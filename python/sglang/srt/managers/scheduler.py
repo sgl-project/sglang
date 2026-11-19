@@ -5842,12 +5842,18 @@ class Scheduler(
         # Flush async trace ops here: in overlap mode this CPU work runs while
         # the next batch's GPU forward is in flight, giving free overlap.
         flush_trace_batch(batch.reqs)
-        snapshot = self.publish_load_snapshot(force=batch.forward_mode.is_extend())
+        # Extend and idle results always publish; decode steps are throttled
+        # to the publish interval. An idle batch exists only to join
+        # attention-DP collectives while other ranks have work, and on_idle
+        # never runs then, so a throttled idle rank's snapshot would lag its
+        # queues by many group steps.
+        force_publish = batch.forward_mode.is_extend() or batch.forward_mode.is_idle()
+        snapshot = self.publish_load_snapshot(force=force_publish)
         # Router-facing gauge on the dedicated PUB socket, reusing the
         # snapshot above rather than walking the queues again.
         self.load_publisher.publish_load_stat(
             self.load_inquirer.get_loads,
-            force=batch.forward_mode.is_extend(),
+            force=force_publish,
             snapshot=snapshot,
         )
 
@@ -6966,7 +6972,10 @@ class Scheduler(
     def configure_logging(self, recv_req: ConfigureLoggingReq):
         if recv_req.log_level is not None:
             logging.getLogger().setLevel(recv_req.log_level.upper())
-        self.ipc_channels.send_to_detokenizer.send_output(recv_req, recv_req)
+        # The embedded Rust server's detokenizer runs in this process; no
+        # detokenizer process reads the socket (see handle_freeze_gc).
+        if self.rust_server is None:
+            self.ipc_channels.send_to_detokenizer.send_output(recv_req, recv_req)
 
     def handle_dumper_control(self, recv_req: DumperControlReqInput):
         from sglang.srt.debug_utils.dumper import dumper
@@ -6980,12 +6989,12 @@ class Scheduler(
                 response = dumper._http_manager.handle_request(
                     method=recv_req.method, body=recv_req.body
                 )
-            self.ipc_channels.send_to_tokenizer.send_output(
+            self.send_control_output(
                 DumperControlReqOutput(success=True, response=response), recv_req
             )
         except Exception as e:
             print(f"[Scheduler] handle_dumper_control error: {e}", flush=True)
-            self.ipc_channels.send_to_tokenizer.send_output(
+            self.send_control_output(
                 DumperControlReqOutput(success=False, response=[], error=str(e)),
                 recv_req,
             )

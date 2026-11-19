@@ -5,25 +5,30 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use futures::Stream;
+use axum::http::StatusCode;
+use futures::{Stream, StreamExt};
 use sglang_api_types::api::v1 as api;
 use sglang_api_types::api::v1::sglang_service_server::SglangService;
 use tonic::{Request, Response, Status};
 
 use super::{info, native_api};
+use crate::api_server::anthropic::Anthropic;
 use crate::api_server::core::{HealthStatus, ReceivedAs};
 use crate::api_server::handlers::{
-    AbortEnding, CoreHandle, CorpusSource, HiCacheError, HiCacheManager, LORA_DISABLED, ToolSpec,
-    WeightGroupOutcome, WeightUpdateOutcome, parse_function_call, separate_reasoning,
+    AbortEnding, CoreHandle, CorpusSource, DumperOutcome, ElasticEpState, HiCacheError,
+    HiCacheManager, LORA_DISABLED, ToolSpec, WeightGroupOutcome, WeightUpdateOutcome,
+    parse_function_call, separate_reasoning,
 };
+use crate::api_server::http::openai::{ChatFormatter, load_chat_support};
 use crate::api_server::http::weights::{decode_payloads, json_object};
+use crate::api_server::ollama::Ollama;
 use crate::message::config::{
     DEFAULT_GRPC_RESPONSE_TIMEOUT_SECS, PreferredSamplingParams, ServerArgs,
 };
 use crate::message::io_struct::{
     DiskWeightUpdate, DistributedWeightUpdate, ExpertDistributionAction, IpcWeightUpdate,
-    PdRoleSwitch, PluginWeightUpdate, ProfileOptions, TensorWeightUpdate, WeightsSendGroup,
-    WeightsUpdateGroup,
+    LoggingConfig, PdRoleSwitch, PluginWeightUpdate, ProfileOptions, SessionOpen,
+    TensorWeightUpdate, WeightsSendGroup, WeightsUpdateGroup,
 };
 use crate::message::request::{GenerationPolicy, into_requests};
 use crate::message::wire::{ClientMaxNewTokens, fill_preferred_sampling};
@@ -52,12 +57,16 @@ pub(crate) struct GrpcService {
     core: CoreHandle,
     config: AdapterConfig,
     hicache_manager: Arc<HiCacheManager>,
+    /// The launch args the data-plane adapters (Ollama, Anthropic) read.
+    server_args: Arc<ServerArgs>,
+    /// The served chat template, for the chat-shaped data planes.
+    chat_formatter: Option<ChatFormatter>,
 }
 
 impl GrpcService {
     pub(crate) fn new(
         core: CoreHandle,
-        server_args: &ServerArgs,
+        server_args: Arc<ServerArgs>,
         hicache_manager: Arc<HiCacheManager>,
     ) -> Self {
         Self {
@@ -70,9 +79,11 @@ impl GrpcService {
                     environ::env_i64("SGLANG_HEALTH_CHECK_TIMEOUT", 20).max(0) as u64,
                 ),
                 has_tokenizer: !server_args.skip_tokenizer_init,
-                generation_policy: server_args.into(),
+                generation_policy: server_args.as_ref().into(),
             },
             hicache_manager,
+            chat_formatter: load_chat_support(&server_args),
+            server_args,
         }
     }
 
@@ -99,6 +110,15 @@ impl GrpcService {
                 has_tokenizer: true,
                 generation_policy: GenerationPolicy::default(),
             },
+            server_args: Arc::new(ServerArgs {
+                model_config: crate::message::config::ModelConfig {
+                    context_len: 4096,
+                    vocab_size: 32_000,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            chat_formatter: None,
         }
     }
 }
@@ -114,6 +134,12 @@ fn response_timeout(secs: u64) -> Duration {
         return Duration::from_secs(DEFAULT_GRPC_RESPONSE_TIMEOUT_SECS);
     }
     Duration::from_secs(secs)
+}
+
+fn openai_unimplemented() -> Status {
+    Status::unimplemented(
+        "the OpenAI API is served over HTTP only until its adapter moves onto the api.v1 schema",
+    )
 }
 
 /// A group operation's merged outcome as the gRPC reply; a frontend-side
@@ -151,6 +177,22 @@ fn lora_disabled() -> Result<Response<api::LoraUpdateResponse>, Status> {
 }
 
 impl GrpcService {
+    fn anthropic(&self) -> Anthropic<'_> {
+        Anthropic {
+            core: &self.core,
+            chat_formatter: self.chat_formatter.as_ref(),
+            server_args: &self.server_args,
+        }
+    }
+
+    fn ollama(&self) -> Ollama<'_> {
+        Ollama {
+            core: &self.core,
+            chat_formatter: self.chat_formatter.as_ref(),
+            server_args: &self.server_args,
+        }
+    }
+
     async fn expert_distribution_record(
         &self,
         action: ExpertDistributionAction,
@@ -810,6 +852,139 @@ impl SglangService for GrpcService {
         lora_disabled()
     }
 
+    async fn open_session(
+        &self,
+        request: Request<api::OpenSessionRequest>,
+    ) -> Result<Response<api::OpenSessionResponse>, Status> {
+        let request = request.into_inner();
+        let opened = self
+            .core
+            .open_session(SessionOpen {
+                capacity_of_str_len: request.capacity_of_str_len,
+                session_id: request.session_id,
+                streaming: request.streaming,
+                timeout: request.timeout,
+            })
+            .await
+            .map_err(native_api::status)?;
+        match opened {
+            Some(session_id) => Ok(Response::new(api::OpenSessionResponse { session_id })),
+            None => Err(Status::already_exists(
+                "Failed to open the session. Check if a session with the same id is still open.",
+            )),
+        }
+    }
+
+    async fn close_session(
+        &self,
+        request: Request<api::CloseSessionRequest>,
+    ) -> Result<Response<api::CloseSessionResponse>, Status> {
+        self.core
+            .close_session(request.into_inner().session_id)
+            .await
+            .map_err(native_api::status)?;
+        Ok(Response::new(api::CloseSessionResponse {}))
+    }
+
+    async fn get_hi_cache_l3_cache_layout(
+        &self,
+        _request: Request<api::GetHiCacheL3CacheLayoutRequest>,
+    ) -> Result<Response<api::GetHiCacheL3CacheLayoutResponse>, Status> {
+        let layout = self
+            .core
+            .hicache_l3_cache_layout()
+            .await
+            .map_err(native_api::status)?;
+        Ok(Response::new(api::GetHiCacheL3CacheLayoutResponse {
+            layout: Some(layout.to_string()),
+        }))
+    }
+
+    async fn configure_logging(
+        &self,
+        request: Request<api::ConfigureLoggingRequest>,
+    ) -> Result<Response<api::ConfigureLoggingResponse>, Status> {
+        let request = request.into_inner();
+        self.core
+            .configure_logging(LoggingConfig {
+                log_requests: request.log_requests,
+                log_requests_level: request.log_requests_level,
+                log_requests_format: request.log_requests_format,
+                log_level: request.log_level,
+                dump_requests_folder: request.dump_requests_folder,
+                dump_requests_threshold: request.dump_requests_threshold,
+                crash_dump_folder: request.crash_dump_folder,
+                dump_requests_exclude_meta_keys: request
+                    .dump_requests_exclude_meta_keys
+                    .map(|list| list.items),
+            })
+            .await
+            .map_err(native_api::status)?;
+        Ok(Response::new(api::ConfigureLoggingResponse {}))
+    }
+
+    /// Served whatever `DUMPER_SERVER_PORT` says: the HTTP mount gate is
+    /// Python's route-level choice, not the dumper's.
+    async fn dumper_control(
+        &self,
+        request: Request<api::DumperControlRequest>,
+    ) -> Result<Response<api::DumperControlResponse>, Status> {
+        let request = request.into_inner();
+        let body = json_object("body", request.body.as_deref())
+            .map_err(Status::invalid_argument)?
+            .unwrap_or_default();
+        match self
+            .core
+            .dumper_control(request.method, body)
+            .await
+            .map_err(native_api::status)?
+        {
+            DumperOutcome::Responses(responses) => Ok(Response::new(api::DumperControlResponse {
+                responses: Some(serde_json::Value::Array(responses).to_string()),
+            })),
+            DumperOutcome::Failed(errors) => Err(Status::failed_precondition(errors.join(" | "))),
+        }
+    }
+
+    async fn scale_elastic_ep(
+        &self,
+        request: Request<api::ScaleElasticEpRequest>,
+    ) -> Result<Response<api::ScaleElasticEpResponse>, Status> {
+        if request.into_inner().new_ep_size <= 0 {
+            return Err(Status::invalid_argument(
+                "new_ep_size must be a positive integer",
+            ));
+        }
+        if self.core.elastic_ep_state().is_none() {
+            return Err(Status::not_found(
+                "elastic EP is not enabled (set --elastic-ep-backend)",
+            ));
+        }
+        Err(Status::failed_precondition(
+            "elastic EP scaling is not served by the Rust frontend",
+        ))
+    }
+
+    async fn get_elastic_ep_state(
+        &self,
+        _request: Request<api::ElasticEpStateRequest>,
+    ) -> Result<Response<api::ElasticEpStateResponse>, Status> {
+        match self.core.elastic_ep_state() {
+            None => Err(Status::not_found(
+                "elastic EP is not enabled (set --elastic-ep-backend)",
+            )),
+            Some(ElasticEpState { effective_ep_size }) => {
+                Ok(Response::new(api::ElasticEpStateResponse {
+                    is_scaling_elastic_ep: false,
+                    effective_ep_size,
+                    pending_ep_size: None,
+                    scale_phase: "idle".into(),
+                    last_error: None,
+                }))
+            }
+        }
+    }
+
     async fn get_remote_instance_transfer_engine_info(
         &self,
         request: Request<api::RemoteInstanceTransferEngineInfoRequest>,
@@ -920,8 +1095,230 @@ impl SglangService for GrpcService {
         }))
     }
 
+    type OllamaChatStream = ResponseStream<api::OllamaChatResponse>;
+
+    /// `/api/chat` over gRPC: the adapter's frames, errors as statuses.
+    async fn ollama_chat(
+        &self,
+        request: Request<api::OllamaChatRequest>,
+    ) -> Result<Response<Self::OllamaChatStream>, Status> {
+        let mut request = request.into_inner();
+        request.apply_absent_defaults();
+        let frames = self
+            .ollama()
+            .chat(request)
+            .await
+            .map_err(native_api::status)?;
+        Ok(Response::new(Box::pin(
+            frames.map(|frame| frame.map_err(native_api::status)),
+        )))
+    }
+
+    type OllamaGenerateStream = ResponseStream<api::OllamaGenerateResponse>;
+
+    async fn ollama_generate(
+        &self,
+        request: Request<api::OllamaGenerateRequest>,
+    ) -> Result<Response<Self::OllamaGenerateStream>, Status> {
+        let mut request = request.into_inner();
+        request.apply_absent_defaults();
+        let frames = self
+            .ollama()
+            .generate(request)
+            .await
+            .map_err(native_api::status)?;
+        Ok(Response::new(Box::pin(
+            frames.map(|frame| frame.map_err(native_api::status)),
+        )))
+    }
+
+    async fn ollama_tags(
+        &self,
+        _request: Request<api::OllamaTagsRequest>,
+    ) -> Result<Response<api::OllamaTagsResponse>, Status> {
+        Ok(Response::new(self.ollama().tags().await))
+    }
+
+    async fn ollama_show(
+        &self,
+        request: Request<api::OllamaShowRequest>,
+    ) -> Result<Response<api::OllamaShowResponse>, Status> {
+        Ok(Response::new(self.ollama().show(request.into_inner())))
+    }
+
+    /// `/v1/messages` without `stream`: failures are statuses with the
+    /// Anthropic message.
+    async fn anthropic_messages(
+        &self,
+        request: Request<api::AnthropicMessagesRequest>,
+    ) -> Result<Response<api::AnthropicMessagesResponse>, Status> {
+        let mut request = request.into_inner();
+        request.apply_absent_defaults();
+        self.anthropic()
+            .messages(request)
+            .await
+            .map(Response::new)
+            .map_err(|failure| failure.grpc_status())
+    }
+
+    type AnthropicStreamMessagesStream = ResponseStream<api::AnthropicStreamEvent>;
+
+    /// `/v1/messages` with `stream`: the event sequence; a failure after
+    /// the first event is an `error` event, as on SSE.
+    async fn anthropic_stream_messages(
+        &self,
+        request: Request<api::AnthropicMessagesRequest>,
+    ) -> Result<Response<Self::AnthropicStreamMessagesStream>, Status> {
+        let mut request = request.into_inner();
+        request.apply_absent_defaults();
+        let events = self
+            .anthropic()
+            .messages_stream(request)
+            .await
+            .map_err(|failure| failure.grpc_status())?;
+        Ok(Response::new(Box::pin(events.map(Ok))))
+    }
+
+    async fn anthropic_count_tokens(
+        &self,
+        request: Request<api::AnthropicCountTokensRequest>,
+    ) -> Result<Response<api::AnthropicCountTokensResponse>, Status> {
+        self.anthropic()
+            .count_tokens(request.into_inner())
+            .await
+            .map(Response::new)
+            .map_err(|failure| failure.grpc_status())
+    }
+
     // The OpenAI interface: the schema is in place for the adapter
     // refactor; the gRPC methods answer UNIMPLEMENTED until it lands.
+    async fn open_ai_completions(
+        &self,
+        _request: Request<api::OpenAiCompletionRequest>,
+    ) -> Result<Response<api::OpenAiCompletionResponse>, Status> {
+        Err(openai_unimplemented())
+    }
+
+    async fn open_ai_chat_completions(
+        &self,
+        _request: Request<api::OpenAiChatCompletionRequest>,
+    ) -> Result<Response<api::OpenAiChatCompletionResponse>, Status> {
+        Err(openai_unimplemented())
+    }
+
+    async fn open_ai_embeddings(
+        &self,
+        _request: Request<api::OpenAiEmbeddingRequest>,
+    ) -> Result<Response<api::OpenAiEmbeddingResponse>, Status> {
+        Err(openai_unimplemented())
+    }
+
+    async fn open_ai_classify(
+        &self,
+        _request: Request<api::OpenAiClassifyRequest>,
+    ) -> Result<Response<api::OpenAiClassifyResponse>, Status> {
+        Err(openai_unimplemented())
+    }
+
+    async fn open_ai_score(
+        &self,
+        request: Request<api::OpenAiScoreRequest>,
+    ) -> Result<Response<api::OpenAiScoreResponse>, Status> {
+        let request = request.into_inner();
+        let scored = crate::api_server::http::openai::score::score_request(
+            &self.core,
+            &self.server_args,
+            ReceivedAs::without_headers,
+            &request,
+        )
+        .await
+        .map_err(|(status, message)| {
+            let code = match status {
+                StatusCode::BAD_REQUEST => tonic::Code::InvalidArgument,
+                StatusCode::SERVICE_UNAVAILABLE => tonic::Code::Unavailable,
+                status if status.is_server_error() => tonic::Code::Internal,
+                _ => tonic::Code::Unknown,
+            };
+            Status::new(code, message)
+        })?;
+        Ok(Response::new(scored.into_response(
+            request.model.clone().unwrap_or_else(|| "default".into()),
+        )))
+    }
+
+    async fn open_ai_rerank(
+        &self,
+        _request: Request<api::OpenAiRerankRequest>,
+    ) -> Result<Response<api::OpenAiRerankResponse>, Status> {
+        Err(openai_unimplemented())
+    }
+
+    async fn open_ai_tokenize(
+        &self,
+        _request: Request<api::OpenAiTokenizeRequest>,
+    ) -> Result<Response<api::OpenAiTokenizeResponse>, Status> {
+        Err(openai_unimplemented())
+    }
+
+    async fn open_ai_detokenize(
+        &self,
+        _request: Request<api::OpenAiDetokenizeRequest>,
+    ) -> Result<Response<api::OpenAiDetokenizeResponse>, Status> {
+        Err(openai_unimplemented())
+    }
+
+    /// The unary Responses API; a streamed response has no RPC yet.
+    async fn open_ai_responses(
+        &self,
+        request: Request<api::OpenAiResponsesRequest>,
+    ) -> Result<Response<api::OpenAiResponsesResponse>, Status> {
+        let request = request.into_inner();
+        let adapter = crate::api_server::responses::Responses {
+            core: &self.core,
+            chat_formatter: self.chat_formatter.as_ref(),
+            server_args: &self.server_args,
+        };
+        let value = adapter
+            .create(&request)
+            .await
+            .map_err(|failure| failure.grpc_status())?;
+        serde_json::from_value::<api::OpenAiResponsesResponse>(value)
+            .map(Response::new)
+            .map_err(|error| Status::internal(format!("responses: {error}")))
+    }
+
+    async fn open_ai_list_models(
+        &self,
+        _request: Request<api::OpenAiListModelsRequest>,
+    ) -> Result<Response<api::OpenAiModelList>, Status> {
+        Err(openai_unimplemented())
+    }
+
+    async fn open_ai_retrieve_model(
+        &self,
+        _request: Request<api::OpenAiRetrieveModelRequest>,
+    ) -> Result<Response<api::OpenAiModelCard>, Status> {
+        Err(openai_unimplemented())
+    }
+
+    type OpenAiStreamCompletionsStream = ResponseStream<api::OpenAiCompletionStreamResponse>;
+
+    async fn open_ai_stream_completions(
+        &self,
+        _request: Request<api::OpenAiCompletionRequest>,
+    ) -> Result<Response<Self::OpenAiStreamCompletionsStream>, Status> {
+        Err(openai_unimplemented())
+    }
+
+    type OpenAiStreamChatCompletionsStream =
+        ResponseStream<api::OpenAiChatCompletionStreamResponse>;
+
+    async fn open_ai_stream_chat_completions(
+        &self,
+        _request: Request<api::OpenAiChatCompletionRequest>,
+    ) -> Result<Response<Self::OpenAiStreamChatCompletionsStream>, Status> {
+        Err(openai_unimplemented())
+    }
 }
 
 /// `--grpc-port` refuses `--admin-api-key` at startup, so a gRPC server never
@@ -1384,7 +1781,7 @@ mod tests {
             };
             GrpcService::new(
                 harness.service.core.clone(),
-                &server_args,
+                Arc::new(server_args),
                 harness.service.hicache_manager.clone(),
             )
             .config
@@ -1692,6 +2089,8 @@ mod tests {
                 service.core.clone(),
                 &ServerArgs::default(),
             )),
+            server_args: service.server_args.clone(),
+            chat_formatter: None,
         };
         let attach = refusing
             .attach_hi_cache_storage(Request::new(api::AttachHiCacheStorageRequest {
@@ -1905,6 +2304,123 @@ mod tests {
         let uuid = uuid::Uuid::parse_str(&ids[0]).unwrap();
         assert_eq!(uuid.get_version(), Some(uuid::Version::Random));
         assert_eq!(ids[0], ids[1]);
+    }
+
+    /// `OllamaChat` renders the messages with the served template and streams
+    /// the adapter's frames, counts on the done frame; `OllamaShow` needs no
+    /// intake.
+    #[tokio::test]
+    async fn ollama_chat_streams_frames_and_show_is_static() {
+        let mut harness = Harness::new(2, true, Duration::from_secs(1));
+        harness.service.chat_formatter =
+            Some(crate::api_server::http::openai::test_utils::chatml_formatter());
+        let request = api::OllamaChatRequest {
+            model: "m".into(),
+            messages: vec![api::OllamaMessage {
+                role: "user".into(),
+                content: "hi".into(),
+                images: None,
+            }],
+            ..Default::default()
+        };
+        let rpc = harness.service.ollama_chat(Request::new(request));
+        let runtime = async {
+            let intake = harness.next_generation().await;
+            assert!(intake.admission.try_accept());
+            let chat = intake.request.chat_prompt.as_ref().unwrap();
+            assert!(chat.prompt.as_str().contains("hi"));
+            assert_eq!(intake.request.sampling_params.max_new_tokens, Some(2048));
+            intake
+                .sink
+                .try_send(ResponseItem::Frame(chunk(&intake.rid, "o", 7, false)))
+                .unwrap();
+            intake
+                .sink
+                .try_send(ResponseItem::Done(chunk(&intake.rid, "k", 8, true)))
+                .unwrap();
+        };
+        let (response, ()) = tokio::join!(rpc, runtime);
+        let mut stream = response.unwrap().into_inner();
+        let first = stream.next().await.unwrap().unwrap();
+        assert_eq!(first.message.as_ref().unwrap().content, "o");
+        assert!(!first.done && first.eval_count.is_none());
+        let second = stream.next().await.unwrap().unwrap();
+        assert_eq!(second.message.as_ref().unwrap().content, "k");
+        let done = stream.next().await.unwrap().unwrap();
+        assert!(done.done);
+        assert_eq!(done.done_reason.as_deref(), Some("stop"));
+        assert_eq!(done.message.as_ref().unwrap().content, "");
+        assert_eq!(done.prompt_eval_count, Some(3));
+        assert_eq!(done.eval_count, Some(2));
+        assert!(stream.next().await.is_none());
+
+        let card = harness
+            .service
+            .ollama_show(Request::new(api::OllamaShowRequest {
+                model: "org/Qwen-Chat".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(card.details.unwrap().family, "Qwen");
+        assert_eq!(card.parameters, "num_ctx 4096");
+    }
+
+    /// `AnthropicMessages` renders through the chat core and shapes the
+    /// reply; `AnthropicCountTokens` counts the rendered prompt's ids.
+    #[tokio::test]
+    async fn anthropic_messages_and_count_tokens_over_grpc() {
+        let mut harness = Harness::new(2, true, Duration::from_secs(1));
+        harness.service.chat_formatter =
+            Some(crate::api_server::http::openai::test_utils::chatml_formatter());
+        let request: api::AnthropicMessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "max_tokens": 8, "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+        let rpc = harness.service.anthropic_messages(Request::new(request));
+        let runtime = async {
+            let intake = harness.next_generation().await;
+            assert!(intake.admission.try_accept());
+            assert_eq!(intake.request.sampling_params.max_new_tokens, Some(8));
+            intake
+                .sink
+                .try_send(ResponseItem::Done(chunk(&intake.rid, "ok", 7, true)))
+                .unwrap();
+        };
+        let (response, ()) = tokio::join!(rpc, runtime);
+        let message = response.unwrap().into_inner();
+        assert_eq!(message.r#type, "message");
+        assert_eq!(message.stop_reason.as_deref(), Some("end_turn"));
+        let content = message.content.unwrap().items;
+        assert_eq!(content.len(), 1);
+        assert!(matches!(
+            &content[0].block,
+            Some(api::anthropic_content_block::Block::Text(text)) if text.text == "ok"
+        ));
+        assert_eq!(message.usage.unwrap().input_tokens, Some(3));
+
+        let request: api::AnthropicCountTokensRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+        let rpc = harness
+            .service
+            .anthropic_count_tokens(Request::new(request));
+        let runtime = async {
+            let TmEvent::Intake { request, admission } =
+                harness.intake_rx.recv_async().await.unwrap()
+            else {
+                panic!("expected intake");
+            };
+            assert!(admission.try_accept());
+            assert!(matches!(request.kind, RequestKind::Tokenize { .. }));
+            request
+                .sink
+                .try_send(ResponseItem::TokenIds(vec![1, 2, 3, 4]))
+                .unwrap();
+        };
+        let (response, ()) = tokio::join!(rpc, runtime);
+        assert_eq!(response.unwrap().into_inner().input_tokens, 4);
     }
 
     #[tokio::test]

@@ -23,7 +23,8 @@ struct Mock {
     id_requests: Arc<AtomicUsize>,
 }
 
-type ItemStream = Pin<Box<dyn Stream<Item = Result<api::GenerateStreamItem, Status>> + Send>>;
+type ItemStreamOf<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
+type ItemStream = ItemStreamOf<api::GenerateStreamItem>;
 
 #[tonic::async_trait]
 impl SglangService for Mock {
@@ -256,6 +257,156 @@ impl SglangService for Mock {
     ) -> Result<Response<api::ParseFunctionCallResponse>, Status> {
         Err(Status::unimplemented("parse_function_call"))
     }
+    type OllamaChatStream = ItemStreamOf<api::OllamaChatResponse>;
+
+    async fn ollama_chat(
+        &self,
+        _: Request<api::OllamaChatRequest>,
+    ) -> Result<Response<Self::OllamaChatStream>, Status> {
+        unimplemented!()
+    }
+
+    type OllamaGenerateStream = ItemStreamOf<api::OllamaGenerateResponse>;
+
+    async fn ollama_generate(
+        &self,
+        _: Request<api::OllamaGenerateRequest>,
+    ) -> Result<Response<Self::OllamaGenerateStream>, Status> {
+        unimplemented!()
+    }
+
+    async fn ollama_tags(
+        &self,
+        _: Request<api::OllamaTagsRequest>,
+    ) -> Result<Response<api::OllamaTagsResponse>, Status> {
+        unimplemented!()
+    }
+
+    async fn ollama_show(
+        &self,
+        _: Request<api::OllamaShowRequest>,
+    ) -> Result<Response<api::OllamaShowResponse>, Status> {
+        unimplemented!()
+    }
+
+    async fn anthropic_messages(
+        &self,
+        _: Request<api::AnthropicMessagesRequest>,
+    ) -> Result<Response<api::AnthropicMessagesResponse>, Status> {
+        unimplemented!()
+    }
+
+    type AnthropicStreamMessagesStream = ItemStreamOf<api::AnthropicStreamEvent>;
+
+    async fn anthropic_stream_messages(
+        &self,
+        _: Request<api::AnthropicMessagesRequest>,
+    ) -> Result<Response<Self::AnthropicStreamMessagesStream>, Status> {
+        unimplemented!()
+    }
+
+    async fn anthropic_count_tokens(
+        &self,
+        _: Request<api::AnthropicCountTokensRequest>,
+    ) -> Result<Response<api::AnthropicCountTokensResponse>, Status> {
+        unimplemented!()
+    }
+
+    async fn open_ai_completions(
+        &self,
+        _: Request<api::OpenAiCompletionRequest>,
+    ) -> Result<Response<api::OpenAiCompletionResponse>, Status> {
+        unimplemented!()
+    }
+
+    async fn open_ai_chat_completions(
+        &self,
+        _: Request<api::OpenAiChatCompletionRequest>,
+    ) -> Result<Response<api::OpenAiChatCompletionResponse>, Status> {
+        unimplemented!()
+    }
+
+    async fn open_ai_embeddings(
+        &self,
+        _: Request<api::OpenAiEmbeddingRequest>,
+    ) -> Result<Response<api::OpenAiEmbeddingResponse>, Status> {
+        unimplemented!()
+    }
+
+    async fn open_ai_classify(
+        &self,
+        _: Request<api::OpenAiClassifyRequest>,
+    ) -> Result<Response<api::OpenAiClassifyResponse>, Status> {
+        unimplemented!()
+    }
+
+    async fn open_ai_score(
+        &self,
+        _: Request<api::OpenAiScoreRequest>,
+    ) -> Result<Response<api::OpenAiScoreResponse>, Status> {
+        unimplemented!()
+    }
+
+    async fn open_ai_rerank(
+        &self,
+        _: Request<api::OpenAiRerankRequest>,
+    ) -> Result<Response<api::OpenAiRerankResponse>, Status> {
+        unimplemented!()
+    }
+
+    async fn open_ai_tokenize(
+        &self,
+        _: Request<api::OpenAiTokenizeRequest>,
+    ) -> Result<Response<api::OpenAiTokenizeResponse>, Status> {
+        unimplemented!()
+    }
+
+    async fn open_ai_detokenize(
+        &self,
+        _: Request<api::OpenAiDetokenizeRequest>,
+    ) -> Result<Response<api::OpenAiDetokenizeResponse>, Status> {
+        unimplemented!()
+    }
+
+    async fn open_ai_responses(
+        &self,
+        _: Request<api::OpenAiResponsesRequest>,
+    ) -> Result<Response<api::OpenAiResponsesResponse>, Status> {
+        unimplemented!()
+    }
+
+    async fn open_ai_list_models(
+        &self,
+        _: Request<api::OpenAiListModelsRequest>,
+    ) -> Result<Response<api::OpenAiModelList>, Status> {
+        unimplemented!()
+    }
+
+    async fn open_ai_retrieve_model(
+        &self,
+        _: Request<api::OpenAiRetrieveModelRequest>,
+    ) -> Result<Response<api::OpenAiModelCard>, Status> {
+        unimplemented!()
+    }
+
+    type OpenAiStreamCompletionsStream = ItemStreamOf<api::OpenAiCompletionStreamResponse>;
+
+    async fn open_ai_stream_completions(
+        &self,
+        _: Request<api::OpenAiCompletionRequest>,
+    ) -> Result<Response<Self::OpenAiStreamCompletionsStream>, Status> {
+        unimplemented!()
+    }
+
+    type OpenAiStreamChatCompletionsStream = ItemStreamOf<api::OpenAiChatCompletionStreamResponse>;
+
+    async fn open_ai_stream_chat_completions(
+        &self,
+        _: Request<api::OpenAiChatCompletionRequest>,
+    ) -> Result<Response<Self::OpenAiStreamChatCompletionsStream>, Status> {
+        unimplemented!()
+    }
+
     async fn separate_reasoning(
         &self,
         _: Request<api::SeparateReasoningRequest>,
@@ -339,6 +490,48 @@ impl SglangService for Mock {
         _: Request<api::UnloadLoraAdapterRequest>,
     ) -> Result<Response<api::LoraUpdateResponse>, Status> {
         Err(Status::unimplemented("unload_lora_adapter"))
+    }
+    async fn get_hi_cache_l3_cache_layout(
+        &self,
+        _: Request<api::GetHiCacheL3CacheLayoutRequest>,
+    ) -> Result<Response<api::GetHiCacheL3CacheLayoutResponse>, Status> {
+        Err(Status::unimplemented("get_hi_cache_l3_cache_layout"))
+    }
+    async fn configure_logging(
+        &self,
+        _: Request<api::ConfigureLoggingRequest>,
+    ) -> Result<Response<api::ConfigureLoggingResponse>, Status> {
+        Err(Status::unimplemented("configure_logging"))
+    }
+    async fn dumper_control(
+        &self,
+        _: Request<api::DumperControlRequest>,
+    ) -> Result<Response<api::DumperControlResponse>, Status> {
+        Err(Status::unimplemented("dumper_control"))
+    }
+    async fn scale_elastic_ep(
+        &self,
+        _: Request<api::ScaleElasticEpRequest>,
+    ) -> Result<Response<api::ScaleElasticEpResponse>, Status> {
+        Err(Status::unimplemented("scale_elastic_ep"))
+    }
+    async fn get_elastic_ep_state(
+        &self,
+        _: Request<api::ElasticEpStateRequest>,
+    ) -> Result<Response<api::ElasticEpStateResponse>, Status> {
+        Err(Status::unimplemented("get_elastic_ep_state"))
+    }
+    async fn open_session(
+        &self,
+        _: Request<api::OpenSessionRequest>,
+    ) -> Result<Response<api::OpenSessionResponse>, Status> {
+        Err(Status::unimplemented("open_session"))
+    }
+    async fn close_session(
+        &self,
+        _: Request<api::CloseSessionRequest>,
+    ) -> Result<Response<api::CloseSessionResponse>, Status> {
+        Err(Status::unimplemented("close_session"))
     }
     async fn freeze_gc(
         &self,

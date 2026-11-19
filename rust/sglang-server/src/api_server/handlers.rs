@@ -17,12 +17,13 @@ mod test_utils;
 mod tokenize;
 mod weights;
 
-pub(crate) use control::ProfileOutcome;
+pub(crate) use control::{DumperOutcome, ProfileOutcome};
 pub(crate) use corpus::CorpusSource;
 pub use generate::{AbortEnding, Aborted};
 pub(crate) use generate::{CoreCall, PendingGeneration, recv_indexed};
 pub(crate) use handle::{CoreConfig, CoreHandle, CoreMetadata, GRACEFUL_CLOSE_TIMEOUT};
 pub(crate) use hicache::{ADMIN_KEY_MISSING, HiCacheError, HiCacheManager};
+pub(crate) use info::ElasticEpState;
 pub(crate) use parsers::{ToolSpec, parse_function_call, separate_reasoning};
 pub(crate) use weights::{
     DiskUpdateOutcome, LORA_DISABLED, PluginUpdateOutcome, WeightGroupOutcome, WeightUpdateOutcome,

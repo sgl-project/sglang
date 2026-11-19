@@ -609,6 +609,12 @@ pub struct DeploymentInfo {
     pub gc_threshold: Option<Vec<i64>>,
     /// `--enable-pd-role-switch`.
     pub enable_pd_role_switch: bool,
+    /// `--elastic-ep-backend`; `None` when elastic EP is off, which is what
+    /// `/scale_elastic_ep` and `/is_scaling_elastic_ep` report.
+    pub elastic_ep_backend: Option<String>,
+    /// `--enable-streaming-session`, which `/open_session` needs for a
+    /// streaming session.
+    pub enable_streaming_session: bool,
     /// The engine-info bootstrap server (`--engine-info-bootstrap-port`), as
     /// the base URL Python's `ServerArgs.engine_info_bootstrap_url` builds.
     pub engine_info_bootstrap_url: Option<String>,
@@ -621,6 +627,17 @@ pub struct DeploymentInfo {
     pub rust_server_endpoints: Vec<RustServerEndpoint>,
     /// Every Rust listener of this launch on this node; the same table on each.
     pub node_listeners: Vec<NodeRustListener>,
+}
+
+impl DeploymentInfo {
+    /// What Python reports as `meta_info.dp_rank`: the scheduler's DP rank,
+    /// `None` without DP. `dp_rank` is the listener and KV-publisher index, so
+    /// it is 0 without DP. The two agree with more than one DP rank, whether
+    /// attention-DP groups or replicas. A rank set only by `SGLANG_DP_RANK`
+    /// with one DP rank reports `None` here, where Python reports it.
+    pub fn reported_dp_rank(&self) -> Option<u32> {
+        self.dp_rank.filter(|_| self.dp_size > 1)
+    }
 }
 
 /// One DP rank's listener, as a base URL (`http://host:port`).

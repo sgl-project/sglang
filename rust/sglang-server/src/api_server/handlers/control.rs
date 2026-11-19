@@ -9,11 +9,12 @@ use crate::message::ids::Rid;
 use tokio::sync::oneshot;
 
 use crate::message::io_struct::{
-    AbortReq, CheckWeightsReqInput, ContinueGenerationReqInput, ControlRequest,
-    ExpertDistributionAction, ExpertDistributionReq, FlushCacheReqInput, FreezeGCReq,
+    AbortReq, CheckWeightsReqInput, CloseSessionReqInput, ConfigureLoggingReq,
+    ContinueGenerationReqInput, ControlRequest, DumperControlReqInput, ExpertDistributionAction,
+    ExpertDistributionReq, FlushCacheReqInput, FreezeGCReq, LoggingConfig, OpenSessionReqInput,
     PauseGenerationReqInput, PdRoleSwitch, PdRoleSwitchReqInput, ProfileOptions, ProfileReq,
-    ReleaseMemoryOccupationReqInput, ResumeMemoryOccupationReqInput, SetInternalStateReq,
-    SlowDownReqInput, UpdateWeightVersionReqInput,
+    ReleaseMemoryOccupationReqInput, ResumeMemoryOccupationReqInput, SessionOpen,
+    SetInternalStateReq, SlowDownReqInput, UpdateWeightVersionReqInput,
 };
 use crate::message::request::RequestKind;
 use crate::message::response::ResponseItem;
@@ -418,6 +419,137 @@ impl CoreHandle {
         self.inner.frontend.set_paused(paused);
     }
 
+    /// `/configure_logging`: set every scheduler rank's log level, as
+    /// Python's `TokenizerManager.configure_logging` relays it. The other
+    /// fields configure the Python frontend's own request logging and dumps;
+    /// the Rust frontend's are fixed at launch, so they are logged and
+    /// dropped. An unknown level is refused before any rank, as Python's
+    /// `logging.setLevel` refuses it.
+    pub(crate) async fn configure_logging(&self, config: LoggingConfig) -> Result<(), CoreError> {
+        if let Some(level) = &config.log_level
+            && !PYTHON_LOG_LEVELS
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(level))
+        {
+            return Err(CoreError::InvalidArgument(format!(
+                "Unknown level: '{}'",
+                level.to_uppercase()
+            )));
+        }
+        if config.log_requests.is_some()
+            || config.log_requests_level.is_some()
+            || config.log_requests_format.is_some()
+            || config.dump_requests_folder.is_some()
+            || config.dump_requests_threshold.is_some()
+            || config.crash_dump_folder.is_some()
+            || config.dump_requests_exclude_meta_keys.is_some()
+        {
+            tracing::warn!(
+                ?config,
+                "configure_logging: request logging and dump settings are fixed at launch on the \
+                 Rust frontend; only log_level is applied"
+            );
+        }
+        if config.log_level.is_none() {
+            return Ok(());
+        }
+        self.ack("configure-logging", &|| {
+            ControlRequest::ConfigureLoggingReq(ConfigureLoggingReq::new(
+                Rid::new().to_string(),
+                config.clone(),
+            ))
+        })
+        .await
+    }
+
+    /// `/dumper/{method}`: run the debug dumper's control method on every
+    /// rank; each DP rank's reply carries one response per worker.
+    pub(crate) async fn dumper_control(
+        &self,
+        method: String,
+        body: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<DumperOutcome, CoreError> {
+        let outputs = self
+            .control(&|| {
+                ControlRequest::DumperControlReqInput(DumperControlReqInput::new(
+                    Rid::new().to_string(),
+                    method.clone(),
+                    body.clone(),
+                ))
+            })
+            .await
+            .decode::<DumperOutput>("dumper-control")?;
+        let errors: Vec<String> = outputs
+            .iter()
+            .filter(|output| !output.success)
+            .map(|output| output.error.clone())
+            .collect();
+        if !errors.is_empty() {
+            return Ok(DumperOutcome::Failed(errors));
+        }
+        Ok(DumperOutcome::Responses(
+            outputs
+                .into_iter()
+                .flat_map(|output| output.response)
+                .collect(),
+        ))
+    }
+
+    /// `/open_session`: open a session on every DP rank's scheduler, as
+    /// Python's `TokenizerManager.open_session`: a streaming session needs
+    /// `--enable-streaming-session`, an unset id is minted here, and a second
+    /// open of an id still in flight is refused. The id comes back once every
+    /// rank opened it; a rank that refused (the id is still open there)
+    /// answers `None`, Python's "check if a session with the same id is still
+    /// open".
+    pub(crate) async fn open_session(
+        &self,
+        mut open: SessionOpen,
+    ) -> Result<Option<String>, CoreError> {
+        if open.streaming == Some(true)
+            && !self.inner.metadata.deployment_info.enable_streaming_session
+        {
+            return Err(CoreError::InvalidArgument(
+                "Streaming sessions are disabled. Please relaunch with --enable-streaming-session."
+                    .into(),
+            ));
+        }
+        let session_id = open
+            .session_id
+            .get_or_insert_with(|| uuid::Uuid::new_v4().simple().to_string())
+            .clone();
+        if !self.inner.frontend.begin_opening(&session_id) {
+            return Ok(None);
+        }
+        let outcome = self
+            .control(&|| {
+                ControlRequest::OpenSessionReqInput(OpenSessionReqInput::new(
+                    Rid::new().to_string(),
+                    open.clone(),
+                ))
+            })
+            .await
+            .decode::<OpenSessionOutput>("open-session");
+        self.inner.frontend.end_opening(&session_id);
+        let outputs = outcome?;
+        Ok(outputs
+            .iter()
+            .all(|output| output.success)
+            .then_some(session_id))
+    }
+
+    /// `/close_session`: close the session on every DP rank; the scheduler
+    /// acks (it has no reply of its own).
+    pub(crate) async fn close_session(&self, session_id: String) -> Result<(), CoreError> {
+        self.ack("close-session", &|| {
+            ControlRequest::CloseSessionReqInput(CloseSessionReqInput::new(
+                Rid::new().to_string(),
+                session_id.clone(),
+            ))
+        })
+        .await
+    }
+
     /// Deliver one control request to every DP rank of the deployment.
     pub(super) async fn control(&self, build: &RequestBuilder<'_>) -> fanout::Replies {
         fanout::fan_out(
@@ -611,6 +743,36 @@ pub(crate) struct ProfileOutcome {
     pub(crate) success: bool,
     #[serde(default)]
     pub(crate) message: String,
+}
+
+/// Python's `logging` level names, which `logging.setLevel` accepts after
+/// upper-casing.
+const PYTHON_LOG_LEVELS: [&str; 8] = [
+    "CRITICAL", "FATAL", "ERROR", "WARN", "WARNING", "INFO", "DEBUG", "NOTSET",
+];
+
+/// The scheduler's `DumperControlReqOutput`.
+#[derive(Debug, serde::Deserialize)]
+struct DumperOutput {
+    success: bool,
+    #[serde(default)]
+    response: Vec<serde_json::Value>,
+    #[serde(default)]
+    error: String,
+}
+
+/// `/dumper/{method}`'s outcome as Python renders it: the ranks' responses
+/// flattened, or every failed rank's error.
+#[derive(Debug, PartialEq)]
+pub(crate) enum DumperOutcome {
+    Responses(Vec<serde_json::Value>),
+    Failed(Vec<String>),
+}
+
+/// The scheduler's `OpenSessionReqOutput`.
+#[derive(Debug, serde::Deserialize)]
+struct OpenSessionOutput {
+    success: bool,
 }
 
 /// The scheduler's `SetInternalStateReqOutput`.
@@ -1477,5 +1639,236 @@ mod tests {
         let released = accept_intake(harness.intake_rx.recv_async().await.unwrap());
         assert!(matches!(released.kind, RequestKind::Generate(_)));
         drop(parked);
+    }
+
+    /// `configure_logging` relays only a log level, refuses an unknown one
+    /// before any rank, and sends nothing when none is given; the dumper
+    /// flattens every rank's responses and collects the failures.
+    #[tokio::test]
+    async fn logging_and_dumper_controls_follow_python() {
+        use crate::api_server::core::CoreErrorKind;
+        use crate::message::io_struct::LoggingConfig;
+        let harness = Harness::unbounded(8);
+        let error = harness
+            .handle
+            .configure_logging(LoggingConfig {
+                log_level: Some("loud".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), CoreErrorKind::InvalidArgument);
+        harness
+            .handle
+            .configure_logging(LoggingConfig {
+                dump_requests_folder: Some("/dumps".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(
+            harness.intake_rx.try_recv().is_err(),
+            "no level, no message"
+        );
+
+        let handle = harness.handle.clone();
+        let bare =
+            Bytes::from(rmp_serde::to_vec_named(&serde_json::json!({"success": true})).unwrap());
+        let (outcome, level) = tokio::join!(
+            handle.configure_logging(LoggingConfig {
+                log_level: Some("debug".into()),
+                ..Default::default()
+            }),
+            async {
+                let request = accept_intake(harness.intake_rx.recv_async().await.unwrap());
+                let RequestKind::Control(control) = &request.kind else {
+                    panic!("expected a control request");
+                };
+                let rmpv::Value::Array(items) =
+                    rmpv::decode::read_value(&mut &control.encode().unwrap()[..]).unwrap()
+                else {
+                    panic!("positional wire");
+                };
+                request
+                    .sink
+                    .try_send(ResponseItem::Control(bare.clone()))
+                    .unwrap();
+                // [tag, rid, ipc, log_requests, log_requests_level, format, log_level, ...]
+                (
+                    items[0].as_str().map(str::to_owned),
+                    items[6].as_str().map(str::to_owned),
+                )
+            },
+        );
+        outcome.unwrap();
+        assert_eq!(
+            level,
+            (Some("ConfigureLoggingReq".into()), Some("debug".into()))
+        );
+
+        let handle = harness.handle.clone();
+        let (outcome, method) = tokio::join!(
+            handle.dumper_control("get_state".into(), serde_json::Map::new()),
+            async {
+                let request = accept_intake(harness.intake_rx.recv_async().await.unwrap());
+                let RequestKind::Control(control) = &request.kind else {
+                    panic!("expected a control request");
+                };
+                let rmpv::Value::Array(items) =
+                    rmpv::decode::read_value(&mut &control.encode().unwrap()[..]).unwrap()
+                else {
+                    panic!("positional wire");
+                };
+                request
+                    .sink
+                    .try_send(ResponseItem::Control(Bytes::from(
+                        rmp_serde::to_vec_named(&serde_json::json!({
+                            "success": true, "response": [{"step": 1}, {"step": 2}], "error": ""
+                        }))
+                        .unwrap(),
+                    )))
+                    .unwrap();
+                items[3].as_str().map(str::to_owned)
+            },
+        );
+        assert_eq!(method.as_deref(), Some("get_state"));
+        assert_eq!(
+            outcome.unwrap(),
+            DumperOutcome::Responses(vec![
+                serde_json::json!({"step": 1}),
+                serde_json::json!({"step": 2})
+            ])
+        );
+        let handle = harness.handle.clone();
+        let (outcome, ()) = tokio::join!(
+            handle.dumper_control("bogus".into(), serde_json::Map::new()),
+            answer_local_control(
+                &harness.intake_rx,
+                Bytes::from(
+                    rmp_serde::to_vec_named(&serde_json::json!({
+                        "success": false, "response": [], "error": "Unknown dumper control method"
+                    }))
+                    .unwrap()
+                ),
+            ),
+        );
+        assert_eq!(
+            outcome.unwrap(),
+            DumperOutcome::Failed(vec!["Unknown dumper control method".into()])
+        );
+    }
+
+    /// `open_session` mints an id, carries Python's fields positionally,
+    /// answers the id once every rank opened it and `None` when one did
+    /// not, refuses a streaming session without the launch flag before any
+    /// rank, and refuses a second open of an id still in flight.
+    #[tokio::test]
+    async fn open_and_close_session_follow_python() {
+        use crate::api_server::core::CoreErrorKind;
+        use crate::message::io_struct::SessionOpen;
+        let harness = Harness::unbounded(8);
+        let error = harness
+            .handle
+            .open_session(SessionOpen {
+                streaming: Some(true),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), CoreErrorKind::InvalidArgument);
+        assert!(harness.intake_rx.try_recv().is_err());
+
+        let reply = |session_id: &str, success: bool| {
+            Bytes::from(
+                rmp_serde::to_vec_named(
+                    &serde_json::json!({"session_id": session_id, "success": success}),
+                )
+                .unwrap(),
+            )
+        };
+        let handle = harness.handle.clone();
+        let (opened, items) = tokio::join!(
+            handle.open_session(SessionOpen {
+                capacity_of_str_len: 1000,
+                timeout: Some(30.0),
+                ..Default::default()
+            }),
+            async {
+                let request = accept_intake(harness.intake_rx.recv_async().await.unwrap());
+                let RequestKind::Control(control) = &request.kind else {
+                    panic!("expected a control request");
+                };
+                let rmpv::Value::Array(items) =
+                    rmpv::decode::read_value(&mut &control.encode().unwrap()[..]).unwrap()
+                else {
+                    panic!("positional wire");
+                };
+                let minted = items[4].as_str().unwrap().to_owned();
+                request
+                    .sink
+                    .try_send(ResponseItem::Control(reply(&minted, true)))
+                    .unwrap();
+                items
+            },
+        );
+        // [tag, rid, ipc, capacity_of_str_len, session_id, streaming, timeout]
+        assert_eq!(items[0].as_str(), Some("OpenSessionReqInput"));
+        assert_eq!(items[3].as_i64(), Some(1000));
+        let minted = items[4].as_str().unwrap();
+        assert_eq!(minted.len(), 32, "a uuid4 hex, as Python mints");
+        assert!(items[5].is_nil());
+        assert_eq!(items[6].as_f64(), Some(30.0));
+        assert_eq!(opened.unwrap().as_deref(), Some(minted));
+
+        // The id is in flight: a second open answers None before any rank.
+        let handle = harness.handle.clone();
+        let first = tokio::spawn(async move {
+            handle
+                .open_session(SessionOpen {
+                    session_id: Some("dup".into()),
+                    ..Default::default()
+                })
+                .await
+        });
+        let request = accept_intake(harness.intake_rx.recv_async().await.unwrap());
+        assert_eq!(
+            harness
+                .handle
+                .open_session(SessionOpen {
+                    session_id: Some("dup".into()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(harness.intake_rx.try_recv().is_err());
+        request
+            .sink
+            .try_send(ResponseItem::Control(reply("dup", false)))
+            .unwrap();
+        assert_eq!(first.await.unwrap().unwrap(), None, "the scheduler refused");
+
+        let handle = harness.handle.clone();
+        let (closed, session_id) = tokio::join!(handle.close_session("dup".into()), async {
+            let request = accept_intake(harness.intake_rx.recv_async().await.unwrap());
+            let RequestKind::Control(control) = &request.kind else {
+                panic!("expected a control request");
+            };
+            let rmpv::Value::Array(items) =
+                rmpv::decode::read_value(&mut &control.encode().unwrap()[..]).unwrap()
+            else {
+                panic!("positional wire");
+            };
+            request
+                .sink
+                .try_send(ResponseItem::Control(Bytes::from(
+                    rmp_serde::to_vec_named(&serde_json::json!({"rid": "x"})).unwrap(),
+                )))
+                .unwrap();
+            items[3].as_str().map(str::to_owned)
+        });
+        closed.unwrap();
+        assert_eq!(session_id.as_deref(), Some("dup"));
     }
 }
