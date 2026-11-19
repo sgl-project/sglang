@@ -1,4 +1,4 @@
-"""M3.1 config resolution, DSpark draft wiring and the deferred MoE handoff."""
+"""M3.1 config resolution, DSpark draft wiring, the deferred MoE handoff and the DP vision encoder."""
 
 import copy
 import os
@@ -30,7 +30,9 @@ from sglang.srt.models.minimax_m3 import (
     get_spec_layer_idx_from_weight_name,
 )
 from sglang.srt.models.minimax_m3_vl import MiniMaxM3SparseForConditionalGeneration
-from sglang.srt.runtime_context import override_platform
+from sglang.srt.models.minimax_vl_common import MiniMaxVLVisionModel
+from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
+from sglang.srt.runtime_context import get_parallel, override_platform
 from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -707,6 +709,44 @@ class TestMiniMaxM31Nvfp4Backend(CustomTestCase):
             )
         # One refresh per prepare, on the cached plan.
         self.assertEqual((first.refreshes, decode.refreshes), (2, 1))
+
+
+class _TilingGather:
+    def __init__(self, world_size):
+        self.world_size = world_size
+        self.input = None
+
+    def all_gather(self, input_, dim):
+        self.input = input_
+        return torch.cat([input_] * self.world_size, dim=dim)
+
+
+class TestMiniMaxVLDataParallelEncoder(CustomTestCase):
+    def test_rank_without_an_image_builds_its_empty_embedding_on_the_tower_device(self):
+        """A DP-encoder rank assigned no image still builds an empty embedding for
+        the all-gather on `vision_model.device`, so the tower must define one."""
+        tower = MiniMaxVLVisionModel.__new__(MiniMaxVLVisionModel)
+        nn.Module.__init__(tower)
+        tower.vision_model = nn.Module()
+        tower.vision_model.embeddings = nn.Module()
+        tower.vision_model.embeddings.patch_embedding = nn.Linear(1, 1, device="meta")
+        tower.spatial_merge_size = 2
+        tower.out_hidden_size = 4
+        gather = _TilingGather(world_size=4)
+
+        # Two images go to ranks 0 and 1 of 4, so rank 2 holds none.
+        with get_parallel().override(
+            attn_tp_size=4, attn_tp_rank=2, attn_tp_group=gather
+        ):
+            run_dp_sharded_mrope_vision_model(
+                tower,
+                torch.zeros(8, 3),
+                [[1, 2, 2], [1, 2, 2]],
+                rope_type="rope_3d",
+            )
+
+        self.assertEqual(gather.input.shape, (1, 4))
+        self.assertEqual(gather.input.device, torch.device("meta"))
 
 
 if __name__ == "__main__":
