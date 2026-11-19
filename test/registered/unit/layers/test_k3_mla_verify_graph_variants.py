@@ -12,7 +12,7 @@ from sglang.srt.layers.attention.graph_variants import (
     create_k3_mla_verify_graph_variants,
     k3_mla_verify_max_kv_len,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
