@@ -13,8 +13,8 @@ use serde_json::{Value, json};
 use sglang_api_types::api::v1::{GenerateResponse, GenerateStreamError};
 use sglang_processor::dynamo_tokenizers::{DecodeResult, Tokenizer};
 use sglang_processor::openai::{
-    ChatModel, OpenAiHeaders, OpenAiSettings, OpenAiTokenizer, Responder, TokenPieces, lower_chat,
-    lower_completion,
+    ChatModel, Declined, OpenAiHeaders, OpenAiSettings, OpenAiTokenizer, Responder, TokenPieces,
+    lower_chat, lower_completion,
 };
 use sglang_processor::{
     ChatFormatter, ChatFormatterOptions, load_tokenizer, resolve_model_file, select_chat_formatter,
@@ -140,18 +140,22 @@ fn check_case(
     let lowered = match case["endpoint"].as_str() {
         Some("chat") => {
             let recorded = || serde_json::from_value(case["generate"]["input_ids"].clone()).ok();
-            let render = |request: &Value| match checkpoint {
-                Some(checkpoint) => checkpoint.render(request, settings),
-                None => recorded(),
+            let render = |request: &Value| {
+                match checkpoint {
+                    Some(checkpoint) => checkpoint.render(request, settings),
+                    None => recorded(),
+                }
+                .ok_or_else(|| "the prompt did not render".to_owned())
             };
             lower_chat(&body, &headers, settings, chat_model, render, tokenizer)
                 .map(|(body, responder)| (body, Responder::Chat(Box::new(responder))))
         }
         _ => lower_completion(&body, &headers, settings, tokenizer)
-            .map(|(body, responder)| (body, Responder::Completion(Box::new(responder)))),
+            .map(|(body, responder)| (body, Responder::Completion(Box::new(responder))))
+            .map_err(Declined::from),
     };
     let (generate, mut responder) = match (lowered, case["unsupported"].as_bool()) {
-        (Err(reason), None) if checkpoint.is_none() && reason.0 == "no_tokenizer" => {
+        (Err(reason), None) if checkpoint.is_none() && reason.reason() == "no_tokenizer" => {
             return Ok(false);
         }
         (Err(_), Some(true)) => return Ok(true),

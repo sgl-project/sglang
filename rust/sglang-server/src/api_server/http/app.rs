@@ -32,10 +32,10 @@ pub(super) struct AppState {
     pub(super) core: CoreHandle,
     pub(super) server_args: Arc<ServerArgs>,
     pub(super) generation_policy: GenerationPolicy,
-    pub(super) chat_formatter: Option<openai::ChatFormatter>,
+    pub(super) chat_formatter: Option<crate::api_server::openai::ChatFormatter>,
     pub(super) generate_hook: Option<Arc<dyn GenerateHook>>,
-    /// The processor's chat layer, tried before the Dynamo-typed chat handler.
-    pub(super) openai_chat: Option<openai::OpenAiChat>,
+    /// What the processor's OpenAI layer reads of this server.
+    pub(super) openai: Arc<crate::api_server::openai::OpenAi>,
 }
 
 /// Every listener warms its own rank, as Python's `_execute_server_warmup`
@@ -123,15 +123,13 @@ pub async fn serve(
     hicache_manager: Arc<HiCacheManager>,
     tokenizer: Option<Arc<sglang_processor::DynamoTokenizer>>,
 ) {
-    let chat_formatter = openai::load_chat_support(&server_args);
+    let chat_formatter = crate::api_server::openai::load_chat_support(&server_args);
     let drain = core.clone();
-    // Legacy conversation templates add stop strings `lower_chat` never sees;
-    // they stay on the typed handler.
-    let openai_chat = chat_formatter
-        .as_ref()
-        .filter(|formatter| !matches!(formatter, openai::ChatFormatter::Legacy(_)))
-        .zip(tokenizer)
-        .map(|(formatter, tokenizer)| openai::OpenAiChat::new(&server_args, formatter, tokenizer));
+    let openai = Arc::new(crate::api_server::openai::OpenAi::new(
+        &server_args,
+        chat_formatter.as_ref(),
+        tokenizer,
+    ));
     let generation_policy = GenerationPolicy::from(server_args.as_ref());
     let state = Arc::new(AppState {
         core,
@@ -139,7 +137,7 @@ pub async fn serve(
         generation_policy,
         chat_formatter,
         generate_hook,
-        openai_chat,
+        openai,
     });
     let relay_failure = startup_failure.clone();
     // Cancelled with the api runtime on shutdown.

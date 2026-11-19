@@ -79,7 +79,7 @@ const HOP_BY_HOP: [HeaderName; 8] = [
 
 /// A generation route Python reads `routed_dp_rank` on, and where it reads it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum HintRoute {
+pub(in crate::api_server) enum HintRoute {
     /// `/generate`: the router's `x-override-routed-dp-rank` header when
     /// header overrides are on (`http_server.serve_generate_request`), then
     /// the body's `routed_dp_rank`. One rank for the whole of a batch body.
@@ -107,7 +107,7 @@ impl HintRoute {
     /// `X-Data-Parallel-Rank` is read first, as Python reads it before it
     /// applies the override, so a malformed one fails even under a valid
     /// override.
-    pub(super) fn header_rank(
+    pub(in crate::api_server) fn header_rank(
         self,
         headers: &HeaderMap,
         overrides: bool,
@@ -229,19 +229,6 @@ fn pydantic_int(value: &serde_json::Value) -> Option<i64> {
                 .flatten()
         }),
         Value::Null | Value::Array(_) | Value::Object(_) => None,
-    }
-}
-
-/// A DP rank field of an OpenAI request, as pydantic's `Optional[int]` reads
-/// it there ([`pydantic_int`]).
-pub(super) fn lax_rank<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Option<i64>, D::Error> {
-    match serde_json::Value::deserialize(deserializer)? {
-        serde_json::Value::Null => Ok(None),
-        value => pydantic_int(&value).map(Some).ok_or_else(|| {
-            serde::de::Error::custom(format!("invalid DP rank {value}: not an integer"))
-        }),
     }
 }
 

@@ -698,11 +698,17 @@ fn lower_openai(
     {
         return Err("default_chat_template_kwargs_differ");
     }
-    let render = |request: &Value| ctx.tokenizers.encode_chat(&model.0, request);
+    // The router leaves a refused request to the engine too, which answers
+    // with Python's own message.
+    let render = |request: &Value| {
+        ctx.tokenizers
+            .encode_chat(&model.0, request)
+            .ok_or_else(|| "the router did not render the prompt".to_owned())
+    };
     let chat_model = ctx.tokenizers.chat_model();
     lower_chat(body, &headers, &settings, chat_model, render, tokenizer)
         .map(|(body, responder)| (body, Responder::Chat(Box::new(responder))))
-        .map_err(|unsupported| unsupported.0)
+        .map_err(|declined| declined.reason())
 }
 
 /// The OpenAI settings every worker of `model` reports; `None` if any is unread or they differ.

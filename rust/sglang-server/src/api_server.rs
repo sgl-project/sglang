@@ -11,4 +11,5 @@ pub(crate) mod handlers;
 pub(crate) mod http;
 pub(crate) mod log;
 pub(crate) mod ollama;
+pub(crate) mod openai;
 pub(crate) mod responses;

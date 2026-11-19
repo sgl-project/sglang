@@ -620,7 +620,6 @@ pub enum TokenizeInput {
         text: String,
         add_special_tokens: bool,
     },
-    Chat(Box<RenderedChat>),
 }
 
 /// A rendered chat prompt and the `continue_final_message` text after it.

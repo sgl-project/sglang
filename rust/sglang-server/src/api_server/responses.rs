@@ -1,6 +1,6 @@
 //! OpenAI Responses adapter shared by the HTTP route and the gRPC service,
 //! the stateless, non-harmony path of Python's `OpenAIServingResponses`: a
-//! Responses request becomes one chat request served by the chat core, and
+//! Responses request becomes one chat request served by the chat route, and
 //! the chat reply or stream is re-shaped into Responses output items and
 //! events. The response store (`--enable-response-store`), gpt-oss harmony
 //! rendering and the built-in tool servers are not served; the requests
@@ -14,24 +14,13 @@ use futures::{Stream, StreamExt};
 use serde_json::{Map, Value, json};
 use sglang_api_types::api::v1 as api;
 use sglang_processor::dynamo_protocols::types::{
-    ChatCompletionMessageContent, CreateChatCompletionRequest, CreateChatCompletionResponse,
-    CreateChatCompletionStreamResponse,
+    ChatCompletionMessageContent, CreateChatCompletionResponse, CreateChatCompletionStreamResponse,
 };
-use sglang_processor::{ReasoningOptions, dynamo_tool_choice};
 use tonic::{Code, Status};
 
-use super::core::CoreError;
-use super::handlers::{CoreCall, CoreHandle};
-use super::http::openai::chat::{
-    OutputParsing, SamplingDefaults, chat_sampling, prepare_chat_prompt, starts_in_reasoning,
-    unary_chat_response,
-};
-use super::http::openai::pd_routing::PDRoutingFields;
-use super::http::openai::{ChatFormatter, unix_seconds_u32};
-use crate::api_server::log::ReceivedAs;
+use super::openai::unix_seconds_u32;
+use super::openai::{OpenAiService, Served};
 use crate::message::config::ServerArgs;
-use crate::message::ids::Rid;
-use crate::message::request::{GenerateRequest, RenderedChat};
 
 /// One SSE event: its `type` (the SSE event name) and its JSON payload.
 pub(crate) type ResponsesEvent = (String, Value);
@@ -40,8 +29,8 @@ pub(crate) type Events = Pin<Box<dyn Stream<Item = ResponsesEvent> + Send + 'sta
 /// The per-listener facts a Responses call needs; both transports build one
 /// from their own state.
 pub(crate) struct Responses<'a> {
-    pub(crate) core: &'a CoreHandle,
-    pub(crate) chat_formatter: Option<&'a ChatFormatter>,
+    /// The chat route's serving path, which gRPC sends its plan through.
+    pub(crate) chat: OpenAiService<'a>,
     pub(crate) server_args: &'a ServerArgs,
 }
 
@@ -77,13 +66,6 @@ impl ResponsesFailure {
         Self {
             kind: "Bad Request",
             ..Self::invalid(message)
-        }
-    }
-
-    fn from_core(error: CoreError) -> Self {
-        Self {
-            status: error.http_status(),
-            ..Self::invalid(error.to_string())
         }
     }
 
@@ -225,7 +207,7 @@ impl Echo {
     }
 }
 
-/// A function or custom tool the request declared, as the chat core sees it.
+/// A function or custom tool the request declared, as the chat route sees it.
 struct DeclaredTools {
     chat_tools: Vec<Value>,
     custom: HashSet<String>,
@@ -457,7 +439,7 @@ fn flatten_tool_output(output: Option<&Value>) -> Value {
     }
 }
 
-/// A function call's arguments as the JSON-object string the chat core expects.
+/// A function call's arguments as the JSON-object string the chat route expects.
 fn tool_call_arguments(raw: Option<&Value>) -> String {
     match raw {
         Some(Value::String(text)) => match serde_json::from_str::<Value>(text) {
@@ -804,40 +786,9 @@ pub(crate) struct Plan {
     echo: Echo,
     custom_tools: HashSet<String>,
     tools_callable: bool,
-    want_logprobs: bool,
     reasoning_summary: bool,
     encrypted_reasoning: bool,
-    json_schema: Option<String>,
-    kwargs: Map<String, Value>,
 }
-
-/// One submitted chat generation and what its reply shaping needs.
-struct Submitted {
-    call: CoreCall,
-    plan: Plan,
-    parsing: OutputParsing,
-}
-
-/// The chat request's own fields, for the typed request; the body also
-/// carries SGLang extensions the chat route reads from the raw JSON.
-const CHAT_REQUEST_KEYS: [&str; 16] = [
-    "model",
-    "messages",
-    "stream",
-    "tools",
-    "tool_choice",
-    "parallel_tool_calls",
-    "stop",
-    "temperature",
-    "top_p",
-    "frequency_penalty",
-    "presence_penalty",
-    "max_completion_tokens",
-    "logprobs",
-    "top_logprobs",
-    "response_format",
-    "reasoning_effort",
-];
 
 impl Responses<'_> {
     /// Python's `create_responses` up to the chat request: validation, the
@@ -1063,7 +1014,7 @@ impl Responses<'_> {
             kwargs.entry("enable_thinking").or_insert(json!(false));
         }
         if !kwargs.is_empty() {
-            chat_body["chat_template_kwargs"] = Value::Object(kwargs.clone());
+            chat_body["chat_template_kwargs"] = Value::Object(kwargs);
         }
         let echo = Echo {
             id,
@@ -1097,168 +1048,31 @@ impl Responses<'_> {
             echo,
             custom_tools: declared.custom,
             tools_callable,
-            want_logprobs,
             reasoning_summary,
             encrypted_reasoning,
-            json_schema,
-            kwargs,
         })
     }
 
-    /// The core path, for gRPC: render the planned chat request with the
-    /// served template and submit it. (HTTP sends the plan through the chat
-    /// route instead, so a model's token-level chat encoder applies.)
-    async fn submit(
-        &self,
-        request: &api::OpenAiResponsesRequest,
-        stream: bool,
-    ) -> Result<Submitted, ResponsesFailure> {
-        let Some(formatter) = self.chat_formatter else {
-            return Err(ResponsesFailure::invalid(
-                "this model has no usable chat template",
-            ));
-        };
-        let plan = self.plan(request, stream)?;
-        let mut typed = Map::new();
-        for key in CHAT_REQUEST_KEYS {
-            if let Some(value) = plan.chat_body.get(key).filter(|v| !v.is_null()) {
-                typed.insert(key.into(), value.clone());
-            }
-        }
-        let mut chat_request: CreateChatCompletionRequest =
-            serde_json::from_value(Value::Object(typed.clone()))
-                .map_err(|error| ResponsesFailure::invalid(format!("{error} None")))?;
-        let mut body = Value::Object(typed);
-        if !plan.kwargs.is_empty() {
-            body["chat_template_kwargs"] = Value::Object(plan.kwargs.clone());
-        }
-        let rendered: RenderedChat = prepare_chat_prompt(
-            formatter,
-            body,
-            &mut chat_request,
-            &self.server_args.default_chat_template_kwargs,
-        )
-        .map_err(|message| ResponsesFailure::invalid(format!("{message} None")))?;
-
-        let dynamo_choice = dynamo_tool_choice(&chat_request.tool_choice);
-        let chat_tools = sglang_processor::chat_tool_definitions(
-            chat_request.tools.as_deref(),
-            &chat_request.messages,
-        )
-        .map_err(|error| ResponsesFailure::invalid(error.to_string()))?;
-        let parser = plan
-            .tools_callable
-            .then(|| self.server_args.tool_call_parser.clone())
-            .flatten();
-        if plan.tools_callable && parser.is_none() {
-            return Err(ResponsesFailure::invalid(
-                "tool calls require --tool-call-parser",
-            ));
-        }
-        let reasoning_parser = self.server_args.reasoning_parser.clone();
-        let tools = (!chat_tools.is_empty()).then_some(chat_tools);
-        let mut sampling = chat_sampling(
-            &chat_request,
-            SamplingDefaults::RESPONSES,
-            parser.as_deref(),
-            &dynamo_choice,
-            tools.as_deref().unwrap_or_default(),
-            chat_request.parallel_tool_calls,
-            self.server_args,
-        )
-        .map_err(ResponsesFailure::invalid)?;
-        if let Some(top_k) = request.top_k {
-            sampling.top_k = top_k;
-        }
-        if let Some(min_p) = request.min_p {
-            sampling.min_p = min_p;
-        }
-        if let Some(repetition_penalty) = request.repetition_penalty {
-            sampling.repetition_penalty = repetition_penalty;
-        }
-        if let Some(schema) = plan.json_schema.clone() {
-            sampling.json_schema = Some(schema);
-        }
-        let starts_in_reasoning =
-            starts_in_reasoning(reasoning_parser.as_deref(), rendered.prompt.as_str());
-        let routing = PDRoutingFields {
-            bootstrap_host: request.bootstrap_host.clone(),
-            bootstrap_port: request.bootstrap_port.clone(),
-            bootstrap_room: request.bootstrap_room.clone(),
-            routed_dp_rank: request.routed_dp_rank,
-            disagg_prefill_dp_rank: request.disagg_prefill_dp_rank,
-        }
-        .normalize(1, 1)
-        .map_err(|error| ResponsesFailure::invalid(error.to_string()))?;
-        let native = GenerateRequest {
-            rid: Rid::from_client(&plan.echo.id),
-            chat_prompt: Some(Box::new(rendered)),
-            sampling_params: sampling,
-            stream,
-            return_logprob: plan.want_logprobs,
-            logprob_start_len: -1,
-            top_logprobs_num: if plan.want_logprobs {
-                request.top_logprobs.unwrap_or(0)
-            } else {
-                0
-            },
-            return_text_in_logprobs: plan.want_logprobs.then_some(true),
-            session_id: request.session_id.clone(),
-            extra_key: request.extra_key.clone(),
-            cache_salt: request.cache_salt.clone(),
-            bootstrap_host: routing.bootstrap.bootstrap_hosts[0].clone(),
-            bootstrap_port: routing.bootstrap.bootstrap_ports[0],
-            bootstrap_room: routing.bootstrap.bootstrap_rooms[0],
-            routed_dp_rank: routing.routed_dp_rank,
-            disagg_prefill_dp_rank: routing.disagg_prefill_dp_rank,
-            ..Default::default()
-        };
-        let call = self
-            .core
-            .generate(native, ReceivedAs::without_headers())
-            .await
-            .map_err(ResponsesFailure::from_core)?;
-        Ok(Submitted {
-            call,
-            plan,
-            parsing: OutputParsing::Text {
-                reasoning_parser,
-                reasoning_options: ReasoningOptions {
-                    force_reasoning: starts_in_reasoning.then_some(true),
-                    ..Default::default()
-                },
-                tool_parser: parser,
-                tools,
-            },
-        })
-    }
-
-    /// `POST /v1/responses` without `stream`, on the core path.
+    /// `POST /v1/responses` without `stream`, for gRPC: the planned chat
+    /// request through the chat route's serving path, as HTTP sends it.
     pub(crate) async fn create(
         &self,
         request: &api::OpenAiResponsesRequest,
     ) -> Result<Value, ResponsesFailure> {
-        let Submitted {
-            call,
-            plan,
-            parsing,
-            ..
-        } = self.submit(request, false).await?;
-        let chat = unary_chat_response(
-            vec![(0, call)],
-            plan.echo.id.clone(),
-            plan.echo.model.clone().unwrap_or_default(),
-            0,
-            plan.want_logprobs,
-            parsing,
-            0,
-            plan.echo.parallel_tool_calls,
-            None,
-            true,
-        )
-        .await
-        // Python answers every generation failure here as a 400.
-        .map_err(|(_, message)| ResponsesFailure::invalid(message))?;
+        let plan = self.plan(request, false)?;
+        let reply = match self.chat.chat(&plan.chat_body).await {
+            Served::Reply(reply) => reply,
+            Served::Events(_) => unreachable!("a chat without `stream` answers once"),
+        };
+        if reply.status != 200 {
+            let error: Value = serde_json::from_str(&reply.body).unwrap_or_default();
+            let message = error["message"].as_str().unwrap_or("Upstream error");
+            // Python answers every generation failure here as a 400.
+            return Err(ResponsesFailure::invalid(message));
+        }
+        let chat = serde_json::from_str(&reply.body).map_err(|error| {
+            ResponsesFailure::invalid(format!("unreadable chat completion: {error}"))
+        })?;
         Ok(plan.shape_unary(chat))
     }
 }

@@ -8,8 +8,9 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use sglang_api_types::api::v1::{
     GenerateMetaInfo, GenerateRequest, GenerateResponse, GenerateStreamError, ImagesConfig,
-    Int64List, LogprobEntry, NullableTopLogprobs, SamplingParams, SamplingParamsOrList, TokenIds,
-    TokenIdsOrList, WatermarkRequestConfig, sampling_params_or_list, string_or_list,
+    Int64List, LogprobEntry, MediaInput, MediaItem, MediaItems, NullableTopLogprobs,
+    OptionalMediaItem, SamplingParams, SamplingParamsOrList, TokenIds, TokenIdsOrList,
+    WatermarkRequestConfig, media_input, media_item, sampling_params_or_list, string_or_list,
     token_ids_or_list,
 };
 
@@ -22,13 +23,62 @@ use super::wire::{
     Reply, StreamState, abort_event, finish_fields, logprob_slice, logprobs_length, now,
     unary_reply,
 };
-use super::{OpenAiHeaders, OpenAiSettings, OpenAiTokenizer, Unsupported};
+use super::{Declined, OpenAiHeaders, OpenAiSettings, OpenAiTokenizer, Unsupported};
 use crate::py::python_json;
 use crate::think::{ReasoningDefault, ReasoningOptions, ThinkConfig, ThinkDetector, think_config};
 use crate::tool_call::{ToolCallItem, ToolDetector, tool_call_id, tool_detector};
 
 #[cfg(feature = "render")]
 mod deepseek;
+#[cfg(feature = "parser")]
+mod dynamo;
+/// Without `parser` only the ported parsers are served.
+#[cfg(not(feature = "parser"))]
+mod dynamo {
+    use serde_json::Value;
+
+    use super::{ReasoningOptions, ToolDetector, ToolParsing, Unsupported};
+
+    pub(super) const PARSES_REASONING: bool = false;
+
+    pub(super) enum Reasoning {}
+
+    impl Reasoning {
+        pub(super) fn new(_: &str, _: &ReasoningOptions) -> Self {
+            unreachable!("declined when lowering")
+        }
+
+        pub(super) fn push(&mut self, _: &str) -> (String, String) {
+            match *self {}
+        }
+
+        pub(super) fn finish(&mut self) -> (String, String) {
+            match *self {}
+        }
+    }
+
+    pub(super) fn parse_reasoning(
+        _: &str,
+        _: &ReasoningOptions,
+        _: &str,
+        _: &[i64],
+    ) -> (String, String) {
+        unreachable!("declined when lowering")
+    }
+
+    pub(super) fn tool_detector(_: &ToolParsing) -> Option<Box<dyn ToolDetector>> {
+        None
+    }
+
+    pub(super) fn tool_constraint(
+        _: Option<&str>,
+        _: Option<&Value>,
+        _: &[Value],
+        _: Option<bool>,
+    ) -> Result<Option<(bool, String)>, Unsupported> {
+        Ok(None)
+    }
+}
 /// Without `render` there is no recipe: requests whose output it would parse
 /// fall back.
 #[cfg(not(feature = "render"))]
@@ -78,6 +128,10 @@ mod deepseek {
 pub struct ChatModel {
     /// `get_model().context_length`.
     pub context_length: Option<u64>,
+    /// `model_config.is_multimodal`: the model takes media content parts,
+    /// which a text-only model refuses.
+    #[serde(default)]
+    pub is_multimodal: bool,
     /// `model_config.get_default_sampling_params()` under `--sampling-defaults model`.
     pub generation_config: Map<String, Value>,
     /// The chat template always reasons: `template_detection` resolves its
@@ -93,6 +147,9 @@ pub struct ChatModel {
     /// `"dsv41"` output.
     #[serde(default)]
     pub chat_encoding_spec: Option<String>,
+    /// A conversation template's `stop_str`, which precede the request's stops.
+    #[serde(default)]
+    pub template_stops: Vec<String>,
     /// The served DeepSeek-V4 / V4.1 checkpoint, whose output recipe parses
     /// with its tokenizer.
     #[cfg(feature = "render")]
@@ -136,7 +193,13 @@ impl ChatModel {
             ChatFormatter::DeepSeekV41(tokenizer) => (Some("dsv41"), deepseek(true, tokenizer)),
             _ => (None, None),
         };
+        let template_stops = match formatter.stop_strs() {
+            Some(crate::OneOrMany::One(stop)) => vec![stop],
+            Some(crate::OneOrMany::Many(stops)) => stops,
+            None => Vec::new(),
+        };
         Self {
+            template_stops,
             always_thinks: formatter.always_thinks(),
             reasoning_toggle: formatter.reasoning_toggle().map(|(param, enabled)| {
                 ReasoningToggle {
@@ -410,62 +473,128 @@ const GENERIC_ROLES: &[&str] = &[
 
 /// Lower a chat body into a `/generate` body, as
 /// `OpenAIServingChat._convert_to_internal_request` does. `render` returns the
-/// prompt's token ids for the body as sent, or `None` when it cannot.
+/// prompt's token ids for the body as sent, or why it cannot render it.
 pub fn lower_chat(
     body: &[u8],
     headers: &OpenAiHeaders<'_>,
     settings: &OpenAiSettings,
     model: &ChatModel,
-    render: impl FnOnce(&Value) -> Option<Vec<u32>>,
+    render: impl FnOnce(&Value) -> Result<Vec<u32>, String>,
     tokenizer: Option<Arc<dyn OpenAiTokenizer>>,
-) -> Result<(GenerateRequest, ChatResponder), Unsupported> {
+) -> Result<(GenerateRequest, ChatResponder), Declined> {
     let original: Value =
         serde_json::from_slice(body).map_err(|_| Unsupported("unparsed_request"))?;
     let Value::Object(mut raw) = original.clone() else {
-        return Err(Unsupported("unparsed_request"));
+        return Err(Unsupported("unparsed_request").into());
     };
     if UNSUPPORTED_FIELDS
         .iter()
         .any(|field| raw.get(*field).is_some_and(|v| v != false))
-        || raw
-            .get("messages")
-            .and_then(Value::as_array)
-            .is_some_and(|m| m.iter().any(has_tools_or_media))
     {
-        return Err(Unsupported("unsupported_chat_feature"));
+        return Err(Unsupported("unsupported_chat_feature").into());
     }
+    let image_data = media_input(&raw, model)?;
     let labels = custom_labels(headers, settings)?;
     if settings.return_input_ids || settings.return_output_ids || headers.sglext_ids {
-        return Err(Unsupported("sglext_output"));
+        return Err(Unsupported("sglext_output").into());
     }
     let reasoning_parser = settings.reasoning_parser.as_deref();
     let tool_call_parser = settings.tool_call_parser.as_deref();
-    // recipe parses DeepSeek output from its token ids in place of both parsers.
-    let deepseek = deepseek::parsing(model, settings, &original, request_tools(&raw)?.is_some())?;
-    let parser = match reasoning_parser {
-        Some(name) if deepseek.is_none() => {
-            Some(think_config(name).ok_or(Unsupported("reasoning_parser"))?)
+    let (tool_definitions, message_tools) = effective_tools(&raw)?;
+    let tools = request_tools(&raw, tool_definitions.as_deref())?;
+    // `required` or a named tool, which a grammar holds the output to.
+    let forced_choice = raw
+        .get("tool_choice")
+        .filter(|choice| !choice.is_null() && *choice != "auto" && *choice != "none");
+    // `_validate_request`'s tool-choice checks, with Python's messages.
+    if let Some(choice) = forced_choice {
+        let declared = tool_definitions.as_deref().unwrap_or_default();
+        let declares = |name: &str| declared.iter().any(|tool| tool["function"]["name"] == name);
+        let refused = match choice["function"]["name"].as_str() {
+            None if choice != "required" => return Err(Unsupported("invalid_request").into()),
+            None if declared.is_empty() => {
+                Some("Tools cannot be empty if tool choice is set to required.".to_owned())
+            }
+            Some(_) if declared.is_empty() => {
+                Some("Tools cannot be empty if tool choice is set to a specific tool.".to_owned())
+            }
+            Some(name) if !declares(name) => {
+                Some(format!("Tool '{name}' not found in tools list."))
+            }
+            _ => None,
+        };
+        if let Some(message) = refused {
+            return Err(Declined::Invalid(message));
         }
-        _ => None,
-    };
+    }
+    if message_tools {
+        let names: HashSet<_> = tool_definitions
+            .iter()
+            .flatten()
+            .filter_map(|tool| tool["function"]["name"].as_str())
+            .collect();
+        if names.len() != tool_definitions.as_ref().map_or(0, Vec::len) {
+            let message = "Tool names must be unique across request and message tools.";
+            return Err(Declined::Invalid(message.to_owned()));
+        }
+    }
+    // recipe parses DeepSeek output from its token ids in place of both parsers.
+    let deepseek = deepseek::parsing(model, settings, &original, tools.is_some())?;
+    // The text parser's name, and its port when `think/` has one.
+    let reasoning_name = reasoning_parser.filter(|_| deepseek.is_none());
+    let parser = reasoning_name.and_then(think_config);
+    if reasoning_name.is_some() && parser.is_none() && !dynamo::PARSES_REASONING {
+        return Err(Unsupported("reasoning_parser").into());
+    }
     // `_process_messages`: glm47 constrains a request with tools, `"none"`
     // included, by a grammar flagged `ebnf_full_assistant`, which `/generate`
     // does not accept.
     if settings.tool_call_parser.as_deref() == Some("glm47")
-        && raw
-            .get("tools")
-            .and_then(Value::as_array)
+        && tool_definitions
+            .as_ref()
             .is_some_and(|tools| !tools.is_empty())
     {
-        return Err(Unsupported("tool_grammar"));
+        return Err(Unsupported("tool_grammar").into());
     }
-    let tools = request_tools(&raw)?;
-    let tool_definitions = raw.get("tools").and_then(Value::as_array).cloned();
     let parallel_tool_calls = raw.get("parallel_tool_calls") != Some(&Value::Bool(false));
+    let parallel = raw.get("parallel_tool_calls").and_then(Value::as_bool);
+    let mut tool_constraint = None;
     let tool_parsing = match (tool_call_parser, &tools, &tool_definitions) {
         (Some(parser), Some(_), Some(definitions)) if deepseek.is_none() => {
-            tool_detector(parser, definitions).ok_or(Unsupported("tool_parser"))?;
-            Some((parser.to_owned(), definitions.clone()))
+            let strict = definitions
+                .iter()
+                .any(|tool| tool["function"]["strict"] == true);
+            if forced_choice.is_some() || strict {
+                tool_constraint =
+                    dynamo::tool_constraint(Some(parser), forced_choice, definitions, parallel)?;
+            }
+            let structural = matches!(tool_constraint, Some((true, _)));
+            let parsing = ToolParsing {
+                parser: Some(parser.to_owned()),
+                tools: definitions.clone(),
+                forced: forced_choice.map(|choice| (choice.clone(), structural)),
+            };
+            parsing.detector().ok_or(Unsupported("tool_parser"))?;
+            Some(parsing)
+        }
+        // `get_json_schema_constraint`: without a tool parser, a forced choice
+        // is held to a JSON schema and its output read as the JSON calls.
+        (None, Some(_), Some(definitions)) if forced_choice.is_some() => {
+            tool_constraint = dynamo::tool_constraint(None, forced_choice, definitions, parallel)?;
+            let parsing = ToolParsing {
+                parser: None,
+                tools: definitions.clone(),
+                forced: forced_choice.map(|choice| (choice.clone(), false)),
+            };
+            parsing.detector().ok_or(Unsupported("tool_parser"))?;
+            Some(parsing)
+        }
+        // recipe reads a DeepSeek model's calls from its token ids; a forced
+        // choice is held to its tool parser's grammar.
+        (Some(parser), Some(_), Some(definitions)) if forced_choice.is_some() => {
+            tool_constraint =
+                dynamo::tool_constraint(Some(parser), forced_choice, definitions, parallel)?;
+            None
         }
         _ => None,
     };
@@ -476,22 +605,23 @@ pub fn lower_chat(
             .get("session_params")
             .is_some_and(|p| !p.is_object() && !p.is_null())
     {
-        return Err(Unsupported("invalid_request"));
+        return Err(Unsupported("invalid_request").into());
     }
     let thinking_kwarg = normalize_reasoning_inputs(&mut raw)?;
     if raw
         .get("reasoning_effort")
         .is_some_and(|e| !valid_effort(e))
     {
-        return Err(Unsupported("invalid_request"));
+        return Err(Unsupported("invalid_request").into());
     }
     let mut request: ChatRequest =
         serde_json::from_value(Value::Object(raw)).map_err(|_| Unsupported("unparsed_request"))?;
     validate(&request, settings, model)?;
     if request.logprobs && tokenizer.is_none() {
-        return Err(Unsupported("no_tokenizer"));
+        return Err(Unsupported("no_tokenizer").into());
     }
-    let prompt_ids = render(&original).ok_or(Unsupported("render"))?;
+    let prompt_ids = render(&original)
+        .map_err(|message| Declined::Invalid(format!("chat template render failed: {message}")))?;
 
     let kwargs = template_kwargs(
         request.chat_template_kwargs.take().unwrap_or_default(),
@@ -508,9 +638,9 @@ pub fn lower_chat(
     }
     // K3 also stops on its tool parser's `eot_token`.
     let tool_call_stop = match &tool_parsing {
-        Some((parser, _)) if model.is_kimi_k3() => match parser.as_str() {
-            "kimi_k3" => Some(KIMI_K3_TOOLS_CLOSE),
-            _ => return Err(Unsupported("tool_parser")),
+        Some(parsing) if model.is_kimi_k3() => match parsing.parser.as_deref() {
+            Some("kimi_k3") => Some(KIMI_K3_TOOLS_CLOSE),
+            _ => return Err(Unsupported("tool_parser").into()),
         },
         _ => None,
     };
@@ -524,7 +654,7 @@ pub fn lower_chat(
         {
             // Python's reasoning parser raises on null content.
             if last["content"].is_null() && parser.is_some() && request.separate_reasoning {
-                return Err(Unsupported("invalid_request"));
+                return Err(Unsupported("invalid_request").into());
             }
             Some(last["content"].as_str().unwrap_or_default().to_owned())
         }
@@ -535,6 +665,7 @@ pub fn lower_chat(
         &request, &kwargs, model, prompt_ids, thinking, headers, settings,
     )?;
     lowered.custom_labels = labels;
+    lowered.image_data = image_data;
     // `get_structure_constraint`: K3's tool parser constrains `auto` calls by
     // its structural tag, unless the request is already constrained; Python
     // tests the constraints by truthiness, so empty strings are unset.
@@ -545,8 +676,14 @@ pub fn lower_chat(
     else {
         unreachable!("one sampling configuration")
     };
-    if let (Some((tool_parser, _)), Some(definitions)) = (&tool_parsing, &tool_definitions)
-        && tool_parser == "kimi_k3"
+    match tool_constraint {
+        Some((true, tag)) => sampling.structural_tag = Some(tag),
+        Some((false, schema)) => sampling.json_schema = Some(schema),
+        None => {}
+    }
+    if let (Some(parsing), Some(definitions)) = (&tool_parsing, &tool_definitions)
+        && parsing.parser.as_deref() == Some("kimi_k3")
+        && parsing.forced.is_none()
         && [&sampling.regex, &sampling.ebnf, &sampling.json_schema]
             .iter()
             .all(|value| value.as_deref().is_none_or(str::is_empty))
@@ -559,6 +696,17 @@ pub fn lower_chat(
         if let Some(tag) = auto_tool_call_tag(definitions, parallel_tool_calls, &strip)? {
             sampling.structural_tag = Some(python_json(&tag, true));
         }
+    }
+    // `_apply_conversation_template`: `conv.stop_str` comes before
+    // `request.stop`, and is dropped under `ignore_eos`.
+    if !model.template_stops.is_empty() && !request.ignore_eos {
+        let own = match sampling.stop.take().and_then(|s| s.value) {
+            Some(string_or_list::Value::Many(stops)) => stops.items,
+            Some(string_or_list::Value::One(stop)) => vec![stop],
+            None => Vec::new(),
+        };
+        let stops = model.template_stops.iter().cloned().chain(own);
+        sampling.stop = Some(OneOrList::List(stops.collect()).into());
     }
     if let Some(stop) = tool_call_stop {
         let mut stops = match sampling.stop.take().and_then(|s| s.value) {
@@ -573,12 +721,14 @@ pub fn lower_chat(
     }
     let (include_usage, continuous_usage_stats) =
         usage_flags(request.stream_options.as_ref(), settings);
-    let reasoning = parser
+    let reasoning = reasoning_name
         .filter(|_| request.separate_reasoning)
-        .map(|config| ReasoningConfig {
-            think: config,
+        .map(|name| ReasoningConfig {
+            name: name.to_owned(),
+            think: parser,
             options: ReasoningOptions {
-                force_reasoning: Some(thinking),
+                // A Dynamo parser keeps its own default.
+                force_reasoning: parser.map(|_| thinking),
                 stream_reasoning: request.stream_reasoning,
                 previous_content,
                 force_nonempty_content: kwargs.get("force_nonempty_content")
@@ -624,22 +774,105 @@ pub fn lower_chat(
     Ok((lowered, responder))
 }
 
-/// The names of the tools a request lets the model call, or `None` when
-/// `tool_choice` turns them off. Only `auto` without strict tools is served:
-/// it adds no constraint, while the others depend on the engine's xgrammar.
-fn request_tools(raw: &Map<String, Value>) -> Result<Option<Vec<String>>, Unsupported> {
-    let choice = raw.get("tool_choice").filter(|c| !c.is_null());
-    if choice.is_some_and(|c| c != "auto" && c != "none")
-        || raw
-            .get("parallel_tool_calls")
-            .is_some_and(|p| !p.is_boolean())
-    {
-        return Err(Unsupported("tool_choice"));
-    }
-    let tools = match raw.get("tools") {
-        None | Some(Value::Null) => return Ok(None),
-        Some(Value::Array(tools)) => tools,
+/// `_effective_tools`: the request's `tools`, then those a root, system or
+/// developer message declares, and whether a message declared any; `None`
+/// when neither declares any. Python types each as `Tool`, so a message's
+/// tool is a declaration too, not a bare function.
+fn effective_tools(raw: &Map<String, Value>) -> Result<(Option<Vec<Value>>, bool), Unsupported> {
+    let mut tools = match raw.get("tools") {
+        None | Some(Value::Null) => None,
+        Some(Value::Array(tools)) => Some(tools.clone()),
         Some(_) => return Err(Unsupported("invalid_request")),
+    };
+    let mut message_tools = false;
+    let messages = raw.get("messages").and_then(Value::as_array);
+    for message in messages.into_iter().flatten() {
+        let declared = match message.get("tools") {
+            None | Some(Value::Null) => continue,
+            Some(Value::Array(declared)) if declared.iter().all(Value::is_object) => declared,
+            Some(_) => return Err(Unsupported("invalid_request")),
+        };
+        let declares = message["role"].as_str().is_some_and(|role| {
+            ["root", "system", "developer"]
+                .iter()
+                .any(|r| role.eq_ignore_ascii_case(r))
+        });
+        if declares && !declared.is_empty() {
+            message_tools = true;
+            tools
+                .get_or_insert_with(Vec::new)
+                .extend(declared.iter().cloned());
+        }
+    }
+    Ok((tools, message_tools))
+}
+
+/// `_MEDIA_CONTENT_PART_TYPES`, with `input_audio`, which Python's request
+/// model turns into an `audio_url` part.
+const MEDIA_PART_TYPES: [&str; 4] = ["image_url", "video_url", "audio_url", "input_audio"];
+
+/// The media the messages carry, as `/generate` takes it:
+/// `_validate_media_content` refuses any on a text-only model, and
+/// `process_content_for_template_format` collects a multimodal model's images
+/// into `image_data`. Video and audio parts are not served.
+fn media_input(
+    raw: &Map<String, Value>,
+    model: &ChatModel,
+) -> Result<Option<MediaInput>, Declined> {
+    let messages = raw.get("messages").unwrap_or(&Value::Null);
+    let parts = (messages.as_array().into_iter().flatten())
+        .filter_map(|message| message["content"].as_array())
+        .flatten();
+    let types: Vec<&str> = parts
+        .filter_map(|part| part["type"].as_str())
+        .filter(|kind| MEDIA_PART_TYPES.contains(kind))
+        .collect();
+    let Some(&first) = types.first() else {
+        return Ok(None);
+    };
+    if !model.is_multimodal {
+        let media_type = if first == "input_audio" {
+            "audio_url"
+        } else {
+            first
+        };
+        return Err(Declined::Invalid(format!(
+            "Model only supports text input; received unsupported content type '{media_type}'."
+        )));
+    }
+    if types.iter().any(|kind| *kind != "image_url") {
+        let message = "video and audio message content is not supported";
+        return Err(Declined::Invalid(message.to_owned()));
+    }
+    let images = crate::extract_images(messages).map_err(Declined::Invalid)?;
+    let item = |source: String| OptionalMediaItem {
+        item: Some(MediaItem {
+            value: Some(media_item::Value::Source(source)),
+        }),
+    };
+    let items = MediaItems {
+        items: images.into_iter().map(item).collect(),
+    };
+    Ok(Some(MediaInput {
+        value: Some(media_input::Value::Many(items)),
+    }))
+}
+
+/// The names of the tools a request lets the model call, or `None` when it
+/// declares none or `tool_choice` turns them off.
+fn request_tools(
+    raw: &Map<String, Value>,
+    tools: Option<&[Value]>,
+) -> Result<Option<Vec<String>>, Unsupported> {
+    let choice = raw.get("tool_choice").filter(|c| !c.is_null());
+    if raw
+        .get("parallel_tool_calls")
+        .is_some_and(|p| !p.is_boolean())
+    {
+        return Err(Unsupported("invalid_request"));
+    }
+    let Some(tools) = tools else {
+        return Ok(None);
     };
     let mut names = Vec::with_capacity(tools.len());
     for tool in tools {
@@ -647,7 +880,7 @@ fn request_tools(raw: &Map<String, Value>) -> Result<Option<Vec<String>>, Unsupp
         let well_formed = tool.get("type").is_none_or(Value::is_string)
             && tool.get("defer_loading").is_none_or(Value::is_null)
             && function.get("defer_loading").is_none_or(Value::is_null)
-            && function.get("strict").is_none_or(|s| s == false)
+            && function.get("strict").is_none_or(Value::is_boolean)
             && function
                 .get("description")
                 .is_none_or(|d| d.is_string() || d.is_null())
@@ -657,7 +890,7 @@ fn request_tools(raw: &Map<String, Value>) -> Result<Option<Vec<String>>, Unsupp
         };
         names.push(name.to_owned());
     }
-    let parse = !tools.is_empty() && choice.is_none_or(|c| c == "auto");
+    let parse = !tools.is_empty() && choice.is_none_or(|c| c != "none");
     Ok(parse.then_some(names))
 }
 
@@ -725,24 +958,6 @@ fn schema_is_standard(schema: &Value) -> bool {
         | "unevaluatedProperties" => false,
         _ => true,
     })
-}
-
-fn truthy(value: &Value) -> bool {
-    !matches!(value, Value::Null | Value::Bool(false))
-        && value.as_array().is_none_or(|items| !items.is_empty())
-}
-
-fn has_tools_or_media(message: &Value) -> bool {
-    let media = |part: &Value| {
-        matches!(
-            part["type"].as_str(),
-            Some("image_url" | "video_url" | "audio_url" | "input_audio")
-        )
-    };
-    message.get("tools").is_some_and(truthy)
-        || message["content"]
-            .as_array()
-            .is_some_and(|parts| parts.iter().any(media))
 }
 
 fn valid_effort(effort: &Value) -> bool {
@@ -846,7 +1061,7 @@ fn valid_message(message: &Value) -> bool {
     let role = message.get("role").and_then(Value::as_str);
     let text_content = |content: &Value| match content {
         Value::String(_) => true,
-        Value::Array(parts) => parts.iter().all(text_part),
+        Value::Array(parts) => parts.iter().all(content_part),
         _ => false,
     };
     match role {
@@ -865,20 +1080,21 @@ fn valid_message(message: &Value) -> bool {
                         .as_array()
                         .is_some_and(|calls| calls.iter().all(valid_tool_call))
                 })
-                // Non-empty tools never get here.
-                && optional(message, "tools", |tools| {
-                    tools.as_array().is_some_and(Vec::is_empty)
-                })
+                // `effective_tools` read the declarations.
+                && optional(message, "tools", Value::is_array)
         }
         _ => false,
     }
 }
 
-/// A text or `tool_reference` content part.
-fn text_part(part: &Value) -> bool {
+/// A `ChatCompletionMessageContentPart`: text, `tool_reference`, or a media
+/// part, whose source `media_input` read.
+fn content_part(part: &Value) -> bool {
     match part["type"].as_str() {
         Some("text") => part["text"].is_string(),
         Some("tool_reference") => part["name"].is_string(),
+        Some("image_url") => part["image_url"].is_string() || part["image_url"].is_object(),
+        Some(kind @ ("video_url" | "audio_url" | "input_audio")) => part[kind].is_object(),
         _ => false,
     }
 }
@@ -1025,8 +1241,73 @@ fn generate_body(
 }
 
 struct ReasoningConfig {
-    think: ThinkConfig,
+    name: String,
+    /// The port of `name`; `None` leaves it to Dynamo's parser.
+    think: Option<ThinkConfig>,
     options: ReasoningOptions,
+}
+
+impl ReasoningConfig {
+    /// A whole output as `(reasoning, normal)`.
+    fn parse(&self, text: &str, ids: &[i64]) -> (String, String) {
+        match self.think {
+            Some(think) => ThinkDetector::new(think, &self.options).parse(text),
+            None => dynamo::parse_reasoning(&self.name, &self.options, text, ids),
+        }
+    }
+
+    // Without `parser` there is no Dynamo arm to reach.
+    #[cfg_attr(not(feature = "parser"), allow(unreachable_code))]
+    fn split(&self) -> ReasoningSplit {
+        match self.think {
+            Some(think) => ReasoningSplit::Port(ThinkDetector::new(think, &self.options)),
+            None => ReasoningSplit::Dynamo(dynamo::Reasoning::new(&self.name, &self.options)),
+        }
+    }
+}
+
+/// One streamed choice's reasoning split.
+enum ReasoningSplit {
+    Port(ThinkDetector),
+    Dynamo(dynamo::Reasoning),
+}
+
+impl ReasoningSplit {
+    fn push(&mut self, text: &str) -> (String, String) {
+        match self {
+            Self::Port(detector) => detector.push(text),
+            Self::Dynamo(reasoning) => reasoning.push(text),
+        }
+    }
+
+    fn finish(&mut self) -> (String, String) {
+        match self {
+            Self::Port(detector) => detector.finish(),
+            Self::Dynamo(reasoning) => reasoning.finish(),
+        }
+    }
+}
+
+/// The server's tool parser over a request's tools.
+struct ToolParsing {
+    /// `None` reads a forced choice's output as JSON calls, with no parser.
+    parser: Option<String>,
+    tools: Vec<Value>,
+    /// A forced `tool_choice`, and whether a structural tag constrains it.
+    forced: Option<(Value, bool)>,
+}
+
+impl ToolParsing {
+    /// The parser's port, else Dynamo's parser.
+    fn detector(&self) -> Option<Box<dyn ToolDetector>> {
+        // A choice forced by a JSON schema is the calls as JSON, not the parser's format.
+        let json = matches!(self.forced, Some((_, false)));
+        let port = match (&self.parser, json) {
+            (Some(parser), false) => tool_detector(parser, &self.tools),
+            _ => None,
+        };
+        port.or_else(|| dynamo::tool_detector(self))
+    }
 }
 
 /// How the responder parses the output.
@@ -1035,7 +1316,7 @@ enum OutputParsing {
     /// over the output text.
     Text {
         reasoning: Option<ReasoningConfig>,
-        tools: Option<(String, Vec<Value>)>,
+        tools: Option<ToolParsing>,
     },
     /// recipe over the output token ids, in place of both parsers.
     DeepSeek(deepseek::DeepSeekParsing),
@@ -1044,7 +1325,7 @@ enum OutputParsing {
 impl OutputParsing {
     /// The reasoning config and the tool parser with its tools; none when
     /// recipe parses.
-    fn text_parsers(&self) -> (Option<&ReasoningConfig>, Option<&(String, Vec<Value>)>) {
+    fn text_parsers(&self) -> (Option<&ReasoningConfig>, Option<&ToolParsing>) {
         match self {
             OutputParsing::Text { reasoning, tools } => (reasoning.as_ref(), tools.as_ref()),
             OutputParsing::DeepSeek(_) => (None, None),
@@ -1070,7 +1351,7 @@ pub struct ChatResponder {
     created: u64,
     stream: StreamState,
     roles_sent: HashSet<u64>,
-    detectors: HashMap<u64, ThinkDetector>,
+    detectors: HashMap<u64, ReasoningSplit>,
     tool_detectors: HashMap<u64, Box<dyn ToolDetector>>,
     has_tool_calls: HashSet<u64>,
     finish_reasons: Vec<(u64, String, Value)>,
@@ -1142,11 +1423,12 @@ impl ChatResponder {
         let mut text = item.text.clone();
         let mut reasoning = String::new();
         if let Some(config) = reasoning_config {
-            (reasoning, text) = ThinkDetector::new(config.think, &config.options).parse(&text);
+            let ids = item.output_ids.as_ref().map_or(&[][..], |ids| &ids.ids);
+            (reasoning, text) = config.parse(&text, ids);
         }
         let mut calls = Vec::new();
-        if let Some((parser, tools)) = tools
-            && let Some(detector) = tool_detector(parser, tools)
+        if let Some(tools) = tools
+            && let Some(detector) = tools.detector()
             && detector.has_tool_call(&text)
         {
             (text, calls) = detector.parse_non_stream(&text);
@@ -1254,7 +1536,7 @@ impl ChatResponder {
             let detector = self
                 .detectors
                 .entry(index)
-                .or_insert_with(|| ThinkDetector::new(config.think, &config.options));
+                .or_insert_with(|| config.split());
             let (mut reasoning, mut normal) = detector.push(&delta);
             if finish_type.as_deref().is_some_and(|t| t != "abort") {
                 let (end_reasoning, end_normal) = detector.finish();
@@ -1275,9 +1557,10 @@ impl ChatResponder {
         if let Some(tools) = tools {
             // `_process_tool_call_stream`, whose chunks are Pydantic models.
             let flush = finish_type.as_deref().is_some_and(|t| t != "abort");
-            let detector = self.tool_detectors.entry(index).or_insert_with(|| {
-                tool_detector(&tools.0, &tools.1).expect("checked when lowering")
-            });
+            let detector = self
+                .tool_detectors
+                .entry(index)
+                .or_insert_with(|| tools.detector().expect("checked when lowering"));
             let (normal, calls) = detector.parse_stream(&delta, flush);
             let usage = self.chunk_usage(index).unwrap_or(Value::Null);
             // `ChatCompletionResponseStreamChoice._serialize` omits absent tool calls.
@@ -1428,7 +1711,7 @@ impl ChatResponder {
             .parsing
             .text_parsers()
             .1
-            .map(|(parser, _)| parser.as_str())
+            .and_then(|tools| tools.parser.as_deref())
         {
             Some("kimi_k3") => format!(
                 "{}:{}",
@@ -1563,7 +1846,7 @@ mod tests {
     /// The reason `messages` is not lowered, with a renderer that accepts anything.
     fn unsupported(messages: Value) -> Option<&'static str> {
         let body = serde_json::to_vec(&json!({"model": "m", "messages": messages})).unwrap();
-        let render = |_: &Value| Some(vec![1]);
+        let render = |_: &Value| Ok(vec![1]);
         let settings = OpenAiSettings::default();
         lower_chat(
             &body,
@@ -1574,7 +1857,7 @@ mod tests {
             None,
         )
         .err()
-        .map(|reason| reason.0)
+        .map(|reason| reason.reason())
     }
 
     #[test]
@@ -1620,6 +1903,207 @@ mod tests {
         assert_eq!(unsupported(messages), None);
     }
 
+    /// Lower `body` for `model` with a renderer that accepts anything.
+    fn lower(
+        body: &Value,
+        settings: &OpenAiSettings,
+        model: &ChatModel,
+    ) -> Result<(GenerateRequest, ChatResponder), Declined> {
+        lower_chat(
+            &serde_json::to_vec(body).unwrap(),
+            &OpenAiHeaders::default(),
+            settings,
+            model,
+            |_: &Value| Ok(vec![1]),
+            None,
+        )
+    }
+
+    fn sampling(generate: &GenerateRequest) -> &SamplingParams {
+        match generate
+            .sampling_params
+            .as_ref()
+            .and_then(|p| p.value.as_ref())
+        {
+            Some(sampling_params_or_list::Value::One(sampling)) => sampling,
+            other => panic!("one sampling configuration, got {other:?}"),
+        }
+    }
+
+    fn tool(name: &str) -> Value {
+        json!({"type": "function", "function": {
+            "name": name,
+            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+        }})
+    }
+
+    /// `_validate_media_content`: a text-only model refuses media with Python's
+    /// message; a multimodal model's images go to `image_data` in message
+    /// then part order, while its video and audio parts are not served.
+    #[test]
+    fn media_parts_are_refused_or_collected_as_python_does() {
+        let image = |url: &str| json!({"type": "image_url", "image_url": {"url": url}});
+        let audio = json!({"type": "input_audio", "input_audio": {"data": "x", "format": "wav"}});
+        let body = |parts: Value| {
+            json!({"model": "m", "messages": [
+                {"role": "system", "content": [{"type": "text", "text": "be brief"}]},
+                {"role": "user", "content": parts},
+            ]})
+        };
+        let settings = OpenAiSettings::default();
+        let text_only = ChatModel::default();
+        let refused = |model: &ChatModel, parts: Value| lower(&body(parts), &settings, model).err();
+        let text_input = |kind: &str| {
+            let message = format!(
+                "Model only supports text input; received unsupported content type '{kind}'."
+            );
+            Some(Declined::Invalid(message))
+        };
+        assert_eq!(
+            refused(
+                &text_only,
+                json!([{"type": "text", "text": "hi"}, image("a")])
+            ),
+            text_input("image_url")
+        );
+        assert_eq!(
+            refused(&text_only, json!([audio.clone()])),
+            text_input("audio_url")
+        );
+        let multimodal = ChatModel {
+            is_multimodal: true,
+            ..ChatModel::default()
+        };
+        let parts = json!([image("a"), {"type": "text", "text": "hi"}, {"type": "image_url", "image_url": "b"}]);
+        let (generate, _) = lower(&body(parts), &settings, &multimodal).unwrap();
+        assert_eq!(
+            serde_json::to_value(generate.image_data).unwrap(),
+            json!(["a", "b"])
+        );
+        assert!(matches!(
+            refused(&multimodal, json!([audio])),
+            Some(Declined::Invalid(_))
+        ));
+        let (generate, _) = lower(&body(json!("hi")), &settings, &multimodal).unwrap();
+        assert!(generate.image_data.is_none());
+    }
+
+    /// `_effective_tools`: the tools a system message declares are parsed
+    /// with the request's, and their names must not repeat.
+    #[test]
+    fn system_message_tools_are_effective_tools() {
+        let settings = OpenAiSettings {
+            tool_call_parser: Some("hermes".into()),
+            ..OpenAiSettings::default()
+        };
+        let mut body = json!({"model": "m", "messages": [
+            {"role": "system", "content": "s", "tools": [tool("a")]},
+            {"role": "user", "content": "hi"},
+        ], "tools": [tool("b")]});
+        let (_, responder) = lower(&body, &settings, &ChatModel::default()).unwrap();
+        let OutputParsing::Text {
+            tools: Some(parsing),
+            ..
+        } = &responder.parsing
+        else {
+            panic!("tool parsing");
+        };
+        assert_eq!(parsing.tools.len(), 2);
+        body["tools"] = json!([tool("a")]);
+        assert_eq!(
+            lower(&body, &settings, &ChatModel::default()).err(),
+            Some(Declined::Invalid(
+                "Tool names must be unique across request and message tools.".into()
+            ))
+        );
+        // A bare function schema is not a `Tool`.
+        body["messages"][0]["tools"] = json!([{"name": "c", "parameters": {}}]);
+        let refused = lower(&body, &settings, &ChatModel::default()).err();
+        assert_eq!(refused.map(|r| r.reason()), Some("tool_definition"));
+    }
+
+    /// `get_json_schema_constraint`: without a tool parser, `required` and a
+    /// named tool are held to a JSON schema, and read as JSON calls.
+    #[test]
+    fn forced_choice_without_a_parser_is_held_to_a_json_schema() {
+        let settings = OpenAiSettings::default();
+        let model = ChatModel::default();
+        let mut body = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}],
+            "tools": [tool("get_weather")], "tool_choice": "required"});
+        let (generate, responder) = lower(&body, &settings, &model).unwrap();
+        let schema = sampling(&generate).json_schema.clone().unwrap_or_default();
+        assert!(schema.contains("get_weather"), "{schema}");
+        let OutputParsing::Text {
+            tools: Some(parsing),
+            ..
+        } = &responder.parsing
+        else {
+            panic!("tool parsing");
+        };
+        assert!(parsing.parser.is_none() && parsing.forced.is_some());
+        let invalid = |body: &Value| lower(body, &settings, &model).err();
+        body["tool_choice"] = json!({"type": "function", "function": {"name": "nope"}});
+        assert_eq!(
+            invalid(&body),
+            Some(Declined::Invalid(
+                "Tool 'nope' not found in tools list.".into()
+            ))
+        );
+        body["tools"] = json!([]);
+        assert_eq!(
+            invalid(&body),
+            Some(Declined::Invalid(
+                "Tools cannot be empty if tool choice is set to a specific tool.".into()
+            ))
+        );
+        body["tool_choice"] = json!("required");
+        assert_eq!(
+            invalid(&body),
+            Some(Declined::Invalid(
+                "Tools cannot be empty if tool choice is set to required.".into()
+            ))
+        );
+    }
+
+    /// `_apply_conversation_template` drops `conv.stop_str` under `ignore_eos`.
+    #[test]
+    fn template_stops_are_dropped_under_ignore_eos() {
+        let model = ChatModel {
+            template_stops: vec!["<|im_end|>".into()],
+            ..ChatModel::default()
+        };
+        let stops = |ignore_eos: bool| {
+            let body = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}],
+                "stop": "x", "ignore_eos": ignore_eos});
+            let (generate, _) = lower(&body, &OpenAiSettings::default(), &model).unwrap();
+            serde_json::to_value(sampling(&generate).stop.clone()).unwrap()
+        };
+        assert_eq!(stops(false), json!(["<|im_end|>", "x"]));
+        assert_eq!(stops(true), json!("x"));
+    }
+
+    /// A template that refuses the request is a bad request with its message.
+    #[test]
+    fn render_failure_is_a_bad_request_with_its_message() {
+        let body = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+        let refused = lower_chat(
+            &serde_json::to_vec(&body).unwrap(),
+            &OpenAiHeaders::default(),
+            &OpenAiSettings::default(),
+            &ChatModel::default(),
+            |_: &Value| Err("no tool turns".to_owned()),
+            None,
+        )
+        .err();
+        assert_eq!(
+            refused,
+            Some(Declined::Invalid(
+                "chat template render failed: no tool turns".into()
+            ))
+        );
+        assert_eq!(refused.unwrap().reply().status, 400);
+    }
+
     #[test]
     fn stream_chunks_repeat_the_stream_created() {
         let body = json!({
@@ -1634,7 +2118,7 @@ mod tests {
             &OpenAiHeaders::default(),
             &settings,
             &ChatModel::default(),
-            |_: &Value| Some(vec![1]),
+            |_: &Value| Ok(vec![1]),
             None,
         )
         .unwrap();
@@ -1724,7 +2208,7 @@ mod tests {
             &OpenAiHeaders::default(),
             &settings,
             model,
-            |_: &Value| Some(vec![1]),
+            |_: &Value| Ok(vec![1]),
             None,
         )
         .unwrap();

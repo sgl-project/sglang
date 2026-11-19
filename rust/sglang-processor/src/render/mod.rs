@@ -13,7 +13,6 @@ use thiserror::Error;
 mod content_format;
 mod legacy;
 mod loader;
-mod media;
 mod models;
 mod reasoning;
 mod selection;
@@ -23,7 +22,6 @@ mod thinking;
 use self::legacy::LegacyFormatter;
 use self::loader::DeveloperErrors;
 pub use self::loader::load_chat_formatter;
-pub use self::media::extract_images;
 pub(crate) use self::models::deepseek_v4_thinking;
 pub use self::models::{DeepSeekTokenizer, continues_final_message};
 use self::models::{

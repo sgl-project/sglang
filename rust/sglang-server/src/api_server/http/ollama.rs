@@ -159,7 +159,7 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
-    use crate::api_server::http::openai::test_utils::answering_app_state;
+    use crate::api_server::http::test_utils::answering_app_state;
 
     async fn post(state: Arc<AppState>, uri: &str, body: &str) -> (StatusCode, String) {
         let response = routes()

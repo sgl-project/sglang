@@ -73,15 +73,6 @@ impl From<ChunkEvent> for CoreOutput {
 }
 
 impl CoreOutput {
-    /// The token IDs behind `text`: `token_ids` without a matched stop token
-    /// that the detokenizer left out of the text. Parsers that read IDs
-    /// alongside the text use this view so the stop token stays out of their
-    /// output too.
-    pub(crate) fn stop_trimmed_token_ids(&self) -> &[i64] {
-        let trimmed = usize::from(self.stop_token_trimmed);
-        &self.token_ids[..self.token_ids.len().saturating_sub(trimmed)]
-    }
-
     /// Fold one runtime delta into this cumulative native-generation output.
     ///
     /// Runtime events are always incremental. Native HTTP and `api.v1`
@@ -762,32 +753,6 @@ mod tests {
             .unwrap()
             .remove("cached_tokens_details");
         assert_eq!(aborted_keys, abort["meta_info"]);
-    }
-
-    /// A trimmed stop token stays in the accumulated `token_ids` but out of the
-    /// parser view, which must line up with the accumulated text. A stop token
-    /// kept in the text (`no_stop_trim`) stays in both.
-    #[test]
-    fn stop_trimmed_token_ids_exclude_only_a_trimmed_stop_token() {
-        for (stop_token_trimmed, expected) in [(true, &[1, 2][..]), (false, &[1, 2, 3][..])] {
-            let mut output = CoreOutput {
-                token_ids: vec![1],
-                ..Default::default()
-            };
-            assert_eq!(output.stop_trimmed_token_ids(), [1]);
-
-            output.append_delta(&CoreOutput {
-                token_ids: vec![2, 3],
-                finish_reason: serde_json::from_value(
-                    serde_json::json!({"type": "stop", "matched": 3}),
-                )
-                .expect("finish reason must parse"),
-                stop_token_trimmed,
-                ..Default::default()
-            });
-            assert_eq!(output.token_ids, [1, 2, 3]);
-            assert_eq!(output.stop_trimmed_token_ids(), expected);
-        }
     }
 
     /// A finish type this build does not know still reaches the client, as
