@@ -89,6 +89,7 @@ class TestPrefetchCheckpoints(CustomTestCase):
             tensors = {
                 f"layer{i}.weight": torch.randn(32, 32),
                 f"layer{i}.bias": torch.randn(32),
+                f"layer{i}.scale": torch.tensor(0.5),
             }
             path = os.path.join(tmpdir, f"model-{i:05d}.safetensors")
             safetensors.torch.save_file(tensors, path)
@@ -109,8 +110,13 @@ class TestPrefetchCheckpoints(CustomTestCase):
             ):
                 with_pf = dict(safetensors_weights_iterator(paths, prefetch=True))
 
+            expected = {}
+            for path in paths:
+                expected.update(safetensors.torch.load_file(path))
+            self.assertEqual(set(without.keys()), set(expected.keys()))
             self.assertEqual(set(without.keys()), set(with_pf.keys()))
             for name in without:
+                torch.testing.assert_close(without[name], expected[name])
                 torch.testing.assert_close(without[name], with_pf[name])
 
     def test_prefetch_rejects_invalid_thread_count(self):
@@ -332,7 +338,7 @@ class TestPrefetchCheckpoints(CustomTestCase):
                     )
                 )
 
-            self.assertEqual(len(loaded), 6)
+            self.assertEqual(len(loaded), 9)
             self.assertEqual(
                 [call.args[0] for call in drop_cache.call_args_list],
                 paths,

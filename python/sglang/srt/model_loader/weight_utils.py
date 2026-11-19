@@ -13,6 +13,7 @@ import hashlib
 import itertools
 import json
 import logging
+import math
 import os
 import re
 import struct
@@ -1143,12 +1144,76 @@ def _safetensors_offsets(path: str) -> Dict[str, Tuple[int, int]]:
     }
 
 
-def _names_read(f, path: str, readers: Optional[CheckpointTensorReaders]) -> List[str]:
-    """Names of the tensors in ``f`` this rank reads; it skips the others unread."""
+_SAFETENSORS_DTYPES = {
+    **safetensors.torch._TYPES,
+    "F8_E8M0": getattr(torch, "float8_e8m0fnu", None),
+}
+
+
+def _read_tensors(
+    path: str,
+    readers: Optional[CheckpointTensorReaders] = None,
+    num_threads: int = 4,
+    max_bytes_ahead: int = 1 << 30,
+):
+    """Yield the tensors of a safetensors file this rank reads, in name order.
+
+    With ``readers`` (EP), each is read with ``pread`` into its own host memory
+    by ``num_threads`` threads, at most ``max_bytes_ahead`` ahead of the caller:
+    copies to the GPU out of such memory run several times faster than out of a
+    mapping of the file. Without, tensors stay mapped views, of which tensor
+    parallelism may read only a slice."""
     if readers is None:
-        return f.keys()
-    sizes = {k: end - begin for k, (begin, end) in _safetensors_offsets(path).items()}
-    return [k for k in f.keys() if readers(k, sizes[k]) is not None]
+        with safetensors.safe_open(path, framework="pt", device="cpu") as f:
+            for name in f.keys():
+                yield name, f.get_tensor(name)
+        return
+    with open(path, "rb") as f:
+        (size,) = struct.unpack("<Q", f.read(8))
+        header = json.loads(f.read(size))
+    header.pop("__metadata__", None)
+    plan, todo = [], collections.deque()
+    for name in sorted(header):
+        info = header[name]
+        begin, end = (8 + size + o for o in info["data_offsets"])
+        if readers(name, end - begin) is None:
+            continue
+        dtype = _SAFETENSORS_DTYPES.get(info["dtype"])
+        read = (
+            dtype is not None
+            and math.prod(info["shape"]) * dtype.itemsize == end - begin > 0
+        )
+        plan.append((name, read, dtype, info["shape"]))
+        if read:
+            todo.append((begin, end))
+
+    def pread(fd: int, begin: int, end: int) -> torch.Tensor:
+        data = torch.empty(end - begin, dtype=torch.uint8)
+        view, done = memoryview(data.numpy()), 0
+        while done < end - begin:
+            n = os.preadv(fd, [view[done:]], begin + done)
+            if n == 0:
+                raise EOFError(f"{path} ends before byte {end}")
+            done += n
+        return data
+
+    with (
+        safetensors.safe_open(path, framework="pt", device="cpu") as mapped,
+        open(path, "rb") as f,
+        concurrent.futures.ThreadPoolExecutor(num_threads) as pool,
+    ):
+        pending, ahead = collections.deque(), 0
+        for name, read, dtype, shape in plan:
+            if not read:
+                yield name, mapped.get_tensor(name)
+                continue
+            while todo and (not pending or ahead < max_bytes_ahead):
+                begin, end = todo.popleft()
+                pending.append(pool.submit(pread, f.fileno(), begin, end))
+                ahead += end - begin
+            data = pending.popleft().result()
+            ahead -= data.numel()
+            yield name, data.view(dtype).view(shape)
 
 
 def _node_local_peers(ranks: Iterable[int]) -> Tuple[int, int]:
@@ -1401,9 +1466,7 @@ def safetensors_weights_iterator(
                 for name in sorted(result.keys()):
                     yield name, result[name]
         else:
-            with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
-                for name in _names_read(f, st_file, readers):
-                    yield name, f.get_tensor(name)
+            yield from _read_tensors(st_file, readers, prefetch_num_threads)
         if drop_cache_after_load:
             _drop_file_cache_after_load(st_file)
     if prefetch_handle is not None:
@@ -1630,8 +1693,7 @@ def buffered_multi_thread_safetensors_weights_iterator(
             with open(st_file, "rb") as f:
                 result = safetensors.torch.load(f.read())
         else:
-            with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
-                result = {k: f.get_tensor(k) for k in _names_read(f, st_file, readers)}
+            result = dict(_read_tensors(st_file, readers, num_threads=1))
         return result
 
     # Sliding window: max_workers loading + 1 prefetched.
