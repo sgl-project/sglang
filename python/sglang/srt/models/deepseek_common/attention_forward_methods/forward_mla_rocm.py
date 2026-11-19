@@ -26,7 +26,10 @@ from sglang.srt.layers.dcp import (
     cp_lse_ag_out_rs_mla,
     dcp_a2a_lse_reduce,
 )
-from sglang.srt.layers.dcp.layout import is_mla_dcp_lse_base_on_e
+from sglang.srt.layers.dcp.layout import (
+    dsa_shards_index_k,
+    is_mla_dcp_lse_base_on_e,
+)
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 from sglang.srt.layers.quantization.fp8_utils import (
@@ -880,9 +883,10 @@ class DeepseekMLARocmForwardMixin:
             elif forward_batch.forward_mode.is_extend():
                 # Assemble the full sequence into dcp_kv_buffer, which the
                 # backend attends over instead of the sharded local cache
-                # (on gfx950, K3.1's DSA backend gathers its own cache).
+                # (on gfx950, K3.1's sharded index-K backend gathers its own
+                # cache; a gathered DSA prefill still reads this buffer).
                 if (
-                    not (_is_gfx95_supported and self.use_dsa)
+                    not (_is_gfx95_supported and dsa_shards_index_k())
                     and forward_batch.attn_dcp_metadata is not None
                     and forward_batch.attn_dcp_metadata.dcp_kv_buffer is not None
                 ):
