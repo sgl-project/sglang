@@ -215,14 +215,24 @@ def alloc_extend_kernel(
 
 
 # Same free_page_ptr alignment rationale as alloc_extend_kernel above.
-@triton.jit(do_not_specialize=["free_page_ptr"])
+@triton.jit(do_not_specialize=["free_page_ptr", "swa_free_page_ptr"])
 def alloc_decode_kernel(
     seq_lens_ptr,
     last_loc_ptr,
     free_page_ptr,
     out_indices,
     page_size: tl.constexpr,
+    swa_free_page_ptr=None,
+    full_to_swa_ptr=None,
+    req_pool_indices_ptr=None,
+    req_to_token_ptr=None,
+    req_to_token_stride=0,
+    FUSED: tl.constexpr = False,
+    HAS_SWA: tl.constexpr = False,
 ):
+    """FUSED: last_loc is read from req_to_token and the new slot is written
+    back to it. HAS_SWA (FUSED only): also allocate the SWA slot and set
+    full_to_swa[out]."""
     pid = tl.program_id(0)
 
     BLOCK_BS: tl.constexpr = 256
@@ -251,9 +261,28 @@ def alloc_decode_kernel(
     sum_num_new_pages = tl.sum(num_new_pages)
     new_page_start_loc = sum_num_new_pages - num_page_start_loc_self
 
-    if num_page_start_loc_self == 0:
-        last_loc = tl.load(last_loc_ptr + pid)
-        tl.store(out_indices + pid, last_loc + 1)
+    if not FUSED:
+        if num_page_start_loc_self == 0:
+            last_loc = tl.load(last_loc_ptr + pid)
+            tl.store(out_indices + pid, last_loc + 1)
+        else:
+            page = tl.load(free_page_ptr + new_page_start_loc)
+            tl.store(out_indices + pid, page * page_size)
     else:
-        page = tl.load(free_page_ptr + new_page_start_loc)
-        tl.store(out_indices + pid, page * page_size)
+        token_row = (
+            req_to_token_ptr
+            + tl.load(req_pool_indices_ptr + pid).to(tl.int64) * req_to_token_stride
+        )
+        if num_page_start_loc_self == 0:
+            last_loc = tl.load(token_row + pre_len - 1).to(tl.int64)
+            out = last_loc + 1
+            if HAS_SWA:
+                swa_out = tl.load(full_to_swa_ptr + last_loc) + 1
+        else:
+            out = tl.load(free_page_ptr + new_page_start_loc) * page_size
+            if HAS_SWA:
+                swa_out = tl.load(swa_free_page_ptr + new_page_start_loc) * page_size
+        tl.store(out_indices + pid, out)
+        tl.store(token_row + pre_len, out.to(tl.int32))
+        if HAS_SWA:
+            tl.store(full_to_swa_ptr + out, swa_out)
