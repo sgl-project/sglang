@@ -394,5 +394,39 @@ class TestPageRowSliceSendPackerFailure(CustomTestCase):
         manager.engine.batch_transfer_sync.assert_not_called()
 
 
+class TestDraftHeadPackerOutOfMemory(CustomTestCase):
+    """Running out of GPU memory while packing draft heads must fail that send
+    with -1 and return the staging buffer; a raise stops the transfer worker."""
+
+    def test_pack_oom_returns_minus_one(self):
+        import queue
+        from unittest import mock
+
+        import torch
+
+        from sglang.srt.disaggregation.mooncake.draft_head_packer import (
+            DraftHeadPacker,
+        )
+
+        packer = object.__new__(DraftHeadPacker)
+        packer._pages_per_batch = 2
+        packer._free = queue.Queue()
+        buffer = object()
+        packer._free.put(buffer)
+        transfer = mock.Mock(return_value=0)
+        with mock.patch.object(
+            packer, "_pack", side_effect=torch.OutOfMemoryError("CUDA out of memory")
+        ):
+            ret = packer.send(
+                src_page_indices=np.array([3, 4, 5], dtype=np.int32),
+                dst_page_indices=np.array([7, 8, 9], dtype=np.int32),
+                jobs=[],
+                transfer=transfer,
+            )
+        self.assertEqual(ret, -1)
+        transfer.assert_not_called()
+        self.assertIs(packer._free.get_nowait(), buffer)
+
+
 if __name__ == "__main__":
     unittest.main()

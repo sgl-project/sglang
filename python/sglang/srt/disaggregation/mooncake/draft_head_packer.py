@@ -7,6 +7,7 @@ RDMA write per token into one per page.
 
 from __future__ import annotations
 
+import logging
 import queue
 from typing import Callable, List, Tuple
 
@@ -16,8 +17,10 @@ import numpy.typing as npt
 import torch
 
 # Arbitrary; bounds the staging memory, not the request length.
-_PAGES_PER_BATCH = 256
+_MAX_PAGES_PER_BATCH = 256
 _NUM_BUFFERS = 4
+
+logger = logging.getLogger(__name__)
 
 
 class DraftEntryJob(msgspec.Struct, frozen=True):
@@ -39,13 +42,21 @@ class DraftHeadPacker:
         *,
         tensors: List[torch.Tensor],
         page_size: int,
+        window_pages: int,
         register: Callable[[List[int], List[int]], None],
     ):
         self._tensors = tensors
         self._page_size = page_size
         self._device = tensors[0].device
+        # A windowed draft sends at most window_pages per request, so a larger
+        # staging buffer would sit unused; 0 means every page is sent.
+        self._pages_per_batch = (
+            min(window_pages, _MAX_PAGES_PER_BATCH)
+            if window_pages > 0
+            else _MAX_PAGES_PER_BATCH
+        )
         # Sized for a decode rank that keeps every local head, the upper bound.
-        self._batch_bytes = _PAGES_PER_BATCH * sum(
+        self._batch_bytes = self._pages_per_batch * sum(
             t[0].nbytes * page_size for t in tensors
         )
         self._free: queue.Queue[_StagingBuffer] = queue.Queue()
@@ -70,8 +81,8 @@ class DraftHeadPacker:
     ) -> int:
         buffer = self._free.get()
         try:
-            for start in range(0, len(src_page_indices), _PAGES_PER_BATCH):
-                end = start + _PAGES_PER_BATCH
+            for start in range(0, len(src_page_indices), self._pages_per_batch):
+                end = start + self._pages_per_batch
                 src, dst, lengths = self._pack(
                     buffer=buffer,
                     src_pages=src_page_indices[start:end],
@@ -82,6 +93,11 @@ class DraftHeadPacker:
                 if ret != 0:
                     return ret
             return 0
+        except torch.OutOfMemoryError as e:
+            # Runs on the transfer executor: a raise would stop the transfer
+            # worker, so fail only this request.
+            logger.error(f"packing draft KV heads ran out of GPU memory: {e}")
+            return -1
         finally:
             self._free.put(buffer)
 
@@ -109,9 +125,10 @@ class DraftHeadPacker:
                     .view(torch.uint8)
                     .view(-1, self._page_size, tensor.shape[1], tensor[0, 0].nbytes)
                 )
-                picked = paged.index_select(0, pages)[
+                # Slice heads before gathering so the temporary holds only these heads.
+                picked = paged[
                     :, :, job.head_start : job.head_start + job.num_heads
-                ]
+                ].index_select(0, pages)
                 page_bytes = picked[0].numel()
                 out = buffer.data[offset : offset + num_pages * page_bytes]
                 out.view(picked.shape).copy_(picked)

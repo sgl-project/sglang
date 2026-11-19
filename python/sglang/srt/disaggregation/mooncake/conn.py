@@ -2109,6 +2109,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 self._draft_head_packer = DraftHeadPacker(
                     tensors=self.draft_kv_tensors,
                     page_size=self.kv_args.page_size,
+                    window_pages=self.kv_args.draft_window_pages,
                     register=self.engine.batch_register,
                 )
             return self._draft_head_packer
