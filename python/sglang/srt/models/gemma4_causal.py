@@ -69,6 +69,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
@@ -543,7 +544,12 @@ class Gemma4Attention(nn.Module):
                 v = v.unflatten(-1, (self.num_kv_heads, self.head_dim))
                 v = self.v_norm(v)
 
-        # Apply rotary embedding
+        # Apply rotary embedding. Layers whose attention kernel takes fp8 q get
+        # it straight from the RoPE kernel (no separate cast).
+        q_dtype = get_attn_backend().fp8_query_dtype(self.attn)
+        q_out = torch.empty_like(q, dtype=q_dtype) if q_dtype is not None else None
+        # Only the CUDA rotary path takes q_out; other platforms see the old call.
+        rope_kwargs = {} if q_out is None else {"q_out": q_out}
         use_fused_kv = False
         if k is not None:
             k = k.flatten(-2, -1)
@@ -559,12 +565,16 @@ class Gemma4Attention(nn.Module):
                 use_fused_kv = True
             else:
                 fused_arg = None
-            q, k = self.rotary_emb(positions, q, k, fused_set_kv_buffer_arg=fused_arg)
+            q, k = self.rotary_emb(
+                positions, q, k, fused_set_kv_buffer_arg=fused_arg, **rope_kwargs
+            )
             k = k.unflatten(-1, (self.num_kv_heads, self.head_dim))
         else:
             # Rotary embedding requires a key input; use zeros since KV is shared from another layer
             dummy_k = torch.zeros_like(q[:, : self.kv_size])
-            q, _ = self.rotary_emb(positions, q, dummy_k)
+            q, _ = self.rotary_emb(positions, q, dummy_k, **rope_kwargs)
+        if q_out is not None:
+            q = q_out
 
         q = q.unflatten(-1, (self.num_heads, self.head_dim))
         attn_output = self.attn(

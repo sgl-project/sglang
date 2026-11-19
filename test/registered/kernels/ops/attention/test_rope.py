@@ -436,5 +436,36 @@ def test_fused_rope_store(
     assert torch.all(v_cache_ref[out_loc] == v_cache_fused[out_loc]), "v_cache mismatch"
 
 
+@pytest.mark.skipif(is_hip(), reason="q_out targets the CUDA fp8 e4m3fn/e5m2 query")
+@pytest.mark.parametrize("q_dtype", [torch.float8_e4m3fn])
+@pytest.mark.parametrize("is_neox", [True, False])
+@pytest.mark.parametrize("num_tokens", [1, 48, 3900])
+@pytest.mark.parametrize("head_dim", [128, 256])
+@pytest.mark.parametrize("pos_dtype", [torch.int32, torch.int64])
+def test_rope_q_out(q_dtype, is_neox, num_tokens, head_dim, pos_dtype) -> None:
+    """Rotated q written straight to another dtype equals in-place RoPE + cast,
+    k is rotated in place as before, and the input q is left untouched."""
+    from sglang.kernels.ops.attention.rope import apply_rope_inplace
+
+    torch.manual_seed(0)
+    cos_sin_cache = create_cos_sin_cache(head_dim)
+    q = torch.randn(num_tokens, 8, head_dim, device=DEVICE, dtype=DTYPE)
+    k = torch.randn(num_tokens, 4, head_dim, device=DEVICE, dtype=DTYPE)
+    positions = torch.randint(0, MAX_SEQ_LEN, (num_tokens,), device=DEVICE)
+    positions = positions.to(pos_dtype)
+
+    q_ref, k_ref = q.clone(), k.clone()
+    apply_rope_inplace(q_ref, k_ref, cos_sin_cache, positions, is_neox=is_neox)
+
+    q_in, k_new = q.clone(), k.clone()
+    q_out = torch.empty_like(q, dtype=q_dtype)
+    apply_rope_inplace(
+        q_in, k_new, cos_sin_cache, positions, is_neox=is_neox, q_out=q_out
+    )
+    assert torch.equal(q_out.view(torch.uint8), q_ref.to(q_dtype).view(torch.uint8))
+    assert torch.equal(k_new, k_ref)
+    assert torch.equal(q_in, q)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))

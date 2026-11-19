@@ -330,11 +330,13 @@ class RotaryEmbedding(BaseFusedOp):
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
         fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
+        q_out: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """A PyTorch-native implementation of forward()."""
         assert fused_set_kv_buffer_arg is None, (
             "fused_set_kv_buffer_arg is not supported for native implementation"
         )
+        assert q_out is None, "q_out is not supported for native implementation"
 
         if offsets is not None:
             positions = positions + offsets
@@ -462,12 +464,18 @@ class RotaryEmbedding(BaseFusedOp):
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
         fused_set_kv_buffer_arg: Optional[Union[FusedSetKVBufferArg, dict]] = None,
+        q_out: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """``q_out``: a buffer shaped like ``query`` in another dtype (e.g. fp8).
+        The rotated query is written there and ``query`` is left untouched; the
+        caller uses ``q_out`` as the query. Full-head rotary on the JIT kernel
+        only."""
         if not self.use_fallback_kernel:
             batch_size = positions.size(0)
             q_rope = query.view(batch_size, -1, self.head_size)
             k_rope = key.view(batch_size, -1, self.head_size)
             if self.head_size != self.rotary_dim:
+                assert q_out is None, "q_out needs rotary_dim == head_size"
                 q_rope = q_rope[..., : self.rotary_dim]
                 k_rope = k_rope[..., : self.rotary_dim]
             apply_rope_with_cos_sin_cache_inplace(
@@ -477,8 +485,14 @@ class RotaryEmbedding(BaseFusedOp):
                 cos_sin_cache=self.cos_sin_cache,
                 is_neox=self.is_neox_style,
                 fused_args=fused_set_kv_buffer_arg,
+                q_out=(
+                    q_out.view(batch_size, -1, self.head_size)
+                    if q_out is not None
+                    else None
+                ),
             )
         else:
+            assert q_out is None, "q_out is not supported by the fallback rotary kernel"
             if fused_set_kv_buffer_arg is not None and _is_hip:
                 extra_args = fused_set_kv_buffer_arg
                 k_cache = fused_set_kv_buffer_arg["key_cache"]

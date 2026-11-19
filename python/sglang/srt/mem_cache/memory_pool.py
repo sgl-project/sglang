@@ -3059,6 +3059,12 @@ class MHATokenToKVPool(KVCache, MHAKVView):
             return
 
         if cache_k.dtype != self.dtype:
+            if self._can_cast_store(cache_k, cache_v, dcp_kv_mask):
+                # one kernel: divide by the scale, cast to fp8 and scatter the rows
+                self._cast_store_kv(
+                    layer_id - self.start_layer, loc, cache_k, cache_v, k_scale, v_scale
+                )
+                return
             if k_scale is not None:
                 cache_k.div_(k_scale)
             if v_scale is not None:
@@ -3118,6 +3124,71 @@ class MHATokenToKVPool(KVCache, MHAKVView):
             return
 
         self._store_kv_layer(layer_id - self.start_layer, loc, cache_k, cache_v)
+
+    def _can_cast_store(
+        self, cache_k: torch.Tensor, cache_v: torch.Tensor, dcp_kv_mask
+    ) -> bool:
+        """fp8 pool fed bf16/fp16 K/V on the plain NHD slot layout: the cast can
+        run inside the scatter (cast_store_kv_kernel) instead of two aten casts."""
+        return (
+            _is_cuda
+            and self.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+            and cache_k.dtype in (torch.bfloat16, torch.float16)
+            and cache_v.dtype == cache_k.dtype
+            and dcp_kv_mask is None
+            and not self.use_hnd
+            and self.kv_cache_layout != "vectorized_5d"
+            and cache_k.dim() == 3
+            and cache_v.dim() == 3
+            and cache_k.stride(-1) == 1
+            and cache_v.stride(-1) == 1
+            and (self.head_dim & (self.head_dim - 1)) == 0
+            and (self.v_head_dim & (self.v_head_dim - 1)) == 0
+        )
+
+    def _cast_store_kv(
+        self,
+        layer_idx: int,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        k_scale,
+        v_scale,
+    ) -> None:
+        n, h, _ = cache_k.shape
+        if n == 0:
+            return
+        k_buf = self.k_buffer[layer_idx].view(self.dtype)
+        v_buf = self.v_buffer[layer_idx].view(self.dtype)
+        has_scale = k_scale is not None or v_scale is not None
+        one = (
+            torch.ones(1, dtype=torch.float32, device=cache_k.device)
+            if has_scale
+            else None
+        )
+        cast_store_kv_kernel[(n, h)](
+            cache_k,
+            cache_v,
+            k_buf,
+            v_buf,
+            loc,
+            _scale_as_tensor(k_scale, cache_k) if k_scale is not None else one,
+            _scale_as_tensor(v_scale, cache_v) if v_scale is not None else one,
+            cache_k.stride(0),
+            cache_k.stride(1),
+            cache_v.stride(0),
+            cache_v.stride(1),
+            k_buf.stride(0),
+            v_buf.stride(0),
+            # size + page_size = real slots + the reserved padding slot; writes
+            # to the padding slot (0) are skipped as in store_cache
+            self.size + self.page_size,
+            H=h,
+            DK=self.head_dim,
+            DV=self.v_head_dim,
+            HAS_SCALE=has_scale,
+            num_warps=4,
+        )
 
     def _store_kv_layer(
         self,
@@ -5976,6 +6047,60 @@ def move_kv_cache_native(
     for k_cache, v_cache in zip(k_buffer, v_buffer):
         k_cache[tgt_loc_flat] = k_cache[src_loc_flat]
         v_cache[tgt_loc_flat] = v_cache[src_loc_flat]
+
+
+def _scale_as_tensor(scale, like: torch.Tensor) -> torch.Tensor:
+    if torch.is_tensor(scale):
+        return scale.reshape(-1)[:1].to(torch.float32)
+    return torch.full((1,), float(scale), dtype=torch.float32, device=like.device)
+
+
+@triton.jit
+def cast_store_kv_kernel(
+    k_ptr,
+    v_ptr,
+    k_cache_ptr,
+    v_cache_ptr,
+    loc_ptr,
+    k_scale_ptr,
+    v_scale_ptr,
+    k_stride_t,
+    k_stride_h,
+    v_stride_t,
+    v_stride_h,
+    k_cache_stride,
+    v_cache_stride,
+    size_limit,
+    H: tl.constexpr,
+    DK: tl.constexpr,
+    DV: tl.constexpr,
+    HAS_SCALE: tl.constexpr,
+):
+    """One (token, head) per program: K/V rows divided by their per-tensor scale
+    (rounded in the source dtype, as the pool's div_ did), cast to the cache
+    dtype and scattered to slot ``loc``. Slot 0 is the reserved padding slot."""
+    t = tl.program_id(0)
+    h = tl.program_id(1)
+    loc = tl.load(loc_ptr + t).to(tl.int64)
+    tl.device_assert(loc >= 0 and loc < size_limit, "set_kv_buffer: slot out of range")
+    if loc == 0:
+        return
+    dk = tl.arange(0, DK)
+    k = tl.load(k_ptr + t * k_stride_t + h * k_stride_h + dk)
+    if HAS_SCALE:
+        k = (k.to(tl.float32) / tl.load(k_scale_ptr)).to(k.dtype)
+    tl.store(
+        k_cache_ptr + loc * k_cache_stride + h * DK + dk,
+        k.to(k_cache_ptr.dtype.element_ty),
+    )
+    dv = tl.arange(0, DV)
+    v = tl.load(v_ptr + t * v_stride_t + h * v_stride_h + dv)
+    if HAS_SCALE:
+        v = (v.to(tl.float32) / tl.load(v_scale_ptr)).to(v.dtype)
+    tl.store(
+        v_cache_ptr + loc * v_cache_stride + h * DV + dv,
+        v.to(v_cache_ptr.dtype.element_ty),
+    )
 
 
 @triton.jit

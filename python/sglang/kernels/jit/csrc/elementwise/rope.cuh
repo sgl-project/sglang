@@ -26,6 +26,13 @@ struct FusedRopeParams {
   uint32_t num_tokens;
 };
 
+struct FusedRopeQOutParams {
+  FusedRopeParams base_params;
+  void* __restrict__ q_out_ptr;  // rotated q written here as QOutType; q itself is left untouched
+  int64_t q_out_stride_bytes;
+  int64_t q_out_head_stride_bytes;
+};
+
 struct FusedRopeStoreParams {
   FusedRopeParams base_params;
   void* v_ptr;
@@ -166,6 +173,124 @@ __global__ void fused_rope_kernel(const __grid_constant__ FusedRopeParams params
   PDLTriggerSecondary<kUsePDL>();
 }
 
+// Rotate one head row read as T and write it to `out` as TOut (e.g. fp8 for an
+// attention kernel that quantizes q anyway); the input row is left as is. The
+// rotated values are rounded to T before the TOut conversion, so the result is
+// what rotating in place and casting the T row afterwards would give.
+template <typename T, typename TOut, bool kIsNeox, int64_t kRopeDim, int64_t kVecSize>
+__device__ __forceinline__ void
+rope_rotate_head_out(const void* input, const void* cos_ptr, const void* sin_ptr, uint32_t lane_id, void* out) {
+  using namespace device;
+  using T2 = packed_t<T>;
+  using O2 = packed_t<TOut>;
+  using Storage = AlignedVector<T2, kVecSize>;
+  using OutStorage = AlignedVector<O2, kVecSize>;
+  if constexpr (kIsNeox) {
+    using CacheStorage = AlignedVector<fp32x2_t, kVecSize>;
+    const auto input_y = pointer::offset(input, (kRopeDim / 2) * sizeof(T));
+    const auto out_y = pointer::offset(out, (kRopeDim / 2) * sizeof(TOut));
+    const auto input_vec_x = load_as<Storage>(input, lane_id);
+    const auto input_vec_y = load_as<Storage>(input_y, lane_id);
+    const auto cos_pair = load_as<CacheStorage>(cos_ptr, lane_id);
+    const auto sin_pair = load_as<CacheStorage>(sin_ptr, lane_id);
+    OutStorage out_vec_x, out_vec_y;
+#pragma unroll
+    for (int64_t j = 0; j < kVecSize; ++j) {
+      const auto [x0, x1] = cast<fp32x2_t>(input_vec_x[j]);
+      const auto [y0, y1] = cast<fp32x2_t>(input_vec_y[j]);
+      const auto [cos_0, cos_1] = cos_pair[j];
+      const auto [sin_0, sin_1] = sin_pair[j];
+      const auto out_x0 = x0 * cos_0 - y0 * sin_0;
+      const auto out_y0 = x0 * sin_0 + y0 * cos_0;
+      const auto out_x1 = x1 * cos_1 - y1 * sin_1;
+      const auto out_y1 = x1 * sin_1 + y1 * cos_1;
+      out_vec_x[j] = cast<O2>(cast<T2, fp32x2_t>({out_x0, out_x1}));
+      out_vec_y[j] = cast<O2>(cast<T2, fp32x2_t>({out_y0, out_y1}));
+    }
+    store_as<OutStorage>(out, out_vec_x, lane_id);
+    store_as<OutStorage>(out_y, out_vec_y, lane_id);
+  } else {
+    using CacheStorage = AlignedVector<float, kVecSize>;
+    const auto input_vec = load_as<Storage>(input, lane_id);
+    const auto cos_vec = load_as<CacheStorage>(cos_ptr, lane_id);
+    const auto sin_vec = load_as<CacheStorage>(sin_ptr, lane_id);
+    OutStorage out_vec;
+#pragma unroll
+    for (int64_t j = 0; j < kVecSize; ++j) {
+      const auto [x, y] = cast<fp32x2_t>(input_vec[j]);
+      const auto cos = cos_vec[j];
+      const auto sin = sin_vec[j];
+      const auto out_x = x * cos - y * sin;
+      const auto out_y = x * sin + y * cos;
+      out_vec[j] = cast<O2>(cast<T2, fp32x2_t>({out_x, out_y}));
+    }
+    store_as<OutStorage>(out, out_vec, lane_id);
+  }
+}
+
+// fused_rope_kernel with q written to a separate QOutType buffer (k in place).
+template <
+    bool kIsNeox,
+    int64_t kRopeDim,
+    bool kUsePDL,
+    typename DType,
+    typename QDType,
+    typename QOutType,
+    typename IdType,
+    uint32_t kWorkThreads>
+__global__ void fused_rope_qout_kernel(const __grid_constant__ FusedRopeQOutParams params) {
+  using namespace device;
+
+  constexpr int64_t kCosSinStrideBytes = kRopeDim * sizeof(float);
+  constexpr int64_t kVecSize = next_pow2(kRopeDim, (2 * kWorkThreads * (1 + kIsNeox)));
+  constexpr int64_t kDimPerThread = kVecSize * 2 * (1 + kIsNeox);
+  constexpr uint32_t kLaneCount = kRopeDim / kDimPerThread;
+  static_assert(kRopeDim % kDimPerThread == 0 && kLaneCount <= kWorkThreads);
+  static_assert(sizeof(QDType) == sizeof(DType), "q/k must be same-size dtypes");
+
+  const auto& [base_params, q_out, q_out_stride_bytes, q_out_head_stride_bytes] = params;
+  const auto &[
+    q, k, cos_sin_cache_ptr, positions, // pointers
+    q_stride_bytes, k_stride_bytes, head_stride_bytes,  // strides
+    num_qo_heads, num_kv_heads, num_tokens // dimensions
+  ] = base_params;
+
+  const auto num_blks = gridDim.x;
+  constexpr auto kWorkersPerBlock = kBlockSize / kWorkThreads;
+  const auto num_workers = num_blks * kWorkersPerBlock;
+  const auto num_q_and_k_heads = num_qo_heads + num_kv_heads;
+  const auto num_works = num_q_and_k_heads * num_tokens;
+  const auto start_worker_id = (blockIdx.x * kBlockSize + threadIdx.x) / kWorkThreads;
+  const auto cos_cache_ptr = cos_sin_cache_ptr;
+  const auto sin_cache_ptr = pointer::offset(cos_sin_cache_ptr, kCosSinStrideBytes / 2);
+
+  uint32_t lane_id = threadIdx.x % kWorkThreads;
+  if constexpr (kLaneCount < kWorkThreads) {
+    if (lane_id >= kLaneCount) return;
+  }
+
+  PDLWaitPrimary<kUsePDL>();
+
+  for (auto idx = start_worker_id; idx < num_works; idx += num_workers) {
+    const int64_t token_id = idx / num_q_and_k_heads;
+    const int64_t head_id = idx % num_q_and_k_heads;
+    const auto pos = static_cast<const IdType*>(positions)[token_id];
+    const auto cos_ptr = pointer::offset(cos_cache_ptr, pos * kCosSinStrideBytes);
+    const auto sin_ptr = pointer::offset(sin_cache_ptr, pos * kCosSinStrideBytes);
+    if (head_id < num_qo_heads) {
+      const auto input = pointer::offset(q, token_id * q_stride_bytes, head_id * head_stride_bytes);
+      const auto out = pointer::offset(q_out, token_id * q_out_stride_bytes, head_id * q_out_head_stride_bytes);
+      rope_rotate_head_out<QDType, QOutType, kIsNeox, kRopeDim, kVecSize>(input, cos_ptr, sin_ptr, lane_id, out);
+    } else {
+      // k is pre-offset by -num_qo_heads heads on the host
+      const auto input = pointer::offset(k, token_id * k_stride_bytes, head_id * head_stride_bytes);
+      rope_rotate_head<DType, kIsNeox, kRopeDim, kVecSize>(input, cos_ptr, sin_ptr, lane_id);
+    }
+  }
+
+  PDLTriggerSecondary<kUsePDL>();
+}
+
 template <
     bool kIsNeox,
     int64_t kRopeDim,
@@ -243,8 +368,15 @@ __global__ void fused_rope_store_kernel(const __grid_constant__ FusedRopeStorePa
 }
 
 // QDType (default = DType) is q's dtype; k/v/caches use DType. Same-size
-// dtypes only (fp16 q with bf16 k for the fp8-KV fp16-Q feed).
-template <bool kIsNeox, int64_t kRopeDim, bool kUsePDL, typename DType, typename QDType = DType>
+// dtypes only (fp16 q with bf16 k for the fp8-KV fp16-Q feed). QOutType is the
+// dtype run_qout writes the rotated q as (any size, e.g. fp8).
+template <
+    bool kIsNeox,
+    int64_t kRopeDim,
+    bool kUsePDL,
+    typename DType,
+    typename QDType = DType,
+    typename QOutType = QDType>
 struct FusedRopeKernel {
   static constexpr uint32_t kDimPerThread = std::gcd(16 / sizeof(DType), kRopeDim);
   static constexpr uint32_t kWorkThreads = next_pow2(kRopeDim, kDimPerThread);
@@ -258,6 +390,9 @@ struct FusedRopeKernel {
   template <typename IdType>
   static constexpr auto _kernel_1 =
       fused_rope_store_kernel<kIsNeox, kRopeDim, kUsePDL, DType, QDType, IdType, kWorkThreads>;
+  template <typename IdType>
+  static constexpr auto _kernel_2 =
+      fused_rope_qout_kernel<kIsNeox, kRopeDim, kUsePDL, DType, QDType, QOutType, IdType, kWorkThreads>;
 
   static auto get_num_sm(DLDevice device) {
     static const auto kNumSM = host::runtime::get_sm_count(device.device_id);
@@ -328,6 +463,90 @@ struct FusedRopeKernel {
     static const uint32_t kOccupancyTable[2] = {
         runtime::get_blocks_per_sm(_kernel_0<int32_t>, kBlockSize),
         runtime::get_blocks_per_sm(_kernel_0<int64_t>, kBlockSize),
+    };
+    const auto max_blocks = kOccupancyTable[is_int32 ? 0 : 1] * kNumSM;
+    const auto num_works = (num_qo_heads + num_kv_heads) * num_tokens;
+    const auto needed_blocks = div_ceil(num_works, (kBlockSize / kWorkThreads));
+    const auto num_blocks = std::min(max_blocks, needed_blocks);
+    LaunchKernel(num_blocks, kBlockSize, device.unwrap())  //
+        .enable_pdl(kUsePDL)(kernel, params);
+  }
+
+  // RoPE with q written to q_out (QOutType, own strides) and k rotated in place.
+  static void run_qout(
+      const tvm::ffi::TensorView q,
+      const tvm::ffi::TensorView k,
+      const tvm::ffi::TensorView q_out,
+      const tvm::ffi::TensorView cos_sin_cache,
+      const tvm::ffi::TensorView positions) {
+    using namespace host;
+    auto N = SymbolicSize{"num_tokens"};
+    auto Q = SymbolicSize{"num_qo_heads"};
+    auto K = SymbolicSize{"num_kv_heads"};
+    auto D = SymbolicSize{"rope_dim"};
+    auto Dq = SymbolicSize{"q_stride"};
+    auto Dk = SymbolicSize{"k_stride"};
+    auto Dd = SymbolicSize{"head_stride"};
+    auto Dqo = SymbolicSize{"q_out_stride"};
+    auto Ddo = SymbolicSize{"q_out_head_stride"};
+    auto device = SymbolicDevice{};
+    auto id_type = SymbolicDType{};
+    D.set_value(kRopeDim);
+    device.set_options<kDLCUDA>();
+    TensorMatcher({N, Q, D})  // q input
+        .with_strides({Dq, Dd, 1})
+        .with_dtype<QDType>()
+        .with_device(device)
+        .verify(q);
+    TensorMatcher({N, K, D})  // k input
+        .with_strides({Dk, Dd, 1})
+        .with_dtype<DType>()
+        .with_device(device)
+        .verify(k);
+    TensorMatcher({N, Q, D})  // q output
+        .with_strides({Dqo, Ddo, 1})
+        .with_dtype<QOutType>()
+        .with_device(device)
+        .verify(q_out);
+    TensorMatcher({-1, D})  // cos_sin_cache
+        .with_dtype<float>()
+        .with_device(device)
+        .verify(cos_sin_cache);
+    TensorMatcher({N})  // positions
+        .with_dtype<int32_t, int64_t>(id_type)
+        .with_device(device)
+        .verify(positions);
+
+    const auto num_tokens = static_cast<uint32_t>(N.unwrap());
+    const auto num_qo_heads = static_cast<uint32_t>(Q.unwrap());
+    const auto num_kv_heads = static_cast<uint32_t>(K.unwrap());
+    const auto head_stride_bytes = static_cast<int64_t>(Dd.unwrap() * sizeof(DType));
+    const int64_t k_offset = static_cast<int64_t>(num_qo_heads) * head_stride_bytes;
+    const auto params = FusedRopeQOutParams{
+        .base_params =
+            FusedRopeParams{
+                .q_ptr = q.data_ptr(),
+                .k_ptr = pointer::offset(k.data_ptr(), -k_offset),
+                .cos_sin_cache_ptr = cos_sin_cache.data_ptr(),
+                .positions = positions.data_ptr(),
+                .q_stride_bytes = static_cast<int64_t>(Dq.unwrap() * sizeof(DType)),
+                .k_stride_bytes = static_cast<int64_t>(Dk.unwrap() * sizeof(DType)),
+                .head_stride_bytes = head_stride_bytes,
+                .num_qo_heads = num_qo_heads,
+                .num_kv_heads = num_kv_heads,
+                .num_tokens = num_tokens,
+            },
+        .q_out_ptr = q_out.data_ptr(),
+        .q_out_stride_bytes = static_cast<int64_t>(Dqo.unwrap() * sizeof(QOutType)),
+        .q_out_head_stride_bytes = static_cast<int64_t>(Ddo.unwrap() * sizeof(QOutType)),
+    };
+
+    const auto is_int32 = id_type.is_type<int32_t>();
+    const auto kernel = is_int32 ? _kernel_2<int32_t> : _kernel_2<int64_t>;
+    const uint32_t kNumSM = get_num_sm(device.unwrap());
+    static const uint32_t kOccupancyTable[2] = {
+        runtime::get_blocks_per_sm(_kernel_2<int32_t>, kBlockSize),
+        runtime::get_blocks_per_sm(_kernel_2<int64_t>, kBlockSize),
     };
     const auto max_blocks = kOccupancyTable[is_int32 ? 0 : 1] * kNumSM;
     const auto num_works = (num_qo_heads + num_kv_heads) * num_tokens;
