@@ -19,6 +19,7 @@ import psutil
 import zmq.asyncio
 from fastapi import Response
 
+from sglang.multimodal_gen.runtime import server_warmup
 from sglang.multimodal_gen.runtime.disaggregation.orchestrator import DiffusionServer
 from sglang.multimodal_gen.runtime.entrypoints import http_server
 from sglang.multimodal_gen.runtime.entrypoints.http_server import (
@@ -41,6 +42,61 @@ def _make_request(warmup_done) -> SimpleNamespace:
 
 
 class TestHealthWarmupGate(unittest.IsolatedAsyncioTestCase):
+    async def test_failed_warmup_aborts_startup_without_marking_ready(self):
+        """Default synthetic warmup failures must not admit inference traffic."""
+        for resolutions in (None, ["512x512"]):
+            for failure in ("response", "exception"):
+                with self.subTest(resolutions=resolutions, failure=failure):
+                    args = SimpleNamespace(
+                        warmup_resolutions=resolutions,
+                        scheduler_endpoints=["tcp://replica-0"],
+                    )
+                    warmup_done = asyncio.Event()
+                    error = "RMSNorm has no attribute eps"
+                    forward = mock.AsyncMock(
+                        return_value=SimpleNamespace(error=error),
+                        side_effect=RuntimeError(error)
+                        if failure == "exception"
+                        else None,
+                    )
+                    with (
+                        mock.patch.object(
+                            http_server,
+                            "should_run_synthetic_server_warmup",
+                            return_value=True,
+                        ),
+                        mock.patch.object(
+                            http_server, "_wait_until_http_live", mock.AsyncMock()
+                        ),
+                        mock.patch.object(
+                            http_server,
+                            "async_scheduler_client",
+                            SimpleNamespace(forward=forward),
+                        ),
+                        mock.patch.object(
+                            server_warmup,
+                            "should_include_warmup_image",
+                            return_value=False,
+                        ),
+                        mock.patch.object(
+                            server_warmup,
+                            "build_client_warmup_reqs",
+                            return_value=[object()],
+                        ),
+                        mock.patch.object(http_server.os, "kill") as kill,
+                        mock.patch.object(http_server, "logger") as logger,
+                    ):
+                        await http_server._run_server_warmup_after_http_live(
+                            args, warmup_done
+                        )
+
+                    self.assertFalse(warmup_done.is_set())
+                    kill.assert_called_once_with(
+                        os.getpid(), http_server.signal.SIGTERM
+                    )
+                    self.assertIn(error, str(logger.error.call_args.args[1]))
+                    logger.info.assert_not_called()
+
     async def test_router_exit_fails_pending_requests_without_rpc_deadline(self):
         with tempfile.TemporaryDirectory() as directory:
             endpoint = f"ipc://{directory}/frontend"

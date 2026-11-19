@@ -435,7 +435,7 @@ def _apply_warmup_frame_contract(
     Warmup requests skip ``SamplingParams._adjust``, so the cap must run the
     model frame contract itself -- without this, e.g. LongLive2's capped 17
     frames map to 5 latent frames (not divisible by its 8-frame causal block)
-    and every server warmup fails silently under fail-open. Pipelines that
+    and server warmup fails. Pipelines that
     align frames to ``num_gpus`` (rather than sharding the sequence dim) get
     the same latent alignment real requests get.
     """

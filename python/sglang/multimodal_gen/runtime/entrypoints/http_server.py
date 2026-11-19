@@ -125,7 +125,6 @@ async def _run_server_warmup_after_http_live(
         await run_async_client_warmup(
             server_args,
             async_scheduler_client.forward,
-            fail_open=server_args.warmup_resolutions is None,
         )
         logger.info("The server is fired up and ready to roll!")
         warmup_done.set()
