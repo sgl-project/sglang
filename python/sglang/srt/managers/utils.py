@@ -52,6 +52,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+# Async copy of the top logprobs to the host: one copy for the [rows, k] tensor
+# (every row asks the same k), or one batched copy for the per-row list.
 def _async_d2h_top_logprobs(
     rows: Optional[Union[torch.Tensor, List]],
 ) -> Optional[Union[torch.Tensor, List]]:
