@@ -3,6 +3,7 @@
 
 from typing import Any
 
+import torch
 from safetensors import safe_open
 
 from sglang.multimodal_gen.configs.models.dits.minimax_h3 import MiniMaxH3DiTArchConfig
@@ -111,8 +112,74 @@ def validate_minimax_h3_checkpoint_variant(
         )
 
 
+def _qkv_class_separation(block_stats: torch.Tensor, labels: torch.Tensor) -> float:
+    """Between-class / within-class variance of per-block statistics."""
+    mean = block_stats.mean()
+    between = within = 0.0
+    for cls in range(3):
+        values = block_stats[labels == cls]
+        between += values.numel() * float((values.mean() - mean) ** 2)
+        within += float(((values - values.mean()) ** 2).sum())
+    return between / max(within, 1e-12)
+
+
+def detect_minimax_h3_qkv_layout(
+    path: str,
+    num_heads: int,
+    head_dim: int,
+    min_margin: float = 10.0,
+    min_separation: float = 0.02,
+) -> str | None:
+    """Tell the fused-QKV row layout of an unquantized single-file checkpoint.
+
+    The official checkpoint interleaves rows per head (``[q_h, k_h, v_h]`` for
+    each head), while Comfy-Org exports store ``[q_all, k_all, v_all]``; both
+    layouts exist among community single files, and the tensor names and
+    shapes are the same. Q, K and V rows differ in scale, so the mean row norm
+    of each ``head_dim`` block separates cleanly into three classes under the
+    true layout only (measured on block 0: about 0.2 vs below 0.02 for both the
+    Comfy-Org BF16 export and the official transformer).
+
+    Returns ``"native"``, ``"interleaved"``, or ``None`` when the checkpoint
+    has no BF16/FP16/FP32 ``blocks.0`` QKV weight or the margin is too small.
+    """
+    mapping = get_param_names_mapping(MiniMaxH3DiTArchConfig().param_names_mapping)
+    with safe_open(path, framework="pt", device="cpu") as checkpoint:
+        key = next(
+            (
+                k
+                for k in checkpoint.keys()
+                if mapping(k)[0] == "blocks.0.attn.qkv_proj.weight"
+            ),
+            None,
+        )
+        if key is None:
+            return None
+        weight = checkpoint.get_tensor(key)
+    rows = 3 * num_heads * head_dim
+    if (
+        weight.dtype not in (torch.bfloat16, torch.float16, torch.float32)
+        or weight.dim() != 2
+        or weight.shape[0] != rows
+    ):
+        return None
+    row_norms = torch.cat(
+        [chunk.float().norm(dim=1) for chunk in weight.split(4096, dim=0)]
+    )
+    block_stats = row_norms.reshape(3 * num_heads, head_dim).mean(dim=1)
+    index = torch.arange(3 * num_heads)
+    native = _qkv_class_separation(block_stats, index // num_heads)
+    interleaved = _qkv_class_separation(block_stats, index % 3)
+    if native > min_separation and native > min_margin * interleaved:
+        return "native"
+    if interleaved > min_separation and interleaved > min_margin * native:
+        return "interleaved"
+    return None
+
+
 __all__ = [
     "comfy_quant_key_filter",
+    "detect_minimax_h3_qkv_layout",
     "inspect_minimax_h3_safetensors",
     "resolve_minimax_h3_checkpoint_quantization",
     "validate_minimax_h3_checkpoint_variant",

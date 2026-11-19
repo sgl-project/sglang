@@ -23,6 +23,7 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader imp
 from sglang.multimodal_gen.runtime.loader.gguf_weights import gguf_weights_iterator
 from sglang.multimodal_gen.runtime.loader.minimax_h3_weights import (
     comfy_quant_key_filter,
+    detect_minimax_h3_qkv_layout,
     inspect_minimax_h3_safetensors,
     resolve_minimax_h3_checkpoint_quantization,
     validate_minimax_h3_checkpoint_variant,
@@ -66,6 +67,49 @@ def _resolve_checkpoint_load_device(
     ):
         return torch.device("cpu")
     return runtime_device
+
+
+def _minimax_h3_override_qkv_layout(
+    arch_config: Any,
+    safetensors_list: list[str],
+    override_config_path: str | None,
+    checkpoint_quant_config: Any,
+) -> str | None:
+    """QKV layout for a MiniMax-H3 ``--transformer-weights-path`` override.
+
+    Quantized single files and GGUF already report their layout. An
+    unquantized single file may hold either the official per-head grouped
+    rows or the ``[q_all, k_all, v_all]`` rows of a Comfy-Org export, so its
+    layout is read from the weights. An explicit layout, a sharded override,
+    or one with its own config keeps the current behavior.
+    """
+    current = arch_config.checkpoint_qkv_layout
+    if (
+        current is not None
+        or checkpoint_quant_config is not None
+        or len(safetensors_list) != 1
+        or override_config_path is not None
+    ):
+        return current
+    detected = detect_minimax_h3_qkv_layout(
+        safetensors_list[0],
+        arch_config.num_attention_heads,
+        arch_config.attention_head_dim,
+    )
+    if detected is None:
+        logger.warning(
+            "Could not tell the QKV layout of MiniMax-H3 weights %s; assuming the "
+            "official grouped layout. Set checkpoint_qkv_layout if the output is "
+            "corrupted.",
+            safetensors_list[0],
+        )
+        return current
+    logger.info(
+        "MiniMax-H3 transformer weights %s use the %s QKV layout",
+        safetensors_list[0],
+        detected,
+    )
+    return detected
 
 
 def _minimax_h3_adaln_cache_key_filter(name: str) -> bool:
@@ -334,6 +378,14 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
                     safetensors_list,
                     dit_config.arch_config.param_names_mapping,
                     dit_config.arch_config.reverse_param_names_mapping,
+                )
+                dit_config.arch_config.checkpoint_qkv_layout = (
+                    _minimax_h3_override_qkv_layout(
+                        dit_config.arch_config,
+                        safetensors_list,
+                        transformer_override_config_path,
+                        checkpoint_quant_config,
+                    )
                 )
                 if adaln_curve_shape is not None:
                     (
