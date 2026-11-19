@@ -18,6 +18,7 @@ import logging
 import re
 from array import array
 from collections import defaultdict
+from copy import copy
 from functools import lru_cache, partial
 from typing import Callable, Iterable, List, Optional, Tuple, Union
 
@@ -54,6 +55,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.utils.common import add_prefix
@@ -1305,11 +1307,19 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         if self.language_model_only:
             self.visual = None
         else:
+            vision_quant_config = None
+            if isinstance(quant_config, ModelSlimConfig):
+                vision_quant_config = copy(quant_config)
+                # Derived models may disable the language-name mapper while
+                # retaining this vision tower and its checkpoint names.
+                vision_quant_config.apply_weight_name_mapper(
+                    Qwen3VLForConditionalGeneration.hf_to_sglang_mapper
+                )
             self.visual = Qwen3VLMoeVisionModel(
                 config.vision_config,
                 # NOTE: Qwen3-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
                 # Other quantization methods (e.g., GPTQ, AWQ) are untested and may not be supported.
-                quant_config=None,
+                quant_config=vision_quant_config,
                 norm_eps=getattr(config, "rms_norm_eps", 1e-6),
                 prefix=add_prefix("model.visual", prefix),
                 use_data_parallel=self.use_data_parallel,

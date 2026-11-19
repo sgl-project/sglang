@@ -97,8 +97,28 @@ class NPUPlatformBase(Platform):
         dtype: torch.dtype,
     ) -> str:
         if selected_backend == AttentionBackendEnum.FA:
+            from sglang.multimodal_gen.runtime.layers.attention.backends.ascend_fa import (
+                AscendFABackend,
+            )
+            from sglang.multimodal_gen.runtime.server_args import get_global_server_args
+
+            try:
+                server_args = get_global_server_args()
+            except ValueError:
+                # Standalone native FA does not require global server arguments.
+                pass
+            else:
+                AscendFABackend.prepare_for_server_args(server_args)
             logger.info("Using Ascend Flash Attention backend.")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.ascend_fa.AscendFABackend"
+
+        elif selected_backend == AttentionBackendEnum.ASCEND_SPARSE_ATTN:
+            from sglang.multimodal_gen.runtime.layers.attention.backends.ascend_sparse_attn import (  # noqa: F401
+                AscendSparseAttentionBackend,
+            )
+
+            logger.info("Using Ascend sparse attention backend")
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.ascend_sparse_attn.AscendSparseAttentionBackend"
 
         elif selected_backend == AttentionBackendEnum.LASER_ATTN:
             try:
