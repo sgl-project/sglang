@@ -77,6 +77,10 @@ def handle_moe_kernel_config(server_args: Any):
         raise ValueError(
             "The argument paged-experts-enable-disk requires --enable-paged-experts."
         )
+    if cfg.paged_experts_fused_host_copy and not cfg.enable_paged_experts:
+        raise ValueError(
+            "--paged-experts-fused-host-copy requires --enable-paged-experts."
+        )
     if cfg.paged_experts_host_memory_gb is not None:
         if not cfg.enable_paged_experts:
             raise ValueError(
