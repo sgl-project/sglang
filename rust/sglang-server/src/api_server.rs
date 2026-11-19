@@ -11,3 +11,4 @@ pub(crate) mod handlers;
 pub(crate) mod http;
 mod log;
 pub(crate) mod ollama;
+pub(crate) mod responses;

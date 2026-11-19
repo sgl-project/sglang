@@ -28,6 +28,9 @@ pub(super) use self::minimax_m3::{
 pub use self::pydantic_dump::continues_final_message;
 pub(crate) use self::pydantic_dump::pydantic_bool;
 pub(super) use self::pydantic_dump::{function_dump, split_continuation};
-pub(super) use self::qwen38::{is_qwen38, render as render_qwen38, takes_content_parts};
+pub(super) use self::qwen38::{
+    DEVELOPER_ERROR as QWEN38_DEVELOPER_ERROR, is_qwen38, render as render_qwen38,
+    takes_content_parts,
+};
 pub(super) use self::step3p5::{is_step3p5, render as render_step3p5};
 pub(super) use self::template_context::preserve_messages;

@@ -556,6 +556,13 @@ impl SamplingDefaults {
         fallback_temperature: 1.0,
         fallback_top_p: 1.0,
     };
+    /// Python's `ResponsesRequest._DEFAULT_SAMPLING_PARAMS`: 0.7 / 1.0.
+    pub(crate) const RESPONSES: SamplingDefaults = SamplingDefaults {
+        temperature: None,
+        top_p: None,
+        fallback_temperature: 0.7,
+        fallback_top_p: 1.0,
+    };
     /// The resolved model defaults (empty in `--sampling-defaults openai`
     /// mode), which slot between the user's values and the OpenAI terminals.
     pub(super) fn with_model_defaults(mut self, model: &DefaultSamplingParams) -> SamplingDefaults {
@@ -719,6 +726,7 @@ pub(crate) async fn unary_chat_response(
                             name: call.name,
                             arguments: call.arguments,
                         },
+                        custom: None,
                     })
                     .collect();
                 // `parse_chat_response`: calls turn only a stop into `tool_calls`.
@@ -1122,6 +1130,7 @@ fn deepseek_choices(
                 name: call.name,
                 arguments: Some(call.arguments),
             }),
+            custom: None,
         };
         choice(chat_delta(None, None, Some(vec![call]), None), None);
     }
@@ -1203,6 +1212,7 @@ pub(super) fn chat_logprobs(extras: Option<&ChunkExtras>) -> ChatChoiceLogprobs 
                     bytes: Some(text.as_bytes().to_vec()),
                     token: text,
                     logprob,
+                    token_id: None,
                 }
             })
             .collect();
