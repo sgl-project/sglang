@@ -683,16 +683,20 @@ class _CFGParallelModel:
                 CFGBranch("conditional", True, {"index": 1}),
             ]
         )
+        # request-owned, one per branch: a per-step slice would start empty every step
+        self._static: dict[int, StaticStreams] = {}
+
+    def _predict(self, packed: Packed, index: int) -> Tensor:
+        half = packed.num_samples // 2
+        sample = packed.slice_samples(index * half, (index + 1) * half)
+        if packed.static is not None:
+            sample.static = self._static.setdefault(index, StaticStreams())
+        return self.model(packed=sample)["image"]
 
     def __call__(self, *, packed: Packed):
-        half = packed.num_samples // 2
         predictions = run_cfg_parallel(
             self.policy,
-            lambda branch: self.model(
-                packed=packed.slice_samples(
-                    branch.kwargs["index"] * half, (branch.kwargs["index"] + 1) * half
-                )
-            )["image"],
+            lambda branch: self._predict(packed, branch.kwargs["index"]),
         )
         return {"image": torch.cat(predictions)}
 
@@ -850,7 +854,6 @@ class Flux3ImageDenoiseStage(DenoisingStage):
                 and not server_args.enable_torch_compile
                 and not server_args.enable_attention_backend_autotune
                 and not server_args.dit_layerwise_offload
-                and not server_args.enable_cfg_parallel
                 and not sequential_cfg
                 and batch.skip_softmax_params is None
                 and self.transformer.can_reuse_mode_blocks()
