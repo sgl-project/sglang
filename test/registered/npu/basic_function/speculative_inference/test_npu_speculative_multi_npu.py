@@ -16,8 +16,8 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_npu_ci(est_time=400, suite="base-b-test-4-npu-a3")
-register_npu_ci(est_time=400, suite="nightly-4-npu-a3", nightly=True)
+register_npu_ci(est_time=400, suite="extra-b-test-4-npu-a3")
+register_npu_ci(est_time=400, suite="nightly-test-4-npu-a3", nightly=True)
 
 _ASCEND_BACKEND = "ascend"
 
@@ -45,7 +45,8 @@ _COMMON_ARGS = [
     "decode",
     "--mem-fraction-static",
     "0.7",
-    "--disable-cuda-graph",
+    "--disable-decode-cuda-graph",
+    "--disable-prefill-cuda-graph",
     "--dtype",
     "bfloat16",
 ]

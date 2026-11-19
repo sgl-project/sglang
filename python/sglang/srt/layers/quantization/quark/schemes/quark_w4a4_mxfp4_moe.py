@@ -123,6 +123,27 @@ _use_triton_w4a16 = _is_consumer_rdna
 _TRITON_W4A16_NUM_WARPS = 8
 
 
+def _swizzle_mxfp4(quant_tensor, scale, num_warps):
+    """Convert packed MXFP4 weights and their scales to the triton_kernels matmul
+    layouts. triton_kernels comes from the ROCm image, not the sglang-kernel wheel."""
+    from triton_kernels.numerics import InFlexData
+    from triton_kernels.tensor import FP4, convert_layout, wrap_torch_tensor
+    from triton_kernels.tensor_details import layout
+
+    value_layout = layout.make_default_matmul_mxfp4_w_layout(mx_axis=-2)
+    scale_layout = layout.make_default_matmul_mxfp4_w_scale_layout(
+        mx_axis=-2, num_warps=num_warps
+    )
+    # transpose the tensor so that the quantization axis is on dim1
+    quant_tensor = quant_tensor.transpose(-2, -1)
+    scale = scale.transpose(-2, -1)
+    quant_tensor = convert_layout(
+        wrap_torch_tensor(quant_tensor, dtype=FP4), value_layout
+    )
+    scale = convert_layout(wrap_torch_tensor(scale), scale_layout)
+    return quant_tensor, InFlexData(), scale
+
+
 class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
     def __init__(
         self,
@@ -1166,8 +1187,6 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
 
     def _process_weights_triton_w4a16(self, layer: torch.nn.Module) -> None:
         from triton_kernels.matmul import FlexCtx, PrecisionConfig
-
-        from sglang.srt.layers.quantization.mxfp4 import _swizzle_mxfp4
 
         assert (
             self.is_checkpoint_mxfp4_serialized and self.dequantization_config is None

@@ -11,6 +11,8 @@ from pathlib import Path
 import pytest
 import requests
 
+ADMIN_API_KEY = "sk-admin-for-test"
+
 
 @pytest.fixture
 def collection_server(tmp_path):
@@ -53,6 +55,7 @@ def collection_server(tmp_path):
         "--mem-fraction-static=0.1",
         "--host=127.0.0.1",
         f"--port={port}",
+        f"--admin-api-key={ADMIN_API_KEY}",
     ]
     log_path = tmp_path / "server.log"
     with log_path.open("w") as log:
@@ -91,7 +94,12 @@ def test_baseline_collection(collection_server):
     url, output, log_path = collection_server
 
     def post(path, payload=None):
-        response = requests.post(url + path, json=payload or {}, timeout=60)
+        response = requests.post(
+            url + path,
+            json=payload or {},
+            headers={"Authorization": f"Bearer {ADMIN_API_KEY}"},
+            timeout=60,
+        )
         assert response.ok, response.text + "\n" + log_path.read_text()
 
     post("/start_profile")
