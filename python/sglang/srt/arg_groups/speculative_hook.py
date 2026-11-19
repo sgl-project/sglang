@@ -302,11 +302,10 @@ def _handle_dflash(server_args: ServerArgs) -> None:
     if current_platform.is_out_of_tree():
         is_supported = current_platform.supports_speculative_algorithm(algorithm)
     else:
-        is_supported = (
-            cfg.device.startswith("cuda")
-            or cfg.device == "npu"
-            or cfg.device == "xpu"
-            or cfg.device == "musa"
+        is_supported = cfg.device.startswith("cuda") or cfg.device in (
+            "npu",
+            "xpu",
+            "musa",
         )
     if not is_supported:
         raise ValueError(
