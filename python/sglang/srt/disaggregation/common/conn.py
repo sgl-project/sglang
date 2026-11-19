@@ -361,6 +361,11 @@ class CommonKVManager(BaseKVManager):
             get_disagg().disaggregation_max_top_logprobs_num
             != MetadataBuffers.DEFAULT_TOP_LOGPROBS_NUM
         )
+        # Decode reports this at registration: with a radix cache it reuses
+        # draft KV beyond the sliding window, so prefill must send all of it.
+        self.decode_enable_radix_cache = (
+            get_disagg().disaggregation_decode_enable_radix_cache
+        )
         self.kv_cache_dtype_str = args.kv_cache_dtype_str
         self.kv_layout = args.kv_layout
         self.dsv41_spec_layout = get_dsv41_spec_layout(args)

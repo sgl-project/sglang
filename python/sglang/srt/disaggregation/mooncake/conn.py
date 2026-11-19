@@ -83,7 +83,6 @@ from sglang.srt.observability.trace import (
 )
 from sglang.srt.runtime_context import (
     get_device,
-    get_disagg,
     get_memory,
     get_observability,
     get_parallel,
@@ -3915,7 +3914,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 *self.kv_args.kv_item_lens,
             ),
             b"1" if self.kv_args.draft_rows_dcp_collapsed else b"0",
-            b"1" if get_disagg().disaggregation_decode_enable_radix_cache else b"0",
+            b"1" if self.decode_enable_radix_cache else b"0",
         ]
 
     def build_receiver_metadata_message(

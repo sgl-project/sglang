@@ -61,6 +61,7 @@ def _manager(manager_class=CommonKVManager):
     manager.enable_staging = False
     manager.customized_info_enabled = False
     manager.exchange_aux_item_lens = False
+    manager.decode_enable_radix_cache = False
     return manager
 
 
@@ -238,6 +239,7 @@ class TestReceiverControlMessages(CustomTestCase):
                 b"",
                 struct.pack("Q", 16),
                 b"1",
+                b"0",
             ],
             "nixl": [
                 b"NixlMsgGuard",
