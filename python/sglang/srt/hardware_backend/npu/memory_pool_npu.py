@@ -1410,26 +1410,19 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             index_k.view(-1, 1, self.index_head_dim),
         )
 
-    def _chunk_copy_npu_to_cpu(
-        self, buf_of_layers, indices, uses_global_slots_per_layer
-    ):
+    def _chunk_copy_npu_to_cpu(self, buf_of_layers, indices):
         chunk_size = self.cpu_offloading_chunk_size
         out = []
-        for tensors_per_layer, uses_global_slots in zip(
-            buf_of_layers, uses_global_slots_per_layer, strict=True
-        ):  # [k_buf, v_buf]
+        for tensors_per_layer in buf_of_layers:  # [k_buf, v_buf]
             layer_chunks = []
             for i in range(0, len(indices), chunk_size):
                 ci = indices[i : i + chunk_size]
                 layer_chunks.append(
                     [
-                        t[self._copy_indices_for_buffer(ci, uses_global)].to(
+                        t[self._copy_indices_for_buffer(ci, self.is_draft_worker)].to(
                             "cpu", non_blocking=True
                         )
-                        for t, uses_global in zip(
-                            tensors_per_layer, uses_global_slots, strict=True
-                        )
-                        if t is not None
+                        for t in tensors_per_layer
                     ]
                 )
             out.append(layer_chunks)
@@ -1443,7 +1436,6 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             self.v_buffer[local_layer_id].flatten(0, 1),
         ]
         if self.dsa_kv_cache_store_fp8:
-            # Copy FP8 records as opaque bytes without decoding/requantizing.
             buffers = [
                 buf.view(torch.uint8) if buf.dtype == torch.float8_e4m3fn else buf
                 for buf in buffers
@@ -1454,17 +1446,13 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         buf_of_layers = [
             self._get_kv_cache_layer_buffers(i) for i in range(self.layer_num)
         ]
-        return self._chunk_copy_npu_to_cpu(
-            buf_of_layers,
-            indices,
-            [[self.is_draft_worker] * 2 for _ in buf_of_layers],
-        )
+        return self._chunk_copy_npu_to_cpu(buf_of_layers, indices)
 
     def _load_kv_cache_cpu_copy(self, kv_cpu, indices):
         chunk_size = self.cpu_offloading_chunk_size
-        for local_layer_id in range(self.layer_num):
+        for local_layer_id in range(self.layer_num):  # each layer
             buffers = self._get_kv_cache_layer_buffers(local_layer_id)
-            for i in range(0, len(indices), chunk_size):
+            for i in range(0, len(indices), chunk_size):  # a chunk of kv rows
                 chunk_indices = indices[i : i + chunk_size]
                 chunk = kv_cpu[local_layer_id][i // chunk_size]
                 for buffer, cpu in zip(buffers, chunk, strict=True):
@@ -1482,7 +1470,11 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         buffers = [self.index_k_buffer[slot].flatten(0, 1)]
         if self.index_k_scale_buffer is not None:
             buffers.append(self.index_k_scale_buffer[slot].flatten(0, 1))
-        if self.dsa_kv_cache_store_fp8:
+        # Get flattened view (not paged)
+        # [[num_index_pages × index_page_size, 1, index_head_dim],[num_index_pages × index_page_size, 1]]
+        if (
+            self.dsa_kv_cache_store_fp8
+        ):  # view FP8 as uint8 to avoid FP8 advanced-indexing restrictions
             buffers = [
                 buf.view(torch.uint8) if buf.dtype == torch.float8_e4m3fn else buf
                 for buf in buffers
@@ -1490,48 +1482,47 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         return buffers
 
     def _get_index_cache_cpu_copy(self, indices):
-        # only 1/index_kpool of indices are used
-        index_rows = torch.unique_consecutive(indices // self.index_kpool)
+        index_indices = torch.unique_consecutive(indices // self.index_kpool)
         chunk_size = self.cpu_offloading_chunk_size
         index_cpu = []
-        for local_layer_id in range(self.layer_num):
+        for local_layer_id in range(self.layer_num):  # each layer
             index_cpu.append([])
             buffers = self._get_index_cache_layer_buffers(local_layer_id)
             if not buffers:
                 continue
-            for i in range(0, len(index_rows), chunk_size):
-                rows = index_rows[i : i + chunk_size]
+            for i in range(0, len(index_indices), chunk_size):  # a chunk of index rows
+                rows = index_indices[i : i + chunk_size]
                 index_cpu[-1].append(
                     [buf[rows].to("cpu", non_blocking=True) for buf in buffers]
                 )
         return index_cpu
 
     def _load_index_cache_cpu_copy(self, index_cpu, indices):
-        index_rows = torch.unique_consecutive(indices // self.index_kpool)
+        index_indices = torch.unique_consecutive(indices // self.index_kpool)
         chunk_size = self.cpu_offloading_chunk_size
-        for local_layer_id in range(self.layer_num):
+        for local_layer_id in range(self.layer_num):  # each layer
             buffers = self._get_index_cache_layer_buffers(local_layer_id)
             if not buffers:
                 continue
-            for i in range(0, len(index_rows), chunk_size):
-                rows = index_rows[i : i + chunk_size]
+            for i in range(0, len(index_indices), chunk_size):
+                rows = index_indices[i : i + chunk_size]
                 chunk = index_cpu[local_layer_id][i // chunk_size]
                 for buf, saved in zip(buffers, chunk, strict=True):
                     assert saved.shape[0] == len(rows)
                     buf[rows] = saved.to(buf.device)
 
-    # Tail: list[Tensor[tail_slots, index_head_dim]]
+    # Tail: List[Tensor[req_pool_size, index_kpool + tail_extra_slots, index_head_dim]]
     def _kpool_tail_rows(self, req_pool_index):
         return [
             buf[req_pool_index] if buf.shape[0] else None
             for group in (self._compress_tail_k, self._compress_tail_score)
-            for buf in group
+            for buf in group  # each layer
         ]
 
     def _get_tail_cpu_copy(self, req_pool_index):
         return [
-            row.to("cpu").clone() if row is not None else None
-            for row in self._kpool_tail_rows(req_pool_index)
+            row.to("cpu") if row is not None else None
+            for row in self._kpool_tail_rows(req_pool_index)  # each layer
         ]
 
     def _load_tail_cpu_copy(self, tail_cpu, req_pool_index):
@@ -1539,7 +1530,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             self._kpool_tail_rows(req_pool_index), tail_cpu, strict=True
         ):
             if saved is not None:
-                buf.copy_(saved.to(buf.device))
+                buf.copy_(saved)  # H2D copy once
 
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         torch.npu.synchronize()
