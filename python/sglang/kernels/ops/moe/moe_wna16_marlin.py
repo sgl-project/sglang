@@ -52,8 +52,10 @@ class HostCopy(msgspec.Struct, frozen=True):
     memory, so that the kernel pages an expert in itself (marlin_template.h)."""
 
     weight: int  # device address of the host table of packed weights
-    scales: int  # ... of the block scales
-    global_scale: int  # ... of the NVFP4 global scales; 0 without them
+    scales: int  # device address of the host table of block scales
+    global_scale: (
+        int  # device address of the host table of NVFP4 global scales; 0 without them
+    )
     num_experts: int
     expert_slot: torch.Tensor  # [E] int32: the slot each expert is paged into
     count: torch.Tensor  # [1] int32: experts the current step pages in
@@ -96,8 +98,9 @@ def _jit_moe_wna16_marlin_host_copy_module(
     zero_inactive_output: bool = False,
     has_inactive_prefix_count: bool = False,
 ) -> Module:
-    """The kernel with the fused host copy: the same source built with SGL_MARLIN_MOE_HOST_COPY, as
-    a module of its own. The module above is built from the text that macro leaves out."""
+    """The kernel with the fused host copy: the same source built with SGL_MARLIN_MOE_HOST_COPY.
+    It is compiled as a separate module, so that the module above, used without the host copy, is
+    built only from the original code."""
     args = make_cpp_args(
         dtype,
         is_ep,
