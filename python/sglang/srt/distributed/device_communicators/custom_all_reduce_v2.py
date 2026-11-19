@@ -537,6 +537,11 @@ class CustomAllReduceV2:
         if self.disabled:
             yield
             return
+        # Build the communicator while every rank captures at startup. Graphs
+        # that route their all-reduces elsewhere (FlashInfer AllReduce fusion)
+        # never touch it, and its JIT compile would otherwise run inside the
+        # first eager all-reduce that needs it, stalling that batch for seconds.
+        self.obj
         self._in_capture = True
         try:
             yield
