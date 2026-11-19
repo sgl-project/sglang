@@ -90,6 +90,10 @@ from sglang.srt.distributed import (
 from sglang.srt.layers.layer_boundary.stage import check_stage_producers
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
+from sglang.srt.layers.moe.ep_to_tp_transform import (
+    is_load_tp_by_experts_enabled,
+    node_expert_prefetch_selection,
+)
 from sglang.srt.layers.moe.utils import (
     resolve_shared_experts_config,
 )
@@ -113,6 +117,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.model_loader.weight_utils import (
     CheckpointFilePrefetchHandle,
+    SelectedPrefetch,
     _prefetch_all_checkpoints,
     buffered_multi_thread_safetensors_weights_iterator,
     download_safetensors_index_file_from_hf,
@@ -641,8 +646,13 @@ class DefaultModelLoader(BaseModelLoader):
         resolved_source: Optional[ResolvedSource] = None,
         startup_prefetch_started: bool = False,
         startup_prefetch_active: bool = False,
+        prefetch_selection: Optional[SelectedPrefetch] = None,
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
-        """Get an iterator for the model weights based on the load format."""
+        """Get an iterator for the model weights based on the load format.
+
+        ``prefetch_selection`` limits checkpoint prefetching to the tensors this
+        node reads.
+        """
         extra_config = self.load_config.model_loader_extra_config
         use_multithread = extra_config.get("enable_multithread_load", True)
 
@@ -745,6 +755,7 @@ class DefaultModelLoader(BaseModelLoader):
                     prefetch_num_threads=prefetch_num_threads,
                     drop_cache_after_load=weight_loader_drop_cache_after_load,
                     max_inflight_bytes=extra_config.get("max_inflight_bytes"),
+                    prefetch_selection=prefetch_selection,
                 )
             else:
                 if "max_inflight_bytes" in extra_config:
@@ -758,6 +769,7 @@ class DefaultModelLoader(BaseModelLoader):
                     prefetch=start_iterator_prefetch,
                     prefetch_num_threads=prefetch_num_threads,
                     drop_cache_after_load=weight_loader_drop_cache_after_load,
+                    prefetch_selection=prefetch_selection,
                 )
 
         else:
@@ -811,7 +823,15 @@ class DefaultModelLoader(BaseModelLoader):
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
 
         primary_weights = DefaultModelLoader.Source.init_new(model_config, model)
-        yield from self._get_weights_iterator(primary_weights)
+        prefetch_selection = (
+            node_expert_prefetch_selection(model)
+            if is_load_tp_by_experts_enabled()
+            and get_model().weight_loader_prefetch_checkpoints
+            else None
+        )
+        yield from self._get_weights_iterator(
+            primary_weights, prefetch_selection=prefetch_selection
+        )
 
         secondary_weights = cast(
             Iterable[DefaultModelLoader.Source], getattr(model, "secondary_weights", ())
