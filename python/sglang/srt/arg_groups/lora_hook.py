@@ -16,10 +16,7 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef
-from sglang.srt.lora.utils import (
-    get_normalized_target_modules,
-    kv_b_lora_prefix_cache_error,
-)
+from sglang.srt.lora.utils import get_normalized_target_modules
 from sglang.srt.runtime_context import get_platform
 
 logger = logging.getLogger(__name__)
@@ -114,11 +111,6 @@ def check_lora_server_args(server_args: Any):
             )
 
     if cfg.enable_lora:
-        if cfg.enable_two_batch_overlap:
-            # TBO children are sliced from the parent ForwardBatch without a
-            # LoRA batch of their own, so the adapter segments outrun their rows.
-            raise ValueError("LoRA does not support --enable-two-batch-overlap")
-
         if cfg.lora_backend == "triton_v2" and not cfg.moe_runner_backend.startswith(
             "lora"
         ):
@@ -199,8 +191,8 @@ def check_lora_server_args(server_args: Any):
 def _lora_targets_kv_b_proj(server_args: Any) -> bool:
     """Whether the CLI LoRA targets name ``kv_b_proj``.
 
-    Adapters that only come with --lora-paths resolve their targets in
-    LoRAManager.init_lora_shapes, which re-checks there.
+    Targets that only come with --lora-paths adapters resolve at load time and
+    are not covered here.
     """
     cfg = resolving_view(server_args)
     targets = cfg.lora_target_modules
@@ -212,29 +204,33 @@ def _lora_targets_kv_b_proj(server_args: Any) -> bool:
 
 
 def check_kv_b_lora_prefix_cache(server_args: Any):
-    """Keep cached prefixes off the MHA paths when an adapter targets kv_b_proj."""
+    """Keep trtllm_mla cached prefixes on the absorbed MLA path for kv_b_proj adapters.
+
+    The MHA cached-prefix paths re-project the cached latent through kv_b_proj
+    on prefix rows while the wrapped layer runs the adapter with the batch's
+    extend-token segments; on trtllm_mla every extend with a cached prefix takes
+    that path and faults. With the chunked prefix cache disabled, trtllm_mla
+    sends those extends to the absorbed MLA path, which applies the kv_b_proj
+    delta per token. Other backends are out of this rule's scope and keep their
+    previous behaviour; KV sharding needs the chunked prefix cache.
+    """
     if not _lora_targets_kv_b_proj(server_args):
         return
     cfg = resolving_view(server_args)
+    if cfg.disable_chunked_prefix_cache or cfg.enable_kv_cache_sharding:
+        return
     prefill_backend, _ = attention_backends_of(cfg)
-    error = kv_b_lora_prefix_cache_error(
-        prefill_backend,
+    if prefill_backend != "trtllm_mla":
+        return
+    declare_resolution(
+        server_args,
+        "check_kv_b_lora_prefix_cache",
         disable_chunked_prefix_cache=True,
-        enable_kv_cache_sharding=cfg.enable_kv_cache_sharding,
-        fa4_absorbed_mla=get_platform().is_sm100_or_sm110,
     )
-    if error is not None:
-        raise ValueError(error)
-    if not cfg.disable_chunked_prefix_cache:
-        declare_resolution(
-            server_args,
-            "check_kv_b_lora_prefix_cache",
-            disable_chunked_prefix_cache=True,
-        )
-        logger.info(
-            "LoRA targets kv_b_proj: chunked prefix cache disabled so cached "
-            "prefixes take the absorbed MLA path, which applies the adapter."
-        )
+    logger.info(
+        "LoRA targets kv_b_proj: chunked prefix cache disabled so cached "
+        "prefixes take the absorbed MLA path, which applies the adapter."
+    )
 
 
 def check_lora_moe_runner_args(server_args: Any):

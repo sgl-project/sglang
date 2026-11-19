@@ -44,7 +44,6 @@ from sglang.srt.lora.utils import (
     auto_detect_lora_target_modules,
     get_normalized_target_modules,
     get_target_module_name,
-    kv_b_lora_prefix_cache_error,
     warn_if_adapter_targets_embeddings,
 )
 from sglang.srt.managers.io_struct import LoRAUpdateOutput
@@ -52,12 +51,10 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.runtime_context import (
     LoRABatchLayout,
-    attention_backends,
     get_exec,
     get_forward,
     get_lora,
     get_parallel,
-    get_platform,
     get_schedule,
     get_spec,
 )
@@ -952,20 +949,6 @@ class LoRAManager:
                 "incompatible with DSA indexer Q/K fusion. Set "
                 "SGLANG_DISABLE_DSA_INDEXER_FUSION=1 to disable fusion and use indexer LoRA."
             )
-
-        # The attention modules snapshot the chunked-prefix flag when the model
-        # is built, so a kv_b_proj target that only surfaced here (inferred from
-        # the adapters) can no longer be made safe: fail with the fix spelled out.
-        if "kv_b_proj" in self.target_modules:
-            prefill_backend, _ = attention_backends()
-            error = kv_b_lora_prefix_cache_error(
-                prefill_backend,
-                disable_chunked_prefix_cache=get_schedule().disable_chunked_prefix_cache,
-                enable_kv_cache_sharding=get_parallel().enable_kv_cache_sharding,
-                fa4_absorbed_mla=get_platform().is_sm100_or_sm110,
-            )
-            if error is not None:
-                raise ValueError(error)
 
         if max_lora_rank is not None:
             self.max_lora_rank = max_lora_rank
