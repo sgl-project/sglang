@@ -1315,10 +1315,11 @@ def _prefetch_all_checkpoints(
     # across nodes, but page cache is not shared across nodes.
     if torch.distributed.is_initialized():
         world_group = get_parallel().world_group
-        # LOCAL_SIZE is unset on GPU; ranks are numbered node by node.
+        # Only the CPU backend sets LOCAL_SIZE; otherwise use ranks per node.
         local_world_size = world_group.local_size or (
             get_parallel().launch_world_size // get_parallel().nnodes
         )
+        # Ranks are numbered node by node, so this is the rank's index on its node.
         local_rank = world_group.rank % local_world_size
     else:
         local_rank = 0
