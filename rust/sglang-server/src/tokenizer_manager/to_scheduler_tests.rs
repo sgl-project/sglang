@@ -1052,6 +1052,38 @@ fn admitted_request_keeps_registration() {
     );
 }
 
+/// A request's dispatch finish time is stamped once the scheduler channel
+/// takes it, and never for one a full channel refuses.
+#[test]
+fn dispatch_finish_time_is_stamped_when_the_channel_takes_the_request() {
+    let (mut intake, _detok_rx, consumer, _tm_tx, _mm_rx) = make_intake();
+    let dispatch_finish_time = |req: &Request| match &req.kind {
+        RequestKind::Generate(g) => g.dispatch_finish_time.clone(),
+        other => panic!("not a generate request: {other:?}"),
+    };
+    let before = std::time::SystemTime::now();
+    // The test channel holds 16; the 17th request is refused.
+    let stamps: Vec<_> = (0..17)
+        .map(|id| {
+            let req = generate_req(id, SamplingParams::default());
+            let stamp = dispatch_finish_time(&req);
+            assert_eq!(stamp.get(), None, "unstamped before dispatch");
+            intake.drive(req);
+            stamp
+        })
+        .collect();
+    assert_eq!(consumer.drain(32).len(), 16);
+    for stamp in &stamps[..16] {
+        let stamped = stamp.get().expect("dispatched");
+        assert!(before <= stamped && stamped <= std::time::SystemTime::now());
+    }
+    assert_eq!(
+        stamps[16].get(),
+        None,
+        "a refused request was never dispatched"
+    );
+}
+
 /// A pool return in `Failed` state (failed encode) is rejected via the same
 /// path and deregistered, not leaked.
 #[test]

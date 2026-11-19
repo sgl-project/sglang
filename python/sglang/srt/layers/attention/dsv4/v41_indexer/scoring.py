@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Generator, Iterator, List, Optional, Tuple
 import msgspec
 import torch
 
+from sglang.kernels.ops.attention.dsv4.candidate_blocks import amax8_varlen
 from sglang.kernels.ops.attention.dsv4.candidate_scores import (
     can_use_candidate_scores,
     candidate_scores,
@@ -17,6 +18,7 @@ from sglang.kernels.ops.attention.dsv4.candidate_scores import (
 from sglang.kernels.ops.attention.dsv4.candidate_table import CANDIDATE_BLOCK_SIZE
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
     finish_paged_indexer_topk,
+    finish_prefill_indexer_topk,
     flat_selection_slots,
     fp4_index_logits_decode,
     fp4_index_logits_paged,
@@ -340,6 +342,23 @@ def topk_ragged(
     topk_transform_ragged_v2(logits, lens, out_offsets=offsets, out_indices=out)
 
 
+def select_prefill_block_ids(
+    logits: torch.Tensor,
+    lens: torch.Tensor,
+    nblocks: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    offsets: torch.Tensor,
+) -> None:
+    """Select size-8 blocks by their maximum score, keeping the newest block."""
+    width = (logits.shape[1] + CANDIDATE_BLOCK_SIZE - 1) // CANDIDATE_BLOCK_SIZE
+    keys = logits.new_empty(
+        (logits.shape[0], (width + 3) // 4 * 4), dtype=torch.float32
+    )
+    amax8_varlen(logits, lens, out=keys)
+    topk_ragged(keys, nblocks, out=out, offsets=offsets)
+
+
 def dense_prefill_topk(
     data: DeepGEMMPrefillData,
     kv: Tuple[torch.Tensor, torch.Tensor],
@@ -533,6 +552,22 @@ def write_prefill(
     idx: torch.Tensor,
 ) -> None:
     k, lc = request.k, request.lc
+    if (
+        envs.SGLANG_OPT_DSV41_TRITON_PREFILL_SELECTION.get()
+        and idx.is_cuda
+        and get_platform().is_sm90
+        and k <= 4096
+    ):
+        finish_prefill_indexer_topk(
+            idx,
+            request.slots,
+            chunk.tok,
+            chunk.lens,
+            inputs.out_raw_indices,
+            inputs.out_page_indices,
+            lc,
+        )
+        return
     idx = idx.sort(dim=-1).values
     reach = idx < chunk.lens[:, None]
     if inputs.out_page_indices is not None:
@@ -574,7 +609,7 @@ def decode_scores(
     ratio = inputs.compress_ratio
     indexer = inputs.indexer
     req, pos = inputs.req_rows, inputs.positions
-    paged = get_platform().is_sm90
+    paged = get_platform().is_sm90 or get_platform().is_sm120
     bs = req.shape[0]
     assert pos.shape[0] == bs, (
         f"decode expects one token per request, {pos.shape=} {bs=}"
@@ -608,6 +643,12 @@ def decode_scores(
             lmax,
             ratio,
             candidate_mask,
+            rows_per_request=(
+                metadata.rows_per_request
+                if inputs.is_verify
+                and envs.SGLANG_OPT_DSV41_VERIFY_INDEXER_BF16_K_REUSE.get()
+                else 1
+            ),
         )
         return PagedDecodeScores(
             bs=bs,
