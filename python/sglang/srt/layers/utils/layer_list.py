@@ -16,12 +16,25 @@
 from __future__ import annotations
 
 import functools
-from typing import Any, Callable, Dict, Optional, Protocol, Sequence, Tuple
+from contextlib import closing
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    Optional,
+    Protocol,
+    Sequence,
+    Tuple,
+)
 
 import torch
 
 from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.runtime_context import get_parallel
+
+if TYPE_CHECKING:
+    from sglang.srt.distributed.vpp_layout import VPPLayout
 
 
 class LayerFn(Protocol):
@@ -142,3 +155,75 @@ def _no_stage_facts(layer_fn: LayerFn) -> None:
         "without a shared declaration function: give make_layers its "
         "stage_facts, the stages a layer declares without building it"
     )
+
+
+def make_vpp_layers(
+    layout: VPPLayout,
+    physical_rank: int,
+    layer_fn: LayerFn,
+    prefix: str = "",
+    return_tuple: bool = False,
+    offloader_kwargs: Optional[Dict[str, Any]] = None,
+    final_read: Optional[Any] = None,
+    stage_facts: Optional[Callable[[int], Sequence[Any]]] = None,
+) -> torch.nn.ModuleList:
+    """Build local VPP layers with a separate stack per logical stage."""
+    from sglang.srt.layers.layer_boundary.factories import (
+        check_declared_stages,
+        layer_stack,
+    )
+    from sglang.srt.layers.offloader import get_offloader
+    from sglang.srt.layers.utils import PPMissingLayer
+
+    local_stages = layout.stages_for_rank(physical_rank)
+    owned_layer_ids = layout.layer_ids_for_rank(physical_rank)
+
+    def neighbour(idx):
+        if stage_facts is not None:
+            return functools.partial(stage_facts, idx)
+        return functools.partial(_no_stage_facts, layer_fn)
+
+    def build_layers():
+        for stage in local_stages:
+            # Keep each logical stage's construction boundary independent.
+            with layer_stack(
+                previous_layers=[
+                    neighbour(idx) for idx in reversed(range(stage.start_layer))
+                ],
+                next_layers=[
+                    neighbour(idx)
+                    for idx in range(stage.end_layer, layout.num_hidden_layers)
+                ],
+                final_read=final_read,
+            ) as stack:
+                for idx in range(stage.start_layer, stage.end_layer):
+                    appended = len(stack.appends)
+                    layer = layer_fn(
+                        idx=idx,
+                        prefix=add_prefix(idx, prefix),
+                    )
+                    if stage_facts is not None and layout.logical_size > 1:
+                        check_declared_stages(
+                            stack,
+                            appended,
+                            stage_facts(idx),
+                            f"layer {idx}",
+                        )
+                    yield layer
+
+    # Some offloaders require one wrapping call for all local layers.
+    # Closing also restores the active stack if wrapping raises an error.
+    with closing(build_layers()) as layers:
+        wrapped = get_offloader().wrap_modules(
+            layers,
+            **(offloader_kwargs or {}),
+        )
+
+    modules = [
+        PPMissingLayer(return_tuple=return_tuple)
+        for _ in range(layout.num_hidden_layers)
+    ]
+    for layer_id, layer in zip(owned_layer_ids, wrapped, strict=True):
+        modules[layer_id] = layer
+
+    return torch.nn.ModuleList(modules)
