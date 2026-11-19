@@ -13,12 +13,14 @@ import signal
 import stat
 import threading
 import time
+from collections import Counter
 from typing import List, Optional
 
 import torch
 import torch.nn as nn
 
 from sglang.srt.configs.load_config import LoadConfig
+from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.model_loader.loader import (
     BaseModelLoader,
     _initialize_model,
@@ -85,6 +87,45 @@ def _daemon_alive(pid: int) -> bool:
 # nothing unmaps them on garbage collection, and the driver releases this
 # process's mappings and address reservation when it exits.
 _LOADED_MODEL_TRANSPORTS: List[WeightCacheTransportBackend] = []
+
+
+def privatize_ipc_parameter(model: nn.Module, parameter: nn.Parameter) -> None:
+    """Copy a shared parameter before a startup write, preserving its identity.
+
+    Call before any runtime consumer retains the storage address. Separate
+    tensor views cannot follow a storage replacement and are rejected.
+    """
+    imported = getattr(model, "_ipc_imported_tensors", ())
+    if not imported:
+        return
+
+    storage = parameter.untyped_storage()
+    if not any(t.untyped_storage()._cdata == storage._cdata for t in imported):
+        return
+
+    if not parameter.is_contiguous() or parameter.nbytes != storage.nbytes():
+        raise RuntimeError("Expected a contiguous IPC parameter covering its storage")
+
+    alias = _find_direct_storage_alias(model, parameter)
+    if alias is not None:
+        raise RuntimeError(f"Cannot privatize IPC parameter shared with {alias}")
+
+    parameter.data = parameter.detach().clone()
+
+
+def _find_direct_storage_alias(model: nn.Module, parameter: nn.Parameter) -> str | None:
+    storage_id = parameter.untyped_storage()._cdata
+    for path, module in model.named_modules():
+        for attrs in (module._parameters, module._buffers, vars(module)):
+            for name, tensor in attrs.items():
+                if (
+                    tensor is not parameter
+                    and isinstance(tensor, torch.Tensor)
+                    and tensor.layout == torch.strided
+                    and tensor.untyped_storage()._cdata == storage_id
+                ):
+                    return f"{path}.{name}" if path else name
+    return None
 
 
 class WeightCacheModelLoader(BaseModelLoader):
@@ -359,7 +400,11 @@ class WeightCacheModelLoader(BaseModelLoader):
             # requires_grad=False: the memory is shared with the daemon and must
             # be treated as read-only, and SGLang is inference-only, so autograd
             # must never write into it.
-            new_param = nn.Parameter(tensor, requires_grad=False)
+            new_param = (
+                tensor
+                if isinstance(tensor, nn.Parameter)
+                else nn.Parameter(tensor, requires_grad=False)
+            )
             setattr(obj, leaf_name, new_param)
         else:
             # register_buffer raises KeyError if the name already exists as a
@@ -415,6 +460,13 @@ class WeightCacheModelLoader(BaseModelLoader):
         }
         existing_buffers = {name: buf for name, buf in model.named_buffers()}
         existing_names = set(existing_params) | set(existing_buffers)
+        tied_ids = {
+            key
+            for key, count in Counter(map(id, existing_params.values())).items()
+            if count > 1
+        }
+        attached_ties = {}
+        tied_slots = {}
 
         imported_refs = []
         imported_count = 0
@@ -447,7 +499,32 @@ class WeightCacheModelLoader(BaseModelLoader):
                     continue
 
             # Replace or register the tensor in the model
-            self._set_module_tensor(model, name, imported_tensor, is_param=is_param)
+            tensor = imported_tensor
+            original_id = id(existing_params.get(name))
+            if original_id in tied_ids:
+                # A single module slot cannot represent different storage
+                # views, even if state_dict names reach it via different paths.
+                key = (
+                    original_id,
+                    tensor.untyped_storage()._cdata,
+                    tensor.storage_offset(),
+                    tensor.stride(),
+                )
+                module_path, _, leaf = name.rpartition(".")
+                slot = (id(model.get_submodule(module_path)), leaf)
+                first_name, first_key, first_is_param = tied_slots.setdefault(
+                    slot, (name, key, is_param)
+                )
+                if (key, is_param) != (first_key, first_is_param):
+                    raise RuntimeError(
+                        f"[WeightCacheModelLoader] Conflicting entries for the same parameter "
+                        f"slot: {first_name!r} and {name!r}"
+                    )
+                if is_param:
+                    if key not in attached_ties:
+                        attached_ties[key] = nn.Parameter(tensor, requires_grad=False)
+                    tensor = attached_ties[key]
+            self._set_module_tensor(model, name, tensor, is_param=is_param)
             imported_refs.append(imported_tensor)
             imported_count += 1
 
@@ -500,6 +577,13 @@ class WeightCacheModelLoader(BaseModelLoader):
                 f"  buffers: {still_on_meta_buffers[:10]}"
                 f"{'...' if len(still_on_meta_buffers) > 10 else ''}"
             )
+
+        # The daemon exported the post-load scale tensors. Recover their
+        # process-local scalar copies without preparing the shared scales again.
+        for module in model.modules():
+            if isinstance(getattr(module, "quant_method", None), BaseKVCacheMethod):
+                module.k_scale_float = module.k_scale.item()
+                module.v_scale_float = module.v_scale.item()
 
         map_elapsed = time.perf_counter() - map_tic
 

@@ -395,7 +395,8 @@ class Model(msgspec.Struct):
             "persist across restarts, so this alone does not speed up restart "
             "(the first start is slower). For fast recovery, run the standalone "
             "daemon (python -m sglang.srt.weight_cache.daemon) and connect with "
-            "'client'. 'client': connect to existing daemon and load via IPC.",
+            "'client'. 'client': connect to existing daemon and load via IPC. "
+            "With EAGLE, EAGLE3, DSPARK, DFLASH, STANDALONE or NGRAM, only the target uses the weight cache.",
             choices=["off", "daemon", "client"],
         ),
     ] = "off"

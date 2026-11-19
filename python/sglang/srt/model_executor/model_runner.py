@@ -1397,6 +1397,7 @@ class ModelRunner:
             weight_cache_mode=get_model().weight_cache_mode,
             weight_cache_socket=get_model().weight_cache_socket,
             weight_cache_transport=get_model().weight_cache_transport,
+            is_draft_worker=self.is_draft_worker,
             load_group=self.load_group,
         )
 

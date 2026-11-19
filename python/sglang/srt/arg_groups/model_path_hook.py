@@ -275,15 +275,20 @@ def handle_load_format(server_args: Any):
             "that selects IPC loading automatically."
         )
 
-    # Speculative decoding loads an extra draft model whose weights the
-    # daemon does not export, so refuse the combination up front instead of
-    # failing deep inside draft-worker load (draft-model daemon TBD).
-    if cfg.weight_cache_mode != "off" and cfg.speculative_algorithm is not None:
+    # These paths use the cache only for the target runner.
+    if cfg.weight_cache_mode != "off" and cfg.speculative_algorithm not in (
+        None,
+        "EAGLE",
+        "EAGLE3",
+        "DSPARK",
+        "DFLASH",
+        "STANDALONE",
+        "NGRAM",
+    ):
         raise ValueError(
-            "--weight-cache-mode is not supported together with speculative "
-            "decoding (--speculative-algorithm): the weight cache daemon does "
-            "not export the draft model's weights. Disable one of them "
-            "(--weight-cache-mode off) for this configuration."
+            "--weight-cache-mode supports speculative decoding with EAGLE, EAGLE3, "
+            f"DSPARK, DFLASH, STANDALONE and NGRAM only (got {cfg.speculative_algorithm}). Set "
+            "--weight-cache-mode off to use this speculative algorithm."
         )
 
 

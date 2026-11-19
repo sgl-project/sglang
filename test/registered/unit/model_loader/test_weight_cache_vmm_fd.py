@@ -350,6 +350,8 @@ class TestVmmExportAndImport(CustomTestCase):
     fetch_state exchange over a socketpair, then the engine-side import."""
 
     def test_round_trip(self):
+        from sglang.srt.configs.load_config import LoadConfig, LoadFormat
+
         torch.manual_seed(0)
         model = _TinyModel()
         model_ref = weakref.ref(model)
@@ -462,6 +464,31 @@ class TestVmmExportAndImport(CustomTestCase):
         self.assertEqual(
             len(set(storage_ptr.values())), len(storage_ptr) - 1
         )  # only the tie shares
+
+        loader = ipc_loader.WeightCacheModelLoader(
+            LoadConfig(load_format=LoadFormat.IPC_CACHE)
+        )
+        loader._transport_backend = client
+        with mock.patch.object(
+            ipc_loader, "_initialize_model", side_effect=lambda *_: _TinyModel()
+        ):
+            attached = loader._load_zero_copy_mode(
+                SimpleNamespace(dtype=torch.float32), None, response["entries"], None
+            )
+        self.addCleanup(ipc_loader._LOADED_MODEL_TRANSPORTS.remove, client)
+        self.assertIs(attached.embed.weight, attached.head.weight)
+        self.assertEqual(
+            attached.embed.weight.data_ptr(), imported["embed.weight"].data_ptr()
+        )
+        ipc_loader.privatize_ipc_parameter(attached, attached.embed.weight)
+        attached.embed.weight[1].fill_(4)
+        self.assertIs(attached.embed.weight, attached.head.weight)
+        self.assertNotEqual(
+            attached.embed.weight.data_ptr(), imported["embed.weight"].data_ptr()
+        )
+        torch.testing.assert_close(
+            imported["head.weight"], expected["head.weight"], rtol=0, atol=0
+        )
 
         client.close()
         backend.close()
