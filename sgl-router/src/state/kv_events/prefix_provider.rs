@@ -380,6 +380,7 @@ mod tests {
     use super::*;
     use crate::state::kv_events::tree::KvWorkerId;
     use crate::state::kv_events::wire::BlockStored;
+    use crate::tokenizer::MEDIA_TAG_MARK;
     use std::time::Duration;
 
     const BLOCK: u32 = 2;
@@ -456,13 +457,39 @@ mod tests {
         provider
     }
 
-    /// `pre` text blocks, then a block opening with an image (the two tokens
-    /// after it stand in for its identity tag), then `post` blocks.
+    /// `pre` text blocks, then a block opening with a tagged image (the marker
+    /// and the tokens after it stand in for its identity tag), then `post` blocks.
     fn media_prompt(pre: usize, post: usize) -> Vec<u32> {
         let mut prompt = tokens(pre);
-        prompt.push(IMAGE);
-        prompt.extend((0..(BLOCK as usize - 1) + post * BLOCK as usize).map(|i| 50_000 + i as u32));
+        prompt.extend([IMAGE, MEDIA_TAG_MARK]);
+        prompt.extend((0..(BLOCK as usize - 2) + post * BLOCK as usize).map(|i| 50_000 + i as u32));
         prompt
+    }
+
+    /// An image placeholder a caller's `input_ids` or a `/generate` prompt
+    /// spells out carries no identity tag, so two such prompts with the same
+    /// text and different images would share one placement: media affinity
+    /// leaves them to route by their text.
+    #[test]
+    fn an_untagged_placeholder_is_not_a_media_prompt() {
+        let provider = media_provider_with_pending(0);
+        let ns = CacheNamespace::default();
+        assert!(provider.tree.is_media_prompt(&media_prompt(4, 2)));
+        let mut first = tokens(4);
+        first.extend([IMAGE, 50_000, 50_001, 50_002, 50_003]);
+        assert!(!provider.tree.is_media_prompt(&first));
+        let signal = lookup(&provider, &first);
+        assert!(signal.media_hashes.is_none());
+        provider.record_route(&signal, "http://b");
+        provider.record_rank(&first, &ns, "http://b", 1);
+        let mut other = tokens(4);
+        other.extend([IMAGE, 60_000, 60_001, 60_002, 60_003]);
+        let signal = lookup(&provider, &other);
+        assert!(matches!(signal.outcome, PrefixOutcome::Empty));
+        assert!(provider.rank_depths(&other, &ns, "http://b").is_empty());
+        assert!(provider.rank_depths(&first, &ns, "http://b").is_empty());
+        assert_eq!(provider.tree.media().hits(), 0);
+        assert_eq!(provider.tree.media_tiebreaks(), 0);
     }
 
     #[test]
@@ -604,7 +631,7 @@ mod tests {
     /// placement and the conversation key must survive that.
     #[test]
     fn placement_survives_an_image_in_a_partial_block() {
-        const WIDE: u32 = 4;
+        const WIDE: u32 = 8;
         let tree = Arc::new(HashTree::new());
         let oracle = BlockSizeOracle::new();
         oracle.try_set(WIDE).expect("block size");
@@ -615,10 +642,10 @@ mod tests {
         let ns = CacheNamespace::default();
         // Four text blocks, then the image and its tag open a fifth block that
         // the turn does not fill.
-        let mut turn1: Vec<u32> = (1..=16).collect();
-        turn1.extend([IMAGE, 50_000, 50_001]);
+        let mut turn1: Vec<u32> = (1..=32).collect();
+        turn1.extend([IMAGE, MEDIA_TAG_MARK, 50_000, 50_001]);
         let mut turn2 = turn1.clone();
-        turn2.extend(50_002..50_011);
+        turn2.extend(50_002..50_022);
         let hashes1 = provider.block_hashes(&turn1, &ns).unwrap();
         let hashes2 = provider.block_hashes(&turn2, &ns).unwrap();
         assert_ne!(hashes1[4], hashes2[4], "the image block's own hash moves");
@@ -635,7 +662,7 @@ mod tests {
             let event = BlockStored {
                 block_hashes: hashes1[..4].to_vec(),
                 parent_block_hash: None,
-                token_ids: turn1[..16].to_vec(),
+                token_ids: turn1[..32].to_vec(),
                 block_size: WIDE,
                 lora_id: None,
                 lora_name: None,
@@ -686,7 +713,15 @@ mod tests {
         provider.record_route(&signal, "http://b");
         provider.record_rank(&first, &ns, "http://b", 1);
         let mut other = first[..4 * BLOCK as usize].to_vec();
-        other.extend([IMAGE, 60_000, 60_001, 60_002, 60_003, 60_004, 60_005]);
+        other.extend([
+            IMAGE,
+            MEDIA_TAG_MARK,
+            60_000,
+            60_001,
+            60_002,
+            60_003,
+            60_004,
+        ]);
         let signal = lookup(&provider, &other);
         assert!(
             matches!(signal.outcome, PrefixOutcome::Empty),
@@ -725,7 +760,7 @@ mod tests {
             .store_event(&KvWorkerId::new("http://a".to_owned(), 0), &event);
         // Rank 1 remembers another chat that shares only that text (another image).
         let mut other = prompt[..4 * BLOCK as usize].to_vec();
-        other.extend([IMAGE, 60_000, 60_001, 60_002, 60_003]);
+        other.extend([IMAGE, MEDIA_TAG_MARK, 60_000, 60_001, 60_002]);
         provider.record_rank(&other, &ns, "http://a", 1);
         assert_eq!(provider.rank_depths(&prompt, &ns, "http://a"), [(0, 4)]);
         assert_eq!(

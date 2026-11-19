@@ -79,8 +79,15 @@ pub struct TokenizerRegistry {
 pub(crate) const MEDIA_TOKENS: &[&str] = &["<｜deepseek_image｜>"];
 
 /// Ids that follow each image placeholder in a chat's routing ids (see
-/// [`tag_images`]).
-pub const MEDIA_TAG_LEN: usize = 2;
+/// [`tag_images`]): [`MEDIA_TAG_MARK`], then two from the image's identity.
+pub const MEDIA_TAG_LEN: usize = 3;
+
+/// The id that opens an image's identity tag. No tokenizer vocabulary reaches
+/// it, so it marks ids that `tag_images` produced: a placeholder a caller's
+/// `input_ids` or a `/generate` prompt spells out is not followed by it, and
+/// media affinity leaves such prompts alone (see
+/// [`crate::state::kv_events::HashTree::first_media_position`]).
+pub const MEDIA_TAG_MARK: u32 = u32::MAX;
 
 /// Routing-only ids for a chat with images: after each placeholder in `ids`,
 /// [`MEDIA_TAG_LEN`] ids derived from the image's source (`images`, in
@@ -107,14 +114,17 @@ pub(crate) fn tag_images(ids: Vec<u32>, placeholders: &[u32], images: &[String])
     tagged
 }
 
-/// An image's identity tag: the leading bytes of its source's SHA-256, as a
-/// URL or data URL is the identity the engine's own image hash follows.
+/// An image's identity tag: [`MEDIA_TAG_MARK`], then the leading bytes of its
+/// source's SHA-256, as a URL or data URL is the identity the engine's own
+/// image hash follows.
 fn media_tag(source: &str) -> [u32; MEDIA_TAG_LEN] {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(source.as_bytes());
-    std::array::from_fn(|i| {
-        u32::from_be_bytes(digest[i * 4..i * 4 + 4].try_into().expect("4 bytes"))
-    })
+    let mut tag = [MEDIA_TAG_MARK; MEDIA_TAG_LEN];
+    for (i, word) in tag[1..].iter_mut().enumerate() {
+        *word = u32::from_be_bytes(digest[i * 4..i * 4 + 4].try_into().expect("4 bytes"));
+    }
+    tag
 }
 
 /// Ids of [`MEDIA_TOKENS`] declared by a `tokenizer.json`.
@@ -722,11 +732,13 @@ mod tests {
         assert_eq!(other.len(), ids.len());
         assert_eq!(other[..=at], ids[..=at]);
         let tag = at + 1..at + 1 + MEDIA_TAG_LEN;
+        assert_eq!(ids[tag.start], MEDIA_TAG_MARK, "the tag is marked");
         assert_ne!(other[tag.clone()], ids[tag.clone()]);
         assert_eq!(other[tag.end..], ids[tag.end..]);
         // Token counts see the prompt as the engine renders it: no tag.
         let counted = formatter.encode(&tokenizer, &image_chat).unwrap();
         assert_eq!(counted.len() + MEDIA_TAG_LEN, ids.len());
+        assert!(!counted.contains(&MEDIA_TAG_MARK));
         assert_eq!(counted[..=at], ids[..=at]);
         assert_eq!(counted[at + 1..], ids[tag.end..]);
         assert_eq!(counted, formatter.encode(&tokenizer, &other_chat).unwrap());
@@ -752,6 +764,10 @@ mod tests {
         );
         assert_eq!(tagged.last(), Some(&3));
         assert_ne!(media_tag("a"), media_tag("b"));
+        // Every tag opens with the marker and differs by its image.
+        assert_eq!(media_tag("a")[0], MEDIA_TAG_MARK);
+        assert_eq!(media_tag("b")[0], MEDIA_TAG_MARK);
+        assert_ne!(media_tag("a")[1..], media_tag("b")[1..]);
         // A placeholder past the images, or no known placeholder, tags nothing.
         assert_eq!(
             tag_images(vec![9, 9], &[9], &images[..1]).len(),

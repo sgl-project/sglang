@@ -117,6 +117,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use tracing::{debug, error};
 
 use super::pending::PendingPrefixes;
+use crate::tokenizer::MEDIA_TAG_MARK;
 
 mod snapshot;
 
@@ -1260,17 +1261,24 @@ impl HashTree {
     }
 
     /// Position of the prompt's first image placeholder when media affinity is
-    /// enabled; `None` for a text prompt or with media affinity off.
+    /// enabled and the placeholder carries its identity tag, which only a chat's
+    /// routing ids do (see [`crate::tokenizer::tag_images`]). `None` for a text
+    /// prompt, with media affinity off, or for ids that were never tagged: a
+    /// caller's `input_ids`, or a `/generate` or completions prompt spelling the
+    /// placeholder out. Those carry no image identity, so a placement keyed from
+    /// them would stand for every image behind the same text; they route by
+    /// their text, as without media affinity.
     pub fn first_media_position(&self, tokens: &[u32]) -> Option<usize> {
         if !self.media.is_enabled() {
             return None;
         }
         let ids = self.media_tokens.get().filter(|ids| !ids.is_empty())?;
-        tokens.iter().position(|t| ids.contains(t))
+        let position = tokens.iter().position(|t| ids.contains(t))?;
+        (tokens.get(position + 1) == Some(&MEDIA_TAG_MARK)).then_some(position)
     }
 
     /// Whether media affinity applies to this prompt: it is enabled and the
-    /// prompt carries an image placeholder.
+    /// prompt carries a tagged image placeholder.
     pub fn is_media_prompt(&self, tokens: &[u32]) -> bool {
         self.first_media_position(tokens).is_some()
     }
