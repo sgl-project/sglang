@@ -53,12 +53,12 @@ MAMBA2 = {
 }
 
 
-def seal(root):
+def seal(root, kernel=KERNEL, chunks=1):
     definition = {
         "name": "chunk_scan",
         "op_type": "mamba",
         "tags": [f"fi_api:{SITE}"],
-        "axes": {"K": {"type": "const", "value": 1}},
+        "axes": {"K": {"type": "const", "value": chunks}},
         "inputs": {name: {"shape": list(axes)} for name, axes in SHAPES.items()},
         "outputs": {},
     }
@@ -73,11 +73,11 @@ def seal(root):
             "setup_entry_point": "kernel.py::setup",
             "destination_passing_style": True,
         },
-        "sources": [{"path": "kernel.py", "content": KERNEL}],
+        "sources": [{"path": "kernel.py", "content": kernel}],
     }
     files = {"definition.json": definition, "solution.json": solution}
     files = {name: json.dumps(doc).encode() for name, doc in files.items()}
-    files["kernel.py"] = KERNEL.encode()
+    files["kernel.py"] = kernel.encode()
     digests = {name: hashlib.sha256(data).hexdigest() for name, data in files.items()}
     listing = "".join(f"{name}\0{d}\n" for name, d in sorted(digests.items()))
     bundle_sha256 = hashlib.sha256(listing.encode()).hexdigest()
@@ -93,11 +93,13 @@ def seal(root):
 @pytest.fixture
 def package(tmp_path, monkeypatch):
     root = tmp_path / "packages"
-    digest = seal(root)
+    # A package that fails to import, selected first under the same names: its
+    # Definition (K == 3) must not be routed to the next package's kernel.
+    digests = [seal(root, "raise RuntimeError\n", 3), seal(root)]
     monkeypatch.setenv("FLASHINFER_KERNEL_PACKAGE_ROOT", str(root))
-    monkeypatch.setenv("FLASHINFER_KERNEL_PACKAGES", digest)
+    monkeypatch.setenv("FLASHINFER_KERNEL_PACKAGES", ",".join(digests))
     monkeypatch.setenv("KERNEL_PACKAGE_PROBE", str(tmp_path / "probe.json"))
-    return root, digest
+    return root, digests
 
 
 def test_package_serves_chunk_scan_in_scheduler(package, tmp_path):
@@ -127,8 +129,9 @@ def test_package_serves_chunk_scan_in_scheduler(package, tmp_path):
 
 
 def test_setup_package_refuses_memory_saver(package):
-    root, digest = package
-    packages.load_packages(root, [digest])  # FlashInfer was imported before the env
+    root, digests = package
+    # FlashInfer was imported before the env; load as its import does.
+    packages.load_packages(root, digests, strict=False)
     rc.reset_context()
     rc.publish(ServerArgs(model_path="dummy", enable_memory_saver=True), role="test")
     try:

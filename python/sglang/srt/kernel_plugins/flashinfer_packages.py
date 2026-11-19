@@ -52,6 +52,22 @@ def activate(exec_config: Any) -> None:
         logger.warning("FLASHINFER_KERNEL_PACKAGES needs FlashInfer >= 0.7.5; ignored.")
         return
 
+    root = Path(os.environ.get(packages.ROOT_ENV) or packages.DEFAULT_PACKAGE_ROOT)
+    sites: dict[str, str] = {}
+    for digest in filter(None, map(str.strip, selection.split(","))):
+        try:
+            package = packages.verify_package(root, digest)
+            tags = (package.definition or {}).get("tags") or ()
+            site = next((t[7:] for t in tags if t.startswith("fi_api:")), "")
+            key = package.operation, str(package.solution.get("name"))
+            if preloaded_entry(*key) is not None:
+                sites[digest] = site
+        except Exception:
+            continue  # FlashInfer warned about it at import
+    # FlashInfer's own checks again, installing nothing: a package it refused at
+    # import stays out, so a Definition only ever runs its own package's kernel.
+    loaded = packages.load_packages(root, list(sites), strict=False, enable=False)
+
     offload = exec_config.offload
     features = {
         "--enable-eplb": exec_config.moe.enable_eplb,
@@ -63,22 +79,16 @@ def activate(exec_config: Any) -> None:
     if error := weight_rewrite_error(*(name for name, on in features.items() if on)):
         raise ValueError(error)
 
-    root = Path(os.environ.get(packages.ROOT_ENV) or packages.DEFAULT_PACKAGE_ROOT)
-    routed = set()
-    for digest in filter(None, map(str.strip, selection.split(","))):
-        try:
-            package = packages.verify_package(root, digest)
-            run = preloaded_entry(package.operation, str(package.solution.get("name")))
-            tags = (package.definition or {}).get("tags") or ()
-            site = next((t[7:] for t in tags if t.startswith("fi_api:")), "")
-        except Exception:
-            continue  # FlashInfer refused it at import, with a warning
-        if run is None or package.operation in routed:
-            continue
-        routed.add(package.operation)
-        _routes.setdefault(site, []).append((package.definition, run))
+    for package in loaded.packages:
+        name = str(loaded.solutions[package.operation].name)
+        site = sites[package.digest]
+        _routes.setdefault(site, []).append(
+            (package.definition, loaded.callables[package.operation, name])
+        )
         logger.info(
-            "FlashInfer kernel package %s: %s.", digest[:12], site or package.operation
+            "FlashInfer kernel package %s: %s.",
+            package.digest[:12],
+            site or package.operation,
         )
 
 
