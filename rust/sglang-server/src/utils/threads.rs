@@ -9,8 +9,7 @@
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use rustix::thread::{CpuSet, sched_setaffinity};
-
+use super::platform::{self, CpuSet};
 use super::runtime::Runnable;
 use crate::message::config::RuntimeConfig;
 
@@ -26,25 +25,7 @@ use crate::message::config::RuntimeConfig;
 /// idles, and every stream it serves stalls with it. On a shared set the
 /// kernel wakes it on any idle core.
 pub(super) fn frontend_cpu_set(cfg: &RuntimeConfig) -> Option<CpuSet> {
-    let cores = cfg.rust_server_args.cores.as_deref().unwrap_or_default();
-    let mut set = CpuSet::new();
-    for &core in cores {
-        if core < CpuSet::MAX_CPU {
-            set.set(core);
-        } else {
-            tracing::warn!(core, "frontend core id out of range; ignored");
-        }
-    }
-    (set.count() > 0).then_some(set)
-}
-
-/// Pin the calling thread to `cpus` if a set was given (no-op otherwise).
-pub(super) fn pin_current(cpus: Option<&CpuSet>) {
-    if let Some(set) = cpus
-        && let Err(error) = sched_setaffinity(None, set)
-    {
-        tracing::warn!(%error, "could not pin a frontend thread to the frontend cores");
-    }
+    platform::cpu_set(cfg.rust_server_args.cores.as_deref().unwrap_or_default())
 }
 
 /// Spawn a single [`Runnable`] stage on a named thread, optionally pinned.
@@ -58,7 +39,7 @@ fn spawn_stage(
     let handle = std::thread::Builder::new()
         .name(name.to_string())
         .spawn(move || {
-            pin_current(cpus.as_ref());
+            platform::pin_current(cpus.as_ref());
             stage.run();
         })
         .expect("spawn stage");

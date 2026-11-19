@@ -23,7 +23,7 @@ use crate::HttpLayer;
 use crate::message::config::RuntimeConfig;
 use crate::message::detok::DetokMsg;
 
-use super::threads::{frontend_cpu_set, join_all_with_timeout, pin_current, spawn_pool};
+use super::threads::{frontend_cpu_set, join_all_with_timeout, spawn_pool};
 use crate::tokenizer_manager::channel::{
     FromSchedulerRx, FromSchedulerTx, ToSchedulerRx, ToSchedulerTx, from_scheduler, to_scheduler,
 };
@@ -270,7 +270,7 @@ impl Runtime {
         if let Some(notify) = notify {
             let _ = self.drain_notify.set(notify);
         }
-        let (read, write) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)?;
+        let (read, write) = super::platform::pipe_cloexec()?;
         // Python requires a non-blocking wakeup fd.
         rustix::fs::fcntl_setfl(&write, rustix::fs::OFlags::NONBLOCK)?;
         let core = self.core.clone();
@@ -317,19 +317,10 @@ impl Drop for Runtime {
     }
 }
 
-/// Send the drain-ended datagram to the abstract Unix socket `name`; best
-/// effort, since the launching process falls back to scheduler exits.
+/// Send the drain-ended datagram to the Unix socket `name`; best effort,
+/// since the launching process falls back to scheduler exits.
 fn notify_drained(name: &str) {
-    use std::os::linux::net::SocketAddrExt;
-    use std::os::unix::net::{SocketAddr, UnixDatagram};
-
-    // Non-blocking: a full receive queue (EAGAIN) loses only this report.
-    let sent = SocketAddr::from_abstract_name(name).and_then(|addr| {
-        let socket = UnixDatagram::unbound()?;
-        socket.set_nonblocking(true)?;
-        socket.send_to_addr(b"drained", &addr)
-    });
-    if let Err(error) = sent {
+    if let Err(error) = super::platform::send_notify_datagram(name, b"drained") {
         tracing::warn!(%error, name, "could not report the drain's end");
     }
 }
@@ -582,12 +573,12 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
             .spawn(move || {
                 // This thread runs `block_on` (the listeners' accept loops);
                 // the runtime's worker and blocking threads pin on start.
-                pin_current(cpus.as_ref());
+                super::platform::pin_current(cpus.as_ref());
                 let mut builder = tokio::runtime::Builder::new_multi_thread();
                 builder
                     .worker_threads(cfg.rust_server_args.http_api_worker_num)
                     .enable_all()
-                    .on_thread_start(move || pin_current(cpus.as_ref()));
+                    .on_thread_start(move || super::platform::pin_current(cpus.as_ref()));
                 let rt = builder.build().expect("build api runtime");
                 rt.block_on(async move {
                     let http = api_server::http::app::serve(
@@ -974,15 +965,13 @@ mod tests {
     /// drain signal's byte counts, as a wakeup fd carries every caught signal.
     /// Once the listeners have closed, the scheduler's parked wait ends and
     /// the launching process gets its datagram.
+    #[cfg(target_os = "linux")]
     #[test]
     fn drain_signal_fd_begins_the_drain_and_reports_its_end() {
         use std::io::Write;
-        use std::os::linux::net::SocketAddrExt;
-        use std::os::unix::net::{SocketAddr, UnixDatagram};
 
         let name = format!("sglang-drain-test-{}", std::process::id());
-        let launcher =
-            UnixDatagram::bind_addr(&SocketAddr::from_abstract_name(&name).unwrap()).unwrap();
+        let launcher = crate::utils::platform::bind_notify_socket(&name).unwrap();
         launcher
             .set_read_timeout(Some(std::time::Duration::from_secs(5)))
             .unwrap();
@@ -1024,14 +1013,11 @@ mod tests {
     /// the drain completes, and the launching process hears of it, only on
     /// the release. A release before any drain began is ignored, and the
     /// hold cannot be taken once a drain began.
+    #[cfg(target_os = "linux")]
     #[test]
     fn held_drain_end_waits_for_the_release() {
-        use std::os::linux::net::SocketAddrExt;
-        use std::os::unix::net::{SocketAddr, UnixDatagram};
-
         let name = format!("sglang-drain-hold-test-{}", std::process::id());
-        let launcher =
-            UnixDatagram::bind_addr(&SocketAddr::from_abstract_name(&name).unwrap()).unwrap();
+        let launcher = crate::utils::platform::bind_notify_socket(&name).unwrap();
         launcher.set_nonblocking(true).unwrap();
         let (addr, _) = free_loopback_addrs();
         let rt = start(test_config(addr, None), None).expect("start runtime");
