@@ -5,6 +5,11 @@ from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
 
+from sglang.srt.mem_cache.allocator.page_identity import (
+    PageFree,
+    cpu_page_identity,
+    with_page_span,
+)
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     IncLockRefResult,
@@ -165,6 +170,10 @@ class FullComponent(TreeComponent):
         if child_cd.value is not None:
             new_parent.component_data[ct].value = child_cd.value[:split_len].clone()
             child_cd.value = child_cd.value[split_len:].clone()
+            if child_cd.page_span is not None:
+                span = child_cd.page_span
+                new_parent.component_data[ct].page_span = span.slice(0, split_len)
+                child_cd.page_span = span.slice(split_len, span.token_length)
         if child_cd.host_value is not None:
             new_parent.component_data[ct].host_value = child_cd.host_value[
                 :split_len
@@ -185,7 +194,10 @@ class FullComponent(TreeComponent):
 
         # Device layer
         if EvictLayer.DEVICE in target and cd.value is not None:
-            device_frees[self.component_type].append(cd.value)
+            device_frees[self.component_type].append(
+                with_page_span(cd.value, cd.page_span)
+            )
+            cd.page_span = None
             # Progress toward an eviction request and the ledger move are
             # both in allocator units (see reclaimable_value_len).
             freed = self.reclaimable_value_len(node)
@@ -499,13 +511,15 @@ class FullComponent(TreeComponent):
         if phase == LinkerTransferPhase.OFFLOAD:
             if node is None or not node.hash_value:
                 return None
-            value = node.component_data[self.component_type].value
+            cd = node.component_data[self.component_type]
+            value = cd.value
             if value is None:
                 return None
             return PoolTransfer(
                 name=PoolName.KV,
                 device_indices=value.to(torch.int64),
                 keys=list(node.hash_value),
+                page_span=cd.page_span,
             )
 
         if not keys:
@@ -522,11 +536,16 @@ class FullComponent(TreeComponent):
             slots = storage.take_units(sub_pool, num_tokens)
             if slots is None:
                 return None
+            # SlotGuard records the CPU page span of the slots it just handed out.
+            identity = cpu_page_identity(self.cache.token_to_kv_pool_allocator)
 
             return PoolTransfer(
                 name=PoolName.KV,
                 device_indices=slots.to(torch.int64),
                 keys=list(keys),
+                page_span=(
+                    identity.last_allocation_spans[0] if identity is not None else None
+                ),
             )
 
     def update_external_linker_load(
@@ -539,7 +558,12 @@ class FullComponent(TreeComponent):
     ) -> Optional[PoolTransfer]:
         if phase == ExternalLinkerLoadPhase.ABORT:
             storage, sub_pool = self.storage_and_sub_pool()
-            storage.release_taken(sub_pool, transfer.device_indices)
+            kwargs = (
+                {"page_span": transfer.page_span}
+                if transfer.page_span is not None
+                else {}
+            )
+            storage.release_taken(sub_pool, transfer.device_indices, **kwargs)
             return None
         return transfer
 
@@ -556,8 +580,12 @@ class FullComponent(TreeComponent):
         elif isinstance(action, FreeComponentDeviceSlot):
             storage, sub_pool = self.storage_and_sub_pool()
             for indices in action.indices:
+                kwargs = {}
+                if isinstance(indices, PageFree):
+                    kwargs["page_span"] = indices.page_span
+                    indices = indices.indices
                 # tree values are page-aligned copies of a kv row: page-exact segments
-                storage.free_units(sub_pool, indices)
+                storage.free_units(sub_pool, indices, **kwargs)
         else:
             raise AssertionError(
                 f"FullComponent: unhandled ComponentAction {type(action).__name__}"

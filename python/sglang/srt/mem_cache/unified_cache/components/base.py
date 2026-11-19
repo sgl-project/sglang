@@ -107,6 +107,8 @@ class ComponentData:
     host_lock_ref: int = 0
     session_ref: int = 0
     session_ids: Optional[set[str]] = None
+    # Physical page identities mirror value slicing; never read from the GPU.
+    page_span: Any = None
 
 
 class _AbsentComponentData(ComponentData):

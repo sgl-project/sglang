@@ -27,6 +27,7 @@ from sglang.srt.layers.cp.utils import (
     get_cp_sharded_padded_allocation_size,
     get_cp_sharded_padded_cache_transfer_indices,
 )
+from sglang.srt.mem_cache.allocator.page_identity import PageSpan, cpu_page_identity
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.capacity import capacity_decision
 from sglang.srt.mem_cache.common import (
@@ -83,6 +84,15 @@ def write_cache_indices(
     # This writer's one caller is `alloc_for_extend`, so the prefill half
     # decides; the fallback below pays several `.item()` syncs per request.
     prefill_backend, _ = attention_backends()
+    # Guarded alloc_for_extend records the CPU row spans itself, after the aux
+    # allocation succeeds. The Triton writer bypasses ReqToTokenPool.write.
+    # DecodeReqToTokenPool is not a ReqToTokenPool and has no CPU page rows.
+    page_write_kwargs = (
+        {"cpu_page_writes": ()}
+        if isinstance(req_to_token_pool, ReqToTokenPool)
+        and req_to_token_pool.cpu_page_rows is not None
+        else {}
+    )
     if support_triton(prefill_backend):
         prefix_pointers = torch.tensor(
             [t.data_ptr() for t in prefix_tensors],
@@ -111,10 +121,12 @@ def write_cache_indices(
             req_to_token_pool.write(
                 (req_idx, slice(0, prefix_len)),
                 prefix_tensors[i],
+                **page_write_kwargs,
             )
             req_to_token_pool.write(
                 (req_idx, slice(prefix_len, seq_len)),
                 out_cache_loc[pt : pt + extend_len],
+                **page_write_kwargs,
             )
             pt += extend_len
 
@@ -225,7 +237,11 @@ def alloc_paged_token_slots_extend(
     extend_num_tokens: int,
     req_pool_indices: Optional[torch.Tensor] = None,
     batch=None,
+    prefix_page_spans=None,
 ):
+    guarded_kwargs = (
+        {} if prefix_page_spans is None else {"prefix_page_spans": prefix_page_spans}
+    )
     out_cache_loc = _storage(tree_cache).take_extend(
         rows=req_pool_indices,
         prefix_lens=prefix_lens,
@@ -237,6 +253,7 @@ def alloc_paged_token_slots_extend(
         make_room=_room_in(tree_cache),
         tree_cache=tree_cache,
         batch=batch,
+        **guarded_kwargs,
     )
 
     if out_cache_loc is None:
@@ -360,6 +377,22 @@ def _prefix_kv_indices(batch: ScheduleBatch, req: Req) -> torch.Tensor:
     return batch.tree_cache.prefix_device_indices(req)
 
 
+def _prefix_kv_page_spans(batch):
+    identity = cpu_page_identity(batch.tree_cache.token_to_kv_pool_allocator)
+    if identity is None:
+        return None
+    spans = []
+    for req, length in zip(batch.reqs, batch.prefix_lens):
+        if not length:
+            span = PageSpan((), identity.page_size, 0, 0)
+        elif req.kv.holds_kv:
+            span = identity.page_rows.get(req.kv.req_pool_idx, 0, length)
+        else:
+            span = batch.tree_cache.prefix_cpu_page_span(req)
+        spans.append(span)
+    return tuple(spans)
+
+
 def alloc_for_extend(
     batch: ScheduleBatch,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -374,6 +407,10 @@ def alloc_for_extend(
     batch.maybe_evict_swa()
 
     prefix_tensors = [_prefix_kv_indices(batch, r) for r in batch.reqs]
+    prefix_page_spans = _prefix_kv_page_spans(batch)
+    identity = cpu_page_identity(batch.tree_cache.token_to_kv_pool_allocator)
+    if identity is not None and batch.model_config.is_encoder_decoder:
+        raise ValueError("SlotGuard v1 does not support encoder-decoder KV rows")
 
     reuse_kv = None
     if batch.is_dllm():
@@ -481,6 +518,7 @@ def alloc_for_extend(
             extend_num_tokens=alloc_extend_num_tokens,
             req_pool_indices=req_pool_indices_device,
             batch=batch,
+            prefix_page_spans=prefix_page_spans,
         )
 
     # Write to req_to_token_pool
@@ -521,6 +559,15 @@ def alloc_for_extend(
                 )
             offset += local_count
         out_cache_loc = torch.cat(outputs) if outputs else out_cache_loc.new_empty((0,))
+    if identity is not None:
+        # Rows are recorded only once the aux allocation below succeeds.
+        new_page_refs = identity.last_allocation_refs
+        row_spans = tuple(
+            PageSpan.concat((prefix, extension))
+            for prefix, extension in zip(
+                prefix_page_spans, identity.last_allocation_spans
+            )
+        )
     write_cache_indices(
         out_cache_loc,
         req_pool_indices_device,
@@ -540,10 +587,16 @@ def alloc_for_extend(
             target_seq_lens_cpu=batch.seq_lens_cpu,
         )
     except Exception:
-        if is_cp_sharded_padded():
-            out_cache_loc = physical_out_cache_loc
-        storage.free_tokens(out_cache_loc)
+        if identity is not None:
+            identity.free_recent_allocation(new_page_refs)
+        else:
+            if is_cp_sharded_padded():
+                out_cache_loc = physical_out_cache_loc
+            storage.free_tokens(out_cache_loc)
         raise
+    if identity is not None:
+        for row, span in zip(req_pool_indices, row_spans):
+            identity.page_rows.set(row, span)
 
     # DSV4-NPU hook: no-op on non-DSV4 paths.
     if _is_npu:
@@ -653,6 +706,19 @@ def alloc_paged_token_slots_decode(
     req_to_token_write: Optional[tuple] = None,
 ) -> torch.Tensor:
     """Allocate paged KV cache for decode batch."""
+    identity = cpu_page_identity(tree_cache.token_to_kv_pool_allocator)
+    guarded_kwargs = {}
+    if identity is not None:
+        if batch is None or token_per_req != 1:
+            raise ValueError(
+                "guarded decode requires one-token CPU request-row metadata"
+            )
+        starts = seq_lens_cpu.tolist()
+        rows = batch.req_pool_indices_cpu.tolist()
+        guarded_kwargs["prefix_last_page_ids"] = tuple(
+            identity.page_rows.last_page(row, end - 1) if end > 1 else None
+            for row, end in zip(rows, starts)
+        )
     out_cache_loc = _storage(tree_cache).take_decode(
         rows=req_pool_indices,
         seq_lens=seq_lens,
@@ -662,6 +728,7 @@ def alloc_paged_token_slots_decode(
         req_to_token_write=req_to_token_write,
         tree_cache=tree_cache,
         batch=batch,
+        **guarded_kwargs,
     )
 
     if out_cache_loc is None:
@@ -686,6 +753,11 @@ def alloc_for_decode_default(batch: ScheduleBatch, token_per_req: int) -> torch.
         out_cache_loc: allocated cache locations
     """
 
+    identity = cpu_page_identity(batch.tree_cache.token_to_kv_pool_allocator)
+    # CPU rows use decoder positions; encoder-decoder device rows add encoder_lens.
+    if identity is not None and batch.model_config.is_encoder_decoder:
+        raise ValueError("SlotGuard v1 does not support encoder-decoder KV rows")
+
     batch.maybe_evict_swa()
 
     seq_lens_gpu = batch.seq_lens
@@ -697,8 +769,10 @@ def alloc_for_decode_default(batch: ScheduleBatch, token_per_req: int) -> torch.
         out_cache_loc = alloc_token_slots(batch.tree_cache, bs * token_per_req)
     else:
         # Paged allocation
+        # The fused write skips ReqToTokenPool.write, so it cannot record page ids.
         fused_write = (
-            token_per_req == 1
+            identity is None
+            and token_per_req == 1
             and not batch.model_config.is_encoder_decoder
             and type(batch.req_to_token_pool).write is ReqToTokenPool.write
             and batch.tree_cache.token_to_kv_pool_allocator.supports_fused_decode_write
@@ -733,8 +807,23 @@ def alloc_for_decode_default(batch: ScheduleBatch, token_per_req: int) -> torch.
         else:
             locs = seq_lens_gpu.clone()
 
+        page_write_kwargs = {}
+        if identity is not None:
+            new_page_refs = identity.last_allocation_refs
+            cpu_page_writes = tuple(
+                zip(
+                    batch.req_pool_indices_cpu.tolist(),
+                    batch.seq_lens_cpu.tolist(),
+                    identity.last_allocation_spans,
+                )
+            )
+            # Validated now, recorded only once the aux allocation below succeeds.
+            identity.page_rows.check_writes(cpu_page_writes)
+            page_write_kwargs["cpu_page_writes"] = ()
         batch.req_to_token_pool.write(
-            (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
+            (batch.req_pool_indices, locs),
+            out_cache_loc.to(torch.int32),
+            **page_write_kwargs,
         )
 
     # DSV4-NPU hook: no-op on non-DSV4 paths.
@@ -752,8 +841,13 @@ def alloc_for_decode_default(batch: ScheduleBatch, token_per_req: int) -> torch.
             target_seq_lens_cpu=batch.seq_lens_cpu + token_per_req,
         )
     except Exception:
-        _storage(batch.tree_cache).free_tokens(out_cache_loc)
+        if identity is None:
+            _storage(batch.tree_cache).free_tokens(out_cache_loc)
+        else:
+            identity.free_recent_allocation(new_page_refs)
         raise
+    if identity is not None:
+        batch.req_to_token_pool.write_cpu_page_spans(cpu_page_writes)
 
     for req in batch.reqs:
         req.kv.allocate_decode(token_per_req)

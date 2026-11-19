@@ -9,6 +9,7 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.mem_cache.allocator.page_identity import PageSpan
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.components.base import (
@@ -50,6 +51,7 @@ class TestComponentSplitFieldCoverage(unittest.TestCase):
         ComponentType.FULL: {
             "value": "divide",
             "host_value": "divide",
+            "page_span": "divide",
             "lock_ref": "copy",
             "host_lock_ref": "copy",
             "session_ref": "copy",
@@ -59,6 +61,7 @@ class TestComponentSplitFieldCoverage(unittest.TestCase):
         ComponentType.SWA: {
             "value": "divide",
             "host_value": "divide",
+            "page_span": "reset",
             "lock_ref": "copy",
             "host_lock_ref": "copy",
             "session_ref": "copy",
@@ -70,6 +73,7 @@ class TestComponentSplitFieldCoverage(unittest.TestCase):
         ComponentType.MAMBA: {
             "value": "reset",
             "host_value": "reset",
+            "page_span": "reset",
             "lock_ref": "reset",
             "host_lock_ref": "reset",
             "session_ref": "reset",
@@ -119,6 +123,10 @@ class TestComponentSplitFieldCoverage(unittest.TestCase):
         cd.session_ref = 4
         cd.session_ids = None
         cd.metadata = {"uuid": 7, "host_uuid": 9, "unrelated": "keep"}
+        if component_type == ComponentType.FULL:
+            cd.page_span = PageSpan(
+                tuple(range(1, self.CHILD_LEN + 1)), 1, 0, self.CHILD_LEN
+            )
         return node
 
     def _split(self, component_type):
@@ -164,6 +172,14 @@ class TestComponentSplitFieldCoverage(unittest.TestCase):
                         )
                     elif rule == "divide":
                         self.assertIsNotNone(got, f"{component_type.name}.{name}")
+                        if name == "page_span":
+                            span = getattr(before, name)
+                            self.assertEqual(got, span.slice(0, self.SPLIT_LEN))
+                            self.assertEqual(
+                                getattr(child_cd, name),
+                                span.slice(self.SPLIT_LEN, self.CHILD_LEN),
+                            )
+                            continue
                         self.assertTrue(
                             torch.equal(got, getattr(before, name)[: self.SPLIT_LEN])
                         )

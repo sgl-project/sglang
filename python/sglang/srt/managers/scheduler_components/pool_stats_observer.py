@@ -97,6 +97,10 @@ class PoolStats:
     hisparse_host_tokens: Optional[int] = None
     hisparse_host_token_usage: Optional[float] = None
 
+    # Physically occupied after the tree/request relinquishes local ownership.
+    # These pages are neither free nor tree-evictable; capacity stays unchanged.
+    full_retired_size: int = 0
+
     def window(self, name: str) -> Optional[WindowPoolStats]:
         return next((w for w in self.windows if w.name == name), None)
 
@@ -132,6 +136,8 @@ class PoolStats:
             parts.append(f"mamba usage: {self.mamba_usage:.2f}")
         if not parts:
             parts.append(f"token usage: {self.full_token_usage:.2f}")
+        if self.full_retired_size:
+            parts.append(f"retired full tokens: {self.full_retired_size}")
         return parts
 
     def get_decode_usage_msg_parts(self) -> List[str]:
@@ -167,6 +173,8 @@ class PoolStats:
             parts.append(
                 f"#token: {self.full_num_used}, token usage: {self.full_token_usage:.2f}"
             )
+        if self.full_retired_size:
+            parts.append(f"#retired full tokens: {self.full_retired_size}")
         return parts
 
     def update_scheduler_stats(self, stats: SchedulerStats) -> None:
@@ -282,6 +290,7 @@ class SchedulerPoolStatsObserver:
             full_available_size=available_size,
             full_evictable_size=evictable_size,
             full_capacity=full.capacity,
+            full_retired_size=self.token_to_kv_pool_allocator.retired_size(),
         )
 
     def _get_hisparse_token_info(self, pool_stats: PoolStats) -> PoolStats:

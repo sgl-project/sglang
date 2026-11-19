@@ -29,6 +29,7 @@ import torch
 
 from sglang.srt.disaggregation.kv_events import StorageMedium
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.allocator.page_identity import with_page_span
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     DecLockRefResult,
@@ -1467,6 +1468,14 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 node,
                 state.value[:prefix_len],
                 session_id=state.params.session_id,
+                page_span=(
+                    state.params.page_span.slice(
+                        state.total_prefix_length,
+                        state.total_prefix_length + prefix_len,
+                    )
+                    if state.params.page_span is not None
+                    else None
+                ),
             )
             state.result.record_adopted_range(
                 BASE_COMPONENT_TYPE,
@@ -1537,7 +1546,16 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                     FreeDeviceKVFullOnly([dup[:swa_already_freed]])
                 )
             if swa_already_freed < dup.numel():
-                state.pending_actions.append(FreeDeviceKV([dup[swa_already_freed:]]))
+                span = (
+                    state.params.page_span.slice(
+                        abs_start + swa_already_freed, abs_start + dup.numel()
+                    )
+                    if state.params.page_span is not None
+                    else None
+                )
+                state.pending_actions.append(
+                    FreeDeviceKV([with_page_span(dup[swa_already_freed:], span)])
+                )
         self._finish_insert_walk_node(state, node, prefix_len)
 
     def _finish_insert_walk_node(
@@ -1574,6 +1592,14 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 priority=state.priority,
                 session_id=state.params.session_id,
                 rotation_base=state.params.rotation_base,
+                page_span=(
+                    state.params.page_span.slice(
+                        state.total_prefix_length,
+                        state.total_prefix_length + len(state.key),
+                    )
+                    if state.params.page_span is not None
+                    else None
+                ),
             )
             state.is_new_leaf = True
         else:
@@ -1717,6 +1743,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         priority: int = 0,
         session_id: Optional[str] = None,
         rotation_base: Optional[int] = None,
+        page_span=None,
     ) -> UnifiedTreeNode:
         new_node = self._new_node(priority=priority)
         new_node.parent = parent
@@ -1729,6 +1756,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # on a root path carrying the same base.
         new_node.rotation_base = rotation_base
         new_node.component_data[BASE_COMPONENT_TYPE].value = value.clone()
+        new_node.component_data[BASE_COMPONENT_TYPE].page_span = page_span
         parent.children[key.child_key(self.page_size)] = new_node
         self.component_evictable_size_[BASE_COMPONENT_TYPE] += self.components_by_type[
             BASE_COMPONENT_TYPE
@@ -1746,6 +1774,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         node: UnifiedTreeNode,
         fresh_value: torch.Tensor,
         session_id: Optional[str] = None,
+        page_span=None,
     ) -> None:
         """Restore an evicted node's Full device value from fresh KV indices
         during insert."""
@@ -1753,6 +1782,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         cd = node.component_data[ct]
         assert cd.value is None
         cd.value = fresh_value.clone()
+        cd.page_span = page_span
         n = self.components_by_type[ct].reclaimable_value_len(node)
         if cd.lock_ref > 0:
             self.component_protected_size_[ct] += n

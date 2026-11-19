@@ -35,6 +35,11 @@ from sglang.srt.managers.scheduler_components.shm_tag_exchange import (
     fold_u64,
     get_shm_exchange,
 )
+from sglang.srt.mem_cache.allocator.page_identity import (
+    PageFree,
+    PageSpan,
+    cpu_page_identity,
+)
 from sglang.srt.mem_cache.allocator.page_interleave import (
     page_interleave_shard_size,
 )
@@ -240,6 +245,9 @@ class UnifiedRadixCache(BasePrefixCache):
         if is_cp_sharded_padded():
             self.logical_page_size *= get_cp_strategy().cp_size
         self.disable = params.disable
+        identity = cpu_page_identity(params.token_to_kv_pool_allocator)
+        if identity is not None:
+            self.req_to_token_pool.attach_cpu_page_identity(identity.page_rows)
 
         if params.enable_metrics:
             self.init_metrics_collector()
@@ -500,6 +508,9 @@ class UnifiedRadixCache(BasePrefixCache):
         self.linker = UnifiedCacheLinkerWrapper(self, cache_linker)
 
     def reset(self) -> None:
+        identity = cpu_page_identity(self.token_to_kv_pool_allocator)
+        if identity is not None:
+            identity.assert_reset_safe()
         if self.linker is not None:
             self.linker.reset()
         self._reset_full()
@@ -508,6 +519,9 @@ class UnifiedRadixCache(BasePrefixCache):
         """Full reset: destroy entire tree and all state."""
         # In-flight restores still read their host slots; finish them first.
         self._discard_restore_backups()
+        identity = cpu_page_identity(self.token_to_kv_pool_allocator)
+        if identity is not None:
+            identity.assert_reset_safe()
         self.tree_core.reset()
         self.session_refs.reset()
 
@@ -549,6 +563,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def init_hicache(self, server_args: ServerArgs, params: CacheInitParams) -> None:
         """Initialize HiCache infrastructure."""
+        if cpu_page_identity(self.token_to_kv_pool_allocator) is not None:
+            raise ValueError("SlotGuard v1 does not support HiCache L2/L3")
         self.host_memory_mode = get_memory().hicache_host_memory_mode
         if self.host_memory_mode == "buffer_only":
             supported = {ComponentType.FULL, ComponentType.MAMBA, *self.window_slots()}
@@ -773,6 +789,13 @@ class UnifiedRadixCache(BasePrefixCache):
     def insert(self, params: InsertParams) -> InsertResult:
         if self.disable:
             return InsertResult(prefix_len=0)
+        identity = cpu_page_identity(self.token_to_kv_pool_allocator)
+        if identity is not None:
+            if params.page_span is None or params.value is None:
+                raise ValueError("guarded tree insert requires CPU page provenance")
+            if params.page_span.token_length != params.value.numel():
+                raise ValueError("insert CPU page provenance length mismatch")
+            identity.page_refs(params.page_span)
         # Fail fast on re-entrancy without touching the in-flight walk.
         assert not self.tree_core.has_ongoing_insert(), "re-entrant insert"
         if self.buffer_pipeline is not None:
@@ -1730,6 +1753,11 @@ class UnifiedRadixCache(BasePrefixCache):
 
         insert_params.key = radix_key
         insert_params.value = values
+        identity = cpu_page_identity(self.token_to_kv_pool_allocator)
+        if identity is not None:
+            insert_params.page_span = identity.page_rows.get(
+                req.kv.req_pool_idx, 0, page_aligned_len
+            )
         reuse_existing_mamba = False
         if self._mamba_host_only_checkpoint():
             mamba = self.components.get(ComponentType.MAMBA)
@@ -1763,6 +1791,15 @@ class UnifiedRadixCache(BasePrefixCache):
             return
         req.kv.record_insert(page_aligned_len)
 
+        # The first insert may have freed duplicate private pages. Both the
+        # prompt-boundary insert and row rebind must use its surviving path.
+        # Splitting that path below preserves these physical locations.
+        new_last_node = result.last_device_node
+        new_indices = self.path_device_indices(new_last_node)
+        new_page_span = (
+            self.path_cpu_page_span(new_last_node) if identity is not None else None
+        )
+
         # Split the leaf at the prompt boundary so eviction can drop the output
         # KV without the prompt. prev_prefix_len keeps the overlapping indices
         # from being freed as duplicates.
@@ -1781,7 +1818,12 @@ class UnifiedRadixCache(BasePrefixCache):
                 replace(
                     insert_params,
                     key=prompt_key,
-                    value=values[: len(prompt_key)],
+                    value=new_indices[: len(prompt_key)],
+                    page_span=(
+                        new_page_span.slice(0, len(prompt_key))
+                        if new_page_span is not None
+                        else None
+                    ),
                     prev_prefix_len=len(prompt_key),
                     inserted_len=len(prompt_key),
                     priority=min(
@@ -1792,8 +1834,6 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # With PD decode radix caching, SWA matching can stop short of the inserted path.
         # Repoint from that path to protect all tree-owned KV.
-        new_last_node = result.last_device_node
-        new_indices = self.path_device_indices(new_last_node)
         new_prefix_len = result.prefix_len
         assert req.kv.cache_protected_len <= len(new_indices) + self.page_size - 1, (
             f"{req.kv.cache_protected_len=}, {len(new_indices)=}, {page_aligned_len=}"
@@ -1804,6 +1844,21 @@ class UnifiedRadixCache(BasePrefixCache):
         self.req_to_token_pool.write(
             (req.kv.req_pool_idx, slice(req.kv.cache_protected_len, len(new_indices))),
             new_indices[req.kv.cache_protected_len :],
+            **(
+                {
+                    "cpu_page_writes": (
+                        (
+                            req.kv.req_pool_idx,
+                            req.kv.cache_protected_len,
+                            new_page_span.slice(
+                                req.kv.cache_protected_len, len(new_indices)
+                            ),
+                        ),
+                    )
+                }
+                if identity is not None
+                else {}
+            ),
         )
 
         self.unlock(req.lock)
@@ -1933,7 +1988,11 @@ class UnifiedRadixCache(BasePrefixCache):
             # tree values are page-aligned copies of a kv row: page-exact segments
             storage = self.kv_storage()
             for indices in action.indices:
-                storage.free_token_rows(indices)
+                kwargs = {}
+                if isinstance(indices, PageFree):
+                    kwargs["page_span"] = indices.page_span
+                    indices = indices.indices
+                storage.free_token_rows(indices, **kwargs)
         elif isinstance(action, FreeDeviceKVFullOnly):
             storage = self.kv_storage()
             for indices in action.indices:
@@ -5132,6 +5191,43 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def path_device_indices(self, node: NodeId) -> torch.Tensor:
         return self.tree_core.collect_full_device_indices(node, self.root_node_handle())
+
+    def path_cpu_page_span(self, node):
+        """Owner-side counterpart to path_device_indices; no background walk."""
+        identity = cpu_page_identity(self.token_to_kv_pool_allocator)
+        if identity is None:
+            raise ValueError("cache has no CPU physical-page identity capability")
+        identity._owner()
+        chunks = []
+        current = self.tree_core.node_by_id(node)
+        while current.parent is not None:
+            cd = current.component_data[ComponentType.FULL]
+            if cd.value is None or cd.page_span is None:
+                raise ValueError(
+                    "Full path lacks explicit CPU physical-page provenance"
+                )
+            chunks.append(cd.page_span)
+            current = current.parent
+        return PageSpan.concat(reversed(chunks), page_size=self.page_size)
+
+    def prefix_cpu_page_span(self, req):
+        # prefix_device_indices may take document-reuse slots or append a
+        # request-private linker load tail; neither has a CPU page span.
+        if self.uocr_doc_reuse is not None:
+            raise ValueError("SlotGuard v1 does not support document KV reuse")
+        if self.linker is not None and req.rid in self.linker.private_load_indices:
+            raise ValueError("SlotGuard v1 supports only prefetch linker restores")
+        return self.path_cpu_page_span(req.last_node).slice(0, req.prefix_len)
+
+    def assert_cpu_page_identity_supported(self) -> None:
+        """Reject paths that put Full KV on the device without a CPU page span:
+        HiCache load-back, document reuse and request-private linker loads."""
+        if self.cache_controller is not None:
+            raise ValueError("SlotGuard v1 does not support HiCache L2/L3")
+        if self.uocr_doc_reuse is not None:
+            raise ValueError("SlotGuard v1 does not support document KV reuse")
+        if self.linker is not None and self.linker.load_mode != "prefetch":
+            raise ValueError("SlotGuard v1 supports only prefetch linker restores")
 
     def root_node_handle(self, extra_key: Optional[str] = None) -> NodeId:
         """The root's NodeId -- URC match results carry NodeIds."""
