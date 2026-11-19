@@ -239,6 +239,7 @@
     "registered/unit/lora/test_lora_inactive_batch_skip.py",
     "registered/unit/lora/test_lora_manager_init_modules.py",
     "registered/unit/lora/test_lora_moe_inplace_unit.py",
+    "registered/unit/lora/test_lora_moe_runner_default.py",
     "registered/unit/lora/test_lora_overlap_loader_unit.py",
     "registered/unit/lora/test_lora_pp.py",
     "registered/unit/lora/test_lora_spec_verify_batch_info.py",
