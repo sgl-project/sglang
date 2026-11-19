@@ -67,6 +67,8 @@ pub fn dynamo_tool_parser_name(parser: &str) -> &str {
         "llama3" => "llama3_json",
         "qwen" => "qwen25",
         "glm" => "glm47",
+        // V4.1 output carries V4's DSML tool calls.
+        "deepseekv41" => "deepseekv4",
         other => other,
     }
 }
@@ -90,9 +92,10 @@ pub fn dynamo_tool_choice(choice: &Option<ChatCompletionToolChoiceOption>) -> To
     }
 }
 
-/// Validate `tool_choice` against `tools`, then build its constraint when a
-/// tool `parser` is configured: the parser's structural tag if it has one,
-/// else a JSON-schema array of `{name, parameters}` for `required`/named.
+/// Validate `tool_choice` against `tools`, then build its constraint: the
+/// `parser`'s structural tag if it has one, else (`get_json_schema_constraint`,
+/// with or without a parser) a JSON-schema array of `{name, parameters}` for
+/// `required`/named.
 pub fn tool_constraint(
     parser: Option<&str>,
     tool_choice: &ToolChoice,
@@ -111,28 +114,30 @@ pub fn tool_constraint(
         return Err(format!("tool named \"{name}\" in tool_choice is not present in tools").into());
     }
 
-    let Some(parser) = parser else {
-        return Ok(None);
-    };
-    let parser = dynamo_tool_parser_name(parser);
-    let config = get_tool_parser_map()
-        .get(parser)
-        .ok_or_else(|| format!("tool-call parser `{parser}` is not supported by Dynamo"))?;
-    let builder = config.structural_tag_builder.clone().or_else(|| {
-        (parser == "llama3_json"
-            && *tool_choice == ToolChoice::Auto
-            && tools.iter().any(|tool| tool.strict.unwrap_or(false)))
-        .then(|| {
-            StructuralTagBuilder::TriggeredTags(TriggeredTagsConfig {
-                begin_template: r#"<|python_tag|>{"name":"{name}", "arguments":"#.to_string(),
-                end_template: "}".to_string(),
-                triggers: vec!["<|python_tag|>".to_string()],
-                content_style: Default::default(),
-                tool_call_ban_tokens: Vec::new(),
-                reasoning_end: None,
+    let builder = match parser.map(dynamo_tool_parser_name) {
+        None => None,
+        Some(parser) => {
+            let config = get_tool_parser_map()
+                .get(parser)
+                .ok_or_else(|| format!("tool-call parser `{parser}` is not supported by Dynamo"))?;
+            config.structural_tag_builder.clone().or_else(|| {
+                (parser == "llama3_json"
+                    && *tool_choice == ToolChoice::Auto
+                    && tools.iter().any(|tool| tool.strict.unwrap_or(false)))
+                .then(|| {
+                    StructuralTagBuilder::TriggeredTags(TriggeredTagsConfig {
+                        begin_template: r#"<|python_tag|>{"name":"{name}", "arguments":"#
+                            .to_string(),
+                        end_template: "}".to_string(),
+                        triggers: vec!["<|python_tag|>".to_string()],
+                        content_style: Default::default(),
+                        tool_call_ban_tokens: Vec::new(),
+                        reasoning_end: None,
+                    })
+                })
             })
-        })
-    });
+        }
+    };
     if let Some(builder) = builder
         && let Some(tag) = builder
             .build_tool_call_format(&ToolCallFormatBuildContext {
@@ -340,6 +345,7 @@ mod tests {
         assert_eq!(dynamo_tool_parser_name("qwen"), "qwen25");
         assert_eq!(dynamo_tool_parser_name("glm"), "glm47");
         assert_eq!(dynamo_tool_parser_name("deepseekv4"), "deepseekv4");
+        assert_eq!(dynamo_tool_parser_name("deepseekv41"), "deepseekv4");
     }
 
     #[test]
@@ -360,6 +366,24 @@ mod tests {
         assert_eq!(schema["items"]["properties"]["name"]["enum"][0], "get_time");
         assert!(schema["items"].get("anyOf").is_none());
         assert!(schema.get("maxItems").is_none());
+    }
+
+    /// Without a parser there is no structural tag, so a forced choice is
+    /// held to the same schema Python builds for it.
+    #[test]
+    fn forced_choice_without_a_parser_builds_the_same_schema() {
+        let tools = [tool("get_weather", false), tool("get_time", false)];
+        let schema =
+            json_schema(tool_constraint(None, &ToolChoice::Required, &tools, Some(false)).unwrap());
+        assert_eq!(schema["items"]["anyOf"].as_array().unwrap().len(), 2);
+        assert_eq!(schema["maxItems"], 1);
+        let named = ToolChoice::Named("get_time".into());
+        let schema = json_schema(tool_constraint(None, &named, &tools, None).unwrap());
+        assert_eq!(schema["items"]["properties"]["name"]["enum"][0], "get_time");
+        assert_eq!(
+            tool_constraint(None, &ToolChoice::Auto, &tools, None),
+            Ok(None)
+        );
     }
 
     #[test]

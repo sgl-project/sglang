@@ -55,9 +55,6 @@ impl Reasoning {
     }
 }
 
-/// A forced `tool_choice` and strict tools are served.
-pub(super) const CONSTRAINS_TOOLS: bool = true;
-
 fn definitions(tools: &[Value]) -> Vec<ToolDefinition> {
     let definition = |tool: &Value| {
         let function = &tool["function"];
@@ -70,10 +67,10 @@ fn definitions(tools: &[Value]) -> Vec<ToolDefinition> {
     tools.iter().filter_map(definition).collect()
 }
 
-/// The grammar `choice` holds the output to under `parser`, as
+/// The grammar `choice` holds the output to under `parser` (or none), as
 /// `(is a structural tag, grammar)`: a structural tag, else a JSON schema.
 pub(super) fn tool_constraint(
-    parser: &str,
+    parser: Option<&str>,
     choice: Option<&Value>,
     tools: &[Value],
     parallel_tool_calls: Option<bool>,
@@ -83,23 +80,23 @@ pub(super) fn tool_constraint(
         Some(Value::String(choice)) if choice == "required" => ToolChoice::Required,
         Some(choice) => match choice["function"]["name"].as_str() {
             Some(name) => ToolChoice::Named(name.to_owned()),
-            None => return Err(Unsupported("tool_choice")),
+            None => return Err(Unsupported("invalid_request")),
         },
     };
     let tools = definitions(tools);
-    let constraint =
-        crate::parser::tool_constraint(Some(parser), &choice, &tools, parallel_tool_calls)
-            .map_err(|_| Unsupported("invalid_request"))?;
+    let constraint = crate::parser::tool_constraint(parser, &choice, &tools, parallel_tool_calls)
+        .map_err(|_| Unsupported("invalid_request"))?;
     Ok(constraint.map(|constraint| match constraint {
         ToolConstraint::StructuralTag(tag) => (true, tag),
         ToolConstraint::JsonSchema(schema) => (false, schema),
     }))
 }
 
-/// The detector for a tool parser Dynamo knows.
+/// The detector for a tool parser Dynamo knows, or without a parser for the
+/// JSON calls of a forced choice.
 pub(super) fn tool_detector(parsing: &ToolParsing) -> Option<Box<dyn ToolDetector>> {
-    let parser = dynamo_tool_parser_name(&parsing.parser);
-    if !get_tool_parser_map().contains_key(parser) {
+    let parser = parsing.parser.as_deref().map(dynamo_tool_parser_name);
+    if parser.is_some_and(|parser| !get_tool_parser_map().contains_key(parser)) {
         return None;
     }
     let (choice, structural_tag) = match &parsing.forced {
@@ -109,7 +106,7 @@ pub(super) fn tool_detector(parsing: &ToolParsing) -> Option<Box<dyn ToolDetecto
         None => (None, false),
     };
     Some(Box::new(DynamoTools {
-        parser: parser.to_owned(),
+        parser: parser.map(str::to_owned),
         tools: definitions(&parsing.tools),
         json_calls: parsing.forced.is_some() && !structural_tag,
         choice,
@@ -119,7 +116,8 @@ pub(super) fn tool_detector(parsing: &ToolParsing) -> Option<Box<dyn ToolDetecto
 }
 
 struct DynamoTools {
-    parser: String,
+    /// `None` reads only the JSON calls of a forced choice.
+    parser: Option<String>,
     tools: Vec<ToolDefinition>,
     /// A forced choice under a JSON schema: the output is the calls as JSON.
     json_calls: bool,
@@ -186,7 +184,7 @@ impl DynamoTools {
         self.jail.get_or_insert_with(|| {
             let (chunks, received) = unbounded();
             let parsed = apply_tool_calling_jail(
-                Some(self.parser.clone()),
+                self.parser.clone(),
                 self.choice.clone(),
                 Some(self.tools.clone()),
                 self.structural_tag,
@@ -215,7 +213,7 @@ impl ToolDetector for DynamoTools {
         // The parse only computes, so it finishes without a runtime.
         let parsed = futures::executor::block_on(try_tool_call_parse_aggregate_finalize(
             text,
-            Some(&self.parser),
+            self.parser.as_deref(),
             Some(&self.tools),
         ));
         let Ok((calls, normal)) = parsed else {
@@ -304,7 +302,7 @@ mod tests {
 
     fn detector(parser: &str, forced: Option<(Value, bool)>) -> Option<Box<dyn ToolDetector>> {
         tool_detector(&ToolParsing {
-            parser: parser.into(),
+            parser: Some(parser.into()),
             tools: weather_tools(),
             forced,
         })
@@ -315,18 +313,59 @@ mod tests {
         assert!(detector("no-such-parser", None).is_none());
     }
 
+    /// Without a parser, a forced choice is held to a JSON schema and its
+    /// output read as the JSON calls, whole and streamed.
+    #[test]
+    fn forced_choice_without_a_parser_reads_json_calls() {
+        let tools = weather_tools();
+        let required = json!("required");
+        let (structural, schema) = tool_constraint(None, Some(&required), &tools, None)
+            .unwrap()
+            .unwrap();
+        assert!(!structural && schema.contains("get_weather"), "{schema}");
+        let parsing = ToolParsing {
+            parser: None,
+            tools,
+            forced: Some((required, false)),
+        };
+        let calls = r#"[{"name": "get_weather", "parameters": {"city": "Paris"}}]"#;
+        let (normal, parsed) = tool_detector(&parsing).unwrap().parse_non_stream(calls);
+        assert_eq!(normal, "");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].name, "get_weather");
+        assert_eq!(parsed[0].parameters, r#"{"city":"Paris"}"#);
+
+        let mut detector = tool_detector(&parsing).unwrap();
+        let (head, tail) = calls.split_at(30);
+        let (mut normal, mut streamed) = detector.parse_stream(head, false);
+        let (rest, more) = detector.parse_stream(tail, true);
+        normal += &rest;
+        streamed.extend(more);
+        assert_eq!(normal.trim(), "");
+        let name: String = streamed.iter().map(|call| call.name.as_str()).collect();
+        let arguments: String = streamed
+            .iter()
+            .map(|call| call.parameters.as_str())
+            .collect();
+        assert_eq!(name, "get_weather");
+        assert_eq!(
+            serde_json::from_str::<Value>(&arguments).unwrap(),
+            json!({"city": "Paris"})
+        );
+    }
+
     #[test]
     fn forced_choice_is_constrained_and_read_as_json() {
         let tools = weather_tools();
         let required = json!("required");
         // Hermes has a structural tag, which keeps the parser's own format.
-        let (structural, tag) = tool_constraint("hermes", Some(&required), &tools, None)
+        let (structural, tag) = tool_constraint(Some("hermes"), Some(&required), &tools, None)
             .unwrap()
             .unwrap();
         assert!(structural && tag.contains("get_weather"), "{tag}");
         let missing = json!({"type": "function", "function": {"name": "nope"}});
         assert_eq!(
-            tool_constraint("hermes", Some(&missing), &tools, None),
+            tool_constraint(Some("hermes"), Some(&missing), &tools, None),
             Err(Unsupported("invalid_request"))
         );
 

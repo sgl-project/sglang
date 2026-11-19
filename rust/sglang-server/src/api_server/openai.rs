@@ -14,7 +14,7 @@ use serde_json::{Map, Value};
 use sglang_api_types::api::v1::{self as api, GenerateResponse, GenerateStreamError};
 use sglang_processor::dynamo_tokenizers::{DecodeResult, Tokenizer};
 use sglang_processor::openai::{
-    ChatModel, OpenAiHeaders, OpenAiSettings, OpenAiTokenizer, PROMPT_LIST_FIELDS,
+    ChatModel, Declined, OpenAiHeaders, OpenAiSettings, OpenAiTokenizer, PROMPT_LIST_FIELDS,
     ROUTING_KEY_HEADER, Reply, Responder, TokenPieces, Unsupported, choices_per_prompt,
     copy_prompt_per_choice, lower_chat, lower_completion, lower_score,
 };
@@ -196,6 +196,7 @@ impl ChatSupport {
         Self {
             model: ChatModel {
                 context_length: Some(server_args.model_config.context_len),
+                is_multimodal: server_args.model_config.is_multimodal,
                 generation_config,
                 ..ChatModel::for_formatter(formatter)
             },
@@ -204,20 +205,25 @@ impl ChatSupport {
         }
     }
 
-    /// The prompt ids Python's chat layer encodes for `request`.
-    fn render(&self, request: &Value, defaults: &ChatTemplateKwargs) -> Option<Vec<u32>> {
+    /// The prompt ids Python's chat layer encodes for `request`, or why the
+    /// template refused it.
+    fn render(&self, request: &Value, defaults: &ChatTemplateKwargs) -> Result<Vec<u32>, String> {
         let formatter = &self.formatter;
         if let Some(ids) = formatter.encode_request(request.clone(), defaults) {
-            return ids.ok();
+            return ids.map_err(|error| error.to_string());
         }
-        let (prompt, continuation) = formatter.render_chat(request.clone(), defaults).ok()?;
+        let (prompt, continuation) = formatter
+            .render_chat(request.clone(), defaults)
+            .map_err(|error| error.to_string())?;
         let rendered = RenderedChat {
             prompt,
             continuation,
             ids: None,
         };
-        let ids = rendered.encode(&*self.tokenizer).ok()?;
-        Some(ids.into_iter().map(|id| id as u32).collect())
+        let ids = rendered
+            .encode(&*self.tokenizer)
+            .map_err(|error| error.to_string())?;
+        Ok(ids.into_iter().map(|id| id as u32).collect())
     }
 }
 
@@ -248,8 +254,8 @@ pub(crate) enum Served {
     Events(BoxStream<'static, String>),
 }
 
-fn declined(reason: Unsupported) -> Reply {
-    tracing::warn!(reason = reason.0, "declined OpenAI request");
+fn declined(reason: Declined) -> Reply {
+    tracing::warn!(reason = reason.reason(), "declined OpenAI request");
     reason.reply()
 }
 
@@ -288,7 +294,7 @@ impl OpenAiService<'_> {
         );
         let (generate, responder) = match lowered {
             Ok(lowered) => lowered,
-            Err(reason) => return Served::Reply(declined(reason)),
+            Err(reason) => return Served::Reply(declined(reason.into())),
         };
         self.core
             .log_openai_request(OpenAiRequest::Completion, body, headers);
@@ -491,13 +497,13 @@ async fn lower(
     body: Bytes,
     routing_key: Option<String>,
     sglext_ids: bool,
-) -> Result<(Value, Responder), Unsupported> {
+) -> Result<(Value, Responder), Declined> {
     let shared = openai.clone();
     // Rendering and tokenizing are CPU work, kept off the async workers.
     let lowered = tokio::task::spawn_blocking(move || {
         let openai = shared;
         let Some(chat) = &openai.chat else {
-            return Err(Unsupported("chat_template"));
+            return Err(Unsupported("chat_template").into());
         };
         let headers = OpenAiHeaders {
             routing_key: routing_key.as_deref(),
@@ -515,7 +521,7 @@ async fn lower(
         )
     })
     .await;
-    let (generate, responder) = lowered.map_err(|_| Unsupported("render"))??;
+    let (generate, responder) = lowered.map_err(|_| Declined::from(Unsupported("render")))??;
     let generate = serde_json::to_value(generate).expect("api.v1 types serialize to JSON");
     Ok((generate, Responder::Chat(Box::new(responder))))
 }

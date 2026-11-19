@@ -145,10 +145,9 @@ pub struct Unsupported(pub &'static str);
 
 /// The reasons that fault the request; any other is a feature the processor
 /// does not serve.
-const REQUEST_FAULTS: [&str; 5] = [
+const REQUEST_FAULTS: [&str; 4] = [
     "unparsed_request",
     "invalid_request",
-    "tool_choice",
     "tool_definition",
     // Python refuses chat without a template as a bad request.
     "chat_template",
@@ -164,6 +163,39 @@ impl Unsupported {
             return Reply::error(400, &format!("Invalid request ({reason})"));
         }
         Reply::error(501, &format!("Not supported by this server ({reason})"))
+    }
+}
+
+/// Why a chat request is not lowered: a feature the processor does not
+/// serve, or a request Python refuses, with Python's message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Declined {
+    Unsupported(Unsupported),
+    /// `_validate_request`'s (or the chat template's) refusal, a 400.
+    Invalid(String),
+}
+
+impl From<Unsupported> for Declined {
+    fn from(reason: Unsupported) -> Self {
+        Self::Unsupported(reason)
+    }
+}
+
+impl Declined {
+    /// The reason, as [`Unsupported`] names it.
+    pub fn reason(&self) -> &'static str {
+        match self {
+            Self::Unsupported(Unsupported(reason)) => reason,
+            Self::Invalid(_) => "invalid_request",
+        }
+    }
+
+    /// The answer of a host with no engine route to leave the request to.
+    pub fn reply(&self) -> Reply {
+        match self {
+            Self::Unsupported(reason) => reason.reply(),
+            Self::Invalid(message) => Reply::error(400, message),
+        }
     }
 }
 

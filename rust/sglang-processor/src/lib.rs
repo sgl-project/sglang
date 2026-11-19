@@ -10,6 +10,8 @@ mod deepseek_output;
 mod error;
 #[cfg(any(feature = "parser", feature = "openai"))]
 mod kimi_k3_format;
+#[cfg(any(feature = "openai", feature = "render"))]
+mod media;
 #[cfg(feature = "mm")]
 mod mm;
 mod model_files;
@@ -35,6 +37,8 @@ pub use deepseek_output::{
     DeepSeekStopMatch, DeepSeekToolCall, DeepSeekToolCallDelta,
 };
 pub use error::ProcessorError;
+#[cfg(any(feature = "openai", feature = "render"))]
+pub use media::extract_images;
 #[cfg(feature = "mm")]
 pub use mm::{MmOutput, MmOutputItem, MmProcessor};
 pub use model_files::{resolve_model_file, resolve_tokenizer_file};
@@ -47,8 +51,8 @@ pub use parser::{
 #[cfg(feature = "render")]
 pub use render::{
     ChatFormatter, ChatFormatterOptions, DeepSeekTokenizer, OneOrMany, TemplateArgs, TemplateError,
-    ThinkingTemplates, continues_final_message, extract_images, load_chat_formatter,
-    requested_effort, requested_thinking, select_chat_formatter,
+    ThinkingTemplates, continues_final_message, load_chat_formatter, requested_effort,
+    requested_thinking, select_chat_formatter,
 };
 #[cfg(any(feature = "parser", feature = "openai"))]
 pub use think::ReasoningOptions;

@@ -241,7 +241,7 @@ SGLang additions:
 
 ```rust
 lower_completion(body, &headers, &settings, tokenizer) -> Result<(GenerateRequest, CompletionResponder), Unsupported>
-lower_chat(body, &headers, &settings, &chat_model, render, tokenizer) -> Result<(GenerateRequest, ChatResponder), Unsupported>
+lower_chat(body, &headers, &settings, &chat_model, render, tokenizer) -> Result<(GenerateRequest, ChatResponder), Declined>
 responder.unary(items) / responder.stream_data(item) -> OpenAI JSON or SSE events
 // item is Result<GenerateResponse, GenerateStreamError>; unary accepts a Vec of items
 responder.stream_end() // after the transport receives [DONE]

@@ -3,16 +3,17 @@
 //! streamed, and how `n` choices, scheduler failures and parsers are served.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use sglang_server::ServerArgs;
+use sglang_server::{MediaError, MmData, MmProcessOutput, MmProcessor, ServerArgs, TokenIds};
 use sglang_server_test::{OutputDetails, SchedulerlessServer, free_loopback_addrs};
 
 use crate::common::{
     HttpResponse, PIECES, Sse, byte_level_deepseek_dir, deepseek_dir, fused_dir, http,
-    next_scheduler_request, next_scheduler_work, piece_id, push_terminal, take_startup_freeze_gc,
-    tokenizer_dir, word_id,
+    multimodal_template_dir, next_scheduler_request, next_scheduler_work, piece_id, push_terminal,
+    raising_template_dir, take_startup_freeze_gc, tokenizer_dir, word_id,
 };
 
 /// A server named `model` with the word tokenizer of `tokenizer_dir`, after
@@ -80,44 +81,147 @@ fn completions_handler_validates_before_submit() {
     );
 }
 
+/// What Python's `_validate_request` refuses is a 400 with its message,
+/// before anything reaches the scheduler; a text-only model refuses media
+/// content. Without a chat template, every chat is refused (template gate).
 #[test]
 fn chat_handler_validates_before_submit() {
-    let (rt, addr) = server_with(|_| {});
+    let (rt, addr) = chatml_server();
     let user = json!([{"role": "user", "content": "hi"}]);
+    let image = json!({"type": "image_url", "image_url": {"url": "http://example.com/x.png"}});
+    let tool = json!({"type": "function", "function": {"name": "f", "parameters": {}}});
     let cases = [
-        (json!({"model": "model", "messages": []}), "empty messages"),
-        (json!({"model": "model", "messages": user, "n": 0}), "n=0"),
         (
-            json!({"model": "model", "messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "http://example.com/x.png"}}]}]}),
+            json!({"model": "model", "messages": []}),
+            "empty messages",
+            "",
+        ),
+        (
+            json!({"model": "model", "messages": user, "n": 0}),
+            "n=0",
+            "",
+        ),
+        (
+            json!({"model": "model", "messages": [{"role": "user", "content": [image]}]}),
             "media content",
+            "Model only supports text input; received unsupported content type 'image_url'.",
         ),
         (
-            json!({"model": "model", "messages": user, "function_call": "auto"}),
-            "deprecated function_call",
+            json!({"model": "model", "messages": user, "tool_choice": "required"}),
+            "required without tools",
+            "Tools cannot be empty if tool choice is set to required.",
         ),
         (
-            json!({"model": "model", "messages": user, "audio": {"input_audio": {"data": "x", "format": "wav"}}}),
-            "audio",
+            json!({"model": "model", "messages": user, "tools": [tool], "tool_choice": {"type": "function", "function": {"name": "g"}}}),
+            "named tool not declared",
+            "Tool 'g' not found in tools list.",
         ),
         (
-            json!({"model": "model", "messages": user, "max_completion_tokens": 0}),
-            "max_completion_tokens=0",
+            json!({"model": "model", "messages": user, "temperature": "hot"}),
+            "mistyped field",
+            "",
         ),
     ];
-    for (body, label) in cases {
-        assert_eq!(
-            post(addr, "/v1/chat/completions", &body).status,
-            400,
-            "{label}"
-        );
+    for (body, label, message) in cases {
+        let response = post(addr, "/v1/chat/completions", &body);
+        assert_eq!(response.status, 400, "{label}: {}", response.body);
+        if !message.is_empty() {
+            assert_eq!(response.json()["message"], message, "{label}");
+        }
     }
-    // A valid request with no loaded chat template is a 400 (template gate).
-    let valid = json!({"model": "model", "messages": user});
-    assert_eq!(post(addr, "/v1/chat/completions", &valid).status, 400);
+    // Malformed JSON is a 400 too.
+    assert_eq!(
+        http(addr, "POST", "/v1/chat/completions", &[], "not json").status,
+        400
+    );
     assert!(
         rt.next_request(Duration::from_millis(200)).is_none(),
         "a refused chat reached the scheduler"
     );
+    // A valid request with no loaded chat template is a 400 (template gate).
+    let (rt, addr) = server_with(|_| {});
+    let valid = json!({"model": "model", "messages": user});
+    assert_eq!(post(addr, "/v1/chat/completions", &valid).status, 400);
+    assert!(
+        rt.next_request(Duration::from_millis(200)).is_none(),
+        "a chat without a template reached the scheduler"
+    );
+}
+
+/// A chat template that refuses the conversation is a 400 carrying the
+/// template's message, as Python answers the Jinja `raise_exception`.
+#[test]
+fn template_refusal_is_a_bad_request_with_its_message() {
+    let (rt, addr) = server_with(|args| args.tokenizer_path = raising_template_dir().into());
+    let body = json!({"model": "model", "messages": [{"role": "user", "content": "hi"}]});
+    let response = post(addr, "/v1/chat/completions", &body);
+    assert_eq!(response.status, 400, "{}", response.body);
+    let message = response.json()["message"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        message.starts_with("chat template render failed: ")
+            && message.contains("the first message must be a system message"),
+        "{message}"
+    );
+    assert!(
+        rt.next_request(Duration::from_millis(200)).is_none(),
+        "a refused chat reached the scheduler"
+    );
+    // `/v1/tokenize` with `messages` renders the same way.
+    let response = post(addr, "/v1/tokenize", &json!({"messages": body["messages"]}));
+    assert_eq!(response.status, 400, "{}", response.body);
+    assert_eq!(response.json()["message"], message);
+    // With a system message first, the template renders and the chat is served.
+    let messages =
+        json!([{"role": "system", "content": "be brief"}, {"role": "user", "content": "hi"}]);
+    let app = (rt, addr);
+    let served = answered(
+        &app,
+        "/v1/chat/completions",
+        json!({"model": "model", "messages": messages}),
+    );
+    assert_eq!(served.status, 200, "{}", served.body);
+}
+
+/// A multimodal model's chat images reach the multimodal pool as the
+/// request's `image_data`: the pool's processor refusing them fails the chat
+/// as a 400 with its message, as on `/generate`.
+#[test]
+fn chat_images_reach_the_multimodal_pool() {
+    struct FailingProcessor;
+    impl MmProcessor for FailingProcessor {
+        fn process(&self, _: TokenIds, mm: MmData) -> Result<MmProcessOutput, MediaError> {
+            let sources = mm.image_data.len();
+            Err(MediaError::Client(format!(
+                "image decode failed for {sources} image(s)"
+            )))
+        }
+    }
+    let (rt, addr) = server_with(|args| {
+        args.tokenizer_path = multimodal_template_dir().into();
+        args.model_config.is_multimodal = true;
+    });
+    rt.start_mm_workers(Arc::new(FailingProcessor), 1);
+    let image = |url: &str| json!({"type": "image_url", "image_url": {"url": url}});
+    let body = json!({"model": "model", "messages": [{"role": "user", "content": [
+        {"type": "text", "text": "what is this?"},
+        image("data:image/png;base64,AAAA"),
+        image("data:image/png;base64,BBBB"),
+    ]}]});
+    let response = post(addr, "/v1/chat/completions", &body);
+    assert_eq!(response.status, 400, "{}", response.body);
+    assert!(
+        response.body.contains("image decode failed for 2 image(s)"),
+        "{}",
+        response.body
+    );
+    // Without media the chat is served as on a text model.
+    let text = json!({"model": "model", "messages": [{"role": "user", "content": "hi"}]});
+    let app = (rt, addr);
+    let served = answered(&app, "/v1/chat/completions", text);
+    assert_eq!(served.status, 200, "{}", served.body);
 }
 
 /// Python's chat and completions handlers serve any `model` name and echo it
@@ -383,30 +487,66 @@ fn streaming_chat_emits_role_deltas_usage_and_done() {
     }
 }
 
-/// A tool parser the processor has no port of parses through Dynamo's, whole
-/// and streamed, for a free and a forced choice.
+/// Tool calls are read from the output, whole and streamed: by Dynamo's
+/// parser for a `--tool-call-parser` the processor has no port of (Hermes),
+/// for a free and a forced choice, whether the request or a system message
+/// declares the tools; and without any parser for a forced choice, whose
+/// output a JSON schema holds to the calls as JSON.
 #[test]
-fn unported_tool_parser_returns_tool_calls() {
-    let [head, tail] = [PIECES[9], PIECES[10]].map(piece_id);
+fn tool_calls_are_read_with_and_without_a_parser() {
+    let hermes = [PIECES[9], PIECES[10]];
+    let json_calls = [PIECES[11], PIECES[12]];
+    let named = json!({"type": "function", "function": {"name": "get_weather"}});
+    // (parser, tool_choice, tools on the system message, output, a word of the grammar)
+    let cases = [
+        (Some("hermes"), Value::Null, false, hermes, None),
+        (
+            Some("hermes"),
+            json!("required"),
+            false,
+            hermes,
+            Some("get_weather"),
+        ),
+        (Some("hermes"), Value::Null, true, hermes, None),
+        (None, json!("required"), false, json_calls, Some("minItems")),
+        (None, named, false, json_calls, Some("minItems")),
+    ];
     let cases = [false, true]
         .into_iter()
-        .flat_map(|stream| [(stream, Value::Null), (stream, json!("required"))]);
-    for (stream, tool_choice) in cases {
-        let (rt, addr) = fused_chat_server(|args| args.tool_call_parser = Some("hermes".into()));
+        .flat_map(|stream| cases.iter().cloned().map(move |case| (stream, case)));
+    for (stream, (parser, tool_choice, on_system, pieces, grammar)) in cases {
+        let label = format!(
+            "stream={stream} parser={parser:?} tool_choice={tool_choice} on_system={on_system}"
+        );
+        let [head, tail] = pieces.map(piece_id);
+        let (rt, addr) = fused_chat_server(|args| args.tool_call_parser = parser.map(Into::into));
         let mut body = chat_request(stream);
         body["tool_choice"] = tool_choice;
-        body["tools"] = json!([{"type": "function", "function": {
+        let tools = json!([{"type": "function", "function": {
             "name": "get_weather",
             "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
         }}]);
+        if on_system {
+            body["messages"] = json!([
+                {"role": "system", "content": "You can call tools.", "tools": tools},
+                {"role": "user", "content": "hi"},
+            ]);
+        } else {
+            body["tools"] = tools;
+        }
         let client = std::thread::spawn(move || {
             http(addr, "POST", "/v1/chat/completions", &[], &body.to_string())
         });
-        let rid = next_scheduler_request(&rt).rid().expect("rid");
+        let request = next_scheduler_request(&rt);
+        if let Some(grammar) = grammar {
+            let header = String::from_utf8_lossy(&request.header);
+            assert!(header.contains(grammar), "{label}: no grammar in {header}");
+        }
+        let rid = request.rid().expect("rid");
         rt.push_output_with(&rid, &[head], chat_frame()).unwrap();
         rt.push_output_with(&rid, &[tail], chat_stop()).unwrap();
         let response = client.join().unwrap();
-        assert_eq!(response.status, 200, "{}", response.body);
+        assert_eq!(response.status, 200, "{label}: {}", response.body);
         let (name, arguments, finish_reason) = if stream {
             let events: Vec<Value> = response
                 .body
@@ -438,9 +578,9 @@ fn unported_tool_parser_returns_tool_calls() {
                 choice["finish_reason"].as_str().map(str::to_owned),
             )
         };
-        assert_eq!(name, "get_weather", "{}", response.body);
-        assert_eq!(parse(&arguments), json!({"city": "Paris"}));
-        assert_eq!(finish_reason.as_deref(), Some("tool_calls"));
+        assert_eq!(name, "get_weather", "{label}: {}", response.body);
+        assert_eq!(parse(&arguments), json!({"city": "Paris"}), "{label}");
+        assert_eq!(finish_reason.as_deref(), Some("tool_calls"), "{label}");
     }
 }
 
@@ -861,18 +1001,43 @@ fn tokenize_takes_what_chat_takes() {
     assert_eq!(response.status, 200, "{}", response.body);
 }
 
-/// A request the processor declines is refused, naming the reason.
+/// A forced choice on a DeepSeek model, whose output recipe reads, is held
+/// to its tool parser's DSML grammar and served; a request the processor
+/// declines is refused, naming the reason.
 #[test]
-fn declined_request_is_refused() {
-    let (rt, addr) = deepseek_server();
-    let tool = json!({"type": "function", "function": {"name": "f", "parameters": {}}});
+fn deepseek_forced_choice_is_constrained_and_declines_are_named() {
+    let tool = json!({"type": "function", "function": {
+        "name": "f",
+        "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+    }});
     let mut body = chat_body();
     body["tools"] = json!([tool]);
     body["tool_choice"] = json!("required");
+    let app = deepseek_server_with(|args| args.tool_call_parser = Some("deepseekv41".into()));
+    let (rt, addr) = (&app.0, app.1);
+    let client = std::thread::spawn(move || {
+        http(addr, "POST", "/v1/chat/completions", &[], &body.to_string())
+    });
+    let Some(request) = rt.next_request(Duration::from_secs(5)) else {
+        panic!("refused: {}", client.join().unwrap().body);
+    };
+    let header = String::from_utf8_lossy(&request.header);
+    assert!(header.contains("DSML"), "no DSML grammar in {header}");
+    answer_ok(rt, &request.rid().expect("rid"));
+    let response = client.join().unwrap();
+    assert_eq!(response.status, 200, "{}", response.body);
+
+    // A field the processor does not reproduce is declined by name.
+    let (rt, addr) = deepseek_server();
+    let mut body = chat_body();
+    body["return_routed_experts"] = json!(true);
     let response = post(addr, "/v1/chat/completions", &body);
-    assert_eq!(response.status, 400, "{}", response.body);
-    assert_eq!(response.json()["message"], "Invalid request (tool_choice)");
-    nothing_submitted(&rt, "a refused tool call");
+    assert_eq!(response.status, 501, "{}", response.body);
+    assert_eq!(
+        response.json()["message"],
+        "Not supported by this server (unsupported_chat_feature)"
+    );
+    nothing_submitted(&rt, "a declined request");
 }
 
 /// Launch defaults and request overrides must reach both rendering and response parsing.

@@ -158,6 +158,8 @@ impl TokenizerRegistry {
             chat_encoding_spec: None,
             // The workers apply their conversation template's stop strings.
             template_stops: Vec::new(),
+            // The workers validate media against their model.
+            is_multimodal: false,
             deepseek: None,
         };
         me.inner.insert(m.id.clone(), t);

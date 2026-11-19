@@ -231,7 +231,7 @@ pub fn deepseek_dir() -> &'static str {
 }
 
 /// The pieces of [`fused_dir`]'s tokenizer, ids 1.. in order.
-pub const PIECES: [&str; 11] = [
+pub const PIECES: [&str; 13] = [
     "<think>be",
     "cause</think>Par",
     "is",
@@ -244,6 +244,9 @@ pub const PIECES: [&str; 11] = [
     // A Hermes tool call, cut inside its arguments.
     "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": ",
     "\"Paris\"}}\n</tool_call>",
+    // The same call as a JSON-schema-constrained forced choice emits it.
+    "[{\"name\": \"get_weather\", \"parameters\": {\"city\": ",
+    "\"Paris\"}}]",
 ];
 
 /// The id of `piece` in [`fused_dir`]'s tokenizer.
@@ -271,6 +274,46 @@ pub fn fused_dir() -> &'static str {
         });
         checkpoint("fused", &[("tokenizer.json", &config)])
     })
+}
+
+/// [`tokenizer_dir`]'s tokenizer with a chat template that refuses a
+/// conversation not opened by a system message, through `raise_exception`.
+pub fn raising_template_dir() -> &'static str {
+    static DIR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let template = "{% if messages[0]['role'] != 'system' %}\
+            {{ raise_exception('the first message must be a system message') }}{% endif %}\
+            {% for message in messages %}{{ message['content'] }}\n{% endfor %}";
+        templated_dir("raising", template)
+    })
+}
+
+/// [`tokenizer_dir`]'s tokenizer with a chat template that renders content
+/// parts, an image part as an `<image>` placeholder.
+pub fn multimodal_template_dir() -> &'static str {
+    static DIR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let template = "{% for message in messages %}\
+            {% if message['content'] is string %}{{ message['content'] }}\
+            {% else %}{% for part in message['content'] %}\
+            {% if part['type'] == 'text' %}{{ part['text'] }}\
+            {% elif part['type'] == 'image_url' %}<image>{% endif %}\
+            {% endfor %}{% endif %}\n{% endfor %}";
+        templated_dir("multimodal", template)
+    })
+}
+
+/// A checkpoint `name` with [`tokenizer_dir`]'s tokenizer and the chat
+/// `template` in its `tokenizer_config.json`.
+fn templated_dir(name: &str, template: &str) -> String {
+    let dir = checkpoint_dir(name, None);
+    let config = serde_json::json!({"chat_template": template});
+    std::fs::write(
+        std::path::Path::new(&dir).join("tokenizer_config.json"),
+        config.to_string(),
+    )
+    .unwrap();
+    dir
 }
 
 /// A DeepSeek V4.1 checkpoint with a byte-level tokenizer: id 0 is the lone
