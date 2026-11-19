@@ -1,13 +1,22 @@
+import json
 import unittest
 
 from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
     TestNpuAccuracyMultiNodePdSepTestCaseBase,
 )
-from sglang.test.ascend.e2e.test_npu_multi_node_utils import NIC_NAME
+from sglang.test.ascend.e2e.test_npu_multi_node_utils import (
+    NIC_NAME,
+    get_mooncake_master_server_address,
+)
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
     DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH,
     assert_metrics,
     run_bench_serving,
+)
+from sglang.test.ascend.test_ascend_utils import (
+    append_ld_library_path,
+    resolve_local_ip,
+    write_memfabric_tent_conf,
 )
 from sglang.test.ci.ci_register import register_npu_ci
 
@@ -55,6 +64,14 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ENVS = {
     "SGLANG_PROFILE_WITH_STACK": "False",
     # send cached prefix to decode early for radix-cache hits
     "SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX": "1",
+    # L3 store client: MemFabric TENT transport over the NPU device path, as in
+    # the standalone deployment scripts. The store endpoint travels in the
+    # extra-config JSON and MC_TENT_CONF, both built in setUpClass.
+    "MC_USE_TENT": "1",
+    "MF_PROTOCOL": "device_sdma",
+    "MF_STORE_PROTOCOL": "device_sdma",
+    "MF_TRANSFER_TIMEOUT": "10000",
+    "SGLANG_HICACHE_MOONCAKE_REUSE_TE": "0",
 }
 
 # Decode node environment variables for DSV4-Flash-0731 PD-Sep deployment.
@@ -125,6 +142,10 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
     "page_first",
     "--hicache-write-policy",
     "write_through",
+    "--hicache-storage-prefetch-policy",
+    "wait_complete",
+    "--hicache-storage-backend",
+    "mooncake",
     "--enable-cache-report",
     "--max-total-tokens",
     140000,
@@ -205,13 +226,45 @@ class TestNPUDeepSeekV4Flash0731W8A8PDSEPGPQAHigh(
 
     @classmethod
     def setUpClass(cls):
+        # Only the prefill node runs the L3 store client; the decode node has no
+        # storage backend. Everything deployment-specific is assembled here: the
+        # TENT config and MemFabric library path of this pod, plus the Mooncake
+        # store config, which is one JSON passed through
+        # --hicache-storage-backend-extra-config (once it carries
+        # master_server_address the client ignores the MOONCAKE_* env vars).
+        # The master runs on the first prefill pod, not necessarily this one, and
+        # the segment is requested per scheduler rank: keep it small, because
+        # 16-20 GiB made the Ascend driver reject the last rank's HalMemCreate
+        # and the prefill server died with "Failed to setup Mooncake store,
+        # error code: -600".
+        l3_config = json.dumps(
+            {
+                "master_server_address": get_mooncake_master_server_address(),
+                "metadata_server": "P2PHANDSHAKE",
+                "protocol": "ascend",
+                "global_segment_size": "8gb",
+                "local_hostname": resolve_local_ip(),
+                "extra_backend_tag": "pd-1p1d-dsv4-flash-0731",
+            }
+        )
         cls.model_config = {
             "model_path": DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH,
-            "prefill_args": list(DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS),
+            "prefill_args": [
+                *DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS,
+                "--hicache-storage-backend-extra-config",
+                l3_config,
+            ],
             "decode_args": list(DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_DECODE_ARGS),
-            "prefill_envs": dict(DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ENVS),
+            "prefill_envs": {
+                **DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ENVS,
+                "MC_TENT_CONF": write_memfabric_tent_conf(),
+                "LD_LIBRARY_PATH": append_ld_library_path(("memfabric_hybrid", "lib")),
+            },
             "decode_envs": dict(DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_DECODE_ENVS),
-            "router_args": [],
+            # DSV4-Flash GPQA High streams up to 125k tokens per request, which
+            # takes over an hour; the default 1800s router timeout cuts those
+            # responses off mid-stream ("incomplete chunked read" in evalscope).
+            "router_args": ["--request-timeout-secs", "10800"],
             "router_envs": {},
         }
         super().setUpClass()
