@@ -640,6 +640,64 @@ def generate_metrics_json(
     logger.info(f"Metrics JSON written to {output_path}")
 
 
+def dump_pod_logs(namespace, pod_name_key_str, metrics_data_file):
+    """Archive the container log of every pod that has not archived its own.
+
+    The pod-side script only copies its own log after its test process exits, so
+    when one role fails the remaining pods are deleted before they archive
+    anything (the prefill pod was the only log in the artifact). Running before
+    delete_pod() captures the router, prefill and decode logs no matter how each
+    pod ended; pods that already wrote their own copy are left untouched.
+    """
+    if not metrics_data_file:
+        return
+    try:
+        pods = core_api.list_namespaced_pod(namespace=namespace)
+    except Exception as e:
+        logger.warning(f"Failed to list pods for log collection: {e}")
+        return
+
+    for pod in pods.items:
+        pod_name = pod.metadata.name
+        if pod_name_key_str not in pod_name:
+            continue
+        out_dir = os.path.join(metrics_data_file, "node_logs", pod_name)
+        # The pod archives its own log here once its test process exits; skip
+        # those so the same log is not stored twice.
+        if os.path.isdir(out_dir) and any(
+            name.endswith(".log") for name in os.listdir(out_dir)
+        ):
+            logger.info(f"Pod log already archived by {pod_name}, skipping")
+            continue
+        out_path = os.path.join(out_dir, f"{pod_name}.log")
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+            # Write straight to disk: a router/prefill log can be tens of MB.
+            with open(out_path, "w", encoding="utf-8") as f:
+                result = subprocess.run(
+                    [
+                        "kubectl",
+                        "logs",
+                        "-n",
+                        namespace,
+                        pod_name,
+                        "--all-containers=true",
+                    ],
+                    stdout=f,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=120,
+                )
+            if result.returncode != 0:
+                logger.warning(
+                    f"kubectl logs {pod_name} failed: {result.stderr.strip()}"
+                )
+            else:
+                logger.info(f"Pod log saved to {out_path}")
+        except Exception as e:
+            logger.warning(f"Failed to archive logs for pod {pod_name}: {e}")
+
+
 def run_npu_e2e_test_case(
     docker_image_url: str,
     kube_name_space: str,
@@ -855,6 +913,7 @@ def run_npu_e2e_test_case(
                 except Exception as e:
                     logger.error(f"Failed to generate metrics JSON: {e}", exc_info=True)
     finally:
+        dump_pod_logs(kube_name_space, final_kube_job_name, metrics_data_file)
         if os.path.exists(kube_yaml_file):
             # Don't delete pod when trouble_shotting is enabled
             if not trouble_shotting:
