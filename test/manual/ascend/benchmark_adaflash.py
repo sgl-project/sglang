@@ -80,7 +80,7 @@ DATASET_PRESETS = {
         "concurrency": 64,
         "max_new_tokens": 2048,
         "context_length": 4096,
-        "mem_fraction_static": 0.45,
+        "mem_fraction_static": 0.80,
     },
 }
 
