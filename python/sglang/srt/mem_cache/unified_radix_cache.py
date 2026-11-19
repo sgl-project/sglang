@@ -10,6 +10,7 @@ from array import array
 from collections import deque
 from contextlib import ExitStack, nullcontext
 from dataclasses import replace
+from functools import partial
 from http import HTTPStatus
 from queue import Queue
 from typing import (
@@ -219,6 +220,7 @@ class _OngoingPrefetch(NamedTuple):
 
 
 class UnifiedRadixCache(BasePrefixCache):
+    _trim_full_eviction_leaf: Optional[Callable[[NodeId, int], None]] = None
     # Unlimited-OCR v2 split-document KV reuse; None for every other model.
     uocr_doc_reuse: Optional[DocReuse] = None
     # Whether eviction walks every component in one joint LRU order; set from the
@@ -317,6 +319,24 @@ class UnifiedRadixCache(BasePrefixCache):
         # Components execute boundary actions through the tree core.
         for component in self.components.values():
             component.tree_core = self.tree_core
+
+        chunk = envs.SGLANG_PYTHON_RADIX_EVICT_TAIL_CHUNK_SIZE.get()
+        if chunk < 0 or chunk % params.page_size:
+            raise ValueError(
+                "eviction tail chunk size must be a nonnegative page multiple"
+            )
+        if (
+            chunk
+            and self._tree_core_backend == "python"
+            and self.tree_components == (BASE_COMPONENT_TYPE,)
+            and type(self.components[BASE_COMPONENT_TYPE]) is FullComponent
+            and not params.enable_session_radix_cache
+            and params.attn_cp_size == 1
+            and page_interleave_shard_size(params.token_to_kv_pool_allocator) == 1
+        ):
+            self._trim_full_eviction_leaf = partial(
+                self.components[BASE_COMPONENT_TYPE].trim_eviction_leaf, chunk=chunk
+            )
 
         if (
             page_interleave_shard_size(params.token_to_kv_pool_allocator) > 1
@@ -1295,6 +1315,15 @@ class UnifiedRadixCache(BasePrefixCache):
                 tracker[ct] += pending_tokens
                 node_id, made_progress = self._evict_device_next_node(ct, tracker)
                 tracker[ct] -= pending_tokens
+                if (
+                    node_id is not None
+                    and self._trim_full_eviction_leaf is not None
+                    and satisfied is None
+                ):
+                    remaining = request_cnt - tracker[ct]
+                    if demand is not None and ct in demand:
+                        remaining = demand[ct] - self._pool_available(ct)
+                    self._trim_full_eviction_leaf(node_id, remaining - pending_tokens)
                 if node_id is None:
                     if not made_progress:
                         break
