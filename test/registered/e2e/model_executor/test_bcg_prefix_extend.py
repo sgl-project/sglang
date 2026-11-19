@@ -26,7 +26,7 @@ from sglang.test.test_utils import (
 )
 
 # MI35x only: the logprob tolerance was measured on MI355X.
-register_amd_ci(est_time=600, suite="nightly-amd-1-gpu-mi35x", nightly=True)
+register_amd_ci(est_time=600, suite="nightly-test-1-gpu-amd-mi35x", nightly=True)
 
 _SERVER_ARGS = [
     "--trust-remote-code",
