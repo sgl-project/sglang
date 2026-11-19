@@ -291,7 +291,7 @@ class TestPrefetchCheckpoints(CustomTestCase):
             expert.format(3, n) for n in ("weight", "weight_scale_inv")
         }
         self.assertEqual(
-            {k for k, v in tensors.items() if selects[0](k, v.nbytes)}, read
+            {k for k, v in tensors.items() if selects[0](k, v.nbytes, v.shape)}, read
         )
         self.assertEqual(set(loaded), read)
 
