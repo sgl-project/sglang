@@ -1,0 +1,3 @@
+[
+  {"hw":"h100","mode":"balanced","verified":"verified","gpus":1,"env":{},"url":"https://docs.sglang.io/cookbook/autoregressive/IFM/Jais-3#hw=h100&variant=7b&quant=bf16&strategy=balanced&nodes=single","command":"sglang serve \\\n  --model-path IFM/Jais-3-7B \\\n  --tp 1 \\\n  --dtype bfloat16 \\\n  --attention-backend fa3 \\\n  --reasoning-parser k2_horizon \\\n  --host 0.0.0.0 \\\n  --port 30000"}
+]

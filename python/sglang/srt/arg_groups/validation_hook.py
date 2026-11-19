@@ -13,7 +13,11 @@ from sglang.srt.arg_groups.arg_utils import (
     _field_to_cli_name,
     record_fields,
 )
-from sglang.srt.arg_groups.choices import BUILT_IN_SAMPLING_BACKENDS
+from sglang.srt.arg_groups.choices import (
+    BUILT_IN_SAMPLING_BACKENDS,
+    REMOVED_CHOICES,
+    removed_choice_message,
+)
 from sglang.srt.arg_groups.model_override_base import resolved_view, resolving_view
 from sglang.srt.arg_groups.overrides import (
     _hisparse_validation,
@@ -24,7 +28,7 @@ from sglang.srt.configs.unlimited_ocr_v2 import UocrDocumentConfig
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     parse_ib_device_config,
 )
-from sglang.srt.environ import envs
+from sglang.srt.environ import REMOVED_ENVS, envs
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.runtime_context import (
     attn_dp_enabled_of,
@@ -357,6 +361,11 @@ def check_server_args(server_args: Any):
             "--port listener, so the other replicas' listeners advertise "
             "registries that never become ready. Launch one prefill server per "
             "replica, or unset SGLANG_RUST_SERVER."
+        )
+
+    if cfg.disable_multimodal and cfg.enable_multimodal:
+        raise ValueError(
+            "--disable-multimodal cannot be combined with --enable-multimodal"
         )
 
     assert cfg.base_gpu_id >= 0, "base_gpu_id must be non-negative"
@@ -925,14 +934,30 @@ def default_unset_prefill_decode_interval(server_args: Any):
         )
 
 
+def validate_removed_options(server_args: Any):
+    """Stop on a removed choice value or environment variable, naming what to use.
+
+    The CLI rejects a removed value while parsing; this covers the Python API.
+    """
+    cfg = resolving_view(server_args)
+    for field in REMOVED_CHOICES:
+        message = removed_choice_message(field, getattr(cfg, field))
+        if message is not None:
+            raise ValueError(f"--{field.replace('_', '-')}: {message}.")
+    for name in os.environ:
+        if name in REMOVED_ENVS:
+            raise ValueError(
+                f"Environment variable {name} was removed in SGLang 1.0; "
+                f"{REMOVED_ENVS[name]}."
+            )
+        if name.startswith("SGL_") and hasattr(envs, "SGLANG_" + name[4:]):
+            raise ValueError(
+                f"Environment variable {name} was removed in SGLang 1.0; use "
+                f"SGLANG_{name[4:]}."
+            )
+
+
 def validate_sampling_mask_max_tokens(server_args: Any):
-    if envs.SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS.is_set():
-        raise ValueError(
-            "SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS is no longer supported. "
-            "Unset it. To enable sampling masks for disaggregated serving, set "
-            "SGLANG_ENABLE_DISAGG_SAMPLING_MASK=1 and use the same positive "
-            "--sampling-mask-max-tokens value on both prefill and decode servers."
-        )
     cfg = resolving_view(server_args)
     if cfg.sampling_mask_max_tokens <= 0:
         raise ValueError(
