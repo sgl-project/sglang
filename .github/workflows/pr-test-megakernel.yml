@@ -116,15 +116,15 @@ jobs:
         working-directory: sgl-nvidia-mega
         env:
           TESTS: ${{ matrix.tests }}
-          KIMI_CI_OUTPUT_DIR: ${{ runner.temp }}/kimi-ci-${{ github.run_id }}-${{ github.run_attempt }}
+          MEGA_E2E_OUTPUT_DIR: ${{ runner.temp }}/megakernel-e2e-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           read -ra paths <<< "$TESTS"
           python3 -m pytest -v -rfE -s "${paths[@]}"
 
-      - name: Save Kimi comparison evidence
+      - name: Save megakernel comparison evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: kimi-ci-${{ matrix.runner }}
-          path: ${{ runner.temp }}/kimi-ci-${{ github.run_id }}-${{ github.run_attempt }}
+          name: megakernel-e2e-${{ matrix.runner }}
+          path: ${{ runner.temp }}/megakernel-e2e-${{ github.run_id }}-${{ github.run_attempt }}
           if-no-files-found: ignore
