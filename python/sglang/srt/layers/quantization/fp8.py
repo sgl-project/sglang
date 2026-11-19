@@ -914,9 +914,7 @@ class Fp8LinearMethod(LinearMethodBase):
             and weight.dtype == torch.float8_e4m3fn
         )
         gfx942_bf16_cache = (
-            _is_gfx942_supported
-            and envs.SGLANG_OPT_GFX942_BLOCK_FP8_BF16.get()
-            and weight.dtype == torch.float8_e4m3fnuz
+            _is_gfx942_supported and weight.dtype == torch.float8_e4m3fnuz
         )
         if (
             (hopper_bf16_cache or gfx942_bf16_cache)
@@ -946,16 +944,15 @@ class Fp8LinearMethod(LinearMethodBase):
                     block_quant_dequant(weight, weight_scale, [32, 32], torch.bfloat16),
                     persistent=False,
                 )
-                env_name = (
-                    "SGLANG_OPT_GFX942_BLOCK_FP8_BF16"
-                    if gfx942_bf16_cache
-                    else "SGLANG_OPT_HOPPER_BLOCK_FP8_BF16"
-                )
                 layer._derived_weight_cache_error = (
-                    "Online weight updates are not supported while FP8 "
+                    "Online weight updates are not supported for group32 FP8 "
+                    "weights on gfx942: captured CUDA graphs retain their BF16 "
+                    "expansions."
+                    if gfx942_bf16_cache
+                    else "Online weight updates are not supported while Hopper FP8 "
                     "BF16 weight caches are active: captured CUDA graphs retain "
-                    f"these derived weights. Restart with {env_name}=0 to allow "
-                    "online updates."
+                    "these derived weights. Restart with "
+                    "SGLANG_OPT_HOPPER_BLOCK_FP8_BF16=0 to allow online updates."
                 )
         if self.block_fp8_as_mxfp8:
             self._prepare_block_fp8_as_mxfp8(layer)

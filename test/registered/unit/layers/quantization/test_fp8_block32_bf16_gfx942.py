@@ -5,7 +5,6 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import fp8_utils
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.utils import is_gfx942_supported
@@ -100,11 +99,10 @@ class TestGfx942Block32Bf16Linear(CustomTestCase):
                 has_cache = getattr(layer, "_block_fp8_bf16_weight", None) is not None
                 self.assertEqual(has_cache, cached)
 
-    def test_env_off_skips_cache(self):
-        with envs.SGLANG_OPT_GFX942_BLOCK_FP8_BF16.override(False):
-            layer, _ = _build_layer(64, 128)
-        self.assertIsNone(getattr(layer, "_block_fp8_bf16_weight", None))
-        self.assertIsNone(getattr(layer, "_derived_weight_cache_error", None))
+    def test_cache_rejects_online_updates(self):
+        layer, _ = _build_layer(64, 128)
+        self.assertIsNotNone(getattr(layer, "_block_fp8_bf16_weight", None))
+        self.assertIn("gfx942", layer._derived_weight_cache_error)
 
 
 if __name__ == "__main__":
