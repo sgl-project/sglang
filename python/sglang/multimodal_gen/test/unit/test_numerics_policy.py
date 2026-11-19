@@ -8,6 +8,7 @@ tier's contract depend on the build. The policy sets both explicitly.
 
 import sys
 import unittest
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -17,6 +18,12 @@ from sglang.multimodal_gen.runtime.utils.numerics_policy import apply_numerics_p
 
 class TestNumericsPolicy(unittest.TestCase):
     def setUp(self):
+        cuda_platform = patch(
+            "sglang.multimodal_gen.runtime.utils.numerics_policy.current_platform.is_cuda",
+            return_value=True,
+        )
+        cuda_platform.start()
+        self.addCleanup(cuda_platform.stop)
         self._cudnn_tf32 = torch.backends.cudnn.allow_tf32
         self._bf16_reduction = (
             torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction

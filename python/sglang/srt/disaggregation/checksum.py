@@ -43,6 +43,11 @@ def page_indices_for_request(
     kv_indices = scheduler.req_to_token_pool.req_to_token[
         req.kv.req_pool_idx, start_idx:end_idx
     ]
+    # req_to_token contains virtual IDs with unified memory. Digest the same
+    # physical pages as the transfer, including after arena compaction.
+    kv_indices = scheduler.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
+        kv_indices
+    )
     return _to_page_indices_gpu(kv_indices, page_size)
 
 
@@ -93,10 +98,15 @@ def _state_indices(
     router = pool.layer_router
     # A pool wrapping one token KV view keeps its other layers' state per request.
     if router.wrapped_view() is not None:
+        state_ids = scheduler.token_to_kv_pool_allocator.state_ids(
+            scheduler.req_to_token_pool.state_sub_pool
+        )
         return (
-            scheduler.req_to_token_pool.req_index_to_mamba_index_mapping[
-                req.kv.req_pool_idx
-            ]
+            state_ids.ids(
+                scheduler.req_to_token_pool.req_index_to_mamba_index_mapping[
+                    req.kv.req_pool_idx
+                ]
+            )
             .to(torch.int64)
             .contiguous()
             .reshape(-1)
