@@ -186,10 +186,11 @@ fallback. An explicit `--moe-runner-backend triton` also bypasses the native
 FP8 path.
 
 MXFP8 also uses Triton for an explicit Triton runner, input-side router
-weighting, uncombined outputs, exact GELU, expert parallelism (EP), or non-Xe2
-architectures. In this fallback, activations undergo dynamic per-token-group FP8
+weighting, uncombined outputs, exact GELU, or expert parallelism (EP).
+In this fallback, activations undergo dynamic per-token-group FP8
 quantization, and the Triton GEMM kernel decodes UE8M0 scale bytes into FP32
 multipliers on the fly without materializing BF16 expert weights.
+To use Triton on non-Xe2 architectures, pass `--moe-runner-backend triton`.
 
 ## Benchmarking with Requests
 

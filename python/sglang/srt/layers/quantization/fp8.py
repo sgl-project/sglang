@@ -2132,7 +2132,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             # apply() sends these to kernels that take the checkpoint block.
             and not _is_cpu
             and not (
-                not get_moe_runner_backend().is_triton()
+                _is_xpu
+                and not get_moe_runner_backend().is_triton()
                 and can_use_xpu_fp8_moe(
                     layer.moe_runner_config,
                     self.weight_block_size,
