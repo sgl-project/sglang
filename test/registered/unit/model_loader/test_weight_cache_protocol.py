@@ -197,7 +197,8 @@ class TestDerivedBufferIpcContract(CustomTestCase):
         daemon.model = daemon_model
         daemon.gpu_id = 0
         daemon.state_entries = {}
-        daemon.transport_backend = None
+        daemon.transport_name = TORCH_IPC_BACKEND
+        daemon.transport_backend = TorchIpcTransportBackend()
         daemon._export_state()
 
         a, b = socket.socketpair()
