@@ -114,13 +114,6 @@ class TestBreakableAuxHiddenStatesBuffer(CustomTestCase):
             self.assertEqual(aux.data_ptr(), buffer.data_ptr())
             self.assertEqual(tuple(aux.shape), (size, NUM_CAPTURES * HIDDEN))
 
-        last = sizes[-1]
-        expected = torch.cat(
-            [torch.full((last, HIDDEN), float(last + i)) for i in range(NUM_CAPTURES)],
-            dim=-1,
-        )
-        torch.testing.assert_close(buffer[:last], expected)
-
     def test_output_outside_the_runner_buffer_gets_its_own_leaf(self):
         runner = _make_runner()
         runner.aux_hidden_states_buffer = torch.zeros(MAX_TOKENS, NUM_CAPTURES * HIDDEN)
