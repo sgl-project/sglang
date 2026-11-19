@@ -827,6 +827,18 @@ class TestAllocationIntegration(CustomTestCase):
         self.assertEqual(receiver.poll(), KVPoll.Success)
         self.assertNotIn(1, self.decode.failure_records)
 
+    def test_recompute_http_error_after_success_is_ignored_in_early_mode(self):
+        self.decode.defer_decode_allocation = False
+        with get_context().override_server_args(
+            disaggregation_decode_allocation_policy="early"
+        ):
+            receiver = self.receiver(policy="early")
+            self.assertEqual(receiver.poll(), KVPoll.WaitingForInput)
+            self.decode.update_status(1, KVPoll.Success)
+            self.decode._fail_prefill_recompute(receiver, "late HTTP timeout")
+            self.assertEqual(receiver.poll(), KVPoll.Success)
+            self.assertNotIn(1, self.decode.failure_records)
+
     def test_receiver_retirement_waits_for_recompute_error_callback(self):
         receiver = self.receiver()
         error_started = threading.Event()
