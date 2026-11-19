@@ -69,5 +69,53 @@ class TestRawChecksumWithoutCuda(CustomTestCase):
                 )
 
 
+class _ModelWithNonPersistentBuffers(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear = nn.Linear(4, 4)
+        self.rotary_emb = nn.Module()
+        # Same shape of buffer as MRotaryEmbedding.axis_map: an index map that
+        # is built at init and never sent by a weight update.
+        self.rotary_emb.register_buffer(
+            "axis_map", torch.tensor([0, 1, 2, 0, 1, 2]), persistent=False
+        )
+        self.register_buffer("token_map", torch.arange(8), persistent=False)
+        self.register_buffer("running_mean", torch.zeros(4))
+        self.linear.weight.requires_grad_(False)
+        self.linear.bias.requires_grad_(False)
+
+
+class TestResetTensorsKeepsNonPersistentBuffers(CustomTestCase):
+    def setUp(self):
+        torch.manual_seed(0)
+        self.model = _ModelWithNonPersistentBuffers()
+        enter_scope(self, published_topology())
+        self.checker = WeightChecker(get_model=lambda: self.model)
+
+    def test_reset_keeps_non_persistent_buffers(self):
+        """reset_tensors must not write random values into buffers that are not
+        in the state dict, because a weight update cannot restore them."""
+        axis_map = self.model.rotary_emb.axis_map.clone()
+        token_map = self.model.token_map.clone()
+        self.checker.handle("reset_tensors", role="target")
+        self.assertTrue(torch.equal(self.model.rotary_emb.axis_map, axis_map))
+        self.assertTrue(torch.equal(self.model.token_map, token_map))
+
+    def test_reset_still_changes_params_and_persistent_buffers(self):
+        weight = self.model.linear.weight.clone()
+        running_mean = self.model.running_mean.clone()
+        self.checker.handle("reset_tensors", role="target")
+        self.assertFalse(torch.equal(self.model.linear.weight, weight))
+        self.assertFalse(torch.equal(self.model.running_mean, running_mean))
+
+    def test_compare_passes_after_restoring_state_dict(self):
+        """Simulate a weight update: it restores only the state dict."""
+        self.checker.handle("snapshot", role="target")
+        state = {k: v.clone() for k, v in self.model.state_dict().items()}
+        self.checker.handle("reset_tensors", role="target")
+        self.model.load_state_dict(state)
+        self.checker.handle("compare", role="target")
+
+
 if __name__ == "__main__":
     unittest.main()
