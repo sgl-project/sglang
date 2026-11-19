@@ -188,6 +188,16 @@ def _register_group(group: "GroupCoordinator") -> None:
     _groups[group.unique_name] = weakref.ref(group)
 
 
+def _aiter_capture_registered(ca_comm) -> bool:
+    # Copy-in whenever the communicator was built for it: ranks may replay
+    # different graphs (see custom_all_reduce._enable_register_for_capturing).
+    return (
+        ca_comm.enable_register_for_capturing
+        and not envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
+        and not envs.SGLANG_AITER_CAPTURE_COPY_IN.get()
+    )
+
+
 @register_custom_op(mutates_args=["tensor"])
 @register_split_op()
 def inplace_all_reduce(tensor: torch.Tensor, group_name: str) -> None:
@@ -1220,13 +1230,9 @@ class GroupCoordinator:
             return False
         if getattr(ca_comm, "_IS_CAPTURING", False):
             if torch.cuda.is_current_stream_capturing():
-                if (
-                    envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
-                    or envs.SGLANG_AITER_CAPTURE_COPY_IN.get()
-                ):
-                    ca_comm.reduce_scatter(input, output, registered=False)
-                else:
-                    ca_comm.reduce_scatter(input, output, registered=True)
+                ca_comm.reduce_scatter(
+                    input, output, registered=_aiter_capture_registered(ca_comm)
+                )
             elif is_in_tc_piecewise_cuda_graph():
                 ca_comm.reduce_scatter(input, output, registered=False)
             else:
@@ -1338,13 +1344,10 @@ class GroupCoordinator:
         ):
             if getattr(ca_comm, "_IS_CAPTURING", False):
                 if torch.cuda.is_current_stream_capturing():
-                    if (
-                        envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
-                        or envs.SGLANG_AITER_CAPTURE_COPY_IN.get()
-                    ):
-                        ca_comm.all_gather_unreg(input, out=output, dim=0)
-                    else:
+                    if _aiter_capture_registered(ca_comm):
                         ca_comm.all_gather_reg(input, out=output, dim=0)
+                    else:
+                        ca_comm.all_gather_unreg(input, out=output, dim=0)
                 elif is_in_tc_piecewise_cuda_graph():
                     ca_comm.all_gather_unreg(input, out=output, dim=0)
                 else:
