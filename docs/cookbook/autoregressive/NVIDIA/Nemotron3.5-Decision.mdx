@@ -1,0 +1,157 @@
+---
+title: NVIDIA Nemotron 3.5 Decision 8B
+description: "Deploy Nemotron 3.5 Decision 8B with SGLang for calibrated choice, yes/no, and score responses over text or JSON on NVIDIA GPUs."
+tag: NEW
+---
+
+## Deployment
+
+Install SGLang using the [installation guide](/docs/get-started/install). Until a release includes Nemotron Decision support, use a [nightly build](/docs/get-started/install#nightly-builds) after [#51364](https://github.com/sgl-project/sglang/pull/51364) merges. The Docker tab uses `lmsysorg/sglang:dev`.
+
+Choose your GPU to generate a BF16 launch command. Each recipe uses one GPU and SGLang's default attention, graph, and memory settings.
+
+import { Deployment } from "/src/snippets/_deployment.jsx";
+import { config } from "/src/snippets/configs/nvidia/nemotron-3.5-decision.jsx";
+
+<Deployment config={config} />
+
+## Playground
+
+The Playground lets you adjust tensor parallelism. The deployment recipes above use one GPU.
+
+import { Playground } from "/src/snippets/_playground.jsx";
+
+<Playground config={config} />
+
+## 1. Model introduction
+
+[NVIDIA Nemotron 3.5 Decision 8B](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Decision-8B-BF16) answers typed questions about text or JSON. It uses a Ministral 3 backbone with fully bidirectional attention and scores the supplied answer options without generating text. See the checkpoint's model card and [license](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Decision-8B-BF16/blob/main/LICENSE) for usage terms.
+
+Send requests through `/v1/systemone` or `/v1/decisions`. Both use the checkpoint's trained prompt, answer labels, and calibration. A `choice` selects an option, a boolean question returns a probability, and a `score` returns a probability-weighted value over ordered levels.
+
+## 2. Configuration tips
+
+- **Complete reads.** Each question reads its full state and question together. SGLang disables prefix caching and chunked prefill because every token must attend to the complete question. A request with several questions runs one read per question. A follow-up PR is planned for opt-in shared-state packing: state tokens would attend only to the state, while each question would attend to the state and its own tokens. This changes the attention pattern and may change answer probabilities.
+- **Input budget.** The default prefill budget is 32K tokens, or 16K on GPUs below 60 GiB. The checkpoint allows up to 131,072 tokens per complete prompt, but the server's prefill budget, context length, and available memory can impose a smaller limit. Increase `--max-prefill-tokens` only when the GPU has room for the full read. Oversized prompts return an error rather than being truncated.
+- **Question limits.** The BF16 checkpoint allows up to 512 questions per request and 2–501 options or score levels per question. Options retain their input order. These limits are read from `decision.json` in the model repository.
+- **API formats.** `/v1/systemone` takes a `state` and a dictionary of named questions. `/v1/decisions` takes `input` and a list of questions with IDs. Its `prompt_format_version` is 2 for this checkpoint; requesting a different version returns an error.
+- **Calibration.** The checkpoint sets calibration temperatures by question type. `/v1/decisions` also accepts a request `temperature` to adjust answer probabilities. It does not change `label_mass`, the full-vocabulary probability assigned to the candidate labels.
+- **Supported inputs.** Requests accept text and JSON. Images, chat completions, shared-state packing, and multi-token generation are not supported. ROCm serving is rejected at startup because its default attention backend does not honor this model’s bidirectional attention.
+
+See [Decision models](/docs/supported-models/decision_models) for the full API reference and error behavior.
+
+## 3. Request examples
+
+Run these examples against the server started above. They ask which team owns an outage, whether the service is down, and how severe the outage is.
+
+<Accordion title="System One API (Python)">
+
+```python Example
+import json
+import requests
+
+response = requests.post(
+    "http://localhost:30000/v1/systemone",
+    json={
+        "model": "nvidia/NVIDIA-Nemotron-3.5-Decision-8B-BF16",
+        "state": {"ticket": "The service is down. All users are affected."},
+        "questions": {
+            "team": {
+                "type": "choice",
+                "instructions": "Which team should handle this ticket?",
+                "criteria": {
+                    "billing": "Payments and invoices",
+                    "operations": "Service outages",
+                },
+            },
+            "down": {"type": "noul", "instructions": "Is the service down?"},
+            "severity": {
+                "type": "score",
+                "instructions": "Rate the service impact.",
+                "criteria": ["No impact", "Degraded service", "Service unavailable"],
+            },
+        },
+    },
+    timeout=120,
+)
+response.raise_for_status()
+answers = response.json()["answers"]
+print(json.dumps({
+    "team": answers["team"]["choice"],
+    "down": answers["down"]["noul"],
+    "severity": answers["severity"]["score"],
+}, indent=2))
+```
+
+</Accordion>
+
+<Accordion title="Example Output">
+
+Captured on one H100. Probabilities can vary with hardware and numerical backend.
+
+```json Output
+{
+  "team": "operations",
+  "down": 0.9748211641513499,
+  "severity": 1.9575377800171994
+}
+```
+
+</Accordion>
+
+<Accordion title="Decisions API (Python)">
+
+```python Example
+import json
+import requests
+
+response = requests.post(
+    "http://localhost:30000/v1/decisions",
+    json={
+        "model": "nvidia/NVIDIA-Nemotron-3.5-Decision-8B-BF16",
+        "input": {"ticket": "The service is down. All users are affected."},
+        "questions": [
+            {
+                "id": "team",
+                "type": "choice",
+                "question": "Which team should handle this ticket?",
+                "options": [
+                    {"name": "billing", "description": "Payments and invoices"},
+                    {"name": "operations", "description": "Service outages"},
+                ],
+            },
+            {"id": "down", "type": "yes_no", "question": "Is the service down?"},
+            {
+                "id": "severity",
+                "type": "score",
+                "question": "Rate the service impact.",
+                "levels": ["No impact", "Degraded service", "Service unavailable"],
+            },
+        ],
+    },
+    timeout=120,
+)
+response.raise_for_status()
+answers = response.json()["answers"]
+print(json.dumps({
+    "team": answers["team"]["choice"],
+    "down": answers["down"]["probabilities"]["yes"],
+    "severity": answers["severity"]["score"],
+}, indent=2))
+```
+
+</Accordion>
+
+<Accordion title="Example Output">
+
+Captured on one H100. Probabilities can vary with hardware and numerical backend.
+
+```json Output
+{
+  "team": "operations",
+  "down": 0.9748211641513499,
+  "severity": 1.9575377800171994
+}
+```
+
+</Accordion>
