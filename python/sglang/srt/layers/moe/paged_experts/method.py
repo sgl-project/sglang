@@ -530,7 +530,8 @@ def make_for_layer(layer, base_method) -> PagedExpertsMoEMethod:
         expert_format=expert_format,
         num_experts=num_experts,
         num_resident=num_resident,
-        graphs=not cuda_graph_fully_disabled(),
+        graphs=not cuda_graph_fully_disabled()
+        or get_exec().moe.paged_experts_fused_host_copy,
         auto_size=requested is None,
     )
 
