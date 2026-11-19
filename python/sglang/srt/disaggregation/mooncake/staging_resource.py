@@ -108,9 +108,8 @@ class MooncakeStagingResource:
         )
         # Keep ownership even if the transport cannot confirm registration.
         self._registration_attempted = True
-        ret = self.engine.batch_register([self.backing.get_ptr()], [self.capacity])
-        if ret != 0:
-            raise RuntimeError(f"Shared staging registration failed (ret={ret})")
+        # The TE wrapper returns None on success and raises on failure.
+        self.engine.batch_register([self.backing.get_ptr()], [self.capacity])
         self.prefill_buffers = [
             StagingBuffer.from_tensor(
                 self.backing.buffer[

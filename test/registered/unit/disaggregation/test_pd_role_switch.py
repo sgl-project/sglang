@@ -1007,7 +1007,8 @@ class TestMooncakeStagingResource(unittest.TestCase):
 
     def resource(self, decode_bytes=4096, device_type="cuda"):
         engine = SimpleNamespace(
-            batch_register=Mock(return_value=0), batch_deregister=Mock(return_value=0)
+            batch_register=Mock(return_value=None),
+            batch_deregister=Mock(return_value=0),
         )
         args = SimpleNamespace(gpu_id=0, page_size=1, kv_item_lens=[128, 128])
         r = MooncakeStagingResource(
@@ -1133,7 +1134,7 @@ class TestMooncakeStagingResource(unittest.TestCase):
     def test_registration_errors_keep_storage_owned(self):
         r = MooncakeStagingResource(
             SimpleNamespace(
-                batch_register=Mock(return_value=-1),
+                batch_register=Mock(side_effect=RuntimeError("registration failed")),
                 batch_deregister=Mock(return_value=0),
             ),
             SimpleNamespace(gpu_id=0, page_size=1, kv_item_lens=[128]),
