@@ -13,7 +13,7 @@ import torch
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 
-register_amd_ci(est_time=20, stage="stage-b", runner_config="1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=20, stage="base-b", runner_config="1-gpu-small-amd-mi35x")
 
 if not (torch.cuda.is_available() and is_hip() and is_gfx95_supported()):
     pytest.skip("gfx950 fp8 asm MLA kernel", allow_module_level=True)
