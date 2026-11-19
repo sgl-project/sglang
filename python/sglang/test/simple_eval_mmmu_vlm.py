@@ -5,6 +5,7 @@ MMMU evaluation for VLMs using the run_eval simple-evals interface.
 
 from __future__ import annotations
 
+import ast
 import base64
 import io
 import re
@@ -96,20 +97,7 @@ class MMMUVLMEval(Eval):
         for subs in self.DOMAIN_CAT2SUB_CAT.values():
             subjects.extend(subs)
 
-        # Load validation split of each subject
-        datasets = []
-        for subj in subjects:
-            try:
-                d = load_dataset("MMMU/MMMU", subj, split="validation")
-                # attach subject info via transform
-                d = d.add_column("__subject__", [subj] * len(d))
-                datasets.append(d)
-            except Exception:
-                continue
-        if not datasets:
-            raise RuntimeError("Failed to load MMMU datasets")
-
-        merged = concatenate_datasets(datasets)
+        merged = concatenate_datasets(self._load_subject_datasets(subjects))
 
         # Deterministic selection: sort by id (fallback to subject+index)
         def _key(idx):
@@ -135,17 +123,10 @@ class MMMUVLMEval(Eval):
             all_choices = None
             options = None
             if raw_options:
-                try:
-                    options = (
-                        raw_options
-                        if isinstance(raw_options, list)
-                        else list(eval(raw_options))
-                    )
-                    if isinstance(options, list) and len(options) > 0:
-                        index2ans, all_choices = self._build_mc_mapping(options)
-                        question_type = "multiple-choice"
-                except Exception:
-                    options = None
+                options = self._parse_options(raw_options)
+                if options:
+                    index2ans, all_choices = self._build_mc_mapping(options)
+                    question_type = "multiple-choice"
 
             # Build final textual prompt; include choices if MC
             prompt_text = f"{question}\n"
@@ -177,6 +158,44 @@ class MMMUVLMEval(Eval):
             )
 
         return samples
+
+    @staticmethod
+    def _load_subject_datasets(subjects: List[str]) -> list:
+        """Validation split of every subject, tagged with `__subject__`.
+
+        Raises if any subject fails to load: the samples are picked from the
+        merged set by id, so a missing subject silently changes which questions
+        are scored and how many.
+        """
+        datasets = []
+        failures = []
+        for subj in subjects:
+            try:
+                d = load_dataset("MMMU/MMMU", subj, split="validation")
+            except Exception as e:
+                failures.append(f"{subj} ({_brief_error(e)})")
+                continue
+            datasets.append(d.add_column("__subject__", [subj] * len(d)))
+        if failures:
+            raise RuntimeError(
+                f"Failed to load {len(failures)} of {len(subjects)} MMMU subjects: "
+                + "; ".join(failures)
+            )
+        return datasets
+
+    @staticmethod
+    def _parse_options(raw_options) -> Optional[List[str]]:
+        """Options as a list, or None. MMMU stores them as a Python list literal."""
+        if isinstance(raw_options, list):
+            options = raw_options
+        else:
+            try:
+                options = ast.literal_eval(raw_options)
+            except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError):
+                return None
+        if not isinstance(options, (list, tuple)) or not options:
+            return None
+        return list(options)
 
     @staticmethod
     def _split_prompt_for_image(prompt: str) -> tuple[str, str]:
@@ -332,6 +351,18 @@ class MMMUVLMEval(Eval):
         return EvalResult(
             score=overall_acc, metrics=printable_results, htmls=htmls, convos=convos
         )
+
+
+def _brief_error(error: Exception, max_chars: int = 200) -> str:
+    """Exception type and the first line of its message, at most `max_chars` long.
+
+    Hub errors can span many lines; one line per subject keeps the message short.
+    """
+    lines = str(error).splitlines()
+    first_line = lines[0] if lines else ""
+    if len(first_line) > max_chars:
+        first_line = first_line[: max_chars - 3] + "..."
+    return f"{type(error).__name__}: {first_line}"
 
 
 def _parse_multi_choice_response(
