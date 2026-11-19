@@ -1856,6 +1856,11 @@ class Envs:
     SGLANG_OPT_SCHEDULER_SHM_SYNC_LEADER_TCP = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # Per-tensor FP8 linears through flashinfer_bmm_fp8 run the device table's cuBLASLt
+    # algorithm for an exact (N, K, M), byte-equal to stock (bmm_fp8_cublaslt_algos.py).
+    SGLANG_OPT_BMM_FP8_TUNED_ALGOS = EnvBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
     # PD decode optimizations follow the shared switch unless explicitly disabled.
     SGLANG_ENABLE_NV_MEGA_PDDEC_RUNTIME_OPTIMIZATION = EnvBool(True)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,

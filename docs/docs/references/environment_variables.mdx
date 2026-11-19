@@ -153,6 +153,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Follows the NVIDIA runtime master (both unset: <code>false</code>)</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_OPT_BMM_FP8_TUNED_ALGOS`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Let per-tensor FP8 linears that run FlashInfer's `bmm_fp8` with the cuBLAS backend use the cuBLASLt algorithm that the device's table (`python/sglang/kernels/ops/gemm/configs/bmm_fp8_cublaslt_algos/`) lists for the exact (N, K, M), when the device and the loaded cuBLASLt and FlashInfer versions match the table's. The first eager call of each shape keeps the algorithm only if its output is byte-equal to the stock one; any other call runs the stock path. When unset, this follows `SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION`; an explicit `0` or `1` takes precedence.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Follows the NVIDIA runtime master (both unset: <code>false</code>)</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_ENABLE_TORCH_INFERENCE_MODE`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Control whether to use torch.inference_mode</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`false`</td>
