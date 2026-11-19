@@ -738,9 +738,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 raise ValueError("INT8 indexer KV cache is not supported with NPU KPool.")
             index_dtype = torch.int8 if legacy_int8 else capability.indexer_kv_dtype
             scale_dtype = torch.float16 if legacy_int8 else capability.indexer_scale_dtype
-            index_bytes = index_head_dim * index_dtype.itemsize
+            index_bytes = index_head_dim * torch._utils._element_size(index_dtype)
             if scale_dtype is not None:
-                index_bytes += scale_dtype.itemsize
+                index_bytes += torch._utils._element_size(scale_dtype)
             indexer_size_per_token = ceil_div(index_bytes, compression)
             element_size = 1
         memory_config = get_memory()

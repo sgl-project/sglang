@@ -363,8 +363,9 @@ class DSANPUIndexerMixin:
             self.dsa_enable_prefill_cp and forward_batch.attn_cp_metadata is not None
         )
         # The metadata-backed operator consumes the full forward's query lengths.
-        pool = self.token_to_kv_pool if hasattr(self, "token_to_kv_pool") else forward_batch.token_to_kv_pool
-        capability = getattr(pool, "kv_capability", None)
+        pool = get_token_to_kv_pool()
+        index_pool = getattr(pool, "full_kv_pool", pool)
+        capability = getattr(index_pool, "kv_capability", None)
         uses_metadata_indexer = capability is not None and capability.indexer_quant and capability.indexer_kv_dtype == torch.int8
         shard = (
             _get_indexer_query_shard(forward_batch, bs)
@@ -559,7 +560,6 @@ class DSANPUIndexerMixin:
                 "NPU DSA+DCP origin_out_cache_loc metadata has an incompatible "
                 f"length: {indexer_cache_loc.shape[0]} != {positions.shape[0]}"
             )
-        pool = get_token_to_kv_pool()
         # Hybrid pools (Kimi K2/K3) keep the index buffers on the inner
         # full-attn pool, which is keyed by compact (dense) layer ids;
         # translate the global layer id before unwrapping the wrapper.
@@ -716,7 +716,7 @@ class DSANPUIndexerMixin:
                     pool.index_k_store_dtype,
                     pool.index_k_scale_dtype,
                 )
-                if pool.kv_capability.indexer_quant and pool.kv_capability.indexer_kv_dtype == torch.int8:
+                if uses_metadata_indexer:
                     # Idle ranks get no handle from the backend; skip the kernel.
                     if forward_batch.forward_mode.is_idle():
                         return torch.full(
