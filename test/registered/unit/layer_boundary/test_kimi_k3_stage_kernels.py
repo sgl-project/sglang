@@ -45,6 +45,8 @@ def k3_planning(parallel, **options):
     code reads (prefill CP, pipeline width)."""
     if not hasattr(parallel, "pp_size"):
         parallel.pp_size = 1
+    if not hasattr(parallel, "cp_strategy"):
+        parallel.cp_strategy = None
     with (
         fixture.planning(parallel, **options),
         patch.object(kimi_k3, "get_parallel", lambda: parallel),
