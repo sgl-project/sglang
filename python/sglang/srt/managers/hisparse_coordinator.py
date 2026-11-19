@@ -61,6 +61,7 @@ from sglang.srt.mem_cache.allocator.hisparse import (
 )
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
+    KVCache,
     MiniMaxSparseKVPool,
     ReqToTokenPool,
 )
@@ -129,6 +130,24 @@ def resolve_shared_index_layers(
         )
         return None
     return pattern
+
+
+def _resolve_pool_layer_index(
+    *,
+    kvcache: KVCache,
+    device_pool: KVCache,
+    callers_pass_model_layer_ids: bool,
+) -> Optional[Dict[int, int]]:
+    # A hybrid pool keeps only its full-attention layers, in a dense full pool.
+    if isinstance(kvcache, HybridLinearKVPool):
+        return kvcache.full_attention_layer_id_mapping
+    # A pipeline-parallel stage keeps only its own layers.
+    if callers_pass_model_layer_ids and device_pool.start_layer > 0:
+        return {
+            device_pool.start_layer + layer_index: layer_index
+            for layer_index in range(device_pool.layer_num)
+        }
+    return None
 
 
 def _build_prefetch_groups(
@@ -652,12 +671,14 @@ class HiSparseCoordinator:
                 )
                 self.item_size_bytes = self.mem_pool_host.token_stride_size
         self.page_size = self.mem_pool_device.page_size
-        # Model layer id -> layer index of the dense full pool; None when the
-        # attention callers already pass pool layer indices.
-        self._pool_layer_index: Optional[Dict[int, int]] = (
-            kvcache.full_attention_layer_id_mapping
-            if isinstance(kvcache, HybridLinearKVPool)
-            else None
+        # Model layer id -> layer index of the device and host buffers; None when
+        # the attention callers already pass buffer layer indices.
+        self._pool_layer_index = _resolve_pool_layer_index(
+            kvcache=kvcache,
+            device_pool=self.mem_pool_device,
+            callers_pass_model_layer_ids=not (
+                self.is_dsv4_hisparse or self.is_m3_hisparse
+            ),
         )
 
         max_num_req_slots = req_to_token_pool.req_to_token.shape[0]
@@ -1604,27 +1625,6 @@ class HiSparseCoordinator:
             num_blocks=self._prefetch_copy_blocks,
             is_dsv4_layout=self.is_dsv4_hisparse,
             skip_io=self.skip_io,
-        )
-
-    def swap_in_selected_dsa_pages(
-        self,
-        req_pool_indices: torch.Tensor,
-        compressed_seq_lens: torch.Tensor,
-        top_k_result: torch.Tensor,
-        global_layer_id: int,
-    ) -> torch.Tensor:
-        """Convert DSA global layer IDs to PP-local HiSparse buffer indices.
-
-        DSv4 callers already use compressed pool indices and retain the
-        original swap_in_selected_pages entry point.
-        """
-        if self.is_dsv4_hisparse or self.is_m3_hisparse:
-            raise ValueError("Global DSA layer conversion requires a DSA pool")
-        local_layer_id = global_layer_id - self.mem_pool_device.start_layer
-        if not 0 <= local_layer_id < self.mem_pool_device.layer_num:
-            raise ValueError(f"DSA layer {global_layer_id} outside this PP stage")
-        return self.swap_in_selected_pages(
-            req_pool_indices, compressed_seq_lens, top_k_result, local_layer_id
         )
 
     def swap_in_selected_pages(
