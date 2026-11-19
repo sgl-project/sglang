@@ -224,8 +224,6 @@ class GenerateReqInput:
     # Stable identity shared by requests in the same session. Unlike
     # session_params, this does not alter or reconstruct the prompt.
     session_id: Optional[str] = field(default=None, kw_only=True)
-    # The session that spawned this one (an agent's sub-agent); cache hints only.
-    parent_session_id: Optional[str] = field(default=None, kw_only=True)
     # The input prompt. It can be a single prompt or a batch of prompts.
     text: Optional[Union[List[str], str]] = None
     # The token ids for text.
@@ -305,6 +303,12 @@ class GenerateReqInput:
     return_flat_raw_output_top_logprobs: bool = False
     # Base64-encode the flat arrays. Requires one of the two flags above.
     return_flat_raw_top_logprobs_b64: bool = False
+    # Return output sampling masks as flat arrays plus row lengths instead of the
+    # nested per-token lists, on the finished response only. Requires
+    # return_sampling_mask.
+    return_flat_raw_sampling_mask: bool = False
+    # Base64-encode those arrays. Requires return_flat_raw_sampling_mask.
+    return_flat_raw_sampling_mask_b64: bool = False
     # Whether to stream output.
     stream: bool = False
     # Whether to log metrics for this request (e.g. health_generate calls do not log metrics)
@@ -349,11 +353,6 @@ class GenerateReqInput:
 
     # For DP routing — external router assigns a specific DP worker
     routed_dp_rank: Optional[int] = None
-    # Deprecated alias for `routed_dp_rank`, still accepted because
-    # sgl-model-gateway's dp-aware mode injects this spelling into every
-    # request it forwards (DPAwareWorker::prepare_request), and the OpenAI
-    # entrypoints and Engine.generate() accept it as well.
-    data_parallel_rank: Optional[int] = None
     # For PD disagg — hint telling decode which prefill DP worker has the KV cache
     disagg_prefill_dp_rank: Optional[int] = None
     # Routing key for routing-key schedule policy
@@ -485,18 +484,6 @@ class GenerateReqInput:
             ValueError: If inputs are not properly specified (e.g., none or all of
                        text, input_ids, input_embeds are provided)
         """
-        if self.data_parallel_rank is not None:
-            import warnings
-
-            warnings.warn(
-                "'data_parallel_rank' is deprecated, use 'routed_dp_rank' instead.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-            if self.routed_dp_rank is None:
-                self.routed_dp_rank = self.data_parallel_rank
-            self.data_parallel_rank = None
-
         self._validate_inputs()
         self._determine_batch_size()
         if self.session_id is not None and self.session_params is not None:
@@ -543,6 +530,18 @@ class GenerateReqInput:
             raise ValueError(
                 "return_flat_raw_top_logprobs_b64 requires return_flat_raw_top_logprobs "
                 "or return_flat_raw_output_top_logprobs."
+            )
+        if self.return_flat_raw_sampling_mask and self.stream:
+            raise ValueError(
+                "return_flat_raw_sampling_mask is only set on the finished response "
+                "and does not support stream=True."
+            )
+        if (
+            self.return_flat_raw_sampling_mask_b64
+            and not self.return_flat_raw_sampling_mask
+        ):
+            raise ValueError(
+                "return_flat_raw_sampling_mask_b64 requires return_flat_raw_sampling_mask."
             )
 
     def _determine_batch_size(self):
@@ -1092,7 +1091,6 @@ class GenerateReqInput:
         sub = GenerateReqInput(
             rid=self.rid[i],
             session_id=self.session_id,
-            parent_session_id=self.parent_session_id,
             text=self.text[i] if self.text is not None else None,
             input_ids=self.input_ids[i] if self.input_ids is not None else None,
             input_embeds=(
@@ -1124,6 +1122,8 @@ class GenerateReqInput:
             return_flat_raw_top_logprobs=self.return_flat_raw_top_logprobs,
             return_flat_raw_output_top_logprobs=self.return_flat_raw_output_top_logprobs,
             return_flat_raw_top_logprobs_b64=self.return_flat_raw_top_logprobs_b64,
+            return_flat_raw_sampling_mask=self.return_flat_raw_sampling_mask,
+            return_flat_raw_sampling_mask_b64=self.return_flat_raw_sampling_mask_b64,
             stream=self.stream,
             log_metrics=self.log_metrics,
             return_hidden_states=(
@@ -1315,8 +1315,6 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # scheduler (encoder disaggregation). A defaulted tail field, so older
     # IPC senders decode as None.
     mm_routing_labels: Optional[Dict[str, List[str]]] = None
-    # See GenerateReqInput.parent_session_id; a defaulted tail field.
-    parent_session_id: Optional[str] = None
 
     # Internal identity for an opt-in cancellation retirement receipt. Append-only
     # so existing positional IPC senders continue to decode with None here.
@@ -2679,6 +2677,15 @@ class FreezeGCReq(BaseReq, kw_only=True):
     gc_threshold: Optional[List[int]] = None
 
 
+class ControlAckOutput(BaseReq, kw_only=True):
+    """The reply for a control request whose handler returns nothing
+    (pause/continue generation, freeze_gc, configure_logging, close_session).
+    Sent only to the Rust frontend, which waits for one reply per control
+    request; the Python TokenizerManager fire-and-forgets these."""
+
+    success: bool = True
+
+
 class ShutdownReq(BaseReq, kw_only=True):
     # Broadcast across TP ranks via the normal recv path, so all ranks break
     # the scheduler loop on the same iteration.
@@ -2761,7 +2768,7 @@ class ParseFunctionCallReq(BaseReq, kw_only=True):
         default_factory=list
     )  # A list of available function tools (name, parameters, etc.).
     tool_call_parser: Optional[str] = (
-        None  # Specify the parser type, e.g. 'llama3', 'qwen25', or 'mistral'. If not specified, tries all.
+        None  # Specify the parser type, e.g. 'llama3', 'qwen', or 'mistral'. If not specified, tries all.
     )
 
 

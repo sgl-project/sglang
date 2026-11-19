@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.dflash_utils import build_speculative_verify_target_probs
 from sglang.srt.speculative.eagle_utils import _apply_joint_top_k_top_p
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 if torch.version.cuda is not None:
     from flashinfer.sampling import top_k_renorm_probs, top_p_renorm_probs
@@ -18,7 +18,13 @@ if torch.version.cuda is not None:
     )
     from sglang.srt.speculative.uno_utils import _build_sparse_target_support_tensors
 else:
-    from sgl_kernel import tree_speculative_sampling_target_only
+    if torch.version.hip is not None:
+        # the Triton port of the CUDA kernel, which gfx950 resolves the name to
+        from sglang.kernels.ops.speculative.target_only_sampling import (
+            tree_speculative_sampling_target_only_triton as tree_speculative_sampling_target_only,
+        )
+    else:
+        from sgl_kernel import tree_speculative_sampling_target_only
 
     from sglang.kernels.ops.sampling.renorm_triton import (
         top_k_renorm_probs_triton as top_k_renorm_probs,
@@ -28,6 +34,8 @@ else:
     )
 
 register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-small")
+# backend-specific: gfx950 serves this kernel with its Triton port
+register_amd_ci(est_time=16, stage="base-a-jit-kernel-unit", runner_config="amd")
 
 test_cases = [
     (
@@ -306,56 +314,69 @@ def test_uno_compact_preserves_original_top_p_nucleus(joint_top_k_top_p_case):
     torch.testing.assert_close(support_probs, expected_probs[:, :4].view(1, 1, 4))
 
 
-@pytest.mark.skipif(torch.version.cuda is None, reason="UNO compact path requires CUDA")
-@pytest.mark.parametrize("requests", [1, 16, 68])
-def test_uno_fused_top_p_mass_matches_the_compiled_bound(requests, monkeypatch):
-    """SGLANG_OPT_SPEC_FUSED_TOP_P_MASS: the compiled bound up to fp32 summation order,
-    and the same kept supports."""
-    from sglang.kernels.ops.speculative.top_p_mass import top_p_for_top_k_support
-    from sglang.srt.speculative import uno_utils
-    from sglang.srt.speculative.dflash_utils import _adjust_top_p_for_top_k
+def _reference(candidates, coins, final_coins, target_probs, draft_probs):
+    """The CUDA kernel on single-chain trees with in-order slots, at the default
+    thresholds 1: accept a node iff its coin is below its token's target prob, then
+    draw the bonus token by inverting the CDF of relu(target - draft), or of the
+    target row alone once every slot is filled. Returns predicts, accept_index,
+    accept_token_num and the updated draft_probs."""
+    bs, num_nodes = candidates.shape
+    predicts = torch.full((bs * num_nodes,), -1, dtype=torch.int32)
+    accept_index = torch.full((bs, num_nodes), -1, dtype=torch.int32)
+    accept_token_num = torch.zeros(bs, dtype=torch.int32)
+    draft_probs = draft_probs.clone()
+    for b in range(bs):
+        row, last, accepted = 0, b * num_nodes, 0
+        accept_index[b, 0] = last
+        for node in range(1, num_nodes):
+            token = int(candidates[b, node])
+            prob = target_probs[b, row, token]
+            if not coins[b, row] < prob:
+                draft_probs[b, row, token] = prob
+                break
+            predicts[last] = token
+            row, last, accepted = node, b * num_nodes + node, accepted + 1
+            accept_index[b, accepted] = last
+        accept_token_num[b] = accepted
+        residual = target_probs[b, row]
+        if accepted < num_nodes - 1:
+            residual = (residual - draft_probs[b, row]).clamp(min=0)
+        above = (residual.cumsum(0) > final_coins[b] * residual.sum()) & (residual > 0)
+        predicts[last] = int(above.nonzero()[0])
+    return predicts, accept_index, accept_token_num, draft_probs
 
-    width, vocab, max_top_k = 4, 248320, 20
-    rows = requests * width
-    g = torch.Generator(device="cuda").manual_seed(requests)
-    logits = torch.randn(rows, vocab, generator=g, device="cuda") * 2.5
-    peaks = torch.randint(0, vocab, (rows, 8), generator=g, device="cuda")
-    logits.scatter_add_(1, peaks, torch.rand(rows, 8, generator=g, device="cuda") * 12)
-    temperatures = 0.5 + torch.rand(requests, 1, generator=g, device="cuda")
-    top_ks = torch.randint(2, max_top_k + 1, (requests,), generator=g, device="cuda")
-    top_ps = 0.6 + 0.4 * torch.rand(requests, generator=g, device="cuda")
 
-    topk_logits = torch.topk(logits, max_top_k, dim=-1).values
-    expanded_t = temperatures.repeat_interleave(width, dim=0)
-    valid = torch.arange(max_top_k, device="cuda")[None, :] < top_ks.repeat_interleave(
-        width
-    ).view(rows, 1)
-    scaled = (topk_logits / expanded_t).masked_fill(~valid, float("-inf"))
-    want = _adjust_top_p_for_top_k(
-        scaled, logits, top_ps.repeat_interleave(width).view(rows, 1), expanded_t
+@pytest.mark.skipif(torch.version.hip is None, reason="ROCm Triton port")
+def test_target_only_triton_matches_reference():
+    """Two 3-node chains over a vocabulary past two 4096-wide blocks. Request 0
+    fills every slot and draws its bonus token from the second block; request 1
+    rejects its first node and draws from the third, carrying the CDF across the
+    block its rejection emptied. Dyadic probabilities keep every fp32 sum exact."""
+    bs, num_nodes, vocab = 2, 3, 8200
+    target_probs = torch.zeros(bs, num_nodes, vocab)
+    target_probs[..., [1, 4097, 8193]] = torch.tensor([0.25, 0.25, 0.5])
+    operands = {
+        "candidates": torch.tensor([[0, 8193, 4097], [0, 4097, 1]]),
+        "uniform_samples": torch.tensor([[0.1, 0.1, 0.0], [0.6, 0.0, 0.0]]),
+        "uniform_samples_for_final_sampling": torch.tensor([0.3, 0.5]),
+        "target_probs": target_probs,
+        "draft_probs": torch.zeros_like(target_probs),
+    }
+    expected = _reference(*operands.values())
+    actual = {name: t.cuda() for name, t in operands.items()}
+    actual.update(
+        retrive_index=torch.arange(bs * num_nodes, device="cuda").view(bs, num_nodes),
+        retrive_next_token=torch.tensor([[1, 2, -1]] * bs, device="cuda"),
+        retrive_next_sibling=torch.full((bs, num_nodes), -1, device="cuda"),
+        predicts=torch.full((bs * num_nodes,), -1, dtype=torch.int32, device="cuda"),
+        accept_index=torch.full((bs, num_nodes), -1, dtype=torch.int32, device="cuda"),
+        accept_token_num=torch.zeros(bs, dtype=torch.int32, device="cuda"),
     )
-    got = top_p_for_top_k_support(
-        topk_logits, logits, temperatures, top_ks, top_ps, width
-    )
-    torch.testing.assert_close(got, want, rtol=1e-5, atol=0)
-
-    supports = {}
-    for fused in (False, True):
-        monkeypatch.setattr(uno_utils, "_FUSED_TOP_P_MASS", fused)
-        supports[fused] = _build_sparse_target_support_tensors(
-            next_token_logits=logits,
-            temperatures=temperatures,
-            top_ks=top_ks,
-            top_ps=top_ps,
-            batch_size=requests,
-            forward_width=width,
-            max_top_k=max_top_k,
-        )
-    assert torch.equal(supports[False][0], supports[True][0])
-    assert torch.equal(supports[False][1] > 0, supports[True][1] > 0)
-    torch.testing.assert_close(
-        supports[True][1], supports[False][1], rtol=1e-5, atol=1e-7
-    )
+    tree_speculative_sampling_target_only(**actual, deterministic=True)
+    for name, want in zip(
+        ("predicts", "accept_index", "accept_token_num", "draft_probs"), expected
+    ):
+        assert torch.equal(actual[name].cpu(), want), name
 
 
 if __name__ == "__main__":

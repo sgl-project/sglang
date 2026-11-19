@@ -10,11 +10,8 @@ from sglang.kernels.ops.mamba.mamba_state_indices_triton import (
     fused_replay_state_indices,
 )
 from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
-    _state_multi_eligible,
     fused_conv_window_scatter_with_mask,
     fused_mamba_state_scatter_with_mask,
-    fused_state_scatter_multi,
-    int32_scatter_rows,
     scatter_mamba_states_after_mtp_verify,
     track_mamba_states_all_layers,
     track_mamba_states_if_needed,
@@ -64,8 +61,6 @@ logger = logging.getLogger(__name__)
 _validate_mamba_replay_state_indices = (
     envs.SGLANG_VALIDATE_MAMBA_REPLAY_STATE_INDICES.get()
 )
-# the verify commit's PLE side states in one launch
-_COMMIT_MULTI_SCATTER = envs.SGLANG_OPT_SPEC_COMMIT_MULTI_SCATTER.get()
 
 
 class MambaAttnBackendBase(AttentionBackend):
@@ -1353,6 +1348,10 @@ class HybridLinearAttnBackend(AttentionBackend):
         return self.full_attn_backend.data_type
 
     @property
+    def plans_padded_extend_rows(self) -> bool:
+        return self.full_attn_backend.plans_padded_extend_rows
+
+    @property
     def supports_ragged_verify_graph(self) -> bool:
         return (
             self.full_attn_backend.supports_ragged_verify_graph
@@ -1885,26 +1884,6 @@ def commit_ple_states_after_verify(
             )
         )
 
-    if _COMMIT_MULTI_SCATTER and state_pairs:
-        if src_indices_raw is None and _state_multi_eligible(state_pairs):
-            fused_state_scatter_multi(
-                state_pairs,
-                state_indices_tensor,
-                last_correct_step_indices,
-                mamba_track_indices,
-                mamba_steps_to_track,
-            )
-            return
-        # The per-pair launches below, on rows cast once.
-        state_indices_tensor, last_correct_step_indices, src_indices_raw = (
-            int32_scatter_rows(
-                state_indices_tensor, last_correct_step_indices, src_indices_raw
-            )
-        )
-        if mamba_track_indices is not None:
-            mamba_track_indices, mamba_steps_to_track, _ = int32_scatter_rows(
-                mamba_track_indices, mamba_steps_to_track, src_indices_raw
-            )
     scatter = HybridLinearAttnBackend._scatter_speculative_state_with_mask
     for state, intermediate_state in state_pairs:
         scatter(

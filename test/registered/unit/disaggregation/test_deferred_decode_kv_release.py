@@ -805,7 +805,9 @@ def _run_release_consensus(rank: int, rendezvous: str) -> None:
                     (scenario + "_drained", [0, 1] if scenario == "mixed" else [1, 0])
                 )
             metrics = q.scheduler.metrics_collector.observe_decode_deferred_kv_release
-            outcomes = [observed.kwargs["outcome"] for observed in metrics.call_args_list]
+            outcomes = [
+                observed.kwargs["outcome"] for observed in metrics.call_args_list
+            ]
             if scenario == "mixed":
                 expected_outcomes = ["timeout", "drained"]
             elif scenario == "deadline":
