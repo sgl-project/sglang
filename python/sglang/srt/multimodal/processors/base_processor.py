@@ -57,6 +57,7 @@ from sglang.srt.runtime_context import (
     get_serving,
 )
 from sglang.srt.utils import envs, logger
+from sglang.srt.utils.process import kill_itself_when_parent_died
 
 
 @dataclasses.dataclass
@@ -217,6 +218,7 @@ def _forget_parent_executor_wakeups():
 
 
 def _init_cpu_worker(media_url_policy: tuple) -> None:
+    kill_itself_when_parent_died()
     _forget_parent_executor_wakeups()
     # A spawned worker starts from the default media policy, not the server's.
     configure_media_url_security(*media_url_policy)
