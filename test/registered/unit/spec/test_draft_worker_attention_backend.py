@@ -4,6 +4,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import torch
+
 from sglang.srt.arg_groups.kimi_k3_hook import apply_kimi_k3_spec_backend_defaults
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.environ import envs
@@ -88,9 +90,15 @@ class TestDraftWorkerAttentionBackend(CustomTestCase):
 
     def test_aiter_is_taken_only_when_named_for_a_dspark_draft(self):
         """An --attention-backend aiter the draft merely inherits, or aiter named
-        for another algorithm's draft, keeps the platform fallback as before."""
-        self.assertEqual(self._resolve(named_backend=None), "triton")
-        self.assertEqual(self._resolve(algorithm="DFLASH"), "triton")
+        for another algorithm's draft, keeps the platform fallback as before:
+        triton on a HIP build, flashinfer elsewhere."""
+        for hip_version, fallback in (("7.2", "triton"), (None, "flashinfer")):
+            with (
+                self.subTest(hip=hip_version),
+                patch.object(torch.version, "hip", hip_version),
+            ):
+                self.assertEqual(self._resolve(named_backend=None), fallback)
+                self.assertEqual(self._resolve(algorithm="DFLASH"), fallback)
 
 
 class TestKimiK3DSparkDraftBackendDefault(CustomTestCase):
