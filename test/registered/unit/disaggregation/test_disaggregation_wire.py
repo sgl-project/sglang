@@ -1088,9 +1088,9 @@ class TestDisaggregationWire(unittest.TestCase):
                             manager.validate_aux_buffers(dst_ptrs, peer_lens)
 
     def test_sampling_mask_buffer_forces_the_aux_item_length_exchange(self):
-        """With the PD sampling-mask buffer on, a prefill must refuse a decode whose
-        build has no sampled-token slot in the sampling-logprob row, whether or not
-        that decode reports its buffer sizes."""
+        """An older build has no buffer for the sampled token's logprob. With the PD
+        sampling-mask buffers on, a prefill must refuse such a decode whether or not
+        it reports its buffer sizes, and such a prefill must refuse this decode."""
         args = KVArgs()
         args.kv_cache_dtype_str = "bfloat16"
         args.kv_item_lens = []
@@ -1133,17 +1133,27 @@ class TestDisaggregationWire(unittest.TestCase):
                 aux_data_ptrs=ptrs, aux_item_lens=item_lens
             )
             manager.validate_aux_buffers(ptrs, item_lens)
-            row = item_lens.index(buffers.output_token_sampling_logprobs[0].nbytes)
-            older_item_lens = [*item_lens]
-            older_item_lens[row] -= 4
+            added = ptrs.index(buffers.output_token_sampling_logprobs.data_ptr())
+            older_ptrs = ptrs[:added] + ptrs[added + 1 :]
+            older_item_lens = item_lens[:added] + item_lens[added + 1 :]
             for peer_lens in (older_item_lens, None):
                 with (
-                    self.subTest(peer_lens=peer_lens),
+                    self.subTest(older="decode", peer_lens=peer_lens),
                     self.assertRaisesRegex(
                         ValueError, "metadata buffer layout mismatch"
                     ),
                 ):
-                    manager.validate_aux_buffers(ptrs, peer_lens)
+                    manager.validate_aux_buffers(older_ptrs, peer_lens)
+            # An older prefill does not ask for sizes; this decode sends them.
+            manager.exchange_aux_item_lens = False
+            manager.kv_args = SimpleNamespace(
+                aux_data_ptrs=older_ptrs, aux_item_lens=older_item_lens
+            )
+            with (
+                self.subTest(older="prefill"),
+                self.assertRaisesRegex(ValueError, "metadata buffer layout mismatch"),
+            ):
+                manager.validate_aux_buffers(ptrs, item_lens)
 
     def test_mooncake_aux_transfer_uses_destination_row_stride(self):
         source = np.arange(192, dtype=np.uint8).reshape(3, 64)
@@ -3041,21 +3051,26 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                     self.assertEqual(
                         buffers.output_token_sampling_mask_idx.shape, (1, 3)
                     )
-                    length, mask, logprobs = buffers.get_buf(0)[6:9]
+                    length, mask, mask_logprobs, logprob = buffers.get_buf(0)[6:10]
                     self.assertEqual(length[0].item(), 3)
                     self.assertEqual(mask.tolist(), [7, 8, 9])
-                    self.assertEqual(logprobs.tolist(), [-1.5, -1.25, -1.5, -2.0])
+                    # One logprob per mask id, and the sampled token's on its own.
+                    self.assertEqual(mask_logprobs.tolist(), [-1.25, -1.5, -2.0])
+                    self.assertEqual(logprob.tolist(), [-1.5] + [0.0] * 15)
                 else:
                     self.assertIsNone(buffers.output_token_sampling_mask_len)
                     self.assertIsNone(buffers.output_token_sampling_mask_idx)
+                    self.assertIsNone(buffers.output_token_sampling_mask_logprobs)
                     self.assertIsNone(buffers.output_token_sampling_logprobs)
-                    self.assertEqual(buffers.get_buf(0)[6:9], (None, None, None))
+                    self.assertEqual(buffers.get_buf(0)[6:10], (None,) * 4)
         disabled_ptrs, _, disabled_sizes = schemas[0]
         enabled_ptrs, _, enabled_sizes = schemas[1]
-        self.assertEqual(len(enabled_ptrs) - len(disabled_ptrs), 3)
-        self.assertEqual(sum(enabled_sizes) - sum(disabled_sizes), (3 + 4) * 4 + 64)
+        self.assertEqual(len(enabled_ptrs) - len(disabled_ptrs), 4)
+        self.assertEqual(sum(enabled_sizes) - sum(disabled_sizes), (3 + 3) * 4 + 128)
 
-    def test_sampling_logprob_uses_first_metadata_slot(self):
+    def test_sampling_logprob_is_sent_without_a_mask(self):
+        """A captured request that returns sampling logprobs only still sends its
+        first token's logprob, with an empty mask."""
         with envs.SGLANG_ENABLE_DISAGG_SAMPLING_MASK.override(True):
             buffers = MetadataBuffers(
                 size=1,
@@ -3064,9 +3079,9 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                 max_sampling_mask_tokens=3,
             )
             buffers.set_buf(self._make_req(None, sampling_logprob=-0.5))
-            length, _, logprobs = buffers.get_buf(0)[6:9]
+            length, _, _, logprob = buffers.get_buf(0)[6:10]
             self.assertEqual(length[0].item(), 0)
-            self.assertEqual(logprobs[0].item(), -0.5)
+            self.assertEqual(logprob[0].item(), -0.5)
 
     def test_sampling_mask_row_reaches_decode_unchanged(self):
         """The prefill worker's first-token row is the row the decode worker streams."""

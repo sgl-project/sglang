@@ -638,10 +638,6 @@ class CustomizedInfoError(ValueError):
 class MetadataBuffers:
     CUSTOMIZED_INFO_SLOTS = slice(6, 8)
     DEFAULT_TOP_LOGPROBS_NUM = 128
-    # Row layout of output_token_sampling_logprobs: the sampled token's logprob,
-    # then one logprob per support token.
-    SAMPLING_LOGPROB_SLOT = 0
-    SAMPLING_SUPPORT_LOGPROBS_START = 1
 
     def __init__(
         self,
@@ -717,6 +713,7 @@ class MetadataBuffers:
                 )
             self.output_token_sampling_mask_len = None
             self.output_token_sampling_mask_idx = None
+            self.output_token_sampling_mask_logprobs = None
             self.output_token_sampling_logprobs = None
             if self.enable_sampling_mask:
                 self.output_token_sampling_mask_len = torch.zeros(
@@ -725,13 +722,14 @@ class MetadataBuffers:
                 self.output_token_sampling_mask_idx = torch.zeros(
                     (size, max_sampling_mask_tokens), dtype=torch.int32, device=device
                 )
-                self.output_token_sampling_logprobs = torch.zeros(
-                    (
-                        size,
-                        self.SAMPLING_SUPPORT_LOGPROBS_START + max_sampling_mask_tokens,
-                    ),
+                # Index-aligned with output_token_sampling_mask_idx.
+                self.output_token_sampling_mask_logprobs = torch.zeros(
+                    (size, max_sampling_mask_tokens),
                     dtype=torch.float32,
                     device=device,
+                )
+                self.output_token_sampling_logprobs = torch.zeros(
+                    (size, 16), dtype=torch.float32, device=device
                 )
             # For PD + spec decode
             self.output_topk_p = torch.zeros(
@@ -802,6 +800,7 @@ class MetadataBuffers:
             self.output_customized_info_len,
             self.output_token_sampling_mask_len,
             self.output_token_sampling_mask_idx,
+            self.output_token_sampling_mask_logprobs,
             self.output_token_sampling_logprobs,
             self.output_topk_p,
             self.output_topk_index,
@@ -838,6 +837,11 @@ class MetadataBuffers:
             ),
             (
                 self.output_token_sampling_mask_idx[idx].clone()
+                if self.enable_sampling_mask
+                else None
+            ),
+            (
+                self.output_token_sampling_mask_logprobs[idx].clone()
                 if self.enable_sampling_mask
                 else None
             ),
@@ -973,16 +977,12 @@ class MetadataBuffers:
             self.output_token_sampling_mask_idx[
                 req.metadata_buffer_index, :mask_len
             ].copy_(torch.from_numpy(chunk.token_ids))
-            sampling_logprobs = self.output_token_sampling_logprobs[
-                req.metadata_buffer_index
-            ]
-            logprob_slot = self.SAMPLING_LOGPROB_SLOT
-            sampling_logprobs[logprob_slot : logprob_slot + 1].copy_(
-                torch.from_numpy(chunk.selected_logprobs)
-            )
-            support_start = self.SAMPLING_SUPPORT_LOGPROBS_START
-            sampling_logprobs[support_start : support_start + mask_len].copy_(
-                torch.from_numpy(chunk.support_logprobs)
+            self.output_token_sampling_mask_logprobs[
+                req.metadata_buffer_index, :mask_len
+            ].copy_(torch.from_numpy(chunk.support_logprobs))
+            (sampling_logprob,) = chunk.selected_logprobs.tolist()
+            self.output_token_sampling_logprobs[req.metadata_buffer_index][0] = (
+                sampling_logprob
             )
         # For PD + spec decode
         if req.hidden_states_tensor is not None:

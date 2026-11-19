@@ -3418,6 +3418,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             output_top_logprobs_idx,
             output_token_sampling_mask_len,
             output_token_sampling_mask_idx,
+            output_token_sampling_mask_logprobs,
             output_token_sampling_logprobs,
             output_topk_p,
             output_topk_index,
@@ -3511,17 +3512,12 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     "sampling mask buffer disabled on decode side"
                 )
                 sampling_mask_len = int(output_token_sampling_mask_len[0].item())
-                sampling_logprob = output_token_sampling_logprobs[
-                    MetadataBuffers.SAMPLING_LOGPROB_SLOT
-                ].item()
+                sampling_logprob = output_token_sampling_logprobs[0].item()
                 sampling_mask_idx = (
                     output_token_sampling_mask_idx[:sampling_mask_len].cpu().numpy()
                 )
-                support_start = MetadataBuffers.SAMPLING_SUPPORT_LOGPROBS_START
                 sampling_mask_logprobs = (
-                    output_token_sampling_logprobs[
-                        support_start : support_start + sampling_mask_len
-                    ]
+                    output_token_sampling_mask_logprobs[:sampling_mask_len]
                     .cpu()
                     .numpy()
                 )
