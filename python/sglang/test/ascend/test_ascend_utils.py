@@ -1007,6 +1007,9 @@ HICACHE_STORAGE_BACKEND_ARG = "--hicache-storage-backend"
 # framework already uses: --dist-init-addr (5000), the PD separation worker
 # HTTP server (8000) and the MemCache components (5007/6007/8007).
 MOONCAKE_MASTER_PORT = 50051
+# Metrics endpoint of the same master. The standalone deployment scripts set it
+# explicitly, and the store client's master_metrics_port defaults to this value.
+MOONCAKE_MASTER_METRICS_PORT = 9003
 
 
 def get_hicache_storage_backend(other_args):
@@ -1056,6 +1059,7 @@ def _wait_for_tcp_port(process, port, timeout=30, poll_interval=0.5):
 
 def start_mooncake_master(
     master_port=MOONCAKE_MASTER_PORT,
+    metrics_port=MOONCAKE_MASTER_METRICS_PORT,
     eviction_high_watermark_ratio=0.95,
 ):
     """Start the Mooncake master service on the current node.
@@ -1066,8 +1070,13 @@ def start_mooncake_master(
     metadata server keeps its ``P2PHANDSHAKE`` default, which avoids needing a
     shared metadata endpoint (and its auth token) for multi-node runs.
 
+    The flags follow the standalone deployment scripts. The one difference is
+    the RPC bind address: those scripts bind loopback on a single host, while
+    prefill peers here may live in other pods and have to reach this one.
+
     Args:
         master_port (int): Port the master service listens on.
+        metrics_port (int): Port the master exposes its metrics on.
         eviction_high_watermark_ratio (float): Watermark that triggers eviction.
 
     Returns:
@@ -1075,7 +1084,10 @@ def start_mooncake_master(
     """
     command = [
         "mooncake_master",
-        f"--port={master_port}",
+        "--rpc_address=0.0.0.0",
+        f"--rpc_port={master_port}",
+        "--metrics_host=127.0.0.1",
+        f"--metrics_port={metrics_port}",
         f"--eviction_high_watermark_ratio={eviction_high_watermark_ratio}",
     ]
     logger.info(f"Starting mooncake master: {' '.join(command)}")

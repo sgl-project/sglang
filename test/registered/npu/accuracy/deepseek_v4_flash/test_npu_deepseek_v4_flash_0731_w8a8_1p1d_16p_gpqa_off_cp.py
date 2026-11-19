@@ -23,10 +23,9 @@ register_npu_ci(
 
 # Mooncake L3 store client config: the store runs on the MemFabric TENT
 # transport over the NPU device path, as in the standalone Mooncake deployment.
-# With --attn-dp-size 16 every prefill rank is its own scheduler (tp_size=1), so
-# this segment is requested per rank: 8 GiB x 16 ranks = 128 GiB pinned host
-# memory per node. Larger values (16-20 GiB) made the Ascend driver reject the
-# last rank's HalMemCreate and the prefill server died with
+# The segment is requested per prefill rank: 8 GiB x 16 ranks = 128 GiB pinned
+# host memory per node. Larger values (16-20 GiB) made the Ascend driver reject
+# the last rank's HalMemCreate and the prefill server died with
 # "Failed to setup Mooncake store, error code: -600".
 MOONCAKE_ENVS = {
     "MOONCAKE_PROTOCOL": "ascend",
@@ -126,9 +125,9 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
     "--page-size",
     128,
     "--tp-size",
-    16,
+    8,
     "--pp-size",
-    1,
+    2,
     "--trust-remote-code",
     "--device",
     "npu",
@@ -151,7 +150,7 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
     "--chunked-prefill-size",
     131072,
     "--attn-dp-size",
-    16,
+    8,
     "--tokenizer-worker-num",
     16,
     "--moe-a2a-backend",

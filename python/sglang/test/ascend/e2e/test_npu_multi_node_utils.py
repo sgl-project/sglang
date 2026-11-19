@@ -576,6 +576,35 @@ def get_memcache_meta_service_url(
     return f"tcp://{host_ip}:{port}"
 
 
+def get_mooncake_master_server_address(
+    port: Optional[int] = None,
+    timeout: int = LOCAL_TIMEOUT,
+    poll_interval: int = 15,
+):
+    """Get the ``<host>:<port>`` address of the Mooncake master.
+
+    The host is the node that runs the storage service (see
+    ``_get_storage_service_node_ip``), i.e. the first prefill pod rather than
+    whichever pod asks. This is the value for ``master_server_address`` in the
+    ``--hicache-storage-backend-extra-config`` JSON.
+
+    Args:
+        port (int): Master port. Defaults to ``MOONCAKE_MASTER_PORT`` so it
+            stays in step with the master launch helper.
+        timeout (int): Total timeout when resolving the host IP.
+        poll_interval (int): Interval between host IP checks.
+
+    Returns:
+        str: ``<host ip>:<port>``.
+    """
+    if port is None:
+        from sglang.test.ascend.test_ascend_utils import MOONCAKE_MASTER_PORT
+
+        port = MOONCAKE_MASTER_PORT
+    host_ip = _get_storage_service_node_ip(timeout=timeout, poll_interval=poll_interval)
+    return f"{host_ip}:{port}"
+
+
 def check_role(allowed_roles: Union[str, Iterable[str]]):
     if isinstance(allowed_roles, str):
         allowed_roles = {allowed_roles}
@@ -1031,11 +1060,17 @@ def start_router_thread(model_config, base_url):
     # prefill and decode workers to be registered.
     health_check_url = f"{base_url}/readiness"
     logger.info(f"Waiting for router to be ready at {health_check_url}")
-    wait_server_ready(health_check_url, process_holder=process_holder)
+    wait_server_ready(
+        health_check_url,
+        process_holder=process_holder,
+        launch_thread=router_thread,
+    )
     return router_thread
 
 
-def wait_server_ready(url, timeout=LOCAL_TIMEOUT, process_holder=None):
+def wait_server_ready(
+    url, timeout=LOCAL_TIMEOUT, process_holder=None, launch_thread=None
+):
     """Wait for the server to be ready.
 
     Args:
@@ -1043,6 +1078,10 @@ def wait_server_ready(url, timeout=LOCAL_TIMEOUT, process_holder=None):
         timeout (int): Timeout in seconds.
         process_holder (list): Optional single-element list holding the router
             subprocess, so an early exit fails fast instead of polling.
+        launch_thread (threading.Thread): Optional thread running the launcher.
+            A launcher cannot outlive its thread, so a thread that exited
+            before the subprocess was created means the launcher raised (its
+            traceback is printed by the thread) — fail fast instead of polling.
 
     Raises:
         RuntimeError: If server fails to start within timeout.
@@ -1056,6 +1095,15 @@ def wait_server_ready(url, timeout=LOCAL_TIMEOUT, process_holder=None):
             raise RuntimeError(
                 f"Router exited with code {process_holder[0].returncode} before "
                 f"serving {url}; check the router output above for the reason"
+            )
+        if (
+            launch_thread is not None
+            and not launch_thread.is_alive()
+            and not process_holder
+        ):
+            raise RuntimeError(
+                f"Server launcher exited before starting the server for {url}; "
+                "check the traceback printed by the launcher thread above"
             )
         try:
             response = requests.get(url, timeout=30)
