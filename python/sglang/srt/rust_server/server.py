@@ -20,7 +20,6 @@ import signal
 import threading
 import time
 from array import array
-from itertools import chain
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
@@ -62,7 +61,7 @@ from sglang.srt.rust_server.config import (
 )
 from sglang.srt.rust_server.multimodal import (
     MM_TRANSPORT_STATS,
-    RUST_MM_FAMILIES,
+    PythonMmFallback,
     RustMmProcessor,
     RustMmSpec,
     settle_shm_buffers,
@@ -290,37 +289,39 @@ class RustServer:
 
     @classmethod
     def _resolve_multimodal(cls, scheduler: Scheduler) -> Optional[RustMmSpec]:
-        """Resolve the built-in Rust MM pipeline for a multimodal model, and
-        refuse a model it cannot serve. ``launch`` calls this before the
-        listener binds, so a refused model never accepts a connection. A
-        model package whose ``_start_multimodal`` starts its own pipeline
-        overrides this to return ``None``; its server admits no generation
-        request until that pipeline starts."""
+        """Resolve the built-in Rust MM pipeline for a multimodal model, or
+        ``None`` to serve it with the Python processor. A model package whose
+        ``_start_multimodal`` starts its own pipeline overrides this to return
+        ``None``; its server admits no generation request until that
+        pipeline starts."""
         mm_spec = RustMmProcessor(
             server_args=scheduler.server_args,
             model_config=scheduler.model_config,
             processor=scheduler.processor,
         ).resolve_spec()
         if mm_spec is None:
-            supported = sorted(
-                set(chain.from_iterable(f.model_types for f in RUST_MM_FAMILIES))
-            )
-            raise RuntimeError(
-                "SGLANG_RUST_SERVER=1: no Rust MM pipeline for "
-                f"model_type={scheduler.model_config.hf_config.model_type!r} "
-                f"(supported: {', '.join(supported)}; "
-                "images only). Pass --disable-multimodal to serve it text-only, "
-                "or unset SGLANG_RUST_SERVER."
+            logger.warning(
+                "rust server: no Rust MM pipeline for model_type=%r; "
+                "the Rust MM workers run SGLang's Python multimodal processor",
+                scheduler.model_config.hf_config.model_type,
             )
         return mm_spec
 
     def _start_multimodal(self, scheduler: Scheduler) -> None:
         """Start the Rust workers for the pipeline ``launch`` resolved."""
-        assert self.mm_spec is not None
-        self.server.start_mm_workers(
-            self._build_mm_spec(self.mm_spec),
-            get_mm().mm_processor_worker_num or RustMmProcessor.AUTO_MM_WORKERS,
-        )
+        workers = get_mm().mm_processor_worker_num or RustMmProcessor.AUTO_MM_WORKERS
+        if self.mm_spec is None:
+            self.server.start_python_mm_workers(
+                PythonMmFallback(
+                    server_args=scheduler.server_args,
+                    model_config=scheduler.model_config,
+                    processor=scheduler.processor,
+                    max_req_input_len=scheduler.max_req_input_len,
+                ),
+                workers,
+            )
+        else:
+            self.server.start_mm_workers(self._build_mm_spec(self.mm_spec), workers)
 
     @staticmethod
     def _server_core_budget(allowed_core_count: int, mm_workers: int) -> int:
@@ -484,10 +485,6 @@ class RustServer:
             cpu_share=frontend_cpu_share,
         )
 
-        # Multimodal models must have a Rust pipeline — there is no Python
-        # fallback. The listener answers as soon as the server is constructed
-        # (a multimodal one admits generation requests once `_start_multimodal`
-        # starts its pool), so refuse a model without one first.
         mm_spec = (
             cls._resolve_multimodal(scheduler)
             if scheduler.model_config.is_multimodal
@@ -744,7 +741,8 @@ class RustServer:
         A wrapper only translates: it may build ``ShmPointerMMData`` stubs from
         a ``ShmBuffer``'s name, and the segment stays valid for every TP rank
         because ``drain`` settles its ownership after the wrapper returns."""
-        assert self.mm_spec is not None
+        if self.mm_spec is None:
+            return PythonMmFallback.unwrap(buffers)
         return RustMmProcessor.wrap_encoded(self.mm_spec, buffers)
 
     def set_startup_time(self, scheduler_startup_time: Dict[str, Any]) -> None:
@@ -927,8 +925,8 @@ class RustServer:
             obj.token_ids_logprob = token_ids_logprob.tolist()
         if self._multimodal_enabled and "mm.meta" in buffers:
             # Wrapping the worker's buffers into tensors is the only Python
-            # step of the Rust path; a text-only request on a multimodal
-            # model carries no `mm.*` buffers.
+            # step of the Rust pipeline (the Python fallback unpickles); a
+            # text-only request on a multimodal model carries no `mm.*` buffers.
             obj.mm_inputs = self._wrap_mm_result(buffers)
             if self._mm_cache_namespace is None:
                 raise RuntimeError("Rust multimodal cache namespace is not initialized")

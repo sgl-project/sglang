@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import logging
+import pickle
+import threading
 from typing import TYPE_CHECKING, Any, Dict, FrozenSet, Optional, Tuple
 
 import msgspec
@@ -105,8 +108,7 @@ RUST_MM_FAMILIES: Tuple[RustMmFamily, ...] = (
 def rust_mm_family_for(
     mm_processor_cls: Any, model_type: Optional[str]
 ) -> Optional[RustMmFamily]:
-    """The declared family serving this model, or ``None`` — which
-    :meth:`RustServer.launch` turns into a hard error (no Python fallback)."""
+    """The declared family serving this model, or ``None``."""
     return next(
         (f for f in RUST_MM_FAMILIES if f.serves(mm_processor_cls, model_type)), None
     )
@@ -202,8 +204,7 @@ class RustMmProcessor:
     time :meth:`wrap_encoded` wraps the Rust-produced buffers into the
     scheduler's ``MultimodalProcessorOutput``.
 
-    There is no Python fallback: a model without a Rust MM spec fails at launch,
-    and inputs outside the pipeline's scope are rejected per request.
+    Inputs outside the pipeline's scope are rejected per request.
     """
 
     # Rust mm-worker threads when --mm-processor-worker-num is 0. They are
@@ -241,7 +242,7 @@ class RustMmProcessor:
 
     def resolve_spec(self) -> Optional[RustMmSpec]:
         """The :class:`RustMmSpec` for this model, or ``None`` when it has no
-        Rust pipeline (the launch gate turns that into a hard error).
+        Rust pipeline.
 
         Carries only resolved settings — patch geometry, pixel limits,
         normalization, token ids — never the HF config, and is conservative by
@@ -434,3 +435,61 @@ class RustMmProcessor:
                 "image_grid_thw": torch.tensor([[t, h, w]], dtype=torch.long)
             },
         )
+
+
+class PythonMmFallback:
+    """Runs SGLang's Python MM processor on the Rust MM workers, for a model with
+    no Rust pipeline."""
+
+    def __init__(
+        self,
+        *,
+        server_args: ServerArgs,
+        model_config: ModelConfig,
+        processor,
+        max_req_input_len: int,
+    ):
+        from sglang.srt.managers.multimodal_processor import get_mm_processor
+
+        # In-process: no feature transport, as for the scheduler's own processor.
+        self._mm_processor = get_mm_processor(
+            model_config.hf_config,
+            server_args,
+            processor,
+            "default",
+            model_config=model_config,
+            skip_mm_pool=True,
+        )
+        self._max_req_input_len = max_req_input_len
+        # The processors are async and own their executors: one loop serves them all.
+        self._loop = asyncio.new_event_loop()
+        threading.Thread(
+            target=self._loop.run_forever, name="py-mm-fallback", daemon=True
+        ).start()
+
+    def __call__(self, input_ids, images, videos, audios) -> Tuple[list, bytes]:
+        from sglang.srt.managers.io_struct import GenerateReqInput
+
+        request = GenerateReqInput(
+            input_ids=input_ids,
+            image_data=images or None,
+            video_data=videos or None,
+            audio_data=audios or None,
+        )
+        coro = self._mm_processor.process_mm_data_async(
+            image_data=request.image_data,
+            audio_data=request.audio_data,
+            input_text=input_ids,
+            request_obj=request,
+            max_req_input_len=self._max_req_input_len,
+        )
+        output = asyncio.run_coroutine_threadsafe(coro, self._loop).result()
+        # The drain requires a full identity on every item; hash here, off the scheduler loop.
+        for item in output.mm_items:
+            item.set_pad_value()
+        ids = input_ids if output.input_ids is None else output.input_ids
+        return ids, pickle.dumps(output, protocol=pickle.HIGHEST_PROTOCOL)
+
+    @staticmethod
+    def unwrap(buffers):
+        return pickle.loads(memoryview(buffers["mm.feature.0"]).cast("B"))
