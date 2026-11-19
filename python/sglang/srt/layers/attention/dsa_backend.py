@@ -5295,7 +5295,11 @@ class DeepseekSparseAttnMultiStepBackend:
 
         # Use multi-backend fused copy when we have 3 or more backends
         # This is 3x faster than calling the single-backend copy 3 times
-        if self.speculative_num_steps > 3:
+        # It does not refresh the rank-local context lengths of sharded index-K.
+        if (
+            self.speculative_num_steps > 3
+            and not self.attn_backends[0].dsa_shards_index_k
+        ):
             try:
                 from sglang.kernels.ops.attention.dsa.fused_metadata_copy import (
                     fused_metadata_copy_multi_cuda,
