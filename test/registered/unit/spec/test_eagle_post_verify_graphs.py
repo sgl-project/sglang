@@ -276,6 +276,94 @@ class TestPostVerifyGraphs(CustomTestCase):
                 self.assertIsNone(worker._post_verify_graphs)
                 self.assertIsNone(worker._simulated_acc_len_rng)
 
+    def test_a_new_key_past_the_graph_key_bound_runs_eagerly(self):
+        """SGLANG_POST_VERIFY_MAX_GRAPH_KEYS bounds the graph sets, 64 unless raised; a
+        new key past it gets no graph set and leaves the forced-length stream alone."""
+        self.assertEqual(envs.SGLANG_POST_VERIFY_MAX_GRAPH_KEYS.default, 64)
+        graphs = eagle_post_verify_graphs._PostVerifyGraphs(
+            body=None, commit=None, sim_rng=torch.Generator()
+        )
+        graphs._states = {key: SimpleNamespace(turn=0) for key in range(3)}
+        with (
+            patch.object(eagle_post_verify_graphs, "_MAX_POST_VERIFY_STATES", 3),
+            patch.object(graphs, "_draw_sim_len", side_effect=AssertionError),
+        ):
+            self.assertIsNone(
+                graphs.run(key=3, inputs={}, make_slot=None, sim_max_len=1)
+            )
+        self.assertEqual(set(graphs._states), {0, 1, 2})
+
+    def test_the_pool_is_presized_for_the_largest_batch_when_memory_allows(self):
+        graphs = _worker(switch=True)._post_verify_graphs._graphs
+        self.assertIsNotNone(graphs.presize)
+        nbytes = eagle_post_verify_graphs.pool_presize_bytes(
+            max_requests=128, tokens_per_request=4, vocab=248320, free_bytes=1 << 40
+        )
+        self.assertEqual(nbytes, 2 * 128 * 4 * 248320 * 4 + (64 << 20))
+        self.assertEqual(
+            eagle_post_verify_graphs.pool_presize_bytes(
+                max_requests=128,
+                tokens_per_request=4,
+                vocab=248320,
+                free_bytes=nbytes + (1 << 30) - 1,
+            ),
+            0,
+        )
+
+    def test_pool_presize_runs_once_inside_the_first_sampled_capture(self):
+        events = []
+        graphs = eagle_post_verify_graphs._PostVerifyGraphs(
+            body=lambda slot: events.append(("body", slot.num_requests)) or ("out",),
+            commit=lambda slot, outputs: None,
+            sim_rng=torch.Generator(),
+        )
+        graphs.presize = lambda slot: events.append(("size", slot.num_requests)) or 4096
+        native_empty = torch.empty
+
+        def empty(*args, **kwargs):
+            if kwargs.get("dtype") is torch.uint8:
+                events.append(("presize", args[0]))
+            return native_empty(*args, **kwargs)
+
+        @contextmanager
+        def graph(*args, **kwargs):
+            events.append(("capture",))
+            yield
+
+        cuda = torch.cuda
+        with (
+            patch.object(cuda, "graph_pool_handle", return_value="pool"),
+            patch.object(cuda, "Stream", MagicMock),
+            patch.object(cuda, "Event", MagicMock),
+            patch.object(cuda, "CUDAGraph", MagicMock),
+            patch.object(cuda, "current_stream", MagicMock()),
+            patch.object(cuda, "graph", graph),
+            patch.object(torch, "empty", empty),
+            patch(
+                "sglang.srt.distributed.parallel_state.graph_capture", _graph_capture
+            ),
+        ):
+            for bs, greedy in ((2, True), (4, False), (9, False)):
+                graphs._capture(
+                    SimpleNamespace(num_requests=bs, is_all_greedy=greedy, device="cpu")
+                )
+        self.assertEqual(
+            events,
+            [
+                ("capture",),
+                ("body", 2),
+                ("capture",),
+                ("size", 4),
+                ("capture",),
+                ("presize", 4096),
+                ("body", 4),
+                ("capture",),
+                ("capture",),
+                ("body", 9),
+                ("capture",),
+            ],
+        )
+
     def test_a_kv_pool_that_clears_c128_draft_states_keeps_the_eager_verify(self):
         """The post-verify graphs skip the eager verify's cleanup of rejected c128
         draft states (DeepSeek-V4), so a KV pool that has one never reaches them;
@@ -552,7 +640,11 @@ class TestPostVerifyGraphsMatchEager(CustomTestCase):
         reference_rng = simulated_acc_len_generator(0)
         graphs = EaglePostVerifyGraphs(
             target_worker=SimpleNamespace(
-                model_runner=SimpleNamespace(watermark_state=None, model_config=None)
+                model_runner=SimpleNamespace(
+                    watermark_state=None,
+                    model_config=None,
+                    decode_cuda_graph_capture_bs=list(BATCH_SIZES),
+                )
             ),
             simulated_acc_len_rng=worker_rng,
         )
