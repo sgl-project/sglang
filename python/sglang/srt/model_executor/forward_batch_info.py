@@ -1690,6 +1690,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         extend_lens = batch.extend_lens
         prefix_lens = batch.prefix_lens
 
+        text_rows = self._text_only_mrope_positions(
+            batch=batch, rl_on_policy_target=rl_on_policy_target
+        )
+        if text_rows is not None:
+            self.mrope_positions = text_rows
+            return
+
         # Optimize text-only branch with torch.arange
         mrope_positions_list = [None] * batch_size
         for batch_idx in range(batch_size):
@@ -1736,6 +1743,33 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             mrope_positions_list,
             dim=1,
         ).to(dtype=torch.int64, device=model_runner.device, non_blocking=True)
+
+    def _text_only_mrope_positions(
+        self, batch: ScheduleBatch, rl_on_policy_target: Optional[str]
+    ) -> Optional[torch.Tensor]:
+        """An all-text extend's [3, tokens] MRoPE rows, repeated from self.positions
+        on the device; None sends any other batch to the host loop."""
+        extend_lens = batch.extend_lens
+        prefix_lens = batch.prefix_lens
+        positions = self.positions
+        text_only = rl_on_policy_target is not None or all(
+            mm_input is None for mm_input in batch.multimodal_inputs
+        )
+        if (
+            not text_only
+            or batch.dllm_config is not None
+            or not isinstance(extend_lens, list)
+            or not isinstance(prefix_lens, list)
+            # compute_position built self.positions from these host lists.
+            or self.extend_seq_lens_cpu != extend_lens
+            or self.extend_prefix_lens_cpu != prefix_lens
+            or positions is None
+            or positions.dim() != 1
+            or positions.numel() != sum(extend_lens)
+        ):
+            return None
+        # prefix_lens[b] + j for each request, the loop's arange values.
+        return positions.to(torch.int64).unsqueeze(0).repeat(3, 1)
 
     def _pad_tensor_to_size(self, tensor: torch.Tensor, size: int, *, value: int = 0):
         if value == 0:
