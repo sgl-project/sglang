@@ -37,6 +37,7 @@ from sglang.multimodal_gen.registry import (
     _get_config_info,
 )
 from sglang.multimodal_gen.runtime.models.dits import cosmos3_sim_auto
+from sglang.multimodal_gen.runtime.models.dits.cosmos3_multiview import pack_state
 from sglang.multimodal_gen.runtime.models.dits.cosmos3_sim_auto import (
     ChunkReuse,
     ChunkShard,
@@ -80,7 +81,16 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos3_simulation.sim_auto_layou
     ring_slot_for_step,
 )
 from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_simulation.multiview import (
+    EXTRA_CAPTION_LENGTHS,
+    EXTRA_FRAMES_PER_VIEW,
+    EXTRA_LATENT_FRAMES_PER_VIEW,
+    EXTRA_NUM_VIEWS,
+    EXTRA_PACKED_SHAPES,
+    EXTRA_TRANSFORMER_KWARGS,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_simulation.sim_auto import (
+    Cosmos3SimAutoRolloutStage,
     ReplayRing,
     _FlatLayout,
     camera_major_slice,
@@ -972,6 +982,69 @@ def _positional_shift(q, k, norm_q, norm_k, head_dim, cos_sin_cache, positions):
 
 
 class TestChunkReuse(unittest.TestCase):
+    def test_the_stage_reuses_rows_at_lossless_once_the_full_pass_is_ready(self):
+        stage = object.__new__(Cosmos3SimAutoRolloutStage)
+        stage.attention_backend = None
+        latents = torch.zeros(1, 2, 1, 2, 2)
+        extra = {
+            EXTRA_NUM_VIEWS: 1,
+            EXTRA_FRAMES_PER_VIEW: 1,
+            EXTRA_LATENT_FRAMES_PER_VIEW: 1,
+            EXTRA_TRANSFORMER_KWARGS: {
+                "lidar_control_latents": None,
+                "rig_view_ids": torch.zeros(1, dtype=torch.long),
+            },
+            "control_latents": [latents],
+            "condition_latents": pack_state([latents]),
+            EXTRA_PACKED_SHAPES: (tuple(latents.shape[1:]),),
+            "cond_text_ids": torch.zeros(1, 1, dtype=torch.long),
+            EXTRA_CAPTION_LENGTHS: {"cond": [1]},
+        }
+        with (
+            mock.patch.object(stage, "_prepare_lidar", return_value=None),
+            mock.patch.object(stage, "_geometry", return_value=(None, None, ())),
+            mock.patch.object(stage, "_encode_captions", return_value=([], None, 0)),
+            mock.patch.object(stage, "_ring", return_value=None),
+        ):
+            sessions = {
+                quality: stage._prepare(
+                    SimpleNamespace(
+                        extra=extra,
+                        seed=0,
+                        fps=10,
+                        sampling_params=SimpleNamespace(quality=quality),
+                    ),
+                    torch.device("cpu"),
+                )
+                for quality in ("exact", "lossless")
+            }
+        self.assertFalse(sessions["exact"].reuse_enabled)
+        self.assertTrue(sessions["lossless"].reuse_enabled)
+        stages = (
+            "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages"
+        )
+        rows = torch.tensor([0])
+        with (
+            mock.patch.object(stage, "_plan_key", return_value=("key",)),
+            mock.patch.object(stage, "_plan"),
+            mock.patch(
+                f"{stages}.cosmos3_simulation.sim_auto.build_replay_mask",
+                return_value="full",
+            ),
+            mock.patch(
+                f"{stages}.cosmos3_simulation.sim_auto.drop_unused_query_blocks",
+                return_value="reduced",
+            ),
+        ):
+            for reuse, expected in (
+                (ChunkReuse(rows=rows), "full"),
+                (ChunkReuse(rows=rows, hidden=torch.zeros(1)), "reduced"),
+            ):
+                mask = stage._block_mask(
+                    sessions["lossless"], None, (), None, PASS_NOISY, reuse
+                )
+                self.assertEqual(mask, expected)
+
     def test_reusable_tokens_are_the_ones_the_timestep_never_reaches(self):
         for step, joint in ((1, False), (2, True)):
             with self.subTest(step=step, joint=joint):
