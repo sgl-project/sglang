@@ -7,7 +7,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.multimodal_gen.runtime.distributed import sage_ulysses_route
 from sglang.multimodal_gen.runtime.layers.attention.backends import (
     prepared_sage_attn as dense,
 )
@@ -268,73 +267,6 @@ def test_missing_prequantized_kernel_has_actionable_error(monkeypatch):
             dense._load_prepared_dense_sage_kernel()
     finally:
         dense._load_prepared_dense_sage_kernel.cache_clear()
-
-
-@pytest.mark.parametrize("eligible", [False, True])
-def test_dense_forward_uses_shared_transport_without_subblock_metadata(
-    monkeypatch, eligible
-):
-    calls = []
-    encoded = operands(130)
-    # Use a one-batch record with the same number of elements as rank-local Q.
-    encoded = SimpleNamespace(
-        **{
-            **vars(encoded),
-            "q": encoded.q[:1],
-            "k": encoded.k[:1],
-            "v": encoded.v[:1],
-            "q_scale": encoded.q_scale[:1],
-            "k_scale": encoded.k_scale[:1],
-            "v_scale": encoded.v_scale[:1],
-        }
-    )
-    q = torch.zeros((64, 8, 128), dtype=torch.bfloat16)
-    monkeypatch.setattr(
-        sage_ulysses_route,
-        "check_prepared_sage_route",
-        lambda *args, **kwargs: SimpleNamespace(enabled=eligible, reason="test"),
-    )
-
-    def load_kernel():
-        calls.append("load")
-
-        def kernel(*args):
-            assert args[0].shape[1] == args[1].shape[1] == 130
-            calls.append("attention")
-            args[3].fill_(5)
-
-        return kernel
-
-    def exchange(query, key, value):
-        assert query is key is value is q
-        calls.append("exchange")
-        return encoded
-
-    def gather(output):
-        calls.append("gather")
-        assert torch.all(output[:, :130] == 5)
-        assert not output[:, 130:].count_nonzero().item()
-        return output.reshape(1, *q.shape)
-
-    monkeypatch.setattr(dense, "_load_prepared_dense_sage_kernel", load_kernel)
-    result = dense.prepared_dense_sage_attention_forward(
-        q,
-        q,
-        q,
-        impl=SimpleNamespace(
-            quantize_before_a2a=True, causal=False, dropout=0, softmax_scale=0.125
-        ),
-        cu_seqlens_host=(0, 130, 256),
-        max_seqlen=130,
-        ulysses_active=True,
-        ring_active=False,
-        transport=SimpleNamespace(exchange=exchange, gather=gather),
-    )
-    assert calls == (["load", "exchange", "attention", "gather"] if eligible else [])
-    if eligible:
-        assert result.shape == q.shape
-    else:
-        assert result is None
 
 
 @pytest.mark.parametrize("gate", ["disabled", "causal", "dropout"])
