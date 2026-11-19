@@ -706,6 +706,45 @@ def bf16_gemm_dispatch(
     return _bf16_gemm_dispatch_impl(x, weight, bias)
 
 
+def bf16_gemm_peer_store(x: torch.Tensor, weight: torch.Tensor, **destinations) -> bool:
+    """``bf16_gemm_dispatch(x, weight, None)``'s split-K or low-latency GEMM and tactic,
+    stored into peer buffers (FlashInfer's ``LamportPeerStoreConfig``: ``destinations``).
+    False, with nothing launched, when the dispatcher picks another kernel."""
+    m, (n, k) = x.shape[0], weight.shape
+    if _mm_bf16 is not None and m <= _BF16_LOW_M_AUTOTUNE_MAX_M:
+        return False  # the autotuned low-M GEMM has no peer-store epilogue
+    if _enable_bf16_splitk_gemm and use_bf16_splitk_gemm(m, n, k):
+        warp_tactic = _active_warp_splitk_tactics.get((m, n, k))
+        if warp_tactic is not None:
+            from flashinfer.gemm.kernels.dense_bf16_gemm_warp_splitk import (
+                run_warp_splitk_dense_peer_store as run,
+            )
+
+            tactic = _warp_splitk_tactic(*warp_tactic)
+        elif _prefer_direct(m, n, k):
+            return False
+        else:
+            from flashinfer.gemm.kernels.dense_bf16_gemm_sm100_splitk import (
+                run_splitk_dense_peer_store as run,
+            )
+
+            tactic = _splitk_tactic(*_BF16_SPLITK_TUNED_TACTICS[(m, n, k)])
+    elif _use_cutedsl_bf16_gemm is not None and _use_cutedsl_bf16_gemm(m, n, k):
+        # FlashInfer's copy of the low-latency GEMM shares tactic ids 0-28.
+        from flashinfer.gemm.kernels.tgv_gemm_cute_ext import (
+            run_tgv_cute_ext_peer_store as run,
+        )
+
+        from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import _pick_tactic
+
+        tactic = _pick_tactic(m, n, k)
+    else:
+        return False
+    # ``out`` is a shape operand only; the peer-store epilogue never writes it.
+    run(x, weight.T, x.new_empty(m, n), tactic, **destinations)
+    return True
+
+
 def warmup_bf16_gemms(model: torch.nn.Module, max_m: int) -> None:
     from sglang.srt.layers.linear import LinearBase
 

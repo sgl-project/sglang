@@ -49,40 +49,34 @@ def _jit_module(n: int, world_size: int) -> Module:
     )
 
 
-# Pooler (pre-expert projection) at TP4: the local slice + gather beats the replicated projection
-# up to the 8 MB push slot, measured on SM103 and SM107.
-POOLER_TP4_MAX_TOKENS = 1024
+# TP4 gathers up to the 8 MB push slot (m * n * 2 bytes), measured on SM103 and SM107.
+TP4_MAX_TOKENS = 1024
 
 
 def gemm_ag_supported(
-    comm: Optional[WorkspaceLease],
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    pooler: bool = False,
+    comm: Optional[WorkspaceLease], x: torch.Tensor, weight: torch.Tensor
 ) -> bool:
-    """``pooler`` selects the pre-expert projection's rule: TP4/TP8 on SM103 or SM107 (the
-    unpooler measured faster on the gather path on SM103 only) and up to POOLER_TP4_MAX_TOKENS at TP4;
-    both keep the B200 TP8 rule up to B200_PROJECTION_MAX_TOKENS."""
     if comm is None or not comm.has_multicast or comm.world_size < 2:
         return False
     if x.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16 or x.dim() != 2:
         return False
     m, k = x.shape
     n = weight.shape[0]
-    sm_ok = current_arch().is_sm(10, 3) or (pooler and current_arch().is_sm(10, 7))
-    capability = torch.cuda.get_device_capability(x.device)
-    b200_tp8 = comm.world_size == 8 and capability == (10, 0)
-    if pooler and (comm.world_size not in (4, 8) or not (sm_ok or b200_tp8)):
-        return False
-    max_tokens = (
-        POOLER_TP4_MAX_TOKENS if pooler and comm.world_size == 4 else MAX_TOKENS
-    )
     return (
-        1 <= m <= max_tokens
+        1 <= m <= (TP4_MAX_TOKENS if comm.world_size == 4 else MAX_TOKENS)
         and (
             m <= SMALL_PROJECTION_MAX_TOKENS
-            or (comm.world_size in (4, 8) and n in (4096, 8192) and sm_ok)
-            or (b200_tp8 and n in (4096, 8192) and m <= B200_PROJECTION_MAX_TOKENS)
+            or (
+                comm.world_size in (4, 8)
+                and n in (4096, 8192)
+                and (current_arch().is_sm(10, 3) or current_arch().is_sm(10, 7))
+            )
+            or (
+                comm.world_size == 8
+                and n in (4096, 8192)
+                and m <= B200_PROJECTION_MAX_TOKENS
+                and torch.cuda.get_device_capability(x.device) == (10, 0)
+            )
         )
         and weight.shape[1] == k
         and n % (comm.world_size * _VEC) == 0
@@ -103,59 +97,3 @@ def all_gather(
         comm.get_communicator(), local.contiguous(), b, c, out
     )
     return out
-
-
-# norm_fp4_quant's thread count at H = 4096: one 16-element block per thread.
-_NORM_QUANT_THREADS = 256
-
-
-@cache_once
-def _norm_quant_module(n: int, world_size: int) -> Module:
-    args = make_cpp_args(n, world_size, _NORM_QUANT_THREADS, is_arch_support_pdl())
-    return load_jit(
-        "muse_spark_all_gather_norm_fp4_quant",
-        *args,
-        cuda_files=["muse_spark/all_gather_norm_fp4_quant.cuh"],
-        cuda_wrappers=[("run", f"MuseSparkAllGatherNormFp4Quant<{args}>::run")],
-        extra_cuda_cflags=["-O3"],
-    )
-
-
-def all_gather_norm_fp4_quant_supported(local: torch.Tensor, n: int) -> bool:
-    """Shape and dtype only; callers must also pass ``gemm_ag_supported(..., pooler=True)``,
-    which checks the push plane, world size, architecture and token cap."""
-    return n == 4096 and local.dtype == torch.bfloat16 and local.dim() == 2
-
-
-def all_gather_norm_fp4_quant(
-    comm: WorkspaceLease,
-    local: torch.Tensor,
-    weight: Optional[torch.Tensor],
-    eps: float,
-    global_scale: torch.Tensor,
-    write_rows: bool = True,
-) -> tuple[Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
-    """Gathered ``[M, N]`` bf16 rows, then their RMS norm as static-scale NVFP4: ``(rows, fp4 [M, N/2], sf [M, N/16])``.
-
-    fp4 / sf are bitwise ``fused_norm_fp4_quant_static`` of the gathered rows; ``rows`` is None unless ``write_rows``.
-    """
-    m, n_local = local.shape
-    n = n_local * comm.world_size
-    out = (
-        torch.empty(m, n, dtype=torch.bfloat16, device=local.device)
-        if write_rows
-        else None
-    )
-    fp4 = torch.empty(m, n // 2, dtype=torch.uint8, device=local.device)
-    sf = torch.empty(m, n // 16, dtype=torch.uint8, device=local.device)
-    _norm_quant_module(n, comm.world_size).run(
-        comm.get_communicator(),
-        local.contiguous(),
-        weight,
-        global_scale.reshape(1),
-        float(eps),
-        out,
-        fp4,
-        sf,
-    )
-    return out, fp4, sf

@@ -21,7 +21,6 @@ from torch import nn
 
 from sglang.kernels.ops.attention.muse_spark_qk_norm_rope_store import FusedQKNorm
 from sglang.kernels.ops.communication.muse_spark_all_gather import (
-    all_gather_norm_fp4_quant_supported,
     gemm_ag_supported,
 )
 from sglang.kernels.ops.communication.muse_spark_all_gather_norm_residual import (
@@ -648,9 +647,9 @@ class MuseSpark1xMoE(nn.Module):
             and self.pre_expert_norm is not None
             and not self.experts.use_marlin
             and not self.experts.quant_config.use_per_token_activation
-            and all_gather_norm_fp4_quant_supported(
-                hidden_states, self.pre_expert_proj.weight.shape[0]
-            )
+            and self.experts._pre_norm_weight(self.pre_expert_norm) is not None
+            # FlashInfer's rule: H = 1024 * k, k <= 8.
+            and self.pre_expert_proj.weight.shape[0] in (1024 * k for k in range(1, 9))
         )
 
     def _routing_op(self) -> FusedMuseSparkRouting:
@@ -828,8 +827,19 @@ class MuseSpark1xMoE(nn.Module):
             expert_input, _ = self.pre_expert_proj(hidden_states)
         else:
             comm = muse_workspace()
-            if not sp_active and gemm_ag_supported(
-                comm, hidden_states, self.pre_expert_proj.weight, pooler=True
+            if (
+                self.tp_size in (4, 8)
+                and not sp_active
+                and (
+                    torch.cuda.get_device_capability(hidden_states.device)
+                    in ((10, 3), (10, 7))
+                    or (
+                        self.tp_size == 8
+                        and torch.cuda.get_device_capability(hidden_states.device)
+                        == (10, 0)
+                    )
+                )
+                and gemm_ag_supported(comm, hidden_states, self.pre_expert_proj.weight)
             ):
                 if self._fuse_ag_norm_quant(hidden_states):
                     fp4, sf = gemm_ag_norm_fp4_quant(
@@ -841,7 +851,7 @@ class MuseSpark1xMoE(nn.Module):
                         self.experts.w13_input_scale_quant,
                     )
                     prepared_input = (fp4, sf, None)
-                    # The experts read only the row count and dtype once prepared_input is given.
+                    # The experts read only its row count and dtype.
                     expert_input = hidden_states
                 else:
                     expert_input = gemm_ag(

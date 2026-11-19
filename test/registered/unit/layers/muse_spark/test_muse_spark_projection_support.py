@@ -43,10 +43,10 @@ class TestMuseSparkProjectionSupport(CustomTestCase):
         self.assertFalse(self.supported(0))
 
     def test_existing_hardware_and_small_projection_paths(self):
-        for tp in (4, 8):
+        for tp, cap in ((4, gather.TP4_MAX_TOKENS), (8, gather.MAX_TOKENS)):
             self.comm.world_size = tp
-            self.assertTrue(self.supported(512, capability=(10, 3)))
-            self.assertFalse(self.supported(513, capability=(10, 3)))
+            self.assertTrue(self.supported(cap, capability=(10, 3)))
+            self.assertFalse(self.supported(cap + 1, capability=(10, 3)))
         for tp in (2, 4):
             self.comm.world_size = tp
             self.assertFalse(self.supported(9))
