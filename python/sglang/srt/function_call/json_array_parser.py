@@ -40,6 +40,9 @@ class JsonArrayParser(BaseFormatDetector):
         """
         Streaming incremental parsing with tool validation.
         """
+        if self.current_tool_id > 0 and not self.current_tool_name_sent:
+            self._buffer = (self._buffer + new_text).lstrip(" \t\r\n")
+            new_text = ""
         return super().parse_streaming_increment(new_text, tools)
 
     def finish(self, tools: List[Tool]) -> StreamingParseResult:
