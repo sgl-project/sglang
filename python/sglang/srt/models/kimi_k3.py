@@ -81,7 +81,7 @@ from sglang.srt.layers.linear import (
     resolve_linear_parallel_group,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe import route_quant_handoff, route_sort
+from sglang.srt.layers.moe import route_quant_handoff
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import (
@@ -655,13 +655,6 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
         self.topk.bind_runner_backend(
             self.experts.runner_backend,
             routing_method_type=self.experts.routing_method_type,
-        )
-        # Ask the radix-4 router to also write the experts' MoE sort only when
-        # their runner consumes one; the runner decides per batch size.
-        self._route_sort_consumer = (
-            self.experts.runner.route_sort_consumer()
-            if envs.SGLANG_K3_RADIX4_TOPK.get() and self.experts.runner is not None
-            else None
         )
 
         # MegaMoE (deep_gemm fused a2a+GEMM over the EP symm buffer) replaces
@@ -1827,9 +1820,7 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
             # the FFN read already ran the front on this rank's rows (shard_front)
             return self._forward_row_front(prefix_sum)
         hidden_states = hidden_states.view(-1, hidden_size)
-        if self._route_sort_consumer is not None:
-            route_sort.stage(self._route_sort_consumer)
-        try:
+        with self._route_sort_scope():
             if cp_shard_rows:
                 return self._forward_cp_shard_rows(hidden_states)
             if hidden_states.shape[0] > 0 and self._eligible_for_fused_front:
@@ -1842,10 +1833,6 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
                     prefix_sum=prefix_sum,
                     valid_token_count=valid_token_count,
                 )
-        finally:
-            # A sort that no experts call consumed must not outlive this layer.
-            if self._route_sort_consumer is not None:
-                route_sort.clear(self._route_sort_consumer)
         return out.view(num_tokens, hidden_size)
 
 

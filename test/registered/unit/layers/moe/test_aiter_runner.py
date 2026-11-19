@@ -7,7 +7,7 @@ import torch
 import sglang.srt.layers.moe.moe_runner.aiter as aiter_runner
 from sglang.srt.environ import envs
 from sglang.srt.layers import zero_copy_context
-from sglang.srt.layers.moe import route_quant_handoff
+from sglang.srt.layers.moe import route_sort
 from sglang.srt.layers.moe.moe_runner import MoeRunner, aiter_route_sort
 from sglang.srt.layers.moe.moe_runner.aiter import (
     AiterMoeQuantInfo,
@@ -128,12 +128,14 @@ def test_aiter_runner_shows_its_staged_route_sort_consumer_its_fused_moe_call(
     consumer = runner.route_sort_consumer()
     calls = []
     consumer.observe = calls.append
+    # clear() drops the sort no fused_moe consumed through AITER's registrar.
+    monkeypatch.setattr(aiter_route_sort, "_registrar", lambda: lambda sort: None)
     for staged in (consumer, aiter_route_sort.AiterRouteSortConsumer()):
-        route_quant_handoff.stage_route_sort(staged)
+        route_sort.stage(staged)
         try:
             runner.run(_runner_input(), _quant_info(), {})
         finally:
-            route_quant_handoff.clear()
+            route_sort.clear(staged)
     # Shown its own layer's call only, not another staged layer's.
     assert len(calls) == 1 and calls[0].keys() == captured[0].keys()
     assert all(calls[0][name] is value for name, value in captured[0].items())

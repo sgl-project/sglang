@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.layers.moe import route_quant_handoff, route_sort
+from sglang.srt.layers.moe import route_sort
 from sglang.srt.layers.moe.moe_runner import aiter_route_sort
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -120,7 +120,7 @@ def _route(consumer, m, registrations):
     ):
         route_sort.stage(consumer)
         try:
-            route_quant_handoff.bind_select_experts(None, fused_routing_ok=True)
+            route_sort.bind_select_experts(None, fused_routing_ok=True)
             hit = route_sort.try_route_sort_fused(
                 torch.zeros((m, NUM_EXPERTS)),
                 torch.zeros(NUM_EXPERTS),
@@ -129,7 +129,7 @@ def _route(consumer, m, registrations):
                 routed_scaling_factor=2.5,
             )
         finally:
-            route_quant_handoff.clear()
+            route_sort.clear(consumer)
     return hit, route_with_sort.call_count
 
 
@@ -151,13 +151,14 @@ class TestAiterRouteSortConsumer(CustomTestCase):
         hit, launches = _route(consumer, 128, registrations)
         self.assertIsNone(hit)
         self.assertEqual(launches, 0)
-        self.assertEqual([r["M"] for r in registrations], [16])
+        # The layer's clear() drops a sort no fused_moe consumed (None).
+        self.assertEqual([r and r["M"] for r in registrations], [16, None, None])
 
     def test_declines_before_it_has_seen_the_layers_fused_moe_call(self):
         registrations = []
         hit, _ = _route(aiter_route_sort.AiterRouteSortConsumer(), 16, registrations)
         self.assertIsNone(hit)
-        self.assertEqual(registrations, [])
+        self.assertEqual(registrations, [None])
         self.lookup.assert_not_called()
 
     def test_asks_aiter_once_per_batch_size(self):

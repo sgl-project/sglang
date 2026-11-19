@@ -2,20 +2,22 @@
 K3 MoE layer leaves no routing state behind for the next one."""
 
 import unittest
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from typing import Optional
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 
 from sglang.srt.configs.kimi_linear import KimiLinearConfig
-from sglang.srt.layers.moe import route_quant_handoff
+from sglang.srt.environ import envs
+from sglang.srt.layers.moe import route_quant_handoff, route_sort
 from sglang.srt.layers.moe.moe_runner import aiter_route_sort
 from sglang.srt.models.kimi_k3 import (
     KimiK3ForConditionalGeneration,
     KimiK3LinearForCausalLM,
     KimiK3MoE,
 )
+from sglang.srt.models.kimi_k3_amd import moe as kimi_k3_amd_moe
 from sglang.srt.runtime_context import get_context, get_exec
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -70,12 +72,21 @@ def _unfused_moe(
         registrations.append({"M": hidden_states.shape[0]})
         return hidden_states
 
-    return SimpleNamespace(
+    moe = SimpleNamespace(
         _row_front_out=None,
         _eligible_for_fused_front=False,
         _forward_unfused=route_without_fused_moe,
         _route_sort_consumer=route_sort_consumer,
     )
+    moe._route_sort_scope = MethodType(KimiK3MoE._route_sort_scope, moe)
+    return moe
+
+
+class _MoeOnRunner(kimi_k3_amd_moe.KimiK3MoEHipMixin):
+    """A MoE layer whose route-sort consumer comes from the mixin's own lookup."""
+
+    def __init__(self, runner):
+        self.experts = SimpleNamespace(runner=runner)
 
 
 class TestKimiK3MoERouteSortLifetime(CustomTestCase):
@@ -93,28 +104,77 @@ class TestKimiK3MoERouteSortLifetime(CustomTestCase):
             KimiK3MoE.forward(moe, torch.zeros(2, 4))
         self.assertIsNone(registrations[-1])
         # The request no routing call consumed is dropped with it.
-        self.assertEqual(route_quant_handoff.take_route_sort(), (None, None))
+        self.assertIsNone(route_sort.staged())
 
     def test_route_sort_request_needs_unrewritten_routing(self):
         """AITER matches the sort to the router's own topk tensors, so a request is
         dropped when select_experts rewrites them (EPLB remap, simulated routing,
         shared slots), and otherwise carries its padding row count."""
         non_padded = torch.tensor(3)
-        consumer = aiter_route_sort.AiterRouteSortConsumer()
+        consumer = MagicMock()
         try:
-            route_quant_handoff.stage_route_sort(consumer)
-            route_quant_handoff.bind_select_experts(non_padded, fused_routing_ok=False)
-            self.assertIsNone(route_quant_handoff.take_route_sort()[0])
-            route_quant_handoff.stage_route_sort(consumer)
-            route_quant_handoff.bind_select_experts(non_padded, fused_routing_ok=True)
-            self.assertEqual(
-                route_quant_handoff.take_route_sort(), (consumer, non_padded)
-            )
+            route_sort.stage(consumer)
+            route_sort.bind_select_experts(non_padded, fused_routing_ok=False)
+            self.assertIsNone(route_sort._take()[0])
+            route_sort.stage(consumer)
+            route_sort.bind_select_experts(non_padded, fused_routing_ok=True)
+            self.assertEqual(route_sort._take(), (consumer, non_padded))
             # Consumed once; the runner still sees the consumer until clear().
-            self.assertIsNone(route_quant_handoff.take_route_sort()[0])
-            self.assertIs(route_quant_handoff.staged_route_sort(), consumer)
+            self.assertIsNone(route_sort._take()[0])
+            self.assertIs(route_sort.staged(), consumer)
+        finally:
+            route_sort.clear(consumer)
+        consumer.drop.assert_called_once_with()
+
+    def test_route_sort_and_route_quant_stashes_clear_independently(self):
+        """The routed-quant handoff is staged and cleared inside the layer's
+        route-sort scope, so neither may clear the other's request."""
+        consumer, x = MagicMock(), torch.zeros(2, 4)
+        try:
+            route_sort.stage(consumer)
+            route_quant_handoff.stage(x)
+            route_quant_handoff.clear()
+            self.assertIs(route_sort.staged(), consumer)
+            route_quant_handoff.stage(x)
+            route_sort.clear(consumer)
+            self.assertIs(route_quant_handoff._handoff.request_x, x)
         finally:
             route_quant_handoff.clear()
+            route_sort.clear(consumer)
+
+    def test_layer_off_rocm_neither_reads_the_switch_nor_asks_its_runner(self):
+        """Off ROCm the radix-4 router writes no MoE sort: the layer's scope is a
+        no-op and never reads SGLANG_K3_RADIX4_TOPK or asks its runner."""
+        runner = MagicMock()
+        moe = _MoeOnRunner(runner)
+        with (
+            patch.object(kimi_k3_amd_moe, "_is_hip", False),
+            patch.object(envs.SGLANG_K3_RADIX4_TOPK, "get") as switch,
+        ):
+            with moe._route_sort_scope():
+                self.assertIsNone(route_sort.staged())
+        switch.assert_not_called()
+        runner.route_sort_consumer.assert_not_called()
+
+    def test_layer_on_rocm_stages_its_runners_consumer_around_the_forward(self):
+        """On ROCm with SGLANG_K3_RADIX4_TOPK the layer asks its runner once and
+        stages that consumer only while the scope is open."""
+        runner = MagicMock()
+        moe = _MoeOnRunner(runner)
+        consumer = runner.route_sort_consumer.return_value
+        with (
+            patch.object(kimi_k3_amd_moe, "_is_hip", True),
+            envs.SGLANG_K3_RADIX4_TOPK.override(True),
+        ):
+            for _ in range(2):
+                with moe._route_sort_scope():
+                    self.assertIs(route_sort.staged(), consumer)
+                self.assertIsNone(route_sort.staged())
+            # A layer without a runner has no consumer to stage.
+            with _MoeOnRunner(None)._route_sort_scope():
+                self.assertIsNone(route_sort.staged())
+        runner.route_sort_consumer.assert_called_once_with()
+        self.assertEqual(consumer.drop.call_count, 2)
 
     def test_layer_without_route_sort_never_probes_aiter(self):
         """CUDA, non-AITER runners and EP layers cannot consume a router-written

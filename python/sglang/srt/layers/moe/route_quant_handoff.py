@@ -18,11 +18,6 @@ consume-once stash instead of new signatures:
                                     moe_fused_gate call on a hit
     Mxfp4MoEMethod.apply (situ)     take(x) skips the quant and the pack
 
-The fused route+sort launch (route_sort: the router also writes the experts'
-MoE sort) is requested through the same stash: stage_route_sort(consumer)
-before self.topk, take_route_sort() in biased_grouped_topk_gpu's radix-4
-branch, and staged_route_sort() in the MoE runner that consumes the sort.
-
 Every step is fallback-safe: if the routing dispatch never consumes the staged
 request (different model, uncovered shape, triton fallback) or the runner's
 ``take`` misses (activations re-viewed or copied), the unfused chain runs as
@@ -46,10 +41,6 @@ class _Handoff(msgspec.Struct):
     num_token_non_padded: Optional[torch.Tensor] = None
     fused_routing_ok: bool = False
     padded_rows_masked: bool = False
-    # staged by the model layer: let the radix-4 router also write the MoE sort
-    # on the batch sizes this route_sort.RouteSortConsumer takes
-    route_sort: Optional[Any] = None
-    route_sort_taken: bool = False
     # published by the routing dispatch, keyed by the staged activations
     produced_x: Optional[torch.Tensor] = None
     packed: Optional[torch.Tensor] = None
@@ -76,38 +67,13 @@ def clear() -> None:
     _handoff = _Handoff()
 
 
-def stage_route_sort(consumer: Any) -> None:
-    """Ask the next radix-4 routing call to also write the MoE sort where
-    consumer (route_sort.RouteSortConsumer) takes the batch. Caller pairs this
-    with clear() (try/finally)."""
-    _handoff.route_sort = consumer
-    _handoff.route_sort_taken = False
-
-
 def bind_select_experts(
     num_token_non_padded: Optional[torch.Tensor], fused_routing_ok: bool
 ) -> None:
-    if _handoff.request_x is None and _handoff.route_sort is None:
+    if _handoff.request_x is None:
         return
     _handoff.num_token_non_padded = num_token_non_padded
     _handoff.fused_routing_ok = fused_routing_ok
-
-
-def take_route_sort() -> Tuple[Optional[Any], Optional[torch.Tensor]]:
-    """Consume a staged route-sort request: its consumer if select_experts
-    leaves the router's ids and weights as they are, which a sort of them needs
-    (else None), and the padding row count it bound."""
-    consumer = None
-    if not _handoff.route_sort_taken and _handoff.fused_routing_ok:
-        consumer = _handoff.route_sort
-    _handoff.route_sort_taken = True
-    return consumer, _handoff.num_token_non_padded
-
-
-def staged_route_sort() -> Optional[Any]:
-    """The staged route-sort consumer, until clear(), for the MoE runner that
-    consumes the sort to show it the layer's experts call."""
-    return _handoff.route_sort
 
 
 def take_padded_rows_masked() -> bool:
