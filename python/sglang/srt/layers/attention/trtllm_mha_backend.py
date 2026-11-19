@@ -1223,14 +1223,25 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         return 1
 
     def _should_use_fused_fp8_path(
-        self, save_kv_cache: bool, k: torch.Tensor, forward_batch: ForwardBatch
+        self,
+        save_kv_cache: bool,
+        k: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer: Optional[RadixAttention] = None,
     ) -> bool:
-        """Check if we should use the fused FP8 KV cache write path."""
+        """Check if we should use the fused FP8 KV cache write path.
+
+        True for an FP8 KV cache, and for the FP8 sliding-window layers of an
+        NVFP4 cache (--swa-kv-cache-dtype fp8_e4m3).
+        """
         return (
             not is_cp_active(forward_batch)
             and save_kv_cache
             and k is not None
-            and self.data_type == torch.float8_e4m3fn
+            and (
+                self.data_type == torch.float8_e4m3fn
+                or (layer is not None and layer.layer_id in self._fp8_kv_layer_ids)
+            )
         )
 
     def _fused_fp8_qkv_kv_cache(
@@ -1809,7 +1820,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         """Run forward for decode using TRTLLM MHA kernel."""
 
         use_fused_fp8_path = self._should_use_fused_fp8_path(
-            save_kv_cache, k, forward_batch
+            save_kv_cache, k, forward_batch, layer
         )
         use_fused_qkv = use_fused_fp8_path and not self.is_xqa_impl
 
@@ -1918,7 +1929,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         # The fused path writes rank-local K/V directly to cache. CP needs
         # the strategy to gather K/V into full logical token order first.
         use_fused_fp8_path = self._should_use_fused_fp8_path(
-            save_kv_cache, k, forward_batch
+            save_kv_cache, k, forward_batch, layer
         )
         use_fused_qkv = use_fused_fp8_path and not self.is_xqa_impl
 
