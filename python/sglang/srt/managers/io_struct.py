@@ -2653,6 +2653,15 @@ class FreezeGCReq(BaseReq, kw_only=True):
     gc_threshold: Optional[List[int]] = None
 
 
+class ControlAckOutput(BaseReq, kw_only=True):
+    """The reply for a control request whose handler returns nothing
+    (pause/continue generation, freeze_gc, configure_logging, close_session).
+    Sent only to the Rust frontend, which waits for one reply per control
+    request; the Python TokenizerManager fire-and-forgets these."""
+
+    success: bool = True
+
+
 class ShutdownReq(BaseReq, kw_only=True):
     # Broadcast across TP ranks via the normal recv path, so all ranks break
     # the scheduler loop on the same iteration.
@@ -2735,7 +2744,7 @@ class ParseFunctionCallReq(BaseReq, kw_only=True):
         default_factory=list
     )  # A list of available function tools (name, parameters, etc.).
     tool_call_parser: Optional[str] = (
-        None  # Specify the parser type, e.g. 'llama3', 'qwen25', or 'mistral'. If not specified, tries all.
+        None  # Specify the parser type, e.g. 'llama3', 'qwen', or 'mistral'. If not specified, tries all.
     )
 
 

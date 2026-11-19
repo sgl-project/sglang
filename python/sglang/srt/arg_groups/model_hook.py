@@ -254,6 +254,10 @@ def handle_model_specific_adjustments(server_args: Any):
 
         apply_kimi_k3_linear_attn_defaults(server_args)
         apply_kimi_k3_spec_backend_defaults(server_args)
+        if model_arch == "KimiK31ForConditionalGeneration" and get_platform().is_gfx95:
+            from sglang.srt.models.kimi_k3_amd import env_defaults
+
+            env_defaults.apply_kimi_k31_rocm_env_defaults()
 
     if model_arch == "Glm5NextForConditionalGeneration":
         from sglang.srt.arg_groups.glm5_next_hook import (
@@ -794,7 +798,7 @@ def handle_model_capability_adjustments(server_args: Any):
         logger.warning(
             "HRM-Text (prefix_lm) detected: forcing --attention-backend "
             "triton, --chunked-prefill-size -1, --disable-radix-cache, and "
-            "--disable-cuda-graph for correctness of the bidirectional "
+            "--disable-decode-cuda-graph --disable-prefill-cuda-graph for correctness of the bidirectional "
             "prompt attention."
         )
 
