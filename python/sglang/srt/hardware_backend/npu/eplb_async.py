@@ -138,6 +138,59 @@ def _install_routing_layer(current, planned, layer: int, staged_rows) -> None:
             count[layer].copy_(current.logical_to_all_physical_map_num_valid[layer])
 
 
+def _broadcast_placement(placement, error, rank, group, physical_shape, num_logical):
+    """Use a fixed header and one CPU tensor for a successful plan."""
+    # The first header value is -1 on failure, 0 for an empty plan, or the
+    # number of layers to install. The second is the replica table width.
+    header = torch.zeros(2, dtype=torch.int64, device="cpu")
+    if rank == 0:
+        if error is None and placement is not None:
+            try:
+                changed, physical, logical = placement
+                width = logical.size(-1)
+                if physical.shape != physical_shape or logical.shape != (
+                    physical_shape[0],
+                    num_logical,
+                    width,
+                ):
+                    raise ValueError("EPLB placement changed the routing geometry")
+                payload = torch.cat(
+                    (
+                        torch.tensor(changed, dtype=torch.int64, device="cpu"),
+                        physical.flatten(),
+                        logical.flatten(),
+                    )
+                )
+                payload = payload.to(torch.int64)
+                header[0] = len(changed)
+                header[1] = width
+            except Exception as exc:
+                error = str(exc)
+        if error is not None:
+            header[0] = -1
+    dist.broadcast(header, src=0, group=group)
+    count, width = header.tolist()
+    if count < 0:
+        message = [error]
+        dist.broadcast_object_list(message, src=0, group=group)
+        raise RuntimeError(f"EPLB CPU planner failed: {message[0]}")
+    if count == 0:
+        return None
+    layers, slots = physical_shape
+    physical_end = count + layers * slots
+    logical_shape = (layers, num_logical, width)
+    if rank != 0:
+        payload = torch.empty(
+            physical_end + layers * num_logical * width, dtype=torch.int64, device="cpu"
+        )
+    dist.broadcast(payload, src=0, group=group)
+    return (
+        tuple(payload[:count].tolist()),
+        payload[count:physical_end].view(physical_shape),
+        payload[physical_end:].view(logical_shape),
+    )
+
+
 class NpuEplbRuntime:
     def __init__(
         self,
@@ -191,24 +244,29 @@ class NpuEplbRuntime:
         self._owner_stream = self.device_module.current_stream()
         # dump_record returns a fresh, globally reduced tensor. Keep it in the
         # worker closure and copy it on the migration stream only on rank 0.
-        payload = [None]
+        event_error = None
         if self.rank == 0:
             try:
                 self._owner_ready.record(self._owner_stream)
             except Exception as error:
-                payload[0] = (str(error), None)
+                event_error = str(error)
 
         def compute():
-            if self.rank == 0 and payload[0] is None:
+            error = event_error
+            placement = None
+            if self.rank == 0 and error is None:
                 try:
-                    payload[0] = (None, self._plan_on_root(counts))
-                except Exception as error:
-                    payload[0] = (str(error), None)
-            dist.broadcast_object_list(payload, src=0, group=self.plan_group)
-            error, result = payload[0]
-            if error is not None:
-                raise RuntimeError(f"EPLB CPU planner failed: {error}")
-            return result
+                    placement = self._plan_on_root(counts)
+                except Exception as exc:
+                    error = str(exc)
+            return _broadcast_placement(
+                placement,
+                error,
+                self.rank,
+                self.plan_group,
+                self.metadata.physical_to_logical_map_cpu.shape,
+                self.metadata.num_logical_experts,
+            )
 
         return compute
 
@@ -384,6 +442,7 @@ def create_npu_async_eplb(model_config, weights, metadata):
             tuple(tuple(t.shape) for t in runtime.staging),
             batch_size,
             spec,
+            metadata.num_logical_experts,
             hashlib.sha256(initial_layout.numpy().tobytes()).digest(),
         )
     except Exception as exc:
