@@ -3,7 +3,7 @@ import dataclasses
 import struct
 import threading
 from collections import deque
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
@@ -207,6 +207,8 @@ def build_dcp_token_transfer_plan(
             + dst_local % dst_page_size,
         )
 
+    draft_offsets = np.arange(num_kv_tokens, dtype=np.int64)
+    draft_local = src_page_offset * physical_page_size + draft_offsets
     chunk_start = decode_prefix_len + src_page_offset * physical_page_size
     target_offsets = np.arange(
         (dcp_rank - chunk_start) % dcp_size,
@@ -220,89 +222,5 @@ def build_dcp_token_transfer_plan(
         return DCPTokenTransferPlan(
             target_src, target_dst, target_src.copy(), target_dst.copy()
         )
-    draft_offsets = np.arange(num_kv_tokens, dtype=np.int64)
-    draft_local = src_page_offset * physical_page_size + draft_offsets
     draft_src, draft_dst = rows(draft_offsets, virtual_page_size, draft_local)
     return DCPTokenTransferPlan(target_src, target_dst, draft_src, draft_dst)
-
-
-def build_dcp_chunk_src_rows(
-    src_page_indices: npt.NDArray[np.int32],
-    dst_page_indices: npt.NDArray[np.int32],
-    *,
-    physical_page_size: int,
-    dcp_size: int,
-    dcp_ranks: Sequence[int],
-    src_page_offset: int = 0,
-    decode_prefix_len: int = 0,
-    num_kv_tokens: Optional[int] = None,
-) -> Tuple[npt.NDArray[np.int64], Dict[int, Tuple[int, int]]]:
-    """Source rows of one transfer chunk for several decode DCP ranks.
-
-    Concatenates each rank's ``build_dcp_token_transfer_plan`` target source
-    rows (in ``dcp_ranks`` order) and returns each rank's ``[start, end)`` span
-    in them, so one gather can pack the chunk for all ranks.
-    """
-    parts = []
-    spans: Dict[int, Tuple[int, int]] = {}
-    start = 0
-    for rank in dcp_ranks:
-        rank_rows = build_dcp_token_transfer_plan(
-            src_page_indices,
-            dst_page_indices,
-            physical_page_size=physical_page_size,
-            dcp_size=dcp_size,
-            dcp_rank=rank,
-            src_page_offset=src_page_offset,
-            decode_prefix_len=decode_prefix_len,
-            num_kv_tokens=num_kv_tokens,
-            # Only the target rows are used; this skips the replicated draft rows.
-            draft_rows_collapsed=True,
-        ).target_src_token_indices
-        parts.append(rank_rows)
-        spans[rank] = (start, start + rank_rows.size)
-        start += rank_rows.size
-    rows = np.concatenate(parts) if parts else np.empty((0,), dtype=np.int64)
-    return rows, spans
-
-
-def row_transfer_blocks(
-    src_rows: npt.NDArray[np.int64],
-    dst_rows: npt.NDArray[np.int64],
-    entries: Sequence[Tuple[int, int, int]],
-) -> List[List[Tuple[int, int, int]]]:
-    """Transfer blocks moving source row ``src_rows[i]`` to destination row
-    ``dst_rows[i]`` of each entry.
-
-    ``entries`` holds (source base, destination base, row bytes). Each entry
-    gets one (src, dst, length) block per run of rows consecutive on both
-    sides; packed sources are consecutive, so that is one block per
-    destination page or less.
-    """
-    src_rows = np.asarray(src_rows, dtype=np.int64)
-    dst_rows = np.asarray(dst_rows, dtype=np.int64)
-    if src_rows.size != dst_rows.size:
-        raise ValueError(
-            "row_transfer_blocks requires equal-length src/dst rows, "
-            f"got {src_rows.size} and {dst_rows.size}"
-        )
-    if dst_rows.size == 0:
-        return [[] for _ in entries]
-    run_starts = np.flatnonzero((np.diff(src_rows) != 1) | (np.diff(dst_rows) != 1)) + 1
-    run_starts = np.concatenate((np.zeros(1, dtype=np.int64), run_starts))
-    run_lens = np.diff(np.append(run_starts, dst_rows.size))
-    src_runs = src_rows[run_starts]
-    dst_runs = dst_rows[run_starts]
-    blocks = []
-    for src_base, dst_base, width in entries:
-        width = int(width)
-        blocks.append(
-            list(
-                zip(
-                    (int(src_base) + src_runs * width).tolist(),
-                    (int(dst_base) + dst_runs * width).tolist(),
-                    (run_lens * width).tolist(),
-                )
-            )
-        )
-    return blocks
