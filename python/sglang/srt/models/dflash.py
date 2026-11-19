@@ -274,18 +274,26 @@ def candidate_topk(
             "DFlash candidate top-k requires a dense FP16/BF16/FP32 target lm_head "
             "or a supported lm_head.quant_method."
         )
-    if lm_head.tp_size > 1 and lm_head.tp_size != get_parallel().tp_size:
+    # A head tied to a plain nn.Embedding (Gemma-4) holds the whole vocabulary on
+    # every rank, so it has no tp_size, org_vocab_size or shard_indices.
+    replicated = isinstance(lm_head, nn.Embedding)
+    if (
+        not replicated
+        and lm_head.tp_size > 1
+        and lm_head.tp_size != get_parallel().tp_size
+    ):
         raise RuntimeError(
             "DFlash candidate top-k: the target lm_head is vocab-sharded over a "
             "group other than the draft's; with dp attention, pass "
             "--enable-dp-lm-head."
         )
-    tp = lm_head.tp_size == 1
-    num_org = (
-        int(lm_head.org_vocab_size)
-        if tp
-        else int(lm_head.shard_indices.num_org_elements)
-    )
+    tp = replicated or lm_head.tp_size == 1
+    if replicated:
+        num_org = int(weight.shape[0])
+    elif tp:
+        num_org = int(lm_head.org_vocab_size)
+    else:
+        num_org = int(lm_head.shard_indices.num_org_elements)
     logits = _project_candidate_logits(
         hidden, lm_head, num_org=num_org, use_quant_head=use_quant_head
     )
@@ -1932,7 +1940,9 @@ class DFlash2DraftModel(DFlashDraftModel):
         """Top-k base candidates via the target lm_head: hidden [N, H] -> global
         candidate_ids / unary_logits [N, K]."""
         assert self.lm_head is not None, "draft_model.lm_head unset before capture"
-        fused = self.merge_candidates_fused and _is_pow2_above_one(self.lm_head.tp_size)
+        fused = self.merge_candidates_fused and _is_pow2_above_one(
+            getattr(self.lm_head, "tp_size", 1)
+        )
         if fused:
             ids, vals, _ = candidate_topk(
                 hidden,

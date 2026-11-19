@@ -270,6 +270,33 @@ def test_fused_candidates_need_a_power_of_two_head_split(monkeypatch, head_tp_si
     )
     DFlash2DraftModel.compute_candidates(model, torch.randn(2, 4))
     assert calls == [{}]
+def test_candidate_topk_on_a_tied_embedding_head_under_tp(monkeypatch):
+    """Gemma-4 ties lm_head to embed_tokens, a plain nn.Embedding that holds the
+    whole vocabulary on every TP rank. Treating it as a vocab shard crashed the
+    draft graph capture (no shard_indices); the candidates must come from the
+    full local logits with no all-gather (the head has no tp_group)."""
+    torch.manual_seed(0)
+    k = 4
+    hidden = torch.randn(3, 8, dtype=torch.bfloat16)
+    lm_head = torch.nn.Embedding(16, 8).to(torch.bfloat16)
+
+    monkeypatch.setattr(
+        "sglang.srt.models.dflash.get_parallel",
+        lambda: SimpleNamespace(tp_size=2),
+    )
+    monkeypatch.setattr(
+        "sglang.srt.models.dflash.radix_topk",
+        lambda logits, k: torch.topk(logits, k, dim=-1),
+    )
+
+    ids, vals, lse = candidate_topk(hidden, lm_head, k)
+
+    expected_vals, expected_ids = torch.topk(
+        torch.matmul(hidden, lm_head.weight.T), k, dim=-1
+    )
+    torch.testing.assert_close(ids, expected_ids)
+    torch.testing.assert_close(vals, expected_vals)
+    assert lse is None
 
 
 def test_worker_folds_a_gate_admitted_quantized_selector_head(monkeypatch):
