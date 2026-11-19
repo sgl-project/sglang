@@ -5007,6 +5007,15 @@ class TestKvCacheShardingCompatibility(CustomTestCase):
             self.assertFalse(post_capture_kv_sizing_planned(args))
             args.enable_kv_cache_sharding = False
             self.assertTrue(post_capture_kv_sizing_planned(args))
+            args.disaggregation_transfer_backend = "nixl"
+            for mode in ("prefill", "decode"):
+                args.disaggregation_mode = mode
+                args.enable_unified_memory = False
+                self.assertTrue(post_capture_kv_sizing_planned(args))
+                args.enable_unified_memory = True
+                self.assertFalse(post_capture_kv_sizing_planned(args))
+            args.disaggregation_mode = "null"
+            self.assertTrue(post_capture_kv_sizing_planned(args))
 
     def test_chunk_rounding_expands_automatic_activation_headroom(self):
         args = self._rounding_args(raw_mem_fraction=None, resolved_mem_fraction=0.9)
