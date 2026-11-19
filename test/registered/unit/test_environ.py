@@ -250,6 +250,8 @@ class TestKimiK3HipRenamedEnvs(unittest.TestCase):
             "sglang",
             "sglang",
         ),
+        ("SGLANG_OPT_HIP_K3_AITER", "SGLANG_AITER_K3_OPT", "1", True),
+        ("SGLANG_OPT_HIP_K3_RADIX4_TOPK", "SGLANG_K3_RADIX4_TOPK", "1", True),
     )
 
     def test_old_name_forwards_with_warning(self):

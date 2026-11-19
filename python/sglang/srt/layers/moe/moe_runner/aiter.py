@@ -160,6 +160,19 @@ def _aiter_fused_moe_supports_no_combine() -> bool:
     return "no_combine" in inspect.signature(fused_moe).parameters
 
 
+# AITER's generic MXFP4 MoE kernels take an intermediate padded to a multiple of 256.
+_MXFP4_INTERMEDIATE_ALIGN = 256
+
+
+def aiter_mxfp4_intermediate_align(layer: torch.nn.Module) -> int:
+    """The alignment AITER's MXFP4 MoE pads ``layer``'s intermediate to: the one
+    the model declared for its experts' kernels (``FusedMoE.mxfp4_intermediate_align``)
+    under SGLANG_USE_AITER, otherwise the generic kernels' 256."""
+    if layer.mxfp4_intermediate_align is not None and envs.SGLANG_USE_AITER.get():
+        return layer.mxfp4_intermediate_align
+    return _MXFP4_INTERMEDIATE_ALIGN
+
+
 @functools.cache
 def _aiter_fused_moe_supports_output() -> bool:
     from aiter.fused_moe import fused_moe
