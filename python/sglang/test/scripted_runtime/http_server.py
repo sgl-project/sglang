@@ -27,13 +27,15 @@ from sglang.test.scripted_runtime.io_struct import (
     Shutdown,
 )
 from sglang.test.scripted_runtime.utils import close_zmq_socket
-from sglang.test.test_utils import ADMIN_API_KEY_FOR_TEST
+from sglang.test.test_utils import ADMIN_API_KEY_FOR_TEST, is_in_amd_ci
 
 DEFAULT_RUN_TIMEOUT_S: float = 120.0
 
 CANARY_REFERENCE_TIMEOUT_SCALE: float = 4.0
 SHUTDOWN_JOIN_TIMEOUT_S: float = 60.0
-LISTENER_ACCEPT_TIMEOUT_S: float = 300.0
+# HookReady follows model load and server warmup. On a cold ROCm CI runner,
+# AITER can still be compiling the first prefill kernel five minutes into launch.
+LISTENER_ACCEPT_TIMEOUT_S: float = 600.0 if is_in_amd_ci() else 300.0
 HTTP_READY_TIMEOUT_S: float = 300.0
 HTTP_READY_POLL_INTERVAL_S: float = 0.5
 SERVER_HOST: str = "127.0.0.1"
