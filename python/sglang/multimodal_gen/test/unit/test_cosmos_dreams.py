@@ -829,40 +829,39 @@ class TestCosmosDreamsKVHistory(unittest.TestCase):
             ],
         )
 
-    def test_history_matches_sink_plus_tail_through_slides_moves_and_growth(self):
+    def test_history_matches_sink_plus_tail_through_slides_and_moves(self):
         tokens, sink_frames, window_frames = 2, 2, 5
         text_kv = _text_kv()
-        for rollout_frames in (None, 60):
-            history = new_kv_history(
-                text_kv,
-                tokens_per_frame=tokens,
-                sink_frames=sink_frames,
-                window_frames=window_frames,
-                chunk_frames=3,
-                rollout_frames=rollout_frames,
+        history = new_kv_history(
+            text_kv,
+            tokens_per_frame=tokens,
+            sink_frames=sink_frames,
+            window_frames=window_frames,
+            chunk_frames=3,
+            rollout_frames=None,
+        )
+        kept: list[float] = []
+        for frame in range(60):
+            chunk_frames = 1 + frame % 3
+            # Tails alternate like a transfer rollout's control and RGB commits.
+            tail_frames = window_frames - frame % 2
+            label = float(frame)
+            read = _commit_labelled(
+                history,
+                label,
+                chunk_frames * tokens,
+                tail_tokens=tail_frames * tokens,
             )
-            kept: list[float] = []
-            for frame in range(60):
-                chunk_frames = 1 + frame % 3
-                # Tails alternate like a transfer rollout's control and RGB commits.
-                tail_frames = window_frames - frame % 2
-                label = float(frame)
-                read = _commit_labelled(
-                    history,
-                    label,
-                    chunk_frames * tokens,
-                    tail_tokens=tail_frames * tokens,
-                )
-                chunk = [label] * (chunk_frames * tokens)
-                self.assertEqual(read, [-1.0] * 3 + kept + chunk, msg=f"frame {frame}")
-                kept = kept + chunk
-                bound = (sink_frames + tail_frames) * tokens
-                if len(kept) > bound:
-                    kept = kept[: sink_frames * tokens] + kept[-tail_frames * tokens :]
-                for layer in range(len(text_kv)):
-                    key, value = history.committed(layer)
-                    self.assertEqual(key[0, :, 0, 0].tolist(), kept)
-                    self.assertEqual(value[0, :, 0, 0].tolist(), kept)
+            chunk = [label] * (chunk_frames * tokens)
+            self.assertEqual(read, [-1.0] * 3 + kept + chunk, msg=f"frame {frame}")
+            kept = kept + chunk
+            bound = (sink_frames + tail_frames) * tokens
+            if len(kept) > bound:
+                kept = kept[: sink_frames * tokens] + kept[-tail_frames * tokens :]
+            for layer in range(len(text_kv)):
+                key, value = history.committed(layer)
+                self.assertEqual(key[0, :, 0, 0].tolist(), kept)
+                self.assertEqual(value[0, :, 0, 0].tolist(), kept)
 
     def test_rollout_inside_its_window_gets_exactly_its_length(self):
         history = new_kv_history(

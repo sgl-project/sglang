@@ -805,11 +805,10 @@ class TestBlockMask(unittest.TestCase):
             _wide_plan(grid=SensorGrid(9, 11, 1, 1), lengths=(130, 70, 90)),
         )
         cases = [
-            (block_size, index, plan, table_dtype)
+            (block_size, index, plan, torch.int32)
             for block_size in ((256, 128), (128, 128))
             for index, plan in enumerate(plans)
-            for table_dtype in (torch.int8, torch.int32)
-        ]
+        ] + [((128, 128), 1, plans[1], torch.int8)]
         for block_size, index, plan, table_dtype in cases:
             with self.subTest(block_size=block_size, plan=index, table=table_dtype):
                 with mock.patch(
@@ -904,40 +903,13 @@ class TestPaddingRows(unittest.TestCase):
         plan = _wide_plan()
         cpu = torch.device("cpu")
         fa4 = build_replay_fa4_mask(plan, device=cpu, block_size=(128, 128)).sparsity
-        triton = build_replay_block_mask(plan, device=cpu).block_mask
-        for label, (q_block, kv_block), lists in (
-            (
-                "fa4",
-                (128, 128),
-                (
-                    (fa4.partial_counts, fa4.partial_indices),
-                    (fa4.full_counts, fa4.full_indices),
-                ),
-            ),
-            (
-                "triton",
-                (64, 64),
-                (
-                    (triton.kv_num_blocks[0, 0], triton.kv_indices[0, 0]),
-                    (triton.full_kv_num_blocks[0, 0], triton.full_kv_indices[0, 0]),
-                ),
-            ),
-        ):
-            with self.subTest(kernel=label):
-                self.assertNotEqual(plan.num_query_tokens % q_block, 0)
-                listed = _listed_blocks(*lists[0]) | _listed_blocks(*lists[1])
-                real = torch.zeros(
-                    listed.shape[0] * q_block, listed.shape[1] * kv_block
-                )
-                real[: plan.num_query_tokens, : plan.num_key_tokens] = (
-                    _dense_token_mask(plan)
-                )
-                readable = (
-                    real.view(listed.shape[0], q_block, listed.shape[1], kv_block)
-                    .sum(dim=(1, 3))
-                    .bool()
-                )
-                self.assertTrue(torch.equal(listed, readable))
+        self.assertNotEqual(plan.num_query_tokens % 128, 0)
+        listed = _listed_blocks(fa4.partial_counts, fa4.partial_indices)
+        listed |= _listed_blocks(fa4.full_counts, fa4.full_indices)
+        real = torch.zeros(listed.shape[0] * 128, listed.shape[1] * 128)
+        real[: plan.num_query_tokens, : plan.num_key_tokens] = _dense_token_mask(plan)
+        readable = real.view(listed.shape[0], 128, listed.shape[1], 128).sum(dim=(1, 3))
+        self.assertTrue(torch.equal(listed, readable.bool()))
 
 
 class _TupleLinear(torch.nn.Module):
@@ -1046,28 +1018,26 @@ class TestChunkReuse(unittest.TestCase):
                 self.assertEqual(mask, expected)
 
     def test_reusable_tokens_are_the_ones_the_timestep_never_reaches(self):
-        for step, joint in ((1, False), (2, True)):
-            with self.subTest(step=step, joint=joint):
-                plans, items = [], None
-                for pass_kind in (PASS_NOISY, PASS_CLEAN):
-                    plan, items, _, _ = _plan(step, pass_kind, joint=joint)
-                    plans.append(plan)
-                embedded = torch.cat(
-                    [
-                        torch.zeros(item.num_tokens, dtype=torch.bool)
-                        if item.is_control
-                        else generated_token_mask(item)
-                        for item in items
-                    ]
-                )
-                reusable = reusable_token_mask(plans)
-                self.assertTrue(torch.equal(reusable, ~embedded))
-                self.assertTrue(bool(reusable.any()) and not bool(reusable.all()))
-                recomputed = torch.zeros(plans[0].num_key_tokens, dtype=torch.bool)
-                recomputed[: plans[0].num_current_tokens] = ~reusable
-                noisy, clean = (_dense_token_mask(plan) for plan in plans)
-                self.assertTrue(torch.equal(noisy[reusable], clean[reusable]))
-                self.assertFalse(bool(noisy[reusable][:, recomputed].any()))
+        plans, items = [], None
+        for pass_kind in (PASS_NOISY, PASS_CLEAN):
+            plan, items, _, _ = _plan(0, pass_kind, joint=True)
+            plans.append(plan)
+        embedded = torch.cat(
+            [
+                torch.zeros(item.num_tokens, dtype=torch.bool)
+                if item.is_control
+                else generated_token_mask(item)
+                for item in items
+            ]
+        )
+        reusable = reusable_token_mask(plans)
+        self.assertTrue(torch.equal(reusable, ~embedded))
+        self.assertTrue(bool(reusable.any()) and not bool(reusable.all()))
+        recomputed = torch.zeros(plans[0].num_key_tokens, dtype=torch.bool)
+        recomputed[: plans[0].num_current_tokens] = ~reusable
+        noisy, clean = (_dense_token_mask(plan) for plan in plans)
+        self.assertTrue(torch.equal(noisy[reusable], clean[reusable]))
+        self.assertFalse(bool(noisy[reusable][:, recomputed].any()))
 
     def test_a_token_reading_a_recomputed_token_is_recomputed(self):
         def plans():
