@@ -122,6 +122,40 @@ class TestPureSWARadixCache(CustomTestCase):
         self.assertEqual(allocator.freed, [6, 7])
         self.assertEqual(allocator.skipped, [4, 5])
 
+    def test_finish_does_not_cache_window_evicted_slots_without_a_floor(self):
+        cache = _make_cache(disable=False, num_tokens=8)
+        allocator = cache.token_to_kv_pool_allocator
+        token_ids = array("q", range(8))
+        req = SimpleNamespace(
+            origin_input_ids=token_ids[:4],
+            output_ids=array("q", range(4, 8)),
+            full_untruncated_fill_ids=token_ids,
+            extra_key=None,
+            cache_salt=None,
+            last_node=cache.root_node,
+            lock=None,
+            priority=0,
+            kv=ReqKvInfo(req_pool_idx=0),
+        )
+
+        # The prompt is cached after prefill, so the tree owns [0, 4).
+        cache.checkpoint(req, up_to=4)
+        self.assertEqual(req.kv.cache_protected_len, 4)
+        # Decode slides the window past [4, 6) and frees those slots.
+        # Without a prefill-aware floor, window_evict_floor stays 0.
+        req.kv.set_evicted_seqlen("swa", 6)
+
+        cache.checkpoint(req, up_to=8)
+        cache.free_kv_row(req.kv, [(req.kv.cache_protected_len, 8)])
+        cache.unlock(req.lock)
+
+        # Only the prompt stays cached; the freed [4, 6) must not reenter the tree.
+        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(token_ids)))
+        self.assertEqual(match.device_prefix_len, 4)
+        self.assertEqual(cache.total_size(), 4)
+        self.assertEqual(allocator.freed, [6, 7])
+        self.assertEqual(allocator.skipped, [4, 5])
+
 
 class TestDisabledPureSWARadixCache(CustomTestCase):
     def test_finished_req_skips_protected_prefix_and_evicted_range(self):

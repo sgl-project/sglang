@@ -518,11 +518,14 @@ class RadixCache(BasePrefixCache):
         token_ids = req.full_untruncated_fill_ids[:up_to]
         # Pure-SWA trees never cache what the window already evicted.
         window_evict_floor = req.kv.window_evict_floor
-        key_limit = (
-            ceil_align(window_evict_floor, self.page_size)
-            if window_evict_floor > 0
-            else None
-        )
+        if window_evict_floor > 0:
+            key_limit = ceil_align(window_evict_floor, self.page_size)
+        elif req.kv.max_evicted_seqlen > req.kv.cache_protected_len:
+            # Without a floor the window frees slots right after the cached prefix.
+            # Those slots are back in the allocator, so the key stops at the prefix.
+            key_limit = req.kv.cache_protected_len
+        else:
+            key_limit = None
         radix_key, _, _ = self._insert_cache(
             req, token_ids, key_limit=key_limit, split_prompt=True
         )
