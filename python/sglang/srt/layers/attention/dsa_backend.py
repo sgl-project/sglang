@@ -857,9 +857,9 @@ class DeepseekSparseAttnBackend(
         self._kv_shard_pool = get_kv_shard_pool(self.token_to_kv_pool)
         self.hisparse_coordinator = model_runner.hisparse_coordinator
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
-        self.dcp_gathered_prefill_crossover = self._init_dcp_prefill_crossover(
-            model_runner
-        )
+        # Zero never gathers; init_dcp_prefill_crossover prices the route once
+        # the model runner knows which owned route the model takes.
+        self.dcp_gathered_prefill_crossover = 0.0
         # Translates the ids `req_to_token` holds into the physical ids the
         # page tables carry (`_read_v2p`); identity on a static pool.
         self.runner_ids = model_runner.runner_ids
@@ -1957,34 +1957,37 @@ class DeepseekSparseAttnBackend(
             return False
         return is_dsa_dcp_gathered_prefill(forward_batch.attn_dcp_metadata)
 
-    def _init_dcp_prefill_crossover(self, model_runner) -> float:
-        # Without DCP there is no owned route to weigh the gathered one
-        # against, and a zero crossover never chooses it. Ask before reading
-        # the model config: the two routes are the only reason this backend
-        # wants ``v_head_dim``, and a caller that cannot reach them is not
-        # obliged to carry it.
-        if self.attn_dcp_size == 1:
-            return 0.0
-        parallel = get_parallel()
-        # The partials are projected before the merge, and the query is built
-        # locally, only on the a2a backend with q-replicate on.
-        a2a = parallel.dcp_comm_backend in ("a2a", "fi_a2a")
-        crossover = dcp_gathered_prefill_crossover(
-            v_head_dim=model_runner.model_config.v_head_dim,
+    def init_dcp_prefill_crossover(
+        self,
+        *,
+        v_head_dim: int,
+        partial_dtype: torch.dtype,
+        project_before_merge: bool,
+        q_all_gather: bool,
+    ) -> None:
+        """Price the gathered DCP prefill against the owned route the model
+        takes: whether it projects before the merge and gathers its query."""
+        # Only ROCm plans the gathered route, and without DCP there is no
+        # owned route to weigh it against.
+        if not _is_hip or self.attn_dcp_size == 1:
+            return
+        self.dcp_gathered_prefill_crossover = dcp_gathered_prefill_crossover(
+            v_head_dim=v_head_dim,
             kv_lora_rank=self.kv_lora_rank,
             qk_rope_head_dim=self.qk_rope_head_dim,
-            # The owned route's a2a carries the partials in the model dtype.
-            partial_dtype=model_runner.dtype,
+            partial_dtype=partial_dtype,
             kv_dtype=self.token_to_kv_pool.dtype,
-            project_before_merge=a2a,
-            q_all_gather=not (a2a and parallel.dcp_replicate_q_proj),
+            project_before_merge=project_before_merge,
+            q_all_gather=q_all_gather,
         )
         logger.info(
             "dsa dcp gathered prefill: crossover %.3f prefix tokens per "
-            "extend token and gathered head",
-            crossover,
+            "extend token and gathered head (project_before_merge=%s, "
+            "q_all_gather=%s)",
+            self.dcp_gathered_prefill_crossover,
+            project_before_merge,
+            q_all_gather,
         )
-        return crossover
 
     def _plan_dcp_gathered_prefill(
         self, forward_batch: ForwardBatch, page_table_width: int

@@ -27,6 +27,7 @@ from sglang.srt.layers.dcp import (
     dcp_a2a_lse_reduce,
 )
 from sglang.srt.layers.dcp.layout import (
+    dcp_projects_before_merge,
     dsa_shards_index_k,
     is_mla_dcp_lse_base_on_e,
 )
@@ -600,10 +601,7 @@ class DeepseekMLARocmForwardMixin:
         from sglang.srt.model_executor.runner import get_is_capture_mode
 
         q_replicate_active = (
-            self.is_dcp_q_replicate_phase(forward_batch)
-            and not self.use_deep_gemm_bmm
-            and self.w_kc_qrep is not None
-            and self.q_b_proj_qrep_weight is not None
+            self.is_dcp_q_replicate_phase(forward_batch) and self._dcp_q_replicated()
         )
         q_lora = None
         topk_indices = None
@@ -1278,12 +1276,22 @@ class DeepseekMLARocmForwardMixin:
         return dtype
 
     def _dcp_project_before_merge(self: DeepseekV2AttentionMLA) -> bool:
+        return dcp_projects_before_merge(
+            w_vc_replicated=self.w_vc_qrep is not None,
+            o_proj_unquantized=isinstance(
+                self.o_proj.quant_method, UnquantizedLinearMethod
+            ),
+            kv_b_lora_active=is_kv_b_lora_active(self)
+            or _SGLANG_EXPERIMENTAL_LORA_OPTI,
+        )
+
+    def _dcp_q_replicated(self: DeepseekV2AttentionMLA) -> bool:
+        """Whether --dcp-replicate-q-proj built this layer's full-head Q weights,
+        so the owned DCP route builds every head's query without a gather."""
         return (
-            get_parallel().dcp_comm_backend == "a2a"
-            and self.w_vc_qrep is not None
-            and isinstance(self.o_proj.quant_method, UnquantizedLinearMethod)
-            and not is_kv_b_lora_active(self)
-            and not _SGLANG_EXPERIMENTAL_LORA_OPTI
+            not self.use_deep_gemm_bmm
+            and self.w_kc_qrep is not None
+            and self.q_b_proj_qrep_weight is not None
         )
 
     def _dcp_project_partials(
