@@ -377,9 +377,10 @@ class Gemma4Detector(BaseFormatDetector):
 
                                 calls.append(
                                     ToolCallItem(
-                                        tool_index=self._tool_indices.get(
-                                            func_name, -1
-                                        ),
+                                        # Streaming deltas index tool calls by
+                                        # their order in the response, not by
+                                        # the tool's position in the request.
+                                        tool_index=self.current_tool_id,
                                         name=func_name,
                                         parameters="",
                                     )
@@ -408,9 +409,7 @@ class Gemma4Detector(BaseFormatDetector):
 
                             calls.append(
                                 ToolCallItem(
-                                    tool_index=self._tool_indices.get(
-                                        self.current_func_name, -1
-                                    ),
+                                    tool_index=self.current_tool_id,
                                     parameters=json.dumps(
                                         arguments, ensure_ascii=False
                                     ),
