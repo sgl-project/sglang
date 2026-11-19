@@ -531,11 +531,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         self._fused_chain_verify_fn = None
         if (
             envs.SGLANG_OPT_FUSED_KDA_VERIFY.get()
-            # nv_cutedsl resolves to the Triton verify kernel off CUDA
-            and (
-                verify_backend.is_triton()
-                or (is_hip() and verify_backend.is_nv_cutedsl())
-            )
+            and verify_backend.is_triton()
             and self.kernel_dispatcher.verify_kernel.supports_fused_chain_verify
         ):
             from sglang.kernels.ops.attention.linear.fused_kda_conv_recurrent_verify import (
@@ -1589,14 +1585,8 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
         seq_len, dim = mixed_qkv.shape
         batch_size = seq_len // draft_token_num
-        hip_ring = replayssm_on and is_hip()
-        if (
-            replayssm_on
-            and not hip_ring
-            and (
-                batch_size != 1
-                or not (get_platform().is_sm90 or get_platform().is_sm100)
-            )
+        if replayssm_on and (
+            batch_size != 1 or not (get_platform().is_sm90 or get_platform().is_sm100)
         ):
             # The runtime still uses BV=4, not the benchmark's best-BV sweep:
             # fused+ring wins at B=1 but regresses from B=4 (B=2 at T=8) on
@@ -1643,19 +1633,10 @@ class KDAAttnBackend(MambaAttnBackendBase):
             or (layer.bias is not None and layer.bias.dtype != layer.conv_weights.dtype)
         ):
             return False
-        # ReplaySSM ring (no intermediate-ssm cache): the kernel only reads
-        # ssm_states (h0, upcast to fp32 in-kernel, as the unfused
-        # fused_sigmoid_gating_delta_rule_update does), so a bf16 state pool
-        # (--mamba-ssm-dtype bfloat16) is fine there.
-        ssm_dtype_ok = ssm_states.dtype == torch.float32 or (
-            replayssm_on
-            and hip_ring
-            and ssm_states.dtype in (torch.bfloat16, torch.float16)
-        )
         if (
             layer.A_log.dtype != torch.float32
             or layer.dt_bias.dtype != torch.float32
-            or not ssm_dtype_ok
+            or ssm_states.dtype != torch.float32
         ):
             return False
         if replayssm_on:
@@ -1683,9 +1664,8 @@ class KDAAttnBackend(MambaAttnBackendBase):
             or (not replayssm_on and not intermediate_state_cache.is_contiguous())
         ):
             return False
-        a_width = layer.head_k_dim * layer.num_v_heads
         if (
-            a.numel() != seq_len * a_width
+            a.numel() != seq_len * layer.num_v_heads * layer.head_k_dim
             or b.numel() != seq_len * layer.num_v_heads
             or layer.A_log.numel() != layer.num_v_heads
             or layer.dt_bias.numel() != layer.num_v_heads * layer.head_k_dim
