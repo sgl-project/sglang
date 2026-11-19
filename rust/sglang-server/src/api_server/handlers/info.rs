@@ -219,20 +219,10 @@ mod tests {
         assert!(abort_rx.try_recv().is_err());
     }
 
-    /// `/server_info` lists one internal state per DP rank, in rank order:
-    /// a target with a lower rank than this listener's comes first. A rank
-    /// whose state breaks the typed contract fails it, named in the error.
+    /// A rank whose internal state breaks the typed contract fails
+    /// `/server_info`, named in the error.
     #[tokio::test]
-    async fn server_info_lists_internal_states_in_rank_order() {
-        let throughputs: Vec<_> = rank_one_server_info(serde_json::json!(2.5))
-            .await
-            .unwrap()
-            .internal_states
-            .iter()
-            .map(|state| state.last_gen_throughput)
-            .collect();
-        assert_eq!(throughputs, [Some(2.5), Some(1.5)]);
-
+    async fn server_info_names_the_rank_with_an_invalid_state() {
         let error = rank_one_server_info(serde_json::json!("fast"))
             .await
             .unwrap_err()

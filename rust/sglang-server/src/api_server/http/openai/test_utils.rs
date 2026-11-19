@@ -99,27 +99,6 @@ pub(super) fn with_cached_tokens(mut item: ResponseItem, cached: u32) -> Respons
     item
 }
 
-/// A submitted legacy completion choice.
-pub(super) fn submitted(
-    index: usize,
-    prompt_index: usize,
-    rid: &str,
-) -> (
-    super::completions::SubmittedChoice,
-    tokio::sync::mpsc::Sender<ResponseItem>,
-) {
-    let (tx, rx) = tokio::sync::mpsc::channel(8);
-    (
-        super::completions::SubmittedChoice {
-            index,
-            prompt_index,
-            echo: String::new(),
-            call: CoreCall::from_test_generation_parts(rid.into(), rx, flume::unbounded().0),
-        },
-        tx,
-    )
-}
-
 /// A submitted chat choice (the tuple `chat_event_stream` consumes).
 pub(super) fn chat_submitted(
     index: usize,
@@ -276,11 +255,6 @@ fn answering_app_state_built(
     })
 }
 
-/// The built-in chatml template, for tests that render a chat prompt.
-pub(crate) fn chatml_formatter() -> super::ChatFormatter {
-    sglang_processor::load_chat_formatter(None, None, None, Some("chatml")).unwrap()
-}
-
 /// Serve one request through the full router (extractors, auth, routing).
 /// `with_state` consumes the state into a `Router<()>`, which is what
 /// implements `tower::Service`.
@@ -360,43 +334,9 @@ async fn openai_error_response_covers_unary_and_sse() {
     assert!(text.contains("[DONE]"));
 }
 
+/// A closed tm inbox (shutdown) surfaces as 503.
 #[tokio::test]
-async fn completions_handler_validates_before_submit() {
-    let app = routes().with_state(app_state(core_handle()));
-    let cases = [
-        (json!({"model": "model", "prompt": "hi", "n": 0}), "n=0"),
-        (
-            json!({"model": "model", "prompt": "hi", "max_tokens": 0}),
-            "max_tokens=0",
-        ),
-        (json!({"model": "model", "prompt": ""}), "empty prompt"),
-        (
-            json!({"model": "model", "prompt": "hi", "best_of": 2}),
-            "best_of>1",
-        ),
-        (
-            json!({"model": "model", "prompt": "hi", "suffix": "x"}),
-            "suffix",
-        ),
-        (
-            json!({"model": "model", "prompt": "hi", "prompt_embeds": [[1.0]]}),
-            "prompt_embeds",
-        ),
-    ];
-    for (body, label) in cases {
-        let response = post_json(app.clone(), "/v1/completions", body).await;
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{label}");
-    }
-    // Malformed JSON → 400 (JsonRejection path).
-    let req = Request::builder()
-        .method("POST")
-        .uri("/v1/completions")
-        .header("content-type", "application/json")
-        .body(Body::from("not json"))
-        .unwrap();
-    let response = oneshot(app.clone(), req).await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    // A closed tm inbox (shutdown) surfaces as 503.
+async fn completions_on_a_closed_intake_is_a_503() {
     let app = routes().with_state(app_state(frontend_closed()));
     let response = post_json(
         app.clone(),
@@ -407,101 +347,14 @@ async fn completions_handler_validates_before_submit() {
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
 
-#[tokio::test]
-async fn chat_handler_validates_before_submit() {
-    let app = routes().with_state(app_state(core_handle()));
-    let cases = [
-        (json!({"model": "model", "messages": []}), "empty messages"),
-        (
-            json!({"model": "model", "messages": [{"role": "user", "content": "hi"}], "n": 0}),
-            "n=0",
-        ),
-        (
-            json!({"model": "model", "messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "http://example.com/x.png"}}]}]}),
-            "media content",
-        ),
-        (
-            json!({"model": "model", "messages": [{"role": "user", "content": "hi"}], "function_call": "auto"}),
-            "deprecated function_call",
-        ),
-        (
-            json!({"model": "model", "messages": [{"role": "user", "content": "hi"}], "audio": {"input_audio": {"data": "x", "format": "wav"}}}),
-            "audio",
-        ),
-        (
-            json!({"model": "model", "messages": [{"role": "user", "content": "hi"}], "max_completion_tokens": 0}),
-            "max_completion_tokens=0",
-        ),
-    ];
-    for (body, label) in cases {
-        let response = post_json(app.clone(), "/v1/chat/completions", body).await;
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{label}");
-    }
-    // A valid request with no loaded chat template → 400 (template gate).
-    let response = post_json(
-        app.clone(),
-        "/v1/chat/completions",
-        json!({"model": "model", "messages": [{"role": "user", "content": "hi"}]}),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-}
-
-/// Python's chat and completions handlers serve any `model` name and echo it
-/// back. Only a `base-model:adapter` name is refused: it asks for a LoRA
-/// adapter, which this server does not support.
-#[tokio::test]
-async fn openai_handlers_serve_any_model_name() {
-    let app = routes().with_state(answering_app_state());
-    let messages = json!([{"role": "user", "content": "hi"}]);
-    for (path, body) in [
-        ("/v1/completions", json!({"prompt": "hi"})),
-        ("/v1/chat/completions", json!({"messages": messages})),
-    ] {
-        for model in ["model", "other-model"] {
-            let mut body = body.clone();
-            body["model"] = json!(model);
-            let response = post_json(app.clone(), path, body).await;
-            assert_eq!(response.status(), StatusCode::OK, "{path} {model}");
-            assert_eq!(body_json(response).await["model"], model, "{path}");
-        }
-        let mut body = body.clone();
-        body["model"] = json!("model:adapter");
-        let response = post_json(app.clone(), path, body).await;
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
-        let message = body_json(response).await["error"]["message"].clone();
-        assert!(message.as_str().unwrap().contains("`adapter`"), "{message}");
-    }
-    // As in Python, an empty adapter (`name:`) is none. The served name is
-    // always accepted, even with a colon in it.
+/// Only a `base-model:adapter` name is refused. As in Python, an empty
+/// adapter (`name:`) is none, and the served name is always accepted, even
+/// with a colon in it.
+#[test]
+fn model_error_refuses_only_an_adapter_name() {
     assert_eq!(model_error("other-model: ", "model"), None);
     assert!(model_error("org/model:v1", "model").is_some());
     assert_eq!(model_error("org/model:v1", "org/model:v1"), None);
-}
-
-/// Both OpenAI streams declare UTF-8, as Python's `StreamingResponse` does.
-#[tokio::test]
-async fn openai_streams_declare_utf8_event_stream() {
-    let app = routes().with_state(answering_app_state());
-    let messages = json!([{"role": "user", "content": "hi"}]);
-    for (path, body) in [
-        (
-            "/v1/completions",
-            json!({"model": "model", "prompt": "hi", "stream": true}),
-        ),
-        (
-            "/v1/chat/completions",
-            json!({"model": "model", "messages": messages, "stream": true}),
-        ),
-    ] {
-        let response = post_json(app.clone(), path, body).await;
-        assert_eq!(response.status(), StatusCode::OK, "{path}");
-        assert_eq!(
-            response.headers()["content-type"],
-            crate::utils::response::SSE_CONTENT_TYPE,
-            "{path}"
-        );
-    }
 }
 
 #[tokio::test]

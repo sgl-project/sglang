@@ -1096,7 +1096,7 @@ mod tests {
     use crate::message::request::RequestKind;
     use crate::message::response::{ChunkEvent, ResponseItem};
     use crate::tokenizer_manager::wiring::TmEvent;
-    use crate::utils::error::Error;
+
     use axum::body::Body;
     use axum::http::Request;
     use futures::StreamExt;
@@ -1279,214 +1279,6 @@ mod tests {
         state.core.finish_custom_warmups();
         let response = health_without_generation(State(state)).await;
         assert_eq!(response.status(), StatusCode::OK);
-    }
-
-    /// A healthy `/health_generate` carries the configured metadata headers;
-    /// `/health` sharing the probe does not.
-    #[tokio::test]
-    async fn healthy_probe_carries_configured_headers() {
-        let (intake_tx, intake_rx) = flume::unbounded();
-        let (abort_tx, _abort_rx) = flume::unbounded();
-        let activity: crate::tokenizer_manager::from_scheduler::ActivityCounter =
-            Default::default();
-        let server_args = crate::message::config::ServerArgs {
-            health_generate_headers: [
-                ("x-custom-header".to_string(), "v".to_string()),
-                ("x-rust-server".to_string(), "health".to_string()),
-            ]
-            .into(),
-            ..Default::default()
-        };
-        let state = Arc::new(AppState {
-            core: crate::api_server::handlers::CoreHandle::new(
-                intake_tx,
-                abort_tx,
-                crate::api_server::handlers::CoreConfig {
-                    response_capacity: 8,
-                    response_activity: activity.clone(),
-                    startup_ready: true,
-                    is_disaggregation: false,
-                    mm_limits: Default::default(),
-                    multimodal: false,
-                    peer_endpoints: Vec::new(),
-                    metadata: crate::api_server::handlers::CoreMetadata::default(),
-                    metrics: None,
-                    request_log: None,
-                    generate_validator: None,
-                    abort_hook: None,
-                },
-            ),
-            generation_policy: crate::message::request::GenerationPolicy::from(&server_args),
-            server_args: Arc::new(server_args),
-            chat_formatter: None,
-            generate_hook: None,
-            openai_chat: None,
-        });
-        // Each probe that reaches intake counts as scheduler output.
-        tokio::spawn(async move {
-            while intake_rx.recv_async().await.is_ok() {
-                activity.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-        });
-
-        let response = health_generate(State(state.clone()), Duration::from_secs(5), true).await;
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response.headers()["x-custom-header"], "v");
-        assert_eq!(response.headers()["x-rust-server"], "health");
-
-        let response = health_generate(State(state), Duration::from_secs(5), false).await;
-        assert_eq!(response.status(), StatusCode::OK);
-        assert!(response.headers().get("x-custom-header").is_none());
-    }
-
-    /// Also: an HTTP layer's [`crate::RequestStart`] starts the request's
-    /// timing, so `e2e_latency` covers the layer's work too.
-    async fn assert_native_http_rid_echo(client_rid: &str, stream: bool) {
-        let (intake_tx, intake_rx) = flume::unbounded();
-        let (abort_tx, abort_rx) = flume::unbounded();
-        let core = crate::api_server::handlers::CoreHandle::new(
-            intake_tx,
-            abort_tx,
-            crate::api_server::handlers::CoreConfig {
-                response_capacity: 8,
-                response_activity: Default::default(),
-                startup_ready: true,
-                is_disaggregation: false,
-                mm_limits: Default::default(),
-                multimodal: false,
-                peer_endpoints: Vec::new(),
-                metadata: crate::api_server::handlers::CoreMetadata::default(),
-                metrics: None,
-                request_log: None,
-                generate_validator: None,
-                abort_hook: None,
-            },
-        );
-        let state = Arc::new(AppState {
-            core,
-            server_args: Arc::new(crate::message::config::ServerArgs::default()),
-            generation_policy: GenerationPolicy::default(),
-            chat_formatter: None,
-            generate_hook: None,
-            openai_chat: None,
-        });
-
-        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
-        let responder = tokio::spawn(async move {
-            let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap()
-            else {
-                panic!("HTTP generation must enter through core intake");
-            };
-            assert!(admission.try_accept());
-            let RequestKind::Generate(generate) = &request.kind else {
-                panic!("/generate must submit a generation request");
-            };
-            assert_eq!(generate.input_ids.as_deref(), Some([1, 2].as_slice()));
-            let rid = request.rid.clone();
-            if stream {
-                request
-                    .sink
-                    .try_send(ResponseItem::Frame(ChunkEvent {
-                        rid: rid.clone(),
-                        text: "o".into(),
-                        prompt_tokens: 2,
-                        completion_tokens: 1,
-                        ..Default::default()
-                    }))
-                    .unwrap();
-                finish_rx.await.unwrap();
-            }
-            request
-                .sink
-                .try_send(ResponseItem::Done(ChunkEvent {
-                    rid,
-                    text: if stream { "k" } else { "ok" }.into(),
-                    prompt_tokens: 2,
-                    completion_tokens: if stream { 1 } else { 2 },
-                    finish_reason: serde_json::from_value(serde_json::json!({
-                        "type": "length",
-                        "length": 2
-                    }))
-                    .unwrap(),
-                    ..Default::default()
-                }))
-                .unwrap();
-        });
-
-        let layer_work = Duration::from_secs(5);
-        let request = Request::builder()
-            .method("POST")
-            .uri("/generate")
-            .header("content-type", "application/json")
-            .extension(crate::RequestStart(
-                Instant::now().checked_sub(layer_work).unwrap(),
-            ))
-            .body(Body::from(
-                serde_json::to_vec(&serde_json::json!({
-                    "rid": client_rid,
-                    "input_ids": [1, 2],
-                    "sampling_params": {"max_new_tokens": 2},
-                    "stream": stream,
-                }))
-                .unwrap(),
-            ))
-            .unwrap();
-        let response = routes().with_state(state).oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let mut body_stream = response.into_body().into_data_stream();
-        let mut body = Vec::new();
-        if stream {
-            // Read the first SSE frame before Done, avoiding cumulative coalescing.
-            body.extend_from_slice(&body_stream.next().await.unwrap().unwrap());
-            finish_tx.send(()).unwrap();
-        }
-        while let Some(chunk) = body_stream.next().await {
-            body.extend_from_slice(&chunk.unwrap());
-        }
-        responder.await.unwrap();
-        let values: Vec<serde_json::Value> = if stream {
-            String::from_utf8(body.to_vec())
-                .unwrap()
-                .lines()
-                .filter_map(|line| line.strip_prefix("data: "))
-                .filter(|data| *data != "[DONE]")
-                .map(|data| serde_json::from_str(data).unwrap())
-                .collect()
-        } else {
-            vec![serde_json::from_slice(&body).unwrap()]
-        };
-        assert!(!values.is_empty());
-        if stream {
-            assert!(
-                values.len() >= 2,
-                "stream must carry intermediate and terminal frames"
-            );
-        }
-        for value in &values {
-            assert_eq!(value["meta_info"]["id"], client_rid);
-        }
-        let value = values.last().unwrap();
-        assert_eq!(value["text"], "ok");
-        assert_eq!(value["meta_info"]["id"], client_rid);
-        assert_eq!(value["meta_info"]["prompt_tokens"], 2);
-        assert_eq!(value["meta_info"]["completion_tokens"], 2);
-        let e2e_latency = value["meta_info"]["e2e_latency"].as_f64().unwrap();
-        assert!(e2e_latency >= layer_work.as_secs_f64(), "{e2e_latency}");
-        assert!(abort_rx.try_recv().is_err());
-    }
-
-    #[tokio::test]
-    async fn unary_http_generate_round_trips_through_frontend_handle() {
-        assert_native_http_rid_echo("client-rid", false).await;
-    }
-
-    #[tokio::test]
-    async fn long_rids_round_trip_through_unary_and_streaming_http() {
-        for client_rid in ["x".repeat(200), "é".repeat(128)] {
-            for stream in [false, true] {
-                assert_native_http_rid_echo(&client_rid, stream).await;
-            }
-        }
     }
 
     /// Each item `body` submits under `server_args`: its `max_new_tokens`, and
@@ -1742,46 +1534,75 @@ mod tests {
         );
     }
 
-    /// An item whose `sampling_params` name no `max_new_tokens` is marked
-    /// defaulted and keeps the value the fills gave it (the preferred one, else
-    /// the launch default); one that names it, even as null, keeps the client's. A
-    /// list is marked object by object, and one object marks every item.
+    /// What each item is submitted with for `max_new_tokens`, and whether it
+    /// is marked defaulted. An item whose `sampling_params` name none takes
+    /// the preferred sampling params' value, else the launch default (no
+    /// limit when that is `None`), and is marked; one that names it, even as
+    /// null, keeps the client's and is not. A list is marked object by
+    /// object, and one object marks every item.
     #[tokio::test]
-    async fn generate_marks_each_max_new_tokens_the_client_omits() {
+    async fn omitted_max_new_tokens_is_filled_and_marked_defaulted() {
         use crate::message::config::{PreferredSamplingParams, ServerArgs};
-        let args = |preferred: Option<serde_json::Value>| ServerArgs {
+        let launch_default = ServerArgs::default().default_max_new_tokens;
+        let args = |default_max_new_tokens, preferred: Option<serde_json::Value>| ServerArgs {
+            default_max_new_tokens,
             preferred_sampling_params: preferred.map(PreferredSamplingParams),
             ..Default::default()
         };
         let preferred = Some(serde_json::json!({"temperature": 1.0, "max_new_tokens": 4096}));
+        let preferred_args = || args(launch_default, preferred.clone());
+        let omitted = serde_json::json!({"input_ids": [1, 2]});
         let cases = [
+            // Filled by the preferred sampling params.
             (
-                args(preferred.clone()),
+                preferred_args(),
                 serde_json::json!({"input_ids": [1]}),
                 vec![(Some(4096), true)],
             ),
             (
-                args(preferred.clone()),
+                preferred_args(),
                 serde_json::json!({"input_ids": [1], "sampling_params": {"top_p": 0.5}}),
                 vec![(Some(4096), true)],
             ),
             (
-                args(None),
+                args(Some(4096), Some(serde_json::json!({"max_new_tokens": 7}))),
+                omitted.clone(),
+                vec![(Some(7), true)],
+            ),
+            // Filled by the launch default, which may be no limit.
+            (
+                args(launch_default, None),
                 serde_json::json!({"input_ids": [1]}),
                 vec![(Some(128), true)],
             ),
             (
-                args(preferred.clone()),
+                args(Some(4096), None),
+                omitted.clone(),
+                vec![(Some(4096), true)],
+            ),
+            (args(None, None), omitted, vec![(None, true)]),
+            // Named by the client, even as null.
+            (
+                preferred_args(),
                 serde_json::json!({"input_ids": [1], "sampling_params": {"max_new_tokens": 8}}),
                 vec![(Some(8), false)],
             ),
             (
-                args(preferred.clone()),
+                preferred_args(),
                 serde_json::json!({"input_ids": [1], "sampling_params": {"max_new_tokens": null}}),
                 vec![(None, false)],
             ),
             (
-                args(preferred.clone()),
+                args(Some(4096), None),
+                serde_json::json!({
+                    "input_ids": [1, 2],
+                    "sampling_params": {"max_new_tokens": 3},
+                }),
+                vec![(Some(3), false)],
+            ),
+            // A batch: object by object, or one object for every item.
+            (
+                preferred_args(),
                 serde_json::json!({
                     "input_ids": [[1], [2]],
                     "sampling_params": [{}, {"max_new_tokens": 8}],
@@ -1789,7 +1610,7 @@ mod tests {
                 vec![(Some(4096), true), (Some(8), false)],
             ),
             (
-                args(preferred),
+                preferred_args(),
                 serde_json::json!({
                     "input_ids": [[1], [2]],
                     "sampling_params": {"max_new_tokens": 8},
@@ -1801,37 +1622,6 @@ mod tests {
             let submitted =
                 submitted_max_new_tokens(server_args, body.clone(), expected.len()).await;
             assert_eq!(submitted, expected, "{body}");
-        }
-    }
-
-    /// An omitted `max_new_tokens` takes the launch default, beneath the
-    /// request's own value and the preferred sampling params; a `None`
-    /// default is no limit. Whichever fill supplies it, it is marked defaulted.
-    #[tokio::test]
-    async fn omitted_max_new_tokens_takes_the_launch_default() {
-        use crate::message::config::{PreferredSamplingParams, ServerArgs};
-        let args = |default_max_new_tokens, preferred: Option<serde_json::Value>| ServerArgs {
-            default_max_new_tokens,
-            preferred_sampling_params: preferred.map(PreferredSamplingParams),
-            ..Default::default()
-        };
-        let omitted = serde_json::json!({"input_ids": [1, 2]});
-        let explicit = serde_json::json!({
-            "input_ids": [1, 2],
-            "sampling_params": {"max_new_tokens": 3},
-        });
-        let preferred = Some(serde_json::json!({"max_new_tokens": 7}));
-        for (server_args, body, expected) in [
-            (args(Some(4096), None), &omitted, (Some(4096), true)),
-            (args(None, None), &omitted, (None, true)),
-            (args(Some(4096), preferred), &omitted, (Some(7), true)),
-            (args(Some(4096), None), &explicit, (Some(3), false)),
-        ] {
-            assert_eq!(
-                submitted_max_new_tokens(server_args, body.clone(), 1).await,
-                vec![expected],
-                "{body}"
-            );
         }
     }
 
@@ -1952,451 +1742,6 @@ mod tests {
                 "started": self.started,
                 "failed": [status.as_u16(), message],
             }));
-        }
-    }
-
-    /// The launch's generate validator refuses at every ingress before
-    /// anything is submitted, a batch's valid items included: native
-    /// `/generate` with its 400 (a stream's error frame), and the OpenAI
-    /// routes with their 400, unary even for a stream, as Python answers the
-    /// tokenizer manager's `ValueError` before the stream starts.
-    #[tokio::test]
-    async fn generate_validator_refuses_every_ingress_before_submission() {
-        let native = serde_json::json!({"code": 400, "message": "top_logprobs_num 2"});
-        let native_stream = serde_json::json!({
-            "code": 400,
-            "message": "top_logprobs_num 2",
-            "type": "invalid_request_error",
-            "retryable": false,
-        });
-        let openai = serde_json::json!({
-            "object": "error",
-            "message": "top_logprobs_num 2",
-            "type": "BadRequestError",
-            "param": null,
-            "code": 400,
-        });
-        let generate = |text: serde_json::Value, top_logprobs_num, stream| {
-            serde_json::json!({
-                "text": text,
-                "stream": stream,
-                "return_logprob": true,
-                "top_logprobs_num": top_logprobs_num,
-            })
-        };
-        let completion = |stream| {
-            serde_json::json!({
-                "model": "m",
-                "prompt": [1, 2],
-                "logprobs": 2,
-                "max_tokens": 1,
-                "stream": stream,
-            })
-        };
-        for (uri, body, status, error) in [
-            (
-                "/generate",
-                generate(
-                    serde_json::json!(["x", "y"]),
-                    serde_json::json!([1, 2]),
-                    false,
-                ),
-                StatusCode::BAD_REQUEST,
-                &native,
-            ),
-            (
-                "/generate",
-                generate(
-                    serde_json::json!(["x", "y"]),
-                    serde_json::json!([1, 2]),
-                    true,
-                ),
-                StatusCode::OK,
-                &native_stream,
-            ),
-            (
-                "/generate",
-                generate(serde_json::json!("x"), serde_json::json!(2), false),
-                StatusCode::BAD_REQUEST,
-                &native,
-            ),
-            (
-                "/v1/completions",
-                completion(false),
-                StatusCode::BAD_REQUEST,
-                &openai,
-            ),
-            (
-                "/v1/completions",
-                completion(true),
-                StatusCode::BAD_REQUEST,
-                &openai,
-            ),
-        ] {
-            let (intake_tx, intake_rx) = flume::unbounded();
-            let core = crate::api_server::handlers::CoreHandle::new(
-                intake_tx,
-                flume::unbounded().0,
-                crate::api_server::handlers::CoreConfig {
-                    response_capacity: 8,
-                    response_activity: Default::default(),
-                    startup_ready: true,
-                    is_disaggregation: false,
-                    mm_limits: Default::default(),
-                    multimodal: false,
-                    metadata: crate::api_server::handlers::CoreMetadata::default(),
-                    metrics: None,
-                    request_log: None,
-                    peer_endpoints: Vec::new(),
-                    generate_validator: Some(Arc::new(crate::api_server::core::TopLogprobsCap)),
-                    abort_hook: None,
-                },
-            );
-            let state = Arc::new(AppState {
-                core,
-                server_args: Arc::new(crate::message::config::ServerArgs {
-                    served_model_name: "m".into(),
-                    ..Default::default()
-                }),
-                generation_policy: GenerationPolicy::default(),
-                chat_formatter: None,
-                generate_hook: None,
-                openai_chat: None,
-            });
-            let case = format!("{uri} {body}");
-            let request = Request::builder()
-                .method("POST")
-                .uri(uri)
-                .header("content-type", "application/json")
-                .body(Body::from(body.to_string()))
-                .unwrap();
-            let response = routes()
-                .merge(super::super::openai::routes())
-                .with_state(state)
-                .oneshot(request)
-                .await
-                .unwrap();
-            assert_eq!(response.status(), status, "{case}");
-            let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
-                .await
-                .unwrap();
-            let body = std::str::from_utf8(&body).unwrap();
-            let first = body
-                .strip_prefix("data: ")
-                .unwrap_or(body)
-                .lines()
-                .next()
-                .unwrap();
-            assert_eq!(&parse(first)["error"], error, "{case}");
-            assert!(
-                intake_rx.is_empty(),
-                "{case}: an item reached the scheduler"
-            );
-        }
-    }
-
-    /// A hook's keys reach every native frame of every request — unary,
-    /// cumulative and incremental streams, single and batch — each request's
-    /// hook started from its own sampling params, with the scheduler's decode
-    /// latency for a unary request and this frontend's for a streamed one;
-    /// without a hook the frames are the schema's. A finished request's stats
-    /// reach its terminal frame only, after the schema's keys and before the
-    /// hook's, with the decode throughput when metrics are on; a request whose
-    /// terminal output carries no stats (an older scheduler) reports neither.
-    /// The hook starts from each item's request, the HTTP headers and the
-    /// sampling params the client sent for it (without the launch-time
-    /// preferred ones), and sees each terminal frame once. An HTTP layer's
-    /// earlier [`crate::RequestStart`] lengthens every terminal `e2e_latency`
-    /// but neither decode latency. Every frame carries the listener's DP rank
-    /// (null without data parallelism), a status abort's terminal stream frame
-    /// included.
-    #[tokio::test]
-    async fn generate_hook_keys_reach_every_frame() {
-        for (stream, incremental, hook, batch, metrics) in [
-            (false, false, true, true, true),
-            (false, false, false, false, false),
-            (true, false, true, true, false),
-            (true, false, false, false, true),
-            (true, true, true, true, true),
-            (true, true, false, false, true),
-        ] {
-            // A hooked case also runs as DP rank 1, which frames report; the
-            // rest without DP, whose frames report null.
-            let dp_rank: u32 = if hook { 1 } else { 0 };
-            let server_args = crate::message::config::ServerArgs {
-                incremental_streaming_output: incremental,
-                metrics: metrics.then(|| crate::message::config::MetricsConfig {
-                    multiproc_dir: String::new(),
-                    labels: Default::default(),
-                    priority_label: false,
-                    bucket_time_to_first_token: None,
-                    bucket_inter_token_latency: None,
-                    bucket_e2e_request_latency: None,
-                    bucket_prompt_tokens: None,
-                    bucket_generation_tokens: None,
-                }),
-                preferred_sampling_params: Some(crate::message::config::PreferredSamplingParams(
-                    serde_json::json!({"top_k": 7}),
-                )),
-                deployment_info: crate::message::config::DeploymentInfo {
-                    dp_size: if hook { 2 } else { 1 },
-                    dp_rank: Some(dp_rank),
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
-            let (intake_tx, intake_rx) = flume::unbounded();
-            let core = crate::api_server::handlers::CoreHandle::new(
-                intake_tx,
-                flume::unbounded().0,
-                crate::api_server::handlers::CoreConfig {
-                    response_capacity: 8,
-                    response_activity: Default::default(),
-                    startup_ready: true,
-                    is_disaggregation: false,
-                    mm_limits: Default::default(),
-                    multimodal: false,
-                    peer_endpoints: Vec::new(),
-                    metadata: crate::api_server::handlers::CoreMetadata::from(&server_args),
-                    metrics: None,
-                    request_log: None,
-                    generate_validator: None,
-                    abort_hook: None,
-                },
-            );
-            let top_p_hook = TopPHook::default();
-            let state = Arc::new(AppState {
-                core,
-                server_args: Arc::new(server_args),
-                generation_policy: GenerationPolicy::default(),
-                chat_formatter: None,
-                generate_hook: hook
-                    .then(|| Arc::new(top_p_hook.clone()) as Arc<dyn crate::GenerateHook>),
-                openai_chat: None,
-            });
-            let items = if batch { 2 } else { 1 };
-            // Every item's delta, then every terminal: a stream emits two
-            // frames per item. The first item's terminal output carries its
-            // stats.
-            let responder = tokio::spawn(async move {
-                let mut sinks = Vec::new();
-                for _ in 0..items {
-                    let TmEvent::Intake { request, admission } =
-                        intake_rx.recv_async().await.unwrap()
-                    else {
-                        panic!("expected a generation intake");
-                    };
-                    assert!(admission.try_accept());
-                    sinks.push((request.rid.clone(), request.sink.clone()));
-                }
-                // One output token logprob per output.
-                let logprob = || crate::message::response::ChunkExtras {
-                    out_lp_val: vec![-0.5],
-                    out_lp_idx: vec![1],
-                    ..Default::default()
-                };
-                for (rid, sink) in &sinks {
-                    let ResponseItem::Frame(mut chunk) = frame(0, "a") else {
-                        unreachable!()
-                    };
-                    chunk.rid = rid.clone();
-                    chunk.extras = Some(Box::new(logprob()));
-                    sink.try_send(ResponseItem::Frame(chunk)).unwrap();
-                }
-                // A streamed item's decode latency runs from this frontend's
-                // first output, so let the stream take that first.
-                tokio::time::sleep(Duration::from_millis(2)).await;
-                for (item, (rid, sink)) in sinks.iter().enumerate() {
-                    let ResponseItem::Done(mut chunk) = done(0, "b") else {
-                        unreachable!()
-                    };
-                    chunk.rid = rid.clone();
-                    // A streamed batch's second item ends on a status abort,
-                    // still a frame.
-                    if stream && item == 1 {
-                        chunk.finish_reason = serde_json::from_value(serde_json::json!({
-                            "type": "abort",
-                            "message": "Aborted",
-                            "status_code": 500,
-                            "err_type": null
-                        }))
-                        .unwrap();
-                    }
-                    let mut stats = serde_json::Map::new();
-                    stats.insert("num_retractions".into(), serde_json::json!(1));
-                    stats.insert("queue_time".into(), serde_json::json!(0.5));
-                    let extras = crate::message::response::ChunkExtras {
-                        // The scheduler times non-streaming requests only.
-                        decode_latency: (!stream).then_some(0.25),
-                        request_stats: (item == 0).then(|| RequestStats(stats)),
-                        ..logprob()
-                    };
-                    chunk.extras = Some(Box::new(extras));
-                    sink.try_send(ResponseItem::Done(chunk)).unwrap();
-                }
-            });
-            let (text, sampling_params) = if batch {
-                (
-                    serde_json::json!(["x", "y"]),
-                    serde_json::json!([{"top_p": 0.5}, {"top_p": 0.25}]),
-                )
-            } else {
-                (serde_json::json!("x"), serde_json::json!({"top_p": 0.5}))
-            };
-            let body = serde_json::json!({
-                "rid": "r",
-                "text": text,
-                "stream": stream,
-                "sampling_params": sampling_params,
-            });
-            let layer_work = Duration::from_secs(5);
-            let request = Request::builder()
-                .method("POST")
-                .uri("/generate")
-                .header("content-type", "application/json")
-                .header("x-test", "v")
-                .extension(crate::RequestStart(
-                    Instant::now().checked_sub(layer_work).unwrap(),
-                ))
-                .body(Body::from(body.to_string()))
-                .unwrap();
-            let response = routes().with_state(state).oneshot(request).await.unwrap();
-            if stream {
-                assert_eq!(
-                    response.headers()["content-type"],
-                    crate::utils::response::SSE_CONTENT_TYPE
-                );
-            }
-            let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
-                .await
-                .unwrap();
-            responder.await.unwrap();
-            let body = std::str::from_utf8(&body).unwrap();
-            let frames: Vec<serde_json::Value> = if stream {
-                body.lines()
-                    .filter_map(|line| line.strip_prefix("data: "))
-                    .filter(|data| *data != "[DONE]")
-                    .map(parse)
-                    .collect()
-            } else if batch {
-                parse(body).as_array().unwrap().clone()
-            } else {
-                vec![parse(body)]
-            };
-
-            let case = format!(
-                "stream={stream} incremental={incremental} hook={hook} batch={batch} metrics={metrics} dp_rank={dp_rank}"
-            );
-            // A stream takes each delta before its terminal output arrives.
-            assert_eq!(frames.len(), items * if stream { 2 } else { 1 }, "{case}");
-            let mut seen = [0usize; 2];
-            for (position, frame) in frames.iter().enumerate() {
-                // A unary batch is an array in request order, without `index`;
-                // a single request has none either.
-                let index = frame["index"]
-                    .as_u64()
-                    .map_or(if batch { position } else { 0 }, |i| i as usize);
-                let meta = frame["meta_info"].as_object().unwrap();
-                let terminal = !meta["finish_reason"].is_null();
-                assert_eq!(
-                    meta.get("dp_rank"),
-                    Some(&serde_json::json!(hook.then_some(dp_rank))),
-                    "{case}"
-                );
-                let keys: Vec<&str> = meta.keys().map(String::as_str).collect();
-                let e2e_latency = meta.get("e2e_latency").and_then(serde_json::Value::as_f64);
-                assert_eq!(e2e_latency.is_some(), terminal, "{case}");
-                if let Some(e2e_latency) = e2e_latency {
-                    assert!(
-                        e2e_latency >= layer_work.as_secs_f64(),
-                        "{case}: {e2e_latency}"
-                    );
-                }
-                let stats = terminal && index == 0;
-                assert_eq!(meta.get("num_retractions").is_some(), stats, "{case}");
-                assert_eq!(
-                    meta.get("decode_throughput").is_some(),
-                    stats && metrics,
-                    "{case}"
-                );
-                if stats {
-                    let at = keys
-                        .iter()
-                        .position(|key| *key == "num_retractions")
-                        .unwrap();
-                    assert_eq!(
-                        keys[at..at + 2],
-                        ["num_retractions", "queue_time"],
-                        "{case}"
-                    );
-                    assert_eq!(meta["queue_time"], 0.5, "{case}");
-                    if metrics {
-                        assert_eq!(keys[at + 2], "decode_throughput", "{case}");
-                        // Two tokens, 0.25 s apart by the scheduler's clock.
-                        if !stream {
-                            assert_eq!(meta["decode_throughput"], 4.0, "{case}");
-                        }
-                    }
-                }
-                if !hook {
-                    assert!(meta.get("top_p").is_none() && frame.get("first").is_none());
-                    continue;
-                }
-                assert_eq!(meta["top_p"], [0.5, 0.25][index], "{case}");
-                assert_eq!(frame.get("first").is_some(), seen[index] == 0, "{case}");
-                assert_eq!(meta.get("decode_s").is_some(), terminal, "{case}");
-                if terminal && !stream {
-                    assert_eq!(meta["decode_s"], 0.25, "{case}");
-                }
-                // A streamed request's decode latency runs from its first
-                // output, which the layer's work came before.
-                if terminal && stream {
-                    let decode_s = meta["decode_s"].as_f64().unwrap();
-                    assert!(
-                        e2e_latency.unwrap() - decode_s >= layer_work.as_secs_f64(),
-                        "{case}: {e2e_latency:?} - {decode_s}"
-                    );
-                }
-                if stats {
-                    let stats_at = keys.iter().position(|key| *key == "num_retractions");
-                    let hook_at = keys.iter().position(|key| *key == "top_p");
-                    assert!(stats_at < hook_at, "{case}");
-                }
-                seen[index] += 1;
-            }
-            let mut log = std::mem::take(&mut *top_p_hook.log.lock().unwrap());
-            if !hook {
-                assert!(log.is_empty(), "{case}");
-                continue;
-            }
-            log.sort_by_key(|entry| entry["started"]["rid"].as_str().unwrap().to_owned());
-            assert_eq!(log.len(), items, "{case}");
-            for (item, entry) in log.iter().enumerate() {
-                let rid = if batch {
-                    format!("r_{item}")
-                } else {
-                    "r".into()
-                };
-                let client = if batch {
-                    sampling_params[item].clone()
-                } else {
-                    sampling_params.clone()
-                };
-                let expected = serde_json::json!({
-                    "started": {"rid": rid, "header": "v", "top_k": 7, "client": client},
-                    // Two tokens, one per output.
-                    "completion_tokens": 2,
-                    "queue_time": (item == 0).then_some(0.5),
-                    "decode_latency": entry["decode_latency"],
-                    // Both outputs', though an incremental terminal frame
-                    // carries only its own.
-                    "output_token_logprobs": 2,
-                });
-                assert_eq!(entry, &expected, "{case}");
-                if !stream {
-                    assert_eq!(entry["decode_latency"], 0.25, "{case}");
-                }
-            }
         }
     }
 
@@ -2889,130 +2234,6 @@ mod tests {
         }
     }
 
-    /// The native unary response uses the same names and meanings as Python's
-    /// TokenizerManager metadata, and adds e2e_latency only on the terminal
-    /// result. The timer is seconds from normalized-request acceptance through
-    /// terminal-output handling.
-    #[tokio::test]
-    async fn unary_terminal_meta_info_matches_python_semantics() {
-        let (tx, rx) = mpsc::channel(2);
-        tx.send(ResponseItem::Done(ChunkEvent {
-            rid: "internal-rid".into(),
-            text: "ok".into(),
-            token_ids: vec![7, 8],
-            prompt_tokens: 5,
-            completion_tokens: 2,
-            finish_reason: serde_json::from_value(serde_json::json!({
-                "type": "length",
-                "length": 2
-            }))
-            .expect("finish reason must parse"),
-            ..Default::default()
-        }))
-        .await
-        .unwrap();
-        let mut call =
-            CoreCall::from_test_generation_parts("internal-rid".into(), rx, flume::unbounded().0);
-
-        let timing = RequestTiming {
-            created_at: Instant::now() - Duration::from_millis(20),
-            time_to_first_token: None,
-            e2e_latency: None,
-        };
-        let request = RequestState {
-            timing,
-            scheduler_decode_latency: None,
-            report_decode_throughput: false,
-            output_token_logprobs: 0,
-            customized_info: CustomizedInfoState::default(),
-            hook: None,
-        };
-        let (status, item) = drain_unary(&mut call, "client-rid", request).await;
-        let value = serde_json::to_value(&item).unwrap();
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(value["meta_info"]["id"], "client-rid");
-        assert_eq!(value["meta_info"]["prompt_tokens"], 5);
-        assert_eq!(value["meta_info"]["completion_tokens"], 2);
-        assert_eq!(
-            value["meta_info"]["finish_reason"],
-            serde_json::json!({"type": "length", "length": 2})
-        );
-        assert!(
-            value["meta_info"]["e2e_latency"].as_f64().unwrap() >= 0.020,
-            "latency is expressed in seconds from request creation"
-        );
-        assert!(
-            value["meta_info"].get("ttft").is_none()
-                && value["meta_info"].get("time_to_first_token").is_none(),
-            "TTFT is recorded internally but is not part of this PR's API"
-        );
-    }
-
-    /// Two sub-requests' frames interleave into one stream, each tagged with its
-    /// batch `index`; text accumulates per item; `[DONE]` comes only after both
-    /// terminate, then the stream ends.
-    #[tokio::test]
-    async fn interleaves_indexes_and_accumulates() {
-        let (tx0, rx0) = mpsc::channel(8);
-        let (tx1, rx1) = mpsc::channel(8);
-        let calls = vec![timed_call(10, rx0), timed_call(11, rx1)];
-        let stream = generation_event_stream(calls, false, true);
-        futures::pin_mut!(stream);
-
-        // Drive deterministically: exactly one channel has data before each poll.
-        tx0.send(frame(10, "a")).await.unwrap();
-        let v = parse(&stream.next().await.unwrap());
-        assert_eq!(v["index"], 0);
-        assert_eq!(v["text"], "a");
-
-        tx1.send(frame(11, "b")).await.unwrap();
-        let v = parse(&stream.next().await.unwrap());
-        assert_eq!(v["index"], 1);
-        assert_eq!(v["text"], "b");
-
-        tx0.send(done(10, "!")).await.unwrap();
-        let v = parse(&stream.next().await.unwrap());
-        assert_eq!(v["index"], 0);
-        assert_eq!(v["text"], "a!", "cumulative per item");
-        assert_eq!(v["meta_info"]["finish_reason"]["type"], "length");
-        assert!(v["meta_info"]["e2e_latency"].as_f64().unwrap() >= 0.010);
-
-        tx1.send(done(11, "?")).await.unwrap();
-        let v = parse(&stream.next().await.unwrap());
-        assert_eq!(v["index"], 1);
-        assert_eq!(v["text"], "b?");
-        assert!(v["meta_info"]["e2e_latency"].as_f64().unwrap() >= 0.010);
-
-        assert_eq!(stream.next().await.unwrap(), "[DONE]");
-        assert!(stream.next().await.is_none());
-    }
-
-    #[tokio::test]
-    async fn dropping_stream_aborts_only_unfinished_calls() {
-        use crate::tokenizer_manager::wiring::AbortSource;
-
-        let (tx0, rx0) = mpsc::channel(8);
-        let (tx1, rx1) = mpsc::channel(8);
-        let (abort_tx, abort_rx) = flume::unbounded();
-        let calls = vec![
-            timed_call_with_abort(10, rx0, abort_tx.clone()),
-            timed_call_with_abort(11, rx1, abort_tx),
-        ];
-        let mut stream = Box::pin(generation_event_stream(calls, false, true));
-
-        tx0.send(done(10, "done")).await.unwrap();
-        assert_eq!(parse(&stream.next().await.unwrap())["index"], 0);
-        tx1.send(frame(11, "live")).await.unwrap();
-        assert_eq!(parse(&stream.next().await.unwrap())["index"], 1);
-
-        drop(stream);
-        assert!(matches!(
-            abort_rx.recv().unwrap(),
-            AbortSource::Guard(rid) if rid.as_str() == "11"
-        ));
-        assert!(abort_rx.try_recv().is_err());
-    }
-
     /// A core failure before the stream starts is one SSE frame with Python's
     /// `type` and `retryable` for its kind; unary, it's the bare native body.
     #[tokio::test]
@@ -3100,205 +2321,45 @@ mod tests {
         }
     }
 
-    /// A per-item error is surfaced with its `index` and doesn't end the batch;
-    /// `[DONE]` still waits for the other item.
+    /// A client that falls behind finds a backlog. Cumulative frames each
+    /// supersede the last, so the backlog collapses to one frame carrying the
+    /// latest state (the Python waiter's `out = out_list[-1]`); incremental
+    /// frames are deltas, so every one is emitted.
     #[tokio::test]
-    async fn per_item_error_carries_index() {
-        let (tx0, rx0) = mpsc::channel(8);
-        let (tx1, rx1) = mpsc::channel(8);
-        let log = Arc::default();
-        let calls: Vec<_> = [timed_call(10, rx0), timed_call(11, rx1)]
-            .into_iter()
-            .map(|(call, mut request)| {
-                request.hook = Some(RequestHook {
-                    hook: Arc::new(TopPHook::default()),
-                    frames: TopPFrames::logging(&log),
-                });
-                (call, request)
-            })
-            .collect();
-        let stream = generation_event_stream(calls, false, true);
-        futures::pin_mut!(stream);
+    async fn a_backlog_coalesces_cumulative_frames_and_keeps_every_delta() {
+        for incremental in [false, true] {
+            let (tx, rx) = mpsc::channel(8);
+            let calls = vec![timed_call(10, rx)];
+            let stream = generation_event_stream(calls, incremental, false);
+            futures::pin_mut!(stream);
 
-        tx0.send(ResponseItem::Error(Error::Validation("bad".into())))
-            .await
-            .unwrap();
-        let v = parse(&stream.next().await.unwrap());
-        assert_eq!(v["index"], 0);
-        assert_eq!(v["error"]["code"], 400);
-        assert_eq!(v["error"]["type"], "invalid_request_error");
-        assert_eq!(v["error"]["retryable"], false);
+            // Three chunks queued before the stream is ever polled.
+            for text in ["a", "b", "c"] {
+                tx.send(frame(10, text)).await.unwrap();
+            }
+            if incremental {
+                for (n, expect) in [(1, "a"), (2, "b"), (3, "c")] {
+                    let v = parse(&stream.next().await.unwrap());
+                    assert_eq!(v["text"], expect, "delta {n} must not be dropped");
+                    assert_eq!(
+                        v["meta_info"]["completion_tokens"], n,
+                        "count stays cumulative"
+                    );
+                }
+                continue;
+            }
+            let v = parse(&stream.next().await.unwrap());
+            assert_eq!(v["text"], "abc", "one frame, full cumulative text");
+            assert_eq!(v["meta_info"]["completion_tokens"], 3, "no tokens lost");
 
-        tx1.send(done(11, "ok")).await.unwrap();
-        let v = parse(&stream.next().await.unwrap());
-        assert_eq!(v["index"], 1);
-
-        assert_eq!(stream.next().await.unwrap(), "[DONE]");
-        // A package's hook hears of the failure, and of the other item's end.
-        let log = log.lock().unwrap();
-        assert_eq!(log[0]["failed"], serde_json::json!([400, "bad"]));
-        assert_eq!(log[1]["completion_tokens"], 1);
+            // The terminal frame still carries everything, and only then does [DONE] land.
+            tx.send(done(10, "!")).await.unwrap();
+            let v = parse(&stream.next().await.unwrap());
+            assert_eq!(v["text"], "abc!");
+            assert_eq!(v["meta_info"]["finish_reason"]["type"], "length");
+            assert_eq!(stream.next().await.unwrap(), "[DONE]");
+        }
     }
-
-    /// A scheduler abort that carried an error status ends a stream on a
-    /// normal frame, as Python's server ends it: the output so far, the
-    /// request's counts, and the abort as the finish reason, then `[DONE]`.
-    /// A unary response answers with the abort's status and message instead.
-    #[tokio::test]
-    async fn scheduler_abort_ends_a_stream_on_a_frame_and_fails_unary() {
-        let finish_reason = serde_json::json!({
-            "type": "abort",
-            "message": "media decode failed",
-            "status_code": 432,
-            "err_type": "BadRequestError"
-        });
-        let abort = |rid: u64| {
-            ResponseItem::Done(ChunkEvent {
-                rid: Rid::from(rid.to_string()),
-                prompt_tokens: 5,
-                finish_reason: serde_json::from_value(finish_reason.clone()).unwrap(),
-                ..Default::default()
-            })
-        };
-
-        let (tx, rx) = mpsc::channel(8);
-        let stream = generation_event_stream(vec![timed_call(10, rx)], false, false);
-        futures::pin_mut!(stream);
-        tx.send(frame(10, "partial")).await.unwrap();
-        assert_eq!(parse(&stream.next().await.unwrap())["text"], "partial");
-        tx.send(abort(10)).await.unwrap();
-        let v = parse(&stream.next().await.unwrap());
-        assert!(v.get("error").is_none(), "no error item: {v}");
-        assert_eq!(v["text"], "partial");
-        assert_eq!(v["meta_info"]["prompt_tokens"], 5);
-        assert_eq!(v["meta_info"]["completion_tokens"], 1);
-        assert_eq!(v["meta_info"]["finish_reason"], finish_reason);
-        assert!(v["meta_info"]["e2e_latency"].as_f64().unwrap() >= 0.010);
-        assert_eq!(stream.next().await.unwrap(), "[DONE]");
-
-        let (tx, rx) = mpsc::channel(8);
-        tx.send(abort(11)).await.unwrap();
-        let (mut call, timing) = timed_call(11, rx);
-        let (status, item) = drain_unary(&mut call, "11", timing).await;
-        assert_eq!(status.as_u16(), 432);
-        let v = serde_json::to_value(&item).unwrap();
-        assert_eq!(v["error"]["code"], 432);
-        assert_eq!(v["error"]["message"], "media decode failed");
-    }
-
-    /// `incremental=true`: each frame carries this step's **delta** text/output_ids,
-    /// but `meta_info.completion_tokens` stays cumulative (matching Python), and
-    /// so does the cached-token split, which a scheduler abort does not carry.
-    #[tokio::test]
-    async fn incremental_emits_deltas_with_cumulative_count() {
-        use crate::message::response::{CachedTokensDetails, ChunkExtras};
-
-        let (tx, rx) = mpsc::channel(8);
-        let calls = vec![timed_call(10, rx)];
-        let stream = generation_event_stream(calls, true, true);
-        futures::pin_mut!(stream);
-        let with_extras = |item: ResponseItem, extras: ChunkExtras| {
-            let (ResponseItem::Frame(mut chunk) | ResponseItem::Done(mut chunk)) = item else {
-                unreachable!()
-            };
-            chunk.cached_tokens = 3;
-            chunk.extras = Some(Box::new(extras));
-            chunk
-        };
-        let split = serde_json::json!({"device": 1, "host": 2});
-
-        let hello = with_extras(
-            frame(10, "Hello"),
-            ChunkExtras {
-                cached_tokens_details: Some(CachedTokensDetails {
-                    device: 1,
-                    host: 2,
-                    storage: None,
-                    storage_backend: None,
-                }),
-                ..Default::default()
-            },
-        );
-        tx.send(ResponseItem::Frame(hello)).await.unwrap();
-        let v = parse(&stream.next().await.unwrap());
-        assert_eq!(v["text"], "Hello");
-        assert_eq!(v["meta_info"]["completion_tokens"], 1);
-        assert_eq!(v["meta_info"]["cached_tokens_details"], split);
-        assert!(v["meta_info"].get("e2e_latency").is_none());
-
-        tx.send(frame(10, " world")).await.unwrap();
-        let v = parse(&stream.next().await.unwrap());
-        assert_eq!(v["text"], " world", "delta, not cumulative 'Hello world'");
-        assert_eq!(
-            v["meta_info"]["completion_tokens"], 2,
-            "count stays cumulative"
-        );
-        assert!(v["meta_info"].get("e2e_latency").is_none());
-
-        let aborted = with_extras(
-            done(10, "!"),
-            ChunkExtras {
-                abort_output: true,
-                ..Default::default()
-            },
-        );
-        tx.send(ResponseItem::Done(aborted)).await.unwrap();
-        let v = parse(&stream.next().await.unwrap());
-        assert_eq!(v["text"], "!");
-        assert_eq!(v["meta_info"]["completion_tokens"], 3);
-        assert_eq!(v["meta_info"]["finish_reason"]["type"], "length");
-        assert_eq!(v["meta_info"]["cached_tokens_details"], split);
-        assert!(v["meta_info"]["e2e_latency"].as_f64().unwrap() >= 0.010);
-
-        assert_eq!(stream.next().await.unwrap(), "[DONE]");
-    }
-
-    /// The single-request shape (`with_index=false`, one receiver) omits the
-    /// `index` field entirely, and still terminates with `[DONE]`.
-    #[tokio::test]
-    async fn single_shape_omits_index() {
-        let (tx, rx) = mpsc::channel(8);
-        let calls = vec![timed_call(10, rx)];
-        let stream = generation_event_stream(calls, false, false);
-        futures::pin_mut!(stream);
-
-        tx.send(done(10, "hi")).await.unwrap();
-        let v = parse(&stream.next().await.unwrap());
-        assert_eq!(v["text"], "hi");
-        assert!(v.get("index").is_none(), "single response has no index");
-        assert!(v["meta_info"]["e2e_latency"].as_f64().unwrap() >= 0.010);
-
-        assert_eq!(stream.next().await.unwrap(), "[DONE]");
-    }
-
-    /// A backlog of cumulative chunks collapses to a single frame carrying the latest
-    /// state — each cumulative frame supersedes the last, so emitting the intermediate
-    /// ones ships the full O(T) payload again for nothing. Mirrors the Python waiter's
-    /// `out = out_list[-1]`. This is the whole point of draining in `recv_indexed`.
-    #[tokio::test]
-    async fn cumulative_backlog_coalesces_to_latest() {
-        let (tx, rx) = mpsc::channel(8);
-        let calls = vec![timed_call(10, rx)];
-        let stream = generation_event_stream(calls, false, false);
-        futures::pin_mut!(stream);
-
-        // Three chunks queued before the stream is ever polled (a client falling behind).
-        tx.send(frame(10, "a")).await.unwrap();
-        tx.send(frame(10, "b")).await.unwrap();
-        tx.send(frame(10, "c")).await.unwrap();
-
-        let v = parse(&stream.next().await.unwrap());
-        assert_eq!(v["text"], "abc", "one frame, full cumulative text");
-        assert_eq!(v["meta_info"]["completion_tokens"], 3, "no tokens lost");
-
-        // The terminal frame still carries everything, and only then does [DONE] land.
-        tx.send(done(10, "!")).await.unwrap();
-        let v = parse(&stream.next().await.unwrap());
-        assert_eq!(v["text"], "abc!");
-        assert_eq!(v["meta_info"]["finish_reason"]["type"], "length");
-        assert_eq!(stream.next().await.unwrap(), "[DONE]");
-    }
-
     /// A runtime close must not overtake output that was already queued. The
     /// cumulative adapter first exposes the produced text, then reports the
     /// truncation on the next event, preserving the Step 2 HTTP behavior.
@@ -3323,29 +2384,6 @@ mod tests {
         );
         assert_eq!(stream.next().await.unwrap(), "[DONE]");
         assert!(stream.next().await.is_none());
-    }
-
-    /// Incremental frames are *deltas*, so a backlog must emit every one — dropping
-    /// any would silently lose tokens. Only the cumulative protocol may coalesce.
-    #[tokio::test]
-    async fn incremental_backlog_emits_every_delta() {
-        let (tx, rx) = mpsc::channel(8);
-        let calls = vec![timed_call(10, rx)];
-        let stream = generation_event_stream(calls, true, false);
-        futures::pin_mut!(stream);
-
-        tx.send(frame(10, "a")).await.unwrap();
-        tx.send(frame(10, "b")).await.unwrap();
-        tx.send(frame(10, "c")).await.unwrap();
-
-        for (n, expect) in [(1, "a"), (2, "b"), (3, "c")] {
-            let v = parse(&stream.next().await.unwrap());
-            assert_eq!(v["text"], expect, "delta {n} must not be dropped");
-            assert_eq!(
-                v["meta_info"]["completion_tokens"], n,
-                "count stays cumulative"
-            );
-        }
     }
 
     /// `json_body` accepts and rejects exactly what `Json<Value>` does, with
@@ -3389,55 +2427,6 @@ mod tests {
                     axums.is_ok()
                 ),
             }
-        }
-    }
-
-    /// Python takes `PUT /generate` as well as POST, with the same handler:
-    /// a malformed body is the same 400 on both verbs.
-    #[tokio::test]
-    async fn generate_takes_put_like_post() {
-        use crate::api_server::handlers::{CoreConfig, CoreHandle, CoreMetadata};
-        let (intake_tx, _intake_rx) = flume::unbounded();
-        let (abort_tx, _abort_rx) = flume::unbounded();
-        let core = CoreHandle::new(
-            intake_tx,
-            abort_tx,
-            CoreConfig {
-                response_capacity: 8,
-                response_activity: Default::default(),
-                startup_ready: true,
-                is_disaggregation: false,
-                mm_limits: Vec::new(),
-                multimodal: false,
-                metrics: None,
-                peer_endpoints: Vec::new(),
-                metadata: CoreMetadata::default(),
-                request_log: None,
-                generate_validator: None,
-                abort_hook: None,
-            },
-        );
-        let state = Arc::new(AppState {
-            core,
-            server_args: Arc::new(crate::message::config::ServerArgs::default()),
-            generation_policy: GenerationPolicy::default(),
-            chat_formatter: None,
-            generate_hook: None,
-            openai_chat: None,
-        });
-        for method in ["POST", "PUT"] {
-            let request = Request::builder()
-                .method(method)
-                .uri("/generate")
-                .header("content-type", "application/json")
-                .body(Body::from(r#"{"text": 5}"#))
-                .unwrap();
-            let response = routes()
-                .with_state(state.clone())
-                .oneshot(request)
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{method}");
         }
     }
 }

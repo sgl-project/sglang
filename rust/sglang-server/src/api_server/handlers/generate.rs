@@ -914,7 +914,7 @@ mod tests {
     use super::AbortEnding::{AbortFinishReason, CancelledError};
     use super::*;
     use crate::api_server::core::FrontendMetrics;
-    use crate::api_server::core::{CoreErrorKind, CoreOutput, DrainEnd};
+    use crate::api_server::core::{CoreErrorKind, DrainEnd};
     use crate::api_server::handlers::test_utils::*;
     use crate::message::config::DisaggregationMode;
     use crate::message::multimodal::MmItem;
@@ -950,52 +950,6 @@ mod tests {
                 } if legacy_http_status == status
             ));
         }
-    }
-
-    #[tokio::test]
-    async fn generation_exposes_public_id_and_semantic_events() {
-        let harness = Harness::unbounded(8);
-        let mut call = harness
-            .handle
-            .generate(
-                GenerateRequest {
-                    rid: Rid::from_client("public-id"),
-                    ..Default::default()
-                },
-                ReceivedAs::without_headers(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(call.public_id(), "public-id");
-        assert_ne!(call.runtime.rid.as_str(), "public-id");
-
-        let request = accept_intake(harness.intake_rx.recv().unwrap());
-        request
-            .sink
-            .try_send(ResponseItem::Frame(ChunkEvent {
-                text: "delta".into(),
-                ..Default::default()
-            }))
-            .unwrap();
-        request
-            .sink
-            .try_send(ResponseItem::Done(ChunkEvent {
-                text: "final".into(),
-                ..Default::default()
-            }))
-            .unwrap();
-
-        assert!(matches!(
-            call.recv().await,
-            Some(CoreEvent::Delta(CoreOutput { text, .. })) if text == "delta"
-        ));
-        assert!(matches!(
-            call.recv().await,
-            Some(CoreEvent::Finished(CoreOutput { text, .. })) if text == "final"
-        ));
-        assert!(call.recv().await.is_none());
-        drop(call);
-        assert!(harness.abort_rx.try_recv().is_err());
     }
 
     /// A generation that sets no priority is scheduled and counted under the
@@ -1086,113 +1040,6 @@ mod tests {
                 .parse()
                 .unwrap();
             assert!(sum >= layer_work, "{family}: {sum}");
-        }
-    }
-
-    #[tokio::test]
-    async fn plain_scheduler_abort_remains_a_terminal_output() {
-        let harness = Harness::unbounded(8);
-        let mut call = harness
-            .handle
-            .generate(
-                GenerateRequest {
-                    rid: "plain-abort".into(),
-                    ..Default::default()
-                },
-                ReceivedAs::without_headers(),
-            )
-            .await
-            .unwrap();
-        let request = accept_intake(harness.intake_rx.recv().unwrap());
-        request
-            .sink
-            .try_send(ResponseItem::Done(ChunkEvent {
-                finish_reason: serde_json::from_value(serde_json::json!({
-                    "type": "abort",
-                    "message": "Aborted",
-                    "status_code": null,
-                    "err_type": null
-                }))
-                .unwrap(),
-                ..Default::default()
-            }))
-            .unwrap();
-
-        assert!(matches!(
-            call.recv().await,
-            Some(CoreEvent::Finished(CoreOutput {
-                finish_reason: Some(_),
-                ..
-            }))
-        ));
-        assert!(call.recv().await.is_none());
-        drop(call);
-        assert!(harness.abort_rx.try_recv().is_err());
-    }
-
-    /// A scheduler abort that carried a status fails the call with that
-    /// status and keeps the terminal output, and the scheduler's message
-    /// names the request by the client's rid, not the suffixed one this
-    /// server sent the scheduler — raw, or as Python's `repr` (`{rid=}`)
-    /// with the client's escaping and quoting kept, as Python shows it.
-    #[tokio::test]
-    async fn status_abort_names_the_client_rid() {
-        // (client rid, Python's `repr` of it)
-        for (client_rid, client_repr) in [
-            ("client-rid", "'client-rid'"),
-            (r"back\slash", r"'back\\slash'"),
-            ("new\nline", r"'new\nline'"),
-            ("it's", r#""it's""#),
-        ] {
-            let harness = Harness::unbounded(8);
-            let mut call = harness
-                .handle
-                .generate(
-                    GenerateRequest {
-                        rid: Rid::from_client(client_rid),
-                        ..Default::default()
-                    },
-                    ReceivedAs::without_headers(),
-                )
-                .await
-                .unwrap();
-            let internal = call.runtime.rid.as_str().to_owned();
-            let suffix = &internal[client_rid.len()..];
-            // `repr` of the suffixed rid: the suffix lands inside the quotes.
-            let (body, quote) = client_repr.split_at(client_repr.len() - 1);
-            let internal_repr = format!("{body}{suffix}{quote}");
-            let request = accept_intake(harness.intake_rx.recv().unwrap());
-            request
-                .sink
-                .try_send(ResponseItem::Done(ChunkEvent {
-                    prompt_tokens: 3,
-                    finish_reason: serde_json::from_value(serde_json::json!({
-                        "type": "abort",
-                        "message": format!(
-                            "Request {internal} failed: req.rid={internal_repr}"
-                        ),
-                        "status_code": 500,
-                        "err_type": null
-                    }))
-                    .unwrap(),
-                    ..Default::default()
-                }))
-                .unwrap();
-
-            let Some(CoreEvent::Failed(error)) = call.recv().await else {
-                panic!("a status abort fails the call");
-            };
-            let expected = format!("Request {client_rid} failed: req.rid={client_repr}");
-            assert_eq!(error.http_status().as_u16(), 500);
-            assert_eq!(error.to_string(), expected, "client rid {client_rid:?}");
-            let output = error
-                .into_rejected_output()
-                .expect("a status abort keeps its output");
-            assert_eq!(output.prompt_tokens, 3);
-            assert_eq!(
-                output.finish_reason.unwrap().abort_status(),
-                Some((500, expected.as_str()))
-            );
         }
     }
 
@@ -1436,59 +1283,6 @@ mod tests {
         }
         assert!(!handle.abort(None, CancelledError));
         assert!(abort_rx.try_recv().is_err());
-    }
-
-    async fn assert_duplicate_abort_and_reuse(public_id: &str) {
-        let harness = Harness::unbounded(8);
-        let mut first = harness
-            .handle
-            .generate(public_request(public_id), ReceivedAs::without_headers())
-            .await
-            .unwrap();
-        let mut second = harness
-            .handle
-            .generate(public_request(public_id), ReceivedAs::without_headers())
-            .await
-            .unwrap();
-        let old_a = accept_intake(harness.intake_rx.recv().unwrap());
-        let old_b = accept_intake(harness.intake_rx.recv().unwrap());
-        assert!(harness.handle.abort(Some(public_id), CancelledError));
-        assert!(!harness.handle.abort(Some(public_id), CancelledError));
-        // Backend cancellation does not depend on polling either response.
-        let aborted: std::collections::HashSet<_> = (0..2)
-            .map(|_| harness.abort_rx.try_recv().unwrap().rid().clone())
-            .collect();
-        assert_eq!(aborted, [old_a.rid, old_b.rid].into_iter().collect());
-
-        let new = harness
-            .handle
-            .generate(public_request(public_id), ReceivedAs::without_headers())
-            .await
-            .unwrap();
-        let new_request = accept_intake(harness.intake_rx.recv().unwrap());
-        for call in [&mut first, &mut second] {
-            assert!(matches!(
-                call.recv().await,
-                Some(CoreEvent::Failed(CoreError::Cancelled(_)))
-            ));
-            assert!(call.recv().await.is_none());
-        }
-        drop((first, second));
-        assert!(harness.abort_rx.try_recv().is_err());
-        assert!(harness.handle.abort(Some(public_id), CancelledError));
-        assert_eq!(harness.abort_rx.try_recv().unwrap().rid(), &new_request.rid);
-        drop(new);
-        assert!(harness.abort_rx.try_recv().is_err());
-    }
-
-    #[tokio::test]
-    async fn explicit_abort_cancels_duplicates_but_not_later_id_reuse() {
-        assert_duplicate_abort_and_reuse("same").await;
-    }
-
-    #[tokio::test]
-    async fn long_public_id_abort_cancels_duplicates_but_not_later_reuse() {
-        assert_duplicate_abort_and_reuse(&"x".repeat(200)).await;
     }
 
     #[tokio::test]
@@ -1850,36 +1644,6 @@ mod tests {
                 ));
             }
         }
-    }
-
-    #[tokio::test]
-    async fn completed_and_dropped_calls_are_removed_from_abort_lookup() {
-        let harness = Harness::unbounded(8);
-        let mut call = harness
-            .handle
-            .generate(public_request("done"), ReceivedAs::without_headers())
-            .await
-            .unwrap();
-        let request = accept_intake(harness.intake_rx.recv().unwrap());
-        request
-            .sink
-            .try_send(ResponseItem::Done(ChunkEvent::default()))
-            .unwrap();
-        assert!(matches!(call.recv().await, Some(CoreEvent::Finished(_))));
-        assert!(!harness.handle.abort(Some("done"), CancelledError));
-        drop(call);
-        assert!(harness.abort_rx.try_recv().is_err());
-
-        let call = harness
-            .handle
-            .generate(public_request("dropped"), ReceivedAs::without_headers())
-            .await
-            .unwrap();
-        let request = accept_intake(harness.intake_rx.recv().unwrap());
-        drop(call);
-        assert_eq!(harness.abort_rx.try_recv().unwrap().rid(), &request.rid);
-        assert!(!harness.handle.abort(Some("dropped"), CancelledError));
-        assert!(!harness.handle.abort(None, CancelledError));
     }
 
     #[tokio::test]

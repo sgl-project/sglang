@@ -4187,6 +4187,7 @@ dependencies = [
  "sglang-api-types",
  "sglang-mm",
  "sglang-processor",
+ "sglang-server-test",
  "sha2",
  "socket2",
  "thiserror 2.0.19",
@@ -4199,6 +4200,17 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "zstd",
+]
+
+[[package]]
+name = "sglang-server-test"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "rmp-serde",
+ "rmpv",
+ "serde_json",
+ "sglang-server",
 ]
 
 [[package]]
