@@ -2285,5 +2285,144 @@ class TestEstimatedPerfConstants(CustomTestCase):
         self.assertEqual(self.reporter._ffn_act_bytes_per_token, 0.0)
 
 
+class TestPrefillSolDeviceTimer(CustomTestCase):
+    """_consume_device_gpu_time / _prefill_sol_suffix: the device-timer-based
+    replacement for the wall-clock `est. prefill TFLOPS/s` estimate, and the
+    FIFO gating that must exactly match report_prefill_stats()'s own
+    early-return condition to avoid an unbounded per-rank memory leak."""
+
+    def setUp(self):
+        enter_scope(
+            self,
+            patch(
+                "sglang.srt.managers.scheduler_components.metrics_reporter.ENABLE_METRICS_DEVICE_TIMER",
+                True,
+            ),
+        )
+        self.scheduler = types.SimpleNamespace()
+        self.scheduler.waiting_queue = []
+        self.scheduler.disaggregation_mode = DisaggregationMode.NULL
+        self.reporter = _make_reporter(self, self.scheduler)
+        # _make_reporter's default context leaves enable_mfu_metrics unset;
+        # drive it directly, same as TestSchedulerTimeAccounting does for
+        # enable_metrics -- _wrap_execution_reporter and report_prefill_stats
+        # both read these as plain instance attributes at call time.
+        self.reporter.enable_mfu_metrics = True
+        self.reporter.is_stats_logging_rank = True
+        self.reporter.current_scheduler_metrics_enabled = False
+
+    def _run_extend_forward(self, milliseconds):
+        """Simulate one completed "extend" (prefill) forward of the given
+        device-timer duration, the same way model_runner.py's
+        device_timer_ctx(self.device_timer, "extend") wraps a real forward."""
+        with patch.object(
+            _TimingInterval, "create", return_value=FakeInterval(milliseconds, ready=True)
+        ):
+            with device_timer_ctx(self.reporter.forward_pass_device_timer, "extend"):
+                pass
+
+    def _run_decode_forward(self, milliseconds):
+        with patch.object(
+            _TimingInterval, "create", return_value=FakeInterval(milliseconds, ready=True)
+        ):
+            with device_timer_ctx(self.reporter.forward_pass_device_timer, "decode"):
+                pass
+
+    def test_consume_device_gpu_time_pops_fifo_in_order(self):
+        self._run_extend_forward(2)
+        self._run_extend_forward(5)
+        self._run_extend_forward(9)
+        self.assertAlmostEqual(self.reporter._consume_device_gpu_time("extend"), 0.002)
+        self.assertAlmostEqual(self.reporter._consume_device_gpu_time("extend"), 0.005)
+        self.assertAlmostEqual(self.reporter._consume_device_gpu_time("extend"), 0.009)
+        self.assertIsNone(self.reporter._consume_device_gpu_time("extend"))
+
+    def test_consume_device_gpu_time_none_without_device_timer(self):
+        self.reporter.forward_pass_device_timer = None
+        self.assertIsNone(self.reporter._consume_device_gpu_time("extend"))
+
+    def test_non_extend_category_is_never_queued(self):
+        # Only "extend" is ever drained (by _prefill_sol_suffix); queuing
+        # every category here would leak the other categories' entries
+        # forever since nothing consumes them.
+        self._run_decode_forward(3)
+        self.assertEqual(len(self.reporter._device_timer_elapsed_by_category["extend"]), 0)
+
+    def test_extend_fifo_not_populated_when_rank_cannot_drain(self):
+        # The TP-rank leak this regression test guards against: on a TP rank
+        # other than attn_tp_rank 0 (is_stats_logging_rank=False) without
+        # --enable-metrics-for-all-schedulers (current_scheduler_metrics_enabled
+        # stays False too), report_prefill_stats() returns before ever
+        # reaching _consume_device_gpu_time -- so appending here unconditionally
+        # would grow this queue forever on every such rank.
+        self.reporter.is_stats_logging_rank = False
+        self.reporter.current_scheduler_metrics_enabled = False
+        for _ in range(5):
+            self._run_extend_forward(1)
+        self.assertEqual(len(self.reporter._device_timer_elapsed_by_category["extend"]), 0)
+
+    def test_extend_fifo_populated_when_stats_logging_rank(self):
+        self.reporter.is_stats_logging_rank = True
+        self.reporter.current_scheduler_metrics_enabled = False
+        for _ in range(3):
+            self._run_extend_forward(1)
+        self.assertEqual(len(self.reporter._device_timer_elapsed_by_category["extend"]), 3)
+
+    def test_extend_fifo_populated_when_metrics_enabled_for_all_schedulers(self):
+        # --enable-metrics-for-all-schedulers sets current_scheduler_metrics_enabled
+        # on every rank even when attn_tp_rank != 0 -- confirm the gate also
+        # lets those ranks append (and therefore drain) correctly.
+        self.reporter.is_stats_logging_rank = False
+        self.reporter.current_scheduler_metrics_enabled = True
+        for _ in range(3):
+            self._run_extend_forward(1)
+        self.assertEqual(len(self.reporter._device_timer_elapsed_by_category["extend"]), 3)
+
+    def test_extend_fifo_not_populated_when_mfu_metrics_disabled(self):
+        # A second, narrower trigger of the same leak class: with the device
+        # timer on (e.g. for occupancy logging) but --enable-mfu-metrics off,
+        # _prefill_sol_suffix is never called at all (report_prefill_stats
+        # only reaches it when self.enable_mfu_metrics), so nothing would
+        # ever drain this queue even on the stats-logging rank.
+        self.reporter.enable_mfu_metrics = False
+        self.reporter.is_stats_logging_rank = True
+        for _ in range(5):
+            self._run_extend_forward(1)
+        self.assertEqual(len(self.reporter._device_timer_elapsed_by_category["extend"]), 0)
+
+    def test_prefill_sol_suffix_uses_device_time_not_wall_clock(self):
+        # The core fix: FLOPs / this forward's own device time, not FLOPs /
+        # the wall-clock gap between log lines -- which collapses toward
+        # zero under overlap scheduling even though real GPU work happened.
+        self.reporter._estimate_prefill_perf = Mock(return_value=(6.0e12, 0.0, 0.0))
+        self._run_extend_forward(2000)  # 2.0s of real device time
+        # A deliberately absurd wall-clock elapsed_s: if this leaked into the
+        # TFLOPS math, the result would be ~6 trillion TFLOPS/s instead of 3.
+        suffix = self.reporter._prefill_sol_suffix(batch=None, elapsed_s=1e-6)
+        self.assertEqual(suffix, ", est. prefill TFLOPS/s (per GPU): 3.00")
+
+    def test_prefill_sol_suffix_empty_without_device_timer(self):
+        self.reporter.forward_pass_device_timer = None
+        suffix = self.reporter._prefill_sol_suffix(batch=None, elapsed_s=1.0)
+        self.assertEqual(suffix, "")
+
+    def test_prefill_sol_suffix_empty_when_fifo_not_yet_populated(self):
+        # No forward has completed yet -- the queue is empty, so the caller
+        # must fall back to its own wall-clock estimate instead of crashing
+        # or fabricating a number.
+        suffix = self.reporter._prefill_sol_suffix(batch=None, elapsed_s=1.0)
+        self.assertEqual(suffix, "")
+
+    def test_prefill_sol_suffix_empty_on_non_draining_rank(self):
+        # End-to-end version of test_extend_fifo_not_populated_when_rank_cannot_drain:
+        # on a non-draining rank the queue never fills, so the suffix must
+        # keep falling back gracefully rather than ever reading stale data.
+        self.reporter.is_stats_logging_rank = False
+        self.reporter.current_scheduler_metrics_enabled = False
+        self._run_extend_forward(2000)
+        suffix = self.reporter._prefill_sol_suffix(batch=None, elapsed_s=1.0)
+        self.assertEqual(suffix, "")
+
+
 if __name__ == "__main__":
     unittest.main()
