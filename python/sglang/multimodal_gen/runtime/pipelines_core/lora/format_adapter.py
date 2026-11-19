@@ -259,6 +259,16 @@ def _convert_qwen_image_standard(
     return out
 
 
+def _strip_diffusers_transformer_prefix(
+    state_dict: Dict[str, torch.Tensor],
+) -> Dict[str, torch.Tensor]:
+    """Diffusers `save_lora_weights` files prefix every DiT key with `transformer.`."""
+    prefix = "transformer."
+    if state_dict and all(k.startswith(prefix) for k in state_dict):
+        return {k[len(prefix) :]: v for k, v in state_dict.items()}
+    return state_dict
+
+
 def _convert_non_diffusers_sd_simple(
     state_dict: Mapping[str, torch.Tensor],
     log: logging.Logger,
@@ -609,7 +619,7 @@ def convert_lora_state_dict_by_format(
         if _looks_like_qwen_image(maybe):
             return _convert_qwen_image_standard(maybe, log)
 
-        return maybe
+        return _strip_diffusers_transformer_prefix(maybe)
 
     if fmt == LoRAFormat.NON_DIFFUSERS_SD:
         maybe = _convert_with_diffusers_utils_if_available(state_dict, log)
