@@ -74,6 +74,7 @@ def _top_k_renorm_prob(
     probs: torch.Tensor,
     top_k: Union[torch.Tensor, int],
     deterministic: Optional[bool] = None,
+    max_keep: Optional[int] = None,
 ) -> torch.Tensor:
     if deterministic is None:
         deterministic = renorm_deterministic()
@@ -81,7 +82,21 @@ def _top_k_renorm_prob(
         return _flashinfer_sampling.top_k_renorm_probs(
             probs, top_k, is_deterministic=True
         )
-    return _platform.top_k_renorm_prob(probs, top_k)
+    if max_keep is None:
+        return _platform.top_k_renorm_prob(probs, top_k)
+    return _platform.top_k_renorm_prob(probs, top_k, max_keep=max_keep)
+
+
+def renorm_max_keep_kwargs(max_top_k: Optional[int]) -> dict:
+    """Keyword arguments carrying an optional bound on surviving columns.
+
+    The platform kernel may skip writing back the rest of the vocabulary when
+    it knows at most max_top_k leading columns survive its mask. Only platforms
+    that report the capability accept the argument.
+    """
+    if getattr(_platform, "supports_max_keep_bound", False) and max_top_k:
+        return {"max_keep": int(max_top_k)}
+    return {}
 
 
 top_p_renorm_prob = (
@@ -93,6 +108,7 @@ top_k_renorm_prob = (
 
 __all__ = [
     "renorm_deterministic",
+    "renorm_max_keep_kwargs",
     "top_k_renorm_prob",
     "top_p_renorm_prob",
 ]
