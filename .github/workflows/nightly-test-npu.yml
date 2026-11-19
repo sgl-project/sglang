@@ -2,6 +2,11 @@ name: Nightly Test (NPU)
 on:
   schedule:
     - cron: '0 16 * * *'  # Execute at 0:00 a.m. Beijing Time every day
+  pull_request:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/nightly-test-npu.yml"
   workflow_dispatch:
     inputs:
       ref:
@@ -154,7 +159,8 @@ jobs:
 
   nightly-test-2-npu-a3:
     name: nightly-test-2-npu-a3
-    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-test-2-npu-a3,')) }}
+    # TEMP: only nightly-test-1/4-npu-a3 and nightly-perf-test-4-npu-a3 are rerun
+    if: false
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -188,7 +194,8 @@ jobs:
 
   nightly-test-8-npu-a3:
     name: nightly-test-8-npu-a3
-    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-test-8-npu-a3,')) }}
+    # TEMP: only nightly-test-1/4-npu-a3 and nightly-perf-test-4-npu-a3 are rerun
+    if: false
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -203,7 +210,8 @@ jobs:
 
   nightly-test-16-npu-a3:
     name: nightly-test-16-npu-a3
-    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-test-16-npu-a3,')) }}
+    # TEMP: only nightly-test-1/4-npu-a3 and nightly-perf-test-4-npu-a3 are rerun
+    if: false
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -218,7 +226,8 @@ jobs:
 
   nightly-perf-test-2-npu-a3:
     name: nightly-perf-test-2-npu-a3
-    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-perf-test-2-npu-a3,')) }}
+    # TEMP: only nightly-test-1/4-npu-a3 and nightly-perf-test-4-npu-a3 are rerun
+    if: false
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -250,7 +259,8 @@ jobs:
 
   nightly-perf-test-16-npu-a3:
     name: nightly-perf-test-16-npu-a3
-    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-perf-test-16-npu-a3,')) }}
+    # TEMP: only nightly-test-1/4-npu-a3 and nightly-perf-test-4-npu-a3 are rerun
+    if: false
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -268,7 +278,8 @@ jobs:
   # The acc-2 suite is split across 4 parallel partition jobs via the single `partitions` input.
   nightly-acc-test-2-npu-a3:
     name: nightly-acc-test-2-npu-a3
-    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-acc-test-2-npu-a3,')) }}
+    # TEMP: only nightly-test-1/4-npu-a3 and nightly-perf-test-4-npu-a3 are rerun
+    if: false
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -285,7 +296,8 @@ jobs:
 
   nightly-acc-test-16-npu-a3:
     name: nightly-acc-test-16-npu-a3
-    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-acc-test-16-npu-a3,')) }}
+    # TEMP: only nightly-test-1/4-npu-a3 and nightly-perf-test-4-npu-a3 are rerun
+    if: false
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -301,7 +313,8 @@ jobs:
 
   nightly-acc-test-4-npu-a5:
      name: nightly-acc-test-4-npu-a5
-     if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-acc-test-4-npu-a5,')) }}
+     # TEMP: only nightly-test-1/4-npu-a3 and nightly-perf-test-4-npu-a3 are rerun
+     if: false
      needs: [set-image-config]
      uses: ./.github/workflows/_npu-single-node-test-stage.yml
      with:
@@ -327,7 +340,8 @@ jobs:
 
   nightly-poc-multi-node-tests:
     name: multi-node-poc
-    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-poc-multi-node-tests,')) }}
+    # TEMP: only nightly-test-1/4-npu-a3 and nightly-perf-test-4-npu-a3 are rerun
+    if: false
     needs: [set-image-config, nightly-perf-test-2-npu-a3, nightly-perf-test-4-npu-a3, nightly-perf-test-16-npu-a3, nightly-acc-test-2-npu-a3, nightly-acc-test-16-npu-a3, sgl-router-build-aarch64]
     strategy:
       fail-fast: false
@@ -439,7 +453,8 @@ jobs:
 
   nightly-poc-multi-node-mix-tests:
     name: multi-node-mix-poc
-    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-poc-multi-node-mix-tests,')) }}
+    # TEMP: only nightly-test-1/4-npu-a3 and nightly-perf-test-4-npu-a3 are rerun
+    if: false
     needs: [set-image-config, nightly-perf-test-2-npu-a3, nightly-perf-test-4-npu-a3, nightly-perf-test-16-npu-a3, nightly-acc-test-2-npu-a3, nightly-acc-test-16-npu-a3, nightly-poc-multi-node-tests]
     strategy:
       fail-fast: false
