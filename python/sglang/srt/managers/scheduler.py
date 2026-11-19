@@ -3543,6 +3543,16 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
+        if self.spec_algorithm.is_pard2():
+            from sglang.srt.speculative.pard2_utils import validate_pard2_request
+
+            error_msg = validate_pard2_request(req, self.enable_overlap)
+            if error_msg is not None:
+                req.set_finish_with_abort(error_msg)
+                self.init_req_max_new_tokens(req)
+                self._add_request_to_queue(req)
+                return
+
         if self.spec_algorithm.is_uno():
             error_msg = validate_uno_request(req)
             if error_msg is not None:

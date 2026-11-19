@@ -626,7 +626,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # host every replay), and capturing one freezes the capture-time
         # plan — drafts go stale and accept length collapses to ~1.
         enable_metadata_glue = envs.SGLANG_ENABLE_METADATA_GLUE_GRAPH.get()
-        if enable_metadata_glue and model_runner.spec_algorithm.is_dflash_family():
+        if enable_metadata_glue and (
+            model_runner.spec_algorithm.is_dflash_family()
+            or model_runner.spec_algorithm.is_pard2()
+        ):
             logger.warning(
                 "SGLANG_ENABLE_METADATA_GLUE_GRAPH is incompatible with "
                 "DFlash-family speculative decoding (host-fed fast verify "
@@ -1503,7 +1506,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                         (
                             self.dllm_uses_input_embeds
                             or (
-                                self.model_runner.spec_algorithm.is_dflash_family()
+                                (
+                                    self.model_runner.spec_algorithm.is_dflash_family()
+                                    or self.model_runner.spec_algorithm.is_pard2()
+                                )
                                 and self.model_runner.is_draft_worker
                             )
                         )
@@ -1650,7 +1656,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 and (
                     self.dllm_uses_input_embeds
                     or (
-                        self.model_runner.spec_algorithm.is_dflash_family()
+                        (
+                            self.model_runner.spec_algorithm.is_dflash_family()
+                            or self.model_runner.spec_algorithm.is_pard2()
+                        )
                         and self.model_runner.is_draft_worker
                     )
                 )
@@ -1730,7 +1739,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             and (
                 self.dllm_uses_input_embeds
                 or (
-                    self.model_runner.spec_algorithm.is_dflash_family()
+                    (
+                        self.model_runner.spec_algorithm.is_dflash_family()
+                        or self.model_runner.spec_algorithm.is_pard2()
+                    )
                     and self.model_runner.is_draft_worker
                 )
             )
@@ -2250,7 +2262,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     dtype=self.model_runner.dtype,
                     device=self.model_runner.device,
                 )
-        elif self.model_runner.spec_algorithm.is_dflash_family():
+        elif (
+            self.model_runner.spec_algorithm.is_dflash_family()
+            or self.model_runner.spec_algorithm.is_pard2()
+        ):
             from sglang.srt.speculative.dflash_info import DFlashVerifyInput
             from sglang.srt.speculative.dflash_utils import (
                 resolve_dflash_verify_mask_policy,
@@ -2267,7 +2282,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 draft_token_num=self.captured_req_width,
                 custom_mask=(
                     None
-                    if (self.model_runner.is_draft_worker or not build_custom_mask)
+                    if (
+                        self.model_runner.is_draft_worker
+                        or self.model_runner.spec_algorithm.is_pard2()
+                        or not build_custom_mask
+                    )
                     else self.buffers.custom_mask
                 ),
                 capture_hidden_mode=(

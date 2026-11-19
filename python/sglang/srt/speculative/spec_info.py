@@ -44,6 +44,8 @@ class SpeculativeAlgorithm(Enum):
     STANDALONE = auto()
     NGRAM = auto()
     NONE = auto()
+    # Appended so existing members keep their values.
+    PARD2 = auto()
 
     @classmethod
     def from_string(
@@ -131,8 +133,11 @@ class SpeculativeAlgorithm(Enum):
     def is_ngram(self) -> bool:
         return self == SpeculativeAlgorithm.NGRAM
 
+    def is_pard2(self) -> bool:
+        return self == SpeculativeAlgorithm.PARD2
+
     def supports_target_verify_for_draft(self) -> bool:
-        return self.is_dflash_family()
+        return self.is_dflash_family() or self.is_pard2()
 
     def supports_prefill_shared_read_done(self) -> bool:
         """Whether target EXTEND has no later speculative shared-buffer reader.
@@ -242,6 +247,7 @@ class SpeculativeAlgorithm(Enum):
             _handle_eagle_family,
             _handle_frozen_kv_mtp,
             _handle_ngram,
+            _handle_pard2,
             _handle_uno,
         )
 
@@ -253,6 +259,8 @@ class SpeculativeAlgorithm(Enum):
 
         if self.is_dflash():
             _handle_dflash(server_args)
+        elif self.is_pard2():
+            _handle_pard2(server_args)
         elif self.is_uno():
             _handle_uno(server_args)
         elif self.is_dspark():
@@ -369,6 +377,10 @@ class SpeculativeAlgorithm(Enum):
             from sglang.srt.speculative.ngram_worker import NGRAMWorker
 
             return NGRAMWorker
+        elif self.is_pard2():
+            from sglang.srt.speculative.pard2_worker_v2 import Pard2WorkerV2
+
+            return Pard2WorkerV2
 
         raise ValueError("Unreachable code path in create_worker.")
 
@@ -508,7 +520,7 @@ def create_dummy_verify_input(
                 seq_lens_sum=None,
                 seq_lens_cpu=None,
             )
-    elif spec_algorithm.is_dflash_family():
+    elif spec_algorithm.is_dflash_family() or spec_algorithm.is_pard2():
         from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 
         # Dummy warmup only needs shape metadata; avoid forcing custom-mask mode.

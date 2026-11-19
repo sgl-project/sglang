@@ -31,7 +31,7 @@ class Spec(msgspec.Struct):
     # -------------------------------------------------------------------------
     speculative_algorithm: A[
         Optional[str],
-        "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, NGRAM, DFLASH, DSPARK, UNO. Or any name registered via `SpeculativeAlgorithm.register`.",
+        "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, NGRAM, DFLASH, DSPARK, UNO, PARD2. Or any name registered via `SpeculativeAlgorithm.register`.",
     ] = None
     uno_lora_path: A[Optional[str], "Path to the UNO draft LoRA checkpoint."] = None
     speculative_draft_model_path: A[
@@ -307,3 +307,17 @@ class Spec(msgspec.Struct):
         int,
         "Fail startup if the tokenized external ngram corpus exceeds this many tokens. Tune this based on your CPU memory budget.",
     ] = 10000000
+    speculative_pard2_mode: A[
+        Literal["auto", "target-dependent", "target-independent"],
+        Arg(
+            help=(
+                "PARD2 only. How the draft uses target features. auto is "
+                "target-dependent when the target hidden size times "
+                "len(pard2_target_layers) equals pard2_target_dim and "
+                "<draft>/warp_model.bin is present, and target-independent "
+                "otherwise. A draft config with pard2_target_dependent false "
+                "resolves auto to target-independent."
+            ),
+            resolvable=True,
+        ),
+    ] = "auto"

@@ -87,6 +87,7 @@ logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
+_is_hip = is_hip()
 # On gfx1250, torch.mm for a bf16 lm_head is slower than aiter's GEMM.
 _use_aiter_lm_head = is_hip() and envs.SGLANG_USE_AITER.get() and is_gfx1250_supported()
 if _use_aiter_lm_head:
@@ -565,7 +566,16 @@ class LogitsProcessor(nn.Module):
         self.return_full_logits = return_full_logits
         self.enable_mis = get_exec().features.enable_mis
         features = get_exec().features
-        self.keep_last_hidden_states = features.aux_hidden_state_capture is not None
+        # PARD2 target-dependent drafting also reads the post-norm final (entry -1
+        # of pard2_target_layers).
+        self.keep_last_hidden_states = (
+            features.aux_hidden_state_capture is not None
+            or (
+                _is_hip
+                and get_spec().speculative_algorithm == "PARD2"
+                and get_spec().speculative_pard2_mode == "target-dependent"
+            )
+        )
         # Capture-only mode: how many layers the model must capture, when
         # --return-aux-hidden-state-layer-ids names them.
         layer_ids = features.return_aux_hidden_state_layer_ids

@@ -26,6 +26,7 @@ from sglang.srt.configs.ernie55 import ERNIE5_5_MOE_ARCH
 from sglang.srt.environ import envs
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
+from sglang.srt.utils.device import is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -34,6 +35,8 @@ if TYPE_CHECKING:
     )
 
 logger = logging.getLogger(__name__)
+
+_is_hip = is_hip()
 
 
 def _should_auto_enable_hip_rejection_sampling(
@@ -1667,3 +1670,184 @@ def _auto_choose_speculative_params(server_args: ServerArgs, model_arch: str) ->
         return (1, 1, 2)
     else:
         return (3, 1, 4)
+
+
+# Verify width counts the bonus token, so K = 15 drafts at the default of 16.
+_PARD2_DEFAULT_DRAFT_TOKENS = 16
+
+
+def _handle_pard2(server_args: ServerArgs) -> None:
+    # PARD2 runs on ROCm only, so every PARD2 branch is unreachable elsewhere.
+    if not _is_hip:
+        raise ValueError(
+            "PARD2 speculative decoding is supported on AMD GPUs (ROCm) only."
+        )
+    cfg = resolving_view(server_args)
+    if cfg.speculative_draft_model_path is None:
+        raise ValueError(
+            "PARD2 speculative decoding requires --speculative-draft-model-path."
+        )
+    _reject_pard2_runtime_flags(cfg)
+    _resolve_pard2_chain_shape(server_args, cfg)
+    draft_path = _local_pard2_draft_path(server_args, cfg)
+    with open(os.path.join(draft_path, "config.json"), encoding="utf-8") as f:
+        draft = json.load(f)
+    _reject_pard2_checkpoint(draft, draft_path)
+
+    from sglang.srt.hf_transformers import get_config, get_hf_text_config
+
+    target = get_hf_text_config(
+        get_config(
+            cfg.model_path,
+            trust_remote_code=cfg.trust_remote_code,
+            revision=cfg.revision,
+            model_override_args=json.loads(cfg.json_model_override_args),
+        )
+    )
+    _reject_pard2_against_target(draft, target)
+    _resolve_pard2_mode(server_args, cfg, draft_path, draft, target)
+
+
+def _local_pard2_draft_path(server_args: ServerArgs, cfg) -> str:
+    # The draft's warp_model.bin is read from its directory: resolve an HF repo id
+    # to its local snapshot first.
+    path = cfg.speculative_draft_model_path
+    if os.path.isdir(path):
+        return path
+    from huggingface_hub import snapshot_download
+
+    path = snapshot_download(path, revision=cfg.speculative_draft_model_revision)
+    declare_resolution(server_args, "_handle_pard2", speculative_draft_model_path=path)
+    return path
+
+
+def _reject_pard2_runtime_flags(cfg) -> None:
+    # --speculative-adaptive and LoRA are refused for PARD2 by their own hooks.
+    from sglang.srt.speculative.ragged_verify import (
+        RaggedVerifyMode,
+        read_ragged_verify_mode,
+    )
+
+    unsupported = (
+        ("--tp-size > 1", cfg.tp_size > 1),
+        ("--pp-size > 1", cfg.pp_size > 1),
+        ("DP attention", attn_dp_enabled_of(cfg)),
+        ("--attn-cp-size > 1", cfg.attn_cp_size > 1),
+        ("--dcp-size > 1", cfg.dcp_size > 1),
+        ("PD disaggregation", cfg.disaggregation_mode != "null"),
+        ("--enable-hierarchical-cache", cfg.enable_hierarchical_cache),
+        ("--enable-hisparse", cfg.enable_hisparse),
+        ("--enable-unified-memory", cfg.enable_unified_memory),
+        ("--speculative-dflash-draft-kv-ring", cfg.speculative_dflash_draft_kv_ring),
+        (
+            "--speculative-draft-window-size",
+            cfg.speculative_draft_window_size is not None,
+        ),
+        # Unset page_size is resolved to 1 before this hook on the launch path.
+        ("--page-size other than 1", cfg.page_size not in (None, 1)),
+        ("--enable-mixed-chunk", cfg.enable_mixed_chunk),
+        (
+            "SGLANG_RAGGED_VERIFY_MODE",
+            read_ragged_verify_mode() is not RaggedVerifyMode.STATIC,
+        ),
+        (
+            "--speculative-eagle-topk other than 1",
+            cfg.speculative_eagle_topk not in (None, 1),
+        ),
+    )
+    for flag, enabled in unsupported:
+        if enabled:
+            raise ValueError(f"PARD2 does not support {flag}.")
+
+
+def _resolve_pard2_chain_shape(server_args: ServerArgs, cfg) -> None:
+    steps = cfg.speculative_num_steps
+    if steps is None or int(steps) != 1:
+        if steps is not None and int(steps) != 1:
+            logger.warning(
+                "PARD2 only supports speculative_num_steps == 1; "
+                "overriding speculative_num_steps=%s to 1.",
+                steps,
+            )
+        declare_resolution(server_args, "_handle_pard2", speculative_num_steps=1)
+    if cfg.speculative_eagle_topk is None:
+        declare_resolution(server_args, "_handle_pard2", speculative_eagle_topk=1)
+    width = cfg.speculative_num_draft_tokens
+    if width is None:
+        declare_resolution(
+            server_args,
+            "_handle_pard2",
+            speculative_num_draft_tokens=_PARD2_DEFAULT_DRAFT_TOKENS,
+        )
+        return
+    width = int(width)
+    if width < 2:
+        raise ValueError(
+            "PARD2 needs --speculative-num-draft-tokens >= 2 "
+            f"(verify width, K + 1); got {width}."
+        )
+
+
+def _reject_pard2_checkpoint(draft: dict, path: str) -> None:
+    if (
+        (draft.get("spd_type") != "pard2" and draft.get("pard2") is not True)
+        or draft.get("pard_token") is None
+        or not draft.get("pard2_target_layers")
+    ):
+        raise ValueError(
+            f"{path} is not a PARD-2 draft checkpoint: its config.json needs "
+            "spd_type 'pard2', pard_token and pard2_target_layers."
+        )
+    architectures = draft.get("architectures") or [None]
+    if draft.get("model_type") != "qwen3" or architectures[0] != "Qwen3ForCausalLM":
+        raise ValueError(
+            "PARD2 supports Qwen3 drafts only; got "
+            f"model_type={draft.get('model_type')}."
+        )
+
+
+def _reject_pard2_against_target(draft: dict, target) -> None:
+    n_layers = target.num_hidden_layers
+    for layer in draft["pard2_target_layers"]:
+        if not isinstance(layer, int) or not -n_layers <= layer <= -1:
+            raise ValueError(
+                f"pard2_target_layers entry {layer} is out of range for a "
+                f"target with {n_layers} layers."
+            )
+    if draft.get("vocab_size") != target.vocab_size:
+        raise ValueError(
+            "PARD2 requires the draft to share the target's vocabulary "
+            f"(target {target.vocab_size}, draft {draft.get('vocab_size')})."
+        )
+
+
+def _resolve_pard2_mode(
+    server_args: ServerArgs, cfg, draft_path: str, draft: dict, target
+) -> None:
+    mode = cfg.speculative_pard2_mode
+    if mode != "target-independent":
+        target_dim = target.hidden_size * len(draft["pard2_target_layers"])
+        dims_ok = draft.get("pard2_target_dim") == target_dim
+        warp_ok = os.path.isfile(os.path.join(draft_path, "warp_model.bin"))
+        if mode == "target-dependent" and not (dims_ok and warp_ok):
+            raise ValueError(
+                "--speculative-pard2-mode target-dependent needs "
+                f"{draft_path}/warp_model.bin and pard2_target_dim == {target_dim} "
+                "(target hidden size x len(pard2_target_layers))."
+            )
+        # An explicit false in the draft config selects target-independent for auto.
+        forced_ti = draft.get("pard2_target_dependent") is False
+        if mode == "auto":
+            mode = "target-independent"
+            if dims_ok and warp_ok and not forced_ti:
+                mode = "target-dependent"
+            else:
+                logger.warning(
+                    "PARD2 --speculative-pard2-mode auto resolved to "
+                    "target-independent (pard2_target_dim matches: %s, "
+                    "warp_model.bin found: %s, pard2_target_dependent: %s).",
+                    dims_ok,
+                    warp_ok,
+                    draft.get("pard2_target_dependent"),
+                )
+    declare_resolution(server_args, "_handle_pard2", speculative_pard2_mode=mode)
