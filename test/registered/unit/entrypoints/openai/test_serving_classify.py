@@ -5,6 +5,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 import asyncio
+import json
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -14,6 +15,7 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from transformers import PreTrainedConfig
 
+from sglang.srt.configs.embedding_model_spec import resolve_embedding_model_spec
 from sglang.srt.entrypoints import http_server
 from sglang.srt.entrypoints.openai.protocol import (
     ClassifyData,
@@ -27,14 +29,28 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestServingClassify(CustomTestCase):
-    def _serving(self, problem_type=None, num_labels=2, hf_config=None):
+    def _serving(
+        self, problem_type=None, num_labels=2, hf_config=None, *, per_token=False
+    ):
         if hf_config is None:
             hf_config = PreTrainedConfig(
+                architectures=[
+                    "TestForTokenClassification"
+                    if per_token
+                    else "Qwen3ForSequenceClassification"
+                ],
                 problem_type=problem_type,
                 id2label={i: f"category_{i}" for i in range(num_labels)},
             )
         manager = Mock(
-            model_config=SimpleNamespace(hf_config=hf_config),
+            model_config=SimpleNamespace(
+                hf_config=hf_config,
+                embedding_model_spec=resolve_embedding_model_spec(
+                    getattr(hf_config, "architectures", None),
+                    is_embedding_requested=False,
+                    is_embedding_gemma=False,
+                ),
+            ),
             server_args=None,
             served_model_name="test-classifier",
             model_path="test-model-path",
@@ -142,7 +158,7 @@ class TestServingClassify(CustomTestCase):
                     self.assertAlmostEqual(item["probs"][i], 0.119203, places=6)
 
     def test_token_multi_label_probabilities(self):
-        serving = self._serving("multi_label_classification")
+        serving = self._serving("multi_label_classification", per_token=True)
         result = serving._build_classify_response(
             [{"embedding": [[2.0, 2.0], [-2.0, 2.0], [0.0, -1000.0]]}]
         )
@@ -159,7 +175,7 @@ class TestServingClassify(CustomTestCase):
     def test_token_softmax_over_labels(self):
         for problem_type in (None, "single_label_classification"):
             with self.subTest(problem_type=problem_type):
-                serving = self._serving(problem_type)
+                serving = self._serving(problem_type, per_token=True)
                 item = serving._build_classify_response(
                     [{"embedding": [[0.0, 0.0], [1.0, 0.0], [0.0, 2.0]]}]
                 ).data[0]
@@ -172,7 +188,9 @@ class TestServingClassify(CustomTestCase):
                         self.assertAlmostEqual(actual, probability, places=6)
 
     def test_single_token_single_class_preserves_matrix(self):
-        serving = self._serving("multi_label_classification", num_labels=1)
+        serving = self._serving(
+            "multi_label_classification", num_labels=1, per_token=True
+        )
         item = serving._build_classify_response([{"embedding": [[2.0]]}]).data[0]
         self.assertEqual(item.label, [["category_0"]])
         self.assertEqual(item.num_classes, 1)
@@ -183,7 +201,7 @@ class TestServingClassify(CustomTestCase):
     def test_single_and_batched_token_requests(self):
         for batched in (False, True):
             with self.subTest(batched=batched):
-                serving = self._serving("multi_label_classification")
+                serving = self._serving("multi_label_classification", per_token=True)
                 outputs = [
                     {
                         "embedding": [[-2.0, 2.0], [2.0, -2.0], [0.0, 0.0]],
@@ -260,16 +278,30 @@ class TestServingClassify(CustomTestCase):
             with self.subTest(label=label), self.assertRaises(ValidationError):
                 ClassifyData(index=0, label=label, probs=probs, num_classes=2)
 
-    def test_empty_logits_keep_existing_fallback(self):
-        for embedding in ([], [[], []]):
-            with self.subTest(embedding=embedding):
-                serving = self._serving("multi_label_classification")
-                item = serving._build_classify_response(
-                    [{"embedding": embedding}]
-                ).data[0]
-                self.assertEqual(item.label, [])
-                self.assertEqual(item.probs, [1.0])
-                self.assertEqual(item.num_classes, 1)
+    def test_empty_sequence_logits_keep_existing_fallback(self):
+        serving = self._serving("multi_label_classification")
+        item = serving._build_classify_response([{"embedding": []}]).data[0]
+        self.assertEqual(item.label, [])
+        self.assertEqual(item.probs, [1.0])
+        self.assertEqual(item.num_classes, 1)
+
+    def test_rejects_scores_that_do_not_match_the_checkpoint_task(self):
+        for per_token, scores, expected in (
+            (False, [[0.0, 1.0]], "[classes]"),
+            (True, [0.0, 1.0], "[tokens, classes]"),
+            (True, [[], []], "[tokens, classes]"),
+        ):
+            with self.subTest(per_token=per_token, scores=scores):
+                serving = self._serving(per_token=per_token)
+
+                async def generate_request(*args):
+                    yield {"embedding": scores}
+
+                serving.tokenizer_manager.generate_request = generate_request
+                request = ClassifyRequest(input="example")
+                response = asyncio.run(serving.handle_request(request, None))
+                self.assertEqual(response.status_code, 500)
+                self.assertIn(expected, json.loads(response.body)["message"])
 
 
 if __name__ == "__main__":

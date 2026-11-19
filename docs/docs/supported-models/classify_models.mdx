@@ -65,7 +65,7 @@ POST /v1/classify
 - `data`: Array of classification results
   - `index`: Index of the result
   - `label`: Top class for single-label models, or an array of classes at or above `threshold` for multi-label models. Token models return one such entry per token.
-  - `probs`: Scores in class ID order, with one row per token for token models. The checkpoint's `problem_type` selects sigmoid for multi-label classification, raw scores for regression, and softmax otherwise.
+  - `probs`: Scores in class ID order, with one row per token for supported `*ForTokenClassification` architectures. The checkpoint's `problem_type` selects sigmoid for multi-label classification, raw scores for regression, and softmax otherwise.
   - `num_classes`: Total number of classes
 - `usage`: Token usage information
   - `prompt_tokens`: Number of input tokens

@@ -21,6 +21,20 @@ register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 
 class TestEmbeddingModelSpec(unittest.TestCase):
+    def test_classifier_task_is_resolved_from_the_architecture(self):
+        for architecture, task in (
+            ("Qwen3ForSequenceClassification", EmbeddingTask.CLASSIFY),
+            ("ExampleForTokenClassification", EmbeddingTask.TOKEN_CLASSIFY),
+        ):
+            with self.subTest(architecture=architecture):
+                spec = resolve_embedding_model_spec(
+                    [architecture],
+                    is_embedding_requested=False,
+                    is_embedding_gemma=False,
+                )
+                self.assertEqual(spec.task, task)
+                self.assertEqual(spec.execution, EmbeddingExecution.CLASSIFICATION)
+
     def test_embedding_gemma_declares_full_encoder_bcg_contract(self):
         spec = resolve_embedding_model_spec(
             ["Gemma3TextModel"],
