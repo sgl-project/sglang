@@ -71,7 +71,7 @@ class QwenImage21Pipeline(LoRAPipeline, ComposedPipelineBase):
             # ComfyUI owns CFG; each CFG rank would recompute the same DiT call.
             raise ValueError(
                 "enable_cfg_parallel is not supported for Qwen-Image 2.1 in "
-                "--comfyui-mode; use sp_degree or tp_size"
+                "ComfyUI mode; use sp_degree or tp_size"
             )
         transformer = self.get_module("transformer")
         scheduler = self.get_module("scheduler")

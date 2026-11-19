@@ -11,7 +11,7 @@ from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.managers.scheduler_components.pause_state import PauseState
 from sglang.test.ci.ci_register import register_mlx_ci
 
-register_mlx_ci(est_time=1, suite="stage-a-unit-test-mlx")
+register_mlx_ci(est_time=1, suite="extra-unit-test-mlx")
 
 _HAS_MLX = importlib.util.find_spec("mlx") is not None
 _SKIP_REASON = "requires mlx"
@@ -1253,6 +1253,7 @@ class TestMlxOverlapScheduler(unittest.TestCase):
         req = SimpleNamespace(
             rid="r0",
             exit_via=None,
+            owner_list=None,
             kv=SimpleNamespace(
                 holds_kv=True, holds_mamba=False, retraction_backup=None
             ),

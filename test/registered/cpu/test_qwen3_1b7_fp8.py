@@ -13,7 +13,7 @@ from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import ModelLaunchSettings
 
-register_cpu_ci(est_time=3600, suite="nightly-xeon-models", nightly=True)
+register_cpu_ci(est_time=3600, suite="nightly-xeon-models")
 
 MODEL_PATH = "Qwen/Qwen3-1.7B-FP8"
 

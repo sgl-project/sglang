@@ -18,7 +18,7 @@ on:
   workflow_dispatch:
     inputs:
       continue_on_error:
-        description: 'Continue on error (do not fail the workflow on test failures)'
+        description: 'Continue remaining tests after a failure; the workflow still fails'
         required: false
         type: boolean
         default: true
@@ -30,7 +30,7 @@ on:
         type: string
         default: ''
       continue_on_error:
-        description: 'Continue on error (do not fail the workflow on test failures)'
+        description: 'Continue remaining tests after a failure; the workflow still fails'
         required: false
         type: boolean
         default: true
@@ -43,6 +43,8 @@ jobs:
   nightly-xeon:
     if: github.repository == 'sgl-project/sglang'
     runs-on: xeon-gnr
+    # UT (4h) + model tests (2 x 5h), with time for image build and cleanup.
+    timeout-minutes: 960
     strategy:
       fail-fast: false
       matrix:
@@ -50,9 +52,13 @@ jobs:
           - name: gnr1
             part_id: 0
             part_size: 2
+            nightly_part_lo: 0
+            nightly_part_hi: 2
           - name: gnr2
             part_id: 1
             part_size: 2
+            nightly_part_lo: 1
+            nightly_part_hi: 3
     steps:
       - name: Cleanup workspace
         run: |
@@ -68,15 +74,23 @@ jobs:
           ref: ${{ inputs.ref || github.sha }}
 
       - name: Build image
+        timeout-minutes: 60
         run: |
-          # Fixed tag (no SHA): a new build overwrites the previous image so a
-          # self-hosted box does not accumulate multi-GB images across runs.
-          # Build the image from THIS ref so the installed sglang package
-          # carries our nightly changes (run_suite whitelist + the 11 test
-          # files); the default Dockerfile arg would clone upstream main.
+          set -euo pipefail
+          # Resolve a branch/tag input once, then build from the exact checkout.
+          # Keep the fixed image tag; no per-commit image tags are retained.
+          CHECKOUT_SHA=$(git rev-parse HEAD)
+          echo "Building Xeon image from checkout ${CHECKOUT_SHA}"
           docker build \
-            --build-arg VER_SGLANG=${{ inputs.ref || github.sha }} \
+            --build-arg "SGLANG_REPO=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" \
+            --build-arg "VER_SGLANG=${CHECKOUT_SHA}" \
             . -f docker/xeon.Dockerfile -t sglang_xeon --no-cache
+
+          IMAGE_SHA=$(docker run --rm --entrypoint git sglang_xeon rev-parse HEAD)
+          if [[ "$IMAGE_SHA" != "$CHECKOUT_SHA" ]]; then
+            echo "::error::Xeon image source ${IMAGE_SHA} does not match checkout ${CHECKOUT_SHA}"
+            exit 1
+          fi
 
       - name: Run container
         run: |
@@ -95,25 +109,33 @@ jobs:
           docker exec -w /sglang-checkout/ ci_sglang_${{ matrix.name }} \
             bash -c "source /opt/.venv/bin/activate && python3 -c 'import torch; import sgl_kernel; assert torch.cpu._is_amx_tile_supported(); assert hasattr(torch.ops.sgl_kernel, \"convert_weight_packed\"); '"
 
-      # Phase 1: full per-commit UT suites (same set PR Test runs), partitioned
+      # Phase 1: the current Xeon PR suites (non-TP + TP), partitioned
       # across the 2 GNR boxes by est_time. Small models -> partitioning safe.
       - name: Run unit test suites
         timeout-minutes: 240
         run: |
           docker exec -w /sglang-checkout/ ci_sglang_${{ matrix.name }} \
-            bash -c "source /opt/.venv/bin/activate && cd ./test && python3 run_suite.py --hw cpu --suite base-b-test-cpu,base-c-test-cpu,base-b-tp-test-cpu --auto-partition-id ${{ matrix.part_id }} --auto-partition-size ${{ matrix.part_size }} --timeout-from-est-time ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}"
+            bash -c "source /opt/.venv/bin/activate && cd ./test && python3 run_suite.py --hw cpu --suite extra-test-cpu-intel,extra-tp-test-cpu-intel --auto-partition-id ${{ matrix.part_id }} --auto-partition-size ${{ matrix.part_size }} --timeout-from-est-time ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}"
 
       # Phase 2: nightly large-model accuracy + performance suite. Runs AFTER
       # phase 1 on the same box (serial docker exec), so only one server is ever
-      # resident -> no dual-model OOM. Partitioned across the 2 GNR boxes.
-      # if: !cancelled() -- nightly is a sweep, so phase 2 must run even when
-      # phase 1 reports failures; only a cancel/timeout skips it.
-      - name: Run nightly model accuracy + perf
+      # resident -> no dual-model OOM. Four balanced partitions run as two
+      # serial batches per GNR, keeping each step below the 360-minute limit.
+      # Pair 0+2 and 1+3 so both machines get one larger and one smaller batch.
+      # Continue the sweep after test failures; an explicit cancellation skips it.
+      - name: Run nightly model accuracy + perf (batch 1)
         if: ${{ !cancelled() }}
-        timeout-minutes: 600
+        timeout-minutes: 300
         run: |
           docker exec -w /sglang-checkout/ ci_sglang_${{ matrix.name }} \
-            bash -c "source /opt/.venv/bin/activate && cd ./test && python3 run_suite.py --hw cpu --suite nightly-xeon-models --nightly --auto-partition-id ${{ matrix.part_id }} --auto-partition-size ${{ matrix.part_size }} --timeout-from-est-time ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}"
+            bash -c "source /opt/.venv/bin/activate && cd ./test && python3 run_suite.py --hw cpu --suite nightly-xeon-models --auto-partition-id ${{ matrix.nightly_part_lo }} --auto-partition-size 4 --timeout-from-est-time ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}"
+
+      - name: Run nightly model accuracy + perf (batch 2)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 300
+        run: |
+          docker exec -w /sglang-checkout/ ci_sglang_${{ matrix.name }} \
+            bash -c "source /opt/.venv/bin/activate && cd ./test && python3 run_suite.py --hw cpu --suite nightly-xeon-models --auto-partition-id ${{ matrix.nightly_part_hi }} --auto-partition-size 4 --timeout-from-est-time ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}"
 
       - name: Change permission
         if: always()

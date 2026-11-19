@@ -196,7 +196,10 @@ class DocPrefetch:
         self._device = device
         self._forward_stream = forward_stream
         # Vision runs on every TP rank in lockstep; it is not encoded out of step.
-        self._encode_ahead = early is not None and tp_size == 1
+        # MPS has no side stream to encode on, so its pages encode at prefill.
+        self._encode_ahead = (
+            early is not None and tp_size == 1 and torch.device(device).type != "mps"
+        )
         # Follow-ups waiting for their predecessor.
         self._parked = IndexedReqList(
             ListKind.UOCR_PARKED, abort=lambda r: self._abort(self._parked, r)
@@ -269,7 +272,7 @@ class DocPrefetch:
         }
 
     def _abort(self, windows: ReqList, recv_req: AbortReq) -> None:
-        aborted = windows.take(lambda r: recv_req.matches(r.rid))
+        aborted = [r for r in windows if recv_req.matches(r.rid)]
         for r in aborted:
             self.release_early(r.rid)
         self._abort_windows(aborted, finished_reason=recv_req.finished_reason)
@@ -289,10 +292,9 @@ class DocPrefetch:
             self._early.release(rid)
 
     def reset(self) -> List[Req]:
-        """Forget everything; returns the held follow-ups for the caller to abort."""
+        """Forget everything; returns the held follow-ups for the caller to
+        abort, which takes them out of their lists."""
         held = [*self._parked, *self._released]
-        self._parked.clear()
-        self._released.clear()
         self._finished.clear()
         if self._early is not None:
             self._early.clear()

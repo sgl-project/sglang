@@ -37,7 +37,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 NUM_TOKENS_RANGE = get_benchmark_range(
-    full_range=[1, 64, 256, 1024, 4096],
+    full_range=[1, 64, 256, 512, 1024, 4096],
     ci_range=[64, 512],
 )
 
