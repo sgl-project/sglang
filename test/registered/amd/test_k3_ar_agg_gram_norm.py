@@ -10,7 +10,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_amd_ci
 
-register_amd_ci(est_time=120, suite="stage-c-test-large-8-gpu-amd")
+register_amd_ci(est_time=120, suite="base-c-test-large-8-gpu-amd-mi35x")
 
 _H, _TP = 7168, 8
 
