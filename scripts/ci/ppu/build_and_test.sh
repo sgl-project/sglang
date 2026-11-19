@@ -139,11 +139,14 @@ python3 "$repo/scripts/ci/ppu/check_ppu_environment.py"
 python3 -c 'import torch; print("Runtime Torch:", torch.__version__, "SAIL build marker:", getattr(torch.version, "sail", None)); assert torch.cuda.device_count() == 1'
 python3 -m pip uninstall -y sgl-kernel
 python3 -m pip install --no-deps --no-index --force-reinstall "$wheel_dir/"*.whl
+# Plan required dev_sail dependency changes while preserving PPU platform packages.
 missing_wheels=$(python3 "$checker" missing-dev-sail "$wheel_dir" "$additions")
 if [[ -n "$missing_wheels" ]]; then
     mapfile -t runtime_wheels <<< "$missing_wheels"
+    # Install only planned offline wheels; do not let pip replace platform packages.
     python3 -m pip install --upgrade --no-deps --no-index "${runtime_wheels[@]}"
 fi
+python3 "$checker" verify-dev-sail "$wheel_dir"
 python3 "$checker" snapshot "$artifacts/dependencies-installed.json"
 python3 "$checker" check "$artifacts/dependencies-before.json" "$artifacts/dependencies-installed.json" --additions "$additions"
 python3 - <<'PY'

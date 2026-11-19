@@ -9,6 +9,7 @@ import tempfile
 import unittest
 import zipfile
 from email.parser import Parser
+from importlib import metadata
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -437,10 +438,10 @@ class TestPPUCIDevSailDependencies(CustomTestCase):
             0,
         )
         self.installed["numpy"] = self.message("numpy", "2.5.5")
-        with self.assertRaisesRegex(
-            ValueError, "Preinstalled numpy.*update the runtime image"
-        ):
-            self.checker.missing_dev_sail(self.wheels, self.packages())
+        selected = self.checker.missing_dev_sail(self.wheels, self.packages())
+        self.assertEqual(selected["numpy"][1], "2.3.5")
+        self.assertIn("new-helper", selected)
+        self.assertIn("fast-helper", selected)
 
     def test_build_conflicting_constraints_preserve_existing_inventory(self):
         source = self.wheels / "local index"
@@ -504,6 +505,92 @@ class TestPPUCIDevSailDependencies(CustomTestCase):
                 self.checker.collect_dev_sail(self.wheels)
         self.assertEqual(len(list(self.runtime.glob("version_loop-*.whl"))), 1)
 
+    def test_any_ordinary_dependency_can_upgrade_without_a_package_allowlist(self):
+        self.write_wheel("blake3", "1.0.8")
+        self.root_requirements.extend(["ordinary-client>=2", "compatible-client>=1"])
+        self.write_root()
+        self.installed["ordinary-client"] = self.message("ordinary-client", "1.0")
+        self.installed["ordinary-api"] = self.message("ordinary-api", "1.0")
+        self.installed["compatible-client"] = self.message("compatible-client", "1.5")
+        self.write_wheel("ordinary-client", "2.0", ["ordinary-api>=2"])
+        self.write_wheel("ordinary-api", "2.0")
+        self.write_wheel("compatible-client", "3.0", ["unused-helper>=1"])
+        before = self.packages()
+        selected = self.checker.missing_dev_sail(self.wheels, before)
+        self.assertEqual(selected["ordinary-client"][1], "2.0")
+        self.assertEqual(selected["ordinary-api"][1], "2.0")
+        self.assertNotIn("compatible-client", selected)
+        self.assertNotIn("unused-helper", selected)
+        additions = {n: v for n, (_, v) in selected.items()}
+        after = {
+            **before,
+            **{n: {"version": v, "record": "new"} for n, v in additions.items()},
+        }
+        self.assertEqual(self.checker.check_snapshots(before, after, additions), 0)
+        self.assertEqual(after["compatible-client"], before["compatible-client"])
+
+    def test_runtime_aggregates_shared_constraints_independent_of_visit_order(self):
+        self.write_wheel("blake3", "1.0.8")
+        self.installed["shared-api"] = self.message("shared-api", "1.0")
+        shared = self.write_wheel("shared-api", "2.0", ["new-helper>=1"])
+        self.write_wheel("new-helper", "1.0")
+        self.write_wheel("api-user", "1.0", ["shared-api>=2"])
+        for requirements in (
+            ["shared-api>=1", "api-user"],
+            ["api-user", "shared-api>=1"],
+        ):
+            with self.subTest(requirements=requirements):
+                original = self.root_requirements.copy()
+                self.root_requirements.extend(requirements)
+                self.write_root()
+                selected = self.checker.missing_dev_sail(self.wheels, self.packages())
+                self.assertEqual(selected["shared-api"][1], "2.0")
+                self.assertIn("new-helper", selected)
+                self.root_requirements = original
+        shared.unlink()
+        self.write_wheel("shared-api", "3.0")
+        self.root_requirements.extend(["shared-api<3", "api-user"])
+        self.write_root()
+        with self.assertRaisesRegex(ValueError, "does not satisfy shared-api<3"):
+            self.checker.missing_dev_sail(self.wheels, self.packages())
+
+    def test_runtime_replaces_old_metadata_and_drops_obsolete_constraints(self):
+        self.write_wheel("blake3", "1.0.8")
+        self.root_requirements.extend(["ordinary-client>=2", "ordinary-client>=1"])
+        self.write_root()
+        self.installed["ordinary-client"] = self.message(
+            "ordinary-client", "1.0", ["obsolete-helper>=1", "shared-api<2"]
+        )
+        self.installed["shared-api"] = self.message("shared-api", "1.0")
+        self.write_wheel("ordinary-client", "2.0", ["shared-api>=2"])
+        self.write_wheel("shared-api", "2.0")
+        selected = self.checker.missing_dev_sail(self.wheels, self.packages())
+        self.assertEqual(selected["ordinary-client"][1], "2.0")
+        self.assertEqual(selected["shared-api"][1], "2.0")
+        self.assertNotIn("obsolete-helper", selected)
+
+    def test_snapshot_requires_every_planned_addition_and_rejects_reinstallation(self):
+        before = {"ordinary-client": {"version": "1.0", "record": "old"}}
+        plan = {"ordinary-client": "2.0", "new-api": "1.0"}
+        after = {
+            "ordinary-client": {"version": "2.0", "record": "new"},
+            "new-api": {"version": "1.0", "record": "added"},
+        }
+        self.assertEqual(self.checker.check_snapshots(before, after, plan), 0)
+        for state in (before, {"ordinary-client": after["ordinary-client"]}):
+            with self.subTest(state=state):
+                self.assertNotEqual(
+                    self.checker.check_snapshots(before, state, plan), 0
+                )
+        self.assertNotEqual(self.checker.check_snapshots({}, {}, {"new-api": "1.0"}), 0)
+        reinstalled = {"ordinary-client": {"version": "1.0", "record": "changed"}}
+        self.assertNotEqual(
+            self.checker.check_snapshots(
+                before, reinstalled, {"ordinary-client": "1.0"}
+            ),
+            0,
+        )
+
     def test_runtime_upgrades_use_new_metadata_and_preserve_other_packages(self):
         """Replacing old runtime packages must traverse the new dependency graph."""
         self.write_wheel("blake3", "1.0.8", ["typing-extensions>=4.6"])
@@ -532,6 +619,101 @@ class TestPPUCIDevSailDependencies(CustomTestCase):
                 self.assertNotEqual(
                     self.checker.check_snapshots(before, changed, additions), 0
                 )
+
+    def prepare_transformers_dependencies(self):
+        self.write_wheel("blake3", "1.0.8")
+        self.write_wheel("runtime-helper", "1.2.0")
+        self.write_wheel(
+            "transformers",
+            "5.19.0",
+            ["tokenizers>=0.23.1,<0.24.0", "huggingface-hub>=1.31.0,<3.0"],
+        )
+        self.write_wheel("tokenizers", "0.23.1", ["huggingface-hub>=1.0,<3.0"])
+        self.write_wheel("huggingface-hub", "1.31.0", ["runtime-helper>=1"])
+        self.installed["tokenizers"] = self.message("tokenizers", "0.22.2")
+        self.installed["huggingface-hub"] = self.message(
+            "huggingface-hub", "1.15.0", ["obsolete-hub-helper>=1"]
+        )
+
+    def test_transformers_dependencies_are_planned_and_snapshot_checked(self):
+        self.prepare_transformers_dependencies()
+        before = self.packages()
+        selected = self.checker.missing_dev_sail(self.wheels, before)
+        self.assertEqual(
+            set(selected),
+            {
+                "blake3",
+                "transformers",
+                "peft",
+                "tokenizers",
+                "huggingface-hub",
+                "runtime-helper",
+            },
+        )
+        additions = {n: v for n, (_, v) in selected.items()}
+        after = {
+            **before,
+            **{n: {"version": v, "record": "new"} for n, v in additions.items()},
+        }
+        self.assertEqual(self.checker.check_snapshots(before, after, additions), 0)
+        for name in ("tokenizers", "huggingface-hub"):
+            with self.subTest(name=name):
+                unplanned = {n: v for n, v in additions.items() if n != name}
+                self.assertNotEqual(
+                    self.checker.check_snapshots(before, after, unplanned), 0
+                )
+                incomplete = {**after, name: before[name]}
+                self.assertNotEqual(
+                    self.checker.check_snapshots(before, incomplete, additions), 0
+                )
+                wrong = {**after, name: {"version": "999", "record": "new"}}
+                self.assertNotEqual(
+                    self.checker.check_snapshots(before, wrong, additions), 0
+                )
+        for name in ("torch", "triton", "deep-gemm", "sailify"):
+            self.assertEqual(before[name], after[name])
+
+    def test_matching_transformers_dependencies_are_not_reinstalled(self):
+        self.prepare_transformers_dependencies()
+        for name, version, requirements in (
+            ("tokenizers", "0.23.1", ["huggingface-hub>=1.0,<3.0"]),
+            ("huggingface-hub", "1.31.0", ["runtime-helper>=1"]),
+        ):
+            self.installed[name] = self.message(name, version, requirements)
+        before = self.packages()
+        selected = self.checker.missing_dev_sail(self.wheels, before)
+        for name in ("tokenizers", "huggingface-hub"):
+            with self.subTest(name=name):
+                self.assertNotIn(name, selected)
+                after = {**before, name: {**before[name], "record": "reinstalled"}}
+                self.assertNotEqual(
+                    self.checker.check_snapshots(
+                        before, after, {name: before[name]["version"]}
+                    ),
+                    0,
+                )
+        self.assertIn("runtime-helper", selected)
+
+    def test_transformers_dependencies_require_compatible_offline_wheels(self):
+        self.prepare_transformers_dependencies()
+        for name, good_version, bad_version, requirements in (
+            ("tokenizers", "0.23.1", "0.24.0", ["huggingface-hub>=1.0,<3.0"]),
+            ("huggingface-hub", "1.31.0", "1.15.0", ["runtime-helper>=1"]),
+        ):
+            good_path = (
+                self.runtime
+                / f"{name.replace('-', '_')}-{good_version}-py3-none-any.whl"
+            )
+            good_path.unlink()
+            with self.subTest(name=name, case="missing"):
+                with self.assertRaisesRegex(ValueError, f"missing {name}"):
+                    self.checker.missing_dev_sail(self.wheels, self.packages())
+            bad_path = self.write_wheel(name, bad_version, requirements)
+            with self.subTest(name=name, case="incompatible"):
+                with self.assertRaisesRegex(ValueError, "does not satisfy"):
+                    self.checker.missing_dev_sail(self.wheels, self.packages())
+            bad_path.unlink()
+            self.write_wheel(name, good_version, requirements)
 
     def test_matching_runtime_versions_are_not_reinstalled(self):
         self.write_wheel("blake3", "1.0.8")
@@ -578,9 +760,9 @@ class TestPPUCIDevSailDependencies(CustomTestCase):
             with self.subTest(requirement=requirement):
                 self.write_wheel("transformers", "5.19.0", [requirement])
                 self.installed[name] = self.message(name, version)
-                with self.assertRaisesRegex(
-                    ValueError, "does not satisfy.*runtime image"
-                ):
+                if name == "runtime-helper":
+                    self.write_wheel(name, version)
+                with self.assertRaisesRegex(ValueError, "does not satisfy"):
                     self.checker.missing_dev_sail(self.wheels, self.packages())
         self.write_wheel("transformers", "5.19.0")
         self.write_wheel("peft", "0.18.1", ["transformers<5.19"])
@@ -645,9 +827,13 @@ class TestPPUCIDevSailDependencies(CustomTestCase):
     def test_offline_install_upgrades_real_environment_and_preserves_other_packages(
         self,
     ):
-        self.write_wheel("blake3", "1.0.8")
-        self.write_wheel("runtime-helper", "1.2.0")
-        self.write_wheel("transformers", "5.19.0", ["runtime-helper>=1"])
+        self.prepare_transformers_dependencies()
+        self.root_requirements.append("ordinary-client>=2")
+        self.write_root()
+        self.installed["ordinary-client"] = self.message("ordinary-client", "1.0")
+        self.installed["ordinary-api"] = self.message("ordinary-api", "1.0")
+        self.write_wheel("ordinary-client", "2.0", ["ordinary-api>=2"])
+        self.write_wheel("ordinary-api", "2.0")
         initial_dir = self.wheels / "initial wheels"
         initial_dir.mkdir()
         initial = [
@@ -704,9 +890,20 @@ class TestPPUCIDevSailDependencies(CustomTestCase):
         before = snapshot("before.json")
         self.assertEqual(before["transformers"]["version"], "5.12.1")
         self.assertEqual(before["peft"]["version"], "0.12.0")
-        selected = self.checker.missing_dev_sail(self.wheels, before)
-        install(path for path, _ in selected.values())
-        after = snapshot("after.json")
+        site = target / (
+            "Lib/site-packages"
+            if sys.platform == "win32"
+            else f"lib/python{sys.version_info.major}.{sys.version_info.minor}/site-packages"
+        )
+        with patch.object(
+            self.checker.metadata,
+            "distributions",
+            side_effect=lambda: metadata.Distribution.discover(path=[str(site)]),
+        ):
+            selected = self.checker.missing_dev_sail(self.wheels, before)
+            install(path for path, _ in selected.values())
+            after = snapshot("after.json")
+            self.assertEqual(self.checker.missing_dev_sail(self.wheels, after), {})
         additions = {n: v for n, (_, v) in selected.items()}
         self.assertEqual(
             additions,
@@ -715,22 +912,40 @@ class TestPPUCIDevSailDependencies(CustomTestCase):
                 "peft": "0.18.1",
                 "runtime-helper": "1.2.0",
                 "blake3": "1.0.8",
+                "tokenizers": "0.23.1",
+                "huggingface-hub": "1.31.0",
+                "ordinary-client": "2.0",
+                "ordinary-api": "2.0",
             },
         )
         self.assertEqual(self.checker.check_snapshots(before, after, additions), 0)
         for name in before:
-            if name not in ("transformers", "peft"):
+            if name not in selected:
                 self.assertEqual(after[name], before[name])
         self.assertEqual(after["transformers"]["version"], "5.19.0")
         self.assertEqual(after["peft"]["version"], "0.18.1")
-        site = target / (
-            "Lib/site-packages"
-            if sys.platform == "win32"
-            else f"lib/python{sys.version_info.major}.{sys.version_info.minor}/site-packages"
-        )
+        self.assertEqual(before["tokenizers"]["version"], "0.22.2")
+        self.assertEqual(before["huggingface-hub"]["version"], "1.15.0")
+        self.assertEqual(after["tokenizers"]["version"], "0.23.1")
+        self.assertEqual(after["huggingface-hub"]["version"], "1.31.0")
         for name, version in (("transformers", "5.19.0"), ("peft", "0.18.1")):
             infos = list(site.glob(f"{name}-*.dist-info"))
             self.assertEqual([p.name for p in infos], [f"{name}-{version}.dist-info"])
+
+    def test_verify_dev_sail_cli_checks_the_installed_dependency_graph(self):
+        self.write_wheel("blake3", "1.0.8")
+        selected = self.checker.missing_dev_sail(self.wheels, self.packages())
+        with (
+            patch.object(self.checker, "snapshot", side_effect=self.packages),
+            patch.object(
+                sys, "argv", [str(SCRIPT), "verify-dev-sail", str(self.wheels)]
+            ),
+            patch.object(sys, "stderr"),
+        ):
+            self.assertEqual(self.checker.main(), 1)
+            for name, (path, _) in selected.items():
+                self.installed[name] = self.checker.read_wheel(path)
+            self.assertEqual(self.checker.main(), 0)
 
     def test_runtime_shell_installs_only_selected_wheels_and_propagates_plan_failure(
         self,
@@ -793,6 +1008,12 @@ class TestPPUCIDevSailDependencies(CustomTestCase):
                     self.assertIn("--no-deps", dependency_installs[0])
                     self.assertIn("--no-index", dependency_installs[0])
                     self.assertIn("--upgrade", dependency_installs[0])
+                verifications = [
+                    args
+                    for args in calls
+                    if len(args) > 1 and args[1] == "verify-dev-sail"
+                ]
+                self.assertEqual(len(verifications), int(code == 0))
                 checks = [
                     args for args in calls if len(args) > 1 and args[1] == "check"
                 ]

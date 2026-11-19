@@ -1,6 +1,7 @@
 import itertools
 import math
 import sys
+from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -158,12 +159,20 @@ _SPECIAL_MATRICES = {
 }
 
 
-def hadamard_transform_ref(x, scale=1.0):
-    """Reference impl for the general (power-of-2) hadamard_transform.
+def _hadamard_butterfly_ref(x):
+    """Use an independent PyTorch butterfly reference with O(batch * dim) memory."""
+    out = x.clone()
+    width = 1
+    while width < x.shape[-1]:
+        blocks = out.reshape(*x.shape[:-1], -1, 2, width)
+        left, right = blocks.unbind(dim=-2)
+        out = torch.stack((left + right, left - right), dim=-2).reshape_as(x)
+        width *= 2
+    return out
 
-    Pads dim to the next power of 2, multiplies by the full H matrix
-    via F.linear, then truncates back to the original dim.
-    """
+
+def hadamard_transform_ref(x, scale=1.0):
+    """Pad to a power of two, using dense matrices only for small dimensions."""
     x_shape = x.shape
     dim = x.shape[-1]
     x = x.reshape(-1, dim)
@@ -171,8 +180,13 @@ def hadamard_transform_ref(x, scale=1.0):
     dim_padded = 2**log_dim if dim > 0 else 1
     if dim != dim_padded:
         x = F.pad(x, (0, dim_padded - dim))
-    H = torch.tensor(hadamard(dim_padded, dtype=float), dtype=x.dtype, device=x.device)
-    out = F.linear(x, H)
+    if dim_padded <= 1024:
+        H = torch.tensor(
+            hadamard(dim_padded, dtype=float), dtype=x.dtype, device=x.device
+        )
+        out = F.linear(x, H)
+    else:
+        out = _hadamard_butterfly_ref(x)
     out = out * scale
     return out[..., :dim].reshape(*x_shape)
 
@@ -219,6 +233,36 @@ def hadamard_transform_mn_ref(x, multiple, scale=1.0):
 
     x = x.reshape(batch, -1) * scale
     return x[..., : x_shape[-1]].reshape(*x_shape)
+
+
+@pytest.mark.parametrize("dim", [1, 2, 8, 137, 500, 1000, 2048])
+def test_hadamard_reference_matches_dense_on_cpu(dim):
+    torch.manual_seed(0)
+    x = torch.randn(2, dim, 3, dtype=torch.float64).transpose(1, 2)
+    original = x.clone()
+    dim_padded = 1 << (dim - 1).bit_length()
+    padded = F.pad(x, (0, dim_padded - dim))
+    H = torch.tensor(hadamard(dim_padded, dtype=float), dtype=x.dtype)
+    expected = F.linear(padded, H)[..., :dim] / math.sqrt(dim)
+    actual = hadamard_transform_ref(x, scale=1.0 / math.sqrt(dim))
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(x, original, rtol=0, atol=0)
+
+
+def test_hadamard_reference_maximum_dimension_avoids_dense_matrix():
+    torch.manual_seed(0)
+    dim = 32768
+    x = torch.randn(2, dim)
+    original = x.clone()
+    scale = 1.0 / math.sqrt(dim)
+    with patch(
+        f"{__name__}.hadamard",
+        side_effect=AssertionError("Dense matrices must not be constructed"),
+    ):
+        out = hadamard_transform_ref(x, scale=scale)
+        restored = hadamard_transform_ref(out, scale=scale)
+    torch.testing.assert_close(restored, x, rtol=1e-4, atol=1e-6)
+    torch.testing.assert_close(x, original, rtol=0, atol=0)
 
 
 _DTYPES = [torch.float32, torch.float16, torch.bfloat16]
