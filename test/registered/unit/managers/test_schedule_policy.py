@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import (
+    WAITING_QUEUE_PREFIX_MATCH_MAX,
     CacheAgnosticPolicy,
     CacheAwarePolicy,
     SchedulePolicy,
@@ -160,6 +161,36 @@ class TestShortestPrefillFirst(CustomTestCase):
         with patch.object(self.policy, "_compute_prefix_matches", return_value=set()):
             queue = self.policy.calc_priority(queue)
         self.assertEqual([req.rid for req in queue], ["cached", "short", "long"])
+
+    def test_long_queue_rematches_new_requests_and_a_window(self):
+        queue = [
+            self.make_req(f"r{i}", 8)
+            for i in range(WAITING_QUEUE_PREFIX_MATCH_MAX + 40)
+        ]
+        matched = []
+        with patch(
+            "sglang.srt.managers.schedule_policy.match_kv_cache",
+            side_effect=lambda r, *a, **k: matched.append(r.rid),
+        ):
+            self.policy._compute_prefix_matches(
+                queue, CacheAwarePolicy.SHORTEST_PREFILL_FIRST
+            )
+            self.assertEqual(len(matched), len(queue))
+            matched.clear()
+            queue.append(self.make_req("new", 8))
+            self.policy._compute_prefix_matches(
+                queue, CacheAwarePolicy.SHORTEST_PREFILL_FIRST
+            )
+        self.assertIn("new", matched)
+        self.assertEqual(len(matched), WAITING_QUEUE_PREFIX_MATCH_MAX + 1)
+
+    def test_ranking_match_skips_the_external_store(self):
+        queue = [self.make_req("a", 8)]
+        with patch("sglang.srt.managers.schedule_policy.match_kv_cache") as match:
+            self.policy._compute_prefix_matches(
+                queue, CacheAwarePolicy.SHORTEST_PREFILL_FIRST
+            )
+        self.assertFalse(match.call_args.kwargs["probe_external"])
 
     def test_equal_work_uses_arrival_time(self):
         older = self.make_req("z", 32, arrived=1)

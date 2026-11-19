@@ -80,6 +80,8 @@ class MatchPrefixParams:
     # matched state, and the slot is bound with the request's row.
     defer_cow_slot: bool = False
     req: Optional[Req] = None
+    # Whether a match with a req also probes the external KV store (linker).
+    probe_external: bool = True
 
 
 @dataclasses.dataclass

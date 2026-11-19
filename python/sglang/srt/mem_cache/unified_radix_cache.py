@@ -722,6 +722,7 @@ class UnifiedRadixCache(BasePrefixCache):
         if (
             self.linker is not None
             and params.req is not None
+            and params.probe_external
             and get_disagg().disaggregation_mode != "decode"
         ):
             result = self.linker.match(params.key, params.req, result)

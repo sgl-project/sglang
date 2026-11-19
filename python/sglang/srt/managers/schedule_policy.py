@@ -230,6 +230,8 @@ class SchedulePolicy:
         self.shortest_prefill_aging_factor = shortest_prefill_aging_factor
         self._shortest_prefill_calls = 0
         self._waiting_prefix_refresh_calls = 0
+        # Rotates the bounded re-match window over a long waiting queue.
+        self._rematch_cursor = 0
 
         # It is used to find the matching prefix for in-batch prefix caching.
         self.waiting_queue_radix_tree = RadixCache.create_simulated()
@@ -546,9 +548,14 @@ class SchedulePolicy:
         # In-batch prefix caching: of the requests with almost nothing cached that
         # share a prefix, only one runs, so the shared prefix is computed once.
         candidates = []
-        for r in waiting_queue:
-            prefix_ids = r.origin_input_ids + r.output_ids
-            match_kv_cache(r, self.tree_cache, prefix_ids)
+        for r in self._requests_to_rematch(waiting_queue, policy):
+            # The incrementally kept fill ids avoid an O(context) copy per request.
+            r.refresh_fill_ids()
+            prefix_ids = r.full_untruncated_fill_ids
+            # Ranking skips the external store probe, a remote lookup per uncached
+            # page; admission re-matches each request it takes, probe included.
+            match_kv_cache(r, self.tree_cache, prefix_ids, probe_external=False)
+            r.waiting_prefix_matched = True
             if r.prefix_len <= IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD:
                 # Only the first DEPRIORITIZE_THRESHOLD tokens can decide a match.
                 key_ids = prefix_ids[:IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD]
@@ -593,6 +600,30 @@ class SchedulePolicy:
                     )
                 )
         return temporary_deprioritized
+
+    def _requests_to_rematch(
+        self, waiting_queue: List[Req], policy: CacheAwarePolicy
+    ) -> List[Req]:
+        """The requests whose prefix match this pass refreshes.
+
+        Shortest-prefill-first ranks by uncached length, which moves slowly, and
+        admission re-matches every request it takes. Past
+        WAITING_QUEUE_PREFIX_MATCH_MAX requests, refresh only never-matched ones
+        plus a rotating window, so a pass costs O(window), not O(queue x context).
+        """
+        if (
+            policy != CacheAwarePolicy.SHORTEST_PREFILL_FIRST
+            or len(waiting_queue) <= WAITING_QUEUE_PREFIX_MATCH_MAX
+        ):
+            return waiting_queue
+        fresh = [r for r in waiting_queue if not r.waiting_prefix_matched]
+        matched = [r for r in waiting_queue if r.waiting_prefix_matched]
+        if not matched:
+            return fresh
+        start = self._rematch_cursor % len(matched)
+        window = (matched[start:] + matched[:start])[:WAITING_QUEUE_PREFIX_MATCH_MAX]
+        self._rematch_cursor = start + len(window)
+        return fresh + window
 
     def poll_storage_prefetches(self, waiting_queue: Iterable[Req]) -> None:
         """Observe finished storage prefetches before ranking. Completion is
