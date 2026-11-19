@@ -356,6 +356,11 @@ from sglang.srt.mem_cache.kv.alloc.forward_steps import (
 )
 from sglang.srt.mem_cache.kv_weight_version_tracker import KvWeightVersionTracker
 from sglang.srt.mem_cache.static_kv_storage import StaticPoolShape, kv_storage_of
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
+)
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner_utils.pool import prewarm_graph_pool_borrow
@@ -430,7 +435,11 @@ from sglang.srt.utils import (
     triton_load_watch,
 )
 from sglang.srt.utils.common import TypeBasedDispatcher
-from sglang.srt.utils.device import is_confidential_compute, is_npu
+from sglang.srt.utils.device import (
+    is_confidential_compute,
+    is_gfx942_supported,
+    is_npu,
+)
 from sglang.srt.utils.foundry_adapter import activate_foundry, get_foundry_adapter
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -2321,15 +2330,30 @@ class Scheduler(
             if last_batch_is_extend:
                 return True
 
-        # Idle state is rank-local under MLP synchronization: it must not
-        # choose a collective scheduling boundary there. Intermediate chunks
-        # have no first token to return, so keep their overlap as well.
+        # BF16 DeepSeek-V2-Lite on gfx942 has a host-bound first eager prefill.
+        # Limit the default to the validated model and singleton cache-miss shapes.
+        # Idle state is rank-local under MLP synchronization, so it must not
+        # select a collective scheduling boundary there.
         if (
-            envs.SGLANG_DISABLE_OVERLAP_AFTER_IDLE_PREFILL.get()
+            last_batch.after_idle_gap
             and not self.require_mlp_sync
-            and last_batch.after_idle_gap
-            and last_batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
+            and last_batch.forward_mode == ForwardMode.EXTEND
+            and last_batch.batch_size() == 1
             and last_batch.contains_last_prefill_chunk
+            and last_batch.prefix_lens == [0]
+            and last_batch.extend_num_tokens is not None
+            and 0 < last_batch.extend_num_tokens <= 2048
+            and last_batch.spec_algorithm == SpeculativeAlgorithm.NONE
+            and is_gfx942_supported()
+            and check_cuda_graph_backend(Phase.PREFILL, Backend.DISABLED)
+            and self.is_generation
+            and self.model_config.dtype == torch.bfloat16
+            and self.model_config.quantization is None
+            and self.model_config.hf_config.model_type == "deepseek_v2"
+            and self.model_config.hf_config.hidden_size == 2048
+            and self.model_config.hf_config.num_hidden_layers == 27
+            and self.model_config.hf_config.n_routed_experts == 64
+            and self.model_config.hf_config.num_experts_per_tok == 6
         ):
             return True
 

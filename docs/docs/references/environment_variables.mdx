@@ -204,13 +204,8 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_DISABLE_OVERLAP_AFTER_PREFILL`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Process a prefill step's result before scheduling the next step, for TTFT</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Process all prefill results before scheduling the next step, for TTFT. On gfx942, a complete eager BF16 DeepSeek-V2-Lite generation prefill of 1–2048 tokens for one request with no cached prefix already processes its result early after an idle scheduler iteration. This automatic path excludes MLP synchronization and speculative decoding.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`false`</td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DISABLE_OVERLAP_AFTER_IDLE_PREFILL</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Process the first prefill result after an idle scheduler iteration before scheduling the next step. Applies to the overlap loop when the batch contains a final prefill chunk and MLP synchronization is not required. Continuous prefill keeps overlap. This does not gather burst requests into one batch. <code>SGLANG_DISABLE_OVERLAP_AFTER_PREFILL</code> still processes all prefill results early.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_SCHEDULER_MAX_RECV_PER_POLL`</td>

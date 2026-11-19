@@ -1,8 +1,11 @@
-"""CPU regression tests for returning an idle burst's first prefill early."""
+"""CPU regression tests for automatic early idle-prefill results on gfx942."""
 
 import unittest
+from contextlib import contextmanager
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
+
+import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
@@ -10,34 +13,94 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.environ import envs
+from sglang.srt.managers import scheduler as scheduler_module
 from sglang.srt.managers.schedule_batch import NextBatchPlan, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-def _batch(*, mode=ForwardMode.EXTEND, last_chunk=True, grammar=False):
+def _batch(
+    *,
+    mode=ForwardMode.EXTEND,
+    last_chunk=True,
+    grammar=False,
+    requests=1,
+    tokens=128,
+    prefix=0,
+    spec=SpeculativeAlgorithm.NONE,
+):
     return ScheduleBatch(
-        reqs=[],
+        reqs=[SimpleNamespace(inflight_steps=0) for _ in range(requests)],
         forward_mode=mode,
         contains_last_prefill_chunk=last_chunk,
+        extend_num_tokens=tokens,
+        prefix_lens=[prefix] * requests,
         has_grammar=grammar,
-        spec_algorithm=SpeculativeAlgorithm.NGRAM
-        if grammar
-        else SpeculativeAlgorithm.NONE,
+        spec_algorithm=SpeculativeAlgorithm.NGRAM if grammar else spec,
     )
 
 
-def _run_loop(*, steps, idle_policy, global_policy=False, pause_at=None):
+def _model_config(
+    *,
+    model_type="deepseek_v2",
+    hidden_size=2048,
+    layers=27,
+    experts=64,
+    topk=6,
+    dtype=torch.bfloat16,
+    quantization=None,
+):
+    return SimpleNamespace(
+        dtype=dtype,
+        quantization=quantization,
+        hf_config=SimpleNamespace(
+            model_type=model_type,
+            hidden_size=hidden_size,
+            num_hidden_layers=layers,
+            n_routed_experts=experts,
+            num_experts_per_tok=topk,
+        ),
+    )
+
+
+@contextmanager
+def _platform_settings(*, gfx942=True, prefill_backend=Backend.DISABLED):
+    with (
+        patch.object(scheduler_module, "is_gfx942_supported", return_value=gfx942),
+        patch.object(
+            scheduler_module,
+            "check_cuda_graph_backend",
+            side_effect=lambda phase, backend: (
+                phase == Phase.PREFILL and backend == prefill_backend
+            ),
+        ),
+    ):
+        yield
+
+
+def _run_loop(
+    *,
+    steps,
+    gfx942=True,
+    prefill_backend=Backend.DISABLED,
+    global_policy=False,
+    pause_at=None,
+    model_config=None,
+    is_generation=True,
+):
     """Run the production overlap loop and launch bookkeeping without a GPU."""
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.gracefully_exit = False
     scheduler.last_batch = None
     scheduler.running_batch = None
     scheduler.require_mlp_sync = False
-    scheduler.is_generation = False
+    scheduler.model_config = _model_config() if model_config is None else model_config
+    scheduler.is_generation = is_generation
+    scheduler.launch_batch_sample_if_needed = Mock()
     scheduler.enable_unified_memory = False
     scheduler._sched_idled = False
     scheduler.forward_ct = 0
@@ -94,7 +157,7 @@ def _run_loop(*, steps, idle_policy, global_policy=False, pause_at=None):
     scheduler.process_batch_result = process
 
     with (
-        envs.SGLANG_DISABLE_OVERLAP_AFTER_IDLE_PREFILL.override(idle_policy),
+        _platform_settings(gfx942=gfx942, prefill_backend=prefill_backend),
         envs.SGLANG_DISABLE_OVERLAP_AFTER_PREFILL.override(global_policy),
     ):
         try:
@@ -107,10 +170,10 @@ def _run_loop(*, steps, idle_policy, global_policy=False, pause_at=None):
 
 
 class TestIdlePrefillResultOrder(CustomTestCase):
-    def test_default_keeps_the_first_result_behind_the_next_launch(self):
+    def test_other_architectures_keep_the_first_result_behind_the_next_launch(self):
         trace = _run_loop(
             steps=[None, ("A", _batch()), ("B", _batch()), None],
-            idle_policy=False,
+            gfx942=False,
         )
         self.assertEqual(
             trace,
@@ -120,7 +183,7 @@ class TestIdlePrefillResultOrder(CustomTestCase):
     def test_only_the_idle_first_prefill_is_early(self):
         trace = _run_loop(
             steps=[None, ("A", _batch()), ("B", _batch()), ("C", _batch()), None],
-            idle_policy=True,
+            gfx942=True,
         )
         self.assertEqual(
             trace,
@@ -135,9 +198,7 @@ class TestIdlePrefillResultOrder(CustomTestCase):
         )
 
     def test_continuous_prefill_keeps_overlap(self):
-        trace = _run_loop(
-            steps=[("A", _batch()), ("B", _batch()), None], idle_policy=True
-        )
+        trace = _run_loop(steps=[("A", _batch()), ("B", _batch()), None], gfx942=True)
         self.assertEqual(
             trace,
             [("launch", "A"), ("launch", "B"), ("process", "A"), ("process", "B")],
@@ -154,7 +215,7 @@ class TestIdlePrefillResultOrder(CustomTestCase):
                 ("C", _batch()),
                 None,
             ],
-            idle_policy=True,
+            gfx942=True,
         )
         self.assertEqual(
             trace,
@@ -171,7 +232,7 @@ class TestIdlePrefillResultOrder(CustomTestCase):
     def test_global_policy_still_processes_every_prefill_early(self):
         trace = _run_loop(
             steps=[None, ("A", _batch()), ("B", _batch()), ("C", _batch()), None],
-            idle_policy=True,
+            gfx942=True,
             global_policy=True,
         )
         self.assertEqual(
@@ -196,7 +257,7 @@ class TestIdlePrefillResultOrder(CustomTestCase):
             with self.subTest(mode=mode):
                 trace = _run_loop(
                     steps=[None, ("A", _batch(mode=mode)), ("B", _batch()), None],
-                    idle_policy=True,
+                    gfx942=True,
                 )
                 self.assertLess(
                     trace.index(("launch", "B")), trace.index(("process", "A"))
@@ -205,21 +266,21 @@ class TestIdlePrefillResultOrder(CustomTestCase):
     def test_intermediate_chunk_keeps_overlap(self):
         trace = _run_loop(
             steps=[None, ("A", _batch(last_chunk=False)), ("B", _batch()), None],
-            idle_policy=True,
+            gfx942=True,
         )
         self.assertLess(trace.index(("launch", "B")), trace.index(("process", "A")))
 
-    def test_a_mixed_batch_with_a_finishing_prefill_is_early(self):
+    def test_mixed_prefill_keeps_overlap(self):
         trace = _run_loop(
             steps=[None, ("A", _batch(mode=ForwardMode.MIXED)), ("B", _batch()), None],
-            idle_policy=True,
+            gfx942=True,
         )
-        self.assertLess(trace.index(("process", "A")), trace.index(("launch", "B")))
+        self.assertLess(trace.index(("launch", "B")), trace.index(("process", "A")))
 
     def test_pause_preserves_the_pending_result_and_idle_marker(self):
         trace = _run_loop(
             steps=[None, ("A", _batch()), ("B", _batch()), None],
-            idle_policy=True,
+            gfx942=True,
             pause_at=3,
         )
         self.assertEqual(
@@ -240,7 +301,110 @@ class TestIdlePrefillResultOrder(CustomTestCase):
                 ("B", _batch()),
                 None,
             ],
-            idle_policy=True,
+            gfx942=True,
+        )
+        self.assertLess(trace.index(("process", "A")), trace.index(("launch", "B")))
+
+    def test_prefill_graph_backends_keep_overlap(self):
+        for backend in (Backend.BREAKABLE, Backend.FULL):
+            with self.subTest(backend=backend):
+                trace = _run_loop(
+                    steps=[None, ("A", _batch()), ("B", _batch()), None],
+                    prefill_backend=backend,
+                )
+                self.assertLess(
+                    trace.index(("launch", "B")), trace.index(("process", "A"))
+                )
+
+    def test_multiple_request_prefills_keep_overlap(self):
+        for requests in (2, 4):
+            with self.subTest(requests=requests):
+                trace = _run_loop(
+                    steps=[
+                        None,
+                        ("A", _batch(requests=requests)),
+                        ("B", _batch()),
+                        None,
+                    ],
+                )
+                self.assertLess(
+                    trace.index(("launch", "B")), trace.index(("process", "A"))
+                )
+
+    def test_prefix_cache_hits_keep_overlap(self):
+        trace = _run_loop(
+            steps=[None, ("A", _batch(prefix=64)), ("B", _batch()), None],
+        )
+        self.assertLess(trace.index(("launch", "B")), trace.index(("process", "A")))
+
+    def test_token_shape_boundaries(self):
+        for tokens, early in (
+            (1, True),
+            (128, True),
+            (512, True),
+            (2048, True),
+            (0, False),
+            (2049, False),
+            (4096, False),
+            (None, False),
+        ):
+            with self.subTest(tokens=tokens):
+                trace = _run_loop(
+                    steps=[None, ("A", _batch(tokens=tokens)), ("B", _batch()), None],
+                )
+                self.assertEqual(
+                    trace.index(("process", "A")) < trace.index(("launch", "B")),
+                    early,
+                )
+
+    def test_speculative_prefill_keeps_overlap(self):
+        for spec in (SpeculativeAlgorithm.EAGLE, SpeculativeAlgorithm.NGRAM):
+            with self.subTest(spec=spec):
+                trace = _run_loop(
+                    steps=[None, ("A", _batch(spec=spec)), ("B", _batch()), None],
+                )
+                self.assertLess(
+                    trace.index(("launch", "B")), trace.index(("process", "A"))
+                )
+
+    def test_non_generation_batches_keep_overlap(self):
+        trace = _run_loop(
+            steps=[None, ("A", _batch()), ("B", _batch()), None],
+            is_generation=False,
+        )
+        self.assertLess(trace.index(("launch", "B")), trace.index(("process", "A")))
+
+    def test_unvalidated_model_shapes_and_dtypes_keep_overlap(self):
+        for kwargs in (
+            {"model_type": "qwen3"},
+            {"hidden_size": 5120},
+            {"layers": 60},
+            {"experts": 160},
+            {"topk": 8},
+            {"quantization": "fp8"},
+            {"dtype": torch.float16},
+            {"dtype": torch.float32},
+        ):
+            with self.subTest(config=kwargs):
+                trace = _run_loop(
+                    steps=[None, ("A", _batch()), ("B", _batch()), None],
+                    model_config=_model_config(**kwargs),
+                )
+                self.assertLess(
+                    trace.index(("launch", "B")), trace.index(("process", "A"))
+                )
+
+    def test_global_policy_still_applies_outside_the_automatic_shapes(self):
+        trace = _run_loop(
+            steps=[
+                None,
+                ("A", _batch(requests=4, tokens=4096, prefix=128)),
+                ("B", _batch()),
+                None,
+            ],
+            gfx942=False,
+            prefill_backend=Backend.FULL,
+            global_policy=True,
         )
         self.assertLess(trace.index(("process", "A")), trace.index(("launch", "B")))
 
@@ -250,7 +414,7 @@ class TestIdlePrefillEligibility(CustomTestCase):
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.require_mlp_sync = True
         with (
-            envs.SGLANG_DISABLE_OVERLAP_AFTER_IDLE_PREFILL.override(True),
+            _platform_settings(),
             envs.SGLANG_DISABLE_OVERLAP_AFTER_PREFILL.override(False),
         ):
             for idle in (False, True):
@@ -262,7 +426,7 @@ class TestIdlePrefillEligibility(CustomTestCase):
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.require_mlp_sync = True
         with (
-            envs.SGLANG_DISABLE_OVERLAP_AFTER_IDLE_PREFILL.override(True),
+            _platform_settings(),
             envs.SGLANG_DISABLE_OVERLAP_AFTER_PREFILL.override(True),
         ):
             for local_mode, synchronized, expected in (
@@ -278,7 +442,7 @@ class TestIdlePrefillEligibility(CustomTestCase):
 
     def test_no_pending_batch_does_not_process_a_result(self):
         scheduler = Scheduler.__new__(Scheduler)
-        with envs.SGLANG_DISABLE_OVERLAP_AFTER_IDLE_PREFILL.override(True):
+        with _platform_settings():
             self.assertFalse(scheduler.should_process_last_batch_early(None))
 
     def test_snapshot_preserves_the_idle_marker(self):
