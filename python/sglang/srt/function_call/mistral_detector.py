@@ -40,6 +40,7 @@ class MistralDetector(BaseFormatDetector):
         self._tool_calls_marker = "[TOOL_CALLS"
         self.eot_token = "]"
         self.tool_call_separator = ", "
+        self._pending_array_close = False
 
     def has_tool_call(self, text: str) -> bool:
         """Return True if the text contains either supported tool-call marker."""
@@ -123,6 +124,18 @@ class MistralDetector(BaseFormatDetector):
         chunk (OpenAI streaming semantics).
         """
         self._buffer += new_text
+
+        # The JSON parser consumes each call object, leaving the array's closing
+        # bracket for a later increment. Consume only that delimiter, once.
+        if (
+            self._pending_array_close
+            and self.current_tool_id > 0
+            and not self.current_tool_name_sent
+        ):
+            remaining = self._buffer.lstrip()
+            if remaining.startswith(self.eot_token):
+                self._buffer = remaining[len(self.eot_token) :]
+                self._pending_array_close = False
         current_text = self._buffer
 
         # No marker: either flush as normal text or keep buffering a partial marker.
@@ -130,8 +143,6 @@ class MistralDetector(BaseFormatDetector):
             if not self._ends_with_partial_token(self._buffer, self._tool_calls_marker):
                 normal_text = self._buffer
                 self._buffer = ""
-                if self.eot_token in normal_text:
-                    normal_text = normal_text.replace(self.eot_token, "")
                 return StreamingParseResult(normal_text=normal_text)
             return StreamingParseResult()
 
@@ -149,6 +160,7 @@ class MistralDetector(BaseFormatDetector):
         # Try compact first; JSON-array requires `] [` and often arrives later in streaming.
         compact = self._try_parse_compact_args_format(current_text)
         if compact:
+            self._pending_array_close = False
             func_name, args_obj, consumed = compact
             if func_name not in self._tool_indices:
                 # Unknown tool: treat as normal text and reset state.
@@ -190,6 +202,7 @@ class MistralDetector(BaseFormatDetector):
 
         # Canonical format delegates to the BaseFormatDetector JSON streaming logic.
         if self.bot_token in current_text:
+            self._pending_array_close = True
             return super().parse_streaming_increment(new_text="", tools=tools)
 
         # Otherwise, keep buffering.
