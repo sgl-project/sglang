@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 from typing import (
     Any,
@@ -57,16 +58,29 @@ class Mm(msgspec.Struct):
         bool, "Enable prefix multimodal cache. Currently only supports mm-only."
     ] = False
     mm_enable_dp_encoder: A[
-        bool,
-        "Enabling data parallelism for mm encoder. The dp size will be set to the tp size automatically.",
-    ] = False
+        Optional[bool],
+        Arg(
+            help="Enabling data parallelism for mm encoder. The dp size will be set to the tp size automatically.",
+            action=argparse.BooleanOptionalAction,
+            resolvable=True,
+            fallback=False,
+        ),
+    ] = None
     mm_process_config: A[
         Optional[Dict[str, Any]],
         Arg(
-            help="Multimodal preprocessing config, a json config contains keys: `image`, `video`, `audio`",
+            help="Multimodal preprocessing config, a json config contains keys: `image`, `video`, `audio`, "
+            "and `video_preprocessing_device`, the device the token-space processor decodes and preprocesses "
+            'a video request on (e.g. `{"video_preprocessing_device": "cpu"}`)',
             type_parser=json.loads,
         ),
     ] = None
+    enable_token_space_processor: A[
+        bool,
+        "Enable token-space multimodal preprocessing for supported models. "
+        "Unsupported models keep their existing processor. Not supported with "
+        "--encoder-only or --language-only.",
+    ] = False
     mm_processor_worker_num: A[
         int,
         "Number of threads for multimodal processor calls. 0 selects the "
@@ -90,6 +104,20 @@ class Mm(msgspec.Struct):
         "Maximum size in MiB for one client-supplied remote media download. "
         "The limit is enforced while streaming; set to 0 to disable it.",
     ] = 64
+    media_url_timeout: A[
+        Optional[float],
+        "Seconds to download one client-supplied media URL, redirects and body "
+        "included, for every media type. When unset, REQUEST_TIMEOUT applies, "
+        "else each loader's default.",
+    ] = None
+    allow_local_media_files: A[
+        bool,
+        Arg(
+            help="Allow client media to name local files (paths or file:// URLs). "
+            "Enabled by default; use --no-allow-local-media-files to reject them.",
+            action=argparse.BooleanOptionalAction,
+        ),
+    ] = True
     mm_preprocess_cache_size_mb: A[
         Optional[int],
         Arg(
@@ -132,9 +160,6 @@ class Mm(msgspec.Struct):
             choices=["mooncake"],
         ),
     ] = "mooncake"
-    disable_fast_image_processor: A[
-        bool, "Deprecated. Use --image-processor-backend=pil instead."
-    ] = False
     mm_feature_transport: A[
         Optional[Literal["cpu", "cuda_ipc", "cuda_vmm"]],
         Arg(

@@ -42,6 +42,10 @@ BCG_CAPTURE_MARKER = "[Diffusion BCG] captured"
 # capture() context the fix enters. Its absence is the precise signature of the
 # regression: capture ran, registration did not.
 GRAPH_BUFFER_REGISTRATION_MARKER = "cuda graph addresses"
+# CustomAllReduceV2 registers graph inputs only for its zero-copy pull algorithms,
+# which this workload does not select, so the marker only applies to v1. V2 is
+# detected by its request in the symmetric workspace log.
+CUSTOM_ALL_REDUCE_V2_MARKER = "custom_all_reduce_v2: slot = "
 ILLEGAL_MEMORY_MARKER = "illegal memory access"
 
 # The regression fails during warmup within ~1 min; the timeout only has to be
@@ -104,6 +108,9 @@ class TestDiffusionBCGTP2ZImageTurbo(CustomTestCase):
 
         env = os.environ.copy()
         env.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
+        # this guard exercises legacy graph-buffer registration; v2 uses a
+        # symmetric workspace and does not emit the registration marker
+        env["SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2"] = "0"
 
         try:
             result = subprocess.run(
@@ -146,13 +153,14 @@ class TestDiffusionBCGTP2ZImageTurbo(CustomTestCase):
             f"BCG never captured, so this run did not exercise TP+BCG. "
             f"Log: {log_path}\n{tail}",
         )
-        self.assertIn(
-            GRAPH_BUFFER_REGISTRATION_MARKER,
-            result.stdout,
-            f"custom all-reduce graph buffers were never registered, so capture "
-            f"did not go through the TP group's graph_capture(). "
-            f"Log: {log_path}\n{tail}",
-        )
+        if CUSTOM_ALL_REDUCE_V2_MARKER not in result.stdout:
+            self.assertIn(
+                GRAPH_BUFFER_REGISTRATION_MARKER,
+                result.stdout,
+                f"custom all-reduce graph buffers were never registered, so capture "
+                f"did not go through the TP group's graph_capture(). "
+                f"Log: {log_path}\n{tail}",
+            )
         self.assertIn("Pixel data generated successfully", result.stdout)
 
 

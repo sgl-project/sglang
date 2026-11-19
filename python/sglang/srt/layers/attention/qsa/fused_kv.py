@@ -1,6 +1,8 @@
 import triton
 import triton.language as tl
 
+from sglang.kernels.arch import current_arch
+
 
 @triton.jit
 def _qsa_fused_kv_prepare(
@@ -33,7 +35,11 @@ def _qsa_fused_kv_prepare(
     RATIO: tl.constexpr,
     IB: tl.constexpr,
     CHAIN: tl.constexpr,
+    PAGE: tl.constexpr,
+    USE_PDL: tl.constexpr = False,
 ):
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
     tiles = tl.cdiv(S, B) + 2
     pid = tl.program_id(0)
     row = (pid // (G * tiles * H)) * G + pid % G
@@ -48,10 +54,18 @@ def _qsa_fused_kv_prepare(
         c = tile * B + tl.arange(0, B)
         if EXPAND:
             n = tl.minimum((tl.load(LENGTH + row) // RATIO), IB) * RATIO
-            blocks = tl.load(IDX + row * IB + c // RATIO, c < IB * RATIO, -1)
-            expanded = blocks * RATIO + c % RATIO
             qpos = tl.load(QPOS + row)
             tail_start = (qpos + 1) // RATIO * RATIO
+            if PAGE > 0:
+                # Same count as the COUNTS tile below; the paged consumer never
+                # reads past the page that holds it.
+                tail_count = tl.maximum(
+                    0, tl.minimum(qpos + 1, tl.load(LENGTH + row)) - tail_start
+                )
+                if tile * B >= (n + tail_count + PAGE - 1) // PAGE * PAGE:
+                    return
+            blocks = tl.load(IDX + row * IB + c // RATIO, c < IB * RATIO, -1)
+            expanded = blocks * RATIO + c % RATIO
             tail_off = c - n
             tail = tail_start + tail_off
             pos = tl.where(
@@ -136,7 +150,12 @@ def fused_kv_prepare(
     compress_ratio=1,
     query_positions=None,
     chain_positions=False,
+    visible_page_size=0,
 ):
+    """With block indices (compress_ratio > 1) and ``visible_page_size`` set, a
+    row's packed K/V is written only up to its valid count rounded up to that
+    page: a paged consumer bounded by ``counts`` never reads further, and the
+    rest of the row keeps whatever the buffer held."""
     rows, input_topk = indices.shape
     topk = input_topk * compress_ratio + compress_ratio - 1
     if rows == 0:
@@ -144,6 +163,8 @@ def fused_kv_prepare(
     heads, dim = k_cache.shape[1:]
     stride = packed_k.shape[0] // rows
     block = 8 if compress_ratio > 1 and rows <= 4 else 16
+    use_pdl = current_arch().supports_pdl
+    pdl_kwargs = {"launch_pdl": True} if use_pdl else {}
     _qsa_fused_kv_prepare[(rows * heads * (triton.cdiv(stride, block) + 2),)](
         k_cache,
         v_cache,
@@ -174,5 +195,8 @@ def fused_kv_prepare(
         compress_ratio,
         input_topk,
         chain_positions,
+        visible_page_size if compress_ratio > 1 else 0,
+        USE_PDL=use_pdl,
         num_warps=4,
+        **pdl_kwargs,
     )

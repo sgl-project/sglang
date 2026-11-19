@@ -7,12 +7,10 @@ from sglang.kernels.jit.benchmark.utils import create_empty, create_random
 from sglang.kernels.ops.quantization.fp8_kernel import (
     create_per_token_group_quant_fp8_output_scale,
     fp8_dtype,
-    fp8_max,
-    fp8_min,
 )
 
-# per_token_group_quant_8bit_v2 is DEPRECATED (no production call sites); the
-# kernel is kept only as the perf baseline for this benchmark.
+# per_token_group_quant_8bit_v2 is the perf baseline; production only routes
+# fp32 UE8M0 scales to it.
 from sglang.kernels.ops.quantization.per_token_group_quant import (
     per_token_group_quant,
 )
@@ -22,7 +20,7 @@ from sglang.kernels.ops.quantization.per_token_group_quant_8bit_v2 import (
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
-    est_time=25, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
+    est_time=25, stage="base-b-kernel-benchmark", runner_config="1-gpu-small"
 )
 
 # name -> (moe_intermediate_size, topk, num_experts, group_size)
@@ -39,9 +37,6 @@ def _jit_v2(G, x, x_q, x_s, masked_m, expected_m, fuse):
         x_q,
         x_s,
         G,
-        1e-10,
-        float(fp8_min),
-        float(fp8_max),
         scale_ue8m0=True,
         fuse_silu_and_mul=fuse,
         masked_m=masked_m,

@@ -58,7 +58,7 @@ def _inkling_overrides(server_args: Any, hf_config: Any) -> dict:
     # handle_mamba_radix_cache rejects extra_buffer on a model without it.
     if not cfg.disable_radix_cache:
         overrides["uses_mamba_radix_cache"] = True
-    # Inkling attention runs only on the fa4 (Blackwell) or triton backends --
+    # Inkling attention runs only on the fa4 (Hopper/Blackwell) or triton backends --
     # models/inkling_common/attn.py asserts attention_backend in {fa4, triton}.
     # The generic resolver would otherwise pick trtllm_mha (SM100) / fa3
     # (Hopper), so a bare launch fails on the first attention forward. Pin a
@@ -66,7 +66,10 @@ def _inkling_overrides(server_args: Any, hf_config: Any) -> dict:
     # (mirrors the MiniMax-M3 SM100 fa4-default above); an explicit
     # --attention-backend / --prefill/decode-attention-backend still wins.
     if is_attention_backend_not_set(cfg):
-        inkling_attn_backend = "fa4" if get_platform().is_sm100 else "triton"
+        if get_platform().is_sm90 or get_platform().is_sm100:
+            inkling_attn_backend = "fa4"
+        else:
+            inkling_attn_backend = "triton"
         overrides["attention_backend"] = inkling_attn_backend
         logger.info(
             f"Use {inkling_attn_backend} as the attention backend for Inkling "
