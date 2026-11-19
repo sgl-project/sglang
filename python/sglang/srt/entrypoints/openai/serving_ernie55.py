@@ -34,6 +34,7 @@ _RESERVED_TEMPLATE_KWARGS = frozenset(
         "tools",
         "add_generation_prompt",
         "continue_final_message",
+        "response_format",
         "tokenize",
         "return_dict",
     }
@@ -110,7 +111,6 @@ class Ernie55ChatEncodingAdapter:
     # history tool-call arguments stay parsed JSON (the template re-serializes).
     collects_openai_media = False
     history_tool_call_arguments = "strict"
-    renders_response_format = False
     uncounted_prompt_tokens = 0
     wire = OPENAI_CHAT_WIRE
 
@@ -132,6 +132,12 @@ class Ernie55ChatEncodingAdapter:
         self._tokenizer = tokenizer
         self._default_chat_template_kwargs = dict(default_chat_template_kwargs or {})
         self._hooks = chat_hooks
+        # Checkpoints whose renderer takes response_format state it in the prompt,
+        # in the checkpoint's own wording; older ones render without it.
+        accepted = _accepted_render_kwargs(tokenizer)
+        self.renders_response_format = (
+            accepted is not None and "response_format" in accepted
+        )
         # ErnieChatTokenizer builds its encode tables on first use (0.8 s measured
         # on the 1110 checkpoint); pay that at startup, not on the first request.
         tokenizer.apply_chat_template(
@@ -175,6 +181,10 @@ class Ernie55ChatEncodingAdapter:
         # enable_thinking toggle instead. A reasoning_effort only when the client set one.
         if request.reasoning_effort is not None:
             kwargs.setdefault("reasoning_effort", request.reasoning_effort)
+        if self.renders_response_format and request.response_format is not None:
+            kwargs["response_format"] = request.response_format.model_dump(
+                exclude_unset=True, by_alias=True
+            )
         continue_final = bool(
             request.continue_final_message
             and messages
