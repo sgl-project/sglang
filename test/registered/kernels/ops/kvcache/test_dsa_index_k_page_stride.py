@@ -198,10 +198,17 @@ def test_index_key_cache_strided_layer_buffer(use_fp4_indexer):
         source = torch.tensor([3, 70, 130], device="cuda")
         p.move_kv_cache(source.flip(0) + 64, source)
 
-    lens = torch.tensor([256], dtype=torch.int32, device="cuda")
-    table = torch.arange(4, dtype=torch.int32, device="cuda").unsqueeze(0)
-    k_ref, s_ref = ref_pool.get_index_k_scale_buffer(0, lens, table, 256, 256)
-    k_out, s_out = pool.get_index_k_scale_buffer(0, lens, table, 256, 256)
+    # Non-power-of-two batch, with a zero-length row as can occur after DCP
+    # localization. Reuse its cumulative offsets instead of scanning lengths.
+    lens = torch.tensor([150, 0, 65], dtype=torch.int32, device="cuda")
+    table = torch.tensor(
+        [[3, 0, 2], [0, 0, 0], [1, 3, 0]], dtype=torch.int32, device="cuda"
+    )
+    cu_seq_lens = torch.tensor([0, 150, 150, 215], dtype=torch.int32, device="cuda")
+    k_ref, s_ref = ref_pool.get_index_k_scale_buffer(0, lens, table, 215, 150)
+    k_out, s_out = pool.get_index_k_scale_buffer(
+        0, lens, table, 215, 150, cu_seq_lens=cu_seq_lens
+    )
     torch.cuda.synchronize()
 
     assert torch.equal(strided, packed)
@@ -269,6 +276,20 @@ def test_get_k_and_s_past_int32_offsets():
     (k_ref, s_ref), (k_out, s_out) = outs
     assert torch.equal(k_out, k_ref)
     assert torch.equal(s_out, s_ref)
+    for dtype in (torch.int32, torch.int64):
+        cu_seq_lens = torch.tensor([0, 150, 342], dtype=dtype, device="cuda")
+        k_out, s_out = _get_k_and_s_triton(
+            buf=strided,
+            page_indices=page_table,
+            seq_lens=seq_lens,
+            seq_len_sum=342,
+            max_seq_len=3 * PAGE_SIZE,
+            page_size=PAGE_SIZE,
+            index_head_dim=HEAD_DIM,
+            cu_seq_lens=cu_seq_lens,
+        )
+        assert torch.equal(k_out, k_ref)
+        assert torch.equal(s_out, s_ref)
     _assert_outside_untouched(entries, offset, page_bytes)
 
 

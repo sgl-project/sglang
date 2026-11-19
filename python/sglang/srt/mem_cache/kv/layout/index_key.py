@@ -2,7 +2,7 @@
 page per layer (the page's keys, then their scales), addressed by physical page,
 read and written by the paged index kernels."""
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 
@@ -51,6 +51,8 @@ class IndexKeyView:
         page_indices: torch.Tensor,
         seq_len_sum: int,
         max_seq_len: int,
+        *,
+        cu_seq_lens: Optional[torch.Tensor] = None,
     ):
         from sglang.kernels.ops.kvcache.dsa_index_k_cache import GetKAndS
 
@@ -61,6 +63,7 @@ class IndexKeyView:
             page_indices=page_indices,
             seq_len_sum=seq_len_sum,
             max_seq_len=max_seq_len,
+            cu_seq_lens=cu_seq_lens,
         )
 
     def set_index_k_scale_buffer(

@@ -821,6 +821,7 @@ class TestShardedDSAMetadata(unittest.TestCase):
             patch.object(
                 dsa_backend, "can_dsa_prefill_cp_interleave", return_value=True
             ),
+            patch.object(dsa_backend, "is_cuda", return_value=True),
             patch.object(dsa_backend, "get_cp_strategy", return_value=strategy),
             patch.object(
                 dsa_backend, "pad_dsa_cache_seqlens", side_effect=lambda _, x: x
@@ -840,6 +841,14 @@ class TestShardedDSAMetadata(unittest.TestCase):
         )
         torch.testing.assert_close(
             metadata.get_indexer_seq_len_cpu(), torch.tensor([65])
+        )
+        self.assertIs(
+            metadata.attn_metadata.indexer_gather_cu_seqlens,
+            metadata.attn_metadata.cu_seqlens_k,
+        )
+        torch.testing.assert_close(
+            metadata.attn_metadata.indexer_gather_cu_seqlens,
+            torch.tensor([0, 65], dtype=torch.int32),
         )
         self.assertIs(pool.begin_args[1], req_ids)
         self.assertEqual(pool.begin_args[2], [128, 64, 192])

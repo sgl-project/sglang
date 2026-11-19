@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 import triton
@@ -45,14 +45,14 @@ def _page_stride(buf: torch.Tensor) -> int:
 
 class GetKAndS:
     @classmethod
-    def execute(cls, *args, **kwargs):
+    def execute(cls, *args, cu_seq_lens=None, **kwargs):
         # The aiter path uses cp_gather_indexer_k_quant_cache(preshuffle=True),
         # which only matches the layout produced when the rest of the indexer
         # is on the page_size=64 preshuffle path. Otherwise fall back to the
         # triton implementation (which works on the page_size=1 legacy layout).
         if _use_aiter_preshuffle:
             return cls.aiter(*args, **kwargs)
-        return cls.triton(*args, **kwargs)
+        return cls.triton(*args, cu_seq_lens=cu_seq_lens, **kwargs)
 
     @classmethod
     def aiter(
@@ -105,6 +105,8 @@ class GetKAndS:
         seq_len_tensor: torch.Tensor,
         seq_len_sum: int,
         max_seq_len: int,
+        *,
+        cu_seq_lens: Optional[torch.Tensor] = None,
     ):
         """
         Triton implementation for gathering both K and S data from paged buffer in a single call.
@@ -124,6 +126,7 @@ class GetKAndS:
             max_seq_len=max_seq_len,
             page_size=pool.index_page_size,
             index_head_dim=pool.index_key_bytes_per_token,
+            cu_seq_lens=cu_seq_lens,
         )
 
 
@@ -292,6 +295,8 @@ def _get_k_and_s_triton(
     max_seq_len: int,
     page_size: int,
     index_head_dim: int,
+    *,
+    cu_seq_lens: Optional[torch.Tensor] = None,
 ):
     """
     Fused gather of both K (key) and S (scale) data from paged buffer using Triton.
@@ -304,6 +309,8 @@ def _get_k_and_s_triton(
     :param max_seq_len: max of sequence len, int32
     :param page_size: int, typically 64
     :param index_head_dim: int, typically 128
+    :param cu_seq_lens: optional exclusive offsets for seq_lens, with a trailing
+        total (int32/int64). Reuse forward-batch metadata when available.
     :return: tuple of (k_out, s_out) where
              k_out: (seq_len, index_head_dim), uint8
              s_out: (seq_len, 4), uint8
@@ -327,9 +334,8 @@ def _get_k_and_s_triton(
 
     seq_num = seq_lens.shape[0]
     grid = (seq_num, num_token_blocks, num_k_threads)
-    seq_num_pow2 = 1
-    while seq_num_pow2 < seq_num:
-        seq_num_pow2 *= 2
+    # Only the fallback reduction specializes on batch size.
+    seq_num_pow2 = triton.next_power_of_2(max(seq_num, 1)) if cu_seq_lens is None else 0
 
     _get_k_and_s_triton_kernel[grid](
         buf_ptr=buf,
@@ -337,6 +343,7 @@ def _get_k_and_s_triton(
         k_out_ptr=k_out,
         s_out_ptr=s_out,
         seq_len_ptr=seq_lens,
+        cu_seq_lens_ptr=cu_seq_lens,
         seq_len_num_pow=seq_num_pow2,
         page_size=page_size,
         buf_page_stride=buf_page_stride,
@@ -357,6 +364,7 @@ def _get_k_and_s_triton_kernel(
     k_out_ptr,
     s_out_ptr,
     seq_len_ptr,
+    cu_seq_lens_ptr,
     seq_len_num_pow: tl.constexpr,
     page_size: tl.constexpr,
     buf_page_stride: tl.constexpr,
@@ -380,16 +388,25 @@ def _get_k_and_s_triton_kernel(
     token_ids = block_token_start + token_ids_in_block
     k_offsets = thread_idx * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
 
-    seq_len = tl.load(seq_len_ptr + batch_id)
+    if seq_len_num_pow == 0:
+        # Adjacent cumulative offsets carry both the length and destination
+        # start, so the fast path does not read the original lengths.
+        batch_token_offset = tl.load(cu_seq_lens_ptr + batch_id)
+        seq_end = tl.load(cu_seq_lens_ptr + batch_id + 1)
+        seq_len = seq_end - batch_token_offset
+        batch_token_offset = batch_token_offset.to(tl.int64)
+    else:
+        seq_len = tl.load(seq_len_ptr + batch_id)
     # Grid axis 1 spans the batch-max seq len; fully-masked blocks store nothing.
     if block_token_start >= seq_len:
         return
     token_valid_mask = token_ids < seq_len
 
-    pre_batch_idx = tl.arange(0, seq_len_num_pow)
-    mask_pre_batch_idx = pre_batch_idx < batch_id
-    prev_seq_lens = tl.load(seq_len_ptr + pre_batch_idx, mask=mask_pre_batch_idx)
-    batch_token_offset = tl.sum(prev_seq_lens)
+    if seq_len_num_pow != 0:
+        pre_batch_idx = tl.arange(0, seq_len_num_pow)
+        mask_pre_batch_idx = pre_batch_idx < batch_id
+        prev_seq_lens = tl.load(seq_len_ptr + pre_batch_idx, mask=mask_pre_batch_idx)
+        batch_token_offset = tl.sum(prev_seq_lens)
 
     # Batch calculate the page index and in-page offset of each token.
     page_idx = token_ids // page_size

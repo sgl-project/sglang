@@ -215,6 +215,46 @@ class TestPhysicalPageTables(CustomTestCase):
                     flat = torch.cat([physical[i, :n] for i, n in enumerate(seq_lens)])
                     self.assertTrue(torch.equal(metadata.page_table_1_flattened, flat))
 
+    def test_dcp_indexer_gather_uses_rank_local_offsets(self):
+        from sglang.srt.runtime_context import get_parallel
+
+        # DCP stores compact local KV with a logical page span of 2 * PAGE.
+        req_to_token = torch.arange(REQ_ROWS * WIDTH).reshape(REQ_ROWS, WIDTH)
+        for rank, local_lens in ((0, [7, 1, 11]), (1, [6, 0, 10])):
+            with (
+                self.subTest(rank=rank),
+                get_parallel().override(
+                    dcp_enabled=True,
+                    dcp_size=2,
+                    dcp_rank=rank,
+                    attn_dcp_size=2,
+                    attn_dcp_rank=rank,
+                ),
+                patch(
+                    "sglang.srt.layers.attention.dsa_backend.is_cuda",
+                    return_value=True,
+                ),
+            ):
+                backend = _metadata_backend(req_to_token, None)
+                backend.dsa_shards_index_k = True
+                backend.attn_dcp_size, backend.attn_dcp_rank = 2, rank
+                backend.real_page_span = 2 * PAGE
+                backend.init_forward_metadata(
+                    _extend_batch([2, 0, 3], [13, 1, 21], [5, 0, 9])
+                )
+                m = backend.forward_metadata
+                expected_local = torch.tensor(local_lens)
+                torch.testing.assert_close(m.indexer_gather_local_lens, expected_local)
+                torch.testing.assert_close(
+                    m.indexer_gather_cu_seqlens,
+                    torch.nn.functional.pad(
+                        expected_local.cumsum(0, dtype=torch.int32), (1, 0)
+                    ),
+                )
+                torch.testing.assert_close(
+                    m.cu_seqlens_k, torch.tensor([0, 13, 14, 35], dtype=torch.int32)
+                )
+
 
 class _Written(Exception):
     """Stops a forward once its latent write has been seen."""

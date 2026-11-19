@@ -1872,12 +1872,20 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 layer_id, metadata, block_tables, indexer_seq_lens_cpu
             )
         else:
+            # On small batches the original warp-local reduction is as cheap
+            # or cheaper than reading two offsets. Use the shared offsets
+            # once the batch spans a full warp.
             k_fp8, k_scale = get_token_to_kv_pool().get_index_k_scale_buffer(
                 layer_id,
                 metadata.get_indexer_seq_len(),
                 block_tables,
                 seq_len_sum,
                 max_seq_len,
+                cu_seq_lens=(
+                    metadata.attn_metadata.indexer_gather_cu_seqlens
+                    if batch_size >= 32 and isinstance(metadata, DSAIndexerMetadata)
+                    else None
+                ),
             )
         if not self.fp4_index_k:
             if _is_fp8_fnuz:
@@ -2152,12 +2160,28 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         parallel = get_parallel()
         dcp_size, dcp_rank = parallel.attn_dcp_size, parallel.attn_dcp_rank
         local_lens_cpu = get_dcp_lens(seq_lens_cpu, dcp_size, dcp_rank)
+        attn_metadata = (
+            metadata.attn_metadata if isinstance(metadata, DSAIndexerMetadata) else None
+        )
+        local_lens = (
+            attn_metadata.indexer_gather_local_lens
+            if attn_metadata is not None
+            else None
+        )
+        cu_seq_lens = None
+        if local_lens is None:
+            local_lens = get_dcp_lens(
+                metadata.get_indexer_seq_len(), dcp_size, dcp_rank
+            )
+        else:
+            cu_seq_lens = attn_metadata.indexer_gather_cu_seqlens
         k_fp8, k_scale = get_token_to_kv_pool().get_index_k_scale_buffer(
             layer_id,
-            get_dcp_lens(metadata.get_indexer_seq_len(), dcp_size, dcp_rank),
+            local_lens,
             block_tables,
             int(local_lens_cpu.sum()),
             max(int(local_lens_cpu.max()), 1),
+            cu_seq_lens=cu_seq_lens,
         )
         rows = k_fp8.shape[0]
         k_bytes = k_fp8.view(torch.uint8).view(rows, -1)

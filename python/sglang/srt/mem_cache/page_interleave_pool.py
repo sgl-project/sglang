@@ -916,6 +916,8 @@ class _PageInterleaveIndexKeyCache(IndexKeyCache):
         page_indices: torch.Tensor,
         seq_len_sum: int,
         max_seq_len: int,
+        *,
+        cu_seq_lens: Optional[torch.Tensor] = None,
     ):
         return super().get_k_and_scale(
             layer_id,
@@ -923,6 +925,7 @@ class _PageInterleaveIndexKeyCache(IndexKeyCache):
             self._scratch_pages(layer_id, page_indices),
             seq_len_sum,
             max_seq_len,
+            cu_seq_lens=cu_seq_lens,
         )
 
     def write_targets(

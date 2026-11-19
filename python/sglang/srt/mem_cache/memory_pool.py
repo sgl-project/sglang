@@ -4783,12 +4783,19 @@ class HybridLinearKVPool(KVCache):
         page_indices: torch.Tensor,
         seq_len_sum: int,
         max_seq_len: int,
+        *,
+        cu_seq_lens: Optional[torch.Tensor] = None,
     ):
         assert self.use_dsa, "get_index_k_scale_buffer called when use_dsa is False"
         self._wait_for_layer(layer_id)
         layer_id = self._transfer_full_attention_id(layer_id)
         return self.full_kv_pool.get_index_k_scale_buffer(
-            layer_id, seq_len_tensor, page_indices, seq_len_sum, max_seq_len
+            layer_id,
+            seq_len_tensor,
+            page_indices,
+            seq_len_sum,
+            max_seq_len,
+            cu_seq_lens=cu_seq_lens,
         )
 
     def get_compress_tail_buffers(
@@ -5841,9 +5848,16 @@ class DSATokenToKVPool(MLATokenToKVPool):
         page_indices: torch.Tensor,
         seq_len_sum: int,
         max_seq_len: int,
+        *,
+        cu_seq_lens: Optional[torch.Tensor] = None,
     ):
         return self.index_key_cache.get_k_and_scale(
-            layer_id, seq_len_tensor, page_indices, seq_len_sum, max_seq_len
+            layer_id,
+            seq_len_tensor,
+            page_indices,
+            seq_len_sum,
+            max_seq_len,
+            cu_seq_lens=cu_seq_lens,
         )
 
     def set_index_k_scale_buffer(
