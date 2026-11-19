@@ -1412,6 +1412,79 @@ class TestTritonAttention(CustomTestCase):
 
         self.assertTrue(torch.equal(run(prefix), run(0)[prefix:]))
 
+    def test_unified_sliding_window_tree_mask_matches_reference(self):
+        """A speculative tree mask has full-length rows. On a sliding-window layer
+        the rail holds only the last `window` prefix keys, so the kernel must read
+        the mask with the full row stride, starting at the window's first column."""
+        torch.manual_seed(0)
+        device = get_device()
+        window, num_draft, heads, head_dim = 64, 4, 8, 64
+        parents = [-1, 0, 0, 1]
+        i32 = lambda *x: torch.tensor(x, dtype=torch.int32, device=device)
+        arange = lambda lo, hi: torch.arange(lo, hi, device=device)
+
+        for prefix_len in (window - 8, window, window + 1, 3 * window + 7):
+            with self.subTest(prefix_len=prefix_len):
+                total = prefix_len + num_draft
+                q = torch.randn(
+                    num_draft, heads, head_dim, dtype=torch.bfloat16, device=device
+                )
+                k = torch.randn(
+                    total, heads, head_dim, dtype=torch.bfloat16, device=device
+                )
+                v = torch.randn_like(k)
+
+                mask = torch.zeros(num_draft, total, dtype=torch.bool)
+                mask[:, :prefix_len] = True
+                for row in range(num_draft):
+                    node = row
+                    while node != -1:
+                        mask[row, prefix_len + node] = True
+                        node = parents[node]
+                mask = mask.to(device)
+
+                sm_scale = head_dim**-0.5
+                scores = torch.einsum("qhd,khd->qhk", q.float(), k.float()) * sm_scale
+                q_pos = prefix_len + arange(0, num_draft)
+                k_pos = arange(0, total)
+                allowed = mask & (q_pos[:, None] <= k_pos[None, :] + window)
+                scores = scores.masked_fill(~allowed[:, None, :], float("-inf"))
+                expected = torch.einsum(
+                    "qhk,khd->qhd", torch.softmax(scores, dim=-1), v.float()
+                )
+
+                rail_len = min(prefix_len, window)
+                kv_indptr, kv_indices, kv_prefix_lens = build_unified_kv_indices(
+                    i32(0, rail_len),
+                    arange(prefix_len - rail_len, prefix_len),
+                    i32(0),
+                    i32(num_draft),
+                    arange(prefix_len, total),
+                    1,
+                )
+                o = torch.empty_like(q)
+                extend_attention_fwd_unified(
+                    q,
+                    o,
+                    k,
+                    v,
+                    1.0,
+                    1.0,
+                    i32(0, num_draft),
+                    kv_indptr,
+                    kv_indices,
+                    kv_prefix_lens.to(torch.int32),
+                    num_draft,
+                    custom_mask=mask.flatten(),
+                    mask_indptr=torch.tensor(
+                        [0, num_draft * total], dtype=torch.int64, device=device
+                    ),
+                    sm_scale=sm_scale,
+                    sliding_window_size=window,
+                    window_start_pos=i32(prefix_len - rail_len),
+                )
+                torch.testing.assert_close(o.float(), expected, atol=3e-2, rtol=3e-2)
+
 
 if __name__ == "__main__":
     unittest.main()
