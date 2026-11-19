@@ -40,7 +40,11 @@
 
 #include <concepts>
 #include <cstddef>
+#if defined(__MUSACC__)
 #include <iterator>
+#else
+#include <ranges>
+#endif
 #include <ostream>
 #include <sstream>
 #include <utility>
@@ -161,6 +165,7 @@ inline auto dtype_bytes(DLDataType dtype) -> std::size_t {
   return static_cast<std::size_t>(dtype.bits / 8);
 }
 
+#if defined(__MUSACC__)
 /// \brief Python-style integer range: `irange(n)` -> `[0, n)`.
 template <std::integral T>
 class IotaRange {
@@ -206,6 +211,22 @@ template <std::integral T>
 inline auto irange(T start, T end) -> IotaRange<T> {
   return IotaRange<T>{start, end};
 }
+#else
+namespace stdr = std::ranges;
+namespace stdv = stdr::views;
+
+/// \brief Python-style integer range: `irange(n)` -> `[0, n)`.
+template <std::integral T>
+inline auto irange(T end) {
+  return stdv::iota(static_cast<T>(0), end);
+}
+
+/// \brief Python-style integer range: `irange(start, end)` -> `[start, end)`.
+template <std::integral T>
+inline auto irange(T start, T end) {
+  return stdv::iota(start, end);
+}
+#endif
 
 /** \brief Error class for stream-style error logging. */
 struct Error {

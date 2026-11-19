@@ -43,10 +43,8 @@ using CUresult = MUresult;
 inline constexpr auto cudaSuccess = musaSuccess;
 inline constexpr auto CUDA_SUCCESS = MUSA_SUCCESS;
 #define CUDA_VERSION 0
-#define cudaStreamPerThread musaStreamPerThread
 #define cudaGetErrorString musaGetErrorString
 #define cudaGetLastError musaGetLastError
-#define cudaLaunchKernel musaLaunchKernel
 #define cudaLaunchKernelEx musaLaunchKernelEx
 #define cudaMemcpyAsync musaMemcpyAsync
 #define cudaMemcpyHostToDevice musaMemcpyHostToDevice
@@ -69,8 +67,6 @@ inline constexpr auto CUDA_SUCCESS = MUSA_SUCCESS;
 #define cudaSharedmemCarveoutMaxShared musaSharedmemCarveoutMaxShared
 #define cudaSharedmemCarveoutDefault musaSharedmemCarveoutDefault
 #define cuGetErrorString muGetErrorString
-#define cuDeviceGetAttribute muDeviceGetAttribute
-#define cuFuncSetAttribute muFuncSetAttribute
 #elif !defined(USE_ROCM)
 #include <cuda.h>
 #include <cuda_bf16.h>
