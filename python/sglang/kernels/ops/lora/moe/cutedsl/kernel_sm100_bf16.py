@@ -672,7 +672,11 @@ class GroupedGemmKernelSm100Bf16:
         smem_capacity: int,
         occupancy: int,
         c_smem_layout: cute.Layout,
+        sf_bytes_per_stage: int = 0,
+        reserved_bytes: int = 0,
     ) -> Tuple[int, int, int]:
+        """``sf_bytes_per_stage``: scale factors loaded with each A/B stage;
+        ``reserved_bytes``: shared memory the kernel holds beside the stages."""
         num_acc_stage = 2
         num_c_stage = 2
 
@@ -683,10 +687,12 @@ class GroupedGemmKernelSm100Bf16:
             tiled_mma, mma_tiler_mnk, b_dtype, 1
         )
 
-        ab_bytes_per_stage = cute.size_in_bytes(
-            a_dtype, a_smem_layout_stage_one
-        ) + cute.size_in_bytes(b_dtype, b_smem_layout_staged_one)
-        mbar_helpers_bytes = 1024
+        ab_bytes_per_stage = (
+            cute.size_in_bytes(a_dtype, a_smem_layout_stage_one)
+            + cute.size_in_bytes(b_dtype, b_smem_layout_staged_one)
+            + sf_bytes_per_stage
+        )
+        mbar_helpers_bytes = 1024 + reserved_bytes
 
         c_bytes_per_stage = cute.size_in_bytes(c_dtype, c_smem_layout)
         c_bytes = c_bytes_per_stage * num_c_stage

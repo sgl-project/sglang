@@ -17,6 +17,32 @@ def round_bf16_to_fp32(value):
 
 
 @triton.jit
+def add_rn_f32(a, b):
+    """fp32 ``a + b`` rounded to nearest, never fused into a multiply-add."""
+    return tl.inline_asm_elementwise(
+        "add.rn.f32 $0, $1, $2;",
+        "=r,r,r",
+        [a, b],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def sub_rn_f32(a, b):
+    """fp32 ``a - b`` rounded to nearest, never fused into a multiply-add."""
+    return tl.inline_asm_elementwise(
+        "sub.rn.f32 $0, $1, $2;",
+        "=r,r,r",
+        [a, b],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
 def mul_rn_f32(x, y):
     """Opaque correctly-rounded fp32 multiply that blocks FMA contraction."""
     return tl.inline_asm_elementwise(
@@ -87,10 +113,12 @@ def silu_approx_f32(x):
 
 
 __all__ = [
+    "add_rn_f32",
     "cuda_rsqrtf",
     "div_rn_f32",
     "mul_rn_f32",
     "round_bf16_to_fp32",
     "rsqrt_approx_f32",
     "silu_approx_f32",
+    "sub_rn_f32",
 ]
