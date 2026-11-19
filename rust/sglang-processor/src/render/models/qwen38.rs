@@ -29,6 +29,10 @@ const RESERVED_KWARGS: &[&str] = &[
 
 const MEDIA_PARTS: &[&str] = &["image_url", "video_url", "audio_url", "input_audio"];
 
+/// What the template raises on a developer turn, which Dynamo would fold into
+/// the system turn.
+pub(crate) const DEVELOPER_ERROR: &str = "Unexpected message role.";
+
 /// Qwen3.8's templates (Max, 27B, Flash-Next): Qwen3-Coder's tool-call format,
 /// with a `reasoning_effort` instruction and `preserve_thinking`.
 pub(crate) fn is_qwen38(template: &str) -> bool {
@@ -72,6 +76,9 @@ pub(crate) fn render(
     // The template raises on a later system turn, which Dynamo would demote to a user turn.
     if messages.iter().skip(1).any(|m| m["role"] == "system") {
         return Err("System message must be at the beginning.".into());
+    }
+    if messages.iter().any(|m| m["role"] == "developer") {
+        return Err(DEVELOPER_ERROR.into());
     }
     messages.iter_mut().for_each(join_text_parts);
     if messages.iter().any(trims_unlike_python) {
@@ -325,9 +332,11 @@ impl OAIChatLikeRequest for TemplateRequest {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use serde_json::json;
 
-    use crate::render::ChatFormatter;
+    use crate::render::{ChatFormatter, TemplateArgs, TemplateError};
 
     /// Qwen3.8 is known by its template, which takes content parts lists only when it
     /// renders media; Qwen3's template is not Qwen3.8.
@@ -356,5 +365,42 @@ mod tests {
             formatter(template.replace("preserve_thinking", "")),
             ChatFormatter::HuggingFace { .. }
         ));
+    }
+
+    /// A developer turn fails as in Python on the fallback path too, which media
+    /// requests take, rather than rendering as the system turn Dynamo folds it into.
+    #[test]
+    fn developer_turn_fails_on_the_fallback_path() {
+        let formatter = ChatFormatter::from_tokenizer_config(&json!({"chat_template": concat!(
+            "{#- <function= <parameter= preserve_thinking Reasoning effort is set to -#}",
+            "{%- for m in messages -%}<|im_start|>{{ m.role }}\n",
+            "{%- if m.content is string %}{{ m.content }}{% else %}",
+            "{%- for part in m.content %}{% if part.type == 'image_url' %}",
+            "<|vision_start|><|image_pad|><|vision_end|>{% else %}{{ part.text }}{% endif %}",
+            "{%- endfor %}{% endif %}<|im_end|>\n{% endfor -%}"
+        )}))
+        .unwrap();
+        let body = json!({
+            "model": "test",
+            "messages": [
+                {"role": "developer", "content": "Be brief."},
+                {"role": "user", "content": [
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+                    {"type": "text", "text": "What is this?"}
+                ]}
+            ]
+        });
+        assert!(matches!(
+            formatter.render_request(body.clone(), &HashMap::new()),
+            Err(TemplateError::NeedsRenderFallback { .. })
+        ));
+        let request = serde_json::from_value(body.clone()).unwrap();
+        let args = TemplateArgs::new(&body, &HashMap::new());
+        match formatter.render_template(&request, &args) {
+            Err(TemplateError::Renderer { message }) => {
+                assert_eq!(message, super::DEVELOPER_ERROR)
+            }
+            other => panic!("{:?}", other.map(|(prompt, _)| prompt.into_text())),
+        }
     }
 }

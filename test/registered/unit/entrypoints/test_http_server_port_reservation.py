@@ -315,6 +315,9 @@ def test_each_server_serves_on_the_reservation_or_binds_after_its_release(
         ),
     )
     monkeypatch.setattr(http_server, "_ReusePortMultiprocess", ReusePortMultiprocess)
+    monkeypatch.setattr(
+        http_server, "_shutdown_schedulers_after_http_workers", lambda **kwargs: None
+    )
     # The real module needs watchfiles, which the CPU image may not have.
     monkeypatch.setitem(
         sys.modules,

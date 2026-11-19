@@ -3,7 +3,7 @@
 The fused kernel recomputes the gate matmul and has no slot for the per-expert
 learned bias QuantizedSwitchLinear adds after the matmul, so ``can_fuse`` must
 exclude a gate carrying one, and the patch must leave such a layer unfused.
-Runs only on Apple Silicon with MLX, via stage-a-unit-test-mlx.
+Runs only on Apple Silicon with MLX, via extra-unit-test-mlx.
 """
 
 import importlib.util
@@ -14,7 +14,7 @@ import pytest
 
 from sglang.test.ci.ci_register import register_mlx_ci
 
-register_mlx_ci(est_time=45, suite="stage-a-unit-test-mlx")
+register_mlx_ci(est_time=45, suite="extra-unit-test-mlx")
 
 _IS_APPLE_SILICON = platform.system() == "Darwin" and platform.machine() == "arm64"
 _HAS_MLX = (

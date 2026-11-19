@@ -206,14 +206,14 @@ curl -sS -X POST "http://localhost:30010/v1/images/generations" \
 ```
 
 > **Note**
-> If `response_format=url` is used and cloud storage is not configured, the API returns
-> a relative URL like `/v1/images/<IMAGE_ID>/content`.
+> For image generation and edits, `response_format=url` requires a persistent output
+> directory or cloud storage. If neither is configured, use `b64_json`; requesting a URL returns HTTP 400.
 
 **Edit an image**
 
 **Endpoint:** `POST /v1/images/edits`
 
-This endpoint accepts a multipart form upload with input images and a text prompt. The server can return either a base64-encoded image or a URL to download the image.
+Send a multipart form with a `prompt` and an input image: upload a file with `image`, or pass a remote image URL with `url`. Supplying both adds two inputs. Masked inpainting is not supported: uploading a `mask` returns HTTP 400.
 
 Uploaded filenames are sanitized, and saved uploads are constrained to the
 server's upload directory. This also applies to image uploads for video and mesh
@@ -225,7 +225,6 @@ generation.
 curl -sS -X POST "http://localhost:30010/v1/images/edits" \
   -H "Authorization: Bearer sk-proj-1234567890" \
   -F "image=@local_input_image.png" \
-  -F "url=image_url.jpg" \
   -F "prompt=A calico cat playing a piano on stage" \
   -F "size=1024x1024" \
   -F "response_format=b64_json"
@@ -237,7 +236,6 @@ curl -sS -X POST "http://localhost:30010/v1/images/edits" \
 curl -sS -X POST "http://localhost:30010/v1/images/edits" \
   -H "Authorization: Bearer sk-proj-1234567890" \
   -F "image=@local_input_image.png" \
-  -F "url=image_url.jpg" \
   -F "prompt=A calico cat playing a piano on stage" \
   -F "size=1024x1024" \
   -F "response_format=url"
@@ -245,8 +243,8 @@ curl -sS -X POST "http://localhost:30010/v1/images/edits" \
 
 **Download image content**
 
-When `response_format=url` is used with `POST /v1/images/generations` or `POST /v1/images/edits`,
-the API returns a relative URL like `/v1/images/<IMAGE_ID>/content`.
+Read `data[].url` from the response. A cloud storage URL can be downloaded directly;
+resolve a relative URL such as `/v1/images/<IMAGE_ID>/content` against the server address.
 
 **Endpoint:** `GET /v1/images/&#123;image_id&#125;/content`
 
