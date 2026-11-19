@@ -1,52 +1,7 @@
 import torch
-import triton
 
 from sglang.kernels.ops.gemm.inkling2_cute_grouped_nvfp4 import routed_swap_matmul
 from sglang.kernels.ops.moe.inkling2_moe import _sm_count, routed_quant_module
-
-
-def swizzle_block_scales(scales: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
-    """Write (experts, n, cols) row-major block scales into out (experts, size) in
-    the Blackwell block-scaled layout: 128-row x 4-column tiles of 512 bytes,
-    padding left untouched."""
-    experts, n, cols = scales.shape
-    r = torch.arange(n, device=scales.device)[:, None]
-    c = torch.arange(cols, device=scales.device)[None, :]
-    index = (
-        ((r // 128) * ((cols + 3) // 4) + c // 4) * 512
-        + (r % 32) * 16
-        + ((r // 32) % 4) * 4
-        + c % 4
-    )
-    out.view(torch.uint8)[:, index.flatten()] = scales.reshape(experts, -1).view(
-        torch.uint8
-    )
-    return out
-
-
-def swizzled_scale_size(output_size: int, width: int) -> int:
-    return triton.cdiv(output_size, 128) * 128 * triton.cdiv(width, 64) * 4
-
-
-def swizzle_weight_scales(scales: torch.Tensor) -> torch.Tensor:
-    """Convert (experts, n, k // 16) block scales into the GEMM's scale layout."""
-    if (
-        scales.ndim != 3
-        or scales.dtype != torch.float8_e4m3fn
-        or not scales.is_contiguous()
-        or not scales.is_cuda
-    ):
-        raise ValueError(
-            f"expected contiguous CUDA float8_e4m3fn scales of shape (experts, n, k // 16), "
-            f"got {tuple(scales.shape)} {scales.dtype}"
-        )
-    experts, output_size, scale_width = scales.shape
-    out = torch.zeros(
-        (experts, swizzled_scale_size(output_size, scale_width * 16)),
-        dtype=scales.dtype,
-        device=scales.device,
-    )
-    return swizzle_block_scales(scales, out)
 
 
 def _routed_gemm(device, rows, weight, scales, counts, offsets, schedule, quantize):
