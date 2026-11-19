@@ -10,6 +10,10 @@ import torch
 import torch.distributed
 
 from sglang.srt.disaggregation.base.conn import KVPoll
+from sglang.srt.disaggregation.pp_early_finish import (
+    PPPrefillEarlyFinish,
+    start_pp_prefill_early_finish,
+)
 from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
 from sglang.srt.distributed.communication_op import attn_cp_tp_broadcast_pyobj
 from sglang.srt.distributed.parallel_state import P2PWork
@@ -140,6 +144,9 @@ class SchedulerPPMixin:
     _pp_checked_allocator: Optional[ChainAllocator] = None
     _pp_capacity_digest: Optional[bytes] = None
     _pp_release_reqs_awaiting_verdict: Tuple[ReleaseMemoryOccupationReqInput, ...] = ()
+    # PP rank 0's early finish (SGLANG_OPT_PP_PREFILL_EARLY_FINISH), set by the PP PD
+    # prefill loop; every other loop reads None.
+    pp_prefill_early_finish: Optional[PPPrefillEarlyFinish] = None
 
     @DynamicGradMode()
     def event_loop_pp(self: Scheduler):
@@ -300,6 +307,13 @@ class SchedulerPPMixin:
 
         """
         self.init_pp_loop_state()
+        self.pp_prefill_early_finish = None
+        if envs.SGLANG_OPT_PP_PREFILL_EARLY_FINISH.get():
+            self.pp_prefill_early_finish = start_pp_prefill_early_finish(
+                kv_manager=self.disagg_prefill_bootstrap_queue.kv_manager,
+                transfer_queue=self.disagg_prefill_transfer_queue,
+                output_streamer=self.output_streamer,
+            )
 
         # PD additional state initialization
         tmbs = [None] * self.pp_loop_size

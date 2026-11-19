@@ -16,13 +16,15 @@ the megakernel plugin binds (the gathered verify sampler).
 import os
 import unittest
 from contextlib import ExitStack, contextmanager
+from types import SimpleNamespace
 from typing import Callable, Dict, FrozenSet
 from unittest.mock import patch
 
 import msgspec
 
 from sglang.srt.arg_groups import overrides
-from sglang.srt.disaggregation import decode_freed_slots
+from sglang.srt.disaggregation import decode_freed_slots, pp_early_finish
+from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
 from sglang.srt.environ import envs, nv_mega_runtime_switches
 from sglang.srt.managers.scheduler_components import dp_sync_exchange, shm_tag_exchange
 from sglang.srt.models.qwen3_5 import Qwen3_5MoeForConditionalGeneration
@@ -263,9 +265,31 @@ def _freed_slots(shape: Shape) -> bool:
     )
 
 
+def _pp_prefill_loop(shape: Shape) -> bool:
+    return shape.role == "prefill" and get_parallel().pp_size > 1
+
+
+def _pp_early_finish(shape: Shape) -> bool:
+    if not (_pp_prefill_loop(shape) and envs.SGLANG_OPT_PP_PREFILL_EARLY_FINISH.get()):
+        return False
+    kv_manager = SimpleNamespace(
+        request_status=PPConsensusStore.__new__(PPConsensusStore)
+    )
+    output_streamer = SimpleNamespace(
+        rust_server=None,
+        send_to_detokenizer=SimpleNamespace(enable_thread_safety=lambda: None),
+    )
+    with patch.object(pp_early_finish.EarlyFinishThread, "start"):
+        tracker = pp_early_finish.start_pp_prefill_early_finish(
+            kv_manager=kv_manager, transfer_queue=[], output_streamer=output_streamer
+        )
+    return tracker is not None
+
+
 RESOLVERS: Dict[str, Callable[[Shape], bool]] = {
     "SGLANG_OPT_SCHEDULER_SHM_SYNC_DP_ROWS": _dp_rows,
     "SGLANG_OPT_PD_DECODE_ADMIT_FREED_SLOTS": _freed_slots,
+    "SGLANG_OPT_PP_PREFILL_EARLY_FINISH": _pp_early_finish,
 }
 
 
@@ -357,7 +381,7 @@ _QWEN35_CHAIN = _children()
 _QWEN35_TP_SPEC = _CHAIN | _TRTLLM_CHAIN | _QWEN35_CHAIN
 # A PD prefill with pipeline parallelism; the proxy receive with
 # SGLANG_PP_COMM_OVERLAP, the state victims with HiCache write_back.
-_PP_PREFILL = _children()
+_PP_PREFILL = _children("PP_PREFILL_EARLY_FINISH")
 
 EXPECTED = {
     "decode-dep4": _PD_DECODE | _NO_STAGING | _PD_DECODE_DP | _DP_EXCHANGE | _DP_GRAPHS,

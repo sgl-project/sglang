@@ -705,6 +705,13 @@ class CommonKVManager(BaseKVManager):
     def check_status(self, bootstrap_room: int) -> KVPoll:
         return self.request_status[bootstrap_room]
 
+    def staging_holds_success(self, bootstrap_room: int) -> bool:
+        """Whether the room's Success waits for its staging chunks to transfer,
+        and with deferred allocation also for worker cleanup."""
+        return self._staging_outstanding.get(bootstrap_room, 0) > 0 or (
+            self.defer_decode_allocation and bootstrap_room in self._staging_outstanding
+        )
+
     def check_status_pp_consensus(self, bootstrap_room: int) -> KVPoll:
         statuses = self.request_status.collect(bootstrap_room)
         if any(status is None for status in statuses):
@@ -2572,12 +2579,8 @@ class CommonKVSender(BaseKVSender):
         # Hold Success until all staging chunks transferred. With deferred
         # allocation also wait for worker cleanup (the zero entry is only
         # removed after cleanup), before permitting the room to be reused.
-        if status == KVPoll.Success and (
-            self.kv_mgr._staging_outstanding.get(self.bootstrap_room, 0) > 0
-            or (
-                self.kv_mgr.defer_decode_allocation
-                and self.bootstrap_room in self.kv_mgr._staging_outstanding
-            )
+        if status == KVPoll.Success and self.kv_mgr.staging_holds_success(
+            self.bootstrap_room
         ):
             return KVPoll.Transferring
         if status == KVPoll.Bootstrapping:

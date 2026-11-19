@@ -182,6 +182,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.tp_size = 1
         self.attn_cp_cpu_group = None
         self.attn_tp_cpu_group = None
+        self.pp_prefill_early_finish = None
         self.last_batch = None
         self.result_queue = deque()
         self.deferred_responses = DeferredResponses(
