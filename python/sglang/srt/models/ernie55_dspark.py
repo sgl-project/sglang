@@ -239,9 +239,11 @@ class Ernie5_5_MoeForCausalLMDSpark(nn.Module):
         self.confidence_head = build_dspark_v4_confidence_head(
             config=config, markov_rank=int(dspark_config.markov_rank)
         )
-        # The target's multimax, applied to the draft logits as in training.
+        # The target's multimax. Training applies it to the Markov-refined draft
+        # logits, so it runs on each step's base + bias, not on the base logits.
         self.multimax_ranges = nn.Parameter(torch.zeros(4, dtype=torch.bfloat16))
         self.multimax_ts = nn.Parameter(torch.zeros(4, dtype=torch.bfloat16))
+        self.markov_head.step_logits_activation = self._multimax
         self.embed_tokens: Optional[nn.Module] = None
         self.lm_head: Optional[nn.Module] = None
         self._use_fp32_lm_head = envs.SGLANG_DSPARK_FP32_LM_HEAD.get()
@@ -355,10 +357,12 @@ class Ernie5_5_MoeForCausalLMDSpark(nn.Module):
             local_logits = torch.nn.functional.linear(x_normed.float(), weight.float())
         else:
             local_logits = project_through_lm_head(x_normed, self.lm_head)
-        local_logits = multimax(local_logits, self.multimax_ranges, self.multimax_ts)
         if not self._opt_markov_w2_tp_shard:
             local_logits = gather_and_crop_vocab(local_logits, self.lm_head)
         return local_logits, x_post_hc
+
+    def _multimax(self, logits: torch.Tensor) -> torch.Tensor:
+        return multimax(logits, self.multimax_ranges, self.multimax_ts)
 
     def compute_confidence(
         self,
