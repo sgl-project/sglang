@@ -15,7 +15,7 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_ppu_ci(est_time=1200, suite="stage-a-test-1-gpu-ppu")
+register_ppu_ci(est_time=1200, suite="extra-test-1-gpu-ppu")
 
 
 class SailModelMixin(BasicAPIContractMixin, BasicDecodeCorrectnessMixin):

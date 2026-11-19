@@ -10,7 +10,6 @@ import msgspec
 import torch
 
 from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
-    amax8_varlen,
     amax_topk_blocks,
     candidate_row_lens,
 )
@@ -25,7 +24,6 @@ from sglang.kernels.ops.attention.dsv4.index_logits import (
 )
 from sglang.kernels.ops.attention.dsv4.topk import (
     topk_transform_paged_v2,
-    topk_transform_ragged_v2,
     topk_transform_sparse,
 )
 from sglang.srt.layers.attention.dsv4.indexer import (
@@ -43,6 +41,7 @@ from .scoring import (
     get_index_k_cache,
     quantize_index_q,
     score_tiles,
+    select_prefill_block_ids,
     topk_ragged,
 )
 from .types import (
@@ -516,24 +515,11 @@ def select_prefill_rows(
     each output per scored row, with ``nblocks`` matching the view."""
     lens_all = data.compress_lens
     zero_offsets = torch.zeros_like(lens_all)
-    # the block keys read the score rows through 32-byte vectors
     for tile, logits in score_tiles(data, kv):
         lens = lens_all[tile]
         topk_ragged(logits, lens, out=out_positions[tile], offsets=zero_offsets[tile])
-        # keys past a row's block count stay unset; the top-k reads a row
-        # up to its block count only (v2 wants the stride a multiple of 4)
-        width_blocks = (
-            logits.shape[1] + CANDIDATE_BLOCK_SIZE - 1
-        ) // CANDIDATE_BLOCK_SIZE
-        keys = logits.new_empty(
-            logits.shape[0], (width_blocks + 3) // 4 * 4, dtype=torch.float32
-        )
-        amax8_varlen(logits, lens, out=keys)
-        topk_transform_ragged_v2(
-            keys,
-            nblocks[tile],
-            out_offsets=zero_offsets[: logits.shape[0]],
-            out_indices=out_blocks[tile],
+        select_prefill_block_ids(
+            logits, lens, nblocks[tile], out_blocks[tile], offsets=zero_offsets[tile]
         )
 
 
