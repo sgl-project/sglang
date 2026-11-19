@@ -1807,22 +1807,26 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
                     prefix_sum=prefix_sum,
                     valid_token_count=valid_token_count,
                 )
-            full = layernorm_sp.all_gather_token_rows(
-                hidden_states, total_rows=layernorm_sp.sp_num_tokens()
+            full = k3_sp_collective.sp_all_gather(
+                hidden_states, layernorm_sp.sp_num_tokens()
             )
             if self.routed_expert_up_proj is None:
                 # Not a latent MoE: the output is a TP-partial sum.
-                return layernorm_sp.reduce_scatter_token_rows(self.forward(full))
+                return k3_sp_collective.sp_reduce_scatter(self.forward(full))
             if not self._eligible_for_fused_front:
                 out = layernorm_sp.shard_token_rows(self.forward(full))
                 return out if prefix_sum is None else out + prefix_sum
             gate_up, router_logits, routed_input = self._fused_front(full)
-            latent = full.new_empty((full.shape[0], self.moe_hidden_size))
-            shared_output = full.new_empty(full.shape)
+            latent = k3_sp_collective.sp_partial_rows(
+                "moe_latent", full, self.moe_hidden_size
+            )
+            shared_output = k3_sp_collective.sp_partial_rows(
+                "moe_shared", full, full.shape[1]
+            )
             self._forward_routed(full, router_logits, routed_input, latent)
             self._forward_shared(gate_up, shared_output)
-        latent_rows = layernorm_sp.reduce_scatter_token_rows(latent)
-        shared_rows = layernorm_sp.reduce_scatter_token_rows(shared_output)
+        latent_rows = k3_sp_collective.sp_reduce_scatter(latent)
+        shared_rows = k3_sp_collective.sp_reduce_scatter(shared_output)
         out, _ = self.routed_expert_up_proj(self._latent_norm(latent_rows))
         return _add3(out, shared_rows, prefix_sum)
 
@@ -3259,12 +3263,12 @@ class KimiK3DecoderLayer(nn.Module):
         if not get_forward().sp_active:
             return self._attend(hidden_states, positions, forward_batch, zero_allocator)
         # Attention takes every row, and its output is a TP-partial sum.
-        return layernorm_sp.run_replicated_token_rows(
-            hidden_states,
-            lambda rows: self._attend(rows, positions, forward_batch, zero_allocator),
-            output_is_tp_partial=True,
-            total_rows=layernorm_sp.sp_num_tokens(),
+        rows = k3_sp_collective.sp_all_gather(
+            hidden_states, layernorm_sp.sp_num_tokens()
         )
+        with get_forward().scoped(sp_active=False):
+            partial = self._attend(rows, positions, forward_batch, zero_allocator)
+        return k3_sp_collective.sp_reduce_scatter(partial)
 
     def _attend(
         self,
