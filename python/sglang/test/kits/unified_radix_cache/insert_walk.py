@@ -1,10 +1,8 @@
 from array import array
 from types import SimpleNamespace
 
-from sglang.srt.managers.schedule_batch import (
-    FINISH_LENGTH,
-    Req,
-)
+from sglang.srt.managers.req_types import FINISH_LENGTH
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     InsertParams,
@@ -13,9 +11,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.static_kv_storage import acquire_rows
-from sglang.srt.mem_cache.unified_cache.components.base import (
-    ComponentType,
-)
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.kits.unified_radix_cache.fixtures import (
     build_fixture,
@@ -221,8 +217,12 @@ class SegmentLockFuzzFixtures(UnifiedRadixCacheFixtures):
                     cache.evict(
                         EvictParams(
                             num_tokens=rng.randrange(0, 32),
-                            swa_num_tokens=rng.randrange(0, 32),
                             mamba_num=rng.randrange(0, 4) if self.cfg.has_mamba else 0,
+                            window_num_tokens={
+                                cache.window_sub_pool_of_slot(
+                                    ComponentType.SWA
+                                ): rng.randrange(0, 32)
+                            },
                         )
                     )
             except AssertionError:

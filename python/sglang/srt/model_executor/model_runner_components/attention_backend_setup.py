@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import msgspec
 
 from sglang.srt.environ import envs
+from sglang.srt.kernel_plugins.nvidia.binding import configure_megakernel_aux
 from sglang.srt.layers.attention.attention_registry import (
     ATTENTION_BACKENDS,
     attn_backend_wrapper,
@@ -20,7 +21,6 @@ if TYPE_CHECKING:
 
 from sglang.srt.runtime_context import (
     attention_backends,
-    get_disagg,
     get_exec,
     get_memory,
     get_spec,
@@ -37,8 +37,6 @@ class ResolvedAttentionBackendStr(msgspec.Struct, frozen=True, kw_only=True):
 
 class AttentionBackends(msgspec.Struct, frozen=True, kw_only=True):
     attn_backend: AttentionBackend
-    decode_attn_backend: Optional[AttentionBackend]
-    decode_attn_backend_group: list[AttentionBackend]
     prefill_attention_backend_str: str
     decode_attention_backend_str: str
 
@@ -76,6 +74,8 @@ def configure_aux_hidden_state_capture(
                 "set_dspark_layers_to_capture nor set_dflash_layers_to_capture, "
                 "one of which is required for DFLASH/DSPARK."
             )
+    if dflash_use_aux_hidden_state:
+        configure_megakernel_aux(model, dflash_target_layer_ids)
 
 
 def build_attention_backends(*, model_runner: ModelRunner) -> AttentionBackends:
@@ -97,13 +97,9 @@ def build_attention_backends(*, model_runner: ModelRunner) -> AttentionBackends:
         mamba_backend = Mamba2AttnBackend(model_runner)
         return AttentionBackends(
             attn_backend=mamba_backend,
-            decode_attn_backend=None,
-            decode_attn_backend_group=[],
             prefill_attention_backend_str="mamba2",
             decode_attention_backend_str="mamba2",
         )
-
-    server_args = model_runner.server_args
 
     # Already resolved and stamped on the runner before this call.
     resolved = ResolvedAttentionBackendStr(
@@ -114,22 +110,7 @@ def build_attention_backends(*, model_runner: ModelRunner) -> AttentionBackends:
         ),
     )
 
-    if get_disagg().enable_pdmux:
-        attn_backend = _build_resolved_backend(
-            model_runner=model_runner, resolved=resolved, init_new_workspace=True
-        )
-        decode_attn_backend_group = [
-            _build_resolved_backend(
-                model_runner=model_runner,
-                resolved=resolved,
-                init_new_workspace=False,
-            )
-            for _ in range(get_disagg().sm_group_num)
-        ]
-        decode_attn_backend = decode_attn_backend_group[0]
-    elif (
-        get_exec().overlap.enable_two_batch_overlap and not model_runner.is_draft_worker
-    ):
+    if get_exec().overlap.enable_two_batch_overlap and not model_runner.is_draft_worker:
         attn_backend = TboAttnBackend.init_new(
             lambda: _build_resolved_backend(
                 model_runner=model_runner,
@@ -137,14 +118,10 @@ def build_attention_backends(*, model_runner: ModelRunner) -> AttentionBackends:
                 init_new_workspace=False,
             )
         )
-        decode_attn_backend = None
-        decode_attn_backend_group = []
     else:
         attn_backend = _build_resolved_backend(
             model_runner=model_runner, resolved=resolved, init_new_workspace=False
         )
-        decode_attn_backend = None
-        decode_attn_backend_group = []
 
     if (
         model_runner.device == "npu"
@@ -168,8 +145,6 @@ def build_attention_backends(*, model_runner: ModelRunner) -> AttentionBackends:
 
     return AttentionBackends(
         attn_backend=attn_backend,
-        decode_attn_backend=decode_attn_backend,
-        decode_attn_backend_group=decode_attn_backend_group,
         prefill_attention_backend_str=resolved.prefill,
         decode_attention_backend_str=resolved.decode,
     )

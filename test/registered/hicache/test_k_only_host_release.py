@@ -46,7 +46,11 @@ class TestKOnlyHostRelease(CustomTestCase):
             write_back_staging=main_pool.hicache_write_back_staging,
         )
         self.addCleanup(anchor.destroy)
-        host = MHATokenToKOnlyPoolHost(index_pool, anchor, "layer_first")
+        host = MHATokenToKOnlyPoolHost(
+            buffer_info=index_pool.get_device_pool_infos()[0].buffer_info,
+            anchor_host=anchor,
+            layout="layer_first",
+        )
         buffer = host.k_buffer
         self.addCleanup(_cuda_host_unregister, buffer)
         host.destroy()

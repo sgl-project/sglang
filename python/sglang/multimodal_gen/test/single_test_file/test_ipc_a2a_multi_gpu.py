@@ -182,10 +182,10 @@ def _worker() -> int:
                 )
 
     # groups=-1 picks the most groups that divide the heads per rank and whose
-    # calls still fill four waves of 128-row tiles, and still matches; a shape too
+    # calls still fill three waves of 128-row tiles, and still matches; a shape too
     # small to fill them keeps the sequential exchange
     sms = torch.cuda.get_device_properties(rank).multi_processor_count
-    s_auto = 4 * sms * 128 // world  # one head per group fills four waves
+    s_auto = 3 * sms * 128 // world  # one head per group fills three waves
     torch.manual_seed(77)
     full = [
         torch.randn(s_auto * world, 16, 64, dtype=torch.bfloat16, device="cuda")
@@ -398,6 +398,38 @@ class TestIpcA2AMultiGpu(CustomTestCase):
             "--deny-pidfd-getfd",
             PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True",
         )
+
+
+class TestAutoPipelineGroups(CustomTestCase):
+    def test_group_counts_at_known_shapes(self):
+        """148 SMs: MiniMax-H3 at Ulysses 4 runs 7 two-head groups at 1280x704
+        and 1344x768; Wan 1.3B at Ulysses 4 (one head per group) stays sequential."""
+        from unittest import mock
+
+        from sglang.multimodal_gen.runtime.distributed.device_communicators import (
+            ipc_a2a_multi,
+        )
+
+        def groups(rows, heads):
+            plan = ipc_a2a_multi._PipelinePlan(
+                batch=1,
+                s_local=rows // 4,
+                heads=(heads,) * 3,
+                head_dim=128,
+                replicated=(0, 0, 0),
+                replicated_first=True,
+                world=4,
+                groups=-1,
+            )
+            return ipc_a2a_multi._auto_pipeline_groups(plan)
+
+        with (
+            mock.patch.object(ipc_a2a_multi, "_sm_count", return_value=148),
+            mock.patch.object(torch.cuda, "current_device", return_value=0),
+        ):
+            self.assertEqual(groups(33024, 56), 7)
+            self.assertEqual(groups(37120, 56), 7)
+            self.assertEqual(groups(32768, 12), 0)
 
 
 if __name__ == "__main__":
