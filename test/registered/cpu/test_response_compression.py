@@ -55,51 +55,55 @@ def _header(message, name):
 
 class TestResponseCompressionMiddleware(CustomTestCase):
     def test_compresses_zstd_body(self):
-        sent = _drive(
-            b"gzip, zstd",
-            [_start([(b"content-length", str(len(LARGE)).encode())]), _body(LARGE)],
-        )
-        self.assertEqual(len(sent), 2)
-        start, body = sent
-        self.assertEqual(_header(start, b"content-encoding"), b"zstd")
-        self.assertEqual(
-            _header(start, b"content-length"), str(len(body["body"])).encode()
-        )
-        self.assertIn(b"Accept-Encoding", _header(start, b"vary"))
-        self.assertEqual(_header(start, b"content-type"), b"application/json")
-        self.assertLess(len(body["body"]), len(LARGE))
-        self.assertEqual(
-            zstandard.ZstdDecompressor().decompress(
-                body["body"], max_output_size=len(LARGE)
-            ),
-            LARGE,
-        )
-
-    def test_passthrough_unless_zstd_accepted(self):
-        for accept, compressed in (
-            (None, False),
-            (b"gzip, br", False),
-            (b"zstd;q=0", False),
-            (b"zstd;q=0.5", True),
-        ):
+        for accept in (b"gzip, zstd", b"zstd;q=0.5"):
             with self.subTest(accept=accept):
-                start, _ = _drive(accept, [_start(), _body(LARGE)])
+                sent = _drive(
+                    accept,
+                    [
+                        _start([(b"content-length", str(len(LARGE)).encode())]),
+                        _body(LARGE),
+                    ],
+                )
+                self.assertEqual(len(sent), 2)
+                start, body = sent
+                self.assertEqual(_header(start, b"content-encoding"), b"zstd")
                 self.assertEqual(
-                    _header(start, b"content-encoding"), b"zstd" if compressed else None
+                    _header(start, b"content-length"), str(len(body["body"])).encode()
+                )
+                self.assertIn(b"Accept-Encoding", _header(start, b"vary"))
+                self.assertEqual(_header(start, b"content-type"), b"application/json")
+                self.assertLess(len(body["body"]), len(LARGE))
+                self.assertEqual(
+                    zstandard.ZstdDecompressor().decompress(
+                        body["body"], max_output_size=len(LARGE)
+                    ),
+                    LARGE,
                 )
 
-    def test_passthrough_for_small_streamed_or_encoded_body(self):
-        for case, messages in (
-            ("small", [_start(), _body(SMALL)]),
-            ("streamed", [_start(), _body(LARGE, more_body=True), _body(LARGE)]),
-            ("encoded", [_start([(b"content-encoding", b"gzip")]), _body(LARGE)]),
+    def test_passes_other_responses_through_unchanged(self):
+        for case, accept, messages in (
+            ("no accept-encoding", None, [_start(), _body(LARGE)]),
+            ("other encodings", b"gzip, br", [_start(), _body(LARGE)]),
+            ("zstd refused", b"zstd;q=0", [_start(), _body(LARGE)]),
+            ("small", b"zstd", [_start(), _body(SMALL)]),
+            (
+                "streamed",
+                b"zstd",
+                [_start(), _body(LARGE, more_body=True), _body(LARGE)],
+            ),
+            (
+                "encoded",
+                b"zstd",
+                [_start([(b"content-encoding", b"gzip")]), _body(LARGE)],
+            ),
             (
                 "encoded, capitalized",
+                b"zstd",
                 [_start([(b"Content-Encoding", b"gzip")]), _body(LARGE)],
             ),
         ):
             with self.subTest(case=case):
-                self.assertEqual(_drive(b"zstd", messages), messages)
+                self.assertEqual(_drive(accept, messages), messages)
 
 
 if __name__ == "__main__":
