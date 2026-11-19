@@ -110,6 +110,30 @@ class DSATopKBackend(Enum):
         if not envs.SGLANG_DSA_FUSE_TOPK.get() or force_unfused_topk:
             return self.topk_func(logits, lengths, topk, row_starts=row_starts)
 
+        # Ahead of v2 and independent of it: ROCm turns v2 off for DSA by default,
+        # and real_page_table is always built on ROCm (only CUDA drops page_table_1).
+        if (
+            _use_triton_topk(logits, topk)
+            and self.is_sgl_kernel()
+            and topk_transform_method == TopkTransformMethod.PAGED
+            and row_starts is None
+            and batch_idx_list is None
+            and lengths.shape[0]
+            == logits.shape[0]
+            == attn_metadata.real_page_table.shape[0]
+        ):
+            from sglang.kernels.ops.attention.dsa.triton_topk_transform import (
+                topk_transform_paged_triton,
+            )
+
+            return topk_transform_paged_triton(
+                logits,
+                lengths,
+                attn_metadata.real_page_table,
+                attn_metadata.page_size,
+                topk,
+            )
+
         # Decode-shaped PAGED top-k for the SGL backend (plain decode AND spec
         # verify / draft-extend, whose expanded rows match the same shape) routes
         # to the DeepSeek-V4 top-k v2 JIT kernel. It fuses top-k selection and the
@@ -131,18 +155,6 @@ class DSATopKBackend(Enum):
             == logits.shape[0]
             == attn_metadata.real_page_table.shape[0]
         ):
-            if _use_triton_topk(logits, topk):
-                from sglang.kernels.ops.attention.dsa.triton_topk_transform import (
-                    topk_transform_paged_triton,
-                )
-
-                return topk_transform_paged_triton(
-                    logits,
-                    lengths,
-                    attn_metadata.real_page_table,
-                    attn_metadata.page_size,
-                    topk,
-                )
             return _topk_transform_v2_paged(logits, lengths, topk, attn_metadata)
 
         # Extend-shaped RAGGED top-k for the SGL backend routes to the same v2
@@ -341,6 +353,7 @@ def _use_triton_topk(logits: torch.Tensor, topk: int) -> bool:
         and logits.stride(1) == 1
         and logits.shape[0] * logits.stride(0) * 4 < 2**31
         and 0 < topk <= 2048
+        and topk & (topk - 1) == 0  # the selector's output tile is tl.arange(0, topk)
     )
 
 

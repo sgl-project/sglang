@@ -115,6 +115,24 @@ class TestTritonTopkTransform(unittest.TestCase):
         logits[0, positions[:256]] = 100.0
         self._check(logits, torch.tensor([width]))
 
+    def test_clustered_high_scores_stay_on_fast_path(self):
+        """A run of high scores at the start (attention sink) and a high recent
+        window at 400k context must not push rows onto the whole-row fallback."""
+        from sglang.kernels.ops.attention.dsa import triton_topk_transform as m
+
+        rows, width = 8, 400_000
+        g = torch.Generator(device=self.dev).manual_seed(0)
+        logits = torch.randn(rows, width, device=self.dev, generator=g)
+        logits[:, :128] += 6.0
+        logits[:, -4096:] += 2.0
+        lens = torch.full((rows,), width, dtype=torch.int32)
+        ctr, _, _ = m._estimate_and_collect(
+            logits.view(torch.int32), lens.to(self.dev), TOPK
+        )
+        n = ctr[:, 1].cpu()
+        self.assertTrue(bool(((n >= TOPK) & (n <= m._CAND)).all()), n.tolist())
+        self._check(logits, lens)
+
     def test_all_equal_row(self):
         logits = torch.full((3, 100_000), 0.5, device=self.dev)
         self._check(logits, torch.tensor([100_000, 50_000, 3000]))

@@ -2171,7 +2171,7 @@ class Envs:
     SGLANG_DSA_FUSE_TOPK = EnvBool(True)
     # ROCm: decode / MTP-verify PAGED top-k (<= 128 rows) on the Triton/Gluon
     # single-pass selector (kernels/ops/attention/dsa/triton_topk_transform.py)
-    # instead of the top-k v2 kernel. Exact top-k; tie order among equal keys at
+    # instead of top-k v2 or HIP top-k. Exact top-k; tie order among equal keys at
     # the boundary is not deterministic.
     SGLANG_DSA_TOPK_TRITON = EnvBool(False)
     SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC = EnvBool(False)

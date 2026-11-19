@@ -2,10 +2,17 @@
 
 import builtins
 import sys
+import types
+from types import SimpleNamespace
 
 import pytest
+import torch
 
 from sglang.srt.layers.attention.dsa import dsa_topk_backend
+from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
+    DSATopKBackend,
+    TopkTransformMethod,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -27,6 +34,33 @@ def test_disabled_route_does_not_import_optional_kernel(monkeypatch, is_hip, ena
     monkeypatch.setattr(builtins, "__import__", checked_import)
     # An inactive route must not inspect tensor metadata either.
     assert dsa_topk_backend._use_triton_topk(None, 2048) is False
+
+
+def test_enabled_route_does_not_need_topk_v2(monkeypatch):
+    """ROCm turns top-k v2 off for DSA by default; the opt-in selector must
+    still serve decode PAGED rows instead of silently staying on legacy top-k."""
+    monkeypatch.setattr(dsa_topk_backend, "_is_hip", True)
+    monkeypatch.setenv("SGLANG_DSA_TOPK_TRITON", "1")
+    monkeypatch.setenv("SGLANG_OPT_USE_TOPK_V2", "0")
+    sentinel = torch.empty(0)
+    fake = types.ModuleType("triton_topk_transform")
+    fake.MAX_ROWS = 128
+    fake.topk_transform_paged_triton = lambda *args: sentinel
+    monkeypatch.setitem(
+        sys.modules, "sglang.kernels.ops.attention.dsa.triton_topk_transform", fake
+    )
+    out = DSATopKBackend.SGL_KERNEL.topk_transform(
+        logits=torch.zeros(2, 4096),
+        lengths=torch.full((2,), 4096, dtype=torch.int32),
+        topk=2048,
+        topk_transform_method=TopkTransformMethod.PAGED,
+        attn_metadata=SimpleNamespace(
+            real_page_table=torch.zeros(2, 64, dtype=torch.int32),
+            page_size=64,
+            page_table_1=None,
+        ),
+    )
+    assert out is sentinel
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@
 """Single-pass top-k(<= 2048) + page transform for DSA decode / MTP-verify rows
 (ROCm, <= 128 rows): est (Triton) -> collect (Gluon) -> select (Triton).
 
-  est     per row, sample ~8192 logits (64 probes of 128) and bit-search the
+  est     per row, sample ~8192 logits (2048 probes of 4) and bit-search the
           sample key that leaves ~OVER * topk elements above it in the full row
           -> a per-row threshold (rounded down, so it only adds candidates);
           program 0 also builds the chunk prefix.
@@ -32,8 +32,10 @@ _T = 8192  # logits per collect chunk
 _GRID = 2048  # persistent collect programs
 _CAND = 8192  # candidates per row
 _OVER = 2  # candidate target, x topk
-_SMP_CH = 128  # probe length
-_SMP_NCH = 64  # probes per row
+# Short probes: a 128-long probe on a run of high scores (sink, system prompt)
+# fills the whole sample target above ~262k context and forces the fallback.
+_SMP_CH = 4  # probe length
+_SMP_NCH = 2048  # probes per row
 MAX_ROWS = 128
 _CSTR = 64  # int32 gap between rows' counters
 _COLLECT_NW = 4
@@ -296,33 +298,17 @@ def _topk_select(
         tl.store(out_ptr + r * TOPK + pos, slot, mask=take)
 
 
-def topk_transform_paged_triton(
-    logits: torch.Tensor,
-    lengths: torch.Tensor,
-    page_table: torch.Tensor,
-    page_size: int,
-    topk: int,
-) -> torch.Tensor:
-    """Top-``topk`` of ``logits[row, :lengths[row]]`` mapped to physical KV slots
-    ``page_table[row, p // page_size] * page_size + p % page_size``; ``-1`` padded.
-
-    ``logits`` fp32 ``[rows, >= max(lengths)]`` with unit column stride,
-    ``page_table`` int32 ``[rows, pages]``.  ``rows <= MAX_ROWS`` and
-    ``rows * logits.stride(0) * 4 < 2**31`` (32-bit buffer offsets).
-    """
-    rows = logits.shape[0]
-    dev = logits.device
-    assert 0 < rows <= MAX_ROWS, rows
-    assert page_size & (page_size - 1) == 0, page_size
-    assert logits.dtype == torch.float32 and logits.stride(1) == 1
-    out = torch.empty((rows, topk), dtype=torch.int32, device=dev)
+def _estimate_and_collect(li: torch.Tensor, lengths: torch.Tensor, topk: int):
+    """Runs est + collect on int32-viewed logits; ``ctr[:, 1]`` is each row's
+    candidate count (the fast path needs ``min(L, topk) <= count <= _CAND``)."""
+    rows = li.shape[0]
+    dev = li.device
+    sl = li.stride(0)
+    assert rows * sl * 4 < 2**31 and rows * _CAND * 4 < 2**31
     ctr = torch.empty((rows, _CSTR), dtype=torch.int32, device=dev)
     pref = torch.empty((rows + 1,), dtype=torch.int32, device=dev)
     ckey = torch.empty((rows, _CAND), dtype=torch.int32, device=dev)
     cidx = torch.empty((rows, _CAND), dtype=torch.int32, device=dev)
-    li = logits.view(torch.int32)
-    sl = li.stride(0)
-    assert rows * sl * 4 < 2**31 and rows * _CAND * 4 < 2**31
     _topk_est[(rows,)](
         li,
         lengths,
@@ -356,6 +342,31 @@ def topk_transform_paged_triton(
         NW=_COLLECT_NW,
         num_warps=_COLLECT_NW,
     )
+    return ctr, ckey, cidx
+
+
+def topk_transform_paged_triton(
+    logits: torch.Tensor,
+    lengths: torch.Tensor,
+    page_table: torch.Tensor,
+    page_size: int,
+    topk: int,
+) -> torch.Tensor:
+    """Top-``topk`` of ``logits[row, :lengths[row]]`` mapped to physical KV slots
+    ``page_table[row, p // page_size] * page_size + p % page_size``; ``-1`` padded.
+
+    ``logits`` fp32 ``[rows, >= max(lengths)]`` with unit column stride,
+    ``page_table`` int32 ``[rows, pages]``.  ``rows <= MAX_ROWS`` and
+    ``rows * logits.stride(0) * 4 < 2**31`` (32-bit buffer offsets).
+    """
+    rows = logits.shape[0]
+    assert 0 < rows <= MAX_ROWS, rows
+    assert page_size & (page_size - 1) == 0, page_size
+    assert logits.dtype == torch.float32 and logits.stride(1) == 1
+    li = logits.view(torch.int32)
+    sl = li.stride(0)
+    ctr, ckey, cidx = _estimate_and_collect(li, lengths, topk)
+    out = torch.empty((rows, topk), dtype=torch.int32, device=logits.device)
     _topk_select[(rows,)](
         ckey,
         cidx,
