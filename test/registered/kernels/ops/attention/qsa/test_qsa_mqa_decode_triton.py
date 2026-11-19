@@ -16,7 +16,7 @@ from sglang.srt.layers.attention.qsa.mqa import qsa_mqa_decode, torch_qsa_mqa_de
 from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 
-register_amd_ci(est_time=60, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(est_time=60, stage="base-a-jit-kernel-unit", runner_config="amd")
 
 needs_gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
