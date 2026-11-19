@@ -14,6 +14,7 @@ import tempfile
 import traceback
 import unittest
 from array import array
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
@@ -147,6 +148,9 @@ def _draft_worker(runner):
 
     worker = EagleDraftWorker.__new__(EagleDraftWorker)
     worker.draft_runner = runner
+    # The split condition reads the target's prefill graphs; this runner
+    # captured none, so the target does not bound the split.
+    worker.target_worker = SimpleNamespace(model_runner=runner)
     worker.speculative_algorithm = SpeculativeAlgorithm.EAGLE
     worker.topk = 1
     worker.seed_dsa_topk_from_draft_extend = False
