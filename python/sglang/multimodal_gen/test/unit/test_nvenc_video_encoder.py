@@ -18,9 +18,7 @@ from sglang.test.test_utils import CustomTestCase
 class TestNvencAvailability(CustomTestCase):
     def test_h264_encoder_capability_controls_nvenc(self):
         """A GPU without an H.264 encoder must fall back even when CUDA is available."""
-        from sglang.multimodal_gen.runtime.entrypoints import (
-            nvenc_video_encoder as nvenc,
-        )
+        from sglang.multimodal_gen.runtime.utils import nvenc_video_encoder as nvenc
 
         native = types.ModuleType("PyNvVideoCodec")
         native.GetEncoderCaps = mock.Mock(return_value={"num_encoder_engines": 0})
@@ -49,7 +47,7 @@ class TestNvencAvailability(CustomTestCase):
 class TestNvencVideoEncoder(CustomTestCase):
     def setUp(self):
         super().setUp()
-        from sglang.multimodal_gen.runtime.entrypoints.nvenc_video_encoder import (
+        from sglang.multimodal_gen.runtime.utils.nvenc_video_encoder import (
             supports_nvenc,
         )
 
@@ -59,9 +57,7 @@ class TestNvencVideoEncoder(CustomTestCase):
     def test_warmup_cache_hits_by_resolution(self):
         import av
 
-        from sglang.multimodal_gen.runtime.entrypoints import (
-            nvenc_video_encoder as nvenc,
-        )
+        from sglang.multimodal_gen.runtime.utils import nvenc_video_encoder as nvenc
 
         with nvenc._cache_lock:
             nvenc._idle_sessions.clear()
@@ -115,7 +111,7 @@ class TestNvencVideoEncoder(CustomTestCase):
         """Frame submission returns before the NVENC worker finishes."""
         import av
 
-        from sglang.multimodal_gen.runtime.entrypoints.nvenc_video_encoder import (
+        from sglang.multimodal_gen.runtime.utils.nvenc_video_encoder import (
             NvencVideoEncoder,
         )
 
@@ -180,7 +176,7 @@ class TestNvencVideoEncoder(CustomTestCase):
         import numpy as np
 
         from sglang.multimodal_gen.runtime.entrypoints import utils
-        from sglang.multimodal_gen.runtime.entrypoints.nvenc_video_encoder import (
+        from sglang.multimodal_gen.runtime.utils.nvenc_video_encoder import (
             NvencVideoEncoder,
         )
 

@@ -118,7 +118,7 @@ class EncodeWhileDecoding:
             x264_preset=self._batch.x264_preset,
         )
         if self._use_nvenc:
-            from sglang.multimodal_gen.runtime.entrypoints.nvenc_video_encoder import (
+            from sglang.multimodal_gen.runtime.utils.nvenc_video_encoder import (
                 NvencVideoEncoder,
             )
 

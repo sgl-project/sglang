@@ -26,6 +26,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.kernels import get_kernel
+from sglang.multimodal_gen import envs as diffusion_envs
 from sglang.multimodal_gen.configs.sample.sampling_params import quality_allows
 from sglang.multimodal_gen.configs.task_type import DataType
 from sglang.multimodal_gen.runtime.cache.conditioning import _inference_cache
@@ -2605,9 +2606,9 @@ class Cosmos3DecodingStage(PipelineStage):
             return None
         has_audio = self.sound_tokenizer is not None and batch.audio_latents is not None
         if has_audio:
-            if not envs.SGLANG_USE_NVENC.get():
+            if not diffusion_envs.SGLANG_USE_NVENC:
                 return None
-            from sglang.multimodal_gen.runtime.entrypoints.nvenc_video_encoder import (
+            from sglang.multimodal_gen.runtime.utils.nvenc_video_encoder import (
                 supports_nvenc,
             )
 
@@ -2618,7 +2619,7 @@ class Cosmos3DecodingStage(PipelineStage):
             batch,
             # Keep the VAE's returned frames intact if encoding needs to fall back.
             finish_frames=lambda frames: frames.mul(0.5).add_(0.5).clamp_(0, 1).float(),
-            use_nvenc=envs.SGLANG_USE_NVENC.get(),
+            use_nvenc=diffusion_envs.SGLANG_USE_NVENC,
         )
 
     def _decode_audio(self, batch: Req, device: torch.device):

@@ -34,7 +34,7 @@ from sglang.multimodal_gen.configs.sample.cosmos3 import Cosmos3SamplingParams
 from sglang.multimodal_gen.configs.sample.cosmos_dreams import (
     CosmosDreamsSamplingParams,
 )
-from sglang.multimodal_gen.configs.sample.sampling_params import DataType
+from sglang.multimodal_gen.configs.task_type import DataType
 from sglang.multimodal_gen.registry import (
     _PIPELINE_REGISTRY,
     _discover_and_register_pipelines,
@@ -80,7 +80,6 @@ from sglang.multimodal_gen.runtime.warmup_request_builder import (
     _lighter_valid_num_frames,
 )
 from sglang.multimodal_gen.test.unit.host_sync_guard import RecordOps
-from sglang.srt.environ import envs
 from sglang.test.test_utils import CustomTestCase
 
 # ``transformer/config.json["cosmos3_nano_sim_bimanual"]`` of Cosmos3-Nano-Sim-Bimanual
@@ -1227,14 +1226,14 @@ class TestCosmosDreamsEncodedDecode(CustomTestCase):
         )
         batch = SimpleNamespace(fps=24, num_frames=1, output_compression=None)
         with (
-            envs.SGLANG_USE_NVENC.override(True),
+            mock.patch.dict("os.environ", {"SGLANG_USE_NVENC": "1"}),
             mock.patch(
                 "sglang.multimodal_gen.runtime.pipelines_core.stages."
                 "model_specific_stages.cosmos3_simulation.dreams.streamed_video_output_path",
                 return_value="/tmp/bimanual.mp4",
             ),
             mock.patch(
-                "sglang.multimodal_gen.runtime.entrypoints.nvenc_video_encoder."
+                "sglang.multimodal_gen.runtime.utils.nvenc_video_encoder."
                 "supports_nvenc",
                 return_value=True,
             ),
@@ -1243,14 +1242,14 @@ class TestCosmosDreamsEncodedDecode(CustomTestCase):
                 self.assertIsNotNone(queue.encoder)
                 self.assertTrue(queue.encoder._use_nvenc)
         with (
-            envs.SGLANG_USE_NVENC.override(True),
+            mock.patch.dict("os.environ", {"SGLANG_USE_NVENC": "1"}),
             mock.patch(
                 "sglang.multimodal_gen.runtime.pipelines_core.stages."
                 "model_specific_stages.cosmos3_simulation.dreams.streamed_video_output_path",
                 return_value="/tmp/bimanual.mp4",
             ),
             mock.patch(
-                "sglang.multimodal_gen.runtime.entrypoints.nvenc_video_encoder."
+                "sglang.multimodal_gen.runtime.utils.nvenc_video_encoder."
                 "supports_nvenc",
                 return_value=False,
             ),

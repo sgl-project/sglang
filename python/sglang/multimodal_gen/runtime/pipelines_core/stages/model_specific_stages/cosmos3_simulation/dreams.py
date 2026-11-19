@@ -21,6 +21,7 @@ import PIL.Image
 import torch
 import torch.nn.functional as F
 
+from sglang.multimodal_gen import envs as diffusion_envs
 from sglang.multimodal_gen.configs.models.dits.cosmos_dreams import (
     HISTORY_MODE_FULL,
     TEXT_TOKENS_TRAINING_MAX,
@@ -78,7 +79,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.vision import load_image
-from sglang.srt.environ import envs
 
 logger = init_logger(__name__)
 
@@ -1436,8 +1436,8 @@ class CosmosDreamsRolloutStage(PipelineStage):
         ):
             return None
         encoder = None
-        if batch is not None and envs.SGLANG_USE_NVENC.get():
-            from sglang.multimodal_gen.runtime.entrypoints.nvenc_video_encoder import (
+        if batch is not None and diffusion_envs.SGLANG_USE_NVENC:
+            from sglang.multimodal_gen.runtime.utils.nvenc_video_encoder import (
                 supports_nvenc,
             )
 
