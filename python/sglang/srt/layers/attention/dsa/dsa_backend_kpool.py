@@ -46,10 +46,17 @@ class DeepseekSparseAttnBackendKPoolMixin:
     ) -> None:
         if topk_indices is None or self.dsa_index_kpool <= 1:
             return
+        bf16_kv = self.kv_cache_dtype == torch.bfloat16
         supported = kpool_tail_backends(
             phase,
-            bf16_kv=self.kv_cache_dtype == torch.bfloat16,
+            bf16_kv=bf16_kv,
             device_capability=self.device_capability,
+            raw_fp8_nope=(
+                not bf16_kv
+                and not self.dsa_kv_cache_store_fp8
+                and self.kv_lora_rank == 512
+                and self.qk_rope_head_dim == 0
+            ),
         )
         if dsa_impl in supported:
             return

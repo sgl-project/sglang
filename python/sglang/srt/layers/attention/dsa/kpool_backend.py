@@ -11,17 +11,26 @@ def uses_raw_fp8_dsa_kv_layout(backend: Optional[str]) -> bool:
 
 
 def kpool_tail_backends(
-    phase: str, *, bf16_kv: bool, device_capability: tuple[int, int]
+    phase: str,
+    *,
+    bf16_kv: bool,
+    device_capability: tuple[int, int],
+    raw_fp8_nope: bool = False,
 ) -> tuple[str, ...]:
     """Return the backends that read a pooled tail on this KV dtype and GPU.
 
     FA3's MLA query-value input requires SM90. Q8 prefill can read the tail
-    columns as ragged ids on SM90 with BF16 KV. TRT-LLM uses the architectures
-    that FlashInfer builds for its MLA runner.
+    columns as ragged ids on SM90 over BF16 KV or a raw 512-dim NoPE FP8 pool
+    paired with TileLang decode. TRT-LLM uses the architectures that FlashInfer
+    builds for its MLA runner.
     """
     if device_capability in _TRTLLM_MLA_CAPABILITIES:
         return ("tilelang", "trtllm")
-    if not bf16_kv or device_capability != (9, 0):
+    if device_capability != (9, 0):
+        return ("tilelang",)
+    if not bf16_kv:
+        if phase == "prefill" and raw_fp8_nope:
+            return ("tilelang", "flashmla_sparse_q8")
         return ("tilelang",)
     if phase == "prefill":
         return ("tilelang", "fa3", "flashmla_sparse_q8")
