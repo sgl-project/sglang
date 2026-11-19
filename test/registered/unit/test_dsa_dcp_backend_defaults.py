@@ -9,6 +9,7 @@ from sglang.srt.arg_groups.model_overrides.deepseek_v2 import (
     _dsa_dcp_overrides,
 )
 from sglang.srt.arg_groups.overrides import _check_dsa_backend_constraints
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import override_platform
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -40,7 +41,7 @@ def _backends(overrides):
 
 _GLM_CONFIG = SimpleNamespace(architectures=["GlmMoeDsaForCausalLM"], index_topk=2048)
 _SPLIT_INDEX_K_FIELDS = ("dsa_prefill_backend", "dsa_decode_backend", "kv_cache_dtype")
-_SPLIT_INDEX_K_MAX_CONTEXT_LEN = 1047552
+_SPLIT_INDEX_K_MAX_CONTEXT_LEN = 1048064  # at the dcp_size 4 of _cfg
 
 
 def _glm_overrides(*, is_sm90=True, **fields):
@@ -51,6 +52,9 @@ def _glm_overrides(*, is_sm90=True, **fields):
         enable_prefill_cp=False,
         kv_cache_dtype="auto",
         context_length=None,
+        dsa_topk_backend="sgl-kernel",
+        speculative_algorithm=None,
+        speculative_dsa_topk_backend="sgl-kernel",
     )
     args.update(fields)
     with override_platform(is_npu=False, is_xpu=False, is_hip=False, is_sm90=is_sm90):
@@ -139,8 +143,27 @@ class TestGlmSplitIndexKDcpStartup(CustomTestCase):
                 with self.assertRaisesRegex(ValueError, field.replace("_", "-")):
                     _glm_overrides(**{field: value})
 
+    def test_settings_the_sharded_top_k_cannot_serve_are_rejected(self):
+        """The ranks merge local top-k through the fused sgl-kernel v2 path and
+        keep rank-local slots, so another backend or a rank-0 broadcast would
+        attend the wrong KV rows."""
+        for fields in (
+            {"dsa_topk_backend": "flashinfer"},
+            {"speculative_algorithm": "NEXTN", "speculative_dsa_topk_backend": "torch"},
+        ):
+            with self.subTest(**fields):
+                with self.assertRaisesRegex(ValueError, "fused sgl-kernel v2"):
+                    _glm_overrides(**fields)
+        _glm_overrides(speculative_dsa_topk_backend="torch")
+        with envs.SGLANG_DSA_FUSE_TOPK.override(False):
+            with self.assertRaisesRegex(ValueError, "SGLANG_DSA_FUSE_TOPK"):
+                _glm_overrides()
+        with envs.SGLANG_DSA_TOPK_BROADCAST.override(True):
+            with self.assertRaisesRegex(ValueError, "SGLANG_DSA_TOPK_BROADCAST"):
+                _glm_overrides()
+
     def test_explicit_context_length_over_the_top_k_row_limit_is_rejected(self):
-        with self.assertRaisesRegex(ValueError, "--context-length 1047552"):
+        with self.assertRaisesRegex(ValueError, "--context-length 1048064"):
             _glm_overrides(context_length=_SPLIT_INDEX_K_MAX_CONTEXT_LEN + 1)
         _glm_overrides(context_length=_SPLIT_INDEX_K_MAX_CONTEXT_LEN)
 

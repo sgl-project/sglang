@@ -1,3 +1,4 @@
+import sys
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -7,10 +8,10 @@ import torch
 from transformers import LlamaConfig
 
 from sglang.srt.configs.model_config import (
-    GLM_SPLIT_INDEX_K_DCP_MAX_CONTEXT_LEN,
     ModelConfig,
     dsa_draft_shards_under_dcp,
     glm_dsa_shards_index_k,
+    glm_split_index_k_dcp_max_context_len,
 )
 from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
 from sglang.srt.model_executor.forward_mode import ForwardMode
@@ -88,7 +89,7 @@ def test_unset_context_length_is_capped_only_under_split_index_k():
                     ServerArgs(model_path=checkpoint, **server_args)
                 ).context_len
 
-        assert context_len(dcp_size=4) == GLM_SPLIT_INDEX_K_DCP_MAX_CONTEXT_LEN
+        assert context_len(dcp_size=4) == glm_split_index_k_dcp_max_context_len(4)
         assert context_len() == model_context_len
         assert context_len(is_sm90=False, dcp_size=4) == model_context_len
         assert context_len(dcp_size=4, context_length=4096) == 4096
@@ -122,3 +123,7 @@ def test_forward_mla_merges_exactly_the_extends_that_return_dcp_partials(mode):
             layer, SimpleNamespace(forward_mode=mode)
         )
     assert merged == backend._attends_local_kv_shard(mode)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

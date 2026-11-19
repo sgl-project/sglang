@@ -73,6 +73,7 @@ from sglang.srt.layers.attention.dsa.dsa_dcp import (
 )
 from sglang.srt.layers.attention.dsa.dsa_dcp_sharded import (
     dcp_gather_request_rows,
+    dcp_localize_compact,
     init_dcp_candidate_all_gather,
     init_dcp_fused_topk,
     init_dcp_topk_merge,
@@ -1374,7 +1375,11 @@ class DeepseekSparseAttnBackend(
         physical_indices = page_table.index_select(
             0, topk_indices.masked_fill(padding, 0).reshape(-1).long()
         ).view_as(topk_indices)
-        return physical_indices.masked_fill(padding, -1)
+        physical_indices = physical_indices.masked_fill(padding, -1)
+        if self.dsa_shards_index_k:
+            # Draft decode attends this rank's KV shard, so it takes local slots.
+            return dcp_localize_compact(physical_indices)[0]
+        return physical_indices
 
     def get_device_int32_arange(self, length: int) -> torch.Tensor:
         if length > len(self._arange_buf):

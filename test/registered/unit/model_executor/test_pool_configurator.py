@@ -18,11 +18,14 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_server_args,
     get_spec,
+    override_platform,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+
+_POOL_CONFIGURATOR = "sglang.srt.model_executor.pool_configurator"
 
 
 @contextlib.contextmanager
@@ -1060,6 +1063,41 @@ class TestEagleConfigurator(CustomTestCase):
         self.assertLessEqual(
             config.max_total_num_tokens * actual_bytes_per_token,
             available,
+        )
+
+    @patch(
+        "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
+        return_value=576,
+    )
+    def test_dsa_draft_sharded_under_dcp_is_charged_one_rank_of_rows(
+        self,
+        _mock_calculate_mla_kv_cache_dim,
+    ):
+        """A draft that shards its KV like the DCP target allocates per-rank
+        rows, so charging it dcp_size times would shrink the token pool."""
+        num_layers = 78
+        indexer_bytes_per_token = 132
+
+        mr = _make_model_runner(self, num_layers=num_layers, use_mla_backend=True)
+        _configure_dsa_model(mr)
+        mr.spec_algorithm.is_eagle.return_value = True
+        mr.spec_algorithm.is_none.return_value = False
+        mr.spec_aux_config.eagle_draft_num_layers = 1
+
+        with (
+            mock_cpu_env(kv_size=1, tp_size=4),
+            get_parallel().override(attn_dcp_size=4),
+            override_platform(is_sm90=True),
+            patch(f"{_POOL_CONFIGURATOR}.dsa_shards_index_k", return_value=True),
+        ):
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+
+        self.assertEqual(
+            cfg._cell_size, (576 + indexer_bytes_per_token) * (num_layers + 1)
         )
 
     @patch(

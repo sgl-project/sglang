@@ -10,6 +10,7 @@ from sglang.srt.arg_groups.model_override_base import (
     resolving_view,
     use_mla_backend,
 )
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
 
 logger = logging.getLogger(__name__)
@@ -42,16 +43,32 @@ def _dsa_dcp_overrides(cfg: Any) -> dict:
 
 
 def _glm_split_index_k_dcp_overrides(cfg: Any) -> dict:
-    from sglang.srt.configs.model_config import GLM_SPLIT_INDEX_K_DCP_MAX_CONTEXT_LEN
+    from sglang.srt.configs.model_config import glm_split_index_k_dcp_max_context_len
 
-    if (
-        cfg.context_length is not None
-        and cfg.context_length > GLM_SPLIT_INDEX_K_DCP_MAX_CONTEXT_LEN
-    ):
+    max_context_len = glm_split_index_k_dcp_max_context_len(cfg.dcp_size)
+    if cfg.context_length is not None and cfg.context_length > max_context_len:
         raise ValueError(
             "GLM-5 DSA DCP on SM90 supports --context-length "
-            f"{GLM_SPLIT_INDEX_K_DCP_MAX_CONTEXT_LEN} or less; "
+            f"{max_context_len} or less at --dcp-size {cfg.dcp_size}; "
             f"got {cfg.context_length}."
+        )
+    topk_backends = [cfg.dsa_topk_backend]
+    if cfg.speculative_algorithm is not None:
+        topk_backends.append(cfg.speculative_dsa_topk_backend)
+    if (
+        any(backend != "sgl-kernel" for backend in topk_backends)
+        or not envs.SGLANG_OPT_USE_TOPK_V2.get()
+        or not envs.SGLANG_DSA_FUSE_TOPK.get()
+    ):
+        raise ValueError(
+            "GLM-5 DSA DCP on SM90 needs the fused sgl-kernel v2 DSA top-k "
+            "(--dsa-topk-backend and --speculative-dsa-topk-backend sgl-kernel, "
+            "SGLANG_OPT_USE_TOPK_V2 and SGLANG_DSA_FUSE_TOPK on)."
+        )
+    if envs.SGLANG_DSA_TOPK_BROADCAST.get():
+        # The sharded indexer returns only this rank's local KV slots.
+        raise ValueError(
+            "GLM-5 DSA DCP on SM90 does not support SGLANG_DSA_TOPK_BROADCAST."
         )
     if cfg.dsa_prefill_backend not in (None, "flashmla_sparse_q8", "flashmla_kv"):
         raise ValueError(

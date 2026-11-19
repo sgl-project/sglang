@@ -385,8 +385,17 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         num_layers=draft_num_layers,
                         allocate_all_layers=True,
                     )
-                    draft_kv_size *= dcp_size
-                    draft_indexer_size *= dcp_size
+                    from sglang.srt.mem_cache.kv_cache_configurator import (
+                        draft_loc_space_scale as draft_dcp_loc_space_scale,
+                    )
+
+                    draft_dcp_scale = draft_dcp_loc_space_scale(
+                        hf_config=kvc.model_config.hf_config,
+                        use_mla_backend=kvc.use_mla_backend,
+                        dcp_size=dcp_size,
+                    )
+                    draft_kv_size *= draft_dcp_scale
+                    draft_indexer_size *= draft_dcp_scale
                     self._cell_size += draft_kv_size + draft_indexer_size
                 else:
                     # Under DCP a non-DSA draft pool spans the allocator's widened

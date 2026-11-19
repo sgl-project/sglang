@@ -135,9 +135,7 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
                 bs + 1, dtype=torch.int32, device=self.device
             )
             if self.physical_page_size > 1:
-                real_cols = (
-                    max_len + self.physical_page_size - 1
-                ) // self.physical_page_size
+                real_cols = (max_len + self.real_page_span - 1) // self.real_page_span
                 real_page_table = torch.empty(
                     (bs, real_cols), dtype=torch.int32, device=self.device
                 )
@@ -268,8 +266,8 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
             )
             if self.physical_page_size > 1:
                 real_cols = (
-                    max_seqlen_k + self.physical_page_size - 1
-                ) // self.physical_page_size
+                    max_seqlen_k + self.real_page_span - 1
+                ) // self.real_page_span
                 real_page_table = torch.empty(
                     (seqlens_expanded_size, real_cols),
                     dtype=torch.int32,

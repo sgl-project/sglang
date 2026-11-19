@@ -222,8 +222,10 @@ def is_deepseek_dsa(config) -> bool:
     ) or is_kimi_k31(config)
 
 
-# The top-k merge takes rows of at most 2^20 scores, minus 1024 for headroom.
-GLM_SPLIT_INDEX_K_DCP_MAX_CONTEXT_LEN = (1 << 20) - 1024
+def glm_split_index_k_dcp_max_context_len(dcp_size: int) -> int:
+    # The top-k merge takes rows of at most 2^20 scores. A row spans the request
+    # table, which over-allocates under two allocator pages of 64 * dcp_size tokens.
+    return (1 << 20) - 2 * 64 * dcp_size
 
 
 def glm_dsa_shards_index_k(config, dcp_size: int) -> bool:
@@ -1492,7 +1494,8 @@ class ModelConfig:
                 self.context_len = min(derived_context_len, 8192)
             elif glm_dsa_shards_index_k(self.hf_config, self.dcp_size):
                 self.context_len = min(
-                    derived_context_len, GLM_SPLIT_INDEX_K_DCP_MAX_CONTEXT_LEN
+                    derived_context_len,
+                    glm_split_index_k_dcp_max_context_len(self.dcp_size),
                 )
             else:
                 self.context_len = derived_context_len
