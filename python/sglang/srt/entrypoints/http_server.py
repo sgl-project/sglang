@@ -72,7 +72,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 from fastapi.routing import APIRoute
-from pydantic import ValidationError
+from pydantic import SkipValidation, ValidationError
 from uvicorn.supervisors.multiprocess import Multiprocess
 
 from sglang.srt.configs.model_config import load_joint_head_config, load_pointer_head
@@ -135,6 +135,7 @@ from sglang.srt.entrypoints.server_utils import (
 from sglang.srt.entrypoints.sidecar import rust_server_sidecar
 from sglang.srt.entrypoints.systemone.protocol import (
     NemotronDecisionRequest,
+    NemotronDecisionsRequest,
     SystemOneRequest,
 )
 from sglang.srt.entrypoints.systemone.serving import SystemOneServing
@@ -171,6 +172,7 @@ from sglang.srt.managers.io_struct import (
     SendWeightsToRemoteInstanceReqInput,
     SeparateReasoningReqInput,
     SetInternalStateReq,
+    ShutdownReq,
     SlowDownReqInput,
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
@@ -191,6 +193,7 @@ from sglang.srt.managers.tokenizer_manager import (
     ServerStatus,
     TokenizerManager,
     get_tokenizer_worker_class,
+    wait_for_schedulers_to_exit,
 )
 from sglang.srt.observability.func_timer import enable_func_timer
 from sglang.srt.observability.http_request_metrics import (
@@ -317,6 +320,7 @@ async def lifespan(fast_api_app: FastAPI):
     else:
         # Initialize multi-tokenizer support for worker processes
         server_args = await init_multi_tokenizer()
+        _set_uvicorn_worker_stop_hook(_global_state.tokenizer_manager)
         worker_id = os.getpid()
         warmup_thread_kwargs = _multi_tokenizer_warmup_kwargs(server_args, worker_id)
         thread_label = f"MultiTokenizer-{worker_id}"
@@ -1754,18 +1758,18 @@ async def parse_function_call_request(
             chat_encoding_spec=chat.chat_encoding_spec,
             adapter=chat.encoding_adapter,
         )
+        if text_parser is None:
+            # 1) Initialize the parser based on the request body
+            parser = FunctionCallParser(
+                tools=obj.tools,
+                tool_call_parser=obj.tool_call_parser,
+                tokenizer=get_global_state().tokenizer_manager.tokenizer,
+            )
     except ValueError as error:
         raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=str(error))
     if text_parser is not None:
         normal_text, calls = text_parser.parse_function_call_text(obj.text, obj.tools)
     else:
-        # 1) Initialize the parser based on the request body
-        parser = FunctionCallParser(
-            tools=obj.tools,
-            tool_call_parser=obj.tool_call_parser,
-            tokenizer=get_global_state().tokenizer_manager.tokenizer,
-        )
-
         # 2) Call the non-stream parsing method (non-stream)
         normal_text, calls = parser.parse_non_stream(obj.text)
 
@@ -2065,10 +2069,18 @@ async def v1_score_request(request: ScoringRequest, raw_request: Request):
 
 
 @app.post("/v1/decisions", dependencies=[Depends(validate_json_request)])
-async def v1_decisions_request(request: DecisionRequest, raw_request: Request):
+async def v1_decisions_request(
+    request: SkipValidation[DecisionRequest], raw_request: Request
+):
     """Answer typed choice, score, and yes or no questions about an input by scoring single-token answer labels through the scoring API, without generation."""
-    return await raw_request.app.state.openai_serving_decisions.handle_request(
-        request, raw_request
+    serving = raw_request.app.state.openai_serving_decisions
+    request_type = (
+        DecisionRequest
+        if serving.question_encoder is None
+        else NemotronDecisionsRequest
+    )
+    return await serving.handle_request(
+        _validate_decision_body(request, request_type), raw_request
     )
 
 
@@ -2186,18 +2198,33 @@ async def anthropic_v1_count_tokens(
     )
 
 
+def _validate_decision_body(body, request_type):
+    # Choose the checkpoint schema before validation, without an OpenAPI union.
+    try:
+        return request_type.model_validate(body)
+    except ValidationError as error:
+        raise RequestValidationError(
+            errors=[
+                {**item, "loc": ("body", *item["loc"])}
+                for item in error.errors(include_url=False)
+            ]
+        ) from error
+
+
 ## System One compatible decision API
 @app.post("/v1/systemone", dependencies=[Depends(validate_json_request)])
 async def systemone_decisions(
-    request: Annotated[
-        Union[SystemOneRequest, NemotronDecisionRequest],
-        Body(union_mode="left_to_right"),
-    ],
-    raw_request: Request,
+    request: SkipValidation[SystemOneRequest], raw_request: Request
 ):
     """System One compatible decisions, answered by candidate scoring without generation."""
-    return await raw_request.app.state.systemone_serving.handle_request(
-        request, raw_request
+    serving = raw_request.app.state.systemone_serving
+    request_type = (
+        SystemOneRequest
+        if serving.question_encoder is None
+        else NemotronDecisionRequest
+    )
+    return await serving.handle_request(
+        _validate_decision_body(request, request_type), raw_request
     )
 
 
@@ -2706,6 +2733,33 @@ def _run_uvicorn_workers(
     supervisor.run()
 
 
+def _set_uvicorn_worker_stop_hook(tokenizer_manager: TokenizerManager) -> None:
+    handler = signal.getsignal(signal.SIGTERM)
+    if inspect.ismethod(handler) and isinstance(handler.__self__, uvicorn.Server):
+        server = handler.__self__
+        tokenizer_manager.set_server_stop_hook(
+            lambda: setattr(server, "should_exit", True)
+        )
+    else:
+        logger.warning(
+            "SIGTERM handler %r is not a uvicorn.Server method; this tokenizer "
+            "worker will exit on SIGTERM without the lifespan shutdown.",
+            handler,
+        )
+
+
+def _shutdown_schedulers_after_http_workers(
+    *,
+    router: MultiTokenizerRouter,
+    subprocess_watchdog: Optional[SubprocessWatchdog],
+) -> None:
+    if subprocess_watchdog is not None:
+        subprocess_watchdog.stop()
+    router.dispatch_to_scheduler(ShutdownReq())
+    wait_for_schedulers_to_exit()
+    kill_process_tree(os.getpid(), include_parent=False, wait_timeout=60)
+
+
 class _ReusePortMultiprocess(_SigquitForwardingMultiprocess):
     """Give each uvicorn worker a private SO_REUSEPORT listener.
 
@@ -3193,6 +3247,9 @@ def _setup_and_run_http_server(
                     _run_uvicorn_workers(
                         app_path, reserved_socket=reserved_socket, **uvicorn_options
                     )
+            _shutdown_schedulers_after_http_workers(
+                router=tokenizer_manager, subprocess_watchdog=subprocess_watchdog
+            )
     finally:
         if get_serving().tokenizer_worker_num > 1:
             if multi_tokenizer_args_shm is not None:

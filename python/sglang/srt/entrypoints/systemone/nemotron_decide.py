@@ -10,9 +10,17 @@ import re
 from tokenizers import Tokenizer
 
 from sglang.srt.configs.nemotron_decision import is_nemotron_decision
+from sglang.srt.entrypoints.openai.protocol import (
+    DecisionChoiceQuestion,
+    DecisionScoreQuestion,
+)
+from sglang.srt.entrypoints.systemone.protocol import NemotronDecisionRequest
 
 
 class NemotronDecideEncoder:
+    # Version 1 uses the generic /v1/decisions prompt, not the checkpoint template.
+    prompt_format_version = 2
+
     def __init__(self, *, config, metadata, tokenizer, max_prompt_tokens):
         self.tokenizer = tokenizer
         self.metadata = metadata
@@ -136,12 +144,51 @@ class NemotronDecideEncoder:
         # The API's boolean view is yes/no; the trained head is false/true.
         return ids, label_ids[::-1] if kind == "noul" else label_ids, []
 
-    def calibrate(self, kind, probabilities, logprobs):
-        temperature = self.metadata.get("temperature", {}).get(kind, 1.0)
-        if temperature == 1.0:
+    def encode_decisions(self, request, chat_template_kwargs):
+        questions = {}
+        for question in request.questions:
+            if isinstance(question, DecisionChoiceQuestion):
+                kind = "choice"
+                criteria = {
+                    option.name: option.description for option in question.options
+                }
+            elif isinstance(question, DecisionScoreQuestion):
+                kind, criteria = "score", question.levels
+            else:
+                kind = "noul"
+                criteria = {
+                    {"yes": "true", "no": "false"}[name]: value
+                    for name, value in question.model_dump(
+                        include={"yes", "no"}, exclude_unset=True
+                    ).items()
+                }
+            questions[question.id] = dict(
+                type=kind, instructions=question.question, criteria=criteria
+            )
+        adapted = NemotronDecisionRequest(
+            model=request.model,
+            state=request.input,
+            questions=questions,
+            chat_template_kwargs=chat_template_kwargs,
+        )
+        error = self.validate_request(adapted)
+        if error is not None:
+            raise ValueError(error)
+        for name, question in adapted.questions.items():
+            try:
+                yield self.encode(adapted.state, question, adapted.chat_template_kwargs)
+            except ValueError as error:
+                raise ValueError(f"question {name!r}: {error}") from error
+
+    def calibrate(self, kind, probabilities, logprobs, temperature=1.0):
+        model_temperature = self.metadata.get("temperature", {}).get(kind, 1.0)
+        if model_temperature == temperature == 1.0:
             return probabilities
         maximum = max(logprobs)
-        weights = [math.exp((value - maximum) / temperature) for value in logprobs]
+        weights = [
+            math.exp((value - maximum) / model_temperature / temperature)
+            for value in logprobs
+        ]
         total = math.fsum(weights)
         return [weight / total for weight in weights]
 

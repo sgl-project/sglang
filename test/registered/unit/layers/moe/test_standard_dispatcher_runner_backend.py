@@ -25,7 +25,7 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.runtime_context import get_context, get_flags, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=8, suite="stage-b-test-cpu-intel")
+register_cpu_ci(est_time=8, suite="extra-test-cpu-intel")
 
 NUM_EXPERTS = 8
 NUM_LOCAL_EXPERTS = 4

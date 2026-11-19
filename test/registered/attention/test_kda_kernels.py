@@ -2,9 +2,13 @@ import unittest
 from unittest.mock import patch
 
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.attention.fla.chunk_intra_token_parallel import (
+    chunk_kda_fwd_intra_token_parallel,
+)
 from sglang.kernels.ops.attention.fla.cumsum import chunk_local_cumsum
 from sglang.kernels.ops.attention.fla.fused_recurrent import (
     fused_recurrent_kda_packed_decode,
@@ -22,8 +26,8 @@ from sglang.srt.utils.device import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=28, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=12, stage="stage-b", runner_config="1-gpu-large-amd")
+register_cuda_ci(est_time=34, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=22, stage="base-b", runner_config="1-gpu-large-amd")
 
 
 @triton.jit
@@ -310,6 +314,92 @@ class TestKDAGateChunkCumsum(unittest.TestCase):
         self.assertLess(
             max_diff, 1e-3, f"max_diff={max_diff:.2e}, rel_diff={rel_diff:.2e}"
         )
+
+
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
+class TestKDAPrefillBeyondInt32TokenOffset(unittest.TestCase):
+    """A packed sequence starting past 2**31 / (H * K) tokens must read and write its own rows.
+
+    Its row offset bos * H * K exceeds int32 there. Computed in int32 it wraps
+    negative: the gate cumsum kernels fault and the token-parallel intra-chunk
+    kernel writes the wrong rows.
+    """
+
+    H, K, BT, BC = 32, 128, 64, 16
+    L_B = 1024
+
+    def setUp(self):
+        self.L_A = 2**31 // (self.H * self.K) + 4096
+        self.T = self.L_A + self.L_B
+        self.cu_packed = torch.tensor(
+            [0, self.L_A, self.T], dtype=torch.long, device="cuda"
+        )
+        self.cu_alone = torch.tensor([0, self.L_B], dtype=torch.long, device="cuda")
+        torch.manual_seed(0)
+
+    def _require_free_gib(self, gib):
+        free_bytes, _ = torch.cuda.mem_get_info()
+        if free_bytes < gib * 2**30:
+            self.skipTest(f"needs {gib} GiB of free device memory")
+
+    def _assert_second_sequence_matches(self, fn, *tensors):
+        alone = fn(*(t[:, self.L_A :].contiguous() for t in tensors), self.cu_alone)
+        packed = fn(*tensors, self.cu_packed)[:, self.L_A :]
+        self.assertTrue(torch.equal(packed, alone))
+
+    def test_gate_cumsum(self):
+        self._require_free_gib(20)
+        H, K, BT = self.H, self.K, self.BT
+        raw_g = (torch.randn(1, self.T, H, K, device="cuda") * 0.5 - 2.0).to(
+            torch.bfloat16
+        )
+        A_log = torch.randn(H, device="cuda") * 0.1
+        dt_bias = torch.randn(H * K, device="cuda") * 0.1
+        with self.subTest("chunk_local_cumsum"):
+            self._assert_second_sequence_matches(
+                lambda g, cu: chunk_local_cumsum(g, chunk_size=BT, cu_seqlens=cu),
+                raw_g,
+            )
+        with self.subTest("kda_gate_chunk_cumsum"):
+            self._assert_second_sequence_matches(
+                lambda g, cu: kda_gate_chunk_cumsum(
+                    g, A_log=A_log, chunk_size=BT, dt_bias=dt_bias, cu_seqlens=cu
+                ),
+                raw_g,
+            )
+
+    def test_intra_token_parallel(self):
+        self._require_free_gib(32)
+        H, K, BT, BC = self.H, self.K, self.BT, self.BC
+        shape = (1, self.T, H, K)
+        bf16 = dict(device="cuda", dtype=torch.bfloat16)
+        q = F.normalize(torch.randn(shape, **bf16), dim=-1)
+        k = F.normalize(torch.randn(shape, **bf16), dim=-1)
+        gk = chunk_local_cumsum(
+            -F.softplus(torch.randn(shape, **bf16) * 0.5 - 2.0), chunk_size=BT
+        )
+        beta = torch.rand(1, self.T, H, **bf16).sigmoid()
+
+        def intra(q, k, gk, beta, cu):
+            n = q.shape[1]
+            # The kernel only fills the diagonal blocks; zero the rest.
+            Aqk = torch.zeros(1, n, H, BT, device="cuda", dtype=torch.bfloat16)
+            Akk = torch.zeros(1, n, H, BC, device="cuda", dtype=torch.float32)
+            chunk_kda_fwd_intra_token_parallel(
+                q=q,
+                k=k,
+                gk=gk,
+                beta=beta,
+                Aqk=Aqk,
+                Akk=Akk,
+                scale=K**-0.5,
+                cu_seqlens=cu,
+                chunk_size=BT,
+                sub_chunk_size=BC,
+            )
+            return torch.cat([Aqk.float(), Akk], dim=-1)
+
+        self._assert_second_sequence_matches(intra, q, k, gk, beta)
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")

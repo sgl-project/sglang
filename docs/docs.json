@@ -1460,6 +1460,7 @@
                   {
                     "group": "NVIDIA",
                     "pages": [
+                      "cookbook/autoregressive/NVIDIA/Nemotron3.5-Decision",
                       "cookbook/autoregressive/NVIDIA/Nemotron3.5-Super",
                       "cookbook/autoregressive/NVIDIA/Nemotron3.5-Lightning",
                       "cookbook/autoregressive/NVIDIA/Nemotron3-Ultra",
@@ -1515,6 +1516,12 @@
                     ]
                   },
                   {
+                    "group": "RadixArk",
+                    "pages": [
+                      "cookbook/autoregressive/RadixArk/DaisyRose-27B"
+                    ]
+                  },
+                  {
                     "group": "Recursive",
                     "pages": [
                       "cookbook/autoregressive/Recursive/Flint"
@@ -1544,6 +1551,7 @@
                   {
                     "group": "Tencent",
                     "pages": [
+                      "cookbook/autoregressive/Tencent/Hy4-flash",
                       "cookbook/autoregressive/Tencent/Hy4-Preview",
                       "cookbook/autoregressive/Tencent/Hy3",
                       "cookbook/autoregressive/Tencent/Hunyuan3-Preview"
