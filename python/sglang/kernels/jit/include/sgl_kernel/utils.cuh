@@ -27,45 +27,89 @@
 #include <optional>
 #include <type_traits>
 #if defined(__MUSACC__)
+#include <cuda_runtime.h>
 #include <musa.h>
 #include <musa_bf16.h>
 #include <musa_fp16.h>
 #include <musa_fp8.h>
-#include <musa_runtime.h>
 #ifndef __grid_constant__
 #define __grid_constant__
 #endif
-using cudaError_t = musaError_t;
-using cudaStream_t = musaStream_t;
 using cudaLaunchConfig_t = musaLaunchConfig_t;
 using cudaLaunchAttribute = musaLaunchAttribute;
 using CUresult = MUresult;
-inline constexpr auto cudaSuccess = musaSuccess;
+#ifndef CUDA_SUCCESS
 inline constexpr auto CUDA_SUCCESS = MUSA_SUCCESS;
-#define cudaGetErrorString musaGetErrorString
+#endif
+#ifndef cudaGetLastError
 #define cudaGetLastError musaGetLastError
+#endif
+#ifndef cudaLaunchKernelEx
 #define cudaLaunchKernelEx musaLaunchKernelEx
+#endif
+#ifndef cudaMemcpyAsync
 #define cudaMemcpyAsync musaMemcpyAsync
+#endif
+#ifndef cudaMemcpyHostToDevice
 #define cudaMemcpyHostToDevice musaMemcpyHostToDevice
+#endif
+#ifndef cudaMemcpyDeviceToHost
 #define cudaMemcpyDeviceToHost musaMemcpyDeviceToHost
+#endif
+#ifndef cudaHostGetDevicePointer
 #define cudaHostGetDevicePointer musaHostGetDevicePointer
+#endif
+#ifndef cudaDeviceGetAttribute
 #define cudaDeviceGetAttribute musaDeviceGetAttribute
+#endif
+#ifndef cudaDevAttrComputeCapabilityMajor
 #define cudaDevAttrComputeCapabilityMajor musaDevAttrComputeCapabilityMajor
+#endif
+#ifndef cudaDevAttrComputeCapabilityMinor
 #define cudaDevAttrComputeCapabilityMinor musaDevAttrComputeCapabilityMinor
+#endif
+#ifndef cudaDevAttrMultiProcessorCount
 #define cudaDevAttrMultiProcessorCount musaDevAttrMultiProcessorCount
+#endif
+#ifndef cudaDevAttrMaxSharedMemoryPerBlockOptin
 #define cudaDevAttrMaxSharedMemoryPerBlockOptin musaDevAttrMaxSharedMemoryPerBlockOptin
+#endif
+#ifndef cudaDevAttrMaxSharedMemoryPerBlock
 #define cudaDevAttrMaxSharedMemoryPerBlock musaDevAttrMaxSharedMemoryPerBlock
+#endif
+#ifndef cudaRuntimeGetVersion
 #define cudaRuntimeGetVersion musaRuntimeGetVersion
+#endif
+#ifndef cudaFuncSetAttribute
 #define cudaFuncSetAttribute musaFuncSetAttribute
+#endif
+#ifndef cudaFuncAttributeMaxDynamicSharedMemorySize
 #define cudaFuncAttributeMaxDynamicSharedMemorySize musaFuncAttributeMaxDynamicSharedMemorySize
+#endif
+#ifndef cudaFuncAttributePreferredSharedMemoryCarveout
 #define cudaFuncAttributePreferredSharedMemoryCarveout musaFuncAttributePreferredSharedMemoryCarveout
-#define cudaLaunchAttributeProgrammaticStreamSerialization musaLaunchAttributeProgrammaticStreamSerialization
+#endif
+#ifndef cudaLaunchAttributeProgrammaticStreamSerialization
+#define cudaLaunchAttributeProgrammaticStreamSerialization musaLaunchAttributeIgnore
+#endif
+#ifndef cudaLaunchAttributeClusterDimension
 #define cudaLaunchAttributeClusterDimension musaLaunchAttributeClusterDimension
+#endif
+#ifndef cudaLaunchAttributeCooperative
 #define cudaLaunchAttributeCooperative musaLaunchAttributeCooperative
+#endif
+#ifndef cudaSharedmemCarveoutMaxL1
 #define cudaSharedmemCarveoutMaxL1 musaSharedmemCarveoutMaxL1
+#endif
+#ifndef cudaSharedmemCarveoutMaxShared
 #define cudaSharedmemCarveoutMaxShared musaSharedmemCarveoutMaxShared
+#endif
+#ifndef cudaSharedmemCarveoutDefault
 #define cudaSharedmemCarveoutDefault musaSharedmemCarveoutDefault
+#endif
+#ifndef cuGetErrorString
 #define cuGetErrorString muGetErrorString
+#endif
 #elif !defined(USE_ROCM)
 #include <cuda.h>
 #include <cuda_bf16.h>

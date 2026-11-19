@@ -99,6 +99,14 @@ def musa_home() -> str:
 
 
 @cache_once
+def torchada_cxx_compat_include_dir() -> str:
+    """Torchada's CUDA-to-MUSA C++ compatibility headers."""
+    from torchada.utils.cpp_extension import stable_compat_include_dir
+
+    return stable_compat_include_dir()
+
+
+@cache_once
 def device_compiler_path() -> str:
     """The nvcc/hipcc/mcc/hgcc that JIT builds actually invoke.
 
@@ -258,7 +266,11 @@ def base_cuda_flags() -> List[str]:
 def base_include_paths() -> List[str]:
     includes, _, _ = tvm_ffi_paths()
     if is_musa_runtime():
-        return [*includes, f"{musa_home()}/include"]
+        return [
+            torchada_cxx_compat_include_dir(),
+            *includes,
+            f"{musa_home()}/include",
+        ]
     if is_hip_runtime():
         return [*includes, f"{rocm_home()}/include"]
     return list(includes)
