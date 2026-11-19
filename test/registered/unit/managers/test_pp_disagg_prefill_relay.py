@@ -81,6 +81,7 @@ class _Stage:
         s.pp_group = SimpleNamespace(
             is_first_rank=rank == 0, is_last_rank=rank == pp - 1
         )
+        s.pp_comm_stream = None
         s.pp_comm_stream_ctx = nullcontext()
         s.pp_send_done_event = None
         s._pp_capacity_digest = None
@@ -261,6 +262,7 @@ def _run(pp, depth, early, iters):
     with (
         envs.SGLANG_OPT_PP_EARLY_RELAY.override(early),
         envs.SGLANG_OPT_PP_PREFILL_EARLY_FINISH.override(False),
+        envs.SGLANG_OPT_PP_PROXY_RECV_AFTER_FORWARD.override(False),
         patch.object(pp_module, "get_parallel", return_value=parallel),
     ):
         threads = [threading.Thread(target=body, args=(st,)) for st in stages]

@@ -798,6 +798,11 @@ class Envs:
     # PP PD prefill: a stage forwards reqs, transferred rids and release sets as soon
     # as it has them; every stage gets the same messages at the same iteration.
     SGLANG_OPT_PP_EARLY_RELAY = EnvBool(SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get)
+    # PP PD prefill, needs SGLANG_PP_COMM_OVERLAP: a stage posts its next proxy receive
+    # after its forward in flight; the received bytes and their order are unchanged.
+    SGLANG_OPT_PP_PROXY_RECV_AFTER_FORWARD = EnvBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
     SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH = EnvBool(False)
     # Opt-in: keep receiving prefill requests while forward results are pending.
     SGLANG_ENABLE_DISAGG_PREFILL_CONTINUOUS_INPUT_POLLING = EnvBool(False)

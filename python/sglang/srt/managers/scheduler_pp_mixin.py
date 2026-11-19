@@ -107,6 +107,22 @@ def _pp_prefill_early_relay_enabled() -> bool:
     return True
 
 
+def _pp_prefill_proxy_recv_after_forward_engages(*, comm_overlap: bool) -> bool:
+    """SGLANG_OPT_PP_PROXY_RECV_AFTER_FORWARD is on for the PP PD prefill loop;
+    it needs SGLANG_PP_COMM_OVERLAP's communication stream."""
+    if not comm_overlap:
+        logger.info(
+            "SGLANG_OPT_PP_PROXY_RECV_AFTER_FORWARD declined: needs "
+            "SGLANG_PP_COMM_OVERLAP on a CUDA device"
+        )
+        return False
+    logger.info(
+        "SGLANG_OPT_PP_PROXY_RECV_AFTER_FORWARD engaged: a stage posts its next "
+        "proxy receive only after its forward in flight"
+    )
+    return True
+
+
 def _pp_exchange_outputs_before_forward(
     cur_batch: Optional[ScheduleBatch],
     spec_relay: bool,
@@ -335,6 +351,16 @@ class SchedulerPPMixin:
                 output_streamer=self.output_streamer,
             )
         early_relay = _pp_prefill_early_relay_enabled()
+        # PP rank 0 receives no proxy tensors.
+        if (
+            envs.SGLANG_OPT_PP_PROXY_RECV_AFTER_FORWARD.get()
+            and not self.pp_group.is_first_rank
+        ):
+            self._pp_proxy_recv_after_forward = (
+                _pp_prefill_proxy_recv_after_forward_engages(
+                    comm_overlap=self.pp_comm_stream is not None
+                )
+            )
 
         # PD additional state initialization
         tmbs = [None] * self.pp_loop_size
@@ -766,6 +792,8 @@ class SchedulerPPMixin:
             logger.info(
                 "PP tensor communication overlap enabled on a dedicated CUDA stream"
             )
+        # Set by the PP PD prefill loop (SGLANG_OPT_PP_PROXY_RECV_AFTER_FORWARD).
+        self._pp_proxy_recv_after_forward = False
 
         self._pp_tensor_dict_inbox: Dict[
             str, deque[Tuple[Dict[str, torch.Tensor], Optional[torch.Event]]]
@@ -1217,6 +1245,11 @@ class SchedulerPPMixin:
     def _pp_recv_proxy_tensors(self: Scheduler) -> Optional[PPProxyTensors]:
         pp_proxy_tensors = None
         if not self.pp_group.is_first_rank:
+            if self._pp_proxy_recv_after_forward and self.launch_event is not None:
+                # Post the receive after this stage's forward in flight, as
+                # SGLANG_ENABLE_PP_OUTPUT_RECV_AFTER_FORWARD does for an output recv.
+                with self.pp_comm_stream_ctx:
+                    self.device_module.current_stream().wait_event(self.launch_event)
             tensor_dict, self.pp_proxy_recv_event = self._pp_recv_typed_dict(
                 expected_kind="proxy",
                 all_gather_group=(self.attn_tp_group),
