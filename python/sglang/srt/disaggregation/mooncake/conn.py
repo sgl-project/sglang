@@ -1934,7 +1934,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if plan.empty():
             return 0
 
-        if pack_buffer is not None and envs.SGLANG_DISAGG_DCP_CHUNK_PACK.get():
+        if pack_buffer is not None:
             ret = self._send_kvcache_dcp_chunk_packed(
                 mooncake_session_id,
                 prefill_kv_indices,

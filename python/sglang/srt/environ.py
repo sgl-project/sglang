@@ -975,10 +975,6 @@ class Envs:
     # synchronous all-layer Mooncake batch. Set to a positive value to split
     # larger transfers; 0 preserves the legacy single-batch behavior.
     SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES = EnvInt(0)
-    # PD DCP relayout (DCP-1 prefill to DCP-N decode): pack one transfer
-    # chunk's rows for every decode DCP rank with a single gather, and move a
-    # DCP-collapsed draft with the target rows. 0 restores the per-rank pack.
-    SGLANG_DISAGG_DCP_CHUNK_PACK = EnvBool(True)
     ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE = EnvBool(False)
     ASCEND_NPU_PHY_ID = EnvInt(-1)
     SGLANG_MOONCAKE_SEND_AUX_TCP = EnvBool(False)
