@@ -76,7 +76,46 @@ pub struct TokenizerRegistry {
 
 /// Image placeholder tokens the chat renderers emit, by their spelling in
 /// `tokenizer.json`'s added tokens (DeepSeek-V4 family).
-const MEDIA_TOKENS: &[&str] = &["<｜deepseek_image｜>"];
+pub(crate) const MEDIA_TOKENS: &[&str] = &["<｜deepseek_image｜>"];
+
+/// Ids that follow each image placeholder in a chat's routing ids (see
+/// [`tag_images`]).
+pub const MEDIA_TAG_LEN: usize = 2;
+
+/// Routing-only ids for a chat with images: after each placeholder in `ids`,
+/// [`MEDIA_TAG_LEN`] ids derived from the image's source (`images`, in
+/// placeholder order), so chats whose text is the same but whose images differ
+/// hash differently from their first image on, as they do in the engine, whose
+/// cache keys carry each image's own hash. Nothing before the first image
+/// changes, so the prefix KV events can confirm is hashed as the engine hashes
+/// it. These ids never reach an engine: a chat with media is ineligible for
+/// `input_ids` forwarding.
+pub(crate) fn tag_images(ids: Vec<u32>, placeholders: &[u32], images: &[String]) -> Vec<u32> {
+    if placeholders.is_empty() || images.is_empty() {
+        return ids;
+    }
+    let mut tagged = Vec::with_capacity(ids.len() + images.len() * MEDIA_TAG_LEN);
+    let mut images = images.iter();
+    for id in ids {
+        tagged.push(id);
+        if placeholders.contains(&id) {
+            if let Some(source) = images.next() {
+                tagged.extend(media_tag(source));
+            }
+        }
+    }
+    tagged
+}
+
+/// An image's identity tag: the leading bytes of its source's SHA-256, as a
+/// URL or data URL is the identity the engine's own image hash follows.
+fn media_tag(source: &str) -> [u32; MEDIA_TAG_LEN] {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(source.as_bytes());
+    std::array::from_fn(|i| {
+        u32::from_be_bytes(digest[i * 4..i * 4 + 4].try_into().expect("4 bytes"))
+    })
+}
 
 /// Ids of [`MEDIA_TOKENS`] declared by a `tokenizer.json`.
 fn media_token_ids(tokenizer_json: &serde_json::Value) -> Vec<u32> {
@@ -604,7 +643,20 @@ mod tests {
     fn deepseek_image_chat_encodes_for_routing() {
         let dir = tempfile::tempdir().unwrap();
         let tok = dir.path().join("tokenizer.json");
-        std::fs::copy("tests/fixtures/tiny_tokenizer.json", &tok).unwrap();
+        // The tiny tokenizer, declaring DeepSeek's image placeholder.
+        const PLACEHOLDER: u32 = 257;
+        let mut json: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string("tests/fixtures/tiny_tokenizer.json").unwrap(),
+        )
+        .unwrap();
+        json["added_tokens"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "id": PLACEHOLDER, "content": MEDIA_TOKENS[0], "special": true,
+                "single_word": false, "lstrip": false, "rstrip": false, "normalized": false
+            }));
+        std::fs::write(&tok, serde_json::to_vec(&json).unwrap()).unwrap();
         std::fs::write(
             dir.path().join("config.json"),
             r#"{"model_type":"deepseek_v41"}"#,
@@ -628,11 +680,51 @@ mod tests {
         assert!(!ids.is_empty());
         // Deterministic, so every turn and every router hashes it the same way.
         assert_eq!(formatter.encode(&tokenizer, &image_chat).unwrap(), ids);
+        // The placeholder is followed by the image's identity tag, so the same
+        // text with another image differs from the placeholder on, and only there.
+        let other_chat = serde_json::json!({"messages": [{"role": "user", "content": [
+            {"type": "text", "text": "look"},
+            {"type": "image_url", "image_url": {"url": "https://example.com/b.png"}}
+        ]}]});
+        let other = formatter.encode(&tokenizer, &other_chat).unwrap();
+        let at = ids
+            .iter()
+            .position(|&id| id == PLACEHOLDER)
+            .expect("one placeholder");
+        assert_eq!(ids.iter().filter(|&&id| id == PLACEHOLDER).count(), 1);
+        assert_eq!(other.len(), ids.len());
+        assert_eq!(other[..=at], ids[..=at]);
+        let tag = at + 1..at + 1 + MEDIA_TAG_LEN;
+        assert_ne!(other[tag.clone()], ids[tag.clone()]);
+        assert_eq!(other[tag.end..], ids[tag.end..]);
         // Video is still refused (and falls back as before).
         let video_chat = serde_json::json!({"messages": [{"role": "user", "content": [
             {"type": "video_url", "video_url": {"url": "https://example.com/a.mp4"}}
         ]}]});
         assert!(formatter.encode(&tokenizer, &video_chat).is_err());
+    }
+
+    #[test]
+    fn tag_images_follows_each_placeholder_with_its_image() {
+        let ids = vec![1, 9, 2, 9, 3];
+        let images = ["a".to_string(), "b".to_string()];
+        let tagged = tag_images(ids.clone(), &[9], &images);
+        assert_eq!(tagged.len(), ids.len() + 2 * MEDIA_TAG_LEN);
+        assert_eq!(&tagged[..2], &[1, 9]);
+        assert_eq!(tagged[2..2 + MEDIA_TAG_LEN], media_tag("a"));
+        assert_eq!(&tagged[2 + MEDIA_TAG_LEN..4 + MEDIA_TAG_LEN], &[2, 9]);
+        assert_eq!(
+            tagged[4 + MEDIA_TAG_LEN..4 + 2 * MEDIA_TAG_LEN],
+            media_tag("b")
+        );
+        assert_eq!(tagged.last(), Some(&3));
+        assert_ne!(media_tag("a"), media_tag("b"));
+        // A placeholder past the images, or no known placeholder, tags nothing.
+        assert_eq!(
+            tag_images(vec![9, 9], &[9], &images[..1]).len(),
+            2 + MEDIA_TAG_LEN
+        );
+        assert_eq!(tag_images(ids.clone(), &[], &images), ids);
     }
 
     #[test]

@@ -56,6 +56,14 @@ pub struct ChatFormatter {
     prompt_affixes: Option<super::adapter::PromptAffixes>,
 }
 
+/// Ids of the image placeholders `tokenizer` declares (see [`super::MEDIA_TOKENS`]).
+fn media_placeholders(tokenizer: &Tokenizer) -> Vec<u32> {
+    super::MEDIA_TOKENS
+        .iter()
+        .filter_map(|token| tokenizer.token_to_id(token).ok().flatten())
+        .collect()
+}
+
 impl ChatFormatter {
     /// Load model files and select a template or native formatter from dynamo-render.
     pub fn load(model_id: &str, tokenizer_path: &str) -> Result<Option<Self>> {
@@ -451,13 +459,19 @@ impl ChatFormatter {
                 return match ids {
                     Ok(ids) => Ok(ids),
                     // The processor's text-only path refuses images. Routing still needs the
-                    // chat's tokens, so render it with its image placeholders: the prompt up to
-                    // the first image is then the engine's exactly. These ids are routing-only;
-                    // a chat with media is never eligible for input_ids forwarding.
+                    // chat's tokens, so render it with its image placeholders, each tagged
+                    // with its image's identity: the prompt up to the first image is then the
+                    // engine's exactly, and past it chats with different images differ. These
+                    // ids are routing-only; a chat with media is never eligible for input_ids
+                    // forwarding.
                     Err(err) => match formatter
                         .encode_multimodal_request(request.clone(), &self.worker_defaults)
                     {
-                        Some(Ok(encoded)) if !encoded.images.is_empty() => Ok(encoded.ids),
+                        Some(Ok(encoded)) if !encoded.images.is_empty() => Ok(super::tag_images(
+                            encoded.ids,
+                            &media_placeholders(tokenizer),
+                            &encoded.images,
+                        )),
                         _ => Err(err).context("render chat"),
                     },
                 };
