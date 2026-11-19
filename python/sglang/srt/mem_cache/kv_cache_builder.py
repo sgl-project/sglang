@@ -157,9 +157,13 @@ def prepare_hicache_staging(
     prepare(runner.token_to_kv_pool, runner.mtp_draft_device_pools)
     if draft_plan is not None and draft_plan.mode == HiCacheDraftMode.SIDECAR:
         for pool in draft_plan.device_pools:
-            # SWA sidecars follow only the draft's SWA component.
-            if pool.layer_router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None:
-                pool = pool.layer_router.view(IdSpaceKind.SLIDING_WINDOW)
+            # A hybrid draft gets one sidecar per component: SWA, plus FULL
+            # when the draft has full-attention layers.
+            router = pool.layer_router
+            if router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None:
+                if router.routes_to(IdSpaceKind.FULL):
+                    prepare(router.view(IdSpaceKind.FULL), sidecar=True)
+                pool = router.view(IdSpaceKind.SLIDING_WINDOW)
             elif isinstance(pool, DeepSeekV4TokenToKVPool):
                 pool = pool.swa_kv_pool
             prepare(pool, sidecar=True)

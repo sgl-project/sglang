@@ -109,7 +109,7 @@ export const KimiK31MambaRatioCalculator = () => {
       !(Number(flagArg("--disaggregation-decode-host-receive-threshold")) < 1) &&
       ["cutedsl_mla", "trtllm_mla"].includes(flagArg("--speculative-draft-attention-backend")) &&
       !hasFlag("--enable-unified-memory") &&
-      !env.some((e) => e.startsWith("SGLANG_ENABLE_DFLASH_DRAFT_KV_RING=0"));
+      env.some((e) => e.startsWith("SGLANG_ENABLE_DFLASH_DRAFT_KV_RING=1"));
 
     const ssmBytes = ssmDtype === "float32" ? 4 : 2;
     // Fixed K3.1 geometry:

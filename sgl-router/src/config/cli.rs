@@ -174,7 +174,7 @@ pub struct ServerArgs {
     /// Upper bound on the backoff between retries, in milliseconds.
     #[arg(long, default_value_t = ProxyConfig::default().max_backoff_ms)]
     pub retry_max_backoff_ms: u64,
-    /// PD: return decode's stream only once prefill completes, as sgl-model-gateway does.
+    /// PD: return decode's stream only once prefill completes.
     #[arg(long)]
     pub pd_stream_after_prefill: bool,
 
@@ -266,7 +266,8 @@ pub struct RoutingArgs {
     pub dp_aware: bool,
 
     /// How --dp-aware picks a rank that no routing key or cached prefix decides,
-    /// which in PD mode is every decode rank. Defaults to least_in_flight.
+    /// which in PD mode is every decode rank. Defaults to least_in_flight;
+    /// least_tokens needs the engine's --load-publish-endpoint feed.
     #[arg(long, value_enum, requires = "dp_aware")]
     pub dp_rank_policy: Option<DpRankPolicy>,
 
@@ -1900,7 +1901,7 @@ mod tests {
     }
 
     /// Multiple `--selector` terms AND-join into one comma-separated
-    /// label selector (matches the Python router's space-separated form).
+    /// label selector.
     #[test]
     fn k8s_plain_selector_joins_multiple_terms() {
         let c = into_config_owned(with_model(&[
@@ -3156,6 +3157,25 @@ mod tests {
             legacy_config.model.decode_policy,
             DecodePolicyKind::LegacyHostAffinity
         );
+    }
+
+    #[test]
+    fn dp_rank_policy_requires_dp_aware_and_accepts_least_tokens() {
+        assert_eq!(
+            cfg_of("--policy power_of_two --dp-aware")
+                .unwrap()
+                .model
+                .dp_rank_policy,
+            DpRankPolicy::LeastInFlight
+        );
+        assert_eq!(
+            cfg_of("--policy power_of_two --dp-aware --dp-rank-policy least_tokens")
+                .unwrap()
+                .model
+                .dp_rank_policy,
+            DpRankPolicy::LeastTokens
+        );
+        assert!(cfg_of("--policy power_of_two --dp-rank-policy least_tokens").is_err());
     }
 
     #[test]

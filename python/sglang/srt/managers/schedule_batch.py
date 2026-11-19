@@ -77,6 +77,7 @@ import torch
 from sglang.srt.beam_search.batch_tail import (
     BeamTail,
     append_beam_tail,
+    beam_launch_complete,
     beam_retraction_order,
     num_beam_member_rows,
     strip_beam_tail,
@@ -477,7 +478,6 @@ class Req(ReqDllmMixin):
         decision_layout: Optional[List[int]] = None,
         session_id: Optional[str] = None,
         cache_salt: Optional[str] = None,
-        parent_session_id: Optional[str] = None,
         request_instance_id: Optional[str] = None,
     ):
         # Input and output info
@@ -507,8 +507,6 @@ class Req(ReqDllmMixin):
         # media added by this turn, excluding the session's borrowed history
         self._session_mm_items: List[MultimodalDataItem] = []
         self.session_id = session_id
-        # The session that spawned this one; cache residency hints only.
-        self.parent_session_id = parent_session_id
         # Used by the session radix cache to reject registration after a close/reopen.
         self.session_generation: Optional[int] = None
         self.input_embeds = input_embeds
@@ -3353,7 +3351,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             keep_indices = [
                 i
                 for i in range(len(self.reqs))
-                if not self.reqs[i].finished() and self.reqs[i] not in reqs_to_exclude
+                if not self.reqs[i].finished()
+                and not beam_launch_complete(self.reqs[i])
+                and self.reqs[i] not in reqs_to_exclude
             ]
 
         if keep_indices is None or len(keep_indices) == 0:
