@@ -23,6 +23,7 @@ class TestEagleDraftSamplingPosition(CustomTestCase):
         worker.plan_stream_ctx = nullcontext()
         worker.seed_dsa_topk_from_draft_extend = False
         worker.topk = 1
+        worker.use_fused_draft_sample = False
         worker.device = torch.device("cpu")
 
         logits_output = SimpleNamespace(
