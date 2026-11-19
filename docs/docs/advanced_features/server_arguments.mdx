@@ -2366,6 +2366,12 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: float</td>
     </tr>
+        <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--paged-experts-fused-host-copy`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>With `--enable-paged-experts`, the MoE kernel reads the experts a step pages in from pinned host memory and writes them into their GPU slots as it computes, instead of a separate copy before the kernel, so the experts already on the GPU do not wait for the transfers. Applies to steps that fit the K slots (tokens × top_k ≤ K). Triton with bf16/fp16 experts, or Marlin with NVFP4/MXFP4 experts; not with `--paged-experts-enable-disk`.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
+    </tr>
   </tbody>
 </table>
 
