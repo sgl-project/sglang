@@ -258,6 +258,12 @@ def get_default_config(
                 "BLOCK_SIZE_K": 64,
                 "GROUP_SIZE_M": 1,
             }
+            # Triton 3.9 flips the coalesce-pass encoding order, producing an
+            # inefficient LDS layout with multi-warp GPTQ dequant.  Single warp
+            # keeps everything in registers and avoids the 3.6-4.2x regression.
+            if _is_hip and triton.__version__ >= "3.9":
+                config["num_warps"] = 1
+                config["num_stages"] = 1
     return config
 
 
