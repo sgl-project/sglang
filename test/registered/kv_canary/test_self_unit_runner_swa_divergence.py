@@ -27,7 +27,7 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=13, stage="extra-a", runner_config="1-gpu-small")
 register_amd_ci(est_time=45, suite="extra-a-test-1-gpu-small-amd")
-register_xpu_ci(est_time=60, suite="stage-b-test-1-gpu-xpu")
+register_xpu_ci(est_time=60, suite="extra-test-1-gpu-xpu")
 
 _EMPTY_FORWARD_BATCH = SimpleNamespace(
     req_pool_indices=torch.empty(0, dtype=torch.int64, device=DEFAULT_DEVICE),

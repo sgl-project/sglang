@@ -31,7 +31,7 @@ def test_mxfp8_linear_matches_bf16_and_accepts_prequantized(request) -> None:
     if torch.cuda.get_device_capability()[0] < 10:
         pytest.skip("cuBLASLt MXFP8 block scaling requires Blackwell or newer")
     request.getfixturevalue("single_process_model_parallel")
-    from sglang.kernels.ops.diffusion import silu_mul_mxfp8
+    from sglang.kernels.ops.activation.swiglu_mxfp8_swizzled import silu_mul_mxfp8
 
     in_f, out_f, rows = 512, 384, 200
     layer = _layer(in_f, out_f, bias=False)

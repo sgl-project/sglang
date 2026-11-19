@@ -48,7 +48,6 @@ __global__ void set_mla_kv_concat_q_kernel(const __grid_constant__ SetMlaKVConca
   using namespace device;
   static_assert((kNopeBytes + kRopeBytes) % 16 == 0, "TMA bulk store requires total row to be 16-byte aligned");
 
-  constexpr int64_t kRowBytes = kNopeBytes + kRopeBytes;
   constexpr int kQNopeDim = static_cast<int>(kNopeBytes / sizeof(bf16_t));
   constexpr int kQRopeDim = static_cast<int>(kRopeBytes / sizeof(bf16_t));
 
@@ -59,7 +58,7 @@ __global__ void set_mla_kv_concat_q_kernel(const __grid_constant__ SetMlaKVConca
   PDLWaitPrimary<kUsePDL>();
 
   if (flat_warp < params.batch_size) {
-    // --- KV scatter role: one warp per token (smem staging + TMA bulk store) ---
+    // --- KV scatter role: one warp per token (16B per lane load / store) ---
     const uint32_t item_id = flat_warp;
     const auto loc = static_cast<const TLoc*>(params.loc)[item_id];
 

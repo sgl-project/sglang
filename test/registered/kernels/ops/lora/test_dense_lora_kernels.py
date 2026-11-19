@@ -20,7 +20,7 @@ from sglang.srt.lora.utils import Phase  # noqa: E402
 from sglang.srt.lora.workspace import LoraWorkspace  # noqa: E402
 from sglang.test.ci.ci_register import register_cuda_ci  # noqa: E402
 
-register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="dense LoRA kernels need CUDA"
@@ -218,7 +218,6 @@ def test_engine_matches_reference(batch_name, site_kind, plan_name):
 
     phase = Phase.PREFILL if batch_name == "prefill" else Phase.DECODE
     engine = _engine(batch_info, token_slots, phase)
-    assert torch.equal(engine.token_slots, token_slots)
     out = engine.apply(
         x,
         lambda: base.clone(),

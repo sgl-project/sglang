@@ -4,6 +4,7 @@ description = "In-process Rust gRPC server for SGLang"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 
 # Consumed by python/setup.py: registers this crate as a PyO3 extension module
 # of the main sglang wheel at the given import path.
@@ -23,8 +24,9 @@ crate-type = ["cdylib"]
 [dependencies]
 async-stream = { workspace = true }
 pyo3 = { workspace = true }
-sglang-api-types = { path = "../sglang-api-types" }
-serde_json = { workspace = true }
+sglang-runtime-v1-types = { path = "../sglang-runtime-v1-types" }
+# preserve_order: JSON objects reach Python as dicts in insertion order.
+serde_json = { workspace = true, features = ["preserve_order"] }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tonic = { workspace = true }
