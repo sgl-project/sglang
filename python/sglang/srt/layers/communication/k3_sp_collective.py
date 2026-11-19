@@ -248,6 +248,9 @@ class RowCollective:
             if push and list(group.ranks) == list(get_parallel().tp_group.ranks)
             else None
         )
+        if self._state is not None:
+            # Created now so the KV pool sizing accounts for it; a first-use cuMemCreate mid-serving OOMs.
+            _symm_buffer(self._state, buffer_name, 1, _HIDDEN_SIZE, torch.bfloat16)
 
     def _state_for(self, rows: int) -> Optional[_State]:
         total = rows * self.group.world_size
