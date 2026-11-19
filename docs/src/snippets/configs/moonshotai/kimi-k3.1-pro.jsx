@@ -126,9 +126,9 @@ export const config = {
             "--speculative-draft-model-path RadixArk/Kimi-K3.1-Dflash2-Preview",
             `--speculative-dflash-block-size ${config.dflashBlock(s)}`,
             "--speculative-draft-kv-cache-dtype fp8_e4m3",
-            // The draft KV ring (default on) needs an MLA draft backend; DCP forces this one
-            // anyway, so pinning it keeps DCP and non-DCP recipes on the same path. ROCm runs the
-            // same ring on the Triton draft backend.
+            // The draft KV ring needs an MLA draft backend; DCP
+            // forces this one anyway, so pinning it keeps DCP and non-DCP recipes on the same
+            // path. ROCm's Triton draft backend keeps the per-token draft pool.
             `--speculative-draft-attention-backend ${config.isAmd(s) ? "triton" : "cutedsl_mla"}`,
             // Without ReplaySSM, DFLASH keeps one intermediate KDA state per draft token and the
             // KV pool collapses (5.13M -> 0.77M tokens measured on decode). The PD prefill role
@@ -138,6 +138,9 @@ export const config = {
             // requests skip it.
             ...(config.isAmd(s) ? ["--speculative-use-block-verification"] : []),
           ],
+          // The draft KV ring is opt-in; every NVIDIA recipe here can serve it, and under PD
+          // both roles must set it.
+          env: (s) => (config.isAmd(s) ? [] : ["SGLANG_ENABLE_DFLASH_DRAFT_KV_RING=1"]),
           hints: (s) =>
             s.pdMode === "decode" && s.strategy === "high-throughput"
               ? [`High-throughput decode verifies K = ${config.dflashBlock(s) - 1} (block ${config.dflashBlock(s)}); launch the prefill role with the same block size.`]
@@ -265,9 +268,6 @@ export const config = {
     numPromptsByConc: { 1: 16, 16: 80, 64: 320, 256: 1280 },
   },
 
-  // The K3.1 image is built from docker/k31.Dockerfile; it verifies the Rust radix TreeCore,
-  // flashmla_ops and the 1024-expert FlashInfer DynBlock at build time (a Python-only install
-  // falls back to slower paths silently).
   dockerImages: {
     m890: "egslingjun-registry.cn-wulanchabu.cr.aliyuncs.com/egslingjun-tmp/inference-xpu-pytorch:kimi-k3.1-pro-sglang0.5.22-cuda13.0-pytorch2.13.0-20261103",
     "810e": "egslingjun-registry.cn-wulanchabu.cr.aliyuncs.com/egslingjun-tmp/inference-xpu-pytorch:kimi-k3.1-pro-sglang0.5.22-cuda13.0-pytorch2.13.0-20261103",
@@ -326,61 +326,59 @@ export const config = {
       ],
       routerOverrides: [
         {
-          // MI35x 1P1D: measured behind the ROCm image's SGLang router.
+          // MI35x 1P1D: its benchmark numbers were measured before the switch to sgl-router.
           when: { hw: ["mi350x", "mi355x"] },
           command:
-`python3 -m sglang_router.launch_router \\
-  --pd-disaggregation \\
-  --prefill http://<prefill-host>:{{PREFILL_PORT}} 8998 \\
-  --decode http://<decode-host>:{{DECODE_PORT}} \\
+`sgl-router \\
+  --model-id {{MODEL_NAME}} \\
+  --no-tokenizer \\
+  --worker-urls http://<prefill-host>:{{PREFILL_PORT}} http://<decode-host>:{{DECODE_PORT}} \\
   --host 0.0.0.0 --port {{ROUTER_PORT}} \\
-  --request-timeout-secs 3600`,
+  --request-timeout-secs 3600 \\
+  --stream-idle-timeout-secs 3600 \\
+  --stale-request-timeout-secs 3600`,
         },
         {
           when: { hw: ["m890"] },
           command:
-`SGLANG_ROUTER_STREAM_IDLE_TIMEOUT_SECS=3600 \\
-sgl-router \\
-  --pd-disaggregation \\
-  --prefill http://<prefill-1-head>:{{PREFILL_PORT}} 8998 \\
-  --prefill http://<prefill-2-head>:{{PREFILL_PORT}} 8998 \\
-  --decode http://<decode-head>:{{DECODE_PORT}} \\
+`sgl-router \\
+  --model-id {{MODEL_NAME}} \\
+  --no-tokenizer \\
+  --worker-urls http://<prefill-1-head>:{{PREFILL_PORT}} http://<prefill-2-head>:{{PREFILL_PORT}} http://<decode-head>:{{DECODE_PORT}} \\
   --host 0.0.0.0 --port {{ROUTER_PORT}} \\
   --policy power_of_two \\
-  --model-id {{MODEL_NAME}} \\
-  --tokenizer-path {{MODEL_NAME}} \\
+  --stream-idle-timeout-secs 3600 \\
+  --stale-request-timeout-secs 3600 \\
   --request-timeout-secs 540`,
         },
         {
           when: { hw: ["810e"] },
           command:
-`SGLANG_ROUTER_STREAM_IDLE_TIMEOUT_SECS=3600 \\
-sgl-router \\
-  --pd-disaggregation \\
-  --prefill http://<prefill-head>:{{PREFILL_PORT}} 8998 \\
-  --decode http://<decode-head>:{{DECODE_PORT}} \\
+`sgl-router \\
+  --model-id {{MODEL_NAME}} \\
+  --no-tokenizer \\
+  --worker-urls http://<prefill-head>:{{PREFILL_PORT}} http://<decode-head>:{{DECODE_PORT}} \\
   --host 0.0.0.0 --port {{ROUTER_PORT}} \\
   --policy power_of_two \\
-  --model-id {{MODEL_NAME}} \\
-  --tokenizer-path {{MODEL_NAME}} \\
+  --stream-idle-timeout-secs 3600 \\
+  --stale-request-timeout-secs 3600 \\
   --request-timeout-secs 540`,
         },
       ],
       router: {
         port: 8000,
-        // The K3.1 build of sgl-router renders the K3 chat template and keeps content-less tool
-        // messages; the stock sglang-router 0.3.2 does neither. Raise the stream-idle timeout
-        // for overloaded benchmarks (the 180 s default kills long-queued streams).
+        // --no-tokenizer leaves chat rendering to the workers. Raise the stream-idle timeout
+        // for overloaded benchmarks (the 180 s default kills long-queued streams), and the
+        // request lifetime with it (the 600 s default would cancel them first).
         command:
-`SGLANG_ROUTER_STREAM_IDLE_TIMEOUT_SECS=3600 \\
-sgl-router \\
-  --pd-disaggregation \\
-  --prefill http://<prefill-host>:{{PREFILL_PORT}} 8998 \\
-  --decode http://<decode-host>:{{DECODE_PORT}} \\
+`sgl-router \\
+  --model-id {{MODEL_NAME}} \\
+  --no-tokenizer \\
+  --worker-urls http://<prefill-host>:{{PREFILL_PORT}} http://<decode-host>:{{DECODE_PORT}} \\
   --host 0.0.0.0 --port {{ROUTER_PORT}} \\
   --policy power_of_two \\
-  --model-id moonshotai/Kimi-K3.1-Pro \\
-  --tokenizer-path <Kimi-K3.1-Pro tokenizer.json> \\
+  --stream-idle-timeout-secs 3600 \\
+  --stale-request-timeout-secs 3600 \\
   --request-timeout-secs 540`,
       },
     },
@@ -402,16 +400,17 @@ sgl-router \\
 
     flagSelects: [
       {
-        // DSA sparse-MLA kernel. FlashMLA (flashmla_kv) is the K3.1 default and matches the reference
-        // fp8_ds_mla KV; TRT-LLM and Prims-TS read a raw FP8 KV with FP8 q, so PD peers must both
-        // use one of them. Both phases share one KV pool, so prefill and decode get the same value.
+        // DSA sparse-MLA kernel. Prims-TS is the K3.1 default on SM100/103/107 (all hw this select
+        // shows on); FlashMLA (flashmla_kv) matches the reference fp8_ds_mla KV. TRT-LLM and Prims-TS
+        // read a raw FP8 KV with FP8 q, so PD peers must both use one of them. Both phases share one
+        // KV pool, so prefill and decode get the same value.
         id: "attention", title: "Attention Backend",
         showWhen: (b) => ["b300", "gb300", "b200", "gb200"].includes(b.hw),
         stripPrefixes: ["--dsa-prefill-backend", "--dsa-decode-backend"],
         options: [
-          { id: "flashmla", label: "FlashMLA" },
+          { id: "prims_ts", label: "Prims-TS" },
+          { id: "flashmla", label: "FlashMLA", flags: ["--dsa-prefill-backend flashmla_kv", "--dsa-decode-backend flashmla_kv"] },
           { id: "trtllm",   label: "TRT-LLM",  flags: ["--dsa-prefill-backend trtllm", "--dsa-decode-backend trtllm"] },
-          { id: "prims_ts", label: "Prims-TS", flags: ["--dsa-prefill-backend prims_ts", "--dsa-decode-backend prims_ts"] },
         ],
       },
       {
@@ -1065,7 +1064,6 @@ sgl-router \\
         "HSA_USERPTR_FOR_PAGED_MEM=0",
         "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT=1",
         "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM=1",
-        "SGLANG_OPT_DFLASH_RING_LOCS_FUSED=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -1108,7 +1106,6 @@ sgl-router \\
         "HSA_USERPTR_FOR_PAGED_MEM=0",
         "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT=1",
         "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM=1",
-        "SGLANG_OPT_DFLASH_RING_LOCS_FUSED=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -1152,7 +1149,6 @@ sgl-router \\
         "SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION=0.1",
         "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT=1",
         "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM=1",
-        "SGLANG_OPT_DFLASH_RING_LOCS_FUSED=1",
         "SGLANG_SPEC_TP_SYNC=init,dflash-accept-greedy",
         "SGLANG_TIMEOUT_KEEP_ALIVE=7200",
         "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=3600",
@@ -1205,7 +1201,6 @@ sgl-router \\
         "PYTORCH_HIP_ALLOC_CONF=garbage_collection_threshold:0.99",
         "SGLANG_ROCM_RUNTIME_RESERVE_GB=10",
         "SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1",
-        "SGLANG_OPT_DFLASH_RING_LOCS_FUSED=1",
         "SGLANG_SPEC_TP_SYNC=init,dflash-accept-greedy",
         "SGLANG_TIMEOUT_KEEP_ALIVE=7200",
         "RUSTUP_TOOLCHAIN=stable",
@@ -1257,7 +1252,6 @@ sgl-router \\
         "HSA_USERPTR_FOR_PAGED_MEM=0",
         "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT=1",
         "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM=1",
-        "SGLANG_OPT_DFLASH_RING_LOCS_FUSED=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -1300,7 +1294,6 @@ sgl-router \\
         "HSA_USERPTR_FOR_PAGED_MEM=0",
         "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT=1",
         "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM=1",
-        "SGLANG_OPT_DFLASH_RING_LOCS_FUSED=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -1344,7 +1337,6 @@ sgl-router \\
         "SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION=0.1",
         "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT=1",
         "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM=1",
-        "SGLANG_OPT_DFLASH_RING_LOCS_FUSED=1",
         "SGLANG_SPEC_TP_SYNC=init,dflash-accept-greedy",
         "SGLANG_TIMEOUT_KEEP_ALIVE=7200",
         "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=3600",
@@ -1397,7 +1389,6 @@ sgl-router \\
         "PYTORCH_HIP_ALLOC_CONF=garbage_collection_threshold:0.99",
         "SGLANG_ROCM_RUNTIME_RESERVE_GB=10",
         "SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1",
-        "SGLANG_OPT_DFLASH_RING_LOCS_FUSED=1",
         "SGLANG_SPEC_TP_SYNC=init,dflash-accept-greedy",
         "SGLANG_TIMEOUT_KEEP_ALIVE=7200",
         "RUSTUP_TOOLCHAIN=stable",
@@ -1520,8 +1511,7 @@ sgl-router \\
         "--dist-timeout 3600",
         "--tp-size 32",
         "--ep-size 32",
-        "--dp-size 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--enable-dp-lm-head",
         "--linear-attn-prefill-backend flashkda",
         "--moe-runner-backend deep_gemm",

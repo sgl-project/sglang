@@ -5,6 +5,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.layers.attention import graph_utils
+from sglang.srt.layers.attention.dsa.dsa_dcp import DcpPageTableCache
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
 from sglang.srt.layers.attention.dsa_backend import (
     DeepseekSparseAttnBackend,
@@ -29,6 +30,54 @@ def _routed(pool):
     pool.start_layer, pool.layer_transfer_counter = 0, None
     pool.layer_router = PlainPoolRouter(pool, IdSpaceKind.FULL)
     return pool
+
+
+def _trtllm_backend(metadata, *, dsa_index_topk, **overrides):
+    """A BF16 trtllm DSA backend stand-in for calling ``_forward_trtllm`` on CPU."""
+    backend = SimpleNamespace(
+        forward_metadata=metadata,
+        _trtllm_fused_q=False,
+        kv_cache_dtype=torch.bfloat16,
+        kv_layers=_routed(
+            SimpleNamespace(get_key_buffer=lambda _layer_id: torch.zeros((24, 3)))
+        ).layer_router,
+        physical_page_size=1,
+        kv_cache_dim=3,
+        use_fused_topk=False,
+        qk_nope_head_dim=2,
+        kv_lora_rank=2,
+        qk_rope_head_dim=1,
+        workspace_buffer=None,
+        dsa_index_topk=dsa_index_topk,
+        _multi_ctas_kv_counter_buffer=None,
+        device="cpu",
+        num_q_heads=2,
+        num_dcp_q_heads=2,
+        attn_dcp_size=1,
+        dsa_shards_index_k=False,
+    )
+    backend.__dict__.update(overrides)
+    backend._pad_topk_indices = MethodType(
+        DeepseekSparseAttnBackend._pad_topk_indices, backend
+    )
+    backend._pad_trtllm_sparse_page_table = MethodType(
+        DeepseekSparseAttnBackend._pad_trtllm_sparse_page_table, backend
+    )
+    backend._multi_ctas_kv_counter_for = MethodType(
+        DeepseekSparseAttnBackend._multi_ctas_kv_counter_for, backend
+    )
+    return backend
+
+
+def _transform_index_page_table_dcp_reference(page_table, dcp_size, dcp_rank):
+    """CPU stand-in for the Triton kernel: keep this rank's interleaved global
+    slots as local slots (slot // dcp_size), packed to the front, -1 after."""
+    owned = (page_table >= 0) & (page_table % dcp_size == dcp_rank)
+    result = torch.full_like(page_table, -1)
+    for row in range(page_table.shape[0]):
+        local = page_table[row][owned[row]] // dcp_size
+        result[row, : local.numel()] = local
+    return result, owned.sum(dim=1).to(torch.int32)
 
 
 class TestDSABackendDPPadding(CustomTestCase):
@@ -124,6 +173,7 @@ class TestDSABackendDPPadding(CustomTestCase):
         batch = SimpleNamespace(
             forward_mode=ForwardMode.EXTEND,
             out_cache_loc=torch.arange(rows),
+            out_cache_loc_is_physical=False,
             positions=torch.arange(rows),
             mha_return_lse=False,
             _attn_output=None,
@@ -245,42 +295,97 @@ class TestDSABackendDPPadding(CustomTestCase):
         # prefill caller passes dsa_cache_seqlens_int32 with one row per token.
         self._check_trtllm_padding(is_prefill=True, per_token_seq_lens=True)
 
+    def test_trtllm_sharded_dcp_decode_attends_the_indexer_local_slots(self):
+        """Sharded DCP decode (Kimi-K3.1, trtllm / prims_ts): the indexer already
+        returns this rank's local KV slots and their counts, so attention must read
+        exactly those. Remapping them as interleaved global slots dropped most keys
+        and pointed the rest at other tokens' KV, which garbled every answer."""
+        dcp_size, dcp_rank = 2, 1
+        local_slots = torch.tensor([[4, 7, 10, -1], [6, -1, -1, -1]], dtype=torch.int32)
+        local_counts = torch.tensor([3, 1], dtype=torch.int32)
+        metadata = SimpleNamespace(
+            cache_seqlens_int32=torch.tensor([8, 12], dtype=torch.int32),
+            page_table_1=torch.zeros((2, 12), dtype=torch.int32),
+            max_seq_len_k=12,
+            dcp_topk_length=local_counts,
+        )
+        backend = _trtllm_backend(
+            metadata,
+            dsa_index_topk=4,
+            dsa_shards_index_k=True,
+            attn_dcp_size=dcp_size,
+            attn_dcp_rank=dcp_rank,
+            _dcp_page_table_cache=DcpPageTableCache(),
+            get_device_int32_arange=lambda n: torch.arange(n, dtype=torch.int32),
+        )
+        layer = SimpleNamespace(
+            layer_id=0, tp_q_head_num=2, head_dim=3, k_scale_float=None, scaling=1.0
+        )
+        captured = {}
+
+        def fake_dcp_attention(*, query, block_tables, seq_lens, **kwargs):
+            captured.update(block_tables=block_tables, seq_lens=seq_lens)
+            rows, _, heads, _ = query.shape
+            return torch.ones((rows, 1, heads, 2)), torch.zeros((rows, heads))
+
+        flashinfer = ModuleType("flashinfer")
+        flashinfer.decode = ModuleType("flashinfer.decode")
+        with (
+            patch.dict(
+                "sys.modules",
+                {"flashinfer": flashinfer, "flashinfer.decode": flashinfer.decode},
+            ),
+            patch(
+                "sglang.srt.layers.attention.dsa_backend.transform_index_page_table_decode",
+                side_effect=lambda *, page_table, topk_indices, page_size: topk_indices,
+            ),
+            patch(
+                "sglang.srt.layers.attention.dsa.dsa_dcp.transform_index_page_table_dcp",
+                side_effect=_transform_index_page_table_dcp_reference,
+            ),
+            patch(
+                "sglang.srt.layers.attention.dsa_backend.dcp_trtllm_sparse_attention",
+                side_effect=fake_dcp_attention,
+            ),
+            patch(
+                "sglang.srt.layers.attention.dsa_backend.get_in_autotune_dummy_run",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.layers.attention.dsa_backend.grow_multi_ctas_kv_counter_buffer_if_needed",
+                return_value=None,
+            ),
+            patch(
+                "sglang.srt.layers.attention.dsa_backend."
+                "dsa_cache_seqlens_may_be_padded",
+                return_value=False,
+            ),
+        ):
+            DeepseekSparseAttnBackend._forward_trtllm(
+                backend,
+                q=torch.zeros((2, 2, 3)),
+                k=None,
+                v=None,
+                layer=layer,
+                forward_batch=SimpleNamespace(),
+                seq_lens=metadata.cache_seqlens_int32,
+                save_kv_cache=False,
+                topk_indices=local_slots,
+                is_prefill=False,
+            )
+
+        self.assertEqual(
+            captured["block_tables"].squeeze(1).tolist(), local_slots.tolist()
+        )
+        self.assertEqual(captured["seq_lens"].tolist(), local_counts.tolist())
+
     def _check_trtllm_padding(self, *, is_prefill, per_token_seq_lens=False):
         metadata = SimpleNamespace(
             cache_seqlens_int32=torch.tensor([8, 12], dtype=torch.int32),
             page_table_1=torch.zeros((2, 12), dtype=torch.int32),
             max_seq_len_k=12,
         )
-        backend = SimpleNamespace(
-            forward_metadata=metadata,
-            kv_cache_dtype=torch.bfloat16,
-            kv_layers=_routed(
-                SimpleNamespace(get_key_buffer=lambda _layer_id: torch.zeros((24, 3)))
-            ).layer_router,
-            physical_page_size=1,
-            kv_cache_dim=3,
-            use_fused_topk=False,
-            qk_nope_head_dim=2,
-            kv_lora_rank=2,
-            qk_rope_head_dim=1,
-            workspace_buffer=None,
-            dsa_index_topk=2,
-            _multi_ctas_kv_counter_buffer=None,
-            device="cpu",
-            num_q_heads=2,
-            num_dcp_q_heads=2,
-            attn_dcp_size=1,
-            dsa_shards_index_k=False,
-        )
-        backend._pad_topk_indices = MethodType(
-            DeepseekSparseAttnBackend._pad_topk_indices, backend
-        )
-        backend._pad_trtllm_sparse_page_table = MethodType(
-            DeepseekSparseAttnBackend._pad_trtllm_sparse_page_table, backend
-        )
-        backend._multi_ctas_kv_counter_for = MethodType(
-            DeepseekSparseAttnBackend._multi_ctas_kv_counter_for, backend
-        )
+        backend = _trtllm_backend(metadata, dsa_index_topk=2)
 
         layer = SimpleNamespace(
             layer_id=0,

@@ -102,7 +102,9 @@ def allocate_attention_outputs(layer, query, value, index_query):
     rows = query.shape[0]
     sparse = index_query is not None
     # Follow v, not q: qk-norm may emit q in FP8 while the backend writes bf16.
-    dtype = query.dtype if value is None else value.dtype
+    # Callers pass layers that may not declare a per-layer output dtype.
+    out_dtype = getattr(layer, "out_dtype", None)
+    dtype = out_dtype or (query.dtype if value is None else value.dtype)
     if dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
         dtype = torch.bfloat16
     shape = (
@@ -132,7 +134,9 @@ def _new_attention_output(
     sizing the buffer off an fp8 dtype would silently cast-copy the result to
     fp8.
     """
-    out_dtype = v.dtype if v is not None else q.dtype
+    out_dtype = getattr(layer, "out_dtype", None) or (
+        v.dtype if v is not None else q.dtype
+    )
     if out_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
         out_dtype = torch.bfloat16
     if layer.qk_head_dim != layer.v_head_dim:
@@ -161,13 +165,16 @@ def padded_extend_real_tokens(
 ) -> Optional[int]:
     """The number of real rows of an extend batch of num_tokens rows that MLP sync
     padded to a multiple of attention TP, whose attention metadata covers only
-    those rows; None for a batch without such padding. Target verify plans its
-    padded rows itself."""
+    those rows; None for a batch without such padding. Target verify, and a
+    backend whose extend metadata covers the padded rows (DSA), plan the padded
+    rows themselves."""
     mode = forward_batch.forward_mode
     if not mode.is_extend() or mode.is_target_verify():
         return None
     real_num_tokens = forward_batch.global_num_token_non_padded_cpu
     if real_num_tokens is None or not 0 < real_num_tokens < num_tokens:
+        return None
+    if get_attn_backend().plans_padded_extend_rows:
         return None
     return real_num_tokens
 
