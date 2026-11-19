@@ -472,6 +472,8 @@ class GDNKernelDispatcher:
         # supports MTP verify) only applies when no explicit choice was made.
         # SM90 FlashInfer verify requires a fp32 SSM state, so e.g.
         # --mamba-ssm-dtype bfloat16 setups must be able to force Triton here.
+        self.verify_kernel_is_aiter = False
+        self.verify_conv_update = causal_conv1d_update
         if verify_backend is not None and verify_backend.is_triton():
             self.verify_kernel = triton_kernel
             self.verify_kernel_is_flashinfer = False
@@ -479,6 +481,24 @@ class GDNKernelDispatcher:
             self.verify_kernel = xpu_kernel
             self.tree_verify_kernel = xpu_kernel
             self.verify_kernel_is_flashinfer = False
+        elif verify_backend is not None and verify_backend.is_aiter():
+            if not (is_hip() and envs.SGLANG_USE_AITER.get()):
+                raise ValueError(
+                    "--linear-attn-verify-backend aiter requires ROCm with "
+                    "SGLANG_USE_AITER=1"
+                )
+            from aiter.ops.flydsl.causal_conv1d_update_kernels import (
+                causal_conv1d_update_sglang_flydsl,
+            )
+
+            from sglang.srt.layers.attention.linear.kernels.gdn_aiter import (
+                AiterGDNKernel,
+            )
+
+            self.verify_kernel = AiterGDNKernel()
+            self.verify_kernel_is_flashinfer = False
+            self.verify_kernel_is_aiter = True
+            self.verify_conv_update = causal_conv1d_update_sglang_flydsl
         elif (
             decode_backend.is_flashinfer() or prefill_backend.is_flashinfer()
         ) and flashinfer_kernel.supports_target_verify:
@@ -738,6 +758,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
     def _prefill_graph_extend_supported(self) -> bool:
         from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
+            external_prefill_body,
             get_prefill_num_tokens_to_capture,
         )
 
@@ -745,16 +766,23 @@ class GDNAttnBackend(MambaAttnBackendBase):
         capture_tokens = get_exec().graph.cuda_graph_config.prefill.bs or []
         supported = (
             is_cuda()
-            and isinstance(self.kernel_dispatcher.extend_kernel, TritonGDNKernel)
             and not self.enable_mis
             # The track plan's h rows assume the delta-rule chunk size.
             and self.mamba_chunk_size == FLA_CHUNK_SIZE
             and all(conv.is_contiguous() for conv in mamba_cache.conv)
             and mamba_cache.temporal.is_contiguous()
-            and buckets_keep_chunk_o_block_size(
+        )
+        if isinstance(self.kernel_dispatcher.extend_kernel, TritonGDNKernel):
+            supported = supported and buckets_keep_chunk_o_block_size(
                 get_prefill_num_tokens_to_capture(capture_tokens)
             )
-        )
+        elif supported:
+            # Another extend kernel is captured only inside an external body.
+            body = external_prefill_body(self._model_runner.model)
+            max_seqs = None if body is None else body.linear_prefill_graph_seqs(self)
+            supported = max_seqs is not None
+            if supported:
+                self.prefill_graph_max_seqs = min(self.req_to_token_pool.size, max_seqs)
         rank0_log(
             "GDN prefill extend inside breakable prefill CUDA graphs: "
             + ("on" if supported else "unsupported here, layers keep breaking")
@@ -1331,6 +1359,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
         """forward_extend's plain-extend chain on a captured bucket's static
         tables, so every launch grid depends only on the bucket. Rows past the
         batch belong to no sequence; chunk_fwd_o leaves them zero."""
+        if not isinstance(self.kernel_dispatcher.extend_kernel, TritonGDNKernel):
+            raise RuntimeError("only an external prefill body captures this extend")
         meta = self.prefill_graph_metadata
         layer_cache = self.state_layer_cache(layer.layer_id)
         conv_states = layer_cache.conv[0]
@@ -1434,7 +1464,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             intermediate_state_indices = select_verify_intermediate_state_indices(
                 self.verify_intermediate_state_indices,
                 forward_batch.req_pool_indices,
-                cache_indices[: query_start_loc.shape[0] - 1] >= 0,
+                lambda: cache_indices[: query_start_loc.shape[0] - 1] >= 0,
                 self.req_to_token_pool.size,
             )
             mamba_pool = self.state_pool
@@ -1476,7 +1506,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             mixed_qkv_reshaped = mixed_qkv.view(
                 batch_size, draft_token_num, -1
             ).transpose(1, 2)
-            mixed_qkv_processed = causal_conv1d_update(
+            mixed_qkv_processed = self.kernel_dispatcher.verify_conv_update(
                 mixed_qkv_reshaped,
                 conv_states,
                 layer.conv_weights,
