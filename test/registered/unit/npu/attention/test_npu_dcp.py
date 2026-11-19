@@ -464,31 +464,29 @@ class TestNpuDcpBufferAndLseHelpers(unittest.TestCase):
     def test_pd_buffer_infos_expand_only_global_page_strides(self):
         pool = object.__new__(NPUMLATokenToKVPool)
         pool.use_combined_kv_buffer = False
-        pool.k_buffer = [torch.empty(4, 8, 1, 2)]
-        pool.v_buffer = [torch.empty(4, 8, 1, 1)]
+        # Match the pool's stacked [layer, page, token, head, dim] tensors.
+        pool.k_buffer = torch.empty(2, 4, 8, 1, 2)
+        pool.v_buffer = torch.empty(2, 4, 8, 1, 1)
         pool.dcp_size = 4
         pool.is_draft_worker = False
         pool.dsa_kv_cache_store_fp8 = False
         pool.index_head_dim = 2
         pool.page_size = 8
         pool.index_page_size = 8
-        pool.index_k_buffer = [torch.empty(4, 8, 1, 2)]
-        pool.index_k_scale_buffer = [torch.empty(4, 8, 1)]
+        pool.index_k_buffer = torch.empty(2, 4, 8, 1, 2)
+        pool.index_k_scale_buffer = torch.empty(2, 4, 8, 1)
 
         ptrs, lens, item_lens = pool.get_contiguous_buf_infos()
-        buffers = pool.k_buffer + pool.v_buffer
+        buffers = list(pool.k_buffer) + list(pool.v_buffer)
 
         self.assertEqual(ptrs, [buffer.data_ptr() for buffer in buffers])
         self.assertEqual(lens, [buffer.nbytes for buffer in buffers])
         self.assertEqual(
             item_lens,
-            [
-                pool.k_buffer[0][0].nbytes,
-                pool.v_buffer[0][0].nbytes,
-            ],
+            [buffer[0].nbytes for buffer in buffers],
         )
         state_ptrs, _, state_item_lens = pool.get_state_buf_infos()
-        state_buffers = pool.index_k_buffer + pool.index_k_scale_buffer
+        state_buffers = list(pool.index_k_buffer) + list(pool.index_k_scale_buffer)
         self.assertEqual(state_ptrs, [buffer.data_ptr() for buffer in state_buffers])
         self.assertEqual(
             state_item_lens, [buffer[0].nbytes for buffer in state_buffers]

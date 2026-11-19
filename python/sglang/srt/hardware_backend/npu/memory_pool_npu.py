@@ -1207,9 +1207,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     # for disagg
     def get_contiguous_buf_infos(self):
         self._raise_if_native_kv_cache_disabled()
-        buffers = self.kv_buffer if self.use_combined_kv_buffer else self.k_buffer
+        buffers = list(self.kv_buffer if self.use_combined_kv_buffer else self.k_buffer)
         if self._pd_kv_buffer_groups == 2:
-            buffers = buffers + self.v_buffer
+            buffers += list(self.v_buffer)
         page_scale = self.dcp_size if self.is_draft_worker else 1
         return (
             [buffer.data_ptr() for buffer in buffers],
