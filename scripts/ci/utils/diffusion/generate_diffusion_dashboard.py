@@ -296,11 +296,35 @@ def generate_dashboard(
 
     Returns the markdown string.
     """
+    history_count = len(history)
+    history = [
+        run
+        for run in history
+        if run.get("methodology") == current.get("methodology")
+        and run.get("warmup_requests") == current.get("warmup_requests")
+    ]
     lines: list[str] = []
     lines.append("# SGLang-Diffusion Nightly Performance Dashboard\n")
     ts = current.get("timestamp", datetime.now(timezone.utc).isoformat())
     sha = current.get("commit_sha", "unknown")
     lines.append(f"*Generated: {_short_date(ts)} | Commit: `{_short_sha(sha)}`*\n")
+    methodology = current.get("methodology")
+    if methodology:
+        warmups = current.get("warmup_requests", 1)
+        lines.append(
+            f"*Methodology `{methodology}`: client-side latency through each "
+            "framework's public API, from submit until the output is downloaded; "
+            f"{warmups} identical client warmup request(s) per case, discarded. "
+            "First request = the first request after the server reports ready. "
+            "Server perf dumps are telemetry only.*\n"
+        )
+    excluded_runs = history_count - len(history)
+    if excluded_runs:
+        lines.append(
+            f"*Excluded {excluded_runs} historical run(s) from baselines and trends "
+            "because their measurement methodology or warmup count differs. "
+            "Missing metadata is not treated as matching explicit metadata.*\n"
+        )
 
     current_cases = _extract_case_results(current)
     current_records = _extract_case_records(current)
@@ -371,8 +395,8 @@ def generate_dashboard(
         risk_map[cid] = _assess_risk(cid, current_cases, history, other_frameworks)
 
     # Dynamic header
-    header = "| Model | Risk | Client samples | Server samples |"
-    sep = "|-------|------|----------------|----------------|"
+    header = "| Model | Risk | Client samples | Server samples | First request (s) |"
+    sep = "|-------|------|----------------|----------------|-------------------|"
     for fw in all_frameworks:
         header += f" {fw} median (s) |"
         sep += "---------|"
@@ -406,7 +430,8 @@ def generate_dashboard(
         risk_emoji, _ = risk_map.get(cid, ("✅", ""))
         row = (
             f"| {r['model'].split('/')[-1]} | {risk_emoji} | "
-            f"{sample_count or 'N/A'} | {server_samples} |"
+            f"{sample_count or 'N/A'} | {server_samples} | "
+            f"{_fmt_latency(sg_record.get('first_request_latency_s'))} |"
         )
         # Latency columns -- bold the fastest
         lats = {fw: case_fws.get(fw) for fw in all_frameworks}

@@ -2,15 +2,42 @@
 import base64
 import os
 import re
+import tempfile
+from pathlib import Path
 
 
-def save_base64_image_to_path(base64_data: str, target_path: str) -> str:
+def ensure_path_within_root(target_path: str, root_dir: str) -> str:
+    root_path = Path(root_dir).resolve()
+    candidate = Path(target_path).resolve()
+    if root_path != candidate and root_path not in candidate.parents:
+        raise ValueError("Upload path escapes the uploads root")
+    return str(candidate)
+
+
+def save_image_bytes_to_path(content: bytes, target_path: str) -> str:
+    """Publish a complete input without truncating an existing file on failure."""
+    directory = os.path.dirname(target_path)
+    os.makedirs(directory, exist_ok=True)
+    fd, part_path = tempfile.mkstemp(dir=directory)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(content)
+        os.replace(part_path, target_path)
+    finally:
+        if os.path.exists(part_path):
+            os.remove(part_path)
+    return target_path
+
+
+def save_base64_image_to_path(
+    base64_data: str, target_path: str, *, uploads_root: str | None = None
+) -> str:
     b64_format_hint = (
         "Failed to decode base64 image. "
         "Expected format: `data:[<media-type>];base64,<data>`"
     )
 
-    match = re.match(r"data:(.*?)(;base64)?,(.*)", base64_data)
+    match = re.match(r"data:([^,;\r\n]*)(;base64)?,((?s:.*))", base64_data)
     if not match:
         raise ValueError(b64_format_hint)
     media_type = match.group(1)
@@ -28,14 +55,11 @@ def save_base64_image_to_path(base64_data: str, target_path: str) -> str:
     else:
         ext = "jpg"
     target_path = f"{target_path}.{ext}"
-    os.makedirs(os.path.dirname(target_path), exist_ok=True)
-
+    if uploads_root is not None:
+        target_path = ensure_path_within_root(target_path, uploads_root)
     try:
         image_data = base64.b64decode(data)
     except Exception as exc:
         raise Exception(f"Failed to decode base64 image: {str(exc)}") from exc
 
-    with open(target_path, "wb") as f:
-        f.write(image_data)
-
-    return target_path
+    return save_image_bytes_to_path(image_data, target_path)

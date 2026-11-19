@@ -15,8 +15,8 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.utils import normalize_base_url, release_port, reserve_port
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
-register_cpu_ci(est_time=8, suite="stage-b-test-cpu-intel")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8, suite="extra-test-cpu-intel")
 
 
 class TestTryBindSocket(CustomTestCase):

@@ -67,7 +67,7 @@ export const KimiK3MambaRatioCalculator = () => {
     const hasFlag = (name) => flags.some((f) => f.split(/[\s=]/)[0] === name);
 
     const tp = Number(flagArg("--tp-size")) || 8;
-    const dp = hasFlag("--enable-dp-attention") ? Number(flagArg("--dp-size")) || 1 : 1;
+    const dp = Number(flagArg("--attn-dp-size")) || 1;
     // KDA state and the replicated MLA KV both live per attention-TP group.
     // PP needs no term: it splits the layers of both pools equally.
     const attnTp = Math.max(1, Math.round(tp / dp));
@@ -98,8 +98,7 @@ export const KimiK3MambaRatioCalculator = () => {
     // the decode-lock skip, plus the ping-pong track buffer (2 under the overlap
     // scheduler, 1 for lazy or without overlap). no_buffer has no track buffer and
     // adds the skip's drop back, so it stays 3; a disabled radix cache is 1.
-    // A PD decode server runs a chunk cache: one live slot per request, and the
-    // radix-strategy knobs are inert there.
+    // A PD decode server disables it too; the radix-strategy knobs are inert there.
     const slots = pdRole === "decode"
       ? 1
       : radixOff
@@ -231,15 +230,15 @@ export const KimiK3MambaRatioCalculator = () => {
       : `DSPARK (D = ${block + 1})`;
   const derivedChips = [
     // With DP attention on, show the whole topology so a large-scale preset is
-    // visibly understood: total GPUs = DP replicas x attention-TP group width.
+    // visibly understood: total GPUs = attention DP size x attention-TP group width.
     dp > 1
-      ? `${tp} GPUs = DP ${dp} × Attention TP ${attnTp}`
+      ? `${tp} GPUs = Attention DP ${dp} × Attention TP ${attnTp}`
       : `Attention TP ${attnTp}`,
     `DCP ${dcp}`,
     `KV ${kvDtype === "fp8_e4m3" ? "FP8" : "BF16"}`,
     `State ${ssmDtype === "float32" ? "FP32" : ssmDtype === "bfloat16" ? "BF16" : "FP16"}`,
     pdRole === "decode"
-      ? "PD decode: chunk cache (S = 1)"
+      ? "PD decode: radix off (S = 1)"
       : radixOff
         ? "Radix off (S = 1)"
         : `${strategy}${skipLock ? " + slot saving" : ""} (S = ${slots})`,

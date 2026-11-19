@@ -19,11 +19,10 @@ Guards (undertrained checkpoint — code-path correctness, not answer quality):
   - a long-generation turn that slides past the SWA window (exercises
     out-of-window free_swa -> float holes -> in-place reuse during decode).
 
-An optional env-gated parity class re-runs fixed prompts on the STATIC pools
-and compares logprobs (``INKLING_UNIFIED_PARITY=1``) — the eval-host lane;
-kept out of per-commit CI to bound cost.
+The unified-vs-static logprob parity check lives in
+test/manual/models/test_inkling_unified_parity.py (two server boots).
 
-    python -m pytest test/registered/models/test_inkling_unified.py -v
+    python -m pytest test/registered/e2e/models/test_inkling_unified.py -v
 """
 
 import os
@@ -45,7 +44,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=115, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=120, stage="extra-a", runner_config="1-gpu-large")
 
 _MODEL_PATH = os.environ.get("INKLING_TEST_MODEL_PATH", "thinkingmachines/Inkling")
 _MODEL_REVISION = os.environ.get("INKLING_TEST_MODEL_REVISION", "test")
@@ -77,31 +76,6 @@ def _unified_args(*, attention_backend="triton", prefill_cuda_graph=False):
         # cells cannot serve it (the cuda-graph metadata path has no EXTEND
         # branch), so pin it off rather than lean on the auto-fallback.
         args += ["--cuda-graph-backend-prefill", "disabled"]
-    if _MODEL_REVISION:
-        args += ["--revision", _MODEL_REVISION]
-    return args
-
-
-def _static_args():
-    args = [
-        "--trust-remote-code",
-        "--attention-backend",
-        "triton",
-        "--page-size",
-        "128",
-        "--mamba-radix-cache-strategy",
-        "extra_buffer",
-        # Match the unified cell's Triton pin, which cannot serve Inkling's
-        # default FULL prefill graph.
-        "--cuda-graph-backend-prefill",
-        "disabled",
-        "--swa-full-tokens-ratio",
-        "0.1",
-        "--mamba-full-memory-ratio",
-        "0.1",
-        "--mem-fraction-static",
-        "0.5",
-    ]
     if _MODEL_REVISION:
         args += ["--revision", _MODEL_REVISION]
     return args
@@ -204,10 +178,11 @@ class TestInklingUnifiedFullPrefillGraph(TestInklingUnifiedTriPool):
 
     The pairing used to be a hard boot failure: unified disabled prefill
     capture outright. With capture on, both the captured block table and the
-    SWA write loc have to come from the translator. Re-running the full->swa
+    SWA write loc have to come from the runner_ids. Re-running the full->swa
     map on `out_cache_loc` does not work here -- it is already FULL-side
-    kernel-facing by then, and indexes far past the swa v2p table (a
-    device-side "index out of bounds" assert).
+    physical by then, and a full physical page number is also a valid
+    virtual page of the swa v2p, so the map would silently resolve it to an
+    unrelated token's swa slot.
     `test_input_output_logprobs_match` is the sharp guard: a wrong-slot SWA
     write moves logprobs at once, and
     `test_long_decode_slides_past_swa_window` keeps compaction running
@@ -217,47 +192,6 @@ class TestInklingUnifiedFullPrefillGraph(TestInklingUnifiedTriPool):
     @classmethod
     def server_args(cls):
         return _unified_args(attention_backend="fa4", prefill_cuda_graph=True)
-
-
-@unittest.skipUnless(
-    os.environ.get("INKLING_UNIFIED_PARITY") == "1",
-    "eval-host lane: set INKLING_UNIFIED_PARITY=1 (two sequential server boots)",
-)
-class TestInklingUnifiedVsStaticParity(CustomTestCase):
-    """Greedy logprob parity: unified tri-pool vs static pools, same prompts.
-    Two sequential boots -- the strongest wrong-slot tripwire short of GSM8K."""
-
-    @classmethod
-    def _collect(cls, other_args):
-        proc = popen_launch_server(
-            _MODEL_PATH,
-            DEFAULT_URL_FOR_TEST,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=other_args,
-        )
-        try:
-            out = []
-            for p in _PARITY_PROMPTS:
-                data = _greedy_generate(
-                    DEFAULT_URL_FOR_TEST, p, max_new_tokens=32, logprobs=True
-                )
-                out.append(
-                    (
-                        data["text"],
-                        [t[0] for t in data["meta_info"]["output_token_logprobs"]],
-                    )
-                )
-            return out
-        finally:
-            kill_process_tree(proc.pid)
-
-    def test_parity(self):
-        static = self._collect(_static_args())
-        unified = self._collect(_unified_args())
-        for (s_text, s_lp), (u_text, u_lp) in zip(static, unified):
-            self.assertEqual(s_text, u_text)
-            for a, b in zip(s_lp, u_lp):
-                self.assertAlmostEqual(a, b, places=2)
 
 
 if __name__ == "__main__":

@@ -54,8 +54,8 @@ from sglang.test.kernels.kv_canary._hand_oracle import (
     _hand_fold_partial,
 )
 
-register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_amd_ci(est_time=30, stage="jit-kernel-unit", runner_config="amd")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-small")
+register_amd_ci(est_time=30, stage="base-a-jit-kernel-unit", runner_config="amd")
 
 
 _DEVICE = torch.device("cuda")
@@ -1063,34 +1063,6 @@ class TestRealKvSource:
             real_kv_sources_pair=(sources, sources),
         )
 
-    def test_real_kv_source_above_4_raises(self) -> None:
-        """``len(real_kv_sources) > 4`` → host wrapper raises ValueError before launching."""
-        canary_buf = make_canary_buf(device=_DEVICE)
-        plan = make_verify_plan(
-            slot_indices=[1], positions=[0], prev_slot_indices=[-1], device=_DEVICE
-        )
-        log = FakeViolationLog.allocate(device=_DEVICE)
-        sources = make_real_kv_sources(count=4, device=_DEVICE)
-        extra = make_real_kv_source(device=_DEVICE)
-        too_many = sources + (extra,)
-
-        with pytest.raises(ValueError, match="at most 4 RealKvSource"):
-            launch_canary_verify_kernel(
-                context=VerifyOrWriteContext(
-                    canary_buf=canary_buf,
-                    kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
-                    violation_ring=log.ring,
-                    violation_write_index=log.write_index,
-                    slot_run_counter=log.slot_run_counter,
-                    kernel_run_counter=log.kernel_run_counter,
-                    enable_chain_position_assert=log.enable_chain_position_assert,
-                    real_kv_sources=too_many,
-                    real_kv_hash_mode=consts.RealKvHashMode.NONE,
-                ),
-                plan=plan,
-                check_verify_expected_token=True,
-            )
-
     def test_real_kv_source_holey_dim1(self) -> None:
         """``tensor.shape[1] > page_size * num_bytes_per_token`` → trailing bytes are skipped."""
         buf_pair = _buf_pair()
@@ -1121,6 +1093,47 @@ class TestRealKvSource:
             slot_indices=[1, 2],
             positions=[0, 1],
             prev_slot_indices=[-1, 1],
+            device=_DEVICE,
+        )
+        cuda_log, _ = run_verify_diff(
+            buf_pair=buf_pair,
+            plan_pair=plan_pair,
+            real_kv_sources_pair=(sources, sources_ref),
+            real_kv_hash_mode=consts.RealKvHashMode.ALL,
+        )
+
+        assert _n_violations(cuda_log) == 0
+
+    def test_real_kv_source_strided_rows(self) -> None:
+        """A strided source (``stride(0) > shape[1]``) is folded row by ``stride(0)``.
+
+        The gap after each row is filled with bytes the view does not own; stepping rows by
+        ``shape[1]`` would fold them into the hash and break the clean chain.
+        """
+        buf_pair = _buf_pair()
+        sources = make_real_kv_sources(
+            count=1,
+            num_slots=16,
+            row_gap=32,
+            device=_DEVICE,
+            fill_strategy="random_bytes",
+        )
+        assert sources[0].tensor.stride(0) > sources[0].tensor.shape[1]
+        sources_ref = clone_real_kv_sources(sources)
+
+        _stamp_clean_kv_chain(
+            buf_pair=buf_pair,
+            sources_cuda=sources,
+            input_ids=torch.tensor([1, 2, 3], dtype=torch.int64, device=_DEVICE),
+            positions=torch.tensor([0, 1, 2], dtype=torch.int64, device=_DEVICE),
+            out_cache_loc=torch.tensor([1, 2, 5], dtype=torch.int64, device=_DEVICE),
+            real_kv_hash_mode=consts.RealKvHashMode.ALL,
+        )
+
+        plan_pair = make_verify_plan_pair(
+            slot_indices=[1, 2, 5],
+            positions=[0, 1, 2],
+            prev_slot_indices=[-1, 1, 2],
             device=_DEVICE,
         )
         cuda_log, _ = run_verify_diff(

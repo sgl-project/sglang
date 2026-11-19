@@ -47,16 +47,30 @@ def run_gh_command(args: list[str], max_retries: int = 10) -> dict:
     the utilization numerator whenever GH API hiccuped, severely
     undercounting busy time on busy days.
     """
-    last_err = ""
+    # A stalled gh process must not occupy a worker until the workflow's
+    # 55-minute timeout. Bound both each request and the whole retry loop.
+    deadline = time.monotonic() + 120
+    last_err = "retry budget exhausted"
+    attempts = 0
     for attempt in range(max_retries):
-        result = subprocess.run(
-            ["gh", "api"] + args,
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode == 0:
-            return json.loads(result.stdout)
-        last_err = result.stderr or "(no stderr)"
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        attempts += 1
+        request_timeout = min(30, remaining)
+        try:
+            result = subprocess.run(
+                ["gh", "api"] + args,
+                capture_output=True,
+                text=True,
+                timeout=request_timeout,
+            )
+        except subprocess.TimeoutExpired:
+            last_err = f"request timeout after {request_timeout:.1f}s"
+        else:
+            if result.returncode == 0:
+                return json.loads(result.stdout)
+            last_err = result.stderr or "(no stderr)"
         # Detect retryable conditions: HTTP 5xx, secondary rate limit, abuse
         # detection, network resets. 4xx other than 429 are non-retryable.
         retryable = any(
@@ -76,12 +90,20 @@ def run_gh_command(args: list[str], max_retries: int = 10) -> dict:
                 "timeout",
             )
         )
-        if not retryable:
+        if not retryable or attempts >= max_retries:
+            break
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
             break
         # Exponential backoff with jitter, capped at 60s.
-        delay = min(60, (2**attempt) + random.uniform(0, 1))
+        delay = min(60, (2**attempt) + random.uniform(0, 1), remaining)
+        print(
+            f"Retrying {args[0]} after attempt {attempts}: "
+            f"{last_err.strip()[:200]} (waiting {delay:.1f}s)",
+            flush=True,
+        )
         time.sleep(delay)
-    raise Exception(f"gh api failed after {max_retries} attempts: {last_err[:300]}")
+    raise RuntimeError(f"gh api failed after {attempts} attempts: {last_err[:300]}")
 
 
 def get_workflow_runs(
@@ -462,6 +484,14 @@ _NON_GPU_WORKFLOW_HINTS = (
     "model inventory",
 )
 
+# These high-volume metadata workflows use pull_request_target/workflow_run,
+# so the short pull_request/push gate below does not skip them. Match paths,
+# not PR-controlled run titles: a GPU test can mention either workflow name.
+_HOSTED_ONLY_WORKFLOW_PATHS = {
+    ".github/workflows/pr-check-comment.yml",
+    ".github/workflows/pr-title.yml",
+}
+
 
 def percentile(values: list[float], p: float) -> float | None:
     if not values:
@@ -542,7 +572,7 @@ def queue_timeline(
     ]
 
 
-def _likely_no_gpu_jobs(workflow_name: str) -> bool:
+def _likely_no_gpu_jobs(workflow_name: str, workflow_path: str = "") -> bool:
     """Heuristic: skip per-run job-fetch for workflows that don't dispatch
     to self-hosted GPU runners. The GH API rate limit is the bottleneck on
     busy 24h windows where ~18k workflow runs fire — but only a fraction
@@ -550,6 +580,8 @@ def _likely_no_gpu_jobs(workflow_name: str) -> bool:
     on GPU runners. Skipping the bookkeeping/docs/lint/release runs cuts
     the API call budget roughly in half.
     """
+    if workflow_path in _HOSTED_ONLY_WORKFLOW_PATHS:
+        return True
     if not workflow_name:
         return False
     n = workflow_name.lower()
@@ -561,6 +593,7 @@ def calculate_utilization(
     hours: float = 24,
     runner_filter: str = None,
     lookback_hours: float = None,
+    job_name_filter: str = None,
 ):
     """Calculate runner utilization metrics.
 
@@ -593,7 +626,7 @@ def calculate_utilization(
         # self-hosted runner. Dispatched runs (e.g. rerun-test) go straight
         # to a GPU runner, so they are always fetched.
         if (
-            _likely_no_gpu_jobs(r.get("name", ""))
+            _likely_no_gpu_jobs(r.get("name", ""), r.get("path", ""))
             or r.get("conclusion") in ("skipped", "action_required")
             or (
                 r.get("event") in ("pull_request", "push")
@@ -713,6 +746,18 @@ def calculate_utilization(
                 failed_runs.append((run_id, err))
             elif jobs:
                 all_jobs.extend(jobs)
+
+    if job_name_filter:
+        import re as _re_jnf
+
+        _jnf = _re_jnf.compile(job_name_filter, _re_jnf.IGNORECASE)
+        n_before = len(all_jobs)
+        all_jobs = [j for j in all_jobs if _jnf.search(j.get("name") or "")]
+        print(
+            f"Job-name filter {job_name_filter!r}: kept "
+            f"{len(all_jobs)}/{n_before} jobs — utilization below reads as "
+            f"the share of each pool consumed by the matching jobs."
+        )
 
     print(f"Processing {len(all_jobs)} jobs...")
     if failed_runs:
@@ -1050,6 +1095,15 @@ def main():
     parser.add_argument(
         "--filter", type=str, help="Filter runner labels (e.g., '5090', 'h200')"
     )
+    parser.add_argument(
+        "--job-name-filter",
+        type=str,
+        help=(
+            "Regex; only jobs whose NAME matches are counted (e.g. "
+            "'multimodal|diffusion'). Utilization then reads as the share "
+            "of each pool consumed by the matching jobs."
+        ),
+    )
     parser.add_argument("--output", type=str, help="Output file (default: stdout)")
     parser.add_argument(
         "--queue-series-out",
@@ -1059,7 +1113,16 @@ def main():
     args = parser.parse_args()
 
     results, fetch_failure_pct, longest_waits, coverage_hours = calculate_utilization(
-        args.repo, args.hours, args.filter, lookback_hours=args.lookback_hours
+        args.repo,
+        args.hours,
+        args.filter,
+        lookback_hours=args.lookback_hours,
+        job_name_filter=args.job_name_filter,
+    )
+    title_suffix = (
+        f" — jobs matching {args.job_name_filter!r} only"
+        if args.job_name_filter
+        else ""
     )
     report = format_report(
         results,
@@ -1068,6 +1131,12 @@ def main():
         longest_waits=longest_waits,
         coverage_hours=coverage_hours,
     )
+    if args.job_name_filter:
+        report = report.replace(
+            "# Runner Utilization Report",
+            "# Runner Utilization Report" + title_suffix,
+            1,
+        )
 
     if args.queue_series_out:
         # Every bucket carries its own start, so the window needs no separate

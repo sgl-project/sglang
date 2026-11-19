@@ -19,6 +19,7 @@ Keep module scope limited to the standard library and import-neutral types.
 
 from __future__ import annotations
 
+import io
 import logging
 import pickle
 import sys
@@ -78,6 +79,25 @@ def _warn_if_runtime_imported_early() -> None:
     )
 
 
+def _restore_config_tensor(data: bytes):
+    import torch
+
+    return torch.load(io.BytesIO(data), map_location="cpu", weights_only=True)
+
+
+class _ConfigPickler(pickle.Pickler):
+    def reducer_override(self, obj):
+        import torch
+
+        # Tensor subclasses may need globals rejected by the weights-only loader.
+        if type(obj) in (torch.Tensor, torch.nn.Parameter) and obj.device.type == "cpu":
+            # Tensor's pickle reducer uses legacy torch.save, which warns on NPU.
+            buffer = io.BytesIO()
+            torch.save(obj, buffer, _use_new_zipfile_serialization=True)
+            return _restore_config_tensor, (buffer.getvalue(),)
+        return NotImplemented
+
+
 @dataclass(frozen=True, slots=True)
 class ServerArgsPayload:
     """A deferred ``ServerArgs`` snapshot safe to unpickle before bootstrap."""
@@ -86,7 +106,9 @@ class ServerArgsPayload:
 
     @classmethod
     def capture(cls, server_args: ServerArgs) -> ServerArgsPayload:
-        return cls(pickle.dumps(server_args, protocol=pickle.HIGHEST_PROTOCOL))
+        buffer = io.BytesIO()
+        _ConfigPickler(buffer, protocol=pickle.HIGHEST_PROTOCOL).dump(server_args)
+        return cls(buffer.getvalue())
 
     def materialize(self) -> ServerArgs:
         # Importing ServerArgs pulls in pipeline configuration modules. This
@@ -114,35 +136,39 @@ def bootstrap_scheduler_process(spec: SchedulerProcessSpec) -> None:
     # Arm PDEATHSIG before any vendor code runs: everything below can block,
     # and a child that hangs there would outlive a dead launcher.
     from sglang.multimodal_gen.runtime.utils.process import (
+        defer_full_gc_for_imports,
         kill_itself_when_parent_died,
+        use_thread_lock_for_tqdm,
     )
 
     kill_itself_when_parent_died()
+    use_thread_lock_for_tqdm()
 
     # Every rank re-executes the same script, so one rank reporting is enough.
     if spec.rank == 0:
         _warn_if_runtime_imported_early()
 
-    # Platform initialization is the first extensible runtime action. In
-    # particular it precedes plugin callbacks and hook target resolution, both
-    # of which may import arbitrary runtime modules.
-    from sglang.multimodal_gen.runtime.platforms import initialize_current_platform
+    with defer_full_gc_for_imports():
+        # Platform initialization is the first extensible runtime action. In
+        # particular it precedes plugin callbacks and hook target resolution, both
+        # of which may import arbitrary runtime modules.
+        from sglang.multimodal_gen.runtime.platforms import initialize_current_platform
 
-    initialize_current_platform()
+        initialize_current_platform()
 
-    from sglang.multimodal_gen.runtime.platforms.plugins import (
-        apply_plugin_hooks,
-        load_plugins,
-    )
+        from sglang.multimodal_gen.runtime.platforms.plugins import (
+            apply_plugin_hooks,
+            load_plugins,
+        )
 
-    load_plugins()
-    apply_plugin_hooks()
+        load_plugins()
+        apply_plugin_hooks()
 
-    server_args = spec.server_args.materialize()
+        server_args = spec.server_args.materialize()
 
-    # Resolve the function from its module after hook application. A ``from``
-    # binding created earlier would retain the unpatched callable.
-    from sglang.multimodal_gen.runtime.managers import gpu_worker
+        # Resolve the function from its module after hook application. A ``from``
+        # binding created earlier would retain the unpatched callable.
+        from sglang.multimodal_gen.runtime.managers import gpu_worker
 
     gpu_worker.run_scheduler_process(
         local_rank=spec.local_rank,
@@ -152,8 +178,11 @@ def bootstrap_scheduler_process(spec: SchedulerProcessSpec) -> None:
     )
 
 
-def bootstrap_http_server_process(server_args: ServerArgsPayload) -> None:
+def bootstrap_http_server_process(
+    server_args: ServerArgsPayload, worker_pids: tuple[int, ...] = ()
+) -> None:
     from sglang.multimodal_gen.runtime.utils.process import (
+        defer_full_gc_for_imports,
         kill_itself_when_parent_died,
     )
 
@@ -161,16 +190,19 @@ def bootstrap_http_server_process(server_args: ServerArgsPayload) -> None:
 
     _warn_if_runtime_imported_early()
 
-    # No initialize_current_platform() here: this child serves HTTP and never
-    # touches the device, so it has no reason to bring up a vendor backend.
-    from sglang.multimodal_gen.runtime.platforms.plugins import (
-        apply_plugin_hooks,
-        load_plugins,
-    )
+    with defer_full_gc_for_imports():
+        # No initialize_current_platform() here: this child serves HTTP and never
+        # touches the device, so it has no reason to bring up a vendor backend.
+        from sglang.multimodal_gen.runtime.platforms.plugins import (
+            apply_plugin_hooks,
+            load_plugins,
+        )
 
-    load_plugins()
-    apply_plugin_hooks()
+        load_plugins()
+        apply_plugin_hooks()
 
-    from sglang.multimodal_gen.runtime import launch_server
+        from sglang.multimodal_gen.runtime import launch_server
 
-    launch_server.launch_http_server_only(server_args.materialize())
+        materialized = server_args.materialize()
+
+    launch_server.launch_http_server_only(materialized, worker_pids=worker_pids)

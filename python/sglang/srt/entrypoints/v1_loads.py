@@ -49,8 +49,8 @@ def _num_accelerators_per_dp_rank() -> int:
     """
     parallel = get_parallel()
     num_accelerators = parallel.tp_size * parallel.pp_size
-    if parallel.enable_dp_attention:
-        num_accelerators //= parallel.dp_size
+    if parallel.attn_dp_enabled:
+        num_accelerators //= parallel.num_dp_ranks
     return num_accelerators
 
 

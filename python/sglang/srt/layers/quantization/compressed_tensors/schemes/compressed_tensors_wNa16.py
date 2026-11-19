@@ -25,7 +25,6 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
 from sglang.srt.layers.quantization.marlin_utils import (
     MarlinLinearLayerConfig,
     apply_gptq_marlin_linear,
-    check_marlin_supports_shape,
     marlin_is_k_full,
     marlin_make_empty_g_idx,
     marlin_make_workspace,
@@ -51,13 +50,62 @@ ScalarType, scalar_types = get_scalar_types()
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["CompressedTensorsWNA16"]
+__all__ = ["CompressedTensorsWNA16", "XPUCompressedTensorsWNA16"]
 WNA16_SUPPORTED_TYPES_MAP = {
     4: scalar_types.uint4b8,
     8: scalar_types.uint8b128
 }
 WNA16_ZP_SUPPORTED_TYPES_MAP = {4: scalar_types.uint4, 8: scalar_types.uint8}
 WNA16_SUPPORTED_BITS = list(WNA16_SUPPORTED_TYPES_MAP.keys())
+
+# Marlin repack and GEMM tile the output (N) dimension by 64 columns.  A
+# checkpoint whose intermediate size is not a multiple of 64 (for example the
+# 8608-wide Gemma-4-31B AWQ checkpoint) is padded up to the next tile here; the
+# extra columns are dropped again in apply_weights().
+MARLIN_TILE_N = 64
+
+# Marlin GEMM thread configs (gptq_marlin.cuh) pair (thread_k, thread_n) as
+# (64, 256), (64, 128) and (128, 64), so K has to be 64-aligned, and a padded
+# width that is only 64-aligned leaves (128, 64) as the usable config.
+MARLIN_GEMM_THREAD_K = 64
+MARLIN_GEMM_THREAD_N = 128
+
+
+def _check_marlin_supports_padded_shape(
+    size_n: int, size_k: int, full_k: int, group_size: int
+) -> None:
+    """Reject shapes that no Marlin GEMM thread config covers.
+
+    `size_n` is the padded width, so it is always a multiple of MARLIN_TILE_N.
+    K must still be aligned to the smallest thread_k, and a width that is only
+    64-aligned leaves (128, 64) as the single usable config.
+    """
+    k_tile = size_k % MARLIN_GEMM_THREAD_K == 0
+    k_wide = size_k % MARLIN_GEMM_THREAD_N == 0
+    n_wide = size_n % MARLIN_GEMM_THREAD_N == 0
+    if not k_tile or not (n_wide or k_wide):
+        raise ValueError(
+            f"No Marlin thread config for input_size_per_partition = {size_k} "
+            f"(K) and output_size_per_partition = {size_n} (N): K must be a "
+            f"multiple of {MARLIN_GEMM_THREAD_K}, and either N or K must be a "
+            f"multiple of {MARLIN_GEMM_THREAD_N}. Consider reducing "
+            "tensor_parallel_size or running with --quantization gptq."
+        )
+    if group_size < full_k and size_k % group_size != 0:
+        raise ValueError(
+            f"input_size_per_partition = {size_k} is not divisible by "
+            f"group_size = {group_size}. Consider reducing tensor_parallel_size "
+            "or running with --quantization gptq."
+        )
+
+
+def _pad_marlin_n(t: torch.Tensor, size_n: int) -> torch.Tensor:
+    if t.shape[-1] == size_n:
+        return t
+    pad = torch.zeros(
+        (*t.shape[:-1], size_n - t.shape[-1]), dtype=t.dtype, device=t.device
+    )
+    return torch.cat((t, pad), dim=-1)
 
 
 class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
@@ -191,6 +239,8 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
         layer.register_parameter("weight_packed", weight)
         layer.register_parameter("weight_scale", weight_scale)
         layer.register_parameter("weight_shape", weight_shape)
+        # Set once process_weights_after_loading repacks for the kernel.
+        layer.wna16_repacked = False
 
         if not self.symmetric:
             layer.register_parameter("weight_zero_point", qzeros)
@@ -205,9 +255,43 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
                                             weight_loader=weight_loader)
             layer.register_parameter("weight_g_idx", weight_g_idx)
 
+    def dequantize_weight(self, layer: torch.nn.Module) -> torch.Tensor:
+        """The dense ``[out, in]`` weight of ``layer``, in the scale dtype.
+
+        Reads the checkpoint layout of ``weight_packed`` / ``weight_scale``,
+        so it must run before ``process_weights_after_loading`` repacks them
+        for the kernel (MLA's post-load step builds its absorbed weights from
+        it). Loaders that copy already-repacked tensors are refused.
+        """
+        if layer.wna16_repacked:
+            raise NotImplementedError(
+                "Cannot dequantize a compressed-tensors WNA16 weight after "
+                "process_weights_after_loading has repacked it for the kernel.")
+        if not self.symmetric or self.has_g_idx:
+            raise NotImplementedError(
+                "Dequantizing a compressed-tensors WNA16 weight supports "
+                "symmetric quantization without activation reordering only.")
+        num_bits = 32 // self.pack_factor
+        packed = layer.weight_packed.data  # [N, K // pack_factor] int32
+        scale = layer.weight_scale.data  # [N, K // group_size]
+        shifts = torch.arange(0, 32, num_bits, dtype=torch.int32,
+                              device=packed.device)
+        codes = (packed.unsqueeze(-1) >> shifts) & ((1 << num_bits) - 1)
+        codes = codes.reshape(packed.shape[0], -1)  # [N, K]
+        in_features = codes.shape[1]
+        group_size = (in_features
+                      if self.group_size == -1 else self.group_size)
+        assert scale.shape[1] * group_size == in_features, (
+            f"weight_scale {tuple(scale.shape)} does not cover {in_features} "
+            f"inputs in groups of {group_size}")
+        # (code - offset) and its product with the scale round once, as in fp32.
+        weight = (codes - (1 << (num_bits - 1))).to(scale.dtype)
+        return weight * scale.repeat_interleave(group_size, dim=1)
+
     # Checkpoints are serialized in compressed-tensors format, which is
     # different from the format the kernel may want. Handle repacking here.
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        layer.wna16_repacked = True
         # Default names since marlin requires empty parameters for these,
         # TODO: remove this requirement from marlin (allow optional tensors)
         self.w_q_name = "weight_packed"
@@ -218,10 +302,21 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
         device = getattr(layer, self.w_q_name).device
         c = self.kernel_config
 
-        check_marlin_supports_shape(
-            c.partition_weight_shape[1],  # out_features
-            c.partition_weight_shape[0],  # in_features
-            c.full_weight_shape[0],  # in_features
+        size_n = c.partition_weight_shape[1]
+        size_n_padded = -(-size_n // MARLIN_TILE_N) * MARLIN_TILE_N
+        layer.marlin_size_n_padded = (
+            size_n_padded if size_n_padded != size_n else None
+        )
+
+        # Validate the shape Marlin will actually see.  The tail columns of the
+        # last 64-wide tile are zero padded by the transforms below and are
+        # discarded after the GEMM, so they do not constrain the checkpoint
+        # shape (see sgl-project/sglang#43342); the K tile and the GEMM thread
+        # config still do.
+        _check_marlin_supports_padded_shape(
+            size_n_padded,
+            c.partition_weight_shape[0],
+            c.full_weight_shape[0],
             c.group_size,
         )
 
@@ -248,10 +343,10 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
             assert isinstance(x, BasevLLMParameter)
             permute_param_layout_(x, input_dim=0, output_dim=1, packed_dim=0)
             x.data = gptq_marlin_repack(
-                x.data.contiguous(),
+                _pad_marlin_n(x.data, size_n_padded).contiguous(),
                 perm=layer.g_idx_sort_indices,
                 size_k=c.partition_weight_shape[0],
-                size_n=c.partition_weight_shape[1],
+                size_n=size_n_padded,
                 num_bits=c.weight_type.size_bits,
             )
             return x
@@ -260,9 +355,9 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
             assert isinstance(x, BasevLLMParameter)
             permute_param_layout_(x, input_dim=0, output_dim=1)
             x.data = marlin_permute_scales(
-                x.data.contiguous(),
+                _pad_marlin_n(x.data, size_n_padded).contiguous(),
                 size_k=c.partition_weight_shape[0],
-                size_n=c.partition_weight_shape[1],
+                size_n=size_n_padded,
                 group_size=c.group_size,
             )
             return x
@@ -285,14 +380,17 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
                 layer,
                 self.w_zp_name,
                 lambda x: marlin_zero_points(
-                    unpack_cols(
-                        x.t(),
-                        c.weight_type.size_bits,
-                        grouped_k,
-                        c.partition_weight_shape[1],
+                    _pad_marlin_n(
+                        unpack_cols(
+                            x.t(),
+                            c.weight_type.size_bits,
+                            grouped_k,
+                            size_n,
+                        ),
+                        size_n_padded,
                     ),
                     size_k=grouped_k,
-                    size_n=c.partition_weight_shape[1],
+                    size_n=size_n_padded,
                     num_bits=c.weight_type.size_bits,
                 ),
             )
@@ -322,19 +420,89 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
 
         w_q, w_s, w_zp, w_gidx = _get_weight_params(layer)
 
-        # `process_weights_after_loading` will ensure w_zp and w_gidx are not
-        #  None for marlin
-        return apply_gptq_marlin_linear(
-            input=x,
-            weight=w_q,
-            weight_scale=w_s,
-            weight_zp=w_zp,  # type: ignore
-            g_idx=w_gidx,  # type: ignore
-            g_idx_sort_indices=layer.g_idx_sort_indices,
-            workspace=self.workspace,
-            wtype=c.weight_type,
-            input_size_per_partition=c.partition_weight_shape[0],
-            output_size_per_partition=c.partition_weight_shape[1],
-            is_k_full=self.is_k_full,
-            bias=bias,
+        size_n = c.partition_weight_shape[1]
+        size_n_padded = getattr(layer, "marlin_size_n_padded", None) or size_n
+
+        def _marlin_linear(bias: Optional[torch.Tensor]) -> torch.Tensor:
+            # `process_weights_after_loading` will ensure w_zp and w_gidx are not
+            #  None for marlin
+            return apply_gptq_marlin_linear(
+                input=x,
+                weight=w_q,
+                weight_scale=w_s,
+                weight_zp=w_zp,  # type: ignore
+                g_idx=w_gidx,  # type: ignore
+                g_idx_sort_indices=layer.g_idx_sort_indices,
+                workspace=self.workspace,
+                wtype=c.weight_type,
+                input_size_per_partition=c.partition_weight_shape[0],
+                output_size_per_partition=size_n_padded,
+                is_k_full=self.is_k_full,
+                bias=bias,
+            )
+
+        if size_n_padded == size_n:
+            return _marlin_linear(bias)
+
+        # Drop the zero-padded tail tile, then add the caller's real-width bias.
+        out = _marlin_linear(None)[..., :size_n]
+        if bias is not None:
+            return out + bias
+        # Narrowing the padded rows leaves a non-contiguous view, which the
+        # fused gate/up activations reject, so materialise the real width.
+        return out.contiguous()
+
+
+class XPUCompressedTensorsWNA16(CompressedTensorsWNA16):
+    """WNA16 on Intel XPU: Using torch's int4pack op."""
+
+    def __init__(self,
+                 strategy: str,
+                 num_bits: int,
+                 group_size: Optional[int] = None,
+                 symmetric: Optional[bool] = True,
+                 actorder: Optional[ActivationOrdering] = None):
+        super().__init__(strategy, num_bits, group_size, symmetric, actorder)
+
+        from sglang.srt.hardware_backend.xpu.quantization.compressed_tensors_wna16_kernels import (
+            CompressedTensorsWNA16XPULinearKernel,
         )
+        from sglang.srt.hardware_backend.xpu.quantization.int4pack_utils import (
+            SUPPORTED_GROUP_SIZES,
+        )
+
+        # _weight_int4pack_mm_with_scales_and_zeros cannot express any of these,
+        # so reject at construction rather than after the weights are loaded.
+        if num_bits != 4:
+            raise NotImplementedError(
+                f"compressed-tensors WNA16 on XPU supports 4-bit weights only, "
+                f"got num_bits={num_bits}.")
+        if self.group_size not in SUPPORTED_GROUP_SIZES:
+            raise NotImplementedError(
+                f"compressed-tensors WNA16 on XPU requires group_size in "
+                f"{SUPPORTED_GROUP_SIZES}, got {self.group_size} "
+                "(channelwise/-1 is out of scope).")
+        if not self.symmetric:
+            raise NotImplementedError(
+                "compressed-tensors WNA16 on XPU only supports symmetric weight "
+                "quantization; this checkpoint carries a weight zero-point.")
+        if self.has_g_idx:
+            raise NotImplementedError(
+                "compressed-tensors WNA16 on XPU does not support activation "
+                "reordering (actorder=group).")
+
+        self.kernel = CompressedTensorsWNA16XPULinearKernel(
+            group_size=self.group_size)
+
+    @classmethod
+    def get_min_capability(cls) -> int:
+        # TODO: torch.xpu.get_device_capability
+        return 20
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        layer.wna16_repacked = True
+        self.kernel.process_weights_after_loading(layer)
+
+    def apply_weights(self, layer: torch.nn.Module, x: torch.Tensor,
+                      bias: Optional[torch.Tensor]) -> torch.Tensor:
+        return self.kernel.apply(layer, x, bias)

@@ -178,24 +178,17 @@ inline auto irange(T start, T end) {
 
 /** \brief Error class for stream-style error logging. */
 struct Error {
-  Error(DebugInfo location = {}) {
-    m_oss << "Failed at " << location.file_name() << ":" << location.line() << ": ";
+  std::ostringstream stream;
+  explicit Error(DebugInfo location = {}) {
+    stream << "Failed at " << location.file_name() << ":" << location.line() << ": ";
   }
-
-  template <typename T>
-  Error& operator<<(T&& arg) {
-    m_oss << std::forward<T>(arg);
-    return *this;
-  }
-
   [[noreturn]]
   ~Error() noexcept(false) {
-    throw PanicError(std::move(m_oss).str());
+    throw PanicError(std::move(stream).str());
   }
-
- private:
-  std::ostringstream m_oss;
 };
+
+#define SGL_PANIC ::sglang::host::Error().stream
 
 /**
  * \brief 0-overhead CHECK macro for host code. This can avoid unnecessary
@@ -203,12 +196,10 @@ struct Error {
  *
  * Usage: CHECK_HOST(ptr != nullptr) << "Pointer must not be null";
  */
-// The empty-true-branch if/else form keeps a trailing `else` in user code
-// bound to the user's `if`, not to the macro's.
 #define CHECK_HOST(COND) \
   if (COND) [[likely]] { \
   } else                 \
-    host::Error()
+    SGL_PANIC
 
 }  // namespace host
 
