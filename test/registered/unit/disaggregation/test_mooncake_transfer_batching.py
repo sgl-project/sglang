@@ -14,6 +14,7 @@ from sglang.srt.disaggregation.base.conn import KVPoll, StateType
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager, MooncakeKVSender
+from sglang.srt.disaggregation.transport.base import Copy, Result, Status
 from sglang.srt.distributed.device_communicators.kv_transfer_engine import (
     TransferIntent,
 )
@@ -101,6 +102,22 @@ class TestMooncakeTransferBatching(unittest.TestCase):
                     [50, 100],
                     FOREGROUND,
                 )
+
+    def test_pending_transport_result_is_not_success(self):
+        manager = self._make_manager()
+        manager.transport = MagicMock(
+            write_all=MagicMock(return_value=[object()]),
+            status_all=MagicMock(return_value=Result(Status.PENDING)),
+        )
+        copy = Copy(
+            src=manager._local_keys.kv[0],
+            dst=manager._peers["session"].keys.kv[0],
+            ranges=np.array([[0, 0, 10]], dtype=np.uint64),
+        )
+
+        ret = MooncakeKVManager._transfer_copies(manager, "session", [copy])
+
+        self.assertEqual(ret, -1)
 
     def test_stops_after_first_failed_index_batch(self):
         manager = self._make_manager(side_effect=[0, -1], max_batch_indices=2)

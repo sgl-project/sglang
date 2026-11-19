@@ -946,9 +946,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         result = self.transport.status_all(
             self.transport.write_all(self._peers[mooncake_session_id].remote, copies)
         )
-        if result.status is Status.FAILED:
+        if result.status is not Status.DONE:
             logger.error(
-                "Transfer to session %s failed: %s", mooncake_session_id, result.reason
+                "Transfer to session %s did not complete (%s): %s",
+                mooncake_session_id,
+                result.status.name,
+                result.reason,
             )
             return -1
         return 0
