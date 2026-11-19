@@ -26,6 +26,8 @@ from sglang.srt.arg_groups import overrides
 from sglang.srt.disaggregation import decode_freed_slots, pp_early_finish
 from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
 from sglang.srt.environ import envs, nv_mega_runtime_switches
+from sglang.srt.layers.moe.token_dispatcher import flashinfer as a2a_dispatcher
+from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.managers import scheduler_pp_mixin
 from sglang.srt.managers.scheduler_components import dp_sync_exchange, shm_tag_exchange
 from sglang.srt.models.qwen3_5 import Qwen3_5MoeForConditionalGeneration
@@ -331,6 +333,15 @@ def _dp_post_verify_graphs(shape: Shape) -> bool:
     )
 
 
+def _a2a_output_in_workspace(shape: Shape) -> bool:
+    if shape.args.get("moe_a2a_backend") != "flashinfer_nvlink_one_sided":
+        return False
+    backend = MoeRunnerBackend(shape.args.get("moe_runner_backend", "auto"))
+    return a2a_dispatcher._trtllm_output_in_workspace_eligible(
+        backend, a2a_dispatcher._WorkspaceNamespace.DECODE
+    )
+
+
 RESOLVERS: Dict[str, Callable[[Shape], bool]] = {
     "SGLANG_OPT_SCHEDULER_SHM_SYNC_DP_ROWS": _dp_rows,
     "SGLANG_OPT_PD_DECODE_ADMIT_FREED_SLOTS": _freed_slots,
@@ -338,6 +349,7 @@ RESOLVERS: Dict[str, Callable[[Shape], bool]] = {
     "SGLANG_OPT_PP_EARLY_RELAY": _pp_early_relay,
     "SGLANG_OPT_PP_PROXY_RECV_AFTER_FORWARD": _pp_proxy_recv_after_forward,
     "SGLANG_OPT_SPEC_DP_POST_VERIFY_GRAPHS": _dp_post_verify_graphs,
+    "SGLANG_OPT_MOE_A2A_OUTPUT_IN_WORKSPACE": _a2a_output_in_workspace,
 }
 
 
@@ -418,7 +430,7 @@ _TWO_HOSTS = _children()
 _NO_STAGING = _children()
 # A PD decode with attention DP; the exchange rows on at most two hosts, the
 # post-verify graphs with a bound gathered sampler.
-_PD_DECODE_DP = _children()
+_PD_DECODE_DP = _children("MOE_A2A_OUTPUT_IN_WORKSPACE")
 _DP_EXCHANGE = _children("SCHEDULER_SHM_SYNC_DP_ROWS")
 _DP_GRAPHS = _children("SPEC_DP_POST_VERIFY_GRAPHS")
 # A top-k-1 EAGLE chain outside a PD prefill and attention DP: the generic paths,
