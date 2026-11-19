@@ -223,6 +223,26 @@ def is_deepseek_dsa(config) -> bool:
     ) or is_kimi_k31(config)
 
 
+def is_q8_raw_fp8_nope_layout(
+    *,
+    prefill_backend: Optional[str],
+    decode_backend: Optional[str],
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+) -> bool:
+    """Whether Q8 prefill and TileLang decode can share raw 512-byte FP8 rows.
+
+    This checks consumers and geometry, not the model name. Callers validate
+    dtype, device and incompatible serving options separately.
+    """
+    return (
+        prefill_backend == "flashmla_sparse_q8"
+        and decode_backend == "tilelang"
+        and kv_lora_rank == 512
+        and qk_rope_head_dim == 0
+    )
+
+
 def dsa_draft_shards_under_dcp(config, dcp_size: int) -> bool:
     """Whether a DSA EAGLE/NEXTN draft shards its KV like the DCP target.
 
@@ -1095,7 +1115,9 @@ class ModelConfig:
             ),
             model_override_args=cfg.json_model_override_args,
             is_embedding=cfg.is_embedding,
-            enable_multimodal=cfg.enable_multimodal,
+            enable_multimodal=(
+                False if cfg.disable_multimodal else cfg.enable_multimodal
+            ),
             dtype=cfg.dtype,
             quantization=quantization,
             model_impl=cfg.model_impl,

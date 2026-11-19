@@ -1,0 +1,3 @@
+[
+  {"hw":"h200","mode":"balanced","verified":"verified","gpus":1,"env":{},"url":"https://docs.sglang.io/cookbook/autoregressive/IFM/K2-Horizon#hw=h200&variant=7b&quant=bf16&strategy=balanced&nodes=single","command":"sglang serve \\\n  --model-path IFM/K2-Horizon-7B \\\n  --revision 85d46bbaf6ecd844a8ef61991f6e492d4faf4179 \\\n  --tp 1 \\\n  --dtype bfloat16 \\\n  --attention-backend fa3 \\\n  --reasoning-parser k2_horizon \\\n  --host 0.0.0.0 \\\n  --port 30000"}
+]

@@ -380,6 +380,21 @@ bool is_valid_config(
   BIGGROUP_GET_IF_M234(W_TYPE, 16, 4, 256) \
   BIGGROUP_GET_IF_M234(W_TYPE, 8, 4, 128)
 
+#define FP8G32_GET_IF_M1(W_TYPE, N_BLOCKS, K_BLOCKS, NUM_THREADS)     \
+  _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, true, 2, NUM_THREADS, false) \
+  _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, false, 2, NUM_THREADS, false)
+
+#define FP8G32_GET_IF_M234(W_TYPE, N_BLOCKS, K_BLOCKS, NUM_THREADS)    \
+  _GET_IF(W_TYPE, 2, N_BLOCKS, K_BLOCKS, false, 2, NUM_THREADS, false) \
+  _GET_IF(W_TYPE, 3, N_BLOCKS, K_BLOCKS, false, 2, NUM_THREADS, false) \
+  _GET_IF(W_TYPE, 4, N_BLOCKS, K_BLOCKS, false, 2, NUM_THREADS, false)
+
+#define FP8G32_GET_IF(W_TYPE)            \
+  FP8G32_GET_IF_M1(W_TYPE, 8, 8, 256)    \
+  FP8G32_GET_IF_M1(W_TYPE, 8, 4, 128)    \
+  FP8G32_GET_IF_M234(W_TYPE, 16, 4, 256) \
+  FP8G32_GET_IF_M234(W_TYPE, 8, 4, 128)
+
 #define NVFP4_GET_IF_M1(W_TYPE, N_BLOCKS, K_BLOCKS, NUM_THREADS)      \
   _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, true, 1, NUM_THREADS, false) \
   _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, false, 1, NUM_THREADS, false)
@@ -473,6 +488,7 @@ MarlinFuncPtr get_marlin_kernel(
   NVFP4_GET_IF(host::kFE2M1f)
 
   BIGGROUP_GET_IF(host::kFE4M3fn)
+  FP8G32_GET_IF(host::kFE4M3fn)
 
   ACT_GET_IF(host::kU4B8)
   ACT_GET_IF(host::kU8B128)

@@ -10,6 +10,7 @@ from typing import cast
 from unittest.mock import patch
 
 import torch
+from safetensors.torch import save_file
 
 import sglang.srt.model_loader.loader as loader_mod
 import sglang.srt.model_loader.utils as model_loader_utils
@@ -36,6 +37,69 @@ class _FakeModel:
 
 
 class TestRunaiModelStreamerLoader(CustomTestCase):
+    def test_bundled_draft_file_selection(self):
+        with tempfile.TemporaryDirectory() as model_path:
+            for name in ("model.safetensors", "mtp.safetensors"):
+                save_file({"weight": torch.ones(1)}, os.path.join(model_path, name))
+            with open(
+                os.path.join(model_path, "model.safetensors.index.json"), "w"
+            ) as f:
+                json.dump({"weight_map": {"weight": "model.safetensors"}}, f)
+
+            config = SimpleNamespace(
+                model_path=model_path,
+                revision=None,
+                hf_config=SimpleNamespace(architectures=["DraftModel"]),
+            )
+            model = SimpleNamespace(
+                allow_patterns_overrides=["mtp.safetensors"],
+                safetensors_index_file=None,
+            )
+            loader = loader_mod.RunaiModelStreamerLoader(
+                LoadConfig(load_format=LoadFormat.RUNAI_STREAMER)
+            )
+            loader.target_device_str = "cpu"
+            with (
+                patch.object(loader_mod, "get_server_args", return_value=None),
+                # The runai package is optional; list the local directory instead.
+                patch.object(
+                    runai_utils,
+                    "list_safetensors",
+                    side_effect=lambda path: sorted(
+                        os.path.join(path, name)
+                        for name in os.listdir(path)
+                        if name.endswith(".safetensors")
+                    ),
+                ),
+                patch.object(
+                    weight_utils,
+                    "runai_safetensors_weights_iterator",
+                    return_value=iter(()),
+                ) as streamer,
+            ):
+                list(loader._get_all_weights(config, model))
+                streamer.assert_called_once_with(
+                    [os.path.join(model_path, "mtp.safetensors")],
+                    False,
+                    "cpu",
+                    load_group=_DEFAULT_LOAD_GROUP,
+                )
+
+    def test_local_directory_wildcard_rejected(self):
+        """A directory wildcard must fail loudly on local paths too, not match nothing."""
+        loader = loader_mod.RunaiModelStreamerLoader(
+            LoadConfig(load_format=LoadFormat.RUNAI_STREAMER)
+        )
+        with (
+            tempfile.TemporaryDirectory() as model_path,
+            patch.object(loader_mod, "get_server_args", return_value=None),
+            patch.object(runai_utils, "list_safetensors", return_value=[]),
+            self.assertRaisesRegex(ValueError, "directory wildcards"),
+        ):
+            loader._prepare_weights(
+                model_path, None, allow_patterns_overrides=["*/model.safetensors"]
+            )
+
     def test_remote_checkpoint_index(self):
         for scheme in ("s3", "gs", "az"):
             for relative_cache in (False, True):
@@ -63,6 +127,12 @@ class TestRunaiModelStreamerLoader(CustomTestCase):
                         patch.object(
                             runai_utils, "list_safetensors", return_value=files
                         ) as list_safetensors,
+                        patch.object(
+                            loader_mod, "download_weights_from_hf"
+                        ) as download,
+                        patch.object(
+                            loader_mod, "download_safetensors_index_file_from_hf"
+                        ) as download_index,
                         patch.object(
                             weight_utils,
                             "runai_safetensors_weights_iterator",
@@ -107,6 +177,25 @@ class TestRunaiModelStreamerLoader(CustomTestCase):
                         streamer.assert_called_once_with(
                             files[:2], True, "cpu", load_group=_DEFAULT_LOAD_GROUP
                         )
+
+                        streamer.reset_mock()
+                        config = SimpleNamespace(
+                            model_path=metadata,
+                            model_weights=model_path,
+                            revision="revision",
+                            hf_config=SimpleNamespace(architectures=["DraftModel"]),
+                        )
+                        model = SimpleNamespace(
+                            allow_patterns_overrides=["mtp.safetensors"],
+                            safetensors_index_file=None,
+                        )
+                        list(loader._get_all_weights(config, model))
+                        list_safetensors.assert_called_with(path=model_path)
+                        streamer.assert_called_once_with(
+                            [files[1]], True, "cpu", load_group=_DEFAULT_LOAD_GROUP
+                        )
+                        download.assert_not_called()
+                        download_index.assert_not_called()
 
                         list_safetensors.return_value = [files[-1]]
                         with self.assertRaisesRegex(RuntimeError, shard):
