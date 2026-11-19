@@ -1189,8 +1189,8 @@ class UMBPStore(HiCacheStorage):
         suffixes = self._anchor_key_suffixes()
         prefix = f"{self.config_prefix}_" if self.config_prefix else ""
         key_list = [f"{prefix}{key}{suffix}" for key in keys for suffix in suffixes]
-        # MoRI's SPDK proxy truncates its 256-byte key field to 255 bytes.
-        # Preserve the distinguishing rank/component suffix before any I/O.
+        # MoRI's SPDK proxy truncates keys past 255 bytes, which would cut off
+        # the rank and K/V suffix that keeps keys distinct.
         if any(len(key.encode("utf-8")) > 255 for key in key_list):
             raise ValueError(
                 "UMBP anchor keys must not exceed 255 UTF-8 bytes; "

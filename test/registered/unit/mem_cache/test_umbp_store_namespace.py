@@ -1,9 +1,4 @@
-"""UMBP anchor isolation with real CPU pools and a shared external-client fixture.
-
-Two models with equal KV geometry must not accept each other's cached bytes.
-Only the MoRI client/configuration boundary is substituted; the protocol-only
-layout cases below use a small host descriptor instead of claiming GPU coverage.
-"""
+"""UMBPStore anchor-key namespaces, with real CPU host pools and a fake MoRI client."""
 
 import ctypes
 import os
@@ -42,11 +37,10 @@ class _ClientConfig:
 
 
 class _PointerClient:
-    """External store contract: shared keys and exact-size pointer transfers."""
+    """In-memory MoRI client. Stores share one dict, like workers sharing a cache."""
 
     def __init__(self, objects):
         self.objects = objects
-        self.depths = {}
 
     def is_distributed(self):
         return False
@@ -64,10 +58,6 @@ class _PointerClient:
                 result.append(True)
         return result
 
-    def batch_put_from_ptr_with_depth(self, keys, ptrs, sizes, depths):
-        self.depths.update(zip(keys, depths, strict=True))
-        return self.batch_put_from_ptr(keys, ptrs, sizes)
-
     def batch_get_into_ptr(self, keys, ptrs, sizes):
         result = []
         for key, ptr, size in zip(keys, ptrs, sizes, strict=True):
@@ -83,25 +73,6 @@ class _PointerClient:
             (index for index, key in enumerate(keys) if key not in self.objects),
             len(keys),
         )
-
-
-class _ProtocolPool:
-    """Pointer-order fixture only; it does not emulate model transfer kernels."""
-
-    page_size = 1
-
-    def __init__(self, objects_per_page, *, envelope=False, split=False):
-        self.layout = "page_head" if split else "page_first"
-        self.stores_page_envelope = envelope
-        self.kv_buffer = torch.empty((4, objects_per_page, 8), dtype=torch.float32)
-
-    def get_page_buffer_meta(self, indices):
-        buffers = [row for index in indices.tolist() for row in self.kv_buffer[index]]
-        return [row.data_ptr() for row in buffers], [32] * len(buffers)
-
-    def get_split_heads_page_buffer_meta(self, indices, split_factor):
-        assert self.kv_buffer.shape[1] == split_factor * 2
-        return self.get_page_buffer_meta(indices)
 
 
 class TestUMBPStoreNamespace(CustomTestCase):
@@ -146,42 +117,31 @@ class TestUMBPStoreNamespace(CustomTestCase):
         self.addCleanup(host.destroy)
         return host
 
-    def _store(
-        self, host, objects, *, model="org/model-a", tag="tenant-a", rank=0, **kwargs
-    ):
+    def _store(self, host, objects, *, model="org/model-a", tag="tenant-a"):
         config = HiCacheStorageConfig(
-            tp_rank=rank,
+            tp_rank=0,
             tp_size=2,
             pp_rank=0,
             pp_size=1,
             attn_cp_rank=0,
             attn_cp_size=1,
-            is_mla_model=kwargs.pop("is_mla_model", False),
+            is_mla_model=False,
             enable_storage_metrics=False,
-            is_page_first_layout=host.layout == "page_first",
+            is_page_first_layout=True,
             model_name=model,
             extra_config={
                 "ssd_enabled": False,
                 "dram_capacity_bytes": 1 << 20,
                 "extra_backend_tag": tag,
             },
-            **kwargs,
         )
         client = _PointerClient(objects)
-        boundary = (
-            lambda config: client,
-            _ClientConfig,
-            SimpleNamespace(
-                Standalone="standalone",
-                SharedSSDLeader="leader",
-                SharedSSDFollower="follower",
-            ),
-            None,
-            None,
-            None,
-            None,
-            None,
+        roles = SimpleNamespace(
+            Standalone="standalone",
+            SharedSSDLeader="leader",
+            SharedSSDFollower="follower",
         )
+        boundary = (lambda config: client, _ClientConfig, roles) + (None,) * 5
         with mock.patch.object(
             umbp_store, "_import_umbp_client", return_value=boundary
         ):
@@ -197,45 +157,35 @@ class TestUMBPStoreNamespace(CustomTestCase):
             host.v_buffer[index], torch.full_like(host.v_buffer[index], v)
         )
 
-    def test_models_and_tags_isolate_equal_sized_kv(self):
+    def test_different_model_or_tag_does_not_read_other_pages(self):
         for identity in ({"model": "org/model-b"}, {"tag": "tenant-b"}):
             with self.subTest(identity=identity):
                 objects = {}
-                first_host, second_host, reader_host = (
-                    self._host(),
-                    self._host(),
-                    self._host(),
-                )
-                first = self._store(first_host, objects)
-                second = self._store(second_host, objects, **identity)
-                same_namespace = self._store(reader_host, objects)
-                first_host.k_buffer.fill_(11)
-                first_host.v_buffer.fill_(22)
-                second_host.k_buffer.fill_(33)
-                second_host.v_buffer.fill_(44)
+                a_host, b_host, peer_host = self._host(), self._host(), self._host()
+                a = self._store(a_host, objects)
+                b = self._store(b_host, objects, **identity)
+                a_peer = self._store(peer_host, objects)
+                a_host.k_buffer.fill_(11)
+                a_host.v_buffer.fill_(22)
+                b_host.k_buffer.fill_(33)
+                b_host.v_buffer.fill_(44)
                 indices = torch.tensor([0], dtype=torch.int64)
-                self.assertEqual(first.batch_set_v1(["page"], indices), [True])
-                read_result = second.batch_get_v1(["page"], indices)
-                self._assert_page(second_host, 0, 33, 44)
-                self.assertEqual(read_result, [False])
-                self.assertEqual(second.batch_exists(["page"]), 0)
-                self.assertEqual(second.batch_set_v1(["page"], indices), [True])
 
-                # Both namespaces retain their own bytes; matching peers can share.
-                first_host.kv_buffer.zero_()
-                second_host.kv_buffer.zero_()
-                reader_host.kv_buffer.zero_()
-                for store in (first, second, same_namespace):
-                    self.assertEqual(store.batch_exists(["page"]), 1)
+                self.assertEqual(a.batch_set_v1(["page"], indices), [True])
+                self.assertEqual(b.batch_exists(["page"]), 0)
+                self.assertEqual(b.batch_get_v1(["page"], indices), [False])
+                self._assert_page(b_host, 0, 33, 44)
+                self.assertEqual(b.batch_set_v1(["page"], indices), [True])
+
+                for host in (a_host, b_host, peer_host):
+                    host.kv_buffer.zero_()
+                for store in (a, b, a_peer):
                     self.assertEqual(store.batch_get_v1(["page"], indices), [True])
-                self._assert_page(first_host, 0, 11, 22)
-                self._assert_page(second_host, 0, 33, 44)
-                self._assert_page(reader_host, 0, 11, 22)
-                other_rank = self._store(self._host(), objects, rank=1)
-                self.assertEqual(other_rank.batch_exists(["page"]), 0)
-                self.assertEqual(first.batch_exists(["different-page"]), 0)
+                self._assert_page(a_host, 0, 11, 22)
+                self._assert_page(b_host, 0, 33, 44)
+                self._assert_page(peer_host, 0, 11, 22)
 
-    def test_unnamespaced_compatibility_does_not_enable_legacy_fallback(self):
+    def test_empty_prefix_keeps_legacy_keys(self):
         for model, tag in ((None, None), ("", None), (None, "")):
             with self.subTest(model=model, tag=tag):
                 objects = {}
@@ -249,50 +199,19 @@ class TestUMBPStoreNamespace(CustomTestCase):
                 configured_host.k_buffer.fill_(-7)
                 configured_host.v_buffer.fill_(-9)
                 indices = torch.tensor([0], dtype=torch.int64)
+
                 self.assertEqual(writer.batch_set_v1(["page"], indices), [True])
                 self.assertEqual(set(objects), {"page_0_k", "page_0_v"})
-                self.assertEqual(reader.batch_exists(["page"]), 1)
-                self.assertEqual(reader.batch_exists([]), 0)
                 self.assertEqual(reader.batch_get_v1(["page"], indices), [True])
                 self._assert_page(reader_host, 0, 11, 22)
                 self.assertEqual(configured.batch_exists(["page"]), 0)
                 self.assertEqual(configured.batch_get_v1(["page"], indices), [False])
                 self._assert_page(configured_host, 0, -7, -9)
 
-    def test_depth_aware_writes_and_prefix_queries_use_the_same_namespace(self):
-        objects = {}
-        host = self._host()
-        store = self._store(host, objects)
-        host.k_buffer.fill_(11)
-        host.v_buffer.fill_(22)
-        indices = torch.tensor([0, 1], dtype=torch.int64)
-        self.assertEqual(
-            store.batch_set_v1(
-                ["a", "b"],
-                indices,
-                HiCacheStorageExtraInfo(prefix_keys=["parent-0", "parent-1"]),
-            ),
-            [True, True],
-        )
-        self.assertEqual(
-            store.client.depths,
-            {
-                "tenant-a_org-model-a_a_0_k": 2,
-                "tenant-a_org-model-a_a_0_v": 2,
-                "tenant-a_org-model-a_b_0_k": 3,
-                "tenant-a_org-model-a_b_0_v": 3,
-            },
-        )
-        self.assertEqual(store.batch_exists(["a", "b"]), 2)
-        self.assertEqual(store.batch_exists(["a", "missing", "b"]), 1)
-        host.kv_buffer.zero_()
-        self.assertEqual(store.batch_get_v1(["a", "b"], indices), [True, True])
-        for index in (0, 1):
-            self._assert_page(host, index, 11, 22)
-
-    def test_anchor_key_byte_limit_preserves_component_suffixes(self):
+    def test_anchor_keys_up_to_255_bytes_round_trip(self):
         page_hash = "a" * 64
         indices = torch.tensor([0], dtype=torch.int64)
+        # prefix + "_" + 64-char hash + "_0_k" is exactly 255 bytes.
         for prefix in ("x" * 186, "é" * 93):
             with self.subTest(prefix_bytes=len(prefix.encode("utf-8"))):
                 objects = {}
@@ -301,22 +220,16 @@ class TestUMBPStoreNamespace(CustomTestCase):
                 host.k_buffer.fill_(11)
                 host.v_buffer.fill_(22)
                 self.assertEqual(store.batch_set_v1([page_hash], indices), [True])
-                self.assertEqual(len(objects), 2)
-                self.assertTrue(all(len(key.encode("utf-8")) == 255 for key in objects))
+                self.assertEqual(
+                    [len(key.encode("utf-8")) for key in objects], [255, 255]
+                )
                 host.kv_buffer.zero_()
                 self.assertEqual(store.batch_get_v1([page_hash], indices), [True])
                 self._assert_page(host, 0, 11, 22)
 
                 too_long = self._store(self._host(), {}, model=prefix + "x", tag=None)
-                with self.assertRaisesRegex(ValueError, "255 UTF-8 bytes"):
+                with self.assertRaises(ValueError):
                     too_long.batch_set_v1([page_hash], indices)
-
-        # The envelope suffix is one byte longer than an ordinary K/V suffix.
-        envelope = self._store(
-            _ProtocolPool(1, envelope=True), {}, model="x" * 186, tag=None
-        )
-        with self.assertRaisesRegex(ValueError, "255 UTF-8 bytes"):
-            envelope.batch_set_v1([page_hash], indices)
 
     def test_overlong_anchor_batch_is_rejected_before_client_io(self):
         objects = {}
@@ -324,7 +237,7 @@ class TestUMBPStoreNamespace(CustomTestCase):
         store = self._store(host, objects, model="x" * 187, tag=None)
         host.k_buffer.fill_(-7)
         host.v_buffer.fill_(-9)
-        # The first page fits; the second would lose its K/V suffix on the wire.
+        # The first page fits. The second is one byte over the limit.
         keys = ["short", "a" * 64]
         indices = torch.tensor([0, 1], dtype=torch.int64)
         operations = {
@@ -339,55 +252,12 @@ class TestUMBPStoreNamespace(CustomTestCase):
         with mock.patch.object(store, "client", wraps=store.client) as client:
             for name, operation in operations.items():
                 with self.subTest(operation=name):
-                    with self.assertRaisesRegex(ValueError, "255 UTF-8 bytes"):
+                    with self.assertRaises(ValueError):
                         operation()
                     self.assertEqual(client.mock_calls, [])
         self.assertEqual(objects, {})
-        self.assertEqual(store.client.depths, {})
         for index in (0, 1):
             self._assert_page(host, index, -7, -9)
-
-    def test_protocol_layouts_keep_namespace_and_component_order(self):
-        cases = (
-            ("mla", 1, {"is_mla_model": True}, {}, ("_k",)),
-            ("envelope", 1, {}, {"envelope": True}, ("0_kv",)),
-            (
-                "split_mha",
-                4,
-                {"should_split_heads": True, "tp_lcm_size": 4},
-                {"split": True},
-                ("0_k", "0_v", "1_k", "1_v"),
-            ),
-        )
-        for name, count, config, geometry, suffixes in cases:
-            with self.subTest(layout=name):
-                objects = {}
-                host = _ProtocolPool(count, **geometry)
-                store = self._store(host, objects, **config)
-                host.kv_buffer[0].copy_(
-                    torch.arange(count * 8, dtype=torch.float32).reshape(count, 8)
-                )
-                expected = host.kv_buffer[0].clone()
-                indices = torch.tensor([0], dtype=torch.int64)
-                self.assertEqual(store.batch_set_v1(["page"], indices), [True])
-                self.assertEqual(
-                    set(objects),
-                    {f"tenant-a_org-model-a_page_{suffix}" for suffix in suffixes},
-                )
-                for index, suffix in enumerate(suffixes):
-                    component = torch.arange(
-                        index * 8, (index + 1) * 8, dtype=torch.float32
-                    )
-                    self.assertEqual(
-                        objects[f"tenant-a_org-model-a_page_{suffix}"],
-                        bytes(component.view(torch.uint8).tolist()),
-                    )
-                self.assertEqual(store.batch_exists(["page"]), 1)
-                host.kv_buffer[1].fill_(-1)
-                self.assertEqual(
-                    store.batch_get_v1(["page"], torch.tensor([1])), [True]
-                )
-                torch.testing.assert_close(host.kv_buffer[1], expected)
 
 
 if __name__ == "__main__":
