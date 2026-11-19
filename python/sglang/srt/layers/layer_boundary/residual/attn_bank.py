@@ -48,10 +48,10 @@ class AttnBank:
         self.current = None
 
     def open(
-        self, hidden_states, block_num, inherited=None, *, padded_rows=None
+        self, hidden_states, block_num, inherited=None, *, num_rows=None
     ) -> AttnResidual:
         self.current = AttnResidual(
-            hidden_states, block_num, inherited, padded_rows=padded_rows
+            hidden_states, block_num, inherited, num_rows=num_rows
         )
         return self.current
 

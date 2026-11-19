@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import atexit
 import os
-from types import SimpleNamespace
-from unittest.mock import patch
 
 import pytest
 import torch
@@ -335,53 +333,6 @@ def test_attention_residual_direct_all_gather():
     torch.cuda.synchronize()
     torch.testing.assert_close(output, full_reference, rtol=2e-2, atol=3e-2)
     assert handle is not None
-
-
-@torch.inference_mode()
-def test_unaligned_prefill_sp_bank_transition():
-    from sglang.srt.layers.communication import k3_sp_collective
-    from sglang.srt.models import kimi_k3
-
-    _require_sm100()
-    _init_world()
-    group = get_parallel().world_group
-    world = group.world_size
-    parallel = SimpleNamespace(tp_group=group)
-    padded, width = 4 * world, 1024
-    tokens = padded - 1
-    generator = torch.Generator().manual_seed(49100)
-    stream, snapshot = torch.randn(2, tokens, width, generator=generator).to(
-        _device(), torch.bfloat16
-    )
-    model = kimi_k3.KimiK3LinearModel.__new__(kimi_k3.KimiK3LinearModel)
-    torch.nn.Module.__init__(model)
-    model.end_layer = 1
-    model.config = SimpleNamespace(attn_res_block_size=1)
-    model.attn_bank = kimi_k3.AttnBank()
-    model.output_attn_res_proj = torch.nn.Linear(
-        width, 1, bias=False, device=_device(), dtype=stream.dtype
-    )
-    model.output_attn_res_proj.weight.fill_(0.01)
-    model.output_attn_res_norm = model.norm = kimi_k3.RMSNorm(width).to(stream)
-    bank = model.attn_bank.open(stream, 1, padded_rows=padded)
-    bank.write(snapshot)
-    batch = SimpleNamespace()
-    kimi_k3.residual_batch.start(batch)
-    capture = model._dspark_capture_stream(0, stream, batch)
-    final, _ = bank.forward(
-        stream, None, model.output_attn_res_proj, model.output_attn_res_norm, model.norm
-    )
-    with (
-        patch.object(kimi_k3, "get_parallel", return_value=parallel),
-        patch.object(k3_sp_collective, "get_parallel", return_value=parallel),
-        patch.object(k3_sp_collective, "prefill_sp_comm", return_value=None),
-    ):
-        sp = kimi_k3._PrefillSP(tokens, padded, 0)
-        local = model._prefill_sp_enter(stream, batch, sp)
-        gathered_capture = model._prefill_sp_capture_stream(0, local, sp)
-        gathered_final = model._prefill_sp_final_read(local, sp)
-    torch.testing.assert_close(gathered_capture, capture)
-    torch.testing.assert_close(gathered_final, final)
 
 
 def _precompile(num_gpus):

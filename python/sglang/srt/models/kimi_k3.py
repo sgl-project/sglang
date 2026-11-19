@@ -45,7 +45,6 @@ from sglang.srt.layers.cp.interleave import (
     cp_sequence_to_interleave_order,
     is_interleave_extend,
 )
-from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.dcp.layout import set_dsa_shards_index_k
 from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
 from sglang.srt.layers.dp_attention import (
@@ -163,7 +162,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import is_gfx95_supported, is_hip, is_npu
-from sglang.srt.utils.common import BumpAllocator, ceil_align, get_bool_env_var
+from sglang.srt.utils.common import BumpAllocator, get_bool_env_var
 from sglang.srt.utils.log_utils import print_warning_once, rank0_log
 
 if TYPE_CHECKING:
@@ -537,28 +536,6 @@ def _uses_ep_a2a() -> bool:
         or _a2a_backend.is_ascend_fuseep()
         or _a2a_backend.is_mori()
     )
-
-
-_PREFILL_SP_SHARED_RS_BLOCKS = 16
-
-
-def _prefill_sp_rows(local: int) -> slice:
-    start = get_parallel().tp_group.rank_in_group * local
-    return slice(start, start + local)
-
-
-def _prefill_sp_gather(x: torch.Tensor, *, owned: bool = False) -> torch.Tensor:
-    full = k3_sp_collective.prefill_sp_all_gather(x, owned=owned)
-    return full[: layernorm_sp.sp_num_tokens()]
-
-
-def _prefill_sp_pad_rows(x: torch.Tensor, name: str, padded: int) -> torch.Tensor:
-    full = k3_ar_fusion.symm_buffer(name, padded, x.shape[1], x.dtype)
-    if x.data_ptr() != full.data_ptr():
-        full[: x.shape[0]].copy_(x)
-    if padded != x.shape[0]:
-        full[x.shape[0] :].zero_()
-    return full
 
 
 def _shared_experts_tp_size() -> Optional[int]:
@@ -1814,61 +1791,40 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
         # starts; only `a`'s producer can still be in flight at PDL entry.
         return _add3(out, shared_output, prefix_sum, prefetch_bc=True)
 
-    @property
-    def prefill_sp_capable(self) -> bool:
-        return (
-            self._eligible_for_fused_front
-            and self.fuse_ar_norm
-            and self.alt_stream is not None
-            and self.routed_expert_up_proj is not None
-            and not self._use_mega_moe
-            and k3_ar_fusion.enabled()
-        )
-
-    def forward_prefill_sp(
-        self, normed: torch.Tensor, prefix_sum: torch.Tensor
+    def _forward_sp_rows(
+        self,
+        hidden_states: torch.Tensor,
+        prefix_sum: Optional[torch.Tensor],
+        valid_token_count: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        if TYPE_CHECKING:
-            assert (
-                self.routed_expert_up_proj is not None and self.alt_stream is not None
+        """This rank's rows of the output on a sequence-parallel pass. An EP
+        all-to-all backend dispatches the rows it is given; TP-sharded experts
+        take every row, and their sums are reduce-scattered back."""
+        with get_forward().scoped(sp_active=False):
+            if _uses_ep_a2a():
+                return self.forward(
+                    hidden_states,
+                    prefix_sum=prefix_sum,
+                    valid_token_count=valid_token_count,
+                )
+            full = layernorm_sp.all_gather_token_rows(
+                hidden_states, total_rows=layernorm_sp.sp_num_tokens()
             )
-        hidden_size = normed.shape[1]
-        latent_size = self.moe_hidden_size
-        local = normed.shape[0]
-        padded = local * get_parallel().tp_group.world_size
-        hidden_states = _prefill_sp_gather(normed)
-        num_tokens = hidden_states.shape[0]
-        gate_up, router_logits, routed_input = self._fused_front(hidden_states)
-        buf = k3_ar_fusion.symm_buffer(
-            k3_ar_fusion.MOE_LATENT_SHARED,
-            padded,
-            latent_size + hidden_size,
-            hidden_states.dtype,
-        ).view(-1)
-        latent_full = buf[: padded * latent_size].view(padded, latent_size)
-        shared_full = buf[padded * latent_size :].view(padded, hidden_size)
-        if padded != num_tokens:
-            latent_full[num_tokens:].zero_()
-            shared_full[num_tokens:].zero_()
-        latent = latent_full[:num_tokens]
-        shared_output = shared_full[:num_tokens]
-        shared_local = normed.new_empty((local, hidden_size))
-
-        current_stream = torch.cuda.current_stream()
-        self.alt_stream.wait_stream(current_stream)
-        self._forward_routed(hidden_states, router_logits, routed_input, latent)
-        with torch.cuda.stream(self.alt_stream):
+            if self.routed_expert_up_proj is None:
+                # Not a latent MoE: the output is a TP-partial sum.
+                return layernorm_sp.reduce_scatter_token_rows(self.forward(full))
+            if not self._eligible_for_fused_front:
+                out = layernorm_sp.shard_token_rows(self.forward(full))
+                return out if prefix_sum is None else out + prefix_sum
+            gate_up, router_logits, routed_input = self._fused_front(full)
+            latent = full.new_empty((full.shape[0], self.moe_hidden_size))
+            shared_output = full.new_empty(full.shape)
+            self._forward_routed(full, router_logits, routed_input, latent)
             self._forward_shared(gate_up, shared_output)
-            k3_sp_collective.prefill_sp_reduce_scatter(
-                shared_full, shared_local, num_blocks=_PREFILL_SP_SHARED_RS_BLOCKS
-            )
-        # The latent and shared reduce-scatters share pull semaphores.
-        current_stream.wait_stream(self.alt_stream)
-        latent_local = k3_sp_collective.prefill_sp_reduce_scatter(
-            latent_full, normed.new_empty((local, latent_size))
-        )
-        out, _ = self.routed_expert_up_proj(self._latent_norm(latent_local))
-        return _add3(out, shared_local, prefix_sum, prefetch_bc=True)
+        latent_rows = layernorm_sp.reduce_scatter_token_rows(latent)
+        shared_rows = layernorm_sp.reduce_scatter_token_rows(shared_output)
+        out, _ = self.routed_expert_up_proj(self._latent_norm(latent_rows))
+        return _add3(out, shared_rows, prefix_sum)
 
     def _forward_cp_shard_rows(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """This rank's CP rows of the complete output, for rows gathered
@@ -1920,6 +1876,8 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
             # the FFN read already ran the front on this rank's rows (shard_front)
             return self._forward_row_front(prefix_sum)
         hidden_states = hidden_states.view(-1, hidden_size)
+        if get_forward().sp_active:
+            return self._forward_sp_rows(hidden_states, prefix_sum, valid_token_count)
         if cp_shard_rows:
             return self._forward_cp_shard_rows(hidden_states)
         if hidden_states.shape[0] > 0 and self._eligible_for_fused_front:
@@ -3241,7 +3199,6 @@ class KimiK3DecoderLayer(nn.Module):
             )
 
         self._ffn_writes_stream = _latent_moe_writes_stream(config, layer_idx)
-        self._attn_bank = attn_bank
         self._kda_dwdp = (
             kda_dwdp
             if kda_dwdp is not None and kda_dwdp.needs_layer_hook(layer_idx)
@@ -3299,6 +3256,23 @@ class KimiK3DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
+        if not get_forward().sp_active:
+            return self._attend(hidden_states, positions, forward_batch, zero_allocator)
+        # Attention takes every row, and its output is a TP-partial sum.
+        return layernorm_sp.run_replicated_token_rows(
+            hidden_states,
+            lambda rows: self._attend(rows, positions, forward_batch, zero_allocator),
+            output_is_tp_partial=True,
+            total_rows=layernorm_sp.sp_num_tokens(),
+        )
+
+    def _attend(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        zero_allocator: BumpAllocator,
+    ) -> torch.Tensor:
         # DP attention: idle ranks (padded to the global shape) have no
         # attention metadata; pass hidden_states through shape-preserving
         # (matching the idle skip in other DP-attention models).
@@ -3331,66 +3305,6 @@ class KimiK3DecoderLayer(nn.Module):
 
         return result
 
-    @property
-    def prefill_sp_capable(self) -> bool:
-        return (
-            self._is_moe_layer
-            and not self._sp_moe
-            and self.use_attn_residuals
-            and self._attn_bank is not None
-            and self._ffn_writes_stream
-            and self.all_reduce_fusion
-            and isinstance(self.mlp, KimiK3MoE)
-            and self.mlp.prefill_sp_capable
-        )
-
-    def _forward_prefill_sp(
-        self,
-        stream: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        zero_allocator: BumpAllocator,
-    ) -> torch.Tensor:
-        local = stream.shape[0]
-        rows = _prefill_sp_rows(local)
-        bank = self._attn_bank.require()
-        normed, prefix = bank.forward(
-            stream,
-            None,
-            self.self_attention_res_proj,
-            self.self_attention_res_norm,
-            self.input_layernorm,
-            rows=rows,
-            write=self.is_block_write_layer,
-        )
-        residual = None if self.is_block_write_layer else prefix
-        # Attention takes every row: its linears must not see the SP region.
-        with get_forward().scoped(sp_active=False):
-            partial = self._run_self_attn(
-                _prefill_sp_gather(normed), positions, forward_batch, zero_allocator
-            )
-        if self._kda_dwdp is not None:
-            self._kda_dwdp.wait_issued()
-        prefix = k3_sp_collective.prefill_sp_reduce_scatter(
-            _prefill_sp_pad_rows(
-                partial,
-                k3_ar_fusion.ATTN_O_PROJ,
-                local * get_parallel().tp_group.world_size,
-            ),
-            stream.new_empty(stream.shape),
-            residual,
-        )
-        normed, prefix = bank.forward(
-            prefix,
-            None,
-            self.mlp_res_proj,
-            self.mlp_res_norm,
-            self.post_attention_layernorm,
-            rows=rows,
-        )
-        with get_forward().scoped(sp_active=False):
-            return self.mlp.forward_prefill_sp(normed, prefix)
-
     def forward(
         self,
         positions: torch.Tensor,
@@ -3401,10 +3315,6 @@ class KimiK3DecoderLayer(nn.Module):
     ) -> torch.Tensor:
         if self._kda_dwdp is not None:
             self._kda_dwdp.on_layer_start(self.layer_idx)
-        if get_forward().sp_active:
-            return self._forward_prefill_sp(
-                hidden_states, positions, forward_batch, zero_allocator
-            )
         hidden_states = self.attn_boundary.prepare(
             hidden_states, forward_batch, capture_gathered=capture_gathered
         )
@@ -3604,7 +3514,6 @@ class KimiK3LinearModel(nn.Module):
             device=device,
         )
 
-        sp_padded = self._prefill_sp_padded_rows(forward_batch, hidden_states)
         if self.attn_bank is not None:
             attn_res_block_num = _cdiv(self.end_layer, self.config.attn_res_block_size)
             # A later pipeline rank inherits the rows the earlier ones banked.
@@ -3617,7 +3526,9 @@ class KimiK3LinearModel(nn.Module):
                 hidden_states,
                 attn_res_block_num,
                 inherited,
-                padded_rows=sp_padded,
+                num_rows=layernorm_sp.stack_rows(
+                    forward_batch.forward_mode, hidden_states.shape[0]
+                ),
             )
 
         packs_aux = self.packs_aux_hidden_states
@@ -3648,10 +3559,6 @@ class KimiK3LinearModel(nn.Module):
                 )
         for i in range(self.start_layer, self.end_layer):
             with get_global_expert_distribution_recorder().with_current_layer(i):
-                if sp_padded is not None and i == self._prefill_sp_first_layer:
-                    hidden_states = self._prefill_sp_enter(
-                        hidden_states, forward_batch, sp_padded
-                    )
                 hidden_states = self.layers[i](
                     positions=positions,
                     hidden_states=hidden_states,
@@ -3668,11 +3575,12 @@ class KimiK3LinearModel(nn.Module):
                 and i in captures
                 and (i + 1 < self.end_layer or self.pp_group.is_last_rank)
             ):
-                aux_hidden_states.append(
-                    self._prefill_sp_capture_stream(i, hidden_states)
-                    if get_forward().sp_active
-                    else self._dspark_capture_stream(i, hidden_states, forward_batch)
-                )
+                capture = self._dspark_capture_stream(i, hidden_states, forward_batch)
+                if get_forward().sp_active:
+                    capture = layernorm_sp.sp_exit_gather(
+                        capture, num_tokens=layernorm_sp.sp_num_tokens()
+                    )
+                aux_hidden_states.append(capture)
 
         if not self.pp_group.is_last_rank:
             if self.attn_bank is not None:
@@ -3690,20 +3598,17 @@ class KimiK3LinearModel(nn.Module):
                 )
             return proxy_tensors
 
-        if get_forward().sp_active:
-            hidden_states = self._prefill_sp_exit(hidden_states)
-        else:
-            hidden_states = residual_batch.final_norm(
-                hidden_states,
-                forward_batch,
-                self._final_read,
-                capture=(
-                    aux_hidden_states.capture
-                    if captures_at_input and self.end_layer - 1 in captures
-                    else None
-                ),
-                skip_empty=True,
-            )
+        hidden_states = residual_batch.final_norm(
+            hidden_states,
+            forward_batch,
+            self._final_read,
+            capture=(
+                aux_hidden_states.capture
+                if captures_at_input and self.end_layer - 1 in captures
+                else None
+            ),
+            skip_empty=True,
+        )
         if self.attn_bank is not None:
             self.attn_bank.close()
 
@@ -3711,93 +3616,6 @@ class KimiK3LinearModel(nn.Module):
             return hidden_states, aux_hidden_states.finalize()
         if self.dspark_layers_to_capture is not None:
             return hidden_states, aux_hidden_states
-        return hidden_states
-
-    @cached_property
-    def _prefill_sp_first_layer(self) -> Optional[int]:
-        parallel = get_parallel()
-        if (
-            self.attn_bank is None
-            or self.alt_streams is None
-            or not (self.pp_group.is_first_rank and self.pp_group.is_last_rank)
-            or parallel.tp_size <= 1
-            or parallel.attn_tp_size != parallel.tp_size
-            or parallel.attn_cp_size != 1
-            or self._dp_attention
-            or not k3_ar_fusion.enabled()
-        ):
-            return None
-        layers = range(self.start_layer, self.end_layer)
-        first = next((i for i in layers if _is_moe_layer(self.config, i)), None)
-        if first is None or first == self.start_layer:
-            return None
-        if not all(
-            self.layers[i].prefill_sp_capable for i in range(first, self.end_layer)
-        ):
-            return None
-        return first
-
-    def _prefill_sp_padded_rows(
-        self, forward_batch: ForwardBatch, hidden_states: torch.Tensor
-    ) -> Optional[int]:
-        """The padded row count of a batch that runs sequence-parallel, else None."""
-        from sglang.srt.model_executor.forward_mode import ForwardMode
-
-        # Depends only on the batch size and env, so all TP ranks issue the same collectives.
-        if (
-            not envs.SGLANG_K31_PREFILL_SP_TAIL.get()
-            or forward_batch.forward_mode != ForwardMode.EXTEND
-            or hidden_states.shape[0] < envs.SGLANG_K31_PREFILL_SP_TAIL_MIN_TOKENS.get()
-            or get_is_capture_mode()
-            or is_in_breakable_cuda_graph()
-            or is_cp_active(forward_batch)
-            or self._prefill_sp_first_layer is None
-        ):
-            return None
-        padded = ceil_align(hidden_states.shape[0], 2 * get_parallel().tp_size)
-        if padded > k3_ar_fusion.symm_buffer_max_rows():
-            return None
-        return padded
-
-    def _prefill_sp_enter(
-        self, hidden_states, forward_batch: ForwardBatch, padded: int
-    ) -> torch.Tensor:
-        stream = residual_batch.fold(hidden_states, forward_batch)
-        residual_batch.clear(forward_batch)
-        self.attn_bank.require().include_padding()
-        num_tokens = stream.shape[0]
-        layernorm_sp.set_sp_num_tokens(num_tokens)
-        get_forward().set("sp_active", True)
-        local = padded // get_parallel().tp_group.world_size
-        rows = _prefill_sp_rows(local)
-        start, stop = rows.start, min(rows.stop, num_tokens)
-        if stop - start == local:
-            return stream[rows]
-        shard = stream.new_zeros((local, stream.shape[1]))
-        if stop > start:
-            shard[: stop - start].copy_(stream[start:stop])
-        return shard
-
-    def _prefill_sp_capture_stream(
-        self, layer_idx: int, stream: torch.Tensor
-    ) -> torch.Tensor:
-        rows = _prefill_sp_rows(stream.shape[0])
-        mixed = self._capture_bank_rows(
-            layer_idx, stream, self.attn_bank.require().block_residual[rows]
-        )
-        return _prefill_sp_gather(mixed, owned=True)
-
-    def _prefill_sp_exit(self, stream: torch.Tensor) -> torch.Tensor:
-        normed, _ = self.attn_bank.require().forward(
-            stream,
-            None,
-            self.output_attn_res_proj,
-            self.output_attn_res_norm,
-            self.norm,
-            rows=_prefill_sp_rows(stream.shape[0]),
-        )
-        hidden_states = _prefill_sp_gather(normed, owned=True)
-        get_forward().set("sp_active", False)
         return hidden_states
 
     @property
@@ -3818,11 +3636,6 @@ class KimiK3LinearModel(nn.Module):
         output side for the last layer). The standard path captures at the
         next input instead."""
         hidden_states = residual_batch.snapshot(hidden_states, forward_batch)
-        return self._capture_bank_rows(
-            layer_idx, hidden_states, self.attn_bank.require().block_residual
-        )
-
-    def _capture_bank_rows(self, layer_idx, hidden_states, bank_rows):
         if layer_idx + 1 < self.end_layer:
             next_layer = self.layers[layer_idx + 1]
             score_proj = next_layer.self_attention_res_proj
@@ -3840,7 +3653,7 @@ class KimiK3LinearModel(nn.Module):
             )
         return aggregate_stream(
             hidden_states,
-            bank_rows,
+            self.attn_bank.require().block_residual,
             nvb,
             score_proj,
             score_norm,
