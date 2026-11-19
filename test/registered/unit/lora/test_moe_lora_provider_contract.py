@@ -136,6 +136,65 @@ class TestFp8MarlinFamilyBinding(CustomTestCase):
             family_of_layer(per_tensor)
 
 
+class TestMarlinBlockSize(CustomTestCase):
+    """fused_marlin_moe's block rule and the FP8 provider's two measured exceptions."""
+
+    @staticmethod
+    def _blocks(tokens, capability, sms=152, group=128, shape=(2048, 512), experts=256):
+        from sglang.srt.lora.moe.base_gemm_provider import marlin
+
+        device = torch.device("cuda", 1)
+        quant_info = SimpleNamespace(
+            group_size=group,
+            hidden_size=shape[0],
+            intermediate_size=shape[1],
+            num_local_experts=experts,
+            w13_qweight=SimpleNamespace(device=device),
+        )
+        with (
+            mock.patch.object(marlin.MarlinPairProvider, "__init__", return_value=None),
+            mock.patch.object(
+                torch.cuda, "get_device_capability", return_value=capability
+            ) as device_capability,
+            mock.patch.object(
+                torch.cuda,
+                "get_device_properties",
+                return_value=SimpleNamespace(multi_processor_count=sms),
+            ),
+        ):
+            provider = marlin.MarlinFp8PairProvider(quant_info)
+        device_capability.assert_called_once_with(device)
+        return [provider._block_size_m(t, 8, experts) for t in tokens]
+
+    def test_fp8_block_16_from_6_5_pairs_per_expert_on_sm90(self):
+        tokens = (207, 208, 230, 231, 460, 461, 921, 922, 1382, 1383)
+        shared = [8, 8, 8, 16, 16, 32, 32, 48, 48, 64]
+        self.assertEqual(
+            self._blocks(tokens, (9, 0)), [8, 16, 16, 16, 16, 32, 32, 48, 48, 64]
+        )
+        for capability, other in (
+            ((10, 0), {}),
+            ((9, 0), dict(group=32)),
+            ((9, 0), dict(shape=(4096, 512))),
+            ((9, 0), dict(shape=(2048, 1024))),
+        ):
+            self.assertEqual(self._blocks(tokens, capability, **other), shared, other)
+
+    def test_fp8_blocks_of_48_from_128_to_512_pairs_on_sm103_with_152_sms(self):
+        tokens = (4095, 4096, 16384, 16385)
+        self.assertEqual(self._blocks(tokens, (10, 3), group=32), [64, 48, 48, 64])
+        for capability, sms, other in (
+            ((10, 0), 152, {}),
+            ((10, 3), 148, {}),
+            ((10, 3), 152, dict(group=128)),
+            ((10, 3), 152, dict(shape=(3072, 512))),
+            ((10, 3), 152, dict(shape=(2048, 1024))),
+            ((10, 3), 152, dict(experts=128)),
+        ):
+            blocks = self._blocks(tokens, capability, sms, **{"group": 32, **other})
+            self.assertEqual(blocks, [64] * 4, other)
+
+
 class TestMxfp4ScaleStorage(CustomTestCase):
     def test_lora_backends_store_e8m0_scales(self):
         from sglang.srt.layers.moe.utils import MoeRunnerBackend

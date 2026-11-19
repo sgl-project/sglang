@@ -162,6 +162,46 @@ def test_fp8_marlin_gateup_and_down_match_reference():
     _check_gemms(gateup, down, hidden, topk_ids, act_pairs, w13_eff, w2_eff)
 
 
+def test_fp8_marlin_block_16_at_the_measured_shape():
+    _skip_unless_supported()
+    if torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip("the early block-16 rule is SM90-only")
+    tokens = 13  # 6.5 pairs per expert, the new block-16 boundary.
+    g = torch.Generator(device="cpu").manual_seed(17)
+    hidden_size, intermediate = 2048, 512
+    quant_info, w13_eff, w2_eff = _marlin_layer(
+        "fp8",
+        _rand(g, _E, 2 * intermediate, hidden_size),
+        _rand(g, _E, hidden_size, intermediate),
+    )
+    assert quant_info.group_size == 128
+    provider = select_provider_cls("route_major", "fp8", "marlin")(quant_info)
+    hidden, topk_ids = _rand(g, tokens, hidden_size), _route(g, tokens)
+    act_pairs = _rand(g, tokens * _TOPK, intermediate, scale=0.1)
+
+    state, gateup, down = _run_gemms(provider, hidden, topk_ids, act_pairs)
+    assert state.block_size_m == 16
+    _check_gemms(gateup, down, hidden, topk_ids, act_pairs, w13_eff, w2_eff)
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(2):
+            _run_gemms(provider, hidden, topk_ids, act_pairs)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        state, gateup, down = _run_gemms(provider, hidden, topk_ids, act_pairs)
+    assert state.block_size_m == 16
+    # Replay over new routing and inputs in the captured buffers.
+    topk_ids.copy_(_route(g, tokens))
+    hidden.copy_(_rand(g, tokens, hidden_size))
+    act_pairs.copy_(_rand(g, tokens * _TOPK, intermediate, scale=0.1))
+    graph.replay()
+    torch.cuda.synchronize()
+    _check_gemms(gateup, down, hidden, topk_ids, act_pairs, w13_eff, w2_eff)
+
+
 @pytest.mark.parametrize(
     "family, is_shared_outer, phase",
     (

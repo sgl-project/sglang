@@ -572,6 +572,10 @@
       "quant": [
         "fp8"
       ],
+      "vendor": [
+        "cutedsl",
+        "triton"
+      ],
       "base_gemm_rows": "expert_major",
       "plan": {
         "gate_up_a_family": "grouped",
