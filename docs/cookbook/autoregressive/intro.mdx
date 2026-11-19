@@ -62,6 +62,12 @@ metatags:
     img="/cards/logos/deepseek.png"
   />
   <Card
+    title="RadixArk"
+    mode="card"
+    href="/cookbook/autoregressive/RadixArk/DaisyRose-27B"
+    img="/cards/logos/radixark.png"
+  />
+  <Card
     title="DeepReinforce"
     mode="card"
     href="/cookbook/autoregressive/DeepReinforce/Ornith-1.5"

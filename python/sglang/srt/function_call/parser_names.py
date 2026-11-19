@@ -52,6 +52,7 @@ TOOL_CALL_PARSER_NAMES = [
     "gigachat4",
     "gemma4",
     "inkling",
+    "inkling2",
     "iquest_q1",
     "response_template",
     "xing4_0",
