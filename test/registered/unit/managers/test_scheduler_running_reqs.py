@@ -306,6 +306,7 @@ class TestRunningReqsHooks(CustomTestCase):
         s.process_pending_chunked_abort = Mock()
         s._process_hicache_events = Mock()
         s.require_mlp_sync = False
+        s.is_mixed_chunk = False
         s.spec_algorithm = SpeculativeAlgorithm.NGRAM
         s._should_defer_prefill = Mock(return_value=False)
         s.get_new_batch_prefill = lambda b: NextBatchPlan(None, b)
