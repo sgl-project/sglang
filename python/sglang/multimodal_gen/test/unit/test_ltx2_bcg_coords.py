@@ -263,7 +263,7 @@ class TestLTX2GuidanceBCG(CustomTestCase):
             kwargs["audio_hidden_states"] * 0.5 + prompt,
         )
 
-    def _run_step(self, *, mode, warmup, runner, value, sigmas=None):
+    def _run_step(self, *, mode, warmup, runner, value, sigmas=None, num_outputs=1):
         stage = object.__new__(LTX2DenoisingStage)
         stage.sampler_name = "euler"
         stage._attention_backend_active_override = None
@@ -282,6 +282,8 @@ class TestLTX2GuidanceBCG(CustomTestCase):
         stage.server_args = args
         video = torch.arange(8, dtype=torch.float32).view(1, 2, 4) + value
         audio = torch.arange(4, dtype=torch.float32).view(1, 1, 4) + value
+        video = video.repeat(num_outputs, 1, 1)
+        audio = audio.repeat(num_outputs, 1, 1)
         if sigmas is None:
             sigmas = torch.tensor([1.0, 0.5])
         scheduler = SimpleNamespace(
@@ -371,6 +373,21 @@ class TestLTX2GuidanceBCG(CustomTestCase):
                     self.assertTrue(
                         kwargs["perturbation_configs"][3]["skip_a2v_cross_attn"]
                     )
+
+    def test_multiple_outputs_per_prompt_match_single_output(self):
+        # n=2 holds two latent samples against one prompt row.
+        for mode in ("batched", "legacy", "official"):
+            with self.subTest(mode=mode):
+                single = self._run_step(mode=mode, warmup=False, runner=None, value=1.0)
+                double = self._run_step(
+                    mode=mode, warmup=False, runner=None, value=1.0, num_outputs=2
+                )
+                for result, reference in zip(double, single):
+                    self.assertEqual(result.shape[0], 2)
+                    for sample in result:
+                        torch.testing.assert_close(
+                            sample[None], reference, rtol=0, atol=0
+                        )
 
     def test_steps_never_read_device_sigmas_on_host(self):
         modes = ("official", "batched", "ti2v", "hq", "legacy", "legacy_batched")
