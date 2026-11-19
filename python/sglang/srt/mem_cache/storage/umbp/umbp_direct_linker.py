@@ -841,7 +841,10 @@ class UMBPDirectLinker(UnifiedCacheLinker):
     def offload(
         self, transfers: list[PoolTransfer], session_id: str | None = None
     ) -> bool:
-        expanded = self.pool_group.resolve_transfers(transfers, allow_partial=True)
+        # A state added to a node already stored goes out alone, with no KV.
+        expanded = self.pool_group.resolve_transfers(
+            transfers, allow_partial=True, allow_missing_kv=True
+        )
         if not expanded:
             return False
         self._freeze_gc_once()

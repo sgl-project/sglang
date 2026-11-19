@@ -1693,6 +1693,8 @@ class UnifiedRadixCache(BasePrefixCache):
         try:
             with self._linker_offload_skip_prefix(req, token_ids):
                 result = self.insert(insert_params)
+                if self.linker is not None and not result.rotation_tail_declined:
+                    self.linker.offload_new_state(result.last_device_node)
         finally:
             if reuse_existing_mamba:
                 insert_params.allow_missing_mamba = False
