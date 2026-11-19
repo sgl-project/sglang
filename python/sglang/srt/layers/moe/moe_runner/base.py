@@ -73,6 +73,9 @@ class MoeRunnerConfig:
     # Request FP32 SiLU/multiply intermediates until FP8 quantization.
     # False preserves backend defaults, including their existing FP32 paths.
     silu_mul_keep_fp32: bool = False
+    # Resolved token threshold for Dual-Runner (0 disables; set once at runner
+    # init so forward hot paths avoid reading environment variables).
+    dual_runner_threshold: int = 0
 
     # The MoE placement a fused func needs is the layer's own, not the
     # deployment's: DWDP's `FusedMoE.bind_full_expert_weights` collapses a
@@ -364,3 +367,95 @@ def register_post_permute(
         return permute_func
 
     return decorator
+
+
+def resolve_moe_dual_runner_threshold(
+    raw_threshold: int,
+    runner_config: MoeRunnerConfig,
+    *,
+    is_fp8: bool,
+    scale_ue8m0: Optional[bool] = None,
+) -> int:
+    """Resolve `SGLANG_MOE_DUAL_RUNNER_THRESHOLD` into a concrete token cutoff.
+
+    `0` disables Dual-Runner, `> 0` preserves an explicit cutoff, and `< 0`
+    selects an M_eff-based crossover where DeepGEMM compact's block_e=128
+    padding inflation (`1 + 128 / M_eff`) becomes lower than Triton's WGMMA gap.
+    """
+    if raw_threshold >= 0:
+        return raw_threshold
+
+    num_local_experts = max(1, int(runner_config.num_local_experts or 1))
+    top_k = max(1, int(runner_config.top_k or 1))
+    if is_fp8:
+        if scale_ue8m0 is None:
+            from sglang.srt.layers import deep_gemm_wrapper
+
+            scale_ue8m0 = bool(deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0)
+        # On SM90 (!DEEPGEMM_SCALE_UE8M0), DEEPGEMM_NEED_TMA_ALIGNED_SCALES adds
+        # two unfused quant + tma_align_input_scale HBM transpose passes per layer,
+        # pushing the DeepGEMM crossover to M_eff=1024 (16384 tokens on E=128, k=8).
+        target_m_eff = 256 if scale_ue8m0 else 1024
+        min_tokens = 1024 if scale_ue8m0 else 2048
+    else:
+        target_m_eff = 512
+        min_tokens = 1024
+    return max(min_tokens, (target_m_eff * num_local_experts + top_k - 1) // top_k)
+
+
+def get_moe_dual_runner_unsupported_reason(
+    runner_config: MoeRunnerConfig,
+    *,
+    with_bias: bool,
+) -> Optional[str]:
+    """Return a short reason if shared Dual-Runner prerequisites are unmet."""
+    from sglang.srt.layers import deep_gemm_wrapper
+    from sglang.srt.layers.moe.utils import get_moe_a2a_backend, get_moe_runner_backend
+    from sglang.srt.runtime_context import get_exec, get_lora
+    from sglang.srt.utils import get_device_sm, is_cuda
+
+    if not get_moe_runner_backend().is_auto():
+        return f"moe_runner_backend is {get_moe_runner_backend().name}, not auto"
+    if not get_moe_a2a_backend().is_none():
+        return f"moe_a2a_backend is {get_moe_a2a_backend().name}, not none"
+    if not is_cuda() or get_device_sm() not in (90, 100):
+        return (
+            f"requires SM90/SM100 CUDA "
+            f"(got sm={get_device_sm() if is_cuda() else 'non-cuda'})"
+        )
+    if not deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+        return "ENABLE_JIT_DEEPGEMM is False"
+    if not runner_config.is_gated or runner_config.activation != "silu":
+        return (
+            f"unsupported activation "
+            f"({runner_config.activation}, is_gated={runner_config.is_gated})"
+        )
+    if (
+        runner_config.gemm1_alpha is not None
+        or runner_config.gemm1_clamp_limit is not None
+        or runner_config.swiglu_limit is not None
+    ):
+        return "custom SwiGLU alpha/clamp/limit is unsupported"
+    if (
+        runner_config.apply_router_weight_on_input
+        or runner_config.no_combine
+        or with_bias
+    ):
+        return "apply_router_weight_on_input, no_combine, or expert bias is unsupported"
+
+    try:
+        if get_lora().enable_lora or get_lora().lora_paths:
+            return "LoRA is enabled"
+    except Exception:
+        pass
+    try:
+        moe_exec = get_exec().moe
+        if moe_exec.enable_eplb or moe_exec.enable_paged_experts:
+            return "EPLB or paged experts enabled"
+    except Exception:
+        pass
+
+    hidden_size = int(runner_config.hidden_size or 0)
+    if hidden_size <= 0 or hidden_size % 128 != 0:
+        return f"hidden_size={hidden_size} is not divisible by 128"
+    return None

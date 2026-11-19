@@ -30,6 +30,10 @@ from sglang.srt.layers.amx_utils import (
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
+from sglang.srt.layers.moe.moe_runner.base import (
+    get_moe_dual_runner_unsupported_reason,
+    resolve_moe_dual_runner_threshold,
+)
 from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
 from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
     FlashInferTrtllmFp8MoeQuantInfo,
@@ -70,6 +74,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     dispatch_block_fp8_mxfp8_linear,
     dispatch_w8a8_block_fp8_linear,
     dispatch_w8a8_mxfp8_linear,
+    extract_fp32_block_scale_from_ue8m0,
     gfx1250_mxfp8_prepare_weight,
     input_to_float8,
     mxfp8_group_quantize,
@@ -2082,6 +2087,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         with_bias: bool = False,
         **extra_weight_attrs,
     ):
+        self.with_bias = with_bias
         self.weight_block_size, self.w2_weight_block_size = self._tp_weight_block_sizes(
             layer=layer,
             hidden_size=hidden_size,
@@ -2499,7 +2505,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             from sglang.srt.layers import deep_gemm_wrapper
 
             # Check if MoE will actually use DeepGEMM runner
-            will_use_deepgemm = self.is_deepgemm_moe_runner_backend_enabled()
+            will_use_deepgemm = (
+                getattr(self, "is_dual_runner", False)
+                or self.is_deepgemm_moe_runner_backend_enabled()
+            )
 
             if self.is_fp4_expert and self.dequant_fp4_to_fp8:
                 for weight_param, scale_param in [
@@ -2606,6 +2615,34 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                         weight_shape=weight.shape[-2:],
                         grouped_moe=True,
                     )
+
+                if getattr(self, "is_dual_runner", False):
+                    # Extract float32 scales from the post-requant UE8M0 scales so
+                    # Triton and DeepGEMM read identical quantized weights and scales.
+                    for attr_name, weight, weight_scale, block_size in (
+                        (
+                            "w13_weight_scale_inv_fp32",
+                            layer.w13_weight,
+                            layer.w13_weight_scale_inv,
+                            self.weight_block_size,
+                        ),
+                        (
+                            "w2_weight_scale_inv_fp32",
+                            layer.w2_weight,
+                            layer.w2_weight_scale_inv,
+                            self.w2_weight_block_size or self.weight_block_size,
+                        ),
+                    ):
+                        if getattr(weight_scale, "format_ue8m0", False):
+                            fp32_scale = extract_fp32_block_scale_from_ue8m0(
+                                weight_scale.data,
+                                mn=weight.shape[-2],
+                                k=weight.shape[-1],
+                                block_size=block_size,
+                            )
+                            layer.register_buffer(
+                                attr_name, fp32_scale, persistent=False
+                            )
 
     def _convert_mxfp8_moe_to_block_fp8(self, layer: Module) -> None:
         from sglang.srt.layers.quantization.mxfp8_block_convert import (
@@ -3280,6 +3317,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self._owns_moe_runner = False
+        self.is_dual_runner = False
+        self.dual_runner_threshold = 0
         self.moe_runner_config = moe_runner_config
 
         # MXFP4 experts on NPU run through the ASCEND runner, which
@@ -3301,6 +3340,45 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             return
 
         configured_backend = get_moe_runner_backend()
+        threshold = envs.SGLANG_MOE_DUAL_RUNNER_THRESHOLD.get()
+        if (
+            threshold != 0
+            and configured_backend.is_auto()
+            and get_moe_a2a_backend().is_none()
+        ):
+            unsupported_reason = self._dual_runner_unsupported_reason(
+                layer, moe_runner_config
+            )
+            if unsupported_reason is None:
+                resolved_threshold = resolve_moe_dual_runner_threshold(
+                    threshold, moe_runner_config, is_fp8=True
+                )
+                self.is_dual_runner = True
+                self.dual_runner_threshold = resolved_threshold
+                moe_runner_config.dual_runner_threshold = resolved_threshold
+                self.runner_triton = MoeRunner(
+                    MoeRunnerBackend.TRITON, moe_runner_config
+                )
+                self.runner_deep_gemm = MoeRunner(
+                    MoeRunnerBackend.DEEP_GEMM, moe_runner_config
+                )
+                self.runner = self.runner_triton
+                self._owns_moe_runner = True
+                logger.info_once(
+                    "Enabled Routing-Aware Dual-Runner MoE (FP8): "
+                    "threshold=%d (raw=%d, num_local_experts=%s, top_k=%s).",
+                    resolved_threshold,
+                    threshold,
+                    moe_runner_config.num_local_experts,
+                    moe_runner_config.top_k,
+                )
+                return
+            logger.info_once(
+                "Fp8MoEMethod dual-runner disabled on this layer (%s); "
+                "falling back to single MoE runner.",
+                unsupported_reason,
+            )
+
         moe_runner_backend = self._resolve_moe_runner_backend()
         if (
             configured_backend.is_flashinfer_cutlass()
@@ -3326,6 +3404,57 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             # Direct kernels declare the layout they consume.
             self._moe_runner_backend = moe_runner_backend
 
+    def _dual_runner_unsupported_reason(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ) -> Optional[str]:
+        if layer is None:
+            return "layer is None"
+        from sglang.srt.layers import deep_gemm_wrapper
+        from sglang.srt.model_loader.utils import should_deepgemm_weight_requant_ue8m0
+
+        reason = get_moe_dual_runner_unsupported_reason(
+            moe_runner_config,
+            with_bias=getattr(self, "with_bias", False)
+            or getattr(layer, "with_bias", False),
+        )
+        if reason is not None:
+            return reason
+        if self.is_fp4_expert or self.use_mxfp8:
+            return "FP4/MXFP8 experts are unsupported by FP8 dual-runner"
+        if _is_fp8_fnuz or _use_aiter or _is_cpu or _is_xpu:
+            return "requires non-FNUZ CUDA FP8"
+        block_size = getattr(self, "weight_block_size", None)
+        w2_block_size = getattr(self, "w2_weight_block_size", None)
+        if (
+            not self.block_quant
+            or list(block_size or []) != [128, 128]
+            or (w2_block_size is not None and list(w2_block_size) != [128, 128])
+            or getattr(layer, "allow_fp8_blockwise_tail", False)
+        ):
+            return (
+                f"requires unrefined block-128 FP8 "
+                f"(got block_quant={self.block_quant}, block_size={block_size}, "
+                f"w2_block_size={w2_block_size})"
+            )
+        if moe_runner_config.params_dtype not in (None, torch.bfloat16):
+            return (
+                f"DeepGEMM block-FP8 requires BF16 output, "
+                f"got {moe_runner_config.params_dtype}"
+            )
+        inter = int(getattr(layer, "intermediate_size_per_partition", 0))
+        if inter <= 0 or inter % 128 != 0:
+            return f"intermediate_size_per_partition={inter} is not divisible by 128"
+        if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+            for weight in (layer.w13_weight, layer.w2_weight):
+                if not should_deepgemm_weight_requant_ue8m0(
+                    block_size,
+                    output_dtype=torch.bfloat16,
+                    weight_shape=weight.shape[-2:],
+                    grouped_moe=True,
+                ):
+                    return f"UE8M0 requant unsupported for shape={tuple(weight.shape[-2:])}"
+        return None
+
     def get_moe_runner_backend(self, layer):
         if self.runner is not None:
             return self.runner.runner_backend
@@ -3345,6 +3474,18 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
     def get_triton_quant_info(self, layer: torch.nn.Module) -> TritonMoeQuantInfo:
         use_rocm_mxfp8 = self.use_mxfp8 and _is_hip and _is_gfx95_supported
+        w13_scale = getattr(layer, "w13_weight_scale_inv_fp32", None)
+        if w13_scale is None:
+            w13_scale = (
+                layer.w13_weight_scale_inv
+                if self.block_quant
+                else layer.w13_weight_scale
+            )
+        w2_scale = getattr(layer, "w2_weight_scale_inv_fp32", None)
+        if w2_scale is None:
+            w2_scale = (
+                layer.w2_weight_scale_inv if self.block_quant else layer.w2_weight_scale
+            )
         return TritonMoeQuantInfo(
             w13_weight=layer.w13_weight,
             w2_weight=layer.w2_weight,
@@ -3352,18 +3493,52 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             b2=getattr(layer, "w2_weight_bias", None),
             use_mxfp8=use_rocm_mxfp8,
             use_fp8_w8a8=not use_rocm_mxfp8,
-            w13_scale=(
-                layer.w13_weight_scale_inv
-                if self.block_quant
-                else layer.w13_weight_scale
-            ),
-            w2_scale=(
-                layer.w2_weight_scale_inv if self.block_quant else layer.w2_weight_scale
-            ),
+            w13_scale=w13_scale,
+            w2_scale=w2_scale,
             a13_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,
             block_shape=self.weight_block_size,
             w2_block_shape=self.w2_weight_block_size,
+        )
+
+    def _get_deep_gemm_quant_info(self, layer: torch.nn.Module) -> DeepGemmMoeQuantInfo:
+        w13_weight = layer.w13_weight
+        w2_weight = layer.w2_weight
+
+        if self.block_quant:
+            block_shape = self.quant_config.weight_block_size
+            w13_scale = layer.w13_weight_scale_inv
+            w2_scale = layer.w2_weight_scale_inv
+        else:
+            # Convert per-tensor quant to per-block quant by repeating scales for forward_deepgemm
+            scale_block_size = 128
+            block_shape = [scale_block_size, scale_block_size]
+            w13_scale_n = (w13_weight.shape[1] - 1) // scale_block_size + 1
+            w13_scale_k = (w13_weight.shape[2] - 1) // scale_block_size + 1
+            w13_scale = (
+                layer.w13_weight_scale.unsqueeze(1)
+                .repeat_interleave(w13_scale_n, dim=1)
+                .unsqueeze(2)
+                .repeat_interleave(w13_scale_k, dim=2)
+            )
+            w2_scale_n = (w2_weight.shape[1] - 1) // scale_block_size + 1
+            w2_scale_k = (w2_weight.shape[2] - 1) // scale_block_size + 1
+            w2_scale = (
+                layer.w2_weight_scale.unsqueeze(1)
+                .repeat_interleave(w2_scale_n, dim=1)
+                .unsqueeze(2)
+                .repeat_interleave(w2_scale_k, dim=2)
+            )
+        return DeepGemmMoeQuantInfo(
+            w13_weight=w13_weight,
+            w2_weight=w2_weight,
+            use_fp8=True,
+            w13_scale=w13_scale,
+            w2_scale=w2_scale,
+            block_shape=block_shape,
+            w2_block_shape=self.w2_weight_block_size,
+            is_fp4_experts=self.is_fp4_expert,
+            use_mxfp8=self.use_mxfp8,
         )
 
     def apply(
@@ -3506,6 +3681,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
             return StandardCombineInput(hidden_states=output)
 
+        if getattr(self, "is_dual_runner", False):
+            # shape[0] is a static Python int during CUDA graph capture (zero GPU-CPU sync)
+            if x.shape[0] < self.dual_runner_threshold:
+                return self.runner_triton.run(
+                    dispatch_output, self.get_triton_quant_info(layer)
+                )
+            return self.runner_deep_gemm.run(
+                dispatch_output, self._get_deep_gemm_quant_info(layer)
+            )
+
         if self.runner.runner_backend.is_flashinfer_megamoe():
             from sglang.srt.layers.moe.flashinfer_megamoe import (
                 FlashInferMegaMoeQuantInfo,
@@ -3531,44 +3716,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 ),
             )
         elif self.runner.runner_backend.is_deep_gemm():
-            w13_weight = layer.w13_weight
-            w2_weight = layer.w2_weight
-
-            if self.block_quant:
-                block_shape = self.quant_config.weight_block_size
-                w13_scale = layer.w13_weight_scale_inv
-                w2_scale = layer.w2_weight_scale_inv
-            else:
-                # Convert per-tensor quant to per-block quant by repeating scales for forward_deepgemm
-                scale_block_size = 128
-                block_shape = [scale_block_size, scale_block_size]
-                w13_scale_n = (w13_weight.shape[1] - 1) // scale_block_size + 1
-                w13_scale_k = (w13_weight.shape[2] - 1) // scale_block_size + 1
-                w13_scale = (
-                    layer.w13_weight_scale.unsqueeze(1)
-                    .repeat_interleave(w13_scale_n, dim=1)
-                    .unsqueeze(2)
-                    .repeat_interleave(w13_scale_k, dim=2)
-                )
-                w2_scale_n = (w2_weight.shape[1] - 1) // scale_block_size + 1
-                w2_scale_k = (w2_weight.shape[2] - 1) // scale_block_size + 1
-                w2_scale = (
-                    layer.w2_weight_scale.unsqueeze(1)
-                    .repeat_interleave(w2_scale_n, dim=1)
-                    .unsqueeze(2)
-                    .repeat_interleave(w2_scale_k, dim=2)
-                )
-            quant_info = DeepGemmMoeQuantInfo(
-                w13_weight=w13_weight,
-                w2_weight=w2_weight,
-                use_fp8=True,
-                w13_scale=w13_scale,
-                w2_scale=w2_scale,
-                block_shape=block_shape,
-                w2_block_shape=self.w2_weight_block_size,
-                is_fp4_experts=self.is_fp4_expert,
-                use_mxfp8=self.use_mxfp8,
-            )
+            quant_info = self._get_deep_gemm_quant_info(layer)
         elif (
             self.runner.runner_backend.is_flashinfer_trtllm()
             or self.runner.runner_backend.is_flashinfer_trtllm_routed()

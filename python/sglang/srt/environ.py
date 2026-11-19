@@ -1663,6 +1663,11 @@ class Envs:
     # standard dispatcher, and the triton MoE runner; falls back silently
     # otherwise.
     SGLANG_OPT_MOE_QUANT_ONCE = EnvBool(False)
+    # Token threshold for Routing-Aware Dual-Runner Dispatch:
+    #   0 = disabled (default); > 0 = explicit token threshold;
+    #   < 0 (e.g. -1) = auto M_eff-driven crossover (< threshold: Triton;
+    #   >= threshold: DeepGEMM compact contiguous).
+    SGLANG_MOE_DUAL_RUNNER_THRESHOLD = EnvInt(0)
 
     # ===================================================================
     # DeepGEMM Mega MoE

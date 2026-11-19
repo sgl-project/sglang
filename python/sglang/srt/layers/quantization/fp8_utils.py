@@ -2847,6 +2847,28 @@ def _inverse_transform_scale_ue8m0_impl(sf_packed):
     return sf_unrepeated
 
 
+def extract_fp32_block_scale_from_ue8m0(
+    sf_packed: torch.Tensor,
+    mn: int,
+    k: int,
+    block_size: Optional[List[int]] = None,
+) -> torch.Tensor:
+    """Reconstruct float32 [..., ceil(mn/128), ceil(k/128)] scales from DeepGEMM UE8M0."""
+    block_n, block_k = (
+        (128, 128) if block_size is None else (block_size[0], block_size[1])
+    )
+    assert block_n == 128 and block_k == 128, (
+        f"Expected [128, 128], got {[block_n, block_k]}"
+    )
+    sn = ceil_div(mn, block_n)
+    sk = ceil_div(k, block_k)
+    # Every 128 rows share one exponent byte in packed MN-major int32 words.
+    sf_bytes = (
+        sf_packed[..., 0:mn:block_n, :].contiguous().view(torch.uint8)[..., :sn, :sk]
+    )
+    return (sf_bytes.to(torch.int32) << 23).view(torch.float32).contiguous()
+
+
 # COPIED FROM DeepGEMM
 def per_block_cast_to_fp8(
     x: torch.Tensor, block_size: Tuple[int, int] = (128, 128)

@@ -26,6 +26,10 @@ from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     get_moe_runner_backend,
 )
+from sglang.srt.layers.moe.moe_runner.base import (
+    get_moe_dual_runner_unsupported_reason,
+    resolve_moe_dual_runner_threshold,
+)
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.utils import (
     route_dropped_experts_to_local,
@@ -1374,6 +1378,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         runner_backend = self.get_moe_runner_backend(layer)
         if not (
             _is_cuda
+            and not getattr(self, "is_dual_runner", False)
             and runner_backend is not None
             and runner_backend.is_triton()
             and get_moe_a2a_backend().is_none()
@@ -1604,6 +1609,49 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
+        self.is_dual_runner = False
+        self.dual_runner_threshold = 0
+        self._aiter_runner: Optional[MoeRunner] = None
+
+        threshold = envs.SGLANG_MOE_DUAL_RUNNER_THRESHOLD.get()
+        moe_runner_backend = get_moe_runner_backend()
+        if (
+            threshold != 0
+            and moe_runner_backend.is_auto()
+            and get_moe_a2a_backend().is_none()
+        ):
+            unsupported_reason = self._dual_runner_unsupported_reason(
+                layer, moe_runner_config
+            )
+            if unsupported_reason is None:
+                resolved_threshold = resolve_moe_dual_runner_threshold(
+                    threshold, moe_runner_config, is_fp8=False
+                )
+                self.is_dual_runner = True
+                self.dual_runner_threshold = resolved_threshold
+                moe_runner_config.dual_runner_threshold = resolved_threshold
+                self.runner_triton = MoeRunner(
+                    MoeRunnerBackend.TRITON, moe_runner_config
+                )
+                self.runner_deep_gemm = MoeRunner(
+                    MoeRunnerBackend.DEEP_GEMM, moe_runner_config
+                )
+                self.runner = self.runner_triton
+                logger.info_once(
+                    "Enabled Routing-Aware Dual-Runner MoE (BF16): "
+                    "threshold=%d (raw=%d, num_local_experts=%s, top_k=%s).",
+                    resolved_threshold,
+                    threshold,
+                    moe_runner_config.num_local_experts,
+                    moe_runner_config.top_k,
+                )
+                return
+            logger.info_once(
+                "UnquantizedFusedMoEMethod dual-runner disabled on this layer "
+                "(%s); falling back to single MoE runner.",
+                unsupported_reason,
+            )
+
         if self.use_flashinfer_trtllm_moe:
             backend = (
                 MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED
@@ -1652,6 +1700,34 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
                     "using triton MoE runner."
                 )
 
+    def _dual_runner_unsupported_reason(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ) -> Optional[str]:
+        if layer is None:
+            return "layer is None"
+        if (
+            self.use_flashinfer_trtllm_moe
+            or self.use_flashinfer_cutlass
+            or self.use_deep_gemm
+            or _is_npu
+            or _is_hip
+            or is_xpu()
+        ):
+            return "incompatible runner override or non-CUDA platform"
+        reason = get_moe_dual_runner_unsupported_reason(
+            moe_runner_config,
+            with_bias=getattr(self, "with_bias", False)
+            or getattr(layer, "with_bias", False),
+        )
+        if reason is not None:
+            return reason
+        if layer.w13_weight.dtype != torch.bfloat16:
+            return f"requires bfloat16 weights, got {layer.w13_weight.dtype}"
+        inter = int(getattr(layer, "intermediate_size_per_partition", 0))
+        if inter <= 0 or inter % 64 != 0:
+            return f"intermediate_size_per_partition={inter} is not divisible by 64"
+        return None
+
     def get_moe_runner_backend(self, layer):
         runner = self._aiter_runner if self._aiter_runner is not None else self.runner
         return runner.runner_backend if runner is not None else None
@@ -1691,6 +1767,21 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
         x = dispatch_output.hidden_states
+
+        if getattr(self, "is_dual_runner", False):
+            # shape[0] is a static Python int during CUDA graph capture
+            if x.shape[0] < self.dual_runner_threshold:
+                return self.runner_triton.run(
+                    dispatch_output, self.get_triton_quant_info(layer)
+                )
+            from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
+
+            quant_info = DeepGemmMoeQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                use_fp8=False,
+            )
+            return self.runner_deep_gemm.run(dispatch_output, quant_info)
 
         backend = self.runner.runner_backend
         if backend.is_deep_gemm():
