@@ -1605,6 +1605,103 @@ class FusedMoE(torch.nn.Module):
                 expert_data=expert_data,
             )
 
+    def weight_loader_stacked(
+        self,
+        param: torch.nn.Parameter,
+        loaded_weight: torch.Tensor,
+        weight_name: str,
+        shard_id: str,
+    ) -> bool:
+        """Load a stacked [num_experts, ...] w1/w2/w3 tensor as weight_loader would
+        expert by expert; returns False, loading nothing, when it cannot."""
+        if shard_id not in ("w1", "w2", "w3"):
+            return False
+        # A wrapped loader transforms each expert's tensor first.
+        if param.weight_loader != self.weight_loader:
+            return False
+        if (
+            loaded_weight.dim() != param.data.dim()
+            or loaded_weight.shape[0] != param.data.shape[0]
+        ):
+            return False
+        # Local expert ids must equal checkpoint expert ids.
+        if (
+            self.moe_ep_size != 1
+            or self.num_local_experts != param.data.shape[0]
+            or self._has_fused_shared
+            or getattr(param, "_sglang_require_global_experts", False)
+        ):
+            return False
+        if self.uses_expert_location:
+            metadata = get_global_expert_location_metadata()
+            if metadata is not None:
+                physical_to_logical = metadata.physical_to_logical_map_cpu[
+                    self.layer_id
+                ]
+                if physical_to_logical.numel() != param.data.shape[0] or not (
+                    torch.equal(
+                        physical_to_logical,
+                        torch.arange(
+                            physical_to_logical.numel(),
+                            dtype=physical_to_logical.dtype,
+                        ),
+                    )
+                ):
+                    return False
+        if (
+            getattr(param, "is_gguf_weight", False)
+            or getattr(param, "is_gguf_weight_type", False)
+            or getattr(param, "is_transposed", False)
+        ):
+            return False
+        # Only the methods _weight_loader_impl loads with a plain narrow + copy.
+        method = self.scheme if self.scheme is not None else self.quant_method
+        if self.weight_load_method is not None or type(method) not in (
+            Fp8MoEMethod,
+            UnquantizedFusedMoEMethod,
+        ):
+            return False
+        if "scale" in weight_name or "zero" in weight_name or "offset" in weight_name:
+            if "input_scale" in weight_name or getattr(
+                param, "quant_method", None
+            ) not in (
+                FusedMoeWeightScaleSupported.GROUP.value,
+                FusedMoeWeightScaleSupported.BLOCK.value,
+            ):
+                return False
+        elif (
+            "weight" not in weight_name
+            or "g_idx" in weight_name
+            or "weight_shape" in weight_name
+            or "bias" in weight_name
+        ):
+            return False
+
+        if isinstance(method, UnquantizedFusedMoEMethod):
+            method.maybe_restore_flashinfer_trtllm_bf16_weight_shape_for_load(
+                layer=self,
+                param=param,
+                weight_name=weight_name,
+            )
+        elif self.use_flashinfer_trtllm_moe:
+            from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+                clear_mxfp8_shuffle_index_cache,
+            )
+
+            clear_mxfp8_shuffle_index_cache()
+        if self.use_flashinfer_trtllm_moe:
+            shard_id = {"w1": "w3", "w3": "w1", "w2": "w2"}[shard_id]
+        # The expert dim leads, so the shard dim moves one to the right.
+        shard_dim = {"w1": 0, "w2": 1, "w3": 0}[shard_id] + 1
+        self._load_model_weight_or_group_weight_scale(
+            shard_id=shard_id,
+            shard_dim=shard_dim,
+            loaded_weight=loaded_weight,
+            expert_data=param.data,
+            load_full_w2=getattr(param, "load_full_w2", False),
+        )
+        return True
+
     def weight_loader_fused(
         self,
         param: torch.nn.Parameter,
