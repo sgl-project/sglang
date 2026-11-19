@@ -3,8 +3,9 @@
 
 Communicators and registered outputs are collective resources. Cache keys must
 be identical on every rank; release them before destroying the process groups.
-The cache admits at most 16 distinct (group, device, dtype, payload size)
-contexts and fails explicitly beyond that limit. Set
+Keep only the current geometry for each (group, device, dtype, operation).
+Matching calls reuse their context; geometry changes collectively close the
+old communicator before constructing its replacement. Set
 SGLANG_DIFFUSION_FLASHINFER_ULYSSES=1 to opt in; the BACKEND suffix selects
 FlashInfer's auto/nvlink/nccl/pcie policy (default auto). This path takes
 precedence over the built-in IPC attention pipeline. It requires a FlashInfer
@@ -21,7 +22,6 @@ from sglang.multimodal_gen import envs
 
 logger = logging.getLogger(__name__)
 _CONTEXTS: dict[tuple, "_Context"] = {}
-_MAX_CONTEXTS = 16
 
 
 def enabled() -> bool:
@@ -55,11 +55,16 @@ class _Context:
         key = (op, tuple(x.shape))
         out = self.outputs.get(key)
         if out is None:
-            if len(self.outputs) >= _MAX_CONTEXTS:
-                raise RuntimeError("FlashInfer Ulysses output cache is full")
             out = self.comm.allocate_output(x, op)
             self.outputs[key] = out
         return getattr(self.comm, op)(x, out=out).clone()
+
+    def close(self):
+        # FlashInfer synchronizes and collectively retires registered CUDA
+        # resources before returning. Keep our outputs alive until then.
+        self.comm.close()
+        self.outputs.clear()
+        self.workspace = None
 
 
 def _eligible(x):
@@ -74,17 +79,25 @@ def _eligible(x):
     )
 
 
-def _context(group, x, numel):
-    key = (group, x.device, x.dtype, numel)
+def _context(group, x, numel, op):
+    # QKV input and attention output need separate slots, otherwise each layer
+    # would retire the input communicator just to exchange its smaller output.
+    # Include the full shape: equal-size layouts can need different registered
+    # PCIe outputs even when their communicator capacity is identical.
+    key = (group, x.device, x.dtype, op)
+    geometry = (tuple(x.shape), numel)
     context = _CONTEXTS.get(key)
-    if context is None:
-        if len(_CONTEXTS) >= _MAX_CONTEXTS:
-            raise RuntimeError(
-                "FlashInfer Ulysses geometry cache is full; restart the worker "
-                "before serving more sequence geometries"
-            )
-        context = _Context(group, x, numel)
-        _CONTEXTS[key] = context
+    if context is not None:
+        if context.geometry == geometry:
+            return context
+        # All ranks see the same operation/geometry sequence and must close
+        # together while the group is alive. Returned results own their storage.
+        context.close()
+        del _CONTEXTS[key]
+    # Do not publish a failed initialization; the same geometry can be retried.
+    context = _Context(group, x, numel)
+    context.geometry = geometry
+    _CONTEXTS[key] = context
     return context
 
 
@@ -105,8 +118,8 @@ def exchange(x, group, *, scatter: bool, head_dim: int = 2):
     if x.shape[split_dim] % world:
         return None
     x = x.contiguous()
-    context = _context(group, x, x.numel())
     op = "scatter_heads" if scatter else "gather_heads"
+    context = _context(group, x, x.numel(), op)
     out = context.exchange(x, op)
     return out if head_dim == 2 else out.transpose(1, 2).contiguous()
 
@@ -130,7 +143,7 @@ def exchange_qkv(q, k, v, group):
     is_3d = q.ndim == 3
     if is_3d:
         q, k, v = (t.unsqueeze(0) for t in (q, k, v))
-    context = _context(group, q, 3 * q.numel())
+    context = _context(group, q, 3 * q.numel(), "qkv")
     fused = getattr(context.comm, "scatter_qkv_head_chunk", None)
     if fused is not None and context.comm.backend != "pcie":
         if context.workspace is None:
@@ -162,5 +175,5 @@ def exchange_qkv(q, k, v, group):
 def close_all() -> None:
     """Collectively release resources while their process groups are alive."""
     for context in _CONTEXTS.values():
-        context.comm.close()
+        context.close()
     _CONTEXTS.clear()

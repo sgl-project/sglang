@@ -3,6 +3,7 @@
 
 Validates the real model-parallel groups, Wan's USPAttention and H3's packed
 varlen attention core, both layouts, strided/batched QKV, and group teardown.
+SGLANG_DIFFUSION_FLASHINFER_ULYSSES_BACKEND selects nvlink (default) or nccl.
 """
 
 import os
@@ -35,10 +36,12 @@ from sglang.multimodal_gen.test.unit.conftest import _make_unit_server_args
 def main():
     rank, world = int(os.environ["LOCAL_RANK"]), int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(rank)
+    backend = os.environ.get("SGLANG_DIFFUSION_FLASHINFER_ULYSSES_BACKEND", "nvlink")
+    assert backend in ("nvlink", "nccl"), "this test covers nvlink and nccl"
     os.environ.update(
         SGLANG_DIFFUSION_IPC_A2A="0",
         SGLANG_DIFFUSION_IPC_A2A_MULTI="0",
-        SGLANG_DIFFUSION_FLASHINFER_ULYSSES_BACKEND="nvlink",
+        SGLANG_DIFFUSION_FLASHINFER_ULYSSES_BACKEND=backend,
         # Leave the pipeline enabled to check that FlashInfer takes precedence.
         SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS="-1",
     )
@@ -78,6 +81,32 @@ def main():
                 torch.testing.assert_close(back, shard, rtol=0, atol=0)
                 fi.close_all()
 
+        # Production keeps QKV and output communicators alive across requests.
+        # More than eight distinct lengths used to exhaust the global cache.
+        retained = None
+        for length in range(17, 41):
+            torch.manual_seed(1000 + length)
+            full = torch.randn(
+                1, world * length, world * 2, 64, device="cuda", dtype=torch.bfloat16
+            )
+            shard = full[:, rank * length : (rank + 1) * length]
+            qkv = tuple(shard + offset for offset in (0, 1, 2))
+            got = fi.exchange_qkv(*qkv, get_sp_group().ulysses_group)
+            for offset, operand in enumerate(got):
+                torch.testing.assert_close(
+                    operand,
+                    (full + offset)[:, :, rank * 2 : (rank + 1) * 2],
+                    rtol=0,
+                    atol=0,
+                )
+            back = usp._usp_output_all_to_all(got[0], head_dim=2)
+            torch.testing.assert_close(back, shard, rtol=0, atol=0)
+            assert len(fi._CONTEXTS) == 2
+            if retained is None:
+                retained = (got[0], got[0].clone())
+            torch.testing.assert_close(*retained, rtol=0, atol=0)
+        fi.close_all()
+
         torch.manual_seed(1000 + rank)
         qkv = torch.randn(
             1, 32, world * 2, 3, 64, device="cuda", dtype=torch.bfloat16
@@ -114,10 +143,10 @@ def main():
         for baseline, candidate in zip(*outputs):
             torch.testing.assert_close(candidate, baseline, rtol=0, atol=0)
         assert fi._CONTEXTS, "model attention bypassed FlashInfer"
-        assert all(c.comm.backend == "nvlink" for c in fi._CONTEXTS.values())
+        assert all(c.comm.backend == backend for c in fi._CONTEXTS.values())
         if rank == 0:
             print(
-                f"PASS: {world} GPUs, FP16/BF16, layouts, lifetimes, batched/strided QKV, Wan and H3 attention",
+                f"PASS: {world} GPUs, {backend}, FP16/BF16, layouts, lifetimes, geometry turnover, batched/strided QKV, Wan and H3 attention",
                 flush=True,
             )
     finally:
