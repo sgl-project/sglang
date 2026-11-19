@@ -138,38 +138,10 @@ __device__ __forceinline__ void transfer_dsv4_item_warp(
   }
 }
 #else
-__device__ __forceinline__ void
-transfer_item_warp(int32_t lane_id, const void* src_addr, void* dst_addr, int64_t item_size_bytes) {
-  // 128-bit bulk transfer via paired 64-bit loads (avoids alignment issues with uint4)
-  const int total_pairs = item_size_bytes / 16;  // number of 16-byte chunks
-  {
-    const uint64_t* __restrict__ src = static_cast<const uint64_t*>(src_addr);
-    uint64_t* __restrict__ dst = static_cast<uint64_t*>(dst_addr);
-    for (int j = lane_id; j < total_pairs; j += WARP_SIZE) {
-      uint64_t lo, hi;
-      const uint64_t* s = src + j * 2;
-      asm volatile("ld.global.nc.v2.b64 {%0,%1},[%2];" : "=l"(lo), "=l"(hi) : "l"(s) : "memory");
-      uint64_t* d = dst + j * 2;
-      asm volatile("st.global.cg.v2.b64 [%0],{%1,%2};" ::"l"(d), "l"(lo), "l"(hi) : "memory");
-    }
-  }
-
-  // Tail: 64-bit for remaining 8-byte chunk (if item_size not multiple of 16)
-  const int tail_8B = (item_size_bytes - total_pairs * 16) / 8;
-  if (tail_8B > 0 && lane_id < tail_8B) {
-    const uint64_t* __restrict__ src8 =
-        reinterpret_cast<const uint64_t*>(static_cast<const char*>(src_addr) + total_pairs * 16);
-    uint64_t* __restrict__ dst8 = reinterpret_cast<uint64_t*>(static_cast<char*>(dst_addr) + total_pairs * 16);
-    uint64_t tmp;
-    asm volatile("ld.global.nc.b64 %0,[%1];" : "=l"(tmp) : "l"(src8 + lane_id) : "memory");
-    asm volatile("st.global.cg.b64 [%0],%1;" ::"l"(dst8 + lane_id), "l"(tmp) : "memory");
-  }
-}
-
 // Copies rows [0, num_rows) with one warp; per 1 KiB chunk, every row's loads issue before any store,
-// so the warp waits one host round trip per chunk. Rows must be 16 B aligned and a multiple of 16 B.
+// so the warp waits one host round trip per chunk. Rows must be 16 B aligned; an 8 B remainder is copied too.
 template <int kRows>
-__device__ __forceinline__ void transfer_rows_warp_batched(
+__device__ __forceinline__ void transfer_rows_warp(
     int32_t lane_id,
     const char* const (&src)[kRows],
     char* const (&dst)[kRows],
@@ -187,6 +159,8 @@ __device__ __forceinline__ void transfer_rows_warp_batched(
         const int j = p0 + k * WARP_SIZE + lane_id;
         if (r < num_rows && j < total_pairs) {
           const uint64_t* s = reinterpret_cast<const uint64_t*>(src[r]) + j * 2;
+          // .nc lets ptxas sink loads below the stores (it does on sm_90a); coherent loads keep the order,
+          // but cost ~6% of link bandwidth on 656 B rows (B300), so check the SASS when this loop changes.
           asm volatile("ld.global.nc.v2.b64 {%0,%1},[%2];" : "=l"(lo[r][k]), "=l"(hi[r][k]) : "l"(s) : "memory");
         }
       }
@@ -203,6 +177,23 @@ __device__ __forceinline__ void transfer_rows_warp_batched(
       }
     }
   }
+  if (item_size_bytes - total_pairs * 16 >= 8 && lane_id == 0) {
+    uint64_t tail[kRows];
+#pragma unroll
+    for (int r = 0; r < kRows; ++r) {
+      if (r < num_rows) {
+        const uint64_t* s = reinterpret_cast<const uint64_t*>(src[r] + total_pairs * 16);
+        asm volatile("ld.global.nc.b64 %0,[%1];" : "=l"(tail[r]) : "l"(s) : "memory");
+      }
+    }
+#pragma unroll
+    for (int r = 0; r < kRows; ++r) {
+      if (r < num_rows) {
+        uint64_t* d = reinterpret_cast<uint64_t*>(dst[r] + total_pairs * 16);
+        asm volatile("st.global.cg.b64 [%0],%1;" ::"l"(d), "l"(tail[r]) : "memory");
+      }
+    }
+  }
 }
 #endif
 
@@ -214,17 +205,28 @@ __device__ __forceinline__ int popc_mask(BallotMask mask) {
 #endif
 }
 
-// Copy one missed item host->device with one warp (fused swap-in kernel and copy_cache_planned_kernel);
-// the fused kernel's batched CUDA MLA copy repeats the generic-path addressing below.
+// Misses per copy_miss_items call. CUDA MLA takes 2 and MHA 1, whose K and V rows already make 2;
+// 2 measured best on B300 (CUDA 13.0): 3 let ptxas interleave the stores, 4 needed 72 registers (limit 64).
 template <bool IsMLA, bool IsDsv4Layout>
-__device__ __forceinline__ void copy_miss_item(
+inline constexpr int kMissesPerCall =
+#ifdef USE_ROCM
+    1;
+#else
+    IsMLA && !IsDsv4Layout ? 2 : 1;
+#endif
+
+// Copy misses [0, num_misses) host->device with one warp.
+// Shared by the fused swap-in kernel and copy_cache_planned_kernel, so the layout dispatch cannot drift.
+template <bool IsMLA, bool IsDsv4Layout, int kMisses>
+__device__ __forceinline__ void copy_miss_items(
     int32_t lane_id,
     const void* __restrict__ host_cache_k,
     const void* __restrict__ host_cache_v,
     void* __restrict__ device_buffer_k,
     void* __restrict__ device_buffer_v,
-    int64_t src_loc,
-    int64_t dst_loc,
+    const int64_t (&src_locs)[kMisses],
+    const int64_t (&dst_locs)[kMisses],
+    int num_misses,
     int64_t item_size_bytes,
     // Distance between consecutive host rows: item_size_bytes for a layer-first
     // host pool, a multiple of the cell for one that interleaves layers within a
@@ -232,39 +234,71 @@ __device__ __forceinline__ void copy_miss_item(
     int64_t host_row_bytes) {
   static_assert(!IsDsv4Layout || IsMLA, "DSv4 page-padded layout is K-only (MLA).");
   if constexpr (IsDsv4Layout) {
+    for (int r = 0; r < num_misses; ++r) {
 #ifdef USE_ROCM
-    // ROCm path: host cache and device buffer both use the page-padded C4
-    // layout (same as the write path and the CUDA branch). We can't reuse
-    // device::hisparse::transfer_item here because its warp logic is hardcoded
-    // to a 32-lane warp; on wavefront64 we use transfer_dsv4_item_warp, which
-    // moves the value and the scale in one warp-width-agnostic copy.
-    using namespace device::hisparse;
-    const auto [dst_value_ptr, dst_scale_ptr] = get_pointer_paged(device_buffer_k, static_cast<int32_t>(dst_loc));
-    const auto [src_value_ptr, src_scale_ptr] =
-        get_pointer_paged(const_cast<void*>(host_cache_k), static_cast<int32_t>(src_loc));
-    transfer_dsv4_item_warp(lane_id, src_value_ptr, src_scale_ptr, dst_value_ptr, dst_scale_ptr);
+      // ROCm path: host cache and device buffer both use the page-padded C4
+      // layout (same as the write path and the CUDA branch). We can't reuse
+      // device::hisparse::transfer_item here because its warp logic is hardcoded
+      // to a 32-lane warp; on wavefront64 we use transfer_dsv4_item_warp, which
+      // moves the value and the scale in one warp-width-agnostic copy.
+      using namespace device::hisparse;
+      const auto [dst_value_ptr, dst_scale_ptr] = get_pointer_paged(device_buffer_k, static_cast<int32_t>(dst_locs[r]));
+      const auto [src_value_ptr, src_scale_ptr] =
+          get_pointer_paged(const_cast<void*>(host_cache_k), static_cast<int32_t>(src_locs[r]));
+      transfer_dsv4_item_warp(lane_id, src_value_ptr, src_scale_ptr, dst_value_ptr, dst_scale_ptr);
 #else
-    // CUDA path: page-padded device layout + page-padded host layout, K-only.
-    // The host cache is pinned DRAM but uses the same row layout as the GPU C4
-    // cache, so use the page-padded address calculation for both ends.
-    device::hisparse::transfer_item(
-        /*dst_cache=*/device_buffer_k,
-        /*src_cache=*/const_cast<void*>(host_cache_k),
-        /*dst_index=*/static_cast<int32_t>(dst_loc),
-        /*src_index=*/static_cast<int32_t>(src_loc));
+      // CUDA path: page-padded device layout + page-padded host layout, K-only.
+      // The host cache is pinned DRAM but uses the same row layout as the GPU C4
+      // cache, so use the page-padded address calculation for both ends.
+      device::hisparse::transfer_item(
+          /*dst_cache=*/device_buffer_k,
+          /*src_cache=*/const_cast<void*>(host_cache_k),
+          /*dst_index=*/static_cast<int32_t>(dst_locs[r]),
+          /*src_index=*/static_cast<int32_t>(src_locs[r]));
 #endif
+    }
   } else {
     // Generic path: device linear at item_size_bytes, host linear at
     // host_row_bytes (the same for a layer-first host pool).
-    const auto src_k = static_cast<const char*>(host_cache_k) + src_loc * host_row_bytes;
-    auto dst_k = static_cast<char*>(device_buffer_k) + dst_loc * item_size_bytes;
-    transfer_item_warp(lane_id, src_k, dst_k, item_size_bytes);
-
-    if constexpr (!IsMLA) {
-      const auto src_v = static_cast<const char*>(host_cache_v) + src_loc * host_row_bytes;
-      auto dst_v = static_cast<char*>(device_buffer_v) + dst_loc * item_size_bytes;
-      transfer_item_warp(lane_id, src_v, dst_v, item_size_bytes);
+#ifdef USE_ROCM
+    for (int r = 0; r < num_misses; ++r) {
+      const auto src_k = static_cast<const char*>(host_cache_k) + src_locs[r] * host_row_bytes;
+      auto dst_k = static_cast<char*>(device_buffer_k) + dst_locs[r] * item_size_bytes;
+      transfer_item_warp(lane_id, src_k, dst_k, item_size_bytes);
+      if constexpr (!IsMLA) {
+        const auto src_v = static_cast<const char*>(host_cache_v) + src_locs[r] * host_row_bytes;
+        auto dst_v = static_cast<char*>(device_buffer_v) + dst_locs[r] * item_size_bytes;
+        transfer_item_warp(lane_id, src_v, dst_v, item_size_bytes);
+      }
     }
+#else
+    if constexpr (IsMLA) {
+      const char* src[kMisses];
+      char* dst[kMisses];
+#pragma unroll
+      for (int r = 0; r < kMisses; ++r) {
+        // Never read past num_misses, yet dropping these cost 8 registers (CUDA 13.0)
+        // and let ptxas move some variants' stores in between their loads.
+        src[r] = nullptr;
+        dst[r] = nullptr;
+        if (r < num_misses) {
+          src[r] = static_cast<const char*>(host_cache_k) + src_locs[r] * host_row_bytes;
+          dst[r] = static_cast<char*>(device_buffer_k) + dst_locs[r] * item_size_bytes;
+        }
+      }
+      transfer_rows_warp<kMisses>(lane_id, src, dst, num_misses, item_size_bytes);
+    } else {
+      for (int r = 0; r < num_misses; ++r) {
+        const char* const src[2] = {
+            static_cast<const char*>(host_cache_k) + src_locs[r] * host_row_bytes,
+            static_cast<const char*>(host_cache_v) + src_locs[r] * host_row_bytes};
+        char* const dst[2] = {
+            static_cast<char*>(device_buffer_k) + dst_locs[r] * item_size_bytes,
+            static_cast<char*>(device_buffer_v) + dst_locs[r] * item_size_bytes};
+        transfer_rows_warp<2>(lane_id, src, dst, 2, item_size_bytes);
+      }
+    }
+#endif
   }
 }
 
@@ -773,54 +807,33 @@ __global__ void load_cache_to_device_buffer_kernel(
   }
 
   if constexpr (!SkipIO) {
-    bool batched = false;
-#ifndef USE_ROCM
-    if constexpr (IsMLA && !IsDsv4Layout) {
-      // Warp w copies misses w, w + NUM_WARPS, ... kRows at a time, with their host loads in flight together;
-      // rows that are not a multiple of 16 B keep the per-miss loop.
-      batched = item_size_bytes % 16 == 0;
-      // 2 measured best on B300 (CUDA 13.0): at 3, ptxas can interleave the stores, which loses the gain;
-      // 4 needs 72 registers, over the 64 a 960- or 1024-thread CTA launches with, so loops stay rolled.
-      constexpr int kRows = 2;
-#pragma unroll 1
-      for (int base = warp_id; batched && base < total_misses; base += NUM_WARPS * kRows) {
-        const char* src[kRows];
-        char* dst[kRows];
-        int num_rows = 0;
+    // Warp w copies misses w, w + NUM_WARPS, ... kMisses at a time.
+    constexpr int kMisses = kMissesPerCall<IsMLA, IsDsv4Layout>;
+    for (int base = warp_id; base < total_misses; base += NUM_WARPS * kMisses) {
+      int64_t src_locs[kMisses];
+      int64_t dst_locs[kMisses];
+      int num_misses = 0;
 #pragma unroll
-        for (int r = 0; r < kRows; ++r) {
-          const int miss_idx = base + r * NUM_WARPS;
-          // Never read past num_rows, yet dropping these cost up to 10 registers (CUDA 13.0).
-          src[r] = nullptr;
-          dst[r] = nullptr;
-          if (miss_idx < total_misses) {
-            const int32_t miss_token = s_top_k_tokens[miss_idx];
-            const int16_t evict_slot = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - miss_idx];
-            src[r] = static_cast<const char*>(host_base) + req_host_cache_locs[miss_token] * host_row_bytes;
-            dst[r] = static_cast<char*>(device_buffer_k) +
-                     static_cast<int64_t>(req_device_buffer_locs[evict_slot]) * item_size_bytes;
-            num_rows = r + 1;
-          }
+      for (int r = 0; r < kMisses; ++r) {
+        const int miss_idx = base + r * NUM_WARPS;
+        // Never read past num_misses, yet leaving these unset cost up to 9 registers (CUDA 13.0).
+        src_locs[r] = 0;
+        dst_locs[r] = 0;
+        if (miss_idx < total_misses) {
+          src_locs[r] = req_host_cache_locs[s_top_k_tokens[miss_idx]];
+          dst_locs[r] = static_cast<int64_t>(req_device_buffer_locs[s_lru_slots_out[HOT_BUFFER_SIZE - 1 - miss_idx]]);
+          num_misses = r + 1;
         }
-        transfer_rows_warp_batched<kRows>(lane_id, src, dst, num_rows, item_size_bytes);
       }
-    }
-#endif
-    for (int miss_idx = warp_id; !batched && miss_idx < total_misses; miss_idx += NUM_WARPS) {
-      const int32_t miss_token = s_top_k_tokens[miss_idx];
-      const int16_t evict_slot = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - miss_idx];
-
-      const int64_t src_loc = req_host_cache_locs[miss_token];
-      const int64_t dst_loc = static_cast<int64_t>(req_device_buffer_locs[evict_slot]);
-
-      copy_miss_item<IsMLA, IsDsv4Layout>(
+      copy_miss_items<IsMLA, IsDsv4Layout, kMisses>(
           lane_id,
           host_base,
           host_cache_v,
           device_buffer_k,
           device_buffer_v,
-          src_loc,
-          dst_loc,
+          src_locs,
+          dst_locs,
+          num_misses,
           item_size_bytes,
           host_row_bytes);
     }
@@ -1031,6 +1044,7 @@ __global__ __launch_bounds__(BLOCK_SIZE, 1) void copy_cache_planned_kernel(
     int64_t plan_stride,
     int64_t item_size_bytes) {
   constexpr int NUM_WARPS = BLOCK_SIZE / WARP_SIZE;
+  constexpr int kMisses = kMissesPerCall<IsMLA, IsDsv4Layout>;
   const int lane_id = threadIdx.x % WARP_SIZE;
   const int warp_global = blockIdx.x * NUM_WARPS + threadIdx.x / WARP_SIZE;
   const int total_warps = gridDim.x * NUM_WARPS;
@@ -1053,17 +1067,30 @@ __global__ __launch_bounds__(BLOCK_SIZE, 1) void copy_cache_planned_kernel(
       const int64_t r = base + j;
       const int64_t* src_row = miss_src_locs + r * plan_stride;
       const int32_t* dst_row = miss_dst_locs + r * plan_stride;
-      for (int m = m0; m < cnt; m += total_warps) {
+      for (int m = m0; m < cnt; m += total_warps * kMisses) {
         // Timing probe: the plan is still walked; only the bytes stay put.
         if constexpr (SkipIO) continue;
-        copy_miss_item<IsMLA, IsDsv4Layout>(
+        int64_t src_locs[kMisses];
+        int64_t dst_locs[kMisses];
+        int num_misses = 0;
+#pragma unroll
+        for (int s = 0; s < kMisses; ++s) {
+          const int miss = m + s * total_warps;
+          if (miss < cnt) {
+            src_locs[s] = src_row[miss];
+            dst_locs[s] = static_cast<int64_t>(dst_row[miss]);
+            num_misses = s + 1;
+          }
+        }
+        copy_miss_items<IsMLA, IsDsv4Layout, kMisses>(
             lane_id,
             host_cache_k,
             host_cache_v,
             device_buffer_k,
             device_buffer_v,
-            src_row[m],
-            static_cast<int64_t>(dst_row[m]),
+            src_locs,
+            dst_locs,
+            num_misses,
             item_size_bytes,
             /*host_row_bytes=*/item_size_bytes);
       }

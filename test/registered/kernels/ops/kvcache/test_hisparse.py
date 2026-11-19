@@ -383,7 +383,11 @@ def test_load_cache_to_device_buffer_hits_newest_and_updates_lru() -> None:
 
 
 @pytest.mark.skipif(is_xpu(), reason="MiniMax MHA block swap-in has no XPU kernel.")
-def test_load_blocks_to_device_buffer_mha_handles_partial_newest_block() -> None:
+# 960 is the production swap_in_block_size.
+@pytest.mark.parametrize("block_size", [256, 960])
+def test_load_blocks_to_device_buffer_mha_handles_partial_newest_block(
+    block_size: int,
+) -> None:
     """A partial newest block must not consume slots for its invalid tail."""
     sparse_block_size = 4
     hot_buffer_size = 8
@@ -440,6 +444,7 @@ def test_load_blocks_to_device_buffer_mha_handles_partial_newest_block() -> None
         item_size_bytes=ITEM_SIZE_BYTES,
         hot_buffer_size=hot_buffer_size,
         sparse_block_size=sparse_block_size,
+        block_size=block_size,
         num_real_reqs=torch.tensor([1], dtype=torch.int32, device=DEVICE),
     )
     get_device_module().synchronize()
@@ -491,7 +496,7 @@ def test_load_cache_to_device_buffer_miss_uses_updated_lru_slot() -> None:
 
 @pytest.mark.skipif(
     not is_hip(),
-    reason="CUDA transfer_item_warp assumes 16B-aligned items with no sub-8B remainder.",
+    reason="CUDA transfer_rows_warp assumes 16B-aligned items with no sub-8B remainder.",
 )
 @pytest.mark.parametrize(
     "kv_dim,miss_token",
@@ -754,9 +759,9 @@ def test_late_bound_host_binding_honours_a_wider_row_stride() -> None:
 
 
 @_requires_shared_sources
-# 16 B-multiple rows, as CUDA needs: a 656 B GLM-5.2 FP8 MLA row at 960 threads,
-# and 1152 B, which takes two 1 KiB chunks and several batches per warp.
-@pytest.mark.parametrize("kv_dim,block_size", [(164, 960), (288, 256)])
+# 656 B (GLM-5.2 FP8 MLA) at 960 threads; 1152 B, two 1 KiB chunks at 256 threads;
+# 24 B, one 16 B pair plus the 8 B remainder.
+@pytest.mark.parametrize("kv_dim,block_size", [(164, 960), (288, 256), (6, 256)])
 def test_many_misses_copy_byte_exact_through_a_strided_host(
     kv_dim: int, block_size: int
 ) -> None:
@@ -765,7 +770,8 @@ def test_many_misses_copy_byte_exact_through_a_strided_host(
     40 misses leave warps more than one miss and a partial last batch;
     rows come through a page_first host stride and permuted host and device maps.
     """
-    hot, layers, seq_len = 64, 3, 300
+    # Four layers keep host rows 16 B aligned (CUDA needs it); so do even device rows.
+    hot, layers, seq_len = 64, 4, 300
     item_size_bytes = kv_dim * torch.empty((), dtype=DTYPE).element_size()
     gen = torch.Generator().manual_seed(0)
     host = torch.empty(
