@@ -681,6 +681,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
                 self.assertEqual(
                     queue.move_preallocated(queue.transfer_queue.queue), ([], [])
                 )
+                self.assertFalse(queue.host_pool_blocked)
                 receiver.send_metadata.assert_not_called()
                 self.assertEqual(
                     cache.host_pool_group.available_size(), host_free_before
@@ -754,6 +755,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
                 self.assertEqual(
                     queue.move_preallocated(queue.transfer_queue.queue), ([], [])
                 )
+                self.assertTrue(queue.host_pool_blocked)
                 self.assertEqual(list(queue.queue.items()), [pending])
                 self.assertIsNone(pending_req.kv.req_pool_idx)
                 self.assertIsNone(pending_req.kv.retraction_backup)

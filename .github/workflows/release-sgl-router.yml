@@ -23,10 +23,10 @@ on:
         required: true
         type: string
       ref:
-        description: "Branch, tag, or commit to build (e.g. router-v0.1.0 or main)"
+        description: "Branch, tag, or commit to build (default main), for a build that publishes nothing to production; a release to lmsysorg/sgl-router or PyPI builds the router-v<version> tag"
         required: false
         type: string
-        default: "main"
+        default: ""
       image_repo:
         description: "Docker Hub repo to push to. Use lmsysorg/sglang-staging for testing."
         required: false
@@ -38,7 +38,7 @@ on:
         type: boolean
         default: true
       publish_pypi:
-        description: "Also upload the wheels to PyPI (a version can be uploaded only once)"
+        description: "Also upload the wheels to PyPI (a version can be uploaded only once; builds the router-v<version> tag)"
         required: false
         type: boolean
         default: false
@@ -60,11 +60,46 @@ jobs:
       ref: ${{ steps.resolve.outputs.ref }}
       tags: ${{ steps.resolve.outputs.tags }}
     steps:
+      - name: Resolve the ref to build
+        id: ref
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_REF: ${{ inputs.ref }}
+          INPUT_IMAGE_REPO: ${{ inputs.image_repo }}
+          INPUT_PUBLISH_PYPI: ${{ inputs.publish_pypi }}
+        run: |
+          version=${INPUT_VERSION#router-v}
+          version=${version#v}
+          # Same check as "Resolve version and tags", here so a typo fails with
+          # this message rather than as a tag the checkout cannot find.
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.+][0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::Invalid version '$version' (expected X.Y.Z, optionally with a pre-release suffix)"
+            exit 1
+          fi
+          # The production repo, however its Docker Hub registry is spelled.
+          image_repo=${INPUT_IMAGE_REPO:-lmsysorg/sgl-router}
+          image_repo=${image_repo#index.docker.io/}
+          image_repo=${image_repo#registry-1.docker.io/}
+          image_repo=${image_repo#docker.io/}
+          if [[ "$image_repo" == "lmsysorg/sgl-router" || "$INPUT_PUBLISH_PYPI" == "true" ]]; then
+            # Anything published to production (the image repo or PyPI) is
+            # built from the tagged commit, like release-docker.yml.
+            ref="refs/tags/router-v${version}"
+            if [[ -n "$INPUT_REF" && "$INPUT_REF" != "router-v${version}" && "$INPUT_REF" != "$ref" ]]; then
+              echo "::error::ref '$INPUT_REF' is for a build that publishes nothing to production; a release to lmsysorg/sgl-router or PyPI builds $ref."
+              exit 1
+            fi
+          else
+            ref=${INPUT_REF:-main}
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
       - name: Checkout the release ref
         uses: actions/checkout@v4
         with:
           # Empty: the event's own ref (tag push, pull request).
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || '' }}
+          ref: ${{ steps.ref.outputs.ref }}
           persist-credentials: false
 
       - name: Resolve version and tags
@@ -73,7 +108,7 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           REF_NAME: ${{ github.ref_name }}
           INPUT_VERSION: ${{ inputs.version }}
-          INPUT_REF: ${{ inputs.ref }}
+          INPUT_REF: ${{ steps.ref.outputs.ref }}
           INPUT_PUSH_LATEST: ${{ inputs.push_latest }}
         run: |
           # First `version = "..."` after [package]; the [workspace] table above it has none.
