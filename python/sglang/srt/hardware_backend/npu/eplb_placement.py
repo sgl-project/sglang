@@ -11,7 +11,7 @@ def plan_migration(counts, current, spec, ranks_per_node, layer_ids):
         raise ValueError("EPLB plan changed physical capacity")
     if spec.nodes == 1 and physical.size(1) > logical.size(1):
         physical, logical = _balance_recorded_steps(
-            physical, logical, counts, spec.local_experts
+            physical, logical, counts, spec.local_experts, current, layer_ids
         )
     physical, logical = _align_placement(
         current, physical, logical, spec.local_experts, ranks_per_node
@@ -43,7 +43,6 @@ def _align_placement(old, physical, logical, local_experts, ranks_per_node):
     planned_rows = physical.numpy().reshape(live_rows.shape)
     slots = np.arange(capacity).reshape(-1, local_experts)
     order = np.tile(slots, (layers, 1, 1))
-    ranks = np.arange(ranks_per_node)
     for layer in range(layers):
         for start in range(0, len(slots), ranks_per_node):
             node = slice(start, start + ranks_per_node)
@@ -52,11 +51,7 @@ def _align_placement(old, physical, logical, local_experts, ranks_per_node):
                 continue
             # One receive supplies all local replicas of an expert. Count distinct
             # resident experts, then maximize those hits across the entire node.
-            resident = np.zeros((ranks_per_node, logical.shape[1]), dtype=np.int32)
-            wanted = np.zeros_like(resident)
-            resident[ranks[:, None], live] = 1
-            wanted[ranks[:, None], planned] = 1
-            receives = wanted.sum(axis=1) - resident @ wanted.T
+            resident, wanted, receives = _receive_cost(live, planned, logical.shape[1])
             endpoint = receives
             if ranks_per_node == len(slots):
                 endpoint = np.maximum(receives, _send_upper_bound(resident, wanted))
@@ -74,6 +69,22 @@ def _align_placement(old, physical, logical, local_experts, ranks_per_node):
                 order[layer, start + dest] = planned_slots
 
     return _reindex_placement(physical, logical, order)
+
+
+def _receive_cost(live, planned, num_experts):
+    ranks = np.arange(len(live))[:, None]
+    resident = np.zeros((len(live), num_experts), dtype=np.int32)
+    wanted = np.zeros_like(resident)
+    resident[ranks, live] = 1
+    wanted[ranks, planned] = 1
+    return resident, wanted, wanted.sum(axis=1) - resident @ wanted.T
+
+
+def _min_remote_rows(live, planned, num_experts):
+    from scipy.optimize import linear_sum_assignment
+
+    _, _, cost = _receive_cost(live, planned, num_experts)
+    return cost[linear_sum_assignment(cost)].sum()
 
 
 def _send_upper_bound(resident, wanted):
@@ -134,52 +145,141 @@ def _reindex_placement(physical, logical, order):
     ]
 
 
-def _balance_recorded_steps(physical, logical, counts, local_experts):
-    """Spread experts that peak together, keeping each expert's replica count."""
+def _exchange_slots(expert_ids, features, slots, offers):
+    """Solve independent layer assignments together. Rows of each cost matrix are ranks."""
     from scipy.optimize import linear_sum_assignment
 
+    batches = np.arange(len(expert_ids))[:, None]
+    layer_axis = batches[:, :, None]
+    ranks = np.arange(len(slots))
+    order = np.tile(slots, (len(batches), 1, 1))
+    initial = expert_ids.reshape(order.shape)
+    load = features[layer_axis, initial].sum(axis=2)
+    resident = np.zeros((*order.shape[:2], features.shape[1]), dtype=np.int32)
+    np.add.at(resident, (layer_axis, ranks[:, None], initial), 1)
+
+    for sweep in offers:
+        for offsets in sweep:
+            offered = order[:, ranks, offsets]
+            experts = expert_ids[batches, offered]
+            vectors = features[batches, experts]
+            base = load - vectors
+            cost = base @ vectors.swapaxes(1, 2)
+            blocked = resident[layer_axis, ranks[:, None], experts[:, None, :]]
+            cost[(blocked > 0) & (experts[:, :, None] != experts[:, None, :])] = np.inf
+            take = np.stack([linear_sum_assignment(matrix)[1] for matrix in cost])
+            better = (
+                cost[batches, ranks, take].sum(1) < cost.trace(axis1=1, axis2=2) - 1e-14
+            )
+            take = np.where(better[:, None], take, ranks)
+            order[:, ranks, offsets] = offered[batches, take]
+            resident[batches, ranks, experts] -= 1
+            resident[batches, ranks, experts[batches, take]] += 1
+            load = np.where(better[:, None, None], base + vectors[batches, take], load)
+    return order
+
+
+def _balance_recorded_steps(
+    physical, logical, counts, local_experts, current, layer_ids
+):
+    """Refine replica placement, spending extra searches on layers with headroom."""
     layers, capacity = physical.shape
-    ranks = np.arange(capacity // local_experts)
     slots = np.arange(capacity).reshape(-1, local_experts)
-    order = np.tile(slots, (layers, 1, 1))
-    # First exchange matching slot offsets. Then stagger the offsets by rank
-    # so experts from different slot columns can trade places as well.
+    ranks = np.arange(len(slots))
     columns = np.broadcast_to(np.arange(local_experts), slots.shape)
     offers = (columns.T, ((columns + ranks[:, None]) % local_experts).T)
-    for layer, expert_ids in enumerate(physical.numpy()):
-        samples = counts[:, layer].numpy()
-        totals = samples.sum(axis=1)
-        active = np.flatnonzero(totals)
-        if len(active) < 2:
-            continue
-        # Bin by routed token count to represent small batches in large windows
-        # and bound the number of features in each assignment.
-        by_size = active[np.argsort(totals[active], kind="stable")]
+
+    ids = physical.numpy()
+    samples = counts.numpy()
+    order = np.tile(slots, (layers, 1, 1))
+    totals = samples.sum(axis=2)
+    eligible = np.flatnonzero(np.count_nonzero(totals, axis=0) >= 2)
+    if not len(eligible):
+        return physical, logical
+    replicas = np.stack([np.bincount(row, minlength=logical.shape[1]) for row in ids])
+    features = np.zeros((layers, logical.shape[1], 8))
+    scoring_steps = {}
+    for layer in eligible:
+        active = np.flatnonzero(totals[:, layer])
+        by_size = active[np.argsort(totals[active, layer], kind="stable")]
+        # Only the optional search uses this sample. The migration admission
+        # check below the planner still evaluates the complete recorded window.
+        scoring_steps[layer] = (
+            by_size[np.linspace(0, len(active) - 1, 64, dtype=np.intp)]
+            if len(active) > 64
+            else active
+        )
         groups = np.array_split(by_size, min(8, len(active)))
-        profiles = np.stack([samples[g].sum(axis=0) / totals[g].sum() for g in groups])
-        replicas = np.bincount(expert_ids, minlength=logical.shape[1])
-        features = (profiles / replicas).T
-        placement = order[layer]
-        load = features[expert_ids[placement]].sum(axis=1)
-        resident = np.zeros((len(ranks), len(replicas)), dtype=np.int32)
-        np.add.at(resident, (ranks[:, None], expert_ids[placement]), 1)
-        for sweep in offers:
-            for offsets in sweep:
-                offered = placement[ranks, offsets]
-                experts = expert_ids[offered]
-                base = load - features[experts]
-                # The squared load after an exchange differs only in this dot
-                # product. Each rank keeps its slot count and can keep its row.
-                cost = base @ features[experts].T
-                cost[(resident[:, experts] > 0) & (experts[:, None] != experts)] = (
-                    np.inf
-                )
-                _, take = linear_sum_assignment(cost)
-                if cost[ranks, take].sum() < cost.trace() - 1e-14:
-                    placement[ranks, offsets] = offered[take]
-                    resident[ranks, experts] -= 1
-                    resident[ranks, experts[take]] += 1
-                    load = base + features[experts[take]]
+        profiles = [
+            samples[g, layer].sum(axis=0) / totals[g, layer].sum() for g in groups
+        ]
+        features[layer, :, : len(groups)] = (
+            np.stack(profiles, axis=1) / replicas[layer, :, None]
+        )
+
+    def exchange(layer_ids, schedules):
+        # Bound temporary [layers, ranks, ranks] assignment matrices.
+        for start in range(0, len(layer_ids), 16):
+            batch = layer_ids[start : start + 16]
+            yield batch, _exchange_slots(ids[batch], features[batch], slots, schedules)
+
+    for batch, placement in exchange(eligible, offers):
+        order[batch] = placement
+
+    def score(peak, mass):
+        tail = int(np.ceil(0.95 * len(mass))) - 1
+        return np.array([peak.sum(), np.partition(peak / mass, tail)[tail]])
+
+    def evaluate(layer, placement):
+        steps = scoring_steps[layer]
+        mass = totals[steps, layer]
+        per_copy = samples[steps, layer] / replicas[layer]
+        peak = per_copy[:, ids[layer, placement]].sum(axis=2).max(axis=1)
+        # No layout can beat the average rank or the busiest single replica.
+        lower = np.maximum(mass / len(ranks), per_copy.max(axis=1))
+        return score(peak, mass), score(lower, mass)
+
+    baseline = {}
+    headroom = {}
+    for layer in np.intersect1d(eligible, layer_ids):
+        baseline[layer], lower = evaluate(layer, order[layer])
+        headroom[layer] = (1 - lower / baseline[layer]).sum()
+
+    # Limit extra solver work to one alternate per eight eligible layers.
+    budget = (len(headroom) + 7) // 8
+    shortlist = sorted(headroom, key=headroom.get, reverse=True)[:budget]
+    shortlist = np.array([i for i in shortlist if headroom[i] > 1e-12], dtype=np.intp)
+    # A fixed permutation gives a different exchange neighborhood on each
+    # pass without making placement depend on the process's random state.
+    rng = np.random.default_rng(0)
+    alternate = [rng.random(slots.shape).argsort(axis=1).T for _ in offers]
+    alternatives = []
+    for batch, candidates in exchange(shortlist, alternate):
+        for layer, candidate in zip(batch, candidates, strict=True):
+            candidate_score, _ = evaluate(layer, candidate)
+            improvement = 1 - (candidate_score / baseline[layer]).mean()
+            if improvement <= 1e-12:
+                continue
+            live = current[layer].numpy().reshape(slots.shape)
+            targets = (ids[layer, order[layer]], ids[layer, candidate])
+            if not all(
+                _migration_gain(samples[:, layer], live, target) for target in targets
+            ):
+                continue
+            rows = [
+                _min_remote_rows(live, target, logical.shape[1]) for target in targets
+            ]
+            alternatives.append((rows[1] - rows[0], improvement, layer, candidate))
+
+    # Apply row savings first, then spend them in order of gain per extra row.
+    credit = 0
+    for extra, _, layer, candidate in sorted(
+        alternatives, key=lambda item: (item[0] > 0, -item[1] / max(item[0], 1))
+    ):
+        if extra <= credit:
+            order[layer] = candidate
+            credit -= extra
+
     return _reindex_placement(physical, logical, order)
 
 
@@ -236,41 +336,51 @@ def _prefer_fewer_moves(old, physical, logical, counts, local_experts):
     return physical, logical
 
 
+def _migration_gain(samples, live, target):
+    num_experts = samples.shape[-1]
+
+    def peak_tokens(layer_load, rank_experts):
+        replicas = np.bincount(rank_experts.ravel(), minlength=num_experts)
+        # Keep each float64 gather near 512 KiB even for long recorder windows.
+        steps = max(1, (64 * 1024) // rank_experts.size)
+        peak = np.empty(len(layer_load))
+        for start in range(0, len(peak), steps):
+            block = slice(start, start + steps)
+            per_replica = layer_load[block] / replicas
+            peak[block] = per_replica[:, rank_experts].sum(axis=-1).max(axis=1)
+        return peak
+
+    before_peak = peak_tokens(samples, live)
+    after_peak = peak_tokens(samples, target)
+    gain = (before_peak - after_peak).sum()
+    # Require a saving of 1% of an ideally balanced rank's recorded tokens.
+    if gain <= 0.01 * samples.sum() / len(live):
+        return 0.0
+    if live.size > num_experts:
+        totals = samples.sum(axis=1)
+        active = totals > 0
+        # A replica change can help large batches but overload small ones.
+        # Compare the nearest-rank P95 of each step's busiest rank share.
+        tail = int(np.ceil(0.95 * active.sum())) - 1
+        shares = np.stack([before_peak[active], after_peak[active]]) / totals[active]
+        before_p95, after_p95 = np.partition(shares, tail, axis=1)[:, tail]
+        if after_p95 > before_p95 + 1e-12:
+            return 0.0
+    return gain
+
+
 def _select_layers_for_migration(changed, old, physical, counts, local_experts):
     """Skip marginal improvements and stage the most useful layers first."""
     load = counts.numpy()
     before = old.numpy()
     after = physical.numpy()
-    num_experts = load.shape[-1]
-
-    def peak_tokens(layer_load, rank_experts):
-        replicas = np.bincount(rank_experts.ravel(), minlength=num_experts)
-        per_replica = layer_load / replicas
-        return per_replica[:, rank_experts].sum(axis=-1).max(axis=1)
-
     priorities = {}
     for layer in changed:
         live = before[layer].reshape(-1, local_experts)
         target = after[layer].reshape(live.shape)
-        samples = load[:, layer]
-        before_peak = peak_tokens(samples, live)
-        after_peak = peak_tokens(samples, target)
-        gain = (before_peak - after_peak).sum()
-        # Require a saving of 1% of an ideally balanced rank's recorded tokens.
-        if gain <= 0.01 * samples.sum() / len(live):
+        gain = _migration_gain(load[:, layer], live, target)
+        if not gain:
             continue
-        if live.size > num_experts:
-            totals = samples.sum(axis=1)
-            active = totals > 0
-            # A replica change can help large batches but overload small ones.
-            # Compare the nearest-rank P95 of each step's busiest rank share.
-            tail = int(np.ceil(0.95 * active.sum())) - 1
-            shares = (
-                np.stack([before_peak[active], after_peak[active]]) / totals[active]
-            )
-            before_p95, after_p95 = np.partition(shares, tail, axis=1)[:, tail]
-            if after_p95 > before_p95 + 1e-12:
-                continue
         receives = max(
             len(set(dst) - set(src)) for src, dst in zip(live, target, strict=True)
         )
