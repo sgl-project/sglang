@@ -15,12 +15,9 @@ from sglang.srt.entrypoints.openai.protocol import (
     ErrorResponse,
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
-from sglang.srt.layers.activation import get_classifier_activation_function
 from sglang.srt.managers.io_struct import EmbeddingReqInput
 
 if TYPE_CHECKING:
-    from transformers import PretrainedConfig
-
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
     from sglang.srt.parser.template_manager import TemplateManager
 
@@ -37,9 +34,8 @@ class OpenAIServingClassify(OpenAIServingBase):
     ):
         super().__init__(tokenizer_manager)
         self.template_manager = template_manager
-        hf_config = tokenizer_manager.model_config.hf_config
-        self.id2label = self._get_id2label_mapping(hf_config)
-        self.activation = get_classifier_activation_function(hf_config)
+        self.id2label = self._get_id2label_mapping()
+        self.activation = self._get_clf_activation()
         self.model_name = (
             self.tokenizer_manager.served_model_name
             if self.tokenizer_manager.served_model_name
@@ -112,10 +108,21 @@ class OpenAIServingClassify(OpenAIServingBase):
                         return f"Token ID at index {i} must be non-negative"
         return None
 
-    @staticmethod
-    def _get_id2label_mapping(hf_config: PretrainedConfig) -> Optional[Dict[int, str]]:
+    def _get_clf_activation(self) -> torch.nn.Module:
+        """Select the output activation from the loaded checkpoint config."""
+        hf_config = self.tokenizer_manager.model_config.hf_config
+        problem_type = getattr(hf_config, "problem_type", None)
+        if problem_type == "regression":
+            return torch.nn.Identity()
+        if problem_type == "multi_label_classification":
+            return torch.nn.Sigmoid()
+        # Single-label classification and the legacy default normalize across labels.
+        return torch.nn.Softmax(dim=-1)
+
+    def _get_id2label_mapping(self) -> Optional[Dict[int, str]]:
         """Get id2label mapping from model config."""
         try:
+            hf_config = self.tokenizer_manager.model_config.hf_config
             # Check for id2label in hf_config
             if hf_config.id2label:
                 return hf_config.id2label
