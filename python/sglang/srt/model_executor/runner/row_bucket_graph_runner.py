@@ -60,6 +60,35 @@ def _pack_token_counts(local_rows: int, global_rows: int) -> int:
     return (global_rows << 32) | local_rows
 
 
+def _write_shared(
+    outputs: List[Optional[torch.Tensor]],
+    shared: List[Optional[torch.Tensor]],
+    *,
+    dry_run: bool = False,
+):
+    """The graph's outputs copied into the leading rows of ``shared``; an output
+    that does not fit keeps its own pool buffer. With ``dry_run``, only whether
+    some output would not fit."""
+    if len(outputs) != len(shared):
+        return True if dry_run else outputs
+    result = []
+    for t, buf in zip(outputs, shared):
+        if t is None:
+            result.append(t)
+        elif (
+            buf is None
+            or t.dtype != buf.dtype
+            or t.shape[1:] != buf.shape[1:]
+            or t.shape[0] > buf.shape[0]
+        ):
+            if dry_run:
+                return True
+            result.append(t)
+        elif not dry_run:
+            result.append(buf[: t.shape[0]].copy_(t))
+    return False if dry_run else result
+
+
 class _Graph:
     __slots__ = (
         "graph",
@@ -88,6 +117,10 @@ class RowBucketGraphRunner:
         self.label = label
         self._graphs: dict[tuple, _Graph] = {}
         self._static: dict[tuple, List[torch.Tensor]] = {}
+        # One key's buckets never replay together, so they write their outputs
+        # into the same buffers (sized by the largest bucket so far) instead of
+        # each keeping its own.
+        self._outputs: dict[tuple, List[Optional[torch.Tensor]]] = {}
         self._warm = False
         self.capture_seconds = 0.0
         self.capture_bytes = 0
@@ -129,8 +162,9 @@ class RowBucketGraphRunner:
         changes the recording; ``context`` and ``batch_scope`` wrap capture and
         replay with the breaks' and the body's batch; ``bucket_from`` picks the
         bucket from another row count. Returns views valid until the next replay,
-        cut to ``out_rows`` rows. ``global_num_rows`` opts into a separate GLOBAL
-        device count and localizes the LOCAL count for the bucket's TP shards."""
+        cut to ``out_rows`` rows; every bucket of a key shares them. ``global_num_rows``
+        opts into a separate GLOBAL device count and localizes the LOCAL count for
+        the bucket's TP shards."""
         num_rows = live[0].shape[0]
         out_rows = num_rows if out_rows is None else out_rows
         rows = self.bucket_rows(num_rows if bucket_from is None else bucket_from)
@@ -160,20 +194,18 @@ class RowBucketGraphRunner:
             context(step_batch),
         ):
             if (rows, graph_key) not in self._graphs:
-                # Largest first, so smaller buckets reuse the pool memory the
-                # larger ones took; a bucket below this step's rows cannot be
-                # captured here (the breaks write every live row).
-                for r in range(self.max_rows, rows - 1, -self.row_step):
-                    if (r, graph_key) not in self._graphs:
-                        self._graphs[(r, graph_key)] = self._capture(
-                            r,
-                            num_rows,
-                            static,
-                            forward_batch,
-                            body,
-                            batch_scope,
-                            global_num_rows=global_num_rows,
-                        )
+                # Only this step's bucket: a larger one is captured by the first step
+                # that needs it, so short tails never hold the large buckets' pool.
+                self._graphs[(rows, graph_key)] = self._capture(
+                    rows,
+                    num_rows,
+                    static,
+                    forward_batch,
+                    body,
+                    batch_scope,
+                    global_num_rows=global_num_rows,
+                    output_key=graph_key,
+                )
             graph = self._graphs[(rows, graph_key)]
             if graph.packed_token_counts is not None:
                 local_rows = compute_local_num_token_non_padded_cpu(
@@ -214,6 +246,7 @@ class RowBucketGraphRunner:
         batch_scope: BatchScope,
         *,
         global_num_rows: Optional[int] = None,
+        output_key: tuple = (),
     ) -> _Graph:
         start = time.perf_counter()
         free_before = torch.cuda.mem_get_info()[0]
@@ -278,6 +311,7 @@ class RowBucketGraphRunner:
                 capture_batch,
                 start,
                 free_before,
+                output_key=output_key,
             )
             graph.global_num_token_non_padded = global_num_token_non_padded
             graph.packed_token_counts = packed_token_counts
@@ -293,17 +327,36 @@ class RowBucketGraphRunner:
         capture_batch,
         start,
         free_before,
+        *,
+        output_key: tuple,
     ) -> _Graph:
         pool = get_or_create_global_graph_memory_pool(torch.cuda)
         set_graph_pool_id(pool)
         tp_group = get_parallel().tp_group
         graph = BreakableCUDAGraph()
         with graph_capture(stream=get_or_create_global_graph_capture_stream()) as ctx:
+            # Captured mid-step: return the step's free cache before the warmups'
+            # scratch lands on top of it.
+            torch.cuda.empty_cache()
             # The warmups run eagerly; their KV writes repeat the replay's.
             for _ in range(2):
                 torch.cuda.synchronize()
                 tp_group.barrier()
-                body()
+                warmup_outputs = body()
+            shared = self._outputs.get(output_key)
+            if shared is None or _write_shared(warmup_outputs, shared, dry_run=True):
+                # A larger bucket grows the shared buffers; the graphs captured
+                # before keep the smaller ones they write.
+                self._outputs[output_key] = [
+                    None
+                    if t is None
+                    else torch.empty_like(t, memory_format=torch.contiguous_format)
+                    for t in warmup_outputs
+                ]
+            del warmup_outputs
+            # The warmups' scratch stays cached on the capture stream, which no eager
+            # step reuses; release it before this graph grows the pool on top of it.
+            torch.cuda.empty_cache()
             with (
                 graph_pool_capture_scope(),
                 BreakableCUDAGraphCapture(
@@ -314,7 +367,7 @@ class RowBucketGraphRunner:
                     capture_error_mode="thread_local",
                 ),
             ):
-                outputs = body()
+                outputs = _write_shared(body(), self._outputs[output_key])
         torch.cuda.current_stream().wait_stream(ctx.stream)
         torch.cuda.synchronize()
         recorded = _Graph(

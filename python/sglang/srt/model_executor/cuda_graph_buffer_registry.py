@@ -713,6 +713,7 @@ def build_decode_registry(
     if enable_num_token_non_padded:
         from sglang.srt.model_executor.forward_batch_info import (
             compute_local_num_token_non_padded,
+            compute_local_num_token_non_padded_cpu,
         )
 
         def _num_token_non_padded_post_fill(buf, fb, ctx):
@@ -731,6 +732,17 @@ def build_decode_registry(
             sharded = not enable_prefill_cp and attn_tp_sharded_fn(
                 ctx.padded_num_tokens
             )
+            if fb.global_num_token_non_padded_cpu is not None:
+                # Every writer of the GLOBAL scalar sets its host twin to the same
+                # count: one fill instead of a subtract, a clamp and a copy.
+                buf.fill_(
+                    compute_local_num_token_non_padded_cpu(
+                        fb.global_num_token_non_padded_cpu,
+                        ctx.padded_num_tokens,
+                        sharded=sharded,
+                    )
+                )
+                return
             buf.copy_(
                 compute_local_num_token_non_padded(
                     global_num_token_non_padded=fb.global_num_token_non_padded,

@@ -160,23 +160,25 @@ def get_index_k_cache(
     return k_cache.view(k_cache.shape[0], page_size, 1, 68)
 
 
-def _index_q_and_weights(
+def index_q_and_weights(
     *,
     indexer: DeepseekV41Indexer,
     x: torch.Tensor,
     q_lora: torch.Tensor,
     freqs_cis: torch.Tensor,
     positions: torch.Tensor,
+    head_weights_raw: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """fp4 index queries ``[rows, heads, 64]`` int8 with ``[rows, heads]`` packed
-    ue8m0 scales, and fp32 head weights ``[rows, heads]``."""
+    ue8m0 scales, and fp32 head weights ``[rows, heads]``. ``head_weights_raw`` is
+    ``indexer.head_weights_raw(x)`` when the caller already projected it."""
     rows, heads = x.shape[0], indexer.n_local_heads
     q, _ = indexer.wq_b(q_lora)
     q_fp4, q_sf, weights = index_q_rope_pack_weights(
         q.view(rows, heads, indexer.index_head_dim),
         torch.view_as_real(freqs_cis).flatten(-2),
         positions,
-        indexer.head_weights_raw(x),
+        indexer.head_weights_raw(x) if head_weights_raw is None else head_weights_raw,
         indexer.head_weight_scale,
     )
     return q_fp4.view(rows, heads, 64), q_sf.view(rows, heads), weights
@@ -188,13 +190,16 @@ def get_deep_gemm_decode_data(
     indexer = inputs.indexer
     # The kernel sums head scores locally, so the indexer heads must be replicated.
     assert indexer.n_local_heads == indexer.n_heads
-    q_fp4, q_sf, weights = _index_q_and_weights(
-        indexer=indexer,
-        x=inputs.x,
-        q_lora=inputs.q_lora,
-        freqs_cis=inputs.freqs_cis,
-        positions=inputs.positions,
-    )
+    if inputs.index_q is not None:
+        q_fp4, q_sf, weights = inputs.index_q
+    else:
+        q_fp4, q_sf, weights = index_q_and_weights(
+            indexer=indexer,
+            x=inputs.x,
+            q_lora=inputs.q_lora,
+            freqs_cis=inputs.freqs_cis,
+            positions=inputs.positions,
+        )
     bs = q_fp4.shape[0]
     q_fp4 = q_fp4.view(bs, 1, indexer.n_local_heads, 64)
     q_sf = q_sf.view(bs, 1, indexer.n_local_heads)
@@ -281,7 +286,7 @@ def get_deep_gemm_prefill_data(inputs: PrefillInputs) -> Optional[DeepGEMMPrefil
             plans[ratio] = plan
     if plan is None:
         return None
-    q_fp4, q_sf, weights = _index_q_and_weights(
+    q_fp4, q_sf, weights = index_q_and_weights(
         indexer=inputs.indexer,
         x=inputs.x,
         q_lora=inputs.q_lora,
