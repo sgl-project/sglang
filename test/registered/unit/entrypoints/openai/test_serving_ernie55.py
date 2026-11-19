@@ -3,8 +3,9 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()  # must precede any import that pulls in sgl_kernel
 
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
+from sglang.srt.entrypoints.openai import serving_ernie55
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.serving_ernie55 import Ernie55ChatEncodingAdapter
@@ -22,6 +23,7 @@ def render_chat(
     enable_thinking=None,
     reasoning_effort=None,
     options=None,
+    response_format=None,
 ):
     # Same contract as the checkpoint's module-level render_chat: an explicit
     # signature, so any keyword it does not know raises TypeError.
@@ -92,6 +94,7 @@ class TestErnie55ChatEncodingAdapter(CustomTestCase):
             thinking=thinking,
             image_data=[],
         )
+        tokenizer.adapter = adapter
         return tokenizer
 
     def test_template_kwargs_the_renderer_rejects_are_dropped(self):
@@ -132,6 +135,36 @@ class TestErnie55ChatEncodingAdapter(CustomTestCase):
         self.assertEqual(rendered["messages"][-1]["role"], "user")
         self.assertFalse(rendered["continue_final_message"])
         self.assertTrue(rendered["add_generation_prompt"])
+
+    _SCHEMA_FORMAT = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "answer",
+            "schema": {"type": "object", "properties": {"n": {"type": "integer"}}},
+            "strict": False,
+        },
+    }
+
+    def test_response_format_reaches_a_renderer_that_takes_it(self):
+        """A renderer that states response_format in the prompt must receive the
+        schema, and the adapter must say so, or strict=false keeps the grammar and
+        the model never sees the schema it is constrained to."""
+        tokenizer = self._encode(response_format=self._SCHEMA_FORMAT)
+        self.assertTrue(tokenizer.adapter.renders_response_format)
+        self.assertEqual(
+            tokenizer.template_kwargs[-1]["response_format"], self._SCHEMA_FORMAT
+        )
+
+    def test_renderer_without_response_format_keeps_the_grammar(self):
+        """An older renderer without the response_format keyword would raise on
+        it; it must not receive it, and the grammar must stay on."""
+        accepted = frozenset({"add_generation_prompt", "enable_thinking"})
+        with patch.object(
+            serving_ernie55, "_accepted_render_kwargs", return_value=accepted
+        ):
+            tokenizer = self._encode(response_format=self._SCHEMA_FORMAT)
+        self.assertFalse(tokenizer.adapter.renders_response_format)
+        self.assertNotIn("response_format", tokenizer.template_kwargs[-1])
 
 
 if __name__ == "__main__":
