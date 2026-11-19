@@ -33,6 +33,7 @@ from .protocol import (
     compute_env_stamp,
     get_quant_method_name,
     get_socket_path,
+    hash_model_config,
     hash_quant_config,
     recv_msg,
     send_msg,
@@ -395,6 +396,7 @@ class IpcModelLoader(BaseModelLoader):
             if count > 1
         }
         attached_ties = {}
+        tied_slots = {}
 
         imported_refs = []
         imported_count = 0
@@ -429,18 +431,29 @@ class IpcModelLoader(BaseModelLoader):
             # Replace or register the tensor in the model
             tensor = imported_tensor
             original_id = id(existing_params.get(name))
-            if is_param and original_id in tied_ids:
-                # The constructed model must tie the object, and the owner
-                # must export the same storage view for both names.
+            if original_id in tied_ids:
+                # A single module slot cannot represent different storage
+                # views, even if state_dict names reach it via different paths.
                 key = (
                     original_id,
                     tensor.untyped_storage()._cdata,
                     tensor.storage_offset(),
                     tensor.stride(),
                 )
-                if key not in attached_ties:
-                    attached_ties[key] = nn.Parameter(tensor, requires_grad=False)
-                tensor = attached_ties[key]
+                module_path, _, leaf = name.rpartition(".")
+                slot = (id(model.get_submodule(module_path)), leaf)
+                first_name, first_key, first_is_param = tied_slots.setdefault(
+                    slot, (name, key, is_param)
+                )
+                if (key, is_param) != (first_key, first_is_param):
+                    raise RuntimeError(
+                        f"[IpcModelLoader] Conflicting entries for the same parameter "
+                        f"slot: {first_name!r} and {name!r}"
+                    )
+                if is_param:
+                    if key not in attached_ties:
+                        attached_ties[key] = nn.Parameter(tensor, requires_grad=False)
+                    tensor = attached_ties[key]
             self._set_module_tensor(model, name, tensor, is_param=is_param)
             imported_refs.append(imported_tensor)
             imported_count += 1
@@ -609,6 +622,7 @@ class IpcModelLoader(BaseModelLoader):
                 moe_a2a_backend=get_exec().moe.moe_a2a_backend,
                 quant_method=quant_method,
                 quant_config_hash=hash_quant_config(quant_config),
+                model_config_hash=hash_model_config(model_config.hf_config),
                 dtype=str(model_config.dtype),
                 revision=model_config.revision or "",
                 **compute_env_stamp(),

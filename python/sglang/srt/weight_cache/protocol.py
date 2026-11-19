@@ -25,7 +25,7 @@ class CacheConfig(msgspec.Struct):
     """Fingerprint of the cached weights. Used to validate compatibility
     between a daemon's cached state and a requesting engine process.
 
-    Any mismatch triggers a fallback to disk loading.
+    A mismatch rejects the attachment before any weights are imported.
     """
 
     model_path: str
@@ -54,6 +54,9 @@ class CacheConfig(msgspec.Struct):
     # Comparing these turns that into a clean mismatch. See compute_env_stamp().
     device_capability: str  # local compute capability, e.g. "8.0" ("" if N/A)
     torch_version: str  # torch.__version__ of the process that built the weights
+    # Legacy requests omit this field. The empty value cannot match a new
+    # publication, which always fingerprints the resolved model config.
+    model_config_hash: str = ""
 
     def matches(self, other: "CacheConfig") -> bool:
         """Check if two configs are compatible for weight sharing."""
@@ -65,6 +68,11 @@ class CacheConfig(msgspec.Struct):
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "CacheConfig":
         return cls(**d)
+
+
+def hash_model_config(hf_config: Any) -> str:
+    """Fingerprint the resolved model config, including overrides and buffers' inputs."""
+    return hashlib.sha256(hf_config.to_json_string(use_diff=False).encode()).hexdigest()
 
 
 def hash_quant_config(quant_config: Any) -> str:
