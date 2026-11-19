@@ -275,6 +275,10 @@ impl RadixTreePrefixProvider {
         worker_url: &str,
         rank: u32,
     ) {
+        // A text prompt pays no hashing here (the match already hashed it).
+        if !self.tree.is_media_prompt(tokens) {
+            return;
+        }
         let Some(hashes) = self.block_hashes(tokens, namespace) else {
             return;
         };
