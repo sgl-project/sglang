@@ -177,6 +177,7 @@ class TestLIMState(CustomTestCase):
             )
             configurator = DefaultPoolConfigurator.__new__(DefaultPoolConfigurator)
             configurator._sparse_budget = plan
+            configurator._pd_sparse_decode = False
             configurator._kvc = SimpleNamespace(
                 sparse_kv_budget_plan=plan, sparse_kv_budget_finalized=False
             )
@@ -193,6 +194,7 @@ class TestLIMState(CustomTestCase):
             later = DefaultPoolConfigurator.__new__(DefaultPoolConfigurator)
             later._kvc = configurator._kvc
             later._sparse_budget = selected
+            later._pd_sparse_decode = False
             later._sparse_min_tokens = 129
             later._cell_size = 8
             later._fixed_overhead_bytes = selected.managed_hbm_bytes

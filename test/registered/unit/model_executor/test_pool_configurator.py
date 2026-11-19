@@ -1396,9 +1396,17 @@ class TestEagleConfigurator(CustomTestCase):
         with (
             get_context().override_server_args(
                 attention_backend="ascend",
+                disaggregation_mode="decode",
                 disaggregation_transfer_backend="ascend",
+                disaggregation_decode_extra_slots=extra_rows,
+                page_size=page_size,
+                max_running_requests=requested_rows,
                 max_total_tokens=token_limit,
                 num_reserved_decode_tokens=decode_reserve,
+                speculative_algorithm="EAGLE",
+                speculative_num_steps=2,
+                speculative_num_draft_tokens=3,
+                speculative_eagle_topk=1,
             ),
             envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.override(True),
             envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.override(True),
