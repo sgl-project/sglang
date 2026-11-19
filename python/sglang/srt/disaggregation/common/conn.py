@@ -1180,9 +1180,17 @@ class CommonKVManager(BaseKVManager):
         self.note_abort_ack(ack.room, ack.prefill_rank, ack.generation)
         return True
 
-    def is_abort_release_safe(self, bootstrap_room: int, required_acks: int) -> bool:
+    def is_abort_release_safe(
+        self,
+        bootstrap_room: int,
+        required_acks: int,
+        *,
+        generation: Optional[int] = None,
+    ) -> bool:
         """True once every prefill rank that could still write these pages has acked."""
         state = self._deferred_abort_ack_tracker.get(bootstrap_room)
+        if generation is not None and (state is None or state.generation != generation):
+            return False
         acks = state.prefill_ranks if state is not None else ()
         return len(acks) >= required_acks
 
@@ -3186,6 +3194,10 @@ class CommonKVReceiver(BaseKVReceiver):
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
             self.conclude_state = KVPoll.Failed
         self.ensure_abort_notified()
+
+    @property
+    def abort_generation(self) -> Optional[int]:
+        return self._abort_generation
 
     def ensure_abort_notified(self, *, force_arm: bool = False) -> None:
         """Notify the prefill ranks (and arm drain-ack accounting) exactly once.

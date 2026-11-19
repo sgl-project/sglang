@@ -19,12 +19,14 @@ use crate::message::response::{
 use crate::multi_modality::worker::MmProcessor;
 use crate::tokenizer_manager::from_scheduler::ActivityCounter;
 use crate::tokenizer_manager::wiring::{AbortSource, RequestAdmission, TmEvent};
+use crate::utils::environ;
 use crate::utils::error::Error;
 use crate::utils::fsm::RequestState;
 
 use super::control::PEER_ABORT_MAX_IN_FLIGHT;
 use super::frontend_state::FrontendState;
 use super::generate::{Cancellation, Generation, Generations};
+use super::retirement::RetirementRegistry;
 use crate::api_server::core::fanout::{ControlTarget, RankId};
 use crate::api_server::core::{
     AbortHook, CoreError, DrainEnd, DrainState, FrontendMetrics, GenerateValidator, InFlight,
@@ -171,6 +173,7 @@ pub(super) struct CoreInner {
     /// once here; shared by every `CoreHandle` clone and protocol adapter.
     pub(super) instance_id: String,
     pub(super) generations: Generations,
+    pub(super) retirements: RetirementRegistry,
     pub(super) metrics: Option<Arc<FrontendMetrics>>,
     pub(super) request_log: Option<Arc<RequestLog>>,
     /// The DP rank the local scheduler answers for, and the targets for the rest.
@@ -228,6 +231,10 @@ impl CoreHandle {
                 mm_processor: SetOnce::new(),
                 instance_id: uuid::Uuid::new_v4().to_string(),
                 generations: Generations::default(),
+                retirements: RetirementRegistry::new(environ::env_bool(
+                    super::retirement::ENV_ENABLE,
+                    false,
+                )),
                 metrics: config.metrics,
                 request_log: config.request_log,
                 dp_rank,

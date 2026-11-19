@@ -155,6 +155,7 @@ pub(super) fn status(error: CoreError) -> Status {
         CoreErrorKind::Cancelled => Code::Cancelled,
         CoreErrorKind::DeadlineExceeded => Code::DeadlineExceeded,
         CoreErrorKind::Unavailable => Code::Unavailable,
+        CoreErrorKind::Unimplemented => Code::Unimplemented,
         CoreErrorKind::Internal => Code::Internal,
     };
     Status::new(code, error.to_string())

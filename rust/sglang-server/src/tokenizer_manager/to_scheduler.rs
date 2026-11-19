@@ -4,7 +4,10 @@ use std::collections::HashMap;
 
 use crate::message::detok::DetokMsg;
 use crate::message::ids::Rid;
-use crate::message::io_struct::{AbortReq, ControlRequest};
+use crate::message::io_struct::{
+    AbortReq, CancellationRetirementOutput, CancellationRetirementReq,
+    CancellationRetirementStatus, ControlRequest,
+};
 use crate::message::request::{Request, RequestKind, SchedulerRequest};
 use crate::message::response::ResponseItem;
 use crate::runtime::Runnable;
@@ -453,10 +456,21 @@ impl Intake {
         false
     }
 
-    /// Push a bare control request (`[tag, rid, nil]`) onto the to_scheduler channel. The
-    /// scheduler dispatches it (e.g. `GetInternalStateReq`) and replies via the
-    /// from_scheduler channel as a single `Result`.
-    fn push_control_to_channel(&self, mut req: Request) {
+    /// Push a bare control request onto the ordinary to_scheduler ring (never
+    /// the priority abort lane, which could overtake a generation still in
+    /// Intake). Cancellation retirement may fence a target still in
+    /// `request_states` and answer locally as never scheduler-admitted.
+    fn push_control_to_channel(&mut self, mut req: Request) {
+        if let RequestKind::Control(control) = &req.kind
+            && let ControlRequest::CancellationRetirementReq(retirement) = control.as_ref()
+            && let Some(local) = self.try_fence_retirement_locally(retirement)
+        {
+            let _ = req.sink.try_send(ResponseItem::Control(local));
+            let _ = self.senders.detok_for(&req.rid).send(DetokMsg::Deregister {
+                rid: req.rid.clone(),
+            });
+            return;
+        }
         let encode = match &req.kind {
             RequestKind::Control(control) => control.encode(),
             _ => Err(Error::Internal(
@@ -470,13 +484,40 @@ impl Intake {
                 return;
             }
         };
-        // Control requests carry no tensor cell — empty `ids`.
+        // Ordinary ring after generation: a saturated ring fails closed with
+        // no positive retirement receipt. Never the priority abort lane.
         if !self.to_scheduler_tx.try_push(SchedulerRequest {
             header,
             buffers: Vec::new(),
         }) {
             self.fail(&mut req, Error::QueueFull, true); // registered
         }
+    }
+
+    /// If `target_rid` is still in Intake preprocessing, mark it Aborted so a
+    /// delayed return cannot reach the scheduler, and return a local retired
+    /// receipt. This proves scheduler nonadmission only — not worker completion.
+    fn try_fence_retirement_locally(
+        &mut self,
+        retirement: &CancellationRetirementReq,
+    ) -> Option<bytes::Bytes> {
+        let target = retirement.target_rid().unwrap_or(retirement.get_rid());
+        let target_rid = Rid::from(target);
+        if !self.request_states.contains_key(&target_rid) {
+            return None;
+        }
+        if let Some(state) = self.request_states.get_mut(&target_rid) {
+            *state = RequestState::Aborted;
+        }
+        CancellationRetirementOutput {
+            rid: retirement.get_rid().to_owned(),
+            cancellation_id: retirement.cancellation_id().to_owned(),
+            request_instance_id: retirement.request_instance_id().to_owned(),
+            status: CancellationRetirementStatus::Retired,
+            reason: String::new(),
+        }
+        .encode()
+        .ok()
     }
 
     /// Push a control message the scheduler does not answer. Nothing would

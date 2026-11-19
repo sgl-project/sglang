@@ -26,6 +26,7 @@ pub(crate) enum CoreErrorKind {
     Cancelled,
     DeadlineExceeded,
     Unavailable,
+    Unimplemented,
     Internal,
 }
 
@@ -37,6 +38,9 @@ pub(crate) enum CoreErrorKind {
 pub(crate) enum CoreError {
     #[error("{0}")]
     InvalidArgument(String),
+
+    #[error("{0}")]
+    FailedPrecondition(String),
 
     /// The intake loop has shut down. A caller may retry elsewhere.
     #[error("service unavailable")]
@@ -53,6 +57,9 @@ pub(crate) enum CoreError {
     /// deadline (see [`super::fanout`]).
     #[error("{0}")]
     DeadlineExceeded(String),
+
+    #[error("{0}")]
+    Unimplemented(String),
 
     /// The internal producer disappeared before returning a terminal result.
     ///
@@ -104,10 +111,12 @@ impl CoreError {
     pub(crate) fn kind(&self) -> CoreErrorKind {
         match self {
             Self::InvalidArgument(_) => CoreErrorKind::InvalidArgument,
+            Self::FailedPrecondition(_) => CoreErrorKind::FailedPrecondition,
             Self::Unavailable => CoreErrorKind::Unavailable,
             Self::Overloaded(_) => CoreErrorKind::ResourceExhausted,
             Self::Cancelled(_) => CoreErrorKind::Cancelled,
             Self::DeadlineExceeded(_) => CoreErrorKind::DeadlineExceeded,
+            Self::Unimplemented(_) => CoreErrorKind::Unimplemented,
             Self::ResponseTruncated => CoreErrorKind::Internal,
             Self::RuntimeRejected { kind, .. } => *kind,
             Self::InvalidResponse(_) | Self::Internal(_) => CoreErrorKind::Internal,
@@ -208,6 +217,7 @@ impl CoreError {
             }
             CoreErrorKind::Cancelled => StatusCode::from_u16(499).expect("499 is valid"),
             CoreErrorKind::DeadlineExceeded => StatusCode::GATEWAY_TIMEOUT,
+            CoreErrorKind::Unimplemented => StatusCode::NOT_IMPLEMENTED,
             CoreErrorKind::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }

@@ -28,6 +28,7 @@ import time
 from collections import deque
 from concurrent.futures import Future
 from dataclasses import dataclass
+from enum import IntEnum
 from http import HTTPStatus
 from typing import (
     TYPE_CHECKING,
@@ -3300,6 +3301,13 @@ def _generate_fake_prefill_handoff_output_id(req: Req) -> int:
     return int.from_bytes(digest, byteorder="little") % req.vocab_size
 
 
+class _DeferredReleaseState(IntEnum):
+    # MIN across the attention TP ranks chooses the least certain outcome.
+    PENDING = 0
+    TIMED_OUT = 1
+    DRAINED = 2
+
+
 class DecodeTransferQueue(DecodeHiCacheTransferMixin):
     """
     Store the requests that is polling kv
@@ -3367,9 +3375,19 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             ListKind.PD_RELEASING: self._deferred_releases,
         }
 
-    def _abort_receiving(self, recv_req: AbortReq) -> None:
+    def abort_receiving(self, target: Req) -> None:
+        self._abort_receiving(AbortReq(rid=target.rid), target=target)
+
+    def _abort_receiving(
+        self, recv_req: AbortReq, *, target: Optional[Req] = None
+    ) -> None:
         for decode_req in self.queue.items():
-            if recv_req.matches(decode_req.req.rid):
+            matches = (
+                decode_req.req is target
+                if target is not None
+                else recv_req.matches(decode_req.req.rid)
+            )
+            if matches:
                 logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
                 if decode_req.host_staged:
                     # Keep the host destination alive until prefill stops writing.
@@ -4001,44 +4019,47 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         if not self._deferred_releases:
             return
         now = time.monotonic()
-        drained = []
-        ready = []
+        states: List[int] = []
         releases = list(self._deferred_releases.items())
         for decode_req, _, deadline, _, required_acks in releases:
             if self._is_host_destination(decode_req):
                 # A timeout cannot prove that a remote write has stopped.
                 is_drained = decode_req.kv_receiver.is_abort_release_safe()
-                is_ready = is_drained
+                timed_out = False
             else:
                 is_drained = decode_req.kv_receiver.kv_mgr.is_abort_release_safe(
                     decode_req.req.bootstrap_room, required_acks
                 )
-                is_ready = is_drained or now >= deadline
-            drained.append(is_drained)
-            ready.append(is_ready)
-        # Acks and deadlines are rank-local. Releasing only on some ranks would
-        # diverge admission and the sizes of subsequent polling collectives.
-        # Entries are appended from agreed holds, so every rank reduces the same
-        # list in the same order.
-        ready = all_reduce_flags(
-            flags=ready, group=self.gloo_group, op=torch.distributed.ReduceOp.MIN
+                timed_out = now >= deadline
+            if is_drained:
+                states.append(_DeferredReleaseState.DRAINED)
+            elif timed_out:
+                states.append(_DeferredReleaseState.TIMED_OUT)
+            else:
+                states.append(_DeferredReleaseState.PENDING)
+        # Entries are appended from agreed holds, so every rank reduces the
+        # same list in the same order. A timed-out peer can allow local release
+        # without supplying proof that all remote writers drained.
+        states = all_reduce_flags(
+            flags=states, group=self.gloo_group, op=torch.distributed.ReduceOp.MIN
         )
         to_release = []
-        for entry, is_ready, is_drained in zip(releases, ready, drained):
-            decode_req, start_time, _, idx, _ = entry
-            if is_ready:
+        for entry, state in zip(releases, states):
+            decode_req, start_time, _, idx, required_acks = entry
+            if state != _DeferredReleaseState.PENDING:
                 to_release.append(
                     (
                         decode_req,
                         start_time,
                         idx,
                         decode_req.req.bootstrap_room,
-                        is_drained,
+                        state == _DeferredReleaseState.DRAINED,
+                        required_acks,
                     )
                 )
         # Each release takes its entry out; a failed one is abandoned, not retried,
         # so the ranks' lists stay the same.
-        for decode_req, start_time, idx, room, drained in to_release:
+        for decode_req, start_time, idx, room, drained, required_acks in to_release:
             if not drained:
                 logger.warning(
                     f"Deferred KV release for room {room} timed out after "
@@ -4046,12 +4067,27 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     f"ack from prefill; releasing anyway."
                 )
             outcome = "drained" if drained else "timeout"
+            # Snapshot the evidence before release clears the room's tracker.
+            # Require the original receiver's generation and a nonempty ACK set.
+            receiver = decode_req.kv_receiver
+            generation = getattr(receiver, "abort_generation", None)
+            drain_confirmed = (
+                drained
+                and required_acks > 0
+                and generation is not None
+                and receiver.kv_mgr.is_abort_release_safe(
+                    room, required_acks, generation=generation
+                )
+            )
             try:
                 self._do_release(decode_req, idx)
             except Exception as error:
                 # Isolate a failed release so the rest still run.
                 self.scheduler.request_retirer.abandon(decode_req.req, error)
                 outcome = "error"
+            decode_req.req.decode_retirement_drained = (
+                outcome == "drained" and drain_confirmed
+            )
             self._observe_deferred_kv_release(
                 duration_seconds=max(0.0, now - start_time),
                 outcome=outcome,
