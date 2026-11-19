@@ -1939,6 +1939,9 @@ class DeepseekSparseAttnBackend(
         # (prepare_context_parallel_metadata_for_dcp) is not ours to replace.
         if (
             _is_hip
+            # The only mode the gathered route plans; a decode or draft batch
+            # never reaches for the DCP width.
+            and forward_batch.forward_mode.is_extend_without_speculative()
             and self.attn_dcp_size > 1
             and (
                 forward_batch.attn_dcp_metadata is None
