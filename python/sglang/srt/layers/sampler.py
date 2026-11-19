@@ -171,7 +171,7 @@ class Sampler(nn.Module):
             token_ids_logprobs: Per-sequence list of specific token IDs to retrieve
                 logprobs for. Each element is a list of token IDs (or None) for one
                 sequence in the batch. This is used in speculative decoding.
-            positions: The positions of the tokens in the sequence. Used for deterministic sampling
+            positions: The positions of the tokens in the sequence. Used for seeded sampling
                 to get the unique seed for each position.
             logprob_logits: Optional pre-watermark logits for returned log probabilities.
         """
@@ -404,7 +404,7 @@ class Sampler(nn.Module):
             backend = get_exec().kernel.sampling_backend
             if sampling_info.sampling_seed is not None:
                 # Seeded draws must not depend on the row's batch slot; FlashInfer's seeds do,
-                # the torch sampler's (seed, position, token) hash does not.
+                # the torch sampler's hash of (seed, position) does not.
                 backend = "pytorch"
             if backend in ("flashinfer", "intel_xpu"):
                 if sampling_info.need_min_p_sampling:
@@ -846,8 +846,8 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
     # The top-k mask below zeroes every column at rank >= top_k, so the max_top_k
     # leading columns carry all the mass that survives and sorting only those is
     # exact. The seeded path keeps the full sort because the order of tied
-    # probabilities may depend on k, which is a batch-wide value, and
-    # deterministic inference must not depend on the batch composition.
+    # probabilities may depend on k, which is a batch-wide value, and a seeded draw
+    # must not depend on the batch composition.
     if (
         max_top_k is not None
         and max_top_k < probs.shape[-1]

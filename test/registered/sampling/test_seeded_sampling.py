@@ -1,14 +1,23 @@
-"""Per-request sampling seeds in the torch sampler."""
+"""Per-request sampling seeds, in the torch sampler and through the server."""
 
 import unittest
 
+import requests
 import torch
 
 from sglang.srt.layers.sampler import top_k_top_p_min_p_sampling_from_probs_torch
+from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import (
+    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
+    is_in_amd_ci,
+    popen_launch_server,
+)
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=70, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=10, suite="base-b-test-1-gpu-small-amd")
 
 VOCAB_SIZE = 4096
@@ -53,6 +62,55 @@ class TestSeededSampling(CustomTestCase):
             positions,
         )
         torch.testing.assert_close(min_p_ids, renormalized_ids, rtol=0, atol=0)
+
+
+@unittest.skipIf(
+    is_in_amd_ci(), "Decoding is not bit-exact across runs on the AMD runners."
+)
+class TestSeededGeneration(CustomTestCase):
+    """A seed is honored without --enable-deterministic-inference."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            # A cached prefix recomputes the last prompt token through another path,
+            # which can move its logits enough to flip a near-tie draw.
+            other_args=["--disable-radix-cache"],
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def _generate(self, seed, n=1):
+        # One request at a time, so every draw sees the same batch and logits.
+        response = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": "Write a short story about a lighthouse.",
+                "sampling_params": {
+                    "temperature": 1.0,
+                    "max_new_tokens": 32,
+                    "sampling_seed": seed,
+                    "n": n,
+                },
+            },
+        )
+        response.raise_for_status()
+        body = response.json()
+        return body["text"] if n == 1 else [choice["text"] for choice in body]
+
+    def test_seed_repeats_output(self):
+        self.assertEqual(self._generate(1234), self._generate(1234))
+        self.assertNotEqual(self._generate(1234), self._generate(5678))
+
+    def test_samples_of_a_seeded_request_differ(self):
+        first, second = self._generate(1234, n=2)
+        self.assertNotEqual(first, second)
 
 
 if __name__ == "__main__":

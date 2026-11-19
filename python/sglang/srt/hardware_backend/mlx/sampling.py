@@ -45,6 +45,7 @@ DEFAULT_SAMPLING_SEED = 42
 MAX_BOUNDED_TOP_K = 1024
 
 _warned_ignored_penalties = False
+_warned_ignored_seed = False
 
 
 @dataclass(frozen=True)
@@ -62,7 +63,7 @@ class MlxSamplingParams:
         cls, req: Any, deterministic_seeding: bool = False
     ) -> MlxSamplingParams:
         sp = req.sampling_params
-        global _warned_ignored_penalties
+        global _warned_ignored_penalties, _warned_ignored_seed
         if not _warned_ignored_penalties and (
             sp.frequency_penalty != 0.0
             or sp.presence_penalty != 0.0
@@ -82,6 +83,12 @@ class MlxSamplingParams:
                 sp.sampling_seed
                 if sp.sampling_seed is not None
                 else DEFAULT_SAMPLING_SEED
+            )
+        elif sp.sampling_seed is not None and sp.top_k > 1 and not _warned_ignored_seed:
+            _warned_ignored_seed = True
+            logger.warning(
+                "MLX sampling ignores sampling_seed unless "
+                "--enable-deterministic-inference is set. (Warning logged once.)"
             )
         return cls(
             temperature=sp.temperature,
