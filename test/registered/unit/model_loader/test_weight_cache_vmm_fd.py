@@ -12,6 +12,8 @@ standing in for the VMM allocations:
   - the packing plan's sizes and the free device memory, logged before
     anything is allocated or copied, and the warning when the free memory is
     below the largest allocation
+  - a copied original that something else still references, reported as soon
+    as its allocation is filled and again after packing
   - the fetch_state exchange over a socketpair, then rebuilding every tensor
     on the engine side
   - engine-side layout validation
@@ -710,6 +712,201 @@ class TestPackPlanLog(CustomTestCase):
         self.assertEqual(events[:2], ["empty_cache", "mem_get_info"])
         self.assertIn("pack plan", events[2])
         self.assertLessEqual({"reserve", "map", "copy"}, set(events[3:]))
+
+
+class TestRetainedOriginals(CustomTestCase):
+    """A copied original that something else still references cannot be
+    freed. prepare_export names it as soon as its allocation is filled, again
+    after packing if it is still referenced then, and packs the same bytes
+    either way."""
+
+    @staticmethod
+    def _state():
+        torch.manual_seed(0)
+        # 1 KiB each: with a 512-byte cap, every storage gets its own allocation.
+        return {f"t{i}": (torch.randn(256), True) for i in range(4)}
+
+    def _backend(self):
+        backend = VmmFdTransportBackend(
+            device=CPU, granularity=GRANULARITY, max_alloc_bytes=SLOT_ALIGNMENT
+        )
+        self.addCleanup(backend.close)
+        return backend
+
+    def test_an_original_still_referenced_elsewhere_is_reported(self):
+        state = self._state()
+        expected = {name: tensor.clone() for name, (tensor, _) in state.items()}
+        cache = {"layer": state["t2"][0]}  # e.g. a module-level cache
+        original = StorageWeakRef(cache["layer"].untyped_storage())
+        backend = self._backend()
+        with _host_vmm(), self.assertLogs(transport.logger, "WARNING") as logs:
+            entries = backend.prepare_export(state)
+        first, summary = logs.output
+        self.assertIn(
+            "after filling allocation 3 of 4, 1 copied slot(s) (1024 packed bytes) "
+            "still have source storages referenced elsewhere, e.g. t2;",
+            first,
+        )
+        self.assertIn(
+            "after packing, 1 copied slot(s) (1024 packed bytes) still have", summary
+        )
+        for name, entry in entries.items():
+            pointer = (
+                backend._reservation.base
+                + backend._alloc_offsets[entry["alloc_index"]]
+                + entry["offset"]
+            )
+            packed = view_from_entry(
+                _cpu_storage(pointer, entry["storage_nbytes"]), entry, CPU
+            )
+            torch.testing.assert_close(packed, expected[name], rtol=0, atol=0)
+        # The check holds no reference of its own.
+        self.assertFalse(original.expired())
+        cache.clear()
+        self.assertTrue(original.expired())
+
+    def test_the_report_comes_before_the_next_allocation(self):
+        events = []
+
+        class RecordingReservation(_HostReservation):
+            def map(self, offset, size, *, retain_handle):
+                events.append("map")
+                return super().map(offset, size, retain_handle=retain_handle)
+
+        def recording_warning(msg, *args):
+            events.append(msg % args)
+
+        state = self._state()
+        held = state["t1"][0]
+        with (
+            _host_vmm(),
+            mock.patch.object(cuda_vmm_utils, "VmmReservation", RecordingReservation),
+            mock.patch.object(
+                transport.logger, "warning", side_effect=recording_warning
+            ),
+        ):
+            self._backend().prepare_export(state)
+        first = next(i for i, event in enumerate(events) if "elsewhere" in event)
+        self.assertIn("after filling allocation 2 of 4", events[first])
+        self.assertEqual(events[:first], ["map", "map"])
+        self.assertEqual(events[first + 1 : first + 3], ["map", "map"])
+        self.assertIn("after packing,", events[-1])
+        del held
+
+    def test_no_report_when_every_original_is_freed(self):
+        state = self._state()
+        originals = [StorageWeakRef(t.untyped_storage()) for t, _ in state.values()]
+        with _host_vmm(), self.assertNoLogs(transport.logger, "WARNING"):
+            self._backend().prepare_export(state)
+        self.assertTrue(all(ref.expired() for ref in originals))
+
+    def test_a_leftover_view_keeps_its_original(self):
+        state = self._state()
+        leftover = state["t0"][0][10:20]  # e.g. a loop variable left behind
+        with _host_vmm(), self.assertLogs(transport.logger, "WARNING") as logs:
+            self._backend().prepare_export(state)
+        self.assertIn(
+            "after filling allocation 1 of 4, 1 copied slot(s) (1024 packed bytes) "
+            "still have source storages referenced elsewhere, e.g. t0;",
+            logs.output[0],
+        )
+        del leftover
+
+    def test_tied_names_are_one_storage(self):
+        weight = torch.randn(256)
+        state = {
+            "embed.weight": (weight, True),
+            "head.weight": (weight, True),
+            "other": (torch.randn(256), True),
+        }
+        with _host_vmm(), self.assertLogs(transport.logger, "WARNING") as logs:
+            self._backend().prepare_export(state)
+        self.assertIn(
+            "after filling allocation 1 of 2, 1 copied slot(s) (1024 packed bytes) "
+            "still have source storages referenced elsewhere, e.g. embed.weight;",
+            logs.output[0],
+        )
+        del weight
+
+    @staticmethod
+    def _bytes_on(storage, begin, end):
+        """A uint8 tensor on ``storage[begin:end]``, a storage of its own that
+        keeps ``storage`` alive."""
+        return torch.empty(0, dtype=torch.uint8).set_(storage[begin:end])
+
+    def test_every_storage_over_the_same_memory_is_tracked(self):
+        # Two storages over one buffer, starting at the same address (only one
+        # of them is copied) or overlapping (one slot, two sources). Either can
+        # keep the buffer alive.
+        for start in (0, 16):
+            for keep_names in ((), ("b",), ("a", "b")):
+                with self.subTest(start=start, keep_names=keep_names):
+                    storage = torch.arange(64, dtype=torch.uint8).untyped_storage()
+                    state = {
+                        "a": (self._bytes_on(storage, 0, 48), False),
+                        "b": (self._bytes_on(storage, start, start + 48), False),
+                    }
+                    refs = {
+                        name: StorageWeakRef(t.untyped_storage())
+                        for name, (t, _) in state.items()
+                    }
+                    backing = StorageWeakRef(storage)
+                    held = [state[name][0] for name in keep_names]
+                    del storage
+
+                    backend = self._backend()
+                    with (
+                        _host_vmm(),
+                        mock.patch.object(backend, "_warn_retained") as warn,
+                    ):
+                        backend.prepare_export(state)
+                    reports = [
+                        (len(call.args[1]), sum(slot.nbytes for slot in call.args[1]))
+                        for call in warn.call_args_list
+                    ]
+                    self.assertEqual(
+                        reports, [(1, 48 + start)] * 2 if keep_names else []
+                    )
+                    self.assertEqual(
+                        [not refs[name].expired() for name in ("a", "b")],
+                        [name in keep_names for name in ("a", "b")],
+                    )
+                    held.clear()
+                    self.assertTrue(all(ref.expired() for ref in refs.values()))
+                    self.assertTrue(backing.expired())
+
+    def test_an_owner_released_by_a_later_allocation_is_not_in_the_summary(self):
+        state = self._state()
+        # t1's storage object keeps t0's storage until t1 is copied and
+        # released: a storage object keeps its attributes while it lives.
+        state["t1"][0].untyped_storage().test_owner = state["t0"][0].untyped_storage()
+        original = StorageWeakRef(state["t0"][0].untyped_storage())
+        with _host_vmm(), self.assertLogs(transport.logger, "WARNING") as logs:
+            self._backend().prepare_export(state)
+        self.assertTrue(original.expired())
+        (warning,) = logs.output
+        self.assertIn("after filling allocation 1 of 4", warning)
+
+    def test_the_daemon_reports_a_cache_it_does_not_know(self):
+        model = _TinyModel()
+        unknown_cache = [model.proj]
+        daemon = _make_daemon(
+            model, VmmFdTransportBackend(device=CPU, granularity=GRANULARITY)
+        )
+        self.addCleanup(daemon.transport_backend.close)
+        del model
+        with _host_vmm(), self.assertLogs(transport.logger, "WARNING") as logs:
+            daemon._export_state()
+        first, summary = logs.output
+        # proj.weight (6 x 4) and proj.bias (6) in float32.
+        self.assertIn(
+            "after filling allocation 1 of 1, 2 copied slot(s) (120 packed bytes) "
+            "still have source storages referenced elsewhere, e.g. proj.weight, "
+            "proj.bias;",
+            first,
+        )
+        self.assertIn("after packing, 2 copied slot(s) (120 packed bytes)", summary)
+        del unknown_cache
 
 
 class TestValidateVmmLayout(CustomTestCase):
