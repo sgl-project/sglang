@@ -50,6 +50,9 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos_dreams import (
     split_interleaved_action_vision_tokens,
 )
 from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
+from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
+    FlowMatchEulerDiscreteScheduler,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3 import (
     Cosmos3DecodingStage,
 )
@@ -75,13 +78,14 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
     pad_action_rows,
     prepare_action_rows,
     resolve_geometry,
+    run_fixed_step_sde,
     sde_step_generator,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.warmup_request_builder import (
     _lighter_valid_num_frames,
 )
-from sglang.multimodal_gen.test.unit.host_sync_guard import RecordOps
+from sglang.multimodal_gen.test.unit.host_sync_guard import RecordOps, forbid_host_syncs
 from sglang.test.test_utils import CustomTestCase
 
 # ``transformer/config.json["cosmos3_nano_sim_bimanual"]`` of Cosmos3-Nano-Sim-Bimanual
@@ -690,6 +694,45 @@ class TestCosmosDreamsSdeSeeding(unittest.TestCase):
             for k in range(4)
         }
         self.assertEqual(len(seeds), 800)
+
+
+class TestCosmosDreamsFixedStepSde(CustomTestCase):
+    @staticmethod
+    def _denoise(scheduler, sigmas):
+        def transformer(latents, timestep, **kwargs):
+            return SimpleNamespace(video=latents * (timestep / 1000))
+
+        return run_fixed_step_sde(
+            transformer,
+            scheduler,
+            torch.ones(1, 2, 2, 2),
+            t_list=sigmas,
+            seed=42,
+            frame_start=5,
+            dtype=torch.float32,
+        )
+
+    def test_fixed_schedules_avoid_host_reads_without_changing_latents(self):
+        scheduler = FlowMatchEulerDiscreteScheduler(stochastic_sampling=True)
+        for sigmas in (MANIFEST.t_list, MANIFEST.t_list[::2]):
+            with self.subTest(sigmas=sigmas):
+                with mock.patch.object(scheduler, "set_begin_index"):
+                    expected = self._denoise(scheduler, sigmas)
+                with forbid_host_syncs():
+                    actual = self._denoise(scheduler, sigmas)
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    def test_duplicate_first_timestep_keeps_legacy_index_selection(self):
+        scheduler = FlowMatchEulerDiscreteScheduler(stochastic_sampling=True)
+        self._denoise(scheduler, MANIFEST.t_list)
+        # Distinct sigmas round to the same timestep, which requires the
+        # scheduler's legacy second-match rule.
+        with (
+            self.assertRaisesRegex(AssertionError, "aten.nonzero"),
+            forbid_host_syncs(),
+        ):
+            self._denoise(scheduler, (1.0, 1.0 - 1e-9, 0.625))
+        self.assertIsNone(scheduler.begin_index)
 
 
 class TestCosmosDreamsKVHistory(unittest.TestCase):

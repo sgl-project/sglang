@@ -1236,8 +1236,28 @@ def run_fixed_step_sde(
     **forward_kwargs: Any,
 ) -> torch.Tensor:
     """Fixed-step SDE denoising of one chunk; history K/V is read but never written."""
+    sigmas = list(t_list)
     scheduler.set_shift(1.0)
-    scheduler.set_timesteps(sigmas=list(t_list), device=noise.device)
+    scheduler.set_timesteps(sigmas=sigmas, device=noise.device)
+    config = scheduler.config
+    if (
+        sigmas
+        and type(scheduler) is FlowMatchEulerDiscreteScheduler
+        and not (
+            config.shift_terminal
+            or config.use_karras_sigmas
+            or config.use_exponential_sigmas
+            or config.use_beta_sigmas
+            or config.invert_sigmas
+        )
+    ):
+        # With unit shift, we can check the first timestep on the host. Match
+        # the scheduler's FP32 rounding and keep its lookup for duplicate steps.
+        timesteps = np.asarray(sigmas, dtype=np.float32) * np.float32(
+            config.num_train_timesteps
+        )
+        if np.count_nonzero(timesteps == timesteps[0]) == 1:
+            scheduler.set_begin_index(0)
     latents = noise.float()
     for step_index, timestep in enumerate(scheduler.timesteps):
         with set_forward_context(
