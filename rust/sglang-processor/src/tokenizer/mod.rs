@@ -4,7 +4,7 @@ use std::{path::Path, sync::Arc};
 
 use dynamo_tokenizers::traits::Tokenizer as _;
 use dynamo_tokenizers::{HuggingFaceTokenizer, Tokenizer, TokenizerOptions};
-use tokenizers_dynamo::PostProcessor as _;
+use tokenizers::PostProcessor as _;
 
 use crate::ProcessorError as Error;
 use crate::model_files::resolve_tokenizer_file;
@@ -135,7 +135,7 @@ fn bpe_covers_input(spec: &serde_json::Value) -> bool {
     pre_tokenizer["type"] == "ByteLevel"
         && model["continuing_subword_prefix"].is_null()
         && model["end_of_word_suffix"].is_null()
-        && tokenizers_dynamo::pre_tokenizers::byte_level::ByteLevel::alphabet()
+        && tokenizers::pre_tokenizers::byte_level::ByteLevel::alphabet()
             .into_iter()
             .all(|ch| vocab.get(ch.to_string()).is_some())
 }
@@ -186,7 +186,7 @@ impl DynamoTokenizer {
 
     fn load_fastokens(file: &Path) -> Result<Self, String> {
         let data = std::fs::read(file).map_err(|e| format!("read {}: {e}", file.display()))?;
-        let mut hf = tokenizers_dynamo::Tokenizer::from_bytes(&data)
+        let mut hf = tokenizers::Tokenizer::from_bytes(&data)
             .map_err(|e| format!("tokenizer load failed ({}): {e}", file.display()))?;
         if let Some(model_dir) = file.parent() {
             dynamo_tokenizers::hf::merge_special_tokens_from_config(&mut hf, model_dir);
@@ -318,22 +318,8 @@ impl TextTokenizer for DynamoTokenizer {
             }
             return Ok(ids);
         }
-        if let Some(fast) = &self.fast
-            && (!add_special_tokens || fast.num_special_tokens_to_add() == 0)
-        {
-            let segments = segments
-                .iter()
-                .map(|segment| fastokens::EncodeSegment {
-                    text: segment.text,
-                    allow_special: segment.allow_special,
-                })
-                .collect::<Vec<_>>();
-            // Passing the segments separately preserves their trust boundaries.
-            // The fastokens segmented API does not add post-processor tokens.
-            if let Ok(ids) = fast.encode_segments(&segments) {
-                return Ok(ids.into_iter().map(|id| id as i32).collect());
-            }
-        }
+        // The checkpoint tokenizer enforces Dynamo's control-token checks for
+        // ordinary segments, including IDs produced by base-vocabulary merges.
         let encoding = if add_special_tokens {
             &self.with_specials
         } else {
@@ -552,16 +538,54 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    #[test]
+    fn fastokens_preserves_the_checkpoint_tokenizers_segment_validation() {
+        let dir = write_bpe_tokenizer("fast-segments", false, Some("c"));
+        let file = dir.join("tokenizer.json");
+        let mut spec: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        spec["added_tokens"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "id": 4, "content": "ab", "single_word": false, "lstrip": false,
+                "rstrip": false, "normalized": false, "special": false
+            }));
+        std::fs::write(file, spec.to_string()).unwrap();
+
+        let tokenizer = DynamoTokenizer::load_with_backend(
+            dir.to_str().unwrap(),
+            None,
+            TokenizerBackend::Fastokens,
+        )
+        .unwrap();
+        assert!(tokenizer.fast.is_some());
+        let segments = [EncodeSegment::control("<s>"), EncodeSegment::ordinary("ab")];
+        let error = tokenizer.encode_segments(&segments, false).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("ordinary segment encoded to control-token id 4")
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     fn assert_fastokens_parity(dir: &std::path::Path, text: &str) {
         let path = dir.to_str().unwrap();
         let reference = DynamoTokenizer::load(path, None).unwrap();
         let fast =
             DynamoTokenizer::load_with_backend(path, None, TokenizerBackend::Fastokens).unwrap();
-        assert!(fast.fast.is_some(), "fixture must use the fast encoder");
+        let encoder = fast
+            .fast
+            .as_ref()
+            .expect("fixture must use the fast encoder");
         for add_special_tokens in [false, true] {
-            assert_eq!(
-                fast.encode(text, add_special_tokens).unwrap(),
-                reference.encode(text, add_special_tokens).unwrap(),
+            let expected = reference.encode(text, add_special_tokens).unwrap();
+            let ids = encoder
+                .encode_with_special_tokens(text, add_special_tokens)
+                .unwrap();
+            assert!(
+                ids.into_iter().map(|id| id as i32).eq(expected),
                 "text={text:?} add_special_tokens={add_special_tokens}"
             );
         }

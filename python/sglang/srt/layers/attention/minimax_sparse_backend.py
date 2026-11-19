@@ -305,7 +305,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         ):
             raise NotImplementedError(
                 "MiniMax-M3 MSA attention does not support speculative decoding under "
-                "CUDA graph. Use --disable-cuda-graph, set SGLANG_DISABLE_MSA=1, or "
+                "CUDA graph. Use --disable-decode-cuda-graph --disable-prefill-cuda-graph, set SGLANG_DISABLE_MSA=1, or "
                 "disable speculative decoding."
             )
         self._msa_owns_decode = self._use_msa_decode and not (

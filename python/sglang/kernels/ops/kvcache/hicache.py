@@ -13,6 +13,7 @@ from sglang.kernels.jit.utils import (
     make_cpp_args,
 )
 from sglang.kernels.kernel_api_logging import debug_kernel_api
+from sglang.srt.utils import is_gfx95_supported
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -221,13 +222,23 @@ def _tiles_across_lanes(element_size: int, unroll: int) -> bool:
 
 def _default_unroll(element_size: int) -> int:
     if element_size <= 512:
-        return 4
-
-    if element_size <= 1024:
-        return 2
-
-    # fallback: no unroll
-    return 1
+        unroll = 4
+    elif element_size <= 1024:
+        unroll = 2
+    else:
+        unroll = 1  # fallback: no unroll
+    # gfx950's 16-64 B rounds tile rows such as the 656 B MLA row only with more
+    # items per copy group.
+    if is_gfx95_supported() and not _tiles_across_lanes(element_size, unroll):
+        unroll = next(
+            (
+                u
+                for u in (8, 16, 32)
+                if u > unroll and _tiles_across_lanes(element_size, u)
+            ),
+            unroll,
+        )
+    return unroll
 
 
 @debug_kernel_api

@@ -235,10 +235,12 @@ pub struct ServerArgs {
     /// `max_new_tokens` is clamped rather than rejected (Python
     /// `TokenizerManager._validate_one_request`).
     pub allow_auto_truncate: bool,
-    /// `return_hidden_states` is refused unless the server was launched with it:
-    /// the scheduler simply won't produce them, so the request would 200 with the
-    /// field silently missing.
+    /// The resolved `--enable-return-hidden-states`;
+    /// decides the mode only when `return_hidden_states_mode` is unset.
     pub enable_return_hidden_states: bool,
+    /// The resolved `--return-hidden-states-mode` (`None`, `"last"` or `"full"`):
+    /// the most a request's `return_hidden_states` may ask for.
+    pub return_hidden_states_mode: Option<String>,
     /// Output slots reserved per request on top of its input (eagle stores draft
     /// tokens there). Not a `server_args` field — `TokenizerManager` derives it and
     /// `RustServer._build_server_args` stamps it in, so both sides count alike.
@@ -332,6 +334,7 @@ impl ServerArgs {
         limit_mm_data_per_request,
         allow_auto_truncate,
         enable_return_hidden_states,
+        return_hidden_states_mode,
         num_reserved_tokens,
         tokenizer_model_max_length,
         version,
@@ -399,6 +402,7 @@ impl ServerArgs {
         limit_mm_data_per_request: Vec<(String, usize)>,
         allow_auto_truncate: bool,
         enable_return_hidden_states: bool,
+        return_hidden_states_mode: Option<String>,
         num_reserved_tokens: u64,
         tokenizer_model_max_length: i64,
         version: String,
@@ -464,6 +468,7 @@ impl ServerArgs {
             limit_mm_data_per_request,
             allow_auto_truncate,
             enable_return_hidden_states,
+            return_hidden_states_mode,
             num_reserved_tokens,
             tokenizer_model_max_length,
             version,
@@ -536,6 +541,7 @@ impl Default for ServerArgs {
             limit_mm_data_per_request: Vec::new(),
             allow_auto_truncate: false,
             enable_return_hidden_states: false,
+            return_hidden_states_mode: None,
             num_reserved_tokens: 0,
             tokenizer_model_max_length: -1,
             version: String::new(),
@@ -602,6 +608,22 @@ pub struct DeploymentInfo {
     pub max_prefill_tokens: u64,
     pub enable_dp_attention: bool,
     pub speculative_algorithm: Option<String>,
+    /// `--speculative-ngram-external-corpus-max-tokens`; 0 when the launcher
+    /// did not pass it.
+    pub speculative_ngram_external_corpus_max_tokens: u64,
+    /// `--gc-threshold`, which `/freeze_gc` forwards to every scheduler.
+    pub gc_threshold: Option<Vec<i64>>,
+    /// `--enable-pd-role-switch`.
+    pub enable_pd_role_switch: bool,
+    /// `--elastic-ep-backend`; `None` when elastic EP is off, which is what
+    /// `/scale_elastic_ep` and `/is_scaling_elastic_ep` report.
+    pub elastic_ep_backend: Option<String>,
+    /// `--enable-streaming-session`, which `/open_session` needs for a
+    /// streaming session.
+    pub enable_streaming_session: bool,
+    /// The engine-info bootstrap server (`--engine-info-bootstrap-port`), as
+    /// the base URL Python's `ServerArgs.engine_info_bootstrap_url` builds.
+    pub engine_info_bootstrap_url: Option<String>,
     pub enable_hierarchical_cache: bool,
     pub hicache_ratio: Option<f64>,
     pub hicache_size: u64,
@@ -611,6 +633,17 @@ pub struct DeploymentInfo {
     pub rust_server_endpoints: Vec<RustServerEndpoint>,
     /// Every Rust listener of this launch on this node; the same table on each.
     pub node_listeners: Vec<NodeRustListener>,
+}
+
+impl DeploymentInfo {
+    /// What Python reports as `meta_info.dp_rank`: the scheduler's DP rank,
+    /// `None` without DP. `dp_rank` is the listener and KV-publisher index, so
+    /// it is 0 without DP. The two agree with more than one DP rank, whether
+    /// attention-DP groups or replicas. A rank set only by `SGLANG_DP_RANK`
+    /// with one DP rank reports `None` here, where Python reports it.
+    pub fn reported_dp_rank(&self) -> Option<u32> {
+        self.dp_rank.filter(|_| self.dp_size > 1)
+    }
 }
 
 /// One DP rank's listener, as a base URL (`http://host:port`).
@@ -907,7 +940,7 @@ impl<'py> pyo3::FromPyObject<'_, 'py> for JsonObject {
     module = "sglang.srt.rust_extensions._server"
 )]
 // Lowercase to match the values Python reports for the same field.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DisaggregationMode {
     /// Unified prefill + decode.
@@ -915,6 +948,26 @@ pub enum DisaggregationMode {
     Null,
     Prefill,
     Decode,
+}
+
+/// How much of the hidden states a request asks for or a server allows,
+/// ordered like Python's `CaptureHiddenMode`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum HiddenStatesMode {
+    Null,
+    Last,
+    Full,
+}
+
+impl DisaggregationMode {
+    /// The value Python reports for the same field.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Null => "null",
+            Self::Prefill => "prefill",
+            Self::Decode => "decode",
+        }
+    }
 }
 
 /// The slice of the resolved Python `ModelConfig` the rust server reads.
@@ -1118,7 +1171,7 @@ pub enum MmFamily {
 pub enum MmResample {
     /// `Qwen2VLImageProcessor` / `…Fast` — torchvision on a uint8 tensor.
     AtenU8,
-    /// `Qwen2VLImageProcessorPil`, behind `--disable-fast-image-processor`.
+    /// `Qwen2VLImageProcessorPil`, behind `--image-processor-backend pil`.
     Pil,
 }
 
@@ -1174,6 +1227,17 @@ impl ServerArgs {
             .map_err(|e| format!("invalid preferred_sampling_params: {e}"))?;
         }
         Ok(())
+    }
+
+    /// The most a request's `return_hidden_states` may ask for
+    /// (Python `get_server_return_hidden_states_mode`).
+    pub fn hidden_states_mode(&self) -> HiddenStatesMode {
+        match self.return_hidden_states_mode.as_deref() {
+            Some("last") => HiddenStatesMode::Last,
+            Some("full") => HiddenStatesMode::Full,
+            _ if self.enable_return_hidden_states => HiddenStatesMode::Full,
+            _ => HiddenStatesMode::Null,
+        }
     }
 
     /// True on a prefill or decode node — requests need bootstrap routing.

@@ -27,6 +27,7 @@ from transformers import PretrainedConfig
 from transformers.utils import cached_file
 
 from sglang.srt.arg_groups.model_override_base import resolving_view
+from sglang.srt.beam_search.trie_config import TRIE_OUTPUT_HEAD_FILENAME
 from sglang.srt.configs.bailing_hybrid import is_bailing_multi_gate_enabled
 from sglang.srt.configs.embedding_model_spec import resolve_embedding_model_spec
 from sglang.srt.configs.ernie55 import (
@@ -50,7 +51,7 @@ from sglang.srt.hf_transformers import (
 from sglang.srt.hf_transformers.config import POINTER_ADAPTER_BASES
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import is_hip, is_npu, retry
+from sglang.srt.utils import is_gfx95_supported, is_hip, is_npu, retry
 from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 
 logger = logging.getLogger(__name__)
@@ -222,6 +223,26 @@ def is_deepseek_dsa(config) -> bool:
     ) or is_kimi_k31(config)
 
 
+def is_q8_raw_fp8_nope_layout(
+    *,
+    prefill_backend: Optional[str],
+    decode_backend: Optional[str],
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+) -> bool:
+    """Whether Q8 prefill and TileLang decode can share raw 512-byte FP8 rows.
+
+    This checks consumers and geometry, not the model name. Callers validate
+    dtype, device and incompatible serving options separately.
+    """
+    return (
+        prefill_backend == "flashmla_sparse_q8"
+        and decode_backend == "tilelang"
+        and kv_lora_rank == 512
+        and qk_rope_head_dim == 0
+    )
+
+
 def dsa_draft_shards_under_dcp(config, dcp_size: int) -> bool:
     """Whether a DSA EAGLE/NEXTN draft shards its KV like the DCP target.
 
@@ -256,12 +277,15 @@ def is_glm_moe_dsa(config) -> bool:
     )
 
 
+KIMI_K3_ARCHS = (
+    "KimiK3ForConditionalGeneration",
+    "KimiK31ForConditionalGeneration",
+    "KimiK3LinearForCausalLM",
+)
+
+
 def is_kimi_k3(config) -> bool:
-    return _hf_arch(config) in (
-        "KimiK3ForConditionalGeneration",
-        "KimiK31ForConditionalGeneration",
-        "KimiK3LinearForCausalLM",
-    )
+    return _hf_arch(config) in KIMI_K3_ARCHS
 
 
 _KIMI_K31_ARCHS = (
@@ -2201,6 +2225,8 @@ class ModelConfig:
             "quark_mxfp4",
             "minimax_m3_nvfp4",
         ]
+        if is_gfx95_supported():
+            rocm_supported_quantization.append("modelopt_fp8")
         optimized_quantization_methods = [
             "fp8",
             "marlin",
@@ -2435,7 +2461,9 @@ class ModelConfig:
             # with statement to avoid closing the client.
             client = create_remote_connector(self.model_path)
             if is_remote_url(self.model_path):
-                client.pull_files(allow_pattern=["*config.json"])
+                client.pull_files(
+                    allow_pattern=["*config.json", f"*{TRIE_OUTPUT_HEAD_FILENAME}"]
+                )
                 self.model_weights = self.model_path
                 self.model_path = client.get_local_dir()
 
@@ -2603,6 +2631,9 @@ multimodal_model_archs = [
     "LlavaForConditionalGeneration",
     "LlavaVidForCausalLM",
     "Lfm2VlForConditionalGeneration",
+    "Lfm3VlForConditionalGeneration",
+    "Lfm3AudioForConditionalGeneration",
+    "Lfm3OmniForConditionalGeneration",
     "LightOnOCRForConditionalGeneration",
     *MIMO_V2_MULTIMODAL_ARCHS,
     "MiMoV2ASRForCausalLM",
