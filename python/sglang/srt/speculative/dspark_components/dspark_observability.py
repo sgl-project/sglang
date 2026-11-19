@@ -816,6 +816,15 @@ class DsparkStepObservers:
 
     # --- per-step observation --------------------------------------------
 
+    @property
+    def reads_target_logits(self) -> bool:
+        """Whether observe_verify_step reads the full-vocabulary target logits."""
+        return (
+            bool(self._sts_collect_path)
+            or envs.SGLANG_DSPARK_DEBUG_CONFIDENCE_METRICS.get()
+            or self._block_accept_recorder is not None
+        )
+
     def observe_verify_step(
         self,
         *,
