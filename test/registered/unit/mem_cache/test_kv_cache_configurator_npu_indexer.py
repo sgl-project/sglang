@@ -13,6 +13,40 @@ register_cpu_ci(est_time=5, stage="base-a", runner_config="cpu")
 
 
 class TestNPUIndexerLayerLayout(CustomTestCase):
+    def test_arch35_pd_compact_layout_requires_pp1_dcp1(self):
+        memory = SimpleNamespace(
+            enable_hierarchical_cache=False,
+            enable_hisparse=False,
+            enable_unified_cache_external_linker=False,
+        )
+        with (
+            patch.object(kcc, "_is_npu", True),
+            patch.object(kcc, "get_memory", return_value=memory),
+            patch.object(kcc, "get_disagg") as disagg,
+            patch.object(kcc, "get_parallel") as parallel,
+            patch("sglang.srt.hardware_backend.npu.utils.is_npu_arch35") as arch35,
+        ):
+            for role in ("prefill", "decode"):
+                disagg.return_value = SimpleNamespace(disaggregation_mode=role)
+                for a5, pp, dcp in (
+                    (True, 1, 1),
+                    (True, 2, 1),
+                    (True, 1, 2),
+                    (False, 1, 1),
+                ):
+                    with self.subTest(role=role, a5=a5, pp=pp, dcp=dcp):
+                        arch35.return_value = a5
+                        parallel.return_value = SimpleNamespace(
+                            pp_size=pp, attn_dcp_size=dcp
+                        )
+                        self.assertEqual(
+                            kcc._should_elide_dsa_index_k(is_draft_worker=False),
+                            a5 and pp == dcp == 1,
+                        )
+                        self.assertFalse(
+                            kcc._should_elide_dsa_index_k(is_draft_worker=True)
+                        )
+
     def test_non_arch35_dsa_pool_uses_only_active_indexer_layers(self):
         """Shared layers must not consume indexer slots on non-arch35 NPU."""
         configurator = kcc.KVCacheConfigurator.__new__(kcc.KVCacheConfigurator)
