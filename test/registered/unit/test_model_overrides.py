@@ -1028,6 +1028,33 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             # Generative Ministral3 checkpoints are unaffected.
             self._construct(*nemotron3)
 
+    def test_nemotron35_embedding_rejects_rocm(self):
+        """Nemotron-3.5-Embed's text model has the same ENCODER_ONLY layers, so it
+        must also fail at startup on ROCm."""
+        # The checkpoint is a bare Mistral3Model; ModelConfig renames it.
+        text_config = dict(self._MINI_CONFIG, model_type="ministral3", is_causal=False)
+        vision_config = {
+            "model_type": "pixtral",
+            "hidden_size": 64,
+            "intermediate_size": 128,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "image_size": 64,
+            "patch_size": 16,
+        }
+        nested = {"text_config": text_config, "vision_config": vision_config}
+        embedding_fields = dict(nested, is_causal=False, pooling="avg")
+        nemotron35 = ("Mistral3Model", "mistral3")
+        with override_platform(is_cuda=True):
+            self._construct(*nemotron35, config_extra=embedding_fields)
+        with override_platform(is_cuda=False, is_hip=True):
+            with self.assertRaisesRegex(ValueError, "not supported on ROCm"):
+                self._construct(*nemotron35, config_extra=embedding_fields)
+            # Generative Mistral3 checkpoints are unaffected.
+            self._construct(
+                "Mistral3ForConditionalGeneration", "mistral3", config_extra=nested
+            )
+
     def test_minimax_m2_enables_tf32_matmul(self):
         sa = self._construct("MiniMaxM2ForCausalLM", "llama")
         self.assertTrue(self._resolved(sa, "enable_tf32_matmul"))

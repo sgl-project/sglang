@@ -14,6 +14,7 @@ from transformers import PreTrainedTokenizerFast
 
 from sglang.srt.managers.mm_utils import get_new_expanded_mm_items
 from sglang.srt.managers.req_types import MultimodalDataItem
+from sglang.srt.models.nemotron35_embedding import EmbeddingNemotron35Model
 from sglang.srt.multimodal.modality import Modality, MultimodalInputFormat
 from sglang.srt.multimodal.processors.nemotron35_reranker import (
     Nemotron35RerankerProcessor,
@@ -39,6 +40,10 @@ class TestPixtralProcessor(CustomTestCase):
         processor._effective_patch_size = 28
         processor._precompute_hashes_before_cpu_transfer = MagicMock()
         return processor
+
+    def test_nemotron35_embedding_shares_the_padding_free_processor(self):
+        """Padding must not enter the embedding model's mean pooling either."""
+        self.assertIn(EmbeddingNemotron35Model, Nemotron35RerankerProcessor.models)
 
     def test_reranker_removes_padding_without_changing_other_pixtral_models(self):
         """Masked tokens must not enter reranker attention or mean pooling."""

@@ -198,6 +198,12 @@ def embedding_support_matrix() -> list[dict[str, Any]]:
             **_embedding_nemotron3_spec().as_dict(),
         }
     )
+    rows.append(
+        {
+            "architecture": "Mistral3Model (is_causal=false, pooling=avg)",
+            **_embedding_nemotron35_spec().as_dict(),
+        }
+    )
     return rows
 
 
@@ -267,6 +273,28 @@ def _embedding_nemotron3_spec() -> EmbeddingModelSpec:
         safe_disable_chunked_prefill=True,
         safe_disable_kv_cache=True,
         encoder_only_attention=True,
+    )
+
+
+def _embedding_nemotron35_spec() -> EmbeddingModelSpec:
+    return EmbeddingModelSpec(
+        family="embedding_nemotron35",
+        task=EmbeddingTask.EMBED,
+        execution=EmbeddingExecution.MULTIMODAL,
+        attention=AttentionPattern.BIDIRECTIONAL,
+        pooling=PoolingStrategy.MEAN,
+        normalize=True,
+        postprocessor="model_defined",
+        tokenizer_special_tokens="model_default",
+        supports_dimensions=False,
+        supports_token_embeddings=False,
+        supports_multimodal=True,
+        requires_embedding_flag=False,
+        auto_enable_embedding=True,
+        bidirectional_attention=True,
+        bcg_prefill_policy=BCGPrefillPolicy.DEFAULT,
+        safe_disable_radix_cache=True,
+        safe_disable_chunked_prefill=True,
     )
 
 
@@ -358,6 +386,9 @@ def resolve_embedding_model_spec(
 
     if is_embedding_gemma:
         return _embedding_gemma_spec()
+
+    if "EmbeddingNemotron35Model" in architecture_set:
+        return _embedding_nemotron35_spec()
 
     if (
         "Mistral3ForSequenceClassification" in architecture_set

@@ -11,14 +11,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Image preprocessing for the Nemotron 3.5 reranker."""
+"""Image preprocessing for the Nemotron 3.5 reranker and embedding models."""
 
 from sglang.srt.models.mistral3_reranker import Mistral3ForSequenceClassification
+from sglang.srt.models.nemotron35_embedding import EmbeddingNemotron35Model
 from sglang.srt.multimodal.processors.pixtral import PixtralProcessor
 
 
 class Nemotron35RerankerProcessor(PixtralProcessor):
-    models = [Mistral3ForSequenceClassification]
+    models = [Mistral3ForSequenceClassification, EmbeddingNemotron35Model]
 
     def _call_processor(self, processor, input_text, processor_device, kwargs) -> dict:
         result = super()._call_processor(

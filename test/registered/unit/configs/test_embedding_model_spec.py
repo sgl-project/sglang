@@ -165,6 +165,20 @@ class TestEmbeddingModelSpec(unittest.TestCase):
         self.assertTrue(spec.safe_disable_kv_cache)
         self.assertTrue(spec.encoder_only_attention)
 
+    def test_embedding_nemotron35_resolves_without_is_embedding(self):
+        """The auto-detected checkpoint must reach the multimodal embedding path."""
+        spec = resolve_embedding_model_spec(
+            ["EmbeddingNemotron35Model"],
+            is_embedding_requested=False,
+            is_embedding_gemma=False,
+        )
+
+        self.assertEqual(spec.family, "embedding_nemotron35")
+        self.assertEqual(spec.execution, EmbeddingExecution.MULTIMODAL)
+        self.assertTrue(spec.auto_enable_embedding)
+        # The KV-cache-free prefill path is not validated with image features.
+        self.assertFalse(spec.safe_disable_kv_cache)
+
     def _resolve_nemotron3_embedding_args(self, attention_backend):
         args = ServerArgs(model_path="dummy", attention_backend=attention_backend)
         args._model_config = SimpleNamespace(
@@ -214,8 +228,11 @@ class TestEmbeddingModelSpec(unittest.TestCase):
         matrix = embedding_support_matrix()
         by_architecture = {row["architecture"]: row for row in matrix}
 
-        self.assertEqual(len(matrix), 9)
+        self.assertEqual(len(matrix), 10)
         self.assertIn("EmbeddingGemma2Model", by_architecture)
+        nemotron35 = by_architecture["Mistral3Model (is_causal=false, pooling=avg)"]
+        self.assertEqual(nemotron35["family"], "embedding_nemotron35")
+        self.assertTrue(nemotron35["supports_multimodal"])
         self.assertTrue(by_architecture["EmbeddingGemma2Model"]["supports_multimodal"])
         self.assertEqual(by_architecture["BertModel"]["family"], "bert")
         self.assertEqual(by_architecture["BertModel"]["attention"], "bidirectional")
