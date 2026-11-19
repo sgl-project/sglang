@@ -41,7 +41,10 @@ def mxfp8_group_quant(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     ``[M, K // 32]`` ``uint8`` biased E8M0 exponents in row-major order. The scale
     is ``2^ceil(log2(amax / 448))`` per block, bit-identical to
     ``triton_kernels.numerics_details.mxfp.downcast_to_mxfp(x, float8_e4m3fn,
-    axis=1)`` with its default ROUND_UP mode.
+    axis=1)`` with its default ROUND_UP mode for fp16 and bf16 inputs. For fp32,
+    the value conversion here is the hardware round-to-nearest instruction and
+    matches torch, while triton_kernels' fp32 cast is approximate at an e4m3
+    rounding boundary, so a value may differ by one e4m3 ulp.
     """
     m, k = x.shape
     q = torch.empty((m, k), dtype=torch.float8_e4m3fn, device=x.device)
