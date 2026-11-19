@@ -1979,7 +1979,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_USE_HIP_HC_PREFILL_TRITON</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>On gfx950, run gated hyper-connection sites with a per-branch norm (Qwen3.8) above the FlyDSL mix's 128-row limit as Triton kernels on the raw residual (the down projection a split-K kernel up to 512 rows, a branch-batched GEMM above), without writing the normed residual. Rounding differs from the unfused path, and the folded weights (6.9 MB a site at Qwen3.8-Flash-Next's shapes) are allocated at the first eligible batch. Online weight updates are refused while it is on.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>On gfx950, run gated hyper-connection sites with a per-branch norm (Qwen3.8) of more than 48 rows as Triton kernels on the raw residual (the down projection a split-K kernel up to 512 rows, a branch-batched GEMM above), without writing the normed residual. Rounding differs from the unfused path, and the folded weights (6.9 MB a site at Qwen3.8-Flash-Next's shapes) are allocated at the first eligible batch. Online weight updates are refused while it is on.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
   </tbody>

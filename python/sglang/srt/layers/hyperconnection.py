@@ -12,7 +12,6 @@ from sglang.kernels.ops.gemm.hc_mix import (
     fused_hc_mix_supported,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.hc_mix_flydsl import _MAX_ROWS as _FLYDSL_MAX_ROWS
 from sglang.srt.layers.hc_mix_flydsl import (
     flydsl_hc_mix_supported,
     flydsl_hc_mix_weights_supported,
@@ -21,6 +20,8 @@ from sglang.srt.layers.hc_mix_flydsl import (
 from sglang.srt.utils import is_npu
 
 _is_npu = is_npu()
+# gfx950: HC sites of more than this many rows take the Triton path.
+_HC_PREFILL_MIN_ROWS = 48
 
 
 @lru_cache(None)
@@ -359,7 +360,7 @@ class GatedResidual(HyperConnectionBase):
         if (
             self._hc_prefill_ok
             and normalized_input is None
-            and hyper_input.shape[0] > _FLYDSL_MAX_ROWS
+            and hyper_input.shape[0] > _HC_PREFILL_MIN_ROWS
             and not torch.compiler.is_compiling()
             and not _deterministic_inference()
         ):

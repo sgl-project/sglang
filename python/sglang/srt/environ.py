@@ -1226,7 +1226,7 @@ class Envs:
     # On gfx95x with SGLANG_USE_AITER=1, quantize the BF16 Qwen3.5/3.8 GDN
     # in_proj_qkvz and out_proj to MXFP4 after loading. 0 keeps them BF16.
     SGLANG_ROCM_GDN_ONLINE_MXFP4 = EnvBool(True)
-    # gfx950 only: the gated hyper-connection mix and combine above the FlyDSL row limit
+    # gfx950 only: the gated hyper-connection mix and combine of more than 48 rows
     # run as Triton kernels (the down projection a split-K kernel up to 512 rows, torch.bmm
     # above) without the normed residual.
     SGLANG_USE_HIP_HC_PREFILL_TRITON = EnvBool(False)

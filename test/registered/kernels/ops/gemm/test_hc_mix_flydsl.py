@@ -203,14 +203,16 @@ def _spy_split_k_down(monkeypatch):
 
 @requires_gfx950
 @pytest.mark.parametrize(
-    "rows", [_MAX_ROWS + 1, 160, 176, 208, 255, 300, 511, 512, 513, 1024, 1025, 16384]
+    "rows",
+    [49, _MAX_ROWS + 1, 160, 176, 208, 255, 300, 511, 512, 513, 1024, 1025, 16384],
 )
 def test_prefill_mix_and_combine_match_reference(monkeypatch, rows):
-    # Up to 512 rows (a one-row tail after the 64-row tiles at 129, ragged at 255 and
-    # 511, full at 512, verify batches of 4 rows a request among them): the split-K down
-    # kernel. 513 is the first row of the bmm path; 1024 and 1025 are the last and the
-    # first row of its two up-kernel launch configs (1025 a one-row tail after full
-    # blocks); 16384 is the served prefill chunk.
+    # Up to 512 rows (the first row the path takes at 49, a one-row tail after the
+    # 64-row tiles at 129, ragged at 255 and 511, full at 512, verify batches of 4 rows
+    # a request among them): the split-K down kernel. 513 is the first row of the bmm
+    # path; 1024 and 1025 are the last and the first row of its two up-kernel launch
+    # configs (1025 a one-row tail after full blocks); 16384 is the served prefill
+    # chunk.
     launched = _spy_split_k_down(monkeypatch)
     site, unfused = _make_site(enabled=True), _make_site(enabled=False)
     h, y = _make_inputs(rows)
@@ -335,10 +337,10 @@ def test_rejects_operands_the_kernels_cannot_read():
     "enabled, rows, deterministic",
     [
         (False, _MAX_ROWS + 1, False),
-        (True, _MAX_ROWS, False),
+        (True, 48, False),
         (True, _MAX_ROWS + 1, True),
     ],
-    ids=["flag-off", "flydsl-row-limit", "deterministic-inference"],
+    ids=["flag-off", "min-rows", "deterministic-inference"],
 )
 def test_declines_to_the_unfused_path(monkeypatch, enabled, rows, deterministic):
     from sglang.srt.model_executor.model_runner_components.weight_updater import (
