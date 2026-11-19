@@ -7,7 +7,7 @@ use sgl_kv_indexer::{GrpcPrefixIndex, PrefixIndex, PrefixIndexConfig};
 use sgl_router::{
     config::{
         CachePrefixProvider, ChatRoutingKind, Cli, Config, DiscoveryBackend,
-        KvIndexerEndpointConfig, LogFormat, PolicyKind,
+        KvIndexerEndpointConfig, LogFormat,
     },
     discovery::{spawn_discovery, ModelId},
     policies::{factory::build_registry as build_policy_registry, PolicyRegistry},
@@ -90,26 +90,29 @@ async fn main() -> Result<()> {
                 .context("build policy registry")?,
             ),
             ChatRouting::Legacy,
-            None,
+            Vec::new(),
         ),
         ChatRoutingKind::Reorg => {
-            let (resolver, cleanup) = build_reorg_resolver(
-                &config.model,
-                &engine_state,
-                external_kv_indexer_client.clone(),
-            )
-            .context("build reorg policies")?;
+            let mut resolvers = std::collections::HashMap::new();
+            let mut cleanups = Vec::new();
+            for model in config.models() {
+                let (resolver, cleanup) =
+                    build_reorg_resolver(model, &engine_state, external_kv_indexer_client.clone())
+                        .context("build reorg policies")?;
+                resolvers.insert(ModelId(model.id.clone()), resolver);
+                cleanups.extend(cleanup);
+            }
             (
                 Arc::new(PolicyRegistry::default()),
-                ChatRouting::Reorg([(ModelId(config.model.id.clone()), resolver)].into()),
-                cleanup,
+                ChatRouting::Reorg(resolvers),
+                cleanups,
             )
         }
     };
 
     // Ask the built policies, so any term or filter that reads the prompt is covered.
     ensure!(
-        config.model.tokenizer_path.is_some()
+        config.models().all(|model| model.tokenizer_path.is_some())
             || !chat_routing.needs_request_tokens(&routing_policies),
         "--no-tokenizer is incompatible with cache-aware routing and prefix-cache terms or filters"
     );
@@ -168,7 +171,7 @@ async fn main() -> Result<()> {
     discovery_handle.abort();
     worker_manager_handle.abort();
     inflight_cleanup.shutdown().await;
-    if let Some(cleanup) = reorg_cleanup {
+    for cleanup in reorg_cleanup {
         cleanup.shutdown().await;
     }
     log_shutdown(&outcome.result, outcome.inflight_drain_secs);
@@ -257,13 +260,8 @@ fn log_startup(config: &Config) {
 
 fn create_external_kv_indexer_client(config: &Config) -> Result<Option<Arc<dyn PrefixIndex>>> {
     let endpoint = config
-        .model
-        .cache_aware
-        .as_ref()
-        .filter(|cache| {
-            config.model.policy == PolicyKind::CacheAware
-                && cache.prefix_provider == CachePrefixProvider::Indexer
-        })
+        .cache_aware()
+        .filter(|cache| cache.prefix_provider == CachePrefixProvider::Indexer)
         .and_then(|cache| cache.kv_indexer_endpoint.as_ref());
     endpoint
         .map(|endpoint| {
@@ -291,7 +289,7 @@ fn start_engine_state_monitor(config: &Config, use_external_indexer: bool) -> Ar
     // Only a peer selector enables bootstrap; without one the tracker is
     // pre-settled and `/readyz` never waits on it.
     let bootstrap = Arc::new(
-        match (&config.model.cache_aware, config.discovery.peer_selector()) {
+        match (config.cache_aware(), config.discovery.peer_selector()) {
             (Some(cache), Some(_)) => BootstrapTracker::new_with_opts(
                 Duration::from_millis(cache.bootstrap_timeout_ms),
                 Duration::from_millis(cache.bootstrap_fetch_timeout_cap_ms),
@@ -398,30 +396,22 @@ fn build_app_context(
         local_inflight_requests,
     );
     // An external indexer leaves the local tree empty.
-    app_context.dp_rank_prefix_provider = (config.model.dp_aware
+    app_context.dp_rank_prefix_provider = (config.models().any(|model| model.dp_aware)
         && external_kv_indexer_client.is_none())
     .then(|| RadixTreePrefixProvider::new(engine_state.tree(), Arc::clone(&block_size_oracle)));
     app_context.prefix_index = external_kv_indexer_client;
-    app_context.radix_tree_prefix_provider = (config.model.policy == PolicyKind::CacheAware
-        && config
-            .model
-            .cache_aware
-            .as_ref()
-            .is_some_and(|cache| cache.prefix_provider == CachePrefixProvider::RadixTree))
-    .then(|| {
-        let provider =
-            RadixTreePrefixProvider::new(engine_state.tree(), Arc::clone(&block_size_oracle));
-        match config
-            .model
-            .cache_aware
-            .as_ref()
-            .and_then(|cache| cache.pending_prefix_consult_below)
-        {
-            Some(below) => provider.with_pending_consult_below(below),
-            None => provider,
-        }
-    });
-    if let Some(cache) = config.model.cache_aware.as_ref() {
+    app_context.radix_tree_prefix_provider = config
+        .cache_aware()
+        .filter(|cache| cache.prefix_provider == CachePrefixProvider::RadixTree)
+        .map(|cache| {
+            let provider =
+                RadixTreePrefixProvider::new(engine_state.tree(), Arc::clone(&block_size_oracle));
+            match cache.pending_prefix_consult_below {
+                Some(below) => provider.with_pending_consult_below(below),
+                None => provider,
+            }
+        });
+    if let Some(cache) = config.cache_aware() {
         let ttl = Duration::from_millis(cache.pending_prefix_ttl_ms);
         engine_state.tree().pending().enable(ttl);
         engine_state

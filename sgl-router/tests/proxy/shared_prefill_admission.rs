@@ -140,6 +140,7 @@ impl Policy for CacheCandidatesPolicy {
 
 fn config(policy: PolicyKind) -> Config {
     Config {
+        additional_models: Vec::new(),
         server: ServerConfig {
             host: "0".into(),
             port: 0,

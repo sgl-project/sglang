@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::buckets_reorg::BucketResolver;
-use crate::config::Config;
+use crate::config::{Config, ModelConfig};
 use crate::discovery::ModelId;
 
 use crate::policies::buckets::BucketSelector;
@@ -56,7 +56,7 @@ pub struct AppContext {
     pub registry: Arc<WorkerRegistry>,
     pub policies: Arc<PolicyRegistry>,
     /// Converts static Bucket configuration into request candidate domains.
-    pub bucket_selector: Arc<BucketSelector>,
+    bucket_selectors: HashMap<ModelId, Arc<BucketSelector>>,
     /// Select legacy policies or model-specific bucket-first routing.
     pub chat_routing: ChatRouting,
     /// Per-worker active-load bookkeeping shared by the proxy, policies,
@@ -91,6 +91,18 @@ pub struct AppContext {
 }
 
 impl AppContext {
+    pub fn model_config(&self, model: &ModelId) -> &ModelConfig {
+        self.config
+            .resolve_model(&model.0)
+            .expect("routed model must be configured")
+    }
+
+    pub fn bucket_selector(&self, model: &ModelId) -> &BucketSelector {
+        self.bucket_selectors
+            .get(model)
+            .expect("routed model must have a bucket selector")
+    }
+
     pub fn new(
         config: Config,
         tokenizers: Arc<TokenizerRegistry>,
@@ -129,7 +141,15 @@ impl AppContext {
         // The metrics registry is built after the policy registry, so attach
         // it here for policies that emit their own counters.
         policies.attach_metrics(Arc::clone(&metrics));
-        let bucket_selector = Arc::new(BucketSelector::new(config.model.bucket_config.clone()));
+        let bucket_selectors = config
+            .models()
+            .map(|model| {
+                (
+                    ModelId(model.id.clone()),
+                    Arc::new(BucketSelector::new(model.bucket_config.clone())),
+                )
+            })
+            .collect();
         let decode_gate = DecodeGate::new(config.proxy.decode_dispatch_limit);
         Self {
             config,
@@ -137,7 +157,7 @@ impl AppContext {
             proxy,
             registry,
             policies,
-            bucket_selector,
+            bucket_selectors,
             chat_routing: ChatRouting::Legacy,
             router_inflight_load,
             decode_gate,
@@ -206,13 +226,14 @@ impl AppContext {
     pub fn stub() -> Self {
         Self {
             config: Config {
+                additional_models: Vec::new(),
                 server: crate::config::ServerConfig {
                     host: "x".into(),
                     port: 0,
                     ..Default::default()
                 },
                 observability: Default::default(),
-                model: crate::config::ModelConfig {
+                model: ModelConfig {
                     aliases: Vec::new(),
                     id: "stub-model".into(),
                     tokenizer_path: Some("stub".into()),
@@ -246,7 +267,11 @@ impl AppContext {
             proxy: Arc::new(Proxy::new(std::time::Duration::from_secs(60)).expect("stub proxy")),
             registry: Arc::new(WorkerRegistry::default()),
             policies: Arc::new(PolicyRegistry::default()),
-            bucket_selector: Arc::new(BucketSelector::new(None)),
+            bucket_selectors: [(
+                ModelId("stub-model".into()),
+                Arc::new(BucketSelector::new(None)),
+            )]
+            .into(),
             chat_routing: ChatRouting::Legacy,
             router_inflight_load: RouterInflightLoadRegistry::with_defaults(),
             decode_gate: DecodeGate::new(None),

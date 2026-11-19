@@ -36,6 +36,7 @@ pub const MODEL: &str = "deepseek-v4-tiny";
 /// every caller installs its own `WorkerRegistry`.
 pub fn config() -> Config {
     Config {
+        additional_models: Vec::new(),
         server: ServerConfig {
             host: "0".into(),
             port: 0,

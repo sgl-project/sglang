@@ -40,6 +40,7 @@ async fn errors_with_one_dead_worker(max_attempts: u32) -> usize {
     let w3 = crate::common::mock_worker::MockWorker::start(vec![]).await;
 
     let cfg = Config {
+        additional_models: Vec::new(),
         server: ServerConfig {
             host: "0".into(),
             port: 0,

@@ -124,6 +124,7 @@ async fn spawn_http1_only_worker(hits: Arc<Mutex<usize>>) -> String {
 
 fn config() -> Config {
     Config {
+        additional_models: Vec::new(),
         server: ServerConfig {
             host: "0".into(),
             port: 0,

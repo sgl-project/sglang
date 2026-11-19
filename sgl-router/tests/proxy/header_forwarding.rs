@@ -22,6 +22,7 @@ use tower::ServiceExt;
 async fn forwards_whitelisted_headers_strips_others() {
     let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let cfg = Config {
+        additional_models: Vec::new(),
         server: ServerConfig {
             host: "0".into(),
             port: 0,

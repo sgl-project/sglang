@@ -184,7 +184,7 @@ async fn dispatch<T: Transport>(
     }
     // Only the router chooses DP ranks; a client-supplied rank is never forwarded.
     headers.remove(X_DATA_PARALLEL_RANK);
-    let dp_aware = ctx.config.model.dp_aware && request.accepts_dp_rank();
+    let dp_aware = ctx.model_config(&request.model).dp_aware && request.accepts_dp_rank();
     // The engine gives fan-out item i the room `room + i`, so in PD decode looks
     // for each item on a different prefill rank; one pinned rank would break that.
     let unpin_prefill = dp_aware && decode.is_some() && request.fans_out;
@@ -254,7 +254,13 @@ async fn dispatch<T: Transport>(
     let prefill_load_guards = (
         worker_load_guard,
         active_request_guard,
-        prefill_rank.map(|rank| rank_guard(ctx, &prefill, rank)),
+        prefill_rank.map(|rank| {
+            rank_guard(
+                ctx.model_config(&request.model).dp_rank_policy,
+                &prefill,
+                rank,
+            )
+        }),
     );
 
     // In PD mode, prefill runs independently and decode supplies the client response.
@@ -299,13 +305,17 @@ async fn dispatch<T: Transport>(
             }
             let decode_rank = dp_aware
                 .then(|| {
-                    let rank_tokens = rank_tokens(ctx, &decode);
+                    let rank_tokens = rank_tokens(
+                        ctx,
+                        &decode,
+                        ctx.model_config(&request.model).dp_rank_policy,
+                    );
                     select_dp_rank(
                         &decode,
                         None,
                         &[],
                         &rank_tokens,
-                        ctx.config.model.dp_rank_policy,
+                        ctx.model_config(&request.model).dp_rank_policy,
                     )
                 })
                 .flatten();
@@ -318,7 +328,13 @@ async fn dispatch<T: Transport>(
                     1,
                     request_started_at.elapsed(),
                 ),
-                decode_rank.map(|rank| rank_guard(ctx, &decode, rank)),
+                decode_rank.map(|rank| {
+                    rank_guard(
+                        ctx.model_config(&request.model).dp_rank_policy,
+                        &decode,
+                        rank,
+                    )
+                }),
             );
             let decode_leg = Leg::new(
                 dp_aware,
@@ -744,7 +760,7 @@ fn prompt_dp_rank(
     if worker.dp_ranks() <= 1 {
         return None;
     }
-    let model = &ctx.config.model;
+    let model = ctx.model_config(&request.model);
     let sticky = model.sticky.as_ref().map(|c| c.header_name.as_str());
     let session = model
         .affinity
@@ -760,7 +776,7 @@ fn prompt_dp_rank(
         }
         _ => Vec::new(),
     };
-    let rank_tokens = rank_tokens(ctx, worker);
+    let rank_tokens = rank_tokens(ctx, worker, model.dp_rank_policy);
     select_dp_rank(
         worker,
         key,
@@ -774,8 +790,8 @@ fn prompt_dp_rank(
 /// engine's fresh readings projected by this router's dispatches since them.
 /// Empty under any other policy, and while any rank lacks a fresh reading,
 /// which makes the selector fall back to its in-flight count.
-fn rank_tokens(ctx: &AppContext, worker: &Worker) -> Vec<(u32, u64)> {
-    if ctx.config.model.dp_rank_policy != DpRankPolicy::LeastTokens || worker.dp_ranks() <= 1 {
+fn rank_tokens(ctx: &AppContext, worker: &Worker, policy: DpRankPolicy) -> Vec<(u32, u64)> {
+    if policy != DpRankPolicy::LeastTokens || worker.dp_ranks() <= 1 {
         return Vec::new();
     }
     ctx.engine_reported_load
@@ -785,8 +801,8 @@ fn rank_tokens(ctx: &AppContext, worker: &Worker) -> Vec<(u32, u64)> {
 
 /// Holds the rank slot; stamped under `least_tokens` so later selections can
 /// count it against the engine's last reading.
-fn rank_guard(ctx: &AppContext, worker: &Worker, rank: u32) -> DpRankGuard {
-    if ctx.config.model.dp_rank_policy == DpRankPolicy::LeastTokens {
+fn rank_guard(policy: DpRankPolicy, worker: &Worker, rank: u32) -> DpRankGuard {
+    if policy == DpRankPolicy::LeastTokens {
         worker.dp_rank_timestamped_guard(rank)
     } else {
         worker.dp_rank_guard(rank)

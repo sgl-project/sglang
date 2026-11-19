@@ -52,6 +52,7 @@ fn build_app_context(
     affinity: Option<AffinityConfig>,
 ) -> AppContext {
     let config = Config {
+        additional_models: Vec::new(),
         server: ServerConfig {
             host: "0".into(),
             port: 0,
@@ -1117,4 +1118,86 @@ async fn version_group_capacity_fallback_preserves_decode_limits() {
             "short_first={short_first}, second_full={second_full}"
         );
     }
+}
+
+#[tokio::test]
+async fn models_use_their_own_policy_and_bucket_domains() {
+    use crate::common::mock_worker::MockWorker;
+    let a = MockWorker::start(vec![]).await;
+    let b = MockWorker::start(vec![]).await;
+    let c = MockWorker::start(vec![]).await;
+    let config_for = |id: &str, worker_id: &str| BucketConfig {
+        buckets: vec![bucket(id, BucketStage::Prefill, 0, worker_id)],
+        ttft_slo_policy: Default::default(),
+        tps_slo_policy: Default::default(),
+    };
+    let mut cfg = build_app_context(
+        vec![],
+        config_for("first", "a"),
+        PolicyKind::RoundRobin,
+        None,
+    )
+    .config;
+    let mut second = cfg.model.clone();
+    second.id = "second".into();
+    second.policy = PolicyKind::LoadBased;
+    second.dp_aware = true;
+    let mut second_buckets = config_for("second", "b");
+    second_buckets.buckets[0].worker_ids.push("c".into());
+    second.bucket_config = Some(second_buckets);
+    cfg.additional_models.push(second);
+    let registry = Arc::new(WorkerRegistry::default());
+    for (id, mock) in [("a", &a), ("b", &b), ("c", &c)] {
+        let mut spec = worker_spec(id, mock.url.clone(), WorkerMode::Plain);
+        spec.model_ids.push(ModelId("second".into()));
+        registry
+            .add_with_cb(
+                spec,
+                None,
+                sgl_router::workers::EngineProfile {
+                    dp_ranks: 2,
+                    ..sgl_router::workers::WireProtocol::default().into()
+                },
+            )
+            .unwrap();
+    }
+    let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
+    let policies = Arc::new(build_registry_with_defaults(&cfg).unwrap());
+    let proxy = Arc::new(Proxy::new(Duration::from_secs(5)).unwrap());
+    let ctx = Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies));
+    let busy = ctx.registry.get(&WorkerId("c".into())).unwrap();
+    let _held = busy.load_guard();
+    let app = build_router(ctx);
+    for _ in 0..3 {
+        let response = app.clone().oneshot(Request::builder().method("POST").uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::json!({"model":"second","messages":[{"role":"user","content":"hello"}]}).to_string())).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            b.captured.lock().unwrap().last_body.is_some(),
+            "second model must select its bucket"
+        );
+        assert!(
+            a.captured.lock().unwrap().last_body.is_none(),
+            "default bucket must not receive second model"
+        );
+        assert!(
+            c.captured.lock().unwrap().last_body.is_none(),
+            "load_based must avoid the busy candidate"
+        );
+        assert!(b
+            .captured
+            .lock()
+            .unwrap()
+            .headers
+            .contains_key("x-data-parallel-rank"));
+    }
+
+    let response = app.oneshot(Request::builder().method("POST").uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::json!({"model":"tiny","messages":[{"role":"user","content":"hello"}]}).to_string())).unwrap()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let captured = a.captured.lock().unwrap();
+    assert!(captured.last_body.is_some());
+    assert!(!captured.headers.contains_key("x-data-parallel-rank"));
 }

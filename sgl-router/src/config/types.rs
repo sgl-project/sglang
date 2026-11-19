@@ -3,12 +3,13 @@ use reqwest::header::HeaderValue;
 use serde::Deserialize;
 use std::num::NonZeroU32;
 
-/// Single-model configuration built and validated by [`crate::config::Cli::into_config`].
+/// Model configuration built and validated by [`crate::config::Cli::into_config`].
 #[derive(Debug, Clone)]
 pub struct Config {
     pub server: ServerConfig,
     pub observability: ObservabilityConfig,
     pub model: ModelConfig,
+    pub additional_models: Vec<ModelConfig>,
     /// Discovery mode resolved from CLI options; static URLs are checked by [`Config::validate`].
     pub discovery: DiscoveryBackend,
     pub proxy: ProxyConfig,
@@ -149,7 +150,8 @@ pub enum PolicyKind {
 }
 
 /// Policy used to select decode workers for PD requests.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DecodePolicyKind {
     #[default]
     #[value(name = "power_of_two")]
@@ -160,7 +162,8 @@ pub enum DecodePolicyKind {
 
 /// How `--dp-aware` picks a DP rank that no routing key or cached prefix decides,
 /// which in PD mode is every decode rank.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DpRankPolicy {
     /// The rank with the fewest requests this router has in flight on it.
     #[default]
@@ -455,7 +458,7 @@ impl ModelConfig {
 }
 
 /// External KV Indexer client settings.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct KvIndexerEndpointConfig {
     pub url: String,
     pub query_timeout_ms: u64,
@@ -521,7 +524,7 @@ pub enum CachePrefixProvider {
 }
 
 /// Per-model Cache-Aware configuration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CacheAwareConfig {
     /// Prefix-match source for native Cache-Aware.
     pub prefix_provider: CachePrefixProvider,
