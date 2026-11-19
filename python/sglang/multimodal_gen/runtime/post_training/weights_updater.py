@@ -194,6 +194,8 @@ def _load_weights_into_module(module: torch.nn.Module, weights_iter) -> None:
     with torch.inference_mode():
         restore_weight_snapshot(module)
         model_params = dict(module.named_parameters())
+        if isinstance(module, BaseDiT):
+            weights_iter = _load_non_parameter_weights(module, weights_iter)
         weights_iter = _iter_module_weight_updates(module, weights_iter, model_params)
 
         offload_managers: list = []
@@ -219,6 +221,13 @@ def _load_weights_into_module(module: torch.nn.Module, weights_iter) -> None:
             load_weights_into_model(remaining, model_params)
         else:
             load_weights_into_model(weights_iter, model_params)
+
+
+def _load_non_parameter_weights(module: BaseDiT, weights_iter):
+    """Load the entries ``module`` serves outside named_parameters(); yield the rest."""
+    for name, loaded_weight in weights_iter:
+        if not module.load_non_parameter_weight(name=name, weight=loaded_weight):
+            yield name, loaded_weight
 
 
 def _build_module_weight_name_mapper(module: torch.nn.Module):

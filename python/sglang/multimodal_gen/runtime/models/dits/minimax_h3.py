@@ -45,6 +45,7 @@ from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
     MINIMAX_H3_ADALN_MODALITY_NUM,
     MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT,
+    MINIMAX_H3_PDD_FUSED_HEADS_WEIGHT_NAME_PREFIX,
     MiniMaxH3DiTArchConfig,
     MiniMaxH3DiTConfig,
 )
@@ -1868,20 +1869,52 @@ class MiniMaxH3FinalLayer(nn.Module):
                 f"got {sorted(heads)}"
             )
         steps = heads["video_out.weight"].shape[0]
-        for name in names:
-            projection = getattr(self, name)
-            for suffix, shape in (
-                ("weight", (steps, projection.output_size, projection.input_size)),
-                ("bias", (steps, projection.output_size)),
-            ):
-                key = f"{name}.{suffix}"
-                if steps == 0 or heads[key].shape != shape:
-                    raise ValueError(f"MiniMax-H3 PDD {key} must have shape {shape}")
-                width = projection.output_size_per_partition
-                heads[key] = heads[key].narrow(1, projection.tp_rank * width, width)
-        self._pdd_heads = heads
+        self._pdd_heads = {
+            key: self._narrow_pdd_head_stack(
+                key=key, full_stack=full_stack, num_steps=steps
+            )
+            for key, full_stack in heads.items()
+        }
         self._pdd_device_heads = {}
         logger.info("MiniMax-H3 PDD: %d fused output heads loaded from %s", steps, path)
+
+    def load_pdd_fused_head_stack(self, *, key: str, full_stack: torch.Tensor) -> None:
+        """Replace one loaded head stack with a weight update's.
+
+        ``key`` and ``full_stack`` are an entry of a fused heads file.
+        """
+        heads = self._pdd_heads
+        if heads is None:
+            raise ValueError(
+                f"MiniMax-H3 PDD head update {key!r} reached a model that "
+                "serves no PDD heads"
+            )
+        if key not in heads:
+            raise ValueError(
+                f"MiniMax-H3 PDD head update must be one of {sorted(heads)}, got {key!r}"
+            )
+        loaded_stack = heads[key]
+        tp_shard = self._narrow_pdd_head_stack(
+            key=key, full_stack=full_stack, num_steps=loaded_stack.shape[0]
+        )
+        # An update tensor is a view of the sender's buffer; keep a copy of it.
+        heads[key] = tp_shard.to(
+            device=loaded_stack.device, dtype=loaded_stack.dtype, copy=True
+        )
+        self._pdd_device_heads = {}
+
+    def _narrow_pdd_head_stack(
+        self, *, key: str, full_stack: torch.Tensor, num_steps: int
+    ) -> torch.Tensor:
+        name, suffix = key.rsplit(".", 1)
+        projection = getattr(self, name)
+        shape = (num_steps, projection.output_size)
+        if suffix == "weight":
+            shape += (projection.input_size,)
+        if num_steps == 0 or full_stack.shape != shape:
+            raise ValueError(f"MiniMax-H3 PDD {key} must have shape {shape}")
+        width = projection.output_size_per_partition
+        return full_stack.narrow(1, projection.tp_rank * width, width)
 
     # The PDD head follows the live denoising step in forward context.
     @eager_on_graph
@@ -2160,6 +2193,15 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         self.validate_weight_update_source(weights_path=weights_path)
         cache.weight_files = native_adaln_weight_files(weights_path)
         cache.invalidate()
+
+    def load_non_parameter_weight(self, *, name: str, weight: torch.Tensor) -> bool:
+        if not name.startswith(MINIMAX_H3_PDD_FUSED_HEADS_WEIGHT_NAME_PREFIX):
+            return False
+        self.final_layer.load_pdd_fused_head_stack(
+            key=name.removeprefix(MINIMAX_H3_PDD_FUSED_HEADS_WEIGHT_NAME_PREFIX),
+            full_stack=weight,
+        )
+        return True
 
     def _can_batch_block_adaln(self) -> bool:
         return (

@@ -10,9 +10,15 @@ from unittest.mock import patch
 import torch
 from safetensors.torch import load_file, save_file
 
-from sglang.multimodal_gen.configs.models.dits.minimax_h3 import MiniMaxH3DiTArchConfig
+from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
+    MINIMAX_H3_PDD_FUSED_HEADS_WEIGHT_NAME_PREFIX,
+    MiniMaxH3DiTArchConfig,
+)
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
-from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import MiniMaxH3FinalLayer
+from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
+    MiniMaxH3DiTModel,
+    MiniMaxH3FinalLayer,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
     MINIMAX_H3_SIGMAS_EXTRA_KEY,
 )
@@ -22,6 +28,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.time_request import (
     minimax_h3_time_shift_sigmas,
 )
+from sglang.multimodal_gen.runtime.post_training.weights_updater import WeightsUpdater
 from sglang.multimodal_gen.test.unit.host_sync_guard import CountedUploads
 from sglang.multimodal_gen.tools import build_minimax_h3_pdd_weights as build
 from sglang.test.test_utils import CustomTestCase
@@ -200,6 +207,141 @@ class TestMiniMaxH3PDDOffline(CustomTestCase):
                 json.loads((transformer / "model.safetensors.index.json").read_text()),
                 index,
             )
+
+
+def _make_final_layers(
+    heads_path: Path | None, *, tp_size: int
+) -> list[MiniMaxH3FinalLayer]:
+    """One final layer per TP rank, with the heads file loaded when given."""
+    arch = MiniMaxH3DiTArchConfig(
+        hidden_size=5, latents_dim=6, audio_latents_dim=4, patch_size=(1, 1, 1)
+    )
+    layers = []
+    for rank in range(tp_size):
+        with patch(
+            "sglang.multimodal_gen.runtime.layers.linear.get_tp_group",
+            return_value=SimpleNamespace(world_size=tp_size, rank_in_group=rank),
+        ):
+            layer = MiniMaxH3FinalLayer(
+                arch, None, prefix="final_layer", use_adaln_cache=True
+            )
+        if heads_path is not None:
+            layer.load_pdd_fused_heads(str(heads_path))
+        layers.append(layer)
+    return layers
+
+
+def _project_on_each_rank(
+    layers: list[MiniMaxH3FinalLayer], *, step: int
+) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    h = torch.arange(15, dtype=torch.float32).reshape(3, 5)
+    with set_forward_context(step, None):
+        return [layer._project(h) for layer in layers]
+
+
+def _make_transformer_updater(
+    final_layer: MiniMaxH3FinalLayer,
+) -> tuple[WeightsUpdater, MiniMaxH3DiTModel]:
+    model = MiniMaxH3DiTModel.__new__(MiniMaxH3DiTModel)
+    torch.nn.Module.__init__(model)
+    model.adaln_cache = None
+    model.final_layer = final_layer
+    model.register_parameter("probe", torch.nn.Parameter(torch.zeros(2)))
+    pipeline = SimpleNamespace(modules={"transformer": model}, model_path="")
+    return WeightsUpdater(pipeline), model
+
+
+class TestMiniMaxH3PDDHeadWeightUpdate(CustomTestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name)
+        self.loaded_path = root / "loaded.safetensors"
+        save_file(_make_heads(), str(self.loaded_path))
+        self.updated_heads = {
+            key: 1 - 2 * stack for key, stack in _make_heads().items()
+        }
+        self.updated_path = root / "updated.safetensors"
+        save_file(self.updated_heads, str(self.updated_path))
+
+    def test_head_stack_update_serves_what_loading_it_serves(self):
+        """On each TP rank, and after a forward already holds the old stacks."""
+        layers = _make_final_layers(self.loaded_path, tp_size=2)
+        _project_on_each_rank(layers, step=0)
+
+        for layer in layers:
+            for key, full_stack in self.updated_heads.items():
+                layer.load_pdd_fused_head_stack(key=key, full_stack=full_stack)
+
+        layers_loaded_updated = _make_final_layers(self.updated_path, tp_size=2)
+        for step in (0, 7):
+            with self.subTest(step=step):
+                torch.testing.assert_close(
+                    _project_on_each_rank(layers, step=step),
+                    _project_on_each_rank(layers_loaded_updated, step=step),
+                    rtol=0,
+                    atol=0,
+                )
+
+    def test_head_stack_update_keeps_its_own_copy(self):
+        """The update tensor is the sender's buffer, which the sender reuses."""
+        layers = _make_final_layers(self.loaded_path, tp_size=1)
+        for key, full_stack in self.updated_heads.items():
+            sender_buffer = full_stack.clone()
+            layers[0].load_pdd_fused_head_stack(key=key, full_stack=sender_buffer)
+            sender_buffer.zero_()
+
+        torch.testing.assert_close(
+            _project_on_each_rank(layers, step=3),
+            _project_on_each_rank(
+                _make_final_layers(self.updated_path, tp_size=1), step=3
+            ),
+            rtol=0,
+            atol=0,
+        )
+
+    def test_tensor_update_loads_head_stacks_beside_parameters(self):
+        layers = _make_final_layers(self.loaded_path, tp_size=1)
+        updater, model = _make_transformer_updater(layers[0])
+        named_tensors = [
+            (f"{MINIMAX_H3_PDD_FUSED_HEADS_WEIGHT_NAME_PREFIX}{key}", full_stack)
+            for key, full_stack in self.updated_heads.items()
+        ]
+        named_tensors.insert(1, ("probe", torch.ones(2)))
+
+        ok, message = updater.update_weights_from_tensor(named_tensors)
+
+        self.assertTrue(ok, message)
+        torch.testing.assert_close(
+            _project_on_each_rank(layers, step=3),
+            _project_on_each_rank(
+                _make_final_layers(self.updated_path, tp_size=1), step=3
+            ),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(model.probe, torch.ones(2))
+
+    def test_tensor_update_fails_on_a_head_stack_it_cannot_load(self):
+        """Skipping the stack would leave the engine serving the heads it had."""
+        prefix = MINIMAX_H3_PDD_FUSED_HEADS_WEIGHT_NAME_PREFIX
+        full_stack = self.updated_heads["video_out.weight"]
+        cases = (
+            (None, "video_out.weight", full_stack, "serves no PDD heads"),
+            (self.loaded_path, "video_out.weight", full_stack[:6], "must have shape"),
+            (self.loaded_path, "video_out.scale", full_stack, "must be one of"),
+        )
+        for heads_path, key, update_tensor, expected_message in cases:
+            with self.subTest(expected_message=expected_message):
+                layers = _make_final_layers(heads_path, tp_size=1)
+                updater, _ = _make_transformer_updater(layers[0])
+
+                ok, message = updater.update_weights_from_tensor(
+                    [(f"{prefix}{key}", update_tensor)]
+                )
+
+                self.assertFalse(ok)
+                self.assertIn(expected_message, message)
 
 
 if __name__ == "__main__":
