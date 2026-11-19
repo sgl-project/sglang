@@ -1,6 +1,7 @@
 """Qwen-Image adapters for the ComfyUI DiT-forward contract."""
 
 import comfy.ldm.common_dit
+import torch
 
 from .adapter import ComfyUIModelAdapter, PackedForward
 from .base import SGLDiffusionExecutor
@@ -83,17 +84,37 @@ class QwenImageEditAdapter(QwenImageAdapter):
         context,
         attention_mask=None,
         ref_latents=None,
+        ref_latents_method=None,
         additional_t_cond=None,
         transformer_options=None,
         **kwargs,
     ) -> PackedForward:
+        # The worker has no path for these; forwarding would silently ignore them.
+        if attention_mask is not None:
+            raise ValueError(
+                "QwenImageEditAdapter does not forward ComfyUI's attention_mask "
+                "to the worker; it would silently run without it."
+            )
+        if additional_t_cond is not None:
+            raise ValueError(
+                "QwenImageEditAdapter does not forward ComfyUI's "
+                "additional_t_cond to the worker; it would be silently ignored."
+            )
+        if ref_latents_method is not None and ref_latents_method != "index":
+            raise ValueError(
+                f"QwenImageEditAdapter does not support ref_latents_method="
+                f"{ref_latents_method!r}; the worker always uses 'index'."
+            )
         packed = super().pack(x, timestep, context, **kwargs)
         if ref_latents:
-            pack_ref, orig_ref_shape = self._pack_latents(ref_latents[0])
-            packed.extra_req["image_latent"] = pack_ref
-            packed.extra_req["vae_image_sizes"] = [
-                (orig_ref_shape[-1], orig_ref_shape[-2])
-            ]
+            packed_refs = []
+            vae_image_sizes = []
+            for ref_latent in ref_latents:
+                pack_ref, orig_ref_shape = self._pack_latents(ref_latent)
+                packed_refs.append(pack_ref)
+                vae_image_sizes.append((orig_ref_shape[-1], orig_ref_shape[-2]))
+            packed.extra_req["image_latent"] = torch.cat(packed_refs, dim=1)
+            packed.extra_req["vae_image_sizes"] = vae_image_sizes
         return packed
 
 

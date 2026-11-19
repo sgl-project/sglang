@@ -24,17 +24,14 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
+    pad_mm_tokens,
 )
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputs,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaForCausalLM
+from sglang.srt.multimodal.modality import Modality
 
 
 class AudioLanguageAdapter(nn.Module):
@@ -243,8 +240,6 @@ class VoxtralForConditionalGeneration(nn.Module):
         # Mel filter bank for raw waveform -> mel spectrogram
         self._init_mel_filters(audio_config)
 
-        self.pattern = MultiModalityDataPaddingPatternMultimodalTokens()
-
     def _init_mel_filters(self, audio_config: PretrainedConfig):
         """Initialize mel filter bank for mel spectrogram computation."""
         self._window_size = getattr(audio_config, "window_size", 400)
@@ -339,7 +334,7 @@ class VoxtralForConditionalGeneration(nn.Module):
         return results
 
     def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
-        return self.pattern.pad_input_tokens(input_ids, mm_inputs)
+        return pad_mm_tokens(input_ids, mm_inputs)
 
     def get_audio_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         """Encode audio waveforms -> downsample -> project."""

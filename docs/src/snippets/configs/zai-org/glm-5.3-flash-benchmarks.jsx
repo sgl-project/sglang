@@ -211,6 +211,27 @@ export const benchmarks = [
   },
   // TODO: speed measured with adaptive MTP; re-measure with fixed MTP 5/1/6.
   {
+    match: { hw: "tpu7x", strategy: "low-latency", quant: "fp8" },
+    sglang_version: "sglang-torchtpu 46a6f50291",
+    latencyPercentile: "P50",
+    speed: [
+      {
+        workload: {
+          dataset: "random",
+          isl: 8192,
+          osl: 1024,
+          max_concurrency: 1,
+          num_prompts: 8,
+        },
+        ttft_ms: 363.43,
+        tpot_ms: 2.47,
+        tokens_per_sec_per_gpu: 794.59,
+      },
+    ],
+    notes:
+      "Measured on one TPU7x host (4 chips, TP 8) running the published TPU7x command on sglang-torchtpu main 46a6f50291 (libtpu 0.0.50, torch-tpu 0.2.0rc4), zai-org/GLM-5.3-Flash FP8 with FP8 KV: DSA on the Pallas sparse MLA kernels, MTP 3/1/4 on the chain spec worker with SGLANG_SIMULATE_ACC_LEN=3.4 and SGLANG_SIMULATE_ACC_METHOD=match-expected (accept length 3.41 in the bench summary). 8 random requests at 8,192 input / 1,024 output tokens and concurrency 1, after two discarded warmups, radix cache disabled: 353.15 output tok/s and 3,178.36 total tok/s; TTFT and TPOT are medians (TPOT mean 2.47 ms, P99 2.55 ms). Simulated accept length makes this a throughput-mechanism number. No compile happened after warmup.",
+  },
+  {
     match: { hw: "h100", strategy: "low-latency" },
     sglang_version: "f040cc72e6",
     latencyPercentile: "Mean",
@@ -265,6 +286,12 @@ export const benchmarks = [
     notes:
       "Full GSM8K (all 1,319 problems) on 8x H200 (TP8/EP8) with zai-org/GLM-5.3-Flash at f040cc72e6: 97.35% for the recommended selection; 97.19-97.57% across all 4 measured selections. Run with `sgl-eval run gsm8k --base-url http://localhost:30000/v1 --num-threads 32 --max-tokens 32768`; gsm8k's registered default leaves thinking off, so these are non-thinking numbers and are not directly comparable to the GB300 rows above. Accuracy only, no speed measurement.",
   },
+  // BF16 + Q8 sparse prefill has only a relative A/B so far; these empty entries outrank the hw + strategy rows above.
+  // A defaultAccuracy added to glm-5.3-flash.jsx would show on them as if it were measured.
+  { match: { hw: "h200", strategy: "low-latency", kvDsaPair: "bf16-q8-prefill" } },
+  { match: { hw: "h200", strategy: "high-throughput", kvDsaPair: "bf16-q8-prefill" } },
+  { match: { hw: "h100", strategy: "low-latency", kvDsaPair: "bf16-q8-prefill" } },
+  { match: { hw: "h100", strategy: "high-throughput", kvDsaPair: "bf16-q8-prefill" } },
   // TODO: speed measured on the earlier TP8/EP8 deep_gemm command with adaptive MTP; re-measure on the current recipe.
   {
     match: { hw: "b200", strategy: "low-latency" },

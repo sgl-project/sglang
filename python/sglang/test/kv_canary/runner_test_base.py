@@ -74,6 +74,7 @@ def make_manager(
     req_pool: SimpleNamespace | None = None,
     per_forward_verify_capacity: int = 16,
     speculative_num_steps: int = 1,
+    is_eagle_draft_decode: bool = False,
 ) -> CanaryManager:
     if config is None:
         config = make_config()
@@ -95,6 +96,7 @@ def make_manager(
             per_forward_write_entry_capacity=8,
         ),
         speculative_num_steps=speculative_num_steps,
+        is_eagle_draft_decode=is_eagle_draft_decode,
     )
 
 

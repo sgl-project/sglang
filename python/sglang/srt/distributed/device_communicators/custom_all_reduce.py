@@ -39,6 +39,8 @@ logger = logging.getLogger(__name__)
 
 class CustomAllreduce:
     _SUPPORTED_WORLD_SIZES = [2, 4, 6, 8]
+    # The kernels throw on other dtypes (csrc/allreduce/custom_all_reduce.cu, .hip).
+    _SUPPORTED_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
     _MAX_CAR_SIZE = 8192 * 1024
     if _is_hip:
         # crossover is at 16MB buffer size for ROCm
@@ -53,6 +55,7 @@ class CustomAllreduce:
         group: ProcessGroup,
         device: Union[int, str, torch.device],
         max_size=_MAX_CAR_SIZE,
+        enable_register_for_capturing: bool = True,
     ) -> None:
         """
         Args:
@@ -60,6 +63,8 @@ class CustomAllreduce:
                 default process group.
             device: the device to bind the CustomAllreduce to. If None,
                 it will be bind to f"cuda:{local_rank}".
+            enable_register_for_capturing: directly register graph-owned input
+                buffers instead of staging them through the shared input buffer.
         It is the caller's responsibility to make sure each communicator
         is bind to a unique device, and all communicators in this group
         are in the same node.
@@ -142,6 +147,9 @@ class CustomAllreduce:
         self.disabled = False
         self.original_disabled = False  # Ensure original_disabled == disabled
         self.tms_cudagraph = envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
+        self.enable_register_for_capturing = (
+            enable_register_for_capturing and not self.tms_cudagraph
+        )
 
     @staticmethod
     def create_shared_buffer(
@@ -260,6 +268,8 @@ class CustomAllreduce:
     def should_custom_ar(self, inp: torch.Tensor):
         if self.disabled:
             return False
+        if inp.dtype not in self._SUPPORTED_DTYPES:
+            return False
         inp_size = inp.numel() * inp.element_size()
         # custom allreduce requires input byte size to be multiples of 16
         if inp_size % 16 != 0:
@@ -293,18 +303,47 @@ class CustomAllreduce:
                 )
         elif self.use_amd_deterministic_impl:
             inp_size = inp.numel() * inp.element_size()
-            if inp_size < self.max_size:
+            if inp_size <= self.max_size:
                 reg_buffer = self.buffer.view(inp.dtype)[: inp.numel()]
                 ops.deterministic_all_reduce_unreg(self._ptr, inp, reg_buffer, out)
             else:
-                self.register_buffer(inp)
-                ops.deterministic_all_reduce_reg(self._ptr, inp, out)
+                self._deterministic_all_reduce_oversized(inp, out)
         else:  # normal AMD ROCm path
             if registered:
                 ops.all_reduce_reg(self._ptr, inp, out)
             else:
                 ops.all_reduce_unreg(self._ptr, inp, self.buffer, out)
         return out
+
+    def _deterministic_all_reduce_oversized(
+        self, inp: torch.Tensor, out: torch.Tensor
+    ) -> None:
+        """Reduce an input larger than `self.buffer` one piece at a time.
+
+        Registering the input instead would be cheaper per call, but each
+        registration permanently consumes a `rank_data` slot, so a server that
+        keeps seeing oversized inputs (a large `chunked_prefill_size` is enough
+        to produce one per forward pass) eventually dies with "Rank data buffer
+        is overflowed". Splitting cannot change the result of any element: an
+        all-reduce is elementwise, and the 1-stage kernel accumulates ranks in
+        a fixed order regardless of how many elements it is given.
+        """
+        # `should_custom_ar` only guarantees weak contiguity, so alias the flat
+        # memory span the kernel reads rather than going through `view`.
+        flat_inp = inp.as_strided((inp.numel(),), (1,))
+        flat_out = out.as_strided((out.numel(),), (1,))
+        reg_buffer = self.buffer.view(inp.dtype)
+        # `max_size` is a multiple of 16 bytes, so every piece keeps the 16-byte
+        # size and alignment the kernel requires.
+        chunk = self.max_size // inp.element_size()
+        for beg in range(0, flat_inp.numel(), chunk):
+            piece = flat_inp[beg : beg + chunk]
+            ops.deterministic_all_reduce_unreg(
+                self._ptr,
+                piece,
+                reg_buffer[: piece.numel()],
+                flat_out[beg : beg + chunk],
+            )
 
     def custom_all_reduce(self, input: torch.Tensor) -> Optional[torch.Tensor]:
         """The main allreduce API that provides support for cuda graph."""
@@ -313,7 +352,9 @@ class CustomAllreduce:
             return None
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
-                return self._all_reduce_impl(input, registered=not self.tms_cudagraph)
+                return self._all_reduce_impl(
+                    input, registered=self.enable_register_for_capturing
+                )
             else:
                 # Could be warmup OR piecewise cuda graph split op execution.
                 # In piecewise cuda graph, split ops run eagerly outside the graph
@@ -348,14 +389,19 @@ def dispatch_custom_allreduce(
     """Return the CustomAllreduce class to use (aiter on ROCm if enabled).
 
     On AMD with 1-stage AR enabled, use sglang's CustomAllreduce.
-    Otherwise use AiterCustomAllreduce if available.
+    Otherwise use AiterCustomAllreduce if available. Either is built for copy-in
+    graph capture when DP lanes may replay different graphs
+    (see _enable_register_for_capturing).
 
     On CUDA, the JIT-compiled v2 implementation is used by default.
     Set SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2=0 to fall back to the legacy CustomAllreduce.
-    Multi-node v2 is admitted only for a single NVLink clique (see
-    can_use_custom_all_reduce_v2); other cross-node groups fall back to NCCL.
+    On ROCm, v2 is opt-in: set SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2=1.
+    Multi-node v2 is admitted only for a single NVLink clique, or on ROCm a
+    single gfx1250 fabric clique (see can_use_custom_all_reduce_v2); other
+    cross-node groups fall back to NCCL.
     """
-    if _is_cuda and envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.get():
+    use_v2 = envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2
+    if (_is_cuda and use_v2.get()) or (_is_hip and use_v2.is_set() and use_v2.get()):
         from .custom_all_reduce_v2 import (
             CustomAllReduceV2,
             can_use_custom_all_reduce_v2,
@@ -369,6 +415,8 @@ def dispatch_custom_allreduce(
         return CustomAllreduce
 
     assert _is_hip
+
+    enable_register_for_capturing = _enable_register_for_capturing()
 
     if envs.SGLANG_USE_1STAGE_ALLREDUCE.is_set():
         if envs.SGLANG_USE_1STAGE_ALLREDUCE.get():
@@ -387,7 +435,10 @@ def dispatch_custom_allreduce(
     # On AMD with 1-stage AR, use sglang's CustomAllreduce
     # (AiterCustomAllreduce doesn't have deterministic_all_reduce method)
     if _use_amd_deterministic_impl():
-        return CustomAllreduce
+        return partial(
+            CustomAllreduce,
+            enable_register_for_capturing=enable_register_for_capturing,
+        )
 
     if get_bool_env_var("SGLANG_USE_AITER_AR", default="true"):
         try:
@@ -396,10 +447,9 @@ def dispatch_custom_allreduce(
             )
 
             logger.info("[AR] Using AiterCustomAllreduce (AMD default)")
-            tms_cudagraph = envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
             return partial(
                 AiterCustomAllreduce,
-                enable_register_for_capturing=not tms_cudagraph,
+                enable_register_for_capturing=enable_register_for_capturing,
             )
         except ImportError as e:
             logger.warning(
@@ -407,9 +457,50 @@ def dispatch_custom_allreduce(
                 "falling back to sglang CustomAllreduce. Details: %s",
                 e,
             )
-            return CustomAllreduce
+            return partial(
+                CustomAllreduce,
+                enable_register_for_capturing=enable_register_for_capturing,
+            )
 
-    return CustomAllreduce
+    return partial(
+        CustomAllreduce,
+        enable_register_for_capturing=enable_register_for_capturing,
+    )
+
+
+def _enable_register_for_capturing() -> bool:
+    """Whether custom AR may bind graph-owned input pointers directly.
+
+    DSA DP-attention lanes may replay different decode graphs at the same time.
+    Direct registration bakes a peer-pointer tuple for one captured graph into
+    each custom-AR call. If another rank replays a different graph, that tuple
+    still points at the peer buffer from the original graph and reads stale
+    data. Copy-in uses one pre-registered address per rank across every graph,
+    so independently selected graph variants remain compatible.
+    """
+    if envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get():
+        return False
+
+    from sglang.srt.runtime_context import (
+        attention_backends,
+        get_context,
+        get_parallel,
+    )
+
+    # Before publish there is no backend to check; raising here would make the
+    # caller drop custom AR for the group.
+    if not get_context().is_config_namespace_published("exec"):
+        return True
+
+    _prefill_backend, decode_backend = attention_backends()
+    # "nsa" is the deprecated alias for "dsa".
+    if get_parallel().attn_dp_enabled and decode_backend in ("dsa", "nsa"):
+        logger.info(
+            "[AR] DSA with DP attention: custom all-reduce, all-gather and "
+            "reduce-scatter use copy-in buffers during CUDA graph capture"
+        )
+        return False
+    return True
 
 
 def _use_amd_deterministic_impl() -> bool:

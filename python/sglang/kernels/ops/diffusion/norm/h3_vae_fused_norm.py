@@ -7,9 +7,6 @@ promotes the residual to FP32, so later layers carry an FP32 residual and an
 FP16 attention/FFN update. ``h3_vae_scale_add_rmsnorm`` does the add and the
 next RMSNorm in one launch: the sum stays in registers for the variance, and
 the stored residual matches the eager FP32 add.
-
-``h3_vae_qk_rmsnorm_rope`` is the affine-free head-64 path: RMSNorm, round to
-the activation dtype, then partial NeoX RoPE on the first 48 channels.
 """
 
 from __future__ import annotations
@@ -77,59 +74,6 @@ def _scale_add_rmsnorm_kernel(
     rstd = tl.rsqrt(tl.sum(acc * acc, axis=0) / D + eps)
     weight = tl.load(weight_ptr + cols, mask=mask, other=0.0).to(tl.float32)
     tl.store(out_ptr + row * D + cols, acc * rstd * weight, mask=mask)
-
-
-@triton.jit
-def _qk_rmsnorm_rope_kernel(
-    q_ptr,
-    k_ptr,
-    qo_ptr,
-    ko_ptr,
-    cos_ptr,
-    sin_ptr,
-    stride_qb,
-    stride_qs,
-    stride_qh,
-    stride_kb,
-    stride_ks,
-    stride_kh,
-    seq_len,
-    n_heads,
-    eps,
-):
-    row = tl.program_id(0).to(tl.int64)
-    heads = n_heads
-    token = row // heads
-    head = row % heads
-    seq = token % seq_len
-    batch = token // seq_len
-    cols = tl.arange(0, 64)
-    rope_mask = cols < 48
-    q_base = q_ptr + batch * stride_qb + seq * stride_qs + head * stride_qh
-    k_base = k_ptr + batch * stride_kb + seq * stride_ks + head * stride_kh
-    q = tl.load(q_base + cols).to(tl.float32)
-    k = tl.load(k_base + cols).to(tl.float32)
-    q = (q * tl.rsqrt(tl.sum(q * q, axis=0) / 64 + eps)).to(tl.float16)
-    k = (k * tl.rsqrt(tl.sum(k * k, axis=0) / 64 + eps)).to(tl.float16)
-    cos = tl.load(cos_ptr + seq * 48 + cols, mask=rope_mask, other=0.0).to(tl.float16)
-    sin = tl.load(sin_ptr + seq * 48 + cols, mask=rope_mask, other=0.0).to(tl.float16)
-    # NeoX rotate-half: [-x2, x1] on the first 48 channels.
-    src = tl.where(cols < 24, cols + 24, cols - 24)
-    sign = tl.where(cols < 24, -1.0, 1.0)
-    q_rot = (tl.gather(q.to(tl.float32), src, 0) * sign).to(tl.float16)
-    k_rot = (tl.gather(k.to(tl.float32), src, 0) * sign).to(tl.float16)
-    yq = (
-        (q.to(tl.float32) * cos.to(tl.float32)).to(tl.float16).to(tl.float32)
-        + (q_rot.to(tl.float32) * sin.to(tl.float32)).to(tl.float16).to(tl.float32)
-    ).to(tl.float16)
-    yk = (
-        (k.to(tl.float32) * cos.to(tl.float32)).to(tl.float16).to(tl.float32)
-        + (k_rot.to(tl.float32) * sin.to(tl.float32)).to(tl.float16).to(tl.float32)
-    ).to(tl.float16)
-    yq = tl.where(rope_mask, yq, q)
-    yk = tl.where(rope_mask, yk, k)
-    tl.store(qo_ptr + row * 64 + cols, yq)
-    tl.store(ko_ptr + row * 64 + cols, yk)
 
 
 def _out_kind(dtype: torch.dtype) -> int:
@@ -239,61 +183,3 @@ def h3_vae_scale_add_rmsnorm(
     if inplace:
         return residual, normed.view(out_shape)
     return residual_out, normed.view(out_shape)
-
-
-def h3_vae_qk_rmsnorm_rope(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    eps: float,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor] | None:
-    """Affine-free RMSNorm plus partial NeoX RoPE for head 64 / rotary 48.
-
-    Returns None when the tensors are outside that contract so the caller can
-    keep the unfused norm and RoPE.
-    """
-    if (
-        not query.is_cuda
-        or query.shape != key.shape
-        or query.dtype != key.dtype
-        or query.dtype != torch.float16
-        or query.dim() != 4
-        or query.shape[-1] != 64
-        or query.stride(-1) != 1
-        or key.stride(-1) != 1
-        or cos.shape != sin.shape
-        or cos.dim() != 2
-        or cos.shape[-1] != 48
-        or cos.shape[0] != query.shape[1]
-        or cos.device != query.device
-        or sin.device != query.device
-        or key.device != query.device
-    ):
-        return None
-    batch, seq_len, n_heads, _ = query.shape
-    rows = batch * seq_len * n_heads
-    if rows == 0:
-        return None
-    query_out = torch.empty(rows, 64, device=query.device, dtype=query.dtype)
-    key_out = torch.empty(rows, 64, device=key.device, dtype=key.dtype)
-    _qk_rmsnorm_rope_kernel[(rows,)](
-        query,
-        key,
-        query_out,
-        key_out,
-        cos.contiguous(),
-        sin.contiguous(),
-        query.stride(0),
-        query.stride(1),
-        query.stride(2),
-        key.stride(0),
-        key.stride(1),
-        key.stride(2),
-        seq_len,
-        n_heads,
-        float(eps),
-        num_warps=1,
-    )
-    view = (batch, seq_len, n_heads, 64)
-    return query_out.view(view), key_out.view(view)
