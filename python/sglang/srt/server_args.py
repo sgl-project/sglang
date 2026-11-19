@@ -36,9 +36,8 @@ from sglang.srt.arg_groups.arg_utils import (
 from sglang.srt.arg_groups.argparse_actions import (
     DeprecatedAction,
     DeprecatedAliasStoreAction,
-    DeprecatedChoiceToFlagAction,
-    DeprecatedStoreTrueAction,
 )
+from sglang.srt.arg_groups.choices import reject_removed_choice
 from sglang.srt.arg_groups.model_override_base import (
     ep_joiner_of,
     ep_scale_joiner_of,
@@ -112,6 +111,7 @@ from sglang.srt.arg_groups.choices import (  # noqa: F401
     GRAMMAR_BACKEND_CHOICES,
     LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
     LOAD_FORMAT_CHOICES,
+    LORA_BACKEND_CHOICES,
     MOE_RUNNER_BACKEND_CHOICES,
     MXFP8_MOE_RUNNER_BACKEND_CHOICES,
     QUANTIZATION_CHOICES,
@@ -218,29 +218,46 @@ def _plain(value: Any) -> Any:
     return copy.deepcopy(value)
 
 
+# CLI flags removed in SGLang 1.0, each with what to pass instead. They stay
+# registered only to stop a launch that still passes one with that message.
+REMOVED_FLAGS = {
+    "--disable-cuda-graph": "use --disable-decode-cuda-graph "
+    "--disable-prefill-cuda-graph",
+    "--enable-dp-attention": "use --attn-dp-size <N> instead of "
+    "--dp-size <N> --enable-dp-attention",
+    "--monokernel-backend": "use --enable-amd-monokernel instead of "
+    "--monokernel-backend amd, and --enable-nvidia-megakernel instead of "
+    "--monokernel-backend msa",
+    "--enable-flashinfer-allreduce-fusion": "use "
+    "--flashinfer-allreduce-fusion-backend auto",
+    "--disable-fast-image-processor": "use --image-processor-backend pil",
+    "--disable-outlines-disk-cache": "it had no effect, drop it",
+    "--show-time-cost": "it had no effect, drop it",
+    "--triton-attention-reduce-in-fp32": "it had no effect, drop it",
+}
+
+
+def reject_removed_kwargs(server_args_class: type, kwargs: dict) -> None:
+    """Stop on a keyword for a flag in `REMOVED_FLAGS` that is no longer a
+    field, naming what to use, instead of the constructor's generic error."""
+    for key in kwargs:
+        flag = "--" + key.replace("_", "-")
+        if flag in REMOVED_FLAGS and key not in server_args_class.__struct_fields__:
+            raise TypeError(f"{key} was removed in SGLang 1.0; {REMOVED_FLAGS[flag]}.")
+
+
 class ServerArgs:
     """Raw server configuration, sealed when resolution starts.
 
     Add fields to the matching namespace in ``arg_groups/fields/`` using
     ``A[T, help]`` or ``A[T, Arg(...)]``; see ``arg_utils.Arg`` for CLI metadata.
-    Only dynamic choices, deprecated flags, and ``--config`` need manual
+    Only dynamic choices, removed flags, and ``--config`` need manual
     registration in ``add_cli_args``. ``POSITIONAL_FIELD_ORDER`` preserves
     the positional constructor signature when these namespaces are assembled.
     """
 
     def __post_init__(self):
         """Leave construction unresolved; launchers and publishers call ``resolve_once``."""
-        for name in (
-            "disable_outlines_disk_cache",
-            "show_time_cost",
-            "triton_attention_reduce_in_fp32",
-        ):
-            if getattr(self, name) is not None:
-                logger.warning(
-                    "'%s' is deprecated and has no effect. It will be removed "
-                    "in a future release.",
-                    name,
-                )
 
     def resolve_once(self) -> None:
         """Resolve once, preserving declarations across pickling to child processes.
@@ -325,19 +342,16 @@ class ServerArgs:
     def resolved_dict(self) -> dict[str, Any]:
         """Serialize resolved field values, expanding nested records and excluding bookkeeping.
 
-        One exception: the deprecated `enable_dp_attention` reports whether an
-        attention-DP width was configured, for clients that still read it from
-        `/server_info`. Resolution leaves the field false. It reports the width
-        rather than `attn_dp_enabled`, whose elastic scale-joiner arm is true at
-        width one: a dump carrying that would fold the joiner's replicas into
-        attention-DP groups when it is read back.
+        One addition: `enable_dp_attention`, no longer a field, reports whether
+        an attention-DP width was configured, for clients that still read it
+        from `/server_info`. It reports the width rather than `attn_dp_enabled`,
+        whose elastic scale-joiner arm is true at width one.
         """
 
         resolved = {
             field.name: _plain(resolution_result(self, field.name))
             for field in record_fields(type(self))
         }
-        # TODO: drop together with `--enable-dp-attention` after 2026-12-31.
         resolved["enable_dp_attention"] = resolving_view(self).attn_dp_size > 1
         return resolved
 
@@ -355,7 +369,7 @@ class ServerArgs:
     # construction in model_runner_kv_cache_mixin._init_pools.
 
     def _unified_memory_pd_transfer_backends(self) -> set[str]:
-        return {"mooncake"}
+        return {"mooncake", "nixl"}
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -387,7 +401,7 @@ class ServerArgs:
         tool_call_parser_choices = _tool_call_parser_choices()
         parser.add_argument(
             "--tool-call-parser",
-            type=str,
+            type=reject_removed_choice("tool_call_parser"),
             choices=["auto"] + tool_call_parser_choices,
             default=_declared_default("tool_call_parser"),
             help=f"Specify the parser for handling tool-call interactions. "
@@ -414,36 +428,15 @@ class ServerArgs:
             help="Read CLI options from a config file. Must be a YAML file with configuration options.",
         )
 
-        # --- Deprecated argument registrations ---
-        # `disable_cuda_graph` is `no_cli=True`, so this deprecated spelling is
-        # its only command-line entry point.
-        parser.add_argument(
-            "--disable-cuda-graph",
-            action=DeprecatedStoreTrueAction,
-            new_flag="--cuda-graph-backend-{decode,prefill}=disabled",
-            help="Deprecated. Use --cuda-graph-backend-{decode,prefill}=disabled instead.",
-        )
-        # `enable_dp_attention` is `no_cli=True` too; resolution turns it into
-        # `attn_dp_size`. TODO: remove the flag and the field after 2026-12-31.
-        parser.add_argument(
-            "--enable-dp-attention",
-            action=DeprecatedStoreTrueAction,
-            new_flag="--attn-dp-size <dp-size>",
-            help="Deprecated. Use --attn-dp-size <dp-size> instead of "
-            "--dp-size <dp-size> --enable-dp-attention.",
-        )
-        parser.add_argument(
-            "--monokernel-backend",
-            action=DeprecatedChoiceToFlagAction,
-            dest="monokernel_backend",
-            flags={
-                "amd": ("enable_amd_monokernel", "--enable-amd-monokernel"),
-                "msa": ("enable_nvidia_megakernel", "--enable-nvidia-megakernel"),
-            },
-            help="Deprecated. Use --enable-amd-monokernel instead of "
-            "--monokernel-backend amd, and --enable-nvidia-megakernel instead of "
-            "--monokernel-backend msa.",
-        )
+        for flag, replacement in REMOVED_FLAGS.items():
+            parser.add_argument(
+                flag,
+                action=DeprecatedAction,
+                nargs="?",
+                default=argparse.SUPPRESS,
+                error_message=f"{flag} was removed in SGLang 1.0; {replacement}.",
+                help=argparse.SUPPRESS,
+            )
         # `mamba_max_states_per_path` is `no_cli=True`; any cap still applies.
         parser.add_argument(
             "--mamba-max-states-per-path",
@@ -453,23 +446,6 @@ class ServerArgs:
             type=int,
             default=None,
             help="Deprecated. Use --hybrid-cache-checkpoints-level 2 instead.",
-        )
-        for flag in (
-            "--disable-outlines-disk-cache",
-            "--show-time-cost",
-            "--triton-attention-reduce-in-fp32",
-        ):
-            parser.add_argument(
-                flag,
-                action=DeprecatedAction,
-                default=argparse.SUPPRESS,
-                help="Deprecated. Has no effect.",
-            )
-        parser.add_argument(
-            "--enable-flashinfer-allreduce-fusion",
-            action="store_true",
-            help="(Deprecated: use --flashinfer-allreduce-fusion-backend=auto) "
-            "Enable FlashInfer allreduce fusion with Residual RMSNorm.",
         )
 
     @classmethod
