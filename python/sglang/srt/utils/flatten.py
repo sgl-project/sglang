@@ -14,22 +14,47 @@ from array import array
 from itertools import chain, compress
 from typing import List
 
+# How one row of a request's hidden states nests in ``meta_info["hidden_states"]``.
+# ``HIDDEN_ROW_*`` in the Rust side's ``message/response.rs`` holds the same values.
+HIDDEN_ROW_WHOLE = 0  # the value itself is this one vector (``"last"``)
+HIDDEN_ROW_VECTOR = 1  # an item that is one vector (a decode step)
+HIDDEN_ROW_MATRIX_FIRST = 2  # first row of an item that is a matrix (a prefill step)
+HIDDEN_ROW_MATRIX_NEXT = 3  # a later row of that matrix
+
 
 def flatten_hidden(hs):
-    """Flatten one request's hidden states into a flat ``val`` buffer plus a
-    per-row ``lens`` vector (one row per output position). Each top-level element
-    becomes a single row; the Rust side reshapes back to ``list[list[float]]``,
-    matching ``meta_info["hidden_states"]``'s common per-position-vector shape.
+    """Flatten one request's hidden states into a flat ``val`` buffer, a
+    per-row ``lens`` vector and a per-row ``kinds`` vector, from which the Rust
+    side rebuilds the value with the nesting it has here.
+
+    ``return_hidden_states=True`` gives a list of items: a matrix (one row per
+    token) for a prefill step, one vector for a decode step. A matrix sends
+    each of its rows. ``return_hidden_states="last"`` gives one flat vector,
+    sent as a single row.
     """
     vals: List[float] = []
     lens: List[int] = []
+    kinds: List[int] = []
     if not hs:
-        return vals, lens
-    for row in hs:
-        flat = _flatten_floats(row)
-        vals.extend(flat)
-        lens.append(len(flat))
-    return vals, lens
+        return vals, lens, kinds
+    if isinstance(hs[0], (int, float)):
+        vals.extend(float(x) for x in hs)
+        return vals, [len(vals)], [HIDDEN_ROW_WHOLE]
+    for item in hs:
+        if item and isinstance(item[0], (list, tuple)):
+            kind = HIDDEN_ROW_MATRIX_FIRST
+            for row in item:
+                flat = _flatten_floats(row)
+                vals.extend(flat)
+                lens.append(len(flat))
+                kinds.append(kind)
+                kind = HIDDEN_ROW_MATRIX_NEXT
+        else:
+            flat = _flatten_floats(item)
+            vals.extend(flat)
+            lens.append(len(flat))
+            kinds.append(HIDDEN_ROW_VECTOR)
+    return vals, lens, kinds
 
 
 def _flatten_floats(x):
@@ -185,15 +210,16 @@ class RaggedPairColumns:
 
 
 class NestedRowColumns:
-    """A nested-rows float column (e.g. hidden states): per-request row counts +
-    per-row length stream in the header, one concatenated f32 buffer in the
-    data."""
+    """A nested-rows float column (e.g. hidden states): per-request row counts,
+    a per-row length stream and a per-row kind stream in the header, one
+    concatenated f32 buffer in the data."""
 
     def __init__(self, name, rows):
         self.name = name
         self.rows = rows
         self.v = array("f")
         self.pos = []
+        self.kind = []
         self.req = []
 
     def columns(self):
@@ -206,14 +232,15 @@ class NestedRowColumns:
             return
         req = []
         for row in rows:
-            hv, hlens = flatten_hidden(self.rows[row])
+            hv, hlens, hkinds = flatten_hidden(self.rows[row])
             self.v.fromlist(hv)
             self.pos.extend(hlens)
+            self.kind.extend(hkinds)
             req.append(len(hlens))
         self.req = _scatter(rows, req, batch_size)
 
     def header_cols(self):
-        return [self.req, self.pos]
+        return [self.req, self.pos, self.kind]
 
     def data_cols(self):
         return [self.v.tobytes()]

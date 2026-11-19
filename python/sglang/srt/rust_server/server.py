@@ -92,9 +92,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # The extras families' header columns (`BatchHeader.out_lp_lens` through
-# `hidden_poslens`). A frame without extras that sends a later column pads
+# `hidden_rowkinds`). A frame without extras that sends a later column pads
 # them empty; `push_generation` asserts the count whenever it sends extras.
-_EXTRAS_HEADER_COLS = 12
+_EXTRAS_HEADER_COLS = 13
 
 # `Server.drain_state()` bits (sglang-server `utils/runtime.rs`).
 DRAIN_DRAINING = 1
@@ -1036,7 +1036,8 @@ class RustServer:
             cached_tokens, reasoning_tokens``) plus
             the shape metadata for the optional families (``*_lens`` element counts
             for the flat logprob columns, ``*_reqlens``/``*_poslens`` for the ragged
-            and hidden ones), then the finished requests' weight-version
+            and hidden ones, ``hidden_rowkinds`` for how each hidden-state row
+            nests), then the finished requests' weight-version
             spans, a multimodal model's media token counts,
             ``decode_latencies`` (by row: a finished non-streaming request's
             decode latency in seconds), the scheduler's ``customized_info``
@@ -1059,7 +1060,8 @@ class RustServer:
         (prefill) families ride once on the first chunk. Ragged families (top-k,
         token-ids) flatten a per-position ``list[list]`` into flat ``val``/``idx``
         buffers plus a per-position ``lens`` vector (0 = null position). Hidden
-        states flatten to rows of floats (one row per output position).
+        states flatten to rows of floats, with a kind per row that says how the
+        row nests in the request's value (``flatten_hidden``).
         """
         prompt_tokens = payload.prompt_tokens or []
 

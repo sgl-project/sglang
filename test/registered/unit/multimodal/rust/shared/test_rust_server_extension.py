@@ -1103,7 +1103,7 @@ class TestRustServerExtension(CustomTestCase):
         self.assertEqual(
             msgspec.msgpack.decode(header),
             [["r#1"], [{"type": "abort", "message": "gone"}], [3], [0], [2], [1]]
-            + [[]] * 17
+            + [[]] * 18
             + [[True]],
         )
         self.assertEqual(cols, [b""])
@@ -1218,7 +1218,8 @@ class TestRustServerExtension(CustomTestCase):
         self.assertEqual(ragged(12), [[], [], [[(-4.0, 11), (-6.0, 12)]], []])
         # input_token_ids_logprobs: no row carries it.
         self.assertEqual((h[14], h[15]), ([], []))
-        self.assertEqual((h[16], h[17]), ([0, 0, 0, 1], [2]))
+        # One vector item (kind 1) of two numbers.
+        self.assertEqual((h[16], h[17], h[18]), ([0, 0, 0, 1], [2], [1]))
         self.assertEqual(take("f", 2), [0.5, 1.5])
         self.assertEqual(offset, len(data))
 

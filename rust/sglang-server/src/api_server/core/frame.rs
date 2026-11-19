@@ -12,7 +12,8 @@ use sglang_api_types::api::v1 as api;
 use super::CoreError;
 use crate::message::finish_reason::{FinishKind, FinishReason, Matched};
 use crate::message::response::{
-    CachedTokensDetails, ChunkEvent, ChunkExtras, CustomizedInfo, RequestStats, WeightVersionSpan,
+    CachedTokensDetails, ChunkEvent, ChunkExtras, CustomizedInfo, HIDDEN_ROW_MATRIX_FIRST,
+    HIDDEN_ROW_MATRIX_NEXT, HIDDEN_ROW_WHOLE, RequestStats, WeightVersionSpan,
 };
 use crate::message::types::TokenIds;
 
@@ -168,6 +169,7 @@ impl CoreOutput {
         if !delta_extras.hidden_lens.is_empty() {
             extras.hidden_val = delta_extras.hidden_val.clone();
             extras.hidden_lens = delta_extras.hidden_lens.clone();
+            extras.hidden_kinds = delta_extras.hidden_kinds.clone();
         }
         if !delta_extras.weight_versions.is_empty() {
             extras.weight_versions = delta_extras.weight_versions.clone();
@@ -375,7 +377,11 @@ impl CoreOutput {
             );
         }
         if !extras.hidden_lens.is_empty() {
-            meta.hidden_states = Some(hidden_states(&extras.hidden_val, &extras.hidden_lens));
+            meta.hidden_states = Some(hidden_states(
+                &extras.hidden_val,
+                &extras.hidden_lens,
+                &extras.hidden_kinds,
+            ));
         }
         meta
     }
@@ -471,10 +477,12 @@ fn ragged_logprob_rows(
     rows
 }
 
-/// Reshape flat hidden-state values and per-row lengths into rows.
-fn hidden_states(values: &[f32], lengths: &[u32]) -> api::HiddenStates {
+/// Rebuild Python's hidden-state value from flat values and the rows' lengths
+/// and kinds: the one vector of a `"last"` request, or a list whose items are
+/// vectors (decode steps) and matrices (prefill steps).
+fn hidden_states(values: &[f32], lengths: &[u32], kinds: &[u32]) -> api::HiddenStates {
     use api::{hidden_state_item::Value as Item, hidden_states::Value};
-    let mut items = Vec::with_capacity(lengths.len());
+    let mut rows = Vec::with_capacity(lengths.len());
     let mut offset = 0usize;
     for &length in lengths {
         let length = length as usize;
@@ -485,10 +493,29 @@ fn hidden_states(values: &[f32], lengths: &[u32]) -> api::HiddenStates {
             .copied()
             .map(f64::from)
             .collect();
-        items.push(api::HiddenStateItem {
-            value: Some(Item::Vector(api::HiddenStateRow { values })),
-        });
+        rows.push(api::HiddenStateRow { values });
         offset += length;
+    }
+    if kinds == [HIDDEN_ROW_WHOLE] {
+        return api::HiddenStates {
+            value: rows.pop().map(Value::Last),
+        };
+    }
+    let mut items: Vec<api::HiddenStateItem> = Vec::with_capacity(rows.len());
+    for (row, &kind) in rows.into_iter().zip(kinds) {
+        let open = items.last_mut().and_then(|item| item.value.as_mut());
+        let value = match (kind, open) {
+            (HIDDEN_ROW_MATRIX_NEXT, Some(Item::Matrix(matrix))) => {
+                matrix.rows.push(row);
+                continue;
+            }
+            (HIDDEN_ROW_MATRIX_FIRST | HIDDEN_ROW_MATRIX_NEXT, _) => {
+                Item::Matrix(api::HiddenStateRows { rows: vec![row] })
+            }
+            // `HIDDEN_ROW_VECTOR`: `for_each_chunk` admits no other kind.
+            _ => Item::Vector(row),
+        };
+        items.push(api::HiddenStateItem { value: Some(value) });
     }
     api::HiddenStates {
         value: Some(Value::Items(api::HiddenStateItems { items })),
@@ -588,6 +615,62 @@ mod tests {
         let row = meta.output_top_logprobs[1].row.as_ref().unwrap();
         assert_eq!(row.entries[0].token_id, 9);
         assert!(meta.input_top_logprobs.is_empty());
+    }
+
+    /// Hidden states leave with the nesting Python gave them: a prefill item
+    /// is a matrix with one row per token, a decode item is one vector, and a
+    /// `"last"` request's value is the vector itself.
+    #[test]
+    fn hidden_states_keep_python_nesting() {
+        use crate::message::response::{
+            HIDDEN_ROW_MATRIX_FIRST as MATRIX_FIRST, HIDDEN_ROW_MATRIX_NEXT as MATRIX_NEXT,
+            HIDDEN_ROW_VECTOR as VECTOR, HIDDEN_ROW_WHOLE as WHOLE,
+        };
+        let meta = |hidden_val: Vec<f32>, hidden_lens, hidden_kinds| {
+            let output = CoreOutput {
+                extras: Some(Box::new(ChunkExtras {
+                    hidden_val,
+                    hidden_lens,
+                    hidden_kinds,
+                    ..Default::default()
+                })),
+                ..Default::default()
+            };
+            json(&output.meta_info("rid", None))
+        };
+        let values = vec![0.5, 0.25, -1.0, 2.0, 4.0, 8.0];
+        // Two prefill tokens, then one decode step.
+        assert_eq!(
+            meta(
+                values.clone(),
+                vec![2, 2, 2],
+                vec![MATRIX_FIRST, MATRIX_NEXT, VECTOR]
+            )["hidden_states"],
+            serde_json::json!([[[0.5, 0.25], [-1.0, 2.0]], [4.0, 8.0]])
+        );
+        // One prefill token (the rest of the prompt was cached) stays a matrix.
+        assert_eq!(
+            meta(
+                values.clone(),
+                vec![2, 2, 2],
+                vec![MATRIX_FIRST, VECTOR, VECTOR]
+            )["hidden_states"],
+            serde_json::json!([[[0.5, 0.25]], [-1.0, 2.0], [4.0, 8.0]])
+        );
+        // A second prefill starts a new matrix.
+        assert_eq!(
+            meta(
+                values.clone(),
+                vec![2, 2, 2],
+                vec![MATRIX_FIRST, MATRIX_FIRST, MATRIX_NEXT]
+            )["hidden_states"],
+            serde_json::json!([[[0.5, 0.25]], [[-1.0, 2.0], [4.0, 8.0]]])
+        );
+        assert_eq!(
+            meta(values, vec![6], vec![WHOLE])["hidden_states"],
+            serde_json::json!([0.5, 0.25, -1.0, 2.0, 4.0, 8.0])
+        );
+        assert!(meta(vec![], vec![], vec![]).get("hidden_states").is_none());
     }
 
     /// A request's cached tokens by tier survive the fold of a frame that

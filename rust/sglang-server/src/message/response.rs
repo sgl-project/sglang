@@ -81,6 +81,18 @@ pub const DISPATCH_TAG_ERROR: u8 = 3;
 /// sent after its next step.
 pub const DISPATCH_TAG_HEALTH_ACK: u8 = 4;
 
+/// How a hidden-state row nests in Python's `meta_info["hidden_states"]`: the
+/// values of [`BatchHeader::hidden_rowkinds`], written by Python's
+/// `flatten_hidden`. This one: the value itself is this one vector
+/// (`return_hidden_states: "last"`).
+pub const HIDDEN_ROW_WHOLE: u32 = 0;
+/// An item that is one vector (a decode step).
+pub const HIDDEN_ROW_VECTOR: u32 = 1;
+/// The first row of an item that is a matrix (a prefill step).
+pub const HIDDEN_ROW_MATRIX_FIRST: u32 = 2;
+/// A later row of that matrix.
+pub const HIDDEN_ROW_MATRIX_NEXT: u32 = 3;
+
 /// Read `n` little-endian f32s from `data` at `*off`, advancing `*off`. `None` when
 /// the range runs past the buffer (a malformed / positional-ABI-drifted frame): the
 /// caller rejects the whole frame. Bounds-checked via `data.get` — clamping only the
@@ -154,7 +166,8 @@ pub fn frame_decode_batch_cols(header: &[u8], data_cols: &[&[u8]]) -> Bytes {
 /// - family: `lp` = token logprobs, `top` = top-k logprobs, `tokids_lp` =
 ///   requested-token logprobs, and `hidden` = hidden states;
 /// - shape: `lens` counts elements per request, `reqlens` counts positions or
-///   rows per request, and `poslens` counts elements per position or row.
+///   rows per request, `poslens` counts elements per position or row, and
+///   `rowkinds` (hidden states only) says how each row nests.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct BatchHeader {
     /// Request ids, as the same strings Python holds (`Req.rid`, uuid hex) —
@@ -192,6 +205,10 @@ pub struct BatchHeader {
     pub hidden_reqlens: Vec<u32>,
     #[serde(default)]
     pub hidden_poslens: Vec<u32>,
+    /// How each hidden-state row nests in the request's value (`HIDDEN_ROW_*`),
+    /// one entry per `hidden_poslens` entry.
+    #[serde(default)]
+    pub hidden_rowkinds: Vec<u32>,
     /// The scheduler's `weight_versions`: a finished request's spans, `None`
     /// for one still running; empty when no request in the batch finished.
     #[serde(default)]
@@ -479,19 +496,22 @@ fn take_ragged(
     Some((take_f32(data, cv, nv)?, take_i32(data, ci, nv)?, lens))
 }
 
-/// Like [`take_ragged`] but for hidden states — a val column + row `poslens`, no
-/// idx column. `None` if either read runs past its buffer (see [`take_poslens`],
-/// [`take_f32`]).
+/// Like [`take_ragged`] but for hidden states — a val column + row `poslens`
+/// and the rows' `rowkinds`, no idx column. `None` if a read runs past its
+/// buffer (see [`take_poslens`], [`take_f32`]).
 fn take_hidden(
     data: &[u8],
     cv: &mut usize,
     poslens: &[u32],
+    rowkinds: &[u32],
     pcur: &mut usize,
     nr: usize,
-) -> Option<(Vec<f32>, Vec<u32>)> {
+) -> Option<(Vec<f32>, Vec<u32>, Vec<u32>)> {
+    let start = *pcur;
     let lens = take_poslens(poslens, pcur, nr)?;
+    let kinds = rowkinds.get(start..*pcur)?.to_vec();
     let nv: usize = lens.iter().map(|&x| x as usize).sum();
-    Some((take_f32(data, cv, nv)?, lens))
+    Some((take_f32(data, cv, nv)?, lens, kinds))
 }
 
 /// Decode a batch frame (tag stripped), calling `route` with each request's
@@ -571,6 +591,16 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
         || sum(&h.out_tokids_lp_reqlens) != h.out_tokids_lp_poslens.len()
         || sum(&h.in_tokids_lp_reqlens) != h.in_tokids_lp_poslens.len()
         || sum(&h.hidden_reqlens) != h.hidden_poslens.len()
+        || h.hidden_rowkinds.len() != h.hidden_poslens.len()
+        || !h.hidden_rowkinds.iter().all(|&kind| {
+            matches!(
+                kind,
+                HIDDEN_ROW_WHOLE
+                    | HIDDEN_ROW_VECTOR
+                    | HIDDEN_ROW_MATRIX_FIRST
+                    | HIDDEN_ROW_MATRIX_NEXT
+            )
+        })
     {
         reject!()
     }
@@ -736,10 +766,11 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
                 &mut p_id,
                 lens_i(&h.in_tokids_lp_reqlens, i),
             )?;
-            let (hidden_val, hidden_lens) = take_hidden(
+            let (hidden_val, hidden_lens, hidden_kinds) = take_hidden(
                 data,
                 &mut c_h_v,
                 &h.hidden_poslens,
+                &h.hidden_rowkinds,
                 &mut p_h,
                 lens_i(&h.hidden_reqlens, i),
             )?;
@@ -765,6 +796,7 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
                 in_tid_lens,
                 hidden_val,
                 hidden_lens,
+                hidden_kinds,
                 weight_versions,
                 image_tokens,
                 audio_tokens,
@@ -953,10 +985,12 @@ pub struct ChunkExtras {
     pub in_tid_val: Vec<f32>,
     pub in_tid_idx: Vec<i32>,
     pub in_tid_lens: Vec<u32>,
-    /// Hidden states (dense f32): flat buffer + per-row lengths. Last-writer-wins
-    /// across chunks (the final message has the full set).
+    /// Hidden states (dense f32): flat buffer + per-row lengths and kinds
+    /// (`HIDDEN_ROW_*`). Last-writer-wins across chunks (the final message has
+    /// the full set).
     pub hidden_val: Vec<f32>,
     pub hidden_lens: Vec<u32>,
+    pub hidden_kinds: Vec<u32>,
     /// Which weight version produced which output tokens; on a finished
     /// request's chunk only.
     pub weight_versions: Vec<WeightVersionSpan>,
@@ -1206,6 +1240,7 @@ mod tests {
             arr_u(&[]),     // in_tokids_lp_poslens
             arr_u(&[2, 0]), // hidden_reqlens — 2 rows claimed
             arr_u(&[3]),    // hidden_poslens — only 1 supplied
+            arr_u(&[1]),    // hidden_rowkinds
         ]);
         let mut header = Vec::new();
         rmpv::encode::write_value(&mut header, &header_arr).unwrap();
@@ -1218,6 +1253,47 @@ mod tests {
             !for_each_chunk(&framed[1..], |_| routed += 1).ok,
             "hidden poslens drift must be rejected, not truncated"
         );
+    }
+
+    /// A row kind this build does not know rejects the frame.
+    #[test]
+    fn unknown_hidden_rowkind_is_rejected() {
+        use rmpv::Value;
+        let f = |xs: &[f32]| -> Vec<u8> { xs.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let q = |xs: &[i64]| -> Vec<u8> { xs.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let arr_u = |xs: &[u32]| Value::Array(xs.iter().map(|&x| Value::from(x)).collect());
+        let rejected = |kind: u32| {
+            let header_arr = Value::Array(vec![
+                Value::Array(vec![Value::from("1")]), // rids
+                Value::Array(vec![Value::Nil]),       // finish
+                arr_u(&[0]),                          // prompt
+                arr_u(&[1]),                          // tok_lens
+                arr_u(&[0]),                          // cached_tokens
+                arr_u(&[0]),                          // reasoning_tokens
+                arr_u(&[]),                           // out_lp_lens
+                arr_u(&[]),                           // in_lp_lens
+                arr_u(&[]),                           // out_top_reqlens
+                arr_u(&[]),                           // out_top_poslens
+                arr_u(&[]),                           // in_top_reqlens
+                arr_u(&[]),                           // in_top_poslens
+                arr_u(&[]),                           // out_tokids_lp_reqlens
+                arr_u(&[]),                           // out_tokids_lp_poslens
+                arr_u(&[]),                           // in_tokids_lp_reqlens
+                arr_u(&[]),                           // in_tokids_lp_poslens
+                arr_u(&[1]),                          // hidden_reqlens
+                arr_u(&[2]),                          // hidden_poslens
+                arr_u(&[kind]),                       // hidden_rowkinds
+            ]);
+            let mut header = Vec::new();
+            rmpv::encode::write_value(&mut header, &header_arr).unwrap();
+            let mut data = Vec::new();
+            data.extend(q(&[10])); // token_ids
+            data.extend(f(&[0.1, 0.2])); // hidden_val
+            let framed = frame_decode_batch_cols(&header, &[&data]);
+            !for_each_chunk(&framed[1..], |_| {}).ok
+        };
+        assert!(!rejected(HIDDEN_ROW_MATRIX_NEXT));
+        assert!(rejected(HIDDEN_ROW_MATRIX_NEXT + 1));
     }
 
     /// A frame that fails at request 0 buckets nothing, so bucket-driven cleanup
@@ -1333,7 +1409,7 @@ mod tests {
         //   out_lp_lens, in_lp_lens,
         //   out_top_reqlens, out_top_poslens, in_top_*, out_tokids_lp_*,
         //   in_tokids_lp_*,
-        //   hidden_reqlens, hidden_poslens
+        //   hidden_reqlens, hidden_poslens, hidden_rowkinds
         let header_arr = Value::Array(vec![
             Value::Array(vec![Value::from("1"), Value::from("2")]), // rids
             Value::Array(vec![Value::Nil, Value::Nil]),             // finish
@@ -1353,6 +1429,7 @@ mod tests {
             arr_u(&[]),     // in_tokids_lp_poslens
             arr_u(&[1, 0]), // hidden_reqlens (req0: 1 row)
             arr_u(&[3]),    // hidden_poslens (dim 3)
+            arr_u(&[1]),    // hidden_rowkinds (a vector item)
         ]);
         let mut header = Vec::new();
         rmpv::encode::write_value(&mut header, &header_arr).unwrap();
@@ -1379,6 +1456,7 @@ mod tests {
         assert_eq!(ex0.out_top_lens, vec![2]);
         assert_eq!(ex0.hidden_val, vec![0.1, 0.2, 0.3]);
         assert_eq!(ex0.hidden_lens, vec![3]);
+        assert_eq!(ex0.hidden_kinds, vec![HIDDEN_ROW_VECTOR]);
         // req1 has a token id but no numeric columns → no extras box allocated.
         assert_eq!(events[1].token_ids, vec![20]);
         assert!(events[1].extras.is_none());
@@ -1428,6 +1506,7 @@ mod tests {
                 arr_u(&[]),                                             // in_tokids_lp_poslens
                 reqlens,                                                // hidden_reqlens
                 arr_u(&[]),                                             // hidden_poslens
+                arr_u(&[]),                                             // hidden_rowkinds
             ]);
             let mut header = Vec::new();
             rmpv::encode::write_value(&mut header, &header_arr).unwrap();
@@ -1511,6 +1590,7 @@ mod tests {
             arr_u(&[1]),                          // in_tokids_lp_poslens  ...1 id)
             arr_u(&[1]),                          // hidden_reqlens   (1 row…
             arr_u(&[3]),                          // hidden_poslens   …dim 3)
+            arr_u(&[1]),                          // hidden_rowkinds  (a vector item)
         ]);
         let mut header = Vec::new();
         rmpv::encode::write_value(&mut header, &header_arr).unwrap();

@@ -1,5 +1,7 @@
 """HTTP `/generate` returns hidden states when the server allows the mode:
-one vector for `return_hidden_states="last"`."""
+one vector for `return_hidden_states="last"`, and for `True` a matrix for the
+prefill step followed by one vector per decode step. The Rust server returns
+the same shape for `True` as the Python frontend."""
 
 import json
 import unittest
@@ -13,11 +15,12 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_rust_server_built,
     popen_launch_server,
     terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=120, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=240, stage="base-b", runner_config="1-gpu-small")
 
 PROMPT = "The capital of France is"
 
@@ -113,6 +116,56 @@ class TestGenerateHiddenStatesLast(HiddenStatesServerCase):
 
 class TestGenerateHiddenStatesLastOnFullServer(TestGenerateHiddenStatesLast):
     server_mode = "full"
+
+
+class TestGenerateHiddenStatesFull(HiddenStatesServerCase):
+    """`return_hidden_states=True`: a matrix with one row per prefill token,
+    then one vector per decode step."""
+
+    server_mode = "full"
+    long_prompt = "The quick brown fox jumps over the lazy dog near the quiet river"
+
+    def assert_prefill_matrix_then_vectors(self, hidden_states):
+        prefill, decode = hidden_states[0], hidden_states[1:]
+        self.assertGreater(len(prefill), 0)
+        for row in prefill:
+            self.assertIsInstance(row, list)
+            self.assert_vector(row)
+        for vector in decode:
+            self.assert_vector(vector)
+
+    def test_prefill_item_has_one_row_per_token(self):
+        # A prompt no other test sends, so most of it is not in the prefix cache.
+        meta = self._post(f"Shape test one. {self.long_prompt}", True).json()[
+            "meta_info"
+        ]
+        hidden_states = meta["hidden_states"]
+        self.assert_prefill_matrix_then_vectors(hidden_states)
+        self.assertGreater(len(hidden_states[0]), 1)
+        self.assertEqual(
+            len(hidden_states[0]), meta["prompt_tokens"] - meta["cached_tokens"]
+        )
+        self.assertEqual(len(hidden_states), meta["completion_tokens"])
+
+    def test_cached_prompt_leaves_a_one_row_matrix(self):
+        text = f"Shape test two. {self.long_prompt}"
+        self._post(text, True)
+        meta = self._post(text, True).json()["meta_info"]
+        hidden_states = meta["hidden_states"]
+        self.assertEqual(meta["prompt_tokens"] - meta["cached_tokens"], 1)
+        self.assert_prefill_matrix_then_vectors(hidden_states)
+        self.assertEqual(len(hidden_states[0]), 1)
+
+    def test_stream_keeps_the_shape_in_every_chunk(self):
+        for chunk in self._stream_chunks(f"Shape test three. {self.long_prompt}", True):
+            hidden_states = chunk["meta_info"]["hidden_states"]
+            self.assert_prefill_matrix_then_vectors(hidden_states)
+            self.assertGreater(len(hidden_states[0]), 1)
+
+
+@unittest.skipUnless(is_rust_server_built(), "embedded rust server extension not built")
+class TestGenerateHiddenStatesFullRustServer(TestGenerateHiddenStatesFull):
+    env = {"SGLANG_RUST_SERVER": "1"}
 
 
 if __name__ == "__main__":
