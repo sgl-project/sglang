@@ -2726,6 +2726,17 @@ def _exportable_value(value: str) -> str:
     return value
 
 
+def nv_mega_runtime_switches() -> tuple[EnvField, ...]:
+    """The NVIDIA runtime master, then every field whose unset default follows it."""
+    master = envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION
+    children = tuple(
+        field
+        for field in vars(Envs).values()
+        if isinstance(field, EnvField) and field.default == master.get
+    )
+    return (master,) + children
+
+
 class _DeprecatedEnv:
     """One deprecated env var: warn if it is set, and optionally forward its
     (possibly transformed) value to a replacement env var."""
