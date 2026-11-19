@@ -303,11 +303,7 @@ class Inkling2Experts(nn.Module):
             param.data.copy_(swizzle_blockscale(target).flatten(1))
 
     def _mega_covers(self, low, high):
-        return self.mega is not None and (
-            low > high
-            or self.mega.min_tokens <= low
-            and high <= self.mega.max_tokens * self.ep_size
-        )
+        return self.mega is not None and (low > high or self.mega.min_tokens <= low)
 
     def prepare_routed_exchange(self):
         if self.ep_size == 1 or self.sm90:
@@ -412,9 +408,17 @@ class Inkling2Experts(nn.Module):
 
     def _forward_mega(self, x, weights, ids, combine):
         """Each EP rank feeds its slice of the (replicated) tokens to MegaMoE, which
-        writes the combined rows of every slice to every rank."""
+        writes the combined rows of every slice to every rank. A forward larger than
+        the MegaMoE buffer runs in buffer-sized pieces."""
         mega, deep_gemm = self.mega, self.mega.deep_gemm
         tokens = x.shape[0]
+        cap = mega.max_tokens * self.ep_size
+        if tokens > cap:
+            out = torch.empty_like(x)
+            for s in range(0, tokens, cap):
+                rows = slice(s, s + cap)
+                out[rows] = self._forward_mega(x[rows], weights[rows], ids[rows], True)
+            return out if combine else RoutedOutput(out, None, 0)
         per_rank = -(-tokens // self.ep_size)
         start = min(self.ep_rank * per_rank, tokens)
         local = min(tokens - start, per_rank)
@@ -499,12 +503,7 @@ class Inkling2Experts(nn.Module):
                 f"w13 {tuple(self.w13_weight.shape)} {self.w13_weight.dtype}, "
                 f"w2 {tuple(self.w2_weight.shape)} {self.w2_weight.dtype}"
             )
-        if (
-            self.mega is not None
-            and self.mega.min_tokens
-            <= x.shape[0]
-            <= self.mega.max_tokens * self.ep_size
-        ):
+        if self.mega is not None and self.mega.min_tokens <= x.shape[0]:
             return self._forward_mega(x, weights, ids, combine)
         if self.ep_size > 1 and ids.numel() <= self.max_routed_ids:
             return self._forward_routed(x, weights, ids, combine)
