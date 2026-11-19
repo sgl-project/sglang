@@ -171,9 +171,9 @@ pub enum DpRankPolicy {
     RoundRobin,
     /// The rank expected to hold the fewest KV tokens by the engine's
     /// `--load-publish-endpoint` feed: tokens in use plus queued, with every
-    /// request the rank holds charged a typical request's KV. Ties,
-    /// and a worker without a fresh reading for every rank, fall back to
-    /// `least_in_flight`.
+    /// request the rank holds charged a typical request's KV; a rank without
+    /// room for one more such request ranks last. Ties, and a worker without
+    /// a fresh reading for every rank, fall back to `least_in_flight`.
     #[value(name = "least_tokens")]
     LeastTokens,
 }

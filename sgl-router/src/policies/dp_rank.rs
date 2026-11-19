@@ -14,42 +14,62 @@ use crate::state::load_monitor::engine_reported_load::RankLoad;
 use crate::workers::Worker;
 use sha2::{Digest, Sha256};
 
+/// `rank_tokens` for a rank whose reported capacity cannot take the requests
+/// sent since the reading and one more at a typical size: it ranks after every
+/// rank with room, and among such ranks the in-flight count decides.
+pub const NO_ROOM: u64 = u64::MAX;
+
 /// `rank_tokens` for [`select_dp_rank`]: the KV each rank is expected to
 /// hold, its committed tokens plus every request it holds, and every stamped
-/// request this router sent it since the reading, at a typical request's KV.
-/// KV in use lags: a rank whose requests are all young holds little now and
-/// the most later, so ranking by it herds. Charging each request its expected
-/// size ranks by where the rank is heading instead, and a request dispatched
-/// between two reports counts before the engine has seen it.
+/// request this router sent it since the reading, at a typical request's KV;
+/// or [`NO_ROOM`]. KV in use lags: a rank whose requests are all young holds
+/// little now and the most later, so ranking by it herds. Charging each
+/// request its expected size ranks by where the rank is heading instead, and
+/// a request dispatched between two reports counts before the engine has seen
+/// it.
 ///
-/// A typical request is the lower median of the ranks' mean KV per request,
-/// not the worker-wide mean: one rank holding a few long-context requests
-/// would otherwise inflate what every short request on the others is charged,
-/// and a rank near its KV cap would outrank one that is nearly empty. Ranks
-/// whose requests hold no KV yet (queued on an older publisher, which reports
-/// KV in use only) do not vote, or a two-rank worker would charge nothing and
-/// send every request to that rank until its KV shows up.
+/// A typical request is the median request's KV: the ranks' mean KV per
+/// request, each counted once per request it holds, at the lower median. Not
+/// the worker-wide mean, and not the median rank: a few long-context requests,
+/// even spread over most ranks, would otherwise inflate what every short
+/// request is charged, and a rank near its KV cap would outrank one that is
+/// nearly empty. Ranks whose requests hold no KV yet (queued on an older
+/// publisher, which reports KV in use only) do not vote, or a two-rank worker
+/// would charge nothing and send every request to that rank until its KV
+/// shows up.
 pub fn expected_rank_tokens(worker: &Worker, loads: &[RankLoad]) -> Vec<(u32, u64)> {
-    let mut means: Vec<u64> = loads
+    let mut means: Vec<(u64, u64)> = loads
         .iter()
         .filter(|load| load.num_reqs > 0)
-        .map(|load| load.num_tokens / load.num_reqs)
-        .filter(|&mean| mean > 0)
+        .map(|load| (load.num_tokens / load.num_reqs, load.num_reqs))
+        .filter(|&(mean, _)| mean > 0)
         .collect();
     means.sort_unstable();
+    let requests: u64 = means.iter().map(|&(_, reqs)| reqs).sum();
+    let median = requests.saturating_sub(1) / 2;
+    let mut counted = 0;
     let per_req = means
-        .get(means.len().saturating_sub(1) / 2)
-        .copied()
-        .unwrap_or(0);
+        .iter()
+        .find(|&&(_, reqs)| {
+            counted += reqs;
+            counted > median
+        })
+        .map_or(0, |&(mean, _)| mean);
     loads
         .iter()
         .map(|load| {
             let sent = worker.dp_rank_dispatched_since(load.rank, load.at) as u64;
             let held = load.num_reqs.saturating_add(sent);
-            (
-                load.rank,
-                load.num_tokens.saturating_add(held.saturating_mul(per_req)),
-            )
+            let expected = load.num_tokens.saturating_add(held.saturating_mul(per_req));
+            let needed = load
+                .num_tokens
+                .saturating_add(sent.saturating_add(1).saturating_mul(per_req));
+            let tokens = if load.capacity > 0 && needed > load.capacity {
+                NO_ROOM
+            } else {
+                expected
+            };
+            (load.rank, tokens)
         })
         .collect()
 }
@@ -57,7 +77,7 @@ pub fn expected_rank_tokens(worker: &Worker, loads: &[RankLoad]) -> Vec<(u32, u6
 /// `None` for a single-rank worker. `prefix_depths` is `(rank, cached blocks)`;
 /// `rank_tokens` is `(rank, expected KV tokens)` from the engine's load feed, read
 /// only under `least_tokens`, and ignored unless it covers every candidate so a
-/// rank with no reading never looks idle.
+/// rank with no reading never looks idle; a rank without room ranks last.
 pub fn select_dp_rank(
     worker: &Worker,
     affinity_key: Option<&str>,
@@ -187,12 +207,13 @@ mod tests {
     }
 
     #[test]
-    fn expected_tokens_charge_every_request_at_the_worker_mean() {
+    fn expected_tokens_charge_every_request_at_the_median_request() {
         let w = worker(2);
         let reading = |rank, num_tokens, num_reqs, at| RankLoad {
             rank,
             num_tokens,
             num_reqs,
+            capacity: 0,
             at,
         };
         let at = Instant::now();
@@ -216,9 +237,53 @@ mod tests {
         // cap would look lighter than the nearly empty one.
         let loads = [reading(0, 30_000, 1, newer), reading(1, 4_000, 8, newer)];
         assert_eq!(expected_rank_tokens(&w, &loads), [(0, 30_500), (1, 8_000)]);
+        // Nor when long-context ranks are the majority: the median request is
+        // still a short one, since requests vote, not ranks.
+        let w3 = worker(3);
+        let loads = [
+            reading(0, 30_000, 1, newer),
+            reading(1, 30_000, 1, newer),
+            reading(2, 4_000, 8, newer),
+        ];
+        assert_eq!(
+            expected_rank_tokens(&w3, &loads),
+            [(0, 30_500), (1, 30_500), (2, 8_000)]
+        );
         // A rank whose requests hold no KV yet does not set the charge to 0:
         // its three queued requests count at the other rank's 1000 each.
         let loads = [reading(0, 0, 3, newer), reading(1, 5_000, 5, newer)];
         assert_eq!(expected_rank_tokens(&w, &loads), [(0, 3_000), (1, 10_000)]);
+    }
+
+    #[test]
+    fn a_rank_without_room_for_one_more_typical_request_ranks_last() {
+        let w = worker(2);
+        let at = Instant::now();
+        let reading = |rank, num_tokens, num_reqs, capacity| RankLoad {
+            rank,
+            num_tokens,
+            num_reqs,
+            capacity,
+            at,
+        };
+        // Typical request 500. Rank 0 is expected to hold the least by far,
+        // but has committed 39_800 of 40_000: one more request would not fit.
+        let loads = [reading(0, 39_800, 1, 40_000), reading(1, 4_000, 8, 40_000)];
+        let tokens = expected_rank_tokens(&w, &loads);
+        assert_eq!(tokens, [(0, NO_ROOM), (1, 8_000)]);
+        assert_eq!(select_dp_rank(&w, None, &[], &tokens, TOKENS), Some(1));
+        // Requests sent since the reading take their room first.
+        let loads = [reading(0, 4_000, 8, 40_000), reading(1, 38_500, 1, 40_000)];
+        let _sent = [1, 1, 1].map(|rank| w.dp_rank_timestamped_guard(rank));
+        assert_eq!(expected_rank_tokens(&w, &loads), [(0, 8_000), (1, NO_ROOM)]);
+        // Every rank full: the in-flight count decides.
+        let loads = [reading(0, 39_800, 1, 40_000), reading(1, 39_900, 1, 40_000)];
+        let tokens = expected_rank_tokens(&w, &loads);
+        assert_eq!(tokens, [(0, NO_ROOM), (1, NO_ROOM)]);
+        assert_eq!(select_dp_rank(&w, None, &[], &tokens, TOKENS), Some(0));
+        // An unreported capacity never marks a rank full.
+        drop(_sent);
+        let loads = [reading(0, 39_800, 1, 0), reading(1, 4_000, 8, 0)];
+        assert_eq!(expected_rank_tokens(&w, &loads), [(0, 40_300), (1, 8_000)]);
     }
 }
