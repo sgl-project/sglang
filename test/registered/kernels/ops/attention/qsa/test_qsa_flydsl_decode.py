@@ -14,6 +14,7 @@ import torch
 
 from sglang.srt.utils import is_gfx95_supported
 from sglang.test.ci.ci_register import register_amd_ci
+from sglang.test.mem_cache_utils import routed
 
 register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
@@ -91,8 +92,10 @@ def test_backend_decode_matches_triton_fallback(monkeypatch):
         rows, num_kv_heads, group
     )
     backend = qsa_module.QwenSparseAttnBackend.__new__(qsa_module.QwenSparseAttnBackend)
-    backend.token_to_kv_pool = SimpleNamespace(
-        get_key_buffer=lambda layer_id: k, get_value_buffer=lambda layer_id: v
+    backend.token_to_kv_pool = routed(
+        SimpleNamespace(
+            get_key_buffer=lambda layer_id: k, get_value_buffer=lambda layer_id: v
+        )
     )
     backend.req_to_token_pool = SimpleNamespace(req_to_token=req_to_token)
     backend.qsa_profile = None
