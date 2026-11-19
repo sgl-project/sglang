@@ -6,7 +6,6 @@ from unittest.mock import Mock, call, patch
 
 from sglang.srt.managers.scheduler_components import gc_freezer
 from sglang.srt.managers.scheduler_components.gc_freezer import GCFreezer
-from sglang.srt.managers.scheduler_components.state_check import Severity
 from sglang.srt.utils.gc_utils import refreeze_gc
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -39,13 +38,8 @@ class TestGCFreezer(CustomTestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
 
-    def _freezer(self, *, freeze_on_idle_secs, enable_frozen_garbage_check=False):
-        freezer = GCFreezer(
-            freeze_on_idle_secs=freeze_on_idle_secs,
-            enable_frozen_garbage_check=enable_frozen_garbage_check,
-        )
-        freezer._reporter = self.gc_ops.reporter
-        return freezer
+    def _freezer(self, *, freeze_on_idle_secs):
+        return GCFreezer(freeze_on_idle_secs=freeze_on_idle_secs)
 
     def _gc_calls(self):
         names = ("collect", "freeze_gc", "refreeze_gc", "unfreeze")
@@ -64,28 +58,19 @@ class TestGCFreezer(CustomTestCase):
         self.now[0] += 5.0
         freezer.on_idle(self.forward_ct[0])
 
-    def test_idle_freeze_collects_then_freezes_once_per_idle_period(self):
+    def test_idle_freeze_runs_once_per_idle_period(self):
         self._two_idle_periods(self._freezer(freeze_on_idle_secs=5.0))
-        once = [call.collect(), call.freeze_gc("Scheduler")]
-        self.assertEqual(self._gc_calls(), once + once)
+        self.assertEqual(self._gc_calls(), [call.freeze_gc("Scheduler")] * 2)
 
-    def test_frozen_garbage_warns_in_production_and_is_a_leak_under_the_env(self):
+    def test_frozen_garbage_is_checked_and_warned_at_most_once_per_interval(self):
         freezer = self._freezer(freeze_on_idle_secs=5.0)
         freezer._next_garbage_check = 0.0
         self._two_idle_periods(freezer)
-        self.assertEqual(self._gc_calls()[0], call.refreeze_gc("Scheduler"))
-        self.gc_ops.logger.warning.assert_called_once()
-        self.gc_ops.reporter.report.assert_not_called()
-
-        self.gc_ops.reset_mock()
-        self._two_idle_periods(
-            self._freezer(freeze_on_idle_secs=5.0, enable_frozen_garbage_check=True)
-        )
-        self.assertEqual(self._gc_calls(), [call.refreeze_gc("Scheduler")] * 2)
         self.assertEqual(
-            [c.args[0] for c in self.gc_ops.reporter.report.call_args_list],
-            [Severity.LEAK] * 2,
+            self._gc_calls(),
+            [call.refreeze_gc("Scheduler"), call.freeze_gc("Scheduler")],
         )
+        self.gc_ops.logger.warning.assert_called_once()
 
     def test_cache_reset_unfreezes_and_the_next_idle_check_freezes(self):
         self._freezer(freeze_on_idle_secs=0.0).on_cache_reset()
@@ -97,7 +82,7 @@ class TestGCFreezer(CustomTestCase):
         freezer.on_idle(self.forward_ct[0])
         self.assertEqual(
             self._gc_calls(),
-            [call.unfreeze(), call.collect(), call.freeze_gc("Scheduler")],
+            [call.unfreeze(), call.freeze_gc("Scheduler")],
         )
 
     def test_heap_growth_warns_at_each_half_again(self):

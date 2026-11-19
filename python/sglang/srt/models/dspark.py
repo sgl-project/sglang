@@ -183,6 +183,10 @@ class BaseDSparkMarkovHead(nn.Module, ABC):
         token's embedding, for the fused greedy kernel; otherwise None."""
         return None
 
+    # Step logits = softcap(base + bias), masked from step_vocab_limit on.
+    step_softcap: Optional[float] = None
+    step_vocab_limit: Optional[int] = None
+
 
 class VanillaMarkov(BaseDSparkMarkovHead):
     # This rank's lm_head vocab rows of markov_w2; None biases the whole vocab.

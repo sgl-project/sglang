@@ -6,7 +6,7 @@ from sglang.kernels.ops.attention.fla.kda import chunk_kda
 from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_xpu_ci(est_time=300, suite="stage-b-test-1-gpu-xpu")
+register_xpu_ci(est_time=300, suite="extra-test-1-gpu-xpu")
 
 CHUNK_SIZE = 64
 # Gap between the pool's per-slot pitch and H*V*K. A kernel that assumes a

@@ -303,6 +303,12 @@ class GenerateReqInput:
     return_flat_raw_output_top_logprobs: bool = False
     # Base64-encode the flat arrays. Requires one of the two flags above.
     return_flat_raw_top_logprobs_b64: bool = False
+    # Return output sampling masks as flat arrays plus row lengths instead of the
+    # nested per-token lists, on the finished response only. Requires
+    # return_sampling_mask.
+    return_flat_raw_sampling_mask: bool = False
+    # Base64-encode those arrays. Requires return_flat_raw_sampling_mask.
+    return_flat_raw_sampling_mask_b64: bool = False
     # Whether to stream output.
     stream: bool = False
     # Whether to log metrics for this request (e.g. health_generate calls do not log metrics)
@@ -524,6 +530,18 @@ class GenerateReqInput:
             raise ValueError(
                 "return_flat_raw_top_logprobs_b64 requires return_flat_raw_top_logprobs "
                 "or return_flat_raw_output_top_logprobs."
+            )
+        if self.return_flat_raw_sampling_mask and self.stream:
+            raise ValueError(
+                "return_flat_raw_sampling_mask is only set on the finished response "
+                "and does not support stream=True."
+            )
+        if (
+            self.return_flat_raw_sampling_mask_b64
+            and not self.return_flat_raw_sampling_mask
+        ):
+            raise ValueError(
+                "return_flat_raw_sampling_mask_b64 requires return_flat_raw_sampling_mask."
             )
 
     def _determine_batch_size(self):
@@ -1104,6 +1122,8 @@ class GenerateReqInput:
             return_flat_raw_top_logprobs=self.return_flat_raw_top_logprobs,
             return_flat_raw_output_top_logprobs=self.return_flat_raw_output_top_logprobs,
             return_flat_raw_top_logprobs_b64=self.return_flat_raw_top_logprobs_b64,
+            return_flat_raw_sampling_mask=self.return_flat_raw_sampling_mask,
+            return_flat_raw_sampling_mask_b64=self.return_flat_raw_sampling_mask_b64,
             stream=self.stream,
             log_metrics=self.log_metrics,
             return_hidden_states=(
@@ -2633,6 +2653,15 @@ class FreezeGCReq(BaseReq, kw_only=True):
     gc_threshold: Optional[List[int]] = None
 
 
+class ControlAckOutput(BaseReq, kw_only=True):
+    """The reply for a control request whose handler returns nothing
+    (pause/continue generation, freeze_gc, configure_logging, close_session).
+    Sent only to the Rust frontend, which waits for one reply per control
+    request; the Python TokenizerManager fire-and-forgets these."""
+
+    success: bool = True
+
+
 class ShutdownReq(BaseReq, kw_only=True):
     # Broadcast across TP ranks via the normal recv path, so all ranks break
     # the scheduler loop on the same iteration.
@@ -2715,7 +2744,7 @@ class ParseFunctionCallReq(BaseReq, kw_only=True):
         default_factory=list
     )  # A list of available function tools (name, parameters, etc.).
     tool_call_parser: Optional[str] = (
-        None  # Specify the parser type, e.g. 'llama3', 'qwen25', or 'mistral'. If not specified, tries all.
+        None  # Specify the parser type, e.g. 'llama3', 'qwen', or 'mistral'. If not specified, tries all.
     )
 
 

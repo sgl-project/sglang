@@ -30,7 +30,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.state_capturer.base import TopkCaptureOutput
 from sglang.srt.utils.device import async_d2h as _async_d2h
-from sglang.srt.utils.device import is_cuda
+from sglang.srt.utils.device import is_cuda, is_pin_memory_available
 from sglang.srt.utils.weight_versions import compute_weight_version_spans
 
 if TYPE_CHECKING:
@@ -74,6 +74,30 @@ def is_war_barrier_enabled() -> bool:
         or get_memory().enable_unified_memory
         or envs.SGLANG_ENABLE_WAR_BARRIER.get()
     )
+
+
+def _async_d2h_rows(rows: List[Any]) -> List[Any]:
+    """`_async_d2h` over per-request rows with one host buffer and one copy.
+
+    The rows come back as host views with their shapes, in order; entries that
+    are not tensors pass through.
+    """
+    tensors = [row for row in rows if torch.is_tensor(row)]
+    if len(tensors) < 2 or len({row.dtype for row in tensors}) > 1:
+        return [_async_d2h(row) if torch.is_tensor(row) else row for row in rows]
+    flat = torch.cat([row.reshape(-1) for row in tensors])
+    device = flat.device
+    if device.type != "cpu" and is_pin_memory_available(device):
+        # use record_stream so rows don't get reused before torch.cat finished
+        stream = torch.get_device_module(device).current_stream()
+        for row in tensors:
+            row.record_stream(stream)
+    host = _async_d2h(flat)
+    host_rows = iter(
+        chunk.view(row.shape)
+        for chunk, row in zip(host.split([row.numel() for row in tensors]), tensors)
+    )
+    return [next(host_rows) if torch.is_tensor(row) else row for row in rows]
 
 
 @dataclasses.dataclass
@@ -220,20 +244,17 @@ class GenerationBatchResult:
                     self.logits_output.input_token_logprobs
                 )
             if self.logits_output.next_token_top_logprobs_val is not None:
-                self.logits_output.next_token_top_logprobs_val = [
-                    _async_d2h(v) if torch.is_tensor(v) else v
-                    for v in self.logits_output.next_token_top_logprobs_val
-                ]
+                self.logits_output.next_token_top_logprobs_val = _async_d2h_rows(
+                    self.logits_output.next_token_top_logprobs_val
+                )
             if self.logits_output.next_token_top_logprobs_idx is not None:
-                self.logits_output.next_token_top_logprobs_idx = [
-                    _async_d2h(x) if torch.is_tensor(x) else x
-                    for x in self.logits_output.next_token_top_logprobs_idx
-                ]
+                self.logits_output.next_token_top_logprobs_idx = _async_d2h_rows(
+                    self.logits_output.next_token_top_logprobs_idx
+                )
             if self.logits_output.next_token_token_ids_logprobs_val is not None:
-                self.logits_output.next_token_token_ids_logprobs_val = [
-                    _async_d2h(v) if torch.is_tensor(v) else v
-                    for v in self.logits_output.next_token_token_ids_logprobs_val
-                ]
+                self.logits_output.next_token_token_ids_logprobs_val = _async_d2h_rows(
+                    self.logits_output.next_token_token_ids_logprobs_val
+                )
         if (
             self.logits_output is not None
             and return_hidden_states
