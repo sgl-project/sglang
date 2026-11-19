@@ -18,7 +18,7 @@ ARG MANYLINUX_IMAGE=pytorch/manylinuxaarch64-builder:cuda13.4
 ARG DEEPGEMM_REF=v0.2.9
 ARG SGL_DEEP_GEMM_VERSION=0.2.9
 ARG DEEPEP_SOURCE_REF=sgl-deepep
-ARG SGL_DEEP_EP_VERSION=0.1.2.post1
+ARG SGL_DEEP_EP_VERSION=0.1.3rc5
 # MSA has no versioned release yet; pin a commit with the multi-head q8kv4 indexer,
 # strided cache views, and the SGLang monokernel plugin.
 ARG MSA_COMMIT=1e7bf76f26a5f53cfc2d4d297e1ec2e40955e431
