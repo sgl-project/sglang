@@ -23,7 +23,8 @@ import msgspec
 
 from sglang.srt.arg_groups import overrides
 from sglang.srt.disaggregation import decode_freed_slots
-from sglang.srt.environ import nv_mega_runtime_switches
+from sglang.srt.environ import envs, nv_mega_runtime_switches
+from sglang.srt.managers.scheduler_components import dp_sync_exchange, shm_tag_exchange
 from sglang.srt.models.qwen3_5 import Qwen3_5MoeForConditionalGeneration
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import ServerArgs
@@ -222,6 +223,18 @@ SHAPES = {
 }
 
 
+# Runtime facts the children read besides the server arguments.
+def _exchange_hosts(shape: Shape) -> int:
+    """Hosts of a shared-memory exchange over the shape's TP group, as the stock
+    get_shm_exchange builds it for the PD decode kinds (one host, or two with the
+    multi-host child); 0 when the stock collective runs."""
+    if not envs.SGLANG_OPT_SCHEDULER_SHM_SYNC.get():
+        return 0
+    if shape.hosts > 1 and not envs.SGLANG_OPT_SCHEDULER_SHM_SYNC_MULTIHOST.get():
+        return 0
+    return shape.hosts if shape.hosts <= shm_tag_exchange.PD_DECODE_MAX_HOSTS else 0
+
+
 def _overlap_loop(shape: Shape) -> bool:
     return not shape.args.get("disable_overlap_schedule", False)
 
@@ -232,6 +245,18 @@ def _pd_decode_overlap_loop(shape: Shape) -> bool:
     )
 
 
+def _group_of(size: int):
+    return patch.object(
+        shm_tag_exchange.dist, "get_world_size", side_effect=lambda group=None: size
+    )
+
+
+def _dp_rows(shape: Shape) -> bool:
+    with _group_of(get_parallel().tp_size):
+        declined = dp_sync_exchange._decline_reason(group=object())
+    return declined is None and _exchange_hosts(shape) > 0
+
+
 def _freed_slots(shape: Shape) -> bool:
     return (
         _pd_decode_overlap_loop(shape) and decode_freed_slots.freed_slot_admission_on()
@@ -239,6 +264,7 @@ def _freed_slots(shape: Shape) -> bool:
 
 
 RESOLVERS: Dict[str, Callable[[Shape], bool]] = {
+    "SGLANG_OPT_SCHEDULER_SHM_SYNC_DP_ROWS": _dp_rows,
     "SGLANG_OPT_PD_DECODE_ADMIT_FREED_SLOTS": _freed_slots,
 }
 
@@ -321,7 +347,7 @@ _NO_STAGING = _children()
 # A PD decode with attention DP; the exchange rows on at most two hosts, the
 # post-verify graphs with a bound gathered sampler.
 _PD_DECODE_DP = _children()
-_DP_EXCHANGE = _children()
+_DP_EXCHANGE = _children("SCHEDULER_SHM_SYNC_DP_ROWS")
 _DP_GRAPHS = _children()
 # A top-k-1 EAGLE chain outside a PD prefill and attention DP: the generic paths,
 # then those of the TRT-LLM MHA backend, the vocab-shard verify and the model trait.

@@ -18,6 +18,9 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.scheduler_components.dp_sync_exchange import (
+    exchange_dp_sync_rows,
+)
 from sglang.srt.managers.scheduler_components.metrics_reporter import (
     _decode_total_seq_lens,
     _prefill_attention_pairs,
@@ -74,7 +77,14 @@ def exchange_sync_rows(
     """Fill ``global_flat`` with every rank's ``local_row`` in group-rank order,
     like ``all_gather_single``. On gloo the all-gather is a ring of world_size - 1
     serial hops; gather + broadcast is one hop plus a log-depth tree. At two
-    ranks the ring is the single hop, so it stays."""
+    ranks the ring is the single hop, so it stays.
+
+    A PD decode scheduler with SGLANG_OPT_SCHEDULER_SHM_SYNC_DP_ROWS gathers CPU
+    rows through the shared-memory exchange instead (dp_sync_exchange.py)."""
+    if local_row.device.type == "cpu" and exchange_dp_sync_rows(
+        global_flat, local_row, group=group
+    ):
+        return
     world_size = torch.distributed.get_world_size(group)
     if local_row.device.type != "cpu" or world_size <= 2:
         all_gather_single(global_flat, local_row, group=group)

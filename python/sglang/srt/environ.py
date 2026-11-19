@@ -749,6 +749,12 @@ class Envs:
     # Most per-request states the detokenizer keeps; past it, the oldest is
     # evicted. See https://github.com/sgl-project/sglang/issues/2812
     SGLANG_DETOKENIZER_MAX_STATES = EnvInt(1 << 16)
+    # PD decode under attention DP: each pass's cross-DP sync rows go through the
+    # scheduler's shared-memory exchange instead of a gloo gather and broadcast,
+    # the same rows (dp_sync_exchange.py). Needs SGLANG_OPT_SCHEDULER_SHM_SYNC.
+    SGLANG_OPT_SCHEDULER_SHM_SYNC_DP_ROWS = EnvBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
 
     # ===================================================================
     # Beam search
