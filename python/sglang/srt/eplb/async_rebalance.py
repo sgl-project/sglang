@@ -37,14 +37,19 @@ class Control(Protocol):
     def drained(self, success: bool) -> bool: ...
 
 
+WeightWriteback = Callable[[], None]
+
+
 class Runtime(Protocol):
     def prepare(self, placement: Any) -> tuple[int, ...]: ...
 
     def preparation_ready(self) -> bool: ...
 
-    def stage(self, layer: int) -> Callable[[], None]: ...
+    def record_source_ready(self) -> None: ...
 
-    def install(self, layer: int) -> None: ...
+    def stage(self, layer: int) -> WeightWriteback: ...
+
+    def install(self, layer: int, writeback: WeightWriteback) -> None: ...
 
     def synchronize(self) -> None: ...
 
@@ -60,8 +65,8 @@ class AsyncEplbCoordinator:
         self.control, self.runtime, self.timeout = control, runtime, timeout
         self.phase = Phase.IDLE
         self.epoch = 0
-        self.layers: tuple[int, ...] = ()
-        self.index = 0
+        self._layers: tuple[int, ...] = ()
+        self.layers_installed = 0
         self._future: Future | None = None
         self._error: BaseException | None = None
         self._stage_deadline = 0.0
@@ -76,36 +81,29 @@ class AsyncEplbCoordinator:
         if self.phase != Phase.IDLE or self._closed:
             raise RuntimeError("EPLB coordinator is not idle")
         self.epoch += 1
-        self.layers, self.index, self._error = (), 0, None
+        self._layers = ()
+        self.layers_installed = 0
+        self._error = None
         self._future = self._executor.submit(planner)
         self.phase = Phase.PLANNING
 
-    def _future_ready(self) -> bool:
-        if self._future is None or not self._future.done():
+    def _local_ready(self, layer: int) -> bool:
+        if self._error is not None:
             return False
-        self._error = self._future.exception()
-        return True
-
-    def poll(self) -> bool:
-        """Called by every EP rank at the same target-forward boundary."""
-        if not self.active:
-            return self.phase == Phase.IDLE
-        layer = self.layers[self.index] if self.phase == Phase.STAGING else -1
         try:
-            ready = (
-                self.runtime.preparation_ready()
-                if self.phase == Phase.PREPARING
-                else self._future_ready()
-            )
+            if self.phase == Phase.PREPARING:
+                return self.runtime.preparation_ready()
+            if self._future is not None and self._future.done():
+                self._error = self._future.exception()
+                return self._error is None
+            if self.phase == Phase.STAGING and time.monotonic() >= self._stage_deadline:
+                self._error = TimeoutError(f"EPLB P2P did not finish for layer {layer}")
         except Exception as error:
-            self._error, ready = error, False
-        if (
-            self.phase == Phase.STAGING
-            and not ready
-            and self._error is None
-            and time.monotonic() >= self._stage_deadline
-        ):
-            self._error = TimeoutError(f"EPLB P2P did not finish for layer {layer}")
+            self._error = error
+        return False
+
+    def _all_ranks_ready(self, layer: int) -> bool:
+        ready = self._local_ready(layer)
         try:
             all_ready, any_error = self.control.vote(
                 self.epoch, int(self.phase), layer, ready, self._error is not None
@@ -118,34 +116,45 @@ class AsyncEplbCoordinator:
                 self._fatal("EPLB staging failed; P2P completion unknown", cause)
             self.cancel()
             raise RebalanceAborted("EPLB aborted on at least one rank") from cause
-        if not all_ready:
+        return all_ready
+
+    def poll(self) -> bool:
+        """Advance one phase after all ranks agree at a forward boundary."""
+        if not self.active:
+            return self.phase == Phase.IDLE
+        layer = (
+            self._layers[self.layers_installed] if self.phase == Phase.STAGING else -1
+        )
+        if not self._all_ranks_ready(layer):
             return False
+
         if self.phase == Phase.PLANNING:
             try:
-                self.layers = self.runtime.prepare(self._future.result())
+                self._layers = self.runtime.prepare(self._future.result())
             except Exception as error:
                 self._error = error
             self._future = None
             self.phase = Phase.PREPARING
             return False
-        if self.phase == Phase.PREPARING:
-            if not self.layers:
-                self.phase = Phase.IDLE
-                return True
-        else:
+        if self.phase == Phase.STAGING:
             try:
-                self.runtime.install(layer)
+                writeback = self._future.result()
+                self.runtime.install(layer, writeback)
             except Exception as error:
                 self._fatal("EPLB install failed; layout integrity unknown", error)
-            self.index += 1
-            if self.index == len(self.layers):
-                self.phase = Phase.IDLE
-                return True
+            self._future = None
+            self.layers_installed += 1
+
+        if self.layers_installed == len(self._layers):
+            self.phase = Phase.IDLE
+            return True
+
         self.phase = Phase.STAGING
         self._stage_deadline = time.monotonic() + self.timeout
         try:
-            work = self.runtime.stage(self.layers[self.index])
-            self._future = self._executor.submit(work)
+            self.runtime.record_source_ready()
+            next_layer = self._layers[self.layers_installed]
+            self._future = self._executor.submit(self.runtime.stage, next_layer)
         except Exception as error:
             self._error = error
             self._future = None

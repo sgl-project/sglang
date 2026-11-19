@@ -253,7 +253,7 @@ class EPLBManager:
             "Async EPLB epoch=%d layers=%d elapsed=%.3fs control_wait=%.6fs "
             "stage=%.6fs install_enqueue=%.6fs",
             coordinator.epoch,
-            coordinator.index,
+            coordinator.layers_installed,
             time.perf_counter() - start,
             coordinator.control.wait_seconds,
             runtime.stage_seconds,

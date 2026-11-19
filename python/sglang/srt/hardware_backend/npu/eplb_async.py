@@ -12,7 +12,7 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.environ import envs
-from sglang.srt.eplb.async_rebalance import AsyncEplbCoordinator
+from sglang.srt.eplb.async_rebalance import AsyncEplbCoordinator, WeightWriteback
 from sglang.srt.eplb.expert_location import ExpertLocationMetadata
 from sglang.srt.eplb.expert_location_updater import stage_expert_weights_single_layer
 from sglang.srt.hardware_backend.npu.eplb import (
@@ -84,12 +84,11 @@ class NpuEplbRuntime:
         plan_group,
         p2p_group,
     ):
-        self.metadata, self.spec = metadata, spec
-        self.rank, self.world_size, self.ranks_per_node = (
-            rank,
-            world_size,
-            ranks_per_node,
-        )
+        self.metadata = metadata
+        self.spec = spec
+        self.rank = rank
+        self.world_size = world_size
+        self.ranks_per_node = ranks_per_node
         self.plan_group = plan_group
         self.p2p_group = p2p_group
         self.log_metrics = get_bool_env_var(
@@ -107,7 +106,6 @@ class NpuEplbRuntime:
         self._owner_stream = self.device_module.current_stream()
         self._owner_ready = self.device_module.Event()
         self._new_metadata = None
-        self._install_weights = None
         self.stage_seconds = self.install_enqueue_seconds = 0.0
 
     def planner(self, counts):
@@ -182,45 +180,45 @@ class NpuEplbRuntime:
         if self.device_module.current_stream() != self._owner_stream:
             raise RuntimeError("EPLB target forwards changed their owning stream")
 
-    def stage(self, layer):
+    def record_source_ready(self) -> None:
         self._check_stream()
         # Single-flight staging lets each layer reuse the event after the
         # previous transfer finishes and its install is on the owner stream.
         self._owner_ready.record(self._owner_stream)
 
-        def transfer():
-            self.device_module.set_device(self.device)
-            start = time.perf_counter()
-            # Work.wait orders the current stream after HCCL. The Future can
-            # advertise readiness only after that dependency has completed.
-            handles = []
-            with self.device_module.stream(self._p2p_stream):
-                self._p2p_stream.wait_event(self._owner_ready)
-                install, _ = stage_expert_weights_single_layer(
-                    self.weights[layer],
-                    self.staging,
-                    self.metadata.physical_to_logical_map_cpu[layer].tolist(),
-                    self._new_metadata.physical_to_logical_map_cpu[layer].tolist(),
-                    self.spec.local_experts,
-                    self.ranks_per_node,
-                    self.rank,
-                    world_size=self.world_size,
-                    log_metrics=self.log_metrics,
-                    group=self.p2p_group,
-                    work_handles=handles,
-                    coalesce=True,
-                )
-                self._p2p_stream.synchronize()
-            self.stage_seconds += time.perf_counter() - start
-            self._install_weights = install
+    def stage(self, layer: int) -> WeightWriteback:
+        """Run on the migration worker. The forward thread owns the writeback."""
+        self.device_module.set_device(self.device)
+        start = time.perf_counter()
+        # Work.wait orders the current stream after HCCL. The Future can
+        # advertise readiness only after that dependency has completed.
+        handles = []
+        with self.device_module.stream(self._p2p_stream):
+            self._p2p_stream.wait_event(self._owner_ready)
+            old_layout = self.metadata.physical_to_logical_map_cpu[layer]
+            new_layout = self._new_metadata.physical_to_logical_map_cpu[layer]
+            writeback, _ = stage_expert_weights_single_layer(
+                routed_experts_weights=self.weights[layer],
+                temp_buffers=self.staging,
+                old_physical_to_logical_map=old_layout.tolist(),
+                new_physical_to_logical_map=new_layout.tolist(),
+                num_local_physical_experts=self.spec.local_experts,
+                num_gpu_per_node=self.ranks_per_node,
+                rank=self.rank,
+                world_size=self.world_size,
+                log_metrics=self.log_metrics,
+                group=self.p2p_group,
+                work_handles=handles,
+                coalesce=True,
+            )
+            self._p2p_stream.synchronize()
+        self.stage_seconds += time.perf_counter() - start
+        return writeback
 
-        return transfer
-
-    def install(self, layer):
+    def install(self, layer: int, writeback: WeightWriteback) -> None:
         self._check_stream()
         start = time.perf_counter()
-        self._install_weights()
-        self._install_weights = None
+        writeback()
         self.metadata.update(self._new_metadata, update_layer_ids=[layer])
         if layer == self._last_layer:
             self._new_metadata = None
@@ -230,7 +228,7 @@ class NpuEplbRuntime:
         # The coordinator joins the worker before draining both streams.
         self._p2p_stream.synchronize()
         self._owner_stream.synchronize()
-        self._install_weights = self._new_metadata = None
+        self._new_metadata = None
 
     def close(self):
         dist.destroy_process_group(self.p2p_group)
