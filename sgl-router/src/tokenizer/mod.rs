@@ -156,6 +156,8 @@ impl TokenizerRegistry {
             always_thinks: false,
             reasoning_toggle: None,
             chat_encoding_spec: None,
+            // The workers apply their conversation template's stop strings.
+            template_stops: Vec::new(),
             deepseek: None,
         };
         me.inner.insert(m.id.clone(), t);
