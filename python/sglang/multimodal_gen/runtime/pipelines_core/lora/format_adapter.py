@@ -31,6 +31,13 @@ class LoRAFormat(str, Enum):
     AI_TOOLKIT_FLUX = "ai-toolkit-flux"
 
 
+# Formats whose conversion already folds alpha / rank into A/B, so the loader
+# must not scale by a global alpha from the file's metadata again.
+FORMATS_WITH_FOLDED_ALPHA = frozenset(
+    {LoRAFormat.KOHYA_QWEN_IMAGE, LoRAFormat.KOHYA_Z_IMAGE}
+)
+
+
 def _sample_keys(keys: Iterable[str], k: int = 20) -> list[str]:
     out = []
     for i, key in enumerate(keys):
@@ -230,10 +237,20 @@ def _looks_like_ai_toolkit_flux_lora(state_dict: Mapping[str, torch.Tensor]) -> 
     return (has_double_blocks or has_single_blocks) and has_lora_ab
 
 
+def _is_qwen_image_dit(dit_class_name: str | None) -> bool:
+    # endswith also matches wrapper classes such as FSDPQwenImageTransformer2DModel;
+    # Qwen-Image 2.1 (QwenImage21Transformer2DModel) uses a different layout.
+    return bool(dit_class_name) and dit_class_name.endswith(
+        "QwenImageTransformer2DModel"
+    )
+
+
 def detect_lora_format_from_state_dict(
     state_dict: Mapping[str, torch.Tensor],
+    dit_class_name: str | None = None,
 ) -> LoRAFormat:
-    """Classify LoRA format by key patterns only."""
+    """Classify LoRA format by key patterns, using the loaded DiT class where
+    the keys alone are ambiguous."""
     keys = list(state_dict.keys())
     if not keys:
         return LoRAFormat.STANDARD
@@ -251,6 +268,12 @@ def detect_lora_format_from_state_dict(
     if _looks_like_kohya_flux(state_dict):
         return LoRAFormat.KOHYA_FLUX
     if _looks_like_kohya_qwen_image(state_dict):
+        return LoRAFormat.KOHYA_QWEN_IMAGE
+    # An attention-only Qwen-Image LoRA has no img/txt mlp or mod names, and its
+    # `transformer_blocks_N_attn_*` keys are shared with other MMDiTs.
+    if _is_qwen_image_dit(dit_class_name) and _has_prefix_key(
+        keys, "lora_unet_transformer_blocks_"
+    ):
         return LoRAFormat.KOHYA_QWEN_IMAGE
     if _looks_like_kohya_z_image(state_dict):
         return LoRAFormat.KOHYA_Z_IMAGE
@@ -708,8 +731,26 @@ def normalize_lora_state_dict(
     logger: Optional[logging.Logger] = None,
     *,
     adapter_config: Mapping[str, Any] | None = None,
+    dit_class_name: str | None = None,
 ) -> Dict[str, torch.Tensor]:
     """Normalize any supported LoRA format into a single canonical layout."""
+    normalized, _ = normalize_lora_state_dict_with_format(
+        state_dict,
+        logger,
+        adapter_config=adapter_config,
+        dit_class_name=dit_class_name,
+    )
+    return normalized
+
+
+def normalize_lora_state_dict_with_format(
+    state_dict: Mapping[str, torch.Tensor],
+    logger: Optional[logging.Logger] = None,
+    *,
+    adapter_config: Mapping[str, Any] | None = None,
+    dit_class_name: str | None = None,
+) -> tuple[Dict[str, torch.Tensor], LoRAFormat]:
+    """Like normalize_lora_state_dict, also returning the detected format."""
     log = logger or globals()["logger"]
 
     state_dict = normalize_peft_keys(state_dict)
@@ -724,7 +765,7 @@ def normalize_lora_state_dict(
             ", ".join(_sample_keys(keys, 20)),
         )
 
-    fmt = detect_lora_format_from_state_dict(state_dict)
+    fmt = detect_lora_format_from_state_dict(state_dict, dit_class_name)
     log.info("[LoRAFormatAdapter] detected format: %s", fmt)
 
     normalized = convert_lora_state_dict_by_format(state_dict, fmt, log)
@@ -737,4 +778,4 @@ def normalize_lora_state_dict(
             ", ".join(_sample_keys(norm_keys, 20)),
         )
 
-    return normalized
+    return normalized, fmt

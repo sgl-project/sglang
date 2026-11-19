@@ -5,9 +5,11 @@ import pytest
 import torch
 
 from sglang.multimodal_gen.runtime.pipelines_core.lora.format_adapter import (
+    FORMATS_WITH_FOLDED_ALPHA,
     LoRAFormat,
     detect_lora_format_from_state_dict,
     normalize_lora_state_dict,
+    normalize_lora_state_dict_with_format,
 )
 
 RANK, ALPHA, DIM = 4, 8.0, 16
@@ -85,3 +87,30 @@ def test_kohya_mmdit_without_qwen_modules_is_not_qwen_image():
         ]
     )
     assert detect_lora_format_from_state_dict(sd) == LoRAFormat.NON_DIFFUSERS_SD
+
+
+@pytest.mark.parametrize(
+    "dit_class_name,expected",
+    [
+        (None, LoRAFormat.NON_DIFFUSERS_SD),
+        ("FluxTransformer2DModel", LoRAFormat.NON_DIFFUSERS_SD),
+        ("QwenImageTransformer2DModel", LoRAFormat.KOHYA_QWEN_IMAGE),
+        ("FSDPQwenImageTransformer2DModel", LoRAFormat.KOHYA_QWEN_IMAGE),
+    ],
+)
+def test_attention_only_qwen_kohya_resolves_by_loaded_dit(dit_class_name, expected):
+    # Trained only on to_q / to_v: no img/txt mlp or mod names to identify Qwen-Image.
+    modules = ["transformer_blocks_0_attn_to_q", "transformer_blocks_0_attn_to_v"]
+    sd = _kohya(modules)
+    assert detect_lora_format_from_state_dict(sd, dit_class_name) == expected
+
+    if expected == LoRAFormat.KOHYA_QWEN_IMAGE:
+        out, fmt = normalize_lora_state_dict_with_format(
+            sd, dit_class_name=dit_class_name
+        )
+        assert fmt in FORMATS_WITH_FOLDED_ALPHA
+        assert set(out) == {
+            f"transformer_blocks.0.attn.to_{p}.lora_{ab}.weight"
+            for p in "qv"
+            for ab in "AB"
+        }
