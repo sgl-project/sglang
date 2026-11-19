@@ -37,6 +37,8 @@ class CacheInitParams:
     enable_metrics: bool = False
     enable_kv_cache_events: bool = False
     dynamo_kv_event_format: bool = False
+    # Also publish recurrent-state checkpoint events (KVEventsConfig).
+    publish_recurrent_checkpoints: bool = False
     # LoRA names for KV events; the scheduler registers requests in it.
     kv_event_lora_names: KvEventLoraNames = dataclasses.field(
         default_factory=KvEventLoraNames

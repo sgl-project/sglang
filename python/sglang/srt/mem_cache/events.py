@@ -25,6 +25,8 @@ from collections import OrderedDict
 from typing import TYPE_CHECKING, Any, Iterable, Optional
 
 from sglang.srt.disaggregation.kv_events import (
+    RECURRENT_CHECKPOINT_GROUP_IDX,
+    RECURRENT_CHECKPOINT_SPEC_KIND,
     AllBlocksCleared,
     BlockRemoved,
     BlockStored,
@@ -267,12 +269,17 @@ class KVCacheEventRecorder:
         page_size: int,
         dynamo_format: bool = False,
         lora_names: Optional[KvEventLoraNames] = None,
+        recurrent_checkpoints: bool = False,
     ):
         self.enabled = enabled
         if enabled and dynamo_format:
             enable_mm_routing_labels()
         self.page_size = page_size
         self.dynamo_format = dynamo_format
+        # Publish recurrent-state checkpoints (KVEventsConfig
+        # ``publish_recurrent_checkpoints``); ``record_state_*`` are no-ops
+        # otherwise.
+        self.recurrent_checkpoints = enabled and recurrent_checkpoints
         self.lora_names = lora_names if lora_names is not None else KvEventLoraNames()
         self._queue: list = []
 
@@ -287,13 +294,19 @@ class KVCacheEventRecorder:
             tail = self._queue[-1]
 
             if isinstance(tail, BlockRemoved) and isinstance(event, BlockRemoved):
-                if tail.medium == event.medium:
+                if (
+                    tail.medium == event.medium
+                    and tail.group_idx == event.group_idx
+                    and tail.kv_cache_spec_kind == event.kv_cache_spec_kind
+                ):
                     tail.block_hashes.extend(event.block_hashes)
                     return
 
             elif isinstance(tail, BlockStored) and isinstance(event, BlockStored):
                 if (
                     tail.medium == event.medium
+                    and tail.group_idx == event.group_idx
+                    and tail.kv_cache_spec_kind == event.kv_cache_spec_kind
                     and tail.lora_id == event.lora_id
                     and tail.block_size == event.block_size
                     and tail.cache_salt == event.cache_salt
@@ -453,6 +466,76 @@ class KVCacheEventRecorder:
 
         if block_hashes:
             self.enqueue(BlockRemoved(block_hashes=block_hashes, medium=medium))
+
+    def _checkpoint_block_hash(self, node: Any) -> Optional[int]:
+        """The published hash of the page a recurrent state on ``node`` is
+        valid at: the node's last page, which is also the last hash the
+        attention ``BlockStored`` for this node carries."""
+        event_hash_values = self._node_event_hash_values(node)
+        if not event_hash_values:
+            return None
+        return namespaced_block_hash(
+            hash_str_to_int64(event_hash_values[-1]),
+            namespace_seed=self._namespace_seed(node),
+        )
+
+    def record_state_store(self, node: Any, medium=None) -> None:
+        """One recurrent-state checkpoint cached on ``node`` (at its end).
+
+        Emitted when the state is set, which may happen on a node whose
+        attention pages were stored earlier (a tombstone regaining a state, or
+        a load-back), so this is an event of its own, not a field of the
+        attention store.
+        """
+        if not self.recurrent_checkpoints:
+            return
+        if medium is None:
+            medium = StorageMedium.GPU
+        block_hash = self._checkpoint_block_hash(node)
+        if block_hash is None:
+            return
+        parent_block_hash = self._parent_block_hash(node)
+        if parent_block_hash is not None:
+            parent_block_hash = namespaced_block_hash(
+                parent_block_hash, namespace_seed=self._namespace_seed(node)
+            )
+        self.enqueue(
+            BlockStored(
+                block_hashes=[block_hash],
+                parent_block_hash=parent_block_hash,
+                token_ids=[],
+                block_size=self.page_size,
+                lora_id=None,
+                medium=medium,
+                cache_salt=node.key.cache_salt,
+                lora_name=(
+                    self.lora_names.resolve(node.key.extra_key)
+                    if self.dynamo_format
+                    else self.lora_names.get(node.key.extra_key)
+                ),
+                group_idx=RECURRENT_CHECKPOINT_GROUP_IDX,
+                kv_cache_spec_kind=RECURRENT_CHECKPOINT_SPEC_KIND,
+            )
+        )
+
+    def record_state_remove(self, node: Any, medium=None) -> None:
+        """The recurrent state on ``node`` is gone from ``medium``; its
+        attention pages may stay (a tombstone)."""
+        if not self.recurrent_checkpoints:
+            return
+        if medium is None:
+            medium = StorageMedium.GPU
+        block_hash = self._checkpoint_block_hash(node)
+        if block_hash is None:
+            return
+        self.enqueue(
+            BlockRemoved(
+                block_hashes=[block_hash],
+                medium=medium,
+                group_idx=RECURRENT_CHECKPOINT_GROUP_IDX,
+                kv_cache_spec_kind=RECURRENT_CHECKPOINT_SPEC_KIND,
+            )
+        )
 
     def record_all_cleared(self) -> None:
         if not self.enabled:

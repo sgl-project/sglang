@@ -406,6 +406,7 @@ pub struct TreeCoreInitParamsBinding {
     pub swa_req_ring: bool,
     pub enable_kv_cache_events: bool,
     pub dynamo_kv_event_format: bool,
+    pub publish_recurrent_checkpoints: bool,
     pub mamba_cache_chunk_size: Option<usize>,
     pub mamba_max_states_per_path: Option<usize>,
     pub mamba_host_only_checkpoint: bool,
@@ -432,6 +433,7 @@ impl TreeCoreInitParamsBinding {
             has_swa_host_pool: false,
             enable_kv_cache_events: self.enable_kv_cache_events,
             dynamo_kv_event_format: self.dynamo_kv_event_format,
+            publish_recurrent_checkpoints: self.publish_recurrent_checkpoints,
             mamba_cache_chunk_size: self.mamba_cache_chunk_size,
             mamba_max_states_per_path: self.mamba_max_states_per_path,
             mamba_host_only_checkpoint: self.mamba_host_only_checkpoint,
@@ -443,7 +445,7 @@ impl TreeCoreInitParamsBinding {
 #[pymethods]
 impl TreeCoreInitParamsBinding {
     #[new]
-    #[pyo3(signature = (eviction_policy = "lru".to_string(), page_size = 1, is_write_back = false, enable_hicache = false, write_through_threshold = 256, device = "cpu".to_string(), swa_sliding_window_size = None, enable_kv_cache_events = false, mamba_cache_chunk_size = None, mamba_max_states_per_path = None, slru_protected_threshold = 2, swa_req_ring = false, tlru_tail_budget = 0, tlru_float_config = None, dynamo_kv_event_format = false, mamba_host_only_checkpoint = false, joint_lru = false, state_cost = None))]
+    #[pyo3(signature = (eviction_policy = "lru".to_string(), page_size = 1, is_write_back = false, enable_hicache = false, write_through_threshold = 256, device = "cpu".to_string(), swa_sliding_window_size = None, enable_kv_cache_events = false, mamba_cache_chunk_size = None, mamba_max_states_per_path = None, slru_protected_threshold = 2, swa_req_ring = false, tlru_tail_budget = 0, tlru_float_config = None, dynamo_kv_event_format = false, mamba_host_only_checkpoint = false, joint_lru = false, state_cost = None, publish_recurrent_checkpoints = false))]
     fn new(
         eviction_policy: String,
         page_size: usize,
@@ -463,6 +465,7 @@ impl TreeCoreInitParamsBinding {
         mamba_host_only_checkpoint: bool,
         joint_lru: bool,
         state_cost: Option<(f64, f64)>,
+        publish_recurrent_checkpoints: bool,
     ) -> Self {
         TreeCoreInitParamsBinding {
             eviction_policy,
@@ -479,6 +482,7 @@ impl TreeCoreInitParamsBinding {
             swa_req_ring,
             enable_kv_cache_events,
             dynamo_kv_event_format,
+            publish_recurrent_checkpoints,
             mamba_cache_chunk_size,
             mamba_max_states_per_path,
             mamba_host_only_checkpoint,
@@ -2173,6 +2177,40 @@ macro_rules! tree_core_methods {
                             let item: Py<PyAny> = (
                                 "block_removed",
                                 block_hashes,
+                                medium.as_str(),
+                                extra_key.map(|extra_key| extra_key.to_string()),
+                            )
+                                .into_py_any(py)?;
+                            list.append(item)?;
+                        }
+                        KvCacheEvent::StateStored {
+                            block_hash,
+                            parent_block_hash,
+                            block_size,
+                            medium,
+                            cache_salt,
+                            extra_key,
+                        } => {
+                            let item: Py<PyAny> = (
+                                "state_stored",
+                                block_hash,
+                                parent_block_hash,
+                                block_size,
+                                medium.as_str(),
+                                cache_salt.map(|salt| salt.to_string()),
+                                extra_key.map(|extra_key| extra_key.to_string()),
+                            )
+                                .into_py_any(py)?;
+                            list.append(item)?;
+                        }
+                        KvCacheEvent::StateRemoved {
+                            block_hash,
+                            medium,
+                            extra_key,
+                        } => {
+                            let item: Py<PyAny> = (
+                                "state_removed",
+                                block_hash,
                                 medium.as_str(),
                                 extra_key.map(|extra_key| extra_key.to_string()),
                             )

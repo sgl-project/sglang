@@ -10,6 +10,8 @@ from typing import TYPE_CHECKING, Callable, Mapping, Optional, Sequence
 import torch
 
 from sglang.srt.disaggregation.kv_events import (
+    RECURRENT_CHECKPOINT_GROUP_IDX,
+    RECURRENT_CHECKPOINT_SPEC_KIND,
     AllBlocksCleared,
     BlockRemoved,
     BlockStored,
@@ -168,6 +170,46 @@ def _kv_event_from_tagged(
                 namespaced_block_hash(h, namespace_seed=seed) for h in event[1]
             ],
             medium=StorageMedium(event[2]),
+        )
+    if tag == "state_stored":
+        # (tag, block_hash, parent_block_hash, block_size, medium, cache_salt, extra_key)
+        lora_name = (
+            lora_names.resolve(event[6]) if dynamo_format else lora_names.get(event[6])
+        )
+        seed = (
+            kv_event_namespace_seed(extra_key=event[6], cache_salt=None)
+            if not dynamo_format and lora_name is not None
+            else None
+        )
+        parent = event[2]
+        return BlockStored(
+            block_hashes=[namespaced_block_hash(event[1], namespace_seed=seed)],
+            parent_block_hash=(
+                None
+                if parent is None
+                else namespaced_block_hash(parent, namespace_seed=seed)
+            ),
+            token_ids=[],
+            block_size=event[3],
+            lora_id=None,
+            medium=StorageMedium(event[4]),
+            cache_salt=event[5],
+            lora_name=lora_name,
+            group_idx=RECURRENT_CHECKPOINT_GROUP_IDX,
+            kv_cache_spec_kind=RECURRENT_CHECKPOINT_SPEC_KIND,
+        )
+    if tag == "state_removed":
+        # (tag, block_hash, medium, extra_key)
+        seed = (
+            kv_event_namespace_seed(extra_key=event[3], cache_salt=None)
+            if not dynamo_format and lora_names.get(event[3]) is not None
+            else None
+        )
+        return BlockRemoved(
+            block_hashes=[namespaced_block_hash(event[1], namespace_seed=seed)],
+            medium=StorageMedium(event[2]),
+            group_idx=RECURRENT_CHECKPOINT_GROUP_IDX,
+            kv_cache_spec_kind=RECURRENT_CHECKPOINT_SPEC_KIND,
         )
     if tag == "all_blocks_cleared":
         return AllBlocksCleared()
@@ -609,6 +651,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 swa_req_ring=not params.swa_gates_prefix_match,
                 enable_kv_cache_events=params.enable_kv_cache_events,
                 dynamo_kv_event_format=params.dynamo_kv_event_format,
+                publish_recurrent_checkpoints=params.publish_recurrent_checkpoints,
                 mamba_cache_chunk_size=(
                     numbers[TREE_STATE].checkpoint_interval if has_mamba else None
                 ),

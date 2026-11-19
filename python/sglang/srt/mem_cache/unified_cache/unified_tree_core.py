@@ -544,6 +544,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             page_size=self.page_size,
             dynamo_format=params.dynamo_kv_event_format,
             lora_names=params.kv_event_lora_names,
+            recurrent_checkpoints=params.publish_recurrent_checkpoints,
         )
 
         self.reset()

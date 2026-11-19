@@ -558,6 +558,9 @@ pub struct CacheInitParams {
     pub enable_kv_cache_events: bool,
     /// If true, events use the dynamo format: namespaced block hashes and extra_key.
     pub dynamo_kv_event_format: bool,
+    /// Whether cached recurrent (Mamba) states also publish checkpoint events
+    /// (`StateStored` / `StateRemoved`), keyed by the node's last page hash.
+    pub publish_recurrent_checkpoints: bool,
     /// Chunk alignment for the mamba branching seqlen; None when Mamba is disabled.
     pub mamba_cache_chunk_size: Option<usize>,
     /// Per-root-path cap on cached Mamba states; None means unlimited.
@@ -588,6 +591,7 @@ impl Default for CacheInitParams {
             has_swa_host_pool: false,
             enable_kv_cache_events: false,
             dynamo_kv_event_format: false,
+            publish_recurrent_checkpoints: false,
             mamba_cache_chunk_size: None,
             mamba_max_states_per_path: None,
             mamba_host_only_checkpoint: false,
@@ -673,6 +677,8 @@ pub struct UnifiedTreeCore<K: ChildKeyType> {
     pub(crate) enable_kv_cache_events: bool,
     /// If true, events use the dynamo format: namespaced block hashes and extra_key.
     pub(crate) dynamo_kv_event_format: bool,
+    /// Whether cached Mamba states publish StateStored / StateRemoved events.
+    pub(crate) publish_recurrent_checkpoints: bool,
     /// Queued placement events, drained by take_events.
     pub(crate) kv_event_queue: Vec<KvCacheEvent<K::Atom>>,
     /// Namespaced event hashes, seeded only by cache_salt; events omit extra_key.
@@ -1064,6 +1070,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             has_swa_host_pool: params.has_swa_host_pool,
             enable_kv_cache_events: params.enable_kv_cache_events,
             dynamo_kv_event_format: params.dynamo_kv_event_format,
+            publish_recurrent_checkpoints: params.enable_kv_cache_events
+                && params.publish_recurrent_checkpoints,
             kv_event_queue: Vec::new(),
             namespaced_event_hashes: HashMap::new(),
             write_through_threshold: params.write_through_threshold,
@@ -4182,6 +4190,89 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         }
     }
 
+    /// The published hash of `node_id`'s last page (what a recurrent state on
+    /// the node is keyed by), and the hash it links back to. Hashes lazily.
+    fn checkpoint_block_hashes_(&mut self, node_id: NodeIdx_) -> Option<(i64, Option<i64>)> {
+        if self.arena.node(node_id).hash_value.is_none() {
+            let hash_values = self.arena.compute_node_hash_values(node_id, self.page_size);
+            self.arena.node_mut(node_id).hash_value = Some(hash_values);
+        }
+        let namespaced = self.arena.node(node_id).namespace != KeyNamespace::default();
+        if namespaced {
+            self.ensure_namespaced_event_hashes_(node_id);
+        }
+        let namespace_seed = self.namespace_seed_(node_id);
+        let node = self.arena.node(node_id);
+        let num_pages = node.key.atom_len().div_ceil(self.page_size);
+        if num_pages == 0 {
+            return None;
+        }
+        let last = if namespaced {
+            self.namespaced_event_hashes[&node.id]
+                .get(num_pages - 1)
+                .map(crate::node::hash_digest_to_int64)
+        } else {
+            node.hash_value
+                .as_ref()
+                .expect("hashed above")
+                .get(num_pages - 1)
+                .map(|hash| crate::node::hash_str_to_int64(hash))
+        }?;
+        let parent = node
+            .parent
+            .and_then(|parent_id| {
+                let parent = self.arena.node(parent_id);
+                if namespaced {
+                    self.namespaced_event_hashes
+                        .get(&parent.id)
+                        .and_then(|hashes| hashes.last())
+                        .map(crate::node::hash_digest_to_int64)
+                } else {
+                    parent
+                        .get_last_hash_value()
+                        .map(crate::node::hash_str_to_int64)
+                }
+            })
+            .map(|parent| namespaced_block_hash(namespace_seed.as_ref(), parent));
+        Some((namespaced_block_hash(namespace_seed.as_ref(), last), parent))
+    }
+
+    /// Queue a StateStored for the recurrent state now cached on `node_id`.
+    pub(crate) fn record_state_store_event_(&mut self, node_id: NodeIdx_, medium: StorageMedium) {
+        if !self.publish_recurrent_checkpoints {
+            return;
+        }
+        let Some((block_hash, parent_block_hash)) = self.checkpoint_block_hashes_(node_id) else {
+            return;
+        };
+        let node = self.arena.node(node_id);
+        let event = KvCacheEvent::StateStored {
+            block_hash,
+            parent_block_hash,
+            block_size: self.page_size,
+            medium,
+            cache_salt: node.namespace.cache_salt_arc(),
+            extra_key: node.namespace.extra_key_arc(),
+        };
+        self.enqueue_kv_event_(event);
+    }
+
+    /// Queue a StateRemoved for the recurrent state that left `node_id`.
+    pub(crate) fn record_state_remove_event_(&mut self, node_id: NodeIdx_, medium: StorageMedium) {
+        if !self.publish_recurrent_checkpoints {
+            return;
+        }
+        let Some((block_hash, _)) = self.checkpoint_block_hashes_(node_id) else {
+            return;
+        };
+        let extra_key = self.arena.node(node_id).namespace.extra_key_arc();
+        self.enqueue_kv_event_(KvCacheEvent::StateRemoved {
+            block_hash,
+            medium,
+            extra_key,
+        });
+    }
+
     /// The namespaced-hash seed of `node_id`; None in the default format.
     fn namespace_seed_(&self, node_id: NodeIdx_) -> Option<HashDigest> {
         if !self.dynamo_kv_event_format {
@@ -6692,6 +6783,25 @@ pub enum KvCacheEvent<A> {
     },
     BlockRemoved {
         block_hashes: Vec<i64>,
+        medium: StorageMedium,
+        extra_key: Option<Arc<str>>,
+    },
+    /// A recurrent (Mamba) state cached at the end of a node: `block_hash` is
+    /// the node's last page hash, which the attention BlockStored for that
+    /// page also carries. Python publishes it as a tagged BlockStored
+    /// (`kv_cache_spec_kind="mamba"`, no token ids).
+    StateStored {
+        block_hash: i64,
+        parent_block_hash: Option<i64>,
+        block_size: usize,
+        medium: StorageMedium,
+        cache_salt: Option<Arc<str>>,
+        extra_key: Option<Arc<str>>,
+    },
+    /// The recurrent state at `block_hash` left `medium`; the attention pages
+    /// of that node may stay.
+    StateRemoved {
+        block_hash: i64,
         medium: StorageMedium,
         extra_key: Option<Arc<str>>,
     },
