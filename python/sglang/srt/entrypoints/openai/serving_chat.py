@@ -452,6 +452,11 @@ class OpenAIServingChat(OpenAIServingBase):
             and self.tokenizer_manager.model_config.hf_config.model_type
             == "minimax_m3_vl"
         )
+        self.is_gigachat4 = (
+            hasattr(self.tokenizer_manager.model_config, "hf_config")
+            and hasattr(self.tokenizer_manager.model_config.hf_config, "model_type")
+            and self.tokenizer_manager.model_config.hf_config.model_type == "gigachat4"
+        )
 
         # Which Python-based chat encoder (if any) bypasses apply_chat_template.
         # Values: "dsv32", "dsv4", or custom values set by subclass. None for default.
@@ -2074,7 +2079,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
         else:
             # These templates pair tool results by position.
-            sort_text_runs = self.is_minimax_m3 or self.tool_call_parser == "gigachat4"
+            sort_text_runs = self.is_minimax_m3 or self.is_gigachat4
             if (
                 self.template_manager.jinja_template_may_reorder_tool_results
                 or sort_text_runs

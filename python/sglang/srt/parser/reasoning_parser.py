@@ -415,6 +415,9 @@ class DeepSeekR1Detector(BaseReasoningFormatDetector):
 class GigaChat4Detector(BaseReasoningFormatDetector):
     """Split the template-prefilled think block according to the request's mode."""
 
+    _end_markers = ("</s>", "<|message_sep|>")
+    _trailing_markers = re.compile(r"(?:</s>|<\|message_sep\|>)+\s*$")
+
     def __init__(
         self,
         stream_reasoning: bool = True,
@@ -434,13 +437,37 @@ class GigaChat4Detector(BaseReasoningFormatDetector):
             reasoning_default="reasoning",
             force_nonempty_content=force_nonempty_content,
         )
+        self._terminal_buffer = ""
+        self._finishing = False
 
     def _detect_and_parse_impl(self, text: str) -> StreamingParseResult:
+        text = self._trailing_markers.sub("", text)
         if not self._in_reasoning:
             return StreamingParseResult(normal_text=text)
-        return super()._detect_and_parse_impl(text)
+        text = text.removeprefix(self.think_start_token)
+        reasoning_text, _, normal_text = text.partition(self.think_end_token)
+        return StreamingParseResult(
+            reasoning_text=reasoning_text, normal_text=normal_text
+        )
+
+    def _strip_leading_think_start(self, text: str) -> str:
+        return text
 
     def _parse_streaming_increment_impl(self, new_text: str) -> StreamingParseResult:
+        new_text = self._terminal_buffer + new_text
+        self._terminal_buffer = ""
+        if not self._finishing:
+            holdback = max(
+                self._ends_with_partial_token(new_text, marker)
+                for marker in self._end_markers
+            )
+            end = len(new_text) - holdback
+            trailing = self._trailing_markers.search(new_text[:end])
+            if trailing is not None:
+                end = trailing.start()
+            self._terminal_buffer = new_text[end:]
+            new_text = new_text[:end]
+
         # The template prefills the think block; answer text cannot reopen it.
         if not self._in_reasoning:
             return StreamingParseResult(normal_text=new_text)
@@ -451,6 +478,16 @@ class GigaChat4Detector(BaseReasoningFormatDetector):
         ):
             self.stripped_think_start = True
         return super()._parse_streaming_increment_impl(new_text)
+
+    def finish(self) -> StreamingParseResult:
+        self._finishing = True
+        self._terminal_buffer = self._trailing_markers.sub("", self._terminal_buffer)
+        result = self.parse_streaming_increment("")
+        end = super().finish()
+        return StreamingParseResult(
+            reasoning_text=result.reasoning_text + end.reasoning_text,
+            normal_text=result.normal_text + end.normal_text,
+        )
 
 
 class IQuestQ1ReasoningDetector(BaseReasoningFormatDetector):
