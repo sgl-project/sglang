@@ -20,12 +20,34 @@ from sglang.test.test_utils import (
     ModelLaunchSettings,
     is_in_ci,
     popen_launch_server,
+    write_github_step_summary,
 )
 from sglang.test.tool_call_test_runner import (
     ToolCallTestParams,
     ToolCallTestResult,
     run_tool_call_test,
 )
+
+
+def _write_combined_github_summary(test_name: str, results: list) -> None:
+    def status(result):
+        return "SKIP" if result is None else "PASS" if result.passed else "FAIL"
+
+    summary = f"### {test_name} - Results\n\n"
+    summary += "| Model | Performance | Accuracy | Tool call | Errors |\n"
+    summary += "| --- | --- | --- | --- | --- |\n"
+    for result in results:
+        errors = "<br>".join(
+            str(error).replace("|", r"\|").replace("\n", "<br>")
+            for error in result["errors"]
+            if error
+        )
+        summary += (
+            f"| {result['model']} | {status(result['perf_result'])} | "
+            f"{status(result['accuracy_result'])} | "
+            f"{status(result['tool_call_result'])} | {errors or '-'} |\n"
+        )
+    write_github_step_summary(summary + "\n")
 
 
 def run_combined_tests(
@@ -235,6 +257,9 @@ def run_combined_tests(
         write_accuracy_github_summary(
             test_name, accuracy_params.dataset, accuracy_results
         )
+
+    if is_in_ci():
+        _write_combined_github_summary(test_name, all_results)
 
     # Print summary
     print("\n" + "=" * 60)
