@@ -7,6 +7,9 @@ set -euxo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+# docker/ci.Dockerfile points this at a fixed path: a job container's HOME changes per job.
+# FlashInfer's own JIT cache must agree, via FLASHINFER_WORKSPACE_BASE.
+CI_CACHE_DIR="${XDG_CACHE_HOME:-${HOME}/.cache}"
 
 # shellcheck source=scripts/ci/utils/git_clone_with_retry.sh
 source "${SCRIPT_DIR}/../utils/git_clone_with_retry.sh"
@@ -368,15 +371,15 @@ setup_cargo_cache() {
     # rust/target, so every job recompiles the whole dependency graph. Move the
     # target dir out of the tree: setuptools-rust has no target-dir option of its
     # own and defers to CARGO_TARGET_DIR, which uv passes to the build backend.
-    # Runner containers built from different images share ${HOME}/.cache, and
+    # Runner containers built from different images share CI_CACHE_DIR, and
     # cargo reruns a cached build-script binary without rebuilding it when only
     # the libc changed, so each glibc gets its own tree.
-    local cargo_target_root="${HOME}/.cache/sglang-cargo-target"
+    local cargo_target_root="${CI_CACHE_DIR}/sglang-cargo-target"
     local libc_tag
     libc_tag="$(getconf GNU_LIBC_VERSION 2>/dev/null | tr ' ' '-')"
     export CARGO_TARGET_DIR="${cargo_target_root}/${libc_tag:-unknown-libc}"
-    local cargo_target_lock="${HOME}/.cache/sglang-cargo-target.lock"
-    mkdir -p "${HOME}/.cache"
+    local cargo_target_lock="${CI_CACHE_DIR}/sglang-cargo-target.lock"
+    mkdir -p "${CI_CACHE_DIR}"
     exec 9>"${cargo_target_lock}"
     echo "Waiting for exclusive cargo target lock: ${cargo_target_lock}"
     flock --exclusive 9
@@ -768,10 +771,10 @@ stabilize_flashinfer_jit_paths() {
         return
     fi
 
-    STABLE_FI_DIR="${HOME}/.cache/flashinfer/_stable_src"
+    STABLE_FI_DIR="${CI_CACHE_DIR}/flashinfer/_stable_src"
 
     # Clear stale cached_ops (keep valid compiled kernels)
-    if [ -d "${HOME}/.cache/flashinfer" ]; then
+    if [ -d "${CI_CACHE_DIR}/flashinfer" ]; then
         STALE_COUNT=0
         while IFS= read -r ninja_file; do
             STALE_PATH=$(grep -o '/tmp/sglang-ci-[^ ]*\|flashinfer-src' "$ninja_file" 2>/dev/null | head -1 || true)
@@ -781,7 +784,7 @@ stabilize_flashinfer_jit_paths() {
                     STALE_COUNT=$((STALE_COUNT + 1))
                 fi
             fi
-        done < <(find "${HOME}/.cache/flashinfer" -name "build.ninja" -type f 2>/dev/null)
+        done < <(find "${CI_CACHE_DIR}/flashinfer" -name "build.ninja" -type f 2>/dev/null)
         echo "Cleaned $STALE_COUNT stale FlashInfer cached_ops (kept valid ones)"
     fi
 
@@ -876,11 +879,11 @@ install_msa() {
         echo "FATAL: no MSA_COMMIT default in docker/Dockerfile.cu134"
         exit 1
     fi
-    msa_dir="${HOME}/.cache/sglang-ci/minimax-msa/${msa_commit}"
-    # Runner containers share ${HOME}/.cache: without the lock, one job's rm -rf
+    msa_dir="${CI_CACHE_DIR}/sglang-ci/minimax-msa/${msa_commit}"
+    # Runner containers share CI_CACHE_DIR: without the lock, one job's rm -rf
     # deletes the tree another job is still cloning.
-    mkdir -p "${HOME}/.cache/sglang-ci"
-    exec 8>"${HOME}/.cache/sglang-ci/minimax-msa.lock"
+    mkdir -p "${CI_CACHE_DIR}/sglang-ci"
+    exec 8>"${CI_CACHE_DIR}/sglang-ci/minimax-msa.lock"
     flock --exclusive 8
     if [ ! -f "${msa_dir}/.complete" ]; then
         rm -rf "$msa_dir"
