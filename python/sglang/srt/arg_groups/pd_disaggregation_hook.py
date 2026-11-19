@@ -121,13 +121,6 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
             unsupported.append(
                 "attention or recurrent state beyond dense full attention"
             )
-        budget = cfg.max_prefill_tokens
-        if cfg.chunked_prefill_size is not None and cfg.chunked_prefill_size > 0:
-            budget = min(budget, cfg.chunked_prefill_size)
-        if tail > budget:
-            raise ValueError(
-                "--disaggregation-decode-tail-tokens must fit the prefill token budget"
-            )
         if resolved_view(server_args).speculative_algorithm is not None:
             unsupported.append(
                 "speculative decoding "
@@ -277,6 +270,22 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                     + ", ".join(unsupported)
                     + ". Remove these options or drop --enable-pd-role-switch."
                 )
+
+
+def validate_pd_decode_tail_budget(server_args: ServerArgs) -> None:
+    """Validate the tail against the final hardware/model-resolved budget."""
+    cfg = resolving_view(server_args)
+    tail = cfg.disaggregation_decode_tail_tokens
+    if not tail:
+        return
+    budget = cfg.max_prefill_tokens
+    if cfg.chunked_prefill_size is not None and cfg.chunked_prefill_size > 0:
+        budget = min(budget, cfg.chunked_prefill_size)
+    if tail > budget:
+        raise ValueError(
+            "--disaggregation-decode-tail-tokens must fit the resolved prefill "
+            f"token budget ({budget})"
+        )
 
 
 def _validate_prefill_complete(server_args: ServerArgs) -> None:

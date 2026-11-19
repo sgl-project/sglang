@@ -4347,9 +4347,13 @@ class SchedulerDisaggregationDecodeMixin:
             )
         )
 
-    def _verify_kv_checksums(
-        self, batch: ScheduleBatch, *, filter_tensors: bool = True
-    ) -> None:
+    def _verify_kv_checksums(self, batch: ScheduleBatch) -> None:
+        keep_indices = self._kv_checksum_keep_indices(batch.reqs)
+        if keep_indices is not None:
+            batch.filter_batch(keep_indices=keep_indices)
+
+    def _kv_checksum_keep_indices(self, reqs: List[Req]) -> Optional[List[int]]:
+        """Retire checksum failures; return survivors only if any rank dropped a request."""
         computer: Optional[KvChecksumComputer] = self.kv_checksum_computer
         if computer is None:
             return
@@ -4357,9 +4361,9 @@ class SchedulerDisaggregationDecodeMixin:
         prealloc_queue = self.disagg_decode_prealloc_queue
         kv_manager = prealloc_queue.kv_manager
         mismatch_prob = envs.SGLANG_TEST_DISAGG_KV_CHECKSUM_MISMATCH_PROB.get()
-        mismatched = [0] * len(batch.reqs)
+        mismatched = [0] * len(reqs)
         messages: Dict[int, str] = {}
-        for i, req in enumerate(batch.reqs):
+        for i, req in enumerate(reqs):
             expected = req.expected_kv_checksum
             if (
                 expected == 0
@@ -4410,7 +4414,7 @@ class SchedulerDisaggregationDecodeMixin:
         )
         if not any(mismatched):
             return
-        for i, req in enumerate(batch.reqs):
+        for i, req in enumerate(reqs):
             if mismatched[i]:
                 msg = messages.get(
                     i,
@@ -4419,15 +4423,7 @@ class SchedulerDisaggregationDecodeMixin:
                 )
                 logger.error(msg)
                 self._handle_kv_checksum_mismatch(req, msg)
-        keep_indices = [i for i, bad in enumerate(mismatched) if not bad]
-        if filter_tensors:
-            batch.filter_batch(keep_indices=keep_indices)
-        else:
-            # Tail admission verifies before tensor-level batch preparation;
-            # only the request list exists at this point.
-            batch.reqs[:] = [
-                req for i, req in enumerate(batch.reqs) if i in keep_indices
-            ]
+        return [i for i, bad in enumerate(mismatched) if not bad]
 
     def _handle_kv_checksum_mismatch(self, req: Req, msg: str) -> None:
         # A mismatch means the KV this worker received is not what prefill sent,
@@ -4509,6 +4505,14 @@ class SchedulerDisaggregationDecodeMixin:
         move(can_run_list, self.running_reqs)
         set_time_batch(can_run_list, "set_forward_entry_time")
 
+        # Verify before initializing the batch, so its request-derived flags
+        # (including grammar) describe only requests with intact KV.
+        keep_indices = self._kv_checksum_keep_indices(can_run_list)
+        if keep_indices is not None:
+            can_run_list = [can_run_list[i] for i in keep_indices]
+        if not can_run_list:
+            return None
+
         new_batch = ScheduleBatch.init_new(
             can_run_list,
             self.req_to_token_pool,
@@ -4518,12 +4522,6 @@ class SchedulerDisaggregationDecodeMixin:
             self.enable_overlap,
             self.spec_algorithm,
         )
-        # Same verification gate the prebuilt admission runs before it caches
-        # any KV into the tree. Tail admission has not built its tensors yet,
-        # so reject mismatches at the request-list level only.
-        self._verify_kv_checksums(new_batch, filter_tensors=False)
-        if new_batch.is_empty():
-            return None
         new_batch.prepare_for_tail_extend()
         return new_batch
 

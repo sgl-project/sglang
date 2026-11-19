@@ -38,6 +38,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
 )
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache  # noqa: E402
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
 from sglang.srt.observability import req_time_stats
 from sglang.srt.observability.req_time_stats import SchedulerReqTimeStats
 from sglang.srt.runtime_context import get_context, publish, reset_context  # noqa: E402
@@ -1159,6 +1160,52 @@ class TestDecodePrebuilt(unittest.TestCase):
 
         self.assertEqual([req.rid for req in init_new.call_args.args[0]], ["high"])
         self.assertEqual([req.rid for req in scheduler.waiting_queue], ["low"])
+
+    def test_tail_checksum_survivors_define_batch_grammar(self):
+        scheduler = self._new_scheduler(enable_overlap=False)
+        scheduler.req_to_token_pool.size = 2
+        scheduler.max_running_requests = 2
+        scheduler.kv_checksum_computer = MagicMock()
+        scheduler.kv_checksum_computer.compute.side_effect = [0x10, 0x20]
+        scheduler.disagg_decode_prealloc_queue = MagicMock()
+        scheduler.attn_tp_cpu_group = None
+        scheduler._handle_kv_checksum_mismatch = MagicMock()
+        requests = [
+            MagicMock(
+                rid=rid,
+                owner_list=None,
+                bootstrap_host="prefill",
+                bootstrap_port=30000,
+                bootstrap_room=index,
+                output_ids=[],
+                kv=ReqKvInfo(kv_committed_len=8),
+                expected_kv_checksum=0x20,
+                grammar=grammar,
+                return_logprob=False,
+                return_hidden_states_mode=CaptureHiddenMode.NULL,
+                is_prefill_only=False,
+            )
+            for index, (rid, grammar) in enumerate(
+                [("bad-grammar", object()), ("plain", None)]
+            )
+        ]
+        move(requests, scheduler.waiting_queue)
+        with (
+            patch("sglang.srt.disaggregation.decode.page_indices_for_request"),
+            patch("sglang.srt.disaggregation.decode.state_indices_for_request"),
+            patch(
+                "sglang.srt.disaggregation.decode.all_reduce_flags",
+                side_effect=lambda flags, *_: flags,
+            ),
+            patch.object(ScheduleBatch, "prepare_for_tail_extend", autospec=True),
+            get_context().override_server_args(
+                disaggregation_decode_tail_tokens=4, max_prefill_tokens=8
+            ),
+        ):
+            batch = scheduler._get_new_tail_extend_batch(scheduler.running_batch)
+        self.assertEqual(batch.reqs, [requests[1]])
+        self.assertFalse(batch.has_grammar)
+        scheduler._handle_kv_checksum_mismatch.assert_called_once_with(requests[0], ANY)
 
     def test_prebuilt_requests_run_from_their_admission(self):
         """Admission moves the requests from waiting into running."""

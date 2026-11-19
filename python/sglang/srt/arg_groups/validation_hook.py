@@ -152,6 +152,8 @@ RUST_SERVER_UNSUPPORTED_ARGS = (
     # Chat responses would lack the server-default sglext token ids.
     "return_input_ids",
     "return_output_ids",
+    # Rust request intake/IPC does not yet carry the PD rebootstrap marker.
+    "disaggregation_decode_tail_tokens",
 )
 
 
