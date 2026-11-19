@@ -2,6 +2,9 @@ import importlib.util
 import unittest
 from pathlib import Path
 
+from sglang.test.ascend.e2e.test_npu_multi_node_utils import (
+    get_memcache_meta_service_url,
+)
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
     AISBENCHMARK,
     AISBENCHMARK_DATASET_GSM8K,
@@ -9,6 +12,7 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
     TestNpuPerfMultiNodePdSepTestCaseBase,
 )
 from sglang.test.ascend.test_ascend_utils import (
+    MEMCACHE_CONFIG_STORE_PORT,
     append_ld_library_path,
     write_memfabric_tent_conf,
 )
@@ -112,6 +116,16 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_SPECULATIVE_ARGS = [
     5,
 ]
 
+# MemCache L3 storage config. Endpoint hosts and ports come from the common
+# helpers, so the meta service node (the first prefill node) is resolved at
+# setup time by get_memcache_meta_service_url().
+META_SERVICE_EXTRA_CONFIG_TEMPLATE = (
+    '{{"meta_service_url":"{meta_service_url}", '
+    '"config_store_url":"{config_store_url}", '
+    '"log_level":"info", "world_size":32, "protocol": "device_sdma", '
+    '"prefetch_threshold": 1, "dram_size": "10GB"}}'
+)
+
 # Prefill node launch arguments for DSV4-Flash PD-Sep 128k1k
 DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_PREFILL_ARGS = [
     "--page-size",
@@ -175,6 +189,17 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_PREFILL_ARGS = [
     "--expert-distribution-recorder-buffer-size",
     512,
     *DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_SPECULATIVE_ARGS,
+    "--enable-hierarchical-cache",
+    "--hicache-io-backend",
+    "kernel_ascend",
+    "--hicache-storage-backend",
+    "mooncake",
+    "--hicache-ratio",
+    1.2,
+    "--hicache-write-policy",
+    "write_through",
+    "--hicache-storage-backend-extra-config",
+    META_SERVICE_EXTRA_CONFIG_TEMPLATE,
 ]
 
 # Decode node launch arguments for DSV4-Flash PD-Sep 128k1k
@@ -274,9 +299,19 @@ class TestNPUDeepSeekV4FlashW8A81P1D16PIn128kOut1k20msAisBench(
             common_envs["LD_LIBRARY_PATH"] = append_ld_library_path(
                 ("memfabric_hybrid", "lib"), ("mooncake", None)
             )
+        prefill_args = list(DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_PREFILL_ARGS)
+        extra_config_index = (
+            prefill_args.index("--hicache-storage-backend-extra-config") + 1
+        )
+        prefill_args[extra_config_index] = META_SERVICE_EXTRA_CONFIG_TEMPLATE.format(
+            meta_service_url=get_memcache_meta_service_url(),
+            config_store_url=get_memcache_meta_service_url(
+                port=MEMCACHE_CONFIG_STORE_PORT
+            ),
+        )
         cls.model_config = {
             **DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_MODEL_CONFIG,
-            "prefill_args": list(DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_PREFILL_ARGS),
+            "prefill_args": prefill_args,
             "decode_args": list(DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_DECODE_ARGS),
             "prefill_envs": {
                 **common_envs,

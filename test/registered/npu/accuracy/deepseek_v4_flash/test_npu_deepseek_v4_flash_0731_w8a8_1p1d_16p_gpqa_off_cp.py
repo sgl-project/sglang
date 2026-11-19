@@ -3,11 +3,15 @@ import unittest
 from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
     TestNpuAccuracyMultiNodePdSepTestCaseBase,
 )
+from sglang.test.ascend.e2e.test_npu_multi_node_utils import (
+    get_memcache_meta_service_url,
+)
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
     DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH,
     assert_metrics,
     run_bench_serving,
 )
+from sglang.test.ascend.test_ascend_utils import MEMCACHE_CONFIG_STORE_PORT
 from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
@@ -94,6 +98,16 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_SPECULATIVE_ARGS = [
     6,
 ]
 
+# MemCache L3 storage config. Endpoint hosts and ports come from the common
+# helpers, so the meta service node (the first prefill node) is resolved at
+# setup time by get_memcache_meta_service_url().
+META_SERVICE_EXTRA_CONFIG_TEMPLATE = (
+    '{{"meta_service_url":"{meta_service_url}", '
+    '"config_store_url":"{config_store_url}", '
+    '"log_level":"info", "world_size":32, "protocol": "device_sdma", '
+    '"prefetch_threshold": 1, "dram_size": "10GB"}}'
+)
+
 # Prefill node launch arguments.
 DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
     "--page-size",
@@ -143,10 +157,14 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
     "--enable-hierarchical-cache",
     "--hicache-io-backend",
     "kernel_ascend",
+    "--hicache-storage-backend",
+    "mooncake",
     "--hicache-ratio",
     1.5,
     "--hicache-write-policy",
     "write_through",
+    "--hicache-storage-backend-extra-config",
+    META_SERVICE_EXTRA_CONFIG_TEMPLATE,
     "--enable-cache-report",
     "--max-total-tokens",
     140000,
@@ -238,6 +256,25 @@ class TestNPUDeepSeekV4Flash0731W8A8PDSEPGPQAHigh(
     generation_config = DEEPSEEK_V4_FLASH_0731_W8A8_GENERATION_CONFIG_HIGH
     eval_batch_size = 128
     min_hit_rate_pcts = {"host": 0}  # percent: L2 host hit rate must exceed 0%
+
+    @classmethod
+    def setUpClass(cls):
+        prefill_args = list(DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS)
+        extra_config_index = (
+            prefill_args.index("--hicache-storage-backend-extra-config") + 1
+        )
+        prefill_args[extra_config_index] = META_SERVICE_EXTRA_CONFIG_TEMPLATE.format(
+            meta_service_url=get_memcache_meta_service_url(),
+            config_store_url=get_memcache_meta_service_url(
+                port=MEMCACHE_CONFIG_STORE_PORT
+            ),
+        )
+        cls.model_config = {
+            **DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_MODEL_CONFIG,
+            "prefill_args": prefill_args,
+            "decode_args": list(DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_DECODE_ARGS),
+        }
+        super().setUpClass()
 
     def test_npu_deepseek_v4_flash_0731_w8a8_pd_sep_gpqa_high(self):
         """Run NPU accuracy test for DSV4-Flash-0731 PD-Sep GPQA High mode."""

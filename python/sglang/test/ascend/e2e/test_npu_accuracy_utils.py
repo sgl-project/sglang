@@ -22,6 +22,7 @@ from sglang.test.ascend.e2e.test_npu_multi_node_utils import (
     start_router_thread,
     wait_server_ready,
 )
+from sglang.test.ascend.test_ascend_utils import maybe_start_memcache_meta_service
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -592,6 +593,7 @@ class TestNpuAccuracyTestCaseBase(CustomTestCase):
                 env[key] = value
 
         other_args = list(cls.other_args)
+        cls.meta_service_process = maybe_start_memcache_meta_service(other_args)
 
         cls.process = popen_launch_server(
             cls.model,
@@ -608,6 +610,12 @@ class TestNpuAccuracyTestCaseBase(CustomTestCase):
                 kill_process_tree(cls.process.pid)
             except Exception as e:
                 logger.error(f"Error during tearDown: {e}")
+        meta_service_process = getattr(cls, "meta_service_process", None)
+        if meta_service_process:
+            try:
+                kill_process_tree(meta_service_process.pid)
+            except Exception as e:
+                logger.error(f"Error during meta service teardown: {e}")
         cls._save_metrics_json()
         cls._backup_plog()
 
@@ -657,11 +665,19 @@ class TestNpuAccuracyMultiNodePdMixTestCaseBase(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        pass
+        meta_service_process = getattr(cls, "meta_service_process", None)
+        if meta_service_process:
+            try:
+                kill_process_tree(meta_service_process.pid)
+            except Exception as e:
+                logger.error(f"Error during meta service teardown: {e}")
 
     @classmethod
     @check_role(allowed_roles=["master"])
     def start_pd_mix_master_node(cls):
+        cls.meta_service_process = maybe_start_memcache_meta_service(
+            cls.model_config.get("other_args")
+        )
         sglang_thread = threading.Thread(
             target=launch_pd_mix_node, args=(cls.model_config,)
         )
@@ -742,6 +758,12 @@ class TestNpuAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
                 kill_process_tree(cls.process.pid)
             except Exception as e:
                 logger.error(f"Error during tearDown: {e}")
+        meta_service_process = getattr(cls, "meta_service_process", None)
+        if meta_service_process:
+            try:
+                kill_process_tree(meta_service_process.pid)
+            except Exception as e:
+                logger.error(f"Error during meta service teardown: {e}")
 
     @classmethod
     @check_role(allowed_roles=["router"])
@@ -756,6 +778,10 @@ class TestNpuAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
     @classmethod
     @check_role(allowed_roles=["prefill", "decode"])
     def start_pd_server(cls):
+        if cls.hostname.endswith("prefill-0"):
+            cls.meta_service_process = maybe_start_memcache_meta_service(
+                cls.model_config.get("prefill_args")
+            )
         logger.info(f"Starting pd separation node...")
         cls.process = launch_pd_separation_node(cls.model_config)
         logger.info(f"Pd separation node started with PID: {cls.process.pid}")

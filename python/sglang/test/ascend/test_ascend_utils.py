@@ -12,6 +12,7 @@ import os
 import pathlib
 import random
 import subprocess
+import sys
 import threading
 import time
 from types import SimpleNamespace
@@ -933,6 +934,104 @@ def write_memfabric_tent_conf(path="/tmp/memfabric_tent.json"):
         json.dump(conf, f, indent=2)
     logger.info(f"Wrote memfabric tent config to {path}: {conf}")
     return path
+
+
+# Default ports for the Ascend MemCache meta service components. They avoid the
+# ports the test framework already uses: --dist-init-addr (5000) and the PD
+# separation worker HTTP server (8000).
+MEMCACHE_META_SERVICE_PORT = 5007
+MEMCACHE_CONFIG_STORE_PORT = 6007
+MEMCACHE_METRICS_PORT = 8007
+
+
+def start_memcache_meta_service(
+    config_path="/tmp/metaservice_config.json",
+    meta_service_port=MEMCACHE_META_SERVICE_PORT,
+    config_store_port=MEMCACHE_CONFIG_STORE_PORT,
+    metrics_port=MEMCACHE_METRICS_PORT,
+    extra_config=None,
+):
+    """Start the Ascend MemCache MetaService on the current node.
+
+    The IP comes from ``resolve_local_ip()`` (``POD_IP`` on k8s, loopback for
+    single-machine runs), so a generated ``metaservice_config.json`` works both
+    on every node of a multi-node deployment and on single-machine runs.
+
+    The ports default to the ``MEMCACHE_*_PORT`` constants above, which avoid
+    clashes with the ports the test framework already uses.
+
+    Args:
+        config_path (str): Path of the generated JSON config.
+        meta_service_port (int): Port of ``meta_service_url``.
+        config_store_port (int): Port of ``config_store_url``.
+        metrics_port (int): Port of the HTTP ``metrics_url``.
+        extra_config (dict): Additional MetaConfig keys merged into the config.
+
+    Returns:
+        subprocess.Popen: The meta service process.
+    """
+    host_ip = resolve_local_ip()
+    meta_config = {
+        "meta_service_url": f"tcp://{host_ip}:{meta_service_port}",
+        "config_store_url": f"tcp://{host_ip}:{config_store_port}",
+        "metrics_url": f"http://{host_ip}:{metrics_port}",
+    }
+    if extra_config:
+        meta_config.update(extra_config)
+
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(meta_config, f, indent=2)
+    logger.info(f"Wrote metaservice config to {config_path}: {meta_config}")
+
+    command = [
+        sys.executable,
+        "-m",
+        "sglang.srt.mem_cache.storage.npu_memcache.start_meta_service",
+        "--config_path",
+        config_path,
+    ]
+    logger.info(f"Starting memcache meta service: {' '.join(command)}")
+    try:
+        process = subprocess.Popen(command)
+        logger.info(f"Memcache meta service started with PID: {process.pid}")
+    except Exception as e:
+        raise RuntimeError(f"Failed to start memcache meta service: {e}")
+
+    return process
+
+
+HICACHE_STORAGE_BACKEND_ARG = "--hicache-storage-backend"
+
+
+def maybe_start_memcache_meta_service(other_args):
+    """Start the memcache meta service when HiCache L3 uses mooncake.
+
+    Only the mooncake storage backend connects through the meta service, so
+    every other backend is skipped.
+
+    Args:
+        other_args (list): Server launch args.
+
+    Returns:
+        subprocess.Popen: The meta service process, or None if not started.
+    """
+    if not other_args:
+        return None
+    args = [str(arg) for arg in other_args]
+    backend = None
+    for i, arg in enumerate(args):
+        if arg == HICACHE_STORAGE_BACKEND_ARG:
+            backend = args[i + 1] if i + 1 < len(args) else None
+            break
+        if arg.startswith(f"{HICACHE_STORAGE_BACKEND_ARG}="):
+            backend = arg.split("=", 1)[1]
+            break
+    if backend != "mooncake":
+        return None
+
+    process = start_memcache_meta_service()
+    logger.info(f"Memcache meta service started with PID: {process.pid}")
+    return process
 
 
 def append_ld_library_path(*module_specs):
