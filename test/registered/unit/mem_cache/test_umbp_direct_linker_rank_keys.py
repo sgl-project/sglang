@@ -28,7 +28,11 @@ class TestStorageSuffix(CustomTestCase):
         # rank has to name the same object or the store holds tp_size copies.
         suffixes = {
             _storage_suffix(
-                rank_replicated=True, tp_rank=rank, attn_cp_rank=0, pp_rank=0
+                rank_replicated=True,
+                cp_replicated=False,
+                tp_rank=rank,
+                attn_cp_rank=0,
+                pp_rank=0,
             )
             for rank in range(8)
         }
@@ -37,23 +41,43 @@ class TestStorageSuffix(CustomTestCase):
     def test_sharded_group_keeps_one_keyspace_per_rank(self):
         suffixes = [
             _storage_suffix(
-                rank_replicated=False, tp_rank=rank, attn_cp_rank=0, pp_rank=0
+                rank_replicated=False,
+                cp_replicated=False,
+                tp_rank=rank,
+                attn_cp_rank=0,
+                pp_rank=0,
             )
             for rank in range(8)
         ]
         self.assertEqual(len(set(suffixes)), 8)
         self.assertEqual(suffixes[3], "tp3_cp0_pp0")
 
-    def test_cp_and_pp_shard_even_when_replicated(self):
-        # CP shards the sequence and PP shards layers, so neither may collapse.
-        self.assertEqual(
-            _storage_suffix(rank_replicated=True, tp_rank=0, attn_cp_rank=1, pp_rank=2),
-            "cp1_pp2",
-        )
-        self.assertNotEqual(
-            _storage_suffix(rank_replicated=True, tp_rank=0, attn_cp_rank=0, pp_rank=0),
-            _storage_suffix(rank_replicated=True, tp_rank=0, attn_cp_rank=1, pp_rank=0),
-        )
+    def test_cp_replicated_group_shares_the_non_cp_key(self):
+        suffixes = {
+            _storage_suffix(
+                rank_replicated=True,
+                cp_replicated=True,
+                tp_rank=tp_rank,
+                attn_cp_rank=cp_rank,
+                pp_rank=1,
+            )
+            for tp_rank in range(2)
+            for cp_rank in range(4)
+        }
+        self.assertEqual(suffixes, {"cp0_pp1"})
+
+    def test_group_not_cp_replicated_keeps_a_key_per_cp_rank(self):
+        suffixes = {
+            _storage_suffix(
+                rank_replicated=True,
+                cp_replicated=False,
+                tp_rank=0,
+                attn_cp_rank=cp_rank,
+                pp_rank=2,
+            )
+            for cp_rank in range(4)
+        }
+        self.assertEqual(suffixes, {"cp0_pp2", "cp1_pp2", "cp2_pp2", "cp3_pp2"})
 
 
 class TestPackedDraftRanges(CustomTestCase):
