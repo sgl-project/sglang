@@ -1,5 +1,6 @@
-"""The Rust tests (rust/sglang-server/src/api_server/log/request/logger.rs)
-render the cases below from rust/sglang-server/testdata/request_log.json: the
+"""The Rust tests under rust/sglang-server/src/api_server/log/request.rs and its
+submodules (logger.rs, crash_recorder.rs, py_object.rs) render the cases below
+from rust/sglang-server/testdata/request_log.json: the
 settings Python hands the Rust server and the lines Python's `RequestLogger`
 logs. The fixture keeps only the fields in `_GENERATE_FIELDS` and
 `_OPENAI_REQUESTS`, so it pins the log format, not the request classes' fields;
@@ -664,9 +665,9 @@ class TestRustRequestLogFixture(CustomTestCase):
             f"{path}:\n"
             f"  checked in: {_excerpt(old, new)}\n"
             f"  Python now: {_excerpt(new, old)}\n"
-            f"Regenerate it with `{_WRITE_FIXTURE}`, then make "
-            "rust/sglang-server/src/api_server/log/request.rs pass "
-            "`cargo test -p sglang-server request_log`. A field added to a "
+            f"Regenerate it with `{_WRITE_FIXTURE}`, then make the tests under "
+            "rust/sglang-server/src/api_server/log/request.rs pass: "
+            "`cargo test -p sglang-server log::request`. A field added to a "
             "request class never needs this: the fixture keeps only the "
             "fields named in this test."
         )
