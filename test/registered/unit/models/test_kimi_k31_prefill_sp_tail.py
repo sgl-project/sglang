@@ -44,6 +44,13 @@ def _batch(mode=ForwardMode.EXTEND):
     return SimpleNamespace(forward_mode=mode)
 
 
+class _ExpertsSkippingTheQuant:
+    quant_method = SimpleNamespace(hidden_size=64)
+
+    def __call__(self, x, topk_output):
+        return torch.full((x.shape[0], 8), 2.0)
+
+
 class TestK31PrefillSPTail(CustomTestCase):
     def _begin(
         self, num_tokens, mode=ForwardMode.EXTEND, capture=False, max_rows=16384
@@ -123,6 +130,17 @@ class TestK31PrefillSPTail(CustomTestCase):
             full = k3_sp_collective.prefill_sp_all_gather(local, num_blocks=8)
             self.assertEqual(full.shape, (16, 6))
             torch.testing.assert_close(full[10:12], local)
+
+    def test_runner_that_skips_the_gathered_quant_fails(self):
+        with self.assertRaises(RuntimeError):
+            kimi_k3.KimiK3MoE._forward_routed_gathered(
+                SimpleNamespace(experts=_ExpertsSkippingTheQuant()),
+                torch.ones(3, 2),
+                torch.zeros(3, 2, dtype=torch.int32),
+                torch.empty(3, 64, dtype=torch.float8_e4m3fn),
+                torch.zeros(3, 2, dtype=torch.uint8),
+                torch.zeros(3, 8),
+            )
 
 
 if __name__ == "__main__":
