@@ -15,7 +15,6 @@
 
 from __future__ import annotations
 
-import importlib
 import logging
 import os
 import platform
@@ -1293,7 +1292,9 @@ def get_compiler_backend(mode=None) -> str:
 
 
 def set_cuda_arch():
-    if is_flashinfer_available():
+    if (
+        current_platform.is_cuda() or current_platform.is_sail()
+    ) and is_flashinfer_available():
         capability = torch.cuda.get_device_capability()
         arch = f"{capability[0]}.{capability[1]}"
         os.environ["FLASHINFER_CUDA_ARCH_LIST"] = (

@@ -39,4 +39,5 @@ class SailSRTPlatform(SailDeviceMixin, SRTPlatform):
         graph_capture=True,
         piecewise_graph=True,
         supports_pynccl=True,
+        supports_flashinfer=True,
     )
