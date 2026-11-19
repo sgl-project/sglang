@@ -16,8 +16,16 @@ import torch
 from PIL import Image, ImageOps
 from torch import Tensor
 
+from sglang.multimodal_gen.runtime.cache.conditioning import (
+    cached_encoder_call,
+    prefer_conditioning_cache,
+)
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.distributed import (
+    get_local_torch_device,
+    get_tp_group,
+    model_parallel_is_initialized,
+)
 from sglang.multimodal_gen.runtime.distributed.cfg_parallel_utils import (
     run_cfg_parallel,
 )
@@ -558,9 +566,37 @@ class Flux3ImageTextEncodeStage(PipelineStage):
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         return self.run_grouped_requests([batch], server_args)[0]
 
+    def _encode(self, prompts: list[str], negative: set[str]) -> list:
+        """One conditioning-cache entry per prompt: a negative prompt rarely changes between requests."""
+        group = get_tp_group() if model_parallel_is_initialized() else None
+        unique = list(dict.fromkeys(prompts))
+        encoded = {}
+        computed = {}
+
+        def compute(prompt: str):
+            if prompt not in computed:
+                # the first miss encodes every prompt not served yet, one forward per length bucket
+                missing = [text for text in unique if text not in encoded]
+                computed.update(zip(missing, self.text_encoder.encode_batch(missing)))
+            return computed[prompt]
+
+        for prompt in unique:
+            with prefer_conditioning_cache() if prompt in negative else nullcontext():
+                encoded[prompt] = cached_encoder_call(
+                    self.text_encoder,
+                    (prompt,),
+                    {},
+                    lambda prompt=prompt: compute(prompt),
+                    group,
+                    namespace=self,
+                    share_in_group=True,
+                )
+        return [encoded[prompt] for prompt in prompts]
+
     @torch.no_grad()
     def run_grouped_requests(self, batches, server_args):
         prompts = []
+        negative = set()
         for batch in batches:
             validate_generation(
                 _mode(batch, server_args.pipeline_config),
@@ -580,13 +616,14 @@ class Flux3ImageTextEncodeStage(PipelineStage):
                 prompts.append(prompt or "")
             else:
                 prompts.extend([batch.negative_prompt or "", prompt or ""])
+                negative.add(batch.negative_prompt or "")
         with self.use_declared_component(
             component_name="text_encoder",
             module=self.text_encoder,
             phase="text_encode",
         ):
             with torch.inference_mode():
-                encoded = self.text_encoder.encode_batch(prompts)
+                encoded = self._encode(prompts, negative)
         branches = 1 if self.package_config.dit.flow_map else 2
         for index, batch in enumerate(batches):
             batch.extra["flux3_text"] = encoded[
