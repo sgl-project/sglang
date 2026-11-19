@@ -23,7 +23,9 @@ use sgl_router::policies::request_tokens_for;
 use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::AppContext;
-use sgl_router::state::kv_events::{compute_block_hashes, BlockSizeOracle, HashTree};
+use sgl_router::state::kv_events::{
+    compute_block_hashes, BlockSizeOracle, HashTree, MeteredPrefixIndex,
+};
 use sgl_router::tokenizer::TokenizerRegistry;
 use sgl_router::workers::WorkerRegistry;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -112,18 +114,21 @@ async fn external_indexer_routes_to_the_cached_worker() {
         registry,
         policies,
     );
-    ctx.prefix_index = Some(Arc::new(
+    let metered = Arc::new(MeteredPrefixIndex::new(Arc::new(
         GrpcPrefixIndex::new(PrefixIndexConfig {
             endpoint,
             query_deadline: Duration::from_secs(1),
             max_inflight: 4,
         })
         .unwrap(),
-    ));
+    )));
+    metered.attach_metrics(Arc::clone(&ctx.metrics));
+    ctx.prefix_index = Some(metered);
     ctx.block_size_oracle = oracle;
 
     let app = build_router(Arc::new(ctx));
     let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -138,6 +143,22 @@ async fn external_indexer_routes_to_the_cached_worker() {
     assert_eq!(response.status(), StatusCode::OK);
     assert!(cached.captured.lock().unwrap().last_body.is_some());
     assert!(uncached.captured.lock().unwrap().last_body.is_none());
+
+    // The query that produced this routing decision is countable on the scrape.
+    let scrape = app
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let scrape = axum::body::to_bytes(scrape.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&scrape)
+        .contains(r#"sgl_router_indexer_query_total{outcome="matched"} 1"#));
 
     server.abort();
 }

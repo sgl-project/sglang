@@ -19,7 +19,10 @@ use sgl_router::{
         shutdown::drain_for_termination,
     },
     state::{
-        kv_events::{BlockSizeOracle, BootstrapTracker, KvEventIndex, RadixTreePrefixProvider},
+        kv_events::{
+            BlockSizeOracle, BootstrapTracker, KvEventIndex, MeteredPrefixIndex,
+            RadixTreePrefixProvider,
+        },
         load_monitor::router_inflight_load::{
             spawn_janitor, JanitorHandle, RouterInflightLoadRegistry, SystemTimeClock,
         },
@@ -96,7 +99,9 @@ async fn main() -> Result<()> {
             let (resolver, cleanup) = build_reorg_resolver(
                 &config.model,
                 &engine_state,
-                external_kv_indexer_client.clone(),
+                external_kv_indexer_client
+                    .clone()
+                    .map(|client| client as Arc<dyn PrefixIndex>),
             )
             .context("build reorg policies")?;
             (
@@ -255,7 +260,7 @@ fn log_startup(config: &Config) {
     );
 }
 
-fn create_external_kv_indexer_client(config: &Config) -> Result<Option<Arc<dyn PrefixIndex>>> {
+fn create_external_kv_indexer_client(config: &Config) -> Result<Option<Arc<MeteredPrefixIndex>>> {
     let endpoint = config
         .model
         .cache_aware
@@ -268,7 +273,7 @@ fn create_external_kv_indexer_client(config: &Config) -> Result<Option<Arc<dyn P
     endpoint
         .map(|endpoint| {
             GrpcPrefixIndex::new(prefix_index_config(endpoint))
-                .map(|index| Arc::new(index) as Arc<dyn PrefixIndex>)
+                .map(|index| Arc::new(MeteredPrefixIndex::new(Arc::new(index))))
                 .context("configure KV Indexer client")
         })
         .transpose()
@@ -380,7 +385,7 @@ fn build_app_context(
     routing_policies: Arc<PolicyRegistry>,
     local_inflight_requests: Arc<RouterInflightLoadRegistry>,
     engine_state: &Arc<KvEventIndex>,
-    external_kv_indexer_client: Option<Arc<dyn PrefixIndex>>,
+    external_kv_indexer_client: Option<Arc<MeteredPrefixIndex>>,
 ) -> Result<AppContext> {
     let block_size_oracle = engine_state.block_size_oracle();
     let proxy = Arc::new(
@@ -401,7 +406,11 @@ fn build_app_context(
     app_context.dp_rank_prefix_provider = (config.model.dp_aware
         && external_kv_indexer_client.is_none())
     .then(|| RadixTreePrefixProvider::new(engine_state.tree(), Arc::clone(&block_size_oracle)));
-    app_context.prefix_index = external_kv_indexer_client;
+    if let Some(client) = &external_kv_indexer_client {
+        client.attach_metrics(Arc::clone(&app_context.metrics));
+    }
+    app_context.prefix_index =
+        external_kv_indexer_client.map(|client| client as Arc<dyn PrefixIndex>);
     app_context.radix_tree_prefix_provider = (config.model.policy == PolicyKind::CacheAware
         && config
             .model

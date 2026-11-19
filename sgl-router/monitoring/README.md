@@ -55,6 +55,7 @@ Families the router emits. The dashboard graphs all of them except the
 | `sgl_router_kv_peer_snapshot_total` | Counter | Peer snapshot fetches by `outcome` (`accepted` / `unreachable` / `cold_peer` / `rejected`). A fleet pinned at `unreachable` with warm siblings means the per-fetch bound is too small for the body |
 | `sgl_router_kv_bootstrap_rank_total` | Counter | Final per-rank bootstrap verdicts by `outcome` (`warm`, `warm_unwitnessed`, `from_origin`, `gap`, `uncovered`, `abandoned`, `overflow`, `publisher_reset`, `tree_rejected`); one count per rank per incarnation |
 | `sgl_router_kv_bootstrap_sweep_total` | Counter | Peer sweeps by `result` (`found` / `no_peers` / `fleet_cold` / `timed_out` / `ranks_resolved`) — what separates a healthy early settle on a cold fleet from burning the whole deadline |
+| `sgl_router_indexer_query_total` | Counter | External KV Indexer prefix queries by `outcome` (`matched`, `empty`, `unreachable`, `timeout`, `overloaded`, `query_too_large`, `rejected`). The four transport/limit outcomes lost cache affinity and routed by minimum active load; `rejected` failed the request. Emitted only with an Indexer endpoint, and the counterpart of `sgl_router_kv_tree_maintained=0` |
 
 The legacy `sgl_router_overlap_blocks` metric was removed with the
 `cache_aware_zmq` policy and has no direct replacement. Remove queries, alerts,

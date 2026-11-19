@@ -41,6 +41,7 @@
 //! | `sgl_router_cache_pressure_guard_override_total` | Counter | — |
 //! | `sgl_router_cache_monitor_decisions_total` | Counter | `source` |
 //! | `sgl_router_cache_aware_decisions_total` | Counter | `model_id`, `decision` |
+//! | `sgl_router_indexer_query_total` | Counter | `outcome` |
 //! | `sgl_router_diverted_overlap_blocks` | Histogram | `model_id` |
 //! | `sgl_router_ingress_tokenize_errors_total` | Counter | `model_id` |
 //! | `sgl_router_input_ids_forwarding_total` | Counter | `model_id`, `outcome` |
@@ -510,6 +511,7 @@ pub struct MetricsRegistry {
     cache_pressure_guard_override_total: AtomicU64,
     cache_monitor_decisions_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     cache_aware_decisions_total: Mutex<HashMap<CacheAwareDecisionKey, Arc<AtomicU64>>>,
+    kv_indexer_query_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     diverted_overlap_blocks: Mutex<HashMap<String, Histogram>>,
     ingress_tokenize_errors_total: Mutex<HashMap<String, Arc<AtomicU64>>>,
     retries_total: Mutex<HashMap<String, Arc<AtomicU64>>>,
@@ -836,6 +838,20 @@ impl MetricsRegistry {
         let mut guard = self.policy_selection_failures_total.lock();
         let counter = guard
             .entry(key)
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
+        drop(guard);
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One external KV Indexer prefix query, labelled by the outcome the router
+    /// acted on. `matched` and `empty` were answered; `unreachable`, `timeout`,
+    /// `overloaded` and `query_too_large` cost the request its cache affinity
+    /// and routed by minimum active load; `rejected` failed the request.
+    pub fn record_kv_indexer_query(&self, outcome: &'static str) {
+        let mut guard = self.kv_indexer_query_total.lock();
+        let counter = guard
+            .entry(outcome)
             .or_insert_with(|| Arc::new(AtomicU64::new(0)))
             .clone();
         drop(guard);
@@ -1361,6 +1377,25 @@ impl MetricsRegistry {
             out.push_str(&format!(
                 "sgl_router_cache_monitor_decisions_total{{source=\"{}\"}} {}\n",
                 source, value,
+            ));
+        }
+        drop(guard);
+
+        // kv_indexer_query_total
+        out.push_str(
+            "# HELP sgl_router_indexer_query_total External KV Indexer prefix queries by the outcome the router acted on. matched/empty were answered; unreachable/timeout/overloaded/query_too_large lost cache affinity and routed by minimum active load; rejected failed the request. Absent while no Indexer endpoint is configured.\n",
+        );
+        out.push_str("# TYPE sgl_router_indexer_query_total counter\n");
+        let guard = self.kv_indexer_query_total.lock();
+        let mut entries: Vec<(&&str, u64)> = guard
+            .iter()
+            .map(|(outcome, value)| (outcome, value.load(Ordering::Relaxed)))
+            .collect();
+        entries.sort_by_key(|entry| *entry.0);
+        for (outcome, value) in entries {
+            out.push_str(&format!(
+                "sgl_router_indexer_query_total{{outcome=\"{}\"}} {}\n",
+                outcome, value,
             ));
         }
         drop(guard);
