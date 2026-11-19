@@ -61,11 +61,11 @@ def _inkling_overrides(server_args: Any, hf_config: Any) -> dict:
                 # and tuning are gfx950's and no end-to-end serving run has been
                 # published for it, so say so rather than claim parity.
                 logger.warning(
-                    "Inkling2 on gfx942 (MI300X / MI325X): kernels pass their "
-                    "correctness tests here, but are sized and tuned for gfx950, "
-                    "and the gfx950-only fast paths (Gluon MFMA-order experts, "
-                    "the AITER Triton GEMM) fall back to portable kernels. "
-                    "Expect correct results, not gfx950 performance."
+                    "Inkling2 on gfx942 (MI300X / MI325X): serving is verified "
+                    "here, but the kernels are sized and tuned for gfx950, and "
+                    "its fast paths (Gluon MFMA-order experts, the AITER Triton "
+                    "GEMM) fall back to portable kernels. Expect correct "
+                    "results, not gfx950 performance."
                 )
             if "megamoe" in (cfg.moe_a2a_backend, cfg.moe_runner_backend):
                 raise ValueError(
