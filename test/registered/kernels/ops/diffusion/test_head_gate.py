@@ -7,9 +7,10 @@ import torch
 
 from sglang.kernels.ops.diffusion import head_gate_mul
 from sglang.kernels.ops.diffusion.modulate.head_gate_triton import can_use_head_gate_mul
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-small")
+register_amd_ci(est_time=5, stage="base-a-jit-kernel-unit", runner_config="amd")
 
 
 @pytest.mark.parametrize(
