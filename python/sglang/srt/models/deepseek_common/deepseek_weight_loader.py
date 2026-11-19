@@ -160,6 +160,8 @@ def _load_fused_indexer_wk(
     params_dict: Dict[str, torch.Tensor],
     pending: Dict[str, Dict[str, torch.Tensor]],
     quant_config: Optional[QuantizationConfig],
+    *,
+    retain_for_transaction: bool = False,
 ) -> bool:
     """Load an indexer wk / weights_proj shard into the fused bf16 wk_weights_proj
     param: wk fills the top head_dim rows (dequantized from block-fp8 if needed),
@@ -182,8 +184,11 @@ def _load_fused_indexer_wk(
             return True
 
         entry = pending.setdefault(fused_name + ".weights_proj", {})
-        entry["scale" if is_scale else "weight"] = _clone_if_runai_streamed_tensor(
-            loaded_weight
+        other_field = "weight" if is_scale else "scale"
+        entry["scale" if is_scale else "weight"] = (
+            loaded_weight.clone().detach()
+            if retain_for_transaction and other_field not in entry
+            else _clone_if_runai_streamed_tensor(loaded_weight)
         )
         if "weight" in entry and "scale" in entry:
             pending.pop(fused_name + ".weights_proj")
@@ -202,8 +207,11 @@ def _load_fused_indexer_wk(
         return True
 
     entry = pending.setdefault(fused_name, {})
-    entry["scale" if is_scale else "weight"] = _clone_if_runai_streamed_tensor(
-        loaded_weight
+    other_field = "weight" if is_scale else "scale"
+    entry["scale" if is_scale else "weight"] = (
+        loaded_weight.clone().detach()
+        if retain_for_transaction and other_field not in entry
+        else _clone_if_runai_streamed_tensor(loaded_weight)
     )
     if "weight" in entry and "scale" in entry:
         pending.pop(fused_name)
@@ -279,6 +287,42 @@ class DeepseekV2WeightLoaderMixin:
     pp_group: GroupCoordinator
     num_fused_shared_experts: int
 
+    def _begin_weight_update_transaction(self) -> None:
+        if getattr(self, "_weight_update_load_state", None) is not None:
+            raise RuntimeError("a model weight-load transaction is already active")
+        self._weight_update_load_state = {
+            "cached_a_proj": {},
+            "pending_indexer_wk": {},
+            "weight_names": [],
+            "is_nextn": None,
+        }
+
+    def _commit_weight_update_transaction(self) -> None:
+        state = getattr(self, "_weight_update_load_state", None)
+        if state is None:
+            return
+
+        unresolved = []
+        if state["cached_a_proj"]:
+            unresolved.extend(sorted(state["cached_a_proj"]))
+        if state["pending_indexer_wk"]:
+            unresolved.extend(sorted(state["pending_indexer_wk"]))
+        self._weight_update_load_state = None
+        if unresolved:
+            names = ", ".join(unresolved[:8])
+            raise ValueError(
+                "Weight-update transaction ended with incomplete cross-tensor "
+                f"weights: {names}"
+            )
+
+        is_nextn = state["is_nextn"]
+        self.post_load_weights(
+            is_nextn=bool(is_nextn), weight_names=state["weight_names"]
+        )
+
+    def _abort_weight_update_transaction(self) -> None:
+        self._weight_update_load_state = None
+
     def do_load_weights(
         self,
         weights: Iterable[Tuple[str, torch.Tensor]],
@@ -314,9 +358,24 @@ class DeepseekV2WeightLoaderMixin:
         fuse_qkv_a_proj = hasattr(self.config, "q_lora_rank") and (
             self.config.q_lora_rank is not None
         )
-        cached_a_proj = {} if fuse_qkv_a_proj else None
-
-        pending_indexer_wk: Dict[str, Dict[str, torch.Tensor]] = {}
+        load_state = getattr(self, "_weight_update_load_state", None)
+        cached_a_proj = (
+            load_state["cached_a_proj"]
+            if load_state is not None and fuse_qkv_a_proj
+            else ({} if fuse_qkv_a_proj else None)
+        )
+        pending_indexer_wk = (
+            load_state["pending_indexer_wk"] if load_state is not None else {}
+        )
+        if load_state is None:
+            weight_names = []
+        else:
+            if load_state["is_nextn"] not in (None, is_nextn):
+                raise ValueError(
+                    "A weight-update transaction cannot mix target and NextN weights"
+                )
+            load_state["is_nextn"] = is_nextn
+            weight_names = load_state["weight_names"]
 
         if self.num_fused_shared_experts > 0:
             assert self.num_fused_shared_experts == 1
@@ -339,8 +398,6 @@ class DeepseekV2WeightLoaderMixin:
             indexer_present_prefixes = {
                 n.rsplit(".indexer.", 1)[0] for n in params_dict if ".indexer." in n
             }
-            weight_names = []
-
             num_unused_expert_input_scale = 0
             for name, loaded_weight in weights:
                 if expert_input_scale_unused and _EXPERT_INPUT_SCALE_RE.search(name):
@@ -425,6 +482,7 @@ class DeepseekV2WeightLoaderMixin:
                     params_dict,
                     pending_indexer_wk,
                     self.quant_config,
+                    retain_for_transaction=load_state is not None,
                 ):
                     continue
 
@@ -497,9 +555,6 @@ class DeepseekV2WeightLoaderMixin:
                         if fuse_qkv_a_proj and (
                             "q_a_proj" in name or "kv_a_proj_with_mqa" in name
                         ):
-                            cached_a_proj[name] = _clone_if_runai_streamed_tensor(
-                                loaded_weight
-                            )
                             q_a_proj_name = (
                                 name
                                 if "q_a_proj" in name
@@ -509,6 +564,17 @@ class DeepseekV2WeightLoaderMixin:
                                 name
                                 if "kv_a_proj_with_mqa" in name
                                 else name.replace("q_a_proj", "kv_a_proj_with_mqa")
+                            )
+                            counterpart_name = (
+                                kv_a_proj_name
+                                if name == q_a_proj_name
+                                else q_a_proj_name
+                            )
+                            cached_a_proj[name] = (
+                                loaded_weight.clone().detach()
+                                if load_state is not None
+                                and counterpart_name not in cached_a_proj
+                                else _clone_if_runai_streamed_tensor(loaded_weight)
                             )
 
                             # When both q_a_proj and kv_a_proj_with_mqa has been cached, load the fused weight to parameter
@@ -603,7 +669,8 @@ class DeepseekV2WeightLoaderMixin:
             for future in concurrent.futures.as_completed(futures):
                 future.result()
 
-        self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
+        if load_state is None:
+            self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
 
     def _initialize_nextn_conf(self, is_nextn: bool) -> NextNConfig:
         """

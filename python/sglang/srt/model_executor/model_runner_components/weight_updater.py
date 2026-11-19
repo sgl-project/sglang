@@ -106,6 +106,7 @@ class WeightUpdater:
     recapture_cuda_graph: Callable[[], None]
     get_model_runner: Callable[[], ModelRunner]
     _model_update_group: dict = field(default_factory=dict)
+    _weight_load_transaction: dict = field(default_factory=dict)
 
     def init_weights_update_group(
         self,
@@ -341,16 +342,62 @@ class WeightUpdater:
         return bucket.reconstruct_tensors()
 
     def begin_weight_update(self: WeightUpdater) -> None:
+        model = self.get_model()
         DefaultModelLoader.restore_weights_before_loading(
-            self.get_model(), torch.device(self.device)
+            model, torch.device(self.device)
         )
+        transaction_modules = []
+        try:
+            for module in model.modules():
+                begin = getattr(module, "_begin_weight_update_transaction", None)
+                if begin is not None:
+                    begin()
+                    transaction_modules.append(module)
+        except Exception:
+            for module in transaction_modules:
+                module._abort_weight_update_transaction()
+            self._weight_load_transaction.clear()
+            DefaultModelLoader.postprocess_weights(model, torch.device(self.device))
+            raise
+        self._weight_load_transaction["modules"] = transaction_modules
 
-    def end_weight_update(self: WeightUpdater, *, run_post_load: bool) -> None:
-        if run_post_load:
-            post_load_weights(self.get_model())
-        DefaultModelLoader.postprocess_weights(
-            self.get_model(), torch.device(self.device)
-        )
+    def end_weight_update(
+        self: WeightUpdater, *, run_post_load: bool, commit: bool = True
+    ) -> Tuple[bool, str]:
+        model = self.get_model()
+        transaction_modules = self._weight_load_transaction.pop("modules", [])
+        error = None
+        try:
+            if not commit:
+                for module in transaction_modules:
+                    abort = getattr(module, "_abort_weight_update_transaction", None)
+                    if abort is not None:
+                        abort()
+            elif run_post_load:
+                post_load_weights(model)
+                for module in transaction_modules:
+                    abort = getattr(module, "_abort_weight_update_transaction", None)
+                    if abort is not None:
+                        abort()
+            else:
+                for module in transaction_modules:
+                    module._commit_weight_update_transaction()
+        except Exception as e:
+            error = f"Failed to finalize model weight-load transaction: {e}"
+            logger.exception(error)
+            for module in transaction_modules:
+                abort = getattr(module, "_abort_weight_update_transaction", None)
+                if abort is not None:
+                    abort()
+        try:
+            DefaultModelLoader.postprocess_weights(model, torch.device(self.device))
+        except Exception as e:
+            if error is None:
+                error = f"Failed to postprocess updated weights: {e}"
+            logger.exception("Failed to postprocess updated weights")
+        if not commit and error is None:
+            error = "Weight-update transaction was aborted"
+        return (error is None, error or "Success")
 
     def load_weights_from_distributed(
         self: WeightUpdater, named_tensors: List[Tuple[str, torch.Tensor]]

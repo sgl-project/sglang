@@ -36,11 +36,14 @@ class _FakeDeepseekLoader(DeepseekV2WeightLoaderMixin):
             num_nextn_predict_layers=0,
         )
         self.model = SimpleNamespace()
-        self.quant_config = SimpleNamespace(get_name=lambda: "quark")
+        self.quant_config = SimpleNamespace(
+            get_name=lambda: "quark", weight_block_size=None
+        )
         self.num_fused_shared_experts = 0
         self.pp_group = SimpleNamespace(is_first_rank=True, is_last_rank=True)
         self._params = params
         self.post_load_called = False
+        self.post_load_calls = 0
 
     def named_parameters(self):
         return iter(self._params.items())
@@ -52,6 +55,7 @@ class _FakeDeepseekLoader(DeepseekV2WeightLoaderMixin):
 
     def post_load_weights(self, is_nextn=False, weight_names=None):
         self.post_load_called = True
+        self.post_load_calls += 1
 
 
 class TestQuarkBlockFp8WeightLoading(CustomTestCase):
@@ -119,6 +123,46 @@ class TestQuarkBlockFp8WeightLoading(CustomTestCase):
         )
         self.assertTrue(loader.post_load_called)
 
+    def test_fused_qkv_a_loads_across_transaction_chunks(self):
+        target_name = "model.layers.0.self_attn.fused_qkv_a_proj_with_mqa.weight"
+        target = _FakeParam()
+        loader = _FakeDeepseekLoader({target_name: target})
+        q_weight = torch.full((2, 3), 1.0)
+        kv_weight = torch.full((1, 3), 2.0)
+
+        loader._begin_weight_update_transaction()
+        loader.do_load_weights([("model.layers.0.self_attn.q_a_proj.weight", q_weight)])
+        self.assertIsNone(target.loaded)
+        expected_q_weight = q_weight.clone()
+        q_weight.zero_()
+        loader.do_load_weights(
+            [
+                (
+                    "model.layers.0.self_attn.kv_a_proj_with_mqa.weight",
+                    kv_weight,
+                )
+            ]
+        )
+
+        torch.testing.assert_close(
+            target.loaded, torch.cat([expected_q_weight, kv_weight])
+        )
+        self.assertFalse(loader.post_load_called)
+        loader._commit_weight_update_transaction()
+        self.assertEqual(loader.post_load_calls, 1)
+
+    def test_incomplete_transaction_fails_commit_and_clears_pending_weights(self):
+        target_name = "model.layers.0.self_attn.fused_qkv_a_proj_with_mqa.weight"
+        loader = _FakeDeepseekLoader({target_name: _FakeParam()})
+        loader._begin_weight_update_transaction()
+        loader.do_load_weights(
+            [("model.layers.0.self_attn.q_a_proj.weight", torch.ones((2, 3)))]
+        )
+
+        with self.assertRaisesRegex(ValueError, "incomplete cross-tensor weights"):
+            loader._commit_weight_update_transaction()
+        self.assertIsNone(loader._weight_update_load_state)
+
     def test_unfused_quark_scale_loads_into_scale_inv(self):
         target_name = "model.layers.0.self_attn.o_proj.weight_scale_inv"
         target = _FakeParam()
@@ -181,6 +225,50 @@ class TestQuarkBlockFp8WeightLoading(CustomTestCase):
         )
         torch.testing.assert_close(fused_param[:2], dequantized)
         self.assertEqual(pending, {})
+
+    def test_fp8_indexer_pair_loads_across_transaction_chunks(self):
+        fused_name = "model.layers.0.self_attn.indexer.wk_weights_proj.weight"
+        fused_param = torch.nn.Parameter(
+            torch.zeros((4, 4), dtype=torch.bfloat16), requires_grad=False
+        )
+        loader = _FakeDeepseekLoader({fused_name: fused_param})
+        weight = torch.ones((2, 4), dtype=torch.float8_e4m3fn)
+        scale = torch.ones((1, 1), dtype=torch.float32)
+        dequantized = torch.full((2, 4), 3.0, dtype=torch.bfloat16)
+
+        loader._begin_weight_update_transaction()
+        with patch(
+            "sglang.srt.models.deepseek_common.deepseek_weight_loader."
+            "block_quant_dequant",
+            return_value=dequantized,
+        ) as block_quant_dequant:
+            loader.do_load_weights(
+                [("model.layers.0.self_attn.indexer.wk.weight", weight)]
+            )
+            self.assertEqual(int(fused_param[:2].count_nonzero()), 0)
+            expected_weight = weight.clone()
+            weight.zero_()
+            loader.do_load_weights(
+                [
+                    (
+                        "model.layers.0.self_attn.indexer.wk.weight_scale_inv",
+                        scale,
+                    )
+                ]
+            )
+
+        block_quant_dequant.assert_called_once()
+        loaded_weight, loaded_scale, block_size, dtype = (
+            block_quant_dequant.call_args.args
+        )
+        torch.testing.assert_close(loaded_weight, expected_weight)
+        torch.testing.assert_close(loaded_scale, scale)
+        self.assertEqual(block_size, [128, 128])
+        self.assertEqual(dtype, torch.bfloat16)
+        torch.testing.assert_close(fused_param[:2], dequantized)
+        self.assertFalse(loader.post_load_called)
+        loader._commit_weight_update_transaction()
+        self.assertEqual(loader.post_load_calls, 1)
 
 
 if __name__ == "__main__":

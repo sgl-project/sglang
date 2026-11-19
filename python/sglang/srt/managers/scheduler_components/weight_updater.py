@@ -115,6 +115,10 @@ class _WeightUpdateSession(msgspec.Struct, frozen=True):
     # recorded at begin so end finalizes the same runners
     selector: str
     loaded_weights: bool = False
+    weight_version: Optional[str] = None
+    flush_cache: bool = False
+    torch_empty_cache: bool = False
+    failure: Optional[str] = None
 
 
 @dataclass(kw_only=True, slots=True)
@@ -168,6 +172,33 @@ class SchedulerWeightUpdaterManager:
 
     def record_weight_version_after_update(self, weight_version: Optional[str]) -> None:
         self.scheduler.record_weight_version_change(new_version=weight_version)
+
+    def _record_weight_update_chunk(
+        self, recv_req, *, success: bool, message: str, loaded_weights: bool = True
+    ) -> Tuple[bool, str]:
+        """Accumulate one chunk's commit metadata without publishing it yet."""
+        assert self._session is not None
+        if success and (
+            self._session.weight_version is not None
+            and recv_req.weight_version is not None
+            and self._session.weight_version != recv_req.weight_version
+        ):
+            success = False
+            message = "Weight version changed within one weight-update transaction"
+
+        if success:
+            self._session = msgspec.structs.replace(
+                self._session,
+                loaded_weights=self._session.loaded_weights or loaded_weights,
+                weight_version=recv_req.weight_version or self._session.weight_version,
+                flush_cache=self._session.flush_cache or recv_req.flush_cache,
+                torch_empty_cache=(
+                    self._session.torch_empty_cache or recv_req.torch_empty_cache
+                ),
+            )
+        else:
+            self._session = msgspec.structs.replace(self._session, failure=message)
+        return success, message
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         """In-place update of the weights from disk."""
@@ -230,6 +261,12 @@ class SchedulerWeightUpdaterManager:
                 message="update_weights_from_distributed must run between "
                 "begin_weight_update() and end_weight_update()",
             )
+        if self._session.failure is not None:
+            return UpdateWeightsFromDistributedReqOutput(
+                success=False,
+                message="weight-update transaction already failed: "
+                + self._session.failure,
+            )
         with self._observe_weight_load("distributed"):
             self.scheduler.wait_for_launched_forward()
             # only the target runner joined the update group; drafts load its receive
@@ -249,14 +286,9 @@ class SchedulerWeightUpdaterManager:
                 success, message = self._load_into_selected_runners(
                     weights, recv_req.selector
                 )
-            if success:
-                self._session = msgspec.structs.replace(
-                    self._session, loaded_weights=True
-                )
-                self.record_weight_version_after_update(recv_req.weight_version)
-                success, message = self.flush_cache_after_weight_update(
-                    recv_req, success, message
-                )
+            success, message = self._record_weight_update_chunk(
+                recv_req, success=success, message=message
+            )
             return UpdateWeightsFromDistributedReqOutput(
                 success=success, message=message
             )
@@ -282,6 +314,12 @@ class SchedulerWeightUpdaterManager:
                 message="update_weights_from_tensor must run between "
                 "begin_weight_update() and end_weight_update()",
             )
+        if self._session.failure is not None:
+            return UpdateWeightsFromTensorReqOutput(
+                success=False,
+                message="weight-update transaction already failed: "
+                + self._session.failure,
+            )
         with self._observe_weight_load("tensor"):
             self.scheduler.wait_for_launched_forward()
             named_tensors = self.tp_worker.deserialize_own_rank(
@@ -289,20 +327,19 @@ class SchedulerWeightUpdaterManager:
             )
             success, message = True, "Success"
             for _, runner in self._select_runners(recv_req.selector):
-                success, message = runner.weight_updater.update_weights_from_tensor(
-                    named_tensors=named_tensors,
-                    load_format=recv_req.load_format,
-                )
+                try:
+                    success, message = runner.weight_updater.update_weights_from_tensor(
+                        named_tensors=named_tensors,
+                        load_format=recv_req.load_format,
+                    )
+                except Exception as e:
+                    success, message = False, f"Failed to load weight chunk: {e}"
+                    logger.exception(message)
                 if not success:
                     break
-            if success:
-                self._session = msgspec.structs.replace(
-                    self._session, loaded_weights=True
-                )
-                self.record_weight_version_after_update(recv_req.weight_version)
-                success, message = self.flush_cache_after_weight_update(
-                    recv_req, success, message
-                )
+            success, message = self._record_weight_update_chunk(
+                recv_req, success=success, message=message
+            )
             if not success:
                 logger.error(message)
             torch.distributed.barrier(group=self.tp_cpu_group)
@@ -376,26 +413,64 @@ class SchedulerWeightUpdaterManager:
             if error is not None:
                 return BeginWeightUpdateReqOutput(success=False, message=error)
         self.scheduler.wait_for_launched_forward()
-        for _, runner in runners:
-            runner.weight_updater.begin_weight_update()
+        begun_runners = []
+        try:
+            for _, runner in runners:
+                runner.weight_updater.begin_weight_update()
+                begun_runners.append(runner)
+        except Exception as e:
+            for runner in begun_runners:
+                runner.weight_updater.end_weight_update(
+                    run_post_load=False, commit=False
+                )
+            return BeginWeightUpdateReqOutput(
+                success=False,
+                message=f"Failed to begin model weight-load transaction: {e}",
+            )
         self._session = _WeightUpdateSession(selector=recv_req.selector)
         torch.distributed.barrier(group=self.tp_cpu_group)
         return BeginWeightUpdateReqOutput(success=True, message="Success")
 
     def end_weight_update(self, recv_req: EndWeightUpdateReqInput):
-        """Finalize the runners begin opened; post_load_weights only if no load ran (P2P/RDMA)."""
+        """Commit every selected runner, then publish cache/version metadata."""
         if self._session is None:
             return EndWeightUpdateReqOutput(
                 success=False,
                 message="no weight-update session is open; call begin_weight_update() first",
             )
-        run_post_load = not self._session.loaded_weights
+        session = self._session
+        commit = session.failure is None
+        run_post_load = not session.loaded_weights
         self.scheduler.wait_for_launched_forward()
-        for _, runner in self._select_runners(self._session.selector):
-            runner.weight_updater.end_weight_update(run_post_load=run_post_load)
+        errors = []
+        if session.failure is not None:
+            errors.append(
+                "Weight-update transaction aborted after a chunk failed: "
+                + session.failure
+            )
+        for _, runner in self._select_runners(session.selector):
+            success, message = runner.weight_updater.end_weight_update(
+                run_post_load=run_post_load, commit=commit
+            )
+            if not success and commit:
+                errors.append(message)
         self._session = None
         torch.distributed.barrier(group=self.tp_cpu_group)
-        return EndWeightUpdateReqOutput(success=True, message="Success")
+        if (
+            not errors
+            and session.flush_cache
+            and not self.flush_cache(empty_cache=session.torch_empty_cache)
+        ):
+            errors.append(
+                "Weights were updated, but the cache was not flushed because "
+                "requests are still running or queued. Retract or finish them, "
+                "then call /flush_cache."
+            )
+        if not errors:
+            self.record_weight_version_after_update(session.weight_version)
+        return EndWeightUpdateReqOutput(
+            success=not errors, message="; ".join(errors) if errors else "Success"
+        )
 
     def plugin_weight_update(self, recv_req: PluginWeightUpdateReqInput):
         """Receive weights through a platform transport, then load them as update_weights_from_distributed does."""
@@ -404,6 +479,12 @@ class SchedulerWeightUpdaterManager:
                 success=False,
                 message="plugin_weight_update must run between "
                 "begin_weight_update() and end_weight_update()",
+            )
+        if self._session.failure is not None:
+            return PluginWeightUpdateReqOutput(
+                success=False,
+                message="weight-update transaction already failed: "
+                + self._session.failure,
             )
         handler = current_platform.get_weight_update_handlers().get(recv_req.handler)
         if handler is None:
@@ -442,18 +523,15 @@ class SchedulerWeightUpdaterManager:
             success, message, counts = self._agree_across_tp_ranks(
                 error=error, count=len(weights)
             )
-            if success:
-                if any(counts):
-                    self._session = msgspec.structs.replace(
-                        self._session, loaded_weights=True
-                    )
-                self.record_weight_version_after_update(recv_req.weight_version)
-                success, message = self.flush_cache_after_weight_update(
-                    recv_req, success, message
-                )
-            else:
+            if not success:
                 # each rank loads before the gather, so the ranks that did not fail already have
                 message += "; the other TP ranks have loaded the bucket, redo it or retire the engine"
+            success, message = self._record_weight_update_chunk(
+                recv_req,
+                success=success,
+                message=message,
+                loaded_weights=any(counts),
+            )
             return PluginWeightUpdateReqOutput(
                 success=success,
                 message=message,

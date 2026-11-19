@@ -281,6 +281,7 @@ def _runner(result=(True, "ok")):
     runner.weight_updater.receive_weights_from_distributed.return_value = [
         ("weight", torch.tensor([1.0]))
     ]
+    runner.weight_updater.end_weight_update.return_value = (True, "ok")
     runner.weight_updater.load_rejection.return_value = None
     return runner
 
@@ -380,7 +381,7 @@ class TestRecordWeightVersionAfterUpdate(_WeightUpdaterManagerTestBase):
         output = manager.update_weights_from_distributed(_request())
 
         self.assertTrue(output.success)
-        self.assertEqual(self.recorded, ["v2"])
+        self.assertEqual(self.recorded, [])
         output = manager.end_weight_update(EndWeightUpdateReqInput())
 
         self.assertTrue(output.success)
@@ -388,11 +389,20 @@ class TestRecordWeightVersionAfterUpdate(_WeightUpdaterManagerTestBase):
 
     def test_failed_distributed_update_does_not_record_the_version(self):
         """A failed distributed refit leaves the version alone, exactly like the disk path."""
-        output = self._manager(
-            _runner((False, "boom"))
-        ).update_weights_from_distributed(_request())
+        runner = _runner((False, "boom"))
+        manager = self._manager(runner)
+        output = manager.update_weights_from_distributed(_request())
 
         self.assertFalse(output.success)
+        self.assertEqual(self.recorded, [])
+        second = manager.update_weights_from_distributed(_request())
+        self.assertFalse(second.success)
+        self.assertIn("already failed", second.message)
+        output = manager.end_weight_update(EndWeightUpdateReqInput())
+        self.assertFalse(output.success)
+        runner.weight_updater.end_weight_update.assert_called_once_with(
+            run_post_load=True, commit=False
+        )
         self.assertEqual(self.recorded, [])
 
     def test_successful_tensor_update_records_the_version(self):
@@ -401,7 +411,7 @@ class TestRecordWeightVersionAfterUpdate(_WeightUpdaterManagerTestBase):
         output = updater.update_weights_from_tensor(_request())
 
         self.assertTrue(output.success)
-        self.assertEqual(self.recorded, ["v2"])
+        self.assertEqual(self.recorded, [])
         with patch("torch.distributed.barrier"):
             output = updater.end_weight_update(EndWeightUpdateReqInput())
 
@@ -491,7 +501,7 @@ class TestWeightUpdateSession(_WeightUpdaterManagerTestBase):
         self.assertTrue(output.success)
         for runner in (target, draft):
             runner.weight_updater.end_weight_update.assert_called_once_with(
-                run_post_load=True
+                run_post_load=True, commit=True
             )
         self.assertIsNone(manager._session)
 
@@ -505,7 +515,7 @@ class TestWeightUpdateSession(_WeightUpdaterManagerTestBase):
 
         for runner in (target, draft):
             runner.weight_updater.end_weight_update.assert_called_once_with(
-                run_post_load=False
+                run_post_load=False, commit=True
             )
 
     def test_session_selector_confines_begin_and_end_to_selected_runners(self):
@@ -601,6 +611,9 @@ class TestPluginWeightUpdate(_WeightUpdaterManagerTestBase):
         draft.weight_updater.load_weights_from_distributed.assert_called_once_with(
             weights
         )
+        self.assertEqual((self.recorded, self.flushes), ([], []))
+        output = manager.end_weight_update(EndWeightUpdateReqInput())
+        self.assertTrue(output.success)
         self.assertEqual(self.recorded, ["3"])
         self.assertEqual(len(self.flushes), 1)
 
@@ -616,7 +629,7 @@ class TestPluginWeightUpdate(_WeightUpdaterManagerTestBase):
                 manager.end_weight_update(EndWeightUpdateReqInput())
 
                 target.weight_updater.end_weight_update.assert_called_once_with(
-                    run_post_load=run_post_load
+                    run_post_load=run_post_load, commit=True
                 )
 
     def test_a_failed_receive_loads_nothing_on_its_rank_and_keeps_the_cache_and_version(
