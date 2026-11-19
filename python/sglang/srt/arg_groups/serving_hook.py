@@ -325,7 +325,9 @@ def handle_grpc_args(server_args: Any):
                 "--grpc-port is not supported with --encoder-only: "
                 "encoder disaggregation uses its own server."
             )
-        if cfg.tokenizer_worker_num > 1:
+        # The Rust server serves gRPC itself and sizes its tokenizer thread
+        # pool from --tokenizer-worker-num; only the Python bridge is limited.
+        if cfg.tokenizer_worker_num > 1 and not envs.SGLANG_RUST_SERVER.get():
             raise ValueError(
                 "Native gRPC does not yet support --tokenizer-worker-num > 1. "
                 "Unset --grpc-port or set --tokenizer-worker-num 1."

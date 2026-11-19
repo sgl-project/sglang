@@ -61,8 +61,11 @@ from sglang.srt.utils import (
 
 _is_gfx95_supported = is_gfx95_supported()
 
+from sglang.srt.layers.quantization.inkling2 import Inkling2QuantConfig
+
 # Base quantization methods
 BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
+    "inkling2": Inkling2QuantConfig,
     "fp8": Fp8Config,
     "mxfp8": Fp8Config,
     "minimax_m3_nvfp4": MiniMaxM3Nvfp4Config,

@@ -199,6 +199,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "dp_size",
                     "attn_dp_size",
                     "enable_attn_tp_input_scattered",
+                    "disable_attn_tp_gather",
                     "enable_dp_lm_head",
                     "enable_tp_lm_head_all_to_all",
                     "moe_a2a_backend",
@@ -219,6 +220,8 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "speculative_moe_a2a_backend",
                     "disable_shared_experts_fusion",
                     "kv_cache_dtype",
+                    "reasoning_parser",
+                    "tool_call_parser",
                     "dsa_prefill_backend",
                     "dsa_decode_backend",
                     "dsv4_attn_backend",
@@ -1287,6 +1290,46 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 _cohere2_moe_runner_overrides(_args(None), SimpleNamespace()),
                 {"moe_runner_backend": "flashinfer_trtllm"},
             )
+
+    def test_inkling2_megamoe_default(self):
+        """Quantized Inkling2 experts with EP on SM100 / SM103 / SM107 default to
+        MegaMoE; an explicit backend, BF16 experts, SM90 and TP1 keep theirs."""
+        from sglang.srt.arg_groups.model_overrides.inkling import _inkling_overrides
+
+        hf = SimpleNamespace(architectures=["Inkling2ForConditionalGeneration"])
+
+        def backend(sm=100, tp=4, a2a="none", quantization="inkling2"):
+            args = SimpleNamespace(
+                tool_call_parser="inkling2",
+                reasoning_parser="inkling",
+                tp_size=tp,
+                moe_dp_size=1,
+                ep_size=tp,
+                attn_dp_size=1,
+                moe_a2a_backend=a2a,
+                encoder_only=False,
+                enable_two_batch_overlap=False,
+                enable_single_batch_overlap=False,
+                swa_full_tokens_ratio=0.1,
+                mamba_full_memory_ratio=0.1,
+                mamba_radix_cache_strategy="extra_buffer",
+                disable_radix_cache=False,
+                attention_backend="fa4",
+                prefill_attention_backend=None,
+                decode_attention_backend=None,
+                _model_config=SimpleNamespace(quantization=quantization),
+            )
+            with override_platform(is_cuda=True, device_sm=sm):
+                out = _inkling_overrides(args, hf)
+            return out.get("moe_a2a_backend", a2a), out.get("disable_attn_tp_gather")
+
+        self.assertEqual(backend(), ("megamoe", True))
+        self.assertEqual(backend(sm=103), ("megamoe", True))
+        self.assertEqual(backend(sm=107), ("megamoe", True))
+        self.assertEqual(backend(sm=90), ("none", None))
+        self.assertEqual(backend(tp=1), ("none", None))
+        self.assertEqual(backend(quantization=None), ("none", None))
+        self.assertEqual(backend(a2a="deepep"), ("deepep", None))
 
     def test_mimo_v2_declarations(self):
         # Callable-level golden: MiMoV2 archs are hybrid (config-shape heavy),

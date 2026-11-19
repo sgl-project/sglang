@@ -572,6 +572,18 @@ class TestPrepareServerArgs(CustomTestCase):
                     chunked_prefill_size=-1,
                 ).check_server_args()
 
+    def test_disable_multimodal_rejects_enable_multimodal(self):
+        with self.assertRaisesRegex(
+            ValueError, "--disable-multimodal cannot be combined"
+        ):
+            ServerArgs(
+                model_path="dummy",
+                served_model_name="dummy",
+                enable_multimodal=True,
+                disable_multimodal=True,
+                chunked_prefill_size=-1,
+            ).check_server_args()
+
     def test_instanttensor_device_check_allows_cuda_and_other_loaders(self):
         for device, load_format in (
             ("cuda", "instanttensor"),
@@ -4606,6 +4618,11 @@ class TestGrpcServerArgs(CustomTestCase):
     def test_native_grpc_rejects_multi_tokenizer(self):
         sa = self._args(grpc_port=40000, tokenizer_worker_num=2)
         with self.assertRaises(ValueError):
+            handle_grpc_args(sa)
+
+    def test_rust_server_grpc_accepts_multi_tokenizer(self):
+        sa = self._args(grpc_port=40000, tokenizer_worker_num=4)
+        with envs.SGLANG_RUST_SERVER.override(True):
             handle_grpc_args(sa)
 
     def test_native_grpc_rejects_http_auth(self):

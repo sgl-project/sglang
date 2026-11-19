@@ -423,16 +423,21 @@ class DSparkWorkerV2(BaseSpecWorker):
             and torch.device(self.device).type == "cuda"
             else None
         )
-        static_epilogue_supported = (
-            (
-                (target_is_dsv41 and self._draft_is_moe)
-                or draft_folds_static_commit(
-                    draft_model=self.draft_model, kv_injector=self._kv_injector
-                )
-            )
-            and self._verify_planner.mode_value == "static"
+        static_mode = (
+            self._verify_planner.mode_value == "static"
             and not get_parallel().attn_dp_enabled
             and get_parallel().pp_size == 1
+        )
+        dsv41_static = static_mode and target_is_dsv41 and self._draft_is_moe
+        # The KV pools do not exist yet; alloc_memory_pool checks that the draft
+        # really folds once they do.
+        self._static_epilogue_needs_draft_fold = (
+            static_mode
+            and not dsv41_static
+            and getattr(self.draft_model, "folds_static_verify_commit", False)
+        )
+        static_epilogue_supported = (
+            dsv41_static or self._static_epilogue_needs_draft_fold
         )
         # ROCm (V4.1 target only): inside a HIP graph the accept-site TP broadcasts
         # need the group's pynccl communicator
@@ -634,6 +639,13 @@ class DSparkWorkerV2(BaseSpecWorker):
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
+        if self._static_epilogue_needs_draft_fold and not draft_folds_static_commit(
+            draft_model=self.draft_model, kv_injector=self._kv_injector
+        ):
+            raise ValueError(
+                f"{type(self.draft_model).__name__} folds the static verify commit, "
+                "but its FULL KV slots are not the target's unremapped slots"
+            )
 
     def init_attention_backends(self):
         if not self._hosts_draft:
