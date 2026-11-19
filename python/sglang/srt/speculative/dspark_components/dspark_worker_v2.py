@@ -79,7 +79,6 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
     CommitInjectCtx,
     DsparkVerifyEpilogue,
     TargetVerifyExecutor,
-    draft_folds_static_commit,
     target_model_type,
     verify_logits_adjustments_are_noop,
 )
@@ -426,8 +425,12 @@ class DSparkWorkerV2(BaseSpecWorker):
         static_epilogue_supported = (
             (
                 (target_is_dsv41 and self._draft_is_moe)
-                or draft_folds_static_commit(
-                    draft_model=self.draft_model, kv_injector=self._kv_injector
+                # The draft opts in; whether its FULL slots are the target's needs
+                # the runners' ids, built with the memory pools after this worker,
+                # so the epilogue resolves that on first use.
+                or (
+                    self._kv_injector is not None
+                    and getattr(self.draft_model, "folds_static_verify_commit", False)
                 )
             )
             and self._verify_planner.mode_value == "static"
