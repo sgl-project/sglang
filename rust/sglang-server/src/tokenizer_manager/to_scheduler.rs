@@ -12,7 +12,7 @@ use crate::tokenizer_manager::channel::ToSchedulerTx;
 pub use crate::tokenizer_manager::to_scheduler_types::{Limits, MmDispatch};
 pub(crate) use crate::tokenizer_manager::to_scheduler_validation::fit_input;
 use crate::tokenizer_manager::to_scheduler_validation::{
-    check_total_tokens, validate, validate_input_ids,
+    check_context_window, validate, validate_input_ids,
 };
 use crate::tokenizer_manager::wiring::{AbortSource, Senders, TmEvent};
 use crate::utils::{
@@ -321,7 +321,7 @@ impl Intake {
                 RequestState::PreSendValidating => {
                     if let RequestKind::Generate(g) = &mut req.kind
                         && let Err(e) = validate_input_ids(g, self.limits.vocab_size)
-                            .and_then(|()| check_total_tokens(g, &self.limits))
+                            .and_then(|()| check_context_window(g, &self.limits))
                     {
                         let _ = req.state.apply(Event::Error(e)); // → Failed
                         continue;

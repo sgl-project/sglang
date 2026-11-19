@@ -430,7 +430,7 @@ fn process(
         .result
         .resolve_identities()
         .map_err(Error::Internal)?;
-    // Intake fits the ids to the context (`check_total_tokens`) before the
+    // Intake fits the ids to the context (`check_context_window`) before the
     // scheduler sees them; fit them first, so `processed` sees the same ids. A
     // prompt intake will reject is not observed.
     let fits = ctx
@@ -1210,7 +1210,7 @@ mod tests {
     }
 
     /// `processed` sees the ids intake forwards, fitted to the context as
-    /// `check_total_tokens` fits them: a 12-token prompt on an 8-token context
+    /// `check_context_window` fits them: a 12-token prompt on an 8-token context
     /// is truncated under `allow_auto_truncate` (a prefill with a smaller
     /// context than its decode publishes its own 8 ids), and not observed when
     /// intake will reject it.

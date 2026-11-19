@@ -1455,7 +1455,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def _validate_one_request(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput], input_ids: List[int]
     ) -> None:
-        """Validates that the input token count and the requested token count doesn't exceed the model's context length."""
+        """Validate that the prompt fits and the completion cap is well formed.
+
+        The prompt must leave room for at least one output token. The output cap
+        is an upper bound: only a cap larger than the whole context is rejected,
+        while one that exceeds the room left by the prompt is left to the
+        scheduler's clamp.
+        """
         # FIXME: unify the length validation logic with the one in the scheduler.
         if get_exec().features.enable_encoder_swa_bounded_replay:
             if obj.image_data is not None and not get_platform().is_cuda:
@@ -1482,7 +1488,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         input_token_num = len(input_ids) if input_ids is not None else 0
         input_token_num += self.num_reserved_tokens
 
-        # Validate input length
+        # Validate input length. `>=` also keeps at least one slot for an output
+        # token: a prompt that exactly fills the window is rejected instead of
+        # returning an empty completion with `finish_reason: length`.
         if input_token_num >= self.context_len:
             if self.allow_auto_truncate:
                 logger.warning(
@@ -1498,32 +1506,35 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     f"model's context length ({self.context_len} tokens)."
                 )
 
-        # Validate total tokens (input + max_new_tokens)
+        # `max_new_tokens` is an upper bound, not a reservation of the window.
+        # Only a cap larger than the whole context is invalid on its face; a cap
+        # that merely exceeds the room left by the prompt is left for the
+        # scheduler to clamp (Scheduler.init_req_max_new_tokens), exactly as it
+        # already does for requests that do not send a cap.
         max_new_tokens = obj.sampling_params.get("max_new_tokens")
+        if max_new_tokens is not None and max_new_tokens > _max_req_len:
+            raise ValueError(
+                f"max_new_tokens is too large: {max_new_tokens}. This model "
+                f"supports at most {_max_req_len} completion tokens."
+            )
+
+        # --allow-auto-truncate opts into clamping the completion budget here as
+        # well, so the request leaves the frontend with a budget that fits.
+        # Without it the scheduler clamps, so there is nothing to raise.
         if (
-            self.validate_total_tokens
+            self.allow_auto_truncate
+            and self.validate_total_tokens
             and max_new_tokens is not None
             and (max_new_tokens + input_token_num) > _max_req_len
         ):
-            if self.allow_auto_truncate:
-                logger.warning(
-                    f"Requested token count ({input_token_num} input + {max_new_tokens} new) "
-                    f"exceeds the model's context length ({self.context_len} tokens). "
-                    "Truncating max_new_tokens."
-                )
-                obj.sampling_params["max_new_tokens"] = max(
-                    0, _max_req_len - input_token_num
-                )
-            else:
-                total_tokens = max_new_tokens + input_token_num
-                error_msg = (
-                    f"Requested token count exceeds the model's maximum context length "
-                    f"of {self.context_len} tokens. You requested a total of {total_tokens} "
-                    f"tokens: {input_token_num} tokens from the input messages and "
-                    f"{max_new_tokens} tokens for the completion. Please reduce the number "
-                    f"of tokens in the input messages or the completion to fit within the limit."
-                )
-                raise ValueError(error_msg)
+            logger.warning(
+                f"Requested token count ({input_token_num} input + {max_new_tokens} new) "
+                f"exceeds the model's context length ({self.context_len} tokens). "
+                "Truncating max_new_tokens."
+            )
+            obj.sampling_params["max_new_tokens"] = max(
+                0, _max_req_len - input_token_num
+            )
 
         # Validate embedding requests
         if isinstance(obj, EmbeddingReqInput) and self.is_generation:

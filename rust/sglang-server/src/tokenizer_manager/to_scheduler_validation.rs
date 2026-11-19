@@ -126,15 +126,15 @@ pub(super) fn validate_input_ids(g: &GenerateRequest, vocab_size: u64) -> Result
 }
 
 /// The context-window checks that need the tokenized length, mirroring Python
-/// `TokenizerManager._validate_one_request`: the input alone must fit, and then
-/// input + the client's own `max_new_tokens` must fit. Without them the
-/// scheduler silently clamps and the client gets a 200 with a truncated
-/// completion instead of an actionable 400. A defaulted `max_new_tokens` (see
-/// [`GenerateRequest::max_new_tokens_defaulted`]) is left to that clamp.
+/// `TokenizerManager._validate_one_request`: the input alone must fit, and the
+/// client's own `max_new_tokens` must not exceed the whole window. A cap that
+/// merely exceeds the room the prompt leaves is an upper bound, not a
+/// reservation: the scheduler clamps it. A defaulted `max_new_tokens` (see
+/// [`GenerateRequest::max_new_tokens_defaulted`]) is left to that clamp too.
 ///
-/// Under `allow_auto_truncate` both clamp instead of rejecting — the launch flag
+/// Under `allow_auto_truncate` the cap clamps here as well — the launch flag
 /// opted into that.
-/// The input-length half of [`check_total_tokens`]: `input_ids` truncated to
+/// The input-length half of [`check_context_window`]: `input_ids` truncated to
 /// the context under `allow_auto_truncate`, else the rejection of an input that
 /// does not fit. The MM worker applies it too, so its
 /// [`processed`](crate::MmProcessor::processed) hook sees the ids the
@@ -158,10 +158,11 @@ pub(crate) fn fit_input(input_ids: &mut TokenIds, limits: &Limits) -> Result<(),
     Ok(())
 }
 
-pub(super) fn check_total_tokens(g: &mut GenerateRequest, limits: &Limits) -> Result<(), Error> {
+pub(super) fn check_context_window(g: &mut GenerateRequest, limits: &Limits) -> Result<(), Error> {
     let max_req_len = limits.context_len;
     // Input length first, and unconditionally: `max_new_tokens: null` means "no
-    // cap", which must not disable this.
+    // cap", which must not disable this. `>=` also keeps at least one slot for
+    // an output token, so an accepted request never returns an empty completion.
     fit_input(g.input_ids.as_mut().unwrap_or(&mut Vec::new()), limits)?;
     let input_len =
         g.input_ids.as_ref().map_or(0, |ids| ids.len()) as u64 + limits.num_reserved_tokens;
@@ -170,20 +171,22 @@ pub(super) fn check_total_tokens(g: &mut GenerateRequest, limits: &Limits) -> Re
         return Ok(()); // not the client's value → the scheduler clamps it
     }
     let Some(max_new_tokens) = g.sampling_params.max_new_tokens else {
-        return Ok(()); // no cap requested → nothing to add to the input length
+        return Ok(()); // no cap requested → the scheduler clamps the budget
     };
-    let total = input_len.saturating_add(max_new_tokens.max(0) as u64);
-    if total <= max_req_len {
-        return Ok(());
-    }
-    if !limits.allow_auto_truncate {
+    // A cap above the whole window is invalid on its face. One that only
+    // exceeds the room the prompt leaves is an upper bound, not a reservation.
+    // A negative cap is already rejected by `verify`; compare the non-negative
+    // ones as `u64` so a ceiling above `i64::MAX` cannot wrap.
+    if max_new_tokens > 0 && max_new_tokens as u64 > max_req_len {
         return Err(Error::Validation(format!(
-            "Requested token count exceeds the model's maximum context length of \
-             {max_req_len} tokens. You requested a total of {total} tokens: {input_len} \
-             tokens from the input messages and {max_new_tokens} tokens for the \
-             completion. Please reduce the number of tokens in the input messages or \
-             the completion to fit within the limit."
+            "max_new_tokens is too large: {max_new_tokens}. This model supports at \
+             most {max_req_len} completion tokens."
         )));
+    }
+    if !limits.allow_auto_truncate
+        || input_len.saturating_add(max_new_tokens.max(0) as u64) <= max_req_len
+    {
+        return Ok(());
     }
     let clamped = max_req_len.saturating_sub(input_len) as i64;
     // Re-check what the clamp can break. `verify` already ran (in Normalizing), so

@@ -234,11 +234,11 @@ fn generate_req(id: u64, sampling_params: SamplingParams) -> Request {
     }
 }
 
-/// `input + max_new_tokens` past the context window is an actionable 400, not a
-/// silently truncated 200 (Python `TokenizerManager._validate_one_request`).
-/// The message names both halves so the client can fix the right one.
+/// `max_new_tokens` is an output upper bound, not a reservation of the window
+/// (Python `TokenizerManager._validate_one_request`). A cap that overflows the
+/// room the prompt leaves rides through for the scheduler to clamp.
 #[test]
-fn total_tokens_over_context_is_rejected() {
+fn total_tokens_over_context_is_left_to_the_scheduler() {
     let limits = Limits {
         context_len: 10,
         ..test_limits()
@@ -246,28 +246,72 @@ fn total_tokens_over_context_is_rejected() {
     let mut g = GenerateRequest {
         input_ids: Some(vec![1, 2, 3]),
         sampling_params: SamplingParams {
-            max_new_tokens: Some(100),
+            max_new_tokens: Some(9), // 3 + 9 overflows the 10-token window
             ..Default::default()
         },
         ..Default::default()
     };
-    let err = check_total_tokens(&mut g, &limits).unwrap_err();
+    assert!(check_context_window(&mut g, &limits).is_ok());
+    assert_eq!(g.sampling_params.max_new_tokens, Some(9), "left alone");
+
+    // Exactly the whole window is still a valid cap.
+    g.sampling_params.max_new_tokens = Some(10);
+    assert!(check_context_window(&mut g, &limits).is_ok());
+    assert_eq!(g.sampling_params.max_new_tokens, Some(10), "left alone");
+}
+
+/// A cap above the whole window cannot be satisfied by any prompt, so it is an
+/// actionable 400 rather than a clamp to nothing.
+#[test]
+fn max_new_tokens_above_the_window_is_rejected() {
+    let limits = Limits {
+        context_len: 10,
+        ..test_limits()
+    };
+    let mut g = GenerateRequest {
+        input_ids: Some(vec![1, 2, 3]),
+        sampling_params: SamplingParams {
+            max_new_tokens: Some(11),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let err = check_context_window(&mut g, &limits).unwrap_err();
     let msg = err.to_string();
     assert!(matches!(err, Error::Validation(_)));
-    assert!(msg.contains("total of 103 tokens"), "{msg}");
-    assert!(msg.contains("3 tokens from the input"), "{msg}");
-    assert!(msg.contains("100 tokens for the completion"), "{msg}");
-    // Exactly filling the window is allowed (Python compares with `>`).
-    g.sampling_params.max_new_tokens = Some(7);
-    assert!(check_total_tokens(&mut g, &limits).is_ok());
-    assert_eq!(g.sampling_params.max_new_tokens, Some(7), "left alone");
+    assert!(msg.contains("max_new_tokens is too large: 11"), "{msg}");
+    assert!(msg.contains("at most 10 completion tokens"), "{msg}");
+}
+
+/// A ceiling wider than `i64` must not wrap into a rejection: `u64::MAX` is an
+/// "unbounded" sentinel, and any `i64` cap fits under it.
+#[test]
+fn context_ceiling_above_i64_max_still_accepts_a_cap() {
+    let limits = Limits {
+        context_len: u64::MAX,
+        ..test_limits()
+    };
+    let mut g = GenerateRequest {
+        input_ids: Some(vec![1, 2, 3]),
+        sampling_params: SamplingParams {
+            max_new_tokens: Some(i64::MAX),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    assert!(check_context_window(&mut g, &limits).is_ok());
+    assert_eq!(
+        g.sampling_params.max_new_tokens,
+        Some(i64::MAX),
+        "left alone"
+    );
 }
 
 /// A launcher whose default for an omitted `max_new_tokens` is `None` (no
 /// limit) under `--context-length` lets a prompt near the window through
 /// untouched; the scheduler clamps the output to the room the window leaves.
-/// A client-sent 128 or context-length value is a 400; the same values marked
-/// defaulted are left to the scheduler's clamp.
+/// A client-sent value above the window is a 400; every value up to the window
+/// is left alone, and the same values marked defaulted skip the check.
 #[test]
 fn omitted_max_new_tokens_under_a_context_length_passes_a_near_limit_prompt() {
     let limits = Limits {
@@ -283,27 +327,32 @@ fn omitted_max_new_tokens_under_a_context_length_passes_a_near_limit_prompt() {
         ..Default::default()
     };
     let mut g = request(None);
-    assert!(check_total_tokens(&mut g, &limits).is_ok());
+    assert!(check_context_window(&mut g, &limits).is_ok());
     assert_eq!(
         g.sampling_params.max_new_tokens, None,
         "left to the scheduler"
     );
     for max_new_tokens in [Some(128), Some(1000)] {
-        let err = check_total_tokens(&mut request(max_new_tokens), &limits).unwrap_err();
-        assert!(matches!(err, Error::Validation(_)), "{max_new_tokens:?}");
-        let mut g = GenerateRequest {
-            max_new_tokens_defaulted: true,
-            ..request(max_new_tokens)
-        };
-        assert!(check_total_tokens(&mut g, &limits).is_ok());
+        let mut g = request(max_new_tokens);
+        assert!(check_context_window(&mut g, &limits).is_ok());
         assert_eq!(g.sampling_params.max_new_tokens, max_new_tokens);
     }
+    let err = check_context_window(&mut request(Some(1001)), &limits).unwrap_err();
+    assert!(matches!(err, Error::Validation(_)));
+    assert!(err.to_string().contains("max_new_tokens is too large"));
+
+    let mut g = GenerateRequest {
+        max_new_tokens_defaulted: true,
+        ..request(Some(1001))
+    };
+    assert!(check_context_window(&mut g, &limits).is_ok());
+    assert_eq!(g.sampling_params.max_new_tokens, Some(1001));
 }
 
-/// The reserved slots (eagle draft tokens) count as input, so a request can be
-/// rejected for them even when the prompt alone would fit.
+/// The reserved slots (eagle draft tokens) count as input: 3 prompt + 7
+/// reserved exactly fills a 10-token window, leaving no room for output.
 #[test]
-fn reserved_tokens_count_toward_the_limit() {
+fn reserved_tokens_count_toward_the_input_limit() {
     let limits = Limits {
         context_len: 10,
         num_reserved_tokens: 5,
@@ -312,17 +361,32 @@ fn reserved_tokens_count_toward_the_limit() {
     let mut g = GenerateRequest {
         input_ids: Some(vec![1, 2, 3]),
         sampling_params: SamplingParams {
-            max_new_tokens: Some(3), // 3 + 3 fits, but 3 + 5 + 3 does not
+            max_new_tokens: Some(9), // only a cap; 3 + 5 + 9 overflows
             ..Default::default()
         },
         ..Default::default()
     };
-    let msg = check_total_tokens(&mut g, &limits).unwrap_err().to_string();
-    assert!(msg.contains("8 tokens from the input"), "{msg}");
+    assert!(check_context_window(&mut g, &limits).is_ok());
+    assert_eq!(g.sampling_params.max_new_tokens, Some(9));
+
+    let tight = Limits {
+        num_reserved_tokens: 7,
+        ..limits
+    };
+    let mut g = GenerateRequest {
+        input_ids: Some(vec![1, 2, 3]),
+        ..Default::default()
+    };
+    let msg = check_context_window(&mut g, &tight)
+        .unwrap_err()
+        .to_string();
+    assert!(msg.contains("10 tokens"), "{msg}");
+    assert!(msg.contains("longer than the model's context"), "{msg}");
 }
 
-/// `--allow-auto-truncate` opts into clamping instead of rejecting; with no
-/// context length, or no `max_new_tokens` cap, there is nothing to check.
+/// `--allow-auto-truncate` opts into clamping the cap instead of leaving it to
+/// the scheduler; with no context length, or no `max_new_tokens` cap, there is
+/// nothing to check.
 #[test]
 fn auto_truncate_clamps_and_unknowns_skip() {
     let sp = |max_new_tokens| SamplingParams {
@@ -331,7 +395,7 @@ fn auto_truncate_clamps_and_unknowns_skip() {
     };
     let mut g = GenerateRequest {
         input_ids: Some(vec![1, 2, 3]),
-        sampling_params: sp(Some(100)),
+        sampling_params: sp(Some(9)),
         ..Default::default()
     };
     let truncating = Limits {
@@ -339,12 +403,16 @@ fn auto_truncate_clamps_and_unknowns_skip() {
         allow_auto_truncate: true,
         ..test_limits()
     };
-    assert!(check_total_tokens(&mut g, &truncating).is_ok());
+    assert!(check_context_window(&mut g, &truncating).is_ok());
     assert_eq!(g.sampling_params.max_new_tokens, Some(7), "clamped to fit");
+
+    // A cap above the whole window is still rejected: no prompt can satisfy it.
+    g.sampling_params = sp(Some(11));
+    assert!(check_context_window(&mut g, &truncating).is_err());
 
     // Unknown context length → no ceiling to enforce.
     g.sampling_params = sp(Some(100));
-    assert!(check_total_tokens(&mut g, &test_limits()).is_ok());
+    assert!(check_context_window(&mut g, &test_limits()).is_ok());
     assert_eq!(g.sampling_params.max_new_tokens, Some(100), "untouched");
 
     // No cap requested → nothing to add to the input length, but the input
@@ -354,7 +422,7 @@ fn auto_truncate_clamps_and_unknowns_skip() {
         context_len: 100,
         ..test_limits()
     };
-    assert!(check_total_tokens(&mut g, &roomy).is_ok());
+    assert!(check_context_window(&mut g, &roomy).is_ok());
 }
 
 /// A `max_new_tokens` the client did not send (a preferred value or the schema
@@ -377,7 +445,7 @@ fn defaulted_max_new_tokens_is_left_to_the_scheduler() {
             max_new_tokens_defaulted: true,
             ..Default::default()
         };
-        assert!(check_total_tokens(&mut g, &limits).is_ok());
+        assert!(check_context_window(&mut g, &limits).is_ok());
         assert_eq!(g.sampling_params.max_new_tokens, Some(10), "untouched");
     }
 
@@ -390,7 +458,7 @@ fn defaulted_max_new_tokens_is_left_to_the_scheduler() {
         context_len: 10,
         ..test_limits()
     };
-    let err = check_total_tokens(&mut g, &limits).unwrap_err();
+    let err = check_context_window(&mut g, &limits).unwrap_err();
     assert!(err.to_string().contains("longer than the model's context"));
 }
 
@@ -414,7 +482,7 @@ fn input_length_is_checked_unconditionally() {
         ..Default::default()
     };
     for max_new_tokens in [None, Some(1)] {
-        let err = check_total_tokens(&mut req(max_new_tokens), &limits)
+        let err = check_context_window(&mut req(max_new_tokens), &limits)
             .expect_err("input == context_len must be rejected (Python uses >=)");
         assert!(matches!(err, Error::Validation(_)));
         assert!(err.to_string().contains("longer than the model's context"));
@@ -425,7 +493,7 @@ fn input_length_is_checked_unconditionally() {
         ..Default::default()
     };
     g.sampling_params.max_new_tokens = None;
-    assert!(check_total_tokens(&mut g, &limits).is_ok());
+    assert!(check_context_window(&mut g, &limits).is_ok());
 
     // Under auto-truncate the input is cut to fit instead of rejected.
     let truncating = Limits {
@@ -433,7 +501,7 @@ fn input_length_is_checked_unconditionally() {
         ..limits.clone()
     };
     let mut g = req(None);
-    assert!(check_total_tokens(&mut g, &truncating).is_ok());
+    assert!(check_context_window(&mut g, &truncating).is_ok());
     assert_eq!(
         g.input_ids.as_deref(),
         Some(&[1, 2, 3][..]),
@@ -455,21 +523,21 @@ fn auto_truncate_cannot_invert_min_and_max_new_tokens() {
     let mut g = GenerateRequest {
         input_ids: Some(vec![1, 2, 3]), // clamps max_new_tokens to 7
         sampling_params: SamplingParams {
-            max_new_tokens: Some(100),
+            max_new_tokens: Some(9),
             min_new_tokens: 50, // …which is below min_new_tokens
             ..Default::default()
         },
         ..Default::default()
     };
-    let err = check_total_tokens(&mut g, &limits)
+    let err = check_context_window(&mut g, &limits)
         .expect_err("a clamp that inverts min/max must 400, not ride the wire");
     assert!(matches!(err, Error::Validation(_)));
     assert!(err.to_string().contains("min_new_tokens"), "{err}");
 
     // A clamp that keeps the invariant still clamps.
     g.sampling_params.min_new_tokens = 2;
-    g.sampling_params.max_new_tokens = Some(100);
-    assert!(check_total_tokens(&mut g, &limits).is_ok());
+    g.sampling_params.max_new_tokens = Some(9);
+    assert!(check_context_window(&mut g, &limits).is_ok());
     assert_eq!(g.sampling_params.max_new_tokens, Some(7));
 }
 
