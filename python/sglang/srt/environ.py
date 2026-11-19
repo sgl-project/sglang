@@ -884,6 +884,8 @@ class Envs:
     # PD prefill + write_back: Full-leaf eviction backups (D2H) wait only for
     # work issued before the in-flight forward; 0 waits for that forward too.
     SGLANG_ENABLE_HICACHE_WB_EVICT_RELAXED_FENCE = EnvBool(True)
+    # Also apply the relaxed fence under pipeline parallelism (needs the flag above).
+    SGLANG_ENABLE_HICACHE_WB_EVICT_RELAXED_FENCE_PP = EnvBool(False)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
     # File-backend LRU eviction (opt-in; sizes accept SI/IEC suffixes, "0" disables).
     SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE = EnvStr(None)

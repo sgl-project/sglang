@@ -685,10 +685,11 @@ class Scheduler(
                 cache_controller.write_fence_stream = (
                     self.tp_worker.model_runner.forward_stream
                 )
-        # The PP loop records fence events only for the relaxed fence.
+        # The PP loop records fence events only when the relaxed fence is on for PP.
         self._pp_fence_controller = (
             self._hicache_fence_controller
             if envs.SGLANG_ENABLE_HICACHE_WB_EVICT_RELAXED_FENCE.get()
+            and envs.SGLANG_ENABLE_HICACHE_WB_EVICT_RELAXED_FENCE_PP.get()
             else None
         )
         self.emit_metrics_constants()
