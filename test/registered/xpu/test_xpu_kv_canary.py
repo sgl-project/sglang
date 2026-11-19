@@ -18,11 +18,16 @@ from sglang.srt.kv_canary.config import CanaryMode
 from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.kv_canary.e2e_base import CanaryE2EBase
 
-register_xpu_ci(est_time=600, suite="stage-b-test-1-gpu-xpu")
+register_xpu_ci(est_time=600, suite="extra-test-1-gpu-xpu")
 
-# --disable-cuda-graph is mandatory, not tuning: install_canary refuses a captured decode
+# --disable-decode-cuda-graph --disable-prefill-cuda-graph is mandatory, not tuning: install_canary refuses a captured decode
 # on a device that routes to the torch reference (host work and D2H, so replay checks nothing).
-_XPU_SERVER_ARGS = ("--device", "xpu", "--disable-cuda-graph")
+_XPU_SERVER_ARGS = (
+    "--device",
+    "xpu",
+    "--disable-decode-cuda-graph",
+    "--disable-prefill-cuda-graph",
+)
 
 
 class _XPUCanaryE2EBase(CanaryE2EBase):

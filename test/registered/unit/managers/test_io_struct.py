@@ -10,6 +10,8 @@ import msgspec
 import numpy as np
 import torch
 
+from sglang.srt.entrypoints.openai.protocol import OPENAI_MAX_N
+from sglang.srt.environ import envs
 from sglang.srt.managers import io_struct
 from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
@@ -46,8 +48,8 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=8, suite="stage-b-test-1-gpu-small-amd")
-register_cpu_ci(est_time=6, suite="stage-b-test-cpu-intel")
+register_amd_ci(est_time=8, suite="base-b-test-1-gpu-small-amd")
+register_cpu_ci(est_time=6, suite="extra-test-cpu-intel")
 
 
 class TestTokenizedReqInputMsgpack(unittest.TestCase):
@@ -116,11 +118,40 @@ class TestTokenizedReqInputMsgpack(unittest.TestCase):
                 "GetInternalStateReq",
                 "FlushCacheReqInput",
                 "CheckWeightsReqInput",
+                "FreezeGCReq",
+                "SetInternalStateReq",
+                "ProfileReq",
+                "ExpertDistributionReq",
+                "SlowDownReqInput",
+                "ReleaseMemoryOccupationReqInput",
+                "ResumeMemoryOccupationReqInput",
+                "GetWeightsByNameReqInput",
+                "InitWeightsUpdateGroupReqInput",
+                "DestroyWeightsUpdateGroupReqInput",
+                "InitWeightsSendGroupForRemoteInstanceReqInput",
+                "SendWeightsToRemoteInstanceReqInput",
+                "AddExternalCorpusReqInput",
+                "RemoveExternalCorpusReqInput",
+                "ListExternalCorporaReqInput",
+                "OpenSessionReqInput",
+                "CloseSessionReqInput",
+                "GetHiCacheL3LayoutReq",
+                "ConfigureLoggingReq",
+                "DumperControlReqInput",
+                "UpdateWeightFromDiskReqInput",
+                "UpdateWeightsFromDistributedReqInput",
+                "UpdateWeightsFromTensorReqInput",
+                "UpdateWeightsFromIPCReqInput",
+                "BeginWeightUpdateReqInput",
+                "EndWeightUpdateReqInput",
+                "PluginWeightUpdateReqInput",
+                "PauseGenerationReqInput",
+                "ContinueGenerationReqInput",
+                "PdRoleSwitchReqInput",
+                "UpdateWeightVersionReqInput",
                 "ClearHiCacheReqInput",
                 "DetachHiCacheStorageReqInput",
                 "AttachHiCacheStorageReqInput",
-                "ProfileReq",
-                "FreezeGCReq",
             },
         )
         for name, body in messages:
@@ -585,6 +616,40 @@ class TestGenerateReqInputNormalization(CustomTestCase):
 
         # Check modalities
         self.assertEqual(req.modalities, [None, "image"])
+
+    def test_oversized_n_rejected_before_fan_out(self):
+        """An out-of-range n must be rejected before inputs are expanded n times."""
+        with envs.SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ.override(4096):
+            for n in (0, -1, 4097, True, "2", None, 2.0):
+                for sampling_params in ({"n": n}, [{"n": n}, {"n": n}]):
+                    with self.subTest(n=n, sampling_params=sampling_params):
+                        text = (
+                            "Hello" if isinstance(sampling_params, dict) else ["a", "b"]
+                        )
+                        req = GenerateReqInput(
+                            text=text, sampling_params=sampling_params
+                        )
+                        with self.assertRaisesRegex(ValueError, "n must be an integer"):
+                            req.normalize_batch_and_arguments()
+                        self.assertIsNone(req.rid)
+
+            # Native requests are not limited to OpenAI's n.
+            req = GenerateReqInput(
+                text="Hello", sampling_params={"n": OPENAI_MAX_N + 1}
+            )
+            req.normalize_batch_and_arguments()
+            self.assertEqual(len(req.text), OPENAI_MAX_N + 1)
+
+    def test_list_n_validated_for_every_element(self):
+        """A later element equal to the first by value must still be validated."""
+        for later in (True, 2.0):
+            first = 1 if later is True else 2
+            with self.subTest(later=later):
+                req = GenerateReqInput(
+                    text=["a", "b"], sampling_params=[{"n": first}, {"n": later}]
+                )
+                with self.assertRaisesRegex(ValueError, "n must be an integer"):
+                    req.normalize_batch_and_arguments()
 
     def test_expanding_parallel_sample_correlation(self):
         """Test that when expanding with parallel samples, prompts, images and modalities are properly correlated."""
@@ -1331,25 +1396,12 @@ class TestGenerateReqInputNormalization(CustomTestCase):
             )
             req.normalize_batch_and_arguments()
 
-    def test_data_parallel_rank_alias_maps_to_routed_dp_rank(self):
-        req = GenerateReqInput(text="Hello", sampling_params={}, data_parallel_rank=2)
-        req.normalize_batch_and_arguments()
-        self.assertEqual(req.routed_dp_rank, 2)
-        self.assertIsNone(req.data_parallel_rank)
-
-    def test_data_parallel_rank_alias_does_not_override_routed_dp_rank(self):
-        req = GenerateReqInput(
-            text="Hello", sampling_params={}, data_parallel_rank=2, routed_dp_rank=1
-        )
-        req.normalize_batch_and_arguments()
-        self.assertEqual(req.routed_dp_rank, 1)
-
-    def test_data_parallel_rank_alias_propagates_to_batch_items(self):
+    def test_routed_dp_rank_propagates_to_batch_items(self):
         req = GenerateReqInput(
             text=["Hello", "World"],
             sampling_params=[{}, {}],
             rid=["id1", "id2"],
-            data_parallel_rank=3,
+            routed_dp_rank=3,
         )
         req.normalize_batch_and_arguments()
         self.assertEqual(req[0].routed_dp_rank, 3)

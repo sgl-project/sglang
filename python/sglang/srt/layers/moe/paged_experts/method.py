@@ -4,12 +4,19 @@ from __future__ import annotations
 
 import functools
 import logging
+from types import SimpleNamespace
 from typing import Optional
 
 import torch
 
 from sglang.srt.configs.load_config import LoadFormat
 from sglang.srt.layers.moe.paged_experts import expert_cache
+from sglang.srt.layers.moe.paged_experts.disk_tier import (
+    TieredExpertStore,
+    fill_file,
+    host_rows,
+    tier_cache,
+)
 from sglang.srt.layers.moe.paged_experts.executor import DeviceExecutor, EagerExecutor
 from sglang.srt.layers.moe.paged_experts.expert_cache import ExpertCache, fill_store
 from sglang.srt.layers.moe.paged_experts.formats import (
@@ -72,6 +79,9 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
         self.format = expert_format
         self.num_experts = num_experts
         self.num_resident = num_resident
+        self.host_rows = (
+            num_experts  # experts in pinned host rows: fewer on the disk tier
+        )
         # --paged-experts-num-resident auto: built with K = top_k; the model runner sizes K once
         # the KV cache is allocated (sizing.ExpertSlotSizing).
         self.auto_size = auto_size
@@ -99,6 +109,10 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
         # The GPU table has K rows. The loader below sends all E experts to the host store,
         # so the native expert-id remap never sees ids >= K.
         self._set_num_slots(layer, self.num_resident)
+        # What a step's working memory follows from (``RunnerContract.prefill_bytes``).
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size_per_partition
+        self.params_dtype = params_dtype
         self.native_loader = extra.get("weight_loader")
         self.base_method.create_weights(
             layer=layer,
@@ -146,7 +160,7 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
             if expert_id is None:
                 # A stacked checkpoint tensor (e.g. gpt-oss) holds every expert at once: the
                 # call goes as made to the layer's native loader, on a table of every expert.
-                stacked = torch.nn.Parameter(loads.table[name], requires_grad=False)
+                stacked = torch.nn.Parameter(self._table(name), requires_grad=False)
                 stacked.__dict__.update(param.__dict__)
                 self.native_loader(
                     stacked, loaded_weight, weight_name, shard_id, *rest, **kwargs
@@ -159,9 +173,17 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
                 int(expert_id), name, write, loaded_weight
             ):
                 return
-            write(loads.table[name][expert_id : expert_id + 1])
+            write(self._table(name)[expert_id : expert_id + 1])
 
         return weight_loader
+
+    def _table(self, name):
+        if self.tiered:
+            _cannot_tier(
+                "a load cannot wait as a view of the mapped checkpoint (a stacked tensor, a "
+                "tensor torch allocated or a streamed buffer)"
+            )
+        return self.loads.table[name]
 
     def create_moe_runner(self, layer, moe_runner_config):
         self.moe_runner_config = moe_runner_config  # rebuilt with the final K
@@ -177,6 +199,25 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
             self.num_resident,
             wait=_loads_mapped_files(),
         )
+        self.host_rows = _host_rows(
+            self.loads.rows_like,
+            self.num_experts,
+            self.num_resident,
+            getattr(layer, "layer_id", None),
+        )
+        if self.tiered and not self.loads.waiting:
+            _cannot_tier("the checkpoint is not loaded as mapped safetensors files")
+
+    @property
+    def tiered(self) -> bool:
+        """Whether the layer is on the disk tier."""
+        return self.host_rows < self.num_experts
+
+    @property
+    def max_resident(self) -> int:
+        """At most this many slots: on the disk tier, a wave reads each of up to K experts
+        into a host row of its own."""
+        return self.host_rows
 
     def _expert_cache(self, layer) -> Optional[ExpertCache]:
         """The layer's expert cache entry, once its checkpoint files are loaded: for a layer
@@ -205,9 +246,21 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
             self.contract.repacks,
             self.format.unpaged,
         )
-        width = _router_top_k(layer)
-        self.store = fill_store(step, self._expert_cache(layer), width)
-        step.finish(self.store)
+        cache = self._expert_cache(layer)
+        if self.tiered:
+            # Every expert in the cache file, R of them in host rows.
+            cache = tier_cache(
+                cache, self.loads.rows_like, self.num_experts, self.host_rows
+            )
+            views = fill_file(step, cache, _router_top_k(layer))
+            step.finish(SimpleNamespace(host=views))
+            self.store = TieredExpertStore(
+                step.rows_like, self.num_experts, self.host_rows, cache
+            )
+        else:
+            width = _router_top_k(layer)
+            self.store = fill_store(step, cache, width)
+            step.finish(self.store)
         self.loads.drop()  # the checkpoint views the loads held
         self.loads = None
         if not self.auto_size:
@@ -258,13 +311,17 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
             nbytes = num_resident * _row_bytes(host)
             table = slab[offset : offset + nbytes].view(host.dtype)
             param.data = table.view(num_resident, *host.shape[1:])
-            param.data.copy_(host[:num_resident])
+            if not self.tiered:
+                param.data.copy_(host[:num_resident])
             offset += -(-nbytes // _ALIGN) * _ALIGN
+        if self.tiered:  # the host rows hold other experts: read 0..K-1 from the file
+            self.store.fill_slots(layer, num_resident)
         return offset
 
     def _build(self, layer):
         """The executors and, with CUDA graphs, the device residency, for the final K."""
         self.policy = LRUPolicy(self.num_resident)
+        self.store.bind(layer, device_planned=self.graphs)
         residency = None
         if self.graphs:
             residency = DeviceResidency(
@@ -272,7 +329,6 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
                 num_slots=self.num_resident,
                 device=getattr(layer, next(iter(self.store.host))).device,
             )
-            self.store.bind_device_gather(layer)
             self.device_executor = DeviceExecutor(
                 base_method=self.format.runner_method(self.base_method),
                 store=self.store,
@@ -298,6 +354,8 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
         if (
             self.device_executor is not None
             and topk_output.topk_ids.numel() <= self.num_resident
+            # A breakable graph cannot replay for a disk read: those steps run as a break.
+            and not (self.tiered and is_in_breakable_cuda_graph())
         ):
             return self.device_executor.run(
                 layer=layer, dispatch_output=dispatch_output
@@ -542,6 +600,34 @@ def _refusal(load_format: str) -> str:
 def _load_format() -> str:
     load_format = get_model().load_format
     return getattr(load_format, "value", load_format)
+
+
+def _host_rows(rows_like, num_experts: int, num_resident: int, layer_id) -> int:
+    """Experts the layer keeps in pinned host rows. Without --paged-experts-enable-disk and
+    --paged-experts-host-memory-gb every expert, as without the disk tier: no budget is
+    measured."""
+    moe = get_exec().moe
+    if num_experts <= num_resident or not (
+        moe.paged_experts_enable_disk or moe.paged_experts_host_memory_gb is not None
+    ):
+        return num_experts
+    return host_rows(
+        rows_like,
+        num_experts,
+        num_resident,
+        enabled=moe.paged_experts_enable_disk,
+        layer_id=layer_id,
+    )
+
+
+def _cannot_tier(why: str):
+    raise RuntimeError(
+        "Paged experts: the disk tier builds each layer's file from a safetensors checkpoint "
+        f"with a tensor per expert, read through mmap, but {why}; use --load-format auto, "
+        "safetensors or mistral without --weight-loader-disable-mmap (a checkpoint that stacks "
+        "all experts in one tensor, e.g. gpt-oss, cannot use the tier), or raise "
+        "--paged-experts-host-memory-gb so that every expert fits"
+    )
 
 
 def _loads_mapped_files() -> bool:
