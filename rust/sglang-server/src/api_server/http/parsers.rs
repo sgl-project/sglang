@@ -138,7 +138,7 @@ mod tests {
             server_args,
             chat_formatter: None,
             generate_hook: None,
-            openai_chat: None,
+            openai: Default::default(),
         })
     }
 

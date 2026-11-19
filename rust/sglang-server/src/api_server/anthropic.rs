@@ -1,6 +1,6 @@
 //! Anthropic Messages adapter shared by the HTTP routes and the gRPC
 //! service: an `api.v1` Anthropic request becomes one OpenAI chat request
-//! served by the chat core, and the chat reply or stream is re-shaped into
+//! served by the chat route, and the chat reply or stream is re-shaped into
 //! Anthropic blocks and events. `entrypoints/anthropic/serving.py` is the
 //! reference for every translation here.
 
@@ -14,34 +14,25 @@ use sglang_api_types::api::v1::{
     anthropic_content_delta::Delta, anthropic_search_source::Value as SearchSource,
     anthropic_stream_event::Event,
 };
-use sglang_processor::dynamo_parsers::ToolChoice as DynamoToolChoice;
 use sglang_processor::dynamo_protocols::types::{
-    ChatCompletionMessageContent, ChatCompletionToolChoiceOption, CompletionUsage,
-    CreateChatCompletionRequest, CreateChatCompletionResponse, CreateChatCompletionStreamResponse,
-    FinishReason as OpenAIFinishReason,
+    ChatCompletionMessageContent, CompletionUsage, CreateChatCompletionResponse,
+    CreateChatCompletionStreamResponse, FinishReason as OpenAIFinishReason,
 };
-use sglang_processor::{ReasoningOptions, dynamo_tool_choice};
+use sglang_processor::openai::Reply;
 use tonic::{Code, Status};
 
 use super::core::CoreError;
-use super::handlers::{CoreCall, CoreHandle};
-use super::http::openai::chat::{
-    OutputParsing, SamplingDefaults, chat_event_stream, chat_sampling, prepare_chat_prompt,
-    starts_in_reasoning, unary_chat_response,
-};
-use super::http::openai::pd_routing::PDRoutingFields;
-use super::http::openai::{ChatFormatter, ChatTemplateKwargs, unix_seconds_u32};
-use crate::api_server::log::ReceivedAs;
+use super::openai::{ChatFormatter, ChatTemplateKwargs};
+use super::openai::{OpenAiService, Served, prompt_ids};
 use crate::message::config::ServerArgs;
-use crate::message::ids::Rid;
-use crate::message::request::{GenerateRequest, RenderedChat};
 
 pub(crate) type Events = Pin<Box<dyn Stream<Item = api::AnthropicStreamEvent> + Send + 'static>>;
 
 /// The per-listener facts an Anthropic call needs; both transports build one
 /// from their own state.
 pub(crate) struct Anthropic<'a> {
-    pub(crate) core: &'a CoreHandle,
+    /// The chat route's serving path, which every message goes through.
+    pub(crate) chat: OpenAiService<'a>,
     pub(crate) chat_formatter: Option<&'a ChatFormatter>,
     pub(crate) server_args: &'a ServerArgs,
 }
@@ -118,16 +109,6 @@ fn error_type(status: StatusCode) -> &'static str {
 
 fn message_id() -> String {
     format!("msg_{}", uuid::Uuid::new_v4().simple())
-}
-
-/// One submitted chat generation and what its reply shaping needs.
-struct Submitted {
-    call: CoreCall,
-    model: String,
-    /// The served parsers over the reply, and whether it starts in reasoning.
-    parsing: OutputParsing,
-    tool_choice: Option<ChatCompletionToolChoiceOption>,
-    uses_tool_call_structural_tag: bool,
 }
 
 fn is_server_tool(tool: &api::AnthropicTool) -> bool {
@@ -246,7 +227,7 @@ impl Anthropic<'_> {
     fn to_chat_request(
         &self,
         request: &api::AnthropicMessagesRequest,
-    ) -> Result<(CreateChatCompletionRequest, Option<ChatTemplateKwargs>), AnthropicFailure> {
+    ) -> Result<serde_json::Value, AnthropicFailure> {
         if request.model.is_empty() {
             return Err(AnthropicFailure::invalid("Model is required"));
         }
@@ -564,9 +545,12 @@ impl Anthropic<'_> {
             tracing::info!(betas = ?request.betas, "Anthropic request opted into betas; no-op locally");
         }
 
-        let chat_request: CreateChatCompletionRequest = serde_json::from_value(body)
-            .map_err(|error| AnthropicFailure::invalid(format!("invalid request: {error}")))?;
-        Ok((chat_request, kwargs))
+        // The kwargs ride the body, where the renderer reads an OpenAI request's.
+        if let Some(kwargs) = kwargs {
+            body["chat_template_kwargs"] = serde_json::to_value(kwargs)
+                .map_err(|error| AnthropicFailure::invalid(error.to_string()))?;
+        }
+        Ok(body)
     }
 
     /// Python's `_convert_assistant_thinking_blocks`: prior-turn thinking
@@ -606,121 +590,68 @@ impl Anthropic<'_> {
         Ok(Some(parts.join("\n")))
     }
 
-    /// Render `chat_request` with the served template, `kwargs` riding the
-    /// body as `chat_template_kwargs` so the renderer reads them as it does
-    /// an OpenAI request's.
-    fn render(
-        &self,
-        formatter: &ChatFormatter,
-        chat_request: &mut CreateChatCompletionRequest,
-        kwargs: Option<&ChatTemplateKwargs>,
-    ) -> Result<RenderedChat, AnthropicFailure> {
-        let mut body = serde_json::to_value(&*chat_request)
-            .map_err(|error| AnthropicFailure::invalid(error.to_string()))?;
-        if let Some(kwargs) = kwargs {
-            body["chat_template_kwargs"] = serde_json::to_value(kwargs)
-                .map_err(|error| AnthropicFailure::invalid(error.to_string()))?;
-        }
-        prepare_chat_prompt(
-            formatter,
-            body,
-            chat_request,
-            &self.server_args.default_chat_template_kwargs,
-        )
-        .map_err(AnthropicFailure::invalid)
-    }
-
-    /// Render, resolve sampling, and submit one chat generation, as the
-    /// OpenAI chat route does for `n = 1`.
-    async fn submit(
+    /// The OpenAI chat body of `request`, as the chat route serves `n = 1`.
+    fn chat_body(
         &self,
         request: api::AnthropicMessagesRequest,
         stream: bool,
-    ) -> Result<Submitted, AnthropicFailure> {
-        let Some(formatter) = self.chat_formatter else {
+    ) -> Result<serde_json::Value, AnthropicFailure> {
+        if self.chat_formatter.is_none() {
             return Err(AnthropicFailure::invalid(
                 "this model has no usable chat template",
             ));
-        };
-        let (mut chat_request, kwargs) = self.to_chat_request(&request)?;
-        if chat_request.messages.is_empty() {
+        }
+        let mut body = self.to_chat_request(&request)?;
+        if body["messages"].as_array().is_none_or(Vec::is_empty) {
             return Err(AnthropicFailure::invalid("messages cannot be empty"));
         }
-        let tool_choice = dynamo_tool_choice(&chat_request.tool_choice);
-        let tools = sglang_processor::chat_tool_definitions(
-            chat_request.tools.as_deref(),
-            &chat_request.messages,
-        )
-        .map_err(|error| AnthropicFailure::invalid(error.to_string()))?;
-        let tools_enabled = !tools.is_empty() && tool_choice != DynamoToolChoice::None;
-        let parser = tools_enabled
-            .then(|| self.server_args.tool_call_parser.clone())
-            .flatten();
-        if tools_enabled && parser.is_none() {
+        let has_tools = body["tools"]
+            .as_array()
+            .is_some_and(|tools| !tools.is_empty());
+        if has_tools && body["tool_choice"] != "none" && self.server_args.tool_call_parser.is_none()
+        {
             return Err(AnthropicFailure::invalid(
                 "tool calls require --tool-call-parser",
             ));
         }
-        let reasoning_parser = self.server_args.reasoning_parser.clone();
-        let tools = (!tools.is_empty()).then_some(tools);
-        let rendered = self.render(formatter, &mut chat_request, kwargs.as_ref())?;
-        let mut sampling = chat_sampling(
-            &chat_request,
-            SamplingDefaults::CHAT,
-            parser.as_deref(),
-            &tool_choice,
-            tools.as_deref().unwrap_or_default(),
-            chat_request.parallel_tool_calls,
-            self.server_args,
-        )
-        .map_err(AnthropicFailure::invalid)?;
+        body["stream"] = stream.into();
+        if stream {
+            body["stream_options"] = serde_json::json!({"include_usage": true});
+        }
         if let Some(top_k) = request.top_k {
-            sampling.top_k = top_k;
+            body["top_k"] = top_k.into();
         }
-        let routing = PDRoutingFields {
-            bootstrap_host: request.bootstrap_host,
-            bootstrap_port: request.bootstrap_port,
-            bootstrap_room: request.bootstrap_room,
-            routed_dp_rank: request.routed_dp_rank,
-            disagg_prefill_dp_rank: request.disagg_prefill_dp_rank,
+        // The chat route validates the routing fields as it does its own.
+        let fields = [
+            (
+                "bootstrap_host",
+                serde_json::to_value(request.bootstrap_host),
+            ),
+            (
+                "bootstrap_port",
+                serde_json::to_value(request.bootstrap_port),
+            ),
+            (
+                "bootstrap_room",
+                serde_json::to_value(request.bootstrap_room),
+            ),
+            (
+                "routed_dp_rank",
+                serde_json::to_value(request.routed_dp_rank),
+            ),
+            (
+                "disagg_prefill_dp_rank",
+                serde_json::to_value(request.disagg_prefill_dp_rank),
+            ),
+        ];
+        for (key, value) in fields {
+            match value {
+                Ok(serde_json::Value::Null) => {}
+                Ok(value) => body[key] = value,
+                Err(error) => return Err(AnthropicFailure::invalid(error.to_string())),
+            }
         }
-        .normalize(1, 1)
-        .map_err(|error| AnthropicFailure::invalid(error.to_string()))?;
-        let uses_tool_call_structural_tag = sampling.structural_tag.is_some();
-        let starts_in_reasoning =
-            starts_in_reasoning(reasoning_parser.as_deref(), rendered.prompt.as_str());
-        let native = GenerateRequest {
-            rid: Rid::new(),
-            chat_prompt: Some(Box::new(rendered)),
-            sampling_params: sampling,
-            stream,
-            bootstrap_host: routing.bootstrap.bootstrap_hosts[0].clone(),
-            bootstrap_port: routing.bootstrap.bootstrap_ports[0],
-            bootstrap_room: routing.bootstrap.bootstrap_rooms[0],
-            routed_dp_rank: routing.routed_dp_rank,
-            disagg_prefill_dp_rank: routing.disagg_prefill_dp_rank,
-            ..Default::default()
-        };
-        let call = self
-            .core
-            .generate(native, ReceivedAs::without_headers())
-            .await
-            .map_err(AnthropicFailure::from_core)?;
-        Ok(Submitted {
-            call,
-            model: chat_request.model,
-            parsing: OutputParsing::Text {
-                reasoning_parser,
-                reasoning_options: ReasoningOptions {
-                    force_reasoning: starts_in_reasoning.then_some(true),
-                    ..Default::default()
-                },
-                tool_parser: parser,
-                tools,
-            },
-            tool_choice: chat_request.tool_choice,
-            uses_tool_call_structural_tag,
-        })
+        Ok(body)
     }
 
     /// `POST /v1/messages` without `stream`.
@@ -728,21 +659,16 @@ impl Anthropic<'_> {
         &self,
         request: api::AnthropicMessagesRequest,
     ) -> Result<api::AnthropicMessagesResponse, AnthropicFailure> {
-        let submitted = self.submit(request, false).await?;
-        let response = unary_chat_response(
-            vec![(0, submitted.call)],
-            message_id(),
-            submitted.model,
-            unix_seconds_u32(),
-            false,
-            submitted.parsing,
-            0,
-            true,
-            None,
-            false,
-        )
-        .await
-        .map_err(|(status, message)| AnthropicFailure::from_status(status, message))?;
+        let body = self.chat_body(request, false)?;
+        let reply = match self.chat.chat(&body).await {
+            Served::Reply(reply) => reply,
+            Served::Events(_) => unreachable!("a chat without `stream` answers once"),
+        };
+        if reply.status != 200 {
+            return Err(reply_failure(&reply));
+        }
+        let response = serde_json::from_str(&reply.body)
+            .map_err(|error| AnthropicFailure::from_core(CoreError::Internal(error.to_string())))?;
         Ok(convert_response(response))
     }
 
@@ -754,22 +680,16 @@ impl Anthropic<'_> {
         request: api::AnthropicMessagesRequest,
     ) -> Result<Events, AnthropicFailure> {
         let model = request.model.clone();
-        let submitted = self.submit(request, true).await?;
-        let chunks = chat_event_stream(
-            vec![(0, submitted.call)],
-            message_id(),
-            submitted.model,
-            unix_seconds_u32(),
-            false,
-            true,
-            submitted.parsing,
-            0,
-            submitted.tool_choice,
-            submitted.uses_tool_call_structural_tag,
-            true,
-            None,
-            false,
-        );
+        let body = self.chat_body(request, true)?;
+        let events = match self.chat.chat(&body).await {
+            Served::Events(events) => events,
+            Served::Reply(reply) => return Err(reply_failure(&reply)),
+        };
+        // Each event is one `data:` line.
+        let chunks = events.filter_map(|event| async move {
+            let frame = event.strip_prefix("data: ")?.trim_end();
+            Some(frame.to_owned())
+        });
         Ok(Box::pin(anthropic_events(chunks, model)))
     }
 
@@ -778,11 +698,11 @@ impl Anthropic<'_> {
         &self,
         request: api::AnthropicCountTokensRequest,
     ) -> Result<api::AnthropicCountTokensResponse, AnthropicFailure> {
-        let Some(formatter) = self.chat_formatter else {
+        if self.chat_formatter.is_none() {
             return Err(AnthropicFailure::invalid(
                 "this model has no usable chat template",
             ));
-        };
+        }
         let messages_request = api::AnthropicMessagesRequest {
             model: request.model,
             messages: request.messages,
@@ -793,17 +713,22 @@ impl Anthropic<'_> {
             tools: request.tools,
             ..Default::default()
         };
-        let (mut chat_request, kwargs) = self.to_chat_request(&messages_request)?;
-        let rendered = self.render(formatter, &mut chat_request, kwargs.as_ref())?;
-        let ids = self
-            .core
-            .tokenize_chat(rendered)
+        let body = self.to_chat_request(&messages_request)?;
+        let ids = prompt_ids(self.chat.openai, body.to_string().into())
             .await
-            .map_err(AnthropicFailure::from_core)?;
+            .map_err(|reply| reply_failure(&reply))?;
         Ok(api::AnthropicCountTokensResponse {
             input_tokens: i64::try_from(ids.len()).unwrap_or(i64::MAX),
         })
     }
+}
+
+/// The chat route's error reply, in Anthropic terms.
+fn reply_failure(reply: &Reply) -> AnthropicFailure {
+    let status = StatusCode::from_u16(reply.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let error: serde_json::Value = serde_json::from_str(&reply.body).unwrap_or_default();
+    let message = error["message"].as_str().unwrap_or("Upstream error");
+    AnthropicFailure::from_status(status, message)
 }
 
 fn flush_user_parts(messages: &mut Vec<serde_json::Value>, parts: &mut Vec<serde_json::Value>) {
@@ -1289,7 +1214,7 @@ fn anthropic_events(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api_server::http::openai::test_utils::core_handle;
+    use crate::api_server::http::test_utils::core_handle;
 
     fn request(body: serde_json::Value) -> api::AnthropicMessagesRequest {
         serde_json::from_value(body).unwrap()
@@ -1297,7 +1222,13 @@ mod tests {
 
     fn adapter(server_args: &ServerArgs) -> Anthropic<'_> {
         Anthropic {
-            core: Box::leak(Box::new(core_handle())),
+            chat: OpenAiService {
+                core: Box::leak(Box::new(core_handle())),
+                server_args,
+                generation_policy: Box::leak(Box::new(server_args.into())),
+                generate_hook: None,
+                openai: Box::leak(Box::default()),
+            },
             chat_formatter: None,
             server_args,
         }
@@ -1311,7 +1242,7 @@ mod tests {
     fn converts_messages_tools_and_tool_choice_like_python() {
         let server_args = ServerArgs::default();
         let anthropic = adapter(&server_args);
-        let (chat, kwargs) = anthropic
+        let json = anthropic
             .to_chat_request(&request(serde_json::json!({
                 "model": "m",
                 "max_tokens": 8,
@@ -1338,8 +1269,7 @@ mod tests {
                 "temperature": 0.2
             })))
             .unwrap();
-        assert!(kwargs.is_none());
-        let json = serde_json::to_value(&chat).unwrap();
+        assert!(json["chat_template_kwargs"].is_null());
         let messages = json["messages"].as_array().unwrap();
         assert_eq!(messages[0]["role"], "system");
         assert_eq!(messages[0]["content"], "be brief\ninline");
@@ -1430,7 +1360,7 @@ mod tests {
             ..Default::default()
         };
         let anthropic = adapter(&server_args);
-        let (chat, kwargs) = anthropic
+        let json = anthropic
             .to_chat_request(&request(serde_json::json!({
                 "model": "m",
                 "max_tokens": 8,
@@ -1445,8 +1375,7 @@ mod tests {
                 ]
             })))
             .unwrap();
-        assert_eq!(kwargs.unwrap()["enable_thinking"], false);
-        let json = serde_json::to_value(&chat).unwrap();
+        assert_eq!(json["chat_template_kwargs"]["enable_thinking"], false);
         assert_eq!(json["messages"][1]["reasoning_content"], "hmm");
         assert_eq!(json["messages"][1]["content"], "ok");
     }

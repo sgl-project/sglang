@@ -31,7 +31,7 @@ const HEADER_OVERRIDES: &[(&str, &str, Kind)] = &[
 /// Write each present override header into `body` and return the fields
 /// written, in that order. An unparsable value fails the request (Python
 /// answers 400). A non-object body is left alone; decoding rejects it.
-pub(super) fn apply_header_overrides(
+pub(in crate::api_server) fn apply_header_overrides(
     body: &mut Value,
     headers: &HeaderMap,
 ) -> Result<Map<String, Value>, String> {

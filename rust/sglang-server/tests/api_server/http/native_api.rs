@@ -493,7 +493,12 @@ fn generate_validator_refuses_every_ingress_before_submission() {
             .unwrap_or(&response.body);
         let first: Value =
             serde_json::from_str(first).unwrap_or_else(|_| panic!("{case}: {first}"));
-        assert_eq!(&first["error"], error, "{case}");
+        // The OpenAI route's error is the whole body, as Python's is.
+        let got = match uri {
+            "/generate" => &first["error"],
+            _ => &first,
+        };
+        assert_eq!(got, error, "{case}");
     }
     assert!(
         rt.next_request(Duration::from_millis(200)).is_none(),

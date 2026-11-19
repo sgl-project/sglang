@@ -261,15 +261,8 @@ impl RequestLog {
         )
     }
 
-    /// Whether OpenAI requests get their own line (from level 2).
-    pub(crate) fn logs_openai_requests(&self) -> bool {
-        self.logger
-            .as_ref()
-            .is_some_and(|logger| logger.config.openai_requests)
-    }
-
     /// Log an OpenAI request's `body` as received (Python
-    /// `log_openai_received_request`), when [`Self::logs_openai_requests`].
+    /// `log_openai_received_request`), from level 2.
     /// A body that is not a JSON object is not logged.
     pub(crate) fn openai_received(
         &self,
