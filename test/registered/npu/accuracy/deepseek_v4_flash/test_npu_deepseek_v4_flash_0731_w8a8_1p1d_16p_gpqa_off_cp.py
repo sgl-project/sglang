@@ -158,7 +158,7 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
     "--hicache-io-backend",
     "kernel_ascend",
     "--hicache-storage-backend",
-    "mooncake",
+    "npu_memcache",
     "--hicache-ratio",
     1.5,
     "--hicache-write-policy",

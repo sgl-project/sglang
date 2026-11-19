@@ -1001,13 +1001,15 @@ def start_memcache_meta_service(
 
 
 HICACHE_STORAGE_BACKEND_ARG = "--hicache-storage-backend"
+# HiCache storage backends that connect through the memcache meta service.
+MEMCACHE_STORAGE_BACKENDS = ("mooncake", "npu_memcache")
 
 
 def maybe_start_memcache_meta_service(other_args):
-    """Start the memcache meta service when HiCache L3 uses mooncake.
+    """Start the memcache meta service when HiCache L3 uses memcache storage.
 
-    Only the mooncake storage backend connects through the meta service, so
-    every other backend is skipped.
+    The ``mooncake`` and ``npu_memcache`` storage backends connect through the
+    meta service, so every other backend is skipped.
 
     Args:
         other_args (list): Server launch args.
@@ -1026,7 +1028,7 @@ def maybe_start_memcache_meta_service(other_args):
         if arg.startswith(f"{HICACHE_STORAGE_BACKEND_ARG}="):
             backend = arg.split("=", 1)[1]
             break
-    if backend != "mooncake":
+    if backend not in MEMCACHE_STORAGE_BACKENDS:
         return None
 
     process = start_memcache_meta_service()
