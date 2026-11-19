@@ -52,6 +52,38 @@ class TestFlattenHidden(CustomTestCase):
         self.assertEqual(lens, [4])
         self.assertEqual(kinds, [HIDDEN_ROW_WHOLE])
 
+    def test_kinds_are_in_an_order_the_rust_side_accepts(self):
+        # A copy of `hidden_rowkinds_nest` in the Rust `message/response.rs`,
+        # which rejects the frame otherwise. Change the two together.
+        def nests(kinds):
+            if kinds == [HIDDEN_ROW_WHOLE]:
+                return True
+            in_matrix = False
+            for kind in kinds:
+                if kind == HIDDEN_ROW_MATRIX_NEXT:
+                    if not in_matrix:
+                        return False
+                elif kind not in (HIDDEN_ROW_VECTOR, HIDDEN_ROW_MATRIX_FIRST):
+                    return False
+                in_matrix = kind != HIDDEN_ROW_VECTOR
+            return True
+
+        for hidden_states in (
+            None,
+            [],
+            [0.5, 0.25],
+            [[0.5, 0.25]],
+            [[[0.5, 0.25]]],
+            [[[0.5], [1.5]], [2.5], [3.5]],
+            # Two prefill steps, as a chunked prefill gives.
+            [[[0.5], [1.5]], [[2.5]], [3.5]],
+            [[[0.5]], [1.5], [[2.5], [3.5]], [4.5]],
+            # An item with no rows.
+            [[], [0.5]],
+        ):
+            with self.subTest(hidden_states=hidden_states):
+                self.assertTrue(nests(flatten_hidden(hidden_states)[2]))
+
     def test_no_hidden_states_is_empty(self):
         self.assertEqual(flatten_hidden(None), ([], [], []))
         self.assertEqual(flatten_hidden([]), ([], [], []))

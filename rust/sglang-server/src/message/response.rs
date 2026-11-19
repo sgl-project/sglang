@@ -498,7 +498,8 @@ fn take_ragged(
 
 /// Like [`take_ragged`] but for hidden states — a val column + row `poslens`
 /// and the rows' `rowkinds`, no idx column. `None` if a read runs past its
-/// buffer (see [`take_poslens`], [`take_f32`]).
+/// buffer (see [`take_poslens`], [`take_f32`]) or the kinds are in an order
+/// Python does not write ([`hidden_rowkinds_nest`]).
 fn take_hidden(
     data: &[u8],
     cv: &mut usize,
@@ -510,8 +511,33 @@ fn take_hidden(
     let start = *pcur;
     let lens = take_poslens(poslens, pcur, nr)?;
     let kinds = rowkinds.get(start..*pcur)?.to_vec();
+    if !hidden_rowkinds_nest(&kinds) {
+        return None;
+    }
     let nv: usize = lens.iter().map(|&x| x as usize).sum();
     Some((take_f32(data, cv, nv)?, lens, kinds))
+}
+
+/// Whether `kinds` is an order Python's `flatten_hidden` writes for one
+/// request: no rows, one `WHOLE` row, or items that are each a `VECTOR` row or
+/// a `MATRIX_FIRST` row followed by its `MATRIX_NEXT` rows. Any other order
+/// (an unknown kind included) would rebuild into a value Python did not
+/// send, so it rejects the frame. Python's `test_flatten_hidden.py` checks
+/// what `flatten_hidden` writes against a copy of this rule.
+fn hidden_rowkinds_nest(kinds: &[u32]) -> bool {
+    if kinds == [HIDDEN_ROW_WHOLE] {
+        return true;
+    }
+    let mut in_matrix = false;
+    kinds.iter().all(|&kind| {
+        let nests = match kind {
+            HIDDEN_ROW_VECTOR | HIDDEN_ROW_MATRIX_FIRST => true,
+            HIDDEN_ROW_MATRIX_NEXT => in_matrix,
+            _ => false,
+        };
+        in_matrix = kind != HIDDEN_ROW_VECTOR;
+        nests
+    })
 }
 
 /// Decode a batch frame (tag stripped), calling `route` with each request's
@@ -592,15 +618,6 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
         || sum(&h.in_tokids_lp_reqlens) != h.in_tokids_lp_poslens.len()
         || sum(&h.hidden_reqlens) != h.hidden_poslens.len()
         || h.hidden_rowkinds.len() != h.hidden_poslens.len()
-        || !h.hidden_rowkinds.iter().all(|&kind| {
-            matches!(
-                kind,
-                HIDDEN_ROW_WHOLE
-                    | HIDDEN_ROW_VECTOR
-                    | HIDDEN_ROW_MATRIX_FIRST
-                    | HIDDEN_ROW_MATRIX_NEXT
-            )
-        })
     {
         reject!()
     }
@@ -1255,45 +1272,78 @@ mod tests {
         );
     }
 
-    /// A row kind this build does not know rejects the frame.
+    /// A row kind this build does not know rejects the frame, and so does an
+    /// order of known kinds that Python's `flatten_hidden` never writes.
     #[test]
-    fn unknown_hidden_rowkind_is_rejected() {
+    fn hidden_rowkinds_python_never_writes_are_rejected() {
         use rmpv::Value;
         let f = |xs: &[f32]| -> Vec<u8> { xs.iter().flat_map(|x| x.to_le_bytes()).collect() };
         let q = |xs: &[i64]| -> Vec<u8> { xs.iter().flat_map(|x| x.to_le_bytes()).collect() };
         let arr_u = |xs: &[u32]| Value::Array(xs.iter().map(|&x| Value::from(x)).collect());
-        let rejected = |kind: u32| {
+        let rejected = |requests: &[&[u32]]| {
+            let n = requests.len();
+            let kinds = requests.concat();
             let header_arr = Value::Array(vec![
-                Value::Array(vec![Value::from("1")]), // rids
-                Value::Array(vec![Value::Nil]),       // finish
-                arr_u(&[0]),                          // prompt
-                arr_u(&[1]),                          // tok_lens
-                arr_u(&[0]),                          // cached_tokens
-                arr_u(&[0]),                          // reasoning_tokens
-                arr_u(&[]),                           // out_lp_lens
-                arr_u(&[]),                           // in_lp_lens
-                arr_u(&[]),                           // out_top_reqlens
-                arr_u(&[]),                           // out_top_poslens
-                arr_u(&[]),                           // in_top_reqlens
-                arr_u(&[]),                           // in_top_poslens
-                arr_u(&[]),                           // out_tokids_lp_reqlens
-                arr_u(&[]),                           // out_tokids_lp_poslens
-                arr_u(&[]),                           // in_tokids_lp_reqlens
-                arr_u(&[]),                           // in_tokids_lp_poslens
-                arr_u(&[1]),                          // hidden_reqlens
-                arr_u(&[2]),                          // hidden_poslens
-                arr_u(&[kind]),                       // hidden_rowkinds
+                Value::Array((0..n).map(|i| Value::from(i.to_string())).collect()), // rids
+                Value::Array(vec![Value::Nil; n]),                                  // finish
+                arr_u(&vec![0; n]),                                                 // prompt
+                arr_u(&vec![1; n]),                                                 // tok_lens
+                arr_u(&vec![0; n]),                                                 // cached_tokens
+                arr_u(&vec![0; n]), // reasoning_tokens
+                arr_u(&[]),         // out_lp_lens
+                arr_u(&[]),         // in_lp_lens
+                arr_u(&[]),         // out_top_reqlens
+                arr_u(&[]),         // out_top_poslens
+                arr_u(&[]),         // in_top_reqlens
+                arr_u(&[]),         // in_top_poslens
+                arr_u(&[]),         // out_tokids_lp_reqlens
+                arr_u(&[]),         // out_tokids_lp_poslens
+                arr_u(&[]),         // in_tokids_lp_reqlens
+                arr_u(&[]),         // in_tokids_lp_poslens
+                arr_u(&requests.iter().map(|r| r.len() as u32).collect::<Vec<_>>()), // hidden_reqlens
+                arr_u(&vec![2; kinds.len()]), // hidden_poslens
+                arr_u(&kinds),                // hidden_rowkinds
             ]);
             let mut header = Vec::new();
             rmpv::encode::write_value(&mut header, &header_arr).unwrap();
             let mut data = Vec::new();
-            data.extend(q(&[10])); // token_ids
-            data.extend(f(&[0.1, 0.2])); // hidden_val
+            data.extend(q(&vec![10; n])); // token_ids
+            data.extend(f(&vec![0.1; 2 * kinds.len()])); // hidden_val
             let framed = frame_decode_batch_cols(&header, &[&data]);
             !for_each_chunk(&framed[1..], |_| {}).ok
         };
-        assert!(!rejected(HIDDEN_ROW_MATRIX_NEXT));
-        assert!(rejected(HIDDEN_ROW_MATRIX_NEXT + 1));
+        const WHOLE: u32 = HIDDEN_ROW_WHOLE;
+        const VECTOR: u32 = HIDDEN_ROW_VECTOR;
+        const FIRST: u32 = HIDDEN_ROW_MATRIX_FIRST;
+        const NEXT: u32 = HIDDEN_ROW_MATRIX_NEXT;
+        for kinds in [
+            &[WHOLE][..],
+            &[VECTOR, VECTOR],
+            &[FIRST],
+            &[FIRST, NEXT, NEXT, VECTOR],
+            // A second prefill step starts a second matrix.
+            &[FIRST, NEXT, FIRST, VECTOR, FIRST, NEXT],
+        ] {
+            assert!(!rejected(&[kinds]), "{kinds:?}");
+        }
+        for kinds in [
+            &[NEXT + 1][..],
+            // `WHOLE` is the whole value, never one row among others.
+            &[WHOLE, VECTOR],
+            &[VECTOR, WHOLE],
+            &[WHOLE, WHOLE],
+            // `MATRIX_NEXT` continues a matrix; it cannot start one.
+            &[NEXT],
+            &[NEXT, NEXT],
+            &[VECTOR, NEXT],
+        ] {
+            assert!(rejected(&[kinds]), "{kinds:?}");
+        }
+        // The order is per request: one with no rows is fine beside any other,
+        // and a matrix does not continue from the request before.
+        assert!(!rejected(&[&[], &[WHOLE]]));
+        assert!(!rejected(&[&[FIRST, NEXT], &[WHOLE]]));
+        assert!(rejected(&[&[FIRST], &[NEXT]]));
     }
 
     /// A frame that fails at request 0 buckets nothing, so bucket-driven cleanup

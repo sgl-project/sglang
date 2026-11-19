@@ -509,10 +509,9 @@ fn hidden_states(values: &[f32], lengths: &[u32], kinds: &[u32]) -> api::HiddenS
                 matrix.rows.push(row);
                 continue;
             }
-            (HIDDEN_ROW_MATRIX_FIRST | HIDDEN_ROW_MATRIX_NEXT, _) => {
-                Item::Matrix(api::HiddenStateRows { rows: vec![row] })
-            }
-            // `HIDDEN_ROW_VECTOR`: `for_each_chunk` admits no other kind.
+            (HIDDEN_ROW_MATRIX_FIRST, _) => Item::Matrix(api::HiddenStateRows { rows: vec![row] }),
+            // `HIDDEN_ROW_VECTOR`: `for_each_chunk` admits no other kind here,
+            // and no `HIDDEN_ROW_MATRIX_NEXT` outside a matrix.
             _ => Item::Vector(row),
         };
         items.push(api::HiddenStateItem { value: Some(value) });

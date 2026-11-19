@@ -31,6 +31,12 @@ def flatten_hidden(hs):
     token) for a prefill step, one vector for a decode step. A matrix sends
     each of its rows. ``return_hidden_states="last"`` gives one flat vector,
     sent as a single row.
+
+    For one request the Rust side accepts only these ``kinds``
+    (``hidden_rowkinds_nest`` in ``message/response.rs``): nothing, one
+    ``HIDDEN_ROW_WHOLE``, or items that are each a ``HIDDEN_ROW_VECTOR`` or a
+    ``HIDDEN_ROW_MATRIX_FIRST`` followed by its ``HIDDEN_ROW_MATRIX_NEXT`` rows.
+    Any other order rejects the frame.
     """
     vals: List[float] = []
     lens: List[int] = []
