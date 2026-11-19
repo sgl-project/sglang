@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import timedelta
 
 import torch
@@ -107,18 +107,16 @@ def _make_weight_writeback(weights, buffers, rows) -> WeightWriteback:
     return writeback
 
 
-def _install_routing_layer(current, planned, layer: int) -> None:
-    """Update only the committed layer, preserving captured routing addresses."""
-    for name in (
-        *_DEVICE_ROUTING_FIELDS,
-        "physical_to_logical_map_cpu",
-        "logical_to_all_physical_map_cpu",
-    ):
-        target = getattr(current, name)
-        source = getattr(planned, name)
-        assert (target is None) == (source is None)
-        if target is not None:
-            target[layer].copy_(source[layer])
+def _install_routing_layer(current, planned, layer: int, staged_rows) -> None:
+    """Publish the staged device rows and their CPU mirrors at the same boundary."""
+    for name, row in staged_rows.items():
+        getattr(current, name)[layer].copy_(row)
+    current.physical_to_logical_map_cpu[layer].copy_(
+        planned.physical_to_logical_map_cpu[layer]
+    )
+    current.logical_to_all_physical_map_cpu[layer].copy_(
+        planned.logical_to_all_physical_map_cpu[layer]
+    )
 
     for algorithm, (physical, count) in current._mega_gate_maps.items():
         if algorithm == "static":
@@ -158,6 +156,13 @@ class NpuEplbRuntime:
             layer: adapter.make_weight_views(weights[layer]) for layer in self.layer_ids
         }
         self.staging = adapter.create_temp_buffers()
+        # Reserve one layer before KV sizing. The same owner event fences reuse
+        # of both the routing rows and the weight staging buffers.
+        self._routing_rows = {
+            name: torch.empty_like(table[0])
+            for name in _DEVICE_ROUTING_FIELDS
+            if (table := getattr(metadata, name)) is not None
+        }
         self.device = self.staging[0].device
         self.device_module = torch.get_device_module(self.device)
         self._p2p_stream = self.device_module.Stream(device=self.device)
@@ -185,7 +190,9 @@ class NpuEplbRuntime:
                     with self.device_module.stream(self._p2p_stream):
                         self._p2p_stream.wait_event(self._owner_ready)
                         host = counts.cpu()
-                    payload[0] = (None, self.spec.compute(host))
+                    # Idle forwards can fill a recorder window without routing tokens.
+                    placement = self.spec.compute(host) if host.any().item() else None
+                    payload[0] = (None, placement)
                 except Exception as error:
                     payload[0] = (str(error), None)
             dist.broadcast_object_list(payload, src=0, group=self.plan_group)
@@ -197,6 +204,8 @@ class NpuEplbRuntime:
         return compute
 
     def prepare(self, placement):
+        if placement is None:
+            return ()
         physical, logical = placement
         old = self.metadata.physical_to_logical_map_cpu
         if physical.shape != old.shape:
@@ -206,27 +215,15 @@ class NpuEplbRuntime:
         if not changed:
             return ()
         self._last_layer = changed[-1]
-        # Reuse main's exact dispatch construction on CPU. Building it on NPU
-        # would immediately copy it back to CPU and synchronize the forward.
-        cpu_metadata = ExpertLocationMetadata._init_raw(
+        # Static dispatch draws tie breaks in full layer order. Build the
+        # complete plan on CPU, even when only a few layers need staging.
+        self._new_metadata = ExpertLocationMetadata._init_raw(
             ep_size=self.metadata.ep_size,
             physical_to_logical_map=physical,
             logical_to_all_physical_map=logical,
+            moe_ep_rank=self.rank,
         )
-        self._new_metadata = replace(
-            cpu_metadata,
-            **{
-                name: value.to(self.device, non_blocking=True)
-                for name in _DEVICE_ROUTING_FIELDS
-                if (value := getattr(cpu_metadata, name)) is not None
-            },
-        )
-        self._owner_stream = self.device_module.current_stream()
-        self._owner_ready.record(self._owner_stream)
         return changed
-
-    def preparation_ready(self):
-        return self._new_metadata is None or self._owner_ready.query()
 
     def _check_stream(self):
         if self.device_module.current_stream() != self._owner_stream:
@@ -247,6 +244,8 @@ class NpuEplbRuntime:
         copies = DeferredExpertCopies()
         with self.device_module.stream(self._p2p_stream):
             self._p2p_stream.wait_event(self._owner_ready)
+            for name, row in self._routing_rows.items():
+                row.copy_(getattr(self._new_metadata, name)[layer], non_blocking=True)
             old_layout = self.metadata.physical_to_logical_map_cpu[layer]
             new_layout = self._new_metadata.physical_to_logical_map_cpu[layer]
             update_expert_weights_single_layer(
@@ -273,7 +272,9 @@ class NpuEplbRuntime:
         self._check_stream()
         start = time.perf_counter()
         writeback()
-        _install_routing_layer(self.metadata, self._new_metadata, layer)
+        _install_routing_layer(
+            self.metadata, self._new_metadata, layer, self._routing_rows
+        )
         if layer == self._last_layer:
             self._new_metadata = None
         self.install_enqueue_seconds += time.perf_counter() - start
@@ -354,7 +355,8 @@ def create_npu_async_eplb(model_config, weights, metadata):
         )
     prewarm_eplb_communication(p2p_group)
     logger.info(
-        "Async NPU EPLB ready: staging_bytes=%d",
-        sum(t.numel() for t in runtime.staging),
+        "Async NPU EPLB ready: weight_staging_bytes=%d routing_staging_bytes=%d",
+        sum(t.nbytes for t in runtime.staging),
+        sum(row.nbytes for row in runtime._routing_rows.values()),
     )
     return AsyncEplbCoordinator(EplbControl(control_group), runtime)

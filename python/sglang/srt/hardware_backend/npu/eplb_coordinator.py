@@ -15,10 +15,9 @@ from typing import Any, Callable, Protocol
 class Phase(IntEnum):
     IDLE = 0
     PLANNING = 1
-    PREPARING = 2
-    STAGING = 3
-    DISABLED = 4
-    FAILED = 5
+    STAGING = 2
+    DISABLED = 3
+    FAILED = 4
 
 
 class RebalanceAborted(RuntimeError):
@@ -42,8 +41,6 @@ WeightWriteback = Callable[[], None]
 
 class Runtime(Protocol):
     def prepare(self, placement: Any) -> tuple[int, ...]: ...
-
-    def preparation_ready(self) -> bool: ...
 
     def record_source_ready(self) -> None: ...
 
@@ -75,7 +72,7 @@ class AsyncEplbCoordinator:
 
     @property
     def active(self) -> bool:
-        return self.phase in (Phase.PLANNING, Phase.PREPARING, Phase.STAGING)
+        return self.phase in (Phase.PLANNING, Phase.STAGING)
 
     def start(self, planner: Callable[[], Any]) -> None:
         if self.phase != Phase.IDLE or self._closed:
@@ -84,15 +81,17 @@ class AsyncEplbCoordinator:
         self._layers = ()
         self.layers_installed = 0
         self._error = None
-        self._future = self._executor.submit(planner)
+
+        def plan_layers():
+            return self.runtime.prepare(planner())
+
+        self._future = self._executor.submit(plan_layers)
         self.phase = Phase.PLANNING
 
     def _local_ready(self, layer: int) -> bool:
         if self._error is not None:
             return False
         try:
-            if self.phase == Phase.PREPARING:
-                return self.runtime.preparation_ready()
             if self._future is not None and self._future.done():
                 self._error = self._future.exception()
                 return self._error is None
@@ -129,21 +128,15 @@ class AsyncEplbCoordinator:
             return False
 
         if self.phase == Phase.PLANNING:
-            try:
-                self._layers = self.runtime.prepare(self._future.result())
-            except Exception as error:
-                self._error = error
-            self._future = None
-            self.phase = Phase.PREPARING
-            return False
-        if self.phase == Phase.STAGING:
+            self._layers = self._future.result()
+        else:
             try:
                 writeback = self._future.result()
                 self.runtime.install(layer, writeback)
             except Exception as error:
                 self._fatal("EPLB install failed; layout integrity unknown", error)
-            self._future = None
             self.layers_installed += 1
+        self._future = None
 
         if self.layers_installed == len(self._layers):
             self.phase = Phase.IDLE
