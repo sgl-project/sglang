@@ -70,14 +70,14 @@ class _DomainStub(ContiguousRowDomainProvider):
     """A row domain with a contract but no GEMM engine. Only ``prepare`` runs."""
 
     contract = MoeBaseProviderContract(
-        key="contiguous_stub",
-        quant_info_cls=MoeLoraBf16QuantInfo,
-        gate_first=True,
-        interleaved=False,
-        gate_up_output_dtype=torch.bfloat16,
-        lora_delta_dtype=torch.bfloat16,
-        lora_activation_dtype=torch.bfloat16,
+        key="contiguous_stub", quant_info_cls=MoeLoraBf16QuantInfo
     )
+
+    def _token_width_for(self, max_expert_rows, expected_m):
+        return None
+
+    def _schedules(self, counts, token_width, prefix, workspace, **rows):
+        return {}
 
 
 _TOP_K = 2
@@ -146,7 +146,7 @@ def test_contiguous_dispatch_metadata_contract(
         intermediate_size=_INTERMEDIATE,
         hidden_size=_HIDDEN,
     )
-    provider = _DomainStub(quant_info, m_alignment=alignment)
+    provider = type("Stub", (_DomainStub,), {"M_ALIGNMENT": alignment})(quant_info)
     ws = provider.prepare(hidden_states, topk_ids, top_k, None)
 
     ids = topk_ids.view(-1).cpu()

@@ -598,7 +598,10 @@ def maybe_fuse_routed_scale_and_shared_add(
         ),
     )
     if fused:
-        already_scaled = experts.should_fuse_routed_scaling_factor_in_topk
+        backend = experts.moe_runner_config.runner_backend
+        already_scaled = experts.should_fuse_routed_scaling_factor_in_topk or (
+            backend is not None and backend.is_lora()
+        )
         if shared is not None:
             alpha = 1.0 if already_scaled else routed_scaling_factor
             return shared.add_(routed, alpha=alpha)

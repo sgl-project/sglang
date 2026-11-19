@@ -22,6 +22,7 @@ _E, _H, _I, _K = 4, 128, 128, 2
         ("fp8", "expert_major", False),
         ("fp8", "expert_major", True),
         ("fp8", "route_major", False),
+        ("fp8", "route_major", True),
     ),
     ids=(
         "bf16-masked",
@@ -29,9 +30,17 @@ _E, _H, _I, _K = 4, 128, 128, 2
         "fp8-masked-fused-quant",
         "fp8-masked-separate-quant",
         "fp8-contiguous",
+        "fp8-contiguous-separate-quant",
     ),
 )
 def provider_case(request):
+    family, row_mode, separate_quant = request.param
+    for provider, w13, w2 in providers(family, row_mode, "cutedsl"):
+        yield provider, w13, w2, family, separate_quant
+
+
+def providers(family, row_mode, vendor):
+    """One provider on the module's weights, with the weights it serves."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     if torch.cuda.get_device_capability()[0] not in (9, 10):
@@ -49,7 +58,6 @@ def provider_case(request):
     w2 = (torch.randn(_E, _H, _I, generator=generator) * 0.08).to(
         device="cuda", dtype=torch.bfloat16
     )
-    family, row_mode, separate_quant = request.param
     weights = dict(w13_weight=w13, w2_weight=w2)
     info_cls = MoeLoraBf16QuantInfo
     if family == "fp8":
@@ -70,8 +78,7 @@ def provider_case(request):
         hidden_size=_H,
     )
     with get_context().override_server_args():
-        provider = select_provider_cls(row_mode, family, "cutedsl")(info)
-        yield provider, w13, w2, family, separate_quant
+        yield select_provider_cls(row_mode, family, vendor)(info), w13, w2
 
 
 def _block_quant(weight):
@@ -122,7 +129,6 @@ def _case(provider, workspace, n, is_prefill, *, graph_mode=True, separate_quant
         act = buffer("test:act", provider.act_out_shape(state))
         pairs = buffer("test:pairs", (n, _K, _I))
         provider.gateup(state, gateup)
-        provider.release_prepared_inputs(state)
         provider.act_with_delta(state, gateup, None, ids, act, pairs)
         if separate_quant:
             state.act_quant_ready = False
