@@ -1906,7 +1906,10 @@ class Scheduler(
     def init_dsa_kpool_truncation_align(self):
         """Kpool compress-write asserts chunked extends start on pool boundaries.
         Use the LCM to preserve any existing deterministic-inference alignment."""
-        from sglang.srt.configs.model_config import get_dsa_index_kpool, is_deepseek_dsa
+        from sglang.srt.configs.model_config import (
+            get_dsa_index_kpool,
+            is_deepseek_dsa,
+        )
 
         if not is_deepseek_dsa(self.model_config.hf_config):
             return
