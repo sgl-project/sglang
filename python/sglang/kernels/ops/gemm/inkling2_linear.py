@@ -1,3 +1,5 @@
+import functools
+
 import torch
 import torch.nn.functional as F
 import triton
@@ -151,12 +153,46 @@ def _k_group_blocks(m, n):
     )
 
 
+@functools.lru_cache(maxsize=1)
+def _lds_bytes() -> int:
+    """Shared memory one workgroup may use. gfx950 and NVIDIA have more than
+    gfx942's 64 KB, and the K-group tiles below are sized for the larger
+    budget."""
+    try:
+        return int(torch.cuda.get_device_properties(0).shared_memory_per_block)
+    except Exception:
+        return 64 * 1024
+
+
+def _fit_block_k(block_m, block_n, block_k, stages, itemsize):
+    """Largest block_k <= the requested one whose staged tiles fit in LDS.
+
+    _linear_k_group_partials stages an x tile and a weight tile per pipeline
+    step, needing (block_m + block_n) * block_k * itemsize * stages bytes. At
+    the defaults, a (32, 32) tile needs 98304 -- fine on gfx950, but 50% over
+    gfx942's 65536, where it aborts the whole server with
+
+        triton.runtime.errors.OutOfResources: out of resource: shared memory,
+        Required: 98304, Hardware limit: 65536
+
+    during prefill CUDA-graph capture of the router GEMM. Halving block_k only
+    changes how many K elements are staged per step, not the accumulation, so
+    the result is unchanged; on gfx950 the loop never triggers.
+    """
+    limit = _lds_bytes()
+    while block_k > 32 and (block_m + block_n) * block_k * itemsize * stages > limit:
+        block_k //= 2
+    return block_k
+
+
 def _launch_k_group_partials(
     x, weight, partials, grid_groups, x2=None, weight2=None, block_k=256, num_stages=3
 ):
     m, n, k = x.shape[0], weight.shape[0], weight.shape[1]
     block_m, block_n = _k_group_blocks(m, n)
     wide = block_n == 128
+    stages = min(num_stages, 2) if wide else num_stages
+    block_k = _fit_block_k(block_m, block_n, block_k, stages, x.element_size())
     _linear_k_group_partials[
         (triton.cdiv(m, block_m), triton.cdiv(n, block_n), grid_groups)
     ](
@@ -174,7 +210,7 @@ def _launch_k_group_partials(
         x2,
         weight2,
         num_warps=8 if wide else 4,
-        num_stages=min(num_stages, 2) if wide else num_stages,
+        num_stages=stages,
         enable_fp_fusion=False,
         **({"USE_PDL": True, "launch_pdl": True} if is_arch_support_pdl() else {}),
     )
