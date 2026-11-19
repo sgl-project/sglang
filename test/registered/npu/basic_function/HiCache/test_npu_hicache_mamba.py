@@ -46,11 +46,9 @@ class TestNPUMambaHiCache(CustomTestCase):
             "0.20",
             "--mamba-ssm-dtype",
             "bfloat16",
-            # The default level 2 publishes a running request's Mamba state only
-            # at its branching point or at the request end, so the state the
-            # second, identical prompt could reuse at 3072 never enters the tree
-            # and the warm request misses entirely. Level 3 checkpoints every
-            # prefill chunk, which is what this L1/L3 reuse scenario needs.
+            # Level 3 checkpoints every prefill chunk. The default level 2 defers
+            # a running request's Mamba state until its end, so the 3072-token
+            # checkpoint this warm-hit scenario needs never reaches the tree.
             "--hybrid-cache-checkpoints-level",
             "3",
             "--chunked-prefill-size",
