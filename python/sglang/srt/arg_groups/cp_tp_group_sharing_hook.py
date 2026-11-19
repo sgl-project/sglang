@@ -87,7 +87,16 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
             "ep-size > 1": view.ep_size > 1,
             "moe-a2a-backend": view.moe_a2a_backend != "none",
             "enable-waterfill": cfg.enable_waterfill,
-            "pp-size > 1": cfg.pp_size > 1,
+            # Zigzag PP handoffs carry local token rows. Limit this path to
+            # eager colocated inference on the 4-stage / 4-rank test topology.
+            "pp-size > 1 outside eager colocated PP4/CP4": cfg.pp_size > 1
+            and not (
+                cfg.pp_size == 4
+                and view.attn_cp_size == 4
+                and cfg.disaggregation_mode == "null"
+                and cfg.cuda_graph_backend_prefill == "disabled"
+                and cfg.cuda_graph_backend_decode == "disabled"
+            ),
             # Prefill only: a decode node serves plain TP.
             "disaggregation-mode decode": cfg.disaggregation_mode == "decode",
         }

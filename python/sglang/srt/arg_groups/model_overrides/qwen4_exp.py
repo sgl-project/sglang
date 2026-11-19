@@ -36,16 +36,39 @@ def _qwen4_exp_overrides(server_args: Any, hf_config: Any) -> dict:
             "state descriptors across pipeline stages."
         )
     if cfg.enable_unified_memory:
-        if (cfg.disaggregation_mode != "null" or cfg.pp_size != 1
-                or cfg.dcp_size > 1 or cfg.attn_cp_size > 1 or cfg.enable_prefill_cp
-                or cfg.speculative_algorithm is not None or cfg.enable_hierarchical_cache
-                or not cfg.disable_radix_cache):
+        if (
+            cfg.disaggregation_mode != "null"
+            or cfg.dcp_size > 1
+            or cfg.speculative_algorithm is not None
+            or cfg.enable_hierarchical_cache
+            or not cfg.disable_radix_cache
+        ):
             raise ValueError(
                 "Qwen4-Exp unified memory currently supports colocated eager inference "
-                "with --disable-radix-cache, PP1, no CP, no HiCache and no speculative decoding"
+                "with --disable-radix-cache, no DCP, no HiCache and no speculative decoding"
             )
-        if (cfg.cuda_graph_backend_decode != "disabled"
-                or cfg.cuda_graph_backend_prefill != "disabled"):
+        local_pipeline = (
+            cfg.pp_size == 1 and cfg.attn_cp_size == 1 and not cfg.enable_prefill_cp
+        )
+        # QSA's zigzag CP path writes the complete gathered K/V and compressed
+        # keys to each rank. Each PP stage's arena owns just its local layers.
+        pp4_prefill_cp4 = (
+            cfg.pp_size == 4
+            and cfg.tp_size == cfg.attn_cp_size == 4
+            and cfg.ep_size == 1
+            and cfg.enable_prefill_cp
+            and cfg.cp_strategy == "zigzag"
+            and cfg.cp_kv_layout is None
+        )
+        if not (local_pipeline or pp4_prefill_cp4):
+            raise ValueError(
+                "Qwen4-Exp unified memory supports PP1 without CP, or PP4 with "
+                "TP4, EP1 and zigzag prefill CP4 using replicated KV."
+            )
+        if (
+            cfg.cuda_graph_backend_decode != "disabled"
+            or cfg.cuda_graph_backend_prefill != "disabled"
+        ):
             raise ValueError(
                 "Qwen4-Exp unified memory requires --cuda-graph-backend-decode disabled "
                 "and --cuda-graph-backend-prefill disabled"

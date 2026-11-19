@@ -30,6 +30,7 @@ from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.cp.utils import (
     cp_gather_after_forward,
     cp_shard_hidden_states,
+    cp_shard_position_ids,
     cp_split_before_forward,
     is_cp_active,
 )
@@ -2060,6 +2061,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
     ) -> None:
         super().__init__(config, quant_config, prefix, is_nextn)
         self.hc_count = config.hc_count
+        self._log_cp_handoff = get_bool_env_var("SGLANG_LOG_QWEN4_CP_HANDOFF")
         self.hidden_size = config.hidden_size
         self.has_ple = any(
             self.layers[layer_id].ple is not None
@@ -2112,9 +2114,25 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
 
         shards_rows = _shards_rows_over_cp(forward_batch)
         if shards_rows:
-            hidden_states, positions = cp_split_before_forward(
-                hidden_states, positions, forward_batch
-            )
+            if self.pp_group.is_first_rank:
+                hidden_states, positions = cp_split_before_forward(
+                    hidden_states, positions, forward_batch
+                )
+            else:
+                # The preceding stage sent this CP rank's two zigzag blocks.
+                # Each stage still receives global position IDs from its scheduler.
+                positions = cp_shard_position_ids(positions, forward_batch)
+            if self._log_cp_handoff:
+                logger.info(
+                    "Qwen4 zigzag prefill active: pp_rank=%d cp_rank=%d "
+                    "global_tokens=%d local_hidden_rows=%d local_position_rows=%d",
+                    self.pp_group.rank_in_group,
+                    get_parallel().attn_cp_rank,
+                    forward_batch.attn_cp_metadata.total_seq_lens,
+                    hidden_states.shape[0],
+                    positions.shape[-1],
+                )
+                self._log_cp_handoff = False
 
         breakable_ple = (
             self.has_ple
