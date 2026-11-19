@@ -239,7 +239,13 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
     server_args = get_global_server_args()
     sampling_params_cls = resolve_sampling_params_cls(server_args)
     seconds = request.seconds if request.seconds is not None else DEFAULT_VIDEO_SECONDS
-    fps = request.fps if request.fps is not None else DEFAULT_FPS
+    # Default to the model's own frame rate (e.g. 16 for Wan) so videos play at
+    # the speed the model generated them.
+    fps = (
+        request.fps
+        if request.fps is not None
+        else getattr(sampling_params_cls, "fps", DEFAULT_FPS)
+    )
     num_frames = request.num_frames if request.num_frames is not None else fps * seconds
     num_outputs = request.num_outputs_per_prompt
     if num_outputs is None:
