@@ -691,9 +691,15 @@ class TestRequestSizeAlignment(unittest.TestCase):
 
     def test_request_size_alignment(self):
         capture = _WarningCapture()
-        root = logging.getLogger("sglang.multimodal_gen")
-        root.addHandler(capture)
-        self.addCleanup(root.removeHandler, capture)
+        # An earlier ServerArgs leaves the root level at its log_level, so set the
+        # emitting logger's own level instead of inheriting it.
+        emitter = logging.getLogger(
+            "sglang.multimodal_gen.configs.sample.sampling_params"
+        )
+        self.addCleanup(emitter.setLevel, emitter.level)
+        emitter.setLevel(logging.WARNING)
+        emitter.addHandler(capture)
+        self.addCleanup(emitter.removeHandler, capture)
         for (
             row_id,
             label,
