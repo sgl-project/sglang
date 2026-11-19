@@ -110,6 +110,7 @@ class TestOfflineThroughputInputAccounting(CustomTestCase):
         num_prompts=3,
         extra_request_body=None,
         random_range_ratio=1.0,
+        backend=None,
     ):
         dataset_path = os.path.join(tmpdir, f"{dataset_name}-dataset.json")
         with open(dataset_path, "w") as f:
@@ -138,7 +139,8 @@ class TestOfflineThroughputInputAccounting(CustomTestCase):
             result_filename=result_path,
             extra_request_body=extra_request_body,
         )
-        backend = _RecordingBackend(tokenizer, backend_name)
+        if backend is None:
+            backend = _RecordingBackend(tokenizer, backend_name)
         # Engine/Runtime construction and the macOS launch-time config
         # resolution are boundaries of this contract test; the statistics,
         # dataset sampling and JSONL writer run for real.
@@ -194,6 +196,45 @@ class TestOfflineThroughputInputAccounting(CustomTestCase):
         self.assertEqual(records, [result])
         self.assertTrue(backend.stopped)
         self.assertEqual(len(backend.prompts), 3)
+
+    def test_aborted_response_invalidates_trial_and_shuts_down_runtime(self):
+        tokenizer = _make_tokenizer(with_bos=True)
+        for aborted_index in (0, 1):
+            with (
+                self.subTest(aborted_index=aborted_index),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                backend = _RecordingBackend(tokenizer, "runtime")
+                generate = backend.generate
+
+                def interrupted_generate(**kwargs):
+                    outputs = json.loads(generate(**kwargs))
+                    outputs[aborted_index]["meta_info"] = {
+                        "completion_tokens": 0,
+                        "finish_reason": {
+                            "type": "abort",
+                            "message": "Abort in waiting queue",
+                        },
+                    }
+                    return json.dumps(outputs)
+
+                with patch.object(
+                    backend, "generate", side_effect=interrupted_generate
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "aborted"):
+                        self._run_throughput_test(
+                            tmpdir,
+                            "runtime",
+                            "random",
+                            tokenizer,
+                            input_len=5,
+                            extra_request_body='{"n": 2}',
+                            backend=backend,
+                        )
+                self.assertTrue(backend.stopped)
+                self.assertFalse(
+                    os.path.exists(os.path.join(tmpdir, "random-result.jsonl"))
+                )
 
     def test_random_with_bos_engine_backend(self):
         tokenizer = _make_tokenizer(with_bos=True)

@@ -299,6 +299,13 @@ def throughput_test_once(
     if backend_name == "runtime":
         gen_out = json.loads(gen_out)
 
+    for output in gen_out:
+        finish_reason = output["meta_info"].get("finish_reason") or {}
+        if finish_reason.get("type") == "abort":
+            raise RuntimeError(
+                "Benchmark request was aborted; token counts are incomplete."
+            )
+
     server_info = backend.get_server_info()
 
     measurement_results["total_latency"] = latency
@@ -488,35 +495,37 @@ def throughput_test(
         dataset_path=bench_args.dataset_path,
     )
 
-    # Warm up
-    if not bench_args.skip_warmup:
-        logging.info("\nWarmup...")
-        throughput_test_once(
+    try:
+        # Warm up
+        if not bench_args.skip_warmup:
+            logging.info("\nWarmup...")
+            throughput_test_once(
+                backend_name=bench_args.backend,
+                backend=backend,
+                reqs=warmup_requests,
+                ignore_eos=not bench_args.disable_ignore_eos,
+                extra_request_body=extra_request_body,
+                profile=False,
+                return_logprob=bench_args.return_logprob,
+                logprob_start_len=bench_args.logprob_start_len,
+            )
+            time.sleep(0.5)
+
+        logging.info("\nBenchmark...")
+        result = throughput_test_once(
             backend_name=bench_args.backend,
             backend=backend,
-            reqs=warmup_requests,
+            reqs=input_requests,
             ignore_eos=not bench_args.disable_ignore_eos,
             extra_request_body=extra_request_body,
-            profile=False,
+            profile=bench_args.profile,
+            profile_activities=bench_args.profile_activities,
+            profile_steps=bench_args.profile_steps,
             return_logprob=bench_args.return_logprob,
             logprob_start_len=bench_args.logprob_start_len,
         )
-        time.sleep(0.5)
-
-    logging.info("\nBenchmark...")
-    result = throughput_test_once(
-        backend_name=bench_args.backend,
-        backend=backend,
-        reqs=input_requests,
-        ignore_eos=not bench_args.disable_ignore_eos,
-        extra_request_body=extra_request_body,
-        profile=bench_args.profile,
-        profile_activities=bench_args.profile_activities,
-        profile_steps=bench_args.profile_steps,
-        return_logprob=bench_args.return_logprob,
-        logprob_start_len=bench_args.logprob_start_len,
-    )
-    backend.shutdown()
+    finally:
+        backend.shutdown()
 
     if bench_args.result_filename:
         with open(bench_args.result_filename, "a") as fout:
