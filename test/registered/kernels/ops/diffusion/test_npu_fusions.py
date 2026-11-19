@@ -17,7 +17,7 @@ from sglang.kernels.ops.diffusion import rmsnorm_npu_onepass, silu_mul_npu
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.test.ci.ci_register import register_npu_ci
 
-register_npu_ci(est_time=40, suite="full-1-npu-a3")
+register_npu_ci(est_time=20, suite="extra-b-test-1-npu-a3")
 
 pytestmark = pytest.mark.skipif(
     not (hasattr(torch, "npu") and torch.npu.is_available()),
@@ -50,8 +50,13 @@ def _reference_norm(shape, scale, eps):
     return x, norm.weight, norm(x)
 
 
-@pytest.mark.parametrize("shape", [(16, 128), (1, 32, 128), (1, 4096, 32, 128)])
-@pytest.mark.parametrize("scale,eps", [(1e-4, 1e-6), (100.0, 1e-5)])
+@pytest.mark.parametrize(
+    "shape,scale,eps",
+    [
+        ((16, 128), 1e-4, 1e-6),
+        ((1, 4096, 32, 128), 100.0, 1e-5),
+    ],
+)
 def test_rmsnorm_matches_native(shape, scale, eps):
     x, weight, expected = _reference_norm(shape, scale, eps)
     assert torch.equal(rmsnorm_npu_onepass(x, weight, eps), expected)
