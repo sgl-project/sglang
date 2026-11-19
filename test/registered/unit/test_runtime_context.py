@@ -51,6 +51,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
     get_server_args,
+    get_stream,
     is_scheduler_io_rank,
     max_prefill_buffer_tokens,
     max_speculative_num_draft_tokens,
@@ -1186,6 +1187,43 @@ class TestNamedStreams(_IsolatedServerArgs):
         self.assertIs(a, b)
         self.assertIsNot(a, c)
         self.assertEqual(len(created), 2)
+
+    def test_graph_streams_take_the_decode_stream_priority(self):
+        """On the cuda device type, the streams graphs are captured on take a nonzero
+        SGLANG_PLB_STREAM_PRIORITY, as the decode streams do; other stream names, a
+        zero knob and other devices keep the stock constructor call."""
+        from sglang.srt.environ import envs
+        from sglang.srt.model_executor.runner_utils.pool import (
+            get_or_create_global_graph_capture_stream,
+        )
+
+        class _Stream:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        on = {"priority": -1}
+        for device, priority, expected in (
+            ("cuda", -1, [on, on, {}]),
+            ("cuda", 0, [{}, {}, {}]),
+            ("cpu", -1, [{}, {}, {}]),
+        ):
+            with (
+                self.subTest(device=device, priority=priority),
+                envs.SGLANG_PLB_STREAM_PRIORITY.override(priority),
+                patch(
+                    "torch.get_device_module",
+                    return_value=SimpleNamespace(Stream=_Stream),
+                ),
+            ):
+                reset_context()
+                if device != "cuda":
+                    publish(ServerArgs(model_path="dummy", device=device), role="test")
+                streams = (
+                    get_or_create_global_graph_capture_stream(),
+                    get_stream("alt"),
+                    get_stream("offload"),
+                )
+                self.assertEqual([s.kwargs for s in streams], expected)
 
     def test_get_buffer_keyed_lazy(self):
         reset_context()

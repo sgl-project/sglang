@@ -969,7 +969,8 @@ class Envs:
     SGLANG_NIXL_KV_PACK_BUFFER_SIZE_MB = EnvInt(64)
     # Queue incoming KV scatters between forwards; disabled by default.
     SGLANG_PLB_SCATTER_DEFER = EnvBool(False)
-    # Decode stream priority relative to background KV scatters.
+    # Decode stream priority relative to background KV scatters; the CUDA graph
+    # capture streams take it too.
     SGLANG_PLB_STREAM_PRIORITY = EnvInt(0)
     # 0: original kernel; >0: persistent CTAs; -1: one CTA per page.
     SGLANG_PLB_SCATTER_CTAS = EnvInt(0)

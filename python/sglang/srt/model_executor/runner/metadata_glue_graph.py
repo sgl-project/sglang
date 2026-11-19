@@ -41,6 +41,8 @@ from typing import Any, Dict, List
 
 import torch
 
+from sglang.srt.environ import envs
+
 logger = logging.getLogger(__name__)
 
 
@@ -121,7 +123,9 @@ class MetadataGlueGraph:
             return
 
         if self._capture_stream is None:
-            self._capture_stream = torch.cuda.Stream()
+            self._capture_stream = torch.cuda.Stream(
+                priority=envs.SGLANG_PLB_STREAM_PRIORITY.get()
+            )
         graph = torch.cuda.CUDAGraph()
         try:
             # captured while serving: other threads may use CUDA meanwhile

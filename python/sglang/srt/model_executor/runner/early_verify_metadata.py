@@ -33,6 +33,7 @@ from typing import Any, Dict, Optional
 import msgspec
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     CudaGraphBufferRegistry,
     same_tensor_view,
@@ -60,7 +61,9 @@ class _StagedVerifyInputs(msgspec.Struct, frozen=True):
 
 class EarlyVerifyMetadata:
     def __init__(self, *, device, log_every: int) -> None:
-        self._stream = torch.cuda.Stream(device=device)
+        self._stream = torch.cuda.Stream(
+            device=device, priority=envs.SGLANG_PLB_STREAM_PRIORITY.get()
+        )
         self._done = torch.cuda.Event()
         self._staged: Optional[_StagedVerifyInputs] = None
         self._log_every = log_every
