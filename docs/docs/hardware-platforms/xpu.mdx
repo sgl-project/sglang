@@ -190,7 +190,6 @@ weighting, uncombined outputs, exact GELU, or expert parallelism (EP).
 In this fallback, activations undergo dynamic per-token-group FP8
 quantization, and the Triton GEMM kernel decodes UE8M0 scale bytes into FP32
 multipliers on the fly without materializing BF16 expert weights.
-To use Triton on non-Xe2 architectures, pass `--moe-runner-backend triton`.
 
 ## Benchmarking with Requests
 
