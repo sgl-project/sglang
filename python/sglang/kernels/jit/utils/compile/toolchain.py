@@ -22,7 +22,12 @@ from typing import List, Tuple
 import torch
 
 from sglang.kernels.jit.utils.arch import get_compile_arch
-from sglang.kernels.jit.utils.common import cache_once, is_hip_runtime, is_sail_runtime
+from sglang.kernels.jit.utils.common import (
+    cache_once,
+    is_hip_runtime,
+    is_musa_runtime,
+    is_sail_runtime,
+)
 from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
@@ -73,12 +78,21 @@ def rocm_home() -> str:
 
 
 @cache_once
+def musa_home() -> str:
+    return os.environ.get("MUSA_HOME") or "/usr/local/musa"
+
+
+@cache_once
 def device_compiler_path() -> str:
     """The nvcc/hipcc/hgcc that JIT builds actually invoke.
 
     Resolved the same way tvm-ffi resolves it, so the binary the cache
     fingerprints is the binary that does the compiling.
     """
+    if is_musa_runtime():
+        return os.environ.get("SGLANG_MUSA_MCC") or os.path.join(
+            musa_home(), "bin", "mcc"
+        )
     if is_sail_runtime():
         return hgcc_path()
     if is_hip_runtime():
@@ -145,6 +159,8 @@ def gpu_arch_name() -> str:
     CUDA-shaped ``(major, minor)`` capability: the latter maps gfx940/gfx941/
     gfx942 onto a single ``9.4``, which are three different compile targets.
     """
+    if is_musa_runtime():
+        return f"mp_{get_compile_arch().major}{get_compile_arch().minor}"
     if not is_hip_runtime():
         return get_compile_arch().target_name
     try:
@@ -182,6 +198,10 @@ def target_flags(kernel_name: str = "") -> List[str]:
     the compiler driver to probe: the value is part of the cache key, so it has
     to be decided here and not rediscovered at build time.
     """
+    if is_musa_runtime():
+        # Target flags are supplied by arch.get_default_target_flags so the
+        # loader can vary them by kernel and cache key.
+        return []
     if is_sail_runtime():
         arch = envs.SGLANG_SAIL_GPU_ARCH.get()
         if arch not in _SAIL_GPU_ARCHS:
@@ -208,6 +228,8 @@ def base_cxx_flags() -> List[str]:
 
 
 def base_cuda_flags() -> List[str]:
+    if is_musa_runtime():
+        return ["-x", "musa", "-fPIC"]
     if is_hip_runtime():
         return ["-fPIC", "-D__HIP_PLATFORM_AMD__=1", "-fno-gpu-rdc"]
     return ["-Xcompiler", "-fPIC"]
@@ -215,6 +237,8 @@ def base_cuda_flags() -> List[str]:
 
 def base_include_paths() -> List[str]:
     includes, _, _ = tvm_ffi_paths()
+    if is_musa_runtime():
+        return [*includes, f"{musa_home()}/include"]
     if is_hip_runtime():
         return [*includes, f"{rocm_home()}/include"]
     return list(includes)
@@ -237,6 +261,8 @@ def base_link_flags(*, with_device: bool) -> List[str]:
             "-lhggcrt1",
             "-lhggc",
         ]
+    if is_musa_runtime():
+        return flags + [f"-L{musa_home()}/lib", "-lmusart"]
     if is_hip_runtime():
         return flags + [f"-L{rocm_home()}/lib", "-lamdhip64"]
     return flags + [f"-L{cuda_home()}/lib64", "-lcudart"]

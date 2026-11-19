@@ -40,8 +40,8 @@
 
 #include <concepts>
 #include <cstddef>
+#include <iterator>
 #include <ostream>
-#include <ranges>
 #include <sstream>
 #include <utility>
 
@@ -161,19 +161,50 @@ inline auto dtype_bytes(DLDataType dtype) -> std::size_t {
   return static_cast<std::size_t>(dtype.bits / 8);
 }
 
-namespace stdr = std::ranges;
-namespace stdv = stdr::views;
-
 /// \brief Python-style integer range: `irange(n)` -> `[0, n)`.
 template <std::integral T>
-inline auto irange(T end) {
-  return stdv::iota(static_cast<T>(0), end);
+class IotaRange {
+ public:
+  class Iterator {
+   public:
+    constexpr explicit Iterator(T value) : m_value(value) {}
+    constexpr auto operator*() const -> T {
+      return m_value;
+    }
+    constexpr auto operator++() -> Iterator& {
+      ++m_value;
+      return *this;
+    }
+    constexpr auto operator!=(const Iterator& other) const -> bool {
+      return m_value != other.m_value;
+    }
+
+   private:
+    T m_value;
+  };
+
+  constexpr IotaRange(T begin, T end) : m_begin(begin), m_end(end) {}
+  constexpr auto begin() const -> Iterator {
+    return Iterator{m_begin};
+  }
+  constexpr auto end() const -> Iterator {
+    return Iterator{m_end};
+  }
+
+ private:
+  T m_begin;
+  T m_end;
+};
+
+template <std::integral T>
+inline auto irange(T end) -> IotaRange<T> {
+  return IotaRange<T>{static_cast<T>(0), end};
 }
 
 /// \brief Python-style integer range: `irange(start, end)` -> `[start, end)`.
 template <std::integral T>
-inline auto irange(T start, T end) {
-  return stdv::iota(start, end);
+inline auto irange(T start, T end) -> IotaRange<T> {
+  return IotaRange<T>{start, end};
 }
 
 /** \brief Error class for stream-style error logging. */
