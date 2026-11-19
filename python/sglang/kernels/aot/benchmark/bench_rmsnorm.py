@@ -2,7 +2,6 @@
 # (batch_size, seq_len, hidden_size) and prints speed-up.
 import argparse
 import itertools
-import os
 import re
 from typing import List, Optional, Tuple, Union
 
@@ -233,6 +232,7 @@ def calculate_diff(batch_size, seq_len, hidden_size, use_residual=True):
         print("✅ All available implementations match")
     else:
         print("❌ Implementations differ")
+    return all_match
 
 
 # CI environment uses simplified parameters
@@ -333,33 +333,6 @@ def benchmark(batch_size, seq_len, hidden_size, provider, use_residual):
                 residual.clone() if residual is not None else None,
             )
         )
-
-    # provider == "speedup"
-    if VLLM_AVAILABLE:
-        t_ref, _, _ = timed(
-            lambda: rmsnorm_vllm(
-                x.clone(),
-                weight,
-                residual.clone() if residual is not None else None,
-            )
-        )
-    else:
-        t_ref, _, _ = timed(
-            lambda: rmsnorm_naive(
-                x.clone(),
-                weight,
-                residual.clone() if residual is not None else None,
-            )
-        )
-    t_sgl, _, _ = timed(
-        lambda: rmsnorm_sglang(
-            x.clone(),
-            weight,
-            residual.clone() if residual is not None else None,
-        )
-    )
-    spd = t_ref / t_sgl if t_ref > 0 else 1.0
-    return (spd, spd, spd)
 
 
 if __name__ == "__main__":

@@ -190,6 +190,11 @@ class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig
         ]
     )
 
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        # The 20B DiT is 38 GiB in BF16: component offload moves it onto the
+        # GPU whole, so a smaller card must stream it layer by layer.
+        return ModelDeploymentConfig(dit_layerwise_offload_modes=("memory",))
+
     def expand_conditioning_to_sample_batch(self, batch):
         expander = PromptToSampleBatchExpander.from_batch(batch)
         if expander is None:
@@ -764,6 +769,7 @@ class QwenImageLayeredPipelineConfig(QwenImageEditPipelineConfig):
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         return ModelDeploymentConfig(
+            dit_layerwise_offload_modes=("memory",),
             keep_resident_min_available_gb=70,
             keep_resident_components=("text_encoder", "vae"),
         )

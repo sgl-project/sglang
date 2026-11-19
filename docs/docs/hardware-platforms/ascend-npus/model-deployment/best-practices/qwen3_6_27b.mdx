@@ -74,14 +74,14 @@ export HCCL_OP_EXPANSION_MODE=AIV
 export HCCL_SOCKET_IFNAME=lo
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=300
 export SGLANG_PREFILL_DELAYER_MAX_PREFILL_BS_WINDOW_SIZE=128
-export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
 export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_VIT_ENABLE_CUDA_GRAPH=1
 export STREAMS_PER_DEVICE=32
 
 python3 -m sglang.launch_server \
+    --enable-prefill-delayer \
+    --prefill-delayer-max-delay-passes 300 \
     --model-path $MODEL_PATH \
     --host 127.0.0.1 --port 6688 \
     --tp-size 2 \
@@ -373,12 +373,12 @@ export HCCL_OP_EXPANSION_MODE=AIV
 export HCCL_SOCKET_IFNAME=lo
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=0
-export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=130
-export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
 python3 -m sglang.launch_server \
+    --enable-prefill-delayer \
+    --prefill-delayer-max-delay-passes 130 \
     --model-path $MODEL_PATH \
     --host 127.0.0.1 --port 6688 \
     --tp-size 2 \
@@ -558,12 +558,12 @@ export HCCL_OP_EXPANSION_MODE=AIV
 export HCCL_SOCKET_IFNAME=lo
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=20
-export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
 python3 -m sglang.launch_server \
+    --enable-prefill-delayer \
+    --prefill-delayer-max-delay-passes 20 \
     --model-path $MODEL_PATH \
     --host 127.0.0.1 --port 6688 \
     --tp-size 4 \
@@ -651,12 +651,12 @@ export HCCL_OP_EXPANSION_MODE=AIV
 export HCCL_SOCKET_IFNAME=lo
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 export SGLANG_ENABLE_SPEC_V2=1
-export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=50
-export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
 python3 -m sglang.launch_server \
+    --enable-prefill-delayer \
+    --prefill-delayer-max-delay-passes 50 \
     --model-path $MODEL_PATH \
     --host 127.0.0.1 --port 6688 \
     --tp-size 4 \
@@ -746,12 +746,12 @@ export HCCL_OP_EXPANSION_MODE=AIV
 export HCCL_SOCKET_IFNAME=lo
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=30
-export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
 python3 -m sglang.launch_server \
+    --enable-prefill-delayer \
+    --prefill-delayer-max-delay-passes 30 \
     --model-path $MODEL_PATH \
     --host 127.0.0.1 --port 6688 \
     --tp-size 4 \

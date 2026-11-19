@@ -440,8 +440,9 @@ def check_state_wire(
             raise RuntimeError(
                 f"PD state entry mismatch: only the {role} server registers a "
                 f"DFLASH draft KV ring ({wire[-2:]}). Each server resolves the "
-                f"ring on its own: set SGLANG_ENABLE_DFLASH_DRAFT_KV_RING=0 on the "
-                f"{role} server, or align the flags that turn the ring on."
+                f"ring on its own: unset SGLANG_ENABLE_DFLASH_DRAFT_KV_RING on the "
+                f"{role} server, or set it to 1 on both and align the flags the "
+                "ring needs."
             )
     raise RuntimeError(
         f"PD state entry mismatch: prefill server registers {prefill_wire}, but "
@@ -1136,13 +1137,19 @@ def _get_cp_rank_page_bounds(
 
 def filter_kv_indices_for_shard_rank(
     *,
-    kv_indices: np.ndarray,
+    kv_indices: np.ndarray | torch.Tensor,
     index_slice: slice,
     shard_rank: int,
     shard_size: int,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Logical page l lives on rank l % N as local page l // N; returns the owned
-    local ids and their send positions, which replace the contiguous index_slice."""
+    local ids and their send positions, which replace the contiguous index_slice.
+
+    Host tensor inputs must be ready before this synchronous filter runs.
+    """
+    # A one-element torch bool tensor is interpreted as an integer index by
+    # NumPy. Keep the page ids and their positional mask in the same array type.
+    kv_indices = np.asarray(kv_indices)
     owned = kv_indices % shard_size == shard_rank
     positions = np.arange(index_slice.start, index_slice.stop, dtype=np.int64)
     return kv_indices[owned] // shard_size, positions[owned]
@@ -1899,6 +1906,7 @@ def setup_state_kv_args(
             owner_view.index_bytes_per_token - key_bytes,
         )
     if draft_kv_ring is not None:
+        kv_args.draft_kv_ring_paged = draft_kv_ring.paged
         append_state_component(
             kv_args, StateType.DRAFT_RING, *draft_kv_ring.ring_buf_infos()
         )

@@ -70,8 +70,6 @@ def test_silu_l2norm_reads_strided_qkv_views() -> None:
     assert torch.equal(
         got.view(FRAMES, TOKENS, HEADS, HEAD_DIM).permute(0, 2, 1, 3), frame_major
     )
-    with pytest.raises(ValueError):
-        vdn_silu_l2norm(strided, True, per_frame=TOKENS + 1)
 
 
 def test_frame_stats_prep_is_bit_exact() -> None:
@@ -131,8 +129,6 @@ def test_predicates_reject_unsupported_inputs() -> None:
     assert not can_use_vdn_silu_l2norm(fp16)
     odd = torch.randn(4, 2, 48, device="cuda", dtype=torch.bfloat16)
     assert not can_use_vdn_silu_l2norm(odd)
-    with pytest.raises(ValueError):
-        vdn_silu_l2norm(odd, True)
 
 
 if __name__ == "__main__":

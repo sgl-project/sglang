@@ -4,10 +4,6 @@ import logging
 import math
 import time
 
-from sglang.srt.managers.scheduler_components.state_check import (
-    FailureReporter,
-    Severity,
-)
 from sglang.srt.utils.gc_utils import freeze_gc, refreeze_gc
 
 logger = logging.getLogger(__name__)
@@ -17,15 +13,8 @@ HEAP_GROWTH_WARN_RATIO = 1.5
 
 
 class GCFreezer:
-    def __init__(
-        self,
-        *,
-        freeze_on_idle_secs: float,
-        enable_frozen_garbage_check: bool,
-    ):
+    def __init__(self, *, freeze_on_idle_secs: float):
         self._freeze_on_idle_secs = freeze_on_idle_secs
-        self._enable_frozen_garbage_check = enable_frozen_garbage_check
-        self._reporter = FailureReporter()
         self._seen_forward_ct = -1
         self._next_freeze = math.inf
         now = time.monotonic()
@@ -52,25 +41,20 @@ class GCFreezer:
             self._freeze(now)
 
     def _freeze(self, now: float) -> None:
-        if self._enable_frozen_garbage_check or now >= self._next_garbage_check:
+        if now >= self._next_garbage_check:
             self._next_garbage_check = now + GC_CHECK_INTERVAL_SECS
-            self._report_frozen_garbage(refreeze_gc("Scheduler"))
+            self._warn_frozen_garbage(refreeze_gc("Scheduler"))
         else:
-            gc.collect()
             freeze_gc("Scheduler")
 
-    def _report_frozen_garbage(self, garbage: collections.Counter) -> None:
+    def _warn_frozen_garbage(self, garbage: collections.Counter) -> None:
         if not garbage:
             return
-        message = (
+        logger.warning(
             f"{sum(garbage.values())} frozen objects are cyclic garbage, "
             f"which a frozen heap never frees; collected them now. "
             f"Most common: {garbage.most_common(5)}"
         )
-        if self._enable_frozen_garbage_check:
-            self._reporter.report(Severity.LEAK, message)
-        else:
-            logger.warning(message)
 
     def _check_heap_growth(self) -> None:
         unfrozen = gc.get_objects(2)

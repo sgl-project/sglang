@@ -139,6 +139,10 @@ def init_parallel_runtime(
             get_parallel().tp_rank,
         )
         raise
+    if current_platform.is_rocm():
+        from sglang.srt.distributed.bootstrap_rocm import reserve_runtime_memory
+
+        reserve_runtime_memory(device=device, gpu_id=get_device().gpu_id)
     maybe_init_shared_mooncake_transfer_engine(gpu_id=get_device().gpu_id)
 
     parallel = get_parallel()

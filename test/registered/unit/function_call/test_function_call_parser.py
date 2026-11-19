@@ -44,7 +44,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
-register_cpu_ci(est_time=70, suite="stage-b-test-cpu-intel")
+register_cpu_ci(est_time=70, suite="extra-test-cpu-intel")
 
 
 @functools.lru_cache(maxsize=None)
@@ -5630,7 +5630,7 @@ class TestGetStructureConstraint(unittest.TestCase):
         self.assertEqual(result[0], "structural_tag")
 
     def test_qwen25_required_no_strict_returns_structural_tag(self):
-        parser = self._make_parser("qwen25", strict=False)
+        parser = self._make_parser("qwen", strict=False)
         result = parser.get_structure_constraint("required")
         self.assertIsNotNone(result)
         self.assertEqual(result[0], "structural_tag")
@@ -6503,6 +6503,14 @@ class TestToolCallParserNames(unittest.TestCase):
             sorted(TOOL_CALL_PARSER_NAMES),
             sorted(FunctionCallParser.ToolCallParserEnum),
         )
+
+
+class TestRemovedToolCallParser(unittest.TestCase):
+    def test_removed_name_names_its_replacement(self):
+        with self.assertRaisesRegex(
+            ValueError, "qwen25 was removed in SGLang 1.0; use qwen"
+        ):
+            FunctionCallParser([], "qwen25")
 
 
 if __name__ == "__main__":

@@ -5,7 +5,7 @@ configuration on 8 GPUs.
 
 The model path can be configured via DEEPSEEK_V32_MODEL_PATH environment variable.
 
-Registry: nightly-perf-8-gpu-mi35x-deepseek-v32-mtp suite
+Registry: nightly-perf-test-8-gpu-amd-mi35x-deepseek-v32-mtp suite
 
 Example usage:
     DEEPSEEK_V32_MODEL_PATH=deepseek-ai/DeepSeek-V3.2 python -m pytest test_deepseek_v32_mtp_perf_mi35x.py -v
@@ -28,7 +28,7 @@ from sglang.test.test_utils import (
 # Register for AMD CI - DeepSeek-V3.2 MTP benchmark (~90 min)
 register_amd_ci(
     est_time=5400,
-    suite="nightly-perf-8-gpu-mi35x-deepseek-v32-mtp",
+    suite="nightly-perf-test-8-gpu-amd-mi35x-deepseek-v32-mtp",
     nightly=True,
     disabled="Older model generation; AMD nightly keeps the latest two per family",
 )

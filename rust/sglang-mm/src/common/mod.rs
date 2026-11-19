@@ -27,13 +27,10 @@ pub fn pool() -> &'static rayon::ThreadPool {
     })
 }
 
-/// `SGLANG_MM_RS_THREADS`, else the legacy `SGL_MM_RS_THREADS`: the first one
-/// set decides, and anything but a positive integer leaves the default.
+/// `SGLANG_MM_RS_THREADS`; anything but a positive integer leaves the default.
 #[cfg(feature = "parallel")]
 fn pool_threads_override(var: impl Fn(&str) -> Option<String>) -> Option<usize> {
-    ["SGLANG_MM_RS_THREADS", "SGL_MM_RS_THREADS"]
-        .iter()
-        .find_map(|key| var(key))
+    var("SGLANG_MM_RS_THREADS")
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n > 0)
 }
@@ -247,20 +244,9 @@ mod pool_tests {
         })
     }
 
-    /// The Python side warns `SGL_MM_RS_THREADS` users to switch to
-    /// `SGLANG_MM_RS_THREADS`; the new name must size the pool.
     #[test]
-    fn sglang_name_wins_over_legacy_name() {
+    fn sglang_name_sizes_the_pool() {
         assert_eq!(read(&[("SGLANG_MM_RS_THREADS", "3")]), Some(3));
-        assert_eq!(
-            read(&[("SGLANG_MM_RS_THREADS", "3"), ("SGL_MM_RS_THREADS", "2")]),
-            Some(3)
-        );
-    }
-
-    #[test]
-    fn legacy_name_still_applies() {
-        assert_eq!(read(&[("SGL_MM_RS_THREADS", "2")]), Some(2));
         assert_eq!(read(&[]), None);
     }
 }

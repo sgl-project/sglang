@@ -136,46 +136,46 @@ Then your PR can be merged.
 
 ## How to Trigger CI Tests
 
+### CI Infrastructure Usage Guidelines
+
+You are responsible for any code or content you upload. You confirm that you have the right to share any code or content you submit and that it does not include confidential, sensitive, personal, or illegal information. Your code will run automatically without review in environments that are not fully secure. This service does not guarantee that your code is safe or error-free. If you discover a security issue, you must report it promptly.
+
+### Triggering tests
+
 We have a lot of open PRs but limited CI machines, so only top and trusted contributors have permission to trigger CI tests.
 Users with permission are listed in the [CI_PERMISSIONS.json](https://github.com/sgl-project/sglang/blob/main/.github/CI_PERMISSIONS.json)
 
 **PR authors** can use `/rerun-failed-ci` on their own PRs even if they are not listed in `CI_PERMISSIONS.json`. Selective reruns have additional rules because they execute PR code on self-hosted runners; see the permission table below.
 
-For CI to run on a pull request, it must have the "run-ci" label. Authorized users can add the label or rerun failed tests by commenting on the PR with one of these commands:
+For CI to run on a pull request, it must have the "run-ci" label and not be a draft. Otherwise every CI workflow skips its tests, and only `pr-test-finish` fails, so the PR cannot merge. Authorized users can add the label or rerun failed tests by commenting on the PR with one of these commands:
 
-- `/tag-run-ci-label`: Adds the "run-ci" label. Only **future** commits trigger CI; the current commit is unaffected. Add `nv-extra` or `amd-extra` to also apply "run-ci-nv-extra" or "run-ci-amd-extra". To opt into both, use `/tag-run-ci-label nv-extra amd-extra`. Tiers are listed in [`scripts/ci/opt_in_ci_tiers.json`](https://github.com/sgl-project/sglang/blob/main/scripts/ci/opt_in_ci_tiers.json). The retired `extra` argument is rejected; other unrecognized suffixes are ignored.
-- `/rerun-failed-ci`: Reruns workflows from the latest commit with conclusion **failed, skipped, cancelled, or timed out**.
-- `/tag-and-rerun-ci`: Adds labels and retries completed unsuccessful workflows. Accepts the same tier arguments, such as `/tag-and-rerun-ci nv-extra`. Its retry scope remains broad; use the dedicated hardware commands below to select a tier.
-- `/run-ci`, `/run-base-ci`, `/rerun-base-ci`: With no argument, aliases of `/tag-and-rerun-ci`, preserving its workflow scope and permissions. With one registered tier argument, equivalent to `/run-<tier>-ci`; for example, `/run-ci nv-extra` equals `/run-extra-ci nv`.
-- `/run-ci nv` (also `/run-base-ci nv`, `/run-nv-ci`): Adds "run-ci" and reruns only NVIDIA base and shared checks, including successful runs. It does not select extra CI or other hardware. Only existing runs for the current commit are selected; workflows with no run are skipped. Existing hardware labels are kept, and future pushes follow the existing workflow gates.
-- `/run-ci amd` (also `/run-base-ci amd`, `/run-amd-ci`): Adds only "run-ci" and reruns existing AMD Base runs for the current commit, including successful runs. It skips missing runs, preserves path filters and existing labels, and does not select Extra. AMD Base needs no new "run-ci-amd" label; future pushes keep the existing CI behavior.
-- `/run-full-ci nv` or `/run-full-ci amd` (also `/rerun-full-ci <hardware>`): Combines the selected hardware's Base and Extra tiers. Adds "run-ci" and "run-ci-nv-extra" or "run-ci-amd-extra", then reruns current-commit workflows including successful runs. Active runs are left alone; missing base runs are skipped and missing extra runs are reported.
-- `/run-<tier>-ci`: Selects one registered tier, such as `/run-nv-extra-ci`. Applies "run-ci" and the tier's optional label, then reruns just the listed workflows, including ones that already succeeded.
-- `/run-extra-ci nv` (also `/run-nv-extra-ci`, `/run-ci nv-extra`): Adds "run-ci" and "run-ci-nv-extra", then reruns NVIDIA/shared Extra, including the existing Xeon CPU Extra suite.
-- `/run-extra-ci amd` (also `/run-amd-extra-ci`, `/run-ci amd-extra`): Adds "run-ci" and "run-ci-amd-extra", then reruns only AMD Extra. Both hardware Extra commands include successful runs and also accept `/rerun-extra-ci <hardware>`.
+- `/tag-run-ci-label [<hardware> ...]`: Adds the "run-ci" label, plus the opt-in label of each named hardware (see the hardware arguments below). Only **future** commits trigger CI; the current commit is unaffected. For example, `/tag-run-ci-label xeon npu` adds "run-ci", "run-ci-xeon-extra", and "run-ci-npu-extra".
+- `/rerun-failed-ci`: Reruns workflows from the latest commit with conclusion **failed, skipped, cancelled, or timed out**. Runs whose tests were skipped because the PR was a draft or lacked a label are rerun in full once the PR is ready and has the label.
+- `/tag-and-rerun-ci [<hardware> ...]`: Adds the same labels as `/tag-run-ci-label`, then does what `/rerun-failed-ci` does, which includes rerunning the runs whose tests were skipped for a label it just added.
+- `/run-ci [<hardware> ...]`: With no argument, an alias of `/tag-and-rerun-ci`. With hardware arguments, adds the labels and reruns each named hardware's Base workflows for NVIDIA and AMD, or the only opt-in workflow for any other hardware, including runs that already succeeded. For example, `/run-ci nv xeon`.
+- `/run-extra-ci <hardware> [...]`: Adds the labels and reruns each named hardware's opt-in workflow, including successful runs. For example, `/run-extra-ci nv amd` or `/run-extra-ci xeon`.
+- `/run-full-ci <hardware> [...]`: Base and Extra together for each named hardware; for hardware without a Base tier it is the same as `/run-extra-ci`.
 - `/rerun-test <test-spec> [<test-spec> ...]`: Reruns one or more specific tests directly. A spec may select a file, class, or method using `<file>::<TestClass>[.<test_method>]`. Multiple specs and file globs are supported. `--changed` (short form `-c`) adds every test file the PR itself adds or modifies (under `test/registered/` or the multimodal test directory), so a PR that touches several tests can rerun them all without listing them. Examples: `/rerun-test test_srt_endpoint.py`, `/rerun-test registered/core/test_srt_endpoint.py::TestSRTEndpoint.test_simple_decode`, `/rerun-test test_a.py test_b.py`, `/rerun-test test_*backend*.py`, `/rerun-test --changed`, or `/rerun-test -c`. NPU tests run as whole files on their registered suite's Ascend runner; only a3 suites run through the NPU PR stage workflow are supported. A file registered in a nightly and a non-nightly suite on the same runner runs once, in the non-nightly one. AMD tests run on the runner of their suite's job in the AMD PR workflows; AMD nightly suites and the disaggregation suite are not supported. Without `--hw`, a file runs on the first of CUDA/CPU, NPU, and AMD that it registers. `--hw` picks the backends: `cuda`, `npu`, `amd`, a list such as `--hw cuda,npu` (a listed backend the file does not register is noted as skipped), or `all` (every backend the file registers), for example `/rerun-test --hw npu test_foo.py`.
 - `/rerun-group <group> [<group> ...]`: Expands one or more registered test groups (for example, `/rerun-group rust-server`) and dispatches their tests through the same selective-rerun workflow. It takes `--hw` as `/rerun-test` does, for example `/rerun-group --hw npu <group>`. Groups are defined in [`scripts/ci/rerun_test_groups.json`](https://github.com/sgl-project/sglang/blob/main/scripts/ci/rerun_test_groups.json).
-- `/run-cpu-ci`: Runs only the CPU unit suite (`base-a-test-cpu`) against the PR head, partitioned the same way as in PR CI, without the `run-ci` label or any GPU stage. Its reply comment turns ✅/❌ when the run finishes, as `/rerun-test` does. For a small PR, `/run-cpu-ci` plus `/rerun-group <module>` covers the unit tests and the affected module's tests. Alias: `/rerun-cpu-ci`.
+- `/run-cpu-ci`: Runs only the CPU unit suite (`base-a-test-cpu`) against the PR head, partitioned the same way as in PR CI, without the `run-ci` label or any GPU stage. Its reply comment turns ✅/❌ when the run finishes, as `/rerun-test` does. For a small PR, `/run-cpu-ci` plus `/rerun-group <module>` covers the unit tests and the affected module's tests.
 
-The no-argument Base aliases share the existing multi-hardware retry scope; they do not opt every hardware tier in. Existing gates still apply. `/run-ci <tier>` selects only that tier, while legacy `/tag-and-rerun-ci <tier>` adds labels and retries broadly. Unknown or multiple arguments to `/run-ci` are rejected.
+Hardware arguments are `nv`, `amd`, `xeon`, `npu`, `xpu`, `musa`, `arm64`, `mlx`, `mlu`, and `ppu`; a registered tier name such as `nv-extra` is accepted as well. Every command takes several of them. NVIDIA and AMD have a Base tier, which runs on every PR with "run-ci", and an Extra tier that also needs "run-ci-nv-extra" or "run-ci-amd-extra". Every other hardware has only an Extra tier: its workflow runs on a PR only with "run-ci" and `run-ci-<hardware>-extra`, and needs no label on `main` pushes or schedules (MLU runs only on PRs and manual dispatch). Tiers are listed in [`scripts/ci/opt_in_ci_tiers.json`](https://github.com/sgl-project/sglang/blob/main/scripts/ci/opt_in_ci_tiers.json).
 
-Extra and Full commands require exactly one hardware argument: `nv` or `amd`. Bare `/run-extra-ci` and `/run-full-ci`, unknown hardware, and multiple hardware arguments are rejected before adding labels or rerunning workflows. Regular NVIDIA and AMD Base CI triggers and path filters remain unchanged.
+An opt-in workflow on a PR without its label passes with its tests skipped, so it shows green rather than failed. Adding a label or marking a draft ready does not start a run: push a commit, use `/rerun-failed-ci` or `/tag-and-rerun-ci` (both rerun the runs whose tests were skipped and can now run), rerun with `/run-ci <hardware>`, or use the "Re-run all jobs" button. "Re-run failed jobs" does not rerun skipped tests.
 
-The shared `extra` tier and "run-ci-extra" label are retired. Updated workflows require "run-ci-nv-extra" for NVIDIA/shared Extra and "run-ci-amd-extra" for AMD Extra; the old label no longer enables either. `/tag-run-ci-label extra` and `/tag-and-rerun-ci extra` are rejected with migration guidance.
+Unknown hardware arguments are rejected before any label is added or workflow rerun, and `/run-extra-ci` and `/run-full-ci` need at least one. The shared `extra` tier and "run-ci-extra" label are retired, and the bare `extra` argument is rejected with migration guidance.
 
 The "amd" label classifies PRs touching paths containing `amd` or `rocm`. It does not opt into AMD Extra or disable NVIDIA CI; "run-ci-amd-extra" is the separate execution opt-in. Commands preserve existing labels and do not cancel queued or running workflows.
 
-For an existing PR, update your branch to include the registry, handler, and Extra gate changes, then push to create fresh runs. Reruns keep the original workflow revision, so older runs retain the shared-label behavior.
-
-The `mlu` tier remains registered for `/run-ci mlu` and `/run-mlu-ci`. The `ppu` tier is registered for `/run-ci ppu` and `/run-ppu-ci`; its existing PPU path filters still apply.
+Reruns keep the original workflow revision, so a run created before a workflow change keeps its old gate; push to create fresh runs.
 
 The rerun commands have the following permission rules:
 
 | Command | PR author | Other users | Additional rule for fork PRs |
 | --- | --- | --- | --- |
 | `/rerun-failed-ci` | Always allowed on their own PR | Must have `can_rerun_failed_ci` in `CI_PERMISSIONS.json` | None |
-| `/tag-and-rerun-ci`, no-argument `/run-ci` aliases | May retry their own PR; adding labels still requires `can_tag_run_ci_label` | Labeling and retrying independently require `can_tag_run_ci_label` and `can_rerun_failed_ci`, respectively | None |
-| `/run-<tier>-ci`, `/run-ci <tier>`, `/run-full-ci <hardware>` and their aliases | Not auto-allowed -- these apply labels, which the PR-author allowance does not cover | Must have both `can_tag_run_ci_label` and `can_rerun_failed_ci` in `CI_PERMISSIONS.json` (every listed user has both) | None |
+| `/tag-and-rerun-ci`, no-argument `/run-ci` | May retry their own PR; adding labels still requires `can_tag_run_ci_label` | Labeling and retrying independently require `can_tag_run_ci_label` and `can_rerun_failed_ci`, respectively | None |
+| `/run-ci <hardware...>`, `/run-extra-ci <hardware...>`, `/run-full-ci <hardware...>` | Not auto-allowed -- these apply labels, which the PR-author allowance does not cover | Must have both `can_tag_run_ci_label` and `can_rerun_failed_ci` in `CI_PERMISSIONS.json` (every listed user has both) | None |
 | `/rerun-test`, `/rerun-group`, `/run-cpu-ci` | No special allowance; judged as any other commenter | Must have `cooldown_interval_minutes: 0` in `CI_PERMISSIONS.json`, or `write`/`admin` repository permission | None -- the same rule applies wherever the PR comes from |
 
 <Warning>

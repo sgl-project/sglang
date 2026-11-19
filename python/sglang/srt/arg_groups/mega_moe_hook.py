@@ -40,7 +40,8 @@ def check_mega_moe_compat(server_args: ServerArgs) -> None:
         raise ValueError(
             "--moe-a2a-backend megamoe needs a CUDA SM90 GPU (block-FP8 experts) "
             "or an SM100-class GPU (MXFP4 / NVFP4 experts); it runs DeepGEMM "
-            "kernels over CUDA symmetric memory. On ROCm it runs aiter MegaMoEv2."
+            "kernels over CUDA symmetric memory. On ROCm it runs aiter MegaMoEv2 "
+            "(MegaMoEGfx1250 on gfx1250)."
         )
 
 

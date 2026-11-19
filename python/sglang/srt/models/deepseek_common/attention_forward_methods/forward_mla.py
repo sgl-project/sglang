@@ -55,6 +55,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_cpu,
     _is_cublas_ge_129,
     _is_cuda,
+    _is_gfx95_supported,
     _is_hip,
     _is_musa,
     _is_sail,
@@ -209,7 +210,14 @@ class DeepseekMLAForwardMixin:
             return True
         # DSA extend on HIP merges owned partials like decode, so replicating
         # q_b_proj replaces the per-layer [T, H, 576] Q all-gather there too.
-        return self.use_dsa and _is_hip and mode.is_extend(include_draft_extend_v2=True)
+        # On gfx950, Kimi-K3.1's sharded index-K prefill attends the gathered KV
+        # with this rank's heads instead.
+        return (
+            self.use_dsa
+            and _is_hip
+            and mode.is_extend(include_draft_extend_v2=True)
+            and not (_is_gfx95_supported and dsa_shards_index_k())
+        )
 
     def init_mla_forward(self: DeepseekV2AttentionMLA):
         self.flashinfer_mla_disable_ragged = (
@@ -1017,7 +1025,8 @@ class DeepseekMLAForwardMixin:
                         self.dcp_v_preproject
                         and self.use_dsa
                         and (
-                            attn_output.shape[0] >= 512
+                            # gfx950: the unprojected xGMI exchange bottlenecks decode
+                            attn_output.shape[0] >= (32 if _is_gfx95_supported else 512)
                             # the push-combine reduce wins at any batch size
                             or dcp_push_combine_fits(
                                 attn_output.shape[0] * self.num_local_heads
@@ -1218,7 +1227,7 @@ class DeepseekMLAForwardMixin:
         """
         if self.rotary_emb is None:
             return False
-        if self.current_attention_backend in ("dsa", "nsa"):
+        if self.current_attention_backend == "dsa":
             return (
                 uses_raw_fp8_dsa_kv_layout(get_exec().kernel.dsa_decode_backend)
                 or uses_raw_fp8_dsa_kv_layout(get_exec().kernel.dsa_prefill_backend)

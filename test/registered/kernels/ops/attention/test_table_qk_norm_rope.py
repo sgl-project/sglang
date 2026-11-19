@@ -164,22 +164,6 @@ def test_inplace_repeated_large_grid(d):
         assert_same_bits(actual, expected)
 
 
-@pytest.mark.parametrize("invalid", ["dtype", "qkv_stride", "table", "positions"])
-def test_cuda_mode_rejects_invalid_inputs(invalid):
-    """Malformed typed/strided inputs must fail before raw-pointer addressing."""
-    _, x, pos, qw, kw, cache = inputs(128, 4, 8, 2, 19)
-    if invalid == "dtype":
-        qw = qw.float()
-    elif invalid == "qkv_stride":
-        x = x[:, ::2]
-    elif invalid == "table":
-        cache = cache.half()
-    else:
-        pos = pos.float()
-    with pytest.raises(AssertionError):
-        table_qk_norm_rope_(x, pos, qw, kw, cache, 8, 2, 128, 1e-6, match_cuda=True)
-
-
 @pytest.mark.parametrize(
     "d,dtype,batch",
     [

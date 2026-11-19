@@ -11,7 +11,7 @@ from sglang.srt.layers.moe.utils import route_dropped_experts_to_local
 from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_xpu_ci(est_time=30, suite="stage-b-test-1-gpu-xpu")
+register_xpu_ci(est_time=30, suite="extra-test-1-gpu-xpu")
 
 DEVICE = "xpu"
 HIDDEN_SIZE, INTERMEDIATE_SIZE, NUM_EXPERTS = 512, 256, 16

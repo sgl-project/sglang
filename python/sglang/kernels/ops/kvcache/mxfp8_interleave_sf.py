@@ -102,3 +102,40 @@ def store_sf_interleaved(
         page_size=page_size,
         BLOCK_T=BLOCK_T,
     )
+
+
+@triton.jit
+def _store_sf_token_major_kernel(
+    src,
+    dst,
+    loc,
+    S0: tl.constexpr,
+    S1: tl.constexpr,
+    D0: tl.constexpr,
+    H: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    token = tl.program_id(0)
+    col = tl.arange(0, BLOCK)
+    slot = tl.load(loc + token).to(tl.int64)
+    mask = (col < H * 4) & (slot != 0)
+    value = tl.load(src + token * S0 + (col // 4) * S1 + col % 4, mask=mask, other=0)
+    tl.store(dst + slot * D0 + col, value, mask=mask)
+
+
+def store_sf_token_major(sf_in: torch.Tensor, sf_out: torch.Tensor, loc: torch.Tensor):
+    """Store four UE8M0 scales per head in strided unified token envelopes."""
+    assert sf_in.shape[1:] == sf_out.shape[1:] and sf_in.shape[-1] == 4
+    assert sf_out.stride(1) == 4 and sf_out.stride(2) == sf_in.stride(2) == 1
+    if loc.numel() == 0:
+        return
+    _store_sf_token_major_kernel[(loc.numel(),)](
+        sf_in.view(torch.uint8),
+        sf_out.view(torch.uint8),
+        loc,
+        sf_in.stride(0),
+        sf_in.stride(1),
+        sf_out.stride(0),
+        sf_in.shape[1],
+        triton.next_power_of_2(sf_in.shape[1] * 4),
+    )

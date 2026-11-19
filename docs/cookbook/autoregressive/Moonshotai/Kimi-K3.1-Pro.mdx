@@ -168,7 +168,7 @@ Kimi K3.1 Pro always thinks; set the depth with the top-level `reasoning_effort`
 ### Tuning notes
 
 - **Memory.** The KDA state pool (FP32, ~52 MB per request per rank at TP8) sets the concurrency ceiling; the MLA + indexer KV (~18.9 KB per token) fills the rest. TP and PCP replicate the MLA KV; DCP is the only axis that shards it.
-- **DFLASH.** Decode needs `--enable-linear-replayssm-spec` (the cells carry it) and an explicit `--max-running-requests`. On NVIDIA, the draft KV ring is on by default and adds ~15% target KV.
+- **DFLASH.** Decode needs `--enable-linear-replayssm-spec` (the cells carry it) and an explicit `--max-running-requests`. On NVIDIA, the DFLASH commands set `SGLANG_ENABLE_DFLASH_DRAFT_KV_RING=1` to turn on the draft KV ring, which adds ~15% target KV; without it the ring is off.
 - **MegaMoE.** Non-prefill roles must set `--max-running-requests`; do not add `--enable-symm-mem` (it deadlocks).
 - **PP prefill.** Keep `SGLANG_PP_LAYER_PARTITION=24,24,24,21` and `CUDA_MODULE_LOADING=EAGER` (both in the High-Throughput prefill cell).
 - **HiCache.** Use `--hicache-io-backend direct --hicache-mem-layout page_first_direct` with `--mamba-max-states-per-path 1` (the HiCache overlay adds them).
@@ -261,7 +261,7 @@ Pending update...
 ### 3.3 PD Disaggregation
 
 - **Transfer**: Mooncake (DCP rejects other backends on either role). Prefill listens on `30000`, decode on `30100`.
-- **When using DFLASH, run it on both roles**: the prefill writes the draft KV ring that decode reads.
+- **When using DFLASH, run it on both roles**: with the draft KV ring on, the prefill writes the ring that decode reads, so set `SGLANG_ENABLE_DFLASH_DRAFT_KV_RING` the same on both.
 - **Restart the prefill role whenever the decode role restarts**: prefill keeps the old decode's Mooncake mapping.
 
 <Accordion title="Router">
