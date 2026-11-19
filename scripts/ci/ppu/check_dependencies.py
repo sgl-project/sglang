@@ -4,6 +4,7 @@ import json
 import re
 import subprocess
 import sys
+import tempfile
 import zipfile
 from email.parser import Parser
 from importlib import metadata
@@ -182,9 +183,17 @@ def dev_sail_wheels(wheel_dir):
 
 
 def collect_dev_sail(wheel_dir):
+    from packaging.requirements import Requirement
+
     root, wheels = dev_sail_wheels(wheel_dir)
+    seen = set()
     while True:
-        missing = {}
+        state = tuple(sorted((name, m["Version"]) for name, (_, m) in wheels.items()))
+        if state in seen:
+            raise ValueError("Offline dependency selection did not converge")
+        seen.add(state)
+        constraints = {}
+        needed = set()
 
         def load(name, requirement, strict):
             if is_platform_package(name):
@@ -193,41 +202,57 @@ def collect_dev_sail(wheel_dir):
                 raise ValueError(
                     f"Unexpected dependency on built package: {requirement}"
                 )
+            constraints.setdefault(name, set()).add(str(requirement))
             if name not in wheels:
-                missing.setdefault(name, set()).add(str(requirement))
+                needed.add(name)
                 return None
             message = wheels[name][1]
             if not requirement.specifier.contains(message["Version"], prereleases=True):
-                raise ValueError(
-                    f"Offline wheel {wheels[name][0].name} does not satisfy {requirement}"
-                )
+                needed.add(name)
+                return None
             return message
 
         walk_dev_sail(root, load)
-        if not missing:
+        if not needed:
             return
-        requirements = sorted({r for values in missing.values() for r in values})
-        subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "pip",
-                "wheel",
-                "--index-url",
-                "https://pypi.org/simple",
-                "--no-deps",
-                "--no-build-isolation",
-                "--wheel-dir",
-                str(wheel_dir / "runtime-deps"),
-                *requirements,
-            ],
-            check=True,
-        )
-        _, wheels = dev_sail_wheels(wheel_dir)
-        if missing.keys() - wheels.keys():
-            raise ValueError(
-                f"No wheels produced for {sorted(missing.keys() - wheels.keys())}"
+        requirements = sorted({r for name in needed for r in constraints[name]})
+        with tempfile.TemporaryDirectory(dir=wheel_dir / "runtime-deps") as directory:
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "pip",
+                    "wheel",
+                    "--index-url",
+                    "https://pypi.org/simple",
+                    "--no-deps",
+                    "--no-build-isolation",
+                    "--wheel-dir",
+                    directory,
+                    *requirements,
+                ],
+                check=True,
             )
+            candidates = wheel_inventory(Path(directory))
+            if candidates.keys() != needed:
+                raise ValueError(
+                    f"Expected exactly one replacement wheel for {sorted(needed)}"
+                )
+            for name in needed:
+                path, message = candidates[name]
+                for value in constraints[name]:
+                    if not Requirement(value).specifier.contains(
+                        message["Version"], prereleases=True
+                    ):
+                        raise ValueError(
+                            f"Offline wheel {path.name} does not satisfy {value}"
+                        )
+            for name in sorted(needed):
+                path, _ = candidates[name]
+                if name in wheels:
+                    wheels[name][0].unlink()
+                path.replace(wheel_dir / "runtime-deps" / path.name)
+        _, wheels = dev_sail_wheels(wheel_dir)
 
 
 def missing_dev_sail(wheel_dir, packages):
