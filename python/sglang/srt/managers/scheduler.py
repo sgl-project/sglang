@@ -330,6 +330,9 @@ from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
 from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
+from sglang.srt.managers.scheduler_components.runtime_switch_agreement import (
+    agree_runtime_switches,
+)
 from sglang.srt.managers.scheduler_components.state_check import CheckPhase
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
@@ -608,6 +611,7 @@ class Scheduler(
             dist_port=self.nccl_port,
         )
         bootstrap.init_layer_runtime(model_config=self.model_config)
+        self.check_runtime_switches_agree()
 
         # Init metrics stats
         self.init_metrics_collector()
@@ -2865,6 +2869,13 @@ class Scheduler(
         self.gc_freezer = GCFreezer(
             freeze_on_idle_secs=get_device().gc_freeze_on_idle_secs
         )
+
+    def check_runtime_switches_agree(self) -> None:
+        """Fail startup unless every rank resolves the NVIDIA runtime switches alike."""
+        # Elastic EP joiners cannot enter a WORLD collective during startup.
+        if get_exec().moe.is_ep_joiner:
+            return
+        agree_runtime_switches(group=get_parallel().world_group)
 
     def init_rank_consensus_checker(self) -> None:
         groups = []
