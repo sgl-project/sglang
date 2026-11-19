@@ -4870,7 +4870,10 @@ class DeepseekSparseAttnBackend(
             and forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
         ):
             topk_transform_method = TopkTransformMethod.RAGGED
-        elif self.dsa_shards_index_k and forward_mode == ForwardMode.EXTEND:
+        elif self.dsa_shards_index_k and forward_mode in (
+            ForwardMode.EXTEND,
+            ForwardMode.MIXED,
+        ):
             topk_transform_method = TopkTransformMethod.RAGGED
         else:
             topk_transform_method = TopkTransformMethod.PAGED

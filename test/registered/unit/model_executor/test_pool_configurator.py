@@ -26,6 +26,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 _POOL_CONFIGURATOR = "sglang.srt.model_executor.pool_configurator"
+_MODEL_CONFIG = "sglang.srt.configs.model_config"
 
 
 @contextlib.contextmanager
@@ -1069,36 +1070,42 @@ class TestEagleConfigurator(CustomTestCase):
         "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
         return_value=576,
     )
-    def test_dsa_draft_sharded_under_dcp_is_charged_one_rank_of_rows(
+    def test_dsa_draft_sharded_under_dcp_is_charged_the_rows_it_allocates(
         self,
         _mock_calculate_mla_kv_cache_dim,
     ):
-        """A draft that shards its KV like the DCP target allocates per-rank
-        rows, so charging it dcp_size times would shrink the token pool."""
+        """A draft that shards its KV like the DCP target allocates per-rank KV
+        rows; its index-K rows stay replicated unless index-K shards too."""
         num_layers = 78
-        indexer_bytes_per_token = 132
+        kv, index_k, dcp_size = 576, 132, 4
+        for shards_index_k, index_k_copies in ((True, 1), (False, dcp_size)):
+            mr = _make_model_runner(self, num_layers=num_layers, use_mla_backend=True)
+            _configure_dsa_model(mr)
+            mr.spec_algorithm.is_eagle.return_value = True
+            mr.spec_algorithm.is_none.return_value = False
+            mr.spec_aux_config.eagle_draft_num_layers = 1
 
-        mr = _make_model_runner(self, num_layers=num_layers, use_mla_backend=True)
-        _configure_dsa_model(mr)
-        mr.spec_algorithm.is_eagle.return_value = True
-        mr.spec_algorithm.is_none.return_value = False
-        mr.spec_aux_config.eagle_draft_num_layers = 1
+            with (
+                self.subTest(shards_index_k=shards_index_k),
+                mock_cpu_env(kv_size=1, tp_size=dcp_size),
+                get_parallel().override(attn_dcp_size=dcp_size),
+                override_platform(is_sm90=shards_index_k),
+                patch(f"{_MODEL_CONFIG}.is_hip", return_value=not shards_index_k),
+                patch(
+                    f"{_POOL_CONFIGURATOR}.dsa_shards_index_k",
+                    return_value=shards_index_k,
+                ),
+            ):
+                from sglang.srt.model_executor.pool_configurator import (
+                    create_memory_pool_configurator,
+                )
 
-        with (
-            mock_cpu_env(kv_size=1, tp_size=4),
-            get_parallel().override(attn_dcp_size=4),
-            override_platform(is_sm90=True),
-            patch(f"{_POOL_CONFIGURATOR}.dsa_shards_index_k", return_value=True),
-        ):
-            from sglang.srt.model_executor.pool_configurator import (
-                create_memory_pool_configurator,
-            )
+                cfg = create_memory_pool_configurator(mr)
 
-            cfg = create_memory_pool_configurator(mr)
-
-        self.assertEqual(
-            cfg._cell_size, (576 + indexer_bytes_per_token) * (num_layers + 1)
-        )
+                self.assertEqual(
+                    cfg._cell_size,
+                    (kv + index_k * index_k_copies) * (num_layers + 1),
+                )
 
     @patch(
         "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",

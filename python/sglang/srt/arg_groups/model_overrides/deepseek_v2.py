@@ -43,17 +43,12 @@ def _dsa_dcp_overrides(cfg: Any) -> dict:
 
 
 def _glm_split_index_k_dcp_overrides(cfg: Any) -> dict:
-    from sglang.srt.configs.model_config import glm_split_index_k_dcp_max_context_len
-
-    max_context_len = glm_split_index_k_dcp_max_context_len(cfg.dcp_size)
-    if cfg.context_length is not None and cfg.context_length > max_context_len:
-        raise ValueError(
-            "GLM-5 DSA DCP on SM90 supports --context-length "
-            f"{max_context_len} or less at --dcp-size {cfg.dcp_size}; "
-            f"got {cfg.context_length}."
-        )
     topk_backends = [cfg.dsa_topk_backend]
-    if cfg.speculative_algorithm is not None:
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    spec_algorithm = SpeculativeAlgorithm.from_string(cfg.speculative_algorithm)
+    # NGRAM drafts without a model, so it has no draft indexer.
+    if not (spec_algorithm.is_none() or spec_algorithm.is_ngram()):
         topk_backends.append(cfg.speculative_dsa_topk_backend)
     if (
         any(backend != "sgl-kernel" for backend in topk_backends)

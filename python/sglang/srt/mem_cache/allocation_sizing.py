@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import functools
 import logging
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, List, Optional
 
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.capacity import tokens_fit
@@ -43,18 +43,34 @@ def get_alloc_len_per_decode() -> int:
     draft-token bound after publish, and this runs per decode batch.
     """
     spec = get_spec()
-    if spec.speculative_algorithm is None:
+    return alloc_len_per_decode(
+        speculative_algorithm=spec.speculative_algorithm,
+        num_steps=spec.speculative_num_steps,
+        eagle_topk=spec.speculative_eagle_topk,
+        num_draft_tokens=max_speculative_num_draft_tokens(),
+        page_size=get_alloc_page_size(),
+    )
+
+
+def alloc_len_per_decode(
+    *,
+    speculative_algorithm: Optional[str],
+    num_steps: Optional[int],
+    eagle_topk: Optional[int],
+    num_draft_tokens: Optional[int],
+    page_size: int,
+) -> int:
+    if speculative_algorithm is None:
         return 1
 
     # Spec decoding allocates max(topk * num_steps, num_draft_tokens) per decode step.
-    spec_steps = spec.speculative_num_steps or 1
-    spec_topk = spec.speculative_eagle_topk or 1
-    spec_tokens = max_speculative_num_draft_tokens()
-    page_size = get_alloc_page_size()
+    spec_steps = num_steps or 1
+    spec_topk = eagle_topk or 1
+    spec_tokens = num_draft_tokens
 
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
-    spec_algo = SpeculativeAlgorithm.from_string(spec.speculative_algorithm)
+    spec_algo = SpeculativeAlgorithm.from_string(speculative_algorithm)
     if spec_algo.is_uno():
         if spec_tokens is None:
             raise RuntimeError("UNO requires speculative_num_draft_tokens")
@@ -164,16 +180,39 @@ def get_req_to_token_extra_context_len() -> int:
     headroom and the pools it sits next to derive from the same bag leaves, so
     they cannot disagree after a post-publish override.
     """
+    spec = get_spec()
+    return req_to_token_extra_context_len(
+        speculative_algorithm=spec.speculative_algorithm,
+        num_steps=spec.speculative_num_steps,
+        eagle_topk=spec.speculative_eagle_topk,
+        num_draft_tokens=max_speculative_num_draft_tokens(),
+        page_size=get_alloc_page_size(),
+    )
+
+
+def req_to_token_extra_context_len(
+    *,
+    speculative_algorithm: Optional[str],
+    num_steps: Optional[int],
+    eagle_topk: Optional[int],
+    num_draft_tokens: Optional[int],
+    page_size: int,
+) -> int:
     # FIXME(lsyin): temporary fix for the context length issue under spec decoding
-    extra = 4 + (max_speculative_num_draft_tokens() or 0)
-    page_size = get_alloc_page_size()
-    spec_algorithm = get_spec().speculative_algorithm
-    if spec_algorithm is not None:
+    extra = 4 + (num_draft_tokens or 0)
+    if speculative_algorithm is not None:
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
-        spec_algo = SpeculativeAlgorithm.from_string(spec_algorithm)
+        spec_algo = SpeculativeAlgorithm.from_string(speculative_algorithm)
         if page_size > 1 or spec_algo.is_uno():
             # UNO's double-buffer reserve applies at every page size. Larger
             # pages may additionally round the allocation up by page_size - 1.
-            extra = max(extra, get_alloc_reserve_per_decode() + page_size - 1)
+            reserve = 2 * alloc_len_per_decode(
+                speculative_algorithm=speculative_algorithm,
+                num_steps=num_steps,
+                eagle_topk=eagle_topk,
+                num_draft_tokens=num_draft_tokens,
+                page_size=page_size,
+            )
+            extra = max(extra, reserve + page_size - 1)
     return extra

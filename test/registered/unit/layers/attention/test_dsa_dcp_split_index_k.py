@@ -11,8 +11,8 @@ from sglang.srt.configs.model_config import (
     ModelConfig,
     dsa_draft_shards_under_dcp,
     glm_dsa_shards_index_k,
-    glm_split_index_k_dcp_max_context_len,
 )
+from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
 from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla import (
@@ -86,13 +86,35 @@ def test_unset_context_length_is_capped_only_under_split_index_k():
         def context_len(*, is_sm90=True, **server_args):
             with override_platform(is_sm90=is_sm90, is_sm100=not is_sm90):
                 return ModelConfig.from_server_args(
-                    ServerArgs(model_path=checkpoint, **server_args)
+                    ServerArgs(model_path=checkpoint, page_size=64, **server_args)
                 ).context_len
 
-        assert context_len(dcp_size=4) == glm_split_index_k_dcp_max_context_len(4)
+        # The request table over-allocates four tokens without a draft.
+        assert context_len(dcp_size=4) == model_context_len - 4
         assert context_len() == model_context_len
         assert context_len(is_sm90=False, dcp_size=4) == model_context_len
         assert context_len(dcp_size=4, context_length=4096) == 4096
+        with pytest.raises(ValueError, match="--context-length 1048572"):
+            context_len(dcp_size=4, context_length=model_context_len)
+        # A long draft reserves more than one allocator page of the table.
+        long_draft = dict(
+            speculative_algorithm="NEXTN",
+            speculative_num_steps=64,
+            speculative_eagle_topk=1,
+            speculative_num_draft_tokens=65,
+        )
+        assert context_len(dcp_size=2, **long_draft) == model_context_len - 257
+
+
+@pytest.mark.parametrize("mode", [ForwardMode.EXTEND, ForwardMode.MIXED])
+def test_flashmla_kv_prefill_top_k_is_ragged_under_split_index_k(mode):
+    """A mixed batch prefills from the gathered KV like an extend, so its top-k
+    must address that buffer too; a paged top-k would export widened slots as
+    the draft's seed."""
+    backend = _backend(shards_index_k=True)
+    backend.dsa_kv_cache_store_fp8 = True
+    backend.dsa_prefill_impl = "flashmla_kv"
+    assert backend.get_topk_transform_method(mode) == TopkTransformMethod.RAGGED
 
 
 def test_prefix_rows_index_the_ragged_gathered_kv_under_split_index_k():

@@ -199,7 +199,12 @@ sglang serve \
 
 The `trtllm` DSA kernels need SM100/SM103, so on SM90 GLM-5 DSA also token-shards the **index-K cache**, the layout Kimi K3.1 uses. Each rank scores only the positions it owns, the ranks all-gather their local top-k and merge an exact global top-k, and decode, target verify and MTP draft extend attend the owned KV and merge partial outputs by LSE. Prefill gathers the prefix KV from the DCP group. The MTP draft shards its KV like the target.
 
-Requirements on SM90: `--dsa-prefill-backend flashmla_sparse_q8` or `flashmla_kv`, `--dsa-decode-backend flashmla_kv` and an `fp8_e4m3` KV cache (selected automatically, with `flashmla_sparse_q8` for prefill, and other values are rejected at startup), `attn_tp_size % dcp_size == 0`, the fused `sgl-kernel` DSA top-k (the default) for the target and the draft, and a context length of `2^20 - 128 * dcp_size` or less (1048064 at `--dcp-size 4`), since the deterministic top-k merge takes rows of at most 2^20 scores and a row spans the over-allocated request table. A longer model context is capped to that by default, and a longer `--context-length` is rejected at startup.
+Requirements on SM90:
+
+- `--dsa-prefill-backend flashmla_sparse_q8` or `flashmla_kv`, `--dsa-decode-backend flashmla_kv` and an `fp8_e4m3` KV cache. These are selected automatically, with `flashmla_sparse_q8` for prefill, and other values are rejected at startup.
+- `attn_tp_size % dcp_size == 0`.
+- The fused `sgl-kernel` DSA top-k (the default) for the target and the draft.
+- A context length that keeps the request table within 2^20 tokens, since the deterministic top-k merge takes rows of at most 2^20 scores. The table over-allocates past the context by the speculative decoding reserve: with `--dcp-size 4 --speculative-num-steps 5 --speculative-eagle-topk 1 --speculative-num-draft-tokens 6`, the longest context is 1048309. A longer model context is capped to the limit by default, and a longer `--context-length` is rejected at startup.
 
 ## References
 

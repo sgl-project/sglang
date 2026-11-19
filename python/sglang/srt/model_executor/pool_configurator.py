@@ -395,7 +395,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         dcp_size=dcp_size,
                     )
                     draft_kv_size *= draft_dcp_scale
-                    draft_indexer_size *= draft_dcp_scale
+                    # The draft's index-K is replicated unless index-K shards.
+                    draft_indexer_size *= (
+                        draft_dcp_scale if dsa_shards_index_k() else dcp_size
+                    )
                     self._cell_size += draft_kv_size + draft_indexer_size
                 else:
                     # Under DCP a non-DSA draft pool spans the allocator's widened
