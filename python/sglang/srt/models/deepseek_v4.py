@@ -137,7 +137,11 @@ from sglang.srt.managers.mm_utils import (
     embed_mm_inputs,
     pad_mm_tokens,
 )
-from sglang.srt.managers.req_types import MM_PAD_SHIFT_VALUE, MultimodalInputs
+from sglang.srt.managers.req_types import (
+    MM_PAD_SHIFT_VALUE,
+    MultimodalDataItem,
+    MultimodalInputs,
+)
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -213,6 +217,7 @@ from sglang.srt.multimodal.deepseek_v41_image_processing import (
     image_token_types,
     materialize_image_gpu,
 )
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import (
     get_device,
     get_exec,
@@ -4859,6 +4864,19 @@ class DeepseekV4ForCausalLM(
         self.quant_config = quant_config
         self.wo_a_fp8 = wo_a_fp8_gemm_enabled(quant_config)
         self.use_npu_arch35_mxfp8_wo_a = use_npu_arch35_mxfp8_wo_a(quant_config)
+        # EPD: an encoder-only server hosts just the vision tower, and a
+        # language-only server drops it and consumes precomputed embeddings
+        # from a remote encoder.
+        self.encoder_only = bool(getattr(config, "encoder_only", False))
+        self.language_only = bool(getattr(config, "language_only", False))
+        # Language-only has no local tower, but precomputed embeddings still
+        # have to be injected and MM_PAD_SHIFT sentinels still mapped back to
+        # image_token_id for Engram masking and visual MoE routing.
+        self.supports_visual_inputs = (
+            config.model_type == "deepseek_v41"
+            and config.vision_n_layers > 0
+            and not getattr(config, "language_model_only", False)
+        )
         # The weight loader reads this after the build.
         self.num_fused_shared_experts = get_num_fused_shared_experts()
         self.vision = None
@@ -4866,6 +4884,7 @@ class DeepseekV4ForCausalLM(
             config.model_type == "deepseek_v41"
             and config.vision_n_layers > 0
             and not getattr(config, "language_model_only", False)
+            and not self.language_only
         ):
             if (
                 get_parallel().pp_group.world_size != 1
@@ -4882,6 +4901,19 @@ class DeepseekV4ForCausalLM(
             self.image_start = nn.Parameter(torch.empty(config.hidden_size))
             self.image_end = nn.Parameter(torch.empty(config.hidden_size))
             self.image_newline = nn.Parameter(torch.empty(config.hidden_size))
+
+        if self.encoder_only:
+            self.model = None
+            self.pp_group = get_parallel().pp_group
+            self.lm_head = None
+            self.logits_processor = None
+            self.capture_aux_hidden_states = False
+            self.start_layer = 0
+            self.end_layer = 0
+            self._routed_experts_weights_of_layer = LazyValue(dict)
+            self._mhc_prewarmed_at_load = False
+            return
+
         self.model = DeepseekV4Model(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
@@ -4987,6 +5019,71 @@ class DeepseekV4ForCausalLM(
 
     def pad_input_ids(self, input_ids: array, mm_inputs) -> array:
         return pad_mm_tokens(input_ids, mm_inputs)
+
+    def preprocess_mm_for_encoder(
+        self, images, modality, config, *, use_gpu_preprocessing=False
+    ):
+        """Patchify raw images into one ViT-ready item per image for the encoder."""
+        # Encoder-only packages; keep them off the model import path.
+        from sglang.srt.disaggregation.encoder.preprocessor import (
+            EncoderPreprocessOutput,
+        )
+        from sglang.srt.multimodal.deepseek_v41_image_processing import (
+            GPU_PLAN_KEY,
+            patchify_image,
+            prepare_image_gpu,
+        )
+
+        if modality != Modality.IMAGE or self.vision is None:
+            return None
+
+        items, grids = [], []
+        for image in images:
+            if use_gpu_preprocessing:
+                feature, plan, n_llm_h, n_llm_w = prepare_image_gpu(image, self.config)
+                metadata = {
+                    "n_vit_h": plan["height"] // plan["patch_size"],
+                    "n_vit_w": plan["width"] // plan["patch_size"],
+                    GPU_PLAN_KEY: plan,
+                }
+            else:
+                feature, n_vit_h, n_vit_w, n_llm_h, n_llm_w = patchify_image(
+                    image, self.config
+                )
+                metadata = {"n_vit_h": n_vit_h, "n_vit_w": n_vit_w}
+            items.append(
+                MultimodalDataItem(
+                    modality=Modality.IMAGE,
+                    feature=feature,
+                    model_specific_data=metadata,
+                )
+            )
+            grids.append([1, n_llm_h, n_llm_w])
+
+        # The encoder server reads the aggregate feature for hashing metadata
+        # even when it forwards the item-wise representation to the model.
+        features = [item.feature for item in items]
+        pixel_values = (
+            torch.cat(features, dim=0)
+            if len({tuple(feature.shape[1:]) for feature in features}) == 1
+            else features
+        )
+        return EncoderPreprocessOutput(
+            {"image_grid_hws": grids, "pixel_values": pixel_values},
+            mm_items=items,
+        )
+
+    def encoder_num_tokens(self, grid, modality):
+        """Tokens one image occupies: start, one newline per row, end.
+
+        Returns None for modalities this model does not count, which makes the
+        encoder fall back to the generic patches / merge_size**2 rule.
+        """
+        if modality != Modality.IMAGE:
+            return None
+        values = grid.tolist() if isinstance(grid, torch.Tensor) else list(grid)
+        _, n_llm_h, n_llm_w = (int(value) for value in values)
+        return 2 + (n_llm_w + 1) * n_llm_h
 
     def get_image_feature(self, items):
         """Return complete spans for the shared MM cache and chunk scheduler."""
@@ -5110,7 +5207,7 @@ class DeepseekV4ForCausalLM(
         model uses image_token_id for Engram masking and visual MoE routing.
         """
         if (
-            getattr(self, "vision", None) is not None
+            self.supports_visual_inputs
             and not forward_batch.forward_mode.is_decode()
             and not forward_batch.forward_mode.is_target_verify()
             and forward_batch.mm_inputs is not None
@@ -5119,7 +5216,7 @@ class DeepseekV4ForCausalLM(
             if input_embeds is not None:
                 raise ValueError("Cannot combine input_embeds and image inputs")
             input_embeds = self._prepare_mm_embeddings(input_ids, forward_batch)
-        if getattr(self, "vision", None) is not None and not (
+        if self.supports_visual_inputs and not (
             forward_batch.forward_mode.is_decode_or_idle()
             or forward_batch.forward_mode.is_target_verify()
         ):
@@ -5500,6 +5597,24 @@ class DeepseekV4ForCausalLM(
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
+
+        if self.encoder_only:
+            # The encoder server owns only the vision tower; every language
+            # model tensor in the checkpoint is skipped here.
+            for name, weight in weights:
+                name = self.remap_weight_name_to_dpsk_hf_format(name)
+                if not name.startswith(("vision.", "aligner.", "image_")):
+                    continue
+                param = params_dict.get(name)
+                if param is None:
+                    logger.warning(
+                        "encoder-only load: no parameter for vision tensor %s", name
+                    )
+                    continue
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, weight)
+                loaded_params.add(name)
+            return loaded_params
 
         if is_nextn:
             if hasattr(self.config, "num_nextn_predict_layers"):

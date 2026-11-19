@@ -13,6 +13,7 @@ from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
 )
+from sglang.srt.multimodal.modality import Modality
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -226,6 +227,26 @@ class TestDeepseekV41BCGMultimodal(CustomTestCase):
                     model, torch.arange(3), hidden, batch, ids, ids, False, []
                 )
             torch.testing.assert_close(actual, expected)
+
+
+class TestDeepseekV41EncoderNumTokens(CustomTestCase):
+    """EPD token span of one image: start, (width + newline) per row, end."""
+
+    @staticmethod
+    def _model():
+        return object.__new__(dsv4.DeepseekV4ForCausalLM)
+
+    def test_image_span_length(self):
+        self.assertEqual(
+            self._model().encoder_num_tokens([1, 11, 16], Modality.IMAGE), 189
+        )
+        self.assertEqual(
+            self._model().encoder_num_tokens(torch.tensor([1, 2, 3]), Modality.IMAGE),
+            10,
+        )
+
+    def test_non_image_modality_declares_nothing(self):
+        self.assertIsNone(self._model().encoder_num_tokens([1, 2, 3], Modality.AUDIO))
 
 
 if __name__ == "__main__":

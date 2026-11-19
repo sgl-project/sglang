@@ -29,6 +29,7 @@ from sglang.srt.disaggregation.encoder.server import (
     EncoderMetaRegistry,
     MMEncoder,
     MMError,
+    _flatten_feature_output,
     meta_registry,
 )
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
@@ -719,6 +720,60 @@ class TestMooncakeRegistration(CustomTestCase):
 
         with self.assertLogs(level="ERROR"):
             self.engine.batch_register([0x10000], [0x1000])
+
+
+class TestEncoderFeatureFlatten(CustomTestCase):
+    """The encoder must accept both a 2D tensor and one span per item."""
+
+    def test_two_dimensional_output_passes_through(self):
+        feature = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+        self.assertTrue(torch.equal(_flatten_feature_output(feature), feature))
+
+    def test_extra_leading_dimension_is_flattened(self):
+        feature = torch.arange(24, dtype=torch.float32).reshape(2, 3, 4)
+        flattened = _flatten_feature_output(feature)
+        self.assertEqual(tuple(flattened.shape), (6, 4))
+        self.assertTrue(torch.equal(flattened, feature.reshape(6, 4)))
+
+    def test_spans_concatenate_in_item_order(self):
+        spans = [
+            torch.full((2, 3), 1.0),
+            torch.full((1, 3), 2.0),
+        ]
+        flattened = _flatten_feature_output(spans)
+        self.assertTrue(torch.equal(flattened, torch.cat(spans, dim=0)))
+        self.assertTrue(torch.equal(flattened[2], spans[1][0]))
+
+
+class TestEncoderDeclaredTokenCounts(CustomTestCase):
+    """Models with their own prompt layout declare the per-grid token count."""
+
+    @staticmethod
+    def _preprocessor(counter):
+        preprocessor = object.__new__(EncoderPreprocessor)
+        preprocessor._model_token_counter = counter
+        return preprocessor
+
+    def test_declared_counts_are_used(self):
+        preprocessor = self._preprocessor(lambda grid, modality: grid[1] * 10)
+        self.assertEqual(
+            preprocessor._declared_token_counts([[1, 2, 3], [1, 4, 5]], Modality.IMAGE),
+            [20, 40],
+        )
+
+    def test_missing_counter_falls_back(self):
+        self.assertIsNone(
+            self._preprocessor(None)._declared_token_counts([[1, 2, 3]], Modality.IMAGE)
+        )
+
+    def test_unsupported_modality_falls_back_for_every_grid(self):
+        """A partial declaration falls back as a whole; mixing counts would mis-slice."""
+        counter = lambda grid, modality: grid[1] if modality == Modality.IMAGE else None
+        self.assertIsNone(
+            self._preprocessor(counter)._declared_token_counts(
+                [[1, 2, 3], [1, 4, 5]], Modality.AUDIO
+            )
+        )
 
 
 if __name__ == "__main__":

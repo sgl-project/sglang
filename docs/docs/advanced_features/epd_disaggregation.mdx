@@ -157,6 +157,46 @@ sgl-router \
 
 ```
 
+#### DeepSeek-V4.1
+
+The vision tower stays on the encoder server; the language-only server loads the
+text model and the Engram tables only. One GPU is enough for the ViT.
+
+```bash Command
+# encoder (ViT only)
+python -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V4.1-Flash \
+  --trust-remote-code \
+  --encoder-only \
+  --encoder-transfer-backend zmq_to_scheduler \
+  --port 30000
+
+# language-only server (8 GPUs)
+python -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V4.1-Flash \
+  --trust-remote-code \
+  --language-only \
+  --encoder-urls http://127.0.0.1:30000 \
+  --encoder-transfer-backend zmq_to_scheduler \
+  --engram-config '{"placement": "cpu", "replication": "per_node"}' \
+  --tp-size 8 \
+  --port 30002
+```
+
+Notes:
+
+- The encoder returns one embedding span per image, including the image start,
+  per-row newline and end rows. The language-only server rebuilds the prompt from
+  the grid metadata carried with the embeddings, so the two sides must run the
+  same checkpoint.
+- Set `SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU=1` on both servers to run resizing
+  and patchification on the GPU instead of the CPU path.
+- Engram placement is unchanged by EPD; `--engram-config` applies to the
+  language-only server, and `replication: per_node` needs shared memory huge pages
+  enabled on the host.
+- DSpark and the Reasoning / Tool Calling parsers are configured on the
+  language-only server as in a single-server deployment.
+
 #### gRPC Encoder (EPD)
 
 You can run the encoder as a gRPC server while keeping prefill/decode as HTTP.

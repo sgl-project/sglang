@@ -495,6 +495,24 @@ def _get_mm_feature(mm_inputs, modality):
     )
 
 
+def _flatten_feature_output(feature):
+    """Normalize one model's ``get_*_feature`` result to a [rows, dim] tensor.
+
+    DeepSeek-V4.1 returns one span per item: the image start, row newline and
+    end rows around each ViT block. Concatenating in item order keeps
+    ``slice_embedding``'s token-count split valid for both shapes.
+    """
+    if isinstance(feature, (list, tuple)):
+        spans = [
+            span.reshape(-1, span.shape[-1]) if span.ndim != 2 else span
+            for span in feature
+        ]
+        return torch.cat(spans, dim=0)
+    if feature.ndim != 2:
+        return feature.reshape(-1, feature.shape[-1])
+    return feature
+
+
 def _normalize_aux_value(val):
     """Normalize aux values to pickle types compatible with safe_pickle_loads.
 
@@ -634,6 +652,7 @@ class MMEncoder:
             model_config=self.model_config,
             model_preprocessor=getattr(self.model, "preprocess_mm_for_encoder", None),
             encoder_media_processor_config=encoder_media_processor_config,
+            model_token_counter=getattr(self.model, "encoder_num_tokens", None),
         )
         self.cache_namespace = build_processor_fingerprint(
             self.preprocessor,
@@ -1035,9 +1054,7 @@ class MMEncoder:
 
         forward_start = time.perf_counter()
         with torch.inference_mode():
-            new_embeddings = get_feature_fn(mm_items)
-            if new_embeddings.ndim != 2:
-                new_embeddings = new_embeddings.reshape(-1, new_embeddings.shape[-1])
+            new_embeddings = _flatten_feature_output(get_feature_fn(mm_items))
         if encoder_metrics_collector is not None:
             encoder_metrics_collector.observe_model_forward(
                 time.perf_counter() - forward_start, modality=modality.name.lower()
@@ -1772,7 +1789,9 @@ class MMEncoder:
             if mm_embedding is None:
                 forward_start = time.perf_counter()
                 with torch.inference_mode():
-                    mm_embedding: torch.Tensor = ctx.get_feature_fn(mm_items)
+                    mm_embedding: torch.Tensor = _flatten_feature_output(
+                        ctx.get_feature_fn(mm_items)
+                    )
                     if not keep_on_gpu:
                         mm_embedding = mm_embedding.cpu()
                 if len(mm_embedding.shape) != 2:

@@ -208,7 +208,44 @@ One deployment note: Mooncake needs the RDMA fabric visible inside the container
 
 PD runs with DSpark: on a DSpark recipe both Playground roles keep the speculative flags, and the prefill and decode servers must both pass them. The server accepts this with Mooncake or NIXL transfer, static verification (`SGLANG_RAGGED_VERIFY_MODE`, `static` by default), and no context parallelism on decode (CP=1, DCP=1); it rejects any other combination at startup.
 
-### 3.5 HiCache (Hierarchical KV Caching)
+### 3.5 EPD Disaggregation
+
+V4.1 supports Encoder–Prefill–Decode disaggregation. The ViT runs on a dedicated
+encoder server (one GPU), and the language-only server loads the text model and
+Engram tables with no vision tower.
+
+```bash Command
+# encoder server
+python -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V4.1-Flash \
+  --trust-remote-code \
+  --encoder-only \
+  --encoder-transfer-backend zmq_to_scheduler \
+  --port 30000
+
+# language-only server
+python -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V4.1-Flash \
+  --trust-remote-code \
+  --language-only \
+  --encoder-urls http://127.0.0.1:30000 \
+  --encoder-transfer-backend zmq_to_scheduler \
+  --engram-config '{"placement": "cpu", "replication": "per_node"}' \
+  --tp-size 8 \
+  --port 30002
+```
+
+Both sides must load the same checkpoint, and every language-only server needs
+`--engram-config` because it no longer shares a process with the vision tower.
+Add `SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU=1` on both servers to keep resizing and
+patchification on the GPU.
+
+On 8×H20 the split is accuracy-neutral: MMMU validation (900 questions, 64-way,
+`temperature=1.0`, `reasoning_effort=max`) scored 86.0% with EPD against 85.6%
+colocated, and GSM8K test (1,319 questions, 4-shot, greedy) scored 97.0% against
+96.7%. Per-request latency grew about 3.5% at 64-way saturation.
+
+### 3.6 HiCache (Hierarchical KV Caching)
 
 HiCache extends RadixAttention with a hierarchy of KV cache tiers, significantly expanding effective context capacity for long-context and multi-turn scenarios.
 
@@ -220,7 +257,7 @@ The card is not offered on MI355X: hierarchical cache has not been validated on 
 
 Only the L2 tier is exposed here. For the storage (L3) tier and the canonical flag set, see the [HiCache best-practices recipe](../../../docs/advanced_features/hicache_best_practices) and the [HiCache documentation](../../../docs/advanced_features/hicache).
 
-### 3.6 Agentic Long-Context on MI355X (FP4, DSpark)
+### 3.7 Agentic Long-Context on MI355X (FP4, DSpark)
 
 Agentic replay is a different workload: long-context prompts, multi-turn sessions that reuse their own prefix across turns, and subagent branches that fan out within one session. Concurrency below counts live sessions, not requests. Every command keeps the engram tables on the host, and none adds a HiCache tier. The sessions fit the device pool.
 
