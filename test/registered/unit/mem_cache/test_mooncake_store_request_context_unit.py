@@ -137,6 +137,8 @@ def _make_mooncake_store(binding):
     st.split_factor = 0
     st._use_group_semantics = False
     st.enable_storage_metrics = False
+    st.unified_suffixes = None
+    st.unified_chunk_spans = None
     return st
 
 

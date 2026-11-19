@@ -29,7 +29,6 @@ KIMI_K3_W4A8_32P_ENVS = {
     "SGLANG_ENABLE_SPEC_V2": "1",
     "SGLANG_RAGGED_VERIFY_MODE": "static",
     "SGLANG_DSPARK_FOLDED_PROPOSAL": "0",
-    "SGLANG_DSPARK_FOLDED_SAMPLING": "0",
     "SGLANG_DSPARK_STACKED_CTX_KV": "0",
     "SGLANG_DSPARK_EMBED_IN_GRAPH": "0",
     "SGLANG_NPU_FINE_GRAINED_MOE_DUAL_STREAM": "0",
@@ -39,12 +38,13 @@ KIMI_K3_W4A8_32P_ENVS = {
     "STREAMS_PER_DEVICE": "32",
     "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "128",
-    "DEEPEP_HYBRID_DEPLOYMENT": "1",
-    "HCCL_BUFFSIZE": "2000",
-    "DEEP_NORMAL_LONG_SEQ_ROUND": "2",
-    "DEEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "512",
+    "DEEPEP_NORMAL_LONG_SEQ_ROUND": "2",
+    "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "512",
     "HCCL_OP_EXPANSION_MODE": "AIV",
     "ASCEND_USE_FIA": "1",
+    "SGLANG_NPU_USE_FIAS_V2_BSND": "1",
+    "HCCL_BUFFSIZE": "200",
+    "DEEPEP_HCCL_BUFFSIZE": "1800",
 }
 
 KIMI_K3_W4A8_32P_OTHER_ARGS = [
@@ -126,9 +126,8 @@ KIMI_K3_W4A8_32P_MODEL_CONFIG = {
 class TestNPUKimiK3W4A832PMixIn128kOut1kDecodePrefix(
     TestNpuPerfMultiNodePdMixTestCaseBase
 ):
-    """Pure decode low latency: 128k input with a fully shared prefix
-    (repeat_rate=1, ~100% cache hit) / 1024 out, C12, mean TPOT <= 30 ms,
-    via the official aisbench prefix mode."""
+    """128k-in / 1k-out pure decode at C6 over a 99% shared prefix; gate:
+    mean TPOT <= 30 ms (+1 ms tolerance) and output throughput >= 140 token/s."""
 
     model_config = KIMI_K3_W4A8_32P_MODEL_CONFIG
     benchmark_tool = AISBENCHMARK
@@ -136,12 +135,13 @@ class TestNPUKimiK3W4A832PMixIn128kOut1kDecodePrefix(
     dataset_path = None
     input_len = 131072
     output_len = 1024
-    num_prompts = 12
-    max_concurrency = 12
-    repeat_rate = 1
-    request_rate = 3
+    num_prompts = 6
+    max_concurrency = 6
+    repeat_rate = 0.99
+    request_rate = 0
     dp = 4
     tpot = 30.0
+    output_token_throughput = 140.0
 
     def test_npu_kimi_k3_w4a8_32p_mix_in128k_out1k_decode_prefix(self):
         """Run the 128k pure-decode low-latency TPOT acceptance test."""
