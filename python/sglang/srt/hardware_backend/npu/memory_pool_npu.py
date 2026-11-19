@@ -831,7 +831,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             and get_memory().enable_hierarchical_cache
         ):
             raise ValueError(
-                "--indexer-kv-cache-dtype is not supported with "
+                "--indexer-kv-cache-dtype=int8/mxFP8 is not supported with "
                 "--enable-hierarchical-cache"
             )
         self.indexer_kv_store_int8 = (
@@ -846,9 +846,8 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         )
         if self.indexer_kv_store_mxfp8 and index_kpool <= 1:
             raise ValueError(
-                "--indexer-kv-cache-dtype=mxfp8 requires the KPool pooled-key "
-                "indexer (index_kpool > 1); the lightning-indexer mxfp8 path "
-                "is tracked separately."
+                "The NPU LightningIndexer does not support MXFP8 index cache; "
+                "--indexer-kv-cache-dtype=mxfp8 requires KPool (index_kpool > 1)."
             )
         if self.indexer_kv_store_int8:
             self.index_k_store_dtype = torch.int8
@@ -957,43 +956,31 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                     dtype=self.index_k_store_dtype,
                     device=self.device,
                 )
-                if (
-                    self.dsa_kv_cache_store_fp8
-                    or (self.indexer_kv_store_int8 and self.index_kpool == 1)
-                ) and self.num_indexer_layers > 0:
-                    from sglang.srt.layers.attention.dsa.dsa_npu_indexer import (
-                        create_npu_hadamard_128,
-                    )
+                if self.num_indexer_layers > 0:
+                    if self.dsa_kv_cache_store_fp8 or self.indexer_kv_store_int8:
+                        from sglang.srt.layers.attention.dsa.dsa_npu_indexer import (
+                            create_npu_hadamard_128,
+                        )
 
-                    self.index_k_scale_buffer = torch.zeros(
-                        (*self.index_k_buffer.shape[:-2], 1),
-                        dtype=self.index_k_scale_dtype,
-                        device=self.device,
-                    )
-                    self.indexer_hadamard_128 = create_npu_hadamard_128(
-                        self.index_head_dim, self.device
-                    )
-                elif self.indexer_kv_store_int8 and self.num_indexer_layers > 0:
-                    # KPool quantizes each pooled row symmetrically without
-                    # rotating keys or queries, so no Hadamard buffer is needed.
-                    self.index_k_scale_buffer = torch.zeros(
-                        (*self.index_k_buffer.shape[:-2], 1),
-                        dtype=self.index_k_scale_dtype,
-                        device=self.device,
-                    )
-                elif self.indexer_kv_store_mxfp8 and self.num_indexer_layers > 0:
-                    # KPool MXFP8 keeps keys and queries in the same unrotated
-                    # basis: one E8M0 byte per 32-element block, pair-packed
-                    # as [D/64, 2]; no Hadamard buffer is needed.
-                    self.index_k_scale_buffer = torch.zeros(
-                        (
-                            *self.index_k_buffer.shape[:-1],
-                            self.index_head_dim // 64,
-                            2,
-                        ),
-                        dtype=torch.uint8,
-                        device=self.device,
-                    )
+                        self.index_k_scale_buffer = torch.zeros(
+                            (*self.index_k_buffer.shape[:-2], 1),
+                            dtype=self.index_k_scale_dtype,
+                            device=self.device,
+                        )
+                        self.indexer_hadamard_128 = create_npu_hadamard_128(
+                            self.index_head_dim, self.device
+                        )
+                    elif self.indexer_kv_store_mxfp8:
+                        # MXFP8: E8M0 scales per 32 elements, no Hadamard; pair-packed as [D/64, 2].
+                        self.index_k_scale_buffer = torch.zeros(
+                            (
+                                *self.index_k_buffer.shape[:-1],
+                                self.index_head_dim // 64,
+                                2,
+                            ),
+                            dtype=torch.uint8,
+                            device=self.device,
+                        )
 
         self._compress_tail_k = None
         self._compress_tail_score = None

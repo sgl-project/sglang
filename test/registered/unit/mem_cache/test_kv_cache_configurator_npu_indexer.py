@@ -105,7 +105,8 @@ class TestNPUIndexerMemorySizing(CustomTestCase):
             ("mxfp8", torch.bfloat16, 1, 132),
             ("mxfp8", torch.bfloat16, 4, 33),
             (None, torch.float8_e4m3fn, 1, 132),
-        ]
+            (None, torch.float8_e4m3fn, 4, 33),
+        ]  # (indexer_kv_cache_dtype, kv_cache_dtype, index_kpool, expected bytes/token/layer)
         for indexer_dtype, kv_dtype, kpool, expected in cases:
             with self.subTest(
                 indexer_dtype=indexer_dtype, kv_dtype=kv_dtype, kpool=kpool
@@ -227,6 +228,21 @@ class TestNPUIndexerInt8Cache(CustomTestCase):
                 self.assertEqual(pool.index_k_buffer.dtype, key_dtype)
                 self.assertEqual(None if scale is None else scale.dtype, scale_dtype)
 
+    def test_kpool_fp8_allocates_per_row_fp32_scales(self):
+        pool = self._build_pool(
+            torch.float8_e4m3fn,
+            kv_cache_dim=512 + 512 // 128 * 4 + 64 * 2,
+            index_kpool=4,
+        )
+        self.assertTrue(pool.dsa_kv_cache_store_fp8)
+        self.assertEqual(pool.index_k_buffer.dtype, torch.float8_e4m3fn)
+        self.assertEqual(pool.index_k_scale_buffer.dtype, torch.float32)
+        self.assertEqual(
+            pool.index_k_scale_buffer.shape,
+            (*pool.index_k_buffer.shape[:-2], 1),
+        )
+        self.assertEqual(pool.indexer_hadamard_128.shape, (128, 128))
+
     def test_int8_mode_with_kpool_stores_int8_pooled_keys(self):
         pool = self._build_pool(
             torch.bfloat16,
@@ -240,8 +256,9 @@ class TestNPUIndexerInt8Cache(CustomTestCase):
             pool.index_k_scale_buffer.shape,
             (*pool.index_k_buffer.shape[:-2], 1),
         )
-        # KPool quantizes pooled rows without rotating keys or queries.
-        self.assertIsNone(pool.indexer_hadamard_128)
+        # INT8 queries must rotate into the same basis as the pooled keys.
+        self.assertEqual(pool.indexer_hadamard_128.shape, (128, 128))
+        self.assertEqual(pool.indexer_hadamard_128.dtype, torch.bfloat16)
 
     def test_resolve_indexer_quant_mode(self):
         self.assertIsNone(resolve_indexer_quant_mode(None, torch.bfloat16))
@@ -315,7 +332,7 @@ class TestNPUIndexerMxfp8Cache(CustomTestCase):
         self.assertEqual(pool.get_index_k_scale_buffer(0).dtype, torch.float8_e8m0fnu)
 
     def test_mxfp8_mode_requires_kpool(self):
-        with self.assertRaisesRegex(ValueError, "KPool"):
+        with self.assertRaisesRegex(ValueError, "LightningIndexer.*MXFP8"):
             self._build_pool(
                 torch.bfloat16,
                 indexer_quant_mode=QUANT_MODE_TOKEN_MXFP8,

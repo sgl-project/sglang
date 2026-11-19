@@ -343,17 +343,19 @@ class AscendDSAAttnMultiStepDraftBackend(AscendAttnMultiStepDraftBackend):
     backend_cls = AscendDSAAttnBackend
 
 
-def _quantize_pooled_indexer_query(
+def _quantize_pooled_indexer_query_int8(
     query: torch.Tensor,
+    hadamard: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Symmetric INT8 query quantization for pooled-key scoring.
 
-    KPool stores pooled keys without Hadamard rotation, so the query keeps the
-    same basis: one FP16 scale per query token and indexer head.
+    Rotate queries into the same Hadamard basis as the pooled INT8 keys
+    before quantization, with one FP16 scale per query token and indexer head.
     """
     from sgl_kernel_npu.operators.activation import dynamic_quant
 
-    quantized, scale = dynamic_quant(query, dst_type=torch.int8)
+    rotated = query @ hadamard
+    quantized, scale = dynamic_quant(rotated, dst_type=torch.int8)
     # The padded sentinel row is all zero and must still carry a positive
     # dequantization scale for the INT8 operator contract.
     scale = torch.where(scale > 0, scale, torch.ones_like(scale))
@@ -378,9 +380,8 @@ def _quantize_pooled_indexer_query_mxfp8(
 
 
 def _index_k_scale_cache(pool, layer_id: int):
-    """Write-side KPool scale buffer: FP16 per-row scales for INT8, raw E8M0
-    bytes for MXFP8, None for the unquantized BF16 cache."""
-    if pool.indexer_kv_store_int8:
+    """FP32/FP16 per-row scales for FP8/INT8, raw E8M0 bytes for MXFP8."""
+    if pool.dsa_kv_cache_store_fp8 or pool.indexer_kv_store_int8:
         return pool.get_index_k_scale_buffer(layer_id)
     if pool.indexer_kv_store_mxfp8:
         return pool.get_index_k_scale_buffer(layer_id).view(torch.uint8)
@@ -422,65 +423,54 @@ def _get_topk_npu(
     pool = get_token_to_kv_pool()
     kv = pool.layer_router.read(layer_id)
     pool, layer_id = kv.view, kv.view_layer_id
-    if pool.indexer_kv_store_int8:
-        query_safe, query_descale = _quantize_pooled_indexer_query(query_safe)
-        indices, _ = pool_key_indexer(
-            query=query_safe,
-            pool_key=pool.get_index_k_buffer(layer_id),
-            weights=weights_safe.to(torch.float16),
-            pool_tail_k=tail_lens_safe,
-            actual_seq_q=query_ends_safe,
-            actual_seq_k=pool_lens_safe,
-            block_table=page_table_safe,
-            layout_q="TND",
-            layout_k="PA_BBND",
-            topk=index_topk,
-            pool_size=index_kpool,
-            mask_mode=3,
-            quant_mode=2,
-            return_value=False,
+    indexer_kwargs = dict(quant_mode=-1)  # unquant BF16
+    weights_dtype = torch.bfloat16
+    if pool.dsa_kv_cache_store_fp8:
+        from sglang.srt.layers.attention.dsa.dsa_npu_indexer import (
+            _quantize_npu_indexer_activation,
+        )
+
+        query_safe, query_descale = _quantize_npu_indexer_activation(
+            query_safe, pool.indexer_hadamard_128, torch.float8_e4m3fn, torch.float32
+        )
+        indexer_kwargs.update(
+            quant_mode=0,  # FP8 per-token-head quant
+            q_descale=query_descale,
+            k_descale=pool.get_index_k_scale_buffer(layer_id),
+        )
+    elif pool.indexer_kv_store_int8:
+        query_safe, query_descale = _quantize_pooled_indexer_query_int8(
+            query_safe, pool.indexer_hadamard_128
+        )
+        weights_dtype = torch.float16
+        indexer_kwargs.update(
+            quant_mode=2,  # INT8 quant
             q_descale=query_descale,
             k_descale=pool.get_index_k_scale_buffer(layer_id),
         )
     elif pool.indexer_kv_store_mxfp8:
         query_safe, query_descale = _quantize_pooled_indexer_query_mxfp8(query_safe)
-        indices, _ = pool_key_indexer(
-            query=query_safe,
-            pool_key=pool.get_index_k_buffer(layer_id),
-            # quant_mode=1 accepts BF16; cast FP32->BF16 directly.
-            weights=weights_safe.to(torch.bfloat16),
-            pool_tail_k=tail_lens_safe,
-            actual_seq_q=query_ends_safe,
-            actual_seq_k=pool_lens_safe,
-            block_table=page_table_safe,
-            layout_q="TND",
-            layout_k="PA_BBND",
-            topk=index_topk,
-            pool_size=index_kpool,
-            mask_mode=3,
-            quant_mode=1,
-            return_value=False,
+        indexer_kwargs.update(
+            quant_mode=1,  # MXFP8 quant
             q_descale=query_descale,
             k_descale=pool.get_index_k_scale_buffer(layer_id),
         )
-    else:
-        indices, _ = pool_key_indexer(
-            query=query_safe,
-            pool_key=pool.get_index_k_buffer(layer_id),
-            # quant_mode=-1: weights must match query/pool_key (BF16 cache).
-            weights=weights_safe.to(torch.bfloat16),
-            pool_tail_k=tail_lens_safe,
-            actual_seq_q=query_ends_safe,
-            actual_seq_k=pool_lens_safe,
-            block_table=page_table_safe,
-            layout_q="TND",
-            layout_k="PA_BBND",
-            topk=index_topk,
-            pool_size=index_kpool,
-            mask_mode=3,
-            quant_mode=-1,
-            return_value=False,
-        )
+    indices, _ = pool_key_indexer(
+        query=query_safe,
+        pool_key=pool.get_index_k_buffer(layer_id),
+        weights=weights_safe.to(weights_dtype),
+        pool_tail_k=tail_lens_safe,
+        actual_seq_q=query_ends_safe,
+        actual_seq_k=pool_lens_safe,
+        block_table=page_table_safe,
+        layout_q="TND",
+        layout_k="PA_BBND",
+        topk=index_topk,
+        pool_size=index_kpool,
+        mask_mode=3,
+        return_value=False,
+        **indexer_kwargs,
+    )
     return pack_pool_key_indexer_indices(
         indices=indices[: query.shape[0]],
         positions=positions,
@@ -625,7 +615,7 @@ def _compress_write_extend_npu(
     plan = metadata.attn_metadata.kpool_extend_plan
     assert plan is not None, "NPU DSA extend requires kpool_extend_plan"
 
-    # Tail rings stay BF16, so tail updates cannot reuse the GPU FP8 path.
+    # Tail rings stay BF16 in quantized mode
     writes, tails = plan.writes, plan.tails
     if not writes.is_empty:
         kpool_assemble_softmax_rotate_write_cache(
