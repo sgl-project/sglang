@@ -182,7 +182,9 @@ class OpenAIServingClassify(OpenAIServingBase):
 
         for i, item in enumerate(ret):
             embedding = item.get("embedding", [])
-            labels = [] if is_multi_label else None
+            label = [] if is_multi_label else "Default"
+            probs = [1.0]
+            num_classes = 1
             # Single-score model heads may return scalars, including 0.0.
             if isinstance(embedding, (int, float)):
                 embedding = [embedding]
@@ -194,41 +196,41 @@ class OpenAIServingClassify(OpenAIServingBase):
             if embedding:
                 try:
                     embedding_tensor = torch.tensor(embedding, dtype=torch.float32)
-                    if embedding_tensor.ndim not in (1, 2):
+                    if (
+                        embedding_tensor.ndim not in (1, 2)
+                        or not embedding_tensor.shape[-1]
+                    ):
                         raise ValueError(
-                            "Expected sequence logits [classes] or token logits "
+                            "Expected nonempty sequence logits [classes] or token logits "
                             "[tokens, classes]"
                         )
-                    probs = self.activation(embedding_tensor).tolist()
-
-                    predicted_class = torch.argmax(embedding_tensor, dim=-1)
-                    if embedding_tensor.ndim == 1:
-                        label = self.id2label[predicted_class.item()]
-                        if is_multi_label:
-                            labels = self._get_positive_labels(probs, threshold)
-                    else:
-                        label = [self.id2label[c] for c in predicted_class.tolist()]
-                        if is_multi_label:
-                            labels = [
+                    scores = self.activation(embedding_tensor).tolist()
+                    per_token = embedding_tensor.ndim == 2
+                    if is_multi_label:
+                        label = (
+                            [
                                 self._get_positive_labels(row, threshold)
-                                for row in probs
+                                for row in scores
                             ]
+                            if per_token
+                            else self._get_positive_labels(scores, threshold)
+                        )
+                    else:
+                        top_classes = torch.argmax(embedding_tensor, dim=-1).tolist()
+                        label = (
+                            [self.id2label[class_id] for class_id in top_classes]
+                            if per_token
+                            else self.id2label[top_classes]
+                        )
+                    probs = scores
                     num_classes = embedding_tensor.shape[-1]
 
                 except Exception as e:
                     logger.error(f"Error processing embedding for item {i}: {e}")
-                    probs = [1.0]
-                    label = "Default"
-                    num_classes = 1
-            else:
-                probs = [1.0]
-                label = "Default"
-                num_classes = 1
 
             classify_obj = {
                 "index": i,
                 "label": label,
-                "labels": labels,
                 "probs": probs,
                 "num_classes": num_classes,
             }

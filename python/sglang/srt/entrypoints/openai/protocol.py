@@ -1602,26 +1602,22 @@ class ClassifyRequest(BaseModel):
 
 class ClassifyData(BaseModel):
     index: int
-    label: Union[str, List[str]]
+    label: Union[str, List[str], List[List[str]]]
     probs: Union[List[float], List[List[float]]]
     num_classes: int
-    labels: Optional[Union[List[str], List[List[str]]]] = None
 
     @model_validator(mode="after")
     def _validate_result_shape(self) -> ClassifyData:
-        per_token = isinstance(self.label, list)
-        if self.probs and isinstance(self.probs[0], list) != per_token:
-            raise ValueError("probs must match the sequence or token shape of label")
-        if self.labels and isinstance(self.labels[0], list) != per_token:
-            raise ValueError("labels must match the sequence or token shape of label")
+        if self.probs and isinstance(self.probs[0], list):
+            if not isinstance(self.label, list) or len(self.label) != len(self.probs):
+                raise ValueError("token results need one label entry per score row")
+        elif (
+            isinstance(self.label, list)
+            and self.label
+            and isinstance(self.label[0], list)
+        ):
+            raise ValueError("nested labels require per-token score rows")
         return self
-
-    @model_serializer(mode="wrap")
-    def _serialize(self, handler):
-        data = handler(self)
-        if self.labels is None:
-            data.pop("labels", None)
-        return data
 
 
 class ClassifyResponse(BaseModel):
