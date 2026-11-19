@@ -3,7 +3,7 @@
 
 Run from the repository root, passing the native FL2VA/transformer directory:
     PYTHONPATH=python torchrun --standalone --nproc-per-node=2 \
-        python/sglang/multimodal_gen/test/unit/manual/check_minimax_h3_tp_loading.py \
+        test/manual/multimodal_gen/check_minimax_h3_tp_loading.py \
         --transformer /path/to/FL2VA/transformer
 
 Both models remain resident for torch.equal on every parameter and buffer.
