@@ -4124,7 +4124,10 @@ class RunaiModelStreamerLoader(BaseModelLoader):
             )
 
         weights_iterator = runai_safetensors_weights_iterator(
-            hf_weights_files, self._is_distributed, self.target_device_str
+            hf_weights_files,
+            self._is_distributed,
+            self.target_device_str,
+            load_group=self.load_config.load_group,
         )
 
         if self.load_config.draft_model_idx is not None:
@@ -4322,13 +4325,14 @@ def get_model_loader(
         return RunaiModelStreamerLoader(load_config)
 
     if load_config.load_format == LoadFormat.IPC_CACHE:
-        from sglang.srt.weight_cache.ipc_loader import IpcModelLoader
+        from sglang.srt.weight_cache.ipc_loader import WeightCacheModelLoader
 
-        return IpcModelLoader(
+        return WeightCacheModelLoader(
             load_config=load_config,
             socket_path=load_config.weight_cache_socket,
             weight_cache_mode=load_config.weight_cache_mode,
             fallback_load_format=load_config.fallback_load_format,
+            weight_cache_transport=load_config.weight_cache_transport,
         )
 
     return DefaultModelLoader(load_config)

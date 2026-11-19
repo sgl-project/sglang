@@ -190,6 +190,18 @@ class TestUnifiedMemorySpecGate(CustomTestCase):
                             algorithm is None or (is_cuda and algorithm == "DFLASH"),
                         )
 
+    def test_pd_speculative_decoding_over_nixl_is_refused(self):
+        """NIXL unified-memory PD refuses a DFLASH draft that Mooncake admits."""
+        fields = dict(
+            draft_backend="trtllm_mha",
+            disaggregation_mode="prefill",
+            disaggregation_transfer_backend="nixl",
+            pp_size=1,
+        )
+        with override_platform(is_cuda=True):
+            self.assertTrue(_accepts(None, **fields))
+            self.assertFalse(_accepts("DFLASH", **fields))
+
     def test_buffer_only_hicache_refused_under_pipeline_parallelism(self):
         """Unified memory with more than one pipeline stage refuses buffer_only
         HiCache; one stage, or cache mode, is accepted."""
@@ -216,6 +228,48 @@ class TestUnifiedMemorySpecGate(CustomTestCase):
                 enable_session_radix_cache=False,
             )
         )
+
+
+class TestUnifiedMemoryPDBackends(CustomTestCase):
+    def test_nixl_requires_nvidia_cuda_and_ucx(self):
+        for is_cuda, backend in ((True, "UCX"), (False, "UCX"), (True, "LIBFABRIC")):
+            with (
+                self.subTest(is_cuda=is_cuda, backend=backend),
+                patch(
+                    "sglang.srt.arg_groups.kv_cache_hook.get_platform",
+                    return_value=SimpleNamespace(is_cuda=is_cuda),
+                ),
+                patch(
+                    "sglang.srt.arg_groups.kv_cache_hook.envs.SGLANG_DISAGGREGATION_NIXL_BACKEND.get",
+                    return_value=backend,
+                ),
+            ):
+                self.assertEqual(
+                    _accepts(
+                        None,
+                        device="cuda",
+                        disaggregation_mode="prefill",
+                        disaggregation_transfer_backend="nixl",
+                    ),
+                    is_cuda and backend == "UCX",
+                )
+
+    def test_nixl_and_mooncake_keep_the_same_pd_restrictions(self):
+        for backend in ("nixl", "mooncake"):
+            fields = dict(
+                disaggregation_mode="prefill", disaggregation_transfer_backend=backend
+            )
+            with (
+                self.subTest(backend=backend),
+                patch(
+                    "sglang.srt.arg_groups.kv_cache_hook.get_platform",
+                    return_value=SimpleNamespace(is_cuda=True),
+                ),
+            ):
+                self.assertTrue(_accepts(None, **fields))
+                self.assertFalse(_accepts("EAGLE", **fields))
+                self.assertFalse(_accepts(None, pp_size=2, **fields))
+                self.assertFalse(_accepts(None, dcp_size=2, **fields))
 
 
 if __name__ == "__main__":
