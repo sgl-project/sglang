@@ -34,6 +34,9 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config i
     is_nunchaku_available,
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import RotaryEmbedding
+from sglang.multimodal_gen.runtime.managers.forward_context import (
+    request_allows_lossless,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
@@ -392,9 +395,15 @@ class ZImageAttention(nn.Module):
             )
 
         # The batched 3D table (the one with positions) may take the fused
-        # QKNorm+RoPE kernels anywhere; a 2D table reaches them on CUDA and ROCm,
-        # and gets qk-norm, then the class, on the other platforms.
-        rope_in_qk_norm = _is_cuda or _is_rocm or rope_positions is not None
+        # QKNorm+RoPE kernels anywhere; a 2D table reaches them on CUDA, and on
+        # ROCm for requests that allow lossless fusions, since the fused kernel
+        # changes the rounding of the ROCm split path. Other cases get qk-norm,
+        # then the class.
+        rope_in_qk_norm = (
+            _is_cuda
+            or (_is_rocm and request_allows_lossless())
+            or rope_positions is not None
+        )
         if self.qk_norm and fused_qk is None and rope_in_qk_norm:
             q, k = apply_qk_norm_with_optional_rope(
                 q=q.contiguous(),

@@ -101,6 +101,11 @@ class TestZImageRopeRouting(CustomTestCase):
         sp_group = patch.object(parallel_state, "_SP", SINGLE_RANK_SP_GROUP)
         sp_group.start()
         self.addCleanup(sp_group.stop)
+        lossless = patch.object(
+            zimage_module, "request_allows_lossless", return_value=True
+        )
+        self.allows_lossless = lossless.start()
+        self.addCleanup(lossless.stop)
         self.attention = _build_attention()
         self.cos_sin_cache, self.freqs_complex = _rope_tables()
         self.hidden_states = torch.randn(
@@ -118,7 +123,14 @@ class TestZImageRopeRouting(CustomTestCase):
         return self.attention.attn.query, self.attention.attn.key
 
     def test_rocm_folds_a_2d_table_into_the_qk_norm_call(self):
-        for is_rocm, folded in ((False, False), (True, True)):
+        """ROCm folds a 2D table for lossless requests; an exact request keeps
+        the split path, because the fused kernel moves the rounding."""
+        for is_rocm, allows_lossless, folded in (
+            (False, True, False),
+            (True, True, True),
+            (True, False, False),
+        ):
+            self.allows_lossless.return_value = allows_lossless
             with (
                 patch.object(zimage_module, "_is_rocm", is_rocm),
                 patch.object(
