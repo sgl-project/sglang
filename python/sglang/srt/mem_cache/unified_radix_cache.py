@@ -62,7 +62,6 @@ from sglang.srt.mem_cache.buffer_mode.storage_existence_cache import (
     StorageExistenceCache,
     default_belief_policy,
 )
-from sglang.srt.mem_cache.cache_residency import CacheResidency
 from sglang.srt.mem_cache.capacity import owner_rows_ready
 from sglang.srt.mem_cache.common import RetractionBackup
 from sglang.srt.mem_cache.hicache_storage import (
@@ -137,7 +136,6 @@ from sglang.srt.runtime_context import (
 from sglang.srt.session.streaming_session import StreamingSession, is_virtual_node
 from sglang.srt.utils.common import ceil_align
 from sglang.srt.utils.device import get_device_module
-from sglang.srt.utils.log_utils import print_info_once
 from sglang.srt.utils.poll_timer import PollTimer
 
 if TYPE_CHECKING:
@@ -221,8 +219,6 @@ class _OngoingPrefetch(NamedTuple):
 
 
 class UnifiedRadixCache(BasePrefixCache):
-    # Opt-in residency switch (cache_residency.py); init_hicache sets it.
-    _residency: Optional[CacheResidency] = None
     # Unlimited-OCR v2 split-document KV reuse; None for every other model.
     uocr_doc_reuse: Optional[DocReuse] = None
     # Whether eviction walks every component in one joint LRU order; set from the
@@ -290,6 +286,9 @@ class UnifiedRadixCache(BasePrefixCache):
             )
         # Whether a slot keeps a prefix's recurrent state checkpoints.
         self.is_mamba_enabled = TREE_STATE in families
+        # The tree holds no Mamba state; the cache only frees each request's own slot.
+        self.request_mamba_only = params.request_mamba_only
+        assert not (self.request_mamba_only and self.is_mamba_enabled)
         # Whether the mamba extra (ping-pong) buffer is enabled.
         self.enable_mamba_extra_buffer = (
             params.enable_mamba_extra_buffer if self.is_mamba_enabled else False
@@ -512,8 +511,6 @@ class UnifiedRadixCache(BasePrefixCache):
         # Reset Controller.
         self.session.slots.clear()
         self.ongoing_write_through: dict[int, _OngoingWriteThrough] = {}
-        # Write acks processed before their copies landed, for the duration metric.
-        self._unlanded_write_acks: list[HiCacheAck] = []
         self.ongoing_load_back: dict[
             int, _OngoingLoadBack | list[_OngoingLoadBack]
         ] = {}
@@ -659,9 +656,6 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
         self.load_back_threshold = 10
         self.prefetch_stop_policy = get_memory().hicache_storage_prefetch_policy
-        self._residency = CacheResidency(
-            tree_core=self.tree_core, is_write_back=self.is_write_back
-        )
 
         # Runtime attach/detach of the L3 backend (startup, admin API, atexit).
         atexit.register(self.shutdown)
@@ -701,12 +695,6 @@ class UnifiedRadixCache(BasePrefixCache):
         ],
     )
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
-        if (
-            self._residency is not None
-            and self._residency.subagents is not None
-            and params.req is not None
-        ):
-            self._residency.subagents.on_admit(params.req)
         result = self.session.try_match_prefix(params)
         if result is not None:
             return result
@@ -799,16 +787,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
     @rank_consensus(same_params=True, same_results=True)
     def evict(self, params: EvictParams) -> EvictResult:
-        if params.mamba_num > 0:
-            self._reap_parked_mamba_slots()
         return self._evict(params)
-
-    def _reap_parked_mamba_slots(self) -> None:
-        # Host-only checkpoints need the HiCache controller; without it nothing parks.
-        if self.cache_controller is not None and self._mamba_host_only_checkpoint():
-            # Host-only keeps no device Mamba state in the tree, so the slots a finished
-            # request parked (its checkpoint still copying to host) are the only reclaim.
-            self.components[ComponentType.MAMBA].reap_parked_slots(force=True)
 
     @rank_consensus(same_params=True, same_results=True)
     def evict_for_alloc(self, demand: KVDemand) -> EvictResult:
@@ -823,8 +802,6 @@ class UnifiedRadixCache(BasePrefixCache):
         """
         if self.disable:
             return EvictResult()
-        if demand.state_slots > 0:
-            self._reap_parked_mamba_slots()
         return super().evict_for_alloc(demand)
 
     def reclaim_jointly(
@@ -1085,8 +1062,6 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # Report full-layer tokens only
         self.update_eviction_metrics(tracker[BASE_COMPONENT_TYPE], start_time)
-        if self._residency is not None:
-            self._residency.maybe_log()
         return EvictResult(
             num_tokens_evicted=tracker[BASE_COMPONENT_TYPE],
             mamba_num_evicted=tracker.get(self.slot_id(TREE_STATE), 0),
@@ -1372,61 +1347,13 @@ class UnifiedRadixCache(BasePrefixCache):
     def _demote_backed_up(
         self, node_ids: list[NodeId], tracker: dict[ComponentType, int]
     ) -> None:
-        """Wait once for the queued copies, on the host or (ordered demotion) on
-        the GPU, then demote the nodes in order."""
+        """Wait once for the queued copies, then demote the nodes in order."""
         if not node_ids:
             return
-        if self._write_back_demote_ordered():
-            self._order_write_backs_before_reuse()
-        else:
-            self.writing_check(write_back=True)
+        self.writing_check(write_back=True)
         for node_id in node_ids:
             self._demote(node_id, tracker)
         node_ids.clear()
-
-    def _write_back_demote_ordered(self) -> bool:
-        cc = self.cache_controller
-        # A storage backend reads host copies on the host, and a unified pool's row
-        # moves are not ordered behind the copies: both keep the host wait.
-        return (
-            envs.SGLANG_OPT_HICACHE_WRITE_BACK_ORDERED_DEMOTE.get()
-            and cc is not None
-            and not cc.enable_storage
-            and cc.kv_storage is None
-        )
-
-    def _order_write_backs_before_reuse(self) -> None:
-        """writing_check(write_back=True) with the host wait replaced by stream
-        waits. A demoted page is next written by the forward (target or draft, on
-        the fence stream), by scheduling work or a load on the current stream, or
-        by a load on the engine's host-to-device stream, which also reads host
-        copies; every other stream that touches pool pages branches from these."""
-        cc = self.cache_controller
-        cc.start_writing()
-        if cc.ack_write_queue:
-            # The copies run in order on the engine's device-to-host stream.
-            landed = cc.ack_write_queue[-1].finish_event
-            streams = [device_module.current_stream()]
-            for stream in (
-                cc.write_fence_stream,
-                cc.load_fence_stream,
-                cc.l2_transfer_engine.host_to_device_stream,
-            ):
-                if stream is not None and stream not in streams:
-                    streams.append(stream)
-            for stream in streams:
-                stream.wait_event(landed)
-        for ack in cc.ack_write_queue:
-            for ack_id in ack.node_ids:
-                if ack_id in self.ongoing_write_through:
-                    self._finish_write_through_ack(ack_id)
-            self._log_write_ack_metrics(ack, landed=False)
-        cc.ack_write_queue.clear()
-        assert len(self.ongoing_write_through) == 0
-        print_info_once(
-            "HiCache write-back demotion ordered on the GPU, no host wait "
-            "(SGLANG_OPT_HICACHE_WRITE_BACK_ORDERED_DEMOTE)"
-        )
 
     def _evict_by_joint_lru(
         self,
@@ -1643,12 +1570,15 @@ class UnifiedRadixCache(BasePrefixCache):
 
     @rank_consensus(same_params=["req.rid", "checkpointed"])
     def on_release(self, req: Req, *, checkpointed: bool) -> None:
-        if self._residency is not None and self._residency.subagents is not None:
-            self._residency.subagents.on_release(req)
         if checkpointed:
             return
         for comp in self._components_tuple:
             comp.cleanup_after_caching_req(req, is_finished=True)
+        self._release_request_mamba(req)
+
+    def _release_request_mamba(self, req: Req) -> None:
+        if self.request_mamba_only and req.kv.holds_mamba:
+            self.token_to_kv_pool_allocator.state.release(self.req_to_token_pool, req)
 
     @rank_consensus(same_params=["req.rid", "up_to"])
     def checkpoint(self, req: Req, *, up_to: int, **kwargs) -> None:
@@ -1674,6 +1604,12 @@ class UnifiedRadixCache(BasePrefixCache):
     def checkpoint_into_tree(self, req: Req, *, up_to: int, **kwargs) -> None:
         """Insert ``[cache_protected_len, up_to)`` of the request's record and
         move its tree lock onto the node the insert ended on."""
+        is_finished = req.finished()
+        self._checkpoint_into_tree(req, up_to=up_to, **kwargs)
+        if is_finished:
+            self._release_request_mamba(req)
+
+    def _checkpoint_into_tree(self, req: Req, *, up_to: int, **kwargs) -> None:
         # A finished request hands its component state (mamba) to the tree
         # instead of forking it, and the tree frees what the request still held.
         is_finished = req.finished()
@@ -1858,6 +1794,16 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.session_refs.register_session_ref(
                     req, leaf=result.last_device_node
                 )
+
+        # After the last prefill chunk, decode retires the request's own window, so
+        # the rest of the forward must enter the tree now to keep a window at its end.
+        if (
+            not is_finished
+            and result.swa_branch_inserted
+            and effective_cache_len < len(token_ids)
+            and up_to >= len(req.origin_input_ids)
+        ):
+            self.checkpoint_into_tree(req, up_to=up_to, **kwargs)
 
     @rank_consensus(same_params=["req.rid"])
     def advance_unpublished_req(self, req: Req) -> None:
@@ -4387,9 +4333,8 @@ class UnifiedRadixCache(BasePrefixCache):
             self._log_write_ack_metrics(ack)
             finish_count -= 1
 
-    def _log_write_ack_metrics(self, ack: HiCacheAck, landed: bool = True) -> None:
-        """Record D->H backup volume and duration for a write ack; the duration
-        of a copy not yet ``landed`` is recorded at a later ack once it has."""
+    def _log_write_ack_metrics(self, ack: HiCacheAck) -> None:
+        """Record D->H backup volume and duration for a completed write ack."""
         if self.metrics_collector is None:
             return
         for pool, num_tokens in (ack.num_tokens_by_pool or {}).items():
@@ -4399,15 +4344,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
         if ack.num_bytes > 0:
             self.metrics_collector.increment_backup_num_bytes(ack.num_bytes)
-        if ack.timing_enabled and not landed:
-            self._unlanded_write_acks.append(ack)
-        elif ack.timing_enabled:
+        if ack.timing_enabled:
             duration_ms = ack.start_event.elapsed_time(ack.finish_event)
-            self.metrics_collector.observe_backup_duration(duration_ms / 1000.0)
-        pending = self._unlanded_write_acks
-        while pending and pending[0].finish_event.query():
-            done = pending.pop(0)
-            duration_ms = done.start_event.elapsed_time(done.finish_event)
             self.metrics_collector.observe_backup_duration(duration_ms / 1000.0)
 
     def loading_check(self, finish_count: Optional[int] = None) -> None:
@@ -4433,8 +4371,6 @@ class UnifiedRadixCache(BasePrefixCache):
                 "write_back duplicate-reclaim victims diverged across TP ranks"
             )
 
-        if self._mamba_host_only_checkpoint():
-            self.components[ComponentType.MAMBA].reap_parked_slots()
         while finish_count > 0:
             ack = cc.ack_load_queue.pop(0)
             ack.finish_event.synchronize()
@@ -4512,18 +4448,9 @@ class UnifiedRadixCache(BasePrefixCache):
             # ongoing_load_back is keyed by anchor. A host-only mamba
             # checkpoint stays off the device after its load, so another
             # request can reach this anchor before the first H->D is acked.
-            # A state-only fetch may go beside it: the H->D fills the request's
-            # own slot, and its forward waits on that later load, which the
-            # load stream orders after the anchor's.
             if (
                 self._mamba_host_only_checkpoint()
                 and best_match_node_id in self.ongoing_load_back
-                and not (
-                    envs.SGLANG_OPT_MAMBA_HOST_ONLY_CONCURRENT_FETCH.get()
-                    and params.host_hit_length == 0
-                    and not any(req.window_host_hit_lengths.values())
-                    and not self.tree_core.is_full_device_evicted(best_match_node_id)
-                )
             ):
                 return None
             if self.load_back(best_match_node_id, mem_quota, req=req):
@@ -4849,7 +4776,8 @@ class UnifiedRadixCache(BasePrefixCache):
         )
 
     def supports_mamba(self) -> bool:
-        return self.is_mamba_enabled
+        # A request-only cache still owns the requests' Mamba slot lifecycle.
+        return self.is_mamba_enabled or self.request_mamba_only
 
     # ---- Session radix cache API (delegates to composed UnifiedSessionRefTracker) ----
 
@@ -4919,14 +4847,9 @@ class UnifiedRadixCache(BasePrefixCache):
         )
 
     def mamba_protected_size(self) -> int:
-        size = self.tree_core.mamba_protected_size() + (
+        return self.tree_core.mamba_protected_size() + (
             self.linker.prefetch_size(PoolName.MAMBA) if self.linker is not None else 0
         )
-        if self._mamba_host_only_checkpoint():
-            # Parked slots (a finished request's checkpoint still copying to host)
-            # are neither free, evictable nor held by a request.
-            size += self.components[ComponentType.MAMBA].parked_slot_count()
-        return size
 
     def total_size(self) -> tuple[int, int]:
         return self.tree_core.total_size()
@@ -4935,6 +4858,8 @@ class UnifiedRadixCache(BasePrefixCache):
         return self.tree_core.all_values_flatten()
 
     def all_mamba_values_flatten(self) -> torch.Tensor:
+        if not self.is_mamba_enabled:
+            return torch.empty((0,), dtype=torch.int64)
         return self.tree_core.all_mamba_values_flatten()
 
     def available_and_evictable_str(self) -> str:

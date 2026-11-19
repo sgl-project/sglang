@@ -52,6 +52,8 @@ def _fused_qk_rmsnorm_rope_gate_kernel(
     WEIGHT_SHIFT: tl.constexpr = 1.0,
     EXPLICIT_ROPE_FMA: tl.constexpr = False,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     token = tl.program_id(0)
     head = tl.program_id(1)
     is_k = head >= NUM_Q_HEADS
@@ -187,6 +189,8 @@ def fused_qk_gemma_rmsnorm_rope_gate(
     rot_half_block = triton.next_power_of_2(half_rotary)
 
     grid = (T, num_q_heads + num_kv_heads)
+    use_pdl = current_arch().supports_pdl
+    pdl_kwargs = {"launch_pdl": True} if use_pdl else {}
     _fused_qk_rmsnorm_rope_gate_kernel[grid](
         q_gate,
         k,
@@ -217,7 +221,8 @@ def fused_qk_gemma_rmsnorm_rope_gate(
         HAS_PASS=rotary_dim < head_dim,
         HAS_GATE=has_gate,
         MROPE=mrope,
-        ENABLE_PDL=current_arch().supports_pdl,
+        ENABLE_PDL=use_pdl,
+        **pdl_kwargs,
     )
 
     return q_out, k_out, gate_out if has_gate else None

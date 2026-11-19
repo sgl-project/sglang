@@ -16,6 +16,8 @@ from types import SimpleNamespace
 from typing import Optional
 from unittest.mock import Mock, patch
 
+from transformers import PretrainedConfig
+
 from sglang.srt.arg_groups import model_override_base as base_module
 from sglang.srt.arg_groups import overrides as overrides_module
 from sglang.srt.arg_groups.arg_utils import A, Arg, resolvable_fields
@@ -136,9 +138,13 @@ class TestBoundaryParallelismResolution(CustomTestCase):
                     enable_prefill_cp=prefill,
                     cp_strategy="interleave" if prefill else None,
                 )
+                hf_config = PretrainedConfig(
+                    architectures=["TestModel"], model_type=model_type
+                )
                 model = SimpleNamespace(
-                    hf_config=SimpleNamespace(architectures=["TestModel"]),
-                    hf_text_config=SimpleNamespace(model_type=model_type),
+                    hf_config=hf_config,
+                    hf_text_config=hf_config,
+                    linear_attn_registry_result=None,
                 )
                 with (
                     patch("sglang.srt.arg_groups.parallel_hook.run_hook"),
@@ -192,7 +198,6 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "quantization",
                     "dp_size",
                     "attn_dp_size",
-                    "enable_dp_attention",
                     "enable_attn_tp_input_scattered",
                     "enable_dp_lm_head",
                     "enable_tp_lm_head_all_to_all",
@@ -206,6 +211,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "disable_overlap_schedule",
                     "disable_radix_cache",
                     "uses_mamba_radix_cache",
+                    "decode_state_free_radix_default",
                     "mamba_radix_cache_strategy",
                     "mamba_full_memory_ratio",
                     "ple_offload_embedding",
@@ -251,6 +257,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "mm_preprocess_cache_size_mb",
                     "mm_feature_transport",
                     "mm_enable_dp_encoder",
+                    "enable_flashmla_prefill_token_packing",
                 }
             ),
         )
@@ -4354,8 +4361,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                             {
                                 "attention_backend": "dsa",
                                 "page_size": 64,
-                                "attn_dp_size": 1,
-                                "dp_size": 1,
                                 "moe_dense_tp_size": 1,
                                 "moe_a2a_backend": "deepep",
                                 "ep_size": 8,
@@ -4386,11 +4391,22 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                                 ),
                                 None,
                             )
-                            self.assertEqual(result["attn_dp_size"], attn_dp_size)
                             self.assertEqual(result["attn_cp_size"], expected_cp)
                             self.assertNotIn("moe_dense_tp_size", result)
                             self.assertNotIn("ep_size", result)
                             self.assertNotIn("moe_a2a_backend", result)
+                        # --dp-size N no longer means attention DP here.
+                        with self.assertRaisesRegex(ValueError, "use --attn-dp-size 2"):
+                            _deepseek_family_overrides(
+                                _args(
+                                    enable_prefill_cp=True,
+                                    cp_strategy="interleave",
+                                    tp_size=8,
+                                    dp_size=2,
+                                    attn_dp_size=1,
+                                ),
+                                None,
+                            )
 
         # MLA path on sm100: trtllm_mla fill (all three backends unset)
         with patch(
@@ -4661,6 +4677,37 @@ class TestQwen3VLHopperServingOverrides(CustomTestCase):
         self.assertEqual(updates, {})
         self.assertEqual(envs.SGLANG_VLM_CACHE_SIZE_MB.get(), 512)
         self.assertEqual(envs.SGLANG_MM_FEATURE_CACHE_MB.get(), 2048)
+
+
+class TestLfm3SpeculativeDecoding(CustomTestCase):
+    def test_speculative_decoding_is_rejected(self):
+        from sglang.srt.arg_groups.model_overrides.lfm3 import _lfm3_overrides
+
+        for algorithm in ("EAGLE", "EAGLE3", "NGRAM"):
+            with self.subTest(algorithm=algorithm):
+                args = SimpleNamespace(speculative_algorithm=algorithm)
+                with self.assertRaisesRegex(ValueError, "speculative decoding"):
+                    _lfm3_overrides(args, None)
+
+    def test_dp_attention_is_rejected(self):
+        from sglang.srt.arg_groups.model_overrides.lfm3 import _lfm3_overrides
+
+        args = SimpleNamespace(speculative_algorithm=None, attn_dp_size=2)
+        with self.assertRaisesRegex(ValueError, "DP attention"):
+            _lfm3_overrides(args, None)
+
+    def test_explicit_ragged_flashinfer_prefill_is_rejected(self):
+        from sglang.srt.arg_groups.model_overrides.lfm3 import _lfm3_overrides
+
+        args = SimpleNamespace(
+            speculative_algorithm=None,
+            attn_dp_size=1,
+            attention_backend="flashinfer",
+            prefill_attention_backend=None,
+        )
+        with envs.SGLANG_FLASHINFER_USE_PAGED.override(False):
+            with self.assertRaisesRegex(ValueError, "paged prefill"):
+                _lfm3_overrides(args, None)
 
 
 class TestKimiK31HiSparseDsaBackends(CustomTestCase):

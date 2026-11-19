@@ -12,6 +12,8 @@ Scripts used by [.github/workflows/ci-failure-monitor.yml](../../.github/workflo
 
    All subcommands accept `--dry-run` to print the card JSON instead of posting.
 
+3. **Diffusion Artifact Analyzer** (`ci_failures_analysis_diffusion_npu.py`): Analyzes downloaded test logs and diffusion artifacts, compares failures with coverage recommendations, and writes a Markdown report. It needs no token or extra dependencies and is used by [the NPU diffusion failure monitor](../../.github/workflows/ci-failure-monitor-diffusion-npu.yml).
+
 ## Installation
 
 ```bash
