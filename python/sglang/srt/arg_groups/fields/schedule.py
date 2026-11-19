@@ -276,6 +276,37 @@ class Schedule(msgspec.Struct):
             "5000; defaults to 5000 if unset."
         ),
     ] = None
+    prefill_delayer_mode: A[
+        str,
+        Arg(
+            help=(
+                "'legacy': delay by slot / queue triggers inside the prefill adder. "
+                "'coalesce': negotiate once a pass after the waiting queue is ranked; "
+                "hold prefill for --prefill-decode-interval passes after any DP rank "
+                "prefilled (while decode exists), then until every rank has prefill "
+                "work and the group's pending tokens fill --prefill-delayer-fill-ratio "
+                "of the chunk, bounded by stall / TTFT / KV-pressure releases. "
+                "In coalesce mode the delayer owns --prefill-decode-interval."
+            ),
+            choices=["legacy", "coalesce"],
+        ),
+    ] = "legacy"
+    prefill_delayer_fill_ratio: A[
+        float,
+        "Coalesce mode: release once pending tokens >= ratio x chunk x prefillable ranks.",
+    ] = 0.9
+    prefill_delayer_stall_ticks: A[
+        int,
+        "Coalesce mode: release after this many passes in which the group's prefill work did not grow.",
+    ] = 10
+    prefill_delayer_ttft_ticks: A[
+        int,
+        "Coalesce mode: release after holding a prefill-ready group this many passes.",
+    ] = 200
+    prefill_delayer_kv_high_watermark: A[
+        float,
+        "Coalesce mode: release at once when any prefillable rank's KV usage reaches this.",
+    ] = 0.9
 
     # -------------------------------------------------------------------------
     # Min free slots delay (prefill refill batching)

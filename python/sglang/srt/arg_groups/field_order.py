@@ -574,5 +574,10 @@ POSITIONAL_FIELD_ORDER = (
     "enable_dsa_fp4_indexer",
     "kda_dwdp_size",
     "weight_cache_transport",
+    "prefill_delayer_mode",
+    "prefill_delayer_fill_ratio",
+    "prefill_delayer_stall_ticks",
+    "prefill_delayer_ttft_ticks",
+    "prefill_delayer_kv_high_watermark",
 )
 # fmt: on

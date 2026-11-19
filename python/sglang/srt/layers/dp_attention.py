@@ -866,14 +866,18 @@ def _dp_gather_via_all_gatherv_fp8(
     dequantize back to exact zeros — the MoE-tail invariant is preserved.
     The combine leg (reduce_scatterv) stays bf16: NCCL SUM cannot run on fp8."""
     from sglang.kernels.ops.quantization.fp8_kernel import (
+        _per_token_group_quant_8bit_raw,
         sglang_per_token_group_quant_fp8,
     )
 
     rows = global_tokens.shape[0]
     hidden = global_tokens.shape[-1]
-    q, s = sglang_per_token_group_quant_fp8(
-        local_real.contiguous(), _DP_GATHER_FP8_GROUP
+    # sglang_per_token_group_quant_fp8 ends in a CUDA-only JIT kernel; the triton
+    # one keeps the same row-major fp32 group-128 scales the dequant below reads.
+    quant = (
+        _per_token_group_quant_8bit_raw if _is_hip else sglang_per_token_group_quant_fp8
     )
+    q, s = quant(local_real.contiguous(), _DP_GATHER_FP8_GROUP)
     gq, gs = _get_dp_gather_fp8_bufs(rows, hidden, global_tokens.device)
     tp_group = get_parallel().tp_group
     tp_group.all_gatherv(q.view(torch.uint8), sizes=sizes, output=gq)
