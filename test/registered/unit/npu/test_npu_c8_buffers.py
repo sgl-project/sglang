@@ -82,7 +82,7 @@ class TestC8BufferContracts(CustomTestCase):
         self.addCleanup(scope.restore)
         self.enterContext(get_parallel().override(attn_dcp_rank=0))
 
-    def pool(self, *, packed=True, mixed=False):
+    def pool(self, *, packed=True, mixed=False, indexer_quant_mode=None):
         dtype = torch.int8 if packed else torch.bfloat16
         capability = resolve_kv_capability(
             kv_cache_dtype=dtype, is_arch35=False, soc_name="Ascend910B4"
@@ -99,12 +99,20 @@ class TestC8BufferContracts(CustomTestCase):
             index_head_dim=128,
             kv_cache_dim=656 if packed else None,
             kv_capability=capability,
+            indexer_quant_mode=indexer_quant_mode,
             modelslim_cache_layout=SimpleNamespace(
                 key_dtype=torch.int8, value_dtype=torch.bfloat16
             )
             if mixed
             else None,
         )
+
+    def test_explicit_upstream_indexer_recipe_matches_packed_target_allocation(self):
+        from sglang.srt.mem_cache.kv_cache_dtype import QUANT_MODE_TOKEN_INT8
+
+        pool = self.pool(indexer_quant_mode=QUANT_MODE_TOKEN_INT8)
+        self.assertEqual(pool.index_k_buffer.dtype, torch.int8)
+        self.assertEqual(pool.index_k_scale_buffer.dtype, torch.float16)
 
     def test_packed_pd_descriptors_match_k_and_indexer_storage(self):
         pool = self.pool()
