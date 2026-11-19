@@ -1,13 +1,13 @@
 """The gates that route ROCm MLA through fused RoPE + KV-write kernels.
 
-Two predicates: the gfx95 one that also folds in the q absorb, and the gfx1250
-decode one for fused_qk_rope_cat_and_cache_mla. Every term names a branch the
+Two predicates: the gfx942/gfx95 one that also folds in the q absorb, and the
+gfx1250 decode one for fused_qk_rope_cat_and_cache_mla. Every term names a branch the
 unfused path would otherwise have taken, so the fused path is only equivalent
 where all of them hold. A term quietly dropped would route a shape the kernel
 does not implement, and the wrong answer would look like a plausible one.
 
-The gfx95 caller carries one further term, ``not q_replicate_active``, which
-needs a ForwardBatch to evaluate and so is not part of that predicate.
+The gfx942/gfx95 caller carries one further term, ``not q_replicate_active``,
+which needs a ForwardBatch to evaluate and so is not part of that predicate.
 """
 
 import unittest
@@ -50,13 +50,21 @@ def _attn(**overrides):
     return attn
 
 
+def _can_fuse(attn, is_capture_mode=True):
+    return _CAN_FUSE(attn, is_capture_mode=is_capture_mode)
+
+
 class TestFusedAbsorbGate(CustomTestCase):
     def setUp(self):
         # The first term is the platform, and it short-circuits everything else;
         # patch it so the remaining terms are reachable off gfx95.
-        self._saved = forward_mla_rocm._use_aiter_gfx95
-        forward_mla_rocm._use_aiter_gfx95 = True
-        self.addCleanup(setattr, forward_mla_rocm, "_use_aiter_gfx95", self._saved)
+        self.platform(aiter=True, gfx95=True)
+
+    def platform(self, *, aiter, gfx95):
+        for name, value in (("_use_aiter", aiter), ("_use_aiter_gfx95", gfx95)):
+            patcher = mock.patch.object(forward_mla_rocm, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def test_dcp_turns_it_off(self):
         """DCP decode all-gathers q_nope_out, which this path never produces.
@@ -64,15 +72,25 @@ class TestFusedAbsorbGate(CustomTestCase):
         Without this term the fused branch sets q_nope_out to None and
         all_gather_q_for_mla_decode dereferences it.
         """
-        self.assertFalse(_CAN_FUSE(_attn(dcp_size=2)))
+        self.assertFalse(_can_fuse(_attn(dcp_size=2)))
 
     def test_takes_the_fused_path_when_every_term_holds(self):
-        self.assertTrue(_CAN_FUSE(_attn()))
+        self.assertTrue(_can_fuse(_attn()))
 
-    def test_off_gfx95_nothing_else_is_consulted(self):
-        forward_mla_rocm._use_aiter_gfx95 = False
+    def test_off_rocm_aiter_nothing_else_is_consulted(self):
+        self.platform(aiter=False, gfx95=False)
         # An attn that would otherwise qualify, so only the platform can decide.
-        self.assertFalse(_CAN_FUSE(_attn()))
+        for w_dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+            with self.subTest(w=w_dtype):
+                self.assertFalse(_can_fuse(_attn(w_kc=SimpleNamespace(dtype=w_dtype))))
+
+    def test_gfx942_fuses_only_under_capture(self):
+        """gfx942 absorbs q with the fp8 kernel only under CUDA graph capture,
+        so the fused kernel, which folds in that absorb, is held to the same rule."""
+        self.platform(aiter=True, gfx95=False)
+        fnuz = _attn(w_kc=SimpleNamespace(dtype=torch.float8_e4m3fnuz))
+        self.assertTrue(_can_fuse(fnuz, is_capture_mode=True))
+        self.assertFalse(_can_fuse(fnuz, is_capture_mode=False))
 
     def test_each_term_alone_turns_it_off(self):
         # The kernel absorbs an fp8 weight, needs a rope to fuse, writes the
@@ -86,7 +104,7 @@ class TestFusedAbsorbGate(CustomTestCase):
             ("_skip_rope_for_dsa_tilelang_fused", lambda: False),
         ):
             with self.subTest(term=name):
-                self.assertFalse(_CAN_FUSE(_attn(**{name: broken})))
+                self.assertFalse(_can_fuse(_attn(**{name: broken})))
 
 
 class TestAbsorbBmmConfig(CustomTestCase):
