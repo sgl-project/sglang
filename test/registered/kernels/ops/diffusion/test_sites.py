@@ -17,7 +17,7 @@ the protocol rather than any one model; the real model wrappers live in
 """
 
 import sys
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -466,6 +466,25 @@ def test_fused_linear_gelu_guards_and_lossless_path():
     no_bias = nn.Linear(8, 8, bias=False, device="cuda", dtype=torch.bfloat16)
     assert not linear_gelu.can_use_linear_gelu_static(no_bias)
     assert not linear_gelu.can_use_linear_gelu(good.proj, x.float())
+
+
+@pytest.mark.parametrize(
+    "gcn_arch, epilogue_is_slow",
+    [("gfx1250:sramecc+", True), ("gfx950:sramecc+:xnack-", False), ("gfx942", False)],
+)
+def test_linear_gelu_arch_gate_covers_hip_gfx12(gcn_arch, epilogue_is_slow):
+    """gfx12xx must stay off the epilogue; the other HIP arches must stay on it.
+
+    ``is_sm_at_least`` is NVIDIA-only -- it answers False on every HIP device --
+    so an arch gate written through it alone silently puts gfx1250 back on the
+    slow hipBLASLt GELU epilogue.
+    """
+    from sglang.kernels.arch._hip import HipArch
+
+    arch = HipArch()
+    arch.__dict__["props"] = SimpleNamespace(gcnArchName=gcn_arch)
+    with patch.object(linear_gelu, "current_arch", lambda: arch):
+        assert linear_gelu._vendor_gelu_epilogue_is_slow() is epilogue_is_slow
 
 
 @requires_cuda
