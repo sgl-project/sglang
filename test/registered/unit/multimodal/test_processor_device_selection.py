@@ -10,7 +10,7 @@ import asyncio
 import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, patch
 
 from transformers import BaseImageProcessor, PreTrainedTokenizerFast
 
@@ -115,59 +115,15 @@ class TestFastImageProcessorDevice(CustomTestCase):
         self.assertEqual(self._device(processor, _is_cpu=True), "cpu")
         self.assertEqual(self._device(processor, _is_xpu=True), "xpu")
 
-    def test_npu_glm4v_preprocesses_on_cpu_with_decoding_on_or_off(self):
+    def test_npu_glm4v_preprocesses_on_cpu(self):
         class Glm4vProcessor:
             pass
 
         processor = _make(base_gpu_id=3)
         with patch.multiple(PLACEMENT, _is_cpu=False, _is_xpu=False, _is_npu=True):
-            for enabled in (False, True):
-                with self.subTest(decode=enabled):
-                    processor.gpu_image_decode = enabled
-                    device = processor._fast_image_processor_device(Glm4vProcessor())
-                    self.assertEqual(device, "cpu")
-
-    def test_npu_preserves_current_device_with_decoding_on_or_off(self):
-        hooks = {
-            "qwen_vl_processor": ["npu_apply_qwen_image_preprocess_patch"],
-            "glm46v_processor": ["npu_apply_glm46v_image_preprocess_patch"],
-            "minimax_m3_processor": [
-                "npu_apply_minimax_m3_image_preprocess_patch",
-                "npu_apply_minimax_m3_video_preprocess_patch",
-            ],
-        }
-        modules = {
-            f"sglang.srt.hardware_backend.npu.modules.{name}": SimpleNamespace(
-                **{hook: Mock() for hook in names}
+            self.assertEqual(
+                processor._fast_image_processor_device(Glm4vProcessor()), "cpu"
             )
-            for name, names in hooks.items()
-        }
-        first, second = _make(base_gpu_id=1), _make(base_gpu_id=3)
-        with (
-            patch.dict("sys.modules", modules),
-            patch.multiple(PLACEMENT, _is_cpu=False, _is_xpu=False, _is_npu=True),
-        ):
-            for name in ("Qwen2VLProcessor", "Glm46VProcessor", "MiniMaxVLProcessor"):
-                hf_processor = type(name, (), {})()
-                hf_processor.image_processor = object()
-                hf_processor.video_processor = object()
-                for processor in (first, second):
-                    for enabled in (False, True):
-                        with self.subTest(
-                            name=name,
-                            base_gpu_id=processor.server_args.base_gpu_id,
-                            decode=enabled,
-                        ):
-                            processor.gpu_image_decode = enabled
-                            self.assertEqual(
-                                processor._fast_image_processor_device(hf_processor),
-                                "npu",
-                            )
-        for name, names in hooks.items():
-            for hook in names:
-                getattr(
-                    modules[f"sglang.srt.hardware_backend.npu.modules.{name}"], hook
-                ).assert_called()
 
     def test_platform_respects_cuda_compatibility(self):
         processor = _make(base_gpu_id=3)
@@ -192,32 +148,20 @@ class TestTokenSpaceDevices(CustomTestCase):
         reset_context()
         self.addCleanup(reset_context)
 
-    def test_npu_wrapper_uses_shared_preprocessing_device_policy(self):
-        for name, expected in (
-            ("Glm4vProcessor", "cpu"),
-            ("Qwen2VLProcessor", "npu"),
-            ("Glm46VProcessor", "npu"),
-            ("MiniMaxVLProcessor", "npu"),
+    def test_npu_wrapper_keeps_ordinary_processor_on_npu(self):
+        wrapper = _make_wrapper(base_gpu_id=3)
+        processor = _Processor()
+        processor.image_processor = object.__new__(BaseImageProcessor)
+        wrapper._core = SimpleNamespace(_processor=processor)
+        wrapper._disable_fast_image_processor = False
+        wrapper._rl_on_policy_target = None
+        with (
+            patch.multiple(PLACEMENT, _is_cpu=False, _is_xpu=False, _is_npu=True),
+            patch(
+                "sglang.srt.multimodal.token_space_mm_process.serving_processor.apply_npu_image_preprocess_patches"
+            ),
         ):
-            wrapper = _make_wrapper(base_gpu_id=3)
-            processor = type(name, (), {})()
-            processor.image_processor = object.__new__(BaseImageProcessor)
-            wrapper._core = SimpleNamespace(_processor=processor)
-            wrapper._disable_fast_image_processor = False
-            wrapper._rl_on_policy_target = None
-            with (
-                self.subTest(processor=name),
-                patch.multiple(PLACEMENT, _is_cpu=False, _is_xpu=False, _is_npu=True),
-                patch(
-                    "sglang.srt.multimodal.token_space_mm_process.serving_processor."
-                    "apply_npu_image_preprocess_patches"
-                ) as apply_patches,
-            ):
-                self.assertEqual(wrapper._serving_image_processor_device(), expected)
-                if expected == "npu":
-                    apply_patches.assert_called_once_with(processor)
-                else:
-                    apply_patches.assert_not_called()
+            self.assertEqual(wrapper._serving_image_processor_device(), "npu")
 
     def test_wrapper_fills_the_image_device_unless_pil_decodes(self):
         for use_pil, expected in ((False, "cuda:3"), (True, None)):
