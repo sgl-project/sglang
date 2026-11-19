@@ -269,11 +269,12 @@ class MuseSpark1xFp4Experts(nn.Module):
         """Run expert-owned SP rows and build the BF16 A2A combine payload."""
         if self.use_marlin:
             raise ValueError(
-                "Muse Spark sequence-parallel prefill dispatches the routed "
+                "Muse Spark A2A sequence-parallel prefill dispatches the routed "
                 "experts through the TRT-LLM FP4 MoE runner, which needs a "
                 f"Blackwell (SM100+) device; this device reports SM{self._sm_major}x "
-                "and resolved the Marlin W4A16 backend. Launch without "
-                "sequence-parallel prefill on SM80-SM90."
+                "and resolved the Marlin W4A16 backend. Launch with "
+                "--moe-a2a-backend none, which runs the Marlin experts on the "
+                "all-gathered tokens."
             )
         from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
             FlashInferTrtllmDeferredFinalizeOutput,
