@@ -325,6 +325,9 @@ class UnifiedCacheLinkerWrapper:
         self.inflight_load_rids: list[str] = []
         # Loaded tails stay outside the tree until their forward completes.
         self.private_load_indices: dict[str, torch.Tensor] = {}
+        # Each in-flight load's request and token end. Once the load lands, the
+        # request's inserts skip uploading that prefix back to the store.
+        self.private_load_ends: dict[str, tuple[Req, int]] = {}
         self.inflight_load_index = -1
         # Offloads in flight, each holding a lock on its node until it lands.
         self.pending_offloads: list[_PendingOffload] = []
@@ -713,6 +716,7 @@ class UnifiedCacheLinkerWrapper:
         ):
             req.swa_branching_seqlen = None
         self.private_load_indices[req.rid] = full_transfer.device_indices
+        self.private_load_ends[req.rid] = (req, prefix_len)
         self.inflight_load_rids.append(req.rid)
         return len(full_transfer.device_indices), req.last_node
 
@@ -875,6 +879,12 @@ class UnifiedCacheLinkerWrapper:
         self.cache._all_reduce_attn_groups(landed, torch.distributed.ReduceOp.MIN)
         for rid in rids:
             self.private_load_indices.pop(rid, None)
+            load = self.private_load_ends.pop(rid, None)
+            if landed.item() and load is not None:
+                req, end = load
+                req.linker_offload_skip_prefix_len = max(
+                    req.linker_offload_skip_prefix_len, end
+                )
         if landed.item():
             return []
         logger.error(
@@ -894,6 +904,7 @@ class UnifiedCacheLinkerWrapper:
         self.hit_markers.clear()
         self.inflight_load_rids.clear()
         self.private_load_indices.clear()
+        self.private_load_ends.clear()
         self.inflight_load_index = -1
         for pending in self.pending_offloads:
             self.cache.tree_core.finish_external_linker_offload(
@@ -911,6 +922,7 @@ class UnifiedCacheLinkerWrapper:
         if rid in self.inflight_load_rids and self.cache_linker.cancel_queued_load(rid):
             self.inflight_load_rids.remove(rid)
             self.private_load_indices.pop(rid, None)
+            self.private_load_ends.pop(rid, None)
 
     def close(self) -> None:
         self.cache_linker.close()
