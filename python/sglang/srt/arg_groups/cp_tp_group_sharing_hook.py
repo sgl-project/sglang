@@ -81,22 +81,30 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
         "moe-dp-size > 1": cfg.moe_dp_size > 1,
     }
     if arch == "Qwen4ExpForConditionalGeneration":
+        if cfg.pp_size > 1:
+            if (cfg.pp_size, view.attn_cp_size, cfg.disaggregation_mode) != (
+                4,
+                4,
+                "null",
+            ):
+                raise ValueError(
+                    "Qwen4-Exp CP-TP group sharing with pipeline parallelism "
+                    "requires colocated PP4/CP4."
+                )
+            if (
+                cfg.cuda_graph_config.prefill.backend != Backend.DISABLED
+                or cfg.cuda_graph_config.decode.backend != Backend.DISABLED
+            ):
+                raise ValueError(
+                    "Qwen4-Exp PP4/CP4 requires CUDA graphs disabled "
+                    "for both prefill and decode."
+                )
         unsupported |= {
             # The MoE runs TP experts on rows gathered over the TP group.
             # Waterfill turns on DeepEP and EP after this hook.
             "ep-size > 1": view.ep_size > 1,
             "moe-a2a-backend": view.moe_a2a_backend != "none",
             "enable-waterfill": cfg.enable_waterfill,
-            # Zigzag PP handoffs carry local token rows. Limit this path to
-            # eager colocated inference on the 4-stage / 4-rank test topology.
-            "pp-size > 1 outside eager colocated PP4/CP4": cfg.pp_size > 1
-            and not (
-                cfg.pp_size == 4
-                and view.attn_cp_size == 4
-                and cfg.disaggregation_mode == "null"
-                and cfg.cuda_graph_backend_prefill == "disabled"
-                and cfg.cuda_graph_backend_decode == "disabled"
-            ),
             # Prefill only: a decode node serves plain TP.
             "disaggregation-mode decode": cfg.disaggregation_mode == "decode",
         }

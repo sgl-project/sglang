@@ -918,14 +918,51 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 with self.subTest(mode=mode):
                     self._construct(*qwen4, disaggregation_mode=mode)
 
-            with self.assertRaisesRegex(ValueError, "enable-unified-memory"):
-                self._construct(*qwen4, enable_unified_memory=True)
             with self.assertRaisesRegex(ValueError, "MORI requires --pp-size 1"):
                 self._construct(
                     *qwen4,
                     disaggregation_mode="prefill",
                     disaggregation_transfer_backend="mori",
                     pp_size=2,
+                )
+
+    def test_qwen4_unified_memory_uses_resolved_cuda_graph_settings(self):
+        from sglang.srt.model_executor.cuda_graph_config import Backend
+
+        qwen4 = ("Qwen4ExpForConditionalGeneration", "qwen4_exp")
+        disabled_graph = {
+            "prefill": {"backend": Backend.DISABLED},
+            "decode": {"backend": Backend.DISABLED},
+        }
+        unified_options = {
+            "enable_unified_memory": True,
+            "disable_radix_cache": True,
+            "attention_backend": "triton",
+        }
+        with override_platform(is_cuda=True):
+            for graph_options in (
+                {"disable_cuda_graph": True},
+                {"cuda_graph_config": disabled_graph},
+            ):
+                with self.subTest(graph_options=graph_options):
+                    sa = self._construct(
+                        *qwen4,
+                        **unified_options,
+                        **graph_options,
+                    )
+                    graph_config = self._resolved(sa, "cuda_graph_config")
+                    self.assertEqual(graph_config.prefill.backend, Backend.DISABLED)
+                    self.assertEqual(graph_config.decode.backend, Backend.DISABLED)
+
+            with self.assertRaisesRegex(ValueError, "--disable-radix-cache"):
+                self._construct(*qwen4, enable_unified_memory=True)
+            with self.assertRaisesRegex(ValueError, "requires CUDA graphs disabled"):
+                self._construct(
+                    *qwen4,
+                    cuda_graph_backend_prefill=Backend.DISABLED,
+                    cuda_graph_backend_decode=Backend.DISABLED,
+                    cuda_graph_config={"decode": {"backend": Backend.FULL}},
+                    **unified_options,
                 )
 
     def test_qwen4_ple_file_requires_offload(self):
