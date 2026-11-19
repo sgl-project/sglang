@@ -1837,7 +1837,7 @@ class Envs:
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
     # The DFLASH draft KV ring (speculative/dflash_draft_ring.py); resolved at
     # startup to off where it does not fit.
-    SGLANG_ENABLE_DFLASH_DRAFT_KV_RING = EnvBool(True)
+    SGLANG_ENABLE_DFLASH_DRAFT_KV_RING = EnvBool(False)
     # Disable the compact-slot SWA window lookup for compact MLA drafts.
     SGLANG_DISABLE_DFLASH_COMPACT_SWA_WINDOW = EnvBool(False)
     # Gather DFLASH candidate top-k in one multicast all-gather.
@@ -2174,8 +2174,10 @@ class Envs:
     # Prefill index top-k by the sampled-threshold indexers of kernels/ops/attention/dsa/litetopk_prefill
     # (after LiteTopK, https://arxiv.org/abs/2607.11976) instead of dense logits + top-k, on SM100.
     SGLANG_OPT_USE_PREFILL_LITE_TOPK = EnvBool(False)
+    SGLANG_OPT_DSV41_TRITON_PREFILL_SELECTION = EnvBool(False)
     # Raise the per-rank prefill Indexer score tile limit to 2 GiB.
     SGLANG_OPT_DSV41_LARGE_PREFILL_SCORE_BUDGET = EnvBool(False)
+    SGLANG_OPT_DSV41_VERIFY_INDEXER_BF16_K_REUSE = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
     # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16
@@ -2258,6 +2260,9 @@ class Envs:
     # Draft sampler uses the Gumbel-max trick (argmax(probs / Exp(1))) instead of
     # torch.multinomial, whose device-side validity assert breaks draft-graph replay.
     SGLANG_OPT_USE_GUMBEL_SAMPLE = EnvBool(True)
+    # Rejection-sampling draft proposal as one fused kernel (softmax + exponential-race draw on
+    # torch's Philox state + greedy argmax). Same distribution as the Gumbel sampler.
+    SGLANG_OPT_USE_FUSED_DRAFT_SAMPLE = EnvBool(False)
     # Multi-layer chain-MTP boundary-KV fix: widen the draft-extend window to
     # rewrite rejected-draft KV rows before reuse (acc_len repair; on by default).
     SGLANG_ENABLE_MTP_BOUNDARY_KV_FIX = EnvBool(True)
@@ -2525,12 +2530,11 @@ class Envs:
     # Gemma 4
     # ===================================================================
     # Fused TP all-reduce + RMSNorm -> residual add -> RMSNorm -> per-128 FP8
-    # quant of the dense layer stack as one NVLS kernel per site, for extend
-    # batches of MIN..MAX tokens (SM90 with NVLink multicast, block-FP8 weights).
-    # MIN_TOKENS 0 takes the per-TP-size default (DEFAULT_MIN_TOKENS in
-    # srt/layers/communication/gemma4_ar_fusion.py).
+    # quant of the dense layer stack as one NVLS kernel per site, for extend,
+    # mixed and decode batches of up to MAX tokens (SM90 with NVLink multicast,
+    # block-FP8 weights). MAX also sizes the symmetric buffers; keep it at least
+    # the chunked prefill size so every prefill chunk is fused.
     SGLANG_GEMMA4_AR_FUSION = EnvBool(False)
-    SGLANG_GEMMA4_AR_FUSION_MIN_TOKENS = EnvInt(0)
     SGLANG_GEMMA4_AR_FUSION_MAX_TOKENS = EnvInt(8192)
 
     # ===================================================================

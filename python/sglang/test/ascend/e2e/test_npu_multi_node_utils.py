@@ -392,15 +392,28 @@ def wait_for_all_ports_ready(ips, port, timeout=LOCAL_TIMEOUT, check_interval=15
 def wait_for_pd_worker_roles(
     expected_roles, port, timeout=PD_WORKER_READY_TIMEOUT, check_interval=5
 ):
-    """Wait until every PD worker's `/server_info` reports its own role.
+    """Wait until every PD worker is serving and reports its own role.
 
     sgl-router classifies a worker as prefill/decode by introspecting
     `/server_info` once when it starts, and static worker URLs are never
-    re-introspected. A worker that still accepts TCP but is too busy to answer
-    HTTP for a few seconds therefore stays registered as `Plain`, and the
-    decode side then rejects every request with "Disaggregated request
-    received without bootstrap room id". Waiting for the role here removes
-    that race before the router is launched.
+    re-introspected. Two windows have to close before that introspection can
+    be trusted:
+
+    * The engine may still be starting. `/server_info` is answered as soon as
+      the HTTP server binds, while `/health` stays 503 until the engine
+      finishes its warmup, so a worker can pass a role-only check and then
+      stop answering for the seconds its warmup owns. The router retries the
+      introspection for ~5s, falls back to the discovery backend's `Plain`
+      classification, and rejects the worker when the model already has PD
+      workers ("does not support mixed pools") — a rejection that is never
+      retried, leaving `/readiness` at 503 forever.
+    * A worker that is too busy to answer HTTP a few seconds later would
+      likewise stay registered as `Plain`, and the decode side then rejects
+      every request with "Disaggregated request received without bootstrap
+      room id".
+
+    Requiring `/health` == 200 before reading `/server_info` removes both
+    races before the router is launched.
 
     Args:
         expected_roles (dict): {pod_ip: "prefill" | "decode"}.
@@ -409,7 +422,8 @@ def wait_for_pd_worker_roles(
         check_interval (int): Interval between checks in seconds.
 
     Raises:
-        RuntimeError: If a worker never reports the expected role.
+        RuntimeError: If a worker never becomes healthy or never reports the
+            expected role.
     """
     start_time = time.time()
     pending = dict(expected_roles)
@@ -417,6 +431,16 @@ def wait_for_pd_worker_roles(
 
     while time.time() - start_time < timeout:
         for ip, role in list(pending.items()):
+            health_url = f"http://{ip}:{port}/health"
+            try:
+                health = requests.get(health_url, timeout=10)
+            except Exception as e:
+                last_seen[ip] = f"health request failed: {e}"
+                continue
+            if health.status_code != 200:
+                last_seen[ip] = f"health returned {health.status_code}"
+                continue
+
             url = f"http://{ip}:{port}/server_info"
             try:
                 response = requests.get(url, timeout=10)
@@ -866,11 +890,12 @@ def launch_router(model_config, router_binary, process_holder=None):
         raise RuntimeError("Failed to wait for all nodes to be ready")
 
     # PD separation only: the router reads each worker's role from
-    # /server_info exactly once when it starts, so wait for the roles first.
-    # An open TCP port is not enough — a worker that is still warming up keeps
-    # accepting connections while it cannot answer HTTP yet, and the router
-    # would then register it as Plain and route PD requests to decode without
-    # a bootstrap room id.
+    # /server_info exactly once when it starts, so wait until every worker is
+    # both healthy (/health == 200, i.e. warmup done) and reporting its role.
+    # An open TCP port is not enough, and neither is /server_info on its own:
+    # it answers during warmup, and the router's introspection lands in the
+    # warmup window — it then falls back to Plain and rejects the worker as a
+    # mixed pool, which never recovers.
     if "prefill_args" in model_config and "decode_args" in model_config:
         expected_roles = {}
         for role, urls in (("prefill", prefill_url), ("decode", decode_url)):
