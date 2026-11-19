@@ -25,7 +25,7 @@ register_npu_ci(
 # transport over the NPU device path, as in the standalone Mooncake deployment.
 MOONCAKE_ENVS = {
     "MOONCAKE_PROTOCOL": "ascend",
-    "MOONCAKE_GLOBAL_SEGMENT_SIZE": "16gb",
+    "MOONCAKE_GLOBAL_SEGMENT_SIZE": "20gb",
     "MC_USE_TENT": "1",
     "MF_PROTOCOL": "device_sdma",
     "MF_STORE_PROTOCOL": "device_sdma",
@@ -167,8 +167,8 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
     "kernel_ascend",
     "--hicache-storage-backend",
     "mooncake",
-    "--hicache-ratio",
-    1.5,
+    "--hicache-size",
+    10,
     "--hicache-write-policy",
     "write_through",
     "--hicache-storage-prefetch-policy",
