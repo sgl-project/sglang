@@ -320,17 +320,46 @@ def test_page_first_staged_write_back_page_size_16_hip(
 _HIP_BATCH_SHIM = r"""
 #define _GNU_SOURCE
 #include <dlfcn.h>
+#include <link.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #define HIP_ERROR_NOT_SUPPORTED 801
 
 typedef int (*batch_fn)(void**, void**, size_t*, size_t, void*, size_t*, size_t, size_t*, void*);
 
+static int find_hip(struct dl_phdr_info* info, size_t size, void* out) {
+  (void)size;
+  if (strstr(info->dlpi_name, "libamdhip64") == NULL) {
+    return 0;
+  }
+  void* lib = dlopen(info->dlpi_name, RTLD_NOLOAD | RTLD_LAZY);
+  *(batch_fn*)out = lib == NULL ? NULL : (batch_fn)dlsym(lib, "hipMemcpyBatchAsync");
+  return *(batch_fn*)out != NULL;
+}
+
+static batch_fn real_batch(void) {
+  static batch_fn real = NULL;
+  if (real == NULL) {
+    real = (batch_fn)dlsym(RTLD_NEXT, "hipMemcpyBatchAsync");
+  }
+  /* torch loads its bundled libamdhip64 RTLD_LOCAL, out of RTLD_NEXT's reach. */
+  if (real == NULL) {
+    dl_iterate_phdr(find_hip, &real);
+  }
+  if (real == NULL) {
+    fprintf(stderr, "hip_batch_shim: real hipMemcpyBatchAsync not found\n");
+    abort();
+  }
+  return real;
+}
+
 int hipMemcpyBatchAsync(void** dsts, void** srcs, size_t* sizes, size_t count, void* attrs,
                         size_t* attrs_idxs, size_t num_attrs, size_t* fail_idx, void* stream) {
-  batch_fn real = (batch_fn)dlsym(RTLD_NEXT, "hipMemcpyBatchAsync");
+  batch_fn real = real_batch();
   const char* err = getenv("SHIM_BATCH_ERROR");
   if (err == NULL) {
     return real(dsts, srcs, sizes, count, attrs, attrs_idxs, num_attrs, fail_idx, stream);
