@@ -4,6 +4,7 @@ from typing import Optional
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.srt.environ import envs
 
 _linear_bf16_fp32_algo = envs.SGLANG_OPT_BF16_FP32_GEMM_ALGO.get()
@@ -22,10 +23,7 @@ def _hpc_gemm_bf16xfp32_available() -> bool:
     """HPC-Ops (https://github.com/Tencent/hpc-ops) ships sm90a kernels."""
     if importlib.util.find_spec("hpc") is None:
         return False
-    if not torch.cuda.is_available():
-        return False
-    major, _ = torch.cuda.get_device_capability()
-    return major == 9
+    return current_arch().is_sm(9)
 
 
 def _can_use_hpc_gemm_bf16xfp32(

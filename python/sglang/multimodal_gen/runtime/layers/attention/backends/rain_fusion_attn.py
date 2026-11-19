@@ -22,8 +22,6 @@ logger = init_logger(__name__)
 
 
 class RainFusionAttentionBackend(AttentionBackend):
-    accept_output_buffer: bool = True
-
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
         return [32, 64, 96, 128]
@@ -54,12 +52,6 @@ class RainFusionAttentionMetadata(AttentionMetadata):
 
 
 class RainFusionAttentionMetadataBuilder(AttentionMetadataBuilder):
-    def __init__(self) -> None:
-        pass
-
-    def prepare(self) -> None:
-        pass
-
     def build(
         self,
         current_timestep: int,

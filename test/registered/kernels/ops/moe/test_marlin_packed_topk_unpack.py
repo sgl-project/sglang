@@ -16,8 +16,9 @@ import torch
 
 from sglang.srt.layers.moe.moe_runner.marlin import _fused_unpack_packed_topk
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 
 def _torch_unpack(packed: torch.Tensor):
@@ -27,7 +28,7 @@ def _torch_unpack(packed: torch.Tensor):
 
 
 def _torch_pack(ids: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
-    # inverse of the unpack, matching trtllm_lora_temp/topk_pack._pack_topk_kernel
+    # inverse of the unpack, matching ops/lora/moe/trtllm_lora_temp/topk_pack._pack_topk_kernel
     wbits = weights.to(torch.bfloat16).view(torch.int16).to(torch.int32) & 0xFFFF
     return (ids.to(torch.int32) << 16) | wbits
 
@@ -84,6 +85,65 @@ def test_unpack_empty():
     ids, w = _fused_unpack_packed_topk(packed)
     assert ids.shape == (0, 2) and w.shape == (0, 2)
     assert ids.dtype == torch.int32 and w.dtype == torch.float32
+
+
+class TestPackedTopKRowCount(CustomTestCase):
+    def test_scalar_and_vector_count_replay_mask(self):
+        """A captured packed softmax router reads scalar/vector live counts as they change."""
+        from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate
+
+        num_tokens, num_experts, top_k = 7, 8, 2
+        scores = torch.arange(num_experts, device="cuda", dtype=torch.float32)
+        scores = scores.repeat(num_tokens, 1) * 0.125
+        probs = scores.softmax(dim=-1)
+        ref_weights, ref_ids = probs.topk(top_k, dim=-1)
+        for shape in ((), (1,)):
+            for renormalize in (False, True):
+                with self.subTest(shape=shape, renormalize=renormalize):
+                    count = torch.full(shape, 3, dtype=torch.int32, device="cuda")
+                    packed = torch.empty(
+                        (num_tokens, top_k), dtype=torch.int32, device="cuda"
+                    )
+                    out = {}
+
+                    def run():
+                        out["w"], out["ids"] = moe_fused_gate(
+                            scores,
+                            None,
+                            top_k,
+                            scoring_func="softmax",
+                            renormalize=renormalize,
+                            num_token_non_padded=count,
+                            packed_out=packed,
+                        )
+
+                    def check(live):
+                        expected_weights = ref_weights.clone()
+                        if renormalize:
+                            expected_weights /= expected_weights.sum(
+                                dim=-1, keepdim=True
+                            )
+                        expected_ids = ref_ids.to(torch.int32).clone()
+                        expected_weights[live:] = 0
+                        expected_ids[live:] = -1
+                        torch.testing.assert_close(
+                            out["w"], expected_weights, rtol=1e-5, atol=1e-7
+                        )
+                        self.assertTrue(torch.equal(out["ids"], expected_ids))
+                        self.assertTrue(
+                            torch.equal(packed, _torch_pack(expected_ids, out["w"]))
+                        )
+
+                    run()
+                    check(3)
+                    torch.cuda.synchronize()
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        run()
+                    for live in (0, num_tokens, 3, 0):
+                        count.fill_(live)
+                        graph.replay()
+                        check(live)
 
 
 if __name__ == "__main__":

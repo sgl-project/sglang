@@ -4,8 +4,13 @@ import torch
 import triton
 import triton.language as tl
 
+_MAX_INT32 = 2**31 - 1
 
-@triton.jit
+# Devices with a Triton backend for this kernel. "cuda" also covers ROCm.
+_SUPPORTED_DEVICE_TYPES = ("cuda", "xpu")
+
+
+@triton.jit(do_not_specialize=["rows"])
 def _pack_qkv_destination_major_kernel(
     output_ptr,
     q_ptr,
@@ -21,9 +26,15 @@ def _pack_qkv_destination_major_kernel(
     stride_k_head,
     stride_v_row,
     stride_v_head,
+    IDX64: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    if IDX64:
+        offsets = tl.program_id(0).to(tl.int64) * BLOCK_SIZE + tl.arange(
+            0, BLOCK_SIZE
+        ).to(tl.int64)
+    else:
+        offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < total_elements
 
     dim = offsets % head_size
@@ -62,8 +73,11 @@ def pack_qkv_destination_major(
     """Pack matching ``[rows, global_heads, head_size]`` Q/K/V tensors."""
     if q.dim() != 3 or q.shape != k.shape or q.shape != v.shape:
         raise ValueError("q, k, and v must have the same 3D shape")
-    if not (q.is_cuda and k.is_cuda and v.is_cuda):
-        raise ValueError("q, k, and v must be CUDA tensors")
+    if not all(t.device.type in _SUPPORTED_DEVICE_TYPES for t in (q, k, v)):
+        raise ValueError(
+            f"q, k, and v must be on one of {_SUPPORTED_DEVICE_TYPES}, "
+            f"got {q.device.type}"
+        )
     if not (q.device == k.device == v.device and q.dtype == k.dtype == v.dtype):
         raise ValueError("q, k, and v must have the same device and dtype")
     if q.stride(-1) != 1 or k.stride(-1) != 1 or v.stride(-1) != 1:
@@ -96,6 +110,15 @@ def pack_qkv_destination_major(
     if total_elements == 0:
         return output
 
+    # Input views may be strided (e.g. slices of a fused qkv projection), so
+    # bound each tensor by one past the largest element offset it is addressed at.
+    max_offset = max(
+        output.numel(),
+        *(
+            (rows - 1) * t.stride(0) + (global_heads - 1) * t.stride(1) + head_size
+            for t in (q, k, v)
+        ),
+    )
     block_size = 1024
     with torch.get_device_module().device(q.device):
         _pack_qkv_destination_major_kernel[(triton.cdiv(total_elements, block_size),)](
@@ -113,6 +136,7 @@ def pack_qkv_destination_major(
             k.stride(1),
             v.stride(0),
             v.stride(1),
+            IDX64=max_offset > _MAX_INT32,
             BLOCK_SIZE=block_size,
             num_warps=8,
         )

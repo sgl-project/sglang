@@ -19,7 +19,7 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=72, stage="base-c", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=199, stage="extra-b", runner_config="4-gpu-h100")
 
 _MODEL = os.environ.get("SGLANG_ROUTED_EXPERTS_TEST_MODEL", "deepseek-ai/DeepSeek-V3")
 _NUM_EXPERTS = 24
@@ -71,13 +71,13 @@ class _ReadbackMixin:
             ),
             "--tp",
             "2",
-            "--dp",
+            "--attn-dp-size",
             "2",
             "--ep",
             "2",
-            "--enable-dp-attention",
             "--enable-return-routed-experts",
-            "--disable-cuda-graph",
+            "--disable-decode-cuda-graph",
+            "--disable-prefill-cuda-graph",
             "--disable-radix-cache",
             # Keep the startup budget within the test's 256-token buffer.
             "--chunked-prefill-size",

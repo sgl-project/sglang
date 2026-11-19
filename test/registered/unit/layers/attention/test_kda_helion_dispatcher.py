@@ -1,10 +1,16 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import ANY, MagicMock, patch
 
 import torch
 
 from sglang.srt.arg_groups.attention_hook import handle_linear_attn_backend
-from sglang.srt.layers.attention.linear.kda_backend import KDAKernelDispatcher
+from sglang.srt.arg_groups.glm5_next_hook import apply_glm5_next_spec_backend_defaults
+from sglang.srt.arg_groups.overrides import resolution_result
+from sglang.srt.layers.attention.linear.kda_backend import (
+    KDAAttnBackend,
+    KDAKernelDispatcher,
+)
 from sglang.srt.layers.attention.linear.kernels.kda_helion import HelionKDAKernel
 from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKernel
 from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
@@ -12,12 +18,22 @@ from sglang.srt.runtime_context import override_platform
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestHelionKDADispatcher(unittest.TestCase):
-    def _make_dispatcher(self, decode_backend, prefill_backend):
-        helion_kernel = MagicMock(supports_packed_decode=True)
+    def _make_dispatcher(
+        self,
+        decode_backend,
+        prefill_backend,
+        verify_backend=LinearAttnKernelBackend.TRITON,
+    ):
+        helion_kernel = MagicMock(
+            spec=HelionKDAKernel,
+            supports_packed_decode=True,
+            supports_packed_decode_safe_gate=HelionKDAKernel.supports_packed_decode_safe_gate,
+            supports_safe_gate_verify=HelionKDAKernel.supports_safe_gate_verify,
+        )
         with (
             patch(
                 "sglang.srt.layers.attention.linear.kda_backend.is_cuda",
@@ -31,7 +47,7 @@ class TestHelionKDADispatcher(unittest.TestCase):
             dispatcher = KDAKernelDispatcher(
                 decode_backend=decode_backend,
                 prefill_backend=prefill_backend,
-                verify_backend=LinearAttnKernelBackend.TRITON,
+                verify_backend=verify_backend,
             )
         return dispatcher, helion_kernel, constructor
 
@@ -80,6 +96,21 @@ class TestHelionKDADispatcher(unittest.TestCase):
         self.assertIsInstance(dispatcher.decode_kernel, TritonKDAKernel)
         self.assertIs(dispatcher.extend_kernel, helion_kernel)
         self.assertIsInstance(dispatcher.verify_kernel, TritonKDAKernel)
+
+    def test_explicit_helion_verify_reuses_adapter(self):
+        for decode in (LinearAttnKernelBackend.TRITON, LinearAttnKernelBackend.HELION):
+            with self.subTest(decode=decode):
+                dispatcher, helion_kernel, _ = self._make_dispatcher(
+                    decode,
+                    LinearAttnKernelBackend.TRITON,
+                    LinearAttnKernelBackend.HELION,
+                )
+                self.assertIs(dispatcher.verify_kernel, helion_kernel)
+                self.assertIsInstance(dispatcher.extend_kernel, TritonKDAKernel)
+                if decode.is_helion():
+                    self.assertIs(dispatcher.decode_kernel, helion_kernel)
+                else:
+                    self.assertIsInstance(dispatcher.decode_kernel, TritonKDAKernel)
 
     def test_replayssm_decode_uses_native_helion_kernel(self):
         kernel = HelionKDAKernel.__new__(HelionKDAKernel)
@@ -159,56 +190,148 @@ class TestHelionKDADispatcher(unittest.TestCase):
         self.assertIsNone(args.linear_attn_decode_backend)
         self.assertEqual(args.linear_attn_backend, "helion")
 
+    def test_pp_spec_flashinfer_verify_fallback_is_kda_only(self):
+        cases = (
+            ("KimiK3LinearForCausalLM", {"kda_layers": [0]}, None, "triton"),
+            ("KimiK3LinearForCausalLM", {"kda_layers": [0]}, "flashinfer", "triton"),
+            ("Qwen3NextForCausalLM", {"linear_attention_layers": [0]}, None, None),
+        )
+        for architecture, linear_config, requested, expected in cases:
+            with self.subTest(architecture=architecture, requested=requested):
+                args = ServerArgs(
+                    model_path="dummy",
+                    linear_attn_decode_backend="flashinfer",
+                    linear_attn_verify_backend=requested,
+                )
+                config = SimpleNamespace(
+                    hf_config=SimpleNamespace(
+                        architectures=[architecture], linear_attn_config=linear_config
+                    )
+                )
+                with (
+                    patch(
+                        "sglang.srt.arg_groups.attention_hook.model_config_of",
+                        return_value=config,
+                    ),
+                    patch(
+                        "sglang.srt.arg_groups.attention_hook."
+                        "pp_spec_stable_rows_enabled",
+                        return_value=True,
+                    ),
+                    override_platform(is_sm100=False),
+                    override_platform(is_cuda=False),
+                ):
+                    handle_linear_attn_backend(args)
 
-class TestKDATrackStateSnapshotDeclaration(unittest.TestCase):
-    """Bookkeeping: every KDA prefill kernel must declare whether extend()
-    honors the fp32 track snapshot (``supports_track_state_snapshot``).
+                self.assertEqual(
+                    resolution_result(args, "linear_attn_verify_backend"), expected
+                )
 
-    KDAAttnBackend allocates the snapshot buffer whenever a tracked batch has
-    chunk-unaligned sequences and asserts the flag before use. A kernel that
-    serves extend() without the flag must reject tracked batches loudly
-    (NotImplementedError); a missing declaration used to mean the buffer was
-    silently left unwritten and prefix-cache restores read garbage (the
-    FlashKDA fallback once dropped the track arguments exactly this way).
-    """
 
-    def test_every_kda_prefill_kernel_declares_the_contract(self):
-        from sglang.srt.layers.attention.linear.kernels.kda_cutedsl import (
-            CuteDSLKDAKernel,
-        )
-        from sglang.srt.layers.attention.linear.kernels.kda_flashinfer import (
-            FlashInferKDAKernel,
-        )
-        from sglang.srt.layers.attention.linear.kernels.kda_flashkda import (
-            FlashKDAKernel,
-        )
-        from sglang.srt.layers.attention.linear.kernels.kda_nvidia import (
-            NvidiaKDAKernel,
-        )
-        from sglang.srt.layers.attention.linear.kernels.kda_ptx import (
-            PtxKDAKernel,
-        )
+class TestKDACuteDslVerifySelection(unittest.TestCase):
+    def test_cute_verify_gate_admits_sm90_and_sm100_only(self):
+        """Outside the gate, nv_cutedsl verify silently runs Triton instead.
 
-        # Native support or fallback that forwards the snapshot arguments.
-        for cls in (
-            TritonKDAKernel,
-            HelionKDAKernel,
-            NvidiaKDAKernel,
-            PtxKDAKernel,
-            FlashKDAKernel,
+        SM90 passes only in CUDA graph capture; its eager verify keeps Triton.
+        """
+        heads, dim, steps = 2, 128, 4
+        width = heads * dim
+        layer = SimpleNamespace(
+            bias=None,
+            lower_bound=-5.0,
+            num_q_heads=heads,
+            num_k_heads=heads,
+            num_v_heads=heads,
+            head_q_dim=dim,
+            head_k_dim=dim,
+            head_v_dim=dim,
+            q_dim=width,
+            k_dim=width,
+            v_dim=width,
+            conv_weights=torch.zeros(3 * width, 4, dtype=torch.float32),
+        )
+        backend = KDAAttnBackend.__new__(KDAAttnBackend)
+        backend.state_pool = None
+        backend.kernel_dispatcher = KDAKernelDispatcher(
+            decode_backend=LinearAttnKernelBackend.TRITON,
+            prefill_backend=LinearAttnKernelBackend.TRITON,
+            verify_backend=LinearAttnKernelBackend.NV_CUTEDSL,
+        )
+        verify_args = dict(
+            layer=layer,
+            mixed_qkv=torch.zeros(steps, 3 * width, dtype=torch.bfloat16),
+            a=torch.zeros(1, steps, width, dtype=torch.bfloat16),
+            b=torch.zeros(1, steps, heads, dtype=torch.bfloat16),
+            draft_token_num=steps,
+            ragged_layout=None,
+            conv_states=torch.zeros(2, 3, 3 * width, dtype=torch.bfloat16),
+            ssm_states=torch.zeros(2, heads, dim, dim, dtype=torch.float32),
+            intermediate_state_cache=torch.zeros(
+                1, steps, heads, dim, dim, dtype=torch.float32
+            ),
+            intermediate_conv_window_cache=torch.zeros(
+                1, steps, 3, 3 * width, dtype=torch.bfloat16
+            ),
+            retrieve_parent_token=None,
+            replayssm_rawv=None,
+        )
+        for capability, capturing, admitted in (
+            (None, True, False),
+            ((9, 0), True, True),
+            ((9, 0), False, False),
+            ((10, 0), True, True),
+            ((10, 0), False, True),
+            ((8, 0), True, False),
+            ((12, 0), True, False),
         ):
-            self.assertTrue(
-                cls.supports_track_state_snapshot,
-                f"{cls.__name__} must declare supports_track_state_snapshot "
-                f"(native support or a fallback that forwards track_state)",
-            )
-        # Reject tracked batches loudly instead (extend() raises).
-        for cls in (CuteDSLKDAKernel, FlashInferKDAKernel):
-            self.assertFalse(
-                cls.supports_track_state_snapshot,
-                f"{cls.__name__} rejects tracked batches; it must not claim "
-                f"snapshot support it does not have",
-            )
+            with (
+                self.subTest(capability=capability, capturing=capturing),
+                patch(
+                    "sglang.srt.layers.attention.linear.kda_backend.is_cuda",
+                    return_value=True,
+                ),
+                patch(
+                    "sglang.srt.layers.attention.linear.kda_backend."
+                    "get_is_capture_mode",
+                    return_value=capturing,
+                ),
+                patch("importlib.util.find_spec", return_value=SimpleNamespace()),
+                patch(
+                    "sglang.srt.layers.attention.linear.kda_backend.current_arch",
+                    return_value=SimpleNamespace(
+                        cuda=(
+                            SimpleNamespace(major=capability[0])
+                            if capability is not None
+                            else None
+                        )
+                    ),
+                ),
+            ):
+                self.assertIs(
+                    backend._can_run_dspark_cutedsl_mtp(**verify_args), admitted
+                )
+
+    def test_glm5_next_spec_defaults_verify_to_nv_cutedsl_on_sm100_and_sm90_ring(self):
+        sm90 = {"is_sm90": True, "is_sm100": False}
+        sm100 = {"is_sm90": False, "is_sm100": True}
+        other = {"is_sm90": False, "is_sm100": False}
+        for platform, ring, expected in (
+            (sm90, True, "nv_cutedsl"),
+            (sm90, False, None),
+            (sm100, False, "nv_cutedsl"),
+            (other, True, None),
+        ):
+            with self.subTest(platform=platform, ring=ring):
+                args = ServerArgs(
+                    model_path="dummy",
+                    speculative_algorithm="EAGLE",
+                    enable_linear_replayssm_spec=ring,
+                )
+                with override_platform(**platform):
+                    apply_glm5_next_spec_backend_defaults(args)
+                self.assertEqual(
+                    resolution_result(args, "linear_attn_verify_backend"), expected
+                )
 
 
 if __name__ == "__main__":

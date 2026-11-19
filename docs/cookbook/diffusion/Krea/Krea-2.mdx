@@ -1,5 +1,6 @@
 ---
 title: Krea-2
+description: "Deploy Krea-2 with SGLang - fast, high-quality text-to-image generation."
 metatags:
     description: "Deploy Krea-2 with SGLang - fast, high-quality text-to-image generation."
 ---
@@ -8,7 +9,20 @@ import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
 
 <DiffusionModelTags tags={["image", "text-to-image", "8-step Turbo", "high-fidelity Raw", "Qwen3-VL"]} />
 
-## 1. Model Introduction
+import { Deployment } from '/src/snippets/_deployment.jsx';
+import { config } from '/src/snippets/configs/Krea/krea2.jsx';
+
+## 1. Quick start
+
+Follow the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation) for your GPU platform.
+
+<a id="2-sglang-diffusion-installation" />
+
+<Deployment config={config} />
+
+<a id="1-model-introduction" />
+
+## 2. Model capabilities
 
 [Krea-2](https://huggingface.co/krea/Krea-2-Turbo) is Krea's photorealistic text-to-image family, built as a single-stream MMDiT with a Qwen3-VL text encoder and Qwen-Image VAE. Both public variants use the same native SGLang pipeline and differ mainly in their sampling target.
 
@@ -17,19 +31,19 @@ Choose Turbo for interactive generation: it is distilled to 8 steps with `guidan
 | Variant | Model ID | Sampling profile |
 | --- | --- | --- |
 | Turbo | `krea/Krea-2-Turbo` | 8 steps, no CFG; fastest path |
-| Raw | `krea/Krea-2-Raw` | About 52 steps with CFG; higher-fidelity path |
-
-## 2. SGLang-diffusion Installation
-
-SGLang-diffusion offers multiple installation methods. You can choose the most suitable installation method based on your hardware platform and requirements.
-
-Please refer to the [official SGLang-diffusion installation guide](https://docs.sglang.io/docs/sglang-diffusion/installation) for installation instructions.
+| Raw | `krea/Krea-2-Raw` | About 52 steps with CFG, set per request; higher-fidelity path |
 
 ## 3. Model Deployment
 
 This section covers deploying Krea-2-Turbo for fast, high-quality image generation.
 
 ### 3.1 Basic Configuration
+
+Intel Xeon CPU deployment is supported with `SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu` and the selected Krea-2 checkpoint.
+
+```bash Command
+SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu sglang serve --model-path krea/Krea-2-Turbo
+```
 
 Krea-2-Turbo generates high-quality images in only 8 inference steps. Launch the server with:
 
@@ -40,7 +54,7 @@ sglang serve \
   --port 30000
 ```
 
-The step count and guidance scale are **request-time** settings (see [API Usage](#4-api-usage)); Krea-2-Turbo defaults to 8 steps with `guidance_scale = 1.0`.
+The step count and guidance scale are **request-time** settings (see [API Usage](#4-api-usage)); Krea-2-Turbo defaults to 8 steps with `guidance_scale = 1.0`. Krea-2-Raw is served with the same defaults; set `num_inference_steps` (about 50) and `guidance_scale` (4.5) per request for its CFG path.
 
 ### 3.2 Configuration Tips
 

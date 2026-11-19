@@ -21,8 +21,8 @@ from sglang.test.test_utils import (
 )
 from sglang.utils import wait_for_server
 
-register_npu_ci(est_time=400, suite="nightly-2-npu-a3", nightly=True)
-register_npu_ci(est_time=400, suite="base-b-test-2-npu-a3")
+register_npu_ci(est_time=400, suite="nightly-test-2-npu-a3", nightly=True)
+register_npu_ci(est_time=400, suite="extra-b-test-2-npu-a3")
 
 
 # Keep the first 6 layers of the BF16 checkpoint. The first 6 V4-Flash
@@ -61,6 +61,9 @@ class TestNPUDeepSeekV4ReturnIndexerTopk(CustomTestCase):
         ]
         env = os.environ.copy()
         env.update(DEEPSEEK_V4_BF16_ENVS)
+        env["PYTORCH_NPU_ALLOC_CONF"] = (
+            "expandable_segments:True,pin_memory_expandable_segments:True"
+        )
         _, host, port = DEFAULT_URL_FOR_TEST.split(":")
         server_command = [
             "python3",
@@ -81,16 +84,16 @@ class TestNPUDeepSeekV4ReturnIndexerTopk(CustomTestCase):
             "0.72",
             "--tp-size",
             "2",
-            "--dp-size",
+            "--attn-dp-size",
             "2",
-            "--enable-dp-attention",
             "--enable-dp-lm-head",
             "--kv-cache-dtype",
             "auto",
-            "--disable-cuda-graph",
+            "--disable-decode-cuda-graph",
+            "--disable-prefill-cuda-graph",
             "--enable-return-indexer-topk",
             "--json-model-override-args",
-            '{"num_hidden_layers": 6, "compress_ratios": [0, 0, 4, 128, 4, 128]}',
+            '{"num_hidden_layers": 6, "compress_ratios": [0, 0, 4, 128, 4, 128], "quantization_config": null}',
             "--host",
             host[2:],
             "--port",

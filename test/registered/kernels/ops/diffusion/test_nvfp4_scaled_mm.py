@@ -227,7 +227,9 @@ def _build_layer(
         input_size=input_size,
         output_size=output_size,
         params_dtype=DTYPE,
-        weight_loader=lambda *args, **kwargs: None,
+        weight_loader=lambda param, loaded_weight, *args, **kwargs: param.data.copy_(
+            loaded_weight
+        ),
     )
     layer = layer.to(device=DEVICE)
 
@@ -239,11 +241,10 @@ def _build_layer(
     layer.weight_scale_2.data.copy_(
         (1.0 / weight_global_scale).reshape_as(layer.weight_scale_2)
     )
-    layer.weight_scale.data.copy_(weight_scale_linear)
+    layer.weight_scale.weight_loader(layer.weight_scale, weight_scale_linear)
     if weight_scale_device is not None:
-        layer.weight_scale = torch.nn.Parameter(
-            layer.weight_scale.detach().to(weight_scale_device), requires_grad=False
-        )
+        # Move in place so the parameter keeps its ``nvfp4_scale_layout`` tag.
+        layer.weight_scale.data = layer.weight_scale.data.to(weight_scale_device)
 
     layer._interleave_for_swiglu_fusion = prepare_swiglu_fusion
     layer._accepts_prequantized_fp4 = accepts_prequantized_fp4
@@ -390,7 +391,7 @@ def test_flux2_fused_nvfp4_swiglu_quant_matches_unfused() -> None:
     reloaded_weight = _swap_fp4_nibbles(weight_in_fp4).clone()
     reloaded_weight.view(torch.uint8).flatten()[0] ^= 0x11
     layer_in.weight.data.copy_(reloaded_weight)
-    layer_in.weight_scale.data.copy_(weight_in_scale)
+    layer_in.weight_scale.weight_loader(layer_in.weight_scale, weight_in_scale)
     method_in.process_weights_after_loading(layer_in)
     assert layer_in.weight_swiglu_interleaved.data_ptr() == weight_ptr
     assert layer_in.weight_scale_swiglu_interleaved.data_ptr() == scale_ptr

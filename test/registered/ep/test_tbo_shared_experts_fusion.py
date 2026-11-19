@@ -1,4 +1,3 @@
-import os
 import unittest
 from types import SimpleNamespace
 
@@ -12,7 +11,7 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=253, stage="extra-b", runner_config="8-gpu-h200")
+register_cuda_ci(est_time=276, stage="extra-b", runner_config="8-gpu-h200")
 
 DEEPSEEK_V3_MODEL_PATH = "deepseek-ai/DeepSeek-V3-0324"
 
@@ -30,8 +29,7 @@ class TestTBOWithSharedExpertsFusion(CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "8",
-                "--enable-dp-attention",
-                "--dp",
+                "--attn-dp-size",
                 "8",
                 "--moe-dense-tp-size",
                 "1",
@@ -39,14 +37,11 @@ class TestTBOWithSharedExpertsFusion(CustomTestCase):
                 "deepep",
                 "--enable-two-batch-overlap",
                 "--enforce-shared-experts-fusion",
-                "--disable-cuda-graph",
+                "--disable-decode-cuda-graph",
+                "--disable-prefill-cuda-graph",
                 "--max-running-requests",
                 "512",
             ],
-            env={
-                **os.environ,
-                "SGLANG_TBO_DEBUG": "1",
-            },
         )
 
     @classmethod

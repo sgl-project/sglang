@@ -35,31 +35,24 @@ Properties checked:
      has a sliding window of its own (that per-layer window wins over the flag,
      since this index builder emits one KV list for all draft layers). It warns
      only when it substitutes a different window than the one requested.
-  5. BACKEND WIRING -- both ``TritonMultiStepDraftBackend`` and
-     ``FlashInferMultiStepDraftBackend`` resolve the pair in ``__init__`` and
-     forward it to the kernel, so windowing is honored identically on both
-     backends (CPU-only guard).
 
 The kernel is imported normally from ``sglang`` (no by-file-path staging), so it
 tracks the installed tree.
 """
 
-import inspect
 import unittest
 from types import SimpleNamespace
 from unittest import mock
 
 import torch
 
+from sglang.kernels.ops.speculative.cache_locs import generate_draft_decode_kv_indices
 from sglang.srt.speculative import spec_utils
-from sglang.srt.speculative.spec_utils import (
-    generate_draft_decode_kv_indices,
-    resolve_draft_decode_window,
-)
+from sglang.srt.speculative.spec_utils import resolve_draft_decode_window
 from sglang.srt.utils import next_power_of_2
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 _HAS_CUDA = torch.cuda.is_available()
 
@@ -107,10 +100,13 @@ def _make_inputs(seq_lens, num_steps, topk, page_size=1, pool_len=None):
     )
 
 
-def _run(io, window_size=0, sink_size=0):
+def _run(io, window_size=0, sink_size=0, num_token_blocks=1):
+    """``num_token_blocks > 1`` is the long-context launch of the flashinfer /
+    aiter draft backends: ``NUM_STEPS`` splits each row over token blocks."""
     kv_indices = io["kv_indices"].clone()
     kv_indptr = io["kv_indptr"].clone()
-    generate_draft_decode_kv_indices[(io["num_steps"], io["num_seqs"], io["topk"])](
+    grid = (io["num_steps"] * num_token_blocks, io["num_seqs"], io["topk"])
+    generate_draft_decode_kv_indices[grid](
         io["req_pool_indices"],
         io["req_to_token"],
         io["seq_lens"],
@@ -126,6 +122,7 @@ def _run(io, window_size=0, sink_size=0):
         io["page_size"],
         window_size,
         sink_size,
+        NUM_STEPS=io["num_steps"] if num_token_blocks > 1 else 0,
     )
     torch.cuda.synchronize()
     return kv_indices, kv_indptr
@@ -233,7 +230,7 @@ class TestDraftDecodeWindowKernel(unittest.TestCase):
                         f"tree tokens wrong at step {step} (seq_len={seq_len})",
                     )
 
-    def _assert_slot_layout(self, io, window, sink):
+    def _assert_slot_layout(self, io, window, sink, num_token_blocks=1):
         """Every (request, topk) slot holds [sink + recent] + its own tree branch.
 
         Slots are located by the closed-form kv_indptr oracle, so this also pins
@@ -242,7 +239,9 @@ class TestDraftDecodeWindowKernel(unittest.TestCase):
         covers the identity case too.
         """
         cap = None if window == 0 else window + sink
-        kv_indices, indptr = _run(io, window_size=window, sink_size=sink)
+        kv_indices, indptr = _run(
+            io, window_size=window, sink_size=sink, num_token_blocks=num_token_blocks
+        )
         expected_indptr = _expected_kv_indptr(io, cap=cap)
         self.assertTrue(torch.equal(indptr.cpu(), expected_indptr))
 
@@ -295,6 +294,34 @@ class TestDraftDecodeWindowKernel(unittest.TestCase):
             with self.subTest(seq_lens=seq_lens, topk=topk, window=window, sink=sink):
                 io = _make_inputs(seq_lens, num_steps, topk)
                 self._assert_slot_layout(io, window, sink)
+
+    def test_token_block_grid_matches_window_oracle(self):
+        """NUM_STEPS > 0 with several token blocks per row (the long-context
+        launch the flashinfer draft backend uses) must reproduce the windowed
+        read plan: the closed-form kv_indptr, the [sink + recent] + tree slots,
+        and bit-for-bit the historical one-block grid, for every block count.
+        """
+        for seq_lens, num_steps, topk, page_size, window, sink in [
+            ([5000, 900], 4, 1, 1, 1024, 64),
+            ([5000, 900], 4, 2, 1, 1024, 0),  # pure recent window, tree
+            ([300, 130], 3, 2, 1, 4096, 64),  # cap exceeds seq_len -> keep all
+            ([600, 250], 3, 4, 16, 128, 16),  # paged tree extend
+            ([262145, 131072], 4, 1, 1, 4032, 64),  # long context
+            ([65536, 1029306], 3, 2, 1, 4032, 64),  # long-context tree
+            ([1029306], 4, 1, 1, 0, 0),  # window off, one long row
+        ]:
+            io = _make_inputs(seq_lens, num_steps, topk, page_size=page_size)
+            ref_indices, ref_indptr = _run(io, window_size=window, sink_size=sink)
+            for nb in (2, 3, 33):
+                with self.subTest(
+                    seq_lens=seq_lens, topk=topk, window=window, sink=sink, nb=nb
+                ):
+                    self._assert_slot_layout(io, window, sink, num_token_blocks=nb)
+                    out_indices, out_indptr = _run(
+                        io, window_size=window, sink_size=sink, num_token_blocks=nb
+                    )
+                    self.assertTrue(torch.equal(out_indptr, ref_indptr))
+                    self.assertTrue(torch.equal(out_indices, ref_indices))
 
     def test_tree_topk_paged(self):
         """page_size > 1 AND topk > 1: the paged-tree extend branch.
@@ -397,42 +424,6 @@ class TestResolveDraftDecodeWindow(unittest.TestCase):
         runner = self._runner(window=4032, sink=64)
         del runner.sliding_window_size
         self.assertEqual(resolve_draft_decode_window(runner), (4032, 64))
-
-
-class TestDraftDecodeWindowBackendWiring(unittest.TestCase):
-    """CPU-only guard: both draft backends must forward window/sink to the kernel.
-
-    The kernel tests above prove correctness once the args reach the kernel; this
-    guards the per-backend plumbing (init resolution + kernel passthrough) so it
-    cannot silently regress on either backend without a GPU-loaded model.
-    """
-
-    def _assert_backend_wires(self, cls):
-        init_src = inspect.getsource(cls.__init__)
-        self.assertIn("resolve_draft_decode_window", init_src)
-        self.assertIn("self.draft_window_size", init_src)
-        self.assertIn("self.draft_sink_size", init_src)
-        tmpl_src = inspect.getsource(cls.common_template)
-        self.assertIn("self.draft_window_size", tmpl_src)
-        self.assertIn("self.draft_sink_size", tmpl_src)
-
-    def test_triton_backend_wires_window_sink(self):
-        try:
-            from sglang.srt.layers.attention.triton_backend import (
-                TritonMultiStepDraftBackend,
-            )
-        except ImportError as e:  # pragma: no cover
-            self.skipTest(f"triton backend import unavailable: {e}")
-        self._assert_backend_wires(TritonMultiStepDraftBackend)
-
-    def test_flashinfer_backend_wires_window_sink(self):
-        try:
-            from sglang.srt.layers.attention.flashinfer_backend import (
-                FlashInferMultiStepDraftBackend,
-            )
-        except ImportError as e:  # pragma: no cover
-            self.skipTest(f"flashinfer backend import unavailable: {e}")
-        self._assert_backend_wires(FlashInferMultiStepDraftBackend)
 
 
 if __name__ == "__main__":

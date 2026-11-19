@@ -26,6 +26,7 @@ from sglang.srt.constrained.base_grammar_backend import (
     create_grammar_backend,
     register_grammar_backend,
 )
+from sglang.srt.constrained.reasoner_grammar_backend import ReasonerGrammarObject
 from sglang.srt.runtime_context import get_context  # noqa: E402
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -127,13 +128,6 @@ class TestBaseGrammarBackend(unittest.TestCase):
         result, hit = self.backend.get_cached_or_future_value(key, False)
         self.assertFalse(hit)
         self.assertIsInstance(result, Future)
-
-    def test_dispatch_fallback_error_message_content(self):
-        """dispatch_fallback error should include the key type and value."""
-        with self.assertRaises(ValueError) as ctx:
-            self.backend.dispatch_fallback("custom_type", "custom_value")
-        self.assertIn("custom_type", str(ctx.exception))
-        self.assertIn("custom_value", str(ctx.exception))
 
     def test_init_value_dispatch_none_grammar(self):
         """When dispatch returns None, should not crash on stats check."""
@@ -422,6 +416,13 @@ class TestNulByteGrammarRejection(unittest.TestCase):
                 self.backend._init_value_dispatch((key_type, key_string), False)
 
                 dispatch.assert_called_once_with(key_string)
+
+
+class TestGrammarObjectRepr(unittest.TestCase):
+    def test_repr_matches_across_instances(self):
+        first = ReasonerGrammarObject(None, think_end_ids=[1])
+        second = ReasonerGrammarObject(None, think_end_ids=[1])
+        self.assertEqual(repr(first), repr(second))
 
 
 if __name__ == "__main__":

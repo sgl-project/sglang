@@ -34,12 +34,11 @@ from diffusers.models.normalization import (
 
 from sglang.kernels.ops import diffusion as diffusion_ops
 from sglang.kernels.ops.diffusion import (
+    FUSED_LINEAR_GELU,
     BitExactFusionGate,
     can_use_fused_inplace_qknorm_rope,
     can_use_linear_gelu,
-    fused_gelu_active,
     fused_linear_gelu_tanh,
-    mark_fused_gelu_site,
     residual_gate_add,
     tensors_equal,
 )
@@ -54,11 +53,22 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
 )
+from sglang.multimodal_gen.runtime.managers.forward_context import (
+    DENOISING_LOOP_STATE,
+    get_forward_context_or_none,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
+from sglang.multimodal_gen.runtime.models.dits.common import (
+    layernorm_modulate_bitexact,
+)
+from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+_is_cuda = current_platform.is_cuda()
 
 logger = init_logger(__name__)
 
@@ -73,20 +83,17 @@ def _longcat_gelu_cat(
     if (
         type(activation) is nn.GELU
         and activation.approximate == "tanh"
-        and _LONGCAT_GELU_CAT.can_attempt_once()
-        and diffusion_ops.can_use_fused_gelu_tanh_cat(attn, mlp)
+        and _is_cuda
+        and attn.is_cuda
+        and attn.dtype is torch.bfloat16
+        and not torch.is_grad_enabled()
+        and not torch.compiler.is_compiling()
     ):
-        try:
-            output = diffusion_ops.fused_gelu_tanh_cat(attn, mlp)
-        except Exception as exc:
-            _LONGCAT_GELU_CAT.on_exception(exc, logger=logger)
-        else:
-            if _LONGCAT_GELU_CAT.verified:
-                return output
-            reference = torch.cat((attn, activation(mlp)), dim=-1)
-            return _LONGCAT_GELU_CAT.accept_or_fallback(
-                output, reference, logger=logger
-            )
+        return _LONGCAT_GELU_CAT.run(
+            lambda: diffusion_ops.fused_gelu_tanh_cat(attn, mlp),
+            lambda: torch.cat((attn, activation(mlp)), dim=-1),
+            logger=logger,
+        )
     return torch.cat((attn, activation(mlp)), dim=-1)
 
 
@@ -96,17 +103,22 @@ def _longcat_norm_modulate(
     scale: torch.Tensor,
     shift: torch.Tensor,
 ) -> torch.Tensor:
-    if torch.is_grad_enabled() or torch.compiler.is_compiling():
+
+    def reference():
         return norm(x) * (1 + scale[:, None]) + shift[:, None]
-    # LayerNorm's reduction depends on the live aten dispatch. Verify each
-    # shape/stride before using the bit-exact fused kernel, outside capture.
-    if (
-        not _LONGCAT_LN_MOD.disabled
-        and x.is_cuda
-        and diffusion_ops.is_plain_layer_norm(norm, x.shape[-1])
-        and diffusion_ops.can_use_fused_layernorm_modulate(x, scale, shift)
-    ):
-        sig = (
+
+    if torch.is_grad_enabled() or torch.compiler.is_compiling():
+        return reference()
+    # LayerNorm's reduction depends on the live aten dispatch, so each
+    # shape/stride is verified separately.
+    return layernorm_modulate_bitexact(
+        _LONGCAT_LN_MOD,
+        norm,
+        x,
+        scale,
+        shift,
+        reference,
+        sig=(
             x.shape,
             x.stride(),
             scale.shape,
@@ -116,21 +128,22 @@ def _longcat_norm_modulate(
             norm.eps,
             x.dtype,
             x.device,
-        )
-        verified = _LONGCAT_LN_MOD.is_verified(sig)
-        if verified or not torch.cuda.is_current_stream_capturing():
-            try:
-                out = diffusion_ops.fused_layernorm_modulate(x, scale, shift, norm.eps)
-            except Exception as exc:
-                _LONGCAT_LN_MOD.on_exception(exc, logger=logger)
-            else:
-                if verified:
-                    return out
-                reference = norm(x) * (1 + scale[:, None]) + shift[:, None]
-                return _LONGCAT_LN_MOD.accept_or_fallback(
-                    out, reference, sig=sig, logger=logger
-                )
-    return norm(x) * (1 + scale[:, None]) + shift[:, None]
+        ),
+    )
+
+
+def _longcat_modulation(norm, emb, cache, chunks):
+    if (
+        cache is not None
+        and type(norm.linear) is nn.Linear
+        and type(norm.silu) is nn.SiLU
+        and not norm.silu.inplace
+        and getattr(norm, "emb", None) is None
+    ):
+        values = cache.get(id(norm))
+        if values is not None:
+            return values
+    return norm.linear(norm.silu(emb)).chunk(chunks, dim=1)
 
 
 class _LongCatAdaLayerNormZero(AdaLayerNormZero):
@@ -141,21 +154,24 @@ class _LongCatAdaLayerNormZero(AdaLayerNormZero):
         class_labels: Optional[torch.LongTensor] = None,
         hidden_dtype: Optional[torch.dtype] = None,
         emb: Optional[torch.Tensor] = None,
+        modulation_cache: Optional[dict] = None,
     ):
         if self.emb is not None:
             emb = self.emb(timestep, class_labels, hidden_dtype=hidden_dtype)
-        emb = self.linear(self.silu(emb))
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = emb.chunk(
-            6, dim=1
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+            _longcat_modulation(self, emb, modulation_cache, 6)
         )
         x = _longcat_norm_modulate(self.norm, x, scale_msa, shift_msa)
         return x, gate_msa, shift_mlp, scale_mlp, gate_mlp
 
 
 class _LongCatAdaLayerNormZeroSingle(AdaLayerNormZeroSingle):
-    def forward(self, x: torch.Tensor, emb: Optional[torch.Tensor] = None):
-        emb = self.linear(self.silu(emb))
-        shift_msa, scale_msa, gate_msa = emb.chunk(3, dim=1)
+    def forward(
+        self, x: torch.Tensor, emb: Optional[torch.Tensor] = None, modulation_cache=None
+    ):
+        shift_msa, scale_msa, gate_msa = _longcat_modulation(
+            self, emb, modulation_cache, 3
+        )
         return _longcat_norm_modulate(self.norm, x, scale_msa, shift_msa), gate_msa
 
 
@@ -259,10 +275,6 @@ def _apply_longcat_qknorm_rope(
                 ref,
                 equal=tensors_equal,
                 logger=logger,
-                mismatch_msg=(
-                    "LongCat fused QKNorm+RoPE is not bit-exact on this "
-                    "platform; falling back to the Diffusers chain"
-                ),
             )
 
     return _longcat_qknorm_rope_reference(
@@ -317,14 +329,16 @@ class _LongCatFFN(nn.Module):
             ]
         )
         self.act = nn.GELU(approximate="tanh")
-        # extra-high/high site: up-proj GEMM + tanh-GELU epilogue. Off by
+        # lossless/high site: up-proj GEMM + tanh-GELU epilogue. Off by
         # default; the denoising stage mounts it per batch. The ModuleDict holds
         # `proj` in _modules, so getattr resolves it for the fusion helper.
-        mark_fused_gelu_site(self.net[0], "proj")
+        FUSED_LINEAR_GELU.mark(self.net[0], "proj")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         proj = self.net[0]["proj"]
-        if fused_gelu_active(self.net[0]) and can_use_linear_gelu(proj, hidden_states):
+        if FUSED_LINEAR_GELU.is_enabled(self.net[0]) and can_use_linear_gelu(
+            proj, hidden_states
+        ):
             hidden_states = fused_linear_gelu_tanh(
                 hidden_states, proj.weight, proj.bias
             )
@@ -606,14 +620,14 @@ class _SingleTransformerBlock(nn.Module):
             prefix=f"{prefix}.proj_mlp",
         )
         self.act_mlp = nn.GELU(approximate="tanh")
-        # extra-high/high site: proj_mlp GEMM + tanh-GELU epilogue,
+        # lossless/high site: proj_mlp GEMM + tanh-GELU epilogue,
         # mounted per batch by the denoising stage; off (bit-exact) by default.
-        mark_fused_gelu_site(self, "proj_mlp")
-        # proj_out: RowParallelLinear reduces sharded [attn | mlp] concat via
-        # all-reduce, matching Flux2SingleTransformerBlockAttention.to_out.
+        FUSED_LINEAR_GELU.mark(self, "proj_mlp")
+        # each rank consumes independently sharded attention and MLP inputs
         self.proj_out = RowParallelLinear(
             dim + self.mlp_hidden_dim,
             dim,
+            input_sizes=[num_attention_heads * attention_head_dim, self.mlp_hidden_dim],
             bias=True,
             input_is_parallel=True,
             prefix=f"{prefix}.proj_out",
@@ -626,37 +640,6 @@ class _SingleTransformerBlock(nn.Module):
             eps=1e-6,
             prefix=f"{prefix}.attn",
         )
-        tp_size = get_tp_world_size()
-        if tp_size > 1:
-            self._patch_proj_out_weight_loader(
-                inner_dim=num_attention_heads * attention_head_dim,
-                mlp_dim=self.mlp_hidden_dim,
-                tp_size=tp_size,
-            )
-
-    def _patch_proj_out_weight_loader(
-        self, inner_dim: int, mlp_dim: int, tp_size: int
-    ) -> None:
-        # proj_out input is [attn_shard | mlp_shard] where the two shards come
-        # from non-contiguous column ranges in the checkpoint weight matrix.
-        # Default RowParallelLinear.weight_loader slices contiguously, which is
-        # wrong here; override it to pick the correct columns per rank.
-        proj_out = self.proj_out
-        tp_rank = proj_out.tp_rank
-
-        def _loader(param, loaded_weight):
-            input_dim = getattr(param, "input_dim", None)
-            if input_dim is not None:
-                a = inner_dim // tp_size
-                m = mlp_dim // tp_size
-                attn_cols = loaded_weight.narrow(input_dim, tp_rank * a, a)
-                mlp_cols = loaded_weight.narrow(input_dim, inner_dim + tp_rank * m, m)
-                param.data.copy_(torch.cat([attn_cols, mlp_cols], dim=input_dim))
-            else:
-                param.data.copy_(loaded_weight)
-
-        proj_out.weight_loader = _loader
-        proj_out.weight.weight_loader = _loader
 
     def forward(
         self,
@@ -666,14 +649,17 @@ class _SingleTransformerBlock(nn.Module):
         image_rotary_emb=None,
         cos_sin_cache=None,
         positions=None,
+        modulation_cache=None,
         **kwargs,
     ):
         text_seq_len = encoder_hidden_states.shape[1]
         hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
 
         residual = hidden_states
-        norm_hidden_states, gate = self.norm(hidden_states, emb=temb)
-        gelu_in_projection = fused_gelu_active(self) and can_use_linear_gelu(
+        norm_hidden_states, gate = self.norm(
+            hidden_states, emb=temb, modulation_cache=modulation_cache
+        )
+        gelu_in_projection = FUSED_LINEAR_GELU.is_enabled(self) and can_use_linear_gelu(
             self.proj_mlp, norm_hidden_states
         )
         if gelu_in_projection:
@@ -745,13 +731,16 @@ class _TransformerBlock(nn.Module):
         image_rotary_emb=None,
         cos_sin_cache=None,
         positions=None,
+        modulation_cache=None,
         **kwargs,
     ):
         norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.norm1(
-            hidden_states, emb=temb
+            hidden_states, emb=temb, modulation_cache=modulation_cache
         )
         norm_encoder_hidden_states, c_gate_msa, c_shift_mlp, c_scale_mlp, c_gate_mlp = (
-            self.norm1_context(encoder_hidden_states, emb=temb)
+            self.norm1_context(
+                encoder_hidden_states, emb=temb, modulation_cache=modulation_cache
+            )
         )
 
         attn_output, context_attn_output = self.attn(
@@ -943,6 +932,72 @@ class LongCatImageTransformer2DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
 
         self.layer_names = ["transformer_blocks", "single_transformer_blocks"]
 
+    def _time_conditioning(self, hidden_states):
+        if (
+            torch.compiler.is_compiling()
+            or torch.is_grad_enabled()
+            or not hidden_states.is_cuda
+        ):
+            return None
+        context = get_forward_context_or_none()
+        if context is None or context.current_timestep < 0:
+            return None
+        batch = context.forward_batch
+        if (
+            batch is None
+            or not batch.do_classifier_free_guidance
+            or hidden_states.shape[0] != 1
+        ):
+            return None
+        server_args = get_global_server_args()
+        if (
+            server_args.enable_breakable_cuda_graph
+            or server_args.enable_cfg_parallel
+            or server_args.sp_degree != 1
+            or self.layerwise_offload_managers
+            or torch.cuda.is_current_stream_capturing()
+            or not all(
+                type(block) is _TransformerBlock and "forward" not in vars(block)
+                for block in self.transformer_blocks
+            )
+            or not all(
+                type(block) is _SingleTransformerBlock and "forward" not in vars(block)
+                for block in self.single_transformer_blocks
+            )
+        ):
+            return None
+        # Keep the native one-row projections and reuse each layer's weights
+        # across timesteps. The denoising stage clears this request-local state.
+        state = batch.extra.setdefault(DENOISING_LOOP_STATE, {}).setdefault(
+            "longcat_modulations", {}
+        )
+        key = (hidden_states.dtype, hidden_states.device)
+        entry = state.get(id(self))
+        if entry is None or entry[0] is not batch.timesteps or entry[1] != key:
+            timesteps = batch.timesteps.to(
+                device=hidden_states.device, dtype=hidden_states.dtype
+            ).flatten()
+            embeddings = [
+                self.time_embed(t.reshape(1), hidden_states.dtype) for t in timesteps
+            ]
+            activations = [torch.nn.functional.silu(value) for value in embeddings]
+            by_step = [{} for _ in embeddings]
+            norms = [(block.norm1, 6) for block in self.transformer_blocks]
+            norms += [(block.norm1_context, 6) for block in self.transformer_blocks]
+            norms += [(block.norm, 3) for block in self.single_transformer_blocks]
+            for norm, chunks in norms:
+                if (
+                    type(norm.linear) is nn.Linear
+                    and type(norm.silu) is nn.SiLU
+                    and not norm.silu.inplace
+                    and getattr(norm, "emb", None) is None
+                ):
+                    for values, activation in zip(by_step, activations):
+                        values[id(norm)] = norm.linear(activation).chunk(chunks, dim=1)
+            entry = (batch.timesteps, key, embeddings, by_step)
+            state[id(self)] = entry
+        return entry[2][context.current_timestep], entry[3][context.current_timestep]
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -957,7 +1012,14 @@ class LongCatImageTransformer2DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         hidden_states, _ = self.x_embedder(hidden_states)
 
         # Raw scheduler timestep in [0, 1000] — fed directly (see module docstring).
-        temb = self.time_embed(timestep.to(hidden_states.dtype), hidden_states.dtype)
+        conditioning = self._time_conditioning(hidden_states)
+        if conditioning is None:
+            temb = self.time_embed(
+                timestep.to(hidden_states.dtype), hidden_states.dtype
+            )
+            modulation_cache = None
+        else:
+            temb, modulation_cache = conditioning
 
         encoder_hidden_states, _ = self.context_embedder(encoder_hidden_states)
 
@@ -979,6 +1041,7 @@ class LongCatImageTransformer2DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                 image_rotary_emb=image_rotary_emb,
                 cos_sin_cache=cos_sin_cache,
                 positions=positions,
+                modulation_cache=modulation_cache,
             )
 
         for block in self.single_transformer_blocks:
@@ -989,6 +1052,7 @@ class LongCatImageTransformer2DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                 image_rotary_emb=image_rotary_emb,
                 cos_sin_cache=cos_sin_cache,
                 positions=positions,
+                modulation_cache=modulation_cache,
             )
 
         hidden_states = self.norm_out(hidden_states, temb)
