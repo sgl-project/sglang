@@ -36,7 +36,7 @@ python benchmark/kernels/quantization/tuning_block_wise_kernel.py --N 5120 --K 2
 - `--N`, `--K`: Weight matrix dimensions (N=output_dim, K=input_dim). If not specified, uses `--tp-size` for DeepSeek-V3
 - `--tp-size`: Tensor parallelism size for DeepSeek-V3 (default: 8)
 - `--input-type`: `fp8` or `int8` (default: fp8)
-- `--block-n`, `--block-k`: Block quantization granularity (default: 128)
+- `--block-n`, `--block-k`: Block quantization granularity (default: 128). On CUDA, `--block-k` must be a multiple of 16 (for example 16, 32, 64 or 128); the tuner only tries K tiles that divide it, so recipes such as `[32, 32]` are supported.
 - `--batch-size`: Test single batch size (optional)
 
 ## How to Calculate N and K
