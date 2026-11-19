@@ -806,6 +806,10 @@ class DeepseekSparseAttnBackend(
             model_runner.token_to_kv_pool.dsa_kv_cache_store_fp8
         )
         self.kv_scale_ue8m0 = model_runner.token_to_kv_pool.kv_scale_ue8m0
+        # 352 B/token NVFP4 rows, read only by prims_ts
+        self.dsa_kv_cache_store_nvfp4 = (
+            model_runner.token_to_kv_pool.dsa_kv_cache_store_nvfp4
+        )
         self.dsa_index_topk = get_dsa_index_topk(hf_config)
         kimi_k31 = is_kimi_k31(hf_config)
         self.plans_padded_extend_rows = kimi_k31
@@ -913,12 +917,17 @@ class DeepseekSparseAttnBackend(
             and self.qk_rope_head_dim == 64
         )
         self._trtllm_q_pad_eager: dict[int, torch.Tensor] = {}
-        # prims_ts: the trtllm route with Prims-TS as the kernel
+        # prims_ts: the trtllm route with Prims-TS as the kernel, over the raw
+        # FP8 pool or the 352 B NVFP4 pool
         self._prims_ts: Optional[PrimsTSSparseMLA] = None
         if "prims_ts" in (self.dsa_prefill_impl, self.dsa_decode_impl):
-            if model_runner.kv_cache_dtype != torch.float8_e4m3fn:
+            if self.dsa_kv_cache_store_nvfp4:
+                prims_ts_kv_format = "nvfp4.fp8rope"
+            elif model_runner.kv_cache_dtype == torch.float8_e4m3fn:
+                prims_ts_kv_format = "native"
+            else:
                 raise ValueError(
-                    "--dsa-*-backend prims_ts needs --kv-cache-dtype fp8_e4m3."
+                    "--dsa-*-backend prims_ts needs --kv-cache-dtype fp8_e4m3 or nvfp4."
                 )
             _validate_prims_ts_dcp(
                 dcp_size=get_parallel().attn_dcp_size,
@@ -929,8 +938,11 @@ class DeepseekSparseAttnBackend(
                 num_heads=self.num_q_heads,
                 kv_lora_rank=self.kv_lora_rank,
                 qk_rope_head_dim=self.qk_rope_head_dim,
+                kv_cache_format=prims_ts_kv_format,
             )
-            self._prims_ts = PrimsTSSparseMLA(torch.device(self.device))
+            self._prims_ts = PrimsTSSparseMLA(
+                torch.device(self.device), prims_ts_kv_format
+            )
         self._trtllm_q_pad_graph: Optional[torch.Tensor] = None
         self.flashmla_kv_num_q_heads_prefill = _flashmla_kv_padded_heads(
             self.local_num_q_heads
@@ -1054,6 +1066,20 @@ class DeepseekSparseAttnBackend(
             self.qk_rope_head_dim,
             self.dsa_prefill_impl,
         )
+
+        if self.dsa_kv_cache_store_nvfp4:
+            from sglang.srt.model_executor.cuda_graph_config import Backend
+
+            # Checked here, against the resolved config: the JSON config and
+            # --cuda-graph-backend-prefill override --disable-prefill-cuda-graph.
+            prefill_graph = get_exec().graph.cuda_graph_config.prefill.backend
+            if prefill_graph != Backend.DISABLED:
+                raise ValueError(
+                    "prims_ts with NVFP4 KV supports decode CUDA graphs only; got "
+                    f"prefill CUDA graph backend {prefill_graph!r}. Use "
+                    "--disable-prefill-cuda-graph."
+                )
+
         # Unsupported flashmla_sparse_q8 configs must fail at launch, not mid-forward.
         _validate_flashmla_sparse_q8_backend(
             prefill_impl=self.dsa_prefill_impl,
@@ -4674,13 +4700,11 @@ class DeepseekSparseAttnBackend(
                 ),
             )
         q_prebuilt = (
-            self._trtllm_fused_q
-            and self.kv_cache_dtype == torch.float8_e4m3fn
-            and cos_sin_cache is None
-            and q_rope is not None
-        )
+            (self._trtllm_fused_q and self.kv_cache_dtype == torch.float8_e4m3fn)
+            or self.dsa_kv_cache_store_nvfp4
+        ) and (cos_sin_cache is None and q_rope is not None)
         if q_prebuilt:
-            # The pool casts k on write, the same values as casting it here.
+            # The pool quantizes k on write (FP8 cast or the NVFP4 writer).
             q_all = self._trtllm_q_fp8(
                 q, q_rope, layer.tp_q_head_num, pad_heads=not use_prims_ts
             )
@@ -4854,9 +4878,12 @@ class DeepseekSparseAttnBackend(
             sparse_mla_top_k_lens = prepare_trtllm_nope_sparse_metadata(page_table_1)
 
         q_scale = 1.0
+        # NVFP4 rows carry their own block scales; a checkpoint KV scale does
+        # not apply to them.
         k_scale = (
             layer.k_scale_float
             if getattr(layer, "k_scale_float", None) is not None
+            and not self.dsa_kv_cache_store_nvfp4
             else 1.0
         )
         bmm1_scale = q_scale * k_scale * layer.scaling

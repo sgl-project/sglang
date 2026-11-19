@@ -3859,6 +3859,14 @@ def calculate_mla_kv_cache_dim(
     if not is_dsa_model:
         return kv_cache_dim
 
+    if is_float4_e2m1fn_x2(kv_cache_dtype):
+        # DSA NVFP4 is the 352 B/token row that prims_ts reads.
+        from sglang.kernels.ops.kvcache.dsa_prims_nvfp4_kv_cache import (
+            PRIMS_NVFP4_BYTES_PER_TOKEN,
+        )
+
+        return PRIMS_NVFP4_BYTES_PER_TOKEN
+
     # TRTLLM and Prims-TS use the raw MLA KV layout. In disaggregated serving
     # only the backend for the local role determines the local pool layout; the
     # inactive role may legitimately have a different default backend.

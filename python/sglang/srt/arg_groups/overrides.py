@@ -577,7 +577,10 @@ def _dsa_kv_cache_dtype_default(view: Any) -> dict:
     assert kv_cache_dtype in [
         "bfloat16",
         "fp8_e4m3",
-    ], "DeepSeek DSA only supports bf16/bfloat16 or fp8_e4m3 kv_cache_dtype"
+        "nvfp4",
+    ], (
+        "DeepSeek DSA only supports bf16/bfloat16, fp8_e4m3 or nvfp4 (prims_ts) kv_cache_dtype"
+    )
     if kv_cache_dtype != view.kv_cache_dtype:
         return {"kv_cache_dtype": kv_cache_dtype}
     return {}
@@ -708,6 +711,8 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
         return _kimi_k31_dsa_backends(view)
 
     kv_cache_dtype = view.kv_cache_dtype
+    if kv_cache_dtype == "nvfp4":
+        return _prims_ts_nvfp4_backends(view, hf_config, major)
     user_set_prefill = view.dsa_prefill_backend is not None
     user_set_decode = view.dsa_decode_backend is not None
     declared: Dict[str, Any] = {}
@@ -815,6 +820,69 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
     logger.warning(
         f"Set DSA backends for {kv_cache_dtype} KV Cache: "
         f"prefill={prefill}, decode={decode}."
+    )
+    return declared
+
+
+# Boolean server arguments the prims_ts NVFP4 route has not been tested with
+_PRIMS_TS_NVFP4_UNSUPPORTED = (
+    "enable_mixed_chunk",
+    "enable_hierarchical_cache",
+    "enable_hisparse",
+    "enable_lmcache",
+    "enable_prefill_cp",
+    "enable_two_batch_overlap",
+    "enable_unified_memory",
+    "enable_page_major_kv_layout",
+    "enable_unified_cache_external_linker",
+    "enable_session_radix_cache",
+    "enable_mis",
+    "enable_kv_cache_sharding",
+    "prefill_only_disable_kv_cache",
+    "enable_torch_compile",
+)
+
+
+def _prims_ts_nvfp4_backends(view: Any, hf_config: Any, major: int) -> Dict[str, Any]:
+    """DSA NVFP4 KV is the 352 B/token Prims-TS row, which only prims_ts reads:
+    pin both phases to it and reject what the tested configuration excludes."""
+    declared = _pin_dsa_backends(
+        view,
+        "prims_ts",
+        lambda option, value: (
+            f"DSA --kv-cache-dtype nvfp4 is read only by prims_ts; got {option} {value!r}"
+        ),
+    )
+    if get_platform().is_hip or major != 10:
+        raise ValueError("DSA NVFP4 KV (prims_ts) requires SM100, SM103 or SM107")
+    if hf_config.architectures[0] != "GlmMoeDsaForCausalLM":
+        raise ValueError("DSA NVFP4 KV (prims_ts) is validated for GLM-5.2 only")
+    effective = {
+        view.prefill_attention_backend or view.attention_backend,
+        view.decode_attention_backend or view.attention_backend,
+    }
+    if effective != {"dsa"}:
+        raise ValueError(
+            "DSA NVFP4 KV needs dsa as the prefill and decode attention backend"
+        )
+    if not view.disable_radix_cache:
+        raise ValueError("DSA NVFP4 KV (prims_ts) requires --disable-radix-cache")
+    # Prefill CUDA graphs are rejected at backend init, against the resolved
+    # cuda_graph_config.
+    bad = [name for name in _PRIMS_TS_NVFP4_UNSUPPORTED if getattr(view, name)]
+    if view.speculative_algorithm:
+        bad.append("speculative_algorithm (including MTP)")
+    if view.dllm_algorithm:
+        bad.append("dllm_algorithm")
+    if view.disaggregation_mode != "null":
+        bad.append("disaggregation_mode")
+    for name in ("dcp_size", "attn_cp_size"):
+        if (getattr(view, name) or 1) != 1:
+            bad.append(name)
+    if bad:
+        raise ValueError("DSA NVFP4 KV (prims_ts) does not support: " + ", ".join(bad))
+    logger.warning(
+        "Set DSA backends for nvfp4 KV Cache: prefill=prims_ts, decode=prims_ts."
     )
     return declared
 
