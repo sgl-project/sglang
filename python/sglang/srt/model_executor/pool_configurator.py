@@ -1376,8 +1376,10 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             )
             assert draft_layers > 0, "DSpark draft layer count is required"
         # A draft SWA ring is budgeted with the request windows, not per SWA token.
-        draft_ring_layers = draft_layers if uses_draft_swa_ring() else 0
-        self.paged_draft_layers = draft_layers - draft_ring_layers
+        # Kept on the configurator: platform pools that lay the ring out differently
+        # re-price its pages from this count.
+        self.draft_ring_layers = draft_layers if uses_draft_swa_ring() else 0
+        self.paged_draft_layers = draft_layers - self.draft_ring_layers
         self.request_window_bytes = 0
         if self.encoder_replay:
             slots = self.requested_max_running_requests_per_worker + 1
@@ -1404,7 +1406,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 + 4 * scratch * (self.kv_bytes + 16)
                 + slots * 3 * 16 * self.attn_head_dim * 8
                 + (slots * draft_ring_size + self.page_size)
-                * draft_ring_layers
+                * self.draft_ring_layers
                 * self.kv_bytes
             )
             # Keep the separate metadata/scratch reserve, but bound the budget
@@ -1436,7 +1438,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             )
             draft_ring_bytes = (
                 (request_slots * draft_ring_size + self.page_size)
-                * draft_ring_layers
+                * self.draft_ring_layers
                 * self.kv_bytes
             )
             self.request_window_bytes = max(
