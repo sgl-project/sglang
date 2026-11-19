@@ -3,8 +3,9 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/model_executor/layers/fused_moe/layer.py
 
 import logging
+import mmap
 from enum import Enum
-from functools import cached_property
+from functools import cache, cached_property
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -156,12 +157,39 @@ def _copy_weight_view_before_h2d(loaded_weight: torch.Tensor) -> torch.Tensor:
     return loaded_weight.clone(memory_format=torch.contiguous_format)
 
 
+@cache
+def _faults_pageable_copies(device_index: int) -> bool:
+    """Whether the GPU reads pageable host memory through the host page tables
+    (e.g. Grace Hopper/Blackwell): host-to-device copies from an unfaulted
+    mapping then take their page faults inside the driver copy."""
+    try:
+        from cuda.bindings import runtime as cudart
+    except ImportError:
+        return False
+    attr = cudart.cudaDeviceAttr.cudaDevAttrPageableMemoryAccessUsesHostPageTables
+    err, value = cudart.cudaDeviceGetAttribute(attr, device_index)
+    return err == cudart.cudaError_t.cudaSuccess and bool(value)
+
+
 def _maybe_copy_weight_view_before_h2d(
     loaded_weight: torch.Tensor,
 ) -> torch.Tensor:
-    if not envs.SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D.get():
-        return loaded_weight
-    return _copy_weight_view_before_h2d(loaded_weight)
+    if envs.SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D.get():
+        return _copy_weight_view_before_h2d(loaded_weight)
+    # Faulting a safetensors mmap inside the driver copy is several times
+    # slower than faulting it on the CPU: touch one byte per page first.
+    # Non-contiguous sources are already gathered on the CPU by copy_.
+    if (
+        loaded_weight.device.type == "cpu"
+        and loaded_weight.numel() > 1
+        and loaded_weight.is_contiguous()
+        and torch.cuda.is_available()
+        and _faults_pageable_copies(torch.cuda.current_device())
+    ):
+        flat = loaded_weight.reshape(-1).view(torch.uint8)
+        flat[:: mmap.PAGESIZE].sum()
+        flat[-1:].sum()
+    return loaded_weight
 
 
 def _weight_layout_method(layer):
