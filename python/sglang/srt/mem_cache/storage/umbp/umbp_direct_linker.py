@@ -4,7 +4,7 @@ import logging
 import os
 import threading
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from queue import Empty, Queue
 from typing import Any, Callable
 
@@ -18,6 +18,12 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
 )
+from sglang.srt.mem_cache.hybrid_cache.linker_key_identity import (
+    build_linker_unified_layout,
+)
+from sglang.srt.mem_cache.hybrid_cache.linker_page_unified import (
+    LinkerPageUnifiedStager,
+)
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     resolve_hybrid_device_pool_group,
 )
@@ -27,8 +33,10 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     UnifiedCacheLinker,
 )
 from sglang.srt.runtime_context import (
+    get_memory,
     get_model,
     get_parallel,
+    get_serving,
 )
 from sglang.srt.utils import freeze_gc, get_device_module
 
@@ -192,7 +200,25 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             components=components,
         )
         rank_replicated = self.pool_group.rank_replicated
-        self.pools = self.pool_group.entry_map
+        model_name = get_model().model_path
+        self._unified_layout = None
+        if get_memory().hicache_storage_key_scheme == "unified":
+            self._unified_layout = build_linker_unified_layout(
+                kvcache,
+                self.pool_group,
+                model_name=get_serving().served_model_name or model_name,
+                params=params,
+            )
+        layout = self._unified_layout
+        self.pools = layout.entries if layout else self.pool_group.entry_map
+        self._load_stager = None
+        self._offload_stager = None
+        if layout and layout.head_group_num > 1:
+            kv_entry = self.pools[PoolName.KV]
+            self._load_stager = LinkerPageUnifiedStager(kv_entry, layout.head_group_num)
+            self._offload_stager = LinkerPageUnifiedStager(
+                kv_entry, layout.head_group_num
+            )
         self.num_layers = self.pool_group.num_layers
         if self.num_layers <= 0:
             raise ValueError("UMBP requires at least one logical layer.")
@@ -235,13 +261,14 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         else:
             extra_config["cache_remote_fetches"] = False
 
+        load_entries = dict(self.pools)
+        if self._load_stager is not None:
+            load_entries[PoolName.KV] = self._load_stager.entry
         min_object_size = min(
-            min(
-                pool.get_page_buffer_meta(
-                    torch.arange(pool.page_size, dtype=torch.int64)
-                )[1]
-            )
-            for pool in self.pools.values()
+            size
+            for entry in load_entries.values()
+            for component in entry.buffer_meta
+            for _, _, size in component
         )
         if standalone_requested:
             extra_config.pop("dram_page_size", None)
@@ -266,20 +293,18 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             pp_size=params.pp_size,
             attn_cp_rank=params.attn_cp_rank,
             attn_cp_size=params.attn_cp_size,
-            is_mla_model=True,
+            is_mla_model=rank_replicated if layout else True,
             enable_storage_metrics=False,
             is_page_first_layout=False,
-            model_name=get_model().model_path,
+            model_name=layout.model_name if layout else model_name,
             extra_config=extra_config,
         )
 
         if _storage is None:
             from sglang.srt.mem_cache.storage.umbp.umbp_store import UMBPStore
 
-            # per_rank_keyspace: every object key this class writes carries a
-            # tp{rank} suffix (set just below), so the store must not put the
-            # ranks into the shared-SSD leader/follower scheme meant for
-            # deduplicating replicated MLA KV.
+            # A local store is private to its rank. Every rank writes even
+            # when its keys and bytes match another rank's.
             self.storage = UMBPStore(
                 storage_config, mem_pool_host=None, per_rank_keyspace=True
             )
@@ -346,6 +371,8 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                 rank_replicated,
                 rank_suffix,
             )
+            if layout:
+                logger.info("UMBP direct linker unified L3 keys: %s", layout.suffixes)
         except BaseException:
             self.storage.close()
             raise
@@ -382,7 +409,12 @@ class UMBPDirectLinker(UnifiedCacheLinker):
     def _register_buffers(self) -> None:
         seen = set()
         self._registered: list[tuple[int, int]] = []
-        for pool in self.pools.values():
+        if self._load_stager is None:
+            pools = self.pools.values()
+        else:
+            pools = [entry for name, entry in self.pools.items() if name != PoolName.KV]
+            pools.extend((self._load_stager.entry, self._offload_stager.entry))
+        for pool in pools:
             for buffer in pool.get_hybrid_pool_buffer():
                 storage = buffer.untyped_storage()
                 allocation = (int(storage.data_ptr()), int(storage.nbytes()))
@@ -399,26 +431,40 @@ class UMBPDirectLinker(UnifiedCacheLinker):
     def _object_keys_for_pages(
         self, page_keys: list[str], transfer: PoolTransfer
     ) -> tuple[list[str], int]:
-        component_keys, multiplier = self.storage._get_hybrid_page_component_keys(
-            page_keys, transfer
-        )
-        entry = self.pools[transfer.name]
+        if self._unified_layout is None:
+            component_keys, multiplier = self.storage._get_hybrid_page_component_keys(
+                page_keys, transfer
+            )
+        else:
+            suffixes = self._unified_layout.suffixes[transfer.name]
+            prefix = self.storage.config_prefix
+            prefix = f"{prefix}_" if prefix else ""
+            component_keys = [
+                f"{prefix}{page_key}_{suffix}"
+                for page_key in page_keys
+                for suffix in suffixes
+            ]
+            multiplier = len(suffixes)
         # One key names one stored object, and a packed entry stores a whole
         # page as one object regardless of how many components it has.
-        entries_per_page = 1 if entry.packed else len(entry.components)
+        entries_per_page = self._objects_per_page(transfer.name)
         if multiplier != entries_per_page:
             raise ValueError(
                 f"UMBP pool {transfer.name} produced {multiplier} keys per page "
-                f"but its layout yields {entries_per_page} objects per page "
-                f"(packed={entry.packed}, components={len(entry.components)})."
+                f"but its layout yields {entries_per_page} objects per page."
             )
         # No layer suffix: one object per page (or per page component) holds
         # every layer, and a layer is read back as a byte range inside it.
         return component_keys, multiplier
 
+    def _objects_per_page(self, name: PoolName) -> int:
+        if name == PoolName.KV and self._load_stager is not None:
+            return len(self._load_stager.entry.components)
+        entry = self.pools[name]
+        return 1 if entry.packed else len(entry.components)
+
     def _page_exists(self, page_keys: list[str], transfer: PoolTransfer) -> list[bool]:
-        entry = self.pools[transfer.name]
-        objects_per_page = 1 if entry.packed else len(entry.components)
+        objects_per_page = self._objects_per_page(transfer.name)
         max_objects = CHUNK_PAGES * self.num_layers
         pages_per_call = max(1, max_objects // objects_per_page)
 
@@ -544,7 +590,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         cpu_indices: dict[int, torch.Tensor] = {}
         for name, transfers in grouped.items():
             entry = self.pools[name]
-            entries_per_page = 1 if entry.packed else len(entry.components)
+            entries_per_page = self._objects_per_page(name)
             keys: list[str] = []
             locations: list[int] = []
             for transfer in transfers:
@@ -803,6 +849,50 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         ranges_per_object = max((len(entry) for entry in sizes), default=1)
         return max(1, RANGES_PER_CALL // max(1, ranges_per_object))
 
+    @staticmethod
+    def _pool_windows(plan: _PoolRangePlan, stager: LinkerPageUnifiedStager | None):
+        if stager is None or plan.name != PoolName.KV:
+            yield plan, None
+            return
+        stride = plan.entries_per_page
+        for start in range(0, len(plan.locations), stager.capacity):
+            end = start + stager.capacity
+            locations = plan.locations[start:end]
+            yield (
+                replace(
+                    plan,
+                    keys=plan.keys[start * stride : end * stride],
+                    locations=list(range(len(locations))),
+                    entry=stager.entry,
+                ),
+                locations,
+            )
+
+    def _read_layer_group(self, plan: _PoolRangePlan, group: list[int]) -> None:
+        meta = self._layer_group_ranges(plan, group)
+        if meta is None:
+            return
+        ptrs, sizes, offsets = meta
+        step = self._entries_per_call(sizes)
+        for start in range(0, len(plan.keys), step):
+            end = start + step
+            chunk_keys = plan.keys[start:end]
+            results = list(
+                self.storage.client.batch_get_ranges_into_ptr(
+                    chunk_keys,
+                    ptrs[start:end],
+                    sizes[start:end],
+                    offsets[start:end],
+                )
+            )
+            if len(results) != len(chunk_keys) or not all(results):
+                raise RuntimeError(
+                    f"UMBP get failed for pool={plan.name}, "
+                    f"layers={group[0]}..{group[-1]}: "
+                    f"success={sum(bool(value) for value in results)}/"
+                    f"{len(chunk_keys)}."
+                )
+
     def _run_layer_wise_batch(
         self, counter_index: int, plans: list[_PoolRangePlan], ready: TransferReady
     ) -> None:
@@ -815,33 +905,12 @@ class UMBPDirectLinker(UnifiedCacheLinker):
 
             for group in self._layer_groups():
                 for plan in self._plans_covering(by_layer, group):
-                    meta = self._layer_group_ranges(plan, group)
-                    if meta is None:
-                        continue
-                    ptrs, sizes, offsets = meta
-                    step = self._entries_per_call(sizes)
-                    for start in range(0, len(plan.keys), step):
-                        end = start + step
-                        chunk_keys = plan.keys[start:end]
-                        results = list(
-                            self.storage.client.batch_get_ranges_into_ptr(
-                                chunk_keys,
-                                ptrs[start:end],
-                                sizes[start:end],
-                                offsets[start:end],
-                            )
-                        )
-                        if len(results) != len(chunk_keys) or not all(results):
-                            where = (
-                                f"layer={group[0]}"
-                                if len(group) == 1
-                                else f"layers={group[0]}..{group[-1]}"
-                            )
-                            raise RuntimeError(
-                                f"UMBP get failed for pool={plan.name}, {where}: "
-                                f"success={sum(bool(value) for value in results)}/"
-                                f"{len(chunk_keys)}."
-                            )
+                    for window, locations in self._pool_windows(
+                        plan, self._load_stager
+                    ):
+                        self._read_layer_group(window, group)
+                        if locations is not None:
+                            self._load_stager.unpack(locations, group)
                 # Only now is every layer in the group readable, so they are
                 # released together. A group wider than 1 trades overlap
                 # granularity for fewer times each object is named on the wire.
@@ -936,53 +1005,55 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         # Over plans, not transfers: a plan already carries every task's keys
         # for its pool, so walking transfers would put that pool once per task.
         for plan in plans:
-            entry = plan.entry
-            # From the pool layout, never from the ranges below: see
-            # _object_sizes_per_page.
-            per_page = _object_sizes_per_page(entry)
-            if len(per_page) != plan.entries_per_page:
-                raise ValueError(
-                    f"UMBP pool {plan.name} declares {len(per_page)} object "
-                    f"sizes per page but yields {plan.entries_per_page} objects."
-                )
-            object_sizes = [
-                per_page[index % plan.entries_per_page]
-                for index in range(len(plan.keys))
-            ]
-            ptrs, sizes, offsets = self._all_layer_ranges(plan)
-
-            # Preserve page order so the tier can collapse a layer into a strided copy.
-
-            # An object's ranges must tile it exactly, so a chunk boundary may
-            # fall between objects but never inside one.
-            step = self._entries_per_call(sizes)
-            for start in range(0, len(plan.keys), step):
-                end = start + step
-                chunk_keys = plan.keys[start:end]
-                results = list(
-                    self.storage.client.batch_put_ranges_from_ptr(
-                        chunk_keys,
-                        object_sizes[start:end],
-                        ptrs[start:end],
-                        sizes[start:end],
-                        offsets[start:end],
-                    )
-                )
-                if len(results) != len(chunk_keys) or not all(results):
-                    logger.warning(
-                        "UMBP offload failed: pool=%s object_range=[%d,%d) "
-                        "success=%d/%d returned=%d",
-                        plan.name,
-                        start,
-                        min(end, len(plan.keys)),
-                        sum(bool(value) for value in results),
-                        len(chunk_keys),
-                        len(results),
-                    )
+            for window, locations in self._pool_windows(plan, self._offload_stager):
+                if locations is not None:
+                    self._offload_stager.pack(locations)
+                if not self._write_plan(window):
                     return False
 
         self._stats["offload"] += len(tasks)
         self._stats["offload_batches"] += 1
+        return True
+
+    def _write_plan(self, plan: _PoolRangePlan) -> bool:
+        per_page = _object_sizes_per_page(plan.entry)
+        if len(per_page) != plan.entries_per_page:
+            raise ValueError(
+                f"UMBP pool {plan.name} declares {len(per_page)} object "
+                f"sizes per page but yields {plan.entries_per_page} objects."
+            )
+        object_sizes = [
+            per_page[index % plan.entries_per_page] for index in range(len(plan.keys))
+        ]
+        ptrs, sizes, offsets = self._all_layer_ranges(plan)
+
+        # An object's ranges must tile it exactly. Preserve page order so the
+        # tier can collapse a layer into a strided copy.
+        step = self._entries_per_call(sizes)
+        for start in range(0, len(plan.keys), step):
+            end = start + step
+            chunk_keys = plan.keys[start:end]
+            results = list(
+                self.storage.client.batch_put_ranges_from_ptr(
+                    chunk_keys,
+                    object_sizes[start:end],
+                    ptrs[start:end],
+                    sizes[start:end],
+                    offsets[start:end],
+                )
+            )
+            if len(results) != len(chunk_keys) or not all(results):
+                logger.warning(
+                    "UMBP offload failed: pool=%s object_range=[%d,%d) "
+                    "success=%d/%d returned=%d",
+                    plan.name,
+                    start,
+                    min(end, len(plan.keys)),
+                    sum(bool(value) for value in results),
+                    len(chunk_keys),
+                    len(results),
+                )
+                return False
         return True
 
     def _freeze_gc_once(self) -> None:

@@ -109,6 +109,52 @@ class TestUnifiedKeySchemeArgs(CustomTestCase):
         self.assertEqual(resolution_result(args, "hicache_mem_layout"), "page_unified")
         self.assertEqual(resolution_result(args, "hicache_io_backend"), "kernel")
 
+    def test_direct_linker_accepts_unified_keys_without_host_layout(self):
+        for backend in ("mooncake", "mori"):
+            with self.subTest(backend=backend):
+                args = _resolve(
+                    enable_unified_cache_external_linker=True,
+                    unified_cache_external_linker_backend=backend,
+                    enable_hierarchical_cache=False,
+                    hicache_storage_backend=None,
+                    hicache_storage_head_partition=2,
+                    hicache_mem_layout="layer_first",
+                    hicache_io_backend="direct",
+                )
+                self.assertEqual(
+                    resolution_result(args, "hicache_mem_layout"), "layer_first"
+                )
+                self.assertEqual(
+                    resolution_result(args, "hicache_io_backend"), "direct"
+                )
+
+    def test_direct_linker_rejects_unsupported_unified_topology(self):
+        linker_args = dict(
+            enable_unified_cache_external_linker=True,
+            enable_hierarchical_cache=False,
+            hicache_storage_backend=None,
+        )
+        for fields, message in (
+            (dict(hicache_storage_layer_partition=4), "layer-partition"),
+            (dict(attn_cp_size=2, enable_prefill_cp=True), "attention CP"),
+            (dict(dcp_size=2), "DCP"),
+            (
+                dict(
+                    unified_cache_external_linker_backend="dynamic",
+                    unified_cache_external_linker_config={
+                        "linker": "Example",
+                        "linker_module_path": "example",
+                    },
+                ),
+                "Mooncake or Mori",
+            ),
+        ):
+            with (
+                self.subTest(fields=fields),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                _resolve(**linker_args, **fields)
+
     def test_unified_refuses_speculative_decoding(self):
         # Draft layers sit on the host pool's layer axis but outside the grid.
         with self.assertRaises(NotImplementedError):

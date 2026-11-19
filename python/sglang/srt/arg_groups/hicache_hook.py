@@ -71,6 +71,7 @@ def handle_hicache(server_args: Any):
                 "config was removed in SGLang 1.0; pass the same options as a "
                 "JSON object to --unified-cache-external-linker-config."
             )
+        resolve_hicache_key_scheme(server_args, direct_linker=True)
         return
 
     # Skip all normalization when neither hicache nor decode-offload path is active.
@@ -204,7 +205,7 @@ def _dsa_mtp_packs_into_dcp_host(server_args: Any) -> bool:
     return dsa_draft_shards_under_dcp(hf_config, cfg.dcp_size)
 
 
-def resolve_hicache_key_scheme(server_args: Any):
+def resolve_hicache_key_scheme(server_args: Any, *, direct_linker: bool = False):
     """Validate --hicache-storage-key-scheme and resolve what it implies."""
     cfg = resolving_view(server_args)
     unified = cfg.hicache_storage_key_scheme == "unified"
@@ -234,6 +235,21 @@ def resolve_hicache_key_scheme(server_args: Any):
             raise ValueError(
                 f"--{name.replace('_', '-')} must be positive, got {value}."
             )
+    if direct_linker:
+        if cfg.unified_cache_external_linker_backend not in ("mooncake", "mori"):
+            raise ValueError(
+                "--hicache-storage-key-scheme unified requires the Mooncake or "
+                "Mori backend when used with the direct linker."
+            )
+        if cfg.hicache_storage_layer_partition is not None:
+            raise ValueError(
+                "--hicache-storage-layer-partition is not supported by the direct linker."
+            )
+        if cfg.attn_cp_size > 1 or cfg.dcp_size > 1:
+            raise ValueError(
+                "Unified linker keys require attention CP and DCP sizes of 1."
+            )
+        return
     if cfg.hicache_storage_backend is None:
         raise ValueError(
             "--hicache-storage-key-scheme unified names L3 objects, so it needs "

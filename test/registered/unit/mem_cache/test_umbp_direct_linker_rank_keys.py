@@ -1,5 +1,6 @@
 """Unit tests for the UMBP direct linker's rank-replicated key handling."""
 
+import ctypes
 import unittest
 from queue import Queue
 from types import SimpleNamespace
@@ -8,7 +9,10 @@ from unittest import mock
 import torch
 
 import sglang.srt.mem_cache.unified_cache.unified_cache_linker as unified_cache_linker
-from sglang.srt.mem_cache.hicache_storage import PoolName
+from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.hybrid_cache.linker_page_unified import (
+    LinkerPageUnifiedStager,
+)
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import DevicePoolEntry
 from sglang.srt.mem_cache.storage.umbp.umbp_direct_linker import (
     UMBPDirectLinker,
@@ -97,6 +101,97 @@ class TestPackedDraftRanges(CustomTestCase):
         entry.layer_mapping = {3: (0, 1), 5: 1}
         with self.assertRaisesRegex(ValueError, "maps buffer 1 more than once"):
             _ordered_layers(entry)
+
+
+class TestUnifiedHeadGroups(CustomTestCase):
+    def test_windowed_offload_and_layer_wise_restore(self):
+        buffers = [
+            torch.arange(12 * 4 * 8, dtype=torch.int16).reshape(12, 4, 8) + 1000 * i
+            for i in range(6)
+        ]
+        entry = DevicePoolEntry(
+            name=PoolName.KV,
+            indices_from_pool=PoolName.KV,
+            device_pool=None,
+            components=[buffers],
+            layer_mapping={0: (0, 1), 1: (2, 3), 2: (4, 5)},
+            page_size=2,
+            rows_are_pages=False,
+        )
+        objects = {}
+
+        def put(keys, object_sizes, ptrs, sizes, offsets):
+            for key, size, ptr_row, size_row, offset_row in zip(
+                keys, object_sizes, ptrs, sizes, offsets, strict=True
+            ):
+                payload = bytearray(size)
+                for ptr, length, offset in zip(
+                    ptr_row, size_row, offset_row, strict=True
+                ):
+                    payload[offset : offset + length] = ctypes.string_at(ptr, length)
+                objects[key] = bytes(payload)
+            return [True] * len(keys)
+
+        def get(keys, ptrs, sizes, offsets):
+            for key, ptr_row, size_row, offset_row in zip(
+                keys, ptrs, sizes, offsets, strict=True
+            ):
+                for ptr, length, offset in zip(
+                    ptr_row, size_row, offset_row, strict=True
+                ):
+                    ctypes.memmove(ptr, objects[key][offset : offset + length], length)
+            return [True] * len(keys)
+
+        linker = UMBPDirectLinker.__new__(UMBPDirectLinker)
+        linker._unified_layout = SimpleNamespace(suffixes={PoolName.KV: ["H0", "H1"]})
+        linker._load_stager = LinkerPageUnifiedStager(entry, 2)
+        linker._offload_stager = LinkerPageUnifiedStager(entry, 2)
+        linker._load_stager.capacity = linker._offload_stager.capacity = 1
+        linker.storage = SimpleNamespace(
+            config_prefix="tenant_model",
+            client=SimpleNamespace(
+                batch_put_ranges_from_ptr=put,
+                batch_get_ranges_into_ptr=get,
+                batch_exists=lambda keys: [key in objects for key in keys],
+            ),
+        )
+        linker.pools = {PoolName.KV: entry}
+        linker.pool_layers = {PoolName.KV: [0, 1, 2]}
+        linker.layer_group = 2
+        linker.num_layers = 3
+        linker._async_offload_index_snapshot = False
+        linker._stats = {"offload": 0, "offload_batches": 0}
+        linker.layer_done_counter = unified_cache_linker.LayerWiseLoadCounter(3)
+        counter_index = linker.layer_done_counter.update_producer()
+        ready = SimpleNamespace(synchronize=lambda: None)
+        source_slots = torch.tensor([6, 7, 2, 3])
+        dest_slots = torch.tensor([8, 9, 4, 5])
+        offload = PoolTransfer(
+            name=PoolName.KV, keys=["a", "b"], host_indices=source_slots
+        )
+        self.assertTrue(linker._run_offload([([offload], ready)]))
+        self.assertEqual(linker._page_exists(["a", "b"], offload), [True, True])
+        for page, start in (("a", 6), ("b", 2)):
+            for group in range(2):
+                expected = (
+                    torch.stack(
+                        [
+                            b[start : start + 2, group * 2 : group * 2 + 2]
+                            for b in buffers
+                        ]
+                    )
+                    .numpy()
+                    .tobytes()
+                )
+                self.assertEqual(objects[f"tenant_model_{page}_H{group}"], expected)
+
+        load = PoolTransfer(name=PoolName.KV, keys=["a", "b"], host_indices=dest_slots)
+        linker._run_layer_wise_batch(
+            counter_index, linker._build_load_plans([[load]]), ready
+        )
+        self.assertTrue(linker.finish_layer_wise_loading(counter_index))
+        for buffer in buffers:
+            torch.testing.assert_close(buffer[dest_slots], buffer[source_slots])
 
 
 class TestEveryRankWrites(CustomTestCase):

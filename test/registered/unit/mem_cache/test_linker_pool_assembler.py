@@ -854,6 +854,92 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         self.assertEqual(sizes, [[11, 23]])
         self.assertEqual(offsets, [[7, 35]])
 
+    def test_unified_dsa_keys_distinguish_side_pools_and_draft_models(self):
+        from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+        from sglang.srt.mem_cache.hicache_key_scheme import plan_unified_kv
+        from sglang.srt.mem_cache.hybrid_cache import linker_key_identity
+        from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+
+        target = DSATokenToKVPool.__new__(DSATokenToKVPool)
+        target.page_size = 2
+        target.layer_num = 1
+        target.start_layer = 0
+        target.dtype = target.store_dtype = torch.bfloat16
+        target.kv_cache_dim = 16
+        target.kv_buffer = [torch.zeros((8, 1, 16), dtype=target.store_dtype)]
+        target.index_key_cache = SimpleNamespace(
+            buffer=[torch.zeros((4, 64), dtype=torch.uint8)]
+        )
+        params = CacheInitParams(
+            disable=False,
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=None,
+            page_size=2,
+        )
+        spec = SimpleNamespace(
+            speculative_algorithm="EAGLE",
+            speculative_draft_model_path="org/draft-a",
+            speculative_draft_model_revision=None,
+            speculative_draft_model_quantization=None,
+            speculative_draft_kv_cache_dtype=None,
+            speculative_draft_window_size=None,
+            speculative_draft_sink_size=None,
+        )
+
+        def build():
+            group = resolve_hybrid_device_pool_group(
+                kvcache=target,
+                page_size=2,
+                params=params,
+                components={ComponentType.FULL},
+            )
+            return linker_key_identity.build_linker_unified_layout(
+                target, group, model_name="org/target", params=params
+            ).suffixes
+
+        with (
+            patch.object(
+                linker_key_identity,
+                "get_memory",
+                return_value=SimpleNamespace(
+                    hicache_storage_head_partition=None,
+                    hicache_storage_layer_partition=None,
+                ),
+            ),
+            patch.object(
+                linker_key_identity,
+                "get_parallel",
+                return_value=SimpleNamespace(
+                    attn_tp_rank=0, attn_tp_size=1, attn_dcp_size=1
+                ),
+            ),
+            patch.object(linker_key_identity, "get_spec", return_value=spec),
+        ):
+            plain = build()
+            params.mtp_draft_device_pools = (target,)
+            packed_a = build()
+            spec.speculative_draft_model_path = "org/draft-b"
+            packed_b = build()
+
+        canonical = plan_unified_kv(
+            model_id="org/target-dtype_bfloat16",
+            dtype="bfloat16",
+            page_size=2,
+            rank_replicated=True,
+            local_kv_heads=0,
+            attn_tp_rank=0,
+            attn_tp_size=1,
+            attn_cp_size=1,
+            start_layer=0,
+            end_layer=1,
+            is_final_stage=True,
+        ).suffixes
+        self.assertEqual(plain[PoolName.KV], canonical)
+        self.assertNotEqual(plain[PoolName.INDEXER], canonical)
+        for pool_name in (PoolName.KV, PoolName.INDEXER):
+            self.assertNotEqual(plain[pool_name], packed_a[pool_name])
+            self.assertNotEqual(packed_a[pool_name], packed_b[pool_name])
+
     def test_draft_plan_packs_only_nextn_mtp(self):
         from sglang.srt.speculative import base_spec_worker as spec
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm

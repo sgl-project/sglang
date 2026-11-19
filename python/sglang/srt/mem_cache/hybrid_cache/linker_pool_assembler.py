@@ -45,6 +45,7 @@ class DevicePoolEntry:
         self.layer_mapping = layer_mapping
         self.page_size = page_size
         self.packed = packed
+        self.rows_are_pages = rows_are_pages
         # MLA-family pages have no head dimension to shard, so every attention-TP
         # rank holds identical bytes; KDA state in the same group is sharded.
         self.tp_replicated = tp_replicated
@@ -391,14 +392,66 @@ def _build_kv_device_pool_group(
     page_size: int,
     mtp_draft_device_pools: tuple[Any, ...] = (),
 ) -> DevicePoolGroup:
-    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+    from sglang.srt.mem_cache.memory_pool import (
+        DSATokenToKVPool,
+        MHATokenToKVPool,
+        MLATokenToKVPool,
+    )
 
-    if not isinstance(kvcache, DSATokenToKVPool):
+    if isinstance(kvcache, DSATokenToKVPool):
+        return _build_dsa_device_pool_group(kvcache, page_size, mtp_draft_device_pools)
+    if (
+        not isinstance(kvcache, (MHATokenToKVPool, MLATokenToKVPool))
+        or get_memory().hicache_storage_key_scheme != "unified"
+    ):
         raise ValueError(
             "The direct external linker supports only DSA among single KV "
             f"pools, got {type(kvcache).__name__}."
         )
-    return _build_dsa_device_pool_group(kvcache, page_size, mtp_draft_device_pools)
+    if kvcache.page_size != page_size:
+        raise ValueError("Device KV page size must match the tree page size.")
+    layer_mapping = {i: i for i in range(kvcache.layer_num)}
+    if isinstance(kvcache, MHATokenToKVPool):
+        if kvcache.use_hnd or any(
+            not isinstance(pool, MHATokenToKVPool) or pool.use_hnd
+            for pool in mtp_draft_device_pools
+        ):
+            raise ValueError("Unified linker keys require token-major MHA pools.")
+        entry = _mha_device_pool_entry(
+            PoolName.KV,
+            kvcache,
+            layer_mapping,
+            page_size,
+            draft_pools=mtp_draft_device_pools,
+        )
+        return DevicePoolGroup([entry], kvcache.layer_num, page_size)
+
+    if any(
+        type(pool) is not MLATokenToKVPool
+        or pool.page_size != page_size
+        or pool.layer_shard_enabled
+        or pool.kv_scale_buffer is not None
+        for pool in (kvcache, *mtp_draft_device_pools)
+    ):
+        raise ValueError(
+            "Unified linker keys require dense unscaled MLA pools "
+            "that match the tree page size."
+        )
+    buffers = list(kvcache.kv_buffer)
+    for draft in mtp_draft_device_pools:
+        buffers.extend(draft.kv_buffer)
+    entry = DevicePoolEntry(
+        name=PoolName.KV,
+        indices_from_pool=PoolName.KV,
+        device_pool=kvcache,
+        components=[buffers],
+        layer_mapping=_with_draft_buffers(
+            layer_mapping, range(kvcache.layer_num, len(buffers))
+        ),
+        page_size=page_size,
+        rows_are_pages=False,
+    )
+    return DevicePoolGroup([entry], kvcache.layer_num, page_size, rank_replicated=True)
 
 
 def _build_dsa_device_pool_group(

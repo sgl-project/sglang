@@ -11,14 +11,21 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.hicache_key_scheme import plan_unified_kv
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
     PoolName,
     PoolTransfer,
 )
+from sglang.srt.mem_cache.hybrid_cache import linker_key_identity, linker_pool_assembler
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
 from sglang.srt.mem_cache.pool_host.base import HostKVCache
 from sglang.srt.mem_cache.pool_host.page_unified import PageUnifiedLayout
+from sglang.srt.mem_cache.storage.mooncake_store import mooncake_direct_linker
+from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import MooncakeStore
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.mem_cache.unified_cache.unified_cache_linker import TransferReady
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -29,6 +36,11 @@ LAYERS = 4
 TOTAL_KV_HEADS = 4
 HEAD_DIM = 8
 PAGES = 3
+STORE_CONFIG = {
+    "master_server_address": "127.0.0.1:50051",
+    "check_server": False,
+    "global_segment_size": 0,
+}
 
 
 class _FakeCluster:
@@ -64,6 +76,15 @@ def _fake_store_class(cluster):
                 cluster.objects.setdefault(key, ctypes.string_at(ptr, size))
             return [0] * len(keys)
 
+        def batch_put_from_multi_buffers(self, keys, ptrs, sizes, *config):
+            for key, key_ptrs, key_sizes in zip(keys, ptrs, sizes, strict=True):
+                data = b"".join(
+                    ctypes.string_at(ptr, size)
+                    for ptr, size in zip(key_ptrs, key_sizes, strict=True)
+                )
+                cluster.objects.setdefault(key, data)
+            return [0] * len(keys)
+
         def batch_get_into(self, keys, ptrs, sizes):
             results = []
             for key, ptr, size in zip(keys, ptrs, sizes):
@@ -75,6 +96,46 @@ def _fake_store_class(cluster):
                     continue
                 ctypes.memmove(ptr, data, len(data))
                 results.append(len(data))
+            return results
+
+        def batch_get_into_multi_buffers(self, keys, ptrs, sizes):
+            results = []
+            for key, key_ptrs, key_sizes in zip(keys, ptrs, sizes, strict=True):
+                data = cluster.objects.get(key)
+                if data is None or len(data) > sum(key_sizes):
+                    results.append(-1)
+                    continue
+                offset = 0
+                for ptr, size in zip(key_ptrs, key_sizes, strict=True):
+                    chunk = data[offset : offset + size]
+                    ctypes.memmove(ptr, chunk, len(chunk))
+                    offset += size
+                results.append(len(data))
+            return results
+
+        def batch_get_session_start(self, keys):
+            return [0 if key in cluster.objects else -1 for key in keys]
+
+        def batch_get_session_end(self, keys):
+            return 0
+
+        def batch_get_into_multi_buffer_ranges(self, keys, ptrs, sizes, offsets):
+            results = []
+            for key, key_ptrs, key_sizes, key_offsets in zip(
+                keys, ptrs, sizes, offsets, strict=True
+            ):
+                data = cluster.objects.get(key)
+                if data is None or any(
+                    offset + size > len(data)
+                    for size, offset in zip(key_sizes, key_offsets, strict=True)
+                ):
+                    results.append(-1)
+                    continue
+                for ptr, size, offset in zip(
+                    key_ptrs, key_sizes, key_offsets, strict=True
+                ):
+                    ctypes.memmove(ptr, data[offset : offset + size], size)
+                results.append(sum(key_sizes))
             return results
 
     return FakeMooncakeDistributedStore
@@ -138,9 +199,10 @@ class _Rank:
         end_layer=LAYERS,
         pp_rank=0,
         pp_size=1,
+        model_name="org/model",
     ):
         local_heads = 1 if mla else TOTAL_KV_HEADS // tp_size
-        groups = 1 if mla else local_heads // head_partition
+        groups = local_heads // (head_partition or local_heads)
         self.start_layer = start_layer
         self.end_layer = end_layer
         self.layout = PageUnifiedLayout(
@@ -153,7 +215,7 @@ class _Rank:
             is_mla=mla,
         )
         self.plan = plan_unified_kv(
-            model_id="org/model",
+            model_id=model_name,
             dtype="bfloat16",
             page_size=PAGE_SIZE,
             rank_replicated=mla,
@@ -179,20 +241,12 @@ class _Rank:
             is_mla_model=mla,
             enable_storage_metrics=False,
             is_page_first_layout=False,
-            model_name="org/model",
-            extra_config={
-                "master_server_address": "127.0.0.1:50051",
-                "check_server": False,
-                "global_segment_size": 0,
-            },
+            model_name=model_name,
+            extra_config=dict(STORE_CONFIG),
             unified_suffixes=self.plan.suffixes,
             unified_chunk_spans=self.plan.chunk_spans(self.layout),
         )
         with patch.dict("sys.modules", _fake_mooncake_modules(cluster)):
-            from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
-                MooncakeStore,
-            )
-
             self.store = MooncakeStore(config)
         self.store.register_mem_pool_host(self.pool)
 
@@ -396,10 +450,6 @@ class TestMooncakeUnifiedKeys(CustomTestCase):
             patch.dict("sys.modules", _fake_mooncake_modules(cluster)),
             self.assertRaisesRegex(ValueError, "one chunk span per unified suffix"),
         ):
-            from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
-                MooncakeStore,
-            )
-
             MooncakeStore(config)
 
     def test_hybrid_pool_transfers_are_refused(self):
@@ -409,6 +459,162 @@ class TestMooncakeUnifiedKeys(CustomTestCase):
         transfer = PoolTransfer(name=PoolName.MAMBA, keys=["p"])
         with self.assertRaisesRegex(NotImplementedError, "hybrid pools"):
             rank.store.batch_exists_v2(["p"], [transfer])
+
+
+class TestMooncakeUnifiedLinker(CustomTestCase):
+    def _make_linker(self, cluster, *, mla, load_mode, head_partition):
+        pool_kwargs = dict(
+            size=PAGES * PAGE_SIZE,
+            page_size=PAGE_SIZE,
+            dtype=torch.bfloat16,
+            layer_num=LAYERS,
+            device="cpu",
+            enable_memory_saver=False,
+        )
+        if mla:
+            pool = MLATokenToKVPool(
+                kv_lora_rank=4, qk_rope_head_dim=HEAD_DIM - 4, **pool_kwargs
+            )
+        else:
+            pool = MHATokenToKVPool(
+                head_num=TOTAL_KV_HEADS,
+                head_dim=HEAD_DIM,
+                kv_cache_layout="nhd",
+                enable_alt_stream=False,
+                **pool_kwargs,
+            )
+        params = CacheInitParams(
+            disable=False,
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=types.SimpleNamespace(get_kvcache=lambda: pool),
+            page_size=PAGE_SIZE,
+        )
+        memory = types.SimpleNamespace(
+            hicache_storage_key_scheme="unified",
+            hicache_storage_head_partition=head_partition,
+            hicache_storage_layer_partition=None,
+        )
+        parallel = types.SimpleNamespace(
+            tp_size=1, attn_tp_rank=0, attn_tp_size=1, attn_dcp_rank=0, attn_dcp_size=1
+        )
+        with (
+            patch.dict("sys.modules", _fake_mooncake_modules(cluster)),
+            patch.multiple(
+                mooncake_direct_linker,
+                get_model=lambda: types.SimpleNamespace(model_path="org/model-weights"),
+                get_serving=lambda: types.SimpleNamespace(
+                    served_model_name="org/model"
+                ),
+                get_memory=lambda: memory,
+                get_parallel=lambda: parallel,
+            ),
+            patch.multiple(
+                linker_key_identity,
+                get_memory=lambda: memory,
+                get_parallel=lambda: parallel,
+            ),
+            patch.object(linker_pool_assembler, "get_memory", return_value=memory),
+        ):
+            linker = mooncake_direct_linker.MooncakeDirectLinker(
+                types.SimpleNamespace(enable_linker_mla_dedup=False),
+                params,
+                components={ComponentType.FULL},
+                extra_config={
+                    **STORE_CONFIG,
+                    "load_mode": load_mode,
+                    "linker_load_layer_group": 2,
+                },
+            )
+        self.addCleanup(linker.close)
+        linker.record_transfer_ready = lambda: TransferReady([])
+        linker.gc_frozen = True
+        return linker, pool
+
+    def _load(self, linker, transfer):
+        if linker.load_mode == "prefetch":
+            return linker.prefetch([transfer]).result(timeout=5)
+        self.assertTrue(linker.load("request", [transfer]))
+        return linker.finish_layer_wise_loading(linker.start_layer_wise_loading())
+
+    def test_linker_and_hicache_exchange_canonical_page_bytes(self):
+        for mla, head_partition, tp_size in (
+            (False, 2, 2),
+            (False, None, 1),
+            (True, None, 1),
+        ):
+            for load_mode in ("prefetch", "layer_wise"):
+                with self.subTest(
+                    mla=mla, head_partition=head_partition, load_mode=load_mode
+                ):
+                    self._check_linker_round_trip(
+                        mla=mla,
+                        head_partition=head_partition,
+                        tp_size=tp_size,
+                        load_mode=load_mode,
+                    )
+
+    def _check_linker_round_trip(self, *, mla, head_partition, tp_size, load_mode):
+        cluster = _FakeCluster()
+        linker, pool = self._make_linker(
+            cluster, mla=mla, load_mode=load_mode, head_partition=head_partition
+        )
+        if head_partition is not None:
+            # A two-page request must use multiple staging windows in both directions.
+            linker.load_stager.capacity = linker.offload_stager.capacity = 1
+        hosts = [
+            _Rank(
+                cluster,
+                mla=mla,
+                tp_rank=rank,
+                tp_size=tp_size,
+                head_partition=head_partition,
+                layer_partition=None,
+                model_name="org/model-dtype_bfloat16",
+            )
+            for rank in range(tp_size)
+        ]
+        keys = ["p0", "p1"]
+        logical = _logical_pages(mla, count=len(keys))
+        transfer = PoolTransfer(
+            name=PoolName.KV, keys=keys, device_indices=_page_indices([2, 0])
+        )
+        for host in hosts:
+            host.fill_from(logical, host_pages=[1, 2])
+            self.assertEqual(
+                host.store.batch_set_v1(keys, _page_indices([1, 2])), [True, True]
+            )
+        self.assertEqual(linker.lookup("request", [transfer]), [1, 2])
+        self.assertTrue(self._load(linker, transfer))
+        for page_no, page in zip([2, 0], logical, strict=True):
+            rows = _page_indices([page_no])
+            for layer in range(LAYERS):
+                if mla:
+                    self.assertTrue(
+                        torch.equal(pool.kv_buffer[layer][rows, 0], page[layer])
+                    )
+                else:
+                    self.assertTrue(
+                        torch.equal(pool.k_buffer[layer][rows], page[layer, 0])
+                    )
+                    self.assertTrue(
+                        torch.equal(pool.v_buffer[layer][rows], page[layer, 1])
+                    )
+
+        # Delete the host objects first. A write that only finds existing keys
+        # would not prove that the linker emits the same bytes.
+        expected = {key: cluster.objects.pop(key) for key in _chunk_keys(cluster)}
+        self.assertTrue(linker.offload([transfer]))
+        linker.offload_queue.join()
+        self.assertTrue(linker.pop_completed_offload())
+        self.assertEqual(
+            {key: cluster.objects[key] for key in _chunk_keys(cluster)}, expected
+        )
+
+        last_key = _chunk_keys(cluster)[-1]
+        del cluster.objects[last_key]
+        self.assertEqual(linker.lookup("request", [transfer]), [1])
+        cluster.objects[last_key] = expected[last_key][:-16]
+        self.assertFalse(self._load(linker, transfer))
 
 
 if __name__ == "__main__":

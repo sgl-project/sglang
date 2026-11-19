@@ -47,6 +47,7 @@ from sglang.srt.mem_cache.hicache_key_scheme import (
     namespace_digest,
     normalize_dtype,
     plan_unified_kv,
+    storage_model_id,
 )
 from sglang.srt.mem_cache.kv.memory.views import KVLayoutView, MLAKVView
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
@@ -71,12 +72,9 @@ def storage_model_name(
             "HiCache storage keys require a resolved logical KV cache dtype, "
             f"got {kv_cache_dtype!r}."
         )
-    parts = [
-        model_name,
-        host_pool.storage_format_tag,
-        f"dtype_{normalize_dtype(kv_cache_dtype)}",
-    ]
-    return "-".join(part for part in parts if part)
+    return storage_model_id(
+        model_name, normalize_dtype(kv_cache_dtype), host_pool.storage_format_tag
+    )
 
 
 class LayerLoadingEvent:
