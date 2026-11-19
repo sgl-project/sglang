@@ -89,13 +89,24 @@ def deadline_s(watchdog_timeout: Optional[float]) -> float:
     return min(MAX_DEADLINE_S, 0.5 * float(watchdog_timeout))
 
 
-def device_isa() -> Optional[str]:
-    """Return the GPU ISA without feature suffixes, or None without a GPU."""
+def device_isa(vendor: Any = None) -> Optional[str]:
+    """The GPU ISA a spec's devices are keyed by, or None without a GPU.
+
+    The selected vendor binding answers first through the standard
+    ``device_isa`` hook, naming what only its own hardware stack knows;
+    an absent hook or a None answer keeps the capability-shaped reading
+    standing, exact for the devices whose generations its number names
+    one for one. Querying the selected vendor -- not every vendor in
+    turn -- is what makes two bindings naming different hardware stacks
+    stay independent."""
+    named = getattr(vendor, "device_isa", None) if vendor is not None else None
+    if named is not None:
+        isa = named()
+        if isa is not None:
+            return isa
     if not torch.cuda.is_available():
         return None
     props = torch.cuda.get_device_properties(torch.cuda.current_device())
-    if torch.version.hip:
-        return props.gcnArchName.split(":")[0]
     return f"sm_{props.major}{props.minor}"
 
 
@@ -235,7 +246,7 @@ def handle_monokernel(server_args: ServerArgs) -> None:
     serves = getattr(vendor, "monokernel_serves", None)
     if serves is not None and not serves(backend, model_config.hf_config.architectures):
         return  # e.g. sgl-nvidia-mega, not the MSA plugin, serves this model
-    isa = device_isa()
+    isa = device_isa(vendor)
     spec, reasons = monokernel_disable_reasons(
         cfg=cfg, backend=backend, model_config=model_config, isa=isa
     )
@@ -311,13 +322,14 @@ def monokernel_weights_iterator(
     *, model: torch.nn.Module, weights: Iterable[tuple[str, torch.Tensor]]
 ) -> Iterable[tuple[str, torch.Tensor]]:
     """Let the spec observe checkpoint tensors before model-specific conversion."""
-    backend = _backend()
-    if backend is None:
+    selection = _selection()
+    if selection is None:
         return weights
+    backend, _, vendor = selection
     spec, _ = find_spec(
         backend=backend,
         architectures=model.config.architectures,
-        isa=device_isa(),
+        isa=device_isa(vendor),
         model_type=getattr(model.config, "model_type", None),
     )
     if spec is None or spec.load_tensor is None:
@@ -355,10 +367,11 @@ def install_monokernel_forward(
     capture_tail_hooks: list[Callable[..., None]],
 ) -> None:
     """Build the selected spec and install its forward; runs before KV cache sizing."""
-    backend = _backend()
-    if backend is None:
+    selection = _selection()
+    if selection is None:
         return
-    isa = device_isa()
+    backend, _, vendor = selection
+    isa = device_isa(vendor)
     archs = hf_config.architectures
     model_type = getattr(hf_config, "model_type", None)
     spec, why = find_spec(
