@@ -33,7 +33,10 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.layers.quantization.utils import is_layer_skipped
+from sglang.srt.layers.quantization.utils import (
+    _FALLBACK_FUSED_SHARDS,
+    is_layer_skipped,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +67,12 @@ def _glob_matches(
     if fnmatchcase(prefix, pattern):
         return True
     module_path, _, proj_name = prefix.rpartition(".")
-    shard_names = fused_mapping.get(proj_name)
+    # Same shard lookup as is_layer_skipped, so plain and glob patterns see the
+    # same fused layers when a model declares no mapping of its own.
+    effective_mapping = (
+        fused_mapping if proj_name in fused_mapping else _FALLBACK_FUSED_SHARDS
+    )
+    shard_names = effective_mapping.get(proj_name)
     if not shard_names:
         return False
     shard_prefixes = [

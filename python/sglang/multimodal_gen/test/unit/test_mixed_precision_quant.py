@@ -163,6 +163,21 @@ class TestFusedLayerRouting(unittest.TestCase):
         self.assertEqual("fp8", config.format_for("blocks.3.attn.to_qkv"))
         self.assertEqual("mxfp4", config.format_for("blocks.3.attn.to_out"))
 
+    def test_glob_uses_the_fallback_shards_without_a_model_mapping(self):
+        """A model with no mapping still fuses qkv_proj; globs resolve it
+        through the same fallback shards as plain patterns."""
+        config = _build_config(
+            "mxfp4", [PrecisionRule(pattern="blocks.*.attn.[qkv]_proj", format="fp8")]
+        )
+
+        self.assertEqual("fp8", config.format_for("blocks.3.attn.qkv_proj"))
+
+        partial = _build_config(
+            "mxfp4", [PrecisionRule(pattern="blocks.*.attn.q_proj", format="fp8")]
+        )
+        with self.assertRaisesRegex(ValueError, "some but not all shards"):
+            partial.format_for("blocks.3.attn.qkv_proj")
+
     def test_glob_claiming_some_shards_is_refused(self):
         """A fused layer takes one format, so a glob cannot split its shards."""
         config = self._fused_config("blocks.*.attn.to_q")
