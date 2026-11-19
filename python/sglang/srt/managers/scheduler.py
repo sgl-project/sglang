@@ -3402,6 +3402,7 @@ class Scheduler(
                 return_hidden_states=recv_req.return_hidden_states,
                 return_routed_experts=recv_req.return_routed_experts,
                 routed_experts_start_len=recv_req.routed_experts_start_len,
+                routed_experts_dtype=recv_req.routed_experts_dtype,
                 return_indexer_topk=recv_req.return_indexer_topk,
                 eos_token_ids=self.model_config.hf_eos_token_id,
                 bootstrap_host=recv_req.bootstrap_host,
@@ -3726,6 +3727,15 @@ class Scheduler(
                     f"number of input tokens {len(req.origin_input_ids)=}. Please "
                     f"use a smaller routed_experts_start_len."
                 )
+
+            if recv_req.routed_experts_dtype is not None:
+                from sglang.srt.state_capturer.routed_experts import (
+                    validate_routed_experts_dtype,
+                )
+
+                dtype_err = validate_routed_experts_dtype(recv_req.routed_experts_dtype)
+                if dtype_err is not None:
+                    error_msg = dtype_err
 
             if error_msg is not None:
                 req.set_finish_with_abort(error_msg)

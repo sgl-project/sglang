@@ -17,12 +17,10 @@ import logging
 import signal
 import traceback
 from collections import defaultdict
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import psutil
-import pybase64
 import setproctitle
-import torch
 import zmq
 
 from sglang.srt.beam_search.output import (
@@ -63,6 +61,7 @@ from sglang.srt.runtime_context import (
     publish,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.state_capturer.routed_experts import encode_topk_b64_batch
 from sglang.srt.utils import (
     configure_gc_logging,
     configure_logger,
@@ -370,22 +369,13 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
     @staticmethod
     def _b64_encode_per_request(
-        data_list: Optional[List[Optional[torch.Tensor]]],
+        data_list: Optional[List[Optional[Any]]],
     ) -> Optional[List[Optional[str]]]:
-        """Encode a per-request list of tensors as base64 strings, off the
-        tokenizer hot path. Returns None when the input is None; per-item None
-        stays None.
+        """Encode a per-request list of tensors/arrays as base64 strings, off
+        the tokenizer hot path. Returns None when the input is None; per-item
+        None stays None.
         """
-        if data_list is None:
-            return None
-        return [
-            (
-                pybase64.b64encode(item.numpy().tobytes()).decode("utf-8")
-                if item is not None
-                else None
-            )
-            for item in data_list
-        ]
+        return encode_topk_b64_batch(data_list)
 
     @staticmethod
     def _route_rows(

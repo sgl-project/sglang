@@ -323,6 +323,9 @@ class GenerateReqInput:
     # `[routed_experts_start_len, seqlen - 1)`. Must be in [0, prompt_tokens].
     # 0 = full sequence.
     routed_experts_start_len: int = 0
+    # Optional wire dtype ("uint8", "int16", or "int32") for serialized routed
+    # experts; None preserves the legacy untagged int32 response format.
+    routed_experts_dtype: Optional[str] = None
     return_indexer_topk: bool = False
 
     # The modalities of the image data [image, multi-images, video]
@@ -543,6 +546,16 @@ class GenerateReqInput:
             raise ValueError(
                 "return_flat_raw_sampling_mask_b64 requires return_flat_raw_sampling_mask."
             )
+        if self.routed_experts_dtype is not None:
+            if not self.return_routed_experts:
+                raise ValueError(
+                    "routed_experts_dtype requires return_routed_experts=True."
+                )
+            if self.routed_experts_dtype not in ("uint8", "int16", "int32"):
+                raise ValueError(
+                    f"Unsupported routed_experts_dtype={self.routed_experts_dtype!r}; "
+                    "expected one of ('uint8', 'int16', 'int32')."
+                )
 
     def _determine_batch_size(self):
         """Determine if this is a single example or a batch and the batch size."""
@@ -1133,6 +1146,7 @@ class GenerateReqInput:
             ),
             return_routed_experts=self.return_routed_experts,
             routed_experts_start_len=self.routed_experts_start_len,
+            routed_experts_dtype=self.routed_experts_dtype,
             return_indexer_topk=self.return_indexer_topk,
             modalities=self.modalities[i] if self.modalities else None,
             session_params=self.session_params,
@@ -1230,6 +1244,7 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     return_routed_experts: bool = False
     # See GenerateReqInput.routed_experts_start_len.
     routed_experts_start_len: int = 0
+    routed_experts_dtype: Optional[str] = None
     return_indexer_topk: bool = False
 
     # Session info for continual prompting

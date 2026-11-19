@@ -43,6 +43,7 @@ from typing import (
     Iterable,
     List,
     Optional,
+    Sequence,
     Set,
     Tuple,
     Type,
@@ -214,6 +215,10 @@ from sglang.srt.server_args import (
 )
 from sglang.srt.speculative.spec_decoding_metrics import (
     populate_spec_info,
+)
+from sglang.srt.state_capturer.routed_experts import (
+    ASYNC_TOPK_B64_MIN_BYTES,
+    encode_batch_topk_outputs_async,
 )
 from sglang.srt.utils import (
     configure_gc_logging,
@@ -1829,6 +1834,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 return_hidden_states=obj.return_hidden_states,
                 return_routed_experts=obj.return_routed_experts,
                 routed_experts_start_len=obj.routed_experts_start_len,
+                routed_experts_dtype=obj.routed_experts_dtype,
                 return_indexer_topk=obj.return_indexer_topk,
                 routed_dp_rank=obj.routed_dp_rank,
                 disagg_prefill_dp_rank=obj.disagg_prefill_dp_rank,
@@ -2848,6 +2854,24 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self.last_receive_tstamp = real_time()
             self.soft_watchdog.feed()
 
+    _ASYNC_TOPK_B64_MIN_BYTES = ASYNC_TOPK_B64_MIN_BYTES
+
+    @classmethod
+    async def _encode_batch_topk_outputs(
+        cls,
+        routed_experts: Optional[Sequence[Any]],
+        indexer_topk: Optional[Sequence[Any]],
+    ) -> Tuple[
+        Optional[List[Optional[str]]],
+        Optional[List[Optional[str]]],
+        Optional[List[Optional[str]]],
+    ]:
+        return await encode_batch_topk_outputs_async(
+            routed_experts,
+            indexer_topk,
+            min_async_bytes=cls._ASYNC_TOPK_B64_MIN_BYTES,
+        )
+
     async def _handle_batch_output(
         self,
         recv_obj: Union[
@@ -2858,8 +2882,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ):
         if isinstance(recv_obj, (BatchStrOutput, BatchTokenIDOutput)):
             customized_info = unwrap_from_pickle(recv_obj.customized_info)
+            (
+                encoded_routed_experts,
+                encoded_indexer_topk,
+                routed_dtypes,
+            ) = await self._encode_batch_topk_outputs(
+                getattr(recv_obj, "routed_experts", None),
+                getattr(recv_obj, "indexer_topk", None),
+            )
         else:
             customized_info = None
+            encoded_routed_experts = None
+            encoded_indexer_topk = None
+            routed_dtypes = None
         pending_notify: dict[str, ReqState] = {}
         batch_notify_size = get_serving().batch_notify_size
         for i, rid in enumerate(recv_obj.rids):
@@ -2970,19 +3005,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 hidden_states = recv_obj.output_hidden_states[i]
                 if hidden_states is not None:
                     meta_info["hidden_states"] = hidden_states
-            if getattr(recv_obj, "routed_experts", None):
-                val = recv_obj.routed_experts[i]
+            if encoded_routed_experts:
+                val = encoded_routed_experts[i]
                 if val is not None:
-                    # BatchStrOutput is pre-encoded by the detokenizer;
-                    # BatchTokenIDOutput (skip_tokenizer_init) bypasses it.
-                    if isinstance(val, torch.Tensor):
-                        val = pybase64.b64encode(val.numpy().tobytes()).decode("utf-8")
                     meta_info["routed_experts"] = val
-            if getattr(recv_obj, "indexer_topk", None):
-                val = recv_obj.indexer_topk[i]
+                    req_dtype = getattr(state.obj, "routed_experts_dtype", None)
+                    buf_dtype = routed_dtypes[i] if routed_dtypes is not None else None
+                    effective_dtype = req_dtype or (
+                        buf_dtype if buf_dtype not in (None, "int32") else None
+                    )
+                    if effective_dtype is not None:
+                        meta_info["routed_experts_dtype"] = effective_dtype
+            if encoded_indexer_topk:
+                val = encoded_indexer_topk[i]
                 if val is not None:
-                    if isinstance(val, torch.Tensor):
-                        val = pybase64.b64encode(val.numpy().tobytes()).decode("utf-8")
                     meta_info["indexer_topk"] = val
             if getattr(recv_obj, "dp_ranks", None):
                 meta_info["dp_rank"] = recv_obj.dp_ranks[i]

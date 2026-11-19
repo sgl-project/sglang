@@ -78,6 +78,7 @@ PYTHON_ONLY_REQUEST_FIELDS = frozenset(
         "return_flat_raw_sampling_mask_b64",
         "return_indexer_topk",
         "return_routed_experts",
+        "routed_experts_dtype",
         "sampling_logprobs_mode",
         "token_indices_to_pool",
         "use_audio_in_video",

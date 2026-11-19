@@ -452,6 +452,7 @@ class Req(ReqDllmMixin):
         return_hidden_states: ReturnHiddenStatesMode = False,
         return_routed_experts: bool = False,
         routed_experts_start_len: int = 0,
+        routed_experts_dtype: Optional[str] = None,
         return_indexer_topk: bool = False,
         eos_token_ids: Optional[Set[int]] = None,
         bootstrap_host: Optional[str] = None,
@@ -725,8 +726,9 @@ class Req(ReqDllmMixin):
         # capture routed experts
         self.return_routed_experts = return_routed_experts
         self.routed_experts_start_len = routed_experts_start_len
-        self.routed_experts: Optional[torch.Tensor] = (
-            None  # cpu tensor: shape (seqlen, topk)
+        self.routed_experts_dtype = routed_experts_dtype
+        self.routed_experts: Optional[Union[torch.Tensor, np.ndarray]] = (
+            None  # cpu array/tensor: shape (seqlen, layers, topk)
         )
 
         self.return_indexer_topk = return_indexer_topk

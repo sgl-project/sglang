@@ -1,4 +1,5 @@
-from typing import Any, Optional
+import asyncio
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pybase64
@@ -6,6 +7,7 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
     dp_slot_in,
@@ -31,6 +33,155 @@ from sglang.srt.utils.device import async_d2h
 
 # Key of the routed-expert rows in the tensor dicts pipeline stages exchange.
 PP_ROUTED_EXPERTS_KEY = "routed_experts"
+
+ROUTED_EXPERTS_WIRE_DTYPES: Dict[str, np.dtype] = {
+    "uint8": np.dtype(np.uint8),
+    "int16": np.dtype(np.int16),
+    "int32": np.dtype(np.int32),
+}
+
+
+def validate_routed_experts_dtype(dtype_name: Optional[str]) -> Optional[str]:
+    """Return an error string if ``dtype_name`` cannot represent this model's routed IDs."""
+    if dtype_name is None:
+        return None
+    wire_dtype = ROUTED_EXPERTS_WIRE_DTYPES.get(dtype_name)
+    if wire_dtype is None:
+        return (
+            f"Unsupported routed_experts_dtype={dtype_name!r}; "
+            f"expected one of {tuple(ROUTED_EXPERTS_WIRE_DTYPES)}."
+        )
+    metadata = get_global_expert_location_metadata()
+    if metadata is not None and (
+        metadata.num_logical_experts - 1 > np.iinfo(wire_dtype).max
+    ):
+        return (
+            f"routed_experts_dtype={dtype_name!r} cannot represent "
+            f"{metadata.num_logical_experts} logical experts."
+        )
+    return None
+
+
+def serialize_routed_experts_array(
+    rows: Union[torch.Tensor, np.ndarray],
+    dtype_name: Optional[str] = None,
+) -> np.ndarray:
+    """Convert captured routed-expert rows to a C-contiguous NumPy array for IPC/HTTP.
+
+    Sending a plain NumPy array rather than a ``torch.Tensor`` over ZMQ avoids
+    per-request ``torch.Tensor`` storage reduction overhead, while optional
+    per-request ``dtype_name`` narrowing (``uint8`` / ``int16``) shrinks the IPC
+    and base64 payload 2x-4x without changing the server's internal cache dtype.
+    """
+    arr = (
+        rows.detach().cpu().numpy()
+        if isinstance(rows, torch.Tensor)
+        else np.asarray(rows)
+    )
+    if dtype_name is not None:
+        target_dtype = ROUTED_EXPERTS_WIRE_DTYPES.get(dtype_name)
+        if target_dtype is None:
+            raise ValueError(
+                f"Unsupported routed_experts_dtype={dtype_name!r}; "
+                f"expected one of {tuple(ROUTED_EXPERTS_WIRE_DTYPES)}."
+            )
+        if arr.dtype != target_dtype:
+            info = np.iinfo(target_dtype)
+            if arr.size > 0 and (
+                int(arr.min()) < info.min or int(arr.max()) > info.max
+            ):
+                raise ValueError(
+                    f"Routed expert IDs in [{int(arr.min())}, {int(arr.max())}] "
+                    f"do not fit in routed_experts_dtype={dtype_name!r} "
+                    f"[{info.min}, {info.max}]."
+                )
+            return np.ascontiguousarray(arr, dtype=target_dtype)
+    return np.ascontiguousarray(arr)
+
+
+def encode_topk_b64(
+    item: Optional[Union[str, torch.Tensor, np.ndarray]],
+) -> Optional[str]:
+    """Zero-copy SIMD base64 encoding of a single request's top-k tensor/array."""
+    if item is None or isinstance(item, str):
+        return item
+    arr = (
+        item.detach().cpu().numpy()
+        if isinstance(item, torch.Tensor)
+        else np.asarray(item)
+    )
+    arr = np.ascontiguousarray(arr)
+    return pybase64.b64encode_as_string(memoryview(arr))
+
+
+def encode_topk_b64_batch(
+    items: Optional[Sequence[Optional[Union[str, torch.Tensor, np.ndarray]]]],
+) -> Optional[List[Optional[str]]]:
+    if items is None:
+        return None
+    return [encode_topk_b64(item) for item in items]
+
+
+def topk_batch_raw_nbytes(
+    items: Optional[Sequence[Optional[Union[str, torch.Tensor, np.ndarray]]]],
+) -> int:
+    if not items:
+        return 0
+    total = 0
+    for item in items:
+        if item is None or isinstance(item, str):
+            continue
+        if isinstance(item, torch.Tensor):
+            total += item.numel() * item.element_size()
+        else:
+            total += int(np.asarray(item).nbytes)
+    return total
+
+
+ASYNC_TOPK_B64_MIN_BYTES = 64 * 1024
+
+
+async def encode_batch_topk_outputs_async(
+    routed_experts: Optional[Sequence[Any]],
+    indexer_topk: Optional[Sequence[Any]],
+    *,
+    min_async_bytes: int = ASYNC_TOPK_B64_MIN_BYTES,
+) -> Tuple[
+    Optional[List[Optional[str]]],
+    Optional[List[Optional[str]]],
+    Optional[List[Optional[str]]],
+]:
+    """Encode raw top-k batch buffers, offloading large batches off the event loop."""
+    routed_dtypes: Optional[List[Optional[str]]] = None
+    if routed_experts is not None:
+        routed_dtypes = [
+            (
+                str(item.dtype).removeprefix("torch.")
+                if item is not None and not isinstance(item, str)
+                else None
+            )
+            for item in routed_experts
+        ]
+    raw_bytes = topk_batch_raw_nbytes(routed_experts) + topk_batch_raw_nbytes(
+        indexer_topk
+    )
+    if raw_bytes == 0:
+        return (
+            list(routed_experts) if routed_experts is not None else None,
+            list(indexer_topk) if indexer_topk is not None else None,
+            routed_dtypes,
+        )
+    if raw_bytes >= min_async_bytes:
+        encoded_routed, encoded_indexer = await asyncio.to_thread(
+            lambda: (
+                encode_topk_b64_batch(routed_experts),
+                encode_topk_b64_batch(indexer_topk),
+            )
+        )
+    else:
+        encoded_routed = encode_topk_b64_batch(routed_experts)
+        encoded_indexer = encode_topk_b64_batch(indexer_topk)
+    return encoded_routed, encoded_indexer, routed_dtypes
 
 
 def _is_scattered_a2a_backend() -> bool:
@@ -281,11 +432,19 @@ def extract_routed_experts_from_meta_info(data):
     # To solve the performance issue, we return the experts_ids in base64
     # We left this function for user to change it back to normal int32
     # See detokenizer_manager::_extract_routed_experts
-    routed_experts_base64 = data["meta_info"].get("routed_experts", None)
+    meta_info = data["meta_info"]
+    routed_experts_base64 = meta_info.get("routed_experts", None)
+    dtype_name = meta_info.get("routed_experts_dtype", "int32")
+    wire_dtype = ROUTED_EXPERTS_WIRE_DTYPES.get(dtype_name)
+    if wire_dtype is None:
+        raise ValueError(
+            f"Unsupported routed_experts_dtype={dtype_name!r}; "
+            f"expected one of {tuple(ROUTED_EXPERTS_WIRE_DTYPES)}."
+        )
     routed_experts = np.frombuffer(
-        pybase64.b64decode(routed_experts_base64.encode("utf-8")), dtype=np.int32
+        pybase64.b64decode(routed_experts_base64.encode("utf-8")), dtype=wire_dtype
     )
-    return routed_experts
+    return routed_experts.astype(np.int32, copy=False)
 
 
 def disable_routed_experts_capture_for_draft(model: Any) -> None:
