@@ -122,8 +122,4 @@ def profile_method(
 # ranges only when that subsystem's gate is on.
 scheduler_nvtx_method = partial(profile_method, nvtx_enabled=NVTX_SCHEDULER_ENABLED)
 operations_nvtx_range = partial(profile_range, nvtx_enabled=NVTX_OPERATIONS_ENABLED)
-# Forward-pass spans: the per-step ``step[...]`` label built by
-# ``build_step_span_name`` and the speculative-decoding stage spans. With
-# ``SGLANG_ENABLE_NVTX_FORWARD`` set they also appear as NVTX ranges, so an
-# Nsight Systems timeline carries each step's forward mode and batch size.
 forward_nvtx_range = partial(profile_range, nvtx_enabled=NVTX_FORWARD_ENABLED)
