@@ -403,8 +403,12 @@ pub struct ModelConfig {
     pub decode_policy: DecodePolicyKind,
     /// Send a DP rank as `X-Data-Parallel-Rank`; see [`crate::policies::dp_rank`].
     pub dp_aware: bool,
-    /// Rank choice under `dp_aware` when no routing key or cached prefix decides it.
+    /// Rank choice under `dp_aware` when no routing key or cached prefix decides it;
+    /// in PD mode, the prefill rank.
     pub dp_rank_policy: DpRankPolicy,
+    /// Rank choice under `dp_aware` for the PD decode rank, which no routing key
+    /// or cached prefix ever decides; `None` follows `dp_rank_policy`.
+    pub decode_dp_rank_policy: Option<DpRankPolicy>,
     /// Optional static bucket configuration. `None` uses the global domain.
     pub bucket_config: Option<BucketConfig>,
     /// Reorg `--bucket-config`; `None` builds the default plain and P/D buckets.
@@ -428,6 +432,13 @@ pub struct ModelConfig {
     pub sampling_overrides: SamplingOverrides,
     /// Worker `--default-chat-template-kwargs`, applied when rendering.
     pub default_chat_template_kwargs: crate::tokenizer::chat_formatter::ChatTemplateKwargs,
+}
+
+impl ModelConfig {
+    /// The PD decode rank policy: `--decode-dp-rank-policy`, else `--dp-rank-policy`.
+    pub fn decode_dp_rank_policy(&self) -> DpRankPolicy {
+        self.decode_dp_rank_policy.unwrap_or(self.dp_rank_policy)
+    }
 }
 
 impl ModelConfig {

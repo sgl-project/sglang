@@ -226,8 +226,10 @@ client sent. The router picks the first of these that applies:
    without a fresh reading for every one of its ranks, fall back to the
    in-flight count.
 
-In PD mode, decode is ranked by step 3 only. The decode request names the
-prefill rank in `disagg_prefill_dp_rank`, and the bootstrap room satisfies
+In PD mode, decode is ranked by step 3 only, under `--decode-dp-rank-policy`
+when set and `--dp-rank-policy` otherwise, so prefill and decode can balance
+by different signals. The decode request names the prefill rank in
+`disagg_prefill_dp_rank`, and the bootstrap room satisfies
 `room % prefill_dp_size == prefill_rank`.
 
 A decode rank picked on arrival only starts decoding once prefill has queued,

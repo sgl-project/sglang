@@ -300,6 +300,45 @@ async fn round_robin_gives_decode_ranks_turns() {
     assert_eq!(ranks, ["0", "1", "2", "3", "0", "1", "2", "3"]);
 }
 
+/// `--decode-dp-rank-policy` ranks decode on its own: the prefill rank still
+/// follows `--dp-rank-policy`, here round robin, while decode follows the feed.
+#[tokio::test]
+async fn decode_dp_rank_policy_is_separate_from_the_prefill_policy() {
+    let (prefill, decode) = (
+        MockWorker::start(vec![]).await,
+        MockWorker::start(vec![]).await,
+    );
+    let workers = [
+        (&prefill, WorkerMode::Prefill, 4),
+        (&decode, WorkerMode::Decode, 4),
+    ];
+    let mut cfg = sticky_config();
+    cfg.model.dp_rank_policy = DpRankPolicy::RoundRobin;
+    cfg.model.decode_dp_rank_policy = Some(DpRankPolicy::LeastTokens);
+    let load = EngineReportedLoadTable::new();
+    let app = router_with_load(cfg, &workers, Default::default(), Arc::clone(&load));
+    for (rank, num_tokens) in [(0, 400), (1, 100), (2, 900), (3, 250)] {
+        let stat = LoadStat {
+            num_running_reqs: 0,
+            num_waiting_reqs: 0,
+            num_tokens,
+            max_total_num_tokens: 1_000,
+            native_cache: None,
+        };
+        load.set(&decode.url, rank, stat, Instant::now());
+    }
+    let (mut prefill_ranks, mut decode_ranks) = (Vec::new(), Vec::new());
+    for _ in 0..8 {
+        // No key: the prefill rank has nothing but the policy to go on.
+        decode_ranks.push(send(&app, &decode, &[]).await.unwrap());
+        let prefill_rank = prefill.captured.lock().unwrap().headers.get(RANK).cloned();
+        prefill_ranks.push(prefill_rank.unwrap());
+    }
+    assert_eq!(prefill_ranks, ["0", "1", "2", "3", "0", "1", "2", "3"]);
+    // Decode never lands on the heaviest rank; round robin would have.
+    assert!(!decode_ranks.contains(&"2".to_string()), "{decode_ranks:?}");
+}
+
 #[tokio::test]
 async fn least_tokens_keeps_the_lighter_of_two_decode_ranks() {
     let (prefill, decode) = (
