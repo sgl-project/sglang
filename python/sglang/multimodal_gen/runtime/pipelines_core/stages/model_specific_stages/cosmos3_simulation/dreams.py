@@ -858,13 +858,7 @@ class CausalDecodeQueue:
 def rollout_stream(
     device: torch.device, stream: torch.cuda.Stream | None
 ) -> Iterator[None]:
-    """Issue the block's CUDA work on ``stream``, a higher-priority one (None: stay put).
-
-    A rollout that overlaps its VAE decode shares the GPU with it. On a stream
-    that outranks the decode's, the rollout's kernels take freed SMs first, so
-    the contention lands on the decode, which has slack. Scheduling only: every
-    kernel runs with the same inputs in the same per-stream order.
-    """
+    """Run the block on ``stream`` (None keeps the current one), a scheduling change only."""
     if stream is None:
         yield
         return
@@ -1374,9 +1368,7 @@ class CosmosDreamsRolloutStage(PipelineStage):
         # decoding stage then only post-processes.
         self.vae = vae
         self.overlap_vae_decode = bool(overlap_vae_decode and vae is not None)
-        # Streams of the overlapped decode and, when enabled, of the rollout that
-        # outranks it, made on first use and kept: the CUDA allocator caches freed
-        # memory per stream, so a new stream per request strands the previous one's.
+        # Made on first use and kept: the CUDA allocator caches freed memory per stream.
         self._decode_stream: torch.cuda.Stream | None = None
         self._priority_stream: torch.cuda.Stream | None = None
         # Without a resolved profile the stage runs the artifact as exported:
@@ -1504,8 +1496,7 @@ class CosmosDreamsRolloutStage(PipelineStage):
             )
         decode_queue = self._decode_queue(device, batch)
         with decode_queue or nullcontext():
-            # Only a rollout that shares the GPU with its decode has anything to
-            # outrank; the stream exists only when the priority is switched on.
+            # Only a rollout that shares the GPU with its decode has anything to outrank.
             with rollout_stream(
                 device, None if decode_queue is None else self._priority_stream
             ):

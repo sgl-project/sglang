@@ -1328,9 +1328,7 @@ class TestCosmosDreamsRuntime(unittest.TestCase):
 
 class TestCosmosDreamsRolloutStreams(unittest.TestCase):
     def test_streams_are_made_once_and_reused_across_requests(self):
-        """The CUDA allocator caches freed memory per stream, so a stage that made
-        a new decode or rollout stream per request stranded the previous request's
-        memory and its peak climbed with every request."""
+        """A stream made per request strands the previous request's freed memory."""
         with mock.patch.object(ServerArgs, "__post_init__", lambda self: None):
             args = ServerArgs(model_path="unused", pipeline_config=CosmosDreamsConfig())
         args.component_residency = {"vae": "resident"}
@@ -1359,7 +1357,6 @@ class TestCosmosDreamsRolloutStreams(unittest.TestCase):
             first = stage._decode_queue(torch.device("cuda"), batch)
             second = stage._decode_queue(torch.device("cuda"), batch)
             self.assertIs(first.stream, second.stream)
-            # The rollout only gets its own stream when the priority is switched on.
             self.assertIsNone(stage._priority_stream)
             self.assertEqual(make_stream.call_count, 1)
             stage._decode_stream = None

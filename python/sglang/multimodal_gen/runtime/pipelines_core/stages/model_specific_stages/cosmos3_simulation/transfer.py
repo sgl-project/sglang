@@ -659,8 +659,6 @@ class CosmosDreamsControlVideoStage(PipelineStage):
         fps: float,
         control_path: str,
     ) -> Req:
-        """Resolve what the clip's first frame decides: canvas and geometry. A
-        clip that is still decoding goes on to the prepare stage as it is."""
         manifest = self.manifest
         decoding = isinstance(clip, ControlClipDecode)
         source_hw = (

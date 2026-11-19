@@ -229,9 +229,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_COSMOS3_LIDAR_USE_NATTEN": _lazy_bool(
         "SGLANG_DIFFUSION_COSMOS3_LIDAR_USE_NATTEN"
     ),
-    # Cosmos-Dreams: issue the rollout on a higher-priority CUDA stream than the
-    # VAE decode that overlaps it. Opt-in: it pays when the rollout leaves the GPU
-    # idle between kernels, and costs time when the rollout keeps the GPU busy.
+    # Cosmos-Dreams: rank the rollout's CUDA stream above the VAE decode it overlaps.
     "SGLANG_DIFFUSION_COSMOS_DREAMS_ROLLOUT_STREAM_PRIORITY": _lazy_bool(
         "SGLANG_DIFFUSION_COSMOS_DREAMS_ROLLOUT_STREAM_PRIORITY"
     ),

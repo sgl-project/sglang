@@ -46,8 +46,7 @@ class ControlClipDecode(RequestResource):
         self._thread.start()
 
     def wait(self, num_frames: int | None = None) -> int:
-        """Frames decoded once ``num_frames`` are final or the clip has ended
-        (None: once it has ended)."""
+        """``num_frames`` None waits for the end of the clip."""
         with self._changed:
             self._changed.wait_for(
                 lambda: (
