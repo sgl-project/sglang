@@ -403,10 +403,6 @@ class _ExpertWeightAdapter:
 
 
 def validate_async_eplb_args(cfg) -> None:
-    if not cfg.enable_eplb or cfg.device != "npu":
-        raise ValueError(
-            "--eplb-async-rebalance requires --enable-eplb and --device npu"
-        )
     if cfg.ep_dispatch_algorithm not in (None, "static", "dynamic"):
         raise ValueError("Async NPU EPLB supports static or dynamic dispatch")
     if (

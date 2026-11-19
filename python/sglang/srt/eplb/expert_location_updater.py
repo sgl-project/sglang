@@ -13,8 +13,7 @@
 # ==============================================================================
 import logging
 from collections import defaultdict
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import einops
 import torch
@@ -230,14 +229,6 @@ def _int64_view(t: torch.Tensor) -> Optional[torch.Tensor]:
     return t.view(torch.int64)
 
 
-@dataclass
-class DeferredExpertCopies:
-    """Local staging-to-weight row pairs and P2P work retained by the caller."""
-
-    rows: list[tuple[int, int]] = field(default_factory=list)
-    work: list[torch.distributed.Work] = field(default_factory=list)
-
-
 def update_expert_weights_single_layer(
     routed_experts_weights: List[torch.Tensor],
     temp_buffers: List[torch.Tensor],
@@ -252,8 +243,17 @@ def update_expert_weights_single_layer(
     log_metrics: bool = False,
     group: Optional[torch.distributed.ProcessGroup] = None,
     *,
-    deferred_copies: Optional[DeferredExpertCopies] = None,
+    staged_rows: Optional[List[Tuple[int, int]]] = None,
+    submit_p2p_batch: Optional[
+        Callable[[List[P2POp]], List[torch.distributed.Work]]
+    ] = None,
 ):
+    """Move expert weights, optionally leaving writeback to the caller.
+
+    When `staged_rows` is provided, fill it with local (buffer, weight) row
+    pairs. A custom `submit_p2p_batch` may retain the work handles. The
+    updater still calls wait on every handle before returning.
+    """
     assert all(
         tensor.shape[0] == num_local_physical_experts
         for tensor in routed_experts_weights
@@ -275,6 +275,8 @@ def update_expert_weights_single_layer(
         )
 
     output_logs = [] if debug else None
+    if submit_p2p_batch is None:
+        submit_p2p_batch = torch.distributed.batch_isend_irecv
 
     num_physical_experts = len(old_physical_to_logical_map)
     num_tensors = len(routed_experts_weights)
@@ -310,10 +312,10 @@ def update_expert_weights_single_layer(
         _create_isend_ops(p2p_op_infos)
         _filter_p2p_ops(p2p_op_infos)
         _execute_p2p_ops(p2p_op_infos)
-        if deferred_copies is None:
+        if staged_rows is None:
             _execute_buffer2weight_copies(buffer2weight_copy_infos)
         else:
-            deferred_copies.rows.extend(
+            staged_rows.extend(
                 (_get_local_expert_location(src), _get_local_expert_location(dst))
                 for src, dst in buffer2weight_copy_infos
             )
@@ -579,9 +581,7 @@ def update_expert_weights_single_layer(
                 if eid in ops_by_expert:
                     batch_ops.extend(ops_by_expert[eid])
             if batch_ops:
-                reqs = torch.distributed.batch_isend_irecv(batch_ops)
-                if deferred_copies is not None:
-                    deferred_copies.work.extend(reqs)
+                reqs = submit_p2p_batch(batch_ops)
                 for req in reqs:
                     req.wait()
 

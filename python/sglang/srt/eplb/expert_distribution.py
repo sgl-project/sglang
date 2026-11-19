@@ -146,12 +146,6 @@ class ExpertDistributionRecorder(ABC):
             )
             "reason is that you are using a model that does not support expert distribution"
             "recording. Try setting `get_model_config_for_expert_location` in your model."
-            if get_exec().moe.eplb_async_rebalance:
-                from sglang.srt.hardware_backend.npu.eplb_manager import (
-                    AsyncEplbRecorder,
-                )
-
-                return AsyncEplbRecorder(expert_location_metadata, rank)
             return _ExpertDistributionRecorderReal(expert_location_metadata, rank)
         else:
             return _ExpertDistributionRecorderNoop()

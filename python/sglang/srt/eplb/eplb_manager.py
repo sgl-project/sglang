@@ -103,9 +103,6 @@ class EPLBManager:
                 self._rebalance_disabled_logged = True
             return
 
-        yield from self._rebalance()
-
-    def _rebalance(self):
         elastic_state = ElasticEPStateManager.instance()
         is_post_scale_rebalance = elastic_state is not None and elastic_state.has_scaled
         # A failed later scale leaves the previously committed world serving.

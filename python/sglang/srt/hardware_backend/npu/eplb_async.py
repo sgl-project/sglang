@@ -13,10 +13,7 @@ import torch.distributed as dist
 
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location import ExpertLocationMetadata
-from sglang.srt.eplb.expert_location_updater import (
-    DeferredExpertCopies,
-    update_expert_weights_single_layer,
-)
+from sglang.srt.eplb.expert_location_updater import update_expert_weights_single_layer
 from sglang.srt.hardware_backend.npu.eplb import (
     _ExpertWeightAdapter,
     _validate_migration_topology,
@@ -244,7 +241,14 @@ class NpuEplbRuntime:
         start = time.perf_counter()
         # Work.wait orders the current stream after HCCL. The Future can
         # advertise readiness only after that dependency has completed.
-        copies = DeferredExpertCopies()
+        staged_rows = []
+        pending_work = []
+
+        def submit_p2p_batch(ops):
+            work = dist.batch_isend_irecv(ops)
+            pending_work.extend(work)
+            return work
+
         with self.device_module.stream(self._p2p_stream):
             self._p2p_stream.wait_event(self._owner_ready)
             for name, row in self._routing_rows.items():
@@ -262,10 +266,11 @@ class NpuEplbRuntime:
                 world_size=self.world_size,
                 log_metrics=self.log_metrics,
                 group=self.p2p_group,
-                deferred_copies=copies,
+                staged_rows=staged_rows,
+                submit_p2p_batch=submit_p2p_batch,
             )
             writeback = _make_weight_writeback(
-                self.weights[layer], self.staging, copies.rows
+                self.weights[layer], self.staging, staged_rows
             )
             self._p2p_stream.synchronize()
         self.stage_seconds += time.perf_counter() - start

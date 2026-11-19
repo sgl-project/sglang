@@ -810,6 +810,10 @@ def handle_elastic_ep(server_args: Any):
 def handle_eplb_and_dispatch(server_args: Any):
     cfg = resolving_view(server_args)
     if cfg.eplb_async_rebalance:
+        if cfg.device != "npu" or not cfg.enable_eplb:
+            raise ValueError(
+                "--eplb-async-rebalance requires --enable-eplb and --device npu"
+            )
         from sglang.srt.hardware_backend.npu.eplb import validate_async_eplb_args
 
         validate_async_eplb_args(cfg)

@@ -21,6 +21,11 @@ class AsyncEplbRecorder(_ExpertDistributionRecorderReal):
 
     window_samples = 0
 
+    def __init__(self, metadata, rank):
+        if metadata is None:
+            raise ValueError("Async EPLB requires expert location metadata")
+        super().__init__(metadata, rank)
+
     def _on_forward_pass_end(self, forward_pass_id, outputs):
         super()._on_forward_pass_end(forward_pass_id, outputs)
         if self._recording and self._record_current_pass:
@@ -59,7 +64,10 @@ class NpuAsyncEPLBManager(EPLBManager):
             get_global_expert_distribution_recorder()._reset()
         super().reset_generator()
 
-    def _rebalance(self):
+    def rebalance(self):
+        if self._rebalance_disabled_reason is not None:
+            yield from super().rebalance()
+            return
         coordinator = self._async_coordinator
         if coordinator is None:
             raise RuntimeError(
