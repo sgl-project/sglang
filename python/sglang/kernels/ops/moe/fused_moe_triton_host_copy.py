@@ -50,9 +50,9 @@ def host_copy_kwargs(B: torch.Tensor, plain: bool) -> dict:
 def host_copy_block(
     pid_m, num_tokens_post_padded, host_count_ptr, BLOCK_SIZE_M: tl.constexpr
 ):
-    """The block of tokens a program takes. The experts read from host memory have the highest
-    ids, so their blocks are the last of the sorted list: spread them evenly through the launch,
-    the first one first, so that the host reads and the other blocks' work overlap."""
+    """The block of tokens this thread block takes. The experts read from host memory have the
+    highest ids, so their blocks of tokens come last in the sorted order. We spread them evenly
+    through the launch, so that the host reads overlap with the work on resident experts."""
     groups = tl.cdiv(num_tokens_post_padded, BLOCK_SIZE_M)
     hosts = tl.minimum(tl.load(host_count_ptr), groups)
     if pid_m < groups:
@@ -85,8 +85,9 @@ def host_copy_dot(
     even_Ks: tl.constexpr,
 ):
     """The kernel's K loop for a block that reads its expert from host memory: it writes each
-    piece into the expert's slot as it arrives, and returns 0 for K, so that the kernel's own
-    loop has nothing left to do. A loop of its own, so that no other block pays for the store."""
+    tile into the expert's slot as it arrives, and returns 0 for K, so that the kernel's own
+    loop has nothing left to do. It is a separate loop so that blocks for resident experts do not
+    include any store logic for expert weights."""
     if off_experts >= HOST_SLOTS:
         expert = off_experts - HOST_SLOTS
         slot = tl.load(expert_slot_ptr + expert).to(tl.int64)
