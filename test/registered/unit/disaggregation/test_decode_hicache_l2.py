@@ -37,6 +37,7 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -125,6 +126,9 @@ class _Queue(DecodeHiCachePreallocMixin, DecodeHiCacheTransferMixin):
 class TestDecodeHiCacheL2(CustomTestCase):
     def setUp(self):
         super().setUp()
+        context = get_context().override_server_args(disaggregation_mode="decode")
+        context.install()
+        self.addCleanup(context.restore)
         self.allocator = TokenToKVPoolAllocator(
             size=1024, dtype=torch.float32, device="cpu", kvcache=None, need_sort=False
         )

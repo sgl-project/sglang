@@ -41,7 +41,9 @@ def _transfer_req(fill_len, *, swa_tail_len=None, host_staged=False):
     kv = ReqKvInfo(kv_allocated_len=fill_len, kv_committed_len=fill_len)
     if swa_tail_len is not None:
         kv.set_evicted_seqlen("window_128", fill_len - swa_tail_len)
-    return SimpleNamespace(req=FakeReq(kv=kv), host_staged=host_staged)
+    return SimpleNamespace(
+        req=FakeReq(kv=kv), host_staged=host_staged, prefix_match=None
+    )
 
 
 def _queue(reqs):

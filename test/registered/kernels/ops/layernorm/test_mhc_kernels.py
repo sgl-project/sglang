@@ -12,6 +12,42 @@ register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-large")
 register_cuda_ci(est_time=15, stage="base-b", runner_config="4-gpu-b200")
 
 
+@pytest.mark.parametrize("num_tokens", [256, 1024])
+def test_hopper_bf16x3_mhc_stats_repeatable(num_tokens):
+    """Identical compensated mixing must not change the next layer's input.
+
+    SM90 medium-prefill mixing varied between identical cold requests when the
+    three BF16 dot products used a multistage pipeline. Repetition and cloned
+    input storage cover both persistent and recycled allocations.
+    """
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip("Requires SM90 compensated medium-prefill mixing")
+    from sglang.srt.runtime_context import override_platform
+
+    torch.manual_seed(38926)
+    weight = torch.randn(24, 20480, device="cuda", dtype=torch.float32) * 0.01
+    parts = mhc.split_bf16_hc_weight(weight)
+    scale = torch.tensor([0.5, 0.25, 0.25], device="cuda", dtype=torch.float32)
+    base = torch.zeros(24, device="cuda", dtype=torch.float32)
+    x = torch.randn(num_tokens, 20480, device="cuda", dtype=torch.bfloat16) * 0.1
+    with override_platform(is_sm90=True, is_sm100=False, is_blackwell=False):
+
+        def run(value, operands):
+            return mhc.hc_mix_stats_sinkhorn_bf16x3(
+                value, operands, scale, base, 20, 1e-20, 1e-6
+            )
+
+        expected = tuple(t.clone() for t in run(x, parts))
+        for iteration in range(8):
+            actual = run(
+                x.clone() if iteration % 2 else x,
+                tuple(p.clone() for p in parts) if iteration % 2 else parts,
+            )
+            for result, reference in zip(actual, expected):
+                assert torch.isfinite(result).all()
+                torch.testing.assert_close(result, reference, rtol=0, atol=0)
+
+
 @pytest.fixture
 def stated_tp_group():
     """Provide a TP-group placeholder for kernels with mocked symmetric memory."""

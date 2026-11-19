@@ -762,6 +762,14 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """Locked tokens of one window sub-pool."""
         return 0
 
+    def full_transient_size(self):
+        """FULL slots owned by an unfinished restore, outside the tree/Req rows."""
+        return 0
+
+    def swa_transient_size(self):
+        """Allocated SWA tokens owned outside the request and tree views."""
+        return 0
+
     def total_size(self):
         raise NotImplementedError()
 

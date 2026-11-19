@@ -673,9 +673,16 @@ class HiCacheController:
         self.prefetch_sync_thread = None
         self.backup_thread = None
 
-    # A subclass whose attach continues registering host pools after super()
-    # returns fires on_host_pools_registered() itself, once.
-    _registers_host_pools_after_super_attach = False
+    def _prepare_storage_backend_extra_config(self, storage_backend, extra_config):
+        return dict(extra_config or {})
+
+    def _register_storage_host_pools(self, host_pools):
+        for entry in host_pools or ():
+            self.storage_backend.register_mem_host_pool_v2(entry.host_pool, entry.name)
+        self.storage_backend.on_host_pools_registered()
+
+    def _storage_registration_identity(self):
+        return None
 
     def attach_storage_backend(
         self,
@@ -683,6 +690,7 @@ class HiCacheController:
         prefetch_threshold: int = 256,
         model_name: Optional[str] = None,
         storage_backend_extra_config: Optional[dict] = None,
+        host_pools: Optional[list] = None,
     ):
         """Attach (enable) storage backend at runtime.
 
@@ -752,20 +760,61 @@ class HiCacheController:
         from sglang.srt.mem_cache.utils import get_hash_str
 
         self.get_hash_str = get_hash_str
-        self.storage_config = self._generate_storage_config(
-            model_name, storage_backend_extra_config
-        )
+        previous_storage_config = getattr(self, "storage_config", None)
 
         # Use storage backend factory for dynamic backend creation
         from sglang.srt.mem_cache.storage import StorageBackendFactory
 
         try:
-            self.storage_backend = StorageBackendFactory.create_backend(
-                storage_backend, self.storage_config, self.storage_host_pool
+            # Every rank enters the same groups before any local registration
+            # can fail. A failed peer must not leave another rank publishing a
+            # partially registered backend or waiting in group construction.
+            self.prefetch_hits_sync_groups = self._create_sync_groups()
+            self.prefetch_completion_sync_groups = self._create_sync_groups()
+            registration_error = None
+            identity = bytes(32)
+            has_identity = False
+            try:
+                extra_config = self._prepare_storage_backend_extra_config(
+                    storage_backend, storage_backend_extra_config
+                )
+                self.storage_config = self._generate_storage_config(
+                    model_name, extra_config
+                )
+                self.storage_backend = StorageBackendFactory.create_backend(
+                    storage_backend, self.storage_config, self.storage_host_pool
+                )
+                self.storage_backend.register_mem_pool_host(self.storage_host_pool)
+                self._register_storage_host_pools(host_pools)
+                fingerprint = self._storage_registration_identity()
+                if fingerprint is not None:
+                    candidate_identity = bytes.fromhex(fingerprint)
+                    if len(candidate_identity) != 32:
+                        raise ValueError("Storage registration identity must be SHA256")
+                    identity = candidate_identity
+                    has_identity = True
+            except Exception as error:
+                registration_error = error
+            accepted = torch.tensor(
+                [registration_error is None, has_identity, *identity], dtype=torch.int32
             )
-            self.storage_backend.register_mem_pool_host(self.storage_host_pool)
-            if not self._registers_host_pools_after_super_attach:
-                self.storage_backend.on_host_pools_registered()
+            maximum = accepted.clone()
+            self._all_reduce(
+                accepted,
+                torch.distributed.ReduceOp.MIN,
+                self.prefetch_completion_sync_groups,
+            )
+            self._all_reduce(
+                maximum,
+                torch.distributed.ReduceOp.MAX,
+                self.prefetch_completion_sync_groups,
+            )
+            if not accepted[0].item():
+                if registration_error is not None:
+                    raise registration_error
+                raise RuntimeError("A peer failed storage backend registration.")
+            if not torch.equal(accepted[1:], maximum[1:]):
+                raise RuntimeError("Storage backend namespace differs across ranks.")
 
             self.enable_storage = True
             # todo: threshold policy for prefetching
@@ -785,11 +834,6 @@ class HiCacheController:
                 )
             # tracking the number of tokens locked in prefetching, updated by the main scheduler thread
             self.prefetch_tokens_occupied = 0
-
-            # Use dedicated gloo groups so storage prefetch sync is isolated
-            # from other collectives and consistent across CPxTP participants.
-            self.prefetch_hits_sync_groups = self._create_sync_groups()
-            self.prefetch_completion_sync_groups = self._create_sync_groups()
 
             # Select the get and set functions
             self.page_get_func = self._generic_page_get
@@ -818,7 +862,21 @@ class HiCacheController:
 
             # Ensure stop_event is clear before starting threads.
             self.storage_stop_event.clear()
-            self._start_storage_threads()
+            startup_error = None
+            try:
+                self._start_storage_threads()
+            except Exception as error:
+                startup_error = error
+            started = torch.tensor([startup_error is None], dtype=torch.int32)
+            self._all_reduce(
+                started,
+                torch.distributed.ReduceOp.MIN,
+                self.prefetch_completion_sync_groups,
+            )
+            if not started.item():
+                if startup_error is not None:
+                    raise startup_error
+                raise RuntimeError("A peer failed storage worker startup.")
         except Exception:
             # Best-effort cleanup for partial init.
             try:
@@ -840,6 +898,7 @@ class HiCacheController:
                 pass
             self.storage_backend = None
             self.storage_backend_type = None
+            self.storage_config = previous_storage_config
             self.enable_storage = False
             self.page_get_func = self._generic_page_get
             self.page_set_func = self._generic_page_set

@@ -15,8 +15,13 @@ import logging
 from typing import TYPE_CHECKING, Optional
 
 from sglang.srt.arg_groups.kv_shard_hook import kv_shard_storage_backend_supported
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.buffer_mode.pipeline import validate_buffer_only_stack
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.dsv4_decode_storage_config import (
+    validate_dsv4_decode_storage_config,
+)
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
@@ -26,6 +31,7 @@ from sglang.srt.observability.metrics_collector import (
     StorageMetricsCollector,
     resolve_collector_class,
 )
+from sglang.srt.runtime_context import get_disagg, get_serving
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -99,6 +105,93 @@ class StorageAttachment:
                 "backend yet.",
             )
 
+        native_decode = (
+            get_disagg().disaggregation_mode == "decode"
+            and get_disagg().disaggregation_decode_enable_radix_cache
+            and isinstance(
+                cache.token_to_kv_pool_allocator.get_kvcache(), DeepSeekV4TokenToKVPool
+            )
+        )
+        parsed_config = None
+        if native_decode:
+            if (
+                type(cache.token_to_kv_pool_allocator.get_kvcache())
+                is not DeepSeekV4TokenToKVPool
+            ):
+                return (
+                    False,
+                    "DeepSeek-V4 Decode L3 requires the exact native paged pool.",
+                )
+            if set(
+                cache.token_to_kv_pool_allocator.get_kvcache().compression_ratios
+            ) - {0, 1, 2}:
+                return (
+                    False,
+                    "DeepSeek-V4 Decode L3 supports native C1/C2 pools only.",
+                )
+            # Validate the same effective options as startup, including policy-only
+            # updates. A live backend cannot silently keep a different directory.
+            try:
+                parsed_config = (
+                    HybridCacheController.parse_storage_backend_extra_config(
+                        storage_backend_extra_config_json
+                    )
+                )
+                if cache.enable_storage and storage_backend_extra_config_json is None:
+                    parsed_config = (
+                        dict(controller.storage_config.extra_config or {}),
+                        *parsed_config[1:],
+                    )
+                extra_config = validate_dsv4_decode_storage_config(
+                    backend=storage_backend,
+                    host_memory_mode=cache.host_memory_mode,
+                    write_policy=hicache_write_policy or controller.write_policy,
+                    prefetch_policy=hicache_storage_prefetch_policy
+                    or cache.prefetch_stop_policy,
+                    extra_config=parsed_config[0],
+                    file_storage_path=get_serving().file_storage_path,
+                    file_storage_path_override=envs.SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR.get(),
+                )
+                parsed_config = (extra_config, *parsed_config[1:])
+            except Exception as error:
+                return (
+                    False,
+                    f"DeepSeek-V4 Decode storage configuration rejected: {error}",
+                )
+            if cache.enable_storage and storage_backend_extra_config_json is not None:
+                return (
+                    False,
+                    "Detach the existing Decode L3 backend before changing "
+                    "its namespace, directory or backend configuration.",
+                )
+        elif (
+            cache.enable_storage
+            and storage_backend_extra_config_json is not None
+            and isinstance(
+                cache.token_to_kv_pool_allocator.get_kvcache(), DeepSeekV4TokenToKVPool
+            )
+        ):
+            # Non-Decode native pools retain their legacy backend contract unless
+            # explicitly opted into the new namespace. Once opted in, a live
+            # policy update cannot silently ignore a requested namespace change.
+            try:
+                requested, *_ = (
+                    HybridCacheController.parse_storage_backend_extra_config(
+                        storage_backend_extra_config_json
+                    )
+                )
+            except Exception as error:
+                return False, f"Storage backend configuration rejected: {error}"
+            existing = controller.storage_config.extra_config or {}
+            if (
+                "dsv4_cache_namespace" in requested
+                or "dsv4_cache_namespace" in existing
+            ):
+                return (
+                    False,
+                    "Detach the existing namespaced backend before changing its configuration.",
+                )
+
         # Write-back can retain auxiliary host rows without FULL, or backed
         # descendants below an unbacked FULL ancestor. Those states are invalid
         # for write-through insertion and eviction. Check before changing any
@@ -141,8 +234,12 @@ class StorageAttachment:
                 prefetch_timeout_base,
                 prefetch_timeout_per_ki_token,
                 hicache_storage_pass_prefix_keys,
-            ) = HybridCacheController.parse_storage_backend_extra_config(
-                storage_backend_extra_config_json
+            ) = (
+                parsed_config
+                if parsed_config is not None
+                else HybridCacheController.parse_storage_backend_extra_config(
+                    storage_backend_extra_config_json
+                )
             )
         except Exception as e:
             logger.exception(f"Failed to parse storage_backend_extra_config_json: {e}")

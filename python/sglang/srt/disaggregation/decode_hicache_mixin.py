@@ -20,6 +20,7 @@ from sglang.srt.mem_cache.common import _req_radix_key
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.decode import DecodeRequest
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.mem_cache.dsv41_decode_storage import DecodeStoragePoolPlan
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +33,8 @@ class DecodePrefixMatch:
     last_device_node: Any
     last_host_node: Any = None
     prefetch_registered: bool = False
+    storage_pool_plan: Optional[DecodeStoragePoolPlan] = None
+    reserved_device_indices: Optional[torch.Tensor] = None
 
     @property
     def l1_prefix_len(self) -> int:
@@ -49,6 +52,27 @@ class DecodePrefixMatch:
     def restore_token_count(self) -> int:
         """Number of tokens that need L2/L3 load_back to device."""
         return self.decode_prefix_len - self.l1_prefix_len
+
+    @property
+    def reserved_device_tokens(self) -> int:
+        return (
+            0
+            if self.reserved_device_indices is None
+            else len(self.reserved_device_indices)
+        )
+
+    @property
+    def unallocated_restore_tokens(self) -> int:
+        return self.restore_token_count - self.reserved_device_tokens
+
+
+def _release_decode_storage_reservation(tree_cache, req, prefix_match) -> None:
+    if prefix_match is None or prefix_match.reserved_device_indices is None:
+        return
+    indices = prefix_match.reserved_device_indices
+    prefix_match.reserved_device_indices = None
+    req._decode_storage_device_indices = None
+    tree_cache.release_decode_storage_device(indices)
 
 
 class HiCacheRestoreResult(Enum):
@@ -81,6 +105,7 @@ class DecodeHiCachePreallocMixin:
 
         l3_storage_hit_length = 0
         last_host_node = None
+        storage_pool_plan = None
         if self.scheduler.enable_decode_hicache and self.tree_cache.enable_storage:
             last_host_node = result.last_host_node
             if self.tree_cache.is_backuped(last_host_node) or self.tree_cache.is_root(
@@ -94,20 +119,40 @@ class DecodeHiCachePreallocMixin:
                     if self.tree_cache.hicache_storage_pass_prefix_keys
                     else None
                 )
-                l3_storage_hit_length = self.tree_cache.query_storage_hit_length(
-                    result.last_host_node,
-                    suffix_tokens,
-                    last_hash,
-                    prefix_keys,
-                    extra_key=req.extra_key,
-                    cache_salt=req.cache_salt,
-                )
+                plan_accepted = True
+                if hasattr(self.tree_cache, "decode_storage_pool_plan"):
+                    try:
+                        storage_pool_plan = self.tree_cache.decode_storage_pool_plan()
+                    except ValueError:
+                        # The native builder rejects an invalid/different plan
+                        # on every rank together. Never retry as an anchor-only
+                        # generic query after that agreed refusal.
+                        logger.warning(
+                            "Decode storage pool plan declined for rid=%s", req.rid
+                        )
+                        plan_accepted = False
+                if plan_accepted:
+                    plan_kwargs = (
+                        {"pool_plan": storage_pool_plan}
+                        if storage_pool_plan is not None
+                        else {}
+                    )
+                    l3_storage_hit_length = self.tree_cache.query_storage_hit_length(
+                        result.last_host_node,
+                        suffix_tokens,
+                        last_hash,
+                        prefix_keys,
+                        extra_key=req.extra_key,
+                        cache_salt=req.cache_salt,
+                        **plan_kwargs,
+                    )
 
         return DecodePrefixMatch(
             prefix_indices=prefix_indices,
             l2_host_hit_length=l2_host_hit_length,
             l3_storage_hit_length=l3_storage_hit_length,
             last_device_node=result.last_device_node,
+            storage_pool_plan=storage_pool_plan,
             last_host_node=(
                 result.last_host_node if l3_storage_hit_length > 0 else None
             ),
@@ -125,6 +170,7 @@ class DecodeHiCachePreallocMixin:
             prefix_match is None
             or prefix_match.l3_storage_hit_length <= 0
             or prefix_match.last_host_node is None
+            or prefix_match.prefetch_registered
         ):
             return
         try:
@@ -135,8 +181,14 @@ class DecodeHiCachePreallocMixin:
                 if self.tree_cache.hicache_storage_pass_prefix_keys
                 else None
             )
-            # Same span as the prefill scheduler: the queried hit end, plus the
-            # bigram boundary token, with no second storage query.
+            # Same span as the prefill scheduler: the queried hit end plus the
+            # bigram boundary token. Admission revalidates the same pool plan
+            # before reserving Host space and registering IO.
+            plan_kwargs = (
+                {"pool_plan": prefix_match.storage_pool_plan}
+                if prefix_match.storage_pool_plan is not None
+                else {}
+            )
             ticketed = self.tree_cache.prefetch_from_storage(
                 req.cache_request_handle,
                 prefix_match.last_host_node,
@@ -147,6 +199,7 @@ class DecodeHiCachePreallocMixin:
                 extra_key=req.extra_key,
                 cache_salt=req.cache_salt,
                 storage_hit_end=matched_len + prefix_match.l3_storage_hit_length,
+                **plan_kwargs,
             )
             prefix_match.prefetch_registered = self.tree_cache.has_ongoing_prefetch(
                 req.cache_request_handle
@@ -154,7 +207,26 @@ class DecodeHiCachePreallocMixin:
             if not (prefix_match.prefetch_registered or ticketed):
                 # Declined (below prefetch_threshold or rate limited): nothing loads.
                 prefix_match.l3_storage_hit_length = 0
+            elif prefix_match.storage_pool_plan is not None:
+                # The suffix allocation and this entire restore gap are owned
+                # before send_metadata can promise that Prefill may skip them.
+                indices = self.tree_cache.reserve_decode_storage_device(
+                    prefix_match.restore_token_count, **plan_kwargs
+                )
+                if indices is None:
+                    self.tree_cache.finish(
+                        req.cache_request_handle, CacheRequestOutcome.ABORT
+                    )
+                    prefix_match.prefetch_registered = False
+                    prefix_match.l3_storage_hit_length = 0
+                else:
+                    prefix_match.reserved_device_indices = indices
         except Exception as e:
+            if prefix_match.prefetch_registered:
+                self.tree_cache.finish(
+                    req.cache_request_handle, CacheRequestOutcome.ABORT
+                )
+            _release_decode_storage_reservation(self.tree_cache, req, prefix_match)
             logger.warning(
                 "HiCache L3 prefetch failed for rid=%s: %s; falling back to L2-only LoadingBack",
                 req.rid,
@@ -168,7 +240,7 @@ class DecodeHiCachePreallocMixin:
         if not self.scheduler.enable_decode_hicache:
             return 0
         return sum(
-            dr.prefix_match.restore_token_count
+            dr.prefix_match.unallocated_restore_tokens
             for dr in self.transfer_queue.queue.items()
             if dr.prefix_match is not None and dr.hicache_restore_lock is None
         )
@@ -199,9 +271,20 @@ class DecodeHiCacheTransferMixin:
             decode_req.prefix_match is not None
             and decode_req.prefix_match.prefetch_registered
         ):
+            decode_req.prefix_match.prefetch_registered = False
+            # finish marks IO cancellation; the controller/ACK still owns Host
+            # pages until the storage worker has stopped writing them.
             self.tree_cache.finish(
                 decode_req.req.cache_request_handle, CacheRequestOutcome.ABORT
             )
+        _release_decode_storage_reservation(
+            self.tree_cache, decode_req.req, decode_req.prefix_match
+        )
+        if (
+            decode_req.prefix_match is not None
+            and decode_req.prefix_match.storage_pool_plan is not None
+        ):
+            decode_req.req._decode_storage_pool_plan = None
         self.tree_cache.unlock(decode_req.hicache_restore_lock)
         decode_req.hicache_restore_lock = None
 
@@ -240,7 +323,21 @@ class DecodeHiCacheTransferMixin:
                 req=dr.req,
             )
         )
+        if (
+            pm.l3_storage_hit_length > 0
+            and rematch.device_prefix_len + rematch.host_hit_length
+            < pm.decode_prefix_len
+        ):
+            # Prefill already skipped this span. A short File read cannot be
+            # salvaged by silently shortening the promise or submitting an
+            # orphan partial H2D operation.
+            logger.warning("HiCache storage prefix no longer covers rid=%s", dr.req.rid)
+            dr.hicache_restore_status = HiCacheRestoreResult.FAILED
+            return False
         owned_node = dr.req.last_node
+        if pm.storage_pool_plan is not None:
+            dr.req._decode_storage_pool_plan = pm.storage_pool_plan
+            dr.req._decode_storage_device_indices = pm.reserved_device_indices
         try:
             dr.req.last_node = rematch.last_device_node
             loaded_len, restored_node = self.tree_cache.init_load_back(
@@ -250,8 +347,20 @@ class DecodeHiCacheTransferMixin:
                     req=dr.req,
                 )
             )
+        except Exception:
+            if pm.storage_pool_plan is None:
+                raise
+            logger.exception("HiCache storage load-back failed for rid=%s", dr.req.rid)
+            dr.hicache_restore_status = HiCacheRestoreResult.FAILED
+            return False
         finally:
             dr.req.last_node = owned_node
+            if pm.storage_pool_plan is not None:
+                # Only a successful queue submission consumes the reservation.
+                # A failure retains it here; ACK-owned DMA slots are never freed
+                # by request cleanup once the controller has consumed them.
+                pm.reserved_device_indices = dr.req._decode_storage_device_indices
+        _release_decode_storage_reservation(self.tree_cache, dr.req, pm)
         # Failback: total coverage < required prefix means device alloc likely failed.
         if rematch.device_prefix_len + loaded_len < pm.decode_prefix_len:
             logger.warning(
@@ -349,6 +458,23 @@ class DecodeHiCacheTransferMixin:
         )
         req.prefix_len = prefix_match.decode_prefix_len
         req.last_node = restore_lock.node
+        # Record only the Host span whose restore reached this completed commit.
+        # PREBUILT then preserves the source instead of reporting it as L1.
+        req.host_hit_length = prefix_match.l2_host_hit_length
+        # Upstream PREBUILT accounting treats this as the whole loaded tail,
+        # including its storage span, then subtracts that span from Host hits.
+        req.host_loaded_length = prefix_match.restore_token_count
+        req.storage_hit_length = prefix_match.l3_storage_hit_length
+        if prefix_match.l3_storage_hit_length > 0:
+            req.storage_hit_start = (
+                prefix_match.l1_prefix_len + prefix_match.l2_host_hit_length
+            )
+            self.tree_cache.finish_storage_prefetch_admission(
+                req.cache_request_handle, prefix_match.l3_storage_hit_length, None
+            )
+            prefix_match.prefetch_registered = False
+        if prefix_match.storage_pool_plan is not None:
+            req._decode_storage_pool_plan = None
         req.lock = restore_lock
         # Prevent abort cleanup from releasing the transferred lock.
         decode_req.hicache_restore_lock = None

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import random
@@ -392,6 +393,9 @@ class HiCacheStorage(ABC):
             self.registered_pools = {}
         self.registered_pools[host_pool_name] = host_pool
 
+    def configure_persistent_pool_bundle(self, plan) -> None:
+        """Opt in an actual native persistent-pool plan before storage IO."""
+
     def on_host_pools_registered(self) -> None:
         """The initial host-pool registration burst is over: the anchor pool
         (``register_mem_pool_host``) and every host pool group entry
@@ -669,6 +673,9 @@ class HiCacheStorageFailureInjector(HiCacheStorage):
     def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name):
         self._backend.register_mem_host_pool_v2(host_pool, host_pool_name)
 
+    def configure_persistent_pool_bundle(self, plan) -> None:
+        self._backend.configure_persistent_pool_bundle(plan)
+
     def on_host_pools_registered(self) -> None:
         self._backend.on_host_pools_registered()
 
@@ -813,6 +820,15 @@ class HiCacheStorageFailureInjector(HiCacheStorage):
 
 
 class HiCacheFile(HiCacheStorage):
+    """Raw page files, with atomic native C1/C2 physical-pool generations.
+
+    Retired generations remain immutable for readers and follow ordinary file
+    LRU eviction. Small JSON commit manifests are outside its byte accounting;
+    generation/manifest garbage collection is not performed here.
+    """
+
+    _persistent_bundle = None
+
     def _init_config_suffix(self, storage_config: HiCacheStorageConfig) -> None:
         """Derive the per-deployment key suffix from the storage config."""
         self._unified_suffixes = None
@@ -906,6 +922,10 @@ class HiCacheFile(HiCacheStorage):
         )
 
         self._init_config_suffix(storage_config)
+        self._persistent_bundle = None
+        self._bundle_suffix = (
+            "__dsv41b1_" + hashlib.sha256(self.config_suffix.encode()).hexdigest()[:16]
+        )
         tp_rank = storage_config.tp_rank
         attn_cp_rank = storage_config.attn_cp_rank
 
@@ -952,7 +972,7 @@ class HiCacheFile(HiCacheStorage):
             # also own their shared MLA shard files.
             owned_suffixes = (self.tp_config_suffix,)
             if storage_config.is_rank_replicated and storage_config.is_storage_writer:
-                owned_suffixes += (self.config_suffix,)
+                owned_suffixes += (self.config_suffix, self._bundle_suffix)
         self._evictor = LRUFileEvictor(
             self.file_path,
             owned_suffixes=owned_suffixes,
@@ -962,6 +982,193 @@ class HiCacheFile(HiCacheStorage):
                 self.metadata_cache.remove if self.metadata_cache is not None else None
             ),
         )
+
+    def configure_persistent_pool_bundle(self, plan) -> None:
+        from sglang.srt.mem_cache.storage.dsv41_pool_bundle import Dsv41PoolBundle
+
+        bundle = Dsv41PoolBundle.from_plan(plan)
+        if self._unified_suffixes is not None:
+            raise ValueError("Persistent pool bundles require separate host pools")
+        if not set(bundle.names) <= set(self.registered_pools):
+            raise ValueError("Persistent pool bundle host pools are not registered")
+        if self._persistent_bundle not in (None, bundle):
+            raise ValueError("Persistent pool bundle changed after registration")
+        page_bytes = {}
+        for name in bundle.names:
+            page = self.registered_pools[name].get_dummy_flat_data_page()
+            page_bytes[name] = page.numel() * page.element_size()
+            if page_bytes[name] <= 0:
+                raise ValueError("Persistent physical pool pages must not be empty")
+        self._persistent_bundle = bundle
+        self._bundle_page_bytes = page_bytes
+
+    def _bundle_object_key(self, key, manifest, name):
+        return (
+            self._persistent_bundle.object_key(
+                key, self.config_suffix, manifest["generation"], str(name)
+            )
+            + self._bundle_suffix
+        )
+
+    def _bundle_manifest_path(self, key):
+        return os.path.join(
+            self.file_path,
+            self._persistent_bundle.manifest_key(key, self.config_suffix) + ".json",
+        )
+
+    def _bundle_manifest(self, key):
+        """Pin one committed generation; legacy objects never prove a hit."""
+        try:
+            with open(self._bundle_manifest_path(key), "rb") as source:
+                payload = source.read(16385)
+            if len(payload) > 16384:
+                return None
+            manifest = self._persistent_bundle.decode_manifest(payload, key)
+            if manifest is None:
+                return None
+            for name, obj in manifest["objects"].items():
+                if obj["size"] != self._bundle_page_bytes[name]:
+                    return None
+                path = os.path.join(
+                    self.file_path,
+                    self._bundle_object_key(key, manifest, name) + ".bin",
+                )
+                if os.stat(path).st_size != obj["size"]:
+                    return None
+            return manifest
+        except OSError:
+            return None
+
+    def _read_bundle_pages(self, key, manifest, rows):
+        pages = {}
+        for name, (pool, _) in rows.items():
+            page = pool.get_dummy_flat_data_page()
+            obj = manifest["objects"][str(name)]
+            if page.numel() * page.element_size() != obj["size"]:
+                return None
+            if (
+                self._get_file(self._bundle_object_key(key, manifest, name), page)
+                is None
+            ):
+                return None
+            raw = page.contiguous().view(torch.uint8).numpy().tobytes()
+            if hashlib.sha256(raw).hexdigest() != obj["sha256"]:
+                return None
+            pages[name] = page
+        return pages
+
+    def _write_bundle_page(self, key, rows):
+        current = self._bundle_manifest(key)
+        if (
+            current is not None
+            and self._read_bundle_pages(key, current, rows) is not None
+        ):
+            # Keep all pools from the first complete producer together.
+            return True
+        generation = uuid.uuid4().hex
+        objects = {}
+        pending = {}
+        for name, (pool, offset) in rows.items():
+            page = pool.get_data_page(offset, flat=True)
+            raw = page.contiguous().view(torch.uint8).numpy().tobytes()
+            objects[str(name)] = dict(
+                size=len(raw), sha256=hashlib.sha256(raw).hexdigest()
+            )
+            pending[name] = page
+        payload = self._persistent_bundle.encode_manifest(key, generation, objects)
+        manifest = self._persistent_bundle.decode_manifest(payload, key)
+        for name, page in pending.items():
+            if not self._set_file(self._bundle_object_key(key, manifest, name), page):
+                return False
+        # The size cap may have evicted an earlier object while writing another.
+        for name, obj in objects.items():
+            path = os.path.join(
+                self.file_path, self._bundle_object_key(key, manifest, name) + ".bin"
+            )
+            try:
+                if os.stat(path).st_size != obj["size"]:
+                    return False
+            except OSError:
+                return False
+        tmp_path = os.path.join(self.file_path, "." + uuid.uuid4().hex + ".tmp")
+        try:
+            with open(tmp_path, "wb") as target:
+                target.write(payload)
+            # Old generations remain immutable for readers that pinned them.
+            os.replace(tmp_path, self._bundle_manifest_path(key))
+            return True
+        except OSError:
+            return False
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except FileNotFoundError:
+                pass
+
+    def _bundle_io_v2(self, transfers, *, write):
+        names = set(self._persistent_bundle.names)
+        members = [transfer for transfer in transfers if str(transfer.name) in names]
+        if not members:
+            return self._batch_io_v2(
+                transfers, self._write_page if write else self._read_page
+            )
+        extras = [transfer for transfer in transfers if str(transfer.name) not in names]
+        result = {
+            transfer.name: [False] * len(transfer.keys or []) for transfer in members
+        }
+        keys = members[0].keys or []
+        if (
+            len(members) != len(names)
+            or {str(transfer.name) for transfer in members} != names
+            or any(
+                transfer.keys != keys
+                or transfer.hit_policy != PoolHitPolicy.ALL_PAGES
+                or transfer.host_indices is None
+                or transfer.host_indices.numel()
+                != len(keys) * self.registered_pools[transfer.name].page_size
+                for transfer in members
+            )
+        ):
+            logger.error(
+                "Persistent bundle IO requires the complete aligned physical pool plan"
+            )
+            result.update(
+                self._batch_io_v2(
+                    extras, self._write_page if write else self._read_page
+                )
+            )
+            return result
+        for index, key in enumerate(keys):
+            rows = {
+                transfer.name: (
+                    self.registered_pools[transfer.name],
+                    transfer.host_indices[
+                        index * self.registered_pools[transfer.name].page_size
+                    ].item(),
+                )
+                for transfer in members
+            }
+            if write:
+                success = self._write_bundle_page(key, rows)
+            else:
+                manifest = self._bundle_manifest(key)
+                pages = (
+                    None
+                    if manifest is None
+                    else self._read_bundle_pages(key, manifest, rows)
+                )
+                success = pages is not None
+                if success:
+                    # Do not expose a partly restored host page on a short read.
+                    for name, page in pages.items():
+                        pool, offset = rows[name]
+                        pool.set_from_flat_data_page(offset, page)
+            for transfer in members:
+                result[transfer.name][index] = success
+        result.update(
+            self._batch_io_v2(extras, self._write_page if write else self._read_page)
+        )
+        return result
 
     def _validate_unified_page_bytes(self, page_bytes: int) -> None:
         if self._unified_chunk_spans is not None:
@@ -1040,6 +1247,8 @@ class HiCacheFile(HiCacheStorage):
         target_location: torch.Tensor,
         target_sizes: Optional[Any] = None,
     ) -> torch.Tensor | None:
+        if self._persistent_bundle is not None and target_location.numel() == 0:
+            return target_location if self._bundle_manifest(key) is not None else None
         if self._unified_suffixes is None:
             return self._get_file(self._get_suffixed_key(key), target_location)
         # Do not expose a partially restored page if any chunk is missing,
@@ -1093,6 +1302,12 @@ class HiCacheFile(HiCacheStorage):
         target_location: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
     ) -> bool:
+        if (
+            self._persistent_bundle is not None
+            and value is not None
+            and value.numel() == 0
+        ):
+            return self._bundle_manifest(key) is not None
         if self._unified_suffixes is None:
             return self._set_file(self._get_suffixed_key(key), value)
         for suffixed, chunk in self._page_chunks(key, value):
@@ -1154,6 +1369,8 @@ class HiCacheFile(HiCacheStorage):
         return True
 
     def exists(self, key: str) -> bool:
+        if self._persistent_bundle is not None:
+            return self._bundle_manifest(key) is not None
         return all(self._file_exists(stem) for stem in self._get_component_keys(key))
 
     def _file_exists(self, key: str) -> bool:
@@ -1234,8 +1451,17 @@ class HiCacheFile(HiCacheStorage):
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> PoolTransferResult:
         existing_files = self._collect_existing_component_keys(keys, pool_transfers)
+        bundles = (
+            [self._bundle_manifest(key) for key in keys]
+            if self._persistent_bundle is not None
+            else None
+        )
 
         def has_component(page_idx: int, name: str) -> bool:
+            if bundles is not None and (
+                name == PoolName.KV or str(name) in self._persistent_bundle.names
+            ):
+                return bundles[page_idx] is not None
             return all(
                 f"{stem}.bin" in existing_files
                 for stem in self._get_component_keys(keys[page_idx], name)
@@ -1329,6 +1555,8 @@ class HiCacheFile(HiCacheStorage):
         transfers: List[PoolTransfer],
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> dict[str, List[bool]]:
+        if self._persistent_bundle is not None:
+            return self._bundle_io_v2(transfers, write=False)
         return self._batch_io_v2(transfers, self._read_page)
 
     def batch_set_v2(
@@ -1336,6 +1564,8 @@ class HiCacheFile(HiCacheStorage):
         transfers: List[PoolTransfer],
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> dict[str, List[bool]]:
+        if self._persistent_bundle is not None:
+            return self._bundle_io_v2(transfers, write=True)
         return self._batch_io_v2(transfers, self._write_page)
 
     def clear(self) -> bool:

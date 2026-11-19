@@ -3254,7 +3254,9 @@ def _mock_swa_write_back_io(case, backup="success"):
         host_pool.available_size.return_value = count
         return count
 
-    def write(node, full, transfers, sidecars):
+    def write(node, full, transfers, sidecars, *, agree_allocation=None):
+        # The legacy rank-local callback must not enter a new collective.
+        assert agree_allocation is None
         assert sidecars == []
         assert_resident(node, transfers)
         case.events.append(("write", node))
@@ -4961,7 +4963,8 @@ def test_internal_mamba_write_back_preserves_state_until_ack(backend, backup):
         host_pool.available_size.return_value = 1
         return 1
 
-    def write(node_id, values, transfers, sidecars):
+    def write(node_id, values, transfers, sidecars, *, agree_allocation=None):
+        assert agree_allocation is None
         assert node_id == node and values.tolist() == [10] and sidecars == []
         assert_state_resident()
         events.append("write")

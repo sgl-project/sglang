@@ -383,9 +383,9 @@ class SchedulerInvariantChecker:
     def _get_total_uncached_sizes(
         self, windows: Sequence[str] = ()
     ) -> Tuple[int, Dict[str, int]]:
-        """The full footprint of the KV rows requests own, and each window
-        slot's in ``windows``."""
-        full_uncached = 0
+        """Request-owned rows plus cache-owned FULL restore reservations, and
+        each window slot's request footprint in ``windows``."""
+        full_uncached = self.tree_cache.full_transient_size()
         window_uncached = {sub_pool: 0 for sub_pool in windows}
         for req in self._requests_owning_rows():
             if req.kv.cache_protected_len % self.page_size != 0:
