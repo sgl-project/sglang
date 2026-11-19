@@ -803,6 +803,9 @@ fn media_item(item: &MmItem) -> Value {
             if let Some(detail) = &hints.detail {
                 item.insert("detail".into(), detail.as_str().into());
             }
+            if let Some(grid) = &hints.image_grid_thw {
+                item.insert("image_grid_thw".into(), serde_json::json!(grid));
+            }
             if let Some(max_frames) = hints.max_frames {
                 item.insert("max_frames".into(), max_frames.into());
             }

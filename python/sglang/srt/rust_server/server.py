@@ -1271,6 +1271,10 @@ class RustServer:
             image_mean=spec.image_mean,
             image_std=spec.image_std,
             resample=resample,
+            metadata_only_decode=(
+                envs.SGLANG_PD_MEDIA_METADATA_MODE.get() == "request"
+                and get_disagg().disaggregation_mode == "decode"
+            ),
         )
 
 

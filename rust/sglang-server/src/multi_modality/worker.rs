@@ -177,14 +177,38 @@ pub trait MmProcessor: Send + Sync {
 /// request's resolved media bytes.
 struct ImageMmProcessor {
     pipeline: sglang_processor::MmProcessor,
+    metadata_geometry: Option<(i64, usize)>,
 }
 
 impl MmProcessor for ImageMmProcessor {
+    fn check_media(&self, mm: &MmData) -> Result<(), String> {
+        let has_metadata = mm.image_data.iter().any(|item| {
+            matches!(item,
+            crate::message::multimodal::MmItem::Ref { url, .. } if url.is_empty())
+        });
+        if has_metadata && self.metadata_geometry.is_none() {
+            return Err(
+                "grid-only media is allowed only on a metadata-enabled P/D decode worker".into(),
+            );
+        }
+        Ok(())
+    }
+
     fn process(&self, input_ids: TokenIds, mm: MmData) -> Result<MmProcessOutput, MediaError> {
         if !mm.video_data.is_empty() || !mm.audio_data.is_empty() {
             return Err(MediaError::Client(
                 "unsupported modality: video/audio input".into(),
             ));
+        }
+        if mm.image_data.iter().any(|item| {
+            matches!(item,
+            crate::message::multimodal::MmItem::Ref { url, .. } if url.is_empty())
+        }) {
+            let (image_token_id, merge_size) = self.metadata_geometry.ok_or_else(|| {
+                MediaError::Client("metadata-only media requires an enabled decode worker".into())
+            })?;
+            return process_image_metadata(input_ids, &mm, image_token_id, merge_size)
+                .map_err(MediaError::Client);
         }
         let media = super::payload::resolve_media_work(input_ids, mm)?;
         let input_ids = (media.input_ids.iter())
@@ -200,6 +224,94 @@ impl MmProcessor for ImageMmProcessor {
             .map_err(|error| MediaError::Client(error.to_string()))?;
         encode_output(output).map_err(MediaError::Server)
     }
+}
+
+fn process_image_metadata(
+    input_ids: TokenIds,
+    mm: &MmData,
+    image_token_id: i64,
+    merge_size: usize,
+) -> Result<MmProcessOutput, String> {
+    use crate::message::multimodal::MmItem;
+    use sglang_mm::common::token_layout::{apply_layout, layout_by_placeholder};
+    use sglang_mm::qwen_vl::{MropeItem, mrope_image_only};
+    use std::collections::BTreeMap;
+
+    let mut grids = Vec::new();
+    let mut counts = Vec::new();
+    for item in &mm.image_data {
+        let MmItem::Ref { url, hints } = item else {
+            return Err("cannot mix metadata-only and full-media image items".into());
+        };
+        if !url.is_empty() {
+            return Err("cannot mix metadata-only and full-media image items".into());
+        }
+        let rows = hints
+            .image_grid_thw
+            .as_ref()
+            .ok_or("missing image_grid_thw")?;
+        if rows.len() != 1
+            || rows[0].len() != 3
+            || rows[0].iter().any(|&x| x <= 0 || x > u32::MAX as i64)
+        {
+            return Err("image_grid_thw needs one positive [t,h,w] row per image".into());
+        }
+        let grid = [rows[0][0] as u32, rows[0][1] as u32, rows[0][2] as u32];
+        if merge_size == 0
+            || grid[0] != 1
+            || !(grid[1] as usize).is_multiple_of(merge_size)
+            || !(grid[2] as usize).is_multiple_of(merge_size)
+        {
+            return Err("image grid needs t=1 and h/w divisible by merge size".into());
+        }
+        let count = (grid[1] as usize / merge_size)
+            .checked_mul(grid[2] as usize / merge_size)
+            .ok_or("image grid overflows")?;
+        // Bound before any allocation; normal intake applies the model's tighter limit.
+        if count > 1_048_576 {
+            return Err("image metadata exceeds token limit".into());
+        }
+        grids.push(grid);
+        counts.push(count);
+    }
+    if input_ids.len().saturating_add(counts.iter().sum::<usize>()) > 1_048_576 {
+        return Err("expanded metadata prompt exceeds token limit".into());
+    }
+    let layout = layout_by_placeholder(&input_ids, image_token_id, &counts)?;
+    let expanded = apply_layout(&input_ids, &layout, grids.len())?;
+    let mrope_items = grids
+        .iter()
+        .zip(&expanded.offsets)
+        .map(|(&grid, &(start, end))| MropeItem { start, end, grid })
+        .collect::<Vec<_>>();
+    let (positions, delta) = mrope_image_only(expanded.input_ids.len(), &mrope_items, merge_size)?;
+    let items = grids
+        .into_iter()
+        .zip(expanded.offsets)
+        .map(|(grid, span)| MmEncodedItem {
+            modality: MmModality::Image,
+            feature: Tensor {
+                shape: vec![0],
+                data: TensorData::F32(vec![]),
+            },
+            hash: 0,
+            identity: None,
+            offsets: vec![span],
+            model_specific_data: BTreeMap::from([(
+                "image_grid_thw".into(),
+                MmMetaValue::Ints(grid.into_iter().map(i64::from).collect()),
+            )]),
+        })
+        .collect();
+    Ok(MmProcessOutput {
+        input_ids: expanded.input_ids,
+        result: MmEncodedEntry {
+            items,
+            token_ids: None,
+            mrope: Some(MRope { positions, delta }),
+        },
+        extension: None,
+    })
 }
 
 /// Map the pipeline's output straight onto the common encoded result: each
@@ -296,10 +408,22 @@ pub struct MmContext {
 
 impl MmContext {
     pub fn new(spec: MmSpec) -> Result<Self, String> {
+        let metadata_geometry = if spec.metadata_only_decode {
+            use sglang_processor::dynamo_multimodal::registry::ProcessorSpec;
+            let ProcessorSpec::QwenVl(ref qwen) = spec.pipeline else {
+                return Err("metadata-only decode requires the Qwen-VL image pipeline".into());
+            };
+            Some((i64::from(qwen.image_token_id), qwen.merge_size))
+        } else {
+            None
+        };
         let pipeline =
             sglang_processor::MmProcessor::from_spec(spec.pipeline).map_err(|e| e.to_string())?;
         Ok(Self {
-            processor: Arc::new(ImageMmProcessor { pipeline }),
+            processor: Arc::new(ImageMmProcessor {
+                pipeline,
+                metadata_geometry,
+            }),
             feature_shm: spec.feature_shm,
             limits: None,
         })
@@ -537,6 +661,29 @@ mod tests {
     use crate::message::buffers::find;
     use crate::message::config::HiddenStatesMode;
     use crate::utils::shm::{shm_path, unique_name};
+
+    #[test]
+    fn grid_only_decode_expands_and_positions_without_features() {
+        use crate::message::multimodal::{MediaHints, MmItem};
+        let mm = MmData {
+            image_data: vec![MmItem::Ref {
+                url: String::new(),
+                hints: MediaHints {
+                    image_grid_thw: Some(vec![vec![1, 4, 6]]),
+                    ..Default::default()
+                },
+            }],
+            ..Default::default()
+        };
+        let out = process_image_metadata(vec![7, 99, 8], &mm, 99, 2).unwrap();
+        assert_eq!(out.input_ids, vec![7, 99, 99, 99, 99, 99, 99, 8]);
+        assert_eq!(out.result.items[0].offsets, vec![(1, 6)]);
+        assert!(out.result.items[0].feature.data.is_empty());
+        let rope = out.result.mrope.unwrap();
+        assert_eq!(rope.delta, -3);
+        assert_eq!(&rope.positions[..8], &[0, 1, 1, 1, 1, 1, 1, 4]);
+        assert!(process_image_metadata(vec![99, 99], &mm, 99, 2).is_err());
+    }
 
     /// An external-style processor: one image item with a caller-shaped
     /// feature and spans, no M-RoPE.

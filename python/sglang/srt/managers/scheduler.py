@@ -1625,6 +1625,9 @@ class Scheduler(
         configure_gc_logging("Scheduler")
 
     def init_disaggregation(self):
+        from sglang.srt.disaggregation.media_metadata import validate_server_args
+
+        validate_server_args(self.server_args)
         self.mm_receiver = None
         self.disagg_prefill_bootstrap_queue = None
         self.disagg_prefill_transfer_queue = IndexedReqList(
@@ -1707,6 +1710,11 @@ class Scheduler(
                 max_top_logprobs_num=get_disagg().disaggregation_max_top_logprobs_num,
                 output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
                 kv_checksum_enabled=get_disagg().disaggregation_enable_kv_checksum,
+                media_merge_size=getattr(
+                    getattr(self.model_config.hf_config, "vision_config", None),
+                    "spatial_merge_size",
+                    2,
+                ),
             )
 
             # The decode requests polling kv cache
@@ -1750,6 +1758,11 @@ class Scheduler(
                 max_top_logprobs_num=get_disagg().disaggregation_max_top_logprobs_num,
                 output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
                 kv_checksum_enabled=get_disagg().disaggregation_enable_kv_checksum,
+                media_merge_size=getattr(
+                    getattr(self.model_config.hf_config, "vision_config", None),
+                    "spatial_merge_size",
+                    2,
+                ),
             )
 
             self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(

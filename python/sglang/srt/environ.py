@@ -829,6 +829,9 @@ class Envs:
     SGLANG_DISAGGREGATION_THREAD_POOL_SIZE = EnvInt(None)
     SGLANG_DISAGGREGATION_QUEUE_SIZE = EnvInt(4)
     SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES = EnvInt(0)
+    # Image-only P/D comparison. Both workers must use the same mode/capacity.
+    SGLANG_PD_MEDIA_METADATA_MODE = EnvStr("original")
+    SGLANG_PD_MEDIA_METADATA_MAX_BYTES = EnvInt(16384)
     # Enable on both P and D with the same --sampling-mask-max-tokens value.
     SGLANG_ENABLE_DISAGG_SAMPLING_MASK = EnvBool(False)
     SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT = EnvInt(300)

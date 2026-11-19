@@ -651,10 +651,23 @@ class MetadataBuffers:
         output_dsa_topk_indices_dim: int = 0,
         *,
         kv_checksum_enabled: bool = False,
+        media_merge_size: int = 2,
     ):
         self.custom_mem_pool = custom_mem_pool
         self.output_dsa_topk_indices_dim = output_dsa_topk_indices_dim
         self.enable_sampling_mask = envs.SGLANG_ENABLE_DISAGG_SAMPLING_MASK.get()
+        from sglang.srt.disaggregation.media_metadata import media_mode
+
+        self.media_merge_size = media_merge_size
+        media_capacity = (
+            envs.SGLANG_PD_MEDIA_METADATA_MAX_BYTES.get()
+            if media_mode() == "transfer"
+            else 0
+        )
+        if media_mode() == "transfer" and not 64 <= media_capacity <= 1048576:
+            raise ValueError(
+                "P/D media metadata capacity must be between 64 and 1048576 bytes"
+            )
         customized_info_capacity_env = envs.SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES
         customized_info_capacity = (
             customized_info_capacity_env.parse(
@@ -747,6 +760,16 @@ class MetadataBuffers:
             else:
                 self.output_dsa_topk_indices = None
             # Request validation: store bootstrap_room to detect metadata corruption
+            self.media_metadata = (
+                torch.zeros((size, media_capacity), dtype=torch.uint8, device=device)
+                if media_capacity
+                else None
+            )
+            self.media_metadata_len = (
+                torch.zeros((size, 16), dtype=torch.int32, device=device)
+                if media_capacity
+                else None
+            )
             self.bootstrap_room = torch.zeros(
                 (size, 8), dtype=bootstrap_room_dtype, device=device
             )
@@ -781,6 +804,8 @@ class MetadataBuffers:
         """Reset the fields the next owner reads before its prefill writes
         them, so it sees "not yet written" instead of the previous owner's."""
         self.bootstrap_room[idx] = 0
+        if self.media_metadata_len is not None:
+            self.media_metadata_len[idx] = 0
         if self.kv_checksum is not None:
             self.kv_checksum[idx] = 0
 
@@ -803,6 +828,8 @@ class MetadataBuffers:
         ]
         if self.output_dsa_topk_indices is not None:
             bufs.append(self.output_dsa_topk_indices)
+        if self.media_metadata is not None:
+            bufs.extend([self.media_metadata, self.media_metadata_len])
         bufs.append(self.bootstrap_room)
         if self.kv_checksum is not None:
             bufs.append(self.kv_checksum)
@@ -906,7 +933,36 @@ class MetadataBuffers:
             )
         self.output_customized_info_len[idx, 0] = len(payload)
 
+    def get_media_metadata(self, idx: int) -> bytes:
+        if self.media_metadata is None:
+            return b""
+        length = int(self.media_metadata_len[idx, 0].item())
+        if not 0 <= length <= self.media_metadata.shape[1]:
+            raise ValueError(f"Invalid P/D media metadata length: {length}")
+        return self.media_metadata[idx, :length].cpu().numpy().tobytes()
+
+    def _set_media_metadata(self, req: Req):
+        if self.media_metadata is None:
+            return
+        from sglang.srt.disaggregation.media_metadata import export_metadata
+
+        try:
+            payload = export_metadata(
+                req,
+                merge_size=self.media_merge_size,
+                capacity=self.media_metadata.shape[1],
+            )
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise CustomizedInfoError(f"Invalid P/D media metadata: {exc}") from exc
+        idx = req.metadata_buffer_index
+        if payload:
+            self.media_metadata[idx, : len(payload)].copy_(
+                torch.from_numpy(np.frombuffer(payload, dtype=np.uint8).copy())
+            )
+        self.media_metadata_len[idx, 0] = len(payload)
+
     def set_buf(self, req: Req):
+        self._set_media_metadata(req)
         self._set_customized_info(req)
         self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
         # The cached_tokens buffer is (size, 16); slots 0-3 hold cached token

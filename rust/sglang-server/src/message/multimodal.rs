@@ -18,9 +18,11 @@ pub enum MmItem {
 
 /// The `MediaRef` hints a processor may read, grown as processors need them;
 /// the rest serve Python-side model families the Rust pipeline does not run.
-/// A bare source carries none, and the built-in families ignore them.
+/// A bare source carries none; the opt-in grid-only path consumes its geometry.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct MediaHints {
+    /// One grid row for a metadata-only image on an opt-in P/D decode worker.
+    pub image_grid_thw: Option<Vec<Vec<i64>>>,
     /// Video: the requested frame sampling rate.
     pub fps: Option<f64>,
     /// Image: the requested detail level ("auto" | "low" | "high").
@@ -44,7 +46,14 @@ impl HeapBytes for MmItem {
     fn heap_bytes(&self) -> usize {
         match self {
             MmItem::Source(s) => s.len(),
-            MmItem::Ref { url, hints } => url.len() + hints.detail.as_ref().map_or(0, String::len),
+            MmItem::Ref { url, hints } => {
+                url.len()
+                    + hints.detail.as_ref().map_or(0, String::len)
+                    + hints
+                        .image_grid_thw
+                        .as_ref()
+                        .map_or(0, |rows| rows.iter().map(|r| r.len() * 8).sum::<usize>())
+            }
         }
     }
 }
