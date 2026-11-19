@@ -6,9 +6,10 @@ Widths are decode / verify CUDA-graph batch sizes plus prefill chunks.
 Every op is timed with ``marker.do_bench`` (HIP graph, cold L2: inputs rotated past L2 and L2 flushed per replay)
 next to the time its bytes take at peak HBM bandwidth (``--hbm-tbps``, MI350X 8 TB/s), and checked against the
 incumbent: bitwise where the contracts promise it, otherwise the mismatch fraction and max error are printed.
-Both kernels are plain Triton, so stock ROCm Triton runs this script.
+``rmsnorm_gate`` and ``qk_norm_rope`` are plain Triton and run on stock ROCm Triton; ``paged_decode`` uses TLX
+primitives and needs Triton with the uTLX plugin (SGLang's ``BUILD_UTLX=1`` ROCm image).
 
-    python test/manual/kernels/bench_tlx_gfx950_muse_ops.py [--ops rmsnorm_gate,qk_norm_rope]
+    python test/manual/kernels/bench_tlx_gfx950_muse_ops.py [--ops rmsnorm_gate,qk_norm_rope,paged_decode]
 """
 
 import argparse
@@ -171,9 +172,113 @@ def bench_qk_norm_rope(args):
             _row(name, rows, impls, moved / args.hbm, check)
 
 
+PAGED_DECODE_ROWS = [1, 2, 4, 8, 16, 32, 64, 128]
+CONTEXT, WINDOW, MAX_CONTEXT = 8704, 2047, 32768
+
+
+def _decode_reference(q, kc, vc, bt, ctx, window, gate, scale, eps):
+    """FP32 attention over the visible keys, then the weightless per-head RMSNorm times sigmoid(gate)."""
+    rows = q.shape[0]
+    lo = max(0, ctx - window) if window else 0
+    pages = bt[:rows, : (ctx + PAGE - 1) // PAGE].long()
+    k = kc[pages].float().reshape(rows, -1, HK, D)[:, lo:ctx]
+    v = vc[pages].float().reshape(rows, -1, HK, D)[:, lo:ctx]
+    qf = q.float().view(rows, HK, HQ // HK, D)
+    p = torch.softmax(torch.einsum("bgqd,bkgd->bgqk", qf, k) * scale, dim=-1)
+    o = torch.einsum("bgqk,bkgd->bgqd", p, v).reshape(rows, HQ, D)
+    o = o * torch.rsqrt(o.pow(2).mean(-1, keepdim=True) + eps)
+    return (o.reshape(rows, HQ * D) * torch.sigmoid(gate.float())).to(torch.bfloat16)
+
+
+def bench_paged_decode(args):
+    """One-token decode + the attention-output norm-gate, as aiter_backend.forward_decode and the model run it:
+    up to 8 rows muse_decode_splitkv with the split-K merge folded into the norm-gate; above 8 rows the FP8 query
+    quant, aiter unified attention and the Triton norm-gate. TLX takes the BF16 query and folds the norm-gate into
+    its reduce."""
+    from aiter.ops.triton.attention.unified_attention import unified_attention
+
+    from sglang.kernels.ops.attention.swa_verify_splitkv import muse_decode_splitkv
+    from sglang.kernels.ops.attention.tlx import (
+        paged_attention_decode,
+        paged_attention_decode_supported,
+    )
+    from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant
+    from sglang.srt.rocm_muse_spark.fused_norm_gate import FusedRMSNormGate
+    from sglang.srt.rocm_muse_spark.layers import MuseSpark1xRMSNorm
+
+    eps, scale, fp8 = 1e-6, D**-0.5, torch.float8_e4m3fn
+    norm_gate = FusedRMSNormGate(
+        MuseSpark1xRMSNorm(D, eps=eps, has_weight=False), use_o_gate=True, head_dim=D
+    )
+    one = torch.ones(1, device=DEVICE)
+    for window in (WINDOW, 0):
+        for rows in PAGED_DECODE_ROWS:
+            pages = (CONTEXT + PAGE - 1) // PAGE
+            blocks = rows * pages
+            kc = (torch.randn(blocks, PAGE, HK, D, device=DEVICE) * 0.5).to(fp8)
+            vc = (torch.randn(blocks, PAGE, HK, D, device=DEVICE) * 0.5).to(fp8)
+            # CUDA-graph decode passes the whole page-table buffer: more rows than the batch, MAX_CONTEXT wide.
+            bt = torch.zeros(
+                rows + 8, MAX_CONTEXT // PAGE, dtype=torch.int32, device=DEVICE
+            )
+            perm = torch.randperm(blocks, device=DEVICE).to(torch.int32)
+            bt[:rows, :pages] = perm.view(rows, pages)
+            seq = torch.full((rows,), CONTEXT, dtype=torch.int64, device=DEVICE)
+            cu = torch.arange(rows + 1, dtype=torch.int32, device=DEVICE)
+            q = torch.randn(rows, HQ * D, device=DEVICE, dtype=torch.bfloat16)
+            gate = torch.randn(rows, HQ * D, device=DEVICE, dtype=torch.bfloat16)
+            out = torch.empty_like(q)
+            assert paged_attention_decode_supported(q.view(rows, HQ, D), kc, vc, bt)
+
+            if rows <= 8:
+
+                def incumbent(q, gate):
+                    state = muse_decode_splitkv(
+                        q.view(rows, HQ, D), kc, vc, out.view(rows, HQ, D), cu, seq,
+                        bt, scale, window, one, one, defer_reduce=True,
+                    )  # fmt: skip
+                    return norm_gate.forward_verify_partials((*state, one), out, gate)
+
+            else:
+                window_size = (window - 1, 0) if window else (-1, -1)
+
+                def incumbent(q, gate):
+                    qf, _ = scaled_fp8_quant(q, one)
+                    unified_attention(
+                        q=qf.view(rows, HQ, D), k=kc, v=vc, out=out.view(rows, HQ, D),
+                        cu_seqlens_q=cu, max_seqlen_q=1, seqused_k=seq, max_seqlen_k=MAX_CONTEXT,
+                        softmax_scale=scale, causal=True, window_size=window_size, block_table=bt,
+                        softcap=0, q_descale=one, k_descale=one, v_descale=one,
+                    )  # fmt: skip
+                    return norm_gate.forward_triton(out, gate)
+
+            def tlx(q, gate):
+                o = torch.empty_like(q)
+                paged_attention_decode(
+                    q.view(rows, HQ, D), kc, vc, o.view(rows, HQ, D), seq, bt, scale,
+                    window, MAX_CONTEXT, one, one, out_gate=gate, out_norm_eps=eps,
+                )  # fmt: skip
+                return o
+
+            impls = {
+                "incumbent": _time_us(incumbent, (q, gate), clone=[0, 1]),
+                "tlx": _time_us(tlx, (q, gate), clone=[0, 1]),
+            }
+            ref = _decode_reference(q, kc, vc, bt, CONTEXT, window, gate, scale, eps)
+            check = {
+                "tlx_vs_fp32_ref": _mismatch(tlx(q, gate), ref)["max_abs"],
+                "incumbent_vs_fp32_ref": _mismatch(incumbent(q, gate), ref)["max_abs"],
+            }
+            visible = min(CONTEXT, window) if window else CONTEXT
+            moved = 2 * rows * visible * HK * D + _nbytes(q, gate, q)
+            name = "paged_decode[" + ("window" if window else "full") + "]"
+            _row(name, rows, impls, moved / args.hbm, check)
+
+
 OPS = {
     "rmsnorm_gate": bench_rmsnorm_gate,
     "qk_norm_rope": bench_qk_norm_rope,
+    "paged_decode": bench_paged_decode,
 }
 
 

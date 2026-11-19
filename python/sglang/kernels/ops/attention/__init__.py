@@ -717,6 +717,15 @@ register_kernel(
         capabilities=frozenset({CapabilityRequirement.HIP}),
     )
 )
+# Vendored tlx.ops.paged_attention_decode (gfx950); TLX primitives, needs uTLX (or fbtriton's Triton).
+register_kernel(
+    KernelSpec(
+        op="attention.tlx_paged_attention_decode",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.tlx:paged_attention_decode",
+        capabilities=frozenset({CapabilityRequirement.HIP}),
+    )
+)
 
 # Muse Spark on gfx950 (MI355X): FlyDSL kernels of the same backends.
 _MUSE_SPARK_GFX950_FLYDSL_KERNELS = [

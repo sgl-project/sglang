@@ -185,6 +185,20 @@ class FusedRMSNormGate(BaseFusedOp):
             )
         )
 
+    def tlx_decode_foldable(self, g) -> bool:
+        """Whether the TLX paged decode can apply this norm-gate in its reduce: weightless norm, flat BF16 gate,
+        head dim 64."""
+        return (
+            self._use_o_norm
+            and self._use_o_gate
+            and self._effective_weight is None
+            and self._head_dim == 64
+            and g is not None
+            and g.ndim == 2
+            and g.dtype == torch.bfloat16
+            and g.stride(1) == 1
+        )
+
     def merges_verify_partials(self) -> bool:
         """Whether ``forward_verify_partials`` serves this op (norm always on, head dim 64)."""
         return self._use_o_norm and self._head_dim == 64

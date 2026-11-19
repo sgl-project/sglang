@@ -1089,6 +1089,13 @@ class Envs:
     # gate (head dim 64) runs fbtriton's tlx.ops.rmsnorm_gate (plain Triton, vendored in sglang.kernels.tlx_ops)
     # instead of the fused Triton kernel.
     SGLANG_USE_TLX_RMSNORM_GATE = EnvBool(False)
+    # gfx950 ROCm Muse Spark: decode attention (one query token, FP8 KV cache, page 16) runs fbtriton's
+    # tlx.ops.paged_attention_decode (vendored in sglang.kernels.tlx_ops) with the BF16 query, and applies the
+    # attention output's RMSNorm x sigmoid gate in its split-K reduce. SGLANG_TLX_PAGED_DECODE_LAYERS selects the
+    # layers: window (sliding-window layers, the default), full or all. Uses TLX primitives: needs Triton with the uTLX
+    # plugin (SGLang's BUILD_UTLX=1 ROCm image) or fbtriton.
+    SGLANG_USE_TLX_PAGED_DECODE = EnvBool(False)
+    SGLANG_TLX_PAGED_DECODE_LAYERS = EnvStr("window")
     # Set by someone bisecting a numerical or performance regression to an
     # online-FP8 linear on gfx1250, to take the Triton tile out of the picture
     # without rebuilding. The tile is on by default because hipBLASLt ships no

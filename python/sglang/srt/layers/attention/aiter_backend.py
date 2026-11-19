@@ -265,6 +265,13 @@ _KV_INDEX_BLOCKS_MIN_CONTEXT = 32768
 
 # Muse Spark extend: FP8 Q on full layers from this many query tokens.
 _MUSE_EXTEND_FP8_MIN_Q = 256
+_USE_TLX_PAGED_DECODE = envs.SGLANG_USE_TLX_PAGED_DECODE.get()
+# Which decode layers take tlx.ops.paged_attention_decode: True = sliding-window layers, False = full-context layers.
+_TLX_PAGED_DECODE_WINDOW_LAYERS = {
+    "window": (True,),
+    "full": (False,),
+    "all": (True, False),
+}[envs.SGLANG_TLX_PAGED_DECODE_LAYERS.get()]
 # Full-layer GQA-folded verify (when the two-KV-head kernel is off): batch
 # floor, splits, BN, warps. 12 x 20K-120K contexts: 166 us vs 238 us for the 3D path.
 _MUSE_VERIFY_FULL_GQA = (8, 64, 64, 4)
@@ -5961,6 +5968,55 @@ class AiterAttnBackend(AttentionBackend):
                     )
                 ):
                     return o
+                if (
+                    _USE_TLX_PAGED_DECODE
+                    and self.use_muse_attention_paths
+                    and self.page_size == 16
+                    and self.kv_cache_dtype == fp8_dtype
+                    and sinks is None
+                    and not layer.logit_cap
+                    and q.dtype == torch.bfloat16
+                    and self.forward_metadata.max_q_len == 1
+                    and (window_size != (-1, -1)) in _TLX_PAGED_DECODE_WINDOW_LAYERS
+                ):
+                    from sglang.kernels.ops.attention.tlx import (
+                        NORM_GATE,
+                        paged_attention_decode,
+                        paged_attention_decode_supported,
+                    )
+
+                    q3 = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+                    kc = k_cache.view(
+                        -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
+                    )
+                    vc = v_cache.view(
+                        -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+                    )
+                    if paged_attention_decode_supported(q3, kc, vc, page_table):
+                        gate = NORM_GATE.gate
+                        if gate is not None and not (
+                            layer.v_head_dim == 64
+                            and gate.shape
+                            == (q3.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+                        ):
+                            gate = None
+                        paged_attention_decode(
+                            q3,
+                            kc,
+                            vc,
+                            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                            forward_batch.seq_lens,
+                            page_table,
+                            layer.scaling,
+                            window_size[0] + 1 if window_size[0] > 0 else 0,
+                            max_kv_len,
+                            k_descale,
+                            v_descale,
+                            out_gate=gate,
+                            out_norm_eps=NORM_GATE.eps,
+                        )
+                        NORM_GATE.done = gate is not None
+                        return o
                 if (
                     self.use_muse_attention_paths
                     and bs <= 8
