@@ -463,7 +463,7 @@ def wait_for_pd_worker_roles(
         if now >= next_report:
             logger.info(
                 f"PD worker roles pending after {now - start_time:.0f}s: "
-                f"{ {ip: last_seen.get(ip, 'no response') for ip in pending} }"
+                f"{ {ip: _sample_worker_server_info(ip, port) for ip in pending} }"
             )
             next_report = now + report_interval
 
@@ -472,6 +472,25 @@ def wait_for_pd_worker_roles(
     raise RuntimeError(
         f"PD workers did not report their disaggregation role within {timeout}s: "
         f"{ {ip: last_seen.get(ip, 'no response') for ip in pending} }"
+    )
+
+
+def _sample_worker_server_info(ip, port, timeout=5):
+    """One-line `/server_info` snapshot of a worker that is still pending.
+
+    The readiness wait may short-circuit on a 503 `/health`, which says nothing
+    about whether the scheduler behind the tokenizer is alive. Probing
+    `/server_info` directly (it carries one internal state per DP rank) tells
+    a wedged worker (request times out) from a busy one (it answers).
+    """
+    try:
+        info = requests.get(f"http://{ip}:{port}/server_info", timeout=timeout).json()
+    except Exception as e:
+        return f"server_info failed: {e}"
+    return (
+        f"disaggregation_mode={info.get('disaggregation_mode')!r} "
+        f"bootstrap_port={info.get('disaggregation_bootstrap_port')!r} "
+        f"dp_ranks={len(info.get('internal_states') or [])}"
     )
 
 
