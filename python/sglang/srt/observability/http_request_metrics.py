@@ -74,11 +74,32 @@ def add_http_request_metrics_middleware(app):
 
     patch_app_http_middleware(app)
 
-    @app.middleware("http")
-    async def track_http_status_code(request, call_next):
+    app.add_middleware(_HttpRequestMetricsMiddleware)
+
+
+class _HttpRequestMetricsMiddleware:
+    """Pure ASGI middleware tracking request/response counts and active gauges.
+
+    Unlike a BaseHTTPMiddleware decorator, this observes the response status
+    from the ASGI ``http.response.start`` message, so responses that fail
+    mid-stream keep their submitted status, and an ordinary exception before
+    any response started is counted with the 500 produced by the outer
+    ServerErrorMiddleware. ``receive`` is passed through untouched so that
+    request.is_disconnected() keeps working.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
         metrics = _http_request_metrics
-        if metrics is None:
-            return await call_next(request)
+        if scope["type"] != "http" or metrics is None:
+            await self.app(scope, receive, send)
+            return
+
+        from starlette.requests import Request
+
+        request = Request(scope, receive)
 
         # With recording all requests, we have the risk of high cardinality if requests have arbitrary unhandled paths.
         # But given that SGLang engines with metrics enabled are usually behind routers this looks safe.
@@ -91,17 +112,29 @@ def add_http_request_metrics_middleware(app):
         if routing_key:
             metrics.routing_keys_active.inc(routing_key)
 
+        status_code = None
+
+        async def send_and_capture(message):
+            nonlocal status_code
+            if message["type"] == "http.response.start":
+                status_code = message["status"]
+            await send(message)
+
         try:
-            response = await call_next(request)
-
-            metrics.responses_total.labels(
-                endpoint=path,
-                method=method,
-                status_code=str(response.status_code),
-            ).inc()
-
-            return response
+            await self.app(scope, receive, send_and_capture)
+        except Exception:
+            if status_code is None:
+                # The default outer ServerErrorMiddleware answers 500 for an
+                # unhandled exception before any response was submitted.
+                status_code = 500
+            raise
         finally:
+            if status_code is not None:
+                metrics.responses_total.labels(
+                    endpoint=path,
+                    method=method,
+                    status_code=str(status_code),
+                ).inc()
             metrics.requests_active.labels(endpoint=path, method=method).dec()
             if routing_key:
                 metrics.routing_keys_active.dec(routing_key)
