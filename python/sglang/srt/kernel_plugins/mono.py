@@ -69,14 +69,26 @@ _VENDORS = (
 
 
 def _select(cfg: Any) -> Optional[tuple[str, str, Any]]:
-    """The (backend, flag, vendor module) a configuration selects, or None."""
+    """The (backend, flag, vendor module) a configuration selects, or None.
+
+    Two affirmative answers mean two backends claim the server; that is a
+    configuration error, not a race for vendor order to settle."""
+    answers = []
     for name in _VENDORS:
         vendor = importlib.import_module(name)
         selected = vendor.selected_monokernel(cfg)
         if selected is not None:
             backend, flag = selected
-            return backend, flag, vendor
-    return None
+            answers.append((backend, flag, vendor))
+    if len(answers) > 1:
+        raise ValueError(
+            "monokernel flags conflict in this setup:\n  - "
+            + "\n  - ".join(
+                f"{flag} selects backend {backend!r}" for backend, flag, _ in answers
+            )
+            + "\n  - enable one monokernel backend at a time"
+        )
+    return answers[0] if answers else None
 
 
 # Leave time for peers to abort before the process watchdog fires.
