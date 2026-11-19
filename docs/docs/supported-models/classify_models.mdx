@@ -13,7 +13,7 @@ If your checkpoint's `config.json` declares `"problem_type": "multi_label_classi
 
 The `label` field remains the top-scoring class. To select multiple positive classes, apply your chosen threshold to the full `probs` vector in `id2label` order. No request parameter is needed.
 
-For other or missing `problem_type` values, the endpoint continues to apply softmax.
+For `single_label_classification` or an unset `problem_type`, the endpoint applies softmax. If a supported checkpoint explicitly declares `"problem_type": "regression"`, `probs` contains the raw regression scores. These scores may fall outside the range from 0 to 1.
 
 ## API Endpoint
 

@@ -493,6 +493,17 @@ def get_act_fn(
     return act_fn
 
 
+def get_classifier_activation_function(config: PretrainedConfig) -> nn.Module:
+    """Resolve the activation for classifier outputs from the checkpoint config."""
+    problem_type = getattr(config, "problem_type", None)
+    if problem_type == "regression":
+        return nn.Identity()
+    if problem_type == "multi_label_classification":
+        return nn.Sigmoid()
+    # Single-label classification and the legacy default normalize across labels.
+    return nn.Softmax(dim=-1)
+
+
 def get_cross_encoder_activation_function(config: PretrainedConfig):
     if (
         hasattr(config, "sbert_ce_default_activation_function")

@@ -44,14 +44,28 @@ class TestServingClassify(CustomTestCase):
         self.assertEqual(item.label, "category_0")
         self.assertEqual(item.num_classes, 3)
 
-    def test_other_problem_types_keep_softmax(self):
-        for problem_type in (None, "single_label_classification", "regression"):
+    def test_single_label_and_unset_problem_types_use_softmax(self):
+        for problem_type in (None, "single_label_classification"):
             with self.subTest(problem_type=problem_type):
                 serving = self._serving(problem_type)
                 item = serving._build_classify_response(
                     [{"embedding": [2.0, 2.0]}]
                 ).data[0]
                 self.assertEqual(item.probs, [0.5, 0.5])
+
+    def test_regression_returns_raw_scores(self):
+        for embedding, scores in (
+            ([-2.0, 3.0], [-2.0, 3.0]),
+            ([-2.0], [-2.0]),
+            (0.0, [0.0]),
+        ):
+            with self.subTest(embedding=embedding):
+                serving = self._serving("regression", num_labels=len(scores))
+                item = serving._build_classify_response(
+                    [{"embedding": embedding}]
+                ).data[0]
+                self.assertEqual(item.probs, scores)
+                self.assertEqual(item.num_classes, len(scores))
 
     def test_missing_problem_type_keeps_softmax(self):
         serving = self._serving(

@@ -6,7 +6,6 @@ import uuid
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 import torch
-import torch.nn.functional as F
 from fastapi import Request
 from fastapi.responses import ORJSONResponse
 
@@ -16,9 +15,12 @@ from sglang.srt.entrypoints.openai.protocol import (
     ErrorResponse,
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
+from sglang.srt.layers.activation import get_classifier_activation_function
 from sglang.srt.managers.io_struct import EmbeddingReqInput
 
 if TYPE_CHECKING:
+    from transformers import PretrainedConfig
+
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
     from sglang.srt.parser.template_manager import TemplateManager
 
@@ -35,11 +37,9 @@ class OpenAIServingClassify(OpenAIServingBase):
     ):
         super().__init__(tokenizer_manager)
         self.template_manager = template_manager
-        self.id2label = self._get_id2label_mapping()
-        hf_config = self.tokenizer_manager.model_config.hf_config
-        self.is_multi_label = (
-            getattr(hf_config, "problem_type", None) == "multi_label_classification"
-        )
+        hf_config = tokenizer_manager.model_config.hf_config
+        self.id2label = self._get_id2label_mapping(hf_config)
+        self.activation = get_classifier_activation_function(hf_config)
         self.model_name = (
             self.tokenizer_manager.served_model_name
             if self.tokenizer_manager.served_model_name
@@ -112,10 +112,10 @@ class OpenAIServingClassify(OpenAIServingBase):
                         return f"Token ID at index {i} must be non-negative"
         return None
 
-    def _get_id2label_mapping(self) -> Optional[Dict[int, str]]:
+    @staticmethod
+    def _get_id2label_mapping(hf_config: PretrainedConfig) -> Optional[Dict[int, str]]:
         """Get id2label mapping from model config."""
         try:
-            hf_config = self.tokenizer_manager.model_config.hf_config
             # Check for id2label in hf_config
             if hf_config.id2label:
                 return hf_config.id2label
@@ -161,6 +161,9 @@ class OpenAIServingClassify(OpenAIServingBase):
 
         for i, item in enumerate(ret):
             embedding = item.get("embedding", [])
+            # Single-score model heads may return scalars, including 0.0.
+            if isinstance(embedding, (int, float)):
+                embedding = [embedding]
             meta_info = item.get("meta_info", {})
 
             prompt_tokens += meta_info.get("prompt_tokens", 0)
@@ -169,10 +172,7 @@ class OpenAIServingClassify(OpenAIServingBase):
             if embedding:
                 try:
                     embedding_tensor = torch.tensor(embedding, dtype=torch.float32)
-                    if self.is_multi_label:
-                        probs = torch.sigmoid(embedding_tensor).tolist()
-                    else:
-                        probs = F.softmax(embedding_tensor, dim=0).tolist()
+                    probs = self.activation(embedding_tensor).tolist()
 
                     predicted_class = torch.argmax(embedding_tensor).item()
 
