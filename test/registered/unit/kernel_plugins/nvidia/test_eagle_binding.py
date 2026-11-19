@@ -867,6 +867,23 @@ class TestSpeculativeRuntimeContract(CustomTestCase):
         self.assertIs(strategy(io), output)
         self.assertEqual(calls, [(io, local_keys)])
 
+    def test_strategy_passes_a_gathered_sampler_by_keyword(self):
+        """Runners shaped run(io, local_keys) keep working; the gathered sampler
+        reaches the runner only when a provider sets one."""
+        calls = []
+
+        def run(io, local_keys, *, gathered_tokens=None):
+            calls.append((io, local_keys, gathered_tokens))
+            return "output"
+
+        local_keys = lambda view: None
+        gathered = lambda view: None
+        strategy = spec.PostVerifyStrategy(
+            run=run, local_keys=local_keys, gathered_tokens=gathered
+        )
+        self.assertEqual(strategy("io"), "output")
+        self.assertEqual(calls, [("io", local_keys, gathered)])
+
 
 def _defaults() -> spec.SpeculativeRuntimeHooks:
     return speculative_runtime.default_speculative_runtime_hooks()
@@ -927,6 +944,51 @@ class TestSpeculativeRuntimeHooks(CustomTestCase):
             selected = runtime.bind_speculative_runtime_hooks(model, defaults)
         self.assertIs(selected.post_verify.run, defaults.post_verify.run)
         self.assertIs(selected.post_verify.local_keys, custom_keys)
+        # a factory that predates the optional members adds none of them
+        self.assertIsNone(selected.post_verify.gathered_tokens)
+        self.assertIsNone(selected.verify_shard_head)
+        self.assertIsNone(selected.draft_attention)
+
+    def test_factory_may_add_a_gathered_sampler_a_verify_shard_head_and_a_draft_attention(
+        self,
+    ):
+        defaults = _defaults()
+        gathered = lambda view: None
+        head = lambda view: None
+        attention = lambda view: None
+
+        def factory_with(gathered_tokens, verify_shard_head, draft_attention=None):
+            return lambda stock: spec.SpeculativeRuntimeHooks(
+                post_verify=spec.PostVerifyStrategy(
+                    run=stock.post_verify.run,
+                    local_keys=stock.post_verify.local_keys,
+                    gathered_tokens=gathered_tokens,
+                ),
+                verify_shard_head=verify_shard_head,
+                draft_attention=draft_attention,
+            )
+
+        def bind(factory):
+            with (
+                envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True),
+                patch.object(runtime, "_gather_tp", return_value=[True]),
+            ):
+                return runtime.bind_speculative_runtime_hooks(
+                    _model(speculative_runtime_hooks=factory), defaults
+                )
+
+        selected = bind(factory_with(gathered, head, attention))
+        self.assertIs(selected.post_verify.gathered_tokens, gathered)
+        self.assertIs(selected.verify_shard_head, head)
+        self.assertIs(selected.draft_attention, attention)
+        for name, factory in (
+            ("post_verify.gathered_tokens", factory_with(1, None)),
+            ("verify_shard_head", factory_with(None, "head")),
+            ("draft_attention", factory_with(None, None, "attention")),
+        ):
+            with self.subTest(member=name):
+                with self.assertRaisesRegex(TypeError, name):
+                    bind(factory)
 
     def test_default_post_verify_uses_the_stock_signature(self):
         io = SimpleNamespace(
@@ -980,6 +1042,15 @@ class TestSpeculativeRuntimeHooks(CustomTestCase):
         self.assertIs(batch.forward_mode, ForwardMode.TARGET_VERIFY)
         self.assertIs(batch.sampling_info, io.sampling_info)
         self.assertIs(batch.req_pool_indices, io.req_pool_indices)
+
+        gathered = lambda view: None
+        with patch(
+            "sglang.srt.speculative.eagle_utils.eagle_sample", return_value=expected
+        ) as sample:
+            speculative_runtime.default_post_verify(
+                io, lambda view: None, gathered_tokens=gathered
+            )
+        self.assertIs(sample.call_args.kwargs["gathered_tokens"], gathered)
 
 
 class TestSpecRelayBypass(CustomTestCase):

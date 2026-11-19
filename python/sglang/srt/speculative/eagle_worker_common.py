@@ -91,6 +91,8 @@ class _FallbackPostVerifyStrategy:
 
 class _FallbackRuntimeHooks:
     post_verify = _FallbackPostVerifyStrategy()
+    verify_shard_head = None
+    draft_attention = None
 
 
 def stock_speculative_runtime_hooks() -> Any:
@@ -160,7 +162,9 @@ def bind_eagle_runtime_hooks(
             local_keys = getattr(hooks.post_verify, "local_keys", None)
             # The stock policy declines every temperature row.
             enable(
-                temperature_keys=local_keys is not None and local_keys is not stock_keys
+                temperature_keys=local_keys is not None
+                and local_keys is not stock_keys,
+                shard_head=hooks.verify_shard_head,
             )
     return hooks
 

@@ -2,18 +2,19 @@
 """Provider-neutral defaults for speculative runtime hooks.
 
 The runtime owns verification and all cross-rank exchange. Providers may replace
-only the pure local-key policy. Missing providers preserve the exact default by
-identity.
+only the pure local sampling policies: the local-key policy and the gathered-logits
+sampler. Missing providers preserve the exact default by identity.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import msgspec
 import torch
 
 from sglang.kernels.plugin_kernels.nvidia.spec import (
+    GatheredTokensFn,
     LocalKeysFn,
     PostVerifyIO,
     PostVerifyOutput,
@@ -66,6 +67,8 @@ def default_local_keys(view: ShardedLogitsView) -> torch.Tensor | None:
 def default_post_verify(
     io: PostVerifyIO,
     local_keys: LocalKeysFn,
+    *,
+    gathered_tokens: Optional[GatheredTokensFn] = None,
 ) -> PostVerifyOutput:
     """Run the existing verifier and preserve its outputs and mutation order."""
     from sglang.srt.model_executor.forward_mode import ForwardMode
@@ -89,6 +92,8 @@ def default_post_verify(
     )
     if getattr(eagle_utils, "LOCAL_KEYS_SUPPORTED", False):
         kwargs["local_keys"] = local_keys
+    if gathered_tokens is not None:
+        kwargs["gathered_tokens"] = gathered_tokens
     token_ids, accepted_lengths, accepted_indices = eagle_utils.eagle_sample(
         io.verify_tree,
         batch,
