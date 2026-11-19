@@ -127,6 +127,99 @@ def test_qwen_image_21_dit_does_not_take_qwen_image_kohya_path():
     )
 
 
+def test_qwen_image_21_kohya_lora_is_rejected_instead_of_loading_nothing():
+    # No Kohya name maps to a Qwen-Image 2.1 layer, so the generic fallback
+    # would report success with zero layers applied.
+    sd = _kohya(["transformer_blocks_0_img_mlp_out", "transformer_blocks_0_attn_to_q"])
+    for dit_class_name in (
+        "QwenImage21Transformer2DModel",
+        "FSDPQwenImage21Transformer2DModel",
+    ):
+        with pytest.raises(ValueError, match="Qwen-Image 2.1"):
+            normalize_lora_state_dict(sd, dit_class_name=dit_class_name)
+
+
+_ALPHA_PATTERN_MODULES = {
+    LoRAFormat.KOHYA_QWEN_IMAGE: (
+        "transformer_blocks_0_attn_to_{}",
+        "transformer_blocks.0.attn.to_{}",
+        "QwenImageTransformer2DModel",
+    ),
+    LoRAFormat.KOHYA_Z_IMAGE: (
+        "layers_0_attention_to_{}",
+        "layers.0.attention.to_{}",
+        "ZImageTransformer2DModel",
+    ),
+}
+
+
+@pytest.mark.parametrize("fmt", list(_ALPHA_PATTERN_MODULES))
+def test_alpha_pattern_is_checked_against_the_original_alpha(fmt):
+    kohya, native, dit_class_name = _ALPHA_PATTERN_MODULES[fmt]
+    sd = _kohya([kohya.format("q"), kohya.format("v")])
+    # to_q carries no alpha of its own, so its pattern value is used.
+    del sd[f"lora_unet_{kohya.format('q')}.alpha"]
+    out = normalize_lora_state_dict(
+        sd,
+        adapter_config={"lora_alpha": 1, "alpha_pattern": {"to_v": 8, "to_q": 2}},
+        dit_class_name=dit_class_name,
+    )
+    for proj, alpha in (("v", ALPHA), ("q", 2)):
+        k, n = kohya.format(proj), native.format(proj)
+        got = out[f"{n}.lora_B.weight"] @ out[f"{n}.lora_A.weight"]
+        ref = (
+            sd[f"lora_unet_{k}.lora_up.weight"] @ sd[f"lora_unet_{k}.lora_down.weight"]
+        )
+        torch.testing.assert_close(got, (alpha / RANK) * ref)
+        assert out[f"{n}.alpha"].item() == RANK
+
+    with pytest.raises(ValueError, match="conflict with its alpha 8"):
+        normalize_lora_state_dict(
+            sd,
+            adapter_config={"alpha_pattern": {"to_v": 2}},
+            dit_class_name=dit_class_name,
+        )
+
+
+def test_alpha_pattern_on_fused_z_image_qkv_must_agree_across_q_k_v():
+    # Newer diffusers split a fused `qkv` into to_q/k/v that share one alpha.
+    torch.manual_seed(0)
+    down, up = torch.randn(RANK, DIM), torch.randn(3 * DIM, RANK)
+    sd = {
+        "lora_unet_layers_0_attention_qkv.lora.down.weight": down,
+        "lora_unet_layers_0_attention_qkv.lora.up.weight": up,
+    }
+
+    def load(adapter_config, extra=None):
+        return normalize_lora_state_dict(
+            {**sd, **(extra or {})},
+            adapter_config=adapter_config,
+            dit_class_name="ZImageTransformer2DModel",
+        )
+
+    def assert_scale(out, alpha):
+        for proj, chunk in zip("qkv", up.chunk(3)):
+            n = f"layers.0.attention.to_{proj}"
+            got = out[f"{n}.lora_B.weight"] @ out[f"{n}.lora_A.weight"]
+            torch.testing.assert_close(got, (alpha / RANK) * (chunk @ down))
+
+    try:
+        out = load({"alpha_pattern": {"to_q": 2, "to_k": 2, "to_v": 2}})
+    except ValueError as error:
+        # Releases without the split (e.g. the pinned 0.37) cannot convert it.
+        assert "Could not convert" in str(error)
+        return
+    assert_scale(out, 2)
+    # A pattern on some of q/k/v is fine when it equals the alpha the rest use.
+    own_alpha = {"lora_unet_layers_0_attention_qkv.alpha": torch.tensor(8.0)}
+    assert_scale(load({"alpha_pattern": {"to_q": 8}}, own_alpha), 8)
+    assert_scale(load({"lora_alpha": 8, "alpha_pattern": {"to_q": 8}}), 8)
+    with pytest.raises(ValueError, match="conflict with each other"):
+        load({"alpha_pattern": {"to_k": 8}})
+    with pytest.raises(ValueError, match="conflict with its alpha 8"):
+        load({"alpha_pattern": {"to_q": 8, "to_k": 2}}, own_alpha)
+
+
 @pytest.mark.parametrize("fmt", [LoRAFormat.KOHYA_QWEN_IMAGE, LoRAFormat.KOHYA_Z_IMAGE])
 def test_alpha_fallback_for_modules_without_their_own_alpha(fmt):
     # Modules without `.alpha` take the caller's override, else the file's
