@@ -591,9 +591,9 @@ def post(
         return torch.empty((0, cfg.mult, x.shape[-1]), dtype=x.dtype, device=x.device)
 
     if _is_npu:
-        from sgl_kernel_npu.operators.hyper_conn import mhc_post_dpskv4
+        from sgl_kernel_npu.operators.hyper_conn import mhc_post
 
-        return mhc_post_dpskv4(x, residual, post_mix, comb)
+        return mhc_post(residual, comb, x, post_mix)
 
     if _is_xpu:
         from sglang.srt.models.deepseek_v4 import get_mhc_ops

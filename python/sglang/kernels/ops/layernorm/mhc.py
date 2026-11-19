@@ -2137,12 +2137,13 @@ def npu_hc_pre(
         )
         return y, post, comb, False
 
-    from sgl_kernel_npu.operators.hyper_conn import mhc_pre_dpskv4
+    from sgl_kernel_npu.operators.hyper_conn import mhc_pre_sinkhorn
 
-    y, post, comb = mhc_pre_dpskv4(
+    y, post, comb = mhc_pre_sinkhorn(
         x, hc_fn, hc_scale, hc_base, hc_mult, hc_sinkhorn_iters, hc_eps, rms_norm_eps
     )
-    return y, post, comb, False
+    # The shared kernel API returns flattened [T, N*N] residual weights.
+    return y.to(dtype), post, comb.reshape(-1, hc_mult, hc_mult), False
 
 
 @triton.jit
