@@ -232,10 +232,10 @@ This draft path needs FlashInfer containing
 [#5083](https://github.com/flashinfer-ai/flashinfer/pull/5083).
 The required interfaces are available in
 [FlashInfer 0.7.4](https://github.com/flashinfer-ai/flashinfer/releases/tag/v0.7.4).
-SGLang's pinned FlashInfer **0.7.3 does not include `prepare_qkv`**. The option
-raises an actionable error with that release; no dependency pin is changed
-here. Validating and aligning the dependency and JIT-cache pins is required
-before this becomes ready to merge. Prepared exchange uses **NCCL**; the public FlashInfer API rejects
+This branch inherits main's FlashInfer **0.7.4** and matching JIT-cache pins.
+Older FlashInfer **0.7.3 does not include `prepare_qkv`** and raises an
+actionable error; this PR adds no dependency-pin override. Prepared exchange
+uses **NCCL**; the public FlashInfer API rejects
 prepared PCIe/RDMA communicators, so ordinary PCIe transport support does not
 make prepared low-precision RDMA available.
 

@@ -24,8 +24,8 @@ class _PreparedSageTransport:
         if not hasattr(UlyssesCommunicator, "prepare_qkv"):
             raise ImportError(
                 "Prepared Sage Ulysses requires FlashInfer with the prepared Sage2 "
-                "QKV API (flashinfer-ai/flashinfer#4924); the pinned 0.7.3 "
-                "release does not provide it"
+                "QKV API (flashinfer-ai/flashinfer#4924); install a compatible "
+                "FlashInfer 0.7.4 or newer build"
             )
         self._local_used = max(
             0, min(query.shape[0], used - dist.get_rank(group) * query.shape[0])
