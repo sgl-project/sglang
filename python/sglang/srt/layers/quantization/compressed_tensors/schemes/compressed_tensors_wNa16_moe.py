@@ -606,6 +606,13 @@ class XPUCompressedTensorsWNA16MoE(CompressedTensorsWNA16TritonMoE):
     ):
         self.moe_runner_config = moe_runner_config
 
+    def get_triton_quant_info(self, layer: torch.nn.Module):
+        raise NotImplementedError(
+            "XPUCompressedTensorsWNA16MoE stores signed INT4 weights for "
+            "sgl-kernel-xpu, which the Triton MoE kernels cannot read. Use "
+            "--moe-runner-backend triton for Triton-based MoE paths such as MoE LoRA."
+        )
+
     def apply_weights(
         self,
         layer: torch.nn.Module,
