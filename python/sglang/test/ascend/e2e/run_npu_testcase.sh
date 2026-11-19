@@ -41,6 +41,23 @@ MOONCAKE_MASTER_BIN="$(python -c 'import os, mooncake; print(os.path.join(os.pat
 if [ -n "${MOONCAKE_MASTER_BIN}" ] && [ -f "${MOONCAKE_MASTER_BIN}" ]; then
     export PATH="$(dirname "${MOONCAKE_MASTER_BIN}"):${PATH}"
 fi
+# mooncake_master links against rdma-core (libibverbs) even when it uses the
+# ascend transport; install it when the image omits it, otherwise the process
+# dies with "error while loading shared libraries: libibverbs.so.1".
+if ! ldconfig -p 2>/dev/null | grep -q "libibverbs\.so"; then
+    echo "libibverbs is missing, installing rdma-core..."
+    export DEBIAN_FRONTEND=noninteractive
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get update -qq && apt-get install -y -qq libibverbs1
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y -q libibverbs
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y -q libibverbs
+    fi
+    if ! ldconfig -p 2>/dev/null | grep -q "libibverbs\.so"; then
+        echo "WARNING: libibverbs is still missing; the Mooncake master will fail to start" >&2
+    fi
+fi
 
 # Apply the container patches prepared by the workflow: every entry in
 # SGLANG_NPU_CONTAINER_PATCHES is a directory (relative to the repo root) whose
