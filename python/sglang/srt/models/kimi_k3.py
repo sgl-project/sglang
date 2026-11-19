@@ -151,9 +151,9 @@ from sglang.srt.multimodal.mm_utils import materialize_multimodal_features
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import (
     get_exec,
+    get_model,
     get_parallel,
     get_platform,
-    get_server_args,
     get_spec,
     linear_attn_parallel_group,
     linear_attn_tp_rank,
@@ -3402,7 +3402,7 @@ class KimiK3LinearModel(nn.Module):
                     if shard_shared
                     else ()
                 ),
-                dummy_load=get_server_args().load_format == "dummy",
+                dummy_load=get_model().load_format == "dummy",
             )
         self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,

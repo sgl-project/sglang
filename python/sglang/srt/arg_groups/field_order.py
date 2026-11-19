@@ -572,5 +572,6 @@ POSITIONAL_FIELD_ORDER = (
     "gc_freeze_on_idle_secs",
     "enable_dsa_fp4_indexer",
     "kda_dwdp_size",
+    "weight_cache_transport",
 )
 # fmt: on
