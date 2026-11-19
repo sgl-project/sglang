@@ -244,7 +244,6 @@ class Gemma4Detector(BaseFormatDetector):
         self.parsed_pos: int = 0
         self.is_inside_tool_call: bool = False
         self.current_func_name: Optional[str] = None
-        self._tool_indices: Optional[dict] = None
 
     @staticmethod
     def _extract_tool_calls(text: str) -> list:
@@ -316,8 +315,6 @@ class Gemma4Detector(BaseFormatDetector):
 
         calls = []
         normal_text_chunks = []
-        if self._tool_indices is None:
-            self._tool_indices = self._get_tool_indices(tools)
 
         try:
             while True:
@@ -377,9 +374,7 @@ class Gemma4Detector(BaseFormatDetector):
 
                                 calls.append(
                                     ToolCallItem(
-                                        tool_index=self._tool_indices.get(
-                                            func_name, -1
-                                        ),
+                                        tool_index=self.current_tool_id,
                                         name=func_name,
                                         parameters="",
                                     )
@@ -408,9 +403,7 @@ class Gemma4Detector(BaseFormatDetector):
 
                             calls.append(
                                 ToolCallItem(
-                                    tool_index=self._tool_indices.get(
-                                        self.current_func_name, -1
-                                    ),
+                                    tool_index=self.current_tool_id,
                                     parameters=json.dumps(
                                         arguments, ensure_ascii=False
                                     ),
