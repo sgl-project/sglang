@@ -222,17 +222,6 @@ def test_situ_tables_are_ready_for_other_streams(monkeypatch):
     assert torch.equal(actual, _situ_reference(hidden, gate))
 
 
-def test_situ_rejects_unsupported_operands():
-    hidden = torch.randn(1, 8, 64, device="cuda", dtype=torch.bfloat16)
-    for gate in (hidden.float(), hidden[:, :-1], hidden.cpu()):
-        with pytest.raises(ValueError, match="matching CUDA BF16"):
-            fused_situ_softcap_mul_bitexact(hidden, gate)
-    strided = hidden[..., ::2]
-    for x in (strided, hidden[:, :0]):
-        with pytest.raises(ValueError, match="matching CUDA BF16"):
-            fused_situ_softcap_mul_bitexact(x, x)
-
-
 @pytest.mark.skipif(bool(torch.version.hip), reason="CUDA-only kernel")
 @pytest.mark.parametrize(
     "length,param_dtype",

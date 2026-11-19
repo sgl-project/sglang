@@ -106,7 +106,7 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 - `--attention-backend {BACKEND}`: attention backend for native SGLang and diffusers pipelines
 - `--enable-attention-backend-autotune {true|false}`: for SGLang-native pipelines, benchmark compatible attention backends on each layer's first sufficiently large input and keep a backend only when it is both numerically compatible and measurably faster. Disabled by default and currently validated on SM90 and SM12x. Explicit `--attention-backend`, component overrides, and model-required backends are never replaced.
 - `--component-attention-backends {MAP}`: per-component attention backend overrides, for example `text_encoder=torch_sdpa,transformer=fa`. A key may carry a `.self` or `.cross` role suffix to override one kind of attention only, for example `transformer.cross=fa`
-- `--attention-backend-config {CONFIG}`: attention backend configuration
+- `--attention-backend-config {CONFIG}`: attention backend configuration as a JSON/YAML file path, JSON string, or comma-separated `key=value` pairs. See [Attention Backends](/docs/sglang-diffusion/attention_backends#configuration) for backend-specific options.
 - `--srt-encoder-url {HTTPADDRESS}`: address of SGLang srt server with AR model for GLM-Image like models. See [Models with AR Stage](/docs/sglang-diffusion/models_with_ar).
 - `--srt-encoder-timeout {SECONDS}`: Timeout in seconds for HTTP requests to the SGLang encoder server
 - `--srt-encoder-connection-timeout {SECONDS}`: TCP connection timeout in seconds for SGLang encoder server

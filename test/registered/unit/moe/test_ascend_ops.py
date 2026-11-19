@@ -359,5 +359,99 @@ class TestAscendOpsDispatcherContracts(CustomTestCase):
                 combine.assert_called_once_with(hidden_states, state)
 
 
+class TestAscendOpsPrefillGraph(CustomTestCase):
+    def _topk_output(self, num_tokens):
+        return (
+            torch.ones((num_tokens, 2)),
+            torch.zeros((num_tokens, 2), dtype=torch.int32),
+            None,
+        )
+
+    # Guards the capture path: prefill capture forces is_extend_in_batch False,
+    # so the prefill-graph scope is what keeps dispatch on allgather instead of
+    # falling into the decode MC2 path.
+    def test_prefill_capture_selects_allgather(self):
+        dispatcher = AscendOpsDispatcher.__new__(AscendOpsDispatcher)
+        dispatcher.tp_group = None
+        dispatcher.moe_ascend_ops_config = AscendOpsConfig(prefill="allgather")
+        hidden_states = torch.zeros((8, 4))
+        topk_weights, topk_ids, _ = self._topk_output(8)
+
+        with (
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.ascend_ops.is_in_prefill_graph_scope",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.ascend_ops.get_is_extend_in_batch",
+                return_value=False,
+            ),
+            patch.object(
+                dispatcher, "_dispatch_allgather", return_value="allgather"
+            ) as allgather,
+            patch.object(dispatcher, "_dispatch_low_latency") as low_latency,
+        ):
+            result = dispatcher.dispatch(hidden_states, (topk_weights, topk_ids, None))
+
+        self.assertEqual(result, "allgather")
+        allgather.assert_called_once_with(hidden_states, topk_weights, topk_ids, None)
+        low_latency.assert_not_called()
+
+    # Guards the eager path: an extend batch outside a prefill graph still
+    # selects allgather rather than the decode MC2 path.
+    def test_eager_extend_selects_allgather(self):
+        dispatcher = AscendOpsDispatcher.__new__(AscendOpsDispatcher)
+        dispatcher.tp_group = None
+        dispatcher.moe_ascend_ops_config = AscendOpsConfig(prefill="allgather")
+        hidden_states = torch.zeros((8, 4))
+        topk_weights, topk_ids, _ = self._topk_output(8)
+
+        with (
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.ascend_ops.is_in_prefill_graph_scope",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.ascend_ops.get_is_extend_in_batch",
+                return_value=True,
+            ),
+            patch.object(
+                dispatcher, "_dispatch_allgather", return_value="allgather"
+            ) as allgather,
+        ):
+            result = dispatcher.dispatch(hidden_states, (topk_weights, topk_ids, None))
+
+        self.assertEqual(result, "allgather")
+        allgather.assert_called_once_with(hidden_states, topk_weights, topk_ids, None)
+
+    # Guards the decode graph: capture mode is also set while a decode graph is
+    # captured, so the prefill scope is what keeps that on the MC2 path.
+    def test_decode_capture_keeps_low_latency(self):
+        dispatcher = AscendOpsDispatcher.__new__(AscendOpsDispatcher)
+        dispatcher.tp_group = None
+        hidden_states = torch.zeros((8, 4))
+        topk_weights, topk_ids, _ = self._topk_output(8)
+
+        with (
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.ascend_ops.is_in_prefill_graph_scope",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.ascend_ops.get_is_extend_in_batch",
+                return_value=False,
+            ),
+            patch.object(dispatcher, "_dispatch_allgather") as allgather,
+            patch.object(
+                dispatcher, "_dispatch_low_latency", return_value="mc2"
+            ) as low_latency,
+        ):
+            result = dispatcher.dispatch(hidden_states, (topk_weights, topk_ids, None))
+
+        self.assertEqual(result, "mc2")
+        low_latency.assert_called_once_with(hidden_states, topk_weights, topk_ids)
+        allgather.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
