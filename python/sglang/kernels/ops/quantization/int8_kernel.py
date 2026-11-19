@@ -125,8 +125,9 @@ def _per_token_group_quant_int8(
 
     This function converts the tensor values into int8 values.
     """
-    # Map the program id to the row of X and Y it should compute.
-    g_id = tl.program_id(0)
+    # Map the program id to the row of X and Y it should compute. Row offsets
+    # pass int32 once numel > 2^31.
+    g_id = tl.program_id(0).to(tl.int64)
     y_ptr += g_id * y_stride
     y_q_ptr += g_id * y_stride
     y_s_ptr += g_id

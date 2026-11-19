@@ -7,7 +7,7 @@ import torch
 import triton
 
 from sglang.kernels.ops.gemm.fp8_kernel import w8a8_block_fp8_matmul_triton
-from sglang.kernels.ops.gemm.int8_kernel import w8a8_block_int8_matmul
+from sglang.srt.layers.quantization.int8_utils import apply_w8a8_block_int8_linear
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -58,15 +58,22 @@ class TestBlockMatmulLargeM(CustomTestCase):
         )
         self.assertTrue((out[-1] == 128.0).all().item())
 
-    def test_int8_rows_of_a_past_2_pow_31(self):
+    def test_int8_linear_rows_of_a_past_2_pow_31(self):
+        # Serving path: per-token-group activation quantization, then the matmul
         n, k = 16, WIDE
-        a = torch.ones(M, k, dtype=torch.int8, device="cuda")
-        b = torch.ones(n, k, dtype=torch.int8, device="cuda")
-        a_s, b_s = _unit_scales(M, n, k)
-        out = w8a8_block_int8_matmul(
-            A=a, B=b, As=a_s, Bs=b_s, block_size=BLOCK, output_dtype=torch.float32
+        x = torch.ones(M, k, dtype=torch.bfloat16, device="cuda")
+        w = torch.ones(n, k, dtype=torch.int8, device="cuda")
+        w_s = torch.ones(triton.cdiv(n, BLOCK[0]), k // BLOCK[1], device="cuda")
+        out = apply_w8a8_block_int8_linear(
+            input=x, weight=w, block_size=BLOCK, weight_scale=w_s
         )
-        self.assertTrue((out[-1] == float(WIDE)).all().item())
+        # Each 128-element group quantizes 1.0 to 127 with scale 1/127
+        torch.testing.assert_close(
+            out[-1].float(),
+            torch.full((n,), float(WIDE), device="cuda"),
+            rtol=1e-3,
+            atol=0,
+        )
 
 
 if __name__ == "__main__":
