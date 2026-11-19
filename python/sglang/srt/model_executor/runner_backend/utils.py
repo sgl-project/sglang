@@ -55,19 +55,11 @@ def _needs_hicache_event_capture(model_runner: ModelRunner) -> bool:
     # they capture KDA state reads and need this mechanism.
     backend = model_runner.attn_backend
     memory = get_memory()
-    loads_layer_wise = memory.enable_hierarchical_cache
-    if memory.enable_unified_cache_external_linker:
-        from sglang.srt.mem_cache.unified_cache.linker_config import (
-            parse_linker_load_options,
-        )
-        from sglang.srt.mem_cache.unified_cache.linker_factory import (
-            get_startup_linker_config,
-        )
-
-        # Match the linker's defaults and legacy config resolution. Prefetch
-        # publishes only completed loads, so it needs no graph-managed waits.
-        load_mode, _, _ = parse_linker_load_options(get_startup_linker_config())
-        loads_layer_wise = loads_layer_wise or load_mode == "layer_wise"
+    # The external linker loads layer-wise through the same pool wait hook.
+    # Prefetch has no active layer-wise consumer, so bind skips load waits.
+    loads_layer_wise = (
+        memory.enable_hierarchical_cache or memory.enable_unified_cache_external_linker
+    )
     if not (
         loads_layer_wise
         and backend.use_captured_forward_metadata_for_breakable_cuda_graph
