@@ -52,6 +52,12 @@ _OWN_PUSH_MAX_ROWS = 512
 _FLYDSL_ONESHOT_MAX_ROWS = int(
     os.environ.get("SGLANG_ROCM_MUSE_AR_BOUNDARY_FLYDSL_ONESHOT_MAX_ROWS", "0")
 )
+# MoE batches of at most this many rows unpool only this rank's hidden / TP output columns and gather them inside
+# the FFN boundary kernel (ar_boundary_flydsl_gather.py; 0: never); needs sglang_meta_common's FlyDSL all-reduce
+# helpers and aiter's FlyDSL gfx1250 bf16 GEMM
+_GATHER_FFN_MAX_ROWS = int(
+    os.environ.get("SGLANG_ROCM_MUSE_GATHER_FFN_BOUNDARY_MAX_ROWS", "0")
+)
 
 
 def _mode_for(num_rows: int) -> int:
@@ -143,6 +149,35 @@ def _ensure_one_shot(boundary: FusedPostNormResidualPreNorm) -> None:
         boundary._pre_norm.eps,
     )
     tp.ar_boundary_one_shot.warm()
+
+
+def gather_ffn_boundary(hidden: int, post_eps: float, pre_eps: float):
+    """The TP group's FlyDSL gather + FFN boundary kernel (FlyDSLGatherFfnBoundary), or None when off; built
+    collectively on the first MoE layer's init and shared by every layer."""
+    tp = get_parallel().tp_group
+    if hasattr(tp, "gather_ffn_boundary"):
+        return tp.gather_ffn_boundary
+    tp.gather_ffn_boundary = None
+    if (
+        _GATHER_FFN_MAX_ROWS <= 0
+        or tp.world_size not in (2, 4, 8)
+        or hidden != 8 * 32 * 32
+    ):
+        return None
+    try:
+        import aiter.ops.flydsl.gemm_a16w16_gfx1250  # noqa: F401
+        import sglang_meta_common.ops.comm.flydsl_ar  # noqa: F401
+    except ImportError:
+        return None
+    from sglang.srt.rocm_muse_spark.ar_boundary_flydsl_gather import (
+        FlyDSLGatherFfnBoundary,
+    )
+
+    tp.gather_ffn_boundary = FlyDSLGatherFfnBoundary(
+        tp, hidden, _GATHER_FFN_MAX_ROWS, post_eps, pre_eps, post_weight=True
+    )
+    tp.gather_ffn_boundary.warm()
+    return tp.gather_ffn_boundary
 
 
 def _factored_layout(hidden: int, world_size: int) -> tuple[int, int] | None:

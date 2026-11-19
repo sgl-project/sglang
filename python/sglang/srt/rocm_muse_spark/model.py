@@ -90,6 +90,7 @@ from sglang.srt.rocm_muse_spark import (
 from sglang.srt.rocm_muse_spark.all_reduce_boundary import (
     AllReduceAttnBoundary,
     ar_boundary_enabled,
+    gather_ffn_boundary,
 )
 from sglang.srt.rocm_muse_spark.attention_kv_write import (
     FUSED_QKV_CACHE,
@@ -1573,6 +1574,14 @@ class MuseSpark1xDecoderLayer(nn.Module):
             if ar_boundary_enabled() and not _DENSE_FP8
             else None
         )
+        # MoE layers: the unpooler on this rank's output columns, gathered inside the FFN boundary kernel
+        self._gather_ffn = (
+            gather_ffn_boundary(
+                config.hidden_size, config.post_norm_eps, config.rms_norm_eps
+            )
+            if self.is_moe_layer and not _DENSE_FP8
+            else None
+        )
 
     @staticmethod
     def _is_moe_layer(config: MuseSparkTextConfig, layer_idx: int) -> bool:
@@ -1658,6 +1667,31 @@ class MuseSpark1xDecoderLayer(nn.Module):
             ffn_input, stream, _ = self._fused_attn_boundary.forward(
                 stream, attn_output, branch_dtype=torch.bfloat16
             )
+        if (
+            sp is None
+            and self._gather_ffn is not None
+            and pre_norm_dtype is None
+            and self._gather_ffn.supports(ffn_input.shape[0])
+            and self._can_fuse_unpool_boundary(
+                ffn_input, ffn_boundary, max_rows=self._gather_ffn.max_rows
+            )
+        ):
+            expert_output = self.mlp(
+                ffn_input,
+                skip_post_expert_proj=True,
+                target_verify=target_verify,
+                prefill_fp8=prefill_fp8,
+            )
+            ffn_boundary._ensure_cached_weights(torch.bfloat16)
+            next_attn_input, stream = self._gather_ffn(
+                stream,
+                self._gather_ffn.unpool(expert_output, self.mlp.post_expert_proj.weight),
+                ffn_boundary._cc_post_weight,
+                ffn_boundary._cc_pre_weight,
+                ffn_boundary._cc_alpha,
+                ffn_boundary._cc_beta,
+            )
+            return stream, next_attn_input, None
         if (
             sp is None
             and _FUSED_UNPOOL_BOUNDARY
@@ -1756,16 +1790,19 @@ class MuseSpark1xDecoderLayer(nn.Module):
         return attn.ulysses_qkv_fp8 if ulysses_prepared(attn) else None
 
     def _can_fuse_unpool_boundary(
-        self, x: torch.Tensor, boundary: FusedPostNormResidualPreNorm | None
+        self,
+        x: torch.Tensor,
+        boundary: FusedPostNormResidualPreNorm | None,
+        max_rows: int = 16,
     ) -> bool:
-        """Unpooler + FFN boundary fusion: MoE layers at up to 16 rows (replicated unpooler, any TP)."""
+        """Unpooler + FFN boundary fusion: MoE layers at up to ``max_rows`` rows (replicated unpooler)."""
         if not self.is_moe_layer or boundary is None:
             return False
         proj = self.mlp.post_expert_proj
         return (
             proj is not None
             and proj.bias is None
-            and 0 < x.shape[0] <= 16
+            and 0 < x.shape[0] <= max_rows
             and x.dtype == torch.bfloat16
             and x.shape[1] == 8192
             and x.is_contiguous()
