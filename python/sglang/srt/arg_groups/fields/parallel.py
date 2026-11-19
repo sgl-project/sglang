@@ -359,6 +359,13 @@ class Parallel(msgspec.Struct):
         doc="Attention tensor-parallel width: `tp_size` divided by the "
         "attention-DP and attention-CP dimensions.",
     )
+    shared_experts_tp_width = Derived(
+        fn="sglang.srt.runtime_context.shared_experts_tp_width_of",
+        doc="Shared-expert tensor-parallel width: `shared_experts_tp_size`, "
+        "else `attn_tp_size` under `enable_shared_experts_attn_tp`. `None` "
+        "means no separate width: replicated under an EP all-to-all backend, "
+        "following MoE TP otherwise.",
+    )
     attn_dp_enabled = Derived(
         fn="sglang.srt.runtime_context.attn_dp_enabled_of",
         doc="Whether attention runs data parallel: `attn_dp_size` is wider "

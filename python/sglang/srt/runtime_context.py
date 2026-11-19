@@ -195,6 +195,15 @@ def attn_tp_size_of(cfg: Any):
     return parallel_widths_of(cfg)["attn_tp_size"]
 
 
+def shared_experts_tp_width_of(cfg: Any) -> Optional[int]:
+    """`shared_experts_tp_width`, computed at publish."""
+    if cfg.shared_experts_tp_size is not None:
+        return cfg.shared_experts_tp_size
+    if cfg.enable_shared_experts_attn_tp:
+        return attn_tp_size_of(cfg)
+    return None
+
+
 def attn_dp_enabled_of(cfg: Any) -> bool:
     """`attn_dp_enabled`, computed at publish.
 

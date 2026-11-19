@@ -225,7 +225,8 @@ class TestKimiMLPParallelGroups(CustomTestCase):
                     with parallel_scope(
                         shared_experts_tp_size=requested,
                         enable_shared_experts_attn_tp=enabled,
-                        shared_experts_tp_group=shared,
+                        shared_experts_tp_width=attn_tp if enabled else requested,
+                        shared_experts_tp_group=attn if enabled else shared,
                         attn_tp_group=attn,
                     ):
                         owner, module = build_shared_experts(ep_a2a=ep)
@@ -249,11 +250,14 @@ class TestKimiMLPParallelGroups(CustomTestCase):
                             torch.testing.assert_close(layer.weight, expected)
                         self.assertFalse(module.down_proj.reduce_results)
                         self.assertFalse(module.down_proj.use_dp_attention_reduce)
-                with parallel_scope(shared_experts_tp_size=2):
+                with parallel_scope(
+                    shared_experts_tp_size=2, shared_experts_tp_width=2
+                ):
                     with self.assertRaisesRegex(ValueError, "requires an EP a2a"):
                         build_shared_experts(ep_a2a=False)
                 with parallel_scope(
                     shared_experts_tp_size=3,
+                    shared_experts_tp_width=3,
                     shared_experts_tp_group=SimpleNamespace(
                         world_size=3, rank_in_group=rank % 3
                     ),

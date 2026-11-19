@@ -198,6 +198,11 @@ def handle_shared_experts_tp(server_args: Any):
         attn_cp_size=view.attn_cp_size,
         attn_dp_size=cfg.attn_dp_size,
     )
+    if cfg.enable_shared_experts_attn_tp and size != attn_tp_size:
+        raise ValueError(
+            f"--shared-experts-tp-size ({size}) conflicts with "
+            f"--enable-shared-experts-attn-tp (attention TP {attn_tp_size})."
+        )
     across_dp = shared_experts_tp_spans_dp(
         attn_tp_size=attn_tp_size,
         attn_cp_size=view.attn_cp_size,
