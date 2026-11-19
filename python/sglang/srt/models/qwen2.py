@@ -140,6 +140,7 @@ class Qwen2MLP(nn.Module):
         if self.dual_gemm.can_run(x, self.gate_up_proj):
             x = self.dual_gemm(x, self.gate_up_proj)
         elif self._use_quack_swiglu(x):
+            # The SM120 kernel for dual_gemm's computation; dual_gemm needs SM10x.
             x = quack_swiglu_gemm(x, self.gate_up_proj.weight)
         else:
             gate_up, _ = self.gate_up_proj(x)

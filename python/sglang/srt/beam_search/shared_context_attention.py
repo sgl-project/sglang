@@ -66,6 +66,8 @@ def selected_kernel() -> str:
 
 
 def _attention_kernel(kernel: str):
+    # One contract. "split_kv" and "stream_k" also spread the prompt over the SMs
+    # that a few groups leave idle, at the cost of a second launch for the merge.
     if kernel == "split_kv":
         from sglang.kernels.ops.attention.beam_shared_context_split_kv import (
             shared_context_attention_split_kv,

@@ -1736,6 +1736,16 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Fuse the KDA output gated RMSNorm with per-token-group FP8 quantization for small-M target-verify batches feeding a blockwise-FP8 output projection. Takes effect only on SM90 with <code>SGLANG_ENABLE_FP8_BLOCK_GEMV=1</code>; otherwise it stays off.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_QUACK_SWIGLU_GEMM</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>On SM120 (RTX Blackwell), fuse SiLU-and-mul into the gate/up GEMM of unquantized BF16 MLPs in Qwen2-style models (Qwen2, Qwen3). Deterministic inference, on-policy RL and LoRA-wrapped layers keep the unfused path.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_BEAM_SHARED_CONTEXT_KERNEL</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Kernel for shared-context beam attention (<code>SGLANG_ENABLE_BEAM_SHARED_CONTEXT_ATTENTION=1</code>): <code>default</code>, <code>split_kv</code> (prompt split across CTAs) or <code>stream_k</code> (persistent grid).</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>default</code></td>
+    </tr>
   </tbody>
 </table>
 

@@ -1,6 +1,6 @@
+import unittest
 from types import SimpleNamespace
 
-import pytest
 import torch
 
 from sglang.srt.beam_search.batch_tail import BeamTail, BeamTailEntry
@@ -13,10 +13,9 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-large")
-
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-small")
 
 TOKEN_START = 1000
 CODEBOOK = 16
@@ -166,24 +165,26 @@ def _run_request_steps(coordinator, reqs):
         coordinator.select_and_relay_decode(batch, output)
 
 
-def test_beam_launch_half_never_syncs_the_host():
-    """Run-ahead: from the forward's logits to the relayed tokens, the beam
-    launch half (capture, selection, member spawn, KV remap, relay) issues no
-    host sync, so the CPU queues it while the forward still runs."""
-    # Warm-up: kernel compilation and first allocations.
-    _run_request_steps(*_setup())
-    torch.cuda.synchronize()
-    coordinator, reqs = _setup()
-    torch.cuda.set_sync_debug_mode("error")
-    try:
-        _run_request_steps(coordinator, reqs)
-    finally:
-        torch.cuda.set_sync_debug_mode("default")
-    for req in reqs:
-        group = req.beam_group
-        assert group.num_generated == 3
-        assert len(group._pending_steps) == 3
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+class TestBeamLaunchHalf(CustomTestCase):
+    def test_beam_launch_half_never_syncs_the_host(self):
+        """Run-ahead: from the forward's logits to the relayed tokens, the beam
+        launch half (capture, selection, member spawn, KV remap, relay) issues no
+        host sync, so the CPU queues it while the forward still runs."""
+        # Warm-up: kernel compilation and first allocations.
+        _run_request_steps(*_setup())
+        torch.cuda.synchronize()
+        coordinator, reqs = _setup()
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            _run_request_steps(coordinator, reqs)
+        finally:
+            torch.cuda.set_sync_debug_mode("default")
+        for req in reqs:
+            group = req.beam_group
+            self.assertEqual(group.num_generated, 3)
+            self.assertEqual(len(group._pending_steps), 3)
 
 
 if __name__ == "__main__":
-    raise SystemExit(pytest.main([__file__, "-v"]))
+    unittest.main()
