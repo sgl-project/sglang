@@ -23,6 +23,7 @@ class TestEarlyPrefillPoll(CustomTestCase):
             return SimpleNamespace(running_batch=batch, batch_to_run=None)
 
         scheduler = SimpleNamespace(
+            enable_hicache_storage=False,
             process_disagg_prefill_transfer_queue=lambda: events.append("poll"),
             process_pending_chunked_abort=lambda: None,
             _process_hicache_events=lambda **kwargs: None,
@@ -74,15 +75,16 @@ class TestEarlyPrefillPoll(CustomTestCase):
         scheduler.scheduler_stage_metrics = None
         scheduler.increment_scheduler_iterations = lambda: None
         scheduler.ingest_requests = lambda **kwargs: False
-        scheduler._engine_paused = False
+        scheduler.pause_state = SimpleNamespace(paused=False, may_launch=lambda: True)
         scheduler._deferred_input_requests = []
         scheduler.waiting_queue = SimpleNamespace(join=lambda reqs: None)
         scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(
-            pop_bootstrapped=lambda: []
+            move_bootstrapped=lambda dst: None
         )
         scheduler.running_batch = SimpleNamespace(batch_is_full=False)
         scheduler.last_batch = None
         scheduler.chunked_req = None
+        scheduler.enable_hicache_storage = False
         scheduler.enable_staging = False
         scheduler.process_pending_chunked_abort = lambda: None
         scheduler._process_hicache_events = lambda **kwargs: None
