@@ -473,13 +473,23 @@ impl InMemoryKvIndexerBackend {
                     block.tier_masks.clear();
                 }
                 if let Some(block) = state.blocks.get(hash) {
-                    for (worker, tier, mask) in effective_placements(&state, block) {
+                    let mut add_placement = |worker: &String, tier, mask| {
                         let Some(&index) = candidate_by_id.get(worker) else {
-                            continue;
+                            return;
                         };
                         present[index] = true;
                         block_views[index].token_count = block.token_count;
                         block_views[index].tier_masks.push((tier, mask));
+                    };
+                    // Without pool records, no worker can be pool-bound.
+                    if state.pools.is_empty() {
+                        for ((worker, tier), mask) in &block.placements {
+                            add_placement(worker, *tier, *mask);
+                        }
+                    } else {
+                        for (worker, tier, mask) in effective_placements(&state, block) {
+                            add_placement(worker, tier, mask);
+                        }
                     }
                 }
                 for (index, candidate) in candidates.iter_mut().enumerate() {
