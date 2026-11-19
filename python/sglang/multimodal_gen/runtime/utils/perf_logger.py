@@ -17,6 +17,9 @@ from dateutil.tz import UTC
 
 import sglang
 import sglang.multimodal_gen.envs as envs
+from sglang.multimodal_gen.runtime.managers.request_cancel_error import (
+    RequestCancelledError,
+)
 from sglang.multimodal_gen.runtime.observability.metrics import get_metrics
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
@@ -133,10 +136,8 @@ def get_git_commit_hash() -> str:
                 .strip()
                 .decode("utf-8")
             )
-        _CACHED_COMMIT_HASH = commit_hash
         return commit_hash
     except (subprocess.CalledProcessError, FileNotFoundError):
-        _CACHED_COMMIT_HASH = "N/A"
         return "N/A"
 
 
@@ -345,6 +346,9 @@ class StageProfiler:
         execution_time_s = time.perf_counter() - self.start_time
 
         if exc_type:
+            # each rank stops a cancelled request; the worker logs it once
+            if issubclass(exc_type, RequestCancelledError):
+                return False
             self.logger.error(
                 "[%s] Error during execution after %.4f ms: %s",
                 self.stage_name,

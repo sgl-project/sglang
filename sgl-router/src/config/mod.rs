@@ -255,6 +255,7 @@ mod tests {
             server: ServerConfig::default(),
             observability: ObservabilityConfig::default(),
             model: ModelConfig {
+                aliases: Vec::new(),
                 id: model_id.into(),
                 tokenizer_path: Some("/tmp/tok.json".into()),
                 disable_input_ids_forwarding: false,

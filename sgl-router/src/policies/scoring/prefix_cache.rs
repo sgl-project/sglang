@@ -161,7 +161,7 @@ mod tests {
     }
 
     #[test]
-    fn depth_is_a_fraction_and_a_tail_without_block_zero_misses() {
+    fn depth_is_a_fraction_and_a_tail_under_another_workers_block_counts() {
         let tree = Arc::new(HashTree::new());
         insert(&tree, "deep", 0, 0, 3);
         insert(&tree, "tail", 0, 2, 2);
@@ -173,7 +173,10 @@ mod tests {
 
         let scores = shares(&policy(tree), &ws, &ctx);
         assert_eq!(scores[0], 0.75, "3 of 4 blocks held, not a neutral 1.0");
-        assert_eq!(scores[1], 0.0, "tail without block 0 holds nothing");
+        assert_eq!(
+            scores[1], 1.0,
+            "a chain stored under block 1 means its engine holds blocks 0 and 1"
+        );
         assert_eq!(scores[2], 0.0, "never seen");
     }
 

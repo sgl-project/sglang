@@ -2,10 +2,10 @@
 #
 # Self-contained (no inheritance): same as 1p1d.yaml plus the `mtp:` block. Uses
 # EAGLE3 speculative decoding with an EXTERNAL draft checkpoint (unlike DSV4's
-# built-in EAGLE NextN head): the launcher resolves mtp.draft_model_path through
-# the HF-cache snapshot logic and appends --speculative-draft-model-path. The
-# draft dir must live under /it-share (the container's :ro mount). MTP is applied
-# to both prefill and decode. Mirrors the Kimi-K2.6 serving cookbook.
+# built-in EAGLE NextN head): mtp.draft_model is an HF repo id, resolved in
+# $HF_CACHE like the main model and passed as --speculative-draft-model-path.
+# MTP is applied to both prefill and decode. Mirrors the Kimi-K2.6 serving
+# cookbook.
 #
 # Consumed by:
 #   * scripts/ci/slurm/process_result.py reads `resources` and
@@ -50,10 +50,9 @@ mtp:
   num_steps: 3
   eagle_topk: 1
   num_draft_tokens: 4
-  draft_model_path: /it-share/model_coverage/models--lightseekorg--kimi-k2.6-eagle3.1-mla
+  draft_model: lightseekorg/kimi-k2.6-eagle3.1-mla
 
 runtime:
-  image: lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi35x-20260623
   # Kimi uses split attention backends (aiter prefill / triton decode), not a
   # single --attention-backend.
   prefill_attention_backend: aiter

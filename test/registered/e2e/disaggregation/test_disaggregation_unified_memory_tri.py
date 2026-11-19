@@ -5,8 +5,8 @@ so one unified buffer carries three components with three independent
 compactions -- ``[conv state (up END) | swa (FLOAT) | full (down END)]`` -- and
 PD must ship all three per request: full KV on the ``kv_data_ptrs`` channel,
 sliding-window KV as ``StateType.SWA``, ShortConv state as ``StateType.MAMBA``
-(via the ``req_to_token_pool`` fallback, since the KV pool here is a
-``UnifiedSWAKVPool`` rather than a ``HybridLinearKVPool``).
+(via the ``req_to_token_pool`` fallback, since the KV pool here routes
+full and window layers rather than wrapping one token view).
 
 Two failures this pins that the 2-pool cases cannot:
 
