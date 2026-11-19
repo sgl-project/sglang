@@ -23,6 +23,14 @@ a non-ROCm platform, an SP group that is not two ranks, a pair without
 peer-to-peer access or not on one host, batch > 1, unequal shards, a failed IPC
 handle exchange, or a staging miss during CUDA graph capture -- falls back to
 the NCCL gather and returns the same result.
+
+Scope: init() admits a group only if (1) it has exactly two ranks, (2) both ranks
+are on one host, and (3) torch reports peer access between their devices. Nothing
+here distinguishes "same SoC/socket" from "same host with peer access", and there
+is no hierarchical path (IPC inside a SoC, a collective across SoCs). A group of
+more than two ranks, or one spanning hosts, keeps the NCCL gather. Failure is
+sticky: once init() fails (including an IPC handle exchange failure), this
+process stays on NCCL; a staging miss only falls back for that call.
 """
 
 import logging
@@ -115,7 +123,9 @@ class _State:
         # ipc_a2a this does not also require NVLink: the ordering here is a
         # collective rather than a GPU-side flag spin, so a slower link makes
         # the exchange slower instead of stalling it. _peer_cuda_device also
-        # rejects a pair that is not on one host.
+        # rejects a pair that is not on one host; it compares hostnames, not
+        # sockets, and can_device_access_peer can be true across sockets (e.g.
+        # over xGMI), so a cross-socket pair on one host is admitted.
         peer_dev = _peer_cuda_device(self.group, self.rank, device.index)
         if not torch.cuda.can_device_access_peer(device.index, peer_dev):
             raise RuntimeError(
