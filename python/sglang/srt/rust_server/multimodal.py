@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any, Dict, FrozenSet, Optional, Tuple
 import msgspec
 
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_mm, get_parallel, get_serving
+from sglang.srt.runtime_context import get_disagg, get_mm, get_parallel, get_serving
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -54,6 +54,20 @@ class RustMmSpec(msgspec.Struct, frozen=True, kw_only=True):
         handed the typed ``MmSpec`` instead."""
         fields = (f for f in self.__struct_fields__ if f not in self.DRAIN_ONLY)
         return msgspec.json.encode({f: getattr(self, f) for f in fields}).decode()
+
+
+class RustMmAudioSpec(msgspec.Struct, frozen=True, kw_only=True):
+    audio_token_id: int
+    audio_start_id: int
+    audio_end_id: int
+
+    def rust_json(self) -> str:
+        return msgspec.json.encode(
+            {"family": "qwen3_asr", **msgspec.structs.asdict(self)}
+        ).decode()
+
+
+RustMmModelSpec = RustMmSpec | RustMmAudioSpec
 
 
 class RustMmFamily(msgspec.Struct, frozen=True, kw_only=True):
@@ -239,7 +253,7 @@ class RustMmProcessor:
             import_processors(mm_process_pkg, overwrite=True)
         self._processor = processor or get_processor_wrapper()
 
-    def resolve_spec(self) -> Optional[RustMmSpec]:
+    def resolve_spec(self) -> Optional[RustMmModelSpec]:
         """The :class:`RustMmSpec` for this model, or ``None`` when it has no
         Rust pipeline (the launch gate turns that into a hard error).
 
@@ -253,6 +267,8 @@ class RustMmProcessor:
         mm_processor_cls = get_mm_processor_cls(
             hf_config, model_config=self.model_config
         )
+        if getattr(hf_config, "model_type", None) == "qwen3_asr":
+            return self._resolve_audio_spec(mm_processor_cls)
         family = rust_mm_family_for(
             mm_processor_cls, getattr(hf_config, "model_type", None)
         )
@@ -308,6 +324,62 @@ class RustMmProcessor:
         logger.info("rust server: Rust MM pipeline enabled (family=%s)", family.name)
         return spec
 
+    def _resolve_audio_spec(self, processor_cls) -> Optional[RustMmAudioSpec]:
+        if not envs.SGLANG_EXPERIMENTAL_RUST_AUDIO.get():
+            return None
+
+        from sglang.srt.multimodal.processors.qwen3_asr import (
+            Qwen3ASRMultimodalProcessor,
+        )
+
+        parallel = get_parallel()
+        if (
+            processor_cls is not Qwen3ASRMultimodalProcessor
+            or (
+                parallel.nnodes,
+                parallel.tp_size,
+                parallel.pp_size,
+                parallel.num_dp_ranks,
+            )
+            != (1, 1, 1, 1)
+            or get_disagg().disaggregation_mode != "null"
+            or get_mm().mm_process_config
+        ):
+            return None
+
+        extractor = getattr(self._processor, "feature_extractor", None)
+        expected = {
+            "sampling_rate": 16_000,
+            "n_fft": 400,
+            "hop_length": 160,
+            "feature_size": 128,
+            "n_samples": 480_000,
+            "padding_value": 0.0,
+            "padding_side": "right",
+            "dither": 0.0,
+        }
+        if type(extractor).__name__ != "WhisperFeatureExtractor" or any(
+            getattr(extractor, name, None) != value for name, value in expected.items()
+        ):
+            return None
+        tokenizer = self._processor.tokenizer
+        tokens = ("<|audio_pad|>", "<|audio_start|>", "<|audio_end|>")
+        ids = tokenizer.convert_tokens_to_ids(list(tokens))
+        if tuple(tokenizer.convert_ids_to_tokens(ids)) != tokens:
+            return None
+        thinker = getattr(self.model_config.hf_config, "thinker_config", None)
+        configured_ids = (
+            getattr(thinker, "audio_token_id", None),
+            getattr(thinker, "audio_start_token_id", None),
+            getattr(thinker, "audio_end_token_id", None),
+        )
+        if tuple(ids) != configured_ids:
+            return None
+        logger.info("rust server: experimental Rust audio enabled (family=qwen3_asr)")
+        return RustMmAudioSpec(
+            audio_token_id=ids[0], audio_start_id=ids[1], audio_end_id=ids[2]
+        )
+
     def _use_feature_shm(self) -> bool:
         """Whether to park feature buffers in POSIX shm rather than inline.
 
@@ -333,7 +405,7 @@ class RustMmProcessor:
         )
 
     @staticmethod
-    def wrap_encoded(spec: RustMmSpec | None, buffers):
+    def wrap_encoded(spec: RustMmModelSpec | None, buffers):
         """Drain-time adapter: wrap one request's ``mm.*`` buffers (a
         ``{name: numpy array | ShmBuffer}`` mapping from ``recv_requests``) into
         the scheduler's ``MultimodalProcessorOutput``. Wrapping only -- load,
@@ -376,7 +448,7 @@ class RustMmProcessor:
                 for item in items:
                     item.set_pad_value()
             token_ids = meta["token_ids"]
-            if token_ids is None and spec is not None:
+            if token_ids is None and isinstance(spec, RustMmSpec):
                 token_ids = {
                     "im_token_id": spec.image_token_id,
                     "im_start_id": spec.vision_start_token_id,

@@ -2,15 +2,18 @@
 //! and hand each request back with the expanded ids and the named feature
 //! buffers that ride the ring with it.
 
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use sglang_mm::pipeline::{Tensor, TensorData};
 use sglang_processor::MmOutput;
 use sglang_processor::dynamo_multimodal::processor::{self as dynamo, PositionOutput};
 
-use super::encoded::{MRope, MmEncodedEntry, MmEncodedItem, MmMeta, MmMetaValue, MmModality};
+use super::encoded::{
+    MRope, MmEncodedEntry, MmEncodedItem, MmMeta, MmMetaValue, MmModality, MmTokenIds,
+};
 use crate::message::buffers::{Buffer, BufferData, BufferStore};
 use crate::message::config::MmSpec;
+use crate::message::multimodal::{MediaHints, MmItem};
 use crate::message::request::{MmData, Request, RequestKind};
 use crate::message::types::TokenIds;
 use crate::tokenizer_manager::to_scheduler::{Limits, fit_input};
@@ -173,19 +176,33 @@ pub trait MmProcessor: Send + Sync {
     }
 }
 
-/// The built-in path: SGLang's image pipeline (`sglang_processor::mm`) over the
-/// request's resolved media bytes.
-struct ImageMmProcessor {
+/// The built-in shared family pipeline over the request's resolved media.
+struct NativeMmProcessor {
     pipeline: sglang_processor::MmProcessor,
+    audio_token_ids: Option<MmTokenIds>,
 }
 
-impl MmProcessor for ImageMmProcessor {
-    fn process(&self, input_ids: TokenIds, mm: MmData) -> Result<MmProcessOutput, MediaError> {
-        if !mm.video_data.is_empty() || !mm.audio_data.is_empty() {
-            return Err(MediaError::Client(
-                "unsupported modality: video/audio input".into(),
-            ));
+impl MmProcessor for NativeMmProcessor {
+    fn check_media(&self, mm: &MmData) -> Result<(), String> {
+        if self.audio_token_ids.is_some() {
+            if mm.audio_data.len() != 1 || !mm.image_data.is_empty() || !mm.video_data.is_empty() {
+                return Err(
+                    "native audio accepts exactly one audio item and no image/video".into(),
+                );
+            }
+            if let MmItem::Ref { hints, .. } = &mm.audio_data[0]
+                && *hints != MediaHints::default()
+            {
+                return Err("native audio does not accept media hints".into());
+            }
+        } else if !mm.video_data.is_empty() || !mm.audio_data.is_empty() {
+            return Err("unsupported modality: video/audio input".into());
         }
+        Ok(())
+    }
+
+    fn process(&self, input_ids: TokenIds, mm: MmData) -> Result<MmProcessOutput, MediaError> {
+        self.check_media(&mm).map_err(MediaError::Client)?;
         let media = super::payload::resolve_media_work(input_ids, mm)?;
         let input_ids = (media.input_ids.iter())
             .map(|&id| {
@@ -193,20 +210,33 @@ impl MmProcessor for ImageMmProcessor {
                     .map_err(|_| MediaError::Server(format!("mm: token id {id} out of range")))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let images: Vec<&[u8]> = media.images.iter().map(|image| image.as_ref()).collect();
-        // The pipeline fails on the request's images and prompt layout.
-        let output = (self.pipeline)
-            .process(&input_ids, &images)
-            .map_err(|error| MediaError::Client(error.to_string()))?;
-        encode_output(output).map_err(MediaError::Server)
+        let output = if self.audio_token_ids.is_some() {
+            self.pipeline
+                .process_audio(&input_ids, &media.audios[0])
+                .map_err(|error| match error {
+                    sglang_processor::ProcessorError::Internal(message) => {
+                        MediaError::Server(message)
+                    }
+                    other => MediaError::Client(other.to_string()),
+                })?
+        } else {
+            let images: Vec<&[u8]> = media.images.iter().map(|image| image.as_ref()).collect();
+            self.pipeline
+                .process(&input_ids, &images)
+                .map_err(|error| MediaError::Client(error.to_string()))?
+        };
+        encode_output(output, self.audio_token_ids.clone()).map_err(MediaError::Server)
     }
 }
 
 /// Map the pipeline's output straight onto the common encoded result: each
 /// feature tensor is moved with its own shape and dtype, the per-item span
-/// and hash ride along, and every auxiliary tensor is translated once into
-/// the sidecar's metadata form. Nothing is reconstructed from lengths.
-fn encode_output(output: MmOutput) -> Result<MmProcessOutput, String> {
+/// and hash ride along. Audio aux tensors keep their shape. The image path
+/// still packs grid metadata in its existing form.
+fn encode_output(
+    output: MmOutput,
+    audio_token_ids: Option<MmTokenIds>,
+) -> Result<MmProcessOutput, String> {
     let MmOutput {
         input_ids,
         items,
@@ -220,25 +250,34 @@ fn encode_output(output: MmOutput) -> Result<MmProcessOutput, String> {
             offsets.len()
         ));
     }
+    let audio = audio_token_ids.is_some();
     let items = items
         .into_iter()
         .zip(offsets)
         .map(|(item, span)| {
+            let mut model_specific_data = BTreeMap::new();
+            let mut auxiliary_tensors = BTreeMap::new();
+            for (name, aux) in item.aux {
+                let aux = tensor(aux)?;
+                if audio {
+                    auxiliary_tensors.insert(name, aux);
+                } else {
+                    let meta = aux_meta(&name, aux)?;
+                    model_specific_data.insert(name, meta);
+                }
+            }
             Ok(MmEncodedItem {
-                modality: MmModality::Image,
+                modality: if audio {
+                    MmModality::Audio
+                } else {
+                    MmModality::Image
+                },
                 feature: tensor(item.feature)?,
                 hash: item.hash,
                 identity: None,
                 offsets: vec![span],
-                model_specific_data: item
-                    .aux
-                    .into_iter()
-                    .map(|(name, aux)| {
-                        let meta = aux_meta(&name, tensor(aux)?)?;
-                        Ok((name, meta))
-                    })
-                    .collect::<Result<_, String>>()?,
-                auxiliary_tensors: Default::default(),
+                model_specific_data,
+                auxiliary_tensors,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -250,7 +289,7 @@ fn encode_output(output: MmOutput) -> Result<MmProcessOutput, String> {
         input_ids: input_ids.into_iter().map(i64::from).collect(),
         result: MmEncodedEntry {
             items,
-            token_ids: None,
+            token_ids: audio_token_ids,
             mrope,
         },
         extension: None,
@@ -297,10 +336,23 @@ pub struct MmContext {
 
 impl MmContext {
     pub fn new(spec: MmSpec) -> Result<Self, String> {
+        use sglang_processor::dynamo_multimodal::registry::ProcessorSpec;
+        let audio_token_ids = match &spec.pipeline {
+            ProcessorSpec::Qwen3Asr(spec) => Some(MmTokenIds {
+                audio_token_id: Some(i64::from(spec.audio_token_id)),
+                audio_start_id: Some(i64::from(spec.audio_start_id)),
+                audio_end_id: Some(i64::from(spec.audio_end_id)),
+                ..Default::default()
+            }),
+            _ => None,
+        };
         let pipeline =
             sglang_processor::MmProcessor::from_spec(spec.pipeline).map_err(|e| e.to_string())?;
         Ok(Self {
-            processor: Arc::new(ImageMmProcessor { pipeline }),
+            processor: Arc::new(NativeMmProcessor {
+                pipeline,
+                audio_token_ids,
+            }),
             feature_shm: spec.feature_shm,
             limits: None,
         })
@@ -619,7 +671,7 @@ mod tests {
                 delta: -2,
             },
         };
-        let encoded = encode_output(output).unwrap();
+        let encoded = encode_output(output, None).unwrap();
         assert_eq!(encoded.input_ids, [1, 2, 2, 3]);
         let items = &encoded.result.items;
         assert_eq!(items[0].feature.shape, [6, 2], "shape kept, not rebuilt");
@@ -644,7 +696,7 @@ mod tests {
             offsets: vec![],
             positions: PositionOutput::Rope1D,
         };
-        assert!(encode_output(plain).unwrap().result.mrope.is_none());
+        assert!(encode_output(plain, None).unwrap().result.mrope.is_none());
 
         let bad = MmOutput {
             input_ids: vec![1],
@@ -659,7 +711,7 @@ mod tests {
             offsets: vec![(0, 0)],
             positions: PositionOutput::Rope1D,
         };
-        let Err(err) = encode_output(bad) else {
+        let Err(err) = encode_output(bad, None) else {
             panic!("an f32 aux tensor must be rejected");
         };
         assert!(err.contains("no metadata form"), "{err}");
@@ -925,6 +977,58 @@ mod tests {
         runtime_rid: "r",
         bootstrap_room: None,
     };
+
+    #[test]
+    fn native_audio_request_reaches_the_scheduler_ring() {
+        use sglang_processor::dynamo_multimodal::{
+            models::qwen3_asr::Qwen3AsrSpec, registry::ProcessorSpec,
+        };
+
+        let ctx = MmContext::new(MmSpec {
+            feature_shm: false,
+            pipeline: ProcessorSpec::Qwen3Asr(Qwen3AsrSpec {
+                audio_token_id: 2,
+                audio_start_id: 1,
+                audio_end_id: 3,
+            }),
+        })
+        .unwrap();
+        // Four samples of 16 kHz mono PCM16, carried as an api.v1 media source.
+        let wav = MmItem::Source(
+            concat!(
+                "data:audio/wav;base64,",
+                "UklGRiwAAABXQVZFZm10IBAAAAABAAEAgD4AAAB9AAACABAAZGF0YQgAAAAAAAgADAIT/w=="
+            )
+            .into(),
+        );
+        assert!(
+            ctx.processor
+                .check_media(&MmData {
+                    audio_data: vec![wav.clone(), wav.clone()],
+                    ..Default::default()
+                })
+                .is_err()
+        );
+        let (input_ids, buffers) = process(
+            &ctx,
+            NO_REQUEST,
+            vec![7, 1, 2, 3, 9],
+            MmData {
+                audio_data: vec![wav],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(input_ids.as_slice(), &[7, 1, 2, 3, 9]);
+        assert_eq!(
+            find(&buffers, "mm.feature.0").unwrap().shape,
+            [1, 128, 3000]
+        );
+        assert_eq!(find(&buffers, "mm.aux.0.0").unwrap().shape, [1, 3000]);
+        let meta = decoded_meta(&buffers);
+        assert_eq!(meta["items"][0]["modality"].as_str(), Some("audio"));
+        assert_eq!(meta["token_ids"]["audio_token_id"].as_i64(), Some(2));
+    }
 
     /// An external processor's result rides the same buffers: its tensor's
     /// dtype and shape are kept, the caller hash override applies, and the

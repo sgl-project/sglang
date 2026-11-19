@@ -188,19 +188,59 @@ expanded ids, offsets, grids, M-RoPE positions and feature bytes of every case,
 over the images in `tests/fixtures/mm_parity/images/`.
 
 
-### Native audio integration
+### Experimental native audio validation
 
-The first target is `api.v1 Generate.audio_data` on Qwen3-ASR-0.6B with a
-single 16 kHz mono PCM16 WAV. The shared audio family supplies features,
-prompt layout, positions and the encoder mask. SGLang owns request admission,
-media prefetch and the scheduler handoff.
+`api.v1 Generate.audio_data` accepts a single 16 kHz mono PCM16 WAV up to
+30 seconds on the opt-in Qwen3-ASR profile. Use one GPU and a unified server.
+The profile is a pinned validation dependency built over the
+[shared audio primitives](https://github.com/ai-dynamo/frontend-crates/pull/619).
+The shared family owns features, mask, token expansion and positions. SGLang
+provides media admission, prefetch, and the worker-to-scheduler handoff.
 
-Align the processor entry after decode with the native video work in
-[#51156](https://github.com/sgl-project/sglang/pull/51156) and
-[#51157](https://github.com/sgl-project/sglang/pull/51157). The scheduler ring
-now carries named auxiliary tensors with their shape and dtype, for example
-an audio attention mask. Model support depends on a qualified family
-built over the [shared audio primitives](https://github.com/ai-dynamo/frontend-crates/pull/619).
+From `rust/`, run the processor tests and the scheduler handoff test on Linux CPU:
+
+```sh
+cargo test --locked -p sglang-processor --test qwen3_asr --test mm_parity
+cargo test --locked -p sglang-server --lib native_audio_request_reaches_the_scheduler_ring
+```
+
+For a serving check, use an installed SGLang GPU environment and run from the
+repository root. Download `Qwen/Qwen3-ASR-0.6B` at revision
+`5eb144179a02acc5e5ba31e748d22b0cf3e303b0` into `$MODEL_DIR`.
+
+```sh
+PYTHONPATH="$PWD/python" SGLANG_RUST_SERVER=1 SGLANG_EXPERIMENTAL_RUST_AUDIO=1 \
+  python -m sglang.launch_server --host 127.0.0.1 --port 30000 \
+  --grpc-port 50051 --model-path "$MODEL_DIR"
+```
+
+In another shell, set `WAV` to a short speech sample that meets the input
+restrictions and send the same prompt and bytes used for the Python baseline:
+
+```sh
+python - "$WAV" <<'PY' | grpcurl -plaintext -import-path proto \
+  -proto sglang/api/v1/service.proto -d @ 127.0.0.1:50051 \
+  sglang.api.v1.SglangService/Generate
+import base64, json, pathlib, sys
+
+audio = base64.b64encode(pathlib.Path(sys.argv[1]).read_bytes()).decode()
+prompt = "<|im_start|>user\n<|audio_start|><|audio_pad|><|audio_end|><|im_end|>\n<|im_start|>assistant\n"
+print(json.dumps({
+    "text": {"one": prompt},
+    "audioData": {"item": {"source": "data:audio/wav;base64," + audio}},
+    "samplingParams": {"one": {"temperature": 0, "maxNewTokens": "64"}},
+    "returnPromptTokenIds": True,
+    "stream": False,
+}))
+PY
+```
+
+Record the terminal frame text, prompt IDs and generated IDs. Compare
+with Python `/generate` on the same checkpoint and GPU, using flat JSON
+(`text`, `audio_data`, and `sampling_params`). Also send one malformed WAV
+and one prompt missing the audio placeholder. Both must fail without output.
+Qualifying the numerical backend requires comparing features against the
+checkpoint's Python `WhisperFeatureExtractor`, in addition to the serving check.
 
 ## parser
 

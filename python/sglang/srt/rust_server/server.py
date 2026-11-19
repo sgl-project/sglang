@@ -63,8 +63,9 @@ from sglang.srt.rust_server.config import (
 from sglang.srt.rust_server.multimodal import (
     MM_TRANSPORT_STATS,
     RUST_MM_FAMILIES,
+    RustMmAudioSpec,
+    RustMmModelSpec,
     RustMmProcessor,
-    RustMmSpec,
     settle_shm_buffers,
 )
 from sglang.srt.rust_server.warmups import (
@@ -208,7 +209,7 @@ class RustServer:
         self,
         server: Server,
         http_port: int,
-        mm_spec: Optional[RustMmSpec] = None,
+        mm_spec: Optional[RustMmModelSpec] = None,
         max_per_poll: int = 256,
     ):
         self.server = server
@@ -289,7 +290,7 @@ class RustServer:
         return load_rust_extension("sglang.srt.rust_extensions._server")
 
     @classmethod
-    def _resolve_multimodal(cls, scheduler: Scheduler) -> Optional[RustMmSpec]:
+    def _resolve_multimodal(cls, scheduler: Scheduler) -> Optional[RustMmModelSpec]:
         """Resolve the built-in Rust MM pipeline for a multimodal model, and
         refuse a model it cannot serve. ``launch`` calls this before the
         listener binds, so a refused model never accepts a connection. A
@@ -302,6 +303,13 @@ class RustServer:
             processor=scheduler.processor,
         ).resolve_spec()
         if mm_spec is None:
+            model_type = scheduler.model_config.hf_config.model_type
+            if model_type == "qwen3_asr":
+                raise RuntimeError(
+                    "Rust Qwen3-ASR requires SGLANG_EXPERIMENTAL_RUST_AUDIO=1, "
+                    "the supported Whisper processor config, and single-rank "
+                    "serving without P/D or multimodal overrides."
+                )
             supported = sorted(
                 set(chain.from_iterable(f.model_types for f in RUST_MM_FAMILIES))
             )
@@ -1248,13 +1256,17 @@ class RustServer:
             return b""
 
     @classmethod
-    def _build_mm_spec(cls, spec: RustMmSpec) -> MmSpec:
+    def _build_mm_spec(cls, spec: RustMmModelSpec) -> MmSpec:
         """The typed MM configuration for ``Server.start_mm_workers``: the
         :class:`RustMmSpec` fields the Rust pipeline consumes, as the Rust
         extension's own ``MmSpec`` class (same required-keyword contract as
         :func:`_build_server_args`; ``family`` / ``resample`` become the
         extension's ``MmFamily`` / ``MmResample`` enums)."""
         ext = cls._load_extension()
+        if isinstance(spec, RustMmAudioSpec):
+            return ext.MmSpec.qwen3_asr(
+                spec.audio_token_id, spec.audio_start_id, spec.audio_end_id
+            )
         family = {"qwen_vl": ext.MmFamily.QwenVl}[spec.family]
         resample = {"aten_u8": ext.MmResample.AtenU8, "pil": ext.MmResample.Pil}[
             spec.resample

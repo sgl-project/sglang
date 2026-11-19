@@ -1128,11 +1128,26 @@ impl MmSpec {
                 image_mean,
                 image_std,
                 resample: resample.into(),
+                video: None,
             }),
         };
         Self {
             feature_shm,
             pipeline,
+        }
+    }
+
+    #[staticmethod]
+    fn qwen3_asr(audio_token_id: i32, audio_start_id: i32, audio_end_id: i32) -> Self {
+        use sglang_processor::dynamo_multimodal::models::qwen3_asr::Qwen3AsrSpec;
+        use sglang_processor::dynamo_multimodal::registry::ProcessorSpec;
+        Self {
+            feature_shm: false,
+            pipeline: ProcessorSpec::Qwen3Asr(Qwen3AsrSpec {
+                audio_token_id,
+                audio_start_id,
+                audio_end_id,
+            }),
         }
     }
 }
