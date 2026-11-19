@@ -111,10 +111,11 @@ def situ_and_mul(
     out: Optional[torch.Tensor],
     beta: float,
     linear_beta: Optional[float],
+    cast: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> torch.Tensor:
     from .kimi_k3_situ_and_mul import situ_and_mul as impl
 
-    return impl(input, out, beta, linear_beta)
+    return impl(input, out, beta, linear_beta, cast)
 
 
 __all__ = [
@@ -148,6 +149,16 @@ register_kernel(
         op="activation.cast_to_float32_logits",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.activation.softcap:cast_to_float32_logits",
+        capabilities=CUDA_ONLY,
+    )
+)
+
+
+register_kernel(
+    KernelSpec(
+        op="activation.multimax",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.activation.multimax:multimax",
         capabilities=CUDA_ONLY,
     )
 )

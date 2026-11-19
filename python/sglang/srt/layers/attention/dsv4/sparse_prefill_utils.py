@@ -39,13 +39,12 @@ from typing import Dict, Optional, Tuple
 import torch
 
 from sglang.kernels.ops.attention.dsv4.dequant_k_cache import DIM_NOPE, DIM_ROPE
-from sglang.srt.utils.common import async_h2d
+from sglang.srt.utils.device import async_h2d
 
 # Bf16 workspace per-token width, matching ``dequantize_k_cache_paged_dsv4``'s
 # output: 448 fp8 nope (dequanted) + 64 bf16 rope = 512.
 WORKSPACE_DIM = DIM_NOPE + DIM_ROPE
 DSV4_Q8KV8_PREFILL_ENV = "SGLANG_DSV4_Q8KV8_PREFILL"
-DSV4_Q8KV8_PREFILL_LOG_ENV = "SGLANG_DSV4_Q8KV8_PREFILL_LOG"
 
 from sglang.kernels.ops.attention.dsv4.sparse_prefill_kernels import (
     SPARSE_PREFILL_TOPK_ALIGNMENT,

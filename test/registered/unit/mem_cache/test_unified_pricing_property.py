@@ -7,11 +7,9 @@ by the corner states (holes, a closed move gate, pending reuse behind an unfired
 forward, a pending host-cache reservation, a float with interior holes, a full
 allocator):
 
-- on a chain of two token ends, `can_reserve(n, n)` holds exactly when an
-  allocation of n tokens then succeeds;
-- on a chain whose window floats, the as-is price, the end-flush certificate and
-  the float retreat target each imply that the allocation succeeds, and a
-  positive byte shortfall implies that it fails;
+- on a chain of two token ends and on one whose window floats,
+  `ensure_capacity(n, n)` holds exactly when an allocation of n tokens then
+  succeeds, and asking it moves no page;
 - a refused allocation leaves every band's live pages as they were;
 - the snapshot the chain keeps between decisions equals a fresh one after
   writes and after move-gate flips.
@@ -24,15 +22,10 @@ import random
 import unittest
 from typing import Dict, List, Tuple
 
-from sglang.srt.mem_cache.kv.alloc.pricing import (
-    float_byte_shortfall,
-    float_can_reserve,
-    float_end_certificate,
-    float_high_target,
-)
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang.test.unified_allocator_fixtures import chain_snapshot, float_chain
+from sglang.test.token_demand import token_demand
+from sglang.test.unified_allocator_fixtures import chain_snapshot
 from sglang.test.unified_allocator_trace import (
     BuilderAdapter,
     HostModel,
@@ -106,13 +99,12 @@ def _live(adapter: BuilderAdapter) -> Dict[str, int]:
 class TestUnifiedPricingProperty(CustomTestCase):
     def _each_state(self, chain: str):
         for page_size in (1, 4):
-            for lazy in (False, True):
-                config = TraceConfig(chain=chain, page_size=page_size, lazy=lazy)
-                for name, ops in _states(config):
-                    available = _rebuild(config, ops).allocator.available_size()
-                    for extra in _PAGES_PAST_AVAILABLE:
-                        tokens = max(page_size, available + extra * page_size)
-                        yield config, name, ops, tokens
+            config = TraceConfig(chain=chain, page_size=page_size)
+            for name, ops in _states(config):
+                available = _rebuild(config, ops).allocator.available_size()
+                for extra in _PAGES_PAST_AVAILABLE:
+                    tokens = max(page_size, available + extra * page_size)
+                    yield config, name, ops, tokens
 
     def _allocate(self, adapter: BuilderAdapter, tokens: int) -> bool:
         before = _live(adapter)
@@ -121,37 +113,29 @@ class TestUnifiedPricingProperty(CustomTestCase):
             self.assertEqual(_live(adapter), before, "a refused allocation took pages")
         return out is not None
 
-    def test_two_token_ends_price_exactly(self):
-        for config, name, ops, tokens in self._each_state("swa"):
+    def _prices_exactly(self, chain: str):
+        for config, name, ops, tokens in self._each_state(chain):
             with self.subTest(config=config.key(), state=name, tokens=tokens):
                 adapter = _rebuild(config, ops)
-                priced = adapter.allocator.can_reserve(tokens, tokens)
+                before = chain_snapshot(adapter.allocator)
+                priced = adapter.allocator.ensure_capacity(
+                    token_demand(adapter.allocator, tokens, tokens)
+                )
+                self.assertEqual(chain_snapshot(adapter.allocator), before)
                 self.assertEqual(self._allocate(adapter, tokens), priced)
 
-    def test_float_chain_certificates_are_realized(self):
-        for config, name, ops, tokens in self._each_state("tri"):
-            with self.subTest(config=config.key(), state=name, tokens=tokens):
-                adapter = _rebuild(config, ops)
-                snap = chain_snapshot(adapter.allocator)
-                chain = float_chain(adapter.allocator)
-                as_is = float_can_reserve(snap, chain, tokens, tokens)
-                certified = float_end_certificate(snap, chain, tokens)
-                retreat = float_high_target(snap, chain, tokens) is not None
-                short = float_byte_shortfall(snap, chain, tokens) > 0
-                allocated = self._allocate(adapter, tokens)
-                if as_is or certified or retreat:
-                    self.assertTrue(allocated, (as_is, certified, retreat))
-                if short:
-                    self.assertFalse(allocated)
+    def test_two_token_ends_price_exactly(self):
+        self._prices_exactly("swa")
+
+    def test_float_chain_prices_exactly(self):
+        self._prices_exactly("tri")
 
     def test_kept_snapshot_follows_writes_and_gates(self):
         """The chain keeps one pricing snapshot until a band is written or a
         move gate's answer changes, which no capacity field records."""
         for chain in ("swa", "tri"):
             with self.subTest(chain=chain):
-                adapter = BuilderAdapter(
-                    TraceConfig(chain=chain, page_size=1, lazy=True)
-                )
+                adapter = BuilderAdapter(TraceConfig(chain=chain, page_size=1))
                 c = adapter.allocator
                 kept = c.pricing_snapshot()
                 self.assertIs(c.pricing_snapshot(), kept)

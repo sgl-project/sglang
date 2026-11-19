@@ -101,7 +101,7 @@ class Kandinsky6LatentPreparationStage(PipelineStage):
             video = torch.cat([video, cond, mask], dim=-1)
 
         num_audio_channels = arch.in_audio_dim
-        # align audio duration with request fps, not the pipeline default
+        # align audio duration with the request fps
         num_audio_frames = audio_latent_duration(
             num_latent_frames,
             fps=float(batch.fps),

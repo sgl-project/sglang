@@ -14,7 +14,11 @@ from unittest import mock
 
 from sglang.srt.rust_extensions import load_rust_extension
 from sglang.srt.rust_extensions import loader as rust_extension
-from sglang.srt.rust_extensions.torch_build import torch_build_configuration
+from sglang.srt.rust_extensions.torch_build import (
+    _MAX_SUPPORTED_TORCH,
+    _MIN_SUPPORTED_TORCH,
+    torch_build_configuration,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -534,8 +538,14 @@ crate-type = ["cdylib"]
             self.assertEqual(spaced_build.environment["CC_SHELL_ESCAPED_FLAGS"], "1")
             self.assertIn(f"'{spaced_header}'", spaced_build.environment["CXXFLAGS"])
 
-            fake_torch.__version__ = "2.15.0"
-            with self.assertRaisesRegex(RuntimeError, "PyTorch 2.11 through 2.14"):
+            fake_torch.__version__ = (
+                f"{_MAX_SUPPORTED_TORCH[0]}.{_MAX_SUPPORTED_TORCH[1] + 1}.0"
+            )
+            with self.assertRaisesRegex(
+                RuntimeError,
+                f"PyTorch {_MIN_SUPPORTED_TORCH[0]}.{_MIN_SUPPORTED_TORCH[1]} "
+                f"through {_MAX_SUPPORTED_TORCH[0]}.{_MAX_SUPPORTED_TORCH[1]}",
+            ):
                 torch_build_configuration(
                     compat_header=compat_header,
                     python_module="sglang.srt.mem_cache.rust_tree_core.mem_cache",

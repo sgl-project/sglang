@@ -5,7 +5,7 @@ import unittest
 
 from sglang.test.ci.ci_register import register_amd_ci
 
-register_amd_ci(est_time=450, suite="nightly-amd-1-gpu-mi35x", nightly=True)
+register_amd_ci(est_time=450, suite="nightly-test-1-gpu-amd-mi35x", nightly=True)
 import time
 from types import SimpleNamespace
 
@@ -13,7 +13,7 @@ import requests
 import torch
 
 from sglang.srt.utils import kill_process_tree
-from sglang.srt.utils.common import is_cuda_alike, is_gfx95_supported
+from sglang.srt.utils.device import is_cuda_alike, is_gfx95_supported
 from sglang.test.few_shot_gsm8k import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
