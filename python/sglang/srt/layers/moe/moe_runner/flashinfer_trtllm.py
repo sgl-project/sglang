@@ -1984,6 +1984,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
     quant_info: FlashInferTrtllmFp4MoeQuantInfo,
     runner_config: MoeRunnerConfig,
     use_routed_topk: bool = False,
+    combine_input_buffer: Optional[torch.Tensor] = None,
 ) -> StandardCombineInput:
     """FlashInfer TRTLLM FP4 MoE forward pass.
 
@@ -2101,15 +2102,25 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         output_dtype = (
             hidden_states.dtype if hidden_states_scale is None else torch.bfloat16
         )
-        # A padded kernel output is a scratch buffer; the sliced copy is the
-        # tensor that reaches the all-reduce.
-        symm_output = _get_fp4_moe_output_buffer(
-            num_tokens=num_tokens,
-            hidden_size=hidden_size,
-            dtype=output_dtype,
-            device=hs_fp4.device,
-            symmetric=hidden_pad == 0,
-        )
+        # Finalize into the A2A combine input buffer when the rows fill it exactly
+        # (SGLANG_OPT_MOE_A2A_OUTPUT_IN_WORKSPACE).
+        if (
+            combine_input_buffer is not None
+            and hidden_pad == 0
+            and combine_input_buffer.dtype == output_dtype
+            and combine_input_buffer.shape == (num_tokens, hidden_size)
+        ):
+            symm_output = combine_input_buffer
+        else:
+            # A padded kernel output is a scratch buffer; the sliced copy is the
+            # tensor that reaches the all-reduce.
+            symm_output = _get_fp4_moe_output_buffer(
+                num_tokens=num_tokens,
+                hidden_size=hidden_size,
+                dtype=output_dtype,
+                device=hs_fp4.device,
+                symmetric=hidden_pad == 0,
+            )
 
     # FlashInfer's small-batch finalize sums the top-k outputs in a different order
     # from its large-batch finalize (flashinfer-ai/flashinfer#8831), so a token's
@@ -2475,6 +2486,11 @@ def fused_experts_flashinfer_to_flashinfer_trtllm(
             quant_info,
             runner_config,
             use_routed_topk=True,
+            combine_input_buffer=(
+                None
+                if isinstance(dispatch_output, StandardDispatchOutput)
+                else dispatch_output.moe_output
+            ),
         )
     elif isinstance(quant_info, FlashInferTrtllmFp8MoeQuantInfo):
         mxfp8_dispatch = (

@@ -8,6 +8,7 @@ import torch
 
 from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.srt.arg_groups.overrides import flashinfer_a2a_max_dispatch_tokens_per_rank
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     get_dp_global_num_tokens,
     get_is_extend_in_batch,
@@ -43,6 +44,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     max_prefill_buffer_tokens,
 )
+from sglang.srt.utils.log_utils import print_info_once
 
 try:
     from flashinfer import nvfp4_block_scale_interleave
@@ -109,6 +111,27 @@ def _max_tokens_for_namespace(
             else _WorkspaceNamespace.DECODE
         )
     return max_num_tokens + int(namespace)
+
+
+def _trtllm_output_in_workspace_eligible(
+    runner_backend, namespace: _WorkspaceNamespace
+) -> bool:
+    """SGLANG_OPT_MOE_A2A_OUTPUT_IN_WORKSPACE with a TRT-LLM Gen runner; the first
+    decode dispatch then decides it from the dispatch type."""
+    if not envs.SGLANG_OPT_MOE_A2A_OUTPUT_IN_WORKSPACE.get():
+        return False
+    if runner_backend is not None and (
+        runner_backend.is_flashinfer_trtllm()
+        or runner_backend.is_flashinfer_trtllm_routed()
+    ):
+        return True
+    backend = "none" if runner_backend is None else runner_backend.value
+    print_info_once(
+        f"FlashInfer A2A ({namespace.name.lower()} workspace): "
+        "SGLANG_OPT_MOE_A2A_OUTPUT_IN_WORKSPACE is not used with MoE runner "
+        f"backend {backend}."
+    )
+    return False
 
 
 class FlashinferDispatchOutput(NamedTuple):
@@ -243,6 +266,10 @@ class FlashinferDispatcher(BaseDispatcher):
             else _WorkspaceNamespace.DECODE
         )
         self.decode_a2a_namespace = decode_namespace
+        self.trtllm_output_in_workspace = _trtllm_output_in_workspace_eligible(
+            runner_backend, decode_namespace
+        )
+        self.trtllm_output_in_workspace_logged = False
         self.moe_a2a = make_moe_a2a(decode_namespace)
         self.sp_prefill_moe_a2a = (
             make_moe_a2a(_WorkspaceNamespace.SP_PREFILL)
@@ -341,6 +368,30 @@ class FlashinferDispatcher(BaseDispatcher):
             if not (self.quant_config or {}).get("use_mxfp8", False):
                 return FlashinferA2ADispatchType.BF16
         return self.dispatch_type
+
+    def _trtllm_combine_input_buffer(
+        self, dispatch_type: FlashinferA2ADispatchType
+    ) -> Optional[torch.Tensor]:
+        engaged = dispatch_type == FlashinferA2ADispatchType.NVFP4
+        if not self.trtllm_output_in_workspace_logged:
+            self.trtllm_output_in_workspace_logged = True
+            workspace = self.decode_a2a_namespace.name.lower()
+            if engaged:
+                print_info_once(
+                    f"FlashInfer A2A ({workspace} workspace): TRT-LLM Gen MoE "
+                    "finalizes NVFP4 decode rows into the combine input buffer "
+                    "(SGLANG_OPT_MOE_A2A_OUTPUT_IN_WORKSPACE)."
+                )
+            else:
+                print_info_once(
+                    f"FlashInfer A2A ({workspace} workspace): "
+                    "SGLANG_OPT_MOE_A2A_OUTPUT_IN_WORKSPACE is not used with a "
+                    f"{dispatch_type.value} dispatch; it needs NVFP4."
+                )
+        if not engaged:
+            return None
+        # TRT-LLM Gen's FP4 runner emits BF16 rows for an NVFP4 dispatch.
+        return self.active_moe_a2a.get_combine_input_buffer(torch.bfloat16)
 
     @debug_kernel_api
     def dispatch(
@@ -505,6 +556,8 @@ class FlashinferDispatcher(BaseDispatcher):
             moe_output = None
             if self.payload_in_workspace:
                 moe_output = self.active_moe_a2a.get_combine_input_buffer(output_dtype)
+            elif self.trtllm_output_in_workspace and not is_sp_prefill:
+                moe_output = self._trtllm_combine_input_buffer(dispatch_type)
             return FlashinferDispatchOutput(
                 x,
                 x_sf,
