@@ -27,9 +27,10 @@ from sglang.kernels.ops.communication.muse_spark_all_gather import (
 from sglang.kernels.ops.layernorm.muse_spark_rmsnorm_nvfp4_quant import (
     fused_norm_fp4_quant_static,
 )
-from sglang.srt.distributed.comm_cleanup import register_comm_cleanup
-from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
-    CustomAllReduceV2,
+from sglang.srt.distributed.device_communicators.symm_workspace import (
+    WorkspaceLease,
+    WorkspaceRequest,
+    request_symm_workspace,
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -62,17 +63,26 @@ def _init():
     get_parallel().override_permanently(world_group=coord)
     atexit.register(dist.destroy_process_group)
     logging.disable(logging.INFO)
-    comm = CustomAllReduceV2(
+    lease = request_symm_workspace(
         coord.cpu_group,
         torch.device(f"cuda:{local_rank}"),
-        max_pull_size=0,
-        max_pull_blocks=0,
-        max_push_size=PUSH_BYTES,
-        max_push_blocks=PUSH_BLOCKS,
+        WorkspaceRequest(owner="test_muse_spark_fp4", push_slot_bytes=PUSH_BYTES),
     )
-    assert not comm.disabled
-    register_comm_cleanup(comm)
-    return coord, comm
+    assert lease is not None
+    return coord, _PushBlocksLease(lease)
+
+
+class _PushBlocksLease:
+    """The lease, launching the push plane at PUSH_BLOCKS instead of one block per SM."""
+
+    def __init__(self, lease: WorkspaceLease):
+        self._lease = lease
+
+    def __getattr__(self, name: str):
+        return getattr(self._lease, name)
+
+    def get_communicator(self):
+        return self._lease.get_communicator(push_blocks=PUSH_BLOCKS)
 
 
 def _assert_all_ranks(failures: list[str], context: str) -> None:
@@ -125,9 +135,8 @@ def test_matches_all_gather_then_norm_quant(rows: int, use_graph: bool):
         if use_graph:
             torch.cuda.synchronize()
             graph = torch.cuda.CUDAGraph()
-            with comm.capture():
-                with torch.cuda.graph(graph, stream=side):
-                    outs = _run_step(comm, local, weight, global_scale)
+            with torch.cuda.graph(graph, stream=side):
+                outs = _run_step(comm, local, weight, global_scale)
     torch.cuda.synchronize()
 
     for rnd in range(ROUNDS):

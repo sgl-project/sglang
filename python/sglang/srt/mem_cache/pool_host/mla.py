@@ -206,16 +206,35 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 self._native_buffers = buffer_info.buffers
                 self._native_infos = infos
                 native = self._native_buffers
+                self._v_dtype = self.dtype
+                if (
+                    layout in ("page_first_kv_split", "layer_first_kv_split")
+                    and self.dtype == torch.float8_e4m3fn
+                    and not self.dsa_kv_cache_store_fp8
+                    and native.v is not None
+                    and native.v.dtype == torch.bfloat16
+                ):
+                    # ModelSlim MLA stores FP8 latent and BF16 RoPE separately.
+                    self._v_dtype = native.v.dtype
+                    self._size_per_token = self.layer_num * (
+                        self.kv_lora_rank * self.dtype.itemsize
+                        + self.qk_rope_head_dim * self._v_dtype.itemsize
+                    )
                 index_layers = len(native.index_layer_indices)
                 if (
                     layout in ("page_first_kv_split", "layer_first_kv_split")
                     and native.index_k is not None
                 ):
+                    index_page_size = native.index_k.shape[2]
+                    index_compress_ratio = page_size // index_page_size
                     self._size_per_token += (
-                        native.index_width * self.dtype.itemsize * index_layers
+                        native.index_width
+                        * self.dtype.itemsize
+                        * index_layers
+                        // index_compress_ratio
                     )
                     if native.index_scales is not None:
-                        self._size_per_token += 4 * index_layers
+                        self._size_per_token += 4 * index_layers // index_compress_ratio
                 self.device_kv_buffers = ()
                 self.device_data_ptrs = None
             else:
@@ -338,20 +357,33 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             return super().get_mapping_lengths()
         native = self._native_buffers
         k_width = native.k_width if self.dsa_kv_cache_store_fp8 else self.kv_lora_rank
-        per_row_widths = [
-            self.layer_num * k_width * self.dtype.itemsize,
-            self.layer_num * self.qk_rope_head_dim * self.dtype.itemsize,
+        lengths = [
+            self.page_num
+            * self.page_size
+            * self.layer_num
+            * k_width
+            * self.dtype.itemsize,
+            self.page_num
+            * self.page_size
+            * self.layer_num
+            * self.qk_rope_head_dim
+            * self._v_dtype.itemsize,
         ]
         index_layers = len(native.index_layer_indices)
         if native.index_k is not None:
-            per_row_widths.append(
-                index_layers * native.index_width * self.dtype.itemsize
+            lengths.append(
+                self.page_num
+                * native.index_k.shape[2]
+                * index_layers
+                * native.index_width
+                * self.dtype.itemsize
             )
         if native.index_scales is not None:
             # FP32 scale mirror
-            per_row_widths.append(index_layers * 4)
-        rows = self.page_num * self.page_size
-        return [rows * width for width in per_row_widths]
+            lengths.append(
+                self.page_num * native.index_scales.shape[2] * index_layers * 4
+            )
+        return lengths
 
     def init_kv_buffer(self):
         if self.layout == "layer_first":
@@ -416,10 +448,15 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             # mirror uses (page, num_indexer_layers, ...).
             native = self._native_buffers
             base_dims = (self.page_num, self.layer_num, self.page_size, 1)
+            index_page_size = (
+                native.index_k.shape[2]
+                if native.index_k is not None
+                else self.page_size
+            )
             indexer_dims = (
                 self.page_num,
                 len(native.index_layer_indices),
-                self.page_size,
+                index_page_size,
                 1,
             )
             return self._init_kv_split_buffer(
@@ -458,6 +495,9 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         alloc_func = ALLOC_MEMORY_FUNCS[self._transfer_device.type]
         k_width = native.k_width if self.dsa_kv_cache_store_fp8 else self.kv_lora_rank
         v_width = 0 if self.dsa_kv_cache_store_fp8 else native.v_width
+        v_dtype = self.dtype
+        if v_width and native.v.dtype != native.k.dtype:
+            v_dtype = native.v.dtype
 
         reserve_mla_split_host_memory(
             num_pages=self.page_num,
@@ -466,6 +506,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             k_width=k_width,
             v_width=v_width,
             dtype=self.dtype,
+            v_dtype=v_dtype,
             buffers=native,
         )
         self.k_buffer = alloc_func(
@@ -485,7 +526,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         else:
             self.v_buffer = alloc_func(
                 (*base_dims, v_width),
-                dtype=self.dtype,
+                dtype=v_dtype,
                 device=self.device,
                 pin_memory=self.pin_memory,
                 allocator=self.allocator,
@@ -674,6 +715,15 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 **binding,
                 impl="auto",
             )
+            indexer = self._npu_indexer_layer_bindings.get(layer_id)
+            if indexer is not None:
+                ratio = self.page_size // indexer["page_size"]
+                transfer(
+                    device_indices=device_indices[::ratio] // ratio,
+                    host_indices=host_indices[::ratio] // ratio,
+                    **indexer,
+                    impl="auto",
+                )
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
@@ -753,6 +803,23 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
 
     def _init_npu_transfer_bindings(self):
         self._npu_layer_bindings = {}
+        self._npu_indexer_layer_bindings = {}
+        self._npu_indexer_backup = None
+        native = self._native_buffers
+        compressed_indexer = (
+            self.index_k_buffer is not None
+            and native.index_k.shape[2] != self.page_size
+        )
+        if compressed_indexer:
+            self._npu_indexer_backup = dict(
+                device_k=native.index_k,
+                host_k=self.index_k_buffer,
+                device_v=native.index_k.new_empty(0),
+                host_v=self.index_k_buffer.new_empty(0),
+                device_index_k_scale=native.index_scales,
+                host_index_k_scale=self.index_k_scale_buffer,
+                page_size=native.index_k.shape[2],
+            )
         pools = []
         layer_start = 0
         host_layer_axis = 0 if self.layout == "layer_first_kv_split" else 1
@@ -803,7 +870,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 )
                 if index_scale is not None and index_scale.ndim == 4:
                     index_scale = index_scale.unsqueeze(-1)
-                self._npu_layer_bindings[layer_id] = dict(
+                binding = dict(
                     device_k=layer_view(native.k, 0, device_layer),
                     host_k=layer_view(self.k_buffer, host_layer_axis, host_layer),
                     device_v=layer_view(native.v, 0, device_layer),
@@ -826,6 +893,30 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     device_index_layer_id=0 if slot is not None else None,
                     host_index_layer_id=0 if slot is not None else None,
                 )
+                if slot is not None and compressed_indexer:
+                    # Reuse the layer views for the separate Indexer copy.
+                    self._npu_indexer_layer_bindings[layer_id] = dict(
+                        device_k=binding["device_index_k"],
+                        host_k=binding["host_index_k"],
+                        device_v=binding["device_index_k"].new_empty(0),
+                        host_v=binding["host_index_k"].new_empty(0),
+                        device_index_k_scale=binding["device_index_k_scale"],
+                        host_index_k_scale=binding["host_index_k_scale"],
+                        page_size=index_k.shape[2],
+                        device_layer_id=0,
+                        host_layer_id=0,
+                        device_index_layer_id=0,
+                        host_index_layer_id=0,
+                    )
+                    binding.update(
+                        device_index_k=None,
+                        host_index_k=None,
+                        device_index_k_scale=None,
+                        host_index_k_scale=None,
+                        device_index_layer_id=None,
+                        host_index_layer_id=None,
+                    )
+                self._npu_layer_bindings[layer_id] = binding
             layer_start = layer_end
         self._npu_pool_bindings = tuple(pools)
 
@@ -1004,7 +1095,9 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 transfer = transfer_kv_all_layer_kv_split
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
+            indexer_backup = self._npu_indexer_backup
             for native, host_k, host_v, is_target in self._npu_pool_bindings:
+                copy_indexer_with_kv = is_target and indexer_backup is None
                 transfer(
                     device_indices=device_indices,
                     host_indices=host_indices,
@@ -1013,12 +1106,22 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     device_v=native.v,
                     host_v=host_v,
                     device_index_k=native.index_k,
-                    host_index_k=self.index_k_buffer if is_target else None,
+                    host_index_k=self.index_k_buffer if copy_indexer_with_kv else None,
                     device_index_k_scale=native.index_scales,
-                    host_index_k_scale=self.index_k_scale_buffer if is_target else None,
+                    host_index_k_scale=(
+                        self.index_k_scale_buffer if copy_indexer_with_kv else None
+                    ),
                     page_size=self.page_size,
                     impl="auto",
                 )
+                if is_target and indexer_backup is not None:
+                    ratio = self.page_size // indexer_backup["page_size"]
+                    transfer(
+                        device_indices=device_indices[::ratio] // ratio,
+                        host_indices=host_indices[::ratio] // ratio,
+                        **indexer_backup,
+                        impl="auto",
+                    )
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
@@ -1086,6 +1189,26 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
 
+    def get_hybrid_pool_buffer(self):
+        """Every physical host buffer one logical storage page spans.
+
+        ``get_page_buffer_meta`` emits one pointer per physical buffer and
+        Mooncake packs them into a single object per page, so each of them has
+        to be registered with the transfer engine.  Registering only
+        ``kv_buffer`` leaves the RoPE mirror and the DSA indexer buffers
+        unregistered, which forces those segments onto a copy fallback (and
+        fails outright on URAN/memfabric transfers).
+        """
+        buffers = [self.kv_buffer]
+        if self.layout == "page_first_kv_split":
+            # FP8 DSA packs V into K; the host V mirror holds no valid data.
+            if not getattr(self, "dsa_kv_cache_store_fp8", False):
+                buffers.append(getattr(self, "v_buffer", None))
+            # Indexer buffers exist only for physical Indexer layers.
+            buffers.append(getattr(self, "index_k_buffer", None))
+            buffers.append(getattr(self, "index_k_scale_buffer", None))
+        return [buf for buf in buffers if buf is not None and buf.numel() > 0]
+
     def get_page_buffer_meta(self, indices):
         """Return local buffer pointers and byte sizes for logical storage pages."""
         if self.dcp_size > 1 and self.layout == "page_first_kv_split":
@@ -1118,6 +1241,11 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             index_k_width = (
                 index_k_buffer.shape[-1] if index_k_buffer is not None else 0
             )
+            index_page_size = (
+                index_k_buffer.shape[2]
+                if index_k_buffer is not None
+                else self.page_size
+            )
             index_k_item_size = (
                 index_k_buffer.element_size() if index_k_buffer is not None else 0
             )
@@ -1142,20 +1270,25 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     ptr_list.append(v_ptr)
                 if index_k_buffer_data_ptr is not None:
                     # Host index_k layout is (page_num, num_indexer_layers,
-                    # page_size, 1, index_head_dim).
+                    # index_page_size, 1, index_head_dim).
                     ptr_list.append(
                         index_k_buffer_data_ptr
-                        + indices[index]
+                        + (indices[index] // self.page_size)
+                        * index_page_size
                         * num_indexer_layers
                         * index_k_width
                         * index_k_item_size
                     )
                 if scale_buffer_data_ptr is not None:
                     # Host scale layout is (page_num, num_indexer_layers,
-                    # page_size, 1, 1) FP32: one scale value per token per
+                    # index_page_size, 1, 1) FP32: one scale value per entry per
                     # indexer layer.
                     ptr_list.append(
-                        scale_buffer_data_ptr + indices[index] * num_indexer_layers * 4
+                        scale_buffer_data_ptr
+                        + (indices[index] // self.page_size)
+                        * index_page_size
+                        * num_indexer_layers
+                        * 4
                     )
             k_element_size = self.layer_num * k_item_size * self.page_size * k_width
             v_element_size = (
@@ -1165,9 +1298,9 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 * self.qk_rope_head_dim
             )
             index_k_element_size = (
-                num_indexer_layers * index_k_item_size * self.page_size * index_k_width
+                num_indexer_layers * index_k_item_size * index_page_size * index_k_width
             )
-            scale_element_size = num_indexer_layers * 4 * self.page_size
+            scale_element_size = num_indexer_layers * 4 * index_page_size
             element_size_list = []
             for _ in range(0, len(indices), self.page_size):
                 element_size_list.append(k_element_size)

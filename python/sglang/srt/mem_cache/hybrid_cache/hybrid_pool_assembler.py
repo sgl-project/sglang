@@ -1600,7 +1600,14 @@ def _build_sidecar_host_pool(
         config.buffer_info,
         layer_mapping=config.device_to_host_layer,
         target_device_layer_num=root.layer_num,
-        num_host_pages=root_host_pool.page_num,
+        # A replicated index-K spans every rank's slots, so the host mirror
+        # pages the widened transfer indices untranslated. A sharded one does
+        # not, and keeps the per-rank page count.
+        num_host_pages=(
+            root_host_pool.page_num
+            if dsa_shards_index_k()
+            else root_host_pool.page_num * root_host_pool.dcp_size
+        ),
         transfer_page_size=root_host_pool.page_size,
         layout=root_host_pool.layout,
         buffer_device=root.device,
@@ -1608,6 +1615,9 @@ def _build_sidecar_host_pool(
         layer_sharded=root.layer_shard_enabled,
         dcp_size=root_host_pool.dcp_size if dsa_shards_index_k() else 1,
         dcp_rank=root_host_pool.dcp_rank if dsa_shards_index_k() else 0,
+        # One L3 key covers the anchor's widened page either way: a sharded
+        # mirror spends one page per rank, a replicated one spends dcp_size.
+        storage_pages_per_key=(1 if dsa_shards_index_k() else root_host_pool.dcp_size),
         allocator_type=_get_allocator_type(),
     )
     host.start_layer, host.end_layer = root.start_layer, root.end_layer
@@ -1954,9 +1964,9 @@ def build_hicache_draft_sidecars(
 
     assert len(draft_device_pools) == 1
     draft_kv_pool = draft_device_pools[0]
+    router = draft_kv_pool.layer_router
     if (
-        draft_kv_pool.layer_router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None
-        or isinstance(draft_kv_pool, DeepSeekV4TokenToKVPool)
+        isinstance(draft_kv_pool, DeepSeekV4TokenToKVPool)
         or draft_kv_pool.follows_target_swa_ids
     ):
         return build_swa_draft_pools(
@@ -1964,10 +1974,23 @@ def build_hicache_draft_sidecars(
             tree_cache=tree_cache,
             target_window_host=target_window_host_pool(tree_cache),
         )
-    return build_full_draft_pools(
+    if router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is None:
+        return build_full_draft_pools(
+            draft_kv_pool=draft_kv_pool, tree_cache=tree_cache
+        )
+    # A hybrid draft keeps full-attention layers next to its SWA layers;
+    # both must be restored or the draft reads stale KV after a hit.
+    specs, entries = build_swa_draft_pools(
         draft_kv_pool=draft_kv_pool,
         tree_cache=tree_cache,
+        target_window_host=target_window_host_pool(tree_cache),
     )
+    if router.routes_to(IdSpaceKind.FULL):
+        full_specs, full_entries = build_full_draft_pools(
+            draft_kv_pool=router.view(IdSpaceKind.FULL), tree_cache=tree_cache
+        )
+        specs, entries = full_specs + specs, full_entries + entries
+    return specs, entries
 
 
 _COMPONENT_HOST_ATTR: dict[ComponentType, tuple[str, str]] = {
@@ -2028,13 +2051,6 @@ class StackStrategy:
         raise NotImplementedError
 
 
-def _delegate_c128_host_evict(cache, n: int) -> int:
-    """Delegate C128 host pressure to FULL leaf eviction.
-
-    For example, ``n`` C128 slots request ``n * 128`` FULL tokens."""
-    return cache.evict_host(n * 128, ComponentType.FULL)
-
-
 class _DeepSeekV4Strategy(StackStrategy):
     def owns(self, kvcache):
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
@@ -2081,9 +2097,9 @@ class _DeepSeekV4Strategy(StackStrategy):
             storage_backend=storage_backend,
             host_swa_evict_fn=lambda n: cache.evict_host(n, ComponentType.SWA),
             device_swa_evict_fn=lambda n: _evict_swa_for_device_alloc(cache, n),
-            # _delegate_c128_host_evict converts C128 slots to FULL tokens.
+            # C128's host eviction counts reclaimed summary slots directly.
             host_c128_evict_fn=(
-                (lambda n: _delegate_c128_host_evict(cache, n))
+                (lambda n: cache.evict_host(n, ComponentType.C128))
                 if independent_c128
                 else None
             ),

@@ -1,7 +1,7 @@
-"""Multicast all-gather of bf16 column slices through the CustomAllReduceV2 push workspace.
+"""Multicast all-gather of bf16 column slices through the TP symmetric workspace.
 
 ``out[:, rank slice] = local`` (+ b) (+ c) for every rank's ``[M, N / world]``
-slice: one kernel multicast-stores the slice into every peer's push workspace
+slice: one kernel multicast-stores the slice into every peer's push slots
 and Lamport-spins the full rows together. Any TP world size; needs the plane's
 multicast mapping. The column-parallel projection that produces the slices
 lives in ``sglang.srt.layers.communication.muse_spark_gemm_ag``.
@@ -27,8 +27,8 @@ from sglang.kernels.jit.utils import (
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
-    from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
-        CustomAllReduceV2,
+    from sglang.srt.distributed.device_communicators.symm_workspace import (
+        WorkspaceLease,
     )
 
 SMALL_PROJECTION_MAX_TOKENS = 8
@@ -55,7 +55,7 @@ POOLER_TP4_MAX_TOKENS = 1024
 
 
 def gemm_ag_supported(
-    comm: Optional[CustomAllReduceV2],
+    comm: Optional[WorkspaceLease],
     x: torch.Tensor,
     weight: torch.Tensor,
     pooler: bool = False,
@@ -63,16 +63,7 @@ def gemm_ag_supported(
     """``pooler`` selects the pre-expert projection's rule: TP4/TP8 on SM103 or SM107 (the
     unpooler measured faster on the gather path on SM103 only) and up to POOLER_TP4_MAX_TOKENS at TP4;
     both keep the B200 TP8 rule up to B200_PROJECTION_MAX_TOKENS."""
-    from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
-        CustomAllReduceV2,
-    )
-
-    if (
-        not isinstance(comm, CustomAllReduceV2)
-        or comm.disabled
-        or not comm.has_multicast
-        or comm.world_size < 2
-    ):
+    if comm is None or not comm.has_multicast or comm.world_size < 2:
         return False
     if x.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16 or x.dim() != 2:
         return False
@@ -95,13 +86,13 @@ def gemm_ag_supported(
         )
         and weight.shape[1] == k
         and n % (comm.world_size * _VEC) == 0
-        and m * n * 2 <= comm.max_push_size
+        and m * n * 2 <= comm.request.push_slot_bytes
         and weight.is_contiguous()
     )
 
 
 def all_gather(
-    comm: CustomAllReduceV2,
+    comm: WorkspaceLease,
     local: torch.Tensor,
     out: torch.Tensor,
     b: Optional[torch.Tensor] = None,
@@ -109,7 +100,7 @@ def all_gather(
 ) -> torch.Tensor:
     """``out[:, rank slice] = local`` gathered from every rank, (+ b) (+ c)."""
     _jit_module(out.shape[1], comm.world_size).run(
-        comm.obj, local.contiguous(), b, c, out
+        comm.get_communicator(), local.contiguous(), b, c, out
     )
     return out
 
@@ -137,7 +128,7 @@ def all_gather_norm_fp4_quant_supported(local: torch.Tensor, n: int) -> bool:
 
 
 def all_gather_norm_fp4_quant(
-    comm: CustomAllReduceV2,
+    comm: WorkspaceLease,
     local: torch.Tensor,
     weight: Optional[torch.Tensor],
     eps: float,
@@ -158,7 +149,7 @@ def all_gather_norm_fp4_quant(
     fp4 = torch.empty(m, n // 2, dtype=torch.uint8, device=local.device)
     sf = torch.empty(m, n // 16, dtype=torch.uint8, device=local.device)
     _norm_quant_module(n, comm.world_size).run(
-        comm.obj,
+        comm.get_communicator(),
         local.contiguous(),
         weight,
         global_scale.reshape(1),

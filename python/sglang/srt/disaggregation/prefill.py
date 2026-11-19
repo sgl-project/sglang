@@ -70,6 +70,7 @@ from sglang.srt.disaggregation.utils import (
     setup_state_kv_args,
     state_indices_per_entry,
 )
+from sglang.srt.distributed.pp_sync_window import PPSyncSendWindow
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import is_cp_sharded_padded
 from sglang.srt.layers.cp.utils import get_cp_sharded_padded_cache_transfer_indices
@@ -109,6 +110,7 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_parallel,
     get_schedule,
+    get_spec,
 )
 from sglang.srt.utils import is_npu, rank_consensus_checker
 from sglang.srt.utils.device import async_d2h
@@ -310,7 +312,11 @@ class PrefillBootstrapQueue:
             shard_size=self.scheduler.kv_shard_widening,
         )
         self.transfer_backend = transfer_backend
-        self.pp_poll_sync_work_list: List = []
+        # The PP loop runs pp_size + pp_async_batch_depth rounds deep; the poll
+        # forwards must stay un-waited that long or they lock the ranks together.
+        self.pp_poll_send_window = PPSyncSendWindow(
+            parallel.pp_size + parallel.pp_async_batch_depth
+        )
         if envs.SGLANG_DISAGG_STAGING_BUFFER.get():
             if self.is_mla_backend:
                 raise RuntimeError(
@@ -455,6 +461,7 @@ class PrefillBootstrapQueue:
             self.scheduler.model_config.num_hidden_layers,
             window_tails=storage.retained_window_lengths(),
             draft_kv_ring=self.draft_kv_ring,
+            empty_draft_kv_ring=get_spec().speculative_dflash_draft_kv_ring,
         )
 
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
@@ -608,7 +615,7 @@ class PrefillBootstrapQueue:
                 self.scheduler.pp_group,
                 self.pp_rank,
                 self.pp_size,
-                self.pp_poll_sync_work_list,
+                self.pp_poll_send_window,
             )
         else:
             polls = poll_and_all_reduce_attn_cp_tp_group(
@@ -1463,6 +1470,7 @@ class SchedulerDisaggregationPrefillMixin:
             maybe_release_metadata_buffer(
                 req, self.req_to_metadata_buffer_idx_allocator
             )
+            self._release_mm_inputs(req)
 
         return done_reqs
 
@@ -1575,7 +1583,11 @@ class SchedulerDisaggregationPrefillMixin:
         reqs_to_exclude = set()
         if (req := self.chunked_req) is not None:
             reqs_to_exclude.add(req)
-            self.checkpoint_disagg_prefill(req)
+            # A parked chunk (add_chunked_req found no budget) leaves extend_end
+            # at prefix_len: it computed no new KV to checkpoint or send.
+            computed = req.extend_end > req.prefix_len
+            if computed:
+                self.checkpoint_disagg_prefill(req)
 
             if not self.check_bootstrap(req):
                 # A failed bootstrap released the request, emptying the slot.
@@ -1591,13 +1603,13 @@ class SchedulerDisaggregationPrefillMixin:
                     if req.inflight_steps == 0:
                         self.optimistic_release_and_requeue(req)
                 # else: still bootstrapping, keep computing without sending
-            elif self.enable_overlap:
+            elif computed and self.enable_overlap:
                 # Delay KV transfer to process_batch_result_disagg_prefill when overlap is enabled to ensure results are resolved
                 req.tmp_end_idx = min(
                     req.extend_end,
                     len(req.origin_input_ids),
                 )
-            else:
+            elif computed:
                 self.send_kv_chunk(req)
 
             if self.chunked_req is not None:
@@ -1723,11 +1735,16 @@ class SchedulerDisaggregationPrefillMixin:
 
         sender = req.disagg_kv_sender
         # The schedule stream may wait on the in-flight forward. A sender that takes
-        # host-tensor indices waits on their copy's event itself, so the scheduler
-        # never blocks on these device reads.
-        host_indices = getattr(sender, "supports_host_tensor_indices", False) and not (
-            sender.kv_mgr.enable_all_cp_ranks_for_transfer
-            and not get_parallel().enable_dsa_cache_layer_split
+        # host-tensor indices waits on their copy's event itself. CP and shard
+        # filtering read the indices on the scheduler before that wait, so those
+        # paths need a completed host copy even with CP-TP group sharing.
+        host_indices = (
+            getattr(sender, "supports_host_tensor_indices", False)
+            and sender.kv_mgr.kv_shard_size <= 1
+            and not (
+                sender.kv_mgr.enable_all_cp_ranks_for_transfer
+                and not get_parallel().enable_dsa_cache_layer_split
+            )
         )
 
         def page_indices_of(kv_indices: torch.Tensor):
@@ -1857,6 +1874,8 @@ class SchedulerDisaggregationPrefillMixin:
 
             def _draft_ring_payload():
                 ring = self.disagg_prefill_bootstrap_queue.draft_kv_ring
+                if ring is None:
+                    return None
                 return ring.transfer_rows(int(req.kv.req_pool_idx), seq_len)
 
             def _request_row_payload():
