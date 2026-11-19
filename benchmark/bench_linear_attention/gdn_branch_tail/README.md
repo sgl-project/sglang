@@ -1,15 +1,36 @@
 # Hybrid Linear branch and tail checkpoints: GDN implementation
 
-Hybrid prefix reuse requires a recoverable Linear state at the cached boundary,
-including the convolution history and recurrent state at the same token depth.
-When an extend tracks only one boundary, selecting an interior branch can leave
-its computed aligned prompt tail without a separate checkpoint. Retaining both
-requires independent state ownership for the two boundaries.
+[SGLang #50059](https://github.com/sgl-project/sglang/pull/50059) describes an
+SWA failure mode where a branch-only checkpoint leaves the computed prompt-end
+window unavailable to later turns. Its consecutive-miss diagnosis concerns
+single-chunk prefill followed by Decode beyond one SWA window.
+
+The affected Mamba/Linear `extra_buffer` path has a related placement constraint:
+an interior branch can occupy the final Prefill extend's single tracked state
+boundary, leaving its computed aligned tail without a separate recoverable
+state. Each boundary needs its own convolution history and recurrent state at
+the same token depth.
 
 This patch implements that pattern for GDN: it captures the branch into one
 spare state slot while native tracking captures the aligned tail in the same
-forward, without splitting the extend. See the [backend evidence index](backend-evidence.md)
-for the mechanism comparison and the separately validated KDA prototype.
+forward, without splitting the extend. Both states are captured in that forward;
+publication follows the existing checkpoint policy.
+
+The registered TP1/TP2 reproduction uses a 6,049-token producer and a continuation
+with an additional 64-token suffix:
+
+| Registered reproduction | Native | Feature enabled |
+| --- | --- | --- |
+| Producer prefill chunks | 4,096 + 1,953 | 4,096 + 1,953 |
+| Independent branch probe: cached tokens | 5,952 | 5,952 |
+| Continuation after short Decode: cached tokens | 5,952 | 6,016 |
+| Continuation tokens to prefill (6,113 minus cached) | 161 | 97 |
+
+Short Decode here means one or 32 generated tokens. Branch and continuation
+probes independently rebuild the initial tree. These results demonstrate
+separate branch and aligned-tail reuse; they do not establish the consecutive
+miss chain measured in #50059. The 128-token Decode result and publication
+limitations are described below.
 
 Enable it with `SGLANG_EXPERIMENTAL_GDN_BRANCH_AND_TAIL=1`. It defaults to
 disabled. The first supported configuration uses the
@@ -53,8 +74,9 @@ The registered end-to-end test independently rebuilds the tree for the branch
 and continuation probes. A 6,049-token producer executes as 4,096 + 1,953 tokens.
 The branch probe resumes at 5,952 in both modes. With one or 32 generated tokens,
 the input-only continuation resumes at 5,952 with native tracking and at 6,016
-with the optional capture. The test also covers 128-token Decode and records
-teacher-forced suffix logprobs against cold and native-restored controls.
+with the optional capture. At 128 generated tokens the input-only continuation
+resumes at 5,952 in both modes. The test also records teacher-forced suffix
+logprobs against cold and native-restored controls.
 
 ```bash
 python3 test/registered/unit/mem_cache/unified_radix_cache/test_gdn_branch_tail_cache.py
@@ -103,7 +125,10 @@ continuation and combined latency separately. The directed sample establishes
 a conditional benefit. Coverage and overall service performance require their
 own workload measurements.
 
-The branch/tail placement problem and the two-checkpoint direction were
-discussed in [SGLang #45379](https://github.com/sgl-project/sglang/pull/45379).
-[SGLang #50059](https://github.com/sgl-project/sglang/pull/50059) supplies related
-SWA publication and ownership regression examples.
+## Other Linear backends
+
+The recovery constraint applies across hybrid Linear backends, while snapshot
+capture depends on the backend's state representation. The separate KDA
+prototype provides kernel-state and suffix-continuation evidence; KDA is not
+enabled by this patch. The [backend evidence index](backend-evidence.md) records
+the mechanism comparison, tested versions and validation boundaries.
