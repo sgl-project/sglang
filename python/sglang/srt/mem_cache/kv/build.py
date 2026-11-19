@@ -6,10 +6,12 @@ token views and one `ChainAllocator` over all of them.
 """
 
 import logging
+from functools import partial
 from typing import Any, Optional, Sequence
 
 import msgspec
 
+from sglang.srt.layers.attention.qsa.config import QSAProfile
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.decl import (
@@ -60,6 +62,7 @@ class UnifiedBuildContext(msgspec.Struct, frozen=True, kw_only=True):
     # Per-rank model KV geometry, including when the owner stores MLA latents.
     head_num: Optional[int] = None
     head_dim: Optional[int] = None
+    qsa_profile: Optional[QSAProfile] = None
     # The request table (every plan) and the state storage (a plan with state).
     max_num_reqs: int = 0
     model_context_len: int = 0
@@ -239,7 +242,14 @@ def build_kv_storage(
     kv_size = sized.full_tokens if window is None else arena.num_entries(owner.name) - 1
     owner_spec = owner.spec
     owner_is_mha = isinstance(owner_spec, MHASubPoolSpec)
-    token_to_kv_pool = RoutedKVCache(
+    cache_class = RoutedKVCache
+    if ctx.qsa_profile is not None:
+        from sglang.srt.mem_cache.kv.qsa import QSAUnifiedKVCache
+
+        cache_class = partial(
+            QSAUnifiedKVCache, profile=ctx.qsa_profile, request_memory=request_memory
+        )
+    token_to_kv_pool = cache_class(
         arena=arena,
         owner=owner.name,
         layer_maps=[

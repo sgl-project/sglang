@@ -51,7 +51,52 @@ def resolve_qsa_indexer_dtype(name: str) -> torch.dtype:
     )
 
 
-class QSATokenToKVPool(HybridLinearKVPool):
+class QSAIndexAccess:
+    """Indexer buffer access common to static and unified QSA storage."""
+
+    index_state_dtype = torch.bfloat16
+
+    def get_qsa_key_state_buffer(self, layer_id: int) -> torch.Tensor:
+        return self.qsa_key_state_buffer_pool[
+            self._transfer_full_attention_id(layer_id)
+        ]
+
+    def set_qsa_key_state_buffer(
+        self, layer_id: int, loc: torch.Tensor, token_k: torch.Tensor
+    ) -> None:
+        buffer = self.get_qsa_key_state_buffer(layer_id)
+        buffer[loc.long()] = token_k.to(buffer.dtype)
+
+    def set_qsa_rope_position_buffer(
+        self, loc: torch.Tensor, positions: torch.Tensor
+    ) -> None:
+        positions = positions.long()
+        if positions.ndim == 1:
+            positions = positions.unsqueeze(0).expand(3, -1)
+        if positions.ndim != 2 or positions.shape[0] != 3:
+            raise ValueError(
+                f"QSA RoPE positions must be [tokens] or [3, tokens], got {positions.shape}"
+            )
+        self.qsa_rope_position_buffer[loc.long()] = positions.transpose(0, 1)
+
+    def get_qsa_rope_position_buffer(self, loc: torch.Tensor) -> torch.Tensor:
+        return self.qsa_rope_position_buffer[loc.long()]
+
+    def get_qsa_compressed_k_buffer(self, layer_id: int) -> torch.Tensor:
+        # The indexer reads compressed keys before attention reads the full KV.
+        self._wait_for_layer(layer_id)
+        return self.qsa_compressed_k_buffer_pool[
+            self._transfer_full_attention_id(layer_id)
+        ]
+
+    def set_qsa_compressed_k_buffer(
+        self, layer_id: int, loc: torch.Tensor, compressed_k: torch.Tensor
+    ) -> None:
+        buffer = self.get_qsa_compressed_k_buffer(layer_id)
+        buffer[loc.long()] = compressed_k.to(buffer.dtype)
+
+
+class QSATokenToKVPool(QSAIndexAccess, HybridLinearKVPool):
     """Hybrid KV pool with the minimal BF16 state required by simple QSA."""
 
     def get_device_pool_infos(self) -> tuple[DevicePoolInfo, ...]:
@@ -74,8 +119,6 @@ class QSATokenToKVPool(HybridLinearKVPool):
     # ``compressed_slot = full_slot // ratio`` needs no ownership bookkeeping;
     # lifecycle rides the full-KV allocator and radix tree.
     # Full slot 0 is the reserved padding slot; compressed slot 0 is the inert dump.
-    # Pending-ring dtype: the raw keys are averaged from here, so it stays bf16.
-    index_state_dtype = torch.bfloat16
 
     @classmethod
     def qsa_bytes_per_token(
@@ -246,45 +289,6 @@ class QSATokenToKVPool(HybridLinearKVPool):
         ]
         k_size, v_size = self.get_kv_size_bytes()
         self.mem_usage = (k_size + v_size) / GB
-
-    def get_qsa_key_state_buffer(self, layer_id: int) -> torch.Tensor:
-        return self.qsa_key_state_buffer_pool[
-            self._transfer_full_attention_id(layer_id)
-        ]
-
-    def set_qsa_key_state_buffer(
-        self, layer_id: int, loc: torch.Tensor, token_k: torch.Tensor
-    ) -> None:
-        buffer = self.get_qsa_key_state_buffer(layer_id)
-        buffer[loc.long()] = token_k.to(buffer.dtype)
-
-    def set_qsa_rope_position_buffer(
-        self, loc: torch.Tensor, positions: torch.Tensor
-    ) -> None:
-        positions = positions.long()
-        if positions.ndim == 1:
-            positions = positions.unsqueeze(0).expand(3, -1)
-        if positions.ndim != 2 or positions.shape[0] != 3:
-            raise ValueError(
-                f"QSA RoPE positions must be [tokens] or [3, tokens], got {positions.shape}"
-            )
-        self.qsa_rope_position_buffer[loc.long()] = positions.transpose(0, 1)
-
-    def get_qsa_rope_position_buffer(self, loc: torch.Tensor) -> torch.Tensor:
-        return self.qsa_rope_position_buffer[loc.long()]
-
-    def get_qsa_compressed_k_buffer(self, layer_id: int) -> torch.Tensor:
-        # The indexer reads compressed keys before attention reads the full KV.
-        self._wait_for_layer(layer_id)
-        return self.qsa_compressed_k_buffer_pool[
-            self._transfer_full_attention_id(layer_id)
-        ]
-
-    def set_qsa_compressed_k_buffer(
-        self, layer_id: int, loc: torch.Tensor, compressed_k: torch.Tensor
-    ) -> None:
-        buffer = self.get_qsa_compressed_k_buffer(layer_id)
-        buffer[loc.long()] = compressed_k.to(buffer.dtype)
 
     @staticmethod
     def _get_paged_state_buf_infos(tensors, page_size: int):

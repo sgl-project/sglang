@@ -36,7 +36,20 @@ def _qwen4_exp_overrides(server_args: Any, hf_config: Any) -> dict:
             "state descriptors across pipeline stages."
         )
     if cfg.enable_unified_memory:
-        raise ValueError("Qwen4-Exp does not support --enable-unified-memory yet")
+        if (cfg.disaggregation_mode != "null" or cfg.pp_size != 1
+                or cfg.dcp_size > 1 or cfg.attn_cp_size > 1 or cfg.enable_prefill_cp
+                or cfg.speculative_algorithm is not None or cfg.enable_hierarchical_cache
+                or not cfg.disable_radix_cache):
+            raise ValueError(
+                "Qwen4-Exp unified memory currently supports colocated eager inference "
+                "with --disable-radix-cache, PP1, no CP, no HiCache and no speculative decoding"
+            )
+        if (cfg.cuda_graph_backend_decode != "disabled"
+                or cfg.cuda_graph_backend_prefill != "disabled"):
+            raise ValueError(
+                "Qwen4-Exp unified memory requires --cuda-graph-backend-decode disabled "
+                "and --cuda-graph-backend-prefill disabled"
+            )
     overrides: Dict[str, Any] = {}
 
     if cfg.ple_offload_embedding is None:

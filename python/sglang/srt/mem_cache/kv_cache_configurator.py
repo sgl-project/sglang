@@ -35,6 +35,7 @@ from sglang.srt.configs.model_config import (
     is_deepseek_v4,
     is_kimi_k31,
     is_minimax_sparse,
+    is_qwen4_exp,
     is_unlimited_ocr_v2,
     mla_attention_dcp_size,
     uses_compressed_kv_attention,
@@ -1121,6 +1122,13 @@ class KVCacheConfigurator:
             **state,
         )
 
+    def _unified_qsa_profile(self):
+        if not is_qwen4_exp(self.model_config.hf_config):
+            return None
+        from sglang.srt.layers.attention.qsa.config import parse_qsa_profile
+
+        return parse_qsa_profile(self.model_config.hf_config)
+
     def _init_unified_pools(self, *, sizes: _PoolSizes) -> KVStorage:
         """Build the unified pool stack: one byte buffer shared by every sub-pool
         this runner's layers declare, with virtual ids above the allocator."""
@@ -1153,6 +1161,7 @@ class KVCacheConfigurator:
                     get_parallel().attn_tp_size, get_parallel().attn_dcp_size
                 ),
                 head_dim=self.model_config.head_dim,
+                qsa_profile=self._unified_qsa_profile(),
                 max_num_reqs=sizes.max_running_requests,
                 model_context_len=self.model_config.context_len,
                 extra_max_context_len=extra_max_context_len,
@@ -3256,13 +3265,27 @@ class KVCacheConfigurator:
                     "Unified KV sizing requires the draft payload in the storage "
                     "plan; a separate private draft pool is not budgeted."
                 )
+            layers = self._kv_layer_decls()
+            qsa_profile = self._unified_qsa_profile()
+            qsa_parts = {}
+            if qsa_profile is not None:
+                from sglang.srt.mem_cache.kv.qsa import qsa_storage_parts
+                from sglang.srt.mem_cache.qsa_kv_pool import resolve_qsa_indexer_dtype
+
+                qsa_parts = qsa_storage_parts(
+                    layers,
+                    qsa_profile,
+                    self.page_size,
+                    resolve_qsa_indexer_dtype(get_model().qsa_indexer_dtype),
+                )
             self._unified_plan = plan_kv_storage(
-                self._kv_layer_decls(),
+                layers,
                 page_size=self.page_size,
                 fused_draft=placement,
                 speculative_num_draft_tokens=None
                 if _pd_prefill_skips_mamba_spec_state()
                 else max_speculative_num_draft_tokens(),
+                **qsa_parts,
             )
         from sglang.srt.mem_cache.kv.decl import StateLifetime, WindowLifetime
 
