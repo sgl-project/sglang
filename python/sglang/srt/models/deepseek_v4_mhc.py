@@ -389,9 +389,11 @@ def _mix_stats_impl(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
 
     bf16_decode_grid = (
         bf16_parts is not None
-        and get_platform().is_sm100
-        and get_platform().device_sm != 107
         and x_flat.shape[0] <= 256
+        and (
+            (get_platform().is_sm100 and get_platform().device_sm != 107)
+            or get_platform().is_sm120
+        )
     )
     use_bf16_projection = bf16_parts is not None and (
         hopper_medium or bf16_decode_grid or 4096 <= x_flat.shape[0] <= 65536
