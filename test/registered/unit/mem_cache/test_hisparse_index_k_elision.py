@@ -3,15 +3,16 @@
 CPU-only layout tests; these do not establish GPU/PD generation parity.
 """
 
-from contextlib import nullcontext
+import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 import torch
 
+from sglang.srt.arg_groups.hisparse_hook import HISPARSE_VALIDATED_SPEC_ALGORITHMS
 from sglang.srt.mem_cache import kv_cache_configurator as kcc
-from sglang.srt.mem_cache.index_key_cache import IndexKeyCache
+from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.model_executor.pool_configurator import DefaultPoolConfigurator
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -46,11 +47,8 @@ PP_STAGES = [
 @pytest.mark.parametrize("ratio", [2, 16, 32])
 @pytest.mark.parametrize("shared", [False, True])
 def test_pp_pool_mask_allocation_and_budget(start, end, ratio, shared):
-    """Exercise the real pool builder's mask, allocator and sizing on each stage.
-
-    Only the GPU MLA pool constructor is intercepted. The index-K allocation
-    below uses its actual implementation on CPU with a small logical pool.
-    """
+    """Build each stage's real HiSparse pool on CPU with a small logical pool;
+    its index-K allocation and the sizing must count the same producers."""
     n = end - start
     types = ["full" if i in PRODUCERS or not shared else "shared" for i in range(78)]
     hf = SimpleNamespace(
@@ -75,6 +73,7 @@ def test_pp_pool_mask_allocation_and_budget(start, end, ratio, shared):
             kv_cache_dtype=torch.float8_e4m3fn,
             pool_page_size=64,
             mambaish_config=None,
+            kv_shard_rank=None,
             model_config=SimpleNamespace(
                 hf_config=hf,
                 kv_lora_rank=512,
@@ -90,54 +89,40 @@ def test_pp_pool_mask_allocation_and_budget(start, end, ratio, shared):
             patch.object(kcc, "_is_npu", False),
             patch.object(kcc, "calculate_mla_kv_cache_dim", return_value=656),
             patch.object(kcc, "reject_out_of_tree_path"),
-            patch.object(kcc, "HiSparseDSATokenToKVPool") as pool_cls,
         ):
-            kcc.KVCacheConfigurator._build_dsa_kv_pool(
+            pool = kcc.KVCacheConfigurator._build_dsa_kv_pool(
                 kvc,
                 max_total_num_tokens=128,
                 max_running_requests=8,
                 dsa_pool_class=object,
             )
-            kwargs = pool_cls.call_args.kwargs
-            mask = kwargs["skip_topk_layers"]
-            expected = [types[i] == "shared" for i in range(start, end)]
-            assert mask == expected
-            assert kwargs["layer_num"] == n  # MLA KV still has every layer.
-            assert kwargs["host_to_device_ratio"] == ratio
             cell = DefaultPoolConfigurator._compute_dsa_indexer_cell_size(
                 None,
                 kvc=kvc,
                 num_layers=n,
             )
+        expected = [types[i] == "shared" for i in range(start, end)]
+        assert isinstance(pool, HiSparseDSATokenToKVPool)
+        assert pool.skip_topk_layers == expected
+        assert len(pool.kv_buffer) == n  # MLA KV still has every layer.
         producer_count = expected.count(False)
         assert cell == producer_count * 132 * ratio
 
         logical_tokens = 128 * ratio
-        pool = SimpleNamespace(
-            layer_num=n,
-            page_size=64,
-            index_page_size=64,
-            index_kpool=1,
-            index_head_dim=128,
-            quant_block_size=128,
-            index_k_with_scale_buffer_dtype=torch.uint8,
-            device="cpu",
-            skip_topk_layers=mask,
-            custom_mem_pool=None,
-            memory_saver_adapter=SimpleNamespace(region=lambda _: nullcontext()),
-        )
-        cache = IndexKeyCache(pool, logical_tokens)
-        assert len(cache.buffer) == n  # Zero-row placeholders retain layer IDs.
+        assert pool.index_buf_size == logical_tokens
         pages = (logical_tokens + 65) // 64
-        for buf, skip in zip(cache.buffer, mask):
-            assert buf.shape == (0 if skip else pages, 64 * 132)
-        assert sum(b.nbytes for b in cache.buffer) == producer_count * pages * 64 * 132
-        _, lengths, strides = cache.state_buf_infos()
-        assert lengths == [0 if skip else pages * 64 * 132 for skip in mask]
-        assert strides == [0 if skip else 64 * 132 for skip in mask]
+        buffers = pool.index_k_with_scale_buffer
+        # Zero-row placeholders retain layer IDs.
+        assert [tuple(buf.shape) for buf in buffers] == [
+            (0 if skip else pages, 64 * 132) for skip in expected
+        ]
+        assert sum(buf.nbytes for buf in buffers) == producer_count * pages * 64 * 132
+        _, lengths, strides = pool.get_state_buf_infos()
+        assert lengths == [0 if skip else pages * 64 * 132 for skip in expected]
+        assert strides == [0 if skip else 64 * 132 for skip in expected]
 
 
-@pytest.mark.parametrize("algorithm", [None, "EAGLE", "EAGLE3", "STANDALONE"])
+@pytest.mark.parametrize("algorithm", [None, *HISPARSE_VALIDATED_SPEC_ALGORITHMS])
 @pytest.mark.parametrize("draft", [False, True])
 def test_speculative_and_draft_paths_remain_dense(algorithm, draft):
     with (
@@ -161,3 +146,7 @@ def test_external_linker_guard_is_preserved():
         enable_unified_cache_external_linker=True,
     ):
         assert not kcc._should_elide_dsa_index_k(is_draft_worker=False)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

@@ -116,14 +116,12 @@ class TestNPUIndexerMemorySizing(CustomTestCase):
                         )
                     ),
                     kv_cache_dtype=kv_dtype,
-                    server_args=SimpleNamespace(
-                        indexer_kv_cache_dtype=indexer_dtype,
-                        enable_hisparse=True,
-                    ),
+                    server_args=SimpleNamespace(indexer_kv_cache_dtype=indexer_dtype),
                     is_draft_worker=False,
                 )
                 with (
                     patch.object(pc, "_is_npu", True),
+                    patch.object(kcc, "_should_elide_dsa_index_k", return_value=False),
                     patch.object(
                         pc,
                         "get_exec",
