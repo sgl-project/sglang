@@ -56,6 +56,7 @@ from sglang.benchmark.serving import (
     _finite_positive_float,
     _validate_parsed_gsp_args,
     async_request_openai_embeddings,
+    cli_main,
     flush_server_cache,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -152,6 +153,25 @@ class TestEmbeddingBenchmarkBackends(CustomTestCase):
             ASYNC_REQUEST_FUNCS["vllm-embedding"], async_request_openai_embeddings
         )
         self.assertEqual(_BACKEND_API_PATHS["vllm-embedding"], "/v1/embeddings")
+
+
+class TestChatBenchmarkBackends(CustomTestCase):
+    def test_chat_backend_default_ports(self):
+        """Each chat backend should probe its engine's model endpoint."""
+        for backend, port in [("vllm-chat", 8000), ("lmdeploy-chat", 23333)]:
+            argv = ["bench_serving", "--backend", backend, "--host", "localhost"]
+            with (
+                self.subTest(backend=backend),
+                patch.object(sys, "argv", argv),
+                patch(
+                    "sglang.benchmark.serving.wait_for_endpoint", return_value=False
+                ) as probe,
+            ):
+                with self.assertRaises(SystemExit):
+                    cli_main()
+                self.assertEqual(
+                    probe.call_args.args[0], f"http://localhost:{port}/v1/models"
+                )
 
 
 class TestBenchmarkCacheFlush(CustomTestCase):
