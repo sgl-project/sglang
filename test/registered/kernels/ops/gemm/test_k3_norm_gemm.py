@@ -13,7 +13,7 @@ from sglang.kernels.ops.gemm.k3_norm_gemm import (
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=30, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(est_time=30, suite="base-b-test-1-gpu-small-amd-mi35x")
 
 HEADS, D, EPS = 12, 128, 1e-6
 
