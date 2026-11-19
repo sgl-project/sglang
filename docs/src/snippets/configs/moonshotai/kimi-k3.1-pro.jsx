@@ -126,7 +126,7 @@ export const config = {
             "--speculative-draft-model-path RadixArk/Kimi-K3.1-Dflash2-Preview",
             `--speculative-dflash-block-size ${config.dflashBlock(s)}`,
             "--speculative-draft-kv-cache-dtype fp8_e4m3",
-            // The draft KV ring (default on) needs an MLA draft backend; DCP
+            // The draft KV ring needs an MLA draft backend; DCP
             // forces this one anyway, so pinning it keeps DCP and non-DCP recipes on the same
             // path. ROCm's Triton draft backend keeps the per-token draft pool.
             `--speculative-draft-attention-backend ${config.isAmd(s) ? "triton" : "cutedsl_mla"}`,
@@ -138,6 +138,9 @@ export const config = {
             // requests skip it.
             ...(config.isAmd(s) ? ["--speculative-use-block-verification"] : []),
           ],
+          // The draft KV ring is opt-in; every NVIDIA recipe here can serve it, and under PD
+          // both roles must set it.
+          env: (s) => (config.isAmd(s) ? [] : ["SGLANG_ENABLE_DFLASH_DRAFT_KV_RING=1"]),
           hints: (s) =>
             s.pdMode === "decode" && s.strategy === "high-throughput"
               ? [`High-throughput decode verifies K = ${config.dflashBlock(s) - 1} (block ${config.dflashBlock(s)}); launch the prefill role with the same block size.`]
