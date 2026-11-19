@@ -455,7 +455,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # Hidden-state capture mode cases:
         # - Breakable EAGLE draft: LAST.
         # - EAGLE target: FULL.
-        # - Return-hidden-states or DFLASH: FULL.
+        # - Return-hidden-states, DFLASH, or PARD2 target: FULL.
         # - Otherwise: NULL.
         is_eagle = model_runner.spec_algorithm.is_eagle()
         is_breakable_eagle_draft = (
@@ -473,8 +473,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
         if is_breakable_eagle_draft:
             self.capture_hidden_mode = CaptureHiddenMode.LAST
-        elif (is_eagle and not model_runner.is_draft_worker) or (
-            model_runner.spec_algorithm.is_dflash_family()
+        elif (
+            (is_eagle and not model_runner.is_draft_worker)
+            or model_runner.spec_algorithm.is_dflash_family()
+            or (
+                model_runner.spec_algorithm.is_pard2()
+                and not model_runner.is_draft_worker
+            )
         ):
             self.capture_hidden_mode = CaptureHiddenMode.FULL
         else:

@@ -1667,3 +1667,327 @@ def _auto_choose_speculative_params(server_args: ServerArgs, model_arch: str) ->
         return (1, 1, 2)
     else:
         return (3, 1, 4)
+
+
+_PARD2_MODES = ("auto", "target-dependent", "target-independent")
+# Verify width counts the bonus token, so K = 15 drafts at the default of 16.
+_PARD2_DEFAULT_DRAFT_TOKENS = 16
+
+
+def _handle_pard2(server_args: ServerArgs) -> None:
+    # PARD2 runs on ROCm only, so every PARD2 branch is unreachable elsewhere.
+    if not get_platform().is_hip:
+        raise ValueError(
+            "PARD2 speculative decoding is supported on AMD GPUs (ROCm) only."
+        )
+    cfg = resolving_view(server_args)
+    if cfg.speculative_draft_model_path is None:
+        raise ValueError(
+            "PARD2 speculative decoding requires --speculative-draft-model-path."
+        )
+    _reject_pard2_runtime_flags(cfg)
+    _resolve_pard2_chain_shape(server_args, cfg)
+    draft_path = _local_pard2_draft_path(server_args, cfg)
+    draft = _read_model_config_json(
+        draft_path,
+        cfg,
+        revision=cfg.speculative_draft_model_revision,
+        missing_message=(
+            "PARD2 requires a PARD-2 draft checkpoint "
+            "(spd_type 'pard2', pard_token, pard2_target_layers); "
+            f"{draft_path} is missing config.json."
+        ),
+    )
+    _reject_pard2_checkpoint(draft, draft_path)
+    target = _pard2_text_section(
+        _read_model_config_json(
+            cfg.model_path,
+            cfg,
+            revision=cfg.revision,
+            missing_message=(
+                "PARD2 could not read the target config at "
+                f"{cfg.model_path} (config.json)."
+            ),
+        )
+    )
+    _reject_pard2_against_target(draft, target, cfg.model_path)
+    _resolve_pard2_mode(server_args, cfg, draft_path, draft, target)
+
+
+def _local_pard2_draft_path(server_args: ServerArgs, cfg) -> str:
+    # The draft's warp_model.bin is read from its directory: resolve an HF repo id
+    # to its local snapshot first.
+    path = cfg.speculative_draft_model_path
+    if os.path.isdir(path):
+        return path
+    from huggingface_hub import snapshot_download
+
+    path = snapshot_download(path, revision=cfg.speculative_draft_model_revision)
+    declare_resolution(server_args, "_handle_pard2", speculative_draft_model_path=path)
+    return path
+
+
+def _reject_pard2_runtime_flags(cfg) -> None:
+    _reject_pard2_parallelism(cfg)
+    if cfg.disaggregation_mode != "null":
+        raise ValueError(
+            "PARD2 does not support PD disaggregation yet "
+            f"(--disaggregation-mode {cfg.disaggregation_mode})."
+        )
+    _reject_pard2_pool_features(cfg)
+    # Unset page_size is resolved to 1 before this hook on the launch path.
+    if cfg.page_size not in (None, 1):
+        raise ValueError(
+            f"PARD2 is validated with --page-size 1 only; got {cfg.page_size}."
+        )
+    if cfg.enable_mixed_chunk:
+        raise ValueError(
+            "enable_mixed_chunk is not supported with "
+            f"speculative_algorithm={cfg.speculative_algorithm}"
+        )
+    if cfg.speculative_adaptive:
+        raise ValueError("PARD2 does not support --speculative-adaptive.")
+    _reject_pard2_ragged_verify()
+    if cfg.enable_lora or cfg.lora_paths:
+        raise ValueError("PARD2 does not support --enable-lora yet.")
+    topk = cfg.speculative_eagle_topk
+    if topk is not None and int(topk) != 1:
+        raise ValueError(
+            "PARD2 is a single-chain drafter: --speculative-eagle-topk must be 1."
+        )
+
+
+def _reject_pard2_parallelism(cfg) -> None:
+    checks = (
+        ("--tp-size", cfg.tp_size, cfg.tp_size > 1),
+        ("--pp-size", cfg.pp_size, cfg.pp_size > 1),
+        ("--attn-dp-size", cfg.attn_dp_size, attn_dp_enabled_of(cfg)),
+        ("--attn-cp-size", cfg.attn_cp_size, cfg.attn_cp_size > 1),
+        ("--dcp-size", cfg.dcp_size, cfg.dcp_size > 1),
+    )
+    for flag, value, failed in checks:
+        if failed:
+            raise ValueError(
+                "PARD2 supports --tp-size 1 without PP, DP attention or "
+                f"context parallelism (got {flag}={value})."
+            )
+
+
+def _reject_pard2_pool_features(cfg) -> None:
+    flags = (
+        (cfg.enable_hierarchical_cache, "--enable-hierarchical-cache"),
+        (cfg.enable_hisparse, "--enable-hisparse"),
+        (cfg.enable_unified_memory, "--enable-unified-memory"),
+        (
+            cfg.speculative_dflash_draft_kv_ring,
+            "--speculative-dflash-draft-kv-ring",
+        ),
+        (
+            cfg.speculative_draft_window_size is not None,
+            "--speculative-draft-window-size",
+        ),
+    )
+    for enabled, flag in flags:
+        if enabled:
+            raise ValueError(
+                f"PARD2 does not support {flag}: its draft KV and feature "
+                "buffer live only in the device pool."
+            )
+
+
+def _reject_pard2_ragged_verify() -> None:
+    from sglang.srt.speculative.ragged_verify import (
+        RaggedVerifyMode,
+        read_ragged_verify_mode,
+    )
+
+    if read_ragged_verify_mode() is not RaggedVerifyMode.STATIC:
+        raise ValueError("PARD2 does not support SGLANG_RAGGED_VERIFY_MODE.")
+
+
+def _resolve_pard2_chain_shape(server_args: ServerArgs, cfg) -> None:
+    steps = cfg.speculative_num_steps
+    if steps is None or int(steps) != 1:
+        if steps is not None and int(steps) != 1:
+            logger.warning(
+                "PARD2 only supports speculative_num_steps == 1; "
+                "overriding speculative_num_steps=%s to 1.",
+                steps,
+            )
+        declare_resolution(server_args, "_handle_pard2", speculative_num_steps=1)
+    if cfg.speculative_eagle_topk is None:
+        declare_resolution(server_args, "_handle_pard2", speculative_eagle_topk=1)
+    width = cfg.speculative_num_draft_tokens
+    if width is None:
+        declare_resolution(
+            server_args,
+            "_handle_pard2",
+            speculative_num_draft_tokens=_PARD2_DEFAULT_DRAFT_TOKENS,
+        )
+        return
+    width = int(width)
+    if width < 2:
+        raise ValueError(
+            "PARD2 needs --speculative-num-draft-tokens >= 2 "
+            f"(verify width, K + 1); got {width}."
+        )
+
+
+def _read_model_config_json(path: str, cfg, *, revision, missing_message: str) -> dict:
+    config_path = os.path.join(path, "config.json")
+    if os.path.isfile(config_path):
+        try:
+            with open(config_path, encoding="utf-8") as handle:
+                data = json.load(handle)
+        except json.JSONDecodeError as exc:
+            raise ValueError(missing_message) from exc
+        if isinstance(data, dict):
+            return data
+    from sglang.srt.hf_transformers import get_config
+
+    loaded = get_config(
+        path,
+        trust_remote_code=cfg.trust_remote_code,
+        revision=revision,
+        model_override_args=json.loads(cfg.json_model_override_args),
+    )
+    data = loaded.to_dict() if hasattr(loaded, "to_dict") else None
+    if isinstance(data, dict):
+        return data
+    raise ValueError(missing_message)
+
+
+def _pard2_text_section(config: dict) -> dict:
+    text = config.get("text_config")
+    if isinstance(text, dict) and "hidden_size" in text:
+        return text
+    return config
+
+
+def _reject_pard2_checkpoint(draft: dict, path: str) -> None:
+    prefix = (
+        "PARD2 requires a PARD-2 draft checkpoint "
+        "(spd_type 'pard2', pard_token, pard2_target_layers); "
+        f"{path} is missing "
+    )
+    if draft.get("spd_type") != "pard2" and draft.get("pard2") is not True:
+        raise ValueError(prefix + "spd_type.")
+    if draft.get("pard_token") is None:
+        raise ValueError(prefix + "pard_token.")
+    layers = draft.get("pard2_target_layers")
+    if not isinstance(layers, list) or not layers:
+        raise ValueError(prefix + "pard2_target_layers.")
+    model_type = draft.get("model_type")
+    architectures = draft.get("architectures") or []
+    architecture = architectures[0] if architectures else None
+    if model_type != "qwen3" or architecture != "Qwen3ForCausalLM":
+        raise ValueError(
+            f"PARD2 supports Qwen3 drafts only; got model_type={model_type}."
+        )
+
+
+def _reject_pard2_against_target(draft: dict, target: dict, target_path: str) -> None:
+    hidden = target.get("hidden_size")
+    n_layers = target.get("num_hidden_layers")
+    if not _is_json_int(hidden) or not _is_json_int(n_layers):
+        raise ValueError(
+            "PARD2 could not read hidden_size and num_hidden_layers from "
+            f"{target_path}."
+        )
+    for layer in draft["pard2_target_layers"]:
+        if not _is_json_int(layer) or layer < -n_layers or layer > -1:
+            raise ValueError(
+                f"pard2_target_layers entry {layer} is out of range for a "
+                f"target with {n_layers} layers."
+            )
+    draft_vocab = draft.get("vocab_size")
+    target_vocab = target.get("vocab_size")
+    if not _is_json_int(draft_vocab) or draft_vocab != target_vocab:
+        raise ValueError(
+            "PARD2 requires the draft to share the target's vocabulary "
+            f"(target {target_vocab}, draft {draft_vocab})."
+        )
+
+
+def _is_json_int(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _resolve_pard2_mode(
+    server_args: ServerArgs, cfg, draft_path: str, draft: dict, target: dict
+) -> None:
+    mode = cfg.speculative_pard2_mode
+    if mode not in _PARD2_MODES:
+        raise ValueError(
+            "--speculative-pard2-mode must be auto, target-dependent, or "
+            f"target-independent; got {mode}."
+        )
+    if mode == "target-independent":
+        declare_resolution(
+            server_args,
+            "_handle_pard2",
+            speculative_pard2_mode="target-independent",
+        )
+        return
+
+    hidden = int(target["hidden_size"])
+    n_layers = len(draft["pard2_target_layers"])
+    dim = draft.get("pard2_target_dim")
+    dims_ok = _is_json_int(dim) and hidden * n_layers == dim
+    warp_ok = os.path.isfile(os.path.join(draft_path, "warp_model.bin"))
+    # An explicit false in the draft config selects target-independent for auto.
+    forced_ti = draft.get("pard2_target_dependent") is False
+    if mode == "auto" and (forced_ti or not dims_ok or not warp_ok):
+        _warn_pard2_auto_target_independent(
+            draft_path=draft_path,
+            forced_ti=forced_ti,
+            dims_ok=dims_ok,
+            warp_ok=warp_ok,
+            hidden=hidden,
+            n_layers=n_layers,
+            dim=dim,
+        )
+        declare_resolution(
+            server_args,
+            "_handle_pard2",
+            speculative_pard2_mode="target-independent",
+        )
+        return
+    if mode == "target-dependent" and (not dims_ok or not warp_ok):
+        shown = dim if dim is not None else "missing"
+        raise ValueError(
+            "--speculative-pard2-mode target-dependent needs "
+            f"{draft_path}/warp_model.bin and "
+            "target_hidden_size x len(pard2_target_layers) == pard2_target_dim "
+            f"({hidden} x {n_layers} != {shown})."
+        )
+    declare_resolution(
+        server_args, "_handle_pard2", speculative_pard2_mode="target-dependent"
+    )
+
+
+def _warn_pard2_auto_target_independent(
+    *,
+    draft_path: str,
+    forced_ti: bool,
+    dims_ok: bool,
+    warp_ok: bool,
+    hidden: int,
+    n_layers: int,
+    dim,
+) -> None:
+    reasons = []
+    if forced_ti:
+        reasons.append("draft config pard2_target_dependent is false")
+    if not dims_ok:
+        shown = dim if dim is not None else "missing"
+        reasons.append(
+            "target_hidden_size x len(pard2_target_layers) != pard2_target_dim "
+            f"({hidden} x {n_layers} != {shown})"
+        )
+    if not warp_ok:
+        reasons.append(f"{draft_path}/warp_model.bin is missing")
+    logger.warning(
+        "PARD2 --speculative-pard2-mode auto resolved to target-independent: %s.",
+        "; ".join(reasons),
+    )

@@ -48,6 +48,8 @@ class SpecAuxHiddenStateConfig(msgspec.Struct, kw_only=True):
     draft_kv_num_layers: Optional[int] = None
     # Route the DFLASH-family capture to the model's DSPARK hook when it has one.
     is_dspark: bool = False
+    # PARD2 target-dependent: bytes per KV slot of the projected-feature buffer.
+    pard2_feature_bytes_per_token: Optional[int] = None
 
 
 def resolve_spec_aux_hidden_state_config(
@@ -72,6 +74,13 @@ def resolve_spec_aux_hidden_state_config(
         is_draft_worker=is_draft_worker,
     )
     _resolve_dflash_aux_hidden_state(
+        config=config,
+        server_args=server_args,
+        model_config=model_config,
+        spec_algorithm=spec_algorithm,
+        is_draft_worker=is_draft_worker,
+    )
+    _resolve_pard2_aux_hidden_state(
         config=config,
         server_args=server_args,
         model_config=model_config,
@@ -284,3 +293,61 @@ def _resolve_dflash_aux_hidden_state(
         config.draft_model_config = draft_model_config
         config.draft_kv_num_layers = int(draft_num_layers)
         config.dflash_target_layer_ids = target_layer_ids
+
+
+def pard2_capture_layer_ids(target_layers, target_num_layers: int) -> list[int]:
+    """Capture ids of the PARD-2 target layers other than the post-norm final.
+
+    ``target_layers`` index HF ``output_hidden_states`` from the end: -1 is the
+    post-norm final, L in [-n, -2] is the output of HF layer ``n + L``, which
+    ``set_dflash_layers_to_capture`` takes as id ``n + L``. Ascending, the order
+    the target packs them in.
+    """
+    from sglang.srt.models.qwen3_pard2 import PARD2_FINAL_LAYER
+
+    capture_ids = []
+    for layer in target_layers:
+        if not isinstance(layer, int) or not -target_num_layers <= layer <= -1:
+            raise ValueError(
+                f"pard2_target_layers entry {layer} is out of range for a "
+                f"target with {target_num_layers} layers."
+            )
+        if layer != PARD2_FINAL_LAYER:
+            capture_ids.append(target_num_layers + layer)
+    return sorted(capture_ids)
+
+
+def _resolve_pard2_aux_hidden_state(
+    *,
+    config: SpecAuxHiddenStateConfig,
+    server_args: ServerArgs,
+    model_config: ModelConfig,
+    spec_algorithm: SpeculativeAlgorithm,
+    is_draft_worker: bool,
+) -> None:
+    if not spec_algorithm.is_pard2() or is_draft_worker:
+        return
+
+    draft_model_config = ModelConfig.from_server_args(
+        server_args,
+        model_path=get_spec().speculative_draft_model_path,
+        model_revision=get_spec().speculative_draft_model_revision,
+        is_draft_model=True,
+    )
+    # A private draft pool over the shared allocator, sized like STANDALONE's.
+    draft_num_layers = int(draft_model_config.num_hidden_layers)
+    config.draft_model_config = draft_model_config
+    config.draft_kv_num_layers = draft_num_layers
+    config.eagle_draft_num_layers = draft_num_layers
+
+    if get_spec().speculative_pard2_mode != "target-dependent":
+        return
+    draft_hf_config = draft_model_config.hf_config
+    config.dflash_use_aux_hidden_state = True
+    config.dflash_target_layer_ids = pard2_capture_layer_ids(
+        list(draft_hf_config.pard2_target_layers),
+        int(model_config.hf_text_config.num_hidden_layers),
+    )
+    config.pard2_feature_bytes_per_token = (
+        int(draft_hf_config.hidden_size) * draft_model_config.dtype.itemsize
+    )

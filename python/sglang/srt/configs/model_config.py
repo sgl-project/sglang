@@ -716,6 +716,7 @@ class ModelConfig:
         disable_hybrid_swa_memory: bool = False,
         model_config_parser: str = "auto",
         speculative_algorithm: Optional[str] = None,
+        speculative_pard2_mode: Optional[str] = None,
         is_draft_quantization_explicit: bool = False,
         uocr_v2_default_context_len: int = FALLBACK_CONTEXT_LENGTH,
     ) -> None:
@@ -726,6 +727,7 @@ class ModelConfig:
         self.is_draft_model = is_draft_model
         self.is_draft_quantization_explicit = is_draft_quantization_explicit
         self.speculative_algorithm = speculative_algorithm
+        self.speculative_pard2_mode = speculative_pard2_mode
         self.uocr_v2_default_context_len = uocr_v2_default_context_len
         self.model_impl = model_impl
         self.sampling_defaults = sampling_defaults
@@ -1106,6 +1108,9 @@ class ModelConfig:
             if is_draft_model
             else cfg.decrypted_config_file
         )
+        dtype = cfg.dtype
+        if is_draft_model and cfg.speculative_algorithm == "PARD2" and dtype == "auto":
+            dtype = _target_auto_dtype(cfg)
         return ModelConfig(
             model_path=model_path or cfg.model_path,
             trust_remote_code=cfg.trust_remote_code,
@@ -1116,7 +1121,7 @@ class ModelConfig:
             model_override_args=cfg.json_model_override_args,
             is_embedding=cfg.is_embedding,
             enable_multimodal=cfg.enable_multimodal,
-            dtype=cfg.dtype,
+            dtype=dtype,
             quantization=quantization,
             model_impl=cfg.model_impl,
             sampling_defaults=cfg.sampling_defaults,
@@ -1133,6 +1138,7 @@ class ModelConfig:
             disable_hybrid_swa_memory=cfg.disable_hybrid_swa_memory,
             model_config_parser=cfg.model_config_parser,
             speculative_algorithm=cfg.speculative_algorithm,
+            speculative_pard2_mode=cfg.speculative_pard2_mode,
             uocr_v2_default_context_len=UocrDocumentConfig.from_args(
                 cfg
             ).default_context_length(),
@@ -1378,6 +1384,32 @@ class ModelConfig:
         if is_draft_model and self.hf_config.architectures[0] == "HYV4ForCausalLM":
             self.hf_config.architectures[0] = "HYV4ForCausalLMNextN"
             self.hf_config.num_nextn_predict_layers = 1
+
+        if (
+            is_draft_model
+            and self.speculative_algorithm == "PARD2"
+            and self.hf_config.architectures[0] == "Qwen3ForCausalLM"
+        ):
+            self._config_pard2_draft()
+
+    def _config_pard2_draft(self):
+        if self.speculative_pard2_mode not in (
+            "target-dependent",
+            "target-independent",
+        ):
+            raise ValueError(
+                "A PARD2 draft needs a resolved --speculative-pard2-mode; "
+                f"got {self.speculative_pard2_mode}."
+            )
+        target_dependent = self.speculative_pard2_mode == "target-dependent"
+        self.hf_config.architectures[0] = "Pard2Qwen3ForCausalLM"
+        # Replaces the checkpoint's own flag: the model reads only the resolved mode.
+        self.hf_config.pard2_target_dependent = target_dependent
+        self.hf_config.pard2_warp_model_path = (
+            os.path.join(self.model_path, "warp_model.bin")
+            if target_dependent
+            else None
+        )
 
     def _derive_hybrid_model(self):
         # Use self.context_len after it has been initialized to prevent using context_len which may be None.
@@ -2476,6 +2508,20 @@ _STR_DTYPE_TO_TORCH_DTYPE = {
     "float32": torch.float32,
     "bfloat16": torch.bfloat16,
 }
+
+
+def _target_auto_dtype(cfg) -> str:
+    # A PARD-2 draft ships BF16 weights under a float32 config, which auto maps
+    # to float16; the draft runs at the target's dtype instead.
+    target_config = get_config(
+        cfg.model_path,
+        trust_remote_code=cfg.trust_remote_code,
+        revision=cfg.revision,
+        model_override_args=json.loads(cfg.json_model_override_args),
+        model_config_parser=cfg.model_config_parser,
+    )
+    dtype = _get_and_verify_dtype(get_hf_text_config(target_config), "auto")
+    return str(dtype).removeprefix("torch.")
 
 
 # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py

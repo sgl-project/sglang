@@ -565,7 +565,16 @@ class LogitsProcessor(nn.Module):
         self.return_full_logits = return_full_logits
         self.enable_mis = get_exec().features.enable_mis
         features = get_exec().features
-        self.keep_last_hidden_states = features.aux_hidden_state_capture is not None
+        # PARD2 target-dependent drafting also reads the post-norm final (entry -1
+        # of pard2_target_layers).
+        self.keep_last_hidden_states = (
+            features.aux_hidden_state_capture is not None
+            or (
+                is_hip()
+                and get_spec().speculative_algorithm == "PARD2"
+                and get_spec().speculative_pard2_mode == "target-dependent"
+            )
+        )
         # Capture-only mode: how many layers the model must capture, when
         # --return-aux-hidden-state-layer-ids names them.
         layer_ids = features.return_aux_hidden_state_layer_ids
