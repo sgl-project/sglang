@@ -10,14 +10,6 @@ on:
         required: false
         type: string
         default: ""
-  # Called by release-branch-cut.yml to test a new release branch.
-  workflow_call:
-    inputs:
-      ref:
-        description: "Git ref (branch, tag, or SHA) to test. If not provided, uses the current ref."
-        required: false
-        type: string
-        default: ""
 
 permissions:
   contents: read

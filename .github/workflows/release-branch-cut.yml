@@ -272,13 +272,6 @@ jobs:
       ref: ${{ needs.cut-release-branch.outputs.branch_name }}
     secrets: inherit
 
-  run-nightly-tests-mlu:
-    needs: cut-release-branch
-    uses: ./.github/workflows/nightly-test-mlu.yml
-    with:
-      ref: ${{ needs.cut-release-branch.outputs.branch_name }}
-    secrets: inherit
-
   run-weekly-tests-nvidia:
     needs: cut-release-branch
     uses: ./.github/workflows/weekly-test-nvidia.yml
