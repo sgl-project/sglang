@@ -190,6 +190,26 @@ class TestShortestPrefillFirst(CustomTestCase):
         queue = self.policy.calc_priority([long, other, short])
         self.assertEqual([req.rid for req in queue], ["short", "other", "long"])
 
+    def test_prefix_group_admits_aged_request_first(self):
+        """A long wait can move a request ahead of fresh work sharing its prefix."""
+        policy = SchedulePolicy(
+            policy="shortest-prefill-first",
+            tree_cache=RadixCache.create_simulated(),
+            enable_hierarchical_cache=True,
+            enable_priority_scheduling=False,
+            schedule_low_priority_values_first=False,
+            shortest_prefill_aging_factor=0.5,
+        )
+        old = self.make_req("old", 1024, arrived=1)
+        new = self.make_req("new", 64, arrived=2)
+        independent = _make_req("independent", "", list(range(2048, 2560)))
+        independent.full_untruncated_fill_ids = independent.origin_input_ids[:]
+        new.arrival_processed_tokens = independent.arrival_processed_tokens = 3000
+
+        queue = policy.calc_priority([old, new, independent], processed_tokens=3000)
+
+        self.assertEqual([req.rid for req in queue], ["old", "independent", "new"])
+
     def test_retracted_output_is_part_of_uncached_work(self):
         replay = self.make_req("replay", 16, cached=1024)
         replay.output_ids.extend([0] * 64)

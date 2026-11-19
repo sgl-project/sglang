@@ -324,7 +324,7 @@ class SchedulePolicy:
                 )
         elif isinstance(policy, CacheAwarePolicy):
             temporary_deprioritized = self._compute_prefix_matches(
-                waiting_queue, policy
+                waiting_queue, policy, processed_tokens=processed_tokens
             )
             if policy == CacheAwarePolicy.LPM:
                 SchedulePolicy._sort_by_longest_prefix(
@@ -538,7 +538,11 @@ class SchedulePolicy:
                 raise ValueError(f"Unknown schedule_policy: {policy=}")
 
     def _compute_prefix_matches(
-        self, waiting_queue: List[Req], policy: CacheAwarePolicy
+        self,
+        waiting_queue: List[Req],
+        policy: CacheAwarePolicy,
+        *,
+        processed_tokens: int = 0,
     ) -> Set[int]:
         temporary_deprioritized: Set[int] = set()
         self.waiting_queue_radix_tree.reset()
@@ -555,9 +559,10 @@ class SchedulePolicy:
                 candidates.append((r, key_ids))
 
         if policy == CacheAwarePolicy.SHORTEST_PREFILL_FIRST:
-            # The first of a shared-prefix group runs: make it the shortest, or a
-            # short request waits behind a long one that SPF defers.
-            candidates.sort(key=lambda c: self._shortest_prefill_work(c[0]))
+            # Choose the group leader by the same aged rank used for admission.
+            candidates.sort(
+                key=lambda c: self._shortest_prefill_rank(c[0], processed_tokens)
+            )
 
         for r, key_ids in candidates:
             extra_key = r.extra_key
