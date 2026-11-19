@@ -11,6 +11,7 @@ entries each static pool family registers. All of it goes when those pools do.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 import msgspec
@@ -256,7 +257,8 @@ class StaticKVStorage:
         )
 
     def reset_new_rows(self) -> None:
-        """See `KVStorage.reset_new_rows`."""
+        """Reset the request-scoped state of the rows handed out since the last
+        call, on the current stream (`RowResets`)."""
         self._row_resets.apply()
 
     def _reset_request_rows(self, rows: List[int]) -> None:
@@ -373,8 +375,9 @@ class StaticKVStorage:
         rows: Optional[torch.Tensor],
         seq_lens: torch.Tensor,
         seq_lens_cpu: torch.Tensor,
-        last_loc: torch.Tensor,
+        last_loc: Optional[torch.Tensor],
         make_room: Callable[[int], Any],
+        req_to_token_write: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         tree_cache: Optional[BasePrefixCache] = None,
         batch: Optional[ScheduleBatch] = None,
     ) -> Optional[torch.Tensor]:
@@ -386,6 +389,8 @@ class StaticKVStorage:
         # returns a DSV4OutCacheLoc bundle; hasattr-gated so others stay unchanged.
         is_dsv4 = rows is not None and hasattr(allocator, "c128_attn_allocator")
         extra_alloc_kwargs = {}
+        if req_to_token_write is not None:
+            extra_alloc_kwargs["req_to_token_write"] = req_to_token_write
         if is_dsv4:
             c128_num_pages = allocator.c128_num_pages_needed(
                 (seq_lens_cpu - 1).clamp(min=0), seq_lens_cpu
@@ -612,6 +617,10 @@ class StaticKVStorage:
     def take_state_slots(self, sub_pool: str, count: int) -> Optional[torch.Tensor]:
         """``count`` free state slots of ``sub_pool``; None when none are free."""
         return self._allocator.state_slots.alloc(count)
+
+    def lease_state_slots(self, sub_pool: str, count: int):
+        """A static pool's take is a free-list slice: nothing to lease."""
+        return nullcontext()
 
     def free_state_slots(self, sub_pool: str, slots: torch.Tensor) -> None:
         self._allocator.state_slots.free(slots)
@@ -1194,19 +1203,16 @@ def _static_state_entries(
                 c128_item_lens,
             )
 
-        # On Ascend 950, register C4 state by row so prefill and decode can
-        # pair logical positions even when their SWA-page ring sizes differ.
-        from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
-
-        if is_npu_arch35():
-            c4_ptrs, c4_lens, c4_item_lens = token_to_kv_pool.get_c4_state_buf_infos()
-            if c4_ptrs:
-                add(
-                    AscendStateType.DSV4_C4_STATE,
-                    c4_ptrs,
-                    c4_lens,
-                    c4_item_lens,
-                )
+        # Register C4 state by row on both A3 and Ascend 950 so prefill and
+        # decode can pair logical positions even when their ring sizes differ.
+        c4_ptrs, c4_lens, c4_item_lens = token_to_kv_pool.get_c4_state_buf_infos()
+        if c4_ptrs:
+            add(
+                AscendStateType.DSV4_C4_STATE,
+                c4_ptrs,
+                c4_lens,
+                c4_item_lens,
+            )
 
     # DSV4 NextN shares the target allocator, so target and draft use the same
     # local SWA indices. Keep draft buffers in a separate positional component

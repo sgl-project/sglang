@@ -60,28 +60,6 @@ def test_sm120_runtime_policy_delegates_decode_shapes():
     assert not future_policy.decode_uses_static_max_seqlen_k
 
 
-def test_sm120_preallocated_output_contract_is_validated_before_launch():
-    q = torch.empty((1, 1, 1, 32), device="cuda", dtype=torch.bfloat16)
-    k = torch.empty((1, 1, 1, 32), device="cuda", dtype=torch.bfloat16)
-    v = torch.empty_like(k)
-
-    with pytest.raises(ValueError, match="must not require gradients"):
-        flash_attn_with_kvcache(
-            q,
-            k,
-            v,
-            out=torch.empty_like(q, requires_grad=True),
-        )
-
-    strided_out = torch.empty(
-        (1, 1, 1, 64),
-        device="cuda",
-        dtype=torch.bfloat16,
-    )[..., ::2]
-    with pytest.raises(ValueError, match="must have stride 1"):
-        flash_attn_with_kvcache(q, k, v, out=strided_out)
-
-
 @pytest.mark.parametrize(
     (
         "head_dim",

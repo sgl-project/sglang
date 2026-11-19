@@ -115,8 +115,6 @@ related files
 [@slin1237](https://github.com/slin1237) (Simo Lin)
 
 related files
-- sgl-model-gateway
-- python/sglang/srt/grpc
 - python/sglang/srt/entrypoints
 
 ### Other Notes
