@@ -56,6 +56,7 @@ from sglang.srt.runtime_context import (
     get_spec,
     process_model_config,
 )
+from sglang.srt.utils.log_utils import print_info_once
 
 logger = logging.getLogger(__name__)
 
@@ -336,6 +337,8 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
                 contract=self.contract,
                 routed_scaling_factor=self.routed_scaling_factor,
             )
+            if get_exec().moe.paged_experts_fused_host_copy:
+                self._fuse_host_copy(layer=layer, residency=residency)
         self.executor = EagerExecutor(
             base_method=self.format.runner_method(self.base_method),
             store=self.store,
@@ -345,6 +348,108 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
             routed_scaling_factor=self.routed_scaling_factor,
             device_residency=residency,
         )
+        self.executor.fused_host_copy = (
+            self.device_executor is not None and self.device_executor.fused_host_copy
+        )
+
+    def _fuse_host_copy(self, layer, residency) -> None:
+        """--paged-experts-fused-host-copy: give the layer's MoE kernel the host copy of each slot
+        table, so that it pages experts in itself in this layer's device-planned steps."""
+        from sglang.srt.layers.moe.paged_experts.runners import MARLIN, TRITON
+
+        if self.tiered:
+            raise ValueError(
+                "--paged-experts-fused-host-copy does not support the disk tier "
+                "(--paged-experts-enable-disk)"
+            )
+        if self.contract not in (TRITON, MARLIN):
+            raise ValueError(
+                "--paged-experts-fused-host-copy needs the triton or Marlin MoE runner"
+            )
+        if self.contract is TRITON:
+            self._fuse_host_copy_triton(layer=layer, residency=residency)
+        else:
+            self._fuse_host_copy_marlin(layer=layer, residency=residency)
+        self.device_executor.fused_host_copy = True
+        runner = "triton" if self.contract is TRITON else "Marlin"
+        print_info_once(
+            f"Paged experts: fused host copy on the {runner} MoE runner - decode steps copy "
+            "their missing experts inside the MoE kernels"
+        )
+
+    def _fuse_host_copy_triton(self, layer, residency) -> None:
+        from sglang.kernels.ops.moe.fused_moe_triton_host_copy import HOST_COPIES
+
+        supported = (torch.bfloat16, torch.float16)
+        biases = _expert_biases(self.store.host)
+        for name, host in self.store.host.items():
+            gpu = getattr(layer, name).data
+            if host[0].numel() == 0 or name in biases:
+                continue
+            if gpu.dim() != 3 or gpu.dtype not in supported:
+                found = f"{name} is {gpu.dtype}"
+                if gpu.dim() != 3:
+                    found += f" with {gpu.dim()} dimensions, not 3"
+                raise ValueError(
+                    "--paged-experts-fused-host-copy on the triton MoE runner supports expert "
+                    f"weights of {' or '.join(map(str, supported))}; {found}"
+                )
+            HOST_COPIES[gpu.data_ptr()] = (host, residency.expert_slot, residency.count)
+        _reject_expert_biases(biases)
+
+    def _fuse_host_copy_marlin(self, layer, residency) -> None:
+        from sglang.kernels.ops.moe.moe_wna16_marlin import HOST_COPIES, HostCopy
+        from sglang.kernels.ops.moe.paged_experts import (
+            paged_experts_host_device_pointer,
+        )
+
+        host = self.store.host
+        weights = ("w13_weight", "w2_weight")
+        tables = {w: (f"{w}_scale", f"{w}_scale_2") for w in weights}
+        known = {n for w, (s, g) in tables.items() for n in (w, s, g)}
+        # The dtype of the block scales tells the two supported formats apart.
+        scale_dtypes = {torch.float8_e4m3fn: "NVFP4", torch.float8_e8m0fnu: "MXFP4"}
+        biases = _expert_biases(host)
+        if (
+            not set(host) - set(biases) <= known
+            or not all(w in host and tables[w][0] in host for w in weights)
+            or host[tables[weights[0]][0]].dtype not in scale_dtypes
+        ):
+            supported = " and ".join(
+                f"{fmt} experts (scales of {dtype})"
+                for dtype, fmt in scale_dtypes.items()
+            )
+            paged = ", ".join(f"{name} ({host[name].dtype})" for name in sorted(host))
+            raise ValueError(
+                f"--paged-experts-fused-host-copy on the Marlin MoE runner supports {supported}; "
+                f"this layer pages {paged}"
+            )
+        _reject_expert_biases(biases)
+
+        def address(name: str, gpu: torch.Tensor) -> int:
+            # The kernel reaches a host table as an offset from the slot table, in 16-byte units.
+            pointer = paged_experts_host_device_pointer(host[name])
+            if (pointer - gpu.data_ptr()) % 16 or not gpu.is_contiguous():
+                raise ValueError(
+                    "--paged-experts-fused-host-copy: internal error: the host and slot tables "
+                    f"of {name} must be contiguous and a multiple of 16 bytes apart"
+                )
+            return pointer
+
+        for weight, (scales, global_scale) in tables.items():
+            gpu = getattr(layer, weight).data
+            HOST_COPIES[gpu.data_ptr()] = HostCopy(
+                weight=address(name=weight, gpu=gpu),
+                scales=address(name=scales, gpu=getattr(layer, scales).data),
+                global_scale=(
+                    paged_experts_host_device_pointer(host[global_scale])
+                    if global_scale in host
+                    else 0
+                ),
+                num_experts=self.num_experts,
+                expert_slot=residency.expert_slot,
+                count=residency.count,
+            )
 
     def apply(self, layer, dispatch_output):
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
@@ -407,6 +512,19 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
     _run_eager_into = eager_on_graph(True)(_run_eager_into_impl)
 
 
+def _expert_biases(host) -> list:
+    """The names of the per-expert bias tensors among the paged tensors ``host``."""
+    return sorted(n for n, t in host.items() if n.endswith("_bias") and t[0].numel())
+
+
+def _reject_expert_biases(biases) -> None:
+    if biases:
+        raise ValueError(
+            "--paged-experts-fused-host-copy does not support expert biases "
+            f"({', '.join(biases)})"
+        )
+
+
 # The slot tables of all layers share one allocation under auto; each starts at this alignment.
 _ALIGN = 256
 
@@ -449,7 +567,8 @@ def make_for_layer(layer, base_method) -> PagedExpertsMoEMethod:
         expert_format=expert_format,
         num_experts=num_experts,
         num_resident=num_resident,
-        graphs=not cuda_graph_fully_disabled(),
+        graphs=not cuda_graph_fully_disabled()
+        or get_exec().moe.paged_experts_fused_host_copy,
         auto_size=requested is None,
     )
 

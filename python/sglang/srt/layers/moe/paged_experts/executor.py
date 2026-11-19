@@ -43,6 +43,8 @@ class EagerExecutor:
         self.routed_scaling_factor = routed_scaling_factor
         # Shared with a DeviceExecutor, whose steps (and graph replays) move it on the GPU.
         self.device_residency = device_residency
+        # --paged-experts-fused-host-copy: the MoE kernel reads the device residency's count.
+        self.fused_host_copy = False
 
     def run(self, layer, dispatch_output):
         r = self.device_residency
@@ -51,6 +53,9 @@ class EagerExecutor:
                 "Paged experts: a captured decode batch routes more entries than the K "
                 "resident slots; capture batch sizes must stay at or below K // top_k"
             )
+        if self.fused_host_copy:
+            # This step pages before its GEMMs: the MoE kernel has nothing to read from the host.
+            r.count.zero_()
         out = self._run(layer, dispatch_output)
         if r is not None:
             r.store_from(self.policy)
@@ -140,6 +145,8 @@ class DeviceExecutor:
         self.residency = residency
         self.contract = contract
         self.routed_scaling_factor = routed_scaling_factor
+        # --paged-experts-fused-host-copy: the MoE kernel pages the experts in as it computes.
+        self.fused_host_copy = False
 
     def run(self, layer, dispatch_output):
         from sglang.kernels.ops.moe.paged_experts import paged_experts_decide
@@ -162,12 +169,15 @@ class DeviceExecutor:
             r.count,
             run_ids.view(-1),
             run_w.view(-1),
+            host_ids=self.fused_host_copy,
         )
-        self.store.gather(src=r.src, dst=r.dst, count=r.count)
-        if not torch.cuda.is_current_stream_capturing():
-            # Not a graph replay: page in what the gather left on disk before the GEMM.
-            self.store.resolve_pending()
-        # Every routed expert is now resident; padding got slot 0 and weight 0.
+        if not self.fused_host_copy:
+            self.store.gather(src=r.src, dst=r.dst, count=r.count)
+            if not torch.cuda.is_current_stream_capturing():
+                # Not a graph replay: page in what the gather left on disk before the GEMM.
+                self.store.resolve_pending()
+        # Every routed expert is now resident, or will be when the MoE kernel has run; padding
+        # got slot 0 and weight 0.
         wave_output = dispatch_output._replace(
             topk_output=topk_output._replace(
                 topk_ids=run_ids, topk_weights=run_w.to(topk_weights.dtype)

@@ -47,6 +47,7 @@ def paged_experts_decide(
     count: torch.Tensor,
     run_ids: torch.Tensor,
     run_w: torch.Tensor,
+    host_ids: bool = False,
 ) -> None:
     """Make every expert in ``topk`` (``[T]`` routed ids, negative = padding, ``T <= K``) resident.
 
@@ -57,6 +58,9 @@ def paged_experts_decide(
     ``run_ids`` ``[T]`` int32, the slot holding each entry's expert, and ``run_w`` ``[T]``
     float32, its weight from ``topk_weights`` ``[T]`` float32; padding entries (id outside
     ``[0, E)``) get slot 0 and weight 0.
+
+    With ``host_ids`` (fused host copy) the plan is for the MoE kernel, not for a copy before
+    it: an entry whose expert is paged in gets ``K + expert`` in ``run_ids``.
     """
     _jit_module().paged_experts_decide(
         topk,
@@ -70,6 +74,7 @@ def paged_experts_decide(
         count,
         run_ids,
         run_w,
+        int(host_ids),
     )
 
 

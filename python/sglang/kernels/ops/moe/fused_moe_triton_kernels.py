@@ -11,6 +11,11 @@ import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.kernels.numerics import silu_approx_f32
+from sglang.kernels.ops.moe.fused_moe_triton_host_copy import (
+    host_copy_block,
+    host_copy_dot,
+    host_copy_kwargs,
+)
 from sglang.kernels.ops.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
     scaled_fp8_quant,
@@ -376,6 +381,11 @@ def fused_moe_kernel(
     A_OUTPUT_SLICES: tl.constexpr = 1,
     A_OUTPUT_SLICE_WIDTH: tl.constexpr = 0,
     A_OUTPUT_SLICE_K: tl.constexpr = 0,
+    # Paged experts, fused host copy (fused_moe_triton_host_copy.py); off without b_host_ptr.
+    HOST_SLOTS: tl.constexpr = 0,
+    b_host_ptr=None,
+    expert_slot_ptr=None,
+    host_count_ptr=None,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -436,6 +446,10 @@ def fused_moe_kernel(
     # `a_ptrs` is a block of [BLOCK_SIZE_M, BLOCK_SIZE_K] pointers
     # `b_ptrs` is a block of [BLOCK_SIZE_K, BLOCK_SIZE_N] pointers
     num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+    if b_host_ptr is not None:
+        pid_m = host_copy_block(
+            pid_m, num_tokens_post_padded, host_count_ptr, BLOCK_SIZE_M
+        )
     if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
         return
     offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
@@ -545,6 +559,26 @@ def fused_moe_kernel(
     else:
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
+    if b_host_ptr is not None:
+        accumulator, K = host_copy_dot(
+            accumulator,
+            a_ptrs,
+            token_mask,
+            K,
+            stride_ak,
+            b_ptr,
+            b_host_ptr,
+            expert_slot_ptr,
+            off_experts,
+            offs_k,
+            offs_bn,
+            stride_be,
+            stride_bk,
+            stride_bn,
+            HOST_SLOTS,
+            BLOCK_SIZE_K,
+            even_Ks,
+        )
     for k_start in range(0, K, BLOCK_SIZE_K):
         # Load the next block of A and B, generate a mask by checking the
         # K dimension.
@@ -1050,6 +1084,10 @@ def invoke_fused_moe_kernel(
             if is_arch_support_pdl()
             else {}
         )
+        host_kwargs = host_copy_kwargs(
+            B=B,
+            plain=not b_use_tma and bias is None and B_scale is None and not swap_ab,
+        )
         fused_moe_kernel[grid](
             A,
             a_desc,
@@ -1102,6 +1140,7 @@ def invoke_fused_moe_kernel(
             FUSE_SUM_ALL_REDUCE=fuse_sum_all_reduce,
             ROUTER_TOPK=router_topk,
             FUSE_SWIGLU=fuse_swiglu,
+            **host_kwargs,
             **pdl_kwargs,
             **config,
         )

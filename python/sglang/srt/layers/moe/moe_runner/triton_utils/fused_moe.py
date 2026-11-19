@@ -18,6 +18,7 @@ from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.kernels.ops.activation.silu_and_mul_block_quant import (
     silu_and_mul_block_quant_two_group,
 )
+from sglang.kernels.ops.moe.fused_moe_triton_host_copy import host_expert_ids
 from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
     act_and_mul_triton,
     invoke_fused_moe_kernel,
@@ -478,6 +479,9 @@ def _prepare_fused_moe_run(
 
     num_tokens = hidden_states.shape[0]
     E = w1.shape[0]
+    # Paged experts, fused host copy: ids past w1's slots are experts in host memory.
+    host_ids = host_expert_ids(w1)
+    E += host_ids
     config_dtype = get_config_dtype_str(
         use_fp8_w8a8=use_fp8_w8a8,
         use_int8_w8a8=use_int8_w8a8,
@@ -499,6 +503,15 @@ def _prepare_fused_moe_run(
     # Copy config to avoid mutating the lru_cached dict returned by
     # get_moe_configs; we pop USE_TMA below.
     config = dict(config)
+    if host_ids:
+        # Paged experts, fused host copy: the kernel reads a host expert through pointers, not TMA.
+        up_tma = config.pop("USE_TMA", False)
+        down_tma = down_config.pop("USE_TMA", False) if down_config else False
+        if (up_tma or down_tma) and _moe_support_tma():
+            logger.warning_once(
+                "Paged experts: fused host copy runs the MoE kernels without TMA; USE_TMA in the "
+                "tuned MoE config is ignored"
+            )
     # Up-projection TMA is opt-in: only enabled when the up config file
     # explicitly carries "USE_TMA": true (produced by tuning). By default the
     # existing up config files do not contain this key, so existing users are

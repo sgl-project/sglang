@@ -57,6 +57,10 @@ requests, and breakable prefill graphs run the paged MoE layers as eager breaks.
   pinned as before; with `--paged-experts-enable-disk`, the experts that do not fit what is
   available at startup (within the container's memory limit) go to the disk tier, which then
   keeps 10 GiB of that free. Requires `--enable-paged-experts`.
+- **`--paged-experts-fused-host-copy`**: Copy missing experts inside the MoE kernel instead of
+  before it: the kernel reads each one from the host store and writes it into its slot as it
+  computes, so the experts already resident do not wait for the transfers (see
+  [Captured decode](#captured-decode)). Off by default; requires `--enable-paged-experts`.
 
 ## Supported Configurations and Limitations
 
@@ -104,6 +108,11 @@ requests, and breakable prefill graphs run the paged MoE layers as eager breaks.
   `--enable-linear-replayssm`, `--enable-linear-replayssm-spec`, `--enable-unified-memory`,
   `--expert-distribution-recorder-mode` and `SGLANG_OPT_USE_ONLINE_COMPRESS`. With `auto`, K
   grows at most to R.
+- **Fused host copy** (`--paged-experts-fused-host-copy`): the triton runner with unquantized
+  bf16/fp16 experts, or the Marlin runner with NVFP4 or MXFP4 experts. Other expert types,
+  expert biases, and the disk tier are rejected at startup. It applies to the steps that fit the
+  K slots; host-planned steps (prefill, larger decode batches) still copy their experts before
+  the kernel.
 - **Startup:** with mapped safetensors (`--load-format auto`, `safetensors` or `mistral`, without
   `--weight-loader-disable-mmap`), loading makes no second copy of the experts: each expert is
   read from the checkpoint once, straight into the pinned host store. With other loaders, and
@@ -161,6 +170,12 @@ GPU, with no host synchronization, so the decode graph captures it:
 - a second kernel copies the planned experts of every paged tensor from the pinned host store
   into their slots, reading the host memory directly through its unified address and the count
   on the device, so each graph replay moves exactly the experts it decided on.
+
+With `--paged-experts-fused-host-copy`, there is no second kernel: the decision gives each
+entry whose expert is paged in the id K + expert, and the MoE kernel's thread blocks for those
+ids read the expert from the host store and write it into its slot as they compute. Those
+thread blocks are spread evenly through the launch, so the transfers overlap the resident
+experts' work, and the launch takes about as long as the slower of the two.
 
 Decode capture batch sizes are capped at `K // top_k` (logged at startup); larger batches run
 without a graph. Prefill steps plan their waves on the host: under a breakable prefill graph the
