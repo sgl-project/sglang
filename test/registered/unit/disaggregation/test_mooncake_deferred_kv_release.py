@@ -95,11 +95,11 @@ class TestMooncakeAbortNotification(
         manager._staging_outstanding = defaultdict(int)
         manager.check_status = MagicMock(side_effect=RuntimeError("worker error"))
         queue = MagicMock()
-        queue.get.return_value = _chunk()
+        queue.get.side_effect = [_chunk(), None]
 
-        with self.assertRaisesRegex(RuntimeError, "Transfer thread failed"):
-            manager.transfer_worker(queue, MagicMock())
-        # The failed worker marks its room failed, so no wait on it hangs.
+        # The error fails only this room; the worker runs on to the sentinel.
+        manager.transfer_worker(queue, MagicMock())
+        # The failed room is marked failed, so no wait on it hangs.
         self.assertEqual(manager.request_status[ROOM], KVPoll.Failed)
         self.assertIn("Transfer worker failed", manager.failure_records[ROOM])
         manager.check_status = lambda room: manager.request_status[room]

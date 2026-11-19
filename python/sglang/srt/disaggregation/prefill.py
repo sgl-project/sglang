@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional
 
 import numpy as np
 import torch
+import torch.distributed as dist
 
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
@@ -52,6 +53,7 @@ from sglang.srt.disaggregation.utils import (
     NetworkTransferWaiter,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    all_reduce_flags,
     build_kv_layer_ids,
     build_staging_slot_metadata,
     get_dsa_tail_state_indices,
@@ -669,6 +671,27 @@ class SchedulerDisaggregationPrefillMixin:
     """
     Mixin for Scheduler to handle disaggregation prefill
     """
+
+    def disagg_prefill_unhealthy_reason(self: Scheduler) -> Optional[str]:
+        """Why some rank's KV transfer workers cannot serve every request, or None.
+
+        A collective: every rank that received the health check calls it at the
+        same point of request processing, as for the transfer polls.
+        """
+        queue = self.disagg_prefill_bootstrap_queue
+        local = (
+            None
+            if queue is None
+            else queue.kv_manager.transfer_worker_unhealthy_reason()
+        )
+        flag = [0 if local is None else 1]
+        flag = all_reduce_flags(flag, self.attn_tp_cpu_group, dist.ReduceOp.MAX)
+        flag = all_reduce_flags(flag, self.attn_cp_cpu_group, dist.ReduceOp.MAX)
+        if local is not None:
+            return local
+        if flag[0]:
+            return "A KV transfer worker on another rank is dead or stuck"
+        return None
 
     def maybe_prefetch_staging_for_batch(self: Scheduler, batch: ScheduleBatch) -> None:
         """Pre-send STAGING_REQ so decode allocates staging during GPU forward."""

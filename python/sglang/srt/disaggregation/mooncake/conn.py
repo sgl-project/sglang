@@ -35,6 +35,10 @@ from sglang.srt.disaggregation.common.staging_handler import (
     handle_staging_rsp,
     handle_watermark_msg,
 )
+from sglang.srt.disaggregation.common.transfer_worker_health import (
+    TransferWorkerHealth,
+    is_worker_fatal_error,
+)
 from sglang.srt.disaggregation.common.utils import (
     AuxDataCodec,
     FastQueue,
@@ -277,6 +281,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     sender_trace_module = "mooncake"
 
     AUX_DATA_HEADER = b"AUX_DATA"
+    # Set in __init__ before the PREFILL transfer workers start.
+    transfer_worker_health: Optional[TransferWorkerHealth] = None
     # Implements teardown() below, so runtime PD role switching is supported.
     supports_role_switch = True
     # Bootstrap thread defers the ABORT ack until the transfer worker drains.
@@ -375,6 +381,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self._staging_ctx = PrefillStagingContext() if self.enable_staging else None
             if self.enable_staging:
                 self._init_staging_buffers(len(self.transfer_queues))
+            self.transfer_worker_health = TransferWorkerHealth(
+                stall_timeout_s=(
+                    envs.SGLANG_DISAGGREGATION_TRANSFER_WORKER_STALL_TIMEOUT.get()
+                )
+            )
             for i, (queue, executor) in enumerate(
                 zip(self.transfer_queues, self.executors)
             ):
@@ -2835,6 +2846,32 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if self.enable_deferred_decode_kv_release:
             self.poison_deferred_ack_room(room)
 
+    def transfer_worker_unhealthy_reason(self) -> Optional[str]:
+        health = self.transfer_worker_health
+        return None if health is None else health.unhealthy_reason()
+
+    def _fail_room_on_worker_error(self, room: int, exc: Exception) -> bool:
+        """Fail the room whose chunk raised in the transfer worker, and tell
+        decode so it does not wait out its timeout. Returns whether it did."""
+        reason = f"Transfer worker failed: {exc}"
+        try:
+            status = self.request_status.get(room)
+            # Cleared: a record now would fail a later request reusing the
+            # room. Success: decode already has the data and was told so.
+            if status is None or status == KVPoll.Success:
+                return False
+            # A write may still be in flight: withhold the drained-abort ack.
+            self.poison_deferred_ack_room(room)
+            self.record_failure(room, reason)
+            # Failed before notifying, so a failed notification still leaves
+            # no page move waiting on this room.
+            self.update_status(room, KVPoll.Failed)
+            self.conclude_failure(bootstrap_room=room, failure_reason=reason)
+        except Exception:
+            # Must not raise: it runs in the worker's error path.
+            logger.exception(f"Failed to fail room {room} after a worker error")
+        return True
+
     def transfer_worker(
         self,
         queue: FastQueue,
@@ -2842,6 +2879,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         staging_buffer=None,
         worker_index=0,
     ):
+        health = self.transfer_worker_health
         staging_strategy = None
         if self.enable_trace:
             trace_set_thread_info(
@@ -2859,6 +2897,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 # _stopped alone can never wake a parked worker during a role switch.
                 if kv_chunk is None:
                     break
+                if health is not None:
+                    health.mark_busy(worker_index)
                 if self.enable_trace:
                     kv_chunk.trace_ctx.rebuild_thread_context()
                     kv_chunk.trace_ctx.trace_slice_start(
@@ -2986,19 +3026,22 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                     req.dst_device_kv_indices[kv_chunk.index_slice]
                                 )
 
-                            # NOTE: This is temporarily a workaround to deal with the case where the prefill_kv_indices
-                            # is mismatched with the dst_kv_indices when page size > 1, this should never happen.
+                            # Decode registered fewer pages than prefill sends:
+                            # the two sides disagree on the request's length.
+                            # Truncating would ship part of the KV as a success.
                             if len(chunked_dst_kv_indice) < len(
                                 kv_chunk.prefill_kv_indices
                             ):
-                                logger.warning(
-                                    f"len(chunked_dst_kv_indice) = {len(chunked_dst_kv_indice)}, len(kv_chunk.prefill_kv_indices) = {len(kv_chunk.prefill_kv_indices)}"
+                                self.conclude_failure(
+                                    bootstrap_room=kv_chunk.room,
+                                    failure_reason=(
+                                        "KV page count mismatch: prefill sends "
+                                        f"{len(kv_chunk.prefill_kv_indices)} pages, "
+                                        "decode registered "
+                                        f"{len(chunked_dst_kv_indice)}"
+                                    ),
                                 )
-                                kv_chunk.prefill_kv_indices = (
-                                    kv_chunk.prefill_kv_indices[
-                                        : len(chunked_dst_kv_indice)
-                                    ]
-                                )
+                                break
                             if chunked_dst_device_kv_indice is not None:
                                 chunked_dst_device_kv_indice = (
                                     chunked_dst_device_kv_indice[
@@ -3264,16 +3307,31 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     self._staging_outstanding.pop(kv_chunk.room, None)
 
             except Exception as e:
-                # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
-                if kv_chunk is not None:
-                    self.poison_deferred_ack_room(kv_chunk.room)
-                    # The worker stops: fail its room so that no page move
-                    # waits for a send it will never finish.
-                    self.record_failure(kv_chunk.room, f"Transfer worker failed: {e}")
-                    self.update_status(kv_chunk.room, KVPoll.Failed)
+                # An error scoped to one chunk fails only that request: the
+                # queue is shared by every room hashed onto it, so stopping
+                # here would strand all of them.
+                failed_room = kv_chunk is not None and self._fail_room_on_worker_error(
+                    kv_chunk.room, e
+                )
+                if kv_chunk is not None and not is_worker_fatal_error(e):
+                    logger.error(
+                        f"Transfer worker {worker_index} hit an error on room "
+                        f"{kv_chunk.room} (failed: {failed_room}) and keeps "
+                        f"running: {e!r}",
+                        exc_info=True,
+                    )
+                    if failed_room and health is not None:
+                        health.record_request_failure()
+                    continue
+                # Teardown shuts the pool down under a running worker.
+                if health is not None and not self._stopped:
+                    health.mark_dead(worker_index, repr(e))
                 raise RuntimeError(
                     f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
-                )
+                ) from e
+            finally:
+                if health is not None:
+                    health.mark_idle(worker_index)
 
     def _handle_abort_notification(self, msg: List[bytes]) -> bool:
         if not msg or msg[0] != ABORT_TAG:
@@ -3511,6 +3569,15 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_infos = self.transfer_infos[bootstrap_room].keys()
         session_port_sum = sum(int(session.rsplit(":", 1)[1]) for session in dst_infos)
         shard_idx = session_port_sum % len(self.transfer_queues)
+        health = self.transfer_worker_health
+        if health is not None and health.is_dead(shard_idx):
+            # Nothing drains this queue any more; fail now rather than at the
+            # waiting timeout.
+            self.conclude_failure(
+                bootstrap_room=bootstrap_room,
+                failure_reason=f"KV transfer worker {shard_idx} is dead",
+            )
+            return
 
         if trace_ctx is None:
             trace_ctx = TraceNullContext()

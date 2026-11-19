@@ -846,12 +846,22 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.server_status = ServerStatus.Starting
         self.gracefully_exit = False
         self.last_receive_tstamp = real_time()
+        # Sticky: a scheduler reported a failure that does not clear by itself.
+        self.scheduler_unhealthy_reason: Optional[str] = None
 
         # Session
         self.session_futures = {}  # session_id -> asyncio event
 
         # Subprocess liveness watchdog — set by Engine or http_server after construction
         self._subprocess_watchdog = None
+
+    def _handle_health_check_output(self, recv_obj: HealthCheckOutput) -> None:
+        reason = recv_obj.unhealthy_reason
+        if reason is None or self.scheduler_unhealthy_reason is not None:
+            return
+        logger.error(f"Scheduler reported the server unhealthy: {reason}")
+        self.scheduler_unhealthy_reason = reason
+        self.server_status = ServerStatus.UnHealthy
 
     def is_healthy(self) -> bool:
         """Return whether startup completed and the server is neither unhealthy nor shutting down."""
@@ -1020,7 +1030,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 ),
                 (FreezeGCReq, lambda x: None),
                 # For handling case when scheduler skips detokenizer and forwards back to the tokenizer manager, we ignore it.
-                (HealthCheckOutput, lambda x: None),
+                (HealthCheckOutput, self._handle_health_check_output),
                 # Same skip-detokenizer forwarding case as above.
                 (ConfigureLoggingReq, lambda x: None),
                 (ActiveRanksOutput, self.update_active_ranks),

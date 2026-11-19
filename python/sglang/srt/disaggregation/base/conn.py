@@ -160,6 +160,11 @@ class BaseKVManager(ABC):
         each decode rank receives only a slice of what the sender digested."""
         return True
 
+    def transfer_worker_unhealthy_reason(self) -> Optional[str]:
+        """Why this rank's transfer workers cannot serve every request (a worker
+        died or is stuck), or None. A non-None answer fails the health check."""
+        return None
+
     @abstractmethod
     def __init__(
         self,

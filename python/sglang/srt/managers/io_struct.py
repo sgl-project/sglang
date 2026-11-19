@@ -2702,7 +2702,9 @@ class OpenSessionReqOutput(BaseReq, kw_only=True):
 
 
 class HealthCheckOutput(BaseReq, kw_only=True):
-    pass
+    # Set when the scheduler answers the probe with a failure that will not
+    # clear by itself, such as a dead PD transfer worker.
+    unhealthy_reason: Optional[str] = None
 
 
 class ExpertDistributionReqType(Enum):

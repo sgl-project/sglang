@@ -22,6 +22,7 @@ import dataclasses
 import errno
 import inspect
 import ipaddress
+import itertools
 import logging
 import os
 import signal
@@ -765,6 +766,11 @@ async def ready() -> Response:
     return Response(status_code=status_code)
 
 
+# PD prefill dispatches DP ranks by bootstrap_room: rotating the probe's fake
+# room spreads probes over every DP rank instead of always reaching rank 0.
+_health_check_rooms = itertools.count()
+
+
 @app.get("/health")
 @app.get("/health_generate")
 async def health_generate(request: Request) -> Response:
@@ -780,6 +786,9 @@ async def health_generate(request: Request) -> Response:
         return Response(status_code=503)
 
     if _global_state.tokenizer_manager.server_status == ServerStatus.Starting:
+        return Response(status_code=503)
+
+    if _global_state.tokenizer_manager.scheduler_unhealthy_reason is not None:
         return Response(status_code=503)
 
     # Let an external E2E driver establish a balanced DP batch before health traffic.
@@ -809,7 +818,7 @@ async def health_generate(request: Request) -> Response:
         )
         if get_disagg().disaggregation_mode != DisaggregationMode.NULL.value:
             gri.bootstrap_host = FAKE_BOOTSTRAP_HOST
-            gri.bootstrap_room = 0
+            gri.bootstrap_room = next(_health_check_rooms)
     else:
         gri = EmbeddingReqInput(
             rid=rid, input_ids=[0], sampling_params=sampling_params, log_metrics=False
@@ -825,6 +834,11 @@ async def health_generate(request: Request) -> Response:
     tic = time.time()
     while time.time() < tic + HEALTH_CHECK_TIMEOUT:
         await asyncio.sleep(1)
+        # Checked first: the probe's own failure arrives alongside other traffic.
+        if _global_state.tokenizer_manager.scheduler_unhealthy_reason is not None:
+            task.cancel()
+            _global_state.tokenizer_manager.rid_to_state.pop(rid, None)
+            return Response(status_code=503)
         if _global_state.tokenizer_manager.last_receive_tstamp > tic:
             task.cancel()
             _global_state.tokenizer_manager.rid_to_state.pop(rid, None)

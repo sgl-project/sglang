@@ -836,6 +836,9 @@ class Envs:
     SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL = EnvFloat(5.0)
     SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE = EnvInt(2)
     SGLANG_DISAGGREGATION_WAITING_TIMEOUT = EnvInt(300)
+    # Seconds a prefill KV transfer worker may spend on one chunk before the
+    # health check fails; 0 disables the check.
+    SGLANG_DISAGGREGATION_TRANSFER_WORKER_STALL_TIMEOUT = EnvFloat(600.0)
     # Seconds a unified-memory page move waits for network transfers before it
     # fails; unset: past the bootstrap, waiting and deferred-release timeouts.
     SGLANG_DISAGGREGATION_PAGE_MOVE_WAIT_TIMEOUT = EnvFloat(None)

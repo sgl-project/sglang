@@ -2379,6 +2379,17 @@ class Scheduler(
             if get_mm().mm_feature_transport == "cuda_vmm":
                 vmm_errors = self._materialize_cuda_vmm_inputs(recv_req)
 
+            # A dead PD transfer worker strands its queue while other requests
+            # still finish, so answering the probe from traffic would hide it.
+            if (
+                is_health_check_generate_req(recv_req)
+                and self.disaggregation_mode == DisaggregationMode.PREFILL
+            ):
+                unhealthy_reason = self.disagg_prefill_unhealthy_reason()
+                if unhealthy_reason is not None:
+                    self.send_unhealthy_health_check(recv_req, unhealthy_reason)
+                    continue
+
             # Skip health check when server is busy — ongoing requests already carry health info.
             if is_health_check_generate_req(recv_req) and not self.is_fully_idle(
                 for_health_check=True
@@ -5963,6 +5974,18 @@ class Scheduler(
                 self.release_prefill_sender(probe, abort_sender=True)
             probe.finish_outside_step(FINISH_ABORT())
             self.request_retirer.release(probe, checkpoint=False)
+
+    def send_unhealthy_health_check(self, recv_req, reason: str) -> None:
+        if self.rust_server is not None:
+            # The Rust heartbeat carries no reason: leave the probe unanswered.
+            return
+        self.ipc_channels.send_to_tokenizer.send_output(
+            HealthCheckOutput(
+                rid=recv_req.rid,
+                http_worker_ipc=getattr(recv_req, "http_worker_ipc", None),
+                unhealthy_reason=reason,
+            )
+        )
 
     def maybe_send_health_check_signal(self):
         if self.return_health_check_ipcs:
