@@ -153,7 +153,7 @@ def dsa_backend(pool):
 class TestMegakernelBindingDsa(CustomTestCase):
     def test_the_dsa_view_is_the_running_dsa_backend(self):
         backend = dsa_backend(DsaPool())
-        with patch(BACKEND, return_value=backend):
+        with patch.object(mb, "get_attn_backend", return_value=backend):
             dsa = mb.MegakernelBinding(model=torch.nn.Module()).forward_view().dsa
         same = {
             "kv_lora_rank": "kv_lora_rank",
@@ -181,7 +181,7 @@ class TestMegakernelBindingDsa(CustomTestCase):
 
     def test_a_backend_without_dsa_has_no_dsa_view(self):
         backend = SimpleNamespace(token_to_kv_pool=DsaPool(), forward_metadata=None)
-        with patch(BACKEND, return_value=backend):
+        with patch.object(mb, "get_attn_backend", return_value=backend):
             binding = mb.MegakernelBinding(model=torch.nn.Module())
             self.assertIsNone(binding.forward_view().dsa)
             binding.assert_live()
@@ -204,7 +204,7 @@ class TestMegakernelBindingDsa(CustomTestCase):
             with self.subTest(buffer=attr):
                 backend = dsa_backend(DsaPool())
                 binding = mb.MegakernelBinding(model=torch.nn.Module())
-                with patch(BACKEND, return_value=backend):
+                with patch.object(mb, "get_attn_backend", return_value=backend):
                     binding.forward_view()
                     binding.assert_live()
                     setattr(backend, attr, torch.zeros(32, dtype=torch.uint8))
@@ -222,9 +222,9 @@ class TestMegakernelBindingDsa(CustomTestCase):
             backend.workspace_buffer = workspace
         binding = mb.MegakernelBinding(model=torch.nn.Module())
         for backend in steps + steps:
-            with patch(BACKEND, return_value=backend):
+            with patch.object(mb, "get_attn_backend", return_value=backend):
                 binding.forward_view()
-        with patch(BACKEND, return_value=steps[0]):
+        with patch.object(mb, "get_attn_backend", return_value=steps[0]):
             binding.assert_live()
             steps[2]._multi_ctas_kv_counter_buffer = torch.zeros(16, dtype=torch.uint8)
             with self.assertRaisesRegex(RuntimeError, r"dsa_kv_counter\[2\]"):

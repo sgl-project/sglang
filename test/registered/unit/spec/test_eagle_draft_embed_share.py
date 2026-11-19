@@ -27,6 +27,9 @@ def _run(replicate: bool) -> list:
     worker.draft_worker.alloc_memory_pool.side_effect = lambda **_: calls.append(
         "draft_pool"
     )
+    # alloc_memory_pool checks the draft pool's branch tail copy, a no-op at topk 1
+    worker.draft_runner = worker.draft_worker.model_runner
+    worker.topk = 1
     with (
         envs.SGLANG_ENABLE_EMBED_REPLICATION.override(replicate),
         patch.object(
@@ -41,6 +44,10 @@ def _run(replicate: bool) -> list:
         patch(
             "sglang.srt.speculative.eagle_worker_v2.get_spec",
             return_value=SimpleNamespace(speculative_use_rejection_sampling=False),
+        ),
+        patch(
+            "sglang.srt.speculative.eagle_worker_v2.get_schedule",
+            return_value=SimpleNamespace(page_size=1),
         ),
     ):
         worker.target_embed_and_head_shared = False
