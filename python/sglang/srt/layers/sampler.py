@@ -216,6 +216,12 @@ class Sampler(nn.Module):
                     logits.shape[0], device=logits.device, dtype=torch.int32
                 )
                 _aiter_greedy_sample(batch_next_token_ids, logits)
+            elif logits.device.type == "mps":
+                batch_next_token_ids = sampler_argmax(
+                    logits,
+                    use_mps_kernel=get_exec().graph.mps_execution_backend
+                    == "mlx-compiled",
+                )
             else:
                 batch_next_token_ids = sampler_argmax(logits)
             _trace_e2e_sampler(

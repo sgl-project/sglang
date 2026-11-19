@@ -31,6 +31,62 @@ else:
 # not force `mx.eval`, so MLX can keep these calls inside its lazy graph.
 
 
+def radix_attention(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    kp: mx.array,
+    vp: mx.array,
+    table: mx.array,
+    requests: mx.array,
+    lengths: mx.array,
+    scale: float,
+    *,
+    tails: tuple[mx.array, mx.array] | None = None,
+    page_size: int = 1,
+) -> mx.array:
+    """Read-only radix decode using bundled Metal shaders and lazy MLX primitives.
+
+    Q is [B,H,D]; current K/V and optional tails are [B,KH,D], with H divisible
+    by KH and D in {64,128,256}. Pools are [slots,KH,D]. All floating inputs
+    share float32, float16 or bfloat16 dtype. The [rows,width] request table is
+    int32; request IDs and sequence lengths are [B] int32/int64 arrays.
+
+    The last token comes from current K/V, and the penultimate token comes from
+    tails when supplied. Remaining tokens use table lookups. Invalid device
+    metadata produces NaNs without out-of-bounds reads. Output matches Q.
+    Dispatch geometry is automatic; inputs are never donated or modified.
+    Noncontiguous inputs are made contiguous within the lazy graph.
+    page_size is 1, 16, 32 or 64. Larger pages require aligned, contiguous
+    physical slots within each logical page; only its first table entry is read.
+    """
+    if _metal is None:
+        raise ImportError(
+            "AOT radix attention requires the sgl_kernel Metal build"
+        ) from _IMPORT_ERROR
+    try:
+        from ._metal import radix_attention as native_radix
+    except ImportError as error:
+        raise ImportError(
+            "Rebuild sgl_kernel with setup_metal.py for AOT radix attention"
+        ) from error
+    if tails is not None and len(tails) != 2:
+        raise ValueError("Pending K/V must match the current-token K/V")
+    return native_radix(
+        q,
+        k,
+        v,
+        kp,
+        vp,
+        table,
+        requests,
+        lengths,
+        scale,
+        *(tails if tails is not None else (None, None)),
+        page_size,
+    )
+
+
 def rope_pool_fused(
     q: mx.array,
     k: mx.array,

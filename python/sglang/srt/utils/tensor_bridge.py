@@ -9,8 +9,8 @@ keeps all borrowed DLPack inputs alive until the result has been evaluated.
 This lifetime boundary matters because MLX may donate a borrowed input buffer
 to a lazy operation.
 
-Bridge entry points are serialized because Torch and MLX use different stream
-abstractions over the same Metal command queues.  The lock covers producer
+Bridge entry points are serialized because Torch and MLX use separate Metal
+command queues. The lock covers producer
 fencing, MLX evaluation, and DLPack import.  It cannot cover arbitrary MPS
 work outside the function, so callers must serialize any overlapping use or
 mutation of source and returned MPS tensors as well.

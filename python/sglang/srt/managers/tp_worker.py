@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
 import torch
 
@@ -47,6 +47,7 @@ from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
 from sglang.srt.model_executor.graph_memory_usage import (
@@ -81,6 +82,10 @@ logger = logging.getLogger(__name__)
 
 
 class BaseTpWorker(ABC):
+    def enable_execution_lookahead(self) -> Optional[Callable[..., None]]:
+        """Enable worker-managed lookahead and return its scheduler fence."""
+        return None
+
     @abstractmethod
     def forward_batch_generation(self, forward_batch: ForwardBatch):
         pass
@@ -282,6 +287,20 @@ class BaseTpWorker(ABC):
 
 class TpModelWorker(BaseTpWorker):
     """A tensor parallel model worker."""
+
+    def enable_execution_lookahead(self) -> Optional[Callable[..., None]]:
+        if (
+            get_exec().graph.mps_execution_backend != "mlx-compiled"
+            or get_exec().graph.cuda_graph_config.decode.backend == Backend.DISABLED
+        ):
+            return None
+        from sglang.srt.hardware_backend.mps.compiled_runner import CompiledMlxRunner
+
+        runner = self.model_runner.decode_cuda_graph_runner
+        if not isinstance(runner, CompiledMlxRunner):
+            raise RuntimeError("Asynchronous MPS decode requires the compiled runner")
+        runner.enable_lookahead()
+        return runner.drain
 
     def __init__(
         self,

@@ -447,6 +447,11 @@ def capture_cuda_graphs(
         memory_usage_gb=0,
         capture_time=0,
     )
+    if (
+        model_runner.device == "mps"
+        and get_exec().graph.cuda_graph_config.decode.backend == Backend.DISABLED
+    ):
+        capture_decode_cuda_graph = False
     if capture_decode_cuda_graph:
         model_runner.maybe_init_uocr_greedy_graph()
         if current_platform.capabilities.graph_capture:
@@ -456,6 +461,20 @@ def capture_cuda_graphs(
     else:
         decode = GraphCapture(
             runner=eager_runner,
+            memory_phase=decode_phase,
+            memory_usage_gb=0,
+            capture_time=0,
+        )
+
+    if (
+        capture_decode_cuda_graph
+        and model_runner.device == "mps"
+        and get_exec().graph.mps_execution_backend == "mlx-compiled"
+    ):
+        from sglang.srt.hardware_backend.mps.compiled_runner import CompiledMlxRunner
+
+        decode = GraphCapture(
+            runner=CompiledMlxRunner(model_runner),
             memory_phase=decode_phase,
             memory_usage_gb=0,
             capture_time=0,
@@ -509,6 +528,17 @@ def capture_prefill_graph(
             memory_usage_gb=memory_usage_gb,
             capture_time=capture_time,
         )
+
+    if model_runner.device == "mps":
+        if (
+            model_runner.is_draft_worker
+            or get_exec().graph.mps_execution_backend != "mlx-compiled"
+            or get_exec().graph.cuda_graph_config.prefill.backend != Backend.FULL
+        ):
+            return result(eager_runner)
+        from sglang.srt.hardware_backend.mps.compiled_runner import CompiledMlxRunner
+
+        return result(CompiledMlxRunner(model_runner, prefill=True))
 
     # CPU prefill graph capture is owned by CPUGraphRunner; keep the shared
     # setup path eager for unsupported CPU configurations.
