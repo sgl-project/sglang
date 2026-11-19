@@ -111,6 +111,7 @@ class SpeculativeSamplingMaskCapture(msgspec.Struct):
         )
 
         support_logprobs = None
+        overflow = torch.zeros_like(output_tokens, dtype=torch.bool)
         if self.target_probs is None:
             support_tokens = output_tokens.unsqueeze(-1).to(torch.int32)
             support_lens = torch.ones_like(output_tokens, dtype=torch.int32)
@@ -127,8 +128,12 @@ class SpeculativeSamplingMaskCapture(msgspec.Struct):
                 )
             target_probs = self.target_probs.index_select(0, batch_indices)
             support_probs, support_tokens = torch.topk(
-                target_probs, k=max_top_k, dim=-1
+                target_probs, k=min(max_top_k + 1, target_probs.shape[-1]), dim=-1
             )
+            if support_probs.shape[-1] > max_top_k:
+                overflow = support_probs[..., max_top_k] > 0
+                support_probs = support_probs[..., :max_top_k]
+                support_tokens = support_tokens[..., :max_top_k]
             support_tokens = support_tokens.to(torch.int32)
             support_lens = (support_probs > 0).sum(dim=-1, dtype=torch.int32)
             selected_logprobs = torch.log(
@@ -140,6 +145,7 @@ class SpeculativeSamplingMaskCapture(msgspec.Struct):
                 )
             if greedy_mask is not None:
                 greedy_rows = greedy_mask[:, None]
+                overflow &= ~greedy_rows
                 support_tokens = torch.where(
                     greedy_rows[:, :, None],
                     output_tokens[:, :, None],
@@ -166,7 +172,9 @@ class SpeculativeSamplingMaskCapture(msgspec.Struct):
 
         statuses = torch.where(
             torch.isfinite(selected_logprobs),
-            int(SamplingMaskStatus.OK),
+            torch.where(
+                overflow, int(SamplingMaskStatus.OVERFLOW), int(SamplingMaskStatus.OK)
+            ),
             int(SamplingMaskStatus.INVALID),
         ).to(torch.int8)
         return SamplingMaskOutput(

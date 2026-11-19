@@ -177,6 +177,8 @@ class SamplingBatchInfo:
     # filter_batch keeps it unchanged (ScheduleBatch tightens it with
     # refresh_top_k_flags).
     max_top_k: Optional[int] = None
+    # Upper bound on bounded rows: None is unknown, zero means no bounded rows.
+    max_bounded_top_k: Optional[int] = None
 
     @classmethod
     def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
@@ -352,7 +354,7 @@ class SamplingBatchInfo:
             rows_with_seed=rows_with_seed,
             need_top_p_sampling=any(r.sampling_params.top_p != 1.0 for r in reqs),
             need_min_p_sampling=any(r.sampling_params.min_p > 0 for r in reqs),
-            **_top_k_flags([r.sampling_params.top_k for r in reqs]),
+            **_top_k_flags([r.sampling_params.top_k for r in reqs], vocab_size),
             vocab_size=vocab_size,
             penalizer_orchestrator=penalizer_orchestrator,
             has_custom_logit_processor=has_custom_logit_processor,
@@ -709,6 +711,12 @@ class SamplingBatchInfo:
             else max(self.max_top_k, other.max_top_k)
         )
 
+        self.max_bounded_top_k = (
+            None
+            if self.max_bounded_top_k is None or other.max_bounded_top_k is None
+            else max(self.max_bounded_top_k, other.max_bounded_top_k)
+        )
+
         self.adjusted_merge_batch(other)
 
     def refresh_top_k_flags(self, top_ks: List[int]) -> None:
@@ -719,7 +727,7 @@ class SamplingBatchInfo:
         None for the rest of the running batch. ScheduleBatch.filter_batch calls
         this with its kept requests' top_k.
         """
-        for name, value in _top_k_flags(top_ks).items():
+        for name, value in _top_k_flags(top_ks, self.vocab_size).items():
             setattr(self, name, value)
 
     def _merge_processor_entries(
@@ -782,13 +790,14 @@ _FIELD_NAMES = tuple(f.name for f in dataclasses.fields(SamplingBatchInfo))
 _FIELD_GETTER = operator.itemgetter(*_FIELD_NAMES)
 
 
-def _top_k_flags(top_ks: List[int]) -> Dict[str, Any]:
+def _top_k_flags(top_ks: List[int], vocab_size: int) -> Dict[str, Any]:
     """The SamplingBatchInfo flags that follow from the rows' top_k values."""
     return {
         "is_all_greedy": all(k <= 1 for k in top_ks),
         "is_any_greedy": any(k <= 1 for k in top_ks),
         "need_top_k_sampling": any(k != TOP_K_ALL for k in top_ks),
         "npu_top_k_top_p_eligible": all(1 <= k <= 1024 for k in top_ks),
+        "max_bounded_top_k": max((k for k in top_ks if 1 <= k < vocab_size), default=0),
         # None when any row samples the whole vocabulary.
         "max_top_k": (
             max(top_ks) if top_ks and all(1 <= k < TOP_K_ALL for k in top_ks) else None

@@ -468,9 +468,11 @@ class TestFilterBatch(CustomTestCase):
             batch_size=3,
             top_ks=torch.tensor([10, 50, 30], dtype=torch.int32),
             max_top_k=50,
+            max_bounded_top_k=30,
         )
         info.filter_batch([0, 2], torch.tensor([0, 2]))
         self.assertEqual(info.max_top_k, 50)
+        self.assertEqual(info.max_bounded_top_k, 30)
         self.assertGreaterEqual(info.max_top_k, int(info.top_ks.max()))
 
     def test_filter_with_custom_logit_processor(self):
@@ -641,6 +643,21 @@ class TestMergeBatch(CustomTestCase):
                 info1 = _make_info(max_top_k=lhs)
                 info1.merge_batch(_make_info(max_top_k=rhs))
                 self.assertEqual(info1.max_top_k, expected)
+
+    def test_merge_max_bounded_top_k(self):
+        cases = (
+            (20, 30, 30),
+            (30, 20, 30),
+            (0, 20, 20),
+            (0, 0, 0),
+            (None, 20, None),
+            (20, None, None),
+        )
+        for lhs, rhs, expected in cases:
+            with self.subTest(lhs=lhs, rhs=rhs):
+                info = _make_info(max_bounded_top_k=lhs)
+                info.merge_batch(_make_info(max_bounded_top_k=rhs))
+                self.assertEqual(info.max_bounded_top_k, expected)
 
     def test_merge_with_logit_bias(self):
         """Test that merge pads missing logit_bias with zeros before concatenation."""
@@ -886,6 +903,22 @@ class TestFromScheduleBatch(CustomTestCase):
 
                 self.assertEqual(info.max_top_k, expected)
 
+    def test_max_bounded_top_k_uses_request_params(self):
+        cases = (
+            ((20, 50), 20),
+            ((1, 20), 20),
+            ((20, TOP_K_ALL), 20),
+            ((TOP_K_ALL, TOP_K_ALL), 0),
+            ((50, TOP_K_ALL), 0),
+        )
+        for top_ks, expected in cases:
+            with self.subTest(top_ks=top_ks):
+                batch = MagicMock()
+                batch.reqs = [self._make_req(top_k=k) for k in top_ks]
+                batch.device = DEVICE
+                info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
+                self.assertEqual(info.max_bounded_top_k, expected)
+
     def _top_k_flags(self, info):
         return (
             info.is_all_greedy,
@@ -893,6 +926,7 @@ class TestFromScheduleBatch(CustomTestCase):
             info.need_top_k_sampling,
             info.npu_top_k_top_p_eligible,
             info.max_top_k,
+            info.max_bounded_top_k,
         )
 
     def test_refresh_top_k_flags_after_filter_matches_a_fresh_batch(self):

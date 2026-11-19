@@ -1266,7 +1266,17 @@ def build_speculative_verify_target_probs(
         elif max_top_k > vocab_size:
             max_top_k = vocab_size
 
-        # Sparse exact path for joint top-k/top-p filtering, then scatter to dense.
+        has_unbounded_rows = max_top_k == vocab_size
+        if has_unbounded_rows:
+            max_top_k = getattr(sampling_info, "max_bounded_top_k", None)
+            if max_top_k is None:
+                max_top_k = int(
+                    repeated_top_ks.masked_fill(repeated_top_ks == vocab_size, 0)
+                    .max()
+                    .item()
+                )
+
+        # Preserve exact-K filtering for bounded rows beside whole-vocabulary rows.
         if 0 < max_top_k < vocab_size:
             # A positive temperature keeps the order of the logits, so select on
             # the raw logits and scale only the selected values.
@@ -1298,7 +1308,21 @@ def build_speculative_verify_target_probs(
                     adjusted_top_ps = torch.clamp(repeated_top_ps / topk_mass, max=1.0)
                 topk_probs = _dflash_top_p_renorm_prob(topk_probs, adjusted_top_ps)
 
-            target_probs = topk_probs.new_zeros(next_token_logits.shape)
+            if has_unbounded_rows:
+                if not need_top_p:
+                    scaled_logits = next_token_logits / expanded_temperature
+                target_probs = F.softmax(scaled_logits, dim=-1)
+                if need_top_p:
+                    target_probs = _dflash_top_p_renorm_prob(
+                        target_probs, repeated_top_ps
+                    )
+                bounded_rows = repeated_top_ks.unsqueeze(1) < vocab_size
+                target_probs.masked_fill_(bounded_rows, 0.0)
+                topk_probs = torch.where(
+                    bounded_rows, topk_probs, target_probs.gather(1, topk_indices)
+                )
+            else:
+                target_probs = topk_probs.new_zeros(next_token_logits.shape)
             target_probs.scatter_(1, topk_indices, topk_probs)
             sparse_topk_applied = True
 
