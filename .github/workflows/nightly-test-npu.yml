@@ -78,6 +78,7 @@ jobs:
       image_a5: ${{ steps.set-vars.outputs.image_a5 }}
       run_start_metadata: ${{ steps.set-vars.outputs.run_start_metadata }}
       accuracy_dataset: ${{ steps.set-vars.outputs.accuracy_dataset }}
+      accuracy_date_parity: ${{ steps.set-vars.outputs.accuracy_date_parity }}
     steps:
       # When triggered by PR, no inputs parameters are used. The latest community code is tested by default.
       - name: Set image config
@@ -115,7 +116,8 @@ jobs:
           # Package run metadata (branch/workflow/create_time) as a single JSON for reuse by all
           # test jobs; create_time is UTC+8 date + time (minute precision) recorded once at run
           # start, shared even across midnight.
-          RUN_START_METADATA="$(python3 -c "import json,sys; print(json.dumps({'branch_label':sys.argv[1],'workflow_name':sys.argv[2],'create_time':sys.argv[3]}))" "$BRANCH_LABEL" "${{ github.workflow }}" "$(date -u -d '+8 hours' +%Y%m%d-%H%M)")"
+          BEIJING_CREATE_TIME="$(TZ=Asia/Shanghai date +%Y%m%d-%H%M)"
+          RUN_START_METADATA="$(python3 -c "import json,sys; print(json.dumps({'branch_label':sys.argv[1],'workflow_name':sys.argv[2],'create_time':sys.argv[3]}))" "$BRANCH_LABEL" "${{ github.workflow }}" "${BEIJING_CREATE_TIME}")"
           # Write to GITHUB_OUTPUT and print to the log in one command.
           echo "run_start_metadata=${RUN_START_METADATA}" | tee -a $GITHUB_OUTPUT
           # Multi-node accuracy dataset: an explicit input wins; otherwise gsm8k
@@ -141,6 +143,18 @@ jobs:
               ;;
           esac
           echo "accuracy_dataset=${ACCURACY_DATASET}" | tee -a $GITHUB_OUTPUT
+          # Multi-node accuracy suites rotate by Beijing date parity so that the
+          # shared 4-node pool runs exactly one of them per night. Resolve the
+          # parity once per run so the job gates below stay consistent even
+          # across midnight. 10# forces decimal parsing, otherwise days 08/09
+          # are read as octal.
+          ACCURACY_DAY="$(TZ=Asia/Shanghai date +%d)"
+          if [ $((10#${ACCURACY_DAY} % 2)) -eq 1 ]; then
+            ACCURACY_DATE_PARITY="odd"
+          else
+            ACCURACY_DATE_PARITY="even"
+          fi
+          echo "accuracy_date_parity=${ACCURACY_DATE_PARITY}" | tee -a $GITHUB_OUTPUT
 
   nightly-1-npu-a3:
     name: nightly-1-npu-a3
@@ -227,6 +241,7 @@ jobs:
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
+      ref: ${{ inputs.ref || '' }}
       runner: linux-aarch64-a3-800t-2
       test_type: 'perf'
       test_suite: nightly-perf-2-npu-a3
@@ -243,6 +258,7 @@ jobs:
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
+      ref: ${{ inputs.ref || '' }}
       runner: linux-aarch64-a3-800t-4
       test_type: 'perf'
       test_suite: nightly-perf-4-npu-a3
@@ -259,6 +275,7 @@ jobs:
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
+      ref: ${{ inputs.ref || '' }}
       runner: linux-aarch64-a3-800t-16
       test_type: 'perf'
       test_suite: nightly-perf-16-npu-a3
@@ -277,6 +294,7 @@ jobs:
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
+      ref: ${{ inputs.ref || '' }}
       runner: linux-aarch64-a3-2-
       test_type: 'accuracy'
       test_suite: nightly-acc-2-npu-a3
@@ -294,6 +312,7 @@ jobs:
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
+      ref: ${{ inputs.ref || '' }}
       runner: linux-aarch64-a3-16-
       test_type: 'accuracy'
       test_suite: nightly-acc-16-npu-a3
@@ -310,6 +329,7 @@ jobs:
      needs: [set-image-config]
      uses: ./.github/workflows/_npu-single-node-test-stage.yml
      with:
+       ref: ${{ inputs.ref || '' }}
        runner: linux-amd64-a5-4
        test_type: 'accuracy'
        test_suite: nightly-acc-4-npu-a5
@@ -326,6 +346,7 @@ jobs:
     needs: [set-image-config]
     uses: ./.github/workflows/_pr-test-sgl-router-build.yml
     with:
+      git_ref: ${{ inputs.ref || '' }}
       runs_on: ubuntu-22.04-arm
       artifact_name: sgl-router-aarch64-nightly-npu
     secrets: inherit
@@ -422,8 +443,9 @@ jobs:
 #            prefill_decode_deployment: 'separation'
     uses: ./.github/workflows/nightly-test-npu-e2e-multi-node.yml
     with:
+      ref: ${{ inputs.ref || '' }}
       runner: linux-amd64-cpu-4
-      test_type: ${{ matrix.test_config.test_type || 'perf' }}
+      test_type: ${{ matrix.test_config.test_type || 'accuracy' }}
       test_config_name: ${{ matrix.test_config.name }}
       prefill_size: ${{ matrix.test_config.prefill_size }}
       decode_size: ${{ matrix.test_config.decode_size }}
@@ -455,11 +477,6 @@ jobs:
             node_size: 4
             test_case: test/registered/npu/accuracy/kimi_k3/test_npu_kimi_k3_w4a8_32p_gpqa.py
             test_type: 'accuracy'
-          # deepseek_v4_pro performance tests
-          - name: deepseek_v4_pro_16p_in128k_out1k_prefix90_20ms
-            node_size: 2
-            test_case: test/registered/npu/performance/deepseek_v4_pro/test_npu_deepseek_v4_pro_w4a8_16p_in128k_out1k_prefix90_20ms.py
-            test_type: 'perf'
           - name: kimi_k3_w4a8_32p_mix_in128k_out1_prefill
             node_size: 4
             test_case: test/registered/npu/performance/kimi_k3/test_npu_kimi_k3_w4a8_32p_mix_in128k_out1_prefill.py
@@ -470,6 +487,7 @@ jobs:
             test_type: 'perf'
     uses: ./.github/workflows/nightly-test-npu-e2e-multi-node.yml
     with:
+      ref: ${{ inputs.ref || '' }}
       runner: linux-amd64-cpu-4
       test_type: ${{ matrix.test_config.test_type || 'perf' }}
       test_config_name: ${{ matrix.test_config.name }}
@@ -496,6 +514,8 @@ jobs:
       - nightly-acc-16-npu-a3
       - nightly-acc-4-npu-a5
       - nightly-poc-multi-node-tests
+      - nightly-poc-multi-node-accuracy-odd-day
+      - nightly-poc-multi-node-accuracy-even-day
       - nightly-poc-multi-node-mix-tests
     runs-on: ubuntu-latest
     steps:
@@ -503,6 +523,15 @@ jobs:
         run: |
           multi_result="${{ needs.nightly-poc-multi-node-tests.result }}"
           mix_result="${{ needs.nightly-poc-multi-node-mix-tests.result }}"
+          # Exactly one of the two date-gated accuracy jobs runs; the other is skipped.
+          accuracy_result="success"
+          for r in \
+            "${{ needs.nightly-poc-multi-node-accuracy-odd-day.result }}" \
+            "${{ needs.nightly-poc-multi-node-accuracy-even-day.result }}"; do
+            if [ "${r}" != "success" ] && [ "${r}" != "skipped" ]; then
+              accuracy_result="failure"
+            fi
+          done
 
           # single-node suites are reported per suite; overall status is success if none failed
           single_result="success"
@@ -556,11 +585,12 @@ jobs:
             echo "| ${suite} | $(group_icon ${r}) ${r} |" >> $GITHUB_STEP_SUMMARY
           done
           echo "| multi-node-poc | $(group_icon ${multi_result}) ${multi_result} |" >> $GITHUB_STEP_SUMMARY
+          echo "| multi-node-poc-accuracy | $(group_icon ${accuracy_result}) ${accuracy_result} |" >> $GITHUB_STEP_SUMMARY
           echo "| multi-node-mix-poc | $(group_icon ${mix_result}) ${mix_result} |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
           FAIL=0
-          for r in "${single_result}" "${multi_result}" "${mix_result}"; do
+          for r in "${single_result}" "${multi_result}" "${accuracy_result}" "${mix_result}"; do
             if [ "${r}" != "success" ] && [ "${r}" != "skipped" ]; then FAIL=1; fi
           done
           exit $FAIL

@@ -369,7 +369,7 @@ class ServerArgs:
     # construction in model_runner_kv_cache_mixin._init_pools.
 
     def _unified_memory_pd_transfer_backends(self) -> set[str]:
-        return {"mooncake"}
+        return {"mooncake", "nixl"}
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
