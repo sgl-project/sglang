@@ -273,5 +273,43 @@ def test_region_stages_the_deferred_draft_kv_from_the_joined_projection():
     assert calls == [("stage", 7)]
 
 
+def test_draft_folds_static_commit_needs_the_targets_unremapped_slots():
+    """The worker turns the static epilogue on for a non-V4.1 target from this
+    check, so a draft that opts in but cannot store at the target's cache
+    locations must not count as folding."""
+
+    def injector(target_space, draft_space):
+        def runner(space):
+            return SimpleNamespace(runner_ids=SimpleNamespace(space=lambda kind: space))
+
+        return SimpleNamespace(
+            model_runner=runner(target_space), draft_model_runner=runner(draft_space)
+        )
+
+    shared = SimpleNamespace(key="full", write=None)
+    folding = SimpleNamespace(folds_static_verify_commit=True)
+    cases = {
+        "shared": (folding, injector(shared, shared), True),
+        "opted_out": (SimpleNamespace(), injector(shared, shared), False),
+        "no_injector": (folding, None, False),
+        "other_space": (
+            folding,
+            injector(shared, SimpleNamespace(key="draft", write=None)),
+            False,
+        ),
+        "remapped_write": (
+            folding,
+            injector(SimpleNamespace(key="full", write=object()), shared),
+            False,
+        ),
+        "no_full_space": (folding, injector(None, shared), False),
+    }
+    for name, (draft_model, kv_injector, folds) in cases.items():
+        got = dspark_verify.draft_folds_static_commit(
+            draft_model=draft_model, kv_injector=kv_injector
+        )
+        assert got is folds, name
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

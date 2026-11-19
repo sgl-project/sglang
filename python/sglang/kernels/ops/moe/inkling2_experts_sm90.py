@@ -56,6 +56,7 @@ def _fake_quantize_rows(
     X,
     Y,
     Amax,
+    XS,
     K: tl.constexpr,
     AMAX_BLOCK: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -66,26 +67,28 @@ def _fake_quantize_rows(
         amax = tl.zeros((), tl.float32)
         for chunk in range(tl.cdiv(K, BLOCK)):
             cols = chunk * BLOCK + tl.arange(0, BLOCK)
-            x = tl.load(X + row * K + cols, cols < K, other=0).to(tl.float32)
+            x = tl.load(X + row * XS + cols, cols < K, other=0).to(tl.float32)
             amax = tl.maximum(amax, tl.max(tl.abs(x), 0))
         tl.store(Amax + row, amax)
         for chunk in range(tl.cdiv(K, BLOCK)):
-            _fake_quantize_chunk(X, Y, row, chunk, amax, K, BLOCK)
+            _fake_quantize_chunk(X, Y, row, chunk, amax, XS, K, BLOCK)
     else:
         chunk = tl.program_id(1)
         full = tl.arange(0, AMAX_BLOCK)
         amax = tl.max(
-            tl.abs(tl.load(X + row * K + full, full < K, other=0).to(tl.float32)), 0
+            tl.abs(tl.load(X + row * XS + full, full < K, other=0).to(tl.float32)), 0
         )
         if chunk == 0:
             tl.store(Amax + row, amax)
-        _fake_quantize_chunk(X, Y, row, chunk, amax, K, BLOCK)
+        _fake_quantize_chunk(X, Y, row, chunk, amax, XS, K, BLOCK)
 
 
 @triton.jit
-def _fake_quantize_chunk(X, Y, row, chunk, amax, K: tl.constexpr, BLOCK: tl.constexpr):
+def _fake_quantize_chunk(
+    X, Y, row, chunk, amax, XS, K: tl.constexpr, BLOCK: tl.constexpr
+):
     cols = chunk * BLOCK + tl.arange(0, BLOCK)
-    x = tl.load(X + row * K + cols, cols < K, other=0).to(tl.float32)
+    x = tl.load(X + row * XS + cols, cols < K, other=0).to(tl.float32)
     y = _nvfp4_values(tl.reshape(x, (BLOCK // 16, 16)), amax)
     tl.store(
         Y + row * K + cols, tl.reshape(y, (BLOCK,)).to(Y.dtype.element_ty), cols < K
@@ -118,7 +121,8 @@ def _nvfp4_values(x, amax):
 def fake_quantize(x: torch.Tensor):
     """Rows of x as BF16 NVFP4 values without the outer scale, plus each row's amax."""
     rows, width = x.shape
-    y = torch.empty_like(x, dtype=torch.bfloat16)
+    assert x.stride(1) == 1
+    y = torch.empty((rows, width), dtype=torch.bfloat16, device=x.device)
     amax = torch.empty(rows, dtype=torch.float32, device=x.device)
     if rows:
         loop = rows >= ROW_LOOP_MIN_ROWS
@@ -126,6 +130,7 @@ def fake_quantize(x: torch.Tensor):
             x,
             y,
             amax,
+            x.stride(0),
             width,
             triton.next_power_of_2(width),
             256,
@@ -136,10 +141,10 @@ def fake_quantize(x: torch.Tensor):
 
 
 @triton.jit
-def _fake_quantize_mxfp8_rows(X, Y, K: tl.constexpr, BLOCK: tl.constexpr):
+def _fake_quantize_mxfp8_rows(X, Y, XS, K: tl.constexpr, BLOCK: tl.constexpr):
     row = tl.program_id(0).to(tl.int64)
     cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-    x = tl.load(X + row * K + cols, cols < K, other=0).to(tl.float32)
+    x = tl.load(X + row * XS + cols, cols < K, other=0).to(tl.float32)
     values, exponent = _mxfp8_block(tl.reshape(x, (BLOCK // 32, 32)))
     y = values.to(tl.float32) * _ue8m0(exponent)[:, None]
     tl.store(Y + row * K + cols, tl.reshape(y, (BLOCK,)).to(tl.bfloat16), cols < K)
@@ -148,11 +153,13 @@ def _fake_quantize_mxfp8_rows(X, Y, K: tl.constexpr, BLOCK: tl.constexpr):
 def fake_quantize_mxfp8(x: torch.Tensor):
     """Rows of x as BF16 MXFP8 values."""
     rows, width = x.shape
-    y = torch.empty_like(x, dtype=torch.bfloat16)
+    assert x.stride(1) == 1
+    y = torch.empty((rows, width), dtype=torch.bfloat16, device=x.device)
     if rows:
         _fake_quantize_mxfp8_rows[(rows, triton.cdiv(width, 256))](
             x,
             y,
+            x.stride(0),
             width,
             256,
             enable_fp_fusion=False,

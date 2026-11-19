@@ -1812,7 +1812,7 @@ class FlashAttentionBackend(AttentionBackend):
             kwargs["k_descale"] = fa_k_descale
             kwargs["v_descale"] = fa_v_descale
         if rel_bias is not None:
-            if ver != 4:
+            if ver != 4 and not rel_bias_compact_decode:
                 raise RuntimeError(
                     "rel_bias (sheared bias) is only supported by the FA4 backend."
                 )
@@ -1838,14 +1838,15 @@ class FlashAttentionBackend(AttentionBackend):
             if getattr(forward_batch, "_attn_output", None) is not None
             else None
         )
-        if layer.out_dtype is not None and _fa_out is None:
-            if self.fa_impl_ver != 4:
+        if layer.out_dtype is not None and not rel_bias_compact_decode:
+            if ver != 4:
                 raise ValueError("Explicit attention output dtype requires FA4")
-            _fa_out = torch.empty(
-                (q.shape[0], layer.tp_q_head_num, layer.v_head_dim),
-                dtype=layer.out_dtype,
-                device=q.device,
-            )
+            if _fa_out is None:
+                _fa_out = torch.empty(
+                    (q.shape[0], layer.tp_q_head_num, layer.v_head_dim),
+                    dtype=layer.out_dtype,
+                    device=q.device,
+                )
 
         # Get the appropriate page table based on whether we're using local attention
         if use_local_attn:
@@ -1882,7 +1883,7 @@ class FlashAttentionBackend(AttentionBackend):
 
         if layer.window_anchor_at_start:
             if (
-                self.fa_impl_ver != 4
+                ver != 4
                 or not is_swa_layer
                 or causal
                 or use_local_attn
@@ -2369,6 +2370,8 @@ class FlashAttentionBackend(AttentionBackend):
         rel_bias_compact_decode: bool = False,
         rel_bias_decode_epilogue=None,
     ) -> torch.Tensor:
+        if layer.window_anchor_at_start:
+            raise NotImplementedError("Block-anchored windows are extend-only")
         ver = self._ver_for(layer)
         if score_mod is not None and ver != 4:
             raise RuntimeError("score_mod is only supported by the FA4 backend.")
@@ -2447,7 +2450,7 @@ class FlashAttentionBackend(AttentionBackend):
             kwargs["aux_tensors"] = aux_tensors
         kwargs.update(self._mxfp8_sf_kwargs(layer, forward_batch, q_descale))
         if rel_bias is not None:
-            if ver != 4:
+            if ver != 4 and not rel_bias_compact_decode:
                 raise RuntimeError(
                     "rel_bias (sheared bias) is only supported by the FA4 backend."
                 )
@@ -2471,14 +2474,15 @@ class FlashAttentionBackend(AttentionBackend):
             if getattr(forward_batch, "_attn_output", None) is not None
             else None
         )
-        if layer.out_dtype is not None and _fa_out is None:
-            if self.fa_impl_ver != 4:
+        if layer.out_dtype is not None and not rel_bias_compact_decode:
+            if ver != 4:
                 raise ValueError("Explicit attention output dtype requires FA4")
-            _fa_out = torch.empty(
-                (q.shape[0], layer.tp_q_head_num, layer.v_head_dim),
-                dtype=layer.out_dtype,
-                device=q.device,
-            )
+            if _fa_out is None:
+                _fa_out = torch.empty(
+                    (q.shape[0], layer.tp_q_head_num, layer.v_head_dim),
+                    dtype=layer.out_dtype,
+                    device=q.device,
+                )
 
         q, q_rope, k_rope, fa_k_descale, fa_v_descale = self.prepare_paged_mha_query(
             q,

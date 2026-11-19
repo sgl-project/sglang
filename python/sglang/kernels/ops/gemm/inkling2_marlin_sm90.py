@@ -101,7 +101,7 @@ def repack_mxfp8(weight, scales):
 
 
 @functools.cache
-def _workspace(device):
+def _workspace(device, stream):
     return marlin_make_workspace(device, 4), torch.zeros(1, device=device)
 
 
@@ -190,6 +190,9 @@ def gemm(xq, marlin, out_size, routing, top_k):
     out = torch.empty((rows * top_k, out_size), dtype=torch.bfloat16, device=xq.device)
     if rows:
         sorted_ids, expert_ids, num_padded, size = routing
+        workspace, topk_weights = _workspace(
+            xq.device, torch.cuda.current_stream(xq.device).cuda_stream
+        )
         moe_wna16_marlin_gemm(
             xq,
             out,
@@ -200,11 +203,11 @@ def gemm(xq, marlin, out_size, routing, top_k):
             None,
             None,
             None,
-            _workspace(xq.device)[0],
+            workspace,
             sorted_ids,
             expert_ids,
             num_padded,
-            _workspace(xq.device)[1],
+            topk_weights,
             moe_block_size=size,
             top_k=top_k,
             mul_topk_weights=False,
@@ -228,10 +231,10 @@ def gemm(xq, marlin, out_size, routing, top_k):
 def _gemv_module(nvfp4, n, k, splits, warps):
     args = f"{str(nvfp4).lower()}, {n}, {k}, {splits}, {warps}"
     return load_jit(
-        "inkling2_marlin_gemv",
+        "marlin_moe_gemv",
         *(str(a) for a in (nvfp4, n, k, splits, warps)),
-        cuda_files=["inkling2/marlin_gemv.cuh"],
-        cuda_wrappers=[("run", f"inkling2_marlin_gemv::run<{args}>")],
+        cuda_files=["gemm/marlin_moe/marlin_moe_gemv.cuh"],
+        cuda_wrappers=[("run", f"marlin_moe_gemv::run<{args}>")],
     )
 
 
@@ -255,6 +258,11 @@ def gemv(xq, marlin, out_size, metadata, top_k, tokens, splits=None, warps=None)
     out = torch.empty((rows * top_k, out_size), dtype=torch.bfloat16, device=xq.device)
     if splits is None:
         splits, warps = _gemv_config(tokens, width)
+    if out_size % 64 or width % (16 * splits * warps):
+        raise ValueError(
+            f"Marlin MoE GEMV needs N % 64 == 0 and K % {16 * splits * warps} == 0,"
+            f" got N={out_size}, K={width}"
+        )
     slots = min(counts.numel(), rows * top_k)
     if slots:
         module = _gemv_module(global_scale is not None, out_size, width, splits, warps)

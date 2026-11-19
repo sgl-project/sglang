@@ -1116,6 +1116,16 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         # A draft layout the linker cannot pack must not claim a restore.
         self.assertFalse(build((object(),)).restores_sidecar_drafts)
 
+        # A dense draft on the target's SWA ids has SWA-pool rows; copying it
+        # with full-attention page ids reads the wrong rows or past its end.
+        swa_id_draft = mha(4, 1, 3)
+        swa_id_draft.follows_target_swa_ids = True
+        group = build((swa_id_draft,))
+        self.assertEqual(group.entry_map[PoolName.KV].layer_mapping, {1: (0, 1)})
+        self.assertEqual(
+            group.entry_map[PoolName.SWA].layer_mapping, {0: (0, 2), 2: (1, 3, 4, 5)}
+        )
+
     def test_minimax_m31_nvfp4_maps_page_rows_and_draft(self):
         from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
         from sglang.srt.mem_cache.minimax_m3_nvfp4_pool import (

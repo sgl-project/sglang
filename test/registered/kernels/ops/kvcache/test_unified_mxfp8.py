@@ -18,7 +18,7 @@ pytestmark = pytest.mark.skipif(
 PS, HD = 128, 128
 
 
-def _make_unified_pool(heads):
+def _make_unified_pool(heads, page_size=PS):
     from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec, MHAView
     from sglang.test.unified_allocator_fixtures import arena_of
 
@@ -36,9 +36,14 @@ def _make_unified_pool(heads):
         for name, grow in (("full", "down"), ("swa", "up"))
     ]
     arena = arena_of(
-        specs, total_bytes=8 * PS * specs[0].entry_bytes(), device="cuda", page_size=PS
+        specs,
+        total_bytes=8 * PS * specs[0].entry_bytes(),
+        device="cuda",
+        page_size=page_size,
     )
-    return MHAView(arena=arena, spec=specs[0], page_size=PS, model_layer_ids=(0, 1))
+    return MHAView(
+        arena=arena, spec=specs[0], page_size=page_size, model_layer_ids=(0, 1)
+    )
 
 
 @pytest.mark.parametrize("pack_gqa", [False, True], ids=["unpacked", "packed"])
@@ -77,9 +82,15 @@ def test_fa4_matches_mxfp8_and_bf16_references(
         torch.randn(loc.numel(), heads, HD, device="cuda", dtype=torch.bfloat16)
         for _ in range(2)
     ]
-    for pool in (unified, static):
+    small_pages = _make_unified_pool(heads, page_size=16)
+    for pool in (unified, static, small_pages):
         pool.set_kv_buffer(
             SimpleNamespace(layer_id=0), KVWriteLoc(loc, physical=True), k, v
+        )
+    for family in ("k_buffer", "v_buffer", "k_scale_buffer", "v_scale_buffer"):
+        assert torch.equal(
+            getattr(small_pages, family)[0][loc].view(torch.uint8),
+            getattr(unified, family)[0][loc].view(torch.uint8),
         )
     q = to_mxfp8(
         torch.randn(query_tokens, query_heads, HD, device="cuda", dtype=torch.bfloat16)

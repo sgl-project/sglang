@@ -553,7 +553,8 @@ class DefaultModelLoader(BaseModelLoader):
         elif load_format == LoadFormat.MISTRAL:
             use_safetensors = True
             allow_patterns = ["consolidated*.safetensors"]
-            index_file = "consolidated.safetensors.index.json"
+            if index_file is not None:
+                index_file = "consolidated.safetensors.index.json"
         elif load_format == LoadFormat.PT:
             allow_patterns = ["*.pt"]
         elif load_format == LoadFormat.NPCACHE:
@@ -4042,6 +4043,12 @@ class RunaiModelStreamerLoader(BaseModelLoader):
             if allow_patterns_overrides is not None
             else ["*.safetensors"]
         )
+        for pattern in allow_patterns:
+            if glob.has_magic(os.path.dirname(pattern)):
+                raise ValueError(
+                    "RunAI streamer loading does not support directory wildcards "
+                    f"in weight pattern: {pattern!r}"
+                )
         index_file = safetensors_index_file
 
         hf_folder = (
@@ -4066,11 +4073,6 @@ class RunaiModelStreamerLoader(BaseModelLoader):
         hf_weights_files = []
         for pattern in allow_patterns:
             subfolder = os.path.dirname(pattern)
-            if is_object_storage_path and glob.has_magic(subfolder):
-                raise ValueError(
-                    "RunAI object-storage loading does not support directory wildcards "
-                    f"in weight pattern: {pattern!r}"
-                )
             search_path = os.path.join(hf_folder, subfolder) if subfolder else hf_folder
             hf_weights_files = [
                 path
@@ -4343,13 +4345,14 @@ def get_model_loader(
         return RunaiModelStreamerLoader(load_config)
 
     if load_config.load_format == LoadFormat.IPC_CACHE:
-        from sglang.srt.weight_cache.ipc_loader import IpcModelLoader
+        from sglang.srt.weight_cache.ipc_loader import WeightCacheModelLoader
 
-        return IpcModelLoader(
+        return WeightCacheModelLoader(
             load_config=load_config,
             socket_path=load_config.weight_cache_socket,
             weight_cache_mode=load_config.weight_cache_mode,
             fallback_load_format=load_config.fallback_load_format,
+            weight_cache_transport=load_config.weight_cache_transport,
         )
 
     return DefaultModelLoader(load_config)

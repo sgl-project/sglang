@@ -89,6 +89,25 @@ def target_model_type(target_worker) -> Optional[str]:
     )
 
 
+def draft_folds_static_commit(
+    *, draft_model, kv_injector: Optional[TargetHiddenKvInjector]
+) -> bool:
+    """The draft opts in and its FULL slots are the target's, unremapped, so it
+    can store the verify commit at the target's cache locations."""
+    if kv_injector is None or not getattr(
+        draft_model, "folds_static_verify_commit", False
+    ):
+        return False
+    target = kv_injector.model_runner.runner_ids.space(IdSpaceKind.FULL)
+    draft = kv_injector.draft_model_runner.runner_ids.space(IdSpaceKind.FULL)
+    return (
+        target is not None
+        and draft is not None
+        and draft.key == target.key
+        and target.write is None
+    )
+
+
 def verify_logits_adjustments_are_noop(sampling_info) -> bool:
     if sampling_info is None:
         return True
@@ -1004,18 +1023,10 @@ class DsparkVerifyEpilogue:
         return self._draft_folds_static_commit_cache
 
     def _resolve_draft_folds_static_commit(self) -> bool:
-        if (
-            self.commit_ctx is None
-            or self.commit_ctx.kv_injector is None
-            or not getattr(
-                self.commit_ctx.draft_model, "folds_static_verify_commit", False
-            )
-        ):
-            return False
-        injector = self.commit_ctx.kv_injector
-        target = injector.model_runner.runner_ids.space(IdSpaceKind.FULL)
-        draft = injector.draft_model_runner.runner_ids.space(IdSpaceKind.FULL)
-        return draft.key == target.key and target.write is None
+        return self.commit_ctx is not None and draft_folds_static_commit(
+            draft_model=self.commit_ctx.draft_model,
+            kv_injector=self.commit_ctx.kv_injector,
+        )
 
     @property
     def folds_static_commit(self) -> bool:
