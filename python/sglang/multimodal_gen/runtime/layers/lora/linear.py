@@ -78,6 +78,22 @@ def _compute_lora_delta(
     )
 
 
+def _lora_compute_dtype(x: torch.Tensor, lora_dtype: torch.dtype) -> torch.dtype:
+    """Dtype of the unmerged LoRA matmuls.
+
+    An fp16 adapter on bf16/fp32 activations computes in the activations'
+    dtype (the autocast dtype under autocast, e.g. Wan), as a bf16 adapter
+    would: cast to fp16, DiT activations beyond 65504 overflow to inf and the
+    output turns into NaN (a black image). Other adapters compute in their own
+    dtype, as before.
+    """
+    if lora_dtype != torch.float16 or x.dtype == torch.float16:
+        return lora_dtype
+    if torch.is_autocast_enabled(x.device.type):
+        return torch.get_autocast_dtype(x.device.type)
+    return x.dtype
+
+
 def _can_add_lora_delta_in_gemm(
     out: torch.Tensor, lora_A: torch.Tensor, lora_B: torch.Tensor
 ) -> bool:
@@ -126,7 +142,9 @@ def _add_lora_delta_in_gemm(
             for g in range(lora_B.shape[0])
         ]
     for target, rows, b in groups:
-        if target.dtype == rows.dtype:
+        # autocast (e.g. Wan) runs the shrink GEMM in bf16 whatever the adapter
+        # dtype, and the in-place addmm_ needs all three operands to match
+        if target.dtype == rows.dtype == b.dtype:
             target.addmm_(rows, b.t())
         else:
             target.add_(rows @ b.t())
@@ -273,12 +291,13 @@ class BaseLayerWithLoRA(nn.Module):
             lora_B = lora_B.to_local()
             lora_A = lora_A.to_local()
 
-        x_lora = x.to(dtype=lora_A.dtype)
+        dtype = _lora_compute_dtype(x, lora_A.dtype)
+        x_lora = x.to(dtype=dtype)
         lora_A = self.slice_lora_a_weights(
-            lora_A.to(device=x.device, non_blocking=True)
+            lora_A.to(device=x.device, dtype=dtype, non_blocking=True)
         )
         lora_B = self.slice_lora_b_weights(
-            lora_B.to(device=x.device, non_blocking=True)
+            lora_B.to(device=x.device, dtype=dtype, non_blocking=True)
         )
         if _can_add_lora_delta_in_gemm(out, lora_A, lora_B):
             scale = strength * runtime_lora_scale
@@ -360,7 +379,10 @@ class BaseLayerWithLoRA(nn.Module):
             A, B = self._fused_lora_factors(device=x.device, swiglu_rows=swiglu_rows)
             if len(self.lora_weights_list) > 1:
                 # Reuse the multi-adapter math; the factors above supply local width.
-                delta = B.new_zeros((x_2d.shape[0], B.shape[0]))
+                delta = B.new_zeros(
+                    (x_2d.shape[0], B.shape[0]),
+                    dtype=_lora_compute_dtype(x_2d, B.dtype),
+                )
                 delta = self._add_lora_delta(delta, x_2d, runtime_lora_scale)
                 if swiglu_rows:
                     delta = self._interleave_swiglu_rows(delta.T).T
@@ -368,10 +390,11 @@ class BaseLayerWithLoRA(nn.Module):
                 scale = self.strength * runtime_lora_scale
                 if self.lora_alpha != self.lora_rank:
                     scale *= self.lora_alpha / self.lora_rank  # type: ignore
-                hidden = x_2d.to(dtype=A.dtype) @ A.T
+                dtype = _lora_compute_dtype(x_2d, A.dtype)
+                hidden = x_2d.to(dtype=dtype) @ A.to(dtype=dtype).T
                 if scale != 1.0:
                     hidden = hidden * scale
-                delta = hidden @ B.T
+                delta = hidden @ B.to(dtype=dtype).T
         offset = self._active_lora_output_offset()
         if offset is not None:
             offset = offset.to(device=x.device) * runtime_lora_scale
