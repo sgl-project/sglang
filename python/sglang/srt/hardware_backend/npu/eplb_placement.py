@@ -56,10 +56,11 @@ def _align_placement(old, physical, logical, local_experts, ranks_per_node):
             wanted = np.zeros_like(resident)
             resident[ranks[:, None], live] = 1
             wanted[ranks[:, None], planned] = 1
-            hits = resident @ wanted.T
-            _, sources = linear_sum_assignment(hits, maximize=True)
-            if hits[ranks, sources].sum() == hits.trace():
-                sources = ranks
+            receives = wanted.sum(axis=1) - resident @ wanted.T
+            endpoint = receives
+            if ranks_per_node == len(slots):
+                endpoint = np.maximum(receives, _send_upper_bound(resident, wanted))
+            sources = _assign_ranks(receives, endpoint)
             for dest, source in enumerate(sources):
                 matches = live[dest, :, None] == planned[source, None, :]
                 planned_slots = slots[start + source]
@@ -73,6 +74,51 @@ def _align_placement(old, physical, logical, local_experts, ranks_per_node):
                 order[layer, start + dest] = planned_slots
 
     return _reindex_placement(physical, logical, order)
+
+
+def _send_upper_bound(resident, wanted):
+    """Bound each single-node sender's rows for every prospective target group."""
+    owners = resident.sum(axis=0)
+    destinations = wanted.sum(axis=0)
+    # The updater divides remote destinations evenly among current owners,
+    # giving one extra destination to the first owners in rank order.
+    position = resident.cumsum(axis=0) - 1
+    quotient, remainder = np.divmod(destinations, owners)
+    sends = (resident * (quotient + (position < remainder))).sum(axis=1)
+    # A resident hit removes the last destination. Other owners may keep a
+    # copy too, so this is an upper bound, exact for single-owner experts.
+    saves_send = resident * (position == (destinations - 1) % owners)
+    return sends[:, None] - saves_send @ wanted.T
+
+
+def _assign_ranks(receives, endpoint):
+    """Minimize total receives, then the maximum estimated endpoint load."""
+    from scipy.optimize import linear_sum_assignment
+
+    ranks = np.arange(len(receives))
+    _, assignment = linear_sum_assignment(receives)
+    assigned = receives[ranks, assignment]
+    total = assigned.sum()
+    high = endpoint[ranks, assignment].max()
+    low = max(
+        (total + len(ranks) - 1) // len(ranks),
+        endpoint.min(axis=0).max(),
+        endpoint.min(axis=1).max(),
+    )
+    # A cap is feasible if an assignment still attains the original total.
+    # A forbidden edge alone costs more than that total.
+    while low < high:
+        cap = (low + high) // 2
+        limited = np.where(endpoint <= cap, receives, total + 1)
+        _, candidate = linear_sum_assignment(limited)
+        if limited[ranks, candidate].sum() == total:
+            assignment = candidate
+            high = endpoint[ranks, candidate].max()
+        else:
+            low = cap + 1
+    if receives.trace() == total and endpoint.diagonal().max() <= high:
+        return ranks
+    return assignment
 
 
 def _reindex_placement(physical, logical, order):
