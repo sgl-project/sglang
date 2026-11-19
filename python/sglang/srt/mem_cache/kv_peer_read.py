@@ -10,15 +10,21 @@ the copy engines (``copy_engine=True``).
 Contract:
 
 - A batch is checked as a whole before anything is enqueued: page bounds on both
-  sides, alignment, and that every destination is memory of the reader's device
-  and not an imported region. A rejected batch never touches memory.
+  sides, alignment, that both ends of every destination buffer are memory of the
+  reader's device, and that no destination is an imported region. A rejected
+  batch (ValueError, or PeerReadError from a fail-stopped reader) touches nothing.
+- The caller vouches that each destination buffer is its own memory and that the
+  dst_pages of a group are distinct; one source page may go to several.
 - Until a batch is released, the caller keeps its source pages unchanged and its
   destination pages allocated and free of other writers, including other reads.
 - Groups of a batch complete in order, one event each.
 - A failed batch is FAILED_DRAINED when the reader's stream then synchronizes
-  cleanly, FAILED_UNCERTAIN otherwise. An uncertain batch, including one whose
-  enqueue failed without draining, fail-stops the reader and is never released,
-  so its regions stay mapped for the life of the process.
+  cleanly, FAILED_UNCERTAIN otherwise. An uncertain batch fail-stops the reader
+  and is never released, so its regions stay mapped for the life of the process.
+- Any other error from read() comes from enqueueing: no batch is returned, and
+  groups enqueued before it may have written their destinations. If the stream
+  then drains, nothing is left in flight; otherwise the reader fail-stops as above.
+- A descriptor is refused only when both fabric cliques are known and differ.
 - The owner may reuse an exported allocation only after every reader it went to
   has released its batches on it and unmapped it.
 """
