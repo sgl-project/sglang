@@ -596,7 +596,6 @@ def _load_image(
         image_tensor = decode_jpeg_with_dvpp(image_bytes)
         if image_tensor is not None:
             return image_tensor
-        # Unsupported devices/images return None; execution errors propagate.
     try:
         image = Image.open(BytesIO(image_bytes))
     except (OSError, SyntaxError) as e:
