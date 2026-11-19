@@ -27,6 +27,7 @@ from sglang.srt.arg_groups.choices import (
     LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
     MOE_RUNNER_BACKEND_CHOICES,
     RL_ON_POLICY_TARGET_CHOICES,
+    reject_removed_choice,
 )
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -48,20 +49,10 @@ def _paged_experts_num_resident(value: str) -> Optional[int]:
     )
 
 
-def _parse_attention_backend_arg(value: str) -> str:
-    """Reject the retired alias before argparse checks supported choices."""
-    if value == "compressed":
-        raise argparse.ArgumentTypeError("compressed was removed; use dsv4")
-    return value
-
-
 class ExecFeatures(msgspec.Struct):
     """Namespace ``exec.features``."""
 
     _NS_PATH = "exec.features"
-    disable_outlines_disk_cache: A[
-        Optional[bool], Arg(help="Deprecated. Has no effect.", no_cli=True)
-    ] = None
     enable_fp32_lm_head: A[
         bool,
         "If set, the LM head outputs (logits) are in FP32.",
@@ -227,9 +218,6 @@ class ExecKernel(msgspec.Struct):
     """Namespace ``exec.kernel``."""
 
     _NS_PATH = "exec.kernel"
-    triton_attention_reduce_in_fp32: A[
-        Optional[bool], Arg(help="Deprecated. Has no effect.", no_cli=True)
-    ] = None
 
     # -------------------------------------------------------------------------
     # Kernel backend
@@ -239,7 +227,7 @@ class ExecKernel(msgspec.Struct):
         Arg(
             help="Choose the kernels for attention layers.",
             choices=ATTENTION_BACKEND_CHOICES,
-            type_parser=_parse_attention_backend_arg,
+            type_parser=reject_removed_choice("attention_backend"),
             resolvable=True,
         ),
     ] = None
@@ -248,7 +236,7 @@ class ExecKernel(msgspec.Struct):
         Arg(
             help="Choose the kernels for decode attention layers (have priority over --attention-backend).",
             choices=ATTENTION_BACKEND_CHOICES,
-            type_parser=_parse_attention_backend_arg,
+            type_parser=reject_removed_choice("decode_attention_backend"),
             resolvable=True,
         ),
     ] = None
@@ -269,7 +257,7 @@ class ExecKernel(msgspec.Struct):
         Arg(
             help="Choose the kernels for prefill attention layers (have priority over --attention-backend).",
             choices=ATTENTION_BACKEND_CHOICES,
-            type_parser=_parse_attention_backend_arg,
+            type_parser=reject_removed_choice("prefill_attention_backend"),
             resolvable=True,
         ),
     ] = None
@@ -497,6 +485,12 @@ class ExecKernel(msgspec.Struct):
     enable_fp4_indexer: A[
         bool,
         "Use FP4 queries and index-K cache in the DSA lightning indexer of DeepSeek-V3.2-style sparse attention, ERNIE 5.5 Flash's MLA layers included; requires SM100. DeepSeek V4's C4 indexer has its own switch, --enable-deepseek-v4-fp4-indexer. Default keeps the FP8 indexer.",
+    ] = False
+    enable_dsa_fp4_indexer: A[
+        bool,
+        "Store the DSA indexer keys in MXFP4 and score them with AITER's FP4 MQA-logits kernels "
+        "(Kimi-K3.1 on gfx950 with DCP): the row-group kernel in decode and target verify, the "
+        "prefill kernel over the DCP-gathered keys in prefill.",
     ] = False
     enable_dsa_fused_indexer: A[
         Optional[bool],
@@ -873,7 +867,6 @@ class ExecComm(msgspec.Struct):
         Optional[bool],
         "Enable INT8 quantization of TP communications (limited support).",
     ] = False
-    enable_flashinfer_allreduce_fusion: A[bool, Arg(no_cli=True)] = False
     enforce_disable_flashinfer_allreduce_fusion: A[
         bool,
         "Enforce disable FlashInfer allreduce fusion.",
@@ -953,7 +946,6 @@ class ExecMoe(msgspec.Struct):
             "mori",
             "ascend_fuseep",
             "flashinfer_nvlink_one_sided",
-            "flashinfer",  # Deprecated alias for "flashinfer_nvlink_one_sided"
             "megamoe",
             "deepep_v2",
             "ascend_ops",
@@ -962,8 +954,8 @@ class ExecMoe(msgspec.Struct):
         ],
         Arg(
             help="Choose the backend for MoE A2A. 'flashinfer_nvlink_one_sided' is "
-            "FlashInfer's NVLink one-sided all-to-all; 'flashinfer' is a deprecated "
-            "alias for it.",
+            "FlashInfer's NVLink one-sided all-to-all.",
+            type_parser=reject_removed_choice("moe_a2a_backend"),
             choices=[
                 "none",
                 "deepep",
@@ -972,7 +964,6 @@ class ExecMoe(msgspec.Struct):
                 "mori",
                 "ascend_fuseep",
                 "flashinfer_nvlink_one_sided",
-                "flashinfer",  # Deprecated alias for "flashinfer_nvlink_one_sided"
                 "megamoe",
                 "deepep_v2",
                 "pplx",

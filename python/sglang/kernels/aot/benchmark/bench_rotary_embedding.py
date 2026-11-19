@@ -1,13 +1,9 @@
-import itertools
-import os
-
 import torch
 import triton
 from sgl_kernel.testing.rotary_embedding import (
     FlashInferRotaryEmbedding,
     FusedSetKVBufferArg,
     MHATokenToKVPool,
-    RotaryEmbedding,
     create_inputs,
 )
 

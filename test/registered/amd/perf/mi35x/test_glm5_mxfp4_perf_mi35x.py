@@ -5,7 +5,7 @@ Benchmarks the AMD Quark MXFP4-quantized GLM-5 model on MI35x with 8 GPUs.
 Model: amd/GLM-5-MXFP4 (MOE-only MXFP4 quantization of zai-org/GLM-5)
 Reference: https://huggingface.co/amd/GLM-5-MXFP4
 
-Registry: nightly-perf-8-gpu-mi35x-glm5-mxfp4 suite
+Registry: nightly-perf-test-8-gpu-amd-mi35x-glm5-mxfp4 suite
 """
 
 import os
@@ -19,7 +19,7 @@ from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, _parse_int_list_env
 
 register_amd_ci(
     est_time=18000,
-    suite="nightly-perf-8-gpu-mi35x-glm5-mxfp4",
+    suite="nightly-perf-test-8-gpu-amd-mi35x-glm5-mxfp4",
     nightly=True,
     disabled="Older model generation; AMD nightly keeps the latest two per family",
 )
