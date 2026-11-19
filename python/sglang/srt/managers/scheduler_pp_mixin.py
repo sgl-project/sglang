@@ -367,6 +367,7 @@ class SchedulerPPMixin:
         send_release_work = []
         send_relay_work = []
         write_settle_controller = self._pp_write_settle_controller()
+        self._pp_settle_state_victims(controller=write_settle_controller)
 
         while True:
             server_is_idle = True
@@ -759,6 +760,29 @@ class SchedulerPPMixin:
             "HiCache write_back eviction copies wait for the last processed forward"
         )
         return controller
+
+    def _pp_settle_state_victims(
+        self: Scheduler, controller: Optional[HiCacheController]
+    ) -> None:
+        """Let an eviction walk's internal state backups wait for the last processed
+        forward too; the WAR barrier keeps them behind the newest barriered forward."""
+        if controller is None:
+            return
+        if envs.SGLANG_OPT_HICACHE_WB_SETTLED_STATE_VICTIM.get():
+            decline = None if self._war_barrier_enabled else "no WAR barrier"
+        elif envs.SGLANG_OPT_HICACHE_WB_SETTLED_STATE_VICTIM.is_set():
+            decline = "SGLANG_OPT_HICACHE_WB_SETTLED_STATE_VICTIM=0"
+        else:
+            # Off by default (unset, runtime master off): no line.
+            return
+        if decline is None:
+            controller.write_settle_state_victims = True
+            logger.info(
+                "SGLANG_OPT_HICACHE_WB_SETTLED_STATE_VICTIM engaged: HiCache write_back "
+                "state eviction copies wait for the last processed forward"
+            )
+            return
+        logger.info("SGLANG_OPT_HICACHE_WB_SETTLED_STATE_VICTIM declined: %s", decline)
 
     def _pp_publish_write_settle_event(
         self: Scheduler, controller: Optional[HiCacheController], mb_id: int

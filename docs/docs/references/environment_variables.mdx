@@ -208,6 +208,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_OPT_HICACHE_WB_SETTLED_STATE_VICTIM`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Allow a PP disaggregated prefill with HiCache `write_back` to count a device eviction walk's internal Mamba or SWA state backup as an eviction victim's copy, so the copy waits for the last processed forward instead of the forward in flight when its runtime checks pass (`SGLANG_ENABLE_HICACHE_WB_EVICT_RELAXED_FENCE` on, the scheduler's write-after-read barrier on, and the backup reads only that node). When unset, this follows `SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION`; an explicit `0` or `1` takes precedence.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Follows the NVIDIA runtime master (both unset: <code>false</code>)</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_ENABLE_TORCH_INFERENCE_MODE`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Control whether to use torch.inference_mode</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`false`</td>

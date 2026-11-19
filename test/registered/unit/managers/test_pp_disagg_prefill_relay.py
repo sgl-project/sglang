@@ -114,6 +114,7 @@ class _Stage:
             "_pp_answer_release_requests",
             "_pp_write_settle_controller",
             "_pp_publish_write_settle_event",
+            "_pp_settle_state_victims",
         ):
             setattr(s, name, MethodType(getattr(SchedulerPPMixin, name), s))
         for name in (
@@ -427,6 +428,7 @@ class TestLoopEntry(CustomTestCase):
                     pp_loop_size=1,
                     increment_scheduler_iterations=stop,
                     _pp_write_settle_controller=lambda: None,
+                    _pp_settle_state_victims=lambda controller: None,
                 )
                 environ = {
                     **{k: v for k, v in os.environ.items() if k not in (master, child)},

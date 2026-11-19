@@ -466,6 +466,9 @@ class HiCacheController:
         # Set by the PP disaggregated-prefill loop: the forward-done event of the
         # last micro-batch whose result was processed (see start_writing).
         self.write_settle_event = None
+        # Set by the same loop: an eviction walk's internal state backups also count
+        # as victim copies (see UnifiedRadixCache.backup_node_for_write_back).
+        self.write_settle_state_victims = False
         self.ack_write_queue: List[HiCacheAck] = []
 
         self.l2_transfer_engine = L2TransferEngine(io_backend)
@@ -1116,8 +1119,8 @@ class HiCacheController:
             and op.settled
             and self.write_settle_event is not None
         ):
-            # Every part is an unlocked eviction victim, inserted when a result was
-            # processed, so forwards up to write_settle_event wrote all it reads.
+            # Every part is an eviction victim no request holds; the forwards that wrote
+            # it ended by write_settle_event or, for a state victim, by the WAR wait.
             self.l2_transfer_engine.device_to_host_stream.wait_event(
                 self.write_settle_event
             )

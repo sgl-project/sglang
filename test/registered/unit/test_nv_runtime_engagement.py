@@ -31,6 +31,7 @@ from sglang.srt.layers.moe.token_dispatcher import flashinfer as a2a_dispatcher
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.managers import scheduler_pp_mixin
 from sglang.srt.managers.scheduler_components import dp_sync_exchange, shm_tag_exchange
+from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 from sglang.srt.models.qwen3_5 import Qwen3_5MoeForConditionalGeneration
 from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.server_args import ServerArgs
@@ -314,6 +315,19 @@ def _pp_proxy_recv_after_forward(shape: Shape) -> bool:
     )
 
 
+def _settled_state_victim(shape: Shape) -> bool:
+    if not (
+        _pp_prefill_loop(shape)
+        and shape.args.get("hicache_write_policy") == "write_back"
+    ):
+        return False
+    controller = SimpleNamespace(write_settle_state_victims=False)
+    SchedulerPPMixin._pp_settle_state_victims(
+        SimpleNamespace(_war_barrier_enabled=True), controller=controller
+    )
+    return controller.write_settle_state_victims
+
+
 def _dp_post_verify_graphs(shape: Shape) -> bool:
     # The megakernel plugin binds the gathered verify sampler under the master.
     hooks = SimpleNamespace(
@@ -358,6 +372,7 @@ RESOLVERS: Dict[str, Callable[[Shape], bool]] = {
     "SGLANG_OPT_PP_PREFILL_EARLY_FINISH": _pp_early_finish,
     "SGLANG_OPT_PP_EARLY_RELAY": _pp_early_relay,
     "SGLANG_OPT_PP_PROXY_RECV_AFTER_FORWARD": _pp_proxy_recv_after_forward,
+    "SGLANG_OPT_HICACHE_WB_SETTLED_STATE_VICTIM": _settled_state_victim,
     "SGLANG_OPT_SPEC_DP_POST_VERIFY_GRAPHS": _dp_post_verify_graphs,
     "SGLANG_OPT_MOE_A2A_OUTPUT_IN_WORKSPACE": _a2a_output_in_workspace,
     "SGLANG_OPT_TP_LM_HEAD_ALL_TO_ALL_FP32": _tp_lm_head_fp32,
@@ -463,7 +478,8 @@ EXPECTED = {
     | _QWEN35_TP_SPEC
     | _children(),
     "decode-tp8-one-request": _PD_DECODE | _PD_DECODE_TP | _TWO_HOSTS | _QWEN35_TP_SPEC,
-    "prefill-tp1-pp2": _PP_PREFILL | _children("PP_PROXY_RECV_AFTER_FORWARD"),
+    "prefill-tp1-pp2": _PP_PREFILL
+    | _children("PP_PROXY_RECV_AFTER_FORWARD", "HICACHE_WB_SETTLED_STATE_VICTIM"),
     "aggregated-tp4": _QWEN35_TP_SPEC,
     "aggregated-tp8": _QWEN35_TP_SPEC,
     "decode-tp2": _PD_DECODE | _PD_DECODE_TP | _NO_STAGING | _QWEN35_TP_SPEC,

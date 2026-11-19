@@ -267,6 +267,7 @@ class TestLoopEntry(CustomTestCase):
                     output_streamer="streamer",
                     pp_group=SimpleNamespace(is_first_rank=True),
                     _pp_write_settle_controller=lambda: None,
+                    _pp_settle_state_victims=lambda controller: None,
                 )
                 environ = {
                     **{k: v for k, v in os.environ.items() if k not in (MASTER, CHILD)},

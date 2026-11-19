@@ -1119,7 +1119,7 @@ class UnifiedRadixCache(BasePrefixCache):
             mamba_host_pool = self.host_pool_group.get_pool(PoolName.MAMBA)
             if mamba_host_pool is not None and mamba_host_pool.available_size() < 1:
                 self.evict_host(1, self.slot_id(TREE_STATE))
-            self.backup_node_for_write_back(node_id)
+            self.backup_node_for_write_back(node_id=node_id, state_victim=True)
             result = self.tree_core.finish_mamba_state_eviction(node_id)
         elif result.swa_backup_node_id is not None:
             assert component_type in self.window_slots() and result.node_id is None
@@ -1140,7 +1140,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 and window_host_pool.available_size() < needed
             ):
                 self.evict_host(needed, component_type)
-            self.backup_node_for_write_back(node_id)
+            self.backup_node_for_write_back(node_id=node_id, state_victim=True)
             result = self.tree_core.finish_swa_state_eviction(node_id)
         self._apply_eviction_result(result)
         if self._tracks_write_through_unbacked_evictions():
@@ -2192,18 +2192,23 @@ class UnifiedRadixCache(BasePrefixCache):
 
     # ---- HiCache: Backup / LoadBack ----
 
-    def backup_node_for_write_back(self, node_id: NodeId) -> bool:
+    def backup_node_for_write_back(
+        self, node_id: NodeId, state_victim: bool = False
+    ) -> bool:
         """Synchronously back up one node (Full KV plus any unbacked component
         state) and drain the ack -- the deferred-demote shape the eviction
         loop runs for leaves, reusable by component evictors ahead of an
         internal-state tombstone. Returns True once the backup is committed.
+        ``state_victim``: the device eviction walk took the node's internal state
+        from its component's unlocked LRU for that tombstone.
         """
         # An auxiliary backup may already cover this node under another ack.
         # Finish it before building a new transfer and claiming ack ownership.
         if self.ongoing_write_through:
             self.writing_check(write_back=True)
+        victim = state_victim and self.cache_controller.write_settle_state_victims
         written = self._execute_and_commit_kv_backup(
-            BackupKV(node_ids=[node_id]), write_back=True
+            BackupKV(node_ids=[node_id]), write_back=True, victim=victim
         )
         if written == 0:
             return False
@@ -2292,7 +2297,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self, node_id: NodeId, comp_xfers: dict[ComponentType, list[PoolTransfer]]
     ) -> bool:
         """Whether an eviction victim's copy may skip the forward in flight: the walk
-        takes only unlocked nodes, and no component transfer reads another node."""
+        takes what no request holds, and no component transfer reads another node."""
         if self.cache_controller.write_settle_event is None:
             return False
         return all(

@@ -3196,7 +3196,9 @@ def _internal_swa_write_back_case(
     cache.tree_core.set_hicache_enabled()
     cache.tree_core.has_swa_host_pool = True
     cache.is_write_back = True
-    cache.cache_controller = SimpleNamespace(write_policy="write_back")
+    cache.cache_controller = SimpleNamespace(
+        write_policy="write_back", write_settle_state_victims=False
+    )
     cache._build_backup_sidecar = Mock(return_value=[])
     # The child spans a complete window, so its request lock leaves the older
     # internal SWA segments eligible while preventing a whole-leaf eviction.
@@ -4929,7 +4931,9 @@ def test_internal_mamba_write_back_preserves_state_until_ack(backend, backup):
     core.is_write_back = True
     cache.host_memory_mode = "cache"
     cache.buffer_pipeline = None
-    cache.cache_controller = SimpleNamespace(write_policy="write_back")
+    cache.cache_controller = SimpleNamespace(
+        write_policy="write_back", write_settle_state_victims=False
+    )
     cache.ongoing_write_through = {}
     cache._build_backup_sidecar = Mock(return_value=[])
     host_pool = Mock()

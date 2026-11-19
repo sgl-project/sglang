@@ -228,9 +228,12 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
                 scheduler = self.make_scheduler(batches + [None, None])
                 self.prepare_pp_scheduler(scheduler)
                 controller = SimpleNamespace(
-                    write_policy="write_back", write_settle_event=None
+                    write_policy="write_back",
+                    write_settle_event=None,
+                    write_settle_state_victims=False,
                 )
                 scheduler.enable_hierarchical_cache = True
+                scheduler._war_barrier_enabled = True
                 scheduler.tree_cache = SimpleNamespace(cache_controller=controller)
                 published = []
                 process = scheduler._pp_process_batch_result
@@ -244,6 +247,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
                 scheduler._pp_process_batch_result = record
                 with (
                     envs.SGLANG_ENABLE_HICACHE_WB_EVICT_RELAXED_FENCE.override(relaxed),
+                    envs.SGLANG_OPT_HICACHE_WB_SETTLED_STATE_VICTIM.override(True),
                     get_parallel().override(pp_size=2, pp_async_batch_depth=0),
                     patch(
                         f"{PP_MODULE}.get_disagg",
@@ -260,6 +264,8 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
                         after_idle=False,
                     )
                 self.assertEqual(published, [relaxed] * 4)
+                # State victims are settled only behind the relaxed fence.
+                self.assertIs(controller.write_settle_state_victims, relaxed)
                 if not relaxed:
                     self.assertIsNone(controller.write_settle_event)
 

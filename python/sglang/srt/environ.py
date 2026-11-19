@@ -948,6 +948,11 @@ class Envs:
     # PP disaggregated prefill + write_back: an eviction victim's D2H backup waits for
     # the last forward whose result was processed; 0 waits for the forward in flight.
     SGLANG_ENABLE_HICACHE_WB_EVICT_RELAXED_FENCE = EnvBool(True)
+    # An eviction walk's internal Mamba / SWA state backup waits for the last processed
+    # forward too, same host bytes; needs SGLANG_ENABLE_HICACHE_WB_EVICT_RELAXED_FENCE.
+    SGLANG_OPT_HICACHE_WB_SETTLED_STATE_VICTIM = EnvBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
     # gfx950: override --hicache-ratio for Mamba states in ratio mode; a cached KV
     # prefix cannot be reused after its host state is evicted.
     SGLANG_HICACHE_MAMBA_HOST_RATIO = EnvFloat(None)
