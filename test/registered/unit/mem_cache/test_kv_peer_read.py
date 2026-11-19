@@ -162,6 +162,13 @@ class FakeOps:
                     (s + sp * page_bytes, d + dp * page_bytes, page_bytes)
                 )
 
+    def copy(self, *, srcs, dsts, sizes, stream):
+        if self.fail_launch_at == self.launches:
+            raise RuntimeError("copy failed")
+        self.launches += 1
+        self.log.append(("copy", len(sizes)))
+        self.pending += zip(srcs.tolist(), dsts.tolist(), sizes.tolist())
+
     def record_event(self, stream):
         self.events += 1
         return FakeEvent(self, self.events - 1, len(self.pending))
@@ -228,6 +235,26 @@ class TestReadData(PeerReadTestBase):
         self.reader.release(batch)
         with self.assertRaises(ValueError):
             self.reader.status(batch)
+
+    def test_copy_engine_merges_pages_adjacent_on_both_sides(self):
+        reader = KvPeerReader(READER_DEV, copy_engine=True, _ops=self.ops)
+        region = reader.import_region(describe(self.src, self.region_bytes))
+        # Runs: 1-3 -> 4-6; 5 -> 7; 6 -> 0 (the source is adjacent, the destination not).
+        pairs = ((1, 4), (2, 5), (3, 6), (5, 7), (6, 0))
+        group = self.group(
+            [s for s, _ in pairs],
+            [d for _, d in pairs],
+            regions=[region] * self.layers,
+        )
+        batch = reader.read([group])
+        self.assertEqual(reader.wait(batch).state, ReadState.SUCCESS)
+        self.assertIn(("copy", 3 * self.layers), self.ops.log)
+        self.assertNotIn("launch", self.ops.log)
+        for layer in range(self.layers):
+            for sp, dp in pairs:
+                self.assertEqual(self.dst_page(layer, dp), self.src_page(layer, sp))
+            for dp in (1, 2, 3):
+                self.assertEqual(self.dst_page(layer, dp), b"\xee" * PAGE)
 
     def test_producer_stream_is_waited_before_any_launch(self):
         batch = self.reader.read([self.group([0], [0])], producer_stream="prod")
@@ -476,6 +503,44 @@ class TestKvPeerReadCuda(CustomTestCase):
                 untouched = [p for p in range(CAPACITY) if p not in copied]
                 self.assertTrue(bool((dst[layer][cls][untouched] == SENTINEL).all()))
 
+    def _read_and_check(self, reader, regions):
+        rng = np.random.default_rng(0)
+
+        # Two groups (layers 0-1, layer 2), random pages, layers alternating between
+        # the two regions; the rest keep the sentinel.
+        dst = self._destinations()
+        # No producer stream: the caller vouches the targets are ready.
+        torch.cuda.synchronize(1)
+        src_pages = rng.choice(CAPACITY, 20, replace=False)
+        dst_pages = rng.choice(CAPACITY, 20, replace=False)
+        groups = [
+            self._group(regions, dst, [0, 1], src_pages, dst_pages),
+            self._group(regions, dst, [2], src_pages, dst_pages),
+        ]
+        batch = reader.read(groups)
+        status = reader.wait(batch, timeout=30)
+        self.assertEqual(status.state, ReadState.SUCCESS)
+        self.assertEqual(status.groups_done, 2)
+        self._check(dst, src_pages, dst_pages, range(LAYERS))
+        reader.release(batch)
+
+        # Every page, reversed, behind a producer stream that still writes the targets.
+        dst = self._destinations()
+        producer = torch.cuda.Stream(device=1)
+        with torch.cuda.stream(producer):
+            torch.cuda._sleep(10_000_000)
+            for layer in dst:
+                for buf in layer:
+                    buf.fill_(SENTINEL)
+        pages = np.arange(CAPACITY)
+        batch = reader.read(
+            [self._group(regions[:1], dst, range(LAYERS), pages, pages[::-1].copy())],
+            producer_stream=producer,
+        )
+        self.assertEqual(reader.wait(batch, timeout=30).state, ReadState.SUCCESS)
+        self._check(dst, pages, pages[::-1].copy(), range(LAYERS))
+        reader.release(batch)
+
     def test_export_import_read_release(self):
         ctx = mp.get_context("spawn")
         conn, child = ctx.Pipe()
@@ -484,54 +549,14 @@ class TestKvPeerReadCuda(CustomTestCase):
         try:
             # GPU 0 stays current: the reader must not depend on the caller's device.
             torch.cuda.set_device(0)
-            reader = KvPeerReader(1, num_blocks=16)
-            regions = [
-                reader.import_region(PeerRegionDescriptor.from_bytes(d))
-                for d in conn.recv()
-            ]
-            rng = np.random.default_rng(0)
-
-            # Two groups (layers 0-1, layer 2), random pages, layers alternating between
-            # the two regions; the rest keep the sentinel.
-            dst = self._destinations()
-            # No producer stream: the caller vouches the targets are ready.
-            torch.cuda.synchronize(1)
-            src_pages = rng.choice(CAPACITY, 20, replace=False)
-            dst_pages = rng.choice(CAPACITY, 20, replace=False)
-            groups = [
-                self._group(regions, dst, [0, 1], src_pages, dst_pages),
-                self._group(regions, dst, [2], src_pages, dst_pages),
-            ]
-            batch = reader.read(groups)
-            status = reader.wait(batch, timeout=30)
-            self.assertEqual(status.state, ReadState.SUCCESS)
-            self.assertEqual(status.groups_done, 2)
-            self._check(dst, src_pages, dst_pages, range(LAYERS))
-            reader.release(batch)
-
-            # Every page, reversed, behind a producer stream that still writes the targets.
-            dst = self._destinations()
-            producer = torch.cuda.Stream(device=1)
-            with torch.cuda.stream(producer):
-                torch.cuda._sleep(10_000_000)
-                for layer in dst:
-                    for buf in layer:
-                        buf.fill_(SENTINEL)
-            pages = np.arange(CAPACITY)
-            batch = reader.read(
-                [
-                    self._group(
-                        regions[:1], dst, range(LAYERS), pages, pages[::-1].copy()
-                    )
-                ],
-                producer_stream=producer,
-            )
-            self.assertEqual(reader.wait(batch, timeout=30).state, ReadState.SUCCESS)
-            self._check(dst, pages, pages[::-1].copy(), range(LAYERS))
-            reader.release(batch)
-
-            for region in regions:
-                reader.unmap(region)
+            descs = [PeerRegionDescriptor.from_bytes(d) for d in conn.recv()]
+            for copy_engine in (False, True):
+                with self.subTest(copy_engine=copy_engine):
+                    reader = KvPeerReader(1, num_blocks=16, copy_engine=copy_engine)
+                    regions = [reader.import_region(desc) for desc in descs]
+                    self._read_and_check(reader, regions)
+                    for region in regions:
+                        reader.unmap(region)
             conn.send("unmapped")
             self.assertEqual(conn.recv(), "ok")
         finally:

@@ -3,8 +3,9 @@
 
 The owner describes a FABRIC allocation with :func:`export_region`; its control
 plane hands the descriptor bytes to a reader. :class:`KvPeerReader` maps it
-read-only and gathers pages into the caller's own destination buffers with a
-page-index kernel on a private stream.
+read-only and copies pages into the caller's own destination buffers on a
+private stream: by default with a page-index gather kernel on the SMs, or with
+the copy engines (``copy_engine=True``).
 
 Contract:
 
@@ -39,6 +40,7 @@ from cuda.bindings import driver as drv
 
 from sglang.kernels.ops.kvcache.peer_page_gather import gather_pages
 from sglang.srt.utils.cuda_vmm_utils import (
+    check_drv,
     export_fabric_handle,
     get_gpu_fabric_clique,
     map_fabric_import,
@@ -190,6 +192,20 @@ def _as_pages(value, name: str) -> np.ndarray:
     return pages
 
 
+def _copy_segments(plan: _GroupPlan) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """(src, dst, bytes) of one copy per buffer and run of pages adjacent on both sides."""
+    src_pages, dst_pages = plan.src_pages, plan.dst_pages
+    adjacent = (np.diff(src_pages) == 1) & (np.diff(dst_pages) == 1)
+    starts = np.flatnonzero(np.concatenate(([True], ~adjacent)))
+    run_pages = np.diff(np.append(starts, src_pages.size))
+    srcs, dsts, sizes = [], [], []
+    for page_bytes, src_bases, dst_bases in plan.launches:
+        srcs.append((src_bases[:, None] + src_pages[starts] * page_bytes).ravel())
+        dsts.append((dst_bases[:, None] + dst_pages[starts] * page_bytes).ravel())
+        sizes.append(np.tile(run_pages * page_bytes, src_bases.size))
+    return np.concatenate(srcs), np.concatenate(dsts), np.concatenate(sizes)
+
+
 def _locked(method):
     @functools.wraps(method)
     def call(self, *args, **kwargs):
@@ -203,15 +219,26 @@ class KvPeerReader:
     """Imports peer regions and reads pages out of them on one device.
 
     ``num_blocks`` is the gather's CTA budget: more blocks copy faster but take
-    SMs from whatever else runs on the device.
+    SMs from whatever else runs on the device. ``copy_engine=True`` copies with
+    the copy engines instead and takes no SMs, but the driver submits every
+    (buffer, run of adjacent pages) as its own copy, on the host, inside ``read``.
     """
 
-    def __init__(self, device: int, *, num_blocks: int = 64, _ops=None):
+    def __init__(
+        self,
+        device: int,
+        *,
+        num_blocks: int = 64,
+        copy_engine: bool = False,
+        _ops=None,
+    ):
         self.device = _checked_int(device, "device")
         _checked_int(num_blocks, "num_blocks", 1)
+        self._copy_engine = bool(copy_engine)
         self._ops = _ops if _ops is not None else _CudaOps(self.device, num_blocks)
         self._stream = self._ops.new_stream()
-        self._ops.warmup(self._stream)
+        if not self._copy_engine:
+            self._ops.warmup(self._stream)
         self._clique = self._ops.fabric_clique()
         self._lock = threading.Lock()
         self._regions: set[PeerRegion] = set()
@@ -380,27 +407,37 @@ class KvPeerReader:
 
     def _enqueue(self, batch: _Batch, plans: list[_GroupPlan], producer_stream) -> None:
         ops, stream = self._ops, self._stream
+        with ops.current(stream):
+            if producer_stream is not None:
+                stream.wait_stream(producer_stream)
+            if self._copy_engine:
+                for plan in plans:
+                    srcs, dsts, sizes = _copy_segments(plan)
+                    ops.copy(srcs=srcs, dsts=dsts, sizes=sizes, stream=stream)
+                    batch.events.append(ops.record_event(stream))
+            else:
+                self._enqueue_gathers(batch, plans)
+
+    def _enqueue_gathers(self, batch: _Batch, plans: list[_GroupPlan]) -> None:
+        ops, stream = self._ops, self._stream
         arrays = []  # per group: its page lists, then each launch's base tables
         for plan in plans:
             arrays += [plan.src_pages, plan.dst_pages]
             for _, src_bases, dst_bases in plan.launches:
                 arrays += [src_bases, dst_bases]
-        with ops.current(stream):
-            if producer_stream is not None:
-                stream.wait_stream(producer_stream)
-            batch.tables = ops.upload(arrays)
-            tables = iter(batch.tables)
-            for plan in plans:
-                src_pages, dst_pages = next(tables), next(tables)
-                for page_bytes, _, _ in plan.launches:
-                    ops.gather(
-                        src_bases=next(tables),
-                        dst_bases=next(tables),
-                        src_pages=src_pages,
-                        dst_pages=dst_pages,
-                        page_bytes=page_bytes,
-                    )
-                batch.events.append(ops.record_event(stream))
+        batch.tables = ops.upload(arrays)
+        tables = iter(batch.tables)
+        for plan in plans:
+            src_pages, dst_pages = next(tables), next(tables)
+            for page_bytes, _, _ in plan.launches:
+                ops.gather(
+                    src_bases=next(tables),
+                    dst_bases=next(tables),
+                    src_pages=src_pages,
+                    dst_pages=dst_pages,
+                    page_bytes=page_bytes,
+                )
+            batch.events.append(ops.record_event(stream))
 
     def _drained(self) -> bool:
         """Whether nothing this reader enqueued can still touch memory."""
@@ -442,6 +479,10 @@ class _CudaOps:
     def __init__(self, device: int, num_blocks: int):
         self._device = torch.device("cuda", device)
         self._num_blocks = num_blocks
+        self._copy_attrs = drv.CUmemcpyAttributes()
+        self._copy_attrs.srcAccessOrder = (
+            drv.CUmemcpySrcAccessOrder.CU_MEMCPY_SRC_ACCESS_ORDER_STREAM
+        )
 
     def fabric_clique(self) -> Optional[tuple[bytes, int]]:
         return _fabric_clique(self._device.index)
@@ -509,6 +550,22 @@ class _CudaOps:
             dst_pages=dst_pages,
             page_bytes=page_bytes,
             num_blocks=self._num_blocks,
+        )
+
+    def copy(self, *, srcs, dsts, sizes, stream: torch.cuda.Stream) -> None:
+        """Enqueue the copies on ``stream`` with one cuMemcpyBatchAsync (copy engines)."""
+        check_drv(
+            drv.cuMemcpyBatchAsync(
+                [drv.CUdeviceptr(address) for address in dsts.tolist()],
+                [drv.CUdeviceptr(address) for address in srcs.tolist()],
+                sizes.tolist(),
+                sizes.size,
+                [self._copy_attrs],
+                [0],
+                1,
+                stream.cuda_stream,
+            ),
+            "cuMemcpyBatchAsync",
         )
 
     def record_event(self, stream: torch.cuda.Stream) -> torch.cuda.Event:

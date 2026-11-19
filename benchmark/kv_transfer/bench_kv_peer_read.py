@@ -4,8 +4,9 @@ The owner allocates one FABRIC VMM allocation laid out like a paged MLA pool wit
 a second per-layer index buffer (defaults: GLM-5.2, 78 layers of 36864 B +
 8448 B pages) and exports it. The reader imports it and reads
 ``--pages`` random pages into its own pools, in groups of ``--layers-per-group``
-layers, for each ``--num-blocks``. Reported per point: the CPU time of
-``read()`` (validation, metadata staging, launches) and the wall time until
+layers, for each ``--num-blocks`` and, with ``--copy-engine``, once more with the
+copy engines. Reported per point: the CPU time of ``read()`` (validation,
+metadata staging, launches or copy submission) and the wall time until
 ``wait()`` returns SUCCESS. Every sample checks the first and last page it read
 of every buffer.
 Pages are drawn afresh per sample from the whole pool, so the source L2 is cold.
@@ -149,8 +150,11 @@ def _run(args, conn):
     ]
     rng = np.random.default_rng(args.seed)
     results = []
-    for num_blocks in args.num_blocks:
-        reader = KvPeerReader(dev, num_blocks=num_blocks)
+    arms = [(f"sm{n}", dict(num_blocks=n)) for n in args.num_blocks]
+    if args.copy_engine:
+        arms.append(("ce", dict(copy_engine=True)))
+    for copy, reader_args in arms:
+        reader = KvPeerReader(dev, **reader_args)
         conn.send("export")
         region = reader.import_region(PeerRegionDescriptor.from_bytes(conn.recv()))
         buffer_sets = [
@@ -192,7 +196,7 @@ def _run(args, conn):
                     bad += _verify(args, page_bytes, dst, src_pages, dst_pages)
             nbytes = pages * args.layers * sum(page_bytes)
             point = dict(
-                num_blocks=num_blocks,
+                copy=copy,
                 pages=pages,
                 groups=len(groups),
                 bytes=nbytes,
@@ -203,7 +207,7 @@ def _run(args, conn):
             )
             results.append(point)
             print(
-                f"blocks={num_blocks:4d} pages={pages:6d} "
+                f"copy={copy:5s} pages={pages:6d} "
                 f"groups={len(groups):3d} "
                 f"read()={point['read_cpu_ms']:7.2f} ms wall={point['wall_ms']:8.2f} ms "
                 f"{point['gbps']:6.1f} GB/s bad={bad}",
@@ -222,6 +226,9 @@ def main():
     parser.add_argument("--pages", type=int, nargs="+", default=[16, 128, 1024, 7187])
     parser.add_argument("--layers-per-group", type=int, default=13)
     parser.add_argument("--num-blocks", type=int, nargs="+", default=[32, 64])
+    parser.add_argument(
+        "--copy-engine", action="store_true", help="also read with copy_engine=True"
+    )
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--iters", type=int, default=5)
     parser.add_argument("--seed", type=int, default=0)
