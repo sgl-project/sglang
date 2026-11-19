@@ -198,7 +198,6 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "quantization",
                     "dp_size",
                     "attn_dp_size",
-                    "enable_dp_attention",
                     "enable_attn_tp_input_scattered",
                     "enable_dp_lm_head",
                     "enable_tp_lm_head_all_to_all",
@@ -896,6 +895,91 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 mamba_radix_cache_strategy="extra_buffer",
             )
         self.assertTrue(self._resolved(sa, "uses_mamba_radix_cache"))
+
+    def test_sm100_leaves_awq_gptq_quantization_to_the_loader(self):
+        # ModelConfig converts awq/gptq checkpoints to awq_marlin/gptq_marlin only
+        # when --quantization is unset or names a Marlin method; CUDA registers no
+        # plain gptq method.
+        from sglang.srt.configs.model_config import ModelConfig
+        from sglang.srt.layers.quantization.awq import AWQMarlinConfig
+        from sglang.srt.layers.quantization.gptq import GPTQMarlinConfig
+
+        checkpoints = {
+            "gptq": {
+                "quant_method": "gptq",
+                "bits": 4,
+                "group_size": 128,
+                "sym": True,
+                "desc_act": False,
+            },
+            "awq": {
+                "quant_method": "awq",
+                "bits": 4,
+                "group_size": 128,
+                "zero_point": True,
+                "version": "gemm",
+            },
+        }
+        arches = (
+            ("Qwen3MoeForCausalLM", "qwen3_moe"),
+            ("Glm4MoeForCausalLM", "glm4_moe"),
+            ("DeepseekV3ForCausalLM", "deepseek_v3"),
+        )
+        for arch, model_type in arches:
+            for method, quant_cfg in checkpoints.items():
+                with self.subTest(arch=arch, method=method):
+                    # Marlin support is probed on the device; answer as a GPU would.
+                    with (
+                        override_platform(is_sm100=True, is_blackwell=True),
+                        patch.object(
+                            AWQMarlinConfig,
+                            "is_awq_marlin_compatible",
+                            side_effect=lambda cfg: cfg["quant_method"] == "awq",
+                        ),
+                        patch.object(
+                            GPTQMarlinConfig,
+                            "is_gptq_marlin_compatible",
+                            side_effect=lambda cfg: cfg["quant_method"] == "gptq",
+                        ),
+                    ):
+                        sa = self._construct(
+                            arch,
+                            model_type,
+                            config_extra={"quantization_config": quant_cfg},
+                        )
+                        self.assertIsNone(self._resolved(sa, "quantization"))
+                        self.assertEqual(
+                            ModelConfig.from_server_args(sa).quantization,
+                            f"{method}_marlin",
+                        )
+
+    def test_minimax_m3_leaves_awq_gptq_quantization_to_the_loader(self):
+        from sglang.srt.arg_groups.model_overrides.minimax_m3 import (
+            _minimax_m3_overrides,
+        )
+
+        for method in ("awq", "gptq"):
+            with (
+                self.subTest(method=method),
+                override_platform(is_cuda=True, is_hip=False, is_sm100=False),
+            ):
+                overrides = _minimax_m3_overrides(
+                    SimpleNamespace(
+                        quantization=None,
+                        _quantization_explicitly_unset=False,
+                        attention_backend=None,
+                        moe_runner_backend="auto",
+                        moe_a2a_backend="none",
+                        kv_cache_dtype="auto",
+                        page_size=None,
+                        ep_size=1,
+                    ),
+                    SimpleNamespace(
+                        architectures=["MiniMaxM3SparseForCausalLM"],
+                        quantization_config={"quant_method": method},
+                    ),
+                )
+                self.assertNotIn("quantization", overrides)
 
     def test_mistral_large3_forces_bfloat16(self):
         sa = self._construct("MistralLarge3ForCausalLM", "mistral")
@@ -2897,7 +2981,12 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
             defaults.update(kw)
             return ResolvedView(
-                SimpleNamespace(_model_config=SimpleNamespace(hf_config=hf), **defaults)
+                SimpleNamespace(
+                    _model_config=SimpleNamespace(
+                        hf_config=hf, kv_lora_rank=512, qk_rope_head_dim=64
+                    ),
+                    **defaults,
+                )
             )
 
         with (
@@ -4330,8 +4419,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                             {
                                 "attention_backend": "dsa",
                                 "page_size": 64,
-                                "attn_dp_size": 1,
-                                "dp_size": 1,
                                 "moe_dense_tp_size": 1,
                                 "moe_a2a_backend": "deepep",
                                 "ep_size": 8,
@@ -4362,11 +4449,22 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                                 ),
                                 None,
                             )
-                            self.assertEqual(result["attn_dp_size"], attn_dp_size)
                             self.assertEqual(result["attn_cp_size"], expected_cp)
                             self.assertNotIn("moe_dense_tp_size", result)
                             self.assertNotIn("ep_size", result)
                             self.assertNotIn("moe_a2a_backend", result)
+                        # --dp-size N no longer means attention DP here.
+                        with self.assertRaisesRegex(ValueError, "use --attn-dp-size 2"):
+                            _deepseek_family_overrides(
+                                _args(
+                                    enable_prefill_cp=True,
+                                    cp_strategy="interleave",
+                                    tp_size=8,
+                                    dp_size=2,
+                                    attn_dp_size=1,
+                                ),
+                                None,
+                            )
 
         # MLA path on sm100: trtllm_mla fill (all three backends unset)
         with patch(
