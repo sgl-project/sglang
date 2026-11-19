@@ -58,7 +58,6 @@ def _preprocess_humming_in_expert_chunks(
             )
         for output, chunk_output in zip(outputs, chunk_outputs):
             output[start:end].copy_(chunk_output)
-        # 在下一块预处理前释放本块临时输出，避免两个块同时驻留。
         del chunk_outputs, chunk_output
     return outputs
 

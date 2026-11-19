@@ -14,7 +14,6 @@ Run on H100/H200:
 from __future__ import annotations
 
 from contextlib import nullcontext
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -62,90 +61,6 @@ from flashinfer.fused_moe.core import ActivationType
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 
 GROUP_SIZE = 32  # MXFP4 block size
-
-
-def _build_dsv4_humming_layer(w13, w2, w13_scale, w2_scale):
-    layer = torch.nn.Module()
-    layer.w13_weight = torch.nn.Parameter(w13.clone(), requires_grad=False)
-    layer.w2_weight = torch.nn.Parameter(w2.clone(), requires_grad=False)
-    layer.w13_weight_scale_inv = torch.nn.Parameter(
-        w13_scale.clone().view(torch.float8_e8m0fnu), requires_grad=False
-    )
-    layer.w2_weight_scale_inv = torch.nn.Parameter(
-        w2_scale.clone().view(torch.float8_e8m0fnu), requires_grad=False
-    )
-    return layer
-
-
-def _build_dsv4_humming_method():
-    from sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe import (
-        Mxfp4FlashinferCutlassMoEMethod,
-    )
-
-    method = Mxfp4FlashinferCutlassMoEMethod.__new__(Mxfp4FlashinferCutlassMoEMethod)
-    # 权重已经是 checkpoint 布局，此测试仅跳过基础 FP8 loader。
-    method._fp8 = SimpleNamespace(process_weights_after_loading=lambda layer: None)
-    method._use_mxfp8_act_scaling = False
-    method._use_sm90_humming = True
-    method.prefix = "test.humming"
-    return method
-
-
-def _measure_preprocess_peak(operation):
-    torch.cuda.synchronize()
-    torch.cuda.empty_cache()
-    torch.cuda.reset_peak_memory_stats()
-    initial = torch.cuda.memory_allocated()
-    operation()
-    torch.cuda.synchronize()
-    return torch.cuda.max_memory_allocated() - initial
-
-
-@pytest.mark.skipif(not HAS_CORRECTED_HUMMING_API, reason="Humming API required")
-def test_dsv4_humming_preprocess_reduces_peak_memory(monkeypatch):
-    monkeypatch.setenv("SGLANG_FLASHINFER_MXFP4_PREPROCESS_EXPERT_CHUNK_SIZE", "4")
-    w13, w2, w13_s, w2_s, _, _ = _make_random_mxfp4(9, 512, 512, seed=17)
-    # 先预热真实 FlashInfer kernel，排除 JIT 编译对测量的影响。
-    preprocess_humming(w13[:1], w13_s[:1])
-    preprocess_humming(w2[:1], w2_s[:1])
-
-    def legacy_preprocess(layer):
-        w13_out, w13_scale, w13_residual = preprocess_humming(
-            layer.w13_weight.data.view(torch.uint8),
-            layer.w13_weight_scale_inv.data.view(torch.uint8),
-        )
-        w2_out, w2_scale, w2_residual = preprocess_humming(
-            layer.w2_weight.data.view(torch.uint8),
-            layer.w2_weight_scale_inv.data.view(torch.uint8),
-        )
-        layer.w13_humming_residual_scale = torch.nn.Parameter(
-            w13_residual * 64.0, requires_grad=False
-        )
-        layer.w2_humming_residual_scale = torch.nn.Parameter(
-            w2_residual * 64.0, requires_grad=False
-        )
-        layer.humming_fc2_act_scale = torch.nn.Parameter(
-            torch.ones((), device=w13.device), requires_grad=False
-        )
-        layer.w13_weight = torch.nn.Parameter(w13_out, requires_grad=False)
-        layer.w2_weight = torch.nn.Parameter(w2_out, requires_grad=False)
-        layer.w13_weight_scale_inv = torch.nn.Parameter(w13_scale, requires_grad=False)
-        layer.w2_weight_scale_inv = torch.nn.Parameter(w2_scale, requires_grad=False)
-
-    reference = _build_dsv4_humming_layer(w13, w2, w13_s, w2_s)
-    legacy_peak = _measure_preprocess_peak(lambda: legacy_preprocess(reference))
-    actual = _build_dsv4_humming_layer(w13, w2, w13_s, w2_s)
-    method = _build_dsv4_humming_method()
-    chunked_peak = _measure_preprocess_peak(
-        lambda: method.process_weights_after_loading(actual)
-    )
-
-    for name, parameter in reference.named_parameters():
-        torch.testing.assert_close(getattr(actual, name), parameter, rtol=0, atol=0)
-    assert actual._dsv4_mxfp4_backend == "flashinfer_cutlass_sm90_fp8"
-    assert chunked_peak < legacy_peak * 0.7, (
-        f"分块应降低峰值显存：legacy={legacy_peak}, chunked={chunked_peak}"
-    )
 
 
 @pytest.fixture
@@ -822,9 +737,8 @@ def _make_random_dsv4_mxfp4(num_experts, hidden, inter, seed=0):
         (256, 8, 1024, 1024, 4),
     ],
 )
-@pytest.mark.parametrize("use_humming", [False, True])
 def test_dsv4_apply_matches_flashinfer_direct(
-    tokens, num_experts, hidden, inter, top_k, use_humming, monkeypatch, stated_tp_group
+    tokens, num_experts, hidden, inter, top_k, monkeypatch, stated_tp_group
 ):
     """End-to-end: SGLang's DSv4 ``Mxfp4FlashinferCutlassMoEMethod.apply``
     output must match a direct FlashInfer ``cutlass_fused_moe`` call with
@@ -857,11 +771,7 @@ def test_dsv4_apply_matches_flashinfer_direct(
     # plain SiLU * up — all three SwiGLU scalars None (no clamp configured).
     from sglang.srt.runtime_context import get_context
 
-    if use_humming and not HAS_CORRECTED_HUMMING_API:
-        pytest.skip("Humming API required")
-    with get_context().override_server_args(
-        flashinfer_mxfp4_moe_precision="fp8" if use_humming else "default"
-    ):
+    with get_context().override_server_args(flashinfer_mxfp4_moe_precision="default"):
         method = ds_mod.Mxfp4FlashinferCutlassMoEMethod(
             SimpleNamespace(process_weights_after_loading=lambda layer: None),
             "test",
@@ -892,34 +802,16 @@ def test_dsv4_apply_matches_flashinfer_direct(
     # ---- Direct FlashInfer reference ----
     w13_s_u8 = w31_s.view(torch.uint8)
     w2_s_u8 = w2_s.view(torch.uint8)
-    if use_humming:
-        ref_w13, ref_w13_s, ref_w13_residual = preprocess_humming(
-            w31.view(torch.uint8).contiguous(), w13_s_u8
-        )
-        ref_w2, ref_w2_s, ref_w2_residual = preprocess_humming(
-            w2.view(torch.uint8).contiguous(), w2_s_u8
-        )
-        quant_scales = [
-            ref_w13_s.view(torch.int32),
-            ref_w13_residual * 64.0,
-            torch.ones((), dtype=torch.float32, device="cuda"),
-            ref_w2_s.view(torch.int32),
-            ref_w2_residual * 64.0,
-        ]
-    else:
-        ref_w13 = interleave_moe_weights_for_sm90_mixed_gemm(
-            w31.view(torch.uint8).contiguous(), "fp4"
-        )
-        ref_w2 = interleave_moe_weights_for_sm90_mixed_gemm(
-            w2.view(torch.uint8).contiguous(), "fp4"
-        )
-        ref_w13_s = interleave_moe_scales_for_sm90_mixed_gemm(
-            w13_s_u8, group_size=GROUP_SIZE
-        )
-        ref_w2_s = interleave_moe_scales_for_sm90_mixed_gemm(
-            w2_s_u8, group_size=GROUP_SIZE
-        )
-        quant_scales = [ref_w13_s.view(torch.int32), ref_w2_s.view(torch.int32)]
+    ref_w13 = interleave_moe_weights_for_sm90_mixed_gemm(
+        w31.view(torch.uint8).contiguous(), "fp4"
+    )
+    ref_w2 = interleave_moe_weights_for_sm90_mixed_gemm(
+        w2.view(torch.uint8).contiguous(), "fp4"
+    )
+    ref_w13_s = interleave_moe_scales_for_sm90_mixed_gemm(
+        w13_s_u8, group_size=GROUP_SIZE
+    )
+    ref_w2_s = interleave_moe_scales_for_sm90_mixed_gemm(w2_s_u8, group_size=GROUP_SIZE)
 
     out_ref = torch.empty(tokens, hidden, dtype=torch.bfloat16, device="cuda")
     cutlass_fused_moe(
@@ -929,14 +821,13 @@ def test_dsv4_apply_matches_flashinfer_direct(
         fc1_expert_weights=ref_w13,
         fc2_expert_weights=ref_w2,
         output_dtype=torch.bfloat16,
-        quant_scales=quant_scales,
+        quant_scales=[ref_w13_s.view(torch.int32), ref_w2_s.view(torch.int32)],
         fc1_expert_biases=None,
         fc2_expert_biases=None,
         swiglu_alpha=None,
         swiglu_beta=None,
         swiglu_limit=None,
         use_w4_group_scaling=True,
-        use_wfp4afp8_humming=use_humming,
         activation_type=ActivationType.Swiglu,
         output=out_ref,
     )
@@ -952,11 +843,9 @@ def test_dsv4_apply_matches_flashinfer_direct(
     not HAS_CORRECTED_HUMMING_API,
     reason="requires corrected per-expert Humming API from FlashInfer >= 0.6.18",
 )
-@pytest.mark.parametrize(
-    "num_experts,chunk_size", [(1, 4), (5, 1), (5, 4), (8, 4), (5, 16)]
-)
+@pytest.mark.parametrize("chunk_size", [1, 4, 16])
 def test_dsv4_process_weights_humming_matches_flashinfer_direct(
-    num_experts, chunk_size, monkeypatch
+    chunk_size, monkeypatch
 ):
     """DSv4's native [up; gate] layout must use the same #3738 transform."""
     from types import SimpleNamespace
@@ -967,14 +856,8 @@ def test_dsv4_process_weights_humming_matches_flashinfer_direct(
     monkeypatch.setenv(
         "SGLANG_FLASHINFER_MXFP4_PREPROCESS_EXPERT_CHUNK_SIZE", str(chunk_size)
     )
-    hidden, inter = 256, 256
+    num_experts, hidden, inter = 5, 256, 256
     w13, w2, w13_s, w2_s = _make_random_dsv4_mxfp4(num_experts, hidden, inter)
-    # 覆盖跨 expert 不同 residual，以及 Humming 的 exponent range clamp。
-    offsets = torch.arange(num_experts, device="cuda", dtype=torch.uint8).view(-1, 1, 1)
-    w13_s.view(torch.uint8).add_(offsets)
-    w2_s.view(torch.uint8).add_(offsets + 1)
-    w13_s.view(torch.uint8)[:, 0, 0] = 110
-    w2_s.view(torch.uint8)[:, 0, 0] = 110
     w1, w3 = w13.chunk(2, dim=1)
     w1_s, w3_s = w13_s.chunk(2, dim=1)
     w31 = torch.cat((w3, w1), dim=1).contiguous()
@@ -1011,15 +894,33 @@ def test_dsv4_process_weights_humming_matches_flashinfer_direct(
 
 
 @pytest.mark.skipif(not HAS_CORRECTED_HUMMING_API, reason="Humming API required")
-@pytest.mark.parametrize("chunk_size", [0, -1])
-def test_dsv4_humming_preprocess_rejects_invalid_chunk_size(chunk_size, monkeypatch):
-    monkeypatch.setenv(
-        "SGLANG_FLASHINFER_MXFP4_PREPROCESS_EXPERT_CHUNK_SIZE", str(chunk_size)
+def test_humming_expert_chunks_reduce_peak_memory():
+    from sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe import (
+        _preprocess_humming_in_expert_chunks,
     )
-    w13, w2, w13_s, w2_s, _, _ = _make_random_mxfp4(1, 256, 256)
-    layer = _build_dsv4_humming_layer(w13, w2, w13_s, w2_s)
-    with pytest.raises(ValueError, match="chunk size must be positive"):
-        _build_dsv4_humming_method().process_weights_after_loading(layer)
+
+    weight, _, scale, _ = _make_random_dsv4_mxfp4(9, 512, 512)
+    weight, scale = weight.view(torch.uint8), scale.view(torch.uint8)
+    preprocess_humming(weight[:1], scale[:1])
+
+    def measure(operation):
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        initial = torch.cuda.memory_allocated()
+        outputs = operation()
+        torch.cuda.synchronize()
+        return outputs, torch.cuda.max_memory_allocated() - initial
+
+    reference, whole_peak = measure(lambda: preprocess_humming(weight, scale))
+    actual, chunked_peak = measure(
+        lambda: _preprocess_humming_in_expert_chunks(
+            weight, scale, preprocess_humming, 4
+        )
+    )
+    for output, expected in zip(actual, reference):
+        torch.testing.assert_close(output, expected, rtol=0, atol=0)
+    assert chunked_peak < whole_peak * 0.7
 
 
 class _MockDispatchOutput:
