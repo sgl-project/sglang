@@ -3,7 +3,7 @@
 
 ``TritonKDAKernel.extend`` tries :func:`extend` first on ROCm. It returns None for
 anything the kernel does not cover, and the caller keeps the Triton ``chunk_kda``
-path. On by default on gfx950; ``SGLANG_ROCM_KDA_HIP_PREFILL=0`` turns it off.
+path. Used on gfx950 only.
 
 The kernel is ``attention.kda_prefill_gfx950`` (``KernelBackend.KDA``), implemented
 in ``sglang.kernels.kda_kernels.kda_prefill_gfx950``.
@@ -18,49 +18,15 @@ import torch
 from sglang.kernels.arch import current_arch
 from sglang.kernels.selector import get_kernel
 from sglang.kernels.spec import KernelBackend
-from sglang.srt.environ import envs
 
 
 @lru_cache(maxsize=1)
 def available() -> bool:
     """gfx950 only: the kernel uses the 16x16x32 bf16 MFMA and up to 157 KiB of LDS."""
-    if envs.SGLANG_ROCM_KDA_HIP_PREFILL.get().lower() in ("0", "false"):
-        return False
     if not torch.version.hip or not torch.cuda.is_available():
         return False
     hip = current_arch().hip
     return hip is not None and hip.gcn_arch == "gfx950"
-
-
-def covers(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    ssm_states: torch.Tensor,
-    *,
-    A_log: torch.Tensor | None,
-    dt_bias: torch.Tensor | None,
-    lower_bound: float | None,
-    beta_is_raw: bool,
-) -> bool:
-    """Whether the kernel handles these shapes, dtypes and gate settings."""
-    return (
-        available()
-        and lower_bound == -5.0
-        and beta_is_raw
-        and A_log is not None
-        and dt_bias is not None
-        and all(x.dtype == torch.bfloat16 for x in (q, k, v, g, beta))
-        and ssm_states.dtype == torch.float32
-        and ssm_states.is_contiguous()
-        and q.shape == k.shape == v.shape == g.shape
-        and q.ndim == 4
-        and q.shape[0] == 1
-        and q.shape[-1] == 128
-        and ssm_states.shape[-2:] == (128, 128)
-    )
 
 
 def extend(
@@ -91,11 +57,9 @@ def extend(
     track_chunk_idx = kwargs.get("track_chunk_idx")
     track_ssm_h_src = kwargs.get("track_ssm_h_src")
     if not (
+        available()
         # spec-decode extends stay on the reference path
-        not kwargs.get("is_spec_decode", False)
-        # breakable prefill CUDA graphs pass padded chunk tables; their extend
-        # reaches this kernel through kda_prefill_graph's eager break instead
-        and kwargs.get("chunk_indices") is None
+        and not kwargs.get("is_spec_decode", False)
         and (track_state is None) == (track_chunk_idx is None)
         # aligned-only tracking reads the final state, so h is not needed
         and not (
@@ -103,22 +67,25 @@ def extend(
             and track_state is None
             and (track_ssm_h_src is None or track_ssm_h_src.numel() > 0)
         )
-        and covers(
-            q,
-            k,
-            v,
-            g,
-            beta,
-            ssm_states,
-            A_log=A_log,
-            dt_bias=dt_bias,
-            lower_bound=lower_bound,
-            beta_is_raw=beta_is_raw,
-        )
+        and lower_bound == -5.0
+        and beta_is_raw
+        and A_log is not None
+        and dt_bias is not None
+        and all(x.dtype == torch.bfloat16 for x in (q, k, v, g, beta))
+        and ssm_states.dtype == torch.float32
+        and ssm_states.is_contiguous()
+        and q.shape == k.shape == v.shape == g.shape
+        and q.ndim == 4
+        and q.shape[0] == 1
+        and q.shape[-1] == 128
+        and ssm_states.shape[-2:] == (128, 128)
     ):
         return None
     # the launch layout depends on the longest sequence; T bounds it without a sync
     seq_lens = kwargs.get("extend_seq_lens_cpu")
+    # A breakable prefill graph pads the batch to its bound with empty PAD_SLOT_ID
+    # sequences (its chunk tables are not needed); pick the launch path for one.
+    padded = kwargs.get("chunk_indices") is not None
     output = get_kernel("attention.kda_prefill_gfx950", KernelBackend.KDA)(
         q.contiguous(),
         k.contiguous(),
@@ -138,5 +105,14 @@ def extend(
             if track_chunk_idx is None
             else track_chunk_idx.to(torch.int64).contiguous()
         ),
+        path_seqs=1 if padded else 0,
     )
     return (output, None) if return_intermediate_states else output
+
+
+def preload() -> None:
+    """Load the kernel outside CUDA-graph capture; a no-op off gfx950."""
+    if available():
+        from sglang.kernels.kda_kernels.kda_prefill_gfx950 import ensure_loaded
+
+        ensure_loaded()

@@ -7,7 +7,7 @@ import torch
 from sglang.test.ci.ci_register import register_musa_ci
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 
-register_musa_ci(est_time=1200, suite="nightly-musa-1-gpu", nightly=True)
+register_musa_ci(est_time=1200, suite="nightly-test-1-gpu-musa", nightly=True)
 
 
 _REQUEST_TIMEOUT = 60

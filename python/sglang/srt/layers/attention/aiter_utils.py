@@ -158,10 +158,7 @@ def forward_extend_vectorized_5d(
     # For fp8 K/V we hand the raw fp8 tensors and the layer's per-tensor
     # descales straight to aiter.
     if sub_pool.dtype == fp8_dtype:
-        q_local = q.to(fp8_dtype)
-        q_descale_local = (
-            layer.k_scale if layer.k_scale is not None else backend.k_scale
-        )
+        q_local, q_descale_local = backend._quantize_q_fp8(q)
         k_descale_local = (
             layer.k_scale if layer.k_scale is not None else backend.k_scale
         )

@@ -34,6 +34,17 @@ def test_single_backend_resolves_without_backend():
     )
 
 
+def test_bf16_linear_backends_share_one_contract():
+    specs = K.registry.get("gemm.linear_bf16")
+    assert {spec.backend for spec in specs} == {
+        KernelBackend.CUTE_DSL,
+        KernelBackend.FLASHINFER,
+    }
+    sm120 = PlatformInfo(device_type="cuda", cuda_arch_major=12, cuda_arch_minor=0)
+    assert all(K.capabilities_satisfied(spec.capabilities, sm120) for spec in specs)
+    assert all(not K.capabilities_satisfied(spec.capabilities, _CPU) for spec in specs)
+
+
 def test_shuffle_weighted_sum_has_one_native_primary_backend():
     specs = K.registry.get("moe.shuffle_weighted_sum")
     assert len(specs) == 1
@@ -323,6 +334,19 @@ def test_import_stays_metadata_only():
     assert "CLEAN" in r.stdout
 
 
+def test_minicpm_sala_package_exports_the_function_after_its_submodule():
+    """Importing get_block_table from the minicpm_sala package must give the function
+    even when the same-named submodule was imported first."""
+    code = (
+        "import sglang.kernels.ops.attention.minicpm_sala.get_block_table; "
+        "from sglang.kernels.ops.attention.minicpm_sala import get_block_table; "
+        "print(type(get_block_table).__name__)"
+    )
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "function"
+
+
 @pytest.mark.parametrize(
     "op, backend, device",
     [
@@ -349,6 +373,14 @@ def test_kimi_k3_kernels_are_inventoried_by_operator(op, backend, device):
 def test_router_gemv_is_inventoried_for_cuda_and_hip():
     """CUDA serves FP32 gates and ROCm gfx950 BF16 gates through one Triton GEMV."""
     spec = K.select_kernel("gemm.router_gemv", backend=KernelBackend.TRITON)
+    for platform in (_SM90, _HIP):
+        assert K.capabilities_satisfied(spec.capabilities, platform)
+    assert not K.capabilities_satisfied(spec.capabilities, _CPU)
+
+
+def test_softcap_row_argmax_is_inventoried_for_cuda_and_hip():
+    """The op has its own ROCm split path and its caller runs it on HIP."""
+    spec = K.registry.get_backend("sampling.softcap_row_argmax", KernelBackend.TRITON)
     for platform in (_SM90, _HIP):
         assert K.capabilities_satisfied(spec.capabilities, platform)
     assert not K.capabilities_satisfied(spec.capabilities, _CPU)
@@ -509,6 +541,7 @@ def test_reclassified_public_entry_points_are_inventoried():
         "kv_canary.scatter_req_token_ids",
         "mm.process.image",
         "speculative.row_argmax",
+        "sampling.topk",
     )
     for module in modules:
         tree = ast.parse(
@@ -621,6 +654,9 @@ def test_muse_spark_kernels_are_inventoried_by_operator(op, backends):
         ("gemm.convrot_int8_fused_linear", (12, 0), True),
         ("gemm.convrot_int8_fused_linear", (12, 1), True),
         ("gemm.convrot_int8_fused_linear", (12, 2), False),
+        ("speculative.dspark_markov_walk", (8, 9), False),
+        ("speculative.dspark_markov_walk", (9, 0), True),
+        ("speculative.dspark_markov_walk", (10, 0), False),
     ],
 )
 def test_registered_architecture_boundaries(op, sm, expected):

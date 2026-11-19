@@ -31,6 +31,7 @@ limitations under the License.
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
+#include <sgl_kernel/activation.cuh>
 #include <sgl_kernel/utils.cuh>
 
 #include <cute/tensor.hpp>
@@ -89,18 +90,11 @@ constexpr int kRotSmallTiles = 16;  // n_tiles <= 16 (K <= 16384) runs under a 5
 constexpr int kRotTargetWarpsPerBlock = 8;
 constexpr unsigned kRotFullMask = 0xffffffffu;
 
-// GELU (tanh approximation) matching ATen's CUDA kernel bit-for-bit: same fp32
-// constants and association order, libdevice tanhf. A --use_fast_math build
-// rewrites ::tanhf into the MUFU approximation (measured: 22% of BF16 outputs
-// then shift one INT8 step); the libdevice symbol is exempt from that
-// substitution, so the result does not depend on the build flags.
-extern "C" __device__ float __nv_tanhf(float);
-
+// GELU (tanh approximation) as ATen computes it; an approximate tanh shifts 22%
+// of the BF16 outputs by one INT8 step (measured).
 struct ATenGeluTanh {
   SGL_DEVICE float operator()(float x) const {
-    const float x_cube = x * x * x;
-    const float inner = 0.7978845608028654f * (x + 0.044715f * x_cube);
-    return 0.5f * x * (1.0f + __nv_tanhf(inner));
+    return device::activation::gelu_tanh<false>(x);
   }
 };
 
