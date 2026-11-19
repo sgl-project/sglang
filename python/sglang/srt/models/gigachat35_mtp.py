@@ -235,7 +235,7 @@ class GigaChat35ForCausalLMNextN(DeepseekV2WeightLoaderMixin, nn.Module):
         runtime_roots = ["model.decoder", *(f"model.{root}" for root in nextn_roots)]
 
         def map_name(name):
-            name = _GIGACHAT_WEIGHT_MAPPER._map_name(name).rstrip(".")
+            name = name.rstrip(".")
             if name in ("layers", "model.layers"):
                 return runtime_roots
             for prefix in prefixes:
@@ -254,7 +254,9 @@ class GigaChat35ForCausalLMNextN(DeepseekV2WeightLoaderMixin, nn.Module):
         quant_config.ignored_layers = list(
             dict.fromkeys(
                 mapped
-                for name in quant_config.ignored_layers
+                for name in _GIGACHAT_WEIGHT_MAPPER.apply_list(
+                    quant_config.ignored_layers
+                )
                 for mapped in map_name(name)
             )
         )

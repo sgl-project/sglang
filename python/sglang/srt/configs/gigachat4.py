@@ -30,6 +30,19 @@ class GigaChat4Config(GigaChat35Config):
         self.index_topk = index_topk
         self.index_n_heads = index_n_heads
         self.index_head_dim = index_head_dim
+        for name, default in (
+            ("index_topk_freq", 1),
+            ("index_topk_pattern", None),
+            ("indexer_types", None),
+            ("cli_factor", 1),
+        ):
+            value = kwargs.get(name, default)
+            if value is not None and value != default:
+                raise NotImplementedError(
+                    "DSA index sharing is not supported for GigaChat 4 "
+                    f"({name}={value!r}); each full-attention layer must run "
+                    "its own indexer."
+                )
         if indexer_norm_type != "LlamaRMSNorm":
             raise ValueError(
                 f"Unsupported indexer_norm_type {indexer_norm_type!r} for GigaChat 4; "
