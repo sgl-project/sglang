@@ -1118,6 +1118,30 @@ class TestAllocationIntegration(CustomTestCase):
             mgr._staging_outstanding[1] -= 1
             self.assertEqual(mgr.request_status.get(1), KVPoll.Success)
 
+    def test_clear_waits_for_a_status_write_in_progress(self):
+        """A room cleared while a status write is in progress must stay cleared,
+        or the next request that reuses the room opens on a stale Failed entry."""
+        mgr = self.manager("prefill", 1)
+        mgr.defer_decode_allocation = False
+        mgr.deferred_bootstrap = None
+        mgr._staging_outstanding = defaultdict(int)
+        with get_context().override_server_args(
+            disaggregation_decode_allocation_policy="early"
+        ):
+            sender = MooncakeKVSender(mgr, "prefill:8998", 1)
+            mgr.update_status(1, KVPoll.WaitingForInput)
+            clearing = threading.Thread(target=sender.clear)
+            # Stand in for a worker between update_status's read and its write.
+            with mgr._status_lock:
+                clearing.start()
+                clearing.join(timeout=0.2)
+                with self.subTest("the room stays while a write is in progress"):
+                    self.assertIn(1, mgr.request_status)
+            clearing.join(timeout=5)
+            with self.subTest("clear finishes once the write is done"):
+                self.assertFalse(clearing.is_alive())
+                self.assertNotIn(1, mgr.request_status)
+
     def test_abort_after_deferred_chunk_drains_keeps_success(self):
         mgr = self.manager("prefill", 1)
         mgr.defer_decode_allocation = False
