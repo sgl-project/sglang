@@ -68,10 +68,6 @@ def _meta_info(state: ReqState, chunks, finished: bool, num_output_tokens=0) -> 
             chunk,
             num_output_tokens=num_output_tokens,
             finished=finished and i == len(chunks) - 1,
-            detokenize_logprob_tokens=lambda logprobs, token_ids: [
-                (logprob, token_id, None)
-                for logprob, token_id in zip(logprobs, token_ids)
-            ],
         )
     return meta_info
 
@@ -109,11 +105,13 @@ class TestFlatRawSamplingMaskValidation(CustomTestCase):
 
 class TestSamplingOutputMetaInfo(CustomTestCase):
     def test_flat_matches_nested_rows(self):
+        """A nested row is its (logprob, token_id) pairs, the values the flat arrays
+        carry, and no token text."""
         chunks = [_chunk(rows) for rows in _ROWS]
         nested = _meta_info(_make_state(), chunks, finished=True)
         nested_rows = nested["output_sampling_mask_logprobs"]
         self.assertEqual(
-            [[token_id for _, token_id, _ in row] for row in nested_rows],
+            [[token_id for _, token_id in row] for row in nested_rows],
             [row for rows in _ROWS for row in rows],
         )
         self.assertEqual(len(nested["output_token_sampling_logprobs"]), _NUM_TOKENS)
@@ -144,10 +142,7 @@ class TestSamplingOutputMetaInfo(CustomTestCase):
                             np.split(logprobs, ends), np.split(ids, ends)
                         )
                     ],
-                    [
-                        [(logprob, token_id) for logprob, token_id, _ in row]
-                        for row in nested_rows
-                    ],
+                    nested_rows,
                 )
 
     def test_a_request_finished_without_rows_gets_empty_arrays(self):

@@ -748,7 +748,7 @@ class SpecSamplingMaskKit:
             self.assertEqual(len(mask_rows), len(output_ids))
             self.assertEqual(len(logprobs), len(output_ids))
             for output_id, mask_row, logprob in zip(output_ids, mask_rows, logprobs):
-                support = {token_id: value for value, token_id, _ in mask_row}
+                support = {token_id: value for value, token_id in mask_row}
                 self.assertEqual(len(support), len(mask_row))
                 self.assertAlmostEqual(support[output_id], logprob, places=5)
                 self.assertTrue(all(math.isfinite(value) for value in support.values()))

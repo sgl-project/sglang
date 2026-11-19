@@ -428,8 +428,8 @@ class SamplingMaskTestMixin:
         for token_id, mask_row, sampling_logprob in zip(
             output_ids, mask_rows, sampling_logprobs, strict=True
         ):
-            mask = [mask_token_id for _, mask_token_id, _ in mask_row]
-            logprobs = [logprob for logprob, _, _ in mask_row]
+            mask = [mask_token_id for _, mask_token_id in mask_row]
+            logprobs = [logprob for logprob, _ in mask_row]
             self.assertIn(token_id, mask)
             self.assertEqual(len(mask), len(set(mask)))
             self.assertTrue(all(math.isfinite(logprob) for logprob in logprobs))
@@ -474,7 +474,7 @@ class TestSamplingMask(SamplingMaskTestMixin, CustomTestCase):
         self.assertEqual(baseline.status_code, 200, baseline.text)
         # Exclude tokens that actually belong to the unmodified sampling support.
         baseline_row = baseline.json()["meta_info"]["output_sampling_mask_logprobs"][0]
-        blocked = [token_id for _, token_id, _ in baseline_row][:2]
+        blocked = [token_id for _, token_id in baseline_row][:2]
         self.assertTrue(blocked)
         response = self._post_generate(
             {**params, "custom_params": {"token_ids": blocked}},
@@ -571,7 +571,7 @@ class TestSamplingMask(SamplingMaskTestMixin, CustomTestCase):
                 self.assertGreaterEqual(probs[token_id], top_k_cutoff * (1 - 1e-3))
 
             support_mass = sum(probs[token_id] for token_id in mask_set)
-            for sampling_logprob, token_id, _ in mask_row:
+            for sampling_logprob, token_id in mask_row:
                 expected_logprob = math.log(probs[token_id] / support_mass)
                 self.assertAlmostEqual(sampling_logprob, expected_logprob, delta=1e-2)
 
@@ -985,8 +985,8 @@ class TestDistributedSamplingMask(CustomTestCase):
                     else:
                         self.assertNotIn("output_token_sampling_logprobs", meta)
                     for token_id, mask_row in zip(token_ids, mask_rows, strict=True):
-                        mask = [mask_token_id for _, mask_token_id, _ in mask_row]
-                        step_logprobs = [logprob for logprob, _, _ in mask_row]
+                        mask = [mask_token_id for _, mask_token_id in mask_row]
+                        step_logprobs = [logprob for logprob, _ in mask_row]
                         self.assertIn(token_id, mask)
                         self.assertEqual(len(mask), len(set(mask)))
                         self.assertLessEqual(len(mask), 64)

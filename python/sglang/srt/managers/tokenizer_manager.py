@@ -18,7 +18,6 @@ from __future__ import annotations
 import asyncio
 import copy
 import dataclasses
-import functools
 import gc
 import json
 import logging
@@ -428,7 +427,7 @@ class ReqState:
     output_token_sampling_logprobs: List[float] = dataclasses.field(
         default_factory=list
     )
-    # One row of (logprob, token_id, text) per output token.
+    # One row per output token: (logprob, token_id) for each support token.
     output_sampling_mask_logprobs: List[List[Any]] = dataclasses.field(
         default_factory=list
     )
@@ -583,7 +582,6 @@ def _add_sampling_output_to_meta_info(
     *,
     num_output_tokens: int,
     finished: bool,
-    detokenize_logprob_tokens: Callable[[List[float], List[int]], List[Any]],
 ):
     """Add the sampling logprobs and mask rows a request asked for. A filtered
     request reads its captured rows; an unfiltered one was not captured, and
@@ -597,8 +595,9 @@ def _add_sampling_output_to_meta_info(
         if obj.return_flat_raw_sampling_mask:
             state.output_token_sampling_mask_chunks.append(chunk)
         elif obj.return_sampling_mask:
+            # No text: decoding every support token costs far more than the row.
             state.output_sampling_mask_logprobs.extend(
-                detokenize_logprob_tokens(logprobs, token_ids)
+                list(zip(logprobs, token_ids))
                 for token_ids, logprobs in zip(*chunk.support_rows())
             )
 
@@ -3014,11 +3013,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     num_output_tokens=len(state.output_ids)
                     + len(row_output_ids(recv_obj, i)),
                     finished=recv_obj.finished_reasons[i] is not None,
-                    detokenize_logprob_tokens=functools.partial(
-                        self.detokenize_logprob_tokens,
-                        decode_to_text=state.obj.return_text_in_logprobs
-                        and not self.skip_tokenizer_init,
-                    ),
                 )
 
             if not isinstance(recv_obj, BatchEmbeddingOutput):

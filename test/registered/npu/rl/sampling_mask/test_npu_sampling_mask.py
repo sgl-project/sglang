@@ -96,8 +96,8 @@ class TestGLM52BF16SamplingMask(CustomTestCase):
                 strict=True,
             )
         ):
-            mask = [token_id for _, token_id, _ in mask_row]
-            values = [logprob for logprob, _, _ in mask_row]
+            mask = [token_id for _, token_id in mask_row]
+            values = [logprob for logprob, _ in mask_row]
             self.assertIn(token, mask)
             self.assertEqual(len(mask), len(set(mask)))
             self.assertLessEqual(len(mask), 2048)
@@ -199,7 +199,7 @@ class TestGLM52BF16SamplingMask(CustomTestCase):
             mask_only["output_sampling_mask_logprobs"],
             strict=True,
         ):
-            self.assertIn(token, [token_id for _, token_id, _ in mask_row])
+            self.assertIn(token, [token_id for _, token_id in mask_row])
 
 
 if __name__ == "__main__":
