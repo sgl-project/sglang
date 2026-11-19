@@ -6,6 +6,7 @@ from typing import Any, Dict
 from sglang.srt.arg_groups.model_override_base import (
     _register_for,
     is_attention_backend_not_set,
+    model_config_of,
     reject_dp_size_under_context_parallel,
     resolving_view,
     use_mla_backend,
@@ -87,6 +88,44 @@ def _glm_split_index_k_dcp_overrides(cfg: Any) -> dict:
         "dsa_decode_backend": "flashmla_kv",
         "kv_cache_dtype": "fp8_e4m3",
     }
+
+
+def cap_glm_split_index_k_dcp_context_length(server_args: Any) -> None:
+    from sglang.srt.arg_groups.overrides import (
+        declare_resolution,
+        max_speculative_num_draft_tokens,
+    )
+    from sglang.srt.configs.model_config import glm_dsa_shards_index_k
+    from sglang.srt.mem_cache.allocation_sizing import req_to_token_extra_context_len
+
+    cfg = resolving_view(server_args)
+    model_config = model_config_of(server_args)
+    if not glm_dsa_shards_index_k(model_config.hf_config, cfg.dcp_size):
+        return
+    alloc_page_size = cfg.page_size * cfg.dcp_size
+    extra_context_len = req_to_token_extra_context_len(
+        speculative_algorithm=cfg.speculative_algorithm,
+        num_steps=cfg.speculative_num_steps,
+        eagle_topk=cfg.speculative_eagle_topk,
+        num_draft_tokens=max_speculative_num_draft_tokens(server_args),
+        page_size=alloc_page_size,
+    )
+    # The merge takes rows of at most 2^20 scores; a row spans the request
+    # table rounded up to whole allocator pages.
+    max_context_len = (1 << 20) // alloc_page_size * alloc_page_size - extra_context_len
+    if cfg.context_length is None:
+        if model_config.context_len > max_context_len:
+            declare_resolution(
+                server_args,
+                "cap_glm_split_index_k_dcp_context_length",
+                context_length=max_context_len,
+            )
+    elif cfg.context_length > max_context_len:
+        raise ValueError(
+            "GLM-5 DSA DCP on SM90 supports --context-length "
+            f"{max_context_len} or less with this --dcp-size and speculative "
+            f"decoding setup; got {cfg.context_length}."
+        )
 
 
 @_register_for(

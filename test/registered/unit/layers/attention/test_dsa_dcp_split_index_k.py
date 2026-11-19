@@ -7,6 +7,10 @@ import pytest
 import torch
 from transformers import LlamaConfig
 
+from sglang.srt.arg_groups.model_override_base import model_config_of
+from sglang.srt.arg_groups.model_overrides.deepseek_v2 import (
+    cap_glm_split_index_k_dcp_context_length,
+)
 from sglang.srt.configs.model_config import (
     ModelConfig,
     dsa_draft_shards_under_dcp,
@@ -83,11 +87,11 @@ def test_unset_context_length_is_capped_only_under_split_index_k():
             v_head_dim=4,
         ).save_pretrained(checkpoint)
 
-        def context_len(*, is_sm90=True, **server_args):
+        def context_len(*, is_sm90=True, **fields):
+            server_args = ServerArgs(model_path=checkpoint, page_size=64, **fields)
             with override_platform(is_sm90=is_sm90, is_sm100=not is_sm90):
-                return ModelConfig.from_server_args(
-                    ServerArgs(model_path=checkpoint, page_size=64, **server_args)
-                ).context_len
+                cap_glm_split_index_k_dcp_context_length(server_args)
+                return model_config_of(server_args).context_len
 
         # The request table over-allocates four tokens without a draft.
         assert context_len(dcp_size=4) == model_context_len - 4
@@ -104,6 +108,15 @@ def test_unset_context_length_is_capped_only_under_split_index_k():
             speculative_num_draft_tokens=65,
         )
         assert context_len(dcp_size=2, **long_draft) == model_context_len - 257
+        # Resolution builds the config before EAGLE picks its draft width.
+        early = ServerArgs(
+            model_path=checkpoint,
+            page_size=64,
+            dcp_size=4,
+            speculative_algorithm="EAGLE",
+        )
+        with override_platform(is_sm90=True, is_sm100=False):
+            assert ModelConfig.from_server_args(early).context_len == model_context_len
 
 
 @pytest.mark.parametrize("mode", [ForwardMode.EXTEND, ForwardMode.MIXED])

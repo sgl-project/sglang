@@ -223,28 +223,6 @@ def is_deepseek_dsa(config) -> bool:
     ) or is_kimi_k31(config)
 
 
-def split_index_k_dcp_max_context_len(server_args) -> Optional[int]:
-    from sglang.srt.arg_groups.model_override_base import resolving_view
-    from sglang.srt.arg_groups.overrides import max_speculative_num_draft_tokens
-    from sglang.srt.mem_cache.allocation_sizing import req_to_token_extra_context_len
-
-    cfg = resolving_view(server_args)
-    # The page size is unset until resolution; that early config goes uncapped.
-    if cfg.dcp_size <= 1 or cfg.page_size is None:
-        return None
-    alloc_page_size = cfg.page_size * cfg.dcp_size
-    extra_context_len = req_to_token_extra_context_len(
-        speculative_algorithm=cfg.speculative_algorithm,
-        num_steps=cfg.speculative_num_steps,
-        eagle_topk=cfg.speculative_eagle_topk,
-        num_draft_tokens=max_speculative_num_draft_tokens(server_args),
-        page_size=alloc_page_size,
-    )
-    # The merge takes rows of at most 2^20 scores; a row spans the request
-    # table rounded up to whole allocator pages.
-    return (1 << 20) // alloc_page_size * alloc_page_size - extra_context_len
-
-
 def glm_dsa_shards_index_k(config, dcp_size: int) -> bool:
     # The replicated index-K DCP path needs the trtllm DSA kernels, which SM90 lacks.
     return dcp_size > 1 and is_glm_moe_dsa(config) and get_platform().is_sm90
@@ -750,8 +728,6 @@ class ModelConfig:
         speculative_algorithm: Optional[str] = None,
         is_draft_quantization_explicit: bool = False,
         uocr_v2_default_context_len: int = FALLBACK_CONTEXT_LENGTH,
-        dcp_size: int = 1,
-        split_index_k_dcp_max_context_len: Optional[int] = None,
     ) -> None:
         # Parse args
         self.model_path = model_path
@@ -761,8 +737,6 @@ class ModelConfig:
         self.is_draft_quantization_explicit = is_draft_quantization_explicit
         self.speculative_algorithm = speculative_algorithm
         self.uocr_v2_default_context_len = uocr_v2_default_context_len
-        self.dcp_size = dcp_size
-        self.split_index_k_dcp_max_context_len = split_index_k_dcp_max_context_len
         self.model_impl = model_impl
         self.sampling_defaults = sampling_defaults
         self.quantize_and_serve = quantize_and_serve
@@ -1172,10 +1146,6 @@ class ModelConfig:
             uocr_v2_default_context_len=UocrDocumentConfig.from_args(
                 cfg
             ).default_context_length(),
-            dcp_size=cfg.dcp_size,
-            split_index_k_dcp_max_context_len=split_index_k_dcp_max_context_len(
-                server_args
-            ),
             **kwargs,
         )
 
@@ -1507,22 +1477,6 @@ class ModelConfig:
                 context_length,
             )
 
-        max_context_len = (
-            self.split_index_k_dcp_max_context_len
-            if glm_dsa_shards_index_k(self.hf_config, self.dcp_size)
-            else None
-        )
-        if (
-            context_length is not None
-            and max_context_len is not None
-            and context_length > max_context_len
-        ):
-            raise ValueError(
-                "GLM-5 DSA DCP on SM90 supports --context-length "
-                f"{max_context_len} or less with this --dcp-size and speculative "
-                f"decoding setup; got {context_length}."
-            )
-
         if context_length is not None:
             if context_length > derived_context_len:
                 reason = "Target model's" if is_draft_model else "User-specified"
@@ -1553,8 +1507,6 @@ class ModelConfig:
                 and self.hf_config.architectures[0] == "EmbeddingGemma2Model"
             ):
                 self.context_len = min(derived_context_len, 8192)
-            elif max_context_len is not None:
-                self.context_len = min(derived_context_len, max_context_len)
             else:
                 self.context_len = derived_context_len
 

@@ -389,6 +389,13 @@ def run_resolution_pipeline(server_args: Any) -> None:
     run_hook(handle_nvidia_megakernel, server_args)
     run_hook(handle_monokernel, server_args)
 
+    # needs the resolved page size and draft width
+    from sglang.srt.arg_groups.model_overrides.deepseek_v2 import (
+        cap_glm_split_index_k_dcp_context_length,
+    )
+
+    cap_glm_split_index_k_dcp_context_length(server_args)
+
     finalize_cuda_graph_prefill_max_context(server_args)
 
     # Capability adjustments can late-force a different attention backend or
