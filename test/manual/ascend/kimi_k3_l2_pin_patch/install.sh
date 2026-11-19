@@ -15,6 +15,6 @@ else
 fi
 
 "${python_bin}" "${patch_dir}/install.py" --package-root "${package_root}"
-# Nightly applies this archive before sourcing the SDK. This process only reads
+# Nightly runs this hook before sourcing the SDK. This process only reads
 # metadata; actual loaded-library identity is captured again on the failure.
 "${python_bin}" "${package_root}/srt/mem_cache/pool_host/npu_pin_diagnostics.py" --environment

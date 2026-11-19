@@ -1,148 +1,85 @@
-# Kimi K3 L2 pinned-memory container patch
+# Kimi K3 L2 pinned-memory diagnostics
 
-This package collects evidence for the Mamba D2H "host buffer must use pinned
-memory" error. Its root cause remains unconfirmed. The original exception,
-allocator, transfer mode, and four-node test parameters are retained.
+The diagnostic files travel with the PR checkout. The original K3 accuracy case
+automatically runs their local install.sh through the existing container patch
+step. No diagnostic archive, URL input, or runtime download is needed.
 
-## Apply patch to container
+The error's root cause remains unconfirmed. The hook preserves the original
+exception, allocator, transfer mode, and four-node test parameters.
 
-Pass this zip URL to the test runner's **Apply patch to container** /
-**container_patches** entry:
+## Run through Nightly
 
-~~~text
-https://raw.githubusercontent.com/hanwlax/sglang/codex/k3-hicache-pin-diagnostics/test/manual/ascend/kimi_k3_l2_pin_patch/k3-pin-diagnostics.zip
-~~~
-
-The archive has install.sh at its root. The existing multi-node template
-downloads/extracts it and each Pod runs the installer before the original test.
-This PR ships only the package and guide; runtime/launcher files are unchanged.
-
-[Reviewable package sources](kimi_k3_l2_pin_patch/) include a reproducible builder:
+From an account with upstream Actions permissions:
 
 ~~~bash
-python3 test/manual/ascend/kimi_k3_l2_pin_patch/build_zip.py /tmp/k3-pin-diagnostics.zip
-cmp /tmp/k3-pin-diagnostics.zip test/manual/ascend/kimi_k3_l2_pin_patch/k3-pin-diagnostics.zip
-sha256sum /tmp/k3-pin-diagnostics.zip
+gh workflow run nightly-test-npu.yml --repo sgl-project/sglang --ref main \
+  -f ref=refs/pull/51513/head \
+  -f job_filter=nightly-poc-multi-node-mix-tests \
+  -f accuracy_dataset=gsm8k \
+  -f image_a3=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.1.0-a3
 ~~~
 
-Replace the URL's branch name with the published commit SHA for immutable bytes.
+The workflow checks out the PR, copies its files to the run-scoped shared PVC,
+and mounts them in each Pod at /root/sglang. The launcher automatically includes
+test/manual/ascend/kimi_k3_l2_pin_patch in its local container patch directories
+only for test_npu_kimi_k3_w4a8_32p_gpqa.py. No container_patches URL input is needed.
+The existing mix group also runs its other Kimi cases; they do not select these
+diagnostics. The workflow matrix and original case configuration are unchanged.
 
-## Existing Nightly automation
+Keep the default checkout mode (use_image_sglang empty/false) for the PR source.
+If the existing image-code mode is explicitly selected, the installer instead
+patches the image package that the launcher will import.
 
-The reusable multi-node template accepts container_patches. A caller in the
-upstream CI environment can use this job with its normal trigger/permissions:
+## Files applied inside the container
 
-~~~yaml
-jobs:
-  k3-pin-diagnostics:
-    uses: sgl-project/sglang/.github/workflows/nightly-test-npu-e2e-multi-node.yml@main
-    with:
-      ref: main
-      runner: linux-amd64-cpu-4
-      test_type: accuracy
-      test_config_name: kimi_k3_w4a8_32p_gpqa
-      test_case: test/registered/npu/accuracy/kimi_k3/test_npu_kimi_k3_w4a8_32p_gpqa.py
-      node_size: 4
-      prefill_decode_deployment: mix
-      accuracy_dataset: gsm8k
-      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.1.0-a3
-      container_patches: https://raw.githubusercontent.com/hanwlax/sglang/codex/k3-hicache-pin-diagnostics/test/manual/ascend/kimi_k3_l2_pin_patch/k3-pin-diagnostics.zip
-    secrets: inherit
-~~~
-
-This runs main plus the prints installed inside each Pod. Keep source, image,
-and dataset aligned with the failing run. Cluster credentials/shared PVC are
-required. **The current top-level nightly-test-npu.yml does not expose/forward
-container_patches**; do not add that input to its dispatch command. Use the
-test-team entry that forwards it, the reusable-template caller above, or the
-driver below. This PR does not change workflow inputs.
-
-For the existing driver's single-case route, run in the CI runner after its
-normal source-copy preparation:
-
-~~~bash
-run_id=123456789  # Replace with the run's unique numeric ID.
-checkout="/root/.cache/tests/sglang-${run_id}"
-patch_url=https://raw.githubusercontent.com/hanwlax/sglang/codex/k3-hicache-pin-diagnostics/test/manual/ascend/kimi_k3_l2_pin_patch/k3-pin-diagnostics.zip
-curl -fsSL "${patch_url}" -o /tmp/k3-pin-diagnostics.zip
-mkdir -p "${checkout}/container-patches/k3-pin"
-python3 -m zipfile -e /tmp/k3-pin-diagnostics.zip "${checkout}/container-patches/k3-pin"
-
-cd python/sglang/test/ascend/e2e
-python3 -u run_npu_e2e_test.py \
-  --env ci \
-  --image swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.1.0-a3 \
-  --sglang-source-relative-path "tests/sglang-${run_id}" \
-  --metrics-data-file "/root/.cache/tests/output/${run_id}/accuracy/test_npu_kimi_k3_w4a8_32p_gpqa" \
-  --test-case test/registered/npu/accuracy/kimi_k3/test_npu_kimi_k3_w4a8_32p_gpqa.py \
-  --kube-name-space sgl-project \
-  --kube-job-type multi-pd-mix \
-  --kube-job-name-prefix "ascend-${run_id}" \
-  --run-id "${run_id}" \
-  --container-patches container-patches/k3-pin \
-  --accuracy-dataset gsm8k \
-  --node-size 4 \
-  --sglang-is-in-ci
-~~~
-
-The workflow input takes an HTTPS zip URL. The driver's --container-patches
-takes an already extracted directory relative to the mounted checkout.
-
-## Installer and manual application
-
-The installer matches the launcher's package selection: mounted checkout by
-default, installed image package for SGLANG_USE_IMAGE=true. It only installs
-the Mamba exception hook and its helper, without editing the executing launcher.
-A file lock and atomic writes handle four Pods sharing a checkout. Repeated
+[The local directory](kimi_k3_l2_pin_patch/) contains install.sh, install.py,
+mamba-pin-diagnostics.patch, and npu_pin_diagnostics.py. The installer checks the
+patch in a temporary tree and applies only the Mamba exception hook plus its
+helper. A lock and atomic writes handle four Pods sharing a checkout. Repeated
 installs verify the same hook/helper; unexpected source context or a different
-existing helper fails installation.
+existing helper fails installation and stops that Pod's launcher.
 
-To apply manually, extract the archive and run inside the container:
+Verify "K3_PIN_PATCH applied" or "K3_PIN_PATCH already applied", the target path,
+and source hash in each Pod's log. The original source is saved beside it as
+mamba.py.k3-pin-original. Fresh Pods/run-scoped checkouts are the normal reset.
+
+For manual application after the files have been copied into a container:
 
 ~~~bash
-cd /tmp/k3-pin-diagnostics
-bash install.sh /sgl-workspace/sglang/python/sglang
+bash /root/sglang/test/manual/ascend/kimi_k3_l2_pin_patch/install.sh \
+  /sgl-workspace/sglang/python/sglang
 ~~~
 
-The optional argument is the exact package directory imported by the server.
-Verify "K3_PIN_PATCH applied" or "K3_PIN_PATCH already applied", the target path,
-and source hash in every Pod's log. The original source is saved beside it as
-mamba.py.k3-pin-original. Fresh Pods/run-scoped checkouts are the normal reset.
+The optional argument is the exact sglang package directory imported by the
+server. Omit it in the normal Nightly launcher to follow its package selection.
+
+For direct use of run_npu_e2e_test.py, use the PR checkout already copied to the
+shared directory and keep the original K3 test-case argument. The launcher adds
+the local diagnostic directory automatically. Its existing --container-patches
+option can still specify other local patch directories when needed.
 
 ## Evidence and limits
 
 The installer runs a standard-library-only metadata subprocess without NPU
-initialization. In Nightly it runs before SDK setup, so its paths are pre-setup
-observations. On failure the collector records actual loaded libraries and
-torch_npu-reported versions again.
+initialization. In Nightly this precedes SDK setup, so those paths are pre-setup
+observations. On the original pinned exception, the collector records active
+loaded libraries and torch_npu-reported versions again, and re-raises the error.
 
-Search Pod logs for NPU_PIN_DIAGNOSTIC. JSON records are written under:
+Search Pod logs for NPU_PIN_DIAGNOSTIC. JSON records go to:
 
 ~~~text
 ${METRICS_DATA_FILE}/npu_pin_diagnostics/
 ~~~
 
-The existing artifact upload collects that directory. Records include
-hostname/PID/time, package/build versions, wheel basename, Git IDs, and hashes.
-Failure records add original data/storage pointers, offsets/shapes/strides,
-ACL registration coverage and pointer attributes, Python/ATen pinned results,
-dispatcher/TLS state, and loaded source/library hashes.
+The existing artifact upload collects that directory. Records include package/
+build versions, wheel basename, Git IDs, hashes, original data/storage pointers,
+buffer shapes/strides/offsets, ACL registration coverage and pointer attributes,
+Python/ATen pinned results, and dispatcher/TLS state. One verified torch_npu ELF
+supports a compatibility-cache read guarded by SHA256 and instruction checks;
+other builds skip it. No C++ functions are invoked through ctypes.
+Post-exception state can require follow-up native-check instrumentation.
 
-For one verified torch_npu ELF, an exact SHA256 and instruction check guard
-reading the cached compatibility decision. Other builds skip that read.
-No C++ functions are called through ctypes. Exception unwinding can restore
-state; inconsistent observations may require native-check instrumentation.
-
-The patch cannot modify the Kubernetes driver outside its Pods. Retain image
-IDs separately while Pods exist, for example:
-
-~~~bash
-kubectl -n sgl-project get pods -l "run-id=${run_id}" \
-  -o jsonpath='{range .items[*]}{.metadata.name}{" "}{range .status.containerStatuses[*]}{.imageID}{" "}{end}{"\n"}{end}'
-~~~
-
-Earlier A3 probes passed with a 3,337,224,192-byte registered host tensor and
-16 processes holding 230,691,897,344 registered host bytes. These are negative
-reproduction results, not evidence of a fix. The collector ran successfully on
-A3, with its failure entry manually invoked after a successful native copy.
+Earlier A3 probes and the collector passed, but did not reproduce the original
+failure. The installer passed first/repeat installation in a temporary copy of
+the actual A3 container's default code; its default source was unchanged.
 The original four-node failure still needs test-team capture.

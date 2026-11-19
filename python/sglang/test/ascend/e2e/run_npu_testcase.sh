@@ -26,12 +26,16 @@ export HF_MODULES_CACHE="${HF_MODULES_CACHE:-/tmp/hf_modules}"
 echo "NPU info:"
 npu-smi info
 
-# Apply the container patches prepared by the workflow: every entry in
-# SGLANG_NPU_CONTAINER_PATCHES is a directory (relative to the repo root) whose
-# install.sh ships with that patch archive. The workflow downloads and extracts
-# the archives before the pods start; install.sh owns everything else, including
-# dependency installation and any package mirror configuration.
-if [ -n "${SGLANG_NPU_CONTAINER_PATCHES:-}" ]; then
+# The reference diagnostics travel with the checkout and use the same local
+# install.sh hook as other container patches. Only the original K3 case opts in.
+container_patch_dirs="${SGLANG_NPU_CONTAINER_PATCHES:-}"
+if [ "${test_case}" = "test/registered/npu/accuracy/kimi_k3/test_npu_kimi_k3_w4a8_32p_gpqa.py" ]; then
+    container_patch_dirs="${container_patch_dirs:+${container_patch_dirs},}test/manual/ascend/kimi_k3_l2_pin_patch"
+fi
+
+# Entries are directories relative to the mounted checkout. Their install.sh
+# owns dependency installation and any package mirror configuration.
+if [ -n "${container_patch_dirs}" ]; then
     echo "===== Apply container patches - Begin ====="
     while IFS= read -r patch_dir; do
         patch_dir="$(echo "${patch_dir}" | tr -d '[:space:]')"
@@ -47,9 +51,9 @@ if [ -n "${SGLANG_NPU_CONTAINER_PATCHES:-}" ]; then
         (
             cd "$(dirname "${install_sh}")"
             bash ./install.sh
-        )
+        ) || exit "$?"
         echo "===== Apply container patch: ${patch_dir} - End ====="
-    done <<< "$(echo "${SGLANG_NPU_CONTAINER_PATCHES}" | tr ',' '\n')"
+    done <<< "$(echo "${container_patch_dirs}" | tr ',' '\n')"
     echo "===== Apply container patches - End ====="
 else
     echo "No container patch requested, skip."
