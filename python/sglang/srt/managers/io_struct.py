@@ -651,6 +651,15 @@ class GenerateReqInput:
             self.token_ids_logprob = None
         if self.return_sampling_mask is None:
             self.return_sampling_mask = False
+        if isinstance(self.return_hidden_states, list):
+            # One mode per prompt. The scheduler takes a single mode, so a list
+            # must not reach it.
+            if len(self.return_hidden_states) != 1:
+                raise ValueError(
+                    "The length of return_hidden_states should be equal to the batch size."
+                )
+            self.return_hidden_states = self.return_hidden_states[0]
+        get_return_hidden_states_mode(self.return_hidden_states)
         for field_name in ("extra_key", "cache_salt"):
             value = getattr(self, field_name)
             if value is not None and not isinstance(value, str):

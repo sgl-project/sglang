@@ -807,6 +807,40 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         ):
             req.normalize_batch_and_arguments()
 
+    def test_return_hidden_states_single_request_unwraps_one_item_list(self):
+        # The scheduler takes one mode per request, never a list.
+        for mode in (False, True, "last"):
+            with self.subTest(mode=mode):
+                req = GenerateReqInput(text="Prompt", return_hidden_states=[mode])
+
+                req.normalize_batch_and_arguments()
+
+                self.assertTrue(req.is_single)
+                self.assertNotIsInstance(req.return_hidden_states, list)
+                self.assertEqual(req.return_hidden_states, mode)
+
+    def test_return_hidden_states_single_request_list_length_is_validated(self):
+        for modes in ([], [False, False], [True, "last"]):
+            with self.subTest(modes=modes):
+                req = GenerateReqInput(input_ids=[1, 2, 3], return_hidden_states=modes)
+
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "return_hidden_states should be equal to the batch size",
+                ):
+                    req.normalize_batch_and_arguments()
+
+    def test_return_hidden_states_single_request_modes_are_validated(self):
+        for value in ("invalid", ["invalid"], [None], [[False]]):
+            with self.subTest(value=value):
+                req = GenerateReqInput(text="Prompt", return_hidden_states=value)
+
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "return_hidden_states must be a boolean or the string literal 'last'",
+                ):
+                    req.normalize_batch_and_arguments()
+
     def test_mixed_none_and_images_with_parallel_samples(self):
         """Test that when some batch items have images and others None, parallel expansion works correctly."""
         req = copy.deepcopy(self.base_req)
