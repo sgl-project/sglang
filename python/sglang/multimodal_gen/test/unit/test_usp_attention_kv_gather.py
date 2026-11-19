@@ -309,6 +309,7 @@ class TestKVGatherCallSupport(unittest.TestCase):
             replicated_mode_count=0,
             attn_mask=None,
             num_replicated_kv_prefix=0,
+            query_len=4,
         )
         kwargs.update(overrides)
         return _kv_gather_unsupported_reason(**kwargs)
@@ -329,6 +330,11 @@ class TestKVGatherCallSupport(unittest.TestCase):
         )
         self.assertIn("[B, S_local]", self._reason(attn_mask=torch.ones(1, 1, 4)))
         self.assertIn("integer padding", self._reason(attn_mask=torch.ones(1, 4)))
+        # a cross-attention key mask: 4 keys, 2 query rows
+        self.assertIn(
+            "per query row",
+            self._reason(attn_mask=torch.ones(1, 4, dtype=torch.bool), query_len=2),
+        )
 
     def test_explicit_mode_raises_and_auto_falls_back_at_dispatch(self):
         attn = _make_attention(4)
@@ -344,6 +350,11 @@ class TestKVGatherCallSupport(unittest.TestCase):
             attn.sp_attention_mode_is_auto = False
             with self.assertRaisesRegex(NotImplementedError, "pre-all-to-all"):
                 attn.forward(q, q, q, qkv_pre_all_to_all=True)
+            # 4 query rows against 6 keys with a key mask
+            k = torch.randn(1, 6, 3, 4)
+            key_mask = torch.ones(1, 6, dtype=torch.bool)
+            with self.assertRaisesRegex(NotImplementedError, "per query row"):
+                attn.forward(q, k, k, attn_mask=key_mask)
 
 
 class TestReplicatedModeCountCompile(CustomTestCase):
