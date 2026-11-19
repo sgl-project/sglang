@@ -13,8 +13,6 @@ from __future__ import annotations
 
 import math
 import os
-from collections import OrderedDict
-from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
@@ -25,20 +23,9 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import (
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-
-logger = init_logger(__name__)
-
-# pad buckets (rows, tokens) kept as CUDA graphs; each holds its activations
-_MAX_FORWARD_GRAPHS = 8
-
-
-@dataclass
-class _CapturedForward:
-    graph: torch.cuda.CUDAGraph
-    input_ids: torch.Tensor
-    mask: torch.Tensor
-    tokens: torch.Tensor
+from sglang.multimodal_gen.runtime.models.encoders.text_encoder_graphs import (
+    TextEncoderGraphs,
+)
 
 
 def parse_weight_spec(spec: str) -> tuple[str, str | None, str | None]:
@@ -129,26 +116,17 @@ class Flux3TextEncoder(nn.Module, LayerwiseOffloadableModuleMixin):
         self.output_layers = tuple(output_layers)
         self.pad_multiple = pad_multiple
         self.max_length = max_length
-        # the eager forward is host-bound at prompt lengths, so a pad bucket seen
-        # twice is replayed as a CUDA graph; None where the forward is not eager
-        self._forward_graphs: OrderedDict[tuple[int, ...], _CapturedForward] | None = (
-            None if weight_only_fp8 or compile_language_model else OrderedDict()
+        # the eager forward is host-bound at prompt lengths; None where the
+        # forward is not the plain eager one
+        self._forward_graphs = (
+            None if weight_only_fp8 or compile_language_model else TextEncoderGraphs()
         )
-        self._seen_buckets: set[tuple[int, ...]] = set()
         if weight_only_fp8:
             _quantize_linears_to_weight_only_fp8(self.model)
         elif compile_language_model:
             # One region over mask construction, rotary embedding and the
             # decoder loop; the length varies by pad bucket.
             language_model.forward = torch.compile(language_model.forward, dynamic=True)
-
-    def _apply(self, fn, recurse=True):
-        # a captured graph replays against the weights' old storage; forgetting
-        # the buckets too keeps an encoder that is moved every request eager
-        if self._forward_graphs is not None:
-            self._forward_graphs.clear()
-            self._seen_buckets.clear()
-        return super()._apply(fn, recurse)
 
     @property
     def device(self) -> torch.device:
@@ -202,12 +180,14 @@ class Flux3TextEncoder(nn.Module, LayerwiseOffloadableModuleMixin):
                 results[i] = stacked[j : j + 1]
         return results
 
-    def _forward_context(self, input_ids: torch.Tensor, mask: torch.Tensor):
+    def _forward_context(self, inputs: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Token ids and mask ``(rows, tokens)`` -> stacked hidden states."""
+        mask = inputs["attention_mask"]
         positions = (mask.long().cumsum(-1) - 1).masked_fill(mask == 0, 1)
         # Reference numerics: PyTorch's default SDPA backend choice.
         with torch_default_sdpa_backends():
             out = self.model(
-                input_ids=input_ids,
+                input_ids=inputs["input_ids"],
                 attention_mask=mask,
                 # Qwen3-VL M-RoPE: the text position plus three vision axes.
                 position_ids=positions[None].expand(4, -1, -1),
@@ -217,50 +197,6 @@ class Flux3TextEncoder(nn.Module, LayerwiseOffloadableModuleMixin):
         return torch.cat([out.hidden_states[k] for k in self.output_layers], dim=-1).to(
             self.embed_dtype
         )
-
-    def _context(self, input_ids: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        """Token ids and mask ``(rows, tokens)`` -> stacked hidden states."""
-        graphs = self._forward_graphs
-        if (
-            graphs is None
-            or not input_ids.is_cuda
-            or self.layerwise_offload_managers
-            or torch.cuda.is_current_stream_capturing()
-        ):
-            return self._forward_context(input_ids, mask)
-        bucket = tuple(input_ids.shape)
-        captured = graphs.get(bucket)
-        if captured is None:
-            if bucket not in self._seen_buckets:
-                self._seen_buckets.add(bucket)
-                return self._forward_context(input_ids, mask)
-            graph = torch.cuda.CUDAGraph()
-            static_ids, static_mask = input_ids.clone(), mask.clone()
-            try:
-                with torch.cuda.graph(graph):
-                    tokens = self._forward_context(static_ids, static_mask)
-            except RuntimeError as error:
-                # a forward that synchronizes cannot be captured: stay eager
-                logger.warning(
-                    "FLUX.3 text encoder: CUDA graph capture failed (%s); "
-                    "encoding eagerly",
-                    error,
-                )
-                self._forward_graphs = None
-                return self._forward_context(input_ids, mask)
-            captured = _CapturedForward(graph, static_ids, static_mask, tokens)
-            logger.info(
-                "FLUX.3 text encoder: captured a CUDA graph for %d x %d tokens", *bucket
-            )
-            if len(graphs) >= _MAX_FORWARD_GRAPHS:
-                graphs.popitem(last=False)
-            graphs[bucket] = captured
-        else:
-            graphs.move_to_end(bucket)
-        captured.input_ids.copy_(input_ids)
-        captured.mask.copy_(mask)
-        captured.graph.replay()
-        return captured.tokens.clone()
 
     @torch.no_grad()
     def encode_batch(self, texts: list[str]) -> list[tuple[torch.Tensor, torch.Tensor]]:
@@ -295,10 +231,17 @@ class Flux3TextEncoder(nn.Module, LayerwiseOffloadableModuleMixin):
                 max_length=length,
                 padding_side="right",
             )
-            tokens = self._context(
-                toks["input_ids"].to(self.device, non_blocking=True),
-                toks["attention_mask"].to(self.device, non_blocking=True),
-            )
+            inputs = {
+                name: toks[name].to(self.device, non_blocking=True)
+                for name in ("input_ids", "attention_mask")
+            }
+            if self._forward_graphs is None:
+                tokens = self._forward_context(inputs)
+            else:
+                # a replay writes into the graph's own output
+                tokens = self._forward_graphs(
+                    self.model, inputs, self._forward_context
+                ).clone()
             positions = torch.arange(length, device=tokens.device)
             zeros = torch.zeros_like(positions)
             ids = torch.stack([zeros, zeros, zeros, positions], -1)
