@@ -93,6 +93,17 @@ curl -sS "http://localhost:30010/v1/models/wan-t2v"
 
 `GET /server_info` also reports `served_model_name` for gateway discovery. Video and action responses use this name when the request does not provide a model explicitly.
 
+### Authentication
+
+Inference endpoints accept requests without a key unless you start the server with `--api-key`. When it has one, send it as `Authorization: Bearer <key>`, or as the `api_key` of the OpenAI SDK client:
+
+```bash curl
+curl -sS "http://localhost:30010/v1/models" \
+  -H "Authorization: Bearer $API_KEY"
+```
+
+LoRA and weight management endpoints follow the admin key rules in [API key authentication](/docs/sglang-diffusion/api/cli#api-key-authentication).
+
 ---
 
 ## Endpoints
@@ -500,6 +511,7 @@ The server supports dynamic loading, merging, and unmerging of LoRA adapters.
 - Mutual Exclusion: Only one LoRA configuration can be active per target at a time; that configuration can contain multiple adapters
 - Switching: To switch LoRAs, deactivate the current LoRA with `unmerge_lora_weights`, then `set` the new one
 - Caching: The server caches loaded LoRA weights in memory. Switching back to a previously loaded LoRA (same path) has little cost
+- Authentication: When the server has an admin API key, these endpoints require it; with only `--api-key`, they require that key. See [API key authentication](/docs/sglang-diffusion/api/cli#api-key-authentication)
 
 **Set LoRA Adapter**
 

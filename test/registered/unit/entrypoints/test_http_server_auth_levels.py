@@ -16,7 +16,8 @@ SERVED_ELSEWHERE = {
     "/metrics/",
     "/metrics/{path:path}",
     "/internal/peer",
-    # diffusion management routes are exercised by test/unit/test_http_auth.py
+    # The diffusion server's management routes, which
+    # python/sglang/multimodal_gen/test/unit/test_http_auth.py exercises.
     "/v1/set_lora",
     "/v1/merge_lora_weights",
     "/v1/unmerge_lora_weights",

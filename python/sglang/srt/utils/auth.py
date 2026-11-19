@@ -56,6 +56,9 @@ def _unique_keys(pairs: list) -> dict:
 # Every HTTP route sglang serves, by the Python and the Rust server alike, and
 # its auth level; the Rust server compiles the same file in. A route it does not
 # declare (an extension's, or one whose path an env var sets) is NORMAL.
+# The diffusion server reads the same table: a path it shares with the LLM
+# server takes that level, its own management routes are declared here, and
+# `multimodal_gen/test/unit/test_http_auth.py` pins the routes it leaves NORMAL.
 AUTH_LEVELS: dict[str, AuthLevel] = {
     path: AuthLevel(level)
     for path, level in json.loads(

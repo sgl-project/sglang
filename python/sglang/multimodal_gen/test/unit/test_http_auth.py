@@ -16,13 +16,70 @@ from sglang.multimodal_gen.runtime.entrypoints.http_server import create_app
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.argparse import FlexibleArgumentParser
+from sglang.srt.environ import envs
 from sglang.srt.utils.auth import (
     ADMIN_API_KEY_MISSING_MESSAGE,
     AUTH_LEVELS,
     AuthLevel,
+    _get_auth_level_from_app_and_scope,
     _iter_leaf_routes,
     add_api_key_middleware,
+    undeclared_routes,
 )
+
+# The management routes, with a body their handlers accept.
+_MANAGEMENT_ROUTES = [
+    ("/v1/set_lora", {"lora_nickname": "default"}, AuthLevel.ADMIN_OPTIONAL),
+    ("/v1/merge_lora_weights", {}, AuthLevel.ADMIN_OPTIONAL),
+    ("/v1/unmerge_lora_weights", {}, AuthLevel.ADMIN_OPTIONAL),
+    (
+        "/update_weights_from_tensor_checker",
+        {
+            "target_module": "transformer",
+            "expected_named_tensors_sha256": {"fake.weight": "0" * 64},
+        },
+        AuthLevel.ADMIN_OPTIONAL,
+    ),
+    (
+        "/get_weights_checksum",
+        {"module_names": ["transformer"]},
+        AuthLevel.ADMIN_OPTIONAL,
+    ),
+    ("/update_weights_from_disk", {"model_path": "/fake"}, AuthLevel.ADMIN_FORCE),
+    (
+        "/update_weights_from_tensor",
+        {"serialized_named_tensors": ["fake"]},
+        AuthLevel.ADMIN_FORCE,
+    ),
+    ("/release_memory_occupation", {}, AuthLevel.ADMIN_FORCE),
+    ("/resume_memory_occupation", {}, AuthLevel.ADMIN_FORCE),
+]
+_PROFILE_ROUTES = ["/start_profile", "/stop_profile"]
+
+# The routes `auth_levels.json` does not declare, which are NORMAL. A new route
+# joins this set, or is declared with its level, before the inventory test passes.
+_UNDECLARED_NORMAL_ROUTES = {
+    "/liveness",
+    "/models",
+    "/openpi/policy",
+    "/rollout/generate",
+    "/stats",
+    "/v1/actions/generations",
+    "/v1/actions/metadata",
+    "/v1/actions/realtime",
+    "/v1/images/edits",
+    "/v1/images/generations",
+    "/v1/images/{image_id}/content",
+    "/v1/list_loras",
+    "/v1/meshes",
+    "/v1/meshes/{mesh_id}",
+    "/v1/meshes/{mesh_id}/content",
+    "/v1/model_info",
+    "/v1/realtime_video/generate",
+    "/v1/videos",
+    "/v1/videos/{video_id}",
+    "/v1/videos/{video_id}/content",
+}
 
 
 def _server_args(api_key=None, admin_api_key=None):
@@ -38,13 +95,34 @@ def _server_args(api_key=None, admin_api_key=None):
     )
 
 
-def _route_auth_level(app, path):
-    next(
-        route
-        for prefix, route in _iter_leaf_routes(app.router.routes)
-        if prefix + route.path == path
-    )
-    return AUTH_LEVELS.get(path, AuthLevel.NORMAL)
+def _served_paths(app):
+    return {
+        prefix + route.path for prefix, route in _iter_leaf_routes(app.router.routes)
+    }
+
+
+def _route_auth_level(app, path, scope_type="http"):
+    """The level the middleware resolves for a request to the served route `path`."""
+    assert path in _served_paths(app)
+    scope = {"type": scope_type, "path": path, "root_path": "", "method": "POST"}
+    return _get_auth_level_from_app_and_scope(app, scope)
+
+
+def test_every_route_has_a_reviewed_auth_level():
+    server_args = _server_args()
+    server_args.pipeline_config.supports_action_endpoint = lambda: True
+    server_args.pipeline_config.supports_openpi_endpoint = lambda: True
+    app = create_app(server_args)
+    assert set(undeclared_routes(app)) == _UNDECLARED_NORMAL_ROUTES
+    protected = {
+        path: AUTH_LEVELS[path]
+        for path in _served_paths(app) & set(AUTH_LEVELS)
+        if AUTH_LEVELS[path] != AuthLevel.NORMAL
+    }
+    assert protected == {
+        **{path: level for path, _, level in _MANAGEMENT_ROUTES},
+        **dict.fromkeys(_PROFILE_ROUTES, AuthLevel.ADMIN_FORCE),
+    }
 
 
 @pytest.mark.parametrize("transport", ["http", "websocket"])
@@ -93,7 +171,7 @@ def test_nested_routes_preserve_management_auth_level(
     app.include_router(outer, prefix="/api")
 
     monkeypatch.setitem(AUTH_LEVELS, "/api/v1/management", level)
-    assert _route_auth_level(app, "/api/v1/management") == level
+    assert _route_auth_level(app, "/api/v1/management", transport) == level
     add_api_key_middleware(app, get_keys=lambda: (api_key, admin_api_key))
     client = TestClient(app)
     for token, status in zip(
@@ -196,7 +274,7 @@ def test_diffusion_websockets_reject_unauthorized_handshakes(monkeypatch, path, 
     forward = AsyncMock()
     monkeypatch.setattr(async_scheduler_client, "forward", forward)
     app = create_app(server_args)
-    assert _route_auth_level(app, path) == AuthLevel.NORMAL
+    assert _route_auth_level(app, path, "websocket") == AuthLevel.NORMAL
     client = TestClient(app)
 
     headers = {} if token is None else {"Authorization": f"Bearer {token}"}
@@ -245,58 +323,37 @@ def test_normal_routes_remain_open_when_no_key_is_configured(missing_fields):
     assert client.post("/v1/set_lora").status_code == 422
 
 
+@pytest.mark.parametrize("path,payload,level", _MANAGEMENT_ROUTES)
 @pytest.mark.parametrize(
-    "path,payload",
+    "api_key,admin_api_key,token,optional_status,forced_status",
     [
-        ("/v1/set_lora", {"lora_nickname": "default"}),
-        ("/v1/merge_lora_weights", {}),
-        ("/v1/unmerge_lora_weights", {}),
-        ("/update_weights_from_disk", {"model_path": "/fake"}),
-        ("/update_weights_from_tensor", {"serialized_named_tensors": ["fake"]}),
-        (
-            "/update_weights_from_tensor_checker",
-            {
-                "target_module": "transformer",
-                "expected_named_tensors_sha256": {"fake.weight": "0" * 64},
-            },
-        ),
-        ("/get_weights_checksum", {"module_names": ["transformer"]}),
-        ("/release_memory_occupation", {}),
-        ("/resume_memory_occupation", {}),
-    ],
-)
-@pytest.mark.parametrize(
-    "api_key,admin_api_key,token,status",
-    [
-        (None, None, None, 200),
-        ("user-secret", None, None, 401),
-        ("user-secret", None, "user-secret", 200),
-        (None, "admin-secret", None, 401),
-        (None, "admin-secret", "admin-secret", 200),
-        ("user-secret", "admin-secret", "user-secret", 401),
-        ("user-secret", "admin-secret", "admin-secret", 200),
+        (None, None, None, 200, 403),
+        ("user-secret", None, None, 401, 403),
+        ("user-secret", None, "user-secret", 200, 403),
+        (None, "admin-secret", None, 401, 401),
+        (None, "admin-secret", "admin-secret", 200, 200),
+        ("user-secret", "admin-secret", "user-secret", 401, 401),
+        ("user-secret", "admin-secret", "admin-secret", 200, 200),
     ],
 )
 def test_management_routes_follow_srt_auth_policy(
-    monkeypatch, path, payload, api_key, admin_api_key, token, status
+    monkeypatch,
+    path,
+    payload,
+    level,
+    api_key,
+    admin_api_key,
+    token,
+    optional_status,
+    forced_status,
 ):
     forward = AsyncMock(
         return_value=SimpleNamespace(error=None, output={"success": True})
     )
     monkeypatch.setattr(async_scheduler_client, "forward", forward)
     app = create_app(_server_args(api_key, admin_api_key))
-    forced_paths = {
-        "/update_weights_from_disk",
-        "/update_weights_from_tensor",
-        "/release_memory_occupation",
-        "/resume_memory_occupation",
-    }
-    expected_level = (
-        AuthLevel.ADMIN_FORCE if path in forced_paths else AuthLevel.ADMIN_OPTIONAL
-    )
-    assert _route_auth_level(app, path) == expected_level
-    if path in forced_paths and not admin_api_key:
-        status = 403
+    assert _route_auth_level(app, path) == level
+    status = forced_status if level == AuthLevel.ADMIN_FORCE else optional_status
     client = TestClient(app)
 
     headers = {} if token is None else {"Authorization": f"Bearer {token}"}
@@ -305,6 +362,52 @@ def test_management_routes_follow_srt_auth_policy(
         forward.assert_awaited_once()
     else:
         forward.assert_not_awaited()
+
+
+@pytest.mark.parametrize("path", _PROFILE_ROUTES)
+@pytest.mark.parametrize(
+    "api_key,admin_api_key,token,status",
+    [
+        (None, None, None, 403),
+        ("user-secret", None, "user-secret", 403),
+        (None, "admin-secret", None, 401),
+        ("user-secret", "admin-secret", "user-secret", 401),
+    ],
+)
+def test_profile_routes_require_the_admin_key(
+    path, api_key, admin_api_key, token, status
+):
+    client = TestClient(create_app(_server_args(api_key, admin_api_key)))
+
+    headers = {} if token is None else {"Authorization": f"Bearer {token}"}
+    assert client.post(path, headers=headers).status_code == status
+
+
+def test_stop_profile_reaches_its_handler_with_the_admin_key():
+    client = TestClient(create_app(_server_args(admin_api_key="admin-secret")))
+
+    response = client.post(
+        "/stop_profile", headers={"Authorization": "Bearer admin-secret"}
+    )
+    assert response.status_code == 400
+    assert "Profiling is not in progress" in response.text
+
+
+@pytest.mark.parametrize(
+    "flag,env,expected",
+    [
+        (None, "env-secret", "env-secret"),
+        ("flag-secret", "env-secret", "flag-secret"),
+        (None, None, None),
+    ],
+)
+def test_admin_api_key_defaults_to_the_environment(flag, env, expected):
+    server_args = ServerArgs.__new__(ServerArgs)
+    server_args.admin_api_key = flag
+    with envs.SGLANG_ADMIN_API_KEY.override(env):
+        server_args._adjust_admin_api_key()
+
+    assert server_args.admin_api_key == expected
 
 
 def test_admin_key_only_protects_management_and_keeps_normal_routes_open():

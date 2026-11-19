@@ -108,6 +108,18 @@ class TestDecideRequestAuth(CustomTestCase):
         )
         self.assertTrue(decision.allowed)
 
+    def test_liveness_is_allowed_by_exact_path_only(self):
+        for path, allowed in [("/liveness", True), ("/liveness_generate", False)]:
+            decision = decide_request_auth(
+                method="GET",
+                path=path,
+                authorization_header=None,
+                api_key="secret",
+                admin_api_key=None,
+                auth_level=AuthLevel.NORMAL,
+            )
+            self.assertEqual(decision.allowed, allowed, path)
+
     # ==================== NORMAL Auth Level ====================
 
     def test_normal_no_keys_configured(self):
@@ -347,10 +359,18 @@ def build_auth_decisions_fixture() -> dict:
         f"Bearer {_ADMIN[:-1]}",
     ]
     requests = [("POST", "/generate", level) for level in AuthLevel]
-    # Probes and preflights skip the check at any level.
+    # Probes and preflights skip the check at any level; `/liveness` only by its exact path.
     requests += [
         ("GET", path, AuthLevel.ADMIN_FORCE)
-        for path in ["/health", "/health_generate", "/metrics", "/metrics/x", "/ready"]
+        for path in [
+            "/health",
+            "/health_generate",
+            "/liveness",
+            "/liveness/x",
+            "/metrics",
+            "/metrics/x",
+            "/ready",
+        ]
     ]
     requests.append(("OPTIONS", "/generate", AuthLevel.ADMIN_FORCE))
     cases = []
