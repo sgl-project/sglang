@@ -6902,9 +6902,7 @@ class Scheduler(
         if is_decode:
             entry.requires_decode_drain = True
             if req in lists[ListKind.PD_RECEIVING]:
-                self.disagg_decode_transfer_queue.abort_receiving(
-                    AbortReq(rid=req.rid), target=req
-                )
+                self.disagg_decode_transfer_queue.abort_receiving(req)
         else:
             self.abort_request(AbortReq(rid=req.rid), target=req)
 

@@ -3324,7 +3324,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
     ):
         self.queue = IndexedReqList(
             ListKind.PD_RECEIVING,
-            abort=self.abort_receiving,
+            abort=self._abort_receiving,
             req_of=lambda x: x.req,
         )
         # Host-staged transfers whose KV landed but wait for device admission,
@@ -3375,7 +3375,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             ListKind.PD_RELEASING: self._deferred_releases,
         }
 
-    def abort_receiving(
+    def abort_receiving(self, target: Req) -> None:
+        self._abort_receiving(AbortReq(rid=target.rid), target=target)
+
+    def _abort_receiving(
         self, recv_req: AbortReq, *, target: Optional[Req] = None
     ) -> None:
         for decode_req in self.queue.items():

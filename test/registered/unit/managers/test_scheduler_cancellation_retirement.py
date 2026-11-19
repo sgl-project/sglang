@@ -580,8 +580,7 @@ class TestSchedulerCancellationRetirement(CustomTestCase):
                 move([req], lists[stage])
                 control = self._cancel(scheduler, req, target_rid=req.rid)
                 if stage == ListKind.PD_RECEIVING:
-                    abort_receiving.assert_called_once()
-                    self.assertIs(abort_receiving.call_args.kwargs["target"], req)
+                    abort_receiving.assert_called_once_with(req)
                 else:
                     abort_receiving.assert_not_called()
 

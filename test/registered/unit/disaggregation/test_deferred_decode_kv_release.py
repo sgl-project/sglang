@@ -567,6 +567,21 @@ class TestResolveDeferredReleases(CustomTestCase):
         super().setUp()
         _run_as_single_rank(self)
 
+    def test_abort_receive_targets_the_original_request(self):
+        mgr = _make_manager()
+        q = _make_queue()
+        target = _make_decode_req(100, 1, mgr)
+        other = _make_decode_req(101, 2, mgr)
+        other.req.rid = target.req.rid
+        target.kv_receiver.abort = MagicMock()
+        other.kv_receiver.abort = MagicMock()
+        move([target, other], q.queue)
+
+        q.abort_receiving(target.req)
+
+        target.kv_receiver.abort.assert_called_once_with()
+        other.kv_receiver.abort.assert_not_called()
+
     def test_unpublished_rank_holds_for_peer_without_waiting_for_acks(self):
         mgr = _make_manager()
         queue = _make_queue()
