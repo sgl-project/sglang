@@ -66,6 +66,19 @@ class OpenAIServingCompletion(OpenAIServingBase):
         if not prompt or (isinstance(prompt, list) and all(not p for p in prompt)):
             return "Prompt cannot be empty"
 
+        # FIM tokens can only be spliced into text prompts, not token ids.
+        if (
+            request.suffix
+            and self.template_manager.completion_template_name is not None
+            and not (
+                isinstance(prompt, str)
+                or (
+                    isinstance(prompt, list) and all(isinstance(p, str) for p in prompt)
+                )
+            )
+        ):
+            return "suffix requires a text prompt when a completion template is set."
+
         return self._top_logprobs_error("logprobs", request.logprobs)
 
     def _convert_to_internal_request(
