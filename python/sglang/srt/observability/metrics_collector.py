@@ -787,6 +787,16 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             documentation="Total number of forward passes categorized by CUDA graph.",
             labelnames=list(labels.keys()) + ["mode"],
         )
+        self.decode_cuda_graph_live_rows_total = Counter(
+            name="sglang:decode_cuda_graph_live_rows_total",
+            documentation="Live request rows in ordinary decode CUDA graph replays.",
+            labelnames=labels.keys(),
+        )
+        self.decode_cuda_graph_captured_rows_total = Counter(
+            name="sglang:decode_cuda_graph_captured_rows_total",
+            documentation="Captured request rows in ordinary decode CUDA graph replays, including padding.",
+            labelnames=labels.keys(),
+        )
 
         # =================================================================
         # LoRA pool metrics (only created when LoRA is enabled)
@@ -1588,6 +1598,14 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
     def increment_decode_cuda_graph_pass(self, value: bool) -> None:
         mode = "decode_cuda_graph" if value else "decode_none"
         self.cuda_graph_passes_total.labels(**self.labels, mode=mode).inc(1)
+
+    def increment_decode_cuda_graph_rows(
+        self, live_rows: int, captured_rows: int
+    ) -> None:
+        self.decode_cuda_graph_live_rows_total.labels(**self.labels).inc(live_rows)
+        self.decode_cuda_graph_captured_rows_total.labels(**self.labels).inc(
+            captured_rows
+        )
 
     def increment_prefill_cuda_graph_pass(self, value: bool) -> None:
         mode = "prefill_cuda_graph" if value else "prefill_none"
