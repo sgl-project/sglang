@@ -61,6 +61,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import run_with_deadline
+from sglang.srt.utils.device import is_hip
 
 try:
     from nixl._bindings import (
@@ -188,6 +189,20 @@ class _NixlPostError(RuntimeError):
 # This worker serves other rooms, so bound that wait.
 NIXL_ERR_SETTLE_TIMEOUT_S = 5.0
 NIXL_ERR_SETTLE_POLL_S = 0.001
+
+
+def _pin_aiter_hip_runtime() -> None:
+    # Workaround: once UCX's memory hooks wrap dlopen, AITER's load_hip_runtime()
+    # misses torch's HIP runtime by soname and loads a second one, whose LLVM aborts
+    # the process. It caches its first result, so bind it before the agent exists;
+    # drop once AITER's _loaded_hip_runtime() finds the runtime by its mapped path.
+    if not is_hip():
+        return
+    try:
+        from aiter.jit.utils.hip_runtime import load_hip_runtime
+    except ImportError:
+        return
+    load_hip_runtime()
 
 
 def _resolve_ucx_device_list(ib_device: str, gpu_id: int) -> Optional[str]:
@@ -623,6 +638,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             num_threads=num_threads,
             sync_mode=nixl_thread_sync_t.NIXL_THREAD_SYNC_STRICT,
         )
+        _pin_aiter_hip_runtime()
         self.agent = nixl_agent(str(uuid.uuid4()), agent_config)
         if num_threads > 0:
             # TODO: Remove this once NIXL passes thread parameters from
