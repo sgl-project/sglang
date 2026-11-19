@@ -1922,10 +1922,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     f"Capturing prefill shape ({num_tokens=} {avail_mem=:.2f} GB)"
                 )
             self.capture_one_shape(num_tokens)
-            if (
-                self._ffn_graph_enabled
-                and num_tokens in self._ffn_graph_token_buckets
-            ):
+            if self._ffn_graph_enabled and num_tokens in self._ffn_graph_token_buckets:
                 for rows in FFN_GRAPH_ROWS:
                     if rows <= num_tokens:
                         self.capture_one_shape(num_tokens, ffn_rows=rows)
