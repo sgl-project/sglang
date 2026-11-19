@@ -5,6 +5,7 @@ Tests DeviceMixin, SRTPlatform, PlatformEnum, CpuArchEnum, DeviceCapability,
 and the platform discovery / lazy initialization mechanism.
 """
 
+import os
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -208,22 +209,22 @@ class TestSRTPlatform(CustomTestCase):
 
 
 class TestFlashInferAvailability(CustomTestCase):
+    class OutOfTreePlatform(SRTPlatform):
+        _enum = PlatformEnum.OOT
+
+    class FlashInferPlatform(OutOfTreePlatform):
+        capabilities = PlatformCapabilities(supports_flashinfer=True)
+
     def test_platform_capability_package_and_environment(self):
         from sglang.srt.runtime_context import get_platform
         from sglang.srt.utils import device
 
-        class OutOfTreePlatform(SRTPlatform):
-            _enum = PlatformEnum.OOT
-
-        class FlashInferPlatform(OutOfTreePlatform):
-            capabilities = PlatformCapabilities(supports_flashinfer=True)
-
         cases = (
             (CudaSRTPlatform(), True, True, True),
-            (OutOfTreePlatform(), True, True, False),
-            (FlashInferPlatform(), True, True, True),
-            (FlashInferPlatform(), False, True, False),
-            (FlashInferPlatform(), True, False, False),
+            (self.OutOfTreePlatform(), True, True, False),
+            (self.FlashInferPlatform(), True, True, True),
+            (self.FlashInferPlatform(), False, True, False),
+            (self.FlashInferPlatform(), True, False, False),
         )
         self.addCleanup(device.is_flashinfer_available.cache_clear)
         for platform, installed, enabled, expected in cases:
@@ -244,6 +245,35 @@ class TestFlashInferAvailability(CustomTestCase):
                 device.is_flashinfer_available.cache_clear()
                 self.assertEqual(device.is_flashinfer_available(), expected)
                 self.assertEqual(get_platform().has_flashinfer, expected)
+
+    def test_cuda_arch_export_uses_platform_identity(self):
+        from sglang.srt.utils import device
+
+        for probe in (device.is_cuda, device.is_flashinfer_available):
+            probe.cache_clear()
+            self.addCleanup(probe.cache_clear)
+
+        cases = (
+            (CudaSRTPlatform(), "9.0a"),
+            (SailSRTPlatform(), "9.0a"),
+            (self.FlashInferPlatform(), None),
+        )
+        for platform, expected in cases:
+            with (
+                self.subTest(platform=type(platform).__name__),
+                patch.object(device, "current_platform", platform),
+                patch.object(device, "find_spec", return_value=object()),
+                patch.object(torch.cuda, "is_available", return_value=True),
+                patch.object(torch.version, "cuda", "12.8"),
+                patch.object(torch.cuda, "get_device_capability", return_value=(9, 0)),
+                patch.dict(os.environ, SGLANG_IS_FLASHINFER_AVAILABLE="1"),
+            ):
+                device.is_flashinfer_available.cache_clear()
+                os.environ.pop("FLASHINFER_CUDA_ARCH_LIST", None)
+                self.assertTrue(device.is_cuda())
+                self.assertTrue(device.is_flashinfer_available())
+                device.set_cuda_arch()
+                self.assertEqual(os.environ.get("FLASHINFER_CUDA_ARCH_LIST"), expected)
 
 
 class TestCudaDeviceMixin(CustomTestCase):
