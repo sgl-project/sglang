@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock, Mock, call, patch
 
+import numpy as np
 import torch
 
 from sglang.srt.arg_groups.pd_disaggregation_hook import handle_pd_disaggregation
@@ -23,6 +24,8 @@ from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVSender,
 )
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
+from sglang.srt.disaggregation.utils import MetadataBuffers
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.request_list import (
@@ -38,6 +41,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.runtime_context import get_context, publish, reset_context
+from sglang.srt.sampling.sampling_mask import SamplingMaskRows
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -367,6 +371,7 @@ class TestAllocationIntegration(CustomTestCase):
             storage_prefetch_retry_attempts=3,
             storage_prefetch_last_match_len=8,
             metadata_buffer_index=0,
+            sampling_mask_rows=None,
             reset_for_retract=Mock(),
             advance_cache_request_handle=Mock(),
             time_stats=MagicMock(),
@@ -447,6 +452,7 @@ class TestAllocationIntegration(CustomTestCase):
         req._compute_max_prefix_len = Mock(return_value=31)
         req.storage_prefetch_retry_attempts = 0
         req.storage_prefetch_last_match_len = None
+        req.sampling_mask_rows = None
         req.reset_for_retract = Mock()
         req.advance_cache_request_handle = Mock()
         req.time_stats = MagicMock()
@@ -472,6 +478,73 @@ class TestAllocationIntegration(CustomTestCase):
         req.multimodal_inputs.release_features.assert_not_called()
         scheduler.tree_cache.finish.assert_called_once_with(
             req.cache_request_handle, CacheRequestOutcome.ABORT
+        )
+
+    def test_requeued_parked_request_sends_only_its_retry_sampling_row(self):
+        """A captured request parked after prefill has queued its first token's
+        sampling row. Requeued, it prefills again and samples that token again;
+        the stale row must not reach the metadata buffer beside the new one."""
+        override = get_context().override_server_args(optimistic_prefill_attempts=3)
+        override.install()
+        self.addCleanup(override.restore)
+        rows = SamplingMaskRows()
+        rows.append(
+            -1.5, np.array([7, 8, 9], np.int32), np.array([-1.25, -1.5, -2.0], "f4")
+        )
+        req = FakeReq(
+            rid="retry-mask",
+            cache_request_handle=CacheRequestHandle(rid="retry-mask", attempt_id=0),
+            prefill_attempt_count=0,
+            output_ids=[101],
+            skip_radix_cache_insert=True,
+            storage_prefetch_retry_attempts=0,
+            storage_prefetch_last_match_len=None,
+            reset_for_retract=Mock(),
+            advance_cache_request_handle=Mock(),
+            time_stats=MagicMock(),
+            captures_sampling=True,
+            sampling_mask_rows=rows,
+            metadata_buffer_index=0,
+            cached_tokens=0,
+            cached_tokens_device=0,
+            cached_tokens_host=0,
+            cached_tokens_storage=0,
+            get_mm_token_counts=lambda: (0, 0, 0),
+            return_logprob=False,
+            bootstrap_room=9,
+        )
+        scheduler = SimpleNamespace(
+            tree_cache=Mock(supports_mamba=Mock(return_value=False)),
+            prefill_launched_reqs=KeyedReqList(ListKind.PREFILL_LAUNCHED),
+            waiting_queue=IndexedReqList(ListKind.WAITING),
+            disagg_prefill_bootstrap_queue=SimpleNamespace(queue=[]),
+            metrics_reporter=SimpleNamespace(enable_metrics=False),
+            processed_tokens_counter=0,
+        )
+        move([req], scheduler.prefill_launched_reqs)
+        with (
+            patch("sglang.srt.disaggregation.prefill.checkpoint_kv_cache"),
+            patch("sglang.srt.disaggregation.prefill.release_kv_cache"),
+        ):
+            SchedulerDisaggregationPrefillMixin.optimistic_release_and_requeue(
+                scheduler, req
+            )
+
+        req.output_ids = [102]
+        rows.append(-0.5, np.array([4, 5], np.int32), np.array([-0.5, -1.0], "f4"))
+        with envs.SGLANG_ENABLE_DISAGG_SAMPLING_MASK.override(True):
+            buffers = MetadataBuffers(
+                size=1,
+                hidden_size=2,
+                hidden_states_dtype=torch.float32,
+                max_sampling_mask_tokens=4,
+            )
+        buffers.set_buf(req)
+
+        self.assertEqual(buffers.output_token_sampling_mask_len[0, 0].item(), 2)
+        self.assertEqual(buffers.output_token_sampling_mask_idx[0, :2].tolist(), [4, 5])
+        self.assertEqual(
+            buffers.output_token_sampling_logprobs[0, :3].tolist(), [-0.5, -0.5, -1.0]
         )
 
     def test_chunked_prefill_does_not_yield_for_decode_admission(self):

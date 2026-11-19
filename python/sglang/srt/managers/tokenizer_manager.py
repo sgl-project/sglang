@@ -265,25 +265,58 @@ def _validate_watermark_request(sampling_params: SamplingParams) -> bool:
     return enabled
 
 
-def _validate_unfiltered_sampling_logprobs(
-    obj: GenerateReqInput, watermarked: bool
+def _unfiltered_support_narrowing(
+    obj: GenerateReqInput, sampling_params: SamplingParams
+) -> Optional[str]:
+    """What, besides top-k/top-p/min-p, keeps the sampler from drawing every
+    token of the vocabulary; None when nothing does."""
+    if (
+        sampling_params.json_schema is not None
+        or sampling_params.regex is not None
+        or sampling_params.ebnf is not None
+        or sampling_params.structural_tag is not None
+    ):
+        return "a grammar constraint"
+    if obj.custom_logit_processor:
+        return "a custom logit processor"
+    if sampling_params.logit_bias:
+        return "logit_bias"
+    if sampling_params.min_new_tokens > 0:
+        return "min_new_tokens"
+    # Strict thinking filters tokens of every request through a reasoning grammar.
+    if get_serving().enable_strict_thinking:
+        return "--enable-strict-thinking"
+    return None
+
+
+def _validate_unfiltered_sampling_output(
+    obj: GenerateReqInput, sampling_params: SamplingParams, watermarked: bool
 ) -> None:
     """An unfiltered request returns its output token logprob as its sampling
-    logprob, so the two must come from the same distribution."""
-    if not obj.return_sampling_logprobs or obj.filters_sampling:
+    logprob and an empty mask row, so both must describe what was sampled."""
+    if obj.filters_sampling or not returns_sampling_output(obj):
         return
     if watermarked:
         raise ValueError(
-            "return_sampling_logprobs without top-k/top-p/min-p sampling is not "
-            "supported with watermarking: output token logprobs exclude the "
+            "return_sampling_logprobs or return_sampling_mask without "
+            "top-k/top-p/min-p sampling is not supported with watermarking: "
+            "output token logprobs and the whole-vocabulary support exclude the "
             "watermark."
         )
-    if envs.SGLANG_RETURN_ORIGINAL_LOGPROB.get():
+    if obj.return_sampling_logprobs and envs.SGLANG_RETURN_ORIGINAL_LOGPROB.get():
         raise ValueError(
             "return_sampling_logprobs without top-k/top-p/min-p sampling is not "
             "supported with SGLANG_RETURN_ORIGINAL_LOGPROB=1: output token "
             "logprobs exclude the temperature."
         )
+    if obj.return_sampling_mask:
+        narrowing = _unfiltered_support_narrowing(obj, sampling_params)
+        if narrowing is not None:
+            raise ValueError(
+                "return_sampling_mask without top-k/top-p/min-p sampling is not "
+                f"supported with {narrowing}: the sampling support is no longer "
+                "the whole vocabulary. Set a finite top_k to receive it."
+            )
 
 
 def _reject_missing_dispatched_encoder_embedding(request_obj, mm_inputs):
@@ -1835,7 +1868,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         watermarked = _validate_watermark_request(sampling_params)
         if isinstance(obj, GenerateReqInput):
             obj.filters_sampling = sampling_params.filters_sampling()
-            _validate_unfiltered_sampling_logprobs(obj, watermarked)
+            _validate_unfiltered_sampling_output(obj, sampling_params, watermarked)
 
         # Build return object
         if isinstance(obj, GenerateReqInput):

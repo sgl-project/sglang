@@ -12,10 +12,22 @@ from sglang.srt.speculative.dflash_utils import (
     build_speculative_verify_target_probs,
     is_dflash_sampling_verify_available,
 )
+from sglang.srt.speculative.eagle_utils import verify_commits_argmax_for_sampled_rows
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+
+def sampling_output_requires_exact_accept_thresholds(
+    spec_algorithm: SpeculativeAlgorithm,
+) -> bool:
+    """Whether an acceptance threshold below 1.0 stops this algorithm's committed
+    tokens from being exact samples from the target distribution."""
+    if spec_algorithm.is_none():
+        return False
+    # DSpark accepts by its own block estimator, not by these thresholds.
+    return not spec_algorithm.is_dflash_family() or spec_algorithm.is_dflash()
 
 
 def validate_spec_sampling_mask_request(
@@ -29,8 +41,7 @@ def validate_spec_sampling_mask_request(
             "simulated speculative acceptance."
         )
 
-    # DSpark accepts by its own block estimator, not by these thresholds.
-    if not spec_algorithm.is_dflash_family() or spec_algorithm.is_dflash():
+    if sampling_output_requires_exact_accept_thresholds(spec_algorithm):
         if (
             get_spec().speculative_accept_threshold_single != 1.0
             or get_spec().speculative_accept_threshold_acc != 1.0
@@ -40,12 +51,20 @@ def validate_spec_sampling_mask_request(
                 "decoding requires acceptance thresholds of 1.0."
             )
 
+    non_greedy = req.sampling_params.top_k > 1
     if spec_algorithm.is_dflash():
         # Without the kernel DFlash verifies non-greedy rows by greedy argmax.
-        if req.sampling_params.top_k > 1 and not is_dflash_sampling_verify_available():
+        if non_greedy and not is_dflash_sampling_verify_available():
             return (
                 "return_sampling_logprobs or return_sampling_mask with non-greedy "
                 "DFlash decoding requires sampling verification support."
+            )
+    elif not spec_algorithm.is_dflash_family():
+        if non_greedy and verify_commits_argmax_for_sampled_rows():
+            return (
+                "return_sampling_logprobs or return_sampling_mask with non-greedy "
+                "speculative decoding is not supported on this platform: "
+                "verification commits the argmax token instead of sampling."
             )
 
     if not req.captures_sampling:

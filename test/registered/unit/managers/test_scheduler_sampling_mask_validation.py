@@ -15,9 +15,14 @@ from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.internal_state import (
+    SchedulerInternalStateController,
+    UpdateRejected,
+)
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.session.session_controller import SessionController
+from sglang.srt.speculative import eagle_utils
 from sglang.srt.speculative.spec_sampling_mask import (
     validate_spec_sampling_mask_request,
 )
@@ -69,6 +74,14 @@ def _handle_pd_request(mode, req):
     return abort, scheduler._add_request_to_queue
 
 
+def _spec_algorithm(name):
+    return SimpleNamespace(
+        is_none=lambda: name == "none",
+        is_dflash=lambda: name == "dflash",
+        is_dflash_family=lambda: name in ("dflash", "dspark"),
+    )
+
+
 def _sampling_req(sampling_params, *, logprobs=False, mask=False):
     params = SamplingParams(max_new_tokens=8, **sampling_params)
     params.normalize(None)
@@ -107,8 +120,8 @@ class TestSamplingCapture(CustomTestCase):
         """Output logprobs are exact sampling logprobs under any speculative
         algorithm while acceptance is unrelaxed; a filtered request also needs the
         DFlash capture."""
-        eagle = SimpleNamespace(is_dflash_family=lambda: False, is_dflash=lambda: False)
-        dflash = SimpleNamespace(is_dflash_family=lambda: True, is_dflash=lambda: True)
+        eagle = _spec_algorithm("eagle")
+        dflash = _spec_algorithm("dflash")
         unfiltered = _sampling_req({}, logprobs=True, mask=True)
         greedy = _sampling_req({"temperature": 0.0}, logprobs=True)
 
@@ -127,6 +140,70 @@ class TestSamplingCapture(CustomTestCase):
                 self.assertIsNotNone(
                     validate_spec_sampling_mask_request(unfiltered, algorithm)
                 )
+
+    def test_speculative_decoding_refuses_platforms_whose_verify_is_greedy(self):
+        """On CPU, XPU and ROCm without rejection sampling EAGLE verify commits
+        argmax for a sampled row, so an unfiltered request would get a logprob
+        for a token that was never drawn from that distribution."""
+        eagle = _spec_algorithm("eagle")
+        unfiltered = _sampling_req({"temperature": 0.7}, logprobs=True, mask=True)
+        for platform, use_rejection_sampling, refused in (
+            ("cuda", False, False),
+            ("cpu", False, True),
+            ("cpu", True, True),
+            ("xpu", False, True),
+            ("hip", False, True),
+            ("hip", True, False),
+        ):
+            with (
+                self.subTest(platform=platform, rejection=use_rejection_sampling),
+                patch.multiple(
+                    eagle_utils,
+                    _is_cpu=platform == "cpu",
+                    _is_xpu=platform == "xpu",
+                    _is_hip=platform == "hip",
+                ),
+                get_context().override_server_args(
+                    speculative_accept_threshold_single=1.0,
+                    speculative_accept_threshold_acc=1.0,
+                    speculative_use_rejection_sampling=use_rejection_sampling,
+                ),
+            ):
+                error_msg = validate_spec_sampling_mask_request(unfiltered, eagle)
+                if refused:
+                    self.assertIn("argmax", error_msg)
+                else:
+                    self.assertIsNone(error_msg)
+
+    def test_threshold_update_is_refused_where_admission_required_one(self):
+        """A request admitted because both acceptance thresholds were 1.0 must not
+        see one lowered while it runs, under every algorithm that reads them;
+        DSpark and plain decoding do not."""
+        running = _sampling_req({}, logprobs=True)
+        for name, refused in (
+            ("eagle", True),
+            ("dflash", True),
+            ("dspark", False),
+            ("none", False),
+        ):
+            controller = SchedulerInternalStateController(
+                SimpleNamespace(
+                    spec_algorithm=_spec_algorithm(name),
+                    request_lists=lambda: {"running": [running]},
+                ),
+                record_step_time=False,
+            )
+            for key in (
+                "speculative_accept_threshold_single",
+                "speculative_accept_threshold_acc",
+            ):
+                with self.subTest(algorithm=name, key=key):
+                    controller._validate_accept_threshold(key, 1.0)
+                    if refused:
+                        with self.assertRaises(UpdateRejected):
+                            controller._validate_accept_threshold(key, 0.9)
+                    else:
+                        controller._validate_accept_threshold(key, 0.9)
 
 
 class TestSchedulerSamplingMaskValidation(CustomTestCase):

@@ -568,6 +568,18 @@ def _verify_uses_greedy(
     return is_all_greedy or is_cpu or is_xpu or (is_hip and not use_rejection_sampling)
 
 
+def verify_commits_argmax_for_sampled_rows() -> bool:
+    """Whether EAGLE verify commits argmax even for a row that samples, so its
+    token is not a draw from the target distribution."""
+    return _verify_uses_greedy(
+        is_all_greedy=False,
+        is_cpu=_is_cpu,
+        is_hip=_is_hip,
+        is_xpu=_is_xpu,
+        use_rejection_sampling=get_spec().speculative_use_rejection_sampling,
+    )
+
+
 def _can_use_sparse_uno_tree_target_sampling(
     max_top_k: Optional[int],
     sampling_info: SamplingBatchInfo,
