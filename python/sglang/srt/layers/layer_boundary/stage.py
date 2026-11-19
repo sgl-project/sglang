@@ -37,6 +37,7 @@ from sglang.srt.layers.layer_boundary.prepare import reads_quantized
 from sglang.srt.layers.layer_boundary.residual import bind_update
 from sglang.srt.layers.layer_boundary.residual.access import buffer, from_pp
 from sglang.srt.layers.layer_boundary.residual.add_norm import (
+    MXFP8_SWIZZLED,
     PLAIN_ADD,
 )
 from sglang.srt.layers.layer_boundary.residual.batch import stream_of
@@ -452,6 +453,9 @@ class StageBoundary:
                 else:
                     capture(value + previous, owned=True)
         hidden_states, steps = self._select(hidden_states, forward_batch)
+        if quant_format == MXFP8_SWIZZLED and not reads_quantized(steps.entry):
+            # The 128x4 scale layout does not survive a row gather.
+            quant_format = ""
         hidden_states, stream = self._prepare(
             hidden_states,
             stream,

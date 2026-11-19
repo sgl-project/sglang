@@ -55,6 +55,17 @@ _TWO_SHOT_GEOMETRY = {
     True: ((208, 1, 4), (232, 1, 3), (None, 2, 3)),
 }
 
+# TP2 at hidden 6144 (B300, graph-replayed; untuned elsewhere): 1shot wins wherever the default runs one
+# vector per thread, by up to 1.3 us at 48-96 rows. Entries keep that one vector per
+# thread, and with one vector per thread the RMS reduction order does not depend on
+# the cluster size or on 1shot / 2shot, so the output is bitwise the default's.
+# ``(max_rows, two_shot, vecs_per_thread, cluster_size)``; past the last row bound
+# the default policy applies.
+_TP2_GEOMETRY = {
+    False: ((160, False, 1, 6), (272, False, 1, 4)),
+    True: ((96, False, 1, 8), (160, False, 1, 6), (208, False, 1, 4)),
+}
+
 _COMMS = CommRegistry("all_reduce_fusion")
 
 
@@ -145,6 +156,45 @@ def _jit_module(
             (name, f"MoeFinalizeAllReduceKernel<{args}>::{name}")
             for name in (("run_plain",) if top_k == 0 else ("run", "run_residual_norm"))
         ],
+    )
+
+
+@cache_once
+def _jit_quant_module(
+    world_size: int,
+    hidden_dim: int,
+    top_k: int,
+    cluster_size: int,
+    weight_dtype: torch.dtype,
+) -> Module:
+    """:func:`_jit_module` whose norm epilogue also writes MXFP8 (kQuant)."""
+    require_cluster_launch_arch()
+    args = make_cpp_args(
+        world_size,
+        hidden_dim,
+        top_k,
+        cluster_size,
+        is_arch_support_pdl(),
+        weight_dtype,
+        False,  # kMhc
+        True,  # kQuant
+    )
+    name = "run_plain_quant" if top_k == 0 else "run_residual_norm_quant"
+    return load_jit(
+        "moe_finalize_all_reduce_quant",
+        *args,
+        cuda_files=["distributed/all_reduce_fusion.cuh"],
+        cuda_wrappers=[(name, f"MoeFinalizeAllReduceKernel<{args}>::{name}")],
+    )
+
+
+def _empty_mxfp8(num_tokens: int, hidden_dim: int, device) -> tuple:
+    """``[T, hidden]`` e4m3 and the 128x4-swizzled UE8M0 scales, rows padded to 128
+    (the kernel's bumper cluster zeros the padding)."""
+    padded_rows = (num_tokens + 127) // 128 * 128
+    return (
+        torch.empty(num_tokens, hidden_dim, dtype=torch.float8_e4m3fn, device=device),
+        torch.empty(padded_rows * (hidden_dim // 32), dtype=torch.uint8, device=device),
     )
 
 
@@ -303,6 +353,83 @@ def _all_reduce_residual_norm_op(
     )
 
 
+@register_custom_op(mutates_args=["out", "residual_out", "quantized", "scales"])
+def _moe_finalize_all_reduce_residual_norm_mxfp8_op(
+    world_size: int,
+    hidden_dim: int,
+    top_k: int,
+    cluster_size: int,
+    out: torch.Tensor,
+    gemm2_out: torch.Tensor,
+    expanded_idx_to_permuted_idx: torch.Tensor,
+    expert_weights: torch.Tensor,
+    shared_output: Optional[torch.Tensor],
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+    residual: torch.Tensor,
+    residual_out: torch.Tensor,
+    weight_offset: float,
+    two_shot: bool,
+    vecs_per_thread: int,
+    quantized: torch.Tensor,
+    scales: torch.Tensor,
+) -> None:
+    _jit_quant_module(
+        world_size, hidden_dim, top_k, cluster_size, expert_weights.dtype
+    ).run_residual_norm_quant(
+        _COMMS.get(world_size),
+        out,
+        gemm2_out,
+        expanded_idx_to_permuted_idx,
+        expert_weights,
+        shared_output,
+        norm_weight,
+        norm_eps,
+        residual,
+        residual_out,
+        weight_offset,
+        two_shot,
+        vecs_per_thread,
+        quantized,
+        scales,
+    )
+
+
+@register_custom_op(mutates_args=["out", "residual_out", "quantized", "scales"])
+def _all_reduce_residual_norm_mxfp8_op(
+    world_size: int,
+    hidden_dim: int,
+    cluster_size: int,
+    out: torch.Tensor,
+    input: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+    residual: torch.Tensor,
+    residual_out: torch.Tensor,
+    weight_offset: float,
+    two_shot: bool,
+    vecs_per_thread: int,
+    quantized: torch.Tensor,
+    scales: torch.Tensor,
+) -> None:
+    _jit_quant_module(
+        world_size, hidden_dim, 0, cluster_size, torch.bfloat16
+    ).run_plain_quant(
+        _COMMS.get(world_size),
+        out,
+        input,
+        norm_weight,
+        norm_eps,
+        residual,
+        residual_out,
+        weight_offset,
+        two_shot,
+        vecs_per_thread,
+        quantized,
+        scales,
+    )
+
+
 def _norm_launch(
     world_size: int,
     num_tokens: int,
@@ -313,6 +440,24 @@ def _norm_launch(
     cluster_size: Optional[int],
 ) -> tuple[bool, int, int]:
     """``(two_shot, vecs_per_thread, cluster_size)``; explicit arguments win."""
+    if (
+        world_size == 2
+        and hidden_dim == 6144
+        and two_shot is None
+        and vecs_per_thread is None
+        and cluster_size is None
+        and current_arch().is_sm(10)
+    ):
+        tuned = next(
+            (
+                geo
+                for max_rows, *geo in _TP2_GEOMETRY[finalize]
+                if num_tokens <= max_rows
+            ),
+            None,
+        )
+        if tuned is not None:
+            return tuple(tuned)
     if two_shot is None:
         two_shot = num_tokens >= TWO_SHOT_MIN_TOKENS.get(world_size, 48)
     if vecs_per_thread is None and cluster_size is None and two_shot:
@@ -511,3 +656,116 @@ def moe_finalize_shared_gate_all_reduce(
         shared_gate,
     )
     return out
+
+
+def moe_finalize_all_reduce_residual_norm_mxfp8(
+    gemm2_out: torch.Tensor,
+    expanded_idx_to_permuted_idx: torch.Tensor,
+    expert_weights: torch.Tensor,
+    top_k: int,
+    shared_output: Optional[torch.Tensor],
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+    *,
+    world_size: int,
+    hidden_dim: int,
+    gemma: bool = False,
+    residual_out: Optional[torch.Tensor] = None,
+    cluster_size: Optional[int] = None,
+    two_shot: Optional[bool] = None,
+    vecs_per_thread: Optional[int] = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """:func:`moe_finalize_all_reduce_residual_norm` that also returns the normalized
+    rows as MXFP8, bitwise ``flashinfer.mxfp8_quantize(normed, is_sf_swizzled_layout=True)``.
+
+    :returns: ``(normed, residual_out, quantized, scales)``.
+    """
+    num_tokens = expert_weights.shape[0]
+    assert num_tokens > 0
+    out = torch.empty(
+        num_tokens, hidden_dim, dtype=torch.bfloat16, device=gemm2_out.device
+    )
+    residual_out = residual if residual_out is None else residual_out
+    quantized, scales = _empty_mxfp8(num_tokens, hidden_dim, gemm2_out.device)
+    two_shot, vecs_per_thread, cluster_size = _norm_launch(
+        world_size,
+        num_tokens,
+        hidden_dim,
+        True,
+        two_shot,
+        vecs_per_thread,
+        cluster_size,
+    )
+    _moe_finalize_all_reduce_residual_norm_mxfp8_op(
+        world_size,
+        hidden_dim,
+        top_k,
+        cluster_size,
+        out,
+        gemm2_out,
+        expanded_idx_to_permuted_idx,
+        expert_weights,
+        shared_output,
+        norm_weight,
+        float(norm_eps),
+        residual,
+        residual_out,
+        1.0 if gemma else 0.0,
+        two_shot,
+        vecs_per_thread,
+        quantized,
+        scales,
+    )
+    return out, residual_out, quantized, scales
+
+
+def all_reduce_residual_norm_mxfp8(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+    *,
+    world_size: int,
+    gemma: bool = False,
+    residual_out: Optional[torch.Tensor] = None,
+    cluster_size: Optional[int] = None,
+    two_shot: Optional[bool] = None,
+    vecs_per_thread: Optional[int] = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """:func:`all_reduce_residual_norm` (with residual and norm) that also returns the
+    normalized rows as MXFP8, as in :func:`moe_finalize_all_reduce_residual_norm_mxfp8`.
+
+    :returns: ``(normed, residual_out, quantized, scales)``.
+    """
+    num_tokens, hidden_dim = input.shape
+    assert num_tokens > 0
+    out = torch.empty_like(input)
+    residual_out = residual if residual_out is None else residual_out
+    quantized, scales = _empty_mxfp8(num_tokens, hidden_dim, input.device)
+    two_shot, vecs_per_thread, cluster_size = _norm_launch(
+        world_size,
+        num_tokens,
+        hidden_dim,
+        False,
+        two_shot,
+        vecs_per_thread,
+        cluster_size,
+    )
+    _all_reduce_residual_norm_mxfp8_op(
+        world_size,
+        hidden_dim,
+        cluster_size,
+        out,
+        input,
+        norm_weight,
+        float(norm_eps),
+        residual,
+        residual_out,
+        1.0 if gemma else 0.0,
+        two_shot,
+        vecs_per_thread,
+        quantized,
+        scales,
+    )
+    return out, residual_out, quantized, scales

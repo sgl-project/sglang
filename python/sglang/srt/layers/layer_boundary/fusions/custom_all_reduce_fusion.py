@@ -16,7 +16,9 @@ import torch
 
 from sglang.kernels.ops.communication.all_reduce_fusion import (
     all_reduce_residual_norm,
+    all_reduce_residual_norm_mxfp8,
     moe_finalize_all_reduce_residual_norm,
+    moe_finalize_all_reduce_residual_norm_mxfp8,
 )
 from sglang.srt.layers.layer_boundary import (
     FfnInputFusion,
@@ -31,6 +33,7 @@ from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
     can_fuse_all_reduce,
 )
+from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     is_in_breakable_cuda_graph,
@@ -49,11 +52,20 @@ class CustomAllReduceFusion:
     decode and target-verify rows that fit the registered plane.
     ``defers_finalize``: the layer's MoE can hand off its finalize.
     ``final_norm_eps``: set by install_terminal_finalize when the model's final
-    norm takes a handoff, so the last layer may defer too."""
+    norm takes a handoff, so the last layer may defer too.
+    ``attn_input_mxfp8``: the attention input it reads is handed over as
+    Mxfp8SwizzledInput instead of bf16."""
 
-    def __init__(self, *, hidden_size: int, defers_finalize: bool) -> None:
+    def __init__(
+        self,
+        *,
+        hidden_size: int,
+        defers_finalize: bool,
+        attn_input_mxfp8: bool = False,
+    ) -> None:
         self.hidden_size = int(hidden_size)
         self.defers_finalize = defers_finalize
+        self.attn_input_mxfp8 = attn_input_mxfp8
         self.final_norm_eps: Optional[float] = None
 
     def attn_input_fusions(self, plan) -> tuple:
@@ -116,6 +128,18 @@ class CustomAllReduceFusion:
             return None
         if post_residual_addition is not None:
             residual = residual + post_residual_addition
+        if self.attn_input_mxfp8:
+            return _as_mxfp8_input(
+                *moe_finalize_all_reduce_residual_norm_mxfp8(
+                    *self._finalize_args(owed),
+                    residual,
+                    gamma,
+                    plan.norm.variance_epsilon,
+                    world_size=get_parallel().tp_size,
+                    hidden_dim=self.hidden_size,
+                    residual_out=torch.empty_like(residual),
+                )
+            )
         return self._run_finalize(owed, residual, gamma, plan.norm.variance_epsilon)
 
     def _all_reduce_add_norm(
@@ -135,6 +159,17 @@ class CustomAllReduceFusion:
             return None
         if post_residual_addition is not None:
             residual = residual + post_residual_addition
+        if self.attn_input_mxfp8:
+            return _as_mxfp8_input(
+                *all_reduce_residual_norm_mxfp8(
+                    owed.partial,
+                    residual,
+                    gamma,
+                    plan.norm.variance_epsilon,
+                    world_size=get_parallel().tp_size,
+                    residual_out=torch.empty_like(residual),
+                )
+            )
         return all_reduce_residual_norm(
             owed.partial,
             residual,
@@ -163,13 +198,19 @@ class CustomAllReduceFusion:
             residual_out=torch.empty_like(residual),
         )
 
-    def _run_finalize(self, handoff, residual, gamma, eps):
-        return moe_finalize_all_reduce_residual_norm(
+    @staticmethod
+    def _finalize_args(handoff: MoeDeferredFinalize) -> tuple:
+        return (
             handoff.routed_output,
             handoff.permuted_indices.reshape(-1),
             handoff.expert_weights,
             handoff.expert_weights.shape[1],
             handoff.gated_shared_output,
+        )
+
+    def _run_finalize(self, handoff, residual, gamma, eps):
+        return moe_finalize_all_reduce_residual_norm(
+            *self._finalize_args(handoff),
             residual,
             gamma,
             eps,
@@ -196,6 +237,10 @@ class CustomAllReduceFusion:
             and TokenAxis.ATTN_TP not in plan.fused_input_rows(forward_batch).sharded
             and can_fuse_all_reduce(m, self.hidden_size)
         )
+
+
+def _as_mxfp8_input(normed, residual_out, quantized, scales):
+    return Mxfp8SwizzledInput(quantized, scales), residual_out
 
 
 def install_terminal_finalize(

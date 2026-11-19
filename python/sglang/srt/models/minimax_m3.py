@@ -56,6 +56,7 @@ from sglang.srt.layers.layer_boundary import (
 )
 from sglang.srt.layers.layer_boundary.fusions.moe_finalize import MoeDeferredFinalize
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
+from sglang.srt.layers.layer_boundary.residual.add_norm import MXFP8_SWIZZLED
 from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
 from sglang.srt.layers.linear import (
     LinearParallelGroup,
@@ -120,6 +121,7 @@ from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import (
     get_exec,
     get_forward,
+    get_lora,
     get_parallel,
     get_platform,
     get_stream,
@@ -1782,6 +1784,9 @@ class MiniMaxM3DecoderLayer(nn.Module):
 
         # gfx950 norms quantize for the GEMMs that read them
         self._norm_quant = _hip.norm_quant(self) if _is_gfx95_supported else None
+        self.attn_input_quant_format = (
+            MXFP8_SWIZZLED if self._attn_takes_mxfp8_input() else ""
+        )
 
         options = {}
         if _uses_push_plane_fusion():
@@ -1793,6 +1798,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 hidden_size=config.hidden_size,
                 defers_finalize=self.is_layer_sparse
                 and self.mlp.supports_deferred_finalize,
+                attn_input_mxfp8=self.attn_input_quant_format == MXFP8_SWIZZLED,
             )
         attn, ffn = self.stage_facts(config, layer_id)
         if self._norm_quant is not None:
@@ -1800,6 +1806,31 @@ class MiniMaxM3DecoderLayer(nn.Module):
         self.attn_boundary, self.ffn_boundary = append_stages(
             (attn, self.input_layernorm, options),
             (ffn, self.post_attention_layernorm, options),
+        )
+
+    def _attn_takes_mxfp8_input(self) -> bool:
+        if not _is_cuda:
+            return False
+        # LoRA wraps the projections after construction and takes bf16 input.
+        if get_lora().enable_lora or get_lora().lora_paths:
+            return False
+        try:
+            from sglang.kernels.ops.layernorm.fused_add_rmsnorm_mxfp8 import (
+                supports_fused_add_rmsnorm_mxfp8,
+            )
+        except ImportError:
+            return False
+
+        attn = self.self_attn
+        projections = [attn.qkv_proj]
+        if attn.is_sparse_attention_layer:
+            projections.append(attn.index_qkv_proj)
+        return (
+            self.use_gemma_norm
+            and supports_fused_add_rmsnorm_mxfp8(self.hidden_size)
+            # Subclasses (the DSpark draft) read their input differently.
+            and type(attn) is MiniMaxM3Attention
+            and all(accepts_mxfp8_swizzled_input(p) for p in projections)
         )
 
     @classmethod
@@ -1842,6 +1873,8 @@ class MiniMaxM3DecoderLayer(nn.Module):
             kwargs["quant_format"] = self._norm_quant.attn_quant_format(
                 positions.shape[-1]
             )
+        elif self.attn_input_quant_format:
+            kwargs["quant_format"] = self.attn_input_quant_format
         hidden_states = self.attn_boundary.prepare(
             hidden_states,
             forward_batch,
