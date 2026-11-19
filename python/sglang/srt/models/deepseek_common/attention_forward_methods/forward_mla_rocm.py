@@ -31,6 +31,7 @@ from sglang.srt.layers.dcp.layout import (
     dsa_shards_index_k,
     is_mla_dcp_lse_base_on_e,
 )
+from sglang.srt.layers.dcp.prefill_route import DcpOwnedRoute
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 from sglang.srt.layers.quantization.fp8_utils import (
@@ -1283,6 +1284,15 @@ class DeepseekMLARocmForwardMixin:
             ),
             kv_b_lora_active=is_kv_b_lora_active(self)
             or _SGLANG_EXPERIMENTAL_LORA_OPTI,
+        )
+
+    def dcp_owned_route(self: DeepseekV2AttentionMLA) -> DcpOwnedRoute:
+        """The owned DCP route this layer takes, for the DSA backend to price
+        its gathered prefill against."""
+        return DcpOwnedRoute(
+            v_head_dim=self.v_head_dim,
+            project_before_merge=self._dcp_project_before_merge(),
+            q_all_gather=not self._dcp_q_replicated(),
         )
 
     def _dcp_q_replicated(self: DeepseekV2AttentionMLA) -> bool:

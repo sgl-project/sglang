@@ -96,6 +96,7 @@ from sglang.srt.layers.cp.utils import (
     is_cp_active,
     is_mla_cp_enabled,
 )
+from sglang.srt.layers.dcp.prefill_route import init_dcp_prefill_crossover
 from sglang.srt.layers.dp_attention import get_dp_tp_group, require_gathered_buffer
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.mega_moe import allocate_mega_moe_buffers
@@ -1192,44 +1193,12 @@ class ModelRunner:
         if get_parallel().dcp_enabled and get_parallel().dcp_replicate_q_proj:
             self._prepare_replicated_q_proj()
         if get_parallel().dcp_enabled:
-            self._init_dcp_prefill_crossover()
-
-    def _init_dcp_prefill_crossover(self) -> None:
-        # The DSA backend prices its gathered DCP prefill against the owned
-        # route, which depends on the replicated buffers prepared above.
-        from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
-        from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
-
-        attn = next(
-            (m for m in self.model.modules() if isinstance(m, DeepseekV2AttentionMLA)),
-            None,
-        )
-        if attn is None:
-            return
-        route = dict(
-            v_head_dim=attn.v_head_dim,
-            # The owned route's a2a carries the partials in the model dtype.
-            partial_dtype=self.dtype,
-            project_before_merge=attn._dcp_project_before_merge(),
-            q_all_gather=not attn._dcp_q_replicated(),
-        )
-        seen, pending = set(), [self.attn_backend]
-        while pending:
-            backend = pending.pop()
-            if backend is None or id(backend) in seen:
-                continue
-            seen.add(id(backend))
-            if isinstance(backend, DeepseekSparseAttnBackend):
-                backend.init_dcp_prefill_crossover(**route)
-                continue
-            # TBO children and the hybrid prefill/decode pair each plan their
-            # own batches; vars() skips TboAttnBackend's delegating __getattr__.
-            attrs = vars(backend)
-            pending += attrs.get("children") or []
-            pending += [
-                attrs.get(name)
-                for name in ("primary", "prefill_backend", "decode_backend")
-            ]
+            # The owned route reads the replicated buffers prepared above.
+            init_dcp_prefill_crossover(
+                model=self.model,
+                attn_backend=self.attn_backend,
+                partial_dtype=self.dtype,
+            )
 
     def _prepare_replicated_q_proj(self) -> None:
         # --dcp-replicate-q-proj: gather each rank's attn_tp head-shard of

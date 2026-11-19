@@ -132,6 +132,7 @@ from sglang.srt.layers.dcp.layout import (
     filter_dcp_local_chunk_kv_indices,
     get_dcp_lens,
 )
+from sglang.srt.layers.dcp.prefill_route import DcpOwnedRoute
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
@@ -1961,35 +1962,30 @@ class DeepseekSparseAttnBackend(
         return is_dsa_dcp_gathered_prefill(forward_batch.attn_dcp_metadata)
 
     def init_dcp_prefill_crossover(
-        self,
-        *,
-        v_head_dim: int,
-        partial_dtype: torch.dtype,
-        project_before_merge: bool,
-        q_all_gather: bool,
+        self, *, route: DcpOwnedRoute, partial_dtype: torch.dtype
     ) -> None:
         """Price the gathered DCP prefill against the owned route the model
-        takes: whether it projects before the merge and gathers its query."""
+        takes; ``partial_dtype`` is the dtype its a2a carries the partials in."""
         # Only ROCm plans the gathered route, and without DCP there is no
         # owned route to weigh it against.
         if not _is_hip or self.attn_dcp_size == 1:
             return
         self.dcp_gathered_prefill_crossover = dcp_gathered_prefill_crossover(
-            v_head_dim=v_head_dim,
+            v_head_dim=route.v_head_dim,
             kv_lora_rank=self.kv_lora_rank,
             qk_rope_head_dim=self.qk_rope_head_dim,
             partial_dtype=partial_dtype,
             kv_dtype=self.token_to_kv_pool.dtype,
-            project_before_merge=project_before_merge,
-            q_all_gather=q_all_gather,
+            project_before_merge=route.project_before_merge,
+            q_all_gather=route.q_all_gather,
         )
         logger.info(
             "dsa dcp gathered prefill: crossover %.3f prefix tokens per "
             "extend token and gathered head (project_before_merge=%s, "
             "q_all_gather=%s)",
             self.dcp_gathered_prefill_crossover,
-            project_before_merge,
-            q_all_gather,
+            route.project_before_merge,
+            route.q_all_gather,
         )
 
     def _plan_dcp_gathered_prefill(
