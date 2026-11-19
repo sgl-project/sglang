@@ -224,6 +224,55 @@ class TestHiCacheAutoSize(CustomTestCase):
             resolution_result(explicit, "hicache_host_memory_fraction", 0.8)
         )
 
+    def test_explicit_ratio_ignores_node_mates_allocating_first(self):
+        """An explicit size must fit this rank's share of the host memory free
+        before any rank allocated, not of what node mates left behind."""
+        pool = MHATokenToKVPool(
+            size=128,
+            page_size=2,
+            dtype=torch.float16,
+            head_num=2,
+            head_dim=4,
+            layer_num=2,
+            device="cpu",
+            enable_memory_saver=False,
+        )
+        params = CacheInitParams(
+            disable=False,
+            req_to_token_pool=SimpleNamespace(holds_state_slots=False),
+            token_to_kv_pool_allocator=Mock(
+                get_kvcache=Mock(return_value=pool), storage=None
+            ),
+            page_size=2,
+        )
+        # Four ranks per host; this rank's ~8 KB pool fits its 10 KB share.
+        free = [base.HICACHE_HOST_MEMORY_RESERVE_BYTES + 4 * 10_000]
+        with (
+            # What an explicit --hicache-ratio or --hicache-size resolves to.
+            get_context().override_server_args(
+                enable_hierarchical_cache=True, hicache_host_memory_fraction=None
+            ),
+            patch.object(base, "ranks_per_host", return_value=4),
+            patch.object(
+                base, "available_host_memory_bytes", side_effect=lambda **_: free[0]
+            ),
+            sizing.auto_size_hicache(params, None, enabled=True),
+        ):
+            free[0] = base.HICACHE_HOST_MEMORY_RESERVE_BYTES  # node mates allocated
+            MHATokenToKVPoolHost(
+                pool.get_device_pool_infos()[0].buffer_info,
+                1.0,
+                0,
+                2,
+                "layer_first",
+                pin_memory=False,
+                device="cpu",
+                device_capacity_tokens=pool.size,
+                start_layer=pool.start_layer,
+                end_layer=pool.end_layer,
+                write_back_staging=pool.hicache_write_back_staging,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
