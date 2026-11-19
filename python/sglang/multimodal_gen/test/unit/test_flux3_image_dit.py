@@ -56,6 +56,7 @@ from sglang.multimodal_gen.runtime.models.dits.flux3_image import (
 from sglang.multimodal_gen.runtime.pipelines.flux3_image_weights import (
     resolve_flux3_image_dit_quant_config,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 
 _TINY = dict(
     hidden_size=256,
@@ -243,6 +244,20 @@ def test_packed_cfg_forward_matches_flux3_transformer_per_sample(
         packed.static = None
         uncached = native(packed)["image"]
         torch.testing.assert_close(reused, uncached, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="needs the CUDA kernels")
+def test_native_swiglu_is_within_one_bf16_step_of_the_eager_pair():
+    torch.manual_seed(0)
+    packed = (torch.randn(1, 37, 2 * 96, device="cuda") * 3).bfloat16()
+    gate, value = packed.chunk(2, dim=-1)
+    eager = torch.nn.functional.silu(gate) * value
+    torch.testing.assert_close(
+        flux3_fused_ops._SILU_AND_MUL(packed).float(),
+        eager.float(),
+        rtol=2**-7,
+        atol=1e-6,
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA kernels")

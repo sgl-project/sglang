@@ -958,7 +958,11 @@ class TestFlux3TextEncoder(unittest.TestCase):
 
 class TestFlux3PackedCFGParallel(unittest.TestCase):
     def test_one_sample_per_rank_is_gathered_in_cfg_order(self):
-        from sglang.multimodal_gen.runtime.models.dits.flux3_image import TEXT, pack
+        from sglang.multimodal_gen.runtime.models.dits.flux3_image import (
+            TEXT,
+            StaticStreams,
+            pack,
+        )
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages import (
             flux3_image as stages,
         )
@@ -978,13 +982,27 @@ class TestFlux3PackedCFGParallel(unittest.TestCase):
                 predict(branch) for branch in policy.branches
             ],
         ):
-            model = stages._CFGParallelModel(
-                lambda *, packed: {"image": packed.data["image"]}
-            )
+            seen = []
+
+            def forward(*, packed):
+                seen.append(packed.static)
+                return {"image": packed.data["image"]}
+
+            model = stages._CFGParallelModel(forward)
             output = model(packed=packed)
+            # static streams survive the per-step slice, one per branch
+            packed.static = StaticStreams()
+            model(packed=packed)
+            model(packed=packed)
         torch.testing.assert_close(
             output["image"], torch.cat((torch.zeros(2, 2), torch.ones(2, 2)))
         )
+        self.assertEqual(seen[:2], [None, None])
+        self.assertIsInstance(seen[2], StaticStreams)
+        self.assertIsNot(seen[2], seen[3])
+        self.assertIsNot(seen[2], packed.static)
+        self.assertIs(seen[4], seen[2])
+        self.assertIs(seen[5], seen[3])
 
 
 if __name__ == "__main__":

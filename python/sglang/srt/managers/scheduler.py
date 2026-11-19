@@ -67,7 +67,6 @@ import psutil  # isort: skip
 import setproctitle
 import torch
 import torch.distributed
-from torch.distributed import barrier
 
 if TYPE_CHECKING:
     from torch.cuda import Stream as CudaStream
@@ -219,7 +218,6 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightVersionReqInput,
     UpdateWeightVersionReqOutput,
-    sock_send,
 )
 from sglang.srt.managers.load_snapshot import create_load_snapshot_writer
 from sglang.srt.managers.min_free_slots_delayer import (
@@ -800,6 +798,8 @@ class Scheduler(
 
         self.init_request_retirer()
 
+        self.maybe_wire_uniboost_gamma_ada()
+
         self.init_deferred_responses()
 
         self.init_request_receiver()
@@ -931,10 +931,7 @@ class Scheduler(
             and get_device().sleep_on_idle
         ):
             self.idle_sleeper = IdleSleeper(
-                sockets=[
-                    self.ipc_channels.recv_from_tokenizer,
-                    self.ipc_channels.recv_from_rpc,
-                ],
+                sockets=[self.ipc_channels.recv_from_tokenizer],
                 can_empty_cache=lambda: not self.pause_state.paused,
             )
         else:
@@ -1551,6 +1548,12 @@ class Scheduler(
             self.schedule_low_priority_values_first,
             shortest_prefill_aging_factor=get_schedule().shortest_prefill_aging_factor,
             bounded_lpm_enabled=self.dllm_config is None,
+            uniboost_gamma=get_schedule().uniboost_gamma,
+            enable_uniboost_gamma_ada=get_schedule().enable_uniboost_gamma_ada,
+            # Every rank of a TP or PP group must admit the same batch.
+            uniboost_rank_invariant=get_parallel().tp_size > 1
+            or get_parallel().pp_size > 1,
+            uniboost_step_clock=lambda: self.forward_ct,
         )
         self.policy._on_bounded_state_change = lambda active: (
             self.waiting_queue.set_on_leave(
@@ -2396,10 +2399,7 @@ class Scheduler(
             if output is None:
                 output = self._rust_control_ack(recv_req)
             if output is not None:
-                if self.rust_server is None and isinstance(output, RpcReqOutput):
-                    if self.ipc_channels.recv_from_rpc is not None:
-                        sock_send(self.ipc_channels.recv_from_rpc, output)
-                elif get_parallel().pp_size > 1 and isinstance(
+                if get_parallel().pp_size > 1 and isinstance(
                     output, ReleaseMemoryOccupationReqOutput
                 ):
                     # Answered by the first stage once every stage has released.
@@ -2740,7 +2740,6 @@ class Scheduler(
             )
         self.request_receiver = receiver_factory(
             recv_from_tokenizer=self.recv_from_tokenizer,
-            recv_from_rpc=self.ipc_channels.recv_from_rpc,
             recv_skipper=self.recv_skipper,
             input_blocker=self.input_blocker,
             mm_receiver=self.mm_receiver,
@@ -3007,6 +3006,13 @@ class Scheduler(
             send_abort_output=self.send_abort_output,
             stream_output=self.output_streamer.stream_output,
         )
+
+    def maybe_wire_uniboost_gamma_ada(self) -> None:
+        # gamma-Ada records the latency of every request that ends.
+        if self.policy.uniboost_gamma_ada is not None:
+            self.request_retirer.release_observer = (
+                self.policy.uniboost_gamma_ada.record_finish
+            )
 
     def maybe_init_decode_offload_manager(self) -> None:
         self.decode_offload_manager = None
@@ -3411,7 +3417,7 @@ class Scheduler(
                 routed_dp_rank=recv_req.routed_dp_rank,
                 disagg_prefill_dp_rank=recv_req.disagg_prefill_dp_rank,
                 kv_hints=recv_req.kv_hints,
-                vocab_size=self.model_config.vocab_size,
+                vocab_size=self.model_config.token_id_vocab_size,
                 priority=recv_req.priority,
                 metrics_collector=(
                     self.metrics_collector
@@ -3466,7 +3472,7 @@ class Scheduler(
             req = session.create_req(
                 recv_req,
                 self.tokenizer,
-                self.model_config.vocab_size,
+                self.model_config.token_id_vocab_size,
                 eos_token_ids=self.model_config.hf_eos_token_id,
                 disagg_mode=self.disaggregation_mode,
                 req_factory=partial(self._create_generation_req, recv_req),
@@ -3497,7 +3503,7 @@ class Scheduler(
                 recv_req.input_text,
                 recv_req.input_ids,
                 recv_req.sampling_params,
-                vocab_size=self.model_config.vocab_size,
+                vocab_size=self.model_config.token_id_vocab_size,
                 http_worker_ipc=recv_req.http_worker_ipc,
             )
             req.tokenizer = self.tokenizer
@@ -5090,7 +5096,8 @@ class Scheduler(
         batch.after_idle_gap = self._sched_idled
         self._sched_idled = False
 
-        # Accumulate the prefill-token counter used for HRRN and shortest-prefill-first aging.
+        # Accumulate the prefill-token counter used for HRRN and shortest-prefill-first
+        # aging, and for UniBoost's arrival under tp or pp > 1.
         # A batch reused for decode keeps its stale extend_num_tokens, so count extend batches only.
         if batch.forward_mode.is_extend() and batch.extend_num_tokens:
             self.processed_tokens_counter += batch.extend_num_tokens
@@ -6470,8 +6477,7 @@ class Scheduler(
             f"handle_rpc_request: {recv_req.method}, param: {recv_req.parameters}"
         )
 
-        success = True
-        exec = None
+        error = None
         try:
             func = getattr(self, recv_req.method)
             if recv_req.parameters is not None:
@@ -6479,12 +6485,26 @@ class Scheduler(
             else:
                 func()
         except Exception as e:
-            success = False
-            exec = e
-            logger.error(f"Failed to call rpc {recv_req.method}: {str(e)}")
+            error = str(e)
+            logger.error(f"Failed to call rpc {recv_req.method}: {error}")
 
-        barrier(group=self.tp_group.cpu_group)
-        return RpcReqOutput(success=success, message="" if not exec else str(exec))
+        # Gather over the ranks that ran this request in the same step: the DP
+        # shard under DP attention, where shards may reach it in different steps.
+        parallel = get_parallel()
+        if parallel.attn_dp_enabled:
+            groups = [parallel.attn_tp_group, parallel.attn_cp_group]
+        else:
+            groups = [parallel.tp_group]
+        errors = [error]
+        for group in groups:
+            if group.world_size > 1:
+                gathered = [None] * group.world_size
+                torch.distributed.all_gather_object(
+                    gathered, errors, group=group.cpu_group
+                )
+                errors = [e for rank_errors in gathered for e in rank_errors]
+        errors = [e for e in dict.fromkeys(errors) if e is not None]
+        return RpcReqOutput(success=not errors, message="; ".join(errors))
 
     def handle_update_weight_version(
         self, recv_req: UpdateWeightVersionReqInput

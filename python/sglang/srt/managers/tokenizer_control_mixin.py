@@ -71,6 +71,8 @@ from sglang.srt.managers.io_struct import (
     RemoveExternalCorpusReqOutput,
     ResumeMemoryOccupationReqInput,
     ResumeMemoryOccupationReqOutput,
+    RpcReqInput,
+    RpcReqOutput,
     ScaleElasticEPReqOutput,
     SendWeightsToRemoteInstanceReqInput,
     SendWeightsToRemoteInstanceReqOutput,
@@ -149,6 +151,7 @@ _COMMUNICATOR_SPECS = [
     ("update_lora_adapter", LoRAUpdateOutput),
     ("dumper_control", DumperControlReqOutput),
     ("scale_elastic_ep", ScaleElasticEPReqOutput),
+    ("rpc", RpcReqOutput),
 ]
 
 
@@ -917,6 +920,12 @@ class TokenizerControlMixin:
     ):
         self.auto_create_handle_loop()
         await self.resume_memory_occupation_communicator(obj)
+
+    async def collective_rpc(self: TokenizerManager, obj: RpcReqInput) -> RpcReqOutput:
+        self.auto_create_handle_loop()
+        results = await self.rpc_communicator(obj)
+        errors = dict.fromkeys(r.message for r in results if not r.success)
+        return RpcReqOutput(success=not errors, message="; ".join(errors))
 
     async def check_weights(
         self: TokenizerManager,

@@ -11,7 +11,9 @@ import torch
 from huggingface_hub import snapshot_download
 
 from sglang.kernels.ops.sampling import argmax as sampling_argmax
+from sglang.kernels.ops.sampling import can_softmax_sample
 from sglang.kernels.ops.sampling import softmax as sampling_softmax
+from sglang.kernels.ops.sampling import softmax_sample as sampling_softmax_sample
 from sglang.kernels.ops.speculative.cache_locs import (
     fill_front_out_cache_loc_func,
     generate_draft_decode_window_kv_indices,
@@ -233,6 +235,18 @@ def renorm_draft_probs(
     return sampling_softmax(next_token_logits, temperatures=sampling_info.temperatures)
 
 
+def use_fused_draft_sample(vocab_size: int) -> bool:
+    """Whether `sample_draft_proposal(..., fused=True)` applies: opted in
+    (SGLANG_OPT_USE_FUSED_DRAFT_SAMPLE), not deterministic inference (seeded draws),
+    Gumbel sampling on, and a device / vocabulary `softmax_sample` serves."""
+    return (
+        envs.SGLANG_OPT_USE_FUSED_DRAFT_SAMPLE.get()
+        and not get_exec().deterministic.enable_deterministic_inference
+        and envs.SGLANG_OPT_USE_GUMBEL_SAMPLE.get()
+        and can_softmax_sample(vocab_size)
+    )
+
+
 def sample_draft_proposal(
     next_token_logits: torch.Tensor,
     temperatures: torch.Tensor,
@@ -241,6 +255,7 @@ def sample_draft_proposal(
     sampling_seed: Optional[torch.Tensor] = None,
     positions: Optional[torch.Tensor] = None,
     draft_step: int = 0,
+    fused: bool = False,
 ):
     """Leviathan draft proposal: q = softmax(logits / T), X ~ q.
 
@@ -262,6 +277,9 @@ def sample_draft_proposal(
     (p - q)+ it resamples from is p itself. Both arms commit the target argmax,
     which is what greedy means. Drop that renorm and this stops holding.
     """
+    if fused:
+        # One fused kernel; callers pass the `use_fused_draft_sample` decision.
+        return sampling_softmax_sample(next_token_logits, temperatures, top_ks=top_ks)
     probs = sampling_softmax(next_token_logits, temperatures=temperatures)
     topk_p, topk_index = fast_sample(
         probs,

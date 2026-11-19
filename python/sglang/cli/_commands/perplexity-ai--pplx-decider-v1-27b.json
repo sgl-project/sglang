@@ -1,0 +1,4 @@
+[
+  {"hw":"h200","mode":"balanced","verified":"verified","gpus":1,"env":{},"url":"https://docs.sglang.io/cookbook/autoregressive/Perplexity/PPLX-Decider-v1-27B#hw=h200&variant=default&quant=bf16&strategy=balanced&nodes=single","command":"sglang serve \\\n  --model-path perplexity-ai/pplx-decider-v1-27b \\\n  --host 0.0.0.0 \\\n  --port 30000"},
+  {"hw":"gb300","mode":"balanced","verified":"verified","gpus":1,"env":{},"url":"https://docs.sglang.io/cookbook/autoregressive/Perplexity/PPLX-Decider-v1-27B#hw=gb300&variant=default&quant=bf16&strategy=balanced&nodes=single","command":"sglang serve \\\n  --model-path perplexity-ai/pplx-decider-v1-27b \\\n  --disable-radix-cache \\\n  --host 0.0.0.0 \\\n  --port 30000"}
+]

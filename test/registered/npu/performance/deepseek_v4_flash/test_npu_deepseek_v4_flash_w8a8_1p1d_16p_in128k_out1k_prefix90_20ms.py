@@ -132,7 +132,7 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_PREFILL_ARGS = [
     "--disaggregation-bootstrap-port",
     18998,
     "--mem-fraction-static",
-    0.62,
+    0.68,
     "--prefill-max-requests",
     256,
     "--max-prefill-tokens",

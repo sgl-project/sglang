@@ -210,7 +210,7 @@ async fn completions(
                 rid: rid.clone(),
                 text: text.clone(),
                 input_ids: input_ids.clone(),
-                sampling_params: sampling.clone(),
+                sampling_params: sampling.for_sample(sample_index),
                 stream,
                 return_logprob: request.logprobs.is_some(),
                 logprob_start_len: if echo && request.logprobs.is_some() {

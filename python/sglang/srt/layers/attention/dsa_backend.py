@@ -20,6 +20,7 @@ from sglang.srt.configs.model_config import (
     get_dsa_index_topk,
     is_deepseek_dsa,
     is_kimi_k31,
+    is_q8_raw_fp8_nope_layout,
 )
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.runtime_context import (
@@ -600,6 +601,7 @@ def _validate_flashmla_sparse_q8_backend(
     kv_cache_store_fp8: bool,
     qk_rope_head_dim: int,
     device_sm_major: int,
+    kv_lora_rank: int,
     hisparse_enabled: bool = False,
 ) -> None:
     # flashmla_sparse_q8 casts q and KV to fp8 per call, so the KV cache may be
@@ -620,15 +622,23 @@ def _validate_flashmla_sparse_q8_backend(
                 "fp8_e4m3 KV cache for NoPE MLA models (qk_rope_head_dim=0) yet; use "
                 "--kv-cache-dtype bfloat16."
             )
-        # An fp8 dtype that is NOT stored packed leaves the pool in the raw
-        # 576-dim layout, which the bf16 prefix gather cannot read; without this
-        # the failure is a message-less assert on the first prefix extend.
-        if kv_cache_dtype == torch.float8_e4m3fn and not kv_cache_store_fp8:
+        # Raw fp8 is supported only for the NoPE layout shared with TileLang.
+        # Keep other unpacked layouts (e.g. TRTLLM's 576-dim rows) rejected.
+        if (
+            kv_cache_dtype == torch.float8_e4m3fn
+            and not kv_cache_store_fp8
+            and not is_q8_raw_fp8_nope_layout(
+                prefill_backend=prefill_impl,
+                decode_backend=decode_impl,
+                kv_lora_rank=kv_lora_rank,
+                qk_rope_head_dim=qk_rope_head_dim,
+            )
+        ):
             raise ValueError(
                 "--dsa-prefill-backend flashmla_sparse_q8 requires either a "
-                "bfloat16 KV cache or the packed fp8_e4m3 pool; got an unpacked "
-                "fp8_e4m3 pool (a trtllm backend keeps the raw layout). Use "
-                "--kv-cache-dtype bfloat16."
+                "bfloat16 KV cache, a packed fp8_e4m3 pool, or raw 512-dim NoPE "
+                "fp8 KV with TileLang decode; got an unsupported unpacked pool. "
+                "Use --kv-cache-dtype bfloat16."
             )
         if device_sm_major != 9:
             raise ValueError(
@@ -1052,6 +1062,7 @@ class DeepseekSparseAttnBackend(
             kv_cache_store_fp8=self.dsa_kv_cache_store_fp8,
             qk_rope_head_dim=self.qk_rope_head_dim,
             device_sm_major=self.device_sm_major,
+            kv_lora_rank=self.kv_lora_rank,
             hisparse_enabled=self.hisparse_coordinator is not None,
         )
         _validate_unified_pool_backend(
@@ -3662,8 +3673,9 @@ class DeepseekSparseAttnBackend(
             scales + rope_bf16): ``gather_dequant_requant_fp8_paged_dsa`` gathers,
             dequantizes per group and requantizes to per-tensor fp8 in one
             fused Triton kernel.
-          * prefix extend on a bf16 pool: ``gather_cast_kv_fp8_pad_paged``
-            gathers the rows and store-casts them to fp8.
+          * prefix extend on a bf16 or raw NoPE fp8 pool:
+            ``gather_cast_kv_fp8_pad_paged`` gathers only the referenced rows,
+            store-casting bf16 or copying raw fp8 without scale conversion.
         The top-k width is -1 padded to a multiple of 128 before the pad band
         is sized (kpool rows are index_topk + index_kpool - 1 wide).
         """
@@ -4827,7 +4839,14 @@ class DeepseekSparseAttnBackend(
         page_table_1, sparse_mla_top_k = self._pad_trtllm_sparse_page_table(
             page_table_1
         )
-        if self.attn_dcp_size > 1 and (not self.dsa_shards_index_k or dcp_partial):
+        if dcp_partial:
+            # The sharded indexer already returns this rank's compacted slots and
+            # their counts; remapping them as global slots selects the wrong KV.
+            seq_lens = metadata.dcp_topk_length[: page_table_1.shape[0]]
+            pad = page_table_1.shape[0] - seq_lens.shape[0]
+            if pad > 0:  # padded rows (DP / attention-TP padding) select nothing
+                seq_lens = torch.nn.functional.pad(seq_lens, (0, pad))
+        elif replicated_dcp:
             page_table_1, seq_lens = localize_dcp_page_table(
                 self._dcp_page_table_cache,
                 metadata=metadata,
