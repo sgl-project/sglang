@@ -8,25 +8,25 @@ layers, for each ``--num-blocks`` and, with ``--copy-engine``, once more with th
 copy engines. Reported per point: the CPU time of ``read()`` (validation,
 metadata staging, launches or copy submission) and the wall time until
 ``wait()`` returns SUCCESS. Every sample checks the first and last page it read
-of every buffer.
+of every buffer, and the run exits non-zero if any differs.
 Pages are drawn afresh per sample from the whole pool, so the source L2 is cold.
 
     python benchmark/kv_transfer/bench_kv_peer_read.py --pages 16 1024 7187
 
 By default both run on this node (GPU 0 -> GPU 1). Across nodes of one NVLink
-domain, start one role per node with a directory both can see; this is also the
-cross-node correctness check:
+domain, start one role per node with a new directory both can see (the owner
+creates it); this is also the cross-node correctness check:
 
-    node A: python bench_kv_peer_read.py --role owner  --rendezvous /shared/dir
-    node B: python bench_kv_peer_read.py --role reader --rendezvous /shared/dir
+    node A: python bench_kv_peer_read.py --role owner  --rendezvous /shared/new-dir
+    node B: python bench_kv_peer_read.py --role reader --rendezvous /shared/new-dir
 """
 
 import argparse
 import json
 import multiprocessing as mp
 import os
-import pickle
 import statistics
+import sys
 import time
 from pathlib import Path
 
@@ -35,30 +35,43 @@ import torch
 
 
 class _FileConn:
-    """Pipe-like messages through a shared directory, for roles on different nodes."""
+    """Byte messages through a shared directory, for roles on different nodes.
+
+    The owner creates the directory and the reader requires it empty, so a reused
+    directory is refused instead of replaying an earlier run's messages.
+    """
 
     def __init__(self, directory, me: str, peer: str, timeout: float = 600.0):
         self._dir, self._me, self._peer = Path(directory), me, peer
         self._sent = self._received = 0
         self._timeout = timeout
-        self._dir.mkdir(parents=True, exist_ok=True)
+        if me == "owner":
+            self._dir.mkdir(parents=True)
+            return
+        self._wait_for(self._dir)
+        # The owner writes nothing until the reader's first message.
+        if any(self._dir.iterdir()):
+            raise RuntimeError(f"{self._dir} is not empty; use a new directory")
 
-    def send(self, obj) -> None:
+    def send(self, msg: bytes) -> None:
         path = self._dir / f"{self._me}-{self._sent}.msg"
         tmp = path.with_suffix(".tmp")
-        tmp.write_bytes(pickle.dumps(obj))
+        tmp.write_bytes(msg)
         os.replace(tmp, path)
         self._sent += 1
 
-    def recv(self):
+    def recv(self) -> bytes:
         path = self._dir / f"{self._peer}-{self._received}.msg"
+        self._wait_for(path)
+        self._received += 1
+        return path.read_bytes()
+
+    def _wait_for(self, path: Path) -> None:
         deadline = time.monotonic() + self._timeout
         while not path.exists():
             if time.monotonic() > deadline:
-                raise TimeoutError(f"no message {path}")
+                raise TimeoutError(f"no {path}")
             time.sleep(0.05)
-        self._received += 1
-        return pickle.loads(path.read_bytes())
 
 
 def _geometry(args):
@@ -106,7 +119,7 @@ def _owner(args, conn):
         torch.arange(start, start + n, out=words[start : start + n])
     torch.cuda.synchronize()
 
-    while conn.recv() == "export":
+    while conn.recv() == b"export":
         conn.send(export_region(handle, size, device=dev).to_bytes())
     # Every reader unmapped before sending "done".
     check_drv(drv.cuMemUnmap(va, size), "unmap")
@@ -155,7 +168,7 @@ def _run(args, conn):
         arms.append(("ce", dict(copy_engine=True)))
     for copy, reader_args in arms:
         reader = KvPeerReader(dev, **reader_args)
-        conn.send("export")
+        conn.send(b"export")
         region = reader.import_region(PeerRegionDescriptor.from_bytes(conn.recv()))
         buffer_sets = [
             [
@@ -214,7 +227,7 @@ def _run(args, conn):
                 flush=True,
             )
         reader.unmap(region)
-    conn.send("done")
+    conn.send(b"done")
     return results
 
 
@@ -251,26 +264,24 @@ def main():
         return
     if args.role == "reader":
         results = _run(args, _FileConn(args.rendezvous, "reader", "owner"))
-        _write_json(args, results)
-        return
-
-    ctx = mp.get_context("spawn")
-    conn, child = ctx.Pipe()
-    owner = ctx.Process(target=_owner, args=(args, child))
-    owner.start()
-    try:
-        results = _run(args, conn)
-    finally:
-        owner.join(timeout=120)
-        if owner.is_alive():
-            owner.kill()
-    _write_json(args, results)
-
-
-def _write_json(args, results) -> None:
+    else:
+        ctx = mp.get_context("spawn")
+        conn, child = ctx.Pipe()
+        owner = ctx.Process(target=_owner, args=(args, child))
+        owner.start()
+        child.close()  # so recv() raises EOFError if the owner dies
+        try:
+            results = _run(args, conn)
+        finally:
+            owner.join(timeout=120)
+            if owner.is_alive():
+                owner.kill()
     if args.json:
         with open(args.json, "w") as f:
             json.dump(dict(args=vars(args), results=results), f, indent=1)
+    bad = sum(point["verify_bad"] for point in results)
+    if bad:
+        sys.exit(f"{bad} checked pages differ from the source")
 
 
 if __name__ == "__main__":

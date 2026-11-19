@@ -546,9 +546,11 @@ class TestKvPeerReadCuda(CustomTestCase):
         conn, child = ctx.Pipe()
         owner = ctx.Process(target=_owner, args=(child,))
         owner.start()
+        child.close()  # so recv() raises EOFError if the owner dies
         try:
             # GPU 0 stays current: the reader must not depend on the caller's device.
             torch.cuda.set_device(0)
+            self.assertTrue(conn.poll(300), "the owner sent no descriptors")
             descs = [PeerRegionDescriptor.from_bytes(d) for d in conn.recv()]
             for copy_engine in (False, True):
                 with self.subTest(copy_engine=copy_engine):
