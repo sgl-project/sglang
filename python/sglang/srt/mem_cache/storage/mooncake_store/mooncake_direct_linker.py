@@ -6,6 +6,7 @@ import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from copy import deepcopy
+from dataclasses import replace
 from queue import Empty, Queue
 
 import numpy as np
@@ -18,6 +19,12 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
 )
+from sglang.srt.mem_cache.hybrid_cache.linker_key_identity import (
+    build_linker_unified_layout,
+)
+from sglang.srt.mem_cache.hybrid_cache.linker_page_unified import (
+    LinkerPageUnifiedStager,
+)
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     resolve_hybrid_device_pool_group,
 )
@@ -29,8 +36,10 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     UnifiedCacheLinker,
 )
 from sglang.srt.runtime_context import (
+    get_memory,
     get_model,
     get_parallel,
+    get_serving,
 )
 from sglang.srt.utils import freeze_gc, get_device_module
 
@@ -118,6 +127,9 @@ def _storage_sharing(
 
 
 class MooncakeDirectLinker(UnifiedCacheLinker):
+    load_stager: LinkerPageUnifiedStager | None = None
+    offload_stager: LinkerPageUnifiedStager | None = None
+
     def __init__(
         self,
         server_args,
@@ -139,6 +151,17 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         )
         self.pools = self.pool_group.entry_map
         self.num_layers = self.pool_group.num_layers
+        model_name = get_model().model_path
+        unified_layout = None
+        if get_memory().hicache_storage_key_scheme == "unified":
+            unified_layout = build_linker_unified_layout(
+                kvcache,
+                self.pool_group,
+                model_name=get_serving().served_model_name or model_name,
+                params=params,
+            )
+            model_name = unified_layout.model_name
+            self.pools = unified_layout.entries
 
         tp_rank = 0
         tp_size = get_parallel().tp_size
@@ -170,7 +193,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             is_mla_model=rank_replicated,
             enable_storage_metrics=False,
             is_page_first_layout=False,
-            model_name=get_model().model_path,
+            model_name=model_name,
             extra_config=extra_config,
         )
         if storage is None:
@@ -183,6 +206,19 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             self.storage = storage
         self.storage.mem_pool_host = self.pool_group
         self.storage.registered_pools = self.pools
+        if unified_layout is not None:
+            self.storage.linker_pool_suffixes = unified_layout.suffixes
+            logger.info(
+                "Mooncake direct linker unified L3 keys: %s", unified_layout.suffixes
+            )
+            if unified_layout.head_group_num > 1:
+                entry = self.pools[PoolName.KV]
+                self.load_stager = LinkerPageUnifiedStager(
+                    entry, unified_layout.head_group_num
+                )
+                self.offload_stager = LinkerPageUnifiedStager(
+                    entry, unified_layout.head_group_num
+                )
         storage_suffix = _storage_suffix(
             rank_replicated=rank_replicated,
             tp_rank=tp_rank,
@@ -265,7 +301,14 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
 
     def register_buffers(self) -> None:
         seen = set()
-        for pool in self.pools.values():
+        pools = [
+            pool
+            for name, pool in self.pools.items()
+            if name != PoolName.KV or self.load_stager is None
+        ]
+        if self.load_stager is not None:
+            pools.extend((self.load_stager.entry, self.offload_stager.entry))
+        for pool in pools:
             for buffer in pool.get_hybrid_pool_buffer():
                 storage = buffer.untyped_storage()
                 allocation = (int(storage.data_ptr()), int(storage.nbytes()))
@@ -329,22 +372,69 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
 
     def load_all_layers(self, transfers: list[PoolTransfer]) -> bool:
         for transfer in transfers:
-            keys, multiplier = self.storage._get_hybrid_page_component_keys(
-                list(transfer.keys), transfer
-            )
-            keys = self.storage._tag_keys(keys)
-            ptrs, sizes = self.storage._build_pool_buffer_meta(
-                self.pools[transfer.name],
-                transfer.host_indices,
-                keys,
-                multiplier,
-                None,
-            )
-            received = self.storage._get_batch_zero_copy_impl(keys, ptrs, sizes)
-            # Require every byte of every layer, including short reads.
-            if list(received) != [sum(s) if isinstance(s, list) else s for s in sizes]:
-                return False
+            stager = self.load_stager if transfer.name == PoolName.KV else None
+            if stager is None:
+                if not self._load_pool(transfer, self.pools[transfer.name]):
+                    return False
+                continue
+            location_windows = self._staging_windows(transfer, stager)
+            for window_transfer, locations in location_windows:
+                if not self._load_pool(window_transfer, stager.entry):
+                    return False
+                stager.unpack(locations, range(self.num_layers))
         return True
+
+    def _load_pool(self, transfer, entry) -> bool:
+        keys, multiplier = self.storage._get_hybrid_page_component_keys(
+            list(transfer.keys), transfer
+        )
+        keys = self.storage._tag_keys(keys)
+        ptrs, sizes = self.storage._build_pool_buffer_meta(
+            entry, transfer.host_indices, keys, multiplier, None
+        )
+        received = self.storage._get_batch_zero_copy_impl(keys, ptrs, sizes)
+        # Require every byte of every layer, including short reads.
+        return list(received) == [sum(s) if isinstance(s, list) else s for s in sizes]
+
+    def _staging_windows(self, transfer, stager):
+        locations = self.pools[transfer.name].prepare_locations(transfer.host_indices)
+        if len(locations) != len(transfer.keys):
+            raise ValueError(
+                f"Mooncake pool {transfer.name} has {len(locations)} pages for "
+                f"{len(transfer.keys)} keys."
+            )
+        for start in range(0, len(locations), stager.capacity):
+            end = min(start + stager.capacity, len(locations))
+            yield (
+                replace(
+                    transfer,
+                    keys=transfer.keys[start:end],
+                    host_indices=torch.arange(
+                        (end - start) * self.page_size, dtype=torch.int64, device="cpu"
+                    ),
+                ),
+                locations[start:end],
+            )
+
+    def _load_staged_layer_group(self, keys, locations, group):
+        stager = self.load_stager
+        multiplier = len(stager.entry.components)
+        if len(keys) != len(locations) * multiplier:
+            raise ValueError(
+                "Mooncake staging key count does not match the page count."
+            )
+        for start in range(0, len(locations), stager.capacity):
+            window = locations[start : start + stager.capacity]
+            window_keys = keys[start * multiplier : (start + len(window)) * multiplier]
+            for read in self._range_get_reads(
+                PoolName.KV,
+                window_keys,
+                np.arange(len(window), dtype=np.int64),
+                group,
+                entry=stager.entry,
+            ):
+                self._range_get(*read)
+            stager.unpack(window, group)
 
     def cancel_queued_load(self, rid: str) -> bool:
         return self.pending_loads.pop(rid, None) is not None
@@ -491,10 +581,14 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 range(start, min(start + self.load_layer_group, self.num_layers))
                 for start in range(0, self.num_layers, self.load_layer_group)
             ]
+            staged = (
+                batches.get(PoolName.KV) if self.load_stager is not None else None
+            )
             reads = [
                 [
                     read
                     for name, (keys, locations) in batches.items()
+                    if staged is None or name != PoolName.KV
                     for read in self._range_get_reads(name, keys, locations, group)
                 ]
                 for group in groups
@@ -513,7 +607,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                         f"results={result}"
                     )
             completed = 0
-            for group_reads in reads:
+            for group, group_reads in zip(groups, reads, strict=True):
                 group_futures = []
                 futures.append(group_futures)
                 # Retain each future even if a later submit fails.
@@ -521,6 +615,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     group_futures.append(
                         self.load_io_executor.submit(self._range_get, *read)
                     )
+                if staged is not None:
+                    self._load_staged_layer_group(*staged, group)
                 # Publish groups that landed during this submit: the next submit
                 # can take longer than the earlier groups' reads.
                 completed = self._complete_groups(
@@ -570,10 +666,18 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         return len(futures)
 
     def _range_get_reads(
-        self, name: PoolName, keys: list[str], locations: np.ndarray, group: range
+        self,
+        name: PoolName,
+        keys: list[str],
+        locations: np.ndarray,
+        group: range,
+        *,
+        entry=None,
     ) -> list[tuple]:
         """One pool's range gets for one layer group, split across the I/O threads."""
-        meta = self.pools[name].get_prepared_layers_range_meta(locations, group)
+        if entry is None:
+            entry = self.pools[name]
+        meta = entry.get_prepared_layers_range_meta(locations, group)
         if meta is None or not keys:
             return []
         ptrs, sizes, offsets = meta
@@ -679,8 +783,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     if session_id
                     else None
                 )
-                results = self.storage.batch_set_v2(expanded, extra_info)
-                success = all(all(pool_results) for pool_results in results.values())
+                success = self.offload_transfers(expanded, extra_info)
                 if success:
                     self.stats["offload"] += 1
                     if self.stats["offload"] == 1:
@@ -691,6 +794,30 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 self.offload_results.put(False)
             finally:
                 self.offload_queue.task_done()
+
+    def offload_transfers(self, transfers, extra_info=None) -> bool:
+        stager = self.offload_stager
+        if stager is None:
+            results = self.storage.batch_set_v2(transfers, extra_info)
+            return all(all(pool_results) for pool_results in results.values())
+        direct = [transfer for transfer in transfers if transfer.name != PoolName.KV]
+        if direct:
+            results = self.storage.batch_set_v2(direct, extra_info)
+            if not all(all(pool_results) for pool_results in results.values()):
+                return False
+        for transfer in transfers:
+            if transfer.name != PoolName.KV:
+                continue
+            for window_transfer, locations in self._staging_windows(transfer, stager):
+                stager.pack(locations)
+                results = self.storage.batch_set_v2(
+                    [window_transfer],
+                    extra_info,
+                    pool_overrides={PoolName.KV: stager.entry},
+                )
+                if not all(results[PoolName.KV]):
+                    return False
+        return True
 
     def num_completed_offloads(self) -> int:
         return self.offload_results.qsize()

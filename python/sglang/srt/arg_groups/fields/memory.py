@@ -227,10 +227,10 @@ class Memory(msgspec.Struct):
                 "'unified': keys carry topology-free grid coordinates (a "
                 "namespace digest plus absolute layer and head-group indices), "
                 "so any topology whose shards tile the same grid shares one "
-                "cache. Implies --hicache-mem-layout page_unified and "
-                "--hicache-io-backend kernel. Supported by the file and "
-                "mooncake backends, which store one object per chunk and "
-                "serve head- and layer-partitioned grids."
+                "cache. With HiCache, the file and Mooncake backends support "
+                "head- and layer-partitioned grids using page_unified and "
+                "kernel I/O. With the direct linker, Mooncake and Mori support "
+                "head partitioning for dense MHA KV."
             ),
             choices=["rank-suffix", "unified"],
         ),

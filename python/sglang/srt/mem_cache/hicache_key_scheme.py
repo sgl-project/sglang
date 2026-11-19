@@ -185,6 +185,15 @@ def normalize_dtype(dtype: object) -> str:
     return str(dtype).removeprefix("torch.")
 
 
+def storage_model_id(
+    model_name: str | None, dtype: str, storage_format_tag: str | None = None
+) -> str:
+    """Persisted model identity used by storage producers."""
+    return "-".join(
+        part for part in (model_name, storage_format_tag, f"dtype_{dtype}") if part
+    )
+
+
 class UnifiedKVPlan(msgspec.Struct, frozen=True, kw_only=True):
     """One rank's unified-key objects and where their bytes sit in a page.
 
