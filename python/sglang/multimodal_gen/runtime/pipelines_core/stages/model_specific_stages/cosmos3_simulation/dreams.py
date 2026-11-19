@@ -872,11 +872,13 @@ class CausalDecodeQueue:
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:
         try:
-            self.stream.synchronize()
-        finally:
             self.vae.reset_causal_decode_state()
             if exc_type is not None:
                 self.outputs.clear()
+        finally:
+            # Drain last: freeing pinned outputs records host-allocator events
+            # on this stream, so they must land before the final sync.
+            self.stream.synchronize()
 
     def _denormalize(self, latents: torch.Tensor) -> torch.Tensor:
         return denormalize_vae_latents(latents, self._mean, self._std)
@@ -1119,9 +1121,10 @@ class CosmosDreamsPrepareStage(PipelineStage):
             return None
         if self.profile is None or self.profile.history_mode != HISTORY_MODE_FULL:
             raise ValueError(
-                "Cosmos-Dreams frustum_geometry needs history_mode='full' without "
-                "kv_cache_inference_size/attention_sink_size: retrieval reads the "
-                "complete committed archive."
+                "Cosmos-Dreams frustum_geometry reads the complete committed archive: "
+                "set history_mode='full' in the pipeline config (the default 'auto' "
+                "slides when the export records a K/V window) and leave "
+                "kv_cache_inference_size/attention_sink_size unset."
             )
         if not has_image:
             raise ValueError(
@@ -1220,6 +1223,7 @@ def run_fixed_step_sde(
     seed: int,
     frame_start: int,
     dtype: torch.dtype,
+    forward_batch: Req | None = None,
     **forward_kwargs: Any,
 ) -> torch.Tensor:
     """Fixed-step SDE denoising of one chunk; history K/V is read but never written."""
@@ -1227,7 +1231,9 @@ def run_fixed_step_sde(
     scheduler.set_timesteps(sigmas=list(t_list), device=noise.device)
     latents = noise.float()
     for step_index, timestep in enumerate(scheduler.timesteps):
-        with set_forward_context(current_timestep=step_index, attn_metadata=None):
+        with set_forward_context(
+            current_timestep=step_index, attn_metadata=None, forward_batch=forward_batch
+        ):
             output = transformer(
                 latents.to(dtype),
                 timestep.reshape(1),
@@ -1276,6 +1282,7 @@ def commit_clean_kv(
     sink_frames: int,
     window_frames: int | None,
     read_history: HistoryKV | None = None,
+    forward_batch: Req | None = None,
     **forward_kwargs: Any,
 ) -> list[KVPair]:
     """Clean-refresh ``latent`` (timestep 0, no time embedding) and commit its K/V.
@@ -1283,7 +1290,9 @@ def commit_clean_kv(
     The pass attends to ``history`` unless ``read_history`` narrows it (frustum
     retrieval); the new K/V is always appended to ``history``.
     """
-    with set_forward_context(current_timestep=0, attn_metadata=None):
+    with set_forward_context(
+        current_timestep=0, attn_metadata=None, forward_batch=forward_batch
+    ):
         output = transformer(
             latent.to(dtype),
             torch.zeros(1, device=latent.device, dtype=torch.float32),
@@ -1313,6 +1322,7 @@ class _RolloutContext(msgspec.Struct):
     geometry: CosmosDreamsGeometry
     device: torch.device
     dtype: torch.dtype
+    forward_batch: Req | None = None
     row_domain_ids: torch.Tensor | None = None
 
     def chunk_domain_ids(
@@ -1430,6 +1440,7 @@ class CosmosDreamsRolloutStage(PipelineStage):
             geometry=geometry,
             device=device,
             dtype=torch.bfloat16,
+            forward_batch=batch,
             row_domain_ids=None if row_domain_ids is None else row_domain_ids.to("cpu"),
         )
         rows: torch.Tensor | None = batch.extra[EXTRA_ACTION_ROWS]
@@ -1602,6 +1613,7 @@ class CosmosDreamsRolloutStage(PipelineStage):
             seed=seed,
             frame_start=frame_start,
             dtype=context.dtype,
+            forward_batch=context.forward_batch,
             text_kv=context.text_kv,
             fps=context.fps,
             action_latents=action,
@@ -1632,6 +1644,7 @@ class CosmosDreamsRolloutStage(PipelineStage):
             sink_frames=self.profile.sink_frames,
             window_frames=self.profile.window_frames,
             read_history=read_history,
+            forward_batch=context.forward_batch,
             text_kv=context.text_kv,
             frame_start=frame_idx,
             fps=context.fps,

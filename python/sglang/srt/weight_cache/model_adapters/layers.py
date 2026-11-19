@@ -9,10 +9,12 @@ from sglang.srt.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+from sglang.srt.layers.quantization.unquant import (
+    UnquantizedEmbeddingMethod,
+    UnquantizedLinearMethod,
+)
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
-    UnquantizedEmbeddingMethod,
     VocabParallelEmbedding,
 )
 
@@ -238,7 +240,6 @@ class LayerLayoutBuilder(WeightLayoutBuilder):
             type(module) is not FusedMoE
             or type(method) is not UnquantizedFusedMoEMethod
             or not method.runner.runner_backend.is_triton()
-            or method.use_triton_kernels
             or method.use_flashinfer_trtllm_moe
             or method.use_deep_gemm
             or method.with_bias

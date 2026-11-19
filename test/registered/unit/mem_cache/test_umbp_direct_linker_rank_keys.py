@@ -19,7 +19,7 @@ from sglang.srt.mem_cache.storage.umbp.umbp_direct_linker import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestStorageSuffix(CustomTestCase):
@@ -138,6 +138,39 @@ class TestEveryRankWrites(CustomTestCase):
         self.assertFalse(linker.offload([]))
         self.assertEqual(linker._offload_results.qsize(), 0)
         self.assertEqual(linker._offload_queue.qsize(), 0)
+
+
+class TestLoadReadyEvents(CustomTestCase):
+    def test_load_thread_waits_on_every_event(self):
+        linker = UMBPDirectLinker.__new__(UMBPDirectLinker)
+        order = mock.MagicMock()
+        linker.record_transfer_ready = order.record_transfer_ready
+        order.record_transfer_ready.return_value = unified_cache_linker.TransferReady(
+            [order.indices_ready, order.forward_done]
+        )
+        linker._gc_frozen = True
+        linker._pending = {"rid": ["transfer"]}
+        linker._build_load_plans = lambda _transfers: []
+        linker.layer_done_counter = mock.MagicMock()
+        linker.layer_done_counter.update_producer.return_value = 3
+        linker._stats = {"load": 0}
+        linker._load_queue = Queue()
+        # No layer group to read, so only the waits run.
+        linker.num_layers = 0
+        linker.layer_group = 1
+        linker.pool_layers = {}
+        self.assertEqual(linker.start_layer_wise_loading(), 3)
+        linker._load_queue.put(None)
+        linker._load_thread_func()
+        self.assertEqual(
+            order.mock_calls,
+            [
+                mock.call.record_transfer_ready(),
+                mock.call.indices_ready.synchronize(),
+                mock.call.forward_done.synchronize(),
+            ],
+        )
+        linker.layer_done_counter.fail.assert_not_called()
 
 
 if __name__ == "__main__":

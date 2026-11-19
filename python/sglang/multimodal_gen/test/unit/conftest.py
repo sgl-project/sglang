@@ -127,6 +127,11 @@ def mock_cuda_platform(
             "sglang.multimodal_gen.runtime.platforms.current_platform.enable_dit_layerwise_offload_by_default",
             return_value=True,
         ),
+        # checkpoint sizing reads the local HF cache; tests that need it pass a size
+        patch(
+            "sglang.multimodal_gen.runtime.server_args.auto_tune.checkpoint_component_sizes",
+            return_value=None,
+        ),
     ):
         yield
 

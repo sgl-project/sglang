@@ -451,6 +451,34 @@ def small_model():
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_separate_checkpoint_projections_load_in_qkv_order(small_model, dtype):
+    from sglang.multimodal_gen.runtime.loader.utils import (
+        get_param_names_mapping,
+        hf_to_custom_state_dict,
+    )
+
+    model = small_model.to(dtype)
+    checkpoint = dict(model.state_dict())
+    torch.manual_seed(42)
+    inputs = torch.randn(2, 7, 64).to(dtype)
+    expected = []
+    for index in range(len(model.layers)):
+        checkpoint.pop(f"layers.{index}.proj.qkv.weight")
+        projections = []
+        for name in ("q", "k", "v"):
+            weight = torch.randn(64, 64).to(dtype)
+            checkpoint[f"layers.{index}.proj.{name}.weight"] = weight
+            projections.append(torch.nn.functional.linear(inputs, weight))
+        expected.append(torch.cat(projections, -1))
+    mapped, _ = hf_to_custom_state_dict(
+        checkpoint, get_param_names_mapping(model.param_names_mapping), strict=True
+    )
+    model.load_state_dict(mapped, strict=True, assign=True)
+    for layer, reference in zip(model.layers, expected):
+        torch.testing.assert_close(layer.proj["qkv"](inputs), reference)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_prepared_conditioning_matches_steps_and_requests(
     small_model, dtype, monkeypatch
 ):
@@ -553,8 +581,9 @@ def test_prepared_conditioning_requires_matching_latents(small_model, shape):
 
 
 @pytest.mark.parametrize("use_cfg", [False, True])
+@pytest.mark.parametrize("quality", ["exact", "lossless", "high"])
 def test_denoising_stage_prepares_actual_cfg_branches(
-    small_model, use_cfg, monkeypatch
+    small_model, use_cfg, quality, monkeypatch
 ):
     from sglang.multimodal_gen.runtime.distributed.cfg_policy import CFGPolicy
     from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.moss_image import (
@@ -563,7 +592,7 @@ def test_denoising_stage_prepares_actual_cfg_branches(
 
     batch = SimpleNamespace(
         do_classifier_free_guidance=use_cfg,
-        sampling_params=SimpleNamespace(cfg_gate_step=1.0, quality="exact"),
+        sampling_params=SimpleNamespace(cfg_gate_step=1.0, quality=quality),
     )
     latents = torch.randn(1, 8, 2, 3)
     pos = {"encoder_hidden_states": torch.randn(1, 3, 32)}
@@ -590,8 +619,12 @@ def test_denoising_stage_prepares_actual_cfg_branches(
         assert len(ctx.cfg_policy.branches) == (2 if use_cfg else 1)
         for branch in ctx.cfg_policy.branches:
             assert "prepared_conditioning" in branch.kwargs
+            assert branch.kwargs["fuse_qkv"] is (quality == "high")
             expected = small_model(
-                latents, 938.0, branch.kwargs["encoder_hidden_states"]
+                latents,
+                938.0,
+                branch.kwargs["encoder_hidden_states"],
+                fuse_qkv=quality == "high",
             )
             actual = small_model(latents, 938.0, **branch.kwargs)
             assert torch.equal(actual, expected)
@@ -723,8 +756,9 @@ def test_pipeline_residency_declares_only_components_used_by_each_stage(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("resident_layers", [0, 1])
 @pytest.mark.parametrize("skip_layers", [(), (0,), (1,), (0, 1)])
+@pytest.mark.parametrize("fuse_qkv", [False, True])
 def test_layerwise_offload_preserves_requests_and_streams(
-    small_model, resident_layers, skip_layers
+    small_model, resident_layers, skip_layers, fuse_qkv
 ):
     torch.manual_seed(0)
     model = small_model.to(device="cuda", dtype=torch.bfloat16)
@@ -735,7 +769,10 @@ def test_layerwise_offload_preserves_requests_and_streams(
         for h, w in [(2, 3), (3, 2), (2, 3)]
     ]
     with torch.inference_mode(), set_forward_context(0, None):
-        expected = [model(x, timestep, text, skip_layers=skip_layers) for x in latents]
+        expected = [
+            model(x, timestep, text, skip_layers=skip_layers, fuse_qkv=fuse_qkv)
+            for x in latents
+        ]
     model.configure_layerwise_offload(
         SimpleNamespace(
             performance_mode="manual",
@@ -770,6 +807,7 @@ def test_layerwise_offload_preserves_requests_and_streams(
                     text,
                     prepared_conditioning=prepared,
                     skip_layers=skip_layers,
+                    fuse_qkv=fuse_qkv,
                 )
                 manager.release_all()
             torch.cuda.synchronize()
@@ -1025,3 +1063,88 @@ def test_pipeline_auto_uses_supported_encoder_offload(
     if expected == "component-offload":
         assert "text_encoder" not in (args.layerwise_offload_components or [])
     assert not args.enable_torch_compile and not args.enable_cfg_parallel
+
+
+def _size_server_args(pipeline_config):
+    return SimpleNamespace(
+        model_path="OpenMOSS-Team/MOSS-Image-SFT",
+        model_id=None,
+        backend="sglang",
+        performance_mode="manual",
+        pipeline_class_name=None,
+        pipeline_config=pipeline_config,
+        output_path=None,
+        comfyui_mode=True,
+        enable_cfg_parallel=False,
+        enable_breakable_cuda_graph=False,
+        enable_torch_compile=False,
+        enable_trace=False,
+        attention_backend_config={},
+        num_gpus=1,
+        warmup_steps=1,
+        warmup_num_frames=None,
+    )
+
+
+def _build_image_sampling(server_args, fields):
+    from unittest.mock import patch
+
+    from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+    from sglang.multimodal_gen.configs.task_type import DataType
+    from sglang.multimodal_gen.runtime.entrypoints.openai import utils as openai_utils
+
+    with (
+        patch.object(openai_utils, "get_global_server_args", return_value=server_args),
+        patch.object(
+            SamplingParams, "from_pretrained", return_value=MOSSImageSamplingParams()
+        ),
+    ):
+        return openai_utils.build_sampling_params(
+            "size",
+            prompt="a cat",
+            request_data_type=DataType.IMAGE,
+            num_frames=1,
+            **fields,
+        )
+
+
+@pytest.mark.parametrize(
+    "fields,expected",
+    [
+        ({"size": "1920x1080"}, (1920, 1072)),
+        ({"size": "854x480"}, (848, 480)),
+        ({"size": "1000x1000"}, (992, 992)),
+        ({"width": 1080, "height": 1920}, (1072, 1920)),
+        ({"size": "1280x720"}, (1280, 720)),
+        ({"size": "1024x1024"}, (1024, 1024)),
+    ],
+)
+def test_http_size_aligns_to_the_patch_grid(fields, expected):
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages import (
+        moss_image,
+    )
+
+    server_args = _size_server_args(MOSSImagePipelineConfig())
+    sampling = _build_image_sampling(server_args, fields)
+    assert (sampling.width, sampling.height) == expected
+    batch = Req(sampling_params=sampling)
+    moss_image.MOSSImageBeforeDenoisingStage._validate_request(batch, server_args)
+
+
+def test_warmup_resolution_aligns_to_the_patch_grid():
+    from unittest.mock import patch
+
+    from sglang.multimodal_gen.runtime.warmup_request_builder import build_warmup_reqs
+
+    server_args = _size_server_args(MOSSImagePipelineConfig())
+    with patch(
+        "sglang.multimodal_gen.runtime.warmup_request_builder.get_model_sampling_defaults",
+        return_value=MOSSImageSamplingParams(),
+    ):
+        reqs = build_warmup_reqs(
+            server_args,
+            warmup_resolutions=["1920x1080"],
+            warmup_input_path=None,
+            server_based_warmup=True,
+        )
+    assert [(r.width, r.height) for r in reqs] == [(1920, 1072)]

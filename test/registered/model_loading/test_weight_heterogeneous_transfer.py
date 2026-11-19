@@ -8,13 +8,14 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
+
 from sglang.srt.weight_cache.daemon import (
     WeightCacheDaemon,
     WeightCacheDaemonArgs,
     _prepare_weight_heterogeneous_transfer,
     launch_weight_cache_daemons,
 )
-from sglang.srt.weight_cache.ipc_loader import IpcModelLoader
+from sglang.srt.weight_cache.ipc_loader import WeightCacheModelLoader
 from sglang.srt.weight_cache.protocol import get_ready_path, get_socket_path
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -46,6 +47,7 @@ def _daemon_server_args(**overrides):
         "node_rank": 0,
         "base_gpu_id": 0,
         "gpu_id_step": 1,
+        "weight_cache_transport": "auto",
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -166,7 +168,7 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
                 "is_plain_tensor": True,
             },
         }
-        loader = IpcModelLoader.__new__(IpcModelLoader)
+        loader = WeightCacheModelLoader.__new__(WeightCacheModelLoader)
         loader.load_config = None
         loader._transport_backend = SimpleNamespace(import_tensor=lambda e: e["tensor"])
         with patch(
@@ -216,11 +218,9 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
             }
 
         backend.prepare_export.side_effect = prepare_export
-        with patch(
-            "sglang.srt.weight_cache.daemon.choose_daemon_transport_backend",
-            return_value=backend,
-        ):
-            daemon._export_state()
+        daemon.transport_name = "torch_ipc"
+        daemon.transport_backend = backend
+        daemon._export_state()
 
         exported, is_param = captured["layer.w_kc"]
         self.assertFalse(is_param)
@@ -233,14 +233,18 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
 
         client = Model(None)
         imported = torch.full(derived.shape, 7, dtype=derived.dtype)
-        IpcModelLoader._set_plain_module_tensor(client, "layer.w_kc", imported)
+        WeightCacheModelLoader._set_plain_module_tensor(client, "layer.w_kc", imported)
         self.assertIs(client.layer.w_kc, imported)
         self.assertNotIn("w_kc", client.layer._parameters)
         self.assertNotIn("w_kc", client.layer._buffers)
         imported_scale = torch.tensor(3.0)
-        IpcModelLoader._set_plain_module_tensor(client, "layer.w_scale", imported_scale)
+        WeightCacheModelLoader._set_plain_module_tensor(
+            client, "layer.w_scale", imported_scale
+        )
         self.assertIs(client.layer.w_scale, imported_scale)
-        IpcModelLoader._set_plain_module_value(client, "layer.use_deep_gemm_bmm", True)
+        WeightCacheModelLoader._set_plain_module_value(
+            client, "layer.use_deep_gemm_bmm", True
+        )
         self.assertTrue(client.layer.use_deep_gemm_bmm)
 
     def test_state_compare_checks_plain_derived_values(self):
@@ -337,6 +341,28 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
             with self.subTest(kwargs=kwargs):
                 with self.assertRaisesRegex(ValueError, error):
                     WeightCacheDaemonArgs(**kwargs)
+
+    def test_reshard_rejects_vmm_repacking_before_device_initialization(self):
+        for mode in ("source", "target"):
+            with (
+                self.subTest(mode=mode),
+                patch(
+                    "sglang.srt.weight_cache.daemon.current_platform.get_device_uuid"
+                ) as device_uuid,
+                self.assertRaisesRegex(ValueError, "requires.*torch_ipc.*vmm_fd"),
+            ):
+                WeightCacheDaemon(
+                    server_args=_daemon_server_args(weight_cache_transport="vmm_fd"),
+                    gpu_id=0,
+                    tp_rank=0,
+                    pp_rank=0,
+                    daemon_args=WeightCacheDaemonArgs(
+                        weight_heterogeneous_transfer_mode=mode,
+                        weight_heterogeneous_transfer_host="source",
+                        weight_heterogeneous_transfer_registry_url="tcp://source:1234",
+                    ),
+                )
+            device_uuid.assert_not_called()
 
     def test_weight_heterogeneous_transfer_cli_args(self):
         parser = argparse.ArgumentParser()

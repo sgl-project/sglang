@@ -24,6 +24,7 @@ def _direct_gate_expand_kernel(
     gate_b_ptr,  # [S, E, 2I, R]
     topk_ids_ptr,  # [M, topk]
     token_lora_mapping_ptr,  # [M]
+    adapter_enabled_ptr,
     output_ptr,  # [M, topk, 2I]
     stride_as,
     stride_am,
@@ -34,11 +35,13 @@ def _direct_gate_expand_kernel(
     stride_br,
     stride_oq,
     stride_on,
+    stride_enabled,
     ROUTER_TOPK: tl.constexpr,
     INTERMEDIATE_SIZE: tl.constexpr,
     RANK: tl.constexpr,
     GATE_WIDTH: tl.constexpr,
     NUM_SLOTS: tl.constexpr,
+    HAS_ADAPTER_ENABLED: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
@@ -48,6 +51,15 @@ def _direct_gate_expand_kernel(
     token = route // ROUTER_TOPK
     slot = tl.load(token_lora_mapping_ptr + token).to(tl.int64)
     active = (slot >= 0) & (slot < NUM_SLOTS) & (expert >= 0)
+    if HAS_ADAPTER_ENABLED:
+        active = active & (
+            tl.load(
+                adapter_enabled_ptr + slot * stride_enabled,
+                mask=(slot >= 0) & (slot < NUM_SLOTS),
+                other=0,
+            )
+            != 0
+        )
     expert = tl.maximum(expert, 0)
     offs_m = tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -91,6 +103,7 @@ def _direct_down_shrink_kernel(
     down_a_ptr,  # [S, E, R, I]
     topk_ids_ptr,  # [M, topk]
     token_lora_mapping_ptr,  # [M]
+    adapter_enabled_ptr,
     output_ptr,  # [M, topk, R]
     stride_xq,
     stride_xk,
@@ -100,10 +113,12 @@ def _direct_down_shrink_kernel(
     stride_ak,
     stride_oq,
     stride_or,
+    stride_enabled,
     ROUTER_TOPK: tl.constexpr,
     INTERMEDIATE_SIZE: tl.constexpr,
     RANK: tl.constexpr,
     NUM_SLOTS: tl.constexpr,
+    HAS_ADAPTER_ENABLED: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
@@ -112,6 +127,15 @@ def _direct_down_shrink_kernel(
     token = route // ROUTER_TOPK
     slot = tl.load(token_lora_mapping_ptr + token).to(tl.int64)
     active = (slot >= 0) & (slot < NUM_SLOTS) & (expert >= 0)
+    if HAS_ADAPTER_ENABLED:
+        active = active & (
+            tl.load(
+                adapter_enabled_ptr + slot * stride_enabled,
+                mask=(slot >= 0) & (slot < NUM_SLOTS),
+                other=0,
+            )
+            != 0
+        )
     expert = tl.maximum(expert, 0)
     offs_m = tl.arange(0, BLOCK_M)
     offs_r = tl.arange(0, RANK)
@@ -153,6 +177,8 @@ def direct_decode_gate_expand(
     topk_ids: torch.Tensor,
     token_lora_mapping: torch.Tensor,
     output: torch.Tensor,
+    *,
+    adapter_enabled: torch.Tensor | None = None,
 ) -> None:
     """Expand shared gate/up rank vectors through directly selected experts.
 
@@ -163,6 +189,10 @@ def direct_decode_gate_expand(
     """
 
     num_tokens = topk_ids.shape[0]
+    if adapter_enabled is not None:
+        assert adapter_enabled.shape == (gate_b.shape[0],)
+        assert adapter_enabled.device == topk_ids.device
+        assert adapter_enabled.dtype in (torch.bool, torch.int32, torch.int64)
     if shared_intermediate.ndim == 2:
         shared_slot_stride = 0
         shared_token_stride = shared_intermediate.stride(0)
@@ -180,6 +210,7 @@ def direct_decode_gate_expand(
         gate_b,
         topk_ids,
         token_lora_mapping,
+        adapter_enabled,
         output_flat,
         shared_slot_stride,
         shared_token_stride,
@@ -190,11 +221,13 @@ def direct_decode_gate_expand(
         gate_b.stride(3),
         output_flat.stride(0),
         output_flat.stride(1),
+        adapter_enabled.stride(0) if adapter_enabled is not None else 0,
         ROUTER_TOPK=ROUTER_TOPK,
         INTERMEDIATE_SIZE=intermediate_size,
         RANK=RANK,
         GATE_WIDTH=gate_width,
         NUM_SLOTS=gate_b.shape[0],
+        HAS_ADAPTER_ENABLED=adapter_enabled is not None,
         BLOCK_M=_BLOCK_M,
         BLOCK_N=_GATE_BLOCK_N,
         num_warps=4,
@@ -208,6 +241,8 @@ def direct_decode_down_shrink(
     topk_ids: torch.Tensor,
     token_lora_mapping: torch.Tensor,
     output: torch.Tensor,
+    *,
+    adapter_enabled: torch.Tensor | None = None,
 ) -> None:
     """Shrink directly routed activations through per-expert LoRA-A.
 
@@ -216,6 +251,10 @@ def direct_decode_down_shrink(
     """
 
     num_tokens = topk_ids.shape[0]
+    if adapter_enabled is not None:
+        assert adapter_enabled.shape == (down_a.shape[0],)
+        assert adapter_enabled.device == topk_ids.device
+        assert adapter_enabled.dtype in (torch.bool, torch.int32, torch.int64)
     intermediate_size = activation.shape[1]
     output_flat = output.view(num_tokens * ROUTER_TOPK, RANK)
     num_routes = topk_ids.numel()
@@ -224,6 +263,7 @@ def direct_decode_down_shrink(
         down_a,
         topk_ids,
         token_lora_mapping,
+        adapter_enabled,
         output_flat,
         activation.stride(0),
         activation.stride(1),
@@ -233,10 +273,12 @@ def direct_decode_down_shrink(
         down_a.stride(3),
         output_flat.stride(0),
         output_flat.stride(1),
+        adapter_enabled.stride(0) if adapter_enabled is not None else 0,
         ROUTER_TOPK=ROUTER_TOPK,
         INTERMEDIATE_SIZE=intermediate_size,
         RANK=RANK,
         NUM_SLOTS=down_a.shape[0],
+        HAS_ADAPTER_ENABLED=adapter_enabled is not None,
         BLOCK_M=_BLOCK_M,
         BLOCK_K=_DOWN_BLOCK_K,
         num_warps=4,

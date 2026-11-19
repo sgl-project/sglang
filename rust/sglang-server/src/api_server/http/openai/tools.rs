@@ -16,8 +16,8 @@
 //! [`chat_finish_reason`] maps the scheduler's finish reason onto the OpenAI
 //! wire values.
 
-use dynamo_parsers::{ToolChoice as DynamoToolChoice, ToolDefinition};
-use dynamo_protocols::types::{
+use sglang_processor::dynamo_parsers::{ToolChoice as DynamoToolChoice, ToolDefinition};
+use sglang_processor::dynamo_protocols::types::{
     ChatCompletionMessageContent, ChatCompletionMessageToolCall,
     ChatCompletionMessageToolCallChunk, ChatCompletionStreamResponseDelta,
     FinishReason as OpenAIFinishReason, FunctionCall, FunctionType, Role,
@@ -72,7 +72,7 @@ pub(super) fn chat_delta(
 /// the content passes through untouched. With a parser, a successful parse
 /// returns the leftover non-tool text and the calls; `parallel_tool_calls`
 /// false truncates the batch to the first call, mirroring Python.
-pub(super) async fn parse_chat_tool_calls(
+pub(crate) async fn parse_chat_tool_calls(
     content: String,
     parser: Option<&str>,
     tools: Option<&[ToolDefinition]>,
@@ -110,7 +110,7 @@ pub(super) async fn parse_chat_tool_calls(
 /// Map the scheduler's finish kind onto the OpenAI wire values. Length and
 /// content-filter keep their names; everything else (including a bare abort)
 /// reports as `stop`, matching Python's fallback.
-pub(super) fn chat_finish_reason(output: &CoreOutput) -> Option<OpenAIFinishReason> {
+pub(crate) fn chat_finish_reason(output: &CoreOutput) -> Option<OpenAIFinishReason> {
     let kind = output
         .finish_reason
         .as_ref()
@@ -126,14 +126,16 @@ pub(super) fn chat_finish_reason(output: &CoreOutput) -> Option<OpenAIFinishReas
 mod tests {
     use super::{chat_delta, chat_finish_reason, parse_chat_tool_calls};
     use crate::api_server::core::CoreOutput;
-    use dynamo_parsers::tool_calling::jail::{Annotated, apply_tool_calling_jail};
-    use dynamo_protocols::types::CreateChatCompletionStreamResponse as StreamResponse;
-    use dynamo_protocols::types::{
+    use futures::{StreamExt, stream};
+    use sglang_processor::dynamo_parsers::tool_calling::jail::{
+        Annotated, apply_tool_calling_jail,
+    };
+    use sglang_processor::dynamo_protocols::types::CreateChatCompletionStreamResponse as StreamResponse;
+    use sglang_processor::dynamo_protocols::types::{
         ChatChoiceStream, ChatCompletionMessageContent, ChatCompletionMessageToolCallChunk,
         ChatCompletionToolChoiceOption, FinishReason as OpenAIFinishReason, FunctionCallStream,
         FunctionType, Role,
     };
-    use futures::{StreamExt, stream};
 
     fn stream_item(text: &str, finish: Option<OpenAIFinishReason>) -> Annotated<StreamResponse> {
         Annotated {

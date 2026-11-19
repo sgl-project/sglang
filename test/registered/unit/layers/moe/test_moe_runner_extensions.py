@@ -32,7 +32,7 @@ from sglang.srt.lora.layers import FusedMoEWithLoRA
 from sglang.srt.runtime_context import get_context, get_flags, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=15, suite="stage-b-test-cpu-intel")
+register_cpu_ci(est_time=15, suite="extra-test-cpu-intel")
 
 
 class _TestDispatchRunnerCore(DispatchMoeRunnerCore):
@@ -203,7 +203,7 @@ def test_lora_uses_quant_method_contract_for_registered_backend(
     base_layer.moe_tp_rank = 0
     base_layer.intermediate_size_per_partition = 8
     base_layer.runner = SimpleNamespace(runner_backend=backend)
-    lora_backend = SimpleNamespace(is_moe_lora=False)
+    lora_backend = SimpleNamespace(name="triton", is_moe_lora=False)
     created_runners = []
     monkeypatch.setattr(
         runner_module,

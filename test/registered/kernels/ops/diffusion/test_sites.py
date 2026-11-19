@@ -22,6 +22,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+import torch._dynamo.testing
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -29,6 +30,7 @@ import sglang.kernels.ops.diffusion.sites.fused_gate_rmsnorm_site as gate_rmsnor
 import sglang.kernels.ops.diffusion.sites.fused_linear_gelu_site as linear_gelu
 import sglang.kernels.ops.diffusion.sites.lingbot_video_rmsnorm_site as lingbot_video_rmsnorm
 import sglang.kernels.ops.diffusion.sites.qwen_image_added_qkv_site as qwen_image_added_qkv
+import sglang.kernels.ops.diffusion.sites.sana_video2_softmax_attention_site as sana_video2_softmax_attention
 import sglang.kernels.ops.diffusion.sites.sana_video_linear_attention_site as sana_video_linear_attention
 from sglang.kernels.ops.diffusion import (
     FLUX2_NVFP4_SWIGLU_QUANT,
@@ -503,6 +505,33 @@ def test_mounted_gelu_site_compiles_fullgraph():
     )
 
 
+class _GeluBlock(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.ff = _GeluSite()
+        self.audio_ff = _GeluSite()
+
+    def forward(self, x):
+        return self.ff(x) + self.audio_ff(x)
+
+
+@requires_cuda
+@torch.no_grad()
+def test_mounted_gelu_sites_compile_one_frame_across_linears():
+    # DiT blocks share one compiled forward; a new linear must not recompile it
+    torch._dynamo.reset()
+    blocks = nn.ModuleList(_GeluBlock() for _ in range(12))
+    assert linear_gelu.FUSED_LINEAR_GELU.mount(blocks)
+    counter = torch._dynamo.testing.CompileCounter()
+    for block in blocks:
+        block.compile(backend=counter)
+    x = torch.randn(16, 64, device="cuda", dtype=torch.bfloat16)
+    for _ in range(2):
+        for block in blocks:
+            block(x)
+    assert counter.frame_count == 1
+
+
 @requires_cuda
 @torch.no_grad()
 def test_sana_video_linear_attention_quality_path_and_guards():
@@ -544,6 +573,45 @@ def test_sana_video_linear_attention_quality_path_and_guards():
     )
     sana_video_linear_attention.SANA_VIDEO_LINEAR_ATTENTION.unmount(site)
     assert not sana_video_linear_attention.SANA_VIDEO_LINEAR_ATTENTION.is_enabled(site)
+
+
+@requires_cuda
+@torch.no_grad()
+def test_sana_video2_softmax_attention_quality_path_and_guards():
+    torch.manual_seed(0)
+    site = nn.Module()
+    sana_video2_softmax_attention.SANA_VIDEO2_SOFTMAX_ATTENTION.mark(site)
+    shape = (2, 4, 64, 32)
+    query = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
+    key = torch.randn_like(query)
+    value = torch.randn_like(query)
+
+    assert (
+        sana_video2_softmax_attention.try_sana_video2_softmax_attention(
+            site, query, key, value
+        )
+        is None
+    )
+    assert sana_video2_softmax_attention.SANA_VIDEO2_SOFTMAX_ATTENTION.mount(site)
+    output = sana_video2_softmax_attention.try_sana_video2_softmax_attention(
+        site, query, key, value
+    )
+    assert output.dtype == torch.bfloat16
+    reference = F.scaled_dot_product_attention(
+        query.float(), key.float(), value.float()
+    )
+    torch.testing.assert_close(output.float(), reference, atol=2e-2, rtol=2e-2)
+
+    assert (
+        sana_video2_softmax_attention.try_sana_video2_softmax_attention(
+            site, query.float(), key.float(), value.float()
+        )
+        is None
+    )
+    sana_video2_softmax_attention.SANA_VIDEO2_SOFTMAX_ATTENTION.unmount(site)
+    assert not sana_video2_softmax_attention.SANA_VIDEO2_SOFTMAX_ATTENTION.is_enabled(
+        site
+    )
 
 
 @requires_cuda

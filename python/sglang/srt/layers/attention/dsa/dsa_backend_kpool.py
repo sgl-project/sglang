@@ -21,7 +21,8 @@ if TYPE_CHECKING:
     )
     from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
     from sglang.srt.layers.attention.dsa_backend import _DSA_IMPL_T, DSAMetadata
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.model_executor.forward_mode import ForwardMode
 
 
 @dataclass

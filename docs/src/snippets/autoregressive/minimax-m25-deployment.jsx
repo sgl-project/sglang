@@ -19,7 +19,8 @@ export const MiniMaxM25Deployment = () => {
         { id: 'mi325x', label: 'MI325X', default: false },
         { id: 'mi355x', label: 'MI355X', default: false },
         { id: 'a2', label: 'Ascend A2', description: '8 × 910B4 / 32 GiB per device. The fixed single-request configuration is smoke tested.', default: false },
-        { id: 'a3', label: 'Ascend A3', description: '8 cards / 16 dies · W8A8 + EAGLE3. Reference configuration only; A3 hardware validation is pending.', default: false }
+        { id: 'a3', label: 'Ascend A3', description: '8 cards / 16 dies · W8A8 + EAGLE3. Reference configuration only; A3 hardware validation is pending.', default: false },
+        { id: 'xeon', label: 'XEON', default: false }
       ]
     },
     gpuCount: {
@@ -34,6 +35,9 @@ export const MiniMaxM25Deployment = () => {
           { id: '8gpu', label: '8', disabled: true }
         ];
         const isAMD = values.hardware === 'mi300x' || values.hardware === 'mi325x' || values.hardware === 'mi355x';
+        if (values.hardware === 'xeon') {
+          return [{ id: 'tp6', label: 'TP=6', default: true, disabled: true }];
+        }
         return [
           {
             id: '2gpu',
@@ -154,7 +158,7 @@ export const MiniMaxM25Deployment = () => {
         '    --context-length 4096 --max-running-requests 1',
         '    --chunked-prefill-size 128 --max-prefill-tokens 4096',
         '    --mem-fraction-static 0.96 --max-total-tokens 4096',
-        '    --disable-cuda-graph --disable-radix-cache'
+        '    --disable-decode-cuda-graph --disable-prefill-cuda-graph --disable-radix-cache'
       ];
       return environment.join('\n') + '\n' + launch.join(' \\\n');
     }
@@ -201,8 +205,7 @@ export const MiniMaxM25Deployment = () => {
         '    --model-path "$MODEL_PATH"',
         '    --host 127.0.0.1 --port 6688',
         '    --tp-size 16',
-        '    --enable-dp-attention',
-        '    --dp-size 16',
+        '    --attn-dp-size 16',
         '    --mem-fraction-static 0.75',
         '    --max-running-requests 320',
         '    --disable-radix-cache',
@@ -229,6 +232,7 @@ export const MiniMaxM25Deployment = () => {
     }
 
     const isAMD = hardware === 'mi300x' || hardware === 'mi325x' || hardware === 'mi355x';
+    const isXeon = hardware === 'xeon';
     if (gpuCount === '2gpu' && !isAMD) {
       return '# Please select compatible hardware\n# 2-GPU requires AMD MI300X/MI325X/MI355X';
     }
@@ -245,7 +249,10 @@ export const MiniMaxM25Deployment = () => {
     cmd += 'python -m sglang.launch_server \\\n';
     cmd += `  --model-path ${modelName}`;
 
-    if (gpuCount === '8gpu') {
+    if (isXeon) {
+      cmd += ` \\\n  --device cpu \\\n  --disable-overlap-schedule`;
+      cmd += ` \\\n  --tp 6`;
+    } else if (gpuCount === '8gpu') {
       cmd += ` \\\n  --tp 8`;
       cmd += ` \\\n  --ep 8`;
     } else if (gpuCount === '4gpu') {
@@ -271,6 +278,10 @@ export const MiniMaxM25Deployment = () => {
     cmd += ` \\\n  --trust-remote-code`;
     cmd += ` \\\n  --mem-fraction-static 0.85`;
 
+    if (isXeon) {
+      cmd += ` \\\n  --dtype bfloat16`;
+    }
+
     if (isBlackwell) {
       cmd += ` \\\n  --moe-runner-backend flashinfer_trtllm_routed`;
       cmd += ` \\\n  --fp8-gemm-backend flashinfer_trtllm`;
@@ -278,7 +289,7 @@ export const MiniMaxM25Deployment = () => {
     }
 
     if (useAllreduceFusion) {
-      cmd += ` \\\n  --enable-flashinfer-allreduce-fusion`;
+      cmd += ` \\\n  --flashinfer-allreduce-fusion-backend auto`;
     }
 
     if (isAMD) {
@@ -327,11 +338,12 @@ export const MiniMaxM25Deployment = () => {
 
   const getUpdatedValues = (previous, optionName, value) => {
     if (isAscend(previous) && ['gpuCount', 'thinking', 'toolcall'].includes(optionName)) return previous;
+    if (previous.hardware === 'xeon' && optionName === 'gpuCount') return previous;
     const next = { ...previous, [optionName]: value };
     if (optionName === 'hardware' && value !== 'a3' && value !== 'a2') {
       const items = options.gpuCount.getDynamicItems(next);
       if (!items.some((item) => item.id === next.gpuCount && !item.disabled)) {
-        next.gpuCount = items.find((item) => item.default && !item.disabled).id;
+        next.gpuCount = (items.find((item) => item.default && !item.disabled) || items[0]).id;
       }
     }
     return next;

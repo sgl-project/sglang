@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
+
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -130,6 +131,7 @@ class TestWeightLayout(unittest.TestCase):
 
     def test_moe_helper_matches_native_expert_loader(self):
         from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+        from sglang.srt.layers.moe.utils import MoeRunnerBackend
         from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 
         # Allocate small CPU weights using the actual native classes and loader.
@@ -140,23 +142,17 @@ class TestWeightLayout(unittest.TestCase):
                     with self.subTest(ep_size=ep_size, tp_size=tp_size, ep=ep, tp=tp):
                         module = FusedMoE.__new__(FusedMoE)
                         torch.nn.Module.__init__(module)
-                        method = UnquantizedFusedMoEMethod.__new__(
-                            UnquantizedFusedMoEMethod
-                        )
-                        torch.nn.Module.__init__(method)
-                        for name in (
-                            "use_triton_kernels",
-                            "use_flashinfer_trtllm_moe",
-                            "use_deep_gemm",
-                            "with_bias",
-                            "w13_swiglu_interleaved",
+                        with patch(
+                            "sglang.srt.layers.quantization.unquant.get_moe_runner_backend",
+                            return_value=MoeRunnerBackend.TRITON,
                         ):
-                            setattr(method, name, False)
+                            method = UnquantizedFusedMoEMethod()
                         method.runner = SimpleNamespace(
-                            runner_backend=SimpleNamespace(is_triton=lambda: True)
+                            runner_backend=MoeRunnerBackend.TRITON
                         )
                         module.quant_method = method
                         module.quant_config = None
+                        module.uses_expert_location = True
                         module.num_fused_shared_experts = 0
                         module._has_fused_shared = False
                         module._num_global_routed = 4
@@ -167,7 +163,7 @@ class TestWeightLayout(unittest.TestCase):
                         module.moe_tp_rank, module.moe_tp_size = tp, tp_size
                         module.hidden_size = 4
                         module.intermediate_size_per_partition = 8 // tp_size
-                        module.use_triton_kernels = module.use_flashinfer_trtllm_moe = (
+                        module.use_flashinfer_trtllm_moe = (
                             module.use_presharded_weights
                         ) = False
                         module.moe_runner_config = SimpleNamespace(is_gated=True)
