@@ -147,11 +147,11 @@ def dcp_use_gathered_prefill(
     extend_num_tokens: int,
     gathered_heads: int,
     crossover: float,
+    dcp_size: int,
 ) -> bool:
     """Whether this DCP prefill gathers the cached prefix instead of the query.
     The gather reads position p from rank p % W, so prefixes must be page-whole."""
-    w = get_parallel().dcp_group.world_size
-    if any(p % w for p in extend_prefix_lens_cpu):
+    if any(p % dcp_size for p in extend_prefix_lens_cpu):
         return False
     prefix = sum(extend_prefix_lens_cpu)
     return prefix < crossover * gathered_heads * extend_num_tokens

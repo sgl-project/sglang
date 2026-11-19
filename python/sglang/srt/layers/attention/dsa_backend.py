@@ -2006,6 +2006,7 @@ class DeepseekSparseAttnBackend(
                 forward_batch.extend_num_tokens,
                 self.num_dcp_q_heads,
                 self.dcp_gathered_prefill_crossover,
+                self.attn_dcp_size,
             )
         ):
             return None
