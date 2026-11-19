@@ -142,6 +142,9 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         _storage=None,
         forward_stream=None,
     ):
+        extra_config = dict(extra_config or {})
+        if extra_config.pop("load_mode", "layer_wise") != "layer_wise":
+            raise ValueError("UMBP linker does not implement prefetch loading.")
         self.forward_stream = forward_stream
         self.page_size = params.page_size
         # Group layers to amortize per-object RPC overhead; 8 is the measured default.
@@ -195,7 +198,6 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             raise ValueError(
                 f"UMBP pool mappings contain out-of-range logical layers: {invalid_layers}."
             )
-        extra_config = dict(extra_config or {})
         standalone_requested = bool(
             extra_config.get("standalone_address")
             or os.getenv("UMBP_STANDALONE_ADDRESS")
@@ -317,7 +319,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                 attn_cp_rank=params.attn_cp_rank,
                 pp_rank=params.pp_rank,
             )
-            self.storage.mla_suffix = rank_suffix
+            self.storage.kv_rank_suffix = rank_suffix
             self.storage.mha_suffix = rank_suffix
             self._register_buffers()
             # Report the mode rather than asserting it in the text: the line is
@@ -474,6 +476,9 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                 len(valid_pages),
             )
         return valid_pages
+
+    def prefetch(self, transfers: list[PoolTransfer]) -> None:
+        return None
 
     def load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
         # Lookup establishes a restorable boundary before insert de-duplicates

@@ -111,7 +111,7 @@ def _page_row_device_pool_info(pool, pool_name) -> DevicePoolInfo:
     return DevicePoolInfo(
         pool_name=pool_name,
         indices_from_pool=PoolName.KV,
-        layer_ids=tuple(range(pool.start_layer, pool.start_layer + pool.layer_num)),
+        layer_ids=pool.model_layer_ids,
         buffer_info=PageRowBufferInfo(
             slab=pool.slab,
             rows=tuple(pool.rows),
@@ -167,6 +167,9 @@ class MiniMaxM3Nvfp4IndexKPool(KVCache):
             start_layer,
             end_layer,
             allocation_label=f"MiniMax {msa_name} index",
+        )
+        self.model_layer_ids = tuple(
+            range(self.start_layer, self.start_layer + self.layer_num)
         )
         self.source_dtype = dtype
         self.head_num = head_num
@@ -388,6 +391,9 @@ class MiniMaxM3Nvfp4MainKVPool(KVCache):
             start_layer,
             end_layer,
             allocation_label="MiniMax MSA-v1 main NVFP4",
+        )
+        self.model_layer_ids = tuple(
+            range(self.start_layer, self.start_layer + self.layer_num)
         )
         self.source_dtype = dtype
         self.head_num = head_num

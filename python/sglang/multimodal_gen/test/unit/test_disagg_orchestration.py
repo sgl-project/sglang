@@ -2,14 +2,18 @@
 """Exercise the real head's transfer protocol with lightweight worker peers."""
 
 import base64
+import errno
 import json
 import pickle
+import socket as tcp_socket
 import time
 
 import pytest
 import torch
 import zmq
 
+from sglang.multimodal_gen.configs.sample.wan import WanT2V_1_3B_SamplingParams
+from sglang.multimodal_gen.runtime.disaggregation import orchestrator
 from sglang.multimodal_gen.runtime.disaggregation.orchestrator import DiffusionServer
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.disaggregation.transport.codec import (
@@ -30,6 +34,7 @@ from sglang.multimodal_gen.runtime.pipelines_core import Req
     [
         None,
         "pickle",
+        "unsafe_pickle",
         "empty",
         "batch",
         "invalid_id",
@@ -39,9 +44,12 @@ from sglang.multimodal_gen.runtime.pipelines_core import Req
         "unidentified",
         "role_error",
         "audio",
+        "startup_port",
     ],
 )
-def test_pipeline_transfer_and_slot_reuse(tmp_path, split, preallocated, fault):
+def test_pipeline_transfer_and_slot_reuse(
+    tmp_path, monkeypatch, split, preallocated, fault
+):
     """Every hop reaches its owner; repeated requests and errors return capacity."""
     context = zmq.Context()
     sockets = []
@@ -70,6 +78,7 @@ def test_pipeline_transfer_and_slot_reuse(tmp_path, split, preallocated, fault):
     for holder in holders:
         holder.close()
     server = DiffusionServer(
+        sampling_params_cls=WanT2V_1_3B_SamplingParams,
         frontend_endpoint=frontend,
         encoder_work_endpoints=[] if split else [endpoints[RoleType.ENCODER]],
         denoiser_work_endpoints=[endpoints[RoleType.DENOISER]],
@@ -86,6 +95,27 @@ def test_pipeline_transfer_and_slot_reuse(tmp_path, split, preallocated, fault):
         prompt_encoder_result_endpoint=results[3],
         image_encoder_result_endpoint=results[4],
     )
+    competing_connections = []
+    if fault == "startup_port":
+        original_get_socket = orchestrator.get_zmq_socket
+
+        def connect_with_competing_source_port(*args, **kwargs):
+            if not kwargs["bind"] and not competing_connections:
+                connection = tcp_socket.socket()
+                try:
+                    connection.bind(("127.0.0.1", int(results[2].rsplit(":", 1)[1])))
+                except OSError as error:
+                    connection.close()
+                    if error.errno != errno.EADDRINUSE:
+                        raise
+                else:
+                    connection.connect(("127.0.0.1", int(args[2].rsplit(":", 1)[1])))
+                    competing_connections.append(connection)
+            return original_get_socket(*args, **kwargs)
+
+        monkeypatch.setattr(
+            orchestrator, "get_zmq_socket", connect_with_competing_source_port
+        )
     try:
         server.start()
         assert server.wait_ready(5)
@@ -114,7 +144,7 @@ def test_pipeline_transfer_and_slot_reuse(tmp_path, split, preallocated, fault):
             time.sleep(0.01)
         client = socket(zmq.REQ)
         client.connect(frontend)
-        if fault in ("pickle", "empty", "batch", "invalid_id"):
+        if fault in ("pickle", "unsafe_pickle", "empty", "batch", "invalid_id"):
             payload = (
                 b"invalid pickle"
                 if fault == "pickle"
@@ -128,8 +158,13 @@ def test_pipeline_transfer_and_slot_reuse(tmp_path, split, preallocated, fault):
                 invalid = Req(request_id="invalid")
                 invalid.request_id = []
                 payload = pickle.dumps([invalid])
+            if fault == "unsafe_pickle":
+                payload = pickle.dumps(eval)
             client.send(payload)
-            assert client.recv_pyobj().error
+            error = client.recv_pyobj().error
+            assert error
+            if fault == "unsafe_pickle":
+                assert "Blocked unsafe global" in error
             assert server._thread.is_alive()
         reference = tmp_path / "head-only.png"
         reference.write_bytes(b"head-local image upload")
@@ -137,7 +172,14 @@ def test_pipeline_transfer_and_slot_reuse(tmp_path, split, preallocated, fault):
             request_id = str(iteration)
             image_path = [str(reference)] if iteration else None
             client.send_pyobj(
-                [Req(request_id=request_id, prompt="test", image_path=image_path)]
+                [
+                    Req(
+                        sampling_params=WanT2V_1_3B_SamplingParams(),
+                        request_id=request_id,
+                        prompt="test",
+                        image_path=image_path,
+                    )
+                ]
             )
             req = pickle.loads(work[roles[0]].recv_multipart()[-1])[0]
             if fault == "duplicate" and iteration == 0:
@@ -293,6 +335,8 @@ def test_pipeline_transfer_and_slot_reuse(tmp_path, split, preallocated, fault):
                 )
     finally:
         server.stop()
+        for connection in competing_connections:
+            connection.close()
         for sock in sockets:
             sock.close(linger=0)
         context.destroy(linger=0)

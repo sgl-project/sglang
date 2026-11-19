@@ -1,20 +1,19 @@
 """Tests for the DeepSeek-V4 decode ``wo_a`` bf16 batched-matmul routing.
 
-Covers ``deepseek_v4._apply_wo_a_bf16_matmul``, which (opt-in via
-``SGLANG_OPT_USE_AITER_BATCHED_GEMM`` on supported HIP architectures) routes the
+Covers ``deepseek_v4._apply_wo_a_bf16_matmul``, which on HIP gfx95/gfx1250 routes the
 MLA output-absorb bf16 GEMM off the rocBLAS/Tensile ``Cijk_*`` batched GEMM onto
 aiter's tuned ``batched_gemm_bf16``, with an einsum fallback.
 
-The opt-in flag and the aiter kernel are resolved ONCE at module import
+The eligibility and the aiter kernel are resolved ONCE at module import
 (``_wo_a_aiter_gemm_eligible`` -> ``_wo_a_aiter_batched_gemm_enabled`` and the
 pre-imported ``_wo_a_batched_gemm_bf16``) so the decode critical path pays no
-``EnvBool.get()`` or function-local import per token. The tests therefore drive
-those cached module globals directly.
+function-local import per token. The tests therefore drive those cached module
+globals directly.
 
 Validates:
 1. Static eligibility -- ``_wo_a_aiter_gemm_eligible`` is true only when the
-   flag, the global ``SGLANG_USE_AITER`` switch, HIP, and a supported
-   architecture are all set (table-driven).
+   global ``SGLANG_USE_AITER`` switch, HIP, and gfx95 or gfx1250 are all set
+   (table-driven).
 2. Dispatch/gating -- with the reroute disabled, or on prefill
    (``is_decode=False``), the plain ``torch.einsum("tgd,grd->tgr", ...)`` path
    runs (bit-identical to the old code); only decode + enabled hits the kernel.
@@ -36,11 +35,11 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.utils.common import is_gfx95_supported, is_hip
+from sglang.srt.utils.device import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=60, suite="base-b-test-1-gpu-small-amd-mi35x")
 
 
 @unittest.skipUnless(is_hip(), "wo_a batched_gemm_bf16 routing requires ROCm")
@@ -81,16 +80,12 @@ class TestWoABf16BatchedGemm(CustomTestCase):
     # ------------------------------------------------------ static eligibility
 
     def test_eligibility_gating(self):
+        # The reroute activates only when the global aiter switch, HIP, and
+        # gfx95 or gfx1250 are ALL set -- resolved once at import.
         eligible = self.dsv4._wo_a_aiter_gemm_eligible
-        base = dict(
-            flag=True,
-            use_aiter=True,
-            is_hip=True,
-            is_gfx95=True,
-            is_gfx1250=False,
-        )
+        base = dict(use_aiter=True, is_hip=True, is_gfx95=True, is_gfx1250=False)
         self.assertTrue(eligible(**base))
-        for off in ("flag", "use_aiter", "is_hip", "is_gfx95"):
+        for off in ("use_aiter", "is_hip", "is_gfx95"):
             with self.subTest(disabled=off):
                 self.assertFalse(eligible(**{**base, off: False}))
         self.assertTrue(eligible(**{**base, "is_gfx95": False, "is_gfx1250": True}))

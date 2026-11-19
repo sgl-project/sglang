@@ -145,6 +145,175 @@ def _fused_scatter_from_staging_kernel(
     tl.store(layer_ptr + dst_offsets, vals, mask=mask)
 
 
+@triton.jit
+def _scatter_from_staging_persistent_kernel(
+    layer_ptrs,
+    page_indices,
+    staging,
+    writer_head_offsets,
+    stride_pool_token,
+    per_layer_elems,
+    n_blocks,
+    n_items,
+    ELEMS_PER_TOKEN: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    NUM_LAYERS_X2: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    NPROG: tl.constexpr,
+):
+    """Scatter strided blocks using at most NPROG CTAs."""
+    per_rank_elems = per_layer_elems.to(tl.int64) * NUM_LAYERS_X2
+    for item in range(tl.program_id(0), n_items, NPROG):
+        prog_id = item // n_blocks
+        block_id = item % n_blocks
+        writer_id = prog_id // NUM_LAYERS_X2
+        layer_kv_id = prog_id % NUM_LAYERS_X2
+        layer_ptr = tl.load(layer_ptrs + layer_kv_id).to(staging.dtype)
+        head_offset = tl.load(writer_head_offsets + writer_id)
+        offsets = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < per_layer_elems
+        t_idx = offsets // ELEMS_PER_TOKEN
+        e_idx = offsets % ELEMS_PER_TOKEN
+        page_val = tl.load(page_indices + t_idx // PAGE_SIZE, mask=mask, other=0)
+        pool_token = page_val * PAGE_SIZE + t_idx % PAGE_SIZE
+        src = (
+            writer_id.to(tl.int64) * per_rank_elems
+            + layer_kv_id.to(tl.int64) * per_layer_elems.to(tl.int64)
+            + offsets
+        )
+        vals = tl.load(staging + src, mask=mask)
+        dst = (
+            pool_token * stride_pool_token.to(tl.int64)
+            + head_offset.to(tl.int64)
+            + e_idx
+        )
+        tl.store(layer_ptr + dst, vals, mask=mask)
+
+
+@triton.jit
+def _scatter_staging_pages_kernel(
+    layer_ptrs,
+    page_indices,
+    staging,
+    writer_head_offsets,
+    stride_pool_token,
+    per_layer_elems,
+    ELEMS_PER_TOKEN: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    NUM_LAYERS_X2: tl.constexpr,
+):
+    """Move one page for one writer and layer K/V per program."""
+    page_id = tl.program_id(0)
+    program_id = tl.program_id(1)
+    writer_id = program_id // NUM_LAYERS_X2
+    layer_kv_id = program_id % NUM_LAYERS_X2
+
+    layer_ptr = tl.load(layer_ptrs + layer_kv_id).to(staging.dtype)
+    head_offset = tl.load(writer_head_offsets + writer_id).to(tl.int64)
+    page = tl.load(page_indices + page_id).to(tl.int64)
+    token_offset = tl.arange(0, PAGE_SIZE)[:, None]
+    element_offset = tl.arange(0, ELEMS_PER_TOKEN)[None, :]
+    source = (
+        (writer_id.to(tl.int64) * NUM_LAYERS_X2 + layer_kv_id)
+        * per_layer_elems.to(tl.int64)
+        + (page_id.to(tl.int64) * PAGE_SIZE + token_offset) * ELEMS_PER_TOKEN
+        + element_offset
+    )
+    destination = (
+        (page * PAGE_SIZE + token_offset) * stride_pool_token.to(tl.int64)
+        + head_offset
+        + element_offset
+    )
+    tl.store(layer_ptr + destination, tl.load(staging + source))
+
+
+def _launch_scatter(
+    layer_ptrs,
+    page_idx,
+    staging_typed,
+    head_offsets,
+    num_tokens,
+    stride_pool_token,
+    per_layer_elems,
+    elems_per_token,
+    page_size,
+    num_layers_x2,
+    num_writers,
+    ctas,
+):
+    """Select the default, bounded-CTA, or per-page scatter kernel."""
+    if (
+        ctas < 0
+        and page_size > 0
+        and page_size & (page_size - 1) == 0
+        and elems_per_token > 0
+        and elems_per_token & (elems_per_token - 1) == 0
+    ):
+        _scatter_staging_pages_kernel[
+            (num_tokens // page_size, num_writers * num_layers_x2)
+        ](
+            layer_ptrs,
+            page_idx,
+            staging_typed,
+            head_offsets,
+            stride_pool_token,
+            per_layer_elems,
+            ELEMS_PER_TOKEN=elems_per_token,
+            PAGE_SIZE=page_size,
+            NUM_LAYERS_X2=num_layers_x2,
+            num_warps=8,
+        )
+        return
+    if ctas <= 0:
+        grid = (num_writers * num_layers_x2, triton.cdiv(per_layer_elems, 1024))
+        _fused_scatter_from_staging_kernel[grid](
+            layer_ptrs,
+            page_idx,
+            staging_typed,
+            head_offsets,
+            num_tokens,
+            stride_pool_token,
+            per_layer_elems,
+            elems_per_token,
+            page_size,
+            num_layers_x2,
+            1024,
+        )
+        return
+    BLOCK = 16384
+    n_blocks = triton.cdiv(per_layer_elems, BLOCK)
+    n_items = num_writers * num_layers_x2 * n_blocks
+    _scatter_from_staging_persistent_kernel[(min(ctas, n_items),)](
+        layer_ptrs,
+        page_idx,
+        staging_typed,
+        head_offsets,
+        stride_pool_token,
+        per_layer_elems,
+        n_blocks,
+        n_items,
+        ELEMS_PER_TOKEN=elems_per_token,
+        PAGE_SIZE=page_size,
+        NUM_LAYERS_X2=num_layers_x2,
+        BLOCK_SIZE=BLOCK,
+        NPROG=min(ctas, n_items),
+        num_warps=16,
+    )
+
+
+_SCATTER_I64_CACHE: dict[tuple, torch.Tensor] = {}
+
+
+def _cached_scatter_i64(key: tuple, values: list[int], device) -> torch.Tensor:
+    tensor = _SCATTER_I64_CACHE.get(key)
+    if tensor is None:
+        # Keep pageable pointer-table copies off the in-flight forward stream.
+        with device_stream_context(create_device_stream(device)):
+            tensor = make_ptr_table(values, device=device)
+        _SCATTER_I64_CACHE[key] = tensor
+    return tensor
+
+
 class StagingBuffer:
     """Pre-allocated GPU staging buffer for bulk KV transfer.
 
@@ -687,26 +856,33 @@ def _scatter_staging_to_kv_triton(
     elems_per_token = num_heads * head_dim
     per_layer_elems = num_tokens * elems_per_token
 
-    layer_ptrs = make_ptr_table(
-        [buf.data_ptr() for buf in k_buffers] + [buf.data_ptr() for buf in v_buffers],
-        device=device,
-    )
-
-    writer_head_offsets = torch.tensor(
-        [
-            compute_head_slice_params(
-                prefill_attn_tp_size,
-                decode_attn_tp_size,
-                wr,
-                dst_tp_rank,
-                total_kv_heads,
-            )[2]
-            * head_dim
-            for wr in range(num_writers)
-        ],
-        dtype=torch.int64,
-        device=device,
-    )
+    pointers = [buf.data_ptr() for buf in k_buffers] + [
+        buf.data_ptr() for buf in v_buffers
+    ]
+    head_offsets = [
+        compute_head_slice_params(
+            prefill_attn_tp_size,
+            decode_attn_tp_size,
+            writer,
+            dst_tp_rank,
+            total_kv_heads,
+        )[2]
+        * head_dim
+        for writer in range(num_writers)
+    ]
+    if envs.SGLANG_PLB_SCATTER_DEFER.get():
+        device_key = (device.type, device.index)
+        layer_ptrs = _cached_scatter_i64(
+            ("pointers", device_key, *pointers), pointers, device
+        )
+        writer_head_offsets = _cached_scatter_i64(
+            ("offsets", device_key, *head_offsets), head_offsets, device
+        )
+    else:
+        layer_ptrs = make_ptr_table(pointers, device=device)
+        writer_head_offsets = torch.tensor(
+            head_offsets, dtype=torch.int64, device=device
+        )
 
     int_dtype_map = {1: torch.int8, 2: torch.int16, 4: torch.int32}
     int_dtype = int_dtype_map.get(dtype_size, torch.int16)
@@ -715,11 +891,7 @@ def _scatter_staging_to_kv_triton(
     )
     staging_typed = staging_buffer_view[:total_staging_bytes].view(int_dtype)
 
-    BLOCK_SIZE = 1024
-    num_layers_x2 = 2 * num_layers
-    grid = (num_writers * num_layers_x2, triton.cdiv(per_layer_elems, BLOCK_SIZE))
-
-    _fused_scatter_from_staging_kernel[grid](
+    _launch_scatter(
         layer_ptrs,
         page_idx_tensor,
         staging_typed,
@@ -729,8 +901,9 @@ def _scatter_staging_to_kv_triton(
         per_layer_elems,
         elems_per_token,
         page_size,
-        num_layers_x2,
-        BLOCK_SIZE,
+        2 * num_layers,
+        num_writers,
+        envs.SGLANG_PLB_SCATTER_CTAS.get(),
     )
 
 

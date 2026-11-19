@@ -46,6 +46,7 @@ from sglang.srt.layers.attention.mqa_logits_utils import (
 )
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.mxfp8_input import Mxfp8Block128Input
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
@@ -59,7 +60,7 @@ from sglang.srt.runtime_context import (
     get_platform,
 )
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
-from sglang.srt.utils import add_prefix, is_cuda, is_hip, is_xpu
+from sglang.srt.utils import is_cuda, is_hip, is_xpu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -624,7 +625,6 @@ class C4IndexerBackendMixin:
         if (
             c4_indexer.use_fp4_indexer
             or envs.SGLANG_OPT_USE_TILELANG_INDEXER.get()
-            or envs.SGLANG_OPT_USE_AITER_INDEXER.get()
             or envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
         ):
             return False
@@ -868,7 +868,7 @@ class C4IndexerBackendMixin:
             from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
                 tilelang_fp8_paged_mqa_logits as fn,
             )
-        elif envs.SGLANG_OPT_USE_AITER_INDEXER.get():
+        elif is_hip():
             fn = _aiter_fp8_paged_mqa_logits
         elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
             if get_platform().is_sm120:
@@ -905,7 +905,7 @@ class C4IndexerBackendMixin:
         _use_tilelang = (
             envs.SGLANG_OPT_USE_TILELANG_INDEXER.get() and not use_fp4_indexer
         )
-        _use_aiter = envs.SGLANG_OPT_USE_AITER_INDEXER.get() and not use_fp4_indexer
+        _use_aiter = is_hip() and not use_fp4_indexer
         _use_torch_fn = (
             envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get() and not use_fp4_indexer
         )

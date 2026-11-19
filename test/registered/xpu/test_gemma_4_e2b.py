@@ -24,7 +24,7 @@ import unittest
 import openai
 import torch
 
-from sglang.srt.utils.common import is_xpu
+from sglang.srt.utils.device import is_xpu
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -130,12 +130,12 @@ from sglang.test.ci.ci_register import register_xpu_ci
 # Single e2e test: boot + a short Q&A.
 register_xpu_ci(
     est_time=240,
-    suite="nightly-xpu-kernel-main-1-gpu",
+    suite="nightly-kernel-main-test-1-gpu-xpu",
     nightly=True,
 )
 register_xpu_ci(
     est_time=240,
-    suite="nightly-xpu-kernel-wheel-1-gpu",
+    suite="nightly-kernel-wheel-test-1-gpu-xpu",
     nightly=True,
 )
 
