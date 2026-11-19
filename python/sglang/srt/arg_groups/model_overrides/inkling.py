@@ -12,7 +12,7 @@ from sglang.srt.arg_groups.model_override_base import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils import is_gfx95_supported
+from sglang.srt.utils import is_gfx942_supported, is_gfx95_supported
 
 logger = logging.getLogger(__name__)
 
@@ -45,14 +45,27 @@ def _inkling_overrides(server_args: Any, hf_config: Any) -> dict:
             overrides["reasoning_parser"] = "inkling"
         # ROCm decode: KV splits of 32 keys, up to 128 per request (swept on MI350X)
         if get_platform().is_hip:
-            if (
-                not is_gfx95_supported()
-                and not envs.SGLANG_INKLING2_ALLOW_UNVALIDATED_ROCM.get()
+            if not is_gfx95_supported() and not (
+                is_gfx942_supported()
+                or envs.SGLANG_INKLING2_ALLOW_UNVALIDATED_ROCM.get()
             ):
                 raise ValueError(
-                    "Inkling2 on ROCm is validated on gfx950 (MI350X / MI355X) only; its "
-                    "kernels are sized and tuned there. Set "
-                    "SGLANG_INKLING2_ALLOW_UNVALIDATED_ROCM=1 to run it anyway."
+                    "Inkling2 on ROCm is validated on gfx950 (MI350X / MI355X) and "
+                    "runs on gfx942 (MI300X / MI325X); its kernels are sized and "
+                    "tuned on gfx950. Set SGLANG_INKLING2_ALLOW_UNVALIDATED_ROCM=1 "
+                    "to run it on another ROCm GPU anyway."
+                )
+            if is_gfx942_supported():
+                # gfx942 passes the Inkling2 unit suites (including the ROCm
+                # kernel tests against float64/torch references), but the sizes
+                # and tuning are gfx950's and no end-to-end serving run has been
+                # published for it, so say so rather than claim parity.
+                logger.warning(
+                    "Inkling2 on gfx942 (MI300X / MI325X): kernels pass their "
+                    "correctness tests here, but are sized and tuned for gfx950, "
+                    "and the gfx950-only fast paths (Gluon MFMA-order experts, "
+                    "the AITER Triton GEMM) fall back to portable kernels. "
+                    "Expect correct results, not gfx950 performance."
                 )
             if "megamoe" in (cfg.moe_a2a_backend, cfg.moe_runner_backend):
                 raise ValueError(
