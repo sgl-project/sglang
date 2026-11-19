@@ -25,6 +25,8 @@ class LoRAFormat(str, Enum):
     XLABS_FLUX = "xlabs-ai"
     KOHYA_FLUX = "kohya-flux"
     KOHYA_MINIMAX_H3 = "kohya-minimax-h3"
+    KOHYA_QWEN_IMAGE = "kohya-qwen-image"
+    KOHYA_Z_IMAGE = "kohya-z-image"
     WAN = "wan"
     AI_TOOLKIT_FLUX = "ai-toolkit-flux"
 
@@ -138,6 +140,34 @@ def _looks_like_kohya_flux(state_dict: Mapping[str, torch.Tensor]) -> bool:
     )
 
 
+def _looks_like_kohya_qwen_image(state_dict: Mapping[str, torch.Tensor]) -> bool:
+    """Kohya/musubi Qwen-Image LoRA: lora_unet_transformer_blocks_N_{img,txt}_{mlp,mod}_*.
+
+    The img/txt mlp and mod names separate it from Kohya exports of other
+    MMDiTs that also use diffusers `transformer_blocks` naming.
+    """
+    return any(
+        k.startswith("lora_unet_transformer_blocks_")
+        and any(m in k for m in ("_img_mlp_", "_txt_mlp_", "_img_mod_", "_txt_mod_"))
+        for k in state_dict
+    )
+
+
+def _looks_like_kohya_z_image(state_dict: Mapping[str, torch.Tensor]) -> bool:
+    """Kohya/musubi Z-Image LoRA: lora_unet_{layers,noise_refiner,context_refiner}_N_*."""
+    return any(
+        k.startswith(
+            (
+                "lora_unet_layers_",
+                "lora_unet_noise_refiner_",
+                "lora_unet_context_refiner_",
+            )
+        )
+        and ("_attention_" in k or "_feed_forward_" in k)
+        for k in state_dict
+    )
+
+
 def _looks_like_non_diffusers_sd(state_dict: Mapping[str, torch.Tensor]) -> bool:
     """Classic non-diffusers SD LoRA (Kohya/A1111/sd-scripts)."""
     if not state_dict:
@@ -220,6 +250,10 @@ def detect_lora_format_from_state_dict(
         return LoRAFormat.KOHYA_MINIMAX_H3
     if _looks_like_kohya_flux(state_dict):
         return LoRAFormat.KOHYA_FLUX
+    if _looks_like_kohya_qwen_image(state_dict):
+        return LoRAFormat.KOHYA_QWEN_IMAGE
+    if _looks_like_kohya_z_image(state_dict):
+        return LoRAFormat.KOHYA_Z_IMAGE
 
     if _looks_like_wan_lora(state_dict):
         return LoRAFormat.WAN
@@ -399,6 +433,35 @@ def _convert_kohya_flux_via_diffusers(
             "[LoRAFormatAdapter] Kohya FLUX conversion failed; last error: {last_err}"
         ),
     )
+
+
+def _convert_kohya_dit_via_diffusers(
+    state_dict: Mapping[str, torch.Tensor],
+    converter_name: str,
+    model_name: str,
+    log: logging.Logger,
+) -> Dict[str, torch.Tensor]:
+    """Convert a Kohya/musubi DiT LoRA with the matching diffusers helper.
+
+    The helper folds alpha / rank into A/B and returns `transformer.`-prefixed
+    diffusers names; the prefix is dropped to match the native DiT names.
+    """
+    converted = _convert_via_diffusers_candidates(
+        state_dict,
+        (converter_name,),
+        log=log,
+        no_converter_warning=(
+            f"[LoRAFormatAdapter] No Kohya {model_name} converter found in diffusers."
+        ),
+        success_info=(
+            f"[LoRAFormatAdapter] Converted Kohya {model_name} LoRA using {{name}}"
+        ),
+        all_failed_warning=(
+            f"[LoRAFormatAdapter] Kohya {model_name} conversion failed; "
+            "last error: {last_err}"
+        ),
+    )
+    return {k.removeprefix("transformer."): v for k, v in converted.items()}
 
 
 def _convert_ai_toolkit_flux_lora(
@@ -594,6 +657,22 @@ def convert_lora_state_dict_by_format(
     if fmt == LoRAFormat.KOHYA_FLUX:
         converted = _convert_kohya_flux_via_diffusers(state_dict, log)
         return _convert_non_diffusers_sd_simple(converted, log)
+
+    if fmt == LoRAFormat.KOHYA_QWEN_IMAGE:
+        return _convert_kohya_dit_via_diffusers(
+            state_dict,
+            "_convert_non_diffusers_qwen_lora_to_diffusers",
+            "Qwen-Image",
+            log,
+        )
+
+    if fmt == LoRAFormat.KOHYA_Z_IMAGE:
+        return _convert_kohya_dit_via_diffusers(
+            state_dict,
+            "_convert_non_diffusers_z_image_lora_to_diffusers",
+            "Z-Image",
+            log,
+        )
 
     if fmt == LoRAFormat.WAN:
         maybe = _convert_with_diffusers_utils_if_available(state_dict, log)
