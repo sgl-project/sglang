@@ -85,7 +85,10 @@ from sglang.srt.speculative.eagle_info import (
     EagleDraftInput,
     EagleVerifyInput,
 )
-from sglang.srt.speculative.eagle_post_verify_graphs import EaglePostVerifyGraphs
+from sglang.srt.speculative.eagle_post_verify_graphs import (
+    EaglePostVerifyGraphs,
+    dp_post_verify_graphs_decline,
+)
 from sglang.srt.speculative.eagle_utils import (
     _eagle_prefill_tail_tokens,
     compact_verify_max_top_k,
@@ -1532,11 +1535,16 @@ class EAGLEWorkerV2(BaseSpecWorker):
     def _init_post_verify_graphs(self) -> None:
         # A key is captured at its first rounds, which attention-DP ranks do not reach
         # together, and a capture may end in a collective over the TP group.
-        if not _is_cuda or self.topk != 1 or get_parallel().attn_dp_enabled:
+        attn_dp = get_parallel().attn_dp_enabled
+        dp_graphs = attn_dp and envs.SGLANG_OPT_SPEC_DP_POST_VERIFY_GRAPHS.get()
+        if not _is_cuda or self.topk != 1 or (attn_dp and not dp_graphs):
             logger.warning(
                 "The EAGLE post-verify graphs are disabled: they need CUDA, a chain "
                 "draft (topk 1) and no DP attention"
             )
+            return
+        if dp_graphs:
+            self._init_dp_post_verify_graphs()
             return
         # one stream of forced acceptance lengths, from which the post-verify
         # graphs and the eager verify both draw; the global CPU RNG otherwise
@@ -1547,6 +1555,32 @@ class EAGLEWorkerV2(BaseSpecWorker):
             target_worker=self.target_worker,
             simulated_acc_len_rng=self._simulated_acc_len_rng,
             speculative_runtime_hooks=self._speculative_runtime_hooks,
+        )
+
+    def _init_dp_post_verify_graphs(self) -> None:
+        reason = dp_post_verify_graphs_decline(
+            attn_tp_size=get_parallel().attn_tp_size,
+            speculative_runtime_hooks=self._speculative_runtime_hooks,
+        )
+        if reason is not None:
+            logger.info(
+                "SGLANG_OPT_SPEC_DP_POST_VERIFY_GRAPHS declined (%s): the EAGLE "
+                "post-verify graphs stay off under DP attention",
+                reason,
+            )
+            return
+        logger.info(
+            "SGLANG_OPT_SPEC_DP_POST_VERIFY_GRAPHS: under DP attention the EAGLE "
+            "post-verify graphs take the rounds the provider's gathered sampler "
+            "serves, each rank capturing its own; other rounds stay eager"
+        )
+        # forced acceptance lengths stay on the global CPU RNG, which the eager DP
+        # verify draws them from
+        self._post_verify_graphs = EaglePostVerifyGraphs(
+            target_worker=self.target_worker,
+            simulated_acc_len_rng=None,
+            speculative_runtime_hooks=self._speculative_runtime_hooks,
+            gathered_rounds_only=True,
         )
 
     def init_cuda_graphs(self):

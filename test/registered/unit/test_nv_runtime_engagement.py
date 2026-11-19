@@ -29,8 +29,10 @@ from sglang.srt.environ import envs, nv_mega_runtime_switches
 from sglang.srt.managers import scheduler_pp_mixin
 from sglang.srt.managers.scheduler_components import dp_sync_exchange, shm_tag_exchange
 from sglang.srt.models.qwen3_5 import Qwen3_5MoeForConditionalGeneration
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative import eagle_post_verify_graphs
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, published_topology
 
@@ -248,6 +250,10 @@ def _pd_decode_overlap_loop(shape: Shape) -> bool:
     )
 
 
+def _eagle() -> bool:
+    return SpeculativeAlgorithm.from_string(get_spec().speculative_algorithm).is_eagle()
+
+
 def _group_of(size: int):
     return patch.object(
         shm_tag_exchange.dist, "get_world_size", side_effect=lambda group=None: size
@@ -305,12 +311,33 @@ def _pp_proxy_recv_after_forward(shape: Shape) -> bool:
     )
 
 
+def _dp_post_verify_graphs(shape: Shape) -> bool:
+    # The megakernel plugin binds the gathered verify sampler under the master.
+    hooks = SimpleNamespace(
+        post_verify=SimpleNamespace(
+            gathered_tokens=object() if shape.megakernel else None
+        )
+    )
+    parallel = get_parallel()
+    return (
+        parallel.attn_dp_enabled
+        and _eagle()
+        and envs.SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH.get()
+        and envs.SGLANG_OPT_SPEC_DP_POST_VERIFY_GRAPHS.get()
+        and eagle_post_verify_graphs.dp_post_verify_graphs_decline(
+            attn_tp_size=parallel.attn_tp_size, speculative_runtime_hooks=hooks
+        )
+        is None
+    )
+
+
 RESOLVERS: Dict[str, Callable[[Shape], bool]] = {
     "SGLANG_OPT_SCHEDULER_SHM_SYNC_DP_ROWS": _dp_rows,
     "SGLANG_OPT_PD_DECODE_ADMIT_FREED_SLOTS": _freed_slots,
     "SGLANG_OPT_PP_PREFILL_EARLY_FINISH": _pp_early_finish,
     "SGLANG_OPT_PP_EARLY_RELAY": _pp_early_relay,
     "SGLANG_OPT_PP_PROXY_RECV_AFTER_FORWARD": _pp_proxy_recv_after_forward,
+    "SGLANG_OPT_SPEC_DP_POST_VERIFY_GRAPHS": _dp_post_verify_graphs,
 }
 
 
@@ -393,7 +420,7 @@ _NO_STAGING = _children()
 # post-verify graphs with a bound gathered sampler.
 _PD_DECODE_DP = _children()
 _DP_EXCHANGE = _children("SCHEDULER_SHM_SYNC_DP_ROWS")
-_DP_GRAPHS = _children()
+_DP_GRAPHS = _children("SPEC_DP_POST_VERIFY_GRAPHS")
 # A top-k-1 EAGLE chain outside a PD prefill and attention DP: the generic paths,
 # then those of the TRT-LLM MHA backend, the vocab-shard verify and the model trait.
 _CHAIN = _children()

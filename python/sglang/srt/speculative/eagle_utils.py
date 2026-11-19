@@ -774,6 +774,34 @@ def _gathered_sampling_applies(
     )
 
 
+def gathered_sampling_round(
+    *,
+    batch: ScheduleBatch,
+    verify_input: EagleVerifyInput,
+    vocab_shard: Optional[VocabShard],
+    max_top_k: Optional[int],
+) -> bool:
+    """Whether eagle_sample offers this round to a bound gathered sampler, by its own
+    test; the caller has already excluded grammar and watermark rounds."""
+    info = batch.sampling_info
+    greedy = _verify_uses_greedy(
+        is_all_greedy=info.is_all_greedy,
+        is_cpu=_is_cpu,
+        is_hip=_is_hip,
+        is_xpu=_is_xpu,
+        use_rejection_sampling=get_spec().speculative_use_rejection_sampling,
+    )
+    return _gathered_sampling_applies(
+        greedy=greedy,
+        sparse=not greedy and _can_use_sparse_uno_tree_target_sampling(max_top_k, info),
+        vocab_shard=vocab_shard,
+        verify_input=verify_input,
+        batch=batch,
+        grammar_mask=None,
+        watermark=False,
+    )
+
+
 def _gathered_tokens(
     logits: torch.Tensor,
     *,

@@ -2033,6 +2033,12 @@ class Envs:
     # Sequences a captured GDN extend bucket accepts (at most the request pool); a
     # larger prefill batch runs the step eagerly. Bounds the padded grids and scratch.
     SGLANG_GDN_PREFILL_GRAPH_MAX_SEQS = EnvInt(128)
+    # Under attention DP with one rank per attention-TP group, the EAGLE post-verify
+    # graphs take the rounds a provider's gathered verify sampler serves, each rank
+    # capturing its own. Needs SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH.
+    SGLANG_OPT_SPEC_DP_POST_VERIFY_GRAPHS = EnvBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
 
     # ===================================================================
     # Tokenizer, request state, embeddings, and reasoning controls

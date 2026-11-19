@@ -87,6 +87,7 @@ class _FallbackPostVerifyStrategy:
     # Structural match for the optional binding contract.  ``None`` means the
     # runtime's native greedy key producer, not a provider decline.
     local_keys = None
+    gathered_tokens = None
 
     def __call__(self, io: Any) -> Any:
         return _fallback_post_verify(io)

@@ -9,6 +9,7 @@ row, so it writes the verify forward's slots, staged with the round's inputs."""
 
 from __future__ import annotations
 
+import gc
 import logging
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Callable, Optional
@@ -38,6 +39,19 @@ _MAX_POST_VERIFY_STATES = 64
 _ONE_LAUNCH_LOAD = envs.SGLANG_OPT_SPEC_POST_VERIFY_ONE_LAUNCH_LOAD.get()
 
 
+def dp_post_verify_graphs_decline(
+    *, attn_tp_size: int, speculative_runtime_hooks: Any
+) -> Optional[str]:
+    """Why SGLANG_OPT_SPEC_DP_POST_VERIFY_GRAPHS keeps the post-verify graphs off under
+    attention DP, or None: it captures only the rounds a provider's gathered sampler
+    serves, whose body has no collective when one rank forms each attention-TP group."""
+    if attn_tp_size != 1:
+        return f"the verify result is broadcast over {attn_tp_size} attention-TP ranks"
+    if speculative_runtime_hooks.post_verify.gathered_tokens is None:
+        return "no provider gathered verify sampler is bound"
+    return None
+
+
 class EaglePostVerifyGraphs:
     """The verify's post-section in SGLang's own CUDA graphs, one set per key: batch
     size, sampling mode, forced acceptance, tracking and the verify logits buffer."""
@@ -46,17 +60,23 @@ class EaglePostVerifyGraphs:
         self,
         *,
         target_worker: Any,
-        simulated_acc_len_rng: torch.Generator,
+        simulated_acc_len_rng: Optional[torch.Generator],
         speculative_runtime_hooks: Any = STOCK_SPECULATIVE_RUNTIME_HOOKS,
+        gathered_rounds_only: bool = False,
     ):
+        """gathered_rounds_only (attention DP, SGLANG_OPT_SPEC_DP_POST_VERIFY_GRAPHS):
+        only rounds the bound gathered sampler serves take the graphs; each rank
+        captures its own, with the mamba commit inside the post-verify graph."""
         self._target_worker = target_worker
         self._speculative_runtime_hooks = speculative_runtime_hooks
+        self._gathered_rounds_only = gathered_rounds_only
         # Whether the commit writes recurrent state slots; resolved at first use.
         self._stages_state_slots: Optional[bool] = None
         self._graphs = _PostVerifyGraphs(
             body=self._body,
             commit=self._commit,
             sim_rng=simulated_acc_len_rng,
+            per_rank_capture=gathered_rounds_only,
         )
 
     def run(
@@ -124,6 +144,7 @@ class EaglePostVerifyGraphs:
         can_run_cuda_graph: bool,
         max_top_k: Optional[int] = None,
     ) -> Optional[tuple]:
+        from sglang.srt.speculative.eagle_utils import gathered_sampling_round
         from sglang.srt.speculative.spec_utils import SIMULATE_ACC_LEN
 
         info = batch.sampling_info
@@ -145,6 +166,16 @@ class EaglePostVerifyGraphs:
             or (
                 batch.return_logprob
                 and logits_output.next_token_logits_vocab_shard is not None
+            )
+            # attention DP: only the rounds the gathered sampler serves
+            or (
+                self._gathered_rounds_only
+                and not gathered_sampling_round(
+                    batch=batch,
+                    verify_input=verify_input,
+                    vocab_shard=logits_output.next_token_logits_vocab_shard,
+                    max_top_k=max_top_k,
+                )
             )
         ):
             return None
@@ -325,16 +356,28 @@ def _sample(slot: SimpleNamespace, speculative_runtime_hooks: Any) -> tuple:
 class _PostVerifyGraphs:
     """SGLang-owned post-verify graphs: per key, two slots of fixed staging buffers
     and outputs alternate, so one round's outputs stay valid while the host consumes
-    them; the mamba state commit replays on a side stream until join()."""
+    them; the mamba state commit replays on a side stream until join(), or inside
+    the main graph when each rank captures on its own."""
 
-    def __init__(self, *, body: Callable, commit: Callable, sim_rng: torch.Generator):
+    def __init__(
+        self,
+        *,
+        body: Callable,
+        commit: Callable,
+        sim_rng: Optional[torch.Generator],
+        per_rank_capture: bool = False,
+    ):
         self._body, self._commit = body, commit
         # forced acceptance lengths: the worker's one stream, from which SGLang's eager
         # verify draws too; once per round, whatever else uses the global RNG
         self._sim_rng = sim_rng
+        # attention DP: no TP-wide capture context, whose exit is collective, and the
+        # commit inside the main graph, on the stream the eager verify commits on
+        self._per_rank_capture = per_rank_capture
         self._states: dict[tuple, SimpleNamespace] = {}
         self._pool = None
         self._side_stream = self._main_done = self._commit_done = None
+        self._capture_stream = None
         self._commit_pending = False
         # The host runs up to ~2 rounds ahead; a pinned slot is rewritten only after
         # the event behind its last copy has completed.
@@ -377,6 +420,8 @@ class _PostVerifyGraphs:
                 return outputs[:6]
             self._capture(slot)
         slot.graph.replay()
+        if slot.commit_graph is None:
+            return slot.outputs[:6]
         self._main_done.record()
         self._side_stream.wait_event(self._main_done)
         with torch.cuda.stream(self._side_stream):
@@ -457,6 +502,9 @@ class _PostVerifyGraphs:
     def _capture(self, slot: SimpleNamespace) -> None:
         from sglang.srt.distributed.parallel_state import graph_capture
 
+        if self._per_rank_capture:
+            self._capture_on_this_rank(slot)
+            return
         if self._pool is None:
             self._pool = torch.cuda.graph_pool_handle()
             self._side_stream = torch.cuda.Stream()
@@ -486,6 +534,53 @@ class _PostVerifyGraphs:
             "Captured the EAGLE post-verify graphs for batch size %d",
             slot.num_requests,
         )
+
+    def _capture_on_this_rank(self, slot: SimpleNamespace) -> None:
+        """Record the body and the commit in one graph, with no other rank taking
+        part; the round then replays it."""
+
+        def body_and_commit() -> tuple:
+            outputs = self._body(slot)
+            self._commit(slot, outputs)
+            return outputs
+
+        if self._pool is None:
+            self._pool = torch.cuda.graph_pool_handle()
+        graph = torch.cuda.CUDAGraph()
+        outputs = self._record(graph, body_and_commit)
+        slot.graph, slot.commit_graph, slot.outputs = graph, None, outputs
+        logger.info(
+            "Captured the EAGLE post-verify graph for batch size %d on this rank",
+            slot.num_requests,
+        )
+
+    def _record(self, graph: torch.cuda.CUDAGraph, fn: Callable) -> tuple:
+        """Record fn() into graph without torch.cuda.graph's __enter__, which calls
+        torch.cuda.synchronize() and torch.cuda.empty_cache()
+        (torch/cuda/graphs.py)."""
+        stream = torch.cuda.current_stream()
+        record_on = stream
+        if stream == torch.cuda.default_stream(stream.device):
+            # capture needs a non-default stream: record on one ordered after this one
+            if self._capture_stream is None:
+                self._capture_stream = torch.cuda.Stream(device=stream.device)
+            self._capture_stream.wait_stream(stream)
+            record_on = self._capture_stream
+        # no finalizer may run while the stream captures
+        gc_enabled = gc.isenabled()
+        gc.disable()
+        try:
+            with torch.cuda.stream(record_on):
+                graph.capture_begin(self._pool, capture_error_mode="thread_local")
+                try:
+                    return fn()
+                finally:
+                    graph.capture_end()
+        finally:
+            if gc_enabled:
+                gc.enable()
+            if record_on is not stream:
+                stream.wait_stream(record_on)
 
 
 def _post_verify_inputs(
