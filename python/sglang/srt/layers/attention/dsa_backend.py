@@ -3227,7 +3227,9 @@ class DeepseekSparseAttnBackend(
             )
 
         if dsa_impl == "flashmla_sparse":
-            if self._use_triton_sink_decode(q_nope, kv_cache, page_table_1, attn_sink):
+            if self._use_triton_sink_decode(
+                q_nope, q_rope, kv_cache, page_table_1, attn_sink
+            ):
                 return self._forward_triton_sink_decode(
                     q_nope=q_nope,
                     q_rope=q_rope,
@@ -4269,17 +4271,21 @@ class DeepseekSparseAttnBackend(
             d_v=v_head_dim,
         ).squeeze(0)
 
-    # Decode rows x selection width up to which the Triton split-K kernel beats
-    # FlashMLA's head-padded sparse kernel for sink models with few local heads
-    # (B300: 4 heads x 2048 at bs 32 is 20.4 vs 32.3 us; 8 x 512 at bs 64 is
-    # 13.7 vs 16.9 us; 4 x 2048 at bs 64 is 42.1 vs 40.5 us).
+    # B300, <=16 local heads: Triton beats head-padded FlashMLA up to rows x width
+    # of 64K (4 heads x 2048: 20.4 vs 32.3 us at bs 32, 42.1 vs 40.5 us at bs 64).
     _TRITON_SINK_DECODE_MAX_WORK = 64 * 1024
 
-    def _use_triton_sink_decode(self, q_nope, kv_cache, page_table_1, attn_sink):
+    def _use_triton_sink_decode(
+        self, q_nope, q_rope, kv_cache, page_table_1, attn_sink
+    ):
+        rope_dim = q_rope.shape[-1] if q_rope is not None else 0
         return (
             attn_sink is not None
             and _is_cuda
             and q_nope.shape[1] <= 16
+            and q_nope.shape[-1] % 128 == 0
+            and rope_dim > 0
+            and rope_dim & (rope_dim - 1) == 0
             and q_nope.dtype == torch.bfloat16
             and kv_cache.dtype == torch.bfloat16
             and q_nope.shape[0] * page_table_1.shape[-1]
@@ -4318,6 +4324,7 @@ class DeepseekSparseAttnBackend(
             workspace=workspace,
             lengths=lengths,
             attn_sink=attn_sink,
+            lengths_tail_invalid=False,
         ).squeeze(0)
 
     def _forward_triton_decode(
