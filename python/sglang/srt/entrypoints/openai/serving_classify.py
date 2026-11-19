@@ -36,6 +36,10 @@ class OpenAIServingClassify(OpenAIServingBase):
         super().__init__(tokenizer_manager)
         self.template_manager = template_manager
         self.id2label = self._get_id2label_mapping()
+        hf_config = self.tokenizer_manager.model_config.hf_config
+        self.is_multi_label = (
+            getattr(hf_config, "problem_type", None) == "multi_label_classification"
+        )
         self.model_name = (
             self.tokenizer_manager.served_model_name
             if self.tokenizer_manager.served_model_name
@@ -165,7 +169,10 @@ class OpenAIServingClassify(OpenAIServingBase):
             if embedding:
                 try:
                     embedding_tensor = torch.tensor(embedding, dtype=torch.float32)
-                    probs = F.softmax(embedding_tensor, dim=0).tolist()
+                    if self.is_multi_label:
+                        probs = torch.sigmoid(embedding_tensor).tolist()
+                    else:
+                        probs = F.softmax(embedding_tensor, dim=0).tolist()
 
                     predicted_class = torch.argmax(embedding_tensor).item()
 

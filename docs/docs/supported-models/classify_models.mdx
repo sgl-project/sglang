@@ -7,6 +7,14 @@ This document describes the `/v1/classify` API endpoint implementation in SGLang
 
 The classification API allows you to classify text inputs using classification models. This implementation follows the same format as vLLM's 0.7.0 classification API.
 
+### Multi-label classification
+
+If your checkpoint's `config.json` declares `"problem_type": "multi_label_classification"`, `/v1/classify` applies an elementwise sigmoid to its logits. Each entry in `probs` is an independent class probability, so the entries do not need to sum to one. For example, logits `[2.0, 2.0]` produce probabilities of approximately `[0.880797, 0.880797]`.
+
+The `label` field remains the top-scoring class. To select multiple positive classes, apply your chosen threshold to the full `probs` vector in `id2label` order. No request parameter is needed.
+
+For other or missing `problem_type` values, the endpoint continues to apply softmax.
+
 ## API Endpoint
 
 ```text Output
