@@ -12,6 +12,7 @@ Covers:
   - Resubmission succeeds after cleanup
   - Handler failures clean up pending and dispatched requests
   - _handle_batch_output takes non-streaming first_token_time from the scheduler
+  - _handle_batch_output records each batch's detokenize duration on the root span
 """
 
 import asyncio
@@ -722,6 +723,28 @@ class TestNonStreamingFirstTokenTime(CustomTestCase):
     def test_falls_back_to_arrival_without_scheduler_time(self):
         stats, arrival = self._run(stream=False, prefill_finished_time=0.0)
         self.assertGreaterEqual(stats.first_token_time, arrival)
+
+
+class TestDetokenizeDuration(CustomTestCase):
+    def test_root_span_records_the_detokenize_time_of_every_batch(self):
+        tm = _make_tokenizer_manager(self)
+        rid = "detokenize_rid"
+        state = _make_req_state(rid)
+        state.time_stats.trace_ctx = MagicMock()
+        state.time_stats.trace_ctx.tracing_enable = True
+        tm.rid_to_state[rid] = state
+        for detokenize_duration, finished_reason in (
+            (0.003, _NOT_FINISHED),
+            (None, _NOT_FINISHED),
+            (0.002, None),
+        ):
+            batch_output = _make_batch_str_output(rid, finished_reason)
+            batch_output.detokenize_duration = detokenize_duration
+            asyncio.run(tm._handle_batch_output(batch_output))
+
+        attrs = state.time_stats.trace_ctx.trace_req_finish.call_args.kwargs["attrs"]
+        self.assertAlmostEqual(attrs["detokenize.total_seconds"], 0.005)
+        self.assertEqual(attrs["detokenize.batches"], 2)
 
 
 class TestInitReqStateDuplicateDetection(CustomTestCase):
