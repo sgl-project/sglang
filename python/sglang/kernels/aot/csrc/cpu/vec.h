@@ -93,11 +93,11 @@ inline void store_from_float_ext<at::Half>(at::Half* out, const Vectorized<float
 
 #define CVT_FP16_TO_FP32(a) _mm512_cvtph_ps(a)
 
-#define CVT_FP32_TO_FP8(arch, values) cvtfp32_fp8e4m3<arch>((values))
+#define CVT_FP32_TO_FP8(isa, values) cvtfp32_fp8e4m3<isa>((values))
 
-template <CpuIsa arch>
+template <CpuIsa isa>
 inline __m128i cvtfp32_fp8e4m3(__m512 values) {
-  static_assert(arch == CpuIsa::AMX);
+  static_assert(isa == CpuIsa::AMX);
   return at::vec::cvtfp32_fp8e4m3(values);
 }
 

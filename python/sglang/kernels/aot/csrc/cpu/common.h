@@ -20,22 +20,22 @@ inline bool has_avx10_2() {
 }
 #endif
 
-// Dispatch outside hot loops so the callback can use arch as a template argument.
+// Dispatch outside hot loops so the callback can use isa as a template argument.
 #if defined(CPU_CAPABILITY_AVX10_2)
-#define CPU_DISPATCH_ARCH(...)                  \
+#define CPU_DISPATCH_ISA(...)                   \
   [&]() -> decltype(auto) {                     \
     if (::has_avx10_2()) {                      \
-      constexpr auto arch = ::CpuIsa::AVX10_2;  \
+      constexpr auto isa = ::CpuIsa::AVX10_2;   \
       return __VA_ARGS__();                     \
     } else {                                    \
-      constexpr auto arch = ::CpuIsa::AMX;      \
+      constexpr auto isa = ::CpuIsa::AMX;       \
       return __VA_ARGS__();                     \
     }                                           \
   }()
 #else
-#define CPU_DISPATCH_ARCH(...)            \
+#define CPU_DISPATCH_ISA(...)             \
   [&]() -> decltype(auto) {               \
-    constexpr auto arch = ::CpuIsa::AMX;  \
+    constexpr auto isa = ::CpuIsa::AMX;   \
     return __VA_ARGS__();                 \
   }()
 #endif
