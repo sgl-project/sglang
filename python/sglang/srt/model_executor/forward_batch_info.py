@@ -483,6 +483,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     mamba_track_seqlens: Optional[torch.Tensor] = None  # shape: [b], int64
     mamba_prefill_track_mask_cpu: Optional[List[bool]] = None
     mamba_track_seqlens_cpu: Optional[List[int]] = None
+    gdn_branch_snapshot: Optional[tuple[int, int, torch.Tensor]] = None
     # Deferred mamba init ops: COW pairs and clear indices (performed on forward stream)
     mamba_cow_src_indices: Optional[torch.Tensor] = None
     mamba_cow_dst_indices: Optional[torch.Tensor] = None
@@ -1049,6 +1050,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 if batch.mamba_track_seqlens_cpu is not None
                 else None
             ),
+            gdn_branch_snapshot=batch.gdn_branch_snapshot,
             mamba_cow_src_indices=batch.mamba_cow_src_indices,
             mamba_cow_dst_indices=batch.mamba_cow_dst_indices,
             mamba_clear_indices=batch.mamba_clear_indices,

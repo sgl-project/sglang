@@ -466,6 +466,23 @@ class SchedulerBatchResultProcessor:
                         store=(should_commit_output and discard_finish_reason is None),
                     )
 
+                if (
+                    batch.gdn_branch_snapshot is not None
+                    and batch.gdn_branch_snapshot[0] == i
+                ):
+                    _, depth, slot = batch.gdn_branch_snapshot
+                    self.tree_cache.publish_gdn_branch_snapshot(
+                        req,
+                        depth,
+                        slot,
+                        valid=(
+                            still_in_batch_rows[i]
+                            and discard_finish_reason is None
+                            and req.discard_output_reason is None
+                        ),
+                    )
+                    batch.gdn_branch_snapshot = None
+
                 if not still_in_batch_rows[i]:
                     # Commit nothing; only move the input logprob pointer past
                     # this row.

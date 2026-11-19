@@ -1950,6 +1950,7 @@ class Envs:
     # mamba pool ratio accordingly. Frees one resident slot per running request,
     # raising max_running_requests. Off = original locking + ratio (escape hatch).
     SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK = EnvBool(False)
+    SGLANG_EXPERIMENTAL_GDN_BRANCH_AND_TAIL = EnvBool(False)
     # Hybrid-SSM PD decode with --disaggregation-decode-enable-radix-cache: the
     # radix tree keeps FULL KV only, since prefill sends each request's final
     # recurrent state and no tree-held state is ever read. Unset: the model's

@@ -936,7 +936,32 @@ class GDNAttnBackend(MambaAttnBackendBase):
                         forward_batch
                     ),
                 )
+        self._init_gdn_branch_snapshot(forward_batch)
         self._init_prefill_conv_block_table(forward_batch)
+
+    def _init_gdn_branch_snapshot(self, forward_batch: ForwardBatch) -> None:
+        self.gdn_branch_track = None
+        snapshot = getattr(forward_batch, "gdn_branch_snapshot", None)
+        if (
+            snapshot is None
+            or not forward_batch.forward_mode.is_extend_without_speculative()
+        ):
+            return
+        assert self.mis_metadata is None
+        assert isinstance(self.kernel_dispatcher.extend_kernel, TritonGDNKernel)
+        assert self.mamba_chunk_size == FLA_CHUNK_SIZE
+        row, boundary, slot = snapshot
+        extend_lens = forward_batch.extend_seq_lens_cpu
+        prefix_lens = forward_batch.extend_prefix_lens_cpu
+        relative = boundary - prefix_lens[row]
+        assert 0 < relative < extend_lens[row] and relative % FLA_CHUNK_SIZE == 0
+        packed_end = sum(extend_lens[:row]) + relative
+        chunk_offset = sum(
+            (length + FLA_CHUNK_SIZE - 1) // FLA_CHUNK_SIZE
+            for length in extend_lens[:row]
+        )
+        h_row = chunk_offset + relative // FLA_CHUNK_SIZE
+        self.gdn_branch_track = (self._translate_mamba_indices(slot), packed_end, h_row)
 
     def _init_prefill_conv_block_table(self, forward_batch: ForwardBatch) -> None:
         metadata = self.forward_metadata
@@ -1529,6 +1554,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     mixed_qkv_to_track
                 )
 
+            if self.gdn_branch_track is not None:
+                dst, packed_end, _ = self.gdn_branch_track
+                conv_width = conv_states.shape[-1]
+                raw_window = mixed_qkv[packed_end - conv_width : packed_end]
+                conv_states[dst] = raw_window.transpose(0, 1).unsqueeze(0)
+
             mixed_qkv = self._convolve_prefill(
                 layer,
                 forward_batch,
@@ -1691,6 +1722,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     (conv_states_contig, ssm_states_contig),
                     staging,
                 )
+
+            if self.gdn_branch_track is not None:
+                dst, _, h_row = self.gdn_branch_track
+                # This matches the native Triton intermediate-state copy.
+                assert h is not None and h.dtype == ssm_states.dtype
+                ssm_states[dst] = h[0, h_row : h_row + 1]
 
             if forward_metadata.has_mamba_track_mask:
                 self._track_mamba_state_extend(

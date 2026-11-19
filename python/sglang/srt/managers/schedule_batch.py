@@ -2049,6 +2049,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     mamba_track_seqlens: torch.Tensor = None  # shape: [b], int64
     # TBO rejects Mamba tracking; enabling it must also slice these CPU lists.
     mamba_track_seqlens_cpu: Optional[List[int]] = None
+    # One (batch row, absolute branch depth, spare state slot) per eager extend.
+    gdn_branch_snapshot: Optional[Tuple[int, int, torch.Tensor]] = None
     mamba_prefill_track_mask_cpu: Optional[List[bool]] = None
     mamba_track_mask_cpu: Optional[List[bool]] = None  # shape: [b]
     mamba_track_mask_next_cpu: Optional[List[bool]] = None  # shape: [b]
@@ -2424,6 +2426,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         mamba_track_mask_cpu = []
         mamba_track_positions_cpu = []
         mamba_track_seqlens_cpu = []
+        self.gdn_branch_snapshot = None
 
         for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
             req.extend_batch_idx += 1
@@ -2493,7 +2496,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.is_retracted = False
 
             if get_exec().mamba.enable_mamba_extra_buffer:
-                track_entry = self._mamba_radix_cache_v2_req_prepare_for_extend(req)
+                track_entry = self._mamba_radix_cache_v2_req_prepare_for_extend(req, i)
                 mamba_track_mask_cpu.append(track_entry.track_mask)
                 mamba_track_positions_cpu.append(track_entry.track_position)
                 mamba_track_seqlens_cpu.append(track_entry.track_seqlen)
@@ -2634,6 +2637,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def _mamba_radix_cache_v2_req_prepare_for_extend(
         self,
         req: Req,
+        row: int = 0,
     ) -> _MambaRadixCacheV2TrackEntry:
         cache_chunk_size = mamba_cache_chunk_size()
         state_chunk_size = getattr(
@@ -2708,7 +2712,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 mamba_track_seqlen,
                 cache_chunk_size,
             )
-            if branch is not None:
+            if branch is not None and not self._reserve_gdn_branch_snapshot(
+                req, row, branch, mamba_track_seqlen_aligned
+            ):
                 # We want to track mamba_track_seqlen_aligned, and it's not the last position,
                 # so we need to add 1 to the seqlen to retrieve the correct mamba state from h.
                 # See _force_track_h() for more details.
@@ -2734,6 +2740,46 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             track_position=track_position,
             track_seqlen=mamba_track_seqlen,
         )
+
+    def _reserve_gdn_branch_snapshot(
+        self, req: Req, row: int, branch: int, tail: int
+    ) -> bool:
+        if not envs.SGLANG_EXPERIMENTAL_GDN_BRANCH_AND_TAIL.get():
+            return False
+
+        from sglang.srt.distributed.parallel_state import get_tp_group
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        if (
+            self.gdn_branch_snapshot is not None
+            or req.extend_end < len(req.origin_input_ids)
+            or branch >= tail
+            or branch % self.tree_cache.page_size
+            or branch <= req.kv.cache_protected_len
+            or req.skip_radix_cache_insert
+            or req.session is not None
+            or get_parallel().dcp_enabled
+            or get_disagg().disaggregation_mode != "null"
+            or not get_schedule().disable_overlap_schedule
+            or not get_exec().graph.disable_prefill_cuda_graph
+            or get_exec().mamba.linear_attn_prefill_backend != "triton"
+            or get_exec().mamba.mamba_ssm_dtype != "bfloat16"
+            or not self.spec_algorithm.is_none()
+            or self.model_config.hf_config.architectures
+            != ["Qwen3_5ForConditionalGeneration"]
+            or not isinstance(self.tree_cache, UnifiedRadixCache)
+        ):
+            return False
+        slot = self.tree_cache.reserve_gdn_branch_snapshot(
+            self.token_to_kv_pool_allocator.state_slots.available_size()
+            > len(self.reqs),
+            get_tp_group(),
+            is_middle_chunk=False,
+        )
+        if slot is None:
+            return False
+        self.gdn_branch_snapshot = (row, branch, slot)
+        return True
 
     def _collect_deferred_mamba_cow_and_clear(self, reqs):
         """Collect deferred COW/clear info from requests."""
@@ -3539,6 +3585,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
             mamba_track_seqlens_cpu=self.mamba_track_seqlens_cpu,
+            gdn_branch_snapshot=self.gdn_branch_snapshot,
             mamba_prefill_track_mask_cpu=self.mamba_prefill_track_mask_cpu,
             mamba_track_mask_cpu=self.mamba_track_mask_cpu,
             mamba_track_mask_next_cpu=self.mamba_track_mask_next_cpu,

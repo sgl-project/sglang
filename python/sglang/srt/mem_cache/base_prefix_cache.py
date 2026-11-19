@@ -91,6 +91,7 @@ class InsertParams:
 
     # Mamba specific
     mamba_value: Optional[torch.Tensor] = None
+    mamba_explicit_snapshot: Optional[tuple[int, torch.Tensor]] = None
     # Host-only checkpoint: hicache host-pool index. The radix node keeps this
     # and no GPU slot. Mutually exclusive with mamba_value.
     mamba_host_value: Optional[torch.Tensor] = None

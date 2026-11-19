@@ -1601,6 +1601,49 @@ class UnifiedRadixCache(BasePrefixCache):
             ]
         )
 
+    def reserve_gdn_branch_snapshot(
+        self, spare: bool, tp_group, *, is_middle_chunk: bool
+    ):
+        mamba = self.components.get(ComponentType.MAMBA)
+        if (
+            self.disable
+            or mamba is None
+            or len(self.components) != 2
+            or self.enable_session_radix_cache
+            or self.cache_controller is not None
+            or self.linker is not None
+            or self.tree_core.is_eagle
+            or self._mamba_host_only_checkpoint()
+            or mamba.quantizes_checkpoints
+        ):
+            return None
+        # This optional capture is restricted to the final prefill extend.
+        if is_middle_chunk:
+            return None
+        if tp_group.world_size > 1:
+            capacity = torch.tensor(int(spare), dtype=torch.int32)
+            torch.distributed.all_reduce(
+                capacity, op=torch.distributed.ReduceOp.MIN, group=tp_group.cpu_group
+            )
+            spare = bool(capacity.item())
+        if not spare:
+            return None
+        storage, sub_pool = mamba._state()
+        slot = storage.take_state_slots(sub_pool, 1)
+        assert slot is not None
+        return slot
+
+    def publish_gdn_branch_snapshot(
+        self, req: Req, depth: int, slot: torch.Tensor, *, valid: bool
+    ) -> None:
+        if not valid:
+            self.components[ComponentType.MAMBA]._free_mamba_value(slot)
+            return
+        self._checkpoint_into_tree(
+            req, up_to=depth, mamba_explicit_snapshot=(depth, slot)
+        )
+        logger.debug("GDN branch snapshot published at %d for %s", depth, req.rid)
+
     def checkpoint_into_tree(self, req: Req, *, up_to: int, **kwargs) -> None:
         """Insert ``[cache_protected_len, up_to)`` of the request's record and
         move its tree lock onto the node the insert ended on."""
@@ -1609,10 +1652,12 @@ class UnifiedRadixCache(BasePrefixCache):
         if is_finished:
             self._release_request_mamba(req)
 
-    def _checkpoint_into_tree(self, req: Req, *, up_to: int, **kwargs) -> None:
-        # A finished request hands its component state (mamba) to the tree
-        # instead of forking it, and the tree frees what the request still held.
-        is_finished = req.finished()
+    def _checkpoint_into_tree(
+        self, req: Req, *, up_to: int, mamba_explicit_snapshot=None, **kwargs
+    ) -> None:
+        # An explicit branch state owns its own slot. Keep the request's
+        # tracked tail and its normal final donation separate from this insert.
+        is_finished = req.finished() and mamba_explicit_snapshot is None
         token_ids = req.full_untruncated_fill_ids[:up_to]
 
         if self.disable:
@@ -1632,6 +1677,7 @@ class UnifiedRadixCache(BasePrefixCache):
             priority=req.priority or 0,
             session_id=req.session_id,
             rotation_base=req.kv_rotation_base,
+            mamba_explicit_snapshot=mamba_explicit_snapshot,
         )
         effective_cache_len = len(token_ids)
         for comp in self._components_tuple:
