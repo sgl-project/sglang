@@ -71,7 +71,7 @@ class TestPackedDraftRanges(CustomTestCase):
         self.assertEqual(_ordered_layers(entry), [3, 5])
         linker = UMBPDirectLinker.__new__(UMBPDirectLinker)
         linker.pools = {PoolName.SWA: entry}
-        plan = _PoolRangePlan(PoolName.SWA, ["page"], [1], 1)
+        plan = _PoolRangePlan(PoolName.SWA, ["page"], [1], 1, entry)
         self.assertEqual(
             linker._layer_group_ranges(plan, [3]),
             (
