@@ -226,17 +226,18 @@ class TestGemm(CustomTestCase):
         input[:, ::4] *= 1e-4
         if rows > 1:
             input[0].zero_()
+            input[1] *= 1e-6
         if strided:
             storage = torch.empty(rows, columns + 32, dtype=torch.bfloat16)
             storage[:, :columns] = input
             input = storage[:, :columns]
 
-        scales = (input.float().abs().amax(dim=1) / 448).clamp_min(
-            torch.finfo(torch.float32).eps
-        )
+        fp8_max = torch.finfo(torch.float8_e4m3fn).max
+        scales = input.float().abs().amax(dim=1) / fp8_max
+        inverse_scales = torch.where(scales == 0, 0, scales.reciprocal())
         expected = (
-            (input.float() * scales.reciprocal().unsqueeze(1))
-            .clamp(-448, 448)
+            (input.float() * inverse_scales.unsqueeze(1))
+            .clamp(-fp8_max, fp8_max)
             .to(torch.float8_e4m3fn)
         )
         output, output_scales = torch.ops.sgl_kernel.per_token_quant_fp8_cpu(input)

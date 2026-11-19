@@ -3,37 +3,38 @@
 
 namespace {
 
+constexpr auto FP8_E4M3_MAX = std::numeric_limits<at::Float8_e4m3fn>::max();
+
 template <CpuIsa isa>
 void quantize_row_fp8(
     at::Float8_e4m3fn* __restrict__ out,
     float& scale,
     const at::BFloat16* __restrict__ input,
-    int64_t size) {
-  const float fp8_max = static_cast<float>(std::numeric_limits<at::Float8_e4m3fn>::max());
+    int size) {
+  const float fp8_max = static_cast<float>(FP8_E4M3_MAX);
   const __m512 sign_mask = _mm512_set1_ps(-0.0f);
   const __m512 upper = _mm512_set1_ps(fp8_max);
   const __m512 lower = _mm512_set1_ps(-fp8_max);
-  __m512 maximum0 = _mm512_setzero_ps();
-  __m512 maximum1 = _mm512_setzero_ps();
-  for (int64_t d = 0; d < size; d += 32) {
+  __m512 vmax = _mm512_setzero_ps();
+  for (int d = 0; d < size; d += 32) {
     __m512i packed = _mm512_loadu_si512(input + d);
     __m512 values0 = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(packed, 0));
     __m512 values1 = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(packed, 1));
-    maximum0 = _mm512_max_ps(maximum0, _mm512_andnot_ps(sign_mask, values0));
-    maximum1 = _mm512_max_ps(maximum1, _mm512_andnot_ps(sign_mask, values1));
+    vmax = _mm512_max_ps(vmax, _mm512_andnot_ps(sign_mask, values0));
+    vmax = _mm512_max_ps(vmax, _mm512_andnot_ps(sign_mask, values1));
   }
-  float maximum = _mm512_reduce_max_ps(_mm512_max_ps(maximum0, maximum1));
-  scale = std::max(maximum / fp8_max, std::numeric_limits<float>::epsilon());
-  __m512 inverse_scale = _mm512_set1_ps(1.f / scale);
-  for (int64_t d = 0; d < size; d += 32) {
+  float maximum = _mm512_reduce_max_ps(vmax);
+  scale = maximum / fp8_max;
+  __m512 rscale = _mm512_set1_ps(scale == 0.f ? 0.f : 1.f / scale);
+  for (int d = 0; d < size; d += 32) {
     __m512i packed = _mm512_loadu_si512(input + d);
     __m512 values0 = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(packed, 0));
     __m512 values1 = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(packed, 1));
-    values0 = _mm512_min_ps(upper, _mm512_max_ps(lower, _mm512_mul_ps(values0, inverse_scale)));
-    values1 = _mm512_min_ps(upper, _mm512_max_ps(lower, _mm512_mul_ps(values1, inverse_scale)));
-    __m128i quantized0 = CVT_FP32_TO_FP8(isa, values0);
-    __m128i quantized1 = CVT_FP32_TO_FP8(isa, values1);
-    _mm256_storeu_si256(reinterpret_cast<__m256i*>(out + d), _mm256_set_m128i(quantized1, quantized0));
+    values0 = _mm512_min_ps(upper, _mm512_max_ps(lower, _mm512_mul_ps(values0, rscale)));
+    values1 = _mm512_min_ps(upper, _mm512_max_ps(lower, _mm512_mul_ps(values1, rscale)));
+    __m128i quants0 = CVT_FP32_TO_FP8(values0);
+    __m128i quants1 = CVT_FP32_TO_FP8(values1);
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(out + d), _mm256_set_m128i(quants1, quants0));
   }
 }
 

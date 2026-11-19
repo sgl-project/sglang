@@ -93,8 +93,6 @@ inline void store_from_float_ext<at::Half>(at::Half* out, const Vectorized<float
 
 #define CVT_FP16_TO_FP32(a) _mm512_cvtph_ps(a)
 
-#define CVT_FP32_TO_FP8(isa, values) cvtfp32_fp8e4m3<isa>((values))
-
 template <CpuIsa isa>
 inline __m128i cvtfp32_fp8e4m3(__m512 values) {
   static_assert(isa == CpuIsa::AMX);
@@ -110,6 +108,8 @@ __attribute__((target("avx10.2"))) inline __m128i cvtfp32_fp8e4m3<CpuIsa::AVX10_
   return _mm256_cvtph_hf8(_mm256_castsi256_ph(rounded_to_odd));
 }
 #endif
+
+#define CVT_FP32_TO_FP8(values) cvtfp32_fp8e4m3<isa>((values))
 
 // this doesn't handle NaN.
 inline __m512bh cvt_e4m3_bf16_intrinsic_no_nan(__m256i fp8_vec) {
