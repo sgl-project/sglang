@@ -10,9 +10,11 @@ A rule is ``<pattern>=<format>``. Patterns match against the layer prefix
 (``blocks.12.ffn.fc_out``): a pattern without a glob character matches on
 dotted path boundaries, the match ``--quantization-ignored-layers`` uses, and
 a pattern holding ``*``, ``?`` or ``[`` is matched as a glob against the whole
-prefix. Rules are tried in order and the first match wins, so an explicit rule
-placed ahead of a broader one overrides it. A layer no rule claims takes the
-base format, and an ignored layer stays unquantized whichever rule claims it.
+prefix. A glob claims a fused layer (``to_qkv``) when it claims every shard of
+it (``to_q``, ``to_k``, ``to_v``). Rules are tried in order and the first match
+wins, so an explicit rule placed ahead of a broader one overrides it. A layer
+no rule claims takes the base format, and an ignored layer stays unquantized
+whichever rule claims it.
 
 Routing covers only formats quantized after load, since a pre-quantized
 checkpoint fixes each tensor's format on disk.
@@ -49,9 +51,38 @@ def _is_glob(pattern: str) -> bool:
     return any(char in pattern for char in _GLOB_CHARS)
 
 
+def _glob_matches(
+    pattern: str, prefix: str, fused_mapping: dict[str, list[str]]
+) -> bool:
+    """Match a glob against the layer, or against every shard of a fused layer.
+
+    A fused layer such as ``to_qkv`` exists only in the built model, so a glob
+    written against checkpoint names (``*.to_q``) claims it when it claims all
+    of its shards. A glob that claims only some shards is refused, since the
+    fused layer can take only one format.
+    """
+    if fnmatchcase(prefix, pattern):
+        return True
+    module_path, _, proj_name = prefix.rpartition(".")
+    shard_names = fused_mapping.get(proj_name)
+    if not shard_names:
+        return False
+    shard_prefixes = [
+        f"{module_path}.{shard}" if module_path else shard for shard in shard_names
+    ]
+    shard_hits = {fnmatchcase(shard, pattern) for shard in shard_prefixes}
+    if len(shard_hits) > 1:
+        raise ValueError(
+            f"--quantization-overrides pattern {pattern!r} matches some but not "
+            f"all shards of the fused layer {prefix} ({', '.join(shard_prefixes)}); "
+            "all shards of a fused layer must take the same format"
+        )
+    return shard_hits.pop()
+
+
 def _matches(pattern: str, prefix: str, fused_mapping: dict[str, list[str]]) -> bool:
     if _is_glob(pattern):
-        return fnmatchcase(prefix, pattern)
+        return _glob_matches(pattern, prefix, fused_mapping)
     return is_layer_skipped(prefix, [pattern], fused_mapping=fused_mapping)
 
 
@@ -101,18 +132,41 @@ class MixedPrecisionConfig(QuantizationConfig):
         self.base_format = base_format
         self.rules = rules
         self.ignored_layers = ignored_layers or []
-        self.packed_modules_mapping = packed_modules_mapping or {}
         # Each sub-config takes its own copy of the ignored list, since a config
         # may extend the list it is given with its own environment overrides.
         self._configs: dict[str, QuantizationConfig] = {
             name: get_quantization_config(name)(
                 ignored_layers=list(self.ignored_layers),
-                packed_modules_mapping=dict(self.packed_modules_mapping),
             )
             for name in dict.fromkeys([base_format] + [rule.format for rule in rules])
         }
+        self.packed_modules_mapping = packed_modules_mapping or {}
         self._layer_formats: Counter[str] = Counter()
         self._rule_hits: Counter[int] = Counter()
+
+    @property
+    def packed_modules_mapping(self) -> dict[str, list[str]]:
+        return self._packed_modules_mapping
+
+    @packed_modules_mapping.setter
+    def packed_modules_mapping(self, mapping: dict[str, list[str]]) -> None:
+        # The loader sets the model's fused-layer mapping after this config is
+        # built. Every sub-config needs it to apply its ignored list to fused
+        # layers, so the mapping goes to each of them as well.
+        self._packed_modules_mapping = mapping
+        for config in getattr(self, "_configs", {}).values():
+            config.packed_modules_mapping = mapping
+
+    @property
+    def sub_configs(self) -> tuple[QuantizationConfig, ...]:
+        """The config of each format a layer can be routed to."""
+        return tuple(self._configs.values())
+
+    @property
+    def supports_fsdp(self) -> bool:
+        return all(
+            getattr(config, "supports_fsdp", True) for config in self.sub_configs
+        )
 
     @classmethod
     def get_name(cls) -> str:
@@ -137,6 +191,10 @@ class MixedPrecisionConfig(QuantizationConfig):
             "mixed precision is selected with --quantization-overrides, not "
             "declared by a checkpoint"
         )
+
+    def remap_checkpoint_prefixes(self, param_names_mapping: dict) -> None:
+        for config in self._configs.values():
+            config.remap_checkpoint_prefixes(param_names_mapping)
 
     def _resolve(self, prefix: str) -> tuple[str, int | None]:
         """Format for this layer, and the index of the rule that chose it."""
@@ -213,3 +271,15 @@ class MixedPrecisionConfig(QuantizationConfig):
                 "No layer matched these --quantization-overrides patterns: %s",
                 ", ".join(unmatched),
             )
+
+
+def quant_sub_configs(
+    config: QuantizationConfig | None,
+) -> tuple[QuantizationConfig, ...]:
+    """The configs that quantize layers: each routed format of a mixed config,
+    or the config itself."""
+    if config is None:
+        return ()
+    if isinstance(config, MixedPrecisionConfig):
+        return config.sub_configs
+    return (config,)

@@ -552,6 +552,12 @@ pattern holding `*`, `?` or `[` is matched as a glob against the whole layer
 prefix, which is how a rule names a leaf across every block
 (`'*.ffn.fc_out=fp8'`).
 
+Some models fuse projections that the checkpoint stores separately, such as
+`to_q`, `to_k` and `to_v` into one `to_qkv` layer on Qwen-Image and FLUX.2. A
+glob claims the fused layer when it matches its own name (`'*.attn.to_qkv'`) or
+every one of its shards (`'*.attn.to_[qkv]'`). A fused layer takes one format,
+so a glob that matches only some of its shards (`'*.attn.to_q'`) is rejected.
+
 Entries are tried in order and the first match wins, so a specific rule placed
 ahead of a broader one overrides it. A layer no rule claims takes the
 `--quantization` format, and `--quantization-ignored-layers` outranks every

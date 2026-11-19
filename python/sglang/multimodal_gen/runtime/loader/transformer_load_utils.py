@@ -35,6 +35,11 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config i
     NunchakuConfig,
     _patch_nunchaku_scales,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.mixed_precision import (
+    MixedPrecisionConfig,
+    parse_precision_rules,
+    quant_sub_configs,
+)
 from sglang.multimodal_gen.runtime.loader.gguf_weights import (
     names_gguf_checkpoint,
     read_gguf_tensor_meta,
@@ -180,7 +185,10 @@ class TransformerQuantLoadSpec:
 
     @property
     def is_convrot_int8(self) -> bool:
-        return isinstance(self.quant_config, ConvRotInt8Config)
+        configs = quant_sub_configs(self.quant_config)
+        return bool(configs) and all(
+            isinstance(config, ConvRotInt8Config) for config in configs
+        )
 
     @property
     def is_serialized_convrot_int8(self) -> bool:
@@ -824,6 +832,13 @@ def _needs_device_weight_postprocess(
     quant_config: Optional[QuantizationConfig],
 ) -> bool:
     """Return whether post-load weight processing needs CUDA/NPU tensors."""
+    return any(
+        _config_needs_device_weight_postprocess(config)
+        for config in quant_sub_configs(quant_config)
+    )
+
+
+def _config_needs_device_weight_postprocess(quant_config: QuantizationConfig) -> bool:
     quant_name = _get_quant_config_name(quant_config)
     if quant_name in ("modelopt_fp8", "comfy_fp8", "auto-round", "mxfp8"):
         return True
@@ -998,11 +1013,6 @@ def _resolve_quant_config_from_transformer_override(
 
 def _build_mixed_precision_config(*, server_args: ServerArgs) -> QuantizationConfig:
     """Build the per-layer routing config from --quantization-overrides."""
-    from sglang.multimodal_gen.runtime.layers.quantization.mixed_precision import (
-        MixedPrecisionConfig,
-        parse_precision_rules,
-    )
-
     rules = parse_precision_rules(
         server_args.quantization_overrides,
         supported_formats=ONLINE_QUANTIZATION_METHODS,

@@ -138,6 +138,39 @@ class TestMixedPrecisionRouting(unittest.TestCase):
         self.assertIsNone(config.get_quant_method(layer, "blocks.5.to_q"))
 
 
+class TestFusedLayerRouting(unittest.TestCase):
+    _FUSED = {"to_qkv": ["to_q", "to_k", "to_v"]}
+
+    def _fused_config(self, pattern: str):
+        config = _build_config("mxfp4", [PrecisionRule(pattern=pattern, format="fp8")])
+        config.packed_modules_mapping = self._FUSED
+        return config
+
+    def test_packed_mapping_set_after_build_reaches_every_sub_config(self):
+        config = self._fused_config("blocks.0")
+
+        for sub_config in config.sub_configs:
+            self.assertEqual(self._FUSED, sub_config.packed_modules_mapping)
+
+    def test_glob_claims_a_fused_layer_through_all_its_shards(self):
+        config = self._fused_config("blocks.*.attn.to_[qkv]")
+
+        self.assertEqual("fp8", config.format_for("blocks.3.attn.to_qkv"))
+
+    def test_glob_naming_the_fused_layer_claims_it(self):
+        config = self._fused_config("blocks.*.attn.to_qkv")
+
+        self.assertEqual("fp8", config.format_for("blocks.3.attn.to_qkv"))
+        self.assertEqual("mxfp4", config.format_for("blocks.3.attn.to_out"))
+
+    def test_glob_claiming_some_shards_is_refused(self):
+        """A fused layer takes one format, so a glob cannot split its shards."""
+        config = self._fused_config("blocks.*.attn.to_q")
+
+        with self.assertRaisesRegex(ValueError, "some but not all shards"):
+            config.format_for("blocks.3.attn.to_qkv")
+
+
 class TestServerArgsValidation(unittest.TestCase):
     def _server_args(self, **fields):
         from sglang.multimodal_gen.runtime.server_args.server_args import ServerArgs

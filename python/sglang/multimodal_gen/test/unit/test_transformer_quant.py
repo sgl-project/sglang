@@ -77,6 +77,10 @@ from sglang.multimodal_gen.runtime.layers.quantization.fp8 import (
     Fp8Config,
     Fp8LinearMethod,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.mixed_precision import (
+    MixedPrecisionConfig,
+    PrecisionRule,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp4LinearMethod,
@@ -93,6 +97,7 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader i
     TransformerLoader,
     _default_quantized_attention_backend,
     _resolve_checkpoint_load_device,
+    _validate_fsdp_quantization,
     _warn_if_expected_param_dtype_missing,
 )
 from sglang.multimodal_gen.runtime.loader.minimax_h3_weights import (
@@ -2092,6 +2097,122 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         self.assertIsInstance(block.proj_mlp.quant_method, UnquantizedLinearMethod)
         self.assertIsInstance(block.proj_out.quant_method, UnquantizedLinearMethod)
         self.assertIsInstance(block.attn.to_q.quant_method, UnquantizedLinearMethod)
+
+
+class _FakeFusedQkvTransformer:
+    packed_modules_mapping = {"to_qkv": ["to_q", "to_k", "to_v"]}
+
+
+class TestMixedPrecisionLoading(unittest.TestCase):
+    """The loader treats a mixed config as the union of its routed formats."""
+
+    def _server_args(self, **overrides):
+        defaults = dict(
+            transformer_weights_path=None,
+            pipeline_config=SimpleNamespace(
+                dit_precision="bf16",
+                dit_config=SimpleNamespace(
+                    arch_config=SimpleNamespace(
+                        param_names_mapping={},
+                        reverse_param_names_mapping={},
+                        quant_ignore_remap={},
+                    )
+                ),
+            ),
+            nunchaku_config=None,
+            quantization="mxfp4",
+            quantization_ignored_layers=None,
+            quantization_overrides=None,
+            revision="test-revision",
+            tp_size=1,
+            dit_cpu_offload=False,
+            direct_gpu_weight_loading=False,
+            text_encoder_cpu_offload=False,
+        )
+        defaults.update(overrides)
+        return SimpleNamespace(**defaults)
+
+    def _load_spec(self, server_args):
+        return resolve_transformer_quant_load_spec(
+            hf_config={},
+            server_args=server_args,
+            safetensors_list=[],
+            component_model_path="/unused/component/path",
+            model_cls=_FakeFusedQkvTransformer,
+            cls_name=_FakeFusedQkvTransformer.__name__,
+        )
+
+    def test_ignored_shards_keep_a_fused_layer_unquantized_in_every_format(self):
+        """The model's fused-layer mapping reaches each routed config, so
+        ignoring every shard of ``to_qkv`` keeps it unquantized whichever
+        format the layer is routed to."""
+        ignored = [
+            f"blocks.{block}.attn.{shard}"
+            for block in (0, 1)
+            for shard in ("to_q", "to_k", "to_v")
+        ]
+        spec = self._load_spec(
+            self._server_args(
+                quantization_overrides=["blocks.0=fp8"],
+                quantization_ignored_layers=ignored,
+            )
+        )
+        config = spec.quant_config
+        layer = LinearBase(input_size=16, output_size=48)
+
+        self.assertIsInstance(config, MixedPrecisionConfig)
+        for sub_config in config.sub_configs:
+            self.assertEqual(
+                _FakeFusedQkvTransformer.packed_modules_mapping,
+                sub_config.packed_modules_mapping,
+            )
+        for prefix, format_name in (
+            ("blocks.0.attn.to_qkv", "fp8"),
+            ("blocks.1.attn.to_qkv", "mxfp4"),
+        ):
+            with self.subTest(prefix=prefix):
+                self.assertEqual(format_name, config.format_for(prefix))
+                self.assertIsInstance(
+                    config.get_quant_method(layer, prefix), UnquantizedLinearMethod
+                )
+
+    def test_device_postprocess_follows_the_routed_formats(self):
+        """A mix that holds FP8 or MXFP4 quantizes on the device after load,
+        like each of those formats alone."""
+        for base_format, rule_format in (
+            ("mxfp4", "fp8"),
+            ("convrot_int8", "fp8"),
+            ("convrot_int8", "mxfp4"),
+        ):
+            with self.subTest(base=base_format, rule=rule_format):
+                config = MixedPrecisionConfig(
+                    base_format=base_format,
+                    rules=(PrecisionRule(pattern="blocks.0", format=rule_format),),
+                )
+                spec = TransformerQuantLoadSpec([], config, None, None)
+
+                self.assertTrue(_needs_device_weight_postprocess(config))
+                self.assertFalse(spec.is_convrot_int8)
+
+    def test_fsdp_pins_comfy_kitchen_for_a_routed_convrot_config(self):
+        config = MixedPrecisionConfig(
+            base_format="mxfp4",
+            rules=(PrecisionRule(pattern="blocks.0", format="convrot_int8"),),
+        )
+        (convrot,) = [
+            sub_config
+            for sub_config in config.sub_configs
+            if isinstance(sub_config, ConvRotInt8Config)
+        ]
+        spec = TransformerQuantLoadSpec([], config, None, None)
+
+        convrot.backend = "auto"
+        _validate_fsdp_quantization(spec)
+        self.assertEqual("comfy_kitchen", convrot.backend)
+
+        convrot.backend = "jit"
+        with self.assertRaisesRegex(ValueError, "diffusion FSDP"):
+            _validate_fsdp_quantization(spec)
 
 
 if __name__ == "__main__":

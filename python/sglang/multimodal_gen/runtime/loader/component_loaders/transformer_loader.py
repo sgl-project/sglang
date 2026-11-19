@@ -19,6 +19,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.convrot_int8_conf
 )
 from sglang.multimodal_gen.runtime.layers.quantization.mixed_precision import (
     MixedPrecisionConfig,
+    quant_sub_configs,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     OnlineQuantizationComponentLoader,
@@ -66,6 +67,37 @@ def _resolve_checkpoint_load_device(
     ):
         return torch.device("cpu")
     return runtime_device
+
+
+def _validate_fsdp_quantization(quant_spec: TransformerQuantLoadSpec) -> None:
+    """Refuse quantization that FSDP cannot shard, and pin the ConvRot backend."""
+    if not getattr(quant_spec.quant_config, "supports_fsdp", True):
+        raise ValueError(
+            f"{quant_spec.quant_config.get_name()} does not support FSDP; "
+            "use TP and/or Ulysses SP"
+        )
+    if quant_spec.uses_comfy_layer_markers:
+        raise ValueError(
+            "Comfy quantized checkpoints do not support FSDP "
+            "inference; use TP and/or sequence parallelism instead"
+        )
+    if (
+        quant_spec.quant_config is not None
+        and quant_spec.quant_config.get_name() == "auto-round"
+    ):
+        raise ValueError(
+            "AutoRound checkpoints do not support diffusion FSDP inference; "
+            "use TP and/or sequence parallelism instead"
+        )
+    for config in quant_sub_configs(quant_spec.quant_config):
+        if (
+            isinstance(config, ConvRotInt8Config)
+            and not config.is_checkpoint_int8_serialized
+        ):
+            # Only the comfy_kitchen backend has run under FSDP.
+            config.require_comfy_kitchen(
+                "has not been validated with diffusion FSDP inference"
+            )
 
 
 def _minimax_h3_adaln_cache_key_filter(name: str) -> bool:
@@ -388,34 +420,8 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
             or cpu_offload_flag
         )
         use_fsdp = server_args.should_use_fsdp_for_component(component_name)
-        if use_fsdp and not getattr(quant_spec.quant_config, "supports_fsdp", True):
-            raise ValueError(
-                f"{quant_spec.quant_config.get_name()} does not support FSDP; "
-                "use TP and/or Ulysses SP"
-            )
-        if quant_spec.uses_comfy_layer_markers and use_fsdp:
-            raise ValueError(
-                "Comfy quantized checkpoints do not support FSDP "
-                "inference; use TP and/or sequence parallelism instead"
-            )
-        if (
-            use_fsdp
-            and quant_spec.quant_config is not None
-            and quant_spec.quant_config.get_name() == "auto-round"
-        ):
-            raise ValueError(
-                "AutoRound checkpoints do not support diffusion FSDP inference; "
-                "use TP and/or sequence parallelism instead"
-            )
-        if (
-            use_fsdp
-            and isinstance(quant_spec.quant_config, ConvRotInt8Config)
-            and not quant_spec.quant_config.is_checkpoint_int8_serialized
-        ):
-            # Only the comfy_kitchen backend has run under FSDP.
-            quant_spec.quant_config.require_comfy_kitchen(
-                "has not been validated with diffusion FSDP inference"
-            )
+        if use_fsdp:
+            _validate_fsdp_quantization(quant_spec)
 
         if quant_spec.gguf_file is not None:
             logger.info(
