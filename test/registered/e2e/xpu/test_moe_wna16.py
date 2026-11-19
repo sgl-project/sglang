@@ -563,8 +563,10 @@ class TestXpuMoeWna16(CustomTestCase):
         self.assertFalse(can_use_xpu_fp8_moe(default_config, [32, 32], use_mxfp8=False))
 
         # EP checks
-        with get_parallel().override(tp_size=2, moe_ep_size=2, attn_tp_size=2):
-            self.assertFalse(can_use_xpu_fp8_moe(default_config, None))
+        local_config = MoeRunnerConfig(
+            activation="silu", is_gated=True, num_experts=8, num_local_experts=8
+        )
+        self.assertTrue(can_use_xpu_fp8_moe(local_config, None))
         non_local_config = MoeRunnerConfig(
             activation="silu", is_gated=True, num_experts=8, num_local_experts=4
         )

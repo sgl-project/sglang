@@ -37,7 +37,6 @@ from sglang.srt.layers import deep_gemm_wrapper, offloader
 from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
 from sglang.srt.runtime_context import (
     get_exec,
-    get_parallel,
     get_platform,
 )
 from sglang.srt.utils import (
@@ -856,22 +855,17 @@ def can_use_xpu_fp8_moe(
         ("gelu_tanh", True),
         ("relu2", False),
     )
-    try:
-        ep_active = get_parallel().moe_ep_size > 1
-    except (RuntimeError, ValueError):
-        ep_active = False
-
+    is_ep = (
+        config.num_experts is not None
+        and config.num_local_experts is not None
+        and config.num_experts != config.num_local_experts
+    )
     return (
         valid_block
         and supported_act
         and not config.apply_router_weight_on_input
         and not config.no_combine
-        and not ep_active
-        and not (
-            config.num_experts is not None
-            and config.num_local_experts is not None
-            and config.num_experts != config.num_local_experts
-        )
+        and not is_ep
     )
 
 
