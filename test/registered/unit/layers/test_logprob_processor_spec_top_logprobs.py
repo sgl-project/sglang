@@ -13,7 +13,7 @@ from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     _top_logprobs_to_lists,
 )
-from sglang.srt.managers.utils import _rows_d2h
+from sglang.srt.managers.utils import _async_d2h_top_logprobs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -49,8 +49,8 @@ def _host_rows(nums, greedy, logits, predict, **layout):
     compute_spec_logprobs(_batch(nums, greedy), out, predict.clone(), **layout)
     batched = torch.is_tensor(out.next_token_top_logprobs_val)
     val, idx = _top_logprobs_to_lists(
-        _rows_d2h(out.next_token_top_logprobs_val),
-        _rows_d2h(out.next_token_top_logprobs_idx),
+        _async_d2h_top_logprobs(out.next_token_top_logprobs_val),
+        _async_d2h_top_logprobs(out.next_token_top_logprobs_idx),
     )
     return batched, val, idx
 

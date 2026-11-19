@@ -52,7 +52,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _rows_d2h(
+def _async_d2h_top_logprobs(
     rows: Optional[Union[torch.Tensor, List]],
 ) -> Optional[Union[torch.Tensor, List]]:
     if rows is None:
@@ -246,10 +246,10 @@ class GenerationBatchResult:
                 self.logits_output.input_token_logprobs = _async_d2h(
                     self.logits_output.input_token_logprobs
                 )
-            self.logits_output.next_token_top_logprobs_val = _rows_d2h(
+            self.logits_output.next_token_top_logprobs_val = _async_d2h_top_logprobs(
                 self.logits_output.next_token_top_logprobs_val
             )
-            self.logits_output.next_token_top_logprobs_idx = _rows_d2h(
+            self.logits_output.next_token_top_logprobs_idx = _async_d2h_top_logprobs(
                 self.logits_output.next_token_top_logprobs_idx
             )
             if self.logits_output.next_token_token_ids_logprobs_val is not None:
