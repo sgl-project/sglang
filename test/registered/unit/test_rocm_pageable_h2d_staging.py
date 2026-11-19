@@ -3,7 +3,8 @@
 The default raised here is what keeps the loader out of the MMU-notifier eviction
 loop, so what is worth pinning is that it is a default and not an override: an
 operator who has tuned the threshold must keep their value. The same hook defaults
-aiter's AITER_FORCE_A8W4 on gfx1250, again without overriding an operator's value.
+aiter's AITER_FORCE_A8W4 on gfx1250 and the Triton decode KV split count, again
+without overriding an operator's value.
 """
 
 import os
@@ -11,7 +12,9 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.arg_groups.platform_hook import handle_amd_specifics
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -98,6 +101,36 @@ class TestGfx1250AiterA8W4Default(CustomTestCase):
         os.environ[self.VAR] = "0"
         self._run("gfx1250")
         self.assertEqual(os.environ[self.VAR], "0")
+
+
+class TestRocmTritonKvSplitsDefault(CustomTestCase):
+    FIELD = "triton_attention_num_kv_splits"
+
+    def setUp(self):
+        saved = {v: os.environ.get(v) for v in (VAR, "AITER_FORCE_A8W4")}
+        self.addCleanup(TestGfx1250AiterA8W4Default._restore, saved)
+
+    def _resolved(self, is_hip, **kwargs):
+        server_args = ServerArgs(model_path="dummy", **kwargs)
+        server_args._raw_input = {self.FIELD: getattr(server_args, self.FIELD)}
+        with patch(
+            "sglang.srt.arg_groups.platform_hook.get_platform",
+            return_value=_Platform(is_hip),
+        ):
+            handle_amd_specifics(server_args)
+        return resolution_result(server_args, self.FIELD)
+
+    def test_defaults_to_16_on_hip(self):
+        self.assertEqual(self._resolved(is_hip=True), 16)
+
+    def test_an_operators_value_survives(self):
+        self.assertEqual(self._resolved(is_hip=True, **{self.FIELD: 32}), 32)
+
+    def test_an_explicit_8_survives(self):
+        self.assertEqual(self._resolved(is_hip=True, **{self.FIELD: 8}), 8)
+
+    def test_defaults_to_8_off_hip(self):
+        self.assertEqual(self._resolved(is_hip=False), 8)
 
 
 if __name__ == "__main__":
