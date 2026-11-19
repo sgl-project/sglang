@@ -126,7 +126,6 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.capacity import capacity_decision
 from sglang.srt.mem_cache.common import (
     RetractionBackup,
-    evict_from_tree_cache,
     match_kv_cache,
 )
 from sglang.srt.mem_cache.kv.advance import TrackingAdvance
@@ -1797,24 +1796,6 @@ def unresumable_abort_message() -> str:
     )
 
 
-def release_req(
-    *,
-    req: Req,
-    remaing_req_count: int,
-    tree_cache: BasePrefixCache,
-    request_retirer: RequestRetirer,
-    offload_kv: bool = True,
-) -> bool:
-    """Returns whether the request can be resumed."""
-    resumable = request_retirer.retract(req, offload_kv=offload_kv)
-    # NOTE(lsyin): we should use the newly evictable memory instantly.
-    num_tokens = remaing_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
-    evict_from_tree_cache(tree_cache, num_tokens)
-
-    req.reset_for_retract()
-    return resumable
-
-
 def free_beam_member_rows(
     req: Req, req_to_token_pool, token_to_kv_pool_allocator
 ) -> None:
@@ -1828,7 +1809,6 @@ def free_beam_member_rows(
 def retract_all(
     *,
     reqs: List[Req],
-    tree_cache: BasePrefixCache,
     request_retirer: RequestRetirer,
     offload_kv: bool = True,
 ) -> List[Req]:
@@ -1838,31 +1818,20 @@ def retract_all(
     reqs_to_abort = []
     for idx, req in enumerate(reqs):
         if req.beam_group is not None:
-            req.request_finish(
+            _abort_victim(
+                req,
                 FINISH_ABORT(
                     "Beam search group aborted: beam groups cannot be retracted, "
                     "so they are aborted instead of being requeued.",
                     status_code=HTTPStatus.SERVICE_UNAVAILABLE,
-                )
-            )
-            free_beam_member_rows(
-                req, tree_cache.req_to_token_pool, tree_cache.token_to_kv_pool_allocator
-            )
-            release_req(
-                req=req,
-                remaing_req_count=len(reqs) - idx,
-                tree_cache=tree_cache,
+                ),
                 request_retirer=request_retirer,
-                offload_kv=False,
+                remaining_req_count=len(reqs) - idx,
             )
             reqs_to_abort.append(req)
             continue
-        if not release_req(
-            req=req,
-            remaing_req_count=len(reqs) - idx,
-            tree_cache=tree_cache,
-            request_retirer=request_retirer,
-            offload_kv=offload_kv,
+        if not request_retirer.retract(
+            req, remaining_req_count=len(reqs) - idx, offload_kv=offload_kv
         ):
             req.request_finish(
                 FINISH_ABORT(
@@ -1872,6 +1841,131 @@ def retract_all(
             )
             reqs_to_abort.append(req)
     return reqs_to_abort
+
+
+def _abort_victim(
+    req: Req,
+    reason: FINISH_ABORT,
+    *,
+    request_retirer: RequestRetirer,
+    remaining_req_count: int,
+) -> None:
+    """Abort a retraction victim and release what it holds."""
+    req.request_finish(reason)
+    if req.beam_group is not None:
+        tree_cache = request_retirer.tree_cache
+        free_beam_member_rows(
+            req, tree_cache.req_to_token_pool, tree_cache.token_to_kv_pool_allocator
+        )
+    # Aborting, so a host backup to resume from would be wasted.
+    request_retirer.retract(
+        req, remaining_req_count=remaining_req_count, offload_kv=False
+    )
+
+
+def _retract_victim(
+    req: Req,
+    *,
+    request_retirer: RequestRetirer,
+    remaining_req_count: int,
+) -> bool:
+    """Retract one victim; return whether it can resume, else it is aborted
+    with its reason recorded."""
+    if req.beam_group is not None:
+        _abort_victim(
+            req,
+            FINISH_ABORT(
+                "Beam search group aborted: KV cache pool is full. Beam "
+                "groups cannot be retracted, so they are aborted instead "
+                "of being requeued.",
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            ),
+            request_retirer=request_retirer,
+            remaining_req_count=remaining_req_count,
+        )
+        return False
+    # release memory and don't insert into the tree because we need the space instantly
+    if request_retirer.retract(
+        req, remaining_req_count=remaining_req_count, offload_kv=True
+    ):
+        return True
+    # No backup or rebuild exists and the device KV is already freed.
+    if get_disagg().disaggregation_mode != "decode":
+        message = unresumable_abort_message()
+        status_code = HTTPStatus.SERVICE_UNAVAILABLE
+    elif get_disagg().disaggregation_decode_retraction_backup == "host_pool":
+        message = "Retraction host KV pool exhausted. Aborting the request."
+        status_code = HTTPStatus.INTERNAL_SERVER_ERROR
+    else:
+        message = (
+            "Retracted under decode memory pressure without a KV backup. Retry later."
+        )
+        status_code = HTTPStatus.SERVICE_UNAVAILABLE
+    req.request_finish(FINISH_ABORT(message, status_code=status_code))
+    logger.warning("retract_decode: aborted request %s: %s", req.rid, message)
+    return False
+
+
+@capacity_decision
+def retract_decode(
+    *, batch: ScheduleBatch, request_retirer: RequestRetirer
+) -> Tuple[List[Req], float, List[Req]]:
+    """Retract the decoding requests when there is not enough memory."""
+    sorted_indices = batch._get_decode_retraction_order(batch.reqs)
+    sorted_indices = beam_retraction_order(sorted_indices, batch.reqs)
+
+    retracted_reqs = []
+    reqs_to_abort: List[Req] = []
+    # Victim selection: retract the least preferred request, then re-check the
+    # memory the rest need.
+    first_iter = True
+    while first_iter or (not batch.check_decode_mem(selected_indices=sorted_indices)):
+        if len(sorted_indices) == 1:
+            # Always keep at least one request
+            break
+
+        first_iter = False
+        idx = sorted_indices.pop()
+        req = batch.reqs[idx]
+        if _retract_victim(
+            req,
+            request_retirer=request_retirer,
+            remaining_req_count=len(sorted_indices),
+        ):
+            retracted_reqs.append(req)
+        else:
+            reqs_to_abort.append(req)
+
+    if len(sorted_indices) <= 1 and not batch.check_decode_mem(
+        selected_indices=sorted_indices
+    ):
+        # Even the last remaining request cannot fit in memory.
+        # Instead of crashing the scheduler, gracefully abort it.
+        last_idx = sorted_indices.pop()
+        last_req = batch.reqs[last_idx]
+        _abort_victim(
+            last_req,
+            FINISH_ABORT(
+                "Out of memory even after retracting all other requests "
+                "in the decode batch. Aborting the last request.",
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            ),
+            request_retirer=request_retirer,
+            remaining_req_count=0,
+        )
+        reqs_to_abort.append(last_req)
+        logger.warning(
+            "retract_decode: aborted last request %s due to OOM", last_req.rid
+        )
+
+    batch.filter_batch(keep_indices=sorted_indices)
+
+    # Reqs in batch are filtered
+    new_estimate_ratio = NewTokenRatioTracker.estimate_new_token_ratio_after_retract(
+        batch.reqs
+    )
+
+    return retracted_reqs, new_estimate_ratio, reqs_to_abort
 
 
 def compute_extend_logprob_start_len(
@@ -2950,103 +3044,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             spec_algorithm=self.spec_algorithm,
         )
 
-    @capacity_decision
-    def retract_decode(
-        self, request_retirer: RequestRetirer
-    ) -> Tuple[List[Req], float, List[Req]]:
-        """Retract the decoding requests when there is not enough memory."""
-        sorted_indices = self._get_decode_retraction_order(self.reqs)
-        sorted_indices = beam_retraction_order(sorted_indices, self.reqs)
-
-        retracted_reqs = []
-        reqs_to_abort: List[Req] = []
-        first_iter = True
-        while first_iter or (
-            not self.check_decode_mem(selected_indices=sorted_indices)
-        ):
-            if len(sorted_indices) == 1:
-                # Always keep at least one request
-                break
-
-            first_iter = False
-            idx = sorted_indices.pop()
-            req = self.reqs[idx]
-            if req.beam_group is not None:
-                req.request_finish(
-                    FINISH_ABORT(
-                        "Beam search group aborted: KV cache pool is full. Beam "
-                        "groups cannot be retracted, so they are aborted instead "
-                        "of being requeued.",
-                        status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-                    )
-                )
-                reqs_to_abort.append(req)
-                free_beam_member_rows(
-                    req, self.req_to_token_pool, self.token_to_kv_pool_allocator
-                )
-                # Aborting, so a host backup to resume from would be wasted.
-                self.release_req(
-                    idx, len(sorted_indices), request_retirer, offload_kv=False
-                )
-                continue
-            # release memory and don't insert into the tree because we need the space instantly
-            if self.release_req(idx, len(sorted_indices), request_retirer):
-                retracted_reqs.append(req)
-            else:
-                # No backup or rebuild exists and the device KV is already freed.
-                if get_disagg().disaggregation_mode != "decode":
-                    message = unresumable_abort_message()
-                    status_code = HTTPStatus.SERVICE_UNAVAILABLE
-                elif (
-                    get_disagg().disaggregation_decode_retraction_backup == "host_pool"
-                ):
-                    message = "Retraction host KV pool exhausted. Aborting the request."
-                    status_code = HTTPStatus.INTERNAL_SERVER_ERROR
-                else:
-                    message = (
-                        "Retracted under decode memory pressure without a KV "
-                        "backup. Retry later."
-                    )
-                    status_code = HTTPStatus.SERVICE_UNAVAILABLE
-                req.request_finish(FINISH_ABORT(message, status_code=status_code))
-                reqs_to_abort.append(req)
-                logger.warning(
-                    "retract_decode: aborted request %s: %s", req.rid, message
-                )
-
-        if len(sorted_indices) <= 1 and not self.check_decode_mem(
-            selected_indices=sorted_indices
-        ):
-            # Even the last remaining request cannot fit in memory.
-            # Instead of crashing the scheduler, gracefully abort it.
-            last_idx = sorted_indices.pop()
-            last_req = self.reqs[last_idx]
-            last_req.request_finish(
-                FINISH_ABORT(
-                    "Out of memory even after retracting all other requests "
-                    "in the decode batch. Aborting the last request.",
-                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-                )
-            )
-            reqs_to_abort.append(last_req)
-            if last_req.beam_group is not None:
-                free_beam_member_rows(
-                    last_req, self.req_to_token_pool, self.token_to_kv_pool_allocator
-                )
-            self.release_req(last_idx, 0, request_retirer, offload_kv=False)
-            logger.warning(
-                "retract_decode: aborted last request %s due to OOM", last_req.rid
-            )
-
-        self.filter_batch(keep_indices=sorted_indices)
-
-        # Reqs in batch are filtered
-        new_estimate_ratio = (
-            NewTokenRatioTracker.estimate_new_token_ratio_after_retract(self.reqs)
-        )
-
-        return retracted_reqs, new_estimate_ratio, reqs_to_abort
-
     @staticmethod
     def _get_decode_retraction_order(reqs: List[Req]) -> List[int]:
         """Return indices ordered from most-preferred to least-preferred to keep.
@@ -3087,21 +3084,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             reverse=True,
         )
         return sorted_indices
-
-    def release_req(
-        self,
-        idx: int,
-        remaing_req_count: int,
-        request_retirer: RequestRetirer,
-        offload_kv: bool = True,
-    ) -> bool:
-        return release_req(
-            req=self.reqs[idx],
-            remaing_req_count=remaing_req_count,
-            tree_cache=self.tree_cache,
-            request_retirer=request_retirer,
-            offload_kv=offload_kv,
-        )
 
     def prepare_encoder_info_decode(self):
         # Reset the encoder cached status
