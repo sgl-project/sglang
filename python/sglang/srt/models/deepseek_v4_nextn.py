@@ -270,6 +270,10 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
         self.quant_config = quant_config
         self.wo_a_fp8 = wo_a_fp8_gemm_enabled(quant_config)
         self.use_npu_arch35_mxfp8_wo_a = use_npu_arch35_mxfp8_wo_a(quant_config)
+        # This class builds its own attributes instead of calling the target's
+        # __init__; mirror the EPD flags the inherited loader and input prep read.
+        self.encoder_only = False
+        self.language_only = False
         # The draft layer is text-only; the target model prepares image inputs.
         self.supports_visual_inputs = False
         self.num_fused_shared_experts = get_num_fused_shared_experts()
