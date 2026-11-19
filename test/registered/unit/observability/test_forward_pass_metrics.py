@@ -28,6 +28,8 @@ from sglang.srt.managers.scheduler_components.metrics_reporter import (
     PrefillStats,
     SchedulerMetricsReporter,
     _CacheHitRateWindow,
+    _DEVICE_TIMER_FIFO_MAX_AGE_S,
+    _DEVICE_TIMER_FIFO_MAXLEN,
 )
 from sglang.srt.managers.scheduler_components.request_list import ListKind
 from sglang.srt.managers.scheduler_pp_mixin import PPBatchMetadata, SchedulerPPMixin
@@ -2294,24 +2296,25 @@ class TestEstimatedPerfConstants(CustomTestCase):
 
     def test_non_gated_mlp_uses_two_matrix_formula(self):
         # Plain 2-matrix FFNs (GPT-2/GPT-BigCode/StarCoder2's c_fc+c_proj,
-        # Apertus's xIELU up_proj+down_proj with no gate_proj, Jais's ReLU^2)
-        # must be charged at 4x FLOPs / 2x weight-elems, not the gated
-        # 6x/3x SwiGLU multiplier -- confirmed against the real MLP class
-        # source for starcoder2.py and apertus.py.
+        # Apertus's xIELU up_proj+down_proj with no gate_proj) must be charged
+        # at 4x FLOPs / 2x weight-elems, not the gated 6x/3x SwiGLU multiplier
+        # -- confirmed against the real MLP class source for starcoder2.py
+        # and apertus.py. Gating is keyed off architectures, not hidden_act:
+        # see test_gated_geglu_architecture_not_misclassified_by_activation
+        # for why an activation-name heuristic can't work here.
         gated = _fake_model_config(
             hidden_size=256,
             num_attention_layers=2,
             head_dim=0,
-            hf_text_config_overrides={"intermediate_size": 1024, "hidden_act": "silu"},
+            hf_text_config_overrides={"intermediate_size": 1024},
+            hf_config=types.SimpleNamespace(architectures=["LlamaForCausalLM"]),
         )
         non_gated = _fake_model_config(
             hidden_size=256,
             num_attention_layers=2,
             head_dim=0,
-            hf_text_config_overrides={
-                "intermediate_size": 1024,
-                "hidden_act": "gelu_pytorch_tanh",
-            },
+            hf_text_config_overrides={"intermediate_size": 1024},
+            hf_config=types.SimpleNamespace(architectures=["Starcoder2ForCausalLM"]),
         )
         self._init(gated)
         gated_flops = self.reporter._linear_flops_per_token
@@ -2325,11 +2328,11 @@ class TestEstimatedPerfConstants(CustomTestCase):
             self.reporter._weight_read_bytes_per_token,
         )
 
-    def test_unset_hidden_act_defaults_to_gated(self):
-        # Regression guard: hidden_act is unset in most of this test file's
-        # fake configs (and in any real config this estimator doesn't
-        # recognize) -- it must keep defaulting to the historical gated
-        # (6x/3x) assumption, not silently flip to non-gated.
+    def test_unset_architectures_defaults_to_gated(self):
+        # Regression guard: hf_config/architectures is unset in most of this
+        # test file's fake configs (and in any real config this estimator
+        # doesn't recognize) -- it must keep defaulting to the historical
+        # gated (6x/3x) assumption, not silently flip to non-gated.
         config = _fake_model_config(
             hidden_size=256,
             num_attention_layers=2,
@@ -2337,6 +2340,32 @@ class TestEstimatedPerfConstants(CustomTestCase):
             hf_text_config_overrides={"intermediate_size": 1024},
         )
         self._init(config)
+        self.assertAlmostEqual(
+            self.reporter._linear_flops_per_token, 6.0 * 256 * 1024 * 2
+        )
+
+    def test_gated_geglu_architecture_not_misclassified_by_activation(self):
+        # Gemma2ForCausalLM's MLP (gemma2.py) is gate_up_proj + down_proj (a
+        # gated, 3-matrix GeGLU FFN) and *requires*
+        # hidden_act == hidden_activation == "gelu_pytorch_tanh". StarCoder2's
+        # MLP (starcoder2.py) is a plain, non-gated c_fc + c_proj FFN that
+        # also commonly uses "gelu_pytorch_tanh". The same activation string
+        # maps to both a gated and a non-gated architecture, so hidden_act
+        # alone can never disambiguate them -- only the architecture can.
+        # Regression guard for a real bug: an earlier activation-name-based
+        # heuristic classified any "gelu_pytorch_tanh" config as non-gated,
+        # which silently undercounted Gemma2's FLOPs/weight-bytes by 1/3.
+        gemma2 = _fake_model_config(
+            hidden_size=256,
+            num_attention_layers=2,
+            head_dim=0,
+            hf_text_config_overrides={
+                "intermediate_size": 1024,
+                "hidden_act": "gelu_pytorch_tanh",
+            },
+            hf_config=types.SimpleNamespace(architectures=["Gemma2ForCausalLM"]),
+        )
+        self._init(gemma2)
         self.assertAlmostEqual(
             self.reporter._linear_flops_per_token, 6.0 * 256 * 1024 * 2
         )
@@ -2504,6 +2533,57 @@ class TestPrefillSolDeviceTimer(CustomTestCase):
         self._run_extend_forward(2000)
         suffix = self.reporter._prefill_sol_suffix(batch=None, elapsed_s=1.0)
         self.assertEqual(suffix, "")
+
+    def test_extend_fifo_is_bounded_despite_undrained_appends(self):
+        # DP attention's decode->extend conversion (ScheduleBatch.
+        # convert_decode_to_extend) runs decode work through the same
+        # "extend"-labeled forward dispatch but sets prefill_stats=None, so
+        # report_prefill_stats -- the only drainer -- never runs for it.
+        # metrics_reporter.py cannot tell that case apart from a genuine
+        # extend forward at append time, so the queue must stay bounded
+        # (maxlen) regardless of how many such forwards run undrained.
+        for _ in range(_DEVICE_TIMER_FIFO_MAXLEN + 20):
+            self._run_extend_forward(1)
+        self.assertEqual(
+            len(self.reporter._device_timer_elapsed_by_category["extend"]),
+            _DEVICE_TIMER_FIFO_MAXLEN,
+        )
+
+    def test_consume_device_gpu_time_discards_stale_entries(self):
+        # If an undrained entry (e.g. from a decode->extend conversion, see
+        # test_extend_fifo_is_bounded_despite_undrained_appends) sits in the
+        # queue long enough, a later, unrelated extend forward's stats must
+        # not pair its FLOPs with that stale GPU time -- _consume_device_gpu_time
+        # has to discard it and fall back to None (wall-clock estimate)
+        # instead of silently misattributing it.
+        with patch(
+            "sglang.srt.managers.scheduler_components.metrics_reporter.time.perf_counter",
+            return_value=1000.0,
+        ):
+            self._run_extend_forward(5)  # stale entry, recorded at t=1000.0
+        with patch(
+            "sglang.srt.managers.scheduler_components.metrics_reporter.time.perf_counter",
+            return_value=1000.0 + _DEVICE_TIMER_FIFO_MAX_AGE_S + 1.0,
+        ):
+            self.assertIsNone(self.reporter._consume_device_gpu_time("extend"))
+
+    def test_consume_device_gpu_time_keeps_fresh_entry_behind_stale_one(self):
+        # A stale leaked entry must not block a fresh, legitimate one behind
+        # it in the FIFO -- _consume_device_gpu_time should skip past stale
+        # entries and still return the next genuinely fresh measurement.
+        with patch(
+            "sglang.srt.managers.scheduler_components.metrics_reporter.time.perf_counter",
+            return_value=1000.0,
+        ):
+            self._run_extend_forward(5)  # stale
+        with patch(
+            "sglang.srt.managers.scheduler_components.metrics_reporter.time.perf_counter",
+            return_value=1000.0 + _DEVICE_TIMER_FIFO_MAX_AGE_S + 1.0,
+        ):
+            self._run_extend_forward(7)  # fresh
+            self.assertAlmostEqual(
+                self.reporter._consume_device_gpu_time("extend"), 0.007
+            )
 
 
 if __name__ == "__main__":

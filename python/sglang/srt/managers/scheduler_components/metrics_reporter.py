@@ -76,6 +76,8 @@ CACHE_HIT_RATE_WINDOW_SECONDS = envs.SGLANG_CACHE_HIT_RATE_WINDOW_SECONDS.get()
 GEN_THROUGHPUT_STALENESS_SECONDS = 30.0
 # Update scheduler time counters every 1 second.
 _SCHEDULER_TIME_ACCOUNTING_INTERVAL_NS = 1_000_000_000
+_DEVICE_TIMER_FIFO_MAXLEN = 8
+_DEVICE_TIMER_FIFO_MAX_AGE_S = 5.0
 
 
 class _CacheHitRateWindow:
@@ -323,16 +325,17 @@ class SchedulerMetricsReporter:
         )
         self.forward_pass_device_timer: Optional[DeviceTimer] = None
         self._forward_occupancy_log_window: Optional[_ForwardOccupancyLogWindow] = None
-        # FIFO of each completed "extend" (prefill) forward's own GPU elapsed
-        # time (seconds), populated from the device timer below and drained by
-        # _consume_device_gpu_time -- gives _prefill_sol_suffix an accurate
-        # per-forward duration instead of the wall-clock gap between log
-        # lines. Keyed by category (currently only "extend" is populated) so
-        # a future consumer (e.g. a decode equivalent) can reuse the same
-        # structure without resurrecting the unbounded-growth bug this
-        # avoids: only append for categories something actually drains.
-        self._device_timer_elapsed_by_category: Dict[str, Deque[float]] = defaultdict(
-            deque
+        # FIFO of (wall-clock recorded-at, GPU elapsed seconds) for each
+        # completed "extend" (prefill) forward, populated from the device
+        # timer below and drained by _consume_device_gpu_time -- gives
+        # _prefill_sol_suffix an accurate per-forward duration instead of the
+        # wall-clock gap between log lines. Keyed by category (currently only
+        # "extend" is populated) so a future consumer (e.g. a decode
+        # equivalent) can reuse the same structure without resurrecting the
+        # unbounded-growth bug this avoids: only append for categories
+        # something actually drains.
+        self._device_timer_elapsed_by_category: Dict[str, Deque[Tuple[float, float]]] = defaultdict(
+            lambda: deque(maxlen=_DEVICE_TIMER_FIFO_MAXLEN)
         )
 
         if ENABLE_METRICS_DEVICE_TIMER:
@@ -363,7 +366,7 @@ class SchedulerMetricsReporter:
                     self.is_stats_logging_rank or self.current_scheduler_metrics_enabled
                 ):
                     self._device_timer_elapsed_by_category["extend"].append(
-                        kwargs["t"]
+                        (time.perf_counter(), kwargs["t"])
                     )
                 if self.enable_metrics:
                     self.metrics_collector.increment_forward_execution_seconds(**kwargs)
@@ -820,35 +823,25 @@ class SchedulerMetricsReporter:
             ffn_act_intermediate_size = moe_intermediate_size * active_expert_units
         else:
             # Dense (non-MoE) FFN FLOPs/weight-elems depend on whether the FFN is
-            # gated (SwiGLU-style: separate gate_proj + up_proj + down_proj, 3
-            # weight matrices -- Llama/Mistral/Qwen/Granite/Gemma) or a plain
-            # 2-matrix FFN (up/fc_in + down/fc_out with the nonlinearity applied
-            # directly -- GPT-2/GPT-BigCode/StarCoder2, and novel non-gated
-            # activations like Apertus's xIELU or Jais's ReLU^2). Charging a
-            # 2-matrix FFN at the 3-matrix (6x/3x) multiplier overcounts weight-
-            # read bandwidth by 1.5x -- confirmed by reading the actual MLP class
-            # for starcoder2.py (c_fc + c_proj only) and apertus.py ("with
-            # xielu, there's no gate_proj"). Default to the historical gated
-            # assumption (matches the common case -- Llama/Mistral/Qwen/Granite/
-            # Gemma are all gated, and preserves existing behavior/test
-            # expectations when hidden_act is unset or unrecognized) and only
-            # switch to the 2-matrix multiplier for activations confirmed to
-            # pair with a plain, non-gated FFN in their model's own sglang
-            # implementation.
-            hidden_act = str(getattr(hf_text_config, "hidden_act", "") or "").lower()
-            _NON_GATED_MLP_ACTIVATIONS = {
-                "gelu",
-                "gelu_new",
-                "gelu_fast",
-                "gelu_pytorch_tanh",
-                "gelu_python",
-                "quick_gelu",
-                "relu",
-                "relu2",
-                "squared_relu",
-                "xielu",
+            # gated (SwiGLU/GeGLU-style: separate gate_proj + up_proj + down_proj,
+            # 3 weight matrices) or a plain 2-matrix FFN (up/fc_in + down/fc_out).
+            # Gating is a property of the architecture, not the activation
+            # function (GeGLU and a plain GELU FFN can share the same hidden_act),
+            # so key off architectures rather than hidden_act. Default to gated
+            # for every unlisted architecture.
+            _NON_GATED_MLP_ARCHITECTURES = {
+                "GPT2LMHeadModel",
+                "GPTBigCodeForCausalLM",
+                "Starcoder2ForCausalLM",
+                "ApertusForCausalLM",
             }
-            is_gated_mlp = hidden_act not in _NON_GATED_MLP_ACTIVATIONS
+            model_architectures = (
+                getattr(getattr(model_config, "hf_config", None), "architectures", None)
+                or []
+            )
+            is_gated_mlp = not any(
+                arch in _NON_GATED_MLP_ARCHITECTURES for arch in model_architectures
+            )
             mlp_flop_mult = 6.0 if is_gated_mlp else 4.0
             mlp_weight_mult = 3.0 if is_gated_mlp else 2.0
             mlp_flops = (
@@ -974,7 +967,9 @@ class SchedulerMetricsReporter:
         if several completed (and got drained by the device timer's internal
         `_report()`) before either of their stats got reported. Returns None
         when the device timer is disabled or nothing is queued yet; callers
-        should fall back to a wall-clock estimate in that case."""
+        should fall back to a wall-clock estimate in that case. Discards
+        entries older than _DEVICE_TIMER_FIFO_MAX_AGE_S instead of returning
+        them."""
         if self.forward_pass_device_timer is None:
             return None
         # Poll completed events before reading, without synchronizing.
@@ -982,7 +977,12 @@ class SchedulerMetricsReporter:
         queue = self._device_timer_elapsed_by_category.get(category)
         if not queue:
             return None
-        return queue.popleft()
+        now = time.perf_counter()
+        while queue:
+            recorded_at, elapsed = queue.popleft()
+            if now - recorded_at <= _DEVICE_TIMER_FIFO_MAX_AGE_S:
+                return elapsed
+        return None
 
     def _prefill_sol_suffix(self, batch, elapsed_s: float) -> str:
         """Device-timer-based replacement for the wall-clock `est. prefill
