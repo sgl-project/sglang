@@ -4,7 +4,10 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
+from sglang.srt.layers.attention.flashinfer_backend import (
+    FlashInferAttnBackend,
+    WrapperDispatch,
+)
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -42,6 +45,17 @@ def _gate(
         is_cp_enabled=lambda: cp_enabled,
     ):
         return FlashInferAttnBackend._bidirectional_extend_allowed()
+
+
+def _planned_backend(*, use_ragged: bool, paged_window: int, ragged_window: int):
+    backend = FlashInferAttnBackend.__new__(FlashInferAttnBackend)
+    backend.dispatch_reason = WrapperDispatch.SLIDING_WINDOW
+    backend.prefill_wrappers_ragged = [SimpleNamespace(_window_left=ragged_window)]
+    backend.forward_metadata = SimpleNamespace(
+        use_ragged=use_ragged,
+        prefill_wrappers=[SimpleNamespace(_window_left=paged_window)],
+    )
+    return backend
 
 
 def _layer(attn_type, *, is_cross_attention=False, sliding_window_size=-1):
@@ -84,6 +98,24 @@ class TestFlashInferExtendCausal(CustomTestCase):
                 backend._extend_is_causal(layer, forward_batch, window_planned=True)
             )
         self.assertEqual(backend._extend_window_left(layer, causal=True), 512)
+
+    def test_ragged_window_plan_counts_as_a_window_plan(self):
+        """Under sliding-window dispatch the ragged wrapper of the window layers
+        is planned with the window too, so a ragged extend on it stays causal."""
+        ragged = _planned_backend(use_ragged=True, paged_window=-1, ragged_window=511)
+        self.assertTrue(ragged._extend_window_planned(0))
+        unplanned = _planned_backend(use_ragged=True, paged_window=-1, ragged_window=-1)
+        self.assertFalse(unplanned._extend_window_planned(0))
+        # A paged extend runs only the paged wrapper.
+        paged = _planned_backend(use_ragged=False, paged_window=511, ragged_window=-1)
+        self.assertTrue(paged._extend_window_planned(0))
+        paged_unplanned = _planned_backend(
+            use_ragged=False, paged_window=-1, ragged_window=511
+        )
+        self.assertFalse(paged_unplanned._extend_window_planned(0))
+
+        ragged.dispatch_reason = None
+        self.assertFalse(ragged._extend_window_planned(0))
 
     def test_gate_needs_the_whole_prompt_in_one_forward(self):
         self.assertTrue(_gate())

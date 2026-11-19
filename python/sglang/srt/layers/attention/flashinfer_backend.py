@@ -1572,6 +1572,17 @@ class FlashInferAttnBackend(AttentionBackend):
             return -1
         return layer.sliding_window_size
 
+    def _extend_window_planned(self, wrapper_idx: int) -> bool:
+        # Under sliding-window dispatch the window layers' ragged wrapper is
+        # planned with the window as well, so check every wrapper this extend
+        # runs.
+        if self.dispatch_reason != WrapperDispatch.SLIDING_WINDOW:
+            return False
+        wrappers = [self.forward_metadata.prefill_wrappers[wrapper_idx]]
+        if self.forward_metadata.use_ragged:
+            wrappers.append(self.prefill_wrappers_ragged[wrapper_idx])
+        return any(wrapper._window_left >= 0 for wrapper in wrappers)
+
     @debug_kernel_api
     def forward_extend(
         self,
@@ -1619,7 +1630,7 @@ class FlashInferAttnBackend(AttentionBackend):
         causal = self._extend_is_causal(
             layer,
             forward_batch,
-            window_planned=window_dispatch and prefill_wrapper_paged._window_left >= 0,
+            window_planned=self._extend_window_planned(wrapper_idx),
         )
         window_left = self._extend_window_left(layer, causal)
         # Window-read planning may put the window in a custom mask. Other
