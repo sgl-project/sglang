@@ -17,7 +17,7 @@ import logging
 import os
 import pathlib
 import shutil
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -38,10 +38,14 @@ _SAIL_GPU_ARCHS = (
     "vm_15",
 )
 
+_DEFAULT_CUDA_HOME = "/usr/local/cuda"
+
 
 @cache_once
 def cuda_home() -> str:
     """CUDA install root, resolved the way tvm-ffi resolves it.
+
+    The pip CUDA wheels are a last resort, for installs with no system toolkit.
 
     `arch._jit_cuda_version` probes this nvcc to pick the compile target.
     """
@@ -51,7 +55,32 @@ def cuda_home() -> str:
     nvcc_path = shutil.which("nvcc")
     if nvcc_path is not None:
         return os.path.dirname(os.path.dirname(nvcc_path))
-    return "/usr/local/cuda"
+    if os.path.isfile(os.path.join(_DEFAULT_CUDA_HOME, "bin", "nvcc")):
+        return _DEFAULT_CUDA_HOME
+    # A wheel-only install has no system toolkit: nvcc comes from the pip CUDA
+    # wheels under site-packages/nvidia/cu<major>, which is not on PATH.
+    return _pip_cuda_home() or _DEFAULT_CUDA_HOME
+
+
+def _pip_cuda_home() -> Optional[str]:
+    try:
+        import nvidia
+    except ImportError:
+        return None
+    candidates = sorted(
+        path.parent.parent
+        for root in nvidia.__path__
+        for path in pathlib.Path(root).glob("cu[0-9]*/bin/nvcc")
+        if path.is_file()
+    )
+    if not candidates:
+        return None
+    # Prefer torch's CUDA major, so the JIT toolkit matches the runtime torch loads.
+    torch_major = (torch.version.cuda or "").split(".")[0]
+    for candidate in candidates:
+        if candidate.name == f"cu{torch_major}":
+            return str(candidate)
+    return str(candidates[-1])
 
 
 @cache_once

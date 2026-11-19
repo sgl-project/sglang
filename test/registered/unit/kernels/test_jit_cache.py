@@ -572,5 +572,27 @@ def test_relative_sources_resolve_against_csrc():
     assert resolve_sources(["/usr/include/stdio.h"]) == ("/usr/include/stdio.h",)
 
 
+def test_cuda_home_finds_pip_cuda_wheels(tmp_path, monkeypatch):
+    """With no CUDA_HOME, no nvcc on PATH and no /usr/local/cuda, the JIT toolkit
+    must resolve to the pip `nvidia/cu<major>` root matching torch's CUDA major."""
+    site_nvidia = tmp_path / "site-packages" / "nvidia"
+    for major in ("12", "13"):
+        nvcc = site_nvidia / f"cu{major}" / "bin" / "nvcc"
+        nvcc.parent.mkdir(parents=True)
+        nvcc.touch()
+    fake_nvidia = type(sys)("nvidia")
+    fake_nvidia.__path__ = [str(site_nvidia)]
+    monkeypatch.setitem(sys.modules, "nvidia", fake_nvidia)
+    monkeypatch.delenv("CUDA_HOME", raising=False)
+    monkeypatch.delenv("CUDA_PATH", raising=False)
+    monkeypatch.setattr(toolchain.shutil, "which", lambda name: None)
+    monkeypatch.setattr(toolchain, "_DEFAULT_CUDA_HOME", str(tmp_path / "missing"))
+
+    for torch_cuda, expected in (("12.9", "cu12"), ("13.0", "cu13"), (None, "cu13")):
+        monkeypatch.setattr(toolchain.torch.version, "cuda", torch_cuda)
+        resolved = toolchain.cuda_home.__wrapped__()
+        assert resolved == str(site_nvidia / expected), torch_cuda
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
