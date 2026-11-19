@@ -163,7 +163,7 @@ http2 = [
 ]
 
 fastokens = [
-  "fastokens>=0.3.2",
+  "fastokens>=0.3.5",
 ]
 
 test = [

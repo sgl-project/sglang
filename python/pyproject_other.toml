@@ -116,7 +116,7 @@ tracing = [
 # Same pin as the CUDA pyproject. The ROCm image installs srt_hip*, not `all`,
 # so the Dockerfile has to ask for this extra by name.
 fastokens = [
-  "fastokens>=0.3.2",
+  "fastokens>=0.3.5",
 ]
 
 # Monokernels for gfx950 (--enable-amd-monokernel); the ROCm image checks out this pin too.
