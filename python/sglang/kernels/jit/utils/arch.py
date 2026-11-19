@@ -155,12 +155,19 @@ def get_default_target_flags(arch: CompileArch | None = None) -> List[str]:
     else:
         if arch is None:
             arch = get_compile_arch()
-        return [
+        flags = [
             arch.jit_flag,
             "-std=c++20",
             "-O3",
             "--expt-relaxed-constexpr",
         ]
+        if is_sail_runtime():
+            # SAIL's libdevice ships __nv_expf/__nv_tanhf/__nv_log1pf but no
+            # __nv_erff; the family macro below is what activation.cuh branches
+            # on. Name reuse over a bespoke macro: tilelang's PPU libgens inject
+            # the same token, so a TU compiled by either builder sees one truth.
+            flags.append("-DPPU_DEFAULT")
+        return flags
 
 
 @cache_once
