@@ -157,26 +157,27 @@ class TestShardedDcpPrimsTs(CustomTestCase):
 
 class TestPrimsTsNvfp4(CustomTestCase):
     def _check_nvfp4_matches_reference(self, rows: int):
-        """The same check over the 352 B/token NVFP4 cache that the prims_ts NVFP4
-        route writes, against FP32 attention over the values its loader expands
-        (E2M1 x block scale rounded to E4M3, E4M3 RoPE). Rows past their count are
-        disabled with a zero length, as DP padding rows are."""
+        """The same check over the 352 B/token NVFP4 cache, against FP32 attention
+        over the values its loader expands (E2M1 x block scale rounded to E4M3,
+        E4M3 RoPE). Row 0 uses the full top-k with interior -1 holes; the others
+        have per-row lengths below the top-k, with real slot ids past the length
+        that must not be read; the last row has length 0, as DP padding rows."""
         from sglang.kernels.ops.attention.mla_qk_prep import (
             concat_and_cast_q_fp8_heads,
         )
-        from sglang.srt.layers.attention.dsa.prims_k_cache import (
-            quantize_prims_k_cache_into,
+        from sglang.kernels.ops.kvcache.dsa_prims_nvfp4_kv_cache import (
+            set_prims_nvfp4_kv_buffer,
         )
 
         heads, ctx = 64, 16384
         _require_prims_ts(self, heads, "nvfp4.fp8rope")
         gen = torch.Generator(device="cuda").manual_seed(5)
         kv = torch.zeros((ctx, 1, 352), dtype=torch.uint8, device="cuda")
-        quantize_prims_k_cache_into(
-            torch.randn(ctx, KV_LORA, generator=gen, device="cuda").bfloat16(),
-            torch.randn(ctx, ROPE, generator=gen, device="cuda").bfloat16(),
+        set_prims_nvfp4_kv_buffer(
             kv,
             torch.arange(ctx, device="cuda"),
+            torch.randn(ctx, KV_LORA, generator=gen, device="cuda").bfloat16(),
+            torch.randn(ctx, ROPE, generator=gen, device="cuda").bfloat16(),
         )
         q8 = torch.empty(rows, heads, DIM, dtype=FP8, device="cuda")
         concat_and_cast_q_fp8_heads(
@@ -185,13 +186,15 @@ class TestPrimsTsNvfp4(CustomTestCase):
             torch.randn(rows, heads, ROPE, generator=gen, device="cuda").bfloat16(),
         )
         live = rows - 1
-        slots = torch.full((rows, TOPK), -1, dtype=torch.int32, device="cuda")
+        slots = torch.empty((rows, TOPK), dtype=torch.int32, device="cuda")
         for r in range(rows):
-            pick = torch.randperm(ctx, generator=gen, device="cuda")[:TOPK]
-            # interior -1 holes, as the indexer leaves past a short context
-            holes = torch.rand(TOPK, generator=gen, device="cuda") < 0.25
-            slots[r] = torch.where(holes, -1, pick.to(torch.int32))
-        lengths = torch.full((rows,), TOPK, dtype=torch.int32, device="cuda")
+            slots[r] = torch.randperm(ctx, generator=gen, device="cuda")[:TOPK]
+        holes = torch.rand(TOPK, generator=gen, device="cuda") < 0.25
+        slots[0] = torch.where(holes, -1, slots[0])
+        lengths = torch.randint(
+            1, TOPK, (rows,), generator=gen, device="cuda", dtype=torch.int32
+        )
+        lengths[0] = TOPK
         lengths[live:] = 0
 
         runner = PrimsTSSparseMLA(torch.device("cuda"), "nvfp4.fp8rope")
@@ -210,7 +213,8 @@ class TestPrimsTsNvfp4(CustomTestCase):
         ref = torch.empty((live, heads, KV_LORA), dtype=torch.float32, device="cuda")
         ref_lse = torch.empty((live, heads), dtype=torch.float32, device="cuda")
         for r in range(live):
-            valid = slots[r][slots[r] >= 0]
+            valid = slots[r, : lengths[r]]
+            valid = valid[valid >= 0]
             k = _expand_nvfp4_rows(kv, valid)
             s = (qf[r] @ k.T) * SM_SCALE
             ref_lse[r] = torch.logsumexp(s, dim=-1)
@@ -225,10 +229,10 @@ class TestPrimsTsNvfp4(CustomTestCase):
 
     def test_writer_layout_and_rounding(self):
         """Blocks of E2M1 multiples of a power-of-two scale round-trip exactly;
-        other values land within one E2M1 step; -1 locations and the reserved
-        slot 0 are never written."""
-        from sglang.srt.layers.attention.dsa.prims_k_cache import (
-            quantize_prims_k_cache_into,
+        other values land within one E2M1 step; the reserved slot 0 is never
+        written."""
+        from sglang.kernels.ops.kvcache.dsa_prims_nvfp4_kv_cache import (
+            set_prims_nvfp4_kv_buffer,
         )
 
         if not torch.cuda.is_available():
@@ -246,11 +250,9 @@ class TestPrimsTsNvfp4(CustomTestCase):
         rope = torch.randn(n, ROPE, generator=gen, device="cuda").bfloat16()
         kv = torch.full((n + 2, 1, 352), 0xAB, dtype=torch.uint8, device="cuda")
         loc = torch.arange(1, n + 1, device="cuda")
-        quantize_prims_k_cache_into(exact.bfloat16(), rope, kv, loc)
+        set_prims_nvfp4_kv_buffer(kv, loc, exact.bfloat16(), rope)
         # padding tokens point at slot 0, which the writer skips
-        quantize_prims_k_cache_into(
-            exact[:2].bfloat16(), rope[:2], kv, loc.new_zeros(2)
-        )
+        set_prims_nvfp4_kv_buffer(kv, loc.new_zeros(2), exact[:2].bfloat16(), rope[:2])
         self.assertTrue(torch.all(kv[0] == 0xAB))
         got = _expand_nvfp4_rows(kv, loc)
         torch.testing.assert_close(got[:, :KV_LORA], exact, atol=0, rtol=0)
@@ -258,10 +260,9 @@ class TestPrimsTsNvfp4(CustomTestCase):
         self.assertTrue(torch.all(kv[n + 1] == 0xAB))
 
         noisy = torch.randn(n, KV_LORA, generator=gen, device="cuda").bfloat16()
-        dropped = torch.cat([loc[:-1], loc.new_tensor([-1])])
-        quantize_prims_k_cache_into(noisy, rope, kv, dropped)
-        got = _expand_nvfp4_rows(kv, loc[:-1])[:, :KV_LORA].view(-1, 32, 16)
-        x = noisy[:-1].float().view(-1, 32, 16)
+        set_prims_nvfp4_kv_buffer(kv, loc, noisy, rope)
+        got = _expand_nvfp4_rows(kv, loc)[:, :KV_LORA].view(-1, 32, 16)
+        x = noisy.float().view(-1, 32, 16)
         # E2M1 steps are at most 2 x scale = amax / 3; rounding is within one step.
         step = x.abs().amax(-1, keepdim=True) / 3
         self.assertTrue(torch.all((got - x).abs() <= step * 1.01 + 1e-6))

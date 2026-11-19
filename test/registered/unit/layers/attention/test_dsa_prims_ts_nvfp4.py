@@ -1,6 +1,6 @@
-"""prims_ts over the 352 B/token NVFP4 DSA pool, on CPU: the shared Prims-TS
-launcher's plan and run arguments (FlashInfer stubbed), the per-row lengths and
-causal indices of the NVFP4 route, its dispatch, and the pool/argument checks."""
+"""prims_ts over the 352 B/token NVFP4 DSA pool, on CPU: the Prims-TS launcher's
+plan and run arguments (FlashInfer stubbed), the pool row size and the server
+argument resolution."""
 
 import sys
 import unittest
@@ -11,16 +11,13 @@ import torch
 
 from sglang.srt.arg_groups import overrides
 from sglang.srt.arg_groups.overrides import (
-    _check_dsa_backend_constraints,
+    _PRIMS_TS_NVFP4_UNSUPPORTED,
     _prims_ts_nvfp4_backends,
 )
-from sglang.srt.layers.attention.dsa import prims_ts
 from sglang.srt.layers.attention.dsa.prims_ts import (
     _EXACT_PLAN_MAX_ROWS,
     PrimsTSSparseMLA,
-    make_prims_ts_causal_indices,
 )
-from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
 from sglang.srt.mem_cache import kv_cache_configurator
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -142,97 +139,6 @@ class TestPrimsTSLauncher(_NoCapture):
             PrimsTSSparseMLA(torch.device("cpu", 0), "nvfp4")
 
 
-class TestPrimsTSCausalIndices(unittest.TestCase):
-    def test_causal_rows_take_physical_slots_up_to_their_length(self):
-        table = torch.tensor([[91, 37, 19, 0], [103, 82, 5, 6]], dtype=torch.int32)
-        got = make_prims_ts_causal_indices(
-            table,
-            torch.tensor([0, 1, 1], dtype=torch.int32),
-            torch.tensor([1, 2, 3], dtype=torch.int32),
-            4,  # one DP padding row
-        )
-        want = torch.full((4, 2048), -1, dtype=torch.int32)
-        want[0, :1] = torch.tensor([91])
-        want[1, :2] = torch.tensor([103, 82])
-        want[2, :3] = torch.tensor([103, 82, 5])
-        self.assertTrue(torch.equal(got, want))
-
-    def test_rejects_causal_length_beyond_topk(self):
-        table = torch.zeros((1, 4096), dtype=torch.int32)
-        with self.assertRaises(RuntimeError):
-            make_prims_ts_causal_indices(
-                table,
-                torch.tensor([0], dtype=torch.int32),
-                torch.tensor([2049], dtype=torch.int32),
-                1,
-            )
-
-
-def _nvfp4_backend():
-    return SimpleNamespace(device="cpu", is_dsa_prims_nvfp4=True)
-
-
-class TestPrimsTSNvfp4Forward(_NoCapture):
-    def test_casts_q_and_hands_the_pool_ids_and_lengths_to_the_launcher(self):
-        backend = _nvfp4_backend()
-        cache = torch.zeros((64, 1, 352), dtype=torch.uint8)
-        casts = []
-
-        def cast(q_nope, q_rope, heads, pad_heads=True):
-            out = torch.empty((q_nope.shape[0], heads, 576), dtype=torch.float8_e4m3fn)
-            casts.append((q_nope, q_rope, heads, pad_heads, out))
-            return out
-
-        backend._trtllm_q_fp8 = cast
-        calls = []
-
-        def launch(**kwargs):
-            calls.append(kwargs)
-            q = kwargs["q"]
-            return torch.zeros((q.shape[0], q.shape[1], 512)), None
-
-        backend._prims_ts = SimpleNamespace(forward=launch)
-        layer = SimpleNamespace(
-            v_head_dim=512, head_dim=576, tp_q_head_num=4, scaling=0.25, layer_id=3
-        )
-        q_nope = torch.zeros((3, 4, 512), dtype=torch.bfloat16)
-        q_rope = torch.zeros((3, 4, 64), dtype=torch.bfloat16)
-        ids = torch.zeros((3, 2048), dtype=torch.int32)
-        # Per-row min(seq_len, 2048); the DP padding row is 0 and an extra
-        # padded entry beyond the Q rows is dropped.
-        seqlens = torch.tensor([5, 2048, 0, 0], dtype=torch.int32)
-        metadata = SimpleNamespace(dsa_cache_seqlens_int32=seqlens)
-        out = DeepseekSparseAttnBackend._forward_prims_ts_nvfp4(
-            backend, q_nope, q_rope, layer, cache, ids, metadata
-        )
-
-        self.assertEqual(out.shape, (3, 4, 512))
-        (call,) = calls
-        self.assertIs(call["indices"], ids)
-        self.assertIs(call["kv_cache"], cache)
-        self.assertEqual(call["lengths"].tolist(), [5, 2048, 0])
-        self.assertEqual(call["lengths"].data_ptr(), seqlens.data_ptr())  # a view
-        self.assertEqual((call["sm_scale"], call["kv_scale"]), (0.25, 1.0))
-        self.assertEqual(call["q"].dtype, torch.float8_e4m3fn)
-        (cast,) = casts
-        self.assertIs(cast[0], q_nope)
-        self.assertEqual(cast[2:4], (4, False))  # no head padding for Prims-TS
-        self.assertIs(cast[4], call["q"])
-
-
-class TestPrimsTSNvfp4Metadata(_NoCapture):
-    def test_rejects_fewer_lengths_than_rows(self):
-        layer = SimpleNamespace(v_head_dim=512, head_dim=576, tp_q_head_num=4)
-        metadata = SimpleNamespace(
-            dsa_cache_seqlens_int32=torch.ones(2, dtype=torch.int32)
-        )
-        q = torch.zeros((3, 4, 512), dtype=torch.bfloat16)
-        with self.assertRaisesRegex(RuntimeError, "top-k lengths"):
-            DeepseekSparseAttnBackend._forward_prims_ts_nvfp4(
-                _nvfp4_backend(), q, q[..., :64], layer, None, None, metadata
-            )
-
-
 class TestPrimsTSNvfp4Pool(unittest.TestCase):
     def _cache_dim(self, prefill, decode, dtype=FP4):
         exec_ = SimpleNamespace(
@@ -266,11 +172,6 @@ class TestPrimsTSNvfp4Pool(unittest.TestCase):
             self._cache_dim("prims_ts", "prims_ts", torch.float8_e4m3fn), 576
         )
 
-    def test_nvfp4_pool_cannot_be_shared_with_other_backends(self):
-        for backends in (("prims_ts", "flashmla_kv"), ("flashmla_sparse", "trtllm")):
-            with self.assertRaisesRegex(ValueError, "prefill and decode"):
-                self._cache_dim(*backends)
-
 
 class TestPrimsTSNvfp4Arguments(unittest.TestCase):
     def _view(self, **overrides):
@@ -278,10 +179,17 @@ class TestPrimsTSNvfp4Arguments(unittest.TestCase):
             dsa_prefill_backend=None,
             dsa_decode_backend=None,
             attention_backend="dsa",
-            page_size=64,
+            prefill_attention_backend=None,
+            decode_attention_backend=None,
             disable_radix_cache=True,
-            disable_prefill_cuda_graph=True,
+            speculative_algorithm=None,
+            dllm_algorithm=None,
+            disaggregation_mode="null",
+            dcp_size=1,
+            attn_cp_size=1,
         )
+        for name in _PRIMS_TS_NVFP4_UNSUPPORTED:
+            values[name] = False
         values.update(overrides)
         return SimpleNamespace(**values)
 
@@ -307,7 +215,6 @@ class TestPrimsTSNvfp4Arguments(unittest.TestCase):
         for view in (
             self._view(dsa_decode_backend="flashmla_kv"),
             self._view(disable_radix_cache=False),
-            self._view(page_size=1),
             self._view(speculative_algorithm="EAGLE"),
             self._view(dcp_size=2),
             self._view(enable_hisparse=True),
@@ -318,21 +225,6 @@ class TestPrimsTSNvfp4Arguments(unittest.TestCase):
             self._resolve(self._view(), major=9)
         with self.assertRaises(ValueError):
             self._resolve(self._view(), hf=self._hf("DeepseekV32ForCausalLM"))
-
-    def test_backend_constraints(self):
-        for dtype in ("fp8_e4m3", "nvfp4"):
-            _check_dsa_backend_constraints(dtype, "prims_ts", "prims_ts", hip=False)
-        with self.assertRaisesRegex(ValueError, "fp8_e4m3 or nvfp4"):
-            _check_dsa_backend_constraints("auto", "prims_ts", "prims_ts", hip=False)
-        with self.assertRaises(ValueError):
-            _check_dsa_backend_constraints("nvfp4", "prims_ts", "prims_ts", hip=True)
-        with self.assertRaisesRegex(ValueError, "read only by prims_ts"):
-            _check_dsa_backend_constraints(
-                "nvfp4", "flashmla_sparse", "trtllm", hip=False
-            )
-
-    def test_module_exports(self):
-        self.assertEqual(prims_ts.PRIMS_TS_KV_FORMATS["nvfp4.fp8rope"], 352)
 
 
 if __name__ == "__main__":

@@ -594,14 +594,9 @@ def _check_dsa_backend_constraints(
     chosen = {prefill_backend, decode_backend}
 
     # The SM100/SM103/SM107 check is check_prims_ts_sparse_mla_support, at backend init.
-    if "prims_ts" in chosen and (hip or kv_cache_dtype not in ("fp8_e4m3", "nvfp4")):
+    if "prims_ts" in chosen and (hip or kv_cache_dtype != "fp8_e4m3"):
         raise ValueError(
-            "The prims_ts DSA backend needs CUDA and --kv-cache-dtype fp8_e4m3 or nvfp4."
-        )
-    if kv_cache_dtype == "nvfp4" and chosen != {"prims_ts"}:
-        raise ValueError(
-            "DSA --kv-cache-dtype nvfp4 is read only by prims_ts; set "
-            "--dsa-prefill-backend and --dsa-decode-backend prims_ts."
+            "The prims_ts DSA backend needs CUDA and --kv-cache-dtype fp8_e4m3."
         )
 
     rocm_only = {"triton"} & chosen
@@ -798,6 +793,25 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
     return declared
 
 
+# Boolean server arguments the prims_ts NVFP4 route has not been tested with
+_PRIMS_TS_NVFP4_UNSUPPORTED = (
+    "enable_mixed_chunk",
+    "enable_hierarchical_cache",
+    "enable_hisparse",
+    "enable_lmcache",
+    "enable_prefill_cp",
+    "enable_two_batch_overlap",
+    "enable_unified_memory",
+    "enable_page_major_kv_layout",
+    "enable_unified_cache_external_linker",
+    "enable_session_radix_cache",
+    "enable_mis",
+    "enable_kv_cache_sharding",
+    "prefill_only_disable_kv_cache",
+    "enable_torch_compile",
+)
+
+
 def _prims_ts_nvfp4_backends(view: Any, hf_config: Any, major: int) -> Dict[str, Any]:
     """DSA NVFP4 KV is the 352 B/token Prims-TS row, which only prims_ts reads:
     pin both phases to it and reject what the tested configuration excludes."""
@@ -813,44 +827,26 @@ def _prims_ts_nvfp4_backends(view: Any, hf_config: Any, major: int) -> Dict[str,
     if hf_config.architectures[0] != "GlmMoeDsaForCausalLM":
         raise ValueError("DSA NVFP4 KV (prims_ts) is validated for GLM-5.2 only")
     effective = {
-        getattr(view, "prefill_attention_backend", None) or view.attention_backend,
-        getattr(view, "decode_attention_backend", None) or view.attention_backend,
+        view.prefill_attention_backend or view.attention_backend,
+        view.decode_attention_backend or view.attention_backend,
     }
     if effective != {"dsa"}:
         raise ValueError(
             "DSA NVFP4 KV needs dsa as the prefill and decode attention backend"
         )
-    if view.page_size not in (None, 64):
-        raise ValueError("DSA NVFP4 KV (prims_ts) requires --page-size 64")
-    if not getattr(view, "disable_radix_cache", False):
+    if not view.disable_radix_cache:
         raise ValueError("DSA NVFP4 KV (prims_ts) requires --disable-radix-cache")
     # Prefill CUDA graphs are rejected at backend init, against the resolved
-    # cuda_graph_config (its JSON and per-phase flags override the booleans).
-    unsupported = (
-        "enable_mixed_chunk",
-        "enable_hierarchical_cache",
-        "enable_hisparse",
-        "enable_lmcache",
-        "enable_prefill_cp",
-        "enable_two_batch_overlap",
-        "enable_unified_memory",
-        "enable_page_major_kv_layout",
-        "enable_unified_cache_external_linker",
-        "enable_session_radix_cache",
-        "enable_mis",
-        "enable_kv_cache_sharding",
-        "prefill_only_disable_kv_cache",
-        "enable_torch_compile",
-    )
-    bad = [name for name in unsupported if getattr(view, name, False)]
-    if getattr(view, "speculative_algorithm", None):
+    # cuda_graph_config.
+    bad = [name for name in _PRIMS_TS_NVFP4_UNSUPPORTED if getattr(view, name)]
+    if view.speculative_algorithm:
         bad.append("speculative_algorithm (including MTP)")
-    if getattr(view, "dllm_algorithm", None):
+    if view.dllm_algorithm:
         bad.append("dllm_algorithm")
-    if getattr(view, "disaggregation_mode", "null") != "null":
+    if view.disaggregation_mode != "null":
         bad.append("disaggregation_mode")
     for name in ("dcp_size", "attn_cp_size"):
-        if (getattr(view, name, 1) or 1) != 1:
+        if (getattr(view, name) or 1) != 1:
             bad.append(name)
     if bad:
         raise ValueError("DSA NVFP4 KV (prims_ts) does not support: " + ", ".join(bad))

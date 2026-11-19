@@ -7,7 +7,7 @@ One layer's work for a DSA model (D576 MLA: kv_lora_rank 512 + RoPE 64, top-k
     attn  prims_ts-nvfp4   FlashInfer Prims-TS over the 352 B/token NVFP4 cache
     attn  prims_ts-fp8     FlashInfer Prims-TS over the raw 576 B/token FP8 cache
     attn  trtllm-fp8       FlashInfer trtllm-gen sparse MLA decode, same FP8 cache
-    kv    write-nvfp4      BF16 K -> 352 B rows (prims_k_cache writer)
+    kv    write-nvfp4      BF16 K -> 352 B rows (set_prims_nvfp4_kv_buffer)
     kv    write-fp8        BF16 K -> 576 B rows (E4M3 cast + scatter, the FP8 route)
     q     cast-fp8         BF16 q_nope/q_rope -> E4M3 [rows, H, 576] (both routes)
 
@@ -81,11 +81,11 @@ class Case:
         self.loc = torch.arange(slots, device=dev)
         self.kv_fp8 = torch.cat([k_nope, k_rope], -1).to(FP8).view(slots, 1, DIM)
         self.kv_nvfp4 = torch.zeros((slots, 1, 352), dtype=torch.uint8, device=dev)
-        from sglang.srt.layers.attention.dsa.prims_k_cache import (
-            quantize_prims_k_cache_into,
+        from sglang.kernels.ops.kvcache.dsa_prims_nvfp4_kv_cache import (
+            set_prims_nvfp4_kv_buffer,
         )
 
-        quantize_prims_k_cache_into(k_nope, k_rope, self.kv_nvfp4, self.loc)
+        set_prims_nvfp4_kv_buffer(self.kv_nvfp4, self.loc, k_nope, k_rope)
         self.q_nope = torch.randn(rows, args.heads, KV_LORA, generator=gen, device=dev)
         self.q_rope = torch.randn(rows, args.heads, ROPE, generator=gen, device=dev)
         self.q_nope, self.q_rope = self.q_nope.bfloat16(), self.q_rope.bfloat16()
@@ -158,14 +158,14 @@ def bench_trtllm(case: Case, args, iters, flush):
 
 
 def bench_write_nvfp4(case: Case, tokens: int, iters, flush):
-    from sglang.srt.layers.attention.dsa.prims_k_cache import (
-        quantize_prims_k_cache_into,
+    from sglang.kernels.ops.kvcache.dsa_prims_nvfp4_kv_cache import (
+        set_prims_nvfp4_kv_buffer,
     )
 
     loc = case.loc[:tokens]
     return time_us(
-        lambda: quantize_prims_k_cache_into(
-            case.k_nope[:tokens], case.k_rope[:tokens], case.kv_nvfp4, loc
+        lambda: set_prims_nvfp4_kv_buffer(
+            case.kv_nvfp4, loc, case.k_nope[:tokens], case.k_rope[:tokens]
         ),
         iters,
         flush,

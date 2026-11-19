@@ -45,6 +45,9 @@ from sglang.kernels.ops.kvcache.cache_move import (
     set_kv_buffer_prefix_valid_tiled_fp8,
 )
 from sglang.kernels.ops.kvcache.cache_ops import launch_reshape_and_cache_flash
+from sglang.kernels.ops.kvcache.dsa_prims_nvfp4_kv_cache import (
+    set_prims_nvfp4_kv_buffer,
+)
 from sglang.kernels.ops.kvcache.kvcache import can_use_store_cache, store_cache
 from sglang.kernels.ops.kvcache.mla_buffer import (
     get_mla_kv_buffer_triton,
@@ -4913,25 +4916,9 @@ class MLATokenToKVPool(KVCache, MLAKVView):
             and dtype == torch.float8_e4m3fn
             and override_kv_cache_dim is not None
         )
+        # 352 B/token rows read by prims_ts (calculate_mla_kv_cache_dim)
         self.dsa_kv_cache_store_nvfp4 = use_dsa and is_float4_e2m1fn_x2(dtype)
         if self.dsa_kv_cache_store_nvfp4:
-            from sglang.srt.layers.attention.dsa.prims_k_cache import (
-                PRIMS_NVFP4_BYTES_PER_TOKEN,
-            )
-
-            if not (
-                (kv_lora_rank, qk_rope_head_dim) == (512, 64)
-                and override_kv_cache_dim == PRIMS_NVFP4_BYTES_PER_TOKEN
-                and page_size == 64
-                and not dcp_replicated
-            ):
-                raise ValueError(
-                    "DSA NVFP4 KV needs 512+64 MLA rows of "
-                    f"{PRIMS_NVFP4_BYTES_PER_TOKEN} B, page size 64 and no DCP; got "
-                    f"{kv_lora_rank=}, {qk_rope_head_dim=}, {override_kv_cache_dim=}, "
-                    f"{page_size=}, {dcp_replicated=}"
-                )
-            # Packed bytes; prims_k_cache encodes and decodes them.
             self.store_dtype = torch.uint8
         # When override_kv_cache_dim is provided with dsa model, we assume the
         # override kv cache dim is correct and use it directly.
@@ -5150,11 +5137,7 @@ class MLATokenToKVPool(KVCache, MLAKVView):
             and (self.use_dsa or self.dsa_kv_cache_store_fp8)
         ), "the DSA write paths have no resolved-loc variant"
         if self.dsa_kv_cache_store_nvfp4:
-            from sglang.srt.layers.attention.dsa.prims_k_cache import (
-                quantize_prims_k_cache_into,
-            )
-
-            quantize_prims_k_cache_into(cache_k_nope, cache_k_rope, dst_buffer, loc)
+            set_prims_nvfp4_kv_buffer(dst_buffer, loc, cache_k_nope, cache_k_rope)
         elif (
             _is_hip
             and self.use_dsa

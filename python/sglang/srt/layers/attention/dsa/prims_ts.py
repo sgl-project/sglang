@@ -8,10 +8,8 @@ a natural-log LSE. It reads one of two KV cache formats:
   per-tensor scale). It shares the ``trtllm`` route's query preparation, KV
   store, top-k transforms and DCP slot localization; only the kernel differs.
 - ``nvfp4.fp8rope`` (``--kv-cache-dtype nvfp4``): 352 B/token, 256 packed E2M1
-  NoPE bytes, 64 unscaled E4M3 RoPE bytes, then 32 E4M3 block scales (block b
-  at byte 320 + 8*(b%4) + b//4). There is no global scale. The KV writer and
-  query cast are in ``prims_k_cache``; the indexer's PAGED top-k already holds
-  physical slots and is passed to the kernel as is.
+  NoPE bytes, 64 unscaled E4M3 RoPE bytes, then 32 E4M3 block scales. Its writer
+  is ``set_prims_nvfp4_kv_buffer``; the rest of the route is the same as above.
 """
 
 from __future__ import annotations
@@ -29,8 +27,6 @@ _SUPPORTED_DEVICE_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
 
 # FlashInfer kv_cache_format -> bytes per cached token
 PRIMS_TS_KV_FORMATS = {"native": 576, "nvfp4.fp8rope": 352}
-
-PRIMS_TS_TOPK = 2048
 
 
 def _plan_capacity(rows: int) -> Optional[int]:
@@ -56,8 +52,6 @@ def check_prims_ts_sparse_mla_support(
             f"(kv_lora_rank 512, qk_rope_head_dim 64); got {kv_lora_rank}, "
             f"{qk_rope_head_dim}."
         )
-    if kv_cache_format not in PRIMS_TS_KV_FORMATS:
-        raise ValueError(f"Unknown Prims-TS kv_cache_format {kv_cache_format!r}")
     if torch.cuda.get_device_capability(device) not in _SUPPORTED_DEVICE_CAPABILITIES:
         raise ValueError("Prims-TS sparse MLA requires SM100, SM103 or SM107.")
     try:
@@ -69,7 +63,7 @@ def check_prims_ts_sparse_mla_support(
             device,
             1,
             num_heads,
-            max_topk=PRIMS_TS_TOPK,
+            max_topk=2048,
             q_dtype=torch.float8_e4m3fn,
             qk_rope_head_dim=qk_rope_head_dim,
             kv_cache_format=kv_cache_format,
@@ -81,36 +75,6 @@ def check_prims_ts_sparse_mla_support(
             f"{kv_cache_format} sparse MLA (flashinfer-ai/flashinfer#7410 and "
             f"#7984; #8186 on SM107): {exc}"
         ) from exc
-
-
-def make_prims_ts_causal_indices(
-    page_table_1: torch.Tensor,
-    row_to_batch: torch.Tensor,
-    causal_lens: torch.Tensor,
-    rows: int,
-) -> torch.Tensor:
-    """Physical slots for a prefill whose indexer selected no top-k.
-
-    A missing selection means dense causal attention, which fits the top-k
-    width only while each row's causal length is at most 2048. Slots come from
-    the page-size-1 table; columns past a row's length are -1 holes. The result
-    is the same for every layer of a forward, so callers build it once. An async
-    assertion rejects longer contexts without a host readback.
-    """
-    device = page_table_1.device
-    result = torch.full((rows, PRIMS_TS_TOPK), -1, dtype=torch.int32, device=device)
-    live = min(rows, row_to_batch.numel(), causal_lens.numel())
-    width = min(PRIMS_TS_TOPK, page_table_1.shape[1])
-    if live and width:
-        lengths = causal_lens[:live].view(-1, 1)
-        torch._assert_async(
-            torch.all((lengths >= 0) & (lengths <= PRIMS_TS_TOPK)),
-            "Prims-TS needs a top-k selection beyond causal length 2048",
-        )
-        columns = torch.arange(width, dtype=torch.int32, device=device).view(1, -1)
-        slots = page_table_1[row_to_batch[:live].long(), :width]
-        result[:live, :width] = torch.where(columns < lengths, slots, -1)
-    return result
 
 
 class PrimsTSSparseMLA:
