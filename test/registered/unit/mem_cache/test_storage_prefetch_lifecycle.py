@@ -464,6 +464,169 @@ class TestWaitingStorageSpan(unittest.TestCase):
         self.assertIsNone(cache.waiting_storage_span(_REQ))
 
 
+def _two_rank_capacity_deadline(rank, rendezvous):
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=f"file://{rendezvous}",
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        cache, _ = _timeout_fixture(mode="cache")
+        cache.ongoing_prefetch.clear()
+        cache.cache_controller.prefetch_rate_limited = lambda: True
+        cache.prefetch_from_storage(_REQ, 0, list(range(8)))
+        reductions = []
+        cache._all_reduce = _counting_all_reduce(reductions)
+        if rank == 0:
+            with patch("time.perf_counter", return_value=100.0):
+                assert not cache.check_prefetch_progress(_REQ)
+        with patch("time.perf_counter", return_value=103.0):
+            cache._vote_prefetch_deadlines()
+        assert reductions == [([1], torch.distributed.ReduceOp.MAX)]
+        assert cache.check_prefetch_progress(_REQ)
+        assert cache._storage_prefetch_wait[_REQ].expired
+        assert not cache.storage_prefetch_retries.capacity_deferred
+        _assert_ranks_agree(
+            (len(reductions), cache._storage_prefetch_wait[_REQ].expired)
+        )
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+class TestCapacityDeferredPrefetch(unittest.TestCase):
+    def test_capacity_deadline_is_agreed_before_a_peer_polls(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            torch.multiprocessing.spawn(
+                _two_rank_capacity_deadline,
+                args=(f"{tmpdir}/gloo",),
+                nprocs=2,
+            )
+
+    def test_timeout_budget_survives_capacity_retry(self):
+        cache, _ = _timeout_fixture(mode="cache")
+        cache.ongoing_prefetch.clear()
+        cache.cache_controller.prefetch_rate_limited = lambda: True
+        cache.prefetch_from_storage(_REQ, 0, list(range(8)))
+        with patch("time.perf_counter", return_value=100.0):
+            self.assertFalse(cache.check_prefetch_progress(_REQ))
+        wait = cache._storage_prefetch_wait[_REQ]
+        req = SimpleNamespace(rid=_REQ.rid)
+        list(cache.storage_prefetch_retries.pop_capacity_ready([req], lambda: False))
+        cache.cache_controller.prefetch_rate_limited = lambda: False
+        cache.prefetch_from_storage(_REQ, 0, list(range(8)))
+        self.assertIs(cache._storage_prefetch_wait[_REQ], wait)
+        with patch("time.perf_counter", return_value=103.0):
+            cache._vote_prefetch_deadlines()
+        self.assertTrue(wait.expired)
+        self.assertTrue(cache.check_prefetch_progress(_REQ))
+
+    def test_capacity_deferred_request_is_not_admitted_as_a_miss(self):
+        cache, _ = _timeout_fixture(mode="cache", policy="wait_complete")
+        cache.ongoing_prefetch.clear()
+        cache.cache_controller.prefetch_rate_limited = lambda: True
+        cache.prefetch_from_storage(_REQ, 0, list(range(8)))
+        self.assertFalse(cache.check_prefetch_progress(_REQ))
+
+    def test_capacity_wait_does_not_spend_miss_retry_budget(self):
+        cache, _ = _timeout_fixture(mode="cache", policy="wait_complete")
+        cache.ongoing_prefetch.clear()
+        cache.cache_controller.prefetch_rate_limited = lambda: True
+        cache.prefetch_from_storage(_REQ, 0, list(range(8)))
+        retries = cache.storage_prefetch_retries
+        req = SimpleNamespace(rid=_REQ.rid, storage_prefetch_retry_attempts=8)
+        # Even a queue head with polling disabled and an exhausted miss budget
+        # still has not attempted its capacity-deferred lookup.
+        self.assertEqual(retries.pop_ready([req], 0, 8), [])
+        self.assertFalse(cache.check_prefetch_progress(_REQ))
+        self.assertEqual(list(retries.pop_capacity_ready([req], lambda: True)), [])
+        ready = list(retries.pop_capacity_ready([req], lambda: False))
+        self.assertEqual(ready, [(req, None)])
+        self.assertEqual(req.storage_prefetch_retry_attempts, 8)
+        cache.cache_controller.prefetch_rate_limited = lambda: False
+        cache.prefetch_from_storage(_REQ, 0, list(range(8)))
+        self.assertIn(_REQ, cache.ongoing_prefetch)
+        self.assertFalse(cache.check_prefetch_progress(_REQ))
+
+    def test_scheduler_refreshes_capacity_waiters_without_spending_retry_budget(self):
+        from sglang.srt.managers.scheduler import Scheduler
+
+        retries = StoragePrefetchRetries()
+        retries.defer_capacity(_REQ, 8, 8)
+        req = SimpleNamespace(rid=_REQ.rid, storage_prefetch_retry_attempts=8)
+        scheduler = SimpleNamespace(
+            tree_cache=SimpleNamespace(
+                storage_prefetch_retries=retries,
+                cache_controller=SimpleNamespace(prefetch_rate_limited=lambda: False),
+            ),
+            waiting_queue=[req],
+            _prefetch_kvcache=Mock(),
+            _retry_storage_prefetch=Mock(),
+        )
+        with patch(
+            "sglang.srt.managers.scheduler.get_memory",
+            return_value=SimpleNamespace(
+                hicache_storage_prefetch_retry_poll_interval=0,
+                hicache_storage_prefetch_retry_max_attempts=8,
+            ),
+        ):
+            Scheduler._process_storage_prefetch_retries(scheduler)
+        scheduler._prefetch_kvcache.assert_called_once_with(req, 8)
+        scheduler._retry_storage_prefetch.assert_not_called()
+        self.assertEqual(req.storage_prefetch_retry_attempts, 8)
+
+    def test_capacity_is_rechecked_between_submissions(self):
+        retries = StoragePrefetchRetries()
+        handles = [CacheRequestHandle(str(i), 0) for i in range(2)]
+        reqs = [SimpleNamespace(rid=h.rid) for h in handles]
+        for handle in handles:
+            retries.defer_capacity(handle, 8)
+        limited = False
+        ready = retries.pop_capacity_ready(reqs, lambda: limited)
+        self.assertEqual(next(ready), (reqs[0], None))
+        limited = True
+        self.assertEqual(list(ready), [])
+        self.assertIn(handles[1].rid, retries.capacity_deferred)
+
+    def test_capacity_wait_has_a_timeout_without_an_active_operation(self):
+        cache, _ = _timeout_fixture(mode="cache")
+        cache.ongoing_prefetch.clear()
+        cache.cache_controller.prefetch_rate_limited = lambda: True
+        cache.prefetch_from_storage(_REQ, 0, list(range(8)))
+        votes = []
+        cache._all_reduce = lambda tensor, op: votes.append(tensor.tolist())
+        with patch("time.perf_counter", return_value=100.0):
+            self.assertFalse(cache.check_prefetch_progress(_REQ))
+        with patch("time.perf_counter", return_value=103.0):
+            # Admission never makes a local-clock decision on one rank alone.
+            self.assertFalse(cache.check_prefetch_progress(_REQ))
+            self.assertEqual(votes, [])
+            cache._vote_prefetch_deadlines()
+            self.assertEqual(votes, [[1]])
+            self.assertTrue(cache.check_prefetch_progress(_REQ))
+        self.assertTrue(cache._storage_prefetch_wait[_REQ].expired)
+        cache.prefetch_from_storage(_REQ, 0, list(range(8)))
+        self.assertFalse(cache.storage_prefetch_retries.capacity_deferred)
+
+    def test_best_effort_and_cancel_do_not_hold_capacity_waiters(self):
+        cache, _ = _timeout_fixture(mode="cache", policy="best_effort")
+        cache.ongoing_prefetch.clear()
+        cache.cache_controller.prefetch_rate_limited = lambda: True
+        cache.prefetch_from_storage(_REQ, 0, list(range(8)))
+        self.assertTrue(cache.check_prefetch_progress(_REQ))
+        retries = cache.storage_prefetch_retries
+        self.assertFalse(retries.capacity_deferred)
+        retries.defer_capacity(_REQ, 8)
+        retries.cancel(_REQ.rid)
+        self.assertTrue(cache.check_prefetch_progress(_REQ))
+        retries.defer_capacity(_REQ, 8)
+        retries.clear()
+        self.assertFalse(retries.capacity_deferred)
+        retries.poll_miss(_REQ.rid)
+        self.assertTrue(cache.check_prefetch_progress(_REQ))
+
+
 class TestStoragePrefetchTimeout(unittest.TestCase):
     def test_polls_never_reduce_and_the_tick_votes_once(self):
         """N waiting requests polled in one pass issue no collective; the tick
@@ -897,9 +1060,9 @@ class TestStagedPrefetchLifecycle(unittest.TestCase):
         self.assertEqual(cache.cache_controller.prefetch_tokens_occupied, 0)
         cache.cache_controller.load.assert_not_called()
 
-    def test_retry_budget_bounds_reissues_and_paces_capacity_misses(self):
+    def test_retry_budget_bounds_misses_but_capacity_waits_for_space(self):
         """Past --hicache-storage-prefetch-retry-max-attempts a request stops
-        re-issuing; a rate-limited cache-mode query is paced, not re-issued."""
+        re-issuing; capacity deferral waits for space without a lookup."""
         retries = StoragePrefetchRetries()
         head = SimpleNamespace(rid="head", storage_prefetch_retry_attempts=0)
         req = SimpleNamespace(rid="r", storage_prefetch_retry_attempts=8)
@@ -928,8 +1091,12 @@ class TestStagedPrefetchLifecycle(unittest.TestCase):
         self.assertEqual(cache.ongoing_prefetch, {})
         retries = cache.storage_prefetch_retries
         self.assertEqual(retries.pop_ready([head, req], 2, 8), [])
-        self.assertEqual(retries.pop_ready([head, req], 2, 8), [])
-        self.assertEqual(retries.pop_ready([head, req], 2, 8), [(req, 10)])
+        self.assertEqual(
+            list(retries.pop_capacity_ready([head, req], lambda: True)), []
+        )
+        self.assertEqual(
+            list(retries.pop_capacity_ready([head, req], lambda: False)), [(req, 10)]
+        )
 
     def test_staged_hold_drops_after_bounded_admission_deferrals(self):
         """A hold that cannot be materialized after max_staged_admission_defers

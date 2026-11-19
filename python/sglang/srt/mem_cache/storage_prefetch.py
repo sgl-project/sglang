@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Callable, Iterator, Optional
 
 import msgspec
 
@@ -9,6 +9,7 @@ from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
     from sglang.srt.mem_cache.radix_cache import RadixKey
 
 
@@ -19,6 +20,13 @@ class _StoragePrefetchRetry:
     due_step: Optional[int] = None
 
 
+@dataclass
+class CapacityDeferredPrefetch:
+    handle: CacheRequestHandle
+    requested_tokens: int
+    storage_hit_end: Optional[int] = None
+
+
 class StoragePrefetchRetries:
     """New L3 attempts only (parked IO and retained staging retry at their owner);
     step deadlines keep TP ranks in lockstep, retries follow queue order, and a
@@ -27,18 +35,49 @@ class StoragePrefetchRetries:
     def __init__(self):
         self._pending: dict[str, _StoragePrefetchRetry] = {}
         self._step = 0
+        self.capacity_deferred: dict[str, CapacityDeferredPrefetch] = {}
+
+    def defer_capacity(
+        self,
+        handle: CacheRequestHandle,
+        requested_tokens: int,
+        storage_hit_end: Optional[int] = None,
+    ) -> None:
+        # No lookup has been attempted: this is not a speculative storage miss.
+        self.cancel(handle.rid)
+        self.capacity_deferred[handle.rid] = CapacityDeferredPrefetch(
+            handle, requested_tokens, storage_hit_end
+        )
+
+    def pop_capacity_ready(
+        self, waiting_queue: list[Req], rate_limited: Callable[[], bool]
+    ) -> Iterator[tuple[Req, Optional[int]]]:
+        # Yield one request at a time so each submission's reservation is visible
+        # before considering the next. Refresh the prefix through the scheduler.
+        for req in waiting_queue:
+            deferred = self.capacity_deferred.get(req.rid)
+            if deferred is None:
+                continue
+            if rate_limited():
+                break
+            self.cancel(req.rid)
+            yield req, deferred.storage_hit_end
 
     def poll_miss(self, req_id: str, storage_hit_end: Optional[int] = None) -> None:
+        self.cancel(req_id)
         self._pending[req_id] = _StoragePrefetchRetry(False, storage_hit_end)
 
     def refetch(self, req_id: str, storage_hit_end: Optional[int] = None) -> None:
+        self.cancel(req_id)
         self._pending[req_id] = _StoragePrefetchRetry(True, storage_hit_end)
 
     def cancel(self, req_id: str) -> None:
         self._pending.pop(req_id, None)
+        self.capacity_deferred.pop(req_id, None)
 
     def clear(self) -> None:
         self._pending.clear()
+        self.capacity_deferred.clear()
 
     def pop_ready(
         self, waiting_queue: list[Req], interval: int, max_attempts: int

@@ -2741,8 +2741,9 @@ class UnifiedRadixCache(BasePrefixCache):
             return
         if not buffer_mode and self.cache_controller.prefetch_rate_limited():
             stats["declined_rate_limited"] += 1
-            # Paced: the limiter clears as transfers finish, not on the next pass.
-            self.storage_prefetch_retries.poll_miss(req_id, storage_hit_end)
+            self.storage_prefetch_retries.defer_capacity(
+                request, len(prefetch_key), storage_hit_end
+            )
             return
 
         # Buffer mode holds no tree state during the fetch: buffers are
@@ -2842,18 +2843,25 @@ class UnifiedRadixCache(BasePrefixCache):
             self.cache_controller.prefetch_tokens_occupied += len(prefetch_key)
 
     def _start_storage_prefetch_wait(self, operation: PrefetchOperation) -> None:
+        self._start_storage_prefetch_wait_for_request(
+            operation.handle, operation.stats_requested_tokens
+        )
+
+    def _start_storage_prefetch_wait_for_request(
+        self, handle: CacheRequestHandle, requested_tokens: int
+    ) -> None:
         if (
             self.prefetch_stop_policy == "timeout"
-            and operation.handle not in self._storage_prefetch_wait
+            and handle not in self._storage_prefetch_wait
         ):
             # Start at the first blocked admission poll; refetches keep this budget.
-            pages = operation.stats_requested_tokens // self.page_size
+            pages = requested_tokens // self.page_size
             wait = _StoragePrefetchWait(
                 timeout_s=self.prefetch_timeout_base
                 + pages * self.prefetch_timeout_per_page,
             )
             wait.timer.observe(ready=False)
-            self._storage_prefetch_wait[operation.handle] = wait
+            self._storage_prefetch_wait[handle] = wait
 
     def _prefetch_deadline_expired(self, operation: PrefetchOperation) -> bool:
         if operation.host_indices is not None and (
@@ -2861,7 +2869,10 @@ class UnifiedRadixCache(BasePrefixCache):
         ):
             # KV landed: cutting the pending sidecar read would salvage nothing.
             return False
-        wait = self._storage_prefetch_wait.get(operation.handle)
+        return self._storage_prefetch_wait_expired(operation.handle)
+
+    def _storage_prefetch_wait_expired(self, handle: CacheRequestHandle) -> bool:
+        wait = self._storage_prefetch_wait.get(handle)
         return wait is not None and (
             wait.expired
             or (wait.timer.running and wait.timer.elapsed() > wait.timeout_s)
@@ -2899,23 +2910,29 @@ class UnifiedRadixCache(BasePrefixCache):
 
         Wall clocks differ across ranks: PP0 decides per operation, TP takes
         MAX (any rank timed out) and _all_reduce relays the verdict along PP.
-        The packed tensor has one slot per `ongoing_prefetch` entry in
-        insertion order; this tick's ready-count sync asserted that set is
-        rank-identical (_hicache_sync_digest), and the drain between them
-        only retires in lockstep. With no live prefetch no rank issues a
-        collective. A wait that has not started yet (no blocked poll on PP0)
-        contributes 0 until the next tick. An expired operation is terminated
+        The packed tensor contains active operations followed by capacity
+        waiters, each in insertion order. This tick's ready-count sync asserted
+        that set is rank-identical (_hicache_sync_digest), and the drain between them
+        only retires in lockstep. With no active operation or capacity waiter,
+        no rank issues a collective. A wait that has not started yet (no blocked
+        poll on PP0) contributes 0 until the next tick. An expired operation is terminated
         here so the transfer worker and the hit drain stop spending on it;
         its retirement stays with the admission poll or the drain.
         """
-        if self.prefetch_stop_policy != "timeout" or not self.ongoing_prefetch:
+        if self.prefetch_stop_policy != "timeout":
             return
+        deferred = list(self.storage_prefetch_retries.capacity_deferred.values())
         operations = [info.operation for info in self.ongoing_prefetch.values()]
-        expired = [0] * len(operations)
+        if not operations and not deferred:
+            return
+        expired = [0] * (len(operations) + len(deferred))
         if self.pp_rank == 0:
             expired = [
                 int(self._prefetch_deadline_expired(operation))
                 for operation in operations
+            ] + [
+                int(self._storage_prefetch_wait_expired(item.handle))
+                for item in deferred
             ]
         verdicts = torch.tensor(expired, dtype=torch.int, device="cpu")
         self._all_reduce(verdicts, torch.distributed.ReduceOp.MAX)
@@ -2923,6 +2940,12 @@ class UnifiedRadixCache(BasePrefixCache):
             if verdict:
                 self._mark_prefetch_deadline_expired(operation)
                 self.cache_controller.terminate_prefetch(operation)
+        for item, verdict in zip(deferred, verdicts.tolist()[len(operations) :]):
+            if verdict:
+                self.storage_prefetch_retries.cancel(item.handle.rid)
+                self._storage_prefetch_wait.setdefault(
+                    item.handle, _StoragePrefetchWait()
+                ).expired = True
 
     def _hicache_sync_digest(self) -> int:
         """Value piggybacked on the ready-count MIN sync: equal on every rank
@@ -2936,10 +2959,20 @@ class UnifiedRadixCache(BasePrefixCache):
         if (
             self.enable_storage
             and self.prefetch_stop_policy == "timeout"
-            and self.ongoing_prefetch
+            and (
+                self.ongoing_prefetch or self.storage_prefetch_retries.capacity_deferred
+            )
         ):
-            live = "\0".join(
-                f"{handle.rid}\0{handle.attempt_id}" for handle in self.ongoing_prefetch
+            live = (
+                "\0".join(
+                    f"active:{handle.rid}\0{handle.attempt_id}"
+                    for handle in self.ongoing_prefetch
+                )
+                + "\0"
+                + "\0".join(
+                    f"capacity:{item.handle.rid}\0{item.handle.attempt_id}"
+                    for item in self.storage_prefetch_retries.capacity_deferred.values()
+                )
             )
             digest = digest * 1000003 + zlib.crc32(live.encode()) + 1
         return digest
@@ -3062,6 +3095,15 @@ class UnifiedRadixCache(BasePrefixCache):
             return self._check_pp_prefetch_progress(request)
 
         if request not in self.ongoing_prefetch:
+            deferred = self.storage_prefetch_retries.capacity_deferred.get(request.rid)
+            if deferred is not None:
+                if self.prefetch_stop_policy == "best_effort":
+                    self.storage_prefetch_retries.cancel(request.rid)
+                    return True
+                self._start_storage_prefetch_wait_for_request(
+                    request, deferred.requested_tokens
+                )
+                return False
             return True
 
         operation = self.ongoing_prefetch[request].operation

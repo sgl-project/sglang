@@ -3826,6 +3826,14 @@ class Scheduler(
         retries = self.tree_cache.storage_prefetch_retries
         if retries is None:
             return
+        if retries.capacity_deferred:
+            for req, storage_hit_end in retries.pop_capacity_ready(
+                self.waiting_queue,
+                self.tree_cache.cache_controller.prefetch_rate_limited,
+            ):
+                # Capacity deferral did not issue a lookup and must not consume
+                # the budget for re-querying genuine storage misses.
+                self._prefetch_kvcache(req, storage_hit_end)
         memory = get_memory()
         for req, storage_hit_end in retries.pop_ready(
             self.waiting_queue,
