@@ -572,6 +572,18 @@ class TestPrepareServerArgs(CustomTestCase):
                     chunked_prefill_size=-1,
                 ).check_server_args()
 
+    def test_disable_multimodal_rejects_enable_multimodal(self):
+        with self.assertRaisesRegex(
+            ValueError, "--disable-multimodal cannot be combined"
+        ):
+            ServerArgs(
+                model_path="dummy",
+                served_model_name="dummy",
+                enable_multimodal=True,
+                disable_multimodal=True,
+                chunked_prefill_size=-1,
+            ).check_server_args()
+
     def test_instanttensor_device_check_allows_cuda_and_other_loaders(self):
         for device, load_format in (
             ("cuda", "instanttensor"),
@@ -1854,7 +1866,12 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
         )
         defaults.update(kw)
         view = ResolvedView(
-            SimpleNamespace(_model_config=SimpleNamespace(hf_config=hf), **defaults)
+            SimpleNamespace(
+                _model_config=SimpleNamespace(
+                    hf_config=hf, kv_lora_rank=512, qk_rope_head_dim=64
+                ),
+                **defaults,
+            )
         )
         with (
             patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
@@ -4603,6 +4620,11 @@ class TestGrpcServerArgs(CustomTestCase):
         with self.assertRaises(ValueError):
             handle_grpc_args(sa)
 
+    def test_rust_server_grpc_accepts_multi_tokenizer(self):
+        sa = self._args(grpc_port=40000, tokenizer_worker_num=4)
+        with envs.SGLANG_RUST_SERVER.override(True):
+            handle_grpc_args(sa)
+
     def test_native_grpc_rejects_http_auth(self):
         for rust_server in (False, True):
             for shutdown_rpc in (False, True):
@@ -5057,6 +5079,15 @@ class TestKvCacheShardingCompatibility(CustomTestCase):
         ):
             self.assertFalse(post_capture_kv_sizing_planned(args))
             args.enable_kv_cache_sharding = False
+            self.assertTrue(post_capture_kv_sizing_planned(args))
+            args.disaggregation_transfer_backend = "nixl"
+            for mode in ("prefill", "decode"):
+                args.disaggregation_mode = mode
+                args.enable_unified_memory = False
+                self.assertTrue(post_capture_kv_sizing_planned(args))
+                args.enable_unified_memory = True
+                self.assertFalse(post_capture_kv_sizing_planned(args))
+            args.disaggregation_mode = "null"
             self.assertTrue(post_capture_kv_sizing_planned(args))
 
     def test_chunk_rounding_expands_automatic_activation_headroom(self):
