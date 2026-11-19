@@ -264,17 +264,6 @@ def test_dense_worker_constructor_to_draft_sampler_warmup(
         target_runner.attn_backend = SimpleNamespace(_dspark_dsa_ragged_verify=True)
         draft_runner.attn_backend = SimpleNamespace(_dspark_dsa_ragged_verify=False)
         worker.init_attention_backends()
-        with patch(
-            "sglang.srt.speculative.dspark_components.dspark_dp.get_dp_tp_group",
-            return_value=SimpleNamespace(broadcast_object=Mock(return_value=3)),
-        ) as get_group:
-            assert worker._verify_planner.sync_verify_budget(1) == (3 if hooks else 1)
-            if hooks:
-                get_group.return_value.broadcast_object.assert_called_once_with(
-                    1, src=0
-                )
-            else:
-                get_group.assert_not_called()
         worker.init_cuda_graphs()
         draft_worker.init_cuda_graphs.assert_called_once_with(
             capture_decode_cuda_graph=graph

@@ -1,14 +1,13 @@
-"""Opt-in DSpark budget synchronization and packed attention-DP inputs.
+"""Opt-in DSpark packed attention-DP inputs.
 
 The worker selects and validates the supported execution path. These helpers
 do not select models or devices; cross-DP tier selection stays in the planner.
 """
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dspark_components.dspark_planner import DSparkVerifyHooks
 
@@ -18,19 +17,12 @@ if TYPE_CHECKING:
 
 def make_dspark_verify_hooks(*, coordinate_dp_verify: bool) -> DSparkVerifyHooks:
     return DSparkVerifyHooks(
-        sync_budget=sync_verify_budget,
         prepare_forward_batch=(
             prepare_compact_dp_forward_batch if coordinate_dp_verify else None
         ),
         dynamic_tiers_with_dp=True,
         coordinate_dp_verify=coordinate_dp_verify,
     )
-
-
-def sync_verify_budget(budget: Optional[int]) -> Optional[int]:
-    # Only ranks owning the SAME requests share a budget. None (a missing
-    # confidence snapshot) must also be broadcast to keep their decisions equal.
-    return get_dp_tp_group().broadcast_object(budget, src=0)
 
 
 def prepare_compact_dp_forward_batch(forward_batch: "ForwardBatch") -> None:

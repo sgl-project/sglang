@@ -99,34 +99,24 @@ def test_npu_runner_defers_only_glm_compact_to_common_loader(
         assert runner._replay_graph_key == "legacy-key"
 
 
-@pytest.mark.parametrize(
-    "is_npu,local_budget,root_budget,expected_budget,expected_tier",
-    [
-        (True, 1, 6, 6, 8),
-        (True, None, 6, 6, 8),
-        (True, 1, None, None, -1),
-        (False, 1, 6, 1, 3),
-    ],
-)
-def test_tp_broadcast_budget_precedes_tier_choice(
-    is_npu, local_budget, root_budget, expected_budget, expected_tier
+@pytest.mark.parametrize("with_hooks", [False, True])
+@pytest.mark.parametrize("local_budget,expected_tier", [(4, 6), (0, 2), (None, -1)])
+def test_budget_preparation_preserves_upstream_decision(
+    with_hooks, local_budget, expected_tier
 ):
     planner = dspark_planner.DSparkVerifyPlanner.__new__(
         dspark_planner.DSparkVerifyPlanner
     )
     planner._budget_planner = Mock()
-    planner.model_runner = SimpleNamespace(
-        attn_backend=SimpleNamespace(_dspark_dsa_ragged_verify=is_npu)
-    )
     planner._verify_hooks = (
-        dspark_planner.DSparkVerifyHooks(sync_budget=dspark_dp.sync_verify_budget)
-        if is_npu
+        dspark_dp.make_dspark_verify_hooks(coordinate_dp_verify=True)
+        if with_hooks
         else None
     )
     planner._budget_from_resolved = Mock(return_value=local_budget)
     planner._maybe_gather_dp_verify_tier = Mock()
-    planner.verify_num_draft_tokens = 8
-    planner._schedule_cfg = DSparkScheduleConfig(gamma=7)
+    planner.verify_num_draft_tokens = 9
+    planner._schedule_cfg = DSparkScheduleConfig(gamma=8)
     batch = SimpleNamespace(
         spec_info=SimpleNamespace(),
         batch_size=lambda: 2,
@@ -134,22 +124,20 @@ def test_tp_broadcast_budget_precedes_tier_choice(
         is_extend_in_batch=False,
         req_pool_indices_cpu=torch.tensor([2, 5]),
     )
-    group = SimpleNamespace(broadcast_object=Mock(return_value=root_budget))
-    with (
-        patch.object(dspark_dp, "get_dp_tp_group", return_value=group) as parallel,
-    ):
-        planner.prepare_verify_budget(batch, Mock())
-    assert batch.spec_info.verify_token_budget == expected_budget
+    future_map = Mock()
+    with patch("torch.distributed.broadcast_object_list") as broadcast:
+        planner.prepare_verify_budget(batch, future_map)
+    assert batch.spec_info.verify_token_budget == local_budget
     assert batch.spec_verify_tier_num_tokens == expected_tier
-    if is_npu:
-        group.broadcast_object.assert_called_once_with(local_budget, src=0)
-    else:
-        parallel.assert_not_called()
-        group.broadcast_object.assert_not_called()
+    planner._budget_from_resolved.assert_called_once_with(
+        resolved=future_map.resolve_confidence_cpu.return_value,
+        req_pool_indices_cpu=batch.req_pool_indices_cpu,
+    )
+    broadcast.assert_not_called()
 
 
-@pytest.mark.parametrize("is_npu,is_glm", [(True, True), (True, False), (False, False)])
-def test_sync_budget_uses_runtime_tp_group(is_npu, is_glm):
+@pytest.mark.parametrize("with_hooks", [False, True])
+def test_sync_budget_computation_preserves_upstream_decision(with_hooks):
     planner = dspark_planner.DSparkVerifyPlanner.__new__(
         dspark_planner.DSparkVerifyPlanner
     )
@@ -157,17 +145,15 @@ def test_sync_budget_uses_runtime_tp_group(is_npu, is_glm):
     planner._budget_from_resolved = Mock(return_value=1)
     planner.model_runner = SimpleNamespace(
         req_to_token_pool=SimpleNamespace(req_generation=torch.tensor([10, 20, 30])),
-        attn_backend=SimpleNamespace(_dspark_dsa_ragged_verify=is_glm),
     )
     planner._verify_hooks = (
-        dspark_planner.DSparkVerifyHooks(sync_budget=dspark_dp.sync_verify_budget)
-        if is_npu and is_glm
+        dspark_dp.make_dspark_verify_hooks(coordinate_dp_verify=True)
+        if with_hooks
         else None
     )
-    group = SimpleNamespace(broadcast_object=Mock(return_value=6))
     draft_input = SimpleNamespace()
     with (
-        patch.object(dspark_dp, "get_dp_tp_group", return_value=group) as parallel,
+        patch("torch.distributed.broadcast_object_list") as broadcast,
         patch.object(
             dspark_planner,
             "get_schedule",
@@ -180,15 +166,11 @@ def test_sync_budget_uses_runtime_tp_group(is_npu, is_glm):
             prefix_lens=torch.tensor([11, 22]),
             req_pool_indices=torch.tensor([2, 0]),
         )
-    assert budget == (6 if is_npu and is_glm else 1)
+    assert budget == 1
     assert draft_input.verify_token_budget == budget
     resolved = planner._budget_from_resolved.call_args.kwargs["resolved"]
     assert resolved.generation.tolist() == [30, 10]
-    if is_npu and is_glm:
-        group.broadcast_object.assert_called_once_with(1, src=0)
-    else:
-        parallel.assert_not_called()
-        group.broadcast_object.assert_not_called()
+    broadcast.assert_not_called()
 
 
 @pytest.mark.parametrize("mode", [RaggedVerifyMode.STATIC, RaggedVerifyMode.COMPACT])
@@ -231,28 +213,21 @@ def test_planner_constructor_does_not_read_backend_or_run_budget_collectives(mod
             tp_rank=1,
             verify_num_draft_tokens=4,
             tp_sync=Mock(),
-            verify_hooks=dspark_planner.DSparkVerifyHooks(
-                sync_budget=dspark_dp.sync_verify_budget
-            ),
+            verify_hooks=dspark_planner.DSparkVerifyHooks(),
         )
         assert not hasattr(runner, "attn_backend")
         runner.req_to_token_pool = SimpleNamespace(req_generation=torch.tensor([0, 0]))
         runner.attn_backend = SimpleNamespace(_dspark_dsa_ragged_verify=True)
         if mode is RaggedVerifyMode.COMPACT:
             planner._budget_from_resolved = Mock(return_value=1)
-            group = SimpleNamespace(broadcast_object=Mock(return_value=3))
-            with patch.object(
-                dspark_dp,
-                "get_dp_tp_group",
-                return_value=group,
-            ):
+            with patch("torch.distributed.broadcast_object_list") as broadcast:
                 budget = planner.compute_budget_sync(
                     confidence=torch.ones(2, 3),
                     prefix_lens=torch.tensor([4, 8]),
                     req_pool_indices=torch.tensor([0, 1]),
                 )
-            assert budget == 3
-            group.broadcast_object.assert_called_once_with(1, src=0)
+            assert budget == 1
+            broadcast.assert_not_called()
 
 
 def test_confidence_relay_not_ready_generation_and_source_fence():

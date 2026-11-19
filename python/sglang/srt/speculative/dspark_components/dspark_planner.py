@@ -83,11 +83,10 @@ class VerifyTierResolution(msgspec.Struct, frozen=True):
 class DSparkVerifyHooks(msgspec.Struct, frozen=True):
     """Opt-in execution hooks selected by the worker and validated at backend init.
 
-    Budget synchronization is attention-TP-local. Cross-DP capacity gathering
-    and layout selection belong to this planner, not the callbacks.
+    Cross-DP capacity gathering and layout selection belong to this planner,
+    not the callbacks. Budget computation follows the upstream planner.
     """
 
-    sync_budget: Callable[[Optional[int]], Optional[int]]
     prepare_forward_batch: Optional[Callable[[ForwardBatch], None]] = None
     dynamic_tiers_with_dp: bool = False
     coordinate_dp_verify: bool = False
@@ -243,11 +242,6 @@ class DSparkVerifyPlanner:
             self._verify_hooks is not None and self._verify_hooks.coordinate_dp_verify
         )
 
-    def sync_verify_budget(self, budget: Optional[int]) -> Optional[int]:
-        if self._verify_hooks is None:
-            return budget
-        return self._verify_hooks.sync_budget(budget)
-
     def coordinate_verify_layout(
         self, *, batch: ScheduleBatch, layout: Optional[RaggedVerifyLayout]
     ) -> Optional[RaggedVerifyLayout]:
@@ -370,9 +364,6 @@ class DSparkVerifyPlanner:
         draft_input.verify_token_budget = self._budget_from_resolved(
             resolved=resolved, req_pool_indices_cpu=batch.req_pool_indices_cpu
         )
-        draft_input.verify_token_budget = self.sync_verify_budget(
-            draft_input.verify_token_budget
-        )
         batch.spec_verify_tier_num_tokens = local_verify_tier_num_tokens(
             bs=batch.batch_size(),
             verify_token_budget=draft_input.verify_token_budget,
@@ -421,10 +412,9 @@ class DSparkVerifyPlanner:
             confidence=confidence.to("cpu"),
             generation=generation,
         )
-        budget = self._budget_from_resolved(
+        return self._budget_from_resolved(
             resolved=resolved, req_pool_indices_cpu=req_pool_indices_cpu
         )
-        return self.sync_verify_budget(budget)
 
     def resolve_verify_token_budget(
         self,
@@ -441,6 +431,8 @@ class DSparkVerifyPlanner:
         if not get_schedule().disable_overlap_schedule:
             return draft_input.verify_token_budget
 
+        # No collective: the budget derives only from the broadcast draft tokens
+        # (via confidence), replicated req_generation, and the static sps table.
         draft_input.verify_token_budget = self.compute_budget_sync(
             confidence=confidence,
             prefix_lens=prefix_lens,

@@ -49,7 +49,6 @@ def _planner(runner=None, *, coordinate=True):
     planner.device = "cpu"
     planner.verify_num_draft_tokens = 9
     planner._verify_hooks = dspark_planner.DSparkVerifyHooks(
-        sync_budget=dspark_dp.sync_verify_budget,
         coordinate_dp_verify=coordinate,
     )
     return planner
@@ -196,8 +195,6 @@ def _collective_worker(rank, init_path, graph):
         timeout=timedelta(seconds=45),
     )
     try:
-        groups = [dist.new_group([0, 1]), dist.new_group([2, 3])]
-        attention_group = groups[rank // 2]
         runner = _runner(graph)
         parallel = SimpleNamespace(
             tp_group=SimpleNamespace(cpu_group=dist.group.WORLD),
@@ -206,35 +203,19 @@ def _collective_worker(rank, init_path, graph):
             attn_dp_rank=rank // 2,
         )
 
-        # Two unrelated request sets must keep DIFFERENT budgets. The real
-        # broadcast is confined to each attention-TP group.
-        def broadcast(value, src):
-            values = [value]
-            dist.broadcast_object_list(
-                values, src=(rank // 2) * 2, group=attention_group
-            )
-            return values[0]
-
+        # Local budgets follow upstream computation; capacity gathering must
+        # preserve independent decisions for unrelated request sets.
         planner = _planner(runner)
         planner.model_runner.req_to_token_pool = SimpleNamespace(
             req_generation=torch.zeros(2, dtype=torch.long)
         )
         planner._budget_planner = Mock()
-        planner._budget_from_resolved = Mock(
-            return_value=(2 if rank < 2 else 6) + rank % 2
+        planner._budget_from_resolved = Mock(return_value=(2 if rank < 2 else 6))
+        budget = planner.compute_budget_sync(
+            confidence=torch.ones(1, 8),
+            prefix_lens=torch.tensor([10]),
+            req_pool_indices=torch.tensor([0]),
         )
-        with (
-            patch.object(
-                dspark_dp,
-                "get_dp_tp_group",
-                return_value=SimpleNamespace(broadcast_object=broadcast),
-            ),
-        ):
-            budget = planner.compute_budget_sync(
-                confidence=torch.ones(1, 8),
-                prefix_lens=torch.tensor([10]),
-                req_pool_indices=torch.tensor([0]),
-            )
         assert budget == (2 if rank < 2 else 6)
         # Existing scheduler-time path retains its one-column protocol and
         # per-rank list, including a negative fallback hint and an idle zero.
@@ -380,10 +361,8 @@ def test_verify_hook_selection_before_backend_init(is_npu, architecture, mode, d
             return_value=SimpleNamespace(attn_dp_enabled=dp),
         ),
         envs.SGLANG_RAGGED_VERIFY_MODE.override(mode),
-        patch.object(dspark_dp, "get_dp_tp_group") as group,
     ):
         hooks = dspark_worker_v2._make_verify_hooks(runner)
-    group.assert_not_called()
     assert not hasattr(runner, "attn_backend")
     if not is_npu or architecture != "GlmMoeDsaForCausalLM" or mode == "static":
         assert hooks is None
@@ -414,15 +393,11 @@ def test_default_planner_preserves_inputs_without_collectives():
     planner._verify_hooks = None
     batch, layout = object(), object()
     with (
-        patch.object(dspark_dp, "get_dp_tp_group") as group,
         patch.object(dspark_planner, "gather_dp_verify_tiers") as gather,
     ):
         assert not planner.coordinates_dp_verify
-        assert planner.sync_verify_budget(None) is None
-        assert planner.sync_verify_budget(3) == 3
         assert planner.coordinate_verify_layout(batch=batch, layout=layout) is layout
         assert planner.coordinate_verify_layout(batch=batch, layout=None) is None
-    group.assert_not_called()
     gather.assert_not_called()
 
 
@@ -475,7 +450,6 @@ def test_planner_selects_one_coordination_point(hook_kind, mode, attn_tp, overla
     hooks = None
     if hook_kind == "glm":
         hooks = dspark_planner.DSparkVerifyHooks(
-            sync_budget=lambda budget: budget,
             dynamic_tiers_with_dp=True,
             coordinate_dp_verify=dp and mode == "compact",
         )
