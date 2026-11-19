@@ -2106,7 +2106,10 @@ fn acquire_lock_overshooting_the_window_stops_at_the_crossing_node() {
         /* lock_host = */ false,
     );
     // The 2-atom nodes overshoot the 3-atom window at b (2 -> 4): the walk
-    // stops there, stamps b, and leaves a untouched.
+    // stops there, stamps b, and leaves a untouched. With the window-only
+    // lock split on by default, b is split to its in-window tail (1 atom)
+    // before locking, so only that tail (plus c) is pinned; the split-off
+    // head of b joins a as evictable.
     assert_eq!(tc.arena.device_lock_ref(c, SWA), 1);
     assert_eq!(tc.arena.device_lock_ref(b, SWA), 1);
     assert_eq!(tc.arena.device_lock_ref(a, SWA), 0);
@@ -2116,8 +2119,8 @@ fn acquire_lock_overshooting_the_window_stops_at_the_crossing_node() {
     );
     assert_eq!(node_swa_uuid(&tc, b), Some(100_000_000_000_001));
     assert_eq!(node_swa_uuid(&tc, a), None);
-    assert_eq!(tc.swa_evictable_size(), 2);
-    assert_eq!(tc.swa_protected_size(), 4);
+    assert_eq!(tc.swa_evictable_size(), 3);
+    assert_eq!(tc.swa_protected_size(), 3);
 }
 
 #[test]
