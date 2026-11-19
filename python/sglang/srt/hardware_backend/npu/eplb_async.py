@@ -12,7 +12,10 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.environ import envs
-from sglang.srt.eplb.expert_location import ExpertLocationMetadata
+from sglang.srt.eplb.expert_location import (
+    ExpertLocationMetadata,
+    compute_logical_to_rank_dispatch_physical_map,
+)
 from sglang.srt.eplb.expert_location_updater import update_expert_weights_single_layer
 from sglang.srt.hardware_backend.npu.eplb import (
     _ExpertWeightAdapter,
@@ -103,13 +106,17 @@ def _make_weight_writeback(weights, buffers, rows) -> WeightWriteback:
 
 def _install_routing_layer(current, planned, layer: int, staged_rows) -> None:
     """Publish the staged device rows and their CPU mirrors at the same boundary."""
+    width = staged_rows["logical_to_all_physical_map"].size(-1)
     for name, row in staged_rows.items():
-        getattr(current, name)[layer].copy_(row)
+        destination = getattr(current, name)[layer]
+        if name == "logical_to_all_physical_map":
+            destination = destination[..., :width]
+        destination.copy_(row)
     current.physical_to_logical_map_cpu[layer].copy_(
-        planned.physical_to_logical_map_cpu[layer]
+        planned["physical_to_logical_map"][layer]
     )
-    current.logical_to_all_physical_map_cpu[layer].copy_(
-        planned.logical_to_all_physical_map_cpu[layer]
+    current.logical_to_all_physical_map_cpu[layer, :, :width].copy_(
+        planned["logical_to_all_physical_map"][layer]
     )
 
     for algorithm, (physical, count) in current._mega_gate_maps.items():
@@ -118,7 +125,9 @@ def _install_routing_layer(current, planned, layer: int, staged_rows) -> None:
                 current.logical_to_rank_dispatch_physical_map[layer]
             )
         else:
-            physical[layer].copy_(current.logical_to_all_physical_map[layer])
+            physical[layer, :, :width].copy_(
+                current.logical_to_all_physical_map[layer, :, :width]
+            )
             count[layer].copy_(current.logical_to_all_physical_map_num_valid[layer])
 
 
@@ -153,16 +162,21 @@ class NpuEplbRuntime:
         # Reserve one layer before KV sizing. The same owner event fences reuse
         # of both the routing rows and the weight staging buffers.
         self._routing_rows = {
-            name: torch.empty_like(table[0])
+            name: torch.empty_like(table[0], memory_format=torch.contiguous_format)
             for name in _DEVICE_ROUTING_FIELDS
             if (table := getattr(metadata, name)) is not None
         }
+        self._replica_buffer = self._routing_rows["logical_to_all_physical_map"]
+        # A loaded placement can have holes before the last populated slot.
+        live = metadata.logical_to_all_physical_map_cpu
+        occupied = (live != -1).any(dim=(0, 1)).nonzero()
+        self._replica_width = int(occupied[-1, 0]) + 1 if occupied.numel() else 0
         self.device = self.staging[0].device
         self.device_module = torch.get_device_module(self.device)
         self._p2p_stream = self.device_module.Stream(device=self.device)
         self._owner_stream = self.device_module.current_stream()
         self._owner_ready = self.device_module.Event()
-        self._new_metadata = None
+        self._planned_rows = None
         self.stage_seconds = self.install_enqueue_seconds = 0.0
 
     def planner(self, counts):
@@ -212,14 +226,31 @@ class NpuEplbRuntime:
             return ()
         changed, physical, logical = placement
         self._last_layer = changed[-1]
-        # Static dispatch draws tie breaks in full layer order. Build the
-        # complete plan on CPU, even when only a few layers need staging.
-        self._new_metadata = ExpertLocationMetadata._init_raw(
-            ep_size=self.metadata.ep_size,
-            physical_to_logical_map=physical,
-            logical_to_all_physical_map=logical,
-            moe_ep_rank=self.rank,
+        width = logical.size(-1)
+        # Include the previous populated columns so shrinking the active width
+        # overwrites stale replicas. The graph still points to the full table.
+        self._replica_width = max(self._replica_width, width)
+        self._routing_rows["logical_to_all_physical_map"] = self._replica_buffer.view(
+            -1
+        )[: logical.size(1) * self._replica_width].view(
+            logical.size(1), self._replica_width
         )
+        self._planned_rows = {
+            "physical_to_logical_map": physical,
+            "logical_to_all_physical_map": torch.nn.functional.pad(
+                logical, (0, self._replica_width - width), value=-1
+            )
+            if width < self._replica_width
+            else logical,
+            "logical_to_all_physical_map_num_valid": (logical != -1).sum(dim=-1),
+        }
+        if "logical_to_rank_dispatch_physical_map" in self._routing_rows:
+            # Preserve the shared static algorithm's draws in full layer order.
+            self._planned_rows["logical_to_rank_dispatch_physical_map"] = (
+                compute_logical_to_rank_dispatch_physical_map(
+                    logical, self.metadata.ep_size, physical.size(1), self.rank
+                )
+            )
         return changed
 
     def _check_stream(self):
@@ -249,9 +280,9 @@ class NpuEplbRuntime:
         with self.device_module.stream(self._p2p_stream):
             self._p2p_stream.wait_event(self._owner_ready)
             for name, row in self._routing_rows.items():
-                row.copy_(getattr(self._new_metadata, name)[layer], non_blocking=True)
+                row.copy_(self._planned_rows[name][layer], non_blocking=True)
             old_layout = self.metadata.physical_to_logical_map_cpu[layer]
-            new_layout = self._new_metadata.physical_to_logical_map_cpu[layer]
+            new_layout = self._planned_rows["physical_to_logical_map"][layer]
             update_expert_weights_single_layer(
                 routed_experts_weights=self.weights[layer],
                 temp_buffers=self.staging,
@@ -278,17 +309,17 @@ class NpuEplbRuntime:
         start = time.perf_counter()
         writeback()
         _install_routing_layer(
-            self.metadata, self._new_metadata, layer, self._routing_rows
+            self.metadata, self._planned_rows, layer, self._routing_rows
         )
         if layer == self._last_layer:
-            self._new_metadata = None
+            self._planned_rows = None
         self.install_enqueue_seconds += time.perf_counter() - start
 
     def synchronize(self):
         # The coordinator joins the worker before draining both streams.
         self._p2p_stream.synchronize()
         self._owner_stream.synchronize()
-        self._new_metadata = None
+        self._planned_rows = None
 
     def close(self):
         dist.destroy_process_group(self.p2p_group)

@@ -43,6 +43,7 @@ def _align_placement(old, physical, logical, local_experts, ranks_per_node):
     planned_rows = physical.numpy().reshape(live_rows.shape)
     slots = np.arange(capacity).reshape(-1, local_experts)
     order = np.tile(slots, (layers, 1, 1))
+    offsets = np.arange(local_experts)
     for layer in range(layers):
         for start in range(0, len(slots), ranks_per_node):
             node = slice(start, start + ranks_per_node)
@@ -56,17 +57,18 @@ def _align_placement(old, physical, logical, local_experts, ranks_per_node):
             if ranks_per_node == len(slots):
                 endpoint = np.maximum(receives, _send_upper_bound(resident, wanted))
             sources = _assign_ranks(receives, endpoint)
-            for dest, source in enumerate(sources):
-                matches = live[dest, :, None] == planned[source, None, :]
-                planned_slots = slots[start + source]
-                if matches.trace() < matches.any(axis=1).sum():
-                    offsets = np.arange(local_experts)
-                    slot_score = matches.astype(np.int32) * (local_experts + 1)
-                    slot_score[offsets, offsets] += matches.diagonal()
-                    _, rows = linear_sum_assignment(slot_score, maximize=True)
-                    if slot_score[offsets, rows].sum() > slot_score.trace():
-                        planned_slots = planned_slots[rows]
-                order[layer, start + dest] = planned_slots
+            aligned = order[layer, node]
+            aligned[:] = slots[start + sources]
+            matches = live[:, :, None] == planned[sources, None, :]
+            diagonal = matches.diagonal(axis1=1, axis2=2)
+            # Skip rank rows where identity already retains every possible hit.
+            needs_assignment = diagonal.sum(1) < matches.any(axis=2).sum(1)
+            for dest in np.flatnonzero(needs_assignment):
+                slot_score = matches[dest].astype(np.int32) * (local_experts + 1)
+                slot_score[offsets, offsets] += diagonal[dest]
+                _, rows = linear_sum_assignment(slot_score, maximize=True)
+                if slot_score[offsets, rows].sum() > slot_score.trace():
+                    aligned[dest] = aligned[dest, rows]
 
     return _reindex_placement(physical, logical, order)
 
