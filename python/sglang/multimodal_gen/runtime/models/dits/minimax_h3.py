@@ -1120,6 +1120,10 @@ def _minimax_h3_attention_core_impl(
         q, k, v = _usp_input_all_to_all_packed_qkv(q, k, v)
 
     if attention._attention_backend_enum is AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3:
+        from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn_h3 import (
+            vsa_h3_fold_gate,
+        )
+
         attn_metadata = (
             get_forward_context().attn_metadata
             if attention.prefix.startswith("blocks.")
@@ -2429,10 +2433,12 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
             b = adapter[b_key]
             a64 = a.to(torch.float64)
             b64 = b.to(device=work_device, dtype=torch.float64)
-            projected[a_key] = (a64 @ work_basis.T).to(torch.float32)
+            # Keep the adapter dtype: the folded linear runs the LoRA delta with
+            # the raw activation dtype and rejects a float32 operand.
+            projected[a_key] = (a64 @ work_basis.T).to(a.dtype)
             projected[a_key[: -len("lora_A")] + "lora_output_offset"] = (
                 b64 @ (a64 @ work_mean)
-            ).to(torch.float32)
+            ).to(b.dtype)
 
         logger.info(
             "Projected %d MiniMax H3 AdaLN LoRA modules from width %d to %d",
