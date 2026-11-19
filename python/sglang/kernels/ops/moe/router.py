@@ -47,11 +47,12 @@ def fused_moe_router_cudacore_kernel(
     if moe_softcapping == 0:
         logits_softcapped = logits
     else:
-        # c * tanh(x / c), written with exp(-2|x|/c) so it cannot overflow to inf / inf
-        logits_scaled = logits / moe_softcapping
-        t = tl.exp(-2 * tl.abs(logits_scaled))
-        sign = tl.where(logits_scaled >= 0, 1.0, -1.0)
-        logits_softcapped = sign * (1 - t) / (1 + t) * moe_softcapping
+        # tanh is exactly 1 in fp32 beyond |x| = 20, and exp(40) cannot overflow to inf / inf
+        logits_scaled = tl.minimum(tl.maximum(logits / moe_softcapping, -20.0), 20.0)
+        exped = tl.exp(2 * logits_scaled)
+        top = exped - 1
+        bottom = exped + 1
+        logits_softcapped = top / bottom * moe_softcapping
 
     # Add bias after softcapping
     if is_correction_bias:
@@ -214,11 +215,10 @@ def fused_moe_router_tensorcore_kernel(
     if moe_softcapping == 0:
         logits_softcapped = acc
     else:
-        # c * tanh(x / c), written with exp(-2|x|/c) so it cannot overflow to inf / inf
-        logits_scaled = acc / moe_softcapping
-        t = tl.exp(-2 * tl.abs(logits_scaled))
-        sign = tl.where(logits_scaled >= 0, 1.0, -1.0)
-        logits_softcapped = sign * (1 - t) / (1 + t) * moe_softcapping
+        # tanh is exactly 1 in fp32 beyond |x| = 20, and exp(40) cannot overflow to inf / inf
+        logits_scaled = tl.minimum(tl.maximum(acc / moe_softcapping, -20.0), 20.0)
+        exped = tl.exp(2 * logits_scaled)
+        logits_softcapped = (exped - 1) / (exped + 1) * moe_softcapping
 
     # Add bias after softcapping
     if is_correction_bias:
