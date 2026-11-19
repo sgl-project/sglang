@@ -1412,6 +1412,10 @@ def test_wan_vae_decoder_install_wires_resample_gate() -> None:
 
 
 @torch.no_grad()
+@pytest.mark.skipif(
+    torch.version.hip is not None,
+    reason="the encoder fusions install on NVIDIA CUDA only",
+)
 @pytest.mark.parametrize("channels_last", [False, True], ids=["ncdhw", "cl3d"])
 def test_wan_vae_encoder_install_is_exact_and_ignores_the_decode_gate(
     channels_last,
