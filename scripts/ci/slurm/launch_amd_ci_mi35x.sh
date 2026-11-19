@@ -124,8 +124,12 @@ stream_log() {  # print what the job appended to $LOG since the last call
     local size
     size="$(stat -c %s "$LOG" 2>/dev/null || echo 0)"
     if (( size > LOG_OFFSET )); then
-        tail -c +"$((LOG_OFFSET + 1))" "$LOG" | head -c "$((size - LOG_OFFSET))"
-        LOG_OFFSET="$size"
+        # Read just the new bytes, without a pipe: `tail | head` hit SIGPIPE
+        # when the job appended after the stat, and pipefail + set -e then
+        # cancelled a healthy job. A failed read is retried on the next poll.
+        dd if="$LOG" iflag=skip_bytes,count_bytes bs=1M status=none \
+            skip="$LOG_OFFSET" count="$((size - LOG_OFFSET))" \
+            && LOG_OFFSET="$size"
     fi
 }
 
@@ -171,7 +175,7 @@ for attempt in $(seq 1 "$SUBMIT_ATTEMPTS"); do
     started=0
     while true; do
         sleep 15
-        stream_log
+        stream_log || true  # a read error must not cancel the job
         # The job writes its exit code last; COMPLETING can linger after that.
         [[ -f "$CI_EXIT_FILE" ]] && break
         read -r state reason <<< "$(job_state "$JOB_ID")" || true
@@ -193,7 +197,9 @@ for attempt in $(seq 1 "$SUBMIT_ATTEMPTS"); do
     else
         wait_for_exit_file || true
     fi
-    stream_log           # also picks up the last lines of the log
+    # The last chance to print the end of the log (often the traceback): retry
+    # once, then warn rather than drop it silently.
+    stream_log || { sleep 2; stream_log; } || echo "WARN: could not read the end of $LOG" >&2
 
     if [[ -s "$CI_EXIT_FILE" ]]; then
         # The job copies its artifacts out before it writes the exit code.
