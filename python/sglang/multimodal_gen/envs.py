@@ -50,7 +50,7 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS: str | None = None
     SGLANG_DIFFUSION_FLUX3_NATTEN_BACKEND: str | None = None
     SGLANG_DIFFUSION_CFG_GATE_STEP: float = 1.0
-    # cache-dit env vars (primary transformer)
+    SGLANG_DIFFUSION_WAN_TEXT_PADDING: str = "max"
     # on by default; engages only on 2 ranks with peer-to-peer access and falls
     # back to NCCL when unavailable. Set 0 to force NCCL. Keep this in step with
     # the resolver below -- that is the value the runtime reads.
@@ -73,6 +73,10 @@ if TYPE_CHECKING:
     # distinct (n_local, n_peer, dtype) staging pairs kept; each is two
     # slots and is never freed, so multi-resolution serving needs a cap
     SGLANG_DIFFUSION_IPC_A2A_MAX_BUFFERS: int = 16
+    # two-rank TP on one host: a row-parallel layer's epilogue kernel reads both
+    # ranks' partial sums instead of an all-reduced tensor. Set 0 to all-reduce.
+    SGLANG_DIFFUSION_TP_PEER_PARTIALS: bool = True
+    # cache-dit env vars (primary transformer)
     SGLANG_CACHE_DIT_ENABLED: bool = False
     SGLANG_CACHE_DIT_FN: int = 1
     SGLANG_CACHE_DIT_BN: int = 0
@@ -118,7 +122,6 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND: str | None = None
     SGLANG_DIFFUSION_ENABLE_W8A8_FP8_GEMM: bool = False
     SGLANG_ENABLE_FUSED_QKNORM_ROPE: bool = True
-    MINIMAX_H3_VAE_DECODER_FUSED_NORM: bool = True
     MINIMAX_H3_VAE_DECODER_VIT_FP32_NORM: bool = True
     MINIMAX_H3_VAE_DECODER_STREAM_TEMPORAL_CAT: bool = True
     SGLANG_DIFFUSION_MXFP8_FA_HEAD_CHUNK_SIZE: int = 4
@@ -186,8 +189,8 @@ def _lazy_path(
     return _getter
 
 
-# The begin-* and end* here are used by the documentation generator
-# to extract the used env vars.
+# Diffusion env vars are declared in this dict and read lazily as attributes
+# of this module (e.g. envs.SGLANG_DIFFUSION_IPC_A2A).
 
 # begin-env-vars-definition
 
@@ -225,6 +228,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "SGLANG_DIFFUSION_COSMOS3_LIDAR_USE_NATTEN": _lazy_bool(
         "SGLANG_DIFFUSION_COSMOS3_LIDAR_USE_NATTEN"
+    ),
+    # Store the Wan-Animate-2 reference-video K/V cache in FP8 e4m3 with per-(token, head)
+    # scales, dequantized one block at a time into the attention buffer.
+    "SGLANG_DIFFUSION_WAN_ANIMATE_2_FP8_REFERENCE_KV": _lazy_bool(
+        "SGLANG_DIFFUSION_WAN_ANIMATE_2_FP8_REFERENCE_KV", "false"
     ),
     # MXFP8 Attention quantization
     # Applies to both online ``MXFP8Config`` and offline ``ModelSlimConfig`` (W8A8_MXFP8)
@@ -324,6 +332,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_CFG_GATE_STEP": _lazy_float(
         "SGLANG_DIFFUSION_CFG_GATE_STEP", 1.0
     ),
+    # Wan UMT5 text padding. "max" (default) pads every prompt to 512 tokens.
+    # "longest" encodes only the real tokens; "bucket" rounds up to a multiple of
+    # 64. Both are faster but change the bf16 rounding, so outputs are not
+    # bit-identical to "max".
+    "SGLANG_DIFFUSION_WAN_TEXT_PADDING": _lazy_str(
+        "SGLANG_DIFFUSION_WAN_TEXT_PADDING", "max"
+    ),
     # Kernel backend for convrot_int8 (online or serialized ConvRot INT8):
     # "auto" prefers SGLang's JIT-compiled convrot_int8 ops where they build
     # and run (CC 9.0, 10.0, 12.0, 12.1 with nvcc) and falls back to
@@ -383,8 +398,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_DISABLE_LORA_MERGE_CACHE": _lazy_bool(
         "SGLANG_DIFFUSION_DISABLE_LORA_MERGE_CACHE"
     ),
-    # ================== cache-dit Env Vars ==================
-    # Enable cache-dit acceleration for DiT inference
+    # ================== Ulysses / IPC all-to-all ==================
     # CUDA-IPC transport for 2-rank Ulysses all-to-all (NVLink same-node)
     "SGLANG_DIFFUSION_IPC_A2A": _lazy_bool("SGLANG_DIFFUSION_IPC_A2A", "true"),
     "SGLANG_DIFFUSION_IPC_A2A_MULTI": _lazy_bool(
@@ -399,6 +413,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_IPC_A2A_MAX_BUFFERS": _lazy_int(
         "SGLANG_DIFFUSION_IPC_A2A_MAX_BUFFERS", 16
     ),
+    "SGLANG_DIFFUSION_TP_PEER_PARTIALS": _lazy_bool(
+        "SGLANG_DIFFUSION_TP_PEER_PARTIALS", "true"
+    ),
+    # ================== cache-dit Env Vars ==================
+    # Enable cache-dit acceleration for DiT inference
     "SGLANG_CACHE_DIT_ENABLED": _lazy_bool("SGLANG_CACHE_DIT_ENABLED"),
     # Number of first blocks to always compute (DBCache F parameter)
     "SGLANG_CACHE_DIT_FN": _lazy_int("SGLANG_CACHE_DIT_FN", 1),
@@ -454,13 +473,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "SGLANG_LINGBOT_LAZY_VAE_ENCODE_BLACK_FRAMES"
     ),
     # FlashInfer FP4 GEMM backend override for diffusion NVFP4.
-    # When unset, diffusion ModelOpt NVFP4 defaults to flashinfer_trtllm.
-    # Supported values:
-    # - auto
-    # - flashinfer_cudnn
-    # - flashinfer_cutlass
-    # - flashinfer_trtllm
-    # Legacy aliases `cudnn` and `trtllm` are also accepted.
+    # When unset: trtllm (auto on SM120).
+    # Values: auto, cudnn|flashinfer_cudnn, cutlass|flashinfer_cutlass,
+    # trtllm|flashinfer_trtllm.
     "SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND": _lazy_str(
         "SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND"
     ),
@@ -474,12 +489,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_ENABLE_FUSED_QKNORM_ROPE": lambda: (
         os.getenv("SGLANG_ENABLE_FUSED_QKNORM_ROPE", "1").lower()
         not in {"0", "false", "off", "no"}
-    ),
-    # MiniMax-H3 VAE decoder: fused RMSNorm / QK RMSNorm+RoPE kernels in the
-    # ViT blocks (NVIDIA only). Only 1/true/yes/on keep it enabled.
-    "MINIMAX_H3_VAE_DECODER_FUSED_NORM": lambda: (
-        os.getenv("MINIMAX_H3_VAE_DECODER_FUSED_NORM", "1").strip().lower()
-        in ("1", "true", "yes", "on")
     ),
     # MiniMax-H3 VAE decoder: run the ViT norms in FP32 (the released recipe).
     # Only 1/true/yes/on keep it enabled.

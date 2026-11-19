@@ -12,6 +12,7 @@ try:
 except ImportError:
     torch_varlen_attn = None
 
+from sglang.multimodal_gen.configs.sample.sampling_params import quality_allows
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (  # FlashAttentionMetadata,
     AttentionBackend,
     AttentionImpl,
@@ -52,8 +53,6 @@ def torch_default_sdpa_backends():
 
 
 class SDPABackend(AttentionBackend):
-    accept_output_buffer: bool = True
-
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
         return [32, 64, 96, 128, 160, 192, 224, 256]
@@ -218,13 +217,14 @@ class SDPAImpl(AttentionImpl):
             if start == stop:
                 continue
             if query.device.type != "mps":
-                segment = self.forward(
-                    query[start:stop].unsqueeze(0),
-                    key[start:stop].unsqueeze(0),
-                    value[start:stop].unsqueeze(0),
-                    None,
+                q_seg, k_seg, v_seg = (
+                    t[start:stop].unsqueeze(0) for t in (query, key, value)
                 )
-                output[start:stop].copy_(segment[0])
+                # same call as forward, written in place instead of copied
+                if not self.forward_into(
+                    q_seg, k_seg, v_seg, output[start:stop].unsqueeze(0), None
+                ):
+                    output[start:stop].copy_(self.forward(q_seg, k_seg, v_seg, None)[0])
                 continue
 
             # mps SDPA materializes a quadratic temporary for a varlen segment
@@ -342,7 +342,10 @@ class DynamicCudnnSDPAImpl(SDPAImpl):
             return False
         if query.dtype not in (torch.float16, torch.bfloat16):
             return False
-        if query.shape[2] != key.shape[2]:
+        # sm_10x keeps GQA on cuDNN; CudnnSDPAImpl passes enable_gqa.
+        if query.shape[2] != key.shape[2] and (
+            not self._is_sm100 or query.shape[2] % key.shape[2]
+        ):
             return False
         if self._is_sm103 and _prefers_fa4_on_sm103(query, key):
             return False
@@ -356,7 +359,7 @@ class DynamicCudnnSDPAImpl(SDPAImpl):
             # in rounding. The BCG scope includes warmup, priming FA4 for capture.
             if not is_in_breakable_cuda_graph():
                 context = get_forward_context_or_none()
-                if context is not None and context.quality in ("lossless", "high"):
+                if context is not None and quality_allows(context.quality, "lossless"):
                     return True
             short_side, long_side = sorted((query.shape[1], key.shape[1]))
             return short_side >= 128 or long_side < 128

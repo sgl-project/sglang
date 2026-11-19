@@ -14,6 +14,7 @@ from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
     _FP8_MAX,
     _LOG2E,
     _PREFERRED_BLOCK_K,
+    _as_scaled_fp8_kv,
     _cu_count,
     _gfx950_sparse_mla_kv_splits,
     _gfx950_sparse_mla_num_warps,
@@ -87,6 +88,8 @@ def triton_sparse_mla_decode_splitk(
     workspace: _SplitKWorkspace | None = None,
     return_lse: bool = False,
     lengths: torch.Tensor | None = None,
+    expected_topk: int | None = None,
+    natural_lse: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Split-K Triton sparse MLA decode (DSv4 pattern).
 
@@ -95,22 +98,25 @@ def triton_sparse_mla_decode_splitk(
     kv:      [num_pages, 1, DIM] fp8/bf16
     indices: [bs, 1, topk] int32
     workspace: backend-owned grow-only split-K buffers for graph-safe reuse
-    lengths: optional [bs] int32 in [0, topk]; only the first lengths[i]
+    lengths: optional [>= bs] int32 in [0, topk]; only the first lengths[i]
              indices of row i are scanned, and the rest of the row must be -1.
              Under DCP these are the owned counts and the -1 tail written by
-             transform_index_page_table_dcp (transform_index.py).
+             transform_index_page_table_dcp (transform_index.py) or dcp_local_topk.
+    expected_topk: typical lengths value, which sizes the split count instead of topk
+    natural_lse: return the LSE in natural log, -inf for a row with no key
     returns: [1, bs, H, d_v] bf16, plus a [bs, H] fp32 base-2 LSE if return_lse
     """
+    kv, kv_scaled = _as_scaled_fp8_kv(kv, d_v, q_rope.shape[-1])
     is_fp8 = _validate_input_dtypes(q_nope, q_rope, kv)
-    use_fp8_dot = is_fp8
+    use_fp8_dot = is_fp8 and not kv_scaled
     bs, H, d_v_in = q_nope.shape
     assert d_v_in == d_v
     d_tail = q_rope.shape[-1]
     kv_dim = kv.shape[-1]
     topk = indices.shape[-1]
     if lengths is not None:
-        assert lengths.shape == (bs,) and lengths.dtype == torch.int32, (
-            f"lengths must be [bs={bs}] int32, got {tuple(lengths.shape)} "
+        assert lengths.numel() >= bs and lengths.dtype == torch.int32, (
+            f"lengths must be [>= bs={bs}] int32, got {tuple(lengths.shape)} "
             f"{lengths.dtype}"
         )
         assert indices.dtype == torch.int32
@@ -133,7 +139,8 @@ def triton_sparse_mla_decode_splitk(
 
     # Keep the number of split partials independent of a smaller LDS-safe
     # BLOCK_K. This retains the existing reduction cost on 64 KiB devices.
-    max_kv_splits = max(1, topk // _PREFERRED_BLOCK_K)
+    split_topk = topk if lengths is None else min(expected_topk or topk, topk)
+    max_kv_splits = max(1, split_topk // _PREFERRED_BLOCK_K)
     num_cu = _cu_count(q_nope.device)
     base_ctas = max(1, bs * n_head_blocks)
     optimize_gfx950_fp8 = H == 16 and _is_gfx950_sparse_mla_fp8(
@@ -209,6 +216,7 @@ def triton_sparse_mla_decode_splitk(
                 USE_FP8_DOT=use_fp8_dot,
                 USE_TOPK_LENGTH=lengths is not None,
                 TOPK_TAIL_INVALID=lengths is not None,
+                KV_SCALED=kv_scaled,
                 BLOCK_H=BLOCK_H,
                 BLOCK_K=BLOCK_K,
                 USE_I64_PAGE=not (
@@ -219,6 +227,7 @@ def triton_sparse_mla_decode_splitk(
                 ),
                 lse_out_ptr=lse,
                 STORE_LSE=return_lse,
+                NATURAL_LSE=natural_lse,
                 num_warps=fused_num_warps,
                 num_stages=2,
             )
@@ -271,6 +280,7 @@ def triton_sparse_mla_decode_splitk(
             BLOCK_K=BLOCK_K,
             topk_length_ptr=topk_length,
             USE_TOPK_LENGTH=lengths is not None,
+            KV_SCALED=kv_scaled,
             num_warps=split_num_warps,
             num_stages=2,
         )
@@ -290,22 +300,7 @@ def triton_sparse_mla_decode_splitk(
         BLOCK_K=BLOCK_K,
         lse_out_ptr=lse,
         STORE_LSE=return_lse,
+        NATURAL_LSE=natural_lse,
         num_warps=4,
     )
     return (out.unsqueeze(0), lse) if return_lse else out.unsqueeze(0)
-
-
-# ---------------------------------------------------------------------------
-# Convenience: auto-select best variant
-# ---------------------------------------------------------------------------
-
-
-def triton_sparse_mla_decode(
-    q_nope: torch.Tensor,
-    q_rope: torch.Tensor,
-    kv: torch.Tensor,
-    indices: torch.Tensor,
-    sm_scale: float,
-    d_v: int = 512,
-) -> torch.Tensor:
-    return triton_sparse_mla_decode_splitk(q_nope, q_rope, kv, indices, sm_scale, d_v)

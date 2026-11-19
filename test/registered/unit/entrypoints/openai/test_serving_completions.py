@@ -79,7 +79,7 @@ class ServingCompletionTestCase(unittest.TestCase):
         tm.tokenizer.decode.return_value = "decoded text"
         tm.tokenizer.bos_token_id = 1
 
-        tm.model_config = Mock(is_multimodal=False)
+        tm.model_config = Mock(is_multimodal=False, vocab_size=32000)
         tm.server_args = Mock(enable_cache_report=False)
 
         tm.generate_request = AsyncMock()
@@ -88,6 +88,20 @@ class ServingCompletionTestCase(unittest.TestCase):
         self.template_manager = _MockTemplateManager()
         self.sc = OpenAIServingCompletion(tm, self.template_manager)
         self.fastapi_request = Mock(spec=Request)
+
+    def test_validate_request_bounds_logprobs_to_vocab(self):
+        """logprobs outside [0, vocab_size] must be a 400, not a topk that
+        kills the scheduler."""
+        for logprobs, ok in ((-1, False), (32001, False), (0, True), (32000, True)):
+            with self.subTest(logprobs=logprobs):
+                req = CompletionRequest(model="x", prompt="Hi", logprobs=logprobs)
+                error = self.sc._validate_request(req)
+                if ok:
+                    self.assertIsNone(error)
+                else:
+                    self.assertEqual(
+                        error, f"logprobs must be in [0, 32000], got {logprobs}."
+                    )
 
     # ---------- prompt-handling ----------
     def test_single_token_ids_prompt(self):

@@ -71,9 +71,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
 from sglang.multimodal_gen.runtime.managers.memory_managers.memory_occupation_controller import (
     MemoryOccupationController,
 )
-from sglang.multimodal_gen.runtime.managers.request_cancel import (
+from sglang.multimodal_gen.runtime.managers.request_cancel import raise_if_cancelled
+from sglang.multimodal_gen.runtime.managers.request_cancel_error import (
     RequestCancelledError,
-    raise_if_cancelled,
 )
 from sglang.multimodal_gen.runtime.managers.request_gc import request_gc
 from sglang.multimodal_gen.runtime.observability.metrics import (
@@ -87,7 +87,6 @@ from sglang.multimodal_gen.runtime.pipelines_core import (
     build_pipeline,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
-from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
 from sglang.multimodal_gen.runtime.platforms import (
     current_platform,
     initialize_current_platform,
@@ -106,6 +105,9 @@ from sglang.multimodal_gen.runtime.realtime.video import (
 )
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
 from sglang.multimodal_gen.runtime.utils.common import set_cuda_arch, set_musa_arch
+from sglang.multimodal_gen.runtime.utils.device_errors import (
+    is_unrecoverable_device_error,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     configure_logger,
     init_logger,
@@ -267,6 +269,10 @@ def _probe_workload_units(req: Req) -> int:
 
 class _FatalDistributedForward(SystemExit):
     """Escape request-level recovery when ranks can no longer run in lockstep."""
+
+
+class _FatalDeviceError(SystemExit):
+    """Escape request-level recovery when the device can no longer be trusted."""
 
 
 class GPUWorker(GPUWorkerPostTrainingMixin):
@@ -895,6 +901,16 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 raise _FatalDistributedForward(
                     "Multi-rank forward ran out of memory; restart the server."
                 ) from e
+            if is_unrecoverable_device_error(e):
+                # The device can no longer be trusted and even empty_cache() may
+                # fail; exit so the HTTP backend monitor fails pending requests.
+                measure_server_warmup = False
+                logger.error(
+                    UNRECOVERABLE_DEVICE_ERROR_MSG.format(error=f"{error_context}: {e}")
+                )
+                raise _FatalDeviceError(
+                    "Unrecoverable device error; restart the server."
+                ) from e
             if propagate_forward_errors and forward_failed:
                 if isinstance(e, StopIteration):
                     raise RuntimeError(
@@ -1268,9 +1284,6 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         self._release_warmup_pool_before_serving = False
         if current_platform.is_cpu() or current_platform.is_mps():
             return
-        from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a import (
-            IPC_A2A,
-        )
         from sglang.multimodal_gen.runtime.layers.usp import drop_a2a_staging_buffers
 
         IPC_A2A.drop_staging()
@@ -1758,8 +1771,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
     def _drop_breakable_cuda_graphs(self, reason: str) -> None:
         # captured graphs replay the weights and LoRA branches of capture time
         for stage in self.pipeline.stages:
-            if isinstance(stage, DenoisingStage):
-                stage.drop_breakable_cuda_graphs(reason)
+            stage.drop_breakable_cuda_graphs(reason)
 
     def _update_lora_metrics(self) -> None:
         if self.metrics is not None and isinstance(self.pipeline, LoRAPipeline):
@@ -1777,6 +1789,62 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             return OutputBatch(error="Lora is not enabled")
         status = self.pipeline.get_lora_status()
         return OutputBatch(output=status)
+
+    def start_profile(
+        self,
+        output_dir: str | None = None,
+        profile_id: str | None = None,
+        activities: list[str] | None = None,
+        with_stack: bool | None = None,
+        record_shapes: bool | None = None,
+    ) -> OutputBatch:
+        """
+        Start profiling in GPU Worker process.
+        """
+        from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
+
+        # Check if already profiling
+        existing_profiler = SGLDiffusionProfiler.get_instance()
+        if existing_profiler is not None:
+            return OutputBatch(error="Profiler is already running")
+
+        try:
+            profiler = SGLDiffusionProfiler(
+                request_id=profile_id,
+                rank=self.rank,
+                full_profile=True,  # Always profile all stages
+                activities=activities,
+                log_dir=output_dir,
+                with_stack=with_stack,
+                record_shapes=record_shapes,
+            )
+            logger.info(
+                f"GPU Worker {self.rank}: Profiler started "
+                f"(profile_id={profile_id}, output_dir={output_dir})"
+            )
+            return OutputBatch()
+        except Exception as e:
+            logger.error(f"Failed to start profiler: {e}")
+            return OutputBatch(error=str(e))
+
+    def stop_profile(self, export_trace: bool = True) -> OutputBatch:
+        """
+        Stop profiling and save traces.
+        """
+        from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
+
+        profiler = SGLDiffusionProfiler.get_instance()
+        if profiler is None:
+            return OutputBatch(error="Profiler is not running")
+
+        try:
+            # dump_rank=None means all ranks save their own trace
+            profiler.stop(export_trace=export_trace, dump_rank=None)
+            logger.info(f"GPU Worker {self.rank}: Profiler stopped and trace saved")
+            return OutputBatch()
+        except Exception as e:
+            logger.error(f"Failed to stop profiler: {e}")
+            return OutputBatch(error=str(e))
 
     def release_memory_occupation(self) -> dict:
         return self._get_memory_occupation().release_memory_occupation()
@@ -1821,6 +1889,19 @@ def _oom_exceptions():
     return (torch.OutOfMemoryError,)
 
 
+UNRECOVERABLE_DEVICE_ERROR_MSG = """
+Unrecoverable device error in {error}
+The device or its memory allocator is in an unknown state, so this worker
+exits and the server stops accepting requests. Restart it.
+  - "CUDA driver error" or "!handles_.at(i) INTERNAL ASSERT FAILED" with
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True: a non-OOM driver failure
+    while mapping memory leaves the allocator inconsistent
+    (https://github.com/pytorch/pytorch/issues/188008). It is most common on
+    WSL2/Windows near the memory limit; lower the resolution or memory use, or
+    run without expandable_segments.
+"""
+
+
 def run_scheduler_process(
     local_rank: int,
     rank: int,
@@ -1863,12 +1944,10 @@ def run_scheduler_process(
             }
         )
         scheduler.event_loop()
-    except _FatalDistributedForward:
-        logger.exception(
-            "Worker %d cannot safely continue after a multi-rank OOM", rank
-        )
-        # CUDA/NCCL teardown can wait forever on a peer's outstanding collective.
-        # Exit at the process boundary; the HTTP worker monitor rejects new work.
+    except (_FatalDistributedForward, _FatalDeviceError) as e:
+        logger.exception("Worker %d cannot safely continue: %s", rank, e)
+        # CUDA/NCCL teardown can hang on a peer's collective and a broken
+        # allocator can fail in cleanup; the HTTP worker monitor rejects new work.
         os._exit(1)
     except _oom_exceptions() as _e:
         logger.warning(OOM_MSG)
