@@ -67,12 +67,6 @@ class AscendKVManager(NPUPDLayoutMixin, MooncakeKVManager):
         if ptrs:
             self.engine.batch_register(ptrs, lens)
 
-    def _init_dcp_pack_buffers_once(
-        self, dcp_size: int, *, include_draft: bool = False
-    ) -> None:
-        # NPU DCP uses the common per-token direct transfer.
-        self._dcp_pack_buffers = []
-
     def get_mla_kv_ptrs_with_pp(
         self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int], state_type=None
     ) -> Tuple[List[int], List[int], int]:

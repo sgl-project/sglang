@@ -77,10 +77,27 @@ class NPUPDLayoutMixin:
             return str(exc)
 
     def _init_dcp_pack_buffers_once(self, dcp_size, *, include_draft=False):
-        if self._npu_kv_layout is not None:
-            self._dcp_pack_buffers = []
+        if self._npu_kv_layout is None:
+            return super()._init_dcp_pack_buffers_once(
+                dcp_size, include_draft=include_draft
+            )
+        if self._dcp_pack_buffers is not None or not self.kv_args.kv_item_lens:
             return
-        super()._init_dcp_pack_buffers_once(dcp_size, include_draft=include_draft)
+        from sglang.srt.hardware_backend.npu.dcp_pack import init_npu_dcp_pack_buffers
+        from sglang.srt.runtime_context import get_schedule, max_prefill_buffer_tokens
+        from sglang.srt.utils.common import ceil_align
+
+        max_tokens = max_prefill_buffer_tokens() or get_schedule().max_prefill_tokens
+        max_tokens = ceil_align(max_tokens, self.kv_args.page_size)
+        self._dcp_pack_buffers = init_npu_dcp_pack_buffers(
+            self._register_staging_memory,
+            self.kv_args,
+            len(self.transfer_queues),
+            dcp_size,
+            max_tokens,
+            include_draft=include_draft,
+        )
+        self._dcp_pack_max_tokens = max_tokens
 
     def dsa_index_k_dcp_entries(self, registration_info):
         if self._npu_kv_layout is not None:

@@ -11,6 +11,7 @@ from sglang.srt.disaggregation.base.conn import KVPoll, StateType
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
 from sglang.srt.disaggregation.utils import KVClassType, TransferBackend, get_kv_class
 from sglang.srt.hardware_backend.npu.disaggregation import NPUMooncakeKVManager
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -18,6 +19,37 @@ register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
 class TestNpuIndependentIndexerState(CustomTestCase):
+    def test_npu_managers_register_and_reuse_pack_buffers(self):
+        for manager_class in (NPUMooncakeKVManager, AscendKVManager):
+            with self.subTest(manager=manager_class.__name__):
+                mgr = object.__new__(manager_class)
+                mgr.kv_args = SimpleNamespace(
+                    npu_kv_layout="ND", page_size=128, kv_item_lens=[131072, 16384]
+                )
+                mgr._dcp_pack_buffers = None
+                mgr.transfer_queues = [None, None]
+                mgr._register_staging_memory = Mock()
+                buffers = [object(), object()]
+                with (
+                    get_context().override_server_args(chunked_prefill_size=250),
+                    patch(
+                        "sglang.srt.hardware_backend.npu.dcp_pack.init_npu_dcp_pack_buffers",
+                        return_value=buffers,
+                    ) as allocate,
+                ):
+                    mgr._init_dcp_pack_buffers_once(2)
+                    mgr._init_dcp_pack_buffers_once(2)
+                allocate.assert_called_once_with(
+                    mgr._register_staging_memory,
+                    mgr.kv_args,
+                    2,
+                    2,
+                    256,
+                    include_draft=False,
+                )
+                self.assertIs(mgr._dcp_pack_buffers, buffers)
+                self.assertEqual(mgr._dcp_pack_max_tokens, 256)
+
     def setUp(self):
         super().setUp()
         for name, flags in (

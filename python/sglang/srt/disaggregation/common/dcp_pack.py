@@ -77,9 +77,12 @@ def try_pack_dcp_src(
     gather_stream = pack_buffer.get_gather_stream()
     gather_stream.wait_stream(pack_buffer.producer_stream())
     with device_stream_context(gather_stream):
-        copy_mla_rows_into_pack(
-            kv_data_ptrs, row_indices, pack, token_item_lens, src_token_item_lens
+        # Buffer subclasses can specialize copying with the same stream ordering.
+        pack_rows = getattr(type(pack_buffer), "pack_rows", None)
+        pack_rows = (
+            copy_mla_rows_into_pack if pack_rows is None else pack_buffer.pack_rows
         )
+        pack_rows(kv_data_ptrs, row_indices, pack, token_item_lens, src_token_item_lens)
     gather_stream.synchronize()
 
     packed_ptrs: List[int] = []
