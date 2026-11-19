@@ -26,6 +26,7 @@ from sglang.srt.models.inkling2 import (
 from sglang.srt.models.inkling2_vision import Inkling2VisionEncoder
 from sglang.srt.models.inkling_common import inkling2_moe as moe
 from sglang.srt.multimodal.inkling2 import Inkling2ImageProcessor
+from sglang.srt.multimodal.media_io import ImageData
 from sglang.srt.parser.inkling_renderer import render_inkling_messages
 from sglang.srt.parser.inkling_tokenizer import IMAGE_TOKEN_ID
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
@@ -555,7 +556,7 @@ def test_image_expansion_matches_training_hydration():
             {"type": "text", "text": f"Image {index}:"},
             {"type": "image_url", "image_url": {"url": uri}},
         ]
-        sources.append(SimpleNamespace(url=uri))
+        sources.append(ImageData(url=uri))
         hydrated.append(
             image_processor.preprocess_image_for_training(
                 location=uri,
