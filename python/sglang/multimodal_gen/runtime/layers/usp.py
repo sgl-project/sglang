@@ -120,10 +120,10 @@ def _usp_all_to_all_single(x: torch.Tensor, role: str | None = None) -> torch.Te
     if x.is_cuda and not _UNCACHED_STAGING and not torch.compiler.is_compiling():
         from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a_multi import (
             IPC_A2A_MULTI,
-            ipc_a2a_multi_ready,
+            plain_exchange_ready,
         )
 
-        if ipc_a2a_multi_ready(ulysses_pg):
+        if plain_exchange_ready(ulysses_pg, x.numel() * x.element_size()):
             world_size = torch.distributed.get_world_size(group=ulysses_pg)
             received = IPC_A2A_MULTI.exchange(x.view(world_size, -1))
             if received is not None:

@@ -22,10 +22,6 @@ class SegLaMeta:
     s_offsets: torch.Tensor  # [bs], slot_ids
     q_lengths: torch.Tensor  # [bs], query length
     s_scales: torch.Tensor  # [bs], prefill = 0, decode = 1
-    s_offsets_stride: int = 0
-    q_offsets_stride: int = 0
-    s_scales_stride: int = 0
-    decay_scales_stride: int = 0
     mask: Optional[torch.Tensor] = None  # Currently not supported
 
 
@@ -526,7 +522,6 @@ def seg_la_fwd(
     if softmax_scale is None:
         softmax_scale = HEAD_DIM ** (-0.5)
 
-    # MAX_LENGTH = meta.max_q_length
     MAX_LENGTH = triton.cdiv(length, bs)
 
     assert qo_heads == kv_heads, "seg_la does NOT support GQA currently"

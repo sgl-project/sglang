@@ -160,6 +160,7 @@ from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
+    ControlAckOutput,
     DestroyWeightsUpdateGroupReqInput,
     DetachHiCacheStorageReqInput,
     DetachHiCacheStorageReqOutput,
@@ -2392,6 +2393,8 @@ class Scheduler(
                 continue
 
             output = self._request_dispatcher(recv_req)
+            if output is None:
+                output = self._rust_control_ack(recv_req)
             if output is not None:
                 if self.rust_server is None and isinstance(output, RpcReqOutput):
                     if self.ipc_channels.recv_from_rpc is not None:
@@ -2425,6 +2428,24 @@ class Scheduler(
         else:
             self.output_streamer.release_detokenize_state(req)
             self.ipc_channels.send_to_tokenizer.send_output(abort_req, req)
+
+    # The control requests whose handlers return nothing: Python's
+    # TokenizerManager fire-and-forgets them. The Rust frontend waits for one
+    # reply per control request, so under it each gets a ControlAckOutput.
+    _RUST_ACKED_CONTROL_REQUESTS = (
+        PauseGenerationReqInput,
+        ContinueGenerationReqInput,
+        FreezeGCReq,
+        ConfigureLoggingReq,
+        CloseSessionReqInput,
+    )
+
+    def _rust_control_ack(self, recv_req):
+        """The reply the Rust frontend waits for after a no-reply control
+        handler ran; None for any other request, and under the Python frontend."""
+        if not isinstance(recv_req, self._RUST_ACKED_CONTROL_REQUESTS):
+            return None
+        return ControlAckOutput() if self.rust_server is not None else None
 
     def send_control_output(self, output, recv_req) -> None:
         """Answer a control request, at dispatch or later (a deferred flush)."""
@@ -3390,7 +3411,7 @@ class Scheduler(
                 routed_dp_rank=recv_req.routed_dp_rank,
                 disagg_prefill_dp_rank=recv_req.disagg_prefill_dp_rank,
                 kv_hints=recv_req.kv_hints,
-                vocab_size=self.model_config.vocab_size,
+                vocab_size=self.model_config.token_id_vocab_size,
                 priority=recv_req.priority,
                 metrics_collector=(
                     self.metrics_collector
@@ -3445,7 +3466,7 @@ class Scheduler(
             req = session.create_req(
                 recv_req,
                 self.tokenizer,
-                self.model_config.vocab_size,
+                self.model_config.token_id_vocab_size,
                 eos_token_ids=self.model_config.hf_eos_token_id,
                 disagg_mode=self.disaggregation_mode,
                 req_factory=partial(self._create_generation_req, recv_req),
@@ -3476,7 +3497,7 @@ class Scheduler(
                 recv_req.input_text,
                 recv_req.input_ids,
                 recv_req.sampling_params,
-                vocab_size=self.model_config.vocab_size,
+                vocab_size=self.model_config.token_id_vocab_size,
                 http_worker_ipc=recv_req.http_worker_ipc,
             )
             req.tokenizer = self.tokenizer
@@ -5821,12 +5842,18 @@ class Scheduler(
         # Flush async trace ops here: in overlap mode this CPU work runs while
         # the next batch's GPU forward is in flight, giving free overlap.
         flush_trace_batch(batch.reqs)
-        snapshot = self.publish_load_snapshot(force=batch.forward_mode.is_extend())
+        # Extend and idle results always publish; decode steps are throttled
+        # to the publish interval. An idle batch exists only to join
+        # attention-DP collectives while other ranks have work, and on_idle
+        # never runs then, so a throttled idle rank's snapshot would lag its
+        # queues by many group steps.
+        force_publish = batch.forward_mode.is_extend() or batch.forward_mode.is_idle()
+        snapshot = self.publish_load_snapshot(force=force_publish)
         # Router-facing gauge on the dedicated PUB socket, reusing the
         # snapshot above rather than walking the queues again.
         self.load_publisher.publish_load_stat(
             self.load_inquirer.get_loads,
-            force=batch.forward_mode.is_extend(),
+            force=force_publish,
             snapshot=snapshot,
         )
 
@@ -6945,7 +6972,10 @@ class Scheduler(
     def configure_logging(self, recv_req: ConfigureLoggingReq):
         if recv_req.log_level is not None:
             logging.getLogger().setLevel(recv_req.log_level.upper())
-        self.ipc_channels.send_to_detokenizer.send_output(recv_req, recv_req)
+        # The embedded Rust server's detokenizer runs in this process; no
+        # detokenizer process reads the socket (see handle_freeze_gc).
+        if self.rust_server is None:
+            self.ipc_channels.send_to_detokenizer.send_output(recv_req, recv_req)
 
     def handle_dumper_control(self, recv_req: DumperControlReqInput):
         from sglang.srt.debug_utils.dumper import dumper
@@ -6959,12 +6989,12 @@ class Scheduler(
                 response = dumper._http_manager.handle_request(
                     method=recv_req.method, body=recv_req.body
                 )
-            self.ipc_channels.send_to_tokenizer.send_output(
+            self.send_control_output(
                 DumperControlReqOutput(success=True, response=response), recv_req
             )
         except Exception as e:
             print(f"[Scheduler] handle_dumper_control error: {e}", flush=True)
-            self.ipc_channels.send_to_tokenizer.send_output(
+            self.send_control_output(
                 DumperControlReqOutput(success=False, response=[], error=str(e)),
                 recv_req,
             )
