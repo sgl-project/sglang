@@ -27,6 +27,7 @@ MLA, DSA, VHA, mHC, SiTU, ``wo_a``/``wo_b``).
 
 from __future__ import annotations
 
+from functools import cached_property
 from typing import Iterable, Optional, Tuple, Union
 
 import torch
@@ -44,6 +45,10 @@ from sglang.srt.configs.ernie55 import Ernie5_5_MoeConfig, check_megamoe_situ_be
 from sglang.srt.distributed import tensor_model_parallel_all_reduce
 from sglang.srt.environ import envs
 from sglang.srt.layers.activation import SituAndMul
+from sglang.srt.layers.attention.dsa.flashindexer import (
+    attach_flashindexer_gate,
+    resolve_flashindexer_weights_dir,
+)
 from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.deep_gemm_wrapper.configurer import DEEPGEMM_SCALE_UE8M0
 from sglang.srt.layers.dp_attention import (
@@ -93,6 +98,7 @@ from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
 )
+from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
@@ -109,7 +115,7 @@ from sglang.srt.models.deepseek_v4 import (
     make_hc_head_params,
     make_hc_mixing_params,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_exec, get_model, get_parallel
 from sglang.srt.utils import BumpAllocator, is_cuda
 
 
@@ -923,6 +929,11 @@ class Ernie5_5Model(nn.Module):
             ),
             prefix=add_prefix("layers", prefix),
         )
+        # FlashIndexer gates only the target's MLA indexers; the MTP draft keeps all heads.
+        if get_exec().kernel.enable_flashindexer:
+            for layer in self.layers[self.start_layer : self.end_layer]:
+                if isinstance(layer.self_attn, Ernie5_5MlaAttention):
+                    attach_flashindexer_gate(layer.self_attn.indexer)
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
             self.hc_head = Ernie5_5HcHead(config)
@@ -1027,6 +1038,18 @@ class Ernie5_5_MoeForCausalLM(nn.Module):
         self.logits_processor = Ernie5_5LogitsProcessor(config)
         self.capture_aux_hidden_states = False
         get_attn_tp_context().init_context(config.hybrid_mla_q_lora_rank, is_dsa=True)
+
+    @cached_property
+    def secondary_weights(self) -> list[DefaultModelLoader.Source]:
+        # Resolved lazily: load formats that never read it must not pay for a download.
+        if not get_exec().kernel.enable_flashindexer:
+            return []
+        return [
+            DefaultModelLoader.Source(
+                model_or_path=resolve_flashindexer_weights_dir(),
+                revision=get_model().revision,
+            )
+        ]
 
     @torch.no_grad()
     def forward(

@@ -104,9 +104,11 @@ class Fp4Indexer(Indexer):
         from deep_gemm import fp8_fp4_mqa_logits
 
         q_fp4, q_sf = self._quantize_fp4(q)
-        q_fp4, weights, num_heads = self._pad_heads_for_deep_gemm(q_fp4, weights)
-        if q_fp4.shape[1] > num_heads:
-            q_sf = torch.nn.functional.pad(q_sf, (0, q_fp4.shape[1] - num_heads))
+        # FlashIndexer's 8 selected heads are a native DeepGEMM count: skip the fixed-32 pad.
+        if q_fp4.shape[1] == self.n_heads:
+            q_fp4, weights, num_heads = self._pad_heads_for_deep_gemm(q_fp4, weights)
+            if q_fp4.shape[1] > num_heads:
+                q_sf = torch.nn.functional.pad(q_sf, (0, q_fp4.shape[1] - num_heads))
         k, k_scale = kv
         return fp8_fp4_mqa_logits(
             (q_fp4, q_sf),

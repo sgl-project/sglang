@@ -142,6 +142,7 @@ def pcg_dsa_indexer_prefill_split(
             weights,
             metadata,
             topk_result,
+            flashindexer_hidden=x,
         )
         return
 
@@ -209,6 +210,7 @@ def pcg_dsa_indexer_prefill_split(
         weights,
         metadata,
         topk_result,
+        flashindexer_hidden=x,
     )
     if is_interleave_extend(forward_batch):
         # Interleave BCG replays a bucket-sized local shard: the top-k rows
