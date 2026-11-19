@@ -180,5 +180,92 @@ def test_four_rows_per_warp_match_one_row_per_warp(
     assert torch.equal(q_ref, q_new) and torch.equal(k_ref, k_new)
 
 
+@pytest.mark.parametrize("out_of_place", [False, True])
+@pytest.mark.parametrize("half_warp", [False, True])
+def test_sail_rounded_full_width_qknorm_rope_graph_replay(
+    out_of_place: bool, half_warp: bool
+) -> None:
+    """The HGCC BF16 aggregate-store regression, with changing graph inputs."""
+    from sglang.kernels.jit.utils.common import is_sail_runtime
+    from sglang.kernels.ops.diffusion.rope.qknorm_rope_jit import (
+        _jit_qknorm_rope_module,
+    )
+
+    if not is_sail_runtime():
+        pytest.skip("SAIL BF16 local-vector codegen regression")
+
+    tokens, q_heads, k_heads, dim, max_positions = 17, 7, 2, 128, 67
+    backing = torch.empty(
+        tokens, (q_heads + k_heads) * dim + 16, device="cuda", dtype=torch.bfloat16
+    )
+    q = backing[:, : q_heads * dim].view(tokens, q_heads, dim)
+    k = backing[:, q_heads * dim : -16].view(tokens, k_heads, dim)
+    qw = torch.empty(dim, device="cuda", dtype=torch.bfloat16)
+    kw = torch.empty_like(qw)
+    cache = torch.empty(max_positions, 2 * dim, device="cuda", dtype=torch.bfloat16)
+    positions = torch.empty(tokens, device="cuda", dtype=torch.int64)
+    q_out, k_out = torch.empty_like(q), torch.empty_like(k)
+
+    def make_module(use_half_warp):
+        return _jit_qknorm_rope_module(
+            dim,
+            dim,
+            False,
+            torch.bfloat16,
+            torch.bfloat16,
+            True,
+            False,
+            True,
+            out_of_place,
+            half_warp=use_half_warp,
+        )
+
+    module, reference = make_module(half_warp), make_module(not half_warp)
+
+    def run(mod, q_input, k_input, q_output, k_output):
+        if out_of_place:
+            mod.qknorm_rope_out_of_place(
+                q_input, k_input, q_output, k_output, qw, kw, cache, positions, 1e-5
+            )
+            return q_output, k_output
+        mod.qknorm_rope(q_input, k_input, qw, kw, cache, positions, 1e-5)
+        return q_input, k_input
+
+    def fill(seed):
+        gen = torch.Generator(device="cuda").manual_seed(seed)
+        backing.copy_(torch.randn(backing.shape, device="cuda", generator=gen))
+        qw.copy_(torch.rand(dim, device="cuda", generator=gen) + 0.5)
+        kw.copy_(torch.rand(dim, device="cuda", generator=gen) + 0.5)
+        angles = 50 * torch.randn(max_positions, dim, device="cuda", generator=gen)
+        cache.copy_(torch.cat((angles.cos(), angles.sin()), -1))
+        positions.copy_(
+            torch.randperm(max_positions, device="cuda", generator=gen)[:tokens]
+        )
+
+    fill(0)
+    run(reference, q.clone(), k.clone(), q_out, k_out)
+    run(module, q, k, q_out, k_out)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = run(module, q, k, q_out, k_out)
+
+    for seed in (1, 2, 3):
+        fill(seed)
+        before = backing.clone()
+        q_ref, k_ref = q.clone(), k.clone()
+        expected = run(
+            reference, q_ref, k_ref, torch.empty_like(q_ref), torch.empty_like(k_ref)
+        )
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(actual[0], expected[0])
+        assert torch.equal(actual[1], expected[1])
+        if out_of_place:
+            assert torch.equal(backing, before)
+        else:
+            assert torch.equal(backing[:, -16:], before[:, -16:])
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
