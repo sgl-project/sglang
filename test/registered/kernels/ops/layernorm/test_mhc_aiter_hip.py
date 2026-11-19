@@ -14,7 +14,7 @@ from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=120, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=120, suite="base-b-test-1-gpu-small-amd-mi35x")
 
 
 @unittest.skipUnless(
@@ -216,9 +216,12 @@ class TestMhcPostSplitH(CustomTestCase):
 
     def setUp(self):
         from sglang.srt.models.deepseek_v4 import DeepseekV4DecoderLayer
+        from sglang.srt.models.deepseek_v4_mhc import HcConfig
 
         self.layer = SimpleNamespace(
-            config=SimpleNamespace(model_type="deepseek_v41"), hc_mult=4
+            config=SimpleNamespace(model_type="deepseek_v41"),
+            hc_mult=4,
+            hc_cfg=HcConfig(4, 20, 1e-6, 1e-6, 5120, True, False),
         )
         self.run_post = lambda *args: DeepseekV4DecoderLayer.hc_post(self.layer, *args)
         for setting in (

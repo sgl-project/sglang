@@ -9,7 +9,7 @@ from sglang.srt.platforms.device_mixin import (
     DeviceMixin,
     PlatformEnum,
 )
-from sglang.srt.platforms.interface import SRTPlatform
+from sglang.srt.platforms.interface import PlatformCapabilities, SRTPlatform
 
 
 class NPUDeviceMixin(DeviceMixin):
@@ -71,19 +71,13 @@ class NPUDeviceMixin(DeviceMixin):
 class NPUSRTPlatform(NPUDeviceMixin, SRTPlatform):
     """Default in-tree NPU SRT platform."""
 
+    capabilities = PlatformCapabilities(
+        supports_triton=True,
+        graph_capture=True,
+    )
+
     def get_default_attention_backend(self) -> str:
         return "ascend"
 
     def get_dispatch_key_name(self) -> str:
         return "npu"
-
-    def supports_fp8(self) -> bool:
-        # NPU quantization backends in hardware_backend/npu/quantization
-        return True
-
-    def support_cuda_graph(self) -> bool:
-        # NPUGraphRunner in hardware_backend/npu/graph_runner
-        return True
-
-    def support_piecewise_cuda_graph(self) -> bool:
-        return False

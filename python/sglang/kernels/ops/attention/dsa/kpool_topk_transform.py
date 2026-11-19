@@ -29,7 +29,7 @@ def _jit_kpool_topk_transform_module(group_topk: int) -> Module:
 def fast_kpool_topk_transform_fused(
     score: torch.Tensor,
     lengths: torch.Tensor,
-    pool_size: int,
+    kpool: int,
     topk: int,
     page_table: Optional[torch.Tensor] = None,
     topk_indices_offset: Optional[torch.Tensor] = None,
@@ -37,8 +37,8 @@ def fast_kpool_topk_transform_fused(
     seq_lens: Optional[torch.Tensor] = None,
     page_table_row_index: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    assert topk % pool_size == 0
-    group_topk = topk // pool_size
+    assert topk % kpool == 0
+    group_topk = topk // kpool
     assert group_topk in SUPPORTED_GROUP_TOPK, (
         "fast_kpool_topk_transform supports pool-level topk "
         f"{SUPPORTED_GROUP_TOPK}, got {group_topk}"
@@ -53,7 +53,7 @@ def fast_kpool_topk_transform_fused(
         assert page_table_row_index.dim() == 1
         assert page_table_row_index.shape[0] == score.shape[0]
 
-    out_cols = topk + (pool_size - 1 if seq_lens is not None else 0)
+    out_cols = topk + (kpool - 1 if seq_lens is not None else 0)
     dst_token_indices = score.new_empty((score.shape[0], out_cols), dtype=torch.int32)
 
     module = _jit_kpool_topk_transform_module(group_topk)
@@ -61,7 +61,7 @@ def fast_kpool_topk_transform_fused(
         score,
         lengths,
         dst_token_indices,
-        pool_size,
+        kpool,
         page_table,
         topk_indices_offset,
         row_starts,

@@ -19,6 +19,10 @@ _sgl_kernel_stub = ModuleType("sgl_kernel")
 _sgl_kernel_stub.cutlass_w4a8_moe_mm = Mock()
 _sgl_kernel_stub.get_cutlass_w4a8_moe_mm_data = Mock()
 _sgl_kernel_stub.silu_and_mul = Mock()
+# Loaded before the patch.dict stub below, which unloads every module first
+# imported inside it while their torch inductor registrations stay.
+import sglang.srt.layers.moe  # noqa: E402, F401
+
 with patch.dict(sys.modules, {"sgl_kernel": _sgl_kernel_stub}):
     from sglang.srt.layers.moe import cutlass_w4a8_moe as w4a8_moe
 

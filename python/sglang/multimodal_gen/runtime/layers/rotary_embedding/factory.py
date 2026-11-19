@@ -10,7 +10,6 @@ from .mrope import NDRotaryEmbedding, _to_tuple
 
 _ROPE_DICT: dict[tuple, RotaryEmbedding] = {}
 _ND_ROPE_CACHE: "OrderedDict[tuple, NDRotaryEmbedding]" = OrderedDict()
-_ROPE_3D_CACHE: "OrderedDict[tuple, tuple[torch.Tensor, torch.Tensor]]" = OrderedDict()
 
 
 def get_rope(

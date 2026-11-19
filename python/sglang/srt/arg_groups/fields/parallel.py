@@ -12,6 +12,10 @@ from sglang.srt.arg_groups.arg_utils import (
     Arg,
     Derived,
 )
+from sglang.srt.arg_groups.choices import (
+    CP_KV_LAYOUT_CHOICES,
+    CP_STRATEGY_CHOICES,
+)
 
 
 class Parallel(msgspec.Struct):
@@ -129,10 +133,10 @@ class Parallel(msgspec.Struct):
         Arg(
             help="Communication backend for the decode context-parallel (DCP) "
             "attention reduction: 'ag_rs' (AllGather + ReduceScatter), 'a2a' "
-            "(fused NCCL All-to-All exchange of output+LSE + local Triton LSE "
-            "combine), or 'fi_a2a' (FlashInfer MNNVL All-to-All kernel; requires "
+            "(one All-to-All exchange of output+LSE, then a local LSE combine), "
+            "or 'fi_a2a' (FlashInfer MNNVL All-to-All kernel; requires "
             "Blackwell and a DCP group within one MNNVL domain). Unset resolves "
-            "to 'fi_a2a' where supported, else 'a2a' on CUDA/ROCm, else 'ag_rs'.",
+            "to 'fi_a2a' where supported, else 'a2a' on CUDA/ROCm/XPU, else 'ag_rs'.",
             choices=["ag_rs", "a2a", "fi_a2a"],
             resolvable=True,
         ),
@@ -152,15 +156,33 @@ class Parallel(msgspec.Struct):
     ] = None
     enable_prefill_cp: A[
         bool,
-        "Enable context parallelism for the prefill phase. Select the layout with --cp-strategy.",
+        "Enable context parallelism for the prefill phase. Select the compute strategy with --cp-strategy.",
     ] = False
     cp_strategy: A[
         Optional[str],
         Arg(
             help="Sharding strategy for prefill CP. 'zigzag' assigns each rank one early and one late sequence block; 'interleave' assigns token indices modulo the CP size.",
-            choices=("zigzag", "interleave"),
+            choices=CP_STRATEGY_CHOICES,
         ),
     ] = None
+    cp_kv_layout: A[
+        Optional[str],
+        Arg(
+            help="KV storage layout for prefill CP; omitted keeps replicated KV storage.",
+            choices=CP_KV_LAYOUT_CHOICES,
+        ),
+    ] = None
+    enable_cp_tp_group_sharing: A[
+        bool,
+        Arg(
+            help="(Derived) CP-TP group sharing: prefill CP for hybrid "
+            "linear-attention models where the CP group is the TP group; the "
+            "residual stream, attention and indexer are CP-sharded while MoE "
+            "and linear attention keep TP. Resolved from the model architecture.",
+            no_cli=True,
+            resolvable=True,
+        ),
+    ] = False
     # Split DSA GPU KV/indexer cache layers across CP ranks.
     enable_dsa_cache_layer_split: A[
         bool,
@@ -170,9 +192,14 @@ class Parallel(msgspec.Struct):
         bool,
         "Enable attention tensor-parallel weight slicing during decode under context parallel (cp_size>1). Slices the replicated attention linears to the local CP partition, eliminating redundant decode GEMMs.",
     ] = False
-    # Deprecated spelling of `attn_dp_size`: `--dp-size N --enable-dp-attention`
-    # resolves to `attn_dp_size = N`, `dp_size = 1`.
-    enable_dp_attention: A[bool, Arg(no_cli=True, resolvable=True)] = False
+    enable_kv_cache_sharding: A[
+        bool,
+        "Shard at-rest KV cache storage at page granularity across the group "
+        "that currently replicates it (attention-CP ranks for GQA models "
+        "under prefill CP; attention-TP ranks for MLA models), multiplying "
+        "the group's unique KV capacity. Prefill workers of PD "
+        "disaggregation only.",
+    ] = False
     enable_dp_attention_local_control_broadcast: A[
         bool,
         "With DP-attention, send control messages to every DP group leader and broadcast within attn_tp_group instead of the full tp_group. Eliminates a costly all-ranks gloo sync on every scheduler iteration.",
@@ -213,21 +240,63 @@ class Parallel(msgspec.Struct):
     shared_experts_tp_size: A[
         Optional[int],
         "Shared-expert TP size for Kimi-K3 with an expert-parallel all-to-all "
-        "backend. Must divide attention TP size. Overrides "
+        "backend. Must divide attention TP size, or attention TP x CP size "
+        "with interleave prefill CP; never crosses attention DP replicas. Overrides "
         "--enable-shared-experts-attn-tp when set; 1 replicates the weights.",
     ] = None
     enable_dense_mlp_attn_tp: A[
         bool,
         "Shard dense MLP weights across the attention TP group under DP attention.",
     ] = False
+    kda_dwdp_size: A[
+        Optional[int],
+        "DWDP for Kimi-K3 KDA projection and shared-expert weights on PD prefill "
+        "workers (--disaggregation-mode prefill) under attention DP: each group of "
+        "this many attention-DP ranks holding the same attention-TP slice keeps 1/N "
+        "of every KDA layer's [q,k,v,g] in-projection and o_proj (and of the shared "
+        "experts when they would be replicated), and gathers a layer's full weights "
+        "over NVLink just before it runs. Must divide the attention-DP size. Saves "
+        "~(1 - 1/N) of those weights per rank (about 53 GB for K3 at attention TP 1, "
+        "N=8) for one layer-weight gather per sharded layer per forward.",
+    ] = None
     enable_layernorm_sp: A[
         bool,
         "Enable Megatron-style sequence parallelism (arXiv:2205.05198) for the "
         "LayerNorm/residual regions under pure tensor parallelism: the row-parallel "
         "all-reduce becomes reduce-scatter + all-gather, so LayerNorm runs on "
         "sequence-sharded activations with no extra communication volume. "
-        "Prefill only; Qwen3 dense; requires tp_size > 1 and NVLink/NVSwitch.",
+        "Prefill only; supports Qwen3 dense and Muse Spark ModelOpt NVFP4 with "
+        "TP4/EP4 or TP8/EP8 with FlashInfer A2A or MegaMoE. "
+        "Muse Spark requires the FlashInfer TRT-LLM MoE runner and "
+        "NVLink/NVSwitch.",
     ] = False
+    layernorm_sp_min_tokens: A[
+        int,
+        "With --enable-layernorm-sp, run a pass sequence-parallel only above this "
+        "token count; smaller passes take the replicated path. 0 (the default) "
+        "runs every extend sequence-parallel, as today. The SP collectives cost "
+        "the same per layer whatever the pass size, so small extends -- short "
+        "follow-up turns, small chunks, prefix-cache hits -- can be slower "
+        "sequence-parallel than replicated while large chunks are faster. The "
+        "crossover is deployment-specific: measure extend passes of a few sizes "
+        "on both paths. Must be a captured prefill CUDA graph bucket, or at or "
+        "above the largest one.",
+    ] = 0
+    enable_megamoe_for_layernorm_sp: A[
+        Optional[bool],
+        Arg(
+            help="Use fused MegaMoE for Muse Spark NVFP4 TP4/EP4 or TP8/EP8 LayerNorm-SP prefill, "
+            "including BF16 excluded layers. Decode retains the FlashInfer TRT-LLM "
+            "MoE runner and all-reduce, sharing expert weights with prefill. "
+            "Requires --enable-layernorm-sp, DeepGEMM with post-expert normalization, "
+            "and NVLink/NVSwitch. Enabled by default for Muse Spark NVFP4 on "
+            "data-center Blackwell when LayerNorm-SP is enabled, EP equals TP and "
+            "exceeds 1, and disaggregation mode is not decode. Use "
+            "--no-enable-megamoe-for-layernorm-sp to opt out. "
+            "No FlashInfer A2A backend is required when enabled.",
+            action=argparse.BooleanOptionalAction,
+        ),
+    ] = None
     disable_attn_tp_gather: A[
         bool,
         "Disable scheduler-side attn_tp_gather (the upstream SP path "

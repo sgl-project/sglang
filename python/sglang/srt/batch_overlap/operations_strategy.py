@@ -6,7 +6,7 @@ import torch
 from sglang.srt.batch_overlap import operations
 from sglang.srt.batch_overlap.operations import Operation
 from sglang.srt.layers.moe.token_dispatcher import DeepEPConfig
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.utils import is_hip
 
 _is_hip = is_hip()
@@ -63,7 +63,10 @@ class OperationsStrategy:
                     for layer in layers
                 ]
             )
-        elif layer_name == "DeepseekV4DecoderLayer":
+        # Other model families do not need to import the V4 implementation.
+        from sglang.srt.models.deepseek_v4 import DeepseekV4DecoderLayerBase
+
+        if isinstance(layers[0], DeepseekV4DecoderLayerBase):
             return OperationsStrategy.concat(
                 [
                     _compute_moe_deepseek_v4_layer_operations_strategy_tbo(
@@ -72,8 +75,7 @@ class OperationsStrategy:
                     for layer in layers
                 ]
             )
-        else:
-            raise NotImplementedError
+        raise NotImplementedError
 
 
 def _assert_all_same(items: List):

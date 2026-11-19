@@ -43,15 +43,16 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
+    pad_mm_tokens,
 )
-from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
@@ -59,7 +60,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.utils import WeightsMapper, apply_qk_norm, permute_inv
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, is_cpu, is_cuda
+from sglang.srt.utils import is_cpu, is_cuda
 
 _is_cuda = is_cuda()
 _is_cpu = is_cpu()
@@ -439,7 +440,9 @@ def muse_glimmer_bilinear_pos_embed_lookup(
     weight_parts: List[List[torch.Tensor]] = [[] for _ in range(4)]
 
     for t, h, w in grid_thw.tolist():
-        t, h, w = int(t), int(h), int(w)
+        # Matches the trainer reference, which samples the position grid with
+        # `meshgrid(pos_h, pos_w, indexing="xy")`: height and width swap roles.
+        t, h, w = int(t), int(w), int(h)
         h_grid = (torch.arange(h, device=device).float() + 0.5) * (side / h) - 0.5
         w_grid = (torch.arange(w, device=device).float() + 0.5) * (side / w) - 0.5
 
@@ -595,7 +598,8 @@ class MuseGlimmerVisionEncoderLayer(nn.Module):
         self.attn = VisionAttention(
             embed_dim=config.hidden_size,
             num_heads=config.num_attention_heads,
-            projection_size=config.hidden_size,
+            head_dim=config.head_dim,
+            projection_size=config.num_attention_heads * config.head_dim,
             use_qkv_parallel=True,
             qkv_bias=True,
             proj_bias=True,
@@ -644,7 +648,7 @@ class MuseGlimmerVisionModel(nn.Module):
             prefix=add_prefix("patch_embedder", prefix),
         )
         self.rotary_emb = MuseGlimmerVisionRotaryEmbedding(
-            config.hidden_size // config.num_attention_heads, config.rope_theta
+            config.head_dim, config.rope_theta
         )
         self.ln_pre = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.layers = nn.ModuleList(
@@ -772,15 +776,16 @@ class MuseGlimmerVisionAdapter(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
+        sharded_size = config.padded_projector_hidden_size
         self.fc1 = ColumnParallelLinear(
             config.out_hidden_size,
-            config.projector_hidden_size,
+            sharded_size,
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("fc1", prefix),
         )
         self.fc2 = RowParallelLinear(
-            config.projector_hidden_size,
+            sharded_size,
             config.projector_hidden_size,
             bias=False,
             quant_config=quant_config,
@@ -989,9 +994,7 @@ class MuseGlimmerForConditionalGeneration(MuseGlimmerForCausalLM):
         )
 
     def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
-        return MultiModalityDataPaddingPatternMultimodalTokens().pad_input_tokens(
-            input_ids, mm_inputs
-        )
+        return pad_mm_tokens(input_ids, mm_inputs)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         pixel_values = torch.cat([item.feature for item in items], dim=0)

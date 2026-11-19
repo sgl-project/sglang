@@ -24,12 +24,9 @@ from sglang.kernels.ops.memory.allocator import (
     alloc_extend_kernel,
 )
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
-from sglang.srt.utils import (
-    get_bool_env_var,
-    get_num_new_pages,
-    is_hip,
-    next_power_of_2,
-)
+from sglang.srt.mem_cache.utils import get_num_new_pages
+from sglang.srt.platforms import current_platform
+from sglang.srt.utils import get_bool_env_var, is_hip
 
 _is_hip = is_hip()
 
@@ -113,12 +110,33 @@ def alloc_extend_naive(
     out_indices.copy_(out)
 
 
+def alloc_decode_naive(
+    seq_lens,
+    last_loc,
+    free_pages,
+    out_indices,
+    page_size,
+    num_new_pages,
+):
+    if num_new_pages == 0:
+        out_indices.copy_(last_loc + 1)
+        return
+    need_new_page = ((seq_lens - 1) % page_size == 0).to(torch.int64)
+    new_page_rank = (torch.cumsum(need_new_page, 0) - need_new_page).clamp_(
+        max=num_new_pages - 1
+    )
+    new_page_start = free_pages[new_page_rank] * page_size
+    out_indices.copy_(torch.where(need_new_page.bool(), new_page_start, last_loc + 1))
+
+
 class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     """Same interface as `TokenToKVPoolAllocator`, but the indices handed to one
     request are always page-aligned.
 
     TODO: fuse last_loc into the kernel.
     """
+
+    supports_reuse_guard = True
 
     def __init__(
         self,
@@ -132,6 +150,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         super().__init__(size, page_size, dtype, device, kvcache, need_sort)
         self.num_pages = size // page_size
         self.debug_mode = get_bool_env_var("SGLANG_DEBUG_MEMORY_POOL")
+        self.use_triton_kernels = current_platform.capabilities.supports_triton
 
         # Pre-warm the torch.unique used by free(): on ROCm the first call
         # JIT-compiles rocPRIM sort/unique kernels and costs ~200ms.
@@ -150,9 +169,20 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def get_all_free_pages(self):
         return torch.cat((self.free_pages, *self.staged_pages))
 
+    def set_reuse_guard_event(self, event: torch.cuda.Event | None) -> None:
+        """Cover KV writes still in flight when the scheduler releases pages.
+
+        PD transfers are not stream-ordered with those writes. Freed pages stay
+        staged until allocation pressure requires a merge, which waits below.
+        """
+        self._reuse_guard_event = event
+
     def merge_and_sort_free(self):
         if not self.staged_pages:
             return
+        if self._staged_guard_event is not None:
+            self._staged_guard_event.synchronize()
+            self._staged_guard_event = None
         self.free_pages, _ = torch.sort(self.get_all_free_pages())
         self.staged_pages = []
         self.num_staged_pages = 0
@@ -196,22 +226,50 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             )
 
         bs = len(prefix_lens)
-        if extend_num_tokens // self.page_size + bs + 1 > len(self.free_pages):
+        # Strict upper bound on num_new_pages: one request's page count grows
+        # by less than extend_len / page_size + 1, so the sum is below this.
+        max_new_pages = extend_num_tokens // self.page_size + bs + 1
+        if max_new_pages > len(self.free_pages):
             self.merge_and_sort_free()
+
+        if max_new_pages > len(self.free_pages):
+            # The bound cannot prove the pool is deep enough, and both kernels
+            # read past free_pages when it is not: the Triton one out of
+            # bounds, the native one clamping to duplicate rows. Pay for the
+            # exact count before launching. The fast path leaves it until
+            # after, which is what get_num_new_pages' CPU tensors are for.
+            if num_new_pages is None:
+                num_new_pages = get_num_new_pages(
+                    seq_lens=seq_lens_cpu,
+                    page_size=self.page_size,
+                    prefix_lens=prefix_lens_cpu,
+                )
+            if num_new_pages > len(self.free_pages):
+                return None
 
         out_indices = torch.empty(
             (extend_num_tokens,), dtype=torch.int64, device=self.device
         )
 
-        alloc_extend_kernel[(bs,)](
-            prefix_lens,
-            seq_lens,
-            last_loc,
-            self.free_pages,
-            out_indices,
-            next_power_of_2(bs),
-            self.page_size,
-        )
+        if self.use_triton_kernels:
+            alloc_extend_kernel[(bs,)](
+                prefix_lens,
+                seq_lens,
+                last_loc,
+                self.free_pages,
+                out_indices,
+                self.page_size,
+            )
+        else:
+            alloc_extend_naive(
+                prefix_lens,
+                seq_lens,
+                last_loc,
+                self.free_pages,
+                out_indices,
+                self.page_size,
+                self.device,
+            )
 
         if self.debug_mode:
             assert len(torch.unique(out_indices)) == len(out_indices)
@@ -222,8 +280,6 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 page_size=self.page_size,
                 prefix_lens=prefix_lens_cpu,
             )
-        if num_new_pages > len(self.free_pages):
-            return None
 
         self.free_pages = self.free_pages[num_new_pages:]
         return out_indices
@@ -243,19 +299,6 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if bs > len(self.free_pages):
             self.merge_and_sort_free()
 
-        out_indices = torch.empty((bs,), dtype=torch.int64, device=self.device)
-        alloc_decode_kernel[(bs,)](
-            seq_lens,
-            last_loc,
-            self.free_pages,
-            out_indices,
-            next_power_of_2(bs),
-            self.page_size,
-        )
-
-        if self.debug_mode:
-            assert len(torch.unique(out_indices)) == len(out_indices)
-
         num_new_pages = get_num_new_pages(
             seq_lens=seq_lens_cpu,
             page_size=self.page_size,
@@ -263,6 +306,28 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         if num_new_pages > len(self.free_pages):
             return None
+
+        out_indices = torch.empty((bs,), dtype=torch.int64, device=self.device)
+        if self.use_triton_kernels:
+            alloc_decode_kernel[(bs,)](
+                seq_lens,
+                last_loc,
+                self.free_pages,
+                out_indices,
+                self.page_size,
+            )
+        else:
+            alloc_decode_naive(
+                seq_lens,
+                last_loc,
+                self.free_pages,
+                out_indices,
+                self.page_size,
+                num_new_pages,
+            )
+
+        if self.debug_mode:
+            assert len(torch.unique(out_indices)) == len(out_indices)
 
         self.free_pages = self.free_pages[num_new_pages:]
         return out_indices
@@ -318,6 +383,10 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if self.need_sort:
             self.staged_pages.extend(page_ids)
             self.num_staged_pages += sum(ids.numel() for ids in page_ids)
+            if self._reuse_guard_event is not None:
+                # Events come from successive forwards on the same stream, so
+                # the latest also covers writes guarded by earlier events.
+                self._staged_guard_event = self._reuse_guard_event
         else:
             self.free_pages = torch.cat((*page_ids, self.free_pages))
 
@@ -344,6 +413,8 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         # need_sort only: freed pages wait here, unsorted, until an alloc runs short.
         self.staged_pages: list[torch.Tensor] = []
         self.num_staged_pages = 0
+        self._reuse_guard_event = None
+        self._staged_guard_event = None
 
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         return self._kvcache.get_cpu_copy(

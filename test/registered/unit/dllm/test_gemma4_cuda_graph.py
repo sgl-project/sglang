@@ -9,32 +9,41 @@ import torch
 from sglang.srt.dllm.algorithm.gemma4_renoise import Gemma4Renoise
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.radix_attention import AttentionType
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
 )
 from sglang.srt.models.gemma4_diffusion import DiffusionGemmaTextEmbedding
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase, published_topology
 
-register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class _ReadStream:
     reads_are_translated = False
+    # The windowed layers store in the full sub-pool.
+    window_storage = IdSpaceKind.FULL.value
 
     def __init__(self):
         self.tokens = torch.arange(64).view(4, 16)
 
-    def fill_packed_read_stream(
+    def space(self, kind):
+        # A pool without a window sub-pool has no window id space.
+        return None
+
+    def pack_read_stream(
         self,
+        plan,
         *,
         req_pool_indices,
         seq_lens,
         indptr,
-        total_tokens,
         out,
         kv_start_idx=None,
-        sliding_window=False,
+        kind=IdSpaceKind.FULL,
+        token_mapping=None,
     ):
         for i, (req, length) in enumerate(zip(req_pool_indices, seq_lens)):
             start = 0 if kv_start_idx is None else int(kv_start_idx[i])
@@ -48,13 +57,19 @@ class TestGemma4GraphMetadata(unittest.TestCase):
         backend.device = "cpu"
         backend.dllm_block_size = 4
         backend.sliding_window_size = 6
-        backend.kv_index_translator = _ReadStream()
+        backend.runner_ids = _ReadStream()
         backend.token_to_kv_pool = None
         backend.kv_indptr = torch.zeros(4, dtype=torch.int32)
         backend.qo_indptr = torch.zeros(4, dtype=torch.int32)
-        backend.window_kv_indptr = torch.zeros(4, dtype=torch.int32)
+        full = IdSpaceKind.FULL.value
+        backend.window_lengths = {full: 6}
+        backend.window_write_sub_pools = ()
+        backend.window_kv_indptr = {full: torch.zeros(4, dtype=torch.int32)}
         backend.cuda_graph_kv_indices = torch.zeros(64, dtype=torch.int64)
-        backend.cuda_graph_window_kv_indices = torch.zeros(64, dtype=torch.int64)
+        backend.cuda_graph_window_kv_indices = {
+            full: torch.zeros(64, dtype=torch.int64)
+        }
+        backend.cuda_graph_window_kv_offsets = {full: torch.zeros(3, dtype=torch.int32)}
         return backend
 
     def test_graph_canvas_stays_bidirectional(self):
@@ -89,6 +104,7 @@ class TestGemma4GraphMetadata(unittest.TestCase):
         requests = torch.tensor([1, 2, 0])
         # Prefixes 3, 11, and an empty padded request; each has a four-token canvas.
         backend._apply_cuda_graph_metadata(
+            plan=None,
             bs=3,
             req_pool_indices=requests,
             seq_lens=torch.tensor([7, 15, 4]),
@@ -96,8 +112,9 @@ class TestGemma4GraphMetadata(unittest.TestCase):
             spec_info=None,
         )
         metadata = backend._build_cuda_graph_forward_metadata(
-            3, ForwardMode.DLLM_EXTEND, None
+            3, ForwardMode.DLLM_EXTEND, None, {}
         )
+        window = metadata.windows[IdSpaceKind.FULL.value]
         self.assertEqual(metadata.max_extend_len, 4)
         self.assertIsNone(metadata.custom_mask)
         torch.testing.assert_close(
@@ -111,19 +128,20 @@ class TestGemma4GraphMetadata(unittest.TestCase):
             torch.tensor(list(range(16, 19)) + list(range(32, 43))),
         )
         torch.testing.assert_close(
-            metadata.window_kv_indptr, torch.tensor([0, 3, 9, 9], dtype=torch.int32)
+            window.kv_indptr, torch.tensor([0, 3, 9, 9], dtype=torch.int32)
         )
         torch.testing.assert_close(
-            metadata.window_kv_indices[:9],
+            window.kv_indices[:9],
             torch.tensor(list(range(16, 19)) + list(range(37, 43))),
         )
 
         # The captured views must see different lengths and request slots on replay.
         pointers = (
             metadata.kv_indices.data_ptr(),
-            metadata.window_kv_indices.data_ptr(),
+            window.kv_indices.data_ptr(),
         )
         backend._apply_cuda_graph_metadata(
+            plan=None,
             bs=3,
             req_pool_indices=torch.tensor([3, 1, 0]),
             seq_lens=torch.tensor([4, 9, 4]),
@@ -134,10 +152,10 @@ class TestGemma4GraphMetadata(unittest.TestCase):
             metadata.kv_indptr, torch.tensor([0, 0, 5, 5], dtype=torch.int32)
         )
         torch.testing.assert_close(metadata.kv_indices[:5], torch.arange(16, 21))
-        torch.testing.assert_close(metadata.window_kv_indices[:5], torch.arange(16, 21))
+        torch.testing.assert_close(window.kv_indices[:5], torch.arange(16, 21))
         self.assertEqual(
             pointers,
-            (metadata.kv_indices.data_ptr(), metadata.window_kv_indices.data_ptr()),
+            (metadata.kv_indices.data_ptr(), window.kv_indices.data_ptr()),
         )
 
 
@@ -148,9 +166,10 @@ class TestGemma4GraphInputEmbeddings(unittest.TestCase):
         runner.ragged_verify_mode = False
         runner.deepep_adapter = Mock()
         runner.bs = 4
+        runner.raw_bs = 4
         runner.raw_num_token = 12
+        runner.require_mlp_tp_gather = False
         runner.captured_req_width = 4
-        runner.enable_pdmux = False
         runner.attention_graph_variants = None
         runner._capture_graph_size = Mock(return_value=4)
         runner._resolve_lora_variant = Mock(return_value=None)
@@ -160,6 +179,7 @@ class TestGemma4GraphInputEmbeddings(unittest.TestCase):
             input_ids=torch.zeros(16, dtype=torch.long),
             positions=torch.zeros(16, dtype=torch.long),
             input_embeds=torch.full((16, 7), -1.0),
+            num_token_non_padded=None,
         )
         batch = SimpleNamespace(
             needs_forward_metadata_init=lambda: False,
@@ -179,7 +199,7 @@ class TestGemma4GraphInputEmbeddings(unittest.TestCase):
             runner.load_batch(batch)
 
 
-class TestGemma4VocabularyShards(unittest.TestCase):
+class TestGemma4VocabularyShards(CustomTestCase):
     def test_padded_shards_load_and_reconstruct_soft_embeddings(self):
         torch.manual_seed(123)
         config = SimpleNamespace(vocab_size=73, hidden_size=4)
@@ -191,9 +211,8 @@ class TestGemma4VocabularyShards(unittest.TestCase):
             with self.subTest(tp_size=tp_size):
                 partials = []
                 for rank in range(tp_size):
-                    with patch(
-                        "sglang.srt.layers.vocab_parallel_embedding.get_parallel",
-                        return_value=SimpleNamespace(tp_rank=rank, tp_size=tp_size),
+                    with published_topology(
+                        device="cpu", tp_size=tp_size, ranks={"world_rank": rank}
                     ):
                         embedding = DiffusionGemmaTextEmbedding(config)
                     embedding.weight_loader(embedding.weight, weight)

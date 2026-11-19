@@ -41,6 +41,8 @@ from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.utils.common import add_prefix, set_weight_attrs
+from sglang.srt.layers.utils.layer_list import make_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -56,7 +58,6 @@ from sglang.srt.models.lfm2 import (
     shortconv_target_verify,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, make_layers, set_weight_attrs
 
 
 class Lfm2MoeMLP(nn.Module):
@@ -162,6 +163,7 @@ class Lfm2MoeSparseMoeBlock(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("experts", prefix),
         )
+        self.topk.bind_runner_backend(self.experts.runner_backend)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Optimized expert forward pass using FusedMoE."""
@@ -319,11 +321,15 @@ class Lfm2MoeShortConv(nn.Module):
         self.conv_weight = nn.Parameter(
             torch.empty(self.hidden_size_per_partition, self.conv_kernel)
         )
-        set_weight_attrs(self.conv_weight, {"weight_loader": sharded_weight_loader(0)})
+        set_weight_attrs(
+            self.conv_weight,
+            {"weight_loader": sharded_weight_loader(0, parallel_group="tp")},
+        )
         if self.use_bias:
             self.conv_bias = nn.Parameter(torch.empty(self.hidden_size_per_partition))
             set_weight_attrs(
-                self.conv_bias, {"weight_loader": sharded_weight_loader(0)}
+                self.conv_bias,
+                {"weight_loader": sharded_weight_loader(0, parallel_group="tp")},
             )
         else:
             self.register_parameter("conv_bias", None)

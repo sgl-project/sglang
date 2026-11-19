@@ -10,11 +10,8 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_platform,
 )
-from sglang.srt.utils.common import (
-    get_device_capability,
-    is_cuda,
-)
 from sglang.srt.utils.custom_op import register_custom_op_from_extern
+from sglang.srt.utils.device import get_device_capability, is_cuda
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +117,10 @@ class Fp4GemmRunnerBackend(Enum):
 
     def is_flashinfer(self) -> bool:
         return self.value.startswith("flashinfer_")
+
+    def supports_swiglu_fusion(self) -> bool:
+        """Whether weight preparation builds the fused SwiGLU layout."""
+        return not (self.is_marlin() or self.is_flashinfer_trtllm())
 
     def get_flashinfer_backend(self) -> str:
         """Get the backend string to pass to FlashInfer's mm_fp4 API.

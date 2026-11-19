@@ -1,8 +1,7 @@
 """Runtime glue for the unified_kv backend.
 
 Builds unified_kv-style flat ``kv_indices`` / ``kv_indptr`` from SGLang's already-computed
-DSV4 metadata, scatters SWA K into the ``unified_kv`` ring, and dispatches the
-vendored paged decode/prefill kernels.
+DSV4 metadata and dispatches the vendored paged decode/prefill kernels.
 
 unified_kv[L] layout (page_size 1, row-major):
   - rows ``[0, swa_pages)``    = SWA ring (``state_slot * win + pos % win``);
@@ -27,6 +26,7 @@ on via ``topk_length``); the per-token compressed count is recovered from the
 
 from __future__ import annotations
 
+import logging
 from functools import lru_cache
 from typing import Optional, Tuple
 
@@ -49,173 +49,7 @@ from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.paged_prefill import (
     sparse_attn_v4_paged_prefill,
 )
 
-
-# ---------------------------------------------------------------------------
-# SWA ring scatter
-# ---------------------------------------------------------------------------
-@triton.jit
-def _swa_scatter_kernel(
-    kv_ptr,  # [T, D] bf16
-    state_slot_ptr,  # [T] int
-    positions_ptr,  # [T] int
-    final_pos_ptr,  # [T] int
-    unified_ptr,  # [pages, D] bf16
-    n_rows,
-    ring_stride,  # SWA ring per-slot stride
-    win: tl.constexpr,
-    D: tl.constexpr,
-    HAS_FINAL: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-):
-    row = tl.program_id(0)
-    if row >= n_rows:
-        return
-    pos = tl.load(positions_ptr + row)
-    if HAS_FINAL:
-        fp = tl.load(final_pos_ptr + row)
-        if pos <= fp - win:
-            return
-    s = tl.load(state_slot_ptr + row)
-    loc = s * ring_stride + (pos % ring_stride)
-    offs = tl.arange(0, BLOCK_D)
-    mask = offs < D
-    vals = tl.load(kv_ptr + row * D + offs, mask=mask, other=0.0)
-    tl.store(unified_ptr + loc * D + offs, vals, mask=mask)
-
-
-def store_swa_into_unified(
-    *,
-    kv: torch.Tensor,  # [T, head_dim] bf16, or [T, nope_row_bytes] packed fp8
-    state_slot: torch.Tensor,  # [T] int
-    positions: torch.Tensor,  # [T] int
-    unified_kv: torch.Tensor,  # [pages, ...] same dtype and row width as kv
-    win: int,  # SWA attention window length
-    ring_stride: int,  # SWA ring stride
-    final_pos: Optional[torch.Tensor] = None,  # [T] req's last position
-    kv_rope: Optional[torch.Tensor] = None,  # [T, rope_dim] bf16, fp8 layout only
-    unified_kv_rope: Optional[torch.Tensor] = None,  # [pages, rope_dim] bf16
-) -> None:
-    """Scatter SWA K into ring row ``state_slot * ring_stride + pos % ring_stride``.
-
-    Under the fp8 layout the latent is split over two pools, so ``kv`` carries the
-    already-packed nope row (DSV4_FP8_NOPE_ROW_BYTES wide: values + E8M0 scales +
-    pad; nothing is quantized here) and ``kv_rope`` the bf16 rope half. That width
-    is a byte count that happens to equal the bf16 head_dim in elements -- the two
-    are not the same thing. The scatter itself takes the row width off the tensor;
-    only the pair check reads the constant.
-
-    Both scatters recompute the row index from the same ``state_slot`` /
-    ``positions``, so the two pools stay in lockstep with each other and with the
-    bf16 layout. What a caller can still get wrong is passing two pools that aren't
-    a pair, so the pair goes through ``check_two_pool_pair`` before the first launch
-    -- shared with the fused store, which has the same coupling.
-    """
-    n_rows = kv.shape[0]
-    if n_rows == 0:
-        return
-
-    has_final = final_pos is not None
-    fp_arg = final_pos if has_final else positions
-    assert kv.is_contiguous() and kv.dtype == unified_kv.dtype
-    assert state_slot.is_contiguous() and positions.is_contiguous()
-    assert fp_arg.is_contiguous()
-    two_pool = kv_rope is not None
-    assert two_pool == (unified_kv_rope is not None), (
-        "kv_rope and unified_kv_rope come together"
-    )
-    if two_pool:
-        assert kv_rope.is_contiguous(), (
-            f"kv_rope must be contiguous, got strides {kv_rope.stride()}"
-        )
-        assert kv_rope.shape[0] == n_rows, (
-            f"kv_rope holds {kv_rope.shape[0]} rows, kv holds {n_rows}"
-        )
-        check_two_pool_pair(
-            unified_kv,
-            unified_kv_rope,
-            rope_width=kv_rope.shape[1],
-            rope_dtype=kv_rope.dtype,
-        )
-
-    def _scatter(src: torch.Tensor, dst: torch.Tensor) -> None:
-        D = src.shape[1]
-        assert dst.shape[1] == D, f"row width {D} does not fit pool {dst.shape[1]}"
-        _swa_scatter_kernel[(n_rows,)](
-            src,
-            state_slot,
-            positions,
-            fp_arg,
-            dst,
-            n_rows,
-            ring_stride,
-            win=win,
-            D=D,
-            HAS_FINAL=has_final,
-            BLOCK_D=triton.next_power_of_2(D),
-            num_warps=8,
-        )
-
-    if kv.element_size() == 1:
-        # single-byte rows (any fp8 variant) are a pure byte move, and the E8M0
-        # scale bytes aren't floats -- uint8 avoids a triton convert for `other=`
-        assert unified_kv.is_contiguous()
-        _scatter(kv.view(torch.uint8), unified_kv.view(torch.uint8))
-    else:
-        _scatter(kv, unified_kv)
-
-    if two_pool:
-        _scatter(kv_rope, unified_kv_rope)
-
-
-@triton.jit
-def _scatter_loc_kernel(
-    kv_ptr,  # [T, D] bf16
-    loc_ptr,  # [T] int (unified row index; <0 => skip)
-    unified_ptr,  # [pages, D] bf16
-    n_rows,
-    D: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-):
-    row = tl.program_id(0)
-    if row >= n_rows:
-        return
-    loc = tl.load(loc_ptr + row).to(tl.int64)
-    if loc < 0:
-        return
-    offs = tl.arange(0, BLOCK_D)
-    mask = offs < D
-    vals = tl.load(kv_ptr + row * D + offs, mask=mask, other=0.0)
-    tl.store(unified_ptr + loc * D + offs, vals, mask=mask)
-
-
-def scatter_bf16_into_unified(
-    *,
-    kv: torch.Tensor,  # [T, head_dim] bf16 (already norm+rope'd)
-    loc: torch.Tensor,  # [T] int32/int64 unified ring row; <0 => skip
-    unified_kv: torch.Tensor,  # [pages, head_dim] bf16
-) -> None:
-    """Scatter already-norm+rope'd bf16 K into ``unified_kv[loc]`` (skip loc < 0).
-
-    Companion to ``store_swa_into_unified`` for callers that already hold the
-    precomputed ring row index (the DSpark draft: ``get_unified_swa_loc`` for the
-    draft forward, or the commit-inject layout for target-hidden injection) and
-    need per-row commit masking expressed as ``loc == -1``.
-    """
-    n_rows, D = kv.shape
-    if n_rows == 0:
-        return
-    assert kv.is_contiguous() and kv.dtype == unified_kv.dtype
-    assert loc.is_contiguous()
-    assert unified_kv.is_contiguous()
-    _scatter_loc_kernel[(n_rows,)](
-        kv,
-        loc,
-        unified_kv,
-        n_rows,
-        D=D,
-        BLOCK_D=triton.next_power_of_2(D),
-        num_warps=8,
-    )
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -282,6 +116,289 @@ def _decode_fp8_tail_splits(T: int, compress_ratio: Optional[int]) -> int:
     return max(1, min(_DECODE_SPLIT_TAIL_VALUE, _cu_count() // T))
 
 
+# ---------------------------------------------------------------------------
+# Split plan from aiter's v4 nm latency model (ROCm/aiter#6126, ATOM#2462)
+# ---------------------------------------------------------------------------
+# t(i) ~= L + W(i) * (C + A * kv_len / i) + [i > 1] * (S + D * num_seqs * i),
+# W(i) = ceil(num_seqs * ceil(H / 64) * i / CU). The gfx950 fit is aiter's
+# (gqa=128, qSeqLen=1, graph replay, uniform KV). Used only when the installed
+# aiter predates get_mla_v4_nm_num_kv_splits.
+_V4_NM_SPLIT_COST = {"gfx950": (12.74, 3.21, 0.0300, 3.38, 0.076)}
+V4_NM_MAX_SPLITS = 16
+# rows the constant split table covers; the asm wraps byte offsets past 32768
+V4_NM_SPLIT_TABLE_ROWS = 32768
+
+
+def _ported_num_kv_splits(
+    num_seqs: int, num_heads: int, kv_len: int, gfx: str, cu_num: int
+) -> Optional[int]:
+    cost = _V4_NM_SPLIT_COST.get(gfx)
+    if cost is None:
+        return None
+    L, C, A, S, D = cost
+    tg_factor = max(1, -(-num_heads // 64))
+    kv_len = max(1, kv_len)
+    best_t, best_s = None, 1
+    for s in range(1, V4_NM_MAX_SPLITS + 1):
+        waves = -(-num_seqs * tg_factor * s // cu_num)
+        t = L + waves * (C + A * kv_len / s)
+        if s > 1:
+            t += S + D * num_seqs * s
+        if best_t is None or t < best_t:
+            best_t, best_s = t, s
+    return best_s
+
+
+@lru_cache(maxsize=None)
+def fp8_decode_num_kv_splits(
+    num_seqs: int, num_heads: int, kv_len: int
+) -> Optional[int]:
+    """aiter's latency-model split count for ``mla_decode_fwd_v4_nm``, or None
+    (no model for this arch: keep the existing pick). Host only, cached: the
+    inputs are fixed per captured graph, so capture and replay agree."""
+    try:
+        from aiter.mla import get_mla_v4_nm_num_kv_splits
+    except ImportError:
+        get_mla_v4_nm_num_kv_splits = None
+    if get_mla_v4_nm_num_kv_splits is not None:
+        return int(get_mla_v4_nm_num_kv_splits(num_seqs, num_heads, kv_len))
+    from aiter.jit.utils.chip_info import get_gfx
+
+    return _ported_num_kv_splits(num_seqs, num_heads, kv_len, get_gfx(), _cu_count())
+
+
+_split_tables: dict = {}
+
+
+def fp8_decode_split_table(device: torch.device) -> Optional[torch.Tensor]:
+    """``[V4_NM_MAX_SPLITS, V4_NM_SPLIT_TABLE_ROWS + 1]`` int32, row ``s - 1``
+    the uniform ``split_indptr`` ``[0, s, 2s, ...]``. Built once per device
+    outside capture and never written again, so every plan is a slice of
+    constant memory (no per-layer arange). None if it would be built under
+    capture: that graph keeps the wrapper's own pick."""
+    device = torch.device(device)
+    key = device.index if device.index is not None else torch.cuda.current_device()
+    table = _split_tables.get(key)
+    if table is None:
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        splits = torch.arange(1, V4_NM_MAX_SPLITS + 1, dtype=torch.int32, device=device)
+        table = splits[:, None] * torch.arange(
+            V4_NM_SPLIT_TABLE_ROWS + 1, dtype=torch.int32, device=device
+        )
+        _split_tables[key] = table
+    return table
+
+
+def fp8_decode_split_plan(
+    n_seq: int, num_heads: int, kv_len_hint: int, device: torch.device
+) -> Optional[Tuple[int, torch.Tensor]]:
+    """(num_kv_splits, split_indptr) from the latency model, or None."""
+    if n_seq > V4_NM_SPLIT_TABLE_ROWS:
+        return None
+    s = fp8_decode_num_kv_splits(n_seq, num_heads, int(kv_len_hint))
+    if s is None:
+        return None
+    table = fp8_decode_split_table(device)
+    if table is None:
+        return None
+    return s, table[s - 1, : n_seq + 1]
+
+
+# ---------------------------------------------------------------------------
+# HCA persistent decode (aiter mla_decode_fwd_v4_nm_ps, ROCm/aiter#6126)
+# ---------------------------------------------------------------------------
+HCA_PS_HEADS = 128
+HCA_PS_MAX_ROWS = 32768
+HCA_PS_PARTITIONS = 128
+_hca_ps_workspaces: dict = {}
+
+
+def _hca_ps_api():
+    try:
+        from aiter.mla import get_mla_v4_nm_ps_workspace, mla_decode_fwd_v4_nm_ps
+    except ImportError:
+        return None
+    return get_mla_v4_nm_ps_workspace, mla_decode_fwd_v4_nm_ps
+
+
+def _dev_key(device) -> int:
+    device = torch.device(device)
+    return device.index if device.index is not None else torch.cuda.current_device()
+
+
+def prepare_fp8_hca_persist(device, num_heads: int) -> bool:
+    """Allocate this device's persistent-decode workspace (~64 MiB) when the
+    switch is on and the kernel can serve this rank. Call outside capture,
+    before warmup; idempotent. One workspace per device is enough because
+    every decode layer runs on the forward's compute stream in order."""
+    from sglang.srt.environ import envs
+    from sglang.srt.utils import is_gfx95_supported
+
+    if not envs.SGLANG_DSV4_FP8_HCA_PERSIST.get() or num_heads != HCA_PS_HEADS:
+        return False
+    if not is_gfx95_supported():
+        return False
+    key = _dev_key(device)
+    if key in _hca_ps_workspaces:
+        return True
+    api = _hca_ps_api()
+    if api is None or torch.cuda.is_current_stream_capturing():
+        return False
+    _hca_ps_workspaces[key] = api[0](
+        torch.device("cuda", key), num_partitions=HCA_PS_PARTITIONS
+    )
+    return True
+
+
+def fp8_hca_persist_wanted(
+    *,
+    T: int,
+    H: int,
+    v_head_dim: int,
+    compress_ratio: Optional[int],
+    max_seqlen_q: int,
+    per_token: bool,
+    device,
+) -> bool:
+    from sglang.srt.environ import envs
+
+    if not (
+        compress_ratio == 128
+        and H == HCA_PS_HEADS
+        and v_head_dim == 512
+        and max_seqlen_q == 1
+        and per_token
+        and envs.SGLANG_DSV4_FP8_HCA_PERSIST.get()
+        and envs.SGLANG_DSV4_FP8_HCA_PERSIST_MIN_ROWS.get() <= T <= HCA_PS_MAX_ROWS
+    ):
+        return False
+    # eager calls may allocate it late; a graph captured without one keeps asm
+    return prepare_fp8_hca_persist(device, H)
+
+
+def decode_fp8_hca_ps(
+    *,
+    q: torch.Tensor,  # [T, 128, 512] fp8 packed
+    q_rope: torch.Tensor,  # [T, 128, 64] bf16
+    unified_kv: torch.Tensor,
+    unified_kv_rope: torch.Tensor,
+    kv_indices: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    attn_sink: torch.Tensor,
+) -> torch.Tensor:
+    """One-launch HCA decode: the kernel plans the split from ``kv_indptr`` on
+    the GPU and merges the partials itself. Rows with an empty KV range are
+    left unwritten (the builders never emit one; see decode_fp8_2buff)."""
+    T = q.shape[0]
+    out = q_rope.new_empty((T, HCA_PS_HEADS, 512))
+    if T == 0:
+        return out
+    _hca_ps_api()[1](
+        q,
+        q_rope,
+        unified_kv,
+        unified_kv_rope,
+        kv_indptr[: T + 1],
+        kv_indices,
+        attn_sink,
+        _hca_ps_workspaces[_dev_key(q.device)],
+        out=out,
+    )
+    return out
+
+
+# TODO(aiter#5882): remove once ROCm/aiter#5882 is in the aiter pin
+# (with it: the in-tree fallback below, flydsl_v4nm/ and
+# SGLANG_DSV4_FLYDSL_DECODE_SOURCE; aiter's copy is then the only one).
+_FLYDSL_V4_DECODE_SOURCES = ("auto", "aiter", "intree")
+
+
+@lru_cache(maxsize=1)
+def _flydsl_v4_decode():
+    """The FlyDSL v4 nm decode API (ROCm/aiter#5882) or None (asm kernel).
+
+    SGLANG_DSV4_FLYDSL_DECODE=0 forces None. SGLANG_DSV4_FLYDSL_DECODE_SOURCE:
+    auto (default) takes aiter.ops.flydsl when the installed aiter ships it, else
+    sglang's in-tree copy (flydsl_v4nm); aiter / intree take only that one.
+    """
+    from sglang.srt.environ import envs
+
+    if not envs.SGLANG_DSV4_FLYDSL_DECODE.get():
+        return None
+    source = envs.SGLANG_DSV4_FLYDSL_DECODE_SOURCE.get()
+    if source not in _FLYDSL_V4_DECODE_SOURCES:
+        raise ValueError(
+            f"SGLANG_DSV4_FLYDSL_DECODE_SOURCE={source!r}, expected one of "
+            f"{_FLYDSL_V4_DECODE_SOURCES}"
+        )
+    fly = None
+    if source != "intree":
+        try:
+            from aiter.ops import flydsl as fly
+
+            fly.flydsl_mla_v4_decode_supported  # resolves the lazy import
+            origin = "aiter.ops.flydsl"
+        except (ImportError, AttributeError):
+            fly = None
+    if fly is None and source != "aiter":
+        try:
+            from sglang.kernels.ops.attention.dsv4 import flydsl_v4nm as fly
+
+            origin = "sglang in-tree copy of ROCm/aiter#5882"
+        except ImportError as e:  # no flydsl, or an aiter before ROCm/aiter#6377
+            fly = None
+            logger.warning("in-tree FlyDSL v4 nm decode unavailable: %s", e)
+    if fly is None:
+        logger.info("DSv4 fp8 decode: no FlyDSL v4 nm decode (source=%s)", source)
+    else:
+        logger.info("DSv4 fp8 decode: FlyDSL v4 nm decode from %s", origin)
+    return fly
+
+
+def flydsl_decode_supported(
+    num_heads: int, max_seqlen_q: int = 1, grouped: bool = False
+) -> bool:
+    fly = _flydsl_v4_decode()
+    if fly is None:
+        return False
+    if num_heads == 128:
+        from sglang.srt.environ import envs
+
+        if not envs.SGLANG_DSV4_FLYDSL_DECODE_H128.get():
+            return False
+    return fly.flydsl_mla_v4_decode_supported(num_heads, max_seqlen_q, grouped)
+
+
+def _stream_hint(compress_ratio: Optional[int]) -> Optional[str]:
+    # FlyDSL split plans are keyed by stream kind
+    if compress_ratio is None:
+        return None
+    return {0: "swa", 4: "csa", 128: "hca"}[compress_ratio]
+
+
+def flydsl_grouped_verify_pays(
+    num_heads: int, num_draft: int, num_reqs: int, compress_ratio: int, epi: str
+) -> bool:
+    """aiter's measured policy: whether target verify should read one shared
+    stream per request on this layer kind, for output mode ``epi``."""
+    return flydsl_decode_supported(
+        num_heads, num_draft, grouped=True
+    ) and _flydsl_v4_decode().flydsl_mla_v4_grouped_pays(
+        num_heads, num_draft, num_reqs, hint=_stream_hint(compress_ratio), epi=epi
+    )
+
+
+def build_grouped_verify_streams(
+    state_slot: torch.Tensor, positions: torch.Tensor, *args, **kwargs
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """(kv_indices, kv_indptr, qo_indptr, q_kv_bounds): one stream per request,
+    with per-draft key ranges equal to each draft's per-token stream."""
+    return _flydsl_v4_decode().flydsl_mla_v4_grouped_verify_meta(
+        state_slot.contiguous(), positions.contiguous(), *args, **kwargs
+    )
+
+
 def decode_fp8_2buff(
     *,
     q: torch.Tensor,  # [T, H, nope_row_bytes] fp8 packed nope + inline e8m0 scale
@@ -296,8 +413,17 @@ def decode_fp8_2buff(
     max_seqlen_q: int = 1,
     num_kv_splits: Optional[int] = None,
     compress_ratio: Optional[int] = None,
+    q_kv_bounds: Optional[torch.Tensor] = None,
+    kv_len_hint: Optional[int] = None,
 ) -> torch.Tensor:
-    """Decode over the two-pool fp8 unified_kv, through aiter's v4 nm asm kernel.
+    """Decode over the two-pool fp8 unified_kv, through aiter's FlyDSL v4 nm
+    decode (split merge in the same launch) where available, else the asm kernel.
+
+    On the asm kernel, with ``SGLANG_DSV4_FP8_HCA_PERSIST`` the HCA stream
+    (H128, one q row per sequence) takes the persistent kernel, and with
+    ``SGLANG_DSV4_FP8_DECODE_SPLIT_MODEL`` plus ``kv_len_hint`` (the longest
+    KV a row of this stream can see, fixed per server) the split count comes
+    from aiter's latency model with a constant ``split_indptr``.
 
     Q arrives in the same packed form as the pool rows (nope fp8 + duplicated
     e8m0 tile scales) with its rope half beside it in bf16, which is why this
@@ -314,6 +440,9 @@ def decode_fp8_2buff(
 
     ``max_seqlen_q`` above 1 puts several q rows in one tile, which the v4
     dispatcher serves for gqa=16 at 1, 2 and 4 off the same 64-row tile.
+
+    ``q_kv_bounds`` (FlyDSL only): the grouped verify streams of
+    ``build_grouped_verify_streams``.
     """
     from aiter.mla import mla_decode_fwd_v4_nm
 
@@ -350,15 +479,52 @@ def decode_fp8_2buff(
 
     rows = unified_kv.shape[0]
     out = q_rope.new_empty((n_seq * max_seqlen_q, H, v_head_dim))
-    # Left None, the wrapper's occupancy heuristic picks it, folds the cross-split
-    # merge back into `out`, and leaves the final bf16 there whether or not it
-    # split. Pinning it to 1 costs 6.9x at bs=1 kv=2048.
-    # Sequences, not tokens: the wave-fitting rule counts the workgroups the
-    # kernel launches, which is n_seq x splits. They are the same number on the
-    # per-token path and differ once q rows share a tile.
-    if num_kv_splits is None and n_seq > _DECODE_SPLIT_TAIL_MIN_TOKENS:
-        num_kv_splits = _decode_fp8_tail_splits(n_seq, compress_ratio)
-    mla_decode_fwd_v4_nm(
+    # FlyDSL is a drop-in for the asm kernel: its own capture-safe split plan,
+    # split merge in the same launch
+    if flydsl_decode_supported(H, max_seqlen_q, q_kv_bounds is not None):
+        decode_fwd = _flydsl_v4_decode().flydsl_mla_decode_fwd_v4_nm
+        kwargs = dict(hint=_stream_hint(compress_ratio), q_kv_bounds=q_kv_bounds)
+    else:
+        assert q_kv_bounds is None, "grouped verify streams need FlyDSL"
+        if fp8_hca_persist_wanted(
+            T=T,
+            H=H,
+            v_head_dim=v_head_dim,
+            compress_ratio=compress_ratio,
+            max_seqlen_q=max_seqlen_q,
+            per_token=n_seq == T,
+            device=q.device,
+        ):
+            return decode_fp8_hca_ps(
+                q=q,
+                q_rope=q_rope,
+                unified_kv=unified_kv,
+                unified_kv_rope=unified_kv_rope,
+                kv_indices=kv_indices,
+                kv_indptr=kv_indptr,
+                attn_sink=attn_sink,
+            )
+        split_indptr = None
+        if num_kv_splits is None and kv_len_hint is not None:
+            from sglang.srt.environ import envs
+
+            if envs.SGLANG_DSV4_FP8_DECODE_SPLIT_MODEL.get():
+                plan = fp8_decode_split_plan(n_seq, H, kv_len_hint, q.device)
+                if plan is not None:
+                    num_kv_splits, split_indptr = plan
+        # Left None, the wrapper's occupancy heuristic picks it, folds the
+        # cross-split merge back into `out`, and leaves the final bf16 there
+        # whether or not it split. Pinning it to 1 costs 6.9x at bs=1 kv=2048.
+        # Sequences, not tokens: the wave-fitting rule counts the workgroups the
+        # kernel launches, which is n_seq x splits. They are the same number on
+        # the per-token path and differ once q rows share a tile.
+        if num_kv_splits is None and n_seq > _DECODE_SPLIT_TAIL_MIN_TOKENS:
+            num_kv_splits = _decode_fp8_tail_splits(n_seq, compress_ratio)
+        decode_fwd, kwargs = (
+            mla_decode_fwd_v4_nm,
+            dict(num_kv_splits=num_kv_splits, split_indptr=split_indptr),
+        )
+    decode_fwd(
         q,
         q_rope,
         unified_kv.view(rows, 1, 1, row_bytes),
@@ -369,13 +535,48 @@ def decode_fp8_2buff(
         kv_indices,
         max_seqlen_q,
         sink=attn_sink,
-        num_kv_splits=num_kv_splits,
+        **kwargs,
     )
     # No empty-segment mask: a CG-padded row gets seq_len 1 on the ring slot
     # ReqToTokenPool reserves, so the builders can't emit a zero-length one, and
     # the compare + masked_fill_ was costing a launch per layer for it. One would
     # come back NaN now (all-sink denominator); the guard UT pins that.
     return out[:T]
+
+
+def decode_fp8_2buff_wo_a_mxfp8(
+    *,
+    q: torch.Tensor,  # [T, H, nope_row_bytes] fp8 packed nope + inline e8m0 scale
+    q_rope: torch.Tensor,  # [T, H, rope_dim] bf16
+    unified_kv: torch.Tensor,  # [rows, nope_row_bytes] fp8
+    unified_kv_rope: torch.Tensor,  # [rows, rope_dim] bf16
+    kv_indices: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    attn_sink: torch.Tensor,  # [H] fp32
+    positions: torch.Tensor,  # [T] int64
+    rope_freqs: torch.Tensor,  # [max_pos, rope_dim] fp32, view_as_real(freqs_cis)
+    compress_ratio: int,
+    qo_indptr: Optional[torch.Tensor] = None,
+    max_seqlen_q: int = 1,
+    q_kv_bounds: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """``decode_fp8_2buff`` + inverse RoPE + wo_a mxfp8 quant in one FlyDSL
+    launch. Returns the wo_a operands (fp8 [T, H*512], e8m0 [T, H*4])."""
+    return _flydsl_v4_decode().flydsl_mla_v4_decode_fused(
+        q,
+        q_rope,
+        unified_kv,
+        unified_kv_rope,
+        kv_indptr,
+        kv_indices,
+        attn_sink,
+        positions,
+        rope_freqs,
+        compress_ratio,
+        qo_indptr=qo_indptr,
+        max_seqlen_q=max_seqlen_q,
+        q_kv_bounds=q_kv_bounds,
+    )
 
 
 @triton.jit

@@ -1,4 +1,4 @@
-"""CPU-only tests for decode graph backend resolution."""
+"""CPU-only tests for decode and prefill graph backend resolution."""
 
 import unittest
 from types import SimpleNamespace
@@ -6,12 +6,18 @@ from unittest import mock
 
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.runner_backend import utils as backend_utils
+from sglang.srt.model_executor.runner_backend.base_breakable_graph_backend import (
+    BaseBreakableGraphBackend,
+)
+from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
+    BreakableCudaGraphBackend,
+)
 from sglang.srt.platforms.device_mixin import PlatformEnum
 from sglang.srt.platforms.interface import SRTPlatform
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def _make_graph_runner(*, device="custom"):
@@ -21,12 +27,16 @@ def _make_graph_runner(*, device="custom"):
 def _make_exec_config(
     *,
     backend=Backend.FULL,
+    prefill_backend=Backend.BREAKABLE,
     enable_memory_saver=False,
     debug_cuda_graph=False,
 ):
     return SimpleNamespace(
         graph=SimpleNamespace(
-            cuda_graph_config=SimpleNamespace(decode=SimpleNamespace(backend=backend)),
+            cuda_graph_config=SimpleNamespace(
+                decode=SimpleNamespace(backend=backend),
+                prefill=SimpleNamespace(backend=prefill_backend),
+            ),
             debug_cuda_graph=debug_cuda_graph,
         ),
         features=SimpleNamespace(
@@ -44,6 +54,13 @@ def _make_platform(*, is_out_of_tree, full_backend_cls=None):
 
 class _OutOfTreePlatformWithoutFullGraphBackend(SRTPlatform):
     _enum = PlatformEnum.OOT
+
+
+class TestGraphBackendTypes(CustomTestCase):
+    def test_cuda_breakable_backend_implements_neutral_contract(self):
+        self.assertTrue(
+            issubclass(BreakableCudaGraphBackend, BaseBreakableGraphBackend)
+        )
 
 
 class TestResolveDecodeBackend(CustomTestCase):
@@ -114,37 +131,16 @@ class TestResolveDecodeBackend(CustomTestCase):
             enable_memory_saver=False,
         )
 
-    def test_in_tree_platform_uses_default_full_backend(self):
+    def test_retired_backend_is_not_replaced_with_full(self):
         runner = _make_graph_runner(device="cuda")
-        exec_config = _make_exec_config()
-        expected_backend = object()
-        platform = _make_platform(is_out_of_tree=False)
-
+        exec_config = _make_exec_config(backend=Backend.TC_PIECEWISE)
         with (
-            mock.patch.object(
-                backend_utils,
-                "get_exec",
-                return_value=exec_config,
-            ),
-            mock.patch.object(
-                backend_utils,
-                "current_platform",
-                platform,
-            ),
-            mock.patch.object(
-                backend_utils,
-                "FullCudaGraphBackend",
-                return_value=expected_backend,
-            ) as default_backend_cls,
+            mock.patch.object(backend_utils, "get_exec", return_value=exec_config),
+            mock.patch.object(backend_utils, "FullCudaGraphBackend") as full_backend,
         ):
-            actual_backend = backend_utils.resolve_decode_backend(runner)
-
-        self.assertIs(actual_backend, expected_backend)
-        platform.get_full_graph_backend_cls.assert_not_called()
-        default_backend_cls.assert_called_once_with(
-            runner,
-            enable_memory_saver=False,
-        )
+            with self.assertRaisesRegex(ValueError, "Unsupported decode graph backend"):
+                backend_utils.resolve_decode_backend(runner)
+            full_backend.assert_not_called()
 
     def test_breakable_backend_does_not_consult_full_backend_factory(self):
         runner = _make_graph_runner()
@@ -183,6 +179,53 @@ class TestResolveDecodeBackend(CustomTestCase):
             enable_memory_saver=True,
             debug_eager=True,
         )
+
+
+class TestResolvePrefillBackendNPU(CustomTestCase):
+    def test_npu_breakable_resolves_to_npu_backend(self):
+        runner = _make_graph_runner(device="npu")
+        exec_config = _make_exec_config(
+            prefill_backend=Backend.BREAKABLE,
+            enable_memory_saver=True,
+            debug_cuda_graph=True,
+        )
+        expected_backend = object()
+        with (
+            mock.patch.object(backend_utils, "get_exec", return_value=exec_config),
+            mock.patch.object(
+                backend_utils,
+                "BreakableCudaGraphBackend",
+            ) as cuda_breakable_cls,
+            mock.patch(
+                "sglang.srt.hardware_backend.npu.graph_runner."
+                "breakable_npu_graph_backend.BreakableNPUGraphBackend",
+                return_value=expected_backend,
+            ) as npu_breakable_cls,
+        ):
+            actual_backend = backend_utils.resolve_prefill_backend(runner)
+
+        self.assertIs(actual_backend, expected_backend)
+        npu_breakable_cls.assert_called_once_with(
+            runner,
+            enable_memory_saver=True,
+            debug_eager=True,
+        )
+        cuda_breakable_cls.assert_not_called()
+
+    def test_npu_non_breakable_prefill_rejected(self):
+        # The NPU branch must reject 'full' instead of silently falling back
+        # to the CUDA FullCudaGraphBackend, whose capture would crash on NPU.
+        runner = _make_graph_runner(device="npu")
+        exec_config = _make_exec_config(prefill_backend=Backend.FULL)
+        with (
+            mock.patch.object(backend_utils, "get_exec", return_value=exec_config),
+            mock.patch.object(backend_utils, "FullCudaGraphBackend") as full_backend,
+        ):
+            with self.assertRaisesRegex(
+                ValueError, "NPU prefill graph only supports 'breakable'"
+            ):
+                backend_utils.resolve_prefill_backend(runner)
+            full_backend.assert_not_called()
 
 
 if __name__ == "__main__":
