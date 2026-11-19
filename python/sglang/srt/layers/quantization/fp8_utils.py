@@ -756,16 +756,27 @@ if get_platform().is_sm90 and is_flashinfer_available():
 # "NVIDIA H20-3e" match, "NVIDIA H200" does not.
 _H20_NAME = re.compile(r"NVIDIA H20($|[-\s])")
 
+# Scale layouts fp8_blockscale_gemm_sm90 can read: per-token (block [1, 128]) and
+# per-block ([128, 128]). It takes no block size, so anything else is delegated.
+_SWAPAB_BLOCK_LAYOUTS = ([1, 128], [128, 128])
+
 
 def _h20_swapab_opt_out() -> bool:
     """Whether an opt-in feature pins block-FP8 GEMM to one kernel for every M."""
+    if _fp8_block_gemv_enabled():
+        return True
     # Deferred import: the batch-invariant helpers are read lazily everywhere else
     # in this file too (see the [32, 32] path), so do not pull them in at import.
     from sglang.srt.layers.quantization.mxfp8_input import (
         batch_invariant_or_deterministic,
     )
 
-    return _fp8_block_gemv_enabled() or batch_invariant_or_deterministic()
+    try:
+        return batch_invariant_or_deterministic()
+    except ValueError:
+        # No runtime context: a standalone FP8 linear (diffusion, unit construction)
+        # has no server to have enabled deterministic inference either.
+        return False
 
 
 def _is_h20() -> bool:
@@ -773,7 +784,7 @@ def _is_h20() -> bool:
     if not get_platform().is_sm90:
         return False
     try:
-        name = get_device_name()
+        name = get_device_name(torch.cuda.current_device())
     except Exception:
         return False
     return bool(_H20_NAME.match(name))
@@ -1561,13 +1572,19 @@ def flashinfer_deepgemm_w8a8_block_fp8_linear_with_fallback(
 
     For SM90 (Hopper), this uses the DeepGEMM JIT with automatic swapAB selection.
     """
-    if input_scale is not None or block_size != [128, 128]:
+    if input_scale is not None or list(block_size) not in _SWAPAB_BLOCK_LAYOUTS:
         # fp8_blockscale_gemm_sm90 quantizes the activation itself and takes no
-        # static per-tensor input scale, and it assumes 128x128 block scales (the
-        # call below passes no block size). DeepGEMM serves both, so a
-        # pre-quantized or [64, 128] / [32, 32] checkpoint keeps exactly the
-        # backend `auto` used before this change instead of misindexing scales.
-        return deepgemm_w8a8_block_fp8_linear_with_fallback(
+        # static per-tensor input scale, and its scale tensor is per-token
+        # ([1, 128]) or per-block ([128, 128]) -- the call below passes no block
+        # size, so any other layout would index the wrong scales. DeepGEMM is the
+        # runner `auto` used for those checkpoints before this change, and falls
+        # back to Triton on its own; without JIT DeepGEMM, go straight to Triton
+        # rather than assert inside it.
+        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+            return deepgemm_w8a8_block_fp8_linear_with_fallback(
+                input, weight, block_size, weight_scale, input_scale, bias
+            )
+        return triton_w8a8_block_fp8_linear(
             input, weight, block_size, weight_scale, input_scale, bias
         )
 
