@@ -1,4 +1,5 @@
 // H100: two nodes, TP16. H200: one node, TP8; not yet validated.
+// FP8 target; DFlash2 uses a separate BF16 draft. Measurements: gigachat4-benchmarks.jsx.
 export const config = {
   modelName: "GigaChat 4",
   supportedHardware: ["h100", "h200"],
@@ -10,7 +11,7 @@ export const config = {
     { id: "dflash2", label: "DFlash2" },
   ],
   nodesOptions: [{ id: "single", label: "Single Node" }, { id: "multi-2", label: "Two Nodes" }],
-  modelNames: { "default|fp8": "ai-sage/GigaChat-4-708B-A41B" },
+  modelNames: { "default|fp8": "ai-sage/GigaChat4-708B-A41B" },
   placeholders: {
     HOST_IP: { target: "command", label: "Bind host", default: "0.0.0.0" },
     PORT: { target: "command", label: "Bind port", default: "30000" },
@@ -20,13 +21,13 @@ export const config = {
   },
   curl: "curl http://{{CURL_HOST}}:{{CURL_PORT}}/v1/chat/completions \\\n-H 'Content-Type: application/json' \\\n-d '{ \"model\": \"{{MODEL_NAME}}\", \"messages\": [{\"role\":\"user\",\"content\":\"Hello\"}], \"chat_template_kwargs\": {\"reasoning\": false} }'",
   benchmarkCommands: {
-    speed: "python3 -m sglang.benchmark.serving \\\n  --backend sglang \\\n  --host {{CURL_HOST}} --port {{CURL_PORT}} \\\n  --model {{MODEL_NAME}} \\\n  --dataset-name {{DATASET}} \\\n  --random-input-len {{ISL}} --random-output-len {{OSL}} \\\n  --random-range-ratio 1 --tokenize-prompt \\\n  --num-prompts {{NUM_PROMPTS}} --max-concurrency {{MAX_CONCURRENCY}} \\\n  --warmup-requests 2 --seed 42 --flush-cache",
-    numPromptsByConc: { "1": 16, "4": 16 },
+    speed: "python3 -m sglang.benchmark.serving \\\n  --backend sglang \\\n  --host {{CURL_HOST}} --port {{CURL_PORT}} \\\n  --model {{MODEL_NAME}} \\\n  --dataset-name {{DATASET}} \\\n  --random-input-len {{ISL}} --random-output-len {{OSL}} \\\n  --random-range-ratio 1 --tokenize-prompt \\\n  --num-prompts {{NUM_PROMPTS}} --max-concurrency {{MAX_CONCURRENCY}} \\\n  --temperature 0 --warmup-requests 4 --seed 42 --flush-cache",
+    numPromptsByConc: { "1": 16, "16": 64, "64": 256 },
   },
-  latencyPercentile: "Mean",
+  latencyPercentile: "P50",
   runModes: ["python"],
   dockerImages: { h100: "lmsysorg/sglang:dev", h200: "lmsysorg/sglang:dev" },
-  github: { cookbookModel: "ai-sage/GigaChat-4-708B-A41B" },
+  github: { cookbookModel: "ai-sage/GigaChat4-708B-A41B" },
   playgroundFeatures: {
     attention: {
       knobs: [
@@ -113,10 +114,9 @@ export const config = {
   cells: [
     {
       match: { hw: "h100", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "multi-2" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
-        "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 16",
         "--mem-fraction-static 0.8",
@@ -133,7 +133,6 @@ export const config = {
       verified: true,
       env: [],
       flags: [
-        "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 16",
         "--mem-fraction-static 0.8",
@@ -151,10 +150,9 @@ export const config = {
     },
     {
       match: { hw: "h100", variant: "default", quant: "fp8", strategy: "dflash2", nodes: "multi-2" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
-        "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 16",
         "--mem-fraction-static 0.8",
@@ -176,7 +174,6 @@ export const config = {
       verified: false,
       env: [],
       flags: [
-        "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
         "--mem-fraction-static 0.8",
@@ -194,7 +191,6 @@ export const config = {
       verified: false,
       env: [],
       flags: [
-        "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
         "--mem-fraction-static 0.8",
@@ -216,7 +212,6 @@ export const config = {
       verified: false,
       env: [],
       flags: [
-        "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
         "--mem-fraction-static 0.8",
