@@ -92,8 +92,9 @@ requests the router marks with `disagg_local_prefill: true` itself:
 
 The router sends a marked request to the decode server only, without bootstrap
 fields: `sgl-router` launched with `--pd-local-prefill-max-uncached-tokens N`
-marks a request when its KV-event tree shows a decode server holding the
-prompt's prefix with at most N uncached tokens left. The decode server matches
+marks a request when its KV-event tree (fed by the servers' `--kv-events-config`
+publishers) shows a decode server holding the prompt's prefix with at most N
+uncached tokens left. The decode server matches
 the request against its radix cache and runs the uncached part with chunked
 prefill, interleaved with its decode batches like an aggregated server.
 Requests without the marker keep the normal PD path, so one decode server

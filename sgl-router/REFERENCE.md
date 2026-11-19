@@ -262,10 +262,11 @@ requests take the prefill-then-decode path, so one decode pool serves both.
 
 The decode engines must run `--disaggregation-decode-enable-local-prefill`,
 with `--disaggregation-decode-enable-radix-cache` and KV events, or they
-reject the marked request with 400. The router needs a tokenizer and the local
-KV-event tree for the decision; an external indexer, batched prompts, fan-out
-requests, the gRPC client path and reorg chat routing always go through
-prefill. `sgl_router_pd_local_prefill_total{outcome}` counts the decisions:
+reject the marked request with 400. The router needs a tokenizer for the
+decision and builds the local KV-event tree from the engines'
+`--kv-events-config` publishers under any policy; an external indexer, batched
+prompts, fan-out requests, the gRPC client path and reorg chat routing always
+go through prefill. `sgl_router_pd_local_prefill_total{outcome}` counts the decisions:
 `routed`, `no_prefix` and `uncached_over_limit`.
 
 ### Retries
