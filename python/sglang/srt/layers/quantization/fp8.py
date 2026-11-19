@@ -2021,7 +2021,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         # If loading fp8 checkpoint, pass the weight loaders.
         # If loading an fp16 checkpoint, do not (we will quantize in
         #   process_weights_after_loading()
-        if quant_config.is_checkpoint_fp8_serialized:
+        # Online MXFP8 keeps them too: a weight update may deliver the experts
+        # already quantized, with their scales.
+        if quant_config.is_checkpoint_fp8_serialized or use_mxfp8:
             for weight_scale, scale_block_size in (
                 (w13_weight_scale, weight_block_size),
                 (w2_weight_scale, w2_weight_block_size),
@@ -2041,7 +2043,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     }
                 set_weight_attrs(weight_scale, scale_attrs)
 
-            if _is_hip and _use_hip_int4:
+            if quant_config.is_checkpoint_fp8_serialized and _is_hip and _use_hip_int4:
                 extra_weight_attrs.update(
                     {"quant_method": FusedMoeWeightScaleSupported.CHANNEL.value}
                 )
@@ -2435,8 +2437,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             prepare_mxfp8_moe_weights_for_flashinfer_megamoe(layer)
             return
         elif self.use_mxfp8:
+            # A weight update may have loaded the experts already quantized.
+            is_quantized = layer.w13_weight.dtype in (
+                torch.float8_e4m3fn,
+                torch.float8_e4m3fnuz,
+            )
             self._process_mxfp8_moe_weights(
-                layer, quantize=not self.quant_config.is_checkpoint_fp8_serialized
+                layer,
+                quantize=not self.quant_config.is_checkpoint_fp8_serialized
+                and not is_quantized,
             )
             return
 
