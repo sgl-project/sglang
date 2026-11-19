@@ -248,6 +248,53 @@ def _reject_remote_model_paths(kwargs: dict[str, Any]) -> None:
             )
 
 
+_FILE_OUTPUT_PATH_FIELDS = ("perf_dump_path", "output_path")
+
+
+def _validate_file_output_paths(kwargs: dict[str, Any], server_args: Any) -> None:
+    """Contain request-supplied file-output paths under the server output root.
+
+    `perf_dump_path`/`output_path` reach code that creates directories and
+    atomically overwrites files (e.g. PerformanceLogger.dump_benchmark_report),
+    so a client must not point them at arbitrary locations. The containment
+    root is the operator-configured `server_args.output_path` ("outputs/" by
+    default). When the operator disabled on-disk output (root is None), the
+    only paths the server itself generates are temporary directories, so the
+    system temp dir is the fallback root. `output_file_name` is joined onto
+    the output path by SamplingParams.output_file_path(), so it must be a
+    plain file name and cannot smuggle in a `..` traversal.
+    """
+    root = getattr(server_args, "output_path", None) or tempfile.gettempdir()
+    for name in _FILE_OUTPUT_PATH_FIELDS:
+        value = kwargs.get(name)
+        if value is None:
+            continue
+        if not isinstance(value, str) or not value.strip():
+            raise HTTPException(
+                status_code=400,
+                detail=f"{name} must be a non-empty path string",
+            )
+        try:
+            ensure_path_within_root(value, root)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{name} must stay within the server output directory ({root})",
+            ) from exc
+    file_name = kwargs.get("output_file_name")
+    if file_name is not None and (
+        not isinstance(file_name, str)
+        or not file_name.strip()
+        or file_name in {".", ".."}
+        or "/" in file_name
+        or "\\" in file_name
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="output_file_name must be a plain file name",
+        )
+
+
 def build_sampling_params(request_id: str, **kwargs) -> SamplingParams:
     """Build SamplingParams from request parameters.
 
@@ -296,6 +343,7 @@ def build_sampling_params(request_id: str, **kwargs) -> SamplingParams:
 
     # filter out None values to let SamplingParams defaults apply
     kwargs = {k: v for k, v in kwargs.items() if v is not None}
+    _validate_file_output_paths(kwargs, server_args)
     kwargs.setdefault("save_output", True)
 
     try:

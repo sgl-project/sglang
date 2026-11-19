@@ -4,6 +4,7 @@ import asyncio
 import errno
 import io
 import os
+import tempfile
 import threading
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, wait
@@ -465,6 +466,99 @@ def test_invalid_output_quality_is_a_400_not_a_500(monkeypatch):
         utils.build_sampling_params("request", output_quality="bogus")
     assert exc_info.value.status_code == 400
     assert "output_quality" in exc_info.value.detail
+
+
+def _build_sampling_params_with_captured_kwargs(monkeypatch, server_args):
+    """Patch build_sampling_params to capture (not construct) its kwargs."""
+    captured = {}
+    monkeypatch.setattr(utils, "get_global_server_args", lambda: server_args)
+    monkeypatch.setattr(
+        SamplingParams,
+        "from_user_sampling_params_args",
+        lambda **kw: captured.update(kw) or SimpleNamespace(),
+    )
+    return captured
+
+
+def test_build_sampling_params_rejects_perf_dump_path_outside_output_root(
+    monkeypatch, tmp_path
+):
+    """Regression test for sglang#51555: perf_dump_path reaches code that
+    creates directories and atomically overwrites files, so a client must
+    not point it outside the operator-configured output root."""
+    captured = _build_sampling_params_with_captured_kwargs(
+        monkeypatch,
+        SimpleNamespace(model_path="m", output_path=str(tmp_path)),
+    )
+    with pytest.raises(HTTPException) as exc_info:
+        utils.build_sampling_params(
+            "request", prompt="p", perf_dump_path=str(tmp_path.parent / "evil.json")
+        )
+    assert exc_info.value.status_code == 400
+    assert "perf_dump_path" in exc_info.value.detail
+
+    utils.build_sampling_params(
+        "request", prompt="p", perf_dump_path=str(tmp_path / "report.json")
+    )
+    assert captured["perf_dump_path"] == str(tmp_path / "report.json")
+
+
+def test_build_sampling_params_rejects_output_path_traversal(monkeypatch, tmp_path):
+    captured = _build_sampling_params_with_captured_kwargs(
+        monkeypatch,
+        SimpleNamespace(model_path="m", output_path=str(tmp_path)),
+    )
+    with pytest.raises(HTTPException) as exc_info:
+        utils.build_sampling_params(
+            "request", prompt="p", output_path=str(tmp_path / ".." / "evil")
+        )
+    assert exc_info.value.status_code == 400
+    assert "output_path" in exc_info.value.detail
+
+    utils.build_sampling_params(
+        "request", prompt="p", output_path=str(tmp_path / "sub")
+    )
+    assert captured["output_path"] == str(tmp_path / "sub")
+
+
+def test_build_sampling_params_rejects_traversal_output_file_name(
+    monkeypatch, tmp_path
+):
+    captured = _build_sampling_params_with_captured_kwargs(
+        monkeypatch,
+        SimpleNamespace(model_path="m", output_path=str(tmp_path)),
+    )
+    # output_file_name is joined onto output_path, so a ".." in it would
+    # escape even a contained output_path.
+    for bad_name in ("../evil.mp4", "..\\evil.mp4", "..", "sub/evil.mp4"):
+        with pytest.raises(HTTPException) as exc_info:
+            utils.build_sampling_params(
+                "request", prompt="p", output_file_name=bad_name
+            )
+        assert exc_info.value.status_code == 400
+        assert "output_file_name" in exc_info.value.detail
+
+    utils.build_sampling_params("request", prompt="p", output_file_name="clip.mp4")
+    assert captured["output_file_name"] == "clip.mp4"
+
+
+def test_build_sampling_params_falls_back_to_tempdir_when_output_disabled(
+    monkeypatch,
+):
+    """With no operator-configured output root, only the system temp dir
+    (where the server itself generates temporary output dirs) is allowed."""
+    captured = _build_sampling_params_with_captured_kwargs(
+        monkeypatch, SimpleNamespace(model_path="m")
+    )
+    with pytest.raises(HTTPException) as exc_info:
+        utils.build_sampling_params(
+            "request", prompt="p", perf_dump_path="/var/lib/sglang/evil.json"
+        )
+    assert exc_info.value.status_code == 400
+
+    in_tmp = os.path.join(tempfile.gettempdir(), "report.json")
+    utils.build_sampling_params("request", prompt="p", perf_dump_path=in_tmp)
+    assert captured["perf_dump_path"] == in_tmp
 
 
 @pytest.mark.parametrize(
