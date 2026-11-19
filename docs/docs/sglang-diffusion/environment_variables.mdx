@@ -170,7 +170,7 @@ description: "Configure SGLang diffusion behavior with environment variables."
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>not set</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Optional FlashInfer FP4 GEMM backend override for diffusion NVFP4. When unset, SGLang defaults to <code>flashinfer_trtllm</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Optional FlashInfer FP4 GEMM backend override for diffusion NVFP4. When unset, SGLang uses <code>flashinfer_trtllm</code> (<code>auto</code> on SM120 GPUs).</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DIFFUSION_ENABLE_W8A8_FP8_GEMM</code></td>
