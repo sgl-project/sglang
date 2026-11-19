@@ -73,7 +73,13 @@ class TestDsaDcpBackendDefaults(CustomTestCase):
 class TestDsaDcpBackendConstraints(CustomTestCase):
     def test_hip_dcp_triton_allowed(self):
         _check_dsa_backend_constraints(
-            "fp8_e4m3", "triton", "triton", hip=True, dcp_size=4
+            "fp8_e4m3",
+            "triton",
+            "triton",
+            hip=True,
+            dcp_size=4,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
         )
 
     def test_hip_dcp_rejects_other_backends(self):
@@ -86,12 +92,24 @@ class TestDsaDcpBackendConstraints(CustomTestCase):
             with self.subTest(prefill=prefill, decode=decode):
                 with self.assertRaisesRegex(ValueError, "no DCP path on ROCm"):
                     _check_dsa_backend_constraints(
-                        "fp8_e4m3", prefill, decode, hip=True, dcp_size=4
+                        "fp8_e4m3",
+                        prefill,
+                        decode,
+                        hip=True,
+                        dcp_size=4,
+                        kv_lora_rank=512,
+                        qk_rope_head_dim=64,
                     )
 
     def test_hip_without_dcp_keeps_other_backends(self):
         _check_dsa_backend_constraints(
-            "fp8_e4m3", "tilelang", "tilelang", hip=True, dcp_size=1
+            "fp8_e4m3",
+            "tilelang",
+            "tilelang",
+            hip=True,
+            dcp_size=1,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
         )
 
     def test_trtllm_allowed_only_where_pinned_flashinfer_builds_it(self):
@@ -100,13 +118,25 @@ class TestDsaDcpBackendConstraints(CustomTestCase):
         # turns the (10, 1) case red.
         refusal = "requires SM100/SM103/SM107"
         with patch(_CAPABILITY, return_value=(10, 0)):
-            _check_dsa_backend_constraints("fp8_e4m3", "trtllm", "trtllm", hip=False)
+            _check_dsa_backend_constraints(
+                "fp8_e4m3",
+                "trtllm",
+                "trtllm",
+                hip=False,
+                kv_lora_rank=512,
+                qk_rope_head_dim=64,
+            )
         for capability in ((12, 0), (12, 1), (11, 0), (10, 1), (9, 0)):
             with self.subTest(capability=capability):
                 with patch(_CAPABILITY, return_value=capability):
                     with self.assertRaisesRegex(ValueError, refusal):
                         _check_dsa_backend_constraints(
-                            "fp8_e4m3", "trtllm", "trtllm", hip=False
+                            "fp8_e4m3",
+                            "trtllm",
+                            "trtllm",
+                            hip=False,
+                            kv_lora_rank=512,
+                            qk_rope_head_dim=64,
                         )
 
     def test_refusal_names_the_route_it_accepts_on_sm12x(self):
@@ -115,10 +145,20 @@ class TestDsaDcpBackendConstraints(CustomTestCase):
         with patch(_CAPABILITY, return_value=(12, 0)):
             with self.assertRaisesRegex(ValueError, "tilelang for both phases"):
                 _check_dsa_backend_constraints(
-                    "fp8_e4m3", "trtllm", "trtllm", hip=False
+                    "fp8_e4m3",
+                    "trtllm",
+                    "trtllm",
+                    hip=False,
+                    kv_lora_rank=512,
+                    qk_rope_head_dim=64,
                 )
             _check_dsa_backend_constraints(
-                "fp8_e4m3", "tilelang", "tilelang", hip=False
+                "fp8_e4m3",
+                "tilelang",
+                "tilelang",
+                hip=False,
+                kv_lora_rank=512,
+                qk_rope_head_dim=64,
             )
 
 

@@ -1019,9 +1019,6 @@ class MeshRender:
 
         return torch.from_numpy(texture_inpainted / 255.0).float().to(self.device)
 
-    # Alias for compatibility
-    uv_inpaint = texture_inpaint
-
 
 def array_to_tensor(np_array):
     """Convert numpy array to normalized tensor."""
