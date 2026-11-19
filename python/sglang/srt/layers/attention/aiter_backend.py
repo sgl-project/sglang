@@ -5679,10 +5679,15 @@ class AiterAttnBackend(AttentionBackend):
                     sinks,
                 )
 
-            if self.use_triton_unified_attention:
+            if self.use_triton_unified_attention and (
+                layer.qk_head_dim > 256 or layer.v_head_dim > 256
+            ):
                 # unified_attention has no head_dim cap; route extend through it
-                # so Gemma-4's 512-wide full-attention layers don't hit the CK
-                # `head dimension at most 256` assert.
+                # only where CK cannot run (Gemma-4's 512-wide full-attention
+                # layers hit the CK `head dimension at most 256` assert). For
+                # head_dim <= 256 the CK paged batch_prefill below is much faster
+                # than the Triton unified kernel on prefill-sized Q.
+                # target_verify / draft_extend take unified above regardless.
                 return self._forward_extend_unified(
                     q,
                     layer,
