@@ -73,7 +73,7 @@ def _build_comm() -> Optional[CustomAllReduceV2]:
     )
     if comm.disabled or not comm.has_multicast:
         return None
-    all_reduce.register_comm(comm.obj)
+    all_reduce.register_comm(lambda: comm.obj, world_size=comm.world_size)
     register_comm_cleanup(comm)
     return comm
 

@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import collections
 import logging
+import time
 from enum import Enum
 from typing import TYPE_CHECKING, Callable, Iterable, List, Optional
 
 logger = logging.getLogger(__name__)
+
+import os
 
 import torch
 import torch.nn.functional as F
@@ -37,6 +40,10 @@ from sglang.srt.layers.quantization.base_config import (
 )
 from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.layers.utils.common import set_weight_attrs
+from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
+from sglang.srt.model_executor.runner_utils.prefill_graph import (
+    is_in_prefill_graph_scope,
+)
 from sglang.srt.runtime_context import (
     get_exec,
     get_lora,
@@ -80,16 +87,91 @@ _is_gfx115 = _is_hip and is_gfx115_supported()
 # unquantized layers then skip AITER.
 _skip_aiter_unquant = False
 
+
+def _gfx1250_try_gfx95() -> bool:
+    if os.environ.get("SGLANG_ROCM_MUSE_GFX1250_TRY_GFX95", "1") != "1" or not _is_hip:
+        return False
+    try:
+        return "gfx1250" in torch.cuda.get_device_properties(0).gcnArchName
+    except Exception:
+        return False
+
+
+# gfx1250: the row-major small-M GEMM with its gfx1250 ROW_MAJOR table (tiled / FP8 copies stay gfx950-only).
+_rowmajor_ok = _is_gfx95 or _gfx1250_try_gfx95()
+
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
     from aiter.ops.triton.gemm_a16w16 import gemm_a16w16 as _aiter_triton_a16w16
     from aiter.tuned_gemm import tgemm
+
+    from sglang.srt.layers.quantization.unquant_hip import (
+        a16w16_into,
+        prefer_hipblaslt,
+    )
+
+if _rowmajor_ok:
+    from sglang.kernels.ops.gemm.bf16_tiled_small_m_gemm import (
+        flydsl_gemm,
+        flydsl_gemm_applies,
+        prepare_tiled_weight,
+        rowmajor_gemm,
+        rowmajor_gemm_applies,
+        tiled_gemm,
+        tiled_gemm_applies,
+    )
+    from sglang.kernels.ops.gemm.fp8w_small_m_gemm import (
+        quantize_weight as quantize_fp8w_weight,
+    )
+
+# gfx1250 (Muse Spark TP8): at verify widths of 129..512 rows hipBLASLt beats the untuned
+# default of aiter's tgemm on QKV [2304, 8192], attention O [8192, 1024], DFlash draft QKV
+# [1280, 8192], conv [2048, 8192], gate/up [7168, 8192] and down [8192, 3584].
+# At 128 rows tgemm is as fast or faster.
+_GFX1250_HIPBLASLT_WEIGHTS = frozenset(
+    {(2304, 8192), (8192, 1024), (1280, 8192), (2048, 8192), (7168, 8192), (8192, 3584)}
+)
+_GFX1250_HIPBLASLT_ROWS = range(129, 513)
+try:
+    _is_gfx1250 = (
+        _is_hip and "gfx1250" in torch.cuda.get_device_properties(0).gcnArchName
+    )
+except Exception:
+    _is_gfx1250 = False
 
 # Route supported decode shapes that are absent from the tuned table.
 _A16W16_TRITON_MAX_K = 2048
 _A16W16_TRITON_MAX_M = 64
 _A16W16_TRITON_NARROW_K = 512
 _A16W16_TRITON_NARROW_K_MAX_M = 512
+
+# Unquantized GEMM shapes a model opts into on gfx950 before its weights load
+# (the ROCm Muse Spark model registers its attention O projection and its DFlash
+# draft's MLP; see register_gfx950_unquantized_gemm_shapes):
+# * weight shapes (N, K) whose 17..64-row GEMMs run from a tile-contiguous copy
+#   made in process_weights_after_loading (SGLANG_ROCM_MUSE_DENSE_TILED);
+# * weight shapes (N, K) whose tuned 17..128-row GEMMs read the stored weight
+#   through the same split-K kernel (row-major, no copy; same switch);
+# * weight shapes (N, K) that also keep a per-channel FP8 copy for the FP8 small-M
+#   GEMM a model calls itself with pre-quantized activations (SGLANG_ROCM_MUSE_DENSE_FP8);
+# * exact (M, N, K) GEMMs routed to the aiter Triton a16w16 kernel (wide K, where
+#   the tuned table's pick for the padded M is slower).
+_gfx950_tiled_weight_shapes: set = set()
+_gfx950_rowmajor_weight_shapes: set = set()
+_gfx950_fp8w_weight_shapes: set = set()
+_gfx950_triton_a16w16_shapes: set = set()
+
+
+def register_gfx950_unquantized_gemm_shapes(
+    *, tiled_weights=(), rowmajor_weights=(), fp8_weights=(), triton_a16w16=()
+) -> None:
+    """Opt (N, K) weight shapes into the tiled or row-major small-M GEMM and exact
+    (M, N, K) shapes into the aiter Triton a16w16 GEMM for every unquantized linear
+    layer loaded afterwards in this process. No effect off gfx950."""
+    _gfx950_tiled_weight_shapes.update(tuple(s) for s in tiled_weights)
+    _gfx950_rowmajor_weight_shapes.update(tuple(s) for s in rowmajor_weights)
+    _gfx950_fp8w_weight_shapes.update(tuple(s) for s in fp8_weights)
+    _gfx950_triton_a16w16_shapes.update(tuple(s) for s in triton_a16w16)
 
 
 def _prefer_triton_a16w16(x: torch.Tensor, weight: torch.Tensor) -> bool:
@@ -109,8 +191,10 @@ def _prefer_triton_a16w16(x: torch.Tensor, weight: torch.Tensor) -> bool:
         and x.dtype == torch.bfloat16
         and weight.dtype == torch.bfloat16
         and x.shape[1] == k
-        and 0 < k <= _A16W16_TRITON_MAX_K
-        and 0 < x.shape[0] <= max_m
+        and (
+            (0 < k <= _A16W16_TRITON_MAX_K and 0 < x.shape[0] <= max_m)
+            or (x.shape[0], weight.shape[0], k) in _gfx950_triton_a16w16_shapes
+        )
         and weight.shape[0] > 0
         and x.is_contiguous()
         and weight.is_contiguous()
@@ -148,6 +232,12 @@ _run_direct_dense = None
 _warp_splitk_tactic = None
 _run_warp_splitk_dense = None
 _enable_bf16_splitk_gemm = False
+_mm_bf16 = None
+_flashinfer_autotuner = None
+# CuTe DSL tactics lose to the hand tables and TGV/cuBLAS at M = 24/32.
+_BF16_LOW_M_AUTOTUNE_MAX_M = 16
+# FlashInfer's cute-dsl mm_bf16 raises, rather than falling back, unless K % CTA_K == 0.
+_CUTE_DSL_BF16_CTA_K = 128
 
 # GB300 TP16 tactics measured under CUDA graph replay with PDL and cold weights.
 # Unlisted shapes, including M=64, retain the existing TGV/cuBLAS path.
@@ -389,6 +479,7 @@ def initialize_bf16_gemm_config() -> None:
     global _warp_splitk_tactic, _run_warp_splitk_dense
     global _enable_bf16_splitk_gemm, _use_sm107_splitk_tactics
     global _active_warp_splitk_tactics
+    global _mm_bf16, _flashinfer_autotuner
     global _skip_aiter_unquant
 
     _skip_aiter_unquant = (
@@ -449,6 +540,7 @@ def initialize_bf16_gemm_config() -> None:
     _enable_bf16_splitk_gemm = False
     _use_sm107_splitk_tactics = False
     _active_warp_splitk_tactics = _BF16_WARP_SPLITK_TUNED_TACTICS
+    _mm_bf16 = None
     if backend.is_cutedsl():
         from flashinfer.gemm.kernels.dense_bf16_gemm_direct import (
             default_tactic,
@@ -478,6 +570,12 @@ def initialize_bf16_gemm_config() -> None:
                 **_BF16_SM107_WARP_SPLITK_TUNED_TACTICS,
             }
             _use_sm107_splitk_tactics = True
+        elif not get_exec().kernel.disable_flashinfer_autotune:
+            from flashinfer.autotuner import AutoTuner
+            from flashinfer.gemm import mm_bf16
+
+            _mm_bf16 = mm_bf16
+            _flashinfer_autotuner = AutoTuner.get()
 
     _BF16_GEMM_BACKEND = backend
 
@@ -541,12 +639,61 @@ def _bf16_splitk_gemm(
     return out.view(*x.shape[:-1], weight.shape[0])
 
 
+def _bf16_low_m_autotune(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    out: Optional[torch.Tensor] = None,
+) -> Optional[torch.Tensor]:
+    """Use autotuned low-M kernels for CUDA graphs, avoiding eager dispatch overhead.
+
+    Under FlashInfer autotune, every other eligible call profiles M <= 16 bias-free.
+    """
+    if _mm_bf16 is None:
+        return None
+    m = x.numel() // x.shape[-1]
+    taken = (
+        bias is None
+        and 0 < m <= _BF16_LOW_M_AUTOTUNE_MAX_M
+        and (
+            torch.compiler.is_compiling()
+            or get_is_capture_mode()
+            or is_in_prefill_graph_scope()
+            or (x.is_cuda and torch.cuda.is_current_stream_capturing())
+        )
+    )
+    if not (taken or (m > 0 and _flashinfer_autotuner.is_tuning_mode)):
+        return None
+    if not (
+        x.is_cuda
+        and x.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+        and x.is_contiguous()
+        and weight.is_contiguous()
+        and weight.shape[1] % _CUTE_DSL_BF16_CTA_K == 0
+        and not weight.requires_grad
+    ):
+        return None
+    output = _mm_bf16(
+        x.view(-1, x.shape[-1])[:_BF16_LOW_M_AUTOTUNE_MAX_M],
+        weight.T,
+        None,
+        pdl=True,
+        out=out if taken else None,
+        backend="cute-dsl",
+    )
+    return output.view(*x.shape[:-1], weight.shape[0]) if taken else None
+
+
 def _bf16_gemm_dispatch_impl(
     x: torch.Tensor,
     weight: torch.Tensor,
     bias: Optional[torch.Tensor],
     addend: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    output = _bf16_low_m_autotune(x, weight, bias)
+    if output is not None:
+        return output if addend is None else output.add_(addend)
     m = x.numel() // x.shape[-1]
     if _enable_bf16_splitk_gemm and use_bf16_splitk_gemm(
         m, weight.shape[0], weight.shape[1]
@@ -596,6 +743,47 @@ def bf16_gemm_dispatch(
     return _bf16_gemm_dispatch_impl(x, weight, bias)
 
 
+def warmup_bf16_gemms(model: torch.nn.Module, max_m: int) -> None:
+    from sglang.srt.layers.linear import LinearBase
+
+    weights = {}
+    for module in model.modules():
+        if not isinstance(module, LinearBase) or not isinstance(
+            module.quant_method, UnquantizedLinearMethod
+        ):
+            continue
+        w = module.weight
+        if w.dim() == 2 and w.dtype == torch.bfloat16:
+            weights.setdefault((tuple(w.shape), w.stride()), w)
+    ms = set()
+    p = 1
+    while p <= max_m:
+        # cuBLASLt picks kernels per M, including by M alignment.
+        ms.update((p, p + 1, p * 3 // 2, p * 3 // 2 + 7))
+        p *= 2
+    ms = sorted(m for m in ms if m <= max_m)
+    tic = time.perf_counter()
+    with torch.inference_mode():
+        for w in weights.values():
+            n, k = w.shape
+            x = torch.zeros((max_m, k), dtype=torch.bfloat16, device=w.device)
+            for m in ms:
+                _bf16_gemm_dispatch_impl(x[:m], w, None)
+                _bf16_gemm_dispatch_impl(
+                    x[:m],
+                    w,
+                    None,
+                    addend=torch.zeros((m, n), dtype=w.dtype, device=w.device),
+                )
+            del x
+        torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    logger.info(
+        f"bf16 GEMM warmup: {len(weights)} weight shapes x {len(ms)} M values "
+        f"(max {max_m}) in {time.perf_counter() - tic:.1f}s"
+    )
+
+
 def _can_accumulate_into_addend(
     *,
     weight: torch.Tensor,
@@ -620,6 +808,10 @@ def _can_accumulate_into_addend(
         and addend.shape == (x.shape[0], weight.shape[0])
         and not (x.requires_grad or addend.requires_grad or weight.requires_grad)
     )
+
+
+def bf16_gemm_needs_autotune() -> bool:
+    return _mm_bf16 is not None
 
 
 def get_bf16_gemm_backend() -> Bf16GemmBackend:
@@ -792,6 +984,31 @@ class UnquantizedLinearMethod(LinearMethodBase):
             _amx_process_weight_after_loading(layer, ["weight"])
         else:
             layer.weight.data = maybe_pad_weight_for_gfx115(layer.weight.data)
+        # gfx950 only: the tiled launches are tuned there.
+        if (
+            _is_gfx95
+            and _gfx950_tiled_weight_shapes
+            and envs.SGLANG_ROCM_MUSE_DENSE_TILED.get()
+            and type(layer.weight.data) is torch.Tensor
+            and tuple(layer.weight.shape) in _gfx950_tiled_weight_shapes
+        ):
+            # Remade on every weight load, from the loaded values.
+            layer.small_m_tiled_weight = prepare_tiled_weight(layer.weight.data)
+        layer.small_m_rowmajor = (
+            _rowmajor_ok
+            and envs.SGLANG_ROCM_MUSE_DENSE_TILED.get()
+            and type(layer.weight.data) is torch.Tensor
+            and tuple(layer.weight.shape) in _gfx950_rowmajor_weight_shapes
+        )
+        # FP8 copy (+ per-channel scales) beside the BF16 weight; remade on every weight load.
+        layer.small_m_fp8_weight = (
+            quantize_fp8w_weight(layer.weight.data)
+            if _is_gfx95
+            and envs.SGLANG_ROCM_MUSE_DENSE_FP8.get()
+            and type(layer.weight.data) is torch.Tensor
+            and tuple(layer.weight.shape) in _gfx950_fp8w_weight_shapes
+            else None
+        )
 
     def apply(
         self,
@@ -799,6 +1016,15 @@ class UnquantizedLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if (
+            getattr(layer, "small_m_rowmajor", False)
+            and bias is None
+            and rowmajor_gemm_applies(x, layer.weight)
+        ):
+            return rowmajor_gemm(x, layer.weight)
+        tiled = getattr(layer, "small_m_tiled_weight", None)
+        if tiled is not None and bias is None and tiled_gemm_applies(x, tiled):
+            return tiled_gemm(x, tiled, *layer.weight.shape)
         if use_intel_amx_backend(layer):
             x_shapes = x.shape
             if len(x_shapes) == 3:
@@ -818,8 +1044,24 @@ class UnquantizedLinearMethod(LinearMethodBase):
             and not _skip_aiter_unquant
             and type(layer.weight.data) is torch.Tensor
         ):
-            if _is_gfx95 and _prefer_triton_a16w16(x, layer.weight):
+            if x.dim() == 2 and prefer_hipblaslt(x.shape[0], *layer.weight.shape):
+                return F.linear(x, layer.weight, bias)
+            if (
+                _rowmajor_ok
+                and _is_gfx1250
+                and bias is None
+                and flydsl_gemm_applies(x, layer.weight, x.dtype)
+            ):
+                return flydsl_gemm(x, layer.weight)
+            if _rowmajor_ok and _prefer_triton_a16w16(x, layer.weight):
                 return _aiter_triton_a16w16(x, layer.weight, bias, dtype=x.dtype)
+            if (
+                _is_gfx1250
+                and x.dim() == 2
+                and x.shape[0] in _GFX1250_HIPBLASLT_ROWS
+                and tuple(layer.weight.shape) in _GFX1250_HIPBLASLT_WEIGHTS
+            ):
+                return F.linear(x, layer.weight, bias)
             return tgemm.mm(x, layer.weight, bias, otype=x.dtype)
 
         elif (
@@ -839,6 +1081,10 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 return bf16_gemm_dispatch(x, layer.weight, bias)
             return _bf16_gemm_dispatch_impl(x, layer.weight, bias)
 
+        if bias is not None:
+            # RowParallelLinear holds its bias on TP rank 0 only, and FlashInfer
+            # syncs each tuning call across TP ranks.
+            _bf16_low_m_autotune(x, layer.weight, bias)
         return F.linear(x, layer.weight, bias)
 
     def apply_with_addend(
@@ -868,6 +1114,14 @@ class UnquantizedLinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run an inference-only BF16 linear into caller-owned storage."""
+        if (
+            x.ndim == 2
+            and output.dtype == torch.bfloat16
+            and output.is_contiguous()
+            and output.shape == (x.shape[0], layer.weight.shape[0])
+            and _bf16_low_m_autotune(x, layer.weight, bias, out=output) is not None
+        ):
+            return output
         if (
             _enable_bf16_splitk_gemm
             and bias is None
@@ -913,13 +1167,15 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 f"linear output has shape {output.shape}, expected "
                 f"{(x.shape[0], layer.weight.shape[0])}"
             )
+        if _use_aiter and bias is None and a16w16_into(x, layer.weight, output):
+            return output
         torch.mm(x, layer.weight.t(), out=output)
         if bias is not None:
             output.add_(bias)
         return output
 
 
-def _use_xpu_moe_ld_padding(use_triton_kernels: bool) -> bool:
+def _use_xpu_moe_ld_padding() -> bool:
     """Whether MoE expert weights should get a padded row stride for XPU.
 
     is_xpu() only tells us an XPU exists on this machine, not that the weights
@@ -930,14 +1186,12 @@ def _use_xpu_moe_ld_padding(use_triton_kernels: bool) -> bool:
     backends' MoE kernels expect contiguous expert tensors.
 
     The Triton path stores B transposed and does not read a row stride, so it
-    is excluded even on XPU (either via --moe-runner-backend triton or the
-    triton_kernels build).
+    is excluded even on XPU (--moe-runner-backend triton).
     """
     return (
         is_xpu()
         and not get_moe_runner_backend().is_triton()
         and torch.get_default_device().type == "xpu"
-        and not use_triton_kernels
     )
 
 
@@ -987,13 +1241,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
 
     def __init__(
         self,
-        use_triton_kernels: bool = False,
         use_flashinfer_trtllm_moe: bool = False,
         use_deep_gemm: bool = False,
     ):
         super().__init__()
         self.use_flashinfer_cutlass = get_moe_runner_backend().is_flashinfer_cutlass()
-        self.use_triton_kernels = use_triton_kernels
         self.with_bias = False
         self.use_flashinfer_trtllm_moe = use_flashinfer_trtllm_moe
         self.use_deep_gemm = use_deep_gemm
@@ -1024,7 +1276,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         # XPU only: the sgl-kernel-xpu grouped GEMM honours the weights' row
         # stride, so it can be padded to dodge L3 set aliasing on unlucky K
         # dims. Every other device allocates plainly, exactly as before.
-        pad_ld_for_xpu = _use_xpu_moe_ld_padding(self.use_triton_kernels)
+        pad_ld_for_xpu = _use_xpu_moe_ld_padding()
 
         # Fused gate_up_proj (column parallel)
         w13_up_dim = (
@@ -1033,8 +1285,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             else intermediate_size_per_partition
         )
         w13_weight_n, w13_weight_k = (w13_up_dim, hidden_size)
-        if self.use_triton_kernels:
-            w13_weight_n, w13_weight_k = w13_weight_k, w13_weight_n
         if pad_ld_for_xpu:
             w13_weight_data = _empty_xpu_moe_expert_weight(
                 num_experts, w13_weight_n, w13_weight_k, params_dtype
@@ -1060,8 +1310,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             hidden_size,
             intermediate_size_per_partition,
         )
-        if self.use_triton_kernels:
-            w2_weight_n, w2_weight_k = w2_weight_k, w2_weight_n
         if pad_ld_for_xpu:
             w2_weight_data = _empty_xpu_moe_expert_weight(
                 num_experts, w2_weight_n, w2_weight_k, params_dtype
@@ -1097,10 +1345,15 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             copy_or_rebind_param(
                 layer, "w13_weight", shuffle_weight(layer.w13_weight.data, (16, 16))
             )
+            # copy_or_rebind_param copies the shuffled data into the existing
+            # Parameter, which drops the is_shuffled marker set by shuffle_weight.
+            # aiter.fused_moe uses it to select the preshuffled MoE kernels.
+            layer.w13_weight.is_shuffled = True
             torch.cuda.empty_cache()
             copy_or_rebind_param(
                 layer, "w2_weight", shuffle_weight(layer.w2_weight.data, (16, 16))
             )
+            layer.w2_weight.is_shuffled = True
             torch.cuda.empty_cache()
 
         # Pack weight for get better performance on CPU
@@ -1419,8 +1672,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             backend = MoeRunnerBackend.FLASHINFER_CUTLASS
         elif self.use_deep_gemm:
             backend = MoeRunnerBackend.DEEP_GEMM
-        elif self.use_triton_kernels:
-            backend = MoeRunnerBackend.TRITON_KERNELS
         elif _is_npu:
             layer.w13_kernel = NPUUnquantMoEMethod()
             layer.w2_kernel = NPUUnquantMoEMethod()
@@ -1498,19 +1749,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         x = dispatch_output.hidden_states
 
         backend = self.runner.runner_backend
-        if backend.is_triton_kernels():
-            from sglang.srt.layers.moe.moe_runner.triton_kernels import (
-                TritonKernelsQuantInfo,
-            )
-
-            quant_info = TritonKernelsQuantInfo(
-                w13_weight=layer.w13_weight,
-                w2_weight=layer.w2_weight,
-                w13_bias=getattr(layer, "w13_weight_bias", None),
-                w2_bias=getattr(layer, "w2_weight_bias", None),
-            )
-            return self.runner.run(dispatch_output, quant_info)
-        elif self.runner.runner_backend.is_deep_gemm():
+        if backend.is_deep_gemm():
             w13_weight = layer.w13_weight
             w2_weight = layer.w2_weight
             from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo

@@ -16,6 +16,9 @@ Adding a quantization method means adding a subclass to ``FORMATS``.
 
 from __future__ import annotations
 
+import contextlib
+import logging
+import threading
 from abc import ABC, abstractmethod
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -66,6 +69,37 @@ def expert_params(layer, num_slots: int) -> Tuple[str, ...]:
     )
 
 
+class _QuietThread(logging.Filter):
+    """Drops the info (and lower) records of one thread."""
+
+    def __init__(self, thread: int):
+        super().__init__()
+        self.thread = thread
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.thread != self.thread or record.levelno > logging.INFO
+
+
+@contextlib.contextmanager
+def _quiet():
+    """This thread's info logs off while a post-load step runs again; other threads (the
+    expert cache's writer) log as usual."""
+    quiet = _QuietThread(threading.get_ident())
+    loggers = [logging.root] + [
+        lg
+        for lg in list(logging.root.manager.loggerDict.values())
+        if isinstance(lg, logging.Logger)
+    ]
+    handlers = {id(h): h for lg in loggers for h in lg.handlers}.values()
+    for handler in handlers:
+        handler.addFilter(quiet)
+    try:
+        yield
+    finally:
+        for handler in handlers:
+            handler.removeFilter(quiet)
+
+
 class PostLoad:
     """The base method's post-load step on given experts' loaded rows: a repack runs on a
     layer of K slots, each time from the layer's state before the first run; any other step
@@ -80,6 +114,8 @@ class PostLoad:
         # The step records state on the layer (e.g. that it has run); each run starts from
         # the state before the first.
         self._state = {k: v for k, v in vars(layer).items() if k not in _MODULE_ATTRS}
+        self._params = set(layer._parameters)
+        self._runs = 0
 
     def run(
         self, experts: Sequence[int], out: Optional[Dict[str, torch.Tensor]] = None
@@ -101,7 +137,10 @@ class PostLoad:
             fresh.__dict__.update(template.__dict__)
             fresh.data.copy_(rows[name])
             layer.register_parameter(name, fresh)
-        self.base_method.process_weights_after_loading(layer)
+        # The step's info logs (e.g. "Preparing MXFP4 experts ...") once per layer, not per run.
+        with _quiet() if self._runs else contextlib.nullcontext():
+            self.base_method.process_weights_after_loading(layer)
+        self._runs += 1
         names = [
             n for n in expert_params(layer, self.num_slots) if n not in self.unpaged
         ]
@@ -171,6 +210,11 @@ class PostLoad:
             delattr(layer, k)
         for k, v in self._state.items():
             setattr(layer, k, v)
+        # Parameters the step created in the last run: it may read them in place of the ones
+        # a run loads (MXFP4 Marlin prefers `w13_weight_scale` to the loaded
+        # `w13_weight_scale_inv`).
+        for name in [name for name in layer._parameters if name not in self._params]:
+            delattr(layer, name)
         for name, template in self._templates.items():
             layer.register_parameter(name, template)
 
@@ -317,6 +361,21 @@ class Mxfp4Format(ExpertFormat):
         return isinstance(base_method, Mxfp4MoEMethod)
 
 
+class Fp8Mxfp4ExpertsFormat(ExpertFormat):
+    """MXFP4 routed experts in an FP8 checkpoint (DeepSeek-V4, or any checkpoint with
+    ``routed_experts_quant_method: mxfp4``), served by the Marlin runner."""
+
+    label = "MXFP4 routed experts of an FP8 checkpoint (Marlin)"
+
+    @classmethod
+    def supports(cls, base_method, scheme) -> bool:
+        from sglang.srt.layers.quantization.mxfp4_marlin_moe import (
+            Mxfp4MarlinMoEMethod,
+        )
+
+        return isinstance(base_method, Mxfp4MarlinMoEMethod)
+
+
 class ModelOptNvfp4Format(ExpertFormat):
     label = "ModelOpt NVFP4"
     # Swizzled block scales serve FlashInfer's kernels, not Marlin's.
@@ -405,6 +464,7 @@ FORMATS = (
     GptqFormat,
     AwqFormat,
     Mxfp4Format,
+    Fp8Mxfp4ExpertsFormat,
     ModelOptNvfp4Format,
     CompressedTensorsWNA16Format,
     CompressedTensorsNvfp4Format,

@@ -25,6 +25,7 @@ from typing import List, Optional, Union
 import torch
 import torch.distributed as dist
 
+from sglang.srt.beam_search.trie_output_head import configure_model_trie_output_heads
 from sglang.srt.configs.draft_parallel import DraftParallelLayout
 from sglang.srt.configs.load_config import (
     _DEFAULT_LOAD_GROUP,
@@ -35,6 +36,7 @@ from sglang.srt.configs.model_config import (
     AttentionArch,
     ModelConfig,
     ModelImpl,
+    is_kimi_k31,
 )
 from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
 from sglang.srt.debug_utils.dumper import dumper
@@ -80,7 +82,10 @@ from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
 from sglang.srt.kernel_plugins.amd.binding import (
     install_monokernel_forward,
 )
-from sglang.srt.kernel_plugins.nvidia.binding import install_megakernel
+from sglang.srt.kernel_plugins.nvidia.binding import (
+    install_megakernel,
+    megakernel_state,
+)
 from sglang.srt.kv_canary.api import install_canary
 from sglang.srt.kv_canary.runner.canary_manager import CanaryManager, context_tuple
 from sglang.srt.kv_canary.token_oracle.install import install_token_oracle_from_env
@@ -112,6 +117,7 @@ from sglang.srt.mem_cache.kv_cache_configurator import (
 )
 from sglang.srt.mem_cache.kv_weight_version_tracker import KvWeightVersionRecord
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -148,6 +154,7 @@ from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
     drop_elastic_cuda_graph_state,
     finalize_cuda_graph_capture,
     recapture_elastic_cuda_graph,
+    release_decode_cuda_graph,
     resolve_elastic_cuda_graph_config,
     sync_elastic_cuda_graph_config,
     validate_elastic_cuda_graph_recapture,
@@ -217,7 +224,6 @@ from sglang.srt.runtime_context import (
     get_lora,
     get_memory,
     get_model,
-    get_observability,
     get_parallel,
     get_schedule,
     get_spec,
@@ -248,7 +254,6 @@ from sglang.srt.state_capturer.routed_experts import (
 )
 from sglang.srt.utils import (
     cpu_has_amx_support,
-    enable_show_time_cost,
     get_available_gpu_memory,
     is_host_cpu_arm64,
     is_npu,
@@ -456,10 +461,6 @@ class ModelRunner:
 
         # Auxiliary hidden capture: from the draft, or --enable-return-aux-hidden-states.
         self.init_spec_aux_hidden_state()
-
-        # Apply the rank zero filter to logger
-        if get_observability().show_time_cost:
-            enable_show_time_cost()
 
         misc_utils.maybe_disable_chunked_prefix_cache(
             use_mla_backend=self.use_mla_backend,
@@ -689,6 +690,7 @@ class ModelRunner:
         # The replica count that shares this KV budget is the deployment's, not
         # the one a draft scope reports; the pool is allocated outside any scope,
         # so the PP width comes from the runner's own group.
+        own_state = megakernel_state(self.model)
         self.kv_cache_configurator = KVCacheConfigurator(
             device=self.device,
             gpu_id=self.gpu_id,
@@ -722,6 +724,13 @@ class ModelRunner:
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             memory_pool_config=self.memory_pool_config,
             draft_model_idx=self.draft_model_idx,
+            extra_mamba_cache_bytes_per_req=(
+                0 if own_state is None else own_state.state_bytes_per_slot
+            ),
+            extra_mamba_cache_bytes_per_request_row=(
+                0 if own_state is None else own_state.state_bytes_per_request_row
+            ),
+            allocate_intermediate_ssm=own_state is None or own_state.keeps_draft_ssm,
         )
 
     def init_mindspore_runner(self):
@@ -754,6 +763,7 @@ class ModelRunner:
                 model=self.model, model_config=self.model_config
             )
         prepare_moe_topk(model=self.model, model_config=self.model_config)
+        self.maybe_warmup_bf16_gemms()
 
         self.maybe_init_dwdp()
 
@@ -771,6 +781,12 @@ class ModelRunner:
         )
         self.maybe_apply_post_load_model_transforms()
         self.maybe_init_lora_manager()
+        self.beam_trie_compact_enabled = configure_model_trie_output_heads(
+            self.model,
+            self.model_config,
+            self.device,
+            lora_enabled=self.lora_manager is not None,
+        )
         self.maybe_enable_batch_invariant_mode()
         self.configure_kv_cache_dtype()
         # after every post-load change to the model, before the KV cache is sized
@@ -1306,6 +1322,8 @@ class ModelRunner:
                     self.max_token_pool_size
                 ),
                 max_running_requests=self.max_running_requests,
+                stage_start_layer=self.layer_info.start_layer,
+                stage_end_layer=self.layer_info.end_layer,
                 device=self.device,
             )
         )
@@ -1339,6 +1357,18 @@ class ModelRunner:
         # value from the context where it is used.
         self.pp_group = get_parallel().pp_group
 
+    def maybe_warmup_bf16_gemms(self):
+        """Load cuBLASLt's kernel libraries, which CUDA_MODULE_LOADING=EAGER does not
+        cover; a first load during a PP prefill can hang in cuLibraryLoadData."""
+        max_m = envs.SGLANG_WARMUP_BF16_GEMM_MAX_M.get()
+        if max_m is None:
+            max_m = 16384 if is_kimi_k31(self.model_config.hf_config) else 0
+        if max_m <= 0 or self.device != "cuda":
+            return
+        from sglang.srt.layers.quantization.unquant import warmup_bf16_gemms
+
+        warmup_bf16_gemms(self.model, max_m)
+
     def load_model(self):
         tic_total = time.perf_counter()
         before_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
@@ -1366,6 +1396,7 @@ class ModelRunner:
             draft_model_idx=self.draft_model_idx,
             weight_cache_mode=get_model().weight_cache_mode,
             weight_cache_socket=get_model().weight_cache_socket,
+            weight_cache_transport=get_model().weight_cache_transport,
             load_group=self.load_group,
         )
 
@@ -1638,10 +1669,14 @@ class ModelRunner:
 
     def configure_kv_cache_dtype(self):
         spec_algorithm = getattr(self, "spec_algorithm", None)
-        resolved_kv_cache_dtype, self.kv_cache_dtype = (
+        # Backends read this runner's own label, not get_model().kv_cache_dtype:
+        # a draft runner does not publish its args, so that would be the target's.
+        self.kv_cache_dtype_str, self.kv_cache_dtype = (
             kv_cache_dtype.configure_kv_cache_dtype(
                 server_args_kv_cache_dtype=get_model().kv_cache_dtype,
-                model=getattr(self, "model", None),
+                quant_config=getattr(
+                    getattr(self, "model", None), "quant_config", None
+                ),
                 model_dtype=getattr(self, "dtype", torch.bfloat16),
                 is_draft_worker=getattr(self, "is_draft_worker", False),
                 is_dflash=(
@@ -1652,15 +1687,6 @@ class ModelRunner:
                 speculative_draft_attention_backend=self.draft_attention_backend,
                 speculative_draft_kv_cache_dtype=get_spec().speculative_draft_kv_cache_dtype,
             )
-        )
-        # This runner's OWN resolved dtype string (target or draft). Attention
-        # backends read it directly instead of the process-global get_model()
-        # bag: a draft runner does not publish its args, so the bag would carry
-        # the target's dtype and mis-drive the draft's FP8 cast/descale paths.
-        self.kv_cache_dtype_str = (
-            resolved_kv_cache_dtype
-            if resolved_kv_cache_dtype is not None
-            else get_model().kv_cache_dtype
         )
 
     def _get_attention_backend(self, init_new_workspace: bool = False):
@@ -1704,6 +1730,9 @@ class ModelRunner:
             self.capture_tail_hooks.append(self.uocr_greedy_graph.capture_tail_hook)
 
     def init_decode_cuda_graph(self):
+        release_decode_cuda_graph(
+            decode_runner=self.decode_cuda_graph_runner, eager_runner=self.eager_runner
+        )
         self.decode_cuda_graph_runner = None
         capture = capture_decode_graph(model_runner=self)
         self.decode_cuda_graph_runner = capture.runner
@@ -1894,6 +1923,10 @@ class ModelRunner:
 
         self.forward_pass_id += 1
 
+        # On the forward stream, outside every CUDA graph: orders a reused row's
+        # reset after its previous request's last forward.
+        self._reset_new_request_rows()
+
         # Try msprob debugger
         if self.msprobe_debugger is not None:
             rank_id = self.gpu_id if get_parallel().dp_size > 1 else None
@@ -1945,6 +1978,11 @@ class ModelRunner:
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
         if isinstance(output.logits_output, LogitsProcessorOutput):
             output.logits_output.own_customized_info()
+        if (
+            not self.is_draft_worker
+            and (placement := getattr(self.model, "expert_placement", None)) is not None
+        ):
+            placement.on_forward_end(forward_batch)
 
         no_copy_to_cpu = not get_schedule().disable_overlap_schedule
         if (
@@ -1988,6 +2026,13 @@ class ModelRunner:
             self.maybe_join_ep_ranks()
 
         return output
+
+    def _reset_new_request_rows(self) -> None:
+        if self.req_to_token_pool is None or self.token_to_kv_pool_allocator is None:
+            return
+        kv_storage_of(
+            self.req_to_token_pool, self.token_to_kv_pool_allocator
+        ).reset_new_rows()
 
     def _maybe_execute_deferred_mamba_cow_and_clear(
         self, forward_batch: ForwardBatch
@@ -2039,6 +2084,15 @@ class ModelRunner:
                     state_ids.ids(forward_batch.mamba_cow_src_indices),
                     state_ids.ids(forward_batch.mamba_cow_dst_indices),
                 )
+        own_state = self.token_to_kv_pool_allocator.state.own_state
+        if own_state is not None:
+            # On the forward stream, graphed extend or not.
+            own_state.reset_state_slots(
+                self.runner_ids.state_ids(pool.state_sub_pool).ids(
+                    pool.get_mamba_indices(forward_batch.req_pool_indices)
+                ),
+                forward_batch.req_pool_indices,
+            )
         forward_batch.mamba_clear_indices = None
         forward_batch.mamba_cow_src_indices = None
         forward_batch.mamba_cow_dst_indices = None
