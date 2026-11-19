@@ -561,6 +561,8 @@ jobs:
       test_case: ${{ matrix.test_config.test_case }}
       image: ${{ needs.set-image-config.outputs.image_a3 }}
       prefill_decode_deployment: 'mix'
+      # Diagnose the published image's runtime code, not checkout Python code.
+      use_image_sglang: ${{ matrix.test_config.name == 'kimi_k3_w4a8_32p_gpqa' && 'true' || '' }}
       transformers_version: ''
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
       accuracy_dataset: ${{ matrix.test_config.test_type == 'accuracy' && needs.set-image-config.outputs.accuracy_dataset || '' }}
