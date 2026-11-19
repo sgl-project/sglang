@@ -308,7 +308,8 @@ class RustServer:
         return mm_spec
 
     def _start_multimodal(self, scheduler: Scheduler) -> None:
-        """Start the Rust workers for the pipeline ``launch`` resolved."""
+        """Start the MM workers for the pipeline ``launch`` resolved, or for
+        the Python processor when it resolved none."""
         workers = get_mm().mm_processor_worker_num or RustMmProcessor.AUTO_MM_WORKERS
         if self.mm_spec is None:
             self.server.start_python_mm_workers(
@@ -937,7 +938,9 @@ class RustServer:
                     )
                 # Bind all wrappers, including external packages. Only the
                 # 32-byte worker digest is hashed on the scheduler thread.
-                item.bind_processor_fingerprint(self._mm_cache_namespace)
+                # A Python processor (the fallback) has bound its own items.
+                if item.processor_fingerprint is None:
+                    item.bind_processor_fingerprint(self._mm_cache_namespace)
             if obj.mm_inputs.padded_input_ids is not None:
                 obj.mm_inputs.padded_input_ids = obj.mm_inputs.build_padded_input_ids(
                     obj.mm_inputs.input_ids, obj.mm_inputs.mm_items

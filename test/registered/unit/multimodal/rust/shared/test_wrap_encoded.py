@@ -374,6 +374,31 @@ class TestDrainShmOwnership(TestWrapEncodedShm):
         self.assertNotEqual(identities[0], identities[1])
         self.assertEqual(identities[0], identities[2])
 
+    def test_drain_admits_python_fallback_items_bound_by_their_processor(self):
+        """A Python processor binds its own cache fingerprint to each item; the
+        drain must admit such an item, not reject it as another processor's."""
+        import pickle
+
+        import torch
+
+        item = MultimodalDataItem(modality=Modality.IMAGE, feature=torch.zeros(2, 3))
+        item.set_pad_value()
+        item.bind_processor_fingerprint("sha256:" + "ab" * 32)
+        payload = pickle.dumps(MultimodalProcessorOutput(mm_items=[item]))
+        words = np.zeros(-(-len(payload) // 8), dtype=np.int64)
+        words.view(np.uint8)[: len(payload)] = np.frombuffer(payload, dtype=np.uint8)
+        buffers = {
+            "input_ids": np.arange(4, dtype=np.int64),
+            "mm.feature.0": words,
+            "mm.meta": np.frombuffer(msgspec.msgpack.encode({}), dtype=np.uint8),
+        }
+        server, errors = self._server(self._header("fallback"), buffers)
+        server.mm_spec = None
+        drained = server.drain(8)
+        self.assertEqual(errors, [])
+        (obj,) = drained
+        self.assertEqual(obj.mm_inputs.mm_items[0].identity, item.identity)
+
     def test_external_wrapper_never_touches_ownership(self):
         """An external package's `_wrap_mm_result` builds stubs from the
         segment names and knows nothing about release/discard. Its segments

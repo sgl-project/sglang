@@ -449,6 +449,7 @@ class PythonMmFallback:
         processor,
         max_req_input_len: int,
     ):
+        from sglang.srt.hf_transformers.common import get_tokenizer_from_processor
         from sglang.srt.managers.multimodal_processor import get_mm_processor
 
         # In-process: no feature transport, as for the scheduler's own processor.
@@ -461,6 +462,7 @@ class PythonMmFallback:
             skip_mm_pool=True,
         )
         self._max_req_input_len = max_req_input_len
+        self._tokenizer = get_tokenizer_from_processor(processor)
         # The processors are async and own their executors: one loop serves them all.
         self._loop = asyncio.new_event_loop()
         threading.Thread(
@@ -476,10 +478,14 @@ class PythonMmFallback:
             video_data=videos or None,
             audio_data=audios or None,
         )
+        prompt = input_ids
+        if not self._mm_processor.prefer_tokenized_input:
+            # The Python frontend hands these processors the prompt text.
+            prompt = self._tokenizer.decode(input_ids)
         coro = self._mm_processor.process_mm_data_async(
             image_data=request.image_data,
             audio_data=request.audio_data,
-            input_text=input_ids,
+            input_text=prompt,
             request_obj=request,
             max_req_input_len=self._max_req_input_len,
         )
@@ -487,6 +493,7 @@ class PythonMmFallback:
         # The drain requires a full identity on every item; hash here, off the scheduler loop.
         for item in output.mm_items:
             item.set_pad_value()
+        self._mm_processor.finalize_cache_identities(output)
         ids = input_ids if output.input_ids is None else output.input_ids
         return ids, pickle.dumps(output, protocol=pickle.HIGHEST_PROTOCOL)
 
