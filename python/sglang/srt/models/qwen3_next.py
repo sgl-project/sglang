@@ -13,6 +13,7 @@ from sglang.kernels.ops.attention.qk_gemma_norm_rope import qk_gemma_norm_rope
 from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
     fused_qkvzba_split_reshape_cat,
 )
+from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
 from sglang.srt.configs.qwen3_next import Qwen3NextConfig
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -83,7 +84,6 @@ logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_npu = is_npu()
 _is_cpu = is_cpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
@@ -955,7 +955,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
             q_gate = q_gate.view(*orig_shape, self.num_heads, -1)
             q, gate = torch.chunk(q_gate, 2, dim=-1)
             q = q.reshape(*orig_shape, -1)
-            gate = gate.reshape(*orig_shape, -1)
+            # gate stays as 3D strided view; fused_sigmoid_mul handles it directly
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
             gate = None
@@ -1018,15 +1018,14 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         attn_output = self.attn(q, k, v, forward_batch)
 
         if self.attn_output_gate:
-            if _is_hip:
-                from sglang.kernels.ops.elementwise.elementwise import (
-                    fused_sigmoid_mul,
+            if _is_cuda or _is_hip:
+                # round_sigmoid keeps CUDA bit-identical to torch sigmoid-then-mul.
+                attn_output = fused_sigmoid_mul(
+                    attn_output, gate, inplace=True, round_sigmoid=_is_cuda
                 )
-
-                attn_output = fused_sigmoid_mul(attn_output, gate)
             else:
-                gate = torch.sigmoid(gate)
-                attn_output = attn_output * gate
+                gate = gate.reshape(gate.shape[0], -1)
+                attn_output = attn_output * torch.sigmoid(gate)
 
         output, _ = self.o_proj(attn_output)
         return output

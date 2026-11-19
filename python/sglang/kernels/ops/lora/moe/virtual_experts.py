@@ -488,21 +488,6 @@ def _align_block_size_large(
         return _align_block_size_torch(topk_ids, block_size, num_experts)
 
 
-def _merged_experts_fused_moe_lora_add_fake(
-    output: torch.Tensor,
-    hidden_states: torch.Tensor,
-    lora_a: torch.Tensor,
-    lora_b: torch.Tensor,
-    topk_ids: torch.Tensor,
-    topk_weights: torch.Tensor,
-    token_lora_mapping: torch.Tensor,
-    mul_routed_weight: bool,
-    experts_shared_outer_loras_a: bool,
-    experts_shared_outer_loras_b: bool,
-) -> None:
-    return
-
-
 def _merged_experts_fused_moe_lora_add_impl(
     output: torch.Tensor,
     hidden_states: torch.Tensor,
@@ -732,42 +717,6 @@ def _merged_experts_fused_moe_lora_add_impl(
         router_topk=topk_ids.shape[1],
         a_output_slices=a_output_slices,
     )
-
-
-def _merged_experts_fused_moe_lora_add_op(
-    output: torch.Tensor,
-    hidden_states: torch.Tensor,
-    lora_a: torch.Tensor,
-    lora_b: torch.Tensor,
-    topk_ids: torch.Tensor,
-    topk_weights: torch.Tensor,
-    token_lora_mapping: torch.Tensor,
-    mul_routed_weight: bool,
-    experts_shared_outer_loras_a: bool,
-    experts_shared_outer_loras_b: bool,
-) -> None:
-    _merged_experts_fused_moe_lora_add_impl(
-        output,
-        hidden_states,
-        lora_a,
-        lora_b,
-        topk_ids,
-        topk_weights,
-        token_lora_mapping,
-        mul_routed_weight,
-        experts_shared_outer_loras_a,
-        experts_shared_outer_loras_b,
-    )
-
-
-from sglang.srt.utils.custom_op import direct_register_custom_op
-
-direct_register_custom_op(
-    op_name="merged_experts_fused_moe_lora_add",
-    op_func=_merged_experts_fused_moe_lora_add_op,
-    mutates_args=["output"],
-    fake_impl=_merged_experts_fused_moe_lora_add_fake,
-)
 
 
 def merged_experts_fused_moe_lora_add(

@@ -60,17 +60,8 @@ class ToleranceConfig:
     @classmethod
     def load_profile(cls, all_tolerances: dict, profile_name: str) -> ToleranceConfig:
         """Load a specific tolerance profile from a dictionary of profiles."""
-        # Support both flat structure (backward compatibility) and profiled structure
-        if "e2e" in all_tolerances and not isinstance(all_tolerances["e2e"], dict):
-            tol_data = all_tolerances
-            actual_profile = "legacy/flat"
-        else:
-            tol_data = all_tolerances.get(
-                profile_name, all_tolerances.get("pr_test", {})
-            )
-            actual_profile = (
-                profile_name if profile_name in all_tolerances else "pr_test"
-            )
+        tol_data = all_tolerances.get(profile_name, all_tolerances.get("pr_test", {}))
+        actual_profile = profile_name if profile_name in all_tolerances else "pr_test"
 
         if not tol_data:
             raise ValueError(
@@ -177,7 +168,6 @@ class BaselineConfig:
     scenarios: dict[str, ScenarioConfig]
     step_fractions: Sequence[float]
     tolerances: ToleranceConfig
-    improvement_threshold: float
 
     @classmethod
     def load(cls, path: Path) -> BaselineConfig:
@@ -215,9 +205,6 @@ class BaselineConfig:
             scenarios=scenarios,
             step_fractions=tuple(data["sampling"]["step_fractions"]),
             tolerances=tolerances,
-            improvement_threshold=data.get("improvement_reporting", {}).get(
-                "threshold", 0.2
-            ),
         )
 
     def update(self, path: Path):
@@ -982,15 +969,6 @@ LONGLIVE2_I2V_CI_sampling_params = replace(
     realtime_perf_thresholds={},
     realtime_perf_ignore_initial_chunks=0,
     extras=dict(_REALTIME_MODEL_COMMON_EXTRAS),
-)
-
-TURBOWAN_I2V_sampling_params = DiffusionSamplingParams(
-    prompt="The man in the picture slowly turns his head, his expression enigmatic and otherworldly. The camera performs a slow, cinematic dolly out, focusing on his face. Moody lighting, neon signs glowing in the background, shallow depth of field.",
-    image_path="https://is1-ssl.mzstatic.com/image/thumb/Music114/v4/5f/fa/56/5ffa56c2-ea1f-7a17-6bad-192ff9b6476d/825646124206.jpg/600x600bb.jpg",
-    direct_url_test=True,
-    output_size="960x960",
-    num_frames=4,
-    fps=4,
 )
 
 # Wan-Animate-2 inputs; they ship in the same ci-data-diffusion commit as the GT,

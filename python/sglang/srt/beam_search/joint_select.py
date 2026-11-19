@@ -74,13 +74,30 @@ def joint_select(
     top_tokens: torch.Tensor,  # [num_rows, num_candidates] int64
     stop_token_ids: torch.Tensor,  # [num_stop] int64, may be empty (ignore_eos)
     beam_width: int,
+    num_output_candidates: int | None = None,
 ) -> SelectResult:
-    num_candidates = top_logprobs.shape[1]
+    num_candidates = (
+        top_logprobs.shape[1]
+        if num_output_candidates is None
+        else num_output_candidates
+    )
     k = beam_width
 
     cand_scores, parent, tokens = _ranked_candidates(
         cum_logprobs, top_logprobs, top_tokens, num_candidates
     )
+
+    if stop_token_ids.numel() == 0 and num_candidates >= k:
+        return SelectResult(
+            next_tokens=tokens[:k],
+            parent_idx=parent[:k],
+            new_cum_logprobs=cand_scores[:k],
+            num_survivors=torch.full((), k, dtype=torch.int64, device=tokens.device),
+            fin_tokens=torch.zeros_like(tokens),
+            fin_parent_idx=torch.zeros_like(parent),
+            fin_cum_logprobs=torch.zeros_like(cand_scores),
+            num_finished=torch.zeros((), dtype=torch.int64, device=tokens.device),
+        )
 
     if stop_token_ids.numel() > 0:  # static-shape branch, constant under capture
         is_stop = torch.isin(tokens, stop_token_ids)

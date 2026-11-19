@@ -234,7 +234,7 @@ export SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR=/tmp/sglang_nixl_e2e_storage
   --hicache-storage-prefetch-policy wait_complete \
   --page-size 256 \
   --log-level info \
-  --disable-cuda-graph \
+  --disable-decode-cuda-graph --disable-prefill-cuda-graph \
   --hicache-storage-backend nixl \
   --hicache-storage-backend-extra-config @/tmp/nixl.config.toml \
   --mamba-radix-cache-strategy extra_buffer

@@ -22,15 +22,17 @@ inline constexpr uint32_t kTwoShotPushUnroll = 8;
 template <uint32_t kWorldSize>
 inline constexpr uint32_t kTwoShotPushReduceUnroll = kWorldSize <= 4 ? 8 : 4;
 /// Below these sizes the per-vector kernel wins: one vector per thread spreads a
-/// chunk over more warps than whole hunks do (TP2/TP4 unrolled are 10-14% slower
-/// at 128 KB - 1 MB), and with one rank arriving late TP2/TP4 stay 3-10% slower
-/// up to 4 MB.
+/// chunk over more warps than whole hunks do. TP2 unrolled is 17-26% slower at
+/// 1-2 MB, ties at 4 MB and wins from 8 MB; TP4 is 14-17% slower at 512 KB - 1 MB
+/// and wins from 2 MB, also with a late rank. At TP16 (two hosts) unrolled wins at
+/// every size: 19-29% back to back and 26-30% with a late rank at 256 KB - 2 MB.
 template <uint32_t kWorldSize>
 inline constexpr int64_t kTwoShotPushUnrolledMinBytes =
     int64_t{
-        kWorldSize <= 4  ? 8
-        : kWorldSize < 8 ? 2
-                         : 1}
+        kWorldSize <= 3   ? 8
+        : kWorldSize < 8  ? 2
+        : kWorldSize == 8 ? 1
+                          : 0}
     << 20;
 
 /// `all_reduce_2shot_push_kernel` with the ring_simple memory pipeline: same
@@ -38,8 +40,8 @@ inline constexpr int64_t kTwoShotPushUnrolledMinBytes =
 /// `kWarpThreads * unroll` vectors and issue every load of a hunk before using
 /// any, and slot payload moves as device-scope loads and batched system-scope
 /// stores while the input and output take plain accesses. The
-/// tail past the last whole hunk takes the per-vector path. Single node only
-/// (at most 8 ranks).
+/// tail past the last whole hunk takes the per-vector path. Each peer needs a
+/// warp of its own, so the grid must hold at least `kWorldSize - 1` warps.
 template <typename T, uint32_t kWorldSize, bool kUsePDL, typename Params>
 __global__ __launch_bounds__(kTwoShotPushThreads, 1) __attribute__((
     amdgpu_waves_per_eu(1, 2))) void all_reduce_2shot_push_unrolled_kernel(const __grid_constant__ Params params) {

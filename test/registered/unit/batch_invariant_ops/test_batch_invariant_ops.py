@@ -12,7 +12,7 @@ from sglang.test.test_utils import CustomTestCase
 # Note: MI300 (gfx942) has 64KB shared memory limit but kernel needs 66KB
 # MI35x (gfx950/CDNA4) may have different limits - testing on MI35x only
 register_cuda_ci(est_time=20, stage="nightly", runner_config="1-gpu-large")
-register_amd_ci(est_time=10, suite="nightly-amd-1-gpu-mi35x", nightly=True)
+register_amd_ci(est_time=10, suite="nightly-test-1-gpu-amd-mi35x", nightly=True)
 
 device_type = getattr(torch.accelerator.current_accelerator(), "type", "cpu")
 torch.set_default_device(device_type)

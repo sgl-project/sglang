@@ -31,7 +31,7 @@ from sglang.srt.mem_cache.storage.mmap.mmap_allocator import (
     hugepage_size_requested,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils import is_cuda, is_gfx95_supported, is_hip
 
 logger = logging.getLogger(__name__)
 
@@ -229,6 +229,11 @@ def host_memory_budget_plain_hugetlb(
             else free_hugetlb_bytes
         )
     ranks = ranks_per_host()
+    # gfx950 can pin host memory only up to the amdgpu TTM page limit
+    if is_gfx95_supported():
+        from sglang.srt.mem_cache.pool_host.rocm_budget import clamp_plain_budget
+
+        return clamp_plain_budget(plain // ranks), pool // ranks
     return plain // ranks, pool // ranks
 
 
@@ -611,6 +616,19 @@ class HostKVCache(abc.ABC):
         the page list, not a subsample.
         """
         return token_indices[:: self.page_size] // self.page_size
+
+    def _page_unified_buffer_meta(
+        self, indices: torch.Tensor
+    ) -> tuple[list[int], list[int]]:
+        """One (address, size) run per page; unified L3 chunks cut it by span."""
+        assert len(indices) % self.page_size == 0
+        bytes_per_page = self.page_unified_layout.bytes_per_page
+        base = self.kv_buffer.data_ptr()
+        ptr_list = [
+            base + page_id * bytes_per_page
+            for page_id in self._page_ids(indices).tolist()
+        ]
+        return ptr_list, [bytes_per_page] * len(ptr_list)
 
     def _init_page_unified_staging(self, staging: torch.Tensor | None = None) -> None:
         """Device-side scratch the write-back relayouts into before the D2H.

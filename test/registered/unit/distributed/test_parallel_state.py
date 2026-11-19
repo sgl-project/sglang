@@ -580,5 +580,40 @@ def test_group_desc_none_normalized_to_anonymous():
     assert _read_group_descs(None) == ("anonymous:device", "anonymous:cpu")
 
 
+@pytest.mark.parametrize(
+    "gfx95, gfx942, expect_fused",
+    [(True, False, True), (False, True, True), (False, False, False)],
+)
+def test_fused_allreduce_rmsnorm_quant_per_group_runs_on_gfx942_and_gfx95(
+    monkeypatch, gfx95, gfx942, expect_fused
+):
+    monkeypatch.setattr(parallel_state, "is_hip", lambda: True)
+    monkeypatch.setattr(parallel_state, "is_gfx95_supported", lambda: gfx95)
+    monkeypatch.setattr(parallel_state, "is_gfx942_supported", lambda: gfx942)
+    calls = []
+
+    class _FusedCustomAllReduce:
+        disabled = False
+
+        def custom_fused_ar_rms_per_group_quant(self, *args, **kwargs):
+            calls.append((args, kwargs))
+            return "fused"
+
+    coordinator = parallel_state.GroupCoordinator.__new__(
+        parallel_state.GroupCoordinator
+    )
+    coordinator.ca_comm = _FusedCustomAllReduce()
+    coordinator.world_size = 2
+    x = torch.zeros(4, 3072, dtype=torch.bfloat16)
+    weight = torch.ones(3072, dtype=torch.bfloat16)
+
+    out = coordinator.fused_allreduce_rmsnorm_quant_per_group(
+        x, torch.zeros_like(x), weight, 1e-6
+    )
+
+    assert out == ("fused" if expect_fused else None)
+    assert len(calls) == int(expect_fused)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

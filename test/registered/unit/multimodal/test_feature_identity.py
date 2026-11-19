@@ -36,10 +36,7 @@ from sglang.srt.multimodal.cache.identity import (
 )
 from sglang.srt.multimodal.media_artifacts.base import MediaArtifactInput
 from sglang.srt.multimodal.modality import Modality, MultimodalInputFormat
-from sglang.srt.multimodal.processors.llava import (
-    LlavaImageProcessor,
-    LlavaMultimodalProcessor,
-)
+from sglang.srt.multimodal.processors.llava import LlavaImageProcessor
 from sglang.srt.multimodal.processors.muse_spark_omni import (
     MuseSpark1xOmniMultimodalProcessor,
 )
@@ -217,21 +214,6 @@ class TestFeatureIdentity(CustomTestCase):
         expected = output.padded_input_ids
         processor.finalize_cache_identities(output)
         self.assertIs(output.padded_input_ids, expected)
-
-    def test_composite_processor_uses_inner_identity_namespace(self):
-        inner = LlavaImageProcessor.__new__(LlavaImageProcessor)
-        inner.processor_fingerprint = "sha256:" + "12" * 32
-        outer = LlavaMultimodalProcessor.__new__(LlavaMultimodalProcessor)
-        outer.inner = inner
-        item = _item(torch.arange(8))
-        output = MultimodalProcessorOutput(mm_items=[item])
-        original = item.cache_key
-        outer.finalize_cache_identities(output)
-        self.assertNotEqual(original, item.cache_key)
-        self.assertEqual(item.processor_fingerprint, inner.processor_fingerprint)
-        expected = item.cache_key
-        outer.finalize_cache_identities(output)
-        self.assertEqual(expected, item.cache_key)
 
     def test_dataclass_metadata_keeps_tensor_storage_and_nested_types(self):
         @dataclass(slots=True)

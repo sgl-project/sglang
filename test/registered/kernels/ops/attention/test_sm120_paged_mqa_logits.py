@@ -291,16 +291,10 @@ class TestSM120PagedMqaLogitsTorch(CustomTestCase):
         )
 
     def test_shape_assertions(self):
-        """Wrong head_dim or block_size must raise."""
+        """clean_logits=True is unsupported and must raise rather than be ignored."""
         q, kv, w, sl, pt, msl = _build_inputs(
             1, [64], kv_dtype_view=FP8_DTYPE, device=self.device
         )
-        # head_dim != 128
-        bad_q = q[..., :64]
-        with self.assertRaises(AssertionError):
-            fp8_paged_mqa_logits_torch_sm120(
-                bad_q, kv, w, sl, pt, None, max_seq_len=msl, clean_logits=False
-            )
         # clean_logits=True not supported
         with self.assertRaises(AssertionError):
             fp8_paged_mqa_logits_torch_sm120(

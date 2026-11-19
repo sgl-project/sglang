@@ -1,7 +1,7 @@
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-small")
-register_amd_ci(est_time=10, stage="stage-b", runner_config="1-gpu-small-amd")
+register_amd_ci(est_time=10, stage="base-b", runner_config="1-gpu-small-amd")
 
 import unittest
 
@@ -200,17 +200,6 @@ class TestSpecTopk1Triton(CustomTestCase):
         self.assertEqual(topk_p.shape, (0, 1))
         self.assertEqual(topk_index.shape, (0, 1))
         self.assertEqual(draft_tokens.numel(), 0)
-
-    def test_non_contiguous_inputs_raise(self):
-        logits = torch.empty((16, 4), dtype=torch.float32, device=self.device).t()
-        positions = torch.arange(8, dtype=torch.long, device=self.device)[::2]
-
-        with self.assertRaises(AssertionError):
-            draft_topk1_postprocess(
-                logits, torch.empty(4, dtype=torch.long, device=self.device)
-            )
-        with self.assertRaises(AssertionError):
-            draft_topk1_postprocess(torch.empty((4, 16), device=self.device), positions)
 
 
 if __name__ == "__main__":

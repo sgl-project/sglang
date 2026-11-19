@@ -12,7 +12,7 @@ with thinking enabled (its `<mm:think>` reasoning path). Raw few-shot completion
 (~0.87 vs ~0.96 on GSM8K), so this test uses chat + thinking to match how the
 model is meant to be served and the published reference accuracy.
 
-Registry: nightly-amd-4-gpu-mi35x-minimax-m3-tp4 suite
+Registry: nightly-test-4-gpu-amd-mi35x-minimax-m3-tp4 suite
 """
 
 import json
@@ -40,7 +40,7 @@ from sglang.utils import download_and_cache_file, read_jsonl
 
 register_amd_ci(
     est_time=5400,
-    suite="nightly-amd-4-gpu-mi35x-minimax-m3-tp4",
+    suite="nightly-test-4-gpu-amd-mi35x-minimax-m3-tp4",
     nightly=True,
 )
 

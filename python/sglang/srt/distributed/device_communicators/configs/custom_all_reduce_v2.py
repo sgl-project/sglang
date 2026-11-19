@@ -409,12 +409,12 @@ def _rocm_gfx1250_configs(
     # unset or 0). With HIP_FORCE_DEV_KERNARG=1 the kernels after a 2shot_push
     # run at full speed, so TP2/4/8 take 2shot_push to the last size it wins
     # back to back. 1shot_push also serves decode further, to the last size it
-    # wins in CUDA graphs with a late rank or a GEMM before it (768 KB at TP8,
-    # every decode size at TP2/4): DeepSeek-V4-Flash decode gains about 2-4% at
-    # TP4/TP8.
+    # wins in CUDA graphs with a late rank (768 KB at TP8, also with a GEMM
+    # before it; 1 MB at TP2/4: at 2 MB 2shot_push wins back to back and with a
+    # late rank).
     if dev_kernarg:
         cutoffs.update(
-            {2: (2 * MB, 16 * MB), 4: (2 * MB, 32 * MB), 8: (768 * KB, 32 * MB)}
+            {2: (1 * MB, 16 * MB), 4: (1 * MB, 16 * MB), 8: (768 * KB, 32 * MB)}
         )
     # Where the group is made of partition pairs (both partitions of every
     # accelerator), hier_ring_simple takes over from 2shot_push and ring_simple
@@ -430,22 +430,36 @@ def _rocm_gfx1250_configs(
     configs = {
         ws: config(*cutoff, hier_ring_from.get(ws, 0)) for ws, cutoff in cutoffs.items()
     }
+    if dev_kernarg:
+        # TP8 on partition pairs: hier_2shot_push, tried before hier_ring_simple,
+        # beats 2shot_push by 21% and hier_ring_simple by 14% (10% / 11% with a
+        # late rank) at 16 MB; hier_ring_simple wins from 24 MB
+        tp8 = configs[8].graph._replace(hier_2shot_push=Range(8 * MB + 16, 16 * MB))
+        configs[8] = configs[8]._replace(graph=tp8, eager=tp8)
     # 16 ranks span two hosts in one fabric clique. Tuned there with and
     # without a late rank: across hosts 2shot_push pays two fabric hops, so
     # 1shot_push wins to 256 KB, and a block per CU keeps 2shot_push ahead of
     # RCCL to 64 MB. When both partitions of every accelerator are in the group,
     # hier_2shot_push reduces each pair first, so only half the tensor crosses
-    # the fabric: above 256 KB it beats 2shot_push by 17-31% back to back and
-    # 9-14% with a late rank, so it takes over to 64 MB. ring_simple takes
-    # the sizes above that.
+    # the fabric: above 2 MB it beats 2shot_push by 13-33% back to back, so it
+    # takes over to 64 MB. Up to 2 MB 2shot_push stays: it is 13% faster than
+    # hier with a late rank, as in serving after the MoE, and 7-11% slower
+    # back to back at 512 KB-1 MB. ring_simple takes the sizes above 64 MB.
     tp16 = Heuristic(
         256 * KB,
         0,
         0,
         two_shot_push_threshold=64 * MB,
-        hier_2shot_push=Range(256 * KB, 64 * MB),
+        hier_2shot_push=Range(2 * MB + 16, 64 * MB),
         ring_simple=Range(64 * MB + 16, 4 * 1024 * MB),
     )
+    if dev_kernarg:
+        # Partition pairs at TP16: hier_ring_simple beats ring_simple by 17% at
+        # 128 MB and 7% at 512 MB, also with a late rank, and 2shot_push from
+        # 32 MB (21% at 64 MB). hier_2shot_push is tried first and keeps the
+        # sizes it covers, so this takes 32-64 MB only where the default
+        # max_size caps hier at 32 MB.
+        tp16 = tp16._replace(hier_ring_simple=Range(32 * MB + 16, 4 * 1024 * MB))
     configs[16] = configs[8]._replace(graph=tp16, eager=tp16, num_push_blocks=num_sm)
     return configs
 

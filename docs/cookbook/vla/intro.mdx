@@ -1,14 +1,14 @@
 ---
 title: Overview
 mode: wide
-description: Practical guides for deploying and using Vision-Language-Action policies with SGLang.
+description: Robot action generation with SGLang Diffusion and Vision-Language-Action policies.
 metatags:
-    description: "Explore SGLang Vision-Language-Action policy cookbooks for robot action serving, OpenPI compatibility, caching, and performance tuning."
+    description: "Explore SGLang Diffusion Vision-Language-Action policy cookbooks for robot action generation, OpenPI compatibility, caching, and performance tuning."
 ---
 
-Vision-Language-Action policies map camera observations, language instructions, and robot state into continuous action chunks. They share some runtime machinery with diffusion pipelines, but the user-facing workload is robot action inference rather than image or video generation.
+SGLang Diffusion supports action generation alongside image, video, and audio generation. Vision-Language-Action policies map camera observations, language instructions, and robot state into continuous action chunks using the same `multimodal_gen` runtime.
 
-This section keeps VLA policies separate from the diffusion model cookbook so robot deployments can document their own input schemas, policy endpoints, cache behavior, and control-loop performance targets.
+This section groups dedicated action-policy recipes separately from media recipes so robot deployments can document their own input schemas, policy endpoints, cache behavior, and control-loop performance targets. See the [action API](/docs/sglang-diffusion/api/openai_api#action-generation-sglang-extension) for shared endpoints and [Cosmos3](/cookbook/diffusion/Cosmos/Cosmos3) for world-model action generation.
 
 ## OpenPI
 

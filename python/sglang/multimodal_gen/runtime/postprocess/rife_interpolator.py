@@ -421,7 +421,8 @@ class FrameInterpolator:
         self, model: Model, I0: torch.Tensor, I1: torch.Tensor, n: int, scale: float
     ) -> list[torch.Tensor]:
         """
-        Recursively generate n-1 intermediate frames between I0 and I1.
+        Recursively generate 2*n - 1 intermediate frames between I0 and I1
+        (n a power of two).
 
         Returns a list of intermediate frame tensors (not including I0 or I1).
         """
@@ -485,7 +486,8 @@ class FrameInterpolator:
         model = self._ensure_model_loaded()
         device = model.device()
 
-        n_intermediate = 2**exp // 2  # intermediates per adjacent pair
+        # Recursion width; yields 2**exp - 1 intermediates per adjacent pair.
+        n_intermediate = 2**exp // 2
         start_time = time.perf_counter()
 
         if n_intermediate == 1:

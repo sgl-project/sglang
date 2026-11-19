@@ -18,7 +18,7 @@ from sglang.srt.hardware_backend.mlx.fx_lowering import (
 )
 from sglang.test.ci.ci_register import register_mlx_ci
 
-register_mlx_ci(est_time=10, suite="stage-a-unit-test-mlx")
+register_mlx_ci(est_time=10, suite="extra-unit-test-mlx")
 
 # Same floor as the other two files: the exported-executor test crosses the
 # Torch/MLX bridge, which needs Torch >= 2.13.

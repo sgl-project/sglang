@@ -54,15 +54,14 @@ def fast_topk(
     score      : CUDA fp32 tensor [B, L]
     lengths    : CUDA int32 tensor [B]
     topk       : number of indices per row; 512 or 2048
-    row_starts : optional CUDA int32 tensor [B]; defaults to zeros
+    row_starts : optional CUDA int32 tensor [B]; if omitted, every row starts at 0
+                 and no tensor is allocated
 
     Returns
     -------
     CUDA int32 tensor [B, topk]
     """
     batch = score.shape[0]
-    if row_starts is None:
-        row_starts = torch.zeros(batch, dtype=torch.int32, device=score.device)
     indices = score.new_empty((batch, topk), dtype=torch.int32)
 
     module = _jit_fast_topk_module(topk)

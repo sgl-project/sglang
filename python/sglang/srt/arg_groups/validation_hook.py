@@ -13,7 +13,11 @@ from sglang.srt.arg_groups.arg_utils import (
     _field_to_cli_name,
     record_fields,
 )
-from sglang.srt.arg_groups.choices import BUILT_IN_SAMPLING_BACKENDS
+from sglang.srt.arg_groups.choices import (
+    BUILT_IN_SAMPLING_BACKENDS,
+    REMOVED_CHOICES,
+    removed_choice_message,
+)
 from sglang.srt.arg_groups.model_override_base import resolved_view, resolving_view
 from sglang.srt.arg_groups.overrides import (
     _hisparse_validation,
@@ -24,7 +28,8 @@ from sglang.srt.configs.unlimited_ocr_v2 import UocrDocumentConfig
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     parse_ib_device_config,
 )
-from sglang.srt.environ import envs
+from sglang.srt.environ import REMOVED_ENVS, envs
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.runtime_context import (
     attn_dp_enabled_of,
     describe_kv_events_publisher,
@@ -225,12 +230,14 @@ def check_pipeline_parallel_compat(cfg: Any) -> None:
     assert cfg.disable_overlap_schedule, (
         "Pipeline parallelism is not compatible with overlap schedule"
     )
-    if cfg.speculative_algorithm == "DSPARK":
+    if cfg.speculative_algorithm in ("DSPARK", "DFLASH"):
         assert cfg.disaggregation_mode == "prefill", (
-            "Pipeline parallel DSPARK requires disaggregation-mode=prefill"
+            f"Pipeline parallel {cfg.speculative_algorithm} requires "
+            "disaggregation-mode=prefill"
         )
         assert not envs.SGLANG_ENABLE_PP_SPEC.get(), (
-            "SGLANG_ENABLE_PP_SPEC does not support DSPARK PD prefill"
+            f"SGLANG_ENABLE_PP_SPEC does not support {cfg.speculative_algorithm} "
+            "PD prefill"
         )
     elif cfg.speculative_algorithm is not None:
         assert (
@@ -300,6 +307,30 @@ def check_server_args(server_args: Any):
         f"Got: {cfg.pp_max_micro_batch_size}"
     )
 
+    if cfg.device == "npu":
+        from sglang.srt.hardware_backend.npu.compile_backend import (
+            validate_npugraph_ex_config,
+        )
+
+        # Local import: server_args imports this module at load time.
+        from sglang.srt.server_args import compute_world_size
+
+        # cuda_graph_config stays None until handle_cuda_graph_config runs, which
+        # the resolution pipeline skips for a "none"/"dummy" model path.
+        graph_cfg = cfg.cuda_graph_config
+
+        validate_npugraph_ex_config(
+            enable_compile=cfg.enable_torch_compile,
+            graph_enabled=(
+                graph_cfg is not None and graph_cfg.decode.backend != Backend.DISABLED
+            ),
+            world_size=compute_world_size(
+                dp_size=cfg.dp_size,
+                tp_size=cfg.tp_size,
+                pp_size=cfg.pp_size,
+            ),
+        )
+
     assert not (cfg.disable_cuda_graph_padding and cfg.enable_torch_compile), (
         "--disable-cuda-graph-padding is incompatible with --enable-torch-compile. "
         "With padding disabled, every distinct batch size gets its own torch.compile + "
@@ -330,6 +361,11 @@ def check_server_args(server_args: Any):
             "--port listener, so the other replicas' listeners advertise "
             "registries that never become ready. Launch one prefill server per "
             "replica, or unset SGLANG_RUST_SERVER."
+        )
+
+    if cfg.disable_multimodal and cfg.enable_multimodal:
+        raise ValueError(
+            "--disable-multimodal cannot be combined with --enable-multimodal"
         )
 
     assert cfg.base_gpu_id >= 0, "base_gpu_id must be non-negative"
@@ -479,6 +515,7 @@ def check_server_args(server_args: Any):
         raise ValueError("Communications quantization is only supported for NPU device")
 
     validate_device_sampling_backend(cfg.sampling_backend, cfg.device)
+    validate_device_lora_backend(cfg.lora_backend, cfg.device)
 
     # grpc_port is None for HTTP-only launches, so the == comparison is
     # already False there; no explicit None check needed.
@@ -496,6 +533,8 @@ def check_server_args(server_args: Any):
             raise ValueError(
                 "When setting gc_threshold, it must contain 1 to 3 integers."
             )
+    if cfg.gc_freeze_on_idle_secs < 0:
+        raise ValueError("--gc-freeze-on-idle-secs must be >= 0.")
 
     if cfg.kv_canary_sweep_interval > 0 and cfg.kv_canary == "none":
         raise ValueError(
@@ -661,6 +700,15 @@ def validate_device_sampling_backend(
     if sampling_backend == "intel_xpu" and device != "xpu":
         raise ValueError(
             f"--sampling-backend intel_xpu requires --device xpu, got --device {device}"
+        )
+
+
+def validate_device_lora_backend(lora_backend: str, device: str) -> None:
+    # The intel_xpu LoRA kernels ship only in sgl-kernel-xpu; on another device the
+    # backend import fails late, inside LoRAManager init.
+    if lora_backend == "intel_xpu" and device != "xpu":
+        raise ValueError(
+            f"--lora-backend intel_xpu requires --device xpu, got --device {device}"
         )
 
 
@@ -886,14 +934,30 @@ def default_unset_prefill_decode_interval(server_args: Any):
         )
 
 
+def validate_removed_options(server_args: Any):
+    """Stop on a removed choice value or environment variable, naming what to use.
+
+    The CLI rejects a removed value while parsing; this covers the Python API.
+    """
+    cfg = resolving_view(server_args)
+    for field in REMOVED_CHOICES:
+        message = removed_choice_message(field, getattr(cfg, field))
+        if message is not None:
+            raise ValueError(f"--{field.replace('_', '-')}: {message}.")
+    for name in os.environ:
+        if name in REMOVED_ENVS:
+            raise ValueError(
+                f"Environment variable {name} was removed in SGLang 1.0; "
+                f"{REMOVED_ENVS[name]}."
+            )
+        if name.startswith("SGL_") and hasattr(envs, "SGLANG_" + name[4:]):
+            raise ValueError(
+                f"Environment variable {name} was removed in SGLang 1.0; use "
+                f"SGLANG_{name[4:]}."
+            )
+
+
 def validate_sampling_mask_max_tokens(server_args: Any):
-    if envs.SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS.is_set():
-        raise ValueError(
-            "SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS is no longer supported. "
-            "Unset it. To enable sampling masks for disaggregated serving, set "
-            "SGLANG_ENABLE_DISAGG_SAMPLING_MASK=1 and use the same positive "
-            "--sampling-mask-max-tokens value on both prefill and decode servers."
-        )
     cfg = resolving_view(server_args)
     if cfg.sampling_mask_max_tokens <= 0:
         raise ValueError(
