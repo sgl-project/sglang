@@ -1732,6 +1732,30 @@ class USPAttention(nn.Module):
             self._pipeline_declined.add(key)
         return out
 
+    def forward_into(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        out: torch.Tensor,
+    ) -> bool:
+        """Unmasked local attention written straight into ``out`` (any token stride).
+
+        Returns False, having written nothing, when the call is not the plain
+        single-rank dense case -- the caller then runs ``forward`` and copies.
+        Takes no mask or replicated-token arguments: every path that needs them
+        rewrites the sequence, so there is nothing to write through.
+        """
+        if (
+            not (self.skip_sequence_parallel or get_sequence_parallel_world_size() == 1)
+            or self.capture_dense_attention
+            or get_request_skip_softmax_params() is not None
+        ):
+            return False
+        return self.attn_impl.forward_into(
+            q, k, v, out, get_forward_context().attn_metadata
+        )
+
     def forward_qk_filled(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, fill_all
     ) -> torch.Tensor | None:

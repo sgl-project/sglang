@@ -26,6 +26,13 @@ from sglang.multimodal_gen.runtime.platforms.aiter import (
 
 logger = logging.getLogger(__name__)
 
+if USE_AITER_GFX1250:
+    # The BSHD entry point aiter.flash_attn_func itself dispatches to on gfx1250,
+    # called directly for its out= parameter, which flash_attn_func does not
+    # forward. Imported behind the arch gate so no other GPU pays for a FlyDSL
+    # module it never calls, or fails here on an aiter that predates it.
+    from aiter.ops.flydsl.fmha_kernels import flydsl_flash_attn_batch_fwd
+
 _use_fp8_attn = os.environ.get("SGLANG_DIFFUSION_AITER_FP8_ATTN", "0") == "1"
 _fp8_dtype = torch.float8_e4m3fn
 
@@ -408,6 +415,40 @@ class AITerImpl(AttentionImpl):
         value: torch.Tensor,
     ) -> torch.Tensor:
         return self._forward_bf16(query, key, value)
+
+    @torch.compiler.disable
+    def forward_into(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        out: torch.Tensor | None,
+        attn_metadata: AttentionMetadata = None,
+    ) -> bool:
+        # The FlyDSL BSHD kernel writes its epilogue through any token stride.
+        # Same arguments as _forward_bf16, which reaches it through
+        # aiter.flash_attn_func, so the result is unchanged.
+        if not USE_AITER_GFX1250 or _use_fp8_attn:
+            return False
+        if query.dtype not in (torch.bfloat16, torch.float16):
+            return False
+        if out is None:
+            return True
+        if out.dtype != query.dtype:
+            return False
+        return (
+            flydsl_flash_attn_batch_fwd(
+                query,
+                key,
+                value,
+                causal=self.causal,
+                dropout_p=self.dropout_p,
+                return_lse=False,
+                return_attn_probs=False,
+                out=out,
+            )
+            is not None
+        )
 
     @torch.compiler.disable
     def forward_varlen(

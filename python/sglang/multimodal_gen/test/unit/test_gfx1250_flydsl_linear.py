@@ -27,7 +27,7 @@ def _assert_matches_fp32(out, x, w, bias=None):
 
 @unittest.skipUnless(
     linear.USE_AITER_GFX1250 and not linear._USE_FLYDSL_TDM_GEMM,
-    "needs a gfx1250 GPU with SGLANG_USE_AITER=1 and the TDM GEMM switch off",
+    "needs a gfx1250 GPU with SGLANG_USE_AITER=1 and an aiter without the TDM GEMM",
 )
 class TestGfx1250FlyDSLLinear(unittest.TestCase):
     def test_large_bf16_linear_runs_flydsl_and_matches_fp32(self):
@@ -63,13 +63,13 @@ class TestGfx1250FlyDSLTdmLinear(unittest.TestCase):
 
     def test_tdm_matches_fp32_on_both_tile_sizes(self):
         # 128-row tiles when 256x256 underfills the CUs, 256-row tiles otherwise;
-        # M=4112 also ends on a partial tile.
-        for m, n, k in ((512, 1024, 512), (4112, 6144, 6144)):
+        # M=4112 ends on 16 leftover rows, which take a second 16-row-tile launch.
+        for m, n, k, launches in ((512, 1024, 512, 1), (4112, 6144, 6144, 2)):
             with self.subTest(m=m, n=n, k=k):
                 x, w = _inputs(m, n, k)
                 bias = torch.randn(n, device="cuda", dtype=torch.bfloat16)
                 out, tdm_calls, gemm_calls = self._run(x, w, bias)
-                self.assertEqual((tdm_calls, gemm_calls), (1, 0))
+                self.assertEqual((tdm_calls, gemm_calls), (launches, 0))
                 self.assertEqual(out.shape, (1, m, n))
                 _assert_matches_fp32(out, x, w, bias)
 
@@ -80,6 +80,26 @@ class TestGfx1250FlyDSLTdmLinear(unittest.TestCase):
         second, _, _ = self._run(x, w)
         # Not bit-exact: the kernel's fp32 -> bf16 rounding is not sign-symmetric on ties.
         torch.testing.assert_close(second.float(), -first.float(), atol=1e-3, rtol=1e-2)
+
+    def test_offsets_past_32_bits_keep_the_default_kernel(self):
+        """A shape whose operand offsets overflow 32 bits must not reach the TDM kernel.
+
+        aiter indexes A, B and C with signed 32-bit byte offsets and raises past
+        that instead of clamping, so a caller that routes such a shape there kills
+        the request. Wan 2.2's QKV projection is over the line; FLUX.2 is not.
+        """
+        meta = dict(device="meta", dtype=torch.bfloat16)
+        self.assertGreater(90000 * 30720, linear._TDM_MAX_LEADING_OFFSET)
+        self.assertFalse(
+            linear._tdm_offsets_fit(
+                torch.empty(90000, 5120, **meta), torch.empty(30720, 5120, **meta)
+            )
+        )
+        self.assertTrue(
+            linear._tdm_offsets_fit(
+                torch.empty(4112, 6144, **meta), torch.empty(55296, 6144, **meta)
+            )
+        )
 
     def test_partial_k_tile_keeps_the_default_kernel(self):
         x, w = _inputs(m=512, n=1024, k=576)
@@ -93,8 +113,8 @@ _FLUX2_SINGLE_BLOCK_SHAPES = ((4112, 6144, 55296), (4112, 24576, 6144))
 # Arbitrary; long enough to average over the package's ~1 s power-throttle cycle.
 _SECONDS_PER_KERNEL_PER_ROUND = 3.0
 _ROUNDS = 3
-# About twice the largest gap measured between the two kernels (7%).
-_MAX_KERNEL_GAP = 0.15
+# Arbitrary margin under parity; the TDM path measures 20-23% ahead.
+_MAX_TDM_DEFICIT = 0.05
 
 
 def _sustained_tflops(gemm_2d, operands, seconds: float) -> float:
@@ -112,12 +132,13 @@ def _sustained_tflops(gemm_2d, operands, seconds: float) -> float:
     _HAS_TDM_GEMM, "needs a gfx1250 GPU and an aiter with the TDM GEMM"
 )
 class TestGfx1250GemmKernelParity(unittest.TestCase):
-    def test_default_and_tdm_kernels_stay_close_on_flux2_shapes(self):
-        """Neither FlyDSL GEMM path may fall far behind the other on FLUX.2's linears.
+    def test_tdm_kernel_does_not_fall_behind_default_on_flux2_shapes(self):
+        """The TDM path, which is preferred where available, must not lose to the
+        a16w16 one it displaces on FLUX.2's linears.
 
-        Which one wins depends on package load: measured with aiter 86f6a2b57 the
-        TDM kernel leads by ~7% with the sibling partition idle and by under 1%
-        with it loaded, so only a gap larger than that spread is a regression.
+        Measured with aiter 86f6a2b57: the TDM path (2x2 waves, leftover rows in
+        their own launch) leads by ~23% with the sibling partition idle and by
+        ~20% with it loaded.
         """
         operands = []
         for m, k, n in _FLUX2_SINGLE_BLOCK_SHAPES:
@@ -145,8 +166,7 @@ class TestGfx1250GemmKernelParity(unittest.TestCase):
             f"rounds default {[round(v) for v in samples['default']]}, "
             f"tdm {[round(v) for v in samples['tdm']]}"
         )
-        self.assertGreater(ratio, 1 - _MAX_KERNEL_GAP)
-        self.assertLess(ratio, 1 + _MAX_KERNEL_GAP)
+        self.assertGreater(ratio, 1 - _MAX_TDM_DEFICIT)
 
 
 if __name__ == "__main__":
