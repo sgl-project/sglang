@@ -201,7 +201,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         if self.is_npu:
             self.use_msa = False
             # Prime the native sparse op probe before cuda-graph capture.
-            from sgl_kernel_npu.attention.gqa_share_sparse_attention import (
+            from sgl_kernel_npu.operators.attention.flash_decode_bnsd_with_gqa_share_sparse import (
                 _get_native_sparse_op,
             )
 
@@ -1147,11 +1147,11 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         block_size_q = self._choose_block_size_q(max_seqlen)
 
         # Score-path qblock mappings (layer-invariant), built once per forward.
-        from sgl_kernel_npu.indexer.flash_block_score_prefill import (
-            _build_qblock_mappings as _build_score_qblock_mappings,
+        from sgl_kernel_npu.operators.indexer.indexer_utils import (
+            build_qblock_mappings,
         )
 
-        qblock_mappings = _build_score_qblock_mappings(
+        qblock_mappings = build_qblock_mappings(
             cu_seqlens,
             seq_lens,
             self.req_to_token,

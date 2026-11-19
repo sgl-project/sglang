@@ -507,12 +507,10 @@ class AscendKDAHybridLinearAttnBackend:
                 req_pool_indices=None,
                 state_slots=None,
             ):
-                from sgl_kernel_npu.mamba.speculative_state_scatter import (
-                    speculative_state_scatter_npu,
-                )
                 from sgl_kernel_npu.operators.mamba import (
                     conv_state_rollback,
                     move_intermediate_cache_kda,
+                    speculative_state_scatter,
                 )
 
                 del req_pool_indices
@@ -559,7 +557,7 @@ class AscendKDAHybridLinearAttnBackend:
                     intermediate_conv_window_cache = (
                         mamba_caches.intermediate_conv_window[0]
                     )
-                    speculative_state_scatter_npu(
+                    speculative_state_scatter(
                         conv_states,
                         intermediate_conv_window_cache,
                         dst_indices_tensor,
@@ -581,7 +579,7 @@ class AscendKDAHybridLinearAttnBackend:
                     )
 
                     if has_conv_snapshots:
-                        speculative_state_scatter_npu(
+                        speculative_state_scatter(
                             conv_states,
                             intermediate_conv_window_cache,
                             mamba_track_indices,
