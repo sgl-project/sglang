@@ -99,6 +99,15 @@ def _compressed_tensors_family(model_config: ModelConfig) -> str | None:
 
 def family_of_config(model_config: ModelConfig) -> str | None:
     """Provisional: picks a default runner before any layer exists; layers decide."""
+    if model_config.quantization == "mxfp8":
+        quant_config = model_config.hf_quant_config
+        if (
+            str(quant_config.get("moe_quant_algo", "")).upper() == "NVFP4"
+            and quant_config.get("moe_quant_format") == "nvfp4-pack-quantized"
+        ):
+            # minimax_m3's markers: its override picks the runner for these
+            # packed NVFP4 experts, which no MoE LoRA provider serves.
+            return None
     if model_config.is_fp4_experts:
         return "mxfp4"
     if model_config.quantization == _COMPRESSED_TENSORS:
