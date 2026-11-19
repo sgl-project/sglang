@@ -6,7 +6,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_npu_ci
 
-register_npu_ci(est_time=1, suite="base-a-test-npu")
+register_npu_ci(est_time=1, suite="extra-a-test-npu")
 
 # Initialize the quantization registry as in model-config loading.
 import sglang.srt.layers.quantization  # noqa: F401

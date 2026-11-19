@@ -37,6 +37,8 @@ class Fp4Indexer(Indexer):
         super().__init__(*args, **kwargs)
         # The CuTe DSL paged MQA kernel has no FP4 variant.
         self.paged_mqa_logits_backend = DSAPagedMQALogitsBackend.DEEPGEMM
+        # The DSA LiteTopK prefill kernel scores FP8 queries and index K only.
+        self.use_prefill_lite_topk = False
 
     def _can_use_dsa_indexer_fusion(self, config, is_neox_style: bool) -> bool:
         # The fused Q/K kernels write FP8.

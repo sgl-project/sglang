@@ -51,6 +51,7 @@ from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_context,
     get_device,
+    get_disagg,
     get_exec,
     get_model,
     get_parallel,
@@ -97,6 +98,7 @@ from sglang.srt.speculative.eagle_worker_common import (
     STOCK_SPECULATIVE_RUNTIME_HOOKS,
     bind_eagle_runtime_hooks,
     build_eagle_verify_input,
+    check_draft_branch_tail_copy,
     prepare_for_draft,
     prepare_for_draft_extend,
     run_eagle_verify,
@@ -106,16 +108,18 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     draft_pp_context,
     draft_tp_context,
-    fast_sample,
     get_plan_stream,
     load_token_map,
     renorm_draft_probs,
     sample_draft_proposal,
+    scatter_draft_probs_to_target_vocab,
     select_top_k_tokens,
     simulated_acc_len_generator,
     spec_stage_span,
+    use_fused_draft_sample,
 )
 from sglang.srt.utils.async_probe import (
+    maybe_assert_async,
     maybe_detect_inf,
     maybe_detect_nan,
     maybe_detect_oob,
@@ -196,6 +200,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.topk = get_spec().speculative_eagle_topk
         if get_spec().speculative_use_rejection_sampling:
             assert self.topk == 1, "Chain speculative sampling supports only topk=1"
+        # Decided in alloc_memory_pool, once init_lm_head has fixed the draft logits width.
+        self.use_fused_draft_sample = False
         self.speculative_num_steps = get_spec().speculative_num_steps
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
@@ -255,24 +261,60 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
+        check_draft_branch_tail_copy(
+            self.draft_runner.token_to_kv_pool, self.topk, get_schedule().page_size
+        )
         self.init_token_map()
         self.init_lm_head()
+        self._init_draft_probs_vocab_scatter()
+        # The draft samples over its own logits: a hot-token map narrows them below the
+        # target vocabulary, to widths the fused kernel may not take.
+        self.use_fused_draft_sample = (
+            get_spec().speculative_use_rejection_sampling
+            and use_fused_draft_sample(self.draft_probs_vocab_size)
+        )
 
         if get_spec().speculative_use_rejection_sampling:
-            target_vocab_size = self.target_worker.model_config.vocab_size
-            draft_vocab_size = (
-                self.hot_token_id.shape[0]
-                if self.hot_token_id is not None
-                else target_vocab_size
-            )
-            # FIXME: support reduced (hot) draft vocab by scattering draft probs
-            # into the target vocab via the d2t map before the sampling kernel.
-            if draft_vocab_size != target_vocab_size:
-                raise ValueError(
-                    "--speculative-use-rejection-sampling requires the draft and "
-                    f"target to share one vocab, but the draft vocab "
-                    f"({draft_vocab_size}) != target vocab ({target_vocab_size})."
+            if (
+                self.hot_token_id is not None
+                and self.hot_token_id.shape[0] != self.target_vocab_size
+            ):
+                if get_disagg().disaggregation_mode == "decode":
+                    # pd_first_draft_proposal builds a request's first q at the
+                    # target vocabulary width, not the draft width q travels at.
+                    raise ValueError(
+                        "--speculative-use-rejection-sampling with a reduced draft "
+                        "vocabulary is not supported on a PD-disaggregation decode "
+                        "server."
+                    )
+                logger.info(
+                    "Rejection sampling with a reduced draft vocabulary "
+                    f"({self.hot_token_id.shape[0]} -> {self.target_vocab_size}): q is "
+                    "scattered onto the target vocab through the d2t map, so non-hot "
+                    "target tokens are never proposed and keep their full target "
+                    "probability in the residual."
                 )
+
+    def _init_draft_probs_vocab_scatter(self) -> None:
+        self.target_vocab_size = self.target_worker.model_config.vocab_size
+        if self.hot_token_id is None:
+            self.draft_probs_need_vocab_scatter = False
+            return
+        self.draft_probs_need_vocab_scatter = (
+            # An identity-prefix map still needs expansion to the target width.
+            self.hot_token_id.numel() != self.target_vocab_size
+            or not torch.equal(
+                self.hot_token_id,
+                torch.arange(self.target_vocab_size, device=self.hot_token_id.device),
+            )
+        )
+
+    @property
+    def draft_probs_vocab_size(self) -> int:
+        """Vocabulary width of draft probabilities before verification."""
+        if self.hot_token_id is not None:
+            return self.hot_token_id.shape[0]
+        return self.draft_runner.model_config.vocab_size
 
     def init_attention_backends(self):
         with (
@@ -791,8 +833,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             get_spec().speculative_use_rejection_sampling
             and not forward_batch.sampling_info.is_all_greedy
         )
+        draft_probs_list: Optional[List[torch.Tensor]] = None
         if needs_draft_probs:
-            draft_probs_list: List[torch.Tensor] = [spec_info.draft_probs]
+            draft_probs_list = [spec_info.draft_probs]
 
         topk1_chain_fits = (
             self.topk == 1
@@ -814,6 +857,27 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 device=topk_index.device,
             )
             draft_tokens_topk1[:, :1].copy_(topk_index)
+
+        # A megakernel's top-1 fold, on a greedy chain without logprobs.
+        captured_fold = fold = forward_batch.draft_step_fold
+        if (
+            draft_tokens_topk1 is None
+            or forward_batch.mm_input_embeds is not None
+            or forward_batch.return_logprob
+        ):
+            fold = None
+        forward_batch.draft_step_fold = fold
+        mrope = None
+        if fold is not None and self.draft_runner.model_config.model_is_mrope:
+            mrope = forward_batch.mrope_positions
+            positions = forward_batch.positions
+            if (
+                mrope.shape != (3, positions.numel())
+                or mrope.dtype != positions.dtype
+                or mrope.untyped_storage().data_ptr()
+                == positions.untyped_storage().data_ptr()
+            ):
+                mrope = None  # aliased operands keep the sequential updates
 
         # Forward multiple steps
         scores = None
@@ -871,11 +935,20 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                         sampling_seed=forward_batch.sampling_info.sampling_seed,
                         positions=forward_batch.positions + 1,
                         draft_step=i + 1,
+                        fused=self.use_fused_draft_sample,
                     )
                     draft_probs_list.append(probs)
                     forward_batch.positions.add_(1)
                 elif self.topk == 1:
-                    if _is_cuda or _is_hip:
+                    if fold is not None:
+                        topk_p, topk_index = fold.finalize(
+                            logits_output.next_token_logits,
+                            forward_batch.positions,
+                            draft_tokens_topk1,
+                            i + 1,
+                            mrope,
+                        )
+                    elif _is_cuda or _is_hip:
                         topk_p, topk_index = draft_topk1_postprocess(
                             logits_output.next_token_logits,
                             forward_batch.positions,
@@ -896,7 +969,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     )
                     topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
                     forward_batch.positions.add_(1)
-                if self.draft_runner.model_config.model_is_mrope:
+                if self.draft_runner.model_config.model_is_mrope and mrope is None:
                     forward_batch.mrope_positions.add_(1)
                 maybe_detect_oob(
                     topk_index,
@@ -907,30 +980,57 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 if self.hot_token_id is not None:
                     topk_index = self.hot_token_id[topk_index]
                 hidden_states = logits_output.hidden_states
-
-        draft_probs = (
-            torch.stack(draft_probs_list, dim=1) if needs_draft_probs else None
-        )
+        forward_batch.draft_step_fold = captured_fold
 
         # Organize the results
-        if draft_tokens_topk1 is not None:
-            bs = draft_tokens_topk1.shape[0]
-            top_scores_index = self._topk1_score_indices_prealloc[:bs]
-            parent_list = self._topk1_parents_prealloc[:bs]
-            return parent_list, top_scores_index, draft_tokens_topk1, draft_probs
-
         if topk1_chain_fits:
-            bs = token_list[0].shape[0]
-            draft_tokens = torch.cat(token_list, dim=1)
+            draft_tokens = draft_tokens_topk1
+            if draft_tokens is None:
+                draft_tokens = torch.cat(token_list, dim=1)
+
+            bs = draft_tokens.shape[0]
             top_scores_index = self._topk1_score_indices_prealloc[:bs]
             parent_list = self._topk1_parents_prealloc[:bs]
-            return parent_list, top_scores_index, draft_tokens, draft_probs
+        else:
+            parent_list, top_scores_index, draft_tokens = organize_draft_results(
+                score_list, token_list, parents_list, self.speculative_num_draft_tokens
+            )
 
-        parent_list, top_scores_index, draft_tokens = organize_draft_results(
-            score_list, token_list, parents_list, self.speculative_num_draft_tokens
-        )
-
+        draft_probs = self._build_verify_draft_probs(draft_probs_list, draft_tokens)
         return parent_list, top_scores_index, draft_tokens, draft_probs
+
+    def _build_verify_draft_probs(
+        self,
+        draft_probs_list: Optional[List[torch.Tensor]],
+        draft_tokens: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        """Stack per-step q and align it with chain slots for verification.
+
+        Row i holds the distribution for chain slot i + 1; the verify kernel reads
+        row ``step - 1`` for slot ``step``. None means the proposal distribution
+        was not collected: rejection sampling is off, or the batch is all-greedy.
+        """
+        if draft_probs_list is None:
+            return None
+        draft_probs = torch.stack(draft_probs_list, dim=1)
+        if not self.draft_probs_need_vocab_scatter:
+            return draft_probs
+        draft_probs = scatter_draft_probs_to_target_vocab(
+            draft_probs, self.hot_token_id, self.target_vocab_size
+        )
+        # Every proposed token must have q > 0. Zero-mass rows are graph filler:
+        # capture warms up on zeroed q, and replay zeroes padded rows.
+        if envs.SGLANG_ENABLE_ASYNC_ASSERT.get():
+            proposed_q = draft_probs.gather(
+                -1, draft_tokens.to(torch.int64).unsqueeze(-1)
+            )
+            has_mass = draft_probs.sum(-1, keepdim=True) > 0
+            maybe_assert_async(
+                ((proposed_q > 0) | ~has_mass).all(),
+                "draft_forward: q == 0 on a proposed draft token; draft_probs rows "
+                "are misaligned with the chain slots or the d2t scatter is wrong",
+            )
+        return draft_probs
 
     def _draft_forward_idle(
         self, forward_batch: ForwardBatch, spec_info: EagleDraftInput
@@ -1080,19 +1180,20 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Assemble the next-iter draft spec_info from the extend output.
         use_rejection_sampling = get_spec().speculative_use_rejection_sampling
-        probs = renorm_draft_probs(
-            logits_output.next_token_logits,
-            batch.sampling_info,
-            use_rejection_sampling,
-        )
         if use_rejection_sampling:
-            topk_p, topk_index = fast_sample(
-                probs,
-                num_samples=1,
+            probs, topk_p, topk_index = sample_draft_proposal(
+                logits_output.next_token_logits,
+                batch.sampling_info.temperatures,
+                # Greedy argmax is free in the fused kernel; the stock chain would add a full-vocab one.
+                batch.sampling_info.top_ks if self.use_fused_draft_sample else None,
                 sampling_seed=batch.sampling_info.sampling_seed,
                 positions=batch.seq_lens,
+                fused=self.use_fused_draft_sample,
             )
         else:
+            probs = renorm_draft_probs(
+                logits_output.next_token_logits, batch.sampling_info, False
+            )
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
         return EagleDraftInput(
             topk_p=topk_p,
@@ -1264,6 +1365,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     batch.sampling_info.top_ks,
                     sampling_seed=batch.sampling_info.sampling_seed,
                     positions=batch_result.new_seq_lens,
+                    fused=self.use_fused_draft_sample,
                 )
             if self.topk == 1 and _is_hip:
                 ret_topk_p, ret_topk_index = draft_topk1_argmax_only(
@@ -1446,30 +1548,25 @@ class EAGLEWorkerV2(BaseSpecWorker):
         super().init_cuda_graphs()
         # Build adaptive runtime states after target and draft backends exist.
         if self.adaptive_controller is not None:
-            with (
-                draft_tp_context(self._draft_worker.parallel_layout),
-                speculative_moe_backend_context(),
-                speculative_moe_a2a_backend_context(),
-            ):
-                self.adaptive_controller.register(
-                    SpecRuntimeState(
-                        speculative_num_steps=self.speculative_num_steps,
-                        speculative_num_draft_tokens=self.speculative_num_draft_tokens,
-                        draft_attn_backend=self._draft_worker.draft_attn_backend,
-                        cuda_graph_runner=self._draft_worker.cuda_graph_runner,
-                        target_attn_backend=self._target_worker.model_runner.attn_backend,
-                        target_graph_runner=self._target_worker.model_runner.decode_cuda_graph_runner,
-                        draft_extend_attn_backend=self._draft_worker.draft_extend_attn_backend,
-                        cuda_graph_runner_for_draft_extend=self._draft_worker.cuda_graph_runner_for_draft_extend,
-                    )
+            self.adaptive_controller.register(
+                SpecRuntimeState(
+                    speculative_num_steps=self.speculative_num_steps,
+                    speculative_num_draft_tokens=self.speculative_num_draft_tokens,
+                    draft_attn_backend=self._draft_worker.draft_attn_backend,
+                    cuda_graph_runner=self._draft_worker.cuda_graph_runner,
+                    target_attn_backend=self._target_worker.model_runner.attn_backend,
+                    target_graph_runner=self._target_worker.model_runner.decode_cuda_graph_runner,
+                    draft_extend_attn_backend=self._draft_worker.draft_extend_attn_backend,
+                    cuda_graph_runner_for_draft_extend=self._draft_worker.cuda_graph_runner_for_draft_extend,
                 )
-                self.adaptive_controller.init_states(
-                    cuda_graph_bs=(
-                        None
-                        if check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED)
-                        else get_exec().graph.cuda_graph_bs_decode
-                    ),
-                )
+            )
+            self.adaptive_controller.init_states(
+                cuda_graph_bs=(
+                    None
+                    if check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED)
+                    else get_exec().graph.cuda_graph_bs_decode
+                ),
+            )
 
     def forward_batch_generation(
         self,
@@ -1518,7 +1615,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     dtype=hidden_dtype,
                     topk=self.topk,
                     capture_hidden_mode=capture_mode,
-                    vocab_size=self.target_worker.model_config.vocab_size,
+                    vocab_size=self.draft_worker.draft_probs_vocab_size,
                 )
             if batch.spec_info is not None and batch.spec_info.is_verify_input():
                 # PP+spec: the scheduler pre-built this round's verify input
@@ -1853,8 +1950,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
             speculative_num_draft_tokens,
             cuda_graph_bs=cuda_graph_bs,
         ):
-            self._draft_worker.init_attention_backend()
-            self._draft_worker._capture_cuda_graphs()
+            # Draft overrides must end before target resources are constructed.
+            with (
+                draft_tp_context(self._draft_worker.parallel_layout),
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+            ):
+                self._draft_worker.init_attention_backend()
+                self._draft_worker._capture_cuda_graphs()
 
             # Build target attention backend and CUDA graph runner
             target_model_runner = self._target_worker.model_runner

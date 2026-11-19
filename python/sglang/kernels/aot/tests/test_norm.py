@@ -1,6 +1,8 @@
 # Adapted from https://github.com/flashinfer-ai/flashinfer/blob/4e8eb1879f9c3ba6d75511e5893183bf8f289a62/tests/test_norm.py
 
+import importlib.util
 import sys
+from pathlib import Path
 
 import pytest
 import sgl_kernel
@@ -196,6 +198,16 @@ def test_gemma_fused_add_rmsnorm(batch_size, hidden_size, dtype):
 
     torch.testing.assert_close(x_fused, x_native, rtol=1e-3, atol=1e-3)
     torch.testing.assert_close(residual_fused, residual_native, rtol=1e-3, atol=1e-3)
+
+
+def test_bench_rmsnorm_verify_reports_match():
+    """`bench_rmsnorm.py --verify_only` must report a pass when the implementations agree."""
+    bench_path = Path(__file__).parents[1] / "benchmark" / "bench_rmsnorm.py"
+    spec = importlib.util.spec_from_file_location("bench_rmsnorm", bench_path)
+    bench_rmsnorm = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bench_rmsnorm)
+    torch.manual_seed(0)
+    assert bench_rmsnorm.calculate_diff(4, 128, 4096, use_residual=False) is True
 
 
 if __name__ == "__main__":

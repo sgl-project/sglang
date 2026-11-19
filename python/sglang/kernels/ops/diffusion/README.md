@@ -75,6 +75,10 @@ and FP8/NVFP4 producers can belong to the selected model or deployment path.
 The request `quality` tier neither selects nor disables those independent
 choices.
 
+Sana image LN+modulation fusion is limited to CUDA-graph streams. SANA-Video
+also enables it for default-stream inference, retaining the same per-signature
+bit-exact verification and fallback.
+
 SANA-Video's depthwise convolution/GLU fusion reuses input rows and avoids
 materializing the convolution output. It is enabled for large (`numel >= 2**24`)
 channels-last BF16 inputs with cuDNN enabled on SM120, after an exact comparison with the existing
@@ -86,6 +90,12 @@ SANA-WM uses a different convolution/bias rounding contract and is unchanged.
 SANA-Video's quality-gated linear-attention site keeps BF16 inputs for the
 first GEMM while requesting FP32 accumulation/output, then runs the second
 GEMM in FP32. The default path still promotes Q/K/V before both GEMMs.
+
+SANA-Video 2.0's quality-gated softmax-attention site hands the anchor layers'
+BF16-valued Q/K/V to SDPA without the FP32 upcast, so flash attention is
+eligible instead of the FP32 memory-efficient kernel. Accumulation stays FP32
+inside the kernel; the probabilities round to BF16 before the PV GEMM. The
+default path still promotes Q/K/V to FP32.
 
 ## Entry-point protocol
 
@@ -206,11 +216,10 @@ tensor copy at each residual site.
 | `try_fused_flux2_qkv_epilogue` | KDA (JIT CUDA) | bit-exact vs the selected BF16 chain | FLUX.2 QK RMSNorm + RoPE + joint QKV packing |
 | `try_fused_qwen_qkv_epilogue` | JIT CUDA | bit-exact vs the selected BF16 chain | Qwen-Image QK RMSNorm + RoPE + joint QKV writes; SM90+ |
 | `rmsnorm_cast_before_weight_rope_bitexact` | Triton | ATen-ordered RMSNorm plus exact BF16 rotate-half RoPE, MOSS-Image width 128 |
-| `fused_rope_rotate_half_bitexact` | Triton | bit-exact (elementwise only) |
+| `fused_rope_rotate_half_bitexact` | Triton | separate BF16 rounding after each product and the sum; HiDream-O1-Image reuses it for contiguous Q/K with first-call verification and eager fallback |
 | `fused_rope_rotate_half_fp32` | Triton | paired split-half Q/K RoPE with separately rounded FP32 products and sum before the FP16/BF16 cast; Anima verifies each new signature against eager |
 | `flux3_video_qknorm_rope` | Triton | bit-exact vs affine-free ``nn.RMSNorm`` (head dim 64) plus eager rotate-half RoPE; FLUX 3 video VAE, ``eps=1e-5`` |
 | `fused_complex_rope` | Triton | preserves CUDA complex64 multiply rounding for contiguous BSHD inputs; Qwen-Image 2.1 verifies its first call against eager |
-| `rmsnorm_preserve_reduction` | Triton + aten | preserves the FP32 mean reduction and cast-before-weight rounding; fuses only pointwise work for FP16/BF16 inputs and materializes strided inputs as contiguous; Qwen-Image 2.1 verifies its first call |
 | `qknorm_complex_rope_cuda` / `qknorm_complex_rope_pack_` | JIT CUDA | bit-exact vs `RMSNorm(cast_x_before_out_mul=True)` + complex64 RoPE for head_dim 128; both accept token-strided views of a packed QKV buffer; the pack variant normalizes Q and K in place behind a prefix and copies prefix K/V (and optionally V) in the same launch; Qwen-Image 2.1 verifies its first call |
 | `fused_interleaved_rope_fp64` | JIT CUDA | bit-exact vs paired SANA-Video fp64 RoPE |
 | `fused_inplace_helios_qk_rope` | JIT CUDA | bit-exact paired in-place RoPE for Helios' transposed frequency layout |
