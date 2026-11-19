@@ -2,6 +2,7 @@
 writes the padded rows the aiter MoE expects; the BF16 linear keeps tuned shapes on tgemm."""
 
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
@@ -12,6 +13,7 @@ from sglang.kernels.ops.gemm.router_gemv_hip import (
     rocm_router_reduce_partials,
 )
 from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate
+from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
@@ -91,6 +93,87 @@ class TestAiterJitRouterGate(CustomTestCase):
                 self.assertFalse(topk._aiter_uses_jit_router(1, 1, True, 1))
             with mock.patch.object(topk, "_is_gfx95", False):
                 self.assertFalse(topk._aiter_uses_jit_router(1, 1, False, 1))
+
+
+@unittest.skipUnless(is_hip() and is_gfx95_supported(), "ROCm gfx95 only")
+class TestSharedExpertsFusionDisabled(CustomTestCase):
+    """--disable-shared-experts-fusion leaves no shared slot for the Triton router."""
+
+    def test_gate_needs_a_global_shared_slot(self):
+        """The split-K GEMV serves the gate only when the Triton router will read its
+        partials: one global fused shared slot, not zero and not per-rank slots."""
+        from sglang.srt.models.deepseek_common.amd import deepseek_v2_hip_moe as hip_moe
+
+        if not hip_moe._use_aiter:
+            self.skipTest("needs SGLANG_USE_AITER=1")
+        gate = SimpleNamespace(
+            is_deepseek_v4=False,
+            weight=torch.empty(NUM_EXPERTS, HIDDEN, dtype=torch.bfloat16),
+        )
+        config = SimpleNamespace(
+            scoring_func="sigmoid",
+            topk_method="noaux_tc",
+            n_group=1,
+            topk_group=1,
+            n_routed_experts=NUM_EXPERTS,
+            hidden_size=HIDDEN,
+        )
+
+        def max_tokens(num_fused, per_rank=False):
+            model = SimpleNamespace(
+                shared_experts=SharedExpertsConfig(
+                    fusion_disabled=num_fused == 0, num_fused_shared_experts=num_fused
+                )
+            )
+            with mock.patch.object(hip_moe, "get_model", return_value=model):
+                with mock.patch.object(
+                    hip_moe, "has_per_rank_fused_shared_slots", return_value=per_rank
+                ):
+                    return hip_moe.router_max_tokens(gate, config, is_hash_moe=False)
+
+        self.assertEqual(max_tokens(1), ROCM_GLM_ROUTER_MAX_TOKENS)
+        self.assertEqual(max_tokens(0), -1)
+        self.assertEqual(max_tokens(1, per_rank=True), -1)
+
+    def test_partials_without_shared_slot_reduce_first(self):
+        """Partials reaching select_experts with no shared slot are reduced into the
+        logits before routing, matching a run on the reduced logits."""
+        from sglang.srt.layers.moe.topk import (
+            TopKConfig,
+            TopKOutputFormat,
+            select_experts,
+        )
+
+        gen = torch.Generator(device="cuda").manual_seed(0)
+        weight = (
+            torch.randn(NUM_EXPERTS, HIDDEN, device="cuda", generator=gen) * 0.02
+        ).to(torch.bfloat16)
+        x = torch.randn(36, HIDDEN, device="cuda", generator=gen).to(torch.bfloat16)
+        config = TopKConfig(
+            top_k=TOPK,
+            use_grouped_topk=True,
+            topk_group=1,
+            num_expert_group=1,
+            renormalize=True,
+            shared_experts=SharedExpertsConfig(fusion_disabled=True),
+            correction_bias=torch.randn(NUM_EXPERTS, device="cuda", generator=gen),
+            routed_scaling_factor=SCALE,
+            output_format=TopKOutputFormat.STANDARD,
+            scoring_func="sigmoid",
+        )
+        partials = rocm_router_gemv_split_k(x, weight)
+        logits = torch.empty(x.shape[0], NUM_EXPERTS, device="cuda")
+        rocm_router_reduce_partials(partials, logits)
+        ref = select_experts(x, logits.clone(), config)
+        out = select_experts(
+            x,
+            torch.empty_like(logits),
+            config,
+            router_logits_partials=partials,
+        )
+        self.assertEqual(out.topk_ids.shape[1], TOPK)
+        self.assertTrue(torch.equal(out.topk_ids, ref.topk_ids))
+        self.assertTrue(torch.equal(out.topk_weights, ref.topk_weights))
 
 
 @unittest.skipUnless(is_hip() and is_gfx95_supported(), "ROCm gfx95 only")
