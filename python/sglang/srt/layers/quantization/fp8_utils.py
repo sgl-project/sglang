@@ -756,10 +756,6 @@ if get_platform().is_sm90 and is_flashinfer_available():
 # "NVIDIA H20-3e" match, "NVIDIA H200" does not.
 _H20_NAME = re.compile(r"NVIDIA H20($|[-\s])")
 
-# Scale layouts fp8_blockscale_gemm_sm90 can read: per-token (block [1, 128]) and
-# per-block ([128, 128]). It takes no block size, so anything else is delegated.
-_SWAPAB_BLOCK_LAYOUTS = ([1, 128], [128, 128])
-
 
 def _h20_swapab_opt_out() -> bool:
     """Whether an opt-in feature pins block-FP8 GEMM to one kernel for every M."""
@@ -1572,14 +1568,17 @@ def flashinfer_deepgemm_w8a8_block_fp8_linear_with_fallback(
 
     For SM90 (Hopper), this uses the DeepGEMM JIT with automatic swapAB selection.
     """
-    if input_scale is not None or list(block_size) not in _SWAPAB_BLOCK_LAYOUTS:
-        # fp8_blockscale_gemm_sm90 quantizes the activation itself and takes no
-        # static per-tensor input scale, and its scale tensor is per-token
-        # ([1, 128]) or per-block ([128, 128]) -- the call below passes no block
-        # size, so any other layout would index the wrong scales. DeepGEMM is the
-        # runner `auto` used for those checkpoints before this change, and falls
-        # back to Triton on its own; without JIT DeepGEMM, go straight to Triton
-        # rather than assert inside it.
+    # fp8_blockscale_gemm_sm90 quantizes the activation itself and takes no static
+    # per-tensor input scale, and its scale tensor is per-token (block 1x128) or
+    # per-block (128x128) -- the call below passes no block size, so any other
+    # layout would index the wrong scales. DeepGEMM is the runner `auto` used for
+    # those checkpoints before this change, and falls back to Triton on its own;
+    # without JIT DeepGEMM, go straight to Triton rather than assert inside it.
+    # Unpacked and compared as ints because this runs on every call, not just at
+    # runner selection: allocating `list(block_size)` here shows up on the eager
+    # decode path.
+    block_n, block_k = block_size
+    if input_scale is not None or block_k != 128 or block_n not in (1, 128):
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
             return deepgemm_w8a8_block_fp8_linear_with_fallback(
                 input, weight, block_size, weight_scale, input_scale, bias
