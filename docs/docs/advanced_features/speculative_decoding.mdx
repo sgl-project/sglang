@@ -751,7 +751,7 @@ python3 -m sglang.launch_server \
     --speculative-pard2-mode target-independent
 ```
 
-With `--dtype auto`, the draft runs in the target's dtype. An explicit `--dtype` applies to both models. The draft attention backend follows the target unless `--speculative-draft-attention-backend` is set. The draft keeps its own KV cache in the device pool (and, in target-dependent mode, a per-token feature buffer), so the static memory fraction covers both models. See [OOM Troubleshooting](#oom-troubleshooting) if the server runs out of memory.
+With `--dtype auto`, the draft runs in bfloat16, the dtype of its weights. An explicit `--dtype` applies to both models. The draft attention backend follows the target unless `--speculative-draft-attention-backend` is set. The draft keeps its own KV cache in the device pool (and, in target-dependent mode, a per-token feature buffer), so the static memory fraction covers both models. See [OOM Troubleshooting](#oom-troubleshooting) if the server runs out of memory.
 
 Startup logs a line beginning `PARD2 draft worker: mode=`, including whether `target_proj` was loaded and the verify width with its K.
 
@@ -774,42 +774,11 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)
 ```
 
-### Supported and rejected combinations
+### Limitations
 
-Supported together with PARD2:
+PARD2 needs a Qwen3 PARD-2 draft (`spd_type` `pard2`, `pard_token`, `pard2_target_layers`) whose vocabulary matches the target, one AMD GPU (`--tp-size 1`, no PP, DP attention or context parallelism), `--page-size 1`, and a single chain (`--speculative-num-steps 1`, `--speculative-eagle-topk 1`). Overlap scheduling, the prefix cache, chunked prefill, sampling and log probabilities work with it.
 
-- A Qwen3 draft (`model_type` `qwen3`, architecture `Qwen3ForCausalLM`) whose `config.json` has `spd_type` `pard2` (or `pard2` true), `pard_token`, and a non-empty `pard2_target_layers`, and whose vocabulary size matches the target.
-- `--speculative-pard2-mode` `auto`, `target-dependent`, or `target-independent`, as resolved above.
-- `--speculative-num-draft-tokens` of 2 or more (16 when omitted), `--speculative-num-steps` 1, and `--speculative-eagle-topk` 1.
-- `--tp-size 1`, `--pp-size 1`, no DP attention, `--attn-cp-size 1`, and `--dcp-size 1`.
-- `--page-size 1`, or page size left unset (the launch path resolves that to 1).
-- Overlap scheduling, including `--disable-overlap-schedule`.
-- The prefix cache, chunked prefill, greedy and sampled decoding, and returned log probabilities.
-- `--speculative-draft-attention-backend` as an override of the draft attention backend.
-
-Rejected at startup:
-
-- `--speculative-draft-model-path` omitted.
-- A draft that is not a PARD-2 checkpoint (missing `spd_type` `pard2` or `pard2` true, `pard_token`, or `pard2_target_layers`).
-- A draft whose `model_type` is not `qwen3` or whose first architecture is not `Qwen3ForCausalLM`.
-- A draft vocabulary size different from the target's.
-- A `pard2_target_layers` entry outside `-num_hidden_layers` through `-1`.
-- `--speculative-pard2-mode target-dependent` when `warp_model.bin` is missing or `target_hidden_size * len(pard2_target_layers)` does not equal `pard2_target_dim`.
-- `--speculative-num-draft-tokens` below 2.
-- `--speculative-eagle-topk` other than 1.
-- `--tp-size` above 1, `--pp-size` above 1, DP attention, `--attn-cp-size` above 1, or `--dcp-size` above 1.
-- PD disaggregation (`--disaggregation-mode` other than `null`).
-- `--enable-hierarchical-cache`, `--enable-hisparse`, `--enable-unified-memory`, `--speculative-draft-window-size`, or `--speculative-dflash-draft-kv-ring`. The draft KV and the feature buffer live only in the device pool.
-- `--page-size` other than 1.
-- `--enable-mixed-chunk`.
-- `--speculative-adaptive`, `--speculative-use-block-verification`, or `SGLANG_RAGGED_VERIFY_MODE` set to anything other than static.
-- `--enable-lora`, or any LoRA path.
-- A device other than an AMD GPU (ROCm).
-
-Rejected per request (the request is aborted; the server stays up):
-
-- `return_hidden_states` while overlap scheduling is on.
-- Constrained decoding: a grammar, JSON schema, regex, EBNF, or structural tag.
+Startup rejects PD disaggregation, `--enable-hierarchical-cache`, `--enable-hisparse`, `--enable-unified-memory`, `--speculative-draft-window-size`, `--speculative-dflash-draft-kv-ring`, `--enable-mixed-chunk`, `--speculative-use-block-verification`, LoRA, and `SGLANG_RAGGED_VERIFY_MODE` other than static; `--speculative-adaptive` is turned off with a warning. Requests with constrained decoding, or with `return_hidden_states` under overlap scheduling, are aborted.
 
 ---
 

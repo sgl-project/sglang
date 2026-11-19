@@ -305,16 +305,12 @@ def pard2_capture_layer_ids(target_layers, target_num_layers: int) -> list[int]:
     """
     from sglang.srt.models.qwen3_pard2 import PARD2_FINAL_LAYER
 
-    capture_ids = []
-    for layer in target_layers:
-        if not isinstance(layer, int) or not -target_num_layers <= layer <= -1:
-            raise ValueError(
-                f"pard2_target_layers entry {layer} is out of range for a "
-                f"target with {target_num_layers} layers."
-            )
-        if layer != PARD2_FINAL_LAYER:
-            capture_ids.append(target_num_layers + layer)
-    return sorted(capture_ids)
+    # Entries are in [-n, -1]: _handle_pard2 rejects others at startup.
+    return sorted(
+        target_num_layers + layer
+        for layer in target_layers
+        if layer != PARD2_FINAL_LAYER
+    )
 
 
 def _resolve_pard2_aux_hidden_state(

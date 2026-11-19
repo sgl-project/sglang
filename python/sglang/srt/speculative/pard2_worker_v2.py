@@ -61,7 +61,6 @@ from sglang.srt.speculative.draft_worker_common import (
     make_draft_input_v2,
 )
 from sglang.srt.speculative.pard2_utils import (
-    draft_rows_to_tokens,
     fill_draft_block,
     gather_shifted_features,
     repeat_last_feature,
@@ -132,12 +131,7 @@ class Pard2WorkerV2(BaseSpecWorker):
         self.block_size = int(get_spec().speculative_num_draft_tokens)
         self.speculative_num_draft_tokens = self.block_size
         self.pard_token = int(draft_hf_config.pard_token)
-        self.target_dependent = get_spec().speculative_pard2_mode == "target-dependent"
-        if self.target_dependent != self.draft_model.target_dependent:
-            raise RuntimeError(
-                "PARD2 draft model mode does not match --speculative-pard2-mode "
-                f"{get_spec().speculative_pard2_mode}."
-            )
+        self.target_dependent = self.draft_model.target_dependent
         self.p_buf: Optional[torch.Tensor] = None
         self._draft_block_spec_info = make_draft_block_spec_info(
             draft_token_num=self.block_size, device=self.device
@@ -202,13 +196,6 @@ class Pard2WorkerV2(BaseSpecWorker):
                 dtype=self.draft_model_runner.dtype,
                 device=self.device,
             )
-            if get_parallel().tp_rank == 0:
-                logger.info(
-                    "PARD2 feature buffer: %d slots x %d, %.2f GB",
-                    num_slots,
-                    self.p_buf.shape[1],
-                    self.p_buf.numel() * self.p_buf.element_size() / (1 << 30),
-                )
 
     def init_attention_backends(self):
         with draft_tp_context(self.draft_parallel_layout):
@@ -233,10 +220,6 @@ class Pard2WorkerV2(BaseSpecWorker):
             return self._forward_extend(batch, on_publish=on_publish)
         if batch.spec_info is None:
             batch.spec_info = DFlashDraftInputV2.create_idle_input(device=self.device)
-        if not isinstance(batch.spec_info, DFlashDraftInputV2):
-            raise RuntimeError(
-                "PARD2 expected DFlashDraftInputV2 state on the running batch."
-            )
         if batch.forward_mode.is_idle():
             return self._forward_idle(on_publish=on_publish)
         return self._forward_decode(batch, on_publish=on_publish)
@@ -305,15 +288,6 @@ class Pard2WorkerV2(BaseSpecWorker):
     ) -> None:
         aux = logits_output.hidden_states
         final = logits_output.last_hidden_states
-        if self.draft_model.num_target_aux_layers and aux is None:
-            raise RuntimeError(
-                "PARD2 target-dependent mode needs the target's aux hidden states."
-            )
-        if self.draft_model.uses_target_final and final is None:
-            raise RuntimeError(
-                "PARD2 target-dependent mode needs the target's post-norm final "
-                "hidden states."
-            )
         num_rows = slots.shape[0]
         projected = self.draft_model.project(
             None if aux is None else aux[:num_rows],
@@ -349,12 +323,8 @@ class Pard2WorkerV2(BaseSpecWorker):
                 forward_batch.extend_seq_lens,
                 output_size=positions.shape[0],
             )
-            _, features = gather_shifted_features(
-                self.p_buf,
-                self.req_to_token_pool.req_to_token,
-                req_rows,
-                positions,
-                forward_batch.input_ids,
+            features = gather_shifted_features(
+                self.p_buf, self.req_to_token_pool.req_to_token, req_rows, positions
             )
         forward_batch.input_embeds = self._draft_embeds(
             input_ids=forward_batch.input_ids, features=features
@@ -417,11 +387,9 @@ class Pard2WorkerV2(BaseSpecWorker):
             seq_lens_cpu=seq_lens_cpu,
             seq_lens_sum=seq_lens_sum,
         ).view(bs, block_size, -1)
-        lm_head_weight = self._lm_head_weight()
-        row_logits = torch.matmul(draft_hidden, lm_head_weight.T)
-        draft_tokens = torch.cat(
-            [block_ids[:, :1], draft_rows_to_tokens(row_logits)], dim=1
-        )
+        # Row W - 1 is unused: the K drafts are the argmax of rows 0 .. W - 2.
+        row_logits = torch.matmul(draft_hidden[:, :-1], self._lm_head_weight().T)
+        draft_tokens = torch.cat([block_ids[:, :1], row_logits.argmax(dim=-1)], dim=1)
         del row_logits
 
         logits_output, can_run_cuda_graph = self._verify(
@@ -454,12 +422,8 @@ class Pard2WorkerV2(BaseSpecWorker):
         # Context pass: the verify rows at their own positions write the draft KV.
         context_features = None
         if self.target_dependent:
-            _, context_features = gather_shifted_features(
-                self.p_buf,
-                req_to_token,
-                batch.req_pool_indices,
-                positions_2d,
-                draft_tokens,
+            context_features = gather_shifted_features(
+                self.p_buf, req_to_token, batch.req_pool_indices, positions_2d
             )
         self._run_draft_block(
             batch=batch,
@@ -544,10 +508,7 @@ class Pard2WorkerV2(BaseSpecWorker):
         iteration_ids.bind(forward_batch, self.draft_model_runner.runner_ids)
         with torch.inference_mode(), draft_tp_context(self.draft_parallel_layout):
             draft_out = self.draft_model_runner.forward(forward_batch)
-        hidden = draft_out.logits_output.hidden_states
-        if hidden is None:
-            raise RuntimeError("PARD2 draft model returned no hidden states.")
-        return hidden[:num_tokens]
+        return draft_out.logits_output.hidden_states[:num_tokens]
 
     def _verify(
         self,

@@ -1110,7 +1110,8 @@ class ModelConfig:
         )
         dtype = cfg.dtype
         if is_draft_model and cfg.speculative_algorithm == "PARD2" and dtype == "auto":
-            dtype = _target_auto_dtype(cfg)
+            # A PARD-2 draft ships BF16 weights under a float32 config.
+            dtype = "bfloat16"
         return ModelConfig(
             model_path=model_path or cfg.model_path,
             trust_remote_code=cfg.trust_remote_code,
@@ -2508,20 +2509,6 @@ _STR_DTYPE_TO_TORCH_DTYPE = {
     "float32": torch.float32,
     "bfloat16": torch.bfloat16,
 }
-
-
-def _target_auto_dtype(cfg) -> str:
-    # A PARD-2 draft ships BF16 weights under a float32 config, which auto maps
-    # to float16; the draft runs at the target's dtype instead.
-    target_config = get_config(
-        cfg.model_path,
-        trust_remote_code=cfg.trust_remote_code,
-        revision=cfg.revision,
-        model_override_args=json.loads(cfg.json_model_override_args),
-        model_config_parser=cfg.model_config_parser,
-    )
-    dtype = _get_and_verify_dtype(get_hf_text_config(target_config), "auto")
-    return str(dtype).removeprefix("torch.")
 
 
 # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
