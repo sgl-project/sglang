@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Optional
 import numpy
 import torch
 
+from sglang.srt.layers import vocab_parallel_embedding
 from sglang.srt.layers.quantization.utils import (
     get_scalar_types,
     pack_cols,
@@ -208,11 +209,10 @@ def check_marlin_supports_shape(
 
 
 def check_marlin_supports_layer(layer: torch.nn.Module, group_size: int) -> bool:
-    from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
-
-    if isinstance(layer, ParallelLMHead):
+    if isinstance(layer, vocab_parallel_embedding.ParallelLMHead):
         output_size_per_partition = layer.num_embeddings_padded // layer.tp_size
-        input_size_per_partition = input_size = layer.embedding_dim
+        input_size_per_partition = layer.embedding_dim
+        input_size = layer.embedding_dim
     else:
         output_size_per_partition = (
             getattr(layer, "output_size_per_partition", None) or layer.output_size
