@@ -460,9 +460,8 @@ class FunctionCallParser:
         ):
             if not allow_full_assistant_grammar:
                 return None
-            return (
-                "full_assistant_ebnf",
-                generate_glm_answer_grammar(
+            try:
+                grammar = generate_glm_answer_grammar(
                     enable_thinking=thinking_mode,
                     functions=[tool.function for tool in self.tools],
                     special_tokens=GlmSpecialTokenConfig(),
@@ -470,8 +469,12 @@ class FunctionCallParser:
                     parallel_tool_calls=parallel_tool_calls,
                     any_whitespace=any_whitespace,
                     max_whitespace_cnt=max_whitespace_cnt,
-                ),
-            )
+                )
+            except RuntimeError:
+                # An invalid schema keeps the plain json path, where the
+                # grammar backend rejects the request with a 400.
+                return None
+            return ("full_assistant_ebnf", grammar)
         strict_arguments = self._constrains_auto_arguments()
         structural_tag = self.detector.get_answer_structural_tag(
             tools=self.structural_tag_tools() if strict_arguments else self.tools,

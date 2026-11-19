@@ -2893,6 +2893,8 @@ class ServingChatTestCase(CustomTestCase):
             "uniqueItems": True,
         }
         cases = [
+            # Compiling it in the frontend raised and turned a 400 into a 500.
+            ("glm47", {"schema": {"type": "string", "pattern": "(("}}, {}, {}),
             ("glm47", {"schema": nul_schema}, {}, {}),
             ("kimi_k3", {"schema": nul_schema}, {}, {}),
             ("glm47", {"schema": unique_schema}, {}, {}),
