@@ -2758,8 +2758,15 @@ class ServingChatTestCase(CustomTestCase):
             },
         )
 
+    _WORD_ANSWER_SCHEMA = {
+        "type": "object",
+        "properties": {"word": {"type": "string"}},
+        "required": ["word"],
+        "additionalProperties": False,
+    }
+
     def _auto_tools_with_json_answer_sampling_params(
-        self, parser_name, strict, enable_thinking=False
+        self, parser_name, strict, enable_thinking=False, schema=None
     ):
         self.template_manager.chat_template_name = None
         self.template_manager.jinja_template_content_format = "string"
@@ -2787,12 +2794,7 @@ class ServingChatTestCase(CustomTestCase):
                 "type": "json_schema",
                 "json_schema": {
                     "name": "answer",
-                    "schema": {
-                        "type": "object",
-                        "properties": {"word": {"type": "string"}},
-                        "required": ["word"],
-                        "additionalProperties": False,
-                    },
+                    "schema": schema or self._WORD_ANSWER_SCHEMA,
                 },
             },
             chat_template_kwargs={"enable_thinking": enable_thinking},
@@ -2879,6 +2881,89 @@ class ServingChatTestCase(CustomTestCase):
             json.loads(params["json_schema"])["properties"],
             {"word": {"type": "string"}},
         )
+
+    def test_auto_tools_with_json_answer_keeps_backend_checks(self):
+        """A schema the json backend rejects, a backend that cannot compile
+        the combined grammar, or strict thinking that a GLM full-turn grammar
+        would bypass keeps the plain json path and its checks."""
+        nul_schema = {"type": "string", "pattern": "\x00"}
+        unique_schema = {
+            "type": "array",
+            "items": {"type": "string"},
+            "uniqueItems": True,
+        }
+        cases = [
+            ("glm47", {"schema": nul_schema}, {}, {}),
+            ("kimi_k3", {"schema": nul_schema}, {}, {}),
+            ("glm47", {"schema": unique_schema}, {}, {}),
+            ("kimi_k3", {"schema": unique_schema}, {}, {}),
+            ("glm47", {}, {"grammar_backend": "outlines"}, {}),
+            ("kimi_k3", {}, {"grammar_backend": "outlines"}, {}),
+            ("glm47", {}, {}, {"enable_strict_thinking": True}),
+        ]
+        for parser_name, kwargs, config, server_args in cases:
+            with self.subTest(parser=parser_name, config=config or server_args):
+                self.tm._config_overrides.update(config)
+                with get_context().override_server_args(**server_args):
+                    params = self._auto_tools_with_json_answer_sampling_params(
+                        parser_name, strict=parser_name == "kimi_k3", **kwargs
+                    )
+                self.tm._config_overrides.clear()
+
+                self.assertEqual(
+                    json.loads(params["json_schema"]),
+                    kwargs.get("schema", self._WORD_ANSWER_SCHEMA),
+                )
+                self.assertIsNone(params.get("ebnf"))
+                self.assertIsNone(params.get("structural_tag"))
+
+    def test_glm_auto_tools_with_json_answer_follows_effective_reasoning(self):
+        """GLM-5.3 thinks even with enable_thinking=false, so the answer grammar
+        must admit the thinking block the reasoning parser expects."""
+        self.chat.reasoning_parser = "glm45"
+        self.template_manager.reasoning_config = ReasoningToggleConfig(
+            special_case="always"
+        )
+        params = self._auto_tools_with_json_answer_sampling_params(
+            "glm47", strict=False, enable_thinking=False
+        )
+
+        grammar = Grammar.from_ebnf(params["ebnf"])
+        self.assertTrue(
+            _is_grammar_accept_string(grammar, 'Plan.</think>{"word": "banana"}')
+        )
+        self.assertFalse(_is_grammar_accept_string(grammar, '{"word": "banana"}'))
+
+    def test_glm_auto_tools_with_json_answer_keeps_whitespace_cap(self):
+        """--constrained-json-max-whitespace-cnt bounds the answer branch as it
+        bounds a plain json_schema request."""
+        with get_context().override_server_args(constrained_json_max_whitespace_cnt=1):
+            params = self._auto_tools_with_json_answer_sampling_params(
+                "glm47", strict=False
+            )
+
+        grammar = Grammar.from_ebnf(params["ebnf"])
+        for output, allowed in (
+            (' {"word": "banana"}', True),
+            ('   {"word": "banana"}', False),
+            ('{"word":    "banana"}', False),
+        ):
+            with self.subTest(output=output):
+                self.assertEqual(_is_grammar_accept_string(grammar, output), allowed)
+
+    def test_kimi_k3_answer_without_tool_call_drops_response_markers(self):
+        """With only the kimi_k3 tool parser, a JSON answer that calls no tool
+        must not carry the response-channel markers into message.content."""
+        self.chat.tool_call_parser = "kimi_k3"
+        tool_calls, text, _ = self.chat._process_tool_calls(
+            text='{"word": "hi"}<|close|>response<|sep|><|close|>message<|sep|>',
+            tools=[{"type": "function", "function": {"name": "read_file"}}],
+            finish_reason={"type": "stop", "matched": None},
+            tool_choice="auto",
+        )
+
+        self.assertIsNone(tool_calls)
+        self.assertEqual(text, '{"word": "hi"}')
 
     def test_dsv_tool_choice_none_omits_tools_from_prompt(self):
         self.template_manager.chat_template_name = None

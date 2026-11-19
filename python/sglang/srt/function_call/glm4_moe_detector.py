@@ -1134,6 +1134,8 @@ def generate_glm_answer_grammar(
     special_tokens: GlmSpecialTokenConfig,
     answer_json_schema: str,
     parallel_tool_calls: bool = True,
+    any_whitespace: bool = True,
+    max_whitespace_cnt: Optional[int] = None,
 ) -> str:
     """A glm47 assistant turn that either calls at least one tool or answers
     with JSON matching `answer_json_schema` after the thinking block."""
@@ -1150,9 +1152,16 @@ def generate_glm_answer_grammar(
         parallel_tool_calls=parallel_tool_calls,
         allow_text_before_tool_calls=False,
     )
+    # Mirrors the json backend's whitespace flags, which this schema bypasses.
+    if not any_whitespace:
+        leading_whitespace = ""
+    elif max_whitespace_cnt is not None:
+        leading_whitespace = f" [ \\t\\r\\n]{{0,{max_whitespace_cnt}}}"
+    else:
+        leading_whitespace = " [ \\t\\r\\n]*"
     answer_prefix = _glm_join_rules(
         [
-            "root ::= thinking_block [ \\t\\r\\n]*",
+            f"root ::= thinking_block{leading_whitespace}",
             *_glm_thinking_rules(
                 enable_thinking=enable_thinking,
                 special_tokens=special_tokens,
@@ -1164,7 +1173,11 @@ def generate_glm_answer_grammar(
     # union/concat rename clashing rules, e.g. both sides define basic_number.
     answer_turn = Grammar.concat(
         Grammar.from_ebnf(answer_prefix),
-        Grammar.from_json_schema(answer_json_schema),
+        Grammar.from_json_schema(
+            answer_json_schema,
+            any_whitespace=any_whitespace,
+            max_whitespace_cnt=max_whitespace_cnt,
+        ),
     )
     return str(Grammar.union(Grammar.from_ebnf(tool_turn), answer_turn))
 

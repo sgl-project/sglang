@@ -47,6 +47,11 @@ _CHAT_TEMPLATE_CLIENT_ERRORS: tuple[type[BaseException], ...] = (
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 from jsonschema import Draft202012Validator, SchemaError
 
+from sglang.srt.constrained.base_grammar_backend import _grammar_key_contains_nul
+from sglang.srt.constrained.json_schema_validation import (
+    UnsupportedJSONSchemaFeature,
+    validate_xgrammar_json_schema,
+)
 from sglang.srt.entrypoints.openai import (
     chat_encoding,
     chat_encoding_adapters,
@@ -106,6 +111,7 @@ from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.function_call.kimik3_detector import KimiK3Detector
+from sglang.srt.function_call.kimik3_format import strip_response_wrappers
 from sglang.srt.function_call.utils import (
     get_json_schema_constraint,
     normalize_json_schema_types,
@@ -1758,18 +1764,34 @@ class OpenAIServingChat(OpenAIServingBase):
         thinking_mode: bool,
     ) -> Optional[ToolCallConstraint]:
         """The constraint admitting tool calls or the JSON answer, or None
-        when there is no JSON answer or the parser cannot express both."""
+        when there is no JSON answer or the parser cannot express both.
+
+        None keeps the answer on the plain json path, whose backend checks
+        reject a bad schema instead of the combined grammar bypassing them.
+        """
         if (
             answer_json_schema is None
             or request.tool_choice != "auto"
             # Response templates frame a JSON answer with their own grammar.
             or isinstance(parser.detector, ResponseTemplateToolDetector)
+            # Other backends cannot compile the combined EBNF or structural tag.
+            or self.tokenizer_manager.config_value("grammar_backend") != "xgrammar"
+            or _grammar_key_contains_nul("json", answer_json_schema)
         ):
+            return None
+        try:
+            validate_xgrammar_json_schema(json.loads(answer_json_schema))
+        except (UnsupportedJSONSchemaFeature, json.JSONDecodeError):
             return None
         return parser.get_answer_structure_constraint(
             answer_json_schema,
             parallel_tool_calls=request.parallel_tool_calls,
             thinking_mode=thinking_mode,
+            any_whitespace=not get_serving().constrained_json_disable_any_whitespace,
+            max_whitespace_cnt=get_serving().constrained_json_max_whitespace_cnt,
+            # A full-assistant grammar owns the thinking block, so the reasoner
+            # wrapper that enforces strict thinking and thinking_budget is skipped.
+            allow_full_assistant_grammar=not get_serving().enable_strict_thinking,
         )
 
     def _process_messages(
@@ -1835,7 +1857,14 @@ class OpenAIServingChat(OpenAIServingBase):
             parser = FunctionCallParser(effective_tools, self.tool_call_parser)
             glm_thinking = True if enable_thinking is None else bool(enable_thinking)
             tool_call_constraint = self._answer_tool_call_constraint(
-                request, parser, answer_json_schema, thinking_mode=glm_thinking
+                request,
+                parser,
+                answer_json_schema,
+                # GLM-5.3 thinks even with enable_thinking=false, and a grammar
+                # without the block leaves the JSON in reasoning_content.
+                thinking_mode=(
+                    thinking_mode if self.reasoning_parser else glm_thinking
+                ),
             )
             tool_call_constraint_covers_answer = tool_call_constraint is not None
             if tool_call_constraint is None:
@@ -3371,6 +3400,11 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
                 logger.debug("Unparsed required tool call output: %r", text[:2000])
                 return ToolCallProcessingResult(None, text, finish_reason)
+
+            if isinstance(parser.detector, KimiK3Detector):
+                # Without the kimi_k3 reasoning parser nothing else unwraps the
+                # response channel of an answer that calls no tool.
+                text = strip_response_wrappers(text)
 
         # json_schema constraint → JSON array output for required/named
         if is_required:

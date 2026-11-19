@@ -443,6 +443,9 @@ class FunctionCallParser:
         answer_json_schema: str,
         parallel_tool_calls: bool = True,
         thinking_mode: bool = False,
+        any_whitespace: bool = True,
+        max_whitespace_cnt: Optional[int] = None,
+        allow_full_assistant_grammar: bool = True,
     ) -> Optional[ToolCallConstraint]:
         """
         Returns a constraint for tool_choice="auto" that admits tool calls or a
@@ -455,6 +458,8 @@ class FunctionCallParser:
             isinstance(self.detector, Glm47MoeDetector)
             and self.detector.parses_required_natively()
         ):
+            if not allow_full_assistant_grammar:
+                return None
             return (
                 "full_assistant_ebnf",
                 generate_glm_answer_grammar(
@@ -463,6 +468,8 @@ class FunctionCallParser:
                     special_tokens=GlmSpecialTokenConfig(),
                     answer_json_schema=answer_json_schema,
                     parallel_tool_calls=parallel_tool_calls,
+                    any_whitespace=any_whitespace,
+                    max_whitespace_cnt=max_whitespace_cnt,
                 ),
             )
         strict_arguments = self._constrains_auto_arguments()
