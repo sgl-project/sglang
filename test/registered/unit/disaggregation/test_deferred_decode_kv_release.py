@@ -762,7 +762,7 @@ def _run_release_consensus(rank: int, rendezvous: str) -> None:
             ("host_timeout", True, False, 31.0, [1]),
         ):
             mgr = _make_manager()
-            q = _make_queue()
+            q = _make_queue(enable_metrics=True)
             q.enable_host_receive = host
             dreq = _make_decode_req(42, 0, mgr)
             dreq.host_staged = host
@@ -804,6 +804,15 @@ def _run_release_consensus(rank: int, rendezvous: str) -> None:
                 expected.append(
                     (scenario + "_drained", [0, 1] if scenario == "mixed" else [1, 0])
                 )
+            metrics = q.scheduler.metrics_collector.observe_decode_deferred_kv_release
+            outcomes = [observed.kwargs["outcome"] for observed in metrics.call_args_list]
+            if scenario == "mixed":
+                expected_outcomes = ["timeout", "drained"]
+            elif scenario == "deadline":
+                expected_outcomes = ["drained", "timeout"]
+            else:
+                expected_outcomes = ["drained", "drained"]
+            assert outcomes == expected_outcomes, (rank, scenario, outcomes)
 
         for notification in ("some", "all", "none", "disabled"):
             mgr = _make_manager()

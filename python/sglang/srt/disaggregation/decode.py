@@ -28,6 +28,7 @@ import time
 from collections import deque
 from concurrent.futures import Future
 from dataclasses import dataclass
+from enum import IntEnum
 from http import HTTPStatus
 from typing import (
     TYPE_CHECKING,
@@ -3294,6 +3295,13 @@ def _generate_fake_prefill_handoff_output_id(req: Req) -> int:
     return int.from_bytes(digest, byteorder="little") % req.vocab_size
 
 
+class _DeferredReleaseState(IntEnum):
+    # MIN across the attention TP ranks chooses the least certain outcome.
+    PENDING = 0
+    TIMED_OUT = 1
+    DRAINED = 2
+
+
 class DecodeTransferQueue(DecodeHiCacheTransferMixin):
     """
     Store the requests that is polling kv
@@ -3988,39 +3996,41 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         if not self._deferred_releases:
             return
         now = time.monotonic()
-        drained = []
-        ready = []
+        states: List[int] = []
         releases = list(self._deferred_releases.items())
         for decode_req, _, deadline, _, required_acks in releases:
             if self._is_host_destination(decode_req):
                 # A timeout cannot prove that a remote write has stopped.
                 is_drained = decode_req.kv_receiver.is_abort_release_safe()
-                is_ready = is_drained
+                timed_out = False
             else:
                 is_drained = decode_req.kv_receiver.kv_mgr.is_abort_release_safe(
                     decode_req.req.bootstrap_room, required_acks
                 )
-                is_ready = is_drained or now >= deadline
-            drained.append(is_drained)
-            ready.append(is_ready)
-        # Acks and deadlines are rank-local. Releasing only on some ranks would
-        # diverge admission and the sizes of subsequent polling collectives.
-        # Entries are appended from agreed holds, so every rank reduces the same
-        # list in the same order.
-        ready = all_reduce_flags(
-            flags=ready, group=self.gloo_group, op=torch.distributed.ReduceOp.MIN
+                timed_out = now >= deadline
+            if is_drained:
+                states.append(_DeferredReleaseState.DRAINED)
+            elif timed_out:
+                states.append(_DeferredReleaseState.TIMED_OUT)
+            else:
+                states.append(_DeferredReleaseState.PENDING)
+        # Entries are appended from agreed holds, so every rank reduces the
+        # same list in the same order. A timed-out peer can allow local release
+        # without supplying proof that all remote writers drained.
+        states = all_reduce_flags(
+            flags=states, group=self.gloo_group, op=torch.distributed.ReduceOp.MIN
         )
         to_release = []
-        for entry, is_ready, is_drained in zip(releases, ready, drained):
+        for entry, state in zip(releases, states):
             decode_req, start_time, _, idx, _ = entry
-            if is_ready:
+            if state != _DeferredReleaseState.PENDING:
                 to_release.append(
                     (
                         decode_req,
                         start_time,
                         idx,
                         decode_req.req.bootstrap_room,
-                        is_drained,
+                        state == _DeferredReleaseState.DRAINED,
                     )
                 )
         # Each release takes its entry out; a failed one is abandoned, not retried,
