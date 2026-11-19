@@ -956,6 +956,10 @@ class DFlashWorkerV2(BaseSpecWorker):
                 logger.info("DFLASH draft greedy head kept eager (reason=%s).", reason)
             return None
 
+        if _is_npu and self._adaflash_verify is not None and not self._is_domino:
+            # Keep the draft transformer in Graph. The head runs after length
+            # prediction, on the candidate rows the target will actually verify.
+            return _eager("AdaFlash compact draft head")
         if envs.SGLANG_DFLASH_EAGER_DRAFT_SAMPLER.get():
             return _eager("SGLANG_DFLASH_EAGER_DRAFT_SAMPLER=1")
         if self.block_size <= 1:
@@ -2920,6 +2924,26 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_out = self.draft_model_runner.forward(forward_batch)
         draft_logits_output = draft_out.logits_output
 
+        verify_layout = verify_rows = draft_head_rows = None
+        sampling_info = batch.sampling_info
+        compact_greedy = False
+        if self._adaflash_verify is not None:
+            draft_hidden = draft_logits_output.hidden_states
+            if draft_hidden is None:
+                raise RuntimeError("AdaFlash draft model returned no hidden states.")
+            verify_layout = self._adaflash_verify.layout(
+                draft_hidden.view(bs, block_size, -1)
+            )
+            compact_greedy = self._can_skip_verify_logits(batch, sampling_info)
+            if (
+                compact_greedy
+                and not self._is_domino
+                and not (self._draft_sampler is not None and draft_out.can_run_graph)
+            ):
+                verify_rows, draft_head_rows = self._adaflash_verify.packed_indices(
+                    verify_layout, draft_hidden.device
+                )
+
         if (
             self._is_domino
             and self._draft_sampler is not None
@@ -3030,18 +3054,32 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_hidden = draft_logits_output.hidden_states
             if draft_hidden is None:
                 raise RuntimeError("DFLASH draft model returned no hidden states.")
-            draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
+            draft_hidden = draft_hidden.view(bs, block_size, -1)
             with draft_tp_context(self.draft_parallel_layout):
-                draft_next = self._greedy_sample_from_vocab_parallel_head(
-                    hidden_states=draft_hidden[:, 1:, :].reshape(
-                        -1, draft_hidden.shape[-1]
-                    ),
-                    lm_head=lm_head,
-                ).view(bs, int(self.block_size) - 1)
+                if draft_head_rows is None:
+                    draft_next = self._greedy_sample_from_vocab_parallel_head(
+                        hidden_states=draft_hidden[:, 1:, :].reshape(
+                            -1, draft_hidden.shape[-1]
+                        ),
+                        lm_head=lm_head,
+                    ).view(bs, block_size - 1)
+                else:
+                    draft_next = self._greedy_sample_from_vocab_parallel_head(
+                        hidden_states=draft_hidden.flatten(0, 1).index_select(
+                            0, draft_head_rows
+                        ),
+                        lm_head=lm_head,
+                    )
 
         draft_tokens = self._draft_block_tokens_buf[:bs]
+        if draft_head_rows is None:
+            draft_tokens[:, 1:].copy_(draft_next)
+        else:
+            # Unverified candidate slots may be read by the rectangular
+            # accept scan, but the layout's cutoff excludes them.
+            draft_tokens.zero_()
+            draft_tokens.flatten().index_copy_(0, draft_head_rows, draft_next)
         draft_tokens[:, 0].copy_(block_ids[:, 0])
-        draft_tokens[:, 1:].copy_(draft_next)
 
         # Must stay ahead of the target verify launch below.
         grammar_tree = (
@@ -3052,11 +3090,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         # TARGET_VERIFY uses standard causal masking; custom masks are unnecessary here.
         custom_mask = None
 
-        verify_layout = None
-        sampling_info = batch.sampling_info
         if self._adaflash_verify is not None:
-            draft_hidden = draft_logits_output.hidden_states.view(bs, block_size, -1)
-            verify_layout = self._adaflash_verify.layout(draft_hidden)
             target_out = self._adaflash_verify.run(
                 batch=batch,
                 layout=verify_layout,
@@ -3066,6 +3100,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                 cache_loc_2d=verify_out_cache_loc_2d,
                 iteration_ids=iteration_ids,
                 device=device,
+                packed_indices=verify_rows,
+                greedy_argmax_only=compact_greedy,
             )
         else:
             verify_input_ids = draft_tokens.reshape(-1)
@@ -3130,10 +3166,12 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
-        target_predict = None
+        target_predict = getattr(target_out, "target_predict", None)
         target_lp = self._target_logits_processor
-        if target_lp is not None and target_lp.is_deferred_shard(
-            logits_output.next_token_logits
+        if (
+            target_predict is None
+            and target_lp is not None
+            and target_lp.is_deferred_shard(logits_output.next_token_logits)
         ):
             if self._can_skip_verify_logits(batch, sampling_info):
                 target_predict = target_lp.deferred_argmax(

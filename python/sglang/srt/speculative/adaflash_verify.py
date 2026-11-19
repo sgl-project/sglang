@@ -4,6 +4,9 @@ import logging
 
 import torch
 from sglang.kernels.ops.speculative.dspark.dspark_accept import AcceptGreedy
+from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
+    RaggedVerifyWindow,
+)
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.models.adaflash import DFlashAdaFlashDraftModel
@@ -72,6 +75,28 @@ class AdaFlashVerify:
             )
         return layout
 
+    def packed_indices(self, layout, device):
+        """Map live verification rows and non-anchor draft rows to the block."""
+        if (
+            torch.device(device).type != "npu"
+            or layout.verify_lens_cpu is None
+            or layout.total_verify_tokens != layout.graph_num_tokens
+        ):
+            return None, None
+
+        target_rows = []
+        draft_rows = []
+        for row, length in enumerate(layout.verify_lens_cpu):
+            start = row * self.block_size
+            candidates = range(start + 1, start + length)
+            target_rows.append(start)
+            target_rows.extend(candidates)
+            draft_rows.extend(candidates)
+        return (
+            torch.tensor(target_rows, dtype=torch.long, device=device),
+            torch.tensor(draft_rows, dtype=torch.long, device=device),
+        )
+
     def run(
         self,
         *,
@@ -83,6 +108,8 @@ class AdaFlashVerify:
         cache_loc_2d,
         iteration_ids,
         device,
+        packed_indices=None,
+        greedy_argmax_only=False,
     ):
         verify_window = VerifyWindow(
             positions_2d=positions_2d,
@@ -90,6 +117,17 @@ class AdaFlashVerify:
             verify_cache_loc_2d=cache_loc_2d,
             iteration_ids=iteration_ids,
         )
+        ragged_window = None
+        if packed_indices is not None:
+            # Select from the target window already planned by the worker.
+            ragged_window = RaggedVerifyWindow(
+                positions=positions_2d.flatten().index_select(0, packed_indices),
+                verify_cache_loc=verify_window.verify_cache_loc.index_select(
+                    0, packed_indices
+                ).to(torch.int32),
+                verify_ids=draft_tokens.flatten().index_select(0, packed_indices),
+                window_index=packed_indices,
+            )
         result, _ = self.executor.run_compact(
             batch=batch,
             layout=layout,
@@ -100,6 +138,8 @@ class AdaFlashVerify:
             # The DFlash worker applies its ordinary logits adjustments once.
             sampling_info=None,
             verify_window=verify_window,
+            ragged_window=ragged_window,
+            greedy_argmax_only=greedy_argmax_only and ragged_window is not None,
         )
         actual_tokens = batch.input_ids.numel()
         if actual_tokens != layout.graph_num_tokens:

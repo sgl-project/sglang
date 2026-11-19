@@ -929,7 +929,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
 
         live = ragged_layout
-        if live.bs == cap_layout.bs and live.cap is not None:
+        if live.bs == cap_layout.bs and (
+            live.cap is not None
+            or (
+                self.npu_ragged_verify_mode
+                and live.total_verify_tokens == live.graph_num_tokens
+            )
+        ):
             cap_layout.verify_lens.copy_(live.verify_lens)
             cap_layout.qo_indptr_device.copy_(live.qo_indptr_device)
             cap_layout.extend_start_loc.copy_(live.extend_start_loc)

@@ -108,6 +108,7 @@ def verify_logits_adjustments_are_noop(sampling_info) -> bool:
 class TargetVerifyResult(msgspec.Struct, frozen=True):
     logits_output: object
     can_run_cuda_graph: bool
+    target_predict: Optional[torch.Tensor] = None
 
 
 def candidate_request_length_bound(
@@ -486,17 +487,29 @@ class TargetVerifyExecutor:
         sampling_info,
         verify_window: VerifyWindow,
         inject_gate: bool = False,
+        ragged_window: Optional[RaggedVerifyWindow] = None,
+        greedy_argmax_only: bool = False,
     ) -> tuple[TargetVerifyResult, torch.Tensor]:
-        ragged_window = BuildRaggedVerifyWindow.execute(
-            batch=batch,
-            layout=layout,
-            draft_block_ids=draft_block_ids,
-            draft_tokens=draft_tokens,
-            bs=bs,
-            device=device,
-            verify_num_draft_tokens=self.verify_num_draft_tokens,
-            model_runner=self.model_runner,
-        )
+        if greedy_argmax_only and (
+            sampling_info is not None
+            or self.verify_epilogue is not None
+            or ragged_window is None
+            or layout.total_verify_tokens != layout.graph_num_tokens
+        ):
+            raise ValueError(
+                "Compact argmax requires an unpadded window and unmodified greedy logits."
+            )
+        if ragged_window is None:
+            ragged_window = BuildRaggedVerifyWindow.execute(
+                batch=batch,
+                layout=layout,
+                draft_block_ids=draft_block_ids,
+                draft_tokens=draft_tokens,
+                bs=bs,
+                device=device,
+                verify_num_draft_tokens=self.verify_num_draft_tokens,
+                model_runner=self.model_runner,
+            )
         if self.verify_epilogue is not None:
             self.verify_epilogue.begin_step(layout.verify_lens, armed=inject_gate)
         target_verify = self._run_ragged(
@@ -509,6 +522,30 @@ class TargetVerifyExecutor:
         logits_output = target_verify.logits_output
 
         stride = self.verify_num_draft_tokens
+        if greedy_argmax_only:
+            # Accept operates on token IDs. Reuse the packed window's map and
+            # avoid allocating/filling the rectangular vocabulary tensor.
+            rows = ragged_window.window_index
+            packed_logits = logits_output.next_token_logits[: layout.graph_num_tokens]
+            ids = sampling_argmax(packed_logits)
+            dense_rows = bs * stride
+            target_predict = ids.new_zeros(dense_rows)
+            target_predict.index_copy_(0, rows, ids)
+            hidden = logits_output.hidden_states
+            if hidden is None:
+                raise RuntimeError("Compact verify requires target hidden states.")
+            hidden_strided = hidden.new_zeros((dense_rows, hidden.shape[-1]))
+            hidden_strided.index_copy_(0, rows, hidden[: layout.graph_num_tokens])
+            logits_output.hidden_states = hidden_strided
+            logits_output.next_token_logits = None
+            return (
+                TargetVerifyResult(
+                    logits_output=logits_output,
+                    can_run_cuda_graph=target_verify.can_run_cuda_graph,
+                    target_predict=target_predict,
+                ),
+                hidden_strided,
+            )
         if self.verify_epilogue is not None and target_verify.can_run_cuda_graph:
             strided_logits = self.verify_epilogue.strided_logits
             hidden_strided = self.verify_epilogue.strided_hidden

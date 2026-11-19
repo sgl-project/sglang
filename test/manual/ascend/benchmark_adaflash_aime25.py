@@ -25,6 +25,7 @@ REVISIONS = {
     DFLASH_MODEL: "9b41424b7109f9c5413454f481b09a82b85333f4",
     ADAFLASH_MODEL: "d2fd7eb77c2a9da7b2b04acecbc87a55a6aaecc4",
 }
+REVISIONS["AdaFlash/Qwen3-8B-AdaFlash"] = "7fa2e0719c89b73d8ae25c63e8cc5cdfd7f75fab"
 DATASET = "opencompass/AIME2025"
 DATASET_REVISION = "a6ad95f611d72cf628a80b58bd0432ef6638f958"
 INSTRUCTION = (
@@ -85,18 +86,26 @@ def load_questions(dataset_path=None):
     return rows
 
 
-def prepare_prompts(tokenizer, rows, max_new_tokens, context_length):
+def prepare_prompts(tokenizer, rows, max_new_tokens, context_length, *, thinking=True):
     prepared = []
     for row in rows:
         messages = [{"role": "user", "content": row["question"] + INSTRUCTION}]
         prompt = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True, enable_thinking=True
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=thinking,
         )
-        disabled = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
+        alternate = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=not thinking,
         )
-        if prompt == disabled or "</think>" in prompt[-100:]:
-            raise ValueError("The tokenizer did not enable the Qwen3 thinking template")
+        if prompt == alternate or ("</think>" in prompt[-100:]) == thinking:
+            raise ValueError(
+                "The tokenizer did not apply the requested Qwen3 thinking mode"
+            )
         ids = tokenizer.encode(prompt, add_special_tokens=False)
         if len(ids) + max_new_tokens >= context_length:
             raise ValueError(f"Context length is too small for {row['id']}")
@@ -254,6 +263,7 @@ def evaluate(args, url, tokenizer, rows, method, prefix, probe=False):
                     "top_k": 1,
                     "max_new_tokens": count,
                     "skip_special_tokens": False,
+                    "ignore_eos": args.ignore_eos,
                 },
             },
             timeout=args.request_timeout,
@@ -269,7 +279,7 @@ def evaluate(args, url, tokenizer, rows, method, prefix, probe=False):
             [{"role": "user", "content": f"Compute {i + 1} plus 2."}],
             tokenize=False,
             add_generation_prompt=True,
-            enable_thinking=True,
+            enable_thinking=args.thinking,
         )
         warmups.append(tokenizer.encode(prompt, add_special_tokens=False))
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.concurrency) as pool:
@@ -324,7 +334,8 @@ def evaluate(args, url, tokenizer, rows, method, prefix, probe=False):
         "valid_requests": len(valid),
         "errors": len(results) - len(valid),
         "concurrency": args.concurrency,
-        "enable_thinking": True,
+        "enable_thinking": args.thinking,
+        "ignore_eos": args.ignore_eos,
         "temperature": 0,
         "max_new_tokens": limit,
         "wall_seconds": wall,
@@ -377,7 +388,19 @@ def write_comparison(root, summaries):
         "| 方法 | 吞吐（token/s） | 相对 AR 加速 | 平均接受长度 |",
         "|---|---:|---:|---:|",
     ]
+    fixed = next(
+        (
+            s["output_tokens_per_second"]
+            for s in summaries
+            if s["method"] == "adaflash-fixed"
+        ),
+        None,
+    )
     for summary in summaries:
+        if fixed:
+            summary["speedup_vs_adaflash_fixed"] = (
+                summary["output_tokens_per_second"] / fixed
+            )
         speed = summary["output_tokens_per_second"] / baseline if baseline else None
         summary["speedup_vs_ar"] = speed
         speed_text = f"{speed:.2f}×" if speed is not None else "—"
@@ -415,8 +438,10 @@ def parse_args(argv=None):
     parser.add_argument(
         "--dataset-path",
         type=Path,
-        help="Optional local AIME JSONL with id and question fields",
+        help="Optional local JSONL with id and question fields (e.g. GSM8K)",
     )
+    parser.add_argument("--no-thinking", dest="thinking", action="store_false")
+    parser.add_argument("--ignore-eos", action="store_true")
     parser.add_argument("--concurrency", type=int, default=8)
     parser.add_argument("--max-new-tokens", type=int, default=32768)
     parser.add_argument("--context-length", type=int, default=40960)
@@ -457,9 +482,9 @@ def main(argv=None):
     args.output_dir.mkdir(parents=True, exist_ok=True)
     config = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
     config.update(
-        dataset=DATASET,
-        dataset_revision=DATASET_REVISION,
-        enable_thinking=True,
+        dataset=DATASET if args.dataset_path is None else str(args.dataset_path),
+        dataset_revision=DATASET_REVISION if args.dataset_path is None else None,
+        enable_thinking=args.thinking,
         temperature=0,
     )
     write_json(args.output_dir / "config.json", config)
@@ -497,7 +522,11 @@ def main(argv=None):
                 f"Requested {args.limit} questions, dataset contains {len(questions)}"
             )
         rows = prepare_prompts(
-            tokenizer, questions[: args.limit], args.max_new_tokens, args.context_length
+            tokenizer,
+            questions[: args.limit],
+            args.max_new_tokens,
+            args.context_length,
+            thinking=args.thinking,
         )
         write_json(args.output_dir / "prompts.json", rows)
         for probe in [True, False] if not args.skip_preflight else [False]:
