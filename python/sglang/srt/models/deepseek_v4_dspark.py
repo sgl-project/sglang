@@ -415,6 +415,7 @@ class DSparkV4MarkovHead(BaseDSparkMarkovHead):
     ) -> None:
         super().__init__()
         self.vocab_size = int(vocab_size)
+        self.bias_vocab_size = self.vocab_size
         self.markov_rank = int(markov_rank)
         self._is_dsv41 = bool(is_dsv41)
         if self.markov_rank <= 0:
@@ -682,6 +683,9 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
     # embedding/head weights. The native CUDA path keeps the original DSpark
     # behavior and shares the target model's vocabulary modules.
     uses_own_vocab_modules = _is_npu
+    # These drafts output over the target vocabulary; only a draft with a cropped
+    # draft_vocab_size carries a draft -> target id table.
+    draft_token_to_target = None
     precompile_kernels_after_loading = (
         DeepseekV4ForCausalLM.precompile_kernels_after_loading
     )

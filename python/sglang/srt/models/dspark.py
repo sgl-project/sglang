@@ -14,6 +14,7 @@ from sglang.srt.distributed.communication_op import tensor_model_parallel_all_ga
 from sglang.srt.environ import envs
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
+from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dflash import DFlashDraftModel
@@ -68,6 +69,9 @@ class BaseDSparkMarkovHead(nn.Module, ABC):
     computed from the token drafted at the step before."""
 
     vocab_size: int
+    # The bias's columns: the draft's own output vocabulary, narrower than
+    # vocab_size when the draft crops it. A head that doesn't crop sets both equal.
+    bias_vocab_size: int
     # The rank's slice of a TP-sharded vocab; None when the vocab is whole.
     vocab_shard: Optional[VocabShard] = None
 
@@ -98,7 +102,13 @@ class BaseDSparkMarkovHead(nn.Module, ABC):
 
 
 class VanillaMarkov(BaseDSparkMarkovHead):
-    def __init__(self, *, vocab_size: int, markov_rank: int) -> None:
+    def __init__(
+        self,
+        *,
+        vocab_size: int,
+        markov_rank: int,
+        bias_vocab_size: Optional[int] = None,
+    ) -> None:
         super().__init__()
         self.vocab_size = int(vocab_size)
         self.markov_rank = int(markov_rank)
@@ -106,8 +116,14 @@ class VanillaMarkov(BaseDSparkMarkovHead):
             raise ValueError(
                 f"VanillaMarkov requires markov_rank > 0, got {self.markov_rank}."
             )
+        # markov_w1 embeds the previous *target* token, so it spans the input
+        # vocabulary; markov_w2's rows are the bias over the draft's own output
+        # vocabulary, which a cropped draft keeps narrower.
+        self.bias_vocab_size = (
+            self.vocab_size if bias_vocab_size is None else int(bias_vocab_size)
+        )
         self.markov_w1 = nn.Embedding(self.vocab_size, self.markov_rank)
-        self.markov_w2 = nn.Linear(self.markov_rank, self.vocab_size, bias=False)
+        self.markov_w2 = nn.Linear(self.markov_rank, self.bias_vocab_size, bias=False)
 
     def get_prev_embeddings(self, token_ids: torch.Tensor) -> torch.Tensor:
         return self.markov_w1(token_ids.long())
@@ -162,6 +178,8 @@ class Nemotron35VanillaMarkov(VanillaMarkov):
                 f"got {self.markov_rank}."
             )
         self.markov_w1 = nn.Embedding(self.vocab_size, self.markov_rank)
+        # This head biases the whole vocabulary: cropping is a vanilla-only path.
+        self.bias_vocab_size = self.vocab_size
         self.markov_w2 = ReplicatedLinear(
             self.markov_rank,
             self.vocab_size,
@@ -259,9 +277,27 @@ def build_markov_head(config) -> Optional[nn.Module]:
         )
     markov_head_type = str(getattr(config, "markov_head_type", "vanilla")).lower()
     vocab_size = int(config.vocab_size)
+    # A cropped draft output vocabulary stores markov_w2 with fewer rows than
+    # markov_w1 embeds, plus a d2t table mapping draft ids onto target ids.
+    bias_vocab_size = int(getattr(config, "draft_vocab_size", None) or vocab_size)
+    if bias_vocab_size > vocab_size:
+        raise ValueError(
+            f"DSpark draft_vocab_size={bias_vocab_size} exceeds the draft input "
+            f"vocab_size={vocab_size}."
+        )
     hidden_size = int(config.hidden_size)
     if markov_head_type == "vanilla":
-        return VanillaMarkov(vocab_size=vocab_size, markov_rank=markov_rank)
+        return VanillaMarkov(
+            vocab_size=vocab_size,
+            markov_rank=markov_rank,
+            bias_vocab_size=bias_vocab_size,
+        )
+    if bias_vocab_size != vocab_size:
+        raise ValueError(
+            "DSpark cropped draft vocabularies (draft_vocab_size < vocab_size) "
+            f"are supported with markov_head_type='vanilla' only, got "
+            f"{markov_head_type!r}."
+        )
     if markov_head_type == "gated":
         return GatedMarkovHead(
             vocab_size=vocab_size, markov_rank=markov_rank, hidden_size=hidden_size
@@ -375,9 +411,6 @@ def build_confidence_head(config) -> Optional[nn.Module]:
     )
 
 
-_DSPARK_SKIPPED_WEIGHT_PREFIXES = ("lm_head.", "rotary_emb.")
-
-
 class DSparkDraftMixin:
     supports_pre_gather_target_hidden_projection = True
 
@@ -401,6 +434,26 @@ class DSparkDraftMixin:
             self.markov_head = build_markov_head(config)
         self.confidence_head = build_confidence_head(config)
         self.lm_head: Optional[nn.Module] = None
+        # A cropped draft output vocabulary (draft_vocab_size < vocab_size) owns
+        # its LM head and maps sampled draft ids back onto target ids through the
+        # checkpoint's d2t table; the target head cannot stand in for either.
+        self.draft_output_vocab_size = int(
+            getattr(config, "draft_vocab_size", None) or config.vocab_size
+        )
+        if self.draft_output_vocab_size < int(config.vocab_size):
+            self.lm_head = ParallelLMHead(
+                self.draft_output_vocab_size,
+                int(config.hidden_size),
+                quant_config=quant_config,
+                prefix=f"{prefix}.lm_head" if prefix else "lm_head",
+            )
+            self.register_buffer(
+                "draft_token_to_target",
+                torch.full((self.draft_output_vocab_size,), -1, dtype=torch.int64),
+                persistent=False,
+            )
+        else:
+            self.draft_token_to_target: Optional[torch.Tensor] = None
         # Expose the draft's own layer count so the draft ModelRunner sizes the
         # draft KV pool correctly. Some DSpark draft checkpoints inherit the
         # target's ``num_nextn_predict_layers`` (>0) on the config; without this
@@ -416,6 +469,11 @@ class DSparkDraftMixin:
     ) -> None:
         if not self.is_nemotron_35_draft:
             self.embed_tokens = embed_tokens
+        if self.lm_head is not None:
+            # A cropped draft already projects through its own narrow LM head; the
+            # target head is wider than the draft's output vocabulary, so the
+            # shared head does not apply to it.
+            return
         self.lm_head = lm_head
 
     def forward_embed(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -470,9 +528,20 @@ class DSparkDraftMixin:
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
             normalized_name = name.removeprefix("model.")
-            if any(
-                normalized_name.startswith(p) for p in _DSPARK_SKIPPED_WEIGHT_PREFIXES
-            ):
+            if normalized_name.startswith("rotary_emb."):
+                continue
+            if normalized_name == "d2t":
+                if self.draft_token_to_target is not None:
+                    self._load_draft_token_to_target(loaded_weight)
+                continue
+            if normalized_name.startswith("lm_head."):
+                # A shared target head arrives through attach_shared_modules at
+                # runtime; only a cropped draft owns a head to load here.
+                if self.lm_head is None:
+                    continue
+                param = params_dict[normalized_name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
                 continue
             if normalized_name.startswith("embed_tokens.") and not (
                 self.is_nemotron_35_draft
@@ -502,6 +571,35 @@ class DSparkDraftMixin:
         self._load_confidence_weights(
             confidence_weights=confidence_weights, params_dict=params_dict
         )
+        if self.draft_token_to_target is not None:
+            if int(self.draft_token_to_target.min()) < 0:
+                raise ValueError(
+                    "DSpark cropped draft vocabularies need the checkpoint's d2t "
+                    "table to map draft ids onto target ids, but it was not loaded."
+                )
+
+    def _load_draft_token_to_target(self, loaded_weight: torch.Tensor) -> None:
+        """Decode the checkpoint's delta-encoded d2t table into absolute target ids.
+
+        ``d2t`` stores ``target_id - draft_id``, which vLLM replays as
+        ``draft_ids + d2t[draft_ids]`` on every lookup; the draft keeps the
+        decoded table so the runtime step only indexes it.
+        """
+        draft_vocab_size = self.draft_output_vocab_size
+        if loaded_weight.numel() != draft_vocab_size:
+            raise ValueError(
+                f"DSpark d2t has {loaded_weight.numel()} entries but the draft "
+                f"output vocabulary is {draft_vocab_size}."
+            )
+        draft_ids = torch.arange(draft_vocab_size, device=loaded_weight.device)
+        target_ids = loaded_weight.to(draft_ids.dtype) + draft_ids
+        target_vocab_size = int(self.markov_head.vocab_size)
+        if int(target_ids.min()) < 0 or int(target_ids.max()) >= target_vocab_size:
+            raise ValueError(
+                "DSpark d2t must map every draft id onto a target id in "
+                f"[0, {target_vocab_size})."
+            )
+        self.draft_token_to_target.copy_(target_ids)
 
     def _load_confidence_weights(
         self,

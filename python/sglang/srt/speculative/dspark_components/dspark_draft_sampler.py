@@ -12,6 +12,7 @@ from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftParams,
     draft_markov_block,
     resolve_draft_params,
+    scatter_draft_vocab_logits,
     select_draft_hidden_without_anchor,
     step_logits_width,
 )
@@ -79,9 +80,25 @@ class DsparkDraftSampler:
         # [max_bs, gamma, vocab] step logits for the sampling accept, sized on
         # the first call; a greedy draft keeps none.
         self.step_logits: Optional[torch.Tensor] = None
+        # A cropped draft samples in its own narrower output vocabulary, so the
+        # steps write here and the block scatters the result onto step_logits.
+        self.draft_token_to_target = model.draft_token_to_target
+        self.draft_step_logits: Optional[torch.Tensor] = None
         self._megakernel_steps = None
-        if megakernel_sampler is not None:
+        if megakernel_sampler is not None and self.draft_token_to_target is None:
             self._megakernel_steps = self._build_megakernel_steps(megakernel_sampler)
+        self._allocate_draft_step_logits()
+
+    def _allocate_draft_step_logits(self) -> None:
+        """A cropped draft's steps write in its own vocabulary, so the buffer that
+        holds them must exist wherever step_logits was allocated."""
+        if self.draft_token_to_target is None or self.step_logits is None:
+            return
+        self.draft_step_logits = torch.empty(
+            (self.max_bs, self.gamma, int(self.markov_head.bias_vocab_size)),
+            dtype=self.step_logits.dtype,
+            device=self.step_logits.device,
+        )
 
     def _build_megakernel_steps(self, megakernel_sampler: Callable):
         if not self.greedy_draft:
@@ -110,6 +127,8 @@ class DsparkDraftSampler:
         return steps
 
     def _step_logits(self, base_logits: torch.Tensor) -> torch.Tensor:
+        """The buffer the block's steps write their logits into: the kept step
+        logits themselves, or the draft's own vocabulary when it is cropped."""
         if self.step_logits is None:
             # The runner's warmup calls the tail eagerly before capture.
             # torch.cuda's capture query raises on XPU builds.
@@ -124,6 +143,9 @@ class DsparkDraftSampler:
                 dtype=self.markov_head.step_logits_dtype(base_logits.dtype),
                 device=base_logits.device,
             )
+            self._allocate_draft_step_logits()
+        if self.draft_token_to_target is not None:
+            return self.draft_step_logits
         return self.step_logits
 
     def stage_sampling_params(self, *, bs: int, sampling_info) -> None:
@@ -161,7 +183,7 @@ class DsparkDraftSampler:
     def _markov_block(self, model_hidden, sample_hidden, anchor, bs: int):
         base_logits, confidence_features = self.model.compute_base_logits(model_hidden)
         base_logits = base_logits.view(bs, self.gamma, -1)
-        draft_tokens, _ = draft_markov_block(
+        draft_tokens, step_logits = draft_markov_block(
             markov_head=self.markov_head,
             base_logits=base_logits,
             anchor_tokens=anchor,
@@ -173,12 +195,23 @@ class DsparkDraftSampler:
             if self.greedy_draft
             else self._step_logits(base_logits)[:bs],
             greedy_draft=self.greedy_draft,
+            draft_token_to_target=self.draft_token_to_target,
         )
+        if step_logits is not None and self.draft_token_to_target is not None:
+            scatter_draft_vocab_logits(
+                step_logits,
+                self.draft_token_to_target,
+                self.step_logits.shape[-1],
+                out=self.step_logits[:bs],
+            )
         self.out[: draft_tokens.numel()].copy_(draft_tokens.reshape(-1))
         return draft_tokens, confidence_features
 
 
 def _step_logits_width(model) -> int:
+    if model.draft_token_to_target is not None:
+        # A cropped draft scatters its own vocabulary onto the target one.
+        return int(model.markov_head.vocab_size)
     # Unsharded base logits span the cropped vocab.
     return step_logits_width(model.markov_head, int(model.lm_head.org_vocab_size))
 
@@ -207,7 +240,13 @@ def maybe_build_draft_sampler(
         return _eager("gamma<=0")
     if draft_model.markov_head is None:
         return _eager("no markov head")
-    megakernel_sampler = megakernel_draft_sampler(draft_model)
+    # The compiled kernel adds base logits and bias in one vocabulary, which a
+    # cropped draft does not have.
+    megakernel_sampler = (
+        megakernel_draft_sampler(draft_model)
+        if draft_model.draft_token_to_target is None
+        else None
+    )
     if tp_rank == 0:
         logger.info(
             "DSpark draft proposal (%s) folded into the draft cuda graph%s.",

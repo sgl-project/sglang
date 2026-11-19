@@ -184,6 +184,32 @@ def step_logits_width(markov_head: BaseDSparkMarkovHead, base_width: int) -> int
     return base_width if markov_head.vocab_shard is None else markov_head.vocab_size
 
 
+def scatter_draft_vocab_logits(
+    draft_logits: torch.Tensor,
+    draft_token_to_target: torch.Tensor,
+    target_vocab_size: int,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Lay a cropped draft's step logits out over the target vocabulary.
+
+    The draft samples in its own narrower output vocabulary, while the accept
+    kernels compare distributions over the target one. Placing the draft logits
+    at their target ids and filling the rest with -inf keeps the softmax
+    identical to the draft's own vocabulary, since every unmapped token then
+    weighs exactly zero.
+    """
+    if out is None:
+        out = torch.full(
+            (*draft_logits.shape[:-1], int(target_vocab_size)),
+            float("-inf"),
+            dtype=draft_logits.dtype,
+            device=draft_logits.device,
+        )
+    else:
+        out.fill_(float("-inf"))
+    return out.index_copy_(-1, draft_token_to_target, draft_logits)
+
+
 def _draft_step(
     markov_head: BaseDSparkMarkovHead,
     prev_tokens: torch.Tensor,
@@ -247,9 +273,17 @@ def draft_markov_block(
     tp_sync: SpecTpSync,
     logits_out: Optional[torch.Tensor] = None,
     greedy_draft: bool = False,
+    draft_token_to_target: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Returns the drafted tokens and the [bs, gamma, vocab] step logits,
-    written to ``logits_out`` or allocated here; a greedy draft keeps none."""
+    """Returns the drafted tokens and the [bs, gamma, width] step logits,
+    written to ``logits_out`` or allocated here; width is the draft's own output
+    vocab, or the vocab when the draft shares the target head. A greedy draft
+    keeps no logits.
+
+    ``draft_token_to_target`` is set for a cropped draft output vocabulary: each
+    sampled draft id becomes the target id the next step embeds and the accept
+    verifies.
+    """
     bs, gamma = base_logits.shape[:2]
     if not greedy_draft and logits_out is None:
         logits_out = torch.empty(
@@ -272,6 +306,8 @@ def draft_markov_block(
             step=step,
             logits_out=None if greedy_draft else logits_out[:, step],
         )
+        if draft_token_to_target is not None:
+            prev_tokens = draft_token_to_target[prev_tokens]
         prev_tokens = tp_sync.sync(SpecTpSyncSite.DSPARK_DRAFT, prev_tokens)
         draft_tokens.append(prev_tokens)
     if greedy_draft:
@@ -291,6 +327,7 @@ def sample_draft_block(
     device: torch.device,
     tp_sync: SpecTpSync,
     greedy_draft: bool,
+    draft_token_to_target: Optional[torch.Tensor] = None,
 ) -> DraftBlockResult:
     params = resolve_draft_params(
         sampling_info=sampling_info, bs=base_logits.shape[0], device=device
@@ -304,7 +341,12 @@ def sample_draft_block(
         noise=noise,
         tp_sync=tp_sync,
         greedy_draft=greedy_draft,
+        draft_token_to_target=draft_token_to_target,
     )
+    if step_logits is not None and draft_token_to_target is not None:
+        step_logits = scatter_draft_vocab_logits(
+            step_logits, draft_token_to_target, int(markov_head.vocab_size)
+        )
     return DraftBlockResult(
         draft_tokens=draft_tokens,
         corrected_logits=(
@@ -431,6 +473,7 @@ class DraftBlockProposer:
                 device=device,
                 tp_sync=self._tp_sync,
                 greedy_draft=self._greedy_draft,
+                draft_token_to_target=self.draft_model.draft_token_to_target,
             )
             if self.draft_model.confidence_head is not None:
                 confidence, confidence_raw = self.draft_model.compute_confidence(

@@ -133,6 +133,7 @@ def _folded_draft_model():
         sample_from_anchor=True,
         confidence_head=SimpleNamespace(proj=SimpleNamespace(weight=torch.zeros(1))),
         lm_head=SimpleNamespace(org_vocab_size=VOCAB),
+        draft_token_to_target=None,
         compute_base_logits=Mock(
             side_effect=lambda h: (torch.zeros(h.shape[0], VOCAB), h + 1)
         ),
@@ -197,6 +198,79 @@ class TestMegakernelDraftSampler(CustomTestCase):
             sampler(torch.ones(BS * GAMMA, HIDDEN), input_ids)
         stock.assert_called_once()
         self.assertTrue(sampler.out[: BS * GAMMA].eq(7).all())
+
+
+class TestCroppedDraftStepLogitsBuffer(CustomTestCase):
+    """A cropped draft's steps write in its own vocabulary, while step_logits
+    spans the target vocabulary."""
+
+    DRAFT_VOCAB = VOCAB // 3
+
+    def _model(self):
+        return SimpleNamespace(
+            markov_head=VanillaMarkov(
+                vocab_size=VOCAB, markov_rank=RANK, bias_vocab_size=self.DRAFT_VOCAB
+            ),
+            sample_from_anchor=True,
+            confidence_head=None,
+            lm_head=SimpleNamespace(
+                org_vocab_size=self.DRAFT_VOCAB,
+                num_embeddings_per_partition=self.DRAFT_VOCAB,
+            ),
+            draft_token_to_target=torch.arange(self.DRAFT_VOCAB),
+        )
+
+    def test_cropped_draft_declines_megakernel_sampler(self):
+        factory = Mock(return_value=lambda bs: Mock())
+        sampler = _build(self._model(), greedy_draft=False, factory=factory)
+        factory.assert_not_called()
+        self.assertIsNone(sampler._megakernel_steps)
+
+    def test_the_lazy_path_allocates_both_buffers(self):
+        sampler = _build(self._model(), greedy_draft=False, factory=None)
+        self.assertIsNone(sampler.step_logits)
+        self.assertIsNone(sampler.draft_step_logits)
+        with patch.object(torch.cuda, "is_current_stream_capturing", lambda: False):
+            returned = sampler._step_logits(torch.zeros(BS, self.DRAFT_VOCAB))
+        self.assertIs(returned, sampler.draft_step_logits)
+        self.assertEqual(
+            sampler.draft_step_logits.shape, (2 * BS, GAMMA, self.DRAFT_VOCAB)
+        )
+        self.assertEqual(sampler.step_logits.shape, (2 * BS, GAMMA, VOCAB))
+
+    def test_a_shared_vocabulary_draft_keeps_no_draft_buffer(self):
+        sampler = _build(_folded_draft_model(), greedy_draft=False, factory=None)
+        with patch.object(torch.cuda, "is_current_stream_capturing", lambda: False):
+            returned = sampler._step_logits(torch.zeros(BS, VOCAB))
+        self.assertIsNone(sampler.draft_step_logits)
+        self.assertIs(returned, sampler.step_logits)
+
+    def test_every_head_type_reports_its_bias_width(self):
+        """The draft buffer is sized from the head's bias width, so every head
+        must expose one; Nemotron's constructor bypasses VanillaMarkov's."""
+        heads = (
+            (VanillaMarkov(vocab_size=VOCAB, markov_rank=RANK), VOCAB),
+            (
+                VanillaMarkov(
+                    vocab_size=VOCAB, markov_rank=RANK, bias_vocab_size=VOCAB // 3
+                ),
+                VOCAB // 3,
+            ),
+            (
+                GatedMarkovHead(vocab_size=VOCAB, markov_rank=RANK, hidden_size=HIDDEN),
+                VOCAB,
+            ),
+            (RNNHead(vocab_size=VOCAB, markov_rank=RANK, hidden_size=HIDDEN), VOCAB),
+            (
+                Nemotron35VanillaMarkov(
+                    vocab_size=VOCAB, markov_rank=RANK, quant_config=None, prefix=""
+                ),
+                VOCAB,
+            ),
+        )
+        for head, expected in heads:
+            with self.subTest(head=type(head).__name__, expected=expected):
+                self.assertEqual(head.bias_vocab_size, expected)
 
 
 if __name__ == "__main__":
