@@ -20,6 +20,9 @@ class _AscendKDAExtendKernel:
     """Ascend-only KDA prefill decomposition backed by sgl-kernel-npu."""
 
     uses_state_checkpoints: bool = False
+    wants_int64_query_start_loc: bool = False
+
+    wants_int64_query_start_loc: bool = False
 
     def extend(
         self,
@@ -322,6 +325,8 @@ class AscendKDAAttnBackend(KDAAttnBackend):
         Optional[torch.Tensor],
     ]:
         """Activate raw gate and beta projections in FP32 for Ascend prefill."""
+        if g.ndim == 3:
+            g = g.unflatten(-1, (-1, layer.head_k_dim))
         preactivated_g = fused_kda_gate_npu(
             g.flatten(-2),
             layer.A_log,
@@ -412,6 +417,8 @@ class AscendKDAAttnBackend(KDAAttnBackend):
         # Activate the forget gate and beta in FP32 before entering the
         # recurrent kernel to match the checkpoint's verify contract.
         # This stays in the Ascend backend so shared/GPU model code is unchanged.
+        if dense_a.ndim == 3:
+            dense_a = dense_a.unflatten(-1, (-1, layer.head_k_dim))
         preactivated_a = fused_kda_gate_npu(
             dense_a.flatten(-2),
             layer.A_log,
@@ -494,6 +501,7 @@ class AscendKDAHybridLinearAttnBackend:
                 mamba_steps_to_track,
                 model,
                 req_pool_indices=None,
+                state_slots=None,
             ):
                 from sgl_kernel_npu.mamba.mamba_state_update_triton import (
                     conv_state_rollback,
@@ -506,11 +514,15 @@ class AscendKDAHybridLinearAttnBackend:
                 del req_pool_indices
                 request_number = last_correct_step_indices.shape[0]
 
-                state_indices_tensor = (
-                    self.linear_attn_backend.forward_metadata.mamba_cache_indices[
-                        :request_number
-                    ]
-                )
+                if state_slots is None:
+                    state_slots = self.forward_state_slots(
+                        request_number, mamba_track_indices
+                    )
+                state_indices_tensor = state_slots.working[:request_number]
+                # Checkpoints go to the slots the same forward resolved.
+                if mamba_track_indices is not None:
+                    assert state_slots.track is not None
+                    mamba_track_indices = state_slots.track[:request_number]
 
                 mamba_caches = self.linear_attn_backend.state_pool.get_speculative_mamba2_params_all_layers()
 

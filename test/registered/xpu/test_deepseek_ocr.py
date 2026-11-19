@@ -11,11 +11,11 @@ from unittest.mock import patch
 import requests
 import torch
 
+from sglang.srt.hf_transformers import get_tokenizer
 from sglang.srt.managers.req_types import MultimodalDataItem
 from sglang.srt.models.deepseek_ocr import DeepseekOCRForCausalLM
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.utils import kill_process_tree
-from sglang.srt.utils.hf_transformers import get_tokenizer
 from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -24,7 +24,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_xpu_ci(est_time=360, suite="stage-b-test-1-gpu-xpu")
+register_xpu_ci(est_time=360, suite="extra-test-1-gpu-xpu")
 
 
 class TestDeepSeekOCR(CustomTestCase):

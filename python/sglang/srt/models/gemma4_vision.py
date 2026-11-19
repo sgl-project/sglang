@@ -29,13 +29,13 @@ from sglang.srt.layers.clippable_linear import (
 )
 from sglang.srt.layers.layernorm import Gemma4RMSNorm
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.runtime_context import (
     get_mm,
     get_parallel,
     get_platform,
 )
 from sglang.srt.utils import (
-    add_prefix,
     cpu_has_amx_support,
     get_device_capability,
     is_cpu,

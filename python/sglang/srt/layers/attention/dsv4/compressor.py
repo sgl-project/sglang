@@ -12,6 +12,7 @@ from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.layers.cp.utils import cp_materialize_global_token_order
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
+from sglang.srt.layers.utils.common import add_prefix, set_weight_attrs
 from sglang.srt.mem_cache.deepseek_v4_compress_state import (
     CompressStatePool,
 )
@@ -19,7 +20,7 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.models.deepseek_common.utils import _is_hip, _use_aiter
 from sglang.srt.runtime_context import get_exec
-from sglang.srt.utils import add_prefix, is_npu, set_weight_attrs
+from sglang.srt.utils import is_npu
 
 _is_npu = is_npu()
 
