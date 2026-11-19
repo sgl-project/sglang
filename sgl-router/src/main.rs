@@ -401,26 +401,31 @@ fn build_app_context(
     app_context.dp_rank_prefix_provider = (config.model.dp_aware
         && external_kv_indexer_client.is_none())
     .then(|| RadixTreePrefixProvider::new(engine_state.tree(), Arc::clone(&block_size_oracle)));
+    let external_kv_indexer_client_is_none = external_kv_indexer_client.is_none();
     app_context.prefix_index = external_kv_indexer_client;
-    app_context.radix_tree_prefix_provider = (config.model.policy == PolicyKind::CacheAware
+    // Local prefill on decode reads the same tree, under any policy.
+    let cache_aware_local_tree = config.model.policy == PolicyKind::CacheAware
         && config
             .model
             .cache_aware
             .as_ref()
-            .is_some_and(|cache| cache.prefix_provider == CachePrefixProvider::RadixTree))
-    .then(|| {
-        let provider =
-            RadixTreePrefixProvider::new(engine_state.tree(), Arc::clone(&block_size_oracle));
-        match config
-            .model
-            .cache_aware
-            .as_ref()
-            .and_then(|cache| cache.pending_prefix_consult_below)
-        {
-            Some(below) => provider.with_pending_consult_below(below),
-            None => provider,
-        }
-    });
+            .is_some_and(|cache| cache.prefix_provider == CachePrefixProvider::RadixTree);
+    let local_prefill_tree = config.proxy.local_prefill_max_uncached_tokens.is_some()
+        && external_kv_indexer_client_is_none;
+    app_context.radix_tree_prefix_provider =
+        (cache_aware_local_tree || local_prefill_tree).then(|| {
+            let provider =
+                RadixTreePrefixProvider::new(engine_state.tree(), Arc::clone(&block_size_oracle));
+            match config
+                .model
+                .cache_aware
+                .as_ref()
+                .and_then(|cache| cache.pending_prefix_consult_below)
+            {
+                Some(below) => provider.with_pending_consult_below(below),
+                None => provider,
+            }
+        });
     if let Some(cache) = config.model.cache_aware.as_ref() {
         let ttl = Duration::from_millis(cache.pending_prefix_ttl_ms);
         engine_state.tree().pending().enable(ttl);

@@ -187,9 +187,10 @@ pub struct ServerArgs {
 
     /// PD: send a request only to a decode worker whose KV cache holds its
     /// prefix, marked `disagg_local_prefill`, when the uncached suffix is at
-    /// most N tokens; that worker prefills the suffix itself. Needs the local
-    /// KV-event tree and decode engines launched with
-    /// --disaggregation-decode-enable-local-prefill. Legacy chat routing only.
+    /// most N tokens; that worker prefills the suffix itself. Builds the local
+    /// KV-event tree from the engines' --kv-events-config publishers; the decode
+    /// engines need --disaggregation-decode-enable-local-prefill. Legacy chat
+    /// routing only.
     #[arg(long, value_name = "N")]
     pub pd_local_prefill_max_uncached_tokens: Option<u64>,
 
