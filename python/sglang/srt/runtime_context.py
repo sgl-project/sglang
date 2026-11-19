@@ -1021,7 +1021,9 @@ class RuntimeContext:
                 if self._server_args
                 else "cuda"
             )
-            stream = torch.get_device_module(device).Stream()
+            stream = torch.get_device_module(device).Stream(
+                **_named_stream_kwargs(name=name, device=device)
+            )
             self.resources.streams[name] = stream
         return stream
 
@@ -1678,6 +1680,33 @@ def set_stream(name: str, stream: Any) -> Any:
 
 def get_buffer(name: str, factory: Any) -> Any:
     return _CONTEXT.get_buffer(name, factory)
+
+
+# Named streams that CUDA graph kernels are captured on: the shared capture
+# stream and the model's alt stream.
+_GRAPH_STREAM_NAMES = frozenset({"cuda_graph_capture", "alt"})
+
+
+def _named_stream_kwargs(*, name: str, device: Any) -> Dict[str, int]:
+    """On the cuda device type, graph streams take SGLANG_PLB_STREAM_PRIORITY."""
+    if name not in _GRAPH_STREAM_NAMES or str(device).split(":")[0] != "cuda":
+        return {}
+    from sglang.srt.environ import envs
+
+    priority = envs.SGLANG_PLB_STREAM_PRIORITY.get()
+    # 0 is the stream constructor's default; keep the stock call there.
+    if priority == 0:
+        return {}
+    _log_graph_stream_priority(priority)
+    return {"priority": priority}
+
+
+@functools.lru_cache(maxsize=None)
+def _log_graph_stream_priority(priority: int) -> None:
+    logger.info(
+        "CUDA graph capture streams created at SGLANG_PLB_STREAM_PRIORITY=%d",
+        priority,
+    )
 
 
 _GLOBAL_DWDP_MANAGER: Any = None

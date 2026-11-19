@@ -42,6 +42,7 @@ from sglang.srt.runtime_context import (
     ParallelContext,
     SpawnRanks,
     _FlagGroupBase,
+    _log_graph_stream_priority,
     assert_published,
     derive_parallel_widths,
     get_context,
@@ -51,6 +52,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
     get_server_args,
+    get_stream,
     is_scheduler_io_rank,
     max_prefill_buffer_tokens,
     max_speculative_num_draft_tokens,
@@ -1186,6 +1188,55 @@ class TestNamedStreams(_IsolatedServerArgs):
         self.assertIs(a, b)
         self.assertIsNot(a, c)
         self.assertEqual(len(created), 2)
+
+    def _graph_and_other_streams(self, stream_type, *, priority=-1):
+        from sglang.srt.environ import envs
+        from sglang.srt.model_executor.runner_utils.pool import (
+            get_or_create_global_graph_capture_stream,
+        )
+
+        _log_graph_stream_priority.cache_clear()
+        device_module = SimpleNamespace(Stream=stream_type)
+        with (
+            envs.SGLANG_PLB_STREAM_PRIORITY.override(priority),
+            patch("torch.get_device_module", return_value=device_module),
+        ):
+            return (
+                get_or_create_global_graph_capture_stream(),
+                get_stream("alt"),
+                get_stream("offload"),
+            )
+
+    def test_graph_streams_take_the_decode_stream_priority(self):
+        """On the cuda device type, the streams graphs are captured on take
+        SGLANG_PLB_STREAM_PRIORITY, as the decode streams do; other names do not.
+        One INFO line reports it."""
+
+        class _FakeStream:
+            def __init__(self, priority=0):
+                self.priority = priority
+
+        reset_context()
+        with self.assertLogs("sglang.srt.runtime_context", level="INFO") as logs:
+            streams = self._graph_and_other_streams(_FakeStream)
+        self.assertEqual([s.priority for s in streams], [-1, -1, 0])
+        lines = [m for m in logs.output if "SGLANG_PLB_STREAM_PRIORITY=-1" in m]
+        self.assertEqual(len(lines), 1)
+
+    def test_stock_constructor_without_the_knob_or_off_cuda(self):
+        class _FakeStream:
+            """A device stream type whose constructor takes no priority."""
+
+        for device, priority in (("cuda", 0), ("cpu", -1)):
+            with self.subTest(device=device, priority=priority):
+                reset_context()
+                if device != "cuda":
+                    publish(ServerArgs(model_path="dummy", device=device), role="test")
+                with self.assertNoLogs("sglang.srt.runtime_context", level="INFO"):
+                    streams = self._graph_and_other_streams(
+                        _FakeStream, priority=priority
+                    )
+                self.assertTrue(all(isinstance(s, _FakeStream) for s in streams))
 
     def test_get_buffer_keyed_lazy(self):
         reset_context()
