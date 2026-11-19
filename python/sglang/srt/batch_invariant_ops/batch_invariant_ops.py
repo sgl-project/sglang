@@ -1,6 +1,7 @@
 # Adapted from https://github.com/thinking-machines-lab/batch_invariant_ops/blob/main/batch_invariant_ops/batch_invariant_ops.py
 
 import contextlib
+import functools
 from collections import namedtuple
 from collections.abc import Callable
 from typing import Any, Dict, Optional, Tuple
@@ -12,7 +13,11 @@ import triton.language as tl
 from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
 from sglang.srt.utils import is_gfx95_supported, is_npu
 from sglang.srt.utils.common import calc_diff, get_bool_env_var
-from sglang.srt.utils.device import get_device_core_count, get_dispatch_device_backend
+from sglang.srt.utils.device import (
+    get_device_core_count,
+    get_dispatch_device_backend,
+    is_flashinfer_available,
+)
 
 _is_npu = is_npu()
 _is_gfx95 = is_gfx95_supported()
@@ -508,6 +513,65 @@ def _matmul_persistent_deepgemm(
     return out
 
 
+# Compute capabilities of FlashInfer's batch-invariant BF16 GEMM class.
+_FLASHINFER_MM_BF16_ARCHS = ((10, 0), (10, 3), (10, 7))
+
+
+@functools.lru_cache(maxsize=None)
+def _flashinfer_mm_bf16_supported(device_index: int) -> bool:
+    if not is_flashinfer_available():
+        return False
+    try:
+        # FlashInfer >= 0.7.4
+        from flashinfer.batch_invariant import is_supported_device
+    except ImportError:
+        return False
+    return is_supported_device(
+        torch.device("cuda", device_index), _FLASHINFER_MM_BF16_ARCHS
+    )
+
+
+def _can_use_flashinfer_mm_bf16(
+    a: torch.Tensor, b: torch.Tensor, out_dtype: torch.dtype
+) -> bool:
+    # Depends on the device, the dtypes and the weight only, never on M:
+    # switching providers with the batch size would break batch invariance
+    # even though each provider is batch-invariant on its own.
+    K, N = b.shape
+    return (
+        a.is_cuda
+        and a.dtype == torch.bfloat16
+        and b.dtype == torch.bfloat16
+        and out_dtype == torch.bfloat16
+        and K > 0
+        and N > 0
+        and K % 8 == 0
+        and N % 8 == 0
+        # (K, N) row-major, or the transpose of a row-major (N, K) weight.
+        and (
+            (b.stride(1) == 1 and b.stride(0) == N)
+            or (b.stride(0) == 1 and b.stride(1) == K)
+        )
+        and b.data_ptr() % 16 == 0
+        and _flashinfer_mm_bf16_supported(a.device.index)
+    )
+
+
+def _matmul_persistent_flashinfer(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    bias: torch.Tensor | None = None,
+):
+    from flashinfer import mm_bf16
+
+    out = mm_bf16(a, b, backend="auto", batch_invariant=True)
+    # Add the bias after rounding, as the DeepGEMM path does; mm_bf16's fused
+    # bias is a different numerical class.
+    if bias is not None:
+        out += bias
+    return out
+
+
 def matmul_persistent(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -516,6 +580,9 @@ def matmul_persistent(
 ):
     K, N = b.shape
     out_dtype = out_dtype or a.dtype
+
+    if _can_use_flashinfer_mm_bf16(a, b, out_dtype):
+        return _matmul_persistent_flashinfer(a=a, b=b, bias=bias)
 
     # DeepGEMM has minimum dimension requirements for TMA descriptors
     MIN_DEEPGEMM_DIM = 16
