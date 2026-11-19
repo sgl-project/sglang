@@ -1,3 +1,4 @@
+import os
 import sys
 import types
 import unittest
@@ -63,6 +64,22 @@ class TestMoriAmdGemPool(unittest.TestCase):
             hip_gem.get_allocator.return_value.allocator.return_value
         )
         self.assertEqual(result, (True, mem_pool.return_value, "AMD_GEM"))
+
+    def test_pins_through_the_pd_nics(self):
+        _, modules = self._fake_mori()
+        disagg = MagicMock(disaggregation_ib_device="ionic_0,ionic_1")
+        mori_env, mooncake_env = self._with_env(mori="AMD_GEM")
+        with (
+            mori_env,
+            mooncake_env,
+            modules,
+            patch.dict(os.environ, {"MORI_RDMA_DEVICES": "mlx5_0"}),
+            patch.object(mori_utils, "get_disagg", return_value=disagg),
+            patch.object(mori_utils.torch.cuda, "MemPool", MagicMock()),
+            patch.object(mori_utils.torch.cuda, "device", MagicMock()),
+        ):
+            mori_utils.init_mori_custom_mem_pool("cuda:0")
+            self.assertEqual(os.environ["MORI_RDMA_DEVICES"], "ionic_0,ionic_1")
 
     def test_missing_allocator_fails_instead_of_falling_back(self):
         fake_mori = types.ModuleType("mori")

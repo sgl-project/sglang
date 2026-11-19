@@ -14,11 +14,13 @@
 """MoRI-specific utilities for custom memory pool management."""
 
 import logging
+import os
 from typing import Any, Optional, Tuple
 
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_disagg
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +71,15 @@ def init_mori_custom_mem_pool(
             "SGLANG_MORI_CUSTOM_MEM_POOL=AMD_GEM needs a mori build that ships "
             f"mori.io.HipGemAllocator: {e}"
         ) from e
+
+    # The allocator pins each buffer through an RDMA device from MORI_RDMA_DEVICES, which
+    # the MoRI connector sets from --disaggregation-ib-device only after the KV pool exists.
+    try:
+        ib_device = get_disagg().disaggregation_ib_device
+    except Exception:
+        ib_device = None
+    if ib_device:
+        os.environ["MORI_RDMA_DEVICES"] = ib_device
 
     allocator = HipGemAllocator.get_allocator(device)
     # MemPool binds to the current device; on a non-main thread that is device 0.
