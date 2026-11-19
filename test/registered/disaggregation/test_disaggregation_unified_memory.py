@@ -182,7 +182,7 @@ class TestUnifiedMemoryDisaggregationChunkedPrefill(TestUnifiedMemoryDisaggregat
         self._flush_cache(self.prefill_url)
         self._flush_cache(self.decode_url)
         active = self._cancel_after_handoff(prompt)
-        idle = self._wait_for_decode_idle(active["timestamp"])
+        self._wait_for_decode_idle(active["timestamp"])
 
         # The decode prefix cache is disabled by default. Without resetting
         # either worker, cycle more prompt tokens than fit in its 4096-token
@@ -195,7 +195,9 @@ class TestUnifiedMemoryDisaggregationChunkedPrefill(TestUnifiedMemoryDisaggregat
             self._assert_logprob_parity(
                 reference=reference, actual=actual, label=f"after_cancel_{i}"
             )
-        self._wait_for_decode_idle(idle["timestamp"])
+        # The decode worker publishes wall-clock timestamps on the same host.
+        # Require a snapshot after the final response, not an earlier idle one.
+        self._wait_for_decode_idle(time.time())
 
 
 class TestUnifiedMemoryDisaggregationMHA(TestUnifiedMemoryDisaggregation):
