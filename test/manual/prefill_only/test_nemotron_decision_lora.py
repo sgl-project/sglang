@@ -15,15 +15,12 @@ from sglang.srt.configs.nemotron_decision import load_nemotron_decision_config
 from sglang.srt.entrypoints.systemone.nemotron_decide import NemotronDecideEncoder
 from sglang.srt.entrypoints.systemone.protocol import SystemOneRequest
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
 )
-
-register_cuda_ci(est_time=240, stage="base-b", runner_config="1-gpu-large")
 
 MODEL = "nvidia/NVIDIA-Nemotron-3.5-Decision-8B-BF16"
 REVISION = "40c36c022455a731f1226594108dac296098102f"
@@ -275,17 +272,39 @@ class TestNemotronDecisionLoRAServing(CustomTestCase):
         )
         cls.addClassCleanup(kill_process_tree, process.pid)
 
-    def check_case(self, case):
-        response = requests.post(
-            self.url + "/v1/systemone", json=case["payload"], timeout=120
-        )
+    def check_case(self, case, route="/v1/systemone"):
+        payload = case["payload"]
+        if route == "/v1/decisions":
+            qid, original = next(iter(payload["questions"].items()))
+            question = {"id": qid, "question": original["instructions"]}
+            if case["kind"] == "choice":
+                question.update(
+                    type="choice",
+                    options=[
+                        {"name": name, "description": value}
+                        for name, value in original["criteria"].items()
+                    ],
+                )
+            elif case["kind"] == "score":
+                question.update(type="score", levels=original["criteria"])
+            else:
+                question["type"] = "yes_no"
+                for source, target in (("true", "yes"), ("false", "no")):
+                    if source in (original.get("criteria") or {}):
+                        question[target] = original["criteria"][source]
+            payload = {
+                "model": payload["model"],
+                "input": payload["state"],
+                "questions": [question],
+            }
+        response = requests.post(self.url + route, json=payload, timeout=120)
         response.raise_for_status()
         data = response.json()
         self.assertEqual(set(data["answers"]), set(case["payload"]["questions"]))
         answer = data["answers"][next(iter(case["payload"]["questions"]))]
         actual = (
             {"yes": answer["noul"], "no": 1 - answer["noul"]}
-            if case["kind"] == "noul"
+            if case["kind"] == "noul" and route == "/v1/systemone"
             else answer["probabilities"]
         )
         self.assertEqual(set(actual), set(case["probabilities"]))
@@ -296,8 +315,13 @@ class TestNemotronDecisionLoRAServing(CustomTestCase):
                 delta=0.02,
                 msg=(case["id"], case["payload"]["model"]),
             )
-        self.assertEqual(data["usage"]["input_tokens"], len(case["prompt_ids"]))
-        self.assertEqual(data["usage"]["output_tokens"], 0)
+        input_key, output_key = (
+            ("input_tokens", "output_tokens")
+            if route == "/v1/systemone"
+            else ("prompt_tokens", "completion_tokens")
+        )
+        self.assertEqual(data["usage"][input_key], len(case["prompt_ids"]))
+        self.assertEqual(data["usage"][output_key], 0)
         return actual
 
     def test_base_and_adapter_scores_stay_isolated_under_concurrency(self):
@@ -312,17 +336,26 @@ class TestNemotronDecisionLoRAServing(CustomTestCase):
             ),
             0.5,
         )
-        for case in self.cases:
-            self.check_case(case)
-        with ThreadPoolExecutor(max_workers=4) as pool:
-            list(pool.map(self.check_case, self.cases))
+        for route in ("/v1/systemone", "/v1/decisions"):
+            for case in self.cases:
+                self.check_case(case, route)
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                list(pool.map(lambda case: self.check_case(case, route), self.cases))
 
     def test_unknown_adapter_is_rejected_without_affecting_valid_reads(self):
-        payload = {**self.cases[0]["payload"], "model": "decision-test:missing-adapter"}
-        response = requests.post(self.url + "/v1/systemone", json=payload, timeout=30)
-        self.assertEqual(response.status_code, 400, response.text)
-        for case in self.cases[:3]:
-            self.check_case(case)
+        invalid = {
+            **self.cases[0],
+            "payload": {
+                **self.cases[0]["payload"],
+                "model": "decision-test:missing-adapter",
+            },
+        }
+        for route in ("/v1/systemone", "/v1/decisions"):
+            with self.assertRaises(requests.HTTPError) as error:
+                self.check_case(invalid, route)
+            self.assertEqual(error.exception.response.status_code, 400)
+            for case in self.cases[:3]:
+                self.check_case(case, route)
 
 
 if __name__ == "__main__":

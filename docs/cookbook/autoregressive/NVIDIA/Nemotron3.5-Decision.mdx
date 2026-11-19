@@ -155,3 +155,17 @@ Captured on one H100. Probabilities can vary with hardware and numerical backend
 ```
 
 </Accordion>
+
+## 4. LoRA adapters
+
+Start the server with an adapter directory:
+
+```bash Command
+sglang serve \
+  --model-path nvidia/NVIDIA-Nemotron-3.5-Decision-8B-BF16 \
+  --lora-paths task=/path/to/adapter
+```
+
+The server reads the adapter rank and target modules from `adapter_config.json`. Base and adapter requests can share the server. In either Python example above, set `"model"` to `"nvidia/NVIDIA-Nemotron-3.5-Decision-8B-BF16:task"` to use the adapter. Omit `:task` to use the base weights.
+
+Adapters can change the answer probabilities and selected answer. Validate your adapter on examples from its intended task before using its scores.

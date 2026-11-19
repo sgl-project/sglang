@@ -440,11 +440,17 @@ class OpenAIServingDecisions(OpenAIServingBase):
         request: DecisionRequest,
         raw_request: Request,
     ) -> ORJSONResponse:
+        adapter = (
+            self._resolve_lora_path(request.model, None)
+            if self.question_encoder is not None
+            else None
+        )
         # Checkpoint temperatures vary by question type, so calibrate after scoring.
         prompts, label_token_ids, result = await self._score(
             adapted_request=adapted_request,
             raw_request=raw_request,
             temperature=request.temperature if self.question_encoder is None else 1.0,
+            **({"lora_path": adapter} if adapter is not None else {}),
         )
         answers = {}
         for i, question in enumerate(request.questions):

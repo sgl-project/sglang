@@ -1057,7 +1057,8 @@ class TestSystemOne(unittest.IsolatedAsyncioTestCase):
             "first": manager.logprobs.roll(1),
             "second": manager.logprobs.roll(2),
         }
-        serving = self._serving(manager)
+        from sglang.srt.entrypoints.systemone.protocol import NemotronDecisionsRequest
+
         question = {
             "q": {
                 "type": "choice",
@@ -1065,39 +1066,58 @@ class TestSystemOne(unittest.IsolatedAsyncioTestCase):
                 "criteria": {"a": "First", "b": "Second"},
             }
         }
-        requests_ = [
-            _systemone_request(question).model_copy(
-                update={
-                    "model": "served-model"
-                    if adapter is None
-                    else f"served-model:{adapter}"
+        systemone = _systemone_request(question)
+        decisions = NemotronDecisionsRequest(
+            input=systemone.state,
+            questions=[
+                {
+                    "id": "q",
+                    **_question("choice", {"a": "First", "b": "Second"}, "Choose?"),
                 }
-            )
-            for adapter in (None, "first", "second")
-        ]
-        responses = await asyncio.gather(
-            *(serving.handle_request(request, None) for request in requests_)
+            ],
         )
-        self.assertEqual(len(manager.requests), 3)
-        actual = []
-        for adapter, response, scored in zip(
-            (None, "first", "second"), responses, manager.requests
+        for serving_class, base_request in (
+            (SystemOneServing, systemone),
+            (OpenAIServingDecisions, decisions),
         ):
-            self.assertEqual(response.status_code, 200, response.body)
-            values = (
-                manager.logprobs
-                if adapter is None
-                else manager.adapter_logprobs[adapter]
-            )
-            expected = values[scored.token_ids_logprob[0]].softmax(0).tolist()
-            probabilities = json.loads(response.body)["answers"]["q"]["probabilities"]
-            actual.append(list(probabilities.values()))
-            for probability, expected_probability in zip(
-                probabilities.values(), expected
-            ):
-                self.assertAlmostEqual(probability, expected_probability)
-        self.assertNotEqual(actual[0], actual[1])
-        self.assertNotEqual(actual[1], actual[2])
+            with self.subTest(route=serving_class.route):
+                manager.requests.clear()
+                serving = _handler(manager, serving_class=serving_class)
+                requests_ = [
+                    base_request.model_copy(
+                        update={
+                            "model": "served-model"
+                            if adapter is None
+                            else f"served-model:{adapter}"
+                        }
+                    )
+                    for adapter in (None, "first", "second")
+                ]
+                responses = await asyncio.gather(
+                    *(serving.handle_request(request, None) for request in requests_)
+                )
+                self.assertEqual(len(manager.requests), 3)
+                actual = []
+                for adapter, response, scored in zip(
+                    (None, "first", "second"), responses, manager.requests
+                ):
+                    self.assertEqual(response.status_code, 200, response.body)
+                    values = (
+                        manager.logprobs
+                        if adapter is None
+                        else manager.adapter_logprobs[adapter]
+                    )
+                    expected = values[scored.token_ids_logprob[0]].softmax(0).tolist()
+                    probabilities = json.loads(response.body)["answers"]["q"][
+                        "probabilities"
+                    ]
+                    actual.append(list(probabilities.values()))
+                    for probability, expected_probability in zip(
+                        probabilities.values(), expected
+                    ):
+                        self.assertAlmostEqual(probability, expected_probability)
+                self.assertNotEqual(actual[0], actual[1])
+                self.assertNotEqual(actual[1], actual[2])
 
     async def test_decision_checkpoints_answer_with_their_trained_prompt(self):
         """The prompt literal is decision_messages of perplexity-ai/pplx-decider-v1-27b."""
