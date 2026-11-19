@@ -17,12 +17,12 @@ on:
         description: 'NPU image used by the prefill/decode pods.'
         required: false
         type: string
-        default: 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.1.0-a3'
+        default: 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-a3-B031'
       use_image_sglang:
         description: "If 'true' (default), pods import sglang from the image's site-packages. Set 'false' to use the PR checkout's sglang."
         required: false
         type: string
-        default: 'false'
+        default: 'true'
 
 concurrency:
   group: npu-release-model-data-${{ github.ref }}
@@ -112,11 +112,11 @@ jobs:
       decode_size: ${{ matrix.decode_size }}
       router_size: ${{ matrix.router_size }}
       test_case: ${{ matrix.test_case }}
-      image: ${{ inputs.image || 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.1.0-a3' }}
+      image: ${{ inputs.image || 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-a3-B031' }}
       prefill_decode_deployment: ${{ matrix.prefill_decode_deployment }}
       container_patches: ${{ matrix.container_patches || '' }}
       run_start_metadata: ${{ needs.metadata.outputs.run_start_metadata }}
-      use_image_sglang: ${{ inputs.use_image_sglang || 'false' }}
+      use_image_sglang: ${{ inputs.use_image_sglang || 'true' }}
       test_method: ${{ matrix.test_method || '' }}
       sgl_router_artifact: sgl-router-aarch64-npu-obs
     secrets: inherit

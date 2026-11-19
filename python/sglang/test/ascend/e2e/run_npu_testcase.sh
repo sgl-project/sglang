@@ -26,39 +26,6 @@ export HF_MODULES_CACHE="${HF_MODULES_CACHE:-/tmp/hf_modules}"
 echo "NPU info:"
 npu-smi info
 
-# =======temp install the Mooncake store client and upgrade memfabric-hybrid=====
-# The release image ships no mooncake_master on PATH, so install the store
-# client (mooncake_master lives in the package directory) together with the
-# matching memfabric transport. Both are forced so the wheel's build wins over
-# whatever the image bundled.
-MOONCAKE_WHEEL_BASE=https://sglang-npu.obs.cn-southwest-2.myhuaweicloud.com/memfabric/1.3.1
-pip install --force-reinstall --no-deps \
-    "${MOONCAKE_WHEEL_BASE}/mooncake_transfer_engine_memfabric-0.3.14-cp312-cp312-manylinux_2_35_aarch64.whl" \
-    "${MOONCAKE_WHEEL_BASE}/memfabric_hybrid-1.3.1-cp312-cp312-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl"
-# mooncake_master ships inside the package directory rather than on PATH;
-# expose it so the test helpers can keep launching it by name.
-MOONCAKE_MASTER_BIN="$(python -c 'import os, mooncake; print(os.path.join(os.path.dirname(mooncake.__file__), "mooncake_master"))' 2>/dev/null || true)"
-if [ -n "${MOONCAKE_MASTER_BIN}" ] && [ -f "${MOONCAKE_MASTER_BIN}" ]; then
-    export PATH="$(dirname "${MOONCAKE_MASTER_BIN}"):${PATH}"
-fi
-# mooncake_master links against rdma-core (libibverbs) even when it uses the
-# ascend transport; install it when the image omits it, otherwise the process
-# dies with "error while loading shared libraries: libibverbs.so.1".
-if ! ldconfig -p 2>/dev/null | grep -q "libibverbs\.so"; then
-    echo "libibverbs is missing, installing rdma-core..."
-    export DEBIAN_FRONTEND=noninteractive
-    if command -v apt-get >/dev/null 2>&1; then
-        apt-get update -qq && apt-get install -y -qq libibverbs1
-    elif command -v dnf >/dev/null 2>&1; then
-        dnf install -y -q libibverbs
-    elif command -v yum >/dev/null 2>&1; then
-        yum install -y -q libibverbs
-    fi
-    if ! ldconfig -p 2>/dev/null | grep -q "libibverbs\.so"; then
-        echo "WARNING: libibverbs is still missing; the Mooncake master will fail to start" >&2
-    fi
-fi
-
 # Apply the container patches prepared by the workflow: every entry in
 # SGLANG_NPU_CONTAINER_PATCHES is a directory (relative to the repo root) whose
 # install.sh ships with that patch archive. The workflow downloads and extracts
