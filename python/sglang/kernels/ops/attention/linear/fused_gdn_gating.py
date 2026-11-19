@@ -4,6 +4,19 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.arch import current_arch
+from sglang.srt.utils import print_info_once
+
+# Heads per program of the decode-sized launch.
+_BLK_HEADS = 8
+# From this many tokens on, SM100+ gates all heads of a token in one program;
+# the gated norm's prefill bound at 64 heads.
+ONE_PROGRAM_MIN_TOKENS = 1024
+_ONE_PROGRAM_ON = (
+    "GDN gating prefill launch: on (all heads of a token in one program from "
+    f"{ONE_PROGRAM_MIN_TOKENS} tokens)"
+)
+
 
 @triton.jit
 def _gdn_gating_values(
@@ -49,6 +62,19 @@ def fused_gdn_gating_kernel(
     tl.store(beta_output + off, blk_beta_output.to(b.dtype.element_ty), mask=mask)
 
 
+def _heads_per_program(*, num_tokens: int, num_heads: int) -> int:
+    """Heads a program gates: all heads of a token on SM100+ from
+    ONE_PROGRAM_MIN_TOKENS tokens on (logged once), else _BLK_HEADS."""
+    if (
+        torch.compiler.is_compiling()
+        or num_tokens < ONE_PROGRAM_MIN_TOKENS
+        or not current_arch().is_sm_at_least(10)
+    ):
+        return _BLK_HEADS
+    print_info_once(_ONE_PROGRAM_ON)
+    return max(triton.next_power_of_2(num_heads), _BLK_HEADS)
+
+
 def fused_gdn_gating(
     A_log: torch.Tensor,
     a: torch.Tensor,
@@ -61,7 +87,8 @@ def fused_gdn_gating(
     seq_len = 1
     stride_a = a.stride(0)
     stride_b = b.stride(0)
-    grid = (batch, seq_len, triton.cdiv(num_heads, 8))
+    blk_heads = _heads_per_program(num_tokens=batch, num_heads=num_heads)
+    grid = (batch, seq_len, triton.cdiv(num_heads, blk_heads))
     g = torch.empty(1, batch, num_heads, dtype=torch.float32, device=a.device)
     beta_output = torch.empty(1, batch, num_heads, dtype=torch.float32, device=b.device)
     fused_gdn_gating_kernel[grid](
@@ -77,7 +104,7 @@ def fused_gdn_gating(
         num_heads,
         beta,
         threshold,
-        8,
+        blk_heads,
         num_warps=1,
     )
     return g, beta_output

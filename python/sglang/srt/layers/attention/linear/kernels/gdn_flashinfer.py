@@ -16,12 +16,19 @@ from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
+from sglang.kernels.ops.mamba.gdn_extend_state_copies import (
+    gather_pool_rows,
+    gather_pool_rows_ok,
+    scatter_pool_rows,
+    scatter_pool_rows_ok,
+)
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
 from sglang.srt.layers.attention.linear.kernels.state_pool_io import (
     gather_pool_states,
     scatter_pool_states,
+    state_pool_indices,
 )
 from sglang.srt.runtime_context import (
     mamba_cache_chunk_size,
@@ -601,12 +608,19 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         alpha_fi = torch.exp(g[0].to(torch.float32))
         beta_fi = beta[0].to(torch.float32)
 
-        ssm_cache_indices, live_rows, initial_state_fi = gather_pool_states(
-            ssm_states, cache_indices
+        state_dtype = self._prefill_state_dtype(ssm_states.dtype)
+        pool_rows = gather_pool_rows_ok(
+            states=ssm_states, indices=cache_indices, dtype=state_dtype
         )
-        initial_state_fi = initial_state_fi.to(
-            self._prefill_state_dtype(initial_state_fi.dtype)
-        )
+        if pool_rows:
+            initial_state_fi = gather_pool_rows(
+                states=ssm_states, indices=cache_indices
+            )
+        else:
+            ssm_cache_indices, live_rows, initial_state_fi = gather_pool_states(
+                ssm_states, cache_indices
+            )
+            initial_state_fi = initial_state_fi.to(state_dtype)
         cu_seqlens = query_start_loc.to(torch.int64)
 
         # Keep final state and checkpoints in the same kernel state dtype.
@@ -632,7 +646,21 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         )
 
         # Write back state to pool
-        scatter_pool_states(ssm_states, ssm_cache_indices, live_rows, output_state_fi)
+        if pool_rows and scatter_pool_rows_ok(
+            states=ssm_states, indices=cache_indices, updates=output_state_fi
+        ):
+            scatter_pool_rows(
+                states=ssm_states, indices=cache_indices, updates=output_state_fi
+            )
+        else:
+            if pool_rows:
+                ssm_cache_indices = state_pool_indices(cache_indices)
+                live_rows = (cache_indices > 0).view(
+                    -1, *((1,) * (ssm_states.ndim - 1))
+                )
+            scatter_pool_states(
+                ssm_states, ssm_cache_indices, live_rows, output_state_fi
+            )
 
         # Output: [seq, HV, V] -> [1, seq, HV, V]
         core_attn_out = output_fi.view(1, total_seq_len, num_v_heads, head_v_dim)

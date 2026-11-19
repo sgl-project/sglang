@@ -26,6 +26,10 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
     MambaAttnBackendBase,
 )
+from sglang.srt.layers.attention.linear.gdn_extend_track import (
+    track_conv_windows,
+    track_ssm_states_in_one_launch,
+)
 from sglang.srt.layers.attention.linear.gdn_prefill_graph import (
     GDNPrefillGraphMetadata,
     buckets_keep_chunk_o_block_size,
@@ -1534,11 +1538,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
             mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
         else:
             if forward_metadata.has_mamba_track_mask:
-                mixed_qkv_to_track = mixed_qkv[
-                    forward_metadata.track_conv_indices
-                ].transpose(1, 2)
-                conv_states[forward_metadata.conv_states_mask_indices] = (
-                    mixed_qkv_to_track
+                track_conv_windows(
+                    conv_states=conv_states,
+                    mixed_qkv=mixed_qkv,
+                    metadata=forward_metadata,
                 )
 
             mixed_qkv = self._convolve_prefill(
@@ -1704,7 +1707,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     staging,
                 )
 
-            if forward_metadata.has_mamba_track_mask:
+            if (
+                forward_metadata.has_mamba_track_mask
+                and not track_ssm_states_in_one_launch(
+                    ssm_states=ssm_states,
+                    h=h,
+                    h_track_buf=h_track_buf,
+                    metadata=forward_metadata,
+                )
+            ):
                 self._track_mamba_state_extend(
                     forward_batch,
                     h,

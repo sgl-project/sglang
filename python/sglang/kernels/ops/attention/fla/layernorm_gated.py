@@ -15,6 +15,7 @@ import triton
 import triton.language as tl
 from einops import rearrange
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.fused_op import BaseFusedOp
 from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
@@ -29,12 +30,22 @@ from sglang.srt.utils import (
     device_context,
     is_npu,
     next_power_of_2,
+    print_info_once,
 )
 
 _is_npu = is_npu()
 
 # Maximum rows per Triton block for layernorm gated kernel
 MAX_ROWS_PER_BLOCK = 4
+# From this many rows (1024 tokens of 64 heads) on, SM100+ runs PREFILL_TILE_WARPS
+# one-warp row tiles a program; decode-sized launches keep one tile.
+PREFILL_TILE_MIN_ROWS = 1 << 16
+PREFILL_TILE_WARPS = 4
+_PREFILL_TILES_ON = (
+    f"gated norm prefill tiles: on ({PREFILL_TILE_WARPS} warps and "
+    f"{MAX_ROWS_PER_BLOCK * PREFILL_TILE_WARPS} rows a program from "
+    f"{PREFILL_TILE_MIN_ROWS} rows)"
+)
 
 _GATE_ACTIVATION_FNS = {
     "swish": F.silu,
@@ -137,6 +148,7 @@ def _layer_norm_fwd_1pass_kernel(
     Q=None,
     S=None,
     QUANT: tl.constexpr = False,
+    EARLY_Z: tl.constexpr = False,
 ):
     if USE_GDC:
         tl.extra.cuda.gdc_wait()
@@ -179,6 +191,16 @@ def _layer_norm_fwd_1pass_kernel(
         elif ACTIVATION == "sigmoid":
             x *= tl.sigmoid(z)
 
+    if HAS_Z and NORM_BEFORE_GATE and EARLY_Z:
+        # Issue the gate load with x's; it is applied after the norm.
+        if Z_IS_3D:
+            z_row_offsets = (rows[:, None] // Z_HEADS) * stride_z_token + (
+                rows[:, None] % Z_HEADS
+            ) * stride_z_head
+        else:
+            z_row_offsets = rows[:, None] * stride_z_row
+        z_early = tl.load(Z + z_row_offsets + col_offsets, mask=mask, other=0.0)
+
     # Compute mean and variance per row (reduce along axis 1)
     if not IS_RMS_NORM:
         mean = tl.sum(x, axis=1) / N  # Shape: [ROWS_PER_BLOCK]
@@ -218,14 +240,17 @@ def _layer_norm_fwd_1pass_kernel(
     y = x_hat * w[None, :] + b[None, :] if HAS_BIAS else x_hat * w[None, :]
 
     if HAS_Z and NORM_BEFORE_GATE:
-        if Z_IS_3D:
-            z_row_offsets = (rows[:, None] // Z_HEADS) * stride_z_token + (
-                rows[:, None] % Z_HEADS
-            ) * stride_z_head
+        if EARLY_Z:
+            z = z_early.to(tl.float32)
         else:
-            z_row_offsets = rows[:, None] * stride_z_row
-        Z_base = Z + z_row_offsets + col_offsets
-        z = tl.load(Z_base, mask=mask, other=0.0).to(tl.float32)
+            if Z_IS_3D:
+                z_row_offsets = (rows[:, None] // Z_HEADS) * stride_z_token + (
+                    rows[:, None] % Z_HEADS
+                ) * stride_z_head
+            else:
+                z_row_offsets = rows[:, None] * stride_z_row
+            Z_base = Z + z_row_offsets + col_offsets
+            z = tl.load(Z_base, mask=mask, other=0.0).to(tl.float32)
         if ACTIVATION == "swish" or ACTIVATION == "silu":
             y *= z * tl.sigmoid(z)
         elif ACTIVATION == "sigmoid":
@@ -265,6 +290,29 @@ def calc_rows_per_block(M: int, device: torch.device) -> int:
     rows_per_block = next_power_of_2(cdiv(M, 2 * sm_count))
     rows_per_block = min(rows_per_block, MAX_ROWS_PER_BLOCK)
     return rows_per_block
+
+
+def _use_prefill_tiles(
+    *, M: int, num_warps: int, rows_per_block: int, quant_heads: int
+) -> bool:
+    """Whether a launch runs PREFILL_TILE_WARPS one-warp 4-row tiles a program (SM100+,
+    at least PREFILL_TILE_MIN_ROWS rows). Each outcome is logged once."""
+    if (
+        torch.compiler.is_compiling()
+        or M < PREFILL_TILE_MIN_ROWS
+        or not current_arch().is_sm_at_least(10)
+    ):
+        return False
+    if quant_heads:
+        print_info_once("gated norm prefill tiles: off for the per-head FP8 launch")
+        return False
+    if num_warps != 1 or rows_per_block != MAX_ROWS_PER_BLOCK:
+        print_info_once(
+            "gated norm prefill tiles: off for a launch other than 1 warp of 4 rows"
+        )
+        return False
+    print_info_once(_PREFILL_TILES_ON)
+    return True
 
 
 def _layer_norm_fwd(
@@ -320,6 +368,13 @@ def _layer_norm_fwd(
     num_warps = min(max(BLOCK_N // 256, 1), 8)
     # Calculate rows per block based on SM count
     rows_per_block = calc_rows_per_block(M, x.device)
+    tiles = {}
+    if _use_prefill_tiles(
+        M=M, num_warps=num_warps, rows_per_block=rows_per_block, quant_heads=quant_heads
+    ):
+        rows_per_block = MAX_ROWS_PER_BLOCK * PREFILL_TILE_WARPS
+        num_warps = PREFILL_TILE_WARPS
+        tiles = {"EARLY_Z": True}
     quant = {}
     # quant_heads: one block per token, same per-warp row split (rows round identically), FP8 (q, scale) out
     if quant_heads:
@@ -380,6 +435,7 @@ def _layer_norm_fwd(
             ACTIVATION=activation,
             **pdl_kwargs,
             **quant,
+            **tiles,
         )
     return ((q, s) if quant_heads else out), mean, rstd
 

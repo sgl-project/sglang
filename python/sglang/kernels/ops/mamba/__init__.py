@@ -171,3 +171,19 @@ for _fn in ("kda_track_conv_window", "kda_track_ssm_state"):
         )
     )
 del _fn
+# State-row copies of the eager GDN extend; their *_ok predicates pick them per call.
+for _fn in (
+    "gather_pool_rows",
+    "scatter_pool_rows",
+    "track_state_rows",
+    "track_conv_rows",
+):
+    register_kernel(
+        KernelSpec(
+            op=f"mamba.{_fn}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.mamba.gdn_extend_state_copies:{_fn}",
+            capabilities=CUDA_ONLY,
+        )
+    )
+del _fn

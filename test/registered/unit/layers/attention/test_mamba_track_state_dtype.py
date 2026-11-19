@@ -1,13 +1,22 @@
+import itertools
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
 
+import sglang.kernels.arch as arch_module
+from sglang.kernels.arch._cuda import CudaArch
+from sglang.kernels.arch.base import DeviceArch
+from sglang.kernels.ops.mamba import gdn_extend_state_copies
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     MambaAttnBackendBase,
 )
-from sglang.srt.layers.attention.linear import gdn_backend, kda_backend
+from sglang.srt.layers.attention.linear import (
+    gdn_backend,
+    gdn_extend_track,
+    kda_backend,
+)
 from sglang.srt.layers.attention.linear.gdn_backend import (
     GDNAttnBackend,
     GDNKernelDispatcher,
@@ -27,6 +36,21 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 # is the last fp32 mantissa bit at 1.x, so the probe is fp32-exact (a 2^-24
 # tail would round back to the midpoint itself).
 DOUBLE_ROUND_PROBE = 1.0 + 2.0**-11 + 2.0**-23
+
+
+def _sm100_arch() -> CudaArch:
+    arch = CudaArch()
+    arch.props = SimpleNamespace(major=10, minor=0)
+    return arch
+
+
+def _conv_rows_copy(*, conv, x, tokens, dst):
+    conv[dst] = x[tokens].transpose(1, 2)
+
+
+def _state_rows_copy(*, states, h, h_src, h_dst, final_src, final_dst):
+    states[h_dst] = h.squeeze(0)[h_src]
+    states[final_dst] = states[final_src]
 
 
 class TestTrackMambaStateDtype(CustomTestCase):
@@ -211,9 +235,13 @@ class TestTrackMambaStateDtype(CustomTestCase):
             track_ssm_final_src=torch.tensor([6]),
             track_ssm_final_dst=torch.tensor([5]),
         )
-        for snapshot in (False, True):
+        # On SM100+ the track copies take the one-launch copy kernels; a prefill that
+        # wrote the in-kernel snapshot keeps the index ops for its state rows.
+        for sm100, snapshot in itertools.product((False, True), (False, True)):
             for contiguous in (True, False):
-                with self.subTest(snapshot=snapshot, contiguous=contiguous):
+                with self.subTest(
+                    sm100=sm100, snapshot=snapshot, contiguous=contiguous
+                ):
                     backend = object.__new__(GDNAttnBackend)
                     backend.forward_metadata = metadata
                     backend.mis_metadata = None
@@ -272,6 +300,7 @@ class TestTrackMambaStateDtype(CustomTestCase):
                         defers_prefill_gates=False,
                         extend=extend,
                     )
+                    arch = _sm100_arch() if sm100 else DeviceArch()
                     # Exercise the GPU gather policy with CPU tensors and fake kernels.
                     with (
                         patch.object(gdn_backend, "is_cpu", return_value=False),
@@ -279,8 +308,24 @@ class TestTrackMambaStateDtype(CustomTestCase):
                         patch.object(gdn_backend, "is_hip", return_value=False),
                         patch.object(gdn_backend, "is_xpu", return_value=False),
                         patch.object(gdn_backend, "is_npu", return_value=False),
+                        patch.object(arch_module, "_DEVICE_ARCH", arch),
+                        patch.object(
+                            gdn_extend_state_copies, "_on_cuda", return_value=True
+                        ),
+                        patch.object(
+                            gdn_extend_track,
+                            "track_conv_rows",
+                            side_effect=_conv_rows_copy,
+                        ) as conv_rows,
+                        patch.object(
+                            gdn_extend_track,
+                            "track_state_rows",
+                            side_effect=_state_rows_copy,
+                        ) as state_rows,
                     ):
                         output = backend.forward_extend(layer, batch, qkv, None, None)
+                    self.assertEqual(conv_rows.call_count, int(sm100))
+                    self.assertEqual(state_rows.call_count, int(sm100 and not snapshot))
                     backend._prefill_gates.assert_called_once_with(layer, None, None)
                     torch.testing.assert_close(output.flatten(0, 2), qkv[:, 4:] + 10)
                     torch.testing.assert_close(
