@@ -410,16 +410,7 @@ class TestRoundRobinScheduler(CustomTestCase):
 
 
 class TestFollowRoutingKeyScheduler(CustomTestCase):
-    def test_a_key_stays_on_its_rank_whatever_the_load(self):
-        ctl = _make_controller(num_dp_ranks=4)
-        ctl.follow_routing_key_scheduler(_req(routing_key="session"))
-        first = ctl.routing_key_to_rank[hash("session")]
-        ctl.dp_budget.total_requests[first] = 100
-        for _ in range(3):
-            ctl.follow_routing_key_scheduler(_req(routing_key="session"))
-        self.assertEqual(ctl.workers[first].send_pyobj.call_count, 4)
-
-    def test_new_keys_go_to_the_rank_with_the_fewest_requests(self):
+    def test_a_new_key_goes_to_the_least_loaded_rank_and_stays_there(self):
         ctl = _make_controller(num_dp_ranks=3)
         ctl.dp_budget.total_requests = [5, 0, 1]
         ctl.follow_routing_key_scheduler(_req(routing_key="a"))
@@ -428,6 +419,19 @@ class TestFollowRoutingKeyScheduler(CustomTestCase):
         self.assertEqual(ctl.routing_key_to_rank[hash("a")], 1)
         self.assertEqual(ctl.routing_key_to_rank[hash("b")], 1)
         self.assertEqual(ctl.dp_budget.total_requests, [5, 2, 1])
+        ctl.dp_budget.total_requests[1] = 100
+        ctl.follow_routing_key_scheduler(_req(routing_key="a"))
+        ctl.follow_routing_key_scheduler(
+            TokenizedEmbeddingReqInput(
+                input_text="",
+                input_ids=[1],
+                mm_inputs=None,
+                token_type_ids=None,
+                sampling_params=SamplingParams(),
+                routing_key="a",
+            )
+        )
+        self.assertEqual(ctl.workers[1].send_pyobj.call_count, 4)
 
     def test_a_key_whose_rank_went_inactive_is_placed_again(self):
         ctl = _make_controller(num_dp_ranks=4)
@@ -439,34 +443,17 @@ class TestFollowRoutingKeyScheduler(CustomTestCase):
         self.assertNotEqual(second, first)
         ctl.workers[second].send_pyobj.assert_called_once()
 
-    def test_a_routed_dp_rank_wins_and_is_not_remembered(self):
-        ctl = _make_controller(num_dp_ranks=4)
-        ctl.follow_routing_key_scheduler(_req(routing_key="session", routed_dp_rank=3))
-        ctl.workers[3].send_pyobj.assert_called_once()
-        self.assertNotIn(hash("session"), ctl.routing_key_to_rank)
-
-    def test_a_request_without_a_key_is_balanced_and_not_remembered(self):
-        ctl = _make_controller(num_dp_ranks=2)
-        ctl.dp_budget.total_requests = [3, 0]
-        ctl.follow_routing_key_scheduler(_req())
-        ctl.workers[1].send_pyobj.assert_called_once()
-        self.assertEqual(len(ctl.routing_key_to_rank), 0)
-
-    def test_an_embedding_request_follows_its_key(self):
-        ctl = _make_controller(num_dp_ranks=4)
-        ctl.follow_routing_key_scheduler(_req(routing_key="session"))
-        rank = ctl.routing_key_to_rank[hash("session")]
-        ctl.follow_routing_key_scheduler(
-            TokenizedEmbeddingReqInput(
-                input_text="",
-                input_ids=[1],
-                mm_inputs=None,
-                token_type_ids=None,
-                sampling_params=SamplingParams(),
-                routing_key="session",
-            )
-        )
-        self.assertEqual(ctl.workers[rank].send_pyobj.call_count, 2)
+    def test_a_request_not_routed_by_its_key_is_not_remembered(self):
+        for case, req, rank in (
+            ("routed_dp_rank wins", _req(routing_key="session", routed_dp_rank=0), 0),
+            ("no key is balanced", _req(), 1),
+        ):
+            with self.subTest(case):
+                ctl = _make_controller(num_dp_ranks=2)
+                ctl.dp_budget.total_requests = [3, 0]
+                ctl.follow_routing_key_scheduler(req)
+                ctl.workers[rank].send_pyobj.assert_called_once()
+                self.assertEqual(len(ctl.routing_key_to_rank), 0)
 
     def test_the_least_recently_used_key_is_forgotten_first(self):
         ctl = _make_controller(num_dp_ranks=2)
