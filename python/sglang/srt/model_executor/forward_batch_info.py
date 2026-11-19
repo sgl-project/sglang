@@ -49,6 +49,7 @@ from sglang.srt.layers.dp_attention import (
     dp_slot_in,
     set_dp_buffer_len_from_batch,
     set_is_extend_in_batch,
+    supports_dspark_moe_padding,
     world_dp_gather_enabled,
 )
 from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
@@ -897,9 +898,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             and self.spec_algorithm.is_dspark()
             and self.ragged_verify_layout is None
             and self.spec_info is not None
-            and self.spec_info.num_tokens_per_req == 6
-            and get_parallel().tp_size == get_parallel().attn_dp_size == 8
-            and get_parallel().attn_cp_size == 1
+            and supports_dspark_moe_padding(
+                get_parallel(), self.spec_info.num_tokens_per_req
+            )
         ):
             self.moe_dp_valid_counts = self.global_num_tokens_gpu.clone()
         self.can_run_decode_cuda_graph = batch.can_run_decode_cuda_graph

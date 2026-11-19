@@ -56,16 +56,23 @@ class TestHopperPaddingScope(unittest.TestCase):
             tp_group=None,
         )
         activation = SimpleNamespace(Swiglu=object(), SwigluStep=object())
-        for algorithm, width, mode, wanted in (
-            ("DSPARK", 6, RaggedVerifyMode.STATIC, True),
-            (None, None, RaggedVerifyMode.STATIC, False),
-            ("EAGLE", 6, RaggedVerifyMode.STATIC, False),
-            ("DSPARK", 4, RaggedVerifyMode.STATIC, False),
-            ("DSPARK", 6, RaggedVerifyMode.CAP_ACCEPT, False),
-            ("DSPARK", 6, RaggedVerifyMode.COMPACT, False),
+        for ep, algorithm, width, mode, wanted in (
+            (8, "DSPARK", 6, RaggedVerifyMode.STATIC, True),
+            (4, "DSPARK", 5, RaggedVerifyMode.STATIC, True),
+            (4, "DSPARK", 6, RaggedVerifyMode.STATIC, False),
+            (4, "DSPARK", 5, RaggedVerifyMode.COMPACT, False),
+            (8, "DSPARK", 5, RaggedVerifyMode.STATIC, False),
+            (8, None, None, RaggedVerifyMode.STATIC, False),
+            (8, "EAGLE", 6, RaggedVerifyMode.STATIC, False),
+            (8, "DSPARK", 4, RaggedVerifyMode.STATIC, False),
+            (8, "DSPARK", 6, RaggedVerifyMode.CAP_ACCEPT, False),
+            (8, "DSPARK", 6, RaggedVerifyMode.COMPACT, False),
         ):
+            parallel.moe_ep_size = config.layer.moe_ep_size = ep
+            config.layer.moe_tp_size = 8 // ep
+            quant.w13_weight = torch.empty((384 // ep, 4), dtype=torch.uint8)
             with (
-                self.subTest(algorithm=algorithm, width=width, mode=mode),
+                self.subTest(ep=ep, algorithm=algorithm, width=width, mode=mode),
                 mock.patch.object(
                     cutlass,
                     "get_spec",

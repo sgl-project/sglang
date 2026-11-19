@@ -1,10 +1,11 @@
-"""Eight-rank H100 component checks, outside any serving measurement.
+"""Eight-rank Hopper component checks, outside any serving measurement.
 
-Run with torchrun --standalone --nproc-per-node=8 and the candidate PYTHONPATH.
+Run with torchrun --standalone --nproc-per-node=8 and --ep-size 4 or 8.
 DSV41_TEST_MODEL points at the unmodified checkpoint; DSV41_TEST_OUTPUT is a
 private output directory. These are component checks, not quality equivalence.
 """
 
+import argparse
 import json
 import os
 from pathlib import Path
@@ -38,7 +39,11 @@ def check_close(actual, expected):
     return result
 
 
-def main():
+def main(ep_size):
+    block_size = {8: 5, 4: 4}[ep_size]
+    verify_width = block_size + 1
+    max_len = 8 * verify_width
+    rows = 8 * max_len
     rank = int(os.environ["LOCAL_RANK"])
     assert int(os.environ["WORLD_SIZE"]) == 8
     torch.cuda.set_device(rank)
@@ -52,13 +57,13 @@ def main():
         device="cuda",
         tp_size=8,
         attn_dp_size=8,
-        ep_size=8,
+        ep_size=ep_size,
         attn_cp_size=1,
         attention_backend="dsv4",
         moe_runner_backend="flashinfer_mxfp4",
         flashinfer_mxfp4_moe_precision="fp8",
         speculative_algorithm="DSPARK",
-        speculative_dspark_block_size=5,
+        speculative_dspark_block_size=block_size,
         enable_dp_lm_head=True,
     )
     publish(args, role="test", ranks=SpawnRanks(world_rank=rank, gpu_id=rank))
@@ -86,7 +91,7 @@ def main():
     )
     fb = SimpleNamespace(
         spec_info=SimpleNamespace(
-            num_tokens_per_req=6, num_tokens_for_logprob_per_req=6
+            num_tokens_per_req=verify_width, num_tokens_for_logprob_per_req=verify_width
         ),
         forward_mode=ForwardMode.TARGET_VERIFY,
         spec_algorithm=SpeculativeAlgorithm.DSPARK,
@@ -95,22 +100,24 @@ def main():
     ForwardBatch.init_mlp_sync_metadata(fb, batch, "cuda")
     counts = fb.moe_dp_valid_counts
     torch.testing.assert_close(
-        counts, torch.tensor(batch.global_num_tokens, device="cuda") * 6
+        counts, torch.tensor(batch.global_num_tokens, device="cuda") * verify_width
     )
-    fb.global_num_tokens_gpu.fill_(48)
-    fb.global_dp_buffer_len = 384
-    fb.global_num_tokens_padded_cpu = [48] * 8
+    fb.global_num_tokens_gpu.fill_(max_len)
+    fb.global_dp_buffer_len = rows
+    fb.global_num_tokens_padded_cpu = [max_len] * 8
     fb.dp_padding_mode = dp.DpPaddingMode.MAX_LEN
     dp.set_dp_buffer_len_from_batch(fb)
     ids = (
-        torch.arange(384 * 6, device="cuda", dtype=torch.int32)
-        .view(384, 6)
+        torch.arange(rows * 6, device="cuda", dtype=torch.int32)
+        .view(rows, 6)
         .remainder_(384)
     )
     original = ids.clone()
+    row = torch.arange(rows, device="cuda")
+    position = row % max_len
     masked = dp.copy_mask_dp_moe_padding(ids)
     for turn in range(3):
-        valid = torch.arange(384, device="cuda") % 48 < counts.repeat_interleave(48)
+        valid = position < counts.repeat_interleave(max_len)
         expected = torch.where(valid[:, None], ids, -1)
         torch.testing.assert_close(masked, expected, rtol=0, atol=0)
         torch.testing.assert_close(ids, original, rtol=0, atol=0)
@@ -126,14 +133,14 @@ def main():
         original = ids.clone()
         graph.replay()
         torch.cuda.synchronize()
-        valid = torch.arange(384, device="cuda") % 48 < counts.repeat_interleave(48)
+        valid = position < counts.repeat_interleave(max_len)
         torch.testing.assert_close(
             graph_masked, torch.where(valid[:, None], ids, -1), rtol=0, atol=0
         )
         torch.testing.assert_close(ids, original, rtol=0, atol=0)
     record({"component": "moe_pad_mask", "passed": True})
 
-    # Exercise the actual EP8 Humming/CUTLASS consumer. Both calls use the
+    # Exercise the native Humming/CUTLASS consumer. Both calls use the
     # native preprocessor and identical tensors; only real-row metadata differs.
     from flashinfer.fused_moe import preprocess_moe_weights_for_sm90_mixed_gemm_humming
 
@@ -148,7 +155,7 @@ def main():
 
     assert not envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get()
     generator = torch.Generator(device="cuda").manual_seed(66068407 + rank)
-    hidden, intermediate, experts = 5120, 128, 48
+    hidden, intermediate, experts = 5120, 128, 384 // ep_size
     w13 = torch.randint(
         0,
         256,
@@ -183,48 +190,55 @@ def main():
         humming_fc2_act_scale=torch.ones((), device="cuda", dtype=torch.float32),
     )
     layer = SimpleNamespace(
-        moe_tp_size=1, moe_tp_rank=0, moe_ep_size=8, moe_ep_rank=rank
+        moe_tp_size=8 // ep_size,
+        moe_tp_rank=get_parallel().moe_tp_rank,
+        moe_ep_size=ep_size,
+        moe_ep_rank=get_parallel().moe_ep_rank,
     )
     config = MoeRunnerConfig(
         layer=layer,
         num_experts=384,
-        num_local_experts=48,
+        num_local_experts=experts,
         hidden_size=hidden,
         intermediate_size_per_partition=intermediate,
         top_k=6,
     )
+    generator.manual_seed(66068407)
     x = (
         torch.randn(
-            (384, hidden), device="cuda", dtype=torch.bfloat16, generator=generator
+            (rows, hidden), device="cuda", dtype=torch.bfloat16, generator=generator
         )
         * 0.1
     )
+    # Keep routes distinct when top_k exceeds the number of EP ranks.
     routes = (
-        torch.arange(384, device="cuda")[:, None]
-        + torch.arange(6, device="cuda")[None, :]
-    ).remainder(48).to(torch.int32) + rank * 48
+        (row[:, None] + torch.arange(6, device="cuda")[None, :] * (experts + 1))
+        .remainder(384)
+        .to(torch.int32)
+    )
     original = routes.clone()
     dispatch = StandardDispatchOutput(
         hidden_states=x,
         hidden_states_scale=None,
         topk_output=StandardTopKOutput(
             topk_weights=torch.full(
-                (384, 6), 1 / 6, device="cuda", dtype=torch.float32
+                (rows, 6), 1 / 6, device="cuda", dtype=torch.float32
             ),
             topk_ids=routes,
-            router_logits=torch.empty((384, 384), device="cuda"),
+            router_logits=torch.empty((rows, 384), device="cuda"),
         ),
     )
-    dp.set_dp_buffer_len(384, 48, True, [48] * 8, moe_dp_valid_counts=None)
+    dp.set_dp_buffer_len(rows, max_len, True, [max_len] * 8, moe_dp_valid_counts=None)
     reference = _fused_experts_flashinfer_mxfp4_cutlass(
         dispatch, quant, config
     ).hidden_states
     torch.cuda.synchronize()
     assert torch.isfinite(reference).all() and reference.abs().max() > 0
-    counts = torch.tensor(
-        [0, 6, 12, 18, 24, 30, 36, 48], device="cuda", dtype=torch.int32
+    counts = (
+        torch.tensor(batch.global_num_tokens, device="cuda", dtype=torch.int32)
+        * verify_width
     )
-    dp.set_dp_buffer_len(384, 48, True, [48] * 8, moe_dp_valid_counts=counts)
+    dp.set_dp_buffer_len(rows, max_len, True, [max_len] * 8, moe_dp_valid_counts=counts)
     # Capture/replay the real changed runner, including native MoE finalization.
     eager = _fused_experts_flashinfer_mxfp4_cutlass(
         dispatch, quant, config
@@ -238,7 +252,7 @@ def main():
     for turn in range(2):
         graph.replay()
         torch.cuda.synchronize()
-        valid = torch.arange(384, device="cuda") % 48 < counts.repeat_interleave(48)
+        valid = position < counts.repeat_interleave(max_len)
         torch.testing.assert_close(
             captured[valid], reference[valid], rtol=2**-6, atol=2**-8
         )
@@ -262,5 +276,7 @@ def main():
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--ep-size", type=int, choices=(4, 8), default=8)
     with torch.inference_mode():
-        main()
+        main(parser.parse_args().ep_size)

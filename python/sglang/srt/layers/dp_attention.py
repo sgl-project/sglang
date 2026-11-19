@@ -26,6 +26,7 @@ from sglang.srt.elastic_ep.topology import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
+    ParallelContext,
     derive_attention_ranks,
     derive_attn_tp_size,
     get_device,
@@ -872,6 +873,16 @@ def _copy_mask_dp_pad_topk_ids_kernel(
     ids = tl.load(input_ptr + row * TOPK + offs, mask=offs < TOPK, other=-1)
     valid = row % max_len < tl.load(counts_ptr + row // max_len)
     tl.store(output_ptr + row * TOPK + offs, tl.where(valid, ids, -1), mask=offs < TOPK)
+
+
+def supports_dspark_moe_padding(
+    parallel: ParallelContext, verify_width: Optional[int]
+) -> bool:
+    return (
+        parallel.tp_size == parallel.attn_dp_size == 8
+        and parallel.attn_tp_size == parallel.attn_cp_size == 1
+        and (parallel.moe_ep_size, verify_width) in ((8, 6), (4, 5))
+    )
 
 
 def copy_mask_dp_moe_padding(topk_ids: torch.Tensor) -> torch.Tensor:

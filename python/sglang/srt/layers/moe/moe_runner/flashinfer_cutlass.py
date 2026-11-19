@@ -21,6 +21,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     deployment_attn_dp_size,
     is_allocation_symmetric,
+    supports_dspark_moe_padding,
 )
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
@@ -587,17 +588,17 @@ def _fused_experts_flashinfer_mxfp4_cutlass(
     if (
         use_wfp4afp8_humming
         and get_spec().speculative_algorithm == "DSPARK"
-        and get_spec().speculative_num_draft_tokens == 6
+        and supports_dspark_moe_padding(
+            parallel, get_spec().speculative_num_draft_tokens
+        )
         and read_ragged_verify_mode() is RaggedVerifyMode.STATIC
         and not envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get()
         and torch.cuda.get_device_capability(x.device) == (9, 0)
-        and parallel.tp_size == parallel.attn_dp_size == parallel.moe_ep_size == 8
-        and parallel.attn_tp_size == parallel.attn_cp_size == 1
-        and runner_config.moe_tp_size == 1
-        and runner_config.moe_ep_size == 8
+        and runner_config.moe_ep_size == parallel.moe_ep_size
+        and runner_config.moe_tp_size * runner_config.moe_ep_size == parallel.tp_size
         and x.shape[1] == 5120
         and topk_ids.shape[1] == 6
-        and quant_info.w13_weight.shape[0] == 48
+        and quant_info.w13_weight.shape[0] * runner_config.moe_ep_size == 384
     ):
         # The API below fixes cluster_size=1, min_latency=False, all-to-all=False.
         # CUTLASS range-checks global -1 IDs and non-fused finalization skips them.
