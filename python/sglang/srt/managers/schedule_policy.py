@@ -1037,10 +1037,8 @@ class PrefillAdder:
         # prefill pass. Used by PrefillDelayer's queue-based trigger.
         self.waiting_queue_len = waiting_queue_len
 
-        # `evictable_size()` counts unlocked device tokens, not what eviction
-        # can free: under HiCache write_back with a full host pool, a chain
-        # behind a leaf whose backup fails and whose drop is declined stays
-        # counted. Admission frees each request's KV before committing it.
+        # Evict each admission's KV before committing it, and defer or shrink it to
+        # what eviction freed, so prefill allocates only KV that is already free.
         self._kv_backoff = (
             envs.SGLANG_ENABLE_PREFILL_KV_BACKOFF.get()
             and _prefill_kv_backoff_supported(self)
