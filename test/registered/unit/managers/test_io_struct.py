@@ -518,6 +518,18 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         self.assertEqual(req[0].sampling_logprobs_mode, "selected")
         self.assertEqual(req[1].sampling_logprobs_mode, "support")
 
+    def test_every_item_keeps_the_routing_key(self):
+        cases = {
+            "batch": GenerateReqInput(text=["Hello", "World"], routing_key="key"),
+            "n > 1": GenerateReqInput(
+                text="Hello", sampling_params={"n": 2}, routing_key="key"
+            ),
+        }
+        for name, req in cases.items():
+            with self.subTest(name):
+                req.normalize_batch_and_arguments()
+                self.assertEqual([req[0].routing_key, req[1].routing_key], ["key"] * 2)
+
     def test_single_image_to_list_of_lists(self):
         """Test that a single image is converted to a list of single-image lists."""
         req = copy.deepcopy(self.base_req)
@@ -1517,6 +1529,11 @@ class TestKvHintsTransport(CustomTestCase):
 
 class TestEmbeddingReqInputGetItem(CustomTestCase):
     """Test EmbeddingReqInput.__getitem__."""
+
+    def test_every_item_keeps_the_routing_key(self):
+        req = EmbeddingReqInput(text=["Hello", "World"], routing_key="key")
+        req.normalize_batch_and_arguments()
+        self.assertEqual([req[0].routing_key, req[1].routing_key], ["key"] * 2)
 
     def test_renormalization_refreshes_cached_sampling_params(self):
         """Cached embeddings must use the batch's current sampling settings."""
