@@ -45,6 +45,7 @@ class _Adder(PrefillAdder):
     def __init__(self, *args, **kwargs):
         self.can_run_list = []
         self.preempt_list = []
+        self.preempt_aborted = []
         self.new_chunked_req = None
         self.rem_chunk_tokens = 0
 

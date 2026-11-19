@@ -380,6 +380,7 @@ class TestRunningReqsHooks(CustomTestCase):
                 self.running_batch = batch
                 self.can_run_list = []
                 self.preempt_list = []
+                self.preempt_aborted = []
 
             def budget_state(self):
                 return AddReqResult.CONTINUE
@@ -458,8 +459,8 @@ class TestRunningReqsHooks(CustomTestCase):
 
 
 class TestPriorityPreemptionUnderUnifiedMemory(CustomTestCase):
-    """Priority preemption is off under unified memory, while priority
-    scheduling itself stays on."""
+    """Priority preemption follows priority scheduling whether or not unified
+    memory is on, and --disable-priority-preemption turns it off."""
 
     def _preemption(self, **fields):
         override = get_context().override_server_args(
@@ -478,11 +479,18 @@ class TestPriorityPreemptionUnderUnifiedMemory(CustomTestCase):
         Scheduler.init_schedule_policy(s)
         return s.enable_priority_preemption
 
-    def test_off_with_unified_memory(self):
-        self.assertFalse(self._preemption(enable_unified_memory=True))
+    def test_on_with_unified_memory(self):
+        self.assertTrue(self._preemption(enable_unified_memory=True))
 
     def test_on_without_it(self):
         self.assertTrue(self._preemption(enable_unified_memory=False))
+
+    def test_off_when_disabled_with_unified_memory(self):
+        self.assertFalse(
+            self._preemption(
+                enable_unified_memory=True, disable_priority_preemption=True
+            )
+        )
 
 
 if __name__ == "__main__":
