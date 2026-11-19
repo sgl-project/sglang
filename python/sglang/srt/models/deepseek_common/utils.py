@@ -83,7 +83,8 @@ def _is_block_scale_fp8(proj: torch.nn.Module) -> bool:
 
     Per-channel fp8 has weight_scale shape [N, 1] (one scale per output row).
     Block-scale fp8 has weight_scale shape [N, K/block_size] (multiple columns);
-    Fp8LinearMethod stores it as an fp32 weight_scale_inv [N/128, K/128] instead.
+    Fp8LinearMethod stores it as an fp32 weight_scale_inv instead, and only its
+    [128, 128] blocks match the fused kernels' 128-wide activation groups.
     The fused gfx95 kernels (fused_rms_fp8_group_quant, fused_flatten_fp8_group_quant)
     are only compatible with block-scale layouts — per-channel layers must fall
     through to the plain bf16 path instead.
@@ -91,8 +92,12 @@ def _is_block_scale_fp8(proj: torch.nn.Module) -> bool:
     if not hasattr(proj, "weight") or proj.weight.dtype != torch.float8_e4m3fn:
         return False
     weight_scale = getattr(proj, "weight_scale_inv", None)
-    if weight_scale is not None and weight_scale.dtype != torch.float32:
-        return False
+    if weight_scale is not None:
+        block_size = getattr(
+            getattr(proj, "quant_method", None), "weight_block_size", None
+        )
+        if weight_scale.dtype != torch.float32 or list(block_size or ()) != [128, 128]:
+            return False
     if weight_scale is None:
         weight_scale = getattr(proj, "weight_scale", None)
     if weight_scale is None or weight_scale.dim() != 2:
