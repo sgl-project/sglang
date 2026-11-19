@@ -1,6 +1,7 @@
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
+#include <sgl_kernel/activation.cuh>
 #include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/type.cuh>
 #include <sgl_kernel/utils.cuh>
@@ -13,13 +14,6 @@
 #include <cstdint>
 
 namespace sglang {
-
-SGL_DEVICE float gelu_tanh(float x) {
-  constexpr float kAlpha = 0.044715f;
-  constexpr float kBeta = 0.7978845608028654f;
-  const float cdf = 0.5f * (1.0f + tanhf(kBeta * (x + kAlpha * x * x * x)));
-  return x * cdf;
-}
 
 /**
  * \brief Add a row-wise bias and apply approximate GELU.
@@ -51,7 +45,7 @@ __global__ void bias_gelu_tanh_kernel(
       const float x_f32 = device::cast<fp32_t>(x[i]);
       const float bias_f32 = device::cast<fp32_t>(b[i]);
       const T biased = device::cast<T>(x_f32 + bias_f32);
-      result[i] = device::cast<T>(gelu_tanh(device::cast<fp32_t>(biased)));
+      result[i] = device::cast<T>(device::activation::gelu_tanh<false>(device::cast<fp32_t>(biased)));
     }
     result.store(output, vec_id);
   }
@@ -72,7 +66,7 @@ void bias_gelu_tanh(tvm::ffi::TensorView input, tvm::ffi::TensorView bias, tvm::
   auto num_rows = SymbolicSize{"num_rows"};
   auto hidden_dim = SymbolicSize{"hidden_dim"};
   auto device_ = SymbolicDevice{};
-  device_.set_options<kDLCUDA>();
+  device_.set_options<kDLGPU>();
 
   TensorMatcher({num_rows, hidden_dim}).with_dtype<T>().with_device(device_).verify(input);
   TensorMatcher({hidden_dim}).with_dtype<T>().with_device(device_).verify(bias);

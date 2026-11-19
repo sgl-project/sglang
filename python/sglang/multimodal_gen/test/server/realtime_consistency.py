@@ -299,23 +299,6 @@ def encode_realtime_frames_to_mp4(frames: list[np.ndarray], fps: int) -> bytes:
             pass
 
 
-async def collect_realtime_frames(
-    *,
-    ws_url: str,
-    init_payload: dict[str, Any],
-    events: list[dict[str, Any]],
-    num_chunks: int,
-) -> list[np.ndarray]:
-    return (
-        await collect_realtime_output(
-            ws_url=ws_url,
-            init_payload=init_payload,
-            events=events,
-            num_chunks=num_chunks,
-        )
-    ).frames
-
-
 async def collect_realtime_output(
     *,
     ws_url: str,

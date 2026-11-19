@@ -59,17 +59,6 @@ def _kpool_indexer_prefill_with_output(
     output[num_logical:].fill_(-1)
 
 
-def _kpool_indexer_prefill_capture_stub(
-    indexer,
-    x: torch.Tensor,
-    q_lora: torch.Tensor,
-    positions: torch.Tensor,
-    output: torch.Tensor,
-    layer_id: int,
-) -> None:
-    output.fill_(-1)
-
-
-bcg_kpool_indexer_prefill_with_output = eager_on_graph(
-    True, capture_stub=_kpool_indexer_prefill_capture_stub
-)(_kpool_indexer_prefill_with_output)
+bcg_kpool_indexer_prefill_with_output = eager_on_graph(True)(
+    _kpool_indexer_prefill_with_output
+)

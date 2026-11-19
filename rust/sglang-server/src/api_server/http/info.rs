@@ -1,7 +1,7 @@
 //! Common control-plane endpoints — `/server_info`, `/get_model_info`
 //! (+ `/model_info` alias), `/flush_cache`, `/weights_checker`,
-//! `/abort_request`, backed by typed operations on
-//! [`crate::api_server::core::CoreHandle`]. Data-plane endpoints (incl. `/health*`,
+//! `/start_profile`, `/stop_profile`, `/abort_request`, backed by typed operations on
+//! [`crate::api_server::handlers::CoreHandle`]. Data-plane endpoints (incl. `/health*`,
 //! which round-trips a generate probe) live in the sibling `native_api` and
 //! `openai` modules; the shared `AppState` lives in the parent
 //! `api_server` module.
@@ -10,36 +10,558 @@ use axum::{
     Json, Router,
     body::{Body, Bytes},
     extract::{
-        Query, State,
+        Path, Query, State,
         rejection::{JsonRejection, QueryRejection},
     },
-    http::StatusCode,
+    http::{StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use serde::Deserialize;
 use serde_json::{Map, Value};
+use sglang_api_types::api::v1 as api;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
 use super::app::AppState;
+use super::auth::DeclaredRoute;
 use super::native_api::native_error;
-use crate::api_server::core::CoreError;
+use crate::api_server::core::{CoreError, FORWARD_PEER_PATH};
+use crate::api_server::handlers::{AbortEnding, DumperOutcome, ElasticEpState, ProfileOutcome};
 use crate::message::info::ServerInfo;
+use crate::message::io_struct::{
+    ExpertDistributionAction, LoggingConfig, PdRoleSwitch, ProfileOptions, SessionOpen,
+};
 
 /// The routes this module owns, mounted by `api_server::serve`.
 pub(super) fn routes() -> Router<Arc<AppState>> {
     Router::new()
         // Control-plane: the core performs the typed operation and this
         // adapter renders its result as one non-streamed JSON response.
-        .route("/server_info", get(server_info))
+        .declared_route("/server_info", get(server_info))
+        .declared_route("/get_server_info", get(get_server_info))
+        // Liveness and readiness flags, no scheduler round-trip: `/ping` is
+        // the SageMaker probe (a paused server still answers 200), `/ready`
+        // also needs the server unpaused.
+        .declared_route("/ping", get(ping))
+        .declared_route("/ready", get(ready))
+        .declared_route(
+            "/get_hicache_l3_cache_layout",
+            get(get_hicache_l3_cache_layout),
+        )
+        .declared_route(
+            "/configure_logging",
+            get(configure_logging).post(configure_logging),
+        )
+        .declared_route("/open_session", get(open_session).post(open_session))
+        .declared_route("/close_session", get(close_session).post(close_session))
+        .declared_route("/scale_elastic_ep", post(scale_elastic_ep))
+        .declared_route("/is_scaling_elastic_ep", get(is_scaling_elastic_ep))
+        .merge(dumper_routes())
         // Static config, no scheduler round-trip. `/get_model_info` (+ `/model_info`
         // alias).
-        .route("/get_model_info", get(model_info))
-        .route("/model_info", get(model_info))
-        .route("/flush_cache", get(flush_cache).post(flush_cache))
-        .route("/weights_checker", get(check_weights).post(check_weights))
-        .route("/abort_request", post(abort_request))
+        .declared_route("/get_model_info", get(model_info))
+        .declared_route("/model_info", get(model_info))
+        .declared_route("/flush_cache", get(flush_cache).post(flush_cache))
+        .declared_route("/weights_checker", get(check_weights).post(check_weights))
+        .declared_route(
+            "/set_internal_state",
+            post(set_internal_state).put(set_internal_state),
+        )
+        .declared_route("/start_profile", get(start_profile).post(start_profile))
+        .declared_route("/stop_profile", get(stop_profile).post(stop_profile))
+        .declared_route(
+            "/start_expert_distribution_record",
+            get(start_expert_distribution_record).post(start_expert_distribution_record),
+        )
+        .declared_route(
+            "/stop_expert_distribution_record",
+            get(stop_expert_distribution_record).post(stop_expert_distribution_record),
+        )
+        .declared_route(
+            "/dump_expert_distribution_record",
+            get(dump_expert_distribution_record).post(dump_expert_distribution_record),
+        )
+        .declared_route("/slow_down", get(slow_down).post(slow_down))
+        .declared_route(
+            "/release_memory_occupation",
+            get(release_memory_occupation).post(release_memory_occupation),
+        )
+        .declared_route(
+            "/resume_memory_occupation",
+            get(resume_memory_occupation).post(resume_memory_occupation),
+        )
+        .declared_route("/freeze_gc", get(freeze_gc).post(freeze_gc))
+        .declared_route("/pause_generation", post(pause_generation))
+        .declared_route("/continue_generation", post(continue_generation))
+        .declared_route("/pd_role_switch", post(pd_role_switch))
+        .declared_route("/update_weight_version", post(update_weight_version))
+        .declared_route("/abort_request", post(abort_request))
+        // Listener-to-listener: another DP rank's control request for this
+        // rank's scheduler (see `api_server::core::peer`).
+        .declared_route(FORWARD_PEER_PATH, post(forward_control_req))
+}
+
+/// `POST|PUT /set_internal_state` — Python's `SetInternalStateReq` body; the
+/// response is the bare list of per-rank `updated` flags, 200 whatever the
+/// flags say (a rejected key is `false`, not an error, as in Python).
+async fn set_internal_state(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<api::SetInternalStateRequest>, JsonRejection>,
+) -> Response {
+    let body = match body {
+        Ok(Json(body)) => body,
+        Err(rejection) => {
+            return native_error(StatusCode::BAD_REQUEST, &rejection.body_text(), false);
+        }
+    };
+    match state
+        .core
+        .set_internal_state(body.server_args.as_deref())
+        .await
+    {
+        Ok(updated) => Json(api::SetInternalStateResponse { updated }).into_response(),
+        Err(error) => native_error(error.http_status(), &error.to_string(), false),
+    }
+}
+
+/// Python's `ProfileReq` body for `/start_profile`. `req_type` is accepted
+/// only as one of Python's `ProfileReqType` values and then ignored: the route
+/// always starts.
+#[derive(Deserialize)]
+struct StartProfileBody {
+    #[serde(default)]
+    req_type: Option<u8>,
+    #[serde(flatten)]
+    options: ProfileOptions,
+}
+
+/// `GET|POST /start_profile` — the scheduler ranks start their profilers
+/// with the body's options (Python's defaults for an absent or `null` body);
+/// which ranks under attention DP: see `ProfileReq`.
+/// Python's plain-text 200 once started.
+async fn start_profile(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
+    let options = if body.is_empty() {
+        ProfileOptions::default()
+    } else {
+        match serde_json::from_slice::<Option<StartProfileBody>>(&body) {
+            Ok(None) => ProfileOptions::default(),
+            Ok(Some(StartProfileBody {
+                req_type: None | Some(1 | 2),
+                options,
+            })) => options,
+            Ok(Some(_)) => {
+                return native_error(
+                    StatusCode::BAD_REQUEST,
+                    "req_type: Input should be 1 or 2",
+                    false,
+                );
+            }
+            Err(error) => {
+                return native_error(StatusCode::BAD_REQUEST, &error.to_string(), false);
+            }
+        }
+    };
+    profile_response(
+        state.core.start_profile(options).await,
+        "Start profiling.\n",
+    )
+}
+
+/// `GET|POST /stop_profile` — the scheduler ranks stop their profilers and
+/// write their traces (which ranks under attention DP: see `ProfileReq`);
+/// any body is ignored, as Python ignores it.
+async fn stop_profile(State(state): State<Arc<AppState>>) -> Response {
+    profile_response(
+        state.core.stop_profile().await,
+        "Stop profiling. This will take some time.\n",
+    )
+}
+
+/// Python's responses for both profile routes: 200 with `ok_body` and no
+/// content type. A scheduler refusal (e.g. already profiling) is the
+/// `RuntimeError` Python raises in the route, which reaches the client as the
+/// framework's bare 500 `Internal Server Error`; the reason is only logged.
+fn profile_response(outcome: Result<ProfileOutcome, CoreError>, ok_body: &'static str) -> Response {
+    match outcome {
+        Ok(ProfileOutcome { success: true, .. }) => Response::new(Body::from(ok_body)),
+        Ok(ProfileOutcome { message, .. }) => {
+            tracing::error!(%message, "profile request failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error").into_response()
+        }
+        Err(CoreError::Unavailable) => native_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "service unavailable",
+            false,
+        ),
+        Err(error) => native_error(error.http_status(), &error.to_string(), false),
+    }
+}
+
+async fn start_expert_distribution_record(State(state): State<Arc<AppState>>) -> Response {
+    text_ack(
+        state
+            .core
+            .expert_distribution_record(ExpertDistributionAction::Start)
+            .await,
+        "Start recording the expert distribution.\n",
+    )
+}
+
+async fn stop_expert_distribution_record(State(state): State<Arc<AppState>>) -> Response {
+    text_ack(
+        state
+            .core
+            .expert_distribution_record(ExpertDistributionAction::Stop)
+            .await,
+        "Stop recording the expert distribution.\n",
+    )
+}
+
+async fn dump_expert_distribution_record(State(state): State<Arc<AppState>>) -> Response {
+    text_ack(
+        state
+            .core
+            .expert_distribution_record(ExpertDistributionAction::Dump)
+            .await,
+        "Dump expert distribution record.\n",
+    )
+}
+
+/// Python's `Response(content=<line>)` on success: a bare 200 text body.
+fn text_ack(outcome: Result<(), CoreError>, done: &'static str) -> Response {
+    match outcome {
+        Ok(()) => {
+            let mut response = Response::new(Body::from(done));
+            *response.status_mut() = StatusCode::OK;
+            response
+        }
+        Err(error) => native_error(error.http_status(), &error.to_string(), false),
+    }
+}
+
+/// `GET|POST /slow_down` — Python answers the handler's `None` as a JSON
+/// `null`, and a failure as its `{"error": {...}}` 400 body.
+async fn slow_down(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<api::SlowDownRequest>, JsonRejection>,
+) -> Response {
+    let body = match body {
+        Ok(Json(body)) => body,
+        Err(rejection) => {
+            return native_error(StatusCode::BAD_REQUEST, &rejection.body_text(), false);
+        }
+    };
+    null_ack(state.core.slow_down(body.forward_sleep_time).await)
+}
+
+/// `GET|POST /release_memory_occupation` — see `slow_down` for the shape.
+async fn release_memory_occupation(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<api::ReleaseMemoryOccupationRequest>, JsonRejection>,
+) -> Response {
+    let body = match body {
+        Ok(Json(body)) => body,
+        Err(rejection) => {
+            return native_error(StatusCode::BAD_REQUEST, &rejection.body_text(), false);
+        }
+    };
+    null_ack(
+        state
+            .core
+            .release_memory_occupation(body.tags.map(|list| list.items))
+            .await,
+    )
+}
+
+/// `GET|POST /resume_memory_occupation` — see `slow_down` for the shape.
+async fn resume_memory_occupation(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<api::ResumeMemoryOccupationRequest>, JsonRejection>,
+) -> Response {
+    let body = match body {
+        Ok(Json(body)) => body,
+        Err(rejection) => {
+            return native_error(StatusCode::BAD_REQUEST, &rejection.body_text(), false);
+        }
+    };
+    null_ack(
+        state
+            .core
+            .resume_memory_occupation(body.tags.map(|list| list.items))
+            .await,
+    )
+}
+
+/// FastAPI's rendering of a handler that returns `None`: 200 with `null`.
+fn null_ack(outcome: Result<(), CoreError>) -> Response {
+    match outcome {
+        Ok(()) => Json(Value::Null).into_response(),
+        Err(error) => native_error(error.http_status(), &error.to_string(), false),
+    }
+}
+
+async fn freeze_gc(State(state): State<Arc<AppState>>) -> Response {
+    text_ack(
+        state.core.freeze_gc_all().await,
+        "Garbage collection frozen.\n",
+    )
+}
+
+/// `POST /pause_generation` — Python's `{"message", "status": "ok"}` body.
+async fn pause_generation(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<api::PauseGenerationRequest>, JsonRejection>,
+) -> Response {
+    let body = match body {
+        Ok(Json(body)) => body,
+        Err(rejection) => {
+            return native_error(StatusCode::BAD_REQUEST, &rejection.body_text(), false);
+        }
+    };
+    let mode = body.mode.unwrap_or_else(|| "abort".into());
+    match state.core.pause_generation(&mode).await {
+        Ok(()) => Json(api::GenerationPauseResponse {
+            message: "Generation paused successfully.".into(),
+            status: "ok".into(),
+        })
+        .into_response(),
+        Err(error) => native_error(error.http_status(), &error.to_string(), false),
+    }
+}
+
+/// `POST /continue_generation` — the counterpart of `/pause_generation`.
+async fn continue_generation(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<api::ContinueGenerationRequest>, JsonRejection>,
+) -> Response {
+    let body = match body {
+        Ok(Json(body)) => body,
+        Err(rejection) => {
+            return native_error(StatusCode::BAD_REQUEST, &rejection.body_text(), false);
+        }
+    };
+    match state
+        .core
+        .continue_generation(body.torch_empty_cache.unwrap_or(true))
+        .await
+    {
+        Ok(()) => Json(api::GenerationPauseResponse {
+            message: "Generation continued successfully.".into(),
+            status: "ok".into(),
+        })
+        .into_response(),
+        Err(error) => native_error(error.http_status(), &error.to_string(), false),
+    }
+}
+
+/// `POST /pd_role_switch` — Python's `PdRoleSwitchReqOutput` as JSON, 200 on
+/// success and 400 otherwise; a frontend failure is its `{"error": ...}` 400.
+async fn pd_role_switch(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<api::PdRoleSwitchRequest>, JsonRejection>,
+) -> Response {
+    let body = match body {
+        Ok(Json(body)) => body,
+        Err(rejection) => {
+            return native_error(StatusCode::BAD_REQUEST, &rejection.body_text(), false);
+        }
+    };
+    let switch = PdRoleSwitch {
+        new_role: body.new_role.unwrap_or_default(),
+        decode_cuda_graph_bs: body.decode_cuda_graph_bs.map(|list| list.items),
+        decode_cuda_graph_memory_gb: body.decode_cuda_graph_memory_gb,
+        prepare_only: body.prepare_only,
+    };
+    match state.core.pd_role_switch(switch).await {
+        Ok(outcome) => {
+            let status = if outcome.success {
+                StatusCode::OK
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            (
+                status,
+                Json(api::PdRoleSwitchResponse {
+                    success: outcome.success,
+                    message: outcome.message,
+                    old_role: outcome.old_role,
+                    new_role: outcome.new_role,
+                    safe_to_restore: outcome.safe_to_restore,
+                }),
+            )
+                .into_response()
+        }
+        Err(error) => native_error(StatusCode::BAD_REQUEST, &error.to_string(), false),
+    }
+}
+
+/// `POST /update_weight_version` — Python's `{"success", "message", "new_version"}`
+/// on success, `{"success": false, "message"}` 400 on failure.
+async fn update_weight_version(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<api::UpdateWeightVersionRequest>, JsonRejection>,
+) -> Response {
+    let body = match body {
+        Ok(Json(body)) => body,
+        Err(rejection) => {
+            return native_error(StatusCode::BAD_REQUEST, &rejection.body_text(), false);
+        }
+    };
+    let new_version = body.new_version;
+    match state
+        .core
+        .update_weight_version(new_version.clone(), body.abort_all_requests.unwrap_or(true))
+        .await
+    {
+        Ok(()) => Json(api::UpdateWeightVersionResponse {
+            success: true,
+            message: format!("Weight version updated to {new_version}"),
+            new_version: Some(new_version),
+        })
+        .into_response(),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(api::UpdateWeightVersionResponse {
+                success: false,
+                message: format!("Failed to update weight version: {error}"),
+                new_version: None,
+            }),
+        )
+            .into_response(),
+    }
+}
+
+/// `POST /internal/peer` — the body is a control message's wire bytes,
+/// encoded by another DP rank's listener; the reply body is this scheduler's
+/// encoded output. Errors are plain text so the relaying side can carry the
+/// message into its own merged error.
+async fn forward_control_req(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
+    let Some(routes) = forwarded_tag(&body).and_then(|tag| relayed_by(&tag)) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "not a control message a peer listener relays",
+        )
+            .into_response();
+    };
+    // Without an admin key the forced admin routes refuse before relaying,
+    // so only a request sent straight to this route carries their message;
+    // refuse it too, or the peer route would bypass that refusal.
+    if state.server_args.api_keys.admin_api_key.is_none()
+        && routes.iter().copied().any(super::auth::is_admin_force)
+    {
+        return super::auth::admin_key_missing();
+    }
+    match state.core.forward_control_req(body).await {
+        Ok(reply) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/msgpack")],
+            reply,
+        )
+            .into_response(),
+        Err(error) => (error.http_status(), error.to_string()).into_response(),
+    }
+}
+
+/// Each control message a peer listener relays, with the HTTP routes that fan it
+/// out; a relayed message is held to their levels in `auth_levels.json`.
+const RELAYED_BY: &[(&str, &[&str])] = &[
+    ("AbortReq", &["/abort_request"]),
+    ("GetInternalStateReq", &["/server_info"]),
+    ("FlushCacheReqInput", &["/flush_cache"]),
+    ("CheckWeightsReqInput", &["/weights_checker"]),
+    ("FreezeGCReq", &["/freeze_gc"]),
+    ("SetInternalStateReq", &["/set_internal_state"]),
+    ("ProfileReq", &["/start_profile", "/stop_profile"]),
+    (
+        "ExpertDistributionReq",
+        &[
+            "/start_expert_distribution_record",
+            "/stop_expert_distribution_record",
+            "/dump_expert_distribution_record",
+        ],
+    ),
+    ("SlowDownReqInput", &["/slow_down"]),
+    (
+        "ReleaseMemoryOccupationReqInput",
+        &["/release_memory_occupation"],
+    ),
+    (
+        "ResumeMemoryOccupationReqInput",
+        &["/resume_memory_occupation"],
+    ),
+    ("GetWeightsByNameReqInput", &["/get_weights_by_name"]),
+    (
+        "InitWeightsUpdateGroupReqInput",
+        &["/init_weights_update_group"],
+    ),
+    (
+        "DestroyWeightsUpdateGroupReqInput",
+        &["/destroy_weights_update_group"],
+    ),
+    (
+        "InitWeightsSendGroupForRemoteInstanceReqInput",
+        &["/init_weights_send_group_for_remote_instance"],
+    ),
+    (
+        "SendWeightsToRemoteInstanceReqInput",
+        &["/send_weights_to_remote_instance"],
+    ),
+    ("AddExternalCorpusReqInput", &["/add_external_corpus"]),
+    ("RemoveExternalCorpusReqInput", &["/remove_external_corpus"]),
+    ("ListExternalCorporaReqInput", &["/list_external_corpora"]),
+    ("OpenSessionReqInput", &["/open_session"]),
+    ("CloseSessionReqInput", &["/close_session"]),
+    ("GetHiCacheL3LayoutReq", &["/get_hicache_l3_cache_layout"]),
+    ("ConfigureLoggingReq", &["/configure_logging"]),
+    ("DumperControlReqInput", &["/dumper/{method}"]),
+    (
+        "UpdateWeightFromDiskReqInput",
+        &["/update_weights_from_disk"],
+    ),
+    (
+        "UpdateWeightsFromDistributedReqInput",
+        &["/update_weights_from_distributed"],
+    ),
+    (
+        "UpdateWeightsFromTensorReqInput",
+        &["/update_weights_from_tensor"],
+    ),
+    (
+        "UpdateWeightsFromIPCReqInput",
+        &["/update_weights_from_ipc"],
+    ),
+    ("BeginWeightUpdateReqInput", &["/begin_weight_update"]),
+    ("EndWeightUpdateReqInput", &["/end_weight_update"]),
+    ("PluginWeightUpdateReqInput", &["/plugin_weight_update"]),
+    ("PauseGenerationReqInput", &["/pause_generation"]),
+    ("ContinueGenerationReqInput", &["/continue_generation"]),
+    ("PdRoleSwitchReqInput", &["/pd_role_switch"]),
+    ("UpdateWeightVersionReqInput", &["/update_weight_version"]),
+    ("ClearHiCacheReqInput", &["/hicache/storage-backend/clear"]),
+    (
+        "DetachHiCacheStorageReqInput",
+        &["/hicache/storage-backend"],
+    ),
+    (
+        "AttachHiCacheStorageReqInput",
+        &["/hicache/storage-backend"],
+    ),
+];
+
+fn relayed_by(tag: &str) -> Option<&'static [&'static str]> {
+    RELAYED_BY
+        .iter()
+        .find(|(relayed, _)| *relayed == tag)
+        .map(|(_, routes)| *routes)
+}
+
+/// A forwarded control message's type tag, the first element of its array.
+fn forwarded_tag(body: &[u8]) -> Option<String> {
+    match rmpv::decode::read_value(&mut &body[..]).ok()? {
+        rmpv::Value::Array(items) => items.first()?.as_str().map(str::to_owned),
+        _ => None,
+    }
 }
 
 /// Await the core's complete semantic server-info result. HTTP status and
@@ -71,13 +593,16 @@ async fn await_server_info(state: &AppState) -> Result<ServerInfo, Response> {
 }
 
 /// `GET /get_model_info` (+ `/model_info` alias) — serialize the shared static
-/// model metadata (no scheduler round-trip).
+/// model metadata, Python's launch-time model fields last (no scheduler
+/// round-trip).
 async fn model_info(State(state): State<Arc<AppState>>) -> Response {
-    let info = state.core.model_info();
+    let info = state.core.model_info().await;
     (
         StatusCode::OK,
         [("content-type", "application/json")],
-        serde_json::to_vec(&info).unwrap_or_default(),
+        info.to_json()
+            .and_then(|body| serde_json::to_vec(&body))
+            .unwrap_or_default(),
     )
         .into_response()
 }
@@ -86,7 +611,8 @@ async fn model_info(State(state): State<Arc<AppState>>) -> Response {
 /// `launch_command`, scheduler init info, `kv_events`), as Python reports
 /// them, beneath the runtime's startup timings, typed allowlisted scheduler
 /// metrics and launch metadata. The raw scheduler state is never visible to
-/// this HTTP adapter.
+/// this HTTP adapter. Under DP, the listener of DP rank 0 adds every rank's
+/// listener as `dp_listeners` (see `CoreHandle::server_info`).
 async fn server_info(State(state): State<Arc<AppState>>) -> Response {
     let info = match await_server_info(&state).await {
         Ok(info) => info,
@@ -102,6 +628,234 @@ async fn server_info(State(state): State<Arc<AppState>>) -> Response {
             )
                 .into_response()
         }
+    }
+}
+
+/// The deprecated alias Python keeps, warning on each use.
+async fn get_server_info(state: State<Arc<AppState>>) -> Response {
+    tracing::warn!(
+        "Endpoint '/get_server_info' is deprecated and will be removed in a future version. \
+         Please use '/server_info' instead."
+    );
+    server_info(state).await
+}
+
+/// `GET /ping` — Python's `is_healthy()`: up and not shutting down; an
+/// intentional pause still answers 200. An empty body either way.
+async fn ping(State(state): State<Arc<AppState>>) -> Response {
+    flag_status(state.core.is_ready() && !state.core.is_draining())
+}
+
+/// `GET /ready` — Python's `is_ready()`: healthy and not paused.
+async fn ready(State(state): State<Arc<AppState>>) -> Response {
+    flag_status(state.core.is_ready() && !state.core.is_draining() && !state.core.is_paused())
+}
+
+fn flag_status(ok: bool) -> Response {
+    if ok {
+        StatusCode::OK.into_response()
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE.into_response()
+    }
+}
+
+/// `GET /get_hicache_l3_cache_layout` — the merged L3 layout, always 200.
+async fn get_hicache_l3_cache_layout(State(state): State<Arc<AppState>>) -> Response {
+    match state.core.hicache_l3_cache_layout().await {
+        Ok(layout) => Json(layout).into_response(),
+        Err(error) => native_error(error.http_status(), &error.to_string(), false),
+    }
+}
+
+/// `GET|POST /configure_logging` — Python's empty 200; an unknown level is
+/// refused (Python's `setLevel` raises, which its route does not catch).
+async fn configure_logging(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<api::ConfigureLoggingRequest>, JsonRejection>,
+) -> Response {
+    let body = match body {
+        Ok(Json(body)) => body,
+        Err(rejection) => {
+            return native_error(StatusCode::BAD_REQUEST, &rejection.body_text(), false);
+        }
+    };
+    let outcome = state
+        .core
+        .configure_logging(LoggingConfig {
+            log_requests: body.log_requests,
+            log_requests_level: body.log_requests_level,
+            log_requests_format: body.log_requests_format,
+            log_level: body.log_level,
+            dump_requests_folder: body.dump_requests_folder,
+            dump_requests_threshold: body.dump_requests_threshold,
+            crash_dump_folder: body.crash_dump_folder,
+            dump_requests_exclude_meta_keys: body
+                .dump_requests_exclude_meta_keys
+                .map(|list| list.items),
+        })
+        .await;
+    match outcome {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(error) => native_error(error.http_status(), &error.to_string(), false),
+    }
+}
+
+/// `POST /dumper/{method}`, mounted only under `DUMPER_SERVER_PORT=reuse`
+/// as Python mounts it.
+fn dumper_routes() -> Router<Arc<AppState>> {
+    let router = Router::new();
+    if std::env::var("DUMPER_SERVER_PORT").as_deref() == Ok("reuse") {
+        router.declared_route("/dumper/{method}", post(dumper_control))
+    } else {
+        router
+    }
+}
+
+/// Python's rendering: the ranks' responses flattened as a JSON array, or a
+/// 400 carrying every failed rank's error as `{"error": [...]}`. The body
+/// must be a JSON object (empty when absent).
+async fn dumper_control(
+    State(state): State<Arc<AppState>>,
+    Path(method): Path<String>,
+    body: Bytes,
+) -> Response {
+    let body = if body.is_empty() {
+        Map::new()
+    } else {
+        match serde_json::from_slice::<Value>(&body) {
+            Ok(Value::Object(object)) => object,
+            Ok(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "Request body must be a JSON object."})),
+                )
+                    .into_response();
+            }
+            Err(error) => return native_error(StatusCode::BAD_REQUEST, &error.to_string(), false),
+        }
+    };
+    match state.core.dumper_control(method, body).await {
+        Ok(DumperOutcome::Responses(responses)) => Json(Value::Array(responses)).into_response(),
+        Ok(DumperOutcome::Failed(errors)) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": errors})),
+        )
+            .into_response(),
+        Err(error) => native_error(error.http_status(), &error.to_string(), false),
+    }
+}
+
+/// Python's `_create_error_response`: `{"error": {"message": ...}}`, 400.
+fn session_error(message: &str) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({"error": {"message": message}})),
+    )
+        .into_response()
+}
+
+/// `GET|POST /open_session` — the new session's id as a bare JSON string,
+/// or Python's 400 when it could not be opened.
+async fn open_session(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<api::OpenSessionRequest>, JsonRejection>,
+) -> Response {
+    let body = match body {
+        Ok(Json(body)) => body,
+        Err(rejection) => return session_error(&rejection.body_text()),
+    };
+    let outcome = state
+        .core
+        .open_session(SessionOpen {
+            capacity_of_str_len: body.capacity_of_str_len,
+            session_id: body.session_id,
+            streaming: body.streaming,
+            timeout: body.timeout,
+        })
+        .await;
+    match outcome {
+        Ok(Some(session_id)) => Json(session_id).into_response(),
+        Ok(None) => session_error(
+            "Failed to open the session. Check if a session with the same id is still open.",
+        ),
+        Err(error) => session_error(&error.to_string()),
+    }
+}
+
+/// `GET|POST /close_session` — Python's empty 200.
+async fn close_session(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<api::CloseSessionRequest>, JsonRejection>,
+) -> Response {
+    let body = match body {
+        Ok(Json(body)) => body,
+        Err(rejection) => return session_error(&rejection.body_text()),
+    };
+    match state.core.close_session(body.session_id).await {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(error) => session_error(&error.to_string()),
+    }
+}
+
+/// Python's `{"error": ...}` 404 without `--elastic-ep-backend`.
+fn elastic_ep_disabled() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({"error": "elastic EP is not enabled (set --elastic-ep-backend)"})),
+    )
+        .into_response()
+}
+
+/// `POST /scale_elastic_ep` — the body is checked as Python checks it (a
+/// JSON object with a positive integer `new_ep_size`) before the backend
+/// gate. The Rust frontend serves no scale: with a backend, the refusal
+/// says so.
+async fn scale_elastic_ep(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
+    let error = |status: StatusCode, message: String| {
+        (status, Json(serde_json::json!({"error": message}))).into_response()
+    };
+    let body = match serde_json::from_slice::<Value>(&body) {
+        Ok(Value::Object(object)) => object,
+        Ok(_) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "request body must be a JSON object".into(),
+            );
+        }
+        Err(e) => return error(StatusCode::BAD_REQUEST, format!("Invalid JSON: {e}")),
+    };
+    let positive = body
+        .get("new_ep_size")
+        .and_then(Value::as_i64)
+        .filter(|size| *size > 0 && !body["new_ep_size"].is_boolean())
+        .is_some();
+    if !positive {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "new_ep_size must be a positive integer".into(),
+        );
+    }
+    if state.core.elastic_ep_state().is_none() {
+        return elastic_ep_disabled();
+    }
+    error(
+        StatusCode::BAD_REQUEST,
+        "elastic EP scaling is not served by the Rust frontend".into(),
+    )
+}
+
+/// `GET /is_scaling_elastic_ep` — Python's `get_elastic_ep_state`.
+async fn is_scaling_elastic_ep(State(state): State<Arc<AppState>>) -> Response {
+    match state.core.elastic_ep_state() {
+        None => elastic_ep_disabled(),
+        Some(ElasticEpState { effective_ep_size }) => Json(serde_json::json!({
+            "is_scaling_elastic_ep": false,
+            "effective_ep_size": effective_ep_size,
+            "pending_ep_size": null,
+            "scale_phase": "idle",
+            "last_error": null,
+        }))
+        .into_response(),
     }
 }
 
@@ -169,6 +923,7 @@ struct CheckWeightsBody {
     allow_quant_error: bool,
     skip_tensor_list: Option<Vec<String>>,
     selector: CheckWeightsSelector,
+    names: Option<Vec<String>>,
 }
 
 impl Default for CheckWeightsBody {
@@ -178,6 +933,7 @@ impl Default for CheckWeightsBody {
             allow_quant_error: false,
             skip_tensor_list: None,
             selector: CheckWeightsSelector::All,
+            names: None,
         }
     }
 }
@@ -225,6 +981,7 @@ async fn check_weights(State(state): State<Arc<AppState>>, body: Bytes) -> Respo
             body.allow_quant_error,
             body.skip_tensor_list,
             body.selector.as_str().to_owned(),
+            body.names,
         )
         .await
     {
@@ -285,7 +1042,15 @@ struct AbortRequestBody {
 /// `abort_all`, through the core's cancellation registry, as the gRPC `Abort`
 /// does. Python's contract: 200 with an empty body whether or not anything
 /// matched, and an empty rid without `abort_all` is ignored rather than
-/// matching every request, as `TokenizerManager.abort_request` does.
+/// matching every request, as `TokenizerManager.abort_request` does. Each
+/// aborted request ends as Python ends it, on the scheduler's terminal output
+/// with the abort as its finish reason and the partial generation, rather than
+/// on the cancelled error the gRPC `Abort` reports. Under DP, the listener
+/// of DP rank 0 then relays the abort to every other rank's listener through
+/// the control relay (`CoreHandle::abort_peers`), since each one feeds only
+/// its own DP group and tracks only its own generations; a peer's failure is
+/// logged, not answered, and a relayed abort is served locally and never
+/// relayed again.
 async fn abort_request(
     State(state): State<Arc<AppState>>,
     body: Result<Json<AbortRequestBody>, JsonRejection>,
@@ -297,13 +1062,18 @@ async fn abort_request(
         }
     };
     let rid = body.rid.unwrap_or_default();
+    let ending = AbortEnding::AbortFinishReason;
     if body.abort_all {
-        state.core.abort(None);
+        state.core.abort(None, ending);
     } else if rid.is_empty() {
         tracing::warn!("ignoring abort_request with an empty rid and abort_all=false");
     } else {
-        state.core.abort(Some(&rid));
+        state.core.abort(Some(&rid), ending);
     }
+    // Detached: the reply does not wait on peers, and a client hanging up
+    // cannot cancel the relay.
+    let core = state.core.clone();
+    tokio::spawn(async move { core.abort_peers(rid, body.abort_all).await });
     StatusCode::OK.into_response()
 }
 
@@ -314,18 +1084,42 @@ mod tests {
         http::{Request as HttpRequest, header::CONTENT_TYPE},
     };
     use bytes::Bytes;
+    use futures::StreamExt;
     use tower::ServiceExt;
 
     use super::*;
-    use crate::api_server::core::{CoreConfig, CoreEvent, CoreHandle, CoreMetadata};
-    use crate::message::config::{DisaggregationMode, ModelConfig, ServerArgs};
+    use crate::api_server::core::fanout::ControlTarget;
+    use crate::api_server::core::{CoreEvent, peer_endpoints};
+    use crate::api_server::handlers::{CoreConfig, CoreHandle, CoreMetadata};
+    use crate::message::config::{
+        DeploymentInfo, DisaggregationMode, ModelConfig, RustServerEndpoint, ServerArgs,
+    };
     use crate::message::ids::Rid;
+    use crate::message::io_struct::AbortReq;
+    use crate::message::request::Request;
     use crate::message::request::{GenerateRequest, RequestKind};
-    use crate::message::response::ResponseItem;
+    use crate::message::response::{
+        CachedTokensDetails, ChunkEvent, ChunkExtras, ResponseItem, WeightVersionSpan,
+    };
     use crate::tokenizer_manager::wiring::{AbortSource, TmEvent};
+    use crate::utils::environ;
 
     fn test_state(
         server_args: ServerArgs,
+    ) -> (
+        Arc<AppState>,
+        flume::Receiver<TmEvent>,
+        flume::Receiver<crate::tokenizer_manager::wiring::AbortSource>,
+    ) {
+        test_state_with_peers(server_args, Vec::new(), Vec::new())
+    }
+
+    /// A state whose core answers for the DP ranks `peer_endpoints` reach as
+    /// well as its own, and reports `server_info_state_keys` on `/server_info`.
+    fn test_state_with_peers(
+        server_args: ServerArgs,
+        peer_endpoints: Vec<Arc<dyn ControlTarget>>,
+        server_info_state_keys: Vec<String>,
     ) -> (
         Arc<AppState>,
         flume::Receiver<TmEvent>,
@@ -343,8 +1137,14 @@ mod tests {
                 startup_ready: true,
                 is_disaggregation: false,
                 mm_limits: Default::default(),
-                metadata: CoreMetadata::from(server_args.as_ref()),
+                multimodal: false,
+                peer_endpoints,
+                metadata: CoreMetadata::from(server_args.as_ref())
+                    .with_server_info_state_keys(server_info_state_keys),
                 metrics: None,
+                request_log: None,
+                generate_validator: None,
+                abort_hook: None,
             },
         );
         (
@@ -378,12 +1178,23 @@ mod tests {
         let (state, _, _) = test_state(ServerArgs {
             model_path: "/model".into(),
             served_model_name: "served".into(),
-            tokenizer_path: "/tokenizer".into(),
+            // The server loads a local copy; clients get the launched path.
+            tokenizer_path: "/local-tokenizer-copy".into(),
+            public_tokenizer_path: "/tokenizer".into(),
             weight_version: Some("weights-v1".into()),
             load_format: Some("safetensors".into()),
             reasoning_parser: Some("reasoner".into()),
             tool_call_parser: Some("tools".into()),
             disaggregation_mode: DisaggregationMode::Prefill,
+            launch_model_info: crate::message::config::JsonObject(Arc::new(
+                serde_json::json!({
+                    "has_image_understanding": true,
+                    "architectures": ["Arch"],
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            )),
             ..Default::default()
         });
         let app = routes().with_state(state);
@@ -410,6 +1221,13 @@ mod tests {
             assert_eq!(body["tool_call_parser"], "tools");
             assert_eq!(body["disaggregation_mode"], "prefill");
             assert!(body["preferred_sampling_params"].is_null());
+            // Python's launch-time model fields follow the typed ones.
+            let keys: Vec<_> = body.as_object().unwrap().keys().collect();
+            assert_eq!(
+                keys[keys.len() - 2..],
+                ["has_image_understanding", "architectures"]
+            );
+            assert_eq!(body["architectures"], serde_json::json!(["Arch"]));
         }
     }
 
@@ -417,35 +1235,68 @@ mod tests {
     async fn server_info_route_serializes_only_the_typed_public_subset() {
         // Native floats stay JSON numbers; NumPy scalars encoded by Python's
         // msgspec enc_hook=str must remain JSON strings, as before the refactor.
-        assert_server_info_response(rmpv::Value::from(23.616), serde_json::json!(23.616)).await;
-        assert_server_info_response(rmpv::Value::from("23.616"), serde_json::json!("23.616")).await;
+        // Under DP, the listener of DP rank 0 adds every rank's listener as
+        // `dp_listeners`, by rank; the other listeners do not.
+        assert_server_info_response(rmpv::Value::from(23.616), serde_json::json!(23.616), None)
+            .await;
+        assert_server_info_response(
+            rmpv::Value::from("23.616"),
+            serde_json::json!("23.616"),
+            Some(0),
+        )
+        .await;
+        assert_server_info_response(
+            rmpv::Value::from("23.616"),
+            serde_json::json!("23.616"),
+            Some(1),
+        )
+        .await;
     }
 
     async fn assert_server_info_response(
         kvcache: rmpv::Value,
         expected_kvcache: serde_json::Value,
+        dp_rank: Option<u32>,
     ) {
         let launch_fields = serde_json::json!({
             "model_path": "/model",
             "tp_size": 4,
             "max_total_num_tokens": 1,
             "launch_command": "launch --tp-size 4",
+            "instance_id": "stale-launch-instance-id",
         });
-        let (state, intake_rx, abort_rx) = test_state(ServerArgs {
-            model_path: "/model".into(),
-            served_model_name: "served".into(),
-            tokenizer_path: "/tokenizer".into(),
-            model_config: ModelConfig {
-                context_len: 4096,
+        // Gathered in no particular order; published by rank.
+        let listeners = ["http://10.0.0.1:30000", "http://[fd00::2]:30000"];
+        let rust_server_endpoints = match dp_rank {
+            Some(_) => vec![endpoint(1, listeners[1]), endpoint(0, listeners[0])],
+            None => Vec::new(),
+        };
+        // An embedding package registers its own scheduler fields by name.
+        let (state, intake_rx, abort_rx) = test_state_with_peers(
+            ServerArgs {
+                deployment_info: DeploymentInfo {
+                    dp_rank,
+                    rust_server_endpoints,
+                    ..Default::default()
+                },
+                model_path: "/model".into(),
+                served_model_name: "served".into(),
+                tokenizer_path: "/local-tokenizer-copy".into(),
+                public_tokenizer_path: "/tokenizer".into(),
+                model_config: ModelConfig {
+                    context_len: 4096,
+                    ..Default::default()
+                },
+                max_total_num_tokens: 8192,
+                version: "1.2.3".into(),
+                launch_server_info: crate::message::config::JsonObject(Arc::new(
+                    launch_fields.as_object().unwrap().clone(),
+                )),
                 ..Default::default()
             },
-            max_total_num_tokens: 8192,
-            version: "1.2.3".into(),
-            launch_server_info: crate::message::config::LaunchServerInfo(Arc::new(
-                launch_fields.as_object().unwrap().clone(),
-            )),
-            ..Default::default()
-        });
+            Vec::new(),
+            vec!["package_state".into(), "unset_package_state".into()],
+        );
         let request = tokio::spawn(
             routes().with_state(state).oneshot(
                 HttpRequest::builder()
@@ -478,6 +1329,13 @@ mod tests {
                 rmpv::Value::from("must-not-leak"),
             ),
             (
+                rmpv::Value::from("package_state"),
+                rmpv::Value::Map(vec![(
+                    rmpv::Value::from("tokens_per_owner"),
+                    rmpv::Value::Map(vec![(rmpv::Value::from(0), rmpv::Value::from(7))]),
+                )]),
+            ),
+            (
                 rmpv::Value::from("last_gen_throughput"),
                 rmpv::Value::from(1.5),
             ),
@@ -494,6 +1352,13 @@ mod tests {
                     (rmpv::Value::from("kvcache"), kvcache),
                     (rmpv::Value::from("token_capacity"), rmpv::Value::from(8192)),
                     (rmpv::Value::from("token_capacity_swa"), rmpv::Value::Nil),
+                    (
+                        rmpv::Value::from("token_capacity_window"),
+                        rmpv::Value::Map(vec![(
+                            rmpv::Value::from("window_4096"),
+                            rmpv::Value::from(2048),
+                        )]),
+                    ),
                     (
                         rmpv::Value::from("future_uncontracted_metric"),
                         rmpv::Value::from(99),
@@ -528,12 +1393,13 @@ mod tests {
             .map(String::as_str)
             .collect();
         assert_eq!(
-            keys[..5],
+            keys[..6],
             [
                 "model_path",
                 "tp_size",
                 "max_total_num_tokens",
                 "launch_command",
+                "instance_id",
                 "served_model_name"
             ]
         );
@@ -555,12 +1421,41 @@ mod tests {
         assert_eq!(body["max_context_length"], 4096);
         assert_eq!(body["max_total_num_tokens"], 8192);
         assert_eq!(body["version"], "1.2.3");
+        let instance_id = body["instance_id"]
+            .as_str()
+            .expect("HTTP /server_info must carry typed instance_id");
+        assert_ne!(instance_id, "stale-launch-instance-id");
+        assert_eq!(
+            uuid::Uuid::parse_str(instance_id).unwrap().get_version(),
+            Some(uuid::Version::Random)
+        );
         assert_eq!(body["frontend"], "rust");
         assert_eq!(
             body["internal_states"][0]["rust_mm_transport"]["inline_features"],
             3
         );
         assert_eq!(body["internal_states"][0]["last_gen_throughput"], 1.5);
+        // A registered field passes through after the typed ones, its integer
+        // keys stringified as Python's are; one the scheduler did not set
+        // stays absent.
+        assert_eq!(
+            body["internal_states"][0]["package_state"],
+            serde_json::json!({"tokens_per_owner": {"0": 7}})
+        );
+        assert_eq!(
+            body["internal_states"][0]
+                .as_object()
+                .unwrap()
+                .keys()
+                .next_back()
+                .unwrap(),
+            "package_state"
+        );
+        assert!(
+            body["internal_states"][0]
+                .get("unset_package_state")
+                .is_none()
+        );
         assert_eq!(
             body["internal_states"][0]["memory_usage"]["kvcache"],
             expected_kvcache
@@ -574,6 +1469,10 @@ mod tests {
             serde_json::Value::Null
         );
         assert_eq!(
+            body["internal_states"][0]["memory_usage"]["token_capacity_window"],
+            serde_json::json!({"window_4096": 2048})
+        );
+        assert_eq!(
             body["internal_states"][0]["step_time_dict"]["4"],
             serde_json::json!([0.01])
         );
@@ -584,7 +1483,21 @@ mod tests {
                 .is_none(),
             "uncontracted scheduler fields must not silently become public API"
         );
+        let expected_dp_listeners = (dp_rank == Some(0)).then(|| {
+            serde_json::json!([
+                {"dp_rank": 0, "url": listeners[0]},
+                {"dp_rank": 1, "url": listeners[1]},
+            ])
+        });
+        assert_eq!(body.get("dp_listeners"), expected_dp_listeners.as_ref());
         assert!(abort_rx.try_recv().is_err());
+    }
+
+    fn endpoint(dp_rank: u32, endpoint: &str) -> RustServerEndpoint {
+        RustServerEndpoint {
+            dp_rank,
+            endpoint: endpoint.to_owned(),
+        }
     }
 
     /// `/flush_cache` relays one `FlushCacheReqInput` carrying the query
@@ -684,6 +1597,191 @@ mod tests {
         assert!(intake_rx.try_recv().is_err());
     }
 
+    /// The listener an abort reaches cancels the named generations locally,
+    /// answers at once, and relays the abort to every other rank's listener
+    /// as the scheduler's `AbortReq`; a dead peer is only logged. A relayed
+    /// abort is served on the receiving listener alone, and a no-op abort is
+    /// neither served nor relayed.
+    #[tokio::test]
+    async fn abort_request_reaches_every_dp_listener() {
+        // A live peer that reports each abort relayed to it.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live = format!("http://{}", listener.local_addr().unwrap());
+        let (received_tx, received_rx) = flume::unbounded::<AbortReq>();
+        let peer_app = Router::new().route(
+            FORWARD_PEER_PATH,
+            post(move |body: Bytes| {
+                let received_tx = received_tx.clone();
+                async move {
+                    let abort = AbortReq::decode(&body).unwrap().expect("an AbortReq");
+                    received_tx.send(abort).unwrap();
+                    (StatusCode::OK, rmp_serde::to_vec(&true).unwrap())
+                }
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, peer_app).await.unwrap() });
+        // A dead peer: nothing listens on its port.
+        let dead = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}", listener.local_addr().unwrap())
+        };
+
+        let info = DeploymentInfo {
+            dp_rank: Some(0),
+            rust_server_endpoints: vec![
+                endpoint(0, "http://127.0.0.1:1"),
+                endpoint(1, &dead),
+                endpoint(2, &live),
+            ],
+            ..Default::default()
+        };
+        let peers = peer_endpoints(&info, 0, &Default::default()).unwrap();
+        let (state, intake_rx, abort_rx) = test_state_with_peers(
+            ServerArgs {
+                deployment_info: info,
+                ..Default::default()
+            },
+            peers,
+            Vec::new(),
+        );
+        let core = state.core.clone();
+        let app = routes().with_state(state);
+        let post_abort = |uri: &'static str, body: Bytes| {
+            app.clone().oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+        };
+        let relayed = AbortReq::new("client-rid".into(), false).encode().unwrap();
+        for (uri, body, local, forwarded) in [
+            (
+                "/abort_request",
+                Bytes::from_static(br#"{"rid": "client-rid"}"#),
+                true,
+                Some(("client-rid", false)),
+            ),
+            (
+                "/abort_request",
+                Bytes::from_static(br#"{"abort_all": true}"#),
+                true,
+                Some(("", true)),
+            ),
+            (FORWARD_PEER_PATH, relayed, true, None),
+            (
+                "/abort_request",
+                Bytes::from_static(br#"{"rid": ""}"#),
+                false,
+                None,
+            ),
+        ] {
+            let case = format!("{uri} {}", String::from_utf8_lossy(&body));
+            // A live generation each abort but the no-op one names.
+            let call = core
+                .generate(
+                    GenerateRequest {
+                        rid: Rid::from_client("client-rid"),
+                        ..Default::default()
+                    },
+                    crate::api_server::core::ReceivedAs::without_headers(),
+                )
+                .await
+                .unwrap();
+            let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap()
+            else {
+                panic!("{case}: generate must submit one request");
+            };
+            assert!(admission.try_accept(), "{case}");
+            let response = post_abort(uri, body).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{case}");
+            assert_eq!(
+                matches!(abort_rx.try_recv(), Ok(AbortSource::Request(rid)) if rid == request.rid),
+                local,
+                "{case}: unexpected local abort"
+            );
+            // The aborted call still awaits the scheduler's terminal output;
+            // dropping it releases the request.
+            drop(call);
+            assert!(
+                matches!(abort_rx.try_recv(), Ok(AbortSource::Guard(rid)) if rid == request.rid),
+                "{case}: dropping the call must release the request"
+            );
+            let Some((rid, abort_all)) = forwarded else {
+                continue;
+            };
+            let received =
+                tokio::time::timeout(std::time::Duration::from_secs(10), received_rx.recv_async())
+                    .await
+                    .expect("the live peer never received the abort")
+                    .unwrap();
+            assert_eq!(received.abort_all(), abort_all, "{case}");
+            if abort_all {
+                assert_eq!(received.get_rid().len(), 32, "{case}: a minted rid");
+            } else {
+                assert_eq!(received.get_rid(), rid, "{case}");
+            }
+        }
+        let late = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            received_rx.recv_async(),
+        );
+        assert!(late.await.is_err(), "a relayed or no-op abort was relayed");
+        assert!(
+            intake_rx.try_recv().is_err(),
+            "an abort never reaches the scheduler as control"
+        );
+    }
+
+    /// A table that points a listener back at itself (a peer published at
+    /// this listener's own address) cannot loop: its own relayed abort is
+    /// served on the local registry and never relayed again, so one client
+    /// abort is two requests served, the client's and its own.
+    #[tokio::test]
+    async fn a_self_dial_is_one_local_abort() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let own = format!("http://{}", listener.local_addr().unwrap());
+        let info = DeploymentInfo {
+            dp_rank: Some(0),
+            rust_server_endpoints: vec![endpoint(0, &own), endpoint(1, &own)],
+            ..Default::default()
+        };
+        let peers = peer_endpoints(&info, 0, &Default::default()).unwrap();
+        let (state, _intake_rx, _abort_rx) = test_state_with_peers(
+            ServerArgs {
+                deployment_info: info,
+                ..Default::default()
+            },
+            peers,
+            Vec::new(),
+        );
+        // Aborts are idempotent in the core, so count the requests served.
+        let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = served.clone();
+        let app = routes()
+            .with_state(state)
+            .layer(axum::middleware::map_request(
+                move |request: HttpRequest<Body>| {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    async move { request }
+                },
+            ));
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let response = reqwest::Client::new()
+            .post(format!("{own}/abort_request"))
+            .header(CONTENT_TYPE, "application/json")
+            .body(r#"{"abort_all": true}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        assert_eq!(served.load(std::sync::atomic::Ordering::Relaxed), 2);
+    }
+
     /// `/weights_checker` relays one `CheckWeightsReqInput` carrying the body's
     /// fields (Python's defaults for a missing body) and answers with Python's
     /// JSON: the rank records as sent, in order, with the SHA-256 of their
@@ -731,8 +1829,15 @@ mod tests {
             (
                 "POST",
                 r#"{"action": "fingerprint", "allow_quant_error": true,
-                    "skip_tensor_list": ["lm_head"], "selector": "target", "rid": "x"}"#,
-                ("fingerprint", true, Some("lm_head"), "target"),
+                    "skip_tensor_list": ["lm_head"], "selector": "target", "rid": "x",
+                    "names": ["model.weight"]}"#,
+                (
+                    "fingerprint",
+                    true,
+                    Some("lm_head"),
+                    "target",
+                    Some("model.weight"),
+                ),
                 (true, "Success.", ranks.clone()),
                 StatusCode::OK,
                 serde_json::json!({
@@ -746,7 +1851,7 @@ mod tests {
             (
                 "GET",
                 "",
-                ("checksum", false, None, "all"),
+                ("checksum", false, None, "all", None),
                 (false, "rank 1 failed", rmpv::Value::Nil),
                 StatusCode::BAD_REQUEST,
                 serde_json::json!({"success": false, "message": "rank 1 failed"}),
@@ -754,7 +1859,7 @@ mod tests {
             (
                 "POST",
                 "null",
-                ("checksum", false, None, "all"),
+                ("checksum", false, None, "all", None),
                 (true, "Success.", rmpv::Value::Array(vec![])),
                 StatusCode::OK,
                 serde_json::json!({
@@ -794,6 +1899,8 @@ mod tests {
             assert_eq!(header[4].as_bool(), Some(request.1), "{body}");
             assert_eq!(header[5][0].as_str(), request.2, "{body}");
             assert_eq!(header[6].as_str(), Some(request.3), "{body}");
+            assert_eq!(header.as_array().unwrap().len(), 8);
+            assert_eq!(header[7][0].as_str(), request.4, "{body}");
 
             let mut payload = Vec::new();
             rmpv::encode::write_value(
@@ -841,10 +1948,244 @@ mod tests {
         }
     }
 
+    /// Send `body` to `uri`, answer the one `ProfileReq` it submits with
+    /// `outcome`, and return its decoded header and the HTTP response.
+    async fn profile_round_trip(
+        method: &str,
+        uri: &str,
+        body: &'static str,
+        outcome: (bool, &str),
+    ) -> (Vec<rmpv::Value>, Response) {
+        let (state, intake_rx, _abort_rx) = test_state(ServerArgs::default());
+        let response = tokio::spawn(
+            routes().with_state(state).oneshot(
+                HttpRequest::builder()
+                    .method(method)
+                    .uri(uri)
+                    .body(Body::from(body))
+                    .unwrap(),
+            ),
+        );
+        let TmEvent::Intake {
+            request: runtime_request,
+            admission,
+        } = intake_rx.recv_async().await.unwrap()
+        else {
+            panic!("{uri} must submit one control request");
+        };
+        assert!(admission.try_accept());
+        let RequestKind::Control(control) = &runtime_request.kind else {
+            panic!("{uri} must submit a control request");
+        };
+        let header = control.encode().unwrap();
+        let header = rmpv::decode::read_value(&mut &header[..]).unwrap();
+        let rmpv::Value::Array(header) = header else {
+            panic!("{uri}: the header must be an array");
+        };
+
+        let mut payload = Vec::new();
+        rmpv::encode::write_value(
+            &mut payload,
+            &rmpv::Value::Map(vec![
+                (rmpv::Value::from("rid"), rmpv::Value::from("x")),
+                (rmpv::Value::from("http_worker_ipc"), rmpv::Value::Nil),
+                (rmpv::Value::from("success"), rmpv::Value::from(outcome.0)),
+                (rmpv::Value::from("message"), rmpv::Value::from(outcome.1)),
+            ]),
+        )
+        .unwrap();
+        runtime_request
+            .sink
+            .try_send(ResponseItem::Control(Bytes::from(payload)))
+            .unwrap();
+        (header, response.await.unwrap().unwrap())
+    }
+
+    async fn plain_text(response: Response) -> (StatusCode, Option<String>, String) {
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .map(|value| value.to_str().unwrap().to_owned());
+        let bytes = to_bytes(response.into_body(), 1024).await.unwrap();
+        (
+            status,
+            content_type,
+            String::from_utf8(bytes.to_vec()).unwrap(),
+        )
+    }
+
+    /// `/start_profile` relays one `ProfileReq` carrying the body's fields
+    /// (Python's defaults for a missing or `null` body, a numeric-string
+    /// `start_step` as Python's validation coerces it) and answers with
+    /// Python's plain-text 200; a refused start is Python's bare 500. A
+    /// malformed body is refused before anything reaches the scheduler.
+    #[tokio::test]
+    async fn start_profile_relays_the_body_and_the_scheduler_outcome() {
+        // The stack/shape defaults come from the process env, which the
+        // resolution test drives with an injected reader; here expect what
+        // this env resolves to instead of assuming the knobs are unset.
+        let env_with_stack = environ::get_bool_env_var("SGLANG_PROFILE_WITH_STACK", true);
+        let env_record_shapes = environ::get_bool_env_var("SGLANG_PROFILE_RECORD_SHAPES", true);
+        let (header, response) = profile_round_trip(
+            "POST",
+            "/start_profile",
+            r#"{"output_dir": "/traces", "start_step": "15", "num_steps": 5,
+                "activities": ["CPU", "GPU"], "profile_by_stage": true,
+                "with_stack": false, "profile_id": "run-1", "merge_profiles": true,
+                "profile_prefix": "pre", "profile_stages": ["decode"],
+                "detailed_annotations": true, "req_type": 2, "rid": "ignored",
+                "unknown": 1}"#,
+            (true, "Succeeded"),
+        )
+        .await;
+        let expected: Vec<rmpv::Value> = vec![
+            "ProfileReq".into(),
+            header[1].clone(), // the minted rid
+            rmpv::Value::Nil,
+            1.into(), // START_PROFILE even though the body said 2
+            "/traces".into(),
+            15.into(),
+            5.into(),
+            rmpv::Value::Array(vec!["CPU".into(), "GPU".into()]),
+            true.into(),
+            false.into(),
+            env_record_shapes.into(), // absent from the body
+            "run-1".into(),
+            true.into(),
+            "pre".into(),
+            rmpv::Value::Array(vec!["decode".into()]),
+            true.into(),
+        ];
+        assert_eq!(header, expected);
+        assert_ne!(header[1].as_str(), Some("ignored"));
+        assert_eq!(
+            plain_text(response).await,
+            (StatusCode::OK, None, "Start profiling.\n".to_owned())
+        );
+
+        for (method, body) in [("GET", ""), ("POST", "null"), ("POST", "{}")] {
+            let (header, response) =
+                profile_round_trip(method, "/start_profile", body, (true, "Succeeded")).await;
+            assert_eq!(header.len(), 16, "{body:?}");
+            assert_eq!(header[3].as_u64(), Some(1), "{body:?}");
+            for i in [4, 5, 6, 7, 13, 14] {
+                assert!(header[i].is_nil(), "{body:?}: idx {i}");
+            }
+            for i in [8, 12, 15] {
+                assert_eq!(header[i].as_bool(), Some(false), "{body:?}: idx {i}");
+            }
+            assert_eq!(
+                header[9].as_bool(),
+                Some(env_with_stack),
+                "{body:?}: with_stack"
+            );
+            assert_eq!(
+                header[10].as_bool(),
+                Some(env_record_shapes),
+                "{body:?}: record_shapes"
+            );
+            assert!(
+                header[11].as_str().unwrap().parse::<f64>().is_ok(),
+                "{body:?}: profile_id is the start time"
+            );
+            assert_eq!(plain_text(response).await.0, StatusCode::OK, "{body:?}");
+        }
+
+        let (_, response) = profile_round_trip(
+            "POST",
+            "/start_profile",
+            "",
+            (
+                false,
+                "Profiling is already in progress. Call /stop_profile first.",
+            ),
+        )
+        .await;
+        assert_eq!(
+            plain_text(response).await,
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Some("text/plain; charset=utf-8".to_owned()),
+                "Internal Server Error".to_owned()
+            )
+        );
+
+        for body in [
+            r#"{"num_steps": 5.5}"#,
+            r#"{"num_steps": "five"}"#,
+            r#"{"profile_by_stage": null}"#,
+            r#"{"with_stack": "yes"}"#,
+            r#"{"activities": "CPU"}"#,
+            r#"{"output_dir": 5}"#,
+            r#"{"req_type": 7}"#,
+            "{",
+        ] {
+            let (state, intake_rx, _abort_rx) = test_state(ServerArgs::default());
+            let response = routes()
+                .with_state(state)
+                .oneshot(
+                    HttpRequest::builder()
+                        .method("POST")
+                        .uri("/start_profile")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+            assert!(intake_rx.try_recv().is_err(), "{body}");
+        }
+    }
+
+    /// `/stop_profile` ignores its body, relays a STOP `ProfileReq` with every
+    /// other field at its default, and answers with Python's plain-text 200;
+    /// a refused stop (nothing running) is Python's bare 500.
+    #[tokio::test]
+    async fn stop_profile_relays_the_scheduler_outcome() {
+        for (method, body) in [("POST", "{}"), ("GET", ""), ("POST", r#"{"num_steps": 5}"#)] {
+            let (header, response) =
+                profile_round_trip(method, "/stop_profile", body, (true, "Succeeded.")).await;
+            assert_eq!(header.len(), 16, "{body:?}");
+            assert_eq!(header[0].as_str(), Some("ProfileReq"));
+            assert_eq!(header[3].as_u64(), Some(2), "{body:?}: STOP_PROFILE");
+            for i in [4, 5, 6, 7, 9, 10, 11, 13, 14] {
+                assert!(header[i].is_nil(), "{body:?}: idx {i}");
+            }
+            assert_eq!(
+                plain_text(response).await,
+                (
+                    StatusCode::OK,
+                    None,
+                    "Stop profiling. This will take some time.\n".to_owned()
+                )
+            );
+        }
+
+        let (_, response) = profile_round_trip(
+            "POST",
+            "/stop_profile",
+            "",
+            (
+                false,
+                "Profiling is not in progress. Call /start_profile first.",
+            ),
+        )
+        .await;
+        assert_eq!(
+            plain_text(response).await,
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Some("text/plain; charset=utf-8".to_owned()),
+                "Internal Server Error".to_owned()
+            )
+        );
+    }
+
     /// `/abort_request` cancels the live generation submitted under the body's
     /// rid, or every one with `abort_all`, and answers Python's empty 200: the
-    /// runtime is told to abort the request and the client's call ends as
-    /// cancelled. A rid nothing runs under is still a 200 with nothing
+    /// scheduler is told to abort the request, and the client's call ends on
+    /// the scheduler's answer. A rid nothing runs under is still a 200 with nothing
     /// aborted, an empty rid without `abort_all` is ignored, and a malformed
     /// body is a 400.
     #[tokio::test]
@@ -860,10 +2201,13 @@ mod tests {
             let (state, intake_rx, abort_rx) = test_state(ServerArgs::default());
             let mut call = state
                 .core
-                .generate(GenerateRequest {
-                    rid: Rid::from_client("client-rid"),
-                    ..Default::default()
-                })
+                .generate(
+                    GenerateRequest {
+                        rid: Rid::from_client("client-rid"),
+                        ..Default::default()
+                    },
+                    crate::api_server::core::ReceivedAs::without_headers(),
+                )
                 .await
                 .unwrap();
             let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap()
@@ -891,21 +2235,648 @@ mod tests {
             }
             if aborted {
                 assert!(
-                    matches!(abort_rx.try_recv(), Ok(AbortSource::Guard(rid)) if rid == request.rid),
-                    "{body}: the runtime must be told to abort the request"
+                    matches!(abort_rx.try_recv(), Ok(AbortSource::Request(rid)) if rid == request.rid),
+                    "{body}: the scheduler must be told to abort the request"
                 );
                 assert!(
-                    matches!(
-                        call.recv().await,
-                        Some(CoreEvent::Failed(CoreError::Cancelled(_)))
-                    ),
-                    "{body}: the client's call ends as cancelled"
+                    futures::FutureExt::now_or_never(call.recv()).is_none(),
+                    "{body}: the call waits for the scheduler's answer"
+                );
+                request
+                    .sink
+                    .try_send(scheduler_abort(&request.rid, "", Vec::new(), 0))
+                    .unwrap();
+                let Some(CoreEvent::Finished(output)) = call.recv().await else {
+                    panic!("{body}: the client's call finishes on the scheduler's abort");
+                };
+                assert_eq!(
+                    output.finish_reason.as_ref().and_then(|r| r.kind_name()),
+                    Some("abort"),
+                    "{body}"
                 );
             } else {
                 assert!(abort_rx.try_recv().is_err(), "{body}: nothing is aborted");
             }
             drop(request);
         }
+    }
+
+    /// The terminal output Python's scheduler sends for a running request an
+    /// `/abort_request` names: the step's tokens, the request's counts, cache
+    /// split and weight-version span, and the plain abort as finish reason.
+    fn scheduler_abort(
+        rid: &Rid,
+        text: &str,
+        token_ids: Vec<i64>,
+        completion_tokens: u64,
+    ) -> ResponseItem {
+        ResponseItem::Done(ChunkEvent {
+            rid: rid.clone(),
+            text: text.into(),
+            token_ids,
+            prompt_tokens: 5,
+            cached_tokens: 2,
+            completion_tokens,
+            finish_reason: Some(
+                serde_json::from_value(serde_json::json!({
+                    "type": "abort",
+                    "message": "Aborted",
+                    "status_code": null,
+                    "err_type": null
+                }))
+                .unwrap(),
+            ),
+            extras: Some(Box::new(ChunkExtras {
+                cached_tokens_details: Some(CachedTokensDetails {
+                    device: 0,
+                    host: 2,
+                    storage: None,
+                    storage_backend: None,
+                }),
+                weight_versions: vec![WeightVersionSpan {
+                    version: "v1".into(),
+                    start: 0,
+                    end: 17,
+                }],
+                ..Default::default()
+            })),
+            ..Default::default()
+        })
+    }
+
+    /// An `/abort_request` leaves the request's sink in place and asks the
+    /// scheduler to abort it, so each surface ends on the scheduler's terminal
+    /// output as Python's server ends it: a native stream on a final frame
+    /// with all the output, the counts, the cache split and the abort as its
+    /// finish reason, then `[DONE]`; a unary `/generate` aborted before any
+    /// intermediate output with a 200 carrying the partial generation; a
+    /// `/v1/completions` stream on a final chunk whose `finish_reason` is
+    /// `abort`, then `[DONE]`.
+    #[tokio::test]
+    async fn abort_request_ends_requests_on_the_schedulers_abort() {
+        let (state, intake_rx, abort_rx) = test_state(ServerArgs::default());
+        let app = routes()
+            .merge(super::super::native_api::routes())
+            .merge(super::super::openai::routes())
+            .with_state(state);
+        let post = |path: &'static str, body: serde_json::Value| {
+            tokio::spawn(
+                app.clone().oneshot(
+                    HttpRequest::builder()
+                        .method("POST")
+                        .uri(path)
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                ),
+            )
+        };
+        // Accept the next generation, optionally streaming one frame of it.
+        let start = |frame: bool| {
+            let intake_rx = intake_rx.clone();
+            async move {
+                let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap()
+                else {
+                    panic!("expected a generation");
+                };
+                assert!(admission.try_accept());
+                if frame {
+                    request
+                        .sink
+                        .try_send(ResponseItem::Frame(ChunkEvent {
+                            rid: request.rid.clone(),
+                            text: "partial".into(),
+                            token_ids: vec![7],
+                            prompt_tokens: 5,
+                            cached_tokens: 2,
+                            completion_tokens: 1,
+                            ..Default::default()
+                        }))
+                        .unwrap();
+                }
+                request
+            }
+        };
+        // Abort through the route, then answer as the scheduler does.
+        let (post, abort_rx) = (&post, &abort_rx);
+        let abort = |body: serde_json::Value, request: Request, terminal: ResponseItem| async move {
+            let response = post("/abort_request", body).await.unwrap().unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(
+                matches!(abort_rx.try_recv(), Ok(AbortSource::Request(rid)) if rid == request.rid)
+            );
+            request.sink.try_send(terminal).unwrap();
+        };
+        let data = |chunk: &[u8]| -> Vec<String> {
+            std::str::from_utf8(chunk)
+                .unwrap()
+                .split("\n\n")
+                .filter_map(|event| event.strip_prefix("data: ").map(str::to_owned))
+                .collect()
+        };
+
+        let response = post(
+            "/generate",
+            serde_json::json!({"text": "hi", "rid": "stream", "stream": true}),
+        );
+        let request = start(true).await;
+        let mut body = response
+            .await
+            .unwrap()
+            .unwrap()
+            .into_body()
+            .into_data_stream();
+        let first = data(&body.next().await.unwrap().unwrap());
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&first[0]).unwrap()["text"],
+            "partial"
+        );
+        let terminal = scheduler_abort(&request.rid, " end", vec![8], 1);
+        abort(serde_json::json!({"rid": "stream"}), request, terminal).await;
+        let mut rest = Vec::new();
+        while let Some(chunk) = body.next().await {
+            rest.extend(data(&chunk.unwrap()));
+        }
+        let [last, done] = rest.as_slice() else {
+            panic!("expected a final frame and [DONE]: {rest:?}");
+        };
+        let last: serde_json::Value = serde_json::from_str(last).unwrap();
+        assert!(last.get("error").is_none(), "{last}");
+        assert_eq!(last["text"], "partial end");
+        assert_eq!(last["output_ids"], serde_json::json!([7, 8]));
+        let meta = &last["meta_info"];
+        assert_eq!(meta["finish_reason"]["type"], "abort");
+        assert_eq!(meta["finish_reason"]["message"], "Aborted");
+        assert_eq!(meta["prompt_tokens"], 5);
+        assert_eq!(meta["completion_tokens"], 2);
+        assert_eq!(
+            meta["cached_tokens_details"],
+            serde_json::json!({"device": 0, "host": 2})
+        );
+        assert_eq!(meta["weight_versions"][0]["version"], "v1");
+        assert!(meta["e2e_latency"].is_f64());
+        assert_eq!(done, "[DONE]");
+
+        let response = post(
+            "/generate",
+            serde_json::json!({"text": "hi", "rid": "unary"}),
+        );
+        let request = start(false).await;
+        let terminal = scheduler_abort(&request.rid, "seventeen tokens", (1..=17).collect(), 17);
+        abort(serde_json::json!({"rid": "unary"}), request, terminal).await;
+        let response = response.await.unwrap().unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(body["text"], "seventeen tokens");
+        assert_eq!(body["output_ids"].as_array().unwrap().len(), 17);
+        assert_eq!(body["meta_info"]["completion_tokens"], 17);
+        assert_eq!(body["meta_info"]["finish_reason"]["type"], "abort");
+
+        let response = post(
+            "/v1/completions",
+            serde_json::json!({"model": "m", "prompt": "hi", "stream": true}),
+        );
+        let request = start(true).await;
+        let mut body = response
+            .await
+            .unwrap()
+            .unwrap()
+            .into_body()
+            .into_data_stream();
+        body.next().await.unwrap().unwrap();
+        let terminal = scheduler_abort(&request.rid, "", Vec::new(), 0);
+        abort(serde_json::json!({"abort_all": true}), request, terminal).await;
+        let mut rest = Vec::new();
+        while let Some(chunk) = body.next().await {
+            rest.extend(data(&chunk.unwrap()));
+        }
+        let [last, done] = rest.as_slice() else {
+            panic!("expected a final chunk and [DONE]: {rest:?}");
+        };
+        let last: serde_json::Value = serde_json::from_str(last).unwrap();
+        assert_eq!(last["choices"][0]["finish_reason"], "abort", "{last}");
+        assert_eq!(done, "[DONE]");
+    }
+
+    /// Without an admin key, the peer route refuses the operations of the
+    /// forced admin routes, as those routes do, before they reach the
+    /// scheduler; other control messages still go through.
+    #[tokio::test]
+    async fn peer_route_refuses_forced_admin_operations_without_an_admin_key() {
+        use crate::message::io_struct::{
+            AttachHiCacheStorageReqInput, CheckWeightsReqInput, ControlRequest,
+            DetachHiCacheStorageReqInput, ProfileReq,
+        };
+        let rid = || "sender-rid".to_string();
+        let forced = [
+            ControlRequest::AttachHiCacheStorageReqInput(AttachHiCacheStorageReqInput::new(
+                rid(),
+                "file".into(),
+                None,
+                None,
+                None,
+            )),
+            ControlRequest::DetachHiCacheStorageReqInput(DetachHiCacheStorageReqInput::new(rid())),
+            ControlRequest::CheckWeightsReqInput(CheckWeightsReqInput::new(
+                rid(),
+                "checksum".into(),
+                false,
+                None,
+                "target".into(),
+                None,
+            )),
+            ControlRequest::ProfileReq(ProfileReq::stop(rid())),
+        ];
+        let post = |state: Arc<AppState>, message: &ControlRequest| {
+            routes().with_state(state).oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri(FORWARD_PEER_PATH)
+                    .body(Body::from(message.encode().unwrap()))
+                    .unwrap(),
+            )
+        };
+
+        let (state, intake_rx, _abort_rx) = test_state(ServerArgs::default());
+        for message in &forced {
+            // A relayed operation would wait on the scheduler's reply forever.
+            let response = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                post(state.clone(), message),
+            )
+            .await
+            .expect("refused without waiting on the scheduler")
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{message:?}");
+            let body = to_bytes(response.into_body(), 1024).await.unwrap();
+            assert!(
+                String::from_utf8_lossy(&body).contains("requires admin API key"),
+                "{body:?}"
+            );
+        }
+        assert!(intake_rx.is_empty(), "refused before the scheduler");
+
+        // With an admin key, the relayed detach reaches the scheduler.
+        let mut args = ServerArgs::default();
+        args.api_keys.admin_api_key = Some("sk-admin".into());
+        let (state, intake_rx, _abort_rx) = test_state(args);
+        let response = tokio::spawn(post(state, &forced[1]));
+        let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap() else {
+            panic!("the detach must reach the scheduler");
+        };
+        assert!(admission.try_accept());
+        drop(request);
+        let _ = response.await;
+    }
+
+    #[test]
+    fn relayed_by_covers_every_control_message() {
+        use crate::message::io_struct::ControlRequest;
+        let mut relayed: Vec<&str> = RELAYED_BY.iter().map(|(tag, _)| *tag).collect();
+        relayed.sort_unstable();
+        let mut tags = ControlRequest::TAGS.to_vec();
+        tags.sort_unstable();
+        assert_eq!(relayed, tags);
+        for route in RELAYED_BY.iter().flat_map(|(_, routes)| *routes) {
+            assert!(super::super::auth::has_level(route), "{route}");
+        }
+    }
+
+    /// A message no route fans out (a generate, an unknown tag) is refused
+    /// before it reaches the scheduler.
+    #[tokio::test]
+    async fn peer_route_refuses_a_message_no_listener_relays() {
+        let (state, intake_rx, _abort_rx) = test_state(ServerArgs::default());
+        for tag in ["TokenizedGenerateReqInput", "NotAControlMessage"] {
+            let body = rmp_serde::to_vec(&(tag, "sender-rid", ())).unwrap();
+            let response = routes()
+                .with_state(state.clone())
+                .oneshot(
+                    HttpRequest::builder()
+                        .method("POST")
+                        .uri(FORWARD_PEER_PATH)
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{tag}");
+        }
+        assert!(intake_rx.is_empty());
+    }
+
+    /// `/set_internal_state` relays the object to the scheduler and answers
+    /// Python's bare list of flags with 200; a non-object body is a 400 that
+    /// reaches no scheduler.
+    #[tokio::test]
+    async fn set_internal_state_answers_the_per_rank_flags() {
+        let (state, intake_rx, _abort_rx) = test_state(ServerArgs::default());
+        let response = tokio::spawn(
+            routes().with_state(state.clone()).oneshot(
+                HttpRequest::builder()
+                    .method("PUT")
+                    .uri("/set_internal_state")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"server_args": {"pp_max_micro_batch_size": 4}}"#,
+                    ))
+                    .unwrap(),
+            ),
+        );
+        let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap() else {
+            panic!("set_internal_state must submit one control request");
+        };
+        assert!(admission.try_accept());
+        assert!(matches!(request.kind, RequestKind::Control(_)));
+        request
+            .sink
+            .try_send(ResponseItem::Control(Bytes::from(
+                rmp_serde::to_vec_named(&serde_json::json!({"updated": true})).unwrap(),
+            )))
+            .unwrap();
+        let response = response.await.unwrap().unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response_json(response).await, serde_json::json!([true]));
+
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/set_internal_state")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"server_args": [1, 2]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(intake_rx.try_recv().is_err());
+    }
+
+    /// `/start_profile` takes an absent, empty, or null body as all defaults
+    /// and answers Python's text line; `/stop_profile` too; a failing rank is
+    /// a 500 carrying the scheduler's reason.
+    #[tokio::test]
+    async fn profile_routes_answer_python_text_lines() {
+        for (uri, method, body, reply, status, expected) in [
+            (
+                "/start_profile",
+                "GET",
+                "",
+                (true, ""),
+                StatusCode::OK,
+                "Start profiling.\n",
+            ),
+            (
+                "/start_profile",
+                "POST",
+                "null",
+                (true, ""),
+                StatusCode::OK,
+                "Start profiling.\n",
+            ),
+            (
+                "/start_profile",
+                "POST",
+                r#"{"num_steps": 3, "activities": ["CPU"]}"#,
+                (true, ""),
+                StatusCode::OK,
+                "Start profiling.\n",
+            ),
+            (
+                "/stop_profile",
+                "POST",
+                "",
+                (true, ""),
+                StatusCode::OK,
+                "Stop profiling. This will take some time.\n",
+            ),
+            (
+                "/stop_profile",
+                "GET",
+                "",
+                (false, "Profiler is not running"),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal Server Error",
+            ),
+        ] {
+            let (state, intake_rx, _abort_rx) = test_state(ServerArgs::default());
+            let mut builder = HttpRequest::builder().method(method).uri(uri);
+            if !body.is_empty() {
+                builder = builder.header(CONTENT_TYPE, "application/json");
+            }
+            let response = tokio::spawn(
+                routes()
+                    .with_state(state)
+                    .oneshot(builder.body(Body::from(body)).unwrap()),
+            );
+            let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap()
+            else {
+                panic!("{uri}: must submit one control request");
+            };
+            assert!(admission.try_accept());
+            request
+                .sink
+                .try_send(ResponseItem::Control(Bytes::from(
+                    rmp_serde::to_vec_named(
+                        &serde_json::json!({"success": reply.0, "message": reply.1}),
+                    )
+                    .unwrap(),
+                )))
+                .unwrap();
+            let response = response.await.unwrap().unwrap();
+            assert_eq!(response.status(), status, "{method} {uri} {body:?}");
+            let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(text.contains(expected), "{method} {uri}: {text}");
+        }
+
+        let (state, intake_rx, _abort_rx) = test_state(ServerArgs::default());
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/start_profile")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"num_steps": "many"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(intake_rx.try_recv().is_err());
+    }
+
+    /// The acknowledged routes answer Python's shapes: a text line for the
+    /// expert-distribution recorder, a JSON `null` for the others.
+    #[tokio::test]
+    async fn acknowledged_routes_answer_python_shapes() {
+        let bare = Bytes::from(
+            rmp_serde::to_vec_named(&serde_json::json!({"rid": "x", "http_worker_ipc": null}))
+                .unwrap(),
+        );
+        for (uri, body, expected) in [
+            (
+                "/start_expert_distribution_record",
+                "",
+                "Start recording the expert distribution.\n",
+            ),
+            (
+                "/stop_expert_distribution_record",
+                "",
+                "Stop recording the expert distribution.\n",
+            ),
+            (
+                "/dump_expert_distribution_record",
+                "",
+                "Dump expert distribution record.\n",
+            ),
+            ("/slow_down", r#"{"forward_sleep_time": 0.5}"#, "null"),
+            (
+                "/release_memory_occupation",
+                r#"{"tags": ["weights"]}"#,
+                "null",
+            ),
+            ("/resume_memory_occupation", "{}", "null"),
+        ] {
+            let (state, intake_rx, _abort_rx) = test_state(ServerArgs::default());
+            let mut builder = HttpRequest::builder().method("POST").uri(uri);
+            if !body.is_empty() {
+                builder = builder.header(CONTENT_TYPE, "application/json");
+            }
+            let response = tokio::spawn(
+                routes()
+                    .with_state(state)
+                    .oneshot(builder.body(Body::from(body)).unwrap()),
+            );
+            let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap()
+            else {
+                panic!("{uri}: must submit one control request");
+            };
+            assert!(admission.try_accept());
+            request
+                .sink
+                .try_send(ResponseItem::Control(bare.clone()))
+                .unwrap();
+            let response = response.await.unwrap().unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
+            assert_eq!(String::from_utf8_lossy(&bytes), expected, "{uri}");
+        }
+    }
+
+    /// The pause family answers Python's bodies: `{"message", "status"}` for
+    /// pause and continue, a text line for freeze_gc, and the weight-version
+    /// envelope with the version echoed.
+    #[tokio::test]
+    async fn pause_family_routes_answer_python_shapes() {
+        let bare =
+            Bytes::from(rmp_serde::to_vec_named(&serde_json::json!({"success": true})).unwrap());
+        for (method, uri, body, expected) in [
+            (
+                "POST",
+                "/pause_generation",
+                r#"{"mode": "in_place"}"#,
+                r#"{"message":"Generation paused successfully.","status":"ok"}"#,
+            ),
+            (
+                "POST",
+                "/continue_generation",
+                "{}",
+                r#"{"message":"Generation continued successfully.","status":"ok"}"#,
+            ),
+            ("GET", "/freeze_gc", "", "Garbage collection frozen.\n"),
+            (
+                "POST",
+                "/update_weight_version",
+                r#"{"new_version": "v2"}"#,
+                r#"{"success":true,"message":"Weight version updated to v2","new_version":"v2"}"#,
+            ),
+        ] {
+            let (state, intake_rx, _abort_rx) = test_state(ServerArgs::default());
+            let mut builder = HttpRequest::builder().method(method).uri(uri);
+            if !body.is_empty() {
+                builder = builder.header(CONTENT_TYPE, "application/json");
+            }
+            let response = tokio::spawn(
+                routes()
+                    .with_state(state)
+                    .oneshot(builder.body(Body::from(body)).unwrap()),
+            );
+            let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap()
+            else {
+                panic!("{uri}: must submit one control request");
+            };
+            assert!(admission.try_accept());
+            request
+                .sink
+                .try_send(ResponseItem::Control(bare.clone()))
+                .unwrap();
+            let response = response.await.unwrap().unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
+            assert_eq!(String::from_utf8_lossy(&bytes), expected, "{uri}");
+        }
+    }
+
+    /// A forwarded control request reaches the local scheduler under the rid
+    /// its sender encoded, and the scheduler's bytes come back as the body.
+    #[tokio::test]
+    async fn forward_control_relays_the_sender_rid_and_the_reply_bytes() {
+        let (state, intake_rx, _abort_rx) = test_state(ServerArgs::default());
+        let header = crate::message::io_struct::ControlRequest::FlushCacheReqInput(
+            crate::message::io_struct::FlushCacheReqInput::new("sender-rid".into(), Some(2.0)),
+        )
+        .encode()
+        .unwrap();
+        let response = tokio::spawn(
+            routes().with_state(state.clone()).oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri(FORWARD_PEER_PATH)
+                    .body(Body::from(header.clone()))
+                    .unwrap(),
+            ),
+        );
+        let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap() else {
+            panic!("forwarded control must submit one control request");
+        };
+        assert!(admission.try_accept());
+        assert_eq!(request.rid.as_str(), "sender-rid");
+        let RequestKind::Control(control) = &request.kind else {
+            panic!("expected a control request");
+        };
+        assert_eq!(control.encode().unwrap(), header, "relayed unchanged");
+        request
+            .sink
+            .try_send(ResponseItem::Control(Bytes::from_static(
+                b"scheduler-reply",
+            )))
+            .unwrap();
+        let response = response.await.unwrap().unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        assert_eq!(body.as_ref(), b"scheduler-reply");
+
+        // A body without a rid cannot be routed back: rejected before intake.
+        let no_rid = rmp_serde::to_vec(&("FlushCacheReqInput", (), ())).unwrap();
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri(FORWARD_PEER_PATH)
+                    .body(Body::from(no_rid))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(intake_rx.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -939,5 +2910,402 @@ mod tests {
             abort_rx.recv_async().await.unwrap(),
             crate::tokenizer_manager::wiring::AbortSource::Guard(aborted) if aborted == rid
         ));
+    }
+
+    /// The JSON body whatever the status, for the routes whose refusals
+    /// carry one.
+    async fn any_json(response: Response) -> serde_json::Value {
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    /// `/ping` answers the liveness flag and `/ready` the readiness flag,
+    /// both as bare statuses: a pause keeps `/ping` at 200 and turns
+    /// `/ready` to 503; a drain turns both.
+    #[tokio::test]
+    async fn ping_and_ready_answer_bare_flag_statuses() {
+        let (state, _intake_rx, _abort_rx) = test_state(ServerArgs::default());
+        let probe = |uri: &'static str| {
+            let app = routes().with_state(state.clone());
+            async move {
+                app.oneshot(
+                    HttpRequest::builder()
+                        .method("GET")
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        for uri in ["/ping", "/ready"] {
+            let response = probe(uri).await;
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            assert!(
+                to_bytes(response.into_body(), 16).await.unwrap().is_empty(),
+                "{uri}: empty body"
+            );
+        }
+        state.core.set_paused_for_test(true);
+        assert_eq!(probe("/ping").await.status(), StatusCode::OK);
+        assert_eq!(
+            probe("/ready").await.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        state.core.set_paused_for_test(false);
+        state.core.begin_drain(true);
+        assert_eq!(
+            probe("/ping").await.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            probe("/ready").await.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    /// `/get_hicache_l3_cache_layout` answers the merged layout as the bare
+    /// object; `/configure_logging` is Python's empty 200 and refuses an
+    /// unknown level before any rank.
+    #[tokio::test]
+    async fn l3_layout_and_configure_logging_routes_answer_python_shapes() {
+        let (state, intake_rx, _abort_rx) = test_state(ServerArgs::default());
+        let response = tokio::spawn(
+            routes().with_state(state.clone()).oneshot(
+                HttpRequest::builder()
+                    .method("GET")
+                    .uri("/get_hicache_l3_cache_layout")
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        );
+        let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap() else {
+            panic!("the layout read must submit one control request");
+        };
+        assert!(admission.try_accept());
+        let layout = serde_json::json!({"enabled": false, "hicache_object_layout": {"pools": []}, "reason": "off"});
+        request
+            .sink
+            .try_send(ResponseItem::Control(Bytes::from(
+                rmp_serde::to_vec_named(&serde_json::json!({"layout": layout})).unwrap(),
+            )))
+            .unwrap();
+        let response = response.await.unwrap().unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(any_json(response).await, layout);
+
+        let post = |body: &'static str| {
+            let app = routes().with_state(state.clone());
+            async move {
+                app.oneshot(
+                    HttpRequest::builder()
+                        .method("POST")
+                        .uri("/configure_logging")
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let response = post(r#"{"log_level": "loud"}"#).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(intake_rx.try_recv().is_err());
+        let response = post(r#"{"dump_requests_threshold": 3}"#).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(to_bytes(response.into_body(), 16).await.unwrap().is_empty());
+        assert!(intake_rx.try_recv().is_err(), "no level, no message");
+    }
+
+    /// Without `--elastic-ep-backend` both elastic routes are Python's 404,
+    /// after the body checks `/scale_elastic_ep` runs first; with one, the
+    /// state is idle and a scale is refused.
+    #[tokio::test]
+    async fn elastic_ep_routes_gate_on_the_backend() {
+        let (state, intake_rx, _abort_rx) = test_state(ServerArgs::default());
+        let scale = |state: Arc<AppState>, body: &'static str| async move {
+            let response = routes()
+                .with_state(state)
+                .oneshot(
+                    HttpRequest::builder()
+                        .method("POST")
+                        .uri("/scale_elastic_ep")
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            (status, any_json(response).await)
+        };
+        for (body, message) in [
+            ("[1]", "request body must be a JSON object"),
+            (
+                r#"{"new_ep_size": 0}"#,
+                "new_ep_size must be a positive integer",
+            ),
+            (
+                r#"{"new_ep_size": true}"#,
+                "new_ep_size must be a positive integer",
+            ),
+            (
+                r#"{"new_ep_size": "4"}"#,
+                "new_ep_size must be a positive integer",
+            ),
+        ] {
+            let (status, json) = scale(state.clone(), body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(json["error"], message, "{body}");
+        }
+        let (status, json) = scale(state.clone(), "{not json").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap()
+                .starts_with("Invalid JSON: ")
+        );
+        let (status, json) = scale(state.clone(), r#"{"new_ep_size": 8}"#).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            json["error"],
+            "elastic EP is not enabled (set --elastic-ep-backend)"
+        );
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                HttpRequest::builder()
+                    .method("GET")
+                    .uri("/is_scaling_elastic_ep")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(intake_rx.try_recv().is_err());
+
+        let mut args = ServerArgs::default();
+        args.deployment_info.elastic_ep_backend = Some("mooncake".into());
+        args.deployment_info.dp_size = 2;
+        let (state, _intake_rx, _abort_rx) = test_state(args);
+        let (status, json) = scale(state.clone(), r#"{"new_ep_size": 8}"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            json["error"],
+            "elastic EP scaling is not served by the Rust frontend"
+        );
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                HttpRequest::builder()
+                    .method("GET")
+                    .uri("/is_scaling_elastic_ep")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            any_json(response).await,
+            serde_json::json!({
+                "is_scaling_elastic_ep": false, "effective_ep_size": 2,
+                "pending_ep_size": null, "scale_phase": "idle", "last_error": null
+            })
+        );
+    }
+
+    /// `/dumper/{method}` is mounted only under `DUMPER_SERVER_PORT=reuse`;
+    /// it takes an object body (empty when absent), flattens the ranks'
+    /// responses, and answers the failures as Python's `{"error": [...]}`.
+    #[tokio::test]
+    async fn dumper_route_is_env_gated_and_flattens_rank_responses() {
+        let (state, intake_rx, _abort_rx) = test_state(ServerArgs::default());
+        let post = |state: Arc<AppState>, body: &'static str| {
+            tokio::spawn(
+                routes().with_state(state).oneshot(
+                    HttpRequest::builder()
+                        .method("POST")
+                        .uri("/dumper/get_state")
+                        .body(Body::from(body))
+                        .unwrap(),
+                ),
+            )
+        };
+        // The env is read when the router is built; the tests share one
+        // process, so the gate is only ever turned on here.
+        if std::env::var("DUMPER_SERVER_PORT").as_deref() != Ok("reuse") {
+            let response = post(state.clone(), "").await.unwrap().unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "not mounted by default"
+            );
+            unsafe { std::env::set_var("DUMPER_SERVER_PORT", "reuse") };
+        }
+        let response = post(state.clone(), "[1]").await.unwrap().unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            any_json(response).await["error"],
+            "Request body must be a JSON object."
+        );
+        assert!(intake_rx.try_recv().is_err());
+
+        let response = post(state.clone(), "");
+        let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap() else {
+            panic!("the dumper call must submit one control request");
+        };
+        assert!(admission.try_accept());
+        let RequestKind::Control(control) = &request.kind else {
+            panic!("expected a control request");
+        };
+        let rmpv::Value::Array(items) =
+            rmpv::decode::read_value(&mut &control.encode().unwrap()[..]).unwrap()
+        else {
+            panic!("positional wire");
+        };
+        assert_eq!(items[3].as_str(), Some("get_state"));
+        assert_eq!(
+            items[4],
+            rmpv::Value::Map(vec![]),
+            "an absent body is an empty object"
+        );
+        request
+            .sink
+            .try_send(ResponseItem::Control(Bytes::from(
+                rmp_serde::to_vec_named(&serde_json::json!({
+                    "success": true, "response": [{"step": 3}], "error": ""
+                }))
+                .unwrap(),
+            )))
+            .unwrap();
+        let response = response.await.unwrap().unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(any_json(response).await, serde_json::json!([{"step": 3}]));
+
+        let response = post(state, r#"{"k": 1}"#);
+        let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap() else {
+            panic!("expected a control request");
+        };
+        assert!(admission.try_accept());
+        request
+            .sink
+            .try_send(ResponseItem::Control(Bytes::from(
+                rmp_serde::to_vec_named(&serde_json::json!({
+                    "success": false, "response": [], "error": "boom"
+                }))
+                .unwrap(),
+            )))
+            .unwrap();
+        let response = response.await.unwrap().unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            any_json(response).await,
+            serde_json::json!({"error": ["boom"]})
+        );
+    }
+
+    /// `/open_session` answers the id as a bare JSON string, a refused open
+    /// as Python's `{"error": {"message"}}` 400, and `/close_session` an
+    /// empty 200; both take GET as Python does.
+    #[tokio::test]
+    async fn session_routes_answer_python_shapes() {
+        let (state, intake_rx, _abort_rx) = test_state(ServerArgs::default());
+        let send =
+            |state: Arc<AppState>, method: &'static str, uri: &'static str, body: &'static str| {
+                tokio::spawn(
+                    routes().with_state(state).oneshot(
+                        HttpRequest::builder()
+                            .method(method)
+                            .uri(uri)
+                            .header(CONTENT_TYPE, "application/json")
+                            .body(Body::from(body))
+                            .unwrap(),
+                    ),
+                )
+            };
+        let reply = |success: bool| {
+            Bytes::from(
+                rmp_serde::to_vec_named(
+                    &serde_json::json!({"session_id": "s", "success": success}),
+                )
+                .unwrap(),
+            )
+        };
+        let response = send(
+            state.clone(),
+            "GET",
+            "/open_session",
+            r#"{"capacity_of_str_len": 100, "session_id": "s"}"#,
+        );
+        let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap() else {
+            panic!("open must submit one control request");
+        };
+        assert!(admission.try_accept());
+        request
+            .sink
+            .try_send(ResponseItem::Control(reply(true)))
+            .unwrap();
+        let response = response.await.unwrap().unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response_json(response).await, serde_json::json!("s"));
+
+        let response = send(
+            state.clone(),
+            "POST",
+            "/open_session",
+            r#"{"capacity_of_str_len": 100, "session_id": "s"}"#,
+        );
+        let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap() else {
+            panic!("open must submit one control request");
+        };
+        assert!(admission.try_accept());
+        request
+            .sink
+            .try_send(ResponseItem::Control(reply(false)))
+            .unwrap();
+        let response = response.await.unwrap().unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            any_json(response).await,
+            serde_json::json!({"error": {"message": "Failed to open the session. Check if a session with the same id is still open."}})
+        );
+
+        let response = send(
+            state.clone(),
+            "POST",
+            "/open_session",
+            r#"{"capacity_of_str_len": 100, "streaming": true}"#,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            any_json(response).await["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("--enable-streaming-session")
+        );
+        assert!(intake_rx.try_recv().is_err());
+
+        let response = send(state, "POST", "/close_session", r#"{"session_id": "s"}"#);
+        let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap() else {
+            panic!("close must submit one control request");
+        };
+        assert!(admission.try_accept());
+        request
+            .sink
+            .try_send(ResponseItem::Control(Bytes::from(
+                rmp_serde::to_vec_named(&serde_json::json!({"rid": "x"})).unwrap(),
+            )))
+            .unwrap();
+        let response = response.await.unwrap().unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(to_bytes(response.into_body(), 16).await.unwrap().is_empty());
     }
 }

@@ -13,7 +13,7 @@ from sglang.test.kernels.deepseek_v4.common import (
     store_fp4_index_cache_ref,
 )
 
-register_cuda_ci(est_time=5, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=5, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 HEAD_DIM = 128
 FP4_DIM = HEAD_DIM // 2
@@ -40,6 +40,33 @@ def test_fp4_index_cache_store_layout(num_tokens: int) -> None:
 
     ref_fp4, ref_sf = quantize_fp4_indexer_ref(x)
     expected = store_fp4_index_cache_ref(ref_fp4, ref_sf, loc, num_pages)
+    torch.testing.assert_close(cache, expected)
+
+
+@pytest.mark.parametrize("dcp_rank", [0, 1, 2])
+def test_fp4_index_cache_store_dcp_owned_slots(dcp_rank: int) -> None:
+    dcp_size, num_pages = 3, 2
+    torch.manual_seed(dcp_rank)
+    widened = torch.randperm(num_pages * PAGE_SIZE * dcp_size, device=get_device())[
+        :96
+    ].to(torch.int64)
+    x = torch.randn(96, HEAD_DIM, device=get_device(), dtype=torch.bfloat16)
+    cache = torch.zeros(
+        num_pages,
+        PAGE_SIZE * (FP4_DIM + SCALE_BYTES),
+        device=get_device(),
+        dtype=torch.uint8,
+    )
+
+    store_fp4_index_k_cache(
+        x, cache, widened, page_size=PAGE_SIZE, dcp_size=dcp_size, dcp_rank=dcp_rank
+    )
+
+    owned = widened % dcp_size == dcp_rank
+    ref_fp4, ref_sf = quantize_fp4_indexer_ref(x[owned])
+    expected = store_fp4_index_cache_ref(
+        ref_fp4, ref_sf, widened[owned] // dcp_size, num_pages
+    )
     torch.testing.assert_close(cache, expected)
 
 

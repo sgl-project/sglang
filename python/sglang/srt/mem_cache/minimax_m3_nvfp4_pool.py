@@ -8,18 +8,20 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
+from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+    UnquantizedKVCacheMethod,
+)
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import (
-    GPU_MEMORY_TYPE_KV_CACHE,
     KVCache,
     MiniMaxSparseKVPool,
-    UnquantizedKVCacheMethod,
-    maybe_detect_oob,
     unwrap_write_loc,
 )
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_platform
+from sglang.srt.utils.async_probe import maybe_detect_oob
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo
@@ -109,7 +111,7 @@ def _page_row_device_pool_info(pool, pool_name) -> DevicePoolInfo:
     return DevicePoolInfo(
         pool_name=pool_name,
         indices_from_pool=PoolName.KV,
-        layer_ids=tuple(range(pool.start_layer, pool.start_layer + pool.layer_num)),
+        layer_ids=pool.model_layer_ids,
         buffer_info=PageRowBufferInfo(
             slab=pool.slab,
             rows=tuple(pool.rows),
@@ -165,6 +167,9 @@ class MiniMaxM3Nvfp4IndexKPool(KVCache):
             start_layer,
             end_layer,
             allocation_label=f"MiniMax {msa_name} index",
+        )
+        self.model_layer_ids = tuple(
+            range(self.start_layer, self.start_layer + self.layer_num)
         )
         self.source_dtype = dtype
         self.head_num = head_num
@@ -386,6 +391,9 @@ class MiniMaxM3Nvfp4MainKVPool(KVCache):
             start_layer,
             end_layer,
             allocation_label="MiniMax MSA-v1 main NVFP4",
+        )
+        self.model_layer_ids = tuple(
+            range(self.start_layer, self.start_layer + self.layer_num)
         )
         self.source_dtype = dtype
         self.head_num = head_num

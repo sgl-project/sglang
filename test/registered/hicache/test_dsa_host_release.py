@@ -7,10 +7,7 @@ from sglang.srt.mem_cache.pool_host.common import (
     _cuda_host_register,
     _cuda_host_unregister,
 )
-from sglang.srt.mem_cache.pool_host.dsa import (
-    DSAIndexerPoolHost,
-    make_dsa_indexer_pool_decl,
-)
+from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -52,7 +49,14 @@ class TestDSAHostRelease(CustomTestCase):
         )
         self.addCleanup(anchor.destroy)
         host = DSAIndexerPoolHost(
-            decl=make_dsa_indexer_pool_decl(pool), anchor_host=anchor
+            pool.get_device_pool_infos()[1].buffer_info,
+            layer_mapping={0: 0, 1: 1},
+            target_device_layer_num=pool.layer_num,
+            num_host_pages=anchor.page_num,
+            transfer_page_size=anchor.page_size,
+            layout=anchor.layout,
+            buffer_device=pool.device,
+            dtype=pool.store_dtype,
         )
         buffer = host.index_k_with_scale_buffer
         self.addCleanup(_cuda_host_unregister, buffer)
