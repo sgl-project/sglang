@@ -2,9 +2,6 @@
 
 import torch
 from sgl_kernel_npu.sparsity_driven_kv_offload import unidex_copy_inplace
-from sgl_kernel_npu.sparsity_driven_kv_offload.full_visible_planner import (
-    plan_full_visible_cache,
-)
 
 from sglang.kernels.ops.kvcache.npu_sparse_kv import prepare_sparse_kv_rows
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_budget import (
@@ -51,7 +48,12 @@ class PackedMemFabricKVPool(MemFabricKVPool):
 class C8DecodeAdapter(LIMDecodeAdapter):
     @staticmethod
     def _load_operator():
-        return torch.ops.npu.npu_quant_lightning_indexer
+        operator = getattr(
+            torch.ops.npu, "fused_quant_lightning_indexer_manage_full_visible", None
+        )
+        if operator is None:
+            raise RuntimeError("A5 C8 requires the paired fully visible LIM wheel.")
+        return operator
 
     def select(
         self,
@@ -69,37 +71,25 @@ class C8DecodeAdapter(LIMDecodeAdapter):
         layer = layer_id - manager.start_layer
         batch, width = self.prepare(manager, block_table, forward_batch, layer)
         rows = batch * width
-        lengths = self._pre_lengths[:batch]
-        topk = self.operator(
+        self.operator(
             query=query[:rows].contiguous(),
+            weights=weights[:rows],
             key=key,
-            weights=weights[:rows].contiguous(),
-            query_dequant_scale=query_scale[:rows].contiguous(),
-            key_dequant_scale=key_scale,
-            actual_seq_lengths_query=self.query_ends[width - 1, :batch],
-            actual_seq_lengths_key=lengths,
+            query_scale=query_scale[:rows].contiguous(),
+            key_scale=key_scale,
             block_table=self.block_table[:batch],
-            layout_query="TND",
-            layout_key="PA_BSND",
-            sparse_count=manager.sparse_topk,
-            sparse_mode=3,
-            query_quant_mode=0,
-            key_quant_mode=0,
-        )
-        plan_full_visible_cache(
-            topk.reshape(batch, width, manager.sparse_topk).to(torch.int32),
-            lengths,
-            self.resident_safe_slots[:batch],
-            self._pre_sparse[:batch],
-            self._pre_states[:batch] == -1,
-            manager.device_slot_map[layer],
-            manager.slot_to_source[layer],
-            self.source_ids[:rows],
-            self.device_slots[:rows],
-            self.topk_misses[:rows],
-            self.miss_sources[:batch],
-            self.miss_slots[:batch],
-            self.miss_counts[:batch],
+            query_ends=self.query_ends[width - 1, :batch],
+            lengths=self._pre_lengths[:batch],
+            cache_tokens=self._pre_cache_sizes[:batch],
+            request_state=self._pre_states[:batch],
+            pool_entries=self.resident_safe_slots[:batch],
+            slot_pool=manager.device_slot_map[layer],
+            topk_sources=self.source_ids[:rows],
+            topk_slots=self.device_slots[:rows],
+            topk_miss_counts=self.topk_misses[:rows],
+            miss_sources=self.miss_sources[:batch],
+            miss_slots=self.miss_slots[:batch],
+            miss_counts=self.miss_counts[:batch],
         )
         return self.finish(layer, batch, width)
 
@@ -205,10 +195,13 @@ class C8SparseKVCacheManager(FusedSparseKVCacheManager):
         resident = plan.resident_safe_slots.long()[:, None]
         # IndexShare consumers must use the mapping produced at the owner layer.
         source_map = self.device_slot_map[plan.owner_layer]
-        inverse = self.slot_to_source[plan.owner_layer]
         mapped = source_map[resident, pos.clamp(0, source_map.shape[1] - 1)]
-        owner = inverse[resident, mapped.clamp(0, capacity).long()]
-        mapped_ok = (mapped >= 0) & (mapped < capacity) & (owner == pos)
+        mapped_ok = (
+            (pos >= 0)
+            & (pos < source_map.shape[1])
+            & (mapped >= 0)
+            & (mapped < capacity)
+        )
         valid_now = valid[:rows].reshape_as(pos) & plan.valid_rows[:, None]
         valid_now = valid_now & torch.where(
             short[:, None], (pos >= 0) & (pos < capacity), mapped_ok

@@ -88,7 +88,6 @@ class FusedSparseKVCacheManager:
                 fill_value = None
                 if name in (
                     "device_slot_map",
-                    "slot_to_source",
                     "resident_begin",
                     "resident_end",
                 ):
@@ -102,7 +101,6 @@ class FusedSparseKVCacheManager:
                         "device_kv_buffer",
                         "device_rope_buffer",
                         "device_slot_map",
-                        "slot_to_source",
                     )
                     else spec.allocate(self.device, fill_value)
                 )

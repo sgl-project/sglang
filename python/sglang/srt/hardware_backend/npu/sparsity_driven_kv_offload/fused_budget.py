@@ -113,13 +113,6 @@ class BudgetPlan:
                 num_layers,
             )
             del self.manager_buffers["device_rope_buffer"]
-            # The final column is a write sink for inactive planner lanes.
-            self.manager_buffers["device_slot_map"] = BufferSpec(
-                (resident_rows + 1, context_len + 1), metadata_dtype, num_layers
-            )
-            self.manager_buffers["slot_to_source"] = BufferSpec(
-                (resident_rows + 1, cache_tokens + 1), metadata_dtype, num_layers
-            )
         if resident_rows < request_rows:
             self.manager_buffers["request_to_resident"] = BufferSpec(
                 (request_rows,), metadata_dtype
