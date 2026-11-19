@@ -93,13 +93,12 @@ def _local_tp_size() -> int:
     model = current_model()
     if model.local_tp_size is None:
         parallel = get_parallel()
-        if parallel.tp_size == 1 or parallel.nnodes == 1:
-            # With PP=1 the single-node launcher places every TP rank on this host.
-            model.local_tp_size = parallel.tp_size
+        if parallel.tp_size == 1:
+            model.local_tp_size = 1
         else:
             group = parallel.tp_group
+            # Ray can place TP ranks on different hosts even with nnodes=1.
             # Everyone gathers a result, even when the local proc file cannot be read.
-            # Isolated /dev/shm namespaces on the same kernel still share a RAM budget.
             host_ids = group.all_gather_object(_host_boot_id())
             if None in host_ids:
                 raise RuntimeError(

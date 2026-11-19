@@ -2783,6 +2783,13 @@ class TestTpHostBudget(CustomTestCase):
                     self._rows([0, 0], rank, budget_gb=2, nnodes=2)
                 self.assertEqual(self._rows([0, 0], rank, budget_gb=4, nnodes=2), E)
 
+    def test_one_logical_node_can_span_multiple_physical_hosts(self):
+        # A custom Ray placement group can put each TP rank on a different
+        # host while the logical launcher configuration still has nnodes=1.
+        for rank in range(2):
+            with self.subTest(rank=rank):
+                self.assertEqual(self._rows([0, 1], rank, budget_gb=2, nnodes=1), E)
+
     def test_missing_host_boot_id_fails_on_all_ranks(self):
         for rank in range(2):
             with self.subTest(rank=rank):
