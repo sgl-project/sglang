@@ -74,11 +74,11 @@ class TestEarlyPrefillPoll(CustomTestCase):
         scheduler.scheduler_stage_metrics = None
         scheduler.increment_scheduler_iterations = lambda: None
         scheduler.ingest_requests = lambda **kwargs: False
-        scheduler._engine_paused = False
+        scheduler.pause_state = SimpleNamespace(paused=False, may_launch=lambda: True)
         scheduler._deferred_input_requests = []
         scheduler.waiting_queue = SimpleNamespace(join=lambda reqs: None)
         scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(
-            pop_bootstrapped=lambda: []
+            move_bootstrapped=lambda dst: None
         )
         scheduler.running_batch = SimpleNamespace(batch_is_full=False)
         scheduler.last_batch = None
