@@ -1306,6 +1306,7 @@ class PrefillAdder:
             stats.skipped_chunks,
         )
 
+    @capacity_decision
     def budget_state(self):
         no_token = self.chunked_req_waits or not self.memory_budget.admits_more()
         if no_token:
