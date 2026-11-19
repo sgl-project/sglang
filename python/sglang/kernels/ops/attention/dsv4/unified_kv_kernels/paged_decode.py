@@ -960,8 +960,7 @@ def sparse_attn_v4_paged_decode(
         # test, so the import has to sit behind the same gate as the call.
         from aiter.ops.triton.attention.pa_decode_sparse import pa_decode_sparse
 
-        # aiter's default fills ~1024 CTAs, which over-splits small decode batches
-        # into partials the reduce then dominates; the stream override is a floor.
+        # aiter's default over-splits small batches; the stream override is a floor.
         splits = _kv_splits_heuristic(q.shape[0], q.shape[1], _GFX1250_DECODE_BLOCK_H)
         if kv_splits is not None:
             splits = max(splits, kv_splits)

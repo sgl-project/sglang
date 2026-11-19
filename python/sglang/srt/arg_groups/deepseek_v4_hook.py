@@ -117,8 +117,7 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
     """Apply DeepSeek V4 environment defaults, request limits, and validation."""
     cfg = resolving_view(server_args)
 
-    # Before hisparse / V4.1 validation reads the unified-KV gate. V4 Pro on
-    # gfx1250 selects aiter decode; model_type deepseek_v41 does not.
+    # Must run before hisparse / V4.1 validation reads the unified-KV gate.
     from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
         maybe_enable_gfx1250_v4_unified_kv,
     )

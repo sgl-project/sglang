@@ -627,8 +627,7 @@ def compress_fused_norm_rope_store(
 
 
 def _c128_arrivals(rows: int, device: torch.device) -> torch.Tensor:
-    # Per stream: concurrent launches must not share counters. Outgrown buffers are kept so
-    # captured graphs keep valid addresses; the kernel leaves every counter a multiple of its splits.
+    # Per stream; outgrown buffers are kept so captured graphs keep valid addresses.
     stream = torch.cuda.current_stream(device).cuda_stream
     bufs = get_buffer(f"dsv4_c128_arrivals:{device}:{stream}", list)
     if not bufs or bufs[-1].numel() < rows:

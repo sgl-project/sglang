@@ -46,9 +46,6 @@ class TestGfx1250V4UnifiedKvGate(CustomTestCase):
 
 
 class TestGfx1250V4UnifiedKvFp8Gate(CustomTestCase):
-    """is_unified_kv_fp8 allows gfx1250 alongside gfx95 (both carry the OCP
-    e4m3fn fp8_dtype; aiter ships gfx1250 kernels for this layout)."""
-
     def setUp(self):
         is_unified_kv_fp8.cache_clear()
 
