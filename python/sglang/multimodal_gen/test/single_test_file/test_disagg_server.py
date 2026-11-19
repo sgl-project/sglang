@@ -116,7 +116,7 @@ class DisaggCluster:
     def _alloc_ports(self) -> None:
         self.base_port = find_free_port(HOST)
         self.api_port = find_free_port(HOST)
-        self._role_ports = {role: find_free_port(HOST) for role in self.gpu_layout}
+        self._role_ports: dict[str, int] = {}
 
     # -- context manager -----------------------------------------------------
 
@@ -159,7 +159,8 @@ class DisaggCluster:
 
     def _launch_roles(self) -> None:
         for role in self.gpu_layout:
-            port = self._role_ports[role]
+            port = find_free_port(HOST)
+            self._role_ports[role] = port
             gpus = self.gpu_layout[role]
             log = _LOG_DIR / f"disagg_{self.name}_{role}.log"
             self._logs[role] = log
@@ -173,6 +174,8 @@ class DisaggCluster:
                 role,
                 "--disagg-server-addr",
                 f"tcp://{HOST}:{self.base_port}",
+                # The head connects to this exact endpoint for the lifetime of the cluster.
+                "--strict-ports",
                 "--scheduler-port",
                 str(port),
                 "--num-gpus",
@@ -205,6 +208,9 @@ class DisaggCluster:
             self.model,
             "--disagg-role",
             "server",
+            "--strict-ports",
+            "--master-port",
+            str(find_free_port(HOST)),
             "--scheduler-port",
             str(self.base_port),
             "--port",
