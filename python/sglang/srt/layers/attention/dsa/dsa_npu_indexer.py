@@ -366,7 +366,11 @@ class DSANPUIndexerMixin:
         pool = get_token_to_kv_pool()
         index_pool = getattr(pool, "full_kv_pool", pool)
         capability = getattr(index_pool, "kv_capability", None)
-        uses_metadata_indexer = capability is not None and capability.indexer_quant and capability.indexer_kv_dtype == torch.int8
+        uses_metadata_indexer = (
+            capability is not None
+            and capability.indexer_quant
+            and capability.indexer_kv_dtype == torch.int8
+        )
         shard = (
             _get_indexer_query_shard(forward_batch, bs)
             if is_prefill and not uses_prefill_cp and not uses_metadata_indexer

@@ -82,7 +82,9 @@ class TestC8BufferContracts(CustomTestCase):
         self.addCleanup(scope.restore)
         self.enterContext(get_parallel().override(attn_dcp_rank=0))
 
-    def pool(self, *, packed=True, mixed=False, indexer="auto", indexer_quant_mode=None):
+    def pool(
+        self, *, packed=True, mixed=False, indexer="auto", indexer_quant_mode=None
+    ):
         dtype = torch.int8 if packed else torch.bfloat16
         capability = resolve_kv_capability(
             kv_cache_dtype=dtype,
