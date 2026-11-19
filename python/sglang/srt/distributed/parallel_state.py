@@ -70,6 +70,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_cuda_alike,
     is_gfx95_supported,
+    is_gfx942_supported,
     is_hip,
     is_mlu,
     is_musa,
@@ -185,6 +186,16 @@ _groups: Dict[str, Callable[[], Optional["GroupCoordinator"]]] = {}
 
 def _register_group(group: "GroupCoordinator") -> None:
     _groups[group.unique_name] = weakref.ref(group)
+
+
+def _aiter_capture_registered(ca_comm) -> bool:
+    # Copy-in whenever the communicator was built for it: ranks may replay
+    # different graphs (see custom_all_reduce._enable_register_for_capturing).
+    return (
+        ca_comm.enable_register_for_capturing
+        and not envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
+        and not envs.SGLANG_AITER_CAPTURE_COPY_IN.get()
+    )
 
 
 @register_custom_op(mutates_args=["tensor"])
@@ -907,7 +918,7 @@ class GroupCoordinator:
     ) -> Optional[Tuple[torch.Tensor, ...]]:
         """Attempt fused all-reduce + RMSNorm + per-group FP8 quant.
 
-        ROCm/aiter/gfx95-only entry point. Returns ``None`` on any other
+        ROCm/aiter entry point for gfx942 and gfx95. Returns ``None`` on any other
         platform or when the aiter custom-all-reduce communicator cannot
         service the request, letting the caller fall back to the existing
         ``fused_allreduce_rmsnorm`` + separate per-group quant path.
@@ -922,7 +933,7 @@ class GroupCoordinator:
         the column-major layout the gfx95 bpreshuffle GEMM consumes, so the
         caller can skip the post-kernel scale transpose.
         """
-        if not (is_hip() and is_gfx95_supported()):
+        if not (is_hip() and (is_gfx95_supported() or is_gfx942_supported())):
             return None
 
         ca_comm = self.ca_comm
@@ -1158,6 +1169,10 @@ class GroupCoordinator:
             )
             with pynccl_comm.change_state(enable=True):
                 pynccl_comm.reduce_scatter(output, input)
+        elif _is_cpu and is_shm_available(
+            input.dtype, self.world_size, self.local_size
+        ):
+            torch.ops.sgl_kernel.shm_reduce_scatter_tensor(output, input, REDUCE_OP_SUM)
         else:
             reduce_scatter_single(output, input, group=self.device_group)
         return output
@@ -1174,7 +1189,6 @@ class GroupCoordinator:
                 .view_as(output)
             )
         elif _is_cpu:
-            # TODO: add optimized reduce_scatter_tensor kernel for cpu
             self._reduce_scatter_tensor(output, input)
         elif self._maybe_aiter_reduce_scatter(output, input):
             return
@@ -1218,13 +1232,9 @@ class GroupCoordinator:
             return False
         if getattr(ca_comm, "_IS_CAPTURING", False):
             if torch.cuda.is_current_stream_capturing():
-                if (
-                    envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
-                    or envs.SGLANG_AITER_CAPTURE_COPY_IN.get()
-                ):
-                    ca_comm.reduce_scatter(input, output, registered=False)
-                else:
-                    ca_comm.reduce_scatter(input, output, registered=True)
+                ca_comm.reduce_scatter(
+                    input, output, registered=_aiter_capture_registered(ca_comm)
+                )
             elif is_in_tc_piecewise_cuda_graph():
                 ca_comm.reduce_scatter(input, output, registered=False)
             else:
@@ -1336,13 +1346,10 @@ class GroupCoordinator:
         ):
             if getattr(ca_comm, "_IS_CAPTURING", False):
                 if torch.cuda.is_current_stream_capturing():
-                    if (
-                        envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
-                        or envs.SGLANG_AITER_CAPTURE_COPY_IN.get()
-                    ):
-                        ca_comm.all_gather_unreg(input, out=output, dim=0)
-                    else:
+                    if _aiter_capture_registered(ca_comm):
                         ca_comm.all_gather_reg(input, out=output, dim=0)
+                    else:
+                        ca_comm.all_gather_unreg(input, out=output, dim=0)
                 elif is_in_tc_piecewise_cuda_graph():
                     ca_comm.all_gather_unreg(input, out=output, dim=0)
                 else:
@@ -1369,6 +1376,10 @@ class GroupCoordinator:
             )
             with pynccl_comm.change_state(enable=True):
                 pynccl_comm.all_gather(output, input)
+        elif _is_cpu and is_shm_available(
+            input.dtype, self.world_size, self.local_size
+        ):
+            torch.ops.sgl_kernel.shm_allgather_into_tensor(output, input)
         else:
             all_gather_single(output, input, group=self.device_group)
 
@@ -1392,7 +1403,6 @@ class GroupCoordinator:
 
     def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
         if _is_cpu:
-            # TODO: add optimized all_gather_into_tensor kernel for cpu
             self._all_gather_into_tensor(output, input)
         else:
             # NPU, XPU, and CUDA all go through reg_all_gather_into_tensor (custom_op)

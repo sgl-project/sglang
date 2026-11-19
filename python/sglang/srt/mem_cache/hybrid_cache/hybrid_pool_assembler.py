@@ -238,30 +238,6 @@ def _split_hicache_size(
     )
 
 
-def _pinned_state_host_gb(hicache_size: float) -> Optional[float]:
-    """SGLANG_HICACHE_MAMBA_SIZE_GB, read only with the runtime master; None keeps
-    the proportional split."""
-    from sglang.srt.environ import envs
-
-    if not envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get():
-        return None
-    pinned = envs.SGLANG_HICACHE_MAMBA_SIZE_GB.get()
-    if pinned is None:
-        return None
-    if not 0 < pinned < hicache_size:
-        raise ValueError(
-            f"SGLANG_HICACHE_MAMBA_SIZE_GB={pinned} must lie in (0, --hicache-size "
-            f"{hicache_size})"
-        )
-    logger.info(
-        "HiCache: the Mamba state host pool takes %s of %s GB "
-        "(SGLANG_HICACHE_MAMBA_SIZE_GB)",
-        pinned,
-        hicache_size,
-    )
-    return float(pinned)
-
-
 def build_pool_entry(
     *,
     name: PoolName,
@@ -1148,9 +1124,11 @@ def build_mamba_host_pool(
         (draft_info,) = draft_pool.get_device_pool_infos()
         draft_info.buffer_info.validate(layer_ids=draft_info.layer_ids)
         draft_buffer_infos.append(draft_info.buffer_info)
+    from sglang.srt.mem_cache.pool_host.rocm_budget import mamba_host_ratio
+
     return MambaPoolHost(
         pool_info.buffer_info,
-        get_memory().hicache_ratio,
+        mamba_host_ratio(get_memory().hicache_ratio),
         host_size,
         device_capacity=_device_capacity_tokens(mamba_pool),
         mtp_draft_buffer_infos=draft_buffer_infos,
@@ -1243,14 +1221,9 @@ def build_hybrid_mamba_stack(
     kv_pool = config.root
     kv_host_size, mamba_host_size = None, 0
     if get_memory().hicache_size > 0:
-        pinned = _pinned_state_host_gb(get_memory().hicache_size)
-        if pinned is not None:
-            kv_host_size = get_memory().hicache_size - pinned
-            mamba_host_size = pinned
-        else:
-            kv_host_size, mamba_host_size = _split_hicache_size(
-                get_memory().hicache_size, (kv_pool, mamba_pool)
-            )
+        kv_host_size, mamba_host_size = _split_hicache_size(
+            get_memory().hicache_size, (kv_pool, mamba_pool)
+        )
     index_bytes = _kv_budget_index_bytes(config)
     if index_bytes and kv_host_size is not None:
         kv_bytes = sum(kv_pool.get_kv_size_bytes())
@@ -1453,30 +1426,7 @@ def build_unified_host_stack(
         envelope = None
 
     host_sizes = {s.name: 0 if s.holds_state else None for s in sub_pools}
-    pinned = None
     if memory.hicache_size > 0 and envelope is None:
-        pinned = _pinned_state_host_gb(memory.hicache_size)
-    if pinned is not None:
-        state = [s.name for s in sub_pools if s.holds_state]
-        if len(state) != 1:
-            raise ValueError(
-                "SGLANG_HICACHE_MAMBA_SIZE_GB needs one recurrent-state sub-pool, "
-                f"got {state}"
-            )
-        rest = [s.name for s in sub_pools if not s.holds_state]
-        shares = dict(
-            zip(
-                rest,
-                _split_hicache_size(
-                    memory.hicache_size - pinned,
-                    tuple(storage.view(name) for name in rest),
-                ),
-            )
-        )
-        host_sizes = {
-            name: pinned if name == state[0] else shares[name] for name in host_sizes
-        }
-    elif memory.hicache_size > 0 and envelope is None:
         host_sizes = dict(
             zip(
                 host_sizes,
@@ -1652,7 +1602,14 @@ def _build_sidecar_host_pool(
         config.buffer_info,
         layer_mapping=config.device_to_host_layer,
         target_device_layer_num=root.layer_num,
-        num_host_pages=root_host_pool.page_num,
+        # A replicated index-K spans every rank's slots, so the host mirror
+        # pages the widened transfer indices untranslated. A sharded one does
+        # not, and keeps the per-rank page count.
+        num_host_pages=(
+            root_host_pool.page_num
+            if dsa_shards_index_k()
+            else root_host_pool.page_num * root_host_pool.dcp_size
+        ),
         transfer_page_size=root_host_pool.page_size,
         layout=root_host_pool.layout,
         buffer_device=root.device,
@@ -1660,6 +1617,9 @@ def _build_sidecar_host_pool(
         layer_sharded=root.layer_shard_enabled,
         dcp_size=root_host_pool.dcp_size if dsa_shards_index_k() else 1,
         dcp_rank=root_host_pool.dcp_rank if dsa_shards_index_k() else 0,
+        # One L3 key covers the anchor's widened page either way: a sharded
+        # mirror spends one page per rank, a replicated one spends dcp_size.
+        storage_pages_per_key=(1 if dsa_shards_index_k() else root_host_pool.dcp_size),
         allocator_type=_get_allocator_type(),
     )
     host.start_layer, host.end_layer = root.start_layer, root.end_layer
@@ -2006,9 +1966,9 @@ def build_hicache_draft_sidecars(
 
     assert len(draft_device_pools) == 1
     draft_kv_pool = draft_device_pools[0]
+    router = draft_kv_pool.layer_router
     if (
-        draft_kv_pool.layer_router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None
-        or isinstance(draft_kv_pool, DeepSeekV4TokenToKVPool)
+        isinstance(draft_kv_pool, DeepSeekV4TokenToKVPool)
         or draft_kv_pool.follows_target_swa_ids
     ):
         return build_swa_draft_pools(
@@ -2016,10 +1976,23 @@ def build_hicache_draft_sidecars(
             tree_cache=tree_cache,
             target_window_host=target_window_host_pool(tree_cache),
         )
-    return build_full_draft_pools(
+    if router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is None:
+        return build_full_draft_pools(
+            draft_kv_pool=draft_kv_pool, tree_cache=tree_cache
+        )
+    # A hybrid draft keeps full-attention layers next to its SWA layers;
+    # both must be restored or the draft reads stale KV after a hit.
+    specs, entries = build_swa_draft_pools(
         draft_kv_pool=draft_kv_pool,
         tree_cache=tree_cache,
+        target_window_host=target_window_host_pool(tree_cache),
     )
+    if router.routes_to(IdSpaceKind.FULL):
+        full_specs, full_entries = build_full_draft_pools(
+            draft_kv_pool=router.view(IdSpaceKind.FULL), tree_cache=tree_cache
+        )
+        specs, entries = full_specs + specs, full_entries + entries
+    return specs, entries
 
 
 _COMPONENT_HOST_ATTR: dict[ComponentType, tuple[str, str]] = {
