@@ -1,20 +1,16 @@
 # Hybrid Linear branch and tail checkpoints: GDN implementation
 
-[SGLang #50059](https://github.com/sgl-project/sglang/pull/50059) describes an
-SWA failure mode where a branch-only checkpoint leaves the computed prompt-end
-window unavailable to later turns. Its consecutive-miss diagnosis concerns
-single-chunk prefill followed by Decode beyond one SWA window.
+A continuation can repeat prefill for a prompt tail that the previous request
+already computed. On the affected Mamba/Linear `extra_buffer` path, the final
+Prefill extend can use its single tracked state boundary for an interior
+branch. The branch remains reusable, while the computed aligned tail has no
+separate recoverable state. Each boundary needs its own convolution history
+and recurrent state at the same token depth.
 
-The affected Mamba/Linear `extra_buffer` path has a related placement constraint:
-an interior branch can occupy the final Prefill extend's single tracked state
-boundary, leaving its computed aligned tail without a separate recoverable
-state. Each boundary needs its own convolution history and recurrent state at
-the same token depth.
-
-This patch implements that pattern for GDN: it captures the branch into one
-spare state slot while native tracking captures the aligned tail in the same
-forward, without splitting the extend. Both states are captured in that forward;
-publication follows the existing checkpoint policy.
+This opt-in GDN implementation captures both states during the same final
+Prefill extend. It uses a spare slot for the branch and native tracking for the
+aligned tail, then publishes them according to the existing checkpoint policy.
+It does not split the extend or add another model forward.
 
 The registered TP1/TP2 reproduction uses a 6,049-token producer and a continuation
 with an additional 64-token suffix:
@@ -27,10 +23,17 @@ with an additional 64-token suffix:
 | Continuation tokens to prefill (6,113 minus cached) | 161 | 97 |
 
 Short Decode here means one or 32 generated tokens. Branch and continuation
-probes independently rebuild the initial tree. These results demonstrate
-separate branch and aligned-tail reuse; they do not establish the consecutive
-miss chain measured in #50059. The 128-token Decode result and publication
-limitations are described below.
+probes independently rebuild the initial tree. The 128-token Decode result and
+publication limitations are described below.
+
+A related loss of computed-tail reuse was addressed for SWA in
+[SGLang #50059](https://github.com/sgl-project/sglang/pull/50059): a branch
+checkpoint could leave the prompt-end window outside the cache tree and
+unavailable to later turns. That diagnosis concerns single-chunk prefill
+followed by Decode beyond one SWA window. It supports the motivation to preserve
+the computed tail alongside a branch. Our Linear tests demonstrate separate
+branch and aligned-tail reuse; they do not establish the consecutive-miss chain
+reported there.
 
 Enable it with `SGLANG_EXPERIMENTAL_GDN_BRANCH_AND_TAIL=1`. It defaults to
 disabled. The first supported configuration uses the
