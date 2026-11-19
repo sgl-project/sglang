@@ -556,6 +556,10 @@ class ExecMamba(msgspec.Struct):
             choices=["float32", "bfloat16", "float16"],
         ),
     ] = None
+    enable_gdn_fp32_snapshots: A[
+        bool,
+        "Preserve FP32 GDN prefix-cache snapshots with FP32 SSM states and FP16/BF16 activations. Defaults to the existing activation-dtype snapshot path.",
+    ] = False
     # Deprecated spelling; `--hybrid-cache-checkpoints-level 2` replaces it.
     # Its only command-line entry is the deprecated registration in server_args.
     mamba_max_states_per_path: A[

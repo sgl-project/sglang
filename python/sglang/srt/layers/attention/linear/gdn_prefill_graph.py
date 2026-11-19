@@ -78,6 +78,7 @@ class GDNPrefillGraphMetadata(msgspec.Struct, frozen=True):
     conv_block_table: torch.Tensor  # [max_conv_blocks, 2] (seq, block)
     track_mode: torch.Tensor  # [max_seqs]
     track_h_row: torch.Tensor  # [max_seqs] row of the per-chunk states h
+    track_chunk_idx: torch.Tensor | None  # [max_seqs], selected FP32 snapshots
     track_conv_start: torch.Tensor  # [max_seqs]
     num_logical_tokens: torch.Tensor  # [1]
     host: np.ndarray  # int32 staging for `packed`
@@ -96,6 +97,7 @@ class GDNPrefillGraphMetadata(msgspec.Struct, frozen=True):
         track: bool,
         cache_index_dtype: torch.dtype,
         device: torch.device,
+        fp32_snapshots: bool = False,
     ) -> GDNPrefillGraphMetadata:
         max_seqs = max(1, min(num_tokens, max_seqs_cap))
         max_chunks = triton.cdiv(num_tokens, GDN_CHUNK_SIZE) + max_seqs
@@ -109,6 +111,7 @@ class GDNPrefillGraphMetadata(msgspec.Struct, frozen=True):
             max_seqs,  # track_h_row
             max_seqs,  # track_conv_start
             1,  # num_logical_tokens
+            max_seqs if fp32_snapshots else 0,  # track_chunk_idx
         ]
         packed = torch.zeros(sum(sizes), dtype=torch.int32, device=device)
         views = torch.split(packed, sizes)
@@ -125,6 +128,7 @@ class GDNPrefillGraphMetadata(msgspec.Struct, frozen=True):
             conv_block_table=views[3].view(max_conv_blocks, 2),
             track_mode=views[4],
             track_h_row=views[5],
+            track_chunk_idx=views[8] if fp32_snapshots else None,
             track_conv_start=views[6],
             num_logical_tokens=views[7],
             host=np.zeros(sum(sizes), dtype=np.int32),
@@ -204,11 +208,18 @@ class GDNPrefillGraphMetadata(msgspec.Struct, frozen=True):
 
         track_mode = np.zeros(self.max_seqs, dtype=np.int64)
         track_h_row = np.zeros(self.max_seqs, dtype=np.int64)
+        track_chunk_idx = (
+            np.full(self.max_seqs, -1, dtype=np.int64)
+            if self.track_chunk_idx is not None
+            else None
+        )
         track_conv_start = np.zeros(self.max_seqs, dtype=np.int64)
         if track_rows is not None:
             # Same source rows as the eager plan: h_offsets[row] + chunk.
             for row, chunk in track_rows.chunk_rows:
                 track_h_row[row] = offsets[row] + chunk
+                if track_chunk_idx is not None:
+                    track_chunk_idx[row] = chunk
                 track_mode[row] = TRACK_CHUNK_STATE
             for row in track_rows.final_rows:
                 track_mode[row] = TRACK_FINAL_STATE
@@ -218,6 +229,8 @@ class GDNPrefillGraphMetadata(msgspec.Struct, frozen=True):
         o = self._write(o=o, values=track_h_row)
         o = self._write(o=o, values=track_conv_start)
         o = self._write(o=o, values=np.array([total]))
+        if track_chunk_idx is not None:
+            o = self._write(o=o, values=track_chunk_idx)
         assert o == self.host.shape[0]
 
     def _write(self, *, o: int, values: np.ndarray) -> int:

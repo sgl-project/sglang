@@ -7,8 +7,8 @@ the bucket's fixed row bound and read a per-row mode instead:
 * ``track_mode[r] == 0``: row ``r`` is not tracked (or is padding); no-op.
 * ``track_mode[r] == 1``: the tracked length is chunk aligned; the snapshot is
   the post-extend state of the row's own cache slot.
-* ``track_mode[r] == 2``: the snapshot is the chunk-boundary state stored in
-  ``h[track_h_row[r]]`` (activation dtype), as the eager Triton path reads it.
+* ``track_mode[r] == 2``: read the selected FP32 snapshot, or the activation-dtype
+  chunk state when FP32 snapshots are disabled.
 
 Every tracked row also snapshots its conv window: the ``STATE_LEN`` raw
 pre-conv input rows ending at the tracked boundary.
@@ -65,9 +65,9 @@ def _gdn_track_conv_window_kernel(
 @triton.jit
 def _gdn_track_ssm_kernel(
     ssm_pool,  # [slots, ...] per-slot contiguous
-    h,  # [chunks, ...] per-chunk states
+    h,  # Selected FP32 snapshots or activation-dtype chunk states
     track_mode,  # [rows] int32
-    track_h_row,  # [rows] int32 row of h holding the chunk-boundary state
+    track_h_row,  # None for selected snapshots
     track_dst,  # [rows] int64 physical track slot
     cache_indices,  # [rows] physical cache slot of the row
     stride_ssm_slot,
@@ -86,8 +86,8 @@ def _gdn_track_ssm_kernel(
         src = tl.load(cache_indices + r).to(tl.int64)
         val = tl.load(ssm_pool + src * stride_ssm_slot + offs, mask=mask)
     else:
-        row = tl.load(track_h_row + r).to(tl.int64)
-        val = tl.load(h + row * stride_h_row + offs, mask=mask)
+        row = r if track_h_row is None else tl.load(track_h_row + r)
+        val = tl.load(h + row.to(tl.int64) * stride_h_row + offs, mask=mask)
         val = val.to(ssm_pool.dtype.element_ty)
     tl.store(ssm_pool + dst * stride_ssm_slot + offs, val, mask=mask)
 
@@ -127,16 +127,16 @@ def gdn_track_ssm_state(
     ssm_pool: torch.Tensor,
     h: torch.Tensor,
     track_mode: torch.Tensor,
-    track_h_row: torch.Tensor,
+    track_h_row: torch.Tensor | None,
     track_dst: torch.Tensor,
     cache_indices: torch.Tensor,
 ) -> None:
-    """Snapshot the tracked rows' SSM state into their track slots (mode 1:
-    the row's final state, mode 2: its chunk-boundary state in ``h``)."""
+    """Copy final states or selected boundary snapshots to track slots."""
     rows = track_mode.shape[0]
     numel = ssm_pool[0].numel()
     assert ssm_pool[0].is_contiguous(), "per-slot SSM state must be contiguous"
-    h = h.flatten(0, 1)
+    if track_h_row is not None:
+        h = h.flatten(0, 1)
     assert h[0].is_contiguous() and h[0].numel() == numel
     block = 1024
     _gdn_track_ssm_kernel[(rows, triton.cdiv(numel, block))](

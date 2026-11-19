@@ -182,6 +182,8 @@ class TritonAttnBackend(AttentionBackend):
     # kv_indptr/qo_indptr are preallocated at (req pool + 1); an extend batch
     # can never carry more seqs than the pool.
     extend_dummy_seqs_capped_by_req_pool: bool = True
+    # note (wirybeaver): unify prefill without changing decode splitting.
+    use_unified_prefill: bool = False
 
     # Set for gfx950 draft workers by triton_draft_hip.init_draft_backend.
     draft_bf16_dot: bool = False
@@ -1939,8 +1941,8 @@ class TritonAttnBackend(AttentionBackend):
                 q, k, v, layer, forward_batch, causal, logits_soft_cap, sinks
             )
 
-        # Deterministic mode: use unified 1-stage kernel
-        if self.enable_deterministic:
+        # Unified prefill reads the cached prefix and new suffix from the same KV pool.
+        if self.enable_deterministic or self.use_unified_prefill:
             return self._forward_extend_unified(
                 q,
                 o,

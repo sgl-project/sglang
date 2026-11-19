@@ -46,6 +46,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
     supports_strided_target_verify_qkv: bool = True
     # The chunk kernel steps slots by the pool's stride(0) in int64.
     extend_honors_slot_pitch: bool = True
+    supports_track_state_snapshot: bool = not (is_cpu() or is_npu() or is_xpu())
 
     def packed_decode(
         self,
@@ -206,6 +207,14 @@ class TritonGDNKernel(LinearAttnKernelBase):
                 "chunk_indices": kwargs["chunk_indices"],
                 "chunk_offsets": kwargs["chunk_offsets"],
             }
+        snapshot_arguments = (
+            {
+                "track_state": kwargs.get("track_state"),
+                "track_chunk_idx": kwargs.get("track_chunk_idx"),
+            }
+            if self.supports_track_state_snapshot
+            else {}
+        )
         if is_cpu():
             if not inplace_update:
                 raise NotImplementedError(
@@ -237,6 +246,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
             **inplace_update_args,
             **graph_table_args,
             **output_args,
+            **snapshot_arguments,
         )
 
     def target_verify(
