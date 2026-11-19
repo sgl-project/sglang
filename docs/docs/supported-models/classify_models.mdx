@@ -5,43 +5,7 @@ This document describes the `/v1/classify` API endpoint implementation in SGLang
 
 ## Overview
 
-Classify text with a supported model and get scores for every class. The shape of `label` depends on whether the model predicts one or multiple classes and whether it classifies the whole input or each token.
-
-### Multi-label classification
-
-If your checkpoint's `config.json` declares `"problem_type": "multi_label_classification"`, `/v1/classify` applies an elementwise sigmoid to its logits. Each entry in `probs` is an independent class probability, so the entries do not need to sum to one. For example, logits `[2.0, 2.0]` produce probabilities of approximately `[0.880797, 0.880797]`.
-
-For a multi-label sequence classifier, `label` is an array of classes whose score is at least the request's `threshold`, in class ID order. The threshold defaults to `0.5`. For example, scores of `0.92` for `billing` and `0.88` for `urgent` return `"label": ["billing", "urgent"]` at the default threshold. If no score meets the threshold, `label` is an empty array. If your client served a multi-label checkpoint before this change, update it to accept an array in `label`.
-
-For `single_label_classification` or an unset `problem_type`, the endpoint applies softmax. If a supported checkpoint explicitly declares `"problem_type": "regression"`, `probs` contains the raw regression scores. These scores may fall outside the range from 0 to 1.
-
-### Token classification
-
-For supported models that return logits for each input token, each result in `data` contains a `probs` matrix with shape `[num_tokens, num_classes]`. Rows follow input token order, including special tokens. `num_classes` counts classes, and `index` identifies the input in the batch. Inputs in the same batch can have different token counts.
-
-For single-label token classification, `label` is an array with the highest-scoring class for each token. For multi-label token classification, `label` contains one array of qualifying classes per token, including an empty array for any token whose scores fall below the threshold. The activation follows the same `problem_type` rule for each token.
-
-Here is an example `data` entry for a multi-label classifier with two input tokens and two classes.
-
-```json
-{
-  "index": 0,
-  "label": [["LABEL_0", "LABEL_1"], []],
-  "probs": [[0.880797, 0.817574], [0.119203, 0.182426]],
-  "num_classes": 2
-}
-```
-
-You can provide token IDs through the `input` field when you need to control token positions:
-
-```json
-{
-  "model": "MODEL_PATH",
-  "input": [1, 2]
-}
-```
-
-Replace `MODEL_PATH` with your served model name. This response format preserves per-token scores; it does not merge tokens into entity spans.
+The classification API allows you to classify text inputs using classification models. This implementation follows the same format as vLLM's 0.7.0 classification API.
 
 ## API Endpoint
 
@@ -65,7 +29,7 @@ POST /v1/classify
 - `user` (string, optional): User identifier for tracking
 - `rid` (string, optional): Request ID for tracking
 - `priority` (integer, optional): Request priority
-- `threshold` (number, optional): Minimum score for a positive label in multi-label classification. Accepts values from `0` to `1`, inclusive. Defaults to `0.5`.
+- `threshold` (number, optional): Minimum score for a positive label on multi-label models (0 to 1, default 0.5).
 
 ## Response Format
 
@@ -100,8 +64,8 @@ POST /v1/classify
 - `model`: The model used for classification
 - `data`: Array of classification results
   - `index`: Index of the result
-  - `label`: The highest-scoring class for each prediction position, or all classes at or above the threshold for a multi-label model. Token results contain one entry per token.
-  - `probs`: Scores in class ID order. Sequence results return one vector, and token results return one vector per token.
+  - `label`: Top class for single-label models, or an array of classes at or above `threshold` for multi-label models. Token models return one such entry per token.
+  - `probs`: Scores in class ID order, with one row per token for token models. The checkpoint's `problem_type` selects sigmoid for multi-label classification, raw scores for regression, and softmax otherwise.
   - `num_classes`: Total number of classes
 - `usage`: Token usage information
   - `prompt_tokens`: Number of input tokens
@@ -161,7 +125,7 @@ The classification API works with any classification model supported by SGLang, 
 - `Qwen2ForRewardModel` - Single reward score
 - `LlamaForSequenceClassificationWithNormal_Weights` - Special reward model
 
-**Note**: The `/classify` endpoint in SGLang was originally designed for reward models but now supports all non-generative models. Use `/v1/classify` for the classification response format described here.
+**Note**: The `/classify` endpoint in SGLang was originally designed for reward models but now supports all non-generative models. Our `/v1/classify` endpoint provides a standardized vLLM-compatible interface for classification tasks.
 
 ## Error Handling
 
@@ -196,4 +160,4 @@ python test_classify_api.py
 
 ## Compatibility
 
-Single-label sequence responses use a string `label`. Clients switching from vLLM or an earlier SGLang release should accept arrays in `label` when serving multi-label or token classifiers.
+Single-label sequence responses use a string `label`. Clients upgrading from an earlier SGLang release or switching from vLLM should accept arrays in `label` when serving multi-label or token classifiers.
