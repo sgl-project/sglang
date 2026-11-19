@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import contextlib
 import logging
+from bisect import bisect_right
+from math import isqrt
 from typing import TYPE_CHECKING, Any, Dict, List, NamedTuple, Optional, Tuple, Union
 
 import torch
@@ -2222,13 +2224,36 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             and sum(extend_lens) == q_offset
             and min(extend_lens) >= 0
         ):
-            ext = torch.tensor(extend_lens, dtype=torch.int64)
-            row_req_start = torch.repeat_interleave(torch.cumsum(ext, 0) - ext, ext)
-            row_pos = torch.arange(q_offset, dtype=torch.int64) - row_req_start
-            row_kv = torch.repeat_interleave(seq - ext, ext) + row_pos + 1
-            cum = torch.cumsum(row_kv.clamp_(min=1), 0)
-            targets = cum[-1] * torch.arange(1, tp, dtype=torch.int64) // tp
-            cuts = torch.searchsorted(cum, targets, right=True).tolist()
+            # Within each request, row cost is max(prefix + position + 1, 1).
+            # Its cumulative cost is a flat head followed by an arithmetic
+            # series. Keep only request boundaries, not one tensor entry per
+            # query row; the exact inverse finds the same right-side cut.
+            rows = [0]
+            costs = [0]
+            plans = []
+            for length, ext in zip(seq.tolist(), extend_lens):
+                prefix = length - ext
+                flat = min(ext, max(0, -prefix))
+                tail = ext - flat
+                a = 2 * (prefix + flat) + 1
+                plans.append((flat, a))
+                rows.append(rows[-1] + ext)
+                costs.append(costs[-1] + flat + tail * (a + tail) // 2)
+
+            cuts = []
+            for r in range(1, tp):
+                target = costs[-1] * r // tp
+                req = bisect_right(costs, target) - 1
+                budget = target - costs[req]
+                flat, a = plans[req]
+                # Tail cost for n rows is n * (a + n) / 2. Use integer
+                # sqrt to find the largest n whose cost is within budget.
+                n = (
+                    budget
+                    if budget < flat
+                    else flat + (isqrt(a * a + 8 * (budget - flat)) - a) // 2
+                )
+                cuts.append(rows[req] + n)
         else:
             cuts = [q_offset * r // tp for r in range(1, tp)]
         bounds = [0]
