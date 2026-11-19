@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.dsa_token_shard_layout import (
     DsaTokenShardPlan,
     cumulative,
@@ -238,3 +239,115 @@ def dsa_token_shard_restore_tokens(
     if num_rows > plan.num_tokens:
         out[plan.num_tokens :].zero_()
     return out
+
+
+def dsa_cp_stream_o_proj() -> bool:
+    return envs.SGLANG_NPU_STREAM_O_PROJ.get()
+
+
+def _validate_dsa_cp_token_sharded(model, spec_algorithm):
+    from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+    from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+    from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
+
+    parallel = get_parallel()
+    if not dsa_token_shard_enabled():
+        raise ValueError("DSA-CP token sharding requires NPU and attention TP > 1")
+    if not parallel.dcp_enabled:
+        raise ValueError("DSA-CP token sharding requires DCP")
+    if parallel.dcp_replicate_q_proj:
+        raise ValueError(
+            "DSA-CP token sharding and --dcp-replicate-q-proj use different "
+            "groups for the same cached weights; enable only one"
+        )
+    if not get_moe_a2a_backend().is_none():
+        raise ValueError("DSA-CP token sharding requires the tensor-parallel MoE path")
+    if spec_algorithm is not None and not spec_algorithm.is_none():
+        raise ValueError("DSA-CP token sharding does not support speculative decoding")
+    if is_dp_attention_enabled():
+        raise ValueError("DSA-CP token sharding does not support DP attention")
+    if parallel.enable_prefill_cp:
+        raise ValueError("DSA-CP token sharding does not support prefill CP")
+    if envs.SGLANG_NPU_USE_MLAPO.get():
+        raise ValueError("DSA-CP token sharding does not support MLAPO")
+    if envs.SGLANG_SHARED_EXPERT_TP1.get():
+        raise ValueError("DSA-CP token sharding does not support TP1 shared experts")
+
+    layers = [
+        module
+        for module in model.modules()
+        if isinstance(module, DeepseekV2AttentionMLA) and module.use_dsa
+    ]
+    if not layers:
+        raise ValueError("DSA-CP token sharding requires a model with DSA layers")
+    if any(module.w_kc is None or not module.has_q_b_proj for module in layers):
+        raise ValueError(
+            "DSA-CP token sharding requires MLA q_b/kv_b weights on every DSA layer"
+        )
+    return layers
+
+
+def _dequantized_linear_weight(layer, input_size, device, dtype) -> torch.Tensor:
+    output = layer(torch.eye(input_size, device=device, dtype=dtype))[0]
+    return output.t().contiguous()
+
+
+def prepare_dsa_cp_token_sharded(*, model, device, dtype, spec_algorithm) -> None:
+    """Prepare full-head attention weights for the opt-in DCP residual rebuild."""
+    if not envs.SGLANG_NPU_DSA_CP_TOKEN_SHARDED.get():
+        return
+    layers = _validate_dsa_cp_token_sharded(model, spec_algorithm)
+    tp_group = get_parallel().attn_tp_group
+    stream_o_proj = dsa_cp_stream_o_proj()
+    for module in layers:
+        q_b = _dequantized_linear_weight(
+            module.q_b_proj, module.q_lora_rank, device, dtype
+        )
+        module.q_b_proj_qrep_weight = tp_group.all_gather(q_b, dim=0)
+        module.w_kc_qrep = tp_group.all_gather(module.w_kc.contiguous(), dim=0)
+        module.w_vc_qrep = tp_group.all_gather(module.w_vc.contiguous(), dim=0)
+        o_proj = _dequantized_linear_weight(
+            module.o_proj, module.o_proj.input_size_per_partition, device, dtype
+        )
+        if stream_o_proj:
+            module.o_proj_stream_shard = o_proj
+        else:
+            module.o_proj_qrep_weight = tp_group.all_gather(o_proj, dim=1)
+
+
+def select_dsa_cp_token_sharded(forward_batch) -> bool:
+    """Decide once, after the DCP gather plan and before the model forward."""
+    metadata = forward_batch.attn_dcp_metadata
+    if (
+        not envs.SGLANG_NPU_DSA_CP_TOKEN_SHARDED.get()
+        or metadata.extend_gather_plan is None
+        or get_dsa_token_shard_plan(forward_batch) is None
+    ):
+        return False
+
+    from sglang.srt.layers.logits_processor import extend_reads_input_logprobs
+
+    # Input logprobs consume hidden states at positions outside the logits tail.
+    if extend_reads_input_logprobs(forward_batch):
+        return False
+
+    from sglang.srt.model_executor.runner import get_is_capture_mode
+
+    if get_is_capture_mode():
+        raise RuntimeError(
+            "DSA-CP token sharding cannot capture an extend graph; "
+            "its collectives depend on the batch token grid"
+        )
+    return True
+
+
+def dsa_cp_gather_token_rows(
+    x: torch.Tensor, forward_batch: "ForwardBatch"
+) -> torch.Tensor:
+    """Restore full token rows from this rank's contiguous attention-TP slice."""
+    plan = get_dsa_token_shard_plan(forward_batch)
+    if plan is None:
+        raise RuntimeError("DSA-CP token sharding lost its forward plan")
+    full = x.new_empty((plan.num_tokens_pad,) + x.shape[1:])
+    get_parallel().attn_tp_group.all_gather_into_tensor(full, x)
+    return full[: plan.num_tokens]

@@ -36,6 +36,7 @@ import torch
 
 from sglang.srt.layers.attention.dsa.dsa_token_shard import (
     _build_dsa_token_shard_plan,
+    dsa_cp_gather_token_rows,
     dsa_token_shard_cumulative_query_lens,
     dsa_token_shard_key_lens,
     dsa_token_shard_redistribute_heads,
@@ -46,6 +47,7 @@ from sglang.srt.layers.attention.dsa.dsa_token_shard_layout import (
     cumulative,
     plan_dsa_token_shard,
 )
+from sglang.srt.layers.layer_boundary.ops import slice_dcp_token_residual
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -458,6 +460,45 @@ class TestTokenShardPlumbing(CustomTestCase):
         again = dsa_token_shard_cumulative_query_lens(batch, plan, torch.device("cpu"))
         self.assertIs(again, out)
 
+    def test_dcp_token_gather_restores_order_and_trims_padding(self):
+        full = torch.arange(17 * 3).reshape(17, 3)
+        plans = [plan_dsa_token_shard([17], [117], 4, rank) for rank in range(4)]
+        sends = [dsa_token_shard_slice(full, plan) for plan in plans]
+        gather = mock.Mock(side_effect=lambda out, local: out.copy_(torch.cat(sends)))
+        parallel = types.SimpleNamespace(
+            attn_tp_group=types.SimpleNamespace(all_gather_into_tensor=gather)
+        )
+        for rank, plan in enumerate(plans):
+            with (
+                mock.patch(
+                    "sglang.srt.layers.attention.dsa.dsa_token_shard.get_dsa_token_shard_plan",
+                    return_value=plan,
+                ),
+                mock.patch(
+                    "sglang.srt.layers.attention.dsa.dsa_token_shard.get_parallel",
+                    return_value=parallel,
+                ),
+            ):
+                got = dsa_cp_gather_token_rows(sends[rank], types.SimpleNamespace())
+            torch.testing.assert_close(got, full)
+            self.assertIs(gather.call_args.args[1], sends[rank])
+
+    def test_dcp_residual_slice_uses_equal_padded_rows(self):
+        for num_rows in (17, 20):
+            full = torch.arange(num_rows * 3).reshape(num_rows, 3)
+            for rank in range(4):
+                with self.subTest(num_rows=num_rows, rank=rank):
+                    plan = plan_dsa_token_shard([17], [117], 4, rank)
+                    stream = types.SimpleNamespace(residual=full)
+                    with get_parallel().override(attn_tp_size=4, attn_tp_rank=rank):
+                        slice_dcp_token_residual(stream, torch.zeros(5, 3))
+                    expected = (
+                        dsa_token_shard_slice(full, plan)
+                        if num_rows == 17
+                        else full[rank * 5 : (rank + 1) * 5]
+                    )
+                    torch.testing.assert_close(stream.residual, expected)
+
 
 def _npu_mla_module():
     """Import the NPU MLA module on CPU CI.
@@ -493,6 +534,36 @@ def _npu_mla_module():
         for name in fakes:
             sys.modules.pop(name, None)
     return module
+
+
+class TestStreamedOProjReassembly(CustomTestCase):
+    def test_rank_major_gather_matches_full_input_dimension(self):
+        mod = _npu_mla_module()
+        tp, out_features, local_in = 3, 4, 2
+        shards = [
+            torch.arange(out_features * local_in).reshape(out_features, local_in)
+            + rank * 100
+            for rank in range(tp)
+        ]
+        rank = 1
+        gather = mock.Mock(
+            side_effect=lambda out, local: out.copy_(torch.stack(shards))
+        )
+        parallel = types.SimpleNamespace(
+            attn_tp_size=tp,
+            attn_tp_group=types.SimpleNamespace(all_gather_into_tensor=gather),
+        )
+        module = types.SimpleNamespace(o_proj_stream_shard=shards[rank], layer_id=0)
+        with (
+            mock.patch.object(
+                mod.runtime_context, "get_parallel", return_value=parallel
+            ),
+            mock.patch.object(mod, "_o_proj_slots", [None, None]),
+            mock.patch.object(mod, "_o_proj_gather_slots", [None, None]),
+        ):
+            got = mod._dcp_o_proj_weight(module)
+        torch.testing.assert_close(got, torch.cat(shards, dim=1))
+        self.assertIs(gather.call_args.args[1], shards[rank])
 
 
 class TestReusedTopkAcrossPpStage(CustomTestCase):

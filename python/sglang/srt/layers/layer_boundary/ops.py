@@ -32,6 +32,7 @@ from sglang.srt.layers.cp.utils import (
     cp_gather_full_sequence_states,
     cp_shard_hidden_states,
 )
+from sglang.srt.layers.dcp.metadata import dcp_token_sharded
 from sglang.srt.layers.dp_attention import (
     attn_cp_reduce_scatter_tensor,
     attn_tp_all_gather_into_tensor,
@@ -154,6 +155,24 @@ def attn_tp_reduce_scatter(
     return local_hidden_states
 
 
+def slice_dcp_token_residual(stream, output: torch.Tensor) -> None:
+    residual = stream.residual
+    if residual is None or residual.shape[0] == output.shape[0]:
+        return
+    parallel = get_parallel()
+    start = parallel.attn_tp_rank * output.shape[0]
+    local = residual[start : start + output.shape[0]]
+    if local.shape[0] > output.shape[0]:
+        raise RuntimeError("DCP token-sharded residual exceeds the attention rows")
+    if local.shape[0] < output.shape[0]:
+        # Attention collectives pad every rank to the same row count.
+        padding = residual.new_zeros(
+            (output.shape[0] - local.shape[0], *residual.shape[1:])
+        )
+        local = torch.cat((local, padding), dim=0)
+    stream.residual = local
+
+
 def attn_cp_interleave_reduce_scatter(hidden_states: torch.Tensor):
     """Sum rank-major output onto each rank's equal, padded interleave shard."""
     cp_size = get_parallel().attn_cp_size
@@ -226,6 +245,8 @@ def sum_output(
     may_quantize: bool,
 ) -> torch.Tensor:
     """Complete the sum an output owes over ``group`` on the rows it is on."""
+    if dcp_token_sharded(forward_batch):
+        return attn_tp_reduce_scatter(hidden_states)
     parallel = get_parallel()
     if group is SumGroup.ATTN_TP:
         if parallel.attn_tp_size == 1:

@@ -72,7 +72,10 @@ from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.amx_utils import PackWeightMethod
 from sglang.srt.layers.attention.dsa.dsa_fp4_indexer import dsa_indexer_cls
 from sglang.srt.layers.attention.dsa.dsa_indexer_kpool import IndexerKPool
-from sglang.srt.layers.attention.dsa.dsa_token_shard import dsa_token_shard_enabled
+from sglang.srt.layers.attention.dsa.dsa_token_shard import (
+    dsa_cp_gather_token_rows,
+    dsa_token_shard_enabled,
+)
 from sglang.srt.layers.attention.dsa.utils import (
     maybe_prefetch_next_full_attention_kv,
 )
@@ -87,6 +90,7 @@ from sglang.srt.layers.cp.cp_decode_attn_tp import (
     get_cp_decode_attn_tp_ctx,
 )
 from sglang.srt.layers.cp.utils import cp_gather_full_sequence_states
+from sglang.srt.layers.dcp.metadata import dcp_token_sharded
 from sglang.srt.layers.dcp.planner import (
     prepare_decode_context_parallel_metadata,
 )
@@ -99,6 +103,7 @@ from sglang.srt.layers.layer_boundary import (
     get_attn_tp_context,
     is_dense_ffn_fully_dp,
 )
+from sglang.srt.layers.layer_boundary.adapters.attention import attn_tp_gather
 from sglang.srt.layers.layer_boundary.contracts import BatchVariant
 from sglang.srt.layers.layer_boundary.residual import access as residual_access
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
@@ -355,6 +360,14 @@ class DeepseekV2MLP(nn.Module):
     ):
         if self.is_replicated and x.shape[0] == 0:
             return x
+
+        if (
+            not self.is_replicated
+            and forward_batch is not None
+            and dcp_token_sharded(forward_batch)
+        ):
+            # Every TP weight shard computes the same full token batch.
+            x = attn_tp_gather(x, owned=True)
 
         if (
             getattr(self, "_enable_nvfp4_gemm_swiglu_fusion", False)
@@ -1087,6 +1100,10 @@ class DeepseekV2MoE(nn.Module):
             should_use_gluon_moe,
         )
         from sglang.srt.layers.moe.mega_moe import forward_mega_moe, should_use_mega_moe
+
+        if forward_batch is not None and dcp_token_sharded(forward_batch):
+            # TP experts need the full token batch; their output is scattered back.
+            hidden_states = attn_tp_gather(hidden_states, owned=True)
 
         num_token_non_padded = (
             forward_batch.moe_num_token_non_padded()
@@ -2322,6 +2339,9 @@ class DeepseekV2AttentionMLA(
         # Full-head bf16 w_vc for project-before-merge: the V up-projection runs
         # on every group head before the DCP a2a, so the wire carries v_head_dim.
         self.w_vc_qrep = None
+        # Token-sharded DCP attention runs a complete O-projection on local rows.
+        self.o_proj_qrep_weight = None
+        self.o_proj_stream_shard = None
 
         self.w_scale_k = None
         self.w_scale_v = None
@@ -3539,7 +3559,10 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        with get_attn_tp_context().maybe_input_scattered(forward_batch):
+        with (
+            get_attn_tp_context().maybe_input_scattered(forward_batch),
+            get_forward().scoped(dcp_token_sharded=dcp_token_sharded(forward_batch)),
+        ):
             hidden_states = self.model(
                 input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
             )
@@ -3548,6 +3571,8 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             hidden_states, aux_hidden_states = hidden_states
 
         if self.pp_group.is_last_rank:
+            if dcp_token_sharded(forward_batch):
+                hidden_states = dsa_cp_gather_token_rows(hidden_states, forward_batch)
             return self.logits_processor(
                 input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
             )

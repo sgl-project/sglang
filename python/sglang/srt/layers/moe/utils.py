@@ -12,6 +12,7 @@ import torch
 from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
+    attn_tp_reduce_scatter_tensor,
     is_dp_attention_enabled,
 )
 from sglang.srt.runtime_context import (
@@ -943,6 +944,11 @@ def post_experts_all_reduce(hidden_states: torch.Tensor) -> torch.Tensor:
     sequential ones, which also restores the invariant the fused residual+LN path
     depends on.
     """
+    if get_forward().dcp_token_sharded:
+        parallel = get_parallel()
+        local = hidden_states.tensor_split(parallel.attn_tp_size)[parallel.attn_tp_rank]
+        attn_tp_reduce_scatter_tensor(local, hidden_states)
+        return local
     parallel = get_parallel()
     return _post_experts_sum(
         hidden_states,

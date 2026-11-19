@@ -1319,6 +1319,10 @@ class Envs:
     # DCP extend on NPU: above this many new tokens the prefix KV is gathered
     # whatever the bytes say, as the query path's fp32 merge grows with them.
     SGLANG_NPU_DCP_EXTEND_QUERY_GATHER_MAX_TOKENS = EnvInt(4096)
+    # Opt in to contiguous attention-TP token slices through the DSA DCP residual.
+    SGLANG_NPU_DSA_CP_TOKEN_SHARDED = EnvBool(False)
+    # Within that rebuild, assemble the full O-proj weight on demand per layer.
+    SGLANG_NPU_STREAM_O_PROJ = EnvBool(True)
     # Enable int4x2 weights loading
     SGLANG_NPU_W4A4_NEW_PACKING = EnvBool(False)
     # Opt in to fused MHA KV writes. Disabled by default because ScatterPa

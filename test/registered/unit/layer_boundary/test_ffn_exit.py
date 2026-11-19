@@ -1,7 +1,7 @@
 import types
 import unittest
 from functools import partial
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -187,6 +187,36 @@ class TestFfnExit(CustomTestCase):
                 )
                 torch.testing.assert_close(hidden_states, self.hidden_states * 2 + 1)
                 self.assertIs(residual, self.residual)
+
+    def test_token_sharded_exit_completes_before_the_local_residual_update(self):
+        batch = types.SimpleNamespace(
+            attn_dcp_metadata=types.SimpleNamespace(token_sharded=True)
+        )
+        full = torch.arange(24, dtype=torch.float32).reshape(12, 2)
+        residual = torch.ones(3, 2)
+        for fusions in (
+            None,
+            types.SimpleNamespace(can_defer_finalize=MagicMock(return_value=True)),
+        ):
+            with self.subTest(fusions=fusions is not None):
+                communicator = make_communicator(
+                    fuse=True, reduce_scatter=False, fusions=fusions
+                )
+                # Exercise the real postprocess instead of its usual mock.
+                del communicator.output._complete_now
+                steps = communicator.paths[BatchVariant.ORDINARY]
+                decision = communicator.output._decide(batch, steps)
+                with patch.object(
+                    transport_ops,
+                    "attn_tp_reduce_scatter",
+                    side_effect=lambda value: (value * 4).chunk(4)[1],
+                ):
+                    hidden, remaining = decision.complete(full, residual)
+                self.assertFalse(decision.defer_moe_finalize)
+                torch.testing.assert_close(
+                    hidden + remaining, (full * 4).chunk(4)[1] + residual
+                )
+                communicator.output._defers_sum.assert_not_called()
 
     def test_a_layer_that_declares_no_deferral_runs_postprocess(self):
         communicator = make_communicator(

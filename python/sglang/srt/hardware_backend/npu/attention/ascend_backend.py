@@ -44,6 +44,7 @@ from sglang.srt.layers.attention.dsa.dsa_token_shard import (
     dsa_token_shard_cumulative_query_lens,
     dsa_token_shard_key_lens,
     get_dsa_token_shard_plan,
+    select_dsa_cp_token_sharded,
 )
 from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
@@ -911,6 +912,7 @@ class AscendAttnBackend(AttentionBackend):
                     interleave_size=self.page_size,
                     device=self.device,
                 )
+                dcp_metadata.token_sharded = select_dsa_cp_token_sharded(forward_batch)
 
         if (
             self.use_mla

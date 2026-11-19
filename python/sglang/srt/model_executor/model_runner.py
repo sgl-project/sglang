@@ -1192,6 +1192,17 @@ class ModelRunner:
         if get_parallel().dcp_enabled and get_parallel().dcp_replicate_q_proj:
             self._prepare_replicated_q_proj()
 
+        from sglang.srt.layers.attention.dsa.dsa_token_shard import (
+            prepare_dsa_cp_token_sharded,
+        )
+
+        prepare_dsa_cp_token_sharded(
+            model=self.model,
+            device=self.device,
+            dtype=self.dtype,
+            spec_algorithm=self.spec_algorithm,
+        )
+
     def _prepare_replicated_q_proj(self) -> None:
         # --dcp-replicate-q-proj: gather each rank's attn_tp head-shard of
         # q_b_proj / w_kc into full-head buffers once here (pre-capture) so the

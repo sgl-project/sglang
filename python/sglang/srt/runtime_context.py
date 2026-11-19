@@ -722,6 +722,8 @@ class ForwardFlags:
         # ForwardBatch.attn_tp_sequence_sharded decision, stamped by the model
         # that slices); read by the benchmark routing override.
         "attn_tp_sequence_sharded": False,
+        # DCP residual token sharding, scoped from its per-forward metadata.
+        "dcp_token_sharded": False,
         # Physical token rows in TP rank order for the current Ascend MoE call.
         "ascend_allgather_row_sizes": None,
     }
@@ -741,6 +743,7 @@ class ForwardFlags:
             "lora_batch_layout",
             "sp_active",
             "attn_tp_sequence_sharded",
+            "dcp_token_sharded",
         }
     )
 

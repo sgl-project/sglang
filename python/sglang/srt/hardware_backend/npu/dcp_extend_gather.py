@@ -71,6 +71,8 @@ class NPUDecodeContextParallelMetadata(DecodeContextParallelMetadata):
     # The current layer's gathered (latent, rope) KV. NPU keeps the two apart
     # in the pool and in npu_sparse_flash_attention, so not dcp_kv_buffer.
     extend_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+    # Async chunk-KV gathers and their send buffers, awaited before the pool read.
+    chunk_kv_works: Optional[Tuple] = None
 
 
 # Above this many new tokens a DSA extend gathers the KV whatever the bytes say.

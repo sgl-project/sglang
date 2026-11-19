@@ -20,6 +20,7 @@ import torch
 
 from sglang.srt.layers import layernorm_sp
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateAccumulator
+from sglang.srt.layers.dcp.metadata import dcp_token_sharded
 from sglang.srt.layers.layer_boundary.adapters import branch
 from sglang.srt.layers.layer_boundary.adapters.lora import (
     publish_attn_lora_rows,
@@ -32,7 +33,7 @@ from sglang.srt.layers.layer_boundary.contracts import (
     StagePath,
 )
 from sglang.srt.layers.layer_boundary.layout import SumGroup
-from sglang.srt.layers.layer_boundary.ops import sum_output
+from sglang.srt.layers.layer_boundary.ops import slice_dcp_token_residual, sum_output
 from sglang.srt.layers.layer_boundary.prepare import reads_quantized
 from sglang.srt.layers.layer_boundary.residual import bind_update
 from sglang.srt.layers.layer_boundary.residual.access import buffer, from_pp
@@ -219,13 +220,18 @@ class StageBoundary:
                 if produced.sum_impl is not None
                 else None
             )
-            if produced.always_partial:
+            stream = stream_of(forward_batch)
+            if dcp_token_sharded(forward_batch):
+                # Full O-proj weights complete the attention sum on local rows.
+                slice_dcp_token_residual(stream, hidden_states)
+                owed = None
+            elif produced.always_partial:
                 owed = DeclaredSum(produced.group, completion)
             else:
                 owed = None
                 if completion is not None:
                     hidden_states = completion(hidden_states)
-            return stream_of(forward_batch).record(
+            return stream.record(
                 hidden_states,
                 bind_update(produced.update, forward_batch, update_context),
                 declared_sum=owed,

@@ -6,12 +6,18 @@ from typing import List, NamedTuple, Optional
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.dsa.dsa_token_shard import get_dsa_token_shard_plan
+from sglang.srt.layers.attention.dsa.dsa_token_shard import (
+    dsa_cp_gather_token_rows,
+    dsa_token_shard_cumulative_query_lens,
+    dsa_token_shard_key_lens,
+    get_dsa_token_shard_plan,
+)
 from sglang.srt.layers.attention.dsa.dsa_token_shard_layout import (
     cumulative,
     plan_dsa_token_shard,
 )
 from sglang.srt.layers.cp.utils import cp_gather_full_sequence_states
+from sglang.srt.layers.dcp.metadata import dcp_token_sharded
 from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -287,6 +293,12 @@ class DSANPUIndexerMixin:
         )
 
         bs = q_lora.shape[0]
+        token_sharded = dcp_token_sharded(forward_batch)
+        token_shard_plan = (
+            get_dsa_token_shard_plan(forward_batch) if token_sharded else None
+        )
+        if token_sharded and token_shard_plan is None:
+            raise RuntimeError("DSA-CP token sharding lost its forward plan")
 
         # A rank that scores only its own rows projects only those: wq_b is
         # 25.2 MFLOP per token. k stays full width -- every rank writes the whole
@@ -298,7 +310,7 @@ class DSANPUIndexerMixin:
         )
         shard = (
             _get_indexer_query_shard(forward_batch, bs)
-            if is_prefill and not uses_prefill_cp
+            if is_prefill and not uses_prefill_cp and not token_sharded
             else None
         )
         q_sliced_early = shard is not None and self.rotary_emb.is_neox_style
@@ -380,7 +392,7 @@ class DSANPUIndexerMixin:
 
             k_proj = self.wk(x)[0]  # [b, s, 7168] @ [7168, 128] = [b, s, 128]
             k = self.k_norm(k_proj)
-            if _use_ag_after_qlora and input_on_attn_tp_slices:
+            if _use_ag_after_qlora and input_on_attn_tp_slices and not token_sharded:
                 k = scattered_to_tp_attn_full(k, forward_batch)
             k_pe, k_nope = torch.split(
                 k,
@@ -460,10 +472,17 @@ class DSANPUIndexerMixin:
             assert indexer_cache_loc is not None, (
                 "NPU DSA+DCP requires allocator-global origin_out_cache_loc metadata"
             )
-            assert indexer_cache_loc.shape[0] == positions.shape[0], (
-                "NPU DSA+DCP origin_out_cache_loc metadata has an incompatible "
-                f"length: {indexer_cache_loc.shape[0]} != {positions.shape[0]}"
+            expected_rows = (
+                token_shard_plan.num_tokens if token_sharded else positions.shape[0]
             )
+            assert indexer_cache_loc.shape[0] == expected_rows, (
+                "NPU DSA+DCP origin_out_cache_loc metadata has an incompatible "
+                f"length: {indexer_cache_loc.shape[0]} != {expected_rows}"
+            )
+        if token_sharded:
+            # Every rank writes the full index-K; only queries remain sharded.
+            k = dsa_cp_gather_token_rows(k, forward_batch)
+            k = k[: indexer_cache_loc.shape[0]]
         pool = get_token_to_kv_pool()
         use_quant_indexer = pool.index_k_scale_buffer is not None
         if use_quant_indexer and (self.num_init_tokens or self.num_local_tokens):
@@ -526,7 +545,7 @@ class DSANPUIndexerMixin:
             torch.npu.current_stream().wait_event(q_rope_event)
         if envs.SGLANG_NPU_USE_MULTI_STREAM.get():
             torch.npu.current_stream().wait_event(weights_event)
-        if _use_ag_after_qlora and input_on_attn_tp_slices:
+        if _use_ag_after_qlora and input_on_attn_tp_slices and not token_sharded:
             weights = scattered_to_tp_attn_full(weights, forward_batch)
         block_table = get_attn_backend().forward_metadata.block_tables
         if self.num_init_tokens or self.num_local_tokens:
@@ -568,7 +587,14 @@ class DSANPUIndexerMixin:
             query = q.view(-1, self.n_heads, self.head_dim)
             # The full width for the gather, NOT query.shape[0] (already cut).
             num_query_tokens = bs
-            if shard is not None:
+            if token_sharded:
+                actual_seq_lengths_q = dsa_token_shard_cumulative_query_lens(
+                    forward_batch, token_shard_plan, q.device
+                )
+                actual_seq_lengths_kv = dsa_token_shard_key_lens(
+                    forward_batch, token_shard_plan, k.device
+                )
+            elif shard is not None:
                 if not q_sliced_early:
                     query = shard.take(query)
                 # A late take: under _use_ag_after_qlora weights is gathered
@@ -627,7 +653,9 @@ class DSANPUIndexerMixin:
                     sparse_count=self.index_topk,
                     sparse_mode=3,
                 )[0].squeeze(1)
-            if shard is not None:
+            if token_sharded:
+                forward_batch.npu_indexer_topk_is_local = True
+            elif shard is not None:
                 topk_indices = shard.resolve(
                     topk_indices, num_query_tokens, forward_batch
                 )

@@ -23,6 +23,7 @@ import torch
 
 from sglang.srt.distributed import GroupCoordinator
 from sglang.srt.environ import envs
+from sglang.srt.layers.dcp.metadata import dcp_token_sharded
 from sglang.srt.layers.dp_attention import (
     can_use_dp_reduce_scatter,
     is_dp_attention_enabled,
@@ -43,6 +44,7 @@ from sglang.srt.layers.layer_boundary.ops import (
     all_reduce_to_dp_local,
     dp_reduce_scatter,
     dp_reduce_scatterv,
+    slice_dcp_token_residual,
     sum_output,
     to_dp_local,
 )
@@ -296,6 +298,9 @@ class ExitPolicy:
             # A reduce-scatter completes the sum on its way back.
             owes_sum=steps.output.group is not None and not sum_in_reduce_scatter,
         )
+        if dcp_token_sharded(forward_batch):
+            # The next residual update needs this rank's completed local rows.
+            return ExitDecision(False, sum_in_reduce_scatter, complete_now)
         custom = steps.output.sum_impl
         custom_can_defer = (
             custom.can_defer(forward_batch)
@@ -566,6 +571,10 @@ class MixerExit:
 
     def finish(self, hidden_states: torch.Tensor):
         """Hand the actual mixer result to the next boundary through the stream."""
+        if dcp_token_sharded(self._forward_batch):
+            # Full O-proj weights make the attention output complete on local rows.
+            slice_dcp_token_residual(self._stream, hidden_states)
+            return self._stream.record(hidden_states, self._update, declared_sum=None)
         if self._defers:
             hidden_states = UnreducedOutput(
                 hidden_states, group=get_parallel().tp_group

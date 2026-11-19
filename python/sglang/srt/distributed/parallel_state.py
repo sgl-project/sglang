@@ -1409,6 +1409,18 @@ class GroupCoordinator:
             # + wait_tensor, which invokes sycl_event.wait() and breaks XPU graph capture.
             reg_all_gather_into_tensor(output, input, group_name=self.unique_name)
 
+    def all_gather_into_tensor_async(self, output: torch.Tensor, input: torch.Tensor):
+        """Enqueue an eager all-gather; the caller waits before reading output."""
+        if self.world_size == 1:
+            output.copy_(input)
+            return None
+        if _is_npu:
+            return torch.distributed.all_gather_into_tensor(
+                output, input, group=self.device_group, async_op=True
+            )
+        self.all_gather_into_tensor(output, input)
+        return None
+
     def all_gather(
         self,
         input_: torch.Tensor,
