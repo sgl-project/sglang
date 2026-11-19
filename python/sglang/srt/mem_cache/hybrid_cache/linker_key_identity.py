@@ -30,7 +30,6 @@ if TYPE_CHECKING:
 class LinkerUnifiedLayout:
     model_name: str
     suffixes: dict[PoolName, list[str]]
-    head_group_num: int
     entries: dict[PoolName, DevicePoolEntry]
 
 
@@ -125,6 +124,41 @@ def _raw_layout_identity(entry: DevicePoolEntry, draft_identity: tuple | None) -
     return f"linker-device-v1-{digest}"
 
 
+def _head_group_entry(entry: DevicePoolEntry, head_group_num: int) -> DevicePoolEntry:
+    """Expose each token's contiguous head slice as a page-strided buffer."""
+    page_size = entry.page_size
+    buffers = entry.components[0]
+    num_heads = buffers[0].size(1)
+    heads_per_group = num_heads // head_group_num
+    # Each object is ordered by layer, K/V, then token. Selecting a token's
+    # position within every page keeps these views affine in the page index.
+    components = [
+        [
+            buffer[token::page_size, head : head + heads_per_group, :]
+            for buffer in buffers
+            for token in range(page_size)
+        ]
+        for head in range(0, num_heads, heads_per_group)
+    ]
+    ranges_per_layer = 2 * page_size
+    return DevicePoolEntry(
+        name=entry.name,
+        indices_from_pool=entry.indices_from_pool,
+        device_pool=entry.device_pool,
+        components=components,
+        layer_mapping={
+            layer: tuple(
+                range(layer * ranges_per_layer, (layer + 1) * ranges_per_layer)
+            )
+            for layer in entry.layer_mapping
+        },
+        page_size=page_size,
+        rows_are_pages=True,
+        packed=False,
+        tp_replicated=entry.tp_replicated,
+    )
+
+
 def build_linker_unified_layout(
     kvcache,
     pool_group: DevicePoolGroup,
@@ -170,7 +204,6 @@ def build_linker_unified_layout(
         else None
     )
     suffixes = {}
-    head_group_num = 1
     if canonical is not None:
         entry, local_heads = canonical
         plan = plan_unified_kv(
@@ -193,9 +226,12 @@ def build_linker_unified_layout(
             itemsize=itemsize,
             is_mla=local_heads == 0,
         )
-        entries[PoolName.KV] = entry
+        entries[PoolName.KV] = (
+            _head_group_entry(entry, plan.head_group_num)
+            if plan.head_group_num > 1
+            else entry
+        )
         suffixes[PoolName.KV] = plan.suffixes
-        head_group_num = plan.head_group_num
     elif (
         memory.hicache_storage_head_partition is not None
         and not pool_group.rank_replicated
@@ -253,4 +289,4 @@ def build_linker_unified_layout(
             **parallel_geometry,
         )
         suffixes[name] = plan.suffixes
-    return LinkerUnifiedLayout(model_name, suffixes, head_group_num, entries)
+    return LinkerUnifiedLayout(model_name, suffixes, entries)

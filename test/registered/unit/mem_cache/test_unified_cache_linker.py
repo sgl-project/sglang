@@ -2640,6 +2640,8 @@ class TestTransferReadyEvents(CustomTestCase):
 
     def test_mooncake_offload_thread_waits_on_every_event(self):
         linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+        transfer = PoolTransfer(name=PoolName.KV)
+        linker.pools = {PoolName.KV: SimpleNamespace(packed=True)}
         order = MagicMock()
         linker.storage = order.storage
         order.storage.batch_set_v2.return_value = {}
@@ -2648,7 +2650,7 @@ class TestTransferReadyEvents(CustomTestCase):
         linker.offload_queue = queue.Queue()
         linker.offload_queue.put(
             (
-                ["transfer"],
+                [transfer],
                 1,
                 TransferReady(order.indices_ready, order.forward_done),
                 "session-a",
@@ -2662,7 +2664,7 @@ class TestTransferReadyEvents(CustomTestCase):
                 call.indices_ready.synchronize(),
                 call.forward_done.synchronize(),
                 call.storage.batch_set_v2(
-                    ["transfer"],
+                    [transfer],
                     HiCacheStorageExtraInfo(extra_info={"session_id": "session-a"}),
                 ),
             ],

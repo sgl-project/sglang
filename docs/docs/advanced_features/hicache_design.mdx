@@ -180,7 +180,7 @@ Specifically, **LMCache**, an efficient KV cache layer for enterprise-scale LLM 
 
 ### Page-unified storage with direct linkers
 
-Set `--enable-unified-cache-external-linker` and `--hicache-storage-key-scheme unified` to enable unified object keys with the Mooncake or Mori linker. The linker transfers directly between device KV buffers and the store. For dense MHA and MLA KV, the stored bytes use the page-unified layout. To share these objects between Mooncake HiCache and the Mooncake linker, use the same model, served model name, KV dtype, page size, head partition, and Mooncake backend tag if configured.
+With the Mooncake or Mori direct linker enabled, `--hicache-storage-key-scheme unified` automatically selects the page-unified object layout for compatible KV pools. The linker uses its existing I/O path with GPU buffer views in page-unified order. To share these objects between Mooncake HiCache and the Mooncake linker, use the same model, served model name, KV dtype, page size, head partition, and Mooncake backend tag if configured.
 
 Use `--hicache-storage-head-partition` to share dense MHA KV across attention TP widths that tile the same grid. The linker requires PP, attention CP, and DCP sizes of 1, with the storage layer partition unset. Side pools and pages containing packed draft KV use their own object identities.
 

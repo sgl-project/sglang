@@ -145,9 +145,10 @@ class DevicePoolEntry:
     ) -> tuple[list, list, list] | None:
         """Ranges that read every mapped layer of ``layers`` for each location.
 
-        Packed entries return one range list per location (layer-major); other
-        entries return one per location and component item, holding that item's
-        slice of every layer. None when no layer is mapped.
+        Packed entries return one range list per location (layer-major).
+        Unpacked entries return one per location and component, holding that
+        component's ranges for every mapped layer. Returns None when no layer
+        is mapped.
         """
         per_layer = []
         for layer in layers:
@@ -182,8 +183,16 @@ class DevicePoolEntry:
             raise ValueError(
                 f"Pool {self.name} maps a different number of buffers per layer."
             )
-        # (item, layer, field): one range list per item gathers all layers.
-        items = np.array(per_layer, dtype=np.int64).transpose(1, 0, 2)
+        if not per_layer[0]:
+            return [], [], []
+        # Each component is a separate object, with layer-major ranges.
+        component_count = len(self.components)
+        items = (
+            np.asarray(per_layer, dtype=np.int64)
+            .reshape(len(per_layer), component_count, -1, 4)
+            .transpose(1, 0, 2, 3)
+            .reshape(component_count, -1, 4)
+        )
         ptrs = rows[:, None, None] * items[None, :, :, 1] + items[None, :, :, 0]
         return (
             ptrs.reshape(-1, items.shape[1]).tolist(),
