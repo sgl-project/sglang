@@ -111,6 +111,7 @@ from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.lora.layers import BaseLayerWithLoRA, ColumnParallelLinearWithLoRA
+from sglang.srt.lora.utils import get_default_hidden_dim
 from sglang.srt.managers.mm_utils import (
     embed_mm_inputs,
     pad_mm_tokens,
@@ -4833,7 +4834,7 @@ class DeepseekV4ForCausalLM(nn.Module):
     # the indexer, compressor and engram reuse the leaves wq_b/wkv and are not adapted
     _lora_module_pattern = re.compile(
         r"^model\.layers\.\d+\.(?:self_attn\.(?:wq_a|wq_b|wkv|wo_a|wo_b)"
-        r"|mlp\.shared_experts\.(?:gate_up_proj|down_proj))$"
+        r"|mlp\.shared_experts\.(?:gate_up_proj|down_proj)|mlp\.experts)$"
     )
 
     def should_apply_lora(self, module_name: str) -> bool:
@@ -4842,7 +4843,7 @@ class DeepseekV4ForCausalLM(nn.Module):
     @staticmethod
     def get_lora_target_module_name(name: str) -> str:
         parent, _, leaf = name.rpartition(".")
-        if parent.endswith("shared_experts"):
+        if parent.endswith("experts"):
             return {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}.get(
                 leaf, name
             )
@@ -4852,7 +4853,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         """LoRA input/output dims; every layer is MoE, so gate_up/down are the shared expert's."""
         config = self.config
         shared_inter = config.moe_intermediate_size * config.n_shared_experts
-        return {
+        dims_by_module = {
             "wq_a": (config.hidden_size, config.q_lora_rank),
             "wq_b": (config.q_lora_rank, config.num_attention_heads * config.head_dim),
             "wkv": (config.hidden_size, config.head_dim),
@@ -4863,7 +4864,10 @@ class DeepseekV4ForCausalLM(nn.Module):
             "wo_b": (config.o_groups * config.o_lora_rank, config.hidden_size),
             "gate_up_proj": (config.hidden_size, 2 * shared_inter),
             "down_proj": (shared_inter, config.hidden_size),
-        }[module_name]
+        }
+        if module_name in dims_by_module:
+            return dims_by_module[module_name]
+        return get_default_hidden_dim(module_name, config, layer_idx)
 
     @property
     def routed_experts_weights_of_layer(self):
