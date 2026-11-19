@@ -14,6 +14,11 @@ from sglang.srt.configs.embedding_model_spec import (
     resolve_embedding_model_spec,
     resolved_embedding_plan,
 )
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    CudaGraphConfig,
+    PhaseConfig,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -92,7 +97,7 @@ class TestEmbeddingModelSpec(unittest.TestCase):
 
     def test_jina_ranking_runs_each_prompt_in_one_uncached_prefill(self):
         """JinaForRanking scores at marker tokens inside the prompt; a cached
-        prefix or a chunk split would drop them from the scoring forward."""
+        prefix, a chunk split or a padded prefill graph would break that."""
         args = ServerArgs(model_path="dummy")
         args._model_config = SimpleNamespace(
             embedding_model_spec=resolve_embedding_model_spec(
@@ -105,11 +110,20 @@ class TestEmbeddingModelSpec(unittest.TestCase):
             is_multimodal=False,
             hf_config=SimpleNamespace(architectures=["JinaForRanking"]),
         )
+        # CUDA resolves the prefill graph to breakable by default.
+        args.cuda_graph_config = CudaGraphConfig(
+            prefill=PhaseConfig(backend=Backend.BREAKABLE)
+        )
+        args._cuda_graph_config_locked = set()
         handle_model_capability_adjustments(args)
 
         self.assertTrue(resolution_result(args, "is_embedding"))
         self.assertTrue(resolution_result(args, "disable_radix_cache"))
         self.assertEqual(resolution_result(args, "chunked_prefill_size"), -1)
+        self.assertEqual(
+            resolution_result(args, "cuda_graph_config").prefill.backend,
+            Backend.DISABLED,
+        )
 
     def test_encoder_embedding_models_enable_embedding_mode_automatically(self):
         spec = resolve_embedding_model_spec(
