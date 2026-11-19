@@ -552,7 +552,7 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
             self.assertIs(GDNKernelDispatcher(*backends).extend_kernel, flydsl_kernel)
 
     def test_flydsl_schedule_flows_from_metadata_to_kernel(self):
-        self._run_flydsl_extend(eager_mixed_as_extend=None)
+        self._run_flydsl_extend(eager_mixed_as_extend=False)
         self._run_flydsl_extend(eager_mixed_as_extend=True)
 
     def _run_flydsl_extend(self, *, eager_mixed_as_extend):

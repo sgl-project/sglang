@@ -31,7 +31,7 @@ import hashlib
 import warnings
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, ClassVar, Dict, List, Optional, Set, Tuple, Union
 
 import torch
 
@@ -602,8 +602,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     original_global_num_tokens_cpu: Optional[List[int]] = None
     _original_batch_size: Optional[int] = None
     _original_forward_mode: Optional[ForwardMode] = None
-    # None, not False: TBO's child-batch field check rejects unlisted non-None fields.
-    eager_mixed_as_extend: Optional[bool] = None
+    # Not a field: dataclasses.replace() drops it, so also set it on the final batch.
+    eager_mixed_as_extend: ClassVar[bool] = False
     _original_num_tokens: Optional[int] = None
     global_num_tokens_cpu: Optional[List[int]] = None
     global_num_tokens_gpu: Optional[torch.Tensor] = None
