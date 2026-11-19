@@ -13,7 +13,11 @@ the fused chain a replay takes and accept the forced lengths. With the NVIDIA
 megakernel's fused chain acceptance, eagle_sample's tail (greedy check, injected
 acceptance, accept lengths) must leave every output bitwise as the unfused tail does,
 greedy, compact top-k and dense sampled, at batch sizes up to 64, and the graphs must
-still match eager sampling."""
+still match eager sampling. A round's retained outputs must survive the next round's
+replay, of the other slot or of another key, also when the body frees a temporary at
+the end of capture, and under Confidential Computing the async host copy of a sampled
+round, which nothing orders against that replay, must still read the round it was
+handed."""
 
 import unittest
 from contextlib import contextmanager, nullcontext
@@ -816,6 +820,196 @@ class TestSideStreamCommitWritesTheForwardSlots(CustomTestCase):
                     torch.testing.assert_close(
                         caches.temporal, expected, rtol=0, atol=0
                     )
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")
+class TestRetainedOutputsSurviveTheNextReplay(CustomTestCase):
+    """A round's retained outputs stay intact through the next round's replay, of
+    the other slot of the same key or of another key: the host copy may still read
+    them then. A body with a graph-internal temporary freed at the end of capture,
+    as sampled post-verify bodies have."""
+
+    def setUp(self):
+        from sglang.srt.speculative.eagle_post_verify_graphs import _PostVerifyGraphs
+
+        def body(slot):
+            bs = slot.num_requests
+            out = torch.empty(bs, dtype=torch.int32, device="cuda")
+            # freed back to the graph pool when the capture ends
+            scratch = torch.zeros(bs * 8192, dtype=torch.int32, device="cuda")
+            torch.add(scratch[:bs], 7, out=out)
+            return (out,)
+
+        self.post = _PostVerifyGraphs(
+            body=body,
+            # the side-stream commit; allocates nothing
+            commit=lambda slot, outputs: torch.cuda._sleep(1),
+            sim_rng=None,
+        )
+
+    def _round(self, bs):
+        return self.post.run(
+            key=bs,
+            inputs={"seq_lens": torch.zeros(bs, dtype=torch.int32, device="cuda")},
+            make_slot=lambda staged: SimpleNamespace(num_requests=bs),
+            sim_max_len=1,
+        )[0]
+
+    def _capture(self, bs):
+        # eager warm-ups, then the capture of slot 0 and of slot 1
+        for _ in range(2 * eagle_post_verify_graphs._NUM_WARMUP + 2):
+            self._round(bs)
+
+    def _check(self, held_bs, next_bs):
+        held = self._round(held_bs)  # round N
+        torch.cuda.synchronize()
+        self.assertEqual(held.tolist(), [7] * held_bs)
+        self._round(next_bs)  # round N+1
+        self.post.join()
+        torch.cuda.synchronize()
+        self.assertEqual(held.tolist(), [7] * held_bs)
+
+    def _graphs(self):
+        return (
+            torch.cuda.stream(torch.cuda.Stream()),
+            patch(
+                "sglang.srt.distributed.parallel_state.graph_capture", _graph_capture
+            ),
+        )
+
+    def test_other_slot_replay_keeps_the_held_outputs(self):
+        stream, capture = self._graphs()
+        with stream, capture:
+            self._capture(8)
+            self._round(8)  # slot 0, so round N replays slot 1
+            self._check(8, 8)
+
+    def test_another_keys_replay_keeps_the_held_outputs(self):
+        stream, capture = self._graphs()
+        with stream, capture:
+            self._capture(8)
+            self._capture(7)
+            self._check(7, 8)
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")
+class TestAsyncHostCopyReadsItsOwnRound(CustomTestCase):
+    """Under Confidential Computing the scheduler hands a round's predict and
+    accept_lens to the async D2H worker, which copies them from its own thread and
+    stream; nothing orders that copy against the next round's post-verify replay,
+    which the overlap loop launches before it waits for the copy. Every copy must
+    still read the round it was handed: sampled rounds of one batch size, each the
+    other slot of the key, in the scheduler's order. In serving, the next round's
+    draft and verify forwards run before its replay; this test leaves them out, so
+    the unordered copy loses the race far more often than it would in production."""
+
+    BS = 8
+    # enough rounds that main misread a copy on every run tried; fewer miss it on
+    # fast GPUs
+    ROUNDS = 500
+
+    def setUp(self):
+        publish(ServerArgs(model_path="dummy"), role="test")
+        self.addCleanup(reset_context)
+
+    def test_async_host_copy_reads_the_round_it_was_handed(self):
+        from sglang.srt.managers.async_d2h_copy_worker import AsyncD2HCopyWorker
+        from sglang.srt.managers.scheduler import Scheduler
+        from sglang.srt.managers.utils import GenerationBatchResult
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        bs = self.BS
+        graphs = EaglePostVerifyGraphs(
+            target_worker=SimpleNamespace(
+                model_runner=SimpleNamespace(watermark_state=None, model_config=None)
+            ),
+            simulated_acc_len_rng=simulated_acc_len_generator(0),
+        )
+        generator = torch.Generator(device="cuda").manual_seed(0)
+        forward_stream, copy_stream = torch.cuda.Stream(), torch.cuda.Stream()
+        worker = AsyncD2HCopyWorker(torch.cuda)
+        self.addCleanup(worker.shutdown)
+        # what the scheduler's _copy_result_to_cpu reads, with CC on
+        scheduler = SimpleNamespace(
+            forward_stream=forward_stream,
+            copy_stream=copy_stream,
+            copy_stream_ctx=torch.cuda.stream(copy_stream),
+            enable_async_d2h_copy=True,
+            async_d2h_worker=worker,
+        )
+        eagle_batch = SimpleNamespace(
+            return_logprob=False,
+            return_hidden_states=False,
+            spec_algorithm=SpeculativeAlgorithm.EAGLE,
+        )
+        parallel = SimpleNamespace(
+            tp_group=SimpleNamespace(world_size=1),
+            attn_tp_group=SimpleNamespace(world_size=1),
+        )
+
+        def verify_round():
+            outputs = graphs.run(
+                batch=batch,
+                verify_input=verify_input,
+                logits_output=logits_output,
+                can_run_cuda_graph=True,
+            )
+            graphs.join()
+            return outputs
+
+        misread = []
+
+        def process(i, result, want):
+            result.copy_done.synchronize()
+            got = result.next_token_ids.tolist(), result.accept_lens.tolist()
+            want = want[0].tolist(), want[1].tolist()
+            if got != want:
+                misread.append(
+                    f"round {i}: accept_lens {got[1]}, want {want[1]}"
+                    + ("" if got[0] == want[0] else "; predict differs")
+                )
+
+        with (
+            torch.cuda.stream(forward_stream),
+            patch.object(spec_utils, "commit_mamba_states_after_verify"),
+            patch.object(
+                eagle_post_verify_graphs, "mambaish_config", return_value=None
+            ),
+            patch(
+                "sglang.srt.distributed.parallel_state.graph_capture", _graph_capture
+            ),
+            patch("sglang.srt.runtime_context.get_parallel", return_value=parallel),
+            # CC stages the host side pageable
+            patch("sglang.srt.utils.device.is_confidential_compute", return_value=True),
+        ):
+            # one verify's logits and drafts, which every round samples anew
+            batch, verify_input, logits = _round(bs, generator, vocab=SAMPLED_VOCAB)
+            batch = _sampled(batch, generator=generator)
+            logits_output = SimpleNamespace(
+                next_token_logits=logits, next_token_logits_vocab_shard=None
+            )
+            # eager warm-ups, then the capture of each slot
+            for _ in range(2 * eagle_post_verify_graphs._NUM_WARMUP + 2):
+                verify_round()
+            last = None
+            for i in range(self.ROUNDS):
+                # run_batch(N+1): its replay, then the hand-off of its result
+                predict, accept_lens = verify_round()[:2]
+                want = predict.clone(), accept_lens.clone()
+                result = GenerationBatchResult(
+                    next_token_ids=predict,
+                    accept_lens=accept_lens,
+                    copy_done=torch.cuda.Event(),
+                )
+                Scheduler._copy_result_to_cpu(scheduler, result, eagle_batch)
+                # process_batch_result(N)
+                if last is not None:
+                    process(*last)
+                last = i, result, want
+            process(*last)
+        self.assertFalse(
+            misread, f"{len(misread)} of {self.ROUNDS} copies misread: {misread[:3]}"
+        )
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")

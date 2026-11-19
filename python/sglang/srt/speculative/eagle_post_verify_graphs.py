@@ -5,7 +5,15 @@ outputs and, on a side stream, the mamba state commit, for every batch a graph c
 reproduce; any other batch runs SGLang's eager path.
 
 The side-stream commit may run after the scheduler reused a finished request's
-row, so it writes the verify forward's slots, staged with the round's inputs."""
+row, so it writes the verify forward's slots, staged with the round's inputs.
+
+Every capture shares one graph pool, so a capture's temporaries, freed when it ends,
+may back a later capture's tensors, which every replay of the earlier graph then
+rewrites. A round's outputs must outlive the next round's replay: the host copy
+(copy_stream, or the async D2H worker under Confidential Computing) may read them
+after that replay is enqueued. So each slot keeps its outputs in static buffers
+allocated outside the pool, which its graph fills with one grouped copy; only
+temporaries live in the pool."""
 
 from __future__ import annotations
 
@@ -14,6 +22,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import torch
+from torch.utils._pytree import tree_flatten, tree_map_only
 
 from sglang.kernels.ops.memory.small_field_copy import SmallFieldCopyPlan
 from sglang.srt.configs.hybrid_arch import mambaish_config
@@ -363,6 +372,7 @@ class _PostVerifyGraphs:
                 )
             slot = state.slots[turn] = make_slot(staged)
             slot.staged, slot.graph, slot.commit_graph = staged, None, None
+            slot.outputs = None
             slot.load_plan = (
                 SmallFieldCopyPlan(allow_pinned_src=True) if _ONE_LAUNCH_LOAD else None
             )
@@ -374,6 +384,17 @@ class _PostVerifyGraphs:
                 state.warmups += 1
                 outputs = self._body(slot)
                 self._commit(slot, outputs)
+                if slot.outputs is None:
+                    # the slot's static outputs, outside the graph pool
+                    slot.outputs = tree_map_only(
+                        torch.Tensor,
+                        lambda t: torch.empty_like(
+                            t, memory_format=torch.contiguous_format
+                        ),
+                        outputs,
+                    )
+                # the copy the graph will run, compiled outside the capture
+                _copy_outputs(slot.outputs, outputs)
                 return outputs[:6]
             self._capture(slot)
         slot.graph.replay()
@@ -461,6 +482,8 @@ class _PostVerifyGraphs:
             self._pool = torch.cuda.graph_pool_handle()
             self._side_stream = torch.cuda.Stream()
             self._main_done, self._commit_done = torch.cuda.Event(), torch.cuda.Event()
+        # the eager warm-ups allocated the slot's static outputs
+        assert slot.outputs is not None, "post-verify capture before a warm-up"
         graph = torch.cuda.CUDAGraph()
         with graph_capture(stream=torch.cuda.current_stream()) as ctx:
             with torch.cuda.graph(
@@ -469,7 +492,7 @@ class _PostVerifyGraphs:
                 stream=ctx.stream,
                 capture_error_mode="thread_local",
             ):
-                outputs = self._body(slot)
+                _copy_outputs(slot.outputs, self._body(slot))
         # Captured after the main graph in the same pool and replayed after it.
         commit_graph = torch.cuda.CUDAGraph()
         self._side_stream.wait_stream(torch.cuda.current_stream())
@@ -479,13 +502,27 @@ class _PostVerifyGraphs:
             stream=self._side_stream,
             capture_error_mode="thread_local",
         ):
-            self._commit(slot, outputs)
+            self._commit(slot, slot.outputs)
         torch.cuda.current_stream().wait_stream(self._side_stream)
-        slot.graph, slot.commit_graph, slot.outputs = graph, commit_graph, outputs
+        slot.graph, slot.commit_graph = graph, commit_graph
         logger.info(
             "Captured the EAGLE post-verify graphs for batch size %d",
             slot.num_requests,
         )
+
+
+def _copy_outputs(dsts: tuple, srcs: tuple) -> None:
+    """Copy a round's outputs into a slot's static ones of the same structure, shapes
+    and dtypes, as the graph runners fill their static buffers: one grouped copy, a
+    single launch while every output has at most 8192 elements."""
+    from sglang.srt.model_executor.runner_utils.buffers import _grouped_foreach_copy_
+
+    dst_leaves, dst_spec = tree_flatten(dsts)
+    src_leaves, src_spec = tree_flatten(srcs)
+    assert dst_spec == src_spec, "post-verify outputs changed structure"
+    pairs = [(d, s) for d, s in zip(dst_leaves, src_leaves) if s is not None]
+    assert all(d.shape == s.shape and d.dtype == s.dtype for d, s in pairs)
+    _grouped_foreach_copy_([d for d, _ in pairs], [s for _, s in pairs])
 
 
 def _post_verify_inputs(
