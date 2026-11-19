@@ -63,10 +63,11 @@ def _glm_split_index_k_dcp_overrides(cfg: Any) -> dict:
             "(--dsa-topk-backend and --speculative-dsa-topk-backend sgl-kernel, "
             "SGLANG_OPT_USE_TOPK_V2 and SGLANG_DSA_FUSE_TOPK on)."
         )
-    if envs.SGLANG_DSA_TOPK_BROADCAST.get():
+    if cfg.enable_return_indexer_topk or envs.SGLANG_DSA_TOPK_BROADCAST.get():
         # The sharded indexer returns only this rank's local KV slots.
         raise ValueError(
-            "GLM-5 DSA DCP on SM90 does not support SGLANG_DSA_TOPK_BROADCAST."
+            "GLM-5 DSA DCP on SM90 does not support --enable-return-indexer-topk "
+            "or SGLANG_DSA_TOPK_BROADCAST."
         )
     if cfg.dsa_prefill_backend not in (None, "flashmla_sparse_q8", "flashmla_kv"):
         raise ValueError(

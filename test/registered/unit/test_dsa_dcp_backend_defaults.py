@@ -51,6 +51,7 @@ def _glm_overrides(*, is_sm90=True, **fields):
         enable_prefill_cp=False,
         kv_cache_dtype="auto",
         dsa_topk_backend="sgl-kernel",
+        enable_return_indexer_topk=False,
         speculative_algorithm=None,
         speculative_dsa_topk_backend="sgl-kernel",
     )
@@ -160,6 +161,8 @@ class TestGlmSplitIndexKDcpStartup(CustomTestCase):
         with envs.SGLANG_DSA_TOPK_BROADCAST.override(True):
             with self.assertRaisesRegex(ValueError, "SGLANG_DSA_TOPK_BROADCAST"):
                 _glm_overrides()
+        with self.assertRaisesRegex(ValueError, "--enable-return-indexer-topk"):
+            _glm_overrides(enable_return_indexer_topk=True)
 
 
 class TestDsaDcpBackendConstraints(CustomTestCase):
