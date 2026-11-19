@@ -1,0 +1,64 @@
+# DeepSeek V4.1 index-layer top-k: validation harness
+
+Helper scripts behind the validation evidence of the PR "[Feat] [NVIDIA] deepseek-v4.1: Honor
+--dsa-topk-backend flashinfer in the index-layer top-k". They are added and reverted in that PR's
+history, so they are not part of its diff. This version supersedes the earlier harness commits
+(v1-v3, before the PR's rebase onto `d75d741`); `results/` holds raw outputs too long for the PR
+body.
+
+Where each part ran (one 8x B300 node each, same torch / CUDA / FlashInfer / Triton / deep-gemm /
+sglang-kernel / Python / driver versions):
+
+- Before the rebase, `lmsysorg/sglang:nightly-dev-cu13-20261115-7b5fb39b`: on the PR tree of
+  commit `e887cac` (base `5b1e189`), the serving evals (`run_e2e.sh`, `e2e_queue.sh`) and the
+  greedy logprob comparison (`run_logprob.sh`, `logprob_rounds2.sh`).
+- After the rebase, `lmsysorg/sglang:nightly-dev-cu13-20261118-ecd3d75a`: `RUN=r9 rebase_r9.sh`
+  on the PR head's code and the new base `d75d741` (the seven suites on both trees, the negative
+  controls, the mode-2 parity controls, the CUDA-graph legs, the sgl-kernel base-vs-branch kernel
+  trace, and the kernel traces of every benchmark shape and every `TopKSelector` entry point for
+  every branch variant on `b4861e8`'s tree, whose `python/` equals `e887cac`'s, against this
+  head), then `prewarm_jit.sh` and the operator benchmark (`BENCH_NAME=final-e bench_final.sh`).
+
+`e887cac` and `b4861e8` also wired FlashInfer's unfused top-k (`SGLANG_DSA_FUSE_TOPK=0`) and a
+torch path, which the PR head drops; `e2e_queue.sh` and `logprob_rounds2.sh` still list the
+servers that ran them. The tables in `results/` and in the PR body keep the configurations the
+head wires.
+
+`ROOT=/hai-workspace/dsv41-fi-topk` layout: `sglang/` (the PR tree), `sglang-prev/` (`git archive`
+of `b4861e8`'s `python/` and `test/`, for `scope_r6.sh`), `sglang-base/` (`git archive` of the base
+commit's `python/` and `test/`), `tools/` (these files), `cache/<tree>/` (JIT caches), `sgl-eval-venv/`
+(sgl-eval 0.1.3), and the result folders `logs/`, `bench/`, `e2e/`, `logprob2/`, `trace/`,
+`trace-<run>/`. The checkpoint is at `/data/models/DeepSeek-V4.1-Flash-1017`. To rerun
+elsewhere, edit `ROOT` and `MODEL` in the shell scripts.
+
+| file | role |
+|---|---|
+| `run_tests.sh <sglang\|sglang-base> <log dir>` | the seven pytest suites, one per GPU, with the tree on `PYTHONPATH` |
+| `negative_controls.py` | patches one guarded behavior at a time on the PR tree and checks the guarding test fails |
+| `mode2_controls.py <tree>` | breaks the mode-2 parity check's premises (sgl-kernel top-k v2 built in mode 1; FlashInfer large tie-break) and checks it fails, then runs it unmodified |
+| `verify_graph_backends.py` | runs the CUDA-graph selector test with FlashInfer's op entry points wrapped, logging which kernel each leg captures |
+| `rebase_r9.sh` (`RUN=<name>`) | `scope_r6.sh`, then the seven suites on `sglang-base/` (GPUs 0-6) next to the sgl-kernel base-vs-branch kernel trace (GPU 7; base, branch, base again) |
+| `scope_r6.sh` (`RUN=<name>`) | the suites (GPUs 0-6) and, on GPU 7, the negative controls, mode-2 controls and graph legs; then `trace_sgl_kernel.py` and `trace_entry_points.py` for every branch variant on `sglang-prev/` and `sglang/`, compared per variant |
+| `trace_entry_points.py` | per `TopKSelector` entry point (prefill `ragged`, `raw`, `dense`, one- and two-output `sparse`, `order_candidates`, `paged_from_metadata` bf16 / v2 / row chunk / v1, `amax_blocks`, the `candidate_blocks` helpers), a variant's kernel launches and output digests on one tree; `compare` puts two records side by side |
+| `bench_topk.py` | operator benchmark: per shape a CUDA graph of R x [PDL producer -> selection], seeded inputs, one variant per process; variants base, branch, mode 2 (`SGLANG_TOPK_V2_MODE=2`), FlashInfer, small, small + deterministic; each branch variant checks its environment, and every variant records it |
+| `run_bench_balanced.sh <result dir> [args]` | one warm-up process, then six runs of the six variants in Williams-square order on one GPU |
+| `bench_final.sh` | the final invocation (`BENCH_NAME`; this run `final-e`): `run_bench_balanced.sh`, `analyze_bench.py`, and the 60-round re-run of any cell over 2% |
+| `analyze_bench.py <result dir>` | pooled per-shape medians, per-shape table and suite geomeans |
+| `bench_runs.py <result dir>` | per-run ratios, per-slot spread, the fixed per-replay-cost fit (six runs) |
+| `trace_sgl_kernel.py`, `trace_rerun.sh` | per benchmark shape, a variant's kernel launches, output hashes and top-k validity on one tree; `compare` puts two records side by side (base vs branch and base vs base in `trace_rerun.sh`) |
+| `run_e2e.sh`, `e2e_queue.sh` | serving runs (B300 High-Throughput recipe, TP4 + EP4) with sgl-eval GSM8K and RULER2 64K, one server per half node |
+| `pregen_ruler2.py` | generates the RULER2 64K dataset once for the checkpoint tokenizer |
+| `accuracy_table.py <e2e root> <out dir> <runs...>` | scores with standard errors, paired differences, RULER2 subtasks, raw aggregates |
+| `run_logprob.sh`, `logprob_rounds2.sh`, `logprob_equivalence.py` | greedy logprob comparison on the RULER2 prompts: collect per server, compare pairs |
+| `prewarm_jit.sh <scratch dir>` | one throwaway pass of every variant to fill a fresh node's JIT caches before a benchmark |
+| `topk_order_check.py <selector test file>` | per `SGLANG_TOPK_V2_MODE`: whether repeated sgl-kernel top-k v2 calls return the same set and the same output order |
+
+| `results/` file | content |
+|---|---|
+| `accuracy-details.md` | RULER2 subtasks, every serving run's `run.txt`, sgl-eval settings and raw `aggregate` block (`accuracy_table.py` over the `sgl-kernel`, `flashinfer` and `flashinfer-small-det` runs) |
+| `trace-compare.md` | `trace_sgl_kernel.py compare` of sgl-kernel base `d75d741` vs this head (and base vs base), with the full kernel names (`RUN=r9 rebase_r9.sh`) |
+| `scope-trace-compare.md` | `trace_sgl_kernel.py compare` and `trace_entry_points.py compare` (`--names previous this`) for each branch variant (`RUN=r9 scope_r6.sh`) |
+| `final-e-analysis.md` | `analyze_bench.py` output of the final benchmark (3-decimal us, per-variant environment) |
+| `final-e-runs.md` | `bench_runs.py` output of the final benchmark |
+| `logprob2-report.md` | `logprob_equivalence.py compare` output (table and per-pair JSON) over the configurations the head wires |
+| `topk-order-check.log` | `topk_order_check.py` output in modes 2 and 1 |
