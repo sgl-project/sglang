@@ -220,6 +220,7 @@
     "registered/unit/layer_boundary/test_boundary_output_contracts.py",
     "registered/unit/layer_boundary/test_cutedsl_ar_fusion.py",
     "registered/unit/layers/quantization/test_flashinfer_trtllm_bf16_moe_reload.py",
+    "registered/unit/layers/quantization/test_marlin_fp8_moe_scales.py",
     "registered/unit/layers/test_dual_gemm.py",
     "registered/unit/layers/test_linear_parallel_groups.py",
     "registered/unit/layers/test_llama_inkling_parallel_groups.py",
