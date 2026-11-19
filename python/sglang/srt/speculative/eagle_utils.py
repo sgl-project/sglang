@@ -48,6 +48,7 @@ from sglang.srt.utils import (
     is_xpu,
 )
 from sglang.srt.utils.async_probe import maybe_detect_nan, maybe_detect_oob
+from sglang.srt.utils.device import is_pin_memory_available
 
 if TYPE_CHECKING:
     from sglang.srt.constrained.base_grammar_backend import GrammarMask
@@ -1340,8 +1341,13 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
     for r in batch.reqs:
         r.decode_batch_idx += 1
 
-    cur_kv_lens_cpu = torch.tensor(cur_kv_lens, dtype=torch.int32, device="cpu")
-    nxt_kv_lens_cpu = torch.tensor(nxt_kv_lens, dtype=torch.int32, device="cpu")
+    pin = is_pin_memory_available(batch.device)
+    cur_kv_lens_cpu = torch.tensor(
+        cur_kv_lens, dtype=torch.int32, device="cpu", pin_memory=pin
+    )
+    nxt_kv_lens_cpu = torch.tensor(
+        nxt_kv_lens, dtype=torch.int32, device="cpu", pin_memory=pin
+    )
 
     # Mirrorless opt-out: publish the host-side max of the page-aligned
     # kv_allocated_len (>= committed + alloc reserve, so it upper-bounds
