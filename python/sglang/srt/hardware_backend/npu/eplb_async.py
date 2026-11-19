@@ -12,17 +12,30 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.environ import envs
-from sglang.srt.eplb.async_rebalance import AsyncEplbCoordinator, WeightWriteback
 from sglang.srt.eplb.expert_location import ExpertLocationMetadata
-from sglang.srt.eplb.expert_location_updater import stage_expert_weights_single_layer
+from sglang.srt.eplb.expert_location_updater import (
+    DeferredExpertCopies,
+    update_expert_weights_single_layer,
+)
 from sglang.srt.hardware_backend.npu.eplb import (
     _ExpertWeightAdapter,
     _validate_migration_topology,
     prewarm_eplb_communication,
 )
+from sglang.srt.hardware_backend.npu.eplb_coordinator import (
+    AsyncEplbCoordinator,
+    WeightWriteback,
+)
 from sglang.srt.utils import get_bool_env_var
 
 logger = logging.getLogger(__name__)
+
+_DEVICE_ROUTING_FIELDS = (
+    "physical_to_logical_map",
+    "logical_to_all_physical_map",
+    "logical_to_all_physical_map_num_valid",
+    "logical_to_rank_dispatch_physical_map",
+)
 
 
 class EplbControl:
@@ -70,6 +83,51 @@ class PlanningSpec:
             algorithm=self.algorithm,
         )
         return physical, logical
+
+
+def _make_weight_writeback(weights, buffers, rows) -> WeightWriteback:
+    # The NPU adapter exposes dense byte rows. Merge adjacent copies only
+    # when they are contiguous in both the staging and live storage.
+    ranges = []
+    for source, destination in rows:
+        if ranges:
+            prev_source, prev_dest, length = ranges[-1]
+            if source == prev_source + length and destination == prev_dest + length:
+                ranges[-1] = (prev_source, prev_dest, length + 1)
+                continue
+        ranges.append((source, destination, 1))
+
+    def writeback():
+        for source, destination, length in ranges:
+            for weight, buffer in zip(weights, buffers, strict=True):
+                weight[destination : destination + length].copy_(
+                    buffer[source : source + length]
+                )
+
+    return writeback
+
+
+def _install_routing_layer(current, planned, layer: int) -> None:
+    """Update only the committed layer, preserving captured routing addresses."""
+    for name in (
+        *_DEVICE_ROUTING_FIELDS,
+        "physical_to_logical_map_cpu",
+        "logical_to_all_physical_map_cpu",
+    ):
+        target = getattr(current, name)
+        source = getattr(planned, name)
+        assert (target is None) == (source is None)
+        if target is not None:
+            target[layer].copy_(source[layer])
+
+    for algorithm, (physical, count) in current._mega_gate_maps.items():
+        if algorithm == "static":
+            physical[layer, ..., 0].copy_(
+                current.logical_to_rank_dispatch_physical_map[layer]
+            )
+        else:
+            physical[layer].copy_(current.logical_to_all_physical_map[layer])
+            count[layer].copy_(current.logical_to_all_physical_map_num_valid[layer])
 
 
 class NpuEplbRuntime:
@@ -155,17 +213,11 @@ class NpuEplbRuntime:
             physical_to_logical_map=physical,
             logical_to_all_physical_map=logical,
         )
-        device_fields = (
-            "physical_to_logical_map",
-            "logical_to_all_physical_map",
-            "logical_to_all_physical_map_num_valid",
-            "logical_to_rank_dispatch_physical_map",
-        )
         self._new_metadata = replace(
             cpu_metadata,
             **{
                 name: value.to(self.device, non_blocking=True)
-                for name in device_fields
+                for name in _DEVICE_ROUTING_FIELDS
                 if (value := getattr(cpu_metadata, name)) is not None
             },
         )
@@ -192,12 +244,12 @@ class NpuEplbRuntime:
         start = time.perf_counter()
         # Work.wait orders the current stream after HCCL. The Future can
         # advertise readiness only after that dependency has completed.
-        handles = []
+        copies = DeferredExpertCopies()
         with self.device_module.stream(self._p2p_stream):
             self._p2p_stream.wait_event(self._owner_ready)
             old_layout = self.metadata.physical_to_logical_map_cpu[layer]
             new_layout = self._new_metadata.physical_to_logical_map_cpu[layer]
-            writeback, _ = stage_expert_weights_single_layer(
+            update_expert_weights_single_layer(
                 routed_experts_weights=self.weights[layer],
                 temp_buffers=self.staging,
                 old_physical_to_logical_map=old_layout.tolist(),
@@ -208,8 +260,10 @@ class NpuEplbRuntime:
                 world_size=self.world_size,
                 log_metrics=self.log_metrics,
                 group=self.p2p_group,
-                work_handles=handles,
-                coalesce=True,
+                deferred_copies=copies,
+            )
+            writeback = _make_weight_writeback(
+                self.weights[layer], self.staging, copies.rows
             )
             self._p2p_stream.synchronize()
         self.stage_seconds += time.perf_counter() - start
@@ -219,7 +273,7 @@ class NpuEplbRuntime:
         self._check_stream()
         start = time.perf_counter()
         writeback()
-        self.metadata.update(self._new_metadata, update_layer_ids=[layer])
+        _install_routing_layer(self.metadata, self._new_metadata, layer)
         if layer == self._last_layer:
             self._new_metadata = None
         self.install_enqueue_seconds += time.perf_counter() - start

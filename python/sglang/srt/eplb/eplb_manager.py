@@ -51,14 +51,6 @@ class EPLBManager:
         self._rebalance_num_iterations = get_exec().moe.eplb_rebalance_num_iterations
         self._rebalance_disabled_reason = None
         self._rebalance_disabled_logged = False
-        self._async_coordinator = None
-        self._async_enabled = get_exec().moe.eplb_async_rebalance
-        self._async_sample_floor = 0
-        if (
-            self._async_enabled
-            and get_exec().moe.expert_distribution_recorder_buffer_size <= 0
-        ):
-            raise ValueError("Async EPLB requires a finite positive recorder window")
 
         # Otherwise, the circular buffer will contain stale data. If the case is needed, it can be implemented.
         assert (
@@ -81,21 +73,7 @@ class EPLBManager:
         next(self._main_generator)
 
     def reset_generator(self):
-        if self._async_coordinator is not None:
-            self._async_coordinator.reset()
-            self._async_sample_floor = (
-                get_global_expert_distribution_recorder().completed_forward_passes
-            )
         self._main_generator = self._entrypoint()
-
-    def init_async_rebalance(self):
-        from sglang.srt.hardware_backend.npu.eplb_async import create_npu_async_eplb
-
-        self._async_coordinator = create_npu_async_eplb(
-            self._model_config,
-            self._get_model().routed_experts_weights_of_layer,
-            get_global_expert_location_metadata(),
-        )
 
     def disable_rebalance(self, reason: str):
         self._rebalance_disabled_reason = reason
@@ -125,10 +103,9 @@ class EPLBManager:
                 self._rebalance_disabled_logged = True
             return
 
-        if self._async_enabled:
-            yield from self._rebalance_async()
-            return
+        yield from self._rebalance()
 
+    def _rebalance(self):
         elastic_state = ElasticEPStateManager.instance()
         is_post_scale_rebalance = elastic_state is not None and elastic_state.has_scaled
         # A failed later scale leaves the previously committed world serving.
@@ -209,56 +186,6 @@ class EPLBManager:
             time_end = time.time()
             msg += f" time={time_end - time_start:.3f}s"
         logger.info(msg)
-
-    def _rebalance_async(self):
-        from sglang.srt.eplb.async_rebalance import Phase, RebalanceAborted
-
-        coordinator = self._async_coordinator
-        if coordinator is None:
-            raise RuntimeError(
-                "Async EPLB resources were not initialized before KV sizing"
-            )
-        recorder = get_global_expert_distribution_recorder()
-        enough_samples = (
-            recorder.completed_forward_passes - self._async_sample_floor
-            >= get_exec().moe.expert_distribution_recorder_buffer_size
-        )
-        ready, _ = coordinator.control.vote(
-            coordinator.epoch, Phase.IDLE, -2, enough_samples, False
-        )
-        if not ready:
-            return
-        start = time.perf_counter()
-        snapshot = recorder.dump_record(output_mode="object")
-        if not self._check_rebalance_needed(
-            snapshot["average_utilization_rate_over_window"]
-        ):
-            self._async_sample_floor = recorder.completed_forward_passes
-            return
-        coordinator.control.wait_seconds = 0.0
-        coordinator.start(coordinator.runtime.planner(snapshot["logical_count"]))
-        try:
-            while True:
-                yield
-                if coordinator.poll():
-                    break
-        except RebalanceAborted:
-            self._rebalance_disabled_reason = "asynchronous planning failed"
-            logger.exception("Async EPLB drained; disabling further rebalances")
-        # A partial/mixed-layout statistics window must never feed the next plan.
-        recorder._reset()
-        self._async_sample_floor = recorder.completed_forward_passes
-        runtime = coordinator.runtime
-        logger.info(
-            "Async EPLB epoch=%d layers=%d elapsed=%.3fs control_wait=%.6fs "
-            "stage=%.6fs install_enqueue=%.6fs",
-            coordinator.epoch,
-            coordinator.layers_installed,
-            time.perf_counter() - start,
-            coordinator.control.wait_seconds,
-            runtime.stage_seconds,
-            runtime.install_enqueue_seconds,
-        )
 
     def _compute_expert_location_metadata(
         self, logical_count, *, broadcast_over_world: bool

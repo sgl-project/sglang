@@ -798,17 +798,7 @@ class ModelRunner:
         )
         allocate_mega_moe_buffers(self.model)
         if self.eplb_manager is not None and get_exec().moe.eplb_async_rebalance:
-            if self.startup_weight_load is not None:
-                raise ValueError(
-                    "Async EPLB requires completed weight loading before migration setup"
-                )
-            self.eplb_manager.init_async_rebalance()
-            # Reuse the existing rank-uniform online-update rejection mechanism.
-            if getattr(self.model, "_derived_weight_cache_error", None) is None:
-                self.model._derived_weight_cache_error = (
-                    "Online weight updates are unsupported with async EPLB: "
-                    "the migration worker holds views of the original expert storage."
-                )
+            self.eplb_manager.init_after_model_load(self.startup_weight_load)
 
     def init_memory_saver_adapter(self):
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -853,8 +843,13 @@ class ModelRunner:
             init_lplb_solvers(model_config=self.model_config)
 
     def maybe_init_eplb_manager(self):
+        manager_cls = EPLBManager
+        if get_exec().moe.eplb_async_rebalance and not self.is_draft_worker:
+            from sglang.srt.hardware_backend.npu.eplb_manager import NpuAsyncEPLBManager
+
+            manager_cls = NpuAsyncEPLBManager
         self.eplb_manager = (
-            EPLBManager(
+            manager_cls(
                 model_config=self.model_config,
                 get_model=lambda: self.model,
                 get_expert_location_updater=lambda: self.expert_location_updater,

@@ -810,31 +810,9 @@ def handle_elastic_ep(server_args: Any):
 def handle_eplb_and_dispatch(server_args: Any):
     cfg = resolving_view(server_args)
     if cfg.eplb_async_rebalance:
-        if not cfg.enable_eplb or cfg.device != "npu":
-            raise ValueError(
-                "--eplb-async-rebalance requires --enable-eplb and --device npu"
-            )
-        if cfg.ep_dispatch_algorithm not in (None, "static", "dynamic"):
-            raise ValueError("Async NPU EPLB supports static or dynamic dispatch")
-        if (
-            cfg.pp_size != 1
-            or cfg.elastic_ep_backend is not None
-            or cfg.enable_paged_experts
-            or cfg.enable_memory_saver
-            or cfg.cpu_offload_gb
-            or cfg.offload_group_size > 0
-            or cfg.enable_two_batch_overlap
-            or cfg.enable_single_batch_overlap
-        ):
-            raise ValueError(
-                "Async NPU EPLB requires fixed PP=1 resident weights and single-batch execution"
-            )
-        if cfg.eplb_rebalance_layers_per_chunk not in (None, 1):
-            raise ValueError(
-                "Async NPU EPLB commits one layer per boundary; use chunk size 1"
-            )
-        if cfg.eplb_algorithm.startswith("elasticity"):
-            raise ValueError("Async NPU EPLB does not support elastic placement")
+        from sglang.srt.hardware_backend.npu.eplb import validate_async_eplb_args
+
+        validate_async_eplb_args(cfg)
     if cfg.enable_eplb and (cfg.expert_distribution_recorder_mode is None):
         declare_resolution(
             server_args,

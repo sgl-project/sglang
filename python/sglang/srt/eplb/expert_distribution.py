@@ -146,6 +146,12 @@ class ExpertDistributionRecorder(ABC):
             )
             "reason is that you are using a model that does not support expert distribution"
             "recording. Try setting `get_model_config_for_expert_location` in your model."
+            if get_exec().moe.eplb_async_rebalance:
+                from sglang.srt.hardware_backend.npu.eplb_manager import (
+                    AsyncEplbRecorder,
+                )
+
+                return AsyncEplbRecorder(expert_location_metadata, rank)
             return _ExpertDistributionRecorderReal(expert_location_metadata, rank)
         else:
             return _ExpertDistributionRecorderNoop()
@@ -223,7 +229,6 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         self._expert_location_metadata = expert_location_metadata
 
         self._recording = False
-        self.completed_forward_passes = 0
         self._disable_all = False
         self._record_current_pass = False
         self._current_forward_pass_id = Withable()
@@ -292,7 +297,6 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             self._accumulator.append(
                 forward_pass_id, gatherer_key, single_pass_data, outputs
             )
-        self.completed_forward_passes += 1
 
     def on_select_experts(self, topk_ids: torch.Tensor):
         self._on_hook("on_select_experts", topk_ids=topk_ids)

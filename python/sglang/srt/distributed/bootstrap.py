@@ -193,7 +193,6 @@ def init_parallel_runtime(
     if (
         device == "npu"
         and get_exec().moe.enable_eplb
-        and not get_exec().moe.eplb_async_rebalance
         and get_exec().moe.elastic_ep_backend is None
     ):
         from sglang.srt.hardware_backend.npu.eplb import prewarm_eplb_communication

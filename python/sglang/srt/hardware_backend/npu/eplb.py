@@ -402,11 +402,42 @@ class _ExpertWeightAdapter:
         ]
 
 
+def validate_async_eplb_args(cfg) -> None:
+    if not cfg.enable_eplb or cfg.device != "npu":
+        raise ValueError(
+            "--eplb-async-rebalance requires --enable-eplb and --device npu"
+        )
+    if cfg.ep_dispatch_algorithm not in (None, "static", "dynamic"):
+        raise ValueError("Async NPU EPLB supports static or dynamic dispatch")
+    if (
+        cfg.pp_size != 1
+        or cfg.elastic_ep_backend is not None
+        or cfg.enable_paged_experts
+        or cfg.enable_memory_saver
+        or cfg.cpu_offload_gb
+        or cfg.offload_group_size > 0
+        or cfg.enable_two_batch_overlap
+        or cfg.enable_single_batch_overlap
+    ):
+        raise ValueError(
+            "Async NPU EPLB requires fixed PP=1 resident weights and single-batch execution"
+        )
+    if cfg.eplb_rebalance_layers_per_chunk not in (None, 1):
+        raise ValueError(
+            "Async NPU EPLB commits one layer per boundary; use chunk size 1"
+        )
+    if cfg.eplb_algorithm.startswith("elasticity"):
+        raise ValueError("Async NPU EPLB does not support elastic placement")
+
+
 def prewarm_eplb_communication(group: dist.ProcessGroup | None = None) -> None:
     """Warm the migration communicator before KV sizing."""
     if group is None:
-        from sglang.srt.runtime_context import get_parallel
+        from sglang.srt.runtime_context import get_exec, get_parallel
 
+        # The async runtime warms its dedicated group after weight loading.
+        if get_exec().moe.eplb_async_rebalance:
+            return
         group = get_parallel().tp_group.device_group
     world_size = dist.get_world_size(group)
     _validate_migration_topology(world_size)
