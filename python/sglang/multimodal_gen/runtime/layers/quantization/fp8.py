@@ -67,7 +67,7 @@ from sglang.srt.layers.quantization.utils import (
     is_layer_skipped,
     requantize_with_max_scale,
 )
-from sglang.srt.utils.common import is_gfx1250_supported
+from sglang.srt.utils.device import is_gfx1250_supported
 
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.layers.quantization.rowwise_fp8 import (
@@ -77,7 +77,6 @@ if TYPE_CHECKING:
 
 _is_hip = current_platform.is_hip()
 _is_cuda = current_platform.is_cuda()
-_is_npu = current_platform.is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = current_platform.is_cpu()
 _is_fp8_fnuz = is_fp8_fnuz()

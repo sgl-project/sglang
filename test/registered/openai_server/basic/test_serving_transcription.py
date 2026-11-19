@@ -14,7 +14,8 @@ import numpy as np
 import requests
 import soundfile as sf
 
-from sglang.srt.utils import kill_process_tree, load_audio
+from sglang.srt.multimodal.media_io import load_audio
+from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,

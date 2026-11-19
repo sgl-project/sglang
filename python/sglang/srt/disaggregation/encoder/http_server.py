@@ -40,6 +40,7 @@ from sglang.srt.disaggregation.encoder.server import (
     MMEncoder,
     MMError,
 )
+from sglang.srt.entrypoints.server_utils import add_prometheus_middleware
 from sglang.srt.managers.io_struct import (
     ProfileReq,
     ProfileReqType,
@@ -56,10 +57,8 @@ from sglang.srt.runtime_context import (
     publish,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import (
-    add_prometheus_middleware,
-    configure_logger,
-)
+from sglang.srt.utils import configure_logger
+from sglang.srt.utils.auth import add_api_key_middleware
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 
 logger = logging.getLogger(__name__)
@@ -82,10 +81,6 @@ local_runtime: Optional[EncoderRuntime] = None
 dp_dispatcher: Optional["DPDispatcher"] = None
 
 
-def is_health_check_request(rid: Optional[str]) -> bool:
-    return isinstance(rid, str) and rid.startswith(HEALTH_CHECK_RID_PREFIX)
-
-
 @contextlib.asynccontextmanager
 async def _lifespan(app: FastAPI):
     if dp_dispatcher is not None:
@@ -102,6 +97,8 @@ async def _lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=_lifespan, **fastapi_telemetry_disabled_kwargs())
+# Peers call the data routes without a key, so only the admin levels are enforced here.
+add_api_key_middleware(app, get_keys=lambda: (None, get_serving().admin_api_key))
 
 
 def _register_encoder_url_with_bootstrap():

@@ -29,6 +29,7 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.utils import get_num_fused_shared_experts
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -38,8 +39,9 @@ from sglang.srt.models.glm4_moe_lite import (
     Glm4MoeLiteDecoderLayer,
     Glm4MoeLiteForCausalLM,
 )
-from sglang.srt.runtime_context import get_parallel, get_spec
-from sglang.srt.utils import BumpAllocator, add_prefix, is_npu
+from sglang.srt.models.utils import npu_draft_quant_config
+from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import BumpAllocator
 
 logger = logging.getLogger(__name__)
 
@@ -137,6 +139,8 @@ class Glm4MoeLiteForCausalLMNextN(Glm4MoeLiteForCausalLM):
     # The draft checkpoint reports the NextN architecture name.
     fused_shared_experts_architecture = "Glm4MoeLiteForCausalLMNextN"
 
+    own_quant_config = staticmethod(npu_draft_quant_config)
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -145,8 +149,7 @@ class Glm4MoeLiteForCausalLMNextN(Glm4MoeLiteForCausalLM):
     ) -> None:
         nn.Module.__init__(self)
         self.config = config
-        if is_npu() and get_spec().speculative_draft_model_quantization is None:
-            quant_config = None
+        quant_config = self.own_quant_config(config, quant_config)
         self.quant_config = quant_config
 
         # Drives the inherited loader's shared-expert remap after the build.

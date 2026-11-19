@@ -85,7 +85,6 @@ def get_k_and_s_triton():
         device="cuda",
     ).type(torch.uint8)
 
-    _, buf_numel_per_page = buffer.shape
     _, page_indice_batch_offset = buffer_indexer.shape
     max_seq_len = seq_len_tensor.max().item()
 
@@ -109,7 +108,7 @@ def get_k_and_s_triton():
         seq_len_ptr=seq_len_tensor,
         seq_len_num_pow=seq_num_pow2,
         page_size=page_size,
-        buf_numel_per_page=buf_numel_per_page,
+        buf_page_stride=buffer.stride(0),
         index_head_dim=index_head_dim,
         s_offset_in_page=s_offset_in_page,
         page_indice_batch_offset=page_indice_batch_offset,
@@ -146,7 +145,7 @@ def get_k_and_s_triton():
             seq_len_ptr=seq_len_tensor,
             seq_len_num_pow=seq_num_pow2,
             page_size=page_size,
-            buf_numel_per_page=buf_numel_per_page,
+            buf_page_stride=buffer.stride(0),
             index_head_dim=index_head_dim,
             s_offset_in_page=s_offset_in_page,
             page_indice_batch_offset=page_indice_batch_offset,
@@ -165,7 +164,7 @@ def get_k_and_s_triton():
         seq_len_ptr=seq_len_tensor,
         seq_len_num_pow=seq_num_pow2,
         page_size=page_size,
-        buf_numel_per_page=buf_numel_per_page,
+        buf_page_stride=buffer.stride(0),
         index_head_dim=index_head_dim,
         s_offset_in_page=s_offset_in_page,
         page_indice_batch_offset=page_indice_batch_offset,
