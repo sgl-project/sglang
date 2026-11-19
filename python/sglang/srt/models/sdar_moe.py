@@ -534,6 +534,15 @@ class SDARMoeForCausalLM(nn.Module):
             self.lm_head = PPMissingLayer()
 
         self.logits_processor = LogitsProcessor(config, return_full_logits=True)
+        # Loading from the weight cache bypasses load_weights(), so initialize
+        # the EPLB descriptor here. It reads the expert weights on first use.
+        self.routed_experts_weights_of_layer = LazyValue(
+            lambda: {
+                lid: self.model.layers[lid].mlp.get_moe_weights()
+                for lid in range(self.start_layer, self.end_layer)
+                if isinstance(self.model.layers[lid].mlp, SDARMoeSparseMoeBlock)
+            }
+        )
 
     @property
     def start_layer(self):
@@ -680,15 +689,6 @@ class SDARMoeForCausalLM(nn.Module):
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight)
-
-        if not hasattr(self, "routed_experts_weights_of_layer"):
-            self.routed_experts_weights_of_layer = LazyValue(
-                lambda: {
-                    lid: self.model.layers[lid].mlp.get_moe_weights()
-                    for lid in range(self.start_layer, self.end_layer)
-                    if isinstance(self.model.layers[lid].mlp, SDARMoeSparseMoeBlock)
-                }
-            )
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

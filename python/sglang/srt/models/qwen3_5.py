@@ -2640,6 +2640,11 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
         self.enable_shared_expert_fusion = self.num_fused_shared_experts > 0
 
+        # The EPLB descriptor, built from the expert weights on first use and
+        # dropped by every load_weights(). Loading from the weight cache
+        # bypasses load_weights(), so it starts unbuilt here.
+        self._routed_experts_weights_of_layer = None
+
     def get_hidden_dim(self, module_name: str, layer_idx: int):
         return self.model.get_hidden_dim(module_name, layer_idx)
 
@@ -2990,19 +2995,19 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                         logger.warning(f"Parameter {name} not found in params_dict")
             loaded_params.add(name)
 
-        self._routed_experts_weights_of_layer = LazyValue(
-            lambda: {
-                layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
-                for layer_id in range(self.model.start_layer, self.model.end_layer)
-                if isinstance(self.model.layers[layer_id].mlp, Qwen2MoeSparseMoeBlock)
-            }
-        )
-
+        # New weights may sit in new tensors: rebuild the map on next use.
+        self._routed_experts_weights_of_layer = None
         return loaded_params
 
     @property
     def routed_experts_weights_of_layer(self):
-        return self._routed_experts_weights_of_layer.value
+        if self._routed_experts_weights_of_layer is None:
+            self._routed_experts_weights_of_layer = {
+                layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
+                for layer_id in range(self.model.start_layer, self.model.end_layer)
+                if isinstance(self.model.layers[layer_id].mlp, Qwen2MoeSparseMoeBlock)
+            }
+        return self._routed_experts_weights_of_layer
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
