@@ -731,8 +731,8 @@ class HiCacheController:
                 raise NotImplementedError(
                     "HiCache L3 with DCP requires a generic MLA page layout."
                 )
-        # Otherwise a failed native-hash build surfaces only as per-request lookup
-        # failures while every page keeps being written to storage.
+        # Storage page keys come from the native hash extension;
+        # load it before creating the backend, so attach raises if it cannot build.
         ensure_native_hash()
 
         # Defensive: a previous partial detach may have flipped `enable_storage` but
