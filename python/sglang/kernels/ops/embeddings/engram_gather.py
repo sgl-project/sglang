@@ -11,6 +11,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.arch import current_arch
+
 # e8m0 has no zero: the exponent byte 0 encodes 2**-127.
 _E8M0_ZERO = 2.0**-127
 
@@ -79,33 +81,49 @@ def _engram_gather_kernel(
     out_ptr,
     row_lo,
     row_hi,
+    n,
     DIM: tl.constexpr,
     BLK: tl.constexpr,
+    ROWS: tl.constexpr,
     E8M0_ZERO: tl.constexpr,
     HAS_DST: tl.constexpr,
     MXFP4: tl.constexpr,
 ):
-    row = tl.program_id(0).to(tl.int64)
-    idx = tl.load(ids_ptr + row).to(tl.int64)
-    dst = tl.load(dst_ptr + row).to(tl.int64) if HAS_DST else row
+    # ROWS rows per program, so the dependent loads of a row (id, payload,
+    # scales) overlap with those of the program's other rows.
+    row = tl.program_id(0).to(tl.int64) * ROWS + tl.arange(0, ROWS)
+    valid = row < n
+    idx = tl.load(ids_ptr + row, mask=valid, other=0).to(tl.int64)
+    dst = tl.load(dst_ptr + row, mask=valid, other=0).to(tl.int64) if HAS_DST else row
     # The table holds rows [row_lo, row_hi); an id outside it is not read and
     # comes out as zeros, which is what the sharded all-reduce sums.
-    owned = (idx >= row_lo) & (idx < row_hi)
+    owned = valid & (idx >= row_lo) & (idx < row_hi)
     local = tl.where(owned, idx - row_lo, 0)
     offs = tl.arange(0, DIM)
     vals = _dequant_rows(
         w_ptr.to(tl.int64),
         s_ptr.to(tl.int64),
-        local,
-        offs,
-        owned,
+        local[:, None],
+        offs[None, :],
+        owned[:, None],
         DIM,
         BLK,
         E8M0_ZERO,
         MXFP4,
     )
-    out = tl.where(owned, vals, 0.0)
-    tl.store(out_ptr + dst * DIM + offs, out.to(tl.bfloat16))
+    out = tl.where(owned[:, None], vals, 0.0)
+    tl.store(
+        out_ptr + dst[:, None] * DIM + offs[None, :],
+        out.to(tl.bfloat16),
+        mask=valid[:, None],
+    )
+
+
+def _gather_rows_per_program() -> int:
+    """Rows per program of the local gather: 16 on SM103 and SM107, where one row
+    per program is bound by its chain of dependent loads; 1 on GPUs not measured."""
+    cuda = current_arch().cuda
+    return 16 if cuda is not None and cuda.capability in ((10, 3), (10, 7)) else 1
 
 
 def engram_gather(
@@ -144,7 +162,8 @@ def engram_gather(
         dst = None
         if sort_ids:
             ids, dst = torch.sort(ids)
-        _engram_gather_kernel[(n,)](
+        rows = _gather_rows_per_program()
+        _engram_gather_kernel[(triton.cdiv(n, rows),)](
             weight_ptr,
             scale_ptr,
             ids,
@@ -152,106 +171,13 @@ def engram_gather(
             out,
             row_lo,
             row_hi,
-            DIM=dim,
-            BLK=block_size,
-            E8M0_ZERO=_E8M0_ZERO,
-            HAS_DST=dst is not None,
-            MXFP4=mxfp4,
-        )
-    return out
-
-
-@triton.jit
-def _engram_gather_peer_kernel(
-    ids_ptr,
-    ids_stride,
-    out_ptr,
-    w_bias_ptr,
-    s_bias_ptr,
-    starts_ptr,
-    n_cols,
-    DIM: tl.constexpr,
-    BLK: tl.constexpr,
-    ROWS: tl.constexpr,
-    LOG2_WORLD: tl.constexpr,
-    E8M0_ZERO: tl.constexpr,
-    MXFP4: tl.constexpr,
-):
-    tok = tl.program_id(0).to(tl.int64)
-    cols = tl.program_id(1) * ROWS + tl.arange(0, ROWS)
-    col_ok = cols < n_cols
-    idx = tl.load(ids_ptr + tok * ids_stride + cols, mask=col_ok, other=0).to(tl.int64)
-    # Owner = the last shard whose first row is <= idx; starts is padded to a
-    # power of two with int64 max, so the search never runs past a real shard.
-    owner = tl.zeros([ROWS], dtype=tl.int32)
-    for step in tl.static_range(LOG2_WORLD):
-        probe = owner + (1 << (LOG2_WORLD - 1 - step))
-        start = tl.load(starts_ptr + probe)
-        owner = tl.where(start <= idx, probe, owner)
-    # Bases are pre-biased by each shard's first row, so a global id indexes them.
-    offs = tl.arange(0, DIM)
-    mask = col_ok[:, None]
-    out = _dequant_rows(
-        tl.load(w_bias_ptr + owner)[:, None],
-        tl.load(s_bias_ptr + owner)[:, None],
-        idx[:, None],
-        offs[None, :],
-        mask,
-        DIM,
-        BLK,
-        E8M0_ZERO,
-        MXFP4,
-    )
-    # -0 becomes +0, as the zero-fill + sum of the sharded lookup leaves it, so the
-    # two lookups agree bit for bit.
-    out = tl.where(out == 0.0, 0.0, out)
-    dst = out_ptr + (tok * n_cols + cols)[:, None].to(tl.int64) * DIM + offs[None, :]
-    tl.store(dst, out.to(tl.bfloat16), mask=mask)
-
-
-def engram_gather_peer(
-    ids: torch.Tensor,
-    out: torch.Tensor,
-    w_bias: torch.Tensor,
-    s_bias: torch.Tensor,
-    starts: torch.Tensor,
-    dim: int,
-    block_size: int,
-    mxfp4: bool = False,
-) -> torch.Tensor:
-    """Gather ``ids`` ([T, C] int, unit column stride) into ``out`` ([T, C, dim]
-    bf16, contiguous), reading each id from the shard that owns it.
-
-    ``starts`` ([P] int64, P a power of two) holds each shard's first global row,
-    padded with int64 max; ``w_bias`` / ``s_bias`` ([P] int64) are each shard's
-    row / e8m0 scale base address minus its first row's offset, so any rank's
-    shard (local or a peer mapping over NVLink) is addressed by the global id.
-    Rows are fp8 e4m3, or with ``mxfp4`` E2M1 pairs as in ``engram_gather``.
-    """
-    assert ids.dim() == 2 and ids.stride(1) == 1, (ids.shape, ids.stride())
-    assert ids.dtype in (torch.int32, torch.int64)
-    assert out.is_contiguous() and out.dtype == torch.bfloat16
-    assert out.shape == (*ids.shape, dim), (out.shape, ids.shape)
-    world = starts.numel()
-    assert world & (world - 1) == 0, world
-    t, c = ids.shape
-    if t and c:
-        rows = 8
-        _engram_gather_peer_kernel[(t, triton.cdiv(c, rows))](
-            ids,
-            ids.stride(0),
-            out,
-            w_bias,
-            s_bias,
-            starts,
-            c,
+            n,
             DIM=dim,
             BLK=block_size,
             ROWS=rows,
-            LOG2_WORLD=world.bit_length() - 1,
             E8M0_ZERO=_E8M0_ZERO,
+            HAS_DST=dst is not None,
             MXFP4=mxfp4,
-            num_warps=4,
         )
     return out
 

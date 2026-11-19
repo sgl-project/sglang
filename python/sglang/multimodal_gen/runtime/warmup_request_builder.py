@@ -601,6 +601,9 @@ def build_warmup_reqs(
     if not supports_synthetic_warmup(server_args):
         return []
     sampling_defaults = get_model_sampling_defaults(server_args)
+    warmup_prompt = sampling_defaults.prompt
+    if warmup_prompt is None:
+        warmup_prompt = DEFAULT_PLACEHOLDER_PROMPT
 
     if warmup_resolutions is None:
         width, height = _resolve_default_warmup_resolution(
@@ -665,7 +668,7 @@ def build_warmup_reqs(
             data_type=task_type.data_type(),
             width=width,
             height=height,
-            prompt=DEFAULT_PLACEHOLDER_PROMPT,
+            prompt=warmup_prompt,
         )
         req_kwargs["sampling_params"] = copy(sampling_defaults)
         # Synthetic requests skip SamplingParams._adjust, which resolves this for real ones;
@@ -693,7 +696,6 @@ def build_warmup_reqs(
                 raise RuntimeError(
                     "Warmup image path is required for image-input model"
                 )
-            req_kwargs["prompt"] = DEFAULT_PLACEHOLDER_PROMPT
             default_image_path = sampling_defaults.image_path
             image_count = (
                 len(default_image_path)
@@ -716,9 +718,9 @@ def build_warmup_reqs(
 
         run_real_path_prewarm = server_based_warmup and server_args.enable_torch_compile
         prompts = (
-            (DEFAULT_PLACEHOLDER_PROMPT,) + TORCH_COMPILE_REAL_PATH_PREWARM_PROMPTS
+            (warmup_prompt,) + TORCH_COMPILE_REAL_PATH_PREWARM_PROMPTS
             if run_real_path_prewarm
-            else (DEFAULT_PLACEHOLDER_PROMPT,)
+            else (warmup_prompt,)
         )
         for prompt_idx, prompt in enumerate(prompts):
             prompt_req_kwargs = req_kwargs.copy()

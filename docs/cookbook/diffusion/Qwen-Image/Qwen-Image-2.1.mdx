@@ -304,10 +304,14 @@ These GPUs remain unverified for this model's NVFP4 exports. See the
 Use `--lora-path` and `--lora-merge-mode dynamic|merge` or the runtime adapter APIs.
 Diffusers adapter keys prefixed with `transformer.` map to the native DiT.
 
-Keep eager execution as the default. Breakable CUDA Graph replay requires
-matching resolution and condition-prefix length; unseen shapes run eagerly.
-Text buckets alone do not guarantee replay. SageAttention and Cache-DiT can
-change numerical results and require quality checks for your workload.
+Keep eager execution as the default. For one sample with SP=1, Breakable CUDA
+Graph packs the condition prefix once per request and reuses it across cached
+denoising steps; prefill stays eager. Choose `--bcg-text-buckets` large enough
+for both text and condition-image tokens. Prompts within a captured bucket can
+reuse its graph at the same resolution; uncaptured shapes run eagerly.
+Each bucket keeps separate graph buffers, so measure memory and end-to-end
+latency before enabling BCG. SageAttention and Cache-DiT can change numerical
+results and require quality checks for your workload.
 
 ### Cache-DiT
 

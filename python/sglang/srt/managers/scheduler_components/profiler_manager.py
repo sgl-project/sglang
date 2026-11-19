@@ -21,11 +21,11 @@ from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.managers.io_struct import ProfileReq, ProfileReqOutput, ProfileReqType
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.step_span_utils import set_detailed_annotations_enabled
+from sglang.srt.observability.profile_utils import ProfileManager
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_device, get_parallel
 from sglang.srt.utils import is_mps, is_npu
 from sglang.srt.utils.profile_merger import ProfileMerger
-from sglang.srt.utils.profile_utils import ProfileManager
 from sglang.srt.utils.torch_npu_patch_utils import apply_torch_npu_patches
 
 if TYPE_CHECKING:

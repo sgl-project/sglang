@@ -5,7 +5,7 @@ import torch
 from sglang.kernels.jit.benchmark import marker
 from sglang.kernels.jit.benchmark.utils import DEFAULT_DEVICE
 from sglang.kernels.ops.memory import small_field_copy as small_field_copy_module
-from sglang.kernels.ops.memory.small_field_copy import small_field_copy
+from sglang.kernels.ops.memory.small_field_copy import SmallFieldCopyPlan
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
@@ -56,10 +56,10 @@ def torch_foreach_copy(dsts, srcs):
 def benchmark(batch_size: int, sampling: str, impl: str):
     torch.manual_seed(42)
     dsts, srcs = make_post_verify_inputs(batch_size, sampling)
-    fn = torch_foreach_copy if impl == "torch_foreach" else small_field_copy
+    fn = torch_foreach_copy if impl == "torch_foreach" else SmallFieldCopyPlan()
     with mock.patch.object(small_field_copy_module, "_VEC", impl == "vec16"):
         if impl != "torch_foreach":
-            assert small_field_copy(dsts, srcs)
+            assert fn(dsts, srcs)
         return marker.do_bench(
             fn,
             input_args=(dsts, srcs),

@@ -9,7 +9,7 @@ import logging
 import jinja2
 import transformers.utils.chat_template_utils as hf_chat_utils
 
-from sglang.srt.utils import GLM_MEDIA_CONFIG_KEYS, ImageData, VideoData
+from sglang.srt.multimodal.media_io import GLM_MEDIA_CONFIG_KEYS, ImageData, VideoData
 
 logger = logging.getLogger(__name__)
 
