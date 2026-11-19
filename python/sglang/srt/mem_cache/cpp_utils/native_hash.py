@@ -60,7 +60,7 @@ def _native_hash_input(token_ids: Any) -> tuple[array, int, int, bool]:
         return raw, logical_len, 2 if is_bigram else 1, is_bigram
 
     if is_bigram:
-        return array("I", raw[: logical_len + 1]), logical_len, 2, is_bigram
+        return array("q", raw[: logical_len + 1]), logical_len, 2, is_bigram
 
     if logical_len == 0:
         return array("I"), logical_len, 1, is_bigram
@@ -69,13 +69,13 @@ def _native_hash_input(token_ids: Any) -> tuple[array, int, int, bool]:
     if isinstance(first_token, tuple):
         unit_width = len(first_token)
         return (
-            array("I", (elem for token in raw[:logical_len] for elem in token)),
+            array("q", (elem for token in raw[:logical_len] for elem in token)),
             logical_len,
             unit_width,
             is_bigram,
         )
 
-    return array("I", raw[:logical_len]), logical_len, 1, is_bigram
+    return array("q", raw[:logical_len]), logical_len, 1, is_bigram
 
 
 def get_native_hash(

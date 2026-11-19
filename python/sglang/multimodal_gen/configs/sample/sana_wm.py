@@ -4,10 +4,8 @@
 from dataclasses import dataclass
 from typing import Any, Optional, Sequence, Union
 
-from sglang.multimodal_gen.configs.sample.sampling_params import (
-    DataType,
-    SamplingParams,
-)
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.task_type import DataType
 
 # Type alias for the camera tensor inputs. Accept torch.Tensor, numpy arrays,
 # or nested Python lists — coerced to torch.Tensor downstream in the stage.

@@ -230,6 +230,23 @@ class TestFlux3ServedRegistration(unittest.TestCase):
             add_resolved_pipeline_config_cli_args(parser)
         self.assertEqual(parser.parse_args(args).flux3_alpha, 6.5)
 
+    def test_num_gpus_without_parallel_flags_resolves(self):
+        """The default guidance_scale is None (the package supplies it per
+        request), so the CFG-parallel auto rule must not compare it with 1."""
+        from sglang.multimodal_gen.runtime.server_args import ServerArgs
+        from sglang.multimodal_gen.test.unit.conftest import mock_cuda_platform
+
+        for flow_map in (False, True):
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory) / _MODEL
+                _write_package(root, flow_map=flow_map)
+                with mock_cuda_platform():
+                    args = ServerArgs.from_dict(
+                        {"model_path": str(root), "num_gpus": 2}
+                    )
+                self.assertFalse(args.enable_cfg_parallel)
+                self.assertEqual(args.sp_degree, 2)
+
 
 class TestFlux3ServedOutput(unittest.TestCase):
     def test_decode_output_is_normalized_once_before_worker_materialization(self):
@@ -580,7 +597,6 @@ class TestFlux3RequestControls(unittest.TestCase):
         )
         params.prepare_synthetic_warmup_request_for_queue(req, server_args)
         self.assertEqual(req.num_inference_steps, 1)
-        self.assertEqual(req.extra["warmup_target_num_inference_steps"], 28)
         self.assertEqual(req.extra["cache_dit_num_inference_steps"], 28)
 
     def test_image_api_accepts_the_request_mode(self):
@@ -618,12 +634,108 @@ class TestFlux3RequestControls(unittest.TestCase):
         self.assertEqual(_mode(explicit, config), "t2i")
 
 
+class TestFlux3RequestSizeAlignment(unittest.TestCase):
+    """Requested sizes reach the latent grid as multiples of 16."""
+
+    @staticmethod
+    def _server_args():
+        return SimpleNamespace(
+            model_path=_MODEL,
+            model_id=None,
+            backend="sglang",
+            performance_mode="manual",
+            pipeline_class_name=None,
+            pipeline_config=Flux3ImagePipelineConfig(),
+            output_path=None,
+            comfyui_mode=True,
+            enable_cfg_parallel=False,
+            enable_breakable_cuda_graph=False,
+            enable_torch_compile=False,
+            enable_trace=False,
+            attention_backend_config={},
+            num_gpus=1,
+            warmup_steps=1,
+            warmup_num_frames=None,
+        )
+
+    def _build(self, server_args, fields):
+        from sglang.multimodal_gen.configs.sample.sampling_params import (
+            SamplingParams,
+        )
+        from sglang.multimodal_gen.configs.task_type import DataType
+        from sglang.multimodal_gen.runtime.entrypoints.openai import (
+            utils as openai_utils,
+        )
+
+        with (
+            mock.patch.object(
+                openai_utils, "get_global_server_args", return_value=server_args
+            ),
+            mock.patch.object(
+                SamplingParams,
+                "from_pretrained",
+                return_value=Flux3ImageSamplingParams(),
+            ),
+        ):
+            return openai_utils.build_sampling_params(
+                "size", prompt="a fox", request_data_type=DataType.IMAGE, **fields
+            )
+
+    def test_http_size_aligns_to_the_latent_grid(self):
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.flux3_image import (
+            latent_shape,
+        )
+
+        server_args = self._server_args()
+        for fields, expected in (
+            ({"size": "1920x1080"}, (1920, 1072)),
+            ({"size": "854x480"}, (848, 480)),
+            ({"size": "1000x1000"}, (992, 992)),
+            ({"size": "1000x1000", "image_path": ["reference.png"]}, (992, 992)),
+            ({"size": "1280x720"}, (1280, 720)),
+            ({"size": "1024x1024"}, (1024, 1024)),
+        ):
+            with self.subTest(fields=fields):
+                sampling = self._build(server_args, fields)
+                self.assertEqual((sampling.width, sampling.height), expected)
+                latent_shape(sampling.height, sampling.width)
+
+    def test_warmup_resolution_aligns_to_the_latent_grid(self):
+        from sglang.multimodal_gen.runtime.warmup_request_builder import (
+            build_warmup_reqs,
+        )
+
+        server_args = self._server_args()
+        server_args.pipeline_config.flux3_package = SimpleNamespace(
+            config=SimpleNamespace(
+                dit=SimpleNamespace(flow_map=True),
+                sampler=SimpleNamespace(steps=4),
+            )
+        )
+        with mock.patch(
+            "sglang.multimodal_gen.runtime.warmup_request_builder.get_model_sampling_defaults",
+            return_value=Flux3ImageSamplingParams(),
+        ):
+            reqs = build_warmup_reqs(
+                server_args,
+                warmup_resolutions=["1920x1080"],
+                warmup_input_path="warmup.png",
+                server_based_warmup=True,
+            )
+        self.assertEqual([(r.width, r.height) for r in reqs], [(1920, 1072)])
+
+
 class TestFlux3Lora(unittest.TestCase):
-    def test_rejects_late_lora_before_wrapping_prims_ts_weights(self):
+    _SUPPORTS_LORA = (
+        "sglang.multimodal_gen.runtime.pipelines.flux3_image."
+        "flux3_prims_ts_supports_lora"
+    )
+
+    @staticmethod
+    def _pipeline_with_one_prims_ts_layer():
         from sglang.multimodal_gen.runtime.layers.linear import LinearBase
         from sglang.multimodal_gen.runtime.layers.quantization.flux3_prims_ts import (
             Flux3PrimsTsMethodMixin,
-            Flux3PrimsTsRole,
         )
         from sglang.multimodal_gen.runtime.pipelines.flux3_image import (
             Flux3ImagePipeline,
@@ -635,11 +747,30 @@ class TestFlux3Lora(unittest.TestCase):
         pipeline = Flux3ImagePipeline.__new__(Flux3ImagePipeline)
         pipeline.modules = {"transformer": torch.nn.Sequential(layer)}
         pipeline.lora_target_modules = None
-        pipeline._reject_lora_on_packed_weights()
-        layer.quant_method.prims_ts_role = Flux3PrimsTsRole.SWIGLU
-        with self.assertRaisesRegex(ValueError, "--lora-path"):
+        return pipeline, layer
+
+    def test_rejects_late_lora_before_wrapping_prims_ts_weights(self):
+        from sglang.multimodal_gen.runtime.layers.quantization.flux3_prims_ts import (
+            Flux3PrimsTsRole,
+        )
+
+        pipeline, layer = self._pipeline_with_one_prims_ts_layer()
+        with mock.patch(self._SUPPORTS_LORA, return_value=False):
             pipeline._reject_lora_on_packed_weights()
+            layer.quant_method.prims_ts_role = Flux3PrimsTsRole.SWIGLU
+            with self.assertRaisesRegex(ValueError, "--lora-path"):
+                pipeline._reject_lora_on_packed_weights()
         self.assertIs(pipeline.get_module("transformer")[0], layer)
+
+    def test_accepts_late_lora_when_prims_ts_takes_a_delta(self):
+        from sglang.multimodal_gen.runtime.layers.quantization.flux3_prims_ts import (
+            Flux3PrimsTsRole,
+        )
+
+        pipeline, layer = self._pipeline_with_one_prims_ts_layer()
+        layer.quant_method.prims_ts_role = Flux3PrimsTsRole.SWIGLU
+        with mock.patch(self._SUPPORTS_LORA, return_value=True):
+            pipeline._reject_lora_on_packed_weights()
 
     def test_prefixed_adapter_keys_reach_the_native_modules(self):
         """Prefixed adapters (BFL/ostris ``dit.``, diffusers ``transformer.``)

@@ -22,13 +22,8 @@ if "SGLANG_DIFFUSION_TRACE_FUNCTION" in os.environ:
 
 if TYPE_CHECKING:
     SGLANG_DIFFUSION_NCCL_SO_PATH: str | None = None
-    LD_LIBRARY_PATH: str | None = None
     LOCAL_RANK: int = 0
-    CUDA_VISIBLE_DEVICES: str | None = None
     SGLANG_DIFFUSION_CACHE_ROOT: str = os.path.expanduser("~/.cache/sgl_diffusion")
-    SGLANG_DIFFUSION_CONFIG_ROOT: str = os.path.expanduser("~/.config/sgl_diffusion")
-    SGLANG_DIFFUSION_LOGGING_LEVEL: str = "INFO"
-    SGLANG_DIFFUSION_LOGGING_PREFIX: str = ""
     SGLANG_DIFFUSION_DISABLE_EARLY_VAE_DECODER_CAST: bool = False
     SGLANG_DIFFUSION_DISABLE_VAE_DECODER_STORE: bool = False
     SGLANG_DIFFUSION_DISABLE_MAPPED_WILLNEED: bool = False
@@ -36,15 +31,10 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_DEBUG_HOST_MEMORY: bool = False
     SGLANG_DIFFUSION_DEBUG_LAYERWISE_TIMING: bool = False
     SGLANG_DIFFUSION_DISABLE_LORA_MERGE_CACHE: bool = False
-    SGLANG_DIFFUSION_TARGET_DEVICE: str = "cuda"
     SGLANG_DIFFUSION_PLATFORM_OVERRIDE: str = ""
     SGLANG_EXTERNAL_MODEL_PACKAGE: str = ""
-    MAX_JOBS: str | None = None
-    NVCC_THREADS: str | None = None
-    CMAKE_BUILD_TYPE: str | None = None
-    VERBOSE: bool = False
     SGLANG_DIFFUSION_DISABLE_SP_PAD_MASK: bool = False
-    SGLANG_DIFFUSION_SERVER_DEV_MODE: bool = False
+    SGLANG_DIFFUSION_DISABLE_STAGE_NAN_CHECK: bool = False
     SGLANG_DIFFUSION_DISABLE_MAPPED_COURIER: bool = False
     SGLANG_DIFFUSION_HOST_SPILL_DIR: str = os.path.expanduser(
         "~/.cache/sglang/diffusion/host_spill"
@@ -60,7 +50,7 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS: str | None = None
     SGLANG_DIFFUSION_FLUX3_NATTEN_BACKEND: str | None = None
     SGLANG_DIFFUSION_CFG_GATE_STEP: float = 1.0
-    # cache-dit env vars (primary transformer)
+    SGLANG_DIFFUSION_WAN_TEXT_PADDING: str = "max"
     # on by default; engages only on 2 ranks with peer-to-peer access and falls
     # back to NCCL when unavailable. Set 0 to force NCCL. Keep this in step with
     # the resolver below -- that is the value the runtime reads.
@@ -69,10 +59,12 @@ if TYPE_CHECKING:
     # default while it is validated. Falls back to NCCL when unavailable.
     SGLANG_DIFFUSION_IPC_A2A_MULTI: bool = False
     # head groups for pipelining the Ulysses exchange against dense attention
-    # over the copy-engine transport (MiniMax-H3, and USPAttention's plain path):
+    # over the copy-engine transport (MiniMax-H3, and USPAttention's plain path),
+    # or over the collective one for MiniMax-H3 on aiter:
     # -1 picks the most groups that divide the heads per rank while each group's
-    # call still fills the GPU, and steps aside when the buffers do not fit; 0 or
-    # 1 keeps the sequential exchange; N >= 2 forces N groups
+    # call still fills the GPU (two on the collective path), and steps aside when
+    # the buffers do not fit; 0 or 1 keeps the sequential exchange; N >= 2 forces
+    # N groups
     SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS: int = -1
     # a deadlock backstop, not a per-step budget: a rank can legitimately stall
     # for seconds (layerwise offload, wan2.2 expert-tower swaps), and expiry now
@@ -81,6 +73,10 @@ if TYPE_CHECKING:
     # distinct (n_local, n_peer, dtype) staging pairs kept; each is two
     # slots and is never freed, so multi-resolution serving needs a cap
     SGLANG_DIFFUSION_IPC_A2A_MAX_BUFFERS: int = 16
+    # two-rank TP on one host: a row-parallel layer's epilogue kernel reads both
+    # ranks' partial sums instead of an all-reduced tensor. Set 0 to all-reduce.
+    SGLANG_DIFFUSION_TP_PEER_PARTIALS: bool = True
+    # cache-dit env vars (primary transformer)
     SGLANG_CACHE_DIT_ENABLED: bool = False
     SGLANG_CACHE_DIT_FN: int = 1
     SGLANG_CACHE_DIT_BN: int = 0
@@ -125,6 +121,9 @@ if TYPE_CHECKING:
     SGLANG_LINGBOT_LAZY_VAE_ENCODE_BLACK_FRAMES: int | None = None
     SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND: str | None = None
     SGLANG_DIFFUSION_ENABLE_W8A8_FP8_GEMM: bool = False
+    SGLANG_ENABLE_FUSED_QKNORM_ROPE: bool = True
+    MINIMAX_H3_VAE_DECODER_VIT_FP32_NORM: bool = True
+    MINIMAX_H3_VAE_DECODER_STREAM_TEMPORAL_CAT: bool = True
     SGLANG_DIFFUSION_MXFP8_FA_HEAD_CHUNK_SIZE: int = 4
     SGLANG_DIFFUSION_FP8_WEIGHT_DEQUANT_CACHE: bool = True
     SGLANG_DIFFUSION_ENABLE_COSMOS3_STEP_MIXED_PRECISION: bool = True
@@ -142,13 +141,6 @@ def get_default_cache_root() -> str:
     return os.getenv(
         "XDG_CACHE_HOME",
         os.path.join(os.path.expanduser("~"), ".cache"),
-    )
-
-
-def get_default_config_root() -> str:
-    return os.getenv(
-        "XDG_CONFIG_HOME",
-        os.path.join(os.path.expanduser("~"), ".config"),
     )
 
 
@@ -197,40 +189,12 @@ def _lazy_path(
     return _getter
 
 
-# The begin-* and end* here are used by the documentation generator
-# to extract the used env vars.
+# Diffusion env vars are declared in this dict and read lazily as attributes
+# of this module (e.g. envs.SGLANG_DIFFUSION_IPC_A2A).
 
 # begin-env-vars-definition
 
 environment_variables: dict[str, Callable[[], Any]] = {
-    # ================== Installation Time Env Vars ==================
-    # Target device of sglang-diffusion, supporting [cuda (by default),
-    # rocm, neuron, cpu, openvino]
-    "SGLANG_DIFFUSION_TARGET_DEVICE": _lazy_str(
-        "SGLANG_DIFFUSION_TARGET_DEVICE", "cuda"
-    ),
-    # Maximum number of compilation jobs to run in parallel.
-    # By default this is the number of CPUs
-    "MAX_JOBS": _lazy_str("MAX_JOBS"),
-    # Number of threads to use for nvcc
-    # By default this is 1.
-    # If set, `MAX_JOBS` will be reduced to avoid oversubscribing the CPU.
-    "NVCC_THREADS": _lazy_str("NVCC_THREADS"),
-    # CMake build type
-    # If not set, defaults to "Debug" or "RelWithDebInfo"
-    # Available options: "Debug", "Release", "RelWithDebInfo"
-    "CMAKE_BUILD_TYPE": _lazy_str("CMAKE_BUILD_TYPE"),
-    # If set, sgl_diffusion will print verbose logs during installation
-    "VERBOSE": _lazy_bool("VERBOSE"),
-    # Root directory for SGL-diffusion configuration files
-    # Defaults to `~/.config/sgl_diffusion` unless `XDG_CONFIG_HOME` is set
-    # Note that this not only affects how sgl_diffusion finds its configuration files
-    # during runtime, but also affects how sgl_diffusion installs its configuration
-    # files during **installation**.
-    "SGLANG_DIFFUSION_CONFIG_ROOT": _lazy_path(
-        "SGLANG_DIFFUSION_CONFIG_ROOT",
-        lambda: os.path.join(get_default_config_root(), "sgl_diffusion"),
-    ),
     # ================== Runtime Env Vars ==================
     # Root directory for SGL-diffusion cache files
     # Defaults to `~/.cache/sgl_diffusion` unless `XDG_CACHE_HOME` is set
@@ -241,28 +205,34 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Path to the NCCL library file. It is needed because nccl>=2.19 brought
     # by PyTorch contains a bug: https://github.com/NVIDIA/nccl/issues/1234
     "SGLANG_DIFFUSION_NCCL_SO_PATH": _lazy_str("SGLANG_DIFFUSION_NCCL_SO_PATH"),
-    # when `SGLANG_DIFFUSION_NCCL_SO_PATH` is not set, sgl_diffusion will try to find the nccl
-    # library file in the locations specified by `LD_LIBRARY_PATH`
-    "LD_LIBRARY_PATH": _lazy_str("LD_LIBRARY_PATH"),
     # local rank of the process in the distributed setting, used to determine
     # the GPU device id
     "LOCAL_RANK": _lazy_int("LOCAL_RANK", 0),
-    # used to control the visible devices in the distributed setting
-    "CUDA_VISIBLE_DEVICES": _lazy_str("CUDA_VISIBLE_DEVICES"),
-    # this is used for configuring the default logging level
-    "SGLANG_DIFFUSION_LOGGING_LEVEL": _lazy_str(
-        "SGLANG_DIFFUSION_LOGGING_LEVEL", "INFO"
-    ),
-    # if set, SGLANG_DIFFUSION_LOGGING_PREFIX will be prepended to all log messages
-    "SGLANG_DIFFUSION_LOGGING_PREFIX": _lazy_str("SGLANG_DIFFUSION_LOGGING_PREFIX", ""),
     # Path to the attention configuration file. Only used for sliding tile
     # attention for now.
     "SGLANG_DIFFUSION_ATTENTION_CONFIG": _lazy_path(
         "SGLANG_DIFFUSION_ATTENTION_CONFIG"
     ),
-    # Optional override to force a specific attention backend (e.g. "aiter")
-    "SGLANG_DIFFUSION_ATTENTION_BACKEND": _lazy_str(
-        "SGLANG_DIFFUSION_ATTENTION_BACKEND"
+    # Cosmos3 Multiview-AV attention backend for masked exports: "auto" (default;
+    # FA4 block-sparse on Hopper and Blackwell, FlexAttention Triton elsewhere), "triton" or
+    # "fa4". An explicit pipeline-config multiview_attention_backend wins over it.
+    # Both kernels compute the same attention.
+    "SGLANG_DIFFUSION_COSMOS3_MULTIVIEW_ATTENTION_BACKEND": _lazy_str(
+        "SGLANG_DIFFUSION_COSMOS3_MULTIVIEW_ATTENTION_BACKEND"
+    ),
+    # Debug: under Ulysses, recompute each layer's attention on the gathered
+    # full sequence and log the difference to the sharded result (exactness
+    # check of the collectives; slow, first denoising step only).
+    "SGLANG_DIFFUSION_DEBUG_COSMOS3_MULTIVIEW_SP_CHECK": _lazy_bool(
+        "SGLANG_DIFFUSION_DEBUG_COSMOS3_MULTIVIEW_SP_CHECK"
+    ),
+    "SGLANG_DIFFUSION_COSMOS3_LIDAR_USE_NATTEN": _lazy_bool(
+        "SGLANG_DIFFUSION_COSMOS3_LIDAR_USE_NATTEN"
+    ),
+    # Store the Wan-Animate-2 reference-video K/V cache in FP8 e4m3 with per-(token, head)
+    # scales, dequantized one block at a time into the attention buffer.
+    "SGLANG_DIFFUSION_WAN_ANIMATE_2_FP8_REFERENCE_KV": _lazy_bool(
+        "SGLANG_DIFFUSION_WAN_ANIMATE_2_FP8_REFERENCE_KV", "false"
     ),
     # MXFP8 Attention quantization
     # Applies to both online ``MXFP8Config`` and offline ``ModelSlimConfig`` (W8A8_MXFP8)
@@ -285,6 +255,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_DISABLE_SP_PAD_MASK": _lazy_bool(
         "SGLANG_DIFFUSION_DISABLE_SP_PAD_MASK"
     ),
+    # Skip the per-field torch.isnan() scan (a full-size kernel plus a host
+    # sync) that StageValidators runs alongside shape/type checks on every
+    # request. Shape/type checks still run; only the NaN scan is skipped.
+    "SGLANG_DIFFUSION_DISABLE_STAGE_NAN_CHECK": _lazy_bool(
+        "SGLANG_DIFFUSION_DISABLE_STAGE_NAN_CHECK"
+    ),
     # Select a built-in platform or an installed platform entry point.
     # Empty means automatic plugin activation followed by built-in detection.
     "SGLANG_DIFFUSION_PLATFORM_OVERRIDE": _lazy_str(
@@ -298,10 +274,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_TORCH_PROFILER_DIR": _lazy_path(
         "SGLANG_DIFFUSION_TORCH_PROFILER_DIR"
     ),
-    # If set, sgl_diffusion will run in development mode, which will enable
-    # some additional endpoints for developing and debugging,
-    # e.g. `/reset_prefix_cache`
-    "SGLANG_DIFFUSION_SERVER_DEV_MODE": _lazy_bool("SGLANG_DIFFUSION_SERVER_DEV_MODE"),
     # Kill-switch for the courier thread that ships checkpoint-mapped layers to
     # the device off the compute thread. The courier already falls back to the
     # synchronous copy on any failure; this forces that path up front.
@@ -359,6 +331,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # last conditional-minus-unconditional residual. Keep 1.0 to disable.
     "SGLANG_DIFFUSION_CFG_GATE_STEP": _lazy_float(
         "SGLANG_DIFFUSION_CFG_GATE_STEP", 1.0
+    ),
+    # Wan UMT5 text padding. "max" (default) pads every prompt to 512 tokens.
+    # "longest" encodes only the real tokens; "bucket" rounds up to a multiple of
+    # 64. Both are faster but change the bf16 rounding, so outputs are not
+    # bit-identical to "max".
+    "SGLANG_DIFFUSION_WAN_TEXT_PADDING": _lazy_str(
+        "SGLANG_DIFFUSION_WAN_TEXT_PADDING", "max"
     ),
     # Kernel backend for convrot_int8 (online or serialized ConvRot INT8):
     # "auto" prefers SGLang's JIT-compiled convrot_int8 ops where they build
@@ -419,8 +398,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_DISABLE_LORA_MERGE_CACHE": _lazy_bool(
         "SGLANG_DIFFUSION_DISABLE_LORA_MERGE_CACHE"
     ),
-    # ================== cache-dit Env Vars ==================
-    # Enable cache-dit acceleration for DiT inference
+    # ================== Ulysses / IPC all-to-all ==================
     # CUDA-IPC transport for 2-rank Ulysses all-to-all (NVLink same-node)
     "SGLANG_DIFFUSION_IPC_A2A": _lazy_bool("SGLANG_DIFFUSION_IPC_A2A", "true"),
     "SGLANG_DIFFUSION_IPC_A2A_MULTI": _lazy_bool(
@@ -435,6 +413,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_IPC_A2A_MAX_BUFFERS": _lazy_int(
         "SGLANG_DIFFUSION_IPC_A2A_MAX_BUFFERS", 16
     ),
+    "SGLANG_DIFFUSION_TP_PEER_PARTIALS": _lazy_bool(
+        "SGLANG_DIFFUSION_TP_PEER_PARTIALS", "true"
+    ),
+    # ================== cache-dit Env Vars ==================
+    # Enable cache-dit acceleration for DiT inference
     "SGLANG_CACHE_DIT_ENABLED": _lazy_bool("SGLANG_CACHE_DIT_ENABLED"),
     # Number of first blocks to always compute (DBCache F parameter)
     "SGLANG_CACHE_DIT_FN": _lazy_int("SGLANG_CACHE_DIT_FN", 1),
@@ -490,13 +473,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "SGLANG_LINGBOT_LAZY_VAE_ENCODE_BLACK_FRAMES"
     ),
     # FlashInfer FP4 GEMM backend override for diffusion NVFP4.
-    # When unset, diffusion ModelOpt NVFP4 defaults to flashinfer_trtllm.
-    # Supported values:
-    # - auto
-    # - flashinfer_cudnn
-    # - flashinfer_cutlass
-    # - flashinfer_trtllm
-    # Legacy aliases `cudnn` and `trtllm` are also accepted.
+    # When unset: trtllm (auto on SM120).
+    # Values: auto, cudnn|flashinfer_cudnn, cutlass|flashinfer_cutlass,
+    # trtllm|flashinfer_trtllm.
     "SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND": _lazy_str(
         "SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND"
     ),
@@ -504,6 +483,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # When disabled, FP8 weights are dequantized to compute dtype before matmul.
     "SGLANG_DIFFUSION_ENABLE_W8A8_FP8_GEMM": _lazy_bool(
         "SGLANG_DIFFUSION_ENABLE_W8A8_FP8_GEMM"
+    ),
+    # Kill-switch for the fused QK RMSNorm + RoPE kernels in diffusion DiTs.
+    # Only 0/false/off/no disable it; any other value keeps it on.
+    "SGLANG_ENABLE_FUSED_QKNORM_ROPE": lambda: (
+        os.getenv("SGLANG_ENABLE_FUSED_QKNORM_ROPE", "1").lower()
+        not in {"0", "false", "off", "no"}
+    ),
+    # MiniMax-H3 VAE decoder: run the ViT norms in FP32 (the released recipe).
+    # Only 1/true/yes/on keep it enabled.
+    "MINIMAX_H3_VAE_DECODER_VIT_FP32_NORM": lambda: (
+        os.getenv("MINIMAX_H3_VAE_DECODER_VIT_FP32_NORM", "1").strip().lower()
+        in ("1", "true", "yes", "on")
+    ),
+    # MiniMax-H3 VAE: stitch temporal decode chunks into a preallocated output
+    # as they finish instead of concatenating at the end.
+    "MINIMAX_H3_VAE_DECODER_STREAM_TEMPORAL_CAT": lambda: (
+        os.getenv("MINIMAX_H3_VAE_DECODER_STREAM_TEMPORAL_CAT", "1").strip().lower()
+        not in ("0", "false", "no", "off", "disable", "disabled")
     ),
     # Dequantize storage-only FP8 linear weights to the compute dtype once,
     # at first use (bit-identical outputs; trades weight VRAM for skipping

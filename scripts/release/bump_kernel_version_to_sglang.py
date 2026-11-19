@@ -9,12 +9,8 @@ Updates:
 
 import re
 import sys
+import tomllib
 from pathlib import Path
-
-try:
-    import tomllib  # Python 3.11+
-except ImportError:
-    import tomli as tomllib  # Fallback for older Python versions
 
 
 def get_kernel_version_from_source() -> str:

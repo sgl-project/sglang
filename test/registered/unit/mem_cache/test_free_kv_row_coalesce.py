@@ -31,6 +31,7 @@ class _RowCache(BasePrefixCache):
 
     def __init__(self, allocator, req_to_token):
         self.token_to_kv_pool_allocator = allocator
+        self.logical_page_size = allocator.page_size
         self.req_to_token_pool = SimpleNamespace(req_to_token=req_to_token)
 
     def reset(self):

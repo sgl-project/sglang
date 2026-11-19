@@ -1,9 +1,11 @@
 import unittest
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch, sentinel
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear import gdn_backend
 from sglang.srt.layers.attention.linear.gdn_backend import (
@@ -14,6 +16,7 @@ from sglang.srt.layers.attention.linear.gdn_backend import (
     validate_gdn_mis_backend,
 )
 from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
+    FlashInferGDNKernel,
     maybe_build_flashinfer_checkpoint_plan,
 )
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
@@ -22,12 +25,15 @@ from sglang.srt.layers.attention.linear.utils import (
     resolve_linear_attn_backends,
 )
 from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
+    set_external_prefill_body,
+)
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def _publish(testcase, **fields):
@@ -72,12 +78,88 @@ def make_runner(
             linear_key_head_dim=key_dim,
             linear_value_head_dim=value_dim,
         ),
-        req_to_token_pool=SimpleNamespace(
-            mamba_pool=SimpleNamespace(
-                mamba_cache=SimpleNamespace(temporal=SimpleNamespace(dtype=state_dtype))
+        token_to_kv_pool=SimpleNamespace(
+            layer_router=SimpleNamespace(
+                part_view=lambda part: SimpleNamespace(
+                    mamba_cache=SimpleNamespace(
+                        temporal=SimpleNamespace(dtype=state_dtype)
+                    )
+                )
             )
         ),
     )
+
+
+class TestGDNPrefillGraphExtend(CustomTestCase):
+    @contextmanager
+    def _setup(
+        self, *, cuda=True, enable_mis=False, draft=False, kernel=TritonGDNKernel
+    ):
+        """A target's GDN backend on a setup the graph-safe chain supports, unless
+        the arguments say otherwise."""
+        backend = GDNAttnBackend.__new__(GDNAttnBackend)
+        backend.is_draft_worker = draft
+        backend.enable_mis = enable_mis
+        backend._mamba_chunk_size = 64
+        backend.kernel_dispatcher = SimpleNamespace(
+            extend_kernel=kernel.__new__(kernel)
+        )
+        cache = SimpleNamespace(conv=[torch.zeros(2, 3)], temporal=torch.zeros(2, 3))
+        backend.state_pool = SimpleNamespace(mamba_cache=cache)
+        backend.req_to_token_pool = SimpleNamespace(size=64)
+        backend.prefill_graph_max_seqs = 64
+        backend._model_runner = SimpleNamespace(model=torch.nn.Module())
+        graph = SimpleNamespace(
+            cuda_graph_config=SimpleNamespace(prefill=SimpleNamespace(bs=[512]))
+        )
+        with (
+            patch.object(gdn_backend, "is_cuda", return_value=cuda),
+            patch.object(gdn_backend, "FLA_CHUNK_SIZE", 64, create=True),
+            patch.object(
+                gdn_backend, "buckets_keep_chunk_o_block_size", return_value=True
+            ),
+            patch.object(
+                gdn_backend, "get_exec", return_value=SimpleNamespace(graph=graph)
+            ),
+            patch(
+                "sglang.srt.model_executor.runner.prefill_cuda_graph_runner."
+                "get_prefill_num_tokens_to_capture",
+                return_value=[512],
+            ),
+        ):
+            yield backend
+
+    def test_the_switch_captures_the_extend_only_where_the_setup_supports_it(self):
+        """Off, the default, breakable prefill graphs keep breaking at every GDN
+        layer; on, they capture the target's extend only where this setup supports
+        the graph-safe chain, and a draft's prefill graphs keep their eager path."""
+        for switch, setup, captured in (
+            (False, {}, False),
+            (True, {}, True),
+            (True, dict(cuda=False), False),
+            (True, dict(enable_mis=True), False),
+            (True, dict(draft=True), False),
+        ):
+            with (
+                self.subTest(switch=switch, **setup),
+                envs.SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND.override(switch),
+                self._setup(**setup) as backend,
+            ):
+                self.assertEqual(backend.supports_prefill_graph_extend(), captured)
+
+    def test_another_extend_kernel_is_captured_only_where_an_external_body_asks(self):
+        for body_seqs, captured in (("no body", False), (None, False), (8, True)):
+            with (
+                self.subTest(body_seqs=body_seqs),
+                envs.SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND.override(True),
+                self._setup(kernel=FlashInferGDNKernel) as backend,
+            ):
+                if body_seqs != "no body":
+                    body = MagicMock()
+                    body.linear_prefill_graph_seqs.return_value = body_seqs
+                    set_external_prefill_body(backend._model_runner.model, body)
+                self.assertEqual(backend.supports_prefill_graph_extend(), captured)
+                self.assertEqual(backend.prefill_graph_max_seqs, 8 if captured else 64)
 
 
 class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
@@ -267,6 +349,25 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
                     self.apply_policy(make_runner(self, **runner_args), **hardware)
                 )
 
+    def test_selects_flashinfer_for_a_page_major_pool(self):
+        """The unified pool runs page-major. FlashInfer prefill gathers and
+        scatters each request's state by pool index, whatever the pool's slot
+        pitch, so it qualifies there exactly as on the contiguous pool."""
+        cases = (
+            ("sm100", {}, {}),
+            (
+                "sm90",
+                {"state_dtype": torch.float32},
+                {"capability": (9, 0), "cuda_version": "12.9"},
+            ),
+        )
+        for name, runner_args, hardware in cases:
+            with self.subTest(name=name):
+                runner = make_runner(
+                    self, enable_page_major_kv_layout=True, **runner_args
+                )
+                self.assertEqual(self.apply_policy(runner, **hardware), "flashinfer")
+
     def test_rejects_gdn_config_without_qwen_head_dims(self):
         runner = make_runner(self)
         runner.hybrid_gdn_config = SimpleNamespace()
@@ -275,7 +376,6 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
     def test_rejects_unvalidated_runtime_modes(self):
         cases = (
             ("non_triton_base", {"linear_attn_backend": "cutedsl"}),
-            ("page_major_kv", {"enable_page_major_kv_layout": True}),
             ("dynamic_chunk", {"enable_dynamic_chunking": True}),
             ("unchunked", {"chunked_prefill_size": -1}),
             ("unknown_chunk", {"chunked_prefill_size": None}),
@@ -286,17 +386,21 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
                 self.assertIsNone(self.apply_policy(make_runner(self, **runner_args)))
 
     def test_builds_compact_checkpoint_plan_for_packed_sequences(self):
+        extend_seq_lens = [63, 64, 65, 127, 128, 129]
+        track_mask = [False, True, True, True, True, True]
+        # 65 on the 128-token sequence represents an interior S64
+        # boundary encoded as S64 + 1 by the scheduler.
+        track_seqlens = [63, 64, 65, 127, 65, 129]
+        prefix_lens = [0] * 6
         forward_batch = SimpleNamespace(
-            extend_seq_lens=torch.tensor([63, 64, 65, 127, 128, 129]),
-            mamba_track_mask=torch.tensor([False, True, True, True, True, True]),
-            # 65 on the 128-token sequence represents an interior S64
-            # boundary encoded as S64 + 1 by the scheduler.
-            mamba_track_seqlens=torch.tensor([63, 64, 65, 127, 65, 129]),
-            extend_prefix_lens=torch.zeros(6, dtype=torch.int64),
-        )
-        metadata = SimpleNamespace(
-            track_ssm_h_src=torch.empty(4),
-            track_ssm_h_dst=torch.empty(4),
+            extend_seq_lens=torch.tensor(extend_seq_lens),
+            mamba_track_mask=torch.tensor(track_mask),
+            mamba_track_seqlens=torch.tensor(track_seqlens),
+            extend_prefix_lens=torch.tensor(prefix_lens),
+            extend_seq_lens_cpu=extend_seq_lens,
+            mamba_prefill_track_mask_cpu=track_mask,
+            mamba_track_seqlens_cpu=track_seqlens,
+            extend_prefix_lens_cpu=prefix_lens,
         )
 
         # The chunk size is a derived config member; seed its private cache on a
@@ -304,15 +408,29 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
         override = get_context().override_server_args(_mamba_cache_chunk_size=64)
         override.install()
         self.addCleanup(override.restore)
-        maybe_build_flashinfer_checkpoint_plan(forward_batch, metadata, "cpu")
+        # The scheduler's host copies and the device tensors must plan alike.
+        for use_host_metadata in (False, True):
+            with self.subTest(use_host_metadata=use_host_metadata):
+                metadata = SimpleNamespace(
+                    track_ssm_h_src=torch.empty(4),
+                    track_ssm_h_dst=torch.empty(4),
+                )
+                maybe_build_flashinfer_checkpoint_plan(
+                    forward_batch,
+                    metadata,
+                    "cpu",
+                    use_host_metadata=use_host_metadata,
+                )
 
-        torch.testing.assert_close(
-            metadata.state_checkpoint_cu_starts,
-            torch.tensor([0, 0, 1, 2, 3, 5, 7]),
-        )
-        torch.testing.assert_close(metadata.track_ssm_h_src, torch.tensor([1, 2, 3, 6]))
-        self.assertEqual(metadata.num_state_checkpoints, 7)
-        self.assertEqual(metadata.state_checkpoint_every_n_tokens, 64)
+                torch.testing.assert_close(
+                    metadata.state_checkpoint_cu_starts,
+                    torch.tensor([0, 0, 1, 2, 3, 5, 7]),
+                )
+                torch.testing.assert_close(
+                    metadata.track_ssm_h_src, torch.tensor([1, 2, 3, 6])
+                )
+                self.assertEqual(metadata.num_state_checkpoints, 7)
+                self.assertEqual(metadata.state_checkpoint_every_n_tokens, 64)
 
     def test_decode_tracking_without_h_source_skips_checkpoint_plan(self):
         backend = object.__new__(GDNAttnBackend)
@@ -320,7 +438,9 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
         backend.kernel_dispatcher = SimpleNamespace(extend_uses_state_checkpoints=True)
         metadata = SimpleNamespace(has_mamba_track_mask=True, track_ssm_h_src=None)
         forward_batch = SimpleNamespace(
-            forward_mode=SimpleNamespace(is_target_verify=lambda: False),
+            forward_mode=SimpleNamespace(
+                is_target_verify=lambda: False, is_extend=lambda: False
+            ),
             multi_item_delimiter_indices=None,
             mamba_track_mask=torch.tensor([True]),
             mamba_track_indices=torch.tensor([7]),

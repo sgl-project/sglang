@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Worker-side support for ``--comfyui-mode``.
+"""Worker-side support for ``comfyui_mode``.
 
 ComfyUI owns the sampler loop and calls SGLang once per DiT step. This
 module covers both halves of that contract:
@@ -45,7 +45,7 @@ _CONDITIONING_FIELDS = (
     "sigmas",
 )
 _SESSION_SKIP_EXTRA = frozenset(
-    {"comfyui_session_id", "comfyui_cond_key", "comfyui_cache_fp"}
+    {"comfyui_session_id", "comfyui_cond_key", "comfyui_cache_fp", "comfyui_control"}
 )
 _SESSIONS: dict[str, dict[str, Any]] = {}
 _RUNS: dict[str, Any] = {}

@@ -265,8 +265,11 @@ class _VideoSparseAttentionBackendResolver(_CudaAttentionBackendResolver):
 
 
 # The vendored Triton tile-64 kernel is written against Hopper and Blackwell
-# block-sparse geometry; older architectures fail closed.
-VSA_H3_CAPABILITIES = frozenset({(9, 0), (10, 0), (10, 3)})
+# block-sparse geometry. sm80 (A100) is supported too: there the kernel selects
+# a raw-pointer load path, because Triton does not lower TMA descriptor loads
+# natively before Hopper (see vsa_h3_kernels.py). Older architectures still
+# fail closed.
+VSA_H3_CAPABILITIES = frozenset({(8, 0), (9, 0), (10, 0), (10, 3)})
 
 
 class _VideoSparseAttentionH3BackendResolver(_CudaAttentionBackendResolver):
@@ -282,9 +285,9 @@ class _VideoSparseAttentionH3BackendResolver(_CudaAttentionBackendResolver):
         if capability_tuple not in cls.supported_capabilities:
             found = capability.as_version_str() if capability else "unknown"
             raise ValueError(
-                "VSA-H3 (video_sparse_attn_h3) needs compute capability 9.0 "
-                "(Hopper), 10.0 (B200 / GB200) or 10.3 (B300 / GB300); "
-                f"this device reports {found}."
+                "VSA-H3 (video_sparse_attn_h3) needs compute capability 8.0 "
+                "(A100), 9.0 (Hopper), 10.0 (B200 / GB200) or 10.3 "
+                f"(B300 / GB300); this device reports {found}."
             )
         try:
             from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn_h3 import (  # noqa: F401
@@ -426,7 +429,8 @@ class _VMOBAAttentionBackendResolver(_CudaAttentionBackendResolver):
     @classmethod
     def resolve(cls, platform) -> str:
         try:
-            from kernel.attn.vmoba_attn.vmoba import moba_attn_varlen  # noqa: F401
+            # the in-tree VMoBA runs on FlashAttention 2's varlen kernels
+            import flash_attn.flash_attn_interface  # noqa: F401
 
             from sglang.multimodal_gen.runtime.layers.attention.backends.vmoba import (  # noqa: F401
                 VMOBAAttentionBackend,
@@ -435,7 +439,9 @@ class _VMOBAAttentionBackendResolver(_CudaAttentionBackendResolver):
             return "sglang.multimodal_gen.runtime.layers.attention.backends.vmoba.VMOBAAttentionBackend"
         except ImportError as e:
             logger.error("Failed to import Video MoBA Attention backend: %s", str(e))
-            raise ImportError("Video MoBA Attention backend is not installed. ") from e
+            raise ImportError(
+                "Video MoBA Attention backend requires flash-attn >= 2.7.1."
+            ) from e
 
 
 class _SubBlockSparseAttentionBackendResolver(_CudaAttentionBackendResolver):
@@ -513,16 +519,25 @@ class _FlashAttention2BackendResolver(_CudaAttentionBackendResolver):
         return "sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn_2.FlashAttention2Backend"
 
 
+class _FlashInferFA2BackendResolver(_CudaAttentionBackendResolver):
+    backend = AttentionBackendEnum.FLASHINFER_FA2
+
+    @classmethod
+    def resolve(cls, platform) -> str:
+        try:
+            from flashinfer import single_prefill_with_kv_cache  # noqa: F401
+        except ImportError as error:
+            raise ValueError("FlashInfer FA2 requires flashinfer-python.") from error
+        return "sglang.multimodal_gen.runtime.layers.attention.backends.flashinfer_fa2.FlashInferFA2Backend"
+
+
 class _FlashAttentionBackendResolver(_CudaAttentionBackendResolver):
     backend = AttentionBackendEnum.FA
 
     @classmethod
     def resolve(cls, platform) -> AttentionBackendEnum:
-        if platform.is_sm120():
-            logger.info(
-                "FlashAttention is not supported on SM12.x in this build; falling back to Torch SDPA."
-            )
-            return AttentionBackendEnum.TORCH_SDPA
+        # Explicit FA requests use the native FA4 preparation on Blackwell.
+        # The SM12.x default remains SDPA in _resolve_default_attn_backend.
         return AttentionBackendEnum.FA
 
 
@@ -530,13 +545,13 @@ class _FP8FlashAttentionSM120BackendResolver(_CudaAttentionBackendResolver):
     backend = AttentionBackendEnum.FP8_FA_SM120
 
     # CuTe-DSL mma.sync FP8 kernel written for SM120 (GeForce RTX 50 / RTX PRO
-    # Blackwell). Dense non-causal head_dim 128 only; the backend itself falls
+    # Blackwell) and SM121 (GB10). Dense non-causal head_dim 128 only; it falls
     # back to cuDNN SDPA for other calls.
     @classmethod
     def resolve(cls, platform) -> str | AttentionBackendEnum:
-        if platform.get_device_capability() != (12, 0):
+        if platform.get_device_capability() not in ((12, 0), (12, 1)):
             logger.warning(
-                "fp8_fa_sm120 attention needs an SM120 device; falling back to cuDNN SDPA."
+                "fp8_fa_sm120 attention needs SM120/SM121; falling back to cuDNN SDPA."
             )
             return AttentionBackendEnum.TORCH_CUDNN_SDPA
         try:
@@ -578,6 +593,7 @@ _CUDA_ATTENTION_BACKEND_RESOLVERS = {
         _VMOBAAttentionBackendResolver,
         _SubBlockSparseAttentionBackendResolver,
         _FlashAttention2BackendResolver,
+        _FlashInferFA2BackendResolver,
         _FlashAttentionBackendResolver,
         _FP8FlashAttentionSM120BackendResolver,
     )
@@ -589,26 +605,22 @@ class CudaPlatformBase(Platform):
     device_name: str = "cuda"
     device_type: str = "cuda"
     dispatch_key: str = "CUDA"
-    device_control_env_var: str = "CUDA_VISIBLE_DEVICES"
 
     @classmethod
     def get_local_torch_device(cls) -> torch.device:
         return torch.device(f"cuda:{envs.LOCAL_RANK}")
 
     @classmethod
-    def get_device_capability(cls, device_id: int = 0) -> DeviceCapability | None:
-        raise NotImplementedError
+    def synchronize(cls) -> None:
+        torch.cuda.synchronize()
 
     @classmethod
-    def is_async_output_supported(cls, enforce_eager: bool | None) -> bool:
-        if enforce_eager:
-            logger.warning(
-                "To see benefits of async output processing, enable CUDA "
-                "graph. Since, enforce-eager is enabled, async output "
-                "processor cannot be used"
-            )
-            return False
-        return True
+    def empty_cache(cls) -> None:
+        torch.cuda.empty_cache()
+
+    @classmethod
+    def get_device_capability(cls, device_id: int = 0) -> DeviceCapability | None:
+        raise NotImplementedError
 
     @classmethod
     @lru_cache(maxsize=1)
@@ -779,7 +791,11 @@ class CudaPlatformBase(Platform):
                 )
 
                 supported_sizes = FlashAttentionBackend.get_supported_head_sizes()
-                if head_size not in supported_sizes:
+                # FA4 on sm100 serves every multiple of 8 up to 128, e.g. Qwen-VL vision heads (72, 80)
+                fa4_head_size = (
+                    cls.is_blackwell() and head_size <= 128 and head_size % 8 == 0
+                )
+                if head_size not in supported_sizes and not fa4_head_size:
                     logger.info(
                         "Cannot use FlashAttention backend for head size %d.",
                         head_size,
@@ -806,6 +822,11 @@ class CudaPlatformBase(Platform):
         head_size: int,
         dtype: torch.dtype,
     ) -> str:
+        if selected_backend == AttentionBackendEnum.FLASHINFER_FA2 and dtype not in (
+            torch.float16,
+            torch.bfloat16,
+        ):
+            raise ValueError("FlashInfer FA2 requires float16 or bfloat16 inputs.")
         if selected_backend is None:
             target_backend = cls._resolve_default_attn_backend()
             if target_backend == AttentionBackendEnum.FA and cls.is_blackwell():
@@ -848,11 +869,12 @@ class CudaPlatformBase(Platform):
     @classmethod
     def optimize_vae(cls, vae: torch.nn.Module) -> torch.nn.Module:
         """Install the quality-gated FLUX.2 / AutoencoderKL / Wan / Qwen-Image /
-        MiniMax-H3 VAE decoder fast paths.
+        MiniMax-H3 VAE fast paths.
 
         Requests with quality="lossless" or "high" run the fast paths; the
         "exact" default runs the original module path bit-for-bit. See
-        flux2_vae_cuda_opt and wan_vae_cuda_opt for details.
+        flux2_vae_cuda_opt, wan_vae_cuda_opt and minimax_h3_vae_cuda_opt for
+        details.
         """
         try:
             from sglang.multimodal_gen.runtime.models.vaes.flux2_vae_cuda_opt import (

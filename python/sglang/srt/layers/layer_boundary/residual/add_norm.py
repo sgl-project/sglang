@@ -31,13 +31,15 @@ from sglang.srt.layers.layer_boundary.adapters.attention import (
     get_attn_tp_context,
 )
 from sglang.srt.layers.layer_boundary.residual import LayerResidualOps
+from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.quantization.fp8_utils import (
     _use_aiter_bpreshuffle_gfx95,
     emit_transposed_bpreshuffle_scale,
     materialize_bpreshuffle_fp8_scale_tuple,
     view_aiter_fused_rms_transposed_fp8_scale_tuple,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_exec, get_parallel, get_platform
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -59,6 +61,7 @@ _is_gfx1250_supported = is_gfx1250_supported()
 
 if _use_aiter:
     from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype as _aiter_fp8_dtype
+    from sglang.srt.layers.layer_boundary.residual import add_norm_hip as _hip
 
     if _is_gfx1250_supported:
         from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
@@ -136,15 +139,13 @@ def _fused_rmsnorm_fp8_per_token_quant(
         return (out_fp8, scale.unsqueeze(1))
 
 
-# TODO: According to the discussion in https://github.com/flashinfer-ai/flashinfer/issues/1223#issuecomment-3047256465
-# We set the max token num to 128 for allreduce fusion with min-latency case(use_oneshot=True).
+# Largest batch the non-CuTe-DSL FlashInfer all-reduce fusion runs on;
+# it also sizes that fusion's workspace, pre-allocated before graph capture.
 FUSE_ALLREDUCE_MAX_BATCH_SIZE = 2048
 
 
 def flashinfer_ar_fusion_applies(batch_size: int):
     return (
-        # NOTE: flashinfer 0.6.1 caused performance regression on sm100 for allreduce fusion
-        # Ref: https://github.com/sgl-project/sglang/issues/17237
         (_is_sm90_supported or _is_sm100_supported)
         and _is_flashinfer_available
         and not is_dp_attention_enabled()
@@ -213,8 +214,13 @@ def _update_and_read_residual_aiter_fp8_group(
 ):
     """aiter (ROCm gfx95) fused RMSNorm + FP8 group quant. Under DSA the
     unquantized bf16 output rides along as a third element, so the DSA indexer
-    can skip dequantizing. post_residual_addition is not applied on this path."""
+    can skip dequantizing. post_residual_addition is not applied on this path
+    unless the norm is a Gemma norm."""
     needs_bf16 = get_attn_tp_context().is_dsa
+    if isinstance(norm, GemmaRMSNorm):
+        return _hip.gemma_norm_fp8(
+            norm, hidden_states, residual, post_residual_addition, "fp8", needs_bf16
+        )
     emit_transposed_scale = emit_transposed_bpreshuffle_scale(
         hidden_states.shape[0],
         on_bpreshuffle_gfx95=_use_aiter_bpreshuffle_gfx95,
@@ -244,6 +250,10 @@ def _update_and_read_residual_aiter_fp8_group(
 def _update_and_read_residual_aiter_fp8_per_token(
     norm, hidden_states, residual, post_residual_addition
 ):
+    if _is_gfx95_supported and isinstance(norm, GemmaRMSNorm):
+        return _hip.gemma_norm_fp8(
+            norm, hidden_states, residual, post_residual_addition, "fp8_per_token"
+        )
     if residual is None:
         output = _fused_rmsnorm_fp8_per_token_quant(
             hidden_states, norm.weight.data, norm.variance_epsilon
