@@ -132,6 +132,8 @@ from sglang.srt.models.kimi_k3_amd.moe import (
     KimiK3MoEHipMixin,
     link_hip_paths,
     prepare_hip_paths,
+    routed_mxfp4_intermediate_align_hip,
+    router_logits_contiguous_hip,
     row_shard_bank_hooks_hip,
 )
 from sglang.srt.models.kimi_k3_vl import (
@@ -175,7 +177,6 @@ _EXPERT_WEIGHT_NAME = re.compile(r"experts\.\d+\.w[123]\.")
 _is_hip = is_hip()
 _is_gfx95 = is_gfx95_supported()
 _is_npu = is_npu()
-_aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
 if _is_gfx95:
     from sglang.srt.models.kimi_k3_amd.kimi_k3_hip import (
         aggregate_stream_hip,
@@ -616,6 +617,8 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
 
             moe_quant_config = Mxfp4Config(is_checkpoint_mxfp4_serialized=True)
 
+        self._router_logits_contiguous = router_logits_contiguous_hip()
+
         # Routed experts (operate in moe_hidden_size space)
         # gate_up_interleaved=False: K3 loads per-expert w1/w3 into non-interleaved layout
         self.experts = get_moe_impl_class(moe_quant_config)(
@@ -630,6 +633,7 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
             gemm1_alpha=config.activation_situ_beta,
             gemm1_clamp_limit=config.activation_situ_linear_beta,
             gate_up_interleaved=False,
+            mxfp4_intermediate_align=routed_mxfp4_intermediate_align_hip(),
             # trtllm fused-routing MoE backends (e.g. nvfp4 w4a4) route inside
             # the kernel and require the routing method; K3 uses DSv3-style
             # grouped topk with e_score_correction_bias.
@@ -1612,7 +1616,7 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
         gate_up, router_logits, routed_input = torch.split(
             fused, self._front_sizes, dim=-1
         )
-        if hidden_states.shape[0] > 1 and _is_hip and not _aiter_k3_opt:
+        if hidden_states.shape[0] > 1 and self._router_logits_contiguous:
             router_logits = router_logits.contiguous()
         if cast_routed and self._moe_front_needs_dense_bf16:
             # off an fp32 front the cast allocates the dense buffer, so the
@@ -2354,7 +2358,7 @@ class KimiK3DeltaAttention(nn.Module):
             layer._k3_hip_fused_decode_backend = ""
             layer._k3_hip_fused_decode_ops = None
             w = layer.conv_weights
-            backend = envs.SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND.get().lower()
+            backend = envs.SGLANG_OPT_HIP_K3_KDA_FUSED_BACKEND.get().lower()
             fused_ops = {
                 "aiter": kda_fused_decode_aiter_hip,
                 "gfx950": kda_fused_decode_gfx950,

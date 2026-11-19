@@ -1091,9 +1091,13 @@ class Envs:
     SGLANG_M3_USE_AITER_FUSED_QKNORM = EnvBool(True)
     SGLANG_USE_AITER_AG = EnvBool(True)
     # Kimi-K3 gfx950 prefill: the MoE front on row shards, shared experts TP-sharded
-    SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT = EnvBool(False)
+    SGLANG_OPT_HIP_K3_ROW_SHARDED_ROUTED_FRONT = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT"
+    )
     # Kimi-K3 gfx950 prefill: leave the stream on each rank's rows after the row-sharded tail
-    SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM = EnvBool(False)
+    SGLANG_OPT_HIP_K3_ROW_SHARDED_STREAM = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM"
+    )
     # GiB of gfx950 memory kept out of torch's allocator for HSA queue scratch (0: none)
     SGLANG_ROCM_RUNTIME_RESERVE_GB = EnvFloat(0.0)
     # Run the gfx950 TP4 quick all-reduce on the JIT build (quick_all_reduce_hip) instead of
@@ -1203,10 +1207,14 @@ class Envs:
     SGLANG_ROCM_SMALLM_FP8_BS = EnvBool(True)
     # Fused Kimi-K3 KDA decode kernel: "gfx950" (SGLang HIP) or "aiter" (FlyDSL);
     # any other value keeps the unfused KDA decode.
-    SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND = EnvStr("gfx950")
+    SGLANG_OPT_HIP_K3_KDA_FUSED_BACKEND = EnvStrWithAlias(
+        "gfx950", deprecated_name="SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND"
+    )
     # FlyDSL kernel behind the "aiter" fused KDA decode: "sglang" or "aiter" pins one;
     # "auto" prefers the vendored copy, and AITER's for a state dtype only it takes.
-    SGLANG_USE_HIP_K3_FLYDSL_SOURCE = EnvStr("auto")
+    SGLANG_OPT_HIP_K3_FLYDSL_SOURCE = EnvStrWithAlias(
+        "auto", deprecated_name="SGLANG_USE_HIP_K3_FLYDSL_SOURCE"
+    )
     # Quark MXFP4 dense linear on gfx95: use AITER's preshuffled ASM/CK FP4 GEMM
     # (shared a4w4 tuned CSVs) instead of the Triton gemm_afp4wfp4 path.
     SGLANG_ROCM_USE_AITER_FP4_ASM_GEMM = EnvBool(False)
@@ -1215,6 +1223,17 @@ class Envs:
     # output columns ride along nearly free.
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ = EnvBool(True)
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS = EnvInt(256)
+    # Read only by the Kimi-K3 MoE's ROCm hooks (models/kimi_k3_amd/moe.py): declare
+    # a 128-aligned MXFP4 intermediate on its experts (FusedMoE.mxfp4_intermediate_align)
+    # and skip the router-logits contiguous copy on HIP.
+    SGLANG_OPT_HIP_K3_AITER = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_AITER_K3_OPT"
+    )
+    # Use the radix-4 HIP router for K3 top-k on the AITER path; other routing
+    # shapes keep AITER's kernel.
+    SGLANG_OPT_HIP_K3_RADIX4_TOPK = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_K3_RADIX4_TOPK"
+    )
     # On gfx95x with SGLANG_USE_AITER=1, quantize the BF16 Qwen3.5/3.8 GDN
     # in_proj_qkvz and out_proj to MXFP4 after loading. 0 keeps them BF16.
     SGLANG_ROCM_GDN_ONLINE_MXFP4 = EnvBool(True)
@@ -1826,7 +1845,11 @@ class Envs:
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_OPT_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
     SGLANG_OPT_FLASHINFER_VERIFY_HOST_PLAN = EnvBool(False)
-    SGLANG_OPT_FUSED_KDA_VERIFY = EnvBool(False)
+    # KDA chain (topk 1) target verify: conv + gated delta rule in one launch
+    # (fused_kda_conv_recurrent_verify.py). Only read with --linear-attn-verify-backend triton.
+    SGLANG_OPT_KDA_TRITON_CHAIN_VERIFY = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_OPT_FUSED_KDA_VERIFY"
+    )
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
     # The DFLASH draft KV ring (speculative/dflash_draft_ring.py); resolved at
@@ -2567,8 +2590,6 @@ class Envs:
     # and the latent up_proj tail above the fused-GEMV range (k3_ar_fusion
     # gemm_ag_up_fits). Online weight updates are rejected while on.
     SGLANG_K3_SHARDED_MOE = EnvBool(True)
-    # Use the ROCm radix-4 router for covered K3 top-k workloads.
-    SGLANG_K3_RADIX4_TOPK = EnvBool(False)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MIN_HITS = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MAX_SEQLEN = EnvInt(6144)
@@ -2752,8 +2773,8 @@ REMOVED_ENVS: Dict[str, str] = {
     "SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW": "use SGLANG_OPT_RELEASE_PREFILL_SWA",
     "SYNC_TOKEN_IDS_ACROSS_TP": "use SGLANG_SYNC_TOKEN_IDS_ACROSS_TP",
     "SGLANG_K31_DECODE_MOE": "use SGLANG_USE_CUDA_MXFP4_DECODE_MOE",
-    "SGLANG_ROCM_K3_KDA_FUSED_BACKEND": "use SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND",
-    "SGLANG_K3_FLYDSL_SOURCE": "use SGLANG_USE_HIP_K3_FLYDSL_SOURCE",
+    "SGLANG_ROCM_K3_KDA_FUSED_BACKEND": "use SGLANG_OPT_HIP_K3_KDA_FUSED_BACKEND",
+    "SGLANG_K3_FLYDSL_SOURCE": "use SGLANG_OPT_HIP_K3_FLYDSL_SOURCE",
     "SGLANG_AITER_MLA_DCP_DECODE_BACKEND": "use SGLANG_AITER_MLA_DECODE_BACKEND",
     "SGLANG_EPLB_ROCM_P2P_BATCH_CHUNK_SIZE": "use SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE",
     "SGLANG_Q35MF_BK_VEC_COPY": "use SGLANG_OPT_SMALL_FIELD_COPY_VECTORIZED",

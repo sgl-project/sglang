@@ -1,7 +1,7 @@
 """The FFN read of Kimi-K3's gfx950 row-sharded latent-MoE tail
 (``AttnBankState.ffn_row_shard``): the attention output's sum completed onto
 this rank's 1/TP of the rows and read there, leaving the written residual on the
-shard. With SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM the stream stays on those
+shard. With SGLANG_OPT_HIP_K3_ROW_SHARDED_STREAM the stream stays on those
 (possibly short) row shards, and the next read aggregates the bank there and
 gathers what it read."""
 
@@ -59,7 +59,7 @@ def gather_row_shards(rows: torch.Tensor, num_tokens: int) -> torch.Tensor:
 def stream_rows(rows: int, total: int, parallel) -> Optional[slice]:
     """_bank_rows of a row-sharded stream: the bank rows of this rank's row_shard
     when ``rows`` is its (possibly short or empty) row count, else None."""
-    if not envs.SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM.get():
+    if not envs.SGLANG_OPT_HIP_K3_ROW_SHARDED_STREAM.get():
         return None
     start, valid = row_shard(total, parallel.attn_tp_size, parallel.attn_tp_rank)
     return slice(start, start + valid) if rows == valid else None
@@ -70,10 +70,7 @@ def gather_stream_read(bank: "AttnResidual", normed: torch.Tensor) -> torch.Tens
     its normed input gathered onto every row (the residual stays on the shard).
     Any other read as it is."""
     total = bank.block_residual.shape[0]
-    if (
-        not envs.SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM.get()
-        or normed.shape[0] == total
-    ):
+    if not envs.SGLANG_OPT_HIP_K3_ROW_SHARDED_STREAM.get() or normed.shape[0] == total:
         return normed
     return gather_row_shards(normed, total)
 
@@ -84,7 +81,7 @@ def gather_stream_output(
     """The output read of a stream the MoE tail left on (possibly short) row
     shards: (the read with its normed rows gathered, None). Any other read
     returns (read, rows) for AttnBankOutputRead's own gather."""
-    if rows is None or not envs.SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM.get():
+    if rows is None or not envs.SGLANG_OPT_HIP_K3_ROW_SHARDED_STREAM.get():
         return read, rows
     total = bank.block_residual.shape[0]
     return (gather_row_shards(read[0], total), read[1]), None

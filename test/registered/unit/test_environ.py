@@ -221,6 +221,101 @@ class TestDeprecatedEnvRegistry(unittest.TestCase):
         self.assertEqual(os.environ[new_name], "ABC")
 
 
+class TestKimiK3HipRenamedEnvs(unittest.TestCase):
+    """The pre-rename Kimi-K3 ROCm names keep working with a FutureWarning."""
+
+    RENAMED = (
+        # (new name, old name, value set on the old name, parsed value)
+        (
+            "SGLANG_OPT_HIP_K3_ROW_SHARDED_ROUTED_FRONT",
+            "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT",
+            "1",
+            True,
+        ),
+        (
+            "SGLANG_OPT_HIP_K3_ROW_SHARDED_STREAM",
+            "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM",
+            "1",
+            True,
+        ),
+        (
+            "SGLANG_OPT_HIP_K3_KDA_FUSED_BACKEND",
+            "SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND",
+            "aiter",
+            "aiter",
+        ),
+        (
+            "SGLANG_OPT_HIP_K3_FLYDSL_SOURCE",
+            "SGLANG_USE_HIP_K3_FLYDSL_SOURCE",
+            "sglang",
+            "sglang",
+        ),
+        ("SGLANG_OPT_HIP_K3_AITER", "SGLANG_AITER_K3_OPT", "1", True),
+        ("SGLANG_OPT_HIP_K3_RADIX4_TOPK", "SGLANG_K3_RADIX4_TOPK", "1", True),
+    )
+
+    def test_old_name_forwards_with_warning(self):
+        for new_name, old_name, raw, expected in self.RENAMED:
+            field = vars(type(envs))[new_name]
+            with self.subTest(new_name=new_name), patch.dict(os.environ):
+                os.environ.pop(new_name, None)
+                os.environ[old_name] = raw
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always")
+                    self.assertEqual(field.get(), expected)
+                self.assertEqual(len(caught), 1)
+                self.assertIs(caught[0].category, FutureWarning)
+                self.assertIn(old_name, str(caught[0].message))
+                self.assertIn(new_name, str(caught[0].message))
+
+    def test_new_name_wins_without_warning(self):
+        for new_name, old_name, raw, _ in self.RENAMED:
+            field = vars(type(envs))[new_name]
+            with self.subTest(new_name=new_name), patch.dict(os.environ):
+                os.environ[old_name] = raw
+                with field.override(field.default):
+                    with warnings.catch_warnings(record=True) as caught:
+                        warnings.simplefilter("always")
+                        self.assertEqual(field.get(), field.default)
+                    self.assertEqual(caught, [])
+
+
+# Renamed env vars still read through the old name: new name -> deprecated alias.
+RENAMED_ENVS = {
+    "SGLANG_OPT_KDA_TRITON_CHAIN_VERIFY": "SGLANG_OPT_FUSED_KDA_VERIFY",
+}
+
+
+class TestRenamedEnvAliases(unittest.TestCase):
+    def test_old_name_forwards_with_future_warning(self):
+        for new_name, old_name in RENAMED_ENVS.items():
+            field = vars(type(envs))[new_name]
+            with self.subTest(new_name=new_name), patch.dict(os.environ):
+                self.assertEqual(field.deprecated_name, old_name)
+                os.environ.pop(new_name, None)
+                os.environ[old_name] = "1"
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always")
+                    self.assertIs(field.get(), True)
+                messages = [
+                    str(w.message) for w in caught if w.category is FutureWarning
+                ]
+                self.assertEqual(len(messages), 1)
+                self.assertIn(old_name, messages[0])
+                self.assertIn(new_name, messages[0])
+
+    def test_new_name_wins_over_old_name(self):
+        for new_name, old_name in RENAMED_ENVS.items():
+            field = vars(type(envs))[new_name]
+            with self.subTest(new_name=new_name), patch.dict(os.environ):
+                os.environ[new_name] = "0"
+                os.environ[old_name] = "1"
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always")
+                    self.assertIs(field.get(), False)
+                self.assertFalse([w for w in caught if w.category is FutureWarning])
+
+
 class TestDocumentedBooleanKnobs(unittest.TestCase):
     """Documented booleans must accept `true`/`false`: compared to "1" or "0" at the
     read site, `true` was ignored and even turned the MLA RoPE fusion off."""

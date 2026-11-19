@@ -51,7 +51,6 @@ _use_aiter = _is_hip and (
     get_bool_env_var("SGLANG_USE_AITER") or _is_gfx95 or is_gfx1250_supported()
 )
 _is_shuffle_moe_mxfp4 = _use_aiter and _is_gfx95
-_aiter_k3_opt = _use_aiter and get_bool_env_var("SGLANG_AITER_K3_OPT")
 if _use_aiter:
     from aiter.ops.shuffle import (
         moe_shuffle_scale,
@@ -279,8 +278,12 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         # TP8 that changes the native 384 intermediate width (192 packed) into
         # 512 (256 packed), adding 33% zero work and preventing the native-shape
         # MXMoE tuning table from binding. The K3 FlyDSL path supports 128-wide
-        # alignment in the unpacked dimension, so retain the checkpoint shape.
-        pad_for_aiter = _use_aiter and not (_aiter_k3_opt or _use_triton_w4a16)
+        # alignment in the unpacked dimension, so a layer that declares its
+        # kernels' alignment (FusedMoE.mxfp4_intermediate_align) keeps the
+        # checkpoint shape.
+        pad_for_aiter = _use_aiter and not (
+            layer.mxfp4_intermediate_align is not None or _use_triton_w4a16
+        )
         w13_up_dim, w2_down_dim, weight_padded = get_moe_weight_sizes(
             intermediate_size_per_partition,
             is_aiter_moe=pad_for_aiter,

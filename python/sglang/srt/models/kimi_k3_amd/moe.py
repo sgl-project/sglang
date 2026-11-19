@@ -38,6 +38,7 @@ if TYPE_CHECKING:
 
 _is_gfx95 = is_gfx95_supported()
 _use_aiter = is_hip() and get_bool_env_var("SGLANG_USE_AITER")
+_is_hip = is_hip()
 if _is_gfx95:
     from sglang.kernels.ops.attention import k3_attn_res_read_hip
     from sglang.kernels.ops.gemm import kimi_k3_latent_tail_hip
@@ -128,7 +129,7 @@ class KimiK3MoEHipMixin:
     _row_front_on = False
     _row_front_out: Optional[tuple] = None
     # Set by link_row_sharded_stream_hip when every later layer reads a stream
-    # left on row shards (SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM, PP1).
+    # left on row shards (SGLANG_OPT_HIP_K3_ROW_SHARDED_STREAM, PP1).
     _row_stream = False
 
     def _prepare_hip_paths(self) -> None:
@@ -389,9 +390,9 @@ class KimiK3MoEHipMixin:
         """Post-load on gfx950: turn on shard_front, which runs the MoE front (router
         top-k, latent down-proj) on this rank's rows on top of the row-sharded tail,
         the shared experts TP-sharded on the all-gathered normed input
-        (SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT)."""
+        (SGLANG_OPT_HIP_K3_ROW_SHARDED_ROUTED_FRONT)."""
         if not (
-            envs.SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT.get()
+            envs.SGLANG_OPT_HIP_K3_ROW_SHARDED_ROUTED_FRONT.get()
             and _is_gfx95
             and self.tp_size > 1
             and self._eligible_for_fused_front
@@ -683,8 +684,8 @@ def ffn_row_shards_hip(layer) -> Optional[Callable[[int], bool]]:
 def _row_sharded_switch_on() -> bool:
     """Either opt-in gfx950 row-sharded switch: the routed front or the stream."""
     return (
-        envs.SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT.get()
-        or envs.SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM.get()
+        envs.SGLANG_OPT_HIP_K3_ROW_SHARDED_ROUTED_FRONT.get()
+        or envs.SGLANG_OPT_HIP_K3_ROW_SHARDED_STREAM.get()
     )
 
 
@@ -727,6 +728,20 @@ def row_shard_bank_hooks_hip(layer) -> dict:
     )
 
 
+def routed_mxfp4_intermediate_align_hip() -> Optional[int]:
+    """The intermediate alignment KimiK3MoE's routed experts declare: 128 under
+    SGLANG_OPT_HIP_K3_AITER on ROCm, where AITER runs them on the K3 FlyDSL MoE (TP8
+    keeps the native 384 instead of the generic kernels' 512); None elsewhere."""
+    return 128 if _is_hip and envs.SGLANG_OPT_HIP_K3_AITER.get() else None
+
+
+def router_logits_contiguous_hip() -> bool:
+    """Whether KimiK3MoE copies the router logits it splits off the fused front
+    contiguous before routing a multi-token batch: on ROCm, unless
+    SGLANG_OPT_HIP_K3_AITER is on."""
+    return _is_hip and not envs.SGLANG_OPT_HIP_K3_AITER.get()
+
+
 def prepare_hip_paths(layer) -> None:
     """Post-load, after _merge_front_weights: a MoE KimiK3DecoderLayer's ROCm
     paths and the fp32 next-layer norm weight its column tail reads."""
@@ -743,7 +758,7 @@ def link_row_sharded_stream_hip(model) -> None:
     when every later layer reads it there (its FFN takes the row-sharded read)
     and no pipeline stage boundary follows: a dense layer or a PP send would
     read every row of the stream and of the bank, which the shard left stale."""
-    if not envs.SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM.get():
+    if not envs.SGLANG_OPT_HIP_K3_ROW_SHARDED_STREAM.get():
         return
     if get_parallel().pp_size > 1:
         return

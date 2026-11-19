@@ -1213,6 +1213,7 @@ class TestSharedExpertOnlineMxfp4CreateWeightsGuards(CustomTestCase):
             _has_fused_shared=has_fused_shared,
             use_presharded_weights=True,
             moe_tp_size=1,
+            mxfp4_intermediate_align=None,
         )
 
     def _create_weights(self, scheme, layer, hidden_size, intermediate_size):

@@ -19,6 +19,7 @@ from sglang.srt.layers.quantization.quark.quark import QuarkLinearMethod
 from sglang.srt.layers.quantization.quark.schemes import QuarkW8A8Fp8
 from sglang.srt.models import kimi_k3, kimi_k3_rocm_quant
 from sglang.srt.models.kimi_k3 import KimiK3DeltaAttention, _is_unquantized_mergeable
+from sglang.srt.models.kimi_k3_amd import moe as kimi_k3_amd_moe
 from sglang.srt.models.kimi_k3_rocm_quant import (
     _k3_channel_fp8_to_bf16,
     k3_fused_decode_f_b_weight,
@@ -207,7 +208,7 @@ class TestHipFusedDecodeArming(CustomTestCase):
 
         with (
             mock.patch.object(kimi_k3, "_is_hip", True),
-            envs.SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND.override("aiter"),
+            envs.SGLANG_OPT_HIP_K3_KDA_FUSED_BACKEND.override("aiter"),
             mock.patch.object(
                 kda_fused_decode_aiter_hip, "available", return_value=False
             ),
@@ -232,7 +233,7 @@ class TestHipFusedDecodeArming(CustomTestCase):
                 self.subTest(flags=flags),
                 get_context().override_server_args(**flags),
                 mock.patch.object(kimi_k3, "_is_hip", True),
-                envs.SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND.override("gfx950"),
+                envs.SGLANG_OPT_HIP_K3_KDA_FUSED_BACKEND.override("gfx950"),
                 mock.patch.object(
                     kda_fused_decode_gfx950, "available", return_value=True
                 ),
@@ -265,6 +266,29 @@ class TestHipFusedDecodeArming(CustomTestCase):
         with mock.patch.object(kimi_k3, "print_warning_once") as warn:
             self.assertIsNone(KimiK3DeltaAttention._fused_decode_f_b_weight(attention))
         warn.assert_called_once()
+
+
+class TestRocmMoeOptInHooks(CustomTestCase):
+    """SGLANG_OPT_HIP_K3_AITER reaches the shared MoE code only through the ROCm
+    hooks KimiK3MoE asks: the MXFP4 intermediate alignment its experts declare
+    and whether it copies the router logits contiguous."""
+
+    def test_hooks_follow_the_opt_in_on_rocm_only(self):
+        for is_hip in (False, True):
+            for opt_in in (False, True):
+                with (
+                    self.subTest(is_hip=is_hip, opt_in=opt_in),
+                    mock.patch.object(kimi_k3_amd_moe, "_is_hip", is_hip),
+                    envs.SGLANG_OPT_HIP_K3_AITER.override(opt_in),
+                ):
+                    self.assertEqual(
+                        kimi_k3_amd_moe.routed_mxfp4_intermediate_align_hip(),
+                        128 if is_hip and opt_in else None,
+                    )
+                    self.assertEqual(
+                        kimi_k3_amd_moe.router_logits_contiguous_hip(),
+                        is_hip and not opt_in,
+                    )
 
 
 if __name__ == "__main__":
