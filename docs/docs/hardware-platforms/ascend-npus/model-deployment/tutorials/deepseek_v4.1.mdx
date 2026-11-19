@@ -1,7 +1,7 @@
 ---
 title: "DeepSeek-V4.1-Flash"
 metatags:
-  description: "Deploy DeepSeek-V4.1-Flash on Huawei Ascend 950PR/DT Series NPUs with SGLang using a unified, non-PD service."
+  description: "Deploy DeepSeek-V4.1-Flash on Huawei Ascend A3 and 950PR/DT Series NPUs with SGLang using a unified, non-PD service."
 ---
 
 ## Introduction
@@ -12,8 +12,8 @@ and activates 8B parameters per token during prefill and 16B during decode. This
 so image inputs are not enabled. For more model details, see the
 [DeepSeek-V4.1-Flash technical report](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash).
 
-This guide deploys DeepSeek-V4.1-Flash on Huawei Ascend 950PR/DT Series (A5) NPUs with SGLang. Prefill and decode run
-in one service; Prefill-Decode (PD) disaggregation is not configured.
+This guide covers DeepSeek-V4.1-Flash deployment on A3 Series and 950PR/DT Series (A5) NPUs with SGLang.
+Prefill and decode run in one service; Prefill-Decode (PD) disaggregation is not configured.
 
 ## Configuration summary
 
@@ -26,11 +26,10 @@ The following table summarizes the settings configured by the script. For parame
 | Hardware | Huawei Ascend 950PR/DT Series (A5), 8 NPUs per node |
 | Attention | `--attention-backend dsv4` |
 | Tensor parallelism | `--tp-size 8` |
-| Data parallelism | `--enable-dp-attention` and `--dp-size 8` |
+| Attention data parallelism | `--attn-dp-size 8` |
 | MoE communication | `--moe-a2a-backend deepep` and `--deepep-mode auto` |
 | DP language-model head | `--enable-dp-lm-head` |
 | NPU graph decode batch sizes | `--cuda-graph-bs-decode 1 2 4 8 16 25` |
-| PD disaggregation | Not configured; prefill and decode run in one service |
 | DSPARK | Disabled by default; optional arguments are included in the script |
 
 ## Prerequisites
@@ -44,9 +43,11 @@ checkpoint available at the same paths on every node.
 
 ### Model weights
 
-Set `MODEL_PATH` to the directory containing the DeepSeek-V4.1 checkpoint. Replace the placeholder path in the script
-with the checkpoint directory available in your environment. For multi-node deployments, make the checkpoint accessible
-at the same path on every node.
+Select the checkpoint for your hardware: [DeepSeek-V4.1-Flash-1017-W8A8](https://www.modelscope.cn/models/Eco-Tech/DeepSeek-V4.1-Flash-1017-w8a8)
+for A3, or the [official DeepSeek-V4.1-Flash-1017 checkpoint](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017)
+for A5 (950PR/DT Series). Set `MODEL_PATH` to the directory containing the selected checkpoint. Replace the placeholder
+path in the script with the checkpoint directory available in your environment. For multi-node deployments, make the
+checkpoint accessible at the same path on every node.
 
 ## Installation
 
@@ -56,7 +57,7 @@ For host setup and container creation, follow the
 Pull the SGLang image for Huawei Ascend 950PR/DT Series (A5):
 
 ```bash
-docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-950-dsv41
+docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-950-dsv41-1
 ```
 
 ## Online service deployment
@@ -231,15 +232,6 @@ This tutorial does not provide DeepSeek-V4.1-Flash A5 accuracy results.
 
 For benchmark tools and serving-load examples, see [Performance Testing on Ascend NPU](/docs/hardware-platforms/ascend-npus/evaluation/performance_testing).
 This tutorial does not provide DeepSeek-V4.1-Flash A5 performance results.
-
-## Best practices
-
-### Best-practice configuration reference
-
-The existing
-[DeepSeek-V4-Flash best-practice guide](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/deepseek_v4_flash)
-covers a different model and deployment configuration; treat it as background only and do not copy its values directly
-to this V4.1-Flash setup. This tutorial does not yet include a separately validated V4.1-Flash A5 best-practice profile.
 
 ## Performance tuning
 
