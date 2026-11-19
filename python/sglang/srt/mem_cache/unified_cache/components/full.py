@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
 
+from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     IncLockRefResult,
@@ -495,7 +496,10 @@ class FullComponent(TreeComponent):
         phase: LinkerTransferPhase,
         node: Optional[UnifiedTreeNode],
         keys: Optional[Sequence[str]],
+        start_owner: Optional[int] = None,
     ) -> Optional[PoolTransfer]:
+        """``start_owner`` is the owner class of the first loaded page under
+        logical-page KV sharding, and None otherwise."""
         if phase == LinkerTransferPhase.OFFLOAD:
             if node is None or not node.hash_value:
                 return None
@@ -517,9 +521,20 @@ class FullComponent(TreeComponent):
         if phase == LinkerTransferPhase.LOAD:
             storage, sub_pool = self.storage_and_sub_pool()
             num_tokens = len(keys) * self.cache.page_size
-            if not storage.units_fit(sub_pool, num_tokens):
-                self.cache.evict_for_alloc(KVDemand(full_tokens=num_tokens))
-            slots = storage.take_units(sub_pool, num_tokens)
+            if start_owner is None:
+                if not storage.units_fit(sub_pool, num_tokens):
+                    self.cache.evict_for_alloc(KVDemand(full_tokens=num_tokens))
+                slots = storage.take_units(sub_pool, num_tokens)
+            else:
+                slots = storage.take_cyclic_units(sub_pool, num_tokens, start_owner)
+                if slots is None:
+                    # A cyclic run takes up to one extra page from each class.
+                    shard_size = page_interleave_shard_size(
+                        self.cache.token_to_kv_pool_allocator
+                    )
+                    padded = num_tokens + shard_size * self.cache.page_size
+                    self.cache.evict_for_alloc(KVDemand(full_tokens=padded))
+                    slots = storage.take_cyclic_units(sub_pool, num_tokens, start_owner)
             if slots is None:
                 return None
 

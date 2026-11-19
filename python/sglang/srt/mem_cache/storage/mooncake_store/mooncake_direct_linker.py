@@ -147,7 +147,13 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             tp_rank = torch.distributed.get_rank(group=tp_group)
             tp_size = torch.distributed.get_world_size(group=tp_group)
         rank_replicated = self.pool_group.rank_replicated
-        self.offload_owner = not rank_replicated or tp_rank == 0
+        kv_sharded = self.pool_group.shard_placement is not None
+        self.kv_sharded = kv_sharded
+        # A sharded rank is the only holder of its pages, so every rank writes.
+        self.offload_owner = kv_sharded or not rank_replicated or tp_rank == 0
+        # Sharded pages are byte-identical across the shard group (attention CP,
+        # or attention TP for replicated MLA), so their keys name no shard rank.
+        key_cp_rank = 0 if kv_sharded else params.attn_cp_rank
         extra_config = deepcopy(extra_config or {})
         self.load_layer_group = max(
             1,
@@ -157,6 +163,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             1, int(extra_config.get("linker_load_threads", DEFAULT_LOAD_THREADS))
         )
         self.load_mode = extra_config.pop("load_mode", "layer_wise")
+        if kv_sharded and self.load_mode == "prefetch":
+            # Prefetch publishes loads without a chain rotation base.
+            raise ValueError(
+                "--enable-kv-cache-sharding supports only the layer_wise "
+                "linker load_mode."
+            )
         # TODO: unlike `HiCacheController._generate_storage_config`, this sets no
         # `dp_rank`. Aligning the storage-config producers changes persisted
         # storage keys, so it waits for a storage-key format change.
@@ -186,7 +198,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         storage_suffix = _storage_suffix(
             rank_replicated=rank_replicated,
             tp_rank=tp_rank,
-            attn_cp_rank=params.attn_cp_rank,
+            attn_cp_rank=key_cp_rank,
             pp_rank=params.pp_rank,
         )
         self.storage.mla_suffix = storage_suffix
@@ -196,7 +208,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             rank_replicated=rank_replicated,
             tp_rank=tp_rank,
             tp_size=tp_size,
-            attn_cp_rank=params.attn_cp_rank,
+            attn_cp_rank=key_cp_rank,
             pp_rank=params.pp_rank,
             offload_owner=self.offload_owner,
             dcp_size=get_parallel().attn_dcp_size,
@@ -204,9 +216,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         )
         logger.info(
             "Mooncake direct linker storage topology: "
-            "rank_replicated=%s, tp_rank=%d/%d, offload_owner=%s, suffix=%s, "
-            "tp_shared=%s, offload_pools=%s",
+            "rank_replicated=%s, kv_sharded=%s, tp_rank=%d/%d, offload_owner=%s, "
+            "suffix=%s, tp_shared=%s, offload_pools=%s",
             rank_replicated,
+            kv_sharded,
             tp_rank,
             tp_size,
             self.offload_owner,
@@ -310,7 +323,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             return False
         if rid in self.pending_loads:
             raise RuntimeError(f"Mooncake load for rid={rid} is already queued.")
-        self.pending_loads[rid] = expanded
+        # A rank owning none of the pages still queues the load, so every rank
+        # reports the same verdict and counter.
+        self.pending_loads[rid] = self.pool_group.owned_transfers(expanded)
         return True
 
     def prefetch(self, transfers: list[PoolTransfer]) -> Future[bool] | None:
@@ -623,10 +638,16 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         if not expanded:
             return False
         self.freeze_gc_once()
-        expanded = [t for t in expanded if t.name in self.offload_pools]
-        if not expanded:
+        expanded = [
+            t
+            for t in self.pool_group.owned_transfers(expanded)
+            if t.name in self.offload_pools
+        ]
+        if not expanded and not self.kv_sharded:
             self.offload_results.put(True)
             return True
+        # A sharded rank may own none of this node's pages; its no-op still
+        # queues behind earlier offloads so results keep their node order.
         kv = next(transfer for transfer in transfers if transfer.name == PoolName.KV)
         tokens = len(kv.keys) * self.page_size
         ready = self.record_transfer_ready()
@@ -646,7 +667,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     if session_id
                     else None
                 )
-                results = self.storage.batch_set_v2(expanded, extra_info)
+                results = (
+                    self.storage.batch_set_v2(expanded, extra_info) if expanded else {}
+                )
                 success = all(all(pool_results) for pool_results in results.values())
                 if success:
                     self.stats["offload"] += 1

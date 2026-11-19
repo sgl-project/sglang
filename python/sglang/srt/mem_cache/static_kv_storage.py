@@ -544,6 +544,15 @@ class StaticKVStorage:
     def take_units(self, sub_pool: str, count: int) -> Optional[torch.Tensor]:
         return self._band(sub_pool).alloc(count)
 
+    def take_cyclic_units(
+        self, sub_pool: str, count: int, start_owner: int
+    ) -> Optional[torch.Tensor]:
+        """Logical-page KV sharding: ``count`` units whose page owners cycle
+        from ``start_owner``."""
+        return self._band(sub_pool).alloc_cyclic(
+            start_class=start_owner, need_size=count
+        )
+
     def release_taken(self, sub_pool: str, ids: torch.Tensor) -> None:
         self._band(sub_pool).free(ids)
 

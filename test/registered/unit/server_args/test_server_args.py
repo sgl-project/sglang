@@ -4907,12 +4907,28 @@ class TestKvCacheShardingCompatibility(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "not --hicache-storage-backend"):
             handle_kv_cache_sharding(args)
 
+    def test_mooncake_linker_is_accepted(self):
+        args = self._rounding_args(raw_mem_fraction=0.8, resolved_mem_fraction=0.8)
+        args.enable_unified_cache_external_linker = True
+        with envs.SGLANG_DISAGG_STAGING_BUFFER.override(False):
+            handle_kv_cache_sharding(args, 80 * 1024)
+
     def test_incompatible_cache_tree_modes_are_rejected(self):
         cases = (
             ({"radix_cache_backend": "custom"}, "built-in UnifiedRadixCache"),
             (
-                {"enable_unified_cache_external_linker": True},
-                "does not support --enable-unified-cache-external-linker",
+                {
+                    "enable_unified_cache_external_linker": True,
+                    "unified_cache_external_linker_backend": "mori",
+                },
+                "supports only the mooncake",
+            ),
+            (
+                {
+                    "enable_unified_cache_external_linker": True,
+                    "enable_linker_mla_dedup": True,
+                },
+                "does not support --enable-linker-mla-dedup",
             ),
             (
                 {"enable_streaming_session": True},

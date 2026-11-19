@@ -186,11 +186,19 @@ def handle_kv_cache_sharding(server_args: Any, gpu_mem: Optional[float] = None) 
             "not supported for sharded KV."
         )
     if cfg.enable_unified_cache_external_linker:
-        raise ValueError(
-            "--enable-kv-cache-sharding does not support "
-            "--enable-unified-cache-external-linker: load-back allocates "
-            "through the flat allocator API."
-        )
+        # Only the Mooncake linker moves each rank's own pages under rank-free keys.
+        if cfg.unified_cache_external_linker_backend != "mooncake":
+            raise ValueError(
+                "--enable-kv-cache-sharding supports only the mooncake "
+                "--unified-cache-external-linker-backend, got "
+                f"{cfg.unified_cache_external_linker_backend!r}."
+            )
+        if cfg.enable_linker_mla_dedup:
+            raise ValueError(
+                "--enable-kv-cache-sharding does not support "
+                "--enable-linker-mla-dedup: shard ranks hold different pages, "
+                "so one rank's load cannot be broadcast to the others."
+            )
     if cfg.enable_streaming_session:
         raise ValueError(
             "--enable-kv-cache-sharding does not support streaming sessions: "

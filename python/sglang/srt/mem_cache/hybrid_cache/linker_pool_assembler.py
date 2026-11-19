@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from dataclasses import replace
 from functools import partial
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -18,6 +18,9 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.runtime_context import get_memory, get_parallel
+
+if TYPE_CHECKING:
+    from sglang.srt.mem_cache.page_interleave import PageInterleavePlacement
 
 
 class DevicePoolEntry:
@@ -189,6 +192,37 @@ class DevicePoolGroup:
         self.page_size = page_size
         self.rank_replicated = rank_replicated
         self.kv_buffer = None
+        # Logical-page KV sharding: the placement of the pools' logical slots.
+        self.shard_placement: PageInterleavePlacement | None = None
+
+    def owned_transfers(self, transfers: list[PoolTransfer]) -> list[PoolTransfer]:
+        """Logical-page KV sharding: narrow resolved transfers to this rank's
+        pages, as local rows. Every rank holds the same bytes for a page, so
+        keys name no rank and a page's owner alone reads or writes it."""
+        placement = self.shard_placement
+        if placement is None:
+            return transfers
+        rank = placement.spec.shard_rank
+        owned = []
+        for transfer in transfers:
+            indices = torch.as_tensor(transfer.host_indices, dtype=torch.int64).cpu()
+            if indices.numel() != len(transfer.keys) * self.page_size:
+                raise ValueError(
+                    f"Sharded pool {transfer.name} needs one key per page, got "
+                    f"{len(transfer.keys)} keys for {indices.numel()} slots."
+                )
+            mask = placement.local_mask(indices, rank)
+            pages = mask[:: self.page_size].tolist()
+            if not any(pages):
+                continue
+            owned.append(
+                replace(
+                    transfer,
+                    keys=[key for key, mine in zip(transfer.keys, pages) if mine],
+                    host_indices=placement.local_index(indices[mask]),
+                )
+            )
+        return owned
 
     def resolve_transfers(
         self,
@@ -836,6 +870,7 @@ def resolve_hybrid_device_pool_group(
     from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
         _select_strategy,
     )
+    from sglang.srt.mem_cache.page_interleave_pool import PageInterleaveKVPoolMixin
 
     group = _select_strategy(kvcache, components).build_direct_linker_pool_group(
         kvcache=kvcache,
@@ -848,4 +883,6 @@ def resolve_hybrid_device_pool_group(
         raise ValueError(
             "The direct external linker does not support this model's draft KV."
         )
+    if isinstance(kvcache, PageInterleaveKVPoolMixin):
+        group.shard_placement = kvcache.placement
     return group

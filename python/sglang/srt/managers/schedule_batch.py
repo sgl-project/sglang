@@ -654,9 +654,9 @@ class Req(ReqDllmMixin):
         # least-full for a new chain — and consumed by the radix insert to
         # stamp new tree nodes. Allocation itself must NOT read it back when
         # a tree node is available (the checkpoint dedup rebind
-        # would make it stale); the only allocation-time reader is the
-        # radix-disabled fallback, which keeps no nodes past the root and has
-        # no rebind.
+        # would make it stale); the only allocation-time reader is the root
+        # fallback: a radix-disabled cache, which keeps no nodes past the root
+        # and has no rebind, or an external-linker tail loaded at the root.
         self.kv_rotation_base: Optional[int] = None
 
         # The launched steps carrying this request whose results are not

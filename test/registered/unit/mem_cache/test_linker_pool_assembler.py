@@ -1,6 +1,7 @@
 """Unit tests for external-linker device pool assembly."""
 
 import unittest
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
@@ -23,6 +24,10 @@ from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     _build_deepseek_v4_device_pool_group,
     _mha_device_pool_entry,
     resolve_hybrid_device_pool_group,
+)
+from sglang.srt.mem_cache.page_interleave import (
+    PageInterleavePlacement,
+    PageShardSpec,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -233,6 +238,42 @@ class TestDevicePoolGroup(CustomTestCase):
         self.assertEqual(resolved[0].keys, ["b", "d"])
         self.assertEqual(resolved[0].host_indices.tolist(), [120, 121, 124, 125])
         self.assertEqual(resolved[0].hit_policy, PoolHitPolicy.TRAILING_PAGES)
+
+    def test_sharded_transfers_keep_only_owned_pages_as_local_rows(self):
+        group = DevicePoolGroup([], num_layers=1, page_size=2)
+        transfers = [
+            PoolTransfer(
+                name=name,
+                keys=["a", "b", "c", "d"],
+                host_indices=torch.tensor([4, 5, 2, 3, 14, 15, 8, 9]),
+            )
+            for name in (PoolName.KV, PoolName.INDEXER)
+        ]
+        self.assertIs(group.owned_transfers(transfers), transfers)
+
+        expected = {0: (["a", "d"], [2, 3, 4, 5]), 1: (["b", "c"], [0, 1, 6, 7])}
+        for rank, (keys, rows) in expected.items():
+            group.shard_placement = PageInterleavePlacement(
+                PageShardSpec(
+                    shard_rank=rank,
+                    shard_size=2,
+                    page_size=2,
+                    max_prefix_tokens=4,
+                    chunk_tokens=2,
+                )
+            )
+            owned = group.owned_transfers(transfers)
+            self.assertEqual([t.name for t in owned], [t.name for t in transfers])
+            for transfer in owned:
+                self.assertEqual(transfer.keys, keys)
+                self.assertEqual(transfer.host_indices.tolist(), rows)
+
+        rank0_only = replace(
+            transfers[0], keys=["a", "d"], host_indices=torch.tensor([4, 5, 8, 9])
+        )
+        self.assertEqual(group.owned_transfers([rank0_only]), [])
+        with self.assertRaisesRegex(ValueError, "one key per page"):
+            group.owned_transfers([replace(transfers[0], keys=["a"])])
 
 
 def _dsv4_pool(pool_type, **fields):
