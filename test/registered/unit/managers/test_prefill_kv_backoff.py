@@ -117,6 +117,7 @@ class _PrefillKvBackoffSuite:
         req.needs_host_load_back.return_value = False
         req.last_node = cache.root_node_handle()
         req.lock = None
+        req.beam_group = None
         return req
 
     def _adder(self, cache, allocator, *, rem_chunk_tokens=None):
