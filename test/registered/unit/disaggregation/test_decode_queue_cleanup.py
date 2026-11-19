@@ -79,6 +79,7 @@ class TestDecodePreallocBackfill(CustomTestCase):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         queue.pp_size = 1
         queue.enable_prealloc_backfill = True
+        queue.draft_kv_ring = None
         queue.queue = decode_queue(ListKind.PD_PREALLOC, requests)
         queue.pending_reqs = []
         queue.retracted_queue = []
@@ -90,7 +91,9 @@ class TestDecodePreallocBackfill(CustomTestCase):
         queue.transfer_queue = SimpleNamespace(
             queue=decode_queue(ListKind.PD_RECEIVING), enable_staging=False
         )
-        queue.kv_manager = SimpleNamespace(kv_args=SimpleNamespace(state_types=[]))
+        queue.kv_manager = SimpleNamespace(
+            kv_args=SimpleNamespace(state_types=[], state_sub_pools=[])
+        )
         queue.tree_cache = MagicMock()
         queue.token_to_kv_pool = SimpleNamespace(
             layer_router=SimpleNamespace(sub_pool=lambda kind: None)
@@ -98,6 +101,8 @@ class TestDecodePreallocBackfill(CustomTestCase):
         pool = SimpleNamespace(free=free, allocations=[])
         allocator = MagicMock(page_size=1)
         bind_separate_buffer_capacity(allocator)
+        allocator.sub_pool_roles.return_value = ("full", (), None)
+        queue.tree_cache.full_evictable_size.return_value = 0
         allocator.available_size.side_effect = lambda: pool.free
         allocator.translate_kv_indices_for_transfer.side_effect = lambda x: x
         queue.token_to_kv_pool_allocator = allocator
@@ -140,11 +145,13 @@ class TestDecodePreallocBackfill(CustomTestCase):
         head = self.make_request("head", 8)
         queue, pool = self.make_queue([head])
         for _ in range(10):
-            self.assertEqual(queue.move_preallocated(queue.transfer_queue.queue), ([], []))
+            self.assertEqual(
+                queue.move_preallocated(queue.transfer_queue.queue), ([], [])
+            )
         self.assertEqual(getattr(head, "prealloc_bypass_count", 0), 0)
 
         small = self.make_request("small", 2)
-        queue.queue.join([small])
+        move([small], queue.queue)
         admitted, failed = queue.move_preallocated(queue.transfer_queue.queue)
         self.assertEqual(admitted, [small])
         self.assertEqual(failed, [])
@@ -157,14 +164,18 @@ class TestDecodePreallocBackfill(CustomTestCase):
         head = self.make_request("head", 100)
         small = [self.make_request(f"small-{i}", 1) for i in range(6)]
         queue, pool = self.make_queue([head, *small], free=64)
-        self.assertEqual(queue.move_preallocated(queue.transfer_queue.queue)[0], small[:4])
+        self.assertEqual(
+            queue.move_preallocated(queue.transfer_queue.queue)[0], small[:4]
+        )
         self.assertEqual(head.prealloc_bypass_count, 4)
         self.assertEqual(queue.move_preallocated(queue.transfer_queue.queue), ([], []))
         self.assertEqual(list(queue.queue.items()), [head, *small[4:]])
 
         # Once capacity is released, the aged head is admitted before the rest.
         pool.free = 128
-        self.assertEqual(queue.move_preallocated(queue.transfer_queue.queue)[0], [head, *small[4:]])
+        self.assertEqual(
+            queue.move_preallocated(queue.transfer_queue.queue)[0], [head, *small[4:]]
+        )
         self.assertEqual(list(queue.queue.items()), [])
 
     def test_backfill_keeps_reserved_decode_headroom(self):
@@ -172,7 +183,9 @@ class TestDecodePreallocBackfill(CustomTestCase):
         first = self.make_request("first", 3)
         second = self.make_request("second", 1)
         queue, pool = self.make_queue([head, first, second])
-        self.assertEqual(queue.move_preallocated(queue.transfer_queue.queue)[0], [first])
+        self.assertEqual(
+            queue.move_preallocated(queue.transfer_queue.queue)[0], [first]
+        )
         self.assertEqual(pool.free, 2)
         self.assertEqual(list(queue.queue.items()), [head, second])
         self.assertEqual(second.prealloc_bypass_count, 0)
@@ -201,7 +214,9 @@ class TestDecodePreallocBackfill(CustomTestCase):
         cache.insert(InsertParams(key=RadixKey([0]), value=torch.tensor([127])))
         queue.tree_cache = cache
 
-        self.assertEqual(queue.move_preallocated(queue.transfer_queue.queue)[0], [small])
+        self.assertEqual(
+            queue.move_preallocated(queue.transfer_queue.queue)[0], [small]
+        )
         self.assertEqual(list(queue.queue.items()), [head])
         self.assertEqual(pool.allocations, ["small"])
         self.assertEqual(cache.protected_size(), 0)
@@ -220,7 +235,9 @@ class TestDecodePreallocBackfill(CustomTestCase):
                     else queue.req_to_metadata_buffer_idx_allocator
                 )
                 target.available_size = lambda: 0
-                self.assertEqual(queue.move_preallocated(queue.transfer_queue.queue), ([], []))
+                self.assertEqual(
+                    queue.move_preallocated(queue.transfer_queue.queue), ([], [])
+                )
                 self.assertEqual(pool.allocations, [])
                 self.assertEqual(head.prealloc_bypass_count, 0)
 
@@ -238,7 +255,10 @@ class TestDecodePreallocBackfill(CustomTestCase):
                 else:
                     queue.pp_size = 2
                     kwargs = dict(pp_good_rids=["head", "small"], pp_bad_rids=[])
-                self.assertEqual(queue.move_preallocated(queue.transfer_queue.queue, **kwargs), ([], []))
+                self.assertEqual(
+                    queue.move_preallocated(queue.transfer_queue.queue, **kwargs),
+                    ([], []),
+                )
                 self.assertEqual(pool.allocations, [])
 
     def test_blocked_lookahead_is_bounded_without_charging_idle_work(self):
@@ -247,8 +267,10 @@ class TestDecodePreallocBackfill(CustomTestCase):
         queue, pool = self.make_queue([*heads, small], free=64)
         self.assertEqual(queue.move_preallocated(queue.transfer_queue.queue), ([], []))
         self.assertEqual([r.prealloc_bypass_count for r in heads], [0] * 9)
-        queue.queue.leave([heads[0].req])
-        self.assertEqual(queue.move_preallocated(queue.transfer_queue.queue)[0], [small])
+        move([heads[0]], queue.transfer_queue.queue)
+        self.assertEqual(
+            queue.move_preallocated(queue.transfer_queue.queue)[0], [small]
+        )
         self.assertEqual([r.prealloc_bypass_count for r in heads[1:]], [1] * 8)
 
 
