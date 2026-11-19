@@ -13,7 +13,7 @@ from sglang.kernels.ops.attention.linear.gdn_mps import (
 from sglang.test.ci.ci_register import register_mps_ci
 from sglang.test.kernels import gdn_reference as ref
 
-register_mps_ci(est_time=180, suite="stage-a-unit-test-mps")
+register_mps_ci(est_time=180, suite="extra-unit-test-mps")
 
 pytestmark = pytest.mark.skipif(
     not torch.backends.mps.is_available(), reason="requires Apple MPS"
