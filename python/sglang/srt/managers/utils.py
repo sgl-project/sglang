@@ -22,6 +22,7 @@ from sglang.srt.managers.io_struct import AbortReq, FinishReasonDict
 from sglang.srt.mem_cache.kv_weight_version_tracker import KvWeightVersionRecord
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.runtime_context import (
+    get_memory,
     get_serving,
     get_spec,
     max_speculative_num_draft_tokens,
@@ -29,7 +30,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.state_capturer.base import TopkCaptureOutput
 from sglang.srt.utils.device import async_d2h as _async_d2h
-from sglang.srt.utils.device import is_cuda
+from sglang.srt.utils.device import is_cuda, is_pin_memory_available
 from sglang.srt.utils.weight_versions import compute_weight_version_spans
 
 if TYPE_CHECKING:
@@ -66,12 +67,37 @@ def allocate_distinct_stream(device_module, avoid_streams):
 
 
 def is_war_barrier_enabled() -> bool:
-    # FIXME: off CUDA (ROCm included) the barrier is off unless
-    # SGLANG_ENABLE_WAR_BARRIER is set. Unified memory frees ids and rewrites
-    # request rows on the schedule stream at once and relies on this barrier to
-    # order those writes after the overlapped forward's shared reads; without
-    # it that forward can read unbound or rebound mappings.
-    return is_cuda() or envs.SGLANG_ENABLE_WAR_BARRIER.get()
+    # On by default on CUDA. Unified memory frees ids and rewrites request rows on the
+    # schedule stream at once, so it needs the barrier on every device.
+    return (
+        is_cuda()
+        or get_memory().enable_unified_memory
+        or envs.SGLANG_ENABLE_WAR_BARRIER.get()
+    )
+
+
+def _async_d2h_rows(rows: List[Any]) -> List[Any]:
+    """`_async_d2h` over per-request rows with one host buffer and one copy.
+
+    The rows come back as host views with their shapes, in order; entries that
+    are not tensors pass through.
+    """
+    tensors = [row for row in rows if torch.is_tensor(row)]
+    if len(tensors) < 2 or len({row.dtype for row in tensors}) > 1:
+        return [_async_d2h(row) if torch.is_tensor(row) else row for row in rows]
+    flat = torch.cat([row.reshape(-1) for row in tensors])
+    device = flat.device
+    if device.type != "cpu" and is_pin_memory_available(device):
+        # use record_stream so rows don't get reused before torch.cat finished
+        stream = torch.get_device_module(device).current_stream()
+        for row in tensors:
+            row.record_stream(stream)
+    host = _async_d2h(flat)
+    host_rows = iter(
+        chunk.view(row.shape)
+        for chunk, row in zip(host.split([row.numel() for row in tensors]), tensors)
+    )
+    return [next(host_rows) if torch.is_tensor(row) else row for row in rows]
 
 
 @dataclasses.dataclass
@@ -101,6 +127,8 @@ class GenerationBatchResult:
 
     # For overlap scheduling
     copy_done: Optional[Union[torch.cuda.Event, HostCopyDone]] = None
+    # Side-stream work still writing this batch's KV; copy_done is recorded after it.
+    side_stream_done: Optional[torch.cuda.Event] = None
     # The unified pool's record of this forward; processing the result retires
     # it, so page moves stop treating its pages as in flight.
     unified_forward_done: Optional[torch.cuda.Event] = None
@@ -209,20 +237,17 @@ class GenerationBatchResult:
                     self.logits_output.input_token_logprobs
                 )
             if self.logits_output.next_token_top_logprobs_val is not None:
-                self.logits_output.next_token_top_logprobs_val = [
-                    _async_d2h(v) if torch.is_tensor(v) else v
-                    for v in self.logits_output.next_token_top_logprobs_val
-                ]
+                self.logits_output.next_token_top_logprobs_val = _async_d2h_rows(
+                    self.logits_output.next_token_top_logprobs_val
+                )
             if self.logits_output.next_token_top_logprobs_idx is not None:
-                self.logits_output.next_token_top_logprobs_idx = [
-                    _async_d2h(x) if torch.is_tensor(x) else x
-                    for x in self.logits_output.next_token_top_logprobs_idx
-                ]
+                self.logits_output.next_token_top_logprobs_idx = _async_d2h_rows(
+                    self.logits_output.next_token_top_logprobs_idx
+                )
             if self.logits_output.next_token_token_ids_logprobs_val is not None:
-                self.logits_output.next_token_token_ids_logprobs_val = [
-                    _async_d2h(v) if torch.is_tensor(v) else v
-                    for v in self.logits_output.next_token_token_ids_logprobs_val
-                ]
+                self.logits_output.next_token_token_ids_logprobs_val = _async_d2h_rows(
+                    self.logits_output.next_token_token_ids_logprobs_val
+                )
         if return_hidden_states and self.logits_output.hidden_states is not None:
             self.logits_output.hidden_states = _async_d2h(
                 self.logits_output.hidden_states
@@ -271,23 +296,6 @@ class GenerationBatchResult:
             self.logits_output.auxiliary_device_output = None
             self.forward_auxiliary_output = None
 
-    @classmethod
-    def from_pp_proxy(
-        cls, logits_output, next_pp_outputs: PPProxyTensors, can_run_cuda_graph
-    ):
-        # TODO(lsyin): refactor PP and avoid using dict
-        proxy_dict = next_pp_outputs.tensors
-        return cls(
-            logits_output=logits_output,
-            pp_hidden_states_proxy_tensors=None,
-            next_token_ids=next_pp_outputs["next_token_ids"],
-            extend_input_len_per_req=proxy_dict.get("extend_input_len_per_req", None),
-            extend_logprob_start_len_per_req=proxy_dict.get(
-                "extend_logprob_start_len_per_req", None
-            ),
-            can_run_cuda_graph=can_run_cuda_graph,
-        )
-
 
 def validate_input_length(
     req: Req, max_req_input_len: int, allow_auto_truncate: bool
@@ -312,9 +320,16 @@ def validate_input_length(
             req.origin_input_ids = req.origin_input_ids[:max_req_input_len]
             return None
         else:
+            # OpenAI-compatible clients (e.g. LiteLLM) recognize a context
+            # overflow by OpenAI's "This model's maximum context length is"
+            # sentence; without it this is a generic 400 to them.
+            # Both sentences quote the largest accepted prompt.
+            max_prompt_len = max_req_input_len - 1
             error_msg = (
                 f"Input length ({len(req.origin_input_ids)} tokens) exceeds "
-                f"the maximum allowed length ({max_req_input_len} tokens). "
+                f"the maximum allowed length ({max_prompt_len} tokens). "
+                f"This model's maximum context length is {max_prompt_len} "
+                f"tokens on this server. "
                 f"Use a shorter input or enable --allow-auto-truncate."
             )
             return error_msg

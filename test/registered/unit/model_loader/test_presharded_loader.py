@@ -14,8 +14,9 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.layers.moe.utils import MoeA2ABackend, MoeRunnerBackend
 from sglang.srt.model_loader.loader import PreshardedModelLoader
-from sglang.srt.runtime_context import get_context, get_parallel
+from sglang.srt.runtime_context import get_context, get_flags, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 
 register_cpu_ci(est_time=9, suite="base-a-test-cpu")
@@ -899,6 +900,60 @@ class TestShardConfig(unittest.TestCase):
                     other_name,
                     f"changing {field} must change the cache subfolder name",
                 )
+
+    def test_cutedsl_layout_separates_processed_weight_caches(self):
+        loader = object.__new__(PreshardedModelLoader)
+        model_config = SimpleNamespace(
+            quantization="modelopt_fp4", dtype=torch.bfloat16
+        )
+        target_device = torch.device("cuda:2")
+        configs = {}
+        with (
+            get_context().override_server_args(model_path="dummy"),
+            mock.patch.object(
+                loader, "_compute_structural_signature", return_value="sig"
+            ),
+            mock.patch(
+                "sglang.srt.layers.dp_attention.get_moe_cp_size", return_value=1
+            ),
+        ):
+            for a2a in (MoeA2ABackend.NONE, MoeA2ABackend.FLASHINFER):
+                for swap_ab in (False, True):
+                    with (
+                        self.subTest(a2a=a2a, swap_ab=swap_ab),
+                        get_flags().moe.override(
+                            runner_backend=MoeRunnerBackend.FLASHINFER_CUTEDSL,
+                            a2a_backend=a2a,
+                        ),
+                        mock.patch(
+                            "sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl.use_cutedsl_moe_swap_ab",
+                            return_value=swap_ab,
+                        ) as use_swap_ab,
+                    ):
+                        cfg = loader._collect_shard_config(model_config, target_device)
+                        self.assertEqual(cfg["flashinfer_cutedsl_swap_ab"], swap_ab)
+                        use_swap_ab.assert_called_once_with(target_device)
+                        configs[swap_ab] = cfg
+            for backend, a2a in (
+                (MoeRunnerBackend.FLASHINFER_CUTLASS, MoeA2ABackend.NONE),
+                (MoeRunnerBackend.FLASHINFER_CUTEDSL, MoeA2ABackend.DEEPEP),
+                (MoeRunnerBackend.FLASHINFER_CUTEDSL, MoeA2ABackend.MEGAMOE),
+            ):
+                with get_flags().moe.override(runner_backend=backend, a2a_backend=a2a):
+                    cfg = loader._collect_shard_config(model_config, target_device)
+                    self.assertNotIn("flashinfer_cutedsl_swap_ab", cfg)
+
+        old_config = dict(configs[False])
+        del old_config["flashinfer_cutedsl_swap_ab"]
+        names = [
+            loader._build_subfolder_name(cfg) for cfg in (*configs.values(), old_config)
+        ]
+        self.assertEqual(len(set(names)), 3)
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, loader.CHECKSUM_FILENAME), "w") as f:
+                json.dump({"shard_config": old_config}, f)
+            for cfg in configs.values():
+                self.assertFalse(loader._shard_config_matches(tmp, cfg))
 
     def test_shard_config_matches_equality_and_missing(self):
         # Match must require exact stored equality; missing/mismatched

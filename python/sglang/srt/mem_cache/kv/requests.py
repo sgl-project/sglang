@@ -26,6 +26,7 @@ import msgspec
 import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.utils.device import async_h2d
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
@@ -47,6 +48,30 @@ class StateTracking(msgspec.Struct, frozen=True, kw_only=True):
     initial_slots: int
 
 
+class RowResets:
+    """Rows handed out whose request-scoped device state is not reset yet.
+
+    Handing out a reused row only marks it; the next `ModelRunner.forward`
+    resets it on the forward stream, outside every CUDA graph."""
+
+    def __init__(self, reset: Optional[Callable[[List[int]], None]]) -> None:
+        self._reset = reset
+        self._rows: set[int] = set()
+
+    def mark(self, rows: List[int]) -> None:
+        """``rows`` were handed out: reset them before their first forward."""
+        if self._reset is not None:
+            self._rows.update(rows)
+
+    def apply(self) -> None:
+        """Reset the marked rows, on the current stream."""
+        if not self._rows:
+            return
+        rows = sorted(self._rows)
+        self._rows.clear()
+        self._reset(rows)
+
+
 class RowState(enum.IntEnum):
     """Who holds a request row.
 
@@ -66,6 +91,14 @@ class RowState(enum.IntEnum):
 
 
 _HOLDING = (RowState.ACTIVE, RowState.PARKED, RowState.HELD)
+
+
+class RowUnits(msgspec.Struct, frozen=True, kw_only=True):
+    """What binds the request sub-pools' units to request rows (device ids)
+    and frees them: False from ``bind`` when they do not fit."""
+
+    bind: Callable[[torch.Tensor], bool]
+    free: Callable[[torch.Tensor], None]
 
 
 class RequestTable:
@@ -110,6 +143,9 @@ class RequestTable:
         # Bumped on every hand-out: a reader detects a reused row by comparing
         # the generation it stored.
         self.req_generation = torch.zeros(self._num_rows, dtype=torch.int64)
+        # Binds and frees the request sub-pools' units of rows, with the rows
+        # (`bind_row_units`); None without request sub-pools.
+        self._row_units: Optional[RowUnits] = None
 
         tracking = tracking or StateTracking(
             extra_buffer=False, lazy=False, track_slots=0, initial_slots=0
@@ -129,6 +165,17 @@ class RequestTable:
                     dtype=torch.int64,
                     device=device,
                 )
+
+    def bind_row_units(self, units: RowUnits) -> None:
+        """Every row handed out from now on holds a unit of each request
+        sub-pool until it goes back."""
+        assert self._row_units is None, "the table binds one unit owner"
+        self._row_units = units
+
+    @property
+    def binds_row_units(self) -> bool:
+        """Whether a row handed out takes a unit of every request sub-pool."""
+        return self._row_units is not None
 
     @property
     def holds_state_slots(self) -> bool:
@@ -190,6 +237,10 @@ class RequestTable:
         if need_size == 0:
             return []
         rows = self.free_slots[-need_size:]
+        if self._row_units is not None and not self._row_units.bind(
+            async_h2d(rows, dtype=torch.int64, device=self.device)
+        ):
+            return None
         del self.free_slots[-need_size:]
         for row in rows:
             self._move(row, (RowState.FREE,), state)
@@ -201,6 +252,8 @@ class RequestTable:
         fails here instead of handing it out twice."""
         for row in rows:
             self._move(row, _HOLDING, RowState.FREE)
+        if self._row_units is not None and rows:
+            self._row_units.free(async_h2d(rows, dtype=torch.int64, device=self.device))
         self.free_slots.extend(rows)
 
     def free(self, req: Req) -> None:

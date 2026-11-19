@@ -25,6 +25,9 @@ from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.draft_parallel import resolve_draft_parallel_layout
 from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
 from sglang.srt.speculative.dspark_components.dspark_planner import VerifyWindow
+from sglang.srt.speculative.online_acceptance_estimator import (
+    OnlineAcceptanceEstimator,
+)
 from sglang.srt.speculative.spec_info import (
     SpeculativeAlgorithm,
     spec_scale_global_num_tokens,
@@ -82,6 +85,7 @@ class DraftProposal(msgspec.Struct, frozen=True):
     # [bs, gamma]; None when the draft has no confidence head.
     confidence: Optional[torch.Tensor] = None
     confidence_raw: Optional[torch.Tensor] = None
+    acceptance_features: Optional[torch.Tensor] = None
     folded: bool = False
     # [bs, gamma + 1] ``[anchor | draft tokens]`` from the draft graph tail; None
     # when the caller builds them.
@@ -214,7 +218,13 @@ def _draft_step(
     logits_out: Optional[torch.Tensor],
     sharded_accept: bool,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    if logits_out is None and len(prev_tokens) == 1:
+    # The fused kernel has no vocab mask, and softcap rounding can tie its argmax.
+    if (
+        logits_out is None
+        and len(prev_tokens) == 1
+        and markov_head.step_vocab_limit is None
+        and markov_head.step_softcap is None
+    ):
         # One greedy row, no logits kept: one kernel does the GEMV, add and argmax.
         w2_weight = markov_head.greedy_w2_weight()
         # The kernel reads one w2 row per base-logit column.
@@ -249,6 +259,8 @@ def _draft_step(
         logits_out=logits_out,
         # Rows sample at their temperatures only when the step logits are kept.
         has_sampled_rows=None if logits_out is not None else False,
+        softcap=markov_head.step_softcap,
+        vocab_limit=markov_head.step_vocab_limit,
         **sharded,
     )
     return tokens, state
@@ -346,7 +358,7 @@ class DraftBlockProposer:
     _staged_params_key = None
     num_staged_params_skips = 0
     num_staged_params_calls = 0
-    deferred_commit = None
+    deferred_draft_kv = None
 
     def __init__(
         self,
@@ -361,9 +373,11 @@ class DraftBlockProposer:
         greedy_draft: bool,
         sharded_accept: bool = False,
         dp_moe_sync: bool = False,
+        acceptance_estimator: Optional[OnlineAcceptanceEstimator] = None,
     ) -> None:
         self.draft_model = draft_model
         self.draft_model_runner = draft_model_runner
+        self._acceptance_estimator = acceptance_estimator
         self.gamma = gamma
         self.sample_from_anchor = bool(draft_model.sample_from_anchor)
         self.query_token_num = self.gamma if self.sample_from_anchor else self.gamma + 1
@@ -390,8 +404,8 @@ class DraftBlockProposer:
                 )
             )
         )
-        # SGLANG_DSPARK_DEFER_CONTEXT_KV's staged commit, set by the worker.
-        self.deferred_commit = None
+        # SGLANG_DSPARK_DEFER_CONTEXT_KV's draft KV store, set by its attach_draft.
+        self.deferred_draft_kv = None
         # Persistent (bs, gamma) mask-token buffer: only column 0 (the bonus
         # token) changes per step, so avoid a fresh torch.full every decode.
         self._draft_block_ids_buf: Optional[torch.Tensor] = None
@@ -475,7 +489,7 @@ class DraftBlockProposer:
         )
         draft_block_ids = fwd.draft_block_ids
 
-        confidence = confidence_raw = verify_ids = None
+        confidence = confidence_raw = acceptance_features = verify_ids = None
         folded = False
         if (
             envs.SGLANG_DSPARK_FOLDED_PROPOSAL.get()
@@ -498,7 +512,10 @@ class DraftBlockProposer:
                 ),
                 noise=self._noise if self._sharded_accept else None,
             )
-            if draft_sampler.confidence_out is not None:
+            if draft_sampler.acceptance_features_out is not None:
+                confidence = draft_sampler.confidence_out[:bs]
+                acceptance_features = draft_sampler.acceptance_features_out[:bs]
+            elif draft_sampler.confidence_out is not None:
                 confidence = draft_sampler.confidence_out[:bs]
                 confidence_raw = draft_sampler.confidence_raw_out[:bs]
             if draft_sampler.verify_ids is not None:
@@ -521,7 +538,14 @@ class DraftBlockProposer:
                 greedy_draft=self._greedy_draft,
                 sharded_accept=self._sharded_accept,
             )
-            if self.draft_model.confidence_head is not None:
+            if self._acceptance_estimator is not None:
+                acceptance_features, confidence = self._acceptance_estimator.predict(
+                    logits=draft_block.corrected_logits,
+                    temperatures=torch.where(
+                        draft_block.greedy_mask, 0.0, draft_block.temperatures
+                    ),
+                )
+            elif self.draft_model.confidence_head is not None:
                 confidence, confidence_raw = self.draft_model.compute_confidence(
                     anchor_tokens=draft_block_ids[:, 0],
                     draft_tokens=draft_block.draft_tokens,
@@ -537,6 +561,7 @@ class DraftBlockProposer:
             draft_block=draft_block,
             confidence=confidence,
             confidence_raw=confidence_raw,
+            acceptance_features=acceptance_features,
             folded=folded,
             verify_ids=verify_ids,
         )
@@ -632,6 +657,9 @@ class DraftBlockProposer:
             out_cache_loc=draft_cache_loc,
             seq_lens_sum=draft_seq_lens_sum,
             seq_lens_cpu=draft_seq_lens_cpu,
+            # Hand-built batch bypasses init_new: carry the scheduler's host
+            # length bound so mirrorless replay prep can narrow its copies.
+            max_seq_len_host=getattr(batch, "max_seq_len_host", None),
             positions=draft_positions,
             input_embeds=draft_input_embeds,
             spec_algorithm=SpeculativeAlgorithm.DSPARK,
@@ -656,22 +684,22 @@ class DraftBlockProposer:
             self._stage_sampling_params(
                 draft_sampler, bs=bs, sampling_info=sampling_info
             )
-        commit = self.deferred_commit
-        if commit is not None:
-            commit.before_draft_forward(
+        deferred_draft_kv = self.deferred_draft_kv
+        if deferred_draft_kv is not None:
+            deferred_draft_kv.before_draft_forward(
                 graph_bs=(
                     graph_runner.capture_bs[
                         bisect.bisect_left(graph_runner.capture_bs, bs)
                     ]
                     if runs_graph
                     else None
-                )
+                ),
+                reqs=batch.reqs,
             )
         with torch.inference_mode():
             draft_out = self.draft_model_runner.forward(draft_forward_batch)
-        if commit is not None:
-            assert draft_out.can_run_graph == runs_graph
-            commit.after_draft_forward(graph_ran=draft_out.can_run_graph)
+        # before_draft_forward took runs_graph as whether the graph writes the staging.
+        assert deferred_draft_kv is None or draft_out.can_run_graph == runs_graph
         logits_output = draft_out.logits_output
         raw_hidden = logits_output.hidden_states
         if raw_hidden is None:

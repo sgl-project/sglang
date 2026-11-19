@@ -20,6 +20,7 @@ from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.runtime_context import (
     get_disagg,
+    get_exec,
     get_memory,
     get_serving,
 )
@@ -152,6 +153,13 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
     return create_unified_radix_cache(ctx)
 
 
+def keep_full_kv_only(params: CacheInitParams, tree_slots) -> list:
+    from sglang.srt.mem_cache.kv.plan import TREE_STATE
+
+    params.request_mamba_only = True
+    return [slot for slot in tree_slots if slot.family != TREE_STATE]
+
+
 def _static_tree_shape(ctx: TreeCacheBuildContext, allocator):
     """What static pools tell their prefix tree (a unified pool's plan says it
     itself): which slots the model has, its window layers' attention window,
@@ -192,6 +200,8 @@ def create_unified_radix_cache(
         shape=_static_tree_shape(ctx, allocator),
     )
     tree_slots = list(storage.tree_slots())
+    if ctx.is_hybrid_ssm and get_exec().mamba.decode_state_free_radix:
+        tree_slots = keep_full_kv_only(params, tree_slots)
 
     if hasattr(params.req_to_token_pool, "req_to_c128_sidecar"):
         from sglang.srt.hardware_backend.npu.dsv4.c128_sidecar_component import (

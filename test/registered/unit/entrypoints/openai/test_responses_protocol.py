@@ -29,17 +29,16 @@ def _in_progress_response(request: ResponsesRequest) -> ResponsesResponse:
 
 class ResponsesRequestTestCase(CustomTestCase):
     def test_pd_routing_fields(self):
-        with self.assertWarns(DeprecationWarning):
-            request = ResponsesRequest(
-                model="x",
-                input="hi",
-                bootstrap_host="10.0.0.1",
-                bootstrap_port=8998,
-                bootstrap_room=42,
-                data_parallel_rank=1,
-                disagg_prefill_dp_rank=0,
-                store=False,
-            )
+        request = ResponsesRequest(
+            model="x",
+            input="hi",
+            bootstrap_host="10.0.0.1",
+            bootstrap_port=8998,
+            bootstrap_room=42,
+            routed_dp_rank=1,
+            disagg_prefill_dp_rank=0,
+            store=False,
+        )
 
         self.assertEqual(request.bootstrap_host, "10.0.0.1")
         self.assertEqual(request.bootstrap_port, 8998)
@@ -173,14 +172,13 @@ class ResponsesSamplingParamsTestCase(CustomTestCase):
             model="x", input="hi", store=False, max_output_tokens=100
         )
         params = request.to_sampling_params(default_max_tokens=None)
-        # 100 minus the 2-token BOS/EOS headroom.
-        self.assertEqual(params["max_new_tokens"], 98)
+        self.assertEqual(params["max_new_tokens"], 100)
 
     def test_default_budget_still_caps_when_provided(self):
         # Backwards compatible: an explicit default budget still applies.
         request = ResponsesRequest(model="x", input="hi", store=False)
         params = request.to_sampling_params(default_max_tokens=128)
-        self.assertEqual(params["max_new_tokens"], 126)
+        self.assertEqual(params["max_new_tokens"], 128)
 
     def test_text_format_maps_to_json_schema_constraint(self):
         schema = {"type": "object", "properties": {"age": {"type": "integer"}}}

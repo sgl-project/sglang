@@ -1,13 +1,15 @@
 """One Gemma-4 layer site, fused (NVLS all-reduce + norm -> residual add -> norm ->
 per-128 FP8 quant in one kernel) against the stock chain (the TP all-reduce
 the model runs today: CustomAllReduceV2 within its tuned size bands, NCCL
-above them; then gemma_rmsnorm_residual_scalar + RMSNorm +
-per_token_group_quant_fp8), per token count. ``fused-nocopy`` leaves out the
-staging copy into the symmetric buffer, the cost a producer writing straight
-into it would save. Multi-GPU only; relaunches under torchrun.
+above them; then gemma_rmsnorm_residual_scalar + the SM90 RMSNorm kernel +
+per_token_group_quant_fp8), per token count, from decode batch sizes up to
+prefill chunks. ``fused-nocopy`` leaves out the staging copy into the
+symmetric buffer, which the model path avoids by having the GEMM write it.
+Multi-GPU only; relaunches under torchrun.
 
-The per-TP-size defaults of DEFAULT_MIN_TOKENS
-(srt/layers/communication/gemma4_ar_fusion.py) come from this sweep.
+Both providers read a cold partial and end in the FP8 layout DeepGEMM takes.
+Gemma4ArFusion.applies (srt/layers/communication/gemma4_ar_fusion.py) rests on
+this sweep.
 """
 
 from __future__ import annotations
@@ -17,15 +19,17 @@ import os
 
 import torch
 import torch.distributed as dist
+from sgl_kernel import rmsnorm
 from torch._C._distributed_c10d import _SymmetricMemory
 
 import sglang.srt.distributed.parallel_state as ps
 from sglang.kernels.jit.benchmark import marker
+from sglang.kernels.jit.benchmark.marker import _calculate_rotation_count
 from sglang.kernels.jit.benchmark.utils import get_benchmark_range, multigpu_bench_main
 from sglang.kernels.jit.utils import cache_once
 from sglang.kernels.ops.communication import gemma4_ar_fusion
 from sglang.kernels.ops.layernorm.gemma4_fused_ops import gemma_rmsnorm_residual_scalar
-from sglang.kernels.ops.quantization.fp8_kernel import per_token_group_quant_fp8
+from sglang.kernels.ops.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 from sglang.srt.distributed.comm_cleanup import register_comm_cleanup
 from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
     CustomAllReduceV2,
@@ -43,8 +47,18 @@ register_cuda_ci(
 HIDDEN = 5376  # Gemma-4 31B
 EPS = 1e-6
 GROUP = gemma4_ar_fusion.GROUP
-NUM_TOKENS = get_benchmark_range([128, 256, 512, 1024, 2048, 4096, 8192], [512, 4096])
+NUM_TOKENS = get_benchmark_range(
+    [1, 4, 8, 16, 32, 64, 128, 160, 256, 512, 1024, 2048, 4096, 8192], [32, 512, 4096]
+)
 MAX_TOKENS = max(NUM_TOKENS)
+
+
+def _rotations(num_tokens: int) -> int:
+    # as many partials as do_bench rotates the stock input through, so both
+    # providers read a cold partial (do_bench caps the rotation at 100)
+    return min(_calculate_rotation_count(num_tokens * HIDDEN * 2), 100)
+
+
 PROVIDERS = ["stock", "fused", "fused-nocopy"]
 
 
@@ -63,7 +77,7 @@ def _init():
     # fused kernel borrows this plane's barriers, as it does in the model.
     comm = CustomAllReduceV2(coord.cpu_group, torch.device(f"cuda:{local_rank}"))
     assert not comm.disabled and comm.has_multicast, "needs NVLink multicast"
-    gemma4_ar_fusion.register_comm(comm.obj)
+    gemma4_ar_fusion.register_comm(lambda: comm.obj, world_size=comm.world_size)
     register_comm_cleanup(comm)
     return coord, comm
 
@@ -90,7 +104,10 @@ def _symm(shape, dtype, group_name):
 def _buffers():
     name = _init()[0].cpu_group.group_name
     return (
-        _symm((MAX_TOKENS, HIDDEN), torch.bfloat16, name),
+        # the fused provider rotates through slices of this one
+        _symm(
+            (max(_rotations(n) * n for n in NUM_TOKENS), HIDDEN), torch.bfloat16, name
+        ),
         _symm((MAX_TOKENS, HIDDEN), torch.float8_e4m3fn, name),
         _symm((MAX_TOKENS, HIDDEN // GROUP), torch.float32, name),
     )
@@ -112,8 +129,11 @@ def benchmark(num_tokens: int, provider: str):
         def fn(x):
             x = _stock_all_reduce(comm, coord.device_group, x)
             r = gemma_rmsnorm_residual_scalar(x, w_a, residual, scalar, EPS)
-            y = torch.nn.functional.rms_norm(r, (HIDDEN,), w_b, EPS)
-            return per_token_group_quant_fp8(y, GROUP)
+            y = rmsnorm(r, w_b, EPS)  # what RMSNorm.forward_cuda runs on SM90
+            # the block-FP8 linear's input quant before DeepGEMM on SM90
+            return sglang_per_token_group_quant_fp8(
+                y, GROUP, column_major_scales=True, scale_tma_aligned=True
+            )
 
     else:
         (p_t, p_mc), (o_t, o_mc), (s_t, s_mc) = _buffers()
@@ -122,16 +142,26 @@ def benchmark(num_tokens: int, provider: str):
         rows = max(0, min(num_tokens, row0 + per_rank) - row0)
         mine = residual[row0 : row0 + rows].clone()
         copy = provider == "fused"
+        # the model's scale layout: column-major, 16-byte aligned columns
+        groups, ld = HIDDEN // GROUP, (num_tokens + 3) // 4 * 4
+        scales = s_t.view(-1)[: groups * ld].view(groups, ld).t()[:num_tokens]
+
+        rotations, step = _rotations(num_tokens), [0]
 
         def fn(x):
+            # do_bench rotates x through cold copies; the fused site reads its own
+            # rotation of symmetric slices instead (x stands in for the GEMM output)
+            i = step[0] % rotations
+            step[0] += 1
+            partial_i = p_t[i * num_tokens : (i + 1) * num_tokens]
             if copy:
-                p_t[:num_tokens].copy_(x)  # the staging copy the model path pays
+                partial_i.copy_(x)  # the staging copy the model path pays
             gemma4_ar_fusion.site(
-                p_t[:num_tokens],
-                p_mc,
+                partial_i,
+                p_mc + partial_i.data_ptr() - p_t.data_ptr(),
                 o_t[:num_tokens],
                 o_mc,
-                s_t[:num_tokens],
+                scales,
                 s_mc,
                 mine,
                 w_a,
@@ -143,7 +173,7 @@ def benchmark(num_tokens: int, provider: str):
                 False,
                 world_size=world_size,
             )
-            return o_t[:num_tokens], s_t[:num_tokens]
+            return o_t[:num_tokens], scales
 
     return marker.do_bench(
         fn,

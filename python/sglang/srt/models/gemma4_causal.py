@@ -67,6 +67,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_loader.weight_utils import (
@@ -475,8 +476,10 @@ class Gemma4Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        output_tensor: Optional[torch.Tensor] = None,
         **kwargs,
     ):
+        """``output_tensor``: optional caller-owned storage for o_proj's result."""
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
@@ -573,7 +576,9 @@ class Gemma4Attention(nn.Module):
         )
         if attn_output.dim() == 3:
             attn_output = attn_output.flatten(-2, -1)
-        output, _ = self.o_proj(attn_output)
+        # pass output_tensor only when given: LoRA-wrapped layers do not take it
+        kwargs = {} if output_tensor is None else {"output_tensor": output_tensor}
+        output, _ = self.o_proj(attn_output, **kwargs)
 
         return output
 
@@ -900,10 +905,10 @@ class Gemma4TextModel(PreTrainedModel):
         # non-first PP ranks (eager path produces correct output and
         # GSM8K ~0.92, cuda-graph path emits token soup).  Refuse the
         # combination until the runner becomes schema-aware; users can run
-        # PP + PLE eagerly with --disable-cuda-graph.
+        # PP + PLE eagerly with CUDA graphs disabled on both phases.
         if self.pp_group.world_size > 1 and self.hidden_size_per_layer_input > 0:
             sa = get_server_args()
-            if sa is not None and not get_exec().graph.disable_cuda_graph:
+            if sa is not None and not cuda_graph_fully_disabled():
                 raise ValueError(
                     "Pipeline parallelism is currently incompatible with "
                     "per-layer-input (PLE) embeddings under CUDA graph: "
@@ -911,8 +916,10 @@ class Gemma4TextModel(PreTrainedModel):
                     "{hidden_states, residual} and silently drops "
                     "per_layer_inputs, corrupting per-layer contributions on "
                     "non-first PP ranks. Workarounds: (a) pass "
-                    "--disable-cuda-graph to fall back to eager replay, or "
-                    "(b) use tensor parallelism (--tp-size) instead of PP."
+                    "--cuda-graph-backend-decode disabled "
+                    "--cuda-graph-backend-prefill disabled to fall back to "
+                    "eager execution, or (b) use tensor parallelism "
+                    "(--tp-size) instead of PP."
                 )
 
         if self.pp_group.is_first_rank:
@@ -1043,7 +1050,7 @@ class Gemma4TextModel(PreTrainedModel):
     ) -> bool:
         mode = forward_batch.forward_mode
         return (
-            (mode == ForwardMode.EXTEND or mode.is_mixed())
+            (mode in (ForwardMode.DECODE, ForwardMode.EXTEND) or mode.is_mixed())
             and self._ar_fusion.applies(num_tokens)
             and per_layer_inputs is None
             and pp_proxy_tensors is None
@@ -1057,25 +1064,35 @@ class Gemma4TextModel(PreTrainedModel):
         """The layer stack with every TP all-reduce + epilogue as one fused site.
 
         This rank keeps only its own rows of the residual stream; each site
-        returns the next GEMM's FP8 input for all rows. Same math as
+        returns the next GEMM's FP8 input for all rows. o_proj and down_proj
+        write their partial sums straight into the site's symmetric buffer. Same math as
         Gemma4DecoderLayer.forward: the attention site rounds the
         post-attention norm to bf16 before the add, the MLP site adds in fp32
         and scales.
         """
         fusion = self._ar_fusion
-        if not fusion.used:
-            fusion.used = True
+        kind = "decode" if forward_batch.forward_mode.is_decode() else "extend"
+        if kind not in fusion.used:
+            fusion.used.add(kind)
             logger.info(
-                "gemma4 all-reduce fusion: first fused forward (%d tokens)",
+                "gemma4 all-reduce fusion: first fused %s forward (%d tokens)",
+                kind,
                 input_embeds.shape[0],
             )
-        row0, rows = fusion.rows(input_embeds.shape[0])
+        num_tokens = input_embeds.shape[0]
+        row0, rows = fusion.rows(num_tokens)
+        # Safe to overwrite between sites: a site returns only after every rank
+        # has read this buffer (the kernel's closing barrier).
+        partial_out = fusion.partial_out(num_tokens)
         residual = input_embeds[row0 : row0 + rows].clone()
         x = self.layers[self.start_layer].input_layernorm(input_embeds)
         for idx in range(self.start_layer, self.end_layer):
             layer = self.layers[idx]
             h = layer.self_attn(
-                positions=positions, hidden_states=x, forward_batch=forward_batch
+                positions=positions,
+                hidden_states=x,
+                forward_batch=forward_batch,
+                output_tensor=partial_out,
             )
             x = fusion.site(
                 h,
@@ -1085,7 +1102,7 @@ class Gemma4TextModel(PreTrainedModel):
                 None,
                 round_a=True,
             )
-            h = layer.mlp(x)
+            h = layer.mlp(x, output_tensor=partial_out)
             if idx + 1 < self.end_layer:
                 x = fusion.site(
                     h,
@@ -1355,9 +1372,6 @@ class Gemma4ForCausalLM(PreTrainedModel):
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
-
-    def get_embed_and_head(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self.model.embed_tokens.weight, self.lm_head.weight
 
     def get_attention_sliding_window_size(self):
         return get_attention_sliding_window_size(self.config)

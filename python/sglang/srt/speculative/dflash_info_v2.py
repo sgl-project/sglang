@@ -9,7 +9,10 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
-from sglang.srt.mem_cache.allocation_sizing import page_aligned_decode_alloc_lens
+from sglang.srt.mem_cache.allocation_sizing import (
+    add_spec_decode_headroom_pages,
+    page_aligned_decode_alloc_lens,
+)
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.utils.device import is_pin_memory_available
@@ -152,12 +155,25 @@ class DFlashDraftInputV2(SpecInput):
             reserve=reserve,
             page_size=page_size,
         )
+        nxt_kv_lens, num_needed_tokens = add_spec_decode_headroom_pages(
+            batch,
+            nxt_kv_lens,
+            num_needed_tokens,
+            reserve=reserve,
+            page_size=page_size,
+        )
 
         committed_lens = [int(req.kv.kv_committed_len) for req in batch.reqs]
         top_ks = [int(req.sampling_params.top_k) for req in batch.reqs]
         batch_seq_lens_cpu_t.numpy()[:] = committed_lens
         cur_kv_lens_cpu_t.numpy()[:] = cur_kv_lens
         nxt_kv_lens_cpu_t.numpy()[:] = nxt_kv_lens
+        # Host upper bound of the over-allocated KV lengths (>= committed +
+        # alloc reserve): bounds the NPU backend's mirrorless replay
+        # page-table copies without a D2H sync, mirroring
+        # eagle_utils.eagle_prepare_for_decode. Backend consumers gate on
+        # seq_lens_cpu, so leaving this set in mirror mode is a no-op.
+        batch.max_seq_len_host = int(cur_kv_lens_cpu_t.max())
         committed_seq_lens_sum = sum(committed_lens)
         nxt_kv_lens_sum = sum(nxt_kv_lens)
         max_top_k = max(top_ks)

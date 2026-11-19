@@ -41,6 +41,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.capacity import evict_to_free_tokens, shares_memory
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.mem_cache.storage.flexkv.flexkv_connector import FlexKVConnector
 from sglang.srt.runtime_context import get_spec
@@ -329,10 +330,13 @@ class FlexKVRadixCache(RadixCache):
         if uncached_len <= 0:
             return None
 
-        # Evict to make room when needed.
-        if self.token_to_kv_pool_allocator.available_size() < uncached_len:
+        allocator = self.token_to_kv_pool_allocator
+        if shares_memory(allocator):
+            # The allocation takes these tokens in every sub-pool, as a decode does.
+            evict_to_free_tokens(self, allocator, uncached_len)
+        elif allocator.available_size() < uncached_len:
             self.evict(EvictParams(num_tokens=uncached_len))
-        token_slots = self.token_to_kv_pool_allocator.alloc(uncached_len)
+        token_slots = allocator.alloc(uncached_len)
         if token_slots is None:
             return None
 
