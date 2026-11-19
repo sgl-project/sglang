@@ -31,6 +31,10 @@ logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_musa = is_musa()
+# is_npu() raises when torch_npu is installed but no NPU is visible (CI boxes),
+# and this module is imported by other accelerators' modules, so evaluate the
+# same predicate directly: here we only need a boolean.
+_is_npu = hasattr(torch, "npu") and torch.npu.is_available()
 
 if _is_cuda:
     try:
@@ -341,6 +345,14 @@ def with_nvml_context(fn: Callable[_P, _R]) -> Callable[_P, _R]:
                 return fn(*args, **kwargs)
             finally:
                 amdsmi_shut_down()
+        elif _is_npu:
+            # Ascend NPU has no NVML. Both probes below could only conclude
+            # "no NVLink fabric", so answer that directly: every rank of a TP
+            # group runs on the same platform, so the ranks agree.
+            logger.debug(
+                "NVML is not available on this platform; skipping NVML context."
+            )
+            return False
         else:
             pynvml.nvmlInit()
             try:
