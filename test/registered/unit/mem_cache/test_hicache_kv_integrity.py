@@ -273,11 +273,7 @@ def cpu_hicache_patches():
         mock.patch.object(l2_transfer, "_timing_events_supported", lambda: False),
         # psutil reports the whole box; a shared login node can read as negative
         # free memory long before the fixture's few MB matter.
-        mock.patch.object(
-            pool_host_base,
-            "host_memory_budget_bytes",
-            lambda requested_bytes=0: 1 << 34,
-        ),
+        pool_host_base.host_memory_budget_scope(1 << 34),
         mock.patch.object(
             pool_host_common,
             "_cuda_host_register",
