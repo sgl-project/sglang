@@ -7,6 +7,7 @@ import logging
 import os
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 import uuid
@@ -14,6 +15,7 @@ from unittest.mock import patch
 
 import psutil
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import cudacore_pyspy_dump_utils as dump_utils
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -215,6 +217,72 @@ class TestExclusiveDumpSlot(CustomTestCase):
             self.assertIs(no_interval, dump_utils.DumpSlot.WON)
         with slot(owner="b") as new_owner:
             self.assertIs(new_owner, dump_utils.DumpSlot.WON)
+
+
+class TestHealthFailDumpFile(CustomTestCase):
+    """SGLANG_DEBUG_HEALTH_FAIL_PYSPY_DUMP_DIR: a file copy of the dump."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dump_dir = os.path.join(self.tmp.name, "dumps")
+        # a fresh slot per test, so the rate limit of another test cannot skip it
+        key = f"test-file-{os.getpid()}-{uuid.uuid4().hex}"
+        slot_path = dump_utils._dump_slot_path(key)
+        self.addCleanup(lambda: slot_path.unlink(missing_ok=True))
+        real_slot = dump_utils._exclusive_dump_slot
+        patcher = patch.object(
+            dump_utils,
+            "_exclusive_dump_slot",
+            side_effect=lambda **kw: real_slot(**dict(kw, key=key)),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _dump(self, dump_dir):
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=f"Thread {cmd[-1]} (idle)"
+            )
+
+        with (
+            envs.SGLANG_DEBUG_HEALTH_FAIL_PYSPY_DUMP_DIR.override(dump_dir),
+            patch.object(dump_utils.shutil, "which", return_value="/usr/bin/py-spy"),
+            patch.object(dump_utils.subprocess, "run", side_effect=fake_run),
+        ):
+            with self.assertLogs(dump_utils.logger, level=logging.ERROR):
+                self.assertTrue(dump_utils.pyspy_dump_all_sglang_processes())
+
+    def test_unset_dir_writes_no_file(self):
+        """Without the knob the dump stays log-only."""
+        self._dump(None)
+        self.assertFalse(os.path.exists(self.dump_dir))
+
+    def test_dump_is_appended_with_header(self):
+        """The file gets a UTC/host/pid header and the stack of this process."""
+        self._dump(self.dump_dir)
+        self._dump(self.dump_dir)
+        text = open(os.path.join(self.dump_dir, "health_fail_pyspy.log")).read()
+        self.assertEqual(text.count("==== health-fail py-spy dump"), 2)
+        self.assertIn(f"server pid {os.getpid()}", text)
+        self.assertIn(f"Thread {os.getpid()} (idle)", text)
+
+    def test_full_file_rotates_to_dot_one(self):
+        """A file at the size cap moves to .log.1 and a fresh .log starts."""
+        os.makedirs(self.dump_dir)
+        path = os.path.join(self.dump_dir, "health_fail_pyspy.log")
+        with open(path, "w") as f:
+            f.write("old\n")
+        with patch.object(dump_utils, "_HEALTH_FAIL_DUMP_MAX_BYTES", 1):
+            self._dump(self.dump_dir)
+        self.assertEqual(open(path + ".1").read(), "old\n")
+        self.assertIn("==== health-fail py-spy dump", open(path).read())
+
+    def test_unwritable_dir_does_not_raise(self):
+        """A broken dump dir is one error line; the dump itself still succeeds."""
+        blocker = os.path.join(self.tmp.name, "not-a-dir")
+        open(blocker, "w").close()
+        self._dump(os.path.join(blocker, "dumps"))
 
 
 if __name__ == "__main__":

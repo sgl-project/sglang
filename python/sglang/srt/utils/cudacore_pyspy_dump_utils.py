@@ -21,6 +21,7 @@ import logging
 import os
 import platform
 import shutil
+import socket
 import subprocess
 import tempfile
 import time
@@ -125,7 +126,8 @@ _PTRACE_HINT = (
 _MIN_ATTEMPT_SECS = 1.0
 
 
-def _pyspy_dump_pid(pid: int, title: str, deadline: Optional[float] = None) -> None:
+def _pyspy_dump_pid(pid: int, title: str, deadline: Optional[float] = None) -> str:
+    """Dump one pid into the log; returns the logged text (stack or final error)."""
     # --native, then plain, then --nonblocking. The first two modes suspend the
     # target's threads themselves, which is impossible for an already stopped
     # (e.g. SIGSTOPped) process; --nonblocking reads memory without suspending
@@ -158,15 +160,15 @@ def _pyspy_dump_pid(pid: int, title: str, deadline: Optional[float] = None) -> N
         except subprocess.CalledProcessError as e:
             error = f"{cmd_str}: {e.stderr.strip()}"
         except FileNotFoundError:
-            logger.error(f"py-spy is not on PATH; cannot dump PID {pid} [{title}].")
-            return
+            text = f"py-spy is not on PATH; cannot dump PID {pid} [{title}]."
+            logger.error(text)
+            return text
         except OSError as e:
             error = f"{cmd_str}: {e}"
         else:
-            logger.error(
-                f"Pyspy dump for PID {pid} [{title}] ({cmd_str}):\n{result.stdout}"
-            )
-            return
+            text = f"Pyspy dump for PID {pid} [{title}] ({cmd_str}):\n{result.stdout}"
+            logger.error(text)
+            return text
         last_error = error
         if _PTRACE_DENIED in error or "No such process" in error:
             break  # ptrace denial and a dead pid fail identically in every mode
@@ -175,23 +177,28 @@ def _pyspy_dump_pid(pid: int, title: str, deadline: Optional[float] = None) -> N
                 f"Pyspy failed for PID {pid} ({error}); retrying {retry_modes[i]}"
             )
     denied = any(s in (last_error or "") for s in (_PTRACE_DENIED, "Permission denied"))
-    logger.error(
+    text = (
         f"All pyspy dump attempts failed for PID {pid} "
         f"[{title or '<unknown>'}]: {last_error}{_PTRACE_HINT if denied else ''}"
     )
+    logger.error(text)
+    return text
 
 
 def _pyspy_dump_procs(
     dumps: List[Tuple[int, str]], deadline: Optional[float], max_parallel: int
-) -> None:
+) -> List[str]:
+    """Dump every (pid, title); returns the logged texts in `dumps` order."""
     if not dumps:
-        return
+        return []
     if max_parallel <= 1:
         # Inline: the crash path runs from a signal handler, where a pool's
         # submit() can self-deadlock on the executor module lock.
-        for pid, title in dumps:
+        return [
             _pyspy_dump_pid(pid=pid, title=title, deadline=deadline)
-        return
+            for pid, title in dumps
+        ]
+    texts = []
     with ThreadPoolExecutor(max_workers=min(len(dumps), max_parallel)) as pool:
         futures = {
             pool.submit(_pyspy_dump_pid, pid=pid, title=title, deadline=deadline): (
@@ -202,9 +209,11 @@ def _pyspy_dump_procs(
         }
         for future, (pid, title) in futures.items():
             try:
-                future.result()
+                texts.append(future.result())
             except Exception:
                 logger.exception(f"py-spy dump of PID {pid} [{title}] raised")
+                texts.append(f"py-spy dump of PID {pid} [{title}] raised")
+    return texts
 
 
 def pyspy_dump_schedulers(scheduler_only: bool = False) -> None:
@@ -283,6 +292,27 @@ def _exclusive_dump_slot(
         os.close(fd)
 
 
+_HEALTH_FAIL_DUMP_FILE = "health_fail_pyspy.log"
+_HEALTH_FAIL_DUMP_MAX_BYTES = 64 * 1024 * 1024
+
+
+def _append_health_fail_dump(dump_dir: str, text: str) -> None:
+    """Append one health-failure dump to <dump_dir>/health_fail_pyspy.log.
+
+    A ring of two files (.log, .log.1) of up to 64 MiB each, so a pod that
+    keeps failing its probes cannot fill the volume. Never raises: the dump
+    already went to the log, the file is only a longer-lived copy."""
+    try:
+        os.makedirs(dump_dir, exist_ok=True)
+        path = Path(dump_dir) / _HEALTH_FAIL_DUMP_FILE
+        if path.exists() and path.stat().st_size >= _HEALTH_FAIL_DUMP_MAX_BYTES:
+            path.replace(path.with_name(_HEALTH_FAIL_DUMP_FILE + ".1"))
+        with open(path, "a", encoding="utf-8", errors="replace") as f:
+            f.write(text)
+    except OSError as e:
+        logger.error(f"Cannot append the py-spy dump under {dump_dir}: {e}")
+
+
 def pyspy_dump_all_sglang_processes(
     min_interval_secs: float = 0.0,
     budget_secs: float = 30.0,
@@ -290,7 +320,7 @@ def pyspy_dump_all_sglang_processes(
 ) -> bool:
     """py-spy dump the current process, the launcher, and every sglang::
     process of this server (scheduler ranks, detokenizer, tokenizer workers)
-    into the log.
+    into the log, and also into SGLANG_DEBUG_HEALTH_FAIL_PYSPY_DUMP_DIR when set.
 
     Returns False when the dump was skipped: another tokenizer worker of the
     same server is dumping, or the last dump is less than min_interval_secs
@@ -327,11 +357,21 @@ def pyspy_dump_all_sglang_processes(
         logger.error(
             f"py-spy dump of {len(dumps)} process(es): {[title for _, title in dumps]}"
         )
-        _pyspy_dump_procs(
+        texts = _pyspy_dump_procs(
             dumps=dumps,
             deadline=time.monotonic() + budget_secs,
             max_parallel=max_parallel,
         )
+        from sglang.srt.environ import envs
+
+        dump_dir = envs.SGLANG_DEBUG_HEALTH_FAIL_PYSPY_DUMP_DIR.get()
+        if dump_dir:
+            stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+            header = (
+                f"==== health-fail py-spy dump {stamp} UTC, "
+                f"host {socket.gethostname()}, server pid {server.pid} ===="
+            )
+            _append_health_fail_dump(dump_dir, "\n\n".join([header] + texts) + "\n\n")
     return True
 
 

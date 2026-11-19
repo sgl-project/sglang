@@ -410,6 +410,9 @@ class Envs:
     # Opt-in: on /health timeout, py-spy dump every sglang:: process of this
     # server; minimum seconds between two dumps, 0 disables.
     SGLANG_DEBUG_HEALTH_FAIL_PYSPY_DUMP_INTERVAL_SECS = EnvInt(0)
+    # Also append those dumps to <dir>/health_fail_pyspy.log (ring of two
+    # 64 MiB files) so they outlive the log retention; unset = log only.
+    SGLANG_DEBUG_HEALTH_FAIL_PYSPY_DUMP_DIR = EnvStr(None)
 
     # ===================================================================
     # Constrained decoding and grammar

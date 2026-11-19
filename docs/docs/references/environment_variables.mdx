@@ -1179,6 +1179,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DEBUG_HEALTH_FAIL_PYSPY_DUMP_DIR</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Directory to also append the <code>SGLANG_DEBUG_HEALTH_FAIL_PYSPY_DUMP_INTERVAL_SECS</code> dumps to, as <code>health_fail_pyspy.log</code> (a ring of two 64 MiB files: <code>.log</code> and <code>.log.1</code>). Point it at a persistent volume so the stacks outlive log retention and a liveness restart. Unset keeps the dump log-only.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>unset</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_CUDA_COREDUMP</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable CUDA coredump generation (auto-injects the required <code>CUDA_*</code> env vars).</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
