@@ -11,7 +11,6 @@ from importlib import metadata
 from pathlib import Path
 
 BUILD_TARGETS = {"sglang", "sgl-kernel", "sglang-kernel"}
-RUNTIME_UPGRADES = {"transformers", "peft"}
 PINNED_ADDITIONS = {
     "sailify": "1.0.0",
     "sgl-eval": "0.1.2",
@@ -161,7 +160,8 @@ def walk_dev_sail(root, load):
     while pending:
         requirement, strict = pending.pop()
         name = normalize_name(requirement.name)
-        strict = strict or name in RUNTIME_UPGRADES
+        # Validate ordinary dependencies transitively without an upgrade allowlist.
+        strict = strict or (name != "sglang" and not is_platform_package(name))
         if requirement.url:
             raise ValueError(f"Direct URL dependency is not supported: {requirement}")
         message = root if name == "sglang" else load(name, requirement, strict)
@@ -262,60 +262,100 @@ def collect_dev_sail(wheel_dir):
 
 
 def missing_dev_sail(wheel_dir, packages):
-    from packaging.version import Version
+    from packaging.requirements import Requirement
 
     root, wheels = dev_sail_wheels(wheel_dir)
     distributions = {}
     for dist in metadata.distributions():
         distributions.setdefault(normalize_name(dist.metadata["Name"]), dist.metadata)
-    selected = {}
+    previous_constraints = {}
+    previous_state = None
+    seen = set()
 
-    def load(name, requirement, strict):
-        if is_platform_package(name):
-            actual = SAIL_ALIASES.get(name, name)
-            if actual not in packages:
-                raise ValueError(
-                    f"Runtime image must preinstall {actual} for {requirement}"
-                )
-            if strict and not requirement.specifier.contains(
-                packages[actual]["version"], prereleases=True
-            ):
-                raise ValueError(
-                    f"Preinstalled {actual}=={packages[actual]['version']} "
-                    f"does not satisfy {requirement}; update the runtime image."
-                )
-            return None
-        if name in BUILD_TARGETS:
-            raise ValueError(f"Unexpected dependency on built package: {requirement}")
-        if name in packages and name not in RUNTIME_UPGRADES:
-            if name not in distributions:
-                raise ValueError(f"Missing installed metadata for {name}")
-            if strict and not requirement.specifier.contains(
-                packages[name]["version"], prereleases=True
-            ):
-                raise ValueError(
-                    f"Preinstalled {name}=={packages[name]['version']} "
-                    f"does not satisfy {requirement}; update the runtime image."
-                )
-            return distributions[name]
-        if name not in wheels:
-            raise ValueError(f"Offline wheelhouse is missing {requirement}")
-        path, message = wheels[name]
-        if not requirement.specifier.contains(message["Version"], prereleases=True):
-            raise ValueError(
-                f"Offline wheel {path.name} does not satisfy {requirement}"
-            )
-        if name in packages and Version(packages[name]["version"]) == Version(
-            message["Version"]
-        ):
-            if name not in distributions:
-                raise ValueError(f"Missing installed metadata for {name}")
-            return distributions[name]
-        selected[name] = path, message["Version"]
-        return message
+    # Aggregate constraints and revisit the graph to discard replaced metadata.
+    while True:
+        constraints = {}
+        candidates = {}
+        selected = {}
+        errors = []
 
-    walk_dev_sail(root, load)
-    return selected
+        def load(name, requirement, strict):
+            constraints.setdefault(name, set()).add(str(requirement))
+            if is_platform_package(name):
+                actual = SAIL_ALIASES.get(name, name)
+                if actual not in packages:
+                    errors.append(
+                        f"Runtime image must preinstall {actual} for {requirement}"
+                    )
+                elif strict and not requirement.specifier.contains(
+                    packages[actual]["version"], prereleases=True
+                ):
+                    errors.append(
+                        f"Preinstalled {actual}=={packages[actual]['version']} "
+                        f"does not satisfy {requirement}; update the runtime image."
+                    )
+                return None
+            if name in BUILD_TARGETS:
+                raise ValueError(
+                    f"Unexpected dependency on built package: {requirement}"
+                )
+            if name in candidates:
+                return candidates[name]
+            requirements = {
+                *previous_constraints.get(name, ()),
+                str(requirement),
+            }
+            if name in packages and (
+                name == "sailify"
+                or all(
+                    Requirement(value).specifier.contains(
+                        packages[name]["version"], prereleases=True
+                    )
+                    for value in requirements
+                )
+            ):
+                if name not in distributions:
+                    raise ValueError(f"Missing installed metadata for {name}")
+                message = distributions[name]
+            elif name in wheels:
+                path, message = wheels[name]
+                selected[name] = path, message["Version"]
+            else:
+                message = None
+                errors.append(f"Offline wheelhouse is missing {requirement}")
+            candidates[name] = message
+            return message
+
+        walk_dev_sail(root, load)
+        state = (
+            tuple(sorted((n, tuple(sorted(r))) for n, r in constraints.items())),
+            tuple(
+                sorted((n, m["Version"] if m else None) for n, m in candidates.items())
+            ),
+        )
+        if state == previous_state:
+            # Validate only the final graph, excluding obsolete dependency edges.
+            for name, message in candidates.items():
+                if message is None or (name == "sailify" and name in packages):
+                    continue
+                for value in sorted(constraints[name]):
+                    if not Requirement(value).specifier.contains(
+                        message["Version"], prereleases=True
+                    ):
+                        origin = (
+                            f"Offline wheel {wheels[name][0].name}"
+                            if name in selected
+                            else f"Preinstalled {name}=={message['Version']}"
+                        )
+                        errors.append(f"{origin} does not satisfy {value}")
+            if errors:
+                raise ValueError("\n".join(sorted(set(errors))))
+            return selected
+        if state in seen:
+            raise ValueError("Runtime dependency selection did not converge")
+        seen.add(state)
+        previous_state = state
+        previous_constraints = constraints
 
 
 def check_snapshots(before, after, additions):
@@ -323,31 +363,22 @@ def check_snapshots(before, after, additions):
         raise ValueError(
             "Dependency additions must not include platform or built packages"
         )
-    changed = {
-        name: {"before": before.get(name), "after": after.get(name)}
-        for name in before.keys() | after.keys()
-        if name not in BUILD_TARGETS
-        and not (
+    changed = {}
+    for name in before.keys() | after.keys() | additions.keys():
+        if name in BUILD_TARGETS:
+            continue
+        if (
             name in additions
-            and name in after
-            and after[name]["version"] == additions[name]
-            and (
-                name not in before
-                or (
-                    name in RUNTIME_UPGRADES
-                    and before[name]["version"] != additions[name]
-                )
-            )
-        )
-        and (
-            before.get(name) != after.get(name)
-            or (
-                name in RUNTIME_UPGRADES
-                and name in additions
-                and after.get(name, {}).get("version") != additions[name]
-            )
-        )
-    }
+            and after.get(name, {}).get("version") == additions[name]
+            and before.get(name, {}).get("version") != additions[name]
+            and (name != "sailify" or name not in before)
+        ):
+            # Allow ordinary dependency version changes from the dev_sail plan.
+            continue
+        if before.get(name) != after.get(name) or (
+            name in additions and after.get(name, {}).get("version") != additions[name]
+        ):
+            changed[name] = {"before": before.get(name), "after": after.get(name)}
     if changed:
         print("Unexpected dependency changes:", file=sys.stderr)
         print(json.dumps(changed, indent=2, sort_keys=True), file=sys.stderr)
@@ -370,6 +401,8 @@ def main():
     dev_sail = commands.add_parser("missing-dev-sail")
     dev_sail.add_argument("wheel_dir", type=Path)
     dev_sail.add_argument("additions", type=Path)
+    verify = commands.add_parser("verify-dev-sail")
+    verify.add_argument("wheel_dir", type=Path)
     commands.add_parser("requirements")
     wheels = commands.add_parser("missing-wheels")
     wheels.add_argument("wheel_dir", type=Path)
@@ -377,13 +410,23 @@ def main():
     if args.command == "snapshot":
         args.output.write_text(json.dumps(snapshot(), indent=2, sort_keys=True) + "\n")
         return 0
-    if args.command in ("collect-dev-sail", "missing-dev-sail"):
+    if args.command in ("collect-dev-sail", "missing-dev-sail", "verify-dev-sail"):
         try:
             if args.command == "collect-dev-sail":
                 collect_dev_sail(args.wheel_dir)
             else:
                 packages = snapshot()
                 selected = missing_dev_sail(args.wheel_dir, packages)
+                if args.command == "verify-dev-sail":
+                    if selected:
+                        raise ValueError(
+                            "Installed dev_sail dependencies still require changes: "
+                            + ", ".join(
+                                f"{n}=={v}" for n, (_, v) in sorted(selected.items())
+                            )
+                        )
+                    print("Installed dev_sail dependencies satisfy the wheel metadata.")
+                    return 0
                 args.additions.write_text(
                     json.dumps({n: v for n, (_, v) in selected.items()}, indent=2)
                     + "\n"
@@ -414,7 +457,11 @@ def main():
     before = json.loads(args.before.read_text())
     after = json.loads(args.after.read_text())
     additions = (
-        json.loads(args.additions.read_text()) if args.additions else PINNED_ADDITIONS
+        json.loads(args.additions.read_text())
+        if args.additions
+        else {
+            n: v for n, v in PINNED_ADDITIONS.items() if n not in before and n in after
+        }
     )
     try:
         return check_snapshots(before, after, additions)
