@@ -111,6 +111,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
     get_spec,
+    get_stream,
 )
 from sglang.srt.utils import is_npu, rank_consensus_checker
 from sglang.srt.utils.device import async_d2h
@@ -161,6 +162,15 @@ def clamp_kv_send_end(
     if end_idx is None:
         end_idx = min(req.extend_end, len(req.origin_input_ids))
     return min(end_idx, req.kv.cache_protected_len)
+
+
+def _kv_send_fence(*, current_stream, forward_stream):
+    """A stream ordered after both the indices copies and a forward still
+    writing the KV, without making the scheduling stream wait on that forward."""
+    fence = get_stream("kv_send_fence")
+    fence.wait_stream(current_stream)
+    fence.wait_stream(forward_stream)
+    return fence
 
 
 def _uses_write_through_cache(cache: object) -> bool:
@@ -1610,7 +1620,8 @@ class SchedulerDisaggregationPrefillMixin:
                     len(req.origin_input_ids),
                 )
             elif computed:
-                self.send_kv_chunk(req)
+                # Under PP this chunk's forward may still run on forward_stream.
+                self.send_kv_chunk(req, forward_in_flight=get_parallel().pp_size > 1)
 
             if self.chunked_req is not None:
                 running_batch.batch_is_full = False
@@ -1672,6 +1683,7 @@ class SchedulerDisaggregationPrefillMixin:
         req: Req,
         last_chunk: bool = False,
         end_idx: Optional[int] = None,
+        forward_in_flight: bool = False,
     ) -> None:
         computer: Optional[KvChecksumComputer] = self.kv_checksum_computer
         if last_chunk and computer is not None:
@@ -1692,13 +1704,19 @@ class SchedulerDisaggregationPrefillMixin:
                 digest = computer.compute(page_indices_gpu, state_indices)
                 signature = self.disagg_prefill_bootstrap_queue.kv_checksum_signature
             self.disagg_metadata_buffers.set_kv_checksum(req, digest, signature)
-        self._send_kv_chunk(req, last_chunk=last_chunk, end_idx=end_idx)
+        self._send_kv_chunk(
+            req,
+            last_chunk=last_chunk,
+            end_idx=end_idx,
+            forward_in_flight=forward_in_flight,
+        )
 
     def _send_kv_chunk(
         self: Scheduler,
         req: Req,
         last_chunk: bool = False,
         end_idx: Optional[int] = None,
+        forward_in_flight: bool = False,
     ) -> None:
         """
         Send a prefilled chunk to the decode server
@@ -1969,7 +1987,13 @@ class SchedulerDisaggregationPrefillMixin:
             indices_event = None
             if host_indices:
                 indices_event = self.device_module.Event()
-                indices_event.record(self.device_module.current_stream())
+                stream = self.device_module.current_stream()
+                if forward_in_flight:
+                    # The sender reads KV once this event completes.
+                    stream = _kv_send_fence(
+                        current_stream=stream, forward_stream=self.forward_stream
+                    )
+                indices_event.record(stream)
             segment_is_last = last_chunk and is_final_segment
             if not sender.should_send_kv_chunk(len(page_indices), segment_is_last):
                 continue
