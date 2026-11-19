@@ -13,7 +13,7 @@
 # ==============================================================================
 import logging
 from collections import defaultdict
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import einops
 import torch
@@ -242,7 +242,18 @@ def update_expert_weights_single_layer(
     debug: bool = False,
     log_metrics: bool = False,
     group: Optional[torch.distributed.ProcessGroup] = None,
+    *,
+    staged_rows: Optional[List[Tuple[int, int]]] = None,
+    submit_p2p_batch: Optional[
+        Callable[[List[P2POp]], List[torch.distributed.Work]]
+    ] = None,
 ):
+    """Move expert weights, optionally leaving writeback to the caller.
+
+    When `staged_rows` is provided, fill it with local (buffer, weight) row
+    pairs. A custom `submit_p2p_batch` may retain the work handles. The
+    updater still calls wait on every handle before returning.
+    """
     assert all(
         tensor.shape[0] == num_local_physical_experts
         for tensor in routed_experts_weights
@@ -264,6 +275,8 @@ def update_expert_weights_single_layer(
         )
 
     output_logs = [] if debug else None
+    if submit_p2p_batch is None:
+        submit_p2p_batch = torch.distributed.batch_isend_irecv
 
     num_physical_experts = len(old_physical_to_logical_map)
     num_tensors = len(routed_experts_weights)
@@ -299,7 +312,13 @@ def update_expert_weights_single_layer(
         _create_isend_ops(p2p_op_infos)
         _filter_p2p_ops(p2p_op_infos)
         _execute_p2p_ops(p2p_op_infos)
-        _execute_buffer2weight_copies(buffer2weight_copy_infos)
+        if staged_rows is None:
+            _execute_buffer2weight_copies(buffer2weight_copy_infos)
+        else:
+            staged_rows.extend(
+                (_get_local_expert_location(src), _get_local_expert_location(dst))
+                for src, dst in buffer2weight_copy_infos
+            )
 
         if log_metrics:
             _log_p2p_op_metrics(
@@ -562,7 +581,7 @@ def update_expert_weights_single_layer(
                 if eid in ops_by_expert:
                     batch_ops.extend(ops_by_expert[eid])
             if batch_ops:
-                reqs = torch.distributed.batch_isend_irecv(batch_ops)
+                reqs = submit_p2p_batch(batch_ops)
                 for req in reqs:
                     req.wait()
 
