@@ -300,6 +300,20 @@ class TestGemmaSharedVocabLayout(CustomTestCase):
         torch.testing.assert_close(embed, full_embed[384:512], rtol=0, atol=0)
         torch.testing.assert_close(head, full_head[384:512], rtol=0, atol=0)
 
+    def test_gemma4_dflash_noise_embedding_is_the_raw_table(self):
+        """DFlash drafts are trained on the raw embedding table (SpecForge, vLLM),
+        but Gemma-4's embed_tokens multiplies by sqrt(hidden_size) in forward.
+        Without the inverse scale the draft saw embeddings ~73x too large on
+        Gemma-4-31B and its acceptance length halved."""
+        ids = torch.tensor([3, 17, 200, 511], device="cuda")
+        for kind in ("gemma4", "gemma4_mm"):
+            with self.subTest(kind=kind):
+                model = build_source(kind)
+                fill_source(model)
+                embed = model.get_input_embeddings()
+                noise = embed(ids) * model.get_dflash_noise_embedding_scale()
+                torch.testing.assert_close(noise, embed.weight[ids])
+
 
 if __name__ == "__main__":
     unittest.main()

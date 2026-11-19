@@ -1379,6 +1379,11 @@ class Gemma4ForCausalLM(PreTrainedModel):
     def dtype(self) -> torch.dtype:
         return next(self.parameters()).dtype
 
+    def get_dflash_noise_embedding_scale(self) -> float:
+        # DFlash drafts are trained on the raw embedding table (SpecForge, vLLM),
+        # while embed_tokens multiplies by sqrt(hidden_size) in forward.
+        return 1.0 / self.model.embed_tokens.embed_scale
+
     def set_dflash_layers_to_capture(self, layer_ids: list[int]):
         if layer_ids is None:
             raise ValueError(
