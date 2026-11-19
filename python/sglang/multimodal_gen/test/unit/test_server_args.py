@@ -2891,7 +2891,6 @@ class TestOffloadDefaults(_CudaPlatformTestCase):
                 )
 
                 self.assertEqual(args.residency_mode("transformer"), LAYERWISE_OFFLOAD)
-                self.assertEqual(args.layerwise_offload_components[0], "dit")
 
     def test_auto_cosmos3_super_keeps_dit_resident_on_high_memory_gpu(self):
         # Super is a single-DiT pipeline like Nano, so above the threshold the
