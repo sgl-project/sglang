@@ -9,9 +9,10 @@ use std::time::Instant;
 use futures::Stream;
 use sglang_api_types::api::v1 as api;
 
-use super::core::{CoreError, CoreEvent, CoreOutput, ReceivedAs};
+use super::core::{CoreError, CoreEvent, CoreOutput};
 use super::handlers::{CoreCall, CoreHandle};
 use super::http::openai::{ChatFormatter, render_chat_prompt};
+use crate::api_server::log::ReceivedAs;
 use crate::message::config::ServerArgs;
 use crate::message::ids::Rid;
 use crate::message::request::{GenerateRequest, RenderedChat};

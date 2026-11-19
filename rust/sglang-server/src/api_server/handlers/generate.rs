@@ -17,9 +17,9 @@ use crate::utils::error::Error;
 use super::handle::{
     CoreHandle, ExpectedResponse, LastOutput, RuntimeCall, translate_runtime_error,
 };
-use crate::api_server::core::{
-    BodySnapshot, CoreError, CoreEvent, InFlight, LoggedHeaders, OpenAiRequest, RawBody,
-    ReceivedAs, RequestMetrics, RequestRecord, prefetch,
+use crate::api_server::core::{CoreError, CoreEvent, InFlight, RequestMetrics, prefetch};
+use crate::api_server::log::{
+    BodySnapshot, LoggedHeaders, OpenAiRequest, RawBody, ReceivedAs, RequestRecord,
 };
 
 impl CoreHandle {
@@ -86,7 +86,7 @@ impl CoreHandle {
     }
 
     /// The crash dump's requests (see
-    /// [`RequestLog::crash_dump_snapshot`](crate::api_server::core::RequestLog::crash_dump_snapshot));
+    /// [`RequestLog::crash_dump_snapshot`](crate::api_server::log::RequestLog::crash_dump_snapshot));
     /// `None` without `--crash-dump-folder`.
     pub(crate) fn crash_dump_snapshot(&self) -> Option<Vec<u8>> {
         self.inner.request_log.as_ref()?.crash_dump_snapshot()
@@ -1137,7 +1137,7 @@ mod tests {
                 peer_endpoints: Vec::new(),
                 metadata: CoreMetadata::default(),
                 metrics: None,
-                request_log: Some(crate::api_server::core::RequestLog::for_test(None, true)),
+                request_log: Some(crate::api_server::log::RequestLog::for_test(None, true)),
                 generate_validator: None,
                 abort_hook: None,
             },

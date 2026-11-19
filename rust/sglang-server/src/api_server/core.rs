@@ -12,7 +12,6 @@ mod frame;
 mod metrics;
 mod peer;
 pub(crate) mod prefetch;
-mod request_log;
 mod validator;
 
 pub use abort_hook::AbortHook;
@@ -24,10 +23,6 @@ pub(crate) use frame::{CoreEvent, CoreOutput, HealthStatus};
 pub use metrics::{ExtensionCounter, ExtensionHistogram};
 pub(crate) use metrics::{FLUSH_INTERVAL, FrontendMetrics, RequestMetrics};
 pub(crate) use peer::{FORWARD_PEER_PATH, peer_endpoints};
-pub(crate) use request_log::{
-    BodySnapshot, LoggedHeaders, OpenAiRequest, RawBody, ReceivedAs, RequestLog, RequestRecord,
-    flush_request_log,
-};
 pub use validator::GenerateValidator;
 #[cfg(test)]
 pub(crate) use validator::TopLogprobsCap;

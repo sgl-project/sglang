@@ -304,7 +304,7 @@ impl Runtime {
                 "shutdown: workers did not exit within {SHUTDOWN_JOIN_TIMEOUT:?}; abandoning join"
             );
         }
-        crate::api_server::core::flush_request_log();
+        crate::api_server::log::flush_request_log();
     }
 }
 
@@ -527,7 +527,7 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
             metadata: crate::api_server::handlers::CoreMetadata::from(cfg.server_args.as_ref())
                 .with_server_info_state_keys(cfg.server_info_state_keys.clone()),
             metrics,
-            request_log: crate::api_server::core::RequestLog::from_server_args(&cfg.server_args)?,
+            request_log: crate::api_server::log::RequestLog::from_server_args(&cfg.server_args)?,
             generate_validator: cfg.generate_validator.clone(),
             abort_hook: cfg.abort_hook.clone(),
         },

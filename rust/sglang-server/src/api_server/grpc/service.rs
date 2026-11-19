@@ -13,7 +13,7 @@ use tonic::{Request, Response, Status};
 
 use super::{info, native_api};
 use crate::api_server::anthropic::Anthropic;
-use crate::api_server::core::{HealthStatus, ReceivedAs};
+use crate::api_server::core::HealthStatus;
 use crate::api_server::handlers::{
     AbortEnding, CoreHandle, CorpusSource, DumperOutcome, ElasticEpState, HiCacheError,
     HiCacheManager, LORA_DISABLED, ToolSpec, WeightGroupOutcome, WeightUpdateOutcome,
@@ -21,6 +21,7 @@ use crate::api_server::handlers::{
 };
 use crate::api_server::http::openai::{ChatFormatter, load_chat_support};
 use crate::api_server::http::weights::{decode_payloads, json_object};
+use crate::api_server::log::ReceivedAs;
 use crate::api_server::ollama::Ollama;
 use crate::message::config::{
     DEFAULT_GRPC_RESPONSE_TIMEOUT_SECS, PreferredSamplingParams, ServerArgs,

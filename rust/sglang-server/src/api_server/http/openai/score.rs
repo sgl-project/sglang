@@ -21,9 +21,10 @@ use axum::{
 use sglang_api_types::api::v1 as api;
 
 use super::{collect_output, openai_error};
-use crate::api_server::core::{CoreError, ReceivedAs};
+use crate::api_server::core::CoreError;
 use crate::api_server::handlers::CoreHandle;
 use crate::api_server::http::app::AppState;
+use crate::api_server::log::ReceivedAs;
 use crate::message::config::ServerArgs;
 use crate::message::ids::Rid;
 use crate::message::request::GenerateRequest;
