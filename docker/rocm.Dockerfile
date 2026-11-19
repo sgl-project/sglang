@@ -99,10 +99,6 @@ ARG ROCM_INDEX_URL="https://stable.repo.amd.com/rocm/whl-next/"
 # entry here, not another pairwise OTHER_ROCM_DEVICE_ARCH mapping.
 ARG ROCM_DEVICE_ARCH_LIST="gfx942 gfx950 gfx1250"
 
-# ROCm comes from the pip SDK: the MoRI step puts its rocm_sysdeps on the
-# search paths.
-ENV FLAVOR_ROCM_FROM_PIP="1"
-
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         ca-certificates \
@@ -239,7 +235,8 @@ RUN ln -s ${ROCM_HOME} /opt/rocm
 #   FLAVOR_TORCH_TRITON_PIN_PATCH=1 Point torch's Triton requirement at the Triton
 #                                   installed in 3.10.
 #   FLAVOR_AMDGPU_IDS_REPO          apt repo to take amdgpu.ids from (3.2).
-#   FLAVOR_ROCM_FROM_PIP=1          Set in rocm1000-base.
+#   FLAVOR_ROCM_FROM_PIP=1          ROCm comes from the pip SDK (the ROCm 10 flavors):
+#                                   the MoRI step puts its rocm_sysdeps on the search paths.
 #   PIP_CONSTRAINT                  Pins the torch stack for every later pip call,
 #                                   including in the shipped image: a `pip install`
 #                                   that resolves torch would otherwise replace this
@@ -295,6 +292,7 @@ ENV HSA_ENABLE_IPC_MODE_LEGACY=1
 FROM $BASE_IMAGE_942_ROCM1000 AS gfx942-rocm1000
 ENV AITER_COMMIT_DEFAULT="581579ab51ca26ddd4a08a6aa6aa983a78aaf276"
 ENV FLAVOR_TRITON="sdk"
+ENV FLAVOR_ROCM_FROM_PIP="1"
 ENV FLAVOR_SGLANG_EXTRAS_SUFFIX="_rocm724"
 ENV FLAVOR_TORCH_STACK="torch=2.11. torchvision=0.26. torchaudio=2.11."
 ENV PIP_CONSTRAINT="/etc/sglang/constraints/torch-rocm.txt"
@@ -306,6 +304,7 @@ ENV PIP_CONSTRAINT="/etc/sglang/constraints/torch-rocm.txt"
 FROM $BASE_IMAGE_950_ROCM1000 AS gfx950-rocm1000
 ENV AITER_COMMIT_DEFAULT="581579ab51ca26ddd4a08a6aa6aa983a78aaf276"
 ENV FLAVOR_TRITON="sdk"
+ENV FLAVOR_ROCM_FROM_PIP="1"
 ENV TRITON_REPO_DEFAULT="https://github.com/ROCm/triton.git"
 ENV TRITON_COMMIT_DEFAULT="4cff872ced001ea92d9fcf05b3f6517e2b486d19"
 ENV TRITON_WHEEL_VERSION_SUFFIX=".rocm10.0.0"
@@ -324,6 +323,7 @@ ENV AITER_COMMIT_DEFAULT="07ff5f318b8a34334125a2287acbfcc56bd2898a"
 # upstream revision the MI45x bring-up ran on (carried over from the ROCm 7.14
 # flavor this image replaced); it has a fix the SDK build does not have yet.
 ENV FLAVOR_TRITON="source"
+ENV FLAVOR_ROCM_FROM_PIP="1"
 ENV TRITON_COMMIT_DEFAULT="76940ad348795521b3dc9f6c79acd7309ff924e3"
 ENV FLAVOR_SGLANG_EXTRAS_SUFFIX="_rocm724"
 ENV FLAVOR_TORCH_STACK="torch=2.11. torchvision=0.26. torchaudio=2.11."
@@ -338,6 +338,7 @@ ENV AITER_COMMIT_DEFAULT="07ff5f318b8a34334125a2287acbfcc56bd2898a"
 # The revert is pure Python: #9668 had already moved block pointers out of
 # C++/MLIR.
 ENV FLAVOR_TRITON="source"
+ENV FLAVOR_ROCM_FROM_PIP="1"
 ENV TRITON_COMMIT_DEFAULT="76940ad348795521b3dc9f6c79acd7309ff924e3"
 ENV TRITON_REVERT_COMMITS_DEFAULT="9debefe44117a44c274b05033cfe9e4858883b86"
 ENV FLAVOR_SGLANG_EXTRAS_SUFFIX="_rocm101"
@@ -383,6 +384,16 @@ RUN echo GPU_ARCH="${GPU_ARCH}" \
 ENV GPU_ARCH=${GPU_ARCH}
 ENV GPU_ARCH_LIST=${GPU_ARCH%-*}
 ENV PYTORCH_ROCM_ARCH="gfx942;gfx950;gfx1250"
+
+# Every flavor stage must say which Triton it ships and which SGLang extras it
+# installs (an empty suffix is valid); fail here rather than fall back silently.
+RUN case "${FLAVOR_TRITON:-}" in \
+      wheel|sdk|source) ;; \
+      *) echo "GPU_ARCH=${GPU_ARCH}: FLAVOR_TRITON='${FLAVOR_TRITON:-}' must be wheel, sdk or source"; exit 1 ;; \
+    esac \
+    && if [ -z "${FLAVOR_SGLANG_EXTRAS_SUFFIX+set}" ]; then \
+         echo "GPU_ARCH=${GPU_ARCH}: FLAVOR_SGLANG_EXTRAS_SUFFIX is not set"; exit 1; \
+       fi
 
 # PIP_CONSTRAINT (see the flavor stages) must name an existing file from the
 # first pip call on; it stays empty until the torch stack is final (3.3).
