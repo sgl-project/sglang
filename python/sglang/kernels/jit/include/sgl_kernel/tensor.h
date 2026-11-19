@@ -25,7 +25,6 @@
 #include <cstdint>
 #include <initializer_list>
 #include <optional>
-#include <ranges>
 #include <span>
 #include <sstream>
 #include <string>
@@ -133,7 +132,13 @@ inline constexpr auto kDeviceStringMap = [] {
       std::pair{DLDeviceType::kDLMAIA, "maia"},
       std::pair{DLDeviceType::kDLTrn, "trn"},
   };
-  constexpr auto max_type = stdr::max(map | stdv::keys);
+  constexpr auto max_type = [map] {
+    DLDeviceType result = DLDeviceType::kDLCPU;
+    for (const auto& [code, _] : map) {
+      if (code > result) result = code;
+    }
+    return result;
+  }();
   auto result = std::array<std::string_view, max_type + 1>{};
   for (const auto& [code, name] : map) {
     result[static_cast<std::size_t>(code)] = name;
@@ -316,7 +321,7 @@ struct SymbolicDType {
 
  private:
   auto m_check(DLDataType value) const -> bool {
-    return stdr::empty(m_options) || (stdr::find(m_options, value) != stdr::end(m_options));
+    return m_options.empty() || (std::find(m_options.begin(), m_options.end(), value) != m_options.end());
   }
 
   // options set after binding (e.g. a runtime value) must still hold
@@ -395,7 +400,7 @@ struct SymbolicDevice {
 
  private:
   auto m_check(DLDevice value) const -> bool {
-    return stdr::empty(m_options) || (stdr::any_of(m_options, [value](const DLDevice& opt) {
+    return m_options.empty() || (std::any_of(m_options.begin(), m_options.end(), [value](const DLDevice& opt) {
              // device type must exactly match
              if (opt.device_type != value.device_type) return false;
              // device id can be wildcarded

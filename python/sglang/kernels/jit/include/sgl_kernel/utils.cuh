@@ -26,7 +26,52 @@
 #include <cstdint>
 #include <optional>
 #include <type_traits>
-#ifndef USE_ROCM
+#if defined(__MUSACC__)
+#include <musa.h>
+#include <musa_bf16.h>
+#include <musa_fp16.h>
+#include <musa_fp8.h>
+#include <musa_runtime.h>
+#ifndef __grid_constant__
+#define __grid_constant__
+#endif
+using cudaError_t = musaError_t;
+using cudaStream_t = musaStream_t;
+using cudaLaunchConfig_t = musaLaunchConfig_t;
+using cudaLaunchAttribute = musaLaunchAttribute;
+using CUresult = MUresult;
+inline constexpr auto cudaSuccess = musaSuccess;
+inline constexpr auto CUDA_SUCCESS = MUSA_SUCCESS;
+#define CUDA_VERSION 0
+#define cudaStreamPerThread musaStreamPerThread
+#define cudaGetErrorString musaGetErrorString
+#define cudaGetLastError musaGetLastError
+#define cudaLaunchKernel musaLaunchKernel
+#define cudaLaunchKernelEx musaLaunchKernelEx
+#define cudaMemcpyAsync musaMemcpyAsync
+#define cudaMemcpyHostToDevice musaMemcpyHostToDevice
+#define cudaMemcpyDeviceToHost musaMemcpyDeviceToHost
+#define cudaHostGetDevicePointer musaHostGetDevicePointer
+#define cudaDeviceGetAttribute musaDeviceGetAttribute
+#define cudaDevAttrComputeCapabilityMajor musaDevAttrComputeCapabilityMajor
+#define cudaDevAttrComputeCapabilityMinor musaDevAttrComputeCapabilityMinor
+#define cudaDevAttrMultiProcessorCount musaDevAttrMultiProcessorCount
+#define cudaDevAttrMaxSharedMemoryPerBlockOptin musaDevAttrMaxSharedMemoryPerBlockOptin
+#define cudaDevAttrMaxSharedMemoryPerBlock musaDevAttrMaxSharedMemoryPerBlock
+#define cudaRuntimeGetVersion musaRuntimeGetVersion
+#define cudaFuncSetAttribute musaFuncSetAttribute
+#define cudaFuncAttributeMaxDynamicSharedMemorySize musaFuncAttributeMaxDynamicSharedMemorySize
+#define cudaFuncAttributePreferredSharedMemoryCarveout musaFuncAttributePreferredSharedMemoryCarveout
+#define cudaLaunchAttributeProgrammaticStreamSerialization musaLaunchAttributeProgrammaticStreamSerialization
+#define cudaLaunchAttributeClusterDimension musaLaunchAttributeClusterDimension
+#define cudaLaunchAttributeCooperative musaLaunchAttributeCooperative
+#define cudaSharedmemCarveoutMaxL1 musaSharedmemCarveoutMaxL1
+#define cudaSharedmemCarveoutMaxShared musaSharedmemCarveoutMaxShared
+#define cudaSharedmemCarveoutDefault musaSharedmemCarveoutDefault
+#define cuGetErrorString muGetErrorString
+#define cuDeviceGetAttribute muDeviceGetAttribute
+#define cuFuncSetAttribute muFuncSetAttribute
+#elif !defined(USE_ROCM)
 #include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -60,7 +105,23 @@ inline constexpr auto cudaSuccess = hipSuccess;
 
 namespace sglang {
 
-#ifndef USE_ROCM
+#if defined(__MUSACC__)
+using fp32_t = float;
+using fp16_t = __half;
+using bf16_t = __mt_bfloat16;
+using fp8_e4m3_t = __mt_fp8_e4m3;
+using fp8_e5m2_t = __mt_fp8_e5m2;
+
+using fp32x2_t = float2;
+using fp16x2_t = __half2;
+using bf16x2_t = __mt_bfloat162;
+using fp8x2_e4m3_t = __mt_fp8x2_e4m3;
+using fp8x2_e5m2_t = __mt_fp8x2_e5m2;
+using fp8x4_e4m3_t = __mt_fp8x4_e4m3;
+using fp8x4_e5m2_t = __mt_fp8x4_e5m2;
+
+using fp32x4_t = float4;
+#elif !defined(USE_ROCM)
 using fp32_t = float;
 using fp16_t = __half;
 using bf16_t = __nv_bfloat16;
@@ -95,14 +156,19 @@ using fp32x4_t = float4;
 /*
  * LDG Support
  */
-#ifndef USE_ROCM
+#if defined(__MUSACC__)
+#define SGLANG_LDG(arg) __ldg(arg)
+#elif !defined(USE_ROCM)
 #define SGLANG_LDG(arg) __ldg(arg)
 #else
 #define SGLANG_LDG(arg) *(arg)
 #endif
 
 // DLPack device type for the current platform
-#ifndef USE_ROCM
+#if defined(__MUSACC__)
+inline constexpr auto kDLGPU = kDLExtDev;
+inline constexpr auto kDLGPUHost = kDLCPU;
+#elif !defined(USE_ROCM)
 inline constexpr auto kDLGPU = kDLCUDA;
 inline constexpr auto kDLGPUHost = kDLCUDAHost;
 #else

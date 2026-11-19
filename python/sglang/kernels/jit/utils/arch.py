@@ -176,6 +176,15 @@ def resolve_compile_arch(
 
 def get_default_target_flags(arch: CompileArch | None = None) -> List[str]:
     """Default compile flags for `arch`, defaulting to the detected local GPU."""
+    if is_musa_runtime():
+        if arch is None:
+            arch = get_compile_arch()
+        return [
+            f"--offload-arch=mp_{arch.major}{arch.minor}",
+            f"-DSGL_CUDA_ARCH={arch.major}{arch.minor}0",
+            "-std=c++20",
+            "-O3",
+        ]
     if is_hip_runtime():
         flags = ["-DUSE_ROCM", "-std=c++20", "-O3"]
         # Detect FP8 type based on GPU architecture
