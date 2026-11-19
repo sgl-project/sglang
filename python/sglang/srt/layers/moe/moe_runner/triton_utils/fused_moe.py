@@ -726,6 +726,10 @@ def _fused_moe_kernel_sequence(
         fuse_swiglu=fuse_swiglu_interleaved,
     )
 
+    # The intermediate cache owns this buffer; do not keep an extra reference
+    # alive through the down GEMM and its output allocation.
+    del gemm1_out
+
     if hooks and hooks.after_gate_up:
         # Hooks expect intermediate_cache1 shaped (num_tokens, topk, N); the
         # underlying buffer is laid out as (total_tokens, N) where
