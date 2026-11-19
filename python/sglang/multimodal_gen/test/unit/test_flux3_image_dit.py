@@ -144,6 +144,78 @@ def test_native_module_tree_matches_the_image_checkpoint():
     )
 
 
+def _diffusers_lora_module_names() -> list[str]:
+    """``Flux3Transformer2DModel`` LoRA targets of the tiny DiT, as diffusers'
+    and SimpleTuner's FLUX.3 trainers save them."""
+    blocks = [
+        "mode_blocks.image.0",
+        "mode_blocks.image_cond.0",
+        "txt_mode_blocks.0",
+        "single_transformer_blocks.0",
+        "single_transformer_blocks.1",
+    ]
+    names = [
+        f"{block}.{layer}"
+        for block in blocks
+        for layer in (
+            "attn.to_q",
+            "attn.to_k",
+            "attn.to_v",
+            "attn.to_out.0",
+            "ff.linear_in",
+            "ff.linear_out",
+        )
+    ]
+    for stream in ("image", "image_cond", "txt"):
+        names += [
+            f"early_stream_modulations.{stream}.linear",
+            f"single_stream_modulations.{stream}.linear",
+        ]
+    return names + [
+        "x_embedders.image",
+        "x_embedders.image_cond",
+        "context_embedder",
+        "timestep_embedder.linear_1",
+        "timestep_embedder.linear_2",
+        "target_timestep_embedder.linear_1",
+        "target_timestep_embedder.linear_2",
+        "proj_out",
+        "norm_out.linear",
+    ]
+
+
+def test_diffusers_lora_names_reach_every_native_linear():
+    """Diffusers-format FLUX.3 LoRAs must land on the native modules (q/k/v on
+    their packed ``to_qkv`` shard) and together cover every native linear,
+    instead of matching no layer."""
+    model = _tiny_native_dit("cpu", flow_map=True)
+    lora_map = get_param_names_mapping(
+        flux3_image_dit_config().arch_config.lora_param_names_mapping
+    )
+    param_map = get_param_names_mapping(model.param_names_mapping)
+    modules = dict(model.named_modules())
+    linears = {
+        name
+        for name, module in modules.items()
+        if isinstance(module, (linear.LinearBase, torch.nn.Linear))
+    }
+
+    reached = set()
+    for name in _diffusers_lora_module_names():
+        for part in ("lora_A", "lora_B"):
+            target, index, total = param_map(lora_map(f"transformer.{name}.{part}")[0])
+            assert target.endswith(f".{part}"), (name, target)
+            module = target.removesuffix(f".{part}")
+            assert module in linears, (name, target)
+            if ".attn.to_" in name and "to_out" not in name:
+                assert module.endswith(".to_qkv") and total == 3, (name, target)
+                assert index == "qkv".index(name[-1]), (name, index)
+            else:
+                assert index is None, (name, index)
+            reached.add(module)
+    assert reached == linears
+
+
 def test_attention_backend_failure_is_not_hidden():
     with mock.patch.object(
         flux3_image, "USPAttention", side_effect=ValueError("unsupported backend")

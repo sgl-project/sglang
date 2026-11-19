@@ -95,6 +95,21 @@ def _swap_peft_swiglu_fc1_lora_b(
     return torch.cat([gate, value], dim=0)
 
 
+def _swap_diffusers_flux3_norm_out_lora_b(
+    source_name: str, target_name: str, weight: torch.Tensor
+) -> torch.Tensor:
+    # diffusers' FLUX.3 norm_out emits [scale; shift], the native final-layer
+    # adaLN [shift; scale] (convert_flux3_transformer_checkpoint_to_diffusers).
+    if (
+        weight.dim() != 2
+        or not source_name.endswith("norm_out.linear.lora_B")
+        or not target_name.endswith("final_layer.image.adaLN_modulation.1.lora_B")
+    ):
+        return weight
+    scale, shift = weight.chunk(2, dim=0)
+    return torch.cat([shift, scale], dim=0)
+
+
 def stack_or_compose_fused_lora(
     a_list: list[torch.Tensor],
     b_list: list[torch.Tensor],
@@ -1048,6 +1063,7 @@ class LoRAPipeline(ComposedPipelineBase):
         for name, weight in lora_state_dict.items():
             name = name.replace("diffusion_model.", "")
             name = name.removesuffix(".weight")
+            source_name = name
             # misc-format -> HF-format
             name, _, _ = lora_param_names_mapping_fn(name)
             # HF-format (LoRA) -> SGLang-dit-format
@@ -1071,6 +1087,9 @@ class LoRAPipeline(ComposedPipelineBase):
                     continue
 
             weight = _swap_peft_swiglu_fc1_lora_b(name, target_name, weight)
+            weight = _swap_diffusers_flux3_norm_out_lora_b(
+                source_name, target_name, weight
+            )
             if target_name in new_adapter:
                 raise ValueError(
                     f"Dit target weight name {target_name} already exists in lora_adapters[{lora_nickname}]"
