@@ -35,6 +35,7 @@ from typing import (
 import filelock
 import huggingface_hub.constants
 import numpy as np
+import psutil
 import safetensors.torch
 import torch
 from huggingface_hub import (
@@ -148,6 +149,9 @@ def probe_routed_expert_weight_dtype(model_path: str) -> Optional[str]:
             return meta.get("dtype")
     return None
 
+
+# (name, nbytes) -> (index, count) of this rank among the node's readers, or None.
+CheckpointTensorReaders = Callable[[str, int], Optional[Tuple[int, int]]]
 
 # Block size for sequential checkpoint prefetch reads (page cache warming).
 _PREFETCH_BLOCK_SIZE = None
@@ -1106,16 +1110,56 @@ def np_cache_weights_iterator(
 def _prefetch_checkpoint_file(
     file_path: str,
     cancel_event: Optional[threading.Event] = None,
+    select: Optional[Callable[[str, int], bool]] = None,
 ) -> None:
     """Prefetch a checkpoint file into the OS page cache.
 
-    Reads the file sequentially in 16 MB blocks so the kernel caches its pages
-    before workers load the same file via mmap.
+    Reads the file, or only the tensors ``select(name, nbytes)`` picks,
+    sequentially in 16 MB blocks so the kernel caches its pages before workers
+    load the same file via mmap.
     """
     with open(file_path, "rb") as f:
-        while cancel_event is None or not cancel_event.is_set():
-            if not f.read(_get_prefetch_block_size()):
-                break
+        ranges = [(0, os.fstat(f.fileno()).st_size)]
+        if select is not None:
+            offsets = _safetensors_offsets(file_path)
+            ranges = sorted(r for k, r in offsets.items() if select(k, r[1] - r[0]))
+        for start, end in ranges:
+            f.seek(start)
+            while start < end and (cancel_event is None or not cancel_event.is_set()):
+                n = len(f.read(min(_get_prefetch_block_size(), end - start)))
+                if not n:
+                    break
+                start += n
+
+
+def _safetensors_offsets(path: str) -> Dict[str, Tuple[int, int]]:
+    """Return each tensor's byte range in a safetensors file."""
+    with open(path, "rb") as f:
+        (size,) = struct.unpack("<Q", f.read(8))
+        header = json.loads(f.read(size))
+    header.pop("__metadata__", None)
+    return {
+        k: tuple(8 + size + o for o in v["data_offsets"]) for k, v in header.items()
+    }
+
+
+def _names_read(f, path: str, readers: Optional[CheckpointTensorReaders]) -> List[str]:
+    """Names of the tensors in ``f`` this rank reads; it skips the others unread."""
+    if readers is None:
+        return f.keys()
+    sizes = {k: end - begin for k, (begin, end) in _safetensors_offsets(path).items()}
+    return [k for k in f.keys() if readers(k, sizes[k]) is not None]
+
+
+def _node_local_peers(ranks: Iterable[int]) -> Tuple[int, int]:
+    """Return this rank's index among, and the count of, ``ranks`` on its node."""
+    world_group = get_parallel().world_group
+    per_node = world_group.local_size or (
+        get_parallel().launch_world_size // get_parallel().nnodes
+    )
+    node = world_group.rank // per_node
+    peers = [rank for rank in ranks if rank // per_node == node]
+    return peers.index(world_group.rank), len(peers)
 
 
 class CheckpointFilePrefetchHandle:
@@ -1168,6 +1212,7 @@ class CheckpointFilePrefetchHandle:
 def _prefetch_all_checkpoints(
     sorted_files: List[str],
     num_threads: int = 4,
+    readers: Optional[CheckpointTensorReaders] = None,
 ) -> CheckpointFilePrefetchHandle:
     """Start prefetching checkpoint files into page cache in a background thread.
 
@@ -1203,7 +1248,17 @@ def _prefetch_all_checkpoints(
         local_rank = 0
         local_world_size = 1
 
-    my_files = sorted_files[local_rank::local_world_size]
+    # Whole shards are read faster; prefetch only what the node reads when they
+    # do not fit in RAM.
+    if readers is None or sum(map(os.path.getsize, sorted_files)) <= (
+        0.9 * psutil.virtual_memory().available
+    ):
+        my_files = [(path, None) for path in sorted_files[local_rank::local_world_size]]
+    else:  # Prefetch only what the node reads, split by file among its readers.
+        my_files = [
+            (path, lambda name, n, i=i: (r := readers(name, n)) and i % r[1] == r[0])
+            for i, path in enumerate(sorted_files)
+        ]
     total_for_rank = len(my_files)
     cancel_event = threading.Event()
     succeeded_event = threading.Event()
@@ -1243,12 +1298,14 @@ def _prefetch_all_checkpoints(
             file_iter = iter(my_files)
             pending: Dict[concurrent.futures.Future, str] = {}
 
-            for path in itertools.islice(file_iter, num_threads):
+            def submit(path, select):
+                args = (path, cancel_event) + ((select,) if select else ())
+                pending[executor.submit(_prefetch_checkpoint_file, *args)] = path
+
+            for path, select in itertools.islice(file_iter, num_threads):
                 if cancel_event.is_set():
                     break
-                pending[
-                    executor.submit(_prefetch_checkpoint_file, path, cancel_event)
-                ] = path
+                submit(path, select)
 
             while pending:
                 done, _ = concurrent.futures.wait(
@@ -1267,15 +1324,9 @@ def _prefetch_all_checkpoints(
                         )
                     record_complete()
 
-                    next_path = None if cancel_event.is_set() else next(file_iter, None)
-                    if next_path is not None:
-                        pending[
-                            executor.submit(
-                                _prefetch_checkpoint_file,
-                                next_path,
-                                cancel_event,
-                            )
-                        ] = next_path
+                    next_file = None if cancel_event.is_set() else next(file_iter, None)
+                    if next_file is not None:
+                        submit(*next_file)
 
     def _run_prefetch() -> None:
         start = time.perf_counter()
@@ -1322,6 +1373,7 @@ def safetensors_weights_iterator(
     prefetch: bool = False,
     prefetch_num_threads: int = 4,
     drop_cache_after_load: bool = False,
+    readers: Optional[CheckpointTensorReaders] = None,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files."""
     enable_tqdm = (
@@ -1331,7 +1383,9 @@ def safetensors_weights_iterator(
     prefetch_handle = None
     if prefetch and not disable_mmap:
         prefetch_handle = _prefetch_all_checkpoints(
-            sorted(hf_weights_files), num_threads=prefetch_num_threads
+            sorted(hf_weights_files),
+            num_threads=prefetch_num_threads,
+            readers=readers,
         )
 
     for st_file in tqdm(
@@ -1348,7 +1402,7 @@ def safetensors_weights_iterator(
                     yield name, result[name]
         else:
             with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
-                for name in f.keys():
+                for name in _names_read(f, st_file, readers):
                     yield name, f.get_tensor(name)
         if drop_cache_after_load:
             _drop_file_cache_after_load(st_file)
@@ -1552,6 +1606,7 @@ def buffered_multi_thread_safetensors_weights_iterator(
     prefetch: bool = False,
     prefetch_num_threads: int = 4,
     drop_cache_after_load: bool = False,
+    readers: Optional[CheckpointTensorReaders] = None,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Multi-threaded safetensor loader with bounded memory via a sliding window.
 
@@ -1562,7 +1617,9 @@ def buffered_multi_thread_safetensors_weights_iterator(
     prefetch_handle = None
     if prefetch and not disable_mmap:
         prefetch_handle = _prefetch_all_checkpoints(
-            sorted(hf_weights_files), num_threads=prefetch_num_threads
+            sorted(hf_weights_files),
+            num_threads=prefetch_num_threads,
+            readers=readers,
         )
     enable_tqdm = (
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
@@ -1574,7 +1631,7 @@ def buffered_multi_thread_safetensors_weights_iterator(
                 result = safetensors.torch.load(f.read())
         else:
             with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
-                result = {k: f.get_tensor(k) for k in f.keys()}
+                result = {k: f.get_tensor(k) for k in _names_read(f, st_file, readers)}
         return result
 
     # Sliding window: max_workers loading + 1 prefetched.

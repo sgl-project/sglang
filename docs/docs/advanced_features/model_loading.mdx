@@ -224,7 +224,7 @@ Top-level arguments that tune how safetensors weights are read, independent of `
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--weight-loader-prefetch-checkpoints</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Prefetch checkpoint files into the OS page cache before loading. Each rank prefetches a fraction of the shards, cutting total network I/O on shared filesystems (NFS/Lustre) from N×checkpoint to 1×checkpoint. Recommended for models on network storage. When enabled, multi-threaded safetensors loading is disabled by default to avoid I/O oversubscription with the prefetch threads; set <code>enable_multithread_load=true</code> in <code>--model-loader-extra-config</code> to keep multi-threaded loading (e.g. on local NVMe where prefetch is a no-op).</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Prefetch checkpoint files into the OS page cache before loading. Each rank prefetches a fraction of the shards, cutting total network I/O on shared filesystems (NFS/Lustre) from N×checkpoint to 1×checkpoint. Under expert parallelism, a checkpoint that does not fit in RAM is prefetched only where the node's ranks read it. Recommended for models on network storage. When enabled, multi-threaded safetensors loading is disabled by default to avoid I/O oversubscription with the prefetch threads; set <code>enable_multithread_load=true</code> in <code>--model-loader-extra-config</code> to keep multi-threaded loading (e.g. on local NVMe where prefetch is a no-op).</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>off</td>
     </tr>
     <tr>

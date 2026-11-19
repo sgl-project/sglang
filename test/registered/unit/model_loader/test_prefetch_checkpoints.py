@@ -17,7 +17,10 @@ import safetensors.torch
 import torch
 
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
-from sglang.srt.model_loader.loader import DefaultModelLoader
+from sglang.srt.model_loader.loader import (
+    DefaultModelLoader,
+    _checkpoint_tensor_readers,
+)
 from sglang.srt.model_loader.weight_utils import (
     CheckpointFilePrefetchHandle,
     _prefetch_all_checkpoints,
@@ -234,6 +237,57 @@ class TestPrefetchCheckpoints(CustomTestCase):
             _prefetch_all_checkpoints(paths, num_threads=2)
 
         self.assertEqual(sorted(loaded_paths), paths[1::4])
+
+    @patch("torch.distributed.is_initialized", return_value=True)
+    def test_rank_reads_only_its_experts(self, _):
+        class FakeMoE(torch.nn.Module):
+            layer_id = 1
+            moe_ep_size = 2
+
+            def _weight_loader_expert_ids(self, param, expert_id):
+                if expert_id < 2:  # Experts 0 and 1 are local.
+                    yield expert_id
+
+        model = torch.nn.Module()
+        model.layers = torch.nn.ModuleList([torch.nn.Module(), torch.nn.Module()])
+        model.layers[1].mlp = FakeMoE()
+        group = SimpleNamespace(rank=0, ranks=[0], local_size=1)
+        expert = "layers.1.mlp.experts.{}.{}"
+        tensors = {
+            "layers.1.attn.weight": torch.zeros(4096),
+            expert.format(1, "weight"): torch.zeros(4096),
+            expert.format(3, "weight"): torch.zeros(4096),
+            expert.format(3, "input_scale"): torch.zeros(1),  # scalar: every rank
+            expert.format(3, "weight_scale_inv"): torch.zeros(1024),  # block scales
+        }
+        selects = []
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            patch("sglang.srt.layers.moe.fused_moe_triton.layer.FusedMoE", FakeMoE),
+            patch("threading.Thread", _InlineThread),
+            patch("concurrent.futures.ThreadPoolExecutor", _InlineExecutor),
+            patch("concurrent.futures.wait", side_effect=_wait_all),
+            patch("psutil.virtual_memory", return_value=SimpleNamespace(available=0)),
+            patch("torch.distributed.get_rank", return_value=0),
+            get_parallel().override(world_group=group, moe_tp_group=group),
+        ):
+            path = os.path.join(tmpdir, "model.safetensors")
+            safetensors.torch.save_file(tensors, path)
+            readers = _checkpoint_tensor_readers(model)
+            with patch(
+                "sglang.srt.model_loader.weight_utils._prefetch_checkpoint_file",
+                side_effect=lambda path, cancel_event, select: selects.append(select),
+            ):
+                _prefetch_all_checkpoints([path], readers=readers)
+            loaded = dict(safetensors_weights_iterator([path], readers=readers))
+
+        read = set(tensors) - {
+            expert.format(3, n) for n in ("weight", "weight_scale_inv")
+        }
+        self.assertEqual(
+            {k for k, v in tensors.items() if selects[0](k, v.nbytes)}, read
+        )
+        self.assertEqual(set(loaded), read)
 
     @patch("torch.distributed.is_initialized", return_value=False)
     def test_prefetch_handle_cancels_before_scheduling_next_shard(self, _):
