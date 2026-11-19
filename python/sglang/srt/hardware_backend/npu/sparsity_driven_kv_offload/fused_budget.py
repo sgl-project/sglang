@@ -82,12 +82,12 @@ class BudgetPlan:
         self.prefill_workspace_tokens = prefill_workspace_tokens
         metadata_dtype = torch.int32
         self.manager_buffers = {
-            "device_kv_buffer": BufferSpec(
+            "device_k_buffer": BufferSpec(
                 (resident_rows, cache_tokens, 1, kv_lora_rank),
                 kv_dtype,
                 num_layers,
             ),
-            "device_rope_buffer": BufferSpec(
+            "device_v_buffer": BufferSpec(
                 (resident_rows, cache_tokens, 1, qk_rope_head_dim),
                 kv_dtype,
                 num_layers,
@@ -147,7 +147,7 @@ class BudgetPlan:
             self.adapter_buffers[name] = BufferSpec((batch_capacity,), torch.bool)
         self.device_kv_bytes = sum(
             self.manager_buffers[n].nbytes
-            for n in ("device_kv_buffer", "device_rope_buffer")
+            for n in ("device_k_buffer", "device_v_buffer")
         )
         self.slot_map_bytes = self.manager_buffers["device_slot_map"].nbytes
         # Reserve one maximal forward output without allocating it persistently.
@@ -158,7 +158,7 @@ class BudgetPlan:
         self.copy_sfa_bytes = sum(
             s.nbytes
             for n, s in self.manager_buffers.items()
-            if n not in ("device_kv_buffer", "device_rope_buffer", "device_slot_map")
+            if n not in ("device_k_buffer", "device_v_buffer", "device_slot_map")
             and not n.startswith("prefill_")
         )
         self.prefill_workspace_bytes = sum(

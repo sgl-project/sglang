@@ -99,7 +99,7 @@ class TestPDSplitKVPool(CustomTestCase):
         self.assertEqual(page_bytes, [131072] * 2 + [16384] * 2 + [512] * 2)
 
     def test_host_group_partitions_by_shared_memory(self):
-        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.memfabric_pool import (
+        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.host_pool import (
             _host_group,
         )
 
@@ -236,8 +236,8 @@ class TestPDSplitKVPool(CustomTestCase):
             self.assertTrue(torch.all(tensor[1] == 3))
 
     def test_shared_host_allocation_and_copy(self):
-        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.memfabric_pool import (
-            MemFabricKVPool,
+        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.host_pool import (
+            HostKVPool,
         )
 
         messages = []
@@ -303,7 +303,7 @@ class TestPDSplitKVPool(CustomTestCase):
         )
         with (
             patch(
-                "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.memfabric_pool._host_group",
+                "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.host_pool._host_group",
                 side_effect=lambda group: group,
             ),
             patch.dict(
@@ -330,8 +330,8 @@ class TestPDSplitKVPool(CustomTestCase):
                     dtype=dtype,
                     device="cpu",
                 )
-                owner = MemFabricKVPool(group=Group(0), **kwargs)
-                peer = MemFabricKVPool(group=Group(1), **kwargs)
+                owner = HostKVPool(group=Group(0), **kwargs)
+                peer = HostKVPool(group=Group(1), **kwargs)
                 self.assertEqual(len(allocations), len(widths))
                 self.assertEqual(
                     [c[0].data_ptr() for c in owner.buffers],

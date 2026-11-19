@@ -484,7 +484,7 @@ def mf_case(args, results):
     """Validate fused descriptors through real MF D2H/H2D, eager and replay."""
     d = args.device
     assert d == "npu", "MF transport validation requires an NPU"
-    pool_module = load("candidate_memfabric_pool", SOURCE / "memfabric_pool.py")
+    pool_module = load("candidate_host_pool", SOURCE / "host_pool.py")
     group = SimpleNamespace(
         rank_in_group=0,
         world_size=1,
@@ -492,7 +492,7 @@ def mf_case(args, results):
         barrier=lambda: None,
         broadcast=lambda tensor, src: None,
     )
-    pool = pool_module.MemFabricKVPool(
+    pool = pool_module.HostKVPool(
         tokens=128,
         layers=1,
         page_size=128,

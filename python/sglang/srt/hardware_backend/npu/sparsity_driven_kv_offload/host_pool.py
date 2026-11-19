@@ -69,7 +69,7 @@ def _host_group(parent):
     return _NodeLocalGroup(local_ranks, parent.ranks[parent.rank_in_group], parent)
 
 
-class MemFabricKVPool:
+class HostKVPool:
     """Own the MF allocations; non-owner ranks only wrap broadcast GVAs.
 
     CKV and KPE are separate allocations. Every exported base is 2 MiB aligned

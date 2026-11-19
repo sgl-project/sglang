@@ -96,8 +96,8 @@ class TestLIMState(CustomTestCase):
         plan = resolve_sparse_kv_budget(**options)
         self.assertEqual((plan.request_rows, plan.resident_rows), (103, 3))
         self.assertEqual(plan.batch_capacity, 4)
-        self.assertEqual(plan.manager_buffers["device_kv_buffer"].shape[0], 3)
-        self.assertEqual(plan.manager_buffers["device_rope_buffer"].shape[0], 3)
+        self.assertEqual(plan.manager_buffers["device_k_buffer"].shape[0], 3)
+        self.assertEqual(plan.manager_buffers["device_v_buffer"].shape[0], 3)
         self.assertEqual(plan.manager_buffers["device_slot_map"].shape[0], 4)
         self.assertEqual(plan.manager_buffers["resident_begin"].shape, (2, 103))
         self.assertEqual(plan.manager_buffers["resident_end"].shape, (2, 103))
@@ -404,7 +404,7 @@ class TestLIMState(CustomTestCase):
                     )
                 ),
             ),
-            patch(prefix + "memfabric_pool.MemFabricKVPool", side_effect=host_pool),
+            patch(prefix + "host_pool.HostKVPool", side_effect=host_pool),
             patch.object(
                 fused_manager,
                 "get_parallel",

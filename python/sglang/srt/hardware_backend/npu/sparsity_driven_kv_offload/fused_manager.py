@@ -24,8 +24,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
-    from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.memfabric_pool import (
-        MemFabricKVPool,
+    from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.host_pool import (
+        HostKVPool,
     )
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.managers.schedule_batch import Req
@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 
 
 class FusedSparseKVCacheManager:
-    host_pool: MemFabricKVPool
+    host_pool: HostKVPool
 
     def __init__(
         self,
@@ -91,8 +91,7 @@ class FusedSparseKVCacheManager:
                     fill_value = 0
                 value = (
                     [spec.allocate(self.device, fill_value) for _ in range(spec.count)]
-                    if name
-                    in ("device_kv_buffer", "device_rope_buffer", "device_slot_map")
+                    if name in ("device_k_buffer", "device_v_buffer", "device_slot_map")
                     else spec.allocate(self.device, fill_value)
                 )
                 setattr(self, name, value)
@@ -104,11 +103,11 @@ class FusedSparseKVCacheManager:
 
         # Radix prefixes use native physical token IDs. Keep host payloads in that
         # same address space; request slots own only bounded HBM residency maps.
-        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.memfabric_pool import (
-            MemFabricKVPool,
+        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.host_pool import (
+            HostKVPool,
         )
 
-        self.host_pool = MemFabricKVPool(
+        self.host_pool = HostKVPool(
             tokens=self.host_token_capacity,
             layers=self.layer_num,
             page_size=self.page_size,
@@ -137,12 +136,12 @@ class FusedSparseKVCacheManager:
             self.size,
             self.layer_num,
             self.budget.device_kv_bytes,
-            self.budget.manager_buffers["device_kv_buffer"],
-            self.budget.manager_buffers["device_rope_buffer"],
+            self.budget.manager_buffers["device_k_buffer"],
+            self.budget.manager_buffers["device_v_buffer"],
         )
         for layer_idx in range(self.layer_num):
-            ckv = self.device_kv_buffer[layer_idx]
-            rope = self.device_rope_buffer[layer_idx]
+            ckv = self.device_k_buffer[layer_idx]
+            rope = self.device_v_buffer[layer_idx]
             host_ckv = self.host_k_buffer[layer_idx]
             host_rope = self.host_v_buffer[layer_idx]
             logger.debug(
@@ -302,10 +301,10 @@ class FusedSparseKVCacheManager:
             device=query_nope.device,
         )
         layer_idx = layer.layer_id - self.start_layer
-        cache = self.device_kv_buffer[layer_idx].view(
+        cache = self.device_k_buffer[layer_idx].view(
             -1, self.page_size, self.head_num, self.kv_lora_rank
         )
-        rope_cache = self.device_rope_buffer[layer_idx].view(
+        rope_cache = self.device_v_buffer[layer_idx].view(
             -1, self.page_size, self.head_num, self.qk_rope_head_dim
         )
         fused_scatter_copy_sparse_flash_attention(
