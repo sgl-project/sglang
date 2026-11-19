@@ -32,12 +32,21 @@ register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 def _make_scheduler(
-    *, interval: int, min_bs: int, require_mlp_sync: bool = False
+    *,
+    interval: int,
+    min_bs: int,
+    require_mlp_sync: bool = False,
+    scale_with_backlog: bool = False,
+    running: int = 0,
+    waiting: int = 0,
 ) -> Scheduler:
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.prefill_decode_interval = interval
     scheduler._prefill_decode_interval_remaining = 0
     scheduler.prefill_decode_interval_min_bs = min_bs
+    scheduler.prefill_decode_interval_scale_with_backlog = scale_with_backlog
+    scheduler.running_reqs = [object()] * running
+    scheduler.waiting_queue = [object()] * waiting
     scheduler.require_mlp_sync = require_mlp_sync
     return scheduler
 
@@ -84,6 +93,28 @@ class TestPrefillDecodeIntervalMinBs(unittest.TestCase):
         self.assertTrue(scheduler._should_defer_prefill(_make_running_batch(8)))
         self.assertFalse(scheduler._should_defer_prefill(_make_running_batch(5)))
         self.assertEqual(scheduler._prefill_decode_interval_remaining, 0)
+
+
+class TestPrefillDecodeIntervalBacklogScaling(unittest.TestCase):
+    def _armed(self, **kwargs):
+        scheduler = _make_scheduler(min_bs=0, scale_with_backlog=True, **kwargs)
+        _arm(scheduler)
+        return scheduler._prefill_decode_interval_remaining
+
+    def test_backlog_shortens_interval_by_running_share(self):
+        self.assertEqual(self._armed(interval=16, running=32, waiting=96), 4)
+        self.assertEqual(self._armed(interval=16, running=96, waiting=32), 12)
+
+    def test_no_backlog_keeps_full_interval(self):
+        self.assertEqual(self._armed(interval=16, running=32, waiting=0), 16)
+
+    def test_interval_never_drops_below_one_round(self):
+        self.assertEqual(self._armed(interval=16, running=0, waiting=200), 1)
+
+    def test_disabled_ignores_backlog(self):
+        scheduler = _make_scheduler(interval=16, min_bs=0, running=32, waiting=96)
+        _arm(scheduler)
+        self.assertEqual(scheduler._prefill_decode_interval_remaining, 16)
 
 
 class TestPrefillDecodeIntervalNothingDecodes(unittest.TestCase):
