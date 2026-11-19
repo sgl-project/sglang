@@ -117,6 +117,8 @@ sglang serve                         \
     --page-size                      \   # intel_xpu attention backend supports [32, 64, 128]
 ```
 
+To run the vision encoder and the language model of a multimodal model as separate servers, see [EPD disaggregation on Intel XPU](/docs/advanced_features/epd_disaggregation#intel-xpu).
+
 ## MXFP4 MoE Quantization
 
 Native MXFP4 MoE checkpoints (OCP microscaling FP4: packed `e2m1` weights plus
