@@ -17,7 +17,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cpu_ci(est_time=685, suite="stage-a-tp-test-cpu-intel")
+register_cpu_ci(est_time=685, suite="extra-tp-test-cpu-intel")
 
 
 class TestIntelAMXAttnBackend(CustomTestCase):
@@ -80,7 +80,12 @@ class TestDPAttention(CustomTestCase):
             "--attention-backend",
             "intel_amx",
             "--mem-fraction-static",
-            "0.3",
+            # DP2 weights consume slightly over 30% of the socket container's
+            # pre-load free memory. Leave room for KV without auto-sizing a
+            # large pool when both TP ranks share the same NUMA node.
+            "0.4",
+            "--max-total-tokens",
+            "32768",
             "--disable-overlap-schedule",
             "--tp",
             str(tp_size),

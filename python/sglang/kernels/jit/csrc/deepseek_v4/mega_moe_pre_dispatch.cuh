@@ -35,6 +35,8 @@ struct MegaMoEPreDispatchParams {
   float* __restrict__ buf_topk_weights;  // [padded_max, top_k]
   int32_t* __restrict__ shared_x_sf;     // column-major, BLOCK_M-paged scales
 
+  const int32_t* __restrict__ num_token_non_padded;  // optional device scalar, refreshed on replay
+
   uint64_t buf_x_sf_stride_bytes;
   uint64_t shared_x_sf_col_stride;
   uint32_t shared_block_m;
@@ -56,7 +58,8 @@ template <
     bool kMultiChunk,
     uint32_t kChunksPerThread,
     bool kWriteSharedSF,
-    bool kCopyTopk>
+    bool kCopyTopk,
+    bool kMaskPadding>
 __global__ __launch_bounds__(kMaxBlockThreads, 2) void  //
     mega_moe_pre_dispatch_kernel(const MegaMoEPreDispatchParams __grid_constant__ params) {
   using namespace device;
@@ -76,6 +79,10 @@ __global__ __launch_bounds__(kMaxBlockThreads, 2) void  //
     // ---- Quantize path: one CTA per valid token ----
 
     const uint32_t token_id = bid;
+    bool valid = true;
+    if constexpr (kMaskPadding) {
+      valid = static_cast<int64_t>(token_id) < params.num_token_non_padded[0];
+    }
     const auto token_in = params.x + static_cast<uint64_t>(token_id) * params.hidden;
     const auto token_out = params.buf_x + static_cast<uint64_t>(token_id) * params.hidden;
     uint32_t shared_row = 0;
@@ -84,6 +91,16 @@ __global__ __launch_bounds__(kMaxBlockThreads, 2) void  //
       shared_row = token_id / params.shared_block_m * ((params.shared_block_m + 127u) / 128u * 128u) + m / 128u * 128u +
                    m % 32u * 4u + m % 128u / 32u;
     }
+
+    const auto load_chunk = [&](InputVec& in_vec, uint32_t chunk) {
+      if (valid) {
+        in_vec.load(token_in, chunk);
+      } else {
+#pragma unroll
+        for (uint32_t i = 0; i < kVecElems / 2; ++i)
+          in_vec[i] = bf16x2_t{};
+      }
+    };
 
     const auto quantize_chunk = [&](uint32_t chunk, const InputVec& in_vec) {
       float local_max = 0.0f;
@@ -135,14 +152,14 @@ __global__ __launch_bounds__(kMaxBlockThreads, 2) void  //
       const uint32_t num_chunks = params.hidden / kVecElems;
       for (uint32_t chunk = tid; chunk < num_chunks; chunk += blockDim.x) {
         InputVec in_vec;
-        in_vec.load(token_in, chunk);
+        load_chunk(in_vec, chunk);
         quantize_chunk(chunk, in_vec);
       }
     } else {
       InputVec in_vecs[kChunksPerThread];
 #pragma unroll
       for (uint32_t c = 0; c < kChunksPerThread; ++c) {
-        in_vecs[c].load(token_in, tid + c * blockDim.x);
+        load_chunk(in_vecs[c], tid + c * blockDim.x);
       }
 #pragma unroll
       for (uint32_t c = 0; c < kChunksPerThread; ++c) {
@@ -153,8 +170,8 @@ __global__ __launch_bounds__(kMaxBlockThreads, 2) void  //
     // Copy this token's topk row (no alignment assumptions; top_k is small).
     if (kCopyTopk && tid < params.top_k) {
       const uint32_t off = token_id * params.top_k + tid;
-      params.buf_topk_idx[off] = params.topk_idx[off];
-      params.buf_topk_weights[off] = __fmul_rn(params.topk_weights[off], params.topk_weight_scale);
+      params.buf_topk_idx[off] = valid ? params.topk_idx[off] : -1;
+      params.buf_topk_weights[off] = valid ? __fmul_rn(params.topk_weights[off], params.topk_weight_scale) : 0.0f;
     }
   } else {
     // ---- Pad path: trailing blocks fill [num_tokens, padded_max) with (-1, 0) ----
@@ -176,17 +193,41 @@ __global__ __launch_bounds__(kMaxBlockThreads, 2) void  //
 // ---- Host wrapper
 // ------------------------------------------------------------------------------------------------------------------------
 
-template <int64_t kGroupSize, bool kUsePDL, bool kWriteSharedSF, bool kCopyTopk>
+template <int64_t kGroupSize, bool kUsePDL, bool kWriteSharedSF, bool kCopyTopk, bool kMaskPadding>
 struct MegaMoEPreDispatchKernel {
   static_assert(kGroupSize == 32 || kGroupSize == 64 || kGroupSize == 128, "unsupported group_size");
-  static constexpr auto kernel_one_chunk =
-      mega_moe_pre_dispatch_kernel<static_cast<uint32_t>(kGroupSize), kUsePDL, false, 1, kWriteSharedSF, kCopyTopk>;
-  static constexpr auto kernel_two_chunks =
-      mega_moe_pre_dispatch_kernel<static_cast<uint32_t>(kGroupSize), kUsePDL, false, 2, kWriteSharedSF, kCopyTopk>;
-  static constexpr auto kernel_four_chunks =
-      mega_moe_pre_dispatch_kernel<static_cast<uint32_t>(kGroupSize), kUsePDL, false, 4, kWriteSharedSF, kCopyTopk>;
-  static constexpr auto kernel_multi_chunk =
-      mega_moe_pre_dispatch_kernel<static_cast<uint32_t>(kGroupSize), kUsePDL, true, 1, kWriteSharedSF, kCopyTopk>;
+  static constexpr auto kernel_one_chunk = mega_moe_pre_dispatch_kernel<
+      static_cast<uint32_t>(kGroupSize),
+      kUsePDL,
+      false,
+      1,
+      kWriteSharedSF,
+      kCopyTopk,
+      kMaskPadding>;
+  static constexpr auto kernel_two_chunks = mega_moe_pre_dispatch_kernel<
+      static_cast<uint32_t>(kGroupSize),
+      kUsePDL,
+      false,
+      2,
+      kWriteSharedSF,
+      kCopyTopk,
+      kMaskPadding>;
+  static constexpr auto kernel_four_chunks = mega_moe_pre_dispatch_kernel<
+      static_cast<uint32_t>(kGroupSize),
+      kUsePDL,
+      false,
+      4,
+      kWriteSharedSF,
+      kCopyTopk,
+      kMaskPadding>;
+  static constexpr auto kernel_multi_chunk = mega_moe_pre_dispatch_kernel<
+      static_cast<uint32_t>(kGroupSize),
+      kUsePDL,
+      true,
+      1,
+      kWriteSharedSF,
+      kCopyTopk,
+      kMaskPadding>;
 
   static int max_threads_per_sm(int device_id) {
     return host::init_once(device_id, [device_id] {
@@ -206,7 +247,8 @@ struct MegaMoEPreDispatchKernel {
       const tvm::ffi::TensorView buf_topk_weights,
       const tvm::ffi::Optional<tvm::ffi::TensorView> shared_x_sf,
       const int64_t shared_block_m,
-      const double topk_weight_scale) {
+      const double topk_weight_scale,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> num_token_non_padded) {
     using namespace host;
 
     auto device = SymbolicDevice{};
@@ -313,6 +355,17 @@ struct MegaMoEPreDispatchKernel {
     const uint32_t num_pad_blocks = div_ceil(pad_slots, pad_slots_per_block);
     const auto num_total_blocks = num_tokens + num_pad_blocks;
 
+    const int32_t* live_count = nullptr;
+    if constexpr (kMaskPadding) {
+      static_assert(kCopyTopk, "padding mask requires route writes");
+      const auto count = num_token_non_padded.value();
+      CHECK_HOST(count.numel() == 1) << "num_token_non_padded must have one element";
+      CHECK_HOST(is_type<int32_t>(count.dtype())) << "num_token_non_padded must be int32";
+      CHECK_HOST(count.device().device_type == kDLCUDA && count.device().device_id == x.device().device_id)
+          << "num_token_non_padded must be on the input CUDA device";
+      live_count = static_cast<const int32_t*>(count.data_ptr());
+    }
+
     const auto params = MegaMoEPreDispatchParams{
         .x = static_cast<const bf16_t*>(x.data_ptr()),
         .topk_idx = static_cast<const int32_t*>(topk_idx.data_ptr()),
@@ -322,6 +375,7 @@ struct MegaMoEPreDispatchKernel {
         .buf_topk_idx = static_cast<int64_t*>(buf_topk_idx.data_ptr()),
         .buf_topk_weights = static_cast<float*>(buf_topk_weights.data_ptr()),
         .shared_x_sf = shared_sf_ptr,
+        .num_token_non_padded = live_count,
         .buf_x_sf_stride_bytes = buf_x_sf_stride_bytes,
         .shared_x_sf_col_stride = shared_sf_stride,
         .shared_block_m = static_cast<uint32_t>(shared_block_m),

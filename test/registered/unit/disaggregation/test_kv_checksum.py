@@ -11,7 +11,9 @@ import torch
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.checksum import (
     KvChecksumComputer,
+    _state_indices,
     is_health_check_req,
+    page_indices_for_request,
 )
 from sglang.srt.disaggregation.decode import (
     DecodeTransferQueue,
@@ -20,9 +22,15 @@ from sglang.srt.disaggregation.decode import (
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sglang.srt.disaggregation.utils import MetadataBuffers, kv_layout_signature
 from sglang.srt.environ import envs
+from sglang.srt.managers.req_types import FINISH_ABORT
+from sglang.srt.managers.scheduler_components.request_list import (
+    KeyedReqList,
+    ListKind,
+)
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.router import PlainPoolRouter
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.scheduler_test_utils import FakeReq, release_only_retirer
 
 register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
@@ -118,6 +126,11 @@ class TestKvLayoutSignature(unittest.TestCase):
         self.assertNotEqual(same, make(kv_cache_dtype_str="fp16"))
         self.assertNotEqual(same, make(kv_layout="bucketed"))
         self.assertNotEqual(same, make(state_types=[StateType.DSA]))
+        # A prefill keeping a longer window tail than its decode, a pairing
+        # the PD bootstrap accepts, digests more pages of that window.
+        tails = make(state_window_tails=[128])
+        self.assertEqual(tails, make(state_window_tails=[128]))
+        self.assertNotEqual(tails, make(state_window_tails=[192]))
 
 
 class TestKvChecksumComputerConfig(unittest.TestCase):
@@ -132,6 +145,73 @@ class TestKvChecksumComputerConfig(unittest.TestCase):
 
         self.assertEqual(computer._state_data_ptrs, [55, 66, 77])
         self.assertEqual(computer._state_item_lens, [88, 99, 111])
+
+    def test_leaves_out_the_dflash_draft_kv_ring(self):
+        kv_args = SimpleNamespace(
+            kv_data_ptrs=[11],
+            kv_item_lens=[33],
+            state_types=[StateType.MAMBA, StateType.DRAFT_RING, StateType.REQUEST_ROW],
+            state_data_ptrs=[[55, 66], [77, 78], [79]],
+            state_item_lens=[[88, 99], [111, 112], [4]],
+        )
+        computer = KvChecksumComputer.for_kv_args(kv_args, torch.device("cpu"))
+        self.assertEqual(computer._state_data_ptrs, [55, 66])
+        self.assertEqual(computer._state_item_lens, [88, 99])
+        self.assertEqual(computer._state_entry_sizes, [2])
+
+        kv_args.state_types = [StateType.MAMBA, StateType.REQUEST_ROW]
+        kv_args.state_data_ptrs = [[55, 66], [79]]
+        kv_args.state_item_lens = [[88, 99], [4]]
+        computer = KvChecksumComputer.for_kv_args(kv_args, torch.device("cpu"))
+        self.assertEqual(computer._state_data_ptrs, [55, 66, 79])
+
+
+class TestKvChecksumStateIndices(unittest.TestCase):
+    def test_checksum_translates_only_the_transferred_kv_suffix(self):
+        for pages in ([0, 7, 3, 2], [0, 2, 9, 4]):
+            with self.subTest(pages=pages):
+
+                def translate(ids):
+                    return torch.tensor(pages)[ids // 4] * 4 + ids % 4
+
+                scheduler = SimpleNamespace(
+                    token_to_kv_pool_allocator=SimpleNamespace(
+                        page_size=4,
+                        translate_kv_indices_for_transfer=translate,
+                    ),
+                    req_to_token_pool=SimpleNamespace(
+                        req_to_token=torch.arange(16).reshape(1, -1)
+                    ),
+                )
+                req = SimpleNamespace(kv=SimpleNamespace(req_pool_idx=0))
+                result = page_indices_for_request(
+                    scheduler, req, end_idx=11, start_idx=4
+                )
+                self.assertEqual(result.tolist(), pages[1:3])
+
+    def test_mamba_checksum_uses_physical_state_slots(self):
+        # Unified memory moves state independently of its stable request ID.
+        # The checksum must read the same physical slot as the PD payload.
+        for slots in ([0, 7, 3], [0, 2, 9]):
+            with self.subTest(slots=slots):
+                ids = SimpleNamespace(ids=lambda idx: torch.tensor(slots)[idx])
+                allocator = SimpleNamespace(
+                    get_kvcache=lambda: SimpleNamespace(
+                        layer_router=SimpleNamespace(wrapped_view=lambda: object())
+                    ),
+                    state_ids=Mock(return_value=ids),
+                )
+                scheduler = SimpleNamespace(
+                    token_to_kv_pool_allocator=allocator,
+                    req_to_token_pool=SimpleNamespace(
+                        state_sub_pool="mamba",
+                        req_index_to_mamba_index_mapping=torch.tensor([0, 1, 2]),
+                    ),
+                )
+                req = SimpleNamespace(kv=SimpleNamespace(req_pool_idx=1))
+                result = _state_indices(scheduler, req, seq_len=32, start_idx=0)
+                self.assertEqual(result.tolist(), [slots[1]])
+                allocator.state_ids.assert_called_once_with("mamba")
 
 
 class TestKvChecksumHealthCheck(unittest.TestCase):
@@ -251,11 +331,17 @@ class _FakeScheduler(SchedulerDisaggregationDecodeMixin):
         self.kv_checksum_computer = computer
         self.enable_overlap = False
         self.waiting_queue = []
+        self.running_reqs = KeyedReqList(ListKind.DECODING)
+        # A static pool: no unified storage.
         self.token_to_kv_pool_allocator = SimpleNamespace(
-            page_size=1, get_kvcache=_plain_kv_pool
+            page_size=1,
+            get_kvcache=_plain_kv_pool,
+            storage=None,
+            translate_kv_indices_for_transfer=lambda ids: ids,
         )
         self.req_to_token_pool = SimpleNamespace(req_to_token=req_to_token)
         self.tree_cache = None
+        self.request_retirer = Mock()
         self.enable_hisparse = False
         self.output_streamer = SimpleNamespace(stream_output=self.stream_output)
         self.metrics_reporter = SimpleNamespace(enable_metrics=True)
@@ -292,7 +378,7 @@ def _make_req(
     bootstrap_host="127.0.0.1",
     start_idx=0,
 ):
-    return SimpleNamespace(
+    return FakeReq(
         rid=rid,
         bootstrap_host=bootstrap_host,
         bootstrap_port=8998,
@@ -447,7 +533,6 @@ class TestGetNewPrebuiltBatchChecksum(unittest.TestCase):
         with (
             envs.SGLANG_IS_IN_CI.override(False),
             patch("sglang.srt.disaggregation.decode.prepare_abort") as mock_abort,
-            patch("sglang.srt.disaggregation.decode.release_kv_cache") as mock_release,
         ):
             batch = self._run_once(sched)
             self.assertIsNone(self._run_once(sched))
@@ -456,7 +541,7 @@ class TestGetNewPrebuiltBatchChecksum(unittest.TestCase):
         self.assertEqual(sched.waiting_queue, [])
         self.assertEqual(sched.streamed_aborts, [req])
         mock_abort.assert_called_once()
-        mock_release.assert_called_once()
+        sched.request_retirer.release.assert_called_once_with(req, checkpoint=False)
         sched.metrics_collector.increment_transfer_failed_reqs.assert_called_once_with()
 
     def test_mismatch_raises_in_ci(self):
@@ -475,15 +560,12 @@ class TestGetNewPrebuiltBatchChecksum(unittest.TestCase):
         sched = self._make_sched(_SENTINEL)
         req = _make_req(0xDEADBEEF, self.num_pages, rid="HEALTH_CHECK_1")
         sched.waiting_queue = [req]
-        with (
-            patch("sglang.srt.disaggregation.decode.prepare_abort") as mock_abort,
-            patch("sglang.srt.disaggregation.decode.release_kv_cache") as mock_release,
-        ):
+        with patch("sglang.srt.disaggregation.decode.prepare_abort") as mock_abort:
             batch = self._run_once(sched)
         self.assertEqual(batch.reqs, [req])
         self.assertEqual(sched.streamed_aborts, [])
         mock_abort.assert_not_called()
-        mock_release.assert_not_called()
+        sched.request_retirer.release.assert_not_called()
 
     def test_injected_mismatch_aborts_without_raising_in_ci(self):
         """The injector must not trip the in-CI raise it exists to exercise."""
@@ -494,7 +576,6 @@ class TestGetNewPrebuiltBatchChecksum(unittest.TestCase):
             envs.SGLANG_IS_IN_CI.override(True),
             envs.SGLANG_TEST_DISAGG_KV_CHECKSUM_MISMATCH_PROB.override(1.0),
             patch("sglang.srt.disaggregation.decode.prepare_abort") as mock_abort,
-            patch("sglang.srt.disaggregation.decode.release_kv_cache"),
         ):
             self.assertIsNone(self._run_once(sched))
         self.assertEqual(sched.streamed_aborts, [req])
@@ -508,7 +589,6 @@ class TestGetNewPrebuiltBatchChecksum(unittest.TestCase):
         with (
             envs.SGLANG_IS_IN_CI.override(False),
             patch("sglang.srt.disaggregation.decode.prepare_abort"),
-            patch("sglang.srt.disaggregation.decode.release_kv_cache"),
         ):
             batch = self._run_once(
                 sched, reduce=lambda flags, group, op: [1] * len(flags)
@@ -573,7 +653,6 @@ class TestGetNewPrebuiltBatchChecksum(unittest.TestCase):
         with (
             envs.SGLANG_IS_IN_CI.override(False),
             patch("sglang.srt.disaggregation.decode.prepare_abort") as mock_abort,
-            patch("sglang.srt.disaggregation.decode.release_kv_cache"),
         ):
             batch = self._run_once(sched)
         self.assertEqual(batch.reqs, [skipped])
@@ -586,18 +665,27 @@ class TestKvChecksumMismatchHiSparse(unittest.TestCase):
         # Transfer already admitted the request into HiSparse; the abort must
         # free its host pages before the KV itself.
         sched = _FakeScheduler(None, None)
-        sched.enable_hisparse = True
         calls = []
-        sched.hisparse_coordinator = Mock()
-        sched.hisparse_coordinator.request_finished.side_effect = lambda req: (
-            calls.append(("hisparse", req))
+        hisparse_coordinator = Mock()
+        hisparse_coordinator.release_request.side_effect = lambda req: calls.append(
+            ("hisparse", req)
         )
+        sched.request_retirer = release_only_retirer(Mock(), hisparse_coordinator)
         req = _make_req(0xDEADBEEF, 4)
+        req.kv = SimpleNamespace(
+            holds_kv=True, holds_mamba=False, retraction_backup=None
+        )
+        # What the patched `prepare_abort` would set.
+        req.finished_reason = FINISH_ABORT("KV checksum mismatch")
+        req.cache_request_handle = None
+        req.session = None
+        req.get_mm_token_counts = Mock()
+        req.release_mm_inputs_on_abort = Mock()
         with (
             envs.SGLANG_IS_IN_CI.override(False),
             patch("sglang.srt.disaggregation.decode.prepare_abort"),
             patch(
-                "sglang.srt.disaggregation.decode.release_kv_cache",
+                "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache",
                 side_effect=lambda req, *a, **kw: calls.append(("kv", req)),
             ),
         ):

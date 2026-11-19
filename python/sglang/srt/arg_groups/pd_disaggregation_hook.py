@@ -215,8 +215,7 @@ def _validate_prefill_complete(server_args: ServerArgs) -> None:
         unsupported.append("transfer backends other than Mooncake")
     if cfg.pp_size != 1 or cfg.attn_cp_size != 1 or cfg.dcp_size != 1:
         unsupported.append("pipeline or attention context parallelism")
-    attn_dp_size = cfg.dp_size if cfg.enable_dp_attention else 1
-    if cfg.tp_size != attn_dp_size:
+    if cfg.tp_size != cfg.attn_dp_size:
         unsupported.append("attention tensor parallelism greater than one")
     if cfg.decoupled_spec_role != "null":
         unsupported.append("decoupled speculation")
@@ -318,6 +317,11 @@ def handle_encoder_disaggregation(server_args: Any):
         )
     if cfg.encoder_only and cfg.language_only:
         raise ValueError("Cannot set --encoder-only and --language-only together")
+    if cfg.enable_token_space_processor and (cfg.encoder_only or cfg.language_only):
+        raise ValueError(
+            "--enable-token-space-processor does not support encoder "
+            "disaggregation (--encoder-only / --language-only) yet"
+        )
     if cfg.encoder_only and not cfg.disaggregation_mode == "null":
         raise ValueError(
             "Cannot set --encoder-only and --disaggregation-mode prefill/decode together"
@@ -379,19 +383,22 @@ def handle_encoder_disaggregation(server_args: Any):
         "Glm5NextForConditionalGeneration",
         "MiniMaxM3SparseForConditionalGeneration",
         "MuseSparkForConditionalGeneration",
+        "Inkling2ForConditionalGeneration",
     ]:
         raise ValueError(
             f"Model type {model_arch} is not supported for encoder disaggregation. "
             f"Supported architectures: Qwen2VL, Qwen3VL, Qwen3.5, InternS2, "
-            f"Qwen2Audio, Qwen2.5Omni, Dots3-Note, Kimi, MiMoV2, GLM5Next, MiniMax-M3, MuseSpark."
+            f"Qwen2Audio, Qwen2.5Omni, Dots3-Note, Kimi, MiMoV2, GLM5Next, MiniMax-M3, MuseSpark, "
+            f"Inkling2."
         )
 
     if (
-        model_arch == "MuseSparkForConditionalGeneration"
+        model_arch
+        in ("MuseSparkForConditionalGeneration", "Inkling2ForConditionalGeneration")
         and cfg.language_only
         and cfg.enable_adaptive_dispatch_to_encoder
     ):
         raise ValueError(
-            "Muse language-only servers do not load local encoders; "
+            f"{model_arch} language-only servers do not load local encoders; "
             "--enable-adaptive-dispatch-to-encoder is not supported."
         )

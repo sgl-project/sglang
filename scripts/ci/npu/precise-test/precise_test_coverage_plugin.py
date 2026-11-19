@@ -15,9 +15,9 @@ server drains via its own SIGTERM path), waits a bounded time, then
 defers to the original SIGKILL implementation for whatever is left.
 
 All server teardowns in the coverage suites converge on the single
-sglang.srt.utils.common.kill_process_tree (re-exported by
+sglang.srt.utils.process.kill_process_tree (re-exported by
 sglang.srt.utils, bound into sglang.test.test_utils and the ascend e2e
-utils), so patching that one attribute covers base-b and base-c. The
+utils), so patching that one attribute covers extra-b and extra-c. The
 diffusion suites use their own
 sglang.multimodal_gen.runtime.utils.process.kill_process_tree, patched
 lazily after collection (see _patch_multimodal_kill_process_tree).
@@ -86,9 +86,9 @@ def _patch_module_kill_process_tree(module):
 
 
 def _patch_kill_process_tree():
-    import sglang.srt.utils.common as common
+    import sglang.srt.utils.process as process
 
-    _patch_module_kill_process_tree(common)
+    _patch_module_kill_process_tree(process)
 
 
 def _patch_multimodal_kill_process_tree():
@@ -116,7 +116,7 @@ def pytest_configure(config):
     try:
         _patch_kill_process_tree()
     except Exception as exc:
-        # E.g. base-a hosted runner, where the NPU stack is not importable
+        # E.g. extra-a hosted runner, where the NPU stack is not importable
         # outside the tests' own stubs. No servers are launched there, so
         # skipping the patch is fine — just make it visible in the log.
         print(f"precise_test_coverage_plugin: patch skipped: {exc!r}")

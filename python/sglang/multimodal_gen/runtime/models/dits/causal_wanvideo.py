@@ -54,7 +54,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
     QuantizationConfig,
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
-    _apply_rotary_emb,
+    RotaryEmbedding,
     get_rotary_pos_embed,
 )
 from sglang.multimodal_gen.runtime.layers.visual_embedding import PatchEmbed
@@ -71,7 +71,7 @@ from sglang.multimodal_gen.runtime.platforms import (
     current_platform,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.srt.utils import add_prefix
+from sglang.srt.layers.utils.common import add_prefix
 
 logger = init_logger(__name__)
 
@@ -116,6 +116,16 @@ class CausalWanSelfAttention(nn.Module):
             ),
         )
 
+        # CUDA stays on the triton kernel: flashinfer would rebuild the cos/sin
+        # cache in every block, since no table is hoisted for it here.
+        self.rotary_emb = RotaryEmbedding(
+            head_size=self.head_dim,
+            rotary_dim=self.head_dim,
+            is_neox_style=False,
+            use_precomputed_cache=False,
+            use_flashinfer=False,
+        )
+
     def forward(
         self,
         q: torch.Tensor,
@@ -126,17 +136,32 @@ class CausalWanSelfAttention(nn.Module):
         kv_cache: CausalSelfAttentionKVCache | None = None,
         current_start: int = 0,
         cache_start: int | None = None,
+        *,
+        complex_freqs: torch.Tensor | None = None,
     ):
         r"""
         Args:
-            x(Tensor): Shape [B, L, num_heads, C / num_heads]
-            seq_lens(Tensor): Shape [B]
-            grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
-            freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
+            q(Tensor): Query, shape [B, L, num_heads, C / num_heads]
+            k(Tensor): Key, shape [B, L, num_heads, C / num_heads]
+            v(Tensor): Value, shape [B, L, num_heads, C / num_heads]
+            freqs_cis(tuple[Tensor, Tensor]): Rope ``(cos, sin)`` tables for the block
+            block_mask(BlockMask): FlexAttention mask for the unpadded batch
+            kv_cache(CausalSelfAttentionKVCache | None): KV cache for causal decoding
+            current_start(int): Frame index the current block starts at
+            cache_start(int | None): Frame index the cached prefix starts at
+            complex_freqs(Tensor): Rope complex freqs, shape [L, 1, C / num_heads / 2]
         """
         cos, sin = freqs_cis
-        roped_query = _apply_rotary_emb(q, cos, sin, is_neox_style=False).type_as(v)
-        roped_key = _apply_rotary_emb(k, cos, sin, is_neox_style=False).type_as(v)
+        query, key = self.rotary_emb(
+            query=q,
+            key=k,
+            complex_freqs=complex_freqs,
+            cos=cos,
+            sin=sin,
+        )
+
+        roped_query = query.type_as(v)
+        roped_key = key.type_as(v)
 
         if kv_cache is None:
             # Padding for flex attention
@@ -378,6 +403,8 @@ class CausalWanTransformerBlock(nn.Module):
         crossattn_cache: CrossAttentionKVCache | None = None,
         current_start: int = 0,
         cache_start: int | None = None,
+        *,
+        complex_freqs: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # hidden_states.shape: [batch_size, seq_length, inner_dim]
         # temb.shape: [batch_size, num_frames, 6, inner_dim]
@@ -437,6 +464,7 @@ class CausalWanTransformerBlock(nn.Module):
             kv_cache,
             current_start,
             cache_start,
+            complex_freqs=complex_freqs,
         )
         attn_output = attn_output.flatten(2)
         attn_output, _ = self.to_out(attn_output)
@@ -553,8 +581,6 @@ class CausalWanTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             torch.randn(1, 2, inner_dim) / inner_dim**0.5
         )
 
-        self.gradient_checkpointing = False
-
         # Causal-specific
         self.block_mask = None
         self.num_frame_per_block = self.config.num_frames_per_block
@@ -650,6 +676,7 @@ class CausalWanTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             if rope_cache is not None:
                 rope_cache.clear()
                 rope_cache[rope_key] = freqs_cis
+        complex_freqs = torch.complex(*freqs_cis).unsqueeze(-2)
 
         hidden_states = self.patch_embedding(hidden_states)
         hidden_states = hidden_states.flatten(2).transpose(1, 2)
@@ -684,36 +711,21 @@ class CausalWanTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
 
         # 4. Transformer blocks
         for block_index, block in enumerate(self.blocks):
-            if torch.is_grad_enabled() and self.gradient_checkpointing:
-                causal_kwargs = {
-                    "kv_cache": kv_cache[block_index],
-                    "current_start": current_start,
-                    "cache_start": cache_start,
-                    "block_mask": self.block_mask,
-                }
-                hidden_states = self._gradient_checkpointing_func(
-                    block,
-                    hidden_states,
-                    encoder_hidden_states,
-                    timestep_proj,
-                    freqs_cis,
-                    **causal_kwargs,
-                )
-            else:
-                causal_kwargs = {
-                    "kv_cache": kv_cache[block_index],
-                    "crossattn_cache": crossattn_cache[block_index],
-                    "current_start": current_start,
-                    "cache_start": cache_start,
-                    "block_mask": self.block_mask,
-                }
-                hidden_states = block(
-                    hidden_states,
-                    encoder_hidden_states,
-                    timestep_proj,
-                    freqs_cis,
-                    **causal_kwargs,
-                )
+            causal_kwargs = {
+                "kv_cache": kv_cache[block_index],
+                "crossattn_cache": crossattn_cache[block_index],
+                "current_start": current_start,
+                "cache_start": cache_start,
+                "block_mask": self.block_mask,
+            }
+            hidden_states = block(
+                hidden_states,
+                encoder_hidden_states,
+                timestep_proj,
+                freqs_cis,
+                complex_freqs=complex_freqs,
+                **causal_kwargs,
+            )
 
         # 5. Output norm, projection & unpatchify
         temb = temb.unflatten(dim=0, sizes=timestep.shape).unsqueeze(2)
