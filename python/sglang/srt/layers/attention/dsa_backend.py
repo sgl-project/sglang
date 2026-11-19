@@ -236,6 +236,35 @@ def _to_2d_context_lens(seqlens_32: torch.Tensor, batch_size: int) -> torch.Tens
     return seqlens_32.contiguous().view(-1, 1)
 
 
+def _supports_dsa_mha_one_shot(device_sm: int) -> bool:
+    """Whether the device has a dense prefill kernel for DSA MHA_ONE_SHOT."""
+    if _IS_GFX95:
+        return True
+    if not _is_cuda:
+        return False
+    return device_sm == 90 or 100 <= device_sm < 110 or device_sm == 120
+
+
+def _dsa_mha_one_shot_runtime_options_supported(
+    *,
+    device_sm: int,
+    return_indexer_topk: bool,
+    skip_softmax_prefill_threshold_scale_factor: Optional[float],
+) -> bool:
+    """Whether dense prefill preserves the requested sparse-path semantics."""
+    if device_sm != 120:
+        return True
+
+    # Dense MHA does not run the indexer, so it cannot populate the capture
+    # buffer used by --enable-return-indexer-topk. It also does not consume the
+    # sparse FlashInfer skip-softmax threshold scale factor. Keep those SM120
+    # batches on the existing sparse path instead.
+    return (
+        not return_indexer_topk
+        and skip_softmax_prefill_threshold_scale_factor is None
+    )
+
+
 @dataclass(frozen=True)
 class _RowPlan:
     """How the query rows of a sparse DSA kernel line up with its metadata rows.
@@ -2755,7 +2784,6 @@ class DeepseekSparseAttnBackend(
         llama_4_scaling: Optional[torch.Tensor] = None,
         attn_sink: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-
         causal = not layer.is_cross_attention
         metadata = self.forward_metadata
         assert causal, "DSA is causal only"
@@ -3183,7 +3211,6 @@ class DeepseekSparseAttnBackend(
         llama_4_scaling: Optional[torch.Tensor] = None,
         attn_sink: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-
         causal = not layer.is_cross_attention
         metadata = self.forward_metadata
         assert causal, "DSA is causal only"
@@ -4155,6 +4182,19 @@ class DeepseekSparseAttnBackend(
         )
         return sched_meta
 
+    def _zero_padded_extend_rows(
+        self, out: torch.Tensor, forward_batch: ForwardBatch
+    ) -> torch.Tensor:
+        """Zero planned extend rows that are outside the attention metadata."""
+        real = forward_batch.global_num_token_non_padded_cpu
+        if (
+            self.plans_padded_extend_rows
+            and real is not None
+            and 0 < real < out.shape[0]
+        ):
+            out[real:].zero_()
+        return out
+
     def _forward_standard_mha(
         self,
         q: torch.Tensor,
@@ -4181,7 +4221,28 @@ class DeepseekSparseAttnBackend(
             f"cu_seqlens_k has {len(cu_seqlens_k) - 1} requests"
         )
 
-        # Use TRTLLm ragged attention for SM100 (Blackwell/B200) to avoid FA4 accuracy issues.
+        # SM120 has an architecture-owned FA4 kernel for ragged BF16 attention,
+        # including DSA's asymmetric QK192/V128 shape. The FlashInfer TRT-LLM
+        # runner below only supports the SM100 family and rejects SM120.
+        if _is_cuda and self.device_sm_major == 12:
+            from sglang.kernels.ops.attention.flash_attention_v4_sm120 import (
+                flash_attn_varlen_func as flash_attn_varlen_func_sm120,
+            )
+
+            out = flash_attn_varlen_func_sm120(
+                q=q,
+                k=k,
+                v=v,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=metadata.max_seq_len_q,
+                max_seqlen_k=max_seqlen_k,
+                softmax_scale=layer.scaling,
+                causal=causal,
+            )
+            return self._zero_padded_extend_rows(out, forward_batch)
+
+        # Use TRTLLM ragged attention for SM100 (Blackwell/B200) to avoid FA4 accuracy issues.
         # ROCm devices fall through to the aiter flash_attn_varlen_func path below:
         # flashinfer is CUDA-only and gfx1250 also reports a major of 12 here.
         if _is_cuda and self.device_sm_major >= 10:
@@ -4208,16 +4269,7 @@ class DeepseekSparseAttnBackend(
                 return_lse=False,
                 skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
             )
-            # Planned padded extend rows: the one-shot MHA metadata covers only
-            # the real rows, so zero the MLP-sync padding for the layers after.
-            real = forward_batch.global_num_token_non_padded_cpu
-            if (
-                self.plans_padded_extend_rows
-                and real is not None
-                and 0 < real < out.shape[0]
-            ):
-                out[real:].zero_()
-            return out
+            return self._zero_padded_extend_rows(out, forward_batch)
 
         # Use FA3 for SM90 (Hopper/H200)
         return flash_attn_varlen_func(
@@ -5121,14 +5173,18 @@ class DeepseekSparseAttnBackend(
             sum_seq_lens = sum(forward_batch.seq_lens_cpu)
             device_sm = get_device_sm()
 
-            # Requirements: H200/B200/MI355X, short sequences, supported dtype, fits in chunk
+            # Requirements: a supported dense-attention device, short sequences,
+            # supported dtype, and enough chunk capacity.
             self.use_mha = (
                 self.supports_mha_one_shot
-                and (
-                    device_sm == 90
-                    or (device_sm >= 100 and device_sm < 110)
-                    or _IS_GFX95
-                )  # SM90/SM100 (NVIDIA) or gfx95x (MI355X)
+                and _supports_dsa_mha_one_shot(device_sm)
+                and _dsa_mha_one_shot_runtime_options_supported(
+                    device_sm=device_sm,
+                    return_indexer_topk=get_exec().features.enable_return_indexer_topk,
+                    skip_softmax_prefill_threshold_scale_factor=(
+                        envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get()
+                    ),
+                )
                 and batch_max_kv_len
                 <= envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()  # Short enough for MHA
                 and self.token_to_kv_pool.dtype in [torch.bfloat16, torch.float8_e4m3fn]
