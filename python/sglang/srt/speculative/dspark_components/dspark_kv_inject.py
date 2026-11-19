@@ -11,6 +11,7 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.alloc.iteration_ids import Cols, IterationIds
 from sglang.srt.model_executor.forward_batch_info import compute_position
+from sglang.srt.speculative.dspark_components.dspark_planner import VerifyWindow
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.srt.utils import is_pin_memory_available
 
@@ -28,6 +29,13 @@ class PrefillPlacement(NamedTuple):
         return PrefillPlacement(
             *(None if t is None else t[token_indices] for t in self)
         )
+
+
+class VerifyPlacement(NamedTuple):
+    """Per-token placement of a verify window's target hidden in the draft pool."""
+
+    cache_loc: torch.Tensor
+    swa_loc: Optional[torch.Tensor]  # SWA rows before the commit gate, for an MLA pool
 
 
 class TargetHiddenKvInjector:
@@ -124,6 +132,21 @@ class TargetHiddenKvInjector:
             )
         return PrefillPlacement(cache_loc, positions, state_slot, final_pos, swa_loc)
 
+    def place_verify(self, verify_window: VerifyWindow) -> VerifyPlacement:
+        """Where a verify window's target hidden goes in the draft pool. It reads
+        scheduler-shared tables, so a step that publishes prefill read-done (the
+        verify-merged mixed step) runs it before the target forward."""
+        cache_loc = self.ids_for(verify_window.iteration_ids)
+        pool = self.draft_model_runner.token_to_kv_pool
+        swa_loc = None
+        # A per-request ring is addressed by req slot and position, not a mapping.
+        if (
+            hasattr(pool, "set_swa_key_buffer_radix_fused_norm_rope")
+            and pool.swa_req_ring_size is None
+        ):
+            swa_loc = pool.translate_loc_from_full_to_swa(cache_loc).to(torch.int32)
+        return VerifyPlacement(cache_loc, swa_loc)
+
     def inject_prefill(
         self,
         placement: PrefillPlacement,
@@ -156,6 +179,7 @@ class TargetHiddenKvInjector:
         final_pos: Optional[torch.Tensor] = None,
         target_hidden_is_projected: bool = False,
         iteration_ids: Optional[IterationIds] = None,
+        swa_loc: Optional[torch.Tensor] = None,
     ) -> None:
         self._inject(
             target_hidden=target_hidden,
@@ -167,6 +191,7 @@ class TargetHiddenKvInjector:
             final_pos=final_pos,
             target_hidden_is_projected=target_hidden_is_projected,
             iteration_ids=iteration_ids,
+            swa_loc=swa_loc,
         )
 
     def _inject(
@@ -271,6 +296,12 @@ class TargetHiddenKvInjector:
                 state_slot=state_slot,
                 final_pos=final_pos,
             )
+        elif commit_lens is not None and cache_loc_2d is not None:
+            # A placed verify window: drop its uncommitted tokens.
+            verify_len = cache_loc_2d.shape[1]
+            col = torch.arange(verify_len, device=swa_loc.device).view(1, -1)
+            committed = (col < commit_lens.to(torch.long).view(-1, 1)).reshape(-1)
+            swa_loc = torch.where(committed, swa_loc, torch.full_like(swa_loc, -1))
         with torch.inference_mode():
             self.draft_model.write_target_hidden_kv(
                 main_hidden=target_hidden,
