@@ -205,6 +205,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.enable_staging = False
         self.enable_hierarchical_cache = False
         self.enable_hicache_storage = False
+        self.enable_unified_cache_external_linker = False
         self.enable_overlap = True
         self.enable_async_d2h_copy = False
         self.enable_overlap_mlx = False
@@ -698,6 +699,61 @@ class TestPrefillResultPolling(CustomTestCase):
                 # The next outer admission still gets the retry due at step three.
                 self.assertEqual(
                     retries.pop_ready([head, paced], 2, 8), [(paced, None)]
+                )
+
+    def test_linker_issues_deferred_prefetches_only_outside_result_waits(self):
+        """With the external linker, a batch build during a result wait (on an
+        arrival) retires reads but starts no deferred prefetch; starting them
+        resumes once the result is processed, with or without arrivals."""
+
+        class LinkerScheduler(_Scheduler):
+            def _process_hicache_events(self, should_retry_storage_prefetch=True):
+                super()._process_hicache_events(should_retry_storage_prefetch)
+                Scheduler._process_hicache_events(self, should_retry_storage_prefetch)
+
+            def get_new_batch_prefill(self, running_batch):
+                if self.iteration > 0:
+                    self.admission_attempts.append(self.iteration)
+                    return NextBatchPlan(batch_to_run=None, running_batch=running_batch)
+                return super().get_new_batch_prefill(running_batch)
+
+        for arrivals_during_wait in (False, True):
+            with self.subTest(arrivals_during_wait=arrivals_during_wait):
+                arrivals = [_batch(1)] + [None] * 6
+                if arrivals_during_wait:
+                    arrivals[2] = _batch(2)
+                scheduler = LinkerScheduler(arrivals, {1: _result()}, {1: 4})
+                scheduler.enable_unified_cache_external_linker = True
+                scheduler.enable_lmcache = False
+                drained, issued = [], []
+                scheduler.tree_cache = SimpleNamespace(
+                    check_hicache_events=lambda: drained.append(scheduler.iteration),
+                    linker=SimpleNamespace(
+                        issue_deferred_prefetches=lambda queue: issued.append(
+                            scheduler.iteration
+                        )
+                    ),
+                    flush_pending_backups=Mock(),
+                    finish=Mock(),
+                )
+
+                _run_loop(scheduler)
+
+                passes = [
+                    (step, retry)
+                    for step, action, retry in scheduler.actions
+                    if action == "hicache"
+                ]
+                self.assertEqual(drained, [step for step, _ in passes])
+                self.assertEqual(issued, [step for step, retry in passes if retry])
+                result_step = next(
+                    step
+                    for step, action, name in scheduler.actions
+                    if action == "result" and name == 1
+                )
+                self.assertTrue(any(step > result_step for step in issued))
+                self.assertEqual(
+                    any(not retry for _, retry in passes), arrivals_during_wait
                 )
 
     def test_shutdown_during_intake_stops_new_batches_in_both_modes(self):

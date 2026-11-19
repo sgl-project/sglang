@@ -39,6 +39,7 @@ from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
 )
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.plan import TREE_WINDOW
+from sglang.srt.mem_cache.prefill_budget import PrefillBudget
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
     MooncakeDirectLinker,
@@ -706,6 +707,186 @@ class TestLinkerDevicePrefetch(CustomTestCase):
                 assert self._match(cache, req).device_prefix_len == 6
                 self._assert_balanced(cache, allocator)
                 cache.sanity_check()
+
+    def test_memory_parked_continuation_outranks_prefetch_reads(self):
+        """Prefetch reads holding every free KV slot yield to a chunked
+        continuation parked for memory; each displaced request retries once."""
+        cache, backend, _, allocator = self._fixture()
+        linker = cache.linker
+        # KV held by running requests and the continuation's earlier chunks.
+        held = allocator.alloc(14)
+        burst = [self._request(f"burst-{i}", start=10 * i + 1) for i in range(3)]
+        for req in burst:
+            self._enqueue(cache, req)
+        assert allocator.available_size() == 0
+        # The oldest read already runs on the load thread and cannot be cancelled.
+        assert backend.prefetch_futures[0].set_running_or_notify_cancel()
+        budget = PrefillBudget(allocator, cache)
+        assert budget.available_chunk_tokens(8) is None
+
+        owner = CacheRequestHandle("continuation", 0)
+        linker.report_continuation(
+            request=owner, admitted=False, parked_for_memory=True
+        )
+        handles = [req.cache_request_handle for req in burst]
+        assert all(linker.prefetches[h].discard for h in handles)
+        assert not backend.prefetch_futures[0].cancelled()
+        late = self._request("late", start=41)
+        self._enqueue(cache, late)
+        assert len(backend.prefetch_futures) == 3
+
+        cache.check_hicache_events()
+        assert list(linker.prefetches) == handles[:1]
+        assert budget.available_chunk_tokens(8) == 8
+        assert self._match(cache, burst[1]).device_prefix_len == 0
+
+        # Later passes: parked for another reason, then admitted. Neither the
+        # running read nor the admission pass itself reopens the gate.
+        linker.release_protection(chunked_request=owner)
+        linker.report_continuation(
+            request=owner, admitted=False, parked_for_memory=False
+        )
+        linker.release_protection(chunked_request=owner)
+        linker.report_continuation(
+            request=owner, admitted=True, parked_for_memory=False
+        )
+        chunk = allocator.alloc(8)
+        requeued = self._request("requeued", start=51)
+        self._enqueue(cache, requeued)
+        waiting = [*burst, late, requeued]
+        linker.issue_deferred_prefetches(waiting)
+        assert len(backend.prefetch_futures) == 3
+
+        # The next pass sees the continuation admitted: deferred reads go out
+        # in queue order, except the one whose old read still runs.
+        linker.release_protection(chunked_request=owner)
+        linker.issue_deferred_prefetches(waiting)
+        issued = [call.args[0] for call in backend.lookup.call_args_list[3:]]
+        assert issued == ["burst-1", "burst-2", "late", "requeued"]
+        assert list(linker.deferred_prefetches) == handles[:1]
+
+        # The reclaimed read retires unpublished; only then is it retried, once.
+        backend.prefetch_futures[0].set_result(True)
+        cache.check_hicache_events()
+        assert self._match(cache, burst[0]).device_prefix_len == 0
+        linker.issue_deferred_prefetches(waiting)
+        linker.issue_deferred_prefetches(waiting)
+        assert [call.args[0] for call in backend.lookup.call_args_list[7:]] == [
+            "burst-0"
+        ]
+        assert not linker.deferred_prefetches
+
+        for future in backend.prefetch_futures:
+            if not future.done():
+                future.set_result(False)
+        cache.check_hicache_events()
+        allocator.free(torch.cat([held, chunk]))
+        self._assert_balanced(cache, allocator)
+        cache.sanity_check()
+
+    def test_continuation_protection_ends_with_its_owner(self):
+        """Protection ends when its owner leaves; a released, admitted or
+        superseded request is never retried."""
+        cache, backend, req, _ = self._fixture()
+        linker = cache.linker
+        owner = CacheRequestHandle("continuation", 0)
+        other = CacheRequestHandle("other", 0)
+
+        def protect():
+            linker.report_continuation(
+                request=owner, admitted=False, parked_for_memory=True
+            )
+            assert linker.protected_continuation == owner
+
+        for leave in ("release", "not-chunked", "reset"):
+            with self.subTest(leave=leave):
+                protect()
+                linker.release_request(other)
+                linker.release_protection(chunked_request=owner)
+                assert linker.protected_continuation == owner
+                if leave == "release":
+                    linker.release_request(owner)
+                elif leave == "not-chunked":
+                    linker.release_protection(chunked_request=None)
+                else:
+                    linker.reset()
+                assert linker.protected_continuation is None
+
+        protect()
+        revoked = [self._request(f"r{i}", start=10 * i + 1) for i in range(3)]
+        for r in revoked:
+            self._enqueue(cache, r)
+        superseded = self._request("r2", start=21, attempt=1)
+        self._enqueue(cache, superseded)
+        assert list(linker.deferred_prefetches) == [
+            revoked[0].cache_request_handle,
+            revoked[1].cache_request_handle,
+            superseded.cache_request_handle,
+        ]
+        linker.revoke_deferred_prefetch(revoked[0].cache_request_handle)
+        linker.release_request(revoked[1].cache_request_handle)
+        linker.release_request(owner)
+        linker.issue_deferred_prefetches([*revoked, superseded])
+        assert [call.args[0] for call in backend.lookup.call_args_list] == ["r2"]
+        assert not linker.deferred_prefetches
+
+    def test_owed_prefetch_lives_only_while_its_request_waits(self):
+        """An owed prefetch retry is never resurrected after admission, waits
+        for a request not yet queued, repeats per reclamation, and dies with
+        a reset."""
+        cache, backend, _, _ = self._fixture()
+        linker = cache.linker
+        owner = CacheRequestHandle("continuation", 0)
+
+        def lookups(rid):
+            return sum(c.args[0] == rid for c in backend.lookup.call_args_list)
+
+        def park_then_admit(*retire):
+            linker.report_continuation(
+                request=owner, admitted=False, parked_for_memory=True
+            )
+            for future in retire:
+                future.set_result(True)
+            cache.check_hicache_events()
+            linker.report_continuation(
+                request=owner, admitted=True, parked_for_memory=False
+            )
+            linker.release_protection(chunked_request=owner)
+
+        admitted, late = (
+            self._request(r, start=10 * i + 1) for i, r in enumerate("ab")
+        )
+        self._enqueue(cache, admitted)
+        running = backend.prefetch_futures[-1]
+        assert running.set_running_or_notify_cancel()
+        linker.report_continuation(
+            request=owner, admitted=False, parked_for_memory=True
+        )
+        self._enqueue(cache, late)
+        # Admitted while its reclaimed read still runs; the read retires later.
+        linker.revoke_deferred_prefetch(admitted.cache_request_handle)
+        park_then_admit(running)
+        # The late arrival is still bootstrapping: its retry waits for the queue.
+        linker.issue_deferred_prefetches([])
+        linker.issue_deferred_prefetches([admitted, late])
+        linker.issue_deferred_prefetches([admitted, late])
+        assert lookups("a") == 1 and lookups("b") == 1
+
+        # Reclaimed again, it is owed one more attempt.
+        park_then_admit()
+        linker.issue_deferred_prefetches([late])
+        assert lookups("b") == 2
+
+        linker.report_continuation(
+            request=owner, admitted=False, parked_for_memory=True
+        )
+        self._enqueue(cache, self._request("c", start=31))
+        for future in backend.prefetch_futures:
+            if not future.done():
+                future.set_result(False)
+        linker.reset()
+        assert linker.protected_continuation is None
+        assert not linker.deferred_prefetches and not linker.prefetches
 
     def test_layer_wise_still_uses_queued_loads_without_prefetch(self):
         cache, backend, req, allocator = self._fixture()

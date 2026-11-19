@@ -948,6 +948,8 @@ class PrefillAdder:
         # The unfinished chunked request could not run this pass; only one is
         # tracked, and others would take its room, so none is admitted.
         self.chunked_req_waits = False
+        # Whether it waits for memory, rather than for compute or chunk budget.
+        self.continuation_parked_for_memory = False
         self.log_hit_tokens = 0
         self.reprocessed_log_hit_tokens = 0
         self.log_device_hit_tokens = 0
@@ -1537,6 +1539,14 @@ class PrefillAdder:
         result = self._add_chunked_req(req)
         if result is req and not any(r is req for r in self.can_run_list):
             self.chunked_req_waits = True
+            # With work left and a positive chunk budget, the alignment, SPF and
+            # grid helpers always leave a positive chunk; only memory parks it.
+            self.continuation_parked_for_memory = (
+                self.dllm_config is None
+                and self.rem_chunk_tokens is not None
+                and self.rem_chunk_tokens > 0
+                and req.prefix_len < len(req.full_untruncated_fill_ids)
+            )
         return result
 
     def _add_chunked_req(self, req: Req):

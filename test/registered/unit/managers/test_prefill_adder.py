@@ -498,6 +498,54 @@ class TestPrefillAdder(CustomTestCase):
                 else:
                     self.assertEqual(req.extend_len, expected)
 
+    def test_continuation_park_reason_separates_memory_from_chunk_budget(self):
+        """A continuation parked by memory is reported as such; one parked by a
+        spent chunk budget, or one that runs, is not."""
+        self.mock_tree_cache.supports_mamba.return_value = False
+        self.mock_tree_cache.supports_prefix_sharing.return_value = False
+
+        def parked_for_memory(
+            *,
+            available,
+            chunk,
+            page=64,
+            decode=0,
+            mixed_decode=0,
+            granule=0,
+            slot_reserve=0,
+        ):
+            self.mock_token_allocator.available_size.return_value = available
+            self.mock_token_allocator.request_slot_reserve.return_value = slot_reserve
+            running = [
+                self.create_mock_req(f"decode{i}", priority=0, max_new_tokens=4096)
+                for i in range(decode)
+            ]
+            adder = self.create_adder(
+                self.create_running_batch(running),
+                page_size=page,
+                rem_chunk_tokens=chunk,
+                num_mixed_decode_tokens=mixed_decode,
+            )
+            adder.kv_shard_granule = granule
+            req = self.create_shared_req("continuation")
+            req.prefix_len = granule
+            req.full_untruncated_fill_ids = list(range(100_000))
+            adder.add_chunked_req(req)
+            return adder.continuation_parked_for_memory
+
+        # Decode headroom leaves no KV for the chunk.
+        self.assertTrue(parked_for_memory(available=3200, chunk=16384, decode=4))
+        # Memory holds less than one sharded step.
+        self.assertTrue(parked_for_memory(available=3, chunk=64, page=16, granule=16))
+        # The chunk fits but its request slot reserve does not.
+        self.assertTrue(
+            parked_for_memory(available=1000, chunk=64, page=16, slot_reserve=4096)
+        )
+        # Mixed decode rows spend the whole chunk budget: not a memory park.
+        self.assertFalse(parked_for_memory(available=1000, chunk=16, mixed_decode=28))
+        # The chunk runs.
+        self.assertFalse(parked_for_memory(available=1000, chunk=64, page=16))
+
     def test_exact_chunk_fill_keeps_mamba_chunks_page_aligned(self):
         # A Mamba checkpoint only lands on a page-aligned chunk end, so an
         # off-grid chunk leaves the rest of the prompt uncacheable. Without
@@ -1698,6 +1746,7 @@ class TestPrefillAdder(CustomTestCase):
         self.assertIs(result, req)
         self.assertIsNone(req.extend_end)
         self.assertEqual(len(adder.can_run_list), 0)
+        self.assertTrue(adder.continuation_parked_for_memory)
 
     def test_a_continuation_below_the_checkpoint_grid_waits(self):
         """REGRESSION: a continuation whose memory fits less than one
@@ -1736,6 +1785,7 @@ class TestPrefillAdder(CustomTestCase):
         self.assertIs(adder.add_chunked_req(req), req)
         self.assertIsNone(req.extend_end)
         self.assertEqual(adder.can_run_list, [])
+        self.assertTrue(adder.continuation_parked_for_memory)
 
     def test_swa_budget_for_req(self):
         # budget = max(alloc - window, 0) + min(extend + max_new, window) + page,
@@ -2206,6 +2256,7 @@ class TestPrefillAdder(CustomTestCase):
         continuation.prefix_len = 4
         self.assertIs(adder.add_chunked_req(continuation), continuation)
         self.assertEqual(adder.can_run_list, [])
+        self.assertTrue(adder.continuation_parked_for_memory)
 
         waiting = self.create_shared_req("waiting")
         waiting.full_untruncated_fill_ids = list(range(40))
@@ -2224,6 +2275,7 @@ class TestPrefillAdder(CustomTestCase):
         continuation.prefix_len = 11
         self.assertIsNone(adder.add_chunked_req(continuation))
         self.assertEqual(adder.can_run_list, [continuation])
+        self.assertFalse(adder.continuation_parked_for_memory)
         waiting = self.create_shared_req("waiting")
         waiting.full_untruncated_fill_ids = list(range(4))
         adder.add_one_req(waiting, has_chunked_req=False, truncation_align_size=None)
@@ -2244,6 +2296,7 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(adder.can_run_list, [continuation])
         self.assertLess(continuation.extend_end, 12)
         self.assertGreater(adder.rem_chunk_tokens, 0)
+        self.assertFalse(adder.continuation_parked_for_memory)
 
         for length in (4, 40):
             waiting = self.create_shared_req("waiting")
@@ -2312,6 +2365,7 @@ class TestPrefillAdder(CustomTestCase):
         self.assertIs(adder.add_chunked_req(continuation), continuation)
         self.assertEqual(adder.can_run_list, [])
         self.assertIs(adder.budget_state(), AddReqResult.NO_TOKEN)
+        self.assertTrue(adder.continuation_parked_for_memory)
 
         alone, _ = self._pressured_shared_adder(running=0, held_tokens=held)
         continuation = self.create_shared_req("continuation")
@@ -2320,6 +2374,7 @@ class TestPrefillAdder(CustomTestCase):
         self.assertIs(alone.add_chunked_req(continuation), continuation)
         self.assertEqual(alone.can_run_list, [continuation])
         self.assertGreater(continuation.extend_end, 4)
+        self.assertFalse(alone.continuation_parked_for_memory)
 
     def test_an_idle_session_row_does_not_hold_back_a_continuation(self):
         """An idle streaming session's parked row gives no memory back, so a

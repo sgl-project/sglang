@@ -4306,6 +4306,11 @@ class Scheduler(
             self.tree_cache.check_hicache_events()
             if self.enable_hicache_storage and should_retry_storage_prefetch:
                 self._process_storage_prefetch_retries()
+            if (
+                self.enable_unified_cache_external_linker
+                and should_retry_storage_prefetch
+            ):
+                self.tree_cache.linker.issue_deferred_prefetches(self.waiting_queue)
 
     @scheduler_stage_method(SCHEDULER_STAGE_GET_NEXT_BATCH)
     def get_next_batch_to_run(
@@ -4560,6 +4565,15 @@ class Scheduler(
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
         running_batch: ScheduleBatch,
     ) -> Tuple[Optional[ScheduleBatch], ScheduleBatch]:
+        if self.enable_unified_cache_external_linker:
+            # Before any early return and any re-queue that may prefetch.
+            self.tree_cache.linker.release_protection(
+                chunked_request=(
+                    self.chunked_req.cache_request_handle
+                    if self.chunked_req is not None
+                    else None
+                )
+            )
         # Check if the grammar is ready in the grammar queue
         if self.grammar_manager.has_waiting_grammars():
             ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
@@ -4724,6 +4738,12 @@ class Scheduler(
         chunk_parked = (
             self.chunked_req is not None and self.chunked_req not in adder.can_run_list
         )
+        if resumed_req is not None and self.enable_unified_cache_external_linker:
+            self.tree_cache.linker.report_continuation(
+                request=resumed_req.cache_request_handle,
+                admitted=any(r is resumed_req for r in adder.can_run_list),
+                parked_for_memory=adder.continuation_parked_for_memory,
+            )
         # Requests no memory will ever come back for; aborted after the loop.
         unschedulable: List[Req] = []
         # Get requests from the waiting queue to a new prefill batch
@@ -4890,6 +4910,11 @@ class Scheduler(
         if self.enable_hicache_storage and retries is not None:
             for req in can_run_list:
                 retries.cancel(req.rid)
+        if self.enable_unified_cache_external_linker:
+            for req in can_run_list:
+                self.tree_cache.linker.revoke_deferred_prefetch(
+                    req.cache_request_handle
+                )
         # Every other request of the batch comes from the waiting queue.
         admitted = [req for req in can_run_list if req is not resumed_req]
         self.invariant_checker.check_admitted(admitted)

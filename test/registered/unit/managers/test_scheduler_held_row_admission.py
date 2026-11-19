@@ -20,6 +20,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
     ListKind,
     move,
 )
+from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.runtime_context import get_context
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -255,6 +256,105 @@ class TestBoundedV2SkippedAdmission(TestHeldRowAdmission):
                 self.assertTrue(
                     all(req not in blocked for req in built.exception.args[0])
                 )
+
+
+class _LinkerReq(_Req):
+    def __init__(self, rid):
+        super().__init__(holds_row=True)
+        self.cache_request_handle = CacheRequestHandle(rid, 0)
+
+
+class _MemoryParkingAdder(_ParkingAdder):
+    def add_chunked_req(self, req):
+        self.continuation_parked_for_memory = True
+        return req
+
+
+class _AdmittingAdder(_Adder):
+    continuation_parked_for_memory = False
+
+
+class TestLinkerContinuationHooks(CustomTestCase):
+    """Each pass releases linker protection before anything can prefetch, then
+    reports the continuation verdict; admission revokes owed prefetches."""
+
+    def _run_pass(self, adder_class, waiting):
+        running = [_LinkerReq("running")]
+        chunked = _LinkerReq("chunked")
+        s = TestHeldRowAdmission._scheduler(
+            self, DisaggregationMode.PREFILL, running, chunked, waiting, adder_class
+        )
+        s.enable_unified_cache_external_linker = True
+        linker = Mock()
+        s.tree_cache.linker = linker
+        built = []
+
+        def capture(can_run_list, *args, **kwargs):
+            built.extend(can_run_list)
+            raise _BatchBuilt
+
+        with (
+            get_context().override_server_args(pp_max_micro_batch_size=NUM_ROWS),
+            patch.object(ScheduleBatch, "init_new", side_effect=capture),
+            patch("sglang.srt.managers.scheduler.set_time_batch"),
+        ):
+            try:
+                s._get_new_batch_prefill_raw(
+                    prefill_delayer_single_pass=None,
+                    running_batch=ScheduleBatch(reqs=running),
+                )
+            except _BatchBuilt:
+                pass
+        return linker, chunked, built
+
+    def test_memory_parked_continuation_is_reported_after_release(self):
+        linker, chunked, built = self._run_pass(
+            _MemoryParkingAdder, [_LinkerReq("waiting")]
+        )
+        self.assertEqual(built, [])
+        self.assertEqual(
+            [name for name, _, _ in linker.method_calls],
+            ["release_protection", "report_continuation"],
+        )
+        linker.release_protection.assert_called_once_with(
+            chunked_request=chunked.cache_request_handle
+        )
+        linker.report_continuation.assert_called_once_with(
+            request=chunked.cache_request_handle,
+            admitted=False,
+            parked_for_memory=True,
+        )
+
+    def test_admitted_continuation_revokes_owed_prefetches(self):
+        linker, chunked, built = self._run_pass(_AdmittingAdder, [])
+        self.assertEqual(built, [chunked])
+        linker.report_continuation.assert_called_once_with(
+            request=chunked.cache_request_handle,
+            admitted=True,
+            parked_for_memory=False,
+        )
+        linker.revoke_deferred_prefetch.assert_called_once_with(
+            chunked.cache_request_handle
+        )
+
+    def test_deferred_prefetches_wait_for_a_retry_pass(self):
+        s = Scheduler.__new__(Scheduler)
+        s.enable_hierarchical_cache = False
+        s.enable_lmcache = False
+        s.enable_hicache_storage = False
+        s.enable_unified_cache_external_linker = True
+        s.tree_cache = Mock()
+        s.waiting_queue = [_LinkerReq("waiting")]
+        for retry in (False, True):
+            s.tree_cache.reset_mock()
+            with get_context().override_server_args():
+                s._process_hicache_events(should_retry_storage_prefetch=retry)
+            s.tree_cache.check_hicache_events.assert_called_once_with()
+            issue = s.tree_cache.linker.issue_deferred_prefetches
+            if retry:
+                issue.assert_called_once_with(s.waiting_queue)
+            else:
+                issue.assert_not_called()
 
 
 if __name__ == "__main__":

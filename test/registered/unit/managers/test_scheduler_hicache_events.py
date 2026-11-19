@@ -71,6 +71,42 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
                     [call.drain(), call.retry(), call.admit(self.running_batch)] * 2,
                 )
 
+    def test_pd_prefill_starts_linker_prefetches_only_on_retry_passes(self):
+        """With the external linker, every PD batch build retires reads before
+        admission; deferred prefetches start only on passes that may start new
+        storage reads."""
+        # With HiCache off, the event gate reads get_memory().enable_flexkv.
+        enter_scope(self, published_topology())
+        s = self.scheduler
+        s.enable_hierarchical_cache = False
+        s.enable_hicache_storage = False
+        s.enable_unified_cache_external_linker = True
+        s.tree_cache.linker = SimpleNamespace(
+            issue_deferred_prefetches=self.calls.issue
+        )
+        s.resolve_waiting_queue_bootstrap = Mock()
+        s.get_new_batch_prefill = self.calls.admit
+        s.get_new_batch_prefill.return_value = NextBatchPlan(
+            batch_to_run=None, running_batch=self.running_batch
+        )
+        s.waiting_queue = [SimpleNamespace(rid="deferred")]
+        for retry in (False, True):
+            s.get_next_disagg_prefill_batch_to_run(
+                running_batch=self.running_batch,
+                last_batch=None,
+                should_retry_storage_prefetch=retry,
+            )
+        self.assertEqual(
+            self.calls.mock_calls,
+            [
+                call.drain(),
+                call.admit(self.running_batch),
+                call.drain(),
+                call.issue(s.waiting_queue),
+                call.admit(self.running_batch),
+            ],
+        )
+
     def test_unified_drains_when_prefill_is_deferred(self):
         s = self.scheduler
         s.enable_fpm = False

@@ -330,6 +330,14 @@ class UnifiedCacheLinkerWrapper:
         self.pending_offloads: list[_PendingOffload] = []
         # Page-aligned radix-key prefix excluded from offload during an insert.
         self.offload_skip_prefix_len = 0
+        # A chunked continuation that admission parked for lack of memory. While
+        # set, prefetch reads yield to it: none is issued until a pass after the
+        # one that admits it (its chunk is then allocated), or until it leaves.
+        self.protected_continuation: Optional[CacheRequestHandle] = None
+        self.protected_continuation_admitted = False
+        # Requests owed one prefetch attempt once no continuation is protected
+        # and their reclaimed read, if any, has retired. Ordered set.
+        self.deferred_prefetches: dict[CacheRequestHandle, None] = {}
 
         cache.tree_core.enable_external_cache_linker = True
         cache.write_through_threshold = 1
@@ -408,7 +416,14 @@ class UnifiedCacheLinkerWrapper:
         for previous in self.prefetches:
             if previous.rid == request.rid and previous != request:
                 self._cancel_prefetch(previous)
+        for previous in list(self.deferred_prefetches):
+            if previous.rid == request.rid and previous != request:
+                del self.deferred_prefetches[previous]
         if self.cache.disable or request in self.prefetches:
+            return
+        if self.protected_continuation is not None:
+            # Returns before any collective: the gate is rank-identical state.
+            self.deferred_prefetches[request] = None
             return
         req.init_next_round_input(self.cache, cow_mamba=False)
         if is_virtual_node(req.last_node) or req.positional_embed_overrides is not None:
@@ -504,6 +519,58 @@ class UnifiedCacheLinkerWrapper:
             state.discard = True
             if state.future is not None:
                 state.future.cancel()
+
+    def report_continuation(
+        self, *, request: CacheRequestHandle, admitted: bool, parked_for_memory: bool
+    ) -> None:
+        """Admission's verdict on the chunked continuation this pass. One parked
+        for lack of memory outranks every speculative read."""
+        if self.load_mode != "prefetch":
+            return
+        if admitted:
+            if request == self.protected_continuation:
+                self.protected_continuation_admitted = True
+            return
+        if not parked_for_memory:
+            return
+        self.protected_continuation = request
+        self.protected_continuation_admitted = False
+        # Cancelled reads free their slots through check_prefetch_events once
+        # every rank has stopped writing; each owner gets one retry afterwards.
+        for victim, state in self.prefetches.items():
+            if not state.discard:
+                self._cancel_prefetch(victim)
+                self.deferred_prefetches[victim] = None
+
+    def release_protection(
+        self, *, chunked_request: Optional[CacheRequestHandle]
+    ) -> None:
+        """Run at the start of each scheduling pass, before admission can return."""
+        if self.protected_continuation is None:
+            return
+        if (
+            self.protected_continuation_admitted
+            or chunked_request != self.protected_continuation
+        ):
+            self._clear_protection()
+
+    def _clear_protection(self) -> None:
+        self.protected_continuation = None
+        self.protected_continuation_admitted = False
+
+    def issue_deferred_prefetches(self, waiting_queue: Sequence[Req]) -> None:
+        """Give each deferred request still waiting its one prefetch attempt,
+        in queue order, once no continuation is protected."""
+        if self.protected_continuation is not None or not self.deferred_prefetches:
+            return
+        for req in waiting_queue:
+            request = req.cache_request_handle
+            if request in self.deferred_prefetches and request not in self.prefetches:
+                del self.deferred_prefetches[request]
+                self.prefetch(req)
+
+    def revoke_deferred_prefetch(self, request: CacheRequestHandle) -> None:
+        self.deferred_prefetches.pop(request, None)
 
     def prefetch_size(self, pool: PoolName) -> int:
         """Device slots still owned by prefetch, including discarded writes."""
@@ -892,6 +959,8 @@ class UnifiedCacheLinkerWrapper:
         for request in list(self.prefetches):
             self._finish_prefetch(request, publish=False)
         self.hit_markers.clear()
+        self._clear_protection()
+        self.deferred_prefetches.clear()
         self.inflight_load_rids.clear()
         self.private_load_indices.clear()
         self.inflight_load_index = -1
@@ -905,6 +974,9 @@ class UnifiedCacheLinkerWrapper:
     def release_request(self, request: CacheRequestHandle) -> None:
         rid = request.rid
         self.hit_markers.pop(rid, None)
+        self.deferred_prefetches.pop(request, None)
+        if request == self.protected_continuation:
+            self._clear_protection()
         self._cancel_prefetch(request)
         # A queued load targets slots the request owns and is about to free.
         # A started one is finished by finish_loads before anything is freed.
