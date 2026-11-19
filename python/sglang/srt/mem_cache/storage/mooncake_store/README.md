@@ -86,7 +86,10 @@ state objects. This is per-client transient memory, separate from the shared
 `global_segment_size`; include both in the host memory budget.
 
 To keep the storage engine independent of a PD NVLink engine, set
-`SGLANG_HICACHE_MOONCAKE_REUSE_TE=0`.
+`SGLANG_HICACHE_MOONCAKE_REUSE_TE=0`. A store with protocol `"rdma"` in a PD
+worker on the Mooncake transfer backend with `MC_FORCE_MNNVL` set does this on
+its own: it starts its own transfer engine with `MC_FORCE_MNNVL` unset for the
+setup call, so the store stays on RDMA.
 
 ### Unified L3 keys (cross-TP/PP reuse)
 
