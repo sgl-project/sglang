@@ -1,10 +1,19 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
+import sglang.kernels.arch as arch_module
+from sglang.kernels.arch._cuda import CudaArch
+from sglang.kernels.ops.mamba import gdn_extend_state_copies
+from sglang.srt.layers.attention.linear.kernels import gdn_flashinfer
 from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
     FlashInferGDNKernel,
+)
+from sglang.srt.layers.attention.linear.kernels.state_pool_io import (
+    gather_pool_states,
+    scatter_pool_states,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -28,6 +37,44 @@ def _states():
     states[0].fill_(float("nan"))
     states[1].fill_(3)
     return states
+
+
+def _extend(kernel, states):
+    """One prefill over a live lane and three empty ones; returns the gathered state."""
+    captured = {}
+
+    def prefill(**kw):
+        captured["initial"] = kw["initial_state"].clone()
+        kw["output_state"].copy_(kw["initial_state"] + 2)
+        return torch.zeros_like(kw["v"]), kw["output_state"]
+
+    kernel._prefill_fn = prefill
+    qkv = torch.ones((1, 1, 1, 4))
+    gate = torch.zeros((1, 1, 1))
+    with patch(
+        "sglang.kernels.ops.attention.fla.l2norm.gdn_prefill_qkv_prepare_fwd",
+        side_effect=lambda q, k, v: (q, k, v),
+    ):
+        kernel.extend(
+            qkv,
+            qkv,
+            qkv,
+            gate,
+            gate,
+            ssm_states=states,
+            cache_indices=torch.tensor([1, -1, -1, 0], dtype=torch.int32),
+            query_start_loc=torch.tensor([0, 1, 1, 1, 1], dtype=torch.int32),
+        )
+    return captured["initial"]
+
+
+def _gather_rows(*, states, indices):
+    return gather_pool_states(states, indices)[2]
+
+
+def _scatter_rows(*, states, indices, updates):
+    safe_indices, live_rows, _ = gather_pool_states(states, indices)
+    scatter_pool_states(states, safe_indices, live_rows, updates)
 
 
 class TestLinearStatePoolPadding(CustomTestCase):
@@ -72,36 +119,48 @@ class TestLinearStatePoolPadding(CustomTestCase):
                 kernel = _kernel()
                 kernel.use_state_pool = state_pool
                 states = _states()
-                captured = {}
-
-                def prefill(**kw):
-                    captured["initial"] = kw["initial_state"].clone()
-                    kw["output_state"].copy_(kw["initial_state"] + 2)
-                    return torch.zeros_like(kw["v"]), kw["output_state"]
-
-                kernel._prefill_fn = prefill
-                qkv = torch.ones((1, 1, 1, 4))
-                gate = torch.zeros((1, 1, 1))
-                with patch(
-                    "sglang.kernels.ops.attention.fla.l2norm.gdn_prefill_qkv_prepare_fwd",
-                    side_effect=lambda q, k, v: (q, k, v),
-                ):
-                    kernel.extend(
-                        qkv,
-                        qkv,
-                        qkv,
-                        gate,
-                        gate,
-                        ssm_states=states,
-                        cache_indices=torch.tensor([1, -1, -1, 0], dtype=torch.int32),
-                        query_start_loc=torch.tensor(
-                            [0, 1, 1, 1, 1], dtype=torch.int32
-                        ),
-                    )
-                self.assertEqual(torch.count_nonzero(captured["initial"][1:]), 0)
+                initial = _extend(kernel, states)
+                self.assertEqual(torch.count_nonzero(initial[1:]), 0)
                 torch.testing.assert_close(states[1], torch.full((1, 4, 4), 5.0))
                 self.assertEqual(torch.count_nonzero(states[0]), 0)
                 torch.testing.assert_close(states[2:], torch.full((6, 1, 4, 4), 19.0))
+
+    def test_flashinfer_prefill_state_copies_on_sm100(self):
+        """On SM100+ a prefill whose kernel keeps the pool dtype gathers and writes back
+        with one copy launch each; a prefill that widens the state keeps the index ops."""
+        sm100 = CudaArch()
+        sm100.props = SimpleNamespace(major=10, minor=0)
+        for state_pool, pool_dtype, copies in (
+            (False, torch.float32, True),
+            (True, torch.float32, True),
+            (False, torch.bfloat16, False),
+        ):
+            with self.subTest(state_pool=state_pool, pool_dtype=pool_dtype):
+                kernel = _kernel()
+                kernel.use_state_pool = state_pool
+                states = _states().to(pool_dtype)
+                with (
+                    patch.object(arch_module, "_DEVICE_ARCH", sm100),
+                    patch.object(
+                        gdn_extend_state_copies, "_on_cuda", return_value=True
+                    ),
+                    patch.object(
+                        gdn_flashinfer, "gather_pool_rows", side_effect=_gather_rows
+                    ) as gather,
+                    patch.object(
+                        gdn_flashinfer, "scatter_pool_rows", side_effect=_scatter_rows
+                    ) as scatter,
+                ):
+                    initial = _extend(kernel, states)
+                self.assertEqual(
+                    (gather.call_count, scatter.call_count), (int(copies),) * 2
+                )
+                self.assertEqual(initial.dtype, torch.float32)
+                self.assertEqual(torch.count_nonzero(initial[1:]), 0)
+                torch.testing.assert_close(
+                    states[1].float(), torch.full((1, 4, 4), 5.0)
+                )
+                self.assertEqual(torch.count_nonzero(states[0]), 0)
 
     def test_cutedsl_prefill_passes_a_backed_slot_for_empty_sequences(self):
         """CuTe TMA can load H0 for an empty sequence, so its slot must stay backed."""
