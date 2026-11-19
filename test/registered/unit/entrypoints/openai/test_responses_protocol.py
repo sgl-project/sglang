@@ -168,18 +168,38 @@ class ResponsesSamplingParamsTestCase(CustomTestCase):
         self.assertIsNone(params["max_new_tokens"])
 
     def test_none_default_with_max_output_tokens_honored(self):
-        request = ResponsesRequest(
-            model="x", input="hi", store=False, max_output_tokens=100
-        )
-        params = request.to_sampling_params(default_max_tokens=None)
-        # 100 minus the 2-token BOS/EOS headroom.
-        self.assertEqual(params["max_new_tokens"], 98)
+        for requested in (1, 2, 100, 500):
+            request = ResponsesRequest(
+                model="x", input="hi", store=False, max_output_tokens=requested
+            )
+            params = request.to_sampling_params(default_max_tokens=None)
+            self.assertEqual(params["max_new_tokens"], requested)
 
     def test_default_budget_still_caps_when_provided(self):
-        # Backwards compatible: an explicit default budget still applies.
+        # Backwards compatible: an explicit default budget still applies with
+        # 2-token BOS/EOS headroom, without shrinking smaller user limits.
         request = ResponsesRequest(model="x", input="hi", store=False)
         params = request.to_sampling_params(default_max_tokens=128)
         self.assertEqual(params["max_new_tokens"], 126)
+
+        small_budget = ResponsesRequest(model="x", input="hi", store=False)
+        self.assertEqual(
+            small_budget.to_sampling_params(default_max_tokens=1)["max_new_tokens"], 0
+        )
+
+        capped = ResponsesRequest(
+            model="x", input="hi", store=False, max_output_tokens=500
+        )
+        self.assertEqual(
+            capped.to_sampling_params(default_max_tokens=128)["max_new_tokens"], 126
+        )
+
+        uncapped = ResponsesRequest(
+            model="x", input="hi", store=False, max_output_tokens=10
+        )
+        self.assertEqual(
+            uncapped.to_sampling_params(default_max_tokens=128)["max_new_tokens"], 10
+        )
 
     def test_text_format_maps_to_json_schema_constraint(self):
         schema = {"type": "object", "properties": {"age": {"type": "integer"}}}
