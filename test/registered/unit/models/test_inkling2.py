@@ -657,6 +657,7 @@ def _rocm_overrides(
     *,
     hip=True,
     gfx95=True,
+    gfx942=False,
     env=(),
     **server_args,
 ):
@@ -669,6 +670,7 @@ def _rocm_overrides(
     platform = SimpleNamespace(is_hip=hip, is_sm90=False, is_sm100=False)
     monkeypatch.setattr(inkling, "get_platform", lambda: platform)
     monkeypatch.setattr(inkling_hip, "is_gfx95_supported", lambda: gfx95)
+    monkeypatch.setattr(inkling_hip, "is_gfx942_supported", lambda: gfx942)
     # the override exports these on ROCm; preset them so nothing leaks to later tests
     monkeypatch.setenv("SGLANG_TRITON_DECODE_SPLIT_MIN_TOKENS", "32")
     monkeypatch.setenv("SGLANG_TRITON_DECODE_SPLIT_MAX", "128")
@@ -718,17 +720,27 @@ def test_rocm_keeps_exact_all_reduce(tmp_path, monkeypatch, release_config, hip,
     assert os.environ["ROCM_QUICK_REDUCE_QUANTIZATION"] == expected
 
 
-@pytest.mark.parametrize("gfx95,allow", [(False, False), (False, True), (True, False)])
-def test_rocm_requires_gfx950(tmp_path, monkeypatch, release_config, gfx95, allow):
-    """Inkling2's ROCm kernels are sized and validated on gfx950 only (an LDS-sized
-    tile would not fit gfx942's 64 KB): other ROCm GPUs refuse at launch unless
+@pytest.mark.parametrize(
+    "gfx95,gfx942,allow",
+    [
+        (False, False, False),
+        (False, False, True),
+        (True, False, False),
+        (False, True, False),
+    ],
+)
+def test_rocm_requires_gfx950_or_gfx942(
+    tmp_path, monkeypatch, release_config, gfx95, gfx942, allow
+):
+    """Inkling2's ROCm kernels are sized and tuned on gfx950, and also run on
+    gfx942; any other ROCm GPU refuses at launch unless
     SGLANG_INKLING2_ALLOW_UNVALIDATED_ROCM is set."""
     env = [("SGLANG_INKLING2_ALLOW_UNVALIDATED_ROCM", "1")] if allow else []
 
     def run():
-        _rocm_overrides(tmp_path, monkeypatch, release_config, gfx95=gfx95, env=env)
+        _rocm_overrides(tmp_path, monkeypatch, release_config, gfx95=gfx95, gfx942=gfx942, env=env)
 
-    if gfx95 or allow:
+    if gfx95 or gfx942 or allow:
         run()
     else:
         with pytest.raises(ValueError, match="gfx950"):
