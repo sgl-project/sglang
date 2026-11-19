@@ -341,7 +341,9 @@ class SchedulePolicy:
             deprioritized = self._compute_prefix_matches(
                 self._bounded_members, CacheAwarePolicy.LPM
             )
-            self._sort_by_longest_prefix(self._bounded_members, deprioritized)
+            self._sort_by_longest_prefix(
+                self._bounded_members, deprioritized, self.lpm_compute_weight
+            )
             next_ids = {id(r) for r in self._bounded_next_members}
             return (
                 self._bounded_members
@@ -496,7 +498,9 @@ class SchedulePolicy:
             deprioritized = self._compute_prefix_matches(
                 self._bounded_next_members, CacheAwarePolicy.LPM
             )
-            self._sort_by_longest_prefix(self._bounded_next_members, deprioritized)
+            self._sort_by_longest_prefix(
+                self._bounded_next_members, deprioritized, self.lpm_compute_weight
+            )
             yield from self._bounded_next_members
 
     def allows_admission(self, req: Req) -> bool:
