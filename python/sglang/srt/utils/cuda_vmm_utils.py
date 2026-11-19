@@ -1008,9 +1008,6 @@ def map_chunk_into_span(
     check_drv(drv.cuMemRelease(imp_h), "cuMemRelease(span)")
 
 
-FABRIC_HANDLE_BYTES = 64
-
-
 def get_gpu_fabric_clique(device_id: int):
     """``(cluster_uuid, clique_id)`` of a GPU's NVLink fabric, or ``None`` when
     NVML is missing or the GPU has not joined a clique."""
