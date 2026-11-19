@@ -773,6 +773,12 @@ __global__ void Marlin(
           C[sorted_row * prob_n / 8 + col] = {0, 0, 0, 0};
         }
       }
+#ifdef SGL_MARLIN_MOE_HOST_COPY
+      // In a launch that reads experts from the host, a host read can delay this thread block until the others
+      // already wait on the lock. Make the zeros above visible before the lock is written, or a zero that
+      // lands after their atomicAdd would erase it.
+      if (num_host_experts > 0) __threadfence();
+#endif
       // After write zero to output, write a negative value to lock.
       // Every SM that processes the same slice would wait for
       // the negative value, and then atomicAdd 1 to it.
