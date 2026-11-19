@@ -96,7 +96,6 @@ class TestFlux3RoleLoading(CustomTestCase):
                     quantization=None,
                     disagg_role=role,
                     should_start_component_on_cpu=lambda _: True,
-                    component_precisions={},
                 )
                 with (
                     patch.object(

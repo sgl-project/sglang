@@ -38,7 +38,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.f
     Flux3ImageDecodeStage,
     Flux3ImageDenoiseStage,
     Flux3ImageTextEncodeStage,
-    flux3_vae_dtype,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -101,7 +100,7 @@ class Flux3ImagePipeline(LoRAPipeline, ComposedPipelineBase):
             )
             with torch.device("meta"):
                 vae = Flux3ImageVAE(Flux3ImageVAEConfig()).to(
-                    dtype=flux3_vae_dtype(server_args, package.config)
+                    dtype=precision_to_dtype(package.config.vae.dtype)
                 )
             load_model_state_dict(
                 vae, load_file(str(package.vae), device=str(vae_device)), assign=True
