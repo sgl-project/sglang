@@ -255,7 +255,6 @@ from sglang.srt.managers.schedule_policy import (
     PrefillAdder,
     SchedulePolicy,
     mamba_prefill_chunk_grid,
-    uniboost_needs_rank_invariance,
 )
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
@@ -800,6 +799,8 @@ class Scheduler(
         self.init_beam_coordinator()
 
         self.init_request_retirer()
+
+        self.maybe_wire_uniboost_gamma_ada()
 
         self.init_deferred_responses()
 
@@ -1554,9 +1555,10 @@ class Scheduler(
             bounded_lpm_enabled=self.dllm_config is None,
             uniboost_gamma=get_schedule().uniboost_gamma,
             enable_uniboost_gamma_ada=get_schedule().enable_uniboost_gamma_ada,
-            uniboost_rank_invariant=uniboost_needs_rank_invariance(
-                get_parallel().tp_size, get_parallel().pp_size
-            ),
+            # Every rank of a TP or PP group must admit the same batch.
+            uniboost_rank_invariant=get_parallel().tp_size > 1
+            or get_parallel().pp_size > 1,
+            uniboost_step_clock=lambda: self.forward_ct,
         )
         self.policy._on_bounded_state_change = lambda active: (
             self.waiting_queue.set_on_leave(
@@ -3013,6 +3015,13 @@ class Scheduler(
             send_abort_output=self.send_abort_output,
             stream_output=self.output_streamer.stream_output,
         )
+
+    def maybe_wire_uniboost_gamma_ada(self) -> None:
+        # gamma-Ada records the latency of every request that ends.
+        if self.policy.uniboost_gamma_ada is not None:
+            self.request_retirer.release_observer = (
+                self.policy.uniboost_gamma_ada.record_finish
+            )
 
     def maybe_init_decode_offload_manager(self) -> None:
         self.decode_offload_manager = None
@@ -5096,7 +5105,8 @@ class Scheduler(
         batch.after_idle_gap = self._sched_idled
         self._sched_idled = False
 
-        # Accumulate the prefill-token counter used for HRRN and shortest-prefill-first aging.
+        # Accumulate the prefill-token counter used for HRRN and shortest-prefill-first
+        # aging, and for UniBoost's arrival under tp or pp > 1.
         # A batch reused for decode keeps its stale extend_num_tokens, so count extend batches only.
         if batch.forward_mode.is_extend() and batch.extend_num_tokens:
             self.processed_tokens_counter += batch.extend_num_tokens
@@ -5886,10 +5896,6 @@ class Scheduler(
 
         # Submit this batch's queued host backups before the next scheduler step.
         self.tree_cache.flush_pending_backups()
-
-        # UniBoost gamma-Ada: observe finished request latencies for the
-        # adaptive boost-gamma controller (no-op unless enabled).
-        self.policy.uniboost_record_finished(batch.reqs)
 
         self._record_step_counters(batch, result)
 

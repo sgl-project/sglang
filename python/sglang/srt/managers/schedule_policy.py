@@ -39,28 +39,35 @@ logger = logging.getLogger(__name__)
 # ==============================================================================
 """Request scheduler policy"""
 
-import math
 import os
 import random
-import threading
-import time
-from collections import Counter, deque
+from collections import Counter
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import lru_cache
-from typing import TYPE_CHECKING, Dict, Iterable, List, Mapping, Optional, Set, Union
+from typing import (
+    TYPE_CHECKING,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Set,
+    Union,
+)
 
 import torch
 
 from sglang.srt.beam_search.batch_tail import beam_decode_budget
 from sglang.srt.dllm.config import DllmConfig
-from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
     split_cached_prefix_by_tier,
 )
+from sglang.srt.managers.uniboost_gamma_ada import GammaAdaController
 from sglang.srt.mem_cache.allocation import retire_window
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -173,192 +180,8 @@ def estimate_prefill_extend_tile_metrics(
 BOUNDED_LPM_WINDOW_SIZE = 64
 
 
-# UniBoost rank-invariant mode: Phi is floored to this grid and ties break on
-# the arrival sequence number, so float noise cannot reorder ranks differently.
-UNIBOOST_PHI_QUANTUM_S = 1e-4
-
-# gamma-Ada controller internals.
-UNIBOOST_GAMMA_ADA_MIN = 1.0
-UNIBOOST_GAMMA_ADA_MAX = 200.0
-UNIBOOST_GAMMA_ADA_BETA = 0.3
-UNIBOOST_GAMMA_ADA_TAIL_SENSITIVITY = 4.0
-UNIBOOST_GAMMA_ADA_INTERVAL_S = 5.0
-UNIBOOST_GAMMA_ADA_WINDOW = 2000
-UNIBOOST_GAMMA_ADA_MIN_SAMPLES = 200
-UNIBOOST_GAMMA_ADA_REFIT_EVERY_K = 256
-
-
-def uniboost_needs_rank_invariance(tp_size: int, pp_size: int) -> bool:
-    """Whether several ranks must compute the same UniBoost queue order."""
-    return tp_size > 1 or pp_size > 1
-
-
-class GammaAdaController:
-    """Adapts the UniBoost boost rate ``gamma`` to the latency tail (gamma-Ada).
-
-    With ``r = t99 / t95`` over recent latencies, the target is
-    ``gamma_max / (1 + tail_sensitivity * max(r - 1, 0))``: a heavy tail pulls
-    gamma down (more SJF), a flat tail pushes it up (more FCFS). The target is
-    EMA-smoothed by ``beta``.
-
-    Wall-clock mode refits on a daemon thread every ``interval_s``. The
-    rank-invariant mode instead refits synchronously every ``refit_every_k``
-    completions with step-count latencies, so all ranks get the same gamma.
-    """
-
-    __slots__ = (
-        "gamma",
-        "gamma_min",
-        "gamma_max",
-        "beta",
-        "tail_sensitivity",
-        "interval_s",
-        "min_samples",
-        "refit_every_k",
-        "refit_count",
-        "_samples",
-        "_completions_since_refit",
-        "_last_update_t",
-        "_thread",
-        "_stop_event",
-    )
-
-    def __init__(
-        self,
-        *,
-        gamma_init: float,
-        gamma_min: float = UNIBOOST_GAMMA_ADA_MIN,
-        gamma_max: float = UNIBOOST_GAMMA_ADA_MAX,
-        beta: float = UNIBOOST_GAMMA_ADA_BETA,
-        tail_sensitivity: float = UNIBOOST_GAMMA_ADA_TAIL_SENSITIVITY,
-        interval_s: float = UNIBOOST_GAMMA_ADA_INTERVAL_S,
-        window: int = UNIBOOST_GAMMA_ADA_WINDOW,
-        min_samples: int = UNIBOOST_GAMMA_ADA_MIN_SAMPLES,
-        refit_every_k: int = 0,
-    ) -> None:
-        # gamma_min must stay strictly positive: b_gamma divides by gamma.
-        self.gamma_min = max(float(gamma_min), 1e-6)
-        self.gamma_max = max(float(gamma_max), self.gamma_min)
-        self.gamma = min(max(float(gamma_init), self.gamma_min), self.gamma_max)
-        self.beta = min(max(float(beta), 0.0), 1.0)
-        self.tail_sensitivity = max(float(tail_sensitivity), 0.0)
-        self.interval_s = max(float(interval_s), 0.0)
-        self.min_samples = max(int(min_samples), 1)
-        self.refit_every_k = max(int(refit_every_k), 0)
-        self._samples = deque(maxlen=max(int(window), self.min_samples))
-        self._completions_since_refit = 0
-        self._last_update_t = 0.0
-        self.refit_count = 0
-        self._thread: Optional[threading.Thread] = None
-        self._stop_event = threading.Event()
-
-    def record(self, latency_s: float) -> None:
-        """Record one completed request's end-to-end latency."""
-        if latency_s > 0.0:
-            self._samples.append(float(latency_s))
-
-    def record_completion(self, latency: float) -> Optional[float]:
-        """Record a step-count latency; refit every ``refit_every_k`` calls.
-
-        Returns the new gamma when a refit ran, else ``None``.
-        """
-        self.record(latency)
-        self._completions_since_refit += 1
-        if (
-            self.refit_every_k > 0
-            and self._completions_since_refit >= self.refit_every_k
-            and len(self._samples) >= self.min_samples
-        ):
-            self._completions_since_refit = 0
-            return self._refit_once()
-        return None
-
-    def start(self) -> None:
-        """Start the background refit daemon thread. Idempotent."""
-        if self._thread is not None and self._thread.is_alive():
-            return
-        self._stop_event.clear()
-        self._thread = threading.Thread(
-            target=self._run, name="uniboost-gamma-ada", daemon=True
-        )
-        self._thread.start()
-
-    def stop(self, timeout: float = 2.0) -> None:
-        """Stop the background refit thread."""
-        self._stop_event.set()
-        thread = self._thread
-        if thread is not None:
-            thread.join(timeout)
-        self._thread = None
-
-    def _run(self) -> None:
-        # A non-positive interval still sleeps briefly instead of busy-looping.
-        wait_s = self.interval_s if self.interval_s > 0.0 else 0.05
-        while not self._stop_event.wait(wait_s):
-            try:
-                self._refit_once()
-            except Exception:
-                logger.exception(
-                    "UniBoost gamma-Ada refit failed; keeping gamma=%.4g",
-                    self.gamma,
-                )
-
-    @staticmethod
-    def _percentile(sorted_vals, q: float) -> float:
-        """Linear-interpolated percentile q in [0,1] over a sorted list."""
-        n = len(sorted_vals)
-        if n == 1:
-            return sorted_vals[0]
-        pos = q * (n - 1)
-        lo = int(pos)
-        hi = min(lo + 1, n - 1)
-        frac = pos - lo
-        return sorted_vals[lo] * (1.0 - frac) + sorted_vals[hi] * frac
-
-    def _target_gamma(self) -> float:
-        vals = sorted(self._samples)
-        t95 = self._percentile(vals, 0.95)
-        t99 = self._percentile(vals, 0.99)
-        if t95 <= 0.0:
-            return self.gamma_max
-        ratio = t99 / t95
-        excess = ratio - 1.0 if ratio > 1.0 else 0.0
-        target = self.gamma_max / (1.0 + self.tail_sensitivity * excess)
-        if target < self.gamma_min:
-            return self.gamma_min
-        if target > self.gamma_max:
-            return self.gamma_max
-        return target
-
-    def _refit_once(self):
-        """Refit gamma; returns it, or ``None`` below ``min_samples``."""
-        if len(self._samples) < self.min_samples:
-            return None
-        target = self._target_gamma()
-        gamma = (1.0 - self.beta) * self.gamma + self.beta * target
-        if gamma < self.gamma_min:
-            gamma = self.gamma_min
-        elif gamma > self.gamma_max:
-            gamma = self.gamma_max
-        self.gamma = gamma
-        self.refit_count += 1
-        logger.info(
-            "UniBoost gamma-Ada refit #%d: gamma=%.4g /s (target %.4g, n=%d)",
-            self.refit_count,
-            gamma,
-            target,
-            len(self._samples),
-        )
-        return gamma
-
-    def maybe_update(self, now: float):
-        """Refit if ``interval_s`` has passed since the last refit at ``now``."""
-        if now - self._last_update_t < self.interval_s:
-            return None
-        if len(self._samples) < self.min_samples:
-            return None
-        self._last_update_t = now
-        return self._refit_once()
+# UniBoost re-matches this many requests at the head of the sorted queue each pass.
+UNIBOOST_MATCH_WINDOW_SIZE = 64
 
 
 class CacheAwarePolicy(Enum):
@@ -396,6 +219,7 @@ class SchedulePolicy:
         uniboost_gamma: float = 10.0,
         enable_uniboost_gamma_ada: bool = False,
         uniboost_rank_invariant: bool = False,
+        uniboost_step_clock: Optional[Callable[[], int]] = None,
     ):
         self._lpm_gate_calls = 0
         self._on_bounded_state_change = None
@@ -436,15 +260,14 @@ class SchedulePolicy:
         self.uniboost_alpha_s_per_token = (
             envs.SGLANG_UNIBOOST_ALPHA_US_PER_TOKEN.get() / 1e6
         )
-        self.uniboost_gamma_controller: Optional[GammaAdaController] = None
-        self.uniboost_match_topk = envs.SGLANG_UNIBOOST_MATCH_TOPK.get()
-        # Set by _init_uniboost when several ranks must sort identically.
-        self.uniboost_rank_invariant = False
-        self.uniboost_arrival_step_s = envs.SGLANG_UNIBOOST_ARRIVAL_STEP_S.get()
-        self._uniboost_next_arrival_seq = 0
-        self._uniboost_step = 0
+        self.uniboost_rank_invariant = uniboost_rank_invariant
+        self.uniboost_gamma_ada: Optional[GammaAdaController] = None
         if self.policy == CacheAwarePolicy.UNIBOOST:
-            self._init_uniboost(enable_uniboost_gamma_ada, uniboost_rank_invariant)
+            self._init_uniboost(enable_uniboost_gamma_ada, uniboost_step_clock)
+        elif enable_uniboost_gamma_ada:
+            raise ValueError(
+                "enable_uniboost_gamma_ada requires schedule_policy=uniboost"
+            )
 
     def calc_priority(
         self,
@@ -535,16 +358,7 @@ class SchedulePolicy:
                     waiting_queue, self.priority_sign
                 )
         elif policy == CacheAwarePolicy.UNIBOOST:
-            self._refresh_uniboost_gamma()
-            tree_disabled = self.tree_cache.disable
-            if not tree_disabled and self.uniboost_match_topk <= 0:
-                # Legacy: full per-pass prefix matching over the queue
-                # (populates req.num_matched_prefix_tokens for the
-                # cache-aware effective-work estimate).
-                self._compute_prefix_matches(waiting_queue, policy)
             self._sort_by_uniboost(waiting_queue)
-            if not tree_disabled and self.uniboost_match_topk > 0:
-                self._uniboost_refresh_frontier(waiting_queue)
         elif isinstance(policy, CacheAwarePolicy):
             temporary_deprioritized = self._compute_prefix_matches(
                 waiting_queue, policy
@@ -691,10 +505,14 @@ class SchedulePolicy:
         bootstrap_queue: Iterable[Req] = (),
     ) -> None:
         # Head last, so LRU evicts in reverse admission order; cache-aware policies
-        # already touch while matching, and other eviction strategies ignore recency.
+        # already touch while matching (UniBoost only its head window), and other
+        # eviction strategies ignore recency.
         bootstrap_max = envs.SGLANG_WAITING_PREFIX_REFRESH_BOOTSTRAP_MAX.get()
         if (
-            isinstance(policy, CacheAwarePolicy)
+            (
+                isinstance(policy, CacheAwarePolicy)
+                and policy != CacheAwarePolicy.UNIBOOST
+            )
             or not (waiting_queue or (bootstrap_queue and bootstrap_max > 0))
             or not envs.SGLANG_ENABLE_WAITING_PREFIX_REFRESH.get()
             or get_disagg().disaggregation_mode == "decode"
@@ -733,11 +551,6 @@ class SchedulePolicy:
         if self._bounded_active:
             return False
         policy = self._determine_active_policy(waiting_queue)
-        if policy == CacheAwarePolicy.UNIBOOST and not self.tree_cache.disable:
-            # Frontier-K matches only the top-K requests; deeper ones are unmatched.
-            topk = self.uniboost_match_topk
-            if 0 < topk < len(waiting_queue):
-                return self.tree_cache.supports_fast_match_prefix()
         return (
             isinstance(policy, CacheAwarePolicy)
             or self.tree_cache.supports_fast_match_prefix()
@@ -790,6 +603,13 @@ class SchedulePolicy:
             # The first of a shared-prefix group runs: make it the shortest, or a
             # short request waits behind a long one that SPF defers.
             candidates.sort(key=lambda c: self._shortest_prefill_work(c[0]))
+        elif policy == CacheAwarePolicy.UNIBOOST:
+            # Likewise, the group's leader is its highest-priority member.
+            candidates.sort(
+                key=lambda c: self._uniboost_phi(
+                    c[0], self._shortest_prefill_work(c[0])
+                )
+            )
 
         for r, key_ids in candidates:
             extra_key = r.extra_key
@@ -831,7 +651,8 @@ class SchedulePolicy:
         otherwise observed only when admission reaches a request, which a
         request still ranked by its unloaded prefix may never do."""
         if (
-            self.policy != CacheAwarePolicy.SHORTEST_PREFILL_FIRST
+            self.policy
+            not in (CacheAwarePolicy.SHORTEST_PREFILL_FIRST, CacheAwarePolicy.UNIBOOST)
             or not self.tree_cache.can_poll_prefetch_progress()
         ):
             return
@@ -846,14 +667,14 @@ class SchedulePolicy:
         )
         return max(1, len(r.origin_input_ids) + len(r.output_ids) - cached)
 
-    def _shortest_prefill_rank(self, r: Req, processed_tokens: int) -> float:
+    def _prefill_rank(self, r: Req, work: int, processed_tokens: int) -> float:
+        """Admission rank under shortest-prefill-first or UniBoost; lower goes first."""
+        if self.policy == CacheAwarePolicy.UNIBOOST:
+            return self._uniboost_phi(r, work)
         # Aging lowers the rank by the prefill work done while the request
         # waited, bounding its wait to about work / factor processed tokens.
         waited_tokens = max(0, processed_tokens - r.arrival_processed_tokens)
-        return (
-            self._shortest_prefill_work(r)
-            - self.shortest_prefill_aging_factor * waited_tokens
-        )
+        return work - self.shortest_prefill_aging_factor * waited_tokens
 
     def _sort_by_shortest_prefill(
         self,
@@ -866,7 +687,7 @@ class SchedulePolicy:
         waiting_queue.sort(
             key=lambda r: (
                 r.rid in temporary_deprioritized,
-                self._shortest_prefill_rank(r, processed_tokens),
+                self._prefill_rank(r, self._shortest_prefill_work(r), processed_tokens),
                 r.time_stats.wait_queue_entry_time,
             )
         )
@@ -880,15 +701,16 @@ class SchedulePolicy:
         *,
         processed_tokens: int,
     ) -> Optional[int]:
-        """Cap the active prefill chunk to reserve tokens for shorter waiting requests."""
+        """Cap the active prefill chunk to reserve tokens for waiting requests
+        that rank ahead of it under shortest-prefill-first or UniBoost."""
         if (
-            self.policy != CacheAwarePolicy.SHORTEST_PREFILL_FIRST
+            self.policy
+            not in (CacheAwarePolicy.SHORTEST_PREFILL_FIRST, CacheAwarePolicy.UNIBOOST)
             or budget < 2 * page_size
         ):
             return None
         remaining = len(chunked_req.full_untruncated_fill_ids) - chunked_req.prefix_len
-        chunked_waited = max(0, processed_tokens - chunked_req.arrival_processed_tokens)
-        chunked_rank = remaining - self.shortest_prefill_aging_factor * chunked_waited
+        chunked_rank = self._prefill_rank(chunked_req, remaining, processed_tokens)
         reserved = 0
         for req in waiting_queue:
             work = self._shortest_prefill_work(req)
@@ -899,7 +721,7 @@ class SchedulePolicy:
             cached = len(req.origin_input_ids) + len(req.output_ids) - work
             charge += PrefillAdder._replay_len(req, cached)
             if (
-                self._shortest_prefill_rank(req, processed_tokens) >= chunked_rank
+                self._prefill_rank(req, work, processed_tokens) >= chunked_rank
                 or reserved + charge > budget - page_size
             ):
                 break
@@ -1006,189 +828,84 @@ class SchedulePolicy:
             )
         )
 
-    # ------------------------------------------------------------------
-    # UniBoost (tail-aware admission boosting, ICML'26 "beyond prediction")
-    # ------------------------------------------------------------------
-    def _init_uniboost(self, enable_gamma_ada: bool, rank_invariant: bool) -> None:
-        """Arm UniBoost, or fall back to fcfs when misconfigured.
-
-        ``rank_invariant`` (tp_size > 1 or pp_size > 1) keeps the sort key and
-        gamma-Ada off the per-rank wall clock, so every rank admits the same
-        batch from the same request stream.
-        """
-        if rank_invariant:
-            if envs.SGLANG_UNIBOOST_FORCE_FCFS_MULTI_RANK.get():
-                logger.warning(
-                    "UniBoost disabled by SGLANG_UNIBOOST_FORCE_FCFS_MULTI_RANK=1; "
-                    "falling back to fcfs."
-                )
-                self.policy = CacheAgnosticPolicy.FCFS
-                return
-            self.uniboost_rank_invariant = True
-        if self.uniboost_gamma <= 0.0:
-            logger.warning(
-                "UniBoost requested but --uniboost-gamma=%s is not > 0; "
-                "falling back to fcfs",
-                self.uniboost_gamma,
+    def _init_uniboost(
+        self, enable_gamma_ada: bool, step_clock: Optional[Callable[[], int]]
+    ) -> None:
+        """``step_clock`` is a step counter identical on every rank; gamma-Ada
+        measures latency with it under rank invariance."""
+        gamma, alpha = self.uniboost_gamma, self.uniboost_alpha_s_per_token
+        if not (math.isfinite(gamma) and gamma > 0):
+            raise ValueError(f"uniboost_gamma must be finite and > 0, got {gamma}")
+        if not (math.isfinite(alpha) and alpha > 0):
+            raise ValueError(
+                "SGLANG_UNIBOOST_ALPHA_US_PER_TOKEN must be finite and > 0, got "
+                f"{alpha * 1e6}"
             )
-            self.policy = CacheAgnosticPolicy.FCFS
-            return
+        # The largest boost, b(alpha) ~= -ln(gamma * alpha) / gamma, must be finite.
+        if not (gamma * alpha > 0 and math.isfinite(math.log(gamma * alpha) / gamma)):
+            raise ValueError(f"uniboost_gamma={gamma} is too small for alpha={alpha}")
         if enable_gamma_ada:
-            self.uniboost_gamma_controller = GammaAdaController(
-                gamma_init=self.uniboost_gamma,
-                min_samples=UNIBOOST_GAMMA_ADA_MIN_SAMPLES,
-                refit_every_k=(
-                    UNIBOOST_GAMMA_ADA_REFIT_EVERY_K
-                    if self.uniboost_rank_invariant
-                    else 0
-                ),
+            self.uniboost_gamma_ada = GammaAdaController(
+                gamma,
+                step_clock=step_clock if self.uniboost_rank_invariant else None,
             )
-            if not self.uniboost_rank_invariant:
-                # A per-rank refit thread would let gammas drift across ranks,
-                # so only the wall-clock mode uses it.
-                self.uniboost_gamma_controller.start()
         logger.info(
-            "UniBoost enabled: gamma=%.4g /s, alpha=%.1f us/token, "
-            "gamma-Ada=%s, mode=%s",
-            self.uniboost_gamma,
+            "UniBoost enabled: gamma=%.4g /s, alpha=%.1f us/token, gamma-Ada=%s, "
+            "arrival clock=%s",
+            self._uniboost_current_gamma(),
             self.uniboost_alpha_s_per_token * 1e6,
-            "on" if self.uniboost_gamma_controller is not None else "off",
-            "rank-invariant" if self.uniboost_rank_invariant else "wall-clock",
+            "on" if enable_gamma_ada else "off",
+            "processed tokens" if self.uniboost_rank_invariant else "wall",
         )
 
-    def _uniboost_boost_value(self, work_tokens: int) -> float:
-        """Boost ``b_gamma(w) = ln(1 / (1 - e^{-gamma w})) / gamma`` in seconds.
+    def _uniboost_phi(self, r: Req, work: int) -> float:
+        """``Phi = arrival - b(alpha * work)`` in seconds; lower is admitted first.
 
-        ``w = alpha * uncached_tokens``. The boost decays to ~0 for long jobs,
-        so they keep their FCFS rank and are never starved.
+        ``b(w) = ln(1 / (1 - e^(-gamma * w))) / gamma`` decays to 0 for long work,
+        so a long request keeps its FCFS place and is never starved.
         """
-        w = self.uniboost_alpha_s_per_token * max(work_tokens, 0)
-        if w <= 0.0:
-            # No uncached work: maximal (finite) boost.
-            return 1e9
-        gamma = self.uniboost_gamma
-        gw = gamma * w
-        denom = -math.expm1(-gw)  # 1 - e^{-gw}, accurate for small gw
-        if denom <= 0.0:
-            return 1e9
-        return -math.log(denom) / gamma
+        if self.uniboost_rank_invariant:
+            # Processed prefill tokens advance identically on every rank.
+            arrival = self.uniboost_alpha_s_per_token * r.arrival_processed_tokens
+        else:
+            arrival = r.time_stats.wait_queue_entry_time
+        gamma = self._uniboost_current_gamma()
+        # A resumed chunk may have no work left; b(0) is unbounded.
+        gamma_w = gamma * self.uniboost_alpha_s_per_token * max(work, 1)
+        return arrival + math.log(-math.expm1(-gamma_w)) / gamma
 
-    def _uniboost_priority(self, req: Req, now: float) -> float:
-        """Phi(i) = arrival_i - b_gamma(effective_work_i); lower = serve sooner."""
-        arrival = req.time_stats.wait_queue_entry_time or now
-        prompt_len = len(req.origin_input_ids) + len(req.output_ids)
-        # Cache-aware effective work: a mostly cached prompt is short work.
-        uncached = prompt_len - int(req.num_matched_prefix_tokens)
-        return arrival - self._uniboost_boost_value(uncached)
-
-    def _uniboost_assign_arrival_seq(self, waiting_queue: List[Req]) -> None:
-        """Stamp newly seen requests with an arrival sequence number and step.
-
-        Every rank sees the same request stream in the same order, so the
-        sequence numbers match across ranks.
-        """
-        for r in waiting_queue:
-            if r.uniboost_arrival_seq is None:
-                r.uniboost_arrival_seq = self._uniboost_next_arrival_seq
-                self._uniboost_next_arrival_seq += 1
-                r.uniboost_enqueue_step = self._uniboost_step
-
-    def _uniboost_invariant_key(self, req: Req):
-        """Rank-invariant sort key: quantized Phi, then arrival sequence."""
-        arrival = req.uniboost_arrival_seq * self.uniboost_arrival_step_s
-        prompt_len = len(req.origin_input_ids) + len(req.output_ids)
-        uncached = prompt_len - int(req.num_matched_prefix_tokens)
-        phi = arrival - self._uniboost_boost_value(uncached)
-        return (int(round(phi / UNIBOOST_PHI_QUANTUM_S)), req.uniboost_arrival_seq)
+    def _uniboost_current_gamma(self) -> float:
+        if self.uniboost_gamma_ada is not None:
+            return self.uniboost_gamma_ada.gamma
+        return self.uniboost_gamma
 
     def _sort_by_uniboost(self, waiting_queue: List[Req]) -> None:
-        """Sort the waiting queue in place by UniBoost priority Phi."""
-        if self.uniboost_rank_invariant:
-            # Stamp even a lone request: gamma-Ada needs its enqueue step.
-            self._uniboost_assign_arrival_seq(waiting_queue)
-            if len(waiting_queue) < 2:
-                return
-            waiting_queue.sort(key=self._uniboost_invariant_key)
-            return
-        if len(waiting_queue) < 2:
-            return
-        now = time.perf_counter()
-        waiting_queue.sort(key=lambda r: self._uniboost_priority(r, now))
+        if self.uniboost_gamma_ada is not None:
+            self.uniboost_gamma_ada.stamp_first_seen(waiting_queue)
 
-    def _uniboost_refresh_frontier(self, waiting_queue: List[Req]) -> None:
-        """Re-match only the top-K candidates and re-sort them.
+        def phi(r: Req) -> float:
+            return self._uniboost_phi(r, self._shortest_prefill_work(r))
 
-        Deeper entries keep their last match. A stale match can only
-        under-count cached tokens, so it under-boosts but never starves.
-        """
-        k = min(self.uniboost_match_topk, len(waiting_queue))
-        if k <= 0:
+        if self.tree_cache.disable:
+            waiting_queue.sort(key=phi)
             return
-        for r in waiting_queue[:k]:
-            match_kv_cache(r, self.tree_cache)
-        if k > 1:
-            if self.uniboost_rank_invariant:
-                waiting_queue[:k] = sorted(
-                    waiting_queue[:k], key=self._uniboost_invariant_key
-                )
-            else:
-                now = time.perf_counter()
-                waiting_queue[:k] = sorted(
-                    waiting_queue[:k], key=lambda r: self._uniboost_priority(r, now)
-                )
-
-    def _refresh_uniboost_gamma(self) -> None:
-        """Pick up the latest gamma from the gamma-Ada controller."""
-        controller = self.uniboost_gamma_controller
-        if controller is None:
-            return
-        self.uniboost_gamma = controller.gamma
-
-    def uniboost_record_finished(self, reqs: List[Req]) -> None:
-        """Record finished, non-aborted latencies for gamma-Ada (once each).
-
-        The rank-invariant mode measures latency in processed batch results,
-        which advance in lockstep on every rank.
-        """
-        if self.uniboost_rank_invariant:
-            # One tick per processed batch result: the shared step clock.
-            self._uniboost_step += 1
-        controller = self.uniboost_gamma_controller
-        if controller is None:
-            return
-        if self.uniboost_rank_invariant:
-            for req in reqs:
-                if not req.finished():
-                    continue
-                if req.uniboost_latency_recorded:
-                    continue
-                req.uniboost_latency_recorded = True
-                if isinstance(req.finished_reason, FINISH_ABORT):
-                    continue
-                if req.uniboost_enqueue_step is None:
-                    # Never passed a scheduling pass (should not happen).
-                    continue
-                latency_steps = max(self._uniboost_step - req.uniboost_enqueue_step, 1)
-                controller.record_completion(float(latency_steps))
-            return
-        now = time.perf_counter()
-        for req in reqs:
-            if not req.finished():
-                continue
-            if req.uniboost_latency_recorded:
-                continue
-            req.uniboost_latency_recorded = True
-            if isinstance(req.finished_reason, FINISH_ABORT):
-                continue
-            # Retraction resets wait_queue_entry_time; scheduler_recv_time is
-            # set once, so retracted requests keep their full latency.
-            arrival = req.time_stats.scheduler_recv_time
-            if arrival <= 0.0:
-                continue
-            end = req.time_stats.completion_time
-            if end <= 0.0:
-                end = now
-            controller.record(end - arrival)
+        if len(waiting_queue) > UNIBOOST_MATCH_WINDOW_SIZE:
+            # Past the head window, a request is matched only when first seen
+            # (new or retracted: last_node is None); its count may go stale.
+            for r in waiting_queue:
+                if r.last_node is None:
+                    match_kv_cache(r, self.tree_cache)
+            waiting_queue.sort(key=phi)
+        window = waiting_queue[:UNIBOOST_MATCH_WINDOW_SIZE]
+        deprioritized = self._compute_prefix_matches(window, CacheAwarePolicy.UNIBOOST)
+        window.sort(key=phi)
+        # As in LPM and SPF, a request sharing a leader's uncached prefix waits
+        # at the end of the queue until the leader has cached it.
+        waiting_queue[:] = (
+            [r for r in window if r.rid not in deprioritized]
+            + waiting_queue[UNIBOOST_MATCH_WINDOW_SIZE:]
+            + [r for r in window if r.rid in deprioritized]
+        )
 
     @staticmethod
     def _sort_by_routing_key(

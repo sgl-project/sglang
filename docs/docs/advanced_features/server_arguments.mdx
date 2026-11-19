@@ -522,7 +522,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--uniboost-gamma`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Boost decay rate gamma (1/s) for `--schedule-policy uniboost`. Larger values behave more like fcfs, smaller values more like shortest-job-first. With `--enable-uniboost-gamma-ada` this is the starting value. Values &lt;= 0 fall back to fcfs.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Boost decay rate gamma (1/s) for `--schedule-policy uniboost`. Larger values behave more like fcfs, smaller values more like shortest-job-first. With `--enable-uniboost-gamma-ada` this is the starting value. Must be &gt; 0.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`10.0`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: float</td>
     </tr>

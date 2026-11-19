@@ -113,7 +113,7 @@ class Schedule(msgspec.Struct):
     ] = 0.0
     uniboost_gamma: A[
         float,
-        "Boost decay rate gamma (1/s) for --schedule-policy uniboost. Larger values behave more like fcfs, smaller values more like shortest-job-first. With --enable-uniboost-gamma-ada this is the starting value. Values <= 0 fall back to fcfs.",
+        "Boost decay rate gamma (1/s) for --schedule-policy uniboost. Larger values behave more like fcfs, smaller values more like shortest-job-first. With --enable-uniboost-gamma-ada this is the starting value. Must be > 0.",
     ] = 10.0
     enable_uniboost_gamma_ada: A[
         bool,
