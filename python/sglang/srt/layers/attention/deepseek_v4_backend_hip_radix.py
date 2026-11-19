@@ -1916,17 +1916,24 @@ class DeepseekV4HipRadixBackend(
         if self._fp4_c4_rowgroup_rows(metadata, forward_batch) is not None:
             # scored on the row-group kernel, its workspace built with the metadata
             return
-        if (
-            is_cp_active(forward_batch)
-            or getattr(forward_batch, "tbo_children", None)
-            or getattr(forward_batch, "tbo_parent_token_range", None) is not None
-        ):
-            return
-
         from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
             fp4_natural_layout,
             prepare_fp4_prefill_workspace,
         )
+
+        # Only a batch split across CP ranks needs the per-layer path.
+        # TODO: try gfx950.
+        cp_split = (
+            is_cp_active(forward_batch)
+            if fp4_natural_layout()
+            else get_parallel().attn_cp_size != 1
+        )
+        if (
+            cp_split
+            or getattr(forward_batch, "tbo_children", None)
+            or getattr(forward_batch, "tbo_parent_token_range", None) is not None
+        ):
+            return
 
         indexer_metadata = metadata.indexer_metadata
         cu_seq_q = None
