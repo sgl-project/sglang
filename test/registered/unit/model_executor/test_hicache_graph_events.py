@@ -195,19 +195,24 @@ class TestHiCacheGraphEvents(unittest.TestCase):
 
 
 class TestCapturedKdaWaitGate(unittest.TestCase):
-    def _needs_capture(self, *, hicache, linker, captured=True):
+    def _needs_capture(
+        self, *, hicache, linker, captured=True, config=None, legacy_config=None
+    ):
         from sglang.srt.layers.attention.linear.kda_backend import KDAAttnBackend
         from sglang.srt.model_executor.runner_backend import utils
+        from sglang.srt.runtime_context import get_context
 
         backend = SimpleNamespace(
             use_captured_forward_metadata_for_breakable_cuda_graph=captured,
             linear_attn_backend=object.__new__(KDAAttnBackend),
         )
-        memory = SimpleNamespace(
+        with get_context().override_server_args(
             enable_hierarchical_cache=hicache,
             enable_unified_cache_external_linker=linker,
-        )
-        with patch.object(utils, "get_memory", return_value=memory):
+            unified_cache_external_linker_backend="mooncake",
+            unified_cache_external_linker_config=config,
+            hicache_storage_backend_extra_config=legacy_config,
+        ):
             return utils._needs_hicache_event_capture(
                 SimpleNamespace(attn_backend=backend)
             )
@@ -215,6 +220,33 @@ class TestCapturedKdaWaitGate(unittest.TestCase):
     def test_layer_wise_loaders_need_capture(self):
         self.assertTrue(self._needs_capture(hicache=True, linker=False))
         self.assertTrue(self._needs_capture(hicache=False, linker=True))
+
+    def test_linker_load_mode(self):
+        for mode, expected in (("layer_wise", True), ("prefetch", False)):
+            with self.subTest(mode=mode):
+                self.assertEqual(
+                    self._needs_capture(
+                        hicache=False, linker=True, config={"load_mode": mode}
+                    ),
+                    expected,
+                )
+
+    def test_legacy_prefetch_config_needs_no_capture(self):
+        self.assertFalse(
+            self._needs_capture(
+                hicache=False, linker=True, legacy_config='{"load_mode": "prefetch"}'
+            )
+        )
+
+    def test_explicit_config_overrides_legacy_prefetch(self):
+        self.assertTrue(
+            self._needs_capture(
+                hicache=False,
+                linker=True,
+                config={"load_mode": "layer_wise"},
+                legacy_config='{"load_mode": "prefetch"}',
+            )
+        )
 
     def test_no_capture_without_a_layer_wise_loader_or_captured_extend(self):
         self.assertFalse(self._needs_capture(hicache=False, linker=False))
