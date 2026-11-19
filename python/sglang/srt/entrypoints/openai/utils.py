@@ -1,8 +1,8 @@
+import json
 import logging
 from typing import Any, Literal
 
 import torch
-from tokenizers import decoders
 from transformers import PreTrainedTokenizerFast
 
 from sglang.srt.entrypoints.openai.protocol import (
@@ -25,7 +25,7 @@ _BYTE_DECODER: dict[str, int] = {}
 
 # Tokenizer-level cache: once verified, we know whether *all* tokens from a
 # given tokenizer can safely use the byte decoder. Avoids per-token checks.
-_BYTE_LEVEL_TOKENIZERS: set = set()
+_BYTE_LEVEL_VERDICTS: dict[int, bool] = {}
 
 
 def _build_byte_decoder() -> dict[str, int]:
@@ -58,19 +58,19 @@ def _is_byte_level_tokenizer(tokenizer) -> bool:
     probed on a few sampled vocabulary pieces.
     """
     tid = id(tokenizer)
-    if tid in _BYTE_LEVEL_TOKENIZERS:
-        return True
+    if tid in _BYTE_LEVEL_VERDICTS:
+        return _BYTE_LEVEL_VERDICTS[tid]
 
     is_bl = getattr(tokenizer, "is_byte_level", None)
     if isinstance(is_bl, bool):
-        if is_bl:
-            _BYTE_LEVEL_TOKENIZERS.add(tid)
+        _BYTE_LEVEL_VERDICTS[tid] = is_bl
         return is_bl
 
     if isinstance(tokenizer, PreTrainedTokenizerFast):
-        is_bl = isinstance(tokenizer.backend_tokenizer.decoder, decoders.ByteLevel)
-        if is_bl:
-            _BYTE_LEVEL_TOKENIZERS.add(tid)
+        # fastokens backs the tokenizer with a shim whose decoder carries no type
+        decoder = json.loads(tokenizer.backend_tokenizer.to_str()).get("decoder") or {}
+        is_bl = decoder.get("type") == "ByteLevel"
+        _BYTE_LEVEL_VERDICTS[tid] = is_bl
         return is_bl
 
     # Slow path: probe with a known é token.
@@ -90,9 +90,10 @@ def _is_byte_level_tokenizer(tokenizer) -> bool:
             # If any char in the piece is NOT in the byte decoder table,
             # this tokenizer does NOT use byte-level encoding.
             if any(ch not in _BYTE_DECODER for ch in piece):
+                _BYTE_LEVEL_VERDICTS[tid] = False
                 return False
         # All sampled tokens are byte-decodable → likely byte-level BPE.
-        _BYTE_LEVEL_TOKENIZERS.add(tid)
+        _BYTE_LEVEL_VERDICTS[tid] = True
         return True
     except Exception:
         return False
