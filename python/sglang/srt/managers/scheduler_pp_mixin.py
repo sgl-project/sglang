@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from collections import defaultdict, deque
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -16,6 +17,7 @@ from sglang.srt.distributed.parallel_state import P2PWork
 from sglang.srt.environ import InvariantCheckLevel, envs
 from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.managers.io_struct import FlushCacheReqInput
 from sglang.srt.managers.mm_utils import strip_mm_features_for_pp_relay
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.managers.req_types import FINISH_ABORT
@@ -140,6 +142,7 @@ class SchedulerPPMixin:
     _pp_checked_allocator: Optional[ChainAllocator] = None
     _pp_capacity_digest: Optional[bytes] = None
     _pp_release_reqs_awaiting_verdict: Tuple[ReleaseMemoryOccupationReqInput, ...] = ()
+    _pp_flush_probe = False
 
     @DynamicGradMode()
     def event_loop_pp(self: Scheduler):
@@ -252,6 +255,7 @@ class SchedulerPPMixin:
                     if cur_batch:
                         self._pp_send_proxy_to_next_stage(result)
                 self._pp_answer_release_requests()
+                self._pp_finish_flush()
 
                 self.pp_outputs = next_pp_outputs
                 if cur_batch:
@@ -411,6 +415,7 @@ class SchedulerPPMixin:
                     if cur_batch:
                         self._pp_send_proxy_to_next_stage(result)
                 self._pp_answer_release_requests()
+                self._pp_finish_flush()
 
                 self.pp_outputs = next_pp_outputs
                 release_rids = next_release_rids
@@ -614,6 +619,7 @@ class SchedulerPPMixin:
                     if cur_batch and not cur_batch.forward_mode.is_prebuilt():
                         self._pp_send_proxy_to_next_stage(result)
                 self._pp_answer_release_requests()
+                self._pp_finish_flush()
 
                 self.pp_outputs = next_pp_outputs
                 release_rids = next_release_rids
@@ -644,7 +650,64 @@ class SchedulerPPMixin:
         """Hold a pause, and the inputs after it, until no micro-batch is
         unprocessed."""
         has_unprocessed_mb = any(mb is not None for mb in self.mbs)
-        return self.ingest_requests(stop_at_pause=has_unprocessed_mb)
+        received = self.ingest_requests(stop_at_pause=has_unprocessed_mb)
+        return self._pp_prepare_flush(received)
+
+    def _pp_flush_idle(self: Scheduler) -> bool:
+        return self.is_fully_idle(ignore_waiting=self.pause_state.paused)
+
+    def _pp_flush_vote(self: Scheduler, values, *, across_stages=False):
+        # A DP replica receives its own probe on the work channel. Only the
+        # ranks that share its queue may enter these conditional collectives.
+        groups = (
+            [self.attn_tp_group, self.attn_cp_group]
+            if get_parallel().attn_dp_enabled
+            else [self.tp_group]
+        )
+        if across_stages:
+            groups.append(self.pp_group)
+        votes = torch.tensor(values, dtype=torch.int, device="cpu")
+        for group in groups:
+            if group.world_size > 1:
+                torch.distributed.all_reduce(
+                    votes, op=torch.distributed.ReduceOp.MIN, group=group.cpu_group
+                )
+        return votes.tolist()
+
+    def _pp_vote_on_flush_probe(self: Scheduler, deadline: float):
+        parallel = get_parallel()
+        leader = parallel.attn_tp_rank == 0 and parallel.attn_cp_rank == 0
+        return self._pp_flush_vote(
+            [self._pp_flush_idle(), not leader or time.monotonic() < deadline]
+        )
+
+    def _pp_prepare_flush(self: Scheduler, received: List) -> List:
+        if self.pp_group.is_first_rank:
+            self._pp_flush_probe = self.flush_wrapper.prepare_pp_probe(
+                self._pp_vote_on_flush_probe
+            )
+            if self._pp_flush_probe:
+                return [*received, FlushCacheReqInput(pp_probe=True)]
+        else:
+            # The raw relay includes requests held behind a pause. Every stage
+            # must vote on the same iteration, even if its dispatcher is held.
+            self._pp_flush_probe = any(
+                isinstance(req, FlushCacheReqInput) and req.pp_probe for req in received
+            )
+        return received
+
+    def _pp_finish_flush(self: Scheduler) -> None:
+        if not self._pp_flush_probe:
+            return
+        self._pp_flush_probe = False
+        # All request, tensor and PD sends for this turn have been issued. A
+        # busy PP0 never waits here while later stages still need its sends.
+        (idle,) = self._pp_flush_vote([self._pp_flush_idle()], across_stages=True)
+        if idle:
+            success = self._flush_idle_cache()
+            (idle,) = self._pp_flush_vote([success], across_stages=True)
+        if self.pp_group.is_first_rank:
+            self.flush_wrapper.finish_pp_probe(bool(idle))
 
     def _pp_apply_war_barrier(self: Scheduler) -> None:
         """Order later schedule-stream writes after the launched forward's reads.

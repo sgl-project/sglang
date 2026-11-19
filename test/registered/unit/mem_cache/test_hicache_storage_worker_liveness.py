@@ -6,8 +6,11 @@ import tempfile
 import threading
 import time
 import unittest
+from array import array
 from contextlib import contextmanager, nullcontext
 from datetime import timedelta
+from functools import partial
+from pathlib import Path
 from queue import Queue
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -25,6 +28,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     PrefetchOperation as HybridPrefetchOperation,
 )
+from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -96,6 +100,188 @@ def _same_on_both_ranks(value):
     torch.distributed.all_gather_object(gathered, value)
     assert gathered[0] == gathered[1], gathered
     return gathered[0]
+
+
+@contextmanager
+def _pp_file_cache(rank, directory):
+    from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+    from sglang.srt.runtime_context import get_parallel
+    from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+    from sglang.test.kits.unified_radix_cache import fixtures
+    from sglang.test.kits.unified_radix_cache.config import CacheConfig
+
+    with patch.object(fixtures, "get_device", return_value="cpu"):
+        cache, _, _ = fixtures.build_fixture(
+            CacheConfig(page_size=PAGE, num_layers=1, kv_size=32),
+            tree_core_backend="python",
+        )
+    params = cache.cache_init_params
+    params.pp_cache_group = cache.pp_group = torch.distributed.group.WORLD
+    params.pp_size = cache.pp_size = 2
+    params.pp_rank = cache.pp_rank = rank
+    args = ServerArgs(
+        model_path="dummy",
+        page_size=PAGE,
+        enable_hierarchical_cache=True,
+        hicache_ratio=2,
+        hicache_io_backend="direct",
+        hicache_mem_layout="page_first_direct",
+        hicache_storage_backend="file",
+        hicache_host_memory_mode="buffer_only",
+        hicache_storage_prefetch_policy="wait_complete",
+        file_storage_path=directory,
+        hicache_storage_backend_extra_config='{"prefetch_threshold": 2, "max_size": 0, "min_free_space": 0}',
+    )
+    set_global_server_args_for_scheduler(args)
+    with get_parallel().override(
+        pp_rank=rank, pp_size=2, tp_rank=0, tp_size=1, attn_cp_rank=0, attn_tp_rank=0
+    ):
+        # The Gloo ranks read disk pages into ordinary CPU memory.
+        with patch(
+            "sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler.get_mha_host_pool_cls",
+            return_value=partial(MHATokenToKVPoolHost, pin_memory=False),
+        ):
+            cache.init_hicache(args, params)
+        try:
+            yield cache
+        finally:
+            cache.cache_controller.detach_storage_backend()
+            fixtures.drop_hicache_atexit_pin(cache)
+            cache.release_host_resources()
+
+
+def _check_file_ticket(cache, key, pages):
+    controller = cache.cache_controller
+    rid = "immediately-after-flush"
+    deadline = time.monotonic() + 10
+    while not controller.is_pp_prefetch_ready(rid):
+        assert time.monotonic() < deadline, f"PP{cache.pp_rank} missed the next ticket"
+        time.sleep(0.01)
+    operation = controller.pp_prefetch_states[rid].operation
+    assert operation.storage_hit_count == operation.completed_tokens == len(key)
+    for offset, page in zip(operation.host_indices[::PAGE], pages, strict=True):
+        assert torch.equal(
+            controller.storage_host_pool.get_data_page(int(offset)), page
+        )
+    assert controller.release_pp_prefetch(rid)
+
+
+def _two_rank_flush_with_file_storage(rank, rendezvous):
+    from sglang.srt.managers.io_struct import FlushCacheReqInput
+    from sglang.srt.managers.scheduler_components.flush_wrapper import (
+        SchedulerFlushWrapper,
+    )
+    from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+    from sglang.srt.mem_cache.base_prefix_cache import EvictParams, InsertParams
+    from sglang.srt.mem_cache.utils import get_storage_hash_str
+    from sglang.test.kits.unified_radix_cache.fixtures import match_prefix
+
+    dist = torch.distributed
+    _init_two_ranks(rank, rendezvous)
+    try:
+        with _pp_file_cache(rank, str(Path(rendezvous).parent)) as cache:
+            controller = cache.cache_controller
+            key = RadixKey(array("q", range(2 * PAGE)))
+            pages = [
+                torch.full_like(
+                    controller.storage_host_pool.get_data_page(0), 10 * rank + i
+                )
+                for i in (1, 2)
+            ]
+            for h, page in zip(
+                get_storage_hash_str(key, page_size=PAGE), pages, strict=True
+            ):
+                assert controller.storage_backend.set(h, page)
+
+            stage = SchedulerPPMixin()
+            stage.pp_group = SimpleNamespace(
+                is_first_rank=rank == 0, cpu_group=dist.group.WORLD, world_size=2
+            )
+            stage.tp_group = SimpleNamespace(world_size=1)
+            stage.pause_state = SimpleNamespace(paused=False)
+            stage.is_fully_idle = lambda **_: not cache.transfers_in_flight()
+            replies = []
+            resets = 0
+
+            def flush():
+                nonlocal resets
+                assert not cache.transfers_in_flight()
+                # Let PP0 issue its next lookup before the follower starts resetting.
+                marker = torch.ones(1)
+                if rank == 1:
+                    dist.recv(marker, src=0)
+                cache.reset()
+                if rank == 0:
+                    assert controller.submit_prefetch(
+                        CacheRequestHandle("immediately-after-flush", 0),
+                        key,
+                        None,
+                        None,
+                        [],
+                        None,
+                    ).decision
+                    dist.send(marker, dst=1)
+                resets += 1
+                return True
+
+            stage._flush_idle_cache = flush
+            stage.flush_wrapper = SchedulerFlushWrapper(
+                flush_cache=flush,
+                is_fully_idle=stage.is_fully_idle,
+                pp_rank=rank,
+                send_output=lambda result, _: replies.append(result.success),
+            )
+
+            def tick(req=None):
+                # Ingestion precedes the request relay. A stage acts on the
+                # probe after its sends for the iteration have been issued.
+                if rank == 0:
+                    if req is not None:
+                        assert stage.flush_wrapper.handle(req) is None
+                    received = [
+                        stage._pp_prepare_flush([req] if req is not None else [])
+                    ]
+                    dist.broadcast_object_list(received, src=0)
+                else:
+                    received = [None]
+                    dist.broadcast_object_list(received, src=0)
+                    for message in received[0]:
+                        if isinstance(message, FlushCacheReqInput):
+                            assert stage.flush_wrapper.handle(message) is None
+                    stage._pp_prepare_flush(received[0])
+                stage._pp_finish_flush()
+
+            # Each side can be the stage whose queued write prevents a flush.
+            for attempt, (timeout, busy_rank) in enumerate(
+                ((0, 0), (0, 1), (30, 0), (30, 1))
+            ):
+                if rank == busy_rank:
+                    tokens = array("q", range(8, 8 + 2 * PAGE))
+                    cache.insert(
+                        InsertParams(
+                            key=RadixKey(tokens),
+                            value=cache.token_to_kv_pool_allocator.alloc(len(tokens)),
+                        )
+                    )
+                    node = match_prefix(cache, tokens).last_device_node
+                    cache.buffer_pipeline.enqueue_backup_intent(node)
+                    assert not cache.buffer_pipeline.is_idle()
+                tick(FlushCacheReqInput(timeout_s=timeout))
+                assert resets == attempt
+                assert replies == ([False] if rank == 0 and timeout == 0 else [])
+                if rank == busy_rank:
+                    cache.evict(EvictParams(num_tokens=len(tokens)))
+                    cache.buffer_pipeline.flush_pending_writes()
+                    assert cache.buffer_pipeline.is_idle()
+                replies.clear()
+                tick(FlushCacheReqInput(timeout_s=0) if timeout == 0 else None)
+                assert resets == attempt + 1
+                assert replies == ([True] if rank == 0 else [])
+                _check_file_ticket(cache, key, pages)
+                replies.clear()
+            dist.barrier()  # Both ranks retire their last ticket before detach.
+    finally:
+        dist.destroy_process_group()
 
 
 def _hybrid_operation(rid, pool_transfers):
@@ -443,6 +629,9 @@ class TestStorageWorkersAcrossRanks(unittest.TestCase):
 
     def test_backend_failures_keep_the_ack_sequence(self):
         self._spawn(_two_rank_backend_failures_keep_the_ack_sequence)
+
+    def test_pp_flush_waits_for_every_stage_and_preserves_file_tickets(self):
+        self._spawn(_two_rank_flush_with_file_storage)
 
     def test_stop_answers_the_backlog_without_backend_calls(self):
         self._spawn(_two_rank_stop_answers_backlog_without_backend)

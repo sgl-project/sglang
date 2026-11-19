@@ -24,6 +24,7 @@ from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
+    FlushCacheReqInput,
     MMInputsProcessError,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -343,9 +344,8 @@ class SchedulerRequestReceiver:
     def _split_work_and_control_reqs(self, recv_reqs: List):
         # An AbortReq arrives behind its request on this DP group's own socket;
         # the work channel keeps that order, the broadcast from global rank 0 does not.
-        work_reqs = [
-            req
-            for req in recv_reqs
+        work_reqs, control_reqs = [], []
+        for req in recv_reqs:
             if isinstance(
                 req,
                 (
@@ -355,22 +355,10 @@ class SchedulerRequestReceiver:
                     BatchTokenizedEmbeddingReqInput,
                     AbortReq,
                 ),
-            )
-        ]
-        control_reqs = [
-            req
-            for req in recv_reqs
-            if not isinstance(
-                req,
-                (
-                    TokenizedGenerateReqInput,
-                    TokenizedEmbeddingReqInput,
-                    BatchTokenizedGenerateReqInput,
-                    BatchTokenizedEmbeddingReqInput,
-                    AbortReq,
-                ),
-            )
-        ]
+            ) or (isinstance(req, FlushCacheReqInput) and req.pp_probe):
+                work_reqs.append(req)
+            else:
+                control_reqs.append(req)
         return work_reqs, control_reqs
 
 

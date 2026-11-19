@@ -2050,6 +2050,8 @@ class ClearHiCacheReqOutput(BaseReq, kw_only=True):
 
 class FlushCacheReqInput(BaseReq, kw_only=True):
     timeout_s: Optional[float] = None
+    # Internal PP relay: PP0 asks the stages of this DP replica to vote.
+    pp_probe: bool = False
 
 
 class FlushCacheReqOutput(BaseReq, kw_only=True):
