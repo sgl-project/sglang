@@ -16,7 +16,6 @@
 from __future__ import annotations
 
 import builtins
-import importlib
 import logging
 import os
 import platform
@@ -400,14 +399,13 @@ def xpu_has_xmx_support():
 
 
 @lru_cache(maxsize=1)
-def is_flashinfer_available():
-    """
-    Check whether flashinfer is available.
-    As of Oct. 6, 2024, it is only available on NVIDIA GPUs.
-    """
-    if not get_bool_env_var("SGLANG_IS_FLASHINFER_AVAILABLE", default="true"):
-        return False
-    return importlib.util.find_spec("flashinfer") is not None and is_cuda()
+def is_flashinfer_available() -> bool:
+    """Check whether FlashInfer is enabled, supported, and installed."""
+    return (
+        get_bool_env_var("SGLANG_IS_FLASHINFER_AVAILABLE", default="true")
+        and current_platform.capabilities.supports_flashinfer
+        and find_spec("flashinfer") is not None
+    )
 
 
 def is_nvidia_cublas_version_ge_12_9():

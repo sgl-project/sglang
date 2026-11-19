@@ -20,7 +20,7 @@ from sglang.srt.platforms.device_mixin import (
     DeviceMixin,
     PlatformEnum,
 )
-from sglang.srt.platforms.interface import SRTPlatform
+from sglang.srt.platforms.interface import PlatformCapabilities, SRTPlatform
 from sglang.srt.platforms.mlu import MluSRTPlatform
 from sglang.srt.platforms.mps import MpsSRTPlatform
 from sglang.srt.platforms.npu import NPUSRTPlatform
@@ -205,6 +205,45 @@ class TestSRTPlatform(CustomTestCase):
                 return True
 
         self.assertTrue(OutOfTreePlatform().support_mamba_cache_extra_buffer())
+
+
+class TestFlashInferAvailability(CustomTestCase):
+    def test_platform_capability_package_and_environment(self):
+        from sglang.srt.runtime_context import get_platform
+        from sglang.srt.utils import device
+
+        class OutOfTreePlatform(SRTPlatform):
+            _enum = PlatformEnum.OOT
+
+        class FlashInferPlatform(OutOfTreePlatform):
+            capabilities = PlatformCapabilities(supports_flashinfer=True)
+
+        cases = (
+            (CudaSRTPlatform(), True, True, True),
+            (OutOfTreePlatform(), True, True, False),
+            (FlashInferPlatform(), True, True, True),
+            (FlashInferPlatform(), False, True, False),
+            (FlashInferPlatform(), True, False, False),
+        )
+        self.addCleanup(device.is_flashinfer_available.cache_clear)
+        for platform, installed, enabled, expected in cases:
+            with (
+                self.subTest(
+                    platform=type(platform).__name__,
+                    installed=installed,
+                    enabled=enabled,
+                ),
+                patch.object(device, "current_platform", platform),
+                patch.object(
+                    device, "find_spec", return_value=object() if installed else None
+                ),
+                patch.dict(
+                    "os.environ", SGLANG_IS_FLASHINFER_AVAILABLE=str(int(enabled))
+                ),
+            ):
+                device.is_flashinfer_available.cache_clear()
+                self.assertEqual(device.is_flashinfer_available(), expected)
+                self.assertEqual(get_platform().has_flashinfer, expected)
 
 
 class TestCudaDeviceMixin(CustomTestCase):
