@@ -18,6 +18,7 @@ It supporst page size = 1.
 
 # Adapted from
 # https://github.com/ModelTC/lightllm/blob/f2a54f0912293f683bf1d1695fd12c4098a5bf82/lightllm/models/llama/triton_kernel/context_flashattention_nopad.py#L1
+import torch
 import triton
 import triton.language as tl
 
@@ -51,7 +52,11 @@ def _fwd_kernel(
     BLOCK_N: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     Lk: tl.constexpr,
+    SPLIT_OUTPUT: tl.constexpr = False,
 ):
+    if SPLIT_OUTPUT:
+        tl.static_assert(Lk == 72 and BLOCK_DMODEL == 128 and not IS_CAUSAL)
+        tl.static_assert(kv_group_num == 1)
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
     start_m = tl.program_id(2)
@@ -73,7 +78,17 @@ def _fwd_kernel(
         + offs_d[None, :]
     )
     off_k = offs_n[None, :] * stride_kbs + cur_kv_head * stride_kh + offs_d[:, None]
-    off_v = offs_n[:, None] * stride_vbs + cur_kv_head * stride_vh + offs_d[None, :]
+    if not SPLIT_OUTPUT:
+        off_v = offs_n[:, None] * stride_vbs + cur_kv_head * stride_vh + offs_d[None, :]
+    else:
+        offs_v_lo = tl.arange(0, 64)
+        offs_v_hi = 64 + tl.arange(0, 16)
+        off_v_lo = (
+            offs_n[:, None] * stride_vbs + cur_kv_head * stride_vh + offs_v_lo[None, :]
+        )
+        off_v_hi = (
+            offs_n[:, None] * stride_vbs + cur_kv_head * stride_vh + offs_v_hi[None, :]
+        )
 
     mask_d = offs_d < Lk
 
@@ -84,12 +99,20 @@ def _fwd_kernel(
     )
 
     k_ptrs = K + off_k
-    v_ptrs = V + off_v
+    if not SPLIT_OUTPUT:
+        v_ptrs = V + off_v
+    else:
+        v_lo_ptrs = V + off_v_lo
+        v_hi_ptrs = V + off_v_hi
 
     # initialize pointer to m and l
     m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
-    acc = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
+    if not SPLIT_OUTPUT:
+        acc = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
+    else:
+        acc_lo = tl.zeros([BLOCK_M, 64], dtype=tl.float32)
+        acc_hi = tl.zeros([BLOCK_M, 16], dtype=tl.float32)
 
     block_mask = tl.where(block_start_loc < cur_batch_seq_len, 1, 0)
 
@@ -139,29 +162,66 @@ def _fwd_kernel(
         p = p * p_scale[:, None]
         # scale acc
         acc_scale = l_i / l_i_new * alpha
-        acc = acc * acc_scale[:, None]
-        # update acc
-        v = tl.load(
-            v_ptrs + (cur_batch_in_all_start_index + start_n) * stride_vbs,
-            mask=((start_n + offs_n[:, None]) < cur_batch_seq_len) & (mask_d[None, :]),
-            other=0.0,
-        )
+        if not SPLIT_OUTPUT:
+            acc = acc * acc_scale[:, None]
+            # update acc
+            v = tl.load(
+                v_ptrs + (cur_batch_in_all_start_index + start_n) * stride_vbs,
+                mask=((start_n + offs_n[:, None]) < cur_batch_seq_len)
+                & (mask_d[None, :]),
+                other=0.0,
+            )
 
-        p = p.to(v.dtype)
-        acc += tl.dot(p, v)
+            p = p.to(v.dtype)
+            acc += tl.dot(p, v)
+        else:
+            acc_lo = acc_lo * acc_scale[:, None]
+            acc_hi = acc_hi * acc_scale[:, None]
+            v_lo = tl.load(
+                v_lo_ptrs + (cur_batch_in_all_start_index + start_n) * stride_vbs,
+                mask=((start_n + offs_n[:, None]) < cur_batch_seq_len)
+                & (offs_v_lo[None, :] < Lk),
+                other=0.0,
+            )
+            v_hi = tl.load(
+                v_hi_ptrs + (cur_batch_in_all_start_index + start_n) * stride_vbs,
+                mask=((start_n + offs_n[:, None]) < cur_batch_seq_len)
+                & (offs_v_hi[None, :] < Lk),
+                other=0.0,
+            )
+            p = p.to(v_lo.dtype)
+            acc_lo += tl.dot(p, v_lo)
+            acc_hi += tl.dot(p, v_hi)
         # update m_i and l_i
         l_i = l_i_new
         m_i = m_i_new
-    # initialize pointers to output
-    off_o = (
-        (cur_batch_in_all_start_index + offs_m[:, None]) * stride_obs
-        + cur_head * stride_oh
-        + offs_d[None, :]
-    )
-    out_ptrs = Out + off_o
-    tl.store(
-        out_ptrs, acc, mask=(offs_m[:, None] < cur_batch_seq_len) & (mask_d[None, :])
-    )
+    if not SPLIT_OUTPUT:
+        # initialize pointers to output
+        off_o = (
+            (cur_batch_in_all_start_index + offs_m[:, None]) * stride_obs
+            + cur_head * stride_oh
+            + offs_d[None, :]
+        )
+        out_ptrs = Out + off_o
+        tl.store(
+            out_ptrs,
+            acc,
+            mask=(offs_m[:, None] < cur_batch_seq_len) & (mask_d[None, :]),
+        )
+    else:
+        off_o = (
+            cur_batch_in_all_start_index + offs_m[:, None]
+        ) * stride_obs + cur_head * stride_oh
+        tl.store(
+            Out + off_o + offs_v_lo[None, :],
+            acc_lo,
+            mask=(offs_m[:, None] < cur_batch_seq_len) & (offs_v_lo[None, :] < Lk),
+        )
+        tl.store(
+            Out + off_o + offs_v_hi[None, :],
+            acc_hi,
+            mask=(offs_m[:, None] < cur_batch_seq_len) & (offs_v_hi[None, :] < Lk),
+        )
 
 
 def context_attention_fwd(
@@ -174,8 +234,9 @@ def context_attention_fwd(
     out: [b * s, head, head_dim]
     sm_scale: softmax scale, defaults to 1/sqrt(head_dim)
     """
+    arch = current_arch() if _is_cuda or _is_hip else None
     # props.major is the gfx major on ROCm, so gfx9+ takes the larger block too.
-    if (_is_cuda or _is_hip) and current_arch().props.major > 8:
+    if arch is not None and arch.props.major > 8:
         BLOCK = 128
     else:
         BLOCK = 64
@@ -186,6 +247,19 @@ def context_attention_fwd(
         sm_scale = 1.0 / (Lq**0.5)
     batch, head = b_seq_len.shape[0], q.shape[1]
     kv_group_num = q.shape[1] // k.shape[1]
+
+    # Head72 otherwise pads the value/output path to 128 columns. On SM120,
+    # splitting it into 64+16 reduces accumulator spills while preserving the
+    # original QK/softmax reduction and key-block traversal.
+    split_output = (
+        _is_cuda
+        and arch.cuda.is_sm(12, 0)
+        and not is_causal
+        and Lq == Lk == Lv == 72
+        and q.shape[1] == k.shape[1] == v.shape[1]
+        and q.dtype == k.dtype == v.dtype == o.dtype == torch.bfloat16
+        and q.stride(-1) == k.stride(-1) == v.stride(-1) == o.stride(-1) == 1
+    )
 
     grid = (batch, head, triton.cdiv(max_input_len, BLOCK))
     num_warps = 4 if Lk <= 64 else 8
@@ -214,4 +288,5 @@ def context_attention_fwd(
         num_warps=num_warps,
         num_stages=1,
         Lk=Lk,
+        SPLIT_OUTPUT=split_output,
     )
