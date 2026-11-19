@@ -1078,6 +1078,25 @@ class TestMegakernelBindingDsa(CustomTestCase):
                     with self.assertRaisesRegex(RuntimeError, name):
                         binding.assert_live()
 
+    def test_each_draft_step_backend_seals_its_own_dsa_buffers(self):
+        """An EAGLE draft's per-step DSA backends each own a KV counter: a later step's
+        view is not a reallocation, and a counter regrown after its first read fails
+        assert_live whichever backend is running."""
+        pool, workspace = DsaPool(), torch.zeros(16, dtype=torch.uint8)
+        steps = [dsa_backend(pool) for _ in range(3)]
+        for backend in steps:
+            # the workspace is one named runtime buffer; the counter is per backend
+            backend.workspace_buffer = workspace
+        binding = mb.MegakernelBinding(model=torch.nn.Module())
+        for backend in steps + steps:
+            with patch(BACKEND, return_value=backend):
+                binding.forward_view()
+        with patch(BACKEND, return_value=steps[0]):
+            binding.assert_live()
+            steps[2]._multi_ctas_kv_counter_buffer = torch.zeros(16, dtype=torch.uint8)
+            with self.assertRaisesRegex(RuntimeError, r"dsa_kv_counter\[2\]"):
+                binding.assert_live()
+
 
 if __name__ == "__main__":
     unittest.main()

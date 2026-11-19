@@ -472,6 +472,7 @@ class MegakernelBinding:
         self._hybrid_sources: Optional[_HybridSources] = None
         self._verify_aux_width = 0
         self._capture_aux_buffers: dict[str, torch.Tensor] = {}
+        self._dsa_backends: list[AttentionBackend] = []
 
     def preparation_view(self, model_runner: ModelRunner) -> PreparationView:
         """The post-pool, pre-capture resources for an optional build hook."""
@@ -505,11 +506,7 @@ class MegakernelBinding:
         )
         dsa = None if hybrid_family else view.dsa
         if dsa is not None:
-            for name, buffer in _dsa_buffers(dsa).items():
-                if buffer is not None:
-                    self._seal(
-                        name, buffer, lambda name=name: self._current_dsa_buffer(name)
-                    )
+            self._seal_dsa_buffers(backend, dsa)
         return view
 
     def prefill_view(self) -> ForwardView:
@@ -1067,11 +1064,22 @@ class MegakernelBinding:
 
         return get_attn_backend().token_to_kv_pool
 
-    def _current_dsa_buffer(self, name: str) -> Optional[torch.Tensor]:
-        from sglang.srt.model_executor.forward_context import get_attn_backend
-
-        dsa = _dsa_view(get_attn_backend())
-        return None if dsa is None else _dsa_buffers(dsa)[name]
+    def _seal_dsa_buffers(self, backend: AttentionBackend, dsa: DsaView) -> None:
+        # An EAGLE draft runs one DSA backend per step and one for draft extend,
+        # each owning its KV counter; each backend's buffers are sealed by its index.
+        index = next(
+            (i for i, known in enumerate(self._dsa_backends) if known is backend), None
+        )
+        if index is None:
+            index = len(self._dsa_backends)
+            self._dsa_backends.append(backend)
+        for name, buffer in _dsa_buffers(dsa).items():
+            if buffer is not None:
+                self._seal(
+                    f"{name}[{index}]",
+                    buffer,
+                    lambda name=name: _dsa_buffers(dsa)[name],
+                )
 
     def _history(self) -> Optional[torch.Tensor]:
         # only models with Engram layers have a hasher
@@ -1087,7 +1095,7 @@ def _dsa_view(backend: Any) -> Optional[DsaView]:
 
 
 def _dsa_buffers(dsa: DsaView) -> dict[str, Optional[torch.Tensor]]:
-    """The DSA backend's buffers a captured step reads by address, sealed by name."""
+    """The DSA backend's buffers a captured step reads by address, sealed per backend."""
     return {
         "dsa_workspace": dsa.workspace_buffer,
         "dsa_kv_counter": dsa.multi_ctas_kv_counter_buffer,
