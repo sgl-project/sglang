@@ -663,11 +663,15 @@ def launch_pd_mix_node(model_config):
 
     from sglang.test.ascend.test_ascend_utils import (
         get_hicache_storage_backend,
+        resolve_local_ip,
         set_mooncake_master_env,
     )
 
     if get_hicache_storage_backend(other_args) == "mooncake":
         set_mooncake_master_env(master_node_ip)
+        # Each node registers its own address with the store instead of the
+        # shared "localhost" default, which other nodes cannot reach.
+        os.environ.setdefault("MOONCAKE_LOCAL_HOSTNAME", resolve_local_ip())
 
     host_ip = get_host_ip()
     logger.info(f"Starting node, {host_ip=} {other_args=}")
@@ -877,11 +881,15 @@ def launch_pd_separation_node(model_config):
 
     from sglang.test.ascend.test_ascend_utils import (
         get_hicache_storage_backend,
+        resolve_local_ip,
         set_mooncake_master_env,
     )
 
     if get_hicache_storage_backend(service_args) == "mooncake":
         set_mooncake_master_env(master_prefill_ip)
+        # Each node registers its own address with the store instead of the
+        # shared "localhost" default, which other nodes cannot reach.
+        os.environ.setdefault("MOONCAKE_LOCAL_HOSTNAME", resolve_local_ip())
 
     try:
         process = popen_launch_server(

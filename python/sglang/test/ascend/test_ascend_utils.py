@@ -11,6 +11,7 @@ import logging
 import os
 import pathlib
 import random
+import socket
 import subprocess
 import sys
 import threading
@@ -1019,6 +1020,40 @@ def get_hicache_storage_backend(other_args):
     return None
 
 
+def _wait_for_tcp_port(process, port, timeout=30, poll_interval=0.5):
+    """Wait until ``port`` on this node accepts connections.
+
+    A Mooncake store client that connects before the master is listening fails
+    its setup, and the store does not retry, so every launch of the master has
+    to be followed by this check.
+
+    Args:
+        process (subprocess.Popen): The process expected to open the port.
+        port (int): Port the process listens on.
+        timeout (float): Seconds to wait before giving up.
+        poll_interval (float): Seconds between connection attempts.
+
+    Raises:
+        RuntimeError: If the process exits or the port never opens.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise RuntimeError(
+                f"Process {process.pid} exited with code {process.returncode} "
+                f"before opening port {port}"
+            )
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=1):
+                logger.info(f"Port {port} is ready")
+                return
+        except OSError:
+            time.sleep(poll_interval)
+
+    kill_process_tree(process.pid)
+    raise RuntimeError(f"Port {port} was not opened within {timeout}s")
+
+
 def start_mooncake_master(
     master_port=MOONCAKE_MASTER_PORT,
     eviction_high_watermark_ratio=0.95,
@@ -1050,6 +1085,7 @@ def start_mooncake_master(
     except Exception as e:
         raise RuntimeError(f"Failed to start mooncake master: {e}")
 
+    _wait_for_tcp_port(process, master_port)
     return process
 
 

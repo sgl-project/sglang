@@ -34,6 +34,7 @@ MOONCAKE_GLOBAL_SEGMENT_SIZE = "64gb"
 
 # Mooncake + TENT + MemFabric, only used when the Mooncake package is present.
 MOONCAKE_ENVS = {
+    "MOONCAKE_PROTOCOL": "ascend",
     "MC_USE_TENT": "1",
     "MF_PROTOCOL": "device_sdma",
     "MF_TRANSFER_TIMEOUT": "10000",

@@ -8,6 +8,11 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
     assert_metrics,
     run_bench_serving,
 )
+from sglang.test.ascend.test_ascend_utils import (
+    append_ld_library_path,
+    resolve_local_ip,
+    write_memfabric_tent_conf,
+)
 from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
@@ -15,6 +20,17 @@ register_npu_ci(
     suite="",
     nightly=True,
 )
+
+# Mooncake L3 store client config: the store runs on the MemFabric TENT
+# transport over the NPU device path, as in the standalone Mooncake deployment.
+MOONCAKE_ENVS = {
+    "MOONCAKE_PROTOCOL": "ascend",
+    "MOONCAKE_GLOBAL_SEGMENT_SIZE": "16gb",
+    "MC_USE_TENT": "1",
+    "MF_PROTOCOL": "device_sdma",
+    "MF_STORE_PROTOCOL": "device_sdma",
+    "MF_TRANSFER_TIMEOUT": "10000",
+}
 
 DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_COMMON_ENVS = {
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
@@ -155,6 +171,8 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
     1.5,
     "--hicache-write-policy",
     "write_through",
+    "--hicache-storage-prefetch-policy",
+    "wait_complete",
     "--hicache-storage-backend-extra-config",
     HICACHE_EXTRA_CONFIG,
     "--enable-cache-report",
@@ -251,10 +269,23 @@ class TestNPUDeepSeekV4Flash0731W8A8PDSEPGPQAHigh(
 
     @classmethod
     def setUpClass(cls):
+        # Only the prefill node opens the Mooncake L3 store; the decode node has
+        # no HiCache storage backend, so it keeps its own env untouched.
+        prefill_envs = dict(DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ENVS)
+        prefill_envs.update(MOONCAKE_ENVS)
+        # Per-node values: the TENT config, the registered store hostname and
+        # the MemFabric library path must describe the pod this node runs on.
+        prefill_envs["MC_TENT_CONF"] = write_memfabric_tent_conf()
+        prefill_envs["MOONCAKE_LOCAL_HOSTNAME"] = resolve_local_ip()
+        prefill_envs["LD_LIBRARY_PATH"] = append_ld_library_path(
+            ("memfabric_hybrid", "lib"), ("mooncake", None)
+        )
         cls.model_config = {
             **DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_MODEL_CONFIG,
             "prefill_args": list(DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS),
             "decode_args": list(DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_DECODE_ARGS),
+            "prefill_envs": prefill_envs,
+            "decode_envs": dict(DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_DECODE_ENVS),
         }
         super().setUpClass()
 
