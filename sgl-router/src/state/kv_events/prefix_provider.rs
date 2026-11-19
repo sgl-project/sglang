@@ -19,9 +19,9 @@ pub struct PrefixLookupResult {
     /// The query's block hashes when the local tree answered, so routing can
     /// record the placement without rehashing.
     pub block_hashes: Option<Arc<[i64]>>,
-    /// The query's media chain (see `RadixTreePrefixProvider::media_chain`)
-    /// when it is a media chat under media affinity, so routing can record
-    /// where the chat went.
+    /// The query's media chain (see `RadixTreePrefixProvider::media_chain`),
+    /// from its conversation key on, when it is a media chat under media
+    /// affinity, so routing can record where the chat went.
     pub media_hashes: Option<Arc<[i64]>>,
 }
 
@@ -100,14 +100,23 @@ impl RadixTreePrefixProvider {
                 merge_depth(&mut depth_by_url, url.to_string(), depth);
             }
         }
+        // Taken before the media tier: only a worker that won through its pending
+        // stake is a follower of that stake, not one a remembered placement or
+        // the rendezvous tie-break below prefers.
+        let pending_winners: Vec<String> = depth_by_url
+            .iter()
+            .filter(|(url, depth)| confirmed_by_url.get(*url) < Some(depth))
+            .map(|(url, _)| url.clone())
+            .collect();
         // A chat with images is confirmed by KV events only up to its first image,
         // so a placement remembered past that point counts where it is strictly
         // deeper than the best confirmed match. A real deeper hit still decides.
         let pending_best = depth_by_url.values().copied().max();
         let media = self.media_chain(tokens, namespace, &hashes);
-        if let Some((chain, key)) = &media {
+        if let Some(media) = &media {
             let mut deepened = false;
-            for (url, depth) in self.tree.media().depths(chain) {
+            for (url, matched) in self.tree.media().depths(&media.chain) {
+                let depth = media.depth(matched);
                 if Some(u32::try_from(depth).unwrap_or(u32::MAX)) > confirmed {
                     merge_depth(&mut depth_by_url, url.to_string(), depth);
                     deepened = true;
@@ -115,18 +124,13 @@ impl RadixTreePrefixProvider {
             }
             if deepened {
                 self.tree.media().record_hit();
-            } else if prefer_rendezvous(&mut depth_by_url, *key) {
+            } else if prefer_rendezvous(&mut depth_by_url, media.key) {
                 // No placement remembered here (another router may have routed the
                 // previous turn): every router breaks the tie on the shared prefix
                 // the same way for the same conversation, by rendezvous hash.
                 self.tree.record_media_tiebreak();
             }
         }
-        let pending_winners: Vec<String> = depth_by_url
-            .iter()
-            .filter(|(url, depth)| confirmed_by_url.get(*url) < Some(depth))
-            .map(|(url, _)| url.clone())
-            .collect();
         let outcome = match depth_by_url.values().copied().max() {
             None => PrefixOutcome::Empty,
             Some(best_prefix_blocks) => {
@@ -152,7 +156,7 @@ impl RadixTreePrefixProvider {
             outcome,
             query_blocks: hashes.len(),
             pending_winners,
-            media_hashes: media.map(|(chain, _)| Arc::<[i64]>::from(chain)),
+            media_hashes: media.map(|media| Arc::<[i64]>::from(media.chain)),
             block_hashes: consult_pending.then(|| hashes.into()),
         })
     }
@@ -189,11 +193,12 @@ impl RadixTreePrefixProvider {
             .filter(|(worker, _)| worker.url == worker_url)
             .map(|(worker, depth)| (worker.dp_rank, depth))
             .collect();
-        if let Some((chain, key)) = self.media_chain(tokens, namespace, &hashes) {
+        if let Some(media) = self.media_chain(tokens, namespace, &hashes) {
             let before = depths.iter().map(|&(_, d)| d).max();
             let owner_prefix = format!("{worker_url}#");
             let mut remembered = false;
-            for (owner, depth) in self.tree.media_ranks().depths(&chain) {
+            for (owner, matched) in self.tree.media_ranks().depths(&media.chain) {
+                let depth = media.depth(matched);
                 // Confirmed first, as for workers: a remembered rank counts only
                 // where it is strictly deeper than every confirmed match here, so
                 // a rank known to hold the prefix is never outranked by a stale
@@ -218,7 +223,7 @@ impl RadixTreePrefixProvider {
                     .iter()
                     .map(|&(rank, d)| (rank.to_string(), u32::try_from(d).unwrap_or(u32::MAX)))
                     .collect();
-                if prefer_rendezvous(&mut by_rank, key) {
+                if prefer_rendezvous(&mut by_rank, media.key) {
                     self.tree.record_media_tiebreak();
                 }
                 for (rank, d) in &mut depths {
@@ -231,39 +236,42 @@ impl RadixTreePrefixProvider {
         depths
     }
 
-    /// A media chat's routing chain and conversation key; `None` for a text
-    /// prompt or with media affinity off.
+    /// A media chat's routing chain; `None` for a text prompt or with media
+    /// affinity off.
     ///
-    /// The chain is the prompt's block hashes with the block holding the first
-    /// image replaced by the key: the hash of that block's tokens through the
-    /// image and its identity tag (see [`crate::tokenizer::tag_images`]),
-    /// chained to the block before it. The text that follows the image in that
-    /// block, and so the block's own hash, changes as the conversation grows
-    /// (a first turn often ends in it); the key does not. So every turn of the
-    /// chat finds the placement its first turn recorded, and every router
-    /// breaks the same tie the same way. The blocks after it are the chat's as
-    /// rendered, so a later turn still matches a longer placement block by
-    /// block. KV events never confirm that block or any after it (the engine's
-    /// keys carry the image's own hash), so the substitution costs no
-    /// confirmed match.
+    /// The chain starts at the conversation key: the hash of the tokens of the
+    /// block holding the first image, through the image and its identity tag
+    /// (see [`crate::tokenizer::tag_images`]), chained to the block before it.
+    /// The prompt's block hashes after that block follow. The text after the
+    /// image in its block, and so the block's own hash, changes as the
+    /// conversation grows (a first turn often ends in it); the key does not.
+    /// So every turn of the chat finds the placement its first turn recorded,
+    /// and every router breaks the same tie the same way, while a later turn
+    /// still matches a longer placement block by block.
+    ///
+    /// The text before the image is not in the chain: the key covers it
+    /// through its parent hash, and a placement counts only once it matches
+    /// the key, so a chat that shares only that text with another chat (a
+    /// burst of new chats on one system prompt) inherits nothing from it. KV
+    /// events never confirm the image's block or any after it (the engine's
+    /// keys carry the image's own hash), so the confirmed match, at most the
+    /// blocks before it, is always shallower than a matching placement.
     fn media_chain(
         &self,
         tokens: &[u32],
         namespace: &CacheNamespace,
         hashes: &[i64],
-    ) -> Option<(Vec<i64>, i64)> {
+    ) -> Option<MediaChain> {
         let position = self.tree.first_media_position(tokens)?;
         let block_size = usize::try_from(self.block_size_oracle.get()?).ok()?.max(1);
         let block = position / block_size;
         let end = (position + 1 + MEDIA_TAG_LEN).min(tokens.len());
         let parent = block.checked_sub(1).and_then(|i| hashes.get(i).copied());
         let key = media_key(namespace, parent, &tokens[block * block_size..end]);
-        let mut chain = hashes.to_vec();
-        match chain.get_mut(block) {
-            Some(slot) => *slot = key,
-            None => chain.push(key),
-        }
-        Some((chain, key))
+        let mut chain = Vec::with_capacity(hashes.len().saturating_sub(block));
+        chain.push(key);
+        chain.extend(hashes.iter().skip(block + 1));
+        Some(MediaChain { chain, key, block })
     }
 
     /// Remember the DP rank a media chat was placed on, so its next turn goes
@@ -282,16 +290,33 @@ impl RadixTreePrefixProvider {
         let Some(hashes) = self.block_hashes(tokens, namespace) else {
             return;
         };
-        if let Some((chain, _)) = self.media_chain(tokens, namespace, &hashes) {
+        if let Some(media) = self.media_chain(tokens, namespace, &hashes) {
             self.tree
                 .media_ranks()
-                .record(&format!("{worker_url}#{rank}"), &chain);
+                .record(&format!("{worker_url}#{rank}"), &media.chain);
         }
     }
 
     fn block_hashes(&self, tokens: &[u32], namespace: &CacheNamespace) -> Option<Vec<i64>> {
         let hashes = self.block_size_oracle.block_hashes(tokens, namespace)?;
         (!hashes.is_empty()).then_some(hashes)
+    }
+}
+
+/// A media chat's routing chain (see [`RadixTreePrefixProvider::media_chain`]).
+struct MediaChain {
+    /// The conversation key, then the block hashes after the first image's block.
+    chain: Vec<i64>,
+    key: i64,
+    /// Index of the first image's block in the prompt's block hashes.
+    block: usize,
+}
+
+impl MediaChain {
+    /// The prompt depth, in blocks, of a placement matching `matched` entries
+    /// of the chain: the blocks before the image's, then the matched ones.
+    fn depth(&self, matched: usize) -> usize {
+        self.block + matched
     }
 }
 
@@ -417,7 +442,11 @@ mod tests {
 
     /// A provider with media affinity on and `IMAGE` as the image placeholder.
     fn media_provider() -> RadixTreePrefixProvider {
-        let provider = provider(60_000, 0);
+        media_provider_with_pending(60_000)
+    }
+
+    fn media_provider_with_pending(pending_ttl_ms: u64) -> RadixTreePrefixProvider {
+        let provider = provider(pending_ttl_ms, 0);
         provider.tree.media().enable(Duration::from_secs(1_800));
         provider
             .tree
@@ -593,15 +622,15 @@ mod tests {
         let hashes1 = provider.block_hashes(&turn1, &ns).unwrap();
         let hashes2 = provider.block_hashes(&turn2, &ns).unwrap();
         assert_ne!(hashes1[4], hashes2[4], "the image block's own hash moves");
-        let (chain1, key1) = provider.media_chain(&turn1, &ns, &hashes1).unwrap();
-        let (chain2, key2) = provider.media_chain(&turn2, &ns, &hashes2).unwrap();
-        assert_eq!(key1, key2, "the conversation key does not");
+        let media1 = provider.media_chain(&turn1, &ns, &hashes1).unwrap();
+        let media2 = provider.media_chain(&turn2, &ns, &hashes2).unwrap();
+        assert_eq!(media1.key, media2.key, "the conversation key does not");
         assert_eq!(
-            chain1[..4],
-            hashes1[..4],
-            "text blocks stay engine-compatible"
+            media1.chain,
+            [media1.key],
+            "turn 1 ends in the image's block"
         );
-        assert_eq!((chain1[4], chain2[4]), (key1, key1));
+        assert_eq!(media2.chain, [media2.key, hashes2[5], hashes2[6]]);
         for url in ["http://a", "http://b"] {
             let event = BlockStored {
                 block_hashes: hashes1[..4].to_vec(),
@@ -620,6 +649,13 @@ mod tests {
         }
         let first = lookup(&provider, &turn1);
         assert_eq!(provider.tree.media_tiebreaks(), 1, "no placement yet");
+        // The preference is one block over the confirmed four, which the partial
+        // image block makes the fifth query block: the policy's cap at
+        // `query_blocks` leaves it intact.
+        let mut first_depths: Vec<_> = depths(&first).into_iter().map(|(_, d)| d).collect();
+        first_depths.sort();
+        assert_eq!(first_depths, [4, 5]);
+        assert_eq!(first.query_blocks, 5);
         provider.record_route(&first, "http://b");
         provider.record_rank(&turn1, &ns, "http://b", 1);
         let signal = lookup(&provider, &turn2);
@@ -636,6 +672,35 @@ mod tests {
         let mut by_rank = provider.rank_depths(&turn2, &ns, "http://b");
         by_rank.sort();
         assert_eq!(by_rank, [(0, 4), (1, 5)]);
+    }
+
+    /// A burst of new image chats on one cold system prompt: the first chat's
+    /// placement must not attract the others, which share only that text.
+    #[test]
+    fn a_chat_sharing_only_the_text_before_its_image_inherits_no_placement() {
+        let provider = media_provider_with_pending(0);
+        let ns = CacheNamespace::default();
+        let first = media_prompt(4, 2);
+        let signal = lookup(&provider, &first);
+        assert!(matches!(signal.outcome, PrefixOutcome::Empty));
+        provider.record_route(&signal, "http://b");
+        provider.record_rank(&first, &ns, "http://b", 1);
+        let mut other = first[..4 * BLOCK as usize].to_vec();
+        other.extend([IMAGE, 60_000, 60_001, 60_002, 60_003, 60_004, 60_005]);
+        let signal = lookup(&provider, &other);
+        assert!(
+            matches!(signal.outcome, PrefixOutcome::Empty),
+            "nothing remembered for it"
+        );
+        assert_eq!(provider.tree.media().hits(), 0);
+        assert_eq!(provider.tree.media_tiebreaks(), 0);
+        assert!(provider.rank_depths(&other, &ns, "http://b").is_empty());
+        // The first chat's own next turn still finds its placement.
+        let next = media_prompt(4, 5);
+        let signal = lookup(&provider, &next);
+        assert_eq!(depths(&signal), [("http://b".into(), 7)]);
+        assert_eq!(provider.tree.media().hits(), 1);
+        assert_eq!(provider.rank_depths(&next, &ns, "http://b"), [(1, 7)]);
     }
 
     #[test]
