@@ -265,6 +265,7 @@ class TestLoopEntry(CustomTestCase):
                     disagg_prefill_bootstrap_queue=SimpleNamespace(kv_manager="kv"),
                     disagg_prefill_transfer_queue="queue",
                     output_streamer="streamer",
+                    pp_group=SimpleNamespace(is_first_rank=True),
                 )
                 environ = {
                     **{k: v for k, v in os.environ.items() if k not in (MASTER, CHILD)},

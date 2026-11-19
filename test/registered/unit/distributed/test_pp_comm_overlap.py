@@ -7,6 +7,7 @@ from unittest.mock import Mock, call, patch
 import torch
 
 from sglang.srt.distributed.parallel_state import GroupCoordinator
+from sglang.srt.environ import envs
 from sglang.srt.managers import scheduler_pp_mixin as pp_mod
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -171,6 +172,7 @@ class TestPPCommOverlap(CustomTestCase):
                     ),
                     pp_comm_stream=None,
                     pp_comm_stream_ctx=nullcontext(),
+                    _pp_proxy_recv_after_forward=False,
                     _pp_tensor_dict_inbox=defaultdict(deque),
                     copy_stream=stream,
                     copy_stream_ctx=nullcontext(),
@@ -240,6 +242,102 @@ class TestPPCommOverlap(CustomTestCase):
             proxy = schedulers[1]._pp_recv_proxy_tensors()
             torch.testing.assert_close(proxy.tensors["hidden_states"], expected_gather)
             self.assertTrue(all(not queue for queue in mailboxes.values()))
+
+
+class _StopLoop(Exception):
+    pass
+
+
+class TestPPProxyRecvAfterForward(CustomTestCase):
+    """SGLANG_OPT_PP_PROXY_RECV_AFTER_FORWARD (needs SGLANG_PP_COMM_OVERLAP)."""
+
+    def _recv_order(self, after_forward, launch_event):
+        log = []
+
+        class _CommStream:
+            def __enter__(self):
+                log.append("enter comm stream")
+
+            def __exit__(self, *exc):
+                log.append("exit comm stream")
+
+        stream = SimpleNamespace(wait_event=lambda event: log.append(("wait", event)))
+        scheduler = _make_scheduler(
+            pp_group=SimpleNamespace(is_first_rank=False),
+            attn_tp_group=None,
+            _pp_proxy_recv_after_forward=after_forward,
+            launch_event=launch_event,
+            pp_comm_stream_ctx=_CommStream(),
+            device_module=SimpleNamespace(current_stream=lambda: stream),
+        )
+
+        def recv(expected_kind, all_gather_group):
+            log.append(("recv", expected_kind))
+            return {"hidden_states": torch.zeros(1)}, "recv done"
+
+        scheduler._pp_recv_typed_dict = recv
+        scheduler._pp_recv_proxy_tensors()
+        return log
+
+    def test_proxy_receive_is_posted_after_the_forward_in_flight(self):
+        forward = object()
+        self.assertEqual(
+            self._recv_order(True, forward),
+            [
+                "enter comm stream",
+                ("wait", forward),
+                "exit comm stream",
+                ("recv", "proxy"),
+            ],
+        )
+        # Off, or no forward launched yet: the stock receive.
+        self.assertEqual(self._recv_order(False, forward), [("recv", "proxy")])
+        self.assertEqual(self._recv_order(True, None), [("recv", "proxy")])
+
+    def test_only_the_pd_prefill_loop_with_comm_overlap_turns_it_on(self):
+        def stop():
+            raise _StopLoop()
+
+        for child, comm_stream, first_rank, on in (
+            (True, object(), False, True),
+            (False, object(), False, False),
+            (True, None, False, False),
+            (True, object(), True, False),
+        ):
+            overlap = comm_stream is not None
+            with self.subTest(child=child, overlap=overlap, first_rank=first_rank):
+                scheduler = _make_scheduler(
+                    pp_group=SimpleNamespace(is_first_rank=first_rank),
+                    pp_comm_stream=comm_stream,
+                    pp_loop_size=1,
+                    # What init_pp_loop_state sets for every PP loop.
+                    _pp_proxy_recv_after_forward=False,
+                    init_pp_loop_state=lambda: None,
+                    increment_scheduler_iterations=stop,
+                )
+                with (
+                    envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True),
+                    envs.SGLANG_OPT_PP_PROXY_RECV_AFTER_FORWARD.override(child),
+                    envs.SGLANG_OPT_PP_PREFILL_EARLY_FINISH.override(False),
+                    envs.SGLANG_OPT_PP_EARLY_RELAY.override(False),
+                    self.assertRaises(_StopLoop),
+                ):
+                    scheduler.event_loop_pp_disagg_prefill()
+                self.assertEqual(scheduler._pp_proxy_recv_after_forward, on)
+
+    def test_other_pp_loops_keep_the_stock_receive(self):
+        scheduler = _make_scheduler(
+            spec_algorithm=SimpleNamespace(is_none=lambda: True),
+            token_to_kv_pool_allocator=None,
+            device="cpu",
+        )
+        with (
+            published_topology(role="scheduler", pp_size=2),
+            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True),
+            envs.SGLANG_OPT_PP_PROXY_RECV_AFTER_FORWARD.override(True),
+        ):
+            scheduler.init_pp_loop_state()
+        self.assertFalse(scheduler._pp_proxy_recv_after_forward)
 
 
 if __name__ == "__main__":

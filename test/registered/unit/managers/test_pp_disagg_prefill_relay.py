@@ -89,6 +89,7 @@ class _Stage:
         s.pp_group = SimpleNamespace(
             is_first_rank=rank == 0, is_last_rank=rank == pp - 1
         )
+        s.pp_comm_stream = None
         s.pp_comm_stream_ctx = nullcontext()
         s.pp_send_done_event = None
         s._pp_capacity_digest = None
@@ -407,7 +408,10 @@ class TestLoopEntry(CustomTestCase):
 
         master = "SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION"
         child = "SGLANG_OPT_PP_EARLY_RELAY"
-        others = ("SGLANG_OPT_PP_PREFILL_EARLY_FINISH",)
+        others = (
+            "SGLANG_OPT_PP_PREFILL_EARLY_FINISH",
+            "SGLANG_OPT_PP_PROXY_RECV_AFTER_FORWARD",
+        )
         for env, on in (
             ({}, False),
             ({master: "1"}, True),

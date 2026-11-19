@@ -178,6 +178,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Follows the NVIDIA runtime master (both unset: <code>false</code>)</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_OPT_PP_PROXY_RECV_AFTER_FORWARD`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Let a later stage of a pipeline-parallel PD prefill post its next proxy-tensor receive only after its own forward in flight, when its checks pass (`SGLANG_PP_COMM_OVERLAP` is on). The received bytes and their order are unchanged. When unset, this follows `SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION`; an explicit `0` or `1` takes precedence.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Follows the NVIDIA runtime master (both unset: <code>false</code>)</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_ENABLE_TORCH_INFERENCE_MODE`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Control whether to use torch.inference_mode</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`false`</td>

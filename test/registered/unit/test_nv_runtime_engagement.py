@@ -293,11 +293,24 @@ def _pp_early_relay(shape: Shape) -> bool:
     )
 
 
+def _pp_proxy_recv_after_forward(shape: Shape) -> bool:
+    # PP rank 0 receives no proxy tensors: a later stage decides.
+    comm_overlap = os.environ.get("SGLANG_PP_COMM_OVERLAP") == "1"
+    return (
+        _pp_prefill_loop(shape)
+        and envs.SGLANG_OPT_PP_PROXY_RECV_AFTER_FORWARD.get()
+        and scheduler_pp_mixin._pp_prefill_proxy_recv_after_forward_engages(
+            comm_overlap=comm_overlap
+        )
+    )
+
+
 RESOLVERS: Dict[str, Callable[[Shape], bool]] = {
     "SGLANG_OPT_SCHEDULER_SHM_SYNC_DP_ROWS": _dp_rows,
     "SGLANG_OPT_PD_DECODE_ADMIT_FREED_SLOTS": _freed_slots,
     "SGLANG_OPT_PP_PREFILL_EARLY_FINISH": _pp_early_finish,
     "SGLANG_OPT_PP_EARLY_RELAY": _pp_early_relay,
+    "SGLANG_OPT_PP_PROXY_RECV_AFTER_FORWARD": _pp_proxy_recv_after_forward,
 }
 
 
@@ -399,7 +412,7 @@ EXPECTED = {
     | _QWEN35_TP_SPEC
     | _children(),
     "decode-tp8-one-request": _PD_DECODE | _PD_DECODE_TP | _TWO_HOSTS | _QWEN35_TP_SPEC,
-    "prefill-tp1-pp2": _PP_PREFILL | _children(),
+    "prefill-tp1-pp2": _PP_PREFILL | _children("PP_PROXY_RECV_AFTER_FORWARD"),
     "aggregated-tp4": _QWEN35_TP_SPEC,
     "aggregated-tp8": _QWEN35_TP_SPEC,
     "decode-tp2": _PD_DECODE | _PD_DECODE_TP | _NO_STAGING | _QWEN35_TP_SPEC,
