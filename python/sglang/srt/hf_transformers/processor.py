@@ -25,6 +25,7 @@ from transformers import (
 )
 from transformers.utils import cached_file
 
+from sglang.srt.configs.jina_ocr import JinaOCRConfig, is_jina_ocr_config
 from sglang.srt.multimodal.customized_mm_processor_utils import _CUSTOMIZED_MM_PROCESSOR
 from sglang.srt.utils import logger
 
@@ -332,7 +333,9 @@ def _get_processor(
         )
     is_ocr2 = _is_deepseek_ocr2_model(config)
     if _is_deepseek_ocr_model(config) or is_ocr2:
-        config.model_type = "deepseek-ocr"
+        config.model_type = (
+            JinaOCRConfig.model_type if is_jina_ocr_config(config) else "deepseek-ocr"
+        )
         config.update({"architectures": ["DeepseekOCRForCausalLM"]})
         if is_ocr2:
             _override_v_head_dim_if_zero(config)
