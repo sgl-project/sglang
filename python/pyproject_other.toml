@@ -175,14 +175,14 @@ srt_hpu = ["sglang[runtime_common]"]
 
 # https://docs.sglang.io/hardware-platforms/sail
 srt_sail = [
-  "deep_gemm-for-sail>=1.1.0",
-  "flash-attention-for-sail",
-  "flashinfer-for-sail",
-  "flashmla-for-sail",
+  "deep_gemm>=1.1.0",
+  "flash-attn",
+  "flashinfer-python",
+  "flash-mla",
   "sailify==1.0.0",
   "sglang[runtime_common]",
-  "torch-for-sail",
-  "triton-for-sail",
+  "torch",
+  "triton",
 ]
 
 # Keep vendor pins in sync with scripts/ci/mlu/component_versions.properties.

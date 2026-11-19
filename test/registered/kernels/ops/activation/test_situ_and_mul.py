@@ -9,7 +9,11 @@ from sglang.kernels.ops.activation import (
     situ_and_mul_post_quant_mxfp4,
 )
 from sglang.srt.utils import get_device_sm, is_sail
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_ppu_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_ppu_ci,
+)
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=70, stage="base-b-kernel-unit", runner_config="4-gpu-b200")

@@ -316,6 +316,12 @@ class TestPPUCIDevSailDependencies(CustomTestCase):
                 f"{stem}.dist-info/METADATA",
                 self.message(name, version, requirements, extras).as_string(),
             )
+            archive.writestr(
+                f"{stem}.dist-info/WHEEL",
+                "Wheel-Version: 1.0\nGenerator: fixture\n"
+                "Root-Is-Purelib: true\nTag: py3-none-any\n",
+            )
+            archive.writestr(f"{stem}.dist-info/RECORD", "")
         return path
 
     def write_root(self):
@@ -347,11 +353,12 @@ class TestPPUCIDevSailDependencies(CustomTestCase):
         }
 
         def build_wheels(command, check):
+            destination = Path(command[command.index("--wheel-dir") + 1])
             for value in command[command.index("--wheel-dir") + 2 :]:
                 requirement = Requirement(value)
                 name = self.checker.normalize_name(requirement.name)
                 version, dependencies = available[name]
-                self.write_wheel(name, version, dependencies)
+                self.write_wheel(name, version, dependencies, directory=destination)
             return subprocess.CompletedProcess(command, 0)
 
         with patch.object(self.checker.subprocess, "run", side_effect=build_wheels):
@@ -361,6 +368,141 @@ class TestPPUCIDevSailDependencies(CustomTestCase):
         selected = self.checker.missing_dev_sail(self.wheels, self.packages())
         self.assertEqual(set(selected), set(available))
         self.assertFalse(any(self.checker.is_platform_package(n) for n in inventory))
+
+    def local_pip(self, source):
+        run = subprocess.run
+
+        def build(command, check):
+            index = command.index("--index-url")
+            command = [
+                *command[:index],
+                "--no-index",
+                "--find-links",
+                str(source),
+                "--disable-pip-version-check",
+                *command[index + 2 :],
+            ]
+            return run(command, check=check, capture_output=True, text=True)
+
+        return patch.object(self.checker.subprocess, "run", side_effect=build)
+
+    def test_build_reselects_numpy_after_discovering_transitive_constraints(self):
+        source = self.wheels / "local index"
+        source.mkdir()
+        for name, version, requirements, extras in (
+            ("blake3", "1.0.8", [], []),
+            ("numpy", "2.5.5", [], []),
+            ("numpy", "2.3.5", ["new-helper[fast]>=1"], []),
+            ("numpy", "1.26.4", [], []),
+            (
+                "array-user",
+                "1.0",
+                ["numpy>=2", 'numpy>=99; sys_platform == "unused"'],
+                [],
+            ),
+            (
+                "mistral-common",
+                "1.13.1",
+                ['numpy>=1.25,<2.4; python_version < "99"'],
+                [],
+            ),
+            ("new-helper", "1.0", ['fast-helper; extra == "fast"'], ["fast"]),
+            ("fast-helper", "1.0", [], []),
+        ):
+            self.write_wheel(name, version, requirements, extras, source)
+        self.root_requirements.extend(["numpy", "array-user", "mistral-common==1.13.1"])
+        self.write_root()
+        with self.local_pip(source):
+            self.checker.collect_dev_sail(self.wheels)
+        inventory = self.checker.wheel_inventory(self.runtime)
+        self.assertEqual(inventory["numpy"][1]["Version"], "2.3.5")
+        self.assertEqual(len(list(self.runtime.glob("numpy-*.whl"))), 1)
+        self.assertIn("new-helper", inventory)
+        self.assertIn("fast-helper", inventory)
+        self.assertFalse(any(self.checker.is_platform_package(n) for n in inventory))
+        self.write_wheel("transformers", "5.19.0", ["numpy>=2,<2.4"])
+        self.installed["numpy"] = self.message("numpy", "2.3.1")
+        before = self.packages()
+        selected = self.checker.missing_dev_sail(self.wheels, before)
+        self.assertNotIn("numpy", selected)
+        after = {
+            **before,
+            **{n: {"version": v, "record": "new"} for n, (_, v) in selected.items()},
+        }
+        self.assertEqual(after["numpy"], before["numpy"])
+        self.assertEqual(
+            self.checker.check_snapshots(
+                before, after, {n: v for n, (_, v) in selected.items()}
+            ),
+            0,
+        )
+        self.installed["numpy"] = self.message("numpy", "2.5.5")
+        with self.assertRaisesRegex(
+            ValueError, "Preinstalled numpy.*update the runtime image"
+        ):
+            self.checker.missing_dev_sail(self.wheels, self.packages())
+
+    def test_build_conflicting_constraints_preserve_existing_inventory(self):
+        source = self.wheels / "local index"
+        source.mkdir()
+        old = self.write_wheel("numpy", "2.5.5")
+        original = old.read_bytes()
+        for version in ("2.3.5", "2.5.5"):
+            self.write_wheel("numpy", version, directory=source)
+        self.write_wheel("blake3", "1.0.8")
+        self.write_wheel("mistral-common", "1.13.1", ["numpy>=1.25,<2.4"])
+        self.root_requirements.extend(["numpy>=2.5", "mistral-common==1.13.1"])
+        self.write_root()
+        with self.local_pip(source), self.assertRaises(subprocess.CalledProcessError):
+            self.checker.collect_dev_sail(self.wheels)
+        self.assertEqual(old.read_bytes(), original)
+        self.assertEqual([p.name for p in self.runtime.glob("numpy-*.whl")], [old.name])
+        self.assertFalse(any(p.is_dir() for p in self.runtime.iterdir()))
+
+    def test_build_rejects_invalid_replacement_without_deleting_old_wheel(self):
+        self.write_wheel("blake3", "1.0.8")
+        old = self.write_wheel("numpy", "2.5.5")
+        original = old.read_bytes()
+        self.root_requirements.append("numpy>=2,<2.4")
+        self.write_root()
+        for version in (None, "1.26.4"):
+
+            def build(command, check):
+                if version is not None:
+                    destination = Path(command[command.index("--wheel-dir") + 1])
+                    self.write_wheel("numpy", version, directory=destination)
+                return subprocess.CompletedProcess(command, 0)
+
+            with (
+                self.subTest(version=version),
+                patch.object(self.checker.subprocess, "run", side_effect=build),
+            ):
+                with self.assertRaises(ValueError):
+                    self.checker.collect_dev_sail(self.wheels)
+            self.assertEqual(old.read_bytes(), original)
+            self.assertEqual(len(list(self.runtime.glob("numpy-*.whl"))), 1)
+
+    def test_build_version_cycles_fail_without_repeated_downloads(self):
+        self.write_wheel("blake3", "1.0.8")
+        self.write_wheel("version-loop", "2.0", ["version-loop<2"])
+        self.root_requirements.append("version-loop")
+        self.write_root()
+
+        def build(command, check):
+            destination = Path(command[command.index("--wheel-dir") + 1])
+            older = "version-loop<2" in command
+            self.write_wheel(
+                "version-loop",
+                "1.0" if older else "2.0",
+                ["version-loop>=2" if older else "version-loop<2"],
+                directory=destination,
+            )
+            return subprocess.CompletedProcess(command, 0)
+
+        with patch.object(self.checker.subprocess, "run", side_effect=build):
+            with self.assertRaisesRegex(ValueError, "did not converge"):
+                self.checker.collect_dev_sail(self.wheels)
+        self.assertEqual(len(list(self.runtime.glob("version_loop-*.whl"))), 1)
 
     def test_runtime_upgrades_use_new_metadata_and_preserve_other_packages(self):
         """Replacing old runtime packages must traverse the new dependency graph."""
@@ -424,13 +566,9 @@ class TestPPUCIDevSailDependencies(CustomTestCase):
                 with self.assertRaisesRegex(ValueError, f"missing {name}"):
                     self.checker.missing_dev_sail(self.wheels, self.packages())
             bad_path = self.write_wheel(name, bad_version)
-            for collect in (False, True):
-                with self.subTest(name=name, case="incompatible", collect=collect):
-                    with self.assertRaisesRegex(ValueError, "does not satisfy"):
-                        if collect:
-                            self.checker.collect_dev_sail(self.wheels)
-                        else:
-                            self.checker.missing_dev_sail(self.wheels, self.packages())
+            with self.subTest(name=name, case="incompatible"):
+                with self.assertRaisesRegex(ValueError, "does not satisfy"):
+                    self.checker.missing_dev_sail(self.wheels, self.packages())
             bad_path.unlink()
             self.write_wheel(name, good_version)
         for requirement, name, version in (
@@ -517,14 +655,7 @@ class TestPPUCIDevSailDependencies(CustomTestCase):
             for name, message in self.installed.items()
         ]
         for wheel in [*initial, *self.runtime.glob("*.whl")]:
-            stem = wheel.name.split("-py3-", 1)[0]
             with zipfile.ZipFile(wheel, "a") as archive:
-                archive.writestr(
-                    f"{stem}.dist-info/WHEEL",
-                    "Wheel-Version: 1.0\nGenerator: fixture\n"
-                    "Root-Is-Purelib: true\nTag: py3-none-any\n",
-                )
-                archive.writestr(f"{stem}.dist-info/RECORD", "")
                 archive.writestr(
                     wheel.name.split("-", 1)[0] + ".py", "VALUE = 'offline-fixture'\n"
                 )
