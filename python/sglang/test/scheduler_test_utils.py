@@ -30,6 +30,7 @@ class FakeReq(SimpleNamespace):
     __hash__ = object.__hash__
 
     owner_list = None
+    aborted_by_caller = False
     # Req's exit_ledger fields.
     exit_via = None
     send_via = None

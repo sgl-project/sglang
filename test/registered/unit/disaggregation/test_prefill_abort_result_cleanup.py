@@ -5,9 +5,13 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
-from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
+from sglang.srt.disaggregation.prefill import (
+    PrefillBootstrapQueue,
+    SchedulerDisaggregationPrefillMixin,
+)
 from sglang.srt.disaggregation.utils import MetadataBuffers
 from sglang.srt.environ import envs
+from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.managers.scheduler_components.request_list import (
@@ -253,6 +257,38 @@ class TestPrefillCompleteResult(CustomTestCase):
         self.assertEqual(req.output_ids, [])
         self.assertEqual(list(scheduler.disagg_prefill_transfer_queue), [])
         req.disagg_kv_sender.mark_prefill_complete.assert_not_called()
+
+
+@pytest.mark.parametrize("in_bootstrap", [True, False], ids=["bootstrap", "transfer"])
+@patch(
+    "sglang.srt.disaggregation.prefill.get_parallel",
+    return_value=SimpleNamespace(tp_rank=0, pp_size=1),
+)
+def test_only_an_aborted_transfer_is_traced_without_a_server_fault(_, in_bootstrap):
+    """A request aborted while its KV sender holds it must not be traced as a
+    500, unlike one whose transfer broke."""
+    statuses = {}
+    for name, abort in (
+        ("aborted", AbortReq(rid="r")),
+        ("another request aborted", AbortReq(rid="other")),
+    ):
+        scheduler = _Scheduler()
+        scheduler.request_retirer = Mock()
+        scheduler.metrics_reporter = SimpleNamespace(enable_metrics=False)
+        req = Req("r", "", array("q", [1]), SamplingParams())
+        req.disagg_kv_sender = Mock()
+        req.time_stats.trace_ctx = Mock()
+        if in_bootstrap:
+            PrefillBootstrapQueue._abort(SimpleNamespace(queue=[req]), abort)
+            scheduler.handle_bootstrap_failure(req)
+        else:
+            move([req], scheduler.disagg_prefill_transfer_queue)
+            scheduler._abort_prefill_transfer(abort)
+            scheduler.handle_inflight_transfer_failure(req)
+        abort_info = req.time_stats.trace_ctx.abort.call_args.kwargs["abort_info"]
+        statuses[name] = abort_info["status_code"]
+
+    assert statuses == {"aborted": None, "another request aborted": 500}
 
 
 class _EarlySendScheduler(SchedulerDisaggregationPrefillMixin):
