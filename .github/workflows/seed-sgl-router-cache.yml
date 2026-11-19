@@ -15,7 +15,6 @@ on:
       - 'rust/sglang-processor/**'
       - 'rust/sglang-runtime-v1-types/**'
       - '.github/workflows/_pr-test-sgl-router-build.yml'
-      - 'scripts/ci/utils/build_sgl_router.sh'
       # Not hashed into the key, but they set its arch part: by the runner each job
       # here builds on, and by the runner consumers restore on there.
       - '.github/workflows/seed-sgl-router-cache.yml'

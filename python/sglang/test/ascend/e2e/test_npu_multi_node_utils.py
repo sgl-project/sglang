@@ -47,6 +47,7 @@ BOOTSTRAP_INIT_PORT = 8995
 
 # Timeouts and delays
 ROUTER_CONFIGMAP_TIMEOUT = 300
+PD_WORKER_READY_TIMEOUT = 600
 SERVER_INITIALIZATION_DELAY = 30
 SERVICE_EXIT_WAIT_SECONDS = 120
 
@@ -388,11 +389,110 @@ def wait_for_all_ports_ready(ips, port, timeout=LOCAL_TIMEOUT, check_interval=15
     return False
 
 
-def _get_nnodes_from_args(args_list):
+def wait_for_pd_worker_roles(
+    expected_roles, port, timeout=PD_WORKER_READY_TIMEOUT, check_interval=5
+):
+    """Wait until every PD worker is serving and reports its own role.
+
+    sgl-router classifies a worker as prefill/decode by introspecting
+    `/server_info` once when it starts, and static worker URLs are never
+    re-introspected. Two windows have to close before that introspection can
+    be trusted:
+
+    * The engine may still be starting. `/server_info` is answered as soon as
+      the HTTP server binds, while `/health` stays 503 until the engine
+      finishes its warmup, so a worker can pass a role-only check and then
+      stop answering for the seconds its warmup owns. The router retries the
+      introspection for ~5s, falls back to the discovery backend's `Plain`
+      classification, and rejects the worker when the model already has PD
+      workers ("does not support mixed pools") — a rejection that is never
+      retried, leaving `/readiness` at 503 forever.
+    * A worker that is too busy to answer HTTP a few seconds later would
+      likewise stay registered as `Plain`, and the decode side then rejects
+      every request with "Disaggregated request received without bootstrap
+      room id".
+
+    Requiring `/health` == 200 before reading `/server_info` removes both
+    races before the router is launched.
+
+    Args:
+        expected_roles (dict): {pod_ip: "prefill" | "decode"}.
+        port (int): Worker HTTP port.
+        timeout (int): Total timeout in seconds.
+        check_interval (int): Interval between checks in seconds.
+
+    Raises:
+        RuntimeError: If a worker never becomes healthy or never reports the
+            expected role.
+    """
+    start_time = time.time()
+    pending = dict(expected_roles)
+    last_seen = {}
+
+    while time.time() - start_time < timeout:
+        for ip, role in list(pending.items()):
+            health_url = f"http://{ip}:{port}/health"
+            try:
+                health = requests.get(health_url, timeout=10)
+            except Exception as e:
+                last_seen[ip] = f"health request failed: {e}"
+                continue
+            if health.status_code != 200:
+                last_seen[ip] = f"health returned {health.status_code}"
+                continue
+
+            url = f"http://{ip}:{port}/server_info"
+            try:
+                response = requests.get(url, timeout=10)
+                response.raise_for_status()
+                info = response.json()
+            except Exception as e:
+                last_seen[ip] = f"request failed: {e}"
+                continue
+
+            mode = info.get("disaggregation_mode")
+            bootstrap_port = info.get("disaggregation_bootstrap_port")
+            last_seen[ip] = f"disaggregation_mode={mode!r}"
+            if mode != role:
+                continue
+            if mode == "prefill" and not bootstrap_port:
+                last_seen[ip] += " (bootstrap port missing)"
+                continue
+            del pending[ip]
+            logger.info(
+                f"Worker {url} reports disaggregation_mode={mode} "
+                f"bootstrap_port={bootstrap_port}"
+            )
+
+        if not pending:
+            logger.info(f"All {len(expected_roles)} PD workers report their role")
+            return
+
+        time.sleep(check_interval)
+
+    raise RuntimeError(
+        f"PD workers did not report their disaggregation role within {timeout}s: "
+        f"{ {ip: last_seen.get(ip, 'no response') for ip in pending} }"
+    )
+
+
+def _get_arg_value(args_list, name):
     for i, arg in enumerate(args_list):
-        if arg == "--nnodes" and i + 1 < len(args_list):
-            return int(args_list[i + 1])
+        # Args are not always strings: launcher-injected values (ports,
+        # sizes) are ints and must not be probed for a "--key=value" prefix.
+        if not isinstance(arg, str):
+            continue
+        if arg == name and i + 1 < len(args_list):
+            return args_list[i + 1]
+        # Also accept the --key=value form.
+        if arg.startswith(f"{name}="):
+            return arg[len(name) + 1 :]
     return None
+
+
+def _get_nnodes_from_args(args_list):
+    nnodes = _get_arg_value(args_list, "--nnodes")
+    return int(nnodes) if nnodes is not None else None
 
 
 def _is_instance_head(pod_index, is_multi_node_instance, nnodes):
@@ -574,9 +674,23 @@ def launch_pd_separation_node(model_config):
     # Generate prefill/decode run command
     service_args = list()
 
-    mf_addr = f"tcp://{master_prefill_ip}:24666"
-    os.environ["ASCEND_MF_STORE_URL"] = mf_addr
-    logger.info(f"Setting ENV_VAR ASCEND_MF_STORE_URL={mf_addr}")
+    # ASCEND_MF_STORE_URL belongs to the Ascend memfabric transfer path. Other
+    # backends (e.g. mooncake with TENT) configure their metadata through their
+    # own config (MC_TENT_CONF), so the legacy store URL must not leak into the
+    # launched process.
+    role_args = (
+        model_config["prefill_args"]
+        if role == "prefill"
+        else model_config["decode_args"]
+    )
+    transfer_backend = _get_arg_value(role_args, "--disaggregation-transfer-backend")
+    if transfer_backend in (None, "ascend"):
+        mf_addr = f"tcp://{master_prefill_ip}:24666"
+        os.environ["ASCEND_MF_STORE_URL"] = mf_addr
+        logger.info(f"Setting ENV_VAR ASCEND_MF_STORE_URL={mf_addr}")
+    else:
+        os.environ.pop("ASCEND_MF_STORE_URL", None)
+        logger.info(f"Skip ASCEND_MF_STORE_URL for transfer backend {transfer_backend}")
 
     if role == "prefill":
         # Current node is prefill
@@ -708,7 +822,7 @@ def launch_pd_separation_node(model_config):
 
 
 # Launch router node
-def launch_router(model_config, router_binary):
+def launch_router(model_config, router_binary, process_holder=None):
     logger.info(f"launch_router start ......")
     discover_worker_nodes()
 
@@ -775,6 +889,20 @@ def launch_router(model_config, router_binary):
     ):
         raise RuntimeError("Failed to wait for all nodes to be ready")
 
+    # PD separation only: the router reads each worker's role from
+    # /server_info exactly once when it starts, so wait until every worker is
+    # both healthy (/health == 200, i.e. warmup done) and reporting its role.
+    # An open TCP port is not enough, and neither is /server_info on its own:
+    # it answers during warmup, and the router's introspection lands in the
+    # warmup window — it then falls back to Plain and rejects the worker as a
+    # mixed pool, which never recovers.
+    if "prefill_args" in model_config and "decode_args" in model_config:
+        expected_roles = {}
+        for role, urls in (("prefill", prefill_url), ("decode", decode_url)):
+            for url in urls:
+                expected_roles[url.rsplit(":", 1)[0]] = role
+        wait_for_pd_worker_roles(expected_roles, port=PREFILL_DECODE_PORT)
+
     # Set environment variables
     set_environment_variables(model_config.get("router_envs"))
 
@@ -798,6 +926,8 @@ def launch_router(model_config, router_binary):
     try:
         router_process = subprocess.Popen(router_command)
         logger.info(f"Router process started with PID: {router_process.pid}")
+        if process_holder is not None:
+            process_holder.append(router_process)
     except Exception as e:
         raise RuntimeError(f"Failed to start router process: {e}")
 
@@ -806,8 +936,11 @@ def start_router_thread(model_config, base_url):
     logger.info(f"Starting router in thread...")
     # Looked up here so a missing binary fails the test, not the daemon thread.
     router_binary = find_sgl_router_binary()
+    # Filled by launch_router so the readiness wait can fail fast if the router
+    # exits early (e.g. rejected arguments) instead of polling until timeout.
+    process_holder = []
     router_thread = threading.Thread(
-        target=launch_router, args=(model_config, router_binary)
+        target=launch_router, args=(model_config, router_binary, process_holder)
     )
     router_thread.daemon = True
     router_thread.start()
@@ -816,16 +949,18 @@ def start_router_thread(model_config, base_url):
     # prefill and decode workers to be registered.
     health_check_url = f"{base_url}/readiness"
     logger.info(f"Waiting for router to be ready at {health_check_url}")
-    wait_server_ready(health_check_url)
+    wait_server_ready(health_check_url, process_holder=process_holder)
     return router_thread
 
 
-def wait_server_ready(url, timeout=LOCAL_TIMEOUT):
+def wait_server_ready(url, timeout=LOCAL_TIMEOUT, process_holder=None):
     """Wait for the server to be ready.
 
     Args:
         url (str): Server URL to check.
         timeout (int): Timeout in seconds.
+        process_holder (list): Optional single-element list holding the router
+            subprocess, so an early exit fails fast instead of polling.
 
     Raises:
         RuntimeError: If server fails to start within timeout.
@@ -835,6 +970,11 @@ def wait_server_ready(url, timeout=LOCAL_TIMEOUT):
     check_interval = 10
 
     while True:
+        if process_holder and process_holder[0].poll() is not None:
+            raise RuntimeError(
+                f"Router exited with code {process_holder[0].returncode} before "
+                f"serving {url}; check the router output above for the reason"
+            )
         try:
             response = requests.get(url, timeout=30)
             if response.status_code == 200:
