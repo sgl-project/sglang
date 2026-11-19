@@ -36,7 +36,10 @@ class FakeReq(SimpleNamespace):
 
 
 def release_only_retirer(
-    tree_cache=None, hisparse_coordinator=None, beam_coordinator=None
+    tree_cache=None,
+    hisparse_coordinator=None,
+    beam_coordinator=None,
+    before_kv_release=None,
 ) -> RequestRetirer:
     """A `RequestRetirer` for a test that only releases requests, never aborts
     a queued one."""
@@ -48,6 +51,7 @@ def release_only_retirer(
         uocr_runtime=None,
         send_abort_output=None,
         stream_output=None,
+        before_kv_release=before_kv_release,
     )
 
 

@@ -169,6 +169,10 @@ def resolve_forward_inputs(
                 batch.input_ids, future_map.output_tokens_buf, batch.req_pool_indices
             )
 
+    if future_map is None:
+        return False
+    future_map.resolve_dllm_block_tokens(batch)
+
     # Only the overlap path relays spec extras through the future_map; the
     # synchronous (non-overlap) V2 path installs next_draft_input directly.
     if batch.enable_overlap and not batch.spec_algorithm.is_none():
@@ -384,6 +388,9 @@ class FutureMap:
             req_pool_size=self.req_pool_size,
             pool=req_to_token_pool,
         )
+        # FDFO block tokens, [req_pool_size, block_size]. -1 means this row has no future yet.
+        self.dllm_block_tokens_buf: Optional[torch.Tensor] = None
+
         # An unchanged top-k-1 batch can consume the draft extend's outputs in place.
         # Keep its relay pending until the next batch establishes whether it can.
         self.relay_bypass = spec_relay_bypass_enabled(spec_algo)
@@ -405,6 +412,37 @@ class FutureMap:
         self.output_tokens_buf = relay.output_tokens
         relay.adopted = True
         self._relay = relay
+
+    def stash_dllm_block_tokens(
+        self, indices: torch.Tensor, block_tokens: torch.Tensor
+    ) -> None:
+        block_size = block_tokens.shape[-1]
+        if self.dllm_block_tokens_buf is None:
+            self.dllm_block_tokens_buf = torch.full(
+                (self.req_pool_size, block_size),
+                -1,
+                dtype=torch.int64,
+                device=self.device,
+            )
+        self.dllm_block_tokens_buf[indices.long()] = block_tokens.to(dtype=torch.int64)
+
+    def resolve_dllm_block_tokens(self, batch: ScheduleBatch) -> None:
+        """Overwrite block rows that already have a future. A new block's first step stays on the CPU mask."""
+        buf = self.dllm_block_tokens_buf
+        if (
+            buf is None
+            or batch.input_ids is None
+            or not batch.is_dllm()
+            or not batch.dllm_config.first_done_first_out_mode
+        ):
+            return
+        indices = batch.req_pool_indices
+        block_size = buf.shape[-1]
+        if indices is None or batch.input_ids.numel() != indices.shape[0] * block_size:
+            return
+        rows = buf[indices.long()]
+        flat = batch.input_ids.view(-1, block_size)
+        flat.copy_(torch.where(rows[:, :1] >= 0, rows.to(dtype=flat.dtype), flat))
 
     def defer_relay(
         self,

@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Set
 
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.req import DllmReqPhase
-from sglang.srt.managers.req_types import FINISH_LENGTH
+from sglang.srt.managers.req_types import FINISH_ABORT, FINISH_LENGTH
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.managers.scheduler_components.request_list import (
@@ -38,8 +38,14 @@ class SchedulerDllmMixin:
             abort=self._abort_dllm_req,
         )
 
-    def _abort_dllm_req(self: Scheduler, req: Req) -> None:
-        self.request_retirer.abort(req)
+    def _abort_dllm_req(self: Scheduler, req: Req, recv_req: AbortReq) -> None:
+        req.clear_requested_finish()
+        req.finished_output = True
+        self.request_retirer.abort(
+            req,
+            reason=FINISH_ABORT(recv_req.abort_message),
+            finished_reason=recv_req.finished_reason,
+        )
         logger.debug(f"Abort dLLM queued request. {req.rid=}")
 
     def validate_dllm_request(self: Scheduler, req: Req) -> Optional[str]:
@@ -48,7 +54,7 @@ class SchedulerDllmMixin:
         return self.dllm_config.validate_request(req)
 
     def get_new_batch_dllm(
-        self: Scheduler, running_batch: ScheduleBatch, staged: List[Req]
+        self: Scheduler, running_batch: ScheduleBatch
     ) -> Optional[ScheduleBatch]:
         """Generate a new batch for DLLM (Diffusion LLM) scheduling."""
         if self.enable_priority_preemption:
@@ -65,10 +71,10 @@ class SchedulerDllmMixin:
         # Create prefill adder with resource constraints
         adder = self._create_dllm_prefill_adder(running_bs, running_batch=running_batch)
 
-        # The last round's requests start their next block.
-        for req in staged:
-            req.init_next_round_input()
         self._fetch_waiting_reqs()
+        for req in self.dllm_manager.waiting_queue:
+            if req.dllm_initialized:
+                req.determine_dllm_phase()
 
         # Process batches
         forward_mode = self._process_dllm_batches(adder, running_batch=running_batch)
@@ -99,6 +105,9 @@ class SchedulerDllmMixin:
             self.dllm_config.requires_separate_context_encoding
             and not batch.forward_mode.is_dllm_extend()
         ):
+            for req in batch.reqs:
+                if not req.finished() and not req.dllm_block_done:
+                    self._complete_dllm_block(req)
             self.metrics_reporter.report_prefill_stats(
                 batch=batch,
                 prefill_stats=batch.prefill_stats,
@@ -108,40 +117,33 @@ class SchedulerDllmMixin:
             return
 
         fdfo_mode = self.dllm_config.first_done_first_out_mode
-        assert not fdfo_mode or result.accept_length_per_req_cpu is not None, (
-            "FDFO dLLM result is missing accept lengths."
-        )
-
-        # FDFO also commits unresolved blocks so their KV can be reused.
-        if fdfo_mode or result.next_token_ids:
+        if fdfo_mode or result.next_token_ids.numel() > 0:
+            block_tokens = result.next_token_ids.tolist()
+            assert not fdfo_mode or result.dllm_block_done is not None, (
+                "FDFO dLLM result is missing dllm_block_done."
+            )
+            block_done = result.dllm_block_done.tolist() if fdfo_mode else None
             block_size = self.dllm_config.block_size
             algo_states = result.dllm_algo_state
+            has_new_tokens = False
+
+            assert result.dllm_block_ids is not None
+            assert len(result.dllm_block_ids) == len(batch.reqs)
 
             self.token_to_kv_pool_allocator.free_group_begin()
-            for idx in range(batch.batch_size()):
-                req = batch.reqs[idx]
-
-                if not fdfo_mode:
-                    next_token_ids = result.next_token_ids[idx].tolist()
-                    new_tokens = len(next_token_ids)
-                    if new_tokens == 0:
-                        continue
-
-                    req.full_untruncated_fill_ids[
-                        req.extend_end - new_tokens : req.extend_end
-                    ] = array("q", next_token_ids)
-                    self.metrics_reporter.num_generated_tokens += new_tokens
-
-                    req.output_ids.extend(next_token_ids)
-                    req.update_finish_state(new_accepted_len=new_tokens)
-                    self._finish_dllm_request_if_needed(req)
+            for idx, req in enumerate(batch.reqs):
+                if (
+                    req.finished()
+                    or result.dllm_block_ids[idx] != req.dllm_block_id
+                    or req.dllm_block_done
+                ):
                     continue
 
-                next_token_ids = result.next_token_ids[idx]
+                next_token_ids = block_tokens[idx]
                 assert len(next_token_ids) == block_size
 
-                if result.accept_length_per_req_cpu[idx] == 0:
-                    # Unresolved: keep partial state and KV for the next FDFO round.
+                # Keep the unresolved block for the next FDFO step.
+                if fdfo_mode and not block_done[idx]:
                     req.dllm_incomplete_ids = array("q", next_token_ids)
                     req.dllm_algo_state = (
                         algo_states[idx] if algo_states is not None else None
@@ -151,30 +153,27 @@ class SchedulerDllmMixin:
                 req.dllm_incomplete_ids = array("q")
                 req.dllm_algo_state = None
 
-                # Mirror the resolved block into the committed fill ids so the
-                # prefix cache keys on the real tokens, not the mask block, next
-                # round. Index relative to extend_end (the truncated/
-                # committed length), which can be shorter than
-                # full_untruncated_fill_ids when the staging adder truncates the
-                # block to the KV budget.
-                req.full_untruncated_fill_ids[
-                    req.extend_end - block_size : req.extend_end
-                ] = array("q", next_token_ids)
-
-                len_input = len(req.origin_input_ids)
+                # extend_end accounts for KV-budget truncation.
                 len_fill = req.extend_end
-                if len_fill <= len_input:
-                    continue
+                req.full_untruncated_fill_ids[len_fill - block_size : len_fill] = array(
+                    "q", next_token_ids
+                )
 
-                if len_fill - len(next_token_ids) < len_input:
-                    next_token_ids = next_token_ids[len_input - len_fill :]
+                committed_len = len(req.origin_input_ids) + len(req.output_ids)
+                if len_fill > committed_len:
+                    if len_fill - block_size < committed_len:
+                        next_token_ids = next_token_ids[committed_len - len_fill :]
 
-                self.metrics_reporter.num_generated_tokens += len(next_token_ids)
-                req.output_ids.extend(next_token_ids)
-                req.update_finish_state(new_accepted_len=len(next_token_ids))
-                self._finish_dllm_request_if_needed(req)
+                    has_new_tokens = True
+                    self.metrics_reporter.num_generated_tokens += len(next_token_ids)
+                    req.output_ids.extend(next_token_ids)
+                    req.update_finish_state(new_accepted_len=len(next_token_ids))
+                    self._finish_dllm_request_if_needed(req)
 
-            self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
+                self._complete_dllm_block(req)
+
+            if fdfo_mode or has_new_tokens:
+                self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
             self.token_to_kv_pool_allocator.free_group_end()
 
         self.metrics_reporter.report_prefill_stats(
@@ -183,6 +182,18 @@ class SchedulerDllmMixin:
             can_run_cuda_graph=result.can_run_cuda_graph,
             dp_cooperation_info=batch.dp_cooperation_info,
         )
+
+    def _complete_dllm_block(self: Scheduler, req: Req) -> None:
+        """Finish a block once; keep its ID/done until the next block is scheduled."""
+        if req.dllm_block_done:
+            return
+        req.dllm_block_done = True
+        if req.finished() or not self.dllm_config.requires_separate_context_encoding:
+            return
+        if self.dllm_config.first_done_first_out_mode:
+            self._clear_dllm_future(req)
+        self.finish_dllm_forward(req)
+        req.init_next_round_input()
 
     def _finish_dllm_request_if_needed(self: Scheduler, req: Req) -> None:
         if (
@@ -217,6 +228,15 @@ class SchedulerDllmMixin:
         assert req.kv.max_evicted_seqlen <= context_len
         req.extend_end = context_len
         self.stash_chunked_request(req)
+
+    def finish_completed_dllm_blocks(self: Scheduler) -> None:
+        if self.dllm_config.requires_separate_context_encoding:
+            return
+        for req in self.dllm_manager.waiting_queue:
+            if req.dllm_block_done and req.extend_end > req.prefix_len:
+                if self.dllm_config.first_done_first_out_mode:
+                    self._clear_dllm_future(req)
+                self.finish_dllm_forward(req)
 
     def finish_dllm_forward(self: Scheduler, req: Req) -> None:
         """Commit or discard KV after one scheduler-visible dLLM forward."""
@@ -413,11 +433,30 @@ class SchedulerDllmMixin:
 
         return res
 
+    def _dllm_inflight_reqs(self: Scheduler) -> Set[Req]:
+        if not self.enable_overlap or self.dllm_config.algorithm != "LowConfidence":
+            return set()
+
+        return {req for batch, _ in self.result_queue for req in batch.reqs}
+
+    def _dllm_waiting_for_final_forward(
+        self: Scheduler, req: Req, inflight_reqs: Set[Req]
+    ) -> bool:
+        tokens = req.dllm_incomplete_ids
+        return (
+            bool(tokens)
+            and self.dllm_config.mask_id not in tokens
+            and req in inflight_reqs
+        )
+
     def process_dllm_staging_reqs(
         self: Scheduler, adder: PrefillAdder, reqs: List[Req]
     ) -> AddReqResult:
         """Process staging DLLM requests with resource allocation."""
+        inflight_reqs = self._dllm_inflight_reqs()
         for req in reqs:
+            if self._dllm_waiting_for_final_forward(req, inflight_reqs):
+                continue
             res = adder.add_dllm_staging_req(req)
             if res == AddReqResult.NO_TOKEN:
                 return res
@@ -432,7 +471,7 @@ class DllmManager:
     def __init__(
         self,
         dllm_config: Optional[DllmConfig],
-        abort: Callable[[Req], None],
+        abort: Callable[[Req, AbortReq], None],
     ):
         self.dllm_config = dllm_config
         self.max_running_reqs = (
@@ -477,4 +516,4 @@ class DllmManager:
 
     def _abort(self, recv_req: AbortReq) -> None:
         for req in [r for r in self.waiting_queue if recv_req.matches(r.rid)]:
-            self._abort_one(req)
+            self._abort_one(req, recv_req)

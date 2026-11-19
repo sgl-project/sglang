@@ -3006,6 +3006,12 @@ class Scheduler(
             uocr_runtime=self.uocr_runtime,
             send_abort_output=self.send_abort_output,
             stream_output=self.output_streamer.stream_output,
+            before_kv_release=(
+                self._clear_dllm_future
+                if self.dllm_config is not None
+                and self.dllm_config.first_done_first_out_mode
+                else None
+            ),
         )
 
     def maybe_init_decode_offload_manager(self) -> None:
@@ -4307,6 +4313,15 @@ class Scheduler(
             if self.enable_hicache_storage and should_retry_storage_prefetch:
                 self._process_storage_prefetch_retries()
 
+    def _clear_dllm_future(self, req):
+        if self.future_map is None:
+            return
+        buf = self.future_map.dllm_block_tokens_buf
+        slot = req.kv.req_pool_idx
+        if buf is not None and slot is not None:
+            with self.forward_stream_ctx if self.enable_overlap else nullcontext():
+                buf[slot] = -1
+
     @scheduler_stage_method(SCHEDULER_STAGE_GET_NEXT_BATCH)
     def get_next_batch_to_run(
         self, running_batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
@@ -4318,11 +4333,10 @@ class Scheduler(
         if self.dllm_config is not None:
             # Read before the merge below empties last_batch.
             staged = self.dllm_manager.staged_reqs(last_batch)
+            self.finish_completed_dllm_blocks()
 
         # Merge the prefill batch into the running batch
         reqs_to_exclude = set(staged)
-        for req in staged:
-            self.finish_dllm_forward(req)
 
         if self.chunked_req is not None:
             # Move the chunked request out of the batch so that we can merge
@@ -4390,7 +4404,7 @@ class Scheduler(
             running_batch.batch_is_full = False
 
         if self.dllm_config is not None:
-            new_batch = self.get_new_batch_dllm(running_batch, staged)
+            new_batch = self.get_new_batch_dllm(running_batch)
         elif self._should_defer_prefill(running_batch):
             new_batch = None
             self._negotiate_prefill_delayer_while_deferring()
@@ -5453,9 +5467,15 @@ class Scheduler(
                         # FIXME(lsyin): maybe move this to forward_batch_generation
                         batch_result.copy_done = self.device_module.Event()
                         if batch_result.delay_sample_func is None:
-                            self._relay_forward_payload(
-                                batch, future_indices, batch_result
-                            )
+                            if batch.is_dllm():
+                                if self.dllm_config.first_done_first_out_mode:
+                                    self.future_map.stash_dllm_block_tokens(
+                                        future_indices, batch_result.next_token_ids
+                                    )
+                            else:
+                                self._relay_forward_payload(
+                                    batch, future_indices, batch_result
+                                )
                             if _is_hip:
                                 # Cross-stream sync costs more than the tiny D2H it
                                 # overlaps.
@@ -5591,7 +5611,12 @@ class Scheduler(
                 batch_result = self.model_worker.forward_batch_generation(
                     batch, **kwargs
                 )
-                if batch_result.has_sampled_token_ids:
+                if batch.is_dllm():
+                    if self.dllm_config.first_done_first_out_mode:
+                        self.future_map.stash_dllm_block_tokens(
+                            batch.req_pool_indices, batch_result.next_token_ids
+                        )
+                elif batch_result.has_sampled_token_ids:
                     # Non-spec: relay via future_map, gathered next iter.
                     self._relay_forward_payload(
                         batch, batch.req_pool_indices, batch_result

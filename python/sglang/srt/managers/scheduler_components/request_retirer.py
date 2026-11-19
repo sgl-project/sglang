@@ -44,6 +44,7 @@ class RequestRetirer:
         uocr_runtime: Optional[UocrSchedulerRuntime],
         send_abort_output: Callable[[AbortReq, Req], None],
         stream_output: Callable[..., None],
+        before_kv_release: Optional[Callable[[Req], None]] = None,
     ):
         self.tree_cache = tree_cache
         self.beam_coordinator = beam_coordinator
@@ -51,6 +52,7 @@ class RequestRetirer:
         self.uocr_runtime = uocr_runtime
         self.send_abort_output = send_abort_output
         self.stream_output = stream_output
+        self.before_kv_release = before_kv_release
 
     def abort(
         self,
@@ -103,7 +105,12 @@ class RequestRetirer:
         # HiSparse clears its mapping of the row before the row is freed.
         if req.kv.holds_kv and self.hisparse_coordinator is not None:
             self.hisparse_coordinator.release_request(req)
+        self._release_kv(req, checkpoint=checkpoint)
+
+    def _release_kv(self, req: Req, *, checkpoint: bool) -> None:
         if req.kv.holds_kv or req.kv.holds_mamba:
+            if self.before_kv_release is not None:
+                self.before_kv_release(req)
             release_kv_cache(req, self.tree_cache, checkpoint=checkpoint)
 
     def retract(self, req: Req, *, offload_kv: bool) -> bool:
@@ -126,8 +133,7 @@ class RequestRetirer:
         else:
             resumable = req.resumable_by_rebootstrap
         # TODO (csy): for preempted requests, we may want to insert into the tree
-        if req.kv.holds_kv or req.kv.holds_mamba:
-            release_kv_cache(req, self.tree_cache, checkpoint=False)
+        self._release_kv(req, checkpoint=False)
         return resumable
 
     def abort_retracted(self, req: Req, *, reason: FINISH_ABORT) -> None:

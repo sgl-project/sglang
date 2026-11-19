@@ -77,7 +77,7 @@ _ADMISSION_ENTRY_POINTS = {
     "prefill": lambda s, batch: s._get_new_batch_prefill_raw(
         prefill_delayer_single_pass=None, running_batch=batch
     ),
-    "dllm": lambda s, batch: s.get_new_batch_dllm(batch, []),
+    "dllm": lambda s, batch: s.get_new_batch_dllm(batch),
 }
 
 
