@@ -22,6 +22,8 @@ SLICE = 10
 
 
 class FakePool:
+    packed = True
+
     def __init__(self, skip_layers=()):
         self.skip_layers = set(skip_layers)
 

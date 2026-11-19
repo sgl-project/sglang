@@ -10,10 +10,11 @@ import torch
 
 import sglang.srt.mem_cache.unified_cache.unified_cache_linker as unified_cache_linker
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
-from sglang.srt.mem_cache.hybrid_cache.linker_page_unified import (
-    LinkerPageUnifiedStager,
+from sglang.srt.mem_cache.hybrid_cache.linker_key_identity import (
+    _head_group_entry,
 )
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import DevicePoolEntry
+from sglang.srt.mem_cache.storage.umbp import umbp_direct_linker
 from sglang.srt.mem_cache.storage.umbp.umbp_direct_linker import (
     UMBPDirectLinker,
     _ordered_layers,
@@ -104,7 +105,7 @@ class TestPackedDraftRanges(CustomTestCase):
 
 
 class TestUnifiedHeadGroups(CustomTestCase):
-    def test_windowed_offload_and_layer_wise_restore(self):
+    def test_head_group_offload_and_layer_wise_restore(self):
         buffers = [
             torch.arange(12 * 4 * 8, dtype=torch.int16).reshape(12, 4, 8) + 1000 * i
             for i in range(6)
@@ -144,9 +145,6 @@ class TestUnifiedHeadGroups(CustomTestCase):
 
         linker = UMBPDirectLinker.__new__(UMBPDirectLinker)
         linker._unified_layout = SimpleNamespace(suffixes={PoolName.KV: ["H0", "H1"]})
-        linker._load_stager = LinkerPageUnifiedStager(entry, 2)
-        linker._offload_stager = LinkerPageUnifiedStager(entry, 2)
-        linker._load_stager.capacity = linker._offload_stager.capacity = 1
         linker.storage = SimpleNamespace(
             config_prefix="tenant_model",
             client=SimpleNamespace(
@@ -155,12 +153,18 @@ class TestUnifiedHeadGroups(CustomTestCase):
                 batch_exists=lambda keys: [key in objects for key in keys],
             ),
         )
-        linker.pools = {PoolName.KV: entry}
+        linker.pools = {PoolName.KV: _head_group_entry(entry, 2)}
         linker.pool_layers = {PoolName.KV: [0, 1, 2]}
         linker.layer_group = 2
         linker.num_layers = 3
         linker._async_offload_index_snapshot = False
         linker._stats = {"offload": 0, "offload_batches": 0}
+        self.enterContext(mock.patch.object(umbp_direct_linker, "RANGES_PER_CALL", 12))
+        range_meta = self.enterContext(
+            mock.patch.object(
+                linker, "_layer_group_ranges", wraps=linker._layer_group_ranges
+            )
+        )
         linker.layer_done_counter = unified_cache_linker.LayerWiseLoadCounter(3)
         counter_index = linker.layer_done_counter.update_producer()
         ready = SimpleNamespace(synchronize=lambda: None)
@@ -192,6 +196,10 @@ class TestUnifiedHeadGroups(CustomTestCase):
         self.assertTrue(linker.finish_layer_wise_loading(counter_index))
         for buffer in buffers:
             torch.testing.assert_close(buffer[dest_slots], buffer[source_slots])
+        self.assertEqual(
+            [call.args[0].locations for call in range_meta.call_args_list],
+            [[3], [1], [4], [2], [4], [2]],
+        )
 
 
 class TestEveryRankWrites(CustomTestCase):

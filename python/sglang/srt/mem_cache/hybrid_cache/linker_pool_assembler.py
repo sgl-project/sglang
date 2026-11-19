@@ -163,10 +163,16 @@ class DevicePoolEntry:
         row_offsets = [item[3] for item in items]
         if self.packed:
             return ptrs.tolist(), [row_sizes] * len(rows), [row_offsets] * len(rows)
+        # Unpacked entries store one object per component. A head-group
+        # component can contain several nonadjacent ranges in the same layer.
+        width = len(buffer_indices)
+        if not width:
+            return [], [], []
+        starts = range(0, len(items), width)
         return (
-            ptrs.reshape(-1, 1).tolist(),
-            [[value] for value in row_sizes] * len(rows),
-            [[value] for value in row_offsets] * len(rows),
+            ptrs.reshape(-1, width).tolist(),
+            [row_sizes[i : i + width] for i in starts] * len(rows),
+            [row_offsets[i : i + width] for i in starts] * len(rows),
         )
 
 

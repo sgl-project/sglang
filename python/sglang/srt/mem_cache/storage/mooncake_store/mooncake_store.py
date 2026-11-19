@@ -1314,7 +1314,6 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         transfers: List[PoolTransfer],
         is_set: bool,
         session_id: Optional[str] = None,
-        pool_overrides: Mapping[PoolName, DevicePoolEntry] | None = None,
     ):
         # Expand every pool first so one logical operation becomes one Mooncake
         # RPC rather than one RPC per hybrid-cache component.
@@ -1325,9 +1324,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         all_group_ids = []
         buffer_requests = []
         for transfer in transfers:
-            host_pool = (pool_overrides or {}).get(transfer.name)
-            if host_pool is None:
-                host_pool = self.registered_pools.get(transfer.name)
+            host_pool = self.registered_pools.get(transfer.name)
             keys = transfer.keys
             if host_pool is None:
                 raise ValueError(f"Unregistered Mooncake hybrid pool: {transfer.name}")
@@ -1477,8 +1474,6 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         self,
         transfers: List[PoolTransfer],
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
-        *,
-        pool_overrides: Mapping[PoolName, DevicePoolEntry] | None = None,
     ) -> dict:
         # Write path carries both the request context and the writing session.
         # Mooncake publishes ``session_id`` on stored KV events, while the backup
@@ -1487,12 +1482,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             session_id = (
                 (extra_info.extra_info or {}).get("session_id") if extra_info else None
             )
-            return self._batch_io_v2(
-                transfers,
-                is_set=True,
-                session_id=session_id,
-                pool_overrides=pool_overrides,
-            )
+            return self._batch_io_v2(transfers, is_set=True, session_id=session_id)
 
     def _get_mha_split_heads_buffer_meta(self, keys, indices):
         ptr_list, element_size_list = (

@@ -536,6 +536,8 @@ class TestMooncakeUnifiedLinker(CustomTestCase):
         self.assertTrue(linker.load("request", [transfer]))
         return linker.finish_layer_wise_loading(linker.start_layer_wise_loading())
 
+    # A two-page split-head transfer needs two batches with this range budget.
+    @patch.object(mooncake_direct_linker, "_MAX_BATCH_RANGES", 64)
     def test_linker_and_hicache_exchange_canonical_page_bytes(self):
         for mla, head_partition, tp_size in (
             (False, 2, 2),
@@ -558,9 +560,6 @@ class TestMooncakeUnifiedLinker(CustomTestCase):
         linker, pool = self._make_linker(
             cluster, mla=mla, load_mode=load_mode, head_partition=head_partition
         )
-        if head_partition is not None:
-            # A two-page request must use multiple staging windows in both directions.
-            linker.load_stager.capacity = linker.offload_stager.capacity = 1
         hosts = [
             _Rank(
                 cluster,

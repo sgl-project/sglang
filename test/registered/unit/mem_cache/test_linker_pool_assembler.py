@@ -77,25 +77,36 @@ class TestDevicePoolEntry(CustomTestCase):
         self.assertEqual(offsets, [[6], [14], [6], [14]])
 
     def test_layer_ranges_preserve_layout_and_row_order(self):
-        buffers = [torch.zeros((6, width), dtype=torch.uint8) for width in (3, 5)]
+        components = [
+            [torch.zeros((6, width), dtype=torch.uint8) for width in widths]
+            for widths in ((3, 5), (7, 11))
+        ]
+        buffers = [buffer for component in components for buffer in component]
         for packed in (True, False):
             pool = DevicePoolEntry(
                 name=PoolName.KV,
                 indices_from_pool=PoolName.KV,
                 device_pool=None,
-                components=[buffers],
+                components=components,
                 layer_mapping={0: (0, 1)},
                 page_size=1,
                 rows_are_pages=True,
                 packed=packed,
             )
             for rows in ([4, 0, 4], []):
-                ptrs = [[buffer[row].data_ptr() for buffer in buffers] for row in rows]
-                expected = (ptrs, [[3, 5]] * len(rows), [[0, 3]] * len(rows))
-                if not packed:
-                    expected = tuple(
-                        [[value] for row in part for value in row] for part in expected
-                    )
+                if packed:
+                    ptrs = [
+                        [buffer[row].data_ptr() for buffer in buffers] for row in rows
+                    ]
+                    sizes, offsets = [[3, 5, 7, 11]], [[0, 3, 8, 15]]
+                else:
+                    ptrs = [
+                        [buffer[row].data_ptr() for buffer in component]
+                        for row in rows
+                        for component in components
+                    ]
+                    sizes, offsets = [[3, 5], [7, 11]], [[0, 3], [0, 7]]
+                expected = (ptrs, sizes * len(rows), offsets * len(rows))
                 for locations in (rows, np.asarray(rows, dtype=np.int64)):
                     with self.subTest(packed=packed, rows=rows, kind=type(locations)):
                         self.assertEqual(
@@ -1390,28 +1401,6 @@ class TestUmbpMultiBufferLayerMapping(CustomTestCase):
         self.assertEqual([len(layer) for layer in items], [2, 2])
         offsets = [item[3] for layer in items for item in layer]
         self.assertEqual(offsets, entry._component_offsets[0])
-
-    def test_unpacked_entry_refuses_a_multi_buffer_layer(self):
-        from sglang.srt.mem_cache.storage.umbp.umbp_direct_linker import (
-            UMBPDirectLinker,
-            _PoolRangePlan,
-        )
-
-        buffers = [torch.zeros((8, 4), dtype=torch.uint8) for _ in range(4)]
-        entry = self._entry([buffers], {0: (0, 1), 1: (2, 3)}, packed=False)
-        plan = _PoolRangePlan(
-            name=PoolName.KV,
-            keys=["a"],
-            locations=[0],
-            entries_per_page=1,
-            entry=entry,
-        )
-        linker = object.__new__(UMBPDirectLinker)
-
-        # One object per (page, component) cannot express a layer that spans
-        # two buffers of the same component: it has no object to put them in.
-        with self.assertRaisesRegex(ValueError, "no object partition"):
-            UMBPDirectLinker._layer_group_ranges(linker, plan, [0, 1])
 
 
 if __name__ == "__main__":
