@@ -71,6 +71,8 @@ on:
 
 # Mirrors _pr-test-stage.yml's env, so a rerun validates what CI actually ran.
 env:
+  # Evidence branch: each job installs into its own /tmp venv, removed by the cleanup step.
+  USE_VENV: "1"
   # PyTorch stack for scripts/ci/cuda/ci_install_dependency.sh. Set here because
   # some self-hosted runners export an older CU_VERSION into the job environment.
   CU_VERSION: cu134
@@ -252,6 +254,10 @@ jobs:
         if: failure()
         with:
           artifact-suffix: ${{ matrix.partition }}
+
+      - name: Clean up per-job venv
+        if: always()
+        run: bash scripts/ci/cuda/ci_cleanup_venv.sh
 
   rerun-test-multimodal-gen:
     name: rerun-test-multimodal-gen (partition ${{ matrix.partition }})
