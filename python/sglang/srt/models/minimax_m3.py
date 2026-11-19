@@ -551,14 +551,14 @@ class MiniMaxM3MoE(nn.Module):
                 "M3.1 NVFP4 MegaMoE weights are not ready on this device"
             )
         num_tokens = hidden_states.shape[0]
-        # Under CUDA-graph capture the shared expert runs on the alt stream beside
-        # the router and MegaMoE, which keeps SMs free for other streams (as
-        # DeepSeek's forward_mega_moe forks it); eager steps run it inline.
+        # Overlap with the router and MegaMoE only in a whole-graph capture,
+        # since a breakable-graph break would split the fork from its join.
         fork_shared = (
             self.alt_stream is not None
             and self.shared_experts is not None
             and num_tokens > 0
             and get_is_capture_mode()
+            and not is_in_breakable_cuda_graph()
         )
         if fork_shared:
             self.alt_stream.wait_stream(torch.cuda.current_stream())
