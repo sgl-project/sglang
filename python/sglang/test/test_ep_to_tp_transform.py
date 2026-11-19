@@ -26,6 +26,7 @@ from sglang.srt.distributed.parallel_state import (
 from sglang.srt.layers.moe.ep_to_tp_transform import (
     EP_TO_TP_SUPPORTED_ARCHS,
     maybe_ep_to_tp_transform_all_layers,
+    node_expert_prefetch_selection,
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.utils import MoeRunnerBackend, initialize_moe_config
@@ -981,6 +982,42 @@ class TestEpToTpTransform(unittest.TestCase):
         self.assertTrue(groups)
         self.assertNotIn(tp_device_group, groups)
         self.assertFalse(moe._ep_load_for_tp)
+        del moe, stack
+
+    def test_prefetch_selection_keeps_only_this_nodes_experts(self):
+        """Selective prefetch skips exactly the routed experts that other nodes'
+        ranks own, and splits the files among the ranks of one node."""
+        n_routed = 16
+        big = 1 << 20
+
+        def expert(e):
+            return f"model.layers.0.mlp.experts.{e}.gate_proj.weight"
+
+        with _load_tp_by_experts_config(True):
+            moe = self._make_moe(num_experts=n_routed)
+            stack = _FakeDecoderStack([_FakeLayer(_FakeMoEMlp(moe))], 0, 1)
+            same_node = node_expert_prefetch_selection(stack)
+            with mock.patch("socket.gethostname", return_value=f"host{self.rank}"):
+                own_node = node_expert_prefetch_selection(stack)
+
+        self.assertEqual(
+            (same_node.node_rank, same_node.node_size), (self.rank, self.world_size)
+        )
+        self.assertTrue(all(same_node.keep(expert(e), big) for e in range(n_routed)))
+
+        self.assertEqual((own_node.node_rank, own_node.node_size), (0, 1))
+        per_rank = n_routed // self.world_size
+        own = range(self.rank * per_rank, (self.rank + 1) * per_rank)
+        for e in range(n_routed):
+            self.assertEqual(own_node.keep(expert(e), big), e in own, expert(e))
+            # Per-expert scales load on every rank.
+            self.assertTrue(
+                own_node.keep(expert(e).replace("weight", "input_scale"), 4)
+            )
+        self.assertTrue(own_node.keep("model.layers.0.self_attn.o_proj.weight", big))
+        self.assertTrue(
+            own_node.keep("model.layers.0.mlp.shared_experts.down_proj.weight", big)
+        )
         del moe, stack
 
     def test_transform_matches_tp_shape_when_padding_does_not_commute(self):

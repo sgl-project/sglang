@@ -15,6 +15,8 @@ K3) can drive the same transform.
 from __future__ import annotations
 
 import logging
+import re
+import socket
 import time
 from typing import TYPE_CHECKING
 
@@ -25,6 +27,8 @@ from sglang.srt.runtime_context import get_model, get_parallel
 
 if TYPE_CHECKING:
     import torch.nn as nn
+
+    from sglang.srt.model_loader.weight_utils import SelectedPrefetch
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +64,66 @@ def load_tp_by_experts_requested(model_loader_extra_config: str | dict) -> bool:
 def is_load_tp_by_experts_enabled() -> bool:
     """Whether ``--model-loader-extra-config`` requested EP-style TP loading."""
     return load_tp_by_experts_requested(get_model().model_loader_extra_config)
+
+
+_EXPERT_INDEX = re.compile(r"\.experts\.(\d+)\.")
+# Every rank loads some per-expert tensors for all experts (e.g. NVFP4 input
+# scales), so tensors this small are prefetched whatever expert they belong to.
+_ALWAYS_PREFETCH_BYTES = 64 * 1024
+
+
+def node_expert_prefetch_selection(model: nn.Module) -> SelectedPrefetch | None:
+    """The checkpoint tensors this node's ranks read under ``load_tp_by_experts``.
+
+    Keeps every tensor except the routed experts of ranks on other nodes, and
+    splits the node's files among its TP ranks. None when no MoE layer loads
+    EP-style. All TP ranks must call this together: it gathers each rank's
+    host and experts over the TP group.
+    """
+    from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
+    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+    from sglang.srt.model_loader.weight_utils import SelectedPrefetch
+
+    metadata = get_global_expert_location_metadata()
+    local_experts: set[int] = set()
+    for module in model.modules():
+        if not isinstance(module, FusedMoE) or not module._ep_load_for_tp:
+            continue
+        start = module._expert_storage_rank * module._num_local_routed
+        end = start + module._num_local_routed
+        if (
+            metadata is not None
+            and module.layer_id < metadata.physical_to_logical_map_cpu.shape[0]
+        ):
+            physical_to_logical = metadata.physical_to_logical_map_cpu[module.layer_id]
+            local_experts.update(physical_to_logical[start:end].tolist())
+        else:
+            local_experts.update(range(start, end))
+    if not local_experts:
+        return None
+
+    tp_group = get_parallel().tp_group
+    host = socket.gethostname()
+    peers: list[tuple[str, list[int]]] = [None] * tp_group.world_size
+    torch.distributed.all_gather_object(
+        peers, (host, sorted(local_experts)), group=tp_group.cpu_group
+    )
+    node = [rank for rank, (peer_host, _) in enumerate(peers) if peer_host == host]
+    node_experts = {e for rank in node for e in peers[rank][1]}
+
+    def keep(name: str, nbytes: int) -> bool:
+        match = _EXPERT_INDEX.search(name)
+        return (
+            match is None
+            or nbytes <= _ALWAYS_PREFETCH_BYTES
+            or int(match.group(1)) in node_experts
+        )
+
+    return SelectedPrefetch(
+        keep=keep,
+        node_rank=node.index(tp_group.rank_in_group),
+        node_size=len(node),
+    )
 
 
 def _new_transform_group() -> torch.distributed.ProcessGroup:

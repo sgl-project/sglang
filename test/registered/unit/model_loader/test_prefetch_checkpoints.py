@@ -5,9 +5,12 @@ Verifies that weights loaded with prefetch enabled are bit-identical
 to weights loaded without prefetch.
 """
 
+import functools
+import json
 import os
 import tempfile
 import threading
+import time
 import unittest
 from concurrent.futures import Future
 from types import SimpleNamespace
@@ -20,7 +23,10 @@ from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.model_loader.weight_utils import (
     CheckpointFilePrefetchHandle,
+    SelectedPrefetch,
     _prefetch_all_checkpoints,
+    _prefetch_selected_tensors,
+    _selected_read_ranges,
     buffered_multi_thread_safetensors_weights_iterator,
     fastsafetensors_weights_iterator,
     safetensors_weights_iterator,
@@ -383,6 +389,142 @@ class TestPrefetchCheckpoints(CustomTestCase):
             list(fastsafetensors_weights_iterator(["model.safetensors"]))
 
         self.assertEqual(devices, [torch.device("cuda", 1)])
+
+    def test_selected_read_ranges_cover_only_kept_tensors(self):
+        """Kept tensors merge across small gaps; dropped tensors are read only
+        inside such a gap."""
+        sizes = {"a": 3000, "b": 3000, "c": 4, "d": 2500, "e": 4000, "f": 50, "g": 9}
+        keep = {"a", "c", "d", "g"}
+        gap = 100
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "model.safetensors")
+            safetensors.torch.save_file(
+                {k: torch.zeros(n, dtype=torch.uint8) for k, n in sizes.items()}, path
+            )
+            with open(path, "rb") as f:
+                header_len = int.from_bytes(f.read(8), "little")
+                header = json.loads(f.read(header_len))
+            with patch(
+                "sglang.srt.model_loader.weight_utils._SELECTED_PREFETCH_MERGE_GAP",
+                gap,
+            ):
+                ranges = _selected_read_ranges(path, lambda n, _: n in keep)
+
+        base = 8 + header_len
+        kept_bytes = set()
+        for name in keep:
+            begin, end = header[name]["data_offsets"]
+            kept_bytes.update(range(base + begin, base + end))
+        self.assertTrue(all(a[1] < b[0] for a, b in zip(ranges, ranges[1:])))
+        read = set().union(*(range(start, end) for start, end in ranges))
+        self.assertTrue(kept_bytes <= read)
+        extra = sorted(read - kept_bytes)
+        runs = []
+        for pos in extra:
+            if runs and pos == runs[-1][1]:
+                runs[-1][1] = pos + 1
+            else:
+                runs.append([pos, pos + 1])
+        for start, end in runs:
+            self.assertLessEqual(end - start, gap)
+            self.assertIn(start - 1, kept_bytes)
+            self.assertIn(end, kept_bytes)
+
+    @patch("torch.distributed.is_initialized", return_value=False)
+    def test_selected_prefetch_yields_identical_weights(self, _):
+        """A prefetch selection changes what is read ahead, never what is loaded."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = self._create_safetensors_files(tmpdir, num_shards=12)
+            expected = dict(safetensors_weights_iterator(paths, prefetch=False))
+            selection = SelectedPrefetch(
+                keep=lambda name, nbytes: name.endswith(".bias"),
+                node_rank=0,
+                node_size=1,
+            )
+            for iterator in (
+                safetensors_weights_iterator,
+                functools.partial(
+                    buffered_multi_thread_safetensors_weights_iterator, max_workers=2
+                ),
+            ):
+                loaded = list(
+                    iterator(paths, prefetch=True, prefetch_selection=selection)
+                )
+                self.assertEqual([n for n, _ in loaded], list(expected))
+                for name, tensor in loaded:
+                    torch.testing.assert_close(tensor, expected[name])
+
+    @patch("torch.distributed.is_initialized", return_value=False)
+    def test_selected_prefetch_partitions_files_across_the_node(self, _):
+        """The node's ranks together prefetch every file exactly once."""
+        paths = [f"model-{i:05d}.safetensors" for i in range(11)]
+        read = []
+        with (
+            patch(
+                "sglang.srt.model_loader.weight_utils._selected_read_ranges",
+                return_value=[(0, 64)],
+            ),
+            patch(
+                "sglang.srt.model_loader.weight_utils._read_ranges",
+                side_effect=lambda path, ranges, cancel: read.append(path) or 0,
+            ),
+        ):
+            for node_rank in range(3):
+                handle = _prefetch_selected_tensors(
+                    paths,
+                    selection=SelectedPrefetch(
+                        keep=lambda name, nbytes: True,
+                        node_rank=node_rank,
+                        node_size=3,
+                    ),
+                    num_threads=2,
+                )
+                handle.begin_file(len(paths))
+                handle.wait(timeout=30)
+        self.assertEqual(sorted(read), paths)
+
+    @patch("torch.distributed.is_initialized", return_value=False)
+    def test_selected_prefetch_stays_within_lookahead(self, _):
+        """The prefetch starts no file more than its lookahead past the loader,
+        so a selection larger than the page cache is not read and evicted
+        before the loader reaches it."""
+        paths = [f"model-{i:05d}.safetensors" for i in range(40)]
+        started = []
+        with (
+            patch(
+                "sglang.srt.model_loader.weight_utils._selected_read_ranges",
+                side_effect=lambda path, keep: started.append(path) or [(0, 64)],
+            ),
+            patch(
+                "sglang.srt.model_loader.weight_utils._read_ranges",
+                return_value=0,
+            ),
+        ):
+            handle = _prefetch_selected_tensors(
+                paths,
+                selection=SelectedPrefetch(
+                    keep=lambda name, nbytes: True,
+                    node_rank=0,
+                    node_size=1,
+                ),
+                num_threads=2,
+            )
+            lookahead = handle._lookahead
+            deadline = time.monotonic() + 30
+            while len(started) < lookahead and time.monotonic() < deadline:
+                time.sleep(0.01)
+            time.sleep(0.5)
+            self.assertEqual(sorted(started), paths[:lookahead])
+
+            handle.begin_file(5)
+            deadline = time.monotonic() + 30
+            while len(started) < lookahead + 6 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            time.sleep(0.5)
+            self.assertEqual(sorted(started), paths[: lookahead + 6])
+
+            handle.stop(timeout=30)
+            self.assertTrue(handle.done)
 
 
 class TestPrefetchDispatch(CustomTestCase):
