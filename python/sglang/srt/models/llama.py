@@ -607,6 +607,7 @@ class LlamaForCausalLM(nn.Module):
             supported_architecture=type(self) is LlamaForCausalLM
             and config.model_type == "llama",
             quant_config=quant_config,
+            model_type=config.model_type,
         )
 
     def _init_model(

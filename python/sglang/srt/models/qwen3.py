@@ -829,6 +829,7 @@ class Qwen3ForCausalLM(nn.Module):
             supported_architecture=type(self) is Qwen3ForCausalLM
             and config.model_type == "qwen3",
             quant_config=quant_config,
+            model_type=config.model_type,
         )
 
     def get_input_embeddings(self) -> nn.Embedding:

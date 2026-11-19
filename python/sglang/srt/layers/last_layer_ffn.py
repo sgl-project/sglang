@@ -1,9 +1,46 @@
-"""Shared last-layer FFN row selection for supported dense decoders."""
+"""Shared last-layer FFN row selection for supported dense decoders.
+
+The optimization is automatic for the measured dense architectures. There is
+no environment variable. Quantized, parallel, LoRA, TBO, and full-hidden-state
+requests keep the ordinary path, as do input shapes without a measured gain.
+"""
 
 import torch
 
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
+
+# Smallest newly extended token count whose paired 95% savings interval stayed
+# positive on RTX 4090, BF16, breakable prefill graphs. Shorter totals keep the
+# ordinary path. The key is the architecture, not one checkpoint. Each cutoff
+# was measured on one model and then used for that architecture.
+# qwen2 (Qwen2 and Qwen2.5): Qwen2.5-7B, 128 crossed zero; 512-token totals did not.
+# qwen3: Qwen3-4B, 128 crossed zero; 512x1 and larger measured totals did not.
+# llama: LlamaForCausalLM with model_type "llama", including Llama 2 and Llama 3.
+# The 2048-token cutoff was measured on Llama-3.2-1B.
+MIN_EXTEND_TOKENS = {
+    "qwen2": 512,
+    "qwen3": 512,
+    "llama": 2048,
+}
+# Pruned graphs exist only at buckets replayed with a positive interval.
+# The default capture ladder is otherwise left on the ordinary graph.
+# Qwen2 adds 16384 because 4096x4 was measured; Qwen3 and Llama were not.
+FFN_GRAPH_TOKEN_BUCKETS = {
+    "qwen2": (512, 2048, 4096, 8192, 16384),
+    "qwen3": (512, 2048, 4096, 8192),
+    "llama": (2048, 8192),
+}
+# Measured batches are 1 and 4. A 16-row variant would cover unmeasured
+# batches, so batches above 4 stay on the ordinary path.
+FFN_GRAPH_ROWS = (1, 4)
+FFN_GRAPH_VARIANT = "last_layer_ffn_"
+
+if set(MIN_EXTEND_TOKENS) != set(FFN_GRAPH_TOKEN_BUCKETS):
+    raise RuntimeError("last-layer FFN architecture tables diverged")
+for _model_type, _buckets in FFN_GRAPH_TOKEN_BUCKETS.items():
+    if any(bucket < MIN_EXTEND_TOKENS[_model_type] for bucket in _buckets):
+        raise RuntimeError(f"{_model_type} graph bucket is below its measured minimum")
 
 
 def eligible_batch(batch):
@@ -77,14 +114,29 @@ def select_attention_rows(hidden_states, batch, indices):
     return residual_batch.import_replay_handoff(handoff, batch)
 
 
-# Graph variants bound the output shape independently of token count.
-FFN_GRAPH_ROWS = (1, 4, 16)
-FFN_GRAPH_VARIANT = "last_layer_ffn_"
+def shape_allows_pruning(batch, min_extend_tokens):
+    """Enable only shapes with a measured gain for this architecture."""
+    if min_extend_tokens is None or batch.batch_size > FFN_GRAPH_ROWS[-1]:
+        return False
+    lens = batch.extend_seq_lens_cpu
+    return bool(lens) and sum(lens) >= min_extend_tokens
 
 
-def graph_rows_for_batch(batch):
+def select_graph_token_buckets(model_type, capture_num_tokens):
+    """Measured buckets that this server already captures."""
+    minimum = MIN_EXTEND_TOKENS[model_type]
+    captured = set(capture_num_tokens)
+    return tuple(
+        bucket
+        for bucket in FFN_GRAPH_TOKEN_BUCKETS[model_type]
+        if bucket >= minimum and bucket in captured
+    )
+
+
+def graph_rows_for_batch(batch, min_extend_tokens):
     if (
-        not eligible_batch(batch)
+        not shape_allows_pruning(batch, min_extend_tokens)
+        or not eligible_batch(batch)
         or batch.input_embeds is not None
         or getattr(batch, "return_pooled_hidden_states", False)
         or getattr(batch, "_original_forward_mode", None) == ForwardMode.MIXED
@@ -104,18 +156,18 @@ def stage_graph_indices(buffer, seq_lens, rows):
         buffer[bs:rows].zero_()
 
 
-def configure_last_layer_ffn(model, *, supported_architecture, quant_config):
-    """An explicit architecture opt-in, restricted to the validated layouts."""
-    from sglang.srt.environ import envs
+def configure_last_layer_ffn(
+    model, *, supported_architecture, quant_config, model_type
+):
+    """Enable measured architectures. Unsupported layouts stay on the original path."""
     from sglang.srt.model_executor.cuda_graph_config import Backend
     from sglang.srt.runtime_context import get_exec, get_parallel
     from sglang.srt.utils import is_cuda
 
-    model.enable_last_layer_ffn_pruning = (
-        envs.SGLANG_ENABLE_LAST_LAYER_FFN_PRUNING.get()
-    )
+    recognized = model_type in MIN_EXTEND_TOKENS
     model._ffn_pruning_supported = (
         supported_architecture
+        and recognized
         and quant_config is None
         and is_cuda()
         and get_parallel().tp_size == 1
@@ -125,6 +177,13 @@ def configure_last_layer_ffn(model, *, supported_architecture, quant_config):
         and get_exec().graph.cuda_graph_config.prefill.backend
         in (Backend.DISABLED, Backend.BREAKABLE)
     )
+    model.enable_last_layer_ffn_pruning = model._ffn_pruning_supported
+    if model._ffn_pruning_supported:
+        model.last_layer_ffn_min_extend_tokens = MIN_EXTEND_TOKENS[model_type]
+        model.last_layer_ffn_graph_buckets = FFN_GRAPH_TOKEN_BUCKETS[model_type]
+    else:
+        model.last_layer_ffn_min_extend_tokens = None
+        model.last_layer_ffn_graph_buckets = ()
 
 
 def prepare_last_layer_ffn(model, batch, *, get_embedding=False, input_embeds=None):
@@ -144,6 +203,7 @@ def prepare_last_layer_ffn(model, batch, *, get_embedding=False, input_embeds=No
         and not is_in_prefill_graph_scope()
         and model.enable_last_layer_ffn_pruning
         and model._ffn_pruning_supported
+        and shape_allows_pruning(batch, model.last_layer_ffn_min_extend_tokens)
         and not get_embedding
         and input_embeds is None
         and not model.capture_aux_hidden_states

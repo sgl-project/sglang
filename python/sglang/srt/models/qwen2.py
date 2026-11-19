@@ -564,6 +564,7 @@ class Qwen2ForCausalLM(nn.Module):
             supported_architecture=type(self) is Qwen2ForCausalLM
             and config.model_type == "qwen2",
             quant_config=quant_config,
+            model_type=config.model_type,
         )
 
     def get_input_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:

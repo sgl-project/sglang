@@ -90,6 +90,10 @@
       "destination": "/docs/advanced_features/breakable_cuda_graph"
     },
     {
+      "source": "/advanced_features/last_layer_ffn_pruning.html",
+      "destination": "/docs/advanced_features/last_layer_ffn_pruning"
+    },
+    {
       "source": "/advanced_features/checkpoint_engine.html",
       "destination": "/docs/advanced_features/checkpoint_engine"
     },
@@ -1003,6 +1007,7 @@
               "docs/advanced_features/dp_for_multi_modal_encoder",
               "docs/advanced_features/cuda_graph_for_multi_modal_encoder",
               "docs/advanced_features/breakable_cuda_graph",
+              "docs/advanced_features/last_layer_ffn_pruning",
               "docs/advanced_features/llm-d",
               "docs/advanced_features/deterministic_inference",
               "docs/advanced_features/observability",

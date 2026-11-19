@@ -506,7 +506,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # Current layer-stack invocation; each TBO child owns a separate stream.
     residual_stream: Optional[ResidualStream] = None
-    # Per-invocation metadata for dense Qwen last-layer FFN pruning.
+    # Per-invocation metadata for dense Qwen2, Qwen3, and Llama last-layer FFN pruning.
     last_layer_ffn_indices: Optional[torch.Tensor] = None
     last_layer_ffn_pruned: bool = False
     last_layer_ffn_graph_rows: int = 0
