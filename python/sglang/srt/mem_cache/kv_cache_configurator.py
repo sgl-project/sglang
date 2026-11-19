@@ -1206,6 +1206,10 @@ class KVCacheConfigurator:
                         decode=mamba.enable_linear_replayssm,
                         speculative=replay_spec,
                         is_kda=cache_params.is_kda,
+                        compact_kda=replay_spec
+                        and cache_params.use_compact_kda_replay(
+                            decode=mamba.enable_linear_replayssm
+                        ),
                         cache_len=mamba.linear_replayssm_cache_len,
                         key_heads=cache_params.shape.num_k_heads_per_tp,
                     ),
@@ -3699,9 +3703,14 @@ class KVCacheConfigurator:
         )
         if replayssm_active:
             record_len = get_exec().mamba.linear_replayssm_cache_len
+            compact_kda = config.mamba2_cache_params.use_compact_kda_replay(
+                decode=get_exec().mamba.enable_linear_replayssm
+            )
+            if compact_kda:
+                record_len = max_speculative_num_draft_tokens() or record_len
             replayssm_ring_per_req = (
                 config.mamba2_cache_params.replayssm_ring_bytes_per_req(
-                    record_len=record_len
+                    record_len=record_len, compact_kda=compact_kda
                 )
             )
         else:

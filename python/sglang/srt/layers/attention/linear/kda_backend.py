@@ -1321,6 +1321,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
         # skips the write (CACHE_INTERMEDIATE_STATES=False); the output is unaffected.
         replayssm_rawv = getattr(mamba_cache_params, "replayssm_rawv", None)
         replayssm_on = replayssm_rawv is not None
+        save_kda_deltas = replayssm_on and getattr(
+            self.state_pool, "compact_kda_replay", False
+        )
         if intermediate_state_cache is None and not replayssm_on:
             raise RuntimeError(
                 "KDA target_verify requires a speculative mamba cache "
@@ -1390,6 +1393,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 replayssm_g=mamba_cache_params.replayssm_g,
                 replayssm_beta=mamba_cache_params.replayssm_beta,
                 replayssm_ring_indices=ring_kwargs.get("ring_indices"),
+                save_kda_deltas=save_kda_deltas,
             )
         if ragged_layout is None:
             batch_size = seq_len // draft_token_num
@@ -1418,7 +1422,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             # conv1d + transpose-copy + recurrence sequence. Chain (topk==1) only --
             # retrieve_* are None there; the tree path and any unsupported shape keep
             # the reference kernels.
-            if self._can_run_fused_chain_verify(
+            if not save_kda_deltas and self._can_run_fused_chain_verify(
                 layer=layer,
                 mixed_qkv=mixed_qkv,
                 a=a,
@@ -1542,6 +1546,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             cache_steps=draft_token_num,
             retrieve_parent_token=retrieve_parent_token,
             lower_bound=layer.lower_bound,
+            save_kda_deltas=save_kda_deltas,
             **ring_kwargs,
             **(
                 dict(
@@ -1930,6 +1935,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         replayssm_g: Optional[torch.Tensor] = None,
         replayssm_beta: Optional[torch.Tensor] = None,
         replayssm_ring_indices: Optional[torch.Tensor] = None,
+        save_kda_deltas: bool = False,
     ) -> torch.Tensor:
         from sglang.kernels.ops.attention.kda_decode_mtp import (
             fused_kda_decode_mtp_dspark,
@@ -2001,6 +2007,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             replayssm_beta=replayssm_beta,
             replayssm_ring_indices=replayssm_ring_indices,
             onorm_gate=onorm_gate,
+            save_kda_deltas=save_kda_deltas,
             onorm_weight=onorm_weight,
             onorm_eps=onorm_eps,
         )

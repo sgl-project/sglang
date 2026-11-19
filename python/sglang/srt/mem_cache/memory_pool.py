@@ -687,7 +687,7 @@ class MambaPool:
         self.linear_replayssm_cache_len = linear_replayssm_cache_len
         # ReplaySSM: the decode ring (--enable-linear-replayssm) allocates the
         # chunked (d, k) records + write_pos; the spec-verify flag
-        # (--enable-linear-replayssm-spec) uses compact replay for GDN and raw
+        # (--enable-linear-replayssm-spec) uses compact replay for GDN and
         # fold-every-commit for KDA. The shared g allocation gates on
         # `_replayssm_on`.
         self.enable_linear_replayssm_spec = enable_linear_replayssm_spec
@@ -696,6 +696,10 @@ class MambaPool:
         )
         _replayssm_on = enable_linear_replayssm or enable_linear_replayssm_spec
         self.replayssm_request_ring = False
+        self.compact_kda_replay = (
+            enable_linear_replayssm_spec
+            and cache_params.use_compact_kda_replay(decode=enable_linear_replayssm)
+        )
 
         # for disagg with nvlink
         self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
@@ -815,23 +819,12 @@ class MambaPool:
                 # Decode records follow the SSM dtype. Spec-verify compact d/k
                 # records follow the activation dtype; g stays fp32.
                 ring_dtype = conv_dtype if enable_linear_replayssm_spec else ssm_dtype
-                # Fold-every-commit: one verify window, no chunked (d, k)
-                # records. KDA is the exception on both counts: its window
-                # stays L-sized (the fused verify ring-write drops
-                # absorb-inflated rows past L), and d/k stay allocated --
-                # forward_decode routes on `replayssm_d is None` (fused vs
-                # decode-ring), so skipping them would flip KDA decode to the
-                # fused path, a behavior change needing its own validation
-                # (memory follow-up).
-                if self.replayssm_spec_fold and not cache_params.is_kda:
-                    record_len = (
-                        speculative_num_draft_tokens
-                        if speculative_num_draft_tokens is not None
-                        else L
-                    )
-                else:
-                    record_len = L
-                if not self.replayssm_spec_fold or cache_params.is_kda:
+                # Compact speculative records hold one verify window; decode uses d/k.
+                fold_window = self.compact_kda_replay or (
+                    self.replayssm_spec_fold and not cache_params.is_kda
+                )
+                record_len = (speculative_num_draft_tokens or L) if fold_window else L
+                if not fold_window:
                     replayssm_d = torch.zeros(
                         size=(num_mamba_layers, num_slots, hv, L, v_dim),
                         dtype=ring_dtype,
@@ -855,10 +848,8 @@ class MambaPool:
                     dtype=torch.float32,
                     device=device,
                 )
-                # KDA still uses raw-input fold-every-commit. GDN materializes
-                # its compact d/k/g history directly and needs no duplicate ring.
                 if enable_linear_replayssm_spec and cache_params.is_kda:
-                    if cache_params.is_kda or not self.replayssm_spec_fold:
+                    if not self.compact_kda_replay:
                         # Backstop for the KDA ring invariants; this pool is
                         # sized with the final adaptive-aware draft maximum.
                         if L & (L - 1) != 0:
@@ -873,14 +864,17 @@ class MambaPool:
                             raise ValueError(
                                 f"spec-verify ring too small: {L} < {min_ring_len}"
                             )
+                    record_dtype = (
+                        torch.float32 if self.compact_kda_replay else conv_dtype
+                    )
                     replayssm_rawv = torch.zeros(
                         size=(num_mamba_layers, num_slots, hv, record_len, v_dim),
-                        dtype=conv_dtype,
+                        dtype=record_dtype,
                         device=device,
                     )
                     replayssm_rawk = torch.zeros(
                         size=(num_mamba_layers, num_slots, h_k, record_len, k_dim),
-                        dtype=conv_dtype,
+                        dtype=record_dtype,
                         device=device,
                     )
                     replayssm_beta = torch.zeros(

@@ -252,6 +252,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     USE_GDC: tl.constexpr = False,
     MATCH_CUTEDSL_DECODE: tl.constexpr = False,
     ROUND_STATE_TO_BF16: tl.constexpr = False,
+    SAVE_KDA_DELTAS: tl.constexpr = False,
 ):
     """
     Fused kernel that combines sigmoid gating computation with recurrent delta rule update.
@@ -423,8 +424,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         else:
             b_beta = 1.0 / (1.0 + tl.exp(-b_b))
 
-        # fused ring-write: stash this step's raw inputs + in-kernel gate/beta
-        # into the per-slot ring for the commit fold to replay. Must sit here --
+        # Raw records must be captured before normalization and the delta rule:
         # b_k is still pre-l2norm, b_v still pre-delta, b_g/b_beta are formed,
         # so the fold's replay is bit-identical to the update below. rawk uses
         # the k-head i_h (shared across a GQA group); rawv/g/beta use the v-head
@@ -436,7 +436,8 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
                 ring_slot = tl.load(ring_indices + i_n).to(tl.int64)
             else:
                 ring_slot = tl.load(h0_indices + i_n).to(tl.int64)
-            if ring_slot >= 0 and step_idx < MAX_CACHE_LEN:
+            in_ring = ring_slot >= 0 and step_idx < MAX_CACHE_LEN
+            if not SAVE_KDA_DELTAS and in_ring:
                 tl.store(
                     replayssm_rawv
                     + ring_slot * stride_rawv_slot
@@ -527,6 +528,23 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
 
         # Apply beta gating: v *= beta
         b_v *= b_beta
+
+        if SAVE_KDA_DELTAS:
+            if in_ring:
+                vh_row = i_hv * MAX_CACHE_LEN + step_idx
+                k_row = i_h * MAX_CACHE_LEN + step_idx
+                values = replayssm_rawv + ring_slot * stride_rawv_slot
+                tl.store(values + vh_row * V + o_v, b_v, mask=mask_v)
+                if i_v == 0:
+                    keys = replayssm_rawk + ring_slot * stride_rawk_slot
+                    if i_hv % (HV // H) == 0:
+                        tl.store(keys + k_row * K + o_k, b_k, mask=mask_k)
+                    gates = replayssm_g + ring_slot * stride_g_slot
+                    decay = b_gate_multiplier if MATCH_CUTEDSL_DECODE else tl.exp(b_g)
+                    tl.store(gates + vh_row * K + o_k, decay, mask=mask_k)
+                    rounding = replayssm_beta + ring_slot * stride_beta_slot
+                    separate = not MATCH_CUTEDSL_DECODE and V == 128 and BV == 4
+                    tl.store(rounding + vh_row, separate)
 
         # Update hidden state: h += k[:, None] * v[None, :]
         if MATCH_CUTEDSL_DECODE:
@@ -633,6 +651,7 @@ def fused_sigmoid_gating_delta_rule_update(
     # decays and updates through FMA, and a BF16 state pool is rounded after
     # every token.
     match_cutedsl_decode: bool = False,
+    save_kda_deltas: bool = False,
 ):
     """
     Fused triton implementation of sigmoid gating delta rule update.
@@ -817,6 +836,7 @@ def fused_sigmoid_gating_delta_rule_update(
         stride_beta_slot=stride_beta_slot,
         MAX_CACHE_LEN=max_cache_len,
         CACHE_RING=cache_ring,
+        SAVE_KDA_DELTAS=cache_ring and is_kda and save_kda_deltas,
         ring_indices=ring_indices
         if ring_indices is not None
         else initial_state_indices,

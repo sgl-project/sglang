@@ -54,7 +54,8 @@ GATES = [(-5.0, "safe"), (None, "softplus")]
     "lower_bound", [g[0] for g in GATES], ids=[g[1] for g in GATES]
 )
 @pytest.mark.parametrize("pad", [False, True], ids=["nopad", "pad"])
-def test_ring_fold_parity(bs, T, HV, H, K, V, lower_bound, pad):
+@pytest.mark.parametrize("compact", [False, True] if torch.version.cuda else [False])
+def test_ring_fold_parity(bs, T, HV, H, K, V, lower_bound, pad, compact):
     L = max(16, 2 * T)  # ring length; power-of-two backstop satisfied
     scale = K**-0.5
     torch.manual_seed(0)
@@ -108,6 +109,7 @@ def test_ring_fold_parity(bs, T, HV, H, K, V, lower_bound, pad):
         cache_steps=T,
         # fused ring-write (kwargs below are added by the fusion).
         cache_ring=True,
+        save_kda_deltas=compact,
         replayssm_rawv=rawv,
         replayssm_rawk=rawk,
         replayssm_g=gring,
@@ -125,6 +127,7 @@ def test_ring_fold_parity(bs, T, HV, H, K, V, lower_bound, pad):
         slots,
         acc,
         max_cache_len=L,
+        save_kda_deltas=compact,
         num_k_heads=H,
         use_qk_l2norm_in_kernel=True,
         null_block_id=-1,

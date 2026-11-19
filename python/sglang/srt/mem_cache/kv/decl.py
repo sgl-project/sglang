@@ -150,6 +150,7 @@ class StateReplay(msgspec.Struct, frozen=True, kw_only=True):
     is_kda: bool
     cache_len: int
     key_heads: int
+    compact_kda: bool = False
 
 
 class StateGeometry(msgspec.Struct, frozen=True, kw_only=True):
@@ -363,11 +364,14 @@ def with_state_replay(
         return geometry
     hv, value_dim, key_dim = geometry.temporal_state_shape
     length = replay.cache_len
+    if replay.compact_kda and speculative_num_draft_tokens is not None:
+        length = speculative_num_draft_tokens
     if length <= 0:
         raise ValueError("ReplaySSM ring length must be positive")
     if (
         replay.speculative
         and replay.is_kda
+        and not replay.compact_kda
         and (
             length & (length - 1)
             or (
@@ -410,20 +414,22 @@ def with_state_replay(
             slice_axis=0,
         ),
     ]
+    if replay.compact_kda:
+        ring = [part for part in ring if part.name == "replayssm_g"]
     if replay.speculative and (replay.is_kda or dtype != torch.float32):
         ring.extend(
             (
                 TensorPartDecl(
                     name="replayssm_rawv",
                     shape=(hv, length, value_dim),
-                    dtype=geometry.conv_dtype,
+                    dtype=torch.float32 if replay.compact_kda else geometry.conv_dtype,
                     layer_ids=layer_ids,
                     slice_axis=0,
                 ),
                 TensorPartDecl(
                     name="replayssm_rawk",
                     shape=(replay.key_heads, length, key_dim),
-                    dtype=geometry.conv_dtype,
+                    dtype=torch.float32 if replay.compact_kda else geometry.conv_dtype,
                     layer_ids=layer_ids,
                     slice_axis=0,
                 ),

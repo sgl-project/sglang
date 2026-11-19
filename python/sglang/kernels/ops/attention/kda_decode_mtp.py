@@ -187,6 +187,7 @@ def kda_decode_mtp_kernel(
     lower_bound: cutlass.Constexpr[float],
     CACHE_RING: cutlass.Constexpr[bool],
     SEPARATE_RING_INDEX: cutlass.Constexpr[bool],
+    SAVE_DELTAS: cutlass.Constexpr[bool],
     APPLY_ONORM: cutlass.Constexpr[bool],
     onorm_eps: cutlass.Constexpr[float],
     USE_PACKED_FMA: cutlass.Constexpr[bool],
@@ -511,8 +512,7 @@ def kda_decode_mtp_kernel(
                                 r_state[
                                     (KERNEL_WIDTH - 1) * VEC_SIZE + 2 * VEC_SIZE + i
                                 ] = r_xk
-                            # Complete independent key chains before raw-ring stores.
-                            if cutlass.const_expr(CACHE_RING):
+                            if cutlass.const_expr(CACHE_RING and not SAVE_DELTAS):
                                 for i in range(VEC_SIZE):
                                     k_idx = i * WARP_SIZE + in_warp_tid
                                     ring_rawk[ring_slot, i_hv, i_t, k_idx] = (
@@ -538,13 +538,19 @@ def kda_decode_mtp_kernel(
                                     qk_j // 4,
                                     qk_j % 4,
                                 ] = r_k[i]
+                                if cutlass.const_expr(SAVE_DELTAS):
+                                    ring_rawk[ring_slot, i_hv, i_t, k_idx] = r_k[i]
                             if in_warp_tid == 0:
                                 sBeta[i_t] = cute.arch.rcp_approx(
                                     cutlass.Float32(1.0)
                                     + cute.math.exp(-r_b_raw, fastmath=True)
                                 )
                                 if cutlass.const_expr(CACHE_RING):
-                                    ring_beta[ring_slot, i_hv, i_t] = sBeta[i_t]
+                                    ring_beta[ring_slot, i_hv, i_t] = (
+                                        cutlass.Float32(0.0)
+                                        if cutlass.const_expr(SAVE_DELTAS)
+                                        else sBeta[i_t]
+                                    )
                         else:
                             # Gate warps do not otherwise use r_q in this phase.
                             for i in range(VEC_SIZE):
@@ -562,14 +568,14 @@ def kda_decode_mtp_kernel(
                                 r_gk = lower_bound * sigmoid_val
                                 qk_grp = k_idx % P2_LANES_K
                                 qk_j = k_idx // P2_LANES_K
-                                sG[
-                                    i_t,
-                                    qk_grp,
-                                    qk_j // 4,
-                                    qk_j % 4,
-                                ] = cute.math.exp(r_gk, fastmath=True)
+                                decay = cute.math.exp(r_gk, fastmath=True)
+                                sG[i_t, qk_grp, qk_j // 4, qk_j % 4] = decay
                                 if cutlass.const_expr(CACHE_RING):
-                                    ring_g[ring_slot, i_hv, i_t, k_idx] = r_gk
+                                    ring_g[ring_slot, i_hv, i_t, k_idx] = (
+                                        decay
+                                        if cutlass.const_expr(SAVE_DELTAS)
+                                        else r_gk
+                                    )
                         if cutlass.const_expr(_job == 0):
                             for i in range(VEC_SIZE):
                                 k_idx = i * 32 + in_warp_tid
@@ -668,7 +674,7 @@ def kda_decode_mtp_kernel(
                     sOnormGate[_t * HEAD_DIM + _v_idx] = cute.arch.rcp_approx(
                         cutlass.Float32(1.0) + cute.math.exp(-gate_raw, fastmath=True)
                     )
-                if cutlass.const_expr(CACHE_RING):
+                if cutlass.const_expr(CACHE_RING and not SAVE_DELTAS):
                     ring_rawv[ring_slot, i_hv, _t, _v_idx] = cutlass.BFloat16(_vconv)
                 for _w in cutlass.range_constexpr(KERNEL_WIDTH - 1):
                     intermediate_conv_v[scratch_row, _t, head_off + _v_idx, _w] = (
@@ -785,6 +791,9 @@ def kda_decode_mtp_kernel(
                                 shk, offset=offset, mask=-1, mask_and_clamp=31
                             )
                     vnb = (r_v - shk) * r_beta_val
+                    if cutlass.const_expr(SAVE_DELTAS):
+                        if k_grp == 0 and i_t < n_tok:
+                            ring_rawv[ring_slot, i_hv, i_t, v_base + v_row] = vnb
                     shq_1 = 0.0
                     shq_2 = 0.0
                     for jp in range(P2_VEC // 2):
@@ -909,6 +918,7 @@ def _run_kda_decode_mtp_dspark(
     lower_bound: cutlass.Constexpr[float],
     CACHE_RING: cutlass.Constexpr[bool],
     SEPARATE_RING_INDEX: cutlass.Constexpr[bool],
+    SAVE_DELTAS: cutlass.Constexpr[bool],
     APPLY_ONORM: cutlass.Constexpr[bool],
     onorm_eps: cutlass.Constexpr[float],
     USE_PACKED_FMA: cutlass.Constexpr[bool],
@@ -1004,6 +1014,7 @@ def _run_kda_decode_mtp_dspark(
         lower_bound,
         CACHE_RING,
         SEPARATE_RING_INDEX,
+        SAVE_DELTAS,
         APPLY_ONORM,
         onorm_eps,
         USE_PACKED_FMA,
@@ -1114,6 +1125,7 @@ def fused_kda_decode_mtp_dspark(
     onorm_weight=None,
     onorm_eps=None,
     replayssm_ring_indices=None,
+    save_kda_deltas=False,
 ):
     """Run Kimi-K3 KDA verify while preserving DSpARK rollback semantics.
 
@@ -1124,7 +1136,7 @@ def fused_kda_decode_mtp_dspark(
     --speculative-dspark-block-size), inferred here from T // N - 1.
 
     ReplaySSM: passing the four replayssm_* rings switches the kernel to
-    CACHE_RING mode — per-step raw inputs go to the rings (consumed by the
+    CACHE_RING mode — raw inputs or compact deltas go to the rings (consumed by the
     commit-time exact fold, see kda_replayssm_spec_decode.py) and the per-step
     intermediate_ssm state snapshots are skipped, so intermediate_ssm may be
     None. The rings are indexed by ``ssm_state_indices`` unless
@@ -1193,13 +1205,14 @@ def fused_kda_decode_mtp_dspark(
                 f"{TILE_K}] / [slots, H, L]"
             )
         if (
-            replayssm_rawv.dtype != torch.bfloat16
-            or replayssm_rawk.dtype != torch.bfloat16
+            replayssm_rawv.dtype
+            != (torch.float32 if save_kda_deltas else torch.bfloat16)
+            or replayssm_rawk.dtype != replayssm_rawv.dtype
             or replayssm_g.dtype != torch.float32
             or replayssm_beta.dtype != torch.float32
         ):
             raise ValueError(
-                "expected ReplaySSM ring dtypes rawv/rawk=bf16, g/beta=fp32"
+                "expected matching ReplaySSM value/key dtypes (bf16 or fp32), and fp32 g/beta"
             )
         if intermediate_ssm is None:
             # Dead-branch placeholder: CACHE_RING skips every ht snapshot
@@ -1283,6 +1296,7 @@ def fused_kda_decode_mtp_dspark(
         block_threads,
         cache_ring,
         separate_ring_index,
+        save_kda_deltas,
         apply_onorm,
         float(onorm_eps) if apply_onorm else 0.0,
         float(scale),
@@ -1307,6 +1321,7 @@ def fused_kda_decode_mtp_dspark(
             lower_bound=float(lower_bound),
             CACHE_RING=cache_ring,
             SEPARATE_RING_INDEX=separate_ring_index,
+            SAVE_DELTAS=cache_ring and save_kda_deltas,
             APPLY_ONORM=apply_onorm,
             onorm_eps=float(onorm_eps) if apply_onorm else 0.0,
             USE_PACKED_FMA=cuda_arch.major >= 10,

@@ -45,6 +45,15 @@ def _kda_params():
     return KimiLinearCacheParams(shape=shape, dtype=DTYPE, layers=LAYERS)
 
 
+@pytest.mark.parametrize("backend", ["cuda", "hip"])
+def test_compact_kda_replay_backend(backend, monkeypatch):
+    monkeypatch.setenv("SGLANG_KDA_REPLAYSSM_SAVE_DELTAS", "1")
+    monkeypatch.setattr(
+        "sglang.kernels.ops.attention.fla.utils.get_available_device", lambda: backend
+    )
+    assert _kda_params().use_compact_kda_replay(decode=False) == (backend == "cuda")
+
+
 def _gdn_params(temporal_dtype=torch.float32):
     # Only shape.temporal and shape.num_k_heads_per_tp are read here; the rest
     # are dummy (the accounting does not depend on them).

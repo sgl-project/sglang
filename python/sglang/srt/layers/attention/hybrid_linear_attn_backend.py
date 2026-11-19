@@ -1684,6 +1684,7 @@ class HybridLinearAttnBackend(AttentionBackend):
                 assert state_slots.ring is not None, "request-scoped ring without rows"
                 ring_indices = state_slots.ring[:request_number]
             commit_kda_replayssm_after_verify(
+                save_kda_deltas=mamba_pool.compact_kda_replay,
                 spec_state=mamba_caches,
                 state_batch_indices=state_indices_tensor,
                 accept_lens=last_correct_step_indices + 1,

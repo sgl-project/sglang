@@ -152,9 +152,10 @@ def _run(
         rows = ring_count or (
             num_slots if ring_rows is None else int(ring_rows.max()) + 1
         )
+        dtype = torch.float32 if arm == "compact" else torch.bfloat16
         rings = dict(
-            rawv=torch.zeros(rows, H, L, K, device=DEV, dtype=torch.bfloat16),
-            rawk=torch.zeros(rows, H, L, K, device=DEV, dtype=torch.bfloat16),
+            rawv=torch.zeros(rows, H, L, K, device=DEV, dtype=dtype),
+            rawk=torch.zeros(rows, H, L, K, device=DEV, dtype=dtype),
             gring=torch.zeros(rows, H, L, K, device=DEV, dtype=torch.float32),
             betar=torch.zeros(rows, H, L, device=DEV, dtype=torch.float32),
         )
@@ -162,6 +163,7 @@ def _run(
         intermediate_ssm=None,
         **{arg: rings[name] for name, arg in RING_PARTS},
         replayssm_ring_indices=ring_rows,
+        save_kda_deltas=arm == "compact",
         **kwargs,
     )
     return out, dict(**rings, h0=h0, slots=slots)
@@ -204,10 +206,14 @@ def _request_sub_pool_rings(backing, *, rows, H, num_spec, layer):
 @pytest.mark.parametrize(
     "N,H,num_spec", [(4, 2, 4), (1, 12, 5), (16, 2, 8)], ids=["small", "k3ish", "wide"]
 )
-def test_cutedsl_ring_fold_parity(N, H, num_spec):
+@pytest.mark.parametrize("arm", ["ring", "compact"])
+def test_cutedsl_ring_fold_parity(N, H, num_spec, arm):
     seed = 0
     out_base, base = _run("baseline", N=N, H=H, num_spec=num_spec, seed=seed)
-    out_ring, ring = _run("ring", N=N, H=H, num_spec=num_spec, seed=seed)
+    ring_rows = base["scratch"] if arm == "compact" else None
+    out_ring, ring = _run(
+        arm, N=N, H=H, num_spec=num_spec, seed=seed, ring_rows=ring_rows
+    )
 
     torch.testing.assert_close(out_ring, out_base, rtol=0, atol=0)
 
@@ -223,6 +229,8 @@ def test_cutedsl_ring_fold_parity(N, H, num_spec):
         ring["slots"],
         acc,
         max_cache_len=ring["rawv"].shape[2],
+        save_kda_deltas=arm == "compact",
+        ring_indices=ring_rows,
         num_k_heads=H,
         use_qk_l2norm_in_kernel=True,
         null_block_id=-1,
@@ -230,6 +238,8 @@ def test_cutedsl_ring_fold_parity(N, H, num_spec):
     for j in range(N):
         base_state = base["inter"][base["scratch"][j], T_req - 1]
         fold = ckpt[ring["slots"][j]]
+        if arm == "compact":
+            assert torch.equal(fold, base_state)
         rel = (
             (fold - base_state).abs().max() / base_state.abs().max().clamp_min(1e-6)
         ).item()

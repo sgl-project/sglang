@@ -124,24 +124,32 @@ class BaseLinearStateParams(ABC):
             + ssm_numel * self.dtype.temporal.itemsize
         ) * len(self.layers)
 
-    def replayssm_ring_bytes_per_req(self, record_len: int) -> int:
+    def use_compact_kda_replay(self, *, decode: bool) -> bool:
+        if decode or not self.is_kda or not envs.SGLANG_KDA_REPLAYSSM_SAVE_DELTAS.get():
+            return False
+        from sglang.kernels.ops.attention.fla.utils import get_available_device
+
+        return get_available_device() == "cuda"
+
+    def replayssm_ring_bytes_per_req(
+        self, record_len: int, *, compact_kda: bool = False
+    ) -> int:
         """ReplaySSM spec-verify scratch bytes across all layers.
 
         GDN keeps compact d/k/g plus low parts for the activation-dtype d/k
-        rings. KDA keeps its raw-input fold window and d/k rings.
+        rings. KDA keeps a compact verify window or raw inputs and d/k rings.
         """
         hv, v_dim, k_dim = self.shape.temporal
         h_k = self.shape.num_k_heads_per_tp
         conv_b = self.dtype.conv.itemsize
         fp32_b = 4
         if self.is_kda:
+            # The compact delta format has no decode ring.
+            key_value_bytes = fp32_b if compact_kda else 2 * conv_b
             per_layer = (
-                hv * record_len * v_dim * conv_b  # rawv
-                + h_k * record_len * k_dim * conv_b  # rawk
-                + hv * record_len * fp32_b  # beta
-                + hv * record_len * k_dim * fp32_b  # vector g
-                + hv * record_len * v_dim * conv_b  # d
-                + h_k * record_len * k_dim * conv_b  # k
+                (hv * v_dim + h_k * k_dim) * record_len * key_value_bytes
+                + hv * record_len * fp32_b  # beta or rounding mode
+                + hv * record_len * k_dim * fp32_b  # per-channel decay
             )
         else:
             per_layer = (

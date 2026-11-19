@@ -9,15 +9,14 @@ hog that collapses dspark concurrency) with a small per-request input window +
 an exact-fold on commit.
 
 Scheme (fold-every-commit, no circular ring / periodic flush):
-  * during verify, the KDA backend stores the draft window's raw inputs
-    (raw v, raw pre-norm k, per-K log-decay gate ``gk`` (fp32), beta (fp32)) into
-    the per-slot ring at positions ``0..spec_len``;
+  * verify stores raw v/k, log-decay and beta, or, in compact mode, the FP32
+    value delta, normalized key, decay multiplier and rounding mode.
   * on commit, :func:`commit_kda_replayssm_spec` replays the *accepted* prefix
     ``0..accept_len`` from the persistent checkpoint ``h0`` into ``h0`` in place —
     ``h0`` is always the current committed state, so the next verify reads it
     directly as its initial state (no lag, no chunked reconstruction).
 
-The exact-fold is a BITWISE CLONE of ``fused_recurrent_gated_delta_rule_fwd_kernel``'s
+The raw fold is a BITWISE CLONE of ``fused_recurrent_gated_delta_rule_fwd_kernel``'s
 ``IS_KDA`` branch (fused_recurrent.py): same full-K fp32 rows with num_warps=1, so
 each V column's K reduction matches; BV only partitions independent V columns
 across programs and need not match the recurrent kernel's. Same division-form L2
@@ -78,6 +77,7 @@ def kda_replayssm_exact_fold_kernel(
     ring_indices,
     stride_ring: tl.constexpr,
     SEPARATE_RING_INDEX: tl.constexpr,
+    SAVE_DELTAS: tl.constexpr = False,
 ):
     i_v = tl.program_id(0)
     i_n = tl.program_id(1)
@@ -155,13 +155,27 @@ def kda_replayssm_exact_fold_kernel(
         nxt_g = tl.load(p_g + (t + 1) * K, mask=mask_k & has_next, other=0.0)
         nxt_b = tl.load(p_b + (t + 1), mask=has_next, other=0.0)
 
-        # --- verbatim recurrent update, IS_KDA branch (see module docstring) ---
-        if USE_QK_L2NORM_IN_KERNEL:
-            b_k = b_k / (tl.sqrt(tl.sum(b_k * b_k) + 1e-6))
-        b_h *= tl.exp(b_gk[:, None])  # per-K gate decay, broadcast over V
-        b_v -= tl.sum(b_h * b_k[:, None], 0)
-        b_v *= b_beta
-        b_h += b_k[:, None] * b_v[None, :]
+        if SAVE_DELTAS:
+            decayed = b_h * b_gk[:, None]
+            if b_beta != 0:
+                # The narrow Triton verify tile rounds the update and add separately.
+                b_h = tl.inline_asm_elementwise(
+                    "add.rn.f32 $0, $1, $2;",
+                    constraints="=f,f,f",
+                    args=[decayed, b_k[:, None] * b_v[None, :]],
+                    dtype=tl.float32,
+                    is_pure=True,
+                    pack=1,
+                )
+            else:
+                b_h = tl.fma(b_k[:, None], b_v[None, :], decayed)
+        else:
+            if USE_QK_L2NORM_IN_KERNEL:
+                b_k = b_k / (tl.sqrt(tl.sum(b_k * b_k) + 1e-6))
+            b_h *= tl.exp(b_gk[:, None])
+            b_v -= tl.sum(b_h * b_k[:, None], 0)
+            b_v *= b_beta
+            b_h += b_k[:, None] * b_v[None, :]
 
         # Interval-crossing snapshot -> track slot (state AFTER step `track_step`).
         if HAS_TRACK:
@@ -194,6 +208,7 @@ def commit_kda_replayssm_spec(
     use_qk_l2norm_in_kernel: bool = True,
     null_block_id: int = 0,
     ring_indices: torch.Tensor | None = None,
+    save_kda_deltas: bool = False,
 ) -> None:
     """Replay each request's accepted window into its fp32 checkpoint in place.
 
@@ -256,6 +271,7 @@ def commit_kda_replayssm_spec(
         ring_indices=ssm_state_indices if ring_indices is None else ring_indices,
         stride_ring=0 if ring_indices is None else ring_indices.stride(0),
         SEPARATE_RING_INDEX=ring_indices is not None,
+        SAVE_DELTAS=save_kda_deltas,
         num_warps=1,
         num_stages=3,
     )
@@ -276,6 +292,7 @@ def commit_kda_replayssm_spec_all_layers(
     use_qk_l2norm_in_kernel: bool = True,
     null_block_id: int = 0,
     ring_indices: torch.Tensor | None = None,
+    save_kda_deltas: bool = False,
 ) -> None:
     """Fold every layer's accepted window in a single launch.
 
@@ -339,6 +356,7 @@ def commit_kda_replayssm_spec_all_layers(
         ring_indices=ssm_state_indices if ring_indices is None else ring_indices,
         stride_ring=0 if ring_indices is None else ring_indices.stride(0),
         SEPARATE_RING_INDEX=ring_indices is not None,
+        SAVE_DELTAS=save_kda_deltas,
         num_warps=1,
         num_stages=3,
     )
@@ -355,6 +373,7 @@ def commit_kda_replayssm_after_verify(
     src_indices_raw: torch.Tensor | None = None,
     null_block_id: int = -1,
     ring_indices: torch.Tensor | None = None,
+    save_kda_deltas: bool = False,
 ) -> None:
     """Fold each layer's accepted window into `temporal` and roll back conv.
 
@@ -384,6 +403,7 @@ def commit_kda_replayssm_after_verify(
         mamba_steps_to_track=mamba_steps_to_track,
         null_block_id=null_block_id,
         ring_indices=ring_indices,
+        save_kda_deltas=save_kda_deltas,
     )
     # Conv rollback + track-slot conv snapshot, per conv group (fold already did
     # the ssm side via HAS_TRACK). Loop mirrors the recurrent commit's zip; track

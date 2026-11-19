@@ -1775,6 +1775,21 @@ class TestDeclaredParts(CustomTestCase):
         self.assertTrue(torch.all(ngram.intermediate_context == 17))
         self.assertEqual(len(plan.scratch), 4)
 
+    def test_compact_kda_ring_is_request_memory(self):
+        replay = StateReplay(
+            decode=False,
+            speculative=True,
+            is_kda=True,
+            cache_len=8,
+            key_heads=1,
+            compact_kda=True,
+        )
+        storage, _, _ = _build(state=True, gamma=8, replay=replay)
+        view = storage.view("mamba")
+        self.assertTrue(view.replayssm_request_ring)
+        self.assertIsNone(view.mamba_cache.replayssm_d)
+        self.assertEqual(view.mamba_cache.replayssm_rawv.dtype, torch.float32)
+
     def test_gdn_spec_ring_is_request_memory(self):
         """The GDN speculative ring and its cursors form the request sub-pool: a
         float of the chain the prefix tree, host stores and PD peers never see,

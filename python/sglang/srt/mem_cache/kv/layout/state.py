@@ -230,6 +230,7 @@ class StateView:
     linear_replayssm_cache_len = 16
     replayssm_write_pos = None
     replayssm_is_kda = False
+    compact_kda_replay = False
     enable_linear_replayssm_spec = False
     replayssm_spec_fold = False
     replayssm_request_ring = False
@@ -307,6 +308,7 @@ class StateView:
             self.enable_linear_replayssm_spec = replay.speculative
             self.replayssm_spec_fold = replay.speculative and replay.is_kda
             self.replayssm_is_kda = replay.is_kda
+            self.compact_kda_replay = replay.compact_kda
             self.linear_replayssm_cache_len = replay.cache_len
             self.replayssm_write_pos = payloads.get("replayssm_write_pos")
             self.replayssm_spec_write_pos = payloads.get("replayssm_spec_write_pos")
@@ -314,7 +316,7 @@ class StateView:
             self.replayssm_is_flush = payloads.get("replayssm_is_flush")
             # Parts a request owns (the GDN and KDA speculative rings) are indexed
             # by the request row's unit, the rest by state slot.
-            self.replayssm_request_ring = "replayssm_d" in request_parts
+            self.replayssm_request_ring = "replayssm_g" in request_parts
         if intermediate_conv_window is None:
             self.mamba_cache = self.State(
                 conv=list(conv_views), temporal=temporal_view, **ring_fields
