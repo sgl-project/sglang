@@ -1905,16 +1905,18 @@ class PrefillAdder:
             return self.add_one_req_ignore_eos(req, truncation_align_size)
 
         max_new = self._swa_new_tokens(req)
-        layer_reserved = bool(
-            getattr(req, "external_cache_hit_length", None) and req.host_hit_length
-        )
+        # A layer-wise ticket already owns the FULL/window destinations and the
+        # Mamba checkpoint that becomes the request's working state at load-back.
+        has_ticket = getattr(req, "external_cache_hit_length", None)
+        reserved_hit = req.host_hit_length if has_ticket else 0
+        window_loads = {} if reserved_hit else req.window_host_hit_lengths
         total_tokens, state_slots = self._prefill_charge(req)
-        if layer_reserved:
-            # The ticket holds the FULL/window destinations and the Mamba
-            # checkpoint, which replaces the request's working state at load-back.
-            total_tokens -= req.host_hit_length
-            if self.memory_budget.has_state_slots and req.mamba_host_hit_length:
-                state_slots -= req.mamba_host_hit_length + int(not req.kv.holds_mamba)
+        if (
+            reserved_hit
+            and self.memory_budget.has_state_slots
+            and req.mamba_host_hit_length
+        ):
+            state_slots -= req.mamba_host_hit_length + int(not req.kv.holds_mamba)
         if not self.memory_budget.state_slots_fit(state_slots):
             if (
                 isinstance(self.tree_cache, UnifiedRadixCache)
@@ -1928,13 +1930,11 @@ class PrefillAdder:
         with self._lock_node(req.last_node):
             admission = self._select_prefill_admission(
                 req,
-                total_tokens=total_tokens,
+                total_tokens=total_tokens - reserved_hit,
                 state_slots=state_slots,
                 host_hit_length=req.host_hit_length,
-                window_host_hit_lengths={}
-                if layer_reserved
-                else req.window_host_hit_lengths,
-                reserved_host_tokens=req.host_hit_length if layer_reserved else 0,
+                window_host_hit_lengths=window_loads,
+                reserved_host_tokens=reserved_hit,
                 truncation_align_size=truncation_align_size,
                 has_chunked_req=has_chunked_req,
             )
@@ -1977,7 +1977,7 @@ class PrefillAdder:
                     if isinstance(self.tree_cache, UnifiedRadixCache)
                     else nullcontext()
                 ):
-                    full_load_tokens = 0 if layer_reserved else req.host_hit_length
+                    full_load_tokens = req.host_hit_length - reserved_hit
                     if (
                         self.memory_budget.load_back_needs_full_tokens
                         and isinstance(self.tree_cache, UnifiedRadixCache)
@@ -2001,9 +2001,7 @@ class PrefillAdder:
                         ),
                         extend_input_len=admission.extend_len,
                         max_new_tokens=load_max_new,
-                        window_host_hit_lengths={}
-                        if layer_reserved
-                        else req.window_host_hit_lengths,
+                        window_host_hit_lengths=window_loads,
                         chunk_limit=admission.chunk_limit,
                     )
                     if not self.memory_budget.prepare_load_back(**load_budget):
@@ -2059,8 +2057,7 @@ class PrefillAdder:
                     # No FULL was loaded; recomputation may no longer fit.
                     admission = self._select_prefill_admission(
                         req,
-                        total_tokens=total_tokens
-                        + (promised_host_hit if layer_reserved else 0),
+                        total_tokens=total_tokens,
                         state_slots=state_slots,
                         host_hit_length=0,
                         window_host_hit_lengths={},
