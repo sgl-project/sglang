@@ -13,6 +13,7 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.layers.moe.paged_experts import runners
 from sglang.srt.layers.moe.paged_experts.residency import (
     DeviceResidency,
     LRUPolicy,
@@ -69,8 +70,23 @@ class EagerExecutor:
         r = self.device_residency
         routed = counts.tolist() if r is None else r.load_into(self.policy, counts)
         distinct = [e for e in range(self.num_experts) if routed[e]]
+        with self.store.host_planned():
+            waves = plan_waves(
+                policy=self.policy,
+                distinct=distinct,
+                in_host_rows=self.store.in_host_rows(),
+            )
+            merged = self._run_waves(layer, dispatch_output, waves, routed, topk_ids)
+        return StandardCombineInput(
+            hidden_states=self.contract.finish(
+                merged=merged,
+                hidden_states=dispatch_output.hidden_states,
+                routed_scaling_factor=self.routed_scaling_factor,
+            )
+        )
+
+    def _run_waves(self, layer, dispatch_output, waves, routed, topk_ids):
         merged = None
-        waves = plan_waves(policy=self.policy, distinct=distinct)
         # Every wave's slot map in one upload that does not wait for the GPU. Index E (and -1,
         # which wraps to it) stays -1: padded routing entries are masked.
         to_slot = torch.full((len(waves), self.num_experts + 1), -1, dtype=torch.int32)
@@ -82,7 +98,8 @@ class EagerExecutor:
         for w, wave in enumerate(waves):
             self.store.page_in(layer=layer, loads=wave.loads)
             slots = to_slot[w][topk_ids]
-            if len(waves) == 1:  # only padding is outside the wave
+            if len(waves) == 1 and not self._bounded(layer, dispatch_output, slots):
+                # Only padding is outside the wave.
                 merged = run_on_slots(self.base_method, layer, dispatch_output, slots)
                 break
             merged = self.contract.run_wave(
@@ -93,12 +110,15 @@ class EagerExecutor:
                 merged=merged,
                 num_entries=sum(routed[e] for e in wave.experts),
             )
-        return StandardCombineInput(
-            hidden_states=self.contract.finish(
-                merged=merged,
-                hidden_states=dispatch_output.hidden_states,
-                routed_scaling_factor=self.routed_scaling_factor,
-            )
+        if merged is None:  # no routed entry in any wave: only padding
+            merged = run_on_slots(self.base_method, layer, dispatch_output, slots)
+        return merged
+
+    def _bounded(self, layer, dispatch_output, slots) -> bool:
+        """Whether a one-wave step larger than one compacted call goes through the contract's
+        waves, which bound each runner call's rows (``runners.COMPACT_ROWS``)."""
+        return slots.numel() > runners.COMPACT_ROWS and self.contract.compacts(
+            self.base_method, layer, dispatch_output
         )
 
 
@@ -144,6 +164,9 @@ class DeviceExecutor:
             run_w.view(-1),
         )
         self.store.gather(src=r.src, dst=r.dst, count=r.count)
+        if not torch.cuda.is_current_stream_capturing():
+            # Not a graph replay: page in what the gather left on disk before the GEMM.
+            self.store.resolve_pending()
         # Every routed expert is now resident; padding got slot 0 and weight 0.
         wave_output = dispatch_output._replace(
             topk_output=topk_output._replace(

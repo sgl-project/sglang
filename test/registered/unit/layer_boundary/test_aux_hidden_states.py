@@ -187,7 +187,7 @@ class TestBoundCaptureOwnership(CustomTestCase):
             declare_attn,
             declare_ffn,
         )
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.model_executor.forward_mode import ForwardMode
         from sglang.test.boundary_fixtures import build_stages
         from sglang.test.communicator_patch import patch_communicator
 

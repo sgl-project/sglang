@@ -11,9 +11,9 @@ from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 # gfx950: fused_q_norm_rope's HIP operation order matches the batched RoPE DeepseekV4 turns on
-register_amd_ci(est_time=40, stage="stage-b", runner_config="1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=40, stage="base-b", runner_config="1-gpu-small-amd-mi35x")
 
 
 class TestQRopeStore(CustomTestCase):

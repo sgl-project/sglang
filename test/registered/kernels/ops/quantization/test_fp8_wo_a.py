@@ -10,8 +10,10 @@ import unittest
 import torch
 
 import sglang.kernels.ops.quantization.fp8_group_major_quant_ue8m0 as fp8_wo_a_module
+from sglang.kernels.ops.attention.dsv4 import fused_rope_inplace
 from sglang.kernels.ops.quantization.fp8_group_major_quant_ue8m0 import (
     sglang_per_token_group_quant_fp8_dsv4_wo_a,
+    sglang_per_token_group_quant_fp8_dsv4_wo_a_with_rope,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import (
     fp8_dtype,
@@ -95,6 +97,67 @@ class TestDeepSeekV4FP8WoA(CustomTestCase):
             "fp8 codes differ",
         )
         self.assertTrue(torch.equal(o_s, packed_ref), "packed scales differ")
+
+    def test_fused_inverse_rope_quant_matches_production(self):
+        torch.manual_seed(42)
+        for T in (0, 1, 32, 100, 777, 2047, 8192, 8193):
+            for G in (2, 16):
+                with self.subTest(T=T, G=G):
+                    D = 4096
+                    x = self._strided_tgd(T, G, D, torch.bfloat16, torch.device("cuda"))
+                    angles = torch.randn(128, 32, device="cuda")
+                    freqs = torch.polar(torch.ones_like(angles), angles)
+                    positions = torch.randint(128, (T,), device="cuda")
+                    ref = x.clone()
+                    if T:
+                        heads = ref.view(T, G * (D // 512), 512)
+                        fused_rope_inplace(
+                            heads[..., -64:],
+                            None,
+                            freqs,
+                            positions=positions,
+                            inverse=True,
+                        )
+                    q_ref, s_ref = sglang_per_token_group_quant_fp8_dsv4_wo_a(ref)
+                    q, s = sglang_per_token_group_quant_fp8_dsv4_wo_a_with_rope(
+                        x, freqs, positions
+                    )
+                    torch.cuda.synchronize()
+                    self.assertTrue(
+                        torch.equal(q.view(torch.int8), q_ref.view(torch.int8))
+                    )
+                    self.assertTrue(torch.equal(s, s_ref))
+                    self.assertEqual(s.stride(), s_ref.stride())
+                    self.assertEqual(q.stride(), q_ref.stride())
+
+    def test_fused_inverse_rope_quant_cuda_graph(self):
+        T, G, D = 32, 2, 4096
+        x = torch.randn(T, G, D, device="cuda", dtype=torch.bfloat16)
+        angles = torch.randn(128, 32, device="cuda")
+        freqs = torch.polar(torch.ones_like(angles), angles)
+        positions = torch.randint(128, (T,), device="cuda")
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                sglang_per_token_group_quant_fp8_dsv4_wo_a_with_rope(
+                    x, freqs, positions
+                )
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            q, s = sglang_per_token_group_quant_fp8_dsv4_wo_a_with_rope(
+                x, freqs, positions
+            )
+        # Replay with updated input so the test catches stale capture values.
+        x.normal_()
+        graph.replay()
+        q_ref, s_ref = sglang_per_token_group_quant_fp8_dsv4_wo_a_with_rope(
+            x, freqs, positions
+        )
+        torch.cuda.synchronize()
+        self.assertTrue(torch.equal(q.view(torch.int8), q_ref.view(torch.int8)))
+        self.assertTrue(torch.equal(s, s_ref))
 
     def test_dsv4_wo_a_quant_matches_flat_reference(self):
         torch.manual_seed(1)

@@ -25,8 +25,9 @@ captured region needs no other owner.
 import functools
 import threading
 import warnings
+from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import TYPE_CHECKING, Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Optional
 
 import torch
 
@@ -35,10 +36,13 @@ try:
 except ImportError:
     rt = None
 
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.capture_recorder import (
+    BreakableCaptureRecorder,
+)
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.cuda_utils import (
     checkCudaErrors,
 )
-from sglang.srt.utils import get_device_module, is_hip, is_musa, is_xpu
+from sglang.srt.utils import get_device_module, is_hip, is_musa, is_npu, is_xpu
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.runner_backend_utils.hicache_graph_events import (
@@ -51,7 +55,10 @@ __all__ = [
     "eager_on_graph",
     "BreakableCUDAGraph",
     "BreakableCUDAGraphCapture",
+    "BreakableCaptureRecorder",
     "break_graph",
+    "get_breakable_capture_recorder",
+    "use_breakable_capture_recorder",
 ]
 
 
@@ -63,10 +70,8 @@ def _check_cuda_bindings():
         )
 
 
-# Active BreakableCUDAGraphCapture context for the currently-capturing thread.
-# eager_on_graph's wrapper uses this to split the current torch.cuda.CUDAGraph
-# at break points.
-_current_capture_var: ContextVar["BreakableCUDAGraphCapture | None"] = ContextVar(
+# Active device-specific recorder for the currently-capturing thread.
+_current_capture_var: ContextVar[BreakableCaptureRecorder | None] = ContextVar(
     "current_capture", default=None
 )
 _current_stream_var: ContextVar[torch.Stream | None] = ContextVar(
@@ -77,6 +82,23 @@ _current_stream_var: ContextVar[torch.Stream | None] = ContextVar(
 _forked_streams_var: ContextVar[set[torch.Stream] | None] = ContextVar(
     "forked_streams", default=None
 )
+
+
+def get_breakable_capture_recorder() -> BreakableCaptureRecorder | None:
+    """Return the recorder installed for the current breakable capture."""
+    return _current_capture_var.get()
+
+
+@contextmanager
+def use_breakable_capture_recorder(
+    recorder: BreakableCaptureRecorder,
+) -> Iterator[None]:
+    """Install a device-specific recorder for ``eager_on_graph`` calls."""
+    token = _current_capture_var.set(recorder)
+    try:
+        yield
+    finally:
+        _current_capture_var.reset(token)
 
 
 def get_current_stream(device: torch.device | None = None) -> torch.Stream:
@@ -97,13 +119,21 @@ def _is_stream_capturing(stream: torch.Stream) -> bool:
     # use the portable device API. On NVIDIA, keep querying the CUDA runtime
     # directly via cuda-python because torch.cuda.is_current_stream_capturing()
     # has proven unreliable there.
-    if is_hip() or is_musa() or _is_xpu:
+    if is_npu() or is_hip() or is_musa() or _is_xpu:
         with get_device_module().stream(stream):
             return get_device_module().is_current_stream_capturing()
     return (
         _capture_status(stream.cuda_stream)
         == rt.cudaStreamCaptureStatus.cudaStreamCaptureStatusActive
     )
+
+
+def _device_graph_cls():
+    if is_npu():
+        return torch.npu.NPUGraph
+    if _is_xpu:
+        return torch.xpu.XPUGraph
+    return torch.cuda.CUDAGraph
 
 
 # Hook torch.cuda.Stream.wait_stream to track side-stream forks/joins that happen
@@ -280,7 +310,7 @@ def eager_on_graph(
 
         @functools.wraps(inner)
         def wrapper(*args, **kwargs):
-            capture = _current_capture_var.get()
+            capture = get_breakable_capture_recorder()
             if capture is None:
                 if output_factory is not None:
                     return inner(*args, **kwargs)
@@ -295,7 +325,7 @@ def eager_on_graph(
                 kwargs = dict(kwargs, out=output)
 
             # End the segment that captured up to this break point.
-            capture._end_current_segment()
+            capture.end_current_segment()
 
             if on_capture is not None:
                 on_capture(*args, **kwargs)
@@ -303,14 +333,16 @@ def eager_on_graph(
             # Weak-ref captured inputs produced by graph segments. Their storage
             # is pinned by the segment CUDAGraphs' mempool use-count, so Python
             # refs do not need to keep every intermediate alive.
-            captured_args = tuple(_weak_ref_if_tensor(a) for a in args)
-            captured_kwargs = {k: _weak_ref_if_tensor(v) for k, v in kwargs.items()}
+            captured_args = tuple(capture.retain_for_replay(a) for a in args)
+            captured_kwargs = {
+                k: capture.retain_for_replay(v) for k, v in kwargs.items()
+            }
             if output_factory is None:
-                capture.cuda_graph._break_fns.append(
+                capture.register_eager_call(
                     functools.partial(run, *captured_args, **captured_kwargs)
                 )
             else:
-                captured_output = _weak_ref_if_tensor(output)
+                captured_output = capture.retain_for_replay(output)
                 if pass_output:
                     captured_kwargs["out"] = captured_output
 
@@ -318,10 +350,10 @@ def eager_on_graph(
                     new_out = inner(*captured_args, **captured_kwargs)
                     _copy_into_output(captured_output, new_out)
 
-                capture.cuda_graph._break_fns.append(replay_fn)
+                capture.register_eager_call(replay_fn)
 
             # Start a fresh CUDAGraph segment for the remainder of the forward.
-            capture._begin_new_segment()
+            capture.begin_next_segment()
             return output
 
         return functools.update_wrapper(_EagerOnGraphCallable(wrapper, inner), inner)
@@ -399,7 +431,7 @@ class BreakableCUDAGraphCapture:
         self._stream = stream
         self._capture_error_mode = capture_error_mode
         self._stream_ctx = None
-        self._capture_token = None
+        self._capture_recorder_ctx = None
         self._stream_token = None
         self._forked_token = None
         self._current_graph = None
@@ -410,7 +442,8 @@ class BreakableCUDAGraphCapture:
         if self._stream is not None:
             self._stream_ctx = get_device_module().stream(self._stream)
             self._stream_ctx.__enter__()
-        self._capture_token = _current_capture_var.set(self)
+        self._capture_recorder_ctx = use_breakable_capture_recorder(self)
+        self._capture_recorder_ctx.__enter__()
         self._stream_token = _current_stream_var.set(
             self._stream or get_device_module().current_stream()
         )
@@ -424,15 +457,28 @@ class BreakableCUDAGraphCapture:
         finally:
             _forked_streams_var.reset(self._forked_token)
             _current_stream_var.reset(self._stream_token)
-            _current_capture_var.reset(self._capture_token)
+            self._capture_recorder_ctx.__exit__(*args)
+            self._capture_recorder_ctx = None
             if self._stream_ctx is not None:
                 self._stream_ctx.__exit__(*args)
                 self._stream_ctx = None
             _uninstall_wait_stream_hook()
         return False
 
+    def end_current_segment(self) -> None:
+        self._end_current_segment()
+
+    def begin_next_segment(self) -> None:
+        self._begin_new_segment()
+
+    def register_eager_call(self, callback: Callable[[], Any]) -> None:
+        self.cuda_graph._break_fns.append(callback)
+
+    def retain_for_replay(self, value: Any) -> Any:
+        return _weak_ref_if_tensor(value)
+
     def _begin_new_segment(self) -> None:
-        graph_cls = torch.xpu.XPUGraph if _is_xpu else torch.cuda.CUDAGraph
+        graph_cls = _device_graph_cls()
         # keep_graph retains the raw graph for dedup; skip it on the plain path.
         # Dedup is CUDA-only (it introspects the raw graph via cuda-python), so
         # XPU always takes the plain path below.

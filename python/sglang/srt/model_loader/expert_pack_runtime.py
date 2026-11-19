@@ -15,10 +15,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from sglang.srt.arg_groups.overrides import (
-    declare_resolution,
-    resolving_view,
-)
+from sglang.srt.arg_groups.model_override_base import resolving_view
+from sglang.srt.arg_groups.overrides import declare_resolution
 
 METADATA_FORMAT_VERSION = 3
 GGUF_SHARD_SUFFIX_RE = re.compile(r"-\d{5}-of-\d{5}\.gguf$")

@@ -2,9 +2,7 @@
 
 from sglang.kernels.jit.utils.arch import (
     get_activation_cuda_cflags,
-    get_jit_cuda_arch,
     is_arch_support_pdl,
-    override_jit_cuda_arch,
 )
 from sglang.kernels.jit.utils.common import (
     aligned_new_empty,
@@ -39,9 +37,7 @@ __all__ = [
     "load_jit",
     "parallel_compile",
     "cuda_stubs_dir",
-    "override_jit_cuda_arch",
     "get_activation_cuda_cflags",
-    "get_jit_cuda_arch",
     "is_arch_support_pdl",
     "KERNEL_PATH",
 ]
