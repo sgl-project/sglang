@@ -74,6 +74,7 @@ class StartupWeightLoadState(str, enum.Enum):
 class StartupWeightLoadOptions:
     device: str
     is_cuda_platform: bool
+    is_npu: bool
     cuda_graph_enabled: bool
     prefill_cuda_graph_backend: Backend
     is_draft_worker: bool
@@ -82,7 +83,7 @@ class StartupWeightLoadOptions:
     attn_cp_size: int
     dcp_size: int
     pp_size: int
-    dp_size: int
+    num_dp_ranks: int
     ep_size: int
     cpu_offload_gb: int
     offload_group_size: int
@@ -115,6 +116,7 @@ class StartupWeightLoadOptions:
         return cls(
             device=get_device().device,
             is_cuda_platform=current_platform.is_cuda(),
+            is_npu=current_platform.is_npu(),
             cuda_graph_enabled=cuda_graph_enabled,
             prefill_cuda_graph_backend=cuda_graph_config.prefill.backend,
             is_draft_worker=is_draft_worker,
@@ -123,7 +125,7 @@ class StartupWeightLoadOptions:
             attn_cp_size=get_parallel().attn_cp_size,
             dcp_size=get_parallel().dcp_size,
             pp_size=get_parallel().pp_size,
-            dp_size=get_parallel().dp_size,
+            num_dp_ranks=get_parallel().num_dp_ranks,
             ep_size=get_parallel().ep_size,
             cpu_offload_gb=get_exec().offload.cpu_offload_gb,
             offload_group_size=get_exec().offload.offload_group_size,
@@ -338,7 +340,11 @@ class StartupWeightLoadManager:
         # Keep these checks here because they depend on resolved loader and model
         # state; ServerArgs owns only the mode selection.
         basic_rules = (
-            (not options.is_cuda_platform or options.device != "cuda", "CUDA only"),
+            (
+                not (options.is_cuda_platform or options.is_npu)
+                or options.device not in ("cuda", "npu"),
+                "CUDA or NPU only",
+            ),
             (not options.cuda_graph_enabled, "CUDA graph capture is disabled"),
             (
                 options.prefill_cuda_graph_backend == Backend.TC_PIECEWISE,
@@ -369,7 +375,7 @@ class StartupWeightLoadManager:
                 "decode context parallelism is not supported",
             ),
             (options.pp_size != 1, "pipeline parallelism is not supported"),
-            (options.dp_size != 1, "data parallelism is not supported"),
+            (options.num_dp_ranks != 1, "data parallelism is not supported"),
             (options.ep_size != 1, "expert parallelism is not supported"),
             (options.cpu_offload_gb > 0, "CPU offload is not supported"),
             (

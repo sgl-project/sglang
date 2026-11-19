@@ -17,7 +17,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
+register_npu_ci(est_time=400, suite="nightly-test-1-npu-a3", nightly=True)
 
 TEST_MODEL_MATRIX = {
     "/root/.cache/modelscope/hub/models/Qwen/Qwen3.5-0.8B": {
@@ -44,6 +44,8 @@ class TestNPUMambaHiCache(CustomTestCase):
             "1",
             "--mem-fraction-static",
             "0.20",
+            "--mamba-ssm-dtype",
+            "bfloat16",
             "--chunked-prefill-size",
             "1024",
             "--page-size",

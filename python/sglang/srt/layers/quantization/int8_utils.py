@@ -2,10 +2,8 @@ from typing import List, Optional
 
 import torch
 
-from sglang.kernels.ops.quantization.int8_kernel import (
-    per_token_group_quant_int8,
-    w8a8_block_int8_matmul,
-)
+from sglang.kernels.ops.gemm.int8_kernel import w8a8_block_int8_matmul
+from sglang.kernels.ops.quantization.int8_kernel import per_token_group_quant_int8
 
 
 def apply_w8a8_block_int8_linear(

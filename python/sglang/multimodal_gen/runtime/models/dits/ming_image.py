@@ -1,0 +1,321 @@
+# SPDX-License-Identifier: Apache-2.0
+# Adapted from inclusionAI/Ming-Image.
+import math
+
+import torch
+from torch import nn
+from torch.nn import functional as F
+
+from sglang.kernels.ops.diffusion import (
+    BitExactFusionGate,
+    can_use_rmsnorm_cast_before_weight,
+    can_use_rmsnorm_cast_before_weight_scale,
+    fused_packed_silu_mul_bitexact,
+    rmsnorm_cast_before_weight_bitexact,
+    rmsnorm_cast_before_weight_scale_bitexact,
+)
+from sglang.multimodal_gen.runtime.distributed import get_sp_world_size
+from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import (
+    gather_seq,
+    shard_like,
+    shard_seq,
+    tail_attn_meta,
+)
+from sglang.multimodal_gen.runtime.models.dits.zimage import (
+    ZImageTransformer2DModel,
+    ZImageTransformerBlock,
+)
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.layers.layernorm import RMSNorm
+
+logger = init_logger(__name__)
+_MING_SWIGLU_FUSION = BitExactFusionGate(
+    "Ming-Image packed SiLU-mul", per_signature=True
+)
+
+_MING_RMSNORM_FUSION = BitExactFusionGate("Ming-Image RMSNorm", per_signature=True)
+_MING_NORM_SCALE_FUSION = BitExactFusionGate(
+    "Ming-Image RMSNorm epilogue", per_signature=True
+)
+
+
+def _eager_silu_and_mul(x: torch.Tensor) -> torch.Tensor:
+    gate, up = x.chunk(2, dim=-1)
+    return F.silu(gate) * up
+
+
+class MingRMSNorm(RMSNorm):
+    def __init__(self, dim, eps=1e-5):
+        # unlike Z-Image, Ming's reference accumulates the variance in fp32
+        super().__init__(dim, eps=eps, cast_x_before_out_mul=True, force_native=True)
+
+    def forward_native(
+        self, x, residual=None, post_residual_addition=None, quant_linear=None
+    ):
+        native = super().forward_native
+        if (
+            torch.compiler.is_compiling()
+            or residual is not None
+            or x.shape[-1] != self.hidden_size
+            or self.weight.dtype != x.dtype
+            or not self.weight.is_contiguous()
+            or not can_use_rmsnorm_cast_before_weight(
+                device=x.device,
+                dtype=x.dtype,
+                contiguous=x.is_contiguous(),
+                eps=self.variance_epsilon,
+            )
+        ):
+            return native(x, residual, post_residual_addition, quant_linear)
+        return _MING_RMSNORM_FUSION.run(
+            lambda: rmsnorm_cast_before_weight_bitexact(
+                x, self.weight, self.variance_epsilon
+            ),
+            lambda: native(x),
+            sig=(
+                x.device.index,
+                x.dtype,
+                x.shape[-1],
+                x.numel() // x.shape[-1] >= 16,
+                x.numel() >= 2**29,
+                self.variance_epsilon,
+            ),
+            logger=logger,
+            reraise=(ValueError,),
+        )
+
+
+def _ming_norm_scale(x, scale, norm, enable_fused, residual=None):
+    def reference():
+        y = norm(x) * scale
+        return y if residual is None else residual + y
+
+    if (
+        not enable_fused
+        or torch.compiler.is_compiling()
+        or norm.variance_epsilon not in (1e-6, 1e-5)
+        or not can_use_rmsnorm_cast_before_weight_scale(x, norm.weight, scale, residual)
+    ):
+        return reference()
+    return _MING_NORM_SCALE_FUSION.run(
+        lambda: rmsnorm_cast_before_weight_scale_bitexact(
+            x, norm.weight, scale, residual, norm.variance_epsilon
+        ),
+        reference,
+        sig=(x.device, x.dtype, norm.variance_epsilon, residual is not None),
+        logger=logger,
+        reraise=(ValueError,),
+    )
+
+
+class MingImageTransformerBlock(ZImageTransformerBlock):
+    def __init__(self, *args, quant_config=None, **kwargs):
+        super().__init__(*args, quant_config=quant_config, **kwargs)
+        self.enable_ming_norm_fusion = quant_config is None
+
+    def _norm_scale(self, x, scale, norm):
+        return _ming_norm_scale(x, scale, norm, self.enable_ming_norm_fusion)
+
+    def _norm_tanh_mul_add(self, x, gate, residual, norm):
+        return _ming_norm_scale(
+            x, torch.tanh(gate), norm, self.enable_ming_norm_fusion, residual
+        )
+
+
+class MingSiluAndMul(nn.Module):
+    def forward(self, x):
+        # Inductor can fuse the reference expression while tracing.
+        if torch.compiler.is_compiling():
+            return _eager_silu_and_mul(x)
+
+        can_fuse = (
+            x.is_cuda
+            and x.dtype is torch.bfloat16
+            and x.dim() == 3
+            and x.stride(-1) == 1
+            and x.stride(-2) >= x.shape[-1]
+            and x.stride(0) == x.shape[1] * x.stride(1)
+            and x.shape[-1] % 2 == 0
+            and x.numel() > 0
+        )
+        if not can_fuse:
+            return _eager_silu_and_mul(x)
+
+        # The first tensor of each layout is compared bit-for-bit against eager.
+        return _MING_SWIGLU_FUSION.run(
+            lambda: fused_packed_silu_mul_bitexact(x),
+            lambda: _eager_silu_and_mul(x),
+            sig=(
+                x.dtype,
+                x.device,
+                x.shape[0],
+                x.shape[-1],
+                x.stride(-2),
+                x.stride(-1),
+            ),
+            logger=logger,
+        )
+
+
+class MingImageTransformer2DModel(ZImageTransformer2DModel):
+    """Ming-Image's joint DiT, sharing Z-Image blocks and TP/SP attention."""
+
+    norm_cls = MingRMSNorm
+    block_cls = MingImageTransformerBlock
+    _no_split_modules = ["MingImageTransformerBlock"]
+    _aliases = ["DiffusionTransformer"]
+
+    def __init__(self, config, hf_config, quant_config=None):
+        super().__init__(config, hf_config, quant_config)
+        self.learned_padding = config.alignment_padding_mode == "learned"
+        if not self.learned_padding:
+            del self.x_pad_token, self.cap_pad_token
+            self.register_buffer(
+                "x_pad_token", torch.zeros(1, self.dim, device="cpu"), persistent=False
+            )
+            self.register_buffer(
+                "cap_pad_token",
+                torch.zeros(1, self.dim, device="cpu"),
+                persistent=False,
+            )
+        self.layer_names = ["noise_refiner", "context_refiner", "layers"]
+        for layer in (*self.noise_refiner, *self.context_refiner, *self.layers):
+            layer.feed_forward.act = MingSiluAndMul()
+
+    def forward(
+        self,
+        hidden_states,
+        encoder_hidden_states,
+        timestep,
+        direct_embeddings,
+        reference_latents=None,
+        **kwargs,
+    ):
+        x = hidden_states
+        batch_size, channels, output_frames, height, width = x.shape
+        if reference_latents is not None:
+            x = torch.cat((x, reference_latents), 2)
+        frames = x.shape[2]
+        x = x.reshape(batch_size, channels, frames, height // 2, 2, width // 2, 2)
+        x = x.permute(0, 2, 3, 5, 4, 6, 1).flatten(1, 3).flatten(2)
+        x_length = x.shape[1]
+        sp_size = get_sp_world_size()
+        x_target = math.ceil(x_length / 32) * 32
+        x = F.pad(x, (0, 0, 0, x_target - x_length))
+        x, _ = self.all_x_embedder["2-1"](x)
+        x = self._replace_padding_with_token_mask(
+            x,
+            (torch.arange(x_target, device=x.device) < x_length).unsqueeze(0),
+            self.x_pad_token,
+        )
+        cap, _ = self.cap_embedder(encoder_hidden_states)
+        cap = torch.cat((cap, direct_embeddings), 1)
+        cap_length = cap.shape[1]
+        cap_target = math.ceil(cap_length / 32) * 32
+        cap = F.pad(cap, (0, 0, 0, cap_target - cap_length))
+        cap = self._replace_padding_with_token_mask(
+            cap,
+            (torch.arange(cap_target, device=x.device) < cap_length).unsqueeze(0),
+            self.cap_pad_token,
+        )
+
+        cap_ids = self.create_coordinate_grid(
+            (cap_target, 1, 1), (1, 0, 0), x.device
+        ).flatten(0, 2)
+        x_ids = self.create_coordinate_grid(
+            (frames, height // 2, width // 2), (cap_target + 1, 0, 0), x.device
+        ).flatten(0, 2)
+        x_ids = F.pad(x_ids, (0, 0, 0, x_target - x_length))
+        x_valid = x_target if self.learned_padding else x_length
+        cap_valid = cap_target if self.learned_padding else cap_length
+        x_freqs, cap_freqs = self.rotary_emb(x_ids), self.rotary_emb(cap_ids)
+        # Freqs are rebuilt every forward, so the identity-keyed _get_rope_cache
+        # would never hit.
+        x_rope_cos_sin_cache, x_rope_positions, x_rope_freqs_complex = (
+            self._build_rope_cache(x_freqs)
+        )
+        cap_rope_cos_sin_cache, cap_rope_positions, cap_rope_freqs_complex = (
+            self._build_rope_cache(cap_freqs)
+        )
+        x_mask, x_meta = self._get_attn_mask_and_meta(
+            "_ming_x_mask", [x_valid] * batch_size, x_target, x.device
+        )
+        cap_mask, cap_meta = self._get_attn_mask_and_meta(
+            "_ming_cap_mask", [cap_valid] * batch_size, cap_target, x.device
+        )
+        adaln = self.t_embedder(((1000.0 - timestep) / 1000.0) * self.t_scale).to(
+            x.dtype
+        )
+        for layer in self.noise_refiner:
+            x = layer(
+                x,
+                x_freqs,
+                adaln,
+                rope_cos_sin_cache=x_rope_cos_sin_cache,
+                rope_positions=x_rope_positions,
+                attn_mask=x_mask,
+                attn_mask_meta=x_meta,
+                skip_sequence_parallel_override=True,
+                rope_freqs_complex=x_rope_freqs_complex,
+            )
+        for layer in self.context_refiner:
+            cap = layer(
+                cap,
+                cap_freqs,
+                rope_cos_sin_cache=cap_rope_cos_sin_cache,
+                rope_positions=cap_rope_positions,
+                attn_mask=cap_mask,
+                attn_mask_meta=cap_meta,
+                rope_freqs_complex=cap_rope_freqs_complex,
+            )
+        if sp_size > 1:
+            # masked alignment rows never contribute; learned registers must stay
+            x, cap = x[:, :x_valid], cap[:, :cap_valid]
+            x_freqs = tuple(freq[:x_valid] for freq in x_freqs)
+            cap_freqs = tuple(freq[:cap_valid] for freq in cap_freqs)
+        unified = torch.cat((x, cap), 1)
+        freqs = tuple(
+            torch.cat((image_freq, text_freq), -2)
+            for image_freq, text_freq in zip(x_freqs, cap_freqs)
+        )
+        mask, meta = self._get_joint_attn_mask_and_meta(
+            [x_valid] * batch_size,
+            x_target,
+            [cap_valid] * batch_size,
+            cap_target,
+            x.device,
+        )
+        if sp_size > 1:
+            # shard the complete joint sequence, with only global-tail padding
+            unified, shard = shard_seq(unified)
+            freqs = tuple(shard_like(freq, shard, dim=0) for freq in freqs)
+            mask, meta = None, tail_attn_meta(shard, batch_size, x.device)
+        rope_cos_sin_cache, rope_positions, rope_freqs_complex = self._build_rope_cache(
+            freqs
+        )
+        for layer in self.layers:
+            unified = layer(
+                unified,
+                freqs,
+                adaln,
+                rope_cos_sin_cache=rope_cos_sin_cache,
+                rope_positions=rope_positions,
+                attn_mask=mask,
+                attn_mask_meta=meta,
+                rope_freqs_complex=rope_freqs_complex,
+            )
+        if sp_size == 1:
+            unified = unified[:, :x_target]
+        output = self.all_final_layer["2-1"](unified, adaln)
+        if sp_size > 1:
+            output = gather_seq(output, shard.orig_len)
+        output = output[:, :x_length].reshape(
+            batch_size, frames, height // 2, width // 2, 2, 2, channels
+        )
+        output = output.permute(0, 6, 1, 2, 4, 3, 5).reshape(
+            batch_size, channels, frames, height, width
+        )
+        return -output[:, :, :output_frames]
+
+
+EntryClass = MingImageTransformer2DModel

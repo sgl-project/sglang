@@ -1,7 +1,7 @@
 //! Configuration and multimodal handles for scheduler intake.
 
-use crate::message::config::ServerArgs;
-use crate::message::request::MmRequest;
+use crate::message::config::{HiddenStatesMode, ServerArgs};
+use crate::message::request::Request;
 
 /// Dispatches multimodal requests onto the MM worker channel.
 #[derive(Clone)]
@@ -10,12 +10,9 @@ pub struct MmDispatch {
     /// ignored, as the Python `TokenizerManager` does with `mm_processor is
     /// None`.
     pub enabled: bool,
-    /// → MM worker pool (spawned via `Server.start_mm_workers`).
-    pub tx: flume::Sender<MmRequest>,
-    /// Parked results. Purged here when a late result arrives for a request
-    /// that is no longer parked; otherwise it would leak, since only the
-    /// scheduler drain pops entries.
-    pub results: crate::multi_modality::result_store::MmResultStore,
+    /// -> MM worker pool (spawned via `Server.start_mm_workers`); carries the
+    /// whole request, like the tokenizer pool's edge.
+    pub tx: flume::Sender<Request>,
 }
 
 /// Resolved once at boot from the scheduler's `server_args`.
@@ -32,8 +29,8 @@ pub struct Limits {
     pub num_reserved_tokens: u64,
     /// Clamp `max_new_tokens` to what fits instead of rejecting the request.
     pub allow_auto_truncate: bool,
-    /// Whether the server can produce hidden states at all.
-    pub enable_return_hidden_states: bool,
+    /// The most a request's `return_hidden_states` may ask for.
+    pub return_hidden_states_mode: HiddenStatesMode,
 }
 
 impl From<&ServerArgs> for Limits {
@@ -44,7 +41,7 @@ impl From<&ServerArgs> for Limits {
             context_len: sa.model_config.context_len,
             num_reserved_tokens: sa.num_reserved_tokens,
             allow_auto_truncate: sa.allow_auto_truncate,
-            enable_return_hidden_states: sa.enable_return_hidden_states,
+            return_hidden_states_mode: sa.hidden_states_mode(),
         }
     }
 }

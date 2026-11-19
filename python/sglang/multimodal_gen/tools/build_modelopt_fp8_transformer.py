@@ -26,10 +26,9 @@ import gc
 import json
 import os
 import re
-import shutil
 from collections import defaultdict
 from pathlib import Path
-from typing import Callable, Iterable, Mapping, Sequence
+from typing import Callable, Mapping, Sequence
 
 import torch
 from safetensors import safe_open
@@ -38,11 +37,14 @@ from safetensors.torch import load_file, save_file
 from sglang.multimodal_gen.runtime.utils.quantization_utils import (
     normalize_flat_modelopt_quant_config,
 )
+from sglang.multimodal_gen.tools.modelopt_checkpoint import (
+    load_config,
+    load_selected_tensors,
+    load_weight_map,
+    prepare_output_dir,
+    resolve_transformer_dir,
+)
 
-INDEX_FILENAMES = [
-    "model.safetensors.index.json",
-    "diffusion_pytorch_model.safetensors.index.json",
-]
 FP8_E4M3_MAXBOUND = 448.0
 DEFAULT_FLUX2_KEEP_BF16_PATTERNS = [
     r"^time_guidance_embed\.(timestep_embedder|guidance_embedder)\.linear_[12]$",
@@ -209,16 +211,6 @@ DEFAULT_QWEN_IMAGE_KEEP_BF16_PATTERNS = [
 ]
 
 
-def _resolve_transformer_dir(path: str) -> str:
-    candidate = Path(path).expanduser().resolve()
-    if (candidate / "config.json").is_file():
-        return str(candidate)
-    transformer_dir = candidate / "transformer"
-    if (transformer_dir / "config.json").is_file():
-        return str(transformer_dir)
-    raise FileNotFoundError(f"Could not resolve a transformer directory from: {path}")
-
-
 def _resolve_backbone_ckpt(path: str) -> str:
     candidate = Path(path).expanduser().resolve()
     if candidate.is_file():
@@ -227,53 +219,6 @@ def _resolve_backbone_ckpt(path: str) -> str:
     if backbone_path.is_file():
         return str(backbone_path)
     raise FileNotFoundError(f"Could not resolve backbone.pt from: {path}")
-
-
-def _find_index_file(model_dir: str) -> str | None:
-    for filename in INDEX_FILENAMES:
-        candidate = os.path.join(model_dir, filename)
-        if os.path.isfile(candidate):
-            return filename
-
-    matches = sorted(
-        filename
-        for filename in os.listdir(model_dir)
-        if filename.endswith(".safetensors.index.json")
-    )
-    return matches[0] if matches else None
-
-
-def _load_weight_map(model_dir: str) -> tuple[dict[str, str], str | None]:
-    index_filename = _find_index_file(model_dir)
-    if index_filename is not None:
-        with open(os.path.join(model_dir, index_filename), encoding="utf-8") as f:
-            index_data = json.load(f)
-        return dict(index_data["weight_map"]), index_filename
-
-    safetensors_files = sorted(
-        filename
-        for filename in os.listdir(model_dir)
-        if filename.endswith(".safetensors")
-    )
-    if len(safetensors_files) != 1:
-        raise ValueError(
-            f"Expected an index file or a single safetensors shard in {model_dir}, "
-            f"found {len(safetensors_files)} shard(s)."
-        )
-
-    shard_name = safetensors_files[0]
-    with safe_open(
-        os.path.join(model_dir, shard_name), framework="pt", device="cpu"
-    ) as f:
-        weight_map = {key: shard_name for key in f.keys()}
-    index_filename = f"{Path(shard_name).stem}.safetensors.index.json"
-    return weight_map, index_filename
-
-
-def _load_config(model_dir: str) -> dict:
-    config_path = os.path.join(model_dir, "config.json")
-    with open(config_path, encoding="utf-8") as f:
-        return json.load(f)
 
 
 def _load_first_shard_metadata(
@@ -512,37 +457,6 @@ def quantize_fp8_weight(
     return quantized.cpu().contiguous()
 
 
-def _copy_non_shard_files(source_dir: str, output_dir: str) -> None:
-    ignored = set(INDEX_FILENAMES)
-    for entry in os.listdir(source_dir):
-        if entry.endswith(".safetensors") or entry in ignored:
-            continue
-        source_path = os.path.join(source_dir, entry)
-        output_path = os.path.join(output_dir, entry)
-        if os.path.isdir(source_path):
-            shutil.copytree(source_path, output_path, dirs_exist_ok=True)
-        else:
-            shutil.copy2(source_path, output_path)
-
-
-def _load_selected_tensors(
-    model_dir: str,
-    weight_map: Mapping[str, str],
-    tensor_names: Iterable[str],
-) -> dict[str, torch.Tensor]:
-    tensors: dict[str, torch.Tensor] = {}
-    names_by_file: dict[str, list[str]] = defaultdict(list)
-    for name in tensor_names:
-        names_by_file[weight_map[name]].append(name)
-
-    for filename, names in names_by_file.items():
-        shard_path = os.path.join(model_dir, filename)
-        with safe_open(shard_path, framework="pt", device="cpu") as f:
-            for name in names:
-                tensors[name] = f.get_tensor(name).contiguous()
-    return tensors
-
-
 def build_modelopt_fp8_transformer(
     *,
     modelopt_hf_dir: str,
@@ -554,13 +468,13 @@ def build_modelopt_fp8_transformer(
     maxbound: float = FP8_E4M3_MAXBOUND,
     overwrite: bool = False,
 ) -> dict[str, int]:
-    source_dir = _resolve_transformer_dir(modelopt_hf_dir)
+    source_dir = resolve_transformer_dir(modelopt_hf_dir)
     backbone_ckpt_path = _resolve_backbone_ckpt(modelopt_backbone_ckpt)
     base_dir = (
-        _resolve_transformer_dir(base_transformer_dir) if base_transformer_dir else None
+        resolve_transformer_dir(base_transformer_dir) if base_transformer_dir else None
     )
 
-    config = _load_config(source_dir)
+    config = load_config(source_dir)
     quant_config = config.get("quantization_config")
     if not isinstance(quant_config, dict):
         raise ValueError(
@@ -572,7 +486,7 @@ def build_modelopt_fp8_transformer(
             "(quant_method=modelopt)."
         )
 
-    source_weight_map_all, index_filename = _load_weight_map(source_dir)
+    source_weight_map_all, index_filename = load_weight_map(source_dir)
     source_metadata = _load_first_shard_metadata(source_dir, source_weight_map_all)
     is_ltx2_export = _is_ltx2_x0_export(
         config=config,
@@ -596,17 +510,7 @@ def build_modelopt_fp8_transformer(
             "BF16 fallback patterns are enabled, but --base-transformer-dir was not provided."
         )
 
-    output_path = Path(output_dir).expanduser().resolve()
-    if output_path.exists():
-        if not overwrite:
-            raise FileExistsError(
-                f"Output directory already exists: {output_path}. "
-                "Use --overwrite to replace it."
-            )
-        shutil.rmtree(output_path)
-    output_path.mkdir(parents=True, exist_ok=True)
-
-    _copy_non_shard_files(source_dir, str(output_path))
+    output_path = prepare_output_dir(source_dir, output_dir, overwrite=overwrite)
 
     if is_ltx2_export:
         source_weight_map = {
@@ -618,7 +522,7 @@ def build_modelopt_fp8_transformer(
         source_weight_map = source_weight_map_all
     base_weight_map: dict[str, str] = {}
     if base_dir is not None:
-        base_weight_map, _ = _load_weight_map(base_dir)
+        base_weight_map, _ = load_weight_map(base_dir)
     fallback_weight_names = sorted(
         weight_name
         for weight_name in source_weight_map
@@ -681,7 +585,7 @@ def build_modelopt_fp8_transformer(
     )
 
     fallback_tensors = (
-        _load_selected_tensors(base_dir, base_weight_map, fallback_weight_names)
+        load_selected_tensors(base_dir, base_weight_map, fallback_weight_names)
         if fallback_weight_names and base_dir is not None
         else {}
     )

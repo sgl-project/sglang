@@ -1,81 +1,71 @@
 // MiniMax-M3 per-cell benchmark numbers, keyed by the same `match` tuple as
 // minimax-m3.jsx cells. See _deployment.jsx for the speed/accuracy schema.
 //
-// SPEED — bench_serving --flush-cache, random isl2048/osl256, max_concurrency 64,
-// CUDA graph on. B200 (tp8, MXFP8, MSA fmha_sm100 path; re-measured 2026-06-15
-// with piecewise CUDA graph default-on) and H200 (tp8, bf16, built-in Triton
-// sparse) are measured on PR #27944 — warm steady-state from a 3-run sweep (the
-// B200 3-run is identical; the H200 cold-start first run, ~2x slower, is
-// excluded). B300 / GB300
-// rows are the earlier 2026-06-11 tp4 MSA numbers (pre-piecewise),
-// pending a #27944 re-measure on their own boxes. GB200 is a bare-match
-// stub (inferred-supported, not benchmarked). AMD: MI355X at 8-GPU tp8 (native
-// MXFP8) carries a bench_serving speed row; MI300X (MXFP8 -> block-fp8) was
-// accuracy-only. MI350X / MI325X inherit their same-arch sibling's recipe
-// (stubs). (sgl-eval does NOT measure serving throughput — TTFT/TPOT/tok-s come
-// from sglang.bench_serving.)
+// NVIDIA rows (B200 / B300 / GB300 / H200) re-measured 2026-11-04 on
+// lmsysorg/sglang:v0.5.23-cu130 with each cell's exact launch flags. The sparse step
+// runs on the built-in Triton path (the image does not bundle the MSA kernel).
 //
-// GSM8K / GPQA — unified on a SINGLE harness: sgl-eval (github.com/sgl-project/sgl-eval)
-// `run gsm8k` (full 1319) / `run gpqa` (GPQA Diamond 198, n-repeats 4), chat
-// endpoint with --thinking (M3's reasoning path) + M3's recommended sampling
-// (temp 1.0 / top_p 0.95), symbolic grading. This is the config's Reproduce command.
-// H200 is stable at GSM8K 97.04% (std 0.0). B200 was re-measured 2026-06-15 on
-// minimax-m3-upstream (piecewise + MSA decode fix): GSM8K 96.51% recommended /
-// 96.89% greedy (stable single-run), GPQA pass@1[avg-of-4] 89.14% — the merged
-// MSA decode fix resolves the earlier fresh-server-94.4%-then-drift under-load issue.
-// Per-platform re-measurement under sgl-eval is in progress; rows still pending
-// show `gsm8k_pct: null` (no GSM8K row rendered) with the legacy-harness number
-// kept in a comment. Legacy harnesses were NOT comparable across platforms
-// (NVIDIA: few_shot_gsm8k --num-questions 200; AMD: run_eval gsm8k 1319 examples) —
-// which is exactly why we re-measure on one harness.
+// SPEED: sglang.benchmark.serving --dataset-name random --flush-cache (default
+// --random-range-ratio), 1 warm-up run discarded, mean of 3 measured runs.
+// tokens_per_sec_per_gpu = total (input + output) tok/s / GPU count. TTFT/TPOT are
+// means. GB200 is a bare-match stub (inferred-supported, not benchmarked). AMD:
+// MI355X at 8-GPU tp8 (native MXFP8) carries a bench_serving speed row; MI300X
+// (MXFP8 -> block-fp8) was accuracy-only. MI350X / MI325X inherit their same-arch
+// sibling's recipe (stubs).
+//
+// ACCURACY: sgl-eval 0.1.3 (the python/pyproject test-extra pin), `run gsm8k` (full
+// 1319) with --thinking and M3's recommended sampling (temp 1.0 / top_p 0.95), one
+// run, 75 min wall-time cap. A few runs had 1-2 runaway generations still running
+// at the cap; those are scored on the completed questions (noted per row). Single
+// runs at temp 1.0 vary by roughly +/-1 point. Rows still pending show
+// `gsm8k_pct: null` (no GSM8K row rendered).
 export const benchmarks = [
   {
-    // B200 re-measured 2026-06-15 at tp8 on minimax-m3-upstream (piecewise CUDA
-    // graph default-on + AR-fusion revert/off + MSA decode fix). The earlier
-    // #27944 tp4 speed + GSM8K drift were pre-fix; the merged MSA decode fix
-    // resolves the drift (stable single-run greedy 96.89% / recommended 96.51%).
     match: { hw: "b200", variant: "default", quant: "mxfp8", strategy: "balanced", nodes: "single" },
-    sglang_version: "PR #27944",
+    sglang_version: "v0.5.23",
     speed: [
-      // bench_serving --flush-cache, MSA path, tp8; warm steady-state (3-run, identical).
       { workload: { dataset: "random", isl: 2048, osl: 256, max_concurrency: 64, num_prompts: 128 },
-        ttft_ms: 1580, tpot_ms: 24.1, tokens_per_sec_per_gpu: 2385 },
+        ttft_ms: 413, tpot_ms: 25.6, tokens_per_sec_per_gpu: 2261 },
     ],
-    accuracy: { gpqa_pct: 89.1, gsm8k_pct: 96.5, mmmu_pro_pct: 72.7 }, // 2026-06-15, sgl-eval --thinking, recommended sampling (temp 1.0/top_p 0.95), tp8. GSM8K full 1319 = 96.51% (greedy 96.89%). GPQA Diamond 198, n-repeats 4 = pass@1[avg-of-4] 89.14% +/-1.73% (pass@4 95.45%, majority@4 93.52%). MMMU-Pro 2026-06-18, sgl-eval "standard (10 options)" test split, full 1730, single-shot 72.66% (thinking, temp 1.0/top_p 0.95).
+    accuracy: { gpqa_pct: 89.1, gsm8k_pct: 96.7, mmmu_pro_pct: 72.7 }, // GSM8K 96.74% (1319)
+    notes: "GPQA Diamond (89.1, n-repeats 4) and MMMU-Pro (72.7) are from the earlier PR #27944 run (2026-06) and were not re-run on v0.5.23.",
   },
   {
-    // Hopper H200: bf16 build (MXFP8 is Blackwell-only) at tp8, built-in Triton
-    // sparse path (MSA is Blackwell-only). GSM8K re-measured on #27944.
+    // Hopper H200: bf16 build (MXFP8 is Blackwell-only) at tp8; fa3 + page 128,
+    // Triton sparse path. Host driver 570.211.01 (the CUDA 13 image runs on it).
     match: { hw: "h200", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" },
-    sglang_version: "PR #27944",
+    sglang_version: "v0.5.23",
     speed: [
-      // bench_serving --flush-cache, bf16 Triton path; warm steady-state (3-run, cold-start run-1 excluded).
       { workload: { dataset: "random", isl: 2048, osl: 256, max_concurrency: 64, num_prompts: 128 },
-        ttft_ms: 1054, tpot_ms: 70.8, tokens_per_sec_per_gpu: 1044 },
+        ttft_ms: 888, tpot_ms: 41.8, tokens_per_sec_per_gpu: 1381 },
     ],
-    accuracy: { gsm8k_pct: 97.0 }, // #27944, sgl-eval --thinking, full 1319, recommended sampling (temp 1.0/top_p 0.95/top_k 40); stable 97.04% across all 3 runs (std 0.0)
+    accuracy: { gsm8k_pct: 97.0 }, // 97.04% (1319)
   },
   {
     match: { hw: "b300", variant: "default", quant: "mxfp8", strategy: "balanced", nodes: "single" },
-    sglang_version: "PR #27944",
+    sglang_version: "v0.5.23",
     speed: [
-      { workload: { dataset: "random", isl: 2048, osl: 256, max_concurrency: 64 },
-        ttft_ms: null, tpot_ms: 32.8, tokens_per_sec_per_gpu: 3285 },
+      { workload: { dataset: "random", isl: 2048, osl: 256, max_concurrency: 64, num_prompts: 128 },
+        ttft_ms: 446, tpot_ms: 31.5, tokens_per_sec_per_gpu: 3703 },
     ],
-    accuracy: { gsm8k_pct: null }, // TODO: pending sgl-eval re-measure on B300 (legacy few_shot 200: 87.5)
+    accuracy: { gsm8k_pct: 97.1 }, // 97.12% on 1318/1319 (1 runaway generation at the 75 min cap)
   },
   // GB200: inferred-supported, not directly benchmarked.
   { match: { hw: "gb200", variant: "default", quant: "mxfp8", strategy: "balanced", nodes: "single" } },
   {
+    // Measured with the cell's --decode-attention-backend trtllm_mha split. fa4-only
+    // on the same image: 2048/256 c64 TTFT 440 / TPOT 31.5 / 3725 tok/s/GPU;
+    // 8192/256 c24 TTFT 1442 / TPOT 19.8 / 5230 tok/s/GPU; GSM8K 97.0% (1319).
+    // Split + MSA (MiniMax-AI/MSA#27): TPOT 54.3 / 23.4 ms, GSM8K 95.4% (1317/1319).
     match: { hw: "gb300", variant: "default", quant: "mxfp8", strategy: "balanced", nodes: "single" },
-    sglang_version: "PR #27944",
+    sglang_version: "v0.5.23",
     speed: [
-      { workload: { dataset: "random", isl: 2048, osl: 256, max_concurrency: 64 },
-        ttft_ms: 4746, tpot_ms: 39.3, tokens_per_sec_per_gpu: 2493 },
-      { workload: { dataset: "random", isl: 8192, osl: 256, max_concurrency: 24 },
-        ttft_ms: 3324, tpot_ms: 32.9, tokens_per_sec_per_gpu: 4323 },
+      { workload: { dataset: "random", isl: 2048, osl: 256, max_concurrency: 64, num_prompts: 128 },
+        ttft_ms: 435, tpot_ms: 31.5, tokens_per_sec_per_gpu: 3715 },
+      { workload: { dataset: "random", isl: 8192, osl: 256, max_concurrency: 24, num_prompts: 24 },
+        ttft_ms: 1422, tpot_ms: 20.0, tokens_per_sec_per_gpu: 5121 },
     ],
-    accuracy: { gsm8k_pct: null }, // TODO: pending sgl-eval re-measure on GB300 (legacy few_shot 200: 87.5)
+    accuracy: { gsm8k_pct: 95.3 }, // 95.29% on 1317/1319 (2 runaway generations at the 75 min cap)
   },
   // MI355X (gfx950): native MXFP8. Speed: bench_serving 1024/1024 @ conc 64, tp8
   // -> 1678 output tok/s (3355 total incl. input); 3355 / 8 = ~420 tokens/sec/GPU (total, in+out).

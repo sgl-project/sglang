@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
@@ -38,6 +39,7 @@ class GenerateSession:
         self.realtime_session = RealtimeSession()
         self.adapter: BaseRealtimeModelAdapter | None = None
         self.adapter_state: Any = None
+        self.output_lock = asyncio.Lock()
         self.output_pace_next_send_at: float | None = None
         self.output_pace_last_event_id: int | None = None
 

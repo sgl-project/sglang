@@ -10,22 +10,24 @@ This page focuses on optimal configuration and benchmark results for DeepSeek-R1
 On the A3 Series, each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend NPU Reference](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware) for details.
 </Note>
 
+The configurations on this page use the daily build image `quay.io/ascend/sglang:main-cann9.1.0-a3`.
+
 ### Low Latency
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| DeepSeek-R1 | Ascend A3 Series Products | 32 | PD Disaggregation | 3.5k+1.5k | 20ms | W8A8 INT8 | [Optimal Configuration](#deepseek-r1-w8a8-2p1d-32p-in3k5-out1k5-20ms) |
-| DeepSeek-R1 | Ascend A3 Series Products | 32 | PD Disaggregation | 3.5k+1k | 19.0ms | W8A8 INT8 | [Optimal Configuration](#deepseek-r1-w8a8-2p1d-32p-in3k5-out1k-19-0ms) |
-| DeepSeek-R1 | Ascend A3 Series Products | 32 | PD Disaggregation | 3.9k+1k | 19.0ms | W8A8 INT8 | [Optimal Configuration](#deepseek-r1-w8a8-2p1d-32p-in3k9-out1k-19-0ms) |
-| DeepSeek-R1 | Ascend A3 Series Products | 32 | PD Disaggregation | 6k+1.6k | 20.5ms | W8A8 INT8 | [Optimal Configuration](#deepseek-r1-w8a8-2p1d-32p-in6k-out1k6-20-5ms) |
+| DeepSeek-R1 | A3 Series Products | 32 | PD Disaggregation | 3.5k+1.5k | 20ms | W8A8 INT8 | [Optimal Configuration](#deepseek-r1-w8a8-2p1d-32p-in3k5-out1k5-20ms) |
+| DeepSeek-R1 | A3 Series Products | 32 | PD Disaggregation | 3.5k+1k | 19.0ms | W8A8 INT8 | [Optimal Configuration](#deepseek-r1-w8a8-2p1d-32p-in3k5-out1k-19-0ms) |
+| DeepSeek-R1 | A3 Series Products | 32 | PD Disaggregation | 3.9k+1k | 19.0ms | W8A8 INT8 | [Optimal Configuration](#deepseek-r1-w8a8-2p1d-32p-in3k9-out1k-19-0ms) |
+| DeepSeek-R1 | A3 Series Products | 32 | PD Disaggregation | 6k+1.6k | 20.5ms | W8A8 INT8 | [Optimal Configuration](#deepseek-r1-w8a8-2p1d-32p-in6k-out1k6-20-5ms) |
 
 ### High Throughput
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| DeepSeek-R1 | Ascend A3 Series Products | 16 | PD Disaggregation | 3.5k+1.5k | 50ms | W4A8 INT8 | [Optimal Configuration](#deepseek-r1-w4a8-1p1d-16p-in3k5-out1k5-50ms) |
-| DeepSeek-R1 | Ascend A3 Series Products | 8 | PD Mixed | 3.5k+1.5k | 50ms | W4A8 INT8 | [Optimal Configuration](#deepseek-r1-w4a8-8p-in3k5-out1k5-50ms) |
-| DeepSeek-R1 | Ascend A3 Series Products | 32 | PD Disaggregation | 3.5k+1.5k | 50ms | W8A8 INT8 | [Optimal Configuration](#deepseek-r1-w8a8-2p1d-32p-in3k5-out1k5-50ms) |
+| DeepSeek-R1 | A3 Series Products | 16 | PD Disaggregation | 3.5k+1.5k | 50ms | W4A8 INT8 | [Optimal Configuration](#deepseek-r1-w4a8-1p1d-16p-in3k5-out1k5-50ms) |
+| DeepSeek-R1 | A3 Series Products | 8 | PD Mixed | 3.5k+1.5k | 50ms | W4A8 INT8 | [Optimal Configuration](#deepseek-r1-w4a8-8p-in3k5-out1k5-50ms) |
+| DeepSeek-R1 | A3 Series Products | 32 | PD Disaggregation | 3.5k+1.5k | 50ms | W8A8 INT8 | [Optimal Configuration](#deepseek-r1-w8a8-2p1d-32p-in3k5-out1k5-50ms) |
 
 ## Optimal Configuration
 
@@ -33,7 +35,7 @@ On the A3 Series, each card has 2 dies, so `--tp-size` is twice the card count; 
 
 **Model**: DeepSeek-R1
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 16
 
@@ -125,8 +127,7 @@ do
         --speculative-num-steps 1 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 2 \
-        --dp-size 8 \
-        --enable-dp-attention \
+        --attn-dp-size 8 \
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --reasoning-parser deepseek-r1 \
@@ -160,12 +161,11 @@ do
         --port 8001 \
         --nnodes 1 \
         --tp-size 16 \
-        --dp-size 16 \
+        --attn-dp-size 16 \
         --mem-fraction-static 0.9 \
         --max-running-requests 416 \
         --quantization modelslim \
         --moe-a2a-backend deepep \
-        --enable-dp-attention \
         --deepep-mode low_latency \
         --enable-dp-lm-head \
         --cuda-graph-bs-decode 2 4 6 8 10 12 14 16 18 20 22 24 26 \
@@ -196,15 +196,15 @@ done
 # Before running, replace the following placeholders:
 #   <your prefill ip>: prefill node IP address
 #   <your decode ip>: decode node IP address
+#   /path/to/model-weights: the MODEL_PATH the workers were launched with
 # ============================================================
 
-python -m sglang_router.launch_router \
-    --pd-disaggregation \
-    --policy cache_aware \
-    --prefill http://<your prefill ip>:8000 8998 \
-    --decode http://<your decode ip>:8001 \
+sgl-router \
+    --model-id /path/to/model-weights \
+    --no-tokenizer \
+    --worker-urls http://<your prefill ip>:8000 http://<your decode ip>:8001 \
     --host 127.0.0.1 \
-    --port 6688 \
+    --port 6688
 ```
 
 #### Benchmark
@@ -212,7 +212,7 @@ python -m sglang_router.launch_router \
 We tested it based on the `RANDOM` dataset.
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
     --dataset-name random \
     --backend sglang \
     --host 127.0.0.1 \
@@ -232,7 +232,7 @@ python -m sglang.bench_serving \
 
 **Model**: DeepSeek-R1
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 8
 
@@ -279,12 +279,12 @@ export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=72
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 export SGLANG_NPU_USE_MLAPO=1
-export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=200
-export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
 export SGLANG_USE_FIA_NZ=1
 export STREAMS_PER_DEVICE=32
 
 python3 -m sglang.launch_server \
+    --enable-prefill-delayer \
+    --prefill-delayer-max-delay-passes 200 \
     --model-path $MODEL_PATH \
     --host 127.0.0.1 --port 6688 \
     --tp-size 16 \
@@ -302,8 +302,7 @@ python3 -m sglang.launch_server \
     --max-prefill-tokens 3000 \
     --moe-a2a-backend deepep \
     --deepep-mode auto \
-    --enable-dp-attention \
-    --dp-size 16 \
+    --attn-dp-size 16 \
     --enable-dp-lm-head \
     --speculative-algorithm NEXTN \
     --speculative-num-steps 3 \
@@ -320,7 +319,7 @@ python3 -m sglang.launch_server \
 We tested it based on the `RANDOM` dataset.
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
     --dataset-name random \
     --backend sglang \
     --host 127.0.0.1 \
@@ -339,7 +338,7 @@ python -m sglang.bench_serving \
 
 **Model**: DeepSeek-R1
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 32
 
@@ -430,8 +429,7 @@ do
         --speculative-num-steps 1 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 2 \
-        --dp-size 2 \
-        --enable-dp-attention \
+        --attn-dp-size 2 \
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --enable-attn-tp-input-scattered \
@@ -468,12 +466,11 @@ do
         --node-rank $i \
         --nnodes 2 \
         --tp-size 32 \
-        --dp-size 16 \
+        --attn-dp-size 16 \
         --mem-fraction-static 0.75 \
         --max-running-requests 32 \
         --quantization modelslim \
         --moe-a2a-backend deepep \
-        --enable-dp-attention \
         --deepep-mode low_latency \
         --enable-dp-lm-head \
         --moe-dense-tp 1 \
@@ -504,18 +501,18 @@ done
 # Before running, replace the following placeholders:
 #   <your prefill ip1>, <your prefill ip2>: prefill node IP addresses
 #   <your decode ip1>: first decode node IP address (decode may have distributed nodes)
+#   /path/to/model-weights: the MODEL_PATH the workers were launched with
 # ============================================================
 
-export SGLANG_DP_ROUND_ROBIN=1
-python -m sglang_router.launch_router \
-    --pd-disaggregation \
-    --policy cache_aware \
-    --prefill http://<your prefill ip1>:8000 8998 \
-    --prefill http://<your prefill ip2>:8000 8999 \
-    --decode http://<your decode ip1>:8001 \
+sgl-router \
+    --model-id /path/to/model-weights \
+    --no-tokenizer \
+    --worker-urls \
+        http://<your prefill ip1>:8000 \
+        http://<your prefill ip2>:8000 \
+        http://<your decode ip1>:8001 \
     --host 127.0.0.1 \
-    --port 6688 \
-    --mini-lb
+    --port 6688
 ```
 
 #### Benchmark
@@ -523,7 +520,7 @@ python -m sglang_router.launch_router \
 We tested it based on the `RANDOM` dataset.
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
     --dataset-name random \
     --backend sglang \
     --host 127.0.0.1 \
@@ -541,7 +538,7 @@ python -m sglang.bench_serving \
 
 **Model**: DeepSeek-R1
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 32
 
@@ -636,8 +633,7 @@ do
         --speculative-num-steps 1 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 2 \
-        --dp-size 4 \
-        --enable-dp-attention \
+        --attn-dp-size 4 \
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --enable-attn-tp-input-scattered \
@@ -675,12 +671,11 @@ do
         --node-rank $i \
         --nnodes 2 \
         --tp-size 32 \
-        --dp-size 32 \
+        --attn-dp-size 32 \
         --mem-fraction-static 0.82 \
         --max-running-requests 1024 \
         --quantization modelslim \
         --moe-a2a-backend ascend_fuseep \
-        --enable-dp-attention \
         --deepep-mode low_latency \
         --moe-dense-tp 1 \
         --cuda-graph-bs-decode 2 4 6 8 10 12 14 16 18 20 22 24 26 28 30 32 \
@@ -710,18 +705,18 @@ done
 # Before running, replace the following placeholders:
 #   <your prefill ip1>, <your prefill ip2>: prefill node IP addresses
 #   <your decode ip1>: first decode node IP address (decode may have distributed nodes)
+#   /path/to/model-weights: the MODEL_PATH the workers were launched with
 # ============================================================
 
-export SGLANG_DP_ROUND_ROBIN=1
-python -m sglang_router.launch_router \
-    --pd-disaggregation \
-    --policy cache_aware \
-    --prefill http://<your prefill ip1>:8000 8998 \
-    --prefill http://<your prefill ip2>:8000 8999 \
-    --decode http://<your decode ip1>:8001 \
+sgl-router \
+    --model-id /path/to/model-weights \
+    --no-tokenizer \
+    --worker-urls \
+        http://<your prefill ip1>:8000 \
+        http://<your prefill ip2>:8000 \
+        http://<your decode ip1>:8001 \
     --host 127.0.0.1 \
-    --port 6688 \
-    --mini-lb
+    --port 6688
 ```
 
 #### Benchmark
@@ -729,7 +724,7 @@ python -m sglang_router.launch_router \
 We tested it based on the `RANDOM` dataset.
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
     --dataset-name random \
     --backend sglang \
     --host 127.0.0.1 \
@@ -747,7 +742,7 @@ python -m sglang.bench_serving \
 
 **Model**: DeepSeek-R1
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 32
 
@@ -838,8 +833,7 @@ do
         --speculative-num-steps 1 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 2 \
-        --dp-size 2 \
-        --enable-dp-attention \
+        --attn-dp-size 2 \
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --enable-attn-tp-input-scattered \
@@ -876,12 +870,11 @@ do
         --node-rank $i \
         --nnodes 2 \
         --tp-size 32 \
-        --dp-size 16 \
+        --attn-dp-size 16 \
         --mem-fraction-static 0.75 \
         --max-running-requests 32 \
         --quantization modelslim \
         --moe-a2a-backend deepep \
-        --enable-dp-attention \
         --deepep-mode low_latency \
         --enable-dp-lm-head \
         --moe-dense-tp 1 \
@@ -912,18 +905,18 @@ done
 # Before running, replace the following placeholders:
 #   <your prefill ip1>, <your prefill ip2>: prefill node IP addresses
 #   <your decode ip1>: first decode node IP address (decode may have distributed nodes)
+#   /path/to/model-weights: the MODEL_PATH the workers were launched with
 # ============================================================
 
-export SGLANG_DP_ROUND_ROBIN=1
-python -m sglang_router.launch_router \
-    --pd-disaggregation \
-    --policy cache_aware \
-    --prefill http://<your prefill ip1>:8000 8998 \
-    --prefill http://<your prefill ip2>:8000 8999 \
-    --decode http://<your decode ip1>:8001 \
+sgl-router \
+    --model-id /path/to/model-weights \
+    --no-tokenizer \
+    --worker-urls \
+        http://<your prefill ip1>:8000 \
+        http://<your prefill ip2>:8000 \
+        http://<your decode ip1>:8001 \
     --host 127.0.0.1 \
-    --port 6688 \
-    --mini-lb
+    --port 6688
 ```
 
 #### Benchmark
@@ -931,7 +924,7 @@ python -m sglang_router.launch_router \
 We tested it based on the `RANDOM` dataset.
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
     --dataset-name random \
     --backend sglang \
     --host 127.0.0.1 \
@@ -949,7 +942,7 @@ python -m sglang.bench_serving \
 
 **Model**: DeepSeek-R1
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 32
 
@@ -1040,8 +1033,7 @@ do
         --speculative-num-steps 1 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 2 \
-        --dp-size 2 \
-        --enable-dp-attention \
+        --attn-dp-size 2 \
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --enable-attn-tp-input-scattered \
@@ -1078,12 +1070,11 @@ do
         --node-rank $i \
         --nnodes 2 \
         --tp-size 32 \
-        --dp-size 16 \
+        --attn-dp-size 16 \
         --mem-fraction-static 0.75 \
         --max-running-requests 32 \
         --quantization modelslim \
         --moe-a2a-backend deepep \
-        --enable-dp-attention \
         --deepep-mode low_latency \
         --enable-dp-lm-head \
         --moe-dense-tp 1 \
@@ -1114,18 +1105,18 @@ done
 # Before running, replace the following placeholders:
 #   <your prefill ip1>, <your prefill ip2>: prefill node IP addresses
 #   <your decode ip1>: first decode node IP address (decode may have distributed nodes)
+#   /path/to/model-weights: the MODEL_PATH the workers were launched with
 # ============================================================
 
-export SGLANG_DP_ROUND_ROBIN=1
-python -m sglang_router.launch_router \
-    --pd-disaggregation \
-    --policy cache_aware \
-    --prefill http://<your prefill ip1>:8000 8998 \
-    --prefill http://<your prefill ip2>:8000 8999 \
-    --decode http://<your decode ip1>:8001 \
+sgl-router \
+    --model-id /path/to/model-weights \
+    --no-tokenizer \
+    --worker-urls \
+        http://<your prefill ip1>:8000 \
+        http://<your prefill ip2>:8000 \
+        http://<your decode ip1>:8001 \
     --host 127.0.0.1 \
-    --port 6688 \
-    --mini-lb
+    --port 6688
 ```
 
 #### Benchmark
@@ -1133,7 +1124,7 @@ python -m sglang_router.launch_router \
 We tested it based on the `RANDOM` dataset.
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
     --dataset-name random \
     --backend sglang \
     --host 127.0.0.1 \
@@ -1151,7 +1142,7 @@ python -m sglang.bench_serving \
 
 **Model**: DeepSeek-R1
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 32
 
@@ -1241,8 +1232,7 @@ do
         --speculative-num-steps 1 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 2 \
-        --dp-size 2 \
-        --enable-dp-attention \
+        --attn-dp-size 2 \
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --enable-attn-tp-input-scattered \
@@ -1279,12 +1269,11 @@ do
         --node-rank $i \
         --nnodes 2 \
         --tp-size 32 \
-        --dp-size 8 \
+        --attn-dp-size 8 \
         --mem-fraction-static 0.75 \
         --max-running-requests 32 \
         --quantization modelslim \
         --moe-a2a-backend deepep \
-        --enable-dp-attention \
         --deepep-mode low_latency \
         --enable-dp-lm-head \
         --moe-dense-tp 1 \
@@ -1314,18 +1303,18 @@ done
 # Before running, replace the following placeholders:
 #   <your prefill ip1>, <your prefill ip2>: prefill node IP addresses
 #   <your decode ip1>: first decode node IP address (decode may have distributed nodes)
+#   /path/to/model-weights: the MODEL_PATH the workers were launched with
 # ============================================================
 
-export SGLANG_DP_ROUND_ROBIN=1
-python -m sglang_router.launch_router \
-    --pd-disaggregation \
-    --policy cache_aware \
-    --prefill http://<your prefill ip1>:8000 8998 \
-    --prefill http://<your prefill ip2>:8000 8999 \
-    --decode http://<your decode ip1>:8001 \
+sgl-router \
+    --model-id /path/to/model-weights \
+    --no-tokenizer \
+    --worker-urls \
+        http://<your prefill ip1>:8000 \
+        http://<your prefill ip2>:8000 \
+        http://<your decode ip1>:8001 \
     --host 127.0.0.1 \
-    --port 6688 \
-    --mini-lb
+    --port 6688
 ```
 
 #### Benchmark
@@ -1333,7 +1322,7 @@ python -m sglang_router.launch_router \
 We tested it based on the `RANDOM` dataset.
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
     --dataset-name random \
     --backend sglang \
     --host 127.0.0.1 \

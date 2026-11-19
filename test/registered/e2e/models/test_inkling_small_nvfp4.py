@@ -48,7 +48,7 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=1079, stage="extra-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=880, stage="extra-b", runner_config="4-gpu-b200")
 
 _MODEL_PATH = os.environ.get(
     "INKLING_SMALL_TEST_MODEL_PATH", "thinkingmachines/Inkling-Small-NVFP4"
@@ -226,12 +226,11 @@ class TestInklingSmallNvfp4DsparkDeterministic(CustomTestCase):
         self._run(assert_logprobs_match_prefill_cache_hit)
 
     def test_input_output_logprobs_match_decode_cache_hit(self):
-        # Not every prompt: speculation commits up to block_size-1 tokens past
-        # max_new_tokens, and those reach the radix insert but not the returned
-        # output. For roughly one prompt in 32 that puts the request's only mamba
-        # checkpoint past the prefix a follow-up turn can reach, and its decode
-        # region is not reusable. Tighten to 0.99 once that is fixed.
-        self._run(assert_logprobs_match_decode_cache_hit, min_cache_hit_ratio=0.9)
+        # 0.99 is every prompt: the track interval above makes the reuse
+        # unconditional once the cache key stops carrying speculative overshoot,
+        # so a single miss is a state-reuse regression rather than a geometry
+        # coincidence.
+        self._run(assert_logprobs_match_decode_cache_hit, min_cache_hit_ratio=0.99)
 
 
 # The multi-turn branching harness, unlike the single-turn helpers above, replays

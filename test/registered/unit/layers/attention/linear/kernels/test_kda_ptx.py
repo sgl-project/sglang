@@ -9,7 +9,7 @@ from sglang.srt.layers.attention.linear.kernels.kda_ptx import PtxKDAKernel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class _RejectTriton:
@@ -52,6 +52,8 @@ class TestPtxKDATrackRouting(CustomTestCase):
             ),
             "A_log": torch.zeros(H, dtype=torch.float32),
             "dt_bias": torch.zeros(H * D, dtype=torch.float32),
+            # Safe gate; without a lower bound every batch takes Triton.
+            "lower_bound": -5.0,
             "extend_seq_lens_cpu": list(seq_lens),
         }
 
@@ -77,6 +79,7 @@ class TestPtxKDATrackRouting(CustomTestCase):
                 query_start_loc=x["query_start_loc"],
                 A_log=x["A_log"],
                 dt_bias=x["dt_bias"],
+                lower_bound=x["lower_bound"],
                 return_intermediate_states=True,
                 track_ssm_h_src=torch.tensor([1], dtype=torch.long),
                 track_state=track_state,

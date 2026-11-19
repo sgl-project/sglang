@@ -1,0 +1,19 @@
+name: Nightly sgl-router Docker Image
+
+on:
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    if: github.repository == 'sgl-project/sglang'
+    uses: ./.github/workflows/_sgl-router-docker.yml
+    with:
+      image_repo: lmsysorg/sgl-router
+      tags: nightly
+    secrets: inherit

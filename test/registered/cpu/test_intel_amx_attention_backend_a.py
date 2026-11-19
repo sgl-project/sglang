@@ -1,27 +1,23 @@
-"""
-Usage:
-python3 -m unittest test_intel_amx_attention_backend.TestIntelAMXAttnBackend.test_latency_default_model
-"""
-
 import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
-from sglang.test.run_eval import run_eval
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    get_tp_cpu_bind,
     intel_amx_benchmark,
     is_in_ci,
     popen_launch_server,
 )
 
-register_cpu_ci(est_time=685, suite="stage-a-tp-test-cpu-intel")
+register_cpu_ci(est_time=685, suite="extra-tp-test-cpu-intel")
 
 
 class TestIntelAMXAttnBackend(CustomTestCase):
@@ -65,7 +61,7 @@ class TestIntelAMXAttnBackend(CustomTestCase):
                 num_examples=64,
                 num_threads=32,
             )
-            metrics = run_eval(args)
+            metrics = run_sgl_eval(args)
             if is_in_ci():
                 self.assertGreater(metrics["score"], 0.45)
         finally:
@@ -75,6 +71,7 @@ class TestIntelAMXAttnBackend(CustomTestCase):
 class TestDPAttention(CustomTestCase):
     @classmethod
     def setUpClass(cls):
+        tp_size = 2
         cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = [
@@ -83,12 +80,16 @@ class TestDPAttention(CustomTestCase):
             "--attention-backend",
             "intel_amx",
             "--mem-fraction-static",
-            "0.3",
+            # DP2 weights consume slightly over 30% of the socket container's
+            # pre-load free memory. Leave room for KV without auto-sizing a
+            # large pool when both TP ranks share the same NUMA node.
+            "0.4",
+            "--max-total-tokens",
+            "32768",
             "--disable-overlap-schedule",
             "--tp",
-            "2",
-            "--enable-dp-attention",
-            "--dp",
+            str(tp_size),
+            "--attn-dp-size",
             "2",
         ]
         cls.process = popen_launch_server(
@@ -96,6 +97,11 @@ class TestDPAttention(CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=other_args,
+            env=(
+                {"SGLANG_CPU_OMP_THREADS_BIND": bind}
+                if (bind := get_tp_cpu_bind(tp_size)) is not None
+                else None
+            ),
         )
 
     @classmethod

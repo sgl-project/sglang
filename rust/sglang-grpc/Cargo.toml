@@ -4,14 +4,12 @@ description = "In-process Rust gRPC server for SGLang"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 
 # Consumed by python/setup.py: registers this crate as a PyO3 extension module
 # of the main sglang wheel at the given import path.
 [package.metadata.sglang]
 python-module = "sglang.srt.rust_extensions._grpc"
-# build.rs compiles schemas from outside the Rust workspace; include them in
-# the source-loader artifact fingerprint.
-source-inputs = ["../../proto"]
 # Always build optimized, even for an editable install.
 debug = false
 
@@ -26,22 +24,22 @@ crate-type = ["cdylib"]
 [dependencies]
 async-stream = { workspace = true }
 pyo3 = { workspace = true }
-serde_json = { workspace = true }
+sglang-runtime-v1-types = { path = "../sglang-runtime-v1-types" }
+# preserve_order: JSON objects reach Python as dicts in insertion order.
+serde_json = { workspace = true, features = ["preserve_order"] }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
+tonic = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 
-prost = "0.13"
+prost-types = { workspace = true }
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
-tonic = { version = "0.12", features = ["gzip", "transport"] }
 
-[build-dependencies]
-tonic-build = "0.12"
-# Fallback protoc for machines without a system install (see build.rs); keeps
-# `cargo clippy/check/build` and lint CI working without apt/brew protobuf.
-protoc-bin-vendored = "3"
+[dev-dependencies]
+# `ProstCodec` for the hand-rolled unary call in the metadata-service test.
+tonic-prost = { workspace = true }
 
 [features]
 default = ["pyo3/extension-module"]
