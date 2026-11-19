@@ -1008,6 +1008,7 @@ class CommonKVManager(BaseKVManager):
                 int(part.decode("ascii")) for part in msg[1:5]
             )
             writer_id = msg[5].decode("ascii")
+            writer_rank = int(msg[6].decode("ascii"))
         except (IndexError, ValueError, UnicodeDecodeError):
             logger.warning("Dropping malformed CHUNK_READY message")
             return True
@@ -1017,7 +1018,9 @@ class CommonKVManager(BaseKVManager):
         if handler is None:
             logger.warning("CHUNK_READY for room %s without a staging handler", room)
             return True
-        handler.handle_chunk_arrived(room, chunk_idx, page_start, num_pages, writer_id)
+        handler.handle_chunk_arrived(
+            room, chunk_idx, page_start, num_pages, writer_id, writer_rank=writer_rank
+        )
         return True
 
     def conclude_transfer(
