@@ -69,8 +69,13 @@ fn size_text(bytes: usize) -> String {
 /// logging them at INFO would bury real API traffic and counting them in
 /// `worker_requests_total` would swamp the by-outcome view with probe successes. They
 /// are still counted in `responses_total{route,method,status_code}`.
-fn is_infra_path(path: &str) -> bool {
-    matches!(path, "/healthz" | "/readyz" | "/metrics")
+/// `/internal/member_load` is polled every couple of seconds by the sidecar
+/// beside the router, so it is treated the same way.
+pub(crate) fn is_infra_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/healthz" | "/readyz" | "/metrics" | "/internal/member_load"
+    )
 }
 
 /// Collapse an HTTP method to a bounded allow-list for use as a metric label.
@@ -103,7 +108,7 @@ fn normalize_method(method: &axum::http::Method) -> &'static str {
 /// neither set).
 static POD_ID: OnceLock<String> = OnceLock::new();
 
-fn pod_id() -> &'static str {
+pub(crate) fn pod_id() -> &'static str {
     POD_ID.get_or_init(|| {
         std::env::var("POD_NAME")
             .or_else(|_| std::env::var("HOSTNAME"))
@@ -508,6 +513,10 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
         .route("/healthz", get(crate::server::routes::health::healthz))
         .route("/readyz", get(crate::server::routes::health::readyz))
         .route("/metrics", get(crate::server::routes::metrics::metrics))
+        .route(
+            "/internal/member_load",
+            get(crate::server::routes::member_load::member_load),
+        )
         .route(
             "/v1/models",
             get(crate::server::routes::models::list_models),

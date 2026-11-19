@@ -17,6 +17,10 @@ It defaults to off for same-image A/B testing. See
 See [KV event stream health](docs/kv-stream-health.md) for publisher reset
 cleanup, sequence-gap diagnostics, and recovery limits.
 
+`GET /internal/member_load` reports per-role engine load for a gateway
+sidecar; see [member load](docs/member-load.md) for the `member-load/v1`
+contract.
+
 ## Building
 
 ```bash
