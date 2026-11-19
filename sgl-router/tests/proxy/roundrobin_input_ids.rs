@@ -600,3 +600,243 @@ async fn qwen38_chat_lowers_to_generate() {
         assert_eq!(body["sampling_params"]["stop"], Value::Null);
     }
 }
+
+#[tokio::test]
+async fn multi_model_chat_isolates_workers_templates_and_model_listing() {
+    use http_body_util::BodyExt;
+    let first = MockWorker::start(vec![]).await;
+    let second = MockWorker::start(vec![]).await;
+    let mut cfg = config();
+    cfg.model.id = "first".into();
+    let mut other = cfg.model.clone();
+    other.id = "second".into();
+    cfg.additional_models.push(other);
+    let dir = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+    for model in std::iter::once(&mut cfg.model).chain(&mut cfg.additional_models) {
+        let path = dir.path().join(&model.id);
+        std::fs::create_dir(&path).unwrap();
+        std::fs::copy(
+            "tests/fixtures/tiny_tokenizer.json",
+            path.join("tokenizer.json"),
+        )
+        .unwrap();
+        std::fs::write(
+            path.join("chat_template.jinja"),
+            format!("{}:{{{{ messages[0]['content'] }}}}", model.id),
+        )
+        .unwrap();
+        std::fs::write(path.join("config.json"), serde_json::json!({"model_type":"llama","max_position_embeddings":if model.id == "first" {4096} else {8192}}).to_string()).unwrap();
+        model.tokenizer_path = Some(path.join("tokenizer.json").to_str().unwrap().into());
+    }
+    let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
+    assert_eq!(
+        tokenizers.chat_model("first").unwrap().context_length,
+        Some(4096)
+    );
+    assert_eq!(
+        tokenizers.chat_model("second").unwrap().context_length,
+        Some(8192)
+    );
+    let registry = Arc::new(WorkerRegistry::default());
+    for (id, worker) in [("first", &first), ("second", &second)] {
+        let spec = WorkerSpec {
+            id: WorkerId(worker.url.clone()),
+            url: worker.url.clone(),
+            mode: WorkerMode::Plain,
+            model_ids: vec![ModelId(id.into())],
+            ..Default::default()
+        };
+        registry
+            .add_with_cb(spec, None, WireProtocol::default())
+            .unwrap();
+    }
+    let policies = Arc::new(build_registry_with_defaults(&cfg).unwrap());
+    let proxy = Arc::new(Proxy::new(Duration::from_secs(5)).unwrap());
+    let ctx = Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies));
+    for (id, worker, untouched) in [("second", &second, &first), ("first", &first, &second)] {
+        assert_eq!(
+            send(
+                ctx.clone(),
+                json!({"model":id,"messages":[{"role":"user","content":"hello"}]})
+            )
+            .await,
+            StatusCode::OK
+        );
+        let forwarded = captured(worker);
+        assert_eq!(forwarded["model"], id);
+        let ids = forwarded["input_ids"]
+            .as_array()
+            .expect("model template renders to input_ids")
+            .iter()
+            .map(|id| id.as_u64().unwrap() as u32)
+            .collect::<Vec<_>>();
+        let tokenizer = ctx.tokenizers.get(id).unwrap();
+        assert_eq!(
+            sgl_router::tokenizer::adapter::decode_complete(&tokenizer, &ids, true).unwrap(),
+            format!("{id}:hello")
+        );
+        if id == "second" {
+            assert!(untouched.captured.lock().unwrap().last_body.is_none());
+        }
+    }
+    assert_eq!(
+        send(ctx.clone(), json!({"model":"unknown","messages":[]})).await,
+        StatusCode::NOT_FOUND
+    );
+    for (path, body) in [
+        (
+            "/v1/completions",
+            json!({"model":"second","prompt":"second prompt"}),
+        ),
+        (
+            "/v1/embeddings",
+            json!({"model":"second","input":"second input"}),
+        ),
+        (
+            "/v1/classify",
+            json!({"model":"second","input":"second classification"}),
+        ),
+        (
+            "/v1/rerank",
+            json!({"model":"second","query":"second query","documents":["hello"]}),
+        ),
+        (
+            "/generate",
+            json!({"model":"second","text":"second generation"}),
+        ),
+    ] {
+        let response = build_router(ctx.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        assert_eq!(captured(&second)["model"], "second", "{path}");
+        let response = build_router(ctx.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"model":"unknown"}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+    }
+    let response = build_router(ctx.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/generate")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"text":"default generation"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let forwarded = captured(&first);
+    if let Some(ids) = forwarded["input_ids"].as_array() {
+        let ids = ids
+            .iter()
+            .map(|id| id.as_u64().unwrap() as u32)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sgl_router::tokenizer::adapter::decode_complete(
+                &ctx.tokenizers.get("first").unwrap(),
+                &ids,
+                true
+            )
+            .unwrap(),
+            "default generation"
+        );
+    } else {
+        assert_eq!(forwarded["text"], "default generation");
+    }
+    let response = build_router(ctx)
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        value["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["first", "second"]
+    );
+}
+
+#[tokio::test]
+async fn native_envelopes_keep_model_and_json_validation() {
+    let worker = MockWorker::start(vec![]).await;
+    let ctx = build_ctx(worker.url.clone());
+    for path in ["/generate", "/v1/embeddings", "/v1/classify", "/v1/rerank"] {
+        for body in [
+            "[]",
+            "{\"model\":42}",
+            "{\"model\":\"m\",\"stream\":42}",
+            "{\"model\":\"m\",\"extra\":1e400}",
+        ] {
+            let response = build_router(ctx.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}: {body}");
+        }
+    }
+    assert!(worker.captured.lock().unwrap().last_body.is_none());
+    let body = format!(
+        r#"{{"model":"unknown","model":"{MODEL}","stream":null,"stream":false,"max_tokens":null,"max_tokens":8,"max_completion_tokens":null,"max_completion_tokens":8,"text":"hi"}}"#
+    );
+    let response = build_router(ctx.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/generate")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(captured(&worker)["model"], MODEL);
+    let response = build_router(ctx)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"model":"{MODEL}","stream":false,"stream":false,"messages":[]}}"#
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}

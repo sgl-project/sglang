@@ -1082,3 +1082,59 @@ async fn embeddings_fallback_batches_use_per_prompt_context_limits() {
         assert_eq!(status, expected, "{}", String::from_utf8_lossy(&body));
     }
 }
+
+#[tokio::test]
+async fn models_apply_their_own_reorg_admission_limits() {
+    let worker = MockWorker::start(vec![]).await;
+    let mut ctx =
+        Arc::try_unwrap(context(&[], vec![])).unwrap_or_else(|_| panic!("shared context"));
+    ctx.config.model.policy = PolicyKind::PowerOfTwo;
+    ctx.config.model.reorg_admission.max_inflight_requests = Some(1);
+    let mut second = ctx.config.model.clone();
+    second.id = "second".into();
+    second.reorg_admission.max_inflight_requests = Some(2);
+    ctx.config.additional_models.push(second);
+    ctx.tokenizers = Arc::new(TokenizerRegistry::load_from_config(&ctx.config).unwrap());
+    ctx.registry
+        .add(WorkerSpec {
+            id: WorkerId("shared".into()),
+            url: worker.url.clone(),
+            mode: WorkerMode::Plain,
+            model_ids: vec![ModelId("tiny".into()), ModelId("second".into())],
+            ..Default::default()
+        })
+        .unwrap();
+    ctx = AppContext::new(
+        ctx.config.clone(),
+        ctx.tokenizers.clone(),
+        ctx.proxy.clone(),
+        ctx.registry.clone(),
+        ctx.policies.clone(),
+    );
+    let state = sgl_router::state::kv_events::KvEventIndex::new();
+    let resolvers = ctx
+        .config
+        .models()
+        .map(|model| {
+            let (resolver, _) =
+                sgl_router::policies_reorg::factory::build_resolver(model, &state, None).unwrap();
+            (ModelId(model.id.clone()), resolver)
+        })
+        .collect();
+    ctx.chat_routing = ChatRouting::Reorg(resolvers);
+    let engine = ctx.registry.get(&WorkerId("shared".into())).unwrap();
+    engine
+        .active_requests
+        .store(1, std::sync::atomic::Ordering::Relaxed);
+    let app = build_router(Arc::new(ctx));
+    for (model, expected) in [
+        ("tiny", StatusCode::SERVICE_UNAVAILABLE),
+        ("second", StatusCode::OK),
+    ] {
+        let mut value = body("hi");
+        value["model"] = model.into();
+        let response = app.clone().oneshot(request(value)).await.unwrap();
+        assert_eq!(response.status(), expected, "{model}");
+        response.into_body().collect().await.unwrap();
+    }
+}

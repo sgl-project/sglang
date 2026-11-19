@@ -354,6 +354,15 @@ async fn least_tokens_keeps_the_lighter_of_two_decode_ranks() {
 /// candidates compare directly and the projection alone decides.
 #[tokio::test]
 async fn least_tokens_charges_in_flight_requests_to_their_rank() {
+    check_least_tokens_in_flight(false).await;
+}
+
+#[tokio::test]
+async fn additional_model_least_tokens_charges_in_flight_requests() {
+    check_least_tokens_in_flight(true).await;
+}
+
+async fn check_least_tokens_in_flight(additional: bool) {
     let (prefill, decode) = (
         MockWorker::start(vec![]).await,
         MockWorker::start_hanging(Duration::from_secs(30)).await,
@@ -364,6 +373,11 @@ async fn least_tokens_charges_in_flight_requests_to_their_rank() {
     ];
     let mut cfg = sticky_config();
     cfg.model.dp_rank_policy = DpRankPolicy::LeastTokens;
+    if additional {
+        cfg.additional_models.push(cfg.model.clone());
+        cfg.model.id = "default".into();
+        cfg.model.dp_rank_policy = DpRankPolicy::RoundRobin;
+    }
     let load = EngineReportedLoadTable::new();
     let app = router_with_load(cfg, &workers, Default::default(), Arc::clone(&load));
     // Mean KV per request over the worker: 500 / 5 = 100.
