@@ -224,7 +224,7 @@ pub async fn serve(
 
     // Prefill-only KV bootstrap registry. Merged AFTER `with_state` — its
     // router carries its own Arc<Registry> state, so it cannot merge into the
-    // Router<Arc<AppState>> above — and before `log::apply`, so bootstrap traffic
+    // Router<Arc<AppState>> above — and before `log::access::apply`, so bootstrap traffic
     // shows in the access log.
     if server_args.enable_pd_bootstrap() {
         let (routes, sweeper) = pd_bootstrap::router_and_sweeper();
@@ -235,7 +235,7 @@ pub async fn serve(
     app = auth::guard_fallback(app, &server_args.api_keys);
 
     // Apply logging and access log middleware.
-    let app = log::apply(app, &server_args);
+    let app = log::access::apply(app, &server_args);
 
     // The listener was already bound synchronously in `runtime::start` (so a port
     // conflict fails startup); adopt it into the tokio reactor here.

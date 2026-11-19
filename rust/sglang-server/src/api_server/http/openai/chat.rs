@@ -44,8 +44,9 @@ use super::{
     contains_non_image_media, error_payload, indexed_decode_stream, model_error, openai_error,
     submit_generation, unix_seconds_u32,
 };
-use crate::api_server::core::{CoreEvent, CoreOutput, OpenAiRequest};
+use crate::api_server::core::{CoreEvent, CoreOutput};
 use crate::api_server::handlers::CoreCall;
+use crate::api_server::log::OpenAiRequest;
 use crate::message::config::{DefaultSamplingParams, ServerArgs};
 use crate::message::finish_reason::{FinishKind, FinishReason, Matched};
 use crate::message::ids::Rid;

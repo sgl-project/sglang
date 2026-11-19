@@ -169,7 +169,7 @@ pub(in crate::api_server::http) fn answering_app_state() -> Arc<super::AppState>
 
 /// [`answering_app_state`], logging its requests to `request_log`.
 fn answering_app_state_logged(
-    request_log: Arc<crate::api_server::core::RequestLog>,
+    request_log: Arc<crate::api_server::log::RequestLog>,
 ) -> Arc<super::AppState> {
     let formatter = sglang_processor::load_chat_formatter(None, None, None, Some("chatml"));
     answering_app_state_built(
@@ -208,7 +208,7 @@ fn answering_app_state_built(
     formatter: super::ChatFormatter,
     tokenizer: Option<sglang_processor::dynamo_tokenizers::Tokenizer>,
     answer: impl Fn(&str) -> ResponseItem + Send + 'static,
-    request_log: Option<Arc<crate::api_server::core::RequestLog>>,
+    request_log: Option<Arc<crate::api_server::log::RequestLog>>,
 ) -> Arc<super::AppState> {
     let (intake_tx, intake_rx) = flume::unbounded();
     tokio::spawn(async move {
@@ -403,7 +403,7 @@ async fn streaming_submit_failure_answers_inside_the_stream() {
 /// OpenAI request first, as Python's `serving_base` does.
 #[tokio::test]
 async fn openai_request_lines_carry_whitelisted_headers() {
-    let log = crate::api_server::core::RequestLog::for_test(
+    let log = crate::api_server::log::RequestLog::for_test(
         Some(crate::message::config::RequestLogConfig {
             max_length: 1 << 30,
             skip_names: vec!["text".into()],

@@ -327,7 +327,7 @@ impl Server {
     /// Write out the request-log lines still buffered (a crash dump does,
     /// before the process goes down).
     pub fn flush_request_log(&self, py: Python<'_>) {
-        py.detach(crate::api_server::core::flush_request_log);
+        py.detach(crate::api_server::log::flush_request_log);
     }
 
     /// Begin the graceful drain, the Rust side of Python's SIGTERM handling:
