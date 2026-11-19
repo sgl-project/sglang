@@ -15,7 +15,7 @@
 // (8tig .. +8 and 32 + 8tig .. +8): base and corrected move as 16-B accesses and the running best is one (value, row).
 // bias = s_lo float(256 d_hi + d_lo) (exact int32), logit = fma(row scale, bias, base), rounded to bf16 once (RNE);
 // argmax and sampler read the rounded values and corrected receives exactly those bits. Sampling per 8-row item: the
-// row by inverse CDF inside the item (uniform23), the item by Gumbel-max on log2 of its mass (gumbel2_fast).
+// row by inverse CDF inside the item (uniform_23bit), the item by Gumbel-max on log2 of its mass (gumbel2_fast).
 //
 // W2 per CTA: kTiles tiles of 64 rows (16 KiB, canonical K-major B layout); kRes are SMEM-resident (TMA once per
 // launch), the others (bit t of kStreamMask = tile t) stream every step from L2 through a kRing-slot TMA ring.
@@ -42,6 +42,7 @@
 #include <sgl_kernel/utils.h>
 
 #include <sgl_kernel/runtime.cuh>
+#include <sgl_kernel/sampling.cuh>
 #include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/vec.cuh>
 #include <sgl_kernel/warp.cuh>
@@ -155,14 +156,8 @@ SGL_DEVICE int32_t bf16x8_first_eq(uint32_t p0, uint32_t p1, uint32_t p2, uint32
   return row;
 }
 
-// MUFU lg2 / ex2 without the denormal fix-up around every MUFU: for a normal argument .ftz returns the same bits, and
+// MUFU ex2 without the denormal fix-up around every MUFU: for a normal argument .ftz returns the same bits, and
 // every caller passes normal numbers
-SGL_DEVICE float lg2_approx_ftz(float x) {
-  float y;
-  asm("lg2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
-  return y;
-}
-
 SGL_DEVICE float ex2_approx_ftz(float x) {
   float y;
   asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
@@ -267,6 +262,9 @@ SGL_DEVICE int32_t add_acq_rel_cta_s32(int32_t* ptr, int32_t value) {
 namespace sglang::dspark_markov_walk {
 
 namespace ptx = device::ptx;
+using device::sampling::gumbel2_fast;
+using device::sampling::philox;
+using device::sampling::uniform_23bit;
 
 // The Philox counters pack the step into 8 bits (step | request << 8)
 inline constexpr int32_t kMaxSteps = 256;
@@ -302,47 +300,6 @@ SGL_DEVICE uint32_t key_row(uint64_t key) {
 // The bits of a bf16 pair as F2FP packs them, .x in the low half
 SGL_DEVICE uint32_t bf16x2_bits(bf16x2_t value) {
   return *reinterpret_cast<const uint32_t*>(&value);
-}
-
-// Philox4x32-10 (Salmon et al. 2011)
-SGL_DEVICE uint4 philox(uint4 c, uint2 k) {
-#pragma unroll
-  for (int32_t i = 0; i < 10; ++i) {
-    const uint32_t hi0 = __umulhi(0xD2511F53u, c.x), lo0 = 0xD2511F53u * c.x;
-    const uint32_t hi1 = __umulhi(0xCD9E8D57u, c.z), lo1 = 0xCD9E8D57u * c.z;
-    c = make_uint4(hi1 ^ c.y ^ k.x, lo1, hi0 ^ c.w ^ k.y, lo0);
-    k.x += 0x9E3779B9u;
-    k.y += 0xBB67AE85u;
-  }
-  return c;
-}
-
-// The Gumbel transform takes v = (x + 0.5) 2^-32 in (0, 1) at full 32-bit resolution and needs E = -log(1 - v). For
-// x >= 2^31 it uses 1 - v = (~x + 0.5) 2^-32 directly, since 1 - v formed in fp32 drops v's low bits. So this
-// returns v for x < 2^31 and 1 - v otherwise, in [2^-33, 1/2]: E is finite and > 0 for every x.
-SGL_DEVICE float half_uniform(uint32_t x) {
-  constexpr float kTwoM32 = 2.3283064365386963e-10f;  // 2^-32
-  return (__uint2float_rn(x >> 31 ? ~x : x) + 0.5f) * kTwoM32;
-}
-
-// Base-2 Gumbel for keys compared in log2 units: -log2(-log2(1 - v)) = G / ln 2 + log2(ln 2), a constant shift that
-// does not change an argmax. One MUFU lg2 for E whichever half x is in (the half is a per-lane random bit, so a warp
-// calling a different log per half would run both); E by its series for v < 2^-7, so the large-Gumbel end stays
-// exact. Max |error| over all x: 1.3e-5 (log2 units). The lg2 arguments t in [2^-33, 1/2], 1 - t in [1/2, 1 - 2^-7]
-// and E in [2^-33, 34) are all normal.
-SGL_DEVICE float gumbel2_fast(uint32_t x) {
-  const float t = half_uniform(x);
-  const bool hi = x >> 31;
-  const float l = -ptx::lg2_approx_ftz(hi ? t : 1.f - t);
-  const float e =
-      !hi && t < 0.0078125f ? t * 1.4426950408889634f * (1.f + t * (0.5f + t * (0.33333334f + t * 0.25f))) : l;
-  return -ptx::lg2_approx_ftz(e);
-}
-
-// Uniform in (0, 1) for an inverse CDF (inside an 8-row item): u = ((x >> 9) + 0.5) 2^-23, every value exact
-// and in [2^-24, 1 - 2^-24], so u * c < c for every normal fp32 c and a row of zero mass is never drawn
-SGL_DEVICE float uniform23(uint32_t x) {
-  return (__uint2float_rn(x >> 9) + 0.5f) * 1.1920928955078125e-7f;
 }
 
 // Every CTA must be co-resident, since they spin on each other's exchange slots: with the cooperative attribute the
@@ -621,7 +578,7 @@ __global__ void __launch_bounds__(kCtaThreads, 1) markov_walk_kernel(
             mass += ptx::ex2_approx_ftz(fmaf(l8[i], inv_t_log2e, -m_scaled));
             cdf[i] = mass;
           }
-          const float target = uniform23(run == 0 ? x.x : x.z) * mass;  // < mass (uniform23)
+          const float target = uniform_23bit(run == 0 ? x.x : x.z) * mass;  // < mass (uniform_23bit)
           int32_t row = 7;
 #pragma unroll
           for (int32_t i = 6; i >= 0; --i) {
