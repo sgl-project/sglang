@@ -5,7 +5,6 @@ import json
 import logging
 import os
 import struct
-import sys
 import threading
 import time
 import uuid
@@ -62,7 +61,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import run_with_deadline
-from sglang.srt.utils.device import is_hip
+from sglang.srt.utils.aiter import pin_aiter_hip_runtime
 
 try:
     from nixl._bindings import (
@@ -190,29 +189,6 @@ class _NixlPostError(RuntimeError):
 # This worker serves other rooms, so bound that wait.
 NIXL_ERR_SETTLE_TIMEOUT_S = 5.0
 NIXL_ERR_SETTLE_POLL_S = 0.001
-
-
-def _pin_aiter_hip_runtime() -> None:
-    # Workaround: once UCX's memory hooks wrap dlopen, AITER's load_hip_runtime()
-    # misses torch's HIP runtime by soname and loads a second one, whose LLVM aborts
-    # the process. It caches its first result, so bind it before the agent exists;
-    # drop once AITER's _loaded_hip_runtime() finds the runtime by its mapped path.
-    if not is_hip():
-        return
-    try:
-        import aiter.jit.utils.hip_runtime  # noqa: F401
-    except ImportError:
-        return
-    try:
-        import aiter.jit.utils.chip_info  # noqa: F401
-    except ImportError:
-        pass
-    # chip_info imports the same file as top-level `hip_runtime`, a second module
-    # with its own cache, so bind both copies.
-    for name in ("aiter.jit.utils.hip_runtime", "hip_runtime"):
-        module = sys.modules.get(name)
-        if module is not None:
-            module.load_hip_runtime()
 
 
 def _resolve_ucx_device_list(ib_device: str, gpu_id: int) -> Optional[str]:
@@ -648,7 +624,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             num_threads=num_threads,
             sync_mode=nixl_thread_sync_t.NIXL_THREAD_SYNC_STRICT,
         )
-        _pin_aiter_hip_runtime()
+        pin_aiter_hip_runtime()
         self.agent = nixl_agent(str(uuid.uuid4()), agent_config)
         if num_threads > 0:
             # TODO: Remove this once NIXL passes thread parameters from
