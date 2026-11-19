@@ -67,7 +67,7 @@ class DFlashDraftInputV2(SpecInput):
         self.num_tokens_for_logprob_per_req = 1
 
     def _ensure_prepare_length_buffers(
-        self, bs: int, device: torch.device | str
+        self, bs: int, device: torch.device | str, *, need_device: bool
     ) -> None:
         pin_memory = is_pin_memory_available(device)
 
@@ -95,7 +95,7 @@ class DFlashDraftInputV2(SpecInput):
                 (capacity,), dtype=torch.int32, device="cpu", pin_memory=pin_memory
             )
 
-        if needs_gpu_alloc(self._prepare_cur_kv_lens_gpu_buf):
+        if need_device and needs_gpu_alloc(self._prepare_cur_kv_lens_gpu_buf):
             capacity = grown_capacity(self._prepare_cur_kv_lens_gpu_buf)
             self._prepare_cur_kv_lens_gpu_buf = torch.empty(
                 (capacity,), dtype=torch.int32, device=device
@@ -123,23 +123,11 @@ class DFlashDraftInputV2(SpecInput):
         lags by one iteration; keep it separate from the reserved upper bound that backs
         the overallocated mapping.
         """
-        plan_stream, plan_stream_ctx = _get_overlap_plan_stream(batch.device)
-
         bs = batch.batch_size()
         if bs == 0:
             return
 
         batch.maybe_evict_swa()
-
-        self._ensure_prepare_length_buffers(bs, batch.device)
-        assert self._prepare_batch_seq_lens_cpu_buf is not None
-        assert self._prepare_cur_kv_lens_cpu_buf is not None
-        assert self._prepare_nxt_kv_lens_cpu_buf is not None
-        assert self._prepare_cur_kv_lens_gpu_buf is not None
-        assert self._prepare_nxt_kv_lens_gpu_buf is not None
-        batch_seq_lens_cpu_t = self._prepare_batch_seq_lens_cpu_buf[:bs]
-        cur_kv_lens_cpu_t = self._prepare_cur_kv_lens_cpu_buf[:bs]
-        nxt_kv_lens_cpu_t = self._prepare_nxt_kv_lens_cpu_buf[:bs]
 
         # For DFLASH, each decode step needs a fixed-size verify block.
         block_size = int(get_spec().speculative_num_draft_tokens)
@@ -163,17 +151,23 @@ class DFlashDraftInputV2(SpecInput):
             page_size=page_size,
         )
 
+        self._ensure_prepare_length_buffers(
+            bs, batch.device, need_device=bool(num_needed_tokens)
+        )
+        assert self._prepare_batch_seq_lens_cpu_buf is not None
+        assert self._prepare_nxt_kv_lens_cpu_buf is not None
+        batch_seq_lens_cpu_t = self._prepare_batch_seq_lens_cpu_buf[:bs]
+        nxt_kv_lens_cpu_t = self._prepare_nxt_kv_lens_cpu_buf[:bs]
         committed_lens = [int(req.kv.kv_committed_len) for req in batch.reqs]
         top_ks = [int(req.sampling_params.top_k) for req in batch.reqs]
         batch_seq_lens_cpu_t.numpy()[:] = committed_lens
-        cur_kv_lens_cpu_t.numpy()[:] = cur_kv_lens
         nxt_kv_lens_cpu_t.numpy()[:] = nxt_kv_lens
         # Host upper bound of the over-allocated KV lengths (>= committed +
         # alloc reserve): bounds the NPU backend's mirrorless replay
         # page-table copies without a D2H sync, mirroring
         # eagle_utils.eagle_prepare_for_decode. Backend consumers gate on
         # seq_lens_cpu, so leaving this set in mirror mode is a no-op.
-        batch.max_seq_len_host = int(cur_kv_lens_cpu_t.max())
+        batch.max_seq_len_host = max(cur_kv_lens)
         committed_seq_lens_sum = sum(committed_lens)
         nxt_kv_lens_sum = sum(nxt_kv_lens)
         max_top_k = max(top_ks)
@@ -183,39 +177,48 @@ class DFlashDraftInputV2(SpecInput):
         self.max_top_k = max(max_top_k, 1)
         self.uniform_top_k_value = uniform_top_k_value if uniform_top_k else None
 
-        caller_stream = None
-        if plan_stream is not None:
-            caller_stream = torch.get_device_module(batch.device).current_stream()
+        # Only a growing reservation writes req_to_token. While the current
+        # pages suffice, subsequent forwards can use their existing mapping.
+        if num_needed_tokens:
+            assert self._prepare_cur_kv_lens_cpu_buf is not None
+            assert self._prepare_cur_kv_lens_gpu_buf is not None
+            assert self._prepare_nxt_kv_lens_gpu_buf is not None
+            cur_kv_lens_cpu_t = self._prepare_cur_kv_lens_cpu_buf[:bs]
+            cur_kv_lens_cpu_t.numpy()[:] = cur_kv_lens
+            plan_stream, plan_stream_ctx = _get_overlap_plan_stream(batch.device)
+            caller_stream = None
+            if plan_stream is not None:
+                caller_stream = torch.get_device_module(batch.device).current_stream()
 
-        with plan_stream_ctx:
-            if plan_stream is not None and caller_stream is not None:
-                # `batch.seq_lens`, `batch.req_pool_indices`, and related tensors may
-                # have just been rebuilt on the scheduler stream by filter/merge ops.
-                # The plan stream must wait for those writes before reading them.
-                plan_stream.wait_stream(caller_stream)
+            with plan_stream_ctx:
+                if plan_stream is not None and caller_stream is not None:
+                    # `batch.seq_lens`, `batch.req_pool_indices`, and related tensors may
+                    # have just been rebuilt on the scheduler stream by filter/merge ops.
+                    # The plan stream must wait for those writes before reading them.
+                    plan_stream.wait_stream(caller_stream)
 
-            cur_kv_lens = self._prepare_cur_kv_lens_gpu_buf[:bs]
-            nxt_kv_lens = self._prepare_nxt_kv_lens_gpu_buf[:bs]
-            cur_kv_lens.copy_(cur_kv_lens_cpu_t, non_blocking=True)
-            nxt_kv_lens.copy_(nxt_kv_lens_cpu_t, non_blocking=True)
+                cur_kv_lens = self._prepare_cur_kv_lens_gpu_buf[:bs]
+                nxt_kv_lens = self._prepare_nxt_kv_lens_gpu_buf[:bs]
+                cur_kv_lens.copy_(cur_kv_lens_cpu_t, non_blocking=True)
+                nxt_kv_lens.copy_(nxt_kv_lens_cpu_t, non_blocking=True)
 
-            alloc_for_spec_decode(
-                batch.tree_cache,
-                batch.req_to_token_pool,
-                reqs=batch.reqs,
-                req_pool_indices=batch.req_pool_indices,
-                cur_kv_lens=cur_kv_lens,
-                cur_kv_lens_cpu=cur_kv_lens_cpu_t,
-                nxt_kv_lens=nxt_kv_lens,
-                nxt_kv_lens_cpu=nxt_kv_lens_cpu_t,
-                num_needed_tokens=num_needed_tokens,
-                batch=batch,
-            )
-        if caller_stream is not None:
-            # Enqueue the dependency on the caller's stream, not inside the
-            # plan-stream context, so forward work cannot observe partially
-            # prepared req_to_token / KV allocation state.
-            caller_stream.wait_stream(plan_stream)
+                alloc_for_spec_decode(
+                    batch.tree_cache,
+                    batch.req_to_token_pool,
+                    reqs=batch.reqs,
+                    req_pool_indices=batch.req_pool_indices,
+                    cur_kv_lens=cur_kv_lens,
+                    cur_kv_lens_cpu=cur_kv_lens_cpu_t,
+                    nxt_kv_lens=nxt_kv_lens,
+                    nxt_kv_lens_cpu=nxt_kv_lens_cpu_t,
+                    num_needed_tokens=num_needed_tokens,
+                    batch=batch,
+                )
+            if caller_stream is not None:
+                # Enqueue the dependency on the caller's stream, not inside the
+                # plan-stream context, so forward work cannot observe partially
+                # prepared req_to_token / KV allocation state.
+                caller_stream.wait_stream(plan_stream)
         for req in batch.reqs:
             req.decode_batch_idx += 1
         # Seed committed; overlap's resolve overwrites it with the published value.
