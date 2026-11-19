@@ -130,7 +130,6 @@ class TestKVShardMooncakeIO(unittest.TestCase):
             )
             + "-atp2",
             key_tp_rank=key_rank,
-            key_tp_size=2,
             extra_config={
                 "master_server_address": os.environ["MOONCAKE_MASTER"],
                 "metadata_server": os.environ["MOONCAKE_TE_META_DATA_SERVER"],

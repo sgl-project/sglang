@@ -1,6 +1,7 @@
 """Real Mooncake L3 reloads for KV-sharded MLA PD prefill (four GPUs).
 
-Run with mooncake_master/mooncake_client installed and RDMA configured for PD:
+Run with mooncake_master/mooncake_client installed and RDMA configured for PD
+(or set MC_FORCE_TCP=1 for a TCP transfer test):
     python3 -m pytest test/manual/hicache/test_kv_cache_sharding_mooncake_storage.py -v -s
 
 The storage traffic uses TCP. Its external segment survives the prefill
@@ -23,6 +24,8 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
+PAGE_SIZE = 64
+
 
 @unittest.skipUnless(torch.cuda.device_count() >= 4, "Requires four CUDA GPUs")
 class TestKVShardMooncakeStorage(PDDisaggregationServerBase):
@@ -44,7 +47,7 @@ class TestKVShardMooncakeStorage(PDDisaggregationServerBase):
             "--attention-backend",
             backend,
             "--page-size",
-            "64",
+            str(PAGE_SIZE),
             "--context-length",
             "4096",
             "--max-total-tokens",
@@ -91,46 +94,29 @@ class TestKVShardMooncakeStorage(PDDisaggregationServerBase):
     def tearDownClass(cls):
         cls._stop_servers()
 
-    def _generate(self, **payload):
+    def _generate(self, text):
         response = requests.post(
             self.lb_url + "/generate",
             json={
-                **payload,
+                "text": text,
                 "sampling_params": {"temperature": 0, "max_new_tokens": 16},
             },
             timeout=180,
         )
         response.raise_for_status()
-        result = response.json()
-        print("generation:", result)
-        return result
+        return response.json()
 
-    def _metric(self, name, label=None):
+    def _backuped_tokens(self):
         response = requests.get(self.prefill_url + "/metrics", timeout=15)
         response.raise_for_status()
         return sum(
             float(line.rsplit(" ", 1)[1])
             for line in response.text.splitlines()
-            if (line.startswith(name + "{") or line.startswith(name + " "))
-            and (label is None or label in line)
+            if line.startswith("sglang:backuped_tokens_total{")
+            and 'tp_rank="0"' in line
         )
 
-    def _assert_storage_reload(self, target, expected):
-        before = self._metric(
-            "sglang:prefill_effective_tokens_total", 'mode="storage_hit"'
-        )
-        result = self._generate(text=target)
-        self.assertEqual(result["text"], expected)
-        details = result["meta_info"]["cached_tokens_details"]
-        self.assertGreaterEqual(details["storage"], 1024)
-        self.assertEqual(details["device"], 0)
-        self.assertEqual(details["host"], 0)
-        after = self._metric(
-            "sglang:prefill_effective_tokens_total", 'mode="storage_hit"'
-        )
-        self.assertGreaterEqual(after - before, 1024)
-
-    def test_flush_rotation_and_restart(self):
+    def test_storage_reload_after_prefill_restart(self):
         rng = random.Random(0)
         code = str(rng.randrange(100000, 1000000))
         words = (
@@ -141,30 +127,22 @@ class TestKVShardMooncakeStorage(PDDisaggregationServerBase):
             f"The secret code is {code}. Remember it.\n{filler}\n"
             "Question: what is the secret code? Answer: The secret code is"
         )
-        cold = self._generate(text=target)
-        device_hit = self._generate(text=target)
-        self.assertIn(code, device_hit["text"])
-        self.assertGreaterEqual(device_hit["meta_info"]["cached_tokens"], 1024)
+        backup_before = self._backuped_tokens()
+        cold = self._generate(target)
+        self.assertIn(code, cold["text"])
+        self.assertEqual(cold["meta_info"]["cached_tokens"], 0)
 
-        # All full prompt pages must finish their write-through before L1/L2
-        # are discarded. The asynchronous queue can outlive the response.
-        full_pages = (cold["meta_info"]["prompt_tokens"] - 1) // 64 * 64
+        # TP ranks report the same logical prefix. Wait for one rank's
+        # counter to advance by the whole cacheable prompt.
+        prompt_tokens = cold["meta_info"]["prompt_tokens"]
+        cacheable_tokens = (prompt_tokens - 1) // PAGE_SIZE * PAGE_SIZE
+        self.assertGreaterEqual(cacheable_tokens, 1024)
         deadline = time.monotonic() + 120
-        while self._metric("sglang:backuped_tokens_total") < full_pages:
+        while self._backuped_tokens() - backup_before < cacheable_tokens:
             self.assertLess(
                 time.monotonic(), deadline, "Mooncake backup did not finish"
             )
             time.sleep(1)
-
-        for shift in (0, 1):
-            with self.subTest(rotation_shift=shift):
-                response = requests.post(self.prefill_url + "/flush_cache", timeout=60)
-                self.assertEqual(response.status_code, 200, response.text)
-                if shift:
-                    # Consume one owner class before starting the target's
-                    # chain, so its reader differs from its original writer.
-                    self._generate(input_ids=list(range(1000, 1064)))
-                self._assert_storage_reload(target, device_hit["text"])
 
         # Disable the fixture's fail-fast watcher before deliberately stopping
         # its prefill worker. Decode, router, and the storage segment stay up.
@@ -174,7 +152,12 @@ class TestKVShardMooncakeStorage(PDDisaggregationServerBase):
         self.wait_server_ready(
             self.prefill_url + "/health", process=self.process_prefill
         )
-        self._assert_storage_reload(target, device_hit["text"])
+        reloaded = self._generate(target)
+        self.assertEqual(reloaded["output_ids"], cold["output_ids"])
+        details = reloaded["meta_info"]["cached_tokens_details"]
+        self.assertEqual(details["storage"], cacheable_tokens)
+        self.assertEqual(details["device"], 0)
+        self.assertEqual(details["host"], 0)
 
 
 if __name__ == "__main__":

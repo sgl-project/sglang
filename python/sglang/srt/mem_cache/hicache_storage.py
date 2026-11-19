@@ -54,17 +54,14 @@ class HiCacheStorageConfig:
 
     # Whole-page replication can differ from the target's attention layout.
     rank_replicated: Optional[bool] = None
-    # Logical-page KV sharding: keys name the head shard (attn-TP), never the
-    # shard rank that holds a page; tp_rank/tp_size keep the rank-local roles.
+    # Sharded Mooncake keys name the head shard, while tp_rank still identifies
+    # the process that owns the relevant buffers.
     key_tp_rank: Optional[int] = None
-    key_tp_size: Optional[int] = None
 
     def __post_init__(self):
-        if (self.key_tp_rank is None) != (self.key_tp_size is None):
-            raise ValueError("KV-sharded storage requires both key TP rank and size.")
         if self.key_tp_rank is not None:
-            if self.key_tp_size <= 0 or not 0 <= self.key_tp_rank < self.key_tp_size:
-                raise ValueError("Invalid key TP size or rank for KV-sharded storage.")
+            if not 0 <= self.key_tp_rank < self.tp_size:
+                raise ValueError("Invalid key TP rank for KV-sharded storage.")
             if self.dcp_size != 1:
                 raise ValueError("KV-sharded storage and DCP are mutually exclusive.")
         if self.dcp_size < 1 or not 0 <= self.dcp_rank < self.dcp_size:
@@ -94,18 +91,19 @@ class HiCacheStorageConfig:
 
     @property
     def is_storage_writer(self) -> bool:
-        """Select writers among replicas without skipping any owned KV pages.
+        """Select one writer for each shared storage object.
 
-        KV sharding without CP gives every MLA TP rank different pages. With
-        CP, only attention-TP rank 0 writes each CP rank's pages. Otherwise,
-        unified full-page CP replicas use CP rank 0; legacy keys keep their
-        CP-specific writers. Replicated KV uses one writer per DCP shard in
-        the first DCP group.
+        Unified full-page CP replicas share keys and use CP rank 0. Legacy
+        keys include the CP rank, so every CP copy retains its own writer.
+        MLA uses one writer per DCP shard in the first DCP group; with DCP
+        disabled, MLA uses TP rank 0 and non-MLA uses every TP rank.
         """
         if self.key_tp_rank is not None:
+            # Plain TP gives each MLA rank different pages. With CP, each CP
+            # rank's pages have identical bytes across attention TP replicas.
             return (
                 not self.is_rank_replicated
-                or self.attn_cp_size <= 1
+                or self.attn_cp_size == 1
                 or self.key_tp_rank == 0
             )
         if self.unified_suffixes is not None and self.attn_cp_rank != 0:
@@ -888,7 +886,7 @@ class HiCacheFile(HiCacheStorage):
         # Under NSA context parallel each CP rank holds a disjoint slice of
         # every page, so give each rank its own file key to avoid a cross-rank
         # write race.
-        if storage_config.attn_cp_size > 1 and storage_config.key_tp_rank is None:
+        if storage_config.attn_cp_size > 1:
             shard_suffix += (
                 f"_cp{storage_config.attn_cp_rank}_{storage_config.attn_cp_size}"
             )
@@ -898,15 +896,11 @@ class HiCacheFile(HiCacheStorage):
             f"_{model_name}_{storage_config.tp_rank}_{storage_config.tp_size}"
             f"{shard_suffix}"
         )
-        if storage_config.is_rank_replicated:
-            self.config_suffix = f"_{model_name}{shard_suffix}"
-        elif storage_config.key_tp_rank is not None:
-            self.config_suffix = (
-                f"_{model_name}_{storage_config.key_tp_rank}"
-                f"_{storage_config.key_tp_size}{shard_suffix}"
-            )
-        else:
-            self.config_suffix = self.tp_config_suffix
+        self.config_suffix = (
+            f"_{model_name}{shard_suffix}"
+            if storage_config.is_rank_replicated
+            else self.tp_config_suffix
+        )
         # The controller includes the logical KV dtype and any storage_format_tag
         # in model_name. Other layout differences still need extra_backend_tag.
         if storage_config.dcp_size > 1:
@@ -930,7 +924,6 @@ class HiCacheFile(HiCacheStorage):
         self._init_config_suffix(storage_config)
         tp_rank = storage_config.tp_rank
         attn_cp_rank = storage_config.attn_cp_rank
-        kv_sharded = storage_config.key_tp_rank is not None
 
         if not os.path.exists(self.file_path) and tp_rank == 0 and attn_cp_rank == 0:
             os.makedirs(self.file_path)
@@ -971,19 +964,15 @@ class HiCacheFile(HiCacheStorage):
                 self._unified_suffixes if storage_config.is_storage_writer else ()
             )
         else:
-            # Each rank owns its TP-sharded state; selected writers also own
-            # shared MLA shards or rank-free KV-sharded files.
+            # Each rank owns its TP-sharded state; selected DCP writers
+            # also own their shared MLA shard files.
             owned_suffixes = (self.tp_config_suffix,)
-            if (
-                storage_config.is_storage_writer
-                and self.config_suffix != self.tp_config_suffix
-            ):
+            if storage_config.is_rank_replicated and storage_config.is_storage_writer:
                 owned_suffixes += (self.config_suffix,)
         self._evictor = LRUFileEvictor(
             self.file_path,
             owned_suffixes=owned_suffixes,
             tp_rank=tp_rank,
-            kv_sharded=kv_sharded,
             extra_config=storage_config.extra_config,
             on_evict=(
                 self.metadata_cache.remove if self.metadata_cache is not None else None

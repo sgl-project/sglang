@@ -18,14 +18,12 @@ from sglang.srt.disaggregation.kv_events import (
     StorageMedium,
 )
 from sglang.srt.environ import envs
-from sglang.srt.managers.cache_controller import PrefetchAck
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     CacheRequestOutcome,
     EvictParams,
     InsertParams,
-    InsertResult,
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
@@ -41,7 +39,6 @@ from sglang.srt.mem_cache.pool_host import PoolEntry
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.static_kv_storage import acquire_rows
-from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.components.base import CacheTransferPhase
 from sglang.srt.mem_cache.unified_cache.storage_attachment import StorageAttachment
@@ -2894,6 +2891,7 @@ class TestPrefetchCommitOrdering(CustomTestCase):
                 cache.host_memory_mode = "cache"
                 cache.page_size = 4
                 cache.prefetch_threshold = 4
+                cache._prefetch_rotation_base.return_value = None
                 cc = cache.cache_controller
                 cc.page_size = cache.page_size
                 cc.mem_pool_host.anchor_entry.host_pool = object()
@@ -2973,6 +2971,7 @@ class TestPrefetchCommitOrdering(CustomTestCase):
         operation.handle = CacheRequestHandle("req", 0)
         operation.request_id = "req"
         operation.completed_tokens = 8
+        operation.hash_value = [f"h{i}" for i in range(8)]
         cache.ongoing_prefetch = {
             operation.handle: _OngoingPrefetch(
                 7,
@@ -2990,7 +2989,6 @@ class TestPrefetchCommitOrdering(CustomTestCase):
         cache._check_hybrid_prefetch_result.return_value = 8
         cache.cache_controller.prefetch_tokens_occupied = 100
         cache.prefetch_loaded_tokens_by_reqid = {}
-        cache.storage_prefetch_retries = StoragePrefetchRetries()
         cache._can_terminate_prefetch.return_value = True
         cache.pp_rank = 0
 
@@ -3016,6 +3014,9 @@ class TestPrefetchCommitOrdering(CustomTestCase):
             )
         )
 
+        cache.tree_core.insert_host.assert_called_once_with(
+            7, list(range(8)), list(range(100, 108)), [f"h{i}" for i in range(8)]
+        )
         self.assertEqual([c[0] for c in order.mock_calls], ["apply", "commit", "apply"])
         self.assertEqual(applied[0], [walk_action])
         self.assertIsNot(
@@ -3193,7 +3194,6 @@ class TestUnifiedRadixPrefetchCorruption(
         operation.host_indices = host_indices
         operation.completed_tokens = completed_tokens
         operation.storage_start = 0
-        operation.kv_rotation_base = None
         operation.pool_storage_result = PoolTransferResult(
             kv_hit_pages=completed_tokens // self.ps, extra_pool_hit_pages={}
         )
@@ -3247,125 +3247,6 @@ class TestUnifiedRadixPrefetchCorruption(
         )
 
         cache.sanity_check()
-
-    def _declined_prefetch(self, cache, allocator, policy):
-        """An L3 read in flight whose host insert declines on a rotation conflict."""
-        cache.prefetch_stop_policy = policy
-        parent_id = self._insert_device(
-            cache, allocator, list(range(1, 1 + 3 * self.ps))
-        )
-        prefetch_key = RadixKey(
-            array("q", list(range(1000, 1000 + 2 * self.ps)))
-        ).page_aligned(self.ps)
-        completed_tokens = len(prefetch_key)
-        host_indices = cache.cache_controller.mem_pool_host.alloc(completed_tokens)
-        self.assertIsNotNone(host_indices)
-
-        operation = mock.Mock()
-        operation.host_indices = host_indices
-        operation.completed_tokens = completed_tokens
-        operation.storage_start = 3 * self.ps
-        operation.hash_value = [f"h{i}" for i in range(completed_tokens // self.ps)]
-        operation.deadline_expired = False
-        req_id = CacheRequestHandle(f"rotation-declined-{policy}", 0)
-        operation.handle = req_id
-        operation.request_id = req_id.rid
-        cache.ongoing_prefetch[req_id] = _OngoingPrefetch(
-            parent_id,
-            prefetch_key,
-            host_indices,
-            operation,
-            cache.inc_host_lock_ref(parent_id).to_dec_params(),
-            {},
-        )
-        cache._record_storage_prefetch_hit(req_id, completed_tokens)
-        cache.cache_controller.prefetch_tokens_occupied = completed_tokens
-
-        declined = InsertResult(
-            prefix_len=0,
-            total_len=completed_tokens,
-            host_insert_dropped=True,
-            rotation_tail_declined=True,
-        )
-        patches = ExitStack()
-        self.addCleanup(patches.close)
-        for target, name, value in (
-            (cache, "_check_hybrid_prefetch_result", completed_tokens),
-            (cache.cache_controller, "append_host_mem_release", None),
-            (cache.tree_core, "insert_host", declined),
-        ):
-            patches.enter_context(mock.patch.object(target, name, return_value=value))
-        return req_id, operation
-
-    def test_rotation_declined_read_landed_by_the_ack_drain_holds_admission(self):
-        """A KV-shard rotation decline landed by the ACK drain keeps its request
-        out of admission until the re-issue fires, even across passes."""
-        for policy in ("wait_complete", "timeout"):
-            with self.subTest(policy=policy):
-                cache, allocator, _ = build_fixture(self.cfg)
-                self._init_hicache(cache)
-                req_id, operation = self._declined_prefetch(cache, allocator, policy)
-                cache.cache_controller.ack_prefetch_queue.put(
-                    PrefetchAck(rid=req_id.rid, operation=operation, completed_req=True)
-                )
-                cache._drain_storage_control_queues_impl(
-                    n_storage_hit=0,
-                    n_ack_prefetch=1,
-                    n_backup=0,
-                    n_release=0,
-                    extra_release_counts={},
-                    log_metrics=False,
-                )
-                self.assertNotIn(req_id, cache.ongoing_prefetch)
-                for _ in range(2):
-                    self.assertFalse(cache.check_prefetch_progress(req_id))
-
-                # Even at the queue head, the re-issue is due now and resumes the span.
-                head = SimpleNamespace(
-                    rid=req_id.rid, storage_prefetch_retry_attempts=0
-                )
-                self.assertEqual(
-                    cache.storage_prefetch_retries.pop_ready(
-                        [head], interval=8, max_attempts=3
-                    ),
-                    [(head, operation.storage_start + operation.completed_tokens)],
-                )
-                self.assertTrue(cache.check_prefetch_progress(req_id))
-                cache.sanity_check()
-
-    def test_rotation_decline_holds_only_policies_that_wait(self):
-        """best_effort re-issues a declined read without holding admission, a
-        lapsed deadline drops it, and no other refetch ever holds admission."""
-        for policy, deadline_expired in (("best_effort", False), ("timeout", True)):
-            with self.subTest(policy=policy):
-                cache, allocator, _ = build_fixture(self.cfg)
-                self._init_hicache(cache)
-                req_id, operation = self._declined_prefetch(cache, allocator, policy)
-                with (
-                    mock.patch.object(
-                        cache, "_can_terminate_prefetch", return_value=True
-                    ),
-                    mock.patch.object(
-                        cache.cache_controller,
-                        "terminate_prefetch",
-                        return_value=(operation.completed_tokens, operation.hash_value),
-                    ),
-                    mock.patch.object(operation, "is_terminated", return_value=False),
-                ):
-                    self.assertTrue(cache.check_prefetch_progress(req_id))
-                self.assertEqual(operation.deadline_expired, deadline_expired)
-                head = SimpleNamespace(
-                    rid=req_id.rid, storage_prefetch_retry_attempts=0
-                )
-                reissued = cache.storage_prefetch_retries.pop_ready(
-                    [head], interval=8, max_attempts=3
-                )
-                self.assertEqual(bool(reissued), not deadline_expired)
-
-                # An anchor-loss refetch (buffer mode) never holds admission.
-                other = CacheRequestHandle(f"plain-refetch-{policy}", 0)
-                cache.storage_prefetch_retries.refetch(other.rid, self.ps)
-                self.assertTrue(cache.check_prefetch_progress(other))
 
     def test_write_through_eviction_counts_unbacked_tokens(self):
         cache, allocator, _ = build_fixture(self.cfg)
@@ -3517,21 +3398,23 @@ class TestUnifiedRadixCacheStorageAttachBackfill(
             "every node must carry a hash chain once storage is enabled",
         )
 
-    def test_prefetch_threshold_keeps_the_controller_page_floor(self):
-        """Runtime config keeps the controller's one-page prefetch floor: a KV-sharded
-        host pool cannot allocate the bounce of a zero-page L3 hit."""
+    def test_prefetch_threshold_applies_page_floor_only_to_sharded_storage(self):
         cache = self._build_two_level_tree(storage_on_from_the_start=False)
-        StorageAttachment(cache).apply_runtime_config(
-            storage_backend="file",
-            prefetch_threshold=0,
-            prefetch_timeout_base=1.0,
-            prefetch_timeout_per_ki_token=0.25,
-            hicache_storage_pass_prefix_keys=False,
-            enable_storage=True,
-            enable_storage_metrics=False,
-            extra_metric_labels=None,
-        )
-        self.assertEqual(cache.prefetch_threshold, cache.page_size)
+        for sharded, threshold in ((False, 0), (True, cache.page_size)):
+            with mock.patch.object(
+                cache, "_uses_sharded_storage", return_value=sharded
+            ):
+                StorageAttachment(cache).apply_runtime_config(
+                    storage_backend="mooncake",
+                    prefetch_threshold=0,
+                    prefetch_timeout_base=1.0,
+                    prefetch_timeout_per_ki_token=0.25,
+                    hicache_storage_pass_prefix_keys=False,
+                    enable_storage=True,
+                    enable_storage_metrics=False,
+                    extra_metric_labels=None,
+                )
+            self.assertEqual(cache.prefetch_threshold, threshold)
 
 
 class TestAnchorLockOutcomePolicy(AnchorLockOutcomePolicyFixtures, CustomTestCase):

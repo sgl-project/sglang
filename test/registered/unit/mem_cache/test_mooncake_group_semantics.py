@@ -389,7 +389,6 @@ class TestMooncakeGroupSemantics(CustomTestCase):
                 attn_cp_rank=rank // 2,
                 attn_cp_size=2,
                 key_tp_rank=rank % 2,
-                key_tp_size=2,
                 model_name="model-kvshard-page_first-atp2",
             )
             store, fake = _make_store(storage_config=cfg)
@@ -408,25 +407,6 @@ class TestMooncakeGroupSemantics(CustomTestCase):
                 "model-kvshard-page_first-atp2_page_1_v",
             ],
         )
-
-    def test_kv_shard_storage_format_namespaces_do_not_overlap(self):
-        keys = []
-        for layout, attn_tp_size in (
-            ("page_first", 2),
-            ("page_first_direct", 2),
-            ("page_first", 4),
-        ):
-            cfg = replace(
-                _make_config(tp_rank=0, tp_size=4),
-                key_tp_rank=0,
-                key_tp_size=attn_tp_size,
-                model_name=f"model-kvshard-{layout}-atp{attn_tp_size}",
-            )
-            store, fake = _make_store(storage_config=cfg)
-            store.register_mem_pool_host(FakeHostKVCache(2))
-            self.assertEqual(store.batch_set_v1(["page"], torch.arange(1)), [True])
-            keys.append(tuple(fake.batch_put_calls[-1]["keys"]))
-        self.assertEqual(len(set(keys)), len(keys))
 
     def test_dcp_shard_keys_and_replicas(self):
         base = replace(

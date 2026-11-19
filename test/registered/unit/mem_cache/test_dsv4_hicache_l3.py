@@ -358,7 +358,6 @@ class TestC128PrefetchCleanup(CustomTestCase):
 
         cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
         cache.cache_controller = cc
-        cache.token_to_kv_pool_allocator = None
         cache.tree_core = MagicMock(page_size=128)
         cache.host_memory_mode = "cache"
         cache.buffer_pipeline = None

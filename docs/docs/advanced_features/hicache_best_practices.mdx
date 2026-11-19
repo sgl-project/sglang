@@ -98,10 +98,9 @@ Sharded writers use a separate namespace from unsharded writers. Decode workers 
 
 The following restrictions also apply to runtime storage attachment:
 
-- Use `cache` host memory mode. `buffer_only` mode is unsupported with KV-sharded storage.
-- Only the `mooncake` and `file` storage backends are supported. With `file`, all shard ranks must use a shared directory, and file eviction is unsupported: leave `max_size` and `min_free_space` unset in `--hicache-storage-backend-extra-config`, and leave `SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE` and `SGLANG_HICACHE_FILE_BACKEND_MIN_FREE_SPACE` unset.
-- Omit `tp_lcm_size`; heterogeneous head splitting is unsupported with KV sharding.
-- DSA models, including GLM DSA with NextN MTP, are not yet supported with KV-sharded storage: sharded storage I/O covers only the KV host pool, not the indexer pool.
+- Use the Mooncake backend with `cache` host memory mode and the default `rank-suffix` storage key scheme.
+- Use a single KV host pool. DSA indexer pools and other sidecar pools require separate storage support.
+- Omit `tp_lcm_size` to keep each attention rank's head partition intact.
 
 ### Prefetch Policies
 

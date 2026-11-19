@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import Any, Optional
 
@@ -132,68 +131,24 @@ def check_kv_shard_storage(
     *,
     storage_backend: str,
     host_memory_mode: str,
-    extra_config: Optional[dict],
+    key_scheme: str,
 ) -> None:
-    """The HiCache storage configurations KV sharding supports (v1). Runs at
-    launch and again at attach; extra_config is None when launch cannot read
-    it (an @file config), and attach then checks it."""
-    # Each rank passes the backend only its owned keys of a batch;
-    # mooncake and file never derive keys from prefix_keys.
-    if storage_backend not in ("mooncake", "file"):
+    """Validate built-in storage at launch and again at runtime attach."""
+    if storage_backend != "mooncake":
         raise ValueError(
-            "--enable-kv-cache-sharding supports only the mooncake and file "
-            f"HiCache storage backends, got {storage_backend!r}."
+            "--enable-kv-cache-sharding supports only the mooncake "
+            f"built-in HiCache storage backend, got {storage_backend!r}."
         )
     if host_memory_mode != "cache":
         raise ValueError(
             "--enable-kv-cache-sharding requires --hicache-host-memory-mode "
             "cache with a storage backend."
         )
-    if extra_config is None:
-        return
-    if extra_config.get("tp_lcm_size"):
+    if key_scheme != "rank-suffix":
         raise ValueError(
-            "--enable-kv-cache-sharding does not support tp_lcm_size (split heads)."
+            "--enable-kv-cache-sharding requires --hicache-storage-key-scheme "
+            "rank-suffix with Mooncake storage."
         )
-    if storage_backend == "file":
-        from sglang.srt.mem_cache.storage.file.lru_file_evictor import (
-            KV_SHARD_FILE_EVICTION_ERROR,
-            eviction_limits,
-        )
-
-        if any(eviction_limits(extra_config)):
-            raise ValueError(KV_SHARD_FILE_EVICTION_ERROR)
-
-
-def _check_kv_shard_launch_storage(*, server_args: Any, cfg: Any) -> None:
-    """Refuse unsupported KV-shard storage before the model loads."""
-    if is_deepseek_dsa(model_config_of(server_args).hf_config):
-        raise ValueError(
-            "--enable-kv-cache-sharding does not support "
-            "--hicache-storage-backend for DSA models yet: sharded storage "
-            "I/O covers only the KV host pool, not the indexer pool."
-        )
-    raw = cfg.hicache_storage_backend_extra_config
-    extra_config = {}
-    if raw and raw.startswith("@"):
-        # Only attach reads an @file config, and it repeats this check.
-        extra_config = None
-    elif raw:
-        try:
-            extra_config = json.loads(raw)
-        except json.JSONDecodeError as e:
-            raise ValueError(
-                f"--hicache-storage-backend-extra-config is not valid JSON: {e}"
-            ) from e
-        if not isinstance(extra_config, dict):
-            raise ValueError(
-                "--hicache-storage-backend-extra-config must be a JSON object."
-            )
-    check_kv_shard_storage(
-        storage_backend=cfg.hicache_storage_backend,
-        host_memory_mode=cfg.hicache_host_memory_mode,
-        extra_config=extra_config,
-    )
 
 
 def handle_kv_cache_sharding(server_args: Any, gpu_mem: Optional[float] = None) -> None:
@@ -211,8 +166,8 @@ def handle_kv_cache_sharding(server_args: Any, gpu_mem: Optional[float] = None) 
     if cfg.disaggregation_mode != "prefill":
         raise ValueError(
             "--enable-kv-cache-sharding is only supported on PD prefill "
-            "workers: each rank owns only a subset of the logical KV pages, "
-            "which is incompatible with local decode."
+            "workers: a rank's pool holds only its stripe of every cached "
+            "page, which is incompatible with local decode."
         )
     if cfg.speculative_algorithm is not None:
         model_config = model_config_of(server_args)
@@ -295,7 +250,17 @@ def handle_kv_cache_sharding(server_args: Any, gpu_mem: Optional[float] = None) 
         and cfg.hicache_storage_backend is not None
         and not kv_shard_storage_backend_supported(cfg.hicache_storage_backend)
     ):
-        _check_kv_shard_launch_storage(server_args=server_args, cfg=cfg)
+        check_kv_shard_storage(
+            storage_backend=cfg.hicache_storage_backend,
+            host_memory_mode=cfg.hicache_host_memory_mode,
+            key_scheme=cfg.hicache_storage_key_scheme,
+        )
+        if is_deepseek_dsa(model_config_of(server_args).hf_config):
+            raise ValueError(
+                "--enable-kv-cache-sharding does not support "
+                "--hicache-storage-backend for DSA models: sharded storage "
+                "I/O covers only the KV host pool, not the indexer pool."
+            )
     if cfg.enable_hierarchical_cache and is_deepseek_dsa(
         model_config_of(server_args).hf_config
     ):

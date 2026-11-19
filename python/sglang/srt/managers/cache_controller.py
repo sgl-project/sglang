@@ -309,9 +309,6 @@ class StorageOperation:
         self.stats_requested_tokens = 0
         # Absolute token offset at which this storage-prefetched span starts.
         self.storage_start = 0
-        # Logical-page KV sharding: rotation base of the chain a prefetch
-        # extends; its host bounce is drawn in that chain's owner phase.
-        self.kv_rotation_base: Optional[int] = None
 
         self.id = StorageOperation.counter
         StorageOperation.counter += 1
@@ -800,8 +797,20 @@ class HiCacheController:
             check_kv_shard_storage(
                 storage_backend=storage_backend,
                 host_memory_mode=self.host_memory_mode,
-                extra_config=storage_backend_extra_config or {},
+                key_scheme=key_scheme,
             )
+            if (storage_backend_extra_config or {}).get("tp_lcm_size"):
+                raise ValueError(
+                    "--enable-kv-cache-sharding does not support tp_lcm_size (split heads)."
+                )
+            if self.storage_host_pool.layout == "layer_first":
+                from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+
+                if isinstance(self.storage_host_pool.host_pool, MHATokenToKVPoolHost):
+                    raise ValueError(
+                        "KV-sharded MHA with Mooncake requires a page-oriented "
+                        "host layout. Start the server with --hicache-mem-layout page_first."
+                    )
             if self.mem_pool_host is not self.storage_host_pool:
                 other_pools = [
                     str(entry.name)
@@ -847,7 +856,7 @@ class HiCacheController:
                 )
             else:
                 # Leave half the pool for write-back. Prefetch occupancy counts
-                # logical tokens, including widened KV-sharded host pools.
+                # logical tokens, not physical rows on each DCP rank.
                 self.prefetch_capacity_limit = int(
                     0.5 * self.mem_pool_host.logical_size
                 )
@@ -1027,9 +1036,11 @@ class HiCacheController:
         attn_cp_rank, attn_cp_size = self.get_attn_cp_rank_and_size()
         dcp_size = get_parallel().attn_dcp_size
         host_pool = self.storage_host_pool
-        shard_storage_io = isinstance(
-            host_pool, PageInterleaveHostPool
-        ) and not kv_shard_storage_backend_supported(self.storage_backend_type)
+        shard_storage_io = (
+            isinstance(host_pool, PageInterleaveHostPool)
+            and self.storage_backend_type == "mooncake"
+            and not kv_shard_storage_backend_supported("mooncake")
+        )
         # Token KV views carry the server's resolved logical dtype, including
         # FP8 variants that share a uint8 backing buffer.
         model_name = storage_model_name(
@@ -1040,13 +1051,12 @@ class HiCacheController:
                 host_pool.sharded_storage_format_tag if shard_storage_io else None
             ),
         )
-        key_tp_rank = key_tp_size = None
+        key_tp_rank = None
         if shard_storage_io:
             # A page's owner depends on its chain's rotation, so keys name only
             # the head shard; the tag keeps writers of other page bytes apart.
-            key_tp_rank, key_tp_size = parallel.attn_tp_rank, parallel.attn_tp_size
-            tag = f"atp{key_tp_size}"
-            model_name = f"{model_name}-{tag}" if model_name else tag
+            key_tp_rank = parallel.attn_tp_rank
+            model_name = f"{model_name}-atp{parallel.attn_tp_size}"
         unified_plan = self._build_unified_plan(model_name, attn_cp_size)
         unified_chunk_spans = None
         if unified_plan is not None:
@@ -1078,7 +1088,6 @@ class HiCacheController:
             dcp_rank=get_parallel().attn_dcp_rank,
             logical_page_size=self.page_size if dcp_size > 1 else None,
             key_tp_rank=key_tp_rank,
-            key_tp_size=key_tp_size,
         )
 
     def _build_unified_plan(
@@ -1634,11 +1643,6 @@ class HiCacheController:
         start_owner: Optional[int] = None,
     ) -> Optional[torch.Tensor]:
         """Allocate the host bounce for a storage hit."""
-        if start_owner is None and operation.kv_rotation_base is not None:
-            # KV sharding: the bounce lands on the owners of the chain's pages.
-            start_owner = (
-                operation.kv_rotation_base + operation.storage_start // self.page_size
-            )
         if start_owner is None:
             return self.mem_pool_host.alloc(need_size)
         return self.mem_pool_host.alloc(need_size, start_owner=start_owner)

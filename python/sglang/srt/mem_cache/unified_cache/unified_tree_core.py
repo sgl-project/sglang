@@ -676,6 +676,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         return node.rotation_base + prefix_len // self.page_size
 
     def rotation_base_below(self, node_id: NodeId, key: RadixKey) -> Optional[int]:
+        """Return the rotation of the child that the first page would extend."""
         child = self.node_by_id(node_id).children.get(key.child_key(self.page_size))
         return None if child is None else child.rotation_base
 
@@ -2742,9 +2743,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         key: RadixKey,
         host_value: torch.Tensor,
         hash_value: list[str],
+        *,
         rotation_base: Optional[int] = None,
     ) -> InsertResult:
-        """Insert a host-side (backuped) tree path descending from the given node."""
+        """Insert host pages, rejecting sharded pages with a conflicting rotation."""
         node = self.node_by_id(node_id)
         total_len = len(key)
         self._touch_node(node)
@@ -2752,20 +2754,17 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             return InsertResult(prefix_len=0, mamba_exist=True)
 
         child_key = key.child_key(self.page_size)
-        first_child = node.children.get(child_key)
-        if (
-            rotation_base is not None
-            and first_child is not None
-            and first_child.rotation_base != rotation_base
-        ):
-            # Logical-page KV sharding: a path carries one rotation (load-back
-            # draws one cyclic run); decline before the walk mutates anything.
-            return InsertResult(
-                prefix_len=0,
-                total_len=total_len,
-                host_insert_dropped=True,
-                rotation_tail_declined=True,
-            )
+        if rotation_base is not None:
+            child = node.children.get(child_key)
+            if child is not None and child.rotation_base != rotation_base:
+                # Load-back draws one cyclic run. Keep the existing chain and
+                # release the arriving pages at the caller.
+                return InsertResult(
+                    prefix_len=0,
+                    total_len=total_len,
+                    host_insert_dropped=True,
+                    rotation_tail_declined=True,
+                )
         matched_length = 0
         host_prefix_len = 0
         refilled_host_node = None
