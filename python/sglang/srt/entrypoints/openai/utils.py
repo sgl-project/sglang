@@ -69,7 +69,10 @@ def _is_byte_level_tokenizer(tokenizer) -> bool:
     if isinstance(tokenizer, PreTrainedTokenizerFast):
         # fastokens backs the tokenizer with a shim whose decoder carries no type
         decoder = json.loads(tokenizer.backend_tokenizer.to_str()).get("decoder") or {}
-        is_bl = decoder.get("type") == "ByteLevel"
+        is_bl = any(
+            step.get("type") == "ByteLevel"
+            for step in [decoder, *decoder.get("decoders", [])]
+        )
         _BYTE_LEVEL_VERDICTS[tid] = is_bl
         return is_bl
 

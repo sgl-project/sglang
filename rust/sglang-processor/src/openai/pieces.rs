@@ -27,8 +27,10 @@ impl TokenPieces {
             }
         }
         // `_is_byte_level_tokenizer` answers a fast tokenizer with its declared decoder.
-        let byte_level =
-            tokenizer.pointer("/decoder/type").and_then(Value::as_str) == Some("ByteLevel");
+        let decoder = &tokenizer["decoder"];
+        let byte_level = std::iter::once(decoder)
+            .chain(decoder["decoders"].as_array().into_iter().flatten())
+            .any(|step| step["type"] == "ByteLevel");
         Self { pieces, byte_level }
     }
 
@@ -73,6 +75,13 @@ mod tests {
             "added_tokens": [{"id": 0, "content": "<｜begin▁of▁sentence｜>"}], "decoder": {"type": "ByteLevel"}});
         assert_eq!(
             TokenPieces::from_tokenizer_json(&deepseek).byte_level_bytes(3),
+            Some(b"!".to_vec())
+        );
+        // LFM2 wraps its ByteLevel decoder in a Sequence.
+        let lfm2 = json!({"model": {"vocab": {"!": 0}}, "added_tokens": [],
+            "decoder": {"type": "Sequence", "decoders": [{"type": "ByteLevel"}]}});
+        assert_eq!(
+            TokenPieces::from_tokenizer_json(&lfm2).byte_level_bytes(0),
             Some(b"!".to_vec())
         );
         let sentencepiece = json!({"model": {"vocab": {"!": 0, "a": 1}}, "added_tokens": [],

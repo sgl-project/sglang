@@ -504,12 +504,21 @@ class TestHandlerRequestSemantics(CustomTestCase):
 
     def test_logprob_bytes_are_the_token_bytes(self):
         """The vocabulary is byte-level even though its first ids are special tokens,
-        and also behind fastokens' backend, whose decoder carries no type."""
+        also behind fastokens' backend, whose decoder carries no type, and when the
+        ByteLevel decoder sits in a Sequence (LFM2)."""
+        from tokenizers import decoders
         from transformers import PreTrainedTokenizerFast
 
-        for backend in ("huggingface", "fastokens"):
+        for backend in ("huggingface", "fastokens", "sequence decoder"):
             with self.subTest(backend):
                 tokenizer = self.tokenizer
+                if backend == "sequence decoder":
+                    tokenizer = PreTrainedTokenizerFast(
+                        tokenizer_file=_tokenizer_file()
+                    )
+                    tokenizer.backend_tokenizer.decoder = decoders.Sequence(
+                        [decoders.ByteLevel()]
+                    )
                 if backend == "fastokens":
                     try:
                         from sglang.srt.hf_transformers.tokenizer import (
