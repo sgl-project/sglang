@@ -114,27 +114,27 @@ const diffusionJob = (name, step = 'Run diffusion suite') => ({
 
 test('independent diffusion suites collect peer test failures', async () => {
   const result = await check({ independentTestJobPrefix: diffusionPrefix,
-    jobs: [diffusionJob('diffusion-1-gpu-5090 (0)')] });
+    jobs: [diffusionJob('base-b-diffusion-test-1-gpu-small (0)')] });
   assert.deepEqual(result.failures, []);
 });
 
 test('other callers still stop on diffusion test failures', async () => {
-  const job = diffusionJob('diffusion-1-gpu-5090 (0)');
+  const job = diffusionJob('base-b-diffusion-test-1-gpu-small (0)');
   const result = await check({ jobs: [job] });
-  assert.match(result.failures[0], /diffusion-1-gpu-5090/);
+  assert.match(result.failures[0], /base-b-diffusion-test-1-gpu-small/);
 });
 
 test('architecture-specific pre-suite failures do not stop independent suites', async () => {
   const result = await check({ independentTestJobPrefix: diffusionPrefix,
-    jobs: [diffusionJob('diffusion-1-gpu-b200 (0)', 'Run pre-suite commands')] });
+    jobs: [diffusionJob('base-b-diffusion-test-1-gpu-b200 (0)', 'Run pre-suite commands')] });
   assert.deepEqual(result.failures, []);
 });
 
 for (const step of ['Install dependencies', 'Run ./.github/actions/check-maintenance']) {
   test(`independent lanes still stop on setup failure: ${step}`, async () => {
     const result = await check({ independentTestJobPrefix: diffusionPrefix,
-      jobs: [diffusionJob('diffusion-1-gpu-5090 (0)', step)] });
-    assert.match(result.failures[0], /diffusion-1-gpu-5090/);
+      jobs: [diffusionJob('base-b-diffusion-test-1-gpu-small (0)', step)] });
+    assert.match(result.failures[0], /base-b-diffusion-test-1-gpu-small/);
   });
 }
 
@@ -145,7 +145,7 @@ test('independent test collection never skips a failed lint check', async () => 
 
 test('independent peer failure does not hide a build failure', async () => {
   const result = await check({ independentTestJobPrefix: diffusionPrefix,
-    jobs: [diffusionJob('diffusion-1-gpu-5090 (0)'), {
+    jobs: [diffusionJob('base-b-diffusion-test-1-gpu-small (0)'), {
       name: 'sgl-kernel-build-wheels', status: 'completed', conclusion: 'failure',
       steps: [{ name: 'Build wheels', conclusion: 'failure' }],
     }] });
@@ -186,8 +186,8 @@ test('a real producer failure is not hidden with its Base-B wait', async () => {
 test('the generic action still blocks real roots behind a coverage summary', async () => {
   const result = await check({ jobs: [
     failed('call-multimodal-gen-tests / diffusion-coverage-check', 'Verify coverage'),
-    diffusionJob('diffusion-1-gpu-5090 (0)'),
+    diffusionJob('base-b-diffusion-test-1-gpu-small (0)'),
   ] });
-  assert.match(result.failures[0], /diffusion-1-gpu-5090/);
+  assert.match(result.failures[0], /base-b-diffusion-test-1-gpu-small/);
   assert.doesNotMatch(result.failures[0], /coverage-check/);
 });

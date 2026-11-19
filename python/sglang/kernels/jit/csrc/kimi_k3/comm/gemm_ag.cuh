@@ -25,6 +25,8 @@ namespace gemm_ag {
 using device::distributed::EpochCounter;
 // 16B vector = 4 packed bf16 pairs; +0.0 in a pair word is the "not arrived" marker
 using Lamport = device::distributed::LamportTrait<bf16_t, 16 / sizeof(bf16_t), /*kAtom=*/4>;
+// the GEMV producer stores one bf16 pair (one marker word) at a time
+using PairLamport = device::distributed::LamportTrait<bf16_t, 2, /*kAtom=*/4>;
 
 constexpr uint32_t kVecSize = 32 / sizeof(bf16_t);  // 16 bf16 per 32B vector
 constexpr uint32_t kSpinBlock = 128;                // min consumer threads per block
@@ -108,7 +110,7 @@ __global__ __launch_bounds__(K / kVecSize) void gemm_ag_gemv_kernel(
     }
     const auto pair = cast<bf16x2_t>(packed);
     auto bits = *reinterpret_cast<const uint32_t*>(&pair);
-    if (bits == 0) bits = 0x8000u;  // -0.0 in the first element: never all-zero
+    PairLamport::clear_pos_zero(&bits);
     const uint32_t m = (2 * tx) / N_SPLIT;
     const uint32_t n = (2 * tx) % N_SPLIT;  // even column within the tile
     // bf16 index in the phase half's dense [world][M][N / world] prefix;
