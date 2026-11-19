@@ -5,7 +5,7 @@ import os
 import queue
 import threading
 from enum import IntEnum
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 
 import msgspec
 import zmq
@@ -49,6 +49,10 @@ class PPConsensusStore:
     All ranks may use this as a normal Dict, e.g. ``store["key"] = value`` or ``del store["key"]``.
     All modifications done by all ranks are replicated to rank 0 in background.  Rank 0 calls
     ``collect`` to retrieve values of all ranks for the specified key.
+
+    ``version`` moves on every change this rank sees. ``add_listener(fn)`` calls
+    ``fn(key, value)`` after every PUT this rank sees (local, or replicated on
+    rank 0), outside the lock, on the writer's thread; ``fn`` must not block.
     """
 
     def __init__(self, pp_size: int, pp_rank: int, pp_group) -> None:
@@ -58,6 +62,8 @@ class PPConsensusStore:
         self._local_map: Dict[Any, Any] = {}
         self._peer_map: Dict[int, Dict[Any, Any]] = {}
         self._cache_lock = threading.Lock()
+        self.version = 0
+        self._listeners: List[Callable[[Any, Any], None]] = []
         self._replication_queue: Optional[queue.Queue] = None
         self._zmq_ctx: Optional[zmq.Context] = None
         self._socket: Optional[zmq.Socket] = None
@@ -108,6 +114,7 @@ class PPConsensusStore:
             if key not in self._local_map:
                 return default
             value = self._local_map.pop(key)
+            self.version += 1
             self._maybe_replicate_to_rank0(_OpKind.DELETE, key)
         return value
 
@@ -127,13 +134,27 @@ class PPConsensusStore:
         with self._cache_lock:
             self._maybe_replicate_to_rank0(_OpKind.PUT, key, value)
             self._local_map[key] = value
+            self.version += 1
+        if self._listeners:
+            self._notify_put(key, value)
 
     def __delitem__(self, key: Any) -> None:
         with self._cache_lock:
             if key not in self._local_map:
                 raise KeyError(key)
             self._local_map.pop(key)
+            self.version += 1
             self._maybe_replicate_to_rank0(_OpKind.DELETE, key)
+
+    def add_listener(self, fn: Callable[[Any, Any], None]) -> None:
+        self._listeners = self._listeners + [fn]
+
+    def _notify_put(self, key: Any, value: Any) -> None:
+        for fn in self._listeners:
+            try:
+                fn(key, value)
+            except Exception as e:
+                logger.warning("PPConsensusStore listener raised: %r", e)
 
     def close(self) -> None:
         if self._pp_rank > 0:
@@ -191,10 +212,14 @@ class PPConsensusStore:
             logger.debug("recv put rank=%s %s = %s", op.rank, op.key, op.value)
             with self._cache_lock:
                 self._peer_map.setdefault(op.rank, {})[op.key] = op.value
+                self.version += 1
+            if self._listeners:
+                self._notify_put(op.key, op.value)
         else:
             logger.debug("recv delete rank=%s %s", op.rank, op.key)
             with self._cache_lock:
                 self._peer_map.get(op.rank, {}).pop(op.key, None)
+                self.version += 1
 
     def _recv_loop(self) -> None:
         assert self._pp_rank == 0

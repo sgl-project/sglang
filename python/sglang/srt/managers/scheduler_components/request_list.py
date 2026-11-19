@@ -211,6 +211,15 @@ class IndexedReqList(ReqList):
         self._compact()
         return iter(self._items)
 
+    def snapshot(self) -> List[Req]:
+        """The requests held now, for a reader on another thread: unlike
+        iteration, this never compacts the list the owner thread mutates."""
+        return [
+            req
+            for req in map(self._req_of, list(self._items))
+            if req.owner_list is self
+        ]
+
     def __iter__(self) -> Iterator[Req]:
         self._compact()
         return map(self._req_of, self._items)

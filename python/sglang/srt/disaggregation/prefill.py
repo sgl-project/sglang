@@ -1439,6 +1439,9 @@ class SchedulerDisaggregationPrefillMixin:
             return []
 
         done_reqs = []
+        # PP rank 0 with early finish: the requests whose output already went out.
+        early_finish = self.pp_prefill_early_finish
+        streamed_early = set()
 
         # The polls are reduced across ranks in this order.
         transfer_queue = list(self.disagg_prefill_transfer_queue)
@@ -1522,6 +1525,8 @@ class SchedulerDisaggregationPrefillMixin:
                 # todo: set Transferring correctly in backend
                 pass
             elif poll == KVPoll.Success:  # transfer done
+                if early_finish is not None and early_finish.released(req):
+                    streamed_early.add(req.rid)
                 if req.return_routed_experts:
                     self.batch_result_processor._maybe_collect_routed_experts(req)
                 if not isinstance(req.finished_reason, FINISH_ABORT):
@@ -1530,8 +1535,13 @@ class SchedulerDisaggregationPrefillMixin:
                 # FIXME: clean up req's data in transfer engine
                 req.disagg_kv_sender.clear()
                 done_reqs.append(req)
-                req.time_stats.set_prefill_kv_transfer_finish_time()
+                if req.rid not in streamed_early:
+                    req.time_stats.set_prefill_kv_transfer_finish_time()
             elif poll == KVPoll.Failed:
+                # Streamed early, every stage had already reported Success;
+                # a later failure only changes how the stages release the KV.
+                if early_finish is not None and early_finish.released(req):
+                    streamed_early.add(req.rid)
                 self.handle_inflight_transfer_failure(req)
                 done_reqs.append(req)
             else:
@@ -1540,7 +1550,8 @@ class SchedulerDisaggregationPrefillMixin:
                 )
 
         for req in done_reqs:
-            req.time_stats.set_completion_time()
+            if req.rid not in streamed_early:
+                req.time_stats.set_completion_time()
 
         for req in done_reqs:
             if isinstance(req.finished_reason, FINISH_ABORT):
@@ -1560,7 +1571,8 @@ class SchedulerDisaggregationPrefillMixin:
                 if "speed_gb_s" in metrics:
                     self.metrics_reporter.kv_transfer_speed_gb_s = metrics["speed_gb_s"]
 
-        # Stream requests which have finished transfer
+        # Stream requests which have finished transfer; the streamer skips the
+        # ones streamed early (finished and finished_output).
         self.output_streamer.stream_output(
             done_reqs,
             any(req.return_logprob for req in done_reqs),
@@ -1573,6 +1585,8 @@ class SchedulerDisaggregationPrefillMixin:
                 req, self.req_to_metadata_buffer_idx_allocator
             )
             self._release_mm_inputs(req)
+        if early_finish is not None and done_reqs:
+            early_finish.forget(req.rid for req in done_reqs)
 
         return done_reqs
 
