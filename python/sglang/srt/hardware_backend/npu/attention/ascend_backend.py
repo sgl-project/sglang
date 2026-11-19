@@ -561,12 +561,6 @@ class AscendAttnBackend(AttentionBackend):
 
         self.attn_cp_size = get_parallel().attn_cp_size
         supports_shared_read = self._supports_shared_read(model_runner)
-        self.prepare_in_graph = (
-            supports_shared_read
-            and envs.SGLANG_NPU_PREPARE_METADATA_IN_GRAPH.get()
-            and get_disagg().disaggregation_mode != "prefill"
-        )
-        # Ordinary read-done events do not require the external-event API.
         self.shared_read_enabled = (
             supports_shared_read
             and envs.SGLANG_ENABLE_WAR_BARRIER.get()
@@ -607,11 +601,7 @@ class AscendAttnBackend(AttentionBackend):
         if fm == ForwardMode.EXTEND:
             return SharedReadEnds.PRE_REPLAY
         if fm.is_decode() or fm.is_target_verify() or fm.is_draft_extend_v2():
-            return (
-                SharedReadEnds.IN_REPLAY
-                if self.prepare_in_graph
-                else SharedReadEnds.PRE_REPLAY
-            )
+            return SharedReadEnds.PRE_REPLAY
         return SharedReadEnds.UNKNOWN
 
     def _publish_eager_shared_read_done(self, forward_batch: ForwardBatch) -> None:
@@ -711,33 +701,13 @@ class AscendAttnBackend(AttentionBackend):
         in_capture: bool = False,
     ):
         bs = forward_batch.batch_size
-        # Graph variants of one bucket must keep the same captured tensor addresses.
-        if in_capture and (not self.prepare_in_graph or bs not in self.graph_metadata):
+        if in_capture:
             self._init_cuda_graph_metadata(
                 bs,
                 forward_batch.forward_mode,
                 forward_batch.seq_lens,
                 forward_batch.out_cache_loc,
             )
-        if self.dsa_dcp_target:
-            # The indexer reads this fixed input; its live source can change per batch.
-            buffer = self.graph_metadata["dcp_origin_out_cache_loc"]
-            origin_out_cache_loc = getattr(forward_batch, "origin_out_cache_loc", None)
-            if origin_out_cache_loc is None:
-                buffer.zero_()
-            else:
-                num_tokens = origin_out_cache_loc.shape[0]
-                assert num_tokens <= buffer.shape[0], (
-                    "NPU DSA+DCP origin_out_cache_loc exceeds its graph buffer: "
-                    f"{num_tokens} > {buffer.shape[0]}"
-                )
-                buffer[:num_tokens].copy_(origin_out_cache_loc)
-                buffer[num_tokens:].zero_()
-        if self.prepare_in_graph:
-            # The captured graph fills this bucket after its static inputs are ready.
-            self.forward_metadata = self.graph_metadata[bs]
-            self.graph_mode = True
-            return
         if self.needs_cpu_seq_lens:
             seq_lens_cpu = (
                 forward_batch.seq_lens.cpu()
@@ -754,56 +724,9 @@ class AscendAttnBackend(AttentionBackend):
             forward_mode=forward_batch.forward_mode,
             spec_info=forward_batch.spec_info,
             out_cache_loc=forward_batch.out_cache_loc,
+            origin_out_cache_loc=getattr(forward_batch, "origin_out_cache_loc", None),
             max_seq_len_host=getattr(forward_batch, "max_seq_len_host", None),
         )
-
-    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
-        if not self.prepare_in_graph:
-            return
-        mode = forward_batch.forward_mode
-        metadata = self.forward_metadata
-        bs = metadata.block_tables.shape[0]
-        self._fill_graph_block_table(
-            metadata.block_tables, forward_batch.req_pool_indices[:bs]
-        )
-        seq_lens = forward_batch.seq_lens[:bs]
-        if mode.is_target_verify():
-            torch.add(
-                seq_lens, self.speculative_num_draft_tokens, out=metadata.seq_lens
-            )
-        elif self.is_draft_worker and mode.is_decode():
-            torch.add(seq_lens, self.speculative_step_offset_npu, out=metadata.seq_lens)
-
-        if self.dsa_dcp_target:
-            # Local pages derive from the global snapshot without another shared read.
-            local_pages = metadata.block_tables[:, :: self.dcp_size] // self.dcp_size
-            if mode.is_target_verify():
-                block_tables = metadata.dcp_spec_block_tables.view(
-                    bs, self.speculative_num_draft_tokens, -1
-                )
-                local_pages = local_pages[:, None, :]
-                metadata.dcp_spec_seq_lens.copy_(
-                    get_dcp_chain_spec_lens(
-                        metadata.seq_lens,
-                        self.speculative_num_draft_tokens,
-                        self.dcp_size,
-                        self.dcp_rank,
-                        interleave_size=self.page_size,
-                    )
-                )
-            else:
-                block_tables = metadata.dcp_block_tables
-                metadata.dcp_seq_lens.copy_(
-                    get_dcp_lens(
-                        metadata.seq_lens,
-                        self.dcp_size,
-                        self.dcp_rank,
-                        interleave_size=self.page_size,
-                    )
-                )
-            pages = min(local_pages.shape[-1], block_tables.shape[-1])
-            block_tables[..., :pages].copy_(local_pages[..., :pages])
-            block_tables[..., pages:].zero_()
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
@@ -1197,13 +1120,6 @@ class AscendAttnBackend(AttentionBackend):
                 dtype=torch.int32,
                 device=self.device,
             ),
-            "page_offsets": torch.arange(
-                0,
-                self.req_to_token.shape[1],
-                self.page_size,
-                dtype=torch.int64,
-                device=self.device,
-            ),
         }
         if self.dense_mla_dcp_target and self.speculative_num_draft_tokens is not None:
             self.graph_metadata["dcp_mtp_attn_mask"] = torch.ones(
@@ -1340,17 +1256,7 @@ class AscendAttnBackend(AttentionBackend):
                 metadata.uniform_query_len = 1
         if self.needs_cpu_seq_lens and not self.dense_mla_dcp_target:
             metadata.seq_lens_cpu_list = seq_lens.cpu().int().tolist()
-        # Graph-local offsets cannot overwrite the runner's input lengths.
-        offset_kv_lens = self.prepare_in_graph and (
-            forward_mode.is_target_verify()
-            or (self.is_draft_worker and forward_mode.is_decode())
-        )
-        if (
-            self.use_flash_mla
-            or self.use_paged_mtp
-            or self.use_quant_flash_attn
-            or offset_kv_lens
-        ):
+        if self.use_flash_mla or self.use_paged_mtp or self.use_quant_flash_attn:
             metadata.seq_lens = torch.empty_like(seq_lens, dtype=torch.int32)
         else:
             metadata.seq_lens = seq_lens
@@ -1409,23 +1315,6 @@ class AscendAttnBackend(AttentionBackend):
         self.graph_metadata[bs] = metadata
         return metadata
 
-    def _fill_graph_block_table(
-        self,
-        block_tables: torch.Tensor,
-        req_pool_indices: torch.Tensor,
-    ):
-        total_pages = min(
-            block_tables.shape[1],
-            (self.req_to_token.shape[1] + self.page_size - 1) // self.page_size,
-        )
-        # Index both dimensions to avoid copying the full pool's strided view.
-        full_page_locs = self.req_to_token[
-            req_pool_indices[:, None],
-            self.graph_metadata["page_offsets"][None, :total_pages],
-        ]
-        block_tables[:, :total_pages].copy_(full_page_locs // self.page_size)
-        block_tables[:, total_pages:].fill_(0)
-
     def _apply_cuda_graph_metadata(
         self,
         bs: int,
@@ -1435,6 +1324,7 @@ class AscendAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         out_cache_loc: Optional[torch.Tensor] = None,
+        origin_out_cache_loc: Optional[torch.Tensor] = None,
         max_seq_len_host: Optional[int] = None,
     ):
         """Shared capture+replay body for the cuda-graph init path.
@@ -1528,9 +1418,18 @@ class AscendAttnBackend(AttentionBackend):
             )
             metadata.block_tables[:bs, max_seq_pages:].fill_(0)
         elif not self.dense_mla_dcp_target:
-            self._fill_graph_block_table(
-                metadata.block_tables[:bs], req_pool_indices[:bs]
+            total_pages = min(
+                metadata.block_tables.shape[1],
+                (self.req_to_token.shape[1] + self.page_size - 1) // self.page_size,
             )
+            metadata.block_tables[:bs, :total_pages].copy_(
+                self.req_to_token[
+                    req_pool_indices[:bs],
+                    0 : total_pages * self.page_size : self.page_size,
+                ]
+                // self.page_size
+            )
+            metadata.block_tables[:bs, total_pages:].fill_(0)
 
         if self.dense_mla_dcp_target:
             assert seq_lens_cpu is not None, "MLA DCP requires seq_lens_cpu"
@@ -1545,6 +1444,18 @@ class AscendAttnBackend(AttentionBackend):
             metadata.block_tables[:bs, num_pages:].fill_(0)
 
         if self.dsa_dcp_target:
+            if "dcp_origin_out_cache_loc" in self.graph_metadata:
+                buffer = self.graph_metadata["dcp_origin_out_cache_loc"]
+                if origin_out_cache_loc is None:
+                    buffer.zero_()
+                else:
+                    num_tokens = origin_out_cache_loc.shape[0]
+                    assert num_tokens <= buffer.shape[0], (
+                        "NPU DSA+DCP origin_out_cache_loc exceeds its graph buffer: "
+                        f"{num_tokens} > {buffer.shape[0]}"
+                    )
+                    buffer[:num_tokens].copy_(origin_out_cache_loc)
+                    buffer[num_tokens:].zero_()
             # DCP decode/speculative paths use rank-local KV lengths and a block
             # table whose stride is page_size * dcp_world_size. Draft attention
             # uses the ordinary full-KV metadata above instead.
