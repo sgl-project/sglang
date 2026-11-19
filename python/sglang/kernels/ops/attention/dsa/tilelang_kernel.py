@@ -291,7 +291,10 @@ def sparse_attention_fwd_kernel_v2(
     kv_group: int = 1,
     sm_scale: Optional[float] = None,
     block_I: int = 64,
+    head_tile: int = 64,
 ):
+    assert block_I % 16 == 0, "the cooperative KV loader processes 16 rows per step"
+    assert head_tile in (16, 32, 64), "head_tile must be 16, 32 or 64"
     assert dim == tilelang.math.next_power_of_2(dim), (
         f"haven't check padding correctness yet, dim={dim}"
     )
@@ -329,13 +332,11 @@ def sparse_attention_fwd_kernel_v2(
     assert NI % 2 == 0, "NI should be a multiple of 2"
     D = dim
     D_tail = tail_dim
-    if num_heads > 64:
+    if num_heads > 64 and head_tile == 64:
         assert num_heads % 64 == 0, "head_kv should be a multiple of 64"
-        REPLICATE_H = num_heads // 64
-    else:
-        REPLICATE_H = 1
 
-    H_per_block = padded_H if REPLICATE_H == 1 else 64
+    H_per_block = min(padded_H, head_tile)
+    REPLICATE_H = tilelang.cdiv(num_heads, H_per_block)
 
     @T.prim_func
     def main(
@@ -395,7 +396,7 @@ def sparse_attention_fwd_kernel_v2(
             b_i, g_i = by, bz
             s_i = bx if REPLICATE_H == 1 else bx // REPLICATE_H
 
-            H0 = g_i * padded_H + (0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * 64)
+            H0 = g_i * padded_H + (bx % REPLICATE_H) * H_per_block
             H1 = H0 + H_per_block
 
             tx = T.get_thread_binding()
@@ -555,7 +556,7 @@ def sparse_attention_fwd_kernel_v2(
                     T.barrier_arrive(bar_2_128)
                     T.barrier_wait(bar_2_128, 0)
 
-                    for r in T.serial(4):
+                    for r in T.serial(BI // 16):
                         indices_tmp[0] = Indices[
                             b_i, s_i, g_i, (i_i * 2) * BI + r * 16 + (tx - 256) // 8
                         ]
@@ -602,7 +603,7 @@ def sparse_attention_fwd_kernel_v2(
                     T.barrier_arrive(bar_2_128)
                     T.barrier_wait(bar_2_128, 1)
 
-                    for r in T.serial(4):
+                    for r in T.serial(BI // 16):
                         indices_tmp[0] = Indices[
                             b_i, s_i, g_i, (i_i * 2 + 1) * BI + r * 16 + (tx - 256) // 8
                         ]
@@ -1278,7 +1279,21 @@ def tilelang_sparse_fwd(
             if tail_dim == 0
             else sparse_attention_fwd_kernel_v2
         )
-        kernel = kernel_factory(num_heads, d_v, tail_dim, topk, sm_scale=sm_scale)
+        # Bound each SM12x block to 18 KiB of Q and 72 KiB of double-buffered
+        # KV, leaving room for scratch/barriers within its 99 KiB limit.
+        # Additional heads use separate blocks with the same shared layout.
+        if current_arch().is_sm(12) and d_v == 512 and tail_dim == 64:
+            kernel = sparse_attention_fwd_kernel_v2(
+                num_heads,
+                d_v,
+                tail_dim,
+                topk,
+                sm_scale=sm_scale,
+                block_I=32,
+                head_tile=16,
+            )
+        else:
+            kernel = kernel_factory(num_heads, d_v, tail_dim, topk, sm_scale=sm_scale)
         out = kernel(q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0))  # type: ignore
     return out
 
