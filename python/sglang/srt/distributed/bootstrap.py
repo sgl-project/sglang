@@ -139,6 +139,10 @@ def init_parallel_runtime(
             get_parallel().tp_rank,
         )
         raise
+    if current_platform.is_rocm():
+        from sglang.srt.distributed.bootstrap_rocm import reserve_runtime_memory
+
+        reserve_runtime_memory(device=device, gpu_id=get_device().gpu_id)
     maybe_init_shared_mooncake_transfer_engine(gpu_id=get_device().gpu_id)
 
     parallel = get_parallel()
@@ -239,7 +243,7 @@ def _resolve_backend(*, device: str) -> str:
 
 
 def _resolve_dist_init_method(*, dist_port: int) -> str:
-    # Allow external orchestrators (e.g. trainpi) to override the distributed
+    # Allow external orchestrators to override the distributed
     # init method.  When set to "env://", torch uses MASTER_ADDR/MASTER_PORT
     # env-vars and an externally-created TCPStore, completely avoiding port
     # conflicts with intra-host collocation.
