@@ -9,6 +9,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.numerics import mul_rn_f32
+
 
 @triton.jit
 def _rope_rotate_half_fp32_kernel(
@@ -38,8 +40,9 @@ def _rope_rotate_half_fp32_kernel(
         x = tl.load(K + offsets, mask, other=0).to(tl.float32)
         r = tl.load(K + rotated, mask, other=0).to(tl.float32)
     r = tl.where(col < D // 2, -r, r)
-    # Preserve the two FP32 multiplication boundaries; do not contract to FMA.
-    out = x * c + r * s
+    # Packed FP32 lowering can contract despite enable_fp_fusion=False.
+    # Keep both products separately rounded before the addition.
+    out = mul_rn_f32(x, c) + mul_rn_f32(r, s)
     if tl.program_id(1) == 0:
         tl.store(OutQ + offsets, out, mask)
     else:
