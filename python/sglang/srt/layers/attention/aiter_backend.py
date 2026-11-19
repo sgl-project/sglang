@@ -2187,15 +2187,16 @@ class AiterAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         k_descale,
     ) -> torch.Tensor:
-        from aiter.mla_verify import MLA_VERIFY_HK, mla_verify_hk
+        from aiter.mla_verify import mla_verify_hk
 
+        from sglang.srt.layers.attention.graph_variants import K3_MLA_VERIFY_HK
         from sglang.srt.model_executor.runner_utils.capture_mode import (
             get_capture_attention_variant,
         )
 
         kernel = get_capture_attention_variant() or self._k3_mla_verify_kernel
         q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
-        if kernel == MLA_VERIFY_HK:
+        if kernel == K3_MLA_VERIFY_HK:
             return mla_verify_hk(
                 q,
                 k_buffer,
