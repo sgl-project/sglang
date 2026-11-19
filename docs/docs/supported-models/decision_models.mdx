@@ -22,8 +22,9 @@ Other chat models are served when the answer labels are single tokens at the ans
 
 [NVIDIA-Nemotron-3.5-Decision-8B-BF16](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Decision-8B-BF16)
 uses a trained prompt and fully bidirectional attention. Serve it through
-`/v1/systemone`. The default prefill budget is 32K tokens (16K on GPUs below
-60 GiB), bounded by the configured context and checkpoint input limit. Set `--max-prefill-tokens` to
+`/v1/systemone` or `/v1/decisions`. The default prefill budget is 32K tokens
+(16K on GPUs below 60 GiB), bounded by the configured context and checkpoint
+input limit. Set `--max-prefill-tokens` to
 change that budget.
 
 ```bash Command
@@ -60,7 +61,8 @@ print(response.json())
 
 The server reads the checkpoint's `decision.json` and `decision_template.jinja`
 for answer labels, prompt formatting, calibration temperatures and request
-limits. Unknown request fields are rejected for this checkpoint. Options retain their input order. The BF16 checkpoint allows up to
+limits. Options retain their input order. Both endpoints reject unknown request fields
+for this checkpoint. The BF16 checkpoint allows up to
 512 questions per request, 2–501 options or score levels per question, and
 131,072 input tokens per question. The server's context, prefill budget and
 available KV capacity can impose a smaller limit. Longer inputs are rejected
@@ -72,8 +74,38 @@ attend to the whole question. No output tokens are generated. Images, shared-sta
 packing, speculative decoding and multi-token generation are unsupported.
 ROCm serving is rejected because its default attention backend does not honor
 this model's bidirectional attention.
-`/v1/decisions` keeps its generic prompt and directs this checkpoint to
-`/v1/systemone` instead.
+For this checkpoint, `/v1/decisions` uses prompt format version 2, with the same
+trained prompt and calibration as `/v1/systemone`. Generic chat models keep
+version 1. An explicit `prompt_format_version` must match the served version.
+The request `temperature` scales probabilities in addition to the checkpoint's
+per-question calibration; it does not change `label_mass`.
+
+For example, send the same ticket through `/v1/decisions`:
+
+```python Example
+response = requests.post(
+    "http://127.0.0.1:30000/v1/decisions",
+    json={
+        "model": "decision-test",
+        "input": {"ticket": "The service is down."},
+        "questions": [
+            {
+                "id": "team",
+                "type": "choice",
+                "question": "Which team should handle this ticket?",
+                "options": [
+                    {"name": "billing", "description": "Payments and invoices"},
+                    {"name": "operations", "description": "Service outages"},
+                ],
+            },
+            {"id": "urgent", "type": "yes_no", "question": "Does this need urgent attention?"},
+        ],
+    },
+    timeout=60,
+)
+response.raise_for_status()
+print(response.json())
+```
 
 ## Launch command
 

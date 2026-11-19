@@ -68,7 +68,7 @@ class TestNemotronDecisionServing(CustomTestCase):
             kill_process_tree(cls.process.pid)
         super().tearDownClass()
 
-    def request_decision(self, case):
+    def request_decision(self, case, route="/v1/systemone"):
         key, state, question, expected, other = case
         payload = {
             "model": "decision-test",
@@ -89,7 +89,30 @@ class TestNemotronDecisionServing(CustomTestCase):
                 },
             },
         }
-        response = requests.post(self.url + "/v1/systemone", json=payload, timeout=120)
+        if route == "/v1/decisions":
+            payload = {
+                "model": "decision-test",
+                "input": state,
+                "questions": [
+                    {
+                        "id": key,
+                        "type": "choice",
+                        "question": question,
+                        "options": [
+                            {"name": name, "description": meaning}
+                            for name, meaning in payload["questions"][key][
+                                "criteria"
+                            ].items()
+                        ],
+                    },
+                    {
+                        "id": key + "-present",
+                        "type": "yes_no",
+                        "question": f"Does the state mention {expected}?",
+                    },
+                ],
+            }
+        response = requests.post(self.url + route, json=payload, timeout=120)
         response.raise_for_status()
         answers = response.json()["answers"]
         self.assertEqual(set(answers), {key, key + "-present"})
@@ -103,16 +126,25 @@ class TestNemotronDecisionServing(CustomTestCase):
             )
         )
         self.assertAlmostEqual(sum(answer["probabilities"].values()), 1.0, places=5)
-        self.assertGreater(answers[key + "-present"]["noul"], 0.5)
+        present = answers[key + "-present"]
+        probability = (
+            present["noul"]
+            if route == "/v1/systemone"
+            else present["probabilities"]["yes"]
+        )
+        self.assertGreater(probability, 0.5)
         return answer["probabilities"]
 
     def test_distinct_questions_keep_their_answers_under_concurrency(self):
         expected = [self.request_decision(case) for case in CASES]
-        with ThreadPoolExecutor(max_workers=4) as pool:
-            actual = list(pool.map(self.request_decision, CASES))
-        for serial, concurrent in zip(expected, actual):
-            for label in serial:
-                self.assertAlmostEqual(serial[label], concurrent[label], delta=0.02)
+        for route in ("/v1/systemone", "/v1/decisions"):
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                actual = list(
+                    pool.map(lambda case: self.request_decision(case, route), CASES)
+                )
+            for serial, concurrent in zip(expected, actual):
+                for label in serial:
+                    self.assertAlmostEqual(serial[label], concurrent[label], delta=0.02)
 
     def test_probabilities_match_bidirectional_reference(self):
         criteria = {f"item{i:03d}": f"Item {i:03d}" for i in range(501)}
@@ -138,7 +170,7 @@ class TestNemotronDecisionServing(CustomTestCase):
         # The reference is 0.7478; causal attention gives 0.6921.
         self.assertAlmostEqual(actual["item499"], 0.7477865, delta=0.02)
 
-    def test_score_order_and_generic_prompt_refusal(self):
+    def test_score_order_and_prompt_version_validation(self):
         response = requests.post(
             self.url + "/v1/systemone",
             json={
@@ -159,27 +191,32 @@ class TestNemotronDecisionServing(CustomTestCase):
         self.assertEqual(
             max(answer["probabilities"], key=answer["probabilities"].get), "2"
         )
-        response = requests.post(
-            self.url + "/v1/decisions",
-            json={
-                "model": "decision-test",
-                "input": {"capital": "Paris"},
-                "questions": [
-                    {
-                        "id": "capital",
-                        "type": "choice",
-                        "question": "Which capital is listed?",
-                        "options": [
-                            {"name": "Paris", "description": "Paris"},
-                            {"name": "Berlin", "description": "Berlin"},
-                        ],
-                    }
-                ],
-            },
-            timeout=120,
-        )
+        payload = {
+            "model": "decision-test",
+            "input": "The service was excellent. Everything worked perfectly.",
+            "return_prompt_token_ids": True,
+            "questions": [
+                {
+                    "id": "sentiment",
+                    "type": "score",
+                    "question": "Rate the sentiment.",
+                    "levels": ["negative", "neutral", "positive"],
+                }
+            ],
+        }
+        response = requests.post(self.url + "/v1/decisions", json=payload, timeout=120)
+        response.raise_for_status()
+        body = response.json()
+        self.assertEqual(body["prompt_format_version"], 2)
+        actual = body["answers"]["sentiment"]
+        for label, expected in answer["probabilities"].items():
+            self.assertAlmostEqual(actual["probabilities"][label], expected, delta=0.02)
+        self.assertEqual(len(actual["label_token_ids"]), 3)
+        self.assertTrue(actual["prompt_token_ids"])
+        payload["prompt_format_version"] = 1
+        response = requests.post(self.url + "/v1/decisions", json=payload, timeout=30)
         self.assertEqual(response.status_code, 400, response.text)
-        self.assertIn("/v1/systemone", response.text)
+        self.assertIn("uses version 2", response.text)
 
     def test_unsupported_modes_and_unschedulable_prompts_do_not_block_valid_reads(self):
         payload = {

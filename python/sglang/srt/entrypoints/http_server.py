@@ -135,6 +135,7 @@ from sglang.srt.entrypoints.server_utils import (
 from sglang.srt.entrypoints.sidecar import rust_server_sidecar
 from sglang.srt.entrypoints.systemone.protocol import (
     NemotronDecisionRequest,
+    NemotronDecisionsRequest,
     SystemOneRequest,
 )
 from sglang.srt.entrypoints.systemone.serving import SystemOneServing
@@ -2065,10 +2066,18 @@ async def v1_score_request(request: ScoringRequest, raw_request: Request):
 
 
 @app.post("/v1/decisions", dependencies=[Depends(validate_json_request)])
-async def v1_decisions_request(request: DecisionRequest, raw_request: Request):
+async def v1_decisions_request(
+    request: SkipValidation[DecisionRequest], raw_request: Request
+):
     """Answer typed choice, score, and yes or no questions about an input by scoring single-token answer labels through the scoring API, without generation."""
-    return await raw_request.app.state.openai_serving_decisions.handle_request(
-        request, raw_request
+    serving = raw_request.app.state.openai_serving_decisions
+    request_type = (
+        DecisionRequest
+        if serving.question_encoder is None
+        else NemotronDecisionsRequest
+    )
+    return await serving.handle_request(
+        _validate_decision_body(request, request_type), raw_request
     )
 
 

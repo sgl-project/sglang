@@ -2,7 +2,8 @@
 
 Follows the published System One OpenAPI 0.2.0 request and response shapes:
 a state, a map of noul, choice, and score questions keyed by caller ids, and
-one answer per question id.
+one answer per question id. Nemotron also has a checkpoint-specific body for
+`/v1/decisions`, with limits checked against the served checkpoint.
 """
 
 from typing import Annotated, Any, Dict, List, Literal, Optional, Union
@@ -19,8 +20,13 @@ from pydantic import (
 from pydantic.json_schema import SkipJsonSchema
 
 from sglang.srt.entrypoints.openai.protocol import (
+    DecisionChoiceQuestion,
     DecisionImage,
+    DecisionOption,
+    DecisionRequest,
+    DecisionScoreQuestion,
     DecisionText,
+    DecisionYesNoQuestion,
     RequiredDecisionText,
     check_option_names,
     is_blank_decision_text,
@@ -148,6 +154,28 @@ class NemotronDecisionRequest(SystemOneRequest):
             ],
             Field(discriminator="type"),
         ],
+    ] = Field(min_length=1)
+
+
+class NemotronDecisionsChoiceQuestion(DecisionChoiceQuestion):
+    options: List[DecisionOption] = Field(min_length=2)
+
+
+class NemotronDecisionsScoreQuestion(DecisionScoreQuestion):
+    levels: List[RequiredDecisionText] = Field(min_length=2)
+
+
+class NemotronDecisionsRequest(DecisionRequest):
+    input: Any
+    questions: List[
+        Annotated[
+            Union[
+                NemotronDecisionsChoiceQuestion,
+                NemotronDecisionsScoreQuestion,
+                DecisionYesNoQuestion,
+            ],
+            Field(discriminator="type"),
+        ]
     ] = Field(min_length=1)
 
 
