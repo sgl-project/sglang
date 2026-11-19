@@ -1,0 +1,113 @@
+# [CI trial] Builds the sgl-deep-gemm, sgl-deep-ep and sgl-flash-mla wheels against
+# torch 2.15 / CUDA 13.4, from the same sources as the releases sglang pins, so test
+# jobs run the binaries a torch 2.15 release would ship instead of PyPI's torch 2.14
+# builds. Uses the release workflows' build scripts; nothing is published. Test jobs
+# install the `dep-wheel-*` artifacts over the pinned releases (see _pr-test-stage.yml).
+
+name: PR Test - Dependency Wheels Build
+
+on:
+  workflow_call:
+
+env:
+  TORCH_VER: "2.15.0"
+  TORCH_VERSION: "2.15.0"
+  # Sources of the pinned releases (python/pyproject.toml).
+  DEEPGEMM_REF: v0.2.9          # sgl-deep-gemm==0.2.9
+  DEEPGEMM_VERSION: "0.2.9"
+  DEEPEP_REF: v0.1.2.post1      # sgl-deep-ep==0.1.2.post1
+  DEEPEP_VERSION: "0.1.2.post1"
+  FLASHMLA_REF: 85b5264bbe2fe66327afc8a94f1eed80629937ca  # sgl-flash-mla==1.0.5
+  FLASHMLA_VERSION: "1.0.5"
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        package: [deepgemm, deepep, flashmla]
+        arch: [x86_64, aarch64]
+        include:
+          - arch: x86_64
+            runner: x64-kernel-build-node
+          - arch: aarch64
+            runner: arm-kernel-build-node
+    name: build-${{ matrix.package }}-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    steps:
+      - name: Clean workspace (remove root-owned files from prior runs)
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/workspace" alpine:3 \
+            sh -c 'rm -rf /workspace/..?* /workspace/.[!.]* /workspace/*' || true
+
+      - uses: actions/checkout@v4
+
+      - name: Checkout DeepGEMM
+        if: matrix.package == 'deepgemm'
+        uses: actions/checkout@v4
+        with:
+          repository: sgl-project/DeepGEMM
+          ref: ${{ env.DEEPGEMM_REF }}
+          path: DeepGEMM
+          submodules: recursive
+
+      - name: Checkout DeepEP
+        if: matrix.package == 'deepep'
+        uses: actions/checkout@v4
+        with:
+          repository: sgl-project/DeepEP
+          ref: ${{ env.DEEPEP_REF }}
+          path: DeepEP-source
+          submodules: recursive
+
+      - name: Checkout FlashMLA
+        if: matrix.package == 'flashmla'
+        uses: actions/checkout@v4
+        with:
+          repository: sgl-project/FlashMLA
+          ref: ${{ env.FLASHMLA_REF }}
+          path: FlashMLA
+          submodules: recursive
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build sgl-deep-gemm
+        if: matrix.package == 'deepgemm'
+        run: |
+          echo -n "$DEEPGEMM_VERSION" > DeepGEMM/sgl_deep_gemm/VERSION
+          chmod +x ./scripts/build_sgl_deep_gemm.sh ./scripts/rename_sgl_deep_gemm_whl.sh
+          ./scripts/build_sgl_deep_gemm.sh 3.12 13.4 "${{ github.workspace }}/DeepGEMM" "${{ matrix.arch }}"
+          mkdir -p dep-wheels && cp DeepGEMM/dist/*.whl dep-wheels/
+
+      - name: Build sgl-deep-ep
+        if: matrix.package == 'deepep'
+        env:
+          SGL_DEEP_EP_VERSION: ${{ env.DEEPEP_VERSION }}
+        run: |
+          bash scripts/build_sgl_deepep.sh 3.12 13.4 "${{ github.workspace }}/DeepEP-source" "${{ matrix.arch }}"
+          mkdir -p dep-wheels && cp DeepEP-source/dist/*.whl dep-wheels/
+
+      - name: Build sgl-flash-mla
+        if: matrix.package == 'flashmla'
+        run: |
+          echo -n "$FLASHMLA_VERSION" > FlashMLA/flash_mla/VERSION
+          chmod +x ./scripts/build_sgl_flash_mla.sh ./scripts/rename_sgl_flash_mla_whl.sh
+          ./scripts/build_sgl_flash_mla.sh 3.12 13.4 "${{ github.workspace }}/FlashMLA" "${{ matrix.arch }}" cu134
+          mkdir -p dep-wheels && cp FlashMLA/dist/*.whl dep-wheels/
+
+      - name: Check wheels target cu134
+        run: |
+          ls -l dep-wheels/
+          for w in dep-wheels/*.whl; do
+            case "$w" in *+cu134-*) ;; *) echo "::error::$w is not tagged +cu134"; exit 1 ;; esac
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dep-wheel-${{ matrix.package }}-${{ matrix.arch }}
+          path: dep-wheels/*.whl
+          if-no-files-found: error
