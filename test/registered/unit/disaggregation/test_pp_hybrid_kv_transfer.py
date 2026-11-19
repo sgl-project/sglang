@@ -146,6 +146,9 @@ class TestCompactNPUIndexerTransfer(CustomTestCase):
         for transport in (MooncakeKVManager, AscendKVManager):
             with self.subTest(transport=transport.__name__):
                 manager = _RecordingKVManager(prefill_start_layer=0, pp_size=1)
+                manager.attach(
+                    kv=source_ptrs, peer_kv=destination_ptrs, sessions=("peer",)
+                )
                 manager.is_mla_backend = True
                 manager.kv_args.kv_data_ptrs = source_ptrs
                 manager.kv_args.kv_item_lens = lengths
