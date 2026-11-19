@@ -32,6 +32,8 @@ curl http://localhost:30000/generate \
   }'
 ```
 
+`X-Session-ID` is accepted as a fallback for clients that cannot put `session_id` in the body. The body always wins; the header is ignored when the body carries `session_params`, and it is honoured on every route that builds a `session_id` field (`/generate`, `/v1/completions`, `/v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/invocations`). sgl-router forwards it.
+
 When a request finishes, SGLang automatically registers its reusable cache leaves under the `session_id`. This reference-only workflow does not require an `/open_session` call.
 
 Call `/close_session` when the application session ends, including error and cancellation paths:

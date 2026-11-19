@@ -18,6 +18,10 @@ pub fn should_forward_request_header(name: &HeaderName) -> bool {
             | "tracestate"
             // Set by `--dp-aware`; chat dispatch strips the client's copy.
             | "x-data-parallel-rank"
+            // Session identity (see `request_headers.apply_session_id_header`);
+            // the router also routes on this header, so a request routed by
+            // session must keep it on the way to the worker.
+            | "x-session-id"
     ) || n.starts_with("x-request-id-")
         || n.starts_with("x-sgl-")
         // SGLang response extensions (`x-sglext-return-input-ids`, ...), which
@@ -59,6 +63,11 @@ mod tests {
         )));
         assert!(should_forward_request_header(&HeaderName::from_static(
             "x-sglext-return-output-ids"
+        )));
+        // Session identity must survive the hop to the worker, or the engine cannot
+        // fill `session_id` from the header the client sent.
+        assert!(should_forward_request_header(&HeaderName::from_static(
+            "x-session-id"
         )));
 
         // Stripped headers
