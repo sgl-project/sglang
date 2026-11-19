@@ -13,10 +13,11 @@ loads and stores. The table is double-buffered by sequence parity: a rank can
 reuse a slot only after every rank has published the next call, which a rank
 does only after it has finished reading the previous call.
 
-Enabled by SGLANG_OPT_SCHEDULER_SHM_SYNC=1 (default off). Groups that span hosts
-keep the stock gloo path unless SGLANG_OPT_SCHEDULER_SHM_SYNC_MULTIHOST=1 is also
-set: then each host exchanges through shared memory and only the host leaders
-meet in one small gloo all_gather (HierTagExchange).
+Enabled by SGLANG_OPT_SCHEDULER_SHM_SYNC, which follows
+SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION when unset. Groups that span hosts keep
+the stock gloo path unless SGLANG_OPT_SCHEDULER_SHM_SYNC_MULTIHOST is also on: then
+each host exchanges through shared memory and only the host leaders meet in one
+small gloo all_gather (HierTagExchange).
 """
 
 from __future__ import annotations
@@ -43,6 +44,10 @@ _TAG_BITS = 23
 _VAL_BITS = 40
 _TAG_MASK = (1 << _TAG_BITS) - 1
 _VAL_MASK = (1 << _VAL_BITS) - 1
+
+# The PD decode exchange kinds, and what rides them, keep the stock path on a group
+# across more hosts.
+PD_DECODE_MAX_HOSTS = 2
 
 
 class ShmTagExchange:
@@ -196,11 +201,17 @@ class HierTagExchange:
     """ShmTagExchange.allgather for a group that spans hosts: ranks exchange through
     shared memory on their host, and only the host leaders run one gloo all_gather."""
 
-    def __init__(self, group: dist.ProcessGroup, kind: str, width: int = 8):
+    def __init__(
+        self,
+        group: dist.ProcessGroup,
+        kind: str,
+        width: int = 8,
+        hostnames: Optional[List[str]] = None,
+    ):
         ranks = dist.get_process_group_ranks(group)
         me = dist.get_rank(group)
-        hostnames: List[Optional[str]] = [None] * len(ranks)
-        dist.all_gather_object(hostnames, socket.gethostname(), group=group)
+        if hostnames is None:
+            hostnames = _group_hostnames(group)
         hosts = list(dict.fromkeys(hostnames))
         # Group ranks per host, in group-rank order (new_group keeps that order).
         self.members = [
@@ -258,15 +269,28 @@ class HierTagExchange:
         return table
 
 
+def _group_hostnames(group: dist.ProcessGroup) -> List[str]:
+    """Every group rank's hostname, in group-rank order (collective over the group)."""
+    hostnames: List[Optional[str]] = [None] * dist.get_world_size(group)
+    dist.all_gather_object(hostnames, socket.gethostname(), group=group)
+    return hostnames
+
+
 _EXCHANGES: Dict[tuple, object] = {}
 
 
 def get_shm_exchange(
-    group: Optional[dist.ProcessGroup], kind: str, multihost: bool = False
+    group: Optional[dist.ProcessGroup],
+    kind: str,
+    multihost: bool = False,
+    width: int = 8,
+    max_hosts: Optional[int] = None,
 ):
     """Collective on first call per (group, kind): every rank of the group must call it
     at the same point. Returns None (stock path) when disabled, under --sleep-on-idle,
-    or when the group spans hosts and the caller did not opt in with multihost=True."""
+    or when the group spans hosts and the caller did not opt in with multihost=True
+    (or it spans more than `max_hosts` hosts). `width`, the most values per call, is
+    fixed by the first call per (group, kind)."""
     if group is None:
         return None
     key = (id(group), kind)
@@ -283,7 +307,7 @@ def get_shm_exchange(
 
             same = in_the_same_node_as(group, source_rank=0)
             if all(same):
-                _EXCHANGES[key] = ShmTagExchange(group, kind)
+                _EXCHANGES[key] = ShmTagExchange(group, kind, width=width)
                 logger.info(
                     "Shared-memory exchange '%s' enabled for a %d-rank group",
                     kind,
@@ -296,16 +320,35 @@ def get_shm_exchange(
             ):
                 # Only when this group is the whole default group, so the subgroup
                 # creation inside is collective over exactly these ranks.
-                _EXCHANGES[key] = HierTagExchange(group, kind)
-                logger.info(
-                    "Hierarchical shared-memory exchange '%s' enabled for a %d-rank group on %d hosts",
-                    kind,
-                    dist.get_world_size(group),
-                    len(_EXCHANGES[key].members),
+                _EXCHANGES[key] = _hier_exchange(
+                    group, kind=kind, width=width, max_hosts=max_hosts
                 )
             else:
                 _EXCHANGES[key] = None
     return _EXCHANGES[key]
+
+
+def _hier_exchange(
+    group: dist.ProcessGroup, *, kind: str, width: int, max_hosts: Optional[int]
+) -> Optional[HierTagExchange]:
+    hostnames = _group_hostnames(group)
+    num_hosts = len(set(hostnames))
+    if max_hosts is not None and num_hosts > max_hosts:
+        logger.info(
+            "Shared-memory exchange '%s' keeps the stock path: %d hosts, at most %d",
+            kind,
+            num_hosts,
+            max_hosts,
+        )
+        return None
+    exchange = HierTagExchange(group, kind, width=width, hostnames=hostnames)
+    logger.info(
+        "Hierarchical shared-memory exchange '%s' enabled for a %d-rank group on %d hosts",
+        kind,
+        dist.get_world_size(group),
+        len(exchange.members),
+    )
+    return exchange
 
 
 def fold_u64(x: int) -> List[int]:
