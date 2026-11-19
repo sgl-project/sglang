@@ -181,8 +181,11 @@ class TestKimiK3SequenceParallel(CustomTestCase):
                     config = SimpleNamespace(
                         **{**vars(CONFIG), "is_kda_layer": lambda layer_idx: kda}
                     )
+                    # KDA heads span the full TP group only without an EP MoE.
                     with patch.object(
-                        kimi_k3, "linear_attn_parallel_group", return_value="tp"
+                        kimi_k3,
+                        "linear_attn_parallel_group",
+                        return_value="attn_tp" if sp_moe else "tp",
                     ):
                         declare({1: layer}, sp_moe=sp_moe, config=config, sp=True)
                     for boundary in (layer.attn_boundary, layer.ffn_boundary):
