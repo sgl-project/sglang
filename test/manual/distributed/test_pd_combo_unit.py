@@ -10,10 +10,9 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from sglang.srt.server_args import ServerArgs
 from sglang.srt.runtime_context import get_context, get_server_args
+from sglang.srt.server_args import ServerArgs
 from sglang.test.test_utils import CustomTestCase
-
 
 # ---------------------------------------------------------------------------
 # Helpers
