@@ -444,8 +444,6 @@ def retry(
             time.sleep(delay)
 
 
-
-
 def gc_object_counts():
     """O(1) replacement: use gc.get_count() instead of gc.get_objects().
 
