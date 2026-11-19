@@ -357,9 +357,38 @@ def handle_cuda_graph_persistence(server_args: Any):
                 "{save,load}"
             )
         return
+    # Decided before Foundry is activated: activation pins this process's environment.
+    if (
+        cfg.disable_cuda_graph
+        or cfg.disable_decode_cuda_graph
+        or cfg.cuda_graph_backend_decode == Backend.DISABLED
+    ):
+        logger.info(
+            "--cuda-graph-persistence is inactive: decode CUDA graphs are disabled, "
+            "so there is nothing to persist."
+        )
+        _drop_cuda_graph_persistence(server_args)
+        return
+    if cfg.enable_unified_memory:
+        logger.warning(
+            "--cuda-graph-persistence does not support --enable-unified-memory; "
+            "persistence is disabled and the server initializes natively."
+        )
+        _drop_cuda_graph_persistence(server_args)
+        return
     from sglang.srt.utils.foundry_adapter import activate_foundry
 
     activate_foundry(server_args).pin_server_args(server_args)
+
+
+def _drop_cuda_graph_persistence(server_args: Any) -> None:
+    # The record then resolves as without the flag, in this process and its spawns.
+    declare_resolution(
+        server_args,
+        "handle_cuda_graph_persistence",
+        cuda_graph_persistence=None,
+        cuda_graph_persistence_config=None,
+    )
 
 
 def validate_cuda_graph_persistence(server_args: Any):

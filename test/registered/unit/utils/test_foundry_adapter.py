@@ -106,6 +106,19 @@ def _graph_sa(**fields):
     return SimpleNamespace(**{**defaults, **fields})
 
 
+def _hook_sa(**fields):
+    # What the persistence hooks read of a record, at SGLang's defaults unless given.
+    defaults = dict(
+        vars(_graph_sa()),
+        cuda_graph_persistence="save",
+        cuda_graph_persistence_config=None,
+        disable_cuda_graph=False,
+        disable_decode_cuda_graph=False,
+        enable_unified_memory=False,
+    )
+    return SimpleNamespace(**{**defaults, **fields})
+
+
 def _pin_lines(api, server_args):
     # The ``[Foundry] pin:`` lines the adapter prints while pinning ``server_args``.
     with _installed(api), redirect_stderr(io.StringIO()) as err:
@@ -216,9 +229,36 @@ class TestFoundryAdapter(CustomTestCase):
         }
         self.assertEqual({name for name, _, _ in api.calls}, methods)
 
-    def test_unsupported_at_any_step_falls_back_natively(self):
-        """After ``Unsupported`` at any step, later calls no-op, capture is native once;
-        Foundry is told once, and spawns still pass its wrapper to tell the children."""
+    def test_unsupported_config_falls_back_natively(self):
+        """A config resolution rejects never activates Foundry, whose pins stay for good;
+        after Foundry's ``Unsupported`` at any step, later calls no-op, capture is native."""
+        from sglang.srt.arg_groups.cuda_graph_hook import (
+            handle_cuda_graph_persistence,
+            validate_cuda_graph_persistence,
+        )
+        from sglang.srt.arg_groups.model_override_base import resolving_view
+
+        for field, value in (
+            ("disable_cuda_graph", True),
+            ("disable_decode_cuda_graph", True),
+            ("cuda_graph_backend_decode", "disabled"),
+            ("enable_unified_memory", True),
+        ):
+            with self.subTest(rejected_at_resolution=field):
+                api = _fake_api()
+                server_args = _hook_sa(**{field: value})
+                with _installed(api):
+                    handle_cuda_graph_persistence(server_args)
+                    validate_cuda_graph_persistence(server_args)
+                    # A spawned process activates from the same record.
+                    self.assertFalse(activate_foundry(server_args).enabled)
+                self.assertEqual(api.calls, [])
+                self.assertIsNone(resolving_view(server_args).cuda_graph_persistence)
+        api = _fake_api()
+        with _installed(api):
+            handle_cuda_graph_persistence(_hook_sa())
+        self.assertIn("activate", [name for name, *_ in api.calls])
+
         before_spawn = ("activate", "pin_server_args", "validate_resolved_server_args")
         in_scope = ("capture_scope", "capture_one")
         for step in (
@@ -240,6 +280,7 @@ class TestFoundryAdapter(CustomTestCase):
                 self.assertEqual(loops, [1])
                 self.assertIsNone(captured)
                 self.assertEqual(replayed, "cfg" if step in in_scope else None)
+                # Foundry is told once; spawns still pass its wrapper to tell the children.
                 self.assertEqual(
                     [kw for name, _, kw in api.calls if name == "deactivate"],
                     [{"step": step, "reason": "fake reason", "quiet": False}],

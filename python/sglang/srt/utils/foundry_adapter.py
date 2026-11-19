@@ -276,6 +276,11 @@ def activate_foundry(server_args: Any) -> FoundryAdapter:
     activates Foundry once per process (see the process contract)."""
     global _active
     mode = server_args.cuda_graph_persistence
+    if mode in ("save", "load"):
+        from sglang.srt.arg_groups.model_override_base import resolving_view
+
+        # Resolution drops the flag where there is nothing to persist.
+        mode = resolving_view(server_args).cuda_graph_persistence
     # Only the two modes activate;
     # None, and any stand-in a test passes for server_args, run the no-op adapter.
     if mode not in ("save", "load"):
