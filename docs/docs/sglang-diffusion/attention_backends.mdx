@@ -85,7 +85,7 @@ For SGLang-native pipelines, the CLI accepts the lowercase names of `AttentionBa
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`sage_attn_3`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)", whiteSpace: "nowrap"}}>`SAGE_ATTN_3`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Requires SageAttention3 installed per upstream instructions.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>CUDA: requires SageAttention3 installed per upstream instructions. Intel XPU (Xe3P): SageAttention V3 from sgl-kernel-xpu (MXFP4) for batch-1, non-causal BF16 self-attention with head dim 128, no GQA and the default softmax scale; other layers, and every step under ring parallelism (<code>--ring-degree</code> &gt; 1), keep XPU flash attention. Without the kernel, or for non-BF16 models, it falls back to XPU flash attention. Configure via <code>--attention-backend-config</code>.</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`sparge_attn`</td>
@@ -594,6 +594,46 @@ Hybrid window attention constraints:
   </tbody>
 </table>
 
+**SageAttention V3 on Intel XPU (`sage_attn_3`)**
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "24%"}} />
+    <col style={{width: "14%"}} />
+    <col style={{width: "44%"}} />
+    <col style={{width: "18%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Parameter</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Type</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Description</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Default</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`sage_v3_kind`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`str`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`hybrid` (MXFP4 QK, MXFP8 PV) or `pure` (MXFP4 QK and PV). `pure` is faster and less accurate.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`hybrid`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`sage_v3_bf16_blocks`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`list[int]`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Transformer block indices whose self-attention stays on BF16 flash attention. Matches layers whose prefix contains `blocks.<N>.` (e.g. Wan); a layer without a block index is rejected at construction (startup, or the request that sets `--attention-backend-override sage_attn_3`). For Wan2.2-T2V-A14B use `[0, 33, 34, 38]`: with every block on MXFP4 the video is visibly grainy. In the `key=value` form, separate indices with `;` (e.g. `sage_v3_bf16_blocks=0;33;34;38`), since `,` separates pairs.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>none</td>
+    </tr>
+  </tbody>
+</table>
+
+```bash
+sglang generate --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers \
+  --attention-backend sage_attn_3 \
+  --attention-backend-config '{"sage_v3_kind": "pure", "sage_v3_bf16_blocks": [0, 33, 34, 38]}' \
+  --prompt "..."
+```
+
 **Sol-Attn (`sol_attn`)**
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
@@ -839,11 +879,11 @@ AITER quant constraints:
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`sage_attn_3`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Yes</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>No</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>No</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Yes</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>No</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>CUDA-only (optional dependency).</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>CUDA: optional dependency. XPU: Xe3P only, needs sgl-kernel-xpu with <code>sageattn_v3</code>; layer construction fails if the kernel cannot run on the device. Ring steps run XPU flash attention.</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`sparge_attn`</td>
