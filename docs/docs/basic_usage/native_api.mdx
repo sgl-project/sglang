@@ -80,7 +80,7 @@ The response includes `rid`, `cancellation_id`, `status`, `reason`, and `complet
 
 `retired` does not attest device-wide CUDA idleness, native preprocessing completion, or eviction of prefix-cache-owned KV pages. An ordinary generation terminal message or a disconnected HTTP waiter cannot establish retirement.
 
-Retries share the original captured request instance, even after generation output cleanup or reuse of the same `rid`. This also applies to `unknown` and `unsupported` results. Reusing a cancellation ID with a different `rid` returns HTTP 400. The process-local retry window is five minutes from the first operation; use a new cancellation ID for each new operation. Do not retry an old cancellation ID after that window or across a server restart. Receipt storage is bounded to 256 operations per tokenizer process; a full registry rejects new operations with HTTP 400 without canceling them. A wait timeout or client disconnect leaves the shared receipt intact.
+Retries share the original captured request instance, even after generation output cleanup or reuse of the same `rid`. This also applies to `unknown` and `unsupported` results. Reusing a cancellation ID with a different `rid` returns HTTP 400. The process-local retry window is five minutes from the first operation; use a new cancellation ID for each new operation. Do not retry an old cancellation ID after that window or across a server restart. Receipt storage is bounded to 256 operations per tokenizer process; completed receipts retain their bindings until expiry. A full registry rejects new operations with HTTP 400 without canceling them. A wait timeout or client disconnect leaves the shared receipt intact.
 
 ## Get Model Info
 

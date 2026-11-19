@@ -390,6 +390,15 @@ class TestSchedulerCancellationRetirement(CustomTestCase):
         self.assertEqual(entry.status, "retired")
         self.assertEqual(len(entry.replies), 1)
 
+        with patch(
+            "sglang.srt.managers.scheduler.CANCELLATION_RETIREMENT_MAX_ENTRIES", 1
+        ):
+            self._cancel(scheduler, req, "overflow")
+        self.assertEqual(self.outputs.pop()[0].reason, "receipt_capacity")
+        self.assertIs(
+            scheduler._cancellation_retirements[control.cancellation_id], entry
+        )
+
         entry.next_retry_at = 0.0
         scheduler._check_cancellation_retirements()
         self.assertEqual([out.status for out, _ in self.outputs], ["retired"])

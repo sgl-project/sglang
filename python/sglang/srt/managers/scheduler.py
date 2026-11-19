@@ -6579,17 +6579,9 @@ class Scheduler(
                 )
             return
         if len(entries) >= CANCELLATION_RETIREMENT_MAX_ENTRIES:
-            # Completed entries own no resources and can yield room for a new
-            # operation. Never evict an outstanding request's observation.
-            completed = next(
-                (key for key, value in entries.items() if value.status), None
-            )
-            if completed is None:
-                self._reply_cancellation_retirement(
-                    recv_req, "unknown", "receipt_capacity"
-                )
-                return
-            del entries[completed]
+            # Preserve completed bindings and any pending receipt deliveries.
+            self._reply_cancellation_retirement(recv_req, "unknown", "receipt_capacity")
+            return
         entry = _CancellationRetirement(
             rid=recv_req.rid,
             request_instance_id=recv_req.request_instance_id,
