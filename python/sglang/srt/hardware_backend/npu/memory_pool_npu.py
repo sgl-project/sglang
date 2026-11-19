@@ -854,10 +854,14 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self.indexer_quant = index_head_dim is not None and (
             self.indexer_kv_store_int8 or kv_capability.indexer_quant
         )
-        self.indexer_kv_dtype = torch.int8 if self.indexer_kv_store_int8 else kv_capability.indexer_kv_dtype
+        self.indexer_kv_dtype = (
+            torch.int8 if self.indexer_kv_store_int8 else kv_capability.indexer_kv_dtype
+        )
         self.indexer_store_dtype = self.indexer_kv_dtype
-        self.indexer_scale_dtype = torch.float16 if self.indexer_kv_store_int8 else (
-            kv_capability.indexer_scale_dtype if self.indexer_quant else None
+        self.indexer_scale_dtype = (
+            torch.float16
+            if self.indexer_kv_store_int8
+            else (kv_capability.indexer_scale_dtype if self.indexer_quant else None)
         )
         self.index_k_store_dtype = self.indexer_store_dtype
         self.index_k_scale_dtype = self.indexer_scale_dtype

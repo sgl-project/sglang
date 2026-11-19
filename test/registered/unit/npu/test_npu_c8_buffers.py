@@ -2,13 +2,11 @@
 
 import sys
 import unittest
-from enum import Enum
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
 
-import sglang.srt.utils.hf_transformers  # noqa: F401
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -120,11 +118,7 @@ class TestC8BufferContracts(CustomTestCase):
         self.assertTrue(all(pointers))
 
     def test_l2_bytes_and_roundtrip_follow_component_dtypes(self):
-        class Direction(Enum):
-            H2D = 1
-            D2H = 2
-
-        def exchange(**kwargs):
+        def exchange(backup, **kwargs):
             for name in ("k", "v", "index_k", "index_k_scale"):
                 device = kwargs["device_" + name]
                 host = kwargs["host_" + name]
@@ -134,7 +128,7 @@ class TestC8BufferContracts(CustomTestCase):
                 for dev, cpu in zip(
                     kwargs["device_indices"][::4], kwargs["host_indices"][::4]
                 ):
-                    if kwargs["direction"] == Direction.D2H:
+                    if backup:
                         host[int(cpu) // 4].copy_(device[:, int(dev) // 4])
                     else:
                         device[:, int(dev) // 4].copy_(host[int(cpu) // 4])
@@ -145,17 +139,17 @@ class TestC8BufferContracts(CustomTestCase):
                 for tensor in (pool.k_buffer, pool.v_buffer, pool.index_k_buffer):
                     tensor.fill_(7)
                 with (
-                    patch.object(mla, "_is_npu", True),
-                    patch.object(mla, "ascendc_io_enabled", return_value=False),
-                    patch.object(
-                        mla, "memfabric_host_memory_enabled", return_value=False
-                    ),
                     patch.object(mla, "make_kernel_ptr_table", return_value=None),
-                    patch.object(mla, "TransferDirection", Direction, create=True),
                     patch.object(
                         mla,
-                        "transfer_kv_dim_exchange",
-                        side_effect=exchange,
+                        "transfer_kv_all_layer_kv_split_lf_pf",
+                        side_effect=lambda **kwargs: exchange(True, **kwargs),
+                        create=True,
+                    ),
+                    patch.object(
+                        mla,
+                        "transfer_kv_per_layer_kv_split_pf_lf",
+                        side_effect=lambda **kwargs: exchange(False, **kwargs),
                         create=True,
                     ),
                     patch.dict(
@@ -167,8 +161,8 @@ class TestC8BufferContracts(CustomTestCase):
                         },
                     ),
                     patch(
-                        "sglang.srt.mem_cache.pool_host.base.host_memory_budget_bytes",
-                        return_value=1 << 40,
+                        "sglang.srt.mem_cache.pool_host.base.host_memory_preflight",
+                        return_value=(1 << 20, 1 << 40),
                     ),
                 ):
                     host = mla.MLATokenToKVPoolHost(
@@ -184,6 +178,7 @@ class TestC8BufferContracts(CustomTestCase):
                         end_layer=2,
                         target_layer_num=2,
                     )
+                    host._init_npu_transfer_bindings()
                     allocated = sum(
                         tensor.nbytes
                         for tensor in (
@@ -211,9 +206,10 @@ class TestC8BufferContracts(CustomTestCase):
                     )
                     for tensor in (pool.k_buffer, pool.v_buffer, pool.index_k_buffer):
                         tensor[:, 0].zero_()
-                    host.load_to_device_per_layer(
-                        pool, host_ids, device_ids, 0, "kernel_ascend"
-                    )
+                    for layer in range(pool.layer_num):
+                        host.load_to_device_per_layer(
+                            pool, host_ids, device_ids, layer, "kernel_ascend"
+                        )
                     for tensor in (pool.k_buffer, pool.v_buffer, pool.index_k_buffer):
                         self.assertTrue(torch.all(tensor == 7))
 

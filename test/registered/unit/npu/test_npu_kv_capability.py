@@ -21,7 +21,7 @@ register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 sys.modules.setdefault("sgl_kernel_npu", types.ModuleType("sgl_kernel_npu"))
 sys.modules.setdefault("torch_npu", MagicMock(name="torch_npu"))
 import sglang.srt.utils as _utils
-from sglang.srt.utils import common as _common_utils
+from sglang.srt.utils import device as _common_utils
 
 _real_is_npu = _common_utils.is_npu
 _real_utils_is_npu = _utils.is_npu
@@ -181,7 +181,7 @@ class TestConfigureKvCacheDtypeOnNpu(_NpuPatchedTestCase):
         with patch.object(kv_cache_dtype, "current_platform", platform):
             return configure_kv_cache_dtype(
                 server_args_kv_cache_dtype=server_args_kv_cache_dtype,
-                model=model,
+                quant_config=getattr(model, "quant_config", None),
                 model_dtype=torch.bfloat16,
                 is_draft_worker=is_draft_worker,
                 is_dflash=False,
@@ -207,16 +207,16 @@ class TestConfigureKvCacheDtypeOnNpu(_NpuPatchedTestCase):
 
     def test_bf16_and_auto_are_accepted_on_a2(self):
         self._use_npu(arch35=False)
-        self.assertEqual(self._configure("bf16"), (None, torch.bfloat16))
-        self.assertEqual(self._configure("auto"), (None, torch.bfloat16))
+        self.assertEqual(self._configure("bf16"), ("bf16", torch.bfloat16))
+        self.assertEqual(self._configure("auto"), ("auto", torch.bfloat16))
 
     def test_fp8_is_accepted_on_arch35(self):
         self._use_npu(arch35=True)
-        self.assertEqual(self._configure("fp8_e4m3"), (None, FP8))
+        self.assertEqual(self._configure("fp8_e4m3"), ("fp8_e4m3", FP8))
 
     def test_int8_is_accepted_on_a2(self):
         self._use_npu(arch35=False)
-        self.assertEqual(self._configure("int8"), (None, torch.int8))
+        self.assertEqual(self._configure("int8"), ("int8", torch.int8))
 
     def test_int8_on_arch35_is_a_startup_error(self):
         self._use_npu(arch35=True)
@@ -235,7 +235,7 @@ class TestConfigureKvCacheDtypeOnNpu(_NpuPatchedTestCase):
 
     def test_non_npu_platforms_are_not_checked(self):
         self._use_npu(arch35=False)
-        self.assertEqual(self._configure("fp8_e4m3", is_npu=False), (None, FP8))
+        self.assertEqual(self._configure("fp8_e4m3", is_npu=False), ("fp8_e4m3", FP8))
 
 
 class TestMlaKvCacheDim(_NpuPatchedTestCase):
@@ -377,7 +377,9 @@ class TestNpuIndexerSizing(_NpuPatchedTestCase):
         kvc = SimpleNamespace(
             kv_cache_dtype=dtype,
             model_config=SimpleNamespace(hf_config=None),
-            server_args=SimpleNamespace(enable_hisparse=False),
+            server_args=SimpleNamespace(
+                enable_hisparse=False, indexer_kv_cache_dtype=None
+            ),
             is_draft_worker=False,
         )
         with (
