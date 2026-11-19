@@ -272,7 +272,6 @@ impl ResponsesStream {
     /// `id`, else to the latest call with their `index`, so interleaved calls
     /// stay apart.
     fn tool_delta(&mut self, chunk: &Value, out: &mut Vec<u8>) {
-        self.last_held = false;
         let tool_index = chunk.get("index").and_then(Value::as_u64).unwrap_or(0);
         let name = chunk
             .pointer("/function/name")
@@ -291,6 +290,9 @@ impl ResponsesStream {
         let pos = match existing {
             Some(pos) => pos,
             None => {
+                // Only a new call follows held text in generation order; a
+                // continuing delta is the engine sending a step's text first.
+                self.last_held = false;
                 self.close_open(Finish::Completed, out);
                 let call = Call {
                     id: new_id("fc"),
@@ -1027,5 +1029,14 @@ mod tests {
             chunk(indexed(1, Some("g"), r#"{"y":"#), Some("length")),
         ]);
         assert_eq!(statuses(&evs), ["completed", "incomplete", "completed"]);
+        // The engine sends a step's text before the same step's tail of an
+        // earlier call, and the unstreamed tail of the last call after all
+        // text: a continuing delta does not make the call the latest item.
+        let evs = run(&[
+            chunk(indexed(0, Some("f"), r#"{"x":"#), None),
+            chunk(json!({"content": "after the call"}), None),
+            chunk(indexed(0, None, "1}"), Some("length")),
+        ]);
+        assert_eq!(statuses(&evs), ["completed", "incomplete"]);
     }
 }
