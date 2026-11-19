@@ -560,6 +560,7 @@ class TestDisaggregationWire(unittest.TestCase):
             num_draft_entries=0,
             kv_layer_ids=[],
             kv_item_lens=[],
+            draft_kv_ring_paged=False,
         )
         manager.is_mla_backend = True
         manager.is_hybrid_mla_backend = False
@@ -587,6 +588,51 @@ class TestDisaggregationWire(unittest.TestCase):
             )
         self.assertTrue(fully_checked)
         self.assertIsNone(reason)
+
+    def test_mooncake_mha_draft_kv_ring_needs_the_same_attn_tp(self):
+        for paged, dst_tp, rejected in ((True, 2, False), (True, 4, True)):
+            with self.subTest(paged=paged, dst_tp=dst_tp):
+                manager = object.__new__(MooncakeKVManager)
+                manager.kv_args = SimpleNamespace(
+                    state_types=[StateType.DRAFT_RING, StateType.REQUEST_ROW],
+                    state_data_ptrs=[[1000, 1100], [1200]],
+                    state_item_lens=[[256, 256], [4]],
+                    state_layer_ids=[[], []],
+                    num_draft_entries=0,
+                    kv_layer_ids=[],
+                    kv_item_lens=[],
+                    draft_kv_ring_paged=paged,
+                )
+                manager.is_mla_backend = False
+                manager.is_hybrid_mla_backend = False
+                manager.pp_size = 1
+                manager.state_tp_size = 2
+                manager.attn_tp_size = 2
+                registration_info = SimpleNamespace(
+                    mooncake_session_id="decode",
+                    dst_attn_tp_size=dst_tp,
+                    dst_draft_rows_dcp_collapsed=False,
+                    dst_kv_layer_ids=[],
+                    dst_kv_item_lens=[],
+                    dst_state_data_ptrs=[[2000, 2100], [3000]],
+                    dst_state_item_lens=[[256, 256], [4]],
+                    dst_state_layer_ids=[[], []],
+                    dst_dcp_size=1,
+                    requires_dcp_relayout=False,
+                )
+                with get_context().override_server_args(
+                    enable_unified_memory=False,
+                    speculative_algorithm="DFLASH",
+                ):
+                    fully_checked, reason = manager._validate_peer_state_layout(
+                        registration_info
+                    )
+                if rejected:
+                    self.assertFalse(fully_checked)
+                    self.assertIn("same attention TP size", reason)
+                else:
+                    self.assertTrue(fully_checked)
+                    self.assertIsNone(reason)
 
     def test_mooncake_rejects_a_decode_kv_page_stride_at_registration(self):
         """A decode KV pool with another page stride is rejected at registration.
@@ -1416,6 +1462,7 @@ class TestDFlashDraftKVRingRegistration(unittest.TestCase):
 
     def test_a_ring_registers_its_rows_and_floor_last(self):
         ring = SimpleNamespace(
+            paged=False,
             ring_buf_infos=lambda: ([0x2000, 0x3000], [5760, 5760], [576, 576]),
             floor_buf_infos=lambda: ([0x4000], [136], [4]),
         )
@@ -1426,6 +1473,10 @@ class TestDFlashDraftKVRingRegistration(unittest.TestCase):
         )
         self.assertEqual(kv_args.state_data_ptrs[1:], [[0x2000, 0x3000], [0x4000]])
         self.assertEqual(kv_args.state_item_lens[1:], [[576, 576], [4]])
+        self.assertFalse(kv_args.draft_kv_ring_paged)
+        ring.paged = True
+        self.assertTrue(self._register(ring).draft_kv_ring_paged)
+        self.assertFalse(self._register(None).draft_kv_ring_paged)
 
 
 class TestCPReplicatedStateTransfer(unittest.TestCase):

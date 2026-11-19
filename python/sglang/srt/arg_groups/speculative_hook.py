@@ -717,7 +717,8 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                     "DSpark DP MoE or prefill coordination requires "
                     "SGLANG_RAGGED_VERIFY_MODE=static."
                 )
-        if cfg.attn_cp_size > 1:
+
+        if not _is_npu and cfg.attn_cp_size > 1:
             raise ValueError(
                 "DSpark with dp attention does not support context parallel "
                 f"(attn_cp_size={cfg.attn_cp_size})."
@@ -1051,6 +1052,14 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
                 fallback_backend,
             )
             draft_backend = fallback_backend
+    if get_platform().is_gfx95:
+        from sglang.srt.layers.attention.triton_draft_hip import check_dcp_mla_draft
+        from sglang.srt.speculative.dflash_draft_ring import (
+            dflash_draft_reads_rows_by_position,
+        )
+
+        if dflash_draft_reads_rows_by_position(draft_backend, cfg.dcp_size):
+            check_dcp_mla_draft(_load_draft_hf_config(cfg))
     # FIXME: avoid overriding server args directly; pass the resolved draft
     # backend to the draft worker explicitly instead.
     declare_resolution(
@@ -1062,6 +1071,9 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
 
 def _resolve_dflash_mla_draft_window(server_args: ServerArgs) -> None:
     """Runs after the draft backend is final, which it reads."""
+    from sglang.srt.speculative.dflash_draft_ring import (
+        dflash_draft_reads_rows_by_position,
+    )
     from sglang.srt.speculative.dflash_utils import (
         parse_dflash_draft_config,
         resolve_mla_draft_compact_window,
@@ -1071,7 +1083,9 @@ def _resolve_dflash_mla_draft_window(server_args: ServerArgs) -> None:
     window_size = cfg.speculative_draft_window_size
     if window_size is None:
         return
-    if cfg.speculative_draft_attention_backend not in DFLASH_MLA_ONLY_DRAFT_BACKENDS:
+    if not dflash_draft_reads_rows_by_position(
+        cfg.speculative_draft_attention_backend, cfg.dcp_size
+    ):
         return
     draft_hf_config = _load_draft_hf_config(cfg)
     if not parse_dflash_draft_config(draft_hf_config=draft_hf_config).is_mla:
@@ -1104,9 +1118,7 @@ def _resolve_dflash_draft_kv_ring(server_args: ServerArgs) -> None:
         draft_kv_ring_unsupported_reason,
     )
 
-    switch = envs.SGLANG_ENABLE_DFLASH_DRAFT_KV_RING
-    if not switch.get():
-        logger.info("DFLASH draft KV ring: off, SGLANG_ENABLE_DFLASH_DRAFT_KV_RING=0.")
+    if not envs.SGLANG_ENABLE_DFLASH_DRAFT_KV_RING.get():
         return
     cfg = resolving_view(server_args)
     reason = draft_kv_ring_unsupported_reason(
@@ -1119,13 +1131,13 @@ def _resolve_dflash_draft_kv_ring(server_args: ServerArgs) -> None:
         ),
         enable_unified_memory=cfg.enable_unified_memory,
         dcp_size=cfg.dcp_size,
+        attn_cp_size=cfg.attn_cp_size,
+        enable_dp_attention=attn_dp_enabled_of(cfg),
         draft_window_size=cfg.speculative_draft_window_size,
+        is_cuda=current_platform.is_cuda(),
     )
     if reason is not None:
-        if switch.is_set():
-            raise ValueError(f"SGLANG_ENABLE_DFLASH_DRAFT_KV_RING=1, but {reason}.")
-        logger.info("DFLASH draft KV ring: off, %s.", reason)
-        return
+        raise ValueError(f"SGLANG_ENABLE_DFLASH_DRAFT_KV_RING=1, but {reason}.")
     logger.info("DFLASH draft KV ring: on.")
     declare_resolution(
         server_args,

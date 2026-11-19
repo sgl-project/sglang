@@ -27,6 +27,7 @@ from transformers import PretrainedConfig
 from transformers.utils import cached_file
 
 from sglang.srt.arg_groups.model_override_base import resolving_view
+from sglang.srt.beam_search.trie_config import TRIE_OUTPUT_HEAD_FILENAME
 from sglang.srt.configs.bailing_hybrid import is_bailing_multi_gate_enabled
 from sglang.srt.configs.embedding_model_spec import resolve_embedding_model_spec
 from sglang.srt.configs.ernie55 import (
@@ -220,6 +221,26 @@ def is_deepseek_dsa(config) -> bool:
         )
         and _hf_attr(config, "index_topk") is not None
     ) or is_kimi_k31(config)
+
+
+def is_q8_raw_fp8_nope_layout(
+    *,
+    prefill_backend: Optional[str],
+    decode_backend: Optional[str],
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+) -> bool:
+    """Whether Q8 prefill and TileLang decode can share raw 512-byte FP8 rows.
+
+    This checks consumers and geometry, not the model name. Callers validate
+    dtype, device and incompatible serving options separately.
+    """
+    return (
+        prefill_backend == "flashmla_sparse_q8"
+        and decode_backend == "tilelang"
+        and kv_lora_rank == 512
+        and qk_rope_head_dim == 0
+    )
 
 
 def dsa_draft_shards_under_dcp(config, dcp_size: int) -> bool:
@@ -816,6 +837,7 @@ class ModelConfig:
                 "Llama4ForConditionalGeneration",
                 "Step3VLForConditionalGeneration",
                 "InklingForConditionalGeneration",
+                "Inkling2ForConditionalGeneration",
             ]
             if (
                 self.hf_config.architectures[0] in mm_disabled_models
@@ -1094,7 +1116,9 @@ class ModelConfig:
             ),
             model_override_args=cfg.json_model_override_args,
             is_embedding=cfg.is_embedding,
-            enable_multimodal=cfg.enable_multimodal,
+            enable_multimodal=(
+                False if cfg.disable_multimodal else cfg.enable_multimodal
+            ),
             dtype=cfg.dtype,
             quantization=quantization,
             model_impl=cfg.model_impl,
@@ -1257,6 +1281,19 @@ class ModelConfig:
                 )
         if (
             is_draft_model
+            and self.hf_config.architectures[0] == "Inkling2ForConditionalGeneration"
+        ):
+            from sglang.srt.configs.inkling2 import Inkling2MTPConfig
+
+            if self.speculative_algorithm not in (None, "DSPARK"):
+                raise ValueError("Inkling2 MTP requires --speculative-algorithm DSPARK")
+            if self.quantization is not None and self.is_draft_quantization_explicit:
+                raise ValueError("Inkling2 MTP uses its checkpoint BF16 precision")
+            self.quantization = None
+            self.hf_config = Inkling2MTPConfig.from_target(self.hf_config)
+            self.hf_text_config = self.hf_config
+        if (
+            is_draft_model
             and self.hf_config.architectures[0] == "GigaChat35ForCausalLM"
         ):
             self.hf_config.architectures[0] = "GigaChat35ForCausalLMNextN"
@@ -1398,6 +1435,7 @@ class ModelConfig:
             "EmbeddingGemma2Model",
             "InklingForConditionalGeneration",
             "InklingForConditionalGenerationMTP",
+            "Inkling2ForConditionalGeneration",
             "Gemma4UnifiedForConditionalGeneration",
             "DiffusionGemmaForBlockDiffusion",
         ]
@@ -1795,6 +1833,12 @@ class ModelConfig:
         # Use vision_vocab_size for lm_head, LogitsProcessor, and graph-mode logits buffers.
         if _hf_arch(self.hf_config) == "GlmImageForConditionalGeneration":
             self.vocab_size = self.hf_text_config.vision_vocab_size
+        self.token_id_vocab_size = self.vocab_size
+        if _hf_arch(self.hf_config) in {
+            "Inkling2ForConditionalGeneration",
+            "Inkling2ForConditionalGenerationMTP",
+        }:
+            self.vocab_size = self.hf_text_config.padded_vocab_size
 
     def _init_mla_scaling(self, rope_scaling: Optional[dict]) -> None:
         """Base MLA attention scale from the head dims, then the rope mscale."""
@@ -1910,6 +1954,8 @@ class ModelConfig:
 
     # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
     def _parse_quant_hf_config(self):
+        if self.hf_config.architectures == ["Inkling2ForConditionalGenerationMTP"]:
+            return None
         quant_cfg = _quant_config_to_dict(
             getattr(self.hf_config, "quantization_config", None)
         )
@@ -2032,6 +2078,8 @@ class ModelConfig:
 
             {"quant_algo": "FP8", "quant_method": "modelopt", ...}
         """
+        if quant_config_dict.get("quant_method") == "inkling2":
+            return quant_config_dict
         json_quant_configs = unwrap_modelopt_quantization_config(quant_config_dict)
         if not json_quant_configs:
             return None
@@ -2440,7 +2488,9 @@ class ModelConfig:
             # with statement to avoid closing the client.
             client = create_remote_connector(self.model_path)
             if is_remote_url(self.model_path):
-                client.pull_files(allow_pattern=["*config.json"])
+                client.pull_files(
+                    allow_pattern=["*config.json", f"*{TRIE_OUTPUT_HEAD_FILENAME}"]
+                )
                 self.model_weights = self.model_path
                 self.model_path = client.get_local_dir()
 
@@ -2641,6 +2691,7 @@ multimodal_model_archs = [
     "KimiVLForConditionalGeneration",
     "LocateAnythingForConditionalGeneration",
     "InternVLChatModel",
+    "Inkling2ForConditionalGeneration",
     "InternS1ForConditionalGeneration",
     "InternS1ProForConditionalGeneration",
     "Phi4MMForCausalLM",
