@@ -1190,10 +1190,11 @@ def _read_tensors(
         (size,) = struct.unpack("<Q", f.read(8))
         header = json.loads(f.read(size))
     header.pop("__metadata__", None)
-    plan, todo = [], collections.deque()
+    plan, todo, nbytes = [], collections.deque(), 0
     for name in sorted(header):
         info = header[name]
-        begin, end = (8 + size + o for o in info["data_offsets"])
+        begin, end = info["data_offsets"]
+        begin, end = begin + 8 + size, end + 8 + size
         peers = readers(name, end - begin, info["shape"])
         if peers is None:
             continue
@@ -1204,35 +1205,44 @@ def _read_tensors(
             and math.prod(info["shape"]) * dtype.itemsize == end - begin > 0
         )
         plan.append((name, read, dtype, info["shape"]))
-        if read:
-            todo.append((begin, end))
+        if read:  # One read task per 4 MiB or more of consecutive tensors.
+            if not todo or nbytes >= 1 << 22:
+                todo.append([])
+                nbytes = 0
+            todo[-1].append((begin, end))
+            nbytes += end - begin
 
-    def pread(fd: int, begin: int, end: int) -> torch.Tensor:
-        data = torch.empty(end - begin, dtype=torch.uint8)
-        view, done = memoryview(data.numpy()), 0
-        while done < end - begin:
-            n = os.preadv(fd, [view[done:]], begin + done)
-            if n == 0:
-                raise EOFError(f"{path} ends before byte {end}")
-            done += n
-        return data
+    def pread(fd: int, ranges: List[Tuple[int, int]]) -> List[torch.Tensor]:
+        tensors = []
+        for begin, end in ranges:
+            data = torch.empty(end - begin, dtype=torch.uint8)
+            view, done = memoryview(data.numpy()), 0
+            while done < end - begin:
+                n = os.preadv(fd, [view[done:]], begin + done)
+                if n == 0:
+                    raise EOFError(f"{path} ends before byte {end}")
+                done += n
+            tensors.append(data)
+        return tensors
 
     with (
         safetensors.safe_open(path, framework="pt", device="cpu") as mapped,
         open(path, "rb") as f,
         concurrent.futures.ThreadPoolExecutor(num_threads) as pool,
     ):
-        pending, ahead = collections.deque(), 0
+        pending, ready, ahead = collections.deque(), collections.deque(), 0
         for name, read, dtype, shape in plan:
             if not read:
                 yield name, mapped.get_tensor(name)
                 continue
-            while todo and (not pending or ahead < max_bytes_ahead):
-                begin, end = todo.popleft()
-                pending.append(pool.submit(pread, f.fileno(), begin, end))
-                ahead += end - begin
-            data = pending.popleft().result()
-            ahead -= data.numel()
+            if not ready:
+                while todo and (not pending or ahead < max_bytes_ahead):
+                    ranges = todo.popleft()
+                    pending.append(pool.submit(pread, f.fileno(), ranges))
+                    ahead += sum(end - begin for begin, end in ranges)
+                ready.extend(pending.popleft().result())
+                ahead -= sum(data.numel() for data in ready)
+            data = ready.popleft()
             yield name, data.view(dtype).view(shape)
 
 
@@ -1338,10 +1348,13 @@ def _prefetch_all_checkpoints(
     if readers is None or (
         sum(map(os.path.getsize, sorted_files))
         <= 0.9 * psutil.virtual_memory().available
-        and not any(
-            len(readers(k, end - begin, shape) or ()) > 2
-            for path in sorted_files
-            for k, (begin, end, shape) in _safetensors_offsets(path).items()
+        and not (
+            getattr(readers, "stacked", False)
+            and any(
+                len(readers(k, end - begin, shape) or ()) > 2
+                for path in sorted_files
+                for k, (begin, end, shape) in _safetensors_offsets(path).items()
+            )
         )
     ):
         my_files = [(path, None) for path in sorted_files[local_rank::local_world_size]]

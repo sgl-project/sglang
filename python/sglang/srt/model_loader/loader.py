@@ -493,6 +493,7 @@ def _checkpoint_tensor_readers(
             return expert_peers
         return None
 
+    readers.stacked = stacked  # Whether a checkpoint may stack experts.
     return readers
 
 
