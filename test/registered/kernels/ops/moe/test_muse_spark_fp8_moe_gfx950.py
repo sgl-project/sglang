@@ -277,6 +277,14 @@ class TestMuseSparkFp8MoE(CustomTestCase):
             with self.subTest(m=m):
                 self.check_stages(m, gen)
 
+    def test_stages_at_prefill_slot_widths(self):
+        """2048 tokens x top-8 = 16384 routed slots: the width from which the Muse alignment switches to its Triton
+        kernel (``ALIGN_TRITON_MIN``), as every sequence-parallel prefill does."""
+        from sglang.srt.rocm_muse_spark.muse_moe_triton import ALIGN_TRITON_MIN
+
+        self.assertEqual(2048 * TOP_K, ALIGN_TRITON_MIN)
+        self.check_stages(2048, torch.Generator().manual_seed(4))
+
     def test_eps_dominant_and_unnormalized_finalize(self):
         """Expert outputs with RMS ~1e-3 against eps = 1e-5 (the norm no longer cancels scale or routed-weight
         errors), and the has_norm=False combine."""

@@ -489,6 +489,19 @@ class TestPtpcFp8Loading(CustomTestCase):
                     intermediate_size=MOE_INTER,
                 )
 
+    def test_fp8_experts_refuse_other_ocp_fp8_archs(self):
+        """Only gfx950 is supported: gfx1250's expert placement moves expert weights but not their scales."""
+        from sglang.srt.rocm_muse_spark import muse_moe_fp8
+
+        # Hardware capability boundary: the query answers for the GPU, not for the checkpoint.
+        with patch.object(muse_moe_fp8, "is_gfx95_supported", return_value=False):
+            with self.assertRaisesRegex(ValueError, "supported on gfx950 only"):
+                muse.MuseSpark1xFp8Experts(
+                    num_local_experts=2,
+                    expert_hidden_size=MOE_HIDDEN,
+                    intermediate_size=MOE_INTER,
+                )
+
     def test_fp8_experts_refuse_padded_k_without_aiter(self):
         """Without aiter the generic MoE wrapper subtracts SGLANG_MOE_PADDING from K; Muse weights are unpadded."""
         from sglang.kernels.ops.moe import fused_moe_triton_kernels as wrapper

@@ -33,6 +33,7 @@ from sglang.srt.rocm_muse_spark.muse_moe_triton import (
     finalize_norm_weighted_sum_kernel,
     moe_align_block_size,
 )
+from sglang.srt.utils import is_gfx95_supported
 
 # MI350X (gfx950) tile sweep 2026-11-02 at EP8 shapes (32 local experts,
 # K = I = H = 4096, top-8), graph replay. Buckets by routed rows = M * top_k; one
@@ -94,12 +95,15 @@ def pick_configs(rows: int) -> tuple[dict, dict]:
 
 
 def check_moe_fp8_supported() -> None:
-    """The serialized weights are OCP e4m3fn (gfx950); e4m3fnuz GPUs would need a
-    conversion this path does not do. Without aiter the generic wrapper subtracts
-    the MoE padding from K (``SGLANG_MOE_PADDING``); Muse expert weights are
-    unpadded, so K would shrink."""
+    """The serialized weights are OCP e4m3fn; e4m3fnuz GPUs would need a conversion
+    this path does not do. Other OCP-FP8 archs are refused too: gfx1250's expert
+    placement (``expert_placement``) swaps expert weights without their per-channel
+    scales. Without aiter the generic wrapper subtracts the MoE padding from K
+    (``SGLANG_MOE_PADDING``); Muse expert weights are unpadded, so K would shrink."""
     if is_fp8_fnuz():
         raise ValueError("Quark PTPC-FP8 Muse experts need OCP FP8 e4m3fn (gfx950)")
+    if not is_gfx95_supported():
+        raise ValueError("Quark PTPC-FP8 Muse experts are supported on gfx950 only")
     wrapper = fused_moe_triton_kernels
     padded = 0 if wrapper._use_aiter else wrapper.padding_size
     if padded:
