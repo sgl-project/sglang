@@ -178,6 +178,92 @@ class ShardedLogitsView(msgspec.Struct, frozen=True):
 LocalKeysFn = Callable[[ShardedLogitsView], Optional[torch.Tensor]]
 
 
+class GatheredLogitsView(msgspec.Struct, frozen=True):
+    """Borrowed full-vocabulary verify logits for a provider target sampler.
+
+    ``values`` is floating ``[rows, vocab]`` on one device with unit last stride,
+    the same on every rank of the attention-TP group, and read-only: logprobs are
+    computed from it after verification. ``temperatures`` is contiguous float32
+    ``[rows]`` on the same device. The runtime offers a view only for a top-1
+    chain under the exact accept rule whose rows sample at their temperature
+    alone: no top-k, top-p or min-p, penalty, logit bias, request seed, grammar or
+    watermark.
+
+    A policy returns contiguous int64 ``[rows]`` target token ids, each drawn from
+    ``softmax(values / temperature)`` of its row, on ``values.device`` without any
+    collective or host synchronization; or ``None`` before consuming RNG, and the
+    stock sampler handles the round. The choice must be identical on every rank
+    and may use only rank-uniform facts such as ``values.shape`` and dtype; a
+    round captured in a CUDA graph replays the choice made at capture.
+    """
+
+    values: torch.Tensor
+    temperatures: torch.Tensor
+
+
+GatheredTokensFn = Callable[[GatheredLogitsView], Optional[torch.Tensor]]
+
+
+class VerifyShardHeadView(msgspec.Struct, frozen=True):
+    """Borrowed inputs of a target verify's LM head over this rank's vocabulary shard.
+
+    ``weight`` is the plain ``[shard_rows, hidden]`` head shard and
+    ``hidden_states`` is ``[rows, hidden]`` in ``weight.dtype`` on its device.
+    ``out`` is ``None`` or a contiguous ``[rows, shard_rows]`` buffer of
+    ``weight.dtype`` on the same device. A head returns
+    ``hidden_states @ weight.T`` as ``[rows, shard_rows]`` in ``weight.dtype``,
+    written into ``out`` when one is given, without any collective; or ``None``,
+    and the runtime's GEMM runs.
+    """
+
+    hidden_states: torch.Tensor
+    weight: torch.Tensor
+    out: Optional[torch.Tensor]
+
+
+VerifyShardHeadFn = Callable[[VerifyShardHeadView], Optional[torch.Tensor]]
+
+
+class DraftAttentionView(msgspec.Struct, frozen=True):
+    """Borrowed operands of one EAGLE draft attention call on an FP8 KV cache.
+
+    The runtime offers a draft worker's decode (``q_len`` 1) and draft-extend calls of
+    ``q_len`` rows a request after it wrote the call's K / V rows into the layer's
+    pool, as its own attention does first. ``q`` is the call's FP8 E4M3 query
+    ``[rows, q_heads * head_dim]``; ``rows`` may exceed ``requests * q_len``, and the
+    rows past it belong to no request. ``k_pool`` / ``v_pool`` are the layer's FP8 KV
+    pools as the runtime keeps them, in pages of ``page_size`` slots;
+    ``page_table`` is int32 ``[requests, pages]`` and ``cache_seqlens`` int32
+    ``[requests]``, this call's rows included. ``k_scale`` / ``v_scale`` are the
+    layer's scalar KV scales (the query is unscaled) and ``layer`` is the attention
+    layer, read-only. ``step`` is shared by every layer's call of one forward and by
+    no other forward; a provider may key per-forward work on its identity only.
+
+    An attention returns ``[rows, q_heads * head_dim]`` in ``out_dtype`` on ``q``'s
+    device, zero past ``requests * q_len``, or ``None``, and the runtime's attention
+    runs over the written pool. The choice may use only rank-uniform facts such as
+    shapes, dtypes and the layer, so every rank of the attention-TP group makes the
+    same one, with no host synchronization; a call captured in a CUDA graph replays
+    the choice made at capture.
+    """
+
+    layer: Any
+    q: torch.Tensor
+    k_pool: torch.Tensor
+    v_pool: torch.Tensor
+    k_scale: float
+    v_scale: float
+    page_size: int
+    page_table: torch.Tensor
+    cache_seqlens: torch.Tensor
+    q_len: int
+    out_dtype: torch.dtype
+    step: Any
+
+
+DraftAttentionFn = Callable[[DraftAttentionView], Optional[torch.Tensor]]
+
+
 class VerifyLogitsView(Protocol):
     """The mutable logits fields consumed by the stock verifier.
 
@@ -368,23 +454,33 @@ class PostVerifyOutput(msgspec.Struct, frozen=True):
     accepted_indices: torch.Tensor
 
 
-VerifyRunner = Callable[[PostVerifyIO, LocalKeysFn], PostVerifyOutput]
+# (io, local_keys) -> output; a strategy with a gathered sampler also passes it as
+# the keyword gathered_tokens
+VerifyRunner = Callable[..., PostVerifyOutput]
 
 
 class PostVerifyStrategy(msgspec.Struct, frozen=True):
-    """Runtime verifier plus the provider-replaceable local key builder."""
+    """Runtime verifier plus the provider-replaceable sampling policies."""
 
     run: VerifyRunner
     local_keys: LocalKeysFn
+    # None keeps the stock sampler on gathered temperature rows
+    gathered_tokens: Optional[GatheredTokensFn] = None
 
     def __call__(self, io: PostVerifyIO) -> PostVerifyOutput:
-        return self.run(io, self.local_keys)
+        if self.gathered_tokens is None:
+            return self.run(io, self.local_keys)
+        return self.run(io, self.local_keys, gathered_tokens=self.gathered_tokens)
 
 
 class SpeculativeRuntimeHooks(msgspec.Struct, frozen=True):
     """The provider-adjustable strategy around speculative verification."""
 
     post_verify: PostVerifyStrategy
+    # None keeps the runtime's GEMM for the sharded verify's LM head
+    verify_shard_head: Optional[VerifyShardHeadFn] = None
+    # None keeps the runtime's attention on the draft worker's calls
+    draft_attention: Optional[DraftAttentionFn] = None
 
 
 HooksFactory = Callable[[SpeculativeRuntimeHooks], SpeculativeRuntimeHooks]
@@ -434,8 +530,10 @@ class BuiltMegakernel(Protocol):
     when it provides no factory. A target's factory receives SGLang's stock bundle
     and returns a bundle. SGLang selects it only under the independent
     runtime-optimization master switch and otherwise keeps the caller's stock
-    strategies unchanged. A provider may replace only the local key builder within
-    post-verify; the runtime runner remains authoritative.
+    strategies unchanged. Within post-verify a provider may replace the local key
+    builder and add a gathered-logits sampler, and it may add a verify-shard head
+    and a draft attention (DraftAttentionView); the runtime runner remains
+    authoritative.
     """
 
     widths: tuple[int, ...]  # the rows it built, possibly fewer than requested

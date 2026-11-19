@@ -72,10 +72,15 @@ from sglang.srt.utils import is_flashinfer_available, print_info_once
 
 logger = logging.getLogger(__name__)
 
+# (decode, requests, rows a request, rows, taken) of the draft calls offered to a
+# provider attention that were already logged
+_DRAFT_ATTENTION_NOTED: set = set()
+
 if is_flashinfer_available():
     import flashinfer
 
 if TYPE_CHECKING:
+    from sglang.kernels.plugin_kernels.nvidia.spec import DraftAttentionFn
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.dflash_draft_ring import DFlashDraftKVRing
@@ -326,6 +331,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.is_draft_runner = model_runner.is_draft_worker
         self._verify_mask: Optional[VerifyMask] = None
+        # set_draft_attention: a provider attention offered this draft instance's calls
+        self._draft_attention: Optional[DraftAttentionFn] = None
 
         self._nvfp4_fp8_output = None
         if self.uses_trtllm_gen_native_fp4:
@@ -1207,6 +1214,108 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         """Get the fill value for sequence lengths in CUDA graph."""
         return 1
 
+    def set_draft_attention(self, attention: Optional[DraftAttentionFn]) -> bool:
+        """Offer this draft worker instance's decode and draft-extend calls on the
+        fused FP8 KV path to a provider attention (spec.DraftAttentionView), or keep
+        them with None; returns whether this instance offers them."""
+        offers = (
+            attention is not None
+            and self.is_draft_runner
+            and self.data_type == torch.float8_e4m3fn
+            and not self.is_nvfp4_kvcache
+            and not self.is_xqa_impl
+        )
+        self._draft_attention = attention if offers else None
+        return offers
+
+    def _draft_attention_q_len(
+        self,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        layer: RadixAttention,
+        forward_batch: Optional[ForwardBatch],
+        save_kv_cache: bool,
+        sinks: Optional[torch.Tensor],
+        *,
+        decode: bool,
+    ) -> int:
+        """The rows a request of a call the provider attention may take, else 0: a
+        decode, or a draft extend of even rows, that writes its K / V on the fused
+        FP8 path. Shapes and configuration only, so every rank decides alike."""
+        from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
+
+        if (
+            forward_batch is None
+            or get_in_autotune_dummy_run()
+            or not self._should_use_fused_fp8_path(save_kv_cache, k, forward_batch)
+            or v is None
+            or sinks is not None
+            or layer.attn_type == AttentionType.ENCODER_ONLY
+        ):
+            return 0
+        if decode:
+            return 1
+        metadata = self.forward_metadata
+        if (
+            forward_batch.forward_mode.is_draft_extend_v2()
+            and not metadata.is_ragged_verify
+        ):
+            return metadata.max_seq_len_q
+        return 0
+
+    def _offer_draft_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        kwargs: dict,
+        *,
+        q_len: int,
+        decode: bool,
+    ) -> torch.Tensor:
+        """Write the call's K / V rows and FP8 query as the fused path does, then offer
+        them to the provider attention; where it declines, this backend's attention
+        runs over the written pool."""
+        from sglang.kernels.plugin_kernels.nvidia.spec import DraftAttentionView
+
+        q8 = self._fused_fp8_qkv_kv_cache(q, k, v, layer, forward_batch)
+        k_pool, v_pool = self.kv_layers.read(layer.layer_id).kv()
+        metadata = self.forward_metadata
+        o = self._draft_attention(
+            DraftAttentionView(
+                layer=layer,
+                q=q8,
+                k_pool=k_pool,
+                v_pool=v_pool,
+                k_scale=self._get_scalar_scale(layer, "k_scale_float", "k_scale"),
+                v_scale=self._get_scalar_scale(layer, "v_scale_float", "v_scale"),
+                page_size=self.page_size,
+                page_table=self._get_layer_page_table(layer, forward_batch),
+                cache_seqlens=metadata.cache_seqlens_int32,
+                q_len=q_len,
+                out_dtype=self.q_data_type,
+                step=forward_batch,
+            )
+        )
+        requests = int(metadata.cache_seqlens_int32.shape[0])
+        key = (decode, requests, q_len, q8.shape[0], o is not None)
+        if key not in _DRAFT_ATTENTION_NOTED:
+            _DRAFT_ATTENTION_NOTED.add(key)
+            logger.info(
+                "TRT-LLM MHA draft %s of %d requests x %d rows (%d rows): %s",
+                "decode" if decode else "extend",
+                requests,
+                q_len,
+                q8.shape[0],
+                "the provider attention" if o is not None else "stock attention",
+            )
+        if o is not None:
+            return o
+        attend = self.forward_decode if decode else self.forward_extend
+        return attend(q8, None, None, layer, forward_batch, False, **kwargs)
+
     def _should_use_fused_fp8_path(
         self, save_kv_cache: bool, k: torch.Tensor, forward_batch: ForwardBatch
     ) -> bool:
@@ -1792,6 +1901,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         **kwargs,
     ) -> torch.Tensor:
         """Run forward for decode using TRTLLM MHA kernel."""
+        if self._draft_attention is not None and self._draft_attention_q_len(
+            k, v, layer, forward_batch, save_kv_cache, kwargs.get("sinks"), decode=True
+        ):
+            return self._offer_draft_attention(
+                q, k, v, layer, forward_batch, kwargs, q_len=1, decode=True
+            )
 
         use_fused_fp8_path = self._should_use_fused_fp8_path(
             save_kv_cache, k, forward_batch
@@ -1893,6 +2008,20 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         save_kv_cache=True,
         **kwargs,
     ):
+        if self._draft_attention is not None:
+            q_len = self._draft_attention_q_len(
+                k,
+                v,
+                layer,
+                forward_batch,
+                save_kv_cache,
+                kwargs.get("sinks"),
+                decode=False,
+            )
+            if q_len:
+                return self._offer_draft_attention(
+                    q, k, v, layer, forward_batch, kwargs, q_len=q_len, decode=False
+                )
         cp_active = is_cp_active(forward_batch)
         uses_native_fp4 = self._forward_extend_uses_native_fp4(forward_batch)
         if uses_native_fp4 and cp_active:
