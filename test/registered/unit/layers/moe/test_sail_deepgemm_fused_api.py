@@ -15,6 +15,9 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+# Preload the launch module before sys.modules patches so restoring those patches
+# cannot leave a stale package attribute pointing to a different kernel module.
+from sglang.kernels.ops.moe import ep_moe_kernels as kernels
 from sglang.srt.hardware_backend.sail.deep_gemm import entrypoint as sail_entrypoint
 from sglang.srt.hardware_backend.sail.deep_gemm import sail_fused_deepgemm_ops as ops
 from sglang.srt.hardware_backend.sail.deep_gemm import warmup as sail_warmup
@@ -30,7 +33,6 @@ class TestDeepGemmMaskedActivationContract(CustomTestCase):
     def test_oai_validation_and_unsupported_mxfp4_fail_before_launch(self):
         """Invalid activation combinations must raise instead of degrading to plain
         SiLU or writing a wrong FP4 layout."""
-        from sglang.kernels.ops.moe import ep_moe_kernels as kernels
         from sglang.srt.hardware_backend.sail.moe import deepgemm_ep as ep_module
         from sglang.srt.layers.moe.moe_runner import deep_gemm as runner_module
         from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
@@ -274,7 +276,6 @@ class TestDeepGemmMaskedActivationContract(CustomTestCase):
     def test_masked_runner_forwards_alpha_and_keeps_legacy_launch_defaults(self):
         """BF16, channel FP8/INT8 and W4A16 must propagate the activation protocol
         down to the actual launch."""
-        from sglang.kernels.ops.moe import ep_moe_kernels as kernels
         from sglang.srt.environ import envs
         from sglang.srt.hardware_backend.sail.moe import activations as sail_activations
         from sglang.srt.hardware_backend.sail.moe import deepgemm_ep as ep_module
@@ -540,7 +541,6 @@ class TestDeepGemmMaskedActivationContract(CustomTestCase):
     def test_launch_scale_capacity_and_non_power_of_two_channel_width(self):
         """The per-token scale write bound must not exceed the capacity; a 1536-wide
         channel must have exactly one group."""
-        from sglang.kernels.ops.moe import ep_moe_kernels as kernels
 
         # BLOCK_N, the hidden blocks and the per-block scale count are fixed by
         # the kernel write protocol.
@@ -682,7 +682,7 @@ class TestSailDeepGemmFusedApi(CustomTestCase):
             ),
         ):
             result = inspect.unwrap(ops.grouped_gemm_nt_bf16bf16bf16_fused)(
-                a, b, out, ids, config
+                a, b, out, ids
             )
         torch.testing.assert_close(
             out, torch.tensor([[1, 2], [2, 4], [6, 8], [9, 12]], dtype=torch.bfloat16)
