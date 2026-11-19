@@ -124,7 +124,7 @@ class BaseLinearStateParams(ABC):
             + ssm_numel * self.dtype.temporal.itemsize
         ) * len(self.layers)
 
-    def use_compact_kda_replay(self, *, decode: bool) -> bool:
+    def use_compact_kda(self, *, decode: bool) -> bool:
         if decode or not self.is_kda or not envs.SGLANG_KDA_REPLAYSSM_SAVE_DELTAS.get():
             return False
         from sglang.kernels.ops.attention.fla.utils import get_available_device

@@ -1427,7 +1427,7 @@ def commit_mamba_states_after_verify(
             assert state_slots.ring is not None, "request-scoped ring without rows"
             ring_indices = state_slots.ring[: replay_state_indices.shape[0]]
         commit_kda_replayssm_after_verify(
-            save_kda_deltas=mamba_pool.compact_kda_replay,
+            save_kda_deltas=getattr(mamba_pool, "compact_kda", False),
             spec_state=spec_state,
             state_batch_indices=replay_state_indices,
             accept_lens=accept_lens,  # incl. bonus token

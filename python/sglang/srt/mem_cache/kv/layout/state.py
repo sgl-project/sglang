@@ -230,7 +230,7 @@ class StateView:
     linear_replayssm_cache_len = 16
     replayssm_write_pos = None
     replayssm_is_kda = False
-    compact_kda_replay = False
+    compact_kda = False
     enable_linear_replayssm_spec = False
     replayssm_spec_fold = False
     replayssm_request_ring = False
@@ -308,7 +308,7 @@ class StateView:
             self.enable_linear_replayssm_spec = replay.speculative
             self.replayssm_spec_fold = replay.speculative and replay.is_kda
             self.replayssm_is_kda = replay.is_kda
-            self.compact_kda_replay = replay.compact_kda
+            self.compact_kda = replay.compact_kda
             self.linear_replayssm_cache_len = replay.cache_len
             self.replayssm_write_pos = payloads.get("replayssm_write_pos")
             self.replayssm_spec_write_pos = payloads.get("replayssm_spec_write_pos")

@@ -696,9 +696,8 @@ class MambaPool:
         )
         _replayssm_on = enable_linear_replayssm or enable_linear_replayssm_spec
         self.replayssm_request_ring = False
-        self.compact_kda_replay = (
-            enable_linear_replayssm_spec
-            and cache_params.use_compact_kda_replay(decode=enable_linear_replayssm)
+        self.compact_kda = self.replayssm_spec_fold and cache_params.use_compact_kda(
+            decode=enable_linear_replayssm
         )
 
         # for disagg with nvlink
@@ -820,11 +819,11 @@ class MambaPool:
                 # records follow the activation dtype; g stays fp32.
                 ring_dtype = conv_dtype if enable_linear_replayssm_spec else ssm_dtype
                 # Compact speculative records hold one verify window; decode uses d/k.
-                fold_window = self.compact_kda_replay or (
-                    self.replayssm_spec_fold and not cache_params.is_kda
-                )
-                record_len = (speculative_num_draft_tokens or L) if fold_window else L
-                if not fold_window:
+                record_len = L
+                if self.compact_kda:
+                    record_len = speculative_num_draft_tokens or L
+                    ring_dtype = torch.float32
+                else:
                     replayssm_d = torch.zeros(
                         size=(num_mamba_layers, num_slots, hv, L, v_dim),
                         dtype=ring_dtype,
@@ -849,7 +848,7 @@ class MambaPool:
                     device=device,
                 )
                 if enable_linear_replayssm_spec and cache_params.is_kda:
-                    if not self.compact_kda_replay:
+                    if not self.compact_kda:
                         # Backstop for the KDA ring invariants; this pool is
                         # sized with the final adaptive-aware draft maximum.
                         if L & (L - 1) != 0:
@@ -864,17 +863,14 @@ class MambaPool:
                             raise ValueError(
                                 f"spec-verify ring too small: {L} < {min_ring_len}"
                             )
-                    record_dtype = (
-                        torch.float32 if self.compact_kda_replay else conv_dtype
-                    )
                     replayssm_rawv = torch.zeros(
                         size=(num_mamba_layers, num_slots, hv, record_len, v_dim),
-                        dtype=record_dtype,
+                        dtype=ring_dtype,
                         device=device,
                     )
                     replayssm_rawk = torch.zeros(
                         size=(num_mamba_layers, num_slots, h_k, record_len, k_dim),
-                        dtype=record_dtype,
+                        dtype=ring_dtype,
                         device=device,
                     )
                     replayssm_beta = torch.zeros(

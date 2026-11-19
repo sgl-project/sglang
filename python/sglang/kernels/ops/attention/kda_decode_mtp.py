@@ -512,6 +512,7 @@ def kda_decode_mtp_kernel(
                                 r_state[
                                     (KERNEL_WIDTH - 1) * VEC_SIZE + 2 * VEC_SIZE + i
                                 ] = r_xk
+                            # Complete independent key chains before raw-ring stores.
                             if cutlass.const_expr(CACHE_RING and not SAVE_DELTAS):
                                 for i in range(VEC_SIZE):
                                     k_idx = i * WARP_SIZE + in_warp_tid
@@ -546,11 +547,8 @@ def kda_decode_mtp_kernel(
                                     + cute.math.exp(-r_b_raw, fastmath=True)
                                 )
                                 if cutlass.const_expr(CACHE_RING):
-                                    ring_beta[ring_slot, i_hv, i_t] = (
-                                        cutlass.Float32(0.0)
-                                        if cutlass.const_expr(SAVE_DELTAS)
-                                        else sBeta[i_t]
-                                    )
+                                    beta_record = 0.0 if SAVE_DELTAS else sBeta[i_t]
+                                    ring_beta[ring_slot, i_hv, i_t] = beta_record
                         else:
                             # Gate warps do not otherwise use r_q in this phase.
                             for i in range(VEC_SIZE):
@@ -571,11 +569,8 @@ def kda_decode_mtp_kernel(
                                 decay = cute.math.exp(r_gk, fastmath=True)
                                 sG[i_t, qk_grp, qk_j // 4, qk_j % 4] = decay
                                 if cutlass.const_expr(CACHE_RING):
-                                    ring_g[ring_slot, i_hv, i_t, k_idx] = (
-                                        decay
-                                        if cutlass.const_expr(SAVE_DELTAS)
-                                        else r_gk
-                                    )
+                                    gate_record = decay if SAVE_DELTAS else r_gk
+                                    ring_g[ring_slot, i_hv, i_t, k_idx] = gate_record
                         if cutlass.const_expr(_job == 0):
                             for i in range(VEC_SIZE):
                                 k_idx = i * 32 + in_warp_tid
@@ -1204,10 +1199,10 @@ def fused_kda_decode_mtp_dspark(
                 f"expected ReplaySSM ring layouts [slots, H={H}, L>={1 + num_spec}, "
                 f"{TILE_K}] / [slots, H, L]"
             )
+        record_dtype = torch.float32 if save_kda_deltas else torch.bfloat16
         if (
-            replayssm_rawv.dtype
-            != (torch.float32 if save_kda_deltas else torch.bfloat16)
-            or replayssm_rawk.dtype != replayssm_rawv.dtype
+            replayssm_rawv.dtype != record_dtype
+            or replayssm_rawk.dtype != record_dtype
             or replayssm_g.dtype != torch.float32
             or replayssm_beta.dtype != torch.float32
         ):

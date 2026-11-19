@@ -424,7 +424,8 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         else:
             b_beta = 1.0 / (1.0 + tl.exp(-b_b))
 
-        # Raw records must be captured before normalization and the delta rule:
+        # fused ring-write: stash this step's raw inputs + in-kernel gate/beta
+        # into the per-slot ring for the commit fold to replay. Must sit here --
         # b_k is still pre-l2norm, b_v still pre-delta, b_g/b_beta are formed,
         # so the fold's replay is bit-identical to the update below. rawk uses
         # the k-head i_h (shared across a GQA group); rawv/g/beta use the v-head

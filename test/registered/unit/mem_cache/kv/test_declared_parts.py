@@ -1776,13 +1776,8 @@ class TestDeclaredParts(CustomTestCase):
         self.assertEqual(len(plan.scratch), 4)
 
     def test_compact_kda_ring_is_request_memory(self):
-        replay = StateReplay(
-            decode=False,
-            speculative=True,
-            is_kda=True,
-            cache_len=8,
-            key_heads=1,
-            compact_kda=True,
+        replay = msgspec.structs.replace(
+            _GDN_SPEC_REPLAY, is_kda=True, compact_kda=True, cache_len=8
         )
         storage, _, _ = _build(state=True, gamma=8, replay=replay)
         view = storage.view("mamba")

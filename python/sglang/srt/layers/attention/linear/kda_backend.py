@@ -1322,7 +1322,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         replayssm_rawv = getattr(mamba_cache_params, "replayssm_rawv", None)
         replayssm_on = replayssm_rawv is not None
         save_kda_deltas = replayssm_on and getattr(
-            self.state_pool, "compact_kda_replay", False
+            self.state_pool, "compact_kda", False
         )
         if intermediate_state_cache is None and not replayssm_on:
             raise RuntimeError(
@@ -1422,7 +1422,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             # conv1d + transpose-copy + recurrence sequence. Chain (topk==1) only --
             # retrieve_* are None there; the tree path and any unsupported shape keep
             # the reference kernels.
-            if not save_kda_deltas and self._can_run_fused_chain_verify(
+            if self._can_run_fused_chain_verify(
                 layer=layer,
                 mixed_qkv=mixed_qkv,
                 a=a,

@@ -34,6 +34,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice
 
 # Measured on GB300 (K=V=128); any BV keeps the fold bit-identical, re-tune freely.
 KDA_FOLD_BLOCK_V = 8
@@ -158,15 +159,8 @@ def kda_replayssm_exact_fold_kernel(
         if SAVE_DELTAS:
             decayed = b_h * b_gk[:, None]
             if b_beta != 0:
-                # The narrow Triton verify tile rounds the update and add separately.
-                b_h = tl.inline_asm_elementwise(
-                    "add.rn.f32 $0, $1, $2;",
-                    constraints="=f,f,f",
-                    args=[decayed, b_k[:, None] * b_v[None, :]],
-                    dtype=tl.float32,
-                    is_pure=True,
-                    pack=1,
-                )
+                # Match the narrow Triton tile's separately rounded add, including subnormals.
+                b_h = libdevice.add_rn(decayed, b_k[:, None] * b_v[None, :])
             else:
                 b_h = tl.fma(b_k[:, None], b_v[None, :], decayed)
         else:
@@ -274,6 +268,7 @@ def commit_kda_replayssm_spec(
         SAVE_DELTAS=save_kda_deltas,
         num_warps=1,
         num_stages=3,
+        **({"enable_reflect_ftz": False} if save_kda_deltas else {}),
     )
 
 
@@ -359,6 +354,7 @@ def commit_kda_replayssm_spec_all_layers(
         SAVE_DELTAS=save_kda_deltas,
         num_warps=1,
         num_stages=3,
+        **({"enable_reflect_ftz": False} if save_kda_deltas else {}),
     )
 
 
