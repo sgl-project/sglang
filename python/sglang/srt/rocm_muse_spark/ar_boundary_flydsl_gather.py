@@ -14,6 +14,13 @@ piece's x.x, a.a, a.c, c.c (x the post-norm input, a = alpha * stream, c = beta 
 uses x * post_rstd before its bf16 rounding. Senders take the lowest block ids and never wait; a receiver waits only
 on one peer's sender and on its row's other receivers (adjacent block ids), so in-order dispatch keeps it
 deadlock-free. Every rank holds the same columns and stream, so every rank gets the same bits.
+
+Package all-gather (``package=True``; world size 4 or 8, compact DPX placement: ranks 2g, 2g + 1 are the two
+partitions of package g): a sender pushes to its sibling (rank ^ 1) and to the same-parity ranks of the other packages
+only, half the cross-package lines of the flat push; a receiver of a same-parity owner's piece forwards the line, still
+encoded, to the same slot of its sibling's scratch, which is where the sibling's receiver of that piece waits
+(sglang_meta_common cpu_reference.all_gather_plan "package"). A forwarding receiver waits only on a sender, so the
+forwards never wait on the sibling. The bytes are the flat gather's, so the outputs are bit-identical to it.
 """
 
 from __future__ import annotations
@@ -50,6 +57,7 @@ def make_gather_ffn_boundary_launcher(
     post_weight: bool,
     wait_tight: int = 4,
     debug_cap: int = 0,
+    package: bool = False,
 ):
     import flydsl.compiler as flyc
     import flydsl.expr as fx
@@ -77,7 +85,11 @@ def make_gather_ffn_boundary_launcher(
     assert pieces % ws == 0, "every rank owns whole 256-column pieces"
     own_pieces = pieces // ws
     part_lines = row_lines // ws
-    peers = [(rank + r) % ws for r in range(1, ws)]
+    from sglang_meta_common.ops.comm.flydsl_ar.cpu_reference import all_gather_plan
+
+    plan = all_gather_plan(ws, rank, "package" if package else "flat")
+    peers = plan["targets"]
+    sib = plan["sibling"]
     sl = max_rows * part_lines
     max_send = max_rows * own_pieces
     cpol = k.LL_STORE_CPOL_SCOPE_SYS
@@ -188,7 +200,7 @@ def make_gather_ffn_boundary_launcher(
 
             if is_sender:
                 enc = k._flagless_encode(d)
-                for qi in range_constexpr(ws - 1):
+                for qi in range_constexpr(len(peers)):
                     buffer_store(enc, create_buffer_resource_from_addr(bases[peers[qi]]),
                                  line_el(fx.Uint32(rank), idx), cache_modifier=cpol)
             else:
@@ -264,6 +276,11 @@ def make_gather_ffn_boundary_launcher(
                         pend = k._flagless_lines_pending(line, 1)
                         it = it + fx.Uint32(1)
                     record(0, pend)
+                    if const_expr(package):
+                        # a same-parity owner pushes only to this rank of the package: relay to the sibling
+                        if ((owner ^ fx.Uint32(rank)) & fx.Uint32(1)) == fx.Uint32(0):
+                            buffer_store(line, create_buffer_resource_from_addr(bases[sib]), el,
+                                         cache_modifier=cpol)
                     buffer_store(zero4, my_rsrc, el, cache_modifier=cpol)
                     x_i32 = k._flagless_payload(line, 0)
                 x8 = k._upcast_n(x_i32, 4)
@@ -351,7 +368,7 @@ def make_gather_ffn_boundary_launcher(
         stream_: Stream = Stream(None),
     ):
         _ = ("muse_gather_ffn_boundary", ws, rank, hidden, max_rows, post_eps, pre_eps, post_weight, wait_tight,
-             debug_cap)
+             debug_cap, package)
         gather_ffn_boundary_gfx1250(
             base0, base1, base2, base3, base4, base5, base6, base7,
             out, new_stream, inp, stream, alpha, beta, post_w, pre_w,
@@ -394,7 +411,33 @@ class FlyDSLGatherFfnBoundary:
         self._debug_cap = int(os.environ.get("SGLANG_ROCM_MUSE_AR_BOUNDARY_FLYDSL_DEBUG_CAP", "0"))
         self.dbg = (torch.zeros(self._cells.numel() * 3, dtype=torch.int32, device=self.device)
                     if self._debug_cap > 0 else None)
-        self._fn = None
+        # batches of at least this many rows take the package all-gather (0: never)
+        self.package_min_rows = int(os.environ.get("SGLANG_ROCM_MUSE_GATHER_FFN_PACKAGE_MIN_ROWS", "0"))
+        if self.package_min_rows > 0 and not self._compact_placement(tp_group):
+            self.package_min_rows = 0
+        self._fns = {}
+
+    def _compact_placement(self, tp_group) -> bool:
+        """Collective: whether every rank sees ranks 2g, 2g + 1 as the two partitions of package g."""
+        import logging
+
+        from sglang_meta_common.ops.comm.flydsl_ar.hier_allreduce import rank_packages
+        from sglang_meta_common.ops.comm.flydsl_ar.hier_reference import check_compact
+
+        err = None
+        try:
+            if self.world_size not in (4, 8):
+                raise ValueError(f"world size {self.world_size}")
+            check_compact(rank_packages(self.device, tp_group.cpu_group))
+        except (RuntimeError, ValueError, OSError) as e:
+            err = f"{type(e).__name__}: {str(e).splitlines()[0] if str(e) else ''}"
+        ok = torch.tensor([0 if err else 1], dtype=torch.int32)
+        torch.distributed.all_reduce(ok, op=torch.distributed.ReduceOp.MIN, group=tp_group.cpu_group)
+        if not int(ok.item()):
+            logging.getLogger(__name__).warning(
+                "FFN gather boundary: compact DPX placement not confirmed (%s); flat all-gather", err or "another rank")
+            return False
+        return True
 
     def supports(self, num_rows: int) -> bool:
         return 0 < num_rows <= self.max_rows
@@ -415,28 +458,30 @@ class FlyDSLGatherFfnBoundary:
                            tile_k=tile_k, m_warp=m_warp, n_warp=2, num_buffers=4, split_k=split_k,
                            main_loop_unroll=True)
 
-    def _launch(self, args):
+    def _launch(self, args, package: bool = False):
         import flydsl.compiler as flyc
         import flydsl.expr as fx
 
         cu_stream = torch.cuda.current_stream(self.device)
-        if self._fn is not None:
-            self._fn(*args, cu_stream)
+        fn = self._fns.get(package)
+        if fn is not None:
+            fn(*args, cu_stream)
             return
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("FFN gather-boundary FlyDSL kernel was not compiled before graph capture")
         launcher = make_gather_ffn_boundary_launcher(
             self.world_size, self.rank, self.hidden, self.max_rows, self.post_eps, self.pre_eps, self.post_weight,
-            int(os.environ.get("SGLANG_ROCM_MUSE_AR_BOUNDARY_FLYDSL_TIGHT", "4")), self._debug_cap,
+            int(os.environ.get("SGLANG_ROCM_MUSE_AR_BOUNDARY_FLYDSL_TIGHT", "4")), self._debug_cap, package,
         )
         ints = (0,) * 16 + (1, 0, 0, 0, 1)
         typed = tuple(fx.Int32(a) if is32 else fx.Int64(a) for a, is32 in zip(args, ints))
-        self._fn = flyc.compile(launcher, *typed, cu_stream)
+        self._fns[package] = flyc.compile(launcher, *typed, cu_stream)
 
     def warm(self):
         """Compile now (outside graph capture): a null input makes the compile's launch a no-op."""
-        if self._fn is None:
-            self._launch(self._bases + (0,) * 8 + (1, 0, 0, 0, 1))
+        for package in (False, True) if self.package_min_rows > 0 else (False,):
+            if package not in self._fns:
+                self._launch(self._bases + (0,) * 8 + (1, 0, 0, 0, 1), package)
 
     def __call__(self, stream, part, post_weight, pre_weight, alpha, beta):
         """(next pre-norm output in bf16, new fp32 stream) of the FFN boundary on the gathered ``part`` columns
@@ -449,5 +494,5 @@ class FlyDSLGatherFfnBoundary:
             beta.data_ptr(), post_weight.data_ptr() if self.post_weight else 0, pre_weight.data_ptr(),
             rows, self._cells.data_ptr(), self._sums.data_ptr(), 0 if self.dbg is None else self.dbg.data_ptr(),
             rows * (self._own_pieces + self._pieces),
-        ))
+        ), 0 < self.package_min_rows <= rows)
         return out, new_stream
