@@ -6,6 +6,10 @@ import pathlib
 import re
 
 DEFAULT_CUDA_VERSION = "130"
+# Release tags in sgl-project/whl are prefixed with the package name so that
+# packages sharing a version number do not land in the same release.
+RELEASE_TAG_PREFIX = "sglang-kernel-v"
+XPU_RELEASE_TAG_PREFIX = "sglang-kernel-xpu-v"
 # Local version a CUDA wheel carries, e.g. sglang_kernel-0.4.6.post1+cu130-...whl
 CUDA_LOCAL_VERSION_PATTERN = re.compile(r"\+cu(\d+)")
 
@@ -46,7 +50,7 @@ def update_wheel_index(cuda_version=DEFAULT_CUDA_VERSION, rocm_version=None):
         ver = re.findall(
             r"sglang_kernel-([0-9.]+(?:\.post[0-9]+)?)(?:\+cu[0-9]+)?-", path.name
         )[0]
-        full_url = f"{base_url}/v{ver}/{path.name}#sha256={sha256}"
+        full_url = f"{base_url}/{RELEASE_TAG_PREFIX}{ver}/{path.name}#sha256={sha256}"
         with (index_dir / "index.html").open("a") as f:
             f.write(f'<a href="{full_url}">{path.name}</a><br>\n')
 
@@ -56,7 +60,7 @@ def _update_non_cuda_wheel_index(
     version=None,
     package_name="sglang_kernel",
     index_package_name="sglang-kernel",
-    release_tag_suffix="",
+    release_tag_prefix=RELEASE_TAG_PREFIX,
 ):
     backend_dir = f"{backend}{version or ''}"
     index_dir = pathlib.Path(f"sgl-whl/{backend_dir}/{index_package_name}")
@@ -73,7 +77,7 @@ def _update_non_cuda_wheel_index(
             rf"{re.escape(package_name)}-([0-9.]+(?:\.post[0-9]+)?)(?:\+{backend}[0-9]+)?-",
             path.name,
         )[0]
-        full_url = f"{base_url}/v{ver}{release_tag_suffix}/{path.name}#sha256={sha256}"
+        full_url = f"{base_url}/{release_tag_prefix}{ver}/{path.name}#sha256={sha256}"
         with (index_dir / "index.html").open("a") as f:
             f.write(f'<a href="{full_url}">{path.name}</a><br>\n')
 
@@ -83,7 +87,7 @@ def update_wheel_index_xpu():
         "xpu",
         package_name="sglang_kernel_xpu",
         index_package_name="sglang-kernel-xpu",
-        release_tag_suffix="+xpu",
+        release_tag_prefix=XPU_RELEASE_TAG_PREFIX,
     )
 
 

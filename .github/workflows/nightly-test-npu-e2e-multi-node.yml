@@ -3,6 +3,11 @@ name: 'Nightly Test (NPU) Multi Node Template'
 on:
   workflow_call:
     inputs:
+      ref:
+        description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the event commit SHA.'
+        required: false
+        type: string
+        default: ''
       runner:
         required: false
         type: string
@@ -40,16 +45,16 @@ on:
         required: true
         type: string
         description: path of test case file
+      test_method:
+        required: false
+        type: string
+        default: ''
+        description: "Single test method to run inside test_case, formatted as Class.method. Empty runs every test in the file."
       image:
         required: false
         type: string
         description: image for pods
         default: "swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann8.5.0-a3"
-      install_sglang_from_source:
-        required: false
-        type: boolean
-        default: true
-        description: use sglang from source code or from docker image
       prefill_decode_deployment:
         required: true
         type: string
@@ -64,6 +69,26 @@ on:
         type: string
         default: '{}'
         description: 'JSON run metadata {branch_label, workflow_name, create_time}, recorded once at workflow start'
+      container_patches:
+        required: false
+        type: string
+        default: ""
+        description: "Comma separated https URLs of container patch zip archives. This workflow downloads and extracts them into the mounted checkout, and each pod runs the install.sh shipped in its archive, which also owns dependency installation (including any package mirror). Empty keeps the image untouched."
+      accuracy_dataset:
+        required: false
+        type: string
+        default: ''
+        description: 'Accuracy dataset injected into pods as NPU_ACCURACY_DATASET (gsm8k on weekdays, gpqa_diamond on weekends)'
+      use_image_sglang:
+        required: false
+        type: string
+        default: ''
+        description: "If 'true', pods import sglang from the image's site-packages instead of the checkout mounted at /root/sglang/python. Empty/false uses the checkout (nightly default)."
+      sgl_router_artifact:
+        required: false
+        type: string
+        default: ''
+        description: "sgl-router-build's aarch64 artifact for the router pod; empty uses the image's sgl-router."
 
 concurrency:
   group: ascend-nightly-multi-node-${{ github.workflow_ref }}-${{ github.ref }}-${{ inputs.test_config_name }}
@@ -97,9 +122,89 @@ jobs:
 
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      # continue-on-error: the artifact expires in a day, and the router pod falls
+      # back to the image's sgl-router.
+      - name: Download prebuilt sgl-router
+        if: inputs.sgl_router_artifact != ''
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.sgl_router_artifact }}
+          path: sgl-router-bin
+
+      - name: Prepare container patches
+        id: container_patches
+        if: inputs.container_patches != ''
+        env:
+          CONTAINER_PATCHES: ${{ inputs.container_patches }}
+        run: |
+          set -euo pipefail
+          mkdir -p container-patches
+          dirs=""
+          while IFS= read -r url; do
+            url="$(echo "${url}" | tr -d '[:space:]')"
+            if [ -z "${url}" ]; then
+              continue
+            fi
+
+            # Only plain https .zip URLs: the archive path ends up in a pod
+            # command, so reject anything with shell metacharacters.
+            if ! echo "${url}" | grep -Eq '^https://[A-Za-z0-9._~:/@%+=-]+\.zip$'; then
+              echo "Invalid container patch url: ${url}"
+              exit 1
+            fi
+
+            slug="$(printf '%s' "${url}" | sha256sum | awk '{print $1}')"
+            dest="container-patches/${slug}"
+            # A repeated URL would otherwise install twice in the pods.
+            case ",${dirs}," in
+              *",${dest},"*) continue ;;
+            esac
+            rm -rf "${dest}"
+            mkdir -p "${dest}"
+            archive="/tmp/container-patch-${slug}.zip"
+
+            # OBS lives in the same region as the cluster; bypass any proxy.
+            if command -v curl >/dev/null 2>&1; then
+              ( unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY; curl -fsSL -o "${archive}" "${url}" )
+            elif command -v wget >/dev/null 2>&1; then
+              ( unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY; wget -q -O "${archive}" "${url}" )
+            else
+              echo "Neither curl nor wget is available to download ${url}"
+              exit 1
+            fi
+
+            python3 -m zipfile -e "${archive}" "${dest}"
+            if [ -z "$(find "${dest}" -type f -name install.sh -print -quit)" ]; then
+              echo "install.sh not found in ${url}"
+              exit 1
+            fi
+
+            dirs="${dirs:+${dirs},}${dest}"
+          done <<< "$(echo "${CONTAINER_PATCHES}" | tr ',' '\n')"
+          echo "dirs=${dirs}" >> "$GITHUB_OUTPUT"
+          echo "Container patch dirs: ${dirs}"
 
       - name: Prepare code for testing
+        timeout-minutes: 15
         run: |
+          # Sweep orphaned sglang-{run_id} dirs left by jobs killed before Post process.
+          # Backgrounded and capped: the shared PVC is slow, and a pre-existing backlog
+          # must not block the critical path. fds are redirected so the runner does not
+          # wait on the background job's stdout.
+          ( find /root/.cache/tests -regextype posix-extended -maxdepth 1 -type d \
+              -regex '.*/sglang-[0-9]+$' -mtime +7 -print 2>/dev/null \
+            | head -n 5 | xargs -r rm -rf ) >/dev/null 2>&1 </dev/null &
+
+          # The download drops the executable bit; cp keeps it for the pods.
+          chmod +x sgl-router-bin/sgl-router 2>/dev/null || true
+          if [ "${{ inputs.prefill_decode_deployment }}" = "separation" ] && [ ! -x sgl-router-bin/sgl-router ]; then
+            echo "::warning::No prebuilt sgl-router; the router pod falls back to sgl-router on the image's PATH."
+          fi
+
           # copy source code to shared-disk
           # Append run_id to isolate concurrent runs sharing the same PVC.
           current_path=$(pwd)
@@ -128,6 +233,8 @@ jobs:
 
       - name: Run test
         timeout-minutes: 300
+        env:
+          CONTAINER_PATCH_DIRS: ${{ steps.container_patches.outputs.dirs }}
         run: |
           # sglang_source_relative_path is shared-disk path
           # Append run_id so concurrent runs do not overwrite each other on the shared PVC.
@@ -194,6 +301,42 @@ jobs:
             --kube-job-name-prefix ${KUBE_JOB_NAME} \
             --run-id ${{ github.run_id }}"
 
+          container_patches="${CONTAINER_PATCH_DIRS:-}"
+          if [ -n "${container_patches}" ]; then
+            echo "Container patch dirs: ${container_patches}"
+            CMD="${CMD} --container-patches ${container_patches}"
+          fi
+
+          accuracy_dataset="${{ inputs.accuracy_dataset }}"
+          case "${accuracy_dataset}" in
+            ""|gsm8k|gpqa_diamond) ;;
+            *) echo "Unsupported accuracy dataset: ${accuracy_dataset}"; exit 1 ;;
+          esac
+          if [ -n "${accuracy_dataset}" ]; then
+            CMD="${CMD} --accuracy-dataset ${accuracy_dataset}"
+          fi
+
+          use_image_sglang="${{ inputs.use_image_sglang }}"
+          case "${use_image_sglang}" in
+            ""|true|false) ;;
+            *) echo "Unsupported use_image_sglang: ${use_image_sglang}"; exit 1 ;;
+          esac
+          if [ -n "${use_image_sglang}" ]; then
+            CMD="${CMD} --use-image-sglang ${use_image_sglang}"
+          fi
+
+          # Restrict the run to one unittest method inside test_case. The value
+          # ends up in the pod's env, so only plain dotted identifiers pass.
+          test_method="${{ inputs.test_method }}"
+          if [ -n "${test_method}" ]; then
+            if ! echo "${test_method}" | grep -Eq '^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$'; then
+              echo "Invalid test_method: ${test_method}"
+              exit 1
+            fi
+            echo "Test method: ${test_method}"
+            CMD="${CMD} --test-method ${test_method}"
+          fi
+
           if [ "$prefill_decode_deployment" = "separation" ];then
             CMD="${CMD} \
               --prefill-size ${{ inputs.prefill_size }} \
@@ -211,15 +354,7 @@ jobs:
             CMD="${CMD} --sglang-is-in-ci"
           fi
 
-          install_sglang_from_source="${{ inputs.install_sglang_from_source }}"
-          if [ "$install_sglang_from_source" = "true" ] || [ "$install_sglang_from_source" = "True" ];then
-            echo "Install sglang from source."
-            CMD="${CMD} --install-sglang-from-source"
-            commit_id=${{ github.sha }}
-            echo "commit id: ${commit_id}" > "$(dirname "${sglang_test_results_output_path}")/commit_id"
-          else
-            echo "Use sglang from image: ${{ inputs.image }}"
-          fi
+          echo "commit id: ${{ github.sha }}" > "$(dirname "${sglang_test_results_output_path}")/commit_id"
 
           if [ "$transformers_version" != "" ];then
             CMD="${CMD} --transformers-version ${transformers_version}"
@@ -229,6 +364,16 @@ jobs:
 
           echo "Run command: ${CMD}"
           eval "${CMD}"
+
+      - name: Upload metrics artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: npu-metrics-${{ inputs.test_config_name }}
+          # output/<branch>-<create_time>-<run_id>-<run_attempt>/<workflow>/<test_type>/<case>
+          path: /root/.cache/tests/output/*-${{ github.run_id }}-${{ github.run_attempt }}/*/${{ inputs.test_type }}/*
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Post process
         if: always()

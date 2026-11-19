@@ -16,6 +16,7 @@ from sglang.srt.entrypoints.engine import node_hosts_rust_server
 from sglang.srt.environ import envs
 from sglang.srt.managers import disagg_service
 from sglang.srt.managers.load_snapshot import create_load_snapshot_writer, shm_path_for
+from sglang.srt.managers.scheduler_components.pause_state import PauseState
 from sglang.srt.runtime_context import (
     derive_attention_ranks,
     get_context,
@@ -31,14 +32,18 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 def _scheduler_for_typed_config(load_snapshot_writer=None):
     return SimpleNamespace(
-        server_args=SimpleNamespace(enable_return_hidden_states=False),
+        server_args=SimpleNamespace(
+            enable_return_hidden_states=True,
+            return_hidden_states_mode="last",
+            engine_info_bootstrap_url="http://127.0.0.1:6789",
+        ),
         model_config=SimpleNamespace(
             context_len=2048,
             vocab_size=1000,
             is_multimodal=False,
             is_image_understandable_model=False,
             is_audio_understandable_model=False,
-            hf_config=SimpleNamespace(model_type=None),
+            hf_config=SimpleNamespace(model_type=None, architectures=None),
             get_default_sampling_params=lambda: {},
         ),
         get_init_info=MagicMock(
@@ -50,6 +55,7 @@ def _scheduler_for_typed_config(load_snapshot_writer=None):
             )
         ),
         page_size=16,
+        tree_cache=None,
         rust_server_tokenizer_path=lambda: "tokenizer",
         tokenizer=None,
         max_total_num_tokens=1024,
@@ -90,8 +96,6 @@ def _reported_deployment_info() -> api_types.DeploymentInfo:
             "timeout",
         ),
         ({"hicache_write_policy": "write_back"}, "hicache_write_policy", "write_back"),
-        ({"smg_grpc_mode": True}, "grpc_port", None),
-        ({"grpc_mode": True}, "grpc_port", None),
         (
             {"grpc_response_timeout_secs": 900},
             "grpc_response_timeout_secs",
@@ -115,6 +119,11 @@ def _reported_deployment_info() -> api_types.DeploymentInfo:
         # launched path.
         ({"tokenizer_path": "/public"}, "tokenizer_path", "tokenizer"),
         ({"tokenizer_path": "/public"}, "public_tokenizer_path", "/public"),
+        # `--warmups` holds health until Python ran them (`rust_server.warmups`).
+        ({"warmups": "voice_chat"}, "custom_warmups_pending", True),
+        # Blank names run nothing, so nothing would release a hold.
+        ({"warmups": ""}, "custom_warmups_pending", False),
+        ({"warmups": " ,"}, "custom_warmups_pending", False),
     ],
     ids=[
         "native-grpc",
@@ -122,8 +131,6 @@ def _reported_deployment_info() -> api_types.DeploymentInfo:
         "hicache_storage_backend_extra_config",
         "hicache_storage_prefetch_policy",
         "hicache_write_policy",
-        "legacy-smg",
-        "deprecated-legacy-smg",
         "grpc-response-timeout",
         "priority-off",
         "priority-on",
@@ -133,6 +140,9 @@ def _reported_deployment_info() -> api_types.DeploymentInfo:
         "mm-limits-keep-order",
         "loaded-tokenizer",
         "public-tokenizer",
+        "custom-warmups",
+        "custom-warmups-empty",
+        "custom-warmups-blank",
     ],
 )
 def test_typed_config_forwards_resolved_launch_fields(overrides, kwarg, expected):
@@ -159,6 +169,8 @@ def test_typed_config_forwards_resolved_launch_fields(overrides, kwarg, expected
 
     assert extension.ServerArgs.call_args.kwargs[kwarg] == expected
     assert extension.ServerArgs.call_args.kwargs["default_max_new_tokens"] is None
+    # The mode, not only the resolved bool: Rust refuses a request above it.
+    assert extension.ServerArgs.call_args.kwargs["return_hidden_states_mode"] == "last"
     scheduler.get_init_info.assert_not_called()
     scheduler.kv_events_publisher.local_kv_event_sources.assert_called_once_with(16)
     deployment_info = json.loads(
@@ -681,7 +693,7 @@ def test_listener_rank_installs_the_sigterm_drain(hosts):
         _hosts_rust_server=lambda: hosts,
         _holds_rust_drain_end=lambda: False,
         get_rust_server_class=lambda: server_class,
-        _engine_paused=False,
+        pause_state=PauseState(),
     )
     with (
         envs.SGLANG_RUST_SERVER.override(True),
