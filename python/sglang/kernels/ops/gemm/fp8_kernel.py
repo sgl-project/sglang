@@ -493,7 +493,8 @@ def prepare_block_fp8_matmul_inputs(
     Bs: torch.Tensor,
     block_size: List[int],
     output_dtype: torch.dtype = torch.float16,
-) -> Tuple[int, int, int]:
+    output: Optional[torch.Tensor] = None,
+) -> Tuple[int, int, int, torch.Tensor]:
     assert len(block_size) == 2
     block_n, block_k = block_size[0], block_size[1]
 
@@ -529,7 +530,13 @@ def prepare_block_fp8_matmul_inputs(
         raise NotImplementedError
 
     C_shape = A.shape[:-1] + (N,)
-    C = A.new_empty(C_shape, dtype=output_dtype)
+    if output is None:
+        C = A.new_empty(C_shape, dtype=output_dtype)
+    else:
+        # caller-owned storage (e.g. a fused collective's symmetric buffer)
+        assert output.shape == C_shape and output.dtype == output_dtype
+        assert output.is_contiguous()
+        C = output
 
     return M, N, K, C
 
@@ -541,8 +548,11 @@ def w8a8_block_fp8_matmul_deepgemm(
     Bs: torch.Tensor,
     block_size: List[int],
     output_dtype: torch.dtype,
+    output: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    M, N, K, C = prepare_block_fp8_matmul_inputs(A, B, As, Bs, block_size, output_dtype)
+    M, N, K, C = prepare_block_fp8_matmul_inputs(
+        A, B, As, Bs, block_size, output_dtype, output
+    )
 
     # Deepgemm only supports output tensor type as bfloat16
     assert C.dtype == torch.bfloat16 and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
@@ -562,8 +572,7 @@ def w8a8_mxfp8_matmul_deepgemm(
     assert A.is_contiguous() and B.is_contiguous()
     assert output_dtype == torch.bfloat16 and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
 
-    M = A.numel() // A.shape[-1]
-    N, K = B.shape
+    N = B.shape[0]
     C = A.new_empty(A.shape[:-1] + (N,), dtype=output_dtype)
 
     deep_gemm_mxfp8_fp8_bf16_nt(A, As, B, Bs, C)
@@ -786,10 +795,10 @@ def scaled_mm_kernel(
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         masks_k = offsets_k < K
         masks_a = masks_am[:, None] & masks_k[None, :]
-        a = tl.load(a_ptrs, mask=masks_a)
+        a = tl.load(a_ptrs, mask=masks_a, other=0.0)
 
         masks_b = masks_k[:, None] & masks_bn[None, :]
-        b = tl.load(b_ptrs, mask=masks_b)
+        b = tl.load(b_ptrs, mask=masks_b, other=0.0)
 
         # Accumulate results.
         accumulator = tl.dot(a, b, accumulator, out_dtype=accumulator_dtype)

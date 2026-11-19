@@ -32,7 +32,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=239, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=260, suite="stage-b-test-1-gpu-small-amd")
+register_amd_ci(est_time=260, suite="base-b-test-1-gpu-small-amd")
 
 SERVER_ENV = {"SGLANG_USE_PICKLE_IPC": "0"}
 
@@ -516,6 +516,7 @@ class TestSRTEndpoint(CustomTestCase):
         self.assertIsInstance(memory_usage["kvcache"], float)
         self.assertEqual(memory_usage["token_capacity"], max_total_num_tokens)
         self.assertIsNone(memory_usage["token_capacity_swa"])
+        self.assertEqual(memory_usage["token_capacity_window"], {})
         self.assertIsInstance(memory_usage["startup_available"], float)
         self.assertGreater(memory_usage["startup_available"], 0)
         self.assertTrue(graph_phases.issubset(memory_usage["graph"]))
