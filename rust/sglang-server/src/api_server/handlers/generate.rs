@@ -28,7 +28,8 @@ impl CoreHandle {
         request: GenerateRequest,
         received: ReceivedAs,
     ) -> Result<CoreCall, CoreError> {
-        // Python holds client generates while paused, before tokenizing.
+        // A user pause and a weight update both hold admission, before
+        // tokenizing. Neither flag clears the other.
         self.inner.frontend.wait_unpaused().await;
         // Counted from admission, media prefetch included: the drain waits
         // for it.
@@ -210,7 +211,8 @@ impl CoreHandle {
         if requests.is_empty() {
             return Ok(Vec::new());
         }
-        // Python holds client generates while paused, before tokenizing.
+        // A user pause and a weight update both hold admission, before
+        // tokenizing. Neither flag clears the other.
         self.inner.frontend.wait_unpaused().await;
         for request in &mut requests {
             self.set_default_priority(request);

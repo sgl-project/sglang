@@ -1,8 +1,10 @@
 //! Frontend state a control call changes and the request path reads: the
-//! pause flag, and a cache of the scheduler-owned model facts. One per
-//! listener. A control call lands on one listener and fans out to every
-//! scheduler; the peer relay (`forward_control_req`) applies the same
-//! transition here on the other listeners, so the effect is deployment-wide.
+//! user pause, the weight-update hold, and a cache of the scheduler-owned
+//! model facts. One per listener. A control call lands on one listener and
+//! fans out to every scheduler; the peer relay (`forward_control_req`)
+//! applies the same transition here on the other listeners, so the effect
+//! is deployment-wide. In-flight generations drain on their own counter,
+//! not on either flag here.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -41,11 +43,15 @@ impl ModelFacts {
 }
 
 pub(crate) struct FrontendState {
-    /// Python's `is_pause`: generates wait here before admission.
+    /// Python's `is_pause`, set only by `/pause_generation` and cleared only
+    /// by `/continue_generation`. A weight update does not write this.
     paused: watch::Sender<bool>,
+    /// Admission closed by a weight update. Independent of [`Self::paused`]:
+    /// `/continue_generation` does not clear it, and dropping the hold does
+    /// not clear a pause the caller asked for.
+    updating: watch::Sender<bool>,
     /// Python's `model_update_lock`, writer side: one weight update at a
-    /// time on this listener, and no admission while it runs (see
-    /// [`FrontendState::hold_for_update`]).
+    /// time on this listener (see [`FrontendState::hold_for_update`]).
     update_lock: tokio::sync::Mutex<()>,
     /// Python's `session_futures`: the session ids an `/open_session` is in
     /// flight for, so a second open of the same id is refused meanwhile.
@@ -60,6 +66,7 @@ impl FrontendState {
     pub(super) fn new(metadata: &CoreMetadata) -> Self {
         Self {
             paused: watch::Sender::new(false),
+            updating: watch::Sender::new(false),
             update_lock: tokio::sync::Mutex::new(()),
             opening_sessions: std::sync::Mutex::new(std::collections::HashSet::new()),
             facts: RwLock::new(Arc::new(ModelFacts::from_launch(metadata))),
@@ -73,19 +80,14 @@ impl FrontendState {
 
     /// Hold the listener for a weight update: Python's
     /// `model_update_lock.writer_lock`. Updates run one at a time, and
-    /// generates wait at admission until the hold drops, unless the
-    /// deployment was paused already (`/pause_generation`), in which case the
-    /// pause stays as it was. The cached facts are marked stale on release:
-    /// an update changes what the scheduler reports.
+    /// generates wait at admission until the hold drops. The user pause is
+    /// left as it was. The cached facts are marked stale on release: an
+    /// update changes what the scheduler reports.
     pub(super) async fn hold_for_update(&self) -> UpdateHold<'_> {
         let _guard = self.update_lock.lock().await;
-        let pauses = !self.is_paused();
-        if pauses {
-            self.set_paused(true);
-        }
+        self.set_updating(true);
         UpdateHold {
             state: self,
-            pauses,
             _guard,
         }
     }
@@ -94,12 +96,30 @@ impl FrontendState {
         self.paused.send_replace(paused);
     }
 
-    /// Wait until generation is not paused.
+    fn set_updating(&self, updating: bool) {
+        self.updating.send_replace(updating);
+    }
+
+    /// Wait until neither the user pause nor a weight update is holding
+    /// admission. Each flag has its own watch, so a change to one cannot
+    /// clear the other.
     pub(super) async fn wait_unpaused(&self) {
-        let mut rx = self.paused.subscribe();
-        // `wait_for` checks the current value first, so a running listener
-        // passes without yielding.
-        let _ = rx.wait_for(|paused| !paused).await;
+        let mut paused = self.paused.subscribe();
+        let mut updating = self.updating.subscribe();
+        loop {
+            if !*paused.borrow() && !*updating.borrow() {
+                return;
+            }
+            // The sender closing is the listener shutting down. The old
+            // single watch returned there too.
+            let open = tokio::select! {
+                result = paused.changed() => result.is_ok(),
+                result = updating.changed() => result.is_ok(),
+            };
+            if !open {
+                return;
+            }
+        }
     }
 
     /// Mark the cached facts as possibly changed by a control call.
@@ -147,16 +167,13 @@ impl FrontendState {
 /// A listener held for one weight update (see [`FrontendState::hold_for_update`]).
 pub(super) struct UpdateHold<'a> {
     state: &'a FrontendState,
-    pauses: bool,
     _guard: tokio::sync::MutexGuard<'a, ()>,
 }
 
 impl Drop for UpdateHold<'_> {
     fn drop(&mut self) {
         self.state.invalidate();
-        if self.pauses {
-            self.state.set_paused(false);
-        }
+        self.state.set_updating(false);
     }
 }
 

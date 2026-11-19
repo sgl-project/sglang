@@ -1609,8 +1609,8 @@ mod tests {
         let relayed = tokio::spawn(async move { handle.forward_control_req(header).await });
         let request = accept_intake(harness.intake_rx.recv_async().await.unwrap());
         assert!(
-            harness.handle.inner.frontend.is_paused(),
-            "held while it runs"
+            !harness.handle.inner.frontend.is_paused(),
+            "an update is not a user pause"
         );
         let gen_handle = harness.handle.clone();
         let parked = tokio::spawn(async move {

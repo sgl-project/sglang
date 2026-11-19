@@ -876,7 +876,10 @@ mod tests {
             tokio::spawn(async move { handle.begin_weight_update("all".into()).await.unwrap() });
         let request = accept_intake(harness.intake_rx.recv_async().await.unwrap());
         assert_eq!(wire_items(&request)[3].as_str(), Some("all"));
-        assert!(harness.handle.inner.frontend.is_paused());
+        assert!(
+            !harness.handle.inner.frontend.is_paused(),
+            "an update is not a user pause"
+        );
         let gen_handle = harness.handle.clone();
         let parked = tokio::spawn(async move {
             gen_handle
@@ -920,6 +923,76 @@ mod tests {
             harness.handle.inner.frontend.is_paused(),
             "kept the client's pause"
         );
+    }
+
+    /// Continue does not admit a generate while an update holds the listener.
+    /// A pause requested during that hold is still closed after the update ends.
+    #[tokio::test]
+    async fn continue_does_not_open_admission_during_an_update() {
+        use crate::message::request::GenerateRequest;
+        let harness = Harness::unbounded(8);
+        let handle = harness.handle.clone();
+        let update =
+            tokio::spawn(async move { handle.begin_weight_update("all".into()).await.unwrap() });
+        let request = accept_intake(harness.intake_rx.recv_async().await.unwrap());
+        let gen_handle = harness.handle.clone();
+        let parked = tokio::spawn(async move {
+            gen_handle
+                .generate(
+                    GenerateRequest {
+                        input_ids: Some(vec![1]),
+                        ..Default::default()
+                    },
+                    crate::api_server::core::ReceivedAs::without_headers(),
+                )
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert!(!parked.is_finished(), "generate waits for the update");
+
+        let handle = harness.handle.clone();
+        let (continued, ()) = tokio::join!(
+            handle.continue_generation(true),
+            answer_local_control(&harness.intake_rx, status_reply(true, "Success")),
+        );
+        continued.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert!(
+            !parked.is_finished(),
+            "continue admitted a generate during the update"
+        );
+        assert!(harness.intake_rx.try_recv().is_err());
+        assert!(!harness.handle.inner.frontend.is_paused());
+
+        let handle = harness.handle.clone();
+        let (paused, ()) = tokio::join!(
+            handle.pause_generation("in_place"),
+            answer_local_control(&harness.intake_rx, status_reply(true, "Success")),
+        );
+        paused.unwrap();
+        request
+            .sink
+            .try_send(ResponseItem::Control(status_reply(true, "Success")))
+            .unwrap();
+        update.await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert!(
+            !parked.is_finished(),
+            "ending the update cleared the caller's pause"
+        );
+        assert!(harness.handle.inner.frontend.is_paused());
+        assert!(harness.intake_rx.try_recv().is_err());
+
+        let handle = harness.handle.clone();
+        let (continued, ()) = tokio::join!(
+            handle.continue_generation(true),
+            answer_local_control(&harness.intake_rx, status_reply(true, "Success")),
+        );
+        continued.unwrap();
+        let released = accept_intake(harness.intake_rx.recv_async().await.unwrap());
+        assert!(matches!(released.kind, RequestKind::Generate(_)));
+        assert!(!harness.handle.inner.frontend.is_paused());
+        drop(parked);
     }
 
     /// The session updates refuse a multi-rank deployment before any
