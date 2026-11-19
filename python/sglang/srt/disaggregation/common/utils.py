@@ -3,7 +3,7 @@ import dataclasses
 import struct
 import threading
 from collections import deque
-from typing import List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
@@ -31,6 +31,9 @@ class TransferKVChunk:
     # Set when the staging worker first counts this chunk toward the per-room
     # outstanding count; stays set across re-enqueue on a watermark defer.
     staging_counted: bool = False
+    # Decode session id -> send result, for the targets an earlier pass of a
+    # deferred chunk reached; a retry does not write them again.
+    staging_done_targets: Dict[str, bool] = dataclasses.field(default_factory=dict)
     # Early-send: GPU event to synchronize before reading KV (optional).
     wait_event: Optional[object] = None
     # Must complete before reading asynchronously copied host indices.

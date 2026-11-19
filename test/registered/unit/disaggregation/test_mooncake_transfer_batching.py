@@ -1,7 +1,7 @@
 import concurrent.futures
 import ctypes
 import unittest
-from collections import defaultdict
+from collections import defaultdict, deque
 from queue import SimpleQueue
 from threading import Event, Lock
 from types import SimpleNamespace
@@ -845,6 +845,132 @@ class TestMooncakeStagingDeviceType(unittest.TestCase):
             MooncakeKVManager._init_staging_allocator(manager)
 
         self.assertEqual(init_allocator.call_args.kwargs["device_type"], "xpu")
+
+
+class _RetryQueue:
+    """Worker queue whose get() returns the stop sentinel once it is drained."""
+
+    def __init__(self, item):
+        self._items = deque([item])
+
+    def put(self, item):
+        self._items.append(item)
+
+    def get(self):
+        return self._items.popleft() if self._items else None
+
+
+class TestMooncakeStagingDeferredChunk(CustomTestCase):
+    SESSIONS = ("decode-0", "decode-1", "decode-2", "decode-3")
+
+    def _run_with_deferrals(self, is_last_chunk):
+        """One chunk, four staging targets; decode-1 and decode-2 are not ready once."""
+        room = 1
+        manager = SimpleNamespace(
+            enable_trace=False,
+            enable_staging=True,
+            enable_deferred_decode_kv_release=False,
+            is_mla_backend=False,
+            is_hybrid_mla_backend=False,
+            attn_tp_size=1,
+            kv_shard_state_peer_only=False,
+            _staging_outstanding=defaultdict(int),
+            _staging_ctx=SimpleNamespace(watermark_cv=MagicMock()),
+            request_status={room: KVPoll.WaitingForInput},
+            transfer_infos={
+                room: {
+                    session: SimpleNamespace(
+                        room=room,
+                        is_dummy=False,
+                        mooncake_session_id=session,
+                        endpoint="127.0.0.1",
+                        dst_port=6000 + i,
+                        dst_kv_indices=np.array([10]),
+                        dst_device_kv_indices=None,
+                        required_dst_info_num=len(self.SESSIONS),
+                    )
+                    for i, session in enumerate(self.SESSIONS)
+                }
+            },
+            decode_kv_args_table={
+                session: SimpleNamespace(
+                    requires_dcp_relayout=False,
+                    dst_attn_tp_size=2,
+                    staging_base_ptr=0x1000,
+                    staging_total_size=1 << 20,
+                    dst_aux_ptrs=[2000],
+                    dst_aux_item_lens=[16],
+                )
+                for session in self.SESSIONS
+            },
+            session_lock=Lock(),
+            failed_sessions=set(),
+            state_layout_rejections={},
+            _get_dsa_cache_transfer_skip_flags=lambda reg: (False, False),
+            kv_args=SimpleNamespace(kv_data_ptrs=[1]),
+            validate_aux_buffers=MagicMock(),
+            send_chunk_ready=MagicMock(),
+            send_aux=MagicMock(return_value=0),
+            conclude_transfer=MagicMock(),
+            note_send_finished=MagicMock(),
+            bootstrap_port=8998,
+        )
+        manager.check_status = lambda r: manager.request_status[r]
+        manager._do_staging_transfer = lambda *args, **kwargs: (
+            MooncakeKVManager._do_staging_transfer(manager, *args, **kwargs)
+        )
+        not_ready_once = {"decode-1", "decode-2"}
+
+        def check_ready(req, page_start, num_pages):
+            if req.mooncake_session_id in not_ready_once:
+                not_ready_once.discard(req.mooncake_session_id)
+                return (False, 0, -1, 0, -1)
+            return (True, 0, 0, 0, 0)
+
+        strategy = SimpleNamespace(
+            check_ready=check_ready, transfer=MagicMock(return_value=0)
+        )
+        manager._try_create_staging_strategy = lambda staging_buffer: strategy
+        chunk = TransferKVChunk(
+            room=room,
+            prefill_kv_indices=np.array([0], dtype=np.int32),
+            index_slice=slice(0, 1),
+            is_last_chunk=is_last_chunk,
+            prefill_aux_index=0,
+            state_indices=None,
+        )
+        MooncakeKVManager.transfer_worker(
+            manager, _RetryQueue(chunk), MagicMock(), staging_buffer=object()
+        )
+        return manager
+
+    def test_deferred_chunk_writes_each_target_once(self):
+        """A chunk deferred on some targets is retried on those targets only.
+
+        Each repeated write re-sends CHUNK_READY, which the decode fan-in counts
+        as another writer's arrival; an unready target must not hold back the rest.
+        The chunk is re-enqueued, and the worker waits, once per pass.
+        """
+        for is_last_chunk in (False, True):
+            with self.subTest(is_last_chunk=is_last_chunk):
+                manager = self._run_with_deferrals(is_last_chunk)
+                notified = [
+                    c.kwargs["writer_id"]
+                    for c in manager.send_chunk_ready.call_args_list
+                ]
+                self.assertEqual(
+                    notified, ["decode-0", "decode-3", "decode-1", "decode-2"]
+                )
+                manager.note_send_finished.assert_called_once()
+                self.assertEqual(manager._staging_ctx.watermark_cv.wait.call_count, 1)
+                if is_last_chunk:
+                    self.assertEqual(manager.send_aux.call_count, 4)
+                    manager.conclude_transfer.assert_called_once()
+                    kwargs = manager.conclude_transfer.call_args.kwargs
+                    self.assertEqual(kwargs["status"], KVPoll.Success)
+                    self.assertEqual(len(kwargs["targets"]), 4)
+                else:
+                    manager.conclude_transfer.assert_not_called()
 
 
 if __name__ == "__main__":
