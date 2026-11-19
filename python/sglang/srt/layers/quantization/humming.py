@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING, Any, List
 
 import regex as re
 import torch
-
 from sglang.srt.environ import envs
 from sglang.srt.layers.linear import LinearBase
 from sglang.srt.layers.moe import (
@@ -36,6 +35,7 @@ from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
 )
+from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.layers.utils.common import set_weight_attrs
 
 if TYPE_CHECKING:
@@ -587,12 +587,17 @@ class HummingConfig(QuantizationConfig):
         if hasattr(self, "hf_to_sglang_mapper"):
             ignored_layers = self.hf_to_sglang_mapper.apply_list(ignored_layers)
 
+        ignored_layers = [entry for entry in ignored_layers if isinstance(entry, str)]
         for entry in ignored_layers:
-            if isinstance(entry, str) and entry.startswith("re:"):
-                if re.match(entry[3:], prefix):
-                    return True
-            elif entry in prefix:
+            if entry.startswith("re:") and re.match(entry[3:], prefix):
                 return True
+
+        if is_layer_skipped(
+            prefix,
+            [entry for entry in ignored_layers if not entry.startswith("re:")],
+            self.packed_modules_mapping,
+        ):
+            return True
 
         if "lm_head" in prefix:
             return True
