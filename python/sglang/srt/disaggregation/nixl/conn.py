@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import struct
+import sys
 import threading
 import time
 import uuid
@@ -199,10 +200,19 @@ def _pin_aiter_hip_runtime() -> None:
     if not is_hip():
         return
     try:
-        from aiter.jit.utils.hip_runtime import load_hip_runtime
+        import aiter.jit.utils.hip_runtime  # noqa: F401
     except ImportError:
         return
-    load_hip_runtime()
+    try:
+        import aiter.jit.utils.chip_info  # noqa: F401
+    except ImportError:
+        pass
+    # chip_info imports the same file as top-level `hip_runtime`, a second module
+    # with its own cache, so bind both copies.
+    for name in ("aiter.jit.utils.hip_runtime", "hip_runtime"):
+        module = sys.modules.get(name)
+        if module is not None:
+            module.load_hip_runtime()
 
 
 def _resolve_ucx_device_list(ib_device: str, gpu_id: int) -> Optional[str]:
