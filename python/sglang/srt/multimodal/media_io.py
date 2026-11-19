@@ -529,23 +529,20 @@ def smart_to_rgb(
     return image.convert("RGB")
 
 
-def _jpeg_decode_backend(image_bytes: bytes, gpu_image_decode: GPUImageDecodeMode):
-    """Choose the device decoder for an encoded image, or None for PIL.
-
-    The model must enable device decoding and the input must have JPEG markers.
-    CUDA supports both decode modes. NPU handles ordinary JPEG decoding and
-    leaves fancy upsampling to PIL. Hardware-specific eligibility is checked
-    by the selected decoder.
+def is_jpeg_with_cuda(
+    image_bytes: bytes = b"", gpu_image_decode: GPUImageDecodeMode = True
+) -> bool:
     """
-    if not gpu_image_decode or not (
-        image_bytes.startswith(b"\xff\xd8") and image_bytes.endswith(b"\xff\xd9")
-    ):
-        return None
-    if is_cuda():
-        return "cuda"
-    if is_npu() and gpu_image_decode != "nvjpeg_fancy":
-        return "npu"
-    return None
+    Check three conditions:
+    1. whether CUDA is available.
+    2. whether input is recognized as JPEG.
+    3. whether GPU image decode is enabled (some models such as CPM forcibly disable this).
+    """
+    if not is_cuda() or not gpu_image_decode:
+        return False
+    if image_bytes != b"":
+        return image_bytes.startswith(b"\xff\xd8") and image_bytes.endswith(b"\xff\xd9")
+    return False
 
 
 @lru_cache(maxsize=16)
@@ -569,8 +566,7 @@ def _load_image(
     """
     if image_file != "":
         image_bytes = get_image_bytes(image_file)
-    backend = _jpeg_decode_backend(image_bytes, gpu_image_decode)
-    if backend == "cuda":
+    if is_jpeg_with_cuda(image_bytes, gpu_image_decode):
         try:
             if gpu_image_decode == "nvjpeg_fancy":
                 from sglang.srt.utils.nvjpeg_decoder import (
@@ -591,7 +587,8 @@ def _load_image(
                     "Failed to decode JPEG on GPU, falling back to CPU. Error: %s",
                     e,
                 )
-    elif backend == "npu":
+    elif is_npu() and gpu_image_decode is True:
+        # DVPP supports ordinary decoding; models requesting "nvjpeg_fancy" use PIL.
         from sglang.srt.hardware_backend.npu.jpeg import (
             decode_jpeg as decode_jpeg_with_dvpp,
         )
