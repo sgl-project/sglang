@@ -34,7 +34,8 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-# No XPU lane: applications.ai.gpu.deepsymm is not in the XPU CI image; run by hand on XPU.
+# TODO(dayanandav): register_xpu_ci(est_time=1800, suite="nightly-xpu-kernel-main-4-gpu",
+# nightly=True) once applications.ai.gpu.deepsymm is in the XPU CI image; until then run by hand.
 register_cuda_ci(est_time=1800, stage="nightly", runner_config="4-gpu-h100")
 
 MODEL = "Qwen/Qwen3-30B-A3B"

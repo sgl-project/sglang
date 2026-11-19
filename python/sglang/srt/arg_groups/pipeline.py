@@ -304,6 +304,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
         validate_deepep_v2_dispatch_token_budget,
         validate_deepep_v2_speculative_draft,
         validate_flashinfer_a2a_token_budget,
+        validate_xpu_deepep_low_latency_budget,
     )
 
     run_hook(handle_moe_kernel_config, server_args)
@@ -332,6 +333,8 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     # Validate the FlashInfer A2A token budget now that draft-token counts are final.
     run_hook(validate_flashinfer_a2a_token_budget, server_args)
+    # Same for the XPU DeepEP low-latency buffer, which has no bound check of its own.
+    run_hook(validate_xpu_deepep_low_latency_budget, server_args)
 
     from sglang.srt.arg_groups.mega_moe_hook import (
         validate_mega_moe_token_budget_for_model,
