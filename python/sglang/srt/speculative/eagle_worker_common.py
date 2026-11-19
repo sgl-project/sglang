@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from importlib import import_module
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Optional
@@ -46,6 +47,8 @@ from sglang.srt.utils.async_probe import (
     maybe_detect_oob,
 )
 from sglang.srt.utils.device import is_npu
+
+logger = logging.getLogger(__name__)
 
 _is_cpu = is_cpu()
 _is_npu = is_npu()
@@ -167,6 +170,73 @@ def bind_eagle_runtime_hooks(
                 shard_head=hooks.verify_shard_head,
             )
     return hooks
+
+
+def draft_attention_backends(draft_worker: Any) -> tuple:
+    """The attention backends a draft worker's decode steps and draft extend run on."""
+    multi_step = draft_worker.draft_attn_backend
+    return (
+        *(() if multi_step is None else multi_step.attn_backends),
+        draft_worker.draft_extend_attn_backend
+        or draft_worker.draft_runner.attn_backend,
+    )
+
+
+def offer_draft_attention(
+    hooks: Any, *, draft_worker: Any, log_decision: bool = True
+) -> int:
+    """SGLANG_OPT_TRTLLM_MHA_DRAFT_PROVIDER_ATTENTION: hand the provider's draft
+    attention (hooks.draft_attention) to the draft worker's TRT-LLM MHA backends,
+    which then offer it their FP8 decode and draft-extend calls. Returns how many
+    backends took it. Only the EAGLE draft worker's backends (a multi-step decode
+    backend and a draft-extend backend) are offered it; any other draft worker
+    declines. Called at worker init, which logs the decision at INFO, and again for
+    the draft backends each adaptive state rebuilds, which does not."""
+    if not envs.SGLANG_OPT_TRTLLM_MHA_DRAFT_PROVIDER_ATTENTION.get():
+        return 0
+    from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+        HybridLinearAttnBackend,
+    )
+    from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
+    from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
+
+    attention = hooks.draft_attention
+    eagle_draft = isinstance(draft_worker, EagleDraftWorker)
+    backends = (
+        draft_attention_backends(draft_worker)
+        if attention is not None and eagle_draft
+        else ()
+    )
+    taken = 0
+    for backend in backends:
+        if isinstance(backend, HybridLinearAttnBackend):
+            backend = backend.full_attn_backend
+        if isinstance(backend, TRTLLMHAAttnBackend):
+            taken += backend.set_draft_attention(attention)
+    if not log_decision:
+        return taken
+    if taken:
+        logger.info(
+            "SGLANG_OPT_TRTLLM_MHA_DRAFT_PROVIDER_ATTENTION: %d draft TRT-LLM MHA "
+            "backends offer their FP8 decode and draft-extend calls to the provider's "
+            "draft attention",
+            taken,
+        )
+    else:
+        logger.info(
+            "SGLANG_OPT_TRTLLM_MHA_DRAFT_PROVIDER_ATTENTION declined (%s)",
+            (
+                "the provider offers no draft attention"
+                if attention is None
+                else (
+                    f"{type(draft_worker).__name__} is not an EAGLE draft worker"
+                    if not eagle_draft
+                    else "no draft TRT-LLM MHA backend on an FP8 E4M3 KV cache "
+                    "with the TRT-LLM GenMHA decode"
+                )
+            ),
+        )
+    return taken
 
 
 def make_post_verify_io(

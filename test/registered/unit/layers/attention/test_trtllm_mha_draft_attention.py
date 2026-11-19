@@ -10,6 +10,7 @@ CPU-only.
     python -m pytest test/registered/unit/layers/attention/test_trtllm_mha_draft_attention.py -v
 """
 
+import contextlib
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -17,13 +18,20 @@ from unittest.mock import patch
 import torch
 
 from sglang.kernels.plugin_kernels.nvidia.spec import DraftAttentionView
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention import trtllm_mha_backend
+from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+    HybridLinearAttnBackend,
+)
 from sglang.srt.layers.attention.trtllm_mha_backend import (
     TRTLLMHAAttnBackend,
     TRTLLMMHAMetadata,
 )
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.speculative.eagle_worker_common import offer_draft_attention
+from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
+from sglang.srt.speculative.frozen_kv_mtp_worker_v2 import FrozenKVMTPDraftWorker
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -238,6 +246,89 @@ class TestDraftAttentionSeam(CustomTestCase):
                         k, v, _layer(), _batch(mode), True, None, decode=False
                     )
                 self.assertEqual(got, q_len)
+
+
+def _provider_switches():
+    """The runtime master on, the child unset so that it follows the master."""
+    stack = contextlib.ExitStack()
+    stack.enter_context(envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True))
+    field = envs.SGLANG_OPT_TRTLLM_MHA_DRAFT_PROVIDER_ATTENTION
+    stack.enter_context(field.override(None))
+    field.clear()
+    return stack
+
+
+def _worker(*backends):
+    """An EAGLE draft worker whose draft extend runs on its last backend."""
+    *steps, extend = backends
+    worker = object.__new__(EagleDraftWorker)
+    worker.__dict__.update(
+        draft_attn_backend=SimpleNamespace(attn_backends=tuple(steps))
+        if steps
+        else None,
+        draft_extend_attn_backend=extend,
+        draft_runner=SimpleNamespace(attn_backend=None),
+    )
+    return worker
+
+
+def _hybrid(full):
+    backend = HybridLinearAttnBackend.__new__(HybridLinearAttnBackend)
+    backend.full_attn_backend = full
+    return backend
+
+
+class TestDraftProviderAttentionChild(CustomTestCase):
+    """SGLANG_OPT_TRTLLM_MHA_DRAFT_PROVIDER_ATTENTION hands a provider's draft
+    attention to the draft worker's TRT-LLM MHA backends at worker init."""
+
+    def test_only_draft_backends_on_an_fp8_kv_cache_take_it(self):
+        """The child cannot bypass the backend's capability check: a target, BF16,
+        NVFP4 or XQA backend refuses, other backends are left alone."""
+        attention = lambda view: None
+        nvfp4, xqa = _backend(), _backend()
+        nvfp4.is_nvfp4_kvcache, xqa.is_xqa_impl = True, True
+        takers = (_backend(), _hybrid(_backend()))
+        refusers = (
+            _backend(draft=False),
+            _backend(kv_dtype=torch.bfloat16),
+            nvfp4,
+            xqa,
+            _hybrid(_backend(draft=False)),
+        )
+        other = SimpleNamespace(set_draft_attention=lambda attention: 1 / 0)
+        with _provider_switches():
+            taken = offer_draft_attention(
+                SimpleNamespace(draft_attention=attention),
+                draft_worker=_worker(*takers, *refusers, other),
+            )
+        self.assertEqual(taken, 2)
+        self.assertIs(takers[0]._draft_attention, attention)
+        self.assertIs(takers[1].full_attn_backend._draft_attention, attention)
+        for backend in refusers:
+            if isinstance(backend, HybridLinearAttnBackend):
+                backend = backend.full_attn_backend
+            self.assertIsNone(backend._draft_attention)
+        self.assertFalse(takers[0].set_draft_attention(None))
+        self.assertIsNone(takers[0]._draft_attention)
+
+    def test_a_draft_worker_other_than_eagle_s_declines(self):
+        """A frozen-KV MTP draft worker at top-k 1 holds its runner's plain backend,
+        not a multi-step one: its backends are not offered, and init goes on."""
+        backend = _backend()
+        frozen = object.__new__(FrozenKVMTPDraftWorker)
+        frozen.__dict__.update(
+            draft_attn_backend=backend,
+            draft_extend_attn_backend=None,
+            model_runner=SimpleNamespace(attn_backend=backend),
+        )
+        with _provider_switches():
+            taken = offer_draft_attention(
+                SimpleNamespace(draft_attention=lambda view: None),
+                draft_worker=frozen,
+            )
+        self.assertEqual(taken, 0)
+        self.assertIsNone(backend._draft_attention)
 
 
 if __name__ == "__main__":

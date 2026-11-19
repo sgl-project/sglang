@@ -1922,6 +1922,15 @@ class Envs:
     SGLANG_DISABLE_DRAFT_EXTEND_CUDA_GRAPH = EnvBool(False)
 
     # ===================================================================
+    # Speculative decoding: runtime fast paths
+    # ===================================================================
+    # The EAGLE draft worker's TRT-LLM MHA calls on an FP8 KV cache go to the
+    # megakernel provider's draft attention, which decides their arithmetic.
+    SGLANG_OPT_TRTLLM_MHA_DRAFT_PROVIDER_ATTENTION = EnvBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
+
+    # ===================================================================
     # Multimodal processing
     # ===================================================================
     SGLANG_VLM_CACHE_SIZE_MB = EnvInt(100)
