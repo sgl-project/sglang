@@ -2821,11 +2821,36 @@ class TestShardedFileStorage(CustomTestCase):
                 create_backend.assert_not_called()
                 self.assertFalse(controller.enable_storage)
 
+    def test_registered_backend_keeps_its_storage_config_and_io(self):
+        controller = self._controller(1, host_memory_mode="buffer_only")
+        pool = controller.storage_host_pool
+        pool.host_pool.storage_format_tag = "external-format"
+        with (
+            unittest.mock.patch(
+                "sglang.srt.arg_groups.kv_shard_hook._KV_SHARD_STORAGE_BACKENDS",
+                {"dynamic"},
+            ),
+            unittest.mock.patch.object(
+                StorageBackendFactory, "create_backend"
+            ) as create_backend,
+        ):
+            self._attach(controller, 1, storage_backend="dynamic")
+
+        config = controller.storage_config
+        create_backend.assert_called_once_with("dynamic", config, pool)
+        self.assertEqual(config.model_name, "model-external-format-dtype_bfloat16")
+        self.assertEqual(pool.storage_format_tag, "external-format")
+        self.assertIsNone(config.key_tp_rank)
+        self.assertIsNone(config.key_tp_size)
+        self.assertTrue(controller.backup_skip)
+        self.assertEqual(controller.page_get_func, controller._generic_page_get)
+        self.assertEqual(controller.page_set_func, controller._generic_page_set)
+
 
 class TestShardedStorageFormat(CustomTestCase):
     def test_mla_byte_formats_have_separate_namespaces(self):
         pool = _host_pool(0)
-        original = pool.storage_format_tag
+        original = pool.sharded_storage_format_tag
         for changes in (
             {"layout": "page_first"},
             {"dtype": torch.bfloat16},
@@ -2839,7 +2864,7 @@ class TestShardedStorageFormat(CustomTestCase):
                 self.subTest(changes=changes),
                 unittest.mock.patch.multiple(pool, **changes),
             ):
-                self.assertNotEqual(pool.storage_format_tag, original)
+                self.assertNotEqual(pool.sharded_storage_format_tag, original)
 
     def test_mha_head_geometry_is_part_of_the_namespace(self):
         tags = []
@@ -2868,15 +2893,17 @@ class TestShardedStorageFormat(CustomTestCase):
                 end_layer=device.end_layer,
             )
             pool = PageInterleaveHostPool(native, PageInterleavePlacement(_make_spec()))
-            tags.append(pool.storage_format_tag)
+            tags.append(pool.sharded_storage_format_tag)
         self.assertEqual(len(set(tags)), len(tags))
 
     def test_format_is_independent_of_rank_shard_count_and_capacity(self):
-        original = _host_pool(0).storage_format_tag
-        self.assertEqual(_host_pool(3, device_pages=64).storage_format_tag, original)
+        original = _host_pool(0).sharded_storage_format_tag
+        self.assertEqual(
+            _host_pool(3, device_pages=64).sharded_storage_format_tag, original
+        )
         pool = _host_pool(0)
         with unittest.mock.patch.multiple(pool, shard_rank=1, shard_size=2):
-            self.assertEqual(pool.storage_format_tag, original)
+            self.assertEqual(pool.sharded_storage_format_tag, original)
 
     def test_controller_uses_the_format_and_attention_head_shard(self):
         configs = []
@@ -2885,6 +2912,7 @@ class TestShardedStorageFormat(CustomTestCase):
             device = object.__new__(MLATokenToKVPool)
             device.dtype = torch.bfloat16
             controller = SimpleNamespace(
+                storage_backend_type="mooncake",
                 storage_host_pool=pool,
                 mem_pool_host=pool,
                 mem_pool_device=device,
@@ -2919,7 +2947,7 @@ class TestShardedStorageFormat(CustomTestCase):
             self.assertEqual(config.tp_rank, 2 * cp_rank + 1)
             self.assertEqual(
                 config.model_name,
-                f"model-{pool.storage_format_tag}-dtype_bfloat16-atp2",
+                f"model-{pool.sharded_storage_format_tag}-dtype_bfloat16-atp2",
             )
             configs.append(config)
         self.assertEqual(configs[0].model_name, configs[1].model_name)

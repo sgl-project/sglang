@@ -54,7 +54,7 @@ class PageInterleaveHostPool:
         return self.size * self.shard_size
 
     @property
-    def storage_format_tag(self) -> str:
+    def sharded_storage_format_tag(self) -> str:
         # Storage can be read by a different owner, or a different shard group.
         # Name the page bytes, excluding rank and pool capacity. Shape, dtype
         # and layer range must agree even when two formats have equal sizes.

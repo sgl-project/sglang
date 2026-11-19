@@ -122,7 +122,12 @@ class TestKVShardMooncakeIO(unittest.TestCase):
             is_mla_model=is_mla,
             enable_storage_metrics=False,
             is_page_first_layout=True,
-            model_name=storage_model_name("kv-shard-io", host, torch.bfloat16)
+            model_name=storage_model_name(
+                "kv-shard-io",
+                host,
+                torch.bfloat16,
+                storage_format_tag=host.sharded_storage_format_tag,
+            )
             + "-atp2",
             key_tp_rank=key_rank,
             key_tp_size=2,
@@ -162,7 +167,7 @@ class TestKVShardMooncakeIO(unittest.TestCase):
             self._store(host, rank, is_mla, namespace)
             for rank, host in enumerate(hosts)
         ]
-        self.assertEqual(len({host.storage_format_tag for host in hosts}), 1)
+        self.assertEqual(len({host.sharded_storage_format_tag for host in hosts}), 1)
         page_count = 7
         keys = [f"page-{page}" for page in range(page_count)]
         source = hosts[0].alloc(page_count * PAGE_SIZE, start_owner=0)

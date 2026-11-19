@@ -67,8 +67,10 @@ device_module = get_device_module()
 
 def storage_model_name(
     model_name: Optional[str],
-    host_pool: HostKVCache | LogicalHostPool,
+    host_pool: HostKVCache | LogicalHostPool | PageInterleaveHostPool,
     kv_cache_dtype: torch.dtype,
+    *,
+    storage_format_tag: Optional[str] = None,
 ) -> str:
     """Namespace storage keys by page format and the server's logical KV dtype."""
     if not isinstance(kv_cache_dtype, torch.dtype):
@@ -78,7 +80,7 @@ def storage_model_name(
         )
     parts = [
         model_name,
-        host_pool.storage_format_tag,
+        storage_format_tag or host_pool.storage_format_tag,
         f"dtype_{normalize_dtype(kv_cache_dtype)}",
     ]
     return "-".join(part for part in parts if part)
@@ -1024,13 +1026,22 @@ class HiCacheController:
 
         attn_cp_rank, attn_cp_size = self.get_attn_cp_rank_and_size()
         dcp_size = get_parallel().attn_dcp_size
+        host_pool = self.storage_host_pool
+        shard_storage_io = isinstance(
+            host_pool, PageInterleaveHostPool
+        ) and not kv_shard_storage_backend_supported(self.storage_backend_type)
         # Token KV views carry the server's resolved logical dtype, including
         # FP8 variants that share a uint8 backing buffer.
         model_name = storage_model_name(
-            model_name, self.storage_host_pool, getattr(anchor, "dtype", None)
+            model_name,
+            host_pool,
+            getattr(anchor, "dtype", None),
+            storage_format_tag=(
+                host_pool.sharded_storage_format_tag if shard_storage_io else None
+            ),
         )
         key_tp_rank = key_tp_size = None
-        if isinstance(self.storage_host_pool, PageInterleaveHostPool):
+        if shard_storage_io:
             # A page's owner depends on its chain's rotation, so keys name only
             # the head shard; the tag keeps writers of other page bytes apart.
             key_tp_rank, key_tp_size = parallel.attn_tp_rank, parallel.attn_tp_size
