@@ -189,14 +189,6 @@ rm -rf "${log_path}"
 mkdir -p "${log_path}"
 echo "Log path: ${log_path}"
 
-# Capture the actual image packages before K3 startup can fail. This uses the
-# same prepared environment/interpreter and artifact prefix as the Nightly run.
-if [ "${test_case}" = "test/registered/npu/accuracy/kimi_k3/test_npu_kimi_k3_w4a8_32p_gpqa.py" ]; then
-    "${PYTHON_FOR_SGLANG}" \
-        "${sglang_source_path}/python/sglang/srt/mem_cache/pool_host/npu_pin_diagnostics.py" \
-        --environment 2>&1 | tee -a "${log_path}/${tc_name}.log"
-fi
-
 if [ "${TROUBLE_SHOTTING}" = "true" ] || [ "${TROUBLE_SHOTTING}" = "True" ];then
     echo "TROUBLE_SHOTTING=true, the pod will keep alive for four hour."
     ( ${PYTHON_FOR_SGLANG} -u "${sglang_source_path}/${test_case}" "${test_method_args[@]}" 2>&1 || true ) | tee -a "${log_path}/${tc_name}.log"
