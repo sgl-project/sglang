@@ -1,4 +1,5 @@
 import ctypes
+import hashlib
 import json
 import logging
 import os
@@ -20,6 +21,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
     PoolTransferResult,
+    SidecarPoolSpec,
 )
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import DevicePoolEntry
 from sglang.srt.mem_cache.pool_host import HostKVCache, HostTensorAllocator
@@ -408,6 +410,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 if extra_config
                 else False
             )
+            self.pack_component_pools = (extra_config or {}).get(
+                "pack_component_pools", False
+            )
+            self._pool_bundles = ()
             self._use_group_semantics = (
                 self.enable_group_semantics
                 and self._supports_group_ids
@@ -865,6 +871,78 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         ]
         return component_keys, key_multiplier
 
+    def configure_sidecars(self, specs: tuple[SidecarPoolSpec, ...]) -> None:
+        groups = {}
+        if self.pack_component_pools:
+            for spec in specs:
+                groups.setdefault(spec.indices_from_pool, []).append(spec)
+        bundles = []
+        for source, sidecars in groups.items():
+            policies = {spec.hit_policy for spec in sidecars}
+            if len(policies) != 1 or PoolHitPolicy.BLOCK_GROUPS in policies:
+                continue
+            names = sorted(spec.pool_name for spec in sidecars)
+            if source in self.registered_pools:
+                names.insert(0, source)
+            if len(names) < 2:
+                continue
+            layout = []
+            for name in names:
+                pool = self.registered_pools.get(name)
+                if (
+                    not str(getattr(pool, "gpu_device", "")).startswith("cuda")
+                    or not getattr(pool, "page_size", None)
+                    or getattr(pool, "layer_num", None) is None
+                    or not callable(getattr(pool, "get_size_per_token", None))
+                ):
+                    break
+                suffixes, count = self._get_hybrid_page_component_keys(
+                    [""], PoolTransfer(name)
+                )
+                if count != 1:
+                    break
+                layout.append(
+                    (
+                        name,
+                        suffixes[0],
+                        pool.page_size,
+                        pool.layer_num,
+                        pool.get_size_per_token(),
+                    )
+                )
+            else:
+                if len({entry[2] for entry in layout}) == 1:
+                    digest = hashlib.sha256(
+                        json.dumps([source, layout]).encode()
+                    ).hexdigest()
+                    bundles.append((f"_pool_bundle_v1_{digest}", names))
+        self._pool_bundles = tuple(bundles)
+
+    def _object_groups(self, transfers, query_keys=None):
+        bundled = set()
+        if self._pool_bundles:
+            by_name = {transfer.name: transfer for transfer in transfers}
+            for suffix, names in self._pool_bundles:
+                present = [name for name in names if name in by_name]
+                if not present:
+                    continue
+                if query_keys is None and len(present) != len(names):
+                    raise ValueError(
+                        f"Incomplete pool bundle: expected {names}, got {present}"
+                    )
+                members = [by_name[name] for name in present]
+                keys = query_keys if query_keys is not None else members[0].keys
+                if query_keys is None and any(
+                    member.keys != keys for member in members
+                ):
+                    raise ValueError(f"Unaligned page keys for pool bundle {names}")
+                yield members, [f"{key}{suffix}" for key in keys], 1
+                bundled.update(present)
+        for transfer in transfers:
+            if transfer.name not in bundled:
+                keys = query_keys if query_keys is not None else transfer.keys
+                yield [transfer], *self._get_hybrid_page_component_keys(keys, transfer)
+
     def batch_exists_v2(
         self,
         keys: List[str],
@@ -890,14 +968,16 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
         prepared = []
         all_component_keys = []
-        for transfer in pool_transfers or []:
-            component_keys, key_multiplier = self._get_hybrid_page_component_keys(
-                keys, transfer
-            )
+        for members, component_keys, key_multiplier in self._object_groups(
+            pool_transfers or [], keys
+        ):
             component_keys = self._tag_keys(component_keys)
             start = len(all_component_keys)
             all_component_keys.extend(component_keys)
-            prepared.append((transfer, key_multiplier, start, len(all_component_keys)))
+            prepared.extend(
+                (member, key_multiplier, start, len(all_component_keys))
+                for member in members
+            )
 
         all_exists = self._batch_exist(all_component_keys) if all_component_keys else []
         for transfer, key_multiplier, start, end in prepared:
@@ -953,50 +1033,47 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         all_sizes = []
         all_group_ids = []
         buffer_requests = []
-        for transfer in transfers:
-            host_pool = self.registered_pools.get(transfer.name)
-            keys = transfer.keys
-            if host_pool is None:
-                raise ValueError(f"Unregistered Mooncake hybrid pool: {transfer.name}")
-            page_size = host_pool.page_size or 1
-            host_indices = transfer.host_indices
-            assert len(keys) > 0
-            assert len(keys) == len(host_indices) // page_size
-
-            tagged_keys = self._tag_keys(keys)
-            key_strs, key_multiplier = self._get_hybrid_page_component_keys(
-                keys, transfer
-            )
+        for members, key_strs, key_multiplier in self._object_groups(transfers):
+            keys = members[0].keys
             key_strs = self._tag_keys(key_strs)
             start = len(all_key_strs)
             all_key_strs.extend(key_strs)
-            buffer_requests.append(
-                (host_pool, host_indices, key_strs, key_multiplier, start)
-            )
+            buffer_requests.append((members, key_strs, key_multiplier, start))
             if is_set and self._can_use_group_semantics():
                 all_group_ids.extend(
-                    self._expand_group_ids(tagged_keys, key_multiplier)
+                    self._expand_group_ids(self._tag_keys(keys), key_multiplier)
                 )
-            prepared.append((transfer.name, key_multiplier, start, len(all_key_strs)))
+            prepared.append((members, key_multiplier, start, len(all_key_strs)))
 
         if not prepared:
             return {}
 
         exist_result = self._batch_exist(all_key_strs) if is_set else None
-        for host_pool, host_indices, key_strs, key_multiplier, start in buffer_requests:
-            pool_ptrs, pool_sizes = self._build_pool_buffer_meta(
-                host_pool=host_pool,
-                host_indices=host_indices,
-                key_strs=key_strs,
-                key_multiplier=key_multiplier,
-                exist_states=(
-                    exist_result[start : start + len(key_strs)]
-                    if exist_result is not None
-                    else None
-                ),
-            )
-            all_ptrs.extend(pool_ptrs)
-            all_sizes.extend(pool_sizes)
+        for members, key_strs, key_multiplier, start in buffer_requests:
+            for member_idx, member in enumerate(members):
+                pool = self.registered_pools[member.name]
+                assert member.keys and len(member.keys) == len(member.host_indices) // (
+                    pool.page_size or 1
+                )
+                ptrs, sizes = self._build_pool_buffer_meta(
+                    pool,
+                    member.host_indices,
+                    key_strs,
+                    key_multiplier,
+                    exist_result[start : start + len(key_strs)] if is_set else None,
+                )
+                if len(members) == 1:
+                    all_ptrs.extend(ptrs)
+                    all_sizes.extend(sizes)
+                    continue
+                if member_idx == 0:
+                    all_ptrs.extend([] for _ in key_strs)
+                    all_sizes.extend([] for _ in key_strs)
+                for offset, (ptr, size) in enumerate(zip(ptrs, sizes), start):
+                    all_ptrs[offset].extend(ptr if isinstance(ptr, Sequence) else [ptr])
+                    all_sizes[offset].extend(
+                        size if isinstance(size, Sequence) else [size]
+                    )
 
         if any(isinstance(ptr, Sequence) for ptr in all_ptrs):
             all_ptrs = [
@@ -1028,12 +1105,19 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             )
 
         results: dict = {}
-        for name, key_multiplier, start, end in prepared:
-            results[name] = self._batch_postprocess(
-                io_results[start:end],
-                is_set_operate=is_set,
-                key_multiplier=key_multiplier,
-            )
+        for members, key_multiplier, start, end in prepared:
+            if len(members) > 1 and not is_set:
+                hits = [
+                    idx < len(io_results) and io_results[idx] == sum(all_sizes[idx])
+                    for idx in range(start, end)
+                ]
+            else:
+                hits = self._batch_postprocess(
+                    io_results[start:end],
+                    is_set_operate=is_set,
+                    key_multiplier=key_multiplier,
+                )
+            results.update((member.name, hits) for member in members)
         return results
 
     def _build_pool_buffer_meta(

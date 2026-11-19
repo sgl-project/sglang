@@ -331,6 +331,21 @@ layer-first page metadata, Mooncake Store uses Mooncake's multi-buffer zero-copy
 APIs (`batch_put_from_multi_buffers` / `batch_get_into_multi_buffers`) to store
 each logical page across its per-layer buffers.
 
+Set `"pack_component_pools": true` in `--hicache-storage-backend-extra-config`
+to store compatible CUDA host pools as one Mooncake object per component page.
+The unified cache supplies the pool topology: sidecars must share an index
+source, page size and hit policy. The source joins the bundle if registered
+on the hybrid transfer path. A physical main KV pool on the separate primary
+path is not bundled. FULL and SWA retain independent keys and hit policies.
+Singletons, block-group layouts and pools requiring multiple native keys per
+page keep their original keys. Bundling uses scatter/gather; it does not copy
+the tensors into a contiguous staging buffer.
+
+The default is `false`. Use the same setting and pool layout on readers and
+writers: bundled keys use a distinct namespace and do not reuse objects from
+the unbundled or earlier experimental layouts. Fewer keys do not guarantee
+higher bandwidth.
+
 ### Distributed Deployment
 
 Distributed deployment of Mooncake is straightforward. Similar to the single-node setup, start one `metadata service` and one `master service` for this cluster. Then start a `store service` on each server.

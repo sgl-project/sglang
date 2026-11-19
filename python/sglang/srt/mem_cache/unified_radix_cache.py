@@ -592,6 +592,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 raise RuntimeError("HiCache controller is not attached.")
             self.cache_controller.register_host_pool_entry(entry)
         self.sidecar_pool_specs.append(spec)
+        if self.cache_controller is not None:
+            self.cache_controller.configure_storage_sidecars(self.sidecar_pool_specs)
 
     def release_host_resources(self) -> None:
         if self.linker is not None:

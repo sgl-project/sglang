@@ -188,6 +188,9 @@ class HiCacheStorage(ABC):
             self.registered_pools = {}
         self.registered_pools[host_pool_name] = host_pool
 
+    def configure_sidecars(self, specs: tuple[SidecarPoolSpec, ...]) -> None:
+        """Publish the current sidecar topology after host pool registration."""
+
     def on_host_pools_registered(self) -> None:
         """The initial host-pool registration burst is over: the anchor pool
         (``register_mem_pool_host``) and every host pool group entry

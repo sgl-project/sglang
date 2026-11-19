@@ -33,6 +33,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
     PoolTransferResult,
+    SidecarPoolSpec,
     count_pool_hits,
 )
 from sglang.srt.mem_cache.l2_transfer import L2Transfer
@@ -223,6 +224,7 @@ class HybridCacheController(BaseHiCacheController):
         host_memory_mode: str = "cache",
     ):
         startup_storage_backend = storage_backend
+        self.storage_sidecars: tuple[SidecarPoolSpec, ...] = ()
         self.extra_host_mem_release_queues: dict[PoolName, Queue[torch.Tensor]] = {}
         self.pp_prefetch_command_group = None
         self.pp_prefetch_command_thread = None
@@ -347,7 +349,14 @@ class HybridCacheController(BaseHiCacheController):
 
         for entry in host_pools or []:
             self.storage_backend.register_mem_host_pool_v2(entry.host_pool, entry.name)
+        if self.storage_sidecars:
+            self.storage_backend.configure_sidecars(self.storage_sidecars)
         self.storage_backend.on_host_pools_registered()
+
+    def configure_storage_sidecars(self, specs: list[SidecarPoolSpec]) -> None:
+        self.storage_sidecars = tuple(specs)
+        if self.enable_storage:
+            self.storage_backend.configure_sidecars(self.storage_sidecars)
 
     def detach_storage_backend(self):
         super().detach_storage_backend()
