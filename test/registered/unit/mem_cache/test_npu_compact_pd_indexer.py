@@ -1,7 +1,6 @@
 """CPU allocation and geometry checks for opt-in NPU PD indexer elision."""
 
 import unittest
-from enum import Enum
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -70,7 +69,10 @@ class TestNPUCompactPDIndexer(CustomTestCase):
             layer_info=SimpleNamespace(
                 start_layer=0, end_layer=8, num_effective_layers=8
             ),
-            server_args=SimpleNamespace(enable_hisparse=False),
+            server_args=SimpleNamespace(
+                enable_hisparse=False, indexer_kv_cache_dtype=None
+            ),
+            use_combined_kv_buffer=False,
             mambaish_config=None,
             is_draft_worker=False,
             kv_cache_dtype=dtype,
@@ -80,7 +82,10 @@ class TestNPUCompactPDIndexer(CustomTestCase):
     def build_pool(self, compact=True, dtype=torch.bfloat16):
         with envs.SGLANG_NPU_COMPACT_DSA_INDEXER.override(compact):
             return config.KVCacheConfigurator._build_ascend_mla_kv_pool(
-                self.configurator(dtype), max_total_num_tokens=256, is_dsa_model=True
+                self.configurator(dtype),
+                max_total_num_tokens=256,
+                max_running_requests=8,
+                is_dsa_model=True,
             )
 
     def enabled(
@@ -239,15 +244,12 @@ class TestNPUCompactPDIndexer(CustomTestCase):
         pool.layer_num = 3
         pool.indexer_layer_ids = (2, 4)
         pool.index_k_scale_buffer = object()
+        pool.use_combined_kv_buffer = False
         pool.dsa_kv_cache_store_fp8 = True
         self.assertEqual(pool.get_kv_layer_ids(), [2, 3, 4, 2, 4, 2, 4])
 
     def test_l2_backup_and_restore_preserve_compact_rows(self):
-        class Direction(Enum):
-            H2D = 1
-            D2H = 2
-
-        def exchange(**kwargs):
+        def exchange(backup, **kwargs):
             for name in ("k", "v", "index_k", "index_k_scale"):
                 device, host = kwargs["device_" + name], kwargs["host_" + name]
                 if device is None or host is None or not device.numel():
@@ -257,7 +259,7 @@ class TestNPUCompactPDIndexer(CustomTestCase):
                     kwargs["device_indices"][::128], kwargs["host_indices"][::128]
                 ):
                     dev, src = int(dev) // 128, int(src) // 128
-                    if kwargs["direction"] == Direction.D2H:
+                    if backup:
                         host[src].copy_(device[:, dev])
                     else:
                         device[:, dev].copy_(host[src])
@@ -276,19 +278,19 @@ class TestNPUCompactPDIndexer(CustomTestCase):
                     for tensor in (pool.k_buffer, pool.v_buffer, pool.index_k_buffer)
                 ]
                 with (
-                    patch.object(mla, "_is_npu", True),
-                    patch.object(
-                        mla, "memfabric_host_memory_enabled", return_value=False
-                    ),
-                    patch.object(mla, "ascendc_io_enabled", return_value=False),
-                    patch.object(mla, "TransferDirection", Direction, create=True),
+                    patch.object(mla, "make_kernel_ptr_table", return_value=None),
                     patch.object(
                         mla,
-                        "transfer_kv_dim_exchange",
-                        side_effect=exchange,
+                        "transfer_kv_all_layer_kv_split_lf_pf",
+                        side_effect=lambda **kwargs: exchange(True, **kwargs),
                         create=True,
-                    ) as copy,
-                    patch.object(mla, "make_kernel_ptr_table", return_value=None),
+                    ) as backup,
+                    patch.object(
+                        mla,
+                        "transfer_kv_per_layer_kv_split_pf_lf",
+                        side_effect=lambda **kwargs: exchange(False, **kwargs),
+                        create=True,
+                    ) as restore,
                     patch.dict(
                         mla.ALLOC_MEMORY_FUNCS,
                         {
@@ -298,8 +300,8 @@ class TestNPUCompactPDIndexer(CustomTestCase):
                         },
                     ),
                     patch(
-                        "sglang.srt.mem_cache.pool_host.base.host_memory_budget_bytes",
-                        return_value=1 << 40,
+                        "sglang.srt.mem_cache.pool_host.base.host_memory_preflight",
+                        return_value=(1 << 20, 1 << 40),
                     ),
                 ):
                     host = mla.MLATokenToKVPoolHost(
@@ -315,6 +317,7 @@ class TestNPUCompactPDIndexer(CustomTestCase):
                         end_layer=8,
                         target_layer_num=8,
                     )
+                    host._init_npu_transfer_bindings()
                     self.assertEqual(host.index_k_buffer.shape[1], 3)
                     device_ids = torch.arange(256)
                     host_ids = torch.cat((torch.arange(256, 384), torch.arange(128)))
@@ -327,28 +330,21 @@ class TestNPUCompactPDIndexer(CustomTestCase):
                         host.load_to_device_per_layer(
                             pool, host_ids, device_ids, layer, "kernel_ascend"
                         )
-                    self.assertEqual(copy.call_count, 2)
+                    self.assertEqual(backup.call_count, 1)
+                    self.assertEqual(restore.call_count, 8)
                     for actual, original in zip(
                         (pool.k_buffer, pool.v_buffer, pool.index_k_buffer), expected
                     ):
                         torch.testing.assert_close(actual, original, rtol=0, atol=0)
-                    native = pool._mla_buffer_info().buffers
-                    self.assertEqual(
-                        [
-                            host._indexer_slot_range_for_layer(native, layer)
-                            for layer in range(8)
-                        ],
-                        [
-                            (0, 1),
-                            (0, 0),
-                            (0, 0),
-                            (1, 1),
-                            (0, 0),
-                            (0, 0),
-                            (2, 1),
-                            (0, 0),
-                        ],
-                    )
+                    for layer in range(8):
+                        bound = host._npu_layer_bindings[layer]["device_index_k"]
+                        if layer in pool.indexer_layer_ids:
+                            slot = pool.indexer_layer_ids.index(layer)
+                            self.assertEqual(
+                                bound.data_ptr(), pool.index_k_buffer[slot].data_ptr()
+                            )
+                        else:
+                            self.assertIsNone(bound)
 
 
 if __name__ == "__main__":
