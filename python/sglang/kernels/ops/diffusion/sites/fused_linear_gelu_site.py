@@ -130,12 +130,22 @@ def can_use_linear_gelu_static(linear: Any) -> bool:
 _VERDICTS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 
 
+def _vendor_gelu_epilogue_is_slow() -> bool:
+    """Archs whose vendor BLAS picks a GELU epilogue slower than GEMM + GELU."""
+    arch = current_arch()
+    # Measured: cublasLt on SM120 loses to GEMM + the native GELU kernel for the
+    # FLUX production shape (1, 512, 3072 -> 12288); SM90 dispatch is unchanged.
+    if arch.is_sm_at_least(12):
+        return True
+    # Measured on gfx1250: hipBLASLt runs the epilogue as a Tensile MT32x16x32
+    # kernel ~13x slower than GEMM + GELU at every M (249 ms vs 19 ms at M=90000).
+    # `is_sm_at_least` answers for NVIDIA only, so HIP needs its own branch.
+    hip = arch.hip
+    return hip is not None and hip.gcn_arch.startswith("gfx12")
+
+
 def _input_independent_ok(linear: Any) -> bool:
-    if current_arch().is_sm_at_least(12):
-        # The cublasLt GELU epilogue selected by current SM120 PyTorch/CUDA
-        # builds is slower than GEMM + the native GELU kernel for the FLUX
-        # production shape (1, 512, 3072 -> 12288).  Keep quality-gated sites
-        # on their existing eager path on RTX 5090; SM90 dispatch is unchanged.
+    if _vendor_gelu_epilogue_is_slow():
         return False
     return can_use_linear_gelu_static(linear)
 
