@@ -216,7 +216,11 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
     @property
     def max_resident(self) -> int:
         """At most this many slots: on the disk tier, a wave reads each of up to K experts
-        into a host row of its own."""
+        into a host row of its own, and the plan kernel bounds K."""
+        if self.tiered:
+            from sglang.srt.layers.moe.paged_experts import disk_tier
+
+            return min(self.host_rows, disk_tier._MAX_TIER_SLOTS)
         return self.host_rows
 
     def _expert_cache(self, layer) -> Optional[ExpertCache]:
