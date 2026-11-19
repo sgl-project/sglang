@@ -37,6 +37,7 @@ from sglang.srt.observability.utils import generate_buckets
 from sglang.srt.runtime_context import (
     get_device,
     get_disagg,
+    get_exec,
     get_lora,
     get_memory,
     get_mm,
@@ -90,11 +91,6 @@ def _build_server_args(
         "prefill": ext.DisaggregationMode.Prefill,
         "decode": ext.DisaggregationMode.Decode,
     }[get_disagg().disaggregation_mode]
-    grpc_port = (
-        None
-        if get_serving().smg_grpc_mode or get_serving().grpc_mode
-        else get_serving().grpc_port
-    )
     deployment_info = {
         "disaggregation_bootstrap_port": get_disagg().disaggregation_bootstrap_port,
         "node_rank": get_parallel().node_rank,
@@ -113,6 +109,12 @@ def _build_server_args(
         "max_prefill_tokens": get_schedule().max_prefill_tokens,
         "enable_dp_attention": get_parallel().attn_dp_size > 1,
         "speculative_algorithm": get_spec().speculative_algorithm,
+        "speculative_ngram_external_corpus_max_tokens": get_spec().speculative_ngram_external_corpus_max_tokens,
+        "gc_threshold": get_device().gc_threshold,
+        "enable_pd_role_switch": get_disagg().enable_pd_role_switch,
+        "elastic_ep_backend": get_exec().moe.elastic_ep_backend,
+        "enable_streaming_session": get_serving().enable_streaming_session,
+        "engine_info_bootstrap_url": scheduler.server_args.engine_info_bootstrap_url,
         "enable_hierarchical_cache": get_memory().enable_hierarchical_cache,
         "hicache_ratio": get_memory().hicache_ratio,
         "hicache_size": get_memory().hicache_size,
@@ -128,7 +130,7 @@ def _build_server_args(
         ),
         # Every Rust listener of the deployment (`RustServer.gather_server_endpoints`).
         "rust_server_endpoints": scheduler.rust_server_endpoints,
-        "node_listeners": _node_listeners(grpc_port=grpc_port),
+        "node_listeners": _node_listeners(grpc_port=get_serving().grpc_port),
     }
     # `/v1/loads` reads this rank's slot of the scheduler's shared-memory
     # snapshots directly, from the file on this node even under multi-node DP;
@@ -150,9 +152,17 @@ def _build_server_args(
         hicache_write_policy=get_memory().hicache_write_policy,
         host=get_serving().host,
         port=get_serving().port,
-        # The shared field is also populated for legacy SMG mode; only forward
-        # it when it selects SGLang's native gRPC transport.
-        grpc_port=grpc_port,
+        http2=(
+            ext.Http2Config(
+                max_concurrent_streams=get_serving().http2_max_concurrent_streams,
+                initial_connection_window_size=(
+                    get_serving().http2_initial_connection_window_size
+                ),
+            )
+            if get_serving().enable_http2
+            else None
+        ),
+        grpc_port=get_serving().grpc_port,
         grpc_response_timeout_secs=get_serving().grpc_response_timeout_secs,
         api_key=get_serving().api_key,
         admin_api_key=get_serving().admin_api_key,
@@ -216,6 +226,7 @@ def _build_server_args(
         ),
         allow_auto_truncate=get_serving().allow_auto_truncate,
         enable_return_hidden_states=sa.enable_return_hidden_states,
+        return_hidden_states_mode=sa.return_hidden_states_mode,
         # Not a `server_args` field: `TokenizerManager` derives it, and the
         # rust ingress needs the same number for its total-token check.
         num_reserved_tokens=compute_num_reserved_tokens(),
@@ -485,9 +496,6 @@ def _launch_server_info(scheduler: Scheduler) -> str:
             build_server_info(scheduler.server_args, scheduler_info)
         )
     )
-    # The Rust listener speaks HTTP/1 only, whatever `--enable-http2` says; a
-    # router reads this key to pick its protocol.
-    info["enable_http2"] = False
     _redact_api_keys(info, scheduler.server_args)
     return json.dumps(info, default=str)
 

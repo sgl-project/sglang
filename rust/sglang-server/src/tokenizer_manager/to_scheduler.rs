@@ -20,9 +20,9 @@ use crate::utils::{
     fsm::{Event, RequestState, ValidationOutcome},
 };
 
-/// Longest client-supplied rid accepted. It keys the detok table and travels on
-/// every chunk, so its length is a recurring cost; Python mints 32-byte uuid hex.
-pub(super) const MAX_RID_LEN: usize = 128;
+/// Longest client-supplied rid accepted, in UTF-8 bytes. Namespaced caller IDs
+/// can exceed a UUID; keep their per-step wire and detokenizer-table cost bounded.
+pub(super) const MAX_RID_LEN: usize = 256;
 
 /// Intake FSM dispatcher stage. Owns its inbox + downstream handles, so the
 /// runtime spawns it as a [`Runnable`] rather than calling a free `run_*` fn
@@ -547,15 +547,15 @@ impl Intake {
         // buffers out; the resulting values own their data, so no borrow
         // outlives a `fail(&mut req)`.
         let serialized = match &mut req.kind {
-            RequestKind::Generate(g) if g.already_tokenized() => {
-                g.encode_header().map(|header| (header, g.take_buffers()))
-            }
+            RequestKind::Generate(g) if g.already_tokenized() => g
+                .encode_header()
+                .map(|header| (header, g.take_buffers(), g.dispatch_finish_time.clone())),
             RequestKind::Generate(_) => Err(Error::Tokenize("empty input_ids".into())),
             _ => Err(Error::Internal(
                 "non-generate request reached push_to_channel".into(),
             )),
         };
-        let (header, buffers) = match serialized {
+        let (header, buffers, dispatch_finish_time) = match serialized {
             Ok(v) => v,
             Err(e) => {
                 self.fail(&mut req, e, true); // on the push path: registered
@@ -563,10 +563,14 @@ impl Intake {
             }
         };
 
+        // Stamped before the push: once the scheduler has the request, its
+        // response can reach the hook that reads the stamp.
+        dispatch_finish_time.set_now();
         if !self
             .to_scheduler_tx
             .try_push(SchedulerRequest { header, buffers })
         {
+            dispatch_finish_time.clear();
             self.fail(&mut req, Error::QueueFull, true); // registered
         }
         // On success the scheduler owns the request (response arrives by rid); we

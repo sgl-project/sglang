@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     MatchPrefixParams,
 )
+from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
 from sglang.srt.mem_cache.common import match_kv_cache
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
@@ -46,6 +47,7 @@ from sglang.srt.mem_cache.unified_radix_cache import (
     _OngoingPrefetch,
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.utils.device import is_pin_memory_available
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.unified_radix_cache.config import (
     CacheConfig,
@@ -93,7 +95,11 @@ def _window_hit(req):
 
 
 register_cuda_ci(est_time=28, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=28, suite="stage-b-test-1-gpu-small-amd")
+register_amd_ci(est_time=28, suite="base-b-test-1-gpu-small-amd")
+
+
+# About 0.15 s on a 2 GHz GPU, far longer than any admission step.
+GPU_STALL_CYCLES = 300_000_000
 
 
 class TestUnifiedRadixCacheEagleHiCacheStorageKey(
@@ -1490,6 +1496,107 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         cons.sanity_check()
 
     @requires_hicache
+    def test_buffer_only_load_back_admission_never_waits_for_the_gpu(self):
+        """init_load_back returns while a queued GPU stall still runs: in
+        serving that stall is the forward the scheduler stream waits on."""
+        if not is_pin_memory_available("cuda"):
+            self.skipTest("without pinned memory the flag copy waits for the GPU")
+        storage_dir = self._make_storage_dir()
+        seq = self._buffer_swa_seq()
+        warm_seq = self._make_seq(100001, len(seq) // self.cfg.page_size)
+        self._produce_buffer_l3(storage_dir, warm_seq)
+        self._produce_buffer_l3(storage_dir, seq)
+        cons, _, _ = self._build_buffer_hicache_fixture(storage_dir)
+
+        def stage(name, tokens):
+            req_id = CacheRequestHandle(name, 0)
+            cons.prefetch_from_storage(
+                req_id, cons.root_node_handle(), array("q", tokens), None, None
+            )
+            self._pump_hicache_until(
+                cons,
+                lambda: (
+                    cons.check_prefetch_progress(req_id)
+                    and cons.buffer_pipeline.has_staged(req_id)
+                ),
+                "prefetch did not stage",
+            )
+            return req_id
+
+        # A process's first load-back loads its CUDA kernels, which waits for the GPU once.
+        self._consume_staged_prefetch(cons, stage("warm-up", warm_seq))
+        req_id = stage("load-back-no-sync", seq)
+        init_load_back = cons.init_load_back
+
+        def init_load_back_without_sync(params):
+            torch.cuda.synchronize()
+            torch.cuda._sleep(GPU_STALL_CYCLES)
+            torch.cuda.set_sync_debug_mode("error")
+            try:
+                result = init_load_back(params)
+            finally:
+                torch.cuda.set_sync_debug_mode("default")
+            self.assertFalse(
+                torch.cuda.current_stream().query(), "init_load_back waited for the GPU"
+            )
+            torch.cuda.synchronize()
+            return result
+
+        with mock.patch.object(
+            cons, "init_load_back", side_effect=init_load_back_without_sync
+        ):
+            spliced = self._consume_staged_prefetch(cons, req_id)
+        self.assertEqual(len(spliced), len(seq))
+        self.assertFalse(
+            cons.buffer_pipeline._ownership_checks, "an ack left its check pending"
+        )
+        cons.sanity_check()
+
+    @requires_hicache
+    def test_buffer_only_load_back_row_mismatch_raises_at_the_ack(self):
+        """Rows that differ from the H2D destinations at the same length pass
+        admission and raise when the load-back's ack reads the GPU comparison."""
+        storage_dir = self._make_storage_dir()
+        seq = self._buffer_swa_seq()
+        self._produce_buffer_l3(storage_dir, seq)
+        cons, _, _ = self._build_buffer_hicache_fixture(storage_dir)
+        req_id = CacheRequestHandle("row-mismatch", 0)
+        cons.prefetch_from_storage(
+            req_id, cons.root_node_handle(), array("q", seq), None, None
+        )
+        self._pump_hicache_until(
+            cons,
+            lambda: (
+                cons.check_prefetch_progress(req_id)
+                and cons.buffer_pipeline.has_staged(req_id)
+            ),
+            "prefetch did not stage",
+        )
+        path_device_indices = cons.path_device_indices
+
+        def path_with_last_rows_swapped(node):
+            rows = path_device_indices(node).clone()
+            rows[[-2, -1]] = rows[[-1, -2]]
+            return rows
+
+        init_load_back = cons.init_load_back
+        admitted = []
+
+        def init_load_back_with_swapped_rows(params):
+            with mock.patch.object(
+                cons, "path_device_indices", side_effect=path_with_last_rows_swapped
+            ):
+                admitted.append(init_load_back(params))
+            return admitted[-1]
+
+        with mock.patch.object(
+            cons, "init_load_back", side_effect=init_load_back_with_swapped_rows
+        ):
+            with self.assertRaisesRegex(RuntimeError, "ownership violation"):
+                self._consume_staged_prefetch(cons, req_id)
+        self.assertEqual(len(admitted), 1, "admission raised instead of the ack")
+
+    @requires_hicache
     @requires(
         lambda cfg: cfg.components == (ComponentType.FULL,) and cfg.page_size == 4,
         "one FULL page_size=4 fixture covers the decode L3 promise",
@@ -2686,6 +2793,33 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
 define_config_test_classes(UnifiedRadixCacheStorageSuite, globals())
 
 
+@unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+class TestBufferLoadBackOwnershipCheck(CustomTestCase):
+    def test_ownership_mismatch_raises_at_the_ack(self):
+        """One differing row raises at the ack, after the queued compare ran."""
+        if not is_pin_memory_available("cuda"):
+            self.skipTest("without pinned memory the flag copy waits for the GPU")
+        pipeline = BufferModePipeline.__new__(BufferModePipeline)
+        pipeline._ownership_checks = {}
+        canonical = torch.arange(64, device="cuda")
+        # Equal rows pass; this also loads the compare's kernels before the stall.
+        pipeline._check_ownership(-2, canonical, canonical.clone(), "violation")
+        pipeline._verify_ownership(-2)
+        moved = canonical.clone()
+        moved[5] += 1
+        torch.cuda.synchronize()
+        torch.cuda._sleep(GPU_STALL_CYCLES)
+        pipeline._check_ownership(-1, canonical, moved, "violation")
+        self.assertFalse(
+            torch.cuda.current_stream().query(), "the check waited for the GPU"
+        )
+        copied = pipeline._ownership_checks[-1].copied
+        with self.assertRaisesRegex(RuntimeError, "violation"):
+            pipeline._verify_ownership(-1)
+        self.assertTrue(copied.query(), "the ack read the flag before the compare ran")
+        self.assertFalse(pipeline._ownership_checks)
+
+
 @unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
 class TestUnifiedTreeCoreSWAPrefetchBackends(UnifiedRadixCacheFixtures, CustomTestCase):
     cfg = CacheConfig(
@@ -2825,7 +2959,7 @@ class TestPrefetchCommitOrdering(CustomTestCase):
         cache.page_size = 1
         cache.enable_storage_metrics = False
         cache.buffer_pipeline = None  # cache-mode commit path
-        cache.cache_controller.pp_prefetch_decisions = {}
+        cache._is_pp_ticketed.return_value = False
         walk_action = object()
         insert_result = mock.MagicMock()
         insert_result.cache_actions = [walk_action]
@@ -3020,6 +3154,91 @@ class TestUnifiedRadixPrefetchCorruption(
         )
         cache.storage_metrics_collector.log_storage_prefetch_unfulfilled_tokens.assert_called_once_with(
             completed_tokens, "dropped"
+        )
+
+        cache.sanity_check()
+
+    def test_prefetch_over_already_cached_span_reports_already_cached(self):
+        """A span another request cached during the read is freed as a duplicate
+        and reported; only the new tail is credited as loaded from storage."""
+        cache, allocator, _ = build_fixture(self.cfg)
+        self._init_hicache(cache)
+        cache.enable_storage_metrics = True
+        cache.storage_metrics_collector = mock.Mock()
+
+        parent_id = self._insert_device(
+            cache, allocator, list(range(1, 1 + 3 * self.ps))
+        )
+        self.assertGreater(write_backup(cache, parent_id), 0)
+        # Another request lands the first two pages of the span on host first.
+        cached_id = self._attach_host_child(cache, parent_id, start_token=1000)
+        self.assertIsNotNone(cached_id)
+        cached_tokens = 2 * self.ps
+
+        prefetch_key = RadixKey(
+            array("q", list(range(1000, 1000 + 3 * self.ps)))
+        ).page_aligned(self.ps)
+        completed_tokens = len(prefetch_key)
+        host_indices = cache.cache_controller.mem_pool_host.alloc(completed_tokens)
+        self.assertIsNotNone(host_indices)
+        host_used = cache.cache_controller.mem_pool_host.size - (
+            cache.cache_controller.mem_pool_host.available_size()
+        )
+
+        operation = mock.Mock()
+        operation.host_indices = host_indices
+        operation.completed_tokens = completed_tokens
+        operation.storage_start = 0
+        operation.pool_storage_result = PoolTransferResult(
+            kv_hit_pages=completed_tokens // self.ps, extra_pool_hit_pages={}
+        )
+        anchor_lock_params = cache.inc_host_lock_ref(parent_id).to_dec_params()
+        req_id = CacheRequestHandle("already-cached", 0)
+        operation.handle = req_id
+        operation.request_id = req_id.rid
+        cache.ongoing_prefetch[req_id] = _OngoingPrefetch(
+            parent_id,
+            prefetch_key,
+            host_indices,
+            operation,
+            anchor_lock_params,
+            {},
+        )
+        cache._record_storage_prefetch_hit(req_id, completed_tokens)
+        cache.cache_controller.prefetch_tokens_occupied = completed_tokens
+        hashes = [f"h{i}" for i in range(completed_tokens // self.ps)]
+        operation.hash_value = hashes
+
+        with (
+            mock.patch.object(cache, "_can_terminate_prefetch", return_value=True),
+            mock.patch.object(
+                cache,
+                "_check_hybrid_prefetch_result",
+                return_value=completed_tokens,
+            ),
+            mock.patch.object(
+                cache.cache_controller,
+                "terminate_prefetch",
+                return_value=(completed_tokens, hashes),
+            ),
+            mock.patch.object(operation, "is_terminated", return_value=False),
+        ):
+            self.assertTrue(cache.check_prefetch_progress(req_id))
+
+        self.assertEqual(
+            cache.pop_prefetch_loaded_tokens(req_id), completed_tokens - cached_tokens
+        )
+        # The duplicate head goes back to the host pool; the tail stays in the tree.
+        self.assertEqual(
+            cache.cache_controller.mem_pool_host.size
+            - cache.cache_controller.mem_pool_host.available_size(),
+            host_used - cached_tokens,
+        )
+        cache.storage_metrics_collector.log_prefetched_tokens.assert_called_once_with(
+            completed_tokens
+        )
+        cache.storage_metrics_collector.log_storage_prefetch_unfulfilled_tokens.assert_called_once_with(
+            cached_tokens, "already_cached"
         )
 
         cache.sanity_check()
