@@ -55,18 +55,24 @@ class TestRegisteredNPUHostAllocation(unittest.TestCase):
     def test_npu_host_backend_defaults_to_acl_without_setting_environment(self):
         path = ROOT / "python/sglang/srt/mem_cache/pool_host/npu_host_memory.py"
         names = {
-            "host_memory_backend", "memfabric_host_memory_enabled",
-            "acl_host_memory_enabled", "get_host_memory_backend",
+            "host_memory_backend",
+            "memfabric_host_memory_enabled",
+            "acl_host_memory_enabled",
+            "get_host_memory_backend",
         }
         functions = [
-            n for n in ast.parse(path.read_text()).body
+            n
+            for n in ast.parse(path.read_text()).body
             if isinstance(n, ast.FunctionDef) and n.name in names
         ]
         acl = type("AclHostMemoryBackend", (), {})
         mf = type("MemfabricHostMemoryBackend", (), {})
         namespace = dict(
-            os=os, NpuHostMemoryBackend=object,
-            AclHostMemoryBackend=acl, MemfabricHostMemoryBackend=mf, _backend=None,
+            os=os,
+            NpuHostMemoryBackend=object,
+            AclHostMemoryBackend=acl,
+            MemfabricHostMemoryBackend=mf,
+            _backend=None,
         )
         exec(compile(ast.Module(functions, []), str(path), "exec"), namespace)
         env_name = "SGLANG_HICACHE_HOST_MEM_BACKEND"
@@ -85,11 +91,13 @@ class TestRegisteredNPUHostAllocation(unittest.TestCase):
                     self.assertEqual(os.environ.get(env_name), setting)
 
     def test_mha_draft_layout_preserves_npu_layer_order(self):
-        path = ROOT / "python/sglang/srt/mem_cache/hybrid_cache/hybrid_pool_assembler.py"
+        path = (
+            ROOT / "python/sglang/srt/mem_cache/hybrid_cache/hybrid_pool_assembler.py"
+        )
         function = next(
-            n for n in ast.parse(path.read_text()).body
-            if isinstance(n, ast.FunctionDef)
-            and n.name == "_build_mha_mla_host_pool"
+            n
+            for n in ast.parse(path.read_text()).body
+            if isinstance(n, ast.FunctionDef) and n.name == "_build_mha_mla_host_pool"
         )
         mha_info = type("MHABufferInfo", (), {})
         namespace = dict(
@@ -103,9 +111,13 @@ class TestRegisteredNPUHostAllocation(unittest.TestCase):
         exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
         for source in ("page_first_kv_split", "layer_first_kv_split"):
             result = namespace["_build_mha_mla_host_pool"](
-                pool=object(), buffer_info=mha_info(),
-                host_to_device_ratio=2, page_size=128,
-                layout=source, allocator_type="default", pool_label="draft",
+                pool=object(),
+                buffer_info=mha_info(),
+                host_to_device_ratio=2,
+                page_size=128,
+                layout=source,
+                allocator_type="default",
+                pool_label="draft",
             )
             self.assertEqual(result["layout"], "page_first_direct")
 
@@ -611,7 +623,7 @@ class TestNPUSparseDispatch(unittest.TestCase):
                             {
                                 "sglang.srt.configs.model_config": SimpleNamespace(
                                     AttentionArch=SimpleNamespace(MHA="mha"),
-                                    is_deepseek_v4=lambda _: dsv4
+                                    is_deepseek_v4=lambda _: dsv4,
                                 )
                             },
                         ),
@@ -670,7 +682,7 @@ class TestNPUSparseDispatch(unittest.TestCase):
                                 {
                                     "sglang.srt.configs.model_config": SimpleNamespace(
                                         AttentionArch=SimpleNamespace(MHA="mha"),
-                                        is_deepseek_v4=lambda _: dsv4
+                                        is_deepseek_v4=lambda _: dsv4,
                                     ),
                                 },
                             ),

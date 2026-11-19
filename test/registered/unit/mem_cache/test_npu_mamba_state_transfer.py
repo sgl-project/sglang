@@ -100,12 +100,8 @@ class TestNPUMambaStateTransfer(unittest.TestCase):
                 pool = _pool(side_shape=shape)
                 pool.slot_state_buffers[0][1].fill_(7)
                 with (
-                    patch.object(
-                        mamba, "transfer_state_per_layer_direct_pf_lf"
-                    ),
-                    patch.object(
-                        mamba, "transfer_state_all_layer_direct_lf_pf"
-                    ),
+                    patch.object(mamba, "transfer_state_per_layer_direct_pf_lf"),
+                    patch.object(mamba, "transfer_state_all_layer_direct_lf_pf"),
                 ):
                     _load(pool)
                     self.assertTrue(
@@ -146,3 +142,7 @@ class TestNPUMambaStateTransfer(unittest.TestCase):
         self.assertEqual(source.shape, (2, 1, 2, 4))
         self.assertTrue(source.is_contiguous())
         self.assertTrue(torch.all(source[0, 0] == 7))
+
+
+if __name__ == "__main__":
+    unittest.main()
