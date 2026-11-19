@@ -313,7 +313,7 @@ only vLLM references to the TokenSpeed package.
 
 | Toggle / env | Location | Effect on trace interpretation |
 | --- | --- | --- |
-| `enable_flashinfer_allreduce_fusion` | `python/sglang/srt/server_args.py` | Enables the FlashInfer TP allreduce fusion family. |
+| `flashinfer_allreduce_fusion_backend` | `python/sglang/srt/arg_groups/fields/exec_.py` | Selects (and enables) the FlashInfer TP allreduce fusion family. |
 | `enable_aiter_allreduce_fusion` | `python/sglang/srt/server_args.py` | Enables ROCm AITER TP allreduce fusion. |
 | `enable_deterministic_inference` | `python/sglang/srt/server_args.py` | Can intentionally disable or change some fast fusion paths, especially AITER allreduce fusion and some sampling / router choices, so split kernels may be expected. |
 | `enable_single_batch_overlap` | `python/sglang/srt/server_args.py` | Enables the SBO family. |

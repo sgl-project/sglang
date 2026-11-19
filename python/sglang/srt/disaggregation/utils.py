@@ -440,8 +440,9 @@ def check_state_wire(
             raise RuntimeError(
                 f"PD state entry mismatch: only the {role} server registers a "
                 f"DFLASH draft KV ring ({wire[-2:]}). Each server resolves the "
-                f"ring on its own: set SGLANG_ENABLE_DFLASH_DRAFT_KV_RING=0 on the "
-                f"{role} server, or align the flags that turn the ring on."
+                f"ring on its own: unset SGLANG_ENABLE_DFLASH_DRAFT_KV_RING on the "
+                f"{role} server, or set it to 1 on both and align the flags the "
+                "ring needs."
             )
     raise RuntimeError(
         f"PD state entry mismatch: prefill server registers {prefill_wire}, but "
@@ -1905,6 +1906,7 @@ def setup_state_kv_args(
             owner_view.index_bytes_per_token - key_bytes,
         )
     if draft_kv_ring is not None:
+        kv_args.draft_kv_ring_paged = draft_kv_ring.paged
         append_state_component(
             kv_args, StateType.DRAFT_RING, *draft_kv_ring.ring_buf_infos()
         )

@@ -20,7 +20,7 @@ import torch
 import sglang.srt.hf_transformers  # noqa: F401
 from sglang.test.ci.ci_register import register_npu_ci
 
-register_npu_ci(est_time=9, suite="base-a-test-npu")
+register_npu_ci(est_time=9, suite="extra-a-test-npu")
 
 # Avoid importing the real extensions on CPU.  ``layers.dcp`` performs optional
 # kernel discovery during import, so temporarily force the platform probe to

@@ -254,8 +254,7 @@ class TestLocalKvEventSources(CustomTestCase):
         with (
             get_context().override_server_args(
                 tp_size=8,
-                dp_size=4,
-                enable_dp_attention=True,
+                attn_dp_size=4,
                 nnodes=2,
                 node_rank=1,
                 pp_size=1,
@@ -673,7 +672,7 @@ _RECEIVER = "sglang.srt.managers.scheduler_components.request_receiver."
 
 
 def _dp_attention_leader(*, rank: int, local_control: bool) -> SimpleNamespace:
-    """Leader of DP group `rank` under --tp 2 --dp 2 --enable-dp-attention."""
+    """Leader of DP group `rank` under --tp 2 --attn-dp-size 2."""
     return SimpleNamespace(
         attn_dp_enabled=True,
         enable_dp_attention_local_control_broadcast=local_control,

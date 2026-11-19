@@ -20,7 +20,7 @@ from unittest.mock import MagicMock, patch
 from sglang.srt.managers.scheduler_components.pause_state import PauseState
 from sglang.test.ci.ci_register import register_mlx_ci
 
-register_mlx_ci(est_time=5, suite="stage-a-unit-test-mlx")
+register_mlx_ci(est_time=5, suite="extra-unit-test-mlx")
 
 _IS_APPLE_SILICON = platform.system() == "Darwin" and platform.machine() == "arm64"
 _HAS_MLX = importlib.util.find_spec("mlx") is not None

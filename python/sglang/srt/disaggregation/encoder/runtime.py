@@ -117,8 +117,8 @@ def validate_encode_request(request: dict) -> Optional[str]:
         return f"part_idx must be in [0, {num_parts})"
 
     hashes = request.get("hashes")
-    if hashes is not None and not isinstance(hashes, (list, tuple, str, int, bytes)):
-        return f"hashes must be list/scalar, got {type(hashes).__name__}"
+    if hashes is not None and not isinstance(hashes, (list, tuple)):
+        return f"hashes must be a list, got {type(hashes).__name__}"
     return None
 
 

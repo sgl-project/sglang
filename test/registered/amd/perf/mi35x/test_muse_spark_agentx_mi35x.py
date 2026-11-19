@@ -13,7 +13,7 @@ The recipe serves with HF_HUB_OFFLINE=1, so amd/Muse-Spark-Open-816B-A42B-Quark-
 (~450 GB, at the recipe's revision) and RadixArk/Muse-Spark-Open-DFlash2 must
 already be in the node's HF cache.
 
-Registry: nightly-perf-8-gpu-mi35x-muse-spark-agentx suite
+Registry: nightly-perf-test-8-gpu-amd-mi35x-muse-spark-agentx suite
 """
 
 import unittest
@@ -27,7 +27,9 @@ INFERENCEX_COMMIT = "67c3ed26f9c196b3e8286053a44838b4f0024756"
 # Register for AMD CI - one AgentX point: model load, then InferenceX's one-hour
 # measurement window (this row has no warmup grace).
 register_amd_ci(
-    est_time=9000, suite="nightly-perf-8-gpu-mi35x-muse-spark-agentx", nightly=True
+    est_time=9000,
+    suite="nightly-perf-test-8-gpu-amd-mi35x-muse-spark-agentx",
+    nightly=True,
 )
 
 

@@ -24,8 +24,8 @@ from sglang.test.ascend.test_npu_rl_utils import (
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_npu_ci(est_time=800, suite="base-b-test-2-npu-a3")
-register_npu_ci(est_time=800, suite="nightly-2-npu-a3", nightly=True)
+register_npu_ci(est_time=800, suite="extra-b-test-2-npu-a3")
+register_npu_ci(est_time=800, suite="nightly-test-2-npu-a3", nightly=True)
 
 TP_SIZE = 2
 UPDATE_ROUNDS = 2
@@ -38,7 +38,8 @@ BASE_ARGS = (
     "--trust-remote-code",
     "--attention-backend",
     "ascend",
-    "--disable-cuda-graph",
+    "--disable-decode-cuda-graph",
+    "--disable-prefill-cuda-graph",
     "--disable-overlap-schedule",
     "--disable-radix-cache",
     "--context-length",

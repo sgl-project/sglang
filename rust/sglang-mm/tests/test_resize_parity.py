@@ -51,7 +51,7 @@ def tv_resize(arr: np.ndarray, tw: int, th: int) -> np.ndarray:
 
 
 # Every resampler the Rust resize claims, and its reference: `aten_u8` for a
-# default server, `pil_bicubic` for --disable-fast-image-processor, `pil_lanczos`
+# default server, `pil_bicubic` for --image-processor-backend pil, `pil_lanczos`
 # for inkling.
 REFERENCES = {
     "pil_lanczos": lambda a, tw, th: pil_resize(a, tw, th, Image.Resampling.LANCZOS),

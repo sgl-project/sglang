@@ -203,6 +203,7 @@ class TestHeldDestinationPublication(CustomTestCase):
     def test_publishes_while_retracted_requests_wait(self):
         queue, _, _, receiver = self.make_queue()
         queue.resolve_deferred_releases = MagicMock()
+        queue.move_transferred = MagicMock(return_value=[])
         prealloc = SimpleNamespace(
             publish_pending_destinations=MagicMock(),
             move_resumed=lambda dst: [],
@@ -212,12 +213,17 @@ class TestHeldDestinationPublication(CustomTestCase):
             scheduler_stage_metrics=None,
             enable_decode_hicache=False,
             tree_cache=SimpleNamespace(linker=None),
+            enable_hisparse=False,
             disagg_decode_prealloc_queue=prealloc,
             disagg_decode_transfer_queue=queue,
             waiting_queue=IndexedReqList(ListKind.WAITING),
+            _preallocate_new_requests=MagicMock(),
         )
         SchedulerDisaggregationDecodeMixin.process_decode_queue(scheduler)
         receiver.send_metadata.assert_called_once_with("pages", 3, None)
+        # New requests wait for the retracted one; arrived transfers are still polled.
+        scheduler._preallocate_new_requests.assert_not_called()
+        queue.move_transferred.assert_called_once()
 
 
 class _GateReceiver:

@@ -4,7 +4,7 @@ Shares the launch conventions of test_deepseek_v4_pro_fp4.py (same 1.6T model,
 same env, same long launch timeout) but enables prefill CP via
 ``--enable-prefill-cp --cp-strategy interleave`` over the unified_kv backend.
 
-Registry: nightly-amd-8-gpu-mi35x-deepseek-v4-pro suite
+Registry: nightly-test-8-gpu-amd-mi35x-deepseek-v4-pro suite
 """
 
 import os
@@ -24,7 +24,7 @@ from sglang.test.test_utils import (
 
 register_amd_ci(
     est_time=5400,
-    suite="nightly-amd-8-gpu-mi35x-deepseek-v4-pro",
+    suite="nightly-test-8-gpu-amd-mi35x-deepseek-v4-pro",
     nightly=True,
 )
 

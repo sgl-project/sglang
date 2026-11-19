@@ -10,10 +10,7 @@ This page focuses on the deployment of MiMo-V2.5-Pro (FP4) with DFlash speculati
 On the A3 Series, each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend NPU Reference](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware) for details.
 </Note>
 
-<Warning>
-{/* NOTE(agent): The image version and scripts in this file are frozen (validated best practice). Skip this file in batch image-version updates and when deprecating or renaming parameters/flags. */}
-The optimal configurations on this page are validated with the image `quay.io/ascend/sglang:v0.5.18-cann9.0.0-a3`. Use exactly this version; later versions are not covered by this page and may introduce breaking changes.
-</Warning>
+The configurations on this page use the daily build image `quay.io/ascend/sglang:main-cann9.1.0-a3`.
 
 ### Model Deployment
 
@@ -87,7 +84,7 @@ python3 -m sglang.launch_server \
     --disaggregation-mode prefill --disaggregation-transfer-backend ascend \
     --disaggregation-bootstrap-port 8996 \
     --cuda-graph-backend-prefill disabled \
-    --enable-dp-attention --dp-size 2 --enable-dp-lm-head \
+    --attn-dp-size 2 --enable-dp-lm-head \
     --moe-a2a-backend deepep --deepep-mode normal
 ```
 
@@ -115,7 +112,7 @@ python3 -m sglang.launch_server \
     --disaggregation-mode decode --disaggregation-transfer-backend ascend \
     --disaggregation-bootstrap-port 8996 \
     --moe-a2a-backend deepep --deepep-mode low_latency \
-    --enable-dp-attention --dp-size 2 --enable-dp-lm-head \
+    --attn-dp-size 2 --enable-dp-lm-head \
     --speculative-algorithm DFLASH \
     --speculative-num-draft-tokens 8
 ```

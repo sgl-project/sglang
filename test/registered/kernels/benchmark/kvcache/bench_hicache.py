@@ -4,8 +4,7 @@ This benchmark tests the performance of KV cache transfer operations
 between GPU and CPU (host pinned memory), comparing:
 - SGL AOT Kernel: Pre-compiled transfer_kv kernels from sgl_kernel
 - SGL JIT Kernel: JIT-compiled hicache kernels
-- PyTorch Indexing: Plain PyTorch index copy
-- PyTorch 2 Stream: PyTorch implementation using 2 CUDA streams
+- SGL TMA Kernel: JIT-compiled TMA staging kernels (sm_90+)
 
 Tests cover:
 - One Layer: CPU->GPU
@@ -22,7 +21,6 @@ import torch
 from sgl_kernel import transfer_kv_all_layer, transfer_kv_per_layer
 
 from sglang.kernels.jit.benchmark import marker
-from sglang.kernels.jit.benchmark.utils import get_benchmark_range
 from sglang.kernels.ops.kvcache.hicache import (
     DEFAULT_BLOCK_QUOTA,
     TMA_BLOCK_QUOTA,
@@ -35,9 +33,8 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 register_cuda_ci(
     est_time=29, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
 )
-register_amd_ci(est_time=29, stage="jit-kernel-benchmark", runner_config="amd")
+register_amd_ci(est_time=29, stage="base-a-jit-kernel-benchmark", runner_config="amd")
 
-DISABLE_TORCH = os.environ.get("DISABLE_TORCH", "0") == "1"
 PAGE_SIZE = int(os.environ.get("PAGE_SIZE", "1"))
 ENABLE_SORT = True
 GPU_CACHE_SIZE = 256 * 1024  # 256K tokens on GPU
@@ -215,30 +212,12 @@ def sglang_tma_transfer_all(
     )
 
 
-def pytorch_transfer(
-    k_cache_dst: torch.Tensor,
-    v_cache_dst: torch.Tensor,
-    indices_dst_on_dst: torch.Tensor,
-    k_cache_src: torch.Tensor,
-    v_cache_src: torch.Tensor,
-    indices_src_on_src: torch.Tensor,
-) -> None:
-    """PyTorch indexing baseline."""
-    dst_device = k_cache_dst.device
-    k_cache_dst[indices_dst_on_dst] = k_cache_src[indices_src_on_src].to(dst_device)
-    v_cache_dst[indices_dst_on_dst] = v_cache_src[indices_src_on_src].to(dst_device)
-
-
 # Benchmark configuration
 
-ELEMENT_SIZE_RANGE = get_benchmark_range(
-    full_range=[64, 128, 256, 512, 1024],
-    ci_range=[1024],
-)
+ELEMENT_SIZES = [64, 128, 256, 512, 1024]
+CI_ELEMENT_SIZES = [1024]
 
-LINE_VALS = ["aot", "jit", "torch"]
-if DISABLE_TORCH:
-    LINE_VALS.remove("torch")
+LINE_VALS = ["aot", "jit"]
 # The TMA staging kernel needs sm_90+ (cp.async.bulk); skip the line elsewhere.
 if (
     torch.cuda.is_available()
@@ -247,15 +226,23 @@ if (
 ):
     LINE_VALS.insert(2, "tma")
 
+# A/A on GB300 moved host-transfer lines run to run: aot H2D by -24%, tma/jit by 4-8%.
+TOL = marker.Tolerance(rel=0.10)
+
 
 # =============================================================================
 # One Layer Benchmarks
 # =============================================================================
 
 
-@marker.parametrize("element_size", ELEMENT_SIZE_RANGE)
+@marker.parametrize("element_size", ELEMENT_SIZES, CI_ELEMENT_SIZES)
 @marker.parametrize("batch_size", marker.range(14, pattern="pow2"), [16])
-@marker.benchmark("provider", LINE_VALS, unit="ms")
+@marker.benchmark(
+    "provider",
+    LINE_VALS,
+    unit="ms",
+    tolerance=TOL,
+)
 def benchmark_one_layer_h2d(element_size: int, batch_size: int, provider: str):
     """One Layer: Host (CPU) -> Device (GPU)."""
     global cache
@@ -271,7 +258,6 @@ def benchmark_one_layer_h2d(element_size: int, batch_size: int, provider: str):
     if ENABLE_SORT:
         indices_src_gpu, mapping = indices_src_gpu.sort()
         indices_dst_gpu = indices_dst_gpu[mapping]
-    indices_src_cpu = indices_src_gpu.cpu()
     torch.cuda.synchronize()
 
     element_bytes = element_size * k_cache_src.element_size()
@@ -312,17 +298,6 @@ def benchmark_one_layer_h2d(element_size: int, batch_size: int, provider: str):
             )
             for i in range(NUM_LAYERS)
         ],
-        "torch": lambda: [
-            pytorch_transfer(
-                k_cache_dst[i],
-                v_cache_dst[i],
-                indices_dst_gpu,
-                k_cache_src[i],
-                v_cache_src[i],
-                indices_src_cpu,
-            )
-            for i in range(NUM_LAYERS)
-        ],
     }
 
     return marker.do_bench(
@@ -346,9 +321,9 @@ def _create_ptr_tensor(tensors, device="cuda"):
     )
 
 
-@marker.parametrize("element_size", ELEMENT_SIZE_RANGE)
+@marker.parametrize("element_size", ELEMENT_SIZES, CI_ELEMENT_SIZES)
 @marker.parametrize("batch_size", marker.range(14, pattern="pow2"), [16])
-@marker.benchmark("provider", LINE_VALS, unit="ms")
+@marker.benchmark("provider", LINE_VALS, unit="ms", tolerance=TOL)
 def benchmark_all_layer_d2h(element_size: int, batch_size: int, provider: str):
     """All Layer: Device (GPU) -> Host (CPU)."""
     global cache
@@ -364,7 +339,6 @@ def benchmark_all_layer_d2h(element_size: int, batch_size: int, provider: str):
     if ENABLE_SORT:
         indices_dst_gpu, mapping = indices_dst_gpu.sort()
         indices_src_gpu = indices_src_gpu[mapping]
-    indices_dst_cpu = indices_dst_gpu.cpu()
     torch.cuda.synchronize()
 
     element_bytes = element_size * k_caches_src.element_size()
@@ -405,17 +379,6 @@ def benchmark_all_layer_d2h(element_size: int, batch_size: int, provider: str):
             element_bytes,
             element_bytes,
         ),
-        "torch": lambda: [
-            pytorch_transfer(
-                k_caches_dst[i],
-                v_caches_dst[i],
-                indices_dst_cpu,
-                k_caches_src[i],
-                v_caches_src[i],
-                indices_src_gpu,
-            )
-            for i in range(NUM_LAYERS)
-        ],
     }
 
     return marker.do_bench(
@@ -426,7 +389,7 @@ def benchmark_all_layer_d2h(element_size: int, batch_size: int, provider: str):
 
 
 if __name__ == "__main__":
-    MAX_SIZE = max(ELEMENT_SIZE_RANGE)
+    MAX_SIZE = max(ELEMENT_SIZES)
     DEVICE_SHAPE = (NUM_LAYERS * GPU_CACHE_SIZE, MAX_SIZE)
     HOST_SHAPE = (NUM_LAYERS * HOST_CACHE_SIZE, MAX_SIZE)
 

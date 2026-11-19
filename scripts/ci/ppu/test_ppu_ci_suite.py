@@ -49,7 +49,7 @@ class TestPPUCISuite(CustomTestCase):
             test
             for test in tests
             if test.backend == HWBackend.PPU
-            and test.effective_suite == "stage-a-test-1-gpu-ppu"
+            and test.effective_suite == "extra-test-1-gpu-ppu"
             and not test.disabled
         ]
         self.assertCountEqual(
@@ -172,7 +172,8 @@ class TestPPUCIWorkflow(CustomTestCase):
         )
         self.assertEqual(
             self.jobs["pr-test-ppu-finish"]["if"],
-            "always() && needs.check-changes.result != 'skipped'",
+            "always() && needs.check-changes.result != 'skipped' "
+            "&& needs.pr-gate.outputs.opted-in != 'false'",
         )
         runtime = RUNNER.parent.parent / "scripts/ci/ppu/build_and_test.sh"
         self.assertNotIn("--hw cpu", runtime.read_text())
@@ -217,12 +218,10 @@ class TestPPUCIWorkflow(CustomTestCase):
     def test_finish_requires_successful_build_and_sanity_when_in_scope(self):
         finish = self.jobs["pr-test-ppu-finish"]["steps"][0]
         statuses = ("success", "failure", "cancelled", "skipped")
-        for build, sanity, in_scope, opted_in in itertools.product(
-            statuses, statuses, (True, False), ("true", "false")
+        for build, sanity, in_scope in itertools.product(
+            statuses, statuses, (True, False)
         ):
-            with self.subTest(
-                build=build, sanity=sanity, in_scope=in_scope, opted_in=opted_in
-            ):
+            with self.subTest(build=build, sanity=sanity, in_scope=in_scope):
                 needs = {
                     name: {"result": "success"}
                     for name in self.jobs["pr-test-ppu-finish"]["needs"]
@@ -235,7 +234,6 @@ class TestPPUCIWorkflow(CustomTestCase):
                         os.environ,
                         NEEDS_JSON=json.dumps(needs),
                         PPU_IN_SCOPE=str(in_scope).lower(),
-                        OPTED_IN=opted_in,
                         BUILD_RESULT=build,
                         SANITY_RESULT=sanity,
                     ),
@@ -243,8 +241,7 @@ class TestPPUCIWorkflow(CustomTestCase):
                     text=True,
                     timeout=10,
                 )
-                requested = in_scope and opted_in == "true"
-                allowed = {"success"} if requested else {"success", "skipped"}
+                allowed = {"success"} if in_scope else {"success", "skipped"}
                 self.assertEqual(
                     result.returncode == 0,
                     build in allowed and sanity in allowed,
@@ -255,9 +252,6 @@ class TestPPUCIWorkflow(CustomTestCase):
             ("SANITY_RESULT", "ppu-sanity"),
         ):
             self.assertEqual(finish["env"][variable], "${{ needs." + job + ".result }}")
-        self.assertEqual(
-            finish["env"]["OPTED_IN"], "${{ needs.pr-gate.outputs.opted-in }}"
-        )
 
 
 class TestPPUManualSelftests(CustomTestCase):

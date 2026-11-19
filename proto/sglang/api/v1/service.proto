@@ -8,8 +8,15 @@ syntax = "proto3";
 
 package sglang.api.v1;
 
+import "sglang/api/v1/anthropic.proto";
+import "sglang/api/v1/control.proto";
+import "sglang/api/v1/corpus.proto";
 import "sglang/api/v1/generate.proto";
 import "sglang/api/v1/hicache.proto";
+import "sglang/api/v1/ollama.proto";
+import "sglang/api/v1/openai.proto";
+import "sglang/api/v1/parsers.proto";
+import "sglang/api/v1/weights.proto";
 import "sglang/json/v1/options.proto";
 
 service SglangService {
@@ -48,6 +55,123 @@ service SglangService {
   // Duplicate native IDs cancel all matching generations. A later reuse of the
   // ID is unaffected. Internal control/detokenization requests are not targeted.
   rpc Abort(AbortRequest) returns (AbortResponse);
+
+  // `/set_internal_state`: override numeric scheduler knobs on every DP rank;
+  // one `updated` flag per rank.
+  rpc SetInternalState(SetInternalStateRequest) returns (SetInternalStateResponse);
+
+  // `/start_profile` and `/stop_profile`: a profiler capture on every DP rank.
+  rpc StartProfile(StartProfileRequest) returns (ProfileResponse);
+  rpc StopProfile(StopProfileRequest) returns (ProfileResponse);
+
+  // `/{start,stop,dump}_expert_distribution_record`.
+  rpc StartExpertDistributionRecord(ExpertDistributionRecordRequest) returns (ExpertDistributionRecordResponse);
+  rpc StopExpertDistributionRecord(ExpertDistributionRecordRequest) returns (ExpertDistributionRecordResponse);
+  rpc DumpExpertDistributionRecord(ExpertDistributionRecordRequest) returns (ExpertDistributionRecordResponse);
+
+  // `/slow_down`: a per-forward sleep on every DP rank, for testing.
+  rpc SlowDown(SlowDownRequest) returns (SlowDownResponse);
+
+  // `/release_memory_occupation`, `/resume_memory_occupation`.
+  rpc ReleaseMemoryOccupation(ReleaseMemoryOccupationRequest) returns (MemoryOccupationResponse);
+  rpc ResumeMemoryOccupation(ResumeMemoryOccupationRequest) returns (MemoryOccupationResponse);
+
+  // `/get_weights_by_name`: one parameter per DP rank.
+  rpc GetWeightsByName(GetWeightsByNameRequest) returns (GetWeightsByNameResponse);
+
+  // Weight-update process groups and remote-instance sends. Single-DP-rank
+  // deployments only, as in Python.
+  rpc InitWeightsUpdateGroup(InitWeightsUpdateGroupRequest) returns (WeightGroupResponse);
+  rpc DestroyWeightsUpdateGroup(DestroyWeightsUpdateGroupRequest) returns (WeightGroupResponse);
+  rpc InitWeightsSendGroupForRemoteInstance(InitWeightsSendGroupForRemoteInstanceRequest) returns (WeightGroupResponse);
+  rpc SendWeightsToRemoteInstance(SendWeightsToRemoteInstanceRequest) returns (WeightGroupResponse);
+
+  // The weight updates, each under the frontend's update lock on every
+  // listener. Distributed, tensor and plugin updates run inside a
+  // `BeginWeightUpdate` / `EndWeightUpdate` session and on single-DP-rank
+  // deployments only, as in Python.
+  rpc UpdateWeightsFromDisk(UpdateWeightsFromDiskRequest) returns (UpdateWeightsFromDiskResponse);
+  rpc UpdateWeightsFromDistributed(UpdateWeightsFromDistributedRequest) returns (WeightUpdateResponse);
+  rpc UpdateWeightsFromTensor(UpdateWeightsFromTensorRequest) returns (WeightUpdateResponse);
+  rpc UpdateWeightsFromIpc(UpdateWeightsFromIpcRequest) returns (WeightUpdateResponse);
+  rpc BeginWeightUpdate(BeginWeightUpdateRequest) returns (WeightUpdateResponse);
+  rpc EndWeightUpdate(EndWeightUpdateRequest) returns (WeightUpdateResponse);
+  rpc PluginWeightUpdate(PluginWeightUpdateRequest) returns (PluginWeightUpdateResponse);
+
+  // LoRA adapters; refused as "LoRA is not enabled" (see weights.proto).
+  rpc LoadLoraAdapter(LoadLoraAdapterRequest) returns (LoraUpdateResponse);
+  rpc LoadLoraAdapterFromTensors(LoadLoraAdapterFromTensorsRequest) returns (LoraUpdateResponse);
+  rpc UnloadLoraAdapter(UnloadLoraAdapterRequest) returns (LoraUpdateResponse);
+
+  // `/remote_instance_transfer_engine_info`: proxied from the engine-info
+  // bootstrap server.
+  rpc GetRemoteInstanceTransferEngineInfo(RemoteInstanceTransferEngineInfoRequest) returns (RemoteInstanceTransferEngineInfoResponse);
+
+  // `/parse_function_call`, `/separate_reasoning`: frontend-only parsing.
+  rpc ParseFunctionCall(ParseFunctionCallRequest) returns (ParseFunctionCallResponse);
+  rpc SeparateReasoning(SeparateReasoningRequest) returns (SeparateReasoningResponse);
+
+  // `/add_external_corpus`, `/remove_external_corpus`, `/list_external_corpora`.
+  rpc AddExternalCorpus(AddExternalCorpusRequest) returns (AddExternalCorpusResponse);
+  rpc RemoveExternalCorpus(RemoveExternalCorpusRequest) returns (RemoveExternalCorpusResponse);
+  rpc ListExternalCorpora(ListExternalCorporaRequest) returns (ListExternalCorporaResponse);
+
+  // `/freeze_gc`, `/pause_generation`, `/continue_generation`,
+  // `/pd_role_switch`, `/update_weight_version`.
+  rpc FreezeGc(FreezeGcRequest) returns (FreezeGcResponse);
+  rpc PauseGeneration(PauseGenerationRequest) returns (GenerationPauseResponse);
+  rpc ContinueGeneration(ContinueGenerationRequest) returns (GenerationPauseResponse);
+  rpc PdRoleSwitch(PdRoleSwitchRequest) returns (PdRoleSwitchResponse);
+  rpc UpdateWeightVersion(UpdateWeightVersionRequest) returns (UpdateWeightVersionResponse);
+
+  // `/open_session`, `/close_session`: multi-turn sessions on the schedulers.
+  rpc OpenSession(OpenSessionRequest) returns (OpenSessionResponse);
+  rpc CloseSession(CloseSessionRequest) returns (CloseSessionResponse);
+
+  // `/get_hicache_l3_cache_layout`: the merged HiCache L3 layout.
+  rpc GetHiCacheL3CacheLayout(GetHiCacheL3CacheLayoutRequest) returns (GetHiCacheL3CacheLayoutResponse);
+
+  // `/configure_logging`: the scheduler ranks' log level.
+  rpc ConfigureLogging(ConfigureLoggingRequest) returns (ConfigureLoggingResponse);
+
+  // `/dumper/{method}`: the debug dumper's control surface.
+  rpc DumperControl(DumperControlRequest) returns (DumperControlResponse);
+
+  // `/scale_elastic_ep`, `/is_scaling_elastic_ep`.
+  rpc ScaleElasticEp(ScaleElasticEpRequest) returns (ScaleElasticEpResponse);
+  rpc GetElasticEpState(ElasticEpStateRequest) returns (ElasticEpStateResponse);
+
+  // Ollama data plane. Chat and generate are server-streaming like Generate:
+  // a unary request is a one-frame stream, and the final frame carries the
+  // counters. Chat renders the messages with the served chat template.
+  rpc OllamaChat(OllamaChatRequest) returns (stream OllamaChatResponse);
+  rpc OllamaGenerate(OllamaGenerateRequest) returns (stream OllamaGenerateResponse);
+  rpc OllamaTags(OllamaTagsRequest) returns (OllamaTagsResponse);
+  rpc OllamaShow(OllamaShowRequest) returns (OllamaShowResponse);
+
+  // Anthropic Messages data plane. The unary and streamed replies have
+  // different wire shapes, so they are two RPCs; `stream` in the request is
+  // ignored here (the RPC decides).
+  rpc AnthropicMessages(AnthropicMessagesRequest) returns (AnthropicMessagesResponse);
+  rpc AnthropicStreamMessages(AnthropicMessagesRequest) returns (stream AnthropicStreamEvent);
+  rpc AnthropicCountTokens(AnthropicCountTokensRequest) returns (AnthropicCountTokensResponse);
+
+  // OpenAI data plane. The schema is the interface the OpenAI adapter is
+  // being refactored onto; until then these answer UNIMPLEMENTED. Streamed
+  // routes are separate RPCs whose frame is the SSE frame.
+  rpc OpenAiCompletions(OpenAiCompletionRequest) returns (OpenAiCompletionResponse);
+  rpc OpenAiStreamCompletions(OpenAiCompletionRequest) returns (stream OpenAiCompletionStreamResponse);
+  rpc OpenAiChatCompletions(OpenAiChatCompletionRequest) returns (OpenAiChatCompletionResponse);
+  rpc OpenAiStreamChatCompletions(OpenAiChatCompletionRequest) returns (stream OpenAiChatCompletionStreamResponse);
+  rpc OpenAiEmbeddings(OpenAiEmbeddingRequest) returns (OpenAiEmbeddingResponse);
+  rpc OpenAiClassify(OpenAiClassifyRequest) returns (OpenAiClassifyResponse);
+  rpc OpenAiScore(OpenAiScoreRequest) returns (OpenAiScoreResponse);
+  rpc OpenAiRerank(OpenAiRerankRequest) returns (OpenAiRerankResponse);
+  rpc OpenAiTokenize(OpenAiTokenizeRequest) returns (OpenAiTokenizeResponse);
+  rpc OpenAiDetokenize(OpenAiDetokenizeRequest) returns (OpenAiDetokenizeResponse);
+  rpc OpenAiResponses(OpenAiResponsesRequest) returns (OpenAiResponsesResponse);
+  rpc OpenAiListModels(OpenAiListModelsRequest) returns (OpenAiModelList);
+  rpc OpenAiRetrieveModel(OpenAiRetrieveModelRequest) returns (OpenAiModelCard);
 }
 
 message ListModelsRequest {}

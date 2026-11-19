@@ -6,17 +6,50 @@
 //! First match wins: a sticky/session key hashes to a fixed rank, so router
 //! replicas agree without shared state; else the rank with the deepest cached
 //! prefix; else [`DpRankPolicy`] picks: the fewest router in-flight requests,
-//! or the worker's ranks in turn.
+//! the lighter of two random ranks by engine-reported KV tokens (in use or
+//! queued), or the worker's ranks in turn.
 
 use crate::config::DpRankPolicy;
+use crate::state::load_monitor::engine_reported_load::RankLoad;
 use crate::workers::Worker;
 use sha2::{Digest, Sha256};
 
-/// `None` for a single-rank worker. `prefix_depths` is `(rank, cached blocks)`.
+/// `rank_tokens` for [`select_dp_rank`]: each reading moved forward by the
+/// stamped requests this router sent to the rank since it, at the worker's
+/// mean KV per request, so a burst between two engine reports does not all
+/// land on the rank that was lightest at the last one.
+pub fn projected_rank_tokens(worker: &Worker, loads: &[RankLoad]) -> Vec<(u32, u64)> {
+    let (tokens, reqs) = loads.iter().fold((0u64, 0u64), |(tokens, reqs), load| {
+        (
+            tokens.saturating_add(load.num_tokens),
+            reqs.saturating_add(load.num_reqs),
+        )
+    });
+    let per_req = tokens.checked_div(reqs).unwrap_or(0);
+    loads
+        .iter()
+        .map(|load| {
+            let sent = worker.dp_rank_dispatched_since(load.rank, load.at) as u64;
+            (
+                load.rank,
+                load.num_tokens.saturating_add(sent.saturating_mul(per_req)),
+            )
+        })
+        .collect()
+}
+
+/// `None` for a single-rank worker. `prefix_depths` is `(rank, cached blocks)`;
+/// `rank_tokens` is `(rank, committed KV tokens)` from the engine's load feed, read
+/// only under `least_tokens`, and ignored unless it covers every candidate so a
+/// rank with no reading never looks idle. Under `least_tokens` the pick is the
+/// lighter of two candidates drawn at random (power of two choices): router
+/// replicas act on the same engine reading, and all taking its minimum would
+/// herd onto one rank until the next one arrives.
 pub fn select_dp_rank(
     worker: &Worker,
     affinity_key: Option<&str>,
     prefix_depths: &[(u32, usize)],
+    rank_tokens: &[(u32, u64)],
     policy: DpRankPolicy,
 ) -> Option<u32> {
     let ranks = worker.dp_ranks();
@@ -43,13 +76,39 @@ pub fn select_dp_rank(
     if policy == DpRankPolicy::RoundRobin {
         return Some(candidates[worker.next_dp_rank_turn() % candidates.len()]);
     }
+    let tokens_of = |rank: u32| {
+        rank_tokens
+            .iter()
+            .find(|&&(reported, _)| reported == rank)
+            .map(|&(_, tokens)| tokens)
+    };
+    let by_tokens = policy == DpRankPolicy::LeastTokens
+        && candidates.iter().all(|&rank| tokens_of(rank).is_some());
+    let key = |rank: u32| {
+        let tokens = if by_tokens {
+            tokens_of(rank).unwrap_or(0)
+        } else {
+            0
+        };
+        (tokens, worker.dp_rank_inflight(rank))
+    };
+    if by_tokens && candidates.len() > 2 {
+        let first = rand::random::<usize>() % candidates.len();
+        let mut second = rand::random::<usize>() % (candidates.len() - 1);
+        if second >= first {
+            second += 1;
+        }
+        return [candidates[first], candidates[second]]
+            .into_iter()
+            .min_by_key(|&rank| key(rank));
+    }
     // Random start so equally loaded ranks share traffic.
     let start = rand::random::<usize>() % candidates.len();
     candidates[start..]
         .iter()
         .chain(&candidates[..start])
         .copied()
-        .min_by_key(|&rank| worker.dp_rank_inflight(rank))
+        .min_by_key(|&rank| key(rank))
 }
 
 #[cfg(test)]
@@ -57,6 +116,7 @@ mod tests {
     use super::*;
     use crate::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
     use crate::workers::{EngineProfile, WireProtocol};
+    use std::time::{Duration, Instant};
 
     fn worker(dp_ranks: u32) -> Worker {
         let spec = WorkerSpec {
@@ -79,21 +139,89 @@ mod tests {
     }
 
     const LEAST: DpRankPolicy = DpRankPolicy::LeastInFlight;
+    const TOKENS: DpRankPolicy = DpRankPolicy::LeastTokens;
 
     #[test]
     fn affinity_then_prefix_then_load() {
         let w = worker(4);
-        assert_eq!(select_dp_rank(&worker(1), Some("k"), &[], LEAST), None);
+        assert_eq!(select_dp_rank(&worker(1), Some("k"), &[], &[], LEAST), None);
         // Pinned: replicas and releases must agree on the mapping.
         assert_eq!(
-            select_dp_rank(&w, Some("session-42"), &[(0, 9)], LEAST),
+            select_dp_rank(&w, Some("session-42"), &[(0, 9)], &[], LEAST),
             Some(1)
         );
         assert_eq!(
-            select_dp_rank(&w, None, &[(1, 2), (3, 5), (9, 9)], LEAST),
+            select_dp_rank(&w, None, &[(1, 2), (3, 5), (9, 9)], &[], LEAST),
             Some(3)
         );
         let _busy = [0, 1, 3].map(|rank| w.dp_rank_guard(rank));
-        assert_eq!(select_dp_rank(&w, None, &[], LEAST), Some(2));
+        assert_eq!(select_dp_rank(&w, None, &[], &[], LEAST), Some(2));
+    }
+
+    #[test]
+    fn least_tokens_keeps_the_lighter_of_two_random_ranks() {
+        let w = worker(4);
+        let tokens = [(0, 50), (1, 10), (2, 10), (3, 90)];
+        let _busy_1 = w.dp_rank_guard(1);
+        let draws = |rank_tokens: &[(u32, u64)]| -> Vec<u32> {
+            (0..200)
+                .map(|_| select_dp_rank(&w, None, &[], rank_tokens, TOKENS).unwrap())
+                .collect()
+        };
+        // Of two random ranks the lighter wins: rank 3 never beats a rival,
+        // rank 2 beats every one (fewest tokens; in-flight beats rank 1).
+        let picks = draws(&tokens);
+        assert!(!picks.contains(&3), "{picks:?}");
+        let count = |rank| picks.iter().filter(|&&r| r == rank).count();
+        assert!(count(2) > count(0), "{picks:?}");
+        // A cached prefix still outranks load.
+        assert_eq!(
+            select_dp_rank(&w, None, &[(3, 4)], &tokens, TOKENS),
+            Some(3)
+        );
+        // Two candidates compare directly, tokens before in-flight.
+        assert_eq!(
+            select_dp_rank(&w, None, &[(0, 2), (1, 2)], &tokens, TOKENS),
+            Some(1)
+        );
+        // Tokens outrank in-flight: rank 0 is idle but holds more KV, so it
+        // only ever beats rank 3; rank 1 now beats everyone.
+        let _busy_2 = [2, 2].map(|rank| w.dp_rank_guard(rank));
+        let picks = draws(&tokens);
+        assert!(!picks.contains(&3), "{picks:?}");
+        assert!(picks.contains(&1), "{picks:?}");
+        // No reading, or one that misses a candidate: least in flight (0 or 3).
+        for partial in [&[][..], &[(1, 0)][..]] {
+            let picked = select_dp_rank(&w, None, &[], partial, TOKENS).unwrap();
+            assert!(picked == 0 || picked == 3, "{picked}");
+        }
+        // least_in_flight never reads the tokens.
+        let picked = select_dp_rank(&w, None, &[], &tokens, LEAST).unwrap();
+        assert!(picked == 0 || picked == 3, "{picked}");
+    }
+
+    #[test]
+    fn projection_counts_stamped_dispatches_since_each_reading() {
+        let w = worker(2);
+        let reading = |rank, num_tokens, num_reqs, at| RankLoad {
+            rank,
+            num_tokens,
+            num_reqs,
+            at,
+        };
+        let at = Instant::now();
+        // Mean KV per request over the worker: (100 + 400) / (1 + 4).
+        let loads = [reading(0, 100, 1, at), reading(1, 400, 4, at)];
+        assert_eq!(projected_rank_tokens(&w, &loads), [(0, 100), (1, 400)]);
+        let _sent = [0, 0, 0, 0].map(|rank| w.dp_rank_timestamped_guard(rank));
+        let _plain = w.dp_rank_guard(0);
+        assert_eq!(projected_rank_tokens(&w, &loads), [(0, 500), (1, 400)]);
+        // A newer reading already covers them.
+        let newer = Instant::now() + Duration::from_secs(1);
+        let loads = [reading(0, 100, 1, newer), reading(1, 400, 4, newer)];
+        assert_eq!(projected_rank_tokens(&w, &loads), [(0, 100), (1, 400)]);
+        // No request on the worker: nothing to scale by.
+        let loads = [reading(0, 0, 0, at), reading(1, 0, 0, at)];
+        assert_eq!(projected_rank_tokens(&w, &loads), [(0, 0), (1, 0)]);
     }
 }

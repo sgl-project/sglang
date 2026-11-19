@@ -28,11 +28,11 @@ recommended to use v0.5.16 or a later version.
 | Expert Parallelism            | `--ep-size 16 \`<br/>`--moe-a2a-backend deepep \`<br/>`--deepep-mode auto`                    |
 | PD Disaggregation             | `--disaggregation-mode prefill \`<br/>`--disaggregation-transfer-backend ascend`              |
 | Quantization                  | `--quantization modelslim`                                                                    |
-| NPU Graph                     | enabled by default; disable with `--disable-cuda-graph`;<br/>control range via `--cuda-graph-bs-decode` or `--cuda-graph-max-bs-decode`; e.g., `--cuda-graph-bs-decode 1 2 4 8 16 24 36 40 48 56` |
+| NPU Graph                     | enabled by default; disable with `--disable-decode-cuda-graph --disable-prefill-cuda-graph`;<br/>control range via `--cuda-graph-bs-decode` or `--cuda-graph-max-bs-decode`; e.g., `--cuda-graph-bs-decode 1 2 4 8 16 24 36 40 48 56` |
 | Speculative Decoding          | `--speculative-algorithm EAGLE \`<br/>`--speculative-num-steps 2 \`<br/>`--speculative-eagle-topk 1 \`<br/>`--speculative-num-draft-tokens 3` |
 | Overlap Schedule              | `export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                                                  |
 | DP LM Head                    | `--enable-dp-lm-head`                                                                         |
-| DP Attention                  | `--dp-size 16 \`<br/>`--enable-dp-attention`                                                                           |
+| DP Attention                  | `--attn-dp-size 16`                                                                           |
 
 <Note>
 The values in the **Example usage** column are for illustration only. Adjust them according to your hardware, deployment
@@ -228,7 +228,7 @@ python3 -m sglang.launch_server \
     --max-prefill-tokens 80000 \
     --chunked-prefill-size 131072 \
     --max-running-requests 160 \
-    --dp-size 8 --enable-dp-attention \
+    --attn-dp-size 8 \
     --moe-a2a-backend deepep --deepep-mode auto \
     --quantization modelslim --enable-dp-lm-head \
     --kv-cache-dtype bfloat16
@@ -296,7 +296,7 @@ python3 -m sglang.launch_server \
     --cuda-graph-bs-decode 1 2 4 8 16 \
     --enable-dp-lm-head \
     --disable-radix-cache \
-    --enable-dp-attention --dp-size 4 \
+    --attn-dp-size 4 \
     --reasoning-parser deepseek-v4 \
     --speculative-algorithm DSPARK \
     --speculative-draft-attention-backend ascend \

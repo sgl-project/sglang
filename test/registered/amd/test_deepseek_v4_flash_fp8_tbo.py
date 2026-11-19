@@ -16,7 +16,7 @@ Unlike the CPU-only server-args guard unit test (TestTwoBatchOverlapBackend), th
 actually runs the TBO forward on the real model — which only DeepSeek-V4 implements,
 so it needs the real 8-GPU model (a dummy model path would not exercise TBO).
 
-Registry: nightly-amd-8-gpu-mi35x-deepseek-v4-flash suite
+Registry: nightly-test-8-gpu-amd-mi35x-deepseek-v4-flash suite
 """
 
 import os
@@ -37,7 +37,7 @@ from sglang.test.test_utils import (
 )
 
 register_amd_ci(
-    est_time=7200, suite="nightly-amd-8-gpu-mi35x-deepseek-v4-flash", nightly=True
+    est_time=7200, suite="nightly-test-8-gpu-amd-mi35x-deepseek-v4-flash", nightly=True
 )
 
 DEEPSEEK_V4_FLASH_FP8_MODEL_PATH = os.environ.get(

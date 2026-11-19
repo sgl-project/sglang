@@ -108,7 +108,6 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     draft_pp_context,
     draft_tp_context,
-    fast_sample,
     get_plan_stream,
     load_token_map,
     renorm_draft_probs,
@@ -117,6 +116,7 @@ from sglang.srt.speculative.spec_utils import (
     select_top_k_tokens,
     simulated_acc_len_generator,
     spec_stage_span,
+    use_fused_draft_sample,
 )
 from sglang.srt.utils.async_probe import (
     maybe_assert_async,
@@ -200,6 +200,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.topk = get_spec().speculative_eagle_topk
         if get_spec().speculative_use_rejection_sampling:
             assert self.topk == 1, "Chain speculative sampling supports only topk=1"
+        # Decided in alloc_memory_pool, once init_lm_head has fixed the draft logits width.
+        self.use_fused_draft_sample = False
         self.speculative_num_steps = get_spec().speculative_num_steps
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
@@ -265,6 +267,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.init_token_map()
         self.init_lm_head()
         self._init_draft_probs_vocab_scatter()
+        # The draft samples over its own logits: a hot-token map narrows them below the
+        # target vocabulary, to widths the fused kernel may not take.
+        self.use_fused_draft_sample = (
+            get_spec().speculative_use_rejection_sampling
+            and use_fused_draft_sample(self.draft_probs_vocab_size)
+        )
 
         if get_spec().speculative_use_rejection_sampling:
             if (
@@ -927,6 +935,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                         sampling_seed=forward_batch.sampling_info.sampling_seed,
                         positions=forward_batch.positions + 1,
                         draft_step=i + 1,
+                        fused=self.use_fused_draft_sample,
                     )
                     draft_probs_list.append(probs)
                     forward_batch.positions.add_(1)
@@ -1171,19 +1180,20 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Assemble the next-iter draft spec_info from the extend output.
         use_rejection_sampling = get_spec().speculative_use_rejection_sampling
-        probs = renorm_draft_probs(
-            logits_output.next_token_logits,
-            batch.sampling_info,
-            use_rejection_sampling,
-        )
         if use_rejection_sampling:
-            topk_p, topk_index = fast_sample(
-                probs,
-                num_samples=1,
+            probs, topk_p, topk_index = sample_draft_proposal(
+                logits_output.next_token_logits,
+                batch.sampling_info.temperatures,
+                # Greedy argmax is free in the fused kernel; the stock chain would add a full-vocab one.
+                batch.sampling_info.top_ks if self.use_fused_draft_sample else None,
                 sampling_seed=batch.sampling_info.sampling_seed,
                 positions=batch.seq_lens,
+                fused=self.use_fused_draft_sample,
             )
         else:
+            probs = renorm_draft_probs(
+                logits_output.next_token_logits, batch.sampling_info, False
+            )
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
         return EagleDraftInput(
             topk_p=topk_p,
@@ -1355,6 +1365,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     batch.sampling_info.top_ks,
                     sampling_seed=batch.sampling_info.sampling_seed,
                     positions=batch_result.new_seq_lens,
+                    fused=self.use_fused_draft_sample,
                 )
             if self.topk == 1 and _is_hip:
                 ret_topk_p, ret_topk_index = draft_topk1_argmax_only(

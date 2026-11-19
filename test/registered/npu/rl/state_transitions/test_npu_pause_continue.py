@@ -30,8 +30,8 @@ from sglang.test.ascend.test_npu_rl_utils import (
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_npu_ci(est_time=600, suite="base-b-test-1-npu-a3")
-register_npu_ci(est_time=600, suite="nightly-1-npu-a3", nightly=True)
+register_npu_ci(est_time=600, suite="extra-b-test-1-npu-a3")
+register_npu_ci(est_time=600, suite="nightly-test-1-npu-a3", nightly=True)
 
 MODEL = QWEN3_0_6B_WEIGHTS_PATH
 PROMPTS = (
@@ -42,7 +42,8 @@ PROMPTS = (
 SERVER_ARGS = (
     "--attention-backend",
     "ascend",
-    "--disable-cuda-graph",
+    "--disable-decode-cuda-graph",
+    "--disable-prefill-cuda-graph",
     "--disable-overlap-schedule",
     "--mem-fraction-static",
     "0.45",

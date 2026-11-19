@@ -143,7 +143,12 @@ from sglang.srt.runtime_context import (
     snapshot_context,
 )
 from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
-from sglang.srt.server_args import PortArgs, ServerArgs, redact_server_args_secrets
+from sglang.srt.server_args import (
+    PortArgs,
+    ServerArgs,
+    redact_server_args_secrets,
+    reject_removed_kwargs,
+)
 from sglang.srt.utils import (
     MultiprocessingSerializer,
     SerializedTensorPayload,
@@ -311,6 +316,7 @@ class Engine(EngineScoreMixin, EngineBase):
             if "log_level" not in kwargs:
                 # Do not print logs by default
                 kwargs["log_level"] = "error"
+            reject_removed_kwargs(self.server_args_class, kwargs)
             server_args = self.server_args_class(**kwargs)
             # There was no command line, so the call is what the operator
             # asked for. `log_level` is filled in above when absent, so it

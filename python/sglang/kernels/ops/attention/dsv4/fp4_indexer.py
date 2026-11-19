@@ -24,6 +24,74 @@ INDEX_K_SLOT_BYTES = INDEX_K_PAYLOAD_BYTES.value + INDEX_K_SCALE_BYTES.value
 _PAGED_BALANCED_MAX_BATCH = 4096
 
 
+@triton.jit(do_not_specialize=["length"])
+def _finish_prefill_indexer_topk_kernel(
+    indices,
+    slots,
+    tokens,
+    lengths,
+    raw,
+    pages,
+    length,
+    K: tl.constexpr,
+    I0: tl.constexpr,
+    I1: tl.constexpr,
+    S: tl.constexpr,
+    T: tl.constexpr,
+    L: tl.constexpr,
+    R0: tl.constexpr,
+    R1: tl.constexpr,
+    P0: tl.constexpr,
+    P1: tl.constexpr,
+    WRITE_PAGES: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.arange(0, BLOCK)
+    idx = tl.load(indices + row * I0 + cols * I1, cols < K, -1).to(tl.int32)
+    idx = tl.sort(tl.where((idx >= 0) & (idx < length), idx, length), descending=False)
+    token = tl.load(tokens + row * T).to(tl.int64)
+    visible = tl.minimum(tl.load(lengths + row * L), length)
+    valid = (cols < K) & (idx < visible)
+    if WRITE_PAGES:
+        slot = tl.load(slots + idx * S, valid, -1)
+        tl.store(pages + token * P0 + cols * P1, slot, cols < K)
+    tl.store(raw + token * R0 + cols * R1, tl.where(valid, idx, -1), cols < K)
+
+
+def finish_prefill_indexer_topk(
+    indices: torch.Tensor,
+    slots: torch.Tensor,
+    tokens: torch.Tensor,
+    lengths: torch.Tensor,
+    raw_indices: torch.Tensor,
+    page_indices: torch.Tensor | None,
+    length: int,
+) -> None:
+    """Sort selected positions and write their physical slots in one launch."""
+    rows, k = indices.shape
+    if rows and k:
+        _finish_prefill_indexer_topk_kernel[(rows,)](
+            indices,
+            slots,
+            tokens,
+            lengths,
+            raw_indices,
+            page_indices,
+            length,
+            k,
+            *indices.stride(),
+            slots.stride(0),
+            tokens.stride(0),
+            lengths.stride(0),
+            *raw_indices.stride(),
+            *(page_indices.stride() if page_indices is not None else (0, 0)),
+            page_indices is not None,
+            triton.next_power_of_2(k),
+            num_warps=4,
+        )
+
+
 @triton.jit
 def _finish_paged_indexer_topk_kernel(
     Indices,
@@ -535,12 +603,15 @@ def fp4_index_logits_paged(
     max_len: int,
     ratio: int,
     candidate_mask: torch.Tensor | None = None,
+    *,
+    rows_per_request: int = 1,
 ) -> torch.Tensor:
     """Score visible compressed positions directly from the request table.
 
     The output has graph-stable capacity, but only the first ``lens[b]`` values
     are initialized. Consumers must use the current device-side lengths.
     The FP4 decoding and BF16 rounding are shared with the dense-slot path.
+    Groups wider than one must contain consecutive rows of the same request.
     """
     assert q.dtype == torch.bfloat16 and q.shape[-1] == INDEX_HEAD_DIM
     assert table.dtype == torch.uint8 and table.ndim == 2
@@ -561,6 +632,42 @@ def fp4_index_logits_paged(
         alignment_bytes=get_input_stride_alignment_bytes(),
     )
     if not batch or not max_len:
+        return out
+    if (
+        1 < rows_per_request <= 16
+        and batch % rows_per_request == 0
+        and heads == 32
+        and candidate_mask is None
+        and current_arch().is_sm(9)
+    ):
+        groups = batch // rows_per_request
+        workers = min(
+            triton.cdiv(max_len, 128), triton.cdiv(current_arch().num_sms * 4, groups)
+        )
+        _fp4_index_logits_paged_grouped_kernel[(groups, workers)](
+            q,
+            weights,
+            req,
+            req_table,
+            lens,
+            table,
+            out,
+            max_len,
+            page_size,
+            table.stride(0),
+            req_table.stride(0),
+            out.stride(0),
+            q.stride(0),
+            q.stride(1),
+            weights.stride(0),
+            RATIO=ratio,
+            GROUP=rows_per_request,
+            LANES=triton.next_power_of_2(rows_per_request),
+            BLOCK_L=128,
+            HALF_D=INDEX_HEAD_DIM // 2,
+            H=heads,
+            num_warps=4,
+        )
         return out
     if batch <= _PAGED_BALANCED_MAX_BATCH:
         _launch_fp4_index_logits_paged_balanced(
@@ -685,6 +792,58 @@ def _fp4_index_row_query(
     q_odd = tl.load(q + 1)
     w = tl.load(w_ptr + b * stride_wb + offs_h).to(tl.float32)
     return q_even, q_odd, w
+
+
+@triton.jit
+def _fp4_index_logits_paged_grouped_kernel(
+    q,
+    weights,
+    req,
+    req_table,
+    lens,
+    table,
+    out,
+    width,
+    page_size,
+    cache_stride,
+    req_stride,
+    out_stride,
+    stride_qb,
+    stride_qh,
+    stride_wb,
+    RATIO: tl.constexpr,
+    GROUP: tl.constexpr,
+    LANES: tl.constexpr,
+    BLOCK_L: tl.constexpr,
+    HALF_D: tl.constexpr,
+    H: tl.constexpr,
+):
+    first = tl.program_id(0) * GROUP
+    lanes = tl.arange(0, LANES)
+    max_len = tl.minimum(
+        tl.max(tl.load(lens + first + lanes, lanes < GROUP, 0), 0), width
+    )
+    request = tl.load(req + first).to(tl.int64)
+    for tile in range(tl.program_id(1), tl.cdiv(max_len, BLOCK_L), tl.num_programs(1)):
+        cols = tile * BLOCK_L + tl.arange(0, BLOCK_L)
+        valid = cols < max_len
+        slots = (
+            tl.load(req_table + request * req_stride + cols * RATIO, valid, 0).to(
+                tl.int64
+            )
+            // RATIO
+        )
+        k_low, k_high = _fp4_index_k_tile(
+            table, slots, valid, page_size, cache_stride, BLOCK_L, HALF_D
+        )
+        for offset in tl.range(GROUP, loop_unroll_factor=1):
+            row = first + offset
+            q_even, q_odd, w = _fp4_index_row_query(
+                q, weights, row, stride_qb, stride_qh, stride_wb, H, HALF_D
+            )
+            visible = cols < tl.minimum(tl.load(lens + row), width)
+            logits = _fp4_index_logits_from_k(q_even, q_odd, w, k_low, k_high, visible)
+            tl.store(out + row * out_stride + cols, logits, cols < width)
 
 
 @triton.jit

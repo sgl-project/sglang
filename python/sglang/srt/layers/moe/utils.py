@@ -52,8 +52,6 @@ class MoeA2ABackend(Enum):
     def _missing_(cls, value):
         if value is None:
             return cls.NONE
-        if value == "flashinfer":  # Deprecated alias for FLASHINFER.
-            return cls.FLASHINFER
         for member in cls:
             if value == member.value:
                 return member

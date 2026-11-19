@@ -11,7 +11,7 @@ from sglang.srt.hardware_backend.npu.graph_runner import npu_cudagraph_backend a
 from sglang.srt.model_executor.runner import decode_cuda_graph_runner as runner_mod
 from sglang.test.ci.ci_register import register_npu_ci
 
-register_npu_ci(est_time=12, suite="base-a-test-npu")
+register_npu_ci(est_time=12, suite="extra-a-test-npu")
 
 
 def make_backend(*, dflash=False, dspark=False, width=1, bs=4, raw_bs=2):

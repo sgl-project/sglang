@@ -1,7 +1,6 @@
 #include "ngram.h"
 
 #include "trie.h"
-#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -27,15 +26,6 @@ Ngram::Ngram(size_t capacity, const Param& param) : param_(param) {
   if (!(param_.draft_token_num > 0)) {
     throw std::runtime_error(
         "draft_token_num must be greater than 0, current value: " + std::to_string(param_.draft_token_num));
-  }
-  for (auto config : param_.batch_draft_token_num) {
-    if (config != std::numeric_limits<decltype(config)>::max()) {
-      if (!(config <= param_.draft_token_num)) {
-        throw std::runtime_error(
-            "batch_draft_token_num config value " + std::to_string(config) +
-            " must be less than or equal to draft_token_num: " + std::to_string(param_.draft_token_num));
-      }
-    }
   }
 
   trie_ = std::make_unique<Trie>(capacity, param_);
@@ -168,7 +158,7 @@ Result Ngram::batchMatch(
 
   // All budget values are loop-invariant (mutex_ held, sams_ won't change).
   const size_t num_sams = sams_.size();
-  const auto total_draft_token_num = param_.get_draft_token_num(tokens.size());
+  const size_t total_draft_token_num = param_.draft_token_num - 1;
   const size_t total_sam_budget =
       num_sams > 0 ? std::min(param_.external_sam_budget, total_draft_token_num) : size_t{0};
   const size_t per_sam_budget = num_sams > 0 ? total_sam_budget / num_sams : size_t{0};

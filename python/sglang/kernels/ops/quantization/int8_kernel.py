@@ -6,10 +6,11 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils import is_cpu, is_cuda, is_hip
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_cpu = is_cpu()
 if _is_cuda:
     from sglang.kernels.ops.quantization.per_token_group_quant import (
         per_token_group_quant,
@@ -56,6 +57,16 @@ def _per_token_quant_int8(
 
 
 def per_token_quant_int8(x, scale_dtype=torch.float32, cal_sum=False):
+    if _is_cpu:
+        # Not on the CPU hot path (AMX GEMMs quantize activations internally).
+        x_f = x.float()
+        absmax = x_f.abs().amax(dim=-1, keepdim=True).clamp(min=1e-10)
+        x_q = torch.round(x_f * (127.0 / absmax)).to(torch.int8)
+        scales = (absmax / 127.0).to(scale_dtype)
+        if cal_sum:
+            return x_q, scales, x_f.sum(dim=-1).to(x.dtype)
+        return x_q, scales
+
     M = x.numel() // x.shape[-1]
     N = x.shape[-1]
     x_q = torch.empty_like(x, device=x.device, dtype=torch.int8)

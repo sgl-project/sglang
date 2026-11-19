@@ -6,7 +6,7 @@ Kimi-K2.6 shares the same architecture as Kimi-K2.5 (per the model card the
 deployment method is directly reused), so the AMD server arguments match the
 existing Kimi-K2.5 MI35x test.
 
-Registry: nightly-amd-accuracy-8-gpu-mi35x-kimi-k26 suite
+Registry: nightly-accuracy-test-8-gpu-amd-mi35x-kimi-k26 suite
 """
 
 import os
@@ -29,7 +29,7 @@ from sglang.test.test_utils import (
 # Register for AMD CI - Kimi K2.6 accuracy test on MI35x (~90 min)
 register_amd_ci(
     est_time=5400,
-    suite="nightly-amd-accuracy-8-gpu-mi35x-kimi-k26",
+    suite="nightly-accuracy-test-8-gpu-amd-mi35x-kimi-k26",
     nightly=True,
     disabled="Older model generation; AMD nightly keeps the latest two per family",
 )

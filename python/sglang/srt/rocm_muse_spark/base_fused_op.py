@@ -22,20 +22,6 @@ _DUMP_DIR: str | None = os.environ.get("SGLANG_DUMP_FUSED_OPS")
 _trace_call_counter: int = 0
 _triton_native_fallback_logged: set[str] = set()
 
-# ---------------------------------------------------------------------------
-# Global fused-op mode (set once at server startup via --fused-op-mode)
-# ---------------------------------------------------------------------------
-_global_fused_op_mode: str = "default"
-
-
-def set_fused_op_mode(mode: str) -> None:
-    global _global_fused_op_mode
-    _global_fused_op_mode = mode
-
-
-def get_fused_op_mode() -> str:
-    return _global_fused_op_mode
-
 
 class FusedOpBackend(Enum):
     NATIVE = "native"
@@ -44,19 +30,11 @@ class FusedOpBackend(Enum):
     CUTEDSL = "cutedsl"
 
 
-# Priority order for "default" mode: best → fallback
+# Backend priority: best -> fallback
 _DEFAULT_PRIORITY = [
     FusedOpBackend.CUTEDSL,
     FusedOpBackend.TRITON,
     FusedOpBackend.NATIVE,
-]
-
-# Priority order for "torch_compile_fallback" mode: optimized kernels first,
-# then torch.compile'd native instead of plain native.
-_TORCH_COMPILE_FALLBACK_PRIORITY = [
-    FusedOpBackend.CUTEDSL,
-    FusedOpBackend.TRITON,
-    FusedOpBackend.TORCH_COMPILE,
 ]
 
 
@@ -84,35 +62,21 @@ class BaseFusedOp(ABC):
     _BASE_SKIP_ATTRS = frozenset(
         {
             "_available_backends",
-            "_default_backend",
-            "_torch_compile_fallback_backend",
             "_compiled_forward_native",
         }
     )
 
     def __init__(self):
-        # Cache available backends and the default-mode resolution so
+        # Cache available backends and their priority order so the
         # forward() hot-path avoids repeated introspection.
         available = set(self.available_backends())
         self._available_backends = available
         # Subclasses may override _DEFAULT_PRIORITY to change auto-selection.
         priority = getattr(type(self), "_DEFAULT_PRIORITY", _DEFAULT_PRIORITY)
-        # Priority-ordered list of available backends. Default-mode resolution
+        # Priority-ordered list of available backends. Resolution
         # walks this and bounces to the next backend when one is not
         # runtime-eligible for a given call (see _backend_runtime_eligible).
         self._ordered_available_backends = [b for b in priority if b in available]
-        self._default_backend = (
-            self._ordered_available_backends[0]
-            if self._ordered_available_backends
-            else FusedOpBackend.NATIVE
-        )
-        # Pre-compute backend for torch_compile_fallback mode.
-        for backend in _TORCH_COMPILE_FALLBACK_PRIORITY:
-            if backend in available:
-                self._torch_compile_fallback_backend = backend
-                break
-        else:
-            self._torch_compile_fallback_backend = FusedOpBackend.TORCH_COMPILE
 
     @abstractmethod
     def forward_native(self, *args, **kwargs):
@@ -167,30 +131,18 @@ class BaseFusedOp(ABC):
         return backends
 
     def _backend_runtime_eligible(self, backend, *args, **kwargs) -> bool:
-        """Per-call eligibility hook for default-mode backend selection.
+        """Per-call eligibility hook for backend selection.
 
         Returns True by default: a statically-available backend is always
         eligible. Subclasses override to gate a backend on runtime arguments
-        (e.g. tensor shapes/dtypes); when it returns False, default-mode
+        (e.g. tensor shapes/dtypes); when it returns False,
         resolution bounces back to the next priority backend.
         """
         return True
 
     def _resolve_backend(self, *args, **kwargs) -> FusedOpBackend:
-        """Pick the backend based on the global fused-op mode.
-
-        In "default" mode, walk the priority-ordered available backends and
-        return the first that is runtime-eligible for this call, bouncing back
-        to the next backend otherwise.
-        """
-        mode = get_fused_op_mode()
-        if mode == "native":
-            return FusedOpBackend.NATIVE
-        if mode == "torch_compile":
-            return FusedOpBackend.TORCH_COMPILE
-        if mode == "torch_compile_fallback":
-            return self._torch_compile_fallback_backend
-        # mode == "default": first runtime-eligible backend in priority order.
+        """Return the first available backend, in priority order, that is
+        runtime-eligible for this call; native when none is."""
         for backend in self._ordered_available_backends:
             if self._backend_runtime_eligible(backend, *args, **kwargs):
                 return backend

@@ -18,7 +18,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_npu
 from sglang.test.ci.ci_register import register_npu_ci
 
-register_npu_ci(est_time=60, suite="base-b-test-1-npu-a3")
+register_npu_ci(est_time=60, suite="extra-b-test-1-npu-a3")
 pytestmark = pytest.mark.skipif(not is_npu(), reason="NPU is required")
 
 

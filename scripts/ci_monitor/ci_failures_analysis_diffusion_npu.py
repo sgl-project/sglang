@@ -845,7 +845,7 @@ class NpuDiffusionFailuresAnalyzer:
         job_results = {
             job: result
             for job, result in json.loads(self.args.job_results_json).items()
-            if job.startswith(("multimodal-gen-test-", "base-"))
+            if job.startswith(("multimodal-gen-test-", "extra-"))
         }
         diffusion_results = []
         diffusion_records = []

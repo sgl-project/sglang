@@ -13,7 +13,7 @@ from sglang.test.test_utils import (
     CustomTestCase,
 )
 
-register_xpu_ci(est_time=120, suite="stage-b-test-1-gpu-xpu")
+register_xpu_ci(est_time=120, suite="extra-test-1-gpu-xpu")
 
 
 class _ThreadGroup:
