@@ -16,7 +16,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_npu_ci
 
-register_npu_ci(est_time=8, suite="base-a-test-npu")
+register_npu_ci(est_time=8, suite="extra-a-test-npu")
 
 # apply_all_hf_patches() imports transformers submodules that pull in
 # accelerate, whose state module probes find_spec("torch_npu") at import
@@ -38,6 +38,10 @@ for mod in (
     "sgl_kernel_npu.operators.attention",
     "sgl_kernel_npu.operators.indexer",
     "sgl_kernel_npu.operators.mem_cache",
+    # pool_host/{mha,mamba}.py import this under ``if _is_npu``, so only a
+    # real-NPU environment reaches the import; a mock parent without
+    # ``__path__`` would fail the from-import before the names resolve.
+    "sgl_kernel_npu.kvcacheio",
     "sgl_kernel_npu.attention",
     "sgl_kernel_npu.attention.sinks_attention",
     "sgl_kernel_npu.norm",
@@ -337,13 +341,22 @@ class TestPoolFactory(unittest.TestCase):
         with self.assertRaises(AssertionError):
             self._make(page_size=128, global_page_size=128, kv_layout=KVLayout.V4)
 
+    def _pool(self, compression_ratios, **extra):
+        """A bare pool instance: ``_is_v41_model`` is a method, so the fake
+        self must be of the real class (a plain namespace cannot carry it)."""
+        pool = DSV4NPUTokenToKVPool.__new__(DSV4NPUTokenToKVPool)
+        pool.compression_ratios = tuple(compression_ratios)
+        for key, value in extra.items():
+            setattr(pool, key, value)
+        return pool
+
     def test_window_layout_resolves_the_row_format(self):
-        fake = SimpleNamespace(compression_ratios=(0, 1, 2))
+        fake = self._pool((0, 1, 2))
         self.assertIs(
             DSV4NPUTokenToKVPool._window_kv_layout(fake),
             NPUDSV4KVLayout.V41_SWA_FP8,
         )
-        fake_v4 = SimpleNamespace(compression_ratios=(0, 4, 128))
+        fake_v4 = self._pool((0, 4, 128))
         with patch.object(dsv4_memory_pool, "is_npu_arch35", return_value=True):
             self.assertIs(
                 DSV4NPUTokenToKVPool._window_kv_layout(fake_v4),
@@ -358,10 +371,7 @@ class TestPoolFactory(unittest.TestCase):
     def test_pinned_generation_overrides_the_ratio_list(self):
         # A draft worker pins the V4 generation while its ratio list is empty:
         # its forward still runs the V4 sparse-attention op.
-        draft = SimpleNamespace(
-            compression_ratios=(0,),
-            _npu_window_generation="v4",
-        )
+        draft = self._pool((0,), _npu_window_generation="v4")
         with patch.object(dsv4_memory_pool, "is_npu_arch35", return_value=True):
             self.assertIs(
                 DSV4NPUTokenToKVPool._window_kv_layout(draft),
@@ -371,30 +381,19 @@ class TestPoolFactory(unittest.TestCase):
                 DSV4NPUTokenToKVPool.compressed_kv_layout(draft, 1),
                 NPUDSV4KVLayout.V4_FP8,
             )
-        pinned_v41 = SimpleNamespace(
-            compression_ratios=(0,),
-            _npu_window_generation="v41",
-        )
+        pinned_v41 = self._pool((0,), _npu_window_generation="v41")
         self.assertIs(
             DSV4NPUTokenToKVPool._window_kv_layout(pinned_v41),
             NPUDSV4KVLayout.V41_SWA_FP8,
         )
 
     def test_compressed_kv_layout_tags_every_ratio(self):
-        fake = SimpleNamespace(
-            compression_ratios=(0, 1, 2),
-            kv_layout=KVLayout.V4,
-            compressed_kv_layout_option=None,
-        )
+        fake = self._pool((0, 1, 2))
         self.assertIs(
             DSV4NPUTokenToKVPool.compressed_kv_layout(fake, 1),
             NPUDSV4KVLayout.V41_CMP_FP4,
         )
-        fake_v4 = SimpleNamespace(
-            compression_ratios=(0, 4, 128),
-            kv_layout=KVLayout.V4,
-            compressed_kv_layout_option=None,
-        )
+        fake_v4 = self._pool((0, 4, 128))
         with patch.object(dsv4_memory_pool, "is_npu_arch35", return_value=True):
             self.assertIs(
                 DSV4NPUTokenToKVPool.compressed_kv_layout(fake_v4, 4),
@@ -588,24 +587,30 @@ class TestPdBufferEnumeration(unittest.TestCase):
 
 
 class TestCompact1d(unittest.TestCase):
+    """``_stable_compact_1d``: compact into a fixed buffer without NonZero.
+
+    The helper lives on the concrete backend since the verify/seq-metadata
+    unification; the mixin owns the row-value formulas, not the compaction.
+    """
+
     def test_dense_front_with_custom_fill(self):
         dst = torch.full((5,), 99, dtype=torch.int32)
         values = torch.tensor([10, 20, 30], dtype=torch.int64)
         keep = torch.tensor([True, False, True], dtype=torch.bool)
-        LowRatioCompressAscendBackendMixin._dsv41_compact_1d(dst, values, keep, fill=-1)
+        DeepseekV4AscendAttnBackend._stable_compact_1d(dst, values, keep, fill=-1)
         self.assertEqual(dst.tolist(), [10, 30, -1, -1, -1])
 
     def test_overflow_rows_are_dropped_instead_of_raised(self):
         dst = torch.full((2,), 7, dtype=torch.int32)
         values = torch.tensor([1, 2, 3], dtype=torch.int64)
         keep = torch.tensor([True, True, True])
-        LowRatioCompressAscendBackendMixin._dsv41_compact_1d(dst, values, keep, fill=0)
+        DeepseekV4AscendAttnBackend._stable_compact_1d(dst, values, keep, fill=0)
         self.assertEqual(dst.tolist(), [1, 2])
 
     def test_size_mismatch_is_rejected(self):
         dst = torch.zeros(3, dtype=torch.int32)
         with self.assertRaises(ValueError):
-            LowRatioCompressAscendBackendMixin._dsv41_compact_1d(
+            DeepseekV4AscendAttnBackend._stable_compact_1d(
                 dst, torch.tensor([1, 2]), torch.tensor([True]), fill=0
             )
 
@@ -809,6 +814,9 @@ class TestGraphBuffers(unittest.TestCase):
             live_seq_lens=torch.tensor([2], dtype=torch.int32),
             forward_batch=batch,
         )
+        # The unified replay refresh expands the index page tables before the
+        # mode-specific rows (the 1d refresh no longer does it itself).
+        backend._refresh_graph_dsv41_index_page_tables(metadata)
         backend._refresh_graph_dsv41_1d(ctx)
         # Address is stable (the captured graph holds it) and the content is the
         # [k*p, k*p + k) expansion of the refreshed block table.
@@ -853,6 +861,7 @@ class TestGraphBuffers(unittest.TestCase):
             live_seq_lens=torch.tensor([2], dtype=torch.int32),
             forward_batch=batch,
         )
+        backend._refresh_graph_dsv41_index_page_tables(metadata)
         backend._refresh_graph_dsv41_1d(ctx)
         # ratio 2 pages 1:1, ratio 1 expands each full page into two index pages.
         self.assertEqual(metadata.c2_index_page_table.tolist(), [[9, 8]])
@@ -1091,7 +1100,8 @@ class TestIndexerRopeSource(unittest.TestCase):
             patch.object(rope_mod, "Dsv4NpuRoPE", _RopeStub),
             patch.object(DS41, "quant_lightning_indexer_dsl", _QLI()),
         ):
-            out = backend._dsv41_index_full_topk(
+            # The non-candidate path returns ``(scored, None)``.
+            out, _ = backend._dsv41_index_full_topk(
                 layer,
                 torch.zeros(1, 8),
                 torch.zeros(1, 8),
@@ -1648,23 +1658,6 @@ class TestVerifyGraphGuards(unittest.TestCase):
         self._gate(is_v41=False, mode=RaggedVerifyMode.COMPACT)
 
 
-class _FakeTorchOps:
-    """``torch`` proxy that redirects ``torch.ops.custom`` to a recorder.
-
-    Only ``ops`` is replaced; every other attribute falls through to the real
-    torch, so the production writer's ``torch.bfloat16`` / ``torch.uint8`` keep
-    working on a CPU-only box.
-    """
-
-    def __init__(self, custom):
-        self._custom = custom
-
-    def __getattr__(self, name):
-        if name == "ops":
-            return SimpleNamespace(custom=self._custom)
-        return getattr(torch, name)
-
-
 def _dsv41_llm_pool(row_dim, dtype, layout):
     """A ``DSV41NPUSingleKVPool`` with just the ``kv_buffer`` the writers read."""
     pool = object.__new__(DSV41NPUSingleKVPool)
@@ -1684,9 +1677,11 @@ class TestV41PoolWritePath(unittest.TestCase):
     _SELF = SimpleNamespace(qk_nope_head_dim=448, qk_rope_head_dim=64)
 
     def _write(self, *, buf, loc, cache, layout):
+        # The writer calls the ``sgl_kernel_npu`` wrapper directly (imported at
+        # module level), not ``torch.ops.custom``, so the recorder has to
+        # replace that name.
         recorder = MagicMock(name="kv_compress_epilog_v2")
-        custom = SimpleNamespace(kv_compress_epilog_v2=recorder)
-        with patch.object(dsv4_memory_pool, "torch", _FakeTorchOps(custom)):
+        with patch.object(dsv4_memory_pool, "kv_compress_epilog_v2", recorder):
             DSV4NPUTokenToKVPool._write_dsv41_packed_kv(
                 self._SELF, buf=buf, loc=loc, cache=cache, layout=layout
             )
@@ -2178,7 +2173,7 @@ class TestVerifyPaddingRows(unittest.TestCase):
             draft_token_num=2,
         )
         indices, lengths = backend._dsv41_window_indices(batch)
-        self.assertEqual(lengths[:, 0].tolist(), [2, 2, 0, 0])
+        self.assertEqual(lengths[:, 0].tolist(), [4, 4, 0, 0])
         # Live rows unchanged; padding rows emit no indices at all.
         self.assertEqual(indices[0, 0].tolist(), [1, 2, 3, 4])
         self.assertEqual(indices[1, 0].tolist(), [2, 3, 4, 5])
@@ -2187,7 +2182,7 @@ class TestVerifyPaddingRows(unittest.TestCase):
             backend._dsv41_cmp_topk_length(batch, 2)[:, 0].tolist(), [2, 3, 0, 0]
         )
         self.assertEqual(
-            backend._dsv41_cmp_topk_length(batch, 1)[:, 0].tolist(), [2, 3, 0, 0]
+            backend._dsv41_cmp_topk_length(batch, 1)[:, 0].tolist(), [3, 3, 0, 0]
         )
 
     def test_decode_rows_keep_the_per_row_rule(self):

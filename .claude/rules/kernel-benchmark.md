@@ -11,7 +11,7 @@ How a benchmark is written is up to you. The requirement is only that the number
 
 ## Tools
 
-In SGLang we recommend `marker.do_bench` (`python/sglang/kernels/jit/benchmark/marker.py`). It works for any callable, not only JIT kernels, and it measures with a cold L2 by default. It is not mandatory. CUPTI (e.g. CUDA 13 `cupti-python`), the torch profiler / `bench_kineto`, Triton's `do_bench` / proton, `flashinfer.testing`, Nsight Systems / Nsight Compute, or a hand-written loop are all fine. Each pitfall below must be handled, whichever tool you use.
+In SGLang we recommend `marker.do_bench` (`python/sglang/kernels/jit/benchmark/marker/`). It works for any callable, not only JIT kernels, and it measures with a cold L2 by default. It is not mandatory. CUPTI (e.g. CUDA 13 `cupti-python`), the torch profiler / `bench_kineto`, Triton's `do_bench` / proton, `flashinfer.testing`, Nsight Systems / Nsight Compute, or a hand-written loop are all fine. Each pitfall below must be handled, whichever tool you use.
 
 ## L2 cache reuse
 

@@ -284,8 +284,9 @@ class TestNpuMhcSeam(unittest.TestCase):
         state = mhc.HcState(x, pre_prev)
         seen = {}
 
-        def fake_pre_v2(**kwargs):
-            seen.update(kwargs)
+        def fake_pre_dpskv4(*args, **kwargs):
+            seen["args"] = args
+            seen["kwargs"] = kwargs
             return (
                 x.float().mean(1),
                 torch.ones(2, self.MULT),
@@ -293,27 +294,30 @@ class TestNpuMhcSeam(unittest.TestCase):
                 torch.full((2, self.MULT), 0.5),
             )
 
+        stub = ModuleType("sgl_kernel_npu.operators.hyper_conn")
+        stub.mhc_pre_dpskv4 = fake_pre_dpskv4
         with (
             patch.object(mhc, "_is_npu", True),
-            patch.object(
-                torch,
-                "ops",
-                SimpleNamespace(custom=SimpleNamespace(npu_hc_pre_v2=fake_pre_v2)),
-            ),
+            patch.dict(sys.modules, {"sgl_kernel_npu.operators.hyper_conn": stub}),
         ):
             out = mhc.combine(hc, state)
 
         torch.testing.assert_close(out, x.float().mean(1))
-        # The op gets the residual, the previous pre-mix and the layer's weights.
-        self.assertIs(seen["x"], x)
-        self.assertIs(seen["pre_mix"], pre_prev)
-        self.assertIs(seen["hc_fn"], hc.fn)
-        self.assertIs(seen["hc_scale"], hc.scale)
-        self.assertIs(seen["hc_base"], hc.base)
-        self.assertEqual(seen["hc_mult"], self.MULT)
-        self.assertEqual(seen["hc_sinkhorn_iters"], 20)
-        self.assertEqual(seen["norm_eps"], 1e-6)
-        self.assertEqual(seen["hc_eps"], 1e-6)
+        # The residual, the layer's weights and the flow config go in
+        # positionally -- in the CANN order (..., hc_eps, rms_eps).
+        args = seen["args"]
+        self.assertIs(args[0], x)
+        self.assertIs(args[1], hc.fn)
+        self.assertIs(args[2], hc.scale)
+        self.assertIs(args[3], hc.base)
+        self.assertEqual(args[4], self.MULT)
+        self.assertEqual(args[5], 20)
+        self.assertEqual(args[6], 1e-6)
+        self.assertEqual(args[7], 1e-6)
+        # The previous pre-mix is folded in and the pre-mix is requested back.
+        self.assertIs(seen["kwargs"]["pre_mix"], pre_prev)
+        self.assertIs(seen["kwargs"]["return_pre"], True)
+        self.assertEqual(seen["kwargs"]["impl"], "cann_recipes_infer_cann920")
         # ``mix_stats`` is skipped: the post reads the stashed coefficients.
         pre, post_mix, comb = state.stats
         torch.testing.assert_close(pre, torch.full((2, self.MULT), 0.5))
@@ -326,8 +330,9 @@ class TestNpuMhcSeam(unittest.TestCase):
         state = mhc.HcState(x)  # no previous pre-mix
         seen = {}
 
-        def fake_pre_v2(**kwargs):
-            seen.update(kwargs)
+        def fake_pre_dpskv4(*args, **kwargs):
+            seen["args"] = args
+            seen["kwargs"] = kwargs
             return (
                 x.float()[:, 0, :],
                 torch.ones(2, self.MULT),
@@ -335,13 +340,11 @@ class TestNpuMhcSeam(unittest.TestCase):
                 torch.full((2, self.MULT), 0.5),
             )
 
+        stub = ModuleType("sgl_kernel_npu.operators.hyper_conn")
+        stub.mhc_pre_dpskv4 = fake_pre_dpskv4
         with (
             patch.object(mhc, "_is_npu", True),
-            patch.object(
-                torch,
-                "ops",
-                SimpleNamespace(custom=SimpleNamespace(npu_hc_pre_v2=fake_pre_v2)),
-            ),
+            patch.dict(sys.modules, {"sgl_kernel_npu.operators.hyper_conn": stub}),
         ):
             out = mhc.combine(hc, state)
 
@@ -350,24 +353,23 @@ class TestNpuMhcSeam(unittest.TestCase):
         # plain ``norm(x[:, 0, :])`` of the device-agnostic path.
         expected = torch.zeros(2, self.MULT)
         expected[:, 0] = 1.0
-        self.assertEqual(seen["pre_mix"].dtype, torch.float32)
-        torch.testing.assert_close(seen["pre_mix"], expected)
+        pre_mix = seen["kwargs"]["pre_mix"]
+        self.assertEqual(pre_mix.dtype, torch.float32)
+        torch.testing.assert_close(pre_mix, expected)
 
     def test_npu_empty_batch_skips_the_kernel(self):
         hc = self._sub_layer()
         x = self._residual()[:0]
         state = mhc.HcState(x)
 
-        def boom(**kwargs):
+        def boom(*args, **kwargs):
             raise AssertionError("the kernel must not run without rows")
 
+        stub = ModuleType("sgl_kernel_npu.operators.hyper_conn")
+        stub.mhc_pre_dpskv4 = boom
         with (
             patch.object(mhc, "_is_npu", True),
-            patch.object(
-                torch,
-                "ops",
-                SimpleNamespace(custom=SimpleNamespace(npu_hc_pre_v2=boom)),
-            ),
+            patch.dict(sys.modules, {"sgl_kernel_npu.operators.hyper_conn": stub}),
         ):
             out = mhc.combine(hc, state)
 
