@@ -23,7 +23,7 @@ import tempfile
 import threading
 import time
 from abc import ABC, abstractmethod
-from contextlib import contextmanager, suppress
+from contextlib import closing, contextmanager, suppress
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -761,8 +761,14 @@ class DefaultModelLoader(BaseModelLoader):
 
         if self.counter_before_loading_weights == 0.0:
             self.counter_before_loading_weights = time.perf_counter()
+
         # Apply the prefix.
-        return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
+        def apply_prefix():
+            with closing(weights_iterator):
+                for name, tensor in weights_iterator:
+                    yield source.prefix + name, tensor
+
+        return apply_prefix()
 
     @classmethod
     def _filter_mtp_weights(
@@ -773,16 +779,17 @@ class DefaultModelLoader(BaseModelLoader):
         iterator's sliding window actually bounds CPU memory — eager
         materialization caused page-reclaim hangs on large MoE checkpoints
         with multi-layer EAGLE."""
-        for name, tensor in weights_iterator:
-            match = cls._MTP_PATTERN.match(name)
-            if match is not None:
-                idx = int(match.group(1))
-                if idx != draft_model_idx:
-                    continue
-                new_name = name.replace(match.group(), "model.mtp.layers.0.")
-            else:
-                new_name = name
-            yield (prefix + new_name, tensor)
+        with closing(weights_iterator):
+            for name, tensor in weights_iterator:
+                match = cls._MTP_PATTERN.match(name)
+                if match is not None:
+                    idx = int(match.group(1))
+                    if idx != draft_model_idx:
+                        continue
+                    new_name = name.replace(match.group(), "model.mtp.layers.0.")
+                else:
+                    new_name = name
+                yield (prefix + new_name, tensor)
 
     def _get_all_weights(
         self,
@@ -1425,9 +1432,11 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                     setattr(
                         param,
                         key,
-                        QuantizedRLModelLoader._bind_method_to_cls(loader, param)
-                        if callable(loader)
-                        else loader,
+                        (
+                            QuantizedRLModelLoader._bind_method_to_cls(loader, param)
+                            if callable(loader)
+                            else loader
+                        ),
                     )
             native_loaders[name] = param.weight_loader
 
