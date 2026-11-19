@@ -66,7 +66,7 @@ pub fn request_tokens_for(
     if tokenizers.has_chat_formatter(&model_id.0)
         && value.get("messages").is_some_and(|m| m.is_array())
     {
-        if let Some(ids) = tokenizers.encode_chat(&model_id.0, value) {
+        if let Some(ids) = tokenizers.encode_chat_for_routing(&model_id.0, value) {
             return Some(RequestTokens {
                 ids,
                 rendered_from_chat: true,

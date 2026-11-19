@@ -88,8 +88,8 @@ pub const MEDIA_TAG_LEN: usize = 2;
 /// hash differently from their first image on, as they do in the engine, whose
 /// cache keys carry each image's own hash. Nothing before the first image
 /// changes, so the prefix KV events can confirm is hashed as the engine hashes
-/// it. These ids never reach an engine: a chat with media is ineligible for
-/// `input_ids` forwarding.
+/// it. These ids never reach an engine nor a token count: a chat with media is
+/// ineligible for `input_ids` forwarding, and counts use the untagged ids.
 pub(crate) fn tag_images(ids: Vec<u32>, placeholders: &[u32], images: &[String]) -> Vec<u32> {
     if placeholders.is_empty() || images.is_empty() {
         return ids;
@@ -350,15 +350,35 @@ impl TokenizerRegistry {
 
     /// Render with dynamo-render and tokenize; return `None` when unavailable or unsuccessful.
     pub fn encode_chat(&self, model_id: &str, request: &serde_json::Value) -> Option<Vec<u32>> {
-        crate::off_worker::run(|| self.encode_chat_now(model_id, request))
+        crate::off_worker::run(|| self.encode_chat_now(model_id, request, false))
     }
 
-    fn encode_chat_now(&self, model_id: &str, request: &serde_json::Value) -> Option<Vec<u32>> {
+    /// [`Self::encode_chat`] for routing: a chat with images carries its images'
+    /// identity after their placeholders (see [`tag_images`]).
+    pub fn encode_chat_for_routing(
+        &self,
+        model_id: &str,
+        request: &serde_json::Value,
+    ) -> Option<Vec<u32>> {
+        crate::off_worker::run(|| self.encode_chat_now(model_id, request, true))
+    }
+
+    fn encode_chat_now(
+        &self,
+        model_id: &str,
+        request: &serde_json::Value,
+        routing: bool,
+    ) -> Option<Vec<u32>> {
         // Clone the Arc and drop the DashMap guard before the CPU-bound
         // render+encode (mirrors `get`), so no shard read-lock is held across it.
         let entry = Arc::clone(&*self.formatters.get(model_id)?);
         let tokenizer = self.get(model_id)?;
-        match entry.formatter.encode(&tokenizer, request) {
+        let ids = if routing {
+            entry.formatter.encode_for_routing(&tokenizer, request)
+        } else {
+            entry.formatter.encode(&tokenizer, request)
+        };
+        match ids {
             Ok(ids) if !ids.is_empty() => Some(ids),
             Ok(_) => {
                 entry.log_fallback(model_id, "rendered prompt tokenized to zero tokens");
@@ -675,18 +695,25 @@ mod tests {
             {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}
         ]}]});
         let ids = formatter
-            .encode(&tokenizer, &image_chat)
+            .encode_for_routing(&tokenizer, &image_chat)
             .expect("image chat renders for routing");
         assert!(!ids.is_empty());
         // Deterministic, so every turn and every router hashes it the same way.
-        assert_eq!(formatter.encode(&tokenizer, &image_chat).unwrap(), ids);
+        assert_eq!(
+            formatter
+                .encode_for_routing(&tokenizer, &image_chat)
+                .unwrap(),
+            ids
+        );
         // The placeholder is followed by the image's identity tag, so the same
         // text with another image differs from the placeholder on, and only there.
         let other_chat = serde_json::json!({"messages": [{"role": "user", "content": [
             {"type": "text", "text": "look"},
             {"type": "image_url", "image_url": {"url": "https://example.com/b.png"}}
         ]}]});
-        let other = formatter.encode(&tokenizer, &other_chat).unwrap();
+        let other = formatter
+            .encode_for_routing(&tokenizer, &other_chat)
+            .unwrap();
         let at = ids
             .iter()
             .position(|&id| id == PLACEHOLDER)
@@ -697,6 +724,12 @@ mod tests {
         let tag = at + 1..at + 1 + MEDIA_TAG_LEN;
         assert_ne!(other[tag.clone()], ids[tag.clone()]);
         assert_eq!(other[tag.end..], ids[tag.end..]);
+        // Token counts see the prompt as the engine renders it: no tag.
+        let counted = formatter.encode(&tokenizer, &image_chat).unwrap();
+        assert_eq!(counted.len() + MEDIA_TAG_LEN, ids.len());
+        assert_eq!(counted[..=at], ids[..=at]);
+        assert_eq!(counted[at + 1..], ids[tag.end..]);
+        assert_eq!(counted, formatter.encode(&tokenizer, &other_chat).unwrap());
         // Video is still refused (and falls back as before).
         let video_chat = serde_json::json!({"messages": [{"role": "user", "content": [
             {"type": "video_url", "video_url": {"url": "https://example.com/a.mp4"}}

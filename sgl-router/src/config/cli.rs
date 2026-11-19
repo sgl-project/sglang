@@ -359,7 +359,12 @@ pub struct CacheArgs {
     /// derives image token ids from pixels the router never sees), so without
     /// this its later turns tie on the shared prefix and scatter by load. A
     /// remembered placement counts only where it is deeper than every confirmed
-    /// match. 0 or unset disables it. Requires the radix_tree provider.
+    /// match. Without one (another replica routed the previous turn), the tied
+    /// workers are ordered by a rendezvous hash of the conversation, so every
+    /// replica picks the same one; that preference is worth one block, within
+    /// --cache-switch-margin-tokens, so the pressure guard still overrides it
+    /// for a materially more loaded worker. 0 or unset disables it. Requires
+    /// the radix_tree provider.
     #[arg(long)]
     pub cache_media_affinity_ttl_ms: Option<u64>,
 
