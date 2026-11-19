@@ -95,6 +95,25 @@ def _swap_peft_swiglu_fc1_lora_b(
     return torch.cat([gate, value], dim=0)
 
 
+def resolve_lora_target_name(
+    param_names_mapping_fn, name: str, lora_target_names: set[str] | None
+) -> tuple[str, Any, Any]:
+    """Map a LoRA weight name onto a layer this DiT has.
+
+    A mapping may end on an alias the DiT lacks, e.g. split to_q/to_k/to_v
+    weights routed to a fused QKV layer that only quantized builds create; keep
+    the incoming name when that layer exists instead.
+    """
+    target = param_names_mapping_fn(name)
+    if (
+        lora_target_names
+        and target[0] not in lora_target_names
+        and name in lora_target_names
+    ):
+        return name, None, None
+    return target
+
+
 def stack_or_compose_fused_lora(
     a_list: list[torch.Tensor],
     b_list: list[torch.Tensor],
@@ -986,6 +1005,25 @@ class LoRAPipeline(ComposedPipelineBase):
             return bool(self.cur_adapter_name)
         return target in self.cur_adapter_name
 
+    def _lora_target_param_names(self) -> set[str] | None:
+        """LoRA weight names (`<layer>.lora_A/lora_B/alpha`) of the converted layers."""
+        layer_names = [
+            name
+            for attr in (
+                "lora_layers",
+                "lora_layers_transformer_2",
+                "lora_layers_critic",
+            )
+            for name in getattr(self, attr, None) or ()
+        ]
+        if not layer_names:
+            return None
+        return {
+            f"{layer}.{suffix}"
+            for layer in layer_names
+            for suffix in ("lora_A", "lora_B", "alpha")
+        }
+
     def load_lora_adapter(
         self,
         lora_path: str,
@@ -1035,9 +1073,13 @@ class LoRAPipeline(ComposedPipelineBase):
 
         config = self.server_args.pipeline_config.dit_config.arch_config
 
+        # Map onto the layers this DiT actually has: e.g. split Q/K/V LoRA
+        # weights stay split on a bf16 DiT but stack into a fused QKV layer.
+        lora_target_names = self._lora_target_param_names()
         param_names_mapping_fn = get_param_names_mapping(
             config.param_names_mapping
-            or self.modules["transformer"].param_names_mapping
+            or self.modules["transformer"].param_names_mapping,
+            valid_target_names=lora_target_names,
         )
         lora_param_names_mapping_fn = get_param_names_mapping(
             config.lora_param_names_mapping
@@ -1051,7 +1093,9 @@ class LoRAPipeline(ComposedPipelineBase):
             # misc-format -> HF-format
             name, _, _ = lora_param_names_mapping_fn(name)
             # HF-format (LoRA) -> SGLang-dit-format
-            target_name, merge_index, num_params_to_merge = param_names_mapping_fn(name)
+            target_name, merge_index, num_params_to_merge = resolve_lora_target_name(
+                param_names_mapping_fn, name, lora_target_names
+            )
             # for fuse B(out_dim, r) @ A(r, in_dim) -> (N, out_dim, r) @ (N, r, in_dim)
             # see param mapping in HunyuanVideoArchConfig
             if merge_index is not None:
