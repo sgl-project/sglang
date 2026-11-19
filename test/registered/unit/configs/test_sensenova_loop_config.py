@@ -80,6 +80,29 @@ class TestSenseNovaLoopConfig(CustomTestCase):
         self.assertEqual(restored.text_config.num_hidden_layers, 56)
         self.assertEqual(restored.text_config.physical_num_hidden_layers, 32)
 
+    def test_embedding_quantization_survives_config_roundtrip(self):
+        raw = canonical_config()
+        embedding = {
+            "bits": 4,
+            "group_size": 128,
+            "layout": "row_major",
+            "zero_point": True,
+        }
+        raw["quantization_config"] = {
+            "quant_method": "awq",
+            "bits": 4,
+            "group_size": 128,
+            "zero_point": True,
+            "embedding": embedding,
+        }
+        config = SenseNovaLoopConfig(**raw)
+        restored = SenseNovaLoopConfig.from_dict(config.to_dict())
+        self.assertEqual(config.text_config.embedding_quantization, embedding)
+        self.assertEqual(restored.text_config.embedding_quantization, embedding)
+        self.assertIsNone(
+            SenseNovaLoopConfig(**canonical_config()).text_config.embedding_quantization
+        )
+
     def test_gdn_state_and_prefix_cache_are_registered(self):
         config = SenseNovaLoopConfig(**canonical_config())
         spec, text_config = get_linear_attn_config(config)
