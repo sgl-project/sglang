@@ -1515,6 +1515,12 @@
                     ]
                   },
                   {
+                    "group": "RadixArk",
+                    "pages": [
+                      "cookbook/autoregressive/RadixArk/DaisyRose-27B"
+                    ]
+                  },
+                  {
                     "group": "Recursive",
                     "pages": [
                       "cookbook/autoregressive/Recursive/Flint"
