@@ -11,6 +11,7 @@ use tokio::time::Instant;
 use super::generate::{CaptureError, CapturedGeneration};
 use super::handle::{CoreHandle, translate_runtime_error};
 use crate::api_server::core::CoreError;
+use crate::message::config::DisaggregationMode;
 use crate::message::ids::Rid;
 use crate::message::io_struct::{
     CancellationRetirementOutput, CancellationRetirementReq, CancellationRetirementStatus,
@@ -240,9 +241,11 @@ impl CoreHandle {
                 "cancellation retirement receipts do not support multimodal models".into(),
             );
         }
-        if self.inner.is_disaggregation {
+        if self.inner.is_disaggregation
+            && self.inner.metadata.disaggregation_mode != DisaggregationMode::Decode
+        {
             return Some(
-                "cancellation retirement receipts do not support disaggregated serving".into(),
+                "disaggregated cancellation retirement is restricted to Decode transfers".into(),
             );
         }
         if self.inner.metadata.deployment_info.dp_size > 1 {
@@ -306,8 +309,9 @@ impl CoreHandle {
             return Err(retirement_expired());
         }
         // Pending admission can be fenced without a scheduler receipt: Intake
-        // never claimed the request. Native/MM configs are rejected above.
-        if self.inner.generations.fence_pending(&captured.rid) {
+        // never claimed the request. Decode requires scheduler evidence of
+        // row release and of the corresponding transfer draining.
+        if !self.inner.is_disaggregation && self.inner.generations.fence_pending(&captured.rid) {
             let _ = self
                 .inner
                 .generations
@@ -432,6 +436,17 @@ mod tests {
         flume::Receiver<TmEvent>,
         flume::Receiver<AbortSource>,
     ) {
+        handle_with_mode(multimodal, DisaggregationMode::Null)
+    }
+
+    fn handle_with_mode(
+        multimodal: bool,
+        disaggregation_mode: DisaggregationMode,
+    ) -> (
+        CoreHandle,
+        flume::Receiver<TmEvent>,
+        flume::Receiver<AbortSource>,
+    ) {
         let (intake_tx, intake_rx) = flume::unbounded();
         let (abort_tx, abort_rx) = flume::unbounded();
         let core = CoreHandle::new(
@@ -441,11 +456,14 @@ mod tests {
                 response_capacity: 2,
                 response_activity: Default::default(),
                 startup_ready: true,
-                is_disaggregation: false,
+                is_disaggregation: disaggregation_mode != DisaggregationMode::Null,
                 mm_limits: Default::default(),
                 multimodal,
                 peer_endpoints: Vec::new(),
-                metadata: CoreMetadata::default(),
+                metadata: CoreMetadata {
+                    disaggregation_mode,
+                    ..Default::default()
+                },
                 metrics: None,
                 request_log: None,
                 generate_validator: None,
@@ -472,6 +490,20 @@ mod tests {
             abort_rx.try_recv(),
             Ok(AbortSource::Local(rid)) if rid.client_facing() == "fence-me"
         ));
+        assert!(abort_rx.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn decode_cannot_confirm_without_a_scheduler_receipt() {
+        let (core, intake_rx, abort_rx) = handle_with_mode(false, DisaggregationMode::Decode);
+        let _pending = core.hold_generation("decode-rid");
+        let result = core
+            .abort_and_wait("decode-rid", "decode-cancel", 1_000)
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(!result.retirement_confirmed);
+        assert!(matches!(intake_rx.try_recv(), Ok(TmEvent::Intake { .. })));
         assert!(abort_rx.try_recv().is_err());
     }
 

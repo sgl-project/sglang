@@ -18,7 +18,9 @@ from sglang.test.test_utils import (
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.disaggregation.decode import DecodeReqToTokenPool  # noqa: E402
 from sglang.srt.disaggregation.mode import DisaggregationMode  # noqa: E402
+from sglang.srt.disaggregation.utils import TransferBackend  # noqa: E402
 from sglang.srt.environ import envs  # noqa: E402
 from sglang.srt.managers.io_struct import (  # noqa: E402
     AbortReq,
@@ -31,6 +33,8 @@ from sglang.srt.managers.req_types import FINISH_ABORT  # noqa: E402
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch  # noqa: E402
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
 from sglang.srt.managers.scheduler_components.request_list import (  # noqa: E402
+    KeyedReqList,
+    ListKind,
     move,
 )
 from sglang.srt.managers.scheduler_components.request_retirer import (  # noqa: E402
@@ -57,10 +61,16 @@ from sglang.test.scheduler_test_utils import empty_request_lists  # noqa: E402
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
-def make_cpu_scheduler(send_output, *, cache_enabled=False, legacy_cache=False):
+def make_cpu_scheduler(
+    send_output, *, cache_enabled=False, legacy_cache=False, decode=False
+):
     scheduler = Scheduler.__new__(Scheduler)
     empty_request_lists(scheduler)
-    scheduler.req_to_token_pool = ReqToTokenPool(8, 32, "cpu", False)
+    scheduler.req_to_token_pool = (
+        DecodeReqToTokenPool(8, 32, "cpu", False, pre_alloc_size=2)
+        if decode
+        else ReqToTokenPool(8, 32, "cpu", False)
+    )
     scheduler.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
         size=32, dtype=torch.int64, device="cpu", kvcache=None, need_sort=False
     )
@@ -89,7 +99,9 @@ def make_cpu_scheduler(send_output, *, cache_enabled=False, legacy_cache=False):
                 tp_group=None,
             )
         )
-    scheduler.disaggregation_mode = DisaggregationMode.NULL
+    scheduler.disaggregation_mode = (
+        DisaggregationMode.DECODE if decode else DisaggregationMode.NULL
+    )
     for attr in (
         "enable_hierarchical_cache",
         "enable_hicache_storage",
@@ -535,6 +547,63 @@ class TestSchedulerCancellationRetirement(CustomTestCase):
             scheduler._cancellation_retirement_scope_error(),
             "unsupported_execution_mode",
         )
+
+    def test_decode_receipt_requires_transfer_drain_and_local_release(self):
+        for stage, drain_confirmed in (
+            (ListKind.PD_RECEIVING, True),
+            (ListKind.PD_RELEASING, False),
+        ):
+            with self.subTest(stage=stage, drain_confirmed=drain_confirmed):
+                self.outputs.clear()
+                scheduler = make_cpu_scheduler(self._send_output, decode=True)
+                scheduler.rust_server = SimpleNamespace(
+                    push_control_output=lambda request, reply: self._send_output(
+                        reply, request
+                    )
+                )
+                scheduler.transfer_backend = TransferBackend.MOONCAKE
+                receiving = KeyedReqList(ListKind.PD_RECEIVING)
+                releasing = KeyedReqList(ListKind.PD_RELEASING)
+                lists = {
+                    ListKind.PD_RECEIVING: receiving,
+                    ListKind.PD_RELEASING: releasing,
+                }
+                abort_receiving = Mock()
+                scheduler.disagg_decode_transfer_queue = SimpleNamespace(
+                    request_lists=lambda: lists,
+                    enable_deferred_kv_release=True,
+                    enable_host_receive=False,
+                    enable_staging=False,
+                    abort_receiving=abort_receiving,
+                )
+                req = self._req(scheduler)
+                move([req], lists[stage])
+                control = self._cancel(scheduler, req, target_rid=req.rid)
+                if stage == ListKind.PD_RECEIVING:
+                    abort_receiving.assert_called_once()
+                    self.assertIs(abort_receiving.call_args.kwargs["target"], req)
+                else:
+                    abort_receiving.assert_not_called()
+
+                req.finish_outside_step(FINISH_ABORT())
+                scheduler._check_cancellation_retirements()
+                self.assertEqual(self.outputs, [])
+                scheduler.request_retirer.release(req, checkpoint=False)
+                req.decode_retirement_drained = drain_confirmed
+                scheduler._check_cancellation_retirements()
+                self.assertEqual(len(self.outputs), 1)
+                output, route = self.outputs[0]
+                self.assertIs(route, control)
+                self.assertEqual(
+                    output.status, "retired" if drain_confirmed else "unknown"
+                )
+                self.assertEqual(
+                    output.reason,
+                    "" if drain_confirmed else "decode_transfer_drain_unconfirmed",
+                )
+                self.assertEqual(
+                    scheduler.token_to_kv_pool_allocator.available_size(), 32
+                )
 
 
 if __name__ == "__main__":

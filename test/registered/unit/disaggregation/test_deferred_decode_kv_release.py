@@ -625,6 +625,7 @@ class TestResolveDeferredReleases(CustomTestCase):
         # In production the receiver arms the room just before it sends the
         # ABORT (_send_abort_notification), before the scheduler defers here.
         generation = mgr.register_deferred_abort_room(room)
+        dreq.kv_receiver.abort_generation = generation
 
         with patch.object(
             decode_mod.time, "monotonic", side_effect=[10.0, 11.0, 12.0, 13.0]
@@ -656,6 +657,7 @@ class TestResolveDeferredReleases(CustomTestCase):
         self.assertEqual(q.metadata_buffers.bootstrap_room[idx], 0)
         self.assertNotIn(room, mgr._deferred_abort_ack_tracker)
         self.assertIsNone(dreq.kv_receiver)
+        self.assertTrue(dreq.req.decode_retirement_drained)
         q.scheduler.metrics_collector.observe_decode_deferred_kv_release.assert_called_once_with(
             duration_seconds=3.0,
             outcome="drained",
@@ -678,18 +680,36 @@ class TestResolveDeferredReleases(CustomTestCase):
         self.assertEqual(list(q._deferred_releases.items()), [])
         self.assertEqual(q.req_to_metadata_buffer_idx_allocator.freed, [idx])
         self.assertIsNone(dreq.kv_receiver)
+        self.assertFalse(dreq.req.decode_retirement_drained)
         q.scheduler.metrics_collector.observe_decode_deferred_kv_release.assert_called_once_with(
             duration_seconds=32.0,
             outcome="timeout",
         )
+
+    def test_drain_ack_for_new_room_generation_does_not_confirm_old_request(self):
+        mgr = _make_manager()
+        room, idx = 600, 5
+        q = _make_queue()
+        dreq = _make_decode_req(room, idx, mgr)
+        dreq.kv_receiver.abort_generation = mgr.register_deferred_abort_room(room)
+        current_generation = mgr.register_deferred_abort_room(room)
+        mgr.note_abort_ack(room, 0, current_generation)
+        move([(dreq, 10.0, float("inf"), idx, 1)], q._deferred_releases)
+
+        q.resolve_deferred_releases()
+
+        self.assertFalse(dreq.req.decode_retirement_drained)
 
     def test_failed_release_is_isolated_and_abandoned(self):
         mgr = _make_manager()
         q = _make_queue(enable_metrics=True)
         good = _make_decode_req(700, 1, mgr)
         bad = _make_decode_req(701, 2, mgr)
-        # Both already past deadline -> both selected for release.
-        move([(bad, 10.0, float("-inf"), 2, 1)], q._deferred_releases)
+        # One has a real ACK, the other timed out. Both are selected for release.
+        generation = mgr.register_deferred_abort_room(701)
+        bad.kv_receiver.abort_generation = generation
+        mgr.note_abort_ack(701, 0, generation)
+        move([(bad, 10.0, float("inf"), 2, 1)], q._deferred_releases)
         move([(good, 10.0, float("-inf"), 1, 1)], q._deferred_releases)
 
         retirer = q.scheduler.request_retirer
@@ -709,6 +729,7 @@ class TestResolveDeferredReleases(CustomTestCase):
             self.assertEqual(_released(q), [bad.req, good.req])
         retirer.abandon.assert_called_once()
         self.assertIs(retirer.abandon.call_args.args[0], bad.req)
+        self.assertFalse(bad.req.decode_retirement_drained)
         q.scheduler.metrics_collector.observe_decode_deferred_kv_release.assert_has_calls(
             [
                 call(duration_seconds=30.0, outcome="error"),

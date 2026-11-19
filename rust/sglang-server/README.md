@@ -14,25 +14,24 @@
 
 Opt-in `wait_for_retirement_ms` (0..30000) with a nonempty `cancellation_id` (≤128 UTF-8 bytes) waits for exact-request scheduler ownership retirement of one public RID. Absent the wait field, Abort stays the legacy accepted-only cancel (`success` means cancellation was requested; `retirement_confirmed` is always false).
 
-**Supported scope.** Single-rank text serving when `SGLANG_ENABLE_CANCEL_RETIREMENT_RECEIPTS=1`. Multimodal, PD disaggregation, and distributed DP/peer fan-out return `UNIMPLEMENTED` without claiming retirement. Scheduler receipts still apply the parent retirement predicates (cache ownership, speculative, inflight, resources). Feature-disabled paths do not provide scheduler receipts.
+**Supported scope.** Enable with `SGLANG_ENABLE_CANCEL_RETIREMENT_RECEIPTS=1`. This covers unified single-rank text serving and the Decode worker's receive/drain queues in single-rank text P/D with Mooncake device KV and deferred release. Prefill retirement, other Decode stages, host or staged KV transfer, multimodal requests, and multi-rank scheduler receipts are outside this scope. Existing cache and execution restrictions still apply.
 
-**Semantics.** Capture exactly one original internal rid under the public ID before cancel; retries reuse that capture and must not recapture by public RID. Ambiguous duplicate public IDs and `abort_all` are refused for the wait mode. A wait timeout returns `success=true`, `retirement_confirmed=false`; retry the same `cancellation_id` within a bounded five-minute retention window (capacity 256). After retention expiry the server does not claim idempotency or old-target safety. Unknown or lost receipts return `FailedPrecondition` / `Unavailable`. A Generate `CANCELLED` outcome, channel closure, or load counter is not retirement. Positive confirmation covers scheduler ownership (or Intake-local proof the request was never admitted), not native/MM worker completion, PD drain, or CUDA-wide idle.
+**Semantics.** Capture exactly one original internal rid under the public ID before cancel. Retries reuse that capture. Ambiguous duplicate public IDs and `abort_all` are refused for the wait mode. A wait timeout returns `success=true`, `retirement_confirmed=false`. Retry the same `cancellation_id` within the five-minute retention window (capacity 256). Unknown or lost receipts return `FailedPrecondition` / `Unavailable`. A positive Decode receipt requires a nonempty set of matching transfer-drain ACKs and completed local KV, metadata and receiver release. The Decode receipt covers the Decode worker's ownership, independent of Prefill request retirement. A Generate terminal outcome, channel closure, transfer release deadline, or load counter cannot establish retirement.
 
 **Dependency.** [PR #50617](https://github.com/sgl-project/sglang/pull/50617) (replacing #48624) provides the Python HTTP and scheduler receipt implementation reused here for Rust text control. The integration includes its `44d5424d37` core, including failed-delivery retry, MLX rejection and retraction-abort retirement fences; the scheduler core should land first. Rust HTTP waiting remains unsupported; native `api.v1` uses the typed Rust integration below.
 
-This change is stacked on that unmerged PR. Its opt-in feature flag must be set
-before engine startup. The first supported scheduler scope is unified,
-single-rank text serving without speculative decoding and with a supported
-static full-attention cache. The scheduler rejects additional ownership modes
-it cannot prove retired; the flag does not enable those modes.
-
-**CPU checks to run (not executed during this implementation).** From `rust/`:
+**Linux CPU checks.** From `rust/`:
 `cargo test -p sglang-api-types`,
 `cargo test -p sglang-server api_server::handlers::retirement::tests`,
 `cargo test -p sglang-server api_server::grpc::service::tests::abort_`, and
 `cargo test -p sglang-server tokenizer_manager::to_scheduler::tests`.
-Also run the Python scheduler retirement, Rust admission, and API parity suites.
-Live-engine cancellation ordering and normal-generation controls remain pending.
+From the repository root, run the scheduler and transport regressions:
+
+```bash
+python -m pytest -q \
+  test/registered/unit/managers/test_scheduler_cancellation_retirement.py \
+  test/registered/unit/disaggregation/test_deferred_decode_kv_release.py
+```
 
 **Validation plan.**
 
@@ -40,7 +39,8 @@ Live-engine cancellation ordering and normal-generation controls remain pending.
 2. Timeout and disconnect: bounded wait expires or client disconnects without implying retirement; shared operation retains the result.
 3. Public RID reuse: later request with the same public ID does not satisfy the prior instance’s receipt.
 4. Unsupported topology: unknown or unsupported scope fails closed.
-5. Normal generation positive control: completed generate still succeeds without opt-in retirement; legacy Abort remains 499.
+5. Normal generation positive control: completed generate still succeeds without opt-in retirement. Legacy Abort still reports acceptance only.
+6. Decode transport drain: run single-rank Prefill and Decode workers with the same text model, Mooncake, device KV and deferred release. Use native gRPC on Decode. Send the same P/D bootstrap room to both workers. Hold the Prefill transfer or its ACK briefly in the test environment and call `Abort` on Decode while the room is in the receive/drain queue. `wait_for_retirement_ms=0` must report an unconfirmed receipt while the transfer is held. Resume the transfer worker and poll with the same cancellation ID. The positive receipt must follow the ACKs and local release. Repeat with a fresh room and withhold the ACK through the deferred-release deadline. The receipt must remain unconfirmed or end with `FAILED_PRECONDITION`. Run a normal P/D request afterwards to check recovery.
 
 ## api.v1 engine instance identity
 

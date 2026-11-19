@@ -3324,7 +3324,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
     ):
         self.queue = IndexedReqList(
             ListKind.PD_RECEIVING,
-            abort=self._abort_receiving,
+            abort=self.abort_receiving,
             req_of=lambda x: x.req,
         )
         # Host-staged transfers whose KV landed but wait for device admission,
@@ -3375,9 +3375,16 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             ListKind.PD_RELEASING: self._deferred_releases,
         }
 
-    def _abort_receiving(self, recv_req: AbortReq) -> None:
+    def abort_receiving(
+        self, recv_req: AbortReq, *, target: Optional[Req] = None
+    ) -> None:
         for decode_req in self.queue.items():
-            if recv_req.matches(decode_req.req.rid):
+            matches = (
+                decode_req.req is target
+                if target is not None
+                else recv_req.matches(decode_req.req.rid)
+            )
+            if matches:
                 logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
                 if decode_req.host_staged:
                     # Keep the host destination alive until prefill stops writing.
@@ -4035,7 +4042,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         )
         to_release = []
         for entry, state in zip(releases, states):
-            decode_req, start_time, _, idx, _ = entry
+            decode_req, start_time, _, idx, required_acks = entry
             if state != _DeferredReleaseState.PENDING:
                 to_release.append(
                     (
@@ -4044,11 +4051,12 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                         idx,
                         decode_req.req.bootstrap_room,
                         state == _DeferredReleaseState.DRAINED,
+                        required_acks,
                     )
                 )
         # Each release takes its entry out; a failed one is abandoned, not retried,
         # so the ranks' lists stay the same.
-        for decode_req, start_time, idx, room, drained in to_release:
+        for decode_req, start_time, idx, room, drained, required_acks in to_release:
             if not drained:
                 logger.warning(
                     f"Deferred KV release for room {room} timed out after "
@@ -4056,12 +4064,27 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     f"ack from prefill; releasing anyway."
                 )
             outcome = "drained" if drained else "timeout"
+            # Snapshot the evidence before release clears the room's tracker.
+            # Require the original receiver's generation and a nonempty ACK set.
+            receiver = decode_req.kv_receiver
+            generation = getattr(receiver, "abort_generation", None)
+            drain_confirmed = (
+                drained
+                and required_acks > 0
+                and generation is not None
+                and receiver.kv_mgr.is_abort_release_safe(
+                    room, required_acks, generation=generation
+                )
+            )
             try:
                 self._do_release(decode_req, idx)
             except Exception as error:
                 # Isolate a failed release so the rest still run.
                 self.scheduler.request_retirer.abandon(decode_req.req, error)
                 outcome = "error"
+            decode_req.req.decode_retirement_drained = (
+                outcome == "drained" and drain_confirmed
+            )
             self._observe_deferred_kv_release(
                 duration_seconds=max(0.0, now - start_time),
                 outcome=outcome,

@@ -483,6 +483,7 @@ class Req(ReqDllmMixin):
         # Input and output info
         self.rid = rid
         self.request_instance_id = request_instance_id
+        self.decode_retirement_drained = False
         self.cache_request_handle = CacheRequestHandle(rid=rid, attempt_id=0)
         self.origin_input_ids = origin_input_ids
         self.origin_input_ids_unpadded = (

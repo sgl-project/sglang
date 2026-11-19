@@ -96,6 +96,7 @@ from sglang.srt.disaggregation import role_switch
 from sglang.srt.disaggregation.checksum import KvChecksumComputer
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
+    DecodeReqToTokenPool,
     DecodeTransferQueue,
     SchedulerDisaggregationDecodeMixin,
 )
@@ -485,6 +486,7 @@ class _CancellationRetirement:
     request_instance_id: str
     expires_at: float
     req: Optional[Req] = None
+    requires_decode_drain: bool = False
     replies: Dict[Optional[str], CancellationRetirementReq] = dataclasses.field(
         default_factory=dict
     )
@@ -6581,11 +6583,16 @@ class Scheduler(
         if type(cache) not in (RadixCache, UnifiedRadixCache):
             return False
         allocator = cache.token_to_kv_pool_allocator
+        row_pool_type = (
+            DecodeReqToTokenPool
+            if self.disaggregation_mode == DisaggregationMode.DECODE
+            else ReqToTokenPool
+        )
         # UnifiedRadixCache is also the default tree over ordinary static pools.
         # Limit receipts to the same request-row/token owners as the old tree;
         # unified arenas, recurrent state and custom allocators need other fences.
         if (
-            type(cache.req_to_token_pool) is not ReqToTokenPool
+            type(cache.req_to_token_pool) is not row_pool_type
             or type(allocator)
             not in (TokenToKVPoolAllocator, PagedTokenToKVPoolAllocator)
             or allocator.storage is not None
@@ -6635,7 +6642,18 @@ class Scheduler(
             )
         ):
             return "distributed_scheduler"
-        if self.disaggregation_mode != DisaggregationMode.NULL:
+        if self.disaggregation_mode == DisaggregationMode.DECODE:
+            queue = self.disagg_decode_transfer_queue
+            if (
+                self.rust_server is None
+                or self.transfer_backend != TransferBackend.MOONCAKE
+                or queue is None
+                or not queue.enable_deferred_kv_release
+                or queue.enable_host_receive
+                or queue.enable_staging
+            ):
+                return "unsupported_decode_transfer_ownership"
+        elif self.disaggregation_mode != DisaggregationMode.NULL:
             return "disaggregated_scheduler"
         if (
             not self._cancellation_retirement_cache_supported()
@@ -6713,7 +6731,7 @@ class Scheduler(
                 entry.next_retry_at = time.monotonic() + CANCELLATION_RETIREMENT_RETRY_S
 
     def _check_cancellation_retirements(self) -> None:
-        """Observe scheduler-owned row/state and host-step retirement only.
+        """Observe scheduler-owned retirement and any required Decode drain proof.
 
         Processed batches may still reference a finished request. Its explicit
         inflight counter, rather than those historical references, fences host
@@ -6765,7 +6783,12 @@ class Scheduler(
                 and req not in live_reqs
                 and self._pending_chunked_abort_req is not req
             ):
-                self._complete_cancellation_retirement(entry, "retired")
+                if entry.requires_decode_drain and not req.decode_retirement_drained:
+                    self._complete_cancellation_retirement(
+                        entry, "unknown", "decode_transfer_drain_unconfirmed"
+                    )
+                else:
+                    self._complete_cancellation_retirement(entry, "retired")
 
     def handle_cancellation_retirement(
         self, recv_req: CancellationRetirementReq
@@ -6857,6 +6880,14 @@ class Scheduler(
             ListKind.DECODING,
             ListKind.PREFILL_LAUNCHED,
         }
+        is_decode = self.disaggregation_mode == DisaggregationMode.DECODE
+        if is_decode:
+            allowed = {ListKind.PD_RECEIVING, ListKind.PD_RELEASING}
+            if not any(req in lists[kind] for kind in allowed):
+                self._complete_cancellation_retirement(
+                    entry, "unsupported", "unsupported_request_queue"
+                )
+                return
         if any(
             req in requests for kind, requests in lists.items() if kind not in allowed
         ):
@@ -6868,7 +6899,14 @@ class Scheduler(
             self._complete_cancellation_retirement(entry, "unsupported", scope_error)
             return
         entry.req = req
-        self.abort_request(AbortReq(rid=req.rid), target=req)
+        if is_decode:
+            entry.requires_decode_drain = True
+            if req in lists[ListKind.PD_RECEIVING]:
+                self.disagg_decode_transfer_queue.abort_receiving(
+                    AbortReq(rid=req.rid), target=req
+                )
+        else:
+            self.abort_request(AbortReq(rid=req.rid), target=req)
 
     def _abort_waiting(self, recv_req: AbortReq, target: Optional[Req] = None) -> None:
         is_decode = self.disaggregation_mode == DisaggregationMode.DECODE
