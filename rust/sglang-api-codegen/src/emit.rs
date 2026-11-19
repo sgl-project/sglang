@@ -457,6 +457,34 @@ fn nested_elements(name: &str, models: &HashMap<&str, &MessageModel>) -> bool {
         && element_shapes(rust_path, models).contains(&JsonShape::Seq)
 }
 
+/// Whether a bare list's elements are a union that takes an array of arrays
+/// next to a plain array (a list that mixes vectors and matrices). Its first
+/// element can then be either.
+fn mixed_nested_elements(name: &str, models: &HashMap<&str, &MessageModel>) -> bool {
+    let m = models
+        .get(name)
+        .unwrap_or_else(|| panic!("unknown message {name}"));
+    let MessageKind::BareList { item } = &m.kind else {
+        return false;
+    };
+    let FieldKind::RepeatedMessage { rust_path } = &item.kind else {
+        return false;
+    };
+    let Some(element) = models.get(rust_path.as_str()) else {
+        return false;
+    };
+    let MessageKind::Untagged { variants, .. } = &element.kind else {
+        return false;
+    };
+    variants.iter().any(|v| match &v.kind {
+        FieldKind::Message { rust_path, .. } => models.get(rust_path.as_str()).is_some_and(|arm| {
+            matches!(&arm.kind, MessageKind::BareList { .. })
+                && element_shapes(rust_path, models).contains(&JsonShape::Seq)
+        }),
+        _ => false,
+    })
+}
+
 /// The tag the generated `visit_seq` derives from an array's first element.
 fn seq_shape_tag(shape: &JsonShape) -> &'static str {
     match shape {
@@ -699,6 +727,9 @@ fn emit_untagged(
                                 JsonShape::Seq if nested_elements(rust_path, models) => "seq2",
                                 other => seq_shape_tag(&other),
                             });
+                            if shape == JsonShape::Seq && mixed_nested_elements(rust_path, models) {
+                                tags.push("seq2");
+                            }
                         }
                         let mut claimed = false;
                         for tag in tags {
