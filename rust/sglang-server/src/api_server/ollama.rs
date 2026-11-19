@@ -11,7 +11,7 @@ use sglang_api_types::api::v1 as api;
 
 use super::core::{CoreError, CoreEvent, CoreOutput};
 use super::handlers::{CoreCall, CoreHandle};
-use super::http::openai::{ChatFormatter, render_chat_prompt};
+use super::openai::ChatFormatter;
 use crate::api_server::log::ReceivedAs;
 use crate::message::config::ServerArgs;
 use crate::message::ids::Rid;
@@ -106,19 +106,17 @@ impl Ollama<'_> {
             .iter()
             .map(|message| serde_json::json!({"role": message.role, "content": message.content}))
             .collect();
-        let chat_request =
-            serde_json::from_value(serde_json::json!({"model": model, "messages": messages}))
-                .map_err(|error| {
-                    CoreError::InvalidArgument(format!("invalid messages: {error}"))
-                })?;
-        let prompt = render_chat_prompt(
-            formatter,
-            &chat_request,
-            &self.server_args.default_chat_template_kwargs,
-        )
-        .map_err(|error| {
-            CoreError::InvalidArgument(format!("chat template render failed: {error}"))
-        })?;
+        let body = serde_json::json!({"model": model, "messages": messages});
+        let (prompt, continuation) = formatter
+            .render_chat(body, &self.server_args.default_chat_template_kwargs)
+            .map_err(|error| {
+                CoreError::InvalidArgument(format!("chat template render failed: {error}"))
+            })?;
+        let prompt = RenderedChat {
+            prompt,
+            continuation,
+            ids: None,
+        };
         let stream = request.stream_or_default();
         let call = self
             .submit(
@@ -368,7 +366,7 @@ mod tests {
     /// the transports' tests.
     #[test]
     fn show_synthesizes_the_card_from_the_name_and_context_length() {
-        let core = crate::api_server::http::openai::test_utils::core_handle();
+        let core = crate::api_server::http::test_utils::core_handle();
         let server_args = ServerArgs {
             model_config: crate::message::config::ModelConfig {
                 context_len: 4096,

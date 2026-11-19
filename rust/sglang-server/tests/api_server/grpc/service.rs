@@ -886,7 +886,7 @@ fn ollama_chat_streams_frames_and_show_is_static() {
     assert_eq!(card.parameters, "num_ctx 4096");
 }
 
-/// `AnthropicMessages` renders through the chat core and shapes the
+/// `AnthropicMessages` goes through the chat route and shapes the
 /// reply; `AnthropicCountTokens` counts the rendered prompt's ids.
 #[test]
 fn anthropic_messages_and_count_tokens_over_grpc() {

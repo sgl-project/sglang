@@ -562,6 +562,7 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
                 core.clone(),
                 cfg.server_args.clone(),
                 hicache_manager.clone(),
+                tokenizer.clone(),
             );
             (listener, service)
         });

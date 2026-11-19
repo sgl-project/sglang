@@ -1,6 +1,6 @@
 //! Tokenizer-pool and detokenizer-shard unary calls.
 
-use crate::message::request::{RenderedChat, RequestKind, TokenizeInput};
+use crate::message::request::{RequestKind, TokenizeInput};
 use crate::message::response::ResponseItem;
 use crate::message::types::TokenIds;
 
@@ -47,12 +47,6 @@ impl CoreHandle {
             add_special_tokens,
         })
         .await
-    }
-
-    /// Encode a rendered chat prompt on the tokenizer pool.
-    pub(crate) async fn tokenize_chat(&self, chat: RenderedChat) -> Result<TokenIds, CoreError> {
-        self.tokenize_input(TokenizeInput::Chat(Box::new(chat)))
-            .await
     }
 
     async fn tokenize_input(&self, input: TokenizeInput) -> Result<TokenIds, CoreError> {

@@ -106,8 +106,7 @@ async fn create(inner: Router, state: Arc<AppState>, request: Request) -> Respon
     };
     let stream = request.stream == Some(true);
     let adapter = Responses {
-        core: &state.core,
-        chat_formatter: state.chat_formatter.as_ref(),
+        chat: state.openai_service(),
         server_args: &state.server_args,
     };
     let plan = match adapter.plan(&request, stream) {
@@ -179,7 +178,7 @@ mod tests {
     use axum::http::{Request as HttpRequest, header::CONTENT_TYPE};
 
     use super::*;
-    use crate::api_server::http::openai::test_utils::answering_app_state;
+    use crate::api_server::http::test_utils::answering_app_state;
 
     /// The Responses routes over the chat route, as the app mounts them.
     fn app(state: Arc<AppState>) -> Router {

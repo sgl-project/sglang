@@ -231,7 +231,7 @@ pub fn deepseek_dir() -> &'static str {
 }
 
 /// The pieces of [`fused_dir`]'s tokenizer, ids 1.. in order.
-pub const PIECES: [&str; 9] = [
+pub const PIECES: [&str; 11] = [
     "<think>be",
     "cause</think>Par",
     "is",
@@ -241,6 +241,9 @@ pub const PIECES: [&str; 9] = [
     "o",
     "k",
     "ok",
+    // A Hermes tool call, cut inside its arguments.
+    "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": ",
+    "\"Paris\"}}\n</tool_call>",
 ];
 
 /// The id of `piece` in [`fused_dir`]'s tokenizer.

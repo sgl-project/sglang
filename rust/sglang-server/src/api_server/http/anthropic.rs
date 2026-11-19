@@ -30,7 +30,7 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
 
 fn adapter(state: &AppState) -> Anthropic<'_> {
     Anthropic {
-        core: &state.core,
+        chat: state.openai_service(),
         chat_formatter: state.chat_formatter.as_ref(),
         server_args: &state.server_args,
     }
@@ -98,7 +98,7 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
-    use crate::api_server::http::openai::test_utils::answering_app_state;
+    use crate::api_server::http::test_utils::answering_app_state;
 
     async fn post(state: Arc<AppState>, uri: &str, body: &str) -> (StatusCode, String) {
         let response = routes()

@@ -65,14 +65,6 @@ impl CoreHandle {
         }
     }
 
-    /// Whether OpenAI requests get their own request-log line.
-    pub(crate) fn logs_openai_requests(&self) -> bool {
-        self.inner
-            .request_log
-            .as_ref()
-            .is_some_and(|log| log.logs_openai_requests())
-    }
-
     /// Log an OpenAI request's raw `body` as received (from level 2).
     pub(crate) fn log_openai_request(
         &self,

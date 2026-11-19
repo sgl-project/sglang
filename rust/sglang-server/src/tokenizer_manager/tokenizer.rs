@@ -80,7 +80,6 @@ impl Runnable for TokenizerWorker {
                         text,
                         add_special_tokens,
                     } => widen(self.tokenizer.encode(text, *add_special_tokens)),
-                    TokenizeInput::Chat(chat) => widen(chat.encode(&*self.tokenizer)),
                 };
                 let item = match encoded {
                     Ok(ids) => ResponseItem::TokenIds(ids),

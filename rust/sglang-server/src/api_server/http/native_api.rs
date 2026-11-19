@@ -23,11 +23,10 @@ use crate::api_server::core::{
 };
 use crate::api_server::handlers::{CoreCall, PendingGeneration, recv_indexed};
 use crate::api_server::log::{RawBody, ReceivedAs};
+use crate::message::config::ServerArgs;
 #[cfg(test)]
 use crate::message::ids::Rid;
-#[cfg(test)]
-use crate::message::request::GenerationPolicy;
-use crate::message::request::{GenerateRequest, into_requests};
+use crate::message::request::{GenerateRequest, GenerationPolicy, into_requests};
 use crate::message::response::{CustomizedInfo, RequestStats};
 use crate::message::wire::{ClientMaxNewTokens, merge_preferred_sampling};
 use crate::utils::{
@@ -51,7 +50,7 @@ use sglang_api_types::api::v1 as api;
 /// `/generate` currently exposes only `e2e_latency`; this avoids putting
 /// API-only timestamps onto scheduler messages.
 #[derive(Clone, Debug)]
-pub(super) struct RequestTiming {
+pub(in crate::api_server) struct RequestTiming {
     // TODO: Move request lifecycle timing into a dedicated tracing/metrics
     // module and align its design with Python's APIServerReqTimeStats.
     created_at: Instant,
@@ -60,7 +59,7 @@ pub(super) struct RequestTiming {
 }
 
 impl RequestTiming {
-    pub(super) fn new() -> Self {
+    pub(in crate::api_server) fn new() -> Self {
         Self::starting_at(Instant::now())
     }
 
@@ -106,7 +105,7 @@ impl RequestTiming {
 /// API-local state for one request: its timing, its `customized_info` as its
 /// frames report it, and the annotator a model package's [`GenerateHook`]
 /// started for it.
-pub(super) struct RequestState {
+pub(in crate::api_server) struct RequestState {
     timing: RequestTiming,
     /// The scheduler's decode latency, sent for a finished non-streaming
     /// request: this frontend sees that request's first output only up to
@@ -129,9 +128,26 @@ struct RequestHook {
     frames: Box<dyn GenerateFrameHook>,
 }
 
+/// What decoding and annotating a `/generate` body reads of a listener.
+pub(in crate::api_server) struct GenerateContext<'a> {
+    pub(in crate::api_server) server_args: &'a ServerArgs,
+    pub(in crate::api_server) generation_policy: &'a GenerationPolicy,
+    pub(in crate::api_server) generate_hook: Option<&'a Arc<dyn GenerateHook>>,
+}
+
+impl AppState {
+    pub(super) fn generate_context(&self) -> GenerateContext<'_> {
+        GenerateContext {
+            server_args: &self.server_args,
+            generation_policy: &self.generation_policy,
+            generate_hook: self.generate_hook.as_ref(),
+        }
+    }
+}
+
 impl RequestState {
-    pub(super) fn new(
-        state: &AppState,
+    pub(in crate::api_server) fn new(
+        state: &GenerateContext<'_>,
         request: &GenerateRequest,
         headers: &HeaderMap,
         client_sampling_params: Option<&serde_json::Map<String, serde_json::Value>>,
@@ -143,7 +159,7 @@ impl RequestState {
             report_decode_throughput: state.server_args.metrics.is_some(),
             output_token_logprobs: 0,
             customized_info: CustomizedInfoState::default(),
-            hook: state.generate_hook.as_ref().map(|hook| RequestHook {
+            hook: state.generate_hook.map(|hook| RequestHook {
                 hook: hook.clone(),
                 frames: hook.start(request, headers, client_sampling_params),
             }),
@@ -419,7 +435,7 @@ impl serde::Serialize for ReportedCustomizedInfo {
 /// a finished request's stats, the request's `customized_info` keys and the
 /// keys a model package's hook added.
 #[derive(Debug)]
-pub(super) struct NativeFrame {
+pub(in crate::api_server) struct NativeFrame {
     frame: api::GenerateResponse,
     request_stats: Option<RequestStats>,
     customized_info: ReportedCustomizedInfo,
@@ -646,7 +662,7 @@ async fn generate(
         snapshot: state.core.snapshot_body(&body, Some(raw_body), &headers),
         started_at: start.map(|Extension(crate::RequestStart(at))| at),
     };
-    let (payloads, is_batch) = match generate_requests(&state, body) {
+    let (payloads, is_batch) = match generate_requests(&state.generate_context(), body) {
         Ok(requests) => requests,
         Err((code, message, stream)) => return native_error(code, &message, stream),
     };
@@ -669,7 +685,9 @@ async fn generate(
             .and_then(|Extension(held)| held.take())
             .map(|held| held.claim(&mut payload));
         let client_sampling_params = item_sampling_params(client_sampling_params.as_ref(), 0);
-        let request = RequestState::new(&state, &payload, &headers, client_sampling_params, timing);
+        let context = state.generate_context();
+        let request =
+            RequestState::new(&context, &payload, &headers, client_sampling_params, timing);
         generate_single(&state, payload, held, stream, request, received).await
     } else {
         let requests = payloads
@@ -679,7 +697,7 @@ async fn generate(
                 let client_sampling_params =
                     item_sampling_params(client_sampling_params.as_ref(), item);
                 RequestState::new(
-                    &state,
+                    &state.generate_context(),
                     payload,
                     &headers,
                     client_sampling_params,
@@ -747,8 +765,8 @@ fn json_content_type(headers: &HeaderMap) -> bool {
 
 /// Decode a `/generate` body under the launch-time defaults into its requests and
 /// whether it is a batch; an error carries the body's `stream` flag once known.
-pub(super) fn generate_requests(
-    state: &AppState,
+pub(in crate::api_server) fn generate_requests(
+    state: &GenerateContext<'_>,
     mut body: serde_json::Value,
 ) -> Result<(Vec<GenerateRequest>, bool), (StatusCode, String, bool)> {
     // Read before the fills below: only a `max_new_tokens` the client sent is
@@ -781,7 +799,7 @@ pub(super) fn generate_requests(
     // Fan `text`/`input_ids`/`sampling_params` (scalar or list) into per-request
     // payloads. `is_batch` = list form -> the response is a JSON array.
     // Request normalization only returns validation failures.
-    let (mut requests, is_batch) = into_requests(body, &state.generation_policy).map_err(|e| {
+    let (mut requests, is_batch) = into_requests(body, state.generation_policy).map_err(|e| {
         tracing::warn!(error = %e, "rejected request");
         (StatusCode::BAD_REQUEST, e.to_string(), stream)
     })?;
@@ -840,7 +858,7 @@ async fn generate_single(
 /// failed batch item is its own `{ "error": ... }` entry in the array).
 #[derive(Debug, serde::Serialize)]
 #[serde(untagged)]
-pub(super) enum GenerateItem {
+pub(in crate::api_server) enum GenerateItem {
     // Boxed: a frame is ~300 bytes against the error's ~40, and a batch
     // array holds one per item.
     Frame(Box<NativeFrame>),
@@ -863,7 +881,7 @@ pub(super) async fn drain_unary(
 }
 
 /// [`drain_unary`]'s terminal frame, or the error that failed the call.
-pub(super) async fn drain_unary_frame(
+pub(in crate::api_server) async fn drain_unary_frame(
     call: &mut CoreCall,
     rid_str: &str,
     mut request: RequestState,
@@ -958,7 +976,7 @@ pub(super) fn generation_event_stream(
 }
 
 /// [`generation_event_stream`], writing a failed call's frame with `error_frame`.
-pub(super) fn generation_event_stream_with(
+pub(in crate::api_server) fn generation_event_stream_with(
     calls: Vec<(CoreCall, RequestState)>,
     incremental: bool,
     with_index: bool,
@@ -1182,7 +1200,7 @@ mod tests {
             generation_policy: GenerationPolicy::default(),
             chat_formatter: None,
             generate_hook: None,
-            openai_chat: None,
+            openai: Default::default(),
         });
 
         let response = health_generate(State(state), Duration::ZERO, true).await;
@@ -1232,7 +1250,7 @@ mod tests {
             generation_policy: GenerationPolicy::default(),
             chat_formatter: None,
             generate_hook: None,
-            openai_chat: None,
+            openai: Default::default(),
         });
 
         let response = health_without_generation(State(state.clone())).await;
@@ -1270,7 +1288,7 @@ mod tests {
             generation_policy: GenerationPolicy::default(),
             chat_formatter: None,
             generate_hook: None,
-            openai_chat: None,
+            openai: Default::default(),
         });
         state.core.hold_for_custom_warmups();
 
@@ -1313,7 +1331,7 @@ mod tests {
             server_args: Arc::new(server_args),
             chat_formatter: None,
             generate_hook: None,
-            openai_chat: None,
+            openai: Default::default(),
         });
         let responder = tokio::spawn(async move {
             let mut submitted = Vec::new();
@@ -1376,7 +1394,7 @@ mod tests {
             server_args: Arc::new(server_args),
             chat_formatter: None,
             generate_hook: None,
-            openai_chat: None,
+            openai: Default::default(),
         });
         let app = routes().with_state(state.clone());
         for (body, message) in [
@@ -1459,7 +1477,10 @@ mod tests {
             serde_json::json!({"text": "hi", "sampling_logprobs_mode": null}),
             serde_json::json!({"text": ["a", "b"], "sampling_logprobs_mode": [null, null, "support"]}),
         ] {
-            assert!(generate_requests(&state, body.clone()).is_ok(), "{body}");
+            assert!(
+                generate_requests(&state.generate_context(), body.clone()).is_ok(),
+                "{body}"
+            );
         }
         // A body the schema refuses is refused as such first, unlogged, as
         // Python's contract check is.
@@ -1470,7 +1491,7 @@ mod tests {
             "sampling_params": {"unknown": 1},
             "sampling_logprobs_mode": "support",
         });
-        let (status, message, _) = generate_requests(&state, body).unwrap_err();
+        let (status, message, _) = generate_requests(&state.generate_context(), body).unwrap_err();
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(message.contains("unknown"), "{message}");
         assert!(logs.rejections().is_empty());
@@ -1503,7 +1524,7 @@ mod tests {
             server_args: Arc::new(crate::message::config::ServerArgs::default()),
             chat_formatter: None,
             generate_hook: None,
-            openai_chat: None,
+            openai: Default::default(),
         });
         let (body, rank) = (r#"{"input_ids": [1], "routed_dp_rank": 3}"#, 3);
         let logs = crate::utils::logging::capture_logs();

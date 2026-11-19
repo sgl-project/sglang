@@ -7,18 +7,22 @@
 //! sends them to the engine's own OpenAI route.
 
 mod chat;
+mod choices;
 mod completions;
 mod kimi_k3_tag;
 mod pieces;
 mod request;
+mod score;
 mod wire;
 
 use serde::Deserialize;
 use sglang_api_types::api::v1::{GenerateResponse, GenerateStreamError};
 
 pub use chat::{ChatModel, ChatResponder, DeepSeekOutputError, ReasoningToggle, lower_chat};
+pub use choices::{PROMPT_LIST_FIELDS, choices_per_prompt, copy_prompt_per_choice};
 pub use completions::{CompletionResponder, lower_completion};
 pub use pieces::TokenPieces;
+pub use score::{ScoreResponder, lower_score};
 pub use sglang_api_types::api::v1::GenerateRequest;
 pub use wire::Reply;
 
@@ -26,6 +30,8 @@ pub use wire::Reply;
 pub enum Responder {
     Completion(Box<CompletionResponder>),
     Chat(Box<ChatResponder>),
+    /// Scoring answers once and never streams.
+    Score(Box<ScoreResponder>),
 }
 
 impl Responder {
@@ -41,6 +47,7 @@ impl Responder {
         match self {
             Self::Completion(responder) => responder.unary(output),
             Self::Chat(responder) => responder.unary(output),
+            Self::Score(responder) => Some(responder.unary(output)),
         }
     }
 
@@ -53,6 +60,7 @@ impl Responder {
         match self {
             Self::Completion(responder) => responder.stream_data(data),
             Self::Chat(responder) => responder.stream_data(data),
+            Self::Score(_) => Ok(Vec::new()),
         }
     }
 
@@ -61,6 +69,7 @@ impl Responder {
         match self {
             Self::Completion(responder) => responder.stream_end(),
             Self::Chat(responder) => responder.stream_end(),
+            Self::Score(_) => Vec::new(),
         }
     }
 
@@ -69,6 +78,7 @@ impl Responder {
         match self {
             Self::Completion(responder) => responder.done(),
             Self::Chat(responder) => responder.done(),
+            Self::Score(_) => true,
         }
     }
 
@@ -132,3 +142,44 @@ pub trait OpenAiTokenizer: Send + Sync {
 /// Why a request is left to the engine's own OpenAI route.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Unsupported(pub &'static str);
+
+/// The reasons that fault the request; any other is a feature the processor
+/// does not serve.
+const REQUEST_FAULTS: [&str; 5] = [
+    "unparsed_request",
+    "invalid_request",
+    "tool_choice",
+    "tool_definition",
+    // Python refuses chat without a template as a bad request.
+    "chat_template",
+];
+
+impl Unsupported {
+    /// The answer of a host with no engine route to leave the request to.
+    // TODO(rainj-me): carry Python's message with the reason, so a refused
+    // request reads as it does on the Python server.
+    pub fn reply(self) -> Reply {
+        let Self(reason) = self;
+        if REQUEST_FAULTS.contains(&reason) {
+            return Reply::error(400, &format!("Invalid request ({reason})"));
+        }
+        Reply::error(501, &format!("Not supported by this server ({reason})"))
+    }
+}
+
+impl Reply {
+    /// `OpenAIServingBase.create_error_response`: a 400 is a `BadRequestError`;
+    /// any other status is an `HTTPException`, typed by its status code.
+    pub fn error(status: u16, message: &str) -> Self {
+        let err_type = match status {
+            400 => "BadRequestError".to_owned(),
+            _ => status.to_string(),
+        };
+        Self::typed_error(status, &err_type, message)
+    }
+
+    /// An error reply of an explicit `err_type`.
+    pub fn typed_error(status: u16, err_type: &str, message: &str) -> Self {
+        wire::error_reply(message, err_type, status)
+    }
+}

@@ -19,10 +19,11 @@ use crate::api_server::handlers::{
     HiCacheManager, LORA_DISABLED, ToolSpec, WeightGroupOutcome, WeightUpdateOutcome,
     parse_function_call, separate_reasoning,
 };
-use crate::api_server::http::openai::{ChatFormatter, load_chat_support};
 use crate::api_server::http::weights::{decode_payloads, json_object};
 use crate::api_server::log::ReceivedAs;
 use crate::api_server::ollama::Ollama;
+use crate::api_server::openai::OpenAiService;
+use crate::api_server::openai::{ChatFormatter, OpenAi, load_chat_support};
 use crate::message::config::{
     DEFAULT_GRPC_RESPONSE_TIMEOUT_SECS, PreferredSamplingParams, ServerArgs,
 };
@@ -62,6 +63,8 @@ pub(crate) struct GrpcService {
     server_args: Arc<ServerArgs>,
     /// The served chat template, for the chat-shaped data planes.
     chat_formatter: Option<ChatFormatter>,
+    /// What the processor's OpenAI layer reads of this server.
+    openai: Arc<OpenAi>,
 }
 
 impl GrpcService {
@@ -69,7 +72,10 @@ impl GrpcService {
         core: CoreHandle,
         server_args: Arc<ServerArgs>,
         hicache_manager: Arc<HiCacheManager>,
+        tokenizer: Option<Arc<sglang_processor::DynamoTokenizer>>,
     ) -> Self {
+        let chat_formatter = load_chat_support(&server_args);
+        let openai = OpenAi::new(&server_args, chat_formatter.as_ref(), tokenizer);
         Self {
             core,
             config: AdapterConfig {
@@ -83,7 +89,8 @@ impl GrpcService {
                 generation_policy: server_args.as_ref().into(),
             },
             hicache_manager,
-            chat_formatter: load_chat_support(&server_args),
+            chat_formatter,
+            openai: Arc::new(openai),
             server_args,
         }
     }
@@ -102,6 +109,7 @@ impl GrpcService {
         };
         Self {
             hicache_manager: Arc::new(HiCacheManager::new(core.clone(), &args)),
+            openai: Arc::default(),
             core,
             config: AdapterConfig {
                 preferred_sampling_params,
@@ -178,9 +186,19 @@ fn lora_disabled() -> Result<Response<api::LoraUpdateResponse>, Status> {
 }
 
 impl GrpcService {
+    fn openai_service(&self) -> OpenAiService<'_> {
+        OpenAiService {
+            core: &self.core,
+            server_args: &self.server_args,
+            generation_policy: &self.config.generation_policy,
+            generate_hook: None,
+            openai: &self.openai,
+        }
+    }
+
     fn anthropic(&self) -> Anthropic<'_> {
         Anthropic {
-            core: &self.core,
+            chat: self.openai_service(),
             chat_formatter: self.chat_formatter.as_ref(),
             server_args: &self.server_args,
         }
@@ -1226,25 +1244,24 @@ impl SglangService for GrpcService {
         request: Request<api::OpenAiScoreRequest>,
     ) -> Result<Response<api::OpenAiScoreResponse>, Status> {
         let request = request.into_inner();
-        let scored = crate::api_server::http::openai::score::score_request(
-            &self.core,
-            &self.server_args,
-            ReceivedAs::without_headers,
-            &request,
-        )
-        .await
-        .map_err(|(status, message)| {
-            let code = match status {
-                StatusCode::BAD_REQUEST => tonic::Code::InvalidArgument,
-                StatusCode::SERVICE_UNAVAILABLE => tonic::Code::Unavailable,
-                status if status.is_server_error() => tonic::Code::Internal,
+        let reply = self
+            .openai_service()
+            .score(&request, ReceivedAs::without_headers())
+            .await;
+        if reply.status != 200 {
+            let code = match StatusCode::from_u16(reply.status) {
+                Ok(StatusCode::BAD_REQUEST) => tonic::Code::InvalidArgument,
+                Ok(StatusCode::SERVICE_UNAVAILABLE) => tonic::Code::Unavailable,
+                Ok(status) if status.is_server_error() => tonic::Code::Internal,
                 _ => tonic::Code::Unknown,
             };
-            Status::new(code, message)
-        })?;
-        Ok(Response::new(scored.into_response(
-            request.model.clone().unwrap_or_else(|| "default".into()),
-        )))
+            let error: serde_json::Value = serde_json::from_str(&reply.body).unwrap_or_default();
+            let message = error["message"].as_str().unwrap_or("Upstream error");
+            return Err(Status::new(code, message));
+        }
+        let response = serde_json::from_str(&reply.body)
+            .map_err(|error| Status::internal(format!("unreadable score: {error}")))?;
+        Ok(Response::new(response))
     }
 
     async fn open_ai_rerank(
@@ -1275,8 +1292,7 @@ impl SglangService for GrpcService {
     ) -> Result<Response<api::OpenAiResponsesResponse>, Status> {
         let request = request.into_inner();
         let adapter = crate::api_server::responses::Responses {
-            core: &self.core,
-            chat_formatter: self.chat_formatter.as_ref(),
+            chat: self.openai_service(),
             server_args: &self.server_args,
         };
         let value = adapter
@@ -1547,6 +1563,7 @@ mod tests {
                 harness.service.core.clone(),
                 Arc::new(server_args),
                 harness.service.hicache_manager.clone(),
+                None,
             )
             .config
             .response_timeout

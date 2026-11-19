@@ -29,6 +29,56 @@ use crate::tool_call::{ToolCallItem, ToolDetector, tool_call_id, tool_detector};
 
 #[cfg(feature = "render")]
 mod deepseek;
+#[cfg(feature = "parser")]
+mod dynamo;
+/// Without `parser` only the ported parsers are served.
+#[cfg(not(feature = "parser"))]
+mod dynamo {
+    use serde_json::Value;
+
+    use super::{ReasoningOptions, ToolDetector, ToolParsing, Unsupported};
+
+    pub(super) const PARSES_REASONING: bool = false;
+    pub(super) const CONSTRAINS_TOOLS: bool = false;
+
+    pub(super) enum Reasoning {}
+
+    impl Reasoning {
+        pub(super) fn new(_: &str, _: &ReasoningOptions) -> Self {
+            unreachable!("declined when lowering")
+        }
+
+        pub(super) fn push(&mut self, _: &str) -> (String, String) {
+            match *self {}
+        }
+
+        pub(super) fn finish(&mut self) -> (String, String) {
+            match *self {}
+        }
+    }
+
+    pub(super) fn parse_reasoning(
+        _: &str,
+        _: &ReasoningOptions,
+        _: &str,
+        _: &[i64],
+    ) -> (String, String) {
+        unreachable!("declined when lowering")
+    }
+
+    pub(super) fn tool_detector(_: &ToolParsing) -> Option<Box<dyn ToolDetector>> {
+        None
+    }
+
+    pub(super) fn tool_constraint(
+        _: &str,
+        _: Option<&Value>,
+        _: &[Value],
+        _: Option<bool>,
+    ) -> Result<Option<(bool, String)>, Unsupported> {
+        Ok(None)
+    }
+}
 /// Without `render` there is no recipe: requests whose output it would parse
 /// fall back.
 #[cfg(not(feature = "render"))]
@@ -93,6 +143,9 @@ pub struct ChatModel {
     /// `"dsv41"` output.
     #[serde(default)]
     pub chat_encoding_spec: Option<String>,
+    /// A conversation template's `stop_str`, which precede the request's stops.
+    #[serde(default)]
+    pub template_stops: Vec<String>,
     /// The served DeepSeek-V4 / V4.1 checkpoint, whose output recipe parses
     /// with its tokenizer.
     #[cfg(feature = "render")]
@@ -136,7 +189,13 @@ impl ChatModel {
             ChatFormatter::DeepSeekV41(tokenizer) => (Some("dsv41"), deepseek(true, tokenizer)),
             _ => (None, None),
         };
+        let template_stops = match formatter.stop_strs() {
+            Some(crate::OneOrMany::One(stop)) => vec![stop],
+            Some(crate::OneOrMany::Many(stops)) => stops,
+            None => Vec::new(),
+        };
         Self {
+            template_stops,
             always_thinks: formatter.always_thinks(),
             reasoning_toggle: formatter.reasoning_toggle().map(|(param, enabled)| {
                 ReasoningToggle {
@@ -442,12 +501,12 @@ pub fn lower_chat(
     let tool_call_parser = settings.tool_call_parser.as_deref();
     // recipe parses DeepSeek output from its token ids in place of both parsers.
     let deepseek = deepseek::parsing(model, settings, &original, request_tools(&raw)?.is_some())?;
-    let parser = match reasoning_parser {
-        Some(name) if deepseek.is_none() => {
-            Some(think_config(name).ok_or(Unsupported("reasoning_parser"))?)
-        }
-        _ => None,
-    };
+    // The text parser's name, and its port when `think/` has one.
+    let reasoning_name = reasoning_parser.filter(|_| deepseek.is_none());
+    let parser = reasoning_name.and_then(think_config);
+    if reasoning_name.is_some() && parser.is_none() && !dynamo::PARSES_REASONING {
+        return Err(Unsupported("reasoning_parser"));
+    }
     // `_process_messages`: glm47 constrains a request with tools, `"none"`
     // included, by a grammar flagged `ebnf_full_assistant`, which `/generate`
     // does not accept.
@@ -462,11 +521,32 @@ pub fn lower_chat(
     let tools = request_tools(&raw)?;
     let tool_definitions = raw.get("tools").and_then(Value::as_array).cloned();
     let parallel_tool_calls = raw.get("parallel_tool_calls") != Some(&Value::Bool(false));
+    // `required` or a named tool, which a grammar holds the output to.
+    let forced_choice = raw
+        .get("tool_choice")
+        .filter(|choice| !choice.is_null() && *choice != "auto" && *choice != "none");
+    let mut tool_constraint = None;
     let tool_parsing = match (tool_call_parser, &tools, &tool_definitions) {
         (Some(parser), Some(_), Some(definitions)) if deepseek.is_none() => {
-            tool_detector(parser, definitions).ok_or(Unsupported("tool_parser"))?;
-            Some((parser.to_owned(), definitions.clone()))
+            let strict = definitions
+                .iter()
+                .any(|tool| tool["function"]["strict"] == true);
+            if forced_choice.is_some() || strict {
+                let parallel = raw.get("parallel_tool_calls").and_then(Value::as_bool);
+                tool_constraint =
+                    dynamo::tool_constraint(parser, forced_choice, definitions, parallel)?;
+            }
+            let structural = matches!(tool_constraint, Some((true, _)));
+            let parsing = ToolParsing {
+                parser: parser.to_owned(),
+                tools: definitions.clone(),
+                forced: forced_choice.map(|choice| (choice.clone(), structural)),
+            };
+            parsing.detector().ok_or(Unsupported("tool_parser"))?;
+            Some(parsing)
         }
+        // A forced call needs the server's tool parser to constrain and read it.
+        _ if forced_choice.is_some() => return Err(Unsupported("tool_choice")),
         _ => None,
     };
     // Fields the typed request below does not read, typed as Pydantic types them.
@@ -508,7 +588,7 @@ pub fn lower_chat(
     }
     // K3 also stops on its tool parser's `eot_token`.
     let tool_call_stop = match &tool_parsing {
-        Some((parser, _)) if model.is_kimi_k3() => match parser.as_str() {
+        Some(parsing) if model.is_kimi_k3() => match parsing.parser.as_str() {
             "kimi_k3" => Some(KIMI_K3_TOOLS_CLOSE),
             _ => return Err(Unsupported("tool_parser")),
         },
@@ -545,8 +625,14 @@ pub fn lower_chat(
     else {
         unreachable!("one sampling configuration")
     };
-    if let (Some((tool_parser, _)), Some(definitions)) = (&tool_parsing, &tool_definitions)
-        && tool_parser == "kimi_k3"
+    match tool_constraint {
+        Some((true, tag)) => sampling.structural_tag = Some(tag),
+        Some((false, schema)) => sampling.json_schema = Some(schema),
+        None => {}
+    }
+    if let (Some(parsing), Some(definitions)) = (&tool_parsing, &tool_definitions)
+        && parsing.parser == "kimi_k3"
+        && parsing.forced.is_none()
         && [&sampling.regex, &sampling.ebnf, &sampling.json_schema]
             .iter()
             .all(|value| value.as_deref().is_none_or(str::is_empty))
@@ -559,6 +645,16 @@ pub fn lower_chat(
         if let Some(tag) = auto_tool_call_tag(definitions, parallel_tool_calls, &strip)? {
             sampling.structural_tag = Some(python_json(&tag, true));
         }
+    }
+    // `_apply_conversation_template`: `conv.stop_str` comes before `request.stop`.
+    if !model.template_stops.is_empty() {
+        let own = match sampling.stop.take().and_then(|s| s.value) {
+            Some(string_or_list::Value::Many(stops)) => stops.items,
+            Some(string_or_list::Value::One(stop)) => vec![stop],
+            None => Vec::new(),
+        };
+        let stops = model.template_stops.iter().cloned().chain(own);
+        sampling.stop = Some(OneOrList::List(stops.collect()).into());
     }
     if let Some(stop) = tool_call_stop {
         let mut stops = match sampling.stop.take().and_then(|s| s.value) {
@@ -573,12 +669,14 @@ pub fn lower_chat(
     }
     let (include_usage, continuous_usage_stats) =
         usage_flags(request.stream_options.as_ref(), settings);
-    let reasoning = parser
+    let reasoning = reasoning_name
         .filter(|_| request.separate_reasoning)
-        .map(|config| ReasoningConfig {
-            think: config,
+        .map(|name| ReasoningConfig {
+            name: name.to_owned(),
+            think: parser,
             options: ReasoningOptions {
-                force_reasoning: Some(thinking),
+                // A Dynamo parser keeps its own default.
+                force_reasoning: parser.map(|_| thinking),
                 stream_reasoning: request.stream_reasoning,
                 previous_content,
                 force_nonempty_content: kwargs.get("force_nonempty_content")
@@ -625,11 +723,12 @@ pub fn lower_chat(
 }
 
 /// The names of the tools a request lets the model call, or `None` when
-/// `tool_choice` turns them off. Only `auto` without strict tools is served:
-/// it adds no constraint, while the others depend on the engine's xgrammar.
+/// `tool_choice` turns them off. A forced choice and strict tools need a
+/// grammar, which only Dynamo's parsers build.
 fn request_tools(raw: &Map<String, Value>) -> Result<Option<Vec<String>>, Unsupported> {
     let choice = raw.get("tool_choice").filter(|c| !c.is_null());
-    if choice.is_some_and(|c| c != "auto" && c != "none")
+    let forced = choice.is_some_and(|c| c != "auto" && c != "none");
+    if (forced && !dynamo::CONSTRAINS_TOOLS)
         || raw
             .get("parallel_tool_calls")
             .is_some_and(|p| !p.is_boolean())
@@ -647,7 +746,9 @@ fn request_tools(raw: &Map<String, Value>) -> Result<Option<Vec<String>>, Unsupp
         let well_formed = tool.get("type").is_none_or(Value::is_string)
             && tool.get("defer_loading").is_none_or(Value::is_null)
             && function.get("defer_loading").is_none_or(Value::is_null)
-            && function.get("strict").is_none_or(|s| s == false)
+            && function
+                .get("strict")
+                .is_none_or(|s| s == false || (dynamo::CONSTRAINS_TOOLS && s == true))
             && function
                 .get("description")
                 .is_none_or(|d| d.is_string() || d.is_null())
@@ -657,7 +758,7 @@ fn request_tools(raw: &Map<String, Value>) -> Result<Option<Vec<String>>, Unsupp
         };
         names.push(name.to_owned());
     }
-    let parse = !tools.is_empty() && choice.is_none_or(|c| c == "auto");
+    let parse = !tools.is_empty() && choice.is_none_or(|c| c != "none");
     Ok(parse.then_some(names))
 }
 
@@ -1025,8 +1126,72 @@ fn generate_body(
 }
 
 struct ReasoningConfig {
-    think: ThinkConfig,
+    name: String,
+    /// The port of `name`; `None` leaves it to Dynamo's parser.
+    think: Option<ThinkConfig>,
     options: ReasoningOptions,
+}
+
+impl ReasoningConfig {
+    /// A whole output as `(reasoning, normal)`.
+    fn parse(&self, text: &str, ids: &[i64]) -> (String, String) {
+        match self.think {
+            Some(think) => ThinkDetector::new(think, &self.options).parse(text),
+            None => dynamo::parse_reasoning(&self.name, &self.options, text, ids),
+        }
+    }
+
+    // Without `parser` there is no Dynamo arm to reach.
+    #[cfg_attr(not(feature = "parser"), allow(unreachable_code))]
+    fn split(&self) -> ReasoningSplit {
+        match self.think {
+            Some(think) => ReasoningSplit::Port(ThinkDetector::new(think, &self.options)),
+            None => ReasoningSplit::Dynamo(dynamo::Reasoning::new(&self.name, &self.options)),
+        }
+    }
+}
+
+/// One streamed choice's reasoning split.
+enum ReasoningSplit {
+    Port(ThinkDetector),
+    Dynamo(dynamo::Reasoning),
+}
+
+impl ReasoningSplit {
+    fn push(&mut self, text: &str) -> (String, String) {
+        match self {
+            Self::Port(detector) => detector.push(text),
+            Self::Dynamo(reasoning) => reasoning.push(text),
+        }
+    }
+
+    fn finish(&mut self) -> (String, String) {
+        match self {
+            Self::Port(detector) => detector.finish(),
+            Self::Dynamo(reasoning) => reasoning.finish(),
+        }
+    }
+}
+
+/// The server's tool parser over a request's tools.
+struct ToolParsing {
+    parser: String,
+    tools: Vec<Value>,
+    /// A forced `tool_choice`, and whether a structural tag constrains it.
+    forced: Option<(Value, bool)>,
+}
+
+impl ToolParsing {
+    /// The parser's port, else Dynamo's parser.
+    fn detector(&self) -> Option<Box<dyn ToolDetector>> {
+        // A choice forced by a JSON schema is the calls as JSON, not the parser's format.
+        let json = matches!(self.forced, Some((_, false)));
+        let port = match json {
+            true => None,
+            false => tool_detector(&self.parser, &self.tools),
+        };
+        port.or_else(|| dynamo::tool_detector(self))
+    }
 }
 
 /// How the responder parses the output.
@@ -1035,7 +1200,7 @@ enum OutputParsing {
     /// over the output text.
     Text {
         reasoning: Option<ReasoningConfig>,
-        tools: Option<(String, Vec<Value>)>,
+        tools: Option<ToolParsing>,
     },
     /// recipe over the output token ids, in place of both parsers.
     DeepSeek(deepseek::DeepSeekParsing),
@@ -1044,7 +1209,7 @@ enum OutputParsing {
 impl OutputParsing {
     /// The reasoning config and the tool parser with its tools; none when
     /// recipe parses.
-    fn text_parsers(&self) -> (Option<&ReasoningConfig>, Option<&(String, Vec<Value>)>) {
+    fn text_parsers(&self) -> (Option<&ReasoningConfig>, Option<&ToolParsing>) {
         match self {
             OutputParsing::Text { reasoning, tools } => (reasoning.as_ref(), tools.as_ref()),
             OutputParsing::DeepSeek(_) => (None, None),
@@ -1070,7 +1235,7 @@ pub struct ChatResponder {
     created: u64,
     stream: StreamState,
     roles_sent: HashSet<u64>,
-    detectors: HashMap<u64, ThinkDetector>,
+    detectors: HashMap<u64, ReasoningSplit>,
     tool_detectors: HashMap<u64, Box<dyn ToolDetector>>,
     has_tool_calls: HashSet<u64>,
     finish_reasons: Vec<(u64, String, Value)>,
@@ -1142,11 +1307,12 @@ impl ChatResponder {
         let mut text = item.text.clone();
         let mut reasoning = String::new();
         if let Some(config) = reasoning_config {
-            (reasoning, text) = ThinkDetector::new(config.think, &config.options).parse(&text);
+            let ids = item.output_ids.as_ref().map_or(&[][..], |ids| &ids.ids);
+            (reasoning, text) = config.parse(&text, ids);
         }
         let mut calls = Vec::new();
-        if let Some((parser, tools)) = tools
-            && let Some(detector) = tool_detector(parser, tools)
+        if let Some(tools) = tools
+            && let Some(detector) = tools.detector()
             && detector.has_tool_call(&text)
         {
             (text, calls) = detector.parse_non_stream(&text);
@@ -1254,7 +1420,7 @@ impl ChatResponder {
             let detector = self
                 .detectors
                 .entry(index)
-                .or_insert_with(|| ThinkDetector::new(config.think, &config.options));
+                .or_insert_with(|| config.split());
             let (mut reasoning, mut normal) = detector.push(&delta);
             if finish_type.as_deref().is_some_and(|t| t != "abort") {
                 let (end_reasoning, end_normal) = detector.finish();
@@ -1275,9 +1441,10 @@ impl ChatResponder {
         if let Some(tools) = tools {
             // `_process_tool_call_stream`, whose chunks are Pydantic models.
             let flush = finish_type.as_deref().is_some_and(|t| t != "abort");
-            let detector = self.tool_detectors.entry(index).or_insert_with(|| {
-                tool_detector(&tools.0, &tools.1).expect("checked when lowering")
-            });
+            let detector = self
+                .tool_detectors
+                .entry(index)
+                .or_insert_with(|| tools.detector().expect("checked when lowering"));
             let (normal, calls) = detector.parse_stream(&delta, flush);
             let usage = self.chunk_usage(index).unwrap_or(Value::Null);
             // `ChatCompletionResponseStreamChoice._serialize` omits absent tool calls.
@@ -1428,7 +1595,7 @@ impl ChatResponder {
             .parsing
             .text_parsers()
             .1
-            .map(|(parser, _)| parser.as_str())
+            .map(|tools| tools.parser.as_str())
         {
             Some("kimi_k3") => format!(
                 "{}:{}",

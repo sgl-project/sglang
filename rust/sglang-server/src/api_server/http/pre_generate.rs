@@ -193,7 +193,7 @@ mod tests {
             server_args,
             chat_formatter: None,
             generate_hook: None,
-            openai_chat: None,
+            openai: Default::default(),
         });
         let (started_tx, started) = flume::unbounded();
         let (release, release_rx) = flume::unbounded();

@@ -26,8 +26,10 @@ use std::sync::Arc;
 use super::app::AppState;
 use super::auth::DeclaredRoute;
 use super::native_api::native_error;
+use super::openai::openai_error;
 use crate::api_server::core::{CoreError, FORWARD_PEER_PATH};
 use crate::api_server::handlers::{AbortEnding, DumperOutcome, ElasticEpState, ProfileOutcome};
+use crate::api_server::openai::unix_seconds_u32;
 use crate::message::info::ServerInfo;
 use crate::message::io_struct::{
     ExpertDistributionAction, LoggingConfig, PdRoleSwitch, ProfileOptions, SessionOpen,
@@ -62,6 +64,10 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
         // alias).
         .declared_route("/get_model_info", get(model_info))
         .declared_route("/model_info", get(model_info))
+        // The same cards in the OpenAI shape. `{*model}`: a served name may
+        // carry a slash (`org/model`), as Python's `{model:path}` takes it.
+        .declared_route("/v1/models", get(openai_models))
+        .declared_route("/v1/models/{*model}", get(openai_model))
         .declared_route("/flush_cache", get(flush_cache).post(flush_cache))
         .declared_route("/weights_checker", get(check_weights).post(check_weights))
         .declared_route(
@@ -1077,6 +1083,35 @@ async fn abort_request(
     StatusCode::OK.into_response()
 }
 
+/// `GET /v1/models`: the OpenAI model list, from core metadata.
+async fn openai_models(State(state): State<Arc<AppState>>) -> Response {
+    let cards = state.core.list_models().await;
+    let models: Vec<Value> = cards.into_iter().map(openai_model_card).collect();
+    Json(serde_json::json!({ "object": "list", "data": models })).into_response()
+}
+
+/// `GET /v1/models/{model}`: one card, or Python's 404 for an unknown name.
+async fn openai_model(State(state): State<Arc<AppState>>, Path(model): Path<String>) -> Response {
+    let cards = state.core.list_models().await;
+    let Some(card) = cards.into_iter().find(|card| card.id == model) else {
+        let message = format!("The model `{model}` does not exist");
+        return openai_error(StatusCode::NOT_FOUND, message, false);
+    };
+    Json(openai_model_card(card)).into_response()
+}
+
+fn openai_model_card(card: api::ModelCard) -> Value {
+    serde_json::json!({
+        "id": card.id,
+        "object": "model",
+        "created": unix_seconds_u32(),
+        "owned_by": "sglang",
+        "root": card.root,
+        "parent": card.parent,
+        "max_model_len": card.max_model_len,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use axum::{
@@ -1153,7 +1188,7 @@ mod tests {
                 server_args,
                 chat_formatter: None,
                 generate_hook: None,
-                openai_chat: None,
+                openai: Default::default(),
             }),
             intake_rx,
             abort_rx,
