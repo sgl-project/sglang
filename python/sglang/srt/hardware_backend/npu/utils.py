@@ -349,8 +349,6 @@ def npu_format_cast(
     return torch.ops.npu.npu_format_cast(tensor, acl_format.value)
 
 
-
-
 def init_zbal(world_size, gpu_id, world_rank, do_check=True):
     """
     init zbal, if is mix alloc mode, only register for sma & comm
