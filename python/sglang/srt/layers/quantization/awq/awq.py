@@ -6,9 +6,12 @@ import warnings
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
+from torch.nn import functional as F
 
+from sglang.srt.layers import vocab_parallel_embedding
 from sglang.srt.layers.linear import LinearBase
 from sglang.srt.layers.moe import MoeRunnerConfig
+from sglang.srt.layers.parameter import ModelWeightParameter
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     LinearMethodBase,
@@ -74,12 +77,14 @@ class AWQConfig(QuantizationConfig):
         group_size: int,
         zero_point: bool,
         modules_to_not_convert: Optional[List[str]] = None,
+        embedding_quantization: Optional[Dict[str, Any]] = None,
     ) -> None:
         super().__init__()
         self.weight_bits = weight_bits
         self.group_size = group_size
         self.zero_point = zero_point
         self.modules_to_not_convert = modules_to_not_convert or []
+        self.embedding_quantization = embedding_quantization
 
         if self.weight_bits != 4:
             raise ValueError(
@@ -131,13 +136,27 @@ class AWQConfig(QuantizationConfig):
         modules_to_not_convert = cls.get_from_keys_or(
             config, ["modules_to_not_convert"], None
         )
-        return cls(weight_bits, group_size, zero_point, modules_to_not_convert)
+        return cls(
+            weight_bits,
+            group_size,
+            zero_point,
+            modules_to_not_convert,
+            embedding_quantization=config.get("embedding"),
+        )
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
-    ) -> Optional[LinearMethodBase]:
+    ) -> Optional[QuantizeMethodBase]:
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+
+        if (
+            type(layer) is vocab_parallel_embedding.VocabParallelEmbedding
+            and self.embedding_quantization is not None
+        ):
+            if is_layer_skipped_awq(prefix, self.modules_to_not_convert):
+                return None
+            return AWQEmbeddingMethod(self)
 
         if _is_npu:
             if isinstance(layer, LinearBase):
@@ -270,6 +289,7 @@ class AWQMarlinConfig(QuantizationConfig):
         self.weight_bits = weight_bits
         self.modules_to_not_convert = modules_to_not_convert or []
         self.full_config = full_config
+        self.embedding_quantization = full_config.get("embedding")
 
         if self.weight_bits not in self.TYPE_MAP:
             raise ValueError(
@@ -357,10 +377,10 @@ class AWQMarlinConfig(QuantizationConfig):
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional[QuantizeMethodBase]:
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-        from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 
         if isinstance(layer, LinearBase) or (
-            isinstance(layer, ParallelLMHead) and self.lm_head_quantized
+            isinstance(layer, vocab_parallel_embedding.ParallelLMHead)
+            and self.lm_head_quantized
         ):
             if is_layer_skipped_awq(prefix, self.modules_to_not_convert):
                 return UnquantizedLinearMethod()
@@ -390,6 +410,13 @@ class AWQMarlinConfig(QuantizationConfig):
                 )
             layer.scheme = self.get_moe_scheme(layer)
             return AWQMoEMethod(self)
+        if (
+            type(layer) is vocab_parallel_embedding.VocabParallelEmbedding
+            and self.embedding_quantization is not None
+        ):
+            if is_layer_skipped_awq(prefix, self.modules_to_not_convert):
+                return None
+            return AWQEmbeddingMethod(self)
         return None
 
     def get_linear_scheme(self, layer: torch.nn.Module):
@@ -422,6 +449,70 @@ class AWQMarlinConfig(QuantizationConfig):
         return check_marlin_supported(
             quant_type=cls.TYPE_MAP[num_bits], group_size=group_size, has_zp=zero_point
         )
+
+
+class AWQEmbeddingMethod(QuantizeMethodBase):
+    """Row-major INT4 token embeddings, dequantized after lookup."""
+
+    def __init__(self, quant_config: AWQConfig | AWQMarlinConfig) -> None:
+        settings = quant_config.embedding_quantization
+        if (settings["bits"], settings["layout"], settings["zero_point"]) != (
+            4,
+            "row_major",
+            True,
+        ):
+            raise ValueError("AWQ embeddings require row_major INT4 with zero points")
+        self.group_size = settings["group_size"]
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ) -> None:
+        self.params_dtype = params_dtype
+        num_rows = sum(output_partition_sizes)
+        num_groups = input_size_per_partition // self.group_size
+        for name, width, dtype in (
+            ("qweight", input_size_per_partition // 8, torch.int32),
+            ("qzeros", num_groups // 8, torch.int32),
+            ("scales", num_groups, torch.float16),
+        ):
+            layer.register_parameter(
+                name,
+                ModelWeightParameter(
+                    data=torch.empty(num_rows, width, dtype=dtype),
+                    input_dim=1,
+                    output_dim=0,
+                    weight_loader=extra_weight_attrs["weight_loader"],
+                ),
+            )
+        layer.register_buffer(
+            "shifts", torch.arange(0, 32, 4, dtype=torch.int32), persistent=False
+        )
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        raise NotImplementedError("AWQ row-major embeddings support lookup only")
+
+    def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
+        packed = F.embedding(input_, layer.qweight)
+        weight = ((packed.unsqueeze(-1) >> layer.shifts) & 15).flatten(-2)
+        packed_zeros = F.embedding(input_, layer.qzeros)
+        zeros = ((packed_zeros.unsqueeze(-1) >> layer.shifts) & 15).flatten(-2)
+        scales = F.embedding(input_, layer.scales).float()
+        # Preserve checkpoint FP16 scales until the final activation cast.
+        weight = weight.unflatten(-1, (-1, self.group_size)).float()
+        output = (weight - zeros.float().unsqueeze(-1)) * scales.unsqueeze(-1)
+        return output.flatten(-2).to(self.params_dtype)
 
 
 class AWQLinearMethod(LinearMethodBase):

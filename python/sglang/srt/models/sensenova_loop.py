@@ -28,12 +28,7 @@ from sglang.srt.layers.layer_boundary import (
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import GemmaRMSNorm
-from sglang.srt.layers.parameter import ModelWeightParameter
-from sglang.srt.layers.quantization.awq.awq import AWQConfig
-from sglang.srt.layers.quantization.base_config import (
-    QuantizationConfig,
-    QuantizeMethodBase,
-)
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.models import qwen3_5
@@ -101,68 +96,6 @@ class SenseNovaMHCRouter(nn.Module):
         return (mixed + update).flatten(-2)
 
 
-class SenseNovaLoopAWQEmbeddingMethod(QuantizeMethodBase):
-    """Row-major INT4 token embeddings, dequantized after lookup."""
-
-    def __init__(self, group_size: int) -> None:
-        self.group_size = group_size
-
-    def create_weights(
-        self,
-        layer: torch.nn.Module,
-        input_size_per_partition: int,
-        output_partition_sizes: list[int],
-        input_size: int,
-        output_size: int,
-        params_dtype: torch.dtype,
-        **extra_weight_attrs,
-    ) -> None:
-        self.params_dtype = params_dtype
-        num_rows = sum(output_partition_sizes)
-        num_groups = input_size_per_partition // self.group_size
-        for name, width, dtype in (
-            ("qweight", input_size_per_partition // 8, torch.int32),
-            ("qzeros", num_groups // 8, torch.int32),
-            ("scales", num_groups, torch.float16),
-        ):
-            layer.register_parameter(
-                name,
-                ModelWeightParameter(
-                    data=torch.empty(num_rows, width, dtype=dtype),
-                    input_dim=1,
-                    output_dim=0,
-                    weight_loader=extra_weight_attrs["weight_loader"],
-                ),
-            )
-        layer.register_buffer(
-            "shifts", torch.arange(0, 32, 4, dtype=torch.int32), persistent=False
-        )
-
-    def apply(
-        self,
-        layer: torch.nn.Module,
-        x: torch.Tensor,
-        bias: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        raise NotImplementedError("AWQ row-major embeddings support lookup only")
-
-    def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
-        packed = F.embedding(input_, layer.qweight)
-        weight = ((packed.unsqueeze(-1) >> layer.shifts) & 15).flatten(-2)
-        packed_zeros = F.embedding(input_, layer.qzeros)
-        zeros = ((packed_zeros.unsqueeze(-1) >> layer.shifts) & 15).flatten(-2)
-        scales = F.embedding(input_, layer.scales).float()
-        # Preserve checkpoint FP16 scales until the final activation cast.
-        weight = weight.unflatten(-1, (-1, self.group_size)).float()
-        output = (weight - zeros.float().unsqueeze(-1)) * scales.unsqueeze(-1)
-        return output.flatten(-2).to(self.params_dtype)
-
-
-class _SenseNovaLoopAWQEmbeddingConfig(AWQConfig):
-    def get_quant_method(self, layer: nn.Module, prefix: str) -> QuantizeMethodBase:
-        return SenseNovaLoopAWQEmbeddingMethod(group_size=self.group_size)
-
-
 class SenseNovaLoopModel(qwen3_5.Qwen3_5ForCausalLM):
     def __init__(
         self,
@@ -174,16 +107,11 @@ class SenseNovaLoopModel(qwen3_5.Qwen3_5ForCausalLM):
         self.config = config
         self.hidden_size = config.hidden_size
         self.pp_group = get_parallel().pp_group
-        embedding_quant_config = quant_config
-        if config.embedding_quantization is not None:
-            embedding_quant_config = _SenseNovaLoopAWQEmbeddingConfig.from_config(
-                config.embedding_quantization
-            )
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
             org_num_embeddings=config.vocab_size,
-            quant_config=embedding_quant_config,
+            quant_config=quant_config,
             prefix=add_prefix("embed_tokens", prefix),
             enable_tp=not is_dp_attention_enabled(),
         )

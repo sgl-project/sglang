@@ -97,11 +97,9 @@ class TestSenseNovaLoopConfig(CustomTestCase):
         }
         config = SenseNovaLoopConfig(**raw)
         restored = SenseNovaLoopConfig.from_dict(config.to_dict())
-        self.assertEqual(config.text_config.embedding_quantization, embedding)
-        self.assertEqual(restored.text_config.embedding_quantization, embedding)
-        self.assertIsNone(
-            SenseNovaLoopConfig(**canonical_config()).text_config.embedding_quantization
-        )
+        self.assertEqual(config.quantization_config["embedding"], embedding)
+        self.assertEqual(restored.quantization_config["embedding"], embedding)
+        self.assertNotIn("embedding_quantization", config.text_config.to_dict())
 
     def test_gdn_state_and_prefix_cache_are_registered(self):
         config = SenseNovaLoopConfig(**canonical_config())

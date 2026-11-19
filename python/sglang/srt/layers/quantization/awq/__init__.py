@@ -8,6 +8,7 @@ from sglang.kernels.ops.quantization.awq_triton import (
 from .awq import (
     AWQConfig,
     AWQCPUConfig,
+    AWQEmbeddingMethod,
     AWQLinearMethod,
     AWQMarlinConfig,
     AWQMoEMethod,
@@ -27,6 +28,7 @@ __all__ = [
     "AWQMarlinConfig",
     "AWQXPUConfig",
     "AWQLinearMethod",
+    "AWQEmbeddingMethod",
     "AWQMoEMethod",
     "AWQLinearScheme",
     "AWQMarlinLinearScheme",

@@ -15,19 +15,11 @@ from sglang.srt.configs.qwen3_5 import Qwen3_5Config, Qwen3_5TextConfig
 class SenseNovaLoopTextConfig(Qwen3_5TextConfig):
     """Serving slots follow execution order; checkpoint layers remain physical."""
 
-    def __init__(
-        self,
-        execution_plan=(),
-        mhc=None,
-        layer_types=None,
-        embedding_quantization=None,
-        **kwargs,
-    ):
+    def __init__(self, execution_plan=(), mhc=None, layer_types=None, **kwargs):
         super().__init__(layer_types=layer_types, **kwargs)
         self.execution_plan = tuple(execution_plan)
         self.mhc = mhc
         self.layer_types = layer_types
-        self.embedding_quantization = embedding_quantization
 
     @property
     def layers_block_type(self):
@@ -67,9 +59,6 @@ class SenseNovaLoopConfig(Qwen3_5Config):
             layer_types=[kinds[i] for i in self.execution_plan],
             execution_plan=self.execution_plan,
             mhc=mhc,
-            embedding_quantization=(kwargs.get("quantization_config") or {}).get(
-                "embedding"
-            ),
         )
         self.text_config = SenseNovaLoopTextConfig(**text)
         self.architectures = ["SenseNovaLoopForConditionalGeneration"]
