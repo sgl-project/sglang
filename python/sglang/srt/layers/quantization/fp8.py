@@ -73,7 +73,6 @@ from sglang.srt.layers.quantization.fp8_utils import (
     dispatch_w8a8_mxfp8_linear,
     gfx1250_mxfp8_prepare_weight,
     input_to_float8,
-    is_xe2_supported,
     mxfp8_group_quantize,
     normalize_e4m3fn_to_e4m3fnuz,
     pack_mxfp8_weight_scale_for_deepgemm,
@@ -144,7 +143,6 @@ _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
-_is_xe2_supported = is_xe2_supported()
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_gfx95_supported = is_gfx95_supported()
 
@@ -2134,8 +2132,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             # apply() sends these to kernels that take the checkpoint block.
             and not _is_cpu
             and not (
-                _is_xe2_supported
-                and not get_moe_runner_backend().is_triton()
+                not get_moe_runner_backend().is_triton()
                 and can_use_xpu_fp8_moe(
                     layer.moe_runner_config,
                     self.weight_block_size,
@@ -3326,13 +3323,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             _is_xpu
             and moe_runner_backend.is_intel_xpu()
             and not self.is_fp4_expert
-            and not (
-                _is_xe2_supported
-                and can_use_xpu_fp8_moe(
-                    moe_runner_config,
-                    self.weight_block_size,
-                    use_mxfp8=self.use_mxfp8,
-                )
+            and not can_use_xpu_fp8_moe(
+                moe_runner_config,
+                self.weight_block_size,
+                use_mxfp8=self.use_mxfp8,
             )
         ):
             moe_runner_backend = MoeRunnerBackend.TRITON
@@ -3458,13 +3452,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             and not get_moe_runner_backend().is_triton()
             and (
                 self.is_fp4_expert
-                or (
-                    _is_xe2_supported
-                    and can_use_xpu_fp8_moe(
-                        moe_runner_config,
-                        self.weight_block_size,
-                        use_mxfp8=self.use_mxfp8,
-                    )
+                or can_use_xpu_fp8_moe(
+                    moe_runner_config,
+                    self.weight_block_size,
+                    use_mxfp8=self.use_mxfp8,
                 )
             )
         ):

@@ -185,7 +185,6 @@ class TestXpuCallSitesNeverPassTheSentinel(CustomTestCase):
         with self.xpu_branch(
             fp8_module,
             _is_xpu=True,
-            _is_xe2_supported=True,
             _is_npu=False,
             _is_hip=False,
         ):

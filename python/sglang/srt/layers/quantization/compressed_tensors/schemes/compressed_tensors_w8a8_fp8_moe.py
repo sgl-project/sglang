@@ -22,7 +22,6 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
 )
 from sglang.srt.layers.quantization.fp8_utils import (
     can_use_xpu_fp8_moe,
-    is_xe2_supported,
     normalize_e4m3fn_to_e4m3fnuz,
 )
 from sglang.srt.layers.quantization.utils import (
@@ -44,7 +43,6 @@ __all__ = ["CompressedTensorsW8A8Fp8MoE"]
 
 _is_hip = is_hip()
 _is_xpu = is_xpu()
-_is_xe2_supported = is_xe2_supported()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _use_aiter:
@@ -374,10 +372,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             and moe_runner_backend.is_intel_xpu()
             and (
                 self.weight_quant.strategy == QuantizationStrategy.CHANNEL
-                or not (
-                    _is_xe2_supported
-                    and can_use_xpu_fp8_moe(moe_runner_config, self.weight_block_size)
-                )
+                or not can_use_xpu_fp8_moe(moe_runner_config, self.weight_block_size)
             )
         ):
             moe_runner_backend = MoeRunnerBackend.TRITON
@@ -408,7 +403,6 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             _is_xpu
             and not get_moe_runner_backend().is_triton()
             and self.weight_quant.strategy != QuantizationStrategy.CHANNEL
-            and _is_xe2_supported
             and can_use_xpu_fp8_moe(moe_runner_config, self.weight_block_size)
         ):
             from sgl_kernel import fused_experts
