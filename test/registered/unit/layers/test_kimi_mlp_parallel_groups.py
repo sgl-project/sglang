@@ -231,14 +231,15 @@ class TestKimiMLPParallelGroups(CustomTestCase):
                     ):
                         owner, module = build_shared_experts(ep_a2a=ep)
                         comm = ep and expected_size > 1
-                        self.assertEqual(owner._shared_experts_tp_comm, comm)
+                        self.assertEqual(owner._shared_experts_tp is not None, comm)
                         self.assertEqual(
                             owner._shared_experts_tp1, ep and expected_size == 1
                         )
-                        self.assertIs(
-                            owner._shared_experts_tp_group,
-                            shared if requested == 2 else attn if comm else None,
-                        )
+                        if comm:
+                            self.assertIs(
+                                owner._shared_experts_tp.group,
+                                shared if requested == 2 else attn,
+                            )
                         self.assertFalse(module._dense_attn_tp)
                         for name in ("gate_up_proj", "down_proj"):
                             layer = getattr(module, name)

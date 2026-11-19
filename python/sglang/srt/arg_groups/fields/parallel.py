@@ -366,6 +366,11 @@ class Parallel(msgspec.Struct):
         "means no separate width: replicated under an EP all-to-all backend, "
         "following MoE TP otherwise.",
     )
+    shared_experts_tp_spans_dp = Derived(
+        fn="sglang.srt.runtime_context.shared_experts_tp_spans_dp_of",
+        doc="Whether a shared-expert TP group spans attention-DP ranks: "
+        "attention DP with attention TP 1 and CP 1.",
+    )
     attn_dp_enabled = Derived(
         fn="sglang.srt.runtime_context.attn_dp_enabled_of",
         doc="Whether attention runs data parallel: `attn_dp_size` is wider "

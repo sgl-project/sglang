@@ -159,7 +159,6 @@ from sglang.srt.runtime_context import (
     linear_attn_parallel_group,
     linear_attn_tp_rank,
     linear_attn_tp_size,
-    shared_experts_tp_spans_dp,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import is_gfx95_supported, is_hip, is_npu
@@ -543,6 +542,35 @@ def _replicates_shared_experts() -> bool:
     return _uses_ep_a2a() and get_parallel().shared_experts_tp_width in (None, 1)
 
 
+class _SharedExpertsTp:
+    """TP-sharded shared experts: gather the group's rows in, reduce-scatter back."""
+
+    def __init__(self, group, across_dp: bool):
+        self.group = group
+        # Spans DP ranks: rows differ per rank and idle ranks must join the collectives.
+        self.across_dp = across_dp
+        self._rows = k3_sp_collective.RowCollective(
+            group, "shared_tp_all_gather", push=across_dp
+        )
+
+    def gather(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        rows = hidden_states.shape[0]
+        if self.across_dp:
+            rows = k3_sp_collective.dp_max_rows(rows)
+            # A prefill graph holding this replays only when every DP rank runs its bucket.
+            _note_dp_gather_in_prefill_graph()
+        # The direct strategy's output stays valid until the next layer's gather.
+        return self._rows.all_gather(hidden_states, rows, symmetric_fallback=True)
+
+    def reduce_scatter(
+        self, shared_output: torch.Tensor, hidden_states: torch.Tensor
+    ) -> torch.Tensor:
+        # The down_proj output is not in symmetric storage.
+        return self._rows.reduce_scatter(
+            shared_output, hidden_states.shape[0], input_symmetric=False
+        )
+
+
 class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
     """K3 MoE with Latent MoE (experts run in moe_hidden_size space)."""
 
@@ -705,37 +733,21 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
         if requested_shared_tp is not None and not self._ep_a2a:
             raise ValueError("Independent shared-expert TP requires an EP a2a backend.")
         self._shared_experts_tp1 = _replicates_shared_experts()
-        self._shared_experts_tp_comm = (
-            self._ep_a2a and shared_tp is not None and shared_tp > 1
-        )
-        self._shared_experts_tp_group = None
-        # Spans DP ranks: rows differ per rank and idle ranks must join the collectives.
-        self._shared_experts_tp_across_dp = (
-            self._shared_experts_tp_comm
-            and shared_experts_tp_spans_dp(
-                attn_tp_size=parallel.attn_tp_size,
-                attn_cp_size=parallel.attn_cp_size,
-                attn_dp_size=parallel.attn_dp_size,
-            )
-        )
+        self._shared_experts_tp: Optional[_SharedExpertsTp] = None
         shared_experts_parallel_group = None
         if self._shared_experts_tp1:
             shared_experts_parallel_group = "replicated"
-        elif self._shared_experts_tp_comm:
+        elif self._ep_a2a and shared_tp is not None and shared_tp > 1:
             group = parallel.shared_experts_tp_group
             assert group.world_size == shared_tp
-            self._shared_experts_tp_group = group
+            self._shared_experts_tp = _SharedExpertsTp(
+                group, across_dp=parallel.shared_experts_tp_spans_dp
+            )
             shared_experts_parallel_group = "shared_experts_tp"
         else:
             # The full TP group, which _reduce_shared sums over, whatever the
             # dense MLP's sharding.
             shared_experts_parallel_group = "tp"
-        self._shared_experts_tp_sp_comm = self._shared_experts_tp_across_dp and list(
-            self._shared_experts_tp_group.ranks
-        ) == list(parallel.tp_group.ranks)
-        if self._shared_experts_tp_sp_comm:
-            # Collective workspace request: every rank, before graph capture.
-            k3_sp_collective.tp_group_state()
         if self.num_shared_experts is not None and self.num_shared_experts > 0:
             shared_intermediate_size = moe_intermediate_size * self.num_shared_experts
             if shared_tp is not None and shared_intermediate_size % shared_tp != 0:
@@ -1256,59 +1268,20 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
             return self._latent_norm(latent)
         return self._latent_norm(tensor_model_parallel_all_reduce(latent))
 
-    def _shared_tp_sp_state(self, rows: int):
-        if not self._shared_experts_tp_sp_comm:
-            return None
-        return k3_sp_collective.tp_rows_state(
-            rows * self._shared_experts_tp_group.world_size
-        )
-
-    def _gather_shared_expert_inputs(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        rows = hidden_states.shape[0]
-        if self._shared_experts_tp_across_dp:
-            rows = k3_sp_collective.dp_max_rows(rows)
-            # A prefill graph holding this replays only when every DP rank runs its bucket.
-            _note_dp_gather_in_prefill_graph()
-        # The direct strategy's output stays valid until the next layer's gather.
-        return k3_sp_collective.all_gather_rows(
-            hidden_states,
-            rows,
-            self._shared_experts_tp_group,
-            self._shared_tp_sp_state(rows),
-            "shared_tp_all_gather",
-            symmetric_fallback=True,
-        )
-
-    def _reduce_scatter_shared_experts(
-        self, shared_output: torch.Tensor, hidden_states: torch.Tensor
-    ) -> torch.Tensor:
-        group = self._shared_experts_tp_group
-        # The down_proj output is not in symmetric storage.
-        return k3_sp_collective.reduce_scatter_rows(
-            shared_output,
-            hidden_states.shape[0],
-            group,
-            self._shared_tp_sp_state(shared_output.shape[0] // group.world_size),
-            input_symmetric=False,
-        )
-
     def _forward_shared_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Run TP-sharded shared experts while DeepEP tokens stay scattered."""
-        if not self._shared_experts_tp_comm:
+        shared_tp = self._shared_experts_tp
+        if shared_tp is None:
             return self.shared_experts(hidden_states)
-
-        gathered_hidden_states = self._gather_shared_expert_inputs(hidden_states)
-        gathered_shared_output = self.shared_experts(gathered_hidden_states)
-        return self._reduce_scatter_shared_experts(
-            gathered_shared_output, hidden_states
-        )
+        gathered_shared_output = self.shared_experts(shared_tp.gather(hidden_states))
+        return shared_tp.reduce_scatter(gathered_shared_output, hidden_states)
 
     def _can_overlap_shared_experts_npu(self, hidden_states: torch.Tensor) -> bool:
         if not (
             _is_npu
             and envs.SGLANG_NPU_FINE_GRAINED_MOE_DUAL_STREAM.get()
             and self._sbo_shared_overlap
-            and self._shared_experts_tp_comm
+            and self._shared_experts_tp is not None
             and self.use_latent_moe
             and hidden_states.shape[0] > 0
             and get_moe_a2a_backend().is_deepep()
@@ -1356,7 +1329,11 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
         def issue_shared():
             nonlocal shared_input, shared_output, shared_event
             if self.shared_experts is None or (
-                hidden_states.shape[0] == 0 and not self._shared_experts_tp_across_dp
+                hidden_states.shape[0] == 0
+                and not (
+                    self._shared_experts_tp is not None
+                    and self._shared_experts_tp.across_dp
+                )
             ):
                 return
             if fine_grained_overlap:
@@ -1365,7 +1342,7 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
                 self.alt_stream.wait_stream(torch.cuda.current_stream())
                 hidden_states.record_stream(self.alt_stream)
                 with torch.cuda.stream(self.alt_stream):
-                    shared_input = self._gather_shared_expert_inputs(hidden_states)
+                    shared_input = self._shared_experts_tp.gather(hidden_states)
                     shared_input.record_stream(self.alt_stream)
                 return
             if self._sbo_shared_overlap:
@@ -1373,8 +1350,8 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
                 # Keep HCCL collectives on the current stream. The alternate
                 # stream only executes the shared-expert MLP.
                 shared_input = hidden_states
-                if self._shared_experts_tp_comm:
-                    shared_input = self._gather_shared_expert_inputs(hidden_states)
+                if self._shared_experts_tp is not None:
+                    shared_input = self._shared_experts_tp.gather(hidden_states)
                 shared_input.record_stream(self.alt_stream)
                 self.alt_stream.wait_stream(current_stream)
                 with torch.cuda.stream(self.alt_stream):
@@ -1410,7 +1387,7 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
                 # only for the MLP (not for RS).
                 self.alt_stream.wait_stream(current_stream)
                 with torch.cuda.stream(self.alt_stream):
-                    shared_output = self._reduce_scatter_shared_experts(
+                    shared_output = self._shared_experts_tp.reduce_scatter(
                         shared_output, hidden_states
                     )
                     shared_event = self.alt_stream.record_event()
@@ -1438,8 +1415,8 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
             current_stream = torch.cuda.current_stream()
             current_stream.wait_event(shared_event)
             shared_output.record_stream(current_stream)
-            if self._shared_experts_tp_comm and not fine_grained_overlap:
-                shared_output = self._reduce_scatter_shared_experts(
+            if self._shared_experts_tp is not None and not fine_grained_overlap:
+                shared_output = self._shared_experts_tp.reduce_scatter(
                     shared_output, hidden_states
                 )
 
@@ -1508,7 +1485,7 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
             if (
                 self.tp_size > 1
                 and not self._shared_experts_tp1
-                and not self._shared_experts_tp_comm
+                and not self._shared_experts_tp is not None
             ):
                 shared_output = self._reduce_shared(shared_output)
             out = _add3(out, shared_output, prefix_sum)

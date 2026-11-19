@@ -204,6 +204,15 @@ def shared_experts_tp_width_of(cfg: Any) -> Optional[int]:
     return None
 
 
+def shared_experts_tp_spans_dp_of(cfg: Any) -> bool:
+    """`shared_experts_tp_spans_dp`, computed at publish."""
+    return shared_experts_tp_spans_dp(
+        attn_tp_size=attn_tp_size_of(cfg),
+        attn_cp_size=cfg.attn_cp_size,
+        attn_dp_size=cfg.attn_dp_size,
+    )
+
+
 def attn_dp_enabled_of(cfg: Any) -> bool:
     """`attn_dp_enabled`, computed at publish.
 
