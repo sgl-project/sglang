@@ -614,7 +614,12 @@ class MultiDetokenizerRouter:
                     require_clock_domain=True,
                 )
                 if send_time_ns is not None:
-                    self.delivery_seconds.observe((monotonic_ns() - send_time_ns) / 1e9)
+                    receive_time_ns = monotonic_ns()
+                    # CRIU restore can move the monotonic clock backwards.
+                    if receive_time_ns >= send_time_ns:
+                        self.delivery_seconds.observe(
+                            (receive_time_ns - send_time_ns) / 1e9
+                        )
 
             # Control messages must reach every detokenizer process.
             if isinstance(recv_obj, (FreezeGCReq, ConfigureLoggingReq)):

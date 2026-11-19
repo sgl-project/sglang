@@ -23,7 +23,11 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.multi_tokenizer_mixin import MultiDetokenizerRouter
 from sglang.srt.managers.scheduler_components.output_sender import SenderWrapper
-from sglang.test.router_delivery_test_utils import router_for_socket, socket_pair
+from sglang.test.router_delivery_test_utils import (
+    RouterFinished,
+    router_for_socket,
+    socket_pair,
+)
 
 register_cpu_ci(est_time=35, suite="base-a-test-cpu")
 
@@ -77,6 +81,61 @@ def _stop_processes(processes):
 
 
 class TestProductionHistogram(CustomTestCase):
+    def test_clock_rollback_skips_only_the_delivery_observation(self):
+        # rid, send ns, receive ns
+        cases = [
+            ("normal", 1_000_000_000, 1_005_000_000),
+            ("rollback", 11_000_000_000, 1_000_000_000),
+            ("equal", 1_000_000_000, 1_000_000_000),
+        ]
+        metric = "sglang:detokenizer_router_delivery_seconds"
+        with (
+            socket_pair() as (sender, receiver),
+            socket_pair() as (send_a, worker_a),
+            socket_pair() as (send_b, worker_b),
+            router_for_socket(receiver, _TEST_CLOCK_DOMAIN) as (router, registry),
+        ):
+            router.socket_mapping._mapping.update(
+                {"worker-a": send_a, "worker-b": send_b}
+            )
+            for rid, send_ns, _ in cases:
+                with patch.object(
+                    delivery_clock.time, "monotonic_ns", return_value=send_ns
+                ):
+                    delivery_clock.sock_send_with_timestamp(
+                        sender, AbortReq(rid=rid), clock_domain=_TEST_CLOCK_DOMAIN
+                    )
+
+            # Run one event loop across the reset and snapshot the histogram at dispatch.
+            snapshots = []
+            send = router._send
+
+            def forward(endpoint, message):
+                send(endpoint, message)
+                snapshots.append(
+                    (
+                        registry.get_sample_value(metric + "_count"),
+                        registry.get_sample_value(metric + "_sum"),
+                    )
+                )
+                if len(snapshots) == len(cases):
+                    raise RouterFinished
+
+            router._send = forward
+            with (
+                patch(
+                    "sglang.srt.managers.multi_tokenizer_mixin.monotonic_ns",
+                    side_effect=[case[2] for case in cases],
+                ),
+                self.assertRaises(RouterFinished),
+            ):
+                router.event_loop()
+
+            self.assertEqual(snapshots, [(1, 0.005), (1, 0.005), (2, 0.005)])
+            self.assertEqual(sock_recv(worker_a), AbortReq(rid="normal"))
+            self.assertEqual(sock_recv(worker_a), AbortReq(rid="rollback"))
+            self.assertEqual(sock_recv(worker_b), AbortReq(rid="equal"))
+
     def test_registered_histogram_includes_decode_time(self):
         original_codec = io_struct._USE_PICKLE_IPC
         self.addCleanup(setattr, io_struct, "_USE_PICKLE_IPC", original_codec)
