@@ -24,6 +24,7 @@ from sglang.srt.distributed.parallel_state import (
     set_torch_symm_mem_all_reduce,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.attn_tp_push_comm import initialize_attn_tp_push_comm
 from sglang.srt.layers.dp_attention import (
     init_dp_gathered_buffer,
     initialize_dp_attention,
@@ -360,6 +361,10 @@ def init_layer_runtime(*, model_config: ModelConfig) -> None:
     """Size the DP gathered buffer and resolve layernorm SP from the model."""
     init_dp_gathered_buffer(model_config)
     initialize_layernorm_sp(model_config=model_config)
+    initialize_attn_tp_push_comm(
+        hidden_size=model_config.hidden_size,
+        uses_megamoe=get_exec().moe.moe_a2a_backend == "megamoe",
+    )
 
 
 def _prewarm_nccl() -> None:

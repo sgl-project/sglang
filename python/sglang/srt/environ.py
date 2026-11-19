@@ -1671,6 +1671,9 @@ class Envs:
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS = EnvInt(2)
     SGLANG_OPT_DEEPGEMM_MEGA_GATE = EnvBool(False)
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_LOCALIZE = EnvBool(False)
+    # DP attention over TP2 pairs with MegaMoE: move the per-layer attention-TP
+    # all-gather / reduce-scatter rows through symmetric memory instead of NCCL.
+    SGLANG_OPT_ATTN_TP2_PUSH_COMM = EnvBool(True)
 
     # ===================================================================
     # Top-k kernels
