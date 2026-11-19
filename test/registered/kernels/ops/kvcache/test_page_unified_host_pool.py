@@ -19,7 +19,7 @@ import torch
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
@@ -80,6 +80,15 @@ def _pinned_host_pool(host_pool_cls, device_pool, **kwargs):
         )
     finally:
         ALLOC_MEMORY_FUNCS[DEVICE] = original
+
+
+def _check_zero_copy_page_meta(host_pool, host_indices):
+    """Zero-copy backends address the same page block the flat page API copies."""
+    ptrs, sizes = host_pool.get_page_buffer_meta(host_indices)
+    pages = [host_pool.get_data_page(int(index)) for index in host_indices[::PAGE_SIZE]]
+    assert ptrs == [page.data_ptr() for page in pages]
+    assert sizes == [host_pool.page_unified_layout.bytes_per_page] * len(pages)
+    assert all(page.nbytes == size for page, size in zip(pages, sizes))
 
 
 def _restore_storage_pages(host_pool, host_indices):
@@ -188,6 +197,7 @@ def test_mha_page_unified(head_num, head_group_num, dtype, preallocate):
         device_pool, host_indices_cpu, device_indices, "kernel"
     )
     torch.cuda.synchronize()
+    _check_zero_copy_page_meta(host_pool, host_indices_cpu)
     host_indices_cpu = _restore_storage_pages(host_pool, host_indices_cpu)
 
     for layer in range(LAYERS):
@@ -263,6 +273,7 @@ def test_mla_page_unified(kv_lora_rank, qk_rope_head_dim, dtype, preallocate):
         device_pool, host_indices_cpu, device_indices, "kernel"
     )
     torch.cuda.synchronize()
+    _check_zero_copy_page_meta(host_pool, host_indices_cpu)
     host_indices_cpu = _restore_storage_pages(host_pool, host_indices_cpu)
     for layer in range(LAYERS):
         device_pool.kv_buffer[layer].zero_()
