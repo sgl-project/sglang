@@ -145,7 +145,7 @@ class TestNpuHybridMlaKvArgs(CustomTestCase):
         )
         self._assert_target_registered(kv_args)
         self.assertFalse(hasattr(kv_args, "dcp_num_replicated_entries"))
-        self.assertTrue(callable(kv_args.npu_prepare_dcp_token_item_lens))
+        self.assertEqual(kv_args.npu_kv_layout, "ND")
 
     def test_dsa_indexer_registers_as_state_with_draft_layer_ids(self):
         def dsa_pool(layers, draft=False):

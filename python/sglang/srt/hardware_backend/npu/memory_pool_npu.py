@@ -1204,27 +1204,17 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             scale.view(-1, 1),
         )
 
-    def _get_disagg_buffer_entries(self):
-        """Return (buffer, uses_global_slots) entries in PD transfer order."""
-        self._raise_if_native_kv_cache_disabled()
-        global_kv = self.is_draft_worker
-        if self.use_combined_kv_buffer:
-            return [(buffer, global_kv) for buffer in self.kv_buffer]
-        entries = [(buffer, global_kv) for buffer in self.k_buffer]
-        if not getattr(self, "dsa_kv_cache_store_fp8", False):
-            entries += [(buffer, global_kv) for buffer in self.v_buffer]
-        return entries
-
     # for disagg
     def get_contiguous_buf_infos(self):
-        entries = self._get_disagg_buffer_entries()
+        self._raise_if_native_kv_cache_disabled()
+        buffers = self.kv_buffer if self.use_combined_kv_buffer else self.k_buffer
+        if self._pd_kv_buffer_groups == 2:
+            buffers = buffers + self.v_buffer
+        page_scale = self.dcp_size if self.is_draft_worker else 1
         return (
-            [buffer.data_ptr() for buffer, _ in entries],
-            [buffer.nbytes for buffer, _ in entries],
-            [
-                buffer[0].nbytes * (self.dcp_size if uses_global_slots else 1)
-                for buffer, uses_global_slots in entries
-            ],
+            [buffer.data_ptr() for buffer in buffers],
+            [buffer.nbytes for buffer in buffers],
+            [buffer[0].nbytes * page_scale for buffer in buffers],
         )
 
     def configure_pd_dcp(self, kv_args, draft_pool=None, total_kv_layers=None):
@@ -1246,40 +1236,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 kv_args.kv_layer_ids += remap_draft_layer_ids(
                     draft_pool.get_kv_layer_ids(), total_kv_layers
                 )
-        kv_args.npu_prepare_dcp_token_item_lens = self._prepare_pd_dcp_token_item_lens
-
-    def _prepare_pd_dcp_token_item_lens(self, kv_args, peer) -> list[int]:
-        from sglang.srt.disaggregation.utils import resolve_dcp_dst_entry_indices
-
-        if self.use_fia_nz or peer.dst_draft_rows_dcp_collapsed:
-            raise ValueError(
-                "NPU token-interleaved PD requires row-contiguous KV and replicated draft rows."
-            )
-        if len(peer.dst_kv_ptrs) != len(peer.dst_kv_item_lens):
-            raise ValueError("NPU token DCP requires per-entry destination widths")
-        dst_entries = resolve_dcp_dst_entry_indices(
-            kv_args.kv_layer_ids,
-            peer.dst_kv_layer_ids,
-            len(kv_args.kv_data_ptrs),
-            len(peer.dst_kv_ptrs),
-        )
-        num_target = len(kv_args.kv_item_lens) - kv_args.num_draft_entries
-        widths = []
-        for i, (src_bytes, dst_entry) in enumerate(
-            zip(kv_args.kv_item_lens, dst_entries, strict=True)
-        ):
-            width, remainder = divmod(src_bytes, kv_args.page_size)
-            scale = 1 if i < num_target else peer.dst_dcp_size
-            if remainder or width <= 0 or dst_entry >= len(peer.dst_kv_item_lens):
-                raise ValueError("Invalid NPU token DCP page geometry")
-            if peer.dst_kv_item_lens[dst_entry] != src_bytes * scale:
-                raise ValueError(
-                    f"NPU token DCP entry {dst_entry} has incompatible page bytes: "
-                    f"prefill={src_bytes}, decode={peer.dst_kv_item_lens[dst_entry]}, "
-                    f"scale={scale}"
-                )
-            widths.append(width)
-        return widths
+        kv_args.npu_kv_layout = "NZ" if self.use_fia_nz else "ND"
 
     @property
     def _pd_kv_buffer_groups(self):
