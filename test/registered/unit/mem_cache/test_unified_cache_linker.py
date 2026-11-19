@@ -63,7 +63,11 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import get_context, get_disagg
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cpu_ci,
+    register_cuda_ci,
+)
 from sglang.test.kits.unified_radix_cache import fixtures as shared_cache_suite
 from sglang.test.kits.unified_radix_cache.config import (
     CacheConfig,
@@ -80,6 +84,7 @@ from sglang.test.tree_slots import FAMILY_OF, index_slots
 
 register_cpu_ci(est_time=18, suite="base-a-test-cpu")
 register_cuda_ci(est_time=18, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=30, stage="base-b", runner_config="1-gpu-small-amd")
 
 
 class _FakeLinker(UnifiedCacheLinker):
