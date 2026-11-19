@@ -22,23 +22,27 @@ if TYPE_CHECKING:
 _MASK32 = 0xFFFFFFFF
 _UINT32_SCALE = float(1 << 32)
 
+WATERMARK_SECRET_FIELD_NAMES = frozenset(
+    {"watermark_key", "watermark_key_b", "watermark_config"}
+)
+WATERMARK_CONTAINER_FIELD_NAMES = frozenset(
+    {"watermark", "sampling_params", "preferred_sampling_params"}
+)
+_SCALAR_TYPES = frozenset({int, float, str, bool, bytes, type(None)})
+
 
 def redact_watermark_secrets(value: Any, *, in_watermark_config: bool = False) -> Any:
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         result = copy.copy(value)
         for field in dataclasses.fields(value):
             item = getattr(value, field.name)
-            if field.name in {"watermark_key", "watermark_key_b", "watermark_config"}:
+            if field.name in WATERMARK_SECRET_FIELD_NAMES:
                 object.__setattr__(
                     result,
                     field.name,
                     "<redacted>" if item is not None else None,
                 )
-            elif field.name in {
-                "watermark",
-                "sampling_params",
-                "preferred_sampling_params",
-            }:
+            elif field.name in WATERMARK_CONTAINER_FIELD_NAMES:
                 object.__setattr__(
                     result,
                     field.name,
@@ -64,13 +68,9 @@ def redact_watermark_secrets(value: Any, *, in_watermark_config: bool = False) -
         replacements = {}
         for field in msgspec.structs.fields(value):
             item = getattr(value, field.name)
-            if field.name in {"watermark_key", "watermark_key_b", "watermark_config"}:
+            if field.name in WATERMARK_SECRET_FIELD_NAMES:
                 replacements[field.name] = "<redacted>" if item is not None else None
-            elif field.name in {
-                "watermark",
-                "sampling_params",
-                "preferred_sampling_params",
-            }:
+            elif field.name in WATERMARK_CONTAINER_FIELD_NAMES:
                 replacements[field.name] = redact_watermark_secrets(
                     item, in_watermark_config=field.name == "watermark"
                 )
@@ -81,7 +81,7 @@ def redact_watermark_secrets(value: Any, *, in_watermark_config: bool = False) -
         return {
             key: (
                 "<redacted>"
-                if key in {"watermark_key", "watermark_key_b", "watermark_config"}
+                if key in WATERMARK_SECRET_FIELD_NAMES
                 or (in_watermark_config and key in {"key", "key_b"})
                 else redact_watermark_secrets(
                     item,
@@ -90,16 +90,20 @@ def redact_watermark_secrets(value: Any, *, in_watermark_config: bool = False) -
             )
             for key, item in value.items()
         }
-    if isinstance(value, list):
-        return [
-            redact_watermark_secrets(item, in_watermark_config=in_watermark_config)
+    if isinstance(value, (list, tuple)):
+        # Secrets only sit under dict keys or struct/dataclass fields, so a
+        # sequence of plain scalars can never contain one.
+        if _SCALAR_TYPES.issuperset(map(type, value)):
+            # The dump path pickles the result on a worker thread, so a
+            # mutable list must be copied; tuples are safe to alias.
+            return list(value) if isinstance(value, list) else value
+        redacted = [
+            item
+            if type(item) in _SCALAR_TYPES
+            else redact_watermark_secrets(item, in_watermark_config=in_watermark_config)
             for item in value
         ]
-    if isinstance(value, tuple):
-        return tuple(
-            redact_watermark_secrets(item, in_watermark_config=in_watermark_config)
-            for item in value
-        )
+        return redacted if isinstance(value, list) else tuple(redacted)
     return value
 
 
@@ -556,6 +560,7 @@ class WatermarkState:
         self.partial_scores_buffer = torch.empty(0, dtype=torch.float32, device=device)
         self.partial_token_ids_buffer = torch.empty(0, dtype=torch.int32, device=device)
         self.output_token_ids_buffer = torch.empty(0, dtype=torch.int32, device=device)
+        self.chain_masks: dict[int, torch.Tensor] = {}
         if vocab_size > 0 and self.token_ids.is_cuda:
             self._ensure_selection_buffers(max_num_reqs, vocab_size)
 
@@ -1109,6 +1114,59 @@ class WatermarkState:
         for position in range(accept_tokens.shape[1]):
             valid = position < accept_lens
             self.append(req_pool_indices[valid], accept_tokens[valid, position])
+
+    def force_speculative_chain(
+        self,
+        logits: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        chain_tokens: torch.Tensor,
+        positions: torch.Tensor,
+        sampling_info: SamplingBatchInfo,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        batch_size, chain_length = chain_tokens.shape
+        return self.force_speculative_from_tree(
+            logits=logits,
+            req_pool_indices=req_pool_indices,
+            draft_tokens=chain_tokens.reshape(-1),
+            custom_mask=self._chain_mask(chain_length)[:batch_size].reshape(-1),
+            positions=positions.reshape(-1),
+            sampling_info=sampling_info,
+            draft_token_num=chain_length,
+            full_mask=False,
+        )
+
+    def commit_speculative_chain(
+        self,
+        req_pool_indices: torch.Tensor,
+        context_hashes: torch.Tensor,
+        selected: torch.Tensor,
+        accept_tokens: torch.Tensor,
+        accept_lens: torch.Tensor,
+    ) -> None:
+        batch_size, chain_length = accept_tokens.shape
+        accept_index = torch.arange(
+            batch_size * chain_length, dtype=torch.int32, device=accept_tokens.device
+        ).view(batch_size, chain_length)
+        self.record_speculative(
+            req_pool_indices, context_hashes, selected, accept_index, accept_lens
+        )
+        self.append_speculative(req_pool_indices, accept_tokens, accept_lens)
+
+    def _chain_mask(self, chain_length: int) -> torch.Tensor:
+        mask = self.chain_masks.get(chain_length)
+        if mask is None:
+            mask = (
+                torch.ones(
+                    (chain_length, chain_length),
+                    dtype=torch.bool,
+                    device=self.token_ids.device,
+                )
+                .tril()
+                .expand(self.token_ids.shape[0], -1, -1)
+                .contiguous()
+            )
+            self.chain_masks[chain_length] = mask
+        return mask
 
     def force(
         self,

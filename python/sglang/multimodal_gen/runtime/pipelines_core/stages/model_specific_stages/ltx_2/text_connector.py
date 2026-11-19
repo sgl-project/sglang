@@ -1,5 +1,6 @@
 import torch
 
+from sglang.multimodal_gen.configs.sample.sampling_params import quality_allows
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
@@ -107,4 +108,11 @@ class LTX2TextConnectorStage(PipelineStage):
             batch.audio_prompt_embeds = [connector_audio_prompt_embeds]
             batch.prompt_attention_mask = connector_mask
 
+        if self.connectors.output_mask_is_all_valid and quality_allows(
+            batch.quality, "lossless"
+        ):
+            # an all-valid mask adds zeros to every score but pins the DiT's prompt
+            # cross-attention to the slower masked SDPA kernels
+            batch.prompt_attention_mask = None
+            batch.negative_attention_mask = None
         return batch

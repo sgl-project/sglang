@@ -6,11 +6,14 @@ import torch
 
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_cfg_group,
+    get_cfg_sequence_parallel_group,
     get_classifier_free_guidance_rank,
     get_world_group,
     get_world_rank,
+    use_sequence_parallel_group,
 )
 from sglang.multimodal_gen.runtime.distributed.utils import broadcast_pyobj
+from sglang.multimodal_gen.runtime.managers.request_cancel import raise_if_cancelled
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor import (
     PipelineExecutor,
@@ -48,11 +51,14 @@ class ParallelExecutor(PipelineExecutor):
         group = get_world_group()
 
         use_nvtx = self._should_use_stage_nvtx(batch, server_args)
+        requests = batch if isinstance(batch, list) else [batch]
 
         with self._component_residency_request(stages, batch, server_args):
             # TODO: decide when to gather on main when CFG_PARALLEL -> MAIN_RANK_ONLY
             for stage_index, stage in enumerate(stages):
-                paradigm = stage.parallelism_type
+                # all ranks must check before entering rank-selective stage branches
+                raise_if_cancelled(requests)
+                paradigm = stage.parallelism_type_for(batch)
 
                 if paradigm == StageParallelismType.MAIN_RANK_ONLY:
                     if rank == 0:
@@ -120,6 +126,16 @@ class ParallelExecutor(PipelineExecutor):
                         run_stage,
                         use_nvtx,
                     )
+                elif paradigm == StageParallelismType.SEQUENCE_PARALLEL_OVER_CFG_RANKS:
+                    with use_sequence_parallel_group(get_cfg_sequence_parallel_group()):
+                        batch = self._run_stage_with_executor_hooks(
+                            stage,
+                            stage_index,
+                            batch,
+                            server_args,
+                            run_stage,
+                            use_nvtx,
+                        )
                 elif paradigm == StageParallelismType.MAIN_RANK_ONLY_AND_SEND_TO_OTHERS:
                     obj_list = []
                     if rank == 0:
@@ -152,6 +168,7 @@ class ParallelExecutor(PipelineExecutor):
                         batch = broadcasted_batch
 
                     torch.distributed.barrier()
+            raise_if_cancelled(requests)
         return batch
 
     def execute(

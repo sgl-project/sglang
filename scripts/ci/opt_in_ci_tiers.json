@@ -1,0 +1,80 @@
+{
+  "nv-extra": {
+    "label": "run-ci-nv-extra",
+    "workflows": [
+      ".github/workflows/pr-test-extra.yml"
+    ]
+  },
+  "amd-extra": {
+    "label": "run-ci-amd-extra",
+    "workflows": [
+      ".github/workflows/pr-test-amd-extra.yml"
+    ]
+  },
+  "amd": {
+    "label": null,
+    "workflows": [
+      ".github/workflows/pr-test-amd.yml"
+    ]
+  },
+  "nv": {
+    "label": null,
+    "workflows": [
+      ".github/workflows/pr-test.yml",
+      ".github/workflows/lint.yml",
+      ".github/workflows/pr-test-sgl-router.yml",
+      ".github/workflows/pr-test-sgl-processor.yml",
+      ".github/workflows/pr-test-rust-exts.yml",
+      ".github/workflows/pr-test-rust-workspace.yml",
+      ".github/workflows/ci-model-inventory.yml"
+    ]
+  },
+  "mlu-extra": {
+    "label": "run-ci-mlu-extra",
+    "workflows": [
+      ".github/workflows/pr-test-mlu.yml"
+    ]
+  },
+  "ppu-extra": {
+    "label": "run-ci-ppu-extra",
+    "workflows": [
+      ".github/workflows/pr-test-ppu.yml"
+    ]
+  },
+  "xeon-extra": {
+    "label": "run-ci-xeon-extra",
+    "workflows": [
+      ".github/workflows/pr-test-xeon.yml"
+    ]
+  },
+  "npu-extra": {
+    "label": "run-ci-npu-extra",
+    "workflows": [
+      ".github/workflows/pr-test-npu.yml"
+    ]
+  },
+  "xpu-extra": {
+    "label": "run-ci-xpu-extra",
+    "workflows": [
+      ".github/workflows/pr-test-xpu.yml"
+    ]
+  },
+  "musa-extra": {
+    "label": "run-ci-musa-extra",
+    "workflows": [
+      ".github/workflows/pr-test-musa.yml"
+    ]
+  },
+  "arm64-extra": {
+    "label": "run-ci-arm64-extra",
+    "workflows": [
+      ".github/workflows/pr-test-arm64.yml"
+    ]
+  },
+  "mlx-extra": {
+    "label": "run-ci-mlx-extra",
+    "workflows": [
+      ".github/workflows/pr-test-mlx.yml"
+    ]
+  }
+}

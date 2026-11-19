@@ -35,18 +35,6 @@ PASS_CLEAN = "clean"
 ITEM_KINDS = ("rgb_control", "rgb_target", "lidar_control", "lidar_target")
 
 
-def latent_frames_from_pixel_frames(num_frames: int, temporal_compression: int) -> int:
-    """Wan ``4k + 1`` pixel frames give ``k + 1`` latent frames."""
-    if num_frames < 1 or temporal_compression < 1:
-        raise ValueError("num_frames and temporal_compression must be positive.")
-    if (num_frames - 1) % temporal_compression:
-        raise ValueError(
-            f"Cosmos3-Nano-Sim-Auto requires num_frames = {temporal_compression}k + 1 pixel frames, "
-            f"got {num_frames}."
-        )
-    return 1 + (num_frames - 1) // temporal_compression
-
-
 def lidar_num_sweeps(num_frames: int, *, camera_fps: float, lidar_fps: float) -> int:
     """Sweeps captured during ``num_frames`` camera frames (never fewer than one)."""
     if num_frames < 1 or camera_fps <= 0 or lidar_fps <= 0:

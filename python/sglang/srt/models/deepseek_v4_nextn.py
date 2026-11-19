@@ -8,6 +8,9 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import prime_rope_cos_sin
+from sglang.srt.hardware_backend.npu.utils import (
+    use_npu_arch35_mxfp8_wo_a,
+)
 from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
 )
@@ -30,6 +33,7 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -37,16 +41,14 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.models import deepseek_v4_boundary as hc_boundary
+from sglang.srt.models.deepseek_common.utils import _is_cuda, _is_npu
 from sglang.srt.models.deepseek_v4 import (
     DeepseekV4DecoderLayer,
     DeepseekV4ForCausalLM,
-    _is_cuda,
-    _is_npu,
     wo_a_fp8_gemm_enabled,
 )
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
 
@@ -267,6 +269,7 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
         self.pp_group = get_parallel().pp_group
         self.quant_config = quant_config
         self.wo_a_fp8 = wo_a_fp8_gemm_enabled(quant_config)
+        self.use_npu_arch35_mxfp8_wo_a = use_npu_arch35_mxfp8_wo_a(quant_config)
         self.num_fused_shared_experts = get_num_fused_shared_experts()
 
         self.model = DeepseekV4ModelNextN(
@@ -280,6 +283,7 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
             use_attn_tp_group=get_parallel().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
+        self.capture_aux_hidden_states = False
 
     @torch.no_grad()
     def forward(
