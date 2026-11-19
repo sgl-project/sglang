@@ -43,6 +43,7 @@ class KernelBackend(str, Enum):
     JIT = "jit"  # sglang.kernels.jit (nvcc / hipcc)
     AOT = "aot"  # sgl_kernel wheel (CUDA / ROCm builds)
     CUTE_DSL = "cute_dsl"
+    CUTILE = "cutile"  # cuTile (cuda.tile) kernels compiled by tileiras
     FLYDSL = "flydsl"  # FlyDSL MLIR compiler (device=HIP, gfx950)
     HELION = "helion"
     KDA = "KDA"  # Kernel Design Agents generated implementation
