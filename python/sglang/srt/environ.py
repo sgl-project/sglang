@@ -1831,7 +1831,7 @@ class Envs:
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
     # The DFLASH draft KV ring (speculative/dflash_draft_ring.py); resolved at
     # startup to off where it does not fit.
-    SGLANG_ENABLE_DFLASH_DRAFT_KV_RING = EnvBool(True)
+    SGLANG_ENABLE_DFLASH_DRAFT_KV_RING = EnvBool(False)
     # Disable the compact-slot SWA window lookup for compact MLA drafts.
     SGLANG_DISABLE_DFLASH_COMPACT_SWA_WINDOW = EnvBool(False)
     # Gather DFLASH candidate top-k in one multicast all-gather.
