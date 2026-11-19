@@ -18,6 +18,7 @@ This skill launches an SGLang server, validates it with a quick accuracy test, g
 ### Step 1: Launch the server
 
 ```bash
+export SGLANG_ADMIN_API_KEY=<admin_key>
 CUDA_VISIBLE_DEVICES=<gpu_id> sglang serve --model-path <model> --port <port> &
 ```
 
@@ -100,6 +101,7 @@ Return the profile directory path (e.g., `/tmp/1773999986.4769795`) and list its
 ```bash
 # 1. Launch server
 source cleanup/bin/activate
+export SGLANG_ADMIN_API_KEY=sk-admin
 CUDA_VISIBLE_DEVICES=1 sglang serve --model-path Qwen/Qwen3-8B --port 30000 &
 
 # 2. Wait for ready

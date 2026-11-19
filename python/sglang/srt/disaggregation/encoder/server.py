@@ -30,6 +30,7 @@ from sglang.srt.disaggregation.encoder.preprocessor import (
 )
 from sglang.srt.disaggregation.encoder.receiver import (
     EmbeddingData,
+    is_epd_accelerator,
     video_meta_attrs_for,
 )
 from sglang.srt.distributed.parallel_state import (
@@ -400,9 +401,8 @@ class TensorWrapper:
     """Wrapper to keep tensor alive while exposing buffer for zero-copy."""
 
     def __init__(self, tensor):
-        # Ensure tensor is on CPU and contiguous. Only CUDA/NPU tensors are
-        # moved; CPU tensors are left untouched.
-        if tensor.device.type in ("cuda", "npu"):
+        # Ensure tensor is on CPU and contiguous
+        if is_epd_accelerator(tensor.device):
             tensor = tensor.cpu()
         if not tensor.is_contiguous():
             tensor = tensor.contiguous()
@@ -1586,7 +1586,8 @@ class MMEncoder:
                         copied += n
                 offset += num_tokens
 
-            current_platform.synchronize()
+            if is_epd_accelerator(self.device):
+                current_platform.synchronize()
             return mm_embedding
         finally:
             if hit_view_hashes:
@@ -1636,7 +1637,8 @@ class MMEncoder:
             offset += num_tokens
 
         self.mm_global_cache.wait_load_to_device(copy_handles)
-        current_platform.synchronize()
+        if is_epd_accelerator(mm_embedding.device):
+            current_platform.synchronize()
         return mm_embedding
 
     async def _compute_global_cache_embedding(
@@ -2205,9 +2207,9 @@ class MMEncoder:
                 item_offset = item_end
                 token_offset += num_tokens
 
-            # transfer_sync bypasses CUDA streams, so GPU writes (forward and the
-            # per-request clones) must land before /send reads the buffers.
-            if keep_on_gpu and mm_embedding.device.type in ("cuda", "npu"):
+            # transfer_sync bypasses device streams, so device writes (forward and
+            # the per-request clones) must land before /send reads the buffers.
+            if keep_on_gpu and is_epd_accelerator(mm_embedding.device):
                 current_platform.synchronize()
             self._stage_embedding_batch(staged_embeddings)
             return results
