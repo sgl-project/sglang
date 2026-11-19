@@ -18,6 +18,23 @@ TOOL_CALL_END = "<tool_call|>"
 STRING_DELIM = '<|"|>'
 
 
+def _skip_string(text: str, pos: int) -> int:
+    """Return the index just past the ``STRING_DELIM`` at ``pos``.
+
+    A delimiter after ``:``, ``[``, ``,`` or ``{`` opens a string, which is skipped
+    whole (up to ``len(text)`` if unterminated). Any other delimiter closes a string
+    whose opening delimiter the model omitted, and only that delimiter is skipped.
+    """
+    j = pos - 1
+    while j >= 0 and text[j] in " \n\t":
+        j -= 1
+    end = pos + len(STRING_DELIM)
+    if j >= 0 and text[j] not in ":[,{":
+        return end
+    close = text.find(STRING_DELIM, end)
+    return len(text) if close == -1 else close + len(STRING_DELIM)
+
+
 def _parse_gemma4_value(value_str: str) -> object:
     """Parse a single Gemma4 value (after key:) into a Python object."""
     value_str = value_str.strip()
@@ -38,6 +55,10 @@ def _parse_gemma4_value(value_str: str) -> object:
     except ValueError:
         pass
 
+    # String whose opening delimiter was omitted
+    if value_str.endswith(STRING_DELIM):
+        return value_str[: -len(STRING_DELIM)]
+
     # Bare string (no <|"|> delimiters)
     return value_str
 
@@ -49,7 +70,7 @@ def _parse_gemma4_array(arr_str: str) -> list:
     n = len(arr_str)
 
     while i < n:
-        while i < n and arr_str[i] in (" ", ",", "\n", "\t"):
+        while i < n and arr_str[i] in (" ", ",", "\n", "\t", "]"):
             i += 1
         if i >= n:
             break
@@ -71,9 +92,7 @@ def _parse_gemma4_array(arr_str: str) -> list:
             i += 1
             while i < n and depth > 0:
                 if arr_str[i : i + len(STRING_DELIM)] == STRING_DELIM:
-                    i += len(STRING_DELIM)
-                    next_delim = arr_str.find(STRING_DELIM, i)
-                    i = next_delim + len(STRING_DELIM) if next_delim != -1 else n
+                    i = _skip_string(arr_str, i)
                     continue
                 if arr_str[i] == "{":
                     depth += 1
@@ -161,13 +180,7 @@ def _parse_gemma4_args(args_str: str) -> dict:
             i += 1
             while i < n and depth > 0:
                 if args_str[i : i + len(STRING_DELIM)] == STRING_DELIM:
-                    # Skip over string contents
-                    i += len(STRING_DELIM)
-                    next_delim = args_str.find(STRING_DELIM, i)
-                    if next_delim == -1:
-                        i = n
-                    else:
-                        i = next_delim + len(STRING_DELIM)
+                    i = _skip_string(args_str, i)
                     continue
                 if args_str[i] == "{":
                     depth += 1
@@ -183,12 +196,7 @@ def _parse_gemma4_args(args_str: str) -> dict:
             i += 1
             while i < n and depth > 0:
                 if args_str[i : i + len(STRING_DELIM)] == STRING_DELIM:
-                    i += len(STRING_DELIM)
-                    next_delim = args_str.find(STRING_DELIM, i)
-                    if next_delim == -1:
-                        i = n
-                    else:
-                        i = next_delim + len(STRING_DELIM)
+                    i = _skip_string(args_str, i)
                     continue
                 if args_str[i] == "[":
                     depth += 1
@@ -198,9 +206,15 @@ def _parse_gemma4_args(args_str: str) -> dict:
             arr_content = args_str[arr_start : i - 1]
             result[key] = _parse_gemma4_array(arr_content)
 
-        # Bare value (number, boolean, etc.)
+        # Bare value (number, boolean, etc.), or a string whose opening
+        # delimiter was omitted: city:Paris, France<|"|>
         else:
             val_start = i
+            close = args_str.find(STRING_DELIM, i)
+            if close != -1 and not any(c in args_str[i:close] for c in ":{[]}"):
+                result[key] = args_str[i:close].strip()
+                i = close + len(STRING_DELIM)
+                continue
             while i < n and args_str[i] not in (",", "}", "]"):
                 i += 1
             result[key] = _parse_gemma4_value(args_str[val_start:i])
@@ -220,11 +234,7 @@ def _find_matching_brace(text: str) -> int:
     delim_len = len(STRING_DELIM)
     while i < n and depth > 0:
         if text[i : i + delim_len] == STRING_DELIM:
-            i += delim_len
-            next_delim = text.find(STRING_DELIM, i)
-            if next_delim == -1:
-                return -1
-            i = next_delim + delim_len
+            i = _skip_string(text, i)
             continue
         if text[i] == "{":
             depth += 1
