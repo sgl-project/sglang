@@ -59,6 +59,8 @@ pub struct ResponsesStream {
     calls: Vec<Call>,
     /// Emitted after the calls so it cannot split one.
     held: Vec<(Held, String)>,
+    /// The last delta went to `held`, not a call: a cut-off ends it.
+    last_held: bool,
     next_index: usize,
     /// Finished items with their `output_index`.
     output: Vec<(usize, Value)>,
@@ -79,6 +81,7 @@ impl ResponsesStream {
             open: None,
             calls: Vec::new(),
             held: Vec::new(),
+            last_held: false,
             next_index: 0,
             output: Vec::new(),
             finish_reason: None,
@@ -156,6 +159,7 @@ impl ResponsesStream {
             Some((k, text)) if *k == kind => text.push_str(delta),
             _ => self.held.push((kind, delta.to_owned())),
         }
+        self.last_held = true;
         true
     }
 
@@ -187,25 +191,43 @@ impl ResponsesStream {
                 json!({"output_index": index, "item": item}),
                 out,
             );
-            self.emit(
-                "response.content_part.added",
-                json!({"item_id": id, "output_index": index, "content_index": 0,
-                       "part": {"type": "reasoning_text", "text": ""}}),
-                out,
-            );
+            // With `reasoning.summary` the trace streams as summary events,
+            // as the engine does; Codex renders only those live.
+            if self.echo.reasoning_summary {
+                self.emit(
+                    "response.reasoning_summary_part.added",
+                    json!({"item_id": id, "output_index": index, "summary_index": 0,
+                           "part": {"type": "summary_text", "text": ""}}),
+                    out,
+                );
+            } else {
+                self.emit(
+                    "response.content_part.added",
+                    json!({"item_id": id, "output_index": index, "content_index": 0,
+                           "part": {"type": "reasoning_text", "text": ""}}),
+                    out,
+                );
+            }
             self.open = Some(Open::Reasoning {
                 id,
                 index,
                 text: String::new(),
             });
         }
+        let summary = self.echo.reasoning_summary;
         let Some(Open::Reasoning { id, index, text }) = &mut self.open else {
             unreachable!()
         };
         text.push_str(delta);
-        let data = json!({"item_id": id, "output_index": *index, "content_index": 0,
-                          "delta": delta});
-        self.emit("response.reasoning_text.delta", data, out);
+        if summary {
+            let data = json!({"item_id": id, "output_index": *index, "summary_index": 0,
+                              "delta": delta});
+            self.emit("response.reasoning_summary_text.delta", data, out);
+        } else {
+            let data = json!({"item_id": id, "output_index": *index, "content_index": 0,
+                              "delta": delta});
+            self.emit("response.reasoning_text.delta", data, out);
+        }
     }
 
     fn text_delta(&mut self, delta: &str, out: &mut Vec<u8>) {
@@ -250,6 +272,7 @@ impl ResponsesStream {
     /// `id`, else to the latest call with their `index`, so interleaved calls
     /// stay apart.
     fn tool_delta(&mut self, chunk: &Value, out: &mut Vec<u8>) {
+        self.last_held = false;
         let tool_index = chunk.get("index").and_then(Value::as_u64).unwrap_or(0);
         let name = chunk
             .pointer("/function/name")
@@ -316,18 +339,33 @@ impl ResponsesStream {
         };
         let (index, item) = match open {
             Open::Reasoning { id, index, text } => {
-                self.emit(
-                    "response.reasoning_text.done",
-                    json!({"item_id": id, "output_index": index, "content_index": 0,
-                           "text": text}),
-                    out,
-                );
-                self.emit(
-                    "response.content_part.done",
-                    json!({"item_id": id, "output_index": index, "content_index": 0,
-                           "part": {"type": "reasoning_text", "text": text}}),
-                    out,
-                );
+                if self.echo.reasoning_summary {
+                    self.emit(
+                        "response.reasoning_summary_text.done",
+                        json!({"item_id": id, "output_index": index, "summary_index": 0,
+                               "text": text}),
+                        out,
+                    );
+                    self.emit(
+                        "response.reasoning_summary_part.done",
+                        json!({"item_id": id, "output_index": index, "summary_index": 0,
+                               "part": {"type": "summary_text", "text": text}}),
+                        out,
+                    );
+                } else {
+                    self.emit(
+                        "response.reasoning_text.done",
+                        json!({"item_id": id, "output_index": index, "content_index": 0,
+                               "text": text}),
+                        out,
+                    );
+                    self.emit(
+                        "response.content_part.done",
+                        json!({"item_id": id, "output_index": index, "content_index": 0,
+                               "part": {"type": "reasoning_text", "text": text}}),
+                        out,
+                    );
+                }
                 (
                     index,
                     reasoning_item(&id, &text, finish.item_status(), &self.echo),
@@ -410,9 +448,17 @@ impl ResponsesStream {
         self.ensure_started(out);
         let finish = Finish::from_chat(Some(&reason));
         self.close_open(finish, out);
-        self.close_calls(finish, out);
+        // Only the item generated last can have been cut off.
+        let cut_is_held =
+            self.last_held && self.held.last().is_some_and(|(_, t)| !t.trim().is_empty());
+        let (calls_finish, held_finish) = if cut_is_held {
+            (Finish::Completed, finish)
+        } else {
+            (finish, Finish::Completed)
+        };
+        self.close_calls(calls_finish, out);
         self.flush_held(out);
-        self.close_open(finish, out);
+        self.close_open(held_finish, out);
         let mut resp = self.response(finish.status());
         finish.annotate(&mut resp);
         self.emit(finish.event(), json!({ "response": resp }), out);
@@ -898,5 +944,88 @@ mod tests {
         assert_eq!(turn["content"], "Calling f now.");
         assert_eq!(turn["reasoning_content"], "plan");
         assert_eq!(turn["tool_calls"][0]["id"], call_id);
+    }
+
+    /// With `reasoning.summary`, the trace streams as summary events, as the
+    /// engine's own `/v1/responses` does, so Codex renders it live.
+    #[test]
+    fn reasoning_summary_streams_summary_events() {
+        let echo = to_chat(
+            json!({"model": "m", "input": "x", "stream": true,
+                   "reasoning": {"summary": "auto"}}),
+            false,
+        )
+        .unwrap()
+        .echo;
+        let mut s = ResponsesStream::new(echo);
+        let mut raw = Vec::new();
+        for c in [
+            chunk(json!({"reasoning_content": "th"}), None),
+            chunk(json!({"reasoning_content": "ink"}), None),
+            chunk(json!({"content": "ok"}), Some("stop")),
+        ] {
+            raw.extend(s.feed(c.as_bytes()));
+        }
+        raw.extend(s.finish());
+        let evs = events(&raw);
+        assert_framing(&evs);
+        let names: Vec<&str> = evs[2..9].iter().map(|(e, _)| e.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "response.output_item.added",
+                "response.reasoning_summary_part.added",
+                "response.reasoning_summary_text.delta",
+                "response.reasoning_summary_text.delta",
+                "response.reasoning_summary_text.done",
+                "response.reasoning_summary_part.done",
+                "response.output_item.done",
+            ]
+        );
+        for (_, data) in &evs[3..8] {
+            assert_eq!(data["summary_index"], 0);
+            assert!(data.get("content_index").is_none());
+        }
+        assert_eq!(
+            evs[3].1["part"],
+            json!({"type": "summary_text", "text": ""})
+        );
+        assert_eq!(evs[6].1["text"], "think");
+        assert_eq!(
+            evs[7].1["part"],
+            json!({"type": "summary_text", "text": "think"})
+        );
+        let item = &evs.last().unwrap().1["response"]["output"][0];
+        assert_eq!(
+            item["summary"],
+            json!([{"type": "summary_text", "text": "think"}])
+        );
+        assert_eq!(item["content"][0]["text"], "think");
+    }
+
+    /// Only the item generated last can have been cut off: text that followed
+    /// a finished call, or the call that followed held text.
+    #[test]
+    fn the_cut_off_item_is_the_one_generated_last() {
+        let statuses = |evs: &[(String, Value)]| -> Vec<String> {
+            evs.last().unwrap().1["response"]["output"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|i| i["status"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        let evs = run(&[
+            chunk(indexed(0, Some("f"), "{}"), None),
+            chunk(json!({"content": "after the call"}), Some("length")),
+        ]);
+        assert_eq!(evs.last().unwrap().0, "response.incomplete");
+        assert_eq!(statuses(&evs), ["completed", "incomplete"]);
+        let evs = run(&[
+            chunk(indexed(0, Some("f"), "{}"), None),
+            chunk(json!({"content": "between"}), None),
+            chunk(indexed(1, Some("g"), r#"{"y":"#), Some("length")),
+        ]);
+        assert_eq!(statuses(&evs), ["completed", "incomplete", "completed"]);
     }
 }
