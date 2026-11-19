@@ -76,13 +76,6 @@ def derive_attn_tp_size(*, tp_size: int, attn_cp_size: int, attn_dp_size: int) -
     return tp_size // attn_dp_size // attn_cp_size
 
 
-def shared_experts_tp_spans_dp(
-    *, attn_tp_size: int, attn_cp_size: int, attn_dp_size: int
-) -> bool:
-    """Whether a --shared-experts-tp-size group spans attention-DP ranks."""
-    return attn_dp_size > 1 and attn_tp_size == 1 and attn_cp_size == 1
-
-
 def derive_attention_ranks(
     *, tp_rank: int, attn_tp_size: int, attn_cp_size: int
 ) -> tuple:

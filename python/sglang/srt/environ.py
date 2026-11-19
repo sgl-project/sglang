@@ -2563,8 +2563,6 @@ class Envs:
     # and the latent up_proj tail above the fused-GEMV range (k3_ar_fusion
     # gemm_ag_up_fits). Online weight updates are rejected while on.
     SGLANG_K3_SHARDED_MOE = EnvBool(True)
-    # --shared-experts-tp-size == TP under attention DP: K3 push collectives; 0 keeps NCCL.
-    SGLANG_K3_SHARED_TP_SP_COMM = EnvBool(True)
     # --enable-kda-tp PD decode: full-width staging slots per rank for received KDA state.
     SGLANG_K3_KDA_TP_PD_STAGING_SLOTS = EnvInt(4)
     # --enable-kda-tp PD decode: allocate a request's state slot when it joins the batch.
