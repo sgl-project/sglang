@@ -1715,7 +1715,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             and not self.scheduler.enable_lora
             and not self.scheduler.enable_decode_hicache
             and not self.transfer_queue.enable_staging
-            and swa_allocatable_tokens is None
+            and window_allocatable_tokens is None
             and not self.req_to_token_pool.holds_state_slots
             and get_disagg().disaggregation_decode_host_receive_threshold >= 1
         )
