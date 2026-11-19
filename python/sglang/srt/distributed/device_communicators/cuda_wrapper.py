@@ -92,6 +92,14 @@ class CudaRTLibrary:
         ),
         # ​cudaError_t 	cudaFree ( void* devPtr )
         Function("cudaFree", cudaError_t, [ctypes.c_void_p]),
+        # cudaError_t cudaHostAlloc ( void** pHost, size_t size, unsigned int flags )
+        Function(
+            "cudaHostAlloc",
+            cudaError_t,
+            [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t, ctypes.c_uint],
+        ),
+        # cudaError_t cudaFreeHost ( void* ptr )
+        Function("cudaFreeHost", cudaError_t, [ctypes.c_void_p]),
         # ​cudaError_t cudaMemset ( void* devPtr, int  value, size_t count )
         Function(
             "cudaMemset", cudaError_t, [ctypes.c_void_p, ctypes.c_int, ctypes.c_size_t]
@@ -167,6 +175,14 @@ class CudaRTLibrary:
 
     def cudaFree(self, devPtr: ctypes.c_void_p) -> None:
         self.CUDART_CHECK(self.funcs["cudaFree"](devPtr))
+
+    def cudaHostAlloc(self, size: int, flags: int = 0) -> ctypes.c_void_p:
+        ptr = ctypes.c_void_p()
+        self.CUDART_CHECK(self.funcs["cudaHostAlloc"](ctypes.byref(ptr), size, flags))
+        return ptr
+
+    def cudaFreeHost(self, ptr: ctypes.c_void_p) -> None:
+        self.CUDART_CHECK(self.funcs["cudaFreeHost"](ptr))
 
     def cudaMemset(self, devPtr: ctypes.c_void_p, value: int, count: int) -> None:
         self.CUDART_CHECK(self.funcs["cudaMemset"](devPtr, value, count))

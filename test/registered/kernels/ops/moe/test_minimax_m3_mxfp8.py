@@ -28,7 +28,7 @@ if not torch.cuda.is_available():
     pytest.skip("Requires a GPU.", allow_module_level=True)
 
 from sglang.kernels.ops.gemm.mxfp8_amd_gfx95 import (  # noqa: E402
-    _mxfp8_dot_scaled_linear,
+    dot_scaled_mxfp8_blockscaled_linear,
 )
 from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (  # noqa: E402
     _mxfp8_e4m3_quantize_torch,
@@ -151,7 +151,7 @@ def test_mxfp8_native_linear(m, n, k):
     w_fp8, w_scale = _mxfp8_e4m3_quantize_torch(w_bf16)
     x = torch.randn(m, k, device=DEVICE, dtype=torch.bfloat16) * 0.5
 
-    got = _mxfp8_dot_scaled_linear(x, w_fp8, w_scale)
+    got = dot_scaled_mxfp8_blockscaled_linear(x, w_fp8, w_scale)
     # Reference consumes the SAME quantized weights (isolates activation-quant
     # noise) -> dequant to bf16, plain matmul.
     w_deq = dequant_mxfp8_to_bf16(w_fp8, w_scale)
