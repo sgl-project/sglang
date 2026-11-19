@@ -59,6 +59,8 @@ def stored(block_hash, parent, token_ids, spans=None):
         token_ids=token_ids,
         block_size=len(token_ids),
         lora_id=None,
+        medium=None,
+        lora_name=None,
         mm_routing_spans=spans,
     )
 

@@ -253,7 +253,9 @@ class KVCacheEvent(
     other key is a field name. Optional fields left at ``None`` are omitted, so
     adding an optional field never changes the shape an older consumer sees.
     This is the same encoding vLLM uses for its ``KVCacheEvent``, so a consumer
-    such as Dynamo decodes both engines with one code path.
+    such as Dynamo decodes both engines with one code path. The exception is
+    the fields vLLM declares required (``medium``, ``lora_name``): those are
+    always sent, as nil when unset.
 
     ``EventBatch`` stays a positional array ``[ts, events, attn_dp_rank]``.
     """
@@ -283,7 +285,12 @@ class BlockStored(KVCacheEvent):
     token_ids: list[int]
     block_size: int
     lora_id: Optional[int]
-    medium: Optional[str] = None
+    # No defaults on medium and lora_name: vLLM declares them required, so they
+    # are always sent (nil when unset) for vLLM-typed decoders.
+    medium: Optional[str]
+    # Public adapter name for router lookup. Published hashes are opaque IDs
+    # scoped to the internal cache namespace, including the adapter load.
+    lora_name: Optional[str]
     # Salt of the request that stored these blocks. Block hashes are already
     # namespaced by it; consumers index the emitted hashes rather than
     # recompute them.
@@ -291,9 +298,6 @@ class BlockStored(KVCacheEvent):
     # Session that triggered this store. Attribution only: the blocks may be
     # shared with other sessions, and the hash does not depend on it.
     session_id: Optional[str] = None
-    # Public adapter name for router lookup. Published hashes are opaque IDs
-    # scoped to the internal cache namespace, including the adapter load.
-    lora_name: Optional[str] = None
     # Dynamo format only. Per block (aligned with block_hashes): [start, length,
     # label] runs of multimodal tokens whose item carried a caller routing
     # label. Labels are routing metadata only and never affect hashes or reuse.
@@ -302,7 +306,7 @@ class BlockStored(KVCacheEvent):
 
 class BlockRemoved(KVCacheEvent):
     block_hashes: list[int]
-    medium: Optional[str] = None
+    medium: Optional[str]
 
 
 class AllBlocksCleared(KVCacheEvent):

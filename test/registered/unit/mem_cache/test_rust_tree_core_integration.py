@@ -2222,6 +2222,7 @@ def test_insert_emits_block_stored_events():
             block_size=2,
             lora_id=None,
             medium=StorageMedium.GPU,
+            lora_name=None,
         ),
     ]
     assert core.take_events() == []
@@ -2250,6 +2251,7 @@ def test_salted_events_match_python_hash_and_metadata_contract():
             block_size=2,
             lora_id=None,
             medium=StorageMedium.GPU,
+            lora_name=None,
             cache_salt="tenant-a",
         )
     ]
@@ -2340,6 +2342,7 @@ def test_salted_eagle_events_match_the_bigram_hash_contract():
             block_size=2,
             lora_id=None,
             medium=StorageMedium.GPU,
+            lora_name=None,
             cache_salt="tenant-a",
         )
     ]
