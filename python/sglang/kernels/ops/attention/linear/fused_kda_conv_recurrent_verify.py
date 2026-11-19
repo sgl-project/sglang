@@ -37,7 +37,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl, is_hip_runtime
-from sglang.kernels.ops.attention.linear.kda_verify_gfx950 import (
+from sglang.kernels.ops.attention.linear.kda_verify_gfx950_flydsl import (
     kda_verify_gfx950,
     kda_verify_gfx950_supported,
 )

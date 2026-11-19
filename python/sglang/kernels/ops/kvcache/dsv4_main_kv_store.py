@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
 
 import torch
 import triton
@@ -22,13 +21,6 @@ class NopeFp8RopeBf16Pack:
         assert self.k_nope_fp8.shape[-1] == 448
         assert self.k_rope_bf16.shape[-1] == 64
         assert self.scale_k_nope_ue8m0.shape[-1] == 7
-
-    def slice_pack(self, _slice: Any) -> NopeFp8RopeBf16Pack:
-        return NopeFp8RopeBf16Pack(
-            k_nope_fp8=self.k_nope_fp8[_slice],
-            k_rope_bf16=self.k_rope_bf16[_slice],
-            scale_k_nope_ue8m0=self.scale_k_nope_ue8m0[_slice],
-        )
 
 
 class SetKAndS:

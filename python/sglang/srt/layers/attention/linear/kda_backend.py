@@ -5,7 +5,7 @@ import torch
 
 from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.attention import kda_fused_decode
-from sglang.kernels.ops.attention.linear.kda_verify_gfx950 import (
+from sglang.kernels.ops.attention.linear.kda_verify_gfx950_flydsl import (
     kda_verify_gfx950_available,
 )
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
@@ -491,6 +491,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
     # forward_extend then runs the graph-safe chain on these static tables.
     prefill_graph_metadata: Optional[KDAPrefillGraphMetadata] = None
 
+    # gfx950's one-kernel chain verify (kda_backend_hip), set in __init__.
+    _hip_chain_verify_fn = None
+
     def _create_kernel_dispatcher(self, backends):
         return KDAKernelDispatcher(backends.decode, backends.prefill, backends.verify)
 
@@ -546,6 +549,17 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
             self._fused_chain_verify_fn = fused_kda_conv_gating_verify
             rank0_log("KDA fused chain-verify kernel enabled (topk==1 path).")
+        if is_gfx95_supported() and verify_backend.is_triton():
+            from sglang.srt.layers.attention.linear.kda_backend_hip import (
+                kda_chain_verify_gfx950,
+            )
+
+            self._hip_chain_verify_fn = kda_chain_verify_gfx950
+        if is_gfx95_supported():
+            from sglang.kernels.ops.attention.linear import kda_gfx950_prefill
+
+            # Breakable prefill graphs capture the HIP extend; load it before capture.
+            kda_gfx950_prefill.preload()
         # Per-request row index into the speculative `intermediate_ssm` scratch,
         # used by the MTP / target_verify path (mirrors GDNAttnBackend). Sized
         # past the pool for attn_tp-padded warmup/MLP-sync batches (see helper).
@@ -1386,6 +1400,35 @@ class KDAAttnBackend(MambaAttnBackendBase):
         if ragged_layout is None:
             batch_size = seq_len // draft_token_num
             conv_state_indices = cache_indices[:batch_size]
+            # GLM-5.3-Flash TP4's ring verify (16 heads, 6 tokens) takes the FlyDSL
+            # kernel in the fused path below; MI355X, us per call vs the HIP kernel:
+            # B6 7.2 vs 8.6, B16 9.6 vs 13.6, B64 28.2 vs 38.9, tied up to B4.
+            flydsl_first = (
+                replayssm_rawv is not None
+                and layer.num_v_heads == 16
+                and draft_token_num == 6
+                and kda_verify_gfx950_available()
+            )
+            if self._hip_chain_verify_fn is not None and not flydsl_first:
+                core_attn_out = self._hip_chain_verify_fn(
+                    layer,
+                    mixed_qkv=mixed_qkv,
+                    a=a,
+                    b=b,
+                    draft_token_num=draft_token_num,
+                    conv_states=conv_states,
+                    conv_state_indices=conv_state_indices,
+                    ssm_states=ssm_states,
+                    intermediate_state_cache=intermediate_state_cache,
+                    intermediate_conv_window_cache=intermediate_conv_window_cache,
+                    intermediate_state_indices=intermediate_state_indices[:batch_size],
+                    retrieve_next_token=retrieve_next_token,
+                    retrieve_next_sibling=retrieve_next_sibling,
+                    retrieve_parent_token=retrieve_parent_token,
+                    ring_kwargs=ring_kwargs,
+                )
+                if core_attn_out is not None:
+                    return core_attn_out
             # Fused chain-verify fast path: one kernel replaces the transpose-copy +
             # conv1d + transpose-copy + recurrence sequence. Chain (topk==1) only --
             # retrieve_* are None there; the tree path and any unsupported shape keep
@@ -1595,9 +1638,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
         seq_len, dim = mixed_qkv.shape
         batch_size = seq_len // draft_token_num
-        # gfx950 ring path, T=6 GLM-5.3-Flash TP4, us vs the pair: the Triton kernel wins
-        # up to B8; the FlyDSL kernel (kda_verify_gfx950) B6 7.4 vs 18.3, B16 12.3 vs
-        # 27.2, B64 31.9 vs 64.9.
+        # gfx950 ring path, T=6 GLM-5.3-Flash TP4, us vs the pair: the Triton kernel
+        # wins up to B8; the FlyDSL kernel (kda_verify_gfx950_flydsl) B6 7.4 vs 18.3,
+        # B16 12.3 vs 27.2, B64 31.9 vs 64.9.
         gfx950_ring = (
             replayssm_on
             and is_hip()
@@ -1660,7 +1703,8 @@ class KDAAttnBackend(MambaAttnBackendBase):
             or (layer.bias is not None and layer.bias.dtype != layer.conv_weights.dtype)
         ):
             return False
-        # The ring path only reads the state; kda_verify_gfx950 widens a bf16 pool on load.
+        # The ring path only reads the state; the FlyDSL kernel widens a bf16 pool on
+        # load.
         state_dtypes = (
             (torch.float32, torch.bfloat16) if gfx950_ring else (torch.float32,)
         )

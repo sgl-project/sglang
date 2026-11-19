@@ -25,7 +25,7 @@ _disabled = False
 def kda_verify_gfx950_available() -> bool:
     global _disabled
     if _import_error is not None and not _disabled:
-        logger.warning("kda_verify_gfx950 disabled: %s", _import_error)
+        logger.warning("kda_verify_gfx950_flydsl disabled: %s", _import_error)
         _disabled = True
     return not _disabled
 

@@ -2,7 +2,8 @@
 
 A non-storage no-batch stall spins on_idle without sleeping, so the gate must
 cap the O(queue) get_loads for both the DP-balancing writer and the load
-socket. Work held outside the admitted request queues (async SHM
+socket, while an attention-DP rank stepping only idle batches must publish
+every step. Work held outside the admitted request queues (async SHM
 materialization) must keep the scheduler non-idle. CPU-only: builds a bare
 Scheduler with mocked collaborators, like test_scheduler_flush_cache.
 """
@@ -32,6 +33,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.models.unlimited_ocr_v2_support.async_shm import AsyncShmMaterializer
 from sglang.srt.models.unlimited_ocr_v2_support.request_receiver import (
     UocrRequestReceiver,
@@ -81,6 +83,42 @@ class TestOnIdleStallPublish(CustomTestCase):
             mono.return_value = 100.10  # > LOAD_STALL_REFRESH_S
             s.on_idle()
         self.assertEqual(s.publish_load_snapshot.call_count, 2)
+
+
+class TestBatchResultPublish(CustomTestCase):
+    def test_idle_and_extend_results_publish_every_step_decode_is_throttled(self):
+        """An idle batch only joins the attention-DP collectives while other
+        ranks work, so it is the rank's only chance to publish its queues."""
+        s = Scheduler.__new__(Scheduler)
+        s.deferred_responses = MagicMock()
+        s.scheduler_stage_metrics = None
+        s.disaggregation_mode = DisaggregationMode.NULL
+        s.publish_load_snapshot = MagicMock(return_value=None)
+        s.load_publisher = MagicMock()
+        s.load_inquirer = MagicMock()
+        s.batch_result_processor = MagicMock()
+        s._on_step_processed = MagicMock()
+        s.tree_cache = MagicMock()
+        s._record_step_counters = MagicMock()
+        s.metrics_reporter = MagicMock()
+        s.enable_fpm = False
+        s._maybe_clear_mm_inputs = MagicMock()
+        s.maybe_send_health_check_signal = MagicMock()
+        for mode, forced in [
+            (ForwardMode.IDLE, True),
+            (ForwardMode.EXTEND, True),
+            (ForwardMode.DECODE, False),
+        ]:
+            with self.subTest(mode=mode):
+                batch = SimpleNamespace(
+                    reqs=[], forward_mode=mode, is_dllm=lambda: False
+                )
+                s.process_batch_result(batch, MagicMock())
+                s.publish_load_snapshot.assert_called_with(force=forced)
+                self.assertIs(
+                    s.load_publisher.publish_load_stat.call_args.kwargs["force"],
+                    forced,
+                )
 
 
 class TestAsyncShmIdleAccounting(CustomTestCase):

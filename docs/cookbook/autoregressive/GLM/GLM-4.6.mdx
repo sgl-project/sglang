@@ -131,7 +131,7 @@ The answer is 36. To find 15% of 240, we multiply 240 by 0.15, which equals 36.
 #### 4.2.2 Tool Calling
 
 <Note>
-**Parser names by model:** GLM-4.5 and GLM-4.6 use `--tool-call-parser glm45`. GLM-4.7 and GLM-4.7-Flash use `--tool-call-parser glm47`. All GLM models use `--reasoning-parser glm45` regardless of generation.
+**Parser names by model:** GLM-4.5 and GLM-4.6 use `--tool-call-parser glm`. GLM-4.7 and GLM-4.7-Flash use `--tool-call-parser glm47`. All GLM models use `--reasoning-parser glm45` regardless of generation.
 </Note>
 
 GLM-4.6 supports tool calling capabilities. Enable the tool call parser:
@@ -140,7 +140,7 @@ GLM-4.6 supports tool calling capabilities. Enable the tool call parser:
 python -m sglang.launch_server \
   --model zai-org/GLM-4.6 \
   --reasoning-parser glm45 \
-  --tool-call-parser glm45 \
+  --tool-call-parser glm \
   --tp 8 \
   --host 0.0.0.0 \
   --port 8000
