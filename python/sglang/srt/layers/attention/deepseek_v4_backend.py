@@ -413,6 +413,12 @@ def _first_rows(act, n: int):
     return act[:n]
 
 
+def _live_rows(loc: Optional[torch.Tensor], n: int) -> Optional[torch.Tensor]:
+    """First ``n`` rows of a per-row out-loc tensor, which may be padded to a
+    CUDA graph bucket; ``None`` stays ``None``."""
+    return None if loc is None else loc[:n]
+
+
 def _as_int_list(values) -> Optional[List[int]]:
     if values is None:
         return None
@@ -3881,6 +3887,12 @@ class DeepseekV4AttnBackend(
         core = self.forward_metadata.core_metadata
         compressor = layer.compressor
         layer_id = layer.layer_id
+        # A prefill CUDA graph break hands over only the live rows, while the
+        # out-loc metadata keeps the captured (padded) length; the kernels match
+        # every per-row tensor against one row count, so slice to the live rows,
+        # as _low_ratio_compress_torch does.
+        num_tokens = pos.shape[0]
+        raw_out_loc = _live_rows(core.raw_out_loc, num_tokens)
         # Contiguous complex64 freqs_cis gives a real/imag-interleaved view without copying.
         freqs_cis = torch.view_as_real(layer.freqs_cis).flatten(-2)
         kv_cache = pool.get_extra_key_buffer(layer_id)
@@ -3899,14 +3911,14 @@ class DeepseekV4AttnBackend(
                 compressor.wkv(x) if projected is None else projected,
                 compressor.norm.weight.data,
                 pos,
-                core.raw_out_loc,
+                raw_out_loc,
                 compressor.norm.eps,
                 freqs_cis,
                 kv_cache,
                 page_size=page_size,
                 layout=kv_layout,
             )
-            out_loc = core.c1_out_loc
+            out_loc = _live_rows(core.c1_out_loc, num_tokens)
         else:
             # CompressStatePool stores each request's pending pairs in a position ring.
             # KVAndScore rows use | kv | score |, addressed as req * ring_size + pos % ring_size.
@@ -3917,7 +3929,7 @@ class DeepseekV4AttnBackend(
                 compressor.norm.weight.data,
                 pos,
                 req,
-                core.raw_out_loc,
+                raw_out_loc,
                 compressor.norm.eps,
                 freqs_cis,
                 kv_cache,
@@ -3938,7 +3950,7 @@ class DeepseekV4AttnBackend(
                     ring_size=state.ring_size,
                     layout=kv_layout,
                 )
-            out_loc = core.c2_out_loc
+            out_loc = _live_rows(core.c2_out_loc, num_tokens)
 
         indexer = layer.indexer
         if indexer is not None and indexer.owns_k:
