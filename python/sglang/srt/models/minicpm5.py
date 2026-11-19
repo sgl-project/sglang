@@ -74,7 +74,7 @@ from sglang.srt.utils import is_cuda
 _is_cuda = is_cuda()
 
 
-class MiniCPM5MoEAttention(Glm4MoeAttention):
+class MiniCPM5Attention(Glm4MoeAttention):
     def __init__(
         self,
         hidden_size: int,
@@ -182,7 +182,7 @@ class MiniCPM5MoEAttention(Glm4MoeAttention):
         return output
 
 
-class MiniCPM5MoEGate(nn.Module):
+class MiniCPM5Gate(nn.Module):
     """Router in the model dtype; only the correction bias stays in fp32."""
 
     def __init__(self, config, prefix: str = ""):
@@ -198,7 +198,7 @@ class MiniCPM5MoEGate(nn.Module):
         return F.linear(hidden_states, self.weight, None)
 
 
-class MiniCPM5MoESparseMoeBlock(Glm4MoeSparseMoeBlock):
+class MiniCPM5SparseMoeBlock(Glm4MoeSparseMoeBlock):
     def __init__(
         self,
         config: PretrainedConfig,
@@ -235,7 +235,7 @@ class MiniCPM5MoESparseMoeBlock(Glm4MoeSparseMoeBlock):
                 "Only silu is supported for now."
             )
 
-        self.gate = MiniCPM5MoEGate(config=config, prefix=add_prefix("gate", prefix))
+        self.gate = MiniCPM5Gate(config=config, prefix=add_prefix("gate", prefix))
 
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.n_routed_experts + self.num_fused_shared_experts,
@@ -355,7 +355,7 @@ class MiniCPM5MoESparseMoeBlock(Glm4MoeSparseMoeBlock):
         return output
 
 
-class MiniCPM5MoEDecoderLayer(Glm4MoeDecoderLayer):
+class MiniCPM5DecoderLayer(Glm4MoeDecoderLayer):
     def __init__(
         self,
         config: PretrainedConfig,
@@ -370,7 +370,7 @@ class MiniCPM5MoEDecoderLayer(Glm4MoeDecoderLayer):
         self.layer_id = layer_id
         rope_theta, rope_scaling = get_rope_config(config)
 
-        self.self_attn = MiniCPM5MoEAttention(
+        self.self_attn = MiniCPM5Attention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
@@ -389,7 +389,7 @@ class MiniCPM5MoEDecoderLayer(Glm4MoeDecoderLayer):
         self.is_layer_sparse = ffn.sparse
 
         if self.is_layer_sparse:
-            self.mlp = MiniCPM5MoESparseMoeBlock(
+            self.mlp = MiniCPM5SparseMoeBlock(
                 config=config,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
@@ -417,12 +417,12 @@ class MiniCPM5MoEDecoderLayer(Glm4MoeDecoderLayer):
             (attn, self.input_layernorm),
             (ffn, self.post_attention_layernorm),
         )
-        # MiniCPM5MoEAttention.forward_prepare takes a plain tensor, so the
+        # MiniCPM5Attention.forward_prepare takes a plain tensor, so the
         # aiter fused RMSNorm+FP8 input stays off.
         self.attn_quant_format = ""
 
 
-class MiniCPM5MoEModel(Glm4MoeModel):
+class MiniCPM5Model(Glm4MoeModel):
     def __init__(
         self,
         config: PretrainedConfig,
@@ -447,7 +447,7 @@ class MiniCPM5MoEModel(Glm4MoeModel):
         self.alt_stream = get_stream("alt") if _is_cuda else None
         self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
-            lambda idx, prefix: MiniCPM5MoEDecoderLayer(
+            lambda idx, prefix: MiniCPM5DecoderLayer(
                 layer_id=idx,
                 config=config,
                 quant_config=quant_config,
@@ -455,7 +455,7 @@ class MiniCPM5MoEModel(Glm4MoeModel):
                 alt_stream=self.alt_stream,
             ),
             prefix=add_prefix("layers", prefix),
-            stage_facts=lambda idx: MiniCPM5MoEDecoderLayer.stage_facts(config, idx),
+            stage_facts=lambda idx: MiniCPM5DecoderLayer.stage_facts(config, idx),
         )
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(self.embed_dim, eps=config.rms_norm_eps)
@@ -465,7 +465,7 @@ class MiniCPM5MoEModel(Glm4MoeModel):
         self.layers_to_capture = []
 
 
-class MiniCPM5MoEForCausalLM(Glm4MoeForCausalLM):
+class MiniCPM5ForCausalLM(Glm4MoeForCausalLM):
     def __init__(
         self,
         config: PretrainedConfig,
@@ -478,7 +478,7 @@ class MiniCPM5MoEForCausalLM(Glm4MoeForCausalLM):
         self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
         self.num_fused_shared_experts = get_num_fused_shared_experts()
-        self.model = MiniCPM5MoEModel(
+        self.model = MiniCPM5Model(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
         self.lm_head = ParallelLMHead(
@@ -516,4 +516,4 @@ class MiniCPM5MoEForCausalLM(Glm4MoeForCausalLM):
         self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
 
-EntryClass = [MiniCPM5MoEForCausalLM]
+EntryClass = [MiniCPM5ForCausalLM]

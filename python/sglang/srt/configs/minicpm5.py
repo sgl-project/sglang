@@ -18,7 +18,7 @@ from typing import Optional
 from transformers.configuration_utils import PretrainedConfig
 
 
-class MiniCPM5MoEConfig(PretrainedConfig):
+class MiniCPM5Config(PretrainedConfig):
     model_type = "minicpm5_moe"
     keys_to_ignore_at_inference = ["past_key_values"]
 
@@ -97,6 +97,16 @@ class MiniCPM5MoEConfig(PretrainedConfig):
         self.topk_group = topk_group
         self.norm_topk_prob = norm_topk_prob
         self.use_gated_attention = use_gated_attention
+
+        # Older checkpoints use the original MoE-specific architecture name.
+        architectures = kwargs.get("architectures")
+        if architectures:
+            kwargs["architectures"] = [
+                "MiniCPM5ForCausalLM"
+                if architecture == "MiniCPM5MoEForCausalLM"
+                else architecture
+                for architecture in architectures
+            ]
 
         super().__init__(
             pad_token_id=pad_token_id,

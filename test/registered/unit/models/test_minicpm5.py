@@ -7,17 +7,17 @@ from sglang.srt.model_executor.model_runner_components.attention_backend_setup i
     configure_aux_hidden_state_capture,
 )
 from sglang.srt.models.glm4_moe import Glm4MoeModel
-from sglang.srt.models.minicpm5_moe import MiniCPM5MoEForCausalLM, MiniCPM5MoEModel
+from sglang.srt.models.minicpm5 import MiniCPM5ForCausalLM, MiniCPM5Model
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
 
 def test_dspark_captures_at_the_next_glm4_moe_layer_boundary():
-    model = MiniCPM5MoEModel.__new__(MiniCPM5MoEModel)
+    model = MiniCPM5Model.__new__(MiniCPM5Model)
     nn.Module.__init__(model)
     model.layers_to_capture = []
-    target = MiniCPM5MoEForCausalLM.__new__(MiniCPM5MoEForCausalLM)
+    target = MiniCPM5ForCausalLM.__new__(MiniCPM5ForCausalLM)
     nn.Module.__init__(target)
     target.pp_group = SimpleNamespace(is_last_rank=True)
     target.model = model
@@ -33,7 +33,7 @@ def test_dspark_captures_at_the_next_glm4_moe_layer_boundary():
             is_dspark=True,
         )
 
-    assert MiniCPM5MoEModel.forward is Glm4MoeModel.forward
+    assert MiniCPM5Model.forward is Glm4MoeModel.forward
     assert not target.capture_aux_hidden_states
     with pytest.raises(ValueError, match="explicit layer_ids"):
         configure(None)
