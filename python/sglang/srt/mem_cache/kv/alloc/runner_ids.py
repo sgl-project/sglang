@@ -464,7 +464,7 @@ class RunnerIds:
         write_virtual: Optional[torch.Tensor],
         read_extent: int = 0,
         write_slots: Optional[torch.Tensor] = None,
-        translated_writes: Optional[Dict[IdSpaceKind, torch.Tensor]] = None,
+        translated_writes: Optional[Dict[str, torch.Tensor]] = None,
     ) -> IterationIds:
         """This iteration's ids, translated once. ``write_virtual`` is the
         iteration's write window (``[batch, window]`` flattened when its
@@ -494,12 +494,15 @@ class RunnerIds:
         positions_out: Optional[torch.Tensor] = None,
         anchor_src: Optional[torch.Tensor] = None,
         anchor_out: Optional[torch.Tensor] = None,
+        mask_token_id: Optional[int] = None,
+        window_sub_pool: str = IdSpaceKind.SLIDING_WINDOW,
     ) -> IterationIds:
         """Gather one fixed-width speculative window, translating at its producer.
 
         The virtual window stays available for accept/reclaim bookkeeping;
         draft, target and direct writers share the physical outputs. DCP and
         non-CUDA devices retain the plan's ordinary write translation.
+        A draft with its own window band passes that band's name.
         """
         from sglang.kernels.ops.speculative.cache_locs import (
             assign_extend_cache_locs_uniform_func,
@@ -509,7 +512,7 @@ class RunnerIds:
         mappings = {}
         if req_pool_indices.is_cuda and self.reads_are_translated:
             translated = {}
-            for kind in (IdSpaceKind.FULL, IdSpaceKind.SLIDING_WINDOW):
+            for kind in (IdSpaceKind.FULL, window_sub_pool):
                 space = self.space(kind)
                 if space is not None and space.read_v2p is not None:
                     mappings[kind] = space.read_mapping()
@@ -527,13 +530,14 @@ class RunnerIds:
             draft_token_num=width,
             device=req_pool_indices.device,
             full_v2p=mappings.get(IdSpaceKind.FULL),
-            swa_v2p=mappings.get(IdSpaceKind.SLIDING_WINDOW),
+            swa_v2p=mappings.get(window_sub_pool),
             full_out=writes.get(IdSpaceKind.FULL),
-            swa_out=writes.get(IdSpaceKind.SLIDING_WINDOW),
+            swa_out=writes.get(window_sub_pool),
             page_size=self.page_size,
             positions_out=positions_out,
             anchor_src=anchor_src,
             anchor_out=anchor_out,
+            mask_token_id=mask_token_id,
         )
         return self.plan(
             req_pool_indices=req_pool_indices,

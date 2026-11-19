@@ -16,6 +16,68 @@ register_cuda_ci(est_time=15, stage="extra-a", runner_config="1-gpu-small")
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
 class TestUniformExtendPlan(CustomTestCase):
+    def test_dflash_draft_only_window(self):
+        ps, width = 64, 5
+        device = "cuda"
+        full = torch.tensor([0, 3, 2, -1], device=device)
+        window = torch.tensor([0, 1, 7, -1], device=device)
+        rows = torch.tensor([1, 9, 0], device=device)[::2]
+        starts = torch.tensor([0, 9, 3], device=device)[::2]
+        bonus = torch.tensor([81, 9, 93], device=device)[::2]
+        slots = torch.tensor(
+            [[0, 0, 0, 128, -1, 99], [63, 64, 129, 192, 300, 99]], device=device
+        )[:, :5]
+        source = RunnerIds.__new__(RunnerIds)
+        source.page_size, source.req_to_token = ps, slots
+        source._role_sub_pools = {}
+        source._spaces = {
+            name: IdSpace(
+                key=name,
+                read_v2p=table,
+                write=lambda _: self.fail("separate write translation"),
+            )
+            for name, table in ((IdSpaceKind.FULL, full), ("window_2047", window))
+        }
+        draft = RunnerIds.__new__(RunnerIds)
+        draft._role_sub_pools = {IdSpaceKind.SLIDING_WINDOW: "window_2047"}
+        draft._spaces = source._spaces
+        positions = torch.empty((2, width), device=device, dtype=torch.int64)
+        block = torch.empty_like(positions)
+        plan = source.plan_uniform_extend(
+            req_pool_indices=rows,
+            seq_lens=starts,
+            seq_lens_cpu=None,
+            width=width,
+            positions_out=positions,
+            anchor_src=bonus,
+            anchor_out=block,
+            mask_token_id=77,
+            window_sub_pool=draft.sub_pool_name(IdSpaceKind.SLIDING_WINDOW),
+        )
+        for result, expected in (
+            (block, [[81, 77, 77, 77, 77], [93, 77, 77, 77, 77]]),
+            (positions, [[0, 1, 2, 3, 4], [3, 4, 5, 6, 7]]),
+            (plan.write_virtual, [63, 64, 129, 192, 300, 128, -1, 0, 0, 0]),
+            (plan.write_ids(source), [63, 192, 129, 0, 0, 128, 0, 0, 0, 0]),
+            (
+                plan.write_ids(draft, kind=IdSpaceKind.SLIDING_WINDOW),
+                [63, 64, 449, 0, 0, 448, 0, 0, 0, 0],
+            ),
+        ):
+            torch.testing.assert_close(result, result.new_tensor(expected))
+
+        # DSPARK supplies its own proposal ids and only updates the anchor.
+        block[0].fill_(42)
+        source.plan_uniform_extend(
+            req_pool_indices=rows[:1],
+            seq_lens=starts[:1],
+            seq_lens_cpu=None,
+            width=width,
+            anchor_src=bonus[:1],
+            anchor_out=block[:1],
+        )
+        torch.testing.assert_close(block[0], block.new_tensor([81, 42, 42, 42, 42]))
+
     def test_shared_writes_preserve_virtual_ids_and_page_offsets(self):
         """A fused gather must retain per-page offsets and every reader's space.
 

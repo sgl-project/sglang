@@ -561,6 +561,11 @@ def assign_extend_cache_locs_uniform(
     anchor_src=None,
     anchor_out=None,
     anchor_stride=0,
+    mask_token_id: tl.constexpr = None,
+    req_stride: tl.constexpr = 1,
+    start_stride: tl.constexpr = 1,
+    bonus_stride: tl.constexpr = 1,
+    req_row_stride: tl.constexpr = None,
 ):
     """Uniform-length variant of assign_extend_cache_locs: every row extends
     exactly draft_token_num tokens, so the end offset is start +
@@ -568,23 +573,40 @@ def assign_extend_cache_locs_uniform(
     offset is pid * draft_token_num (no cross-row prefix-sum loads)."""
     BLOCK_SIZE: tl.constexpr = 64
     pid = tl.program_id(axis=0)
-    kv_start = tl.load(start_offset + pid)
-    token_pool = req_to_token + tl.load(req_pool_indices + pid) * pool_len
+    kv_start = tl.load(start_offset + pid * start_stride)
+    req = tl.load(req_pool_indices + pid * req_stride).to(tl.int64)
+    token_pool = req_to_token + req * (
+        pool_len if req_row_stride is None else req_row_stride
+    )
     out_cache_ptr = out_cache_loc + pid * draft_token_num
     if anchor_out is not None:
-        tl.store(anchor_out + pid * anchor_stride, tl.load(anchor_src + pid))
+        bonus = tl.load(anchor_src + pid * bonus_stride)
+        if mask_token_id is None:
+            tl.store(anchor_out + pid * anchor_stride, bonus)
 
     offs = tl.arange(0, BLOCK_SIZE)
     num_loop = tl.cdiv(draft_token_num, BLOCK_SIZE)
     for i in range(num_loop):
         o = offs + i * BLOCK_SIZE
         mask = o < draft_token_num
-        data = tl.load(token_pool + kv_start + o, mask=mask)
+        pos = kv_start.to(tl.int64) + o
+        if mask_token_id is not None:
+            # A padded DFLASH block may extend past the request row.
+            data = tl.load(
+                token_pool + pos, mask=mask & (pos >= 0) & (pos < pool_len), other=0
+            )
+            tl.store(
+                anchor_out + pid * anchor_stride + o,
+                tl.where(o == 0, bonus, mask_token_id),
+                mask=mask,
+            )
+        else:
+            data = tl.load(token_pool + pos, mask=mask)
         tl.store(out_cache_ptr + o, data, mask=mask)
         if positions_out is not None:
             tl.store(
                 positions_out + pid * draft_token_num + o,
-                kv_start.to(tl.int64) + o,
+                pos,
                 mask=mask,
             )
         if full_v2p is not None:
@@ -620,6 +642,7 @@ def assign_extend_cache_locs_uniform_func(
     positions_out: Optional[torch.Tensor] = None,
     anchor_src: Optional[torch.Tensor] = None,
     anchor_out: Optional[torch.Tensor] = None,
+    mask_token_id: Optional[int] = None,
 ) -> torch.Tensor:
     """assign_extend_cache_locs for the uniform case (all rows extend exactly
     draft_token_num tokens, e.g. spec target-verify prep). Computes end
@@ -630,7 +653,15 @@ def assign_extend_cache_locs_uniform_func(
     per gathered token. Translation is rank-local (no DCP widening).
     ``positions_out`` ([batch, draft_token_num] int64) gets start + column and
     ``anchor_out[:, 0]`` gets ``anchor_src``, in the same launch.
+    Passing a mask token also fills the remaining draft input columns.
     """
+    if mask_token_id is not None:
+        assert anchor_src is not None and anchor_out is not None
+        assert (
+            anchor_out.shape == (batch_size, draft_token_num)
+            and anchor_out.stride(1) == 1
+        )
+        assert req_to_token.stride(1) == 1
     if full_v2p is not None:
         assert full_out is not None and full_out.numel() == batch_size * draft_token_num
         assert full_v2p.is_contiguous() and full_out.is_contiguous()
@@ -664,6 +695,11 @@ def assign_extend_cache_locs_uniform_func(
             anchor_src=anchor_src,
             anchor_out=anchor_out,
             anchor_stride=0 if anchor_out is None else anchor_out.stride(0),
+            mask_token_id=mask_token_id,
+            req_stride=req_pool_indices.stride(0),
+            start_stride=start_offset.stride(0),
+            bonus_stride=1 if anchor_src is None else anchor_src.stride(0),
+            req_row_stride=req_to_token.stride(0),
         )
         return out_cache_loc
 
@@ -675,6 +711,8 @@ def assign_extend_cache_locs_uniform_func(
             + torch.arange(draft_token_num, device=start_offset.device)
         )
     if anchor_out is not None:
+        if mask_token_id is not None:
+            anchor_out.fill_(mask_token_id)
         anchor_out[:, 0].copy_(anchor_src.view(-1))
     return assign_extend_cache_locs_func(
         req_pool_indices=req_pool_indices,

@@ -107,7 +107,7 @@ class IterationIds:
         write_virtual: Optional[torch.Tensor],
         read_extent: int = 0,
         write_slots: Optional[torch.Tensor] = None,
-        translated_writes: Optional[Dict[IdSpaceKind, torch.Tensor]] = None,
+        translated_writes: Optional[Dict[str, torch.Tensor]] = None,
     ):
         self._source = source
         self.req_pool_indices = req_pool_indices
