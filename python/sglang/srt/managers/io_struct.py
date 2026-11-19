@@ -61,7 +61,6 @@ from sglang.srt.managers.kv_hints import KvHintsEnvelope, decode_kv_hints_envelo
 from sglang.srt.managers.req_types import (
     MultimodalProcessorOutput,
     ReturnHiddenStatesMode,
-    SamplingLogprobsMode,
     get_return_hidden_states_mode,
 )
 from sglang.srt.multimodal.media_io import ImageData, VideoData
@@ -286,14 +285,16 @@ class GenerateReqInput:
     top_logprobs_num: Optional[Union[List[int], int]] = None
     # If return logprobs, the token ids to return logprob for.
     token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None
-    # Whether to return each output token's sampling support and behavior logprob.
+    # Whether to return each output token's logprob under the distribution it was
+    # sampled from: after temperature and top-k/top-p/min-p, renormalized. Equal to
+    # the output token logprob when no filter applies. Requires return_logprob.
+    return_sampling_logprobs: Optional[Union[List[bool], bool]] = None
+    # Whether to return each output token's sampling support with its logprobs
+    # under that distribution. A row is empty when no filter applies: the support
+    # is the whole vocabulary.
     return_sampling_mask: Optional[Union[List[bool], bool]] = None
-    # Return either the selected token's behavior logprob or behavior logprobs for
-    # the full sampling support. When omitted, selected mode is used if
-    # return_sampling_mask is enabled.
-    sampling_logprobs_mode: Optional[
-        Union[List[Optional[SamplingLogprobsMode]], SamplingLogprobsMode]
-    ] = None
+    # Removed: any value but None is rejected.
+    sampling_logprobs_mode: Optional[Any] = None
     # Whether to detokenize tokens in text in the returned logprobs.
     return_text_in_logprobs: bool = False
     # Return prompt top logprobs as flat arrays plus shape metadata instead of
@@ -391,6 +392,10 @@ class GenerateReqInput:
     # Propagates trace context via Engine.generate/async_generate
     external_trace_header: Optional[Dict[str, Any]] = None
     received_time: Optional[float] = None
+
+    # SamplingParams.filters_sampling() of this request, overwritten by the
+    # TokenizerManager once the sampling params are normalized.
+    filters_sampling: bool = False
 
     # For EPD-disaggregated inference
     need_wait_for_mm_inputs: Optional[bool] = None
@@ -531,6 +536,12 @@ class GenerateReqInput:
                 "return_flat_raw_top_logprobs_b64 requires return_flat_raw_top_logprobs "
                 "or return_flat_raw_output_top_logprobs."
             )
+        if self.sampling_logprobs_mode is not None:
+            raise ValueError(
+                "sampling_logprobs_mode was removed. Set return_sampling_logprobs "
+                "for each output token's sampling logprob and return_sampling_mask "
+                "for the sampling support with its logprobs."
+            )
         if self.return_flat_raw_sampling_mask and self.stream:
             raise ValueError(
                 "return_flat_raw_sampling_mask is only set on the finished response "
@@ -649,6 +660,8 @@ class GenerateReqInput:
             self.top_logprobs_num = 0
         if not self.token_ids_logprob:  # covers both None and []
             self.token_ids_logprob = None
+        if self.return_sampling_logprobs is None:
+            self.return_sampling_logprobs = False
         if self.return_sampling_mask is None:
             self.return_sampling_mask = False
         for field_name in ("extra_key", "cache_salt"):
@@ -925,11 +938,11 @@ class GenerateReqInput:
         self.top_logprobs_num = normalize_param(
             self.top_logprobs_num, 0, "top_logprobs_num"
         )
+        self.return_sampling_logprobs = normalize_param(
+            self.return_sampling_logprobs, False, "return_sampling_logprobs"
+        )
         self.return_sampling_mask = normalize_param(
             self.return_sampling_mask, False, "return_sampling_mask"
-        )
-        self.sampling_logprobs_mode = normalize_param(
-            self.sampling_logprobs_mode, None, "sampling_logprobs_mode"
         )
 
         # Handle token_ids_logprob specially due to its nested structure
@@ -1116,8 +1129,8 @@ class GenerateReqInput:
             logprob_start_len=self.logprob_start_len[i],
             top_logprobs_num=self.top_logprobs_num[i],
             token_ids_logprob=self.token_ids_logprob[i],
+            return_sampling_logprobs=self.return_sampling_logprobs[i],
             return_sampling_mask=self.return_sampling_mask[i],
-            sampling_logprobs_mode=self.sampling_logprobs_mode[i],
             return_text_in_logprobs=self.return_text_in_logprobs,
             return_flat_raw_top_logprobs=self.return_flat_raw_top_logprobs,
             return_flat_raw_output_top_logprobs=self.return_flat_raw_output_top_logprobs,
@@ -1216,7 +1229,7 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     token_ids_logprob: Optional[List[int]]
     # Whether to stream output
     stream: bool
-    # Whether to return sparse output-token support from top-k/top-p/min-p sampling.
+    # See GenerateReqInput.return_sampling_mask.
     return_sampling_mask: bool = False
     # Assemble prompt top logprobs as flat arrays scheduler-side (see
     # GenerateReqInput.return_flat_raw_top_logprobs). The b64 flag stays
@@ -1305,9 +1318,8 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # Internal PP control bit, set by PP0 before forwarding the request.
     # Keep tail fields append-only to preserve the positional Rust wire schema.
     pp_prefetch_ticketed: bool = False
-    # Shape of output_token_sampling_logprobs for each output token. This is a
-    # defaulted tail field so older IPC senders decode as selected mode.
-    sampling_logprobs_mode: SamplingLogprobsMode = "selected"
+    # See GenerateReqInput.return_sampling_logprobs.
+    return_sampling_logprobs: bool = False
     # LoRA adapter name; KV events namespace this request's blocks by it.
     lora_name: Optional[str] = None
     # GenerateReqInput.mm_routing_labels split by media type ("image",

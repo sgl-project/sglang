@@ -1042,8 +1042,10 @@ class ChatCompletionRequest(PDRoutingFields):
     return_meta_info: bool = False
     return_input_ids_in_sglext: bool = False
     return_output_ids_in_sglext: bool = False
+    return_sampling_logprobs: bool = False
     return_sampling_mask: bool = False
-    sampling_logprobs_mode: Optional[Literal["selected", "support"]] = None
+    # Removed: any value but None is rejected.
+    sampling_logprobs_mode: Optional[Any] = None
     # Flat output top logprobs in choices[].meta_info (requires return_meta_info);
     # choices[].logprobs top_logprobs are then empty.
     return_flat_raw_output_top_logprobs: bool = False

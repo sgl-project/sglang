@@ -263,6 +263,11 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
         if self.top_k == -1:
             self.top_k = TOP_K_ALL  # whole vocabulary
 
+    def filters_sampling(self) -> bool:
+        """Whether tokens are drawn from a top-k/top-p/min-p filtered distribution
+        rather than softmax(logits / temperature). Valid after normalize()."""
+        return self.top_k != TOP_K_ALL or self.top_p != 1.0 or self.min_p > 0
+
     def verify(self, vocab_size):
         validate_n(self.n)
         if self.beam_width is not None and self.beam_width < 1:

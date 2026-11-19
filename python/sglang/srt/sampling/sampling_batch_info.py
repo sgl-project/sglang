@@ -102,11 +102,11 @@ class SamplingBatchInfo:
 
     # CPU request flags and their derived device indices. The flags make batch
     # filtering cheap; the indices keep sampler work limited to opted-in rows.
-    return_sampling_masks: Optional[List[bool]] = None
-    return_sampling_support_logprobs: Optional[List[bool]] = None
+    captures_sampling: Optional[List[bool]] = None
+    captures_sampling_support: Optional[List[bool]] = None
     sampling_mask_batch_indices: Optional[torch.Tensor] = None
     sampling_support_logprobs_capture_indices: Optional[torch.Tensor] = None
-    # Per-row top_k of mask requests (1 elsewhere); bounds the capture width.
+    # Per-row top_k of support captures (1 elsewhere); bounds the capture width.
     sampling_mask_top_ks: Optional[List[int]] = None
 
     watermark_keys: Optional[torch.Tensor] = None
@@ -213,13 +213,10 @@ class SamplingBatchInfo:
             )
             for r in reqs
         )
-        return_sampling_masks = [r.return_sampling_mask for r in reqs]
-        return_sampling_support_logprobs = [
-            r.return_sampling_mask and r.sampling_logprobs_mode == "support"
-            for r in reqs
-        ]
+        captures_sampling = [r.captures_sampling for r in reqs]
+        captures_sampling_support = [r.captures_sampling_support for r in reqs]
         sampling_mask_batch_indices = cls._make_sampling_mask_batch_indices(
-            return_sampling_masks, device
+            captures_sampling, device
         )
         from sglang.srt.managers.schedule_batch import ScheduleBatch
 
@@ -246,13 +243,13 @@ class SamplingBatchInfo:
             has_watermark_candidates = False
         sampling_support_logprobs_capture_indices = (
             cls._make_sampling_support_logprobs_capture_indices(
-                return_sampling_masks,
-                return_sampling_support_logprobs,
+                captures_sampling,
+                captures_sampling_support,
                 device,
             )
         )
         sampling_mask_top_ks = [
-            r.sampling_params.top_k if r.return_sampling_mask else 1 for r in reqs
+            r.sampling_params.top_k if r.captures_sampling_support else 1 for r in reqs
         ]
 
         if has_custom_logit_processor:
@@ -313,8 +310,8 @@ class SamplingBatchInfo:
             custom_logit_processor=merged_custom_logit_processor,
             device=device,
             logit_bias=logit_bias,
-            return_sampling_masks=return_sampling_masks,
-            return_sampling_support_logprobs=return_sampling_support_logprobs,
+            captures_sampling=captures_sampling,
+            captures_sampling_support=captures_sampling_support,
             sampling_mask_batch_indices=sampling_mask_batch_indices,
             watermark_keys=watermark_keys,
             watermark_context_windows=watermark_context_windows,
@@ -345,35 +342,31 @@ class SamplingBatchInfo:
 
     @staticmethod
     def _make_sampling_mask_batch_indices(
-        return_sampling_masks: List[bool], device: str
+        captures_sampling: List[bool], device: str
     ) -> Optional[torch.Tensor]:
-        """Build device row indices for requests that return sampling masks."""
-        indices = [
-            i for i, should_return in enumerate(return_sampling_masks) if should_return
-        ]
+        """Build device row indices for requests whose sampling is captured."""
+        indices = [i for i, captured in enumerate(captures_sampling) if captured]
         if not indices:
             return None
         return _rows_to_device_indices(indices, device)
 
     @staticmethod
     def _make_sampling_support_logprobs_capture_indices(
-        return_sampling_masks: List[bool],
-        return_sampling_support_logprobs: Optional[List[bool]],
+        captures_sampling: List[bool],
+        captures_sampling_support: List[bool],
         device: str,
     ) -> Optional[torch.Tensor]:
-        """Map support-mode requests to rows in the compact mask capture."""
-        if return_sampling_support_logprobs is None:
-            return None
+        """Map support-capturing requests to rows in the compact capture."""
         capture_index = -1
         indices = []
-        for return_mask, return_support in zip(
-            return_sampling_masks,
-            return_sampling_support_logprobs,
+        for captured, captures_support in zip(
+            captures_sampling,
+            captures_sampling_support,
             strict=True,
         ):
-            if return_mask:
+            if captured:
                 capture_index += 1
-            if return_support:
+            if captures_support:
                 indices.append(capture_index)
         if not indices:
             return None
@@ -494,28 +487,25 @@ class SamplingBatchInfo:
 
         if self.logit_bias is not None:
             self.logit_bias = self.logit_bias[keep_indices_device]
-        if self.return_sampling_masks is not None:
-            self.return_sampling_masks = [
-                self.return_sampling_masks[i] for i in keep_indices
+        if self.captures_sampling is not None:
+            self.captures_sampling = [self.captures_sampling[i] for i in keep_indices]
+            self.captures_sampling_support = [
+                self.captures_sampling_support[i] for i in keep_indices
             ]
             if self.sampling_mask_top_ks is not None:
                 self.sampling_mask_top_ks = [
                     self.sampling_mask_top_ks[i] for i in keep_indices
                 ]
-            if self.return_sampling_support_logprobs is not None:
-                self.return_sampling_support_logprobs = [
-                    self.return_sampling_support_logprobs[i] for i in keep_indices
-                ]
             if self.sampling_mask_batch_indices is not None:
                 self.sampling_mask_batch_indices = (
                     self._make_sampling_mask_batch_indices(
-                        self.return_sampling_masks, self.device
+                        self.captures_sampling, self.device
                     )
                 )
                 self.sampling_support_logprobs_capture_indices = (
                     self._make_sampling_support_logprobs_capture_indices(
-                        self.return_sampling_masks,
-                        self.return_sampling_support_logprobs,
+                        self.captures_sampling,
+                        self.captures_sampling_support,
                         self.device,
                     )
                 )
@@ -573,10 +563,7 @@ class SamplingBatchInfo:
         self.logit_bias = merge_bias_tensor(
             self.logit_bias, other.logit_bias, self_len, other_len, self.device, 0.0
         )
-        if (
-            self.return_sampling_masks is not None
-            or other.return_sampling_masks is not None
-        ):
+        if self.captures_sampling is not None or other.captures_sampling is not None:
             if other.sampling_mask_batch_indices is not None:
                 other_sampling_mask_batch_indices = (
                     other.sampling_mask_batch_indices + self_len
@@ -591,16 +578,16 @@ class SamplingBatchInfo:
                         ]
                     )
                 )
-            self.return_sampling_masks = (
-                self.return_sampling_masks or [False] * self_len
-            ) + (other.return_sampling_masks or [False] * other_len)
-            self.return_sampling_support_logprobs = (
-                self.return_sampling_support_logprobs or [False] * self_len
-            ) + (other.return_sampling_support_logprobs or [False] * other_len)
+            self.captures_sampling = (self.captures_sampling or [False] * self_len) + (
+                other.captures_sampling or [False] * other_len
+            )
+            self.captures_sampling_support = (
+                self.captures_sampling_support or [False] * self_len
+            ) + (other.captures_sampling_support or [False] * other_len)
             self.sampling_support_logprobs_capture_indices = (
                 self._make_sampling_support_logprobs_capture_indices(
-                    self.return_sampling_masks,
-                    self.return_sampling_support_logprobs,
+                    self.captures_sampling,
+                    self.captures_sampling_support,
                     self.device,
                 )
             )

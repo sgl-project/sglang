@@ -705,8 +705,9 @@ class SpecGrammarKit:
 
 
 class SpecSamplingMaskKit:
-    """return_sampling_mask on a mixed greedy/sampling batch: one mask per output
-    token, each output token inside its mask, and greedy rows as singletons."""
+    """Sampling logprobs and masks on a mixed greedy/sampling batch: one logprob
+    and one mask row per output token, each output token inside its row with that
+    logprob, and greedy rows as singletons."""
 
     def test_sampling_mask(self):
         response = requests.post(
@@ -729,13 +730,9 @@ class SpecSamplingMaskKit:
                     },
                 ]
                 * 2,
+                "return_logprob": True,
+                "return_sampling_logprobs": True,
                 "return_sampling_mask": True,
-                "sampling_logprobs_mode": [
-                    "selected",
-                    "selected",
-                    "support",
-                    "support",
-                ],
             },
             timeout=60,
         )
@@ -745,21 +742,18 @@ class SpecSamplingMaskKit:
         for request_idx, output in enumerate(outputs):
             output_ids = output["output_ids"]
             meta_info = output["meta_info"]
-            masks = meta_info["output_token_sampling_mask"]
+            mask_rows = meta_info["output_sampling_mask_logprobs"]
             logprobs = meta_info["output_token_sampling_logprobs"]
             self.assertEqual(len(output_ids), 7)
-            self.assertEqual(len(masks), len(output_ids))
+            self.assertEqual(len(mask_rows), len(output_ids))
             self.assertEqual(len(logprobs), len(output_ids))
-            for output_id, mask, logprob in zip(output_ids, masks, logprobs):
-                self.assertIn(output_id, mask)
-                if request_idx >= 2:
-                    self.assertEqual(len(logprob), len(mask))
-                    self.assertTrue(all(math.isfinite(value) for value in logprob))
-                    self.assertAlmostEqual(
-                        sum(math.exp(value) for value in logprob), 1.0, places=5
-                    )
-                else:
-                    self.assertTrue(math.isfinite(logprob))
+            for output_id, mask_row, logprob in zip(output_ids, mask_rows, logprobs):
+                support = {token_id: value for value, token_id, _ in mask_row}
+                self.assertEqual(len(support), len(mask_row))
+                self.assertAlmostEqual(support[output_id], logprob, places=5)
+                self.assertTrue(all(math.isfinite(value) for value in support.values()))
+                self.assertAlmostEqual(
+                    sum(math.exp(value) for value in support.values()), 1.0, places=5
+                )
                 if request_idx % 2 == 0:
-                    self.assertEqual(mask, [output_id])
-                    self.assertEqual(logprob, [0.0] if request_idx >= 2 else 0.0)
+                    self.assertEqual(support, {output_id: 0.0})

@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import dataclasses
+import functools
 import gc
 import json
 import logging
@@ -202,7 +203,10 @@ from sglang.srt.sampling.custom_logit_processor import (
     UOCR_PAGE_GUARD_PROCESSOR,
     supports_sampling_mask,
 )
-from sglang.srt.sampling.sampling_mask import SamplingMaskChunk
+from sglang.srt.sampling.sampling_mask import (
+    SamplingMaskChunk,
+    returns_sampling_output,
+)
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.sampling.watermarking.core import (
     resolve_watermark_request,
@@ -244,7 +248,8 @@ _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 logger = logging.getLogger(__name__)
 
 
-def _validate_watermark_request(sampling_params: SamplingParams) -> None:
+def _validate_watermark_request(sampling_params: SamplingParams) -> bool:
+    """Whether the request is watermarked, after rejecting unsupported uses."""
     watermark = sampling_params.watermark
     features = get_exec().features
     _, _, enabled = resolve_watermark_request(
@@ -257,6 +262,28 @@ def _validate_watermark_request(sampling_params: SamplingParams) -> None:
     )
     if enabled and (sampling_params.beam_width or 1) > 1:
         raise ValueError("beam search is not supported with watermarking")
+    return enabled
+
+
+def _validate_unfiltered_sampling_logprobs(
+    obj: GenerateReqInput, watermarked: bool
+) -> None:
+    """An unfiltered request returns its output token logprob as its sampling
+    logprob, so the two must come from the same distribution."""
+    if not obj.return_sampling_logprobs or obj.filters_sampling:
+        return
+    if watermarked:
+        raise ValueError(
+            "return_sampling_logprobs without top-k/top-p/min-p sampling is not "
+            "supported with watermarking: output token logprobs exclude the "
+            "watermark."
+        )
+    if envs.SGLANG_RETURN_ORIGINAL_LOGPROB.get():
+        raise ValueError(
+            "return_sampling_logprobs without top-k/top-p/min-p sampling is not "
+            "supported with SGLANG_RETURN_ORIGINAL_LOGPROB=1: output token "
+            "logprobs exclude the temperature."
+        )
 
 
 def _reject_missing_dispatched_encoder_embedding(request_obj, mm_inputs):
@@ -281,8 +308,8 @@ _INCREMENTAL_STREAMING_META_INFO_KEYS = (
     "output_token_logprobs",
     "output_top_logprobs",
     "output_token_ids_logprobs",
-    "output_token_sampling_mask",
     "output_token_sampling_logprobs",
+    "output_sampling_mask_logprobs",
 )
 
 
@@ -365,10 +392,11 @@ class ReqState:
     input_token_ids_logprobs_idx: List = dataclasses.field(default_factory=list)
     output_token_ids_logprobs_val: List = dataclasses.field(default_factory=list)
     output_token_ids_logprobs_idx: List = dataclasses.field(default_factory=list)
-    output_token_sampling_mask: List[List[int]] = dataclasses.field(
+    output_token_sampling_logprobs: List[float] = dataclasses.field(
         default_factory=list
     )
-    output_token_sampling_logprobs: List[Union[float, List[float]]] = dataclasses.field(
+    # One row of (logprob, token_id, text) per output token.
+    output_sampling_mask_logprobs: List[List[Any]] = dataclasses.field(
         default_factory=list
     )
     output_token_sampling_mask_chunks: List[SamplingMaskChunk] = dataclasses.field(
@@ -487,14 +515,12 @@ def _build_flat_top_logprobs_fields_from_arrays(
 def _build_flat_sampling_mask_fields(
     chunks: List[SamplingMaskChunk], return_b64: bool
 ) -> Dict[str, Any]:
-    """A finished request's sampling masks as flat arrays; base64 if ``return_b64``."""
-    fields: Dict[str, Any] = {
-        "output_token_sampling_mask_length": sum(len(c.lengths) for c in chunks)
-    }
+    """A finished request's sampling mask rows as flat arrays; base64 if ``return_b64``."""
+    fields: Dict[str, Any] = {}
     for name, attr, dtype in (
-        ("output_token_sampling_mask_flat", "token_ids", np.int32),
-        ("output_token_sampling_mask_row_lengths", "lengths", np.int32),
-        ("output_token_sampling_logprobs_flat", "logprobs", np.float32),
+        ("output_sampling_mask_logprobs_val_flat", "support_logprobs", np.float32),
+        ("output_sampling_mask_logprobs_idx_flat", "token_ids", np.int32),
+        ("output_sampling_mask_logprobs_row_lengths", "lengths", np.int32),
     ):
         values = np.concatenate(
             [np.empty(0, dtype)] + [getattr(c, attr) for c in chunks]
@@ -507,36 +533,66 @@ def _build_flat_sampling_mask_fields(
     return fields
 
 
-def _add_sampling_mask_to_meta_info(
+def _unfiltered_sampling_mask_chunk(num_rows: int) -> SamplingMaskChunk:
+    """Rows of an unfiltered request: its support is the whole vocabulary, left empty."""
+    return SamplingMaskChunk(
+        selected_logprobs=np.empty(0, dtype=np.float32),
+        lengths=np.zeros(num_rows, dtype=np.int32),
+        token_ids=np.empty(0, dtype=np.int32),
+        support_logprobs=np.empty(0, dtype=np.float32),
+    )
+
+
+def _add_sampling_output_to_meta_info(
     meta_info: dict,
     state: ReqState,
     chunk: Optional[SamplingMaskChunk],
+    *,
+    num_output_tokens: int,
     finished: bool,
+    detokenize_logprob_tokens: Callable[[List[float], List[int]], List[Any]],
 ):
-    if chunk is not None:
-        if state.obj.return_flat_raw_sampling_mask:
+    """Add the sampling logprobs and mask rows a request asked for. A filtered
+    request reads its captured rows; an unfiltered one was not captured, and
+    returns its output token logprobs and one empty mask row per output token."""
+    obj = state.obj
+    if obj.filters_sampling and chunk is not None:
+        if obj.return_sampling_logprobs:
+            state.output_token_sampling_logprobs.extend(
+                chunk.selected_logprobs.tolist()
+            )
+        if obj.return_flat_raw_sampling_mask:
             state.output_token_sampling_mask_chunks.append(chunk)
-        else:
-            masks, logprobs = chunk.to_lists(
-                support_logprobs=state.obj.sampling_logprobs_mode == "support"
+        elif obj.return_sampling_mask:
+            state.output_sampling_mask_logprobs.extend(
+                detokenize_logprob_tokens(logprobs, token_ids)
+                for token_ids, logprobs in zip(*chunk.support_rows())
             )
-            state.output_token_sampling_mask.extend(masks)
-            state.output_token_sampling_logprobs.extend(logprobs)
-            meta_info["output_token_sampling_mask"] = state.output_token_sampling_mask
-            meta_info["output_token_sampling_logprobs"] = (
-                state.output_token_sampling_logprobs
-            )
-            meta_info["output_token_sampling_mask_length"] = len(
-                state.output_token_sampling_mask
-            )
-    # Built once on the finished response; streaming is rejected.
-    if state.obj.return_flat_raw_sampling_mask and finished:
-        meta_info.update(
-            _build_flat_sampling_mask_fields(
-                state.output_token_sampling_mask_chunks,
-                return_b64=state.obj.return_flat_raw_sampling_mask_b64,
-            )
+
+    if obj.return_sampling_logprobs:
+        meta_info["output_token_sampling_logprobs"] = (
+            state.output_token_sampling_logprobs
+            if obj.filters_sampling
+            else state.output_token_logprobs_val
         )
+    if obj.return_flat_raw_sampling_mask:
+        # Built once on the finished response; streaming is rejected.
+        if finished:
+            mask_chunks = (
+                state.output_token_sampling_mask_chunks
+                if obj.filters_sampling
+                else [_unfiltered_sampling_mask_chunk(num_output_tokens)]
+            )
+            meta_info.update(
+                _build_flat_sampling_mask_fields(
+                    mask_chunks, return_b64=obj.return_flat_raw_sampling_mask_b64
+                )
+            )
+    elif obj.return_sampling_mask:
+        mask_rows = state.output_sampling_mask_logprobs
+        if not obj.filters_sampling:
+            mask_rows.extend([] for _ in range(num_output_tokens - len(mask_rows)))
+        meta_info["output_sampling_mask_logprobs"] = mask_rows
 
 
 class InputFormat(Enum):
@@ -1571,20 +1627,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "Please set `--enable-custom-logit-processor` to enable this feature."
                 )
             if (
-                obj.return_sampling_mask
+                returns_sampling_output(obj)
                 and obj.custom_logit_processor
                 and not supports_sampling_mask(obj.custom_logit_processor)
             ):
                 # Reject before scheduling so aborted requests cannot execute
                 # unsupported processors during sampling batch preparation.
                 raise ValueError(
-                    "return_sampling_mask only supports DisallowedTokensLogitsProcessor "
-                    "among custom logit processors."
+                    "return_sampling_logprobs or return_sampling_mask only supports "
+                    "DisallowedTokensLogitsProcessor among custom logit processors."
                 )
-            if obj.sampling_logprobs_mode is not None and not obj.return_sampling_mask:
+            if obj.return_sampling_logprobs and not obj.return_logprob:
                 raise ValueError(
-                    "sampling_logprobs_mode can only be set when "
-                    "return_sampling_mask=true."
+                    "return_sampling_logprobs requires return_logprob=true."
                 )
             if obj.return_flat_raw_sampling_mask and not obj.return_sampling_mask:
                 raise ValueError(
@@ -1777,7 +1832,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         sampling_params = self.sampling_params_class(**sampling_kwargs)
         sampling_params.normalize(self.tokenizer)
         sampling_params.verify(self.model_config.vocab_size)
-        _validate_watermark_request(sampling_params)
+        watermarked = _validate_watermark_request(sampling_params)
+        if isinstance(obj, GenerateReqInput):
+            obj.filters_sampling = sampling_params.filters_sampling()
+            _validate_unfiltered_sampling_logprobs(obj, watermarked)
 
         # Build return object
         if isinstance(obj, GenerateReqInput):
@@ -1809,8 +1867,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 # A logprob batch gathers every request's count, including disabled ones.
                 top_logprobs_num=obj.top_logprobs_num if obj.return_logprob else 0,
                 token_ids_logprob=obj.token_ids_logprob,
+                return_sampling_logprobs=obj.return_sampling_logprobs,
                 return_sampling_mask=obj.return_sampling_mask,
-                sampling_logprobs_mode=obj.sampling_logprobs_mode or "selected",
                 return_flat_raw_top_logprobs=obj.return_flat_raw_top_logprobs,
                 stream=obj.stream,
                 rid=obj.rid,
@@ -2912,16 +2970,22 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     i,
                     finished=recv_obj.finished_reasons[i] is not None,
                 )
-            if (
-                isinstance(state.obj, GenerateReqInput)
-                and state.obj.return_sampling_mask
+            if isinstance(state.obj, GenerateReqInput) and returns_sampling_output(
+                state.obj
             ):
                 output_sampling_mask = recv_obj.output_token_sampling_mask
-                _add_sampling_mask_to_meta_info(
+                _add_sampling_output_to_meta_info(
                     meta_info,
                     state,
                     None if output_sampling_mask is None else output_sampling_mask[i],
+                    num_output_tokens=len(state.output_ids)
+                    + len(row_output_ids(recv_obj, i)),
                     finished=recv_obj.finished_reasons[i] is not None,
+                    detokenize_logprob_tokens=functools.partial(
+                        self.detokenize_logprob_tokens,
+                        decode_to_text=state.obj.return_text_in_logprobs
+                        and not self.skip_tokenizer_init,
+                    ),
                 )
 
             if not isinstance(recv_obj, BatchEmbeddingOutput):

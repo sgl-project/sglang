@@ -3388,8 +3388,8 @@ class Scheduler(
                 return_logprob=recv_req.return_logprob,
                 top_logprobs_num=recv_req.top_logprobs_num,
                 token_ids_logprob=recv_req.token_ids_logprob,
+                return_sampling_logprobs=recv_req.return_sampling_logprobs,
                 return_sampling_mask=recv_req.return_sampling_mask,
-                sampling_logprobs_mode=recv_req.sampling_logprobs_mode,
                 return_flat_raw_top_logprobs=recv_req.return_flat_raw_top_logprobs,
                 stream=recv_req.stream,
                 lora_id=recv_req.lora_id,
@@ -3582,31 +3582,35 @@ class Scheduler(
             )
             return
 
-        if req.return_sampling_mask:
-            if (
-                self.disaggregation_mode != DisaggregationMode.NULL
-                and not self.disagg_metadata_buffers.enable_sampling_mask
-            ):
-                self._reject_bad_request(
-                    req,
-                    "return_sampling_mask requires "
-                    "SGLANG_ENABLE_DISAGG_SAMPLING_MASK=1 on both prefill and "
-                    "decode servers when using disaggregated serving.",
-                )
-                return
+        if (
+            req.captures_sampling
+            and self.disaggregation_mode != DisaggregationMode.NULL
+            and not self.disagg_metadata_buffers.enable_sampling_mask
+        ):
+            self._reject_bad_request(
+                req,
+                "return_sampling_logprobs or return_sampling_mask with top-k/top-p/"
+                "min-p sampling requires SGLANG_ENABLE_DISAGG_SAMPLING_MASK=1 on "
+                "both prefill and decode servers when using disaggregated serving.",
+            )
+            return
+
+        if req.captures_sampling_support:
             top_k = req.sampling_params.top_k
             sampling_mask_cap = self.server_args.sampling_mask_max_tokens
             if top_k != 1 and not (1 < top_k <= sampling_mask_cap):
                 error_msg = (
-                    "return_sampling_mask requires top_k=1 for greedy sampling "
-                    f"or finite 1 < top_k <= {sampling_mask_cap}; got top_k="
-                    f"{top_k}. Lower top_k or increase "
-                    "--sampling-mask-max-tokens."
+                    "return_sampling_mask with top-k/top-p/min-p sampling requires "
+                    "top_k=1 for greedy sampling or finite 1 < top_k <= "
+                    f"{sampling_mask_cap}; got top_k={top_k}. Lower top_k or "
+                    "increase --sampling-mask-max-tokens."
                 )
                 self._reject_bad_request(req, error_msg)
                 return
 
-        if req.return_sampling_mask and not self.spec_algorithm.is_none():
+        if (
+            req.return_sampling_logprobs or req.return_sampling_mask
+        ) and not self.spec_algorithm.is_none():
             error_msg = validate_spec_sampling_mask_request(req, self.spec_algorithm)
             if error_msg is not None:
                 self._reject_bad_request(req, error_msg)

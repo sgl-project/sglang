@@ -58,7 +58,8 @@ class _StreamFirst(SchedulerBatchResultProcessor):
 
 
 def _req(rid, max_new_tokens=8, *, mask=False):
-    params = SamplingParams(max_new_tokens=max_new_tokens)
+    # A mask is captured only under a sampling filter.
+    params = SamplingParams(max_new_tokens=max_new_tokens, top_k=8 if mask else -1)
     params.normalize(None)
     req = Req(
         rid,
@@ -307,7 +308,7 @@ def _checkpoints_after_releases(*, lease):
     cache.components[ComponentType.MAMBA].checkpoints_level = 3
     reqs = [_running_req(cache, 100 * (i + 1)) for i in range(4)]
     for req in reqs[:2]:
-        req.return_sampling_mask = True
+        req.captures_sampling = True
     slots = allocator.state_slots
     pages = []
     while (taken := allocator.alloc(4)) is not None:

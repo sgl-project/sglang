@@ -98,28 +98,25 @@ class TestMergeBiasTensor(CustomTestCase):
 
 
 class TestSamplingMaskBatchIndices(CustomTestCase):
-    def test_filter_and_merge_preserve_support_logprob_modes(self):
+    def test_filter_and_merge_preserve_support_captures(self):
         info = _make_info(
             batch_size=3,
-            return_sampling_masks=[True, True, False],
-            return_sampling_support_logprobs=[False, True, False],
+            captures_sampling=[True, True, False],
+            captures_sampling_support=[False, True, False],
             sampling_mask_batch_indices=torch.tensor([0, 1]),
         )
         info.filter_batch([1, 2], torch.tensor([1, 2]))
-        self.assertEqual(info.return_sampling_support_logprobs, [True, False])
+        self.assertEqual(info.captures_sampling_support, [True, False])
         self.assertEqual(info.sampling_support_logprobs_capture_indices.tolist(), [0])
 
         other = _make_info(
             batch_size=2,
-            return_sampling_masks=[True, True],
-            return_sampling_support_logprobs=[False, True],
+            captures_sampling=[True, True],
+            captures_sampling_support=[False, True],
             sampling_mask_batch_indices=torch.tensor([0, 1]),
         )
         info.merge_batch(other)
-        self.assertEqual(
-            info.return_sampling_support_logprobs,
-            [True, False, False, True],
-        )
+        self.assertEqual(info.captures_sampling_support, [True, False, False, True])
         self.assertEqual(
             info.sampling_support_logprobs_capture_indices.tolist(), [0, 2]
         )
@@ -127,47 +124,54 @@ class TestSamplingMaskBatchIndices(CustomTestCase):
     def test_filter_removes_last_opted_in_row_then_merge_restores_capture(self):
         info = _make_info(
             batch_size=2,
-            return_sampling_masks=[False, True],
+            captures_sampling=[False, True],
+            captures_sampling_support=[False, True],
             sampling_mask_batch_indices=torch.tensor([1]),
         )
         info.filter_batch([0], torch.tensor([0]))
         self.assertIsNone(info.sampling_mask_batch_indices)
         other = _make_info(
             batch_size=1,
-            return_sampling_masks=[True],
+            captures_sampling=[True],
+            captures_sampling_support=[True],
             sampling_mask_batch_indices=torch.tensor([0]),
         )
         info.merge_batch(other)
-        self.assertEqual(info.return_sampling_masks, [False, True])
+        self.assertEqual(info.captures_sampling, [False, True])
         self.assertEqual(info.sampling_mask_batch_indices.tolist(), [1])
 
     def test_filter_rebuilds_row_indices(self):
         info = _make_info(
             batch_size=4,
-            return_sampling_masks=[False, True, False, True],
+            captures_sampling=[False, True, False, True],
+            captures_sampling_support=[False, False, False, True],
             sampling_mask_batch_indices=torch.tensor([1, 3]),
         )
 
         info.filter_batch([1, 2, 3], torch.tensor([1, 2, 3]))
 
-        self.assertEqual(info.return_sampling_masks, [True, False, True])
+        self.assertEqual(info.captures_sampling, [True, False, True])
+        self.assertEqual(info.captures_sampling_support, [False, False, True])
         self.assertEqual(info.sampling_mask_batch_indices.tolist(), [0, 2])
+        self.assertEqual(info.sampling_support_logprobs_capture_indices.tolist(), [1])
 
     def test_merge_offsets_rhs_row_indices(self):
         lhs = _make_info(
             batch_size=2,
-            return_sampling_masks=[False, True],
+            captures_sampling=[False, True],
+            captures_sampling_support=[False, True],
             sampling_mask_batch_indices=torch.tensor([1]),
         )
         rhs = _make_info(
             batch_size=3,
-            return_sampling_masks=[True, False, True],
+            captures_sampling=[True, False, True],
+            captures_sampling_support=[True, False, True],
             sampling_mask_batch_indices=torch.tensor([0, 2]),
         )
 
         lhs.merge_batch(rhs)
 
-        self.assertEqual(lhs.return_sampling_masks, [False, True, True, False, True])
+        self.assertEqual(lhs.captures_sampling, [False, True, True, False, True])
         self.assertEqual(lhs.sampling_mask_batch_indices.tolist(), [1, 2, 4])
 
 

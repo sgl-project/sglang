@@ -137,7 +137,9 @@ class TestPrefillEmbeddingResults(CustomTestCase):
 
 
 class TestSamplingMaskMaterialization(CustomTestCase):
-    def test_selected_and_support_modes_share_one_batch(self):
+    def test_logprob_only_and_support_rows_share_one_batch(self):
+        """A row that captures no support keeps its sampled logprob and gets an
+        empty support, whatever the batch packed for the rows that do."""
         output = LogitsProcessorOutput(
             next_token_logits=None,
             sampling_mask_output=SamplingMaskOutput(
@@ -145,37 +147,38 @@ class TestSamplingMaskMaterialization(CustomTestCase):
                 lengths=torch.tensor([2, 2]),
                 selected_logprobs=torch.tensor([-0.5, -0.25]),
                 support_logprobs=torch.tensor([[-0.25, -1.5]]),
-                statuses=torch.tensor([SamplingMaskStatus.OK, SamplingMaskStatus.OK]),
+                statuses=torch.tensor(
+                    [SamplingMaskStatus.OVERFLOW, SamplingMaskStatus.OK]
+                ),
             ),
         )
         SchedulerBatchResultProcessor.materialize_sampling_mask_output(
             reqs=[
-                SimpleNamespace(
-                    return_sampling_mask=True,
-                    sampling_logprobs_mode="selected",
-                ),
-                SimpleNamespace(
-                    return_sampling_mask=True,
-                    sampling_logprobs_mode="support",
-                ),
+                SimpleNamespace(captures_sampling=True, captures_sampling_support=x)
+                for x in (False, True)
             ],
             output=output,
         )
         self.assertEqual(
+            output.next_token_sampling_mask_status,
+            [SamplingMaskStatus.OK, SamplingMaskStatus.OK],
+        )
+        self.assertEqual(output.next_token_sampling_logprobs, [-0.5, -0.25])
+        self.assertEqual(
             [row.tolist() for row in output.next_token_sampling_mask_idx],
-            [[7, 8], [9, 10]],
+            [[], [9, 10]],
         )
         self.assertEqual(
-            [row.tolist() for row in output.next_token_sampling_logprobs],
-            [[-0.5], [-0.25, -1.5]],
+            [row.tolist() for row in output.next_token_sampling_support_logprobs],
+            [[], [-0.25, -1.5]],
         )
 
-    def test_selected_mode_does_not_require_support_tensor(self):
+    def test_logprob_only_batch_does_not_require_support_tensor(self):
         output = LogitsProcessorOutput(
             next_token_logits=None,
             sampling_mask_output=SamplingMaskOutput(
-                token_ids=torch.tensor([[7, 8]], dtype=torch.int32),
-                lengths=torch.tensor([2]),
+                token_ids=torch.empty((1, 0), dtype=torch.int32),
+                lengths=torch.tensor([0]),
                 selected_logprobs=torch.tensor([-0.5]),
                 support_logprobs=None,
                 statuses=torch.tensor([SamplingMaskStatus.OK]),
@@ -183,14 +186,12 @@ class TestSamplingMaskMaterialization(CustomTestCase):
         )
         SchedulerBatchResultProcessor.materialize_sampling_mask_output(
             reqs=[
-                SimpleNamespace(
-                    return_sampling_mask=True,
-                    sampling_logprobs_mode="selected",
-                )
+                SimpleNamespace(captures_sampling=True, captures_sampling_support=False)
             ],
             output=output,
         )
-        self.assertEqual(output.next_token_sampling_logprobs[0].tolist(), [-0.5])
+        self.assertEqual(output.next_token_sampling_logprobs, [-0.5])
+        self.assertEqual(output.next_token_sampling_mask_idx[0].tolist(), [])
 
     def test_packed_ids_are_copied_before_per_request_slicing(self):
         """Non-overlap capture must not perform one device copy per request."""
@@ -209,15 +210,13 @@ class TestSamplingMaskMaterialization(CustomTestCase):
         )
         SchedulerBatchResultProcessor.materialize_sampling_mask_output(
             reqs=[
-                SimpleNamespace(
-                    return_sampling_mask=x,
-                    sampling_logprobs_mode="support",
-                )
+                SimpleNamespace(captures_sampling=x, captures_sampling_support=x)
                 for x in (True, False, True)
             ],
             output=output,
         )
         packed_ids.cpu.assert_called_once_with()
+        self.assertEqual(output.next_token_sampling_logprobs, [-0.5, None, -0.25])
         self.assertEqual(
             [
                 None if row is None else row.tolist()
@@ -228,7 +227,7 @@ class TestSamplingMaskMaterialization(CustomTestCase):
         self.assertEqual(
             [
                 None if row is None else row.tolist()
-                for row in output.next_token_sampling_logprobs
+                for row in output.next_token_sampling_support_logprobs
             ],
             [[-0.5, -0.75], None, [-0.25]],
         )
@@ -244,7 +243,8 @@ class _PrefillReq(FakeReq):
         self.output_ids = []
         self.time_stats = Mock()
         self.return_logprob = False
-        self.return_sampling_mask = False
+        self.captures_sampling = False
+        self.is_prefill_only = False
         self.grammar = None
         self.require_reasoning = False
         self.customized_info = None
@@ -270,7 +270,7 @@ class _DecodeReq(FakeReq):
         self.finished_reason = None
         self.is_retracted = False
         self.return_logprob = False
-        self.return_sampling_mask = False
+        self.captures_sampling = False
         self.grammar = None
         self.beam_group = None
         self.time_stats = Mock()
@@ -483,7 +483,7 @@ class TestPrefillSkippedOutput(CustomTestCase):
     def test_sampling_mask_middle_chunk_does_not_require_logits_output(self):
         """A non-token-producing PP chunk may omit its logits output."""
         req = _PrefillReq(rid="middle", return_hidden_states=False)
-        req.return_sampling_mask = True
+        req.captures_sampling = True
         batch = SimpleNamespace(
             reqs=[req],
             chunked_req=req,
@@ -622,7 +622,7 @@ class TestSamplingMaskStatusErrors(CustomTestCase):
         processor = _make_processor(self)
         req = _DecodeReq()
         req.output_ids = [7]
-        req.return_sampling_mask = True
+        req.captures_sampling = True
         req.multimodal_inputs = None
         req.update_finish_state = Mock()
         batch = SimpleNamespace(
