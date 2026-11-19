@@ -1,62 +1,68 @@
-"""NPU tests: deterministic inference for RL rollouts (BS1 vs BSN bitwise).
+"""Phase 2 NPU tests: deterministic inference for RL rollouts (BS1 vs BSN bitwise).
 
-Phase 2 of https://github.com/sgl-project/sglang/issues/48822. RL rollouts
-feed generated tokens and logprobs back into the trainer; a rollout engine
-that returns different logprobs for the same prompt depending on how many
+RL rollouts feed generated tokens and logprobs back into the trainer; a rollout
+engine that returns different logprobs for the same prompt depending on how many
 other requests shared the batch silently poisons the training signal. With
 ``--enable-deterministic-inference`` the NPU backend swaps in batch-invariant
 kernels (``torch.ops.batch_invariant_ops.npu_*``), so the same request must
-produce bitwise-identical token ids and logprobs at batch size 1, at batch
-size N and after reordering the batch.
+produce bitwise-identical token ids and logprobs at batch size 1, at batch size
+N, and after reordering the batch.
 
-The suite is capability-gated: the batch-invariant extension package is a
-native build and may be absent from a container, in which case both classes
-skip with an actionable reason instead of failing.
-
-[Test Category] RL consistency
-[Test Target] --enable-deterministic-inference, --rl-on-policy-target
+The suite is capability-gated: the batch-invariant extension is a native build
+that may be absent from a container, in which case every case skips with an
+actionable reason instead of failing.
 """
 
 import os
 import unittest
 
-import requests
-
-from sglang.srt.utils import kill_process_tree
 from sglang.test.ascend.test_ascend_utils import QWEN3_0_6B_WEIGHTS_PATH
-from sglang.test.ci.ci_register import register_npu_ci
-from sglang.test.test_utils import (
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    DEFAULT_URL_FOR_TEST,
-    CustomTestCase,
-    popen_launch_server,
+from sglang.test.ascend.test_npu_rl_utils import (
+    flush_cache,
+    get,
+    npu_rl_env,
+    npu_server,
+    post,
 )
+from sglang.test.ci.ci_register import register_npu_ci
+from sglang.test.test_utils import CustomTestCase
 
-register_npu_ci(est_time=500, suite="nightly-1-npu-a3", nightly=True)
-register_npu_ci(est_time=500, suite="base-b-test-1-npu-a3")
+register_npu_ci(est_time=600, suite="extra-b-test-1-npu-a3")
+register_npu_ci(est_time=600, suite="nightly-test-1-npu-a3", nightly=True)
 
 MAX_NEW_TOKENS = 8
-
 PROMPTS = (
     "The capital of France is",
     "1 + 1 =",
     "def hello():\n    return",
     "In a shocking finding, scientists discovered a herd of unicorns living in",
 )
-
-NPU_SERVER_ENV = {
-    "PYTORCH_NPU_ALLOC_CONF": (
-        "expandable_segments:True,pin_memory_expandable_segments:True"
-    ),
+SAMPLING = {
+    "temperature": 0,
+    "max_new_tokens": MAX_NEW_TOKENS,
+    "ignore_eos": True,
 }
+
+DETERMINISTIC_ARGS = (
+    "--trust-remote-code",
+    "--attention-backend",
+    "ascend",
+    "--mem-fraction-static",
+    "0.5",
+    "--context-length",
+    "1024",
+    "--enable-deterministic-inference",
+)
+
+HAVE_MODEL = os.path.isfile(os.path.join(QWEN3_0_6B_WEIGHTS_PATH, "config.json"))
 
 
 def _batch_invariant_ops_available():
     """Whether the native batch_invariant_ops extension is importable."""
     try:
-        import torch  # noqa: F401
-        import torch_npu  # noqa: F401  # the ops are NPU-only
         import batch_invariant_ops  # noqa: F401
+        import torch
+        import torch_npu  # noqa: F401
 
         torch.ops.batch_invariant_ops.npu_mm_batch_invariant
         torch.ops.batch_invariant_ops.npu_fused_infer_attention_score_batch_invariant
@@ -65,159 +71,125 @@ def _batch_invariant_ops_available():
     return True
 
 
-def _flush_cache(base_url):
-    response = requests.post(base_url + "/flush_cache", timeout=60)
-    response.raise_for_status()
+HAVE_BATCH_INVARIANT_OPS = _batch_invariant_ops_available()
 
-
-def _post_generate(base_url, payload, timeout=180):
-    response = requests.post(base_url + "/generate", json=payload, timeout=timeout)
-    response.raise_for_status()
-    body = response.json()
-    if "error" in body:
-        raise AssertionError(f"generate returned error: {body['error']}")
-    return body
+SKIP_REASON = (
+    "batch_invariant_ops native extension is not installed; build and install "
+    "the torch extension package plus the matching CANN vendor op package first"
+)
 
 
 def _signature_of(body):
-    """(token ids, logprobs) of one /generate response entry."""
+    """(token ids, logprobs) of one /generate response entry.
+
+    Logprobs are compared without rounding: batch invariance is a bitwise
+    property, so a rounded comparison would hide the drift this suite exists to
+    catch.
+    """
     meta = body.get("meta_info", {})
-    logprobs = tuple(item[0] for item in (meta.get("output_token_logprobs") or []))
+    logprobs = tuple(item[0] for item in (meta.get("output_token_logprobs") or ()))
     if not logprobs:
         raise AssertionError("no output_token_logprobs returned")
     return (tuple(body["output_ids"]), logprobs)
 
 
 def _request_signatures(base_url, prompts):
-    payload = {
-        "text": list(prompts),
-        "sampling_params": {
-            "temperature": 0,
-            "max_new_tokens": MAX_NEW_TOKENS,
-            "ignore_eos": True,
+    body = post(
+        base_url,
+        "/generate",
+        {
+            "text": list(prompts),
+            "sampling_params": dict(SAMPLING),
+            "return_logprob": True,
         },
-        "return_logprob": True,
-    }
-    body = _post_generate(base_url, payload)
+        timeout=300,
+    ).json()
     if isinstance(body, list):
         return [_signature_of(item) for item in body]
-    outputs = body.get("data", [body])
-    return [_signature_of(item) for item in outputs]
+    return [_signature_of(item) for item in body.get("data", [body])]
 
 
-def _collect_determinism_trials(base_url, prompts):
+def _collect_trials(base_url):
     """BS=1 reference, a BS=N batch, and a reordered BS=N batch."""
-    trials = {}
+    flush_cache(base_url)
+    bs1 = [_request_signatures(base_url, [prompt])[0] for prompt in PROMPTS]
 
-    _flush_cache(base_url)
-    trials["bs1"] = [_request_signatures(base_url, [prompt])[0] for prompt in prompts]
+    flush_cache(base_url)
+    bsn = _request_signatures(base_url, PROMPTS)
 
-    _flush_cache(base_url)
-    trials["bsn"] = _request_signatures(base_url, prompts)
-
-    _flush_cache(base_url)
-    shuffled = list(prompts)
-    shuffled.reverse()
-    trials["bsn_reversed"] = [
-        None,
-    ] * len(shuffled)
-    results = _request_signatures(base_url, shuffled)
+    flush_cache(base_url)
+    shuffled = list(reversed(PROMPTS))
+    reversed_results = _request_signatures(base_url, shuffled)
+    bsn_reversed = [None] * len(shuffled)
     for position, prompt in enumerate(shuffled):
-        trials["bsn_reversed"][prompts.index(prompt)] = results[position]
+        bsn_reversed[PROMPTS.index(prompt)] = reversed_results[position]
 
-    return trials
+    return {"bs1": bs1, "bsn": bsn, "bsn_reversed": bsn_reversed}
 
 
-def _assert_bitwise_determinism(trials, label):
+def _assert_bitwise_determinism(testcase, trials, label):
     for trial_name, signatures in trials.items():
         for index, signature in enumerate(signatures):
-            self_reference = trials["bs1"][index]
-            if signature != self_reference:
-                raise AssertionError(
-                    f"{label}: {trial_name} diverged from bs1 for prompt {index}\n"
-                    f"  bs1:     {self_reference}\n"
-                    f"  {trial_name}: {signature}"
-                )
+            testcase.assertEqual(
+                signature,
+                trials["bs1"][index],
+                f"{label}: {trial_name} diverged from bs1 for prompt {index}\n"
+                f"  bs1:     {trials['bs1'][index]}\n"
+                f"  {trial_name}: {signature}",
+            )
 
 
-DETERMINISTIC_ARGS = [
-    "--device",
-    "npu",
-    "--attention-backend",
-    "ascend",
-    "--trust-remote-code",
-    "--mem-fraction-static",
-    "0.5",
-    "--context-length",
-    "1024",
-    "--enable-deterministic-inference",
-]
-
-
-def _deterministic_skip_reason():
-    if not _batch_invariant_ops_available():
-        return (
-            "batch_invariant_ops native extension is not installed; "
-            "build and install the torch extension package first "
-            "(torch.ops.batch_invariant_ops.npu_*)"
-        )
-    if not os.path.isfile(os.path.join(QWEN3_0_6B_WEIGHTS_PATH, "config.json")):
-        return f"Qwen3-0.6B model config not found at {QWEN3_0_6B_WEIGHTS_PATH}"
-    return None
-
-
-class _DeterministicServerTestCase(CustomTestCase):
-    extra_server_args: list = []
-    requires_on_policy_target = False
+class _DeterministicServerCase:
+    extra_server_args = ()
 
     @classmethod
     def setUpClass(cls):
-        reason = _deterministic_skip_reason()
-        if reason:
-            raise unittest.SkipTest(reason)
-        cls.process = popen_launch_server(
+        env = npu_rl_env()
+        cls._server = npu_server(
             QWEN3_0_6B_WEIGHTS_PATH,
-            DEFAULT_URL_FOR_TEST,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            env={**os.environ, **NPU_SERVER_ENV},
-            other_args=DETERMINISTIC_ARGS + list(cls.extra_server_args),
+            extra_args=(*DETERMINISTIC_ARGS, *cls.extra_server_args),
+            env=env,
         )
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.trials = _collect_determinism_trials(cls.base_url, PROMPTS)
+        cls.base_url = cls._server.__enter__()
+        cls.trials = _collect_trials(cls.base_url)
 
     @classmethod
     def tearDownClass(cls):
-        if hasattr(cls, "process") and cls.process:
-            kill_process_tree(cls.process.pid)
+        cls._server.__exit__(None, None, None)
 
 
-class TestNpuDeterministicInference(_DeterministicServerTestCase):
+@unittest.skipUnless(HAVE_MODEL, f"model not found: {QWEN3_0_6B_WEIGHTS_PATH}")
+@unittest.skipUnless(HAVE_BATCH_INVARIANT_OPS, SKIP_REASON)
+class TestNpuDeterministicInference(_DeterministicServerCase, CustomTestCase):
     """Same prompt, same tokens and logprobs at BS1, BSN and reversed order."""
 
     def test_01_bs1_matches_bsn_bitwise(self):
-        _assert_bitwise_determinism(self.trials, "deterministic inference")
+        _assert_bitwise_determinism(self, self.trials, "deterministic inference")
 
 
-class TestNpuDeterministicInferenceOnPolicyTarget(_DeterministicServerTestCase):
+@unittest.skipUnless(HAVE_MODEL, f"model not found: {QWEN3_0_6B_WEIGHTS_PATH}")
+@unittest.skipUnless(HAVE_BATCH_INVARIANT_OPS, SKIP_REASON)
+class TestNpuDeterministicInferenceOnPolicyTarget(
+    _DeterministicServerCase, CustomTestCase
+):
     """--rl-on-policy-target fsdp keeps inference deterministic.
 
-    The on-policy target selects the numerical contract the rollout must
-    match (an FSDP trainer); enabling it must not weaken batch invariance,
-    and the server must actually accept and register the flag.
+    The on-policy target selects the numerical contract the rollout must match
+    (an FSDP trainer); enabling it must not weaken batch invariance, and the
+    server must actually accept and register the flag.
     """
 
-    extra_server_args = ["--rl-on-policy-target", "fsdp"]
+    extra_server_args = ("--rl-on-policy-target", "fsdp")
 
     def test_01_bs1_matches_bsn_bitwise(self):
-        _assert_bitwise_determinism(self.trials, "rl_on_policy_target=fsdp")
+        _assert_bitwise_determinism(self, self.trials, "rl_on_policy_target=fsdp")
 
     def test_02_server_registered_the_target(self):
-        response = requests.get(self.base_url + "/server_info", timeout=30)
-        if response.status_code == 404:
+        try:
+            info = get(self.base_url, "/server_info").json()
+        except RuntimeError:
             # Older builds expose the same payload under /get_server_info.
-            response = requests.get(self.base_url + "/get_server_info", timeout=30)
-        response.raise_for_status()
-        info = response.json()
+            info = get(self.base_url, "/get_server_info").json()
         args = info.get("server_args", info)
         self.assertEqual(
             args.get("rl_on_policy_target"),
