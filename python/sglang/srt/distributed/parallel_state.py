@@ -3175,7 +3175,6 @@ def patch_tensor_parallel_group(tp_group: GroupCoordinator, *, owns_attention: b
             moe_dp_size=1,
             moe_tp_size=tp_group.world_size,
             moe_tp_rank=tp_group.rank_in_group,
-            # The draft is plain TP on this group; its rows are not padded for a DP dense FFN.
             moe_dense_tp_size=None,
         )
     dp_flags.scoped_gather_slot = scoped_gather_slot
