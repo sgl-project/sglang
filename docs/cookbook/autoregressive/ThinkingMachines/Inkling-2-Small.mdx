@@ -84,7 +84,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 **AMD.** The ROCm image exports `ROCM_QUICK_REDUCE_QUANTIZATION=INT8`, a lossy all-reduce; the recipe sets it to `NONE`. Attention runs on the Triton backend. Inkling-2-Small on ROCm is validated on gfx950 (MI350X / MI355X) only; other ROCm GPUs refuse at launch.
 
-**Vera Rubin.** The recipes run on one 4-GPU VR200 tray with the GB300 flags (TP4 / EP4, FA4, MegaMoE). They need the `dev-inkling-2-small-cu134` image, which carries the DeepGEMM MegaMoE build for SM107. Both set `SGLANG_OPT_INKLING2_MEGA_MOE_MIN_TOKENS=192`.
+**Vera Rubin.** The recipes run on one 4-GPU VR200 tray with the GB300 flags (TP4 / EP4, FA4, MegaMoE). They need the `dev-inkling-2-small-cu134` image, which carries the DeepGEMM MegaMoE build for SM107. With MegaMoE and EP > 1, the server places each expert's weight pages in the locality domain whose SMs read them; nothing needs to be set. This moves the point where MegaMoE beats the routed kernels down to about 64 tokens per forward, the default threshold. The routed kernels do not split work by domain, so Balanced decode at 16–64 concurrent requests is 2–4% slower than with unlocalized weights; larger batches and DSpark are faster.
 
 **TPU7x.** One TPU7x host (4 chips, 8 TensorCores) runs TP8 / EP8 on sglang-torchtpu. The first start compiles the shapes listed in `--tpu-compile-bs` and `--tpu-compile-tokens`; later starts reuse the compilation cache.
 
