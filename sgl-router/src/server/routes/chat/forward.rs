@@ -9,7 +9,7 @@ use super::preparation::{
 };
 use crate::config::DpRankPolicy;
 use crate::discovery::{ModelId, WorkerId, WorkerMode};
-use crate::policies::dp_rank::{projected_rank_tokens, select_dp_rank};
+use crate::policies::dp_rank::{expected_rank_tokens, select_dp_rank};
 use crate::proxy::grpc::{Additions, EngineRpc, GrpcResponse};
 use crate::proxy::sse::{self, ErrorEventScanner, PumpItem, StreamEnd, StreamEndReason};
 use crate::proxy::Proxy;
@@ -765,8 +765,9 @@ fn prompt_dp_rank(
     )
 }
 
-/// KV tokens per rank of `worker` when `policy` is `least_tokens`: the
-/// engine's fresh readings projected by this router's dispatches since them.
+/// KV tokens per rank of `worker` when `policy` is `least_tokens`: what each
+/// rank is expected to hold, from the engine's fresh readings and this
+/// router's dispatches since them.
 /// Empty under any other policy, and while any rank lacks a fresh reading,
 /// which makes the selector fall back to its in-flight count.
 fn rank_tokens(ctx: &AppContext, worker: &Worker, policy: DpRankPolicy) -> Vec<(u32, u64)> {
@@ -775,7 +776,7 @@ fn rank_tokens(ctx: &AppContext, worker: &Worker, policy: DpRankPolicy) -> Vec<(
     }
     ctx.engine_reported_load
         .fresh_rank_loads(&worker.url, Instant::now())
-        .map_or_else(Vec::new, |loads| projected_rank_tokens(worker, &loads))
+        .map_or_else(Vec::new, |loads| expected_rank_tokens(worker, &loads))
 }
 
 /// Holds the rank slot; stamped under `least_tokens` so later selections can

@@ -340,7 +340,7 @@ async fn decode_dp_rank_policy_is_separate_from_the_prefill_policy() {
 }
 
 #[tokio::test]
-async fn least_tokens_keeps_the_lighter_of_two_decode_ranks() {
+async fn least_tokens_sends_decode_to_the_rank_expected_to_hold_the_fewest_kv_tokens() {
     let (prefill, decode) = (
         MockWorker::start(vec![]).await,
         MockWorker::start(vec![]).await,
@@ -366,31 +366,23 @@ async fn least_tokens_keeps_the_lighter_of_two_decode_ranks() {
     for (rank, num_tokens) in [(0, 400), (1, 100), (2, 900), (3, 250)] {
         publish(rank, num_tokens);
     }
-    // Of two random ranks the lighter wins: the heaviest never beats a
-    // rival, the lightest beats every one.
-    let mut ranks = Vec::new();
-    for _ in 0..32 {
-        ranks.push(send(&app, &decode, &[(KEY, "conv-pd")]).await.unwrap());
+    for _ in 0..3 {
+        let rank = send(&app, &decode, &[(KEY, "conv-pd")]).await;
+        assert_eq!(rank.as_deref(), Some("1"));
     }
-    assert!(!ranks.contains(&"2".to_string()), "{ranks:?}");
-    assert!(ranks.contains(&"1".to_string()), "{ranks:?}");
-    // The pick follows the feed: rank 1 is now the heaviest.
+    // The pick follows the feed.
     publish(1, 950);
-    let mut ranks = Vec::new();
-    for _ in 0..32 {
-        ranks.push(send(&app, &decode, &[(KEY, "conv-pd")]).await.unwrap());
-    }
-    assert!(!ranks.contains(&"1".to_string()), "{ranks:?}");
-    assert!(ranks.contains(&"3".to_string()), "{ranks:?}");
+    let rank = send(&app, &decode, &[(KEY, "conv-pd")]).await;
+    assert_eq!(rank.as_deref(), Some("3"));
     // Without a reading the policy still places the request.
     load.forget_worker(&decode.url);
     assert!(send(&app, &decode, &[(KEY, "conv-pd")]).await.is_some());
 }
 
-/// Between two engine reports, requests still in flight on a rank count as
-/// its mean KV per request, so a burst spreads instead of herding the rank
-/// that was lightest at the last report. Two decode ranks, so the two
-/// candidates compare directly and the projection alone decides.
+/// Every request a rank holds, and every one this router sent it since the
+/// engine's reading, counts as the worker's mean KV per request, so a rank
+/// with few tokens but many young requests is not the lightest, and a burst
+/// between two reports spreads instead of herding.
 #[tokio::test]
 async fn least_tokens_charges_in_flight_requests_to_their_rank() {
     let (prefill, decode) = (
@@ -405,8 +397,9 @@ async fn least_tokens_charges_in_flight_requests_to_their_rank() {
     cfg.model.dp_rank_policy = DpRankPolicy::LeastTokens;
     let load = EngineReportedLoadTable::new();
     let app = router_with_load(cfg, &workers, Default::default(), Arc::clone(&load));
-    // Mean KV per request over the worker: 500 / 5 = 100.
-    for (rank, num_tokens, num_reqs) in [(0, 400, 4), (1, 100, 1)] {
+    // Mean KV per request over the worker: 500 / 3 = 166. Rank 0 is expected
+    // to hold 400 + 2 * 166 = 732, rank 1 100 + 166 = 266.
+    for (rank, num_tokens, num_reqs) in [(0, 400, 2), (1, 100, 1)] {
         let stat = LoadStat {
             num_running_reqs: num_reqs,
             num_waiting_reqs: 0,
@@ -442,8 +435,8 @@ async fn least_tokens_charges_in_flight_requests_to_their_rank() {
         };
         ranks.push(rank);
     }
-    // Rank 1 at 100, then 200, 300 and 400 as each request is charged; at
-    // 400 it ties rank 0, whose router in-flight count is lower.
+    // Rank 1 at 266, then 432, 598 and 764 as each request is charged; at
+    // 764 it passes rank 0's 732.
     assert_eq!(ranks, ["1", "1", "1", "0"]);
     for task in in_flight {
         task.abort();

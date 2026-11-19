@@ -169,10 +169,11 @@ pub enum DpRankPolicy {
     /// The worker's ranks in turn.
     #[value(name = "round_robin")]
     RoundRobin,
-    /// Of two ranks drawn at random, the one with fewer engine-reported KV
-    /// tokens, in use plus queued, from the engine's `--load-publish-endpoint`
-    /// feed; two candidates compare directly. Ties, and a worker without a
-    /// fresh reading for every rank, fall back to `least_in_flight`.
+    /// The rank expected to hold the fewest KV tokens by the engine's
+    /// `--load-publish-endpoint` feed: tokens in use plus queued, with every
+    /// request the rank holds charged the worker's mean KV per request. Ties,
+    /// and a worker without a fresh reading for every rank, fall back to
+    /// `least_in_flight`.
     #[value(name = "least_tokens")]
     LeastTokens,
 }
