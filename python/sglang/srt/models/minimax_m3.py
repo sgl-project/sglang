@@ -551,14 +551,13 @@ class MiniMaxM3MoE(nn.Module):
                 "M3.1 NVFP4 MegaMoE weights are not ready on this device"
             )
         num_tokens = hidden_states.shape[0]
-        # Overlap with the router and MegaMoE only in a whole-graph capture,
-        # since a breakable-graph break would split the fork from its join.
+        # Overlap with the router and MegaMoE in any capture. Breakable capture
+        # joins forked streams before each segment ends, so a break stays correct.
         fork_shared = (
             self.alt_stream is not None
             and self.shared_experts is not None
             and num_tokens > 0
             and get_is_capture_mode()
-            and not is_in_breakable_cuda_graph()
         )
         if fork_shared:
             self.alt_stream.wait_stream(torch.cuda.current_stream())
