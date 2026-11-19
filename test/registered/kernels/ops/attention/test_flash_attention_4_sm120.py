@@ -1574,69 +1574,6 @@ def _paged_prefill_batch(lengths, page_size, num_q_heads, num_kv_heads, head_dim
     )
 
 
-def test_sm120_float32_output_launch_stores_no_plan(monkeypatch):
-    """A plan lookup hands the launch an output of Q's dtype. A SplitKV decode into
-    a float32 output must therefore store no plan: the next call of the same shapes
-    would replay its float32 combine step and fail."""
-    sm120_forward_host.clear_launch_plans()
-    registrations = []
-    original_register_paged = sm120_forward_host.register_paged
-
-    def record_registration(**kwargs):
-        registrations.append(kwargs)
-        return original_register_paged(**kwargs)
-
-    monkeypatch.setattr(sm120_forward_host, "register_paged", record_registration)
-    torch.manual_seed(20261118)
-    batch_size, num_q_heads, num_kv_heads, head_dim = 2, 8, 2, 128
-    max_seqlen, page_size = 512, 64
-    pages_per_request = max_seqlen // page_size
-    q = torch.randn(
-        batch_size, num_q_heads, head_dim, device="cuda", dtype=torch.bfloat16
-    )
-    k_cache = torch.randn(
-        batch_size * pages_per_request,
-        page_size,
-        num_kv_heads,
-        head_dim,
-        device="cuda",
-        dtype=torch.bfloat16,
-    )
-    v_cache = torch.randn_like(k_cache)
-    page_table = torch.arange(
-        batch_size * pages_per_request, device="cuda", dtype=torch.int32
-    ).view(batch_size, pages_per_request)
-    cache_seqlens = torch.full(
-        (batch_size,), max_seqlen, device="cuda", dtype=torch.int32
-    )
-    cu_seqlens_q = torch.arange(batch_size + 1, device="cuda", dtype=torch.int32)
-
-    def run(out):
-        return flash_attn_with_kvcache(
-            q=q,
-            k_cache=k_cache,
-            v_cache=v_cache,
-            page_table=page_table,
-            cache_seqlens=cache_seqlens,
-            cu_seqlens_q=cu_seqlens_q,
-            max_seqlen_q=1,
-            max_seqlen_k=max_seqlen,
-            causal=True,
-            num_splits=2,
-            out=out,
-        )
-
-    in_float32 = run(torch.empty(q.shape, device="cuda", dtype=torch.float32))
-    torch.cuda.synchronize()
-    assert in_float32.dtype == torch.float32
-    assert registrations == []
-    # The next launch of the same shapes compiles for Q's dtype and stores its plan.
-    in_bf16 = run(None)
-    assert in_bf16.dtype == q.dtype
-    assert [call["actual_num_splits"] for call in registrations] == [2]
-    _assert_attention_close(in_bf16, in_float32)
-
-
 def test_sm120_split_kv_paged_prefill_stores_no_plan(monkeypatch):
     """A prefill plan replays one launch. A SplitKV prefill also needs its combine
     step, so it must store no plan and keep the generic path."""

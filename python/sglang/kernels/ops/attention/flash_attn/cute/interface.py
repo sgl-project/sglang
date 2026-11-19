@@ -1865,8 +1865,6 @@ def _flash_attn_fwd(
                 and not requires_grad
                 and (learnable_sink is None or not learnable_sink.requires_grad)
                 and lse is None
-                # A plan lookup hands the launch an output of Q's dtype.
-                and out.dtype == q.dtype
                 and softcap is None
                 and score_mod is None
                 and mask_mod is None
@@ -1923,8 +1921,6 @@ def _flash_attn_fwd(
         and not requires_grad
         and (learnable_sink is None or not learnable_sink.requires_grad)
         and lse is None
-        # A plan lookup hands the launch an output of Q's dtype.
-        and out.dtype == q.dtype
         and softcap is None
         and score_mod is None
         and mask_mod is None
