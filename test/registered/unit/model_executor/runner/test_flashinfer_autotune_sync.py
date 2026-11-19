@@ -68,6 +68,32 @@ class TestAutotuneTacticSyncGroup(CustomTestCase):
         tp_group = SimpleNamespace(world_size=1, cpu_group=object())
         self.assertIsNone(_autotune_tactic_sync_group(tp_group))
 
+    def test_draft_tunes_over_the_group_recorded_at_its_scope(self):
+        # attn_dp=2 x attn_tp=2: a draft's TP scope narrows the TP group to one
+        # attention-DP group, but the drafts of both groups run the same dummy
+        # forwards, so the autotune gets the stage group recorded at the scope's
+        # entry. Outside such a scope it falls back to the TP group as before.
+        stage, narrowed = SimpleNamespace(world_size=4), SimpleNamespace(world_size=2)
+        for scope, recorded in (
+            (autotune.draft_autotune_sync_scope(stage), stage),
+            (nullcontext(), None),
+        ):
+            draft = SimpleNamespace(
+                spec_algorithm=SimpleNamespace(is_speculative=lambda: True),
+                is_draft_worker=True,
+            )
+            with (
+                self.subTest(in_draft_scope=recorded is not None),
+                scope,
+                get_parallel().override(tp_group=narrowed),
+                patch.object(autotune, "should_run_flashinfer_autotune"),
+                patch.object(autotune, "flashinfer_autotune_context") as context,
+            ):
+                autotune.maybe_flashinfer_autotune_speculative_draft(
+                    SimpleNamespace(model_runner=draft), Mock()
+                )
+            self.assertIs(context.call_args.kwargs["tp_group"], recorded)
+
 
 class TestMegaMoEAutotuneStartup(CustomTestCase):
     def test_context_bridges_profile_limits(self):
