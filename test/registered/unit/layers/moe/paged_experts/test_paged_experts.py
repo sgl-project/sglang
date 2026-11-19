@@ -2576,6 +2576,8 @@ class TestDiskTierGuards(CustomTestCase):
                 10  # tiered (10 < E = 16), with more host rows than the kernel cap
             )
             self.assertTrue(method.tiered)
+            self.assertEqual(disk_tier.max_slots(10), 6)
+            self.assertEqual(disk_tier.max_slots(4), 4)
             self.assertEqual(method.max_resident, 6)
             self.assertEqual(
                 sizing.ExpertSlotSizing._grow(
