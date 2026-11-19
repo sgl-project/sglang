@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import bisect
 import functools
+from collections.abc import Callable
 from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
@@ -38,6 +39,8 @@ _MAX_TABULATED_ROWS = 4096
 # Rows chosen one by one; past it, tiers end at powers of two and their 1.5x, since the
 # choice there moves by a few percent at most.
 _EXACT_ROWS = 64
+# The sample kernel runs 256 threads per CTA
+_SAMPLE_THREADS = 256
 _MAX_SUPPORTED_VOCAB_SIZE = _MAX_CLUSTER * max(_THREADS_OPTIONS) * _MAX_ELEMS_PER_THREAD
 
 
@@ -73,9 +76,27 @@ def _jit_softmax_module(
     )
 
 
+@cache_once
+def _jit_softmax_sample_module(
+    threads: int, vecs_per_thread: int, pre_vecs: int, cluster_size: int
+) -> Module:
+    args = make_cpp_args(
+        is_arch_support_pdl(), threads, vecs_per_thread, pre_vecs, cluster_size
+    )
+    return load_jit(
+        "sampling_softmax_sample",
+        *args,
+        cuda_files=["sampling/softmax_sample.cuh"],
+        cuda_wrappers=[
+            ("softmax_sample", f"SoftmaxSampleKernel<{args}>::run"),
+            ("occupancy", f"SoftmaxSampleKernel<{args}>::occupancy"),
+        ],
+    )
+
+
 def _vec_size() -> int:
     # fp32 elements per vector; mirrors `kMaxVecBytes`
-    return current_arch().cuda.max_vec_bytes // 4
+    return current_arch().max_vec_bytes // 4
 
 
 _INPUT_DTYPES = (torch.float32, torch.bfloat16, torch.float16)
@@ -116,13 +137,20 @@ def _cluster_capacity(cluster_size: int, blocks_per_sm: int) -> int:
         return 0
 
 
-def _candidates(vocab_size: int) -> list[_Config]:
+def can_softmax_sample(vocab_size: int) -> bool:
+    max_vocab_size = _MAX_CLUSTER * _SAMPLE_THREADS * _MAX_ELEMS_PER_THREAD
+    return 0 < vocab_size <= max_vocab_size and vocab_size % _vec_size() == 0
+
+
+def _candidates(vocab_size: int, threads_options: tuple[int, ...]) -> list[_Config]:
     """Every (threads, cluster size) whose CTAs hold the row in registers with no idle thread."""
-    max_cluster = _MAX_CLUSTER if current_arch().cuda.supports_cluster else 1
+    cuda = current_arch().cuda
+    assert cuda is not None, "only support CUDA implementation for now"
+    max_cluster = _MAX_CLUSTER if cuda.supports_cluster else 1
     num_vecs = vocab_size // _vec_size()
     max_vecs_per_thread = _MAX_ELEMS_PER_THREAD // _vec_size()
     configs = []
-    for threads in _THREADS_OPTIONS:
+    for threads in threads_options:
         for cluster in range(1, max_cluster + 1):
             vecs_per_thread = -(-num_vecs // (cluster * threads))
             if vecs_per_thread > max_vecs_per_thread:
@@ -213,20 +241,24 @@ class _SoftmaxModuleDispatch:
         return self._entries[index]
 
 
-@cache_once
-def _precompile(dtype: torch.dtype, vocab_size: int) -> _SoftmaxModuleDispatch:
-    if dtype not in _INPUT_DTYPES:
-        raise ValueError(f"softmax: logits must be one of {_INPUT_DTYPES}, got {dtype}")
+def _build_dispatch(
+    vocab_size: int,
+    input_bytes: int,
+    threads_options: tuple[int, ...],
+    module_key: Callable[[_Config], tuple[int, ...]],
+    build: Callable[..., Module],
+    *extra_args,
+) -> _SoftmaxModuleDispatch:
+    """Compiles every candidate config with ``build(*module_key(config), *extra_args)`` and
+    tabulates the `_select_config` choice per row count."""
     # Build every candidate: the cost needs the occupancy its registers actually reach
-    candidates = _candidates(vocab_size)
-    keys = list(dict.fromkeys(_module_key(c) for c in candidates))
-    mods = parallel_compile(
-        functools.partial(_jit_softmax_module, *k, dtype) for k in keys
-    )
+    candidates = _candidates(vocab_size, threads_options)
+    keys = list(dict.fromkeys(module_key(c) for c in candidates))
+    mods = parallel_compile(functools.partial(build, *k, *extra_args) for k in keys)
     built = dict(zip(keys, mods))
     occupancy = {}
     for c in candidates:
-        occupancy[c] = built[_module_key(c)].occupancy()
+        occupancy[c] = built[module_key(c)].occupancy()
         if c.cluster_size > 1:
             occupancy[c] = min(occupancy[c], _MAX_CLUSTER_CTAS_PER_SM)
     # Tabulate the choice per row count into (last row of a run, config) tiers
@@ -235,15 +267,55 @@ def _precompile(dtype: torch.dtype, vocab_size: int) -> _SoftmaxModuleDispatch:
     first = 1
     for last in _tier_bounds():
         rows = range(first, last + 1)
-        config = _select_config(rows, candidates, dtype.itemsize, occupancy)
+        config = _select_config(rows, candidates, input_bytes, occupancy)
         first = last + 1
         if configs and configs[-1] == config:
             max_rows[-1] = last
         else:
             max_rows.append(last)
             configs.append(config)
-    mods = [built[_module_key(c)] for c in configs]
+    mods = [built[module_key(c)] for c in configs]
     return _SoftmaxModuleDispatch(max_rows, configs, mods)
+
+
+@cache_once
+def _precompile(dtype: torch.dtype, vocab_size: int) -> _SoftmaxModuleDispatch:
+    if dtype not in _INPUT_DTYPES:
+        raise ValueError(f"softmax: logits must be one of {_INPUT_DTYPES}, got {dtype}")
+    return _build_dispatch(
+        vocab_size,
+        dtype.itemsize,
+        _THREADS_OPTIONS,
+        _module_key,
+        _jit_softmax_module,
+        dtype,
+    )
+
+
+@cache_once
+def _precompile_sample(vocab_size: int) -> _SoftmaxModuleDispatch:
+    return _build_dispatch(
+        vocab_size,
+        4,
+        (_SAMPLE_THREADS,),
+        _sample_module_key,
+        _jit_softmax_sample_module,
+    )
+
+
+def _sample_pre_vecs(vecs_per_thread: int) -> int:
+    """Vectors per thread whose E the sample kernel draws while its loads are in flight.
+
+    As many as fit 13 vectors of logits plus E in 128 registers, at most 4, leaving at least one
+    vector drawn in the main loop. Measured on B300 (vocab 128256-248320, 1-128 rows): within
+    about 4 % of the best count in every cell, up to 30 % faster than 2 at 4-8 rows.
+    """
+    return max(0, min(4, vecs_per_thread - 1, 13 - vecs_per_thread))
+
+
+def _sample_module_key(config: _Config) -> tuple[int, int, int, int]:
+    pre_vecs = _sample_pre_vecs(config.vecs_per_thread)
+    return config.threads, config.vecs_per_thread, pre_vecs, config.cluster_size
 
 
 def _module_key(config: _Config) -> tuple[int, int, int]:
@@ -273,3 +345,50 @@ def softmax(
         temperatures = temperatures.view(-1)
     module.softmax(logits, out, temperatures, rows_per_request, cluster_size)
     return out
+
+
+def softmax_sample(
+    logits: torch.Tensor,
+    temperatures: Optional[torch.Tensor],
+    *,
+    top_ks: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused draft proposal over fp32 ``[rows, vocab]`` logits, one token per row.
+
+    Returns ``(probs, topk_p, topk_index)``. ``probs = softmax(logits / T)`` in fp32 (written
+    into ``out`` if given; equal to `softmax` up to fp32 rounding, not bitwise).
+    ``topk_index`` (int64 ``[rows, 1]``) is the lowest argmax of the raw logits for a row with
+    ``top_ks[row] <= 1``, else a draw from ``probs[row]``; ``topk_p`` (fp32 ``[rows, 1]``) is
+    ``probs[row, topk_index]``. ``temperatures`` holds one positive value per row, ``top_ks``
+    one int32 per row.
+
+    The draw is an exponential race (argmax of p / E, E ~ Exp(1) per element) on Philox numbers
+    from the device's default CUDA generator, which advances by 4 per call as torch's own
+    samplers do: ``torch.manual_seed`` reproduces it, and a captured CUDA graph draws afresh
+    on every replay.
+    """
+    num_rows, vocab_size = logits.shape
+    if out is None:
+        out = torch.empty_like(logits, dtype=torch.float32)
+    topk_p = logits.new_empty(num_rows, 1, dtype=torch.float32)
+    topk_index = logits.new_empty((num_rows, 1), dtype=torch.int64)
+    # The sample modules are built for one cluster size each
+    _, module = _precompile_sample(vocab_size)(num_rows)
+    if temperatures is not None:
+        temperatures = temperatures.view(-1)
+    generator = torch.cuda.default_generators[logits.device.index]
+    # One Philox counter per group of 4 elements, as curand_uniform4
+    seed, offset, intragraph = generator.philox_state(4)
+    module.softmax_sample(
+        logits,
+        out,
+        temperatures,
+        top_ks.view(-1),
+        seed,
+        offset,
+        intragraph,
+        topk_p,
+        topk_index,
+    )
+    return out, topk_p, topk_index

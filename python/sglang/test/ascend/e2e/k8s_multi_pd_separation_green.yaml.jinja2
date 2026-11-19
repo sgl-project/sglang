@@ -58,6 +58,12 @@ spec:
           value: "{{ run_label }}"
         - name: SGLANG_IS_IN_CI
           value: "{{ sglang_is_in_ci }}"
+        - name: SGLANG_USE_IMAGE
+          value: "{{ use_image_sglang }}"
+        - name: SGLANG_NPU_CONTAINER_PATCHES
+          value: "{{ container_patches }}"
+        - name: NPU_TEST_METHOD
+          value: "{{ test_method }}"
         command: ["/bin/bash", "-c"]
         args:
           - |
@@ -168,6 +174,12 @@ spec:
           value: "{{ run_label }}"
         - name: SGLANG_IS_IN_CI
           value: "{{ sglang_is_in_ci }}"
+        - name: SGLANG_USE_IMAGE
+          value: "{{ use_image_sglang }}"
+        - name: SGLANG_NPU_CONTAINER_PATCHES
+          value: "{{ container_patches }}"
+        - name: NPU_TEST_METHOD
+          value: "{{ test_method }}"
         command: ["/bin/bash", "-c"]
         args:
           - |
@@ -229,11 +241,11 @@ spec:
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: {{ kube_job_name }}-sglang-router
+  name: {{ kube_job_name }}-sgl-router
   namespace: {{ name_space }}
 spec:
   replicas: {{ router_size }}
-  serviceName: {{ kube_job_name }}-sglang-router-headless
+  serviceName: {{ kube_job_name }}-sgl-router-headless
   selector:
     matchLabels:
       app: sgl-ascend
@@ -277,6 +289,12 @@ spec:
           value: "{{ run_label }}"
         - name: SGLANG_IS_IN_CI
           value: "{{ sglang_is_in_ci }}"
+        - name: SGLANG_USE_IMAGE
+          value: "{{ use_image_sglang }}"
+        - name: SGLANG_NPU_CONTAINER_PATCHES
+          value: "{{ container_patches }}"
+        - name: NPU_TEST_METHOD
+          value: "{{ test_method }}"
         command: ["/bin/bash", "-c"]
         args:
           - |
@@ -322,7 +340,7 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ kube_job_name }}-sglang-router-headless
+  name: {{ kube_job_name }}-sgl-router-headless
   namespace: {{ name_space }}
 spec:
   clusterIP: None
