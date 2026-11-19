@@ -26,10 +26,10 @@ differently (Metaspace), split_special_tokens, and truncation or padding left
 enabled on the backend.
 
 ``encode_prompt_segments`` serves renderers that hand over the prompt as
-segments with their special tokens on their own. Those are the cut points, so
-the prompt is not scanned and no length threshold applies, and the ids of the
-text between them are cached per tokenizer: text that recurs across requests,
-like the system prompt, the tool list and earlier turns, is encoded once.
+segments with their special tokens on their own. The ids of the text between
+them are cached per tokenizer, so recurring text is encoded once. Long runs
+with verified pre-token boundaries are split using a fixed character target
+so an edit near the end of a run can still reuse the preceding chunks.
 
 Gated by SGLANG_PARALLEL_PROMPT_ENCODE and SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS.
 """
@@ -56,6 +56,7 @@ _MAX_CHUNKS = 64
 # Per tokenizer; a text longer than the entry limit is encoded but not kept.
 _SEGMENT_CACHE_MAX_TOKENS = 1 << 20
 _SEGMENT_CACHE_MAX_ENTRY_TOKENS = _SEGMENT_CACHE_MAX_TOKENS // 8
+_SEGMENT_CACHE_CHUNK_CHARS = 8192
 
 # Pre-tokenizers that act on each piece independently of its position in the
 # sequence. Metaspace (prepend_scheme="first") and anything unknown are not.
@@ -234,11 +235,20 @@ def _added_spans(text, pattern, npattern):
     return spans
 
 
-def split_prompt(text, pattern, npattern, intra=None, max_chunks=_MAX_CHUNKS):
-    """Split text into at most ~max_chunks pieces at added-token ends and, if
-    intra is given, at its matches strictly inside the gaps between them."""
+def split_prompt(
+    text, pattern, npattern, intra=None, max_chunks=_MAX_CHUNKS, *, target_chars=None
+):
+    """Cut at added-token ends and at intra matches between them.
+
+    By default, aim for at most max_chunks pieces. An explicit target_chars
+    sets a fixed target so the cut locations do not depend on the full length.
+    """
     n = len(text)
-    target = max(_MIN_CHUNK_CHARS, -(-n // max_chunks))
+    target = (
+        max(_MIN_CHUNK_CHARS, -(-n // max_chunks))
+        if target_chars is None
+        else target_chars
+    )
     chunks, start, pos = [], 0, 0
     for s, e in _added_spans(text, pattern, npattern) + [(n, n)]:
         # Gap [pos, s): both characters around an intra cut must lie in it.
@@ -346,21 +356,40 @@ class _SegmentEncoder:
             cuts = self.cuts[segment] = _cuts_at(segment, self.added_tokens)
         return token_id if cuts else None
 
+    def _append_text(self, layout, run, min_chars):
+        text = "".join(run)
+        if self.intra is not None and len(text) >= min_chars:
+            layout.extend(
+                split_prompt(
+                    text,
+                    self.pattern,
+                    self.npattern,
+                    self.intra,
+                    target_chars=_SEGMENT_CACHE_CHUNK_CHARS,
+                )
+            )
+        else:
+            layout.append(text)
+
     def encode(self, segments):
+        min_chars = max(
+            _SEGMENT_CACHE_CHUNK_CHARS,
+            envs.SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS.get(),
+        )
         layout, run = [], []
         for segment in segments:
             if len(segment) <= self.max_cut_len:
                 token_id = self.cut_id(segment)
                 if token_id is not None:
                     if run:
-                        layout.append("".join(run))
+                        self._append_text(layout, run, min_chars)
                         run = []
                     layout.append(token_id)
                     continue
             if segment:
                 run.append(segment)
         if run:
-            layout.append("".join(run))
+            self._append_text(layout, run, min_chars)
 
         texts = [item for item in layout if isinstance(item, str)]
         known = {}

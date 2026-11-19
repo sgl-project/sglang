@@ -659,15 +659,25 @@ class TestPromptSegments(_EncodeCase):
             [["hello world"], ["fresh text"]],
         )
 
-    def test_long_text_between_cut_points_is_split(self):
-        self._set_min_chars(4096)
-        long_text = "the quick brown fox jumps over the lazy dog\n" * 300
-        segments = ["<|user|>", long_text, "<|assistant|>", "<think>"]
+    def test_long_text_reuses_unchanged_chunks_after_a_suffix_edit(self):
+        self._set_min_chars(32768)
+        shared = "".join(f"record {i} says hello world\n" for i in range(2500))
+        before = ["<|user|>", shared + "first question", "<|assistant|>"]
+        after = ["<|user|>", shared + "a different question", "<|assistant|>"]
         with unittest.mock.patch.object(
-            ppe, "split_prompt", wraps=ppe.split_prompt
-        ) as split:
-            self._assert_segments_match_encode(self.tokenizer, segments, ({},))
-        self.assertEqual([call.args[0] for call in split.call_args_list], [long_text])
+            ppe._SegmentEncoder,
+            "_encode",
+            autospec=True,
+            side_effect=ppe._SegmentEncoder._encode,
+        ) as encode:
+            self._assert_segments_match_encode(self.tokenizer, before, ({},))
+            self._assert_segments_match_encode(self.tokenizer, after, ({},))
+
+        cold_chunks, changed_chunks = [call.args[1] for call in encode.call_args_list]
+        self.assertGreater(len(cold_chunks), 2)
+        self.assertEqual(len(changed_chunks), 1)
+        self.assertTrue(changed_chunks[0].endswith("a different question"))
+        self.assertLess(len(changed_chunks[0]), len(shared) // 2)
 
     def test_a_token_another_added_token_can_overlap_is_not_a_cut_point(self):
         tokenizer = _tokenizer(
