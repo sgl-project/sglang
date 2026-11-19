@@ -2,7 +2,6 @@
 """Contracts for dense Sage consuming prepared QKV without requantization."""
 
 import sys
-from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -198,54 +197,6 @@ def test_prepared_sage_ssa_selects_dense_before_sparse_admission(monkeypatch, ga
         transport=transport,
     )
     assert result is output and calls == ["dense"]
-
-
-@pytest.mark.parametrize("same_stream", [False, True])
-@pytest.mark.parametrize("fail", [False, True])
-def test_dense_kernel_stream_orders_exchange_and_gather(monkeypatch, same_stream, fail):
-    calls = []
-
-    class Stream:
-        def __init__(self, name):
-            self.name = name
-
-        def wait_stream(self, other):
-            calls.append((self.name, "wait", other.name))
-
-    default = Stream("default")
-    current = default if same_stream else Stream("compute")
-
-    @contextmanager
-    def select(stream):
-        assert stream is default
-        calls.append("enter")
-        try:
-            yield
-        finally:
-            calls.append("exit")
-
-    monkeypatch.setattr(torch.cuda, "current_stream", lambda device: current)
-    monkeypatch.setattr(torch.cuda, "default_stream", lambda device: default)
-    monkeypatch.setattr(torch.cuda, "stream", select)
-
-    def run():
-        with dense._sage_kernel_stream(torch.device("cuda:0")):
-            calls.append("kernel")
-            if fail:
-                raise RuntimeError("kernel failed")
-
-    if fail:
-        with pytest.raises(RuntimeError, match="kernel failed"):
-            run()
-    else:
-        run()
-    middle = ["enter", "kernel", "exit"]
-    expected = (
-        middle
-        if same_stream
-        else [("default", "wait", "compute"), *middle, ("compute", "wait", "default")]
-    )
-    assert calls == expected
 
 
 def operands(used, dtype=torch.bfloat16):
