@@ -39,7 +39,15 @@ Enable it with `SGLANG_EXPERIMENTAL_GDN_BRANCH_AND_TAIL=1`. It defaults to
 disabled. The first supported configuration uses the
 `Qwen3_5ForConditionalGeneration` architecture, CUDA Triton GDN, BF16 recurrent
 state, `extra_buffer`, eager execution, and unified serving. TP1 and TP2 are
-the validation targets.
+both validated.
+
+The registered end-to-end reproduction has been author-run on NVIDIA H20 with
+the public default model `Qwen/Qwen3.5-4B`, pinned at revision
+`851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a`, in both TP1 and TP2. The branch,
+aligned-tail, multi-step Decode and teacher-forced suffix checks passed. Earlier
+Qwen3.6-27B runs also passed; the public 4B run makes the commands below match
+an actually tested, readily obtainable model. This does not expand the backend
+or execution-mode support listed below.
 
 The scheduler chooses at most one extra snapshot per batch, in request order.
 Other candidates use native branch tracking. Each TP rank must have sufficient
