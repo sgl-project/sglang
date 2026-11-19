@@ -65,6 +65,7 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
 )
 from sglang.srt.disaggregation.minimax import minimax_index_transfer_pages
 from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.disaggregation.shm_flag_reduce import init_decode_flag_reducer
 from sglang.srt.disaggregation.utils import (
     KVClassType,
     MetadataBuffers,
@@ -3347,6 +3348,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         # (decode_req, start_time, deadline, metadata_idx, required_acks).
         self._deferred_releases = IndexedReqList(
             ListKind.PD_RELEASING, req_of=lambda x: x[0].req
+        )
+        init_decode_flag_reducer(
+            self.gloo_group, enable_overlap=scheduler.enable_overlap
         )
         # A page move that cannot avoid a row a receive writes waits, on the
         # host, until every rank's receive is done writing it.
