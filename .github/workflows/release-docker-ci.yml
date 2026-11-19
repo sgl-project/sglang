@@ -1,0 +1,133 @@
+name: Build and Push CI Docker Images
+
+# Publishes docker/ci.Dockerfile next to the dev image: lmsysorg/sglang:dev-ci
+# plus a dated nightly-dev-ci-<date>-<sha> tag, for amd64 and arm64.
+# Models are not baked in; runners keep them in a mounted cache volume.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Custom tag suffix, e.g. 'my-test' -> dev-ci-my-test. Empty publishes dev-ci and a nightly tag."
+        required: false
+        default: ""
+      image_repo:
+        description: "Docker Hub repo to push to. Use lmsysorg/sglang-staging for testing."
+        required: false
+        default: "lmsysorg/sglang"
+  schedule:
+    # After the 00:00 UTC dev image, so both track the same day of main.
+    - cron: "0 3 * * *"
+
+concurrency:
+  group: release-docker-ci-${{ inputs.tag || 'nightly' }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_REPO: ${{ inputs.image_repo || 'lmsysorg/sglang' }}
+
+jobs:
+  build:
+    if: github.repository == 'sgl-project/sglang'
+    strategy:
+      matrix:
+        include:
+          - { arch: amd64, runner: x64-docker-build-node }
+          - { arch: arm64, runner: arm-docker-build-node }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Cleanup workspace (remove root-owned files from prior runs)
+        run: sudo rm -rf "$GITHUB_WORKSPACE"/* || true
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Prune Docker to reclaim disk space
+        run: |
+          docker buildx prune --filter "until=72h" -f
+          docker system prune -af --filter "until=72h"
+          docker volume prune -af
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push ${{ matrix.arch }} image
+        run: |
+          set -euo pipefail
+          docker buildx build \
+            --platform linux/${{ matrix.arch }} \
+            --output type=image,name=${IMAGE_REPO},push-by-digest=true,name-canonical=true,push=true \
+            -f docker/ci.Dockerfile \
+            --label org.opencontainers.image.revision="$(git rev-parse HEAD)" \
+            --label org.opencontainers.image.source="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            --metadata-file /tmp/metadata-ci.json \
+            --no-cache \
+            .
+
+          DIGEST=$(python3 -c "import json; print(json.load(open('/tmp/metadata-ci.json'))['containerimage.digest'])")
+          echo "Pushed digest: ${DIGEST}"
+          mkdir -p /tmp/digests
+          printf '%s' "${DIGEST}" > /tmp/digests/${{ matrix.arch }}
+
+      # Matrix legs cannot each set a job output, so the digests travel as artifacts.
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.arch }}
+          path: /tmp/digests/${{ matrix.arch }}
+          retention-days: 1
+
+  create-manifest:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          pattern: digest-*
+          path: /tmp/digests
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Create multi-arch manifest
+        env:
+          TAG_SUFFIX: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          AMD64_DIGEST="$(cat /tmp/digests/amd64)"
+          ARM64_DIGEST="$(cat /tmp/digests/arm64)"
+          if [ -n "${TAG_SUFFIX}" ]; then
+            TAG_ARGS="-t ${IMAGE_REPO}:dev-ci-${TAG_SUFFIX}"
+          else
+            TAG_ARGS="-t ${IMAGE_REPO}:dev-ci -t ${IMAGE_REPO}:nightly-dev-ci-$(date +%Y%m%d)-${GITHUB_SHA:0:8}"
+          fi
+          docker buildx imagetools create ${TAG_ARGS} \
+            "${IMAGE_REPO}@${AMD64_DIGEST}" \
+            "${IMAGE_REPO}@${ARM64_DIGEST}"
+          echo "Published:${TAG_ARGS}"
+
+  cleanup-nightly:
+    needs: create-manifest
+    if: ${{ !inputs.tag }}
+    uses: ./.github/workflows/_docker-cleanup-nightly.yml
+    with:
+      tag_prefixes: '["nightly-dev-ci"]'
+      image_repo: ${{ inputs.image_repo || 'lmsysorg/sglang' }}
+    secrets: inherit
