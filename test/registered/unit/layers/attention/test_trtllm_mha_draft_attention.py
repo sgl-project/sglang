@@ -10,6 +10,7 @@ CPU-only.
     python -m pytest test/registered/unit/layers/attention/test_trtllm_mha_draft_attention.py -v
 """
 
+import contextlib
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -17,13 +18,21 @@ from unittest.mock import patch
 import torch
 
 from sglang.kernels.plugin_kernels.nvidia.spec import DraftAttentionView
+from sglang.srt.environ import envs
+from sglang.srt.kernel_plugins.nvidia import binding, speculative_runtime
 from sglang.srt.layers.attention import trtllm_mha_backend
+from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+    HybridLinearAttnBackend,
+)
 from sglang.srt.layers.attention.trtllm_mha_backend import (
     TRTLLMHAAttnBackend,
     TRTLLMMHAMetadata,
 )
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.speculative.eagle_worker_common import offer_draft_attention
+from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
+from sglang.srt.speculative.frozen_kv_mtp_worker_v2 import FrozenKVMTPDraftWorker
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -263,6 +272,184 @@ class TestDraftAttentionSeam(CustomTestCase):
                         k, v, _layer(), _batch(mode), True, None, decode=False
                     )
                 self.assertEqual(got, q_len)
+
+
+CHILD = "SGLANG_OPT_TRTLLM_MHA_DRAFT_PROVIDER_ATTENTION"
+UNSET = object()
+
+
+def _switches(*, master, child=UNSET):
+    stack = contextlib.ExitStack()
+    stack.enter_context(
+        envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(master)
+    )
+    field = envs.SGLANG_OPT_TRTLLM_MHA_DRAFT_PROVIDER_ATTENTION
+    if child is UNSET:
+        stack.enter_context(field.override(None))
+        field.clear()
+    else:
+        stack.enter_context(field.override(child))
+    return stack
+
+
+def _eagle_draft(**fields):
+    worker = object.__new__(EagleDraftWorker)
+    worker.__dict__.update(fields)
+    return worker
+
+
+def _worker(*backends):
+    """An EAGLE draft worker whose draft extend runs on its last backend."""
+    *steps, extend = backends
+    return _eagle_draft(
+        draft_attn_backend=SimpleNamespace(attn_backends=tuple(steps))
+        if steps
+        else None,
+        draft_extend_attn_backend=extend,
+        draft_runner=SimpleNamespace(attn_backend=None),
+    )
+
+
+def _hybrid(full):
+    backend = HybridLinearAttnBackend.__new__(HybridLinearAttnBackend)
+    backend.full_attn_backend = full
+    return backend
+
+
+class TestDraftProviderAttentionChild(CustomTestCase):
+    """SGLANG_OPT_TRTLLM_MHA_DRAFT_PROVIDER_ATTENTION hands a provider's draft
+    attention to the draft worker's TRT-LLM MHA backends at worker init."""
+
+    def test_child_on_with_the_master_off_offers_nothing(self):
+        """A provider's hooks are bound only under the master, so the stock hooks
+        carry no draft attention and the child alone changes nothing."""
+        defaults = speculative_runtime.default_speculative_runtime_hooks()
+        self.assertIsNone(defaults.draft_attention)
+        with _switches(master=False, child="1"):
+            hooks = binding.bind_speculative_runtime_hooks(object(), defaults)
+            backend = _backend()
+            self.assertIs(hooks, defaults)
+            self.assertEqual(
+                offer_draft_attention(hooks, draft_worker=_worker(backend)), 0
+            )
+        self.assertIsNone(backend._draft_attention)
+
+    def test_only_draft_trtllm_mha_backends_on_an_fp8_cache_take_it(self):
+        """The child cannot bypass the backend's capability check: a target or
+        BF16-cache backend refuses, other backends are left alone."""
+        attention = lambda view: None
+        takers = (_backend(), _hybrid(_backend()))
+        refusers = (
+            _backend(draft=False),
+            _backend(kv_dtype=torch.bfloat16),
+            _hybrid(_backend(draft=False)),
+        )
+        other = SimpleNamespace(set_draft_attention=lambda attention: 1 / 0)
+        with _switches(master=True):
+            taken = offer_draft_attention(
+                SimpleNamespace(draft_attention=attention),
+                draft_worker=_worker(*takers, *refusers, other),
+            )
+        self.assertEqual(taken, 2)
+        self.assertIs(takers[0]._draft_attention, attention)
+        self.assertIs(takers[1].full_attn_backend._draft_attention, attention)
+        for backend in refusers:
+            if isinstance(backend, HybridLinearAttnBackend):
+                backend = backend.full_attn_backend
+            self.assertIsNone(backend._draft_attention)
+
+    def test_a_draft_worker_other_than_eagle_s_declines(self):
+        """A frozen-KV MTP draft worker at top-k 1 holds its runner's plain backend,
+        not a multi-step one: its backends are not offered, and init goes on."""
+        backend = _backend()
+        frozen = object.__new__(FrozenKVMTPDraftWorker)
+        frozen.__dict__.update(
+            draft_attn_backend=backend,
+            draft_extend_attn_backend=None,
+            model_runner=SimpleNamespace(attn_backend=backend),
+        )
+        with (
+            _switches(master=True),
+            self.assertLogs(
+                "sglang.srt.speculative.eagle_worker_common", level="INFO"
+            ) as logs,
+        ):
+            taken = offer_draft_attention(
+                SimpleNamespace(draft_attention=lambda view: None),
+                draft_worker=frozen,
+            )
+        self.assertEqual(taken, 0)
+        self.assertIsNone(backend._draft_attention)
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn(
+            f"{CHILD} declined (FrozenKVMTPDraftWorker is not an EAGLE draft worker)",
+            logs.output[0],
+        )
+
+    def test_an_adaptive_state_offers_its_rebuilt_draft_backends(self):
+        """An adaptive runtime state rebuilds the draft backends; they take the
+        provider's draft attention before the state's draft graphs are captured,
+        without a second INFO line. With the child at 0 they stay stock."""
+        from sglang.srt.speculative import eagle_worker_v2 as eagle
+
+        attention = lambda view: None
+        for child, expected in (("1", attention), ("0", None)):
+            built, at_capture = [], []
+
+            def rebuild():
+                built[:] = [_backend(), _backend()]
+                draft.draft_attn_backend = SimpleNamespace(attn_backends=(built[0],))
+                draft.draft_extend_attn_backend = built[1]
+
+            draft = _eagle_draft(
+                parallel_layout=SimpleNamespace(tp_group=None),
+                init_attention_backend=rebuild,
+                _capture_cuda_graphs=lambda: at_capture.append(
+                    [backend._draft_attention for backend in built]
+                ),
+                draft_attn_backend=None,
+                draft_extend_attn_backend=None,
+                draft_runner=SimpleNamespace(attn_backend=None),
+                cuda_graph_runner=None,
+                cuda_graph_runner_for_draft_extend=None,
+            )
+            worker = object.__new__(eagle.EAGLEWorkerV2)
+            worker.device, worker.gpu_id = "cpu", 0
+            worker._draft_worker = draft
+            worker._speculative_runtime_hooks = SimpleNamespace(
+                draft_attention=attention
+            )
+            worker._override_worker_state = lambda *args, **kwargs: (
+                contextlib.nullcontext()
+            )
+            worker._target_worker = SimpleNamespace(
+                model_runner=SimpleNamespace(
+                    init_new_workspace=False,
+                    _get_attention_backend=lambda **kwargs: object(),
+                )
+            )
+            scope = contextlib.nullcontext()
+            with (
+                self.subTest(child=child),
+                _switches(master=True, child=child),
+                patch.object(eagle, "draft_tp_context", return_value=scope),
+                patch.object(
+                    eagle, "speculative_moe_backend_context", return_value=scope
+                ),
+                patch.object(
+                    eagle, "speculative_moe_a2a_backend_context", return_value=scope
+                ),
+                patch.object(eagle, "get_available_gpu_memory", return_value=0.0),
+                patch.object(eagle, "check_cuda_graph_backend", return_value=True),
+                patch.object(eagle, "log_info_on_rank0"),
+                self.assertNoLogs(
+                    "sglang.srt.speculative.eagle_worker_common", level="INFO"
+                ),
+            ):
+                state = worker.build_adaptive_runtime_state(2, 3)
+            self.assertEqual(at_capture, [[expected, expected]])
+            self.assertIs(state.draft_attn_backend.attn_backends[0], built[0])
+            self.assertIs(state.draft_extend_attn_backend, built[1])
 
 
 if __name__ == "__main__":
