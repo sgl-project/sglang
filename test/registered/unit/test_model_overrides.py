@@ -1319,7 +1319,10 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 decode_attention_backend=None,
                 _model_config=SimpleNamespace(quantization=quantization),
             )
-            with override_platform(is_cuda=True, device_sm=sm):
+            # is_hip must be pinned: override_platform leaves unspecified
+            # predicates at their real values, so on a ROCm host is_hip stays
+            # True and the Inkling2 ROCm gate fires instead of the CUDA path.
+            with override_platform(is_cuda=True, is_hip=False, device_sm=sm):
                 out = _inkling_overrides(args, hf)
             return out.get("moe_a2a_backend", a2a), out.get("disable_attn_tp_gather")
 
