@@ -26,6 +26,64 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
 /// `/generate` frame on a long request outgrows tonic's 4 MiB default.
 const GRPC_MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
 
+/// Ten minutes without a single completed request is longer than any request
+/// this client is meant to measure. Without this guard a run that stops making
+/// progress waits out one request's six-hour timeout and reports nothing.
+const STALL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+/// How often the stall guard compares the completed count.
+const STALL_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Counts how long the run has gone without completing a request: progress
+/// resets the timer, ticks without progress accumulate towards the timeout.
+struct StallWatch {
+    last_completed: u64,
+    stalled_for: Duration,
+    timeout: Duration,
+}
+
+impl StallWatch {
+    fn new(completed: u64, timeout: Duration) -> Self {
+        Self {
+            last_completed: completed,
+            stalled_for: Duration::ZERO,
+            timeout,
+        }
+    }
+
+    /// Feed one tick and report whether the run has stalled.
+    fn observe(&mut self, completed: u64, elapsed: Duration) -> bool {
+        if completed != self.last_completed {
+            self.last_completed = completed;
+            self.stalled_for = Duration::ZERO;
+            return false;
+        }
+        self.stalled_for += elapsed;
+        self.stalled_for >= self.timeout
+    }
+}
+
+/// Abort the run, with the counts it reached, when no request completes for
+/// `STALL_TIMEOUT`. The run owns the runtime, so a stuck request would
+/// otherwise keep it alive until that request's own timeout expires.
+fn spawn_stall_watchdog(completed: Arc<AtomicU64>, total: usize) {
+    tokio::spawn(async move {
+        let done_at_start = completed.load(Ordering::Relaxed);
+        let mut watch = StallWatch::new(done_at_start, STALL_TIMEOUT);
+        loop {
+            tokio::time::sleep(STALL_CHECK_INTERVAL).await;
+            let done = completed.load(Ordering::Relaxed);
+            if watch.observe(done, STALL_CHECK_INTERVAL) {
+                eprintln!(
+                    "sglang-bench: no request completed in {} s ({done} of {total}); aborting",
+                    STALL_TIMEOUT.as_secs()
+                );
+                std::process::exit(2);
+            }
+        }
+    });
+}
+
 /// Run one benchmark to completion and return its result document, the same
 /// object the Python client writes to its `.jsonl`.
 ///
@@ -226,6 +284,7 @@ async fn dispatch(
         .map(|limit| Arc::new(Semaphore::new(limit)));
     let completed = Arc::new(AtomicU64::new(0));
     let progress = progress_bar(args, rows.len(), completed.clone());
+    spawn_stall_watchdog(completed.clone(), rows.len());
 
     let mut rng = StdRng::seed_from_u64(args.seed ^ 0x5eed);
     let mut handles = Vec::with_capacity(rows.len());
@@ -725,5 +784,19 @@ mod tests {
         // SGLANG_IS_IN_CI is not set in this test process.
         assert!(!should_flush_cache(&plain));
         assert!(!should_flush_cache(&vllm));
+    }
+
+    /// The stall guard resets on any progress and fires only after a full
+    /// timeout without one.
+    #[test]
+    fn stall_watch_fires_only_after_the_timeout_without_progress() {
+        let timeout = Duration::from_secs(60);
+        let tick = Duration::from_secs(30);
+        let mut watch = StallWatch::new(0, timeout);
+        assert!(!watch.observe(0, tick));
+        assert!(watch.observe(0, tick), "no progress for the timeout");
+        assert!(!watch.observe(1, tick), "progress resets the timer");
+        assert!(!watch.observe(1, tick));
+        assert!(watch.observe(1, tick));
     }
 }
