@@ -923,6 +923,7 @@ mod tests {
             pending_winners: Vec::new(),
             block_hashes: None,
             media_hashes: None,
+            media_winners: Vec::new(),
         };
         let ctx = SelectionContext::new(&model, None)
             .with_request_tokens(Some(&[1, 2, 3, 4, 5, 6, 7, 8]))
@@ -934,6 +935,54 @@ mod tests {
             .propose(&workers, &ctx)
             .expect("a routable indexer hit must propose a worker");
 
+        assert_eq!(proposal.kind, ProposalKind::CacheAffinity);
+        assert_eq!(proposal.primary.id, hot.id);
+    }
+
+    /// A short image chat: its routing ids fall under the default token floor,
+    /// which counts none of its image KV. A remembered media placement passes
+    /// the floor; the same depth from KV events alone does not.
+    #[test]
+    fn a_remembered_media_placement_passes_the_token_floor() {
+        let model = ModelId("model".into());
+        let hot = worker("hot");
+        let other = worker("other");
+        let workers = vec![Arc::clone(&hot), Arc::clone(&other)];
+        let config = AffinityConfig::default();
+        assert_eq!(config.cache_affinity_min_matched_tokens, Some(1_024));
+        let policy = CacheAwarePolicy::new(config);
+        let signal = |media_winners: Vec<String>| PrefixLookupResult {
+            outcome: sgl_kv_indexer::PrefixOutcome::Matched {
+                matches: vec![sgl_kv_indexer::PrefixMatch {
+                    matched_prefix_blocks: 2,
+                    worker_id: "hot".into(),
+                    address: "http://hot:30000".into(),
+                }],
+                best_prefix_blocks: 2,
+            },
+            query_blocks: 2,
+            pending_winners: Vec::new(),
+            block_hashes: None,
+            media_hashes: None,
+            media_winners,
+        };
+        let confirmed = signal(Vec::new());
+        let ctx = SelectionContext::new(&model, None)
+            .with_request_tokens(Some(&[1, 2, 3, 4]))
+            .with_input_tokens(300)
+            .with_external_prefix(Some(&confirmed));
+        let proposal = policy.propose(&workers, &ctx).expect("a proposal");
+        assert_ne!(
+            proposal.kind,
+            ProposalKind::CacheAffinity,
+            "300 matched tokens are under the floor"
+        );
+        let remembered = signal(vec!["http://hot:30000".into()]);
+        let ctx = SelectionContext::new(&model, None)
+            .with_request_tokens(Some(&[1, 2, 3, 4]))
+            .with_input_tokens(300)
+            .with_external_prefix(Some(&remembered));
+        let proposal = policy.propose(&workers, &ctx).expect("a proposal");
         assert_eq!(proposal.kind, ProposalKind::CacheAffinity);
         assert_eq!(proposal.primary.id, hot.id);
     }
@@ -969,6 +1018,7 @@ mod tests {
             pending_winners: Vec::new(),
             block_hashes: None,
             media_hashes: None,
+            media_winners: Vec::new(),
         };
         let ctx = SelectionContext::new(&model, None)
             .with_input_tokens(8_000)
@@ -1021,6 +1071,7 @@ mod tests {
             pending_winners: Vec::new(),
             block_hashes: None,
             media_hashes: None,
+            media_winners: Vec::new(),
         };
         let ctx = SelectionContext::new(&model, None)
             .with_input_tokens(64_000)
@@ -1080,6 +1131,7 @@ mod tests {
             pending_winners: Vec::new(),
             block_hashes: None,
             media_hashes: None,
+            media_winners: Vec::new(),
         };
         let ctx = SelectionContext::new(&model, None)
             .with_input_tokens(4_000)
@@ -1134,6 +1186,7 @@ mod tests {
             pending_winners: Vec::new(),
             block_hashes: None,
             media_hashes: None,
+            media_winners: Vec::new(),
         };
         let ctx = SelectionContext::new(&model, None)
             .with_input_tokens(80)
@@ -1176,6 +1229,7 @@ mod tests {
             pending_winners: Vec::new(),
             block_hashes: None,
             media_hashes: None,
+            media_winners: Vec::new(),
         };
         let ctx = SelectionContext::new(&model, None)
             .with_input_tokens(80)
@@ -1210,6 +1264,7 @@ mod tests {
             pending_winners: Vec::new(),
             block_hashes: None,
             media_hashes: None,
+            media_winners: Vec::new(),
         };
         let ctx = SelectionContext::new(&model, None)
             .with_input_tokens(4_125)

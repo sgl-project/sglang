@@ -23,6 +23,12 @@ pub struct PrefixLookupResult {
     /// from its conversation key on, when it is a media chat under media
     /// affinity, so routing can record where the chat went.
     pub media_hashes: Option<Arc<[i64]>>,
+    /// Workers whose reported depth is a remembered media placement: deeper
+    /// than every confirmed match, and at least as deep as any other signal
+    /// for that worker. The cache gate's token floor does not apply
+    /// to them: it counts routing tokens, and the image KV and vision encoding
+    /// such a placement stands for are not among them.
+    pub media_winners: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -113,11 +119,19 @@ impl RadixTreePrefixProvider {
         // deeper than the best confirmed match. A real deeper hit still decides.
         let pending_best = depth_by_url.values().copied().max();
         let media = self.media_chain(tokens, namespace, &hashes);
+        let mut media_winners = Vec::new();
         if let Some(media) = &media {
             let mut deepened = false;
             for (url, matched) in self.tree.media().depths(&media.chain) {
                 let depth = media.depth(matched);
-                if Some(u32::try_from(depth).unwrap_or(u32::MAX)) > confirmed {
+                let depth_blocks = u32::try_from(depth).unwrap_or(u32::MAX);
+                if Some(depth_blocks) > confirmed {
+                    if depth_by_url
+                        .get(&*url)
+                        .is_none_or(|known| depth_blocks >= *known)
+                    {
+                        media_winners.push(url.to_string());
+                    }
                     merge_depth(&mut depth_by_url, url.to_string(), depth);
                     deepened = true;
                 }
@@ -157,6 +171,7 @@ impl RadixTreePrefixProvider {
             query_blocks: hashes.len(),
             pending_winners,
             media_hashes: media.map(|media| Arc::<[i64]>::from(media.chain)),
+            media_winners,
             block_hashes: consult_pending.then(|| hashes.into()),
         })
     }
@@ -502,12 +517,14 @@ mod tests {
         confirm(&provider, "http://b", turn1, 4);
         let first = lookup(&provider, turn1);
         assert!(first.media_hashes.is_some());
+        assert!(first.media_winners.is_empty(), "nothing remembered yet");
         provider.record_route(&first, "http://b");
         let signal = lookup(&provider, &turn2);
         assert_eq!(
             depths(&signal),
             [("http://a".into(), 4), ("http://b".into(), 8)]
         );
+        assert_eq!(signal.media_winners, ["http://b"]);
         assert_eq!(provider.tree.media().hits(), 1);
         assert_eq!(
             provider.tree.pending().hits(),
@@ -699,6 +716,34 @@ mod tests {
         let mut by_rank = provider.rank_depths(&turn2, &ns, "http://b");
         by_rank.sort();
         assert_eq!(by_rank, [(0, 4), (1, 5)]);
+    }
+
+    /// An image chat shorter than one KV block is hashed as a partial block,
+    /// so its placement is remembered like any other.
+    #[test]
+    fn a_chat_shorter_than_a_block_keeps_its_worker() {
+        const WIDE: u32 = 8;
+        let tree = Arc::new(HashTree::new());
+        let oracle = BlockSizeOracle::new();
+        oracle.try_set(WIDE).expect("block size");
+        tree.media().enable(Duration::from_secs(1_800));
+        tree.media_ranks().enable(Duration::from_secs(1_800));
+        tree.set_media_tokens(vec![IMAGE]);
+        let provider = RadixTreePrefixProvider::new(tree, oracle);
+        let ns = CacheNamespace::default();
+        let turn1 = vec![1, 2, IMAGE, MEDIA_TAG_MARK, 50_000, 50_001];
+        let first = lookup(&provider, &turn1);
+        assert!(matches!(first.outcome, PrefixOutcome::Empty));
+        assert_eq!(first.query_blocks, 1);
+        provider.record_route(&first, "http://b");
+        provider.record_rank(&turn1, &ns, "http://b", 1);
+        let mut turn2 = turn1.clone();
+        turn2.extend([50_002, 50_003]);
+        let signal = lookup(&provider, &turn2);
+        assert_eq!(depths(&signal), [("http://b".into(), 1)]);
+        assert_eq!(signal.media_winners, ["http://b"]);
+        assert_eq!(provider.tree.media().hits(), 1);
+        assert_eq!(provider.rank_depths(&turn2, &ns, "http://b"), [(1, 1)]);
     }
 
     /// A burst of new image chats on one cold system prompt: the first chat's

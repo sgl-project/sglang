@@ -363,8 +363,11 @@ pub struct CacheArgs {
     /// workers are ordered by a rendezvous hash of the conversation, so every
     /// replica picks the same one; that preference is worth one block, within
     /// --cache-switch-margin-tokens, so the pressure guard still overrides it
-    /// for a materially more loaded worker. 0 or unset disables it. Requires
-    /// the radix_tree provider.
+    /// for a materially more loaded worker. A remembered placement is exempt
+    /// from --cache-affinity-min-matched-tokens, which counts prompt tokens
+    /// only and none of the image's KV, so short image chats keep their worker
+    /// too; the match-ratio floor and the pressure guard still apply. 0 or
+    /// unset disables it. Requires the radix_tree provider.
     #[arg(long)]
     pub cache_media_affinity_ttl_ms: Option<u64>,
 

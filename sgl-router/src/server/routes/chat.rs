@@ -717,6 +717,7 @@ async fn lookup_prefix_matches(
                 pending_winners: Vec::new(),
                 block_hashes: None,
                 media_hashes: None,
+                media_winners: Vec::new(),
             })
         }
         // Without usable indexer inputs, try the in-process radix tree.

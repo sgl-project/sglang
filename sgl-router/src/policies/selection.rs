@@ -950,6 +950,7 @@ mod tests {
             pending_winners: Vec::new(),
             block_hashes: None,
             media_hashes: None,
+            media_winners: Vec::new(),
         }
     }
 
