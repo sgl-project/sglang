@@ -63,6 +63,7 @@ def _graph_backend(req_to_token, runner_ids, *, drop_wide, bs):
     """A decode-graph DSA backend over real metadata kernels."""
     backend = object.__new__(DeepseekSparseAttnBackend)
     backend.__dict__.update(
+        draft_decode_len=0,
         device=torch.device("cuda"),
         device_sm_major=torch.cuda.get_device_capability()[0],
         num_q_heads=64,

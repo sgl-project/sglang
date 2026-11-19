@@ -121,7 +121,7 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
     ) -> PrecomputedMetadata:
         """Precompute decode metadata, including this draft step's chain."""
         max_len = self.decode_cuda_graph_metadata[bs].page_table_1.shape[1]
-        draft_decode_len = getattr(self, "draft_decode_len", 0)
+        draft_decode_len = self.draft_decode_len
         if draft_decode_len:
             seq_lens = seq_lens + draft_decode_len
 

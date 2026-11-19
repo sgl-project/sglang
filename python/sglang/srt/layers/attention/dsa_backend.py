@@ -790,6 +790,11 @@ class DeepseekSparseAttnBackend(
         hf_config = model_runner.model_config.hf_config
         self.use_dsa = is_deepseek_dsa(hf_config)
         assert self.use_dsa, "DSA backend only supports DeepSeek DSA"
+        self.draft_decode_len = 0
+        if speculative_num_steps and getattr(
+            hf_config, "dsa_draft_attends_to_own_chain", False
+        ):
+            self.draft_decode_len = speculative_step_id + 1
         self.dsa_kv_cache_store_fp8 = (
             model_runner.token_to_kv_pool.dsa_kv_cache_store_fp8
         )
@@ -1007,14 +1012,6 @@ class DeepseekSparseAttnBackend(
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.speculative_step_id = speculative_step_id
 
-        # GigaChat 4 MTP indexes its newly written chain at every draft step.
-        self.draft_decode_len = (
-            speculative_step_id + 1
-            if getattr(hf_config, "model_type", None) == "gigachat4"
-            and speculative_num_steps
-            and self.topk == 1
-            else 0
-        )
         self.use_fused_topk = should_use_dsa_fused_topk(seed_dsa_topk_from_draft_extend)
         if envs.SGLANG_DSA_FUSE_TOPK.get() and not self.use_fused_topk:
             print_warning_once(
@@ -1569,7 +1566,7 @@ class DeepseekSparseAttnBackend(
         if forward_batch.forward_mode.is_target_verify():
             draft_token_num = self.speculative_num_draft_tokens
         elif forward_batch.forward_mode.is_decode_or_idle():
-            draft_token_num = getattr(self, "draft_decode_len", 0)
+            draft_token_num = self.draft_decode_len
         else:
             draft_token_num = 0
 
@@ -2143,7 +2140,7 @@ class DeepseekSparseAttnBackend(
         if forward_mode.is_decode_or_idle():
             # Normal Decode
             # Get sequence information
-            draft_decode_len = getattr(self, "draft_decode_len", 0)
+            draft_decode_len = self.draft_decode_len
             if draft_decode_len:
                 seq_lens = seq_lens + draft_decode_len
             cache_seqlens_int32 = seq_lens.to(torch.int32)
@@ -2333,7 +2330,7 @@ class DeepseekSparseAttnBackend(
             # Normal Decode
             max_len = self._graph_page_table_width(metadata)
             # A chain draft step's metadata covers the prefix plus its own chain.
-            draft_decode_len = getattr(self, "draft_decode_len", 0)
+            draft_decode_len = self.draft_decode_len
             if draft_decode_len:
                 seq_lens = seq_lens + draft_decode_len
 
@@ -5214,7 +5211,7 @@ class DeepseekSparseAttnMultiStepBackend:
     def _init_forward_metadata_replay(self, forward_batch: ForwardBatch) -> None:
         bs = forward_batch.batch_size
         # Chain steps have different KV lengths and cannot share replay metadata.
-        if getattr(self.attn_backends[0], "draft_decode_len", 0):
+        if self.attn_backends[0].draft_decode_len:
             for backend in self.attn_backends:
                 precomputed = backend._precompute_replay_metadata(
                     bs=bs,
