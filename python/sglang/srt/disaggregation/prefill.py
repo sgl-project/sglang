@@ -67,6 +67,7 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce_prefill_pp,
     prepare_abort,
     record_network_transfer,
+    setup_page_row_kv_args,
     setup_state_kv_args,
     state_indices_per_entry,
 )
@@ -355,32 +356,6 @@ class PrefillBootstrapQueue:
         else:
             self.scheduler.kv_checksum_computer = None
 
-    def _draft_kv_window_pages(self, *, page_size: int) -> int:
-        """Trailing pages of draft KV a sliding-window-only DFlash/DSpark draft reads."""
-        spec_algorithm = self.scheduler.spec_algorithm
-        if not spec_algorithm.is_dflash_family():
-            return 0
-        from sglang.srt.configs.model_config import ModelConfig
-        from sglang.srt.runtime_context import get_spec
-        from sglang.srt.speculative.dflash_utils import (
-            get_dflash_attention_sliding_window_size,
-            get_dflash_layer_types,
-        )
-
-        draft_config = ModelConfig.from_server_args(
-            self.scheduler.server_args,
-            model_path=get_spec().speculative_draft_model_path,
-            model_revision=get_spec().speculative_draft_model_revision,
-            is_draft_model=True,
-        ).hf_config
-        layer_types = get_dflash_layer_types(draft_config)
-        if not layer_types or any(t != "sliding_attention" for t in layer_types):
-            return 0
-        window = get_dflash_attention_sliding_window_size(draft_config)
-        # Two spare pages cover the partial last page and draft queries placed
-        # at or before the last prompt token.
-        return -(-window // page_size) + 2
-
     def _init_kv_manager(self) -> CommonKVManager:
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
         kv_args = kv_args_class()
@@ -472,21 +447,25 @@ class PrefillBootstrapQueue:
             kv_args.total_kv_head_num = (
                 self.scheduler.model_config.get_total_num_kv_heads()
             )
-        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
-        from sglang.srt.mem_cache.minimax_m3_nvfp4_pool import MiniMaxM3Nvfp4KVPool
+        draft_window_pages = 0
+        if (
+            draft_kv_pool is not None
+            and self.scheduler.spec_algorithm.is_dflash_family()
+        ):
+            from sglang.srt.speculative.dflash_utils import dflash_draft_window_pages
 
-        # Only the Mooncake sender slices page rows by head.
-        kv_args.main_kv_page_row = (
-            isinstance(self.token_to_kv_pool, MiniMaxM3Nvfp4KVPool)
-            and self.transfer_backend == TransferBackend.MOONCAKE
-        )
-        if kv_args.main_kv_page_row:
-            kv_args.main_kv_head_dim = self.token_to_kv_pool.head_dim
-        if isinstance(draft_kv_pool, MHATokenToKVPool):
-            kv_args.draft_kv_head_num = draft_kv_pool.head_num
-            kv_args.draft_window_pages = self._draft_kv_window_pages(
-                page_size=self.token_to_kv_pool.page_size
+            # A rank holding a draft pool hosts the draft runner and its config.
+            draft_window_pages = dflash_draft_window_pages(
+                self.scheduler.draft_worker.draft_model_runner.model_config.hf_config,
+                page_size=self.token_to_kv_pool.page_size,
             )
+        setup_page_row_kv_args(
+            kv_args,
+            token_to_kv_pool=self.token_to_kv_pool,
+            transfer_backend=self.transfer_backend,
+            draft_token_to_kv_pool=draft_kv_pool,
+            draft_window_pages=draft_window_pages,
+        )
         kv_args.page_size = self.token_to_kv_pool.page_size
 
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
@@ -518,11 +497,8 @@ class PrefillBootstrapQueue:
             self.is_mla_backend,
             **kv_manager_kwargs,
         )
-        if (
-            kv_args.main_kv_page_row
-            and isinstance(draft_kv_pool, MHATokenToKVPool)
-            and self.transfer_backend == TransferBackend.MOONCAKE
-        ):
+        # main_kv_page_row implies the Mooncake manager, the only one that packs.
+        if kv_args.main_kv_page_row and kv_args.draft_kv_head_num:
             kv_manager.set_draft_kv_tensors(
                 draft_kv_pool.k_buffer + draft_kv_pool.v_buffer
             )

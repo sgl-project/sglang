@@ -17,6 +17,7 @@ register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 import unittest
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -31,6 +32,7 @@ from sglang.srt.mem_cache.minimax_m3_nvfp4_pool import (
     main_page_components,
     page_row_layout,
 )
+from sglang.srt.speculative.dflash_utils import dflash_draft_window_pages
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -288,6 +290,22 @@ class TestDraftWindowChunkStart(CustomTestCase):
             ),
             0,
         )
+
+
+class TestDflashDraftWindowPages(CustomTestCase):
+    """DSpark's sliding-only draft (window 4096, 128-token pages) reads 34 pages."""
+
+    def test_sliding_only_draft(self):
+        config = SimpleNamespace(
+            layer_types=["sliding_attention"] * 5, sliding_window=4096
+        )
+        self.assertEqual(dflash_draft_window_pages(config, page_size=128), 34)
+
+    def test_full_attention_layer_sends_every_page(self):
+        config = SimpleNamespace(
+            layer_types=["sliding_attention", "full_attention"], sliding_window=4096
+        )
+        self.assertEqual(dflash_draft_window_pages(config, page_size=128), 0)
 
 
 class TestPageRowSliceSendPackerFailure(CustomTestCase):

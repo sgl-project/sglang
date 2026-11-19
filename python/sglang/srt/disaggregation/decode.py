@@ -90,6 +90,7 @@ from sglang.srt.disaggregation.utils import (
     pre_alloc_fill_len,
     prepare_abort,
     record_network_transfer,
+    setup_page_row_kv_args,
     setup_state_kv_args,
     state_indices_per_entry,
 )
@@ -904,16 +905,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
         if self.transfer_backend == TransferBackend.NIXL:
             kv_args.kv_data_mem_kinds = kv_data_mem_kinds
-        from sglang.srt.mem_cache.minimax_m3_nvfp4_pool import MiniMaxM3Nvfp4KVPool
-
-        # Admits a prefill with another attention TP size only where a sender
-        # can slice page rows by head; the other backends still send whole rows.
-        kv_args.main_kv_page_row = (
-            isinstance(self.token_to_kv_pool, MiniMaxM3Nvfp4KVPool)
-            and self.transfer_backend == TransferBackend.MOONCAKE
+        setup_page_row_kv_args(
+            kv_args,
+            token_to_kv_pool=self.token_to_kv_pool,
+            transfer_backend=self.transfer_backend,
         )
-        if kv_args.main_kv_page_row:
-            kv_args.main_kv_head_dim = self.token_to_kv_pool.head_dim
         kv_args.page_size = self.token_to_kv_pool.page_size
 
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
