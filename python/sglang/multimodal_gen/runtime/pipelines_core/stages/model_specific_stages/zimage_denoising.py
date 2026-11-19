@@ -45,6 +45,8 @@ class ZImageDenoisingStage(DenoisingStage):
             or server_args.enable_cfg_parallel
             or server_args.enable_torch_compile
             or server_args.enable_breakable_cuda_graph
+            # The batched pass holds activations for both branches at once.
+            or server_args.performance_mode == "memory"
             or self._cache_dit_enabled
             or batch.enable_teacache
             or batch.enable_spectrum

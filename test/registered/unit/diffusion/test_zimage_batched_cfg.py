@@ -47,6 +47,7 @@ class TestZImageBatchedCFG(CustomTestCase):
             enable_cfg_parallel=False,
             enable_torch_compile=False,
             enable_breakable_cuda_graph=False,
+            performance_mode="auto",
             pipeline_config=self.config,
         )
         self.positive = self._branch(True, 2)
@@ -109,6 +110,13 @@ class TestZImageBatchedCFG(CustomTestCase):
 
     def test_exact_quality_keeps_serial_predictions(self):
         self.batch.sampling_params.quality = "exact"
+        result = self.stage._predict_noise_with_cfg(**self.kwargs)
+        torch.testing.assert_close(result, torch.full_like(result, 15), rtol=0, atol=0)
+        self.assertEqual(self.stage.forward_batches, [1, 1])
+        self.assertNotIn("zimage_batched_cfg_conditioning", self.batch.extra)
+
+    def test_memory_mode_keeps_serial_predictions(self):
+        self.args.performance_mode = "memory"
         result = self.stage._predict_noise_with_cfg(**self.kwargs)
         torch.testing.assert_close(result, torch.full_like(result, 15), rtol=0, atol=0)
         self.assertEqual(self.stage.forward_batches, [1, 1])
