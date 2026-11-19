@@ -285,9 +285,15 @@ def test_audio_override_reaches_only_the_audio_controller(
 def test_audio_rollout_reaches_the_response_through_select_and_merge(
     batch, stop_step_index, kept_steps
 ):
-    """Audio runs the primary's, possibly stopped, schedule; its rollout survives per-output select and merge and is returned under extra_streams."""
+    """Audio runs the primary's, possibly stopped, schedule; its rollout and the settings its controller used survive per-output select and merge and are returned under extra_streams."""
     batch.rollout_stop_step_index = stop_step_index
     batch.rollout_return_step_indices = kept_steps
+    audio_override = {
+        "rollout_sde_type": "cps",
+        "rollout_noise_level": 0.3,
+        "rollout_log_prob_no_const": True,
+    }
+    batch.rollout_extra_stream_sde_args = {AUDIO_STREAM: audio_override}
     with rollout_scope(batch):
         audio_scheduler = _prepare_both_streams(batch)
         primary_controller = batch.rollout_controllers[PRIMARY_STREAM]
@@ -338,6 +344,7 @@ def test_audio_rollout_reaches_the_response_through_select_and_merge(
         assert dit_trajectory["latent_step_indices"].tolist() == kept_steps
         torch.testing.assert_close(audio_payload["generated_output"], result.audio[i])
         assert audio_payload["sample_rate"] == 24000
+        assert audio_payload["rollout_sde_kernel"] == audio_override
 
 
 def test_sp_sharded_audio_fails_at_the_final_gather_of_an_ode_rollout(batch):
@@ -384,7 +391,12 @@ def test_audio_not_requested_for_rollout_stops_with_the_primary_and_returns_only
             audio_payload = _maybe_deserialize(response.extra_streams[AUDIO_STREAM])
             torch.testing.assert_close(audio_payload["generated_output"], audio[i])
             assert audio_payload["sample_rate"] == 24000
-            for key in ("rollout_log_probs", "rollout_debug_tensors", "dit_trajectory"):
+            for key in (
+                "rollout_log_probs",
+                "rollout_debug_tensors",
+                "dit_trajectory",
+                "rollout_sde_kernel",
+            ):
                 assert audio_payload[key] is None
 
 
@@ -464,8 +476,14 @@ def test_any_named_stream_with_its_own_sigmas_reaches_the_response(
         assert set(response.extra_streams) == {stream}
         assert response.extra_streams[stream]["generated_output"] is None
     stored = {}
-    rollout_api._build_response("r", "p", 10, True, result, stored=stored)
+    responses = rollout_api._build_response("r", "p", 10, True, result, stored=stored)
     assert any(key.startswith(f"extra_streams.{stream}.") for key in stored)
+    # Without an override the stream echoes the top-level settings it inherited.
+    assert responses[0].extra_streams[stream]["rollout_sde_kernel"] == {
+        "rollout_sde_type": "sde",
+        "rollout_noise_level": 0.7,
+        "rollout_log_prob_no_const": False,
+    }
 
 
 def test_stream_not_requested_for_rollout_cuts_its_own_grid_at_the_stop(batch):

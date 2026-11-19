@@ -375,6 +375,7 @@ _NO_ROLLOUT_FIELDS = {
     "rollout_log_probs": None,
     "rollout_debug_tensors": None,
     "dit_trajectory": None,
+    "rollout_sde_kernel": None,
 }
 
 
@@ -413,6 +414,11 @@ def _serialize_extra_streams(
                     serialized_dit_timesteps=timesteps,
                     serialized_dit_sigmas=sigmas,
                 )
+            # Lets a caller tell that its overrides reached the stream's controller.
+            rollout_fields = {
+                **rollout_fields,
+                "rollout_sde_kernel": stream_data.rollout_sde_kernel,
+            }
         output = extra_stream_outputs.get(stream, {})
         output_metadata = {
             key: value for key, value in output.items() if key != "generated_output"
