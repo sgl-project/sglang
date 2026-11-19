@@ -89,6 +89,21 @@ class TestFlux3ImageVAE(unittest.TestCase):
             self.assertTrue(vae.decoder.mid.attn_1.fast_path_gate.enabled)
         self.assertFalse(vae.decoder.mid.attn_1.fast_path_gate.enabled)
 
+    def test_height_sharded_decode_is_opt_in(self):
+        """A decode-parallel group alone keeps the serial decoder (vae_sp false)."""
+        vae_module = "sglang.multimodal_gen.runtime.models.vaes.flux3_image_vae"
+        pc = "sglang.multimodal_gen.runtime.layers.parallel_conv"
+        with (
+            mock.patch(f"{vae_module}.has_decode_parallel_world", return_value=True),
+            mock.patch(f"{pc}.get_decode_parallel_rank", return_value=0),
+            mock.patch(f"{pc}.get_decode_parallel_world_size", return_value=2),
+            torch.device("meta"),
+        ):
+            self.assertFalse(_meta_vae()._spatial_parallel)
+            opted_in = Flux3ImageVAE(Flux3ImageVAEConfig(use_parallel_decode=True))
+        self.assertTrue(opted_in._spatial_parallel)
+        self.assertEqual(opted_in._sp_upsamples, 3)
+
     def test_enable_spatial_parallel_swaps_convs(self):
         vae = _meta_vae()
         # No decode-parallel group in a plain test process: serial decoder.
