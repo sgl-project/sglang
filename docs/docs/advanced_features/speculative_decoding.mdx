@@ -1,9 +1,9 @@
 ---
 title: "Speculative Decoding"
 metatags:
-    description: "SGLang speculative decoding: EAGLE-2/EAGLE-3, MTP, UNO, DFLASH, PARD-2, draft model configuration, and overlap-scheduler guidance."
+    description: "SGLang speculative decoding: EAGLE-2/EAGLE-3, MTP, UNO, DFLASH, draft model configuration, and overlap-scheduler guidance."
 ---
-SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3, MTP, UNO, DFLASH, PARD-2, classic draft-model decoding, and an NGRAM-based variant. Our implementation aims to maximize speed and efficiency and is considered to be among the fastest in open-source LLM engines.
+SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3, MTP, UNO, DFLASH, classic draft-model decoding, and an NGRAM-based variant. Our implementation aims to maximize speed and efficiency and is considered to be among the fastest in open-source LLM engines.
 
 ## Summary
 
@@ -18,7 +18,6 @@ SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3,
 - [Multi Token Prediction](#multi-token-prediction)
 - [UNO decoding](#uno-decoding)
 - [DFlash Decoding](#dflash-decoding)
-- [PARD-2 Decoding](#pard-2-decoding)
 - [Standalone Speculative Decoding (Small Draft Model)](#standalone-speculative-decoding-small-draft-model)
 - [Speculative Decoding V2 (Overlap Scheduler)](#speculative-decoding-v2-overlap-scheduler)
 - [Ngram Speculative Decoding](#ngram-speculative-decoding)
@@ -35,7 +34,6 @@ SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3,
 - **Model is MTP-enabled**: Use **MTP via speculative decoding** (often with small `speculative_num_steps/topk/num_draft_tokens`, see the example section).
 - **You have a UNO adapter for the target model**: Use **UNO** with `--speculative-algorithm UNO` and `--uno-lora-path ...`.
 - **You have a DFlash draft checkpoint**: Use **DFLASH** with `--speculative-algorithm DFLASH` and `--speculative-draft-model-path ...`.
-- **You have a PARD-2 Qwen3 draft** (for example `amd/PARD2-Qwen3-8B` with `Qwen/Qwen3-8B`): Use **PARD2** with `--speculative-algorithm PARD2`, `--speculative-draft-model-path ...`, and `--speculative-pard2-mode`.
 - **You have a smaller draft LLM**: Use **STANDALONE** (`--speculative-algorithm STANDALONE`).
 - **No extra model available**: Use **NGRAM** (`--speculative-algorithm NGRAM`, CUDA-only).
 
@@ -104,13 +102,6 @@ SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3,
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Yes</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>--speculative-algorithm DFLASH</code> + <code>--speculative-draft-model-path ...</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>CUDA DP attention requires <code>--enable-dp-lm-head</code> and <code>attn_cp_size == 1</code>; <code>pp_size == 1</code></td>
-    </tr>
-<tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>PARD-2</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>PARD-2 Qwen3 draft (one forward, linear chain)</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Yes</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>--speculative-algorithm PARD2</code> + <code>--speculative-draft-model-path ...</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>AMD GPUs (ROCm) only, single GPU. <code>--speculative-pard2-mode</code> is <code>auto</code>, <code>target-dependent</code>, or <code>target-independent</code>. K = verify width - 1</td>
     </tr>
 <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>STANDALONE</td>
@@ -703,85 +694,6 @@ Both keys default to `0`, so a checkpoint whose config lost them builds no convo
 
 ---
 
-## PARD-2 Decoding
-
-SGLang supports **PARD-2** ([arXiv:2605.08632](https://arxiv.org/abs/2605.08632)) with `--speculative-algorithm PARD2`. The draft is a standalone Qwen3 causal model that proposes a chain of draft tokens in one forward. The published pair is `Qwen/Qwen3-8B` with `amd/PARD2-Qwen3-8B`. Verification is lossless. PARD2 runs on AMD GPUs (ROCm) only; startup rejects it on any other device.
-
-The same checkpoint serves in two modes:
-
-- **target-dependent** adds `target_proj` (the draft directory's `warp_model.bin`) applied to the target's hidden states onto the draft's input embeddings.
-- **target-independent** uses only the draft's own token embeddings. It does not load `warp_model.bin` and does not capture target hidden states.
-
-### `--speculative-pard2-mode`
-
-The flag is PARD2-only. Its values are `auto` (the default), `target-dependent`, and `target-independent`.
-
-`auto` is target-dependent when the target hidden size times `len(pard2_target_layers)` equals `pard2_target_dim` and the draft directory contains `warp_model.bin`, and target-independent otherwise. A draft config with `pard2_target_dependent` false resolves `auto` to target-independent. When `auto` resolves to target-independent, startup logs a warning that names the reason (the config flag, a dimension mismatch, or a missing `warp_model.bin`).
-
-Passing `target-dependent` explicitly is a startup error unless both `warp_model.bin` and the dimension check succeed. `pard2_target_dependent: false` affects only `auto`; it does not block an explicit `target-dependent`. Passing `target-independent` always selects that mode and skips the projection.
-
-### Draft length
-
-`--speculative-num-draft-tokens` is the verify width, which counts the bonus token the target samples. The number of tokens the draft proposes is
-
-`K = --speculative-num-draft-tokens - 1`.
-
-An omitted width is filled in as 16, so K is 15. A width below 2 is rejected. `--speculative-num-steps` is forced to 1; any other value is overridden to 1 with a warning. `--speculative-eagle-topk` must be 1 (it is filled in as 1 when omitted).
-
-### Launch
-
-For `amd/PARD2-Qwen3-8B`, `auto` resolves to target-dependent:
-
-```bash Command
-python3 -m sglang.launch_server \
-    --model Qwen/Qwen3-8B \
-    --speculative-algorithm PARD2 \
-    --speculative-draft-model-path amd/PARD2-Qwen3-8B \
-    --speculative-pard2-mode auto \
-    --speculative-num-draft-tokens 16
-```
-
-Target-independent on the same draft:
-
-```bash Command
-python3 -m sglang.launch_server \
-    --model Qwen/Qwen3-8B \
-    --speculative-algorithm PARD2 \
-    --speculative-draft-model-path amd/PARD2-Qwen3-8B \
-    --speculative-pard2-mode target-independent
-```
-
-With `--dtype auto`, the draft runs in bfloat16, the dtype of its weights. An explicit `--dtype` applies to both models. The draft attention backend follows the target unless `--speculative-draft-attention-backend` is set. The draft keeps its own KV cache in the device pool (and, in target-dependent mode, a per-token feature buffer), so the static memory fraction covers both models. See [OOM Troubleshooting](#oom-troubleshooting) if the server runs out of memory.
-
-Startup logs a line beginning `PARD2 draft worker: mode=`, including whether `target_proj` was loaded and the verify width with its K.
-
-**Send a request:**
-
-```python Example
-import openai
-
-client = openai.Client(base_url="http://127.0.0.1:30000/v1", api_key="None")
-
-response = client.chat.completions.create(
-    model="Qwen/Qwen3-8B",
-    messages=[
-        {"role": "user", "content": "Write a quicksort implementation in Python."},
-    ],
-    temperature=0,
-    max_tokens=128,
-)
-
-print(response.choices[0].message.content)
-```
-
-### Limitations
-
-PARD2 needs a Qwen3 PARD-2 draft (`spd_type` `pard2`, `pard_token`, `pard2_target_layers`) whose vocabulary matches the target, one AMD GPU (`--tp-size 1`, no PP, DP attention or context parallelism), `--page-size 1`, and a single chain (`--speculative-num-steps 1`, `--speculative-eagle-topk 1`). Overlap scheduling, the prefix cache, chunked prefill, sampling and log probabilities work with it.
-
-Startup rejects PD disaggregation, `--enable-hierarchical-cache`, `--enable-hisparse`, `--enable-unified-memory`, `--speculative-draft-window-size`, `--speculative-dflash-draft-kv-ring`, `--enable-mixed-chunk`, `--speculative-use-block-verification`, LoRA, and `SGLANG_RAGGED_VERIFY_MODE` other than static; `--speculative-adaptive` is turned off with a warning. Requests with constrained decoding, or with `return_hidden_states` under overlap scheduling, are aborted.
-
----
-
 ## Standalone Speculative Decoding (Small Draft Model)
 
 Besides EAGLE/MTP, SGLang also supports **token-level speculative decoding** using a smaller **draft model**. Enable it with `--speculative-algorithm STANDALONE` and provide a draft model via `--speculative-draft-model-path`.
@@ -1029,7 +941,7 @@ Below is a comprehensive list of all speculative decoding parameters available i
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--speculative-algorithm</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>str</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>None</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Algorithm to use: <code>EAGLE</code>, <code>EAGLE3</code>, <code>NEXTN</code> (alias of <code>EAGLE</code>), <code>STANDALONE</code>, <code>NGRAM</code>, <code>DFLASH</code>, <code>DSPARK</code>, <code>UNO</code>, <code>PARD2</code>, or a name registered with <code>SpeculativeAlgorithm.register</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Algorithm to use: <code>UNO</code>, <code>DFLASH</code>, <code>EAGLE</code>, <code>EAGLE3</code>, <code>STANDALONE</code>, <code>NGRAM</code>, <code>NEXTN</code> (alias of <code>EAGLE</code>)</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--speculative-draft-model-path</code></td>
@@ -1071,7 +983,7 @@ Below is a comprehensive list of all speculative decoding parameters available i
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--speculative-num-draft-tokens</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>int</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>None</code> (auto-chosen when omitted)</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Maximum number of draft tokens for verification. Some algorithms auto-tune it; UNO requires it and uses it as linear width or tree verification width <code>V</code>. PARD2 uses it as the verify width, so K = value - 1, and fills in 16 when it is omitted.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Maximum number of draft tokens for verification. Some algorithms auto-tune it; UNO requires it and uses it as linear width or tree verification width <code>V</code>.</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--speculative-dflash-block-size</code></td>
@@ -1138,12 +1050,6 @@ Below is a comprehensive list of all speculative decoding parameters available i
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>str</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Same as target</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Quantization for the draft model (<code>"unquant"</code> to disable)</td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--speculative-pard2-mode</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>str</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>auto</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>PARD2 only. How the draft uses target features. <code>auto</code> is target-dependent when the target hidden size times <code>len(pard2_target_layers)</code> equals <code>pard2_target_dim</code> and the draft directory contains <code>warp_model.bin</code>, and target-independent otherwise. A draft config with <code>pard2_target_dependent</code> false resolves <code>auto</code> to target-independent. Choices: <code>auto</code>, <code>target-dependent</code>, <code>target-independent</code>.</td>
     </tr>
   </tbody>
 </table>
