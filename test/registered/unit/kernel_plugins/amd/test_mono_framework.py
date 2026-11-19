@@ -11,6 +11,7 @@ from msgspec.structs import replace
 
 from sglang.kernels.plugin_kernels.amd import spec as registry
 from sglang.kernels.plugin_kernels.amd.spec import (
+    FLAG,
     DeviceLimits,
     Feature,
     MonoSpec,
@@ -140,7 +141,7 @@ def install(*, archs, lookups=None, is_load_observed=False, model_type="fake"):
     gather = {"return_value": lookups} if lookups else {"side_effect": lambda x: [x]}
     gpu = SimpleNamespace(multi_processor_count=256)
     with (
-        patch.object(mono, "_backend", return_value=BACKEND),
+        patch.object(mono, "_selection", return_value=(BACKEND, FLAG, binding)),
         patch.object(mono, "device_isa", return_value="gfx950"),
         patch.object(mono, "_gather_tp", **gather),
         patch.object(torch.cuda, "current_device", return_value=0),
@@ -334,7 +335,7 @@ class TestMonokernelFramework(CustomTestCase):
             ("layers.0.other.weight", torch.ones(16)),
         ]
         with (
-            patch.object(mono, "_backend", return_value=BACKEND),
+            patch.object(mono, "_selection", return_value=(BACKEND, FLAG, binding)),
             patch.object(mono, "device_isa", return_value="gfx950"),
         ):
             watched = list(iterator(model=model, weights=iter(weights)))
@@ -347,7 +348,7 @@ class TestMonokernelFramework(CustomTestCase):
             list(model.__dict__["_mono_copies"]),
             [("shared expert", "layers.0.shared.weight")],
         )
-        with patch.object(mono, "_backend", return_value=None):
+        with patch.object(mono, "_selection", return_value=None):
             self.assertIs(iterator(model=model, weights=weights), weights)
 
     def test_a_load_path_that_skips_the_observer_is_refused(self):
@@ -502,6 +503,12 @@ class TestMonokernelFramework(CustomTestCase):
         ):
             self.assertTrue(binding.msa_serves([ARCH]))
             self.assertFalse(binding.msa_serves(["OtherForCausalLM"]))
+
+    def test_the_amd_binding_only_names_isa_on_hip(self):
+        # off HIP the vendor defers, and mono's sm_<capability> fallback stands
+        if torch.version.hip:
+            self.skipTest("a HIP box names its ISA through the vendor hook")
+        self.assertIsNone(binding.device_isa())
 
     def test_the_legacy_spec_module_registers_into_the_same_registry(self):
         """The MSA plugin pinned in docker/Dockerfile.cu134 imports

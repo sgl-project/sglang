@@ -44,6 +44,13 @@ def selected_monokernel(cfg: Any) -> Optional[tuple[str, str]]:
     return None
 
 
+def device_isa() -> Optional[str]:
+    if not torch.cuda.is_available() or not torch.version.hip:
+        return None
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    return props.gcnArchName.split(":")[0]
+
+
 def monokernel_serves(backend: str, architectures: Optional[Sequence[str]]) -> bool:
     """Whether the selected backend claims this model at all."""
     return backend != MSA_BACKEND or msa_serves(architectures)
