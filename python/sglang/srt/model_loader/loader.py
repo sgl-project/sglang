@@ -440,13 +440,17 @@ def _checkpoint_tensor_readers(
 
     if model is None or not torch.distributed.is_initialized():
         return None
-    moe_layers = {  # Only where checkpoint layer ids match the module's.
-        module.layer_id: module
-        for name, module in model.named_modules()
-        if isinstance(module, FusedMoE)
-        and module.moe_ep_size > 1
-        and get_layer_id(name + ".") == module.layer_id
-    }
+    moe_layers = collections.defaultdict(list)
+    for name, module in model.named_modules():
+        # Only where checkpoint layer ids match the module's.
+        if (
+            isinstance(module, FusedMoE)
+            and module.moe_ep_size > 1
+            and get_layer_id(name + ".") == module.layer_id
+        ):
+            moe_layers[module.layer_id].append(module)
+    # Several MoE modules in a layer may renumber the checkpoint's experts.
+    moe_layers = {i: m[0] for i, m in moe_layers.items() if len(m) == 1}
     if not moe_layers:
         return None
 
@@ -455,8 +459,10 @@ def _checkpoint_tensor_readers(
 
     @functools.lru_cache(maxsize=None)
     def is_local_expert(layer_id: int, expert_id: int) -> bool:
-        local_ids = moe_layers[layer_id]._weight_loader_expert_ids(None, expert_id)
-        return next(local_ids, None) is not None
+        moe = moe_layers[layer_id]
+        if expert_id >= moe._num_global_routed:  # Not one of its routed experts.
+            return True
+        return next(moe._weight_loader_expert_ids(None, expert_id), None) is not None
 
     def readers(name: str, nbytes: int) -> Optional[Tuple[int, int]]:
         match = _EXPERT_ID_RE.search(name)

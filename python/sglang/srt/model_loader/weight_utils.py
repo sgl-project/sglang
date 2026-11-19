@@ -1326,10 +1326,13 @@ def _prefetch_all_checkpoints(
         local_world_size = 1
 
     # Whole shards are read faster; prefetch only what the node reads when they
-    # do not fit in RAM.
-    if readers is None or sum(map(os.path.getsize, sorted_files)) <= (
-        0.9 * psutil.virtual_memory().available
-    ):
+    # do not fit in RAM. Ranks see different free RAM, so they pick one mode.
+    if readers is not None:
+        size = sum(map(os.path.getsize, sorted_files))
+        fits = torch.tensor(int(size <= 0.9 * psutil.virtual_memory().available))
+        group = get_parallel().moe_ep_group.cpu_group
+        torch.distributed.all_reduce(fits, torch.distributed.ReduceOp.MIN, group)
+    if readers is None or fits:
         my_files = [(path, None) for path in sorted_files[local_rank::local_world_size]]
     else:  # Prefetch only what the node reads, split by file among its readers.
         my_files = [

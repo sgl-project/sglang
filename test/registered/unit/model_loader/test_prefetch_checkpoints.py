@@ -244,6 +244,7 @@ class TestPrefetchCheckpoints(CustomTestCase):
         class FakeMoE(torch.nn.Module):
             layer_id = 1
             moe_ep_size = 2
+            _num_global_routed = 4
 
             def _weight_loader_expert_ids(self, param, expert_id):
                 if expert_id < 2:  # Experts 0 and 1 are local.
@@ -252,13 +253,14 @@ class TestPrefetchCheckpoints(CustomTestCase):
         model = torch.nn.ModuleDict(
             {"layers": torch.nn.ModuleList([torch.nn.Module(), FakeMoE()])}
         )
-        group = SimpleNamespace(rank=0, ranks=[0], local_size=1)
+        group = SimpleNamespace(rank=0, ranks=[0], local_size=1, cpu_group=None)
         expert = "layers.1.experts.{}.{}"
         tensors = {
             "layers.1.attn.weight": torch.randn(4096),
             "layers.1.experts.w13_weight": torch.randn(4, 64),  # stacked: every rank
             expert.format(1, "weight"): torch.randn(4096),
             expert.format(3, "weight"): torch.randn(4096),
+            expert.format(4, "weight"): torch.randn(4096),  # not routed: every rank
             expert.format(3, "input_scale"): torch.tensor(0.5),  # scalar: every rank
             expert.format(3, "weight_scale_inv"): torch.randn(1024),  # block scales
         }
@@ -270,7 +272,10 @@ class TestPrefetchCheckpoints(CustomTestCase):
             patch("concurrent.futures.ThreadPoolExecutor", _InlineExecutor),
             patch("psutil.virtual_memory", return_value=SimpleNamespace(available=0)),
             patch("torch.distributed.get_rank", return_value=0),
-            get_parallel().override(world_group=group, moe_tp_group=group),
+            patch("torch.distributed.all_reduce"),
+            get_parallel().override(
+                world_group=group, moe_tp_group=group, moe_ep_group=group
+            ),
         ):
             path = os.path.join(tmpdir, "model.safetensors")
             safetensors.torch.save_file(tensors, path)
@@ -281,6 +286,9 @@ class TestPrefetchCheckpoints(CustomTestCase):
             ):
                 _prefetch_all_checkpoints([path], readers=readers)
             loaded = dict(safetensors_weights_iterator([path], readers=readers))
+            # Two MoE modules in one layer (e.g. text and vision experts): no skip.
+            model.layers[1] = torch.nn.ModuleDict({"t": FakeMoE(), "v": FakeMoE()})
+            self.assertIsNone(_checkpoint_tensor_readers(model))
 
         read = set(tensors) - {
             expert.format(3, n) for n in ("weight", "weight_scale_inv")

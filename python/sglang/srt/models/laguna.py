@@ -806,10 +806,14 @@ class LagunaForCausalLM(nn.Module):
         # If any routed-expert tensor was silently dropped (e.g. a future
         # checkpoint renaming `gate_proj`, or a ckpt-vs-mapping shape mismatch),
         # fail loud here instead of generating garbage.
+        experts = {i: self.model.layers[i].mlp.experts for i in moe_layer_ids}
         expected = {
             (layer_id, expert_id, shard_id)
             for layer_id in moe_layer_ids
             for expert_id in range(self.config.num_experts)
+            # Under EP the weight iterators yield only this rank's experts.
+            if next(experts[layer_id]._weight_loader_expert_ids(None, expert_id), None)
+            is not None
             for shard_id in ("w1", "w2", "w3")
         }
         missing = expected - loaded_expert_shards
