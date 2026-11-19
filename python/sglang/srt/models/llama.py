@@ -84,6 +84,18 @@ if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
 
 
+# Aligned with HF's implementation, using sliding window inclusive with the last token
+# SGLang assumes exclusive
+def get_attention_sliding_window_size(config) -> Optional[int]:
+    if config.model_type not in ("phi3", "mistral"):
+        return None
+    window = config.sliding_window
+    # Phi-3.5 and Phi-4 set a window past their context length to mean no window.
+    if window is None or window >= config.max_position_embeddings:
+        return None
+    return window - 1
+
+
 class LlamaMLP(nn.Module):
     def __init__(
         self,
@@ -246,6 +258,7 @@ class LlamaAttention(nn.Module):
             layer_id=layer_id,
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
+            sliding_window_size=get_attention_sliding_window_size(config),
         )
 
     def forward_prepare_native(self, positions, hidden_states):
@@ -923,7 +936,8 @@ class LlamaForCausalLM(nn.Module):
 
 
 class Phi3ForCausalLM(LlamaForCausalLM):
-    pass
+    def get_attention_sliding_window_size(self):
+        return get_attention_sliding_window_size(self.config)
 
 
 class InternLM3ForCausalLM(LlamaForCausalLM):
