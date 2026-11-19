@@ -2181,7 +2181,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
             output = self._process_output_after_replay(output, forward_batch)
 
-        if self.model_runner.decode_graph_rows_reporter is not None:
+        if getattr(self.model_runner, "decode_graph_rows_reporter", None) is not None:
             self._report_decode_graph_rows(forward_batch)
 
         if isinstance(output, LogitsProcessorOutput):
