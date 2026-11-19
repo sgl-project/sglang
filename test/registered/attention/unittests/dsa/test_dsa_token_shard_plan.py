@@ -36,6 +36,7 @@ import torch
 
 from sglang.srt.layers.attention.dsa.dsa_token_shard import (
     _build_dsa_token_shard_plan,
+    _validate_dsa_cp_token_sharded,
     dsa_cp_gather_token_rows,
     dsa_token_shard_cumulative_query_lens,
     dsa_token_shard_key_lens,
@@ -49,8 +50,10 @@ from sglang.srt.layers.attention.dsa.dsa_token_shard_layout import (
 )
 from sglang.srt.layers.layer_boundary.ops import slice_dcp_token_residual
 from sglang.srt.model_executor.forward_mode import ForwardMode
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import SpawnRanks, get_parallel, reset_context
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.parallel_groups import publish
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
@@ -192,6 +195,36 @@ class TestTokenShardRefusesDcp(CustomTestCase):
 
     def test_refused_under_dcp(self):
         self.assertIsNone(self._plan(dcp_enabled=True))
+
+
+class TestDcpTokenShardValidation(CustomTestCase):
+    def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(
+            ServerArgs(model_path="dummy", device="cpu", tp_size=2),
+            role="test",
+            ranks=SpawnRanks(world_rank=0),
+        )
+
+    def test_expert_parallel_is_refused(self):
+        # The rebuilt MoE exit reduce-scatters over attention TP; it does not
+        # perform the separate EP sum done by the ordinary output path.
+        with (
+            mock.patch(
+                "sglang.srt.layers.attention.dsa.dsa_token_shard."
+                "dsa_token_shard_enabled",
+                return_value=True,
+            ),
+            get_parallel().override(
+                dcp_enabled=True,
+                dcp_replicate_q_proj=False,
+                moe_ep_size=2,
+                moe_tp_size=1,
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "expert parallel"):
+                _validate_dsa_cp_token_sharded(object(), None)
 
 
 class TestTokenShardRefusesPrefillCp(CustomTestCase):

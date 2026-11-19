@@ -260,6 +260,11 @@ def _validate_dsa_cp_token_sharded(model, spec_algorithm):
             "DSA-CP token sharding and --dcp-replicate-q-proj use different "
             "groups for the same cached weights; enable only one"
         )
+    if parallel.moe_ep_size > 1:
+        raise ValueError(
+            "DSA-CP token sharding requires tensor-parallel MoE; "
+            "expert parallel is not supported"
+        )
     if not get_moe_a2a_backend().is_none():
         raise ValueError("DSA-CP token sharding requires the tensor-parallel MoE path")
     if spec_algorithm is not None and not spec_algorithm.is_none():
