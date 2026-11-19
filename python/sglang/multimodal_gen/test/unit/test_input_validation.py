@@ -59,6 +59,9 @@ class _DummyTI2IConfig:
     ):
         return image, (target_width, target_height)
 
+    def output_size_condition_image(self, images):
+        return images[-1]
+
     def prepare_calculated_size(self, image):
         return image.size
 
@@ -287,6 +290,22 @@ class TestFlux2EditOutputSize(unittest.TestCase):
             "upsampling_scaling_factor": 2,
         }
         self.assertEqual(self._output_size((770, 1344), vae_arch), (768, 1344))
+
+    def test_output_follows_first_of_several_reference_images(self):
+        for sizes in (((768, 1344), (1024, 1024)), ((1024, 1024), (768, 1344))):
+            with self.subTest(sizes=sizes):
+                images = [Image.new("RGB", s, color="red") for s in sizes]
+                batch = _make_batch(images)
+                batch.extra = {"explicit_fields": []}
+                config = Flux2PipelineConfig()
+                config.vae_config.update_model_arch(
+                    {"block_out_channels": [128, 256, 512, 512]}
+                )
+                config.vae_config.post_init()
+                InputValidationStage().preprocess_condition_image(
+                    batch, _make_server_args(config), images[0].width, images[0].height
+                )
+                self.assertEqual((batch.width, batch.height), sizes[0])
 
 
 class TestPerRequestTask(unittest.TestCase):
