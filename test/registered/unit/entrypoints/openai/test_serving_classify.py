@@ -9,14 +9,22 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from transformers import PreTrainedConfig
 
-from sglang.srt.entrypoints.openai.protocol import ClassifyRequest, ClassifyResponse
+from sglang.srt.entrypoints import http_server
+from sglang.srt.entrypoints.openai.protocol import (
+    ClassifyData,
+    ClassifyRequest,
+    ClassifyResponse,
+    TokenClassifyData,
+)
 from sglang.srt.entrypoints.openai.serving_classify import OpenAIServingClassify
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestServingClassify(CustomTestCase):
@@ -135,6 +143,151 @@ class TestServingClassify(CustomTestCase):
                     self.assertEqual(item["num_classes"], 2)
                     self.assertAlmostEqual(item["probs"][1 - i], 0.880797, places=6)
                     self.assertAlmostEqual(item["probs"][i], 0.119203, places=6)
+
+    def test_token_multi_label_probabilities(self):
+        serving = self._serving("multi_label_classification")
+        result = serving._build_classify_response(
+            [{"embedding": [[2.0, 2.0], [-2.0, 2.0], [0.0, -1000.0]]}]
+        )
+        item = result.data[0]
+        self.assertIsInstance(item, TokenClassifyData)
+        self.assertEqual(item.label, ["category_0", "category_1", "category_0"])
+        self.assertEqual(
+            item.labels, [["category_0", "category_1"], ["category_1"], ["category_0"]]
+        )
+        self.assertEqual(item.num_classes, 2)
+        expected = [[0.880797, 0.880797], [0.119203, 0.880797], [0.5, 0.0]]
+        for row, expected_row in zip(item.probs, expected, strict=True):
+            for actual, probability in zip(row, expected_row, strict=True):
+                self.assertAlmostEqual(actual, probability, places=6)
+
+    def test_token_softmax_over_labels(self):
+        for problem_type in (None, "single_label_classification"):
+            with self.subTest(problem_type=problem_type):
+                serving = self._serving(problem_type)
+                item = serving._build_classify_response(
+                    [{"embedding": [[0.0, 0.0], [1.0, 0.0], [0.0, 2.0]]}]
+                ).data[0]
+                self.assertEqual(item.label, ["category_0", "category_0", "category_1"])
+                self.assertNotIn("labels", item.model_dump(mode="json"))
+                self.assertEqual(item.num_classes, 2)
+                expected = [[0.5, 0.5], [0.731059, 0.268941], [0.119203, 0.880797]]
+                for row, expected_row in zip(item.probs, expected, strict=True):
+                    self.assertAlmostEqual(sum(row), 1.0, places=6)
+                    for actual, probability in zip(row, expected_row, strict=True):
+                        self.assertAlmostEqual(actual, probability, places=6)
+
+    def test_single_token_single_class_preserves_matrix(self):
+        serving = self._serving("multi_label_classification", num_labels=1)
+        item = serving._build_classify_response([{"embedding": [[2.0]]}]).data[0]
+        self.assertIsInstance(item, TokenClassifyData)
+        self.assertEqual(item.label, ["category_0"])
+        self.assertEqual(item.num_classes, 1)
+        self.assertEqual(len(item.probs), 1)
+        self.assertEqual(len(item.probs[0]), 1)
+        self.assertAlmostEqual(item.probs[0][0], 0.880797, places=6)
+
+    def test_single_and_batched_token_requests(self):
+        for batched in (False, True):
+            with self.subTest(batched=batched):
+                serving = self._serving("multi_label_classification")
+                outputs = [
+                    {
+                        "embedding": [[-2.0, 2.0], [2.0, -2.0], [0.0, 0.0]],
+                        "meta_info": {"prompt_tokens": 3},
+                    },
+                    {"embedding": [[0.0, 1000.0]], "meta_info": {"prompt_tokens": 1}},
+                ]
+
+                async def generate_request(adapted_request, raw_request):
+                    if batched:
+                        self.assertEqual(adapted_request.text, request.input)
+                    else:
+                        self.assertEqual(adapted_request.input_ids, request.input)
+                    yield outputs if batched else outputs[0]
+
+                serving.tokenizer_manager.generate_request = generate_request
+                request = (
+                    ClassifyRequest(input=["first input", "second"], threshold=0.9)
+                    if batched
+                    else ClassifyRequest(input=[1, 2, 3])
+                )
+                app = FastAPI()
+                app.state.openai_serving_classify = serving
+                # Exercise the production route without starting model workers.
+                app.router.routes.append(
+                    next(
+                        route
+                        for route in http_server.app.routes
+                        if getattr(route, "path", None) == "/v1/classify"
+                    )
+                )
+                with TestClient(app) as client:
+                    response = client.post("/v1/classify", json=request.model_dump())
+                self.assertEqual(response.status_code, 200, response.text)
+                payload = response.json()
+                self.assertEqual(payload["usage"]["prompt_tokens"], 4 if batched else 3)
+                self.assertEqual(payload["usage"]["total_tokens"], 4 if batched else 3)
+                self.assertEqual(payload["usage"]["completion_tokens"], 0)
+                self.assertEqual(len(payload["data"]), 2 if batched else 1)
+                self.assertEqual(
+                    payload["data"][0]["label"],
+                    ["category_1", "category_0", "category_0"],
+                )
+                self.assertEqual(payload["data"][0]["probs"][2], [0.5, 0.5])
+                self.assertEqual(
+                    payload["data"][0]["labels"],
+                    [[], [], []]
+                    if batched
+                    else [["category_1"], ["category_0"], ["category_0", "category_1"]],
+                )
+                self.assertAlmostEqual(
+                    payload["data"][0]["probs"][0][1], 0.880797, places=6
+                )
+                if batched:
+                    self.assertEqual(payload["data"][1]["index"], 1)
+                    self.assertEqual(payload["data"][1]["label"], ["category_1"])
+                    self.assertEqual(payload["data"][1]["labels"], [["category_1"]])
+                    self.assertEqual(payload["data"][1]["probs"], [[0.5, 1.0]])
+                self.assertTrue(
+                    all(item["num_classes"] == 2 for item in payload["data"])
+                )
+
+    def test_response_schema_keeps_labels_and_probabilities_consistent(self):
+        for data_type, label, probs in (
+            (ClassifyData, "a", [0.5, 0.5]),
+            (TokenClassifyData, ["a", "b"], [[0.5, 0.5], [0.25, 0.75]]),
+        ):
+            with self.subTest(data_type=data_type):
+                item = data_type(index=0, label=label, probs=probs, num_classes=2)
+                response = ClassifyResponse(
+                    id="classify-test",
+                    created=0,
+                    model="test-model",
+                    data=[item.model_dump()],
+                    usage={"prompt_tokens": 2, "total_tokens": 2},
+                )
+                self.assertIsInstance(response.data[0], data_type)
+                mismatched_label = ["a", "b"] if isinstance(label, str) else "a"
+                with self.assertRaises(ValidationError):
+                    ClassifyResponse.model_validate(
+                        {
+                            **response.model_dump(),
+                            "data": [{**item.model_dump(), "label": mismatched_label}],
+                        }
+                    )
+
+    def test_empty_logits_keep_existing_fallback(self):
+        for embedding in ([], [[], []]):
+            with self.subTest(embedding=embedding):
+                serving = self._serving("multi_label_classification")
+                item = serving._build_classify_response(
+                    [{"embedding": embedding}]
+                ).data[0]
+                self.assertIsInstance(item, ClassifyData)
+                self.assertEqual(item.label, "Default")
+                self.assertEqual(item.probs, [1.0])
+                self.assertEqual(item.num_classes, 1)
 
 
 if __name__ == "__main__":

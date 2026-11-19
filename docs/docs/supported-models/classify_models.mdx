@@ -15,6 +15,37 @@ The `label` field gives the highest-scoring class. The `labels` array lists ever
 
 For `single_label_classification` or an unset `problem_type`, the endpoint applies softmax. If a supported checkpoint explicitly declares `"problem_type": "regression"`, `probs` contains the raw regression scores. These scores may fall outside the range from 0 to 1.
 
+### Token classification
+
+For supported models that return logits for each input token, each result in `data` contains a `probs` matrix with shape `[num_tokens, num_classes]` and a `label` list with the top-scoring class for each token. Rows follow input token order, including special tokens. `num_classes` counts labels, and `index` identifies the input in the batch. Inputs in the same batch can have different token counts.
+
+The activation follows the same `problem_type` rule. Sigmoid produces independent class probabilities for each token, softmax normalizes each token's row over classes, and regression preserves raw scores. Sequence classification keeps its flat `probs` vector and string `label`.
+
+For multi-label token classification, `labels` contains one array of qualifying classes per token. The request's `threshold` applies independently to each token, so a token can have multiple qualifying classes or an empty array.
+
+For example, a two-token input with two labels can produce this entry in `data`:
+
+```json
+{
+  "index": 0,
+  "label": ["LABEL_1", "LABEL_0"],
+  "labels": [["LABEL_1"], ["LABEL_0"]],
+  "probs": [[0.119203, 0.880797], [0.880797, 0.119203]],
+  "num_classes": 2
+}
+```
+
+You can provide token IDs through the `input` field when you need to control token positions:
+
+```json
+{
+  "model": "MODEL_PATH",
+  "input": [1, 2]
+}
+```
+
+Replace `MODEL_PATH` with your served model name. This response format preserves per-token scores; it does not merge tokens into entity spans.
+
 ## API Endpoint
 
 ```text Output

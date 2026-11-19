@@ -1615,12 +1615,27 @@ class ClassifyData(BaseModel):
         return data
 
 
+class TokenClassifyData(BaseModel):
+    index: int
+    label: List[str]
+    probs: List[List[float]]
+    num_classes: int
+    labels: Optional[List[List[str]]] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if self.labels is None:
+            data.pop("labels", None)
+        return data
+
+
 class ClassifyResponse(BaseModel):
     id: str
     object: str = "list"
     created: int
     model: str
-    data: List[ClassifyData]
+    data: List[Union[ClassifyData, TokenClassifyData]]
     usage: UsageInfo
 
 
