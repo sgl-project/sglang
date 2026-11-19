@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/model_executor/layers/linear.py
 
+import inspect
 from abc import abstractmethod
 
 import torch
@@ -60,11 +61,13 @@ if _USE_AITER_TGEMM:
 # used where available: the TDM kernel takes whole K tiles only and 16-byte-aligned
 # operands, and the a16w16 one serves everything it turns down.
 _TDM_BLOCK_K = 128
+_TDM_BLOCK_N = 256
 # The TDM kernel addresses A, B and C with 32-bit signed byte offsets. Shapes past
 # that (Wan 2.2's large-M QKV projection is one) must stay on the a16w16 kernel;
 # aiter raises rather than reading out of range, so the check has to happen here.
 _TDM_MAX_LEADING_OFFSET = (2**32 - 1) // 2
 _USE_FLYDSL_TDM_GEMM = False
+_USE_FLYDSL_SWIGLU_GEMM = False
 if USE_AITER_GFX1250:
     from aiter.ops.flydsl.gemm_a16w16_gfx1250 import gemm_a16w16 as _flydsl_gemm
 
@@ -189,6 +192,88 @@ if USE_AITER_GFX1250:
             and all(t.data_ptr() % 16 == 0 for t in operands)
         )
 
+    # The SwiGLU epilogue is a later addition to the same aiter kernel.
+    _USE_FLYDSL_SWIGLU_GEMM = (
+        _USE_FLYDSL_TDM_GEMM
+        and "swiglu_col" in inspect.signature(_flydsl_tdm_gemm).parameters
+    )
+
+    @register_custom_op(
+        op_name="flydsl_gfx1250_swiglu_linear",
+        fake_impl=lambda x, weight, swiglu_col, out_prefix: (
+            x.new_empty(*x.shape[:-1], swiglu_col),
+            x.new_empty(
+                *x.shape[:-1], out_prefix + (weight.shape[0] - swiglu_col) // 2
+            ),
+        ),
+    )
+    def flydsl_swiglu_linear(
+        x: torch.Tensor, weight: torch.Tensor, swiglu_col: int, out_prefix: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Bias-free linear whose weight rows from ``swiglu_col`` on are interleaved
+        (gate, up) pairs.
+
+        Returns the plain projection ``[..., swiglu_col]`` (empty when
+        ``swiglu_col`` is 0, i.e. every column is activated) and a
+        ``[..., out_prefix + pairs]`` tensor whose columns from ``out_prefix`` hold
+        ``silu(gate) * up``; its first ``out_prefix`` columns are uninitialized.
+        """
+        x_2d = x.reshape(-1, x.shape[-1])
+        m, n = x_2d.shape[0], weight.shape[0]
+        block_m = _flydsl_tile_m(m, n, x_2d.device)
+        tail = m % block_m
+        if not (m > block_m and 0 < tail <= _TDM_TAIL_MAX_ROWS):
+            tail = 0
+        weight_t = weight.t()
+        plain = torch.empty((m, swiglu_col), device=x.device, dtype=x.dtype)
+        packed = torch.empty(
+            (m, out_prefix + (n - swiglu_col) // 2), device=x.device, dtype=x.dtype
+        )
+        if not _tdm_gemm_supported(x_2d, weight, None):
+            tail = m
+        else:
+            _flydsl_tdm_gemm(
+                x_2d[: m - tail],
+                weight_t,
+                out=plain[: m - tail] if swiglu_col else None,
+                swiglu_col=swiglu_col,
+                out2=packed[: m - tail, out_prefix:],
+                block_m=block_m,
+                block_n=_TDM_BLOCK_N,
+                block_k=_TDM_BLOCK_K,
+                m_waves=2,
+                n_waves=2,
+                group_m=8,
+                interleave=True,
+            )
+        if tail == m:
+            rows = _flydsl_default_gemm_2d(x_2d, weight, None)
+        elif tail:
+            # 64 rows is the smallest tile the interleaved (epilogue) kernel takes.
+            _flydsl_tdm_gemm(
+                x_2d[m - tail :],
+                weight_t,
+                out=plain[m - tail :] if swiglu_col else None,
+                swiglu_col=swiglu_col,
+                out2=packed[m - tail :, out_prefix:],
+                block_m=64,
+                block_n=_TDM_BLOCK_N,
+                block_k=_TDM_BLOCK_K,
+                m_waves=1,
+                n_waves=4,
+                group_m=1,
+                interleave=True,
+            )
+        if tail == m:
+            plain[m - tail :] = rows[:, :swiglu_col]
+            packed[m - tail :, out_prefix:] = (
+                F.silu(rows[:, swiglu_col::2]) * rows[:, swiglu_col + 1 :: 2]
+            )
+        return (
+            plain.view(*x.shape[:-1], swiglu_col),
+            packed.view(*x.shape[:-1], packed.shape[1]),
+        )
+
     @register_custom_op(
         op_name="flydsl_gfx1250_linear",
         fake_impl=lambda x, weight, bias=None: x.new_empty(
@@ -225,6 +310,45 @@ def _use_flydsl_linear(
         and x.stride(-1) == 1
         and weight.stride(-1) == 1
     )
+
+
+def can_use_flydsl_swiglu_weight(weight: torch.Tensor) -> bool:
+    """Whether this GPU runs the fused SwiGLU epilogue for a packed gate/up weight.
+
+    Separate from ``can_use_flydsl_swiglu_linear`` because a caller has to decide
+    whether to store the weight interleaved at load time, before it sees an input.
+    """
+    return _USE_FLYDSL_SWIGLU_GEMM and weight.dtype in (torch.bfloat16, torch.float16)
+
+
+def can_use_flydsl_swiglu_linear(
+    x: torch.Tensor, weight: torch.Tensor, swiglu_col: int, out_prefix: int
+) -> bool:
+    """Whether ``flydsl_swiglu_linear`` takes these operands."""
+    if not (_USE_FLYDSL_SWIGLU_GEMM and _use_flydsl_linear(x, weight, None)):
+        return False
+    n, k = weight.shape
+    out_width = out_prefix + (n - swiglu_col) // 2
+    # Pointer alignment is checked inside the op: data_ptr() breaks a compiled graph.
+    return (
+        k % _TDM_BLOCK_K == 0
+        and _tdm_offsets_fit(x.reshape(-1, k), weight)
+        and x.numel() // k >= 256
+        and 0 <= swiglu_col < n
+        and swiglu_col % _TDM_BLOCK_N == 0
+        and n % _TDM_BLOCK_N == 0
+        # 8 elements = 16 bytes: both outputs' row pitch and the SwiGLU column offset.
+        and swiglu_col % 8 == 0
+        and out_prefix % 8 == 0
+        and out_width % 8 == 0
+    )
+
+
+def apply_flydsl_swiglu_linear(
+    x: torch.Tensor, weight: torch.Tensor, swiglu_col: int, out_prefix: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``flydsl_swiglu_linear``; call only after ``can_use_flydsl_swiglu_linear``."""
+    return flydsl_swiglu_linear(x, weight, swiglu_col, out_prefix)
 
 
 # aiter gemm_a16w16 kernels index operands with int32 offsets and fault beyond this.

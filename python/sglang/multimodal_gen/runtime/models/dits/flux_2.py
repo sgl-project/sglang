@@ -69,6 +69,10 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
     RowParallelLinear,
+    UnquantizedLinearMethod,
+    apply_flydsl_swiglu_linear,
+    can_use_flydsl_swiglu_linear,
+    can_use_flydsl_swiglu_weight,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
@@ -512,6 +516,21 @@ class Flux2SwiGLU(nn.Module):
         return _flux2_swiglu(x, out)
 
 
+def _swiglu_gemm_fusion_eligible(linear: nn.Module) -> bool:
+    """Whether ``linear``'s packed gate/up rows may be stored interleaved.
+
+    Interleaving rewrites the checkpoint's row order in place, so it is only
+    safe on a plain unquantized BF16/FP16 weight this file owns end to end.
+    """
+    return (
+        can_use_flydsl_swiglu_weight(linear.weight)
+        and type(linear) is MergedColumnParallelLinear
+        and linear.tp_size == 1
+        and isinstance(linear.quant_method, UnquantizedLinearMethod)
+        and linear.bias is None
+    )
+
+
 class Flux2FeedForward(nn.Module):
     def __init__(
         self,
@@ -563,6 +582,31 @@ class Flux2FeedForward(nn.Module):
             self.linear_in._interleave_for_swiglu_fusion = True
             self.linear_out._accepts_prequantized_fp4 = True
             FLUX2_NVFP4_SWIGLU_QUANT.mark(self)
+        # True once linear_in stores its rows as (gate, up) pairs, the layout the
+        # FlyDSL GEMM's SwiGLU epilogue reads.
+        self._swiglu_rows_interleaved = False
+
+    def configure_swiglu_gemm_fusion(self) -> None:
+        """Interleave the loaded gate/up rows when the SwiGLU-epilogue GEMM is on."""
+        if (
+            self._swiglu_rows_interleaved
+            or FLUX2_NVFP4_SWIGLU_QUANT.is_enabled(self)
+            or not _swiglu_gemm_fusion_eligible(self.linear_in)
+        ):
+            return
+        weight = self.linear_in.weight.data
+        gate, up = weight.chunk(2, dim=0)
+        weight.copy_(torch.stack((gate, up), dim=1).flatten(0, 1))
+        self._swiglu_rows_interleaved = True
+
+    def assert_swiglu_fusion_still_valid(self) -> None:
+        if self._swiglu_rows_interleaved and (
+            type(self.linear_in) is not MergedColumnParallelLinear
+        ):
+            raise RuntimeError(
+                "The fused SwiGLU epilogue stores linear_in's gate/up rows "
+                "interleaved and does not support wrapping it (e.g. LoRA)."
+            )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if (
@@ -572,7 +616,18 @@ class Flux2FeedForward(nn.Module):
             and not torch.cuda.is_current_stream_capturing()
         ):
             return apply_nvfp4_gemm_swiglu_quant(self.linear_in, self.linear_out, x)
-        x, _ = self.linear_in(x)
+        if self._swiglu_rows_interleaved:
+            weight = self.linear_in.weight
+            if can_use_flydsl_swiglu_linear(x, weight, 0, 0):
+                # The GEMM epilogue writes SwiGLU into the output projection's input.
+                _, x = apply_flydsl_swiglu_linear(x, weight, 0, 0)
+                x, _ = self.linear_out(x)
+                return x
+            x, _ = self.linear_in(x)
+            # Contiguous [gate | up], the layout Flux2SwiGLU expects.
+            x = torch.cat((x[..., 0::2], x[..., 1::2]), dim=-1)
+        else:
+            x, _ = self.linear_in(x)
         x = self.act_fn(x)
         x, _ = self.linear_out(x)
         return x
@@ -982,6 +1037,9 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
             and isinstance(self.to_out.quant_method, ModelOptFp4LinearMethod)
         ):
             self._enable_nvfp4_token_cat = True
+        # True once to_qkv_mlp_proj stores its MLP rows as (gate, up) pairs, the
+        # layout the FlyDSL GEMM's SwiGLU epilogue reads.
+        self._swiglu_rows_interleaved = False
 
         self.attn = USPAttention(
             num_heads=self.local_heads,
@@ -992,6 +1050,20 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
             supported_attention_backends=supported_attention_backends,
         )
 
+    def configure_swiglu_gemm_fusion(self) -> None:
+        """Interleave the loaded MLP rows when the SwiGLU-epilogue GEMM is enabled."""
+        proj = self.to_qkv_mlp_proj
+        if (
+            self._swiglu_rows_interleaved
+            or self.mlp_mult_factor != 2
+            or not _swiglu_gemm_fusion_eligible(proj)
+        ):
+            return
+        mlp_rows = proj.weight.data[3 * self.local_inner_dim :]
+        gate, up = mlp_rows.chunk(2, dim=0)
+        mlp_rows.copy_(torch.stack((gate, up), dim=1).flatten(0, 1))
+        self._swiglu_rows_interleaved = True
+
     def revalidate_fp8_fast_paths(self) -> None:
         """Recompute fused FP8/NVFP4 fast-path eligibility after submodule changes.
 
@@ -1001,6 +1073,14 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
         attributes off the wrapper and crash. Read them defensively here so a
         recheck after wrapping disables the fusion instead.
         """
+        if (
+            self._swiglu_rows_interleaved
+            and type(self.to_qkv_mlp_proj) is not MergedColumnParallelLinear
+        ):
+            raise RuntimeError(
+                "The fused SwiGLU epilogue stores to_qkv_mlp_proj's MLP rows "
+                "interleaved and does not support wrapping it (e.g. LoRA)."
+            )
         self._enable_fp8_token_cat = self.tp_size == 1 and isinstance(
             getattr(self.to_out, "quant_method", None), ModelOptFp8LinearMethod
         )
@@ -1030,12 +1110,35 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
 
         # Parallel in (QKV + MLP in) projection
         qkv_dim = 3 * self.local_inner_dim
-        hidden_states, _ = self.to_qkv_mlp_proj(hidden_states)
-        qkv, mlp_hidden_states = torch.split(
-            hidden_states,
-            [qkv_dim, self.local_mlp_hidden_dim * self.mlp_mult_factor],
-            dim=-1,
-        )
+        gemm_input = None
+        if self._swiglu_rows_interleaved:
+            weight = self.to_qkv_mlp_proj.weight
+            if can_use_flydsl_swiglu_linear(
+                hidden_states, weight, qkv_dim, self.local_inner_dim
+            ):
+                # The GEMM epilogue writes SwiGLU into the output projection's input.
+                qkv, gemm_input = apply_flydsl_swiglu_linear(
+                    hidden_states, weight, qkv_dim, self.local_inner_dim
+                )
+                mlp_hidden_states = None
+            else:
+                hidden_states, _ = self.to_qkv_mlp_proj(hidden_states)
+                qkv = hidden_states[..., :qkv_dim]
+                # Contiguous [gate | up], the layout Flux2SwiGLU expects.
+                mlp_hidden_states = torch.cat(
+                    (
+                        hidden_states[..., qkv_dim::2],
+                        hidden_states[..., qkv_dim + 1 :: 2],
+                    ),
+                    dim=-1,
+                )
+        else:
+            hidden_states, _ = self.to_qkv_mlp_proj(hidden_states)
+            qkv, mlp_hidden_states = torch.split(
+                hidden_states,
+                [qkv_dim, self.local_mlp_hidden_dim * self.mlp_mult_factor],
+                dim=-1,
+            )
 
         # Handle the attention logic
         query, key, value = qkv.chunk(3, dim=-1)
@@ -1063,8 +1166,7 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
         # remaining columns itself where it can; the GEMM input is byte-identical.
         packed_input = not (self._enable_fp8_token_cat or self._enable_nvfp4_token_cat)
         attn_dim = self.local_inner_dim
-        gemm_input = None
-        if packed_input:
+        if packed_input and gemm_input is None:
             gemm_input = query.new_empty(
                 (*query.shape[:-2], attn_dim + mlp_hidden_states.shape[-1] // 2)
             )
@@ -1593,8 +1695,11 @@ class Flux2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         for block in self.transformer_blocks:
             block.configure_fp8_norm_quant()
+            block.ff.configure_swiglu_gemm_fusion()
+            block.ff_context.configure_swiglu_gemm_fusion()
         for block in self.single_transformer_blocks:
             block.configure_fp8_norm_quant()
+            block.attn.configure_swiglu_gemm_fusion()
         enabled = sum(
             block._fp8_img_attn_norm_quant
             + block._fp8_txt_attn_norm_quant
@@ -1618,6 +1723,8 @@ class Flux2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         """
         for block in self.transformer_blocks:
             block.configure_fp8_norm_quant()
+            block.ff.assert_swiglu_fusion_still_valid()
+            block.ff_context.assert_swiglu_fusion_still_valid()
         for block in self.single_transformer_blocks:
             block.configure_fp8_norm_quant()
             block.attn.revalidate_fp8_fast_paths()

@@ -108,6 +108,52 @@ class TestGfx1250FlyDSLTdmLinear(unittest.TestCase):
         _assert_matches_fp32(out, x, w)
 
 
+@unittest.skipUnless(
+    linear._USE_FLYDSL_SWIGLU_GEMM,
+    "needs a gfx1250 GPU with SGLANG_USE_AITER=1 and an aiter whose TDM GEMM "
+    "takes the SwiGLU epilogue",
+)
+class TestGfx1250FlyDSLSwigluLinear(unittest.TestCase):
+    def test_epilogue_matches_unfused_swiglu_including_leftover_rows(self):
+        # M=4112 covers both launches: 256-row tiles and the 16 leftover rows.
+        m, k, plain, pairs, prefix = 4112, 512, 512, 1024, 256
+        x, w = _inputs(m, plain + 2 * pairs, k)
+        interleaved = w.clone()
+        interleaved[plain:] = torch.stack(
+            (w[plain : plain + pairs], w[plain + pairs :]), dim=1
+        ).flatten(0, 1)
+        self.assertTrue(
+            linear.can_use_flydsl_swiglu_linear(x, interleaved, plain, prefix)
+        )
+        out, packed = linear.apply_flydsl_swiglu_linear(x, interleaved, plain, prefix)
+
+        ref = linear.apply_unquantized_linear(x, w)
+        # The reference's leftover rows use split-K, so only the tiled rows are exact.
+        self.assertTrue(torch.equal(out[:, :4096], ref[:, :4096, :plain]))
+        torch.testing.assert_close(
+            out.float(), ref[..., :plain].float(), atol=3e-2, rtol=2e-2
+        )
+        gate, up = ref[..., plain:].float().chunk(2, dim=-1)
+        self.assertEqual(packed.shape, (1, m, prefix + pairs))
+        # swiglu_col = 0 activates every column, the double blocks' feed-forward.
+        self.assertTrue(
+            linear.can_use_flydsl_swiglu_linear(x, interleaved[plain:], 0, 0)
+        )
+        _, all_activated = linear.apply_flydsl_swiglu_linear(
+            x, interleaved[plain:], 0, 0
+        )
+        self.assertTrue(torch.equal(all_activated, packed[..., prefix:]))
+
+        activated = packed[..., prefix:].float()
+        expected = F.silu(gate) * up
+        # The epilogue's exp2/rcp sigmoid may differ from torch's by one BF16 ulp.
+        torch.testing.assert_close(
+            activated[:, :4096], expected[:, :4096], atol=1e-3, rtol=1e-2
+        )
+        # Leftover rows also carry the two launches' different BF16 rounding.
+        torch.testing.assert_close(activated, expected, atol=1e-1, rtol=5e-2)
+
+
 # FLUX.2-dev 720p single block: (M, K, N) of its two linears, 85% of the GEMM time.
 _FLUX2_SINGLE_BLOCK_SHAPES = ((4112, 6144, 55296), (4112, 24576, 6144))
 # Arbitrary; long enough to average over the package's ~1 s power-throttle cycle.
