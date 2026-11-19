@@ -31,6 +31,7 @@ import tqdm
 
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
+from sglang.srt.layers.amx_utils import cpp_wrapper_enabled
 from sglang.srt.layers.dp_attention import (
     require_attn_tp_gather,
     require_gathered_buffer,
@@ -655,6 +656,7 @@ def register_fake_ops(tp_size: int):
         w2_scale,
         w1_zero,
         w2_zero,
+        a1_scale,
         block_size,
         w1_bias,
         w2_bias,
@@ -666,6 +668,14 @@ def register_fake_ops(tp_size: int):
         if inplace:
             return hidden_states
         return torch.empty_like(hidden_states, dtype=torch.bfloat16)
+
+    if cpp_wrapper_enabled():
+
+        @torch.library.register_fake("sgl_kernel::fused_experts_cpu.scalar_args")
+        def _(hidden_states, w1, w2, topk_weights, topk_ids, inplace, *args):
+            if inplace:
+                return hidden_states
+            return torch.empty_like(hidden_states, dtype=torch.bfloat16)
 
     @register_cpu_compile_fake("qkv_proj_with_rope")
     def _(
@@ -690,8 +700,15 @@ def register_fake_ops(tp_size: int):
     ):
         num_seqs = hidden_states.shape[0]
         num_heads = w_kc.shape[0]
-        kv_lora_rank = w_kc.shape[1]
-        qk_rope_head_dim = kv_a_proj_weight.shape[0] - kv_lora_rank
+        kv_lora_rank = (
+            w_kc.shape[1] * w_kc.shape[-1] if w_kc.ndim == 5 else w_kc.shape[1]
+        )
+        kv_a_out = (
+            kv_a_proj_weight.shape[0] * kv_a_proj_weight.shape[-1]
+            if kv_a_proj_weight.ndim == 4
+            else kv_a_proj_weight.shape[0]
+        )
+        qk_rope_head_dim = kv_a_out - kv_lora_rank
         q_input = torch.empty(
             num_seqs,
             num_heads,
@@ -735,11 +752,6 @@ def register_fake_ops(tp_size: int):
     ):
         num_seqs = hidden_states.shape[0]
         num_heads = w_kc.shape[0]
-        kv_lora_rank = w_kc.shape[1]
-        weight_chunks = torch.split(
-            q_a_proj_weight, [q_lora_rank, kv_lora_rank + qk_rope_head_dim], dim=0
-        )
-        qk_rope_head_dim = weight_chunks[1].shape[0] - kv_lora_rank
         q_input = torch.empty(
             num_seqs,
             num_heads,
@@ -1050,6 +1062,71 @@ def register_fake_ops(tp_size: int):
         c_out = bias.shape[0] if bias is not None else weight.shape[0]
         # CPU conv3d is a patch-embedding GEMM whose D/H/W output is one.
         return x.new_empty((x.shape[0], c_out))
+
+    @torch.library.register_fake("sgl_kernel::float8_linear_cpu")
+    def _(
+        input,
+        input_scales,
+        weight,
+        weight_scales,
+        bias,
+        output_dtype,
+    ):
+        in_shape = input.shape
+        if weight.dim() == 4:
+            N = weight.size(0) * weight.size(-1)
+        else:
+            N = weight.size(0)
+        return input.new_empty(*in_shape[:-1], N, dtype=output_dtype)
+
+    @torch.library.register_fake("sgl_kernel::fp8_scaled_mm_with_quant")
+    def _(
+        input,
+        input_scales,
+        channelwise,
+        weight,
+        weight_scales,
+        bias,
+        output_dtype,
+    ):
+        in_shape = input.shape
+        if weight.dim() == 4:
+            N = weight.size(0) * weight.size(-1)
+        else:
+            N = weight.size(0)
+        return input.new_empty(*in_shape[:-1], N, dtype=output_dtype)
+
+    @torch.library.register_fake("sgl_kernel::_quantize_fp8e4m3_vec")
+    def _(
+        input,
+        channelwise,
+        input_scales,
+    ):
+        M = input.shape[0]
+        K = input.shape[1]
+        act_quant = input.new_empty(M, K, dtype=torch.float8_e4m3fn)
+        scale = (
+            input.new_empty(M, dtype=torch.float)
+            if channelwise
+            else input.new_empty(1, dtype=torch.float)
+        )
+        return act_quant, scale
+
+    @torch.library.register_fake("sgl_kernel::quantize_fp8e4m3")
+    def _(
+        input,
+        channelwise,
+        input_scales,
+    ):
+        M = input.shape[0]
+        K = input.shape[1]
+        act_quant = input.new_empty(M, K, dtype=torch.float8_e4m3fn)
+        scale = (
+            input.new_empty(M, dtype=torch.float)
+            if channelwise
+            else input.new_empty(1, dtype=torch.float)
+        )
+        return act_quant, scale
 
     _CPU_COMPILE_FAKE_OPS_REGISTERED = True
 

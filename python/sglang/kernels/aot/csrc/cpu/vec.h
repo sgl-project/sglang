@@ -4,6 +4,10 @@
 #define CPU_CAPABILITY_AVX512
 #endif
 
+#ifdef SGLANG_CPU_FP8_BRGEMM
+#define CPUBLAS_BRGEMM_F8F8BF16
+#endif
+
 #include <ATen/cpu/vec/functional.h>
 #include <ATen/cpu/vec/vec.h>
 

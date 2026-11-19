@@ -494,6 +494,7 @@ class TestCPUGraph(CustomTestCase):
                 None,
                 None,
                 None,
+                None,
                 True,
             )
             self.assertEqual(out.shape, hidden.shape)

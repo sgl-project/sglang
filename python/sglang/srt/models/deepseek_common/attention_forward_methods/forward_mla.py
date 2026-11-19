@@ -749,10 +749,22 @@ class DeepseekMLAForwardMixin:
                 q_nope_out = q_nope_out[:, :expected_m, :]
             elif self.w_kc.dtype == torch.float8_e4m3fn and not _is_sail:
                 if _is_cpu:
-                    q_nope_out = torch.bmm(
-                        q_nope.to(torch.bfloat16).transpose(0, 1),
-                        self.w_kc.to(torch.bfloat16) * self.w_scale,
-                    )
+                    if self.w_kc.ndim == 5:
+                        q_nope_out = q_nope.new_empty(
+                            (self.num_local_heads, q_nope.shape[0], self.kv_lora_rank)
+                        )
+                        torch.ops.sgl_kernel.bmm_cpu(
+                            q_nope_out,
+                            q_nope.transpose(0, 1),
+                            self.w_kc,
+                            True,
+                            self.w_kc_scale,
+                        )
+                    else:
+                        q_nope_out = torch.bmm(
+                            q_nope.to(torch.bfloat16).transpose(0, 1),
+                            self.w_kc.to(torch.bfloat16) * self.w_scale,
+                        )
                 else:
                     # fix bmm_fp8 error under cublas12.9 caused by bumpallocator, detail in pr#11612
                     q_nope_val, q_nope_scale = per_tensor_quant_mla_fp8(
@@ -1175,10 +1187,26 @@ class DeepseekMLAForwardMixin:
             )
         elif self.w_vc.dtype == torch.float8_e4m3fn and not _is_sail:
             if _is_cpu:
-                attn_bmm_output = torch.bmm(
-                    attn_output.to(torch.bfloat16).transpose(0, 1),
-                    self.w_vc.to(torch.bfloat16) * self.w_scale,
-                )
+                if self.w_vc.ndim == 5:
+                    attn_bmm_output = attn_output.new_empty(
+                        (
+                            self.num_local_heads,
+                            attn_output.shape[0],
+                            self.v_head_dim,
+                        )
+                    )
+                    torch.ops.sgl_kernel.bmm_cpu(
+                        attn_bmm_output,
+                        attn_output.transpose(0, 1),
+                        self.w_vc,
+                        True,
+                        self.w_vc_scale,
+                    )
+                else:
+                    attn_bmm_output = torch.bmm(
+                        attn_output.to(torch.bfloat16).transpose(0, 1),
+                        self.w_vc.to(torch.bfloat16) * self.w_scale,
+                    )
                 attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
             else:
                 attn_output_val, attn_output_scale = per_tensor_quant_mla_fp8(

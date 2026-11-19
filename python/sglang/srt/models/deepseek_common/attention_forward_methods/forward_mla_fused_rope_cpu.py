@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.srt.layers.amx_utils import PackWeightMethod
+from sglang.srt.layers.quantization.fp8 import SGLANG_DEEPSEEK_FP8A8
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.deepseek_common.utils import (
     _is_cpu,
@@ -25,7 +26,16 @@ class DeepseekMLACpuForwardMixin:
         # If not, we will use torch.bmm and weight shouldn't be packed in this case
         if self.has_fused_proj and _is_cpu and _is_cpu_amx_available:
             self.quant_method = PackWeightMethod(
-                weight_names=["w_kc", "w_vc"], transpose_dims=[[1, 2], [1, 2]]
+                weight_names=["w_kc", "w_vc"],
+                transpose_dims=[[1, 2], [1, 2]],
+                use_fp8_w8a8=(
+                    SGLANG_DEEPSEEK_FP8A8
+                    and getattr(
+                        self.fused_qkv_a_proj_with_mqa.quant_method,
+                        "block_quant",
+                        False,
+                    )
+                ),
             )
 
         fused_qkv_weight = (
@@ -104,7 +114,13 @@ class DeepseekMLACpuForwardMixin:
                         else None
                     )
                 ),
-                self.w_scale if self.qkv_proj_with_rope_is_fp8 else None,
+                (
+                    self.w_kc_scale
+                    if self.w_kc.ndim == 5
+                    else self.w_scale
+                    if self.qkv_proj_with_rope_is_fp8
+                    else None
+                ),
                 True,  # is_vnni
                 self.weight_block_size,
                 self.q_lora_rank,
@@ -141,7 +157,11 @@ class DeepseekMLACpuForwardMixin:
         #   mat1: [B, M, K]
         #   mat2: [B, N, K]
         B = self.w_vc.size(0)
-        N = self.w_vc.size(1)
+        N = (
+            self.w_vc.size(1) * self.w_vc.size(-1)
+            if self.w_vc.ndim == 5
+            else self.w_vc.size(1)
+        )
         M = attn_output.size(0)
         output = torch.empty([M, int(B * N)], dtype=attn_output.dtype)
         attn_bmm_output = output.view([M, B, N]).transpose_(0, 1)
@@ -150,7 +170,13 @@ class DeepseekMLACpuForwardMixin:
             attn_output.transpose(0, 1),
             self.w_vc,
             True,  # is_vnni
-            self.w_scale if self.qkv_proj_with_rope_is_fp8 else None,  # scale
+            (
+                self.w_vc_scale
+                if self.w_vc.ndim == 5
+                else self.w_scale
+                if self.qkv_proj_with_rope_is_fp8
+                else None
+            ),
         )
         attn_output = output
         if gate is not None:

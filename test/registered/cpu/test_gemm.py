@@ -219,6 +219,44 @@ class TestGemm(CustomTestCase):
         atol = rtol = precision[ref.dtype]
         torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
 
+    @parametrize(M=[0, 1, 11, 130], N=[128, 224], K=[512, 1024], has_bias=[False, True])
+    def test_fp8_w8a8_gemm(self, M, N, K, has_bias):
+        # dynamic per-row activation quantization, 128-wide block weight scales
+        weight = (torch.randn(N, K) * 8).to(torch.float8_e4m3fn)
+        scales = (torch.rand(N, K // 128) + 0.5) * 0.02
+        bias = torch.randn(N, dtype=torch.float32) if has_bias else None
+        data = torch.randn(M, K, dtype=torch.bfloat16)
+
+        x = data.float()
+        row_scales = (x.abs().amax(dim=-1) / 448).clamp_min(
+            torch.finfo(torch.float32).eps
+        )
+        xq = (
+            (x * row_scales.reciprocal().unsqueeze(-1))
+            .clamp(-448, 448)
+            .to(torch.float8_e4m3fn)
+        )
+        dq_weight = weight.float() * scales.repeat_interleave(128, dim=-1)
+        ref = torch.matmul(xq.float(), dq_weight.T) * row_scales.unsqueeze(-1)
+        if has_bias:
+            ref = ref + bias
+        ref = ref.to(torch.bfloat16)
+
+        packed_weight, packed_scales = torch.ops.sgl_kernel.float8_linear_prepack_cpu(
+            weight, scales
+        )
+        atol = rtol = precision[ref.dtype]
+
+        out = torch.ops.sgl_kernel.float8_linear_cpu(
+            xq, row_scales, packed_weight, packed_scales, bias, torch.bfloat16
+        )
+        torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
+
+        out = torch.ops.sgl_kernel.fp8_scaled_mm_with_quant(
+            data, None, True, packed_weight, packed_scales, bias, torch.bfloat16
+        )
+        torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
+
     @parametrize(M=[1, 11], N=[128, 224], K=[512, 576], has_bias=[False, True])
     def test_mxfp4_gemm(self, M, N, K, has_bias):
         prepack = True

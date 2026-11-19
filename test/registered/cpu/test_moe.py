@@ -5,8 +5,16 @@ import pytest
 # TODO: use interface in cpu.py
 import sgl_kernel  # noqa: F401
 import torch
+from torch._inductor import config as inductor_config
 
-from sglang.srt.layers.amx_utils import CPUQuantMethod
+from sglang.srt.environ import envs
+from sglang.srt.layers.amx_utils import CPUQuantMethod, call_fused_experts_cpu
+from sglang.srt.layers.moe import MoeRunnerConfig
+from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
+from sglang.srt.layers.moe.topk import StandardTopKOutput
+from sglang.srt.layers.quantization import fp8 as fp8_module
+from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
+from sglang.srt.model_executor import cpu_graph_runner
 
 kernel = torch.ops.sgl_kernel
 
@@ -49,6 +57,7 @@ def run_fused_experts(
     w2_scale=None,
     w1_zp=None,
     w2_zp=None,
+    a1_scale=None,
     block_size=None,
     w1_bias=None,
     w2_bias=None,
@@ -70,6 +79,7 @@ def run_fused_experts(
         w2_scale,
         w1_zp,
         w2_zp,
+        a1_scale,
         block_size,
         w1_bias,
         w2_bias,
@@ -137,6 +147,367 @@ def make_mxfp4_weights(e, out_dim, in_dim, dtype, with_bias=False):
 
     bias = torch.randn((e, out_dim), dtype=torch.float32) / 10
     return weight_dq, bias, weight_packed, weight_s_packed
+
+
+def quantize_fp8_rows_reference(x):
+    x = x.float()
+    scales = (x.abs().amax(dim=-1) / 448).clamp_min(torch.finfo(torch.float32).eps)
+    # FP32 reciprocal-then-multiply matters at FP8 rounding ties.
+    scaled = x * scales.reciprocal().unsqueeze(-1)
+    return scaled.clamp(-448, 448).to(torch.float8_e4m3fn), scales
+
+
+def full_fp8_moe_reference(a, w1, w2, topk_weights, topk_ids, quantize_down=True):
+    n = w2.shape[-1]
+    topk = topk_ids.shape[1]
+    intermediate = torch.empty(a.shape[0], topk, a.shape[1], dtype=torch.bfloat16)
+    aq, scales = quantize_fp8_rows_reference(a)
+    for expert in range(w1.shape[0]):
+        tokens, slots = torch.where(topk_ids == expert)
+        if tokens.numel() == 0:
+            continue
+        gate_up = (
+            (aq.float()[tokens] @ w1[expert].T) * scales[tokens, None]
+        ).bfloat16()
+        hidden = (
+            torch.nn.functional.silu(gate_up[:, :n].float()) * gate_up[:, n:].float()
+        ).bfloat16()
+        if quantize_down:
+            hidden_q, hidden_scales = quantize_fp8_rows_reference(hidden)
+            down = (
+                (hidden_q.float() @ w2[expert].T) * hidden_scales[:, None]
+            ).bfloat16()
+        else:
+            down = (hidden.float() @ w2[expert].T).bfloat16()
+        intermediate[tokens, slots] = (
+            down.float() * topk_weights[tokens, slots, None]
+        ).bfloat16()
+    return intermediate.float().sum(dim=1).bfloat16()
+
+
+@pytest.fixture
+def full_fp8_method(monkeypatch):
+    monkeypatch.setattr(fp8_module, "_is_cpu", True)
+    monkeypatch.setattr(fp8_module, "SGLANG_DEEPSEEK_FP8A8", True)
+    config = Fp8Config(is_checkpoint_fp8_serialized=True, weight_block_size=[128, 128])
+    with envs.SGLANG_ENABLE_DEEPSEEK_MOE_FP8_DOWN.override(True):
+        return Fp8MoEMethod(config)
+
+
+def make_full_fp8_moe_weights(method, e, n, k):
+    layer = torch.nn.Module()
+    dequantized = []
+    for name, rows, columns in (("w13", 2 * n, k), ("w2", k, n)):
+        weight = (torch.randn(e, rows, columns) * 16).to(torch.float8_e4m3fn)
+        scales = (torch.rand(e, rows // 128, columns // 128) + 0.5) * 0.01
+        setattr(
+            layer, name + "_weight", torch.nn.Parameter(weight, requires_grad=False)
+        )
+        setattr(
+            layer,
+            name + "_weight_scale_inv",
+            torch.nn.Parameter(scales, requires_grad=False),
+        )
+        dequantized.append(
+            weight.float() * scales.repeat_interleave(128, 1).repeat_interleave(128, 2)
+        )
+    method._pack_full_fp8_cpu_weights(layer)
+    return layer, *dequantized
+
+
+def run_full_fp8_moe(layer, a, scales, weights, ids, cpp_wrapper=False, **overrides):
+    args = dict(
+        inplace=False,
+        moe_comp_method=CPUQuantMethod.FP8_W8A8_FULL,
+        w1_scale=layer.w13_weight_scale_inv,
+        w2_scale=layer.w2_weight_scale_inv,
+        w1_zero=None,
+        w2_zero=None,
+        a1_scale=scales,
+        block_size=[128, 128],
+        w1_bias=None,
+        w2_bias=None,
+        alpha=None,
+        limit=None,
+        is_vnni=True,
+        activation="silu",
+    )
+    args.update(overrides)
+    return call_fused_experts_cpu(
+        cpp_wrapper, a, layer.w13_weight, layer.w2_weight, weights, ids, **args
+    )
+
+
+class TestFullFp8MoE:
+    @pytest.mark.parametrize(
+        "is_cpu,deepseek,down,expected",
+        [
+            (True, True, None, True),
+            (True, True, "0", False),
+            (True, True, "1", True),
+            (True, False, None, False),
+            (True, False, "0", False),
+            (False, True, None, False),
+            (False, False, None, False),
+        ],
+    )
+    def test_mode_selection(self, monkeypatch, is_cpu, deepseek, down, expected):
+        monkeypatch.setattr(fp8_module, "_is_cpu", is_cpu)
+        monkeypatch.setattr(fp8_module, "SGLANG_DEEPSEEK_FP8A8", deepseek)
+        if down is None:
+            monkeypatch.delenv("SGLANG_ENABLE_DEEPSEEK_MOE_FP8_DOWN", raising=False)
+        else:
+            monkeypatch.setenv("SGLANG_ENABLE_DEEPSEEK_MOE_FP8_DOWN", down)
+        config = Fp8Config(
+            is_checkpoint_fp8_serialized=True, weight_block_size=[128, 128]
+        )
+        method = Fp8MoEMethod(config)
+        assert method.use_full_fp8_moe == expected
+
+    @pytest.mark.parametrize(
+        "m,n,k,e,topk,skewed",
+        [
+            (1, 128, 256, 8, 2, False),
+            (3, 256, 128, 8, 2, True),
+            (96, 512, 256, 32, 8, False),
+            (121, 256, 256, 8, 4, True),
+        ],
+    )
+    @pytest.mark.parametrize("zero_input", [False, True])
+    def test_two_w8a8_gemms(
+        self, full_fp8_method, m, n, k, e, topk, skewed, zero_input
+    ):
+        layer, w1, w2 = make_full_fp8_moe_weights(full_fp8_method, e, n, k)
+        a = (torch.randn(m, k) / math.sqrt(k)).bfloat16()
+        if zero_input:
+            a.zero_()
+        else:
+            a[0, 0] = 4
+            if m > 1:
+                a[-1].zero_()
+        weights, ids = make_routing(m, e, topk, dtype=dtype)
+        ids = ids.to(torch.int32)
+        if skewed:
+            ids[:] = torch.arange(topk - 1, -1, -1, dtype=torch.int32)
+        aq, scales = kernel._quantize_fp8e4m3_vec(a, True, None)
+        reference = full_fp8_moe_reference(a, w1, w2, weights, ids)
+        try:
+            actual = run_full_fp8_moe(layer, aq, scales, weights, ids)
+        except RuntimeError as error:
+            if "requires CPU FP8 BRGEMM support" in str(error) or (
+                "requires a PyTorch build with CPU FP8 BRGEMM support" in str(error)
+            ):
+                pytest.skip(str(error))
+            raise
+        torch.testing.assert_close(actual, reference, atol=0.0005, rtol=0.02)
+        scalar_actual = run_full_fp8_moe(
+            layer, aq, scales, weights, ids, cpp_wrapper=True
+        )
+        torch.testing.assert_close(scalar_actual, actual, atol=0, rtol=0)
+
+    @pytest.mark.parametrize("num_threads", [1, 5])
+    def test_threaded_gather_and_silu_scratch(self, full_fp8_method, num_threads):
+        previous_threads = torch.get_num_threads()
+        try:
+            with torch.random.fork_rng(devices=[]):
+                torch.manual_seed(1234)
+                torch.set_num_threads(num_threads)
+                m, n, k, e, topk = 97, 384, 256, 8, 3
+                layer, w1, w2 = make_full_fp8_moe_weights(full_fp8_method, e, n, k)
+                a = (torch.randn(m, k) / math.sqrt(k)).bfloat16()
+                a[0].zero_()
+                a[-1, 0] = 4
+                weights, ids = make_routing(m, e, topk, dtype=dtype)
+                aq, scales = kernel._quantize_fp8e4m3_vec(a, True, None)
+                reference = full_fp8_moe_reference(a, w1, w2, weights, ids)
+                try:
+                    actual = run_full_fp8_moe(
+                        layer, aq, scales, weights, ids.to(torch.int32)
+                    )
+                except RuntimeError as error:
+                    if "requires CPU FP8 BRGEMM support" in str(error) or (
+                        "requires a PyTorch build with CPU FP8 BRGEMM support"
+                        in str(error)
+                    ):
+                        pytest.skip(str(error))
+                    raise
+                torch.testing.assert_close(actual, reference, atol=0.0005, rtol=0.02)
+        finally:
+            torch.set_num_threads(previous_threads)
+
+    @pytest.mark.parametrize("m", [1, 96])
+    def test_row_quantization(self, m):
+        a = torch.randn(m, 256).bfloat16()
+        a[0].zero_()
+        if m > 1:
+            a[1, 0] = 128
+        actual_q, actual_scales = kernel._quantize_fp8e4m3_vec(a, True, None)
+        expected_q, expected_scales = quantize_fp8_rows_reference(a)
+        torch.testing.assert_close(actual_scales, expected_scales, atol=0, rtol=0)
+        torch.testing.assert_close(
+            actual_q.float(), expected_q.float(), atol=0.016, rtol=0.13
+        )
+
+    @pytest.mark.parametrize(
+        "overrides,message",
+        [
+            ({"inplace": True}, "inplace=False"),
+            ({"is_vnni": False}, "prepacked weights"),
+            ({"activation": "gelu"}, "silu"),
+            ({"w1_bias": torch.zeros(256)}, "biases"),
+            ({"a1_scale": None}, "requires w1_scale"),
+            ({"w2_scale": None}, "requires w1_scale"),
+            ({"block_size": [64, 128]}, "block_size"),
+            ({"a1_scale": torch.ones(2)}, "as.size"),
+            ({"w2_scale": torch.ones(2, 4, 2, 32)}, "w2s.size"),
+        ],
+    )
+    def test_invalid_full_mode(self, full_fp8_method, overrides, message):
+        layer, _, _ = make_full_fp8_moe_weights(full_fp8_method, 2, 128, 128)
+        a = torch.zeros(1, 128, dtype=torch.float8_e4m3fn)
+        with pytest.raises(RuntimeError, match=message):
+            run_full_fp8_moe(
+                layer,
+                a,
+                torch.ones(1),
+                torch.ones(1, 1),
+                torch.zeros(1, 1, dtype=torch.int32),
+                **overrides,
+            )
+
+    def test_mode_is_snapshotted(self, full_fp8_method):
+        with envs.SGLANG_ENABLE_DEEPSEEK_MOE_FP8_DOWN.override(False):
+            layer, _, _ = make_full_fp8_moe_weights(full_fp8_method, 2, 256, 128)
+        assert full_fp8_method.use_full_fp8_moe
+        assert layer.use_intel_amx_backend
+        assert layer.w13_weight.shape == (2, 16, 1, 128, 32)
+        assert layer.w2_weight.shape == (2, 4, 2, 128, 32)
+        assert layer.w2_weight_scale_inv.shape == (2, 4, 2, 32)
+
+    @pytest.mark.parametrize("m", [0, 3])
+    def test_python_dispatch(self, full_fp8_method, monkeypatch, m):
+        monkeypatch.delenv("SGLANG_ENABLE_DEEPSEEK_MOE_FP8_DOWN", raising=False)
+        full_fp8_method = Fp8MoEMethod(full_fp8_method.quant_config)
+        layer, w1, w2 = make_full_fp8_moe_weights(full_fp8_method, 2, 256, 128)
+        full_fp8_method.create_moe_runner(layer, MoeRunnerConfig())
+        a = (torch.randn(m, 128) / math.sqrt(128)).bfloat16()
+        weights, ids = make_routing(m, 2, 1, dtype=dtype)
+        dispatch = StandardDispatchOutput(
+            hidden_states=a,
+            hidden_states_scale=None,
+            topk_output=StandardTopKOutput(
+                weights, ids.to(torch.int32), torch.zeros(m, 2)
+            ),
+        )
+        try:
+            result = full_fp8_method.apply(layer, dispatch).hidden_states
+        except RuntimeError as error:
+            if "requires CPU FP8 BRGEMM support" in str(error) or (
+                "requires a PyTorch build with CPU FP8 BRGEMM support" in str(error)
+            ):
+                pytest.skip(str(error))
+            raise
+        reference = full_fp8_moe_reference(a, w1, w2, weights, ids)
+        torch.testing.assert_close(result, reference, atol=0.0005, rtol=0.02)
+
+    def test_rejects_incompatible_config(self, full_fp8_method, monkeypatch):
+        monkeypatch.setattr(fp8_module, "SGLANG_DEEPSEEK_FP8A8", False)
+        with envs.SGLANG_ENABLE_DEEPSEEK_MOE_FP8_DOWN.override(True):
+            with pytest.raises(ValueError, match="SGLANG_DEEPSEEK_FP8A8=1"):
+                Fp8MoEMethod(full_fp8_method.quant_config)
+        with pytest.raises(ValueError, match="silu"):
+            full_fp8_method.create_moe_runner(
+                torch.nn.Module(), MoeRunnerConfig(activation="gelu")
+            )
+
+    @pytest.mark.parametrize("n,k", [(128, 320), (352, 256)])
+    def test_rejects_unaligned_weights(self, full_fp8_method, n, k):
+        layer = torch.nn.Module()
+        layer.w13_weight = torch.empty(2, 2 * n, k, dtype=torch.float8_e4m3fn)
+        layer.w2_weight = torch.empty(2, k, n, dtype=torch.float8_e4m3fn)
+        with pytest.raises(ValueError, match="divisible by 128"):
+            full_fp8_method._pack_full_fp8_cpu_weights(layer)
+
+    @pytest.mark.parametrize(
+        "params_dtype,with_bias", [(torch.float16, False), (torch.bfloat16, True)]
+    )
+    def test_rejects_unsupported_activation_dtype_and_bias(
+        self, full_fp8_method, params_dtype, with_bias
+    ):
+        with pytest.raises(ValueError, match="BF16 activations and no expert biases"):
+            full_fp8_method.create_weights(
+                torch.nn.Module(), 2, 128, 256, params_dtype, with_bias=with_bias
+            )
+
+    @pytest.mark.parametrize("m", [1, 96])
+    def test_existing_mixed_precision_path(self, full_fp8_method, m):
+        e, n, k, topk = 8, 256, 256, 2
+        layer, w1, _ = make_full_fp8_moe_weights(full_fp8_method, e, n, k)
+        raw_w2 = (torch.randn(e, k, n) * 16).to(torch.float8_e4m3fn)
+        w2_scales = (torch.rand(e, k // 128, n // 128) + 0.5) * 0.01
+        w2 = raw_w2.float() * w2_scales.repeat_interleave(128, 1).repeat_interleave(
+            128, 2
+        )
+        a = (torch.randn(m, k) / math.sqrt(k)).bfloat16()
+        aq, scales = kernel._quantize_fp8e4m3_vec(a, True, None)
+        weights, ids = make_routing(m, e, topk, dtype=dtype)
+        # Probe the FP8 backend before exercising the unguarded legacy entry point.
+        try:
+            run_full_fp8_moe(layer, aq, scales, weights, ids)
+        except RuntimeError as error:
+            if "requires CPU FP8 BRGEMM support" in str(error) or (
+                "requires a PyTorch build with CPU FP8 BRGEMM support" in str(error)
+            ):
+                pytest.skip(str(error))
+            raise
+        with envs.SGLANG_ENABLE_DEEPSEEK_MOE_FP8_DOWN.override(False):
+            mixed_method = Fp8MoEMethod(full_fp8_method.quant_config)
+        layer.w2_weight = torch.nn.Parameter(
+            kernel.convert_weight_packed(raw_w2), requires_grad=False
+        )
+        layer.w2_weight_scale_inv = torch.nn.Parameter(w2_scales, requires_grad=False)
+        mixed_method.create_moe_runner(layer, MoeRunnerConfig())
+        dispatch = StandardDispatchOutput(
+            hidden_states=a,
+            hidden_states_scale=None,
+            topk_output=StandardTopKOutput(
+                weights, ids.to(torch.int32), torch.zeros(m, e)
+            ),
+        )
+        actual = mixed_method.apply(layer, dispatch).hidden_states
+        reference = full_fp8_moe_reference(a, w1, w2, weights, ids, quantize_down=False)
+        torch.testing.assert_close(actual, reference, atol=0.0005, rtol=0.02)
+
+    @pytest.mark.parametrize("m", [0, 3])
+    def test_fullgraph_and_scalar_overload(self, full_fp8_method, m):
+        layer, _, _ = make_full_fp8_moe_weights(full_fp8_method, 2, 128, 128)
+        a = torch.randn(m, 128).to(torch.float8_e4m3fn)
+        scales = torch.full((m,), 0.1)
+        weights = torch.full((m, 1), 0.7)
+        ids = (torch.arange(m, dtype=torch.int32) % 2).reshape(m, 1)
+        try:
+            expected = run_full_fp8_moe(layer, a, scales, weights, ids)
+        except RuntimeError as error:
+            if "requires CPU FP8 BRGEMM support" in str(error) or (
+                "requires a PyTorch build with CPU FP8 BRGEMM support" in str(error)
+            ):
+                pytest.skip(str(error))
+            raise
+        with inductor_config.patch(cpp_wrapper=True):
+            cpu_graph_runner.register_fake_ops(tp_size=1)
+        for cpp_wrapper in (False, True):
+
+            def forward(a, scales, weights, ids):
+                return run_full_fp8_moe(
+                    layer, a, scales, weights, ids, cpp_wrapper=cpp_wrapper
+                )
+
+            with inductor_config.patch(cpp_wrapper=cpp_wrapper):
+                compiled = torch.compile(forward, backend="inductor", fullgraph=True)
+                result = compiled(a, scales, weights, ids)
+            assert result.shape == (m, 128)
+            assert result.dtype == torch.bfloat16
+            torch.testing.assert_close(result, expected, atol=0, rtol=0)
 
 
 class TestFusedExperts:

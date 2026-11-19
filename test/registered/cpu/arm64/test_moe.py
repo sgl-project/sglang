@@ -82,6 +82,7 @@ class TestFusedExpertsInt8(CustomTestCase):
             None,
             None,
             None,
+            None,
             prepack,
         )
 
