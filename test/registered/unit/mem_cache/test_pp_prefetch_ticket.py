@@ -1104,6 +1104,7 @@ class TestPPPrefetchTicket(unittest.TestCase):
 
 
 class _StageStore:
+    layer_done_counter = Mock()
     load_mode = "prefetch"
     prefetch_policy = "wait_complete"
 
