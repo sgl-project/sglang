@@ -234,7 +234,8 @@ def modelexpress_config_of(cfg: Any) -> dict:
 
 def modelexpress_url_of(cfg: Any) -> Optional[str]:
     """The modelexpress endpoint a config-shaped object points at."""
-    return modelexpress_config_of(cfg).get("url")
+    config = modelexpress_config_of(cfg)
+    return config.get("server_url", config.get("url"))
 
 
 def modelexpress_transport_of(cfg: Any) -> str:

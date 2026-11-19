@@ -173,6 +173,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
+    UpdateWeightsFromModelExpressReqInput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightVersionReqInput,
     VertexGenerateReqInput,
@@ -1338,6 +1339,19 @@ async def update_weights_from_disk(
             content,
             status_code=HTTPStatus.BAD_REQUEST,
         )
+
+
+@app.post("/update_weights_from_modelexpress")
+async def update_weights_from_modelexpress(
+    obj: Annotated[UpdateWeightsFromModelExpressReqInput, Body()], request: Request
+):
+    result = await _global_state.tokenizer_manager.update_weights_from_modelexpress(
+        obj, request
+    )
+    return SGLangORJSONResponse(
+        msgspec_to_builtins(result),
+        status_code=HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST,
+    )
 
 
 @app.post("/init_weights_send_group_for_remote_instance")
