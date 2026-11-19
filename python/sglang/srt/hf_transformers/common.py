@@ -101,6 +101,7 @@ from sglang.srt.configs.all_configs import (
 from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config
 from sglang.srt.configs.deepseek_v41 import DEEPSEEK_V41_CONFIG_CLASSES
 from sglang.srt.configs.internvl import InternVLChatConfig
+from sglang.srt.configs.solar_open2 import SolarOpen2Config
 from sglang.srt.utils import get_bool_env_var, logger, lru_cache_frozenset
 from sglang.srt.utils.hf_transformers_patches import normalize_rope_scaling_compat
 from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
@@ -146,6 +147,7 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         Glm5NextConfig,
         Glm5NextTextConfig,
         KimiLinearConfig,
+        SolarOpen2Config,
         Qwen3NextConfig,
         Qwen4ExpConfig,
         Qwen4ExpTextConfig,

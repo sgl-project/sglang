@@ -25,6 +25,7 @@ REASONING_PARSER_NAMES = [
     "poolside_v1",
     "qwen3",
     "qwen3-thinking",
+    "solar_open2",
     "minimax",
     "minimax-append-think",
     "minimax-m3",
