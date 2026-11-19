@@ -5,6 +5,10 @@ description: "Control how SGLang loads model weights: load formats, model loader
 
 `--model-path` selects the checkpoint to serve; `--load-format` and the weight-loading flags below control how those weights are read into memory. To stream weights from cloud object storage (S3/GCS/Azure), see [Loading Models from Object Storage](./object_storage).
 
+<Note>
+Model weights are downloaded from the [Hugging Face Hub](https://huggingface.co/docs/hub/models-downloading) by default; set `SGLANG_USE_MODELSCOPE=true` to use [ModelScope](/docs/supported-models/modelscope) instead. To serve Hugging Face-hosted artifacts from an on-premises cache, point `HF_ENDPOINT` at a compatible registry such as [MatrixHub](https://matrixhub.ai/), a self-hosted model registry and distribution layer.
+</Note>
+
 ## How loading works
 
 SGLang picks a loader from `--load-format`, falling back to auto-detection from the checkpoint or model path. The default `auto` loader reads `safetensors` and falls back to PyTorch `.bin`.
