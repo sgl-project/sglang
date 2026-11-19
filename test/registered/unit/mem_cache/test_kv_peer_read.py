@@ -1,50 +1,102 @@
-"""Contract tests for the peer KV page reader, against a fake CUDA layer."""
+"""Peer KV page reads: contract tests against a fake CUDA layer, and a two-process
+GPU test over a CUDA FABRIC export, byte-checked."""
 
 import contextlib
+import multiprocessing as mp
 import unittest
 
 import numpy as np
+import torch
+from cuda.bindings import driver as drv
 
 from sglang.srt.mem_cache.kv_peer_read import (
-    KvPeerExporter,
     KvPeerReader,
     PeerBuffer,
     PeerReadBusy,
     PeerReadError,
-    PeerRegion,
     PeerRegionDescriptor,
     ReadGroup,
     ReadState,
+    export_region,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.srt.utils.cuda_vmm_utils import (
+    align_up,
+    check_drv,
+    get_allocation_granularity,
+    get_gpu_fabric_clique,
+    make_device_allocation_prop,
+    make_rw_access_desc,
+    tensor_from_pointer,
+)
+from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
+from sglang.test.test_utils import CustomTestCase, is_in_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cuda_ci(est_time=40, stage="base-c", runner_config="2-gpu-gb300")
 
-NOT_READY, OK, ILLEGAL_ADDRESS, NON_STICKY = 600, 0, 700, 999
 PAGE = 256
 OWNER_DEV, READER_DEV = 0, 1
+CLIQUE = (b"c" * 16, 1)
+NOT_STICKY, STICKY = False, True
+
+
+# ===== Contract tests against a fake CUDA layer =====
+
+
+def describe(base, size, clique=CLIQUE):
+    # The fake's FABRIC handle is the owner's base address.
+    return PeerRegionDescriptor(
+        version=1,
+        size=size,
+        fabric_handle=base.to_bytes(8, "little") * 8,
+        fabric_clique=clique,
+    )
+
+
+class FakeStream:
+    def __init__(self, ops):
+        self.ops = ops
+
+    def wait_stream(self, producer):
+        self.ops.log.append(("wait", producer))
+
+    def synchronize(self):
+        self.ops.log.append("sync")
+        if self.ops.sticky:
+            raise RuntimeError("CUDA error: an illegal memory access was encountered")
+        self.ops.land(len(self.ops.pending))
+
+
+class FakeEvent:
+    def __init__(self, ops, number, mark):
+        self.ops, self.number, self.mark = ops, number, mark
+
+    def query(self):
+        sticky = self.ops.event_errors.get(self.number)
+        if sticky is not None:
+            self.ops.sticky |= sticky
+            raise RuntimeError(f"CUDA error reported on event {self.number}")
+        if self.ops.hold:
+            return False
+        self.ops.land(self.mark)
+        return True
 
 
 class FakeOps:
-    """Byte-addressed fake: launches queue page copies that land when a later event is queried."""
+    """Byte-addressed fake: gathers queue page copies that land when a later event
+    completes or the stream is synchronized."""
 
-    not_ready = NOT_READY
-
-    def __init__(self, clique=(b"c" * 16, 1)):
+    def __init__(self, clique=CLIQUE):
         self.allocs = {}  # base -> (bytearray, device)
-        self.handles = {}  # fabric handle -> base
         self.clique = clique
-        self.pending = []  # copies not yet landed
-        self.event_marks = {}  # recorded event -> number of copies queued before it
-        self.num_events = 0
+        self.pending = []  # queued copies, in stream order
         self.landed = 0
         self.log = []
+        self.events = 0
         self.launches = 0
         self.fail_launch_at = None
-        self.event_codes = {}  # event -> error code reported instead of completion
-        self.sync_code = OK
-        self.fail_record = False
-        self.fail_event_at = None  # new_event call that raises
+        self.event_errors = {}  # event number -> whether its error is sticky
+        self.sticky = False
         self.hold = False
         self._next = 1 << 20
 
@@ -63,17 +115,20 @@ class FakeOps:
         buf, off = self._locate(addr)
         return bytes(buf[off : off + n])
 
-    def fabric_clique(self, device):
+    def land(self, upto):
+        while self.landed < upto:
+            src, dst, n = self.pending[self.landed]
+            data = self.read(src, n)
+            buf, off = self._locate(dst)
+            buf[off : off + n] = data
+            self.landed += 1
+
+    def fabric_clique(self):
         return self.clique
 
-    def export_handle(self, base):
-        handle = base.to_bytes(8, "little") * 8
-        self.handles[handle] = base
-        return handle
-
-    def map_import(self, fabric_handle, size, device):
+    def map_import(self, fabric_handle, size):
         self.log.append("map")
-        return self.handles[fabric_handle]  # alias the owner's bytes
+        return int.from_bytes(fabric_handle[:8], "little")  # alias the owner's bytes
 
     def unmap_import(self, address, size):
         self.log.append("unmap")
@@ -84,78 +139,32 @@ class FakeOps:
                 return device
         return None
 
-    def new_stream(self, device):
-        return "copy-stream"
-
-    def wait_stream(self, stream, producer):
-        self.log.append(("wait", producer))
-
-    def warmup(self, stream):
-        self.log.append("warmup")
+    def new_stream(self):
+        return FakeStream(self)
 
     def current(self, stream):
         return contextlib.nullcontext()
 
-    def stage(self, stream, meta, slices):
-        self.log.append("stage")
-        meta = meta.copy()
-        views = [
-            [
-                (page_bytes, *(meta[o : o + n] for o, n in launch_slices))
-                for page_bytes, launch_slices in group
-            ]
-            for group in slices
-        ]
-        return meta, views
+    def warmup(self, stream):
+        pass
 
-    def launch(self, view):
+    def upload(self, arrays):
+        return [array.copy() for array in arrays]
+
+    def gather(self, *, src_bases, dst_bases, src_pages, dst_pages, page_bytes):
         if self.fail_launch_at == self.launches:
             raise RuntimeError("launch failed")
         self.launches += 1
         self.log.append("launch")
-        page_bytes, src_bases, dst_bases, src_pages, dst_pages = view
         for s, d in zip(src_bases.tolist(), dst_bases.tolist()):
             for sp, dp in zip(src_pages.tolist(), dst_pages.tolist()):
                 self.pending.append(
                     (s + sp * page_bytes, d + dp * page_bytes, page_bytes)
                 )
 
-    def new_event(self, stream):
-        if self.fail_event_at == self.num_events:
-            raise RuntimeError("event creation failed")
-        self.num_events += 1
-        return self.num_events - 1
-
-    def record(self, event, stream):
-        if self.fail_record:
-            raise RuntimeError("record failed")
-        self.event_marks[event] = len(self.pending)
-
-    def _land(self, upto):
-        while self.landed < upto:
-            src, dst, n = self.pending[self.landed]
-            data = self.read(src, n)
-            buf, off = self._locate(dst)
-            buf[off : off + n] = data
-            self.landed += 1
-
-    def query_event(self, event):
-        if event in self.event_codes:
-            return self.event_codes[event]
-        if self.hold:
-            return NOT_READY
-        self._land(self.event_marks[event])
-        return OK
-
-    def sync_event(self, event):
-        self.log.append(("sync", event))
-        return self.sync_code
-
-    def destroy_event(self, event):
-        self.log.append(("destroy", event))
-
-    def is_sticky(self, code):
-        return code == ILLEGAL_ADDRESS
+    def record_event(self, stream):
+        self.events += 1
+        return FakeEvent(self, self.events - 1, len(self.pending))
 
 
 class PeerReadTestBase(unittest.TestCase):
@@ -176,16 +185,13 @@ class PeerReadTestBase(unittest.TestCase):
             self.ops.alloc(self.NUM_PAGES * PAGE, READER_DEV, fill=0xEE)
             for _ in range(self.layers)
         ]
-        self.exporter = KvPeerExporter(OWNER_DEV, _ops=self.ops)
         self.reader = KvPeerReader(READER_DEV, _ops=self.ops)
-        self.desc = self.exporter.export(self.src, self.region_bytes, region_id="kv")
-        self.region = self.reader.import_region(self.desc)
+        self.region = self.reader.import_region(describe(self.src, self.region_bytes))
 
-    def group(self, src_pages, dst_pages, layers=None, dst=None, regions=None):
+    def group(self, src_pages, dst_pages, dst=None, regions=None):
         dst = dst or self.dst
         regions = regions or [self.region] * self.layers
-        layers = range(self.layers) if layers is None else layers
-        buffers = tuple(
+        buffers = [
             PeerBuffer(
                 src_region=regions[layer],
                 src_offset=layer * self.NUM_PAGES * PAGE,
@@ -193,8 +199,8 @@ class PeerReadTestBase(unittest.TestCase):
                 page_bytes=PAGE,
                 dst_num_pages=self.NUM_PAGES,
             )
-            for layer in layers
-        )
+            for layer in range(self.layers)
+        ]
         return ReadGroup(
             buffers=buffers,
             src_pages=np.array(src_pages),
@@ -220,10 +226,8 @@ class TestReadData(PeerReadTestBase):
             for dp in (1, 2, 4, 5, 7):
                 self.assertEqual(self.dst_page(layer, dp), b"\xee" * PAGE)
         self.reader.release(batch)
-
-    def test_kernel_is_warmed_before_the_first_read(self):
-        # A first launch inside a (possibly gated) group could load the module there.
-        self.assertLess(self.ops.log.index("warmup"), self.ops.log.index("map"))
+        with self.assertRaises(ValueError):
+            self.reader.status(batch)
 
     def test_producer_stream_is_waited_before_any_launch(self):
         batch = self.reader.read([self.group([0], [0])], producer_stream="prod")
@@ -234,63 +238,51 @@ class TestReadData(PeerReadTestBase):
         self.reader.release(batch)
 
 
-class TestValidationIsAtomic(PeerReadTestBase):
-    def assert_rejected(self, groups, error=ValueError):
+class TestValidation(PeerReadTestBase):
+    def test_rejected_batches_touch_nothing(self):
+        n = self.NUM_PAGES
+        local = self.ops.alloc(self.region_bytes, READER_DEV)
+        imported = self.reader.import_region(describe(local, self.region_bytes))
+        other_reader = KvPeerReader(READER_DEV, _ops=self.ops)
+        foreign = other_reader.import_region(describe(self.src, self.region_bytes))
+        on_owner = self.ops.alloc(n * PAGE, OWNER_DEV)
+        short = self.ops.alloc(PAGE, READER_DEV)
+        cases = {
+            "source page beyond region": [self.group([0], [0]), self.group([n], [1])],
+            "destination page beyond buffer": [
+                self.group([0], [0]),
+                self.group([1], [n]),
+            ],
+            "destination on another device": [
+                self.group([0], [0], dst=[on_owner, self.dst[1]])
+            ],
+            "destination inside an imported region": [
+                self.group([0], [0], dst=[imported.address, self.dst[1]])
+            ],
+            "destination running past its allocation": [
+                self.group([0], [0], dst=[short, self.dst[1]])
+            ],
+            "misaligned destination": [
+                self.group([0], [0], dst=[self.dst[0] + 16, self.dst[1]])
+            ],
+            "page lists of different lengths": [self.group([0, 1], [0])],
+            "negative page id": [self.group([-1], [0])],
+            "region of another reader": [
+                self.group([0], [0], regions=[foreign] * self.layers)
+            ],
+            "empty batch": [],
+        }
         before = [bytes(self.ops.allocs[d][0]) for d in self.dst]
-        with self.assertRaises(error):
-            self.reader.read(groups)
+        for name, groups in cases.items():
+            with self.subTest(name), self.assertRaises(ValueError):
+                self.reader.read(groups)
         self.assertEqual(self.ops.launches, 0)
         self.assertEqual([bytes(self.ops.allocs[d][0]) for d in self.dst], before)
 
-    def test_source_page_beyond_region(self):
-        self.assert_rejected([self.group([0], [0]), self.group([self.NUM_PAGES], [1])])
-
-    def test_destination_page_beyond_buffer(self):
-        self.assert_rejected([self.group([0], [0]), self.group([1], [self.NUM_PAGES])])
-
-    def test_duplicate_destination_page_in_group(self):
-        self.assert_rejected([self.group([0, 1], [2, 2])])
-
-    def test_same_destination_page_in_two_groups(self):
-        self.assert_rejected([self.group([0], [2]), self.group([1], [2])])
-
-    def test_two_buffers_of_a_group_share_a_destination(self):
-        self.assert_rejected([self.group([0], [2], dst=[self.dst[0], self.dst[0]])])
-
-    def test_partially_overlapping_destination_buffers(self):
-        shifted = [self.dst[0] + PAGE, self.dst[1]]
-        self.assert_rejected([self.group([0], [0]), self.group([1], [5], dst=shifted)])
-
-    def test_destination_on_another_device(self):
-        foreign = self.ops.alloc(self.NUM_PAGES * PAGE, OWNER_DEV)
-        self.assert_rejected([self.group([0], [0], dst=[foreign, self.dst[1]])])
-
-    def test_destination_inside_an_imported_region(self):
-        local = self.ops.alloc(self.region_bytes, READER_DEV)
-        peer = self.reader.import_region(
-            self.exporter.export(local, self.region_bytes, region_id="local")
-        )
-        self.assert_rejected([self.group([0], [0], dst=[peer.address, self.dst[1]])])
-
-    def test_destination_running_past_its_allocation(self):
-        short = self.ops.alloc(PAGE, READER_DEV)
-        self.assert_rejected([self.group([0], [0], dst=[short, self.dst[1]])])
-
-    def test_misaligned_destination(self):
-        self.assert_rejected(
-            [self.group([0], [0], dst=[self.dst[0] + 16, self.dst[1]])]
-        )
-
-    def test_mismatched_page_lists_and_empty_batch(self):
-        self.assert_rejected([self.group([0, 1], [0])])
-        self.assert_rejected([])
-
 
 class TestRegions(PeerReadTestBase):
-    def test_one_batch_reads_several_regions(self):
-        second = self.reader.import_region(
-            self.exporter.export(self.src, self.region_bytes, region_id="kv")
-        )
+    def test_one_batch_reads_several_regions_and_pins_them(self):
+        second = self.reader.import_region(describe(self.src, self.region_bytes))
         self.ops.hold = True
         batch = self.reader.read([self.group([2], [4], regions=[self.region, second])])
         for region in (self.region, second):
@@ -302,74 +294,11 @@ class TestRegions(PeerReadTestBase):
             self.assertEqual(self.dst_page(layer, 4), self.src_page(layer, 2))
         self.reader.release(batch)
         self.reader.unmap(second)
+        with self.assertRaises(ValueError):  # its handle is stale now
+            self.reader.read([self.group([0], [0], regions=[second] * self.layers)])
         self.reader.unmap(self.region)
 
-    def test_unmap_evicts_cached_buffers_that_read_the_region(self):
-        group = self.group([0], [0])
-        batch = self.reader.read([group])
-        self.reader.wait(batch)
-        self.reader.release(batch)
-        self.reader.unmap(self.region)
-        with self.assertRaises(ValueError):  # same tuple, its region is gone
-            self.reader.read([group])
-
-
-class TestInFlightRanges(PeerReadTestBase):
-    def test_conflict_only_while_in_flight(self):
-        self.ops.hold = True
-        first = self.reader.read([self.group([0, 1], [0, 1])])
-        with self.assertRaises(PeerReadBusy):  # retry later, not a caller bug
-            self.reader.read([self.group([2], [1])])
-        disjoint = self.reader.read([self.group([2], [2])])  # same region, other pages
-        self.ops.hold = False
-        for batch in (first, disjoint):
-            self.reader.wait(batch)
-            self.reader.release(batch)
-        again = self.reader.read([self.group([3], [1])])
-        self.reader.wait(again)
-        self.reader.release(again)
-
-    def single(self, dst_base, capacity, page):
-        buffer = PeerBuffer(
-            src_region=self.region,
-            src_offset=0,
-            dst_base=dst_base,
-            page_bytes=PAGE,
-            dst_num_pages=capacity,
-        )
-        return ReadGroup(
-            buffers=(buffer,), src_pages=np.array([0]), dst_pages=np.array([page])
-        )
-
-    def test_growing_a_destination_over_an_in_flight_one(self):
-        self.ops.hold = True
-        base = self.dst[0]
-        self.reader.read([self.single(base, 1, 0)])
-        self.reader.read([self.single(base + 2 * PAGE, 1, 0)])
-        # Same (base, page size) as the first, but now reaching into the second.
-        with self.assertRaises(PeerReadBusy):
-            self.reader.read([self.single(base, 4, 2)])
-
-    def test_self_overlap_is_a_caller_error_behind_an_in_flight_batch(self):
-        """A batch whose own destinations overlap raises ValueError even when it also
-        overlaps a batch in flight: an uncertain one would make PeerReadBusy permanent."""
-        self.ops.hold = True
-        base = self.dst[0]
-        self.reader.read([self.single(base, 4, 0)])
-        with self.assertRaises(ValueError):
-            self.reader.read(
-                [self.single(base, 4, 1), self.single(base + 2 * PAGE, 2, 0)]
-            )
-
-    def test_finished_but_unpolled_batch_does_not_block(self):
-        first = self.reader.read([self.group([0], [0])])  # done, nobody asked
-        second = self.reader.read([self.group([1], [0])])
-        for batch in (first, second):
-            self.assertEqual(self.reader.wait(batch).state, ReadState.SUCCESS)
-            self.reader.release(batch)
-        self.assertEqual(self.dst_page(0, 0), self.src_page(0, 1))
-
-    def test_timeout_keeps_batch_and_ranges(self):
+    def test_timeout_keeps_batch_and_region(self):
         self.ops.hold = True
         batch = self.reader.read([self.group([0], [0])])
         with self.assertRaises(TimeoutError):
@@ -378,118 +307,54 @@ class TestInFlightRanges(PeerReadTestBase):
             self.reader.release(batch)
         with self.assertRaises(PeerReadBusy):
             self.reader.unmap(self.region)
-        with self.assertRaises(PeerReadBusy):
-            self.reader.read([self.group([1], [0])])
-        for bad in (-1, float("inf"), float("nan"), "1"):
+        for bad in (-1, float("inf"), float("nan")):
             with self.assertRaises(ValueError):
                 self.reader.wait(batch, timeout=bad)
+        self.ops.hold = False
+        self.assertEqual(self.reader.wait(batch).state, ReadState.SUCCESS)
 
 
 class TestFailures(PeerReadTestBase):
-    def test_completed_group_survives_later_failure(self):
-        self.ops.event_codes[1] = NON_STICKY
+    def test_completed_group_survives_later_drained_failure(self):
+        self.ops.event_errors[1] = NOT_STICKY
         batch = self.reader.read([self.group([4], [0]), self.group([5], [1])])
         status = self.reader.wait(batch)
         self.assertEqual(status.state, ReadState.FAILED_DRAINED)
-        self.assertTrue(self.reader.group_done(batch, 0))
-        self.assertFalse(self.reader.group_done(batch, 1))
+        self.assertEqual(status.groups_done, 1)
         self.assertEqual(self.dst_page(0, 0), self.src_page(0, 4))
         self.reader.release(batch)
         self.reader.unmap(self.region)
 
-    def test_undrained_failure_is_uncertain_and_pins_everything(self):
-        self.ops.event_codes[0] = NON_STICKY
-        self.ops.sync_code = NON_STICKY
-        batch = self.reader.read([self.group([0], [0])])
-        self.assertEqual(self.reader.wait(batch).state, ReadState.FAILED_UNCERTAIN)
-        with self.assertRaises(PeerReadBusy):
-            self.reader.release(batch)
-        with self.assertRaises(PeerReadBusy):
-            self.reader.unmap(self.region)
-        with self.assertRaises(PeerReadError):
-            self.reader.read([self.group([1], [1])])
-
     def test_sticky_error_fail_stops_every_in_flight_batch(self):
         self.ops.hold = True
         other = self.reader.read([self.group([1], [1])])
-        self.ops.hold = False
-        self.ops.event_codes[1] = ILLEGAL_ADDRESS
+        self.ops.event_errors[1] = STICKY
         failing = self.reader.read([self.group([0], [0])])
-        self.ops.event_codes[0] = NOT_READY  # the other batch has not finished either
         self.assertEqual(self.reader.wait(failing).state, ReadState.FAILED_UNCERTAIN)
         self.assertEqual(self.reader.status(other).state, ReadState.FAILED_UNCERTAIN)
+        with self.assertRaises(PeerReadBusy):
+            self.reader.release(other)
+        with self.assertRaises(PeerReadBusy):
+            self.reader.unmap(self.region)
         with self.assertRaises(PeerReadError):
-            self.reader.import_region(
-                self.exporter.export(self.src, self.region_bytes, region_id="kv")
-            )
+            self.reader.read([self.group([2], [2])])
+        with self.assertRaises(PeerReadError):
+            self.reader.import_region(describe(self.src, self.region_bytes))
 
-    def test_enqueue_failure_with_clean_drain_leaves_nothing_held(self):
-        self.ops.fail_launch_at = 1
+    def test_enqueue_failure_that_drains_leaves_nothing_held(self):
+        self.ops.fail_launch_at = 1  # group 0 is enqueued, group 1 fails
         with self.assertRaises(RuntimeError):
             self.reader.read([self.group([0], [0]), self.group([1], [1])])
+        self.assertIn("sync", self.ops.log)
         self.ops.fail_launch_at = None
         batch = self.reader.read([self.group([2], [0]), self.group([3], [1])])
         self.assertEqual(self.reader.wait(batch).state, ReadState.SUCCESS)
         self.reader.release(batch)
         self.reader.unmap(self.region)
-        self.reader.close()
-
-    def test_drain_covers_a_partially_enqueued_group(self):
-        # Two page sizes make two launches in one group; the second one fails.
-        half = [
-            PeerBuffer(
-                src_region=self.region,
-                src_offset=0,
-                dst_base=self.dst[0],
-                page_bytes=PAGE,
-                dst_num_pages=self.NUM_PAGES,
-            ),
-            PeerBuffer(
-                src_region=self.region,
-                src_offset=self.NUM_PAGES * PAGE,
-                dst_base=self.dst[1],
-                page_bytes=PAGE // 2,
-                dst_num_pages=self.NUM_PAGES,
-            ),
-        ]
-        group = ReadGroup(
-            buffers=tuple(half), src_pages=np.array([0]), dst_pages=np.array([0])
-        )
-        self.ops.fail_launch_at = 1
-        with self.assertRaises(RuntimeError):
-            self.reader.read([group])
-        self.assertIn(
-            ("sync", 0), self.ops.log
-        )  # the group's own event, recorded after the failure
-        self.ops.fail_launch_at = None
-        batch = self.reader.read([self.group([1], [0])])
-        self.assertEqual(self.reader.wait(batch).state, ReadState.SUCCESS)
-
-    def test_unrecorded_launch_fail_stops(self):
-        self.ops.fail_record = True
-        with self.assertRaises(RuntimeError):
-            self.reader.read([self.group([0], [0])])
-        self.assertNotIn(
-            ("sync", 0), self.ops.log
-        )  # nothing covers the launch, so no drain is claimed
-        with self.assertRaises(PeerReadError):
-            self.reader.read([self.group([1], [1])])
-        with self.assertRaises(PeerReadBusy):  # a launch may still be reading it
-            self.reader.unmap(self.region)
-
-    def test_failed_event_creation_destroys_the_events_made(self):
-        self.ops.fail_event_at = 1
-        with self.assertRaises(RuntimeError):
-            self.reader.read([self.group([0], [0]), self.group([1], [1])])
-        self.assertIn(("destroy", 0), self.ops.log)
-        self.assertEqual(self.ops.launches, 0)
-        self.ops.fail_event_at = None
-        batch = self.reader.read([self.group([0], [0])])  # nothing was held
-        self.assertEqual(self.reader.wait(batch).state, ReadState.SUCCESS)
 
     def test_enqueue_failure_without_drain_fail_stops(self):
-        self.ops.fail_launch_at = 1  # group 0 is enqueued, group 1 fails, no drain
-        self.ops.sync_code = ILLEGAL_ADDRESS
+        self.ops.fail_launch_at = 1
+        self.ops.sticky = True
         with self.assertRaises(RuntimeError):
             self.reader.read([self.group([0], [0]), self.group([1], [1])])
         with self.assertRaises(PeerReadError):
@@ -498,51 +363,182 @@ class TestFailures(PeerReadTestBase):
             self.reader.unmap(self.region)
 
 
-class TestRegionsAndLeases(PeerReadTestBase):
-    def test_descriptor_round_trip_and_malformed_input(self):
-        self.assertEqual(
-            PeerRegionDescriptor.from_bytes(self.desc.to_bytes()), self.desc
-        )
-        for data in (b"", b"\x01garbage", self.desc.to_bytes()[:-3]):
+class TestDescriptors(PeerReadTestBase):
+    def test_round_trip_and_malformed_input(self):
+        desc = describe(self.src, self.region_bytes)
+        self.assertEqual(PeerRegionDescriptor.from_bytes(desc.to_bytes()), desc)
+        for data in (b"", b"\x01garbage", desc.to_bytes()[:-3]):
             with self.assertRaises(ValueError):
                 PeerRegionDescriptor.from_bytes(data)
-
-    def test_lease_maps_once_even_after_unmap(self):
-        with self.assertRaises(ValueError):
-            self.reader.import_region(self.desc)
-        self.reader.unmap(self.region)
-        with self.assertRaises(ValueError):
-            self.reader.import_region(self.desc)
-        fresh = self.exporter.export(self.src, self.region_bytes, region_id="kv")
-        self.reader.import_region(fresh)
+        maps = self.ops.log.count("map")
+        for bad in (
+            PeerRegionDescriptor(version=2, size=PAGE, fabric_handle=b"h" * 64),
+            PeerRegionDescriptor(version=1, size=PAGE, fabric_handle=b"h" * 63),
+            PeerRegionDescriptor(version=1, size=0, fabric_handle=b"h" * 64),
+        ):
+            with self.assertRaises(ValueError):
+                self.reader.import_region(bad)
+        self.assertEqual(self.ops.log.count("map"), maps)
 
     def test_other_fabric_clique_rejected_before_mapping(self):
         other = KvPeerReader(READER_DEV, _ops=FakeOps(clique=(b"x" * 16, 1)))
         maps = self.ops.log.count("map")
         with self.assertRaises(PeerReadError):
-            other.import_region(
-                self.exporter.export(self.src, self.region_bytes, region_id="kv")
-            )
+            other.import_region(describe(self.src, self.region_bytes))
         self.assertEqual(self.ops.log.count("map"), maps)
 
-    def test_forged_region_handle(self):
-        forged = PeerRegion(
-            self.region.region_id, self.region.size, self.region.address
-        )
-        with self.assertRaises(ValueError):
-            self.reader.read([self.group([0], [0], regions=[forged] * self.layers)])
-        with self.assertRaises(ValueError):
-            KvPeerReader(READER_DEV, _ops=self.ops).unmap(self.region)
 
-    def test_lease_release_is_exact(self):
-        second = self.exporter.export(self.src, self.region_bytes, region_id="kv")
-        self.assertEqual(self.exporter.outstanding("kv"), 2)
-        self.exporter.release_export(self.desc.lease_id)
-        with self.assertRaises(ValueError):
-            self.exporter.release_export(self.desc.lease_id)
-        self.assertEqual(self.exporter.outstanding("kv"), 1)
-        self.exporter.release_export(second.lease_id)
-        self.assertEqual(self.exporter.outstanding(), 0)
+# ===== Two processes on two GPUs of one NVLink fabric clique =====
+
+LAYERS = 3
+PAGE_BYTES = (1024, 384)  # two buffer classes per layer, like MLA + DSA index
+CAPACITY = 64
+REGION_BYTES = LAYERS * CAPACITY * sum(PAGE_BYTES)
+SENTINEL = 0xEE
+
+
+def _src_offset(layer: int, cls: int) -> int:
+    # Class-major, then layer: [cls0 l0 .. l2][cls1 l0 .. l2], CAPACITY pages each.
+    return (cls * LAYERS * PAGE_BYTES[0] + layer * PAGE_BYTES[cls]) * CAPACITY
+
+
+def _pattern(offsets: torch.Tensor) -> torch.Tensor:
+    return ((offsets * 7 + offsets // 4096) % 251).to(torch.uint8)
+
+
+def _owner(conn) -> None:
+    torch.cuda.set_device(0)
+    fabric = drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
+    prop = make_device_allocation_prop(0, handle_types=int(fabric))
+    size = align_up(REGION_BYTES, get_allocation_granularity(prop))
+    handle = check_drv(drv.cuMemCreate(size, prop, 0), "cuMemCreate")
+    va = int(check_drv(drv.cuMemAddressReserve(size, 0, 0, 0), "reserve"))
+    check_drv(drv.cuMemMap(va, size, 0, handle, 0), "map")
+    check_drv(drv.cuMemSetAccess(va, size, [make_rw_access_desc(0)], 1), "access")
+    view = tensor_from_pointer(va, size, device_id=0)
+    view.copy_(_pattern(torch.arange(size, device="cuda", dtype=torch.int64)))
+    torch.cuda.synchronize()
+
+    # Two descriptors of one allocation: the reader maps it twice, as two regions.
+    conn.send([export_region(handle, size, device=0).to_bytes() for _ in range(2)])
+    assert conn.recv() == "unmapped"  # the reader's ACK: released and unmapped
+    check_drv(drv.cuMemUnmap(va, size), "unmap")
+    check_drv(drv.cuMemAddressFree(va, size), "free")
+    check_drv(drv.cuMemRelease(handle), "release")
+    conn.send("ok")
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+class TestKvPeerReadCuda(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        if torch.cuda.device_count() >= 2 and get_gpu_fabric_clique(0) is not None:
+            return
+        reason = "needs two GPUs in an NVLink fabric clique"
+        # The registered CUDA runner has them: a skip there hides a broken setup.
+        if is_in_ci():
+            raise RuntimeError(reason)
+        raise unittest.SkipTest(reason)
+
+    def _destinations(self):
+        return [
+            [
+                torch.full((CAPACITY, pb), SENTINEL, dtype=torch.uint8, device="cuda:1")
+                for pb in PAGE_BYTES
+            ]
+            for _ in range(LAYERS)
+        ]
+
+    def _group(self, regions, dst, layers, src_pages, dst_pages):
+        buffers = [
+            PeerBuffer(
+                src_region=regions[layer % len(regions)],
+                src_offset=_src_offset(layer, cls),
+                dst_base=dst[layer][cls].data_ptr(),
+                page_bytes=pb,
+                dst_num_pages=CAPACITY,
+            )
+            for layer in layers
+            for cls, pb in enumerate(PAGE_BYTES)
+        ]
+        return ReadGroup(buffers=buffers, src_pages=src_pages, dst_pages=dst_pages)
+
+    def _check(self, dst, src_pages, dst_pages, layers):
+        copied = set(dst_pages.tolist())
+        for layer in layers:
+            for cls, pb in enumerate(PAGE_BYTES):
+                for sp, dp in zip(src_pages.tolist(), dst_pages.tolist()):
+                    base = _src_offset(layer, cls) + sp * pb
+                    want = _pattern(torch.arange(base, base + pb, device="cuda:1"))
+                    self.assertTrue(
+                        torch.equal(dst[layer][cls][dp], want), (layer, cls, sp, dp)
+                    )
+                untouched = [p for p in range(CAPACITY) if p not in copied]
+                self.assertTrue(bool((dst[layer][cls][untouched] == SENTINEL).all()))
+
+    def test_export_import_read_release(self):
+        ctx = mp.get_context("spawn")
+        conn, child = ctx.Pipe()
+        owner = ctx.Process(target=_owner, args=(child,))
+        owner.start()
+        try:
+            # GPU 0 stays current: the reader must not depend on the caller's device.
+            torch.cuda.set_device(0)
+            reader = KvPeerReader(1, num_blocks=16)
+            regions = [
+                reader.import_region(PeerRegionDescriptor.from_bytes(d))
+                for d in conn.recv()
+            ]
+            rng = np.random.default_rng(0)
+
+            # Two groups (layers 0-1, layer 2), random pages, layers alternating between
+            # the two regions; the rest keep the sentinel.
+            dst = self._destinations()
+            # No producer stream: the caller vouches the targets are ready.
+            torch.cuda.synchronize(1)
+            src_pages = rng.choice(CAPACITY, 20, replace=False)
+            dst_pages = rng.choice(CAPACITY, 20, replace=False)
+            groups = [
+                self._group(regions, dst, [0, 1], src_pages, dst_pages),
+                self._group(regions, dst, [2], src_pages, dst_pages),
+            ]
+            batch = reader.read(groups)
+            status = reader.wait(batch, timeout=30)
+            self.assertEqual(status.state, ReadState.SUCCESS)
+            self.assertEqual(status.groups_done, 2)
+            self._check(dst, src_pages, dst_pages, range(LAYERS))
+            reader.release(batch)
+
+            # Every page, reversed, behind a producer stream that still writes the targets.
+            dst = self._destinations()
+            producer = torch.cuda.Stream(device=1)
+            with torch.cuda.stream(producer):
+                torch.cuda._sleep(10_000_000)
+                for layer in dst:
+                    for buf in layer:
+                        buf.fill_(SENTINEL)
+            pages = np.arange(CAPACITY)
+            batch = reader.read(
+                [
+                    self._group(
+                        regions[:1], dst, range(LAYERS), pages, pages[::-1].copy()
+                    )
+                ],
+                producer_stream=producer,
+            )
+            self.assertEqual(reader.wait(batch, timeout=30).state, ReadState.SUCCESS)
+            self._check(dst, pages, pages[::-1].copy(), range(LAYERS))
+            reader.release(batch)
+
+            for region in regions:
+                reader.unmap(region)
+            conn.send("unmapped")
+            self.assertEqual(conn.recv(), "ok")
+        finally:
+            owner.join(timeout=60)
+            if owner.is_alive():
+                owner.kill()
+        self.assertEqual(owner.exitcode, 0)
 
 
 if __name__ == "__main__":

@@ -76,7 +76,7 @@ def _src_offset(args, page_bytes, layer, cls):
 def _owner(args, conn):
     from cuda.bindings import driver as drv
 
-    from sglang.srt.mem_cache.kv_peer_read import KvPeerExporter
+    from sglang.srt.mem_cache.kv_peer_read import export_region
     from sglang.srt.utils.cuda_vmm_utils import (
         align_up,
         check_drv,
@@ -105,14 +105,9 @@ def _owner(args, conn):
         torch.arange(start, start + n, out=words[start : start + n])
     torch.cuda.synchronize()
 
-    exporter = KvPeerExporter(dev)
-    leases = []
     while conn.recv() == "export":
-        desc = exporter.export(handle, size, region_id="bench")
-        leases.append(desc.lease_id)
-        conn.send(desc.to_bytes())
-    for lease in leases:  # every reader unmapped before sending "done"
-        exporter.release_export(lease)
+        conn.send(export_region(handle, size, device=dev).to_bytes())
+    # Every reader unmapped before sending "done".
     check_drv(drv.cuMemUnmap(va, size), "unmap")
     check_drv(drv.cuMemAddressFree(va, size), "free")
     check_drv(drv.cuMemRelease(handle), "release")
@@ -158,9 +153,8 @@ def _run(args, conn):
         reader = KvPeerReader(dev, num_blocks=num_blocks)
         conn.send("export")
         region = reader.import_region(PeerRegionDescriptor.from_bytes(conn.recv()))
-        # Built once per region, as a pool owner would: a reused tuple is validated once.
         buffer_sets = [
-            tuple(
+            [
                 PeerBuffer(
                     src_region=region,
                     src_offset=_src_offset(args, page_bytes, layer, cls),
@@ -172,39 +166,19 @@ def _run(args, conn):
                     first, min(first + args.layers_per_group, args.layers)
                 )
                 for cls, pb in enumerate(page_bytes)
-            )
+            ]
             for first in range(0, args.layers, args.layers_per_group)
         ]
-        for in_flight, pages in ((n, p) for n in args.in_flight for p in args.pages):
-            if (in_flight + 1) * pages > args.capacity:
-                continue  # not enough disjoint destination pages
+        for pages in args.pages:
             cpu, wall, bad = [], [], 0
             for it in range(args.warmup + args.iters):
                 src_pages = rng.choice(args.capacity, pages, replace=False)
-                # Disjoint destination pages for the measured read and the others.
-                dst_all = rng.choice(
-                    args.capacity, (in_flight + 1) * pages, replace=False
-                )
-                dst_pages = dst_all[:pages]
+                dst_pages = rng.choice(args.capacity, pages, replace=False)
                 groups = [
                     ReadGroup(buffers=buffers, src_pages=src_pages, dst_pages=dst_pages)
                     for buffers in buffer_sets
                 ]
-                others = (
-                    [
-                        reader.read(
-                            [
-                                ReadGroup(buffers=b, src_pages=src_pages, dst_pages=d)
-                                for b in buffer_sets
-                            ]
-                        )
-                        for d in np.split(dst_all[pages:], in_flight)
-                    ]
-                    if in_flight
-                    else []
-                )
-                if not others:
-                    torch.cuda.synchronize(dev)
+                torch.cuda.synchronize(dev)
                 t0 = time.perf_counter()
                 batch = reader.read(groups)
                 t1 = time.perf_counter()
@@ -212,9 +186,6 @@ def _run(args, conn):
                 t2 = time.perf_counter()
                 assert status.state == ReadState.SUCCESS, status
                 reader.release(batch)
-                for other in others:
-                    assert reader.wait(other).state == ReadState.SUCCESS
-                    reader.release(other)
                 if it >= args.warmup:
                     cpu.append((t1 - t0) * 1e3)
                     wall.append((t2 - t0) * 1e3)
@@ -223,7 +194,6 @@ def _run(args, conn):
             point = dict(
                 num_blocks=num_blocks,
                 pages=pages,
-                in_flight=in_flight,
                 groups=len(groups),
                 bytes=nbytes,
                 read_cpu_ms=statistics.median(cpu),
@@ -233,14 +203,13 @@ def _run(args, conn):
             )
             results.append(point)
             print(
-                f"blocks={num_blocks:4d} pages={pages:6d} in_flight={in_flight:3d} "
+                f"blocks={num_blocks:4d} pages={pages:6d} "
                 f"groups={len(groups):3d} "
                 f"read()={point['read_cpu_ms']:7.2f} ms wall={point['wall_ms']:8.2f} ms "
                 f"{point['gbps']:6.1f} GB/s bad={bad}",
                 flush=True,
             )
         reader.unmap(region)
-        reader.close()
     conn.send("done")
     return results
 
@@ -253,14 +222,6 @@ def main():
     parser.add_argument("--pages", type=int, nargs="+", default=[16, 128, 1024, 7187])
     parser.add_argument("--layers-per-group", type=int, default=13)
     parser.add_argument("--num-blocks", type=int, nargs="+", default=[32, 64])
-    parser.add_argument(
-        "--in-flight",
-        type=int,
-        nargs="+",
-        default=[0],
-        help="other reads left outstanding while one is timed (its wall time then "
-        "includes theirs)",
-    )
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--iters", type=int, default=5)
     parser.add_argument("--seed", type=int, default=0)
