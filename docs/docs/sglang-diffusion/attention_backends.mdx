@@ -22,7 +22,7 @@ When using the diffusers backend, `--attention-backend` is passed through to dif
 - **NPU**: for ring attention uses FA otherwise uses PyTorch SDPA.
 - **CPU**: uses `amx_attn` when the CPU supports AMX, the dtype is bf16/fp16, and the head size is even; otherwise PyTorch SDPA.
 
-On Blackwell, `dynamic_cudnn_sdpa` keeps FA4 for attention with one side shorter than 128 tokens and the other at least 128 during breakable CUDA graph warmup/capture. In eager execution, `lossless` and `high` requests use cuDNN for these shapes to avoid FA4 host-dispatch overhead; `exact` keeps the reference FA4 route. Switching backends can change floating-point rounding.
+On Blackwell, `dynamic_cudnn_sdpa` keeps FA4 for attention with one side shorter than 128 tokens and the other at least 128 during breakable CUDA graph warmup, capture and replay, including the eager breaks of a replay. In eager execution outside a graph, `lossless` and `high` requests use cuDNN for these shapes to avoid FA4 host-dispatch overhead; `exact` keeps the reference FA4 route. Switching backends can change floating-point rounding.
 
 ## Backend options
 
