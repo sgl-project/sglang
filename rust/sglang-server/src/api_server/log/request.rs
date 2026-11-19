@@ -24,6 +24,9 @@
 //! The crash dump itself is written by Python (`RustServer
 //! .dump_requests_before_crash`), from [`RequestLog::crash_dump_snapshot`].
 
+// TODO(rainj-me): revisit whether these lines must match Python's byte for byte;
+// logging the same information would drop most of `py_object` and `logger`.
+
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
