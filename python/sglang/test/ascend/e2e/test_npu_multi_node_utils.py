@@ -390,7 +390,11 @@ def wait_for_all_ports_ready(ips, port, timeout=LOCAL_TIMEOUT, check_interval=15
 
 
 def wait_for_pd_worker_roles(
-    expected_roles, port, timeout=PD_WORKER_READY_TIMEOUT, check_interval=5
+    expected_roles,
+    port,
+    timeout=PD_WORKER_READY_TIMEOUT,
+    check_interval=5,
+    report_interval=30,
 ):
     """Wait until every PD worker's `/server_info` reports its own role.
 
@@ -402,11 +406,16 @@ def wait_for_pd_worker_roles(
     received without bootstrap room id". Waiting for the role here removes
     that race before the router is launched.
 
+    The last `/server_info` snapshot of every pending worker is also logged
+    every ``report_interval`` seconds, so a worker that is wedged during warmup
+    leaves a trail in the router log instead of only the final timeout.
+
     Args:
         expected_roles (dict): {pod_ip: "prefill" | "decode"}.
         port (int): Worker HTTP port.
         timeout (int): Total timeout in seconds.
         check_interval (int): Interval between checks in seconds.
+        report_interval (int): Interval between state snapshots in seconds.
 
     Raises:
         RuntimeError: If a worker never reports the expected role.
@@ -414,6 +423,7 @@ def wait_for_pd_worker_roles(
     start_time = time.time()
     pending = dict(expected_roles)
     last_seen = {}
+    next_report = start_time + report_interval
 
     while time.time() - start_time < timeout:
         for ip, role in list(pending.items()):
@@ -428,7 +438,12 @@ def wait_for_pd_worker_roles(
 
             mode = info.get("disaggregation_mode")
             bootstrap_port = info.get("disaggregation_bootstrap_port")
-            last_seen[ip] = f"disaggregation_mode={mode!r}"
+            # A responsive worker answers with one internal state per DP rank,
+            # so the count shows whether the scheduler behind it is alive.
+            last_seen[ip] = (
+                f"disaggregation_mode={mode!r} bootstrap_port={bootstrap_port!r} "
+                f"dp_ranks={len(info.get('internal_states') or [])}"
+            )
             if mode != role:
                 continue
             if mode == "prefill" and not bootstrap_port:
@@ -443,6 +458,14 @@ def wait_for_pd_worker_roles(
         if not pending:
             logger.info(f"All {len(expected_roles)} PD workers report their role")
             return
+
+        now = time.time()
+        if now >= next_report:
+            logger.info(
+                f"PD worker roles pending after {now - start_time:.0f}s: "
+                f"{ {ip: last_seen.get(ip, 'no response') for ip in pending} }"
+            )
+            next_report = now + report_interval
 
         time.sleep(check_interval)
 

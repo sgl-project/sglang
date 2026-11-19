@@ -206,8 +206,11 @@ if [ -n "${METRICS_DATA_FILE}" ]; then
     # Keep each pod's log under its own hostname directory so the prefill,
     # decode and router logs all travel with the metrics artifact instead of
     # overwriting the shared test_output.log above.
+    # Do not clear the directory first: the runner already archived this pod's
+    # log here as "<pod>.log" from kubectl, and removing it makes
+    # upload-artifact fail with ENOENT while zipping (run 44525399750). The two
+    # copies have different names, so they coexist.
     node_log_dir="${METRICS_DATA_FILE}/node_logs/${HOSTNAME}"
-    rm -rf "${node_log_dir}"
     mkdir -p "${node_log_dir}"
     cp -a "${log_path}/." "${node_log_dir}/"
     echo "Node log saved to ${node_log_dir}"
