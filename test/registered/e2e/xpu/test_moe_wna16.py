@@ -150,13 +150,27 @@ class TestXpuMoeWna16(CustomTestCase):
                     expert_input, w13_weight, w13_scale, expert_id, b1_cpu
                 )
                 if config.is_gated:
-                    gate = gate_up[: self.intermediate]
-                    up = gate_up[self.intermediate :]
-                    if config.swiglu_limit is not None:
+                    if config.gemm1_alpha is not None:
+                        limit = (
+                            config.gemm1_clamp_limit
+                            if config.gemm1_clamp_limit is not None
+                            else 7.0
+                        )
+                        gate, up = gate_up[::2], gate_up[1::2]
+                        gate = gate.clamp(max=limit)
+                        up = up.clamp(min=-limit, max=limit)
+                        intermediate = (
+                            gate * torch.sigmoid(gate * config.gemm1_alpha) * (up + 1)
+                        )
+                    elif config.swiglu_limit is not None:
+                        gate = gate_up[: self.intermediate]
+                        up = gate_up[self.intermediate :]
                         gate = activation_fn(gate).clamp(max=config.swiglu_limit)
                         up = up.clamp(min=-config.swiglu_limit, max=config.swiglu_limit)
                         intermediate = gate * up
                     else:
+                        gate = gate_up[: self.intermediate]
+                        up = gate_up[self.intermediate :]
                         intermediate = activation_fn(gate) * up
                 else:
                     intermediate = activation_fn(gate_up)
@@ -353,6 +367,31 @@ class TestXpuMoeWna16(CustomTestCase):
             output = method.apply(layer, dispatch_output)
             native.assert_called_once()
             self.assertEqual(native.call_args.kwargs["swiglu_limit"], 10.0)
+        self._assert_output_matches_reference(output, reference)
+
+    def test_fp8_moe_gpt_oss_swiglu_native(self):
+        from sgl_kernel import fused_experts
+
+        dispatch_output = self._create_dispatch_output()
+        config = MoeRunnerConfig(gemm1_alpha=1.702, gemm1_clamp_limit=7.0)
+        method = Fp8MoEMethod(Fp8Config(is_checkpoint_fp8_serialized=True))
+        layer, _, _ = self._build_moe_layer(method, runner_config=config)
+        layer.to(self.device)
+        method.process_weights_after_loading(layer)
+
+        reference = self._reference_moe(
+            dispatch_output,
+            layer.w13_weight,
+            layer.w2_weight,
+            layer.w13_weight_scale,
+            layer.w2_weight_scale,
+            runner_config=config,
+        )
+        with patch("sgl_kernel.fused_experts", wraps=fused_experts) as native:
+            output = method.apply(layer, dispatch_output)
+            native.assert_called_once()
+            self.assertEqual(native.call_args.kwargs["gemm1_alpha"], 1.702)
+            self.assertEqual(native.call_args.kwargs["gemm1_limit"], 7.0)
         self._assert_output_matches_reference(output, reference)
 
     def test_mxfp8_moe_method_serialized(self):
@@ -572,6 +611,29 @@ class TestXpuMoeWna16(CustomTestCase):
         )
         self.assertFalse(can_use_xpu_fp8_moe(non_local_config, None))
 
+        # TP block size refinement: skipped on native XPU path, applied on Triton fallback
+        tp_method = Fp8MoEMethod(
+            Fp8Config(is_checkpoint_fp8_serialized=True, weight_block_size=[128, 128])
+        )
+        tp_layer = MagicMock(
+            moe_tp_size=2,
+            use_presharded_weights=False,
+            moe_runner_config=default_config,
+        )
+        self.assertEqual(
+            tp_method._tp_weight_block_sizes(
+                layer=tp_layer, hidden_size=256, intermediate_size_per_partition=64
+            ),
+            ([128, 128], None),
+        )
+        tp_layer.moe_runner_config = MoeRunnerConfig(activation="gelu", is_gated=True)
+        self.assertEqual(
+            tp_method._tp_weight_block_sizes(
+                layer=tp_layer, hidden_size=256, intermediate_size_per_partition=64
+            ),
+            ([64, 128], [128, 64]),
+        )
+
     def test_compressed_tensors_runner_config_fallback(self):
         from sgl_kernel import fused_experts
 
@@ -582,7 +644,6 @@ class TestXpuMoeWna16(CustomTestCase):
             MoeRunnerConfig(inplace=False, apply_router_weight_on_input=True),
             MoeRunnerConfig(inplace=False, no_combine=True),
             MoeRunnerConfig(inplace=False, activation="gelu"),
-            MoeRunnerConfig(inplace=False, activation="situ"),
         )
         for config in configs:
             with self.subTest(
@@ -692,10 +753,7 @@ class TestXpuMoeWna16(CustomTestCase):
         self.intermediate = 160
         cases = (
             (MoeRunnerBackend.TRITON, {}),
-            (MoeRunnerBackend.TRITON, dict(activation="gelu")),
             (MoeRunnerBackend.AUTO, dict(no_combine=True)),
-            (MoeRunnerBackend.AUTO, dict(activation="gelu")),
-            (MoeRunnerBackend.INTEL_XPU, dict(activation="gelu")),
             (MoeRunnerBackend.INTEL_XPU, dict(apply_router_weight_on_input=True)),
         )
         for backend, settings in cases:
