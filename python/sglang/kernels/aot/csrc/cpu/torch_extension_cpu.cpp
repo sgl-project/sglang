@@ -865,8 +865,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("per_token_quant_int8_cpu", torch::kCPU, &per_token_quant_int8_cpu);
 
 #if !defined(SGLANG_CPU_ARM64_SKIP_X86_ONLY_OPS)
-    m.def("per_token_quant_fp8_cpu(Tensor input) -> (Tensor, Tensor)");
-    m.impl("per_token_quant_fp8_cpu", torch::kCPU, &per_token_quant_fp8_cpu);
+  m.def("per_token_quant_fp8_cpu(Tensor input) -> (Tensor, Tensor)");
+  m.impl("per_token_quant_fp8_cpu", torch::kCPU, &per_token_quant_fp8_cpu);
 #endif
 
   // igemm

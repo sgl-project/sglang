@@ -7,10 +7,7 @@ constexpr auto FP8_E4M3_MAX = std::numeric_limits<at::Float8_e4m3fn>::max();
 
 template <CpuIsa isa>
 void quantize_row_fp8(
-    at::Float8_e4m3fn* __restrict__ out,
-    float& scale,
-    const at::BFloat16* __restrict__ input,
-    int size) {
+    at::Float8_e4m3fn* __restrict__ out, float& scale, const at::BFloat16* __restrict__ input, int size) {
   const float fp8_max = static_cast<float>(FP8_E4M3_MAX);
   const __m512 sign_mask = _mm512_set1_ps(-0.0f);
   const __m512 upper = _mm512_set1_ps(fp8_max);
