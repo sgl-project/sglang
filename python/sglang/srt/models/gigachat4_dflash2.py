@@ -99,13 +99,9 @@ class GigaChat4DFlash2DraftModel(DFlash2DraftModel):
 
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
-        shift_label = getattr(config, "dflash_config", {}).get("shift_label", True)
-        if not isinstance(shift_label, bool):
-            raise ValueError("dflash_config.shift_label must be a bool")
         self.num_stages = int(config.num_hidden_layers)
         self.norm = build_norm(config, config.hidden_size)
         self.hidden_norm = build_norm(config, config.hidden_size)
-        self.shift_label = shift_label
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
         super().load_weights(_remap_gigachat_weight_names(weights))

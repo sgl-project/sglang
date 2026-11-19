@@ -936,6 +936,15 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
             raise ValueError(
                 f"DFLASH Domino requires block_size > 1, got {block_size}."
             )
+    elif "GigaChat4DFlash2DraftModel" in (
+        _cfg_get(draft_hf_config, "architectures", None) or ()
+    ):
+        shift_label = dflash_cfg.get("shift_label", True)
+        if not isinstance(shift_label, bool):
+            raise ValueError(
+                "GigaChat 4 DFlash2 requires dflash_config.shift_label to be a bool, "
+                f"got {shift_label!r}."
+            )
 
     return DFlashDraftConfig(
         num_hidden_layers=num_hidden_layers,
