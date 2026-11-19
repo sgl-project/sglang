@@ -3,6 +3,11 @@ name: 'Nightly Test (NPU) Multi Node Template'
 on:
   workflow_call:
     inputs:
+      ref:
+        description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the event commit SHA.'
+        required: false
+        type: string
+        default: ''
       runner:
         required: false
         type: string
@@ -117,6 +122,8 @@ jobs:
 
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
 
       # continue-on-error: the artifact expires in a day, and the router pod falls
       # back to the image's sgl-router.

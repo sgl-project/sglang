@@ -110,6 +110,8 @@ class PoolName(str, Enum):
     MAMBA = "mamba"
     SWA = "swa"
     INDEXER = "indexer"
+    # the ue8m0 exponents of FP4 index keys, beside INDEXER's e2m1 bytes
+    INDEXER_SCALE = "indexer_scale"
     # TODO(hzh0425): Current DeepSeek V4 pool naming is verbose; will be normalized to
     # 'COMPRESSED_KV / COMPRESSED_INDEXER / COMPRESSED_STATE' in the next PR.
     DEEPSEEK_V4_C1 = "deepseek_v4_c1"

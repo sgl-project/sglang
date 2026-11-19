@@ -1,0 +1,63 @@
+// Frontend-only parsing APIs: tool-call extraction and reasoning separation
+// over a finished text, with the parsers the chat completions route uses. No
+// scheduler round-trip.
+syntax = "proto3";
+
+package sglang.api.v1;
+
+import "sglang/api/v1/common.proto";
+import "sglang/json/v1/options.proto";
+
+// `/parse_function_call`.
+message ParseFunctionCallRequest {
+  string text = 1;
+  // The tools the text may call; `tool_index` in the reply indexes this list.
+  repeated ToolSpec tools = 2;
+  // e.g. "llama3", "qwen25", "mistral"; required.
+  optional string tool_call_parser = 3;
+}
+
+// An OpenAI-shaped tool definition, as Python's `io_struct.Tool`.
+message ToolSpec {
+  ToolFunctionSpec function = 1;
+  optional string type = 2 [
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
+    (sglang.json.v1.field_json).default_string = "function"
+  ];
+}
+
+message ToolFunctionSpec {
+  optional string name = 1;
+  optional string description = 2;
+  // The JSON Schema of the arguments, passed through as JSON text.
+  optional string parameters = 3 [(sglang.json.v1.field_json).raw_json = true];
+}
+
+// Python's `ToolCallItem`: `parameters` is the arguments as a JSON string.
+message ParsedToolCall {
+  int64 tool_index = 1;
+  optional string name = 2 [(sglang.json.v1.field_json).emit_null_when_absent = true];
+  string parameters = 3;
+}
+
+message ParseFunctionCallResponse {
+  string normal_text = 1;
+  repeated ParsedToolCall calls = 2;
+}
+
+// `/separate_reasoning`.
+message SeparateReasoningRequest {
+  string text = 1;
+  // e.g. "deepseek-r1", "qwen3"; required.
+  string reasoning_parser = 2;
+  // Also return the segments as blocks.
+  bool return_blocks = 3;
+}
+
+message SeparateReasoningResponse {
+  string reasoning_text = 1;
+  string text = 2;
+  // Only with `return_blocks`.
+  optional StringList reasoning_blocks = 3;
+  optional StringList text_blocks = 4;
+}

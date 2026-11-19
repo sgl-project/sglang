@@ -130,7 +130,9 @@ class TestDFlashDraftBackendResolution(CustomTestCase):
             patch(f"{HOOK_MODULE}.current_platform", platform),
             patch(
                 f"{HOOK_MODULE}.get_platform",
-                return_value=SimpleNamespace(is_xpu=False, is_hip=False, is_sm100=True),
+                return_value=SimpleNamespace(
+                    is_xpu=False, is_hip=False, is_gfx95=False, is_sm100=True
+                ),
             ),
             patch(
                 f"{HOOK_MODULE}.attention_backends_of",

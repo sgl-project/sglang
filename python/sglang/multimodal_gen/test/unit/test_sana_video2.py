@@ -163,7 +163,10 @@ class TestSanaVideo2(unittest.TestCase):
         self.assertIsInstance(sites[0], GatedSoftmaxAttention)
         self.assertFalse(SANA_VIDEO2_SOFTMAX_ATTENTION.is_enabled(sites[0]))
 
-    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    @unittest.skipUnless(
+        torch.cuda.is_available() and torch.version.cuda is not None,
+        "the BF16 softmax attention site is enabled only on CUDA builds",
+    )
     def test_softmax_attention_quality_path_matches_reference(self):
         from sglang.kernels.ops.diffusion import SANA_VIDEO2_SOFTMAX_ATTENTION
         from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
