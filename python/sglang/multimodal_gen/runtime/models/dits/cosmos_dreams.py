@@ -327,18 +327,7 @@ class CosmosDreamsCrossAttention(Cosmos3CrossAttention):
 
 
 def default_joint_attention_backend() -> AttentionBackendEnum | None:
-    """Preferred backend for the joint ``[text | history | chunk]`` attention.
-
-    * SM12x: FlashInfer FA2.
-    * sm_10x (B200/GB200/B300): FA, i.e. FA4. The platform default there is the
-      dynamic cuDNN SDPA backend, which since sgl-project/sglang#47586 keeps GQA
-      attention (this model: 32 query / 8 KV heads) on cuDNN. For the Dreams
-      rollout, where a short query chunk attends to a long K/V history, cuDNN
-      SDPA measured ~50% slower than FA4 on GB200 (Sim-Transfer 480p, 121 frames:
-      DiT rollout 5.3 s -> 8.5 s per clip) and changes the numerics; FA4 is the
-      route the model's outputs were validated on.
-    * elsewhere: the platform default.
-    """
+    """``None`` keeps the platform default."""
     if not current_platform.is_cuda():
         return None
     if current_platform.is_sm120():

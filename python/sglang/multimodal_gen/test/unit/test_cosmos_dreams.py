@@ -1862,10 +1862,6 @@ class TestCosmosDreamsPromptAndCanvas(unittest.TestCase):
 
 
 class TestCosmosDreamsJointAttentionBackendDefault(unittest.TestCase):
-    """The joint [text | history | chunk] attention keeps the FA (FA4) route on
-    sm_10x instead of the platform's dynamic cuDNN SDPA default (GQA on cuDNN is
-    ~50% slower per rollout step on GB200 and changes the numerics)."""
-
     def _default(self, *, is_cuda=True, is_sm120=False, is_blackwell=False):
         with (
             mock.patch.object(
