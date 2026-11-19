@@ -134,7 +134,7 @@ def _jit_fused_compress_module(
     return load_jit(
         make_name("compress_norm_rope"),
         *args,
-        cuda_files=["deepseek_v4/compress_norm_rope.cuh"],
+        cuda_files=["deepseek_v4/compress_norm_rope_hip.cuh"],
         cuda_wrappers=[
             ("decode", f"{kernel_class}::decode"),
             ("extend", f"{kernel_class}::extend"),
