@@ -1521,14 +1521,15 @@ class Scheduler(
     def _arm_prefill_decode_interval(self, batch: Optional[ScheduleBatch]) -> None:
         if batch is None:
             return
-        if self.prefill_delayer is not None and self.prefill_delayer.coalesce:
+        prefill_delayer = getattr(self, "prefill_delayer", None)
+        if prefill_delayer is not None and prefill_delayer.coalesce:
             is_extend = (
                 batch.is_extend_in_batch
                 if self.require_mlp_sync
                 else batch.forward_mode.is_extend()
             )
             if is_extend:
-                self.prefill_delayer.arm_decode_interval()
+                prefill_delayer.arm_decode_interval()
             return
         if self.prefill_decode_interval == 0:
             return
@@ -4501,11 +4502,18 @@ class Scheduler(
             max_pool_usage = (
                 self.pool_stats_observer.get_pool_stats().get_max_pool_usage()
             )
+            coalesce_inputs = (
+                dict(
+                    running_batch=running_batch.batch_size(),
+                    waiting_queue_len=len(self.waiting_queue),
+                )
+                if self.prefill_delayer.coalesce
+                else {}
+            )
             prefill_delayer_single_pass = PrefillDelayerSinglePassExecutor(
                 self.prefill_delayer,
                 token_usage=max_pool_usage,
-                running_batch=running_batch.batch_size(),
-                waiting_queue_len=len(self.waiting_queue),
+                **coalesce_inputs,
             )
 
         ret, running_batch = self._get_new_batch_prefill_raw(

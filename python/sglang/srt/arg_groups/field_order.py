@@ -461,11 +461,6 @@ POSITIONAL_FIELD_ORDER = (
     "prefill_delayer_wait_seconds_buckets",
     "prefill_delayer_queue_min_ratio",
     "prefill_delayer_max_delay_ms",
-    "prefill_delayer_mode",
-    "prefill_delayer_fill_ratio",
-    "prefill_delayer_stall_ticks",
-    "prefill_delayer_ttft_ticks",
-    "prefill_delayer_kv_high_watermark",
     "min_free_slots_delay",
     "enable_deterministic_inference",
     "rl_on_policy_target",
@@ -578,5 +573,10 @@ POSITIONAL_FIELD_ORDER = (
     "enable_dsa_fp4_indexer",
     "kda_dwdp_size",
     "weight_cache_transport",
+    "prefill_delayer_mode",
+    "prefill_delayer_fill_ratio",
+    "prefill_delayer_stall_ticks",
+    "prefill_delayer_ttft_ticks",
+    "prefill_delayer_kv_high_watermark",
 )
 # fmt: on
