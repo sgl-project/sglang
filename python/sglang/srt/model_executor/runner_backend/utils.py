@@ -56,7 +56,6 @@ def _needs_hicache_event_capture(model_runner: ModelRunner) -> bool:
     backend = model_runner.attn_backend
     memory = get_memory()
     # The external linker loads layer-wise through the same pool wait hook.
-    # Prefetch has no active layer-wise consumer, so bind skips load waits.
     loads_layer_wise = (
         memory.enable_hierarchical_cache or memory.enable_unified_cache_external_linker
     )
