@@ -364,7 +364,6 @@ def _get_k_and_s_triton_kernel(
     k_out_ptr,
     s_out_ptr,
     seq_len_ptr,
-    cu_seq_lens_ptr,
     seq_len_num_pow: tl.constexpr,
     page_size: tl.constexpr,
     buf_page_stride: tl.constexpr,
@@ -373,6 +372,7 @@ def _get_k_and_s_triton_kernel(
     page_indice_batch_offset,
     BLOCK_SIZE: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
+    cu_seq_lens_ptr=None,
 ):
     """
     Fused kernel that gathers both K and S data in a single pass.
