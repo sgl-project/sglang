@@ -383,11 +383,14 @@ def handle_encoder_disaggregation(server_args: Any):
         "Glm5NextForConditionalGeneration",
         "MiniMaxM3SparseForConditionalGeneration",
         "MuseSparkForConditionalGeneration",
+        "DeepseekV4ForCausalLM",
+        "DeepseekV41ForCausalLM",
     ]:
         raise ValueError(
             f"Model type {model_arch} is not supported for encoder disaggregation. "
             f"Supported architectures: Qwen2VL, Qwen3VL, Qwen3.5, InternS2, "
-            f"Qwen2Audio, Qwen2.5Omni, Dots3-Note, Kimi, MiMoV2, GLM5Next, MiniMax-M3, MuseSpark."
+            f"Qwen2Audio, Qwen2.5Omni, Dots3-Note, Kimi, MiMoV2, GLM5Next, "
+            f"MiniMax-M3, MuseSpark, DeepSeek-V4."
         )
 
     if (

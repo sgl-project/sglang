@@ -125,10 +125,13 @@ class EncoderPreprocessor:
         model_config: ModelConfig,
         encoder_media_processor_config: EncoderMediaProcessorConfig,
         model_preprocessor: Optional[Callable] = None,
+        model_token_counter: Optional[Callable] = None,
     ):
         self.server_args = server_args
         self.model_config = model_config
         self._model_preprocessor = model_preprocessor
+        # Models whose prompt layout is not patches / merge_size**2 declare one.
+        self._model_token_counter = model_token_counter
         self.encoder_media_processor_config = encoder_media_processor_config
         self.model_type = getattr(
             model_config.hf_config, "model_type", "unknown"
@@ -663,7 +666,9 @@ class EncoderPreprocessor:
         else:
             raise ValueError(f"Unsupported modality: {modality}")
         grid_thw = self._get_mm_grid_dim(mm_inputs, modality)
-        token_counts = [self.get_num_tokens(grid, modality) for grid in grid_thw]
+        token_counts = self._declared_token_counts(grid_thw, modality)
+        if token_counts is None:
+            token_counts = [self.get_num_tokens(grid, modality) for grid in grid_thw]
         return EncoderPreprocessResult(
             mm_inputs=mm_inputs,
             grid_thw=grid_thw,
@@ -953,6 +958,13 @@ class EncoderPreprocessor:
                 return self._kimi_tokens_from_patch_grid(grid)
             merge_size = getattr(self.image_processor, "merge_size", 2)
             return self.get_num_patches(grid, modality) // (merge_size**2)
+
+    def _declared_token_counts(self, grid_thw, modality) -> Optional[List[int]]:
+        """Per-grid token counts from the model hook, or None to fall back."""
+        if self._model_token_counter is None:
+            return None
+        counts = [self._model_token_counter(grid, modality) for grid in grid_thw]
+        return None if any(count is None for count in counts) else counts
 
     # ------------------------------------------------------------------
     # Video Timestamp Computation

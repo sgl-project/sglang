@@ -60,10 +60,76 @@ class DeepseekV41ImageProcessor(BaseMultimodalProcessor):
                 )
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
         self.image_token_id = hf_config.image_token_id
+        # Every image-span position uses the same token id: only the span
+        # length distinguishes the start, feature and newline rows.
+        self.IM_TOKEN_ID = self.image_token_id
+        self.IM_START_TOKEN_ID = self.image_token_id
+        self.IM_END_TOKEN_ID = self.image_token_id
         self.mm_tokens = MultimodalSpecialTokens(
             image_token=_processor.convert_ids_to_tokens(self.image_token_id),
             image_token_id=self.image_token_id,
         ).build(_processor)
+
+    def get_mm_data(self, prompt, embeddings, **kwargs):
+        """Rebuild V4.1 image spans around embeddings received from an encoder."""
+        img_grid_thw = kwargs.get("img_grid_thw")
+        if img_grid_thw is None:
+            return super().get_mm_data(prompt, embeddings, **kwargs)
+
+        tokens = prompt if isinstance(prompt, list) else self._processor.encode(prompt)
+        grids = (
+            img_grid_thw.tolist()
+            if isinstance(img_grid_thw, torch.Tensor)
+            else img_grid_thw
+        )
+
+        input_ids, spans = [], []
+        grid_idx = 0
+        for token in tokens:
+            if token == self.image_token_id and grid_idx < len(grids):
+                _, n_llm_h, n_llm_w = (int(value) for value in grids[grid_idx])
+                count = 2 + (n_llm_w + 1) * n_llm_h
+                start = len(input_ids)
+                input_ids.extend([self.image_token_id] * count)
+                spans.append((start, len(input_ids) - 1))
+                grid_idx += 1
+            else:
+                input_ids.append(token)
+
+        # pad_value stays unset: the scheduler derives the MM_PAD_SHIFT
+        # sentinels from the item hash, and Engram detects image tokens by it.
+        image_embeddings = embeddings[Modality.IMAGE]
+        mm_items, consumed = [], 0
+        for start, end in spans:
+            num_rows = end - start + 1
+            mm_items.append(
+                MultimodalDataItem(
+                    modality=Modality.IMAGE,
+                    offsets=[(start, end)],
+                    precomputed_embeddings=image_embeddings[
+                        consumed : consumed + num_rows
+                    ],
+                )
+            )
+            consumed += num_rows
+
+        if grid_idx != len(grids):
+            raise ValueError(
+                f"Image placeholders ({grid_idx}) do not match grids ({len(grids)})"
+            )
+        if consumed != image_embeddings.shape[0]:
+            raise ValueError(
+                f"Encoder returned {image_embeddings.shape[0]} rows for "
+                f"{consumed} image-span positions"
+            )
+
+        return MultimodalProcessorOutput(
+            input_ids=input_ids,
+            mm_items=mm_items,
+            im_token_id=self.image_token_id,
+            im_start_id=self.image_token_id,
+            im_end_id=self.image_token_id,
+        )
 
     def preprocess_fingerprint_payload(self):
         payload = super().preprocess_fingerprint_payload()

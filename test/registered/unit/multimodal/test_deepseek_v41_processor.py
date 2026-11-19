@@ -6,6 +6,7 @@ import io
 import unittest
 from types import SimpleNamespace
 
+import torch
 from PIL import Image
 
 from sglang.srt.multimodal.deepseek_v41_image_processing import (
@@ -13,6 +14,7 @@ from sglang.srt.multimodal.deepseek_v41_image_processing import (
     plan_image_grid,
 )
 from sglang.srt.multimodal.media_io import ImageData
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.deepseek_v41 import DeepseekV41ImageProcessor
 from sglang.srt.parser.deepseek_recipe_renderer import IMAGE_TOKEN, DeepSeekRecipe
 from sglang.srt.runtime_context import publish, reset_context
@@ -166,6 +168,89 @@ class TestDeepseekV41ImageProcessor(CustomTestCase):
             self._process(
                 f"see {IMAGE_TOKEN} literal {IMAGE_TOKEN}",
                 [ImageData(url=_png("wide"))],
+            )
+
+
+IMAGE_TOKEN_ID = 129264
+HIDDEN = 8
+
+
+def _epd_processor():
+    """A processor instance for the receiver path; get_mm_data needs no tokenizer."""
+    proc = object.__new__(DeepseekV41ImageProcessor)
+    proc.image_token_id = IMAGE_TOKEN_ID
+    return proc
+
+
+def _span_rows(n_llm_h: int, n_llm_w: int) -> int:
+    return 2 + (n_llm_w + 1) * n_llm_h
+
+
+class TestDeepseekV41EPDMMData(CustomTestCase):
+    """The EPD receiver rebuilds image spans from an encoder's embeddings."""
+
+    def test_single_image_span_and_offsets(self):
+        n_llm_h, n_llm_w = 11, 16
+        rows = _span_rows(n_llm_h, n_llm_w)
+        embeddings = {Modality.IMAGE: torch.arange(rows * HIDDEN).reshape(rows, HIDDEN)}
+
+        output = _epd_processor().get_mm_data(
+            [10, 20, IMAGE_TOKEN_ID, 30],
+            embeddings,
+            img_grid_thw=torch.tensor([[1, n_llm_h, n_llm_w]]),
+        )
+
+        self.assertEqual(len(output.input_ids), 2 + rows + 1)
+        self.assertEqual(output.mm_items[0].offsets, [(2, 2 + rows - 1)])
+        self.assertTrue(
+            torch.equal(
+                output.mm_items[0].precomputed_embeddings, embeddings[Modality.IMAGE]
+            )
+        )
+
+    def test_two_images_keep_embedding_order(self):
+        first, second = (2, 3), (1, 1)
+        total = _span_rows(*first) + _span_rows(*second)
+        embeddings = {
+            Modality.IMAGE: torch.arange(total * HIDDEN).reshape(total, HIDDEN)
+        }
+
+        output = _epd_processor().get_mm_data(
+            [IMAGE_TOKEN_ID, 7, IMAGE_TOKEN_ID],
+            embeddings,
+            img_grid_thw=torch.tensor(
+                [[1, first[0], first[1]], [1, second[0], second[1]]]
+            ),
+        )
+
+        first_rows = _span_rows(*first)
+        self.assertEqual(output.mm_items[0].offsets, [(0, first_rows - 1)])
+        self.assertEqual(
+            output.mm_items[1].offsets,
+            [(first_rows + 1, first_rows + _span_rows(*second))],
+        )
+        self.assertTrue(
+            torch.equal(
+                output.mm_items[1].precomputed_embeddings,
+                embeddings[Modality.IMAGE][first_rows:],
+            )
+        )
+
+    def test_grid_count_mismatch_raises(self):
+        with self.assertRaisesRegex(ValueError, "Image placeholders"):
+            _epd_processor().get_mm_data(
+                [IMAGE_TOKEN_ID],
+                {Modality.IMAGE: torch.zeros(_span_rows(1, 1), HIDDEN)},
+                img_grid_thw=torch.tensor([[1, 1, 1], [1, 1, 1]]),
+            )
+
+    def test_embedding_row_mismatch_raises(self):
+        rows = _span_rows(1, 1)
+        with self.assertRaisesRegex(ValueError, "Encoder returned"):
+            _epd_processor().get_mm_data(
+                [IMAGE_TOKEN_ID],
+                {Modality.IMAGE: torch.zeros(rows - 1, HIDDEN)},
+                img_grid_thw=torch.tensor([[1, 1, 1]]),
             )
 
 
