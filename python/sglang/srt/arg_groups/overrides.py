@@ -2081,6 +2081,14 @@ def post_capture_kv_sizing_planned(server_args: Any) -> bool:
         return False
     if envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get() is not None:
         return False
+    # NIXL registers each unified arena as one region; post-capture VMM backing can
+    # span multiple CUDA allocations, not qualified with our UCX registration.
+    if (
+        cfg.enable_unified_memory
+        and cfg.disaggregation_mode != "null"
+        and cfg.disaggregation_transfer_backend == "nixl"
+    ):
+        return False
     # Mooncake over EFA cannot register the CUDA VMM allocation used by
     # post-capture KV sizing. Fall back to the regular cudaMalloc-backed pool.
     if (
