@@ -868,12 +868,15 @@ class TestAllocationIntegration(CustomTestCase):
             scheduler.pp_group = None
             scheduler.waiting_queue = IndexedReqList(ListKind.WAITING)
             if waiting:
-                scheduler.waiting_queue.join([req])
-            scheduler.handle_bootstrap_failure = Mock()
+                move([req], scheduler.waiting_queue)
+            # Like the real handler, whose retirer takes it out of its list.
+            scheduler.handle_bootstrap_failure = Mock(
+                side_effect=lambda failed: failed.owner_list._leave([failed])
+            )
             queue = PrefillBootstrapQueue.__new__(PrefillBootstrapQueue)
             queue.queue = IndexedReqList(ListKind.PD_BOOTSTRAP)
             if queued_senders is not None:
-                queue.queue.join(
+                move(
                     [
                         FakeReq(
                             rid="queued",
@@ -886,7 +889,8 @@ class TestAllocationIntegration(CustomTestCase):
                             metadata_buffer_index=0,
                             time_stats=MagicMock(),
                         )
-                    ]
+                    ],
+                    queue.queue,
                 )
             queue.pp_rank, queue.pp_size = pp_rank, len(senders)
             queue.pp_poll_send_window = PPSyncSendWindow(rounds=len(senders))
