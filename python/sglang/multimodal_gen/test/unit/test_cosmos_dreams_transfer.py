@@ -40,7 +40,6 @@ from sglang.multimodal_gen.registry import (
     _discover_and_register_pipelines,
     _get_config_info,
 )
-from sglang.multimodal_gen.runtime.cache.conditioning import ConditioningCache
 from sglang.multimodal_gen.runtime.models.dits.cosmos_dreams import (
     build_cosmos_dreams_position_ids,
 )
@@ -62,7 +61,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
     TRANSFER_SYSTEM_PROMPT,
     CosmosDreamsTransferDecodingStage,
     align_pixel_frames_to_chunks,
-    can_encode_while_decoding,
     check_direct_distortion,
     control_frames_used,
     direct_resize_control,
@@ -74,6 +72,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
     resize_center_crop_uint8,
     restore_transfer_output_size,
     select_direct_canvas,
+    streams_control_encode,
     synthetic_control_frames,
     transfer_scale_ratio,
 )
@@ -422,17 +421,11 @@ class TestTransferFramesAndHistory(unittest.TestCase):
                 decode.wait(2)
             decode.close()
 
-    def test_a_conditioning_cache_does_not_hold_the_control_encode_back(self):
-        """A lookup would wait for the clip's last frame, so the encode of a
-        decoding clip starts whether or not the cache could hit."""
-        vae = SimpleNamespace(training=False, use_feature_cache=True)
-        cache = ConditioningCache(1 << 20)
-        with cache.scope():
-            self.assertTrue(can_encode_while_decoding(vae))
-            with cache.group_scope():
-                self.assertTrue(can_encode_while_decoding(vae))
+    def test_the_control_encode_streams_only_with_the_vae_feature_cache(self):
+        vae = SimpleNamespace(use_feature_cache=True)
+        self.assertTrue(streams_control_encode(vae))
         vae.use_feature_cache = False
-        self.assertFalse(can_encode_while_decoding(vae))
+        self.assertFalse(streams_control_encode(vae))
 
     @_fails_if_hung
     def test_encode_of_a_decoding_clip_matches_the_finished_clip(self):

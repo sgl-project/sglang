@@ -447,13 +447,8 @@ def encode_control_latent(
     return _normalized_latent(vae, latent)
 
 
-def can_encode_while_decoding(vae: Any) -> bool:
-    """Whether the control encode may start before the clip has fully decoded.
-
-    Needs the VAE's cached causal encode. Such a clip skips the conditioning
-    cache: a lookup hashes the whole clip, so even a hit waits for the last
-    frame, which takes longer than an encode that keeps up with the decode.
-    """
+def streams_control_encode(vae: Any) -> bool:
+    """A streamed encode skips the conditioning cache, whose lookup hashes the whole clip."""
     return vae.use_feature_cache
 
 
@@ -769,7 +764,7 @@ class CosmosDreamsTransferPrepareStage(PipelineStage):
             # With one latent frame per chunk the rollout uses every whole VAE
             # group of the clip; a longer chunk trims groups only the finished
             # clip can count.
-            if self.manifest.chunk_size == 1 and can_encode_while_decoding(self.vae):
+            if self.manifest.chunk_size == 1 and streams_control_encode(self.vae):
                 latent, frames = encode_decoding_control_latent(
                     self.vae,
                     decode,
