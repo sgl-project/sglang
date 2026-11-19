@@ -231,7 +231,7 @@ python -m mooncake.mooncake_store_service --port=8081
 * `local_hostname`, `MOONCAKE_LOCAL_HOSTNAME`: The hostname of the `store service`.
 * `metadata_server`, `MOONCAKE_TE_META_DATA_SERVER` : The network address of the `metadata service`. The default port is 8080. If the `metadata service` is not deployed, set this field to: `"metadata_server": "P2PHANDSHAKE"`.
 * `master_server_address`, `MOONCAKE_MASTER`: The network address of the `master service`. The default port is 50051.
-* `protocol`, `MOONCAKE_PROTOCOL`: The protocol used by Mooncake. Supported values are `"rdma"` or `"tcp"`. For optimal performance, `"rdma"` is recommended.
+* `protocol`, `MOONCAKE_PROTOCOL`: The protocol used by Mooncake. Supported values are `"rdma"` or `"tcp"`, and `"nvlink"` for the EGM-backed pool described in [Host Memory Pooled over NVLink (EGM)](#host-memory-pooled-over-nvlink-egm). For optimal performance across nodes connected only by a network, `"rdma"` is recommended.
 * `device_name`, `MOONCAKE_DEVICE`: The RDMA devices used by Mooncake. This field can usually be left empty, as Mooncake automatically discovers available NICs by default. This parameter is required only when the protocol is set to `"rdma"` **and** a specific set of NICs needs to be used. Example: `"device_name": "mlx5_0,mlx5_1"`. To list available devices, run `ibv_devices`. **Note:** If the environment variable `MC_MS_AUTO_DISC` is set to `1`, any `device_name` or `MOONCAKE_DEVICE` configuration will be overridden, and Mooncake will switch to auto-discovery mode.
   - For tensor parallel deployments where different ranks should use different devices, you can specify device configurations using JSON format:
     ```json
@@ -409,6 +409,28 @@ each logical page across its per-layer buffers.
 Distributed deployment of Mooncake is straightforward. Similar to the single-node setup, start one `metadata service` and one `master service` for this cluster. Then start a `store service` on each server.
 
 Mooncake also supports high availability mode. This mode enhances fault tolerance by running the `master service` as a cluster of multiple master nodes coordinated through an `etcd` cluster. The master nodes use `etcd` to elect a leader, which is responsible for handling client requests. For more details about how to deploy in this mode, please refer to our [documents](https://kvcache-ai.github.io/Mooncake/).
+
+### Host Memory Pooled over NVLink (EGM)
+
+On multi-node NVLink systems such as GB200 and GB300 NVL72, a GPU can read and write the host memory of another node in its NVLink domain through Extended GPU Memory (EGM). Mooncake can back a Store segment with such memory: it allocates the segment with `cuMemCreate` on a host NUMA node with a fabric handle, and other nodes reach it over NVLink instead of the NIC.
+
+Enable it for the segment each SGLang rank contributes:
+
+```bash
+--hicache-storage-backend-extra-config '{"master_server_address": "<master-ip>:50051", "metadata_server": "http://<master-ip>:8080/metadata", "global_segment_size": "64gb", "protocol": "nvlink", "enable_egm_store_pool": true}'
+```
+
+* `enable_egm_store_pool`, `MOONCAKE_ENABLE_EGM_STORE_POOL`: Back the segment with EGM host memory. Default `false`. Requires `protocol` set to `"nvlink"` and cannot be combined with `standalone_storage`.
+* `egm_numa_nodes`, `MOONCAKE_EGM_NUMA_NODES`: Host NUMA nodes the segment is allocated on, as `"auto"` or a comma-separated list such as `"0,1"`. When unset, each rank uses the host NUMA node of its own GPU, so the segment stays on that GPU's socket. `"auto"` lets Mooncake split the segment across the nodes of every GPU the process can see.
+
+Requirements:
+
+* Mooncake 0.3.14 or later, built with `USE_MNNVL=ON` (the published aarch64 CUDA wheels are) and without TENT (`MC_USE_TENT` unset).
+* EGM enabled in the GPU driver, and an IMEX domain that spans the nodes.
+* `MOONCAKE_LOCAL_HOSTNAME` set to an address that the other nodes can reach, as for `"rdma"`.
+* For the direct linker, which reads into GPU memory: a Mooncake release with [kvcache-ai/Mooncake#4951](https://github.com/kvcache-ai/Mooncake/pull/4951). In 0.3.14 a GPU read from an EGM segment is staged through the local buffer, which is slower and fails for objects larger than `local_buffer_size`.
+
+Every client of the pool, including a dedicated `store service` or another SGLang instance, must be in the same NVLink domain and use `protocol` `"nvlink"`. Only the nodes that contribute EGM memory set `enable_egm_store_pool`.
 
 ### Deployment with Dummy Client (Experimental)
 

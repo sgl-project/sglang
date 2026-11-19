@@ -1006,6 +1006,8 @@ class Envs:
     MOONCAKE_ENABLE_SSD_OFFLOAD = EnvBool(False)
     MOONCAKE_OFFLOAD_FILE_STORAGE_PATH = EnvStr(None)
     MOONCAKE_TENANT_ID = EnvStr("default")
+    MOONCAKE_ENABLE_EGM_STORE_POOL = EnvBool(False)
+    MOONCAKE_EGM_NUMA_NODES = EnvStr(None)
 
     # ===================================================================
     # Ascend MemCache (HiCache L3); see https://gitcode.com/Ascend/memcache
