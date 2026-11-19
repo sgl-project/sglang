@@ -186,13 +186,7 @@ class NpuEplbRuntime:
         def compute():
             if self.rank == 0 and payload[0] is None:
                 try:
-                    self.device_module.set_device(self.device)
-                    with self.device_module.stream(self._p2p_stream):
-                        self._p2p_stream.wait_event(self._owner_ready)
-                        host = counts.cpu()
-                    # Idle forwards can fill a recorder window without routing tokens.
-                    placement = self.spec.compute(host) if host.any().item() else None
-                    payload[0] = (None, placement)
+                    payload[0] = (None, self._plan_on_root(counts))
                 except Exception as error:
                     payload[0] = (str(error), None)
             dist.broadcast_object_list(payload, src=0, group=self.plan_group)
@@ -203,17 +197,30 @@ class NpuEplbRuntime:
 
         return compute
 
-    def prepare(self, placement):
-        if placement is None:
-            return ()
-        physical, logical = placement
+    def _plan_on_root(self, counts):
+        self.device_module.set_device(self.device)
+        with self.device_module.stream(self._p2p_stream):
+            self._p2p_stream.wait_event(self._owner_ready)
+            host = counts.cpu()
+        if not host.any().item():
+            return None
+
+        physical, logical = self.spec.compute(host)
         old = self.metadata.physical_to_logical_map_cpu
         if physical.shape != old.shape:
             raise ValueError("EPLB plan changed physical capacity")
         moved = (physical != old).any(dim=1).tolist()
         changed = tuple(layer for layer in self.layer_ids if moved[layer])
+        # All ranks start with the same layout and commit layers together.
+        # An unchanged plan only needs the completion message.
         if not changed:
+            return None
+        return changed, physical, logical
+
+    def prepare(self, placement):
+        if placement is None:
             return ()
+        changed, physical, logical = placement
         self._last_layer = changed[-1]
         # Static dispatch draws tie breaks in full layer order. Build the
         # complete plan on CPU, even when only a few layers need staging.
