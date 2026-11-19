@@ -1334,6 +1334,10 @@ def _prefetch_all_checkpoints(
         torch.distributed.all_reduce(fits, torch.distributed.ReduceOp.MIN, group)
     if readers is None or fits:
         my_files = [(path, None) for path in sorted_files[local_rank::local_world_size]]
+    elif node_reads := getattr(readers, "node_reads", None):
+        # Each rank reads all that the node reads of its share of the files.
+        files = sorted_files[local_rank::local_world_size]
+        my_files = [(path, node_reads) for path in files]
     else:  # Prefetch only what the node reads, split by file among its readers.
         my_files = [
             (path, lambda name, n, i=i: (r := readers(name, n)) and i % r[1] == r[0])

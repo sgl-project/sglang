@@ -436,6 +436,7 @@ def _checkpoint_tensor_readers(
 ) -> Optional[CheckpointTensorReaders]:
     """Map checkpoint tensors to the node's ranks that read them: under EP a
     rank reads only its own experts. Ranks skip the tensors they do not read."""
+    from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
     if model is None or not torch.distributed.is_initialized():
@@ -474,6 +475,24 @@ def _checkpoint_tensor_readers(
             return expert_peers
         return None
 
+    # With experts placed in order, the node's EP ranks hold one block of them.
+    index, count = _node_local_peers(get_parallel().moe_ep_group.ranks)
+    location = get_global_expert_location_metadata()
+    m = None if location is None else location.physical_to_logical_map_cpu
+    if (m is None or torch.equal(m, torch.arange(m.shape[-1]).expand_as(m))) and all(
+        moe._expert_storage_rank == moe.moe_ep_rank for moe in moe_layers.values()
+    ):
+
+        def node_reads(name: str, nbytes: int) -> bool:
+            match = _EXPERT_ID_RE.search(name)
+            layer_id = get_layer_id(name)
+            if match is None or layer_id not in moe_layers or nbytes <= 8:
+                return True
+            moe, expert_id = moe_layers[layer_id], int(match.group(1))
+            block = expert_id // moe._num_local_routed - moe.moe_ep_rank + index
+            return expert_id >= moe._num_global_routed or 0 <= block < count
+
+        readers.node_reads = node_reads
     return readers
 
 

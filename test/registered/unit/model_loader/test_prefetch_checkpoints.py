@@ -244,7 +244,8 @@ class TestPrefetchCheckpoints(CustomTestCase):
         class FakeMoE(torch.nn.Module):
             layer_id = 1
             moe_ep_size = 2
-            _num_global_routed = 4
+            moe_ep_rank = _expert_storage_rank = 0
+            _num_global_routed, _num_local_routed = 4, 2
 
             def _weight_loader_expert_ids(self, param, expert_id):
                 if expert_id < 2:  # Experts 0 and 1 are local.
