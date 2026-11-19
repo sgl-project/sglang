@@ -28,17 +28,31 @@ impl CoreHandle {
         request: GenerateRequest,
         received: ReceivedAs,
     ) -> Result<CoreCall, CoreError> {
-        // Python holds client generates while paused, before tokenizing.
-        self.inner.frontend.wait_unpaused().await;
-        // Counted from admission, media prefetch included: the drain waits
-        // for it.
-        let in_flight = self.inner.drain.track();
+        // Counted from admission, media prefetch included: the drain and a
+        // weight update both wait for it. The pause is checked again after
+        // the count, so an update that paused in between does not miss it
+        // and then let it start on the new weights.
+        let in_flight = self.admit_count(1).await.remove(0);
         let generation = self
             .inner
             .generations
             .register(request.rid.clone(), self.inner.abort_tx.clone());
         self.generate_registered(request, received, generation, in_flight)
             .await
+    }
+
+    /// Pass the pause gate and count `count` requests. If an update pauses
+    /// after the gate opened and before the count, drop the count and wait
+    /// again. Counting first and then waiting would deadlock that update:
+    /// its idle wait is the same count these requests would be holding.
+    async fn admit_count(&self, count: usize) -> Vec<InFlight> {
+        loop {
+            self.inner.frontend.wait_unpaused().await;
+            let in_flight: Vec<_> = (0..count).map(|_| self.inner.drain.track()).collect();
+            if !self.inner.frontend.is_paused() {
+                return in_flight;
+            }
+        }
     }
 
     /// A native `/generate` body as the request log and the crash dump see
@@ -92,10 +106,27 @@ impl CoreHandle {
         self.inner.request_log.as_ref()?.crash_dump_snapshot()
     }
 
+    /// [`Self::hold_generation`] once [`Self::admit_count`] has passed the
+    /// pause gate. The count comes from that one gate, so a request that
+    /// arrives during an update waits it out.
+    pub(crate) async fn hold_admitted_generation(&self, rid: &str) -> PendingGeneration {
+        let in_flight = self.admit_count(1).await.remove(0);
+        PendingGeneration {
+            generation: self
+                .inner
+                .generations
+                .register(Rid::from_client(rid), self.inner.abort_tx.clone()),
+            in_flight,
+        }
+    }
+
     /// Register a generation under the public ID `rid` before its request
     /// exists, so an explicit cancellation in the meantime is kept for
     /// [`Self::generate_pending`]. The hold counts as in flight: the drain
     /// waits for the work before `/generate` as for media prefetch.
+    /// Does not wait out a pause. Production admission goes through
+    /// [`Self::hold_admitted_generation`], which drops the count if an
+    /// update paused in between.
     pub(crate) fn hold_generation(&self, rid: &str) -> PendingGeneration {
         PendingGeneration {
             generation: self
@@ -168,10 +199,15 @@ impl CoreHandle {
         let record = self
             .receive(std::slice::from_ref(&request), received, false, log_metrics)
             .pop();
-        // Counted from admission, media prefetch included: the drain waits
-        // for it. The health probe is not a client request; the drain never
-        // waits for it.
-        let in_flight = log_metrics.then(|| self.inner.drain.track());
+        // Warmup is a client-shaped request, so it takes the same gate as
+        // `generate`: counted only once admission is open. The health probe
+        // is not a client request; the drain never waits for it, and it does
+        // not wait out a weight update.
+        let in_flight = if log_metrics {
+            Some(self.admit_count(1).await.remove(0))
+        } else {
+            None
+        };
         self.prepare_generations(std::slice::from_mut(&mut request))
             .await?;
         let metrics = log_metrics
@@ -211,7 +247,9 @@ impl CoreHandle {
             return Ok(Vec::new());
         }
         // Python holds client generates while paused, before tokenizing.
-        self.inner.frontend.wait_unpaused().await;
+        // Counted once the pause gate has been passed again (see `admit_count`),
+        // and held through media prefetch.
+        let in_flight = self.admit_count(requests.len()).await;
         for request in &mut requests {
             self.set_default_priority(request);
         }
@@ -226,8 +264,6 @@ impl CoreHandle {
         records.resize_with(requests.len(), || None);
         // One refused item refuses the batch before any item is prepared.
         self.validate(&requests)?;
-        // Counted from admission, media prefetch included (see `generate`).
-        let in_flight: Vec<InFlight> = requests.iter().map(|_| self.inner.drain.track()).collect();
         let mut generations: Vec<_> = requests
             .iter()
             .map(|request| {

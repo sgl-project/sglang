@@ -149,19 +149,25 @@ fn check_selector(selector: &str) -> Result<(), CoreError> {
 
 impl CoreHandle {
     /// Run one weight update under this listener's update hold, as Python's
-    /// `_weight_update_session_replies`: aborts first when asked (Python's
-    /// `abort_request(abort_all=True)`), then nothing is admitted here until
-    /// the scheduler ranks have answered.
+    /// `_weight_update_session_replies`. Pause admission first, then abort
+    /// when asked (Python's `abort_request(abort_all=True)`), so a request
+    /// that has not passed the gate yet cannot start between the abort and
+    /// the pause. Then wait until every generation already running has
+    /// ended. That wait is Python's writer lock waiting out the reader lock
+    /// each request holds for its lifetime. The scheduler sees the update
+    /// only after it. Dropping this call before then releases the pause and
+    /// sends nothing.
     async fn weight_update<T: serde::de::DeserializeOwned>(
         &self,
         what: &str,
         abort_all_requests: bool,
         build: &RequestBuilder<'_>,
     ) -> Result<Vec<T>, CoreError> {
+        let hold = self.inner.frontend.hold_for_update().await;
         if abort_all_requests {
             self.abort(None, AbortEnding::AbortFinishReason);
         }
-        let hold = self.inner.frontend.hold_for_update().await;
+        self.inner.drain.idle().await;
         let outcomes = self.control(build).await.decode::<T>(what);
         drop(hold);
         outcomes
@@ -539,7 +545,7 @@ mod tests {
     use crate::api_server::handlers::{CoreConfig, CoreMetadata};
     use crate::message::config::DeploymentInfo;
     use crate::message::io_struct::WireBytes;
-    use crate::message::request::RequestKind;
+    use crate::message::request::{GenerateRequest, RequestKind};
     use crate::message::response::ResponseItem;
     use bytes::Bytes;
 
@@ -1052,5 +1058,258 @@ mod tests {
             .unwrap();
         assert!(!outcome.success && outcome.message.starts_with("IPC weight update failed"));
         assert!(intake_rx.try_recv().is_err(), "refused before any rank");
+    }
+
+    /// A generation the caller still holds. Its intake has been accepted, so
+    /// the call is past admission and the scheduler would be running it.
+    async fn open_generation(harness: &Harness) -> super::super::CoreCall {
+        let handle = harness.handle.clone();
+        let started = tokio::spawn(async move {
+            handle
+                .generate(
+                    GenerateRequest {
+                        input_ids: Some(vec![1]),
+                        ..Default::default()
+                    },
+                    crate::api_server::core::ReceivedAs::without_headers(),
+                )
+                .await
+                .unwrap()
+        });
+        let request = accept_intake(harness.intake_rx.recv_async().await.unwrap());
+        assert!(matches!(request.kind, RequestKind::Generate(_)));
+        tokio::time::timeout(std::time::Duration::from_secs(1), started)
+            .await
+            .expect("generation admitted")
+            .unwrap()
+    }
+
+    /// The update must not reach the scheduler until `call` ends. Then the
+    /// scheduler sees `tag` and a success reply releases the listener.
+    async fn update_waits_until_the_generation_ends(
+        harness: &Harness,
+        call: super::super::CoreCall,
+        tag: &str,
+        update: impl std::future::Future<Output = Result<(), CoreError>> + Send + 'static,
+    ) {
+        let update = tokio::spawn(update);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            harness.intake_rx.try_recv().is_err(),
+            "{tag} reached the scheduler while a generation was still running"
+        );
+        assert!(
+            harness.handle.inner.frontend.is_paused(),
+            "{tag} admits new generations while it waits"
+        );
+        drop(call);
+        let request = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            harness.intake_rx.recv_async(),
+        )
+        .await
+        .expect("update arrives once the generation ends")
+        .unwrap();
+        let request = accept_intake(request);
+        assert_eq!(wire_items(&request)[0].as_str(), Some(tag));
+        request
+            .sink
+            .try_send(ResponseItem::Control(status_reply(true, "Success")))
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), update)
+            .await
+            .expect("update finishes after the scheduler answers")
+            .unwrap()
+            .unwrap();
+        assert!(!harness.handle.inner.frontend.is_paused());
+    }
+
+    /// Disk, distributed, and tensor updates all wait out a live generation,
+    /// including one whose abort was requested but whose call has not ended.
+    /// Cancelling the update sends nothing and releases the pause.
+    #[tokio::test]
+    async fn an_update_reaches_the_scheduler_only_after_active_generations_finish() {
+        let harness = Harness::unbounded(8);
+        let call = open_generation(&harness).await;
+        let handle = harness.handle.clone();
+        update_waits_until_the_generation_ends(
+            &harness,
+            call,
+            "UpdateWeightFromDiskReqInput",
+            async move {
+                handle
+                    .update_weights_from_disk(DiskWeightUpdate {
+                        model_path: "/models/new".into(),
+                        ..Default::default()
+                    })
+                    .await
+                    .map(|_| ())
+            },
+        )
+        .await;
+
+        let call = open_generation(&harness).await;
+        let handle = harness.handle.clone();
+        update_waits_until_the_generation_ends(
+            &harness,
+            call,
+            "UpdateWeightsFromDistributedReqInput",
+            async move {
+                handle
+                    .update_weights_from_distributed(DistributedWeightUpdate {
+                        selector: "all".into(),
+                        ..Default::default()
+                    })
+                    .await
+                    .map(|_| ())
+            },
+        )
+        .await;
+
+        let call = open_generation(&harness).await;
+        let handle = harness.handle.clone();
+        update_waits_until_the_generation_ends(
+            &harness,
+            call,
+            "UpdateWeightsFromTensorReqInput",
+            async move {
+                handle
+                    .update_weights_from_tensor(TensorWeightUpdate {
+                        serialized_named_tensors: vec![WireBytes(vec![1])],
+                        selector: "target".into(),
+                        ..Default::default()
+                    })
+                    .await
+                    .map(|_| ())
+            },
+        )
+        .await;
+
+        // Abort is requested at once. The update still waits until the call ends.
+        let call = open_generation(&harness).await;
+        let handle = harness.handle.clone();
+        let update = tokio::spawn(async move {
+            handle
+                .update_weights_from_disk(DiskWeightUpdate {
+                    model_path: "/models/new".into(),
+                    abort_all_requests: true,
+                    ..Default::default()
+                })
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            harness.handle.inner.frontend.is_paused(),
+            "admission is paused while the aborted generation is still held"
+        );
+        assert!(
+            harness.abort_rx.try_recv().is_ok(),
+            "abort_all requests the generation's abort before the update"
+        );
+        assert!(
+            harness.intake_rx.try_recv().is_err(),
+            "the update ran before the abort finished"
+        );
+        drop(call);
+        let request = accept_intake(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                harness.intake_rx.recv_async(),
+            )
+            .await
+            .expect("update arrives once the aborted generation ends")
+            .unwrap(),
+        );
+        assert_eq!(
+            wire_items(&request)[0].as_str(),
+            Some("UpdateWeightFromDiskReqInput")
+        );
+        request
+            .sink
+            .try_send(ResponseItem::Control(status_reply(true, "Success")))
+            .unwrap();
+        assert!(update.await.unwrap().unwrap().success);
+
+        // Dropping the update while it waits must not deliver it later.
+        let call = open_generation(&harness).await;
+        let handle = harness.handle.clone();
+        let update = tokio::spawn(async move {
+            handle
+                .update_weights_from_disk(DiskWeightUpdate {
+                    model_path: "/models/new".into(),
+                    ..Default::default()
+                })
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(harness.handle.inner.frontend.is_paused());
+        assert!(harness.intake_rx.try_recv().is_err());
+        update.abort();
+        let _ = update.await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!harness.handle.inner.frontend.is_paused());
+        assert!(
+            harness.intake_rx.try_recv().is_err(),
+            "a cancelled update still reached the scheduler"
+        );
+        drop(call);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(harness.intake_rx.try_recv().is_err());
+    }
+
+    /// A batch uses the same pause gate as one generate. It stays off the
+    /// scheduler for the whole update, then both items are admitted.
+    #[tokio::test]
+    async fn a_batch_stays_off_the_scheduler_until_the_update_finishes() {
+        let harness = Harness::unbounded(8);
+        let handle = harness.handle.clone();
+        let update =
+            tokio::spawn(async move { handle.begin_weight_update("all".into()).await.unwrap() });
+        let request = accept_intake(harness.intake_rx.recv_async().await.unwrap());
+        let gen_handle = harness.handle.clone();
+        let parked = tokio::spawn(async move {
+            gen_handle
+                .generate_batch(
+                    vec![
+                        GenerateRequest {
+                            rid: "batch-a".into(),
+                            input_ids: Some(vec![1]),
+                            ..Default::default()
+                        },
+                        GenerateRequest {
+                            rid: "batch-b".into(),
+                            input_ids: Some(vec![2]),
+                            ..Default::default()
+                        },
+                    ],
+                    crate::api_server::core::ReceivedAs::without_headers(),
+                )
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!parked.is_finished(), "a batch waits for the update");
+        assert!(
+            harness.intake_rx.try_recv().is_err(),
+            "a batch reached the scheduler during the update"
+        );
+        request
+            .sink
+            .try_send(ResponseItem::Control(status_reply(true, "Success")))
+            .unwrap();
+        update.await.unwrap();
+        for _ in 0..2 {
+            let released = accept_intake(
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    harness.intake_rx.recv_async(),
+                )
+                .await
+                .expect("batch item arrives after the update")
+                .unwrap(),
+            );
+            assert!(matches!(released.kind, RequestKind::Generate(_)));
+        }
+        assert!(!harness.handle.inner.frontend.is_paused());
+        drop(parked);
     }
 }
