@@ -18,7 +18,6 @@ from sglang.multimodal_gen.runtime.models.encoders.qwen2_5vl import (
     _select_next_token,
 )
 from sglang.multimodal_gen.runtime.models.encoders.qwen2_5vl_vision import (
-    Qwen2_5VLVisionRotaryEmbedding,
     Qwen2_5VLVisionTransformer,
     _vision_position_ids,
     _vision_window_index,
@@ -28,6 +27,9 @@ from sglang.srt.distributed.utils import get_group_rank_size
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     ReplicatedLinear,
+)
+from sglang.srt.models.qwen2_5_vl import (
+    Qwen2_5_VisionRotaryEmbedding as Qwen2_5VLVisionRotaryEmbedding,
 )
 
 

@@ -37,8 +37,6 @@ class SageAttentionBackend(AttentionBackend):
     def supports_ring_rotation(cls) -> bool:
         return True
 
-    accept_output_buffer: bool = True
-
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
         # SageAttention 2 pads smaller head dimensions to 64 or 128 internally
@@ -243,8 +241,6 @@ class SageAttentionImpl(AttentionImpl):
                 value[:used].unsqueeze(0),
                 None,
             )[0]
-            if used == query.shape[0]:
-                return live_out
             # Keep padded tail at zero so downstream masked rows stay inactive.
             output = torch.zeros_like(query)
             output[:used] = live_out

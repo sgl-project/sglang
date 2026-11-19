@@ -54,7 +54,7 @@ from sglang.multimodal_gen.runtime.utils.quantization_utils import (
 )
 from sglang.multimodal_gen.runtime.weights.source import resolve_weight
 from sglang.srt.environ import envs
-from sglang.srt.utils.hf_transformers import check_gguf_file
+from sglang.srt.hf_transformers import check_gguf_file
 from sglang.utils import is_in_ci
 
 logger = init_logger(__name__)
@@ -673,6 +673,63 @@ def _local_model_index_path(model_path: str) -> str:
     return os.path.join(model_path, "modular_model_index.json")
 
 
+_EXTERNAL_COMPONENT_OPTIONAL_KEYS = frozenset({"type_hint", "variant", "revision"})
+_EXTERNAL_COMPONENT_REQUIRED_KEYS = frozenset(
+    {"pretrained_model_name_or_path", "subfolder"}
+)
+
+
+def external_component_path(name: str, spec: Any) -> str | None:
+    """Where a model_index.json component from another repository lives.
+
+    Such a component is a ``[library, class, source]`` triple whose ``source``
+    is a diffusers modular-pipeline component spec,
+    ``{"type_hint": [library, class], "pretrained_model_name_or_path": repo,
+    "subfolder": folder, "variant": null, "revision": null}``. Returns
+    ``repo/folder`` (an HF ``namespace/repo/subfolder`` or a local path), or
+    None for an ordinary ``[library, class]`` component of this snapshot.
+    Variants and revisions are not supported.
+    """
+    if not (isinstance(spec, list) and len(spec) == 3 and isinstance(spec[2], dict)):
+        return None
+    source = spec[2]
+    keys = set(source)
+    missing = _EXTERNAL_COMPONENT_REQUIRED_KEYS - keys
+    unknown = (
+        keys - _EXTERNAL_COMPONENT_REQUIRED_KEYS - _EXTERNAL_COMPONENT_OPTIONAL_KEYS
+    )
+    if missing or unknown:
+        raise ValueError(
+            f"model_index.json component {name!r} source must have "
+            f"{sorted(_EXTERNAL_COMPONENT_REQUIRED_KEYS)}; missing {sorted(missing)}, "
+            f"unknown {sorted(unknown)}"
+        )
+    repo, subfolder = source["pretrained_model_name_or_path"], source["subfolder"]
+    for key, value in (
+        ("pretrained_model_name_or_path", repo),
+        ("subfolder", subfolder),
+    ):
+        if not isinstance(value, str) or not value:
+            raise ValueError(
+                f"model_index.json component {name!r} {key} must be a non-empty "
+                f"string, got {value!r}"
+            )
+    if "type_hint" in source and list(source["type_hint"]) != list(spec[:2]):
+        raise ValueError(
+            f"model_index.json component {name!r} type_hint {source['type_hint']!r} "
+            f"differs from {spec[:2]!r}"
+        )
+    for key in ("variant", "revision"):
+        if source.get(key) is not None:
+            raise ValueError(
+                f"model_index.json component {name!r}: {key} is not supported, "
+                f"got {source[key]!r}"
+            )
+    if os.path.isabs(repo):
+        return os.path.join(repo, subfolder)
+    return f"{repo}/{subfolder}"
+
+
 def _read_model_index(path: str) -> dict[str, Any]:
     with open(path) as f:
         config = json.load(f)
@@ -686,6 +743,11 @@ def _read_model_index(path: str) -> dict[str, Any]:
                         f"Modular component {name!r} must use its own subfolder"
                     )
                 config[name] = spec[:2]
+        return config
+    # Validate external-component triples here;
+    # ComposedPipelineBase.load_modules resolves them.
+    for name, spec in config.items():
+        external_component_path(name, spec)
     return config
 
 
