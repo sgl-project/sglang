@@ -62,7 +62,8 @@ struct WorkerRecord {
 
 #[derive(Debug, Default)]
 struct PoolRecord {
-    holdings: HashSet<i64>,
+    /// Owner component masks by hash; reverse index for CLEAR_ALL_AT_TIER.
+    holdings: HashMap<i64, u32>,
     members: HashSet<String>,
 }
 
@@ -403,7 +404,12 @@ impl InMemoryKvIndexerBackend {
                 blocks_read: 1,
             });
         };
-        let known_prefix_len = known_request_prefix_len(&state, hashes).unwrap_or(0);
+        // Only the private derived fast path needs request-chain validation.
+        let known_prefix_len = if first.prefix_complete_workers.is_empty() {
+            0
+        } else {
+            known_request_prefix_len(&state, hashes).unwrap_or(0)
+        };
         let fast_worker_ids: HashSet<&str> = if known_prefix_len > 0 {
             first
                 .prefix_complete_workers
@@ -494,6 +500,7 @@ impl InMemoryKvIndexerBackend {
         // Scan shared FULL blocks once per pool. Only DRAM gaps require checking
         // each member's private HBM. No derived pool state or REPORT fanout is needed.
         for (pool_id, mut members) in pool_candidates {
+            let pool = &state.pools[pool_id];
             let mut add_match = |member: &PoolPrefixCandidate<'_>, prefix| {
                 let worker = &state.workers[member.worker_id];
                 if prefix > 0 && !worker.address.is_empty() {
@@ -502,11 +509,12 @@ impl InMemoryKvIndexerBackend {
             };
             let mut prefix = 0;
             for hash in hashes {
-                let block = state.blocks.get(hash);
-                let shared_full = block
-                    .and_then(|block| block.pool_placements.get(pool_id))
+                let shared_full = pool
+                    .holdings
+                    .get(hash)
                     .is_some_and(|mask| mask & COMPONENT_FULL != 0);
                 if !shared_full {
+                    let block = state.blocks.get(hash);
                     members.retain(|member| {
                         let private_full = block
                             .and_then(|block| {
@@ -641,13 +649,20 @@ fn apply_pool(state: &mut State, req: ApplyExternalKvBatchRequest) {
                 if action.block_sizes[i] > 0 {
                     block.token_count = action.block_sizes[i];
                 }
-                state.pools.get_mut(&id).unwrap().holdings.insert(hash);
+                state
+                    .pools
+                    .get_mut(&id)
+                    .unwrap()
+                    .holdings
+                    .insert(hash, action.component_masks[i]);
             }
         } else {
             let hashes = if action.r#type == ExternalKvActionType::ActionClearAllAtTier as i32 {
                 std::mem::take(&mut state.pools.get_mut(&id).unwrap().holdings)
+                    .into_keys()
+                    .collect::<Vec<_>>()
             } else {
-                action.hashes.into_iter().collect()
+                action.hashes
             };
             for hash in hashes {
                 state.pools.get_mut(&id).unwrap().holdings.remove(&hash);
