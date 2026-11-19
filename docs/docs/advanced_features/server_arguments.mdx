@@ -2230,7 +2230,7 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--hicache-storage-key-scheme`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>How L3 storage object keys encode what an object holds. 'rank-suffix' (legacy): keys carry the writer's tp/pp/cp rank, so only a bit-identical topology can reuse the cache. 'unified': keys carry topology-free grid coordinates (a namespace digest plus absolute layer and head-group indices), so any topology whose shards tile the same grid shares one cache. Implies --hicache-mem-layout page_unified and --hicache-io-backend kernel. Currently supported by the file backend for a single MHA/MLA pool. To reuse L3 across different TP and PP splits, set the same --hicache-storage-head-partition and --hicache-storage-layer-partition on all instances so each local shard tiles the shared chunk grid. The file backend stores each chunk separately and reassembles the reader's local pages; a page is a cache hit only when all of its chunks are present. Composite caches (including GLM-5.2 indexer and DeepSeek-V4 pools), draft sidecars, and decode context parallelism (DCP) are not supported.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>How L3 storage object keys encode what an object holds. 'rank-suffix' (legacy): keys carry the writer's tp/pp/cp rank, so only a bit-identical topology can reuse the cache. 'unified': keys carry topology-free grid coordinates (a namespace digest plus absolute layer and head-group indices), so any topology whose shards tile the same grid shares one cache. Implies --hicache-mem-layout page_unified and --hicache-io-backend kernel. Supported by the file and mooncake backends for a single MHA/MLA pool. To reuse L3 across different TP and PP splits, set the same --hicache-storage-head-partition and --hicache-storage-layer-partition on all instances so each local shard tiles the shared chunk grid. Both backends store each chunk separately and reassemble the reader's local pages; a page is a cache hit only when all of its chunks are present. Composite caches (including GLM-5.2 indexer and DeepSeek-V4 pools), speculative decoding, and decode context parallelism (DCP) are not supported.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`rank-suffix`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>rank-suffix</code>, <code>unified</code></td>
     </tr>
@@ -2737,6 +2737,12 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable vocabulary parallel across the attention TP group to avoid all-gather across DP groups, optimizing performance under DP attention.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--kda-dwdp-size`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>DWDP for Kimi-K3 KDA projection and shared-expert weights on PD prefill workers (--disaggregation-mode prefill) under attention DP: each group of this many attention-DP ranks holding the same attention-TP slice keeps 1/N of every KDA layer's [q,k,v,g] in-projection and o_proj (and of the shared experts when they would be replicated), and gathers a layer's full weights over NVLink just before it runs. Must divide the attention-DP size.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: int</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-two-batch-overlap`</td>
