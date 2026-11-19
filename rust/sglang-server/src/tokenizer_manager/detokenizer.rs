@@ -141,7 +141,8 @@ struct DetokState {
     /// `SamplingParams.no_stop_trim`: keep the matched stop in the output. Default
     /// (`false`) trims it off the final chunk (see [`trim_stop_str`]).
     no_stop_trim: bool,
-    /// Per-request incremental decoder; `None` in `skip_tokenizer_init` mode.
+    /// Per-request incremental decoder; `None` in `skip_tokenizer_init` mode
+    /// or when this request sets `skip_detokenize`.
     /// This is the *only* per-request accumulation the shard keeps: the decoder's
     /// internal byte/UTF-8 buffer. Decoded **text deltas** are emitted per chunk
     /// (no cumulative buffer here) — the api-server's drain loop reassembles the
@@ -197,14 +198,19 @@ impl Runnable for DetokenizerWorker {
                     decode_logprob_text,
                     no_stop_trim,
                     skip_special_tokens,
+                    skip_detokenize,
                 } => {
                     table.insert(
                         rid.clone(),
                         DetokState {
                             sink,
-                            decode_logprob_text,
+                            decode_logprob_text: decode_logprob_text && !skip_detokenize,
                             no_stop_trim,
-                            decoder: self.backend.new_decoder(skip_special_tokens),
+                            decoder: if skip_detokenize {
+                                None
+                            } else {
+                                self.backend.new_decoder(skip_special_tokens)
+                            },
                             // Registered == handed to the scheduler == Queued.
                             fsm: RequestState::Queued,
                         },
@@ -449,7 +455,90 @@ fn trim_stop_str(text: &mut String, stop: &str, no_stop_trim: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::message::response::ChunkExtras;
     use tokio::sync::mpsc;
+
+    #[test]
+    fn skip_detokenize_is_request_local_and_preserves_output_metadata() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/special_token_tokenizer.json"
+        );
+        let backend = DetokenizerBackend::Dynamo(
+            sglang_processor::dynamo_tokenizers::Tokenizer::from_file(path).unwrap(),
+        );
+        let (tx, rx) = flume::unbounded();
+        let (abort_tx, abort_rx) = flume::unbounded();
+        let cases = [
+            ("text-before", false),
+            ("ids-only", true),
+            ("text-after", false),
+        ];
+        let mut sinks = Vec::new();
+        for (rid, skip_detokenize) in cases {
+            let (sink, output) = mpsc::channel(4);
+            tx.send(DetokMsg::Register {
+                rid: Rid::from(rid),
+                sink: ResponseSink::Local(sink),
+                decode_logprob_text: true,
+                no_stop_trim: false,
+                skip_special_tokens: true,
+                skip_detokenize,
+            })
+            .unwrap();
+            sinks.push(output);
+        }
+        for (step, ids) in [vec![0], vec![1, 2]].into_iter().enumerate() {
+            let chunks = cases
+                .iter()
+                .map(|(rid, _)| ChunkEvent {
+                    rid: Rid::from(*rid),
+                    token_ids: ids.clone(),
+                    prompt_tokens: 7,
+                    cached_tokens: 3,
+                    finish_reason: (step == 1).then(|| {
+                        serde_json::from_value(serde_json::json!({"type": "length", "length": 3}))
+                            .unwrap()
+                    }),
+                    extras: Some(Box::new(ChunkExtras {
+                        out_lp_val: vec![-0.5],
+                        out_lp_idx: vec![0],
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                })
+                .collect();
+            tx.send(DetokMsg::Chunks(chunks)).unwrap();
+        }
+        drop(tx);
+        DetokenizerWorker::new(0, rx, backend, abort_tx).run();
+
+        for ((rid, skip), mut sink) in cases.into_iter().zip(sinks) {
+            for (step, (ids, text)) in [(vec![0], "a"), (vec![1, 2], "bc")].into_iter().enumerate()
+            {
+                let item = sink.try_recv().unwrap();
+                assert_eq!(matches!(item, ResponseItem::Done(_)), step == 1, "{rid}");
+                let (ResponseItem::Frame(chunk) | ResponseItem::Done(chunk)) = item else {
+                    panic!("{rid}: expected token output");
+                };
+                assert_eq!(chunk.text, if skip { "" } else { text }, "{rid}");
+                assert_eq!(chunk.completion_tokens, ids.len() as u64);
+                assert_eq!(chunk.token_ids, ids);
+                assert_eq!(chunk.prompt_tokens, 7);
+                assert_eq!(chunk.cached_tokens, 3);
+                assert_eq!(chunk.finish_reason.is_some(), step == 1);
+                let extras = chunk.extras.unwrap();
+                assert_eq!(extras.out_lp_val, [-0.5]);
+                assert_eq!(extras.out_lp_idx, [0]);
+                assert_eq!(
+                    extras.out_lp_txt,
+                    if skip { vec![] } else { vec!["a".to_owned()] }
+                );
+            }
+            assert!(sink.try_recv().is_err());
+        }
+        assert!(abort_rx.try_recv().is_err());
+    }
 
     /// A non-terminal chunk that can't be delivered (sink full → client
     /// backpressure) drops the request AND aborts scheduler work — it does not
