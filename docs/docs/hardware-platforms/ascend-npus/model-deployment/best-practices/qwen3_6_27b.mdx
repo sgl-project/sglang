@@ -794,3 +794,65 @@ python -m sglang.benchmark.serving \
     --random-range-ratio 1 \
     --seed 1
 ```
+
+## Deploying on A2 with 32 GB per device
+
+The configurations above target A3 series cards. On an A2 node whose devices expose **32 GB HBM each**
+(`npu-smi info` reports `910B4` with `HBM-Usage 32768MB`), the same scripts produce a KV pool that cannot hold
+a 128K sequence at all:
+
+| configuration | `max_total_num_tokens` | `max_req_input_len` |
+| --- | --- | --- |
+| scripts above, applied verbatim | 38016 | 38010 |
+| A2 32 GB variant (below) | 599680 | 262138 |
+
+Such a request is not rejected. The benchmark reports `Total generated tokens: 1` and `Mean TPOT: 0.00 ms`,
+which is easy to mistake for a valid measurement.
+
+The pool is not memory-bound — `available_gpu_mem` still reports 4.43 GB after allocation. Most of the budget is
+spent on decode CUDA-graph buckets and on the attention-DP split. Three changes recover ~15x the pool:
+
+- `--attn-dp-size 1` instead of `--dp-size 2 --enable-dp-attention`: a single long-context sequence does not
+  benefit from attention DP, and the whole KV budget goes to one scheduler.
+- `--cuda-graph-bs-decode 1 2 4` instead of `8 12 16 20 24 32`: the smallest bucket of the published list is 8,
+  which a single 128K sequence never reaches, while six captured buckets cost graph memory.
+- set `--max-mamba-cache-size` explicitly (see the notes below); its default is sized for high concurrency.
+
+```bash Command
+sglang serve \
+    --model-path $MODEL_PATH \
+    --attention-backend ascend --device npu \
+    --tp-size 4 \
+    --trust-remote-code --host 127.0.0.1 --port 6688 \
+    --mem-fraction-static 0.85 \
+    --max-running-requests 4 \
+    --max-mamba-cache-size 20 \
+    --chunked-prefill-size 16384 --max-prefill-tokens 16384 \
+    --dtype bfloat16 --mamba-ssm-dtype bfloat16 \
+    --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
+    --attn-dp-size 1 \
+    --cuda-graph-bs-decode 1 2 4
+```
+
+Measured on that node — 128K input / 1K output / 90% prefix-cache hit via `generated-shared-prefix`
+(`--gsp-system-prompt-len 115200 --gsp-question-len 12800 --gsp-output-len 1000`), warm prefix cache,
+median of three runs:
+
+| weights | GSM8K (200 questions) | output throughput | Mean TPOT | Mean TTFT |
+| --- | --- | --- | --- | --- |
+| BF16 | 99% | 150.15 tok/s | 18.25 ms | 4408 ms |
+| W8A8 (`--quantization modelslim`) | 96.5% | 146.84 tok/s | 19.65 ms | 4308 ms |
+
+Notes specific to this variant:
+
+- **Mamba state slots bound concurrency.** Hybrid-attention models allocate 5 mamba state slots per request, so the
+  effective limit is `max_mamba_cache_size / 5`. Setting the flag below `5 x max_running_requests` makes every
+  scheduler print `max_running_requests is capped to 0 by the mamba state cache` and the process exits; the client
+  only sees a truncated response.
+- **`--chunked-prefill-size` is bounded by activation memory.** 32768 OOMs inside the linear-attention layer
+  (`torch.cat((query, key, value))`, `NPU out of memory`) even at `--mem-fraction-static 0.85`; 16384 works.
+- **Warm the prefix cache before measuring.** On this case the first run is 71% slower than steady state
+  (85.93 vs 146.84 tok/s for the same W8A8 configuration), because the 115K shared prefix must be prefilled once.
+- **Quantization does not pay off on this workload.** BF16 is both more accurate and slightly faster. The smaller
+  weights only enlarge the KV pool, and the extra pool does not convert into throughput because concurrency is
+  capped by mamba slots and by decode HBM bandwidth.
