@@ -210,6 +210,10 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
             self.num_resident,
             getattr(layer, "layer_id", None),
         )
+        if self.tiered and self.contract.host_alloc is not None:
+            raise RuntimeError(
+                "Paged experts: the disk tier requires the CUDA host allocator"
+            )
         if self.tiered and not self.loads.waiting:
             _cannot_tier("the checkpoint is not loaded as mapped safetensors files")
 
@@ -264,7 +268,7 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
             )
         else:
             width = _router_top_k(layer)
-            self.store = fill_store(step, cache, width)
+            self.store = fill_store(step, cache, width, alloc=self.contract.host_alloc)
             step.finish(self.store)
         self.loads.drop()  # the checkpoint views the loads held
         self.loads = None

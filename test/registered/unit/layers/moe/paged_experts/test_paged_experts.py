@@ -2307,6 +2307,18 @@ class TestDiskTier(CustomTestCase):
             reader.drop_staging()
             self.assertIsNone(reader._staging)
 
+    def test_custom_host_allocator_requires_a_host_resident_store(self):
+        contract = TritonContract()
+        alloc = lambda shape, dtype: torch.empty(shape, dtype=dtype)
+        contract.host_alloc = alloc
+        method, _, _ = _paged_layer(contract)
+        self.assertIs(method.store._alloc_host, alloc)
+        with tempfile.TemporaryDirectory() as folder:
+            method, _, _ = _tiered_layer(folder, E, contract)
+            self.assertIs(method.store._alloc_host, alloc)
+            with self.assertRaisesRegex(RuntimeError, "disk tier requires"):
+                _tiered_layer(folder, 6, contract)
+
     def test_the_tier_needs_loads_that_can_wait(self):
         """Without mapped checkpoint files, or with a load that cannot wait (a stacked
         tensor), the tier cannot replay K experts at a time from the checkpoint: the start
