@@ -218,6 +218,7 @@ def _timeout_fixture(mode="buffer_only", policy="timeout"):
     cache.prefetch_stop_policy = policy
     cache.prefetch_timeout_base = 1.0
     cache.prefetch_timeout_per_page = 0.25
+    cache.pp_size = 1
     cache.pp_rank = 0
     cache._all_reduce = lambda tensor, op: None
     cache.inc_host_lock_ref = Mock()
@@ -499,6 +500,10 @@ def _two_rank_capacity_deadline(rank, rendezvous):
         torch.distributed.destroy_process_group()
 
 
+@patch(
+    "sglang.srt.mem_cache.unified_radix_cache.get_disagg",
+    new=lambda: SimpleNamespace(disaggregation_mode="null"),
+)
 class TestCapacityDeferredPrefetch(unittest.TestCase):
     def test_capacity_deadline_is_agreed_before_a_peer_polls(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -539,6 +544,10 @@ class TestCapacityDeferredPrefetch(unittest.TestCase):
         cache.cache_controller.prefetch_rate_limited = lambda: True
         cache.prefetch_from_storage(_REQ, 0, list(range(8)))
         retries = cache.storage_prefetch_retries
+        # Exercise the legacy pre-query deferral separately; waiting policies
+        # now retain a live lookup before applying allocation backpressure.
+        cache.ongoing_prefetch.clear()
+        retries.defer_capacity(_REQ, 8)
         req = SimpleNamespace(rid=_REQ.rid, storage_prefetch_retry_attempts=8)
         # Even a queue head with polling disabled and an exhausted miss budget
         # still has not attempted its capacity-deferred lookup.

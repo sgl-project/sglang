@@ -512,9 +512,9 @@ class UnifiedRadixCache(BasePrefixCache):
         # Reset Controller.
         self.session.slots.clear()
         self.ongoing_write_through: dict[int, _OngoingWriteThrough] = {}
-        self.ongoing_load_back: dict[int, _OngoingLoadBack | list[_OngoingLoadBack]] = (
-            {}
-        )
+        self.ongoing_load_back: dict[
+            int, _OngoingLoadBack | list[_OngoingLoadBack]
+        ] = {}
         self.enable_storage = False
         self.prefetch_loaded_tokens_by_reqid: dict[CacheRequestHandle, int] = {}
         self.prefetch_admission_locks: dict[
@@ -528,9 +528,9 @@ class UnifiedRadixCache(BasePrefixCache):
         # Rank-agreed L3-hit tokens not yet resolved as usable or unfulfilled.
         # Cache-mode entries survive L3->L2 until H2D succeeds or admission
         # fails; buffer-mode entries survive staging until the H2D ack.
-        self._storage_prefetch_hit_remaining_by_reqid: dict[CacheRequestHandle, int] = (
-            {}
-        )
+        self._storage_prefetch_hit_remaining_by_reqid: dict[
+            CacheRequestHandle, int
+        ] = {}
         self.storage_prefetch_retries = StoragePrefetchRetries()
         self.ongoing_backup: dict[int, tuple[NodeId, DecLockRefParams]] = {}
         # Requested KV tokens of each cache-mode storage write in
@@ -1752,9 +1752,9 @@ class UnifiedRadixCache(BasePrefixCache):
         new_last_node = result.last_device_node
         new_indices = self.path_device_indices(new_last_node)
         new_prefix_len = result.prefix_len
-        assert (
-            req.kv.cache_protected_len <= len(new_indices) + self.page_size - 1
-        ), f"{req.kv.cache_protected_len=}, {len(new_indices)=}, {page_aligned_len=}"
+        assert req.kv.cache_protected_len <= len(new_indices) + self.page_size - 1, (
+            f"{req.kv.cache_protected_len=}, {len(new_indices)=}, {page_aligned_len=}"
+        )
         assert (
             new_prefix_len <= len(new_indices) and len(new_indices) == page_aligned_len
         ), f"{new_prefix_len=}, {len(new_indices)=}, {page_aligned_len=}"
@@ -4571,9 +4571,9 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             self._all_reduce(sync_tensor, torch.distributed.ReduceOp.MIN)
             finish_count = int(sync_tensor[0].item())
-            assert (
-                sync_tensor[1].item() == -sync_tensor[2].item()
-            ), "write_back duplicate-reclaim victims diverged across TP ranks"
+            assert sync_tensor[1].item() == -sync_tensor[2].item(), (
+                "write_back duplicate-reclaim victims diverged across TP ranks"
+            )
 
         while finish_count > 0:
             ack = cc.ack_load_queue.pop(0)
