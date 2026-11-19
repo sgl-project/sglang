@@ -6,6 +6,8 @@ import helion
 import helion.language as hl
 import torch
 
+from sglang.kernels.ops.attention.helion import kda_state_rows
+
 
 @helion.kernel(
     static_shapes=False,
@@ -26,9 +28,11 @@ def _kda_verify(
     A_log: torch.Tensor,
     dt_bias: torch.Tensor,
     state_pool: torch.Tensor,
+    state_rows: torch.Tensor,
     state_indices: torch.Tensor,
     cu_seqlens: torch.Tensor,
     snapshots: torch.Tensor,
+    snapshot_rows: torch.Tensor,
     snapshot_indices: torch.Tensor,
     parents: torch.Tensor | None,
     out: torch.Tensor,
@@ -40,6 +44,11 @@ def _kda_verify(
     HV = hl.specialize(v.size(1))
     K = hl.specialize(q.size(2))
     V = hl.specialize(v.size(2))
+    slot_pitch = hl.specialize(state_pool.stride(0) // K)
+    head_pitch = hl.specialize(state_pool.stride(1) // K)
+    scratch_pitch = hl.specialize(snapshots.stride(0) // K)
+    step_pitch = hl.specialize(snapshots.stride(1) // K)
+    snapshot_head_pitch = hl.specialize(snapshots.stride(2) // K)
     block_v = hl.register_block_size(1, V)
     for tile_n, tile_h, tile_v in hl.tile([N, HV, V], block_size=[1, 1, block_v]):
         n, hv = tile_n.id, tile_h.id
@@ -50,16 +59,19 @@ def _kda_verify(
         start = cu_seqlens[n].long()
         end = cu_seqlens[n + 1].long()
         state = hl.load(
-            state_pool, [slot, hv, tile_v.index, keys], extra_mask=slot >= 0
+            state_rows,
+            [slot * slot_pitch + hv * head_pitch + tile_v.index, keys],
+            extra_mask=slot >= 0,
         ).float()
+        snapshot_base = scratch * scratch_pitch + hv * snapshot_head_pitch
         for token in range(start, end):
             step = token - start
             if parents is not None:
                 use_parent = (step > 0) & (scratch >= 0)
                 parent = parents[n, step].long()
                 parent_state = hl.load(
-                    snapshots,
-                    [scratch, parent, hv, tile_v.index, keys],
+                    snapshot_rows,
+                    [snapshot_base + parent * step_pitch + tile_v.index, keys],
                     extra_mask=use_parent,
                 ).float()
                 state = torch.where(use_parent, parent_state, state)
@@ -83,7 +95,9 @@ def _kda_verify(
             state = state + residual[:, None] * key[None, :]
             out[token, hv, tile_v] = (state * (query * K**-0.5)[None, :]).sum(-1)
             if scratch >= 0:
-                snapshots[scratch, step, hv, tile_v.index, keys] = state
+                snapshot_rows[
+                    snapshot_base + step * step_pitch + tile_v.index, keys
+                ] = state.to(snapshot_rows.dtype)
     return out
 
 
@@ -133,9 +147,11 @@ def helion_kda_verify(
         A_log.reshape(-1),
         dt_bias.reshape(value_heads, key_dim),
         ssm_states,
+        kda_state_rows(ssm_states),
         cache_indices,
         query_start_loc,
         intermediate_states_buffer,
+        kda_state_rows(intermediate_states_buffer),
         intermediate_state_indices,
         retrieve_parent_token,
         out[0],
