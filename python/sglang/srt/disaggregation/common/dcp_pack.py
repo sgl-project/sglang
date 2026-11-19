@@ -91,6 +91,76 @@ def try_pack_dcp_src(
     return packed_ptrs, np.arange(n, dtype=np.int64)
 
 
+# copy_mla_rows_into_pack puts the row-dependent block count on grid.y.
+_MAX_GATHER_GRID_Y = 65535
+_GATHER_BLOCK_BYTES = 1024
+
+
+def pack_dcp_row_segments(
+    pack_buffer: StagingBuffer,
+    segments: Sequence[Tuple[Sequence[int], npt.NDArray[np.integer], Sequence[int]]],
+) -> Optional[List[List[int]]]:
+    """Gather several row sets into the pack buffer, then wait once.
+
+    Each segment is (source buffers, row indices, row bytes): row ``i`` of
+    buffer ``j`` is the ``row_bytes[j]`` bytes at ``rows[i] * row_bytes[j]``.
+    The segments are packed one after another, each buffer by buffer (a
+    buffer's rows are contiguous, in ``rows`` order). Returns each segment's
+    packed base per buffer, or None when the rows do not fit the buffer or one
+    gather launch, so the caller falls back to smaller packs.
+    """
+    plan = []
+    offset = 0
+    for ptrs, rows, widths in segments:
+        n = int(np.asarray(rows).size)
+        widths = [int(width) for width in widths]
+        if len(ptrs) != len(widths):
+            raise ValueError(
+                f"PD DCP pack segment has {len(ptrs)} buffers but {len(widths)} widths"
+            )
+        if n == 0 or not ptrs:
+            plan.append((ptrs, rows, widths, offset, n))
+            continue
+        if -(-n * max(widths) // _GATHER_BLOCK_BYTES) > _MAX_GATHER_GRID_Y:
+            return None
+        plan.append((ptrs, rows, widths, offset, n))
+        offset += n * sum(widths)
+    if not pack_buffer.fits(offset):
+        return None
+
+    pack = pack_buffer.buffer
+    # Transfer worker threads start on device 0 (see try_pack_dcp_src).
+    torch.cuda.set_device(pack.device)
+    gather_stream = pack_buffer.get_gather_stream()
+    gather_stream.wait_stream(pack_buffer.producer_stream())
+    bases: List[List[int]] = []
+    base_ptr = pack_buffer.get_ptr()
+    with device_stream_context(gather_stream):
+        all_rows = [np.asarray(rows, dtype=np.int64) for _, rows, _, _, n in plan if n]
+        if all_rows:
+            # One host-to-device copy, ordered on the gather stream.
+            row_indices = torch.from_numpy(np.concatenate(all_rows)).to(pack.device)
+        row_offset = 0
+        for ptrs, _, widths, seg_offset, n in plan:
+            seg_bases = []
+            entry_offset = seg_offset
+            for width in widths:
+                seg_bases.append(base_ptr + entry_offset)
+                entry_offset += n * width
+            bases.append(seg_bases)
+            if n == 0 or not ptrs:
+                continue
+            copy_mla_rows_into_pack(
+                list(ptrs),
+                row_indices.narrow(0, row_offset, n),
+                pack.narrow(0, seg_offset, n * sum(widths)),
+                widths,
+            )
+            row_offset += n
+    gather_stream.synchronize()
+    return bases
+
+
 def dsa_index_k_item_lens(kv_args) -> List[int]:
     if kv_args.dsa_index_k_token_bytes is None:
         return []

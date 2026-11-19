@@ -17,6 +17,7 @@ from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager, MooncakeK
 from sglang.srt.distributed.device_communicators.kv_transfer_engine import (
     TransferIntent,
 )
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -453,8 +454,19 @@ class TestDcpDsaIndexKTransfer(unittest.TestCase):
 class TestDcpPackLifetime(CustomTestCase):
     def test_failed_transfer_drains_before_pack_buffer_reuse(self):
         """A failed layer must not release the pack buffer while another transfer reads it."""
+        for chunk_pack in (False, True):
+            with (
+                self.subTest(chunk_pack=chunk_pack),
+                envs.SGLANG_DISAGG_DCP_CHUNK_PACK.override(chunk_pack),
+            ):
+                self._check_drain(chunk_pack)
+
+    def _check_drain(self, chunk_pack):
         manager = TestMooncakeTransferBatching._make_manager(
             enable_custom_mem_pool=True
+        )
+        manager._send_kvcache_dcp_chunk_packed = lambda *args, **kwargs: (
+            MooncakeKVManager._send_kvcache_dcp_chunk_packed(manager, *args, **kwargs)
         )
         manager.kv_args = SimpleNamespace(
             page_size=1, kv_layer_ids=[], kv_data_ptrs=[1000, 2000], num_draft_entries=0
@@ -497,6 +509,10 @@ class TestDcpPackLifetime(CustomTestCase):
             patch(
                 "sglang.srt.disaggregation.common.dcp_pack.try_pack_dcp_src",
                 return_value=([1000, 2000], np.array([0], dtype=np.int64)),
+            ),
+            patch(
+                "sglang.srt.disaggregation.common.dcp_pack.pack_dcp_row_segments",
+                return_value=[[1000, 2000]],
             ),
             concurrent.futures.ThreadPoolExecutor(max_workers=2) as transfers,
             concurrent.futures.ThreadPoolExecutor(max_workers=1) as worker,

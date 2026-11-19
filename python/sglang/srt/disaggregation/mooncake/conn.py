@@ -37,12 +37,15 @@ from sglang.srt.disaggregation.common.staging_handler import (
 )
 from sglang.srt.disaggregation.common.utils import (
     AuxDataCodec,
+    DCPTokenTransferPlan,
     FastQueue,
     TransferKVChunk,
     bind_thread_to_device,
+    build_dcp_chunk_src_rows,
     build_dcp_token_transfer_plan,
     group_concurrent_contiguous,
     pack_int_lists,
+    row_transfer_blocks,
     run_on_device,
     unpack_int_lists,
 )
@@ -1693,6 +1696,177 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             page_bytes.pop(),
         )
 
+    def _send_kvcache_dcp_chunk_packed(
+        self,
+        mooncake_session_id: str,
+        prefill_kv_indices: npt.NDArray[np.int32],
+        plan: DCPTokenTransferPlan,
+        *,
+        dst_kv_indices: npt.NDArray[np.int32],
+        src_kv_ptrs: List[int],
+        dst_kv_ptrs: List[int],
+        dst_kv_item_lens: Optional[List[int]],
+        dcp_token_item_lens: List[int],
+        num_target: int,
+        dst_dcp_size: int,
+        dst_dcp_rank: int,
+        src_page_offset: int,
+        decode_prefix_len: int,
+        num_kv_tokens: int,
+        draft_rows_collapsed: bool,
+        dsa_index_k: Optional[Tuple[List[int], List[int], int]],
+        pack_buffer,
+        pack_cache: Optional[dict],
+        executor: concurrent.futures.ThreadPoolExecutor,
+    ) -> Optional[int]:
+        """Send one decode DCP rank's rows of a chunk from a shared pack.
+
+        Every entry that moves the target's owner rows (the target KV, a
+        DCP-collapsed draft, the DSA index-K keys and scales) is gathered once
+        per chunk for all decode DCP ranks, so the chunk costs one gather and
+        one wait, and each rank gets one block per destination page per entry
+        rather than one per token. Returns None, having sent nothing, when the
+        layout needs the per-rank path (head-sliced draft, pack too small).
+        """
+        from sglang.srt.disaggregation.common.dcp_pack import pack_dcp_row_segments
+
+        page_size = self.kv_args.page_size
+        # A collapsed draft takes the target's rows; a replicated draft goes to
+        # every rank from the KV pool, a page run per block, as before.
+        row_entries = list(range(num_target))
+        replicated_draft = []
+        for entry in range(num_target, len(src_kv_ptrs)):
+            src_width = dcp_token_item_lens[entry]
+            dst_width = src_width
+            if dst_kv_item_lens:
+                draft_page_scale = page_size * (
+                    1 if draft_rows_collapsed else dst_dcp_size
+                )
+                dst_width, remainder = divmod(dst_kv_item_lens[entry], draft_page_scale)
+                if remainder or dst_width <= 0:
+                    raise ValueError("Invalid PD DCP draft destination token width")
+            if src_width != dst_width:
+                return None
+            (row_entries if draft_rows_collapsed else replicated_draft).append(entry)
+
+        # DSA index-K: a page holds its tokens' keys, then their scales; each
+        # piece is addressed in units of its own width.
+        index_k_pieces = []
+        if dsa_index_k is not None:
+            index_k_src_ptrs, index_k_dst_ptrs, page_bytes = dsa_index_k
+            value_bytes, scale_bytes = self.kv_args.dsa_index_k_token_bytes
+            if page_bytes % value_bytes or (page_size * value_bytes) % scale_bytes:
+                raise ValueError(
+                    f"DSA index-K page of {page_bytes} bytes does not split into "
+                    f"{value_bytes}-byte keys and {scale_bytes}-byte scales"
+                )
+            for width, offset in (
+                (value_bytes, 0),
+                (scale_bytes, page_size * value_bytes),
+            ):
+                index_k_pieces.append((width, offset // width, page_bytes // width))
+
+        ranks = (
+            tuple(range(dst_dcp_size)) if pack_cache is not None else (dst_dcp_rank,)
+        )
+        key = (
+            dst_dcp_size,
+            ranks,
+            src_page_offset,
+            decode_prefix_len,
+            num_kv_tokens,
+            tuple((src_kv_ptrs[e], dcp_token_item_lens[e]) for e in row_entries),
+            None if dsa_index_k is None else (tuple(dsa_index_k[0]), dsa_index_k[2]),
+        )
+        chunk_pack = pack_cache.get(key) if pack_cache is not None else None
+        if chunk_pack is None:
+            rows, spans = build_dcp_chunk_src_rows(
+                prefill_kv_indices,
+                dst_kv_indices,
+                physical_page_size=page_size,
+                dcp_size=dst_dcp_size,
+                dcp_ranks=ranks,
+                src_page_offset=src_page_offset,
+                decode_prefix_len=decode_prefix_len,
+                num_kv_tokens=num_kv_tokens,
+            )
+            segments = [
+                (
+                    [src_kv_ptrs[e] for e in row_entries],
+                    rows,
+                    [dcp_token_item_lens[e] for e in row_entries],
+                )
+            ]
+            for width, unit_offset, units_per_page in index_k_pieces:
+                units = rows // page_size * units_per_page + unit_offset
+                units += rows % page_size
+                segments.append(
+                    (index_k_src_ptrs, units, [width] * len(index_k_src_ptrs))
+                )
+            if pack_cache is not None:
+                pack_cache.clear()
+            bases = pack_dcp_row_segments(pack_buffer, segments)
+            if bases is None:
+                return None
+            chunk_pack = (spans, bases)
+            if pack_cache is not None:
+                pack_cache[key] = chunk_pack
+
+        spans, bases = chunk_pack
+        start, end = spans[dst_dcp_rank]
+        dst_rows = plan.target_dst_token_indices
+        if end - start != dst_rows.size:
+            raise RuntimeError(
+                "PD DCP chunk pack disagrees with the rank plan: "
+                f"{end - start} packed rows, {dst_rows.size} destination rows"
+            )
+        packed_rows = np.arange(start, end, dtype=np.int64)
+        jobs = row_transfer_blocks(
+            packed_rows,
+            dst_rows,
+            [
+                (base, dst_kv_ptrs[e], dcp_token_item_lens[e])
+                for base, e in zip(bases[0], row_entries)
+            ],
+        )
+        for (width, unit_offset, units_per_page), piece_bases in zip(
+            index_k_pieces, bases[1:]
+        ):
+            dst_units = dst_rows // page_size * units_per_page + unit_offset
+            dst_units += dst_rows % page_size
+            jobs += row_transfer_blocks(
+                packed_rows,
+                dst_units,
+                [
+                    (base, dst, width)
+                    for base, dst in zip(piece_bases, index_k_dst_ptrs)
+                ],
+            )
+        if replicated_draft:
+            jobs += row_transfer_blocks(
+                plan.draft_src_token_indices,
+                plan.draft_dst_token_indices,
+                [
+                    (src_kv_ptrs[e], dst_kv_ptrs[e], dcp_token_item_lens[e])
+                    for e in replicated_draft
+                ],
+            )
+        jobs = [blocks for blocks in jobs if blocks]
+
+        if self.enable_custom_mem_pool:
+            futures = [
+                executor.submit(self._transfer_data, mooncake_session_id, blocks)
+                for blocks in jobs
+            ]
+            try:
+                return self._await_transfer_futures(futures)
+            finally:
+                # No write may outlive this call: the next rank reuses the pack.
+                concurrent.futures.wait(futures)
+        return self._transfer_data(
+            mooncake_session_id, [block for blocks in jobs for block in blocks]
+        )
+
     def send_kvcache_dcp(
         self,
         mooncake_session_id: str,
@@ -1714,6 +1888,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_attn_tp_size: Optional[int] = None,
         draft_rows_collapsed: bool = False,
         dsa_index_k: Optional[Tuple[List[int], List[int], int]] = None,
+        pack_cache: Optional[dict] = None,
     ) -> int:
         if num_kv_tokens is None:
             raise ValueError("PD DCP transfer requires num_kv_tokens")
@@ -1758,6 +1933,34 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         )
         if plan.empty():
             return 0
+
+        if pack_buffer is not None and envs.SGLANG_DISAGG_DCP_CHUNK_PACK.get():
+            ret = self._send_kvcache_dcp_chunk_packed(
+                mooncake_session_id,
+                prefill_kv_indices,
+                plan,
+                dst_kv_indices=dst_kv_indices,
+                src_kv_ptrs=src_kv_ptrs,
+                dst_kv_ptrs=dst_kv_ptrs,
+                dst_kv_item_lens=dst_kv_item_lens,
+                dcp_token_item_lens=dcp_token_item_lens,
+                num_target=num_target,
+                dst_dcp_size=dst_dcp_size,
+                dst_dcp_rank=dst_dcp_rank,
+                src_page_offset=src_page_offset,
+                decode_prefix_len=decode_prefix_len,
+                num_kv_tokens=num_kv_tokens,
+                draft_rows_collapsed=draft_rows_collapsed,
+                dsa_index_k=dsa_index_k,
+                pack_buffer=pack_buffer,
+                pack_cache=pack_cache,
+                executor=executor,
+            )
+            if ret is not None:
+                return ret
+            if pack_cache is not None:
+                # The per-rank packs below overwrite the shared chunk pack.
+                pack_cache.clear()
 
         target_src_kv_ptrs = src_kv_ptrs[:num_target]
         src_token_indices = plan.target_src_token_indices
@@ -2922,6 +3125,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 )
                 polls = []
                 dst_ranks_infos = []
+                # One DCP relayout pack per chunk, shared by its decode ranks.
+                dcp_pack_cache: dict = {}
                 # When staging transfer is not yet ready (watermark/allocation pending),
                 # the chunk is re-enqueued and we break out of the req loop to retry later.
                 staging_deferred = False
@@ -3048,6 +3253,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 dsa_index_k=self.dsa_index_k_dcp_entries(
                                     target_rank_registration_info
                                 ),
+                                pack_cache=dcp_pack_cache,
                             )
                         elif (
                             self.is_mla_backend
