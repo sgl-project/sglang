@@ -41,9 +41,8 @@ from sglang.srt.utils import is_hip
 _MIN_BLOCK_KV = 32
 
 # AMD/CDNA-only Triton launch hints (waves_per_eu, matrix_instr_nonkdim); NVIDIA's
-# Triton rejects these kwargs, so only pass them on ROCm. In production this kernel
-# is dispatched only on AMD (see TritonAttnBackend); keeping it NV-safe lets the
-# numerics test run on the CUDA CI lane.
+# Triton rejects these kwargs, so only pass them on ROCm. The kernel itself is
+# dispatched on CUDA and on gfx950 (see TritonAttnBackend).
 _IS_HIP = is_hip()
 _AMD_LAUNCH_KWARGS = {"waves_per_eu": 4, "matrix_instr_nonkdim": 16} if _IS_HIP else {}
 
@@ -85,18 +84,11 @@ def block_config(head_dim):
 # average prefix length = kv_indices.shape[0] / bs, which is a pure python int
 # from tensor shapes -- no device read. N_SPLITS is then a power of two so the
 # stage2 reduction tile (tl.arange(0, N_SPLITS)) stays cheap.
-#
-# Split-count bounds (internal constants). MAX=16 is the MI350X cap: 32
-# oversubscribes the device and regresses, per tuning.
-ADAPTIVE_SPLITS = True
-MAX_N_SPLITS = 16
-MIN_N_SPLITS = 4
 
 
 def choose_n_splits(avg_seqlen):
-    """Pick N_SPLITS (power of two, in [MIN_N_SPLITS, MAX_N_SPLITS]) from the
-    average prefix length. Tuned by the real-shape sweep (head_dim=256, BS*H_Q
-    =128 base programs on ~132 CUs):
+    """Pick N_SPLITS (4, 8 or 16) from the average prefix length. Tuned by the
+    real-shape sweep (head_dim=256, BS*H_Q=128 base programs on ~132 CUs):
 
         ctx  <  4k -> 4   (short: extra splits add launch/reduction overhead)
         4k <= ctx < 8k -> 8   (sweet spot: best across 1k-16k in the sweep)
@@ -105,8 +97,6 @@ def choose_n_splits(avg_seqlen):
     Never 32 (4096 grid blocks oversubscribes the device and regresses, per the
     sweep). Computed from a static shape (avg prefix = kv_indices.shape[0]/bs),
     so it is HIP-graph-capture safe (no device->host sync)."""
-    if not ADAPTIVE_SPLITS:
-        return DEFAULT_N_SPLITS
     s = int(avg_seqlen)
     if s < 4096:
         n = 4
@@ -114,10 +104,6 @@ def choose_n_splits(avg_seqlen):
         n = 8
     else:
         n = 16
-    if n < MIN_N_SPLITS:
-        n = MIN_N_SPLITS
-    if n > MAX_N_SPLITS:
-        n = MAX_N_SPLITS
     return n
 
 
