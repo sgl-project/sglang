@@ -21,6 +21,9 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_post_permute,
     register_pre_permute,
 )
+from sglang.srt.layers.moe.utils import (  # re-exported: defined there, see its docstring
+    AiterQuantType as AiterQuantType,
+)
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.utils import get_bool_env_var, is_gfx95_supported
 
@@ -45,13 +48,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _MOE_SORTING_DISPATCH_POLICY = envs.SGLANG_AITER_MOE_SORTING_DISPATCH_POLICY.get()
-
-
-class AiterQuantType(str, Enum):
-    NONE = "No"
-    PER_TOKEN = "per_Token"
-    PER_128X128 = "per_128x128"
-    PER_1X32 = "per_1x32"
 
 
 @dataclass

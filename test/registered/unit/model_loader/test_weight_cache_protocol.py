@@ -40,6 +40,7 @@ from sglang.srt.weight_cache.config import build_load_spec, path_checkpoint_id
 from sglang.srt.weight_cache.daemon import WeightCacheDaemon
 from sglang.srt.weight_cache.ipc_loader import WeightCacheModelLoader
 from sglang.srt.weight_cache.protocol import (
+    PROTOCOL_VERSION,
     UnsupportedQuantForIPCError,
     check_ipc_quant_support,
     cleanup_stale_daemon_files,
@@ -322,6 +323,10 @@ class TestLoadSpec(CustomTestCase):
             )
 
 
+# What a daemon serves for a model that holds nothing: no storage, no bytes.
+_EMPTY_SNAPSHOT = {"load_diff": b"", "storages": {}, "host": {}}
+
+
 class TestLoadSpecMismatches(CustomTestCase):
     def test_identical_specs_match(self):
         self.assertEqual(load_spec_mismatches(_make_message(), _make_message()), {})
@@ -367,6 +372,7 @@ class TestLoadSpecMismatches(CustomTestCase):
         daemon.gpu_id = 0
         daemon.config = _make_message()
         daemon.state_entries = {}
+        daemon.manifest = _EMPTY_SNAPSHOT
         daemon.preloaded_weights_bytes = 0
         daemon.transport_backend = mock.Mock(name="torch_ipc")
         for engine_config, served in (
@@ -376,7 +382,12 @@ class TestLoadSpecMismatches(CustomTestCase):
             with self.subTest(served=served):
                 a, b = socket.socketpair()
                 try:
-                    send_msg(b, {"type": "fetch_state", "config": engine_config})
+                    request = {
+                        "type": "fetch_state",
+                        "protocol_version": PROTOCOL_VERSION,
+                        "config": engine_config,
+                    }
+                    send_msg(b, request)
                     daemon._handle_connection(a)
                     send = daemon.transport_backend.send_fetch_state_response
                     self.assertEqual(send.called, served)
@@ -397,6 +408,7 @@ class TestEngineFetchesFromTheDaemon(CustomTestCase):
         daemon.gpu_id = 0
         daemon.config = daemon_config
         daemon.state_entries = {}
+        daemon.manifest = _EMPTY_SNAPSHOT
         daemon.preloaded_weights_bytes = 0
         daemon.transport_backend = TorchIpcTransportBackend()
         loader = WeightCacheModelLoader(LoadConfig(load_format=LoadFormat.IPC_CACHE))
@@ -444,9 +456,12 @@ class TestEngineFetchesFromTheDaemon(CustomTestCase):
         wrong_rank = self._daemon_config(tp_rank=1)
 
         def serve_wrong_rank(conn):
+            version = {"protocol_version": PROTOCOL_VERSION}
+            recv_msg(conn)  # the handshake
+            send_msg(conn, {"status": "ok", **version})
             recv_msg(conn)
             TorchIpcTransportBackend().send_fetch_state_response(
-                conn, config=wrong_rank, entries={}, pid=1
+                conn, config=wrong_rank, entries={}, pid=1, extra=version
             )
 
         with mock.patch.object(

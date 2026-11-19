@@ -178,8 +178,10 @@ class WeightCacheTransportBackend(ABC):
         entries: Dict[str, Dict[str, Any]],
         pid: int,
         preloaded_weights_bytes: int = 0,
+        extra: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """Send a successful fetch_state response."""
+        """Send a successful fetch_state response, with the fields of
+        ``extra`` (the protocol version, the load-diff manifest)."""
 
     @abstractmethod
     def recv_fetch_state_response(
@@ -248,6 +250,7 @@ class TorchIpcTransportBackend(WeightCacheTransportBackend):
         entries: Dict[str, Dict[str, Any]],
         pid: int,
         preloaded_weights_bytes: int = 0,
+        extra: Optional[Dict[str, Any]] = None,
     ) -> None:
         send_msg(
             conn,
@@ -258,6 +261,7 @@ class TorchIpcTransportBackend(WeightCacheTransportBackend):
                 "pid": pid,
                 "transport_backend": self.name,
                 "preloaded_weights_bytes": preloaded_weights_bytes,
+                **(extra or {}),
             },
         )
 
@@ -497,6 +501,7 @@ class VmmFdTransportBackend(WeightCacheTransportBackend):
         entries: Dict[str, Dict[str, Any]],
         pid: int,
         preloaded_weights_bytes: int = 0,
+        extra: Optional[Dict[str, Any]] = None,
     ) -> None:
         fds = self._export_fds()
         try:
@@ -510,6 +515,7 @@ class VmmFdTransportBackend(WeightCacheTransportBackend):
                     "transport_backend": self.name,
                     "preloaded_weights_bytes": preloaded_weights_bytes,
                     "allocation_sizes": list(self._alloc_sizes),
+                    **(extra or {}),
                 },
             )
             send_fds(conn, fds)
@@ -618,11 +624,17 @@ class VmmFdTransportBackend(WeightCacheTransportBackend):
     def close(self) -> None:
         """Unmap every allocation and free the address range; the daemon also
         releases its allocation handles. Tensors built on these mappings must
-        not be used afterwards."""
+        not be used afterwards. Work already queued on the device (a failed
+        load's checks) finishes first."""
         self._storages.clear()
         self._handles = []
         reservation, self._reservation = self._reservation, None
         if reservation is not None:
+            if self._device is not None and self._device.type == "cuda":
+                try:
+                    torch.cuda.synchronize(self._device)
+                except RuntimeError:
+                    logger.exception("vmm_fd: could not synchronize before unmapping")
             reservation.close()
 
 
