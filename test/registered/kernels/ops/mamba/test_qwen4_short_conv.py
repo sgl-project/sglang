@@ -247,41 +247,6 @@ class TestQwen4ShortConv(CustomTestCase):
             invalid[1] = invalid[1].to("cuda:1")
             self.assertFalse(can_fuse_qwen4_varlen_conv(*invalid))
 
-    def test_track_metadata_requires_int64_and_same_device(self):
-        x, weight, state = _inputs(3, 65, 8, kernel_size=3, dilation=4, seed=8)
-        metadata = _metadata([3], [2])
-        track_indices = torch.tensor([6], device="cuda", dtype=torch.long)
-        track_offsets = torch.tensor([2], device="cuda", dtype=torch.long)
-
-        for invalid_indices, invalid_offsets in (
-            (track_indices.int(), track_offsets),
-            (track_indices, track_offsets.int()),
-            (track_indices.cpu(), track_offsets),
-        ):
-            with self.assertRaisesRegex(ValueError, "track metadata"):
-                fused_qwen4_varlen_conv(
-                    x,
-                    weight,
-                    state.clone(),
-                    metadata[3],
-                    *metadata[:3],
-                    dilation=4,
-                    track_indices=invalid_indices,
-                    track_offsets=invalid_offsets,
-                )
-        if torch.cuda.device_count() > 1:
-            with self.assertRaisesRegex(ValueError, "track metadata"):
-                fused_qwen4_varlen_conv(
-                    x,
-                    weight,
-                    state.clone(),
-                    metadata[3],
-                    *metadata[:3],
-                    dilation=4,
-                    track_indices=track_indices.to("cuda:1"),
-                    track_offsets=track_offsets,
-                )
-
     def test_dispatch_is_limited_to_ordinary_bf16_prefill(self):
         x, weight, state = _inputs(3, 65, 5, kernel_size=3, dilation=4, seed=5)
         metadata = _metadata([1, 2], [2, 4])

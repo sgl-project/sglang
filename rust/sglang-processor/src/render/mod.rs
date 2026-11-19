@@ -21,14 +21,16 @@ mod template;
 mod thinking;
 
 use self::legacy::LegacyFormatter;
+use self::loader::DeveloperErrors;
 pub use self::loader::load_chat_formatter;
 pub use self::media::extract_images;
 pub(crate) use self::models::deepseek_v4_thinking;
 pub use self::models::{DeepSeekTokenizer, continues_final_message};
 use self::models::{
-    deep_sort, encode_tools_to_typescript, is_glm53, is_minimax_m3, is_qwen38, is_step3p5,
-    preserve_messages, prints_arguments_as_xml, render_deepseek_v4, render_glm53, render_kimi_k3,
-    render_minimax_m3, render_qwen38, render_step3p5, takes_content_parts,
+    QWEN38_DEVELOPER_ERROR, deep_sort, encode_tools_to_typescript, is_glm53, is_minimax_m3,
+    is_qwen38, is_step3p5, preserve_messages, prints_arguments_as_xml, render_deepseek_v4,
+    render_glm53, render_kimi_k3, render_minimax_m3, render_qwen38, render_step3p5,
+    takes_content_parts,
 };
 #[cfg(feature = "openai")]
 pub(crate) use self::models::{
@@ -55,6 +57,9 @@ pub enum ChatFormatter {
     HuggingFace {
         formatter: PromptFormatter,
         thinking: ThinkingTemplates,
+        /// The template's own errors for a developer turn, which Dynamo would
+        /// render as a system turn instead.
+        developer_errors: DeveloperErrors,
     },
     KimiK25 {
         formatter: PromptFormatter,
@@ -113,8 +118,23 @@ impl ChatFormatter {
         request: &dyn OAIChatLikeRequest,
     ) -> Result<RenderedPrompt, TemplateError> {
         match self {
-            ChatFormatter::HuggingFace { formatter, .. }
-            | ChatFormatter::Glm53(formatter)
+            ChatFormatter::HuggingFace {
+                formatter,
+                developer_errors,
+                ..
+            } => match developer_errors.for_request(request) {
+                Some(message) => Err(TemplateError::Renderer {
+                    message: message.to_owned(),
+                }),
+                None => render_oai(formatter, request),
+            },
+            // Requests `render_request` declines, media ones among them, land here.
+            ChatFormatter::Qwen38 { .. } if has_developer_turn(request) => {
+                Err(TemplateError::Renderer {
+                    message: QWEN38_DEVELOPER_ERROR.to_owned(),
+                })
+            }
+            ChatFormatter::Glm53(formatter)
             | ChatFormatter::MiniMaxM3 { formatter, .. }
             | ChatFormatter::Qwen38 { formatter, .. }
             | ChatFormatter::Step3p5 { formatter, .. } => render_oai(formatter, request),
@@ -360,6 +380,16 @@ impl ChatFormatter {
             ChatFormatter::MiniMaxM3 { .. } | ChatFormatter::Legacy(_) => None,
         }
     }
+}
+
+fn has_developer_turn(request: &dyn OAIChatLikeRequest) -> bool {
+    request.messages().try_iter().is_ok_and(|mut messages| {
+        messages.any(|message| {
+            message
+                .get_attr("role")
+                .is_ok_and(|role| role.as_str() == Some("developer"))
+        })
+    })
 }
 
 fn render_oai(

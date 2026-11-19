@@ -27,6 +27,7 @@ from sglang.srt.arg_groups.choices import (
     LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
     MOE_RUNNER_BACKEND_CHOICES,
     RL_ON_POLICY_TARGET_CHOICES,
+    reject_removed_choice,
 )
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -207,10 +208,6 @@ class ExecFeatures(msgspec.Struct):
         "Use the same value on disaggregated prefill and decode nodes; clients "
         "should set top_k below the limit to leave headroom for cutoff ties.",
     ] = 4096
-    disable_outlines_disk_cache: A[
-        bool,
-        "Disable disk cache of outlines to avoid possible crashes related to file system or high concurrency.",
-    ] = False
     enable_mis: A[
         bool,
         "Enable Multi-Item Scoring optimization. Combines query and multiple items into a single sequence for efficient batch processing. Requires --attention-backend flashinfer; auto-disables CUDA graph, radix cache, and chunked prefill.",
@@ -230,6 +227,7 @@ class ExecKernel(msgspec.Struct):
         Arg(
             help="Choose the kernels for attention layers.",
             choices=ATTENTION_BACKEND_CHOICES,
+            type_parser=reject_removed_choice("attention_backend"),
             resolvable=True,
         ),
     ] = None
@@ -238,6 +236,7 @@ class ExecKernel(msgspec.Struct):
         Arg(
             help="Choose the kernels for decode attention layers (have priority over --attention-backend).",
             choices=ATTENTION_BACKEND_CHOICES,
+            type_parser=reject_removed_choice("decode_attention_backend"),
             resolvable=True,
         ),
     ] = None
@@ -258,6 +257,7 @@ class ExecKernel(msgspec.Struct):
         Arg(
             help="Choose the kernels for prefill attention layers (have priority over --attention-backend).",
             choices=ATTENTION_BACKEND_CHOICES,
+            type_parser=reject_removed_choice("prefill_attention_backend"),
             resolvable=True,
         ),
     ] = None
@@ -337,6 +337,19 @@ class ExecKernel(msgspec.Struct):
                 "prims_ts",
                 "intel_xpu",
             ],
+            resolvable=True,
+        ),
+    ] = None
+    enable_flashmla_prefill_token_packing: A[
+        Optional[bool],
+        Arg(
+            help="Pack adjacent Kimi-K3.1 prefill tokens into one FlashMLA query tile. "
+            "Requires SM100/SM103, FP8 V32 KV cache and at most 32 heads per TP rank. "
+            "Supports DCP prefill after KV gathering, without separate prefill CP. "
+            "Disabled during deterministic inference. On by default for Kimi-K3.1 "
+            "(it only reorders the sparse-key sum); use "
+            "--no-enable-flashmla-prefill-token-packing to disable.",
+            action=argparse.BooleanOptionalAction,
             resolvable=True,
         ),
     ] = None
@@ -438,11 +451,6 @@ class ExecKernel(msgspec.Struct):
             nargs="+",
         ),
     ] = None
-    triton_attention_reduce_in_fp32: A[
-        bool,
-        "Cast the intermediate attention results to fp32 to avoid possible crashes related to fp16."
-        "This only affects Triton attention kernels.",
-    ] = False
     triton_attention_num_kv_splits: A[
         int,
         "The number of KV splits in flash decoding Triton kernel. Larger value is better in longer context scenarios. The default value is 8.",
@@ -458,7 +466,8 @@ class ExecKernel(msgspec.Struct):
         Optional[bool],
         Arg(
             help="Fuse q/k normalization and rope rotary embedding into one "
-            "kernel. By default this is enabled on XPU and disabled elsewhere. "
+            "kernel. By default this is enabled on XPU and for Qwen3 attention "
+            "on ROCm, and disabled elsewhere. "
             "Pass --enable-fused-qk-norm-rope or --no-enable-fused-qk-norm-rope "
             "to force it either way.",
             action=argparse.BooleanOptionalAction,
@@ -476,6 +485,12 @@ class ExecKernel(msgspec.Struct):
     enable_fp4_indexer: A[
         bool,
         "Use FP4 queries and index-K cache in the DSA lightning indexer of DeepSeek-V3.2-style sparse attention, ERNIE 5.5 Flash's MLA layers included; requires SM100. DeepSeek V4's C4 indexer has its own switch, --enable-deepseek-v4-fp4-indexer. Default keeps the FP8 indexer.",
+    ] = False
+    enable_dsa_fp4_indexer: A[
+        bool,
+        "Store the DSA indexer keys in MXFP4 and score them with AITER's FP4 MQA-logits kernels "
+        "(Kimi-K3.1 on gfx950 with DCP): the row-group kernel in decode and target verify, the "
+        "prefill kernel over the DCP-gathered keys in prefill.",
     ] = False
     enable_dsa_fused_indexer: A[
         Optional[bool],
@@ -513,9 +528,19 @@ class ExecMamba(msgspec.Struct):
         doc="Whether the hybrid-mamba radix cache keeps its extra state "
         "buffer: the radix cache is on and the strategy asks for one.",
     )
+    decode_state_free_radix = Derived(
+        fn="sglang.srt.arg_groups.model_override_base.decode_state_free_radix_of",
+        doc="Whether a PD decode server's radix cache holds FULL KV only and "
+        "each request keeps its own single Mamba state slot.",
+    )
     enable_mamba_extra_buffer_lazy = Derived(
         fn="sglang.srt.arg_groups.overrides.mamba_extra_buffer_lazy_of",
         doc="The lazy variant: the strategy is `extra_buffer_lazy` exactly.",
+    )
+    mamba_path_state_cap = Derived(
+        fn="sglang.srt.arg_groups.overrides.mamba_path_state_cap_of",
+        doc="Mamba states kept per root-to-tail path (-1 is unlimited): an "
+        "explicit --mamba-max-states-per-path, else 1 below checkpoint level 3.",
     )
     mamba_backend: A[
         str,
@@ -531,13 +556,31 @@ class ExecMamba(msgspec.Struct):
             choices=["float32", "bfloat16", "float16"],
         ),
     ] = None
+    # Deprecated spelling; `--hybrid-cache-checkpoints-level 2` replaces it.
+    # Its only command-line entry is the deprecated registration in server_args.
     mamba_max_states_per_path: A[
+        Optional[int],
+        Arg(
+            help="Maximum number of cached Mamba states retained per root-to-tail "
+            "path (-1 means unlimited). When enabled, after each insert the "
+            "shallowest eligible interior states beyond the cap are removed while "
+            "their full KV remains. Tail, fork, and locked nodes are preserved. "
+            "Must be -1 or a positive integer.",
+            no_cli=True,
+        ),
+    ] = None
+    hybrid_cache_checkpoints_level: A[
         int,
-        "Maximum number of cached Mamba states retained per root-to-tail path "
-        "(-1 means unlimited). When enabled, after each insert the shallowest eligible "
-        "interior states beyond the cap are removed while their full KV remains. "
-        "Tail, fork, and locked nodes are preserved. Must be -1 or a positive integer.",
-    ] = -1
+        Arg(
+            help="Where a hybrid model's prefix cache checkpoints recurrent "
+            "state. 2: branching points and request ends only (a PD prefill worker's "
+            "end is its complete prompt), with a soft cap of one state per path. "
+            "Host and storage tiers receive published states; models that also have "
+            "sliding-window layers still checkpoint every chunk. 3: every "
+            "prefill chunk and decode tracking boundary.",
+            choices=[2, 3],
+        ),
+    ] = 2
     enable_mamba_cache_stochastic_rounding: A[
         bool,
         "Enable stochastic rounding when writing FP16 Mamba SSM cache states. Requires --mamba-ssm-dtype float16 and CUDA. With --mamba-backend triton, requires SM100.",
@@ -560,6 +603,15 @@ class ExecMamba(msgspec.Struct):
             help="(Derived) whether the model routes through the hybrid-mamba "
             "radix cache handling; resolved from the model architecture, no "
             "CLI surface.",
+            no_cli=True,
+            resolvable=True,
+        ),
+    ] = False
+    decode_state_free_radix_default: A[
+        bool,
+        Arg(
+            help="(Resolved) the model's default for SGLANG_DECODE_STATE_FREE_RADIX; "
+            "set by model overrides, no CLI surface.",
             no_cli=True,
             resolvable=True,
         ),
@@ -600,8 +652,8 @@ class ExecMamba(msgspec.Struct):
     linear_attn_verify_backend: A[
         Optional[str],
         Arg(
-            help="Override the kernel backend for linear attention speculative target-verify. If not set, follows the decode backend (flashinfer decode -> flashinfer verify, otherwise triton). KDA supports triton, nv_cutedsl, and flashinfer verify backends.",
-            choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES + ["nv_cutedsl"],
+            help="Override the kernel backend for linear attention speculative target-verify. If not set, follows the decode backend (flashinfer decode -> flashinfer verify, otherwise triton). KDA supports triton, nv_cutedsl, and flashinfer verify backends. aiter (ROCm, GDN only) runs linear-chain verify on aiter's FlyDSL kernels.",
+            choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES + ["nv_cutedsl", "aiter"],
         ),
     ] = None
     # ReplaySSM buffered output-only linear-attn decode (GDN + KDA): per-slot
@@ -800,7 +852,6 @@ class ExecComm(msgspec.Struct):
         Optional[bool],
         "Enable INT8 quantization of TP communications (limited support).",
     ] = False
-    enable_flashinfer_allreduce_fusion: A[bool, Arg(no_cli=True)] = False
     enforce_disable_flashinfer_allreduce_fusion: A[
         bool,
         "Enforce disable FlashInfer allreduce fusion.",
@@ -880,7 +931,6 @@ class ExecMoe(msgspec.Struct):
             "mori",
             "ascend_fuseep",
             "flashinfer_nvlink_one_sided",
-            "flashinfer",  # Deprecated alias for "flashinfer_nvlink_one_sided"
             "megamoe",
             "deepep_v2",
             "ascend_ops",
@@ -889,8 +939,8 @@ class ExecMoe(msgspec.Struct):
         ],
         Arg(
             help="Choose the backend for MoE A2A. 'flashinfer_nvlink_one_sided' is "
-            "FlashInfer's NVLink one-sided all-to-all; 'flashinfer' is a deprecated "
-            "alias for it.",
+            "FlashInfer's NVLink one-sided all-to-all.",
+            type_parser=reject_removed_choice("moe_a2a_backend"),
             choices=[
                 "none",
                 "deepep",
@@ -899,7 +949,6 @@ class ExecMoe(msgspec.Struct):
                 "mori",
                 "ascend_fuseep",
                 "flashinfer_nvlink_one_sided",
-                "flashinfer",  # Deprecated alias for "flashinfer_nvlink_one_sided"
                 "megamoe",
                 "deepep_v2",
                 "pplx",
@@ -1193,9 +1242,10 @@ class ExecOffload(msgspec.Struct):
         Optional[Dict[str, Any]],
         Arg(
             help="Where the DeepSeek-V4.1 Engram tables live, as JSON: "
-            "'placement' gpu|cpu, 'replication' none|per_node, 'lookup' "
+            "'placement' gpu|cpu, 'replication' none|per_node|group_shards, 'lookup' "
             "auto|all_reduce|reduce_scatter|all_to_all|peer_read; an omitted key "
-            "takes the first value. "
+            "takes the first value. 'group_shards' also takes 'group_size' and "
+            "'group_store'. "
             "See docs/advanced_features/engram.",
             type_parser=json.loads,
         ),

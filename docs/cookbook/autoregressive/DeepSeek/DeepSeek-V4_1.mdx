@@ -1,6 +1,6 @@
 ---
 title: DeepSeek-V4.1
-description: "Deploy DeepSeek-V4.1 Flash with SGLang — launch recipes, feature compatibility, and tuning notes for GB300, H200, B200, B300 and MI355X."
+description: "Deploy DeepSeek-V4.1 Flash with SGLang — launch recipes, feature compatibility, and tuning notes for GB300, H200, B200, B300, MI355X and RTX PRO 6000."
 tag: NEW
 ---
 
@@ -24,10 +24,10 @@ DeepSeek-V4.1 Flash support has **not shipped in an SGLang release yet**, so a s
 
 For how to launch the image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker).
 
-**NVIDIA GPUs** — every NVIDIA cell on this page uses the preview build `lmsysorg/sglang:dev-dsv41` (H200 / B200 / B300 / GB300); the command panel picks it automatically.
+**NVIDIA GPUs** — the H200 / B200 / B300 / GB300 cells use `lmsysorg/sglang:latest`. The RTX PRO 6000 cell uses `lmsysorg/sglang:nightly-dev-20261119-6b374a55`, the first nightly that includes [#45261](https://github.com/sgl-project/sglang/pull/45261), which SM120 needs to start this model. The command panel picks the image automatically.
 
 ```bash Command
-docker pull lmsysorg/sglang:dev-dsv41
+docker pull lmsysorg/sglang:latest
 
 docker run --gpus all \
     --shm-size 32g \
@@ -35,14 +35,14 @@ docker run --gpus all \
     -v ~/.cache/huggingface:/root/.cache/huggingface \
     --env "HF_TOKEN=<your-hf-token>" \
     --ipc=host \
-    lmsysorg/sglang:dev-dsv41 \
+    lmsysorg/sglang:latest \
     sglang serve <use args below>
 ```
 
 **AMD GPUs (ROCm)** — AMD uses the daily-updated `lmsysorg/sglang-rocm` images. You can find the latest images on [Docker Hub](https://hub.docker.com/r/lmsysorg/sglang-rocm/tags). We recommend the ROCm 10 version.
 
 ```bash Command
-docker pull lmsysorg/sglang-rocm:v0.5.22-rocm10-mi35x-20261021
+docker pull lmsysorg/sglang-rocm:v0.5.23-rocm10-mi35x-20261111
 
 docker run \
     --device=/dev/kfd --device=/dev/dri \
@@ -52,7 +52,7 @@ docker run \
     -p 30000:30000 \
     -v ~/.cache/huggingface:/root/.cache/huggingface \
     --env "HF_TOKEN=<your-hf-token>" \
-    lmsysorg/sglang-rocm:v0.5.22-rocm10-mi35x-20261021 \
+    lmsysorg/sglang-rocm:v0.5.23-rocm10-mi35x-20261111 \
     sglang serve <use args below>
 ```
 
@@ -86,7 +86,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 Agentic workloads, such as coding agents and other multi-turn, tool-using assistants, send long prompts whose prefixes grow and repeat from turn to turn. Serving them well depends on reusing the KV cache across turns, offloading it beyond GPU memory, and keeping each session on the workers that already hold its prefix. This section gives complete launch commands for such deployments, each benchmarked in [SemiAnalysis InferenceX](https://inferencex.semianalysis.com/) and linked to the run that measured it. Pick a hardware platform, checkpoint, deployment shape, concurrency, KV cache offloading mechanism and router to get every process of the deployment as a raw command, one tab per process in launch order.
 
-- **Router.** Each configuration was submitted behind one front door: Dynamo (`dynamo.frontend` with `dynamo.sglang` workers) or SGLang (`sglang.launch_server`, behind `sglang_router` when there are several workers or DP-attention ranks).
+- **Router.** Each configuration was submitted behind one front door: Dynamo (`dynamo.frontend` with `dynamo.sglang` workers) or SGLang (`sglang.launch_server`, behind a router when there are several workers or DP-attention ranks).
 - **KV offload.** Choose among these KV cache offloading mechanisms: none (GPU KV only), HiCache (host DRAM), or a Mooncake store attached through the external linker. The Mooncake option needs an image whose SGLang build includes `--enable-unified-cache-external-linker`.
 - **Container image.** Run the commands inside the image listed for each configuration. Several are SGLang nightly images, so flag names follow that image.
 
@@ -117,9 +117,21 @@ import { agentx } from "/src/snippets/agentx/deepseek-ai/deepseek-v4_1.jsx";
 
 ### Do not override the backends
 
-`--attention-backend`, `--moe-runner-backend` and `--fp8-gemm-backend` are selected automatically from the model, hardware, forward mode and shape. On GB300 they resolve to `dsv4` / `flashinfer_mxfp4` / `flashinfer_cutedsl`. Confirm them in the startup log rather than passing them. On gfx950 the MI355X recipes pin `--fp8-gemm-backend aiter` and leave the other two to resolve.
+`--attention-backend`, `--moe-runner-backend` and `--fp8-gemm-backend` are selected automatically from the model, hardware, forward mode and shape. On GB300 they resolve to `dsv4` / `flashinfer_mxfp4` / `flashinfer_cutedsl`. Confirm them in the startup log rather than passing them. On gfx950 the MI355X recipes pin `--fp8-gemm-backend aiter` and leave the other two to resolve. The RTX PRO 6000 recipe pins `--fp8-gemm-backend flashinfer_cutlass`, which is faster there than the automatic choice; see [RTX PRO 6000 (SM120)](#rtx-pro-6000-sm120).
 
 Overriding them is the most common cause of a disappointing measurement: it leaves the 32-wide ue8m0 blocks on the Triton `_w8a8_block_fp8_matmul` fallback, which dominates the decode step and costs most of the model's bs=1 throughput. If your decode rate looks like a small fraction of what you expected, check the resolved backends first.
+
+### RTX PRO 6000 (SM120)
+
+The RTX PRO 6000 cell serves the 1017 checkpoint on eight 96 GB cards with TP8 and EP8. The cards are connected over PCIe only, without NVLink. The base Flash checkpoint has not been run on this hardware.
+
+- **Image.** Use a build that includes [#45261](https://github.com/sgl-project/sglang/pull/45261). Without it, SM120 fails at startup with a DeepGEMM `t.is_cuda()` assertion unless `--enable-deepseek-v4-fp4-indexer` is passed, and at the default 1M context decode graph capture then runs out of memory.
+- **Memory.** The engram tables live on the host, one copy per node. With `--context-length 262144` and `--mem-fraction-static 0.70`, the DSpark decode graphs capture up to batch 128.
+- **NCCL.** `NCCL_P2P_LEVEL=SYS` lets NCCL use PCIe peer-to-peer between GPUs on different CPU sockets.
+- **FP8 GEMM backend.** The cell pins `--fp8-gemm-backend flashinfer_cutlass`. With the backend left to automatic selection, output throughput at random 1K in / 1K out was 17% lower at 32 concurrent requests (2,142 against 2,592 tokens/s) and 18% lower at 128 (3,491 against 4,271), and single-request decode was 31 to 44% slower.
+- **Measured** on 8x RTX PRO 6000 Blackwell Server Edition with this cell: sgl-eval GSM8K 96.59% (1,319 questions, thinking off, temperature 0); needle retrieval 9/9 at 20K, 60K and 120K prompt tokens; 2,592 and 4,271 output tokens/s at 32 and 128 concurrent requests (random 1K in / 1K out); single-request decode of 512 tokens at 160 to 303 tokens/s for 20K to 120K prompt tokens.
+
+`--tp 8 --ep-size 8` with no other flags also starts on this image, at the default 1M context, but it decodes a single request at about 34 tokens/s, against 160 to 303 with this cell. `--tp 8` alone does not load: the MXFP4 MoE runner needs the per-partition intermediate size to be a multiple of 128, and at TP8 without EP it is 288.
 
 ## 3. Advanced Usage
 
@@ -226,20 +238,22 @@ Agentic replay is a different workload: long-context prompts, multi-turn session
 
 TP2 covers concurrency 1 to 32 and TP4 covers 1 to 16; at 32 and 64 the same two GPUs also run DP attention with TP MoE.
 
-**TP2 or TP4, concurrency 1–16:**
+**TP2, concurrency 1–32, or TP4, concurrency 1–16:**
 
-- TP2 raises `--mem-fraction-static` at concurrency 16; TP4 stops at 16 and holds 0.70, with a quarter of the checkpoint per rank leaving room to spare.
+- TP2 raises `--mem-fraction-static` from concurrency 16 and continues through 32; TP4 stops at 16 and holds 0.70, with a quarter of the checkpoint per rank leaving room to spare.
 - A longer `--prefill-decode-interval` runs more decode rounds between prefill batches, trading TTFT for P90 inter-token latency.
 - Up to concurrency 8 it pairs with `--schedule-policy lpm`, which admits the requests with the longest cached prefix first.
+- TP4 concurrency 1 and TP2 concurrency 4, 16 and 32 cap `--max-running-requests` below the session count. Sessions past the cap queue instead of joining the decode batch, which keeps each token stream at small-batch speed and lifts P90 interactivity at the cost of TTFT.
 - These points set `--enable-amd-monokernel`. Do not set `SGLANG_HIP_DSV41_INDEX_K_PAGE8`: the monokernel refuses that layout.
 
 The braced values in the command follow concurrency:
 
 | Concurrency | 1 | 2 | 4 | 8 | 16 | 32 |
 |---|---|---|---|---|---|---|
-| `--max-running-requests` | 2 | 4 | 8 | 16 | 32 | 64 |
+| `--max-running-requests`, TP2 | 2 | 4 | 1 | 16 | 4 | 8 |
+| `--max-running-requests`, TP4 | 1 | 4 | 8 | 16 | 32 | — |
 | `--swa-prefix-tails` | 128 | 128 | 256 | 512 | 1024 | 2048 |
-| `--prefill-decode-interval` | 192 | 192 | 192 | 192 | 96 | 32 |
+| `--prefill-decode-interval` | 192 | 192 | 192 | 192 | 96 | 8 |
 | `--schedule-policy` | lpm | lpm | lpm | lpm | fcfs | fcfs |
 | `--mem-fraction-static`, TP2 | 0.70 | 0.70 | 0.70 | 0.70 | 0.80 | 0.80 |
 | `--mem-fraction-static`, TP4 | 0.70 | 0.70 | 0.70 | 0.70 | 0.70 | — |
@@ -281,7 +295,7 @@ sglang serve \
   --watchdog-timeout 3600
 ```
 
-**TP2, concurrency 32:** the command above with the concurrency-32 column, without `--enable-amd-monokernel`, and with `SGLANG_HIP_DSV41_INDEX_K_PAGE8=1`.
+**TP2, concurrency 32:** the command above with the concurrency-32 column, plus `--tokenizer-backend fastokens`. Eight running requests with five drafts each give 48 rows, which fit the monokernel launch.
 
 **DP2, concurrency 32–64:** two DP attention ranks, one per GPU, with the MoE still tensor parallel across both. The braced values follow concurrency:
 
@@ -338,4 +352,19 @@ sglang serve \
   --watchdog-timeout 3600
 ```
 
-Front the server with `sglang_router --policy cache_aware --dp-aware`, so a multi-turn session lands on the DP rank already holding its prefix.
+Front the server with `sgl-router --policy cache_aware --dp-aware`, so a multi-turn session lands on the DP rank already holding its prefix. The router learns prefixes only from the server's KV events, so add `--kv-events-config '{"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:5557"}' --load-publish-endpoint auto` to the server; each DP rank publishes on its own port from 5557.
+
+**DP attention, concurrency 128–256:** the DP2 command above, run on two GPUs or, with EP4, on four. A longer `--prefill-decode-interval` with `--schedule-policy shortest-prefill-first` limits how often a prefill on one rank stalls decode on every rank. The engram tables keep one host copy per node, and with EP, `SGLANG_DP_SHARED_EXPERT_LOCAL=1` runs the shared expert on each rank's local rows before the DP gather. Start from the DP2 command and change:
+
+| Deployment | DP2, c128 | DP2 + EP2, c128 | DP4 + EP4, c128 | DP4 + EP4, c256 |
+|---|---|---|---|---|
+| `--tp`, `--attn-dp-size` | 2 | 2 | 4 | 4 |
+| `--ep-size` | 1 | 2 | 4 | 4 |
+| `SGLANG_DP_SHARED_EXPERT_LOCAL` | unset | 1 | 1 | 1 |
+| `--prefill-decode-interval` | 24 | 32 | 32 | 40 |
+| `--chunked-prefill-size` | 32768 | 32768 | 32768 | 65536 |
+| `--max-running-requests` | 128 | 128 | 128 | 256 |
+| `--cuda-graph-max-bs-decode` | 64 | 64 | 64 | 128 |
+| `--prefill-delayer-token-usage-low-watermark` | 0.7 | 0.7 | 0.7 | 0.85 |
+
+In every column, also set `--mem-fraction-static 0.85`, `--swa-prefix-tails 4096`, `--schedule-policy shortest-prefill-first` and `--engram-config '{"placement": "cpu", "replication": "per_node"}'`, and front the server with the same router.

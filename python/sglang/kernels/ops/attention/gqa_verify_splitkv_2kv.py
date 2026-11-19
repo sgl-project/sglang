@@ -1,4 +1,4 @@
-"""Target-verify attention, a KV-head pair per program: full layers, 8 verify tokens, GQA 8, 2 or 4 KV heads per rank
+"""Target-verify attention, a KV-head pair per program: full and sliding layers, 8 verify tokens, GQA 8, 2 or 4 KV heads per rank
 (16 / 32 Q heads: TP8 / TP4), HD64, FP8 KV, page 16.
 
 One program per (request, split, KV-head pair) owns both heads of its pair (2 x 64 rows = 8 tokens x 16 heads), so
@@ -45,17 +45,19 @@ def _vv2_tile(
     d,
     context,
     kvlen,
+    low,
     qrel,
     BN: tl.constexpr,
     PAGE: tl.constexpr,
     MASKED: tl.constexpr,
+    WINDOW: tl.constexpr,
     QF8: tl.constexpr,
     PVF8: tl.constexpr,
     QSPLIT: tl.constexpr,
 ):
     positions = tile * BN + nr
     if MASKED:
-        valid = positions < kvlen
+        valid = (positions >= low) & (positions < kvlen)
     # 64-bit page offsets: a layer's pool can exceed 2^31 bytes
     kb = blocks.to(tl.int64) * kv_s0 + (positions % PAGE) * kv_s1
     if MASKED:
@@ -80,6 +82,8 @@ def _vv2_tile(
         s1 = tl.dot(q1, k1.to(tl.bfloat16))
     if MASKED:
         vis = (positions[None, :] <= (context + qrel)[:, None]) & valid[None, :]
+        if WINDOW > 0:
+            vis = vis & ((context + qrel)[:, None] - positions[None, :] < WINDOW)
         s0 = tl.where(vis, s0, float("-inf"))
         s1 = tl.where(vis, s1, float("-inf"))
     n0 = tl.maximum(m0, tl.max(s0, axis=1) * c0)
@@ -96,6 +100,11 @@ def _vv2_tile(
         p1 = tl.exp2(tl.fma(s1, c1[:, None], -n1[:, None]))
     r0 = tl.exp2(m0 - n0)
     r1 = tl.exp2(m1 - n1)
+    if WINDOW > 0 and MASKED:
+        # a sliding head tile can hide every key from the later queries: keep their running max at -inf, not the
+        # 0 stand-in, so the next tile's exponents are taken against the real maximum
+        n0 = tl.where(l0 * r0 + tl.sum(p0, axis=1) > 0, n0, float("-inf"))
+        n1 = tl.where(l1 * r1 + tl.sum(p1, axis=1) > 0, n1, float("-inf"))
     l0 = l0 * r0 + tl.sum(p0, axis=1)
     l1 = l1 * r1 + tl.sum(p1, axis=1)
     if PVF8:
@@ -133,6 +142,7 @@ def _vv2_partials(
     PVBIAS_LOG2: tl.constexpr,
     QSPLIT: tl.constexpr,
     TPF: tl.constexpr,
+    WINDOW: tl.constexpr,
 ):
     slot, pair = tl.program_id(0), tl.program_id(1)
     seq = slot // SPLITS
@@ -180,8 +190,18 @@ def _vv2_partials(
         c0 = tl.full((64,), 1.0, tl.float32) * scale
         c1 = tl.full((64,), 1.0, tl.float32) * scale
     tiles = tl.cdiv(kvlen, BN)
-    tps = tl.cdiv(tiles, SPLITS)
-    begin = split * tps
+    if WINDOW > 0:
+        # sliding layers: keys from the first query's window start; tiles before head_end hold keys outside the
+        # last query's window, so they run masked like the causal tail
+        low = tl.maximum(0, context - WINDOW + 1)
+        first = low // BN
+        head_end = tl.maximum(first, tl.cdiv(context + 8 - WINDOW, BN))
+    else:
+        low = 0
+        first = 0
+        head_end = 0
+    tps = tl.cdiv(tiles - first, SPLITS)
+    begin = first + split * tps
     end = tl.minimum(tiles, begin + tps)
     interior_end = tl.minimum(end, (context + 1) // BN)
     m0 = tl.full((64,), float("-inf"), tl.float32)
@@ -193,6 +213,17 @@ def _vv2_partials(
     table_row = TABLE + seq * table_stride
     # page ids are software-pipelined one tile ahead of the KV loads (the table load latency is otherwise exposed
     # every iteration: table -> wait -> KV address)
+    if WINDOW > 0:
+        for tile in range(begin, tl.minimum(end, head_end)):
+            pos1 = tile * BN + nr
+            blocks = tl.load(
+                table_row + pos1 // PAGE, mask=(pos1 >= low) & (pos1 < kvlen), other=0
+            )
+            acc0, acc1, m0, m1, l0, l1 = _vv2_tile(
+                acc0, acc1, m0, m1, l0, l1, q0c, q1c, q0l, q1l, c0, c1, K, V, blocks, tile, kv_s0, kv_s1, nr, d,
+                context, kvlen, low, qrel, BN, PAGE, True, WINDOW, QF8, PVF8, QSPLIT,
+            )  # fmt: skip
+        begin = tl.maximum(begin, head_end)
     pos0 = begin * BN + nr
     nxt_blocks = tl.load(table_row + pos0 // PAGE, mask=pos0 < kvlen, other=0)
     for tile in range(begin, interior_end):
@@ -225,17 +256,21 @@ def _vv2_partials(
             d,
             context,
             kvlen,
+            low,
             qrel,
             BN,
             PAGE,
             False,
+            WINDOW,
             QF8,
             PVF8,
             QSPLIT,
         )
     for tile in range(tl.maximum(begin, interior_end), end):
         pos1 = tile * BN + nr
-        blocks = tl.load(table_row + pos1 // PAGE, mask=pos1 < kvlen, other=0)
+        blocks = tl.load(
+            table_row + pos1 // PAGE, mask=(pos1 >= low) & (pos1 < kvlen), other=0
+        )
         acc0, acc1, m0, m1, l0, l1 = _vv2_tile(
             acc0,
             acc1,
@@ -259,10 +294,12 @@ def _vv2_partials(
             d,
             context,
             kvlen,
+            low,
             qrel,
             BN,
             PAGE,
             True,
+            WINDOW,
             QF8,
             PVF8,
             QSPLIT,
@@ -333,9 +370,11 @@ def gqa_verify_splitkv_2kv(
     num_stages=2,
     defer_reduce=False,
     fp8=False,
+    window=0,
 ):
     """Full-attention verify, 8 tokens x 16 Q heads x 2 KV heads per (request, split, pair) program, BF16 QK / PV;
-    ``fp8`` = per-row FP8 Q on the FP8 K straight from the cache and FP8 P for P.V (TP4 n8: 150 vs 178 us)."""
+    ``fp8`` = per-row FP8 Q on the FP8 K straight from the cache and FP8 P for P.V (faster than the BF16 form).
+    ``window`` > 0: sliding layer, query i sees keys (i - window, i]."""
     num_seqs = seqused_k.numel()
     heads, kv_heads = q.shape[1], k.shape[2]
     pairs = kv_heads // 2
@@ -378,6 +417,7 @@ def gqa_verify_splitkv_2kv(
         8,
         False,
         fp8,
+        int(window),
         num_warps=num_warps,
         num_stages=num_stages,
         matrix_instr_nonkdim=16,
