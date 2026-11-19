@@ -27,8 +27,6 @@ def qsa_storage_parts(
         for layer in layer_decls
         if any(isinstance(part.lifetime, FullLifetime) for part in layer.parts)
     )
-    if not layer_ids:
-        raise ValueError("unified QSA needs a local FULL layer")
     index_shape = (profile.kv_heads, profile.head_dim)
     compressed = TensorPartDecl(
         name="qsa_compressed_k",
@@ -44,12 +42,10 @@ def qsa_storage_parts(
     )
     rope = TensorPartDecl(name="qsa_pending_rope", shape=(ratio, 3), dtype=torch.int64)
     return {
-        "derived_parts": (
-            DerivedPartDecl(sub_pool="full", part=compressed, wire="qsa_compressed"),
-        ),
+        "derived_parts": (DerivedPartDecl(sub_pool="full", part=compressed),),
         "request_parts": (
-            RequestPartDecl(part=pending, wire="qsa_pending"),
-            RequestPartDecl(part=rope, wire="qsa_pending"),
+            RequestPartDecl(part=pending),
+            RequestPartDecl(part=rope),
         ),
     }
 
@@ -59,24 +55,18 @@ class QSAUnifiedKVCache(QSAIndexAccess, RoutedKVCache):
 
     def __init__(self, *, profile: QSAProfile, request_memory, **kwargs):
         super().__init__(**kwargs)
-        self.full_attention_layer_id_mapping = next(
-            indices for name, _, indices in self._layer_maps if name == self._owner
-        )
         self.qsa_compress_ratio = profile.compress_ratio
         self.qsa_block_topk = profile.block_topk
         self.qsa_token_topk = profile.budget
         self.qsa_index_kv_heads = profile.kv_heads
         self.qsa_index_head_dim = profile.head_dim
         self.qsa_compressed_page_size = self.page_size // profile.compress_ratio
-        self.qsa_num_request_slots = request_memory.rows
         # Flatten [page, groups-per-page] or [request, members-per-group].
         # Both are views over plan-owned allocations; moving a FULL page moves
         # its derived compressed keys through KVArena.move_units.
         page_memory = self._arena.page_parts[self._owner]
         compressed = page_memory.tensors["qsa_compressed_k"].flatten(1, 2)
         self.qsa_compressed_k_buffer_pool = compressed.unbind(0)
-        self.qsa_compressed_flat = compressed.flatten(1)
-        self.qsa_compressed_capacity = compressed.shape[1]
         self.qsa_compressed_dtype = compressed.dtype
         pending = request_memory.tensors["qsa_pending_k"].flatten(1, 2)
         self.qsa_key_state_buffer_pool = pending.unbind(0)
@@ -85,8 +75,7 @@ class QSAUnifiedKVCache(QSAIndexAccess, RoutedKVCache):
         ].flatten(0, 1)
 
     def _transfer_full_attention_id(self, layer_id: int) -> int:
-        return self.full_attention_layer_id_mapping[layer_id]
+        return self.layer_router.route(layer_id).index
 
     def _wait_for_layer(self, layer_id: int) -> None:
-        if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        self.layer_router.read(layer_id)

@@ -6,7 +6,6 @@ token views and one `ChainAllocator` over all of them.
 """
 
 import logging
-from functools import partial
 from typing import Any, Optional, Sequence
 
 import msgspec
@@ -242,14 +241,7 @@ def build_kv_storage(
     kv_size = sized.full_tokens if window is None else arena.num_entries(owner.name) - 1
     owner_spec = owner.spec
     owner_is_mha = isinstance(owner_spec, MHASubPoolSpec)
-    cache_class = RoutedKVCache
-    if ctx.qsa_profile is not None:
-        from sglang.srt.mem_cache.kv.qsa import QSAUnifiedKVCache
-
-        cache_class = partial(
-            QSAUnifiedKVCache, profile=ctx.qsa_profile, request_memory=request_memory
-        )
-    token_to_kv_pool = cache_class(
+    cache_kwargs = dict(
         arena=arena,
         owner=owner.name,
         layer_maps=[
@@ -278,6 +270,14 @@ def build_kv_storage(
             if isinstance(s.lifetime, WindowLifetime)
         },
     )
+    if ctx.qsa_profile is None:
+        token_to_kv_pool = RoutedKVCache(**cache_kwargs)
+    else:
+        from sglang.srt.mem_cache.kv.qsa import QSAUnifiedKVCache
+
+        token_to_kv_pool = QSAUnifiedKVCache(
+            profile=ctx.qsa_profile, request_memory=request_memory, **cache_kwargs
+        )
     req_to_token_pool = _build_request_table(plan, ctx, sized)
     state_storage = None
     if state is not None:

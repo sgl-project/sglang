@@ -299,6 +299,100 @@ def _cpu_sparse_chunk_attention(q, k, v, indices, cu_q, cu_k, kv_lens, scale):
     return output
 
 
+@pytest.mark.parametrize(
+    ("prefix_lens", "save_kv_cache"), [((0, 0), True), ((1, 2), False)]
+)
+def test_qsa_unified_extend_uses_fresh_kv(monkeypatch, prefix_lens, save_kv_cache):
+    class CudaQuery(torch.Tensor):
+        @property
+        def is_cuda(self):
+            return True
+
+    extend_lens = [2, 1]
+    seq_lens = [prefix + extend for prefix, extend in zip(prefix_lens, extend_lens)]
+    q = torch.ones(3, 1, 4, dtype=torch.bfloat16).as_subclass(CudaQuery)
+    k = torch.arange(12, dtype=torch.bfloat16).reshape(3, 1, 4) / 7
+    v = k.clone() + 9
+    # Physical rows are out of order. New rows are deliberately left unwritten.
+    slot_table = torch.tensor([[5, 2, 6], [4, 1, 7]], dtype=torch.int32)
+    k_cache = torch.full((8, 1, 4), float("nan"), dtype=torch.float8_e4m3fn)
+    v_cache = torch.full_like(k_cache, float("nan"))
+    expected_k, expected_v = [], []
+    start = 0
+    for row, (prefix, extend) in enumerate(zip(prefix_lens, extend_lens)):
+        slots = slot_table[row, :prefix].long()
+        k_prefix = torch.full((prefix, 1, 4), row + 30, dtype=k.dtype)
+        v_prefix = k_prefix + 4
+        k_cache[slots] = k_prefix.to(k_cache.dtype)
+        v_cache[slots] = v_prefix.to(v_cache.dtype)
+        expected_k.extend(
+            (k_prefix.to(k_cache.dtype).to(k.dtype), k[start : start + extend])
+        )
+        expected_v.extend(
+            (v_prefix.to(v_cache.dtype).to(v.dtype), v[start : start + extend])
+        )
+        start += extend
+    store = Mock()
+    pool = SimpleNamespace(
+        get_key_buffer=Mock(return_value=k_cache),
+        get_value_buffer=Mock(return_value=v_cache),
+        set_kv_buffer=store,
+    )
+    backend = QwenSparseAttnBackend()
+    backend.token_to_kv_pool = routed(pool)
+    backend.runner_ids = SimpleNamespace(reads_are_translated=True)
+    backend.forward_metadata = SimpleNamespace(
+        token_slot_table=slot_table,
+        paged_cu_q=torch.tensor([0, 2, 3], dtype=torch.int32),
+        sequence_lengths=torch.tensor(seq_lens, dtype=torch.int32),
+    )
+
+    def check(q, actual_k, actual_v):
+        torch.testing.assert_close(actual_k, torch.cat(expected_k), rtol=0, atol=0)
+        torch.testing.assert_close(actual_v, torch.cat(expected_v), rtol=0, atol=0)
+        return q
+
+    direct = Mock(side_effect=lambda q, k, v, *args: check(q, k, v))
+    packed = Mock(side_effect=lambda q, k, v, *args: check(q, k, v))
+    paged = Mock(side_effect=AssertionError("new K/V must come from this forward"))
+    monkeypatch.setattr(
+        qwen_sparse_attn_backend, "sparse_gqa_fwd_interface_triton", direct
+    )
+    monkeypatch.setattr(
+        qwen_sparse_attn_backend, "sparse_gqa_fwd_interface_triton_ck", packed
+    )
+    monkeypatch.setattr(
+        qwen_sparse_attn_backend, "sparse_gqa_paged_prefill_triton", paged
+    )
+    backend.forward_extend(
+        q,
+        k,
+        v,
+        SimpleNamespace(layer_id=0, tp_q_head_num=1, head_dim=4, scaling=0.5),
+        SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            out_cache_loc=torch.cat(
+                [
+                    row[p : p + e]
+                    for row, p, e in zip(slot_table, prefix_lens, extend_lens)
+                ]
+            ),
+            out_cache_loc_is_physical=True,
+            extend_seq_lens_cpu=extend_lens,
+            seq_lens_cpu=seq_lens,
+        ),
+        save_kv_cache=save_kv_cache,
+        topk_indices=torch.zeros(3, 2, dtype=torch.int32),
+    )
+    assert store.call_count == int(save_kv_cache)
+    assert direct.call_count == int(not any(prefix_lens))
+    assert packed.call_count == int(any(prefix_lens))
+    paged.assert_not_called()
+    if not any(prefix_lens):
+        pool.get_key_buffer.assert_not_called()
+        pool.get_value_buffer.assert_not_called()
+
+
 @pytest.mark.parametrize("prefix_lens", [(4, 8), (0, 4), (0, 0)])
 @pytest.mark.parametrize("rank", [0, 1])
 @pytest.mark.parametrize("save_kv_cache", [True, False])
