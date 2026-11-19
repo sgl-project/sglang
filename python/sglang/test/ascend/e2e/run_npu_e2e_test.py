@@ -250,6 +250,15 @@ def check_pods_ready(namespace, pod_name_key_str, timeout=300):
             status = pod.status
             phase = status.phase
             logger.info(f"Pod: {pod_name}, status: {phase}")
+            if phase == "Running":
+                for container in status.container_statuses or []:
+                    logger.info(
+                        "Pod image identity: pod=%s container=%s image=%s image_id=%s",
+                        pod_name,
+                        container.name,
+                        container.image,
+                        container.image_id,
+                    )
             if phase in ("Succeeded", "Failed"):
                 raise RuntimeError(
                     f"Pod {pod_name} entered terminal state {phase!r} before "
