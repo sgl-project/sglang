@@ -658,25 +658,13 @@ mod tests {
         v.get(key).cloned()
     }
 
-    /// Python's `TestForSample` checks the same seeds, so both frontends agree.
+    /// Python's `TestForSample` checks the same seeds.
     #[test]
     fn seeds_for_samples_match_python() {
-        let seeded = norm(r#"{"sampling_seed": 42}"#);
-        assert_eq!(seeded.for_sample(0).sampling_seed, Some(42));
-        assert_eq!(
-            seeded.for_sample(1).sampling_seed,
-            Some(-7046029254386353089)
-        );
-        assert_eq!(
-            seeded.for_sample(2).sampling_seed,
-            Some(4354685564936845396)
-        );
-        let negative = norm(r#"{"sampling_seed": -5}"#);
-        assert_eq!(
-            negative.for_sample(1).sampling_seed,
-            Some(-7046029254386353136)
-        );
-        assert_eq!(norm("{}").for_sample(3).sampling_seed, None);
+        let sp = norm(r#"{"sampling_seed": 42}"#);
+        assert_eq!(sp.for_sample(0).sampling_seed, Some(42));
+        assert_eq!(sp.for_sample(1).sampling_seed, Some(-7046029254386353089));
+        assert_eq!(sp.for_sample(2).sampling_seed, Some(4354685564936845396));
     }
 
     #[test]

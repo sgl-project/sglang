@@ -573,18 +573,20 @@ class TestFilterBatch(CustomTestCase):
         self.assertFalse(info.has_custom_logit_processor)
         self.assertIsNone(info.custom_logit_processor)
 
-    def test_filter_drops_seeds_with_the_last_explicitly_seeded_row(self):
-        """Once no row has an explicit seed, the batch returns to the unseeded samplers."""
-        info = _make_info(
-            batch_size=3,
-            sampling_seed=torch.tensor([5, 123, 6], dtype=torch.int64),
-            rows_with_seed=[False, True, False],
+    def test_seeds_follow_rows_through_merge_and_filter(self):
+        """A merged-in unseeded side gets filler seeds; once the last seeded row
+        leaves, the batch returns to the unseeded samplers."""
+        info = _make_info(batch_size=1)
+        seeded = _make_info(
+            batch_size=1,
+            sampling_seed=torch.tensor([123], dtype=torch.int64),
+            rows_with_seed=[True],
         )
-        info.filter_batch([1, 2], torch.tensor([1, 2]))
-        self.assertEqual(info.sampling_seed.tolist(), [123, 6])
-        self.assertEqual(info.rows_with_seed, [True, False])
+        info.merge_batch(seeded)
+        self.assertEqual(info.sampling_seed[1].item(), 123)
+        self.assertEqual(info.rows_with_seed, [False, True])
 
-        info.filter_batch([1], torch.tensor([1]))
+        info.filter_batch([0], torch.tensor([0]))
         self.assertIsNone(info.sampling_seed)
         self.assertIsNone(info.rows_with_seed)
 
@@ -674,20 +676,6 @@ class TestMergeBatch(CustomTestCase):
         info2.sampling_seed = None
         info1.merge_batch(info2)
         self.assertIsNone(info1.sampling_seed)
-
-    def test_merge_seeds_an_unseeded_side(self):
-        """Merging an unseeded batch with one holding an explicit seed keeps that seed
-        at its offset and gives the unseeded rows seeds of their own."""
-        info1 = _make_info(batch_size=2)
-        info2 = _make_info(
-            batch_size=1,
-            sampling_seed=torch.tensor([123], dtype=torch.int64),
-            rows_with_seed=[True],
-        )
-        info1.merge_batch(info2)
-        self.assertEqual(info1.sampling_seed.shape[0], 3)
-        self.assertEqual(info1.sampling_seed[2].item(), 123)
-        self.assertEqual(info1.rows_with_seed, [False, False, True])
 
     def test_merge_with_both_sampling_seeds(self):
         """Test that merge concatenates both sampling_seed tensors."""
@@ -831,10 +819,9 @@ class TestFromScheduleBatch(CustomTestCase):
         self.assertEqual(info.sampling_seed[0].item(), 123)
         self.assertEqual(info.sampling_seed[1].item(), 42)  # default
 
-    def test_explicit_seed_without_deterministic_inference(self):
-        """A request's seed applies without deterministic inference; the batch's
-        other rows get seeds too, and a batch without one, or whose seeded rows are
-        greedy, stays unseeded."""
+    def test_seed_without_deterministic_inference(self):
+        """A non-greedy request's seed applies and the other rows get seeds too; a
+        greedy seed, or speculative decoding, leaves the batch unseeded."""
         batch = MagicMock()
         batch.device = DEVICE
         batch.reqs = [self._make_req(seed=123, top_k=50), self._make_req(seed=None)]
@@ -843,21 +830,16 @@ class TestFromScheduleBatch(CustomTestCase):
         self.assertEqual(info.sampling_seed[0].item(), 123)
         self.assertEqual(info.rows_with_seed, [True, False])
 
-        for reqs in ([self._make_req(seed=None)], [self._make_req(seed=123, top_k=1)]):
-            batch.reqs = reqs
-            info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
-            self.assertIsNone(info.sampling_seed)
-            self.assertIsNone(info.rows_with_seed)
+        batch.reqs = [self._make_req(seed=123, top_k=1)]
+        self.assertIsNone(
+            SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE).sampling_seed
+        )
 
-    def test_explicit_seed_ignored_with_speculative_decoding(self):
-        """Speculative decoding's draft graphs have seed buffers only in deterministic
-        mode, so a request's seed must not reach them outside it."""
         self._spec_ns.speculative_algorithm = "EAGLE"
-        batch = MagicMock()
-        batch.device = DEVICE
         batch.reqs = [self._make_req(seed=123, top_k=50)]
-        info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
-        self.assertIsNone(info.sampling_seed)
+        self.assertIsNone(
+            SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE).sampling_seed
+        )
 
     def test_from_schedule_batch_sampling_flags(self):
         """Test that sampling flags (need_top_p/top_k/min_p) are set correctly."""

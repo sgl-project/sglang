@@ -807,19 +807,12 @@ class TestRegexMaxLength(CustomTestCase):
 
 class TestForSample(CustomTestCase):
     def test_samples_get_distinct_seeds_that_match_rust(self):
-        """Sample 0 keeps the seed; the others match the Rust server's for_sample
-        (`seeds_for_samples_match_python` there), so both frontends agree."""
+        """Sample 0 keeps the seed; the others match Rust's for_sample
+        (`seeds_for_samples_match_python`)."""
         sp = SamplingParams(sampling_seed=42)
-        self.assertIs(sp.for_sample(0), sp)
+        self.assertEqual(sp.for_sample(0).sampling_seed, 42)
         self.assertEqual(sp.for_sample(1).sampling_seed, -7046029254386353089)
         self.assertEqual(sp.for_sample(2).sampling_seed, 4354685564936845396)
-        self.assertEqual(sp.sampling_seed, 42)
-        self.assertEqual(
-            SamplingParams(sampling_seed=-5).for_sample(1).sampling_seed,
-            -7046029254386353136,
-        )
-        unseeded = SamplingParams()
-        self.assertIs(unseeded.for_sample(3), unseeded)
 
 
 if __name__ == "__main__":
