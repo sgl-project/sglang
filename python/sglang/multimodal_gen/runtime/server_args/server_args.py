@@ -91,6 +91,9 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
 )
 from sglang.multimodal_gen.runtime.utils.precision_types import PRECISION_TO_TYPE
+from sglang.multimodal_gen.runtime.weights.hub_file_model import (
+    apply_hub_file_model_path,
+)
 from sglang.multimodal_gen.runtime.weights.source import (
     is_explicit_weight_file_reference,
 )
@@ -3807,6 +3810,9 @@ class ServerArgs(DisaggServerArgsMixin):
         explicit_arg_names = kwargs.get("_explicit_arg_names")
         if explicit_arg_names is None:
             explicit_arg_names = set(kwargs)
+        explicit_arg_names = set(explicit_arg_names)
+        kwargs = dict(kwargs)
+        apply_hub_file_model_path(kwargs, explicit_arg_names)
 
         component_paths = dict(kwargs.get("component_paths") or {})
         if component_paths:
@@ -3875,6 +3881,7 @@ class ServerArgs(DisaggServerArgsMixin):
             explicit_arg_names = set(kwargs)
         else:
             explicit_arg_names = set(explicit_arg_names)
+        apply_hub_file_model_path(kwargs, explicit_arg_names)
 
         # Convert backend string to enum if necessary
         if "backend" in kwargs and isinstance(kwargs["backend"], str):

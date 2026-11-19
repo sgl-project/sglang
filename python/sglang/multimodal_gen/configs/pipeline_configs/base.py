@@ -143,6 +143,9 @@ class PipelineConfig:
     """The base configuration class for a generation pipeline."""
 
     native_only_components: ClassVar[tuple[str, ...]] = ()
+    # --model-variant values that a single weight file's name can select, such
+    # as "ref2va" in "minimax_h3_ref2va_bf16.safetensors".
+    weight_file_model_variants: ClassVar[tuple[str, ...]] = ()
     # Default task; supported_task_types is a model capability, not a user knob.
     task_type: ModelTaskType = ModelTaskType.I2I
     supported_task_types: ClassVar[tuple[ModelTaskType, ...] | None] = None
@@ -227,6 +230,13 @@ class PipelineConfig:
 
     # DMD parameters
     dmd_denoising_steps: list[int] | None = field(default=None)
+
+    @classmethod
+    def model_variant_for_weight_file(cls, filename: str) -> str | None:
+        """The --model-variant a single weight file's name selects, if exactly one."""
+        name = filename.rsplit("/", 1)[-1].lower()
+        matches = [v for v in cls.weight_file_model_variants if v in name]
+        return matches[0] if len(matches) == 1 else None
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         # return the model-specific config for optimal deployment setting

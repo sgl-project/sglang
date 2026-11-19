@@ -44,6 +44,31 @@ def _is_diffusion_model_from_registry(model_path: str) -> bool:
     return is_registered_diffusion_model_path(model_path)
 
 
+def _is_hub_diffusion_weight_file(model_path: str) -> bool:
+    """Whether model_path names one Hub weight file made for a registered
+    diffusion model, such as a ComfyUI transformer or a LoRA."""
+    if not _diffusion_deps_available():
+        return False
+    try:
+        from sglang.multimodal_gen.runtime.weights.hub_file_model import (
+            find_registered_base_model,
+            parse_hub_file_model_path,
+        )
+    except ImportError:
+        # if diffusion dependencies are not installed
+        return False
+
+    source = parse_hub_file_model_path(model_path)
+    if source is None:
+        return False
+    try:
+        find_registered_base_model(source.repo_id, source.revision, source.filename)
+    except Exception as e:
+        logger.debug("No diffusion base model found for %s: %s", model_path, e)
+        return False
+    return True
+
+
 def is_registered_native_pipeline(pipeline_class_name: str | None) -> bool:
     """Whether ``pipeline_class_name`` names a registered native diffusion pipeline.
 
@@ -106,6 +131,9 @@ def get_is_diffusion_model(model_path: str) -> bool:
     # the diffusion registry is authoritative for native models, including
     # local directories without a top-level model_index.json
     if _is_diffusion_model_from_registry(model_path):
+        return True
+
+    if _is_hub_diffusion_weight_file(model_path):
         return True
 
     if os.path.isdir(model_path):
