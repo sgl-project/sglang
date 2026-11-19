@@ -807,6 +807,18 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         ):
             req.normalize_batch_and_arguments()
 
+    def test_return_hidden_states_none_reads_as_false(self):
+        # JSON null, as for return_logprob.
+        single = GenerateReqInput(text="Prompt", return_hidden_states=None)
+        single.normalize_batch_and_arguments()
+        self.assertIs(single.return_hidden_states, False)
+
+        batch = GenerateReqInput(
+            text=["Prompt 1", "Prompt 2"], return_hidden_states=None
+        )
+        batch.normalize_batch_and_arguments()
+        self.assertEqual(batch.return_hidden_states, [False, False])
+
     def test_return_hidden_states_single_request_unwraps_one_item_list(self):
         # The scheduler takes one mode per request, never a list.
         for mode in (False, True, "last"):

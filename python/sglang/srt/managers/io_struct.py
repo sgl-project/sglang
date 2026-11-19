@@ -313,9 +313,9 @@ class GenerateReqInput:
     stream: bool = False
     # Whether to log metrics for this request (e.g. health_generate calls do not log metrics)
     log_metrics: bool = True
-    # Whether to return hidden states
-    return_hidden_states: Union[
-        List[ReturnHiddenStatesMode], ReturnHiddenStatesMode
+    # Whether to return hidden states. None reads as False.
+    return_hidden_states: Optional[
+        Union[List[ReturnHiddenStatesMode], ReturnHiddenStatesMode]
     ] = False
     # Whether to return captured routed experts
     return_routed_experts: bool = False
@@ -651,6 +651,8 @@ class GenerateReqInput:
             self.token_ids_logprob = None
         if self.return_sampling_mask is None:
             self.return_sampling_mask = False
+        if self.return_hidden_states is None:
+            self.return_hidden_states = False
         if isinstance(self.return_hidden_states, list):
             # One mode per prompt. The scheduler takes a single mode, so a list
             # must not reach it.
@@ -957,6 +959,8 @@ class GenerateReqInput:
 
     def _normalize_return_hidden_states(self, num):
         """Normalize and validate per-request hidden-state return modes."""
+        if self.return_hidden_states is None:
+            self.return_hidden_states = False
         if isinstance(self.return_hidden_states, list):
             if len(self.return_hidden_states) != self.batch_size:
                 raise ValueError(

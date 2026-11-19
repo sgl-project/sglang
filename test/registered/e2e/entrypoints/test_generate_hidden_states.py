@@ -106,6 +106,14 @@ class LastCases:
         without = self._post(PROMPT, [False]).json()
         self.assertNotIn("hidden_states", without["meta_info"])
 
+    def test_null_reads_as_false(self):
+        for text in (PROMPT, [PROMPT, "Hello, my name is"]):
+            outputs = self._post(text, None).json()
+            for output in outputs if isinstance(outputs, list) else [outputs]:
+                self.assertNotIn("hidden_states", output["meta_info"])
+        # Not inside a list.
+        self._post(PROMPT, [None], status_code=400)
+
     def test_list_of_wrong_length_is_rejected(self):
         self._post(PROMPT, ["last", "last"], status_code=400)
         self._post(PROMPT, [], status_code=400)
@@ -128,8 +136,10 @@ class TestGenerateHiddenStatesUnset(HiddenStatesServerCase):
         for mode in ("last", True):
             error = self._post(PROMPT, mode, status_code=400).json()["error"]
             self.assertIn("not configured to return hidden states", error["message"])
-        # The server still serves after the refused requests.
-        self.assertNotIn("hidden_states", self._post(PROMPT, False).json()["meta_info"])
+        # `false` and `null` ask for nothing, so they are served.
+        for mode in (False, None):
+            meta_info = self._post(PROMPT, mode).json()["meta_info"]
+            self.assertNotIn("hidden_states", meta_info)
 
 
 class TestGenerateHiddenStatesLast(LastCases, HiddenStatesServerCase):
