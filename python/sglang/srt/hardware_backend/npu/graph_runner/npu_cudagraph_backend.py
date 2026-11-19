@@ -12,6 +12,7 @@ non-NPU hosts.
 
 from __future__ import annotations
 
+import itertools
 import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
@@ -527,9 +528,10 @@ class NPUCudaGraphBackend(BaseGraphBackend):
                     lengths = layout.verify_lens_cpu
                     if lengths is None:
                         lengths = layout.verify_lens.cpu().tolist()
-                    query_ends = np.cumsum(
-                        list(lengths) + [0] * (runner.bs - len(lengths))
-                    ).tolist()
+                    query_ends = list(itertools.accumulate(lengths))
+                    pad = runner.bs - len(query_ends)
+                    if pad > 0:
+                        query_ends.extend([query_ends[-1]] * pad)
                     return self.replay_with_input_update(
                         shape_key,
                         seq_lens=None,

@@ -934,13 +934,25 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
 
         live = ragged_layout
-        if live.bs == cap_layout.bs and (
-            live.cap is not None
-            or (
-                self.npu_ragged_verify_mode
-                and live.total_verify_tokens == live.graph_num_tokens
-            )
+        if (
+            self.npu_ragged_verify_mode
+            and live.total_verify_tokens == live.graph_num_tokens
         ):
+            # AdaFlash fills the graph tier exactly (leftover == 0). Avoid the
+            # eager PadVerifyLayout.torch allocation/cat/cumsum chain on tail
+            # batches where live.bs < cap_layout.bs.
+            live_bs = live.bs
+            cap_layout.verify_lens[:live_bs].copy_(live.verify_lens)
+            cap_layout.qo_indptr_device[: live_bs + 1].copy_(live.qo_indptr_device)
+            cap_layout.extend_start_loc[:live_bs].copy_(live.extend_start_loc)
+            if live_bs < cap_layout.bs:
+                cap_layout.verify_lens[live_bs:].zero_()
+                cap_layout.qo_indptr_device[live_bs + 1 :].fill_(
+                    live.graph_num_tokens
+                )
+                cap_layout.extend_start_loc[live_bs:].fill_(live.graph_num_tokens)
+            return
+        if live.bs == cap_layout.bs and live.cap is not None:
             cap_layout.verify_lens.copy_(live.verify_lens)
             cap_layout.qo_indptr_device.copy_(live.qo_indptr_device)
             cap_layout.extend_start_loc.copy_(live.extend_start_loc)

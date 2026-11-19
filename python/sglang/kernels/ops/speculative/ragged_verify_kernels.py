@@ -44,7 +44,7 @@ class QoIndptrResult(msgspec.Struct):
 class BuildQoIndptr:
     @classmethod
     def execute(cls, *, verify_lens: torch.Tensor) -> QoIndptrResult:
-        impl = cls.triton if verify_lens.is_cuda else cls.torch
+        impl = cls.triton if verify_lens.device.type == "cuda" else cls.torch
         return impl(verify_lens=verify_lens)
 
     @classmethod
@@ -110,7 +110,9 @@ class PaddedLayout(msgspec.Struct):
 class PadVerifyLayout:
     @classmethod
     def execute(cls, **kwargs) -> PaddedLayout:
-        impl = cls.triton if kwargs["verify_lens"].is_cuda else cls.torch
+        impl = (
+            cls.triton if kwargs["verify_lens"].device.type == "cuda" else cls.torch
+        )
         return impl(**kwargs)
 
     @classmethod

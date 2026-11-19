@@ -13,7 +13,8 @@ from sglang.srt.mem_cache.allocation_sizing import (
     add_spec_decode_headroom_pages,
     page_aligned_decode_alloc_lens,
 )
-from sglang.srt.runtime_context import get_spec
+from sglang.srt.runtime_context import get_schedule, get_spec
+from sglang.srt.speculative.ragged_verify import ragged_verify_compact_enabled
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.utils.device import is_pin_memory_available
 
@@ -147,7 +148,16 @@ class DFlashDraftInputV2(SpecInput):
             raise ValueError(
                 f"DFLASH invalid speculative_num_draft_tokens={block_size}."
             )
-        reserve = 2 * block_size
+        # Without overlap scheduling, kv_committed_len is up to date on every
+        # step, so compact verification only needs one block of headroom instead
+        # of the double-buffered 2x reserve used for overlap lag.
+        if (
+            ragged_verify_compact_enabled()
+            and get_schedule().disable_overlap_schedule
+        ):
+            reserve = block_size
+        else:
+            reserve = 2 * block_size
         page_size = batch.token_to_kv_pool_allocator.page_size
 
         cur_kv_lens, nxt_kv_lens, num_needed_tokens = page_aligned_decode_alloc_lens(

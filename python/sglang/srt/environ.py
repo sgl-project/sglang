@@ -1287,6 +1287,8 @@ class Envs:
     SGLANG_NPU_USE_SCATTER_PA_KV_CACHE = EnvBool(False)
     # Use the graph-safe Triton-Ascend kernel for masked speculative KV commits.
     SGLANG_NPU_USE_TRITON_PREFIX_KV_CACHE_STORE = EnvBool(False)
+    # Use the fused Triton-Ascend norm+RoPE+store kernel for AdaFlash dynamic draft KV writes.
+    SGLANG_NPU_ADAFLASH_FUSED_DRAFT_KV = EnvBool(True)
     # Quantize x to int8 in the dispatch operator (vendor alias consumed by the
     # Ascend DeepEP library; the MTP draft-build scopes override it to False).
     DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False)

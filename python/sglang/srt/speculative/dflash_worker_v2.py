@@ -223,6 +223,49 @@ class _DflashDraftSampler:
         self.out[:n].copy_(selected.view(-1))
 
 
+class _AdaFlashDraftSampler(_DflashDraftSampler):
+    """Capture-safe draft greedy head + AdaFlash length head in one draft graph."""
+
+    def __init__(
+        self,
+        *,
+        length_head,
+        length_scale: float,
+        weight,
+        block_size,
+        num_org,
+        org_vocab_start,
+        max_bs,
+        tp_group=None,
+    ):
+        super().__init__(
+            weight=weight,
+            block_size=block_size,
+            num_org=num_org,
+            org_vocab_start=org_vocab_start,
+            max_bs=max_bs,
+            tp_group=tp_group,
+        )
+        self.length_head = length_head
+        self.length_scale = float(length_scale)
+        self.verify_lens_out = torch.empty(
+            (int(max_bs),), dtype=torch.int32, device=weight.device
+        )
+
+    def __call__(self, hidden_states, input_ids=None):
+        super().__call__(hidden_states, input_ids=input_ids)
+        bs = hidden_states.shape[0] // self.block_size
+        ratios = self.length_head(
+            hidden_states.view(bs, self.block_size, -1)
+        ).squeeze(-1)
+        lengths = (
+            torch.floor(ratios.float() * (self.block_size * self.length_scale))
+            .clamp(1, self.block_size)
+            .to(torch.int32)
+        )
+        self.verify_lens_out[:bs].copy_(lengths)
+
+
 def _commit_accept(candidates, accept_len, bonus_tokens):
     """The committed block: drafted tokens shifted left, the bonus at the accept
     boundary. Returns it with the commit lengths."""
@@ -956,10 +999,6 @@ class DFlashWorkerV2(BaseSpecWorker):
                 logger.info("DFLASH draft greedy head kept eager (reason=%s).", reason)
             return None
 
-        if _is_npu and self._adaflash_verify is not None and not self._is_domino:
-            # Keep the draft transformer in Graph. The head runs after length
-            # prediction, on the candidate rows the target will actually verify.
-            return _eager("AdaFlash compact draft head")
         if envs.SGLANG_DFLASH_EAGER_DRAFT_SAMPLER.get():
             return _eager("SGLANG_DFLASH_EAGER_DRAFT_SAMPLER=1")
         if self.block_size <= 1:
@@ -1056,6 +1095,22 @@ class DFlashWorkerV2(BaseSpecWorker):
                 return _eager("added vocab")
             num_org = int(shard.num_org_elements)
             org_vocab_start = int(shard.org_vocab_start_index)
+        if self._adaflash_verify is not None:
+            if self._target_tp_rank == 0:
+                logger.info(
+                    "AdaFlash draft greedy head and length head folded into the draft graph (tp=%d).",
+                    tp_group.world_size,
+                )
+            return _AdaFlashDraftSampler(
+                length_head=self.draft_model.thresh_head_two_model,
+                length_scale=self._adaflash_verify.length_scale,
+                weight=lm_head.weight,
+                block_size=self.block_size,
+                num_org=num_org,
+                org_vocab_start=org_vocab_start,
+                max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
+                tp_group=tp_group if tp_group.world_size > 1 else None,
+            )
         if self._target_tp_rank == 0:
             logger.info(
                 "DFLASH draft greedy head folded into the draft cuda graph (tp=%d).",
@@ -1944,6 +1999,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         extend_lens: Optional[torch.Tensor] = None,
         swa_cache_loc: Optional[torch.Tensor] = None,
         use_npu_fused_rope: bool = True,
+        adaflash_fused_kv: bool = False,
     ) -> None:
         """Materialize target context features into the draft KV cache at explicit slots.
 
@@ -2159,6 +2215,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 ctx_cache_loc=cache_loc,
                 ctx_swa_cache_loc=swa_cache_loc,
                 use_npu_fused_rope=use_npu_fused_rope,
+                adaflash_fused_kv=adaflash_fused_kv,
             )
 
     def _append_target_hidden_sequential(
@@ -2168,7 +2225,15 @@ class DFlashWorkerV2(BaseSpecWorker):
         ctx_cache_loc: torch.Tensor,
         ctx_swa_cache_loc: Optional[torch.Tensor] = None,
         use_npu_fused_rope: bool = True,
+        adaflash_fused_kv: bool = False,
     ) -> None:
+        packed_store = None
+        if adaflash_fused_kv and _is_npu and ctx_swa_cache_loc is None:
+            from sglang.srt.hardware_backend.npu.adaflash_kv import (
+                try_store_packed_adaflash_kv,
+            )
+
+            packed_store = try_store_packed_adaflash_kv
         for layer in self.draft_model.layers:
             attn = layer.self_attn
             layer_ctx_hidden = self.draft_model.prepare_context_hidden_for_kv(
@@ -2183,20 +2248,25 @@ class DFlashWorkerV2(BaseSpecWorker):
                     swa_cache_loc=ctx_swa_cache_loc,
                 )
                 continue
-            if _is_npu and use_npu_fused_rope:
+            cache_layer = self.draft_model_runner.token_to_kv_pool.layer_router.layer(
+                attn.attn.layer_id
+            )
+            if _is_npu and use_npu_fused_rope and packed_store is None:
                 _, k, v = attn.forward_prepare_npu(ctx_positions, layer_ctx_hidden)
                 # Keep V scaling consistent with forward().
                 if attn.v_scale is not None:
                     v = v * attn.v_scale
             else:
                 k, v = attn.kv_proj_only(layer_ctx_hidden)
+                if packed_store is not None and packed_store(
+                    attn, cache_layer, k, v, ctx_positions, ctx_cache_loc
+                ):
+                    continue
                 k = attn.apply_k_norm(k)
                 k = attn.apply_k_rope(ctx_positions, k)
             k = k.view(-1, attn.num_kv_heads, attn.head_dim)
             v = v.view(-1, attn.num_kv_heads, attn.head_dim)
-            self.draft_model_runner.token_to_kv_pool.layer_router.layer(
-                attn.attn.layer_id
-            ).store(
+            cache_layer.store(
                 attn.attn,
                 KVWriteLoc(
                     ctx_cache_loc,
@@ -2931,21 +3001,40 @@ class DFlashWorkerV2(BaseSpecWorker):
         sampling_info = batch.sampling_info
         compact_greedy = False
         if self._adaflash_verify is not None:
-            draft_hidden = draft_logits_output.hidden_states
-            if draft_hidden is None:
-                raise RuntimeError("AdaFlash draft model returned no hidden states.")
-            verify_layout = self._adaflash_verify.layout(
-                draft_hidden.view(bs, block_size, -1)
-            )
             compact_greedy = self._can_skip_verify_logits(batch, sampling_info)
-            if (
-                compact_greedy
-                and not self._is_domino
-                and not (self._draft_sampler is not None and draft_out.can_run_graph)
-            ):
-                verify_rows, draft_head_rows = self._adaflash_verify.packed_indices(
-                    verify_layout, draft_hidden.device
+            draft_graphed = (
+                self._draft_sampler is not None and draft_out.can_run_graph
+            )
+            precomputed_lens = (
+                getattr(self._draft_sampler, "verify_lens_out", None)
+                if draft_graphed
+                else None
+            )
+            if precomputed_lens is not None:
+                verify_layout = self._adaflash_verify.layout(
+                    precomputed_lens=precomputed_lens[:bs],
+                    bs=bs,
+                    device=device,
                 )
+            else:
+                draft_hidden = draft_logits_output.hidden_states
+                if draft_hidden is None:
+                    raise RuntimeError("AdaFlash draft model returned no hidden states.")
+                verify_layout = self._adaflash_verify.layout(
+                    draft_hidden.view(bs, block_size, -1)
+                )
+            if compact_greedy and not self._is_domino:
+                if self._adaflash_verify.is_full_width(verify_layout):
+                    verify_rows = None
+                    draft_head_rows = None
+                elif draft_graphed:
+                    verify_rows = self._adaflash_verify.packed_target_indices(
+                        verify_layout, device
+                    )
+                else:
+                    verify_rows, draft_head_rows = self._adaflash_verify.packed_indices(
+                        verify_layout, device
+                    )
 
         if (
             self._is_domino
@@ -3280,7 +3369,37 @@ class DFlashWorkerV2(BaseSpecWorker):
             if ring_block_locs is not None
             else self._draft_write_ids(iteration_ids, IdSpaceKind.SLIDING_WINDOW)
         )
-        if verify_rows is not None:
+        if self._adaflash_verify is not None and self._adaflash_verify.can_use_fused_draft_kv(
+            self.draft_model,
+            self.draft_model_runner.token_to_kv_pool,
+            swa_cache_loc,
+        ):
+            # Masked fused norm+RoPE+store: avoids torch.nonzero D2H sync and
+            # avoids copying 5-layer target hidden states before projection.
+            if verify_rows is not None:
+                request_indices = verify_rows // block_size
+                in_prefix = verify_rows % block_size < commit_lens[request_indices]
+                masked_slots = cache_loc.index_select(0, verify_rows).masked_fill(
+                    ~in_prefix, -1
+                )
+                packed_positions = self._adaflash_verify.last_packed_positions
+                if packed_positions is None:
+                    packed_positions = positions.index_select(0, verify_rows)
+            else:
+                in_prefix = (
+                    self._block_pos_offsets[None, :] < commit_lens[:, None]
+                ).reshape(-1)
+                masked_slots = cache_loc.masked_fill(~in_prefix, -1)
+                packed_positions = positions
+            self._append_target_hidden_to_draft_kv_by_loc(
+                target_hidden=hidden,
+                cache_loc=masked_slots,
+                swa_cache_loc=None,
+                positions=packed_positions,
+                use_npu_fused_rope=False,
+                adaflash_fused_kv=True,
+            )
+        elif verify_rows is not None:
             # Select the committed prefix once before projecting K/V. The dense
             # prefix writer otherwise performs a separate nonzero for each layer.
             request_indices = verify_rows // block_size

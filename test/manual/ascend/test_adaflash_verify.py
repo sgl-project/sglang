@@ -133,6 +133,81 @@ class TestAdaFlashVerify(unittest.TestCase):
         self.assertEqual(correct.cpu().tolist(), [6])
         self.assertEqual(bonus.cpu().tolist(), [2])
 
+    def test_small_batch_falls_back_to_cached_full_width_layout(self):
+        adapter = verifier()
+        adapter.min_dynamic_bs = 12
+        adapter._full_width_layouts = {}
+        adapter.model_runner = SimpleNamespace(
+            decode_cuda_graph_runner=SimpleNamespace(
+                ragged_verify_mode=True,
+                capture_num_tokens=[*range(1, 16), *range(16, 16 * 16 + 1, 16)],
+            )
+        )
+        layout1 = adapter.layout(bs=8, device=torch.device("npu"))
+        layout2 = adapter.layout(bs=8, device=torch.device("npu"))
+        self.assertIs(layout1, layout2)
+        self.assertTrue(adapter.is_full_width(layout1))
+        self.assertEqual(layout1.verify_lens_cpu, [16] * 8)
+        self.assertEqual(layout1.total_verify_tokens, 128)
+        self.assertEqual(layout1.graph_num_tokens, 128)
+
+    def test_precomputed_lens_and_packed_target_indices_match_reference(self):
+        adapter = verifier()
+        adapter.min_dynamic_bs = 0
+        adapter._full_width_layouts = {}
+        adapter._buf_cap_bs = 0
+        adapter._buf_slot = 0
+        adapter._meta_cpu_bufs = None
+        adapter._meta_dev_bufs = None
+        adapter._rows_cpu_bufs = None
+        adapter._rows_dev_bufs = None
+        adapter._grid_np = None
+        adapter._col_np = None
+        adapter._row_ids_buf = None
+        adapter._dense_predict_buf = None
+        adapter.model_runner = SimpleNamespace(
+            decode_cuda_graph_runner=SimpleNamespace(
+                ragged_verify_mode=True,
+                capture_num_tokens=[*range(1, 16), 16, 32, 48],
+            )
+        )
+        precomputed = torch.tensor([1, 7, 16], dtype=torch.int32, device="npu")
+        layout = adapter.layout(precomputed_lens=precomputed)
+        self.assertEqual(layout.verify_lens_cpu, [1, 15, 16])
+        self.assertEqual(layout.qo_indptr_device.cpu().tolist(), [0, 1, 16, 32])
+        target_rows = adapter.packed_target_indices(layout, torch.device("npu"))
+        self.assertEqual(
+            target_rows.cpu().tolist(), [0, *range(16, 31), *range(32, 48)]
+        )
+
+    def test_fast_accept_with_target_predict_caps_and_full_width_skips_cap(self):
+        adapter = verifier()
+        adapter.min_dynamic_bs = 0
+        hidden = torch.tensor([0.0, 0.4375, 1.0], device="npu").reshape(3, 1, 1)
+        layout = adapter.layout(hidden)
+        candidates = torch.zeros((3, 16), dtype=torch.int64, device="npu")
+        # Stale zeros in unverified tail slots must still be capped at verify_lens - 1.
+        target_predict = torch.zeros((3, 16), dtype=torch.int64, device="npu")
+        target_predict[1, 7] = 99
+        correct, bonus = adapter.accept(
+            candidates=candidates,
+            logits=None,
+            layout=layout,
+            target_predict=target_predict.reshape(-1),
+        )
+        self.assertEqual(correct.cpu().tolist(), [0, 7, 15])
+        self.assertEqual(bonus.cpu().tolist(), [0, 99, 0])
+
+        full_layout = adapter.full_width_layout(3, torch.device("npu"))
+        correct_full, bonus_full = adapter.accept(
+            candidates=candidates,
+            logits=None,
+            layout=full_layout,
+            target_predict=target_predict.reshape(-1),
+        )
+        self.assertEqual(correct_full.cpu().tolist(), [15, 7, 15])
+        self.assertEqual(bonus_full.cpu().tolist(), [0, 99, 0])
+
 
 if __name__ == "__main__":
     unittest.main()

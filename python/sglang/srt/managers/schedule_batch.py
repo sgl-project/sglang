@@ -2925,6 +2925,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def _new_tokens_required_next_decode_spec_v2(self, requests, page_size):
         """Tight estimate matching eagle_utils.eagle_prepare_for_decode allocation."""
         reserve = get_alloc_reserve_per_decode()
+        if (
+            self.spec_algorithm.is_dflash()
+            and get_schedule().disable_overlap_schedule
+        ):
+            from sglang.srt.speculative.ragged_verify import (
+                ragged_verify_compact_enabled,
+            )
+
+            if ragged_verify_compact_enabled():
+                reserve = int(get_spec().speculative_num_draft_tokens)
         total = 0
         for r in requests:
             x = max(0, r.kv.kv_committed_len + reserve - r.kv.kv_allocated_len)

@@ -489,6 +489,8 @@ class TargetVerifyExecutor:
         inject_gate: bool = False,
         ragged_window: Optional[RaggedVerifyWindow] = None,
         greedy_argmax_only: bool = False,
+        precomputed_argmax_buf: Optional[torch.Tensor] = None,
+        dense_predict_buf: Optional[torch.Tensor] = None,
     ) -> tuple[TargetVerifyResult, torch.Tensor]:
         if greedy_argmax_only and (
             sampling_info is not None
@@ -526,16 +528,33 @@ class TargetVerifyExecutor:
             # Accept operates on token IDs. Reuse the packed window's map and
             # avoid allocating/filling the rectangular vocabulary tensor.
             rows = ragged_window.window_index
-            packed_logits = logits_output.next_token_logits[: layout.graph_num_tokens]
-            # The Ascend Triton operator compiles a new kernel for every row
-            # count. Small batches drain through many shapes in one request wave.
-            if packed_logits.device.type == "npu":
-                ids = packed_logits.argmax(dim=-1)
+            if (
+                precomputed_argmax_buf is not None
+                and target_verify.can_run_cuda_graph
+            ):
+                ids = precomputed_argmax_buf[: layout.graph_num_tokens]
             else:
-                ids = sampling_argmax(packed_logits)
+                packed_logits = logits_output.next_token_logits[
+                    : layout.graph_num_tokens
+                ]
+                # The Ascend Triton operator compiles a new kernel for every row
+                # count. Small batches drain through many shapes in one request wave.
+                if packed_logits.device.type == "npu":
+                    ids = packed_logits.argmax(dim=-1)
+                else:
+                    ids = sampling_argmax(packed_logits)
             dense_rows = bs * stride
-            target_predict = ids.new_zeros(dense_rows)
-            target_predict.index_copy_(0, rows, ids)
+            if rows is None:
+                # Full-width identity order: no scatter needed.
+                target_predict = ids
+            elif dense_predict_buf is not None and dense_predict_buf.numel() >= dense_rows:
+                # Every verified lane [0, verify_lens[r]) is overwritten below;
+                # Accept clamps to verify_lens[r] - 1 so stale tail lanes are ignored.
+                target_predict = dense_predict_buf[:dense_rows]
+                target_predict.index_copy_(0, rows, ids)
+            else:
+                target_predict = ids.new_zeros(dense_rows)
+                target_predict.index_copy_(0, rows, ids)
             hidden = logits_output.hidden_states
             if hidden is None:
                 raise RuntimeError("Compact verify requires target hidden states.")
