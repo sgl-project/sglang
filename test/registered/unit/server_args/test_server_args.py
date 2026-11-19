@@ -1113,6 +1113,25 @@ class TestTokenSpaceProcessorArgs(CustomTestCase):
                     pd_disaggregation_hook.handle_encoder_disaggregation(server_args)
 
 
+class TestLanguageModelOnlyArchitectures(CustomTestCase):
+    @staticmethod
+    def _handle(architecture):
+        from sglang.srt.arg_groups.model_hook import handle_language_model_only
+
+        server_args = ServerArgs(model_path="dummy", language_model_only=True)
+        server_args._model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=[architecture])
+        )
+        handle_language_model_only(server_args)
+
+    def test_accepts_qwen4_exp(self):
+        self._handle("Qwen4ExpForConditionalGeneration")
+
+    def test_rejects_an_unlisted_architecture(self):
+        with self.assertRaisesRegex(ValueError, "does not support"):
+            self._handle("LlamaForCausalLM")
+
+
 class TestMultimodalFeatureTransport(CustomTestCase):
     @staticmethod
     def _set_model_type(server_args, *, is_multimodal):
