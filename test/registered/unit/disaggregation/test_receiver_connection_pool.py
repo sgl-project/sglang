@@ -513,6 +513,24 @@ class TestCommonReceiverLifecycle(CustomTestCase):
         self.assertEqual(receiver.chunk_staging_infos, [])
 
 
+class TestChunkReadySend(CustomTestCase):
+    def test_a_failed_send_does_not_escape_the_worker(self):
+        manager = CommonKVManager.__new__(CommonKVManager)
+        manager._prefill_unique_rank = Mock(return_value=0)
+        manager._send_multipart_locked = Mock(side_effect=RuntimeError("send timeout"))
+
+        manager.send_chunk_ready(
+            room=1,
+            chunk_idx=0,
+            page_start=0,
+            num_pages=4,
+            writer_id="w",
+            targets=[("10.0.0.2", 6000)],
+        )
+
+        manager._send_multipart_locked.assert_called_once()
+
+
 class TestBootstrapServerClose(CustomTestCase):
     def test_close_before_server_thread_runs(self):
         with patch.object(threading.Thread, "start"):

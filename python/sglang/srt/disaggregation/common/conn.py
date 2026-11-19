@@ -998,7 +998,13 @@ class CommonKVManager(BaseKVManager):
         ]
         for endpoint, port in targets:
             na = NetworkAddress(endpoint, port)
-            self._send_multipart_locked(na.to_tcp(), parts, is_ipv6=na.is_ipv6)
+            try:
+                self._send_multipart_locked(na.to_tcp(), parts, is_ipv6=na.is_ipv6)
+            except Exception as e:
+                logger.warning(
+                    f"Failed to send CHUNK_READY for room {room} chunk {chunk_idx} "
+                    f"to {na.to_host_port_str()}: {e}"
+                )
 
     def handle_chunk_ready(self, msg: List[bytes]) -> bool:
         if not msg or msg[0] != b"CHUNK_READY":
