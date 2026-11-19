@@ -1,4 +1,9 @@
+import json
+import time
 import unittest
+import uuid
+
+import requests
 
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.customized_info_sampler import (
@@ -73,20 +78,124 @@ class TestUnifiedMemoryDisaggregation(PDLogprobParityMixin, PDDisaggregationServ
 
 
 class TestUnifiedMemoryDisaggregationChunkedPrefill(TestUnifiedMemoryDisaggregation):
-    """Multi-chunk prefill (257-token prompt, 64-token chunks): each chunk's KV
+    """Multi-chunk prefill (1025-token prompt, 64-token chunks): each chunk's KV
     pages are translated to physical ids and shipped while later chunks still
     run, exercising the chunked send path and the prefill-side move gate
     (`chunked_req.start_send_idx > 0`). The reference server uses the same
-    chunk size so any parity break isolates to the PD transfer.
+    chunk size so any parity break isolates to the PD transfer. A streaming
+    cancellation after handoff must also return decode capacity for reuse.
     """
 
+    parity_prompts = [[1] + [100 + i % 1000 for i in range(1024)]]
+    extra_prefill_env = {
+        **SERVER_ENV,
+        "SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY": "1",
+    }
+    extra_decode_env = extra_prefill_env
     _chunked_args = UNIFIED_MEMORY_ARGS + ["--chunked-prefill-size", "64"]
     baseline_args = _chunked_args
     extra_prefill_args = TestUnifiedMemoryDisaggregation.extra_prefill_args + [
         "--chunked-prefill-size",
         "64",
+        "--enable-metrics",
     ]
     extra_decode_args = extra_prefill_args
+
+    def _wait_for_decode_load(self, predicate, message):
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            response = requests.get(
+                self.decode_url + "/v1/loads?include=core,disagg", timeout=10
+            )
+            response.raise_for_status()
+            (load,) = response.json()["loads"]
+            if predicate(load):
+                return load
+            time.sleep(0.05)
+        self.fail(f"{message}: {load}")
+
+    def _wait_for_decode_idle(self, after):
+        return self._wait_for_decode_load(
+            lambda load: (
+                load["timestamp"] > after
+                and load["num_running_reqs"] == 0
+                and load["num_waiting_reqs"] == 0
+                and load["num_used_tokens"] == 0
+            ),
+            "Decode did not return its active KV capacity",
+        )
+
+    def _cancel_after_handoff(self, prompt):
+        rid = "unified-pd-abort-" + uuid.uuid4().hex
+        with requests.post(
+            self.lb_url + "/generate",
+            json={
+                "rid": rid,
+                "input_ids": prompt,
+                "stream": True,
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": 2048,
+                    "ignore_eos": True,
+                },
+            },
+            stream=True,
+            timeout=60,
+        ) as response:
+            response.raise_for_status()
+            events = (
+                json.loads(line[6:])
+                for line in response.iter_lines()
+                if line.startswith(b"data: ") and line != b"data: [DONE]"
+            )
+            for event in events:
+                if event["meta_info"]["completion_tokens"] > 0:
+                    break
+            else:
+                self.fail("No token arrived before cancellation")
+
+            # A generated token plus an active decode allocation establishes
+            # that the normal PD handoff has completed, without a sleep race.
+            active = self._wait_for_decode_load(
+                lambda load: (
+                    load["num_running_reqs"] == 1
+                    and load["num_used_tokens"] >= len(prompt)
+                ),
+                "Did not observe the streamed request in decode",
+            )
+            requests.post(
+                self.decode_url + "/abort_request",
+                json={"rid": rid, "abort_all": False},
+                timeout=10,
+            ).raise_for_status()
+            for event in events:
+                reason = event["meta_info"]["finish_reason"]
+                if reason is not None:
+                    self.assertEqual(reason["type"], "abort", event)
+                    break
+            else:
+                self.fail("No terminal abort was emitted")
+        return active
+
+    def _check_prompt_parity(self, *, prompt, reference):
+        super()._check_prompt_parity(prompt=prompt, reference=reference)
+        self._flush_cache(self.prefill_url)
+        self._flush_cache(self.decode_url)
+        active = self._cancel_after_handoff(prompt)
+        idle = self._wait_for_decode_idle(active["timestamp"])
+
+        # The decode prefix cache is disabled by default. Without resetting
+        # either worker, cycle more prompt tokens than fit in its 4096-token
+        # budget and compare every new result with the non-PD reference.
+        capacity = active["max_total_num_tokens"]
+        self.assertGreater(capacity, 0)
+        self.assertLessEqual(capacity, 4096)
+        for i in range(capacity // len(prompt) + 1):
+            actual = self._generate(base_url=self.lb_url, input_ids=prompt)
+            self._assert_logprob_parity(
+                reference=reference, actual=actual, label=f"after_cancel_{i}"
+            )
+        self._wait_for_decode_idle(idle["timestamp"])
 
 
 class TestUnifiedMemoryDisaggregationMHA(TestUnifiedMemoryDisaggregation):
