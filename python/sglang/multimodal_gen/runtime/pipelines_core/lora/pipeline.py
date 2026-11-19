@@ -37,8 +37,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import 
     ComposedPipelineBase,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.lora.format_adapter import (
-    FORMATS_WITH_FOLDED_ALPHA,
-    normalize_lora_state_dict_with_format,
+    normalize_lora_state_dict,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.lora.lora_merge_cache import (
     LoraMergeCache,
@@ -1052,15 +1051,15 @@ class LoRAPipeline(ComposedPipelineBase):
         adapter_fingerprint = (stat.st_size, stat.st_mtime_ns)
         raw_state_dict = load_file(lora_local_path)
         adapter_config = load_peft_config(lora_local_path)
-        lora_state_dict, lora_format = normalize_lora_state_dict_with_format(
+        lora_state_dict = normalize_lora_state_dict(
             raw_state_dict,
             logger=logger,
             adapter_config=adapter_config,
             dit_class_name=type(self.modules["transformer"]).__name__,
+            lora_alpha=lora_alpha,
         )
         adapter_lora_alpha = lora_alpha
-        # The file's metadata alpha is already folded into A/B for these formats.
-        if adapter_lora_alpha is None and lora_format not in FORMATS_WITH_FOLDED_ALPHA:
+        if adapter_lora_alpha is None:
             adapter_lora_alpha = get_peft_lora_alpha(adapter_config)
 
         # Swapped in at the end so a failed load keeps the previous adapter.

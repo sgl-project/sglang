@@ -10,6 +10,7 @@ from diffusers.loaders import lora_conversion_utils as lcu
 
 from sglang.multimodal_gen.runtime.pipelines_core.lora.peft_adapter import (
     apply_peft_config,
+    get_peft_lora_alpha,
     normalize_peft_keys,
 )
 
@@ -29,13 +30,6 @@ class LoRAFormat(str, Enum):
     KOHYA_Z_IMAGE = "kohya-z-image"
     WAN = "wan"
     AI_TOOLKIT_FLUX = "ai-toolkit-flux"
-
-
-# Formats whose conversion already folds alpha / rank into A/B, so the loader
-# must not scale by a global alpha from the file's metadata again.
-FORMATS_WITH_FOLDED_ALPHA = frozenset(
-    {LoRAFormat.KOHYA_QWEN_IMAGE, LoRAFormat.KOHYA_Z_IMAGE}
-)
 
 
 def _sample_keys(keys: Iterable[str], k: int = 20) -> list[str]:
@@ -267,7 +261,9 @@ def detect_lora_format_from_state_dict(
         return LoRAFormat.KOHYA_MINIMAX_H3
     if _looks_like_kohya_flux(state_dict):
         return LoRAFormat.KOHYA_FLUX
-    if _looks_like_kohya_qwen_image(state_dict):
+    if _looks_like_kohya_qwen_image(state_dict) and (
+        dit_class_name is None or _is_qwen_image_dit(dit_class_name)
+    ):
         return LoRAFormat.KOHYA_QWEN_IMAGE
     # An attention-only Qwen-Image LoRA has no img/txt mlp or mod names, and its
     # `transformer_blocks_N_attn_*` keys are shared with other MMDiTs.
@@ -458,17 +454,45 @@ def _convert_kohya_flux_via_diffusers(
     )
 
 
+# diffusers' Z-Image converter splits every "_" of a Kohya name; releases before
+# these fixups (e.g. the pinned 0.37) leave the names below over-split.
+_Z_IMAGE_MODULE_NAME_FIXUPS = {
+    "context.refiner.": "context_refiner.",
+    "noise.refiner.": "noise_refiner.",
+    "adaLN.modulation.": "adaLN_modulation.",
+    "all.final.layer.": "all_final_layer.",
+    "all.x.embedder.": "all_x_embedder.",
+    "cap.embedder.": "cap_embedder.",
+    "t.embedder.": "t_embedder.",
+}
+
+
 def _convert_kohya_dit_via_diffusers(
     state_dict: Mapping[str, torch.Tensor],
     converter_name: str,
     model_name: str,
     log: logging.Logger,
+    fill_alpha: int | None = None,
+    module_name_fixups: Mapping[str, str] | None = None,
 ) -> Dict[str, torch.Tensor]:
     """Convert a Kohya/musubi DiT LoRA with the matching diffusers helper.
 
     The helper folds alpha / rank into A/B and returns `transformer.`-prefixed
     diffusers names; the prefix is dropped to match the native DiT names.
+    A module without its own `.alpha` gets `fill_alpha` (else its rank) first,
+    since older diffusers releases require one. Each converted module then
+    records `alpha = rank`, so the loader applies no other alpha on top.
     """
+    state_dict = dict(state_dict)
+    for key in list(state_dict):
+        for down in (".lora_down.weight", ".lora.down.weight"):
+            if key.endswith(down):
+                alpha = (
+                    fill_alpha if fill_alpha is not None else state_dict[key].shape[0]
+                )
+                # Dot-format "to.q" modules look their alpha up as "to_q".
+                base = re.sub(r"to\.([qkv])$", r"to_\1", key[: -len(down)])
+                state_dict.setdefault(base + ".alpha", torch.tensor(float(alpha)))
     converted = _convert_via_diffusers_candidates(
         state_dict,
         (converter_name,),
@@ -484,7 +508,22 @@ def _convert_kohya_dit_via_diffusers(
             "last error: {last_err}"
         ),
     )
-    return {k.removeprefix("transformer."): v for k, v in converted.items()}
+    if any(k.startswith("lora_unet_") for k in converted):
+        raise ValueError(
+            f"Could not convert this Kohya {model_name} LoRA with the installed "
+            "diffusers; it would otherwise load as a no-op"
+        )
+    out = {}
+    for key, tensor in converted.items():
+        key = key.removeprefix("transformer.")
+        for dotted, underscored in (module_name_fixups or {}).items():
+            key = key.replace(dotted, underscored)
+        out[key] = tensor
+    for key in [k for k in out if k.endswith(".lora_A.weight")]:
+        out[key.removesuffix(".lora_A.weight") + ".alpha"] = torch.tensor(
+            float(out[key].shape[0])
+        )
+    return out
 
 
 def _convert_ai_toolkit_flux_lora(
@@ -662,6 +701,7 @@ def convert_lora_state_dict_by_format(
     state_dict: Mapping[str, torch.Tensor],
     fmt: LoRAFormat,
     log: logging.Logger,
+    fill_alpha: int | None = None,
 ) -> Dict[str, torch.Tensor]:
     """Normalize a raw LoRA state_dict into A/B + .weight naming."""
     if fmt == LoRAFormat.QWEN_IMAGE_STANDARD:
@@ -687,6 +727,7 @@ def convert_lora_state_dict_by_format(
             "_convert_non_diffusers_qwen_lora_to_diffusers",
             "Qwen-Image",
             log,
+            fill_alpha,
         )
 
     if fmt == LoRAFormat.KOHYA_Z_IMAGE:
@@ -695,6 +736,8 @@ def convert_lora_state_dict_by_format(
             "_convert_non_diffusers_z_image_lora_to_diffusers",
             "Z-Image",
             log,
+            fill_alpha,
+            _Z_IMAGE_MODULE_NAME_FIXUPS,
         )
 
     if fmt == LoRAFormat.WAN:
@@ -732,25 +775,12 @@ def normalize_lora_state_dict(
     *,
     adapter_config: Mapping[str, Any] | None = None,
     dit_class_name: str | None = None,
+    lora_alpha: int | None = None,
 ) -> Dict[str, torch.Tensor]:
-    """Normalize any supported LoRA format into a single canonical layout."""
-    normalized, _ = normalize_lora_state_dict_with_format(
-        state_dict,
-        logger,
-        adapter_config=adapter_config,
-        dit_class_name=dit_class_name,
-    )
-    return normalized
+    """Normalize any supported LoRA format into a single canonical layout.
 
-
-def normalize_lora_state_dict_with_format(
-    state_dict: Mapping[str, torch.Tensor],
-    logger: Optional[logging.Logger] = None,
-    *,
-    adapter_config: Mapping[str, Any] | None = None,
-    dit_class_name: str | None = None,
-) -> tuple[Dict[str, torch.Tensor], LoRAFormat]:
-    """Like normalize_lora_state_dict, also returning the detected format."""
+    `lora_alpha` is the caller's override for modules that carry no alpha.
+    """
     log = logger or globals()["logger"]
 
     state_dict = normalize_peft_keys(state_dict)
@@ -768,7 +798,12 @@ def normalize_lora_state_dict_with_format(
     fmt = detect_lora_format_from_state_dict(state_dict, dit_class_name)
     log.info("[LoRAFormatAdapter] detected format: %s", fmt)
 
-    normalized = convert_lora_state_dict_by_format(state_dict, fmt, log)
+    fill_alpha = (
+        lora_alpha
+        if lora_alpha is not None
+        else get_peft_lora_alpha(adapter_config or {})
+    )
+    normalized = convert_lora_state_dict_by_format(state_dict, fmt, log, fill_alpha)
     normalized = apply_peft_config(normalized, adapter_config or {})
 
     norm_keys = list(normalized.keys())
@@ -778,4 +813,4 @@ def normalize_lora_state_dict_with_format(
             ", ".join(_sample_keys(norm_keys, 20)),
         )
 
-    return normalized, fmt
+    return normalized

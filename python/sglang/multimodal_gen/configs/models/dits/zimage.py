@@ -54,29 +54,29 @@ class ZImageArchConfig(DiTArchConfig):
                 2,
                 3,
             ),
-            r"(.*)\.attention\.to_q\.(lora_A|lora_B)$": (
+            r"(.*)\.attention\.to_q\.(lora_A|lora_B|alpha)$": (
                 r"\1.attention.to_qkv.\2",
                 0,
                 3,
             ),
-            r"(.*)\.attention\.to_k\.(lora_A|lora_B)$": (
+            r"(.*)\.attention\.to_k\.(lora_A|lora_B|alpha)$": (
                 r"\1.attention.to_qkv.\2",
                 1,
                 3,
             ),
-            r"(.*)\.attention\.to_v\.(lora_A|lora_B)$": (
+            r"(.*)\.attention\.to_v\.(lora_A|lora_B|alpha)$": (
                 r"\1.attention.to_qkv.\2",
                 2,
                 3,
             ),
             r"(.*)\.feed_forward\.w1\.weight$": (r"\1.feed_forward.w13.weight", 0, 2),
             r"(.*)\.feed_forward\.w3\.weight$": (r"\1.feed_forward.w13.weight", 1, 2),
-            r"(.*)\.feed_forward\.w1\.(lora_A|lora_B)$": (
+            r"(.*)\.feed_forward\.w1\.(lora_A|lora_B|alpha)$": (
                 r"\1.feed_forward.w13.\2",
                 0,
                 2,
             ),
-            r"(.*)\.feed_forward\.w3\.(lora_A|lora_B)$": (
+            r"(.*)\.feed_forward\.w3\.(lora_A|lora_B|alpha)$": (
                 r"\1.feed_forward.w13.\2",
                 1,
                 2,
