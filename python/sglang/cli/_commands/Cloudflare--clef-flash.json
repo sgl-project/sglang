@@ -1,0 +1,5 @@
+[
+  {"hw":"h200","mode":"balanced","verified":"verified","gpus":1,"env":{},"url":"https://docs.sglang.io/cookbook/autoregressive/Cloudflare/clef#hw=h200&variant=flash&quant=bf16&strategy=balanced&nodes=single","command":"sglang serve \\\n  --model-path Cloudflare/clef-flash \\\n  --host 0.0.0.0 \\\n  --port 30000"},
+  {"hw":"b200","mode":"balanced","verified":"verified","gpus":1,"env":{},"url":"https://docs.sglang.io/cookbook/autoregressive/Cloudflare/clef#hw=b200&variant=flash&quant=bf16&strategy=balanced&nodes=single","command":"sglang serve \\\n  --model-path Cloudflare/clef-flash \\\n  --host 0.0.0.0 \\\n  --port 30000"},
+  {"hw":"b300","mode":"balanced","verified":"verified","gpus":1,"env":{},"url":"https://docs.sglang.io/cookbook/autoregressive/Cloudflare/clef#hw=b300&variant=flash&quant=bf16&strategy=balanced&nodes=single","command":"sglang serve \\\n  --model-path Cloudflare/clef-flash \\\n  --host 0.0.0.0 \\\n  --port 30000"}
+]
