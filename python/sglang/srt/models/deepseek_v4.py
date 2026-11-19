@@ -4819,6 +4819,27 @@ def _v41_vision_a2a_supported() -> bool:
     return backend.is_none() or (_is_cuda and backend.is_megamoe())
 
 
+def _dsv41_skip_group(
+    *,
+    name: str,
+    has_local_vision: bool,
+    params_dict: dict,
+) -> Optional[str]:
+    """Which checkpoint group this V4.1 tensor has no module for, if any.
+
+    A server without a local tower still routes image tokens when it consumes
+    precomputed embeddings, so `e_score_correction_bias_vl` must load whenever
+    the gate created it; only text-only checkpoints drop that tensor.
+    """
+    if has_local_vision:
+        return None
+    if name.startswith(("vision.", "aligner.", "image_")):
+        return "vision"
+    if name.endswith(".gate.e_score_correction_bias_vl") and name not in params_dict:
+        return "gate.bias_vl"
+    return None
+
+
 class DeepseekV4ForCausalLM(
     nn.Module, LanguageModelInputPreparation, CPBoundedTailLogits
 ):
@@ -5706,17 +5727,15 @@ class DeepseekV4ForCausalLM(
                         name = name.replace("weight_packed", "weight")
 
                     # V4.1 checkpoint tensors with no module in the text model yet.
-                    skip_group = None
-                    if not is_dsv41:
-                        pass
-                    elif self.vision is None and name.startswith(
-                        ("vision.", "aligner.", "image_")
-                    ):
-                        skip_group = "vision"
-                    elif self.vision is None and name.endswith(
-                        ".gate.e_score_correction_bias_vl"
-                    ):
-                        skip_group = "gate.bias_vl"
+                    skip_group = (
+                        _dsv41_skip_group(
+                            name=name,
+                            has_local_vision=self.vision is not None,
+                            params_dict=params_dict,
+                        )
+                        if is_dsv41
+                        else None
+                    )
                     if skip_group is not None:
                         skipped_by_group[skip_group] = (
                             skipped_by_group.get(skip_group, 0) + 1

@@ -141,7 +141,9 @@ class TestDeepseekV41BCGMultimodal(CustomTestCase):
 
                 def outer_forward(ids, positions, batch):
                     model = SimpleNamespace(
-                        vision=object(), config=SimpleNamespace(image_token_id=image_id)
+                        vision=object(),
+                        supports_visual_inputs=True,
+                        config=SimpleNamespace(image_token_id=image_id),
                     )
                     mapped, _ = (
                         dsv4.DeepseekV4ForCausalLM.prepare_language_model_inputs(
@@ -227,6 +229,48 @@ class TestDeepseekV41BCGMultimodal(CustomTestCase):
                     model, torch.arange(3), hidden, batch, ids, ids, False, []
                 )
             torch.testing.assert_close(actual, expected)
+
+
+class TestDsv41WeightSkip(CustomTestCase):
+    """A language-only server still routes image tokens, so it needs the vision bias."""
+
+    BIAS = "model.layers.0.mlp.gate.e_score_correction_bias_vl"
+
+    def test_vision_bias_loads_without_a_local_tower(self):
+        self.assertIsNone(
+            dsv4._dsv41_skip_group(
+                name=self.BIAS,
+                has_local_vision=False,
+                params_dict={self.BIAS: object()},
+            )
+        )
+
+    def test_vision_bias_is_skipped_when_the_gate_has_no_parameter(self):
+        self.assertEqual(
+            dsv4._dsv41_skip_group(
+                name=self.BIAS, has_local_vision=False, params_dict={}
+            ),
+            "gate.bias_vl",
+        )
+
+    def test_vision_weights_are_skipped_without_a_local_tower(self):
+        self.assertEqual(
+            dsv4._dsv41_skip_group(
+                name="vision.blocks.0.norm1.weight",
+                has_local_vision=False,
+                params_dict={},
+            ),
+            "vision",
+        )
+
+    def test_everything_loads_with_a_local_tower(self):
+        self.assertIsNone(
+            dsv4._dsv41_skip_group(
+                name="vision.blocks.0.norm1.weight",
+                has_local_vision=True,
+                params_dict={},
+            )
+        )
 
 
 class TestDeepseekV41EncoderNumTokens(CustomTestCase):
