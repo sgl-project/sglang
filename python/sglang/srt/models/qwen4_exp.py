@@ -1016,10 +1016,6 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                 "PLE embedding offload requires bfloat16 or fp8 weights, got "
                 f"{embedding.weight.dtype}"
             )
-        if _is_npu and embedding.weight.dtype != torch.bfloat16:
-            raise NotImplementedError(
-                "NPU PLE UVA requires bfloat16 storage; FP8 lookup is unsupported"
-            )
         if embedding.num_added_embeddings:
             raise NotImplementedError(
                 "PLE embedding offload does not support added vocabulary rows"
@@ -1109,16 +1105,6 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
 
         flat_ids = input_ids.reshape(-1).long()
         if flat_ids.numel():
-            if input_ids.device.type == "npu":
-                from sglang.srt.hardware_backend.npu.ple import gather_ple_uva_rows
-
-                return gather_ple_uva_rows(
-                    self._npu_uva_table,
-                    flat_ids,
-                    output,
-                    vocab_start=self.shard_indices.org_vocab_start_index,
-                    vocab_end=self.shard_indices.org_vocab_end_index,
-                )
             table, ids = self.weight, flat_ids
             vocab_start = self.shard_indices.org_vocab_start_index
             vocab_end = self.shard_indices.org_vocab_end_index
@@ -1129,8 +1115,14 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                 self._file_prefetcher.enqueue(
                     flat_ids, vocab_start=vocab_start, vocab_end=vocab_end
                 )
+            mapping = self._npu_uva_table
+            weight_ptr = (
+                mapping.get_device_pointer(input_ids.device)
+                if mapping is not None
+                else table.data_ptr()
+            )
             _gather_ple_embedding_from_pinned_kernel[(flat_ids.numel(),)](
-                table.data_ptr(),
+                weight_ptr,
                 ids,
                 output,
                 embedding_dim=self.embedding_dim,
@@ -1493,7 +1485,7 @@ class Qwen4ExpPLELayer(nn.Module):
         batch: Optional[_PLEBatch],
         forward_batch: ForwardBatch,
     ) -> None:
-        """Gather host PLE rows while the preceding decoder layer runs."""
+        """Gather PLE rows via UVA while the preceding decoder layer runs."""
         if self._prefetch_stream is None:
             return
         if self._prefetch_state is not None:
