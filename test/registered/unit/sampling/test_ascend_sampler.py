@@ -146,11 +146,11 @@ class TestAscendSamplingMaskCapture(unittest.TestCase):
         capture = self.sampler._build_ascend_sampling_mask_capture(
             weights, SimpleNamespace(sampling_mask_batch_indices=torch.tensor([0]))
         )
-        for cap, mode in product((3, 2), ("support", "selected")):
-            with self.subTest(cap=cap, mode=mode):
+        for cap in (3, 2):
+            with self.subTest(cap=cap):
                 self.sampler.sampling_mask_max_tokens = cap
                 packed = self.sampler._build_sampling_mask_output(
-                    token, capture, torch.tensor([0]) if mode == "support" else None
+                    token, capture, torch.tensor([0])
                 )
                 output = LogitsProcessorOutput(
                     next_token_logits=None, sampling_mask_output=packed
@@ -158,7 +158,7 @@ class TestAscendSamplingMaskCapture(unittest.TestCase):
                 SchedulerBatchResultProcessor.materialize_sampling_mask_output(
                     [
                         SimpleNamespace(
-                            return_sampling_mask=True, sampling_logprobs_mode=mode
+                            captures_sampling=True, captures_sampling_support=True
                         )
                     ],
                     output,

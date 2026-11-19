@@ -156,7 +156,8 @@ class SamplingMaskStatus(IntEnum):
 
 @dataclasses.dataclass
 class SamplingMaskOutput:
-    """Sampling-support IDs and optional full-support behavior logprobs."""
+    """Each captured row's sampled-token logprob, plus support IDs and logprobs
+    for the rows that capture their support."""
 
     token_ids: torch.Tensor
     lengths: torch.Tensor
@@ -255,13 +256,17 @@ class LogitsProcessorOutput:
         List[Union[List[float], torch.Tensor]]
     ] = None
     next_token_token_ids_logprobs_idx: Optional[List] = None
-    # Post-filter support IDs and requested behavior logprobs, bounded by server
-    # capacity. Logprobs are normalized over the full realized support.
+    # Post-filter sampled-token logprob, support IDs and support logprobs, bounded
+    # by server capacity. Logprobs are normalized over the full realized support.
+    # Host rows hold one value per row, or a list per accepted speculative token.
     sampling_mask_output: Optional[SamplingMaskOutput] = None
+    next_token_sampling_logprobs: Optional[
+        List[Optional[Union[float, List[float]]]]
+    ] = None
     next_token_sampling_mask_idx: Optional[
         List[Optional[Union[np.ndarray, List[np.ndarray]]]]
     ] = None
-    next_token_sampling_logprobs: Optional[
+    next_token_sampling_support_logprobs: Optional[
         List[Optional[Union[np.ndarray, List[np.ndarray]]]]
     ] = None
     next_token_sampling_mask_status: Optional[List[Optional[int]]] = None

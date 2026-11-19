@@ -414,21 +414,30 @@ idx = np.frombuffer(
 ).reshape(shape)
 ```
 
+#### Returning Sampling Logprobs and Sampling Masks
+
+`logprobs` and `top_logprobs` describe the distribution after temperature and before top-k / top-p / min-p. Two more flags in `extra_body`, together with `return_meta_info: true`, describe the distribution each token was actually sampled from: after those filters, renormalized. Each can be set without the other.
+
+- `return_sampling_logprobs: true` (requires `logprobs: true`) adds `output_token_sampling_logprobs` to `meta_info`: one float per output token. With no filter set it equals the output token logprob, so a client reads this one field whatever the sampling parameters are.
+- `return_sampling_mask: true` adds `output_sampling_mask_logprobs`: one row per output token, each entry `[logprob, token_id, text]` for a token the sampler could have drawn. With no filter set every row is empty: the support is the whole vocabulary. With top-p or min-p it needs a finite `top_k` within `--sampling-mask-max-tokens`.
+
+The native `/generate` API takes the same two flags, with `return_logprob` in place of `logprobs`.
+
 #### Returning Flat Sampling Masks
 
-With `return_sampling_mask: true`, set `return_flat_raw_sampling_mask: true` and `return_meta_info: true` in `extra_body` to receive the sampling masks as flat arrays in each choice's `meta_info` instead of one nested list per output token. The arrays arrive with the finished response only, so `stream: true` is not supported.
+With `return_sampling_mask: true`, set `return_flat_raw_sampling_mask: true` to receive the mask rows as flat arrays instead of one nested list per output token. The arrays arrive with the finished response only, so `stream: true` is not supported.
 
-`meta_info` then carries `output_token_sampling_mask_flat` (every row's token ids, row after row), `output_token_sampling_mask_row_lengths` (one row length per output token) and `output_token_sampling_logprobs_flat` (one logprob per token id in `support` mode, one per row in `selected` mode). On chat completions they are base64 by default, under `_b64` keys whose dtypes are given by the `_dtype` fields (int32, int32 and float32). Set `return_flat_raw_sampling_mask_b64: false` for plain JSON lists. The native `/generate` API takes the same fields, with base64 off by default.
+`meta_info` then carries `output_sampling_mask_logprobs_val_flat` (every row's logprobs, row after row), `output_sampling_mask_logprobs_idx_flat` (the matching token ids) and `output_sampling_mask_logprobs_row_lengths` (one row length per output token). On chat completions they are base64 by default, under `_b64` keys whose dtypes are given by the `_dtype` fields (float32, int32 and int32). Set `return_flat_raw_sampling_mask_b64: false` for plain JSON lists. The native `/generate` API takes the same fields, with base64 off by default.
 
 ```python
 meta = response.choices[0].meta_info
 lengths = np.frombuffer(
-    base64.b64decode(meta["output_token_sampling_mask_row_lengths_b64"]),
-    dtype=meta["output_token_sampling_mask_row_lengths_b64_dtype"],
+    base64.b64decode(meta["output_sampling_mask_logprobs_row_lengths_b64"]),
+    dtype=meta["output_sampling_mask_logprobs_row_lengths_b64_dtype"],
 )
 token_ids = np.frombuffer(
-    base64.b64decode(meta["output_token_sampling_mask_flat_b64"]),
-    dtype=meta["output_token_sampling_mask_flat_b64_dtype"],
+    base64.b64decode(meta["output_sampling_mask_logprobs_idx_flat_b64"]),
+    dtype=meta["output_sampling_mask_logprobs_idx_flat_b64_dtype"],
 )
 rows = np.split(token_ids, np.cumsum(lengths)[:-1])
 ```

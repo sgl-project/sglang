@@ -87,6 +87,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# The support row of a captured request that did not ask for the mask.
+_EMPTY_SUPPORT_IDS = np.empty(0, dtype=np.int32)
+_EMPTY_SUPPORT_LOGPROBS = np.empty(0, dtype=np.float32)
+
 
 def _get_speculative_output_stride(result: GenerationBatchResult) -> int:
     """Return the padded per-request width in flattened speculative output."""
@@ -441,10 +445,11 @@ class SchedulerBatchResultProcessor:
                 discard_finish_reason = (
                     req.discard_output_reason if should_commit_output else None
                 )
+                has_sampling_output = req.captures_sampling and not req.is_prefill_only
                 if (
                     should_commit_output
                     and discard_finish_reason is None
-                    and req.return_sampling_mask
+                    and has_sampling_output
                 ):
                     assert logits_output is not None
                     statuses = logits_output.next_token_sampling_mask_status
@@ -563,7 +568,7 @@ class SchedulerBatchResultProcessor:
                     if discard_finish_reason is not None:
                         continue
 
-                    if req.return_sampling_mask:
+                    if has_sampling_output:
                         self.add_sampling_mask_return_values(i, req, logits_output)
 
                     if req.grammar is not None:
@@ -1220,7 +1225,7 @@ class SchedulerBatchResultProcessor:
 
             req.time_stats.set_last_decode_finish_time()
             sampling_mask_finish_reason = None
-            if req.return_sampling_mask:
+            if req.captures_sampling:
                 statuses = logits_output.next_token_sampling_mask_status
                 status = None if statuses is None else statuses[i]
                 sampling_mask_finish_reason = self.get_sampling_mask_finish_reason(
@@ -1253,7 +1258,7 @@ class SchedulerBatchResultProcessor:
                     logits_output=logits_output,
                 )
 
-            if req.return_sampling_mask:
+            if req.captures_sampling:
                 self.add_sampling_mask_return_values(
                     i, req, logits_output, accept_len=new_accept_len
                 )
@@ -1379,11 +1384,12 @@ class SchedulerBatchResultProcessor:
         *,
         accept_len: int = 1,
     ) -> None:
-        """Attach sparse sampling support metadata to the return values."""
+        """Queue the captured sampling rows of this step's committed tokens."""
+        selected_logprobs = output.next_token_sampling_logprobs[i]
         masks = output.next_token_sampling_mask_idx[i]
-        logprobs = output.next_token_sampling_logprobs[i]
+        support_logprobs = output.next_token_sampling_support_logprobs[i]
         if not isinstance(masks, list):
-            req.sampling_mask_rows.append(masks, logprobs)
+            req.sampling_mask_rows.append(selected_logprobs, masks, support_logprobs)
             return
         # Speculative rows carry one support per accepted token; drop the ones
         # past finished_len, as output_ids is trimmed there.
@@ -1392,7 +1398,9 @@ class SchedulerBatchResultProcessor:
             0, min(accept_len, self._visible_output_len(req) - step_start)
         )
         for token in range(num_visible):
-            req.sampling_mask_rows.append(masks[token], logprobs[token])
+            req.sampling_mask_rows.append(
+                selected_logprobs[token], masks[token], support_logprobs[token]
+            )
 
     @staticmethod
     def _fill_speculative_sampling_mask_rows(
@@ -1405,8 +1413,9 @@ class SchedulerBatchResultProcessor:
         token_ids: np.ndarray,
         selected_logprobs: np.ndarray,
         support_logprobs: Optional[np.ndarray],
+        selected_by_batch: list,
         masks: list,
-        logprobs: list,
+        support_by_batch: list,
         status_by_batch: list,
     ) -> None:
         """Speculative rows carry one support per draft position; keep the
@@ -1414,29 +1423,30 @@ class SchedulerBatchResultProcessor:
         assert len(batch_indices) == len(num_accept_tokens)
         support_row = 0
         for row, batch_index in enumerate(batch_indices):
-            returns_support_logprobs = (
-                reqs[batch_index].sampling_logprobs_mode == "support"
-            )
+            captures_support = reqs[batch_index].captures_sampling_support
             num_tokens = num_accept_tokens[row]
             status = max(statuses[row][:num_tokens])
             status_by_batch[batch_index] = status
             if status == SamplingMaskStatus.OK:
-                row_lengths = lengths[row][:num_tokens]
-                masks[batch_index] = [
-                    token_ids[row, token, :length]
-                    for token, length in enumerate(row_lengths)
-                ]
-                if returns_support_logprobs:
-                    logprobs[batch_index] = [
+                selected_by_batch[batch_index] = selected_logprobs[
+                    row, :num_tokens
+                ].tolist()
+                if captures_support:
+                    row_lengths = lengths[row][:num_tokens]
+                    masks[batch_index] = [
+                        token_ids[row, token, :length]
+                        for token, length in enumerate(row_lengths)
+                    ]
+                    support_by_batch[batch_index] = [
                         support_logprobs[support_row, token, :length]
                         for token, length in enumerate(row_lengths)
                     ]
                 else:
-                    logprobs[batch_index] = [
-                        selected_logprobs[row, token : token + 1]
-                        for token in range(num_tokens)
-                    ]
-            if returns_support_logprobs:
+                    masks[batch_index] = [_EMPTY_SUPPORT_IDS] * num_tokens
+                    support_by_batch[batch_index] = [
+                        _EMPTY_SUPPORT_LOGPROBS
+                    ] * num_tokens
+            if captures_support:
                 support_row += 1
 
     @staticmethod
@@ -1444,19 +1454,20 @@ class SchedulerBatchResultProcessor:
         reqs: List[Req],
         output: Optional[LogitsProcessorOutput],
     ) -> None:
-        """Convert opted-in tensor rows to batch-aligned host rows."""
+        """Convert captured tensor rows to batch-aligned host rows."""
         if output is None or output.sampling_mask_output is None:
             return
 
         sampling_output = output.sampling_mask_output
-        batch_indices = [i for i, req in enumerate(reqs) if req.return_sampling_mask]
+        batch_indices = [i for i, req in enumerate(reqs) if req.captures_sampling]
         lengths = sampling_output.lengths.tolist()
         statuses = sampling_output.statuses.tolist()
         assert len(batch_indices) == len(lengths)
 
         batch_size = len(reqs)
+        selected_by_batch = [None] * batch_size
         masks = [None] * batch_size
-        logprobs = [None] * batch_size
+        support_by_batch = [None] * batch_size
         status_by_batch = [None] * batch_size
         token_ids = sampling_output.token_ids.cpu().numpy()
         selected_logprobs = sampling_output.selected_logprobs.cpu().numpy()
@@ -1475,35 +1486,38 @@ class SchedulerBatchResultProcessor:
                 token_ids=token_ids,
                 selected_logprobs=selected_logprobs,
                 support_logprobs=support_logprobs,
+                selected_by_batch=selected_by_batch,
                 masks=masks,
-                logprobs=logprobs,
+                support_by_batch=support_by_batch,
                 status_by_batch=status_by_batch,
             )
-            output.next_token_sampling_mask_idx = masks
-            output.next_token_sampling_logprobs = logprobs
-            output.next_token_sampling_mask_status = status_by_batch
-            output.sampling_mask_output = None
-            return
+        else:
+            selected_logprobs = selected_logprobs.tolist()
+            support_row = 0
+            for row, batch_index in enumerate(batch_indices):
+                captures_support = reqs[batch_index].captures_sampling_support
+                status = int(statuses[row])
+                if not captures_support and status == SamplingMaskStatus.OVERFLOW:
+                    # Without the support there is nothing to overflow.
+                    status = SamplingMaskStatus.OK
+                status_by_batch[batch_index] = status
+                if status == SamplingMaskStatus.OK:
+                    selected_by_batch[batch_index] = selected_logprobs[row]
+                    if captures_support:
+                        length = int(lengths[row])
+                        masks[batch_index] = token_ids[row, :length]
+                        support_by_batch[batch_index] = support_logprobs[
+                            support_row, :length
+                        ]
+                    else:
+                        masks[batch_index] = _EMPTY_SUPPORT_IDS
+                        support_by_batch[batch_index] = _EMPTY_SUPPORT_LOGPROBS
+                if captures_support:
+                    support_row += 1
 
-        support_row = 0
-        for row, batch_index in enumerate(batch_indices):
-            returns_support_logprobs = (
-                reqs[batch_index].sampling_logprobs_mode == "support"
-            )
-            status = int(statuses[row])
-            length = int(lengths[row])
-            status_by_batch[batch_index] = status
-            if status == SamplingMaskStatus.OK:
-                masks[batch_index] = token_ids[row, :length]
-                if returns_support_logprobs:
-                    logprobs[batch_index] = support_logprobs[support_row, :length]
-                else:
-                    logprobs[batch_index] = selected_logprobs[row : row + 1]
-            if returns_support_logprobs:
-                support_row += 1
-
+        output.next_token_sampling_logprobs = selected_by_batch
         output.next_token_sampling_mask_idx = masks
-        output.next_token_sampling_logprobs = logprobs
+        output.next_token_sampling_support_logprobs = support_by_batch
         output.next_token_sampling_mask_status = status_by_batch
         output.sampling_mask_output = None
 
@@ -1680,6 +1694,7 @@ class SchedulerBatchResultProcessor:
         logprob: Optional[float] = None,
         top_logprobs_val: Optional[List[float]] = None,
         top_logprobs_idx: Optional[List[int]] = None,
+        sampling_logprob: Optional[float] = None,
         sampling_mask_idx: Optional[np.ndarray] = None,
         sampling_mask_logprobs: Optional[np.ndarray] = None,
     ) -> None:
@@ -1697,8 +1712,10 @@ class SchedulerBatchResultProcessor:
                 token_ids_logprobs_val=[[]],
                 token_ids_logprobs_idx=[[]],
             )
-        if req.return_sampling_mask:
-            req.sampling_mask_rows.append(sampling_mask_idx, sampling_mask_logprobs)
+        if req.captures_sampling:
+            req.sampling_mask_rows.append(
+                sampling_logprob, sampling_mask_idx, sampling_mask_logprobs
+            )
 
     def _maybe_update_reasoning_tokens(
         self,

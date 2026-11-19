@@ -22,35 +22,47 @@ def validate_spec_sampling_mask_request(
     req: Req, spec_algorithm: SpeculativeAlgorithm
 ) -> Optional[str]:
     """Reject configurations whose committed tokens are not exact samples from
-    the captured target distribution."""
-    if not spec_algorithm.is_dflash_family():
-        return "return_sampling_mask is not supported with speculative decoding."
-
-    # build_speculative_verify_target_probs applies top-k/top-p only.
-    if req.sampling_params.min_p > 0:
-        return "return_sampling_mask with speculative decoding does not support min_p."
-
+    the target distribution the returned sampling logprobs describe."""
     if envs.SGLANG_SIMULATE_ACC_LEN.get() > 0:
         return (
-            "return_sampling_mask is not supported with simulated speculative "
-            "acceptance."
+            "return_sampling_logprobs or return_sampling_mask is not supported with "
+            "simulated speculative acceptance."
         )
 
-    if spec_algorithm.is_dflash():
+    # DSpark accepts by its own block estimator, not by these thresholds.
+    if not spec_algorithm.is_dflash_family() or spec_algorithm.is_dflash():
         if (
             get_spec().speculative_accept_threshold_single != 1.0
             or get_spec().speculative_accept_threshold_acc != 1.0
         ):
             return (
-                "return_sampling_mask with DFlash requires acceptance thresholds "
-                "of 1.0."
+                "return_sampling_logprobs or return_sampling_mask with speculative "
+                "decoding requires acceptance thresholds of 1.0."
             )
+
+    if spec_algorithm.is_dflash():
         # Without the kernel DFlash verifies non-greedy rows by greedy argmax.
         if req.sampling_params.top_k > 1 and not is_dflash_sampling_verify_available():
             return (
-                "return_sampling_mask with non-greedy DFlash decoding requires "
-                "sampling verification support."
+                "return_sampling_logprobs or return_sampling_mask with non-greedy "
+                "DFlash decoding requires sampling verification support."
             )
+
+    if not req.captures_sampling:
+        return None
+
+    if not spec_algorithm.is_dflash_family():
+        return (
+            "return_sampling_logprobs or return_sampling_mask with top-k/top-p/min-p "
+            "sampling is not supported with speculative decoding."
+        )
+
+    # build_speculative_verify_target_probs applies top-k/top-p only.
+    if req.sampling_params.min_p > 0:
+        return (
+            "return_sampling_logprobs or return_sampling_mask with speculative "
+            "decoding does not support min_p."
+        )
 
     return None
 

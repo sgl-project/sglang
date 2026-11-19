@@ -721,8 +721,9 @@ class MetadataBuffers:
                 self.output_token_sampling_mask_idx = torch.zeros(
                     (size, max_sampling_mask_tokens), dtype=torch.int32, device=device
                 )
+                # Slot 0 is the sampled token's logprob; the support logprobs follow.
                 self.output_token_sampling_logprobs = torch.zeros(
-                    (size, max_sampling_mask_tokens),
+                    (size, 1 + max_sampling_mask_tokens),
                     dtype=torch.float32,
                     device=device,
                 )
@@ -957,7 +958,7 @@ class MetadataBuffers:
                     dtype=torch.int32,
                     device="cpu",
                 )
-        if req.return_sampling_mask:
+        if req.captures_sampling:
             # Prefill streams a request only once its KV transfer ends or it aborts,
             # so the first token's row is the only one queued here.
             chunk = req.sampling_mask_rows.view()
@@ -966,9 +967,13 @@ class MetadataBuffers:
             self.output_token_sampling_mask_idx[
                 req.metadata_buffer_index, :mask_len
             ].copy_(torch.from_numpy(chunk.token_ids))
-            self.output_token_sampling_logprobs[
-                req.metadata_buffer_index, : len(chunk.logprobs)
-            ].copy_(torch.from_numpy(chunk.logprobs))
+            sampling_logprobs = self.output_token_sampling_logprobs[
+                req.metadata_buffer_index
+            ]
+            sampling_logprobs[:1].copy_(torch.from_numpy(chunk.selected_logprobs))
+            sampling_logprobs[1 : 1 + mask_len].copy_(
+                torch.from_numpy(chunk.support_logprobs)
+            )
         # For PD + spec decode
         if req.hidden_states_tensor is not None:
             # speculative_eagle_topk should not be greater than 16 currently

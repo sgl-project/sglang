@@ -12,11 +12,15 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.session.session_controller import SessionController
+from sglang.srt.speculative.spec_sampling_mask import (
+    validate_spec_sampling_mask_request,
+)
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -65,13 +69,73 @@ def _handle_pd_request(mode, req):
     return abort, scheduler._add_request_to_queue
 
 
+def _sampling_req(sampling_params, *, logprobs=False, mask=False):
+    params = SamplingParams(max_new_tokens=8, **sampling_params)
+    params.normalize(None)
+    return Req(
+        "r",
+        "",
+        array("q", [1, 2]),
+        params,
+        return_logprob=logprobs,
+        return_sampling_logprobs=logprobs,
+        return_sampling_mask=mask,
+    )
+
+
+class TestSamplingCapture(CustomTestCase):
+    def test_only_filtered_sampling_is_captured(self):
+        """An unfiltered request reuses its output logprobs, so neither flag may put
+        it on the capture path; greedy, top-k, top-p and min-p each must."""
+        for sampling_params, filtered in (
+            ({}, False),
+            ({"top_k": -1, "top_p": 1.0, "temperature": 0.7}, False),
+            ({"top_k": 20}, True),
+            ({"top_p": 0.9}, True),
+            ({"min_p": 0.05}, True),
+            ({"temperature": 0.0}, True),
+        ):
+            for logprobs, mask in ((True, False), (False, True), (False, False)):
+                with self.subTest(params=sampling_params, logprobs=logprobs, mask=mask):
+                    req = _sampling_req(sampling_params, logprobs=logprobs, mask=mask)
+                    captured = filtered and (logprobs or mask)
+                    self.assertEqual(req.captures_sampling, captured)
+                    self.assertEqual(req.captures_sampling_support, filtered and mask)
+                    self.assertEqual(req.sampling_mask_rows is not None, captured)
+
+    def test_speculative_decoding_admits_what_stays_exact(self):
+        """Output logprobs are exact sampling logprobs under any speculative
+        algorithm while acceptance is unrelaxed; a filtered request also needs the
+        DFlash capture."""
+        eagle = SimpleNamespace(is_dflash_family=lambda: False, is_dflash=lambda: False)
+        dflash = SimpleNamespace(is_dflash_family=lambda: True, is_dflash=lambda: True)
+        unfiltered = _sampling_req({}, logprobs=True, mask=True)
+        greedy = _sampling_req({"temperature": 0.0}, logprobs=True)
+
+        with get_context().override_server_args(speculative_accept_threshold_acc=1.0):
+            self.assertIsNone(validate_spec_sampling_mask_request(unfiltered, eagle))
+            self.assertIn(
+                "top-k/top-p/min-p", validate_spec_sampling_mask_request(greedy, eagle)
+            )
+            self.assertIsNone(validate_spec_sampling_mask_request(greedy, dflash))
+            with envs.SGLANG_SIMULATE_ACC_LEN.override(2):
+                self.assertIsNotNone(
+                    validate_spec_sampling_mask_request(unfiltered, eagle)
+                )
+        with get_context().override_server_args(speculative_accept_threshold_acc=0.9):
+            for algorithm in (eagle, dflash):
+                self.assertIsNotNone(
+                    validate_spec_sampling_mask_request(unfiltered, algorithm)
+                )
+
+
 class TestSchedulerSamplingMaskValidation(CustomTestCase):
     def test_disabled_pd_masks_return_bad_request_before_admission(self):
         """Neither PD role may queue mask requests without metadata buffers."""
         for mode in (DisaggregationMode.PREFILL, DisaggregationMode.DECODE):
             with self.subTest(mode=mode):
                 abort, add_to_queue = _handle_pd_request(
-                    mode, MagicMock(return_sampling_mask=True, return_logprob=False)
+                    mode, MagicMock(captures_sampling=True, return_logprob=False)
                 )
                 abort.assert_called_once()
                 self.assertEqual(
@@ -91,7 +155,7 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
                         disaggregation_max_top_logprobs_num=capacity
                     ),
                 ):
-                    req = MagicMock(return_sampling_mask=True, return_logprob=True)
+                    req = MagicMock(captures_sampling=True, return_logprob=True)
                     req.logprob.top_logprobs_num = top_logprobs_num
                     abort, add_to_queue = _handle_pd_request(mode, req)
                     abort.assert_called_once()
@@ -163,8 +227,8 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
                         replace=False,
                         drop_previous_output=False,
                     ),
-                    # The default top_k is invalid together with a sampling mask.
-                    sampling_params=SamplingParams(max_new_tokens=8),
+                    # Top-p without a finite top_k cannot return a sampling mask.
+                    sampling_params=SamplingParams(max_new_tokens=8, top_p=0.9),
                     return_sampling_mask=name == "sampling_mask",
                     return_logprob=False,
                     return_hidden_states=False,
