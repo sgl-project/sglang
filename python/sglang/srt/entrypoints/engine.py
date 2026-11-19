@@ -49,7 +49,6 @@ from typing import (
 import msgspec
 import torch
 import uvloop
-import zmq
 
 from sglang.srt.arg_groups.model_override_base import (
     attention_backends_of,
@@ -94,14 +93,11 @@ from sglang.srt.managers.io_struct import (
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
-    RpcReqOutput,
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
-    sock_recv,
-    sock_send,
 )
 from sglang.srt.managers.multi_tokenizer_mixin import (
     MultiTokenizerRouter,
@@ -138,7 +134,6 @@ from sglang.srt.runtime_context import (
     get_observability,
     get_parallel,
     get_serving,
-    is_control_broadcast_local,
     publish,
     restore_context,
     snapshot_context,
@@ -168,7 +163,6 @@ from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.network import (
     NetworkAddress,
     get_free_port,
-    get_zmq_socket,
     is_port_available,
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -393,15 +387,6 @@ class Engine(EngineScoreMixin, EngineBase):
                 server_args, port_args, scheduler_info
             )
             self.tokenizer_manager._subprocess_watchdog = subprocess_watchdog
-
-        # Initialize ZMQ sockets
-        context = zmq.Context(2)
-        if get_parallel().node_rank == 0:
-            self.send_to_rpc = get_zmq_socket(
-                context, zmq.DEALER, self.port_args.rpc_ipc_name, True
-            )
-        else:
-            self.send_to_rpc = None
 
         # Enable tracing
         if get_observability().enable_trace:
@@ -1519,7 +1504,6 @@ class Engine(EngineScoreMixin, EngineBase):
             scheduler_infos=[scheduler_info], all_child_pids=[]
         )
         self._weight_cache_daemon_procs = []
-        self.send_to_rpc = None
         self.tokenizer_manager, self.template_manager = self._init_tokenizer_worker(
             server_args, port_args, scheduler_info
         )
@@ -1553,11 +1537,6 @@ class Engine(EngineScoreMixin, EngineBase):
                 and self.tokenizer_manager._subprocess_watchdog is not None
             ):
                 self.tokenizer_manager._subprocess_watchdog.stop()
-
-            send_to_rpc = getattr(self, "send_to_rpc", None)
-            if send_to_rpc is not None:
-                send_to_rpc.close(linger=0)
-                self.send_to_rpc = None
 
             # Gracefully stop weight cache daemons *before* the blanket
             # kill_process_tree below, so their SIGTERM handlers can unlink the
@@ -1942,18 +1921,11 @@ class Engine(EngineScoreMixin, EngineBase):
     """
 
     def collective_rpc(self, method: str, **kwargs):
-        if is_control_broadcast_local():
-            raise ValueError(
-                "collective_rpc needs the global control broadcast, but each "
-                "attention-DP group broadcasts its own control requests here "
-                "(dp_attention_local_control_broadcast, set by its flag or "
-                "implied by the deployment, or an elastic EP joiner)."
-            )
         obj = RpcReqInput(method=method, parameters=kwargs)
-        sock_send(self.send_to_rpc, obj)
-        recv_req = sock_recv(self.send_to_rpc, flags=zmq.BLOCKY)
-        assert isinstance(recv_req, RpcReqOutput)
-        assert recv_req.success, recv_req.message
+        result = self.loop.run_until_complete(
+            self.tokenizer_manager.collective_rpc(obj)
+        )
+        assert result.success, result.message
 
     def save_remote_model(self, **kwargs):
         self.collective_rpc("save_remote_model", **kwargs)

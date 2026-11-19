@@ -55,7 +55,6 @@ from sglang.srt.runtime_context import (
     get_serving,
     get_spec,
     is_scheduler_io_rank,
-    is_scheduler_rpc_rank,
     publish,
     spawn_world_rank,
 )
@@ -219,7 +218,6 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightVersionReqInput,
     UpdateWeightVersionReqOutput,
-    sock_send,
 )
 from sglang.srt.managers.load_snapshot import create_load_snapshot_writer
 from sglang.srt.managers.min_free_slots_delayer import (
@@ -893,7 +891,6 @@ class Scheduler(
         self.ipc_channels = SchedulerIpcChannels.create(
             port_args=port_args,
             is_rank_zero=is_rank_zero,
-            is_rpc_rank=is_scheduler_rpc_rank(),
             # The snapshot taken at construction, not a second bag read: this
             # scheduler gates its tokenizer init on the same value, and the two
             # must not be able to disagree.
@@ -931,12 +928,8 @@ class Scheduler(
             and get_parallel().attn_cp_rank == 0
             and get_device().sleep_on_idle
         ):
-            io_sockets = (
-                self.ipc_channels.recv_from_tokenizer,
-                self.ipc_channels.recv_from_rpc,
-            )
             self.idle_sleeper = IdleSleeper(
-                sockets=[s for s in io_sockets if s is not None],
+                sockets=[self.ipc_channels.recv_from_tokenizer],
                 can_empty_cache=lambda: not self.pause_state.paused,
             )
         else:
@@ -2398,10 +2391,7 @@ class Scheduler(
             if output is None:
                 output = self._rust_control_ack(recv_req)
             if output is not None:
-                if self.rust_server is None and isinstance(output, RpcReqOutput):
-                    if self.ipc_channels.recv_from_rpc is not None:
-                        sock_send(self.ipc_channels.recv_from_rpc, output)
-                elif get_parallel().pp_size > 1 and isinstance(
+                if get_parallel().pp_size > 1 and isinstance(
                     output, ReleaseMemoryOccupationReqOutput
                 ):
                     # Answered by the first stage once every stage has released.
@@ -2742,7 +2732,6 @@ class Scheduler(
             )
         self.request_receiver = receiver_factory(
             recv_from_tokenizer=self.recv_from_tokenizer,
-            recv_from_rpc=self.ipc_channels.recv_from_rpc,
             recv_skipper=self.recv_skipper,
             input_blocker=self.input_blocker,
             mm_receiver=self.mm_receiver,
@@ -6483,12 +6472,22 @@ class Scheduler(
             error = str(e)
             logger.error(f"Failed to call rpc {recv_req.method}: {error}")
 
-        # Only the RPC rank replies, so it collects every rank's error.
-        rank_errors = [None] * self.tp_group.world_size
-        torch.distributed.all_gather_object(
-            rank_errors, error, group=self.tp_group.cpu_group
-        )
-        errors = [e for e in dict.fromkeys(rank_errors) if e is not None]
+        # Gather over the ranks that ran this request in the same step: the DP
+        # shard under DP attention, where shards may reach it in different steps.
+        parallel = get_parallel()
+        if parallel.attn_dp_enabled:
+            groups = [parallel.attn_tp_group, parallel.attn_cp_group]
+        else:
+            groups = [parallel.tp_group]
+        errors = [error]
+        for group in groups:
+            if group.world_size > 1:
+                gathered = [None] * group.world_size
+                torch.distributed.all_gather_object(
+                    gathered, errors, group=group.cpu_group
+                )
+                errors = [e for rank_errors in gathered for e in rank_errors]
+        errors = [e for e in dict.fromkeys(errors) if e is not None]
         return RpcReqOutput(success=not errors, message="; ".join(errors))
 
     def handle_update_weight_version(

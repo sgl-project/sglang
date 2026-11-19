@@ -16,7 +16,6 @@ if TYPE_CHECKING:
 @dataclass(frozen=True, slots=True, kw_only=True)
 class SchedulerIpcChannels:
     recv_from_tokenizer: Union[zmq.Socket, "ScriptedTokenizerRecvProxy"]
-    recv_from_rpc: Optional[zmq.Socket]
     send_to_tokenizer: SenderWrapper
     send_to_detokenizer: SenderWrapper
     send_metrics_from_scheduler: Optional[zmq.Socket]
@@ -27,7 +26,6 @@ class SchedulerIpcChannels:
         *,
         port_args: PortArgs,
         is_rank_zero: bool,
-        is_rpc_rank: bool,
         skip_tokenizer_init: bool,
         metrics_enabled: bool,
         enable_scripted_runtime: bool,
@@ -46,13 +44,6 @@ class SchedulerIpcChannels:
                 recv_from_tokenizer = ScriptedTokenizerRecvProxy(
                     underlying=recv_from_tokenizer
                 )
-            # The engine's bound DEALER round-robins over connected peers, so a
-            # second peer would take every other RPC and answer each one twice.
-            recv_from_rpc = (
-                get_zmq_socket(context, zmq.DEALER, port_args.rpc_ipc_name, False)
-                if is_rpc_rank
-                else None
-            )
 
             send_to_tokenizer_raw = get_zmq_socket(
                 context, zmq.PUSH, port_args.tokenizer_ipc_name, False
@@ -73,7 +64,6 @@ class SchedulerIpcChannels:
             send_to_detokenizer = SenderWrapper(send_to_detokenizer_raw)
         else:
             recv_from_tokenizer = None
-            recv_from_rpc = None
             send_to_tokenizer = SenderWrapper(None)
             send_to_detokenizer = SenderWrapper(None)
 
@@ -86,7 +76,6 @@ class SchedulerIpcChannels:
 
         return cls(
             recv_from_tokenizer=recv_from_tokenizer,
-            recv_from_rpc=recv_from_rpc,
             send_to_tokenizer=send_to_tokenizer,
             send_to_detokenizer=send_to_detokenizer,
             send_metrics_from_scheduler=send_metrics_from_scheduler,
