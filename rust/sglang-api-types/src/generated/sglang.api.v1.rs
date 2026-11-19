@@ -72,6 +72,44 @@ pub struct BoolList {
     #[prost(bool, repeated, tag = "1")]
     pub items: ::prost::alloc::vec::Vec<bool>,
 }
+/// A bool or a string. The field that uses it says which strings it takes.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct BoolOrString {
+    #[prost(oneof = "bool_or_string::Value", tags = "1, 2")]
+    pub value: ::core::option::Option<bool_or_string::Value>,
+}
+/// Nested message and enum types in `BoolOrString`.
+pub mod bool_or_string {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Value {
+        #[prost(bool, tag = "1")]
+        Flag(bool),
+        #[prost(string, tag = "2")]
+        Mode(::prost::alloc::string::String),
+    }
+}
+/// One value for every batch item, or one per item.
+/// Untagged, not one_or_many: the `one` arm is itself a union.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct BoolOrStringOrList {
+    #[prost(oneof = "bool_or_string_or_list::Value", tags = "1, 2")]
+    pub value: ::core::option::Option<bool_or_string_or_list::Value>,
+}
+/// Nested message and enum types in `BoolOrStringOrList`.
+pub mod bool_or_string_or_list {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Value {
+        #[prost(message, tag = "1")]
+        One(super::BoolOrString),
+        #[prost(message, tag = "2")]
+        Many(super::BoolOrStringList),
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct BoolOrStringList {
+    #[prost(message, repeated, tag = "1")]
+    pub items: ::prost::alloc::vec::Vec<BoolOrString>,
+}
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Int64OrList {
     #[prost(oneof = "int64_or_list::Value", tags = "1, 2")]
@@ -1189,8 +1227,11 @@ pub struct GenerateRequest {
     pub top_logprobs_num: ::core::option::Option<Int64OrList>,
     #[prost(message, optional, tag = "9")]
     pub token_ids_logprob: ::core::option::Option<TokenIdsOrList>,
+    /// true: every position. false: none. "last": the final position's
+    /// vector only. The schema takes any string; the server checks it.
+    /// `"last"` is served by the Python frontend only; the Rust server refuses it.
     #[prost(message, optional, tag = "10")]
-    pub return_hidden_states: ::core::option::Option<BoolOrList>,
+    pub return_hidden_states: ::core::option::Option<BoolOrStringOrList>,
     #[prost(bool, optional, tag = "11")]
     pub return_text_in_logprobs: ::core::option::Option<bool>,
     /// PD bootstrap columns: a batch mixes bootstrapped and plain requests, so

@@ -182,6 +182,30 @@
     },
     {
       "type": "GenerateRequest",
+      "name": "hidden-state mode string",
+      "input": {
+        "text": "hi",
+        "return_hidden_states": "last"
+      },
+      "canonical": "{\"text\":\"hi\",\"stream\":false,\"return_hidden_states\":\"last\",\"return_prompt_token_ids\":false,\"routed_experts_start_len\":0}"
+    },
+    {
+      "type": "GenerateRequest",
+      "name": "hidden-state modes per batch item: the string beside a bool",
+      "input": {
+        "text": [
+          "a",
+          "b"
+        ],
+        "return_hidden_states": [
+          "last",
+          false
+        ]
+      },
+      "canonical": "{\"text\":[\"a\",\"b\"],\"stream\":false,\"return_hidden_states\":[\"last\",false],\"return_prompt_token_ids\":false,\"routed_experts_start_len\":0}"
+    },
+    {
+      "type": "GenerateRequest",
       "name": "media containers: nested, ref object, bare source; unknown keys ignored",
       "input": {
         "text": "see",

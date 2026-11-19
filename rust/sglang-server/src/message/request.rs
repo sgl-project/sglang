@@ -159,7 +159,10 @@ pub fn into_requests(
     let logprob_start_len = logprob_start_len.and_then(wire::int64_or_list);
     let top_logprobs_num = top_logprobs_num.and_then(wire::int64_or_list);
     let token_ids_logprob = token_ids_logprob.and_then(wire::token_ids_or_list);
-    let return_hidden_states = return_hidden_states.and_then(wire::bool_or_list);
+    let return_hidden_states = return_hidden_states
+        .map(wire::return_hidden_states_or_list)
+        .transpose()?
+        .flatten();
     let bootstrap_host = bootstrap_host.and_then(wire::optional_string_or_list);
     let bootstrap_port = bootstrap_port.and_then(wire::optional_int64_or_list);
     let bootstrap_room = bootstrap_room.and_then(wire::optional_int64_or_list);
@@ -1485,6 +1488,32 @@ mod tests {
         ] {
             assert!(requests(body).is_err(), "{body}");
         }
+    }
+
+    /// The schema takes `return_hidden_states: "last"` for the Python server;
+    /// this server refuses it, alone or anywhere in a batch list.
+    #[test]
+    fn return_hidden_states_last_is_refused() {
+        for body in [
+            r#"{"text": "hi", "return_hidden_states": "last"}"#,
+            r#"{"text": "hi", "return_hidden_states": ["last"]}"#,
+            r#"{"text": ["a", "b"], "return_hidden_states": [false, "last"]}"#,
+        ] {
+            let err = requests(body).unwrap_err().to_string();
+            assert_eq!(
+                err, r#"return_hidden_states "last" is not supported by the Rust server"#,
+                "{body}"
+            );
+        }
+        let err = requests(r#"{"text": "hi", "return_hidden_states": "full"}"#)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            r#"return_hidden_states must be a boolean or "last", got "full""#
+        );
+        let (ps, _) = requests(r#"{"text": "hi", "return_hidden_states": true}"#).unwrap();
+        assert!(ps[0].return_hidden_states);
     }
 
     /// Client-supplied rid semantics mirror Python's `_normalize_batch`: a

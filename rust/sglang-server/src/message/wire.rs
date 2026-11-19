@@ -40,6 +40,37 @@ pub fn bool_or_list(v: api::BoolOrList) -> Option<OneOrMany<bool>> {
     })
 }
 
+/// `return_hidden_states` per item. Only Python serves the `"last"` mode,
+/// so a string anywhere refuses the request, and is never read as a bool.
+pub fn return_hidden_states_or_list(
+    v: api::BoolOrStringOrList,
+) -> Result<Option<OneOrMany<bool>>, Error> {
+    use api::bool_or_string::Value as Mode;
+    use api::bool_or_string_or_list::Value;
+    let flag = |mode: api::BoolOrString| match mode.value {
+        Some(Mode::Flag(on)) => Ok(on),
+        Some(Mode::Mode(mode)) if mode == "last" => Err(Error::Validation(
+            "return_hidden_states \"last\" is not supported by the Rust server".into(),
+        )),
+        Some(Mode::Mode(mode)) => Err(Error::Validation(format!(
+            "return_hidden_states must be a boolean or \"last\", got {mode:?}"
+        ))),
+        // JSON always carries a value; only a protobuf client can leave it unset.
+        None => Ok(false),
+    };
+    v.value
+        .map(|v| match v {
+            Value::One(mode) => flag(mode).map(OneOrMany::One),
+            Value::Many(l) => l
+                .items
+                .into_iter()
+                .map(flag)
+                .collect::<Result<_, _>>()
+                .map(OneOrMany::Many),
+        })
+        .transpose()
+}
+
 fn token_ids(v: api::TokenIds) -> TokenIds {
     v.ids
 }

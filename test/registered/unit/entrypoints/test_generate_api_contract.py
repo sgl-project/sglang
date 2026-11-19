@@ -98,6 +98,25 @@ class TestGenerateContract(CustomTestCase):
         self.assertIsNotNone(error)
         self.assertIn("unknown field", error)
 
+    def test_return_hidden_states_takes_only_the_string_last(self):
+        for value in (True, False, "last", ["last", False]):
+            with self.subTest(value=value):
+                self.assertIsNone(
+                    generate_contract_error(
+                        {"text": "hi", "return_hidden_states": value}
+                    )
+                )
+        # The schema takes any string; the route's parser would read `"true"`
+        # as a bool.
+        for value in ("true", "full", "", ["last", "true"]):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    generate_contract_error(
+                        {"text": "hi", "return_hidden_states": value}
+                    ),
+                    "return_hidden_states must be a boolean or the string literal 'last'.",
+                )
+
 
 class TestGenerateRouteGate(CustomTestCase):
     def test_route_checks_the_contract_and_serve_does_not(self):

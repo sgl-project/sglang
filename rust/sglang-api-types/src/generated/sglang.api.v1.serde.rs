@@ -216,6 +216,121 @@ impl<'de> ::serde::Deserialize<'de> for BoolList {
     }
 }
 
+impl ::serde::Serialize for BoolOrString {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match &self.value {
+            Some(bool_or_string::Value::Flag(v)) => v.serialize(serializer),
+            Some(bool_or_string::Value::Mode(v)) => v.serialize(serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for BoolOrString {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = BoolOrString;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("one of the BoolOrString shapes")
+            }
+            fn visit_bool<E: ::serde::de::Error>(self, v: bool) -> Result<Self::Value, E> {
+                Ok(BoolOrString {
+                    value: Some(bool_or_string::Value::Flag(v)),
+                })
+            }
+            fn visit_str<E: ::serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(BoolOrString {
+                    value: Some(bool_or_string::Value::Mode(v.to_owned())),
+                })
+            }
+            fn visit_string<E: ::serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
+                Ok(BoolOrString {
+                    value: Some(bool_or_string::Value::Mode(v)),
+                })
+            }
+        }
+        deserializer.deserialize_any(V)
+    }
+}
+
+impl ::serde::Serialize for BoolOrStringOrList {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match &self.value {
+            Some(bool_or_string_or_list::Value::One(v)) => v.serialize(serializer),
+            Some(bool_or_string_or_list::Value::Many(v)) => v.serialize(serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for BoolOrStringOrList {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = BoolOrStringOrList;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("one of the BoolOrStringOrList shapes")
+            }
+            fn visit_bool<E: ::serde::de::Error>(self, v: bool) -> Result<Self::Value, E> {
+                Ok(BoolOrStringOrList {
+                    value: Some(bool_or_string_or_list::Value::One(
+                        <BoolOrString as ::serde::Deserialize>::deserialize(
+                            ::serde::de::value::BoolDeserializer::<E>::new(v),
+                        )?,
+                    )),
+                })
+            }
+            fn visit_str<E: ::serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(BoolOrStringOrList {
+                    value: Some(bool_or_string_or_list::Value::One(
+                        <BoolOrString as ::serde::Deserialize>::deserialize(
+                            ::serde::de::value::StrDeserializer::<E>::new(v),
+                        )?,
+                    )),
+                })
+            }
+            fn visit_string<E: ::serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
+                Ok(BoolOrStringOrList {
+                    value: Some(bool_or_string_or_list::Value::One(
+                        <BoolOrString as ::serde::Deserialize>::deserialize(
+                            ::serde::de::value::StringDeserializer::<E>::new(v),
+                        )?,
+                    )),
+                })
+            }
+            fn visit_seq<A: ::serde::de::SeqAccess<'de>>(
+                self,
+                seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let v = <BoolOrStringList as ::serde::Deserialize>::deserialize(
+                    ::serde::de::value::SeqAccessDeserializer::new(seq),
+                )?;
+                Ok(BoolOrStringOrList {
+                    value: Some(bool_or_string_or_list::Value::Many(v)),
+                })
+            }
+        }
+        deserializer.deserialize_any(V)
+    }
+}
+
+impl ::serde::Serialize for BoolOrStringList {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.items.iter())
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for BoolOrStringList {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(BoolOrStringList {
+            items: <::prost::alloc::vec::Vec<BoolOrString> as ::serde::Deserialize>::deserialize(
+                deserializer,
+            )?,
+        })
+    }
+}
+
 impl ::serde::Serialize for Int64OrList {
     fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match &self.value {
@@ -7595,7 +7710,8 @@ impl<'de> ::serde::Deserialize<'de> for GenerateRequest {
                                     "return_hidden_states",
                                 ));
                             }
-                            f_return_hidden_states = Some(map.next_value::<Option<BoolOrList>>()?);
+                            f_return_hidden_states =
+                                Some(map.next_value::<Option<BoolOrStringOrList>>()?);
                         }
                         "return_text_in_logprobs" => {
                             if f_return_text_in_logprobs.is_some() {
