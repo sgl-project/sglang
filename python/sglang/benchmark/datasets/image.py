@@ -140,11 +140,19 @@ def create_mm_data_row(
                 for image_base64 in images_base64
             ]
             content_items.append({"type": "text", "text": text_prompt})
-        prompt_str = processor.apply_chat_template(
-            [{"role": "user", "content": content_items}],
-            add_generation_prompt=True,
-            tokenize=False,
-        )
+        if type(processor).__name__ == "Inkling2Processor":
+            # Not an HF processor; its tokenizer holds the chat template.
+            prompt_str = processor.tokenizer.apply_chat_template(
+                [{"role": "user", "content": content_items}],
+                add_generation_prompt=True,
+                tokenize=False,
+            )
+        else:
+            prompt_str = processor.apply_chat_template(
+                [{"role": "user", "content": content_items}],
+                add_generation_prompt=True,
+                tokenize=False,
+            )
     except Exception as e:
         # Note (Xinyuan): This is a workaround for an issue where some tokenizers do not support content as a list. (e.g. InternVL)
         print(f"Error applying chat template: {e}, fallback to <image> tag")
@@ -175,6 +183,15 @@ def create_mm_data_row(
             inference_mode=True,
         )
         prompt_len = result.input_ids.numel()
+    elif type(processor).__name__ == "Inkling2Processor":
+        # count_tokens_for_image is exact: 40 px per token
+        # (native_patch_size 20 x adapter_merge_size 2).
+        prompt_len = len(
+            processor.tokenizer.encode(prompt_str, add_special_tokens=False)
+        ) + sum(
+            processor.image_processor.count_tokens_for_image(*image.size)
+            for image in images
+        )
     else:
         prompt_len = processor(
             text=[prompt_str],
