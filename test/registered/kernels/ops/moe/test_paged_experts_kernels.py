@@ -1,6 +1,7 @@
 import os
 import tempfile
 import threading
+import types
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -13,10 +14,11 @@ from sglang.kernels.ops.moe.paged_experts import (
     paged_experts_host_device_pointer,
     paged_experts_rows_to_slots,
 )
+from sglang.srt.layers.moe.paged_experts.store import HostExpertStore
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=45, stage="base-b-kernel-unit", runner_config="1-gpu-small")
+register_cuda_ci(est_time=75, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 E, K = 64, 16
 
@@ -36,8 +38,9 @@ class _State:
         self.dst = torch.zeros(num_slots, **i32)
         self.count = torch.zeros(1, **i32)
 
-    def decide(self, topk, weights=None):
-        """Run the decide kernel; return the runner inputs it wrote (slots, weights)."""
+    def decide(self, topk, weights=None, host_ids=False):
+        """Run the decide kernel; return the runner inputs it wrote (slots, weights).
+        ``host_ids``: the fused host copy's ids (K + e for an entry paged in)."""
         if weights is None:
             weights = torch.ones(topk.shape, device="cuda")
         run_ids, run_w = torch.empty_like(topk), torch.empty_like(weights)
@@ -53,6 +56,7 @@ class _State:
             self.count,
             run_ids,
             run_w,
+            host_ids=host_ids,
         )
         return run_ids, run_w
 
@@ -779,6 +783,365 @@ class TestCompactedTritonCalls(CustomTestCase):
                 )
                 lookup_matters.append(full_config != row_config)
         self.assertTrue(any(lookup_matters))
+
+
+class _Layer:
+    """Every expert in a pinned host store, K GPU slots holding experts 0..K-1 at the start."""
+
+    def __init__(self, tensors):  # name -> [E, ...] tensor on the GPU
+        rows = {n: (tuple(t.shape[1:]), t.dtype) for n, t in tensors.items()}
+        self.store = HostExpertStore(rows, E)
+        for n, t in tensors.items():
+            self.store.host[n].copy_(t.cpu())
+        self.initial = {n: t[:K].clone() for n, t in tensors.items()}
+        self.slots = {n: t.clone() for n, t in self.initial.items()}
+
+    def reset(self):
+        for n, t in self.initial.items():
+            self.slots[n].copy_(t)
+
+    def gather(self, state):
+        """The copy kernel that runs before the MoE kernel without the host copy: bring the plan's experts into their slots."""
+        names = list(self.slots)
+        args = _gather_args(
+            [self.store.host[n] for n in names], [self.slots[n] for n in names]
+        )
+        paged_experts_gather(*args, state.src, state.dst, state.count)
+
+    def assert_slots_hold(self, case, state):
+        """Every slot holds, byte for byte, the expert the residency state says it holds."""
+        for n, gpu in self.slots.items():
+            for s, e in enumerate(state.slot_expert.tolist()):
+                case.assertTrue(
+                    torch.equal(gpu[s].cpu(), self.store.host[n][e]), f"{n} slot {s}"
+                )
+
+
+# Routings for 4 tokens x top-2 (8 entries, K = 16 slots, experts 0..15 resident at the start).
+ROUTINGS = {
+    "none missing": [[0, 1], [2, 3], [4, 5], [6, 7]],
+    "all missing": [[16, 17], [18, 19], [20, 21], [22, 23]],
+    "mixed": [[0, 40], [41, 3], [5, 42], [63, 7]],
+    "one missing expert in every token": [[50, 1], [50, 2], [50, 3], [50, 4]],
+    "padding": [[0, 40], [-1, 3], [41, -1], [-1, -1]],
+}
+
+
+class TestFusedHostCopyDecide(CustomTestCase):
+    def test_host_ids_mark_only_the_paged_in_entries(self):
+        """With host_ids the decide kernel makes the same decision (plan, slot tables) and
+        writes the same run ids, except that an entry whose expert is paged in gets K + e."""
+        weights = torch.rand(8, device="cuda")
+        for name, routing in ROUTINGS.items():
+            with self.subTest(routing=name):
+                topk = torch.tensor(routing, dtype=torch.int32, device="cuda").flatten()
+                copy_first, fused = _State(), _State()
+                ids_s, w_s = copy_first.decide(topk, weights, host_ids=False)
+                ids_f, w_f = fused.decide(topk, weights, host_ids=True)
+                for a in (
+                    "src",
+                    "dst",
+                    "count",
+                    "slot_expert",
+                    "expert_slot",
+                    "slot_lastuse",
+                ):
+                    self.assertTrue(
+                        torch.equal(getattr(copy_first, a), getattr(fused, a)), a
+                    )
+                self.assertTrue(torch.equal(w_s, w_f))
+                n = int(copy_first.count.item())
+                paged_in = set(copy_first.src[:n].tolist())
+                want = [
+                    K + e if e in paged_in else s
+                    for e, s in zip(topk.tolist(), ids_s.tolist())
+                ]
+                self.assertEqual(ids_f.tolist(), want)
+
+
+class TestFusedHostCopyTriton(CustomTestCase):
+    """The Triton MoE kernel reading missing experts from host memory: same output as
+    copy-then-compute, bit for bit, and every slot filled."""
+
+    setUpClass = classmethod(TestCompactedTritonCalls.setUpClass.__func__)
+    _run = TestCompactedTritonCalls._run
+
+    def setUp(self):
+        from sglang.kernels.ops.moe.fused_moe_triton_host_copy import HOST_COPIES
+
+        torch.manual_seed(0)
+        hidden, inter = 256, 128
+        self.layer = _Layer(
+            {
+                "w13": torch.randn(
+                    E, 2 * inter, hidden, device="cuda", dtype=torch.bfloat16
+                )
+                / 16,
+                "w2": torch.randn(E, hidden, inter, device="cuda", dtype=torch.bfloat16)
+                / 16,
+            }
+        )
+        self.x = torch.randn(4, hidden, device="cuda", dtype=torch.bfloat16)
+        self.host_copies = HOST_COPIES
+
+    def _register(self, state):
+        # What PagedExpertsMoEMethod._fuse_host_copy_triton does, keyed by slot table address.
+        for n in ("w13", "w2"):
+            ptr = self.layer.slots[n].data_ptr()
+            self.host_copies[ptr] = (
+                self.layer.store.host[n],
+                state.expert_slot,
+                state.count,
+            )
+            self.addCleanup(self.host_copies.pop, ptr, None)
+
+    def _copy_then_compute(self, topk, weights):
+        state = _State()
+        ids, w = state.decide(topk.flatten(), weights.flatten(), host_ids=False)
+        self.layer.reset()
+        self.layer.gather(state)
+        out = self._run(
+            self.x,
+            self.layer.slots["w13"],
+            self.layer.slots["w2"],
+            ids.view(topk.shape),
+            w.view(topk.shape),
+            {},
+        )
+        return out, state
+
+    def _fused(self, topk, weights):
+        state = _State()
+        self._register(state)
+        ids, w = state.decide(topk.flatten(), weights.flatten(), host_ids=True)
+        self.layer.reset()
+        out = self._run(
+            self.x,
+            self.layer.slots["w13"],
+            self.layer.slots["w2"],
+            ids.view(topk.shape),
+            w.view(topk.shape),
+            {},
+        )
+        return out, state
+
+    def test_fused_equals_copy_then_compute_bitwise(self):
+        for name, routing in ROUTINGS.items():
+            with self.subTest(routing=name):
+                topk = torch.tensor(routing, dtype=torch.int32, device="cuda")
+                weights = torch.rand(topk.shape, device="cuda")
+                want, _ = self._copy_then_compute(topk, weights)
+                got, state = self._fused(topk, weights)
+                self.host_copies.clear()  # the copy-then-compute call below must not see it
+                self.assertTrue(torch.equal(got, want))
+                self.layer.assert_slots_hold(self, state)
+
+    def test_many_tokens_on_one_paged_in_expert(self):
+        """32 tokens share expert 50 (missing), so several thread blocks read it from the
+        host and store it into the same slot; the other entry is a resident expert. More
+        entries than the decide kernel takes (K), so the residency is set by hand: expert 50
+        replaces expert 15 in slot 15."""
+        state = _State()
+        state.slot_expert[15] = 50
+        state.expert_slot[15], state.expert_slot[50] = -1, 15
+        state.src[0], state.dst[0], state.count[0] = 50, 15, 1
+        resident = torch.tensor(
+            [t % 8 for t in range(32)], dtype=torch.int32, device="cuda"
+        )
+        slot_ids = torch.stack([torch.full_like(resident, 15), resident], dim=1)
+        fused_ids = torch.stack([torch.full_like(resident, K + 50), resident], dim=1)
+        weights = torch.rand(32, 2, device="cuda")
+        x = torch.randn(32, self.x.shape[1], device="cuda", dtype=torch.bfloat16)
+        w13, w2 = self.layer.slots["w13"], self.layer.slots["w2"]
+
+        self.layer.reset()
+        self.layer.gather(state)
+        want = self._run(x, w13, w2, slot_ids, weights, {})
+        self.layer.reset()
+        self._register(state)
+        got = self._run(x, w13, w2, fused_ids, weights, {})
+        self.host_copies.clear()
+        self.assertTrue(torch.equal(got, want))
+        self.layer.assert_slots_hold(self, state)
+
+    def test_graph_replays_on_new_routing(self):
+        """decide + fused MoE captured once, replayed on new routings: each replay matches
+        copy-then-compute and leaves every slot holding its expert."""
+        state = _State()
+        self._register(state)
+        topk = torch.zeros(4, 2, dtype=torch.int32, device="cuda")
+        weights = torch.ones(4, 2, device="cuda")
+
+        def step():
+            ids, w = state.decide(topk.flatten(), weights.flatten(), host_ids=True)
+            return self._run(
+                self.x,
+                self.layer.slots["w13"],
+                self.layer.slots["w2"],
+                ids.view(4, 2),
+                w.view(4, 2),
+                {},
+            )
+
+        step()  # warm up (compiles) outside the capture
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out = step()
+        generator = torch.Generator().manual_seed(1)
+        for _ in range(10):
+            routing = torch.stack(
+                [torch.randperm(E, generator=generator)[:2] for _ in range(4)]
+            )
+            topk.copy_(routing.to(torch.int32))
+            weights.copy_(torch.rand(4, 2, generator=generator))
+            graph.replay()
+            self.layer.assert_slots_hold(self, state)
+            # Every routed expert is now resident: the MoE kernel on slot ids, without the host copy,
+            # must agree.
+            slot_ids = state.expert_slot[topk.long()]
+            saved = dict(self.host_copies)
+            self.host_copies.clear()
+            want = self._run(
+                self.x,
+                self.layer.slots["w13"],
+                self.layer.slots["w2"],
+                slot_ids,
+                weights,
+                {},
+            )
+            self.host_copies.update(saved)
+            self.assertTrue(torch.equal(out, want))
+
+
+def _torch_moe(x, w1, w2, ids, weights):
+    """The MoE layer in PyTorch on dequantized weights (w1 [E, 2I, H] gate then up, w2
+    [E, H, I]), as test_marlin_moe.py's torch_experts computes it."""
+    from sglang.srt.layers.activation import SiluAndMul
+
+    out = torch.zeros(x.shape[0], w2.shape[1], dtype=torch.float32, device=x.device)
+    for t in range(x.shape[0]):
+        for e, w in zip(ids[t].tolist(), weights[t].tolist()):
+            if e < 0:
+                continue
+            h = SiluAndMul()((x[t : t + 1] @ w1[e].T))
+            out[t] += w * (h @ w2[e].T)[0].float()
+    return out.to(x.dtype)
+
+
+@unittest.skipUnless(
+    torch.cuda.is_available() and torch.cuda.get_device_capability() >= (8, 0),
+    "Marlin needs SM80+",
+)
+class TestFusedHostCopyMarlin(CustomTestCase):
+    """NVFP4 experts through Marlin with the host copy: the output matches the PyTorch MoE on
+    the dequantized weights, and the slots hold their experts byte for byte. Same settings as test_marlin_moe.py: inputs and weights / 10, atol 5e-2,
+    rtol 0."""
+
+    def setUp(self):
+        from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace
+        from sglang.srt.layers.quantization.marlin_utils_fp4 import (
+            prepare_moe_nvfp4_layer_for_marlin,
+        )
+        from sglang.test.test_marlin_utils import make_nvfp4_weight_and_ref
+
+        torch.manual_seed(0)
+        H, I, dtype = 256, 128, torch.bfloat16
+
+        def experts(n, k):
+            # One NVFP4 weight per expert, scaled by 1/10 like test_marlin_moe.py's weights.
+            parts = [make_nvfp4_weight_and_ref(n, k, dtype) for _ in range(E)]
+            return (
+                torch.stack([p[0] for p in parts]),
+                torch.stack([p[1] for p in parts]),
+                torch.stack([p[2].float() / 10 for p in parts]),
+                torch.stack([p[3] / 10 for p in parts]),
+            )
+
+        q13, s13, g13, self.ref13 = experts(2 * I, H)
+        q2, s2, g2, self.ref2 = experts(H, I)
+        ns = types.SimpleNamespace(
+            w13_weight=q13,
+            w2_weight=q2,
+            w13_weight_scale=s13,
+            w2_weight_scale=s2,
+            w13_weight_scale_2=g13,
+            w2_weight_scale_2=g2,
+            moe_runner_config=types.SimpleNamespace(is_gated=True),
+            intermediate_size_per_partition=I,
+            params_dtype=dtype,
+        )
+        prepare_moe_nvfp4_layer_for_marlin(ns, group_size=16)
+        names = (
+            "w13_weight",
+            "w2_weight",
+            "w13_weight_scale",
+            "w2_weight_scale",
+            "w13_weight_scale_2",
+            "w2_weight_scale_2",
+        )
+        self.layer = _Layer({n: getattr(ns, n).data for n in names})
+        self.x = torch.randn(4, H, device="cuda", dtype=dtype) / 10
+        self.workspace = lambda: marlin_make_workspace(self.x.device, 4)
+
+    def _register(self, state):
+        from sglang.kernels.ops.moe.moe_wna16_marlin import HOST_COPIES, HostCopy
+
+        ptr = lambda n: paged_experts_host_device_pointer(self.layer.store.host[n])
+        for w in ("w13_weight", "w2_weight"):
+            key = self.layer.slots[w].data_ptr()
+            HOST_COPIES[key] = HostCopy(
+                weight=ptr(w),
+                scales=ptr(f"{w}_scale"),
+                global_scale=ptr(f"{w}_scale_2"),
+                num_experts=E,
+                expert_slot=state.expert_slot,
+                count=state.count,
+            )
+            self.addCleanup(HOST_COPIES.pop, key, None)
+
+    def _run(self, ids, weights):
+        from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
+            fused_marlin_moe,
+        )
+
+        s = self.layer.slots
+        return fused_marlin_moe(
+            self.x,
+            s["w13_weight"],
+            s["w2_weight"],
+            s["w13_weight_scale"],
+            s["w2_weight_scale"],
+            torch.empty(self.x.shape[0], 1, device="cuda"),
+            weights,
+            ids,
+            global_num_experts=K,
+            w1_global_scale=s["w13_weight_scale_2"],
+            w2_global_scale=s["w2_weight_scale_2"],
+            workspace=self.workspace(),
+            num_bits=4,
+            is_k_full=True,
+            activation="silu",
+            is_gated=True,
+        )
+
+    def test_both_paths_match_the_torch_moe(self):
+        from sglang.kernels.ops.moe.moe_wna16_marlin import HOST_COPIES
+
+        for name, routing in ROUTINGS.items():
+            with self.subTest(routing=name):
+                topk = torch.tensor(routing, dtype=torch.int32, device="cuda")
+                weights = torch.rand(topk.shape, device="cuda")
+                ref = _torch_moe(self.x, self.ref13, self.ref2, topk, weights)
+
+                fused = _State()
+                self._register(fused)
+                ids, w = fused.decide(topk.flatten(), weights.flatten(), host_ids=True)
+                self.layer.reset()
+                fused_out = self._run(ids.view(topk.shape), w.view(topk.shape))
+                HOST_COPIES.clear()
+
+                torch.testing.assert_close(fused_out, ref, atol=5e-2, rtol=0)
+                self.layer.assert_slots_hold(self, fused)
 
 
 if __name__ == "__main__":
