@@ -15,7 +15,10 @@ env:
   # Sources of the pinned releases (python/pyproject.toml).
   DEEPGEMM_REF: v0.2.9          # sgl-deep-gemm==0.2.9
   DEEPGEMM_VERSION: "0.2.9"
-  DEEPEP_REF: v0.1.2.post1      # sgl-deep-ep==0.1.2.post1
+  # sgl-deep-ep==0.1.2.post1 is tag v0.1.2.post1, which predates the sgl_deep_ep/
+  # packaging script build_sgl_deepep.sh needs; build the sgl-deepep head the release
+  # workflow defaults to (3 commits past the tag).
+  DEEPEP_REF: bf737b65b16e6f5aea08595e1de737bc4860bbac
   DEEPEP_VERSION: "0.1.2.post1"
   FLASHMLA_REF: 85b5264bbe2fe66327afc8a94f1eed80629937ca  # sgl-flash-mla==1.0.5
   FLASHMLA_VERSION: "1.0.5"
