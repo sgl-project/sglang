@@ -184,7 +184,7 @@ class TestGrammarCacheLRU(CustomTestCase):
 
 
 class TestGrammarCacheByteBudget(CustomTestCase):
-    """The byte budget is the primary bound (--grammar-cache-limit-bytes)."""
+    """The byte budget is the only bound (DEFAULT_CACHE_LIMIT_BYTES)."""
 
     def test_evicts_oldest_past_byte_budget(self):
         b = _StubBackend(cache_limit_bytes=3 * 40 + 2 * _kb("s0"))

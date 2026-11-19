@@ -198,12 +198,18 @@ class BaseGrammarBackend:
     # Compiled grammars are kept in an LRU cache bounded by host memory. Each
     # compiled grammar holds per-vocabulary token tables, so an unbounded cache
     # leaks host memory whenever clients send a different json_schema / regex /
-    # EBNF per request. The byte budget (--grammar-cache-limit-bytes) is the
-    # only bound: it is known before startup, whereas what an entry count costs
-    # depends on the schemas clients happen to send, and a count would bind
-    # before the budget for small grammars without covering xgrammar's own
-    # compiler cache. In-flight requests keep their own ``copy()`` of a grammar,
-    # so evicting an entry is safe.
+    # EBNF per request. The byte budget is the only bound: it is known before
+    # startup, whereas what an entry count costs depends on the schemas clients
+    # happen to send, and a count would bind before the budget for small
+    # grammars without covering xgrammar's own compiler cache. The budget is a
+    # fixed constant rather than a server flag: how the cache is bounded is an
+    # implementation detail, and 1 GiB holds on the order of a thousand typical
+    # compiled schemas. Backends and tests can still pass ``cache_limit_bytes``
+    # to the constructor. Entries are charged what the backend reports, and
+    # xgrammar's ``memory_size_bytes`` undercounts the RSS a compiled grammar
+    # adds, so the real footprint can exceed the budget by a few times.
+    # In-flight requests keep their own ``copy()`` of a grammar, so evicting an
+    # entry is safe.
     DEFAULT_CACHE_LIMIT_BYTES = 1 << 30
     # Charged per entry when the backend has no size API (outlines, llguidance).
     NOMINAL_GRAMMAR_BYTES = 1 << 20
@@ -423,8 +429,6 @@ def create_grammar_backend(
             server_args, tokenizer, vocab_size, eos_token_ids
         )
 
-    cache_limit_bytes = get_serving().grammar_cache_limit_bytes
-
     # Default grammar backends
     if name == "outlines":
         from sglang.srt.constrained.outlines_backend import OutlinesGrammarBackend
@@ -432,7 +436,6 @@ def create_grammar_backend(
         grammar_backend = OutlinesGrammarBackend(
             tokenizer,
             whitespace_pattern=get_serving().constrained_json_whitespace_pattern,
-            cache_limit_bytes=cache_limit_bytes,
         )
     elif name == "xgrammar":
         from sglang.srt.constrained.xgrammar_backend import (
@@ -450,7 +453,6 @@ def create_grammar_backend(
                 model_eos_token_ids=eos_list,
                 any_whitespace=not get_serving().constrained_json_disable_any_whitespace,
                 max_whitespace_cnt=get_serving().constrained_json_max_whitespace_cnt,
-                cache_limit_bytes=cache_limit_bytes,
             )
         except TokenizerNotSupportedError as e:
             if get_serving().enable_strict_thinking:
@@ -476,7 +478,6 @@ def create_grammar_backend(
             whitespace_pattern=get_serving().constrained_json_whitespace_pattern,
             n_vocab=vocab_size,
             eos_token_ids=eos_token_ids,
-            cache_limit_bytes=cache_limit_bytes,
         )
     elif name == "none":
         if get_serving().enable_strict_thinking:
@@ -506,7 +507,6 @@ def create_grammar_backend(
             reasoning_parser,
             tokenizer,
             enable_strict_thinking=get_serving().enable_strict_thinking,
-            cache_limit_bytes=cache_limit_bytes,
         )
 
     return grammar_backend

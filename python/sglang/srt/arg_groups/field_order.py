@@ -570,6 +570,5 @@ POSITIONAL_FIELD_ORDER = (
     "enable_flashmla_prefill_token_packing",
     "decode_state_free_radix_default",
     "gc_freeze_on_idle_secs",
-    "grammar_cache_limit_bytes",
 )
 # fmt: on
