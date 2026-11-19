@@ -89,6 +89,11 @@ struct PrefixCandidate {
     scanner: WorkerPrefixScanner,
 }
 
+struct PoolPrefixCandidate<'a> {
+    worker_id: &'a String,
+    hbm_key: Option<(String, i32)>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FastPathKind {
     Legacy,
@@ -414,13 +419,34 @@ impl InMemoryKvIndexerBackend {
             HashSet::new()
         };
         let mut seen = HashSet::new();
+        let mut pool_candidates: HashMap<&str, Vec<PoolPrefixCandidate<'_>>> = HashMap::new();
         let mut candidates: Vec<PrefixCandidate> = effective_placements(&state, first)
             .filter(|(worker, _, _)| {
                 !fast_worker_ids.contains(worker.as_str()) && seen.insert(worker.as_str())
             })
-            .map(|(worker, _, _)| {
+            .filter_map(|(worker, _, _)| {
                 let metadata = state.workers.get(worker);
-                PrefixCandidate {
+                if let Some(member) = metadata.filter(|member| !member.dram_pool_id.is_empty()) {
+                    if let Some(spec) = member.spec.filter(|spec| {
+                        spec.version <= 1
+                            && spec.components == COMPONENT_FULL
+                            && tier_in_mask(spec.full_tier_mask, TierType::TierDram as i32)
+                    }) {
+                        pool_candidates
+                            .entry(&member.dram_pool_id)
+                            .or_default()
+                            .push(PoolPrefixCandidate {
+                                worker_id: worker,
+                                hbm_key: tier_in_mask(
+                                    spec.full_tier_mask,
+                                    TierType::TierHbm as i32,
+                                )
+                                .then(|| (worker.clone(), TierType::TierHbm as i32)),
+                            });
+                        return None;
+                    }
+                }
+                Some(PrefixCandidate {
                     address: metadata
                         .map(|worker| worker.address.clone())
                         .unwrap_or_default(),
@@ -428,7 +454,7 @@ impl InMemoryKvIndexerBackend {
                         metadata.and_then(|worker| worker.spec.as_ref()),
                     ),
                     worker_id: worker.clone(),
-                }
+                })
             })
             .collect();
         let candidate_by_id: HashMap<String, usize> = candidates
@@ -462,6 +488,47 @@ impl InMemoryKvIndexerBackend {
                         ));
                     }
                 }
+            }
+        }
+
+        // Scan shared FULL blocks once per pool. Only DRAM gaps require checking
+        // each member's private HBM. No derived pool state or REPORT fanout is needed.
+        for (pool_id, mut members) in pool_candidates {
+            let mut add_match = |member: &PoolPrefixCandidate<'_>, prefix| {
+                let worker = &state.workers[member.worker_id];
+                if prefix > 0 && !worker.address.is_empty() {
+                    entries.push((member.worker_id.clone(), worker.address.clone(), prefix));
+                }
+            };
+            let mut prefix = 0;
+            for hash in hashes {
+                let block = state.blocks.get(hash);
+                let shared_full = block
+                    .and_then(|block| block.pool_placements.get(pool_id))
+                    .is_some_and(|mask| mask & COMPONENT_FULL != 0);
+                if !shared_full {
+                    members.retain(|member| {
+                        let private_full = block
+                            .and_then(|block| {
+                                member
+                                    .hbm_key
+                                    .as_ref()
+                                    .and_then(|key| block.placements.get(key))
+                            })
+                            .is_some_and(|mask| mask & COMPONENT_FULL != 0);
+                        if !private_full {
+                            add_match(member, prefix);
+                        }
+                        private_full
+                    });
+                    if members.is_empty() {
+                        break;
+                    }
+                }
+                prefix += 1;
+            }
+            for member in members {
+                add_match(&member, prefix);
             }
         }
 
