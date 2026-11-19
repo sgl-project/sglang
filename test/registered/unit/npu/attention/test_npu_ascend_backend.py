@@ -144,6 +144,9 @@ class TestSparseAttentionLengthLifetime(CustomTestCase):
         backend.is_hybrid_swa = False
         backend.use_sliding_window_kv_pool = False
         backend.use_mla = False
+        backend.use_quant_flash_attn = False
+        backend.use_flash_mla = False
+        backend.use_paged_mtp = False
         backend.use_int8_quant_indexer = False
         backend.kv_cache_dtype = torch.float8_e4m3fn if packed else torch.bfloat16
         backend.kv_capability = SimpleNamespace(
@@ -185,7 +188,7 @@ class TestSparseAttentionLengthLifetime(CustomTestCase):
             )
 
         with (
-            get_parallel().override(attn_cp_size=1),
+            get_parallel().override(attn_cp_size=1, attn_tp_size=1),
             patch(
                 "sglang.srt.hardware_backend.npu.attention.ascend_backend."
                 "torch_npu.npu_sparse_flash_attention",
