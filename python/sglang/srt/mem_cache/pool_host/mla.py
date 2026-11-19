@@ -206,7 +206,9 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 self._native_buffers = buffer_info.buffers
                 self._native_infos = infos
                 native = self._native_buffers
-                self._v_dtype = native.v.dtype if native.v is not None else native.k.dtype
+                self._v_dtype = (
+                    native.v.dtype if native.v is not None else native.k.dtype
+                )
                 if layout in ("page_first_kv_split", "layer_first_kv_split"):
                     self._size_per_token = self.layer_num * (
                         native.k_width * native.k.element_size()
@@ -217,7 +219,9 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         index_bytes = native.index_width * native.index_k.element_size()
                         if native.index_scales is not None:
                             index_bytes += native.index_scales.element_size()
-                        self._size_per_token += index_bytes * len(native.index_layer_indices) // ratio
+                        self._size_per_token += (
+                            index_bytes * len(native.index_layer_indices) // ratio
+                        )
                 self.device_kv_buffers = ()
                 self.device_data_ptrs = None
             else:
@@ -363,7 +367,10 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             )
         if native.index_scales is not None:
             lengths.append(
-                self.page_num * native.index_scales.shape[2] * index_layers * native.index_scales.element_size()
+                self.page_num
+                * native.index_scales.shape[2]
+                * index_layers
+                * native.index_scales.element_size()
             )
         return [length for length in lengths if length]
 

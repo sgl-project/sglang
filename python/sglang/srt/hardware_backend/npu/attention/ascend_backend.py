@@ -1936,7 +1936,7 @@ class AscendAttnBackend(AttentionBackend):
     ):
         q_nope = q_nope.to(torch.bfloat16)
         q_pe = q_pe.to(torch.bfloat16)
-        packed = packed_kv.view(self.kv_cache_dtype)
+        packed = packed_kv.view(self.kv_capability.kv_cache_dtype)
         return torch_npu.npu_kv_quant_sparse_flash_attention(
             query=torch.cat((q_nope, q_pe), dim=-1).contiguous(),
             key=packed,
