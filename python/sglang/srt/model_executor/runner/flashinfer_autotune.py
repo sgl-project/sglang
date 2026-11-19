@@ -366,7 +366,10 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
                 cache=None if reuse_cache else str(autotune_cache),
                 skip_ops=skip_ops,
             ),
-            autotune_v2(mode="tune", persistent_cache=False),
+            autotune_v2(
+                mode="tune",
+                persistent_cache=envs.SGLANG_FLASHINFER_AUTOTUNE_V2_PERSISTENT_CACHE.get(),
+            ),
             mega_context,
             autotune_dummy_run_mode(run_lm_head=run_lm_head),
         ):
