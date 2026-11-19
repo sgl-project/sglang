@@ -218,7 +218,13 @@ def _draft_step(
     logits_out: Optional[torch.Tensor],
     sharded_accept: bool,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    if logits_out is None and len(prev_tokens) == 1:
+    # The fused kernel has no vocab mask, and softcap rounding can tie its argmax.
+    if (
+        logits_out is None
+        and len(prev_tokens) == 1
+        and markov_head.step_vocab_limit is None
+        and markov_head.step_softcap is None
+    ):
         # One greedy row, no logits kept: one kernel does the GEMV, add and argmax.
         w2_weight = markov_head.greedy_w2_weight()
         # The kernel reads one w2 row per base-logit column.
@@ -253,6 +259,8 @@ def _draft_step(
         logits_out=logits_out,
         # Rows sample at their temperatures only when the step logits are kept.
         has_sampled_rows=None if logits_out is not None else False,
+        softcap=markov_head.step_softcap,
+        vocab_limit=markov_head.step_vocab_limit,
         **sharded,
     )
     return tokens, state
