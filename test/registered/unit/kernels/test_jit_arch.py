@@ -45,5 +45,34 @@ class TestJitPdlCapability(CustomTestCase):
                 self.assertEqual(arch.is_arch_support_pdl.__wrapped__(), expected)
 
 
+class TestJitTargetFlags(CustomTestCase):
+    def test_sail_macro_is_restricted_to_sail(self):
+        compile_arch = arch.CompileArch(8, 9, "")
+        common_flags = [
+            compile_arch.jit_flag,
+            "-std=c++20",
+            "-O3",
+            "--expt-relaxed-constexpr",
+        ]
+        for platform in ("sail", "cuda", "hip"):
+            with self.subTest(platform=platform), ExitStack() as stack:
+                stack.enter_context(
+                    patch.object(arch, "is_hip_runtime", return_value=platform == "hip")
+                )
+                stack.enter_context(
+                    patch.object(
+                        arch, "is_sail_runtime", return_value=platform == "sail"
+                    )
+                )
+                flags = arch.get_default_target_flags(compile_arch)
+                if platform == "sail":
+                    self.assertEqual(flags, [*common_flags, "-DSGL_SAIL=1"])
+                elif platform == "cuda":
+                    self.assertEqual(flags, common_flags)
+                else:
+                    self.assertIn("-DUSE_ROCM", flags)
+                    self.assertNotIn("-DSGL_SAIL=1", flags)
+
+
 if __name__ == "__main__":
     unittest.main()

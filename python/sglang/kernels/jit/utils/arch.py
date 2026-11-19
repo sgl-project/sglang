@@ -155,12 +155,15 @@ def get_default_target_flags(arch: CompileArch | None = None) -> List[str]:
     else:
         if arch is None:
             arch = get_compile_arch()
-        return [
+        flags = [
             arch.jit_flag,
             "-std=c++20",
             "-O3",
             "--expt-relaxed-constexpr",
         ]
+        if is_sail_runtime():
+            flags.append("-DSGL_SAIL=1")
+        return flags
 
 
 @cache_once
