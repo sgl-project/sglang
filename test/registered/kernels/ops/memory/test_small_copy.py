@@ -8,10 +8,11 @@ from sglang.kernels.ops.memory import small_field_copy as small_field_copy_modul
 from sglang.kernels.ops.memory.small_copy import _small_copy_kernel, try_small_copy
 from sglang.kernels.ops.memory.small_field_copy import SmallFieldCopyPlan
 from sglang.srt.environ import envs
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-small")
+register_amd_ci(est_time=25, stage="base-a-jit-kernel-unit", runner_config="amd")
 
 _DTYPES = (
     torch.bool,
