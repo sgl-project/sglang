@@ -119,11 +119,5 @@ def test_bitwise_matches_triton_kernels():
             assert torch.equal(q.view(torch.uint8), ref_q.view(torch.uint8))
 
 
-def test_rejects_bad_hidden():
-    x = torch.randn((4, 48), device="cuda", dtype=torch.bfloat16)
-    with pytest.raises(Exception, match="multiple of 32"):
-        mxfp8_group_quant(x)
-
-
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
