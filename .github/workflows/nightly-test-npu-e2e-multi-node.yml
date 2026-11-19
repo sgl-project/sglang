@@ -364,44 +364,12 @@ jobs:
         with:
           name: npu-metrics-${{ inputs.test_config_name }}
           # output/<branch>-<create_time>-<run_id>-<run_attempt>/<workflow>/<test_type>/<case>
+          # Pods also copy their own log into <case>/node_logs/<host>/, so every
+          # node's log travels with the metrics artifact at no extra cost.
           path: /root/.cache/tests/output/*-${{ github.run_id }}-${{ github.run_attempt }}/*/${{ inputs.test_type }}/*
           if-no-files-found: ignore
           retention-days: 7
-
-      - name: Stage pod logs
-        if: always()
-        env:
-          TEST_CASE: ${{ inputs.test_case }}
-          RUN_ID: ${{ github.run_id }}
-          RUN_ATTEMPT: ${{ github.run_attempt }}
-        run: |
-          set -euo pipefail
-          # Every pod writes logs/log/<run>/<workflow>/<case>/<host>/<case>.log
-          # on the shared PVC, so prefill, decode and router logs live together.
-          # Stage them first: the failing test step cannot publish step outputs.
-          tc_name="$(basename "${TEST_CASE}")"
-          tc_name="${tc_name%.*}"
-          staged=0
-          for case_dir in /root/.cache/tests/logs/log/*-"${RUN_ID}"-"${RUN_ATTEMPT}"/*/"${tc_name}"; do
-            [ -d "${case_dir}" ] || continue
-            run_dir="$(basename "$(dirname "$(dirname "${case_dir}")")")"
-            workflow_dir="$(basename "$(dirname "${case_dir}")")"
-            dest="pod-logs/${run_dir}/${workflow_dir}/${tc_name}"
-            mkdir -p "$(dirname "${dest}")"
-            cp -a "${case_dir}" "${dest}"
-            staged=$((staged + 1))
-          done
-          echo "Staged ${staged} pod log directory(ies) for ${tc_name}"
-
-      - name: Upload pod logs artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: npu-logs-${{ inputs.test_config_name }}
-          path: pod-logs/*
-          if-no-files-found: ignore
-          retention-days: 3
-          # Logs are text; the highest deflate level shrinks them the most.
+          # The bundle carries text logs now; the highest deflate level shrinks it.
           compression-level: 9
 
       - name: Post process

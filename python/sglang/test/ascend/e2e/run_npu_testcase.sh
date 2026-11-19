@@ -203,6 +203,14 @@ if [ -n "${METRICS_DATA_FILE}" ]; then
     # Archive the test log into the output directory for result collection
     cp "${log_path}/${tc_name}.log" "${METRICS_DATA_FILE}/test_output.log"
     echo "Metrics log saved to ${METRICS_DATA_FILE}/test_output.log"
+    # Keep each pod's log under its own hostname directory so the prefill,
+    # decode and router logs all travel with the metrics artifact instead of
+    # overwriting the shared test_output.log above.
+    node_log_dir="${METRICS_DATA_FILE}/node_logs/${HOSTNAME}"
+    rm -rf "${node_log_dir}"
+    mkdir -p "${node_log_dir}"
+    cp -a "${log_path}/." "${node_log_dir}/"
+    echo "Node log saved to ${node_log_dir}"
 fi
 
 source_plog_path="/root/ascend/log/debug/plog"
