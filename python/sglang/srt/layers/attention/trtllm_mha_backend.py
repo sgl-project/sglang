@@ -55,6 +55,7 @@ from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.layout.paged_view import paged_kv_view
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc, window_write_locs
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import (
@@ -386,6 +387,17 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         # SWA hybrid models split the KV cache into full and SWA pools with
         # separate index spaces; SWA layers need a translated page_table.
         self._swa_kv_pool = resolve_window_kv_pool(model_runner)
+        # --swa-kv-cache-dtype fp8_e4m3: SWA layers read an FP8 sub-pool through
+        # the FP8 path while full-attention layers read native NVFP4.
+        self._fp8_kv_layer_ids = frozenset()
+        if (
+            self.is_nvfp4_kvcache
+            and isinstance(self._swa_kv_pool, SWAKVPool)
+            and self._swa_kv_pool.swa_kv_pool.dtype == torch.float8_e4m3fn
+        ):
+            self._fp8_kv_layer_ids = frozenset(
+                self._swa_kv_pool.swa_kv_pool.model_layer_ids
+            )
         # Raw full->swa index mapping tensor for the fused cuda-graph
         # metadata kernel (gather + // page_size happen on device). The unified
         # pool has no token-level mapping, so this is a static-pool mechanism.
@@ -811,7 +823,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         need Q and K descales in BMM1 and V descale in BMM2. Non-FP8 KV cache
         entries are already in model dtype.
         """
-        if self.data_type != torch.float8_e4m3fn:
+        if (
+            self.data_type != torch.float8_e4m3fn
+            and layer.layer_id not in self._fp8_kv_layer_ids
+        ):
             return layer.scaling, 1.0
 
         k_scale = self._get_scalar_scale(layer, "k_scale_float", "k_scale")
@@ -1208,14 +1223,25 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         return 1
 
     def _should_use_fused_fp8_path(
-        self, save_kv_cache: bool, k: torch.Tensor, forward_batch: ForwardBatch
+        self,
+        save_kv_cache: bool,
+        k: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer: Optional[RadixAttention] = None,
     ) -> bool:
-        """Check if we should use the fused FP8 KV cache write path."""
+        """Check if we should use the fused FP8 KV cache write path.
+
+        True for an FP8 KV cache, and for the FP8 sliding-window layers of an
+        NVFP4 cache (--swa-kv-cache-dtype fp8_e4m3).
+        """
         return (
             not is_cp_active(forward_batch)
             and save_kv_cache
             and k is not None
-            and self.data_type == torch.float8_e4m3fn
+            and (
+                self.data_type == torch.float8_e4m3fn
+                or (layer is not None and layer.layer_id in self._fp8_kv_layer_ids)
+            )
         )
 
     def _fused_fp8_qkv_kv_cache(
@@ -1794,7 +1820,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         """Run forward for decode using TRTLLM MHA kernel."""
 
         use_fused_fp8_path = self._should_use_fused_fp8_path(
-            save_kv_cache, k, forward_batch
+            save_kv_cache, k, forward_batch, layer
         )
         use_fused_qkv = use_fused_fp8_path and not self.is_xqa_impl
 
@@ -1821,14 +1847,19 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     *self._kv_write_scales(layer),
                 )
 
+        layer_fp8 = layer.layer_id in self._fp8_kv_layer_ids
+        layer_nvfp4 = self.is_nvfp4_kvcache and not layer_fp8
+        native_fp4 = (
+            self.decode_uses_native_fp4 and not self.is_xqa_impl and not layer_fp8
+        )
         # For XQA, q_dtype should be bf16. For trtllm-gen,
         # q_dtype should be FP8 when KV is in FP8.
         q_scale = 1.0
-        if self.decode_uses_native_fp4 and not self.is_xqa_impl:
+        if native_fp4:
             # SM100 TRT-LLM GenMHA requires FP8 Q for native NVFP4 KV.
             q = q.to(torch.float8_e4m3fn)
         elif (
-            self.data_type == torch.float8_e4m3fn
+            (self.data_type == torch.float8_e4m3fn or layer_fp8)
             and not self.is_xqa_impl
             and not use_fused_qkv
         ):
@@ -1838,7 +1869,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         else:
             q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
 
-        if self.is_nvfp4_kvcache:
+        if layer_nvfp4:
             kv_cache, kv_cache_block_scales = self._get_nvfp4_decode_kv_cache(layer)
         else:
             k_cache, v_cache = self.kv_layers.read(layer.layer_id).kv()
@@ -1847,7 +1878,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             )
             kv_cache_block_scales = None
 
-        if self.is_nvfp4_kvcache:
+        if layer_nvfp4:
             k_scale, v_scale = self._get_nvfp4_bmm_scales(layer)
             bmm1_scale = q_scale * k_scale * layer.scaling
             bmm2_scale = v_scale
@@ -1856,11 +1887,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         attention_sink = kwargs.get("sinks", None)
 
         page_table = self._get_layer_page_table(layer, forward_batch)
-        native_out = (
-            self._nvfp4_output_view(q)
-            if self.decode_uses_native_fp4 and not self.is_xqa_impl
-            else None
-        )
+        native_out = self._nvfp4_output_view(q) if native_fp4 else None
         o = self._run_fixed_q_len_decode(
             q,
             kv_cache,
@@ -1871,14 +1898,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             window_left=layer.sliding_window_size,
             sinks=attention_sink,
             out=native_out,
-            out_dtype=(
-                None
-                if self.decode_uses_native_fp4 and not self.is_xqa_impl
-                else self.q_data_type
-            ),
+            out_dtype=None if native_fp4 else self.q_data_type,
             kv_cache_sf=kv_cache_block_scales,
         )
-        if self.decode_uses_native_fp4 and not self.is_xqa_impl:
+        if native_fp4:
             o = self._finalize_nvfp4_output(o, forward_batch)
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
@@ -1894,7 +1917,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         **kwargs,
     ):
         cp_active = is_cp_active(forward_batch)
-        uses_native_fp4 = self._forward_extend_uses_native_fp4(forward_batch)
+        layer_fp8 = layer.layer_id in self._fp8_kv_layer_ids
+        uses_native_fp4 = (
+            self._forward_extend_uses_native_fp4(forward_batch) and not layer_fp8
+        )
         if uses_native_fp4 and cp_active:
             raise NotImplementedError(
                 "Native NVFP4 TRT-LLM prefill does not yet support context parallelism."
@@ -1903,7 +1929,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         # The fused path writes rank-local K/V directly to cache. CP needs
         # the strategy to gather K/V into full logical token order first.
         use_fused_fp8_path = self._should_use_fused_fp8_path(
-            save_kv_cache, k, forward_batch
+            save_kv_cache, k, forward_batch, layer
         )
         use_fused_qkv = use_fused_fp8_path and not self.is_xqa_impl
 
@@ -1952,7 +1978,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         if uses_native_fp4:
             q = q.to(torch.float8_e4m3fn)
         elif (
-            self.data_type == torch.float8_e4m3fn
+            (self.data_type == torch.float8_e4m3fn or layer_fp8)
             and (not self.is_xqa_impl or not uses_decode_kernel)
             and not use_fused_qkv
         ):

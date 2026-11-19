@@ -576,5 +576,6 @@ POSITIONAL_FIELD_ORDER = (
     "weight_cache_transport",
     "uniboost_gamma",
     "enable_uniboost_gamma_ada",
+    "swa_kv_cache_dtype",
 )
 # fmt: on

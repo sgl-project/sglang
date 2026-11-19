@@ -45,7 +45,16 @@ def handle_nvfp4_prefill_kv_dequant_dtype(server_args: Any) -> None:
                 "--prefill-kv-cache-dequant-dtype applies only with "
                 "--kv-cache-dtype=nvfp4."
             )
+        if cfg.swa_kv_cache_dtype != "auto":
+            raise ValueError(
+                "--swa-kv-cache-dtype applies only with --kv-cache-dtype=nvfp4."
+            )
         return
+
+    if cfg.swa_kv_cache_dtype != "auto" and cfg.enable_unified_memory:
+        raise ValueError(
+            "--swa-kv-cache-dtype does not support --enable-unified-memory."
+        )
 
     if requested_dtype == "auto":
         explicit_backend = cfg.prefill_attention_backend or cfg.attention_backend
@@ -66,6 +75,11 @@ def handle_nvfp4_prefill_kv_dequant_dtype(server_args: Any) -> None:
         )
 
     target_prefill_backend = _NVFP4_PREFILL_BACKEND[requested_dtype]
+    if cfg.swa_kv_cache_dtype != "auto" and target_prefill_backend != "trtllm_mha":
+        raise ValueError(
+            "--swa-kv-cache-dtype requires the trtllm_mha attention backend "
+            "for both prefill and decode (native NVFP4 prefill)."
+        )
     explicit_prefill_backend = cfg.prefill_attention_backend
     if (
         explicit_prefill_backend is not None

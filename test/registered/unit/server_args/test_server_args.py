@@ -1486,6 +1486,58 @@ class TestKV4Compatibility(unittest.TestCase):
             handle_nvfp4_prefill_kv_dequant_dtype(args)
 
     @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
+    def test_swa_kv_cache_dtype_fp8_accepted_with_native_nvfp4(self):
+        args = self._make_nvfp4_args(swa_kv_cache_dtype="fp8_e4m3")
+        handle_nvfp4_prefill_kv_dequant_dtype(args)
+        self.assertEqual(
+            resolution_result(args, "prefill_attention_backend"), "trtllm_mha"
+        )
+
+    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
+    def test_swa_kv_cache_dtype_fp8_resolves_trtllm_without_backend_flags(self):
+        args = self._make_unrouted_nvfp4_args(swa_kv_cache_dtype="fp8_e4m3")
+        handle_nvfp4_prefill_kv_dequant_dtype(args)
+        self.assertEqual(
+            resolution_result(args, "prefill_attention_backend"), "trtllm_mha"
+        )
+        self.assertEqual(
+            resolution_result(args, "decode_attention_backend"), "trtllm_mha"
+        )
+
+    @override_platform(is_cuda=True, is_sm100=False, is_sm120=True)
+    def test_swa_kv_cache_dtype_rejects_fp8_prefill_workspace(self):
+        args = self._make_unrouted_nvfp4_args(swa_kv_cache_dtype="fp8_e4m3")
+        with self.assertRaisesRegex(ValueError, "requires the trtllm_mha"):
+            handle_nvfp4_prefill_kv_dequant_dtype(args)
+
+    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
+    def test_swa_kv_cache_dtype_rejects_non_nvfp4_storage(self):
+        args = ServerArgs(
+            model_path="dummy",
+            kv_cache_dtype="fp8_e4m3",
+            swa_kv_cache_dtype="fp8_e4m3",
+        )
+        with self.assertRaisesRegex(ValueError, "applies only"):
+            handle_nvfp4_prefill_kv_dequant_dtype(args)
+
+    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
+    def test_swa_kv_cache_dtype_rejects_non_trtllm_prefill(self):
+        args = self._make_nvfp4_args(
+            swa_kv_cache_dtype="fp8_e4m3",
+            prefill_attention_backend="flashinfer",
+        )
+        with self.assertRaisesRegex(ValueError, "requires the trtllm_mha"):
+            handle_nvfp4_prefill_kv_dequant_dtype(args)
+
+    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
+    def test_swa_kv_cache_dtype_rejects_unified_memory(self):
+        args = self._make_nvfp4_args(
+            swa_kv_cache_dtype="fp8_e4m3", enable_unified_memory=True
+        )
+        with self.assertRaisesRegex(ValueError, "unified-memory"):
+            handle_nvfp4_prefill_kv_dequant_dtype(args)
+
+    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
     def test_sm100_native_nvfp4_allows_topk_one_speculative_decoding(self):
         for algorithm in ("EAGLE", "EAGLE3", "NEXTN"):
             for prefill_backend, decode_backend in (
