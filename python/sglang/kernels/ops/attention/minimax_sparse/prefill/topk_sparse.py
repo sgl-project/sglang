@@ -133,7 +133,6 @@ def _gqa_share_sparse_fwd_kernel(
     SUB_K: tl.constexpr,  # CDNA KV sub-tile width (0 = disabled)
     # has sink
     HAS_SINK: tl.constexpr,
-    USE_TMA: tl.constexpr,
     IS_FP8: tl.constexpr,
     HAS_LOC_MAPPING: tl.constexpr,
 ):
@@ -398,7 +397,6 @@ def flash_prefill_with_gqa_share_sparse(
     prefix_lens: torch.Tensor,
     max_seqlen_q: int,
     sm_scale: Optional[float] = None,
-    use_tma: bool = True,
     cu_seqblocks_q: Optional[torch.Tensor] = None,
     max_seqblock_q: Optional[int] = None,
     q_scale: Optional[float] = None,
@@ -493,7 +491,6 @@ def flash_prefill_with_gqa_share_sparse(
         BLOCK_SIZE_Q=BLOCK_SIZE_Q,
         SUB_K=_sparse_subk(BLOCK_SIZE_K),
         BLOCK_SIZE_K=BLOCK_SIZE_K,
-        USE_TMA=use_tma,
         IS_FP8=is_fp8,
     )
     return o

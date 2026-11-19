@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 import triton
@@ -18,6 +18,8 @@ def _table_qk_norm_rope_kernel(
     pos_stride,
     row_stride,
     q_size,
+    k_out_ptr,
+    v_out_ptr,
     NHQ: tl.constexpr,
     NH: tl.constexpr,
     D: tl.constexpr,
@@ -26,9 +28,19 @@ def _table_qk_norm_rope_kernel(
     BF16_TABLE: tl.constexpr,
     MROPE: tl.constexpr,
     HEADS_PER_PROGRAM: tl.constexpr,
+    KV_OUT: tl.constexpr,
 ):
     t = tl.program_id(0).to(tl.int64)
     heads = tl.program_id(1) * HEADS_PER_PROGRAM + tl.arange(0, HEADS_PER_PROGRAM)
+    if KV_OUT:
+        # One head per program; programs past the Q / K heads copy a V head to its own row.
+        NHK: tl.constexpr = NH - NHQ
+        hv = tl.program_id(1) - NH
+        if hv >= 0:
+            d = tl.arange(0, D)
+            v = tl.load(qkv_ptr + t * row_stride + q_size + (NHK + hv) * D + d)
+            tl.store(v_out_ptr + (t * NHK + hv) * D + d, v)
+            return
 
     HALF: tl.constexpr = D // 2
     half_ar = tl.arange(0, HALF)[None, :]
@@ -83,6 +95,9 @@ def _table_qk_norm_rope_kernel(
         # A BF16 table uses triton_mrope_fused's expression, so its codegen matches.
         o1 = x1 * cos - x2 * sin
         o2 = x2 * cos + x1 * sin
+    if KV_OUT:
+        k_row = (k_out_ptr + (t * (NH - NHQ) + heads - NHQ) * D)[:, None]
+        row = tl.where(is_q, row, k_row)
     tl.store(row + half_ar, o1.to(tl.bfloat16), mask=mask)
     tl.store(row + HALF + half_ar, o2.to(tl.bfloat16), mask=mask)
 
@@ -100,6 +115,7 @@ def table_qk_norm_rope_(
     *,
     match_cuda: bool = False,
     axis_map: Optional[torch.Tensor] = None,
+    kv_out: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> None:
     """In-place QK RMSNorm + table-lookup neox RoPE on the fused QKV tensor.
 
@@ -116,6 +132,9 @@ def table_qk_norm_rope_(
     MRoPE passes [3, T] positions and ``MRotaryEmbedding.axis_map``, the axis
     each rotary lane reads its position from. A BF16 table rotates in BF16 to
     match ``triton_mrope_fused``.
+
+    With ``kv_out`` = (k, v), contiguous ``[T, num_k_heads * head_dim]`` each, the normed / roped K and a copy
+    of V are written there instead of into ``qkv`` (not with ``match_cuda``).
     """
     if match_cuda:
         assert head_dim in (64, 128, 256)
@@ -151,7 +170,12 @@ def table_qk_norm_rope_(
         heads_per_program, num_warps = 1, 1
     else:
         heads_per_program, num_warps = 8, 4
-    grid = (T, triton.cdiv(num_heads, heads_per_program))
+    k_out, v_out = kv_out if kv_out is not None else (None, None)
+    if kv_out is not None:
+        assert not match_cuda and heads_per_program == 1
+        grid = (T, num_heads + num_k_heads)
+    else:
+        grid = (T, triton.cdiv(num_heads, heads_per_program))
     _table_qk_norm_rope_kernel[grid](
         qkv,
         q_weight,
@@ -162,6 +186,8 @@ def table_qk_norm_rope_(
         positions.stride(0),
         qkv.stride(0),
         num_q_heads * head_dim,
+        k_out,
+        v_out,
         NHQ=num_q_heads,
         NH=num_heads,
         D=head_dim,
@@ -170,5 +196,6 @@ def table_qk_norm_rope_(
         BF16_TABLE=cos_sin_cache.dtype == torch.bfloat16,
         MROPE=axis_map is not None,
         HEADS_PER_PROGRAM=heads_per_program,
+        KV_OUT=kv_out is not None,
         num_warps=num_warps,
     )
