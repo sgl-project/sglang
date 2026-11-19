@@ -40,6 +40,7 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.hf_transformers import get_rope_config
+from sglang.srt.layers import layernorm_sp
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
@@ -657,7 +658,11 @@ class MiniMaxM3MoE(nn.Module):
                 reduce=sum_post_experts_output,
             )
         if shared_output is not None:
-            final_hidden_states = final_hidden_states + shared_output
+            final_hidden_states = torch.add(
+                final_hidden_states,
+                shared_output,
+                out=layernorm_sp.take_partial_sink(final_hidden_states),
+            )
         return final_hidden_states
 
     def _forward_router_experts(
@@ -1659,7 +1664,9 @@ class MiniMaxM3Attention(nn.Module):
             if self.idx_replica_size > 1:
                 idx_o = idx_o / self.idx_replica_size
             idx_output, _ = self.index_o_proj(idx_o)
-            return output + idx_output
+            return torch.add(
+                output, idx_output, out=layernorm_sp.take_partial_sink(output)
+            )
 
         q, k, v, forward_batch = inner_state
         attn_output = self.attn(q, k, v, forward_batch)
@@ -1767,6 +1774,12 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 parallel_group=mlp_parallel_group,
                 reduce_results=False,
             )
+
+        # A MegaMoE layer (routed experts over EP, replicated shared experts)
+        # returns complete rows for the tokens this rank holds.
+        self.mlp_is_rank_local = (
+            self.is_layer_sparse and get_moe_a2a_backend().is_megamoe()
+        )
 
         self.use_gemma_norm = getattr(config, "use_gemma_norm", False)
         if self.use_gemma_norm:
@@ -1883,10 +1896,11 @@ class MiniMaxM3DecoderLayer(nn.Module):
         )
 
         if _input_rows(hidden_states) != 0:
-            hidden_states = self.self_attn(
-                positions=positions,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
+            hidden_states = _stage_compute(
+                lambda x: self.self_attn(
+                    positions=positions, hidden_states=x, forward_batch=forward_batch
+                ),
+                hidden_states,
             )
 
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
@@ -1894,8 +1908,22 @@ class MiniMaxM3DecoderLayer(nn.Module):
 
         with self.ffn_boundary.exit(forward_batch) as ffn_exit:
             if self.is_layer_sparse or _input_rows(hidden_states) != 0:
-                hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)
+                hidden_states = _stage_compute(
+                    lambda x: self.mlp(x, forward_batch=forward_batch),
+                    hidden_states,
+                    rank_local=self.mlp_is_rank_local,
+                )
         return ffn_exit.finish(hidden_states)
+
+
+def _stage_compute(compute, hidden_states: torch.Tensor, *, rank_local: bool = False):
+    if not get_forward().sp_active:
+        return compute(hidden_states)
+    if rank_local:
+        # The stage completes this rank's rows itself: nothing to gather or reduce.
+        with get_forward().scoped(sp_active=False):
+            return compute(hidden_states)
+    return layernorm_sp.sp_gathered_compute(compute, hidden_states)
 
 
 class MiniMaxM3Model(nn.Module):
@@ -2172,6 +2200,11 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
+        aux_hidden_states = layernorm_sp.maybe_gather_aux_hidden_states(
+            aux_hidden_states,
+            input_ids=input_ids,
+            forward_mode=forward_batch.forward_mode,
+        )
 
         if self.pp_group.is_last_rank:
             return self.logits_processor(

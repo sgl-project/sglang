@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 
 from sglang.srt.hf_transformers import get_rope_config
+from sglang.srt.layers import layernorm_sp
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.utils import (
     get_moe_a2a_backend,
@@ -318,6 +319,11 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
         aux_hidden_states = None
         if self.capture_aux_hidden_states and isinstance(hidden_states, tuple):
             hidden_states, aux_hidden_states = hidden_states
+        aux_hidden_states = layernorm_sp.maybe_gather_aux_hidden_states(
+            aux_hidden_states,
+            input_ids=input_ids,
+            forward_mode=forward_batch.forward_mode,
+        )
 
         if self.pp_group.is_last_rank and not get_embedding:
             return self.logits_processor(

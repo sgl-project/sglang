@@ -453,6 +453,14 @@ class StageBoundary:
                 else:
                     capture(value + previous, owned=True)
         hidden_states, steps = self._select(hidden_states, forward_batch)
+        if get_forward().sp_active and not (
+            quant_format == MXFP8_SWIZZLED
+            and layernorm_sp.sp_gathers_mxfp8(hidden_states.shape[0])
+        ):
+            # The SP compute all-gathers a bf16 shard unless it can gather the
+            # MXFP8 one; set only once _select has opened the region on the
+            # stack's first stage.
+            quant_format = ""
         if quant_format == MXFP8_SWIZZLED and not reads_quantized(steps.entry):
             # The 128x4 scale layout does not survive a row gather.
             quant_format = ""
