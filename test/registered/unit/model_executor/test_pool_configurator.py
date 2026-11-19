@@ -1351,6 +1351,124 @@ class TestEagleConfigurator(CustomTestCase):
                         ),
                     )
 
+    def test_pd_sparse_best_effort_sets_the_running_limit(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
+            get_sparse_kv_budget,
+        )
+        from sglang.srt.mem_cache.allocation_sizing import (
+            get_req_to_token_extra_context_len,
+        )
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+
+        page_size, token_limit = 128, 8192
+        decode_reserve = 512
+        min_tokens = page_size + decode_reserve
+        requested_rows, extra_rows = 4, 3
+        mr = _make_model_runner(
+            self,
+            num_layers=4,
+            use_mla_backend=True,
+            page_size=page_size,
+            max_running_requests=requested_rows,
+            disaggregation_mode="decode",
+            disaggregation_decode_extra_slots=extra_rows,
+            speculative_algorithm="EAGLE",
+            speculative_num_steps=2,
+            speculative_num_draft_tokens=3,
+            speculative_eagle_topk=1,
+        )
+        _configure_dsa_model(mr)
+        mr.kv_cache_dtype = torch.bfloat16
+        mr.spec_algorithm.is_eagle.return_value = True
+        mr.spec_algorithm.is_none.return_value = False
+        mr.spec_aux_config.eagle_draft_num_layers = 1
+        mr.config_from_budget.side_effect = lambda budget: (
+            KVCacheConfigurator.config_from_budget(mr, budget)
+        )
+        mr._apply_token_constraints.side_effect = lambda tokens: (
+            KVCacheConfigurator._apply_token_constraints(mr, tokens)
+        )
+        mr.resolve_max_num_reqs.side_effect = lambda tokens: (
+            KVCacheConfigurator.resolve_max_num_reqs(mr, tokens)
+        )
+
+        with (
+            get_context().override_server_args(
+                attention_backend="ascend",
+                disaggregation_transfer_backend="ascend",
+                max_total_tokens=token_limit,
+                num_reserved_decode_tokens=decode_reserve,
+            ),
+            envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.override(True),
+            envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.override(True),
+            envs.SGLANG_NPU_SPARSE_KV_CACHE_SIZE.override(8192),
+            envs.SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB.override(0),
+            patch(
+                "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.is_npu",
+                return_value=True,
+            ),
+            patch("sglang.srt.model_executor.pool_configurator._is_npu", True),
+            patch(
+                "sglang.srt.hardware_backend.npu.utils.is_npu_arch35",
+                return_value=False,
+            ),
+            mock_cpu_env(),
+        ):
+            # Target and draft index-K, plus the draft's native MLA payload.
+            native_bytes_per_token = 5 * 128 * 2 + 576 * 2
+
+            def budget_for(rows, tokens):
+                plan = get_sparse_kv_budget(
+                    model_config=mr.model_config,
+                    request_rows=rows + extra_rows + 1,
+                    resident_rows=rows + 1,
+                    context_len=8192 + get_req_to_token_extra_context_len(),
+                    num_layers=4,
+                    top_k=2048,
+                    kv_bytes_per_token=576 * 2,
+                )
+                request_bytes = plan.request_rows * plan.context_len * 4
+                return (
+                    plan.managed_hbm_bytes
+                    + request_bytes
+                    + (tokens + page_size) * native_bytes_per_token
+                )
+
+            for rows, tokens in (
+                (requested_rows, token_limit),
+                (2, token_limit),
+                (1, min_tokens),
+            ):
+                with self.subTest(rows=rows, tokens=tokens):
+                    mr.sparse_kv_budget_plan = None
+                    mr.sparse_kv_budget_finalized = False
+                    mr._profile_available_bytes.return_value = budget_for(rows, tokens)
+                    with self.assertLogs(
+                        "sglang.srt.mem_cache.kv_cache_configurator", level="INFO"
+                    ) as logs:
+                        sizes = KVCacheConfigurator._resolve_memory_pool_config(
+                            mr, pre_model_load_memory=0
+                        )
+                    self.assertEqual(sizes.max_running_requests, rows)
+                    self.assertEqual(sizes.max_total_num_tokens, tokens)
+                    self.assertEqual(mr.sparse_kv_budget_plan.resident_rows, rows + 1)
+                    self.assertEqual(
+                        mr.sparse_kv_budget_plan.request_rows, rows + extra_rows + 1
+                    )
+                    self.assertIn(
+                        f"requested_bs={requested_rows} effective_bs={rows}",
+                        "\n".join(logs.output),
+                    )
+
+            mr.sparse_kv_budget_plan = None
+            mr.sparse_kv_budget_finalized = False
+            mr._profile_available_bytes.return_value = budget_for(1, min_tokens) - 1
+            with self.assertRaisesRegex(RuntimeError, "one sparse KV resident row"):
+                KVCacheConfigurator._resolve_memory_pool_config(
+                    mr, pre_model_load_memory=0
+                )
+
     def test_eagle_does_not_exceed_budget(self):
         """Total memory (target + draft KV cache) must not exceed available."""
         available = 10_000_000

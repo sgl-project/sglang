@@ -3204,8 +3204,30 @@ class KVCacheConfigurator:
         config.max_running_requests = self.resolve_max_num_reqs(
             config.max_total_num_tokens
         )
+        budget = (
+            self.sparse_kv_budget_plan
+            if get_disagg().disaggregation_mode == "decode"
+            else None
+        )
+        if budget is not None:
+            config.max_running_requests = min(
+                config.max_running_requests, budget.resident_rows - 1
+            )
         configurator = create_memory_pool_configurator(self)
         config = configurator.finalize_with_max_running_requests(config)
+        if budget is not None:
+            requested_per_worker = max(
+                1, get_schedule().max_running_requests // self.attn_dp_size
+            )
+            logger.info(
+                "Sparse KV Decode capacity per worker: requested_bs=%d effective_bs=%d "
+                "native_token_capacity=%d request_rows=%d C=%d",
+                requested_per_worker,
+                config.max_running_requests,
+                config.max_total_num_tokens,
+                budget.request_rows,
+                budget.cache_tokens,
+            )
         config.mem_fraction_static = get_schedule().mem_fraction_static
         return config
 

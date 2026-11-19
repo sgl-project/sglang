@@ -183,6 +183,9 @@ class FusedSparseKVCacheManager:
             self._install_req_alloc_hook(req_to_token_pool)
         else:
             self._clear_resident_rows()
+            req_to_token_pool.available_sparse_resident_rows = (
+                self._available_resident_rows
+            )
             req_to_token_pool.admit_sparse_resident_rows = self._admit_resident_rows
             req_to_token_pool.release_sparse_resident_row = self._release_resident_row
             req_to_token_pool.clear_sparse_resident_rows = self._clear_resident_rows
@@ -234,6 +237,9 @@ class FusedSparseKVCacheManager:
     def _clear_resident_rows(self) -> None:
         self._resident_rows_by_request = [0] * self.size
         self._free_resident_rows = list(range(self.budget.resident_rows - 1, 0, -1))
+
+    def _available_resident_rows(self) -> int:
+        return len(self._free_resident_rows)
 
     def _release_resident_row(self, req_id: int) -> None:
         resident_id = self._resident_rows_by_request[req_id]

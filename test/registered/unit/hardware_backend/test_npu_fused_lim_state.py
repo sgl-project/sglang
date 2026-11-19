@@ -428,7 +428,9 @@ class TestLIMState(CustomTestCase):
         request_ids = [5, 4] if compact_pd else [1, 2]
         if compact_pd:
             self.assertEqual(manager.request_to_resident.tolist(), [0] * 6)
+            self.assertEqual(req_pool.available_sparse_resident_rows(), 2)
             req_pool.admit_sparse_resident_rows(request_ids)
+            self.assertEqual(req_pool.available_sparse_resident_rows(), 0)
             self.assertEqual(manager.request_to_resident.tolist(), [0, 0, 0, 0, 2, 1])
 
         self.assertIs(manager.budget, plan)
@@ -602,8 +604,11 @@ class TestLIMState(CustomTestCase):
             req_pool.release_sparse_resident_row(
                 1
             )  # Transfer aborted before admission.
+            self.assertEqual(req_pool.available_sparse_resident_rows(), 0)
             req_pool.release_sparse_resident_row(5)
+            self.assertEqual(req_pool.available_sparse_resident_rows(), 1)
             req_pool.admit_sparse_resident_rows([3])
+            self.assertEqual(req_pool.available_sparse_resident_rows(), 0)
             self.assertEqual(manager.request_to_resident.tolist(), [0, 0, 0, 1, 2, 0])
             self.assertTrue(manager.device_slot_map[0][1].eq(-1).all())
             self.assertTrue(adapter.last_prefix[:, 1].eq(-1).all())

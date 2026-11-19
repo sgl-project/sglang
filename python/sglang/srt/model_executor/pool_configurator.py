@@ -131,6 +131,9 @@ class MemoryPoolConfig:
 
 
 if TYPE_CHECKING:
+    from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_budget import (
+        BudgetPlan,
+    )
     from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 
 logger = logging.getLogger(__name__)
@@ -254,6 +257,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
     def __init__(self, kvc: KVCacheConfigurator):
         self._sparse_budget = None
+        self._pd_sparse_decode = False
         self._kvc = kvc
         self.kv_cache_dtype_str = kvc.kv_cache_dtype_str
         dcp_size = get_parallel().attn_dcp_size
@@ -308,8 +312,14 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 # The variable-sized native pool contains only indexer KV. The
                 # separate sparse manager is allocated later by AscendAttnBackend
                 # and must be charged before that indexer pool fills HBM.
-                if kvc.sparse_kv_budget_plan is None:
-                    disagg = get_disagg()
+                disagg = get_disagg()
+                self._pd_sparse_decode = (
+                    disagg.disaggregation_mode == "decode"
+                    and not disagg.enable_pd_role_switch
+                )
+                if kvc.sparse_kv_budget_plan is None or (
+                    self._pd_sparse_decode and not kvc.sparse_kv_budget_finalized
+                ):
                     extra_rows = (
                         disagg.disaggregation_decode_extra_slots or 0
                         if disagg.disaggregation_mode == "decode"
@@ -324,9 +334,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         request_rows=max_running_requests_per_worker + extra_rows + 1,
                         resident_rows=(
                             max_running_requests_per_worker + 1
-                            if disagg.disaggregation_mode == "decode"
-                            and not disagg.enable_pd_role_switch
-                            and extra_rows > 0
+                            if self._pd_sparse_decode
                             else max_running_requests_per_worker + extra_rows + 1
                         ),
                         context_len=kvc.model_config.context_len
@@ -339,12 +347,18 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                             + kvc.model_config.qk_rope_head_dim
                         )
                         * torch._utils._element_size(kvc.kv_cache_dtype),
-                    )
-                    kvc.sparse_kv_budget_plan = get_sparse_kv_budget(
                         num_layers=num_layers,
                         kv_dtype=kvc.kv_cache_dtype,
-                        **budget_options,
                     )
+                    if self._pd_sparse_decode:
+                        # The ceiling is a candidate, so enforce the HBM limit
+                        # when fitting the final row count.
+                        budget_options["hbm_budget_bytes"] = 0
+                        self._pd_sparse_budget_options = budget_options
+                    if kvc.sparse_kv_budget_plan is None:
+                        kvc.sparse_kv_budget_plan = get_sparse_kv_budget(
+                            **budget_options
+                        )
                 budget = kvc.sparse_kv_budget_plan
                 self._sparse_budget = budget
                 self._sparse_min_tokens = get_schedule().max_total_tokens or max(
@@ -793,29 +807,126 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             indexer_size_per_token * num_indexer_layers * element_size * indexer_ratio
         )
 
+    def _pd_sparse_extra_hbm_bytes(self, budget: BudgetPlan, page_size: int) -> int:
+        # The request table and the native pools' padding pages are outside
+        # the manager's buffer plan. The table is bounded by the aligned context.
+        return (
+            budget.request_rows * budget.context_len * torch.int32.itemsize
+            + page_size * self._cell_size
+        )
+
+    def _fit_pd_sparse_budget(
+        self, requested: BudgetPlan, available_bytes: int, page_size: int
+    ) -> BudgetPlan:
+        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
+            get_sparse_kv_budget,
+        )
+
+        requested_rows = requested.resident_rows - 1
+        extra_rows = requested.request_rows - requested.resident_rows
+        hbm_limit = envs.SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB.get() * 1024**2
+        token_limit = get_schedule().max_total_tokens
+        # Preallocation needs at least one prompt page plus the per-request
+        # decode reservation, even when the native token pool is empty.
+        min_tokens = ceil_align(
+            max(2, page_size + get_disagg().num_reserved_decode_tokens), page_size
+        )
+        max_rows = requested_rows
+        if token_limit is None:
+            preferred_tokens = ceil_align(self._sparse_min_tokens, page_size)
+        else:
+            preferred_tokens = token_limit // page_size * page_size
+            max_rows = min(max_rows, preferred_tokens // 2)
+            if preferred_tokens < min_tokens:
+                max_rows = 0
+
+        def plan_for(rows: int) -> BudgetPlan:
+            if rows == requested_rows:
+                return requested
+            return get_sparse_kv_budget(
+                **(
+                    self._pd_sparse_budget_options
+                    | {
+                        "request_rows": rows + extra_rows + 1,
+                        "resident_rows": rows + 1,
+                    }
+                )
+            )
+
+        def required_bytes(plan: BudgetPlan, native_tokens: int) -> int:
+            return (
+                plan.managed_hbm_bytes
+                + self._pd_sparse_extra_hbm_bytes(plan, page_size)
+                + native_tokens * self._cell_size
+            )
+
+        def exceeds_budget(plan: BudgetPlan, native_tokens: int) -> bool:
+            return (
+                hbm_limit != 0 and plan.managed_hbm_bytes > hbm_limit
+            ) or required_bytes(plan, native_tokens) > available_bytes
+
+        def exceeds_preferred_budget(rows: int) -> bool:
+            native_tokens = max(
+                preferred_tokens, min_tokens, ceil_align(2 * rows, page_size)
+            )
+            return exceeds_budget(plan_for(rows), native_tokens)
+
+        # Buffer sizes are nondecreasing in the row count, including the graph
+        # and eager scratch rounded to their batch alignment.
+        fitting_rows = bisect_right(
+            range(1, max_rows + 1), False, key=exceeds_preferred_budget
+        )
+        if fitting_rows:
+            return plan_for(fitting_rows)
+
+        # Preserve the largest native token pool possible with one resident
+        # row when even that row cannot coexist with the preferred token count.
+        one_row = plan_for(1)
+        if max_rows < 1 or exceeds_budget(one_row, min_tokens):
+            raise RuntimeError(
+                "Not enough memory for one sparse KV resident row and a native "
+                f"token pool: need {required_bytes(one_row, min_tokens)} bytes "
+                f"for {min_tokens} native tokens, have {available_bytes} bytes "
+                f"(manager needs {one_row.managed_hbm_bytes} bytes, "
+                f"manager HBM limit={hbm_limit or 'unset'}, "
+                f"max_total_tokens={token_limit})."
+            )
+        return one_row
+
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
         budget = self._sparse_budget
         if budget is not None and not self._kvc.sparse_kv_budget_finalized:
-            min_tokens = (
-                (self._sparse_min_tokens + page_size - 1) // page_size * page_size
-            )
-            required = self._fixed_overhead_bytes + min_tokens * self._cell_size
-            if budget.prefill_workspace_tokens and required > available_bytes:
-                logger.warning(
-                    "Disabling sparse prefill workspace (%d tokens): "
-                    "fixed allocations and %d native tokens require %d bytes, "
-                    "but only %d bytes are available.",
-                    budget.prefill_workspace_tokens,
-                    min_tokens,
-                    required,
-                    available_bytes,
+            if self._pd_sparse_decode:
+                fixed_without_manager = (
+                    self._fixed_overhead_bytes - budget.managed_hbm_bytes
                 )
-                self._fixed_overhead_bytes -= budget.prefill_workspace_bytes
-                self._sparse_budget = budget.without_prefill_workspace()
-                self._kvc.sparse_kv_budget_plan = self._sparse_budget
+                budget = self._fit_pd_sparse_budget(
+                    budget, available_bytes - fixed_without_manager, page_size
+                )
+                self._fixed_overhead_bytes = (
+                    fixed_without_manager + budget.managed_hbm_bytes
+                )
+            elif budget.prefill_workspace_tokens:
+                min_tokens = ceil_align(self._sparse_min_tokens, page_size)
+                required = self._fixed_overhead_bytes + min_tokens * self._cell_size
+                if required > available_bytes:
+                    logger.warning(
+                        "Disabling sparse prefill workspace (%d tokens): "
+                        "fixed allocations and %d native tokens require %d bytes, "
+                        "but only %d bytes are available.",
+                        budget.prefill_workspace_tokens,
+                        min_tokens,
+                        required,
+                        available_bytes,
+                    )
+                    self._fixed_overhead_bytes -= budget.prefill_workspace_bytes
+                    budget = budget.without_prefill_workspace()
+            self._sparse_budget = self._kvc.sparse_kv_budget_plan = budget
             self._kvc.sparse_kv_budget_finalized = True
+        if budget is not None and self._pd_sparse_decode:
+            available_bytes -= self._pd_sparse_extra_hbm_bytes(budget, page_size)
         available_bytes = max(available_bytes - self._fixed_overhead_bytes, 0)
         max_total_num_tokens = (
             available_bytes // self._cell_size

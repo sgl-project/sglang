@@ -185,6 +185,7 @@ def get_sparse_kv_budget(
     graph_batch_capacity: Optional[int] = None,
     resident_rows: Optional[int] = None,
     kv_dtype: torch.dtype = torch.bfloat16,
+    hbm_budget_bytes: Optional[int] = None,
 ) -> BudgetPlan:
     resident_rows = request_rows if resident_rows is None else resident_rows
     query_heads = model_config.num_attention_heads // get_parallel().attn_tp_size
@@ -209,6 +210,8 @@ def get_sparse_kv_budget(
             graph_batch_capacity = get_cuda_graph_max_batch_size(resident_rows)
             if decode is not None and decode.bs:
                 graph_batch_capacity = min(max(decode.bs), graph_batch_capacity)
+    if hbm_budget_bytes is None:
+        hbm_budget_bytes = envs.SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB.get() * 1024**2
     return resolve_sparse_kv_budget(
         model_config=model_config,
         page_size=page_size,
@@ -219,7 +222,7 @@ def get_sparse_kv_budget(
         top_k=top_k,
         kv_bytes_per_token=kv_bytes_per_token,
         cache_tokens=envs.SGLANG_NPU_SPARSE_KV_CACHE_SIZE.get(),
-        hbm_budget_bytes=envs.SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB.get() * 1024**2,
+        hbm_budget_bytes=hbm_budget_bytes,
         kv_dtype=kv_dtype,
         prefill_workspace_tokens=prefill_rows * aligned_context,
         max_query_width=get_sparse_kv_max_query_width(),

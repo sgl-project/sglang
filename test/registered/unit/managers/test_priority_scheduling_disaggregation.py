@@ -1009,7 +1009,9 @@ class TestDecodePrebuilt(unittest.TestCase):
         scheduler.enable_priority_scheduling = False
         scheduler.running_batch = MagicMock()
         scheduler.running_batch.batch_size.return_value = 0
-        scheduler.req_to_token_pool = MagicMock(size=1)
+        scheduler.req_to_token_pool = MagicMock(
+            size=1, available_sparse_resident_rows=None
+        )
         scheduler.token_to_kv_pool_allocator = MagicMock()
         scheduler.tree_cache = MagicMock()
         scheduler.model_config = MagicMock()
@@ -1059,6 +1061,36 @@ class TestDecodePrebuilt(unittest.TestCase):
         selected_reqs = init_new.call_args.args[0]
         self.assertEqual([req.rid for req in selected_reqs], ["high"])
         self.assertEqual([req.rid for req in scheduler.waiting_queue], ["low"])
+
+    def test_prebuilt_waits_for_a_free_sparse_resident_row(self):
+        scheduler = self._new_scheduler(enable_overlap=False)
+        scheduler.req_to_token_pool.size = scheduler.max_running_requests = 2
+        first, second = (MagicMock(rid=rid) for rid in ("first", "second"))
+        for req in (first, second):
+            req.kv.restore_done_event = None
+        scheduler.waiting_queue.join([first, second])
+        available = MagicMock(return_value=0)
+        scheduler.req_to_token_pool.available_sparse_resident_rows = available
+
+        with (
+            patch(
+                "sglang.srt.disaggregation.decode.ScheduleBatch.init_new"
+            ) as init_new,
+            get_context().override_server_args(
+                disaggregation_decode_enable_radix_cache=False
+            ),
+        ):
+            select = SchedulerDisaggregationDecodeMixin._get_new_prebuilt_batch
+            self.assertIsNone(select(scheduler, scheduler.running_batch))
+            self.assertEqual(list(scheduler.waiting_queue), [first, second])
+            init_new.assert_not_called()
+
+            available.return_value = 1
+            self.assertIs(
+                select(scheduler, scheduler.running_batch), init_new.return_value
+            )
+            self.assertEqual(init_new.call_args.args[0], [first])
+            self.assertEqual(list(scheduler.waiting_queue), [second])
 
     def test_overlap_waits_for_forward_before_processing_prebuilt(self):
         scheduler = self._new_scheduler(enable_overlap=True)

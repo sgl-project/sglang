@@ -223,6 +223,7 @@ class DecodeReqToTokenPool:
 
     # Mirrors ReqToTokenPool.register_on_alloc_rows.
     _on_alloc_rows: Optional[Callable[[List[int]], None]] = None
+    available_sparse_resident_rows: Optional[Callable[[], int]] = None
     admit_sparse_resident_rows: Optional[Callable[[List[int]], None]] = None
     release_sparse_resident_row: Optional[Callable[[int], None]] = None
     clear_sparse_resident_rows: Optional[Callable[[], None]] = None
@@ -4050,13 +4051,20 @@ class SchedulerDisaggregationDecodeMixin:
         batch_size = min(self.req_to_token_pool.size, self.max_running_requests)
 
         num_not_used_batch = batch_size - curr_batch_size
+        available_resident_rows = getattr(
+            self.req_to_token_pool, "available_sparse_resident_rows", None
+        )
+        if available_resident_rows is not None:
+            # P/D may finish receiving KV while all resident rows are in use.
+            num_not_used_batch = min(num_not_used_batch, available_resident_rows())
+        if num_not_used_batch <= 0:
+            return None
 
         # pop req from waiting queue
         can_run_list: List[Req] = []
 
         for req in self.waiting_queue:
-            # we can only add at least `num_not_used_batch` new batch to the running queue;
-            # a request restored from host memory waits until its copy has finished
+            # A request restored from host memory waits until its copy has finished.
             if len(can_run_list) < num_not_used_batch and (
                 not host_restore
                 or req.kv.restore_done_event is None
