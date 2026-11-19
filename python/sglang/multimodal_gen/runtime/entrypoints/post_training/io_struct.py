@@ -87,6 +87,8 @@ class RolloutRequest(BaseModel):
     rollout_debug_mode: bool = True
 
     rollout_return_denoising_env: bool = False
+    # put the negative cond in denoising_env even when the request runs no CFG
+    rollout_return_neg_cond_kwargs: bool = False
     rollout_return_dit_trajectory: bool = False
     # The latents, debug and cond tensors and the generated output go to the server's output store;
     # the response carries the ref.

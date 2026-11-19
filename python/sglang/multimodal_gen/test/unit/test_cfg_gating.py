@@ -166,6 +166,12 @@ class TestCFGGating(unittest.TestCase):
         self.assertFalse(ctx.extra["cfg_gate_state"]["active"])
         self.assertEqual(ctx.extra["cfg_gate_state"]["gate_step"], 11)
 
+    def test_negative_cond_without_cfg_runs_one_branch(self):
+        """A rollout that only returns the negative cond must sample as without it."""
+        batch = SimpleNamespace(do_classifier_free_guidance=False)
+        policy = CFGPolicy().build(batch, {}, {"pos": 1}, {"neg": 2})
+        self.assertEqual([branch.name for branch in policy.branches], ["conditional"])
+
     def test_rejects_invalid_gate_fraction(self):
         stage = DenoisingStage.__new__(DenoisingStage)
         ctx = SimpleNamespace(timesteps=torch.arange(10), extra={}, is_warmup=True)
