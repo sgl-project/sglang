@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import logging
 from array import array
 from typing import Iterable, List, Optional, Tuple, Union
 
@@ -46,7 +47,8 @@ from sglang.srt.multimodal.mm_utils import run_dp_sharded_vision_model
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import get_mm
 from sglang.srt.utils import is_cuda
-from sglang.utils import logger
+
+logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
 
@@ -419,29 +421,6 @@ class InternVisionModel(PreTrainedModel):
             config,
         )
         self.encoder = InternVisionEncoder(config, quant_config, use_data_parallel)
-
-    def resize_pos_embeddings(self, old_size, new_size, patch_size):
-        pos_emb = self.embeddings.position_embedding
-        _, num_positions, embed_dim = pos_emb.shape
-        cls_emb = pos_emb[:, :1, :]
-        pos_emb = (
-            pos_emb[:, 1:, :]
-            .reshape(1, old_size // patch_size, old_size // patch_size, -1)
-            .permute(0, 3, 1, 2)
-        )
-        pos_emb = F.interpolate(
-            pos_emb.float(),
-            size=new_size // patch_size,
-            mode="bicubic",
-            align_corners=False,
-        )
-        pos_emb = pos_emb.to(cls_emb.dtype).reshape(1, embed_dim, -1).permute(0, 2, 1)
-        pos_emb = torch.cat([cls_emb, pos_emb], dim=1)
-        self.embeddings.position_embedding = nn.Parameter(pos_emb)
-        self.embeddings.image_size = new_size
-        logger.info(
-            "Resized position embeddings from {} to {}".format(old_size, new_size)
-        )
 
     def get_input_embeddings(self):
         return self.embeddings

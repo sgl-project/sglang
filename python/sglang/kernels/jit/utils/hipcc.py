@@ -58,7 +58,6 @@ class HipKernel:
         )
 
     def launch(self, grid, args, stream, block=256, shared=0):
-        grid_x, grid_y = grid if isinstance(grid, tuple) else (grid, 1)
         size = ctypes.c_size_t(ctypes.sizeof(args))
         extra = (ctypes.c_void_p * 5)(
             1,
@@ -70,8 +69,8 @@ class HipKernel:
         check_hip(
             hip_lib().hipModuleLaunchKernel(
                 self.fn,
-                grid_x,
-                grid_y,
+                grid,
+                1,
                 1,
                 block,
                 1,
@@ -90,13 +89,18 @@ def hipcc_path():
 
 
 def build_gfx950_module(src: str, prefix: str) -> ctypes.c_void_p:
-    """Compile ``src`` for gfx950 with hipcc into a fresh temp dir and load it.
+    """Compile ``src`` for gfx950 with hipcc into a fresh temp dir and load it."""
+    return build_hip_module(src, prefix, "gfx950")
+
+
+def build_hip_module(src: str, prefix: str, arch: str) -> ctypes.c_void_p:
+    """Compile ``src`` for ``arch`` (e.g. gfx942) with hipcc into a fresh temp dir and load it.
 
     Raises OSError / subprocess.CalledProcessError (with text stderr) when hipcc
     fails, and RuntimeError when the code object does not load.
     """
     co = os.path.join(tempfile.mkdtemp(prefix=prefix), "k.co")
-    cmd = [hipcc_path(), "--genco", "--offload-arch=gfx950", "-O3", "-o", co, src]
+    cmd = [hipcc_path(), "--genco", f"--offload-arch={arch}", "-O3", "-o", co, src]
     subprocess.run(cmd, check=True, capture_output=True, text=True)
     mod = ctypes.c_void_p()
     check_hip(hip_lib().hipModuleLoad(ctypes.byref(mod), co.encode()), "hipModuleLoad")

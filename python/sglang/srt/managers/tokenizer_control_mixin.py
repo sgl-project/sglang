@@ -59,6 +59,8 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     PdRoleSwitchReqInput,
     PdRoleSwitchReqOutput,
+    PluginWeightUpdateReqInput,
+    PluginWeightUpdateReqOutput,
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
@@ -100,8 +102,8 @@ from sglang.srt.utils import (
     get_bool_env_var,
     normalize_serialized_named_tensor_payloads,
 )
+from sglang.srt.utils.common import TypeBasedDispatcher
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
-from sglang.utils import TypeBasedDispatcher
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -143,6 +145,7 @@ _COMMUNICATOR_SPECS = [
     ("expert_distribution", ExpertDistributionReqOutput),
     ("begin_weight_update", BeginWeightUpdateReqOutput),
     ("end_weight_update", EndWeightUpdateReqOutput),
+    ("plugin_weight_update", PluginWeightUpdateReqOutput),
     ("update_lora_adapter", LoRAUpdateOutput),
     ("dumper_control", DumperControlReqOutput),
     ("scale_elastic_ep", ScaleElasticEPReqOutput),
@@ -474,6 +477,12 @@ class TokenizerControlMixin:
     async def _weight_update_session_call(
         self: TokenizerManager, communicator, obj
     ) -> Tuple[bool, str]:
+        results = await self._weight_update_session_replies(communicator, obj)
+        return FanOutCommunicator.merge_results(results)
+
+    async def _weight_update_session_replies(
+        self: TokenizerManager, communicator, obj
+    ) -> list:
         self.auto_create_handle_loop()
         async with self.is_pause_cond:
             is_paused = self.is_pause
@@ -483,7 +492,7 @@ class TokenizerControlMixin:
         if not is_paused:
             async with self.model_update_lock.writer_lock:
                 results = await communicator(obj)
-        return FanOutCommunicator.merge_results(results)
+        return results
 
     async def begin_weight_update(
         self: TokenizerManager,
@@ -503,12 +512,36 @@ class TokenizerControlMixin:
             self.end_weight_update_communicator, obj
         )
 
+    async def plugin_weight_update(
+        self: TokenizerManager,
+        obj: PluginWeightUpdateReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> PluginWeightUpdateReqOutput:
+        self.auto_create_handle_loop()
+        assert get_parallel().dp_size == 1, (
+            "data-parallel replicas are not supported for plugin weight updates"
+        )
+
+        if obj.abort_all_requests:
+            self.abort_request(abort_all=True)
+
+        # one reply per attention-DP leader, as for update_weights_from_distributed
+        reply = PluginWeightUpdateReqOutput.merged(
+            await self._weight_update_session_replies(
+                self.plugin_weight_update_communicator, obj
+            )
+        )
+        if reply.success and obj.flush_cache and self.mm_processor is not None:
+            self.mm_processor.clear_preprocess_cache()
+        if reply.success and obj.weight_version is not None:
+            self._update_weight_version_if_provided(obj.weight_version)
+        return reply
+
     async def update_weights_from_distributed(
         self: TokenizerManager,
         obj: UpdateWeightsFromDistributedReqInput,
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
-        self.auto_create_handle_loop()
         assert get_parallel().dp_size == 1, (
             "data-parallel replicas are not supported for update weights from distributed"
         )
@@ -516,17 +549,9 @@ class TokenizerControlMixin:
         if obj.abort_all_requests:
             self.abort_request(abort_all=True)
 
-        # Hold is_pause_cond while updating to prevent unpause from racing.
-        async with self.is_pause_cond:
-            is_paused = self.is_pause
-            if is_paused:
-                results = await self.update_weights_from_distributed_communicator(obj)
-
-        if not is_paused:
-            async with self.model_update_lock.writer_lock:
-                results = await self.update_weights_from_distributed_communicator(obj)
-
-        success, message = FanOutCommunicator.merge_results(results)
+        success, message = await self._weight_update_session_call(
+            self.update_weights_from_distributed_communicator, obj
+        )
         if success and obj.flush_cache and self.mm_processor is not None:
             self.mm_processor.clear_preprocess_cache()
         if success and obj.weight_version is not None:
@@ -880,7 +905,10 @@ class TokenizerControlMixin:
         request: Optional[fastapi.Request] = None,
     ):
         self.auto_create_handle_loop()
-        await self.release_memory_occupation_communicator(obj)
+        results = await self.release_memory_occupation_communicator(obj)
+        success, message = FanOutCommunicator.merge_results(results)
+        if not success:
+            raise RuntimeError(message)
 
     async def resume_memory_occupation(
         self: TokenizerManager,

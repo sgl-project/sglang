@@ -5,15 +5,15 @@ A name is ``None`` where the platform has no kernel for it.
 
 import torch
 
-from sglang.srt.utils import is_cuda, is_musa, is_npu
+from sglang.srt.utils import is_cuda, is_gfx95_supported, is_hip, is_musa, is_npu
 
 
 def _with_zero_draft_probs(kernel):
     """Adapt a kernel that still takes ``draft_probs`` to the CUDA/MUSA signature.
 
     The CUDA and MUSA kernels mask the tokens rejected at the last accepted node
-    themselves. The NPU kernel still takes a zeroed ``draft_probs`` scratch
-    buffer, so it is allocated here for that kernel only.
+    themselves. The NPU kernel and the ROCm Triton port still take a zeroed
+    ``draft_probs`` scratch buffer, so it is allocated here for those kernels only.
     """
 
     def tree_speculative_sampling_target_only(*, target_probs, **kwargs):
@@ -49,6 +49,16 @@ else:
     if is_cuda():
         from sglang.kernels.ops.speculative.sampling import (
             tree_speculative_sampling_target_only,
+        )
+    elif is_hip() and is_gfx95_supported():
+        # Triton port of the CUDA kernel above, with the same results. It still
+        # takes a draft_probs buffer, so it gets the zeroed one.
+        from sglang.kernels.ops.speculative.target_only_sampling import (
+            tree_speculative_sampling_target_only_triton,
+        )
+
+        tree_speculative_sampling_target_only = _with_zero_draft_probs(
+            tree_speculative_sampling_target_only_triton
         )
     elif is_musa():
         try:

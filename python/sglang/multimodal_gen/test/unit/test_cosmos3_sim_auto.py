@@ -822,7 +822,7 @@ class TestBlockMask(unittest.TestCase):
 
     @unittest.skipUnless(
         torch.cuda.is_available() and fa4_sparse_available(torch.device("cuda")),
-        "needs an SM90 or SM100 device with the flash-attn-4 CuTe package",
+        "needs an SM90 or SM100 device with the FA4 CuTe kernels",
     )
     def test_cuda_fa4_matches_dense_oracle_and_triton(self):
         torch.manual_seed(2)

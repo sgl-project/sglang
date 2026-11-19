@@ -17,6 +17,7 @@
 
 """Inference-only NemotronH model."""
 
+import logging
 from collections.abc import Iterable
 from functools import lru_cache, partial
 
@@ -94,7 +95,8 @@ from sglang.srt.utils import (
     is_sm120,
 )
 from sglang.srt.utils.custom_op import register_custom_op
-from sglang.utils import logger
+
+logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
 
@@ -310,6 +312,7 @@ class NemotronHMoE(nn.Module):
                 **(
                     dict(parallel_group="replicated")
                     if get_moe_a2a_backend().is_deepep()
+                    or get_moe_a2a_backend().is_ascend_ops()
                     or get_moe_a2a_backend().is_flashinfer()
                     or get_moe_a2a_backend().is_flashinfer_megamoe()
                     else {}

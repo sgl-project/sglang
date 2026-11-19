@@ -115,6 +115,10 @@ class BaseReasoningFormatDetector:
         if self.think_end_token in self.previous_content:
             self._in_reasoning = False
 
+    @property
+    def in_reasoning(self) -> bool:
+        return self._in_reasoning
+
     def get_think_end_token_ids(self, tokenizer: PreTrainedTokenizerBase) -> List[int]:
         return tokenizer.encode(self.think_end_token, add_special_tokens=False)
 
@@ -172,26 +176,26 @@ class BaseReasoningFormatDetector:
         while processed_text.startswith(think_start_text):
             processed_text = processed_text[len(think_start_text) :]
 
-        if (
-            self.think_end_token not in processed_text
-            and self.think_end_token not in self.previous_content
-        ):
-            # Check for tool_start_token interruption
-            tool_idx = self._find_tool_start(processed_text) if in_reasoning else -1
-            if tool_idx != -1:
+        end_idx = processed_text.find(self.think_end_token)
+        if self.think_end_token not in self.previous_content:
+            # Check for tool_start_token interruption. A marker before the think end
+            # still ends the block: streaming and the grammar cannot see that end yet.
+            tool_idx = self._find_tool_start(processed_text)
+            if tool_idx != -1 and (end_idx == -1 or tool_idx < end_idx):
                 reasoning_text = processed_text[:tool_idx]
                 # Preserve tool_start_token in normal text
                 normal_text = processed_text[tool_idx:]
                 return StreamingParseResult(
                     normal_text=normal_text, reasoning_text=reasoning_text
                 )
-            # Assume reasoning was truncated before end token
-            return StreamingParseResult(
-                reasoning_text=self._strip_partial_tool_start(processed_text)
-            )
+            if end_idx == -1:
+                # Assume reasoning was truncated before end token
+                return StreamingParseResult(
+                    reasoning_text=self._strip_partial_tool_start(processed_text)
+                )
 
         # Extract reasoning content
-        if self.think_end_token in processed_text:
+        if end_idx != -1:
             splits = processed_text.split(self.think_end_token, maxsplit=1)
             reasoning_text = splits[0]
             normal_text = splits[1]
@@ -245,10 +249,16 @@ class BaseReasoningFormatDetector:
             self.stripped_think_start = True
             self._in_reasoning = True
 
-        # Handle end of reasoning block
-        if self._in_reasoning and self.think_end_token in current_text:
-            end_idx = current_text.find(self.think_end_token)
+        end_idx = current_text.find(self.think_end_token) if self._in_reasoning else -1
+        tool_idx = (
+            self._find_tool_start(current_text, self._streamed_reasoning_tail)
+            if self._in_reasoning
+            else -1
+        )
 
+        # Handle end of reasoning block; an earlier tool_start_token ends it instead,
+        # as it does when the two arrive in separate chunks.
+        if end_idx != -1 and (tool_idx == -1 or end_idx < tool_idx):
             reasoning_text = current_text[:end_idx]
 
             self._buffer = ""
@@ -261,11 +271,7 @@ class BaseReasoningFormatDetector:
 
         # Continue with reasoning content
         if self._in_reasoning:
-            # Check for tool_start_token interruption. Streaming cannot see a
-            # think_end_token that has not arrived yet; see the chunk_dependent test.
-            tool_idx = self._find_tool_start(
-                current_text, self._streamed_reasoning_tail
-            )
+            # Check for tool_start_token interruption
             if tool_idx != -1:
                 reasoning_text = current_text[:tool_idx]
                 # Preserve tool_start_token in normal text
@@ -485,6 +491,40 @@ class Qwen3Detector(BaseReasoningFormatDetector):
         )
 
 
+class Ernie5_5ReasoningDetector(BaseReasoningFormatDetector):
+    """Reasoning of ERNIE 5.5 Flash: ``<ernie:think> ... </ernie:think>``.
+
+    A tool-call start inside the think block closes it implicitly.
+    """
+
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = False,
+        continue_final_message: bool = False,
+        previous_content: str = "",
+        force_nonempty_content: bool = False,
+    ):
+        super().__init__(
+            "<ernie:think>",
+            "</ernie:think>",
+            think_excluded_tokens=[
+                "<ernie:tool_call>",
+                "</ernie:tool_call>",
+                "<|ernie:im_end|>",
+                "<|ERNIE_MASK|>",
+            ],
+            force_reasoning=force_reasoning,
+            stream_reasoning=stream_reasoning,
+            tool_start_token="<ernie:tool_call>",
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
+            thinks_internally=True,
+            reasoning_default="enable_thinking",
+            force_nonempty_content=force_nonempty_content,
+        )
+
+
 class KimiDetector(BaseReasoningFormatDetector):
     """
     Detector for Kimi Thinking model.
@@ -677,6 +717,7 @@ class KimiK3Detector(BaseReasoningFormatDetector):
         self._tools_passthrough = False
         self._stream_text = ""
         self._streamed_reasoning: list[str] = []
+        self.replayed_reasoning_chars = 0
         self._discard_delayed_think_close = False
 
     def _clean_content(self, text: str) -> str:
@@ -756,6 +797,7 @@ class KimiK3Detector(BaseReasoningFormatDetector):
         )
 
     def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
+        self.replayed_reasoning_chars = 0
         self._buffer += new_text
         if self._force_nonempty_content:
             self._stream_text += new_text
@@ -789,6 +831,7 @@ class KimiK3Detector(BaseReasoningFormatDetector):
                 next_channel_idx=channel_idx,
             ):
                 replay = "".join(self._streamed_reasoning)
+                self.replayed_reasoning_chars = len(replay)
                 self._streamed_reasoning.clear()
                 self._in_reasoning = False
                 self._reasoning_done = True
@@ -843,6 +886,7 @@ class KimiK3Detector(BaseReasoningFormatDetector):
         return StreamingParseResult(normal_text=self._drain_content())
 
     def finish(self) -> StreamingParseResult:
+        streamed_chars = sum(map(len, self._streamed_reasoning))
         self._streamed_reasoning.clear()
         if not self._force_nonempty_content:
             return super().finish()
@@ -852,6 +896,7 @@ class KimiK3Detector(BaseReasoningFormatDetector):
             # answer went out as reasoning; without this gate the re-emit duplicates
             # answers already streamed as content (RESPONSE_OPEN / force_reasoning=False).
             self._buffer = ""
+            self.replayed_reasoning_chars = streamed_chars
             return StreamingParseResult(normal_text=self._clean_content(text))
         if self._in_reasoning and not self.stream_reasoning and self._buffer:
             # super().finish() would emit this buffer as content under
@@ -2332,6 +2377,7 @@ class ReasoningParser:
         "poolside_v1": _PoolsideV1Detector,
         "qwen3": Qwen3Detector,
         "qwen3-thinking": Qwen3Detector,
+        "ernie55": Ernie5_5ReasoningDetector,
         "minimax": Qwen3Detector,
         "minimax-append-think": MiniMaxAppendThinkDetector,
         "minimax-m3": MiniMaxM3Detector,

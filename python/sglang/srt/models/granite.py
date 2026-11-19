@@ -20,6 +20,7 @@
 """Inference-only Granite model compatible with HuggingFace weights."""
 
 import logging
+import traceback
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
@@ -49,7 +50,6 @@ from sglang.srt.model_loader.weight_utils import (
     sharded_weight_loader,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel
-from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
 
@@ -542,7 +542,7 @@ class GraniteForCausalLM(nn.Module):
 
         except Exception:
             logger.error(
-                f"Error getting weights by name {name} in GraniteForCausalLM: {get_exception_traceback()}"
+                f"Error getting weights by name {name} in GraniteForCausalLM: {traceback.format_exc()}"
             )
             return None
 

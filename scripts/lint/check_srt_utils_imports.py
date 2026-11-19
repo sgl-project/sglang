@@ -11,6 +11,12 @@ a cycle. A helper that needs a domain package belongs to that package, as
 
 Imports inside a function or under `TYPE_CHECKING` do not run at import time
 and are not checked.
+
+It also checks that the runtime packages (sglang.srt, sglang.kernels) never
+import sglang.utils, which holds helpers for the client, tests, and docs. A
+helper the runtime needs belongs to the runtime: a generic one in
+sglang.srt.utils, one that a single package uses in that package. This rule
+checks every import, including imports inside a function.
 """
 
 import ast
@@ -19,6 +25,7 @@ from pathlib import Path
 
 PKG_ROOT = Path("python")
 UTILS_DIR = PKG_ROOT / "sglang" / "srt" / "utils"
+RUNTIME_DIRS = (PKG_ROOT / "sglang" / "srt", PKG_ROOT / "sglang" / "kernels")
 
 # This check does not follow imports transitively: add a module here only if it
 # imports no srt domain package at module level itself.
@@ -70,7 +77,43 @@ def _is_allowed(module: str) -> bool:
     return any(module == a or module.startswith(a + ".") for a in ALLOWED)
 
 
-def main() -> int:
+def _sglang_utils_import_lines(path: Path) -> list[int]:
+    source = path.read_text(encoding="utf-8")
+    if "sglang.utils" not in source and "from sglang import" not in source:
+        return []
+    lines = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            if any(alias.name == "sglang.utils" for alias in node.names):
+                lines.append(node.lineno)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0:
+            if node.module == "sglang.utils" or (
+                node.module == "sglang"
+                and any(alias.name == "utils" for alias in node.names)
+            ):
+                lines.append(node.lineno)
+    return lines
+
+
+def _check_sglang_utils_imports() -> int:
+    found = [
+        f"  {path}:{line}"
+        for d in RUNTIME_DIRS
+        for path in sorted(d.rglob("*.py"))
+        for line in _sglang_utils_import_lines(path)
+    ]
+    if found:
+        print("ERROR: sglang.srt and sglang.kernels must not import sglang.utils:")
+        print("\n".join(found))
+        print(
+            "Move the helper into the runtime: sglang.srt.utils for a generic "
+            "one, or the package that uses it."
+        )
+        return 1
+    return 0
+
+
+def _check_utils_domain_imports() -> int:
     paths = sorted(UTILS_DIR.rglob("*.py"))
     if not paths:
         print(f"ERROR: no Python files under {UTILS_DIR}; update UTILS_DIR.")
@@ -93,6 +136,10 @@ def main() -> int:
         )
         return 1
     return 0
+
+
+def main() -> int:
+    return _check_utils_domain_imports() | _check_sglang_utils_imports()
 
 
 if __name__ == "__main__":

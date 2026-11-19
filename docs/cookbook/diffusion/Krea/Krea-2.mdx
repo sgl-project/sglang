@@ -31,7 +31,7 @@ Choose Turbo for interactive generation: it is distilled to 8 steps with `guidan
 | Variant | Model ID | Sampling profile |
 | --- | --- | --- |
 | Turbo | `krea/Krea-2-Turbo` | 8 steps, no CFG; fastest path |
-| Raw | `krea/Krea-2-Raw` | About 52 steps with CFG; higher-fidelity path |
+| Raw | `krea/Krea-2-Raw` | About 52 steps with CFG, set per request; higher-fidelity path |
 
 ## 3. Model Deployment
 
@@ -54,7 +54,7 @@ sglang serve \
   --port 30000
 ```
 
-The step count and guidance scale are **request-time** settings (see [API Usage](#4-api-usage)); Krea-2-Turbo defaults to 8 steps with `guidance_scale = 1.0`.
+The step count and guidance scale are **request-time** settings (see [API Usage](#4-api-usage)); Krea-2-Turbo defaults to 8 steps with `guidance_scale = 1.0`. Krea-2-Raw is served with the same defaults; set `num_inference_steps` (about 50) and `guidance_scale` (4.5) per request for its CFG path.
 
 ### 3.2 Configuration Tips
 
