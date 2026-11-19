@@ -770,6 +770,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             and forward_batch.forward_mode.is_extend()
             and not forward_batch.forward_mode.is_target_verify()
             and not forward_batch.forward_mode.is_mixed()
+            and not forward_batch.eager_mixed_as_extend
             and forward_batch.extend_seq_lens_cpu is not None
         ):
             self.kernel_prefill_metadata = extend_kernel.build_prefill_metadata(

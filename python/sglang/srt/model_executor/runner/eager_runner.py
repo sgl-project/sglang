@@ -208,6 +208,7 @@ class EagerRunner(BaseRunner):
                 # A mixed batch is extend-shaped (decode tails are 1-token
                 # extends); run it as EXTEND. NPU keeps MIXED for its dedicated
                 # kernel; CP keeps it to skip the zigzag split.
+                forward_batch.eager_mixed_as_extend = True
                 forward_batch.forward_mode = ForwardMode.EXTEND
                 mode = ForwardMode.EXTEND
             if mode.is_decode():

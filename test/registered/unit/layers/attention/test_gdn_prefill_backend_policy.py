@@ -552,6 +552,10 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
             self.assertIs(GDNKernelDispatcher(*backends).extend_kernel, flydsl_kernel)
 
     def test_flydsl_schedule_flows_from_metadata_to_kernel(self):
+        self._run_flydsl_extend(eager_mixed_as_extend=None)
+        self._run_flydsl_extend(eager_mixed_as_extend=True)
+
+    def _run_flydsl_extend(self, *, eager_mixed_as_extend):
         extend_kernel = MagicMock(spec=FlyDSLGDNKernel)
         extend_kernel.extend.return_value = (sentinel.output, None, None)
         extend_kernel.build_prefill_metadata.return_value = sentinel.schedule
@@ -571,6 +575,7 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
         )
         batch = SimpleNamespace(
             forward_mode=ForwardMode.EXTEND,
+            eager_mixed_as_extend=eager_mixed_as_extend,
             extend_seq_lens_cpu=[2, 2],
             extend_prefix_lens=None,
             multi_item_delimiter_indices=None,
@@ -600,13 +605,15 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
             backend.init_forward_metadata(batch)
             backend.forward_extend(layer, batch, torch.zeros(4, 6), None, None)
 
+        prefill_metadata = extend_kernel.extend.call_args.kwargs["prefill_metadata"]
+        if eager_mixed_as_extend:
+            extend_kernel.build_prefill_metadata.assert_not_called()
+            self.assertIsNone(prefill_metadata)
+            return
         extend_kernel.build_prefill_metadata.assert_called_once_with(
             [2, 2], cu_seqlens=metadata.query_start_loc
         )
-        self.assertIs(
-            extend_kernel.extend.call_args.kwargs["prefill_metadata"],
-            sentinel.schedule,
-        )
+        self.assertIs(prefill_metadata, sentinel.schedule)
 
     def test_flydsl_wrapper_returns_chunk_states(self):
         kernel = object.__new__(FlyDSLGDNKernel)
