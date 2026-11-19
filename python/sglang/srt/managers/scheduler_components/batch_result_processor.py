@@ -94,7 +94,7 @@ def _top_logprobs_to_lists(val, idx):
     if torch.is_tensor(val):
         return val.tolist(), idx.tolist()
     if val:
-        return [v.tolist() for v in val], [x.tolist() for x in idx]
+        return _rows_to_lists(val), _rows_to_lists(idx)
     return val, idx
 
 
@@ -138,6 +138,25 @@ def _record_token_values(
     if len(values) < output_start:
         values.extend([None] * (output_start - len(values)))
     values.extend(row if num_visible == len(row) else row[:num_visible])
+
+
+def _rows_to_lists(rows: List[torch.Tensor]) -> List[list]:
+    # Without overlap scheduling the rows are still on the device, where every
+    # `.tolist()` is a blocking device-to-host copy; read them back together.
+    if (
+        len(rows) < 2
+        or rows[0].device.type == "cpu"
+        or any(row.dim() != 1 for row in rows)
+        or len({row.dtype for row in rows}) > 1
+    ):
+        return [row.tolist() for row in rows]
+    flat = torch.cat(rows).tolist()
+    lists = []
+    start = 0
+    for row in rows:
+        lists.append(flat[start : start + row.numel()])
+        start += row.numel()
+    return lists
 
 
 @dataclass(kw_only=True, slots=True, frozen=True)
@@ -1324,9 +1343,9 @@ class SchedulerBatchResultProcessor:
             )
 
             if logits_output.next_token_token_ids_logprobs_val:
-                logits_output.next_token_token_ids_logprobs_val = [
-                    v.tolist() for v in logits_output.next_token_token_ids_logprobs_val
-                ]
+                logits_output.next_token_token_ids_logprobs_val = _rows_to_lists(
+                    logits_output.next_token_token_ids_logprobs_val
+                )
         return next_token_ids, next_token_logprobs
 
     def _apply_decode_logprobs(

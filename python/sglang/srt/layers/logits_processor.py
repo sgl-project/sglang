@@ -15,9 +15,10 @@
 
 import dataclasses
 import logging
+import os
 from contextlib import contextmanager
 from enum import IntEnum
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -79,6 +80,9 @@ from sglang.srt.utils.device import (
     use_intel_amx_backend,
 )
 
+if TYPE_CHECKING:
+    from sglang.srt.beam_search.trie_output_head import BeamTrieOutputHead
+
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
@@ -119,6 +123,27 @@ def _runtime_optimized_vocab_shards_enabled() -> bool:
 VERIFY_VOCAB_SHARDS = "vocab_shards"
 VERIFY_FULL_LOGITS = "full_logits"
 VERIFY_LOGITS_VARIANTS = (VERIFY_VOCAB_SHARDS, VERIFY_FULL_LOGITS)
+
+_GFX1250_LMHEAD = None
+
+
+def _gfx1250_lmhead_applies(x: torch.Tensor, w: torch.Tensor) -> bool:
+    """gfx1250: split-K Triton FP32-output lm_head for decode widths."""
+    global _GFX1250_LMHEAD
+    if _GFX1250_LMHEAD is None:
+        try:
+            _GFX1250_LMHEAD = os.environ.get(
+                "SGLANG_ROCM_MUSE_GFX1250_LMHEAD", "1"
+            ) == "1" and (
+                "gfx1250" in torch.cuda.get_device_properties(x.device).gcnArchName
+            )
+        except Exception:
+            _GFX1250_LMHEAD = False
+    if not _GFX1250_LMHEAD:
+        return False
+    from sglang.kernels.ops.gemm.lmhead_splitk_fp32 import applies, wide_applies
+
+    return applies(x, w) or wide_applies(x, w)
 
 
 class SamplingMaskStatus(IntEnum):
@@ -264,6 +289,7 @@ class LogitsProcessorOutput:
     # Beam search only: raw pre-sample logits for the scheduler-side joint
     # selection; see beam_search.logits_capture.
     beam: Optional[BeamLogitsCapture] = None
+    beam_normalizer: Optional[torch.Tensor] = None
 
     ## Part 5: Customized Info
     customized_info: Optional[Dict[str, List[Any]]] = None
@@ -364,6 +390,7 @@ class LogitsMetadata:
 
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
+    beam_trie_levels: Optional[torch.Tensor] = None
 
     # Carried from ForwardBatch so logits pruning can reconstruct the SP gather.
     attn_tp_sequence_sharded: bool = False
@@ -429,6 +456,9 @@ class LogitsMetadata:
             extend_input_logprob_token_ids_gpu=forward_batch.extend_input_logprob_token_ids_gpu,
             is_prefill_only=forward_batch.is_prefill_only,
             attn_tp_sequence_sharded=forward_batch.attn_tp_sequence_sharded,
+            beam_trie_levels=(
+                None if forward_batch.beam is None else forward_batch.beam.trie_levels
+            ),
             global_num_tokens_gpu=forward_batch.global_num_tokens_gpu,
             dp_local_start_pos=forward_batch.dp_local_start_pos,
             dp_local_num_tokens=forward_batch.dp_local_num_tokens,
@@ -547,6 +577,7 @@ class LogitsProcessor(nn.Module):
         )
         self._aux_hidden_states_checked = False
         self.rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
+        self.beam_trie_output_head: Optional[BeamTrieOutputHead] = None
 
         self._logits_gatherer = triton_symm_mem_ag.MultimemAllGatherer(
             max_tokens=triton_symm_mem_ag.recommended_max_tokens(
@@ -732,7 +763,15 @@ class LogitsProcessor(nn.Module):
                     mm_input_embeds=logits_metadata.mm_input_embeds,
                 )
             # Compute logits for both input and sampled tokens.
-            logits = self._get_logits(pruned_states, lm_head, logits_metadata)
+            beam_normalizer = None
+            if self.beam_trie_output_head is None:
+                logits = self._get_logits(pruned_states, lm_head, logits_metadata)
+            else:
+                from sglang.srt.beam_search.trie_output_head import beam_trie_logits
+
+                logits, beam_normalizer = beam_trie_logits(
+                    self, pruned_states, lm_head, logits_metadata
+                )
             sampled_logits = (
                 logits[sample_indices] if sample_indices is not None else logits
             )
@@ -743,6 +782,7 @@ class LogitsProcessor(nn.Module):
                 hidden_states=hidden_states_to_store,
                 last_hidden_states=last_hidden_states_to_store,
                 mm_input_embeds=logits_metadata.mm_input_embeds,
+                beam_normalizer=beam_normalizer,
             )
 
         logprobs_result, sampled_logits = self.input_logprob_processor.forward(
@@ -1378,12 +1418,23 @@ class LogitsProcessor(nn.Module):
             if use_mm_out_dtype and (
                 self.use_fp32_lm_head or self.use_fp32_lm_head_output
             ):
-                logits = torch.mm(
-                    hidden_states,
-                    lm_head.weight.T,
-                    out_dtype=torch.float32,
-                    out=out,
-                )
+                if out is None and _gfx1250_lmhead_applies(
+                    hidden_states, lm_head.weight
+                ):
+                    # gfx1250: hipBLASLt's FP32-output pick is slow at decode
+                    # widths; split-K Triton head instead.
+                    from sglang.kernels.ops.gemm.lmhead_splitk_fp32 import (
+                        lmhead_fp32,
+                    )
+
+                    logits = lmhead_fp32(hidden_states, lm_head.weight)
+                else:
+                    logits = torch.mm(
+                        hidden_states,
+                        lm_head.weight.T,
+                        out_dtype=torch.float32,
+                        out=out,
+                    )
             elif self.use_fp32_lm_head:
                 logits = torch.matmul(
                     hidden_states.to(torch.float32),
