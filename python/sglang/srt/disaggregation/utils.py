@@ -638,6 +638,10 @@ class CustomizedInfoError(ValueError):
 class MetadataBuffers:
     CUSTOMIZED_INFO_SLOTS = slice(6, 8)
     DEFAULT_TOP_LOGPROBS_NUM = 128
+    # Row layout of output_token_sampling_logprobs: the sampled token's logprob,
+    # then one logprob per support token.
+    SAMPLING_LOGPROB_SLOT = 0
+    SAMPLING_SUPPORT_LOGPROBS_START = 1
 
     def __init__(
         self,
@@ -721,9 +725,11 @@ class MetadataBuffers:
                 self.output_token_sampling_mask_idx = torch.zeros(
                     (size, max_sampling_mask_tokens), dtype=torch.int32, device=device
                 )
-                # Slot 0 is the sampled token's logprob; the support logprobs follow.
                 self.output_token_sampling_logprobs = torch.zeros(
-                    (size, 1 + max_sampling_mask_tokens),
+                    (
+                        size,
+                        self.SAMPLING_SUPPORT_LOGPROBS_START + max_sampling_mask_tokens,
+                    ),
                     dtype=torch.float32,
                     device=device,
                 )
@@ -970,8 +976,12 @@ class MetadataBuffers:
             sampling_logprobs = self.output_token_sampling_logprobs[
                 req.metadata_buffer_index
             ]
-            sampling_logprobs[:1].copy_(torch.from_numpy(chunk.selected_logprobs))
-            sampling_logprobs[1 : 1 + mask_len].copy_(
+            logprob_slot = self.SAMPLING_LOGPROB_SLOT
+            sampling_logprobs[logprob_slot : logprob_slot + 1].copy_(
+                torch.from_numpy(chunk.selected_logprobs)
+            )
+            support_start = self.SAMPLING_SUPPORT_LOGPROBS_START
+            sampling_logprobs[support_start : support_start + mask_len].copy_(
                 torch.from_numpy(chunk.support_logprobs)
             )
         # For PD + spec decode

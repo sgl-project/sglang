@@ -87,10 +87,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# The support row of a captured request that did not ask for the mask.
-_EMPTY_SUPPORT_IDS = np.empty(0, dtype=np.int32)
-_EMPTY_SUPPORT_LOGPROBS = np.empty(0, dtype=np.float32)
-
 
 def _get_speculative_output_stride(result: GenerationBatchResult) -> int:
     """Return the padded per-request width in flattened speculative output."""
@@ -1421,6 +1417,9 @@ class SchedulerBatchResultProcessor:
         """Speculative rows carry one support per draft position; keep the
         accepted prefix, as a list with one entry per accepted token."""
         assert len(batch_indices) == len(num_accept_tokens)
+        # The support row of a captured request that did not ask for the mask.
+        empty_support_ids = np.empty(0, dtype=np.int32)
+        empty_support_logprobs = np.empty(0, dtype=np.float32)
         support_row = 0
         for row, batch_index in enumerate(batch_indices):
             captures_support = reqs[batch_index].captures_sampling_support
@@ -1442,9 +1441,9 @@ class SchedulerBatchResultProcessor:
                         for token, length in enumerate(row_lengths)
                     ]
                 else:
-                    masks[batch_index] = [_EMPTY_SUPPORT_IDS] * num_tokens
+                    masks[batch_index] = [empty_support_ids] * num_tokens
                     support_by_batch[batch_index] = [
-                        _EMPTY_SUPPORT_LOGPROBS
+                        empty_support_logprobs
                     ] * num_tokens
             if captures_support:
                 support_row += 1
@@ -1493,6 +1492,9 @@ class SchedulerBatchResultProcessor:
             )
         else:
             selected_logprobs = selected_logprobs.tolist()
+            # The support row of a captured request that did not ask for the mask.
+            empty_support_ids = np.empty(0, dtype=np.int32)
+            empty_support_logprobs = np.empty(0, dtype=np.float32)
             support_row = 0
             for row, batch_index in enumerate(batch_indices):
                 captures_support = reqs[batch_index].captures_sampling_support
@@ -1510,8 +1512,8 @@ class SchedulerBatchResultProcessor:
                             support_row, :length
                         ]
                     else:
-                        masks[batch_index] = _EMPTY_SUPPORT_IDS
-                        support_by_batch[batch_index] = _EMPTY_SUPPORT_LOGPROBS
+                        masks[batch_index] = empty_support_ids
+                        support_by_batch[batch_index] = empty_support_logprobs
                 if captures_support:
                     support_row += 1
 
