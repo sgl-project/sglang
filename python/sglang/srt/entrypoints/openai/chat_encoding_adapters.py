@@ -446,6 +446,22 @@ def _build_deepseek_recipe(
     )
 
 
+def _build_ernie55(ctx: ChatEncodingAdapterContext) -> Optional[ChatEncodingAdapter]:
+    if ctx.tokenizer is None:
+        return None  # --skip-tokenizer-init: the server encodes no chat prompts.
+    from sglang.srt.entrypoints.openai.serving_ernie55 import (
+        Ernie55ChatEncodingAdapter,
+    )
+
+    return Ernie55ChatEncodingAdapter(
+        tokenizer=ctx.tokenizer,
+        reasoning_parser=ctx.reasoning_parser,
+        tool_call_parser=ctx.tool_call_parser,
+        chat_hooks=ctx.chat_hooks,
+        default_chat_template_kwargs=ctx.default_chat_template_kwargs,
+    )
+
+
 _BUILDERS: dict[
     str,
     dict[
@@ -455,6 +471,7 @@ _BUILDERS: dict[
 ] = {
     "inkling": {"builtin": _build_inkling},
     "kimi_k3": {"builtin": _build_kimi_k3},
+    "ernie5_5": {"builtin": _build_ernie55},
     "dsv4": {"builtin": _build_deepseek_recipe},
     "dsv41": {"builtin": _build_deepseek_recipe},
 }

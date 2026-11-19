@@ -862,6 +862,8 @@ def _architecture_auto_parsers(server_args, needs: Tuple[str, ...]) -> Dict[str,
 
     if "KimiK3" in arch or model_type == "kimi_k3":
         reasoning_parser, tool_call_parser = "kimi_k3", "kimi_k3"
+    elif "Ernie5_5" in arch or model_type == "ernie5_5_moe":
+        reasoning_parser, tool_call_parser = "ernie55", "ernie55"
     elif arch == "IQuestQ1ForCausalLM":
         reasoning_parser, tool_call_parser = "iquest_q1", "iquest_q1"
     elif arch in (

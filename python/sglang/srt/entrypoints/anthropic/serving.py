@@ -661,17 +661,18 @@ class AnthropicServing:
                     continue
 
                 # Custom tools always have a validated input_schema
-                # (enforced at Pydantic parse time).
+                # (enforced at Pydantic parse time). Pass no description when the
+                # client sent none, as the OpenAI path does, instead of "".
+                function = {"name": tool.name}
+                if tool.description is not None:
+                    function["description"] = tool.description
+                function["parameters"] = tool.input_schema
+                function["strict"] = tool.strict
                 converted_tools.append(
                     Tool(
                         type="function",
                         defer_loading=tool.defer_loading,
-                        function={
-                            "name": tool.name,
-                            "description": tool.description or "",
-                            "parameters": tool.input_schema,
-                            "strict": tool.strict,
-                        },
+                        function=function,
                     )
                 )
 

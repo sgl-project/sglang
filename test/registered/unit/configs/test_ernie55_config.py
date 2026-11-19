@@ -14,6 +14,7 @@
 # ==============================================================================
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from sglang.srt.arg_groups.model_overrides.ernie55 import _ernie55_overrides
 from sglang.srt.configs.ernie55 import (
@@ -146,7 +147,6 @@ class TestErnie5_5ServerArgOverrides(CustomTestCase):
 
     def test_each_unsupported_feature_is_rejected(self):
         for field, value, message in (
-            ("moe_a2a_backend", "megamoe", "megamoe"),
             ("enable_eplb", True, "EPLB"),
             ("dcp_size", 2, "decode context parallelism"),
         ):
@@ -154,6 +154,18 @@ class TestErnie5_5ServerArgOverrides(CustomTestCase):
                 args = SimpleNamespace(**{**self._SUPPORTED, field: value})
                 with self.assertRaisesRegex(ValueError, message):
                     _ernie55_overrides(args, None)
+
+    def test_megamoe_is_rejected_off_sm100(self):
+        """The SM90 FP8 MegaMoE kernel hardcodes SwiGLU, so ERNIE's SiTU experts
+        produced wrong output without an error on H100; megamoe must be refused
+        there and allowed on SM100."""
+        args = SimpleNamespace(**{**self._SUPPORTED, "moe_a2a_backend": "megamoe"})
+        target = "sglang.srt.arg_groups.model_overrides.ernie55.is_sm100_supported"
+        with patch(target, return_value=False):
+            with self.assertRaisesRegex(ValueError, "SM100"):
+                _ernie55_overrides(args, None)
+        with patch(target, return_value=True):
+            _ernie55_overrides(args, None)
 
     def test_pd_rejects_pipeline_parallelism(self):
         for mode, pp, rejected in (
