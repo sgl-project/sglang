@@ -59,13 +59,15 @@ batch size one. Explicit placement and attention overrides preserve each recipe.
 | GPU | Placement / attention | Generation | Edit | Peak VRAM |
 | --- | --- | --- | --- | --- |
 | H200 141GB | Resident / FlashAttention | 4.48 s | 5.29 s | 38.4 GiB |
-| B200 192GB | Resident / FlashAttention | 2.46 s | 3.02 s | 38.5 GiB |
+| B200 192GB | Resident / cuDNN SDPA | 2.22 s | 2.70 s | 38.5 GiB |
 | RTX PRO 6000 96GB | Resident / Torch SDPA | 8.03 s | 9.63 s | 38.4 GiB |
 | RTX 4090 24GB | DiT and VAE resident, encoder layerwise offload / FlashAttention | 18.68 s | 21.68 s | 22.7 GiB |
 | DGX Spark 128GB unified | Resident / Torch SDPA | 35.36 s | 42.23 s | — (unified) |
 
 Measured with the original checkpoint on 2026-09-20 at 1024×1024, 40 steps, CFG 1, and one RGBA PNG per
-request. Times are median HTTP latency after warmup, including PNG serialization
+request. The B200 row was measured again on 2026-11-01 when one B200 moved to cuDNN SDPA,
+with FlashAttention on the same build for reference: 2.32 s generation and 2.89 s edit (peak VRAM from the
+2026-09-20 FlashAttention run). Times are median HTTP latency after warmup, including PNG serialization
 and excluding startup; VRAM is the sampled request-phase peak. Prompts and
 software versions affect both latency and memory use.
 
@@ -302,10 +304,14 @@ These GPUs remain unverified for this model's NVFP4 exports. See the
 Use `--lora-path` and `--lora-merge-mode dynamic|merge` or the runtime adapter APIs.
 Diffusers adapter keys prefixed with `transformer.` map to the native DiT.
 
-Keep eager execution as the default. Breakable CUDA Graph replay requires
-matching resolution and condition-prefix length; unseen shapes run eagerly.
-Text buckets alone do not guarantee replay. SageAttention and Cache-DiT can
-change numerical results and require quality checks for your workload.
+Keep eager execution as the default. For one sample with SP=1, Breakable CUDA
+Graph packs the condition prefix once per request and reuses it across cached
+denoising steps; prefill stays eager. Choose `--bcg-text-buckets` large enough
+for both text and condition-image tokens. Prompts within a captured bucket can
+reuse its graph at the same resolution; uncaptured shapes run eagerly.
+Each bucket keeps separate graph buffers, so measure memory and end-to-end
+latency before enabling BCG. SageAttention and Cache-DiT can change numerical
+results and require quality checks for your workload.
 
 ### Cache-DiT
 

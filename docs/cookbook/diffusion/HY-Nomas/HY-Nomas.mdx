@@ -60,7 +60,35 @@ sglang serve --model-path tencent/Hy-Nomas --num-gpus 1 --dit-layerwise-offload 
 
 `tencent/Hy-Nomas` is resolved through a pinned [model overlay](https://huggingface.co/Niehen6174/Hy-Nomas-overlay). It downloads the official distilled, non-quantized DiT, the PixelUMM decoder and the Qwen2.5-VL text encoder. It then caches a Diffusers-style pipeline under `SGLANG_DIFFUSION_CACHE_ROOT`. Weights keep their original values and dtypes. Later starts reuse the cache, and a local directory with the same layout can be passed to `--model-path` instead. The first load needs extra disk space for the decoder export.
 
-The overlay does not include Nomas-PE, LoRA adapters, or FP8/INT8 variants.
+The overlay does not include Nomas-PE, LoRA adapters, or FP8/INT8 variants. To use the official quantized checkpoints, override the component weights as shown below.
+
+### INT8 DiT and FP8 VAE
+
+On Linux with NVIDIA CUDA, you can use the official INT8 DiT and FP8 VAE checkpoints from [tencent/Hy-Nomas](https://huggingface.co/tencent/Hy-Nomas/tree/main). The FP8 VAE requires an SM89 or newer GPU, such as an RTX 4090, and BF16 compute precision.
+
+Download the two files with the Hugging Face CLI:
+
+```bash Command
+hf download tencent/Hy-Nomas \
+  DiT/distilled_int8/diffusion_pytorch_model_ema_0_995_int8.safetensors \
+  VAE/PixelUMM_FT_FP8/diffusion_pytorch_model_fp8.safetensors \
+  --local-dir ./hy-nomas-quantized
+```
+
+Start a single-GPU server with both component weight overrides:
+
+```bash Command
+sglang serve \
+  --model-path tencent/Hy-Nomas \
+  --num-gpus 1 \
+  --transformer-weights-path ./hy-nomas-quantized/DiT/distilled_int8/diffusion_pytorch_model_ema_0_995_int8.safetensors \
+  --vae-weights-path ./hy-nomas-quantized/VAE/PixelUMM_FT_FP8/diffusion_pytorch_model_fp8.safetensors \
+  --component-precisions.vae bf16 \
+  --dit-layerwise-offload true \
+  --port 30000
+```
+
+SGLang detects the quantization format from checkpoint metadata; no additional quantization flag is needed. INT8 DiT weights are dequantized to BF16 for linear computation, while the VAE uses FP8 GEMM. You can use either weight override independently. The requests in the following sections work with these checkpoints.
 
 ## 4. Offline and HTTP generation
 

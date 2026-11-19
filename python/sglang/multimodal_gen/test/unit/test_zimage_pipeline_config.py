@@ -4,17 +4,56 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.multimodal_gen.configs.pipeline_configs.diffusers_generic import (
+    DiffusersGenericPipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.zimage import ZImagePipelineConfig
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.configs.sample.zimage import (
     ZImageSamplingParams,
     ZImageTurboSamplingParams,
 )
+from sglang.multimodal_gen.configs.task_type import DataType
+from sglang.multimodal_gen.runtime.entrypoints.openai import utils as openai_utils
 from sglang.multimodal_gen.runtime.models.dits.zimage import (
     ZImageRMSNorm,
     ZImageTransformer2DModel,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.warmup_request_builder import build_warmup_reqs
+
+
+def _zimage_server_args():
+    config = ZImagePipelineConfig()
+    config.vae_config.post_init()
+    return SimpleNamespace(
+        model_path="Tongyi-MAI/Z-Image-Turbo",
+        model_id=None,
+        backend="sglang",
+        performance_mode="manual",
+        pipeline_class_name=None,
+        pipeline_config=config,
+        output_path=None,
+        comfyui_mode=True,
+        enable_cfg_parallel=False,
+        enable_breakable_cuda_graph=False,
+        enable_torch_compile=False,
+        enable_trace=False,
+        attention_backend_config={},
+        num_gpus=1,
+        warmup_steps=1,
+        warmup_num_frames=None,
+    )
+
+
+def _build_sampling(server_args, defaults, fields):
+    with (
+        patch.object(openai_utils, "get_global_server_args", return_value=server_args),
+        patch.object(SamplingParams, "from_pretrained", return_value=defaults),
+    ):
+        return openai_utils.build_sampling_params(
+            "size", prompt="a cat", request_data_type=DataType.IMAGE, **fields
+        )
 
 
 class TestZImagePipelineConfig(unittest.TestCase):
@@ -78,6 +117,64 @@ class TestZImagePipelineConfig(unittest.TestCase):
             atol=0,
         )
         self.assertTrue(config.cfg_policy.parallel_uses_serial_arithmetic)
+
+    def test_http_size_aligns_to_the_patch_grid(self) -> None:
+        server_args = _zimage_server_args()
+        config = server_args.pipeline_config
+        for fields, expected in (
+            ({"size": "1000x1000"}, (992, 992)),
+            ({"size": "1030x776"}, (1024, 768)),
+            ({"width": 1000, "height": 1344}, (992, 1344)),
+            ({"size": "1024x1024"}, (1024, 1024)),
+        ):
+            with self.subTest(fields=fields):
+                sampling = _build_sampling(
+                    server_args, ZImageTurboSamplingParams(), fields
+                )
+                self.assertEqual((sampling.width, sampling.height), expected)
+                # the DiT splits the latent into 2x2 patches
+                _, _, _, height, width = config.prepare_latent_shape(
+                    Req(sampling_params=sampling), 1, 1
+                )
+                self.assertEqual((height % 2, width % 2), (0, 0))
+
+    def test_single_given_side_derives_an_aligned_other_side(self) -> None:
+        server_args = _zimage_server_args()
+        # 598 and 513 keep the latent grid main used; 1000 used to derive 562
+        for fields, expected in (
+            ({"width": 598}, (592, 336)),
+            ({"width": 1000}, (992, 560)),
+            ({"height": 513}, (912, 512)),
+        ):
+            with self.subTest(fields=fields):
+                sampling = _build_sampling(server_args, ZImageSamplingParams(), fields)
+                self.assertEqual((sampling.width, sampling.height), expected)
+
+    def test_diffusers_backend_keeps_requested_size(self) -> None:
+        server_args = _zimage_server_args()
+        server_args.backend = "diffusers"
+        server_args.pipeline_config = DiffusersGenericPipelineConfig()
+        for fields, expected in (
+            ({"width": 1024}, (1024, None)),
+            ({"size": "1000x1000"}, (1000, 1000)),
+        ):
+            with self.subTest(fields=fields):
+                sampling = _build_sampling(server_args, ZImageSamplingParams(), fields)
+                self.assertEqual((sampling.width, sampling.height), expected)
+
+    def test_warmup_resolution_aligns_to_the_patch_grid(self) -> None:
+        server_args = _zimage_server_args()
+        with patch(
+            "sglang.multimodal_gen.runtime.warmup_request_builder.get_model_sampling_defaults",
+            return_value=ZImageTurboSamplingParams(),
+        ):
+            reqs = build_warmup_reqs(
+                server_args,
+                warmup_resolutions=["1000x1000"],
+                warmup_input_path=None,
+                server_based_warmup=True,
+            )
+        self.assertEqual([(r.width, r.height) for r in reqs], [(992, 992)])
 
     def test_rmsnorm_native_formula(self) -> None:
         norm = ZImageRMSNorm(4, eps=1e-5)
