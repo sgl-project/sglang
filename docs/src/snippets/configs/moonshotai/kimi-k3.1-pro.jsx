@@ -126,7 +126,7 @@ export const config = {
             "--speculative-draft-model-path RadixArk/Kimi-K3.1-Dflash2-Preview",
             `--speculative-dflash-block-size ${config.dflashBlock(s)}`,
             "--speculative-draft-kv-cache-dtype fp8_e4m3",
-            // The draft KV ring (default on) needs an MLA draft backend; DCP
+            // The draft KV ring needs an MLA draft backend; DCP
             // forces this one anyway, so pinning it keeps DCP and non-DCP recipes on the same
             // path. ROCm's Triton draft backend keeps the per-token draft pool.
             `--speculative-draft-attention-backend ${config.isAmd(s) ? "triton" : "cutedsl_mla"}`,
@@ -138,6 +138,9 @@ export const config = {
             // requests skip it.
             ...(config.isAmd(s) ? ["--speculative-use-block-verification"] : []),
           ],
+          // The draft KV ring is opt-in; every NVIDIA recipe here can serve it, and under PD
+          // both roles must set it.
+          env: (s) => (config.isAmd(s) ? [] : ["SGLANG_ENABLE_DFLASH_DRAFT_KV_RING=1"]),
           hints: (s) =>
             s.pdMode === "decode" && s.strategy === "high-throughput"
               ? [`High-throughput decode verifies K = ${config.dflashBlock(s) - 1} (block ${config.dflashBlock(s)}); launch the prefill role with the same block size.`]
@@ -265,9 +268,6 @@ export const config = {
     numPromptsByConc: { 1: 16, 16: 80, 64: 320, 256: 1280 },
   },
 
-  // The K3.1 image is built from docker/k31.Dockerfile; it verifies the Rust radix TreeCore,
-  // flashmla_ops and the 1024-expert FlashInfer DynBlock at build time (a Python-only install
-  // falls back to slower paths silently).
   dockerImages: {
     m890: "egslingjun-registry.cn-wulanchabu.cr.aliyuncs.com/egslingjun-tmp/inference-xpu-pytorch:kimi-k3.1-pro-sglang0.5.22-cuda13.0-pytorch2.13.0-20261103",
     "810e": "egslingjun-registry.cn-wulanchabu.cr.aliyuncs.com/egslingjun-tmp/inference-xpu-pytorch:kimi-k3.1-pro-sglang0.5.22-cuda13.0-pytorch2.13.0-20261103",
@@ -1510,8 +1510,7 @@ export const config = {
         "--dist-timeout 3600",
         "--tp-size 32",
         "--ep-size 32",
-        "--dp-size 4",
-        "--enable-dp-attention",
+        "--attn-dp-size 4",
         "--enable-dp-lm-head",
         "--linear-attn-prefill-backend flashkda",
         "--moe-runner-backend deep_gemm",
