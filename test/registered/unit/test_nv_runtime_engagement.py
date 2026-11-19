@@ -26,6 +26,7 @@ from sglang.srt.arg_groups import overrides
 from sglang.srt.disaggregation import decode_freed_slots, pp_early_finish
 from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
 from sglang.srt.environ import envs, nv_mega_runtime_switches
+from sglang.srt.managers import scheduler_pp_mixin
 from sglang.srt.managers.scheduler_components import dp_sync_exchange, shm_tag_exchange
 from sglang.srt.models.qwen3_5 import Qwen3_5MoeForConditionalGeneration
 from sglang.srt.runtime_context import get_parallel
@@ -286,10 +287,17 @@ def _pp_early_finish(shape: Shape) -> bool:
     return tracker is not None
 
 
+def _pp_early_relay(shape: Shape) -> bool:
+    return (
+        _pp_prefill_loop(shape) and scheduler_pp_mixin._pp_prefill_early_relay_enabled()
+    )
+
+
 RESOLVERS: Dict[str, Callable[[Shape], bool]] = {
     "SGLANG_OPT_SCHEDULER_SHM_SYNC_DP_ROWS": _dp_rows,
     "SGLANG_OPT_PD_DECODE_ADMIT_FREED_SLOTS": _freed_slots,
     "SGLANG_OPT_PP_PREFILL_EARLY_FINISH": _pp_early_finish,
+    "SGLANG_OPT_PP_EARLY_RELAY": _pp_early_relay,
 }
 
 
@@ -381,7 +389,7 @@ _QWEN35_CHAIN = _children()
 _QWEN35_TP_SPEC = _CHAIN | _TRTLLM_CHAIN | _QWEN35_CHAIN
 # A PD prefill with pipeline parallelism; the proxy receive with
 # SGLANG_PP_COMM_OVERLAP, the state victims with HiCache write_back.
-_PP_PREFILL = _children("PP_PREFILL_EARLY_FINISH")
+_PP_PREFILL = _children("PP_EARLY_RELAY", "PP_PREFILL_EARLY_FINISH")
 
 EXPECTED = {
     "decode-dep4": _PD_DECODE | _NO_STAGING | _PD_DECODE_DP | _DP_EXCHANGE | _DP_GRAPHS,
