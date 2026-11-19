@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from sglang.kernels.jit.utils import arch
 from sglang.kernels.jit.utils.compile import toolchain
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -15,6 +17,31 @@ def test_musa_home_uses_compiler_override(monkeypatch):
     monkeypatch.delenv("MUSA_PATH", raising=False)
     monkeypatch.setenv("SGLANG_MUSA_MCC", "/opt/musa/bin/mcc")
     assert toolchain.musa_home() == "/opt/musa"
+
+
+def test_musa_runtime_alias_owner_is_torchada():
+    utils = (
+        Path(__file__).resolve().parents[4]
+        / "python/sglang/kernels/jit/include/sgl_kernel/utils.cuh"
+    ).read_text()
+    musa_block = utils.split("#if defined(__MUSACC__)", 1)[1].split(
+        "#elif !defined(USE_ROCM)", 1
+    )[0]
+    for header in (
+        "cuda.h",
+        "cuda_bf16.h",
+        "cuda_fp16.h",
+        "cuda_fp8.h",
+        "cuda_runtime.h",
+    ):
+        assert f"#include <{header}>" in musa_block
+    for symbol in (
+        "cudaFuncAttributeMaxDynamicSharedMemorySize",
+        "cudaLaunchKernelEx",
+        "cudaRuntimeGetVersion",
+        "cuGetErrorString",
+    ):
+        assert f"#define {symbol}" not in musa_block
 
 
 def test_musa_toolchain_paths_and_flags(monkeypatch):

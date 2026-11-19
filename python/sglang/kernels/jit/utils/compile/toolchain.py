@@ -101,6 +101,14 @@ def musa_home() -> str:
 @cache_once
 def torchada_cxx_compat_include_dir() -> str:
     """Torchada's CUDA-to-MUSA C++ compatibility headers."""
+    import torchada
+
+    version = tuple(int(part) for part in torchada.__version__.split(".")[:3])
+    if version < (0, 1, 113):
+        raise RuntimeError(
+            "SGLang MUSA JIT requires torchada>=0.1.113 for stable-compat "
+            "runtime aliases"
+        )
     from torchada.utils.cpp_extension import stable_compat_include_dir
 
     return stable_compat_include_dir()
