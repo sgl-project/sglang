@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from enum import Enum
 from functools import lru_cache, partial
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Union
@@ -45,7 +46,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_cuda_version,
     get_device_capability,
-    get_device_core_count,
+    get_device_name,
     get_device_sm,
     get_hip_version,
     is_cuda,
@@ -747,16 +748,35 @@ if get_platform().is_sm90 and is_flashinfer_available():
 # 114-SM H100 PCIe and SXM H100/H200 are 132. Per byte of weights streamed that
 # leaves H20 with roughly a third of their compute, which is the whole reason a
 # narrow-M block-FP8 GEMM is compute-bound there and bandwidth-bound elsewhere.
-_H20_LIKE_MAX_SMS = 96
+# Matched on the product name rather than the SM count: a MIG slice reports far
+# fewer SMs than its parent, and a sliced H100 is memory-bound like the whole
+# card, so an SM-count test would hand it a default that only helps H20.
+# "H20" is a substring of "H200", so the family needs an SKU boundary instead of
+# `"H20" in name` (as layers/attention/qsa/sparse_attn.py does): "NVIDIA H20" and
+# "NVIDIA H20-3e" match, "NVIDIA H200" does not.
+_H20_NAME = re.compile(r"NVIDIA H20($|[-\s])")
+
+
+def _h20_swapab_opt_out() -> bool:
+    """Whether an opt-in feature pins block-FP8 GEMM to one kernel for every M."""
+    # Deferred import: the batch-invariant helpers are read lazily everywhere else
+    # in this file too (see the [32, 32] path), so do not pull them in at import.
+    from sglang.srt.layers.quantization.mxfp8_input import (
+        batch_invariant_or_deterministic,
+    )
+
+    return _fp8_block_gemv_enabled() or batch_invariant_or_deterministic()
 
 
 def _is_h20() -> bool:
-    """Whether this is an H20-class Hopper part: few SMs, compute-starved."""
-    # Keyed on the SM count, not on the product name: "H20" is a substring of
-    # "H200", so the `"H20" in get_device_name()` test used for the QSA tuning
-    # table (layers/attention/qsa/sparse_attn.py) would select H200 as well.
-    # Every part this does not match keeps the DeepGEMM default it has today.
-    return get_platform().is_sm90 and get_device_core_count() <= _H20_LIKE_MAX_SMS
+    """Whether this is an H20-family Hopper part: few SMs, compute-starved."""
+    if not get_platform().is_sm90:
+        return False
+    try:
+        name = get_device_name()
+    except Exception:
+        return False
+    return bool(_H20_NAME.match(name))
 
 
 def dispatch_w8a8_block_fp8_linear(
@@ -1288,11 +1308,17 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
         return flashinfer_gemm_w8a8_block_fp8_linear_with_fallback
 
     elif backend.is_flashinfer_deepgemm():
-        if not (get_platform().is_sm90 and is_flashinfer_available()):
+        # _HAS_FLASHINFER_SM90_SWAPAB also guards the import: without the symbol
+        # this callable would raise NameError on the first small-M forward.
+        if not (
+            get_platform().is_sm90
+            and is_flashinfer_available()
+            and _HAS_FLASHINFER_SM90_SWAPAB
+        ):
             raise RuntimeError(
                 "FlashInfer DeepGEMM with swapAB requested via --fp8-gemm-backend=flashinfer_deepgemm, "
-                "but it's not available. This backend requires Hopper (SM90) GPUs and FlashInfer "
-                "to be installed."
+                "but it's not available. This backend requires Hopper (SM90) GPUs, FlashInfer, "
+                "and flashinfer.gemm.fp8_blockscale_gemm_sm90."
             )
         return flashinfer_deepgemm_w8a8_block_fp8_linear_with_fallback
 
@@ -1373,7 +1399,22 @@ def _dispatch_auto_backend(act_scale_ue8m0: bool = False) -> Callable:
         # act_scale_ue8m0 through this exact callable below, and the FlashInfer
         # entry point quantizes the activation itself with fp32 scales.
         # --fp8-gemm-backend=deep_gemm still selects plain DeepGEMM everywhere.
-        if _HAS_FLASHINFER_SM90_SWAPAB and _is_h20() and not act_scale_ue8m0:
+        # ...but not when something below depends on one fixed kernel for every M:
+        #   act_scale_ue8m0 is bound through deepgemm_w8a8_block_fp8_linear_with_fallback
+        #     (this callable has no such parameter and quantizes the activation
+        #     itself with fp32 scales), so returning the hybrid would drop it.
+        #   SGLANG_ENABLE_FP8_BLOCK_GEMV routes M=1 to hopper_fp8_block_gemv inside
+        #     deepgemm_w8a8_block_fp8_linear_with_fallback; taking the hybrid here
+        #     would silently skip that opt-in.
+        #   batch-invariant / deterministic inference promises that a request's
+        #     output does not depend on what else is in the batch, which a kernel
+        #     that switches at M=32 would break.
+        if (
+            _HAS_FLASHINFER_SM90_SWAPAB
+            and _is_h20()
+            and not act_scale_ue8m0
+            and not _h20_swapab_opt_out()
+        ):
             return flashinfer_deepgemm_w8a8_block_fp8_linear_with_fallback
         return deepgemm_w8a8_block_fp8_linear_with_fallback
     elif get_platform().is_blackwell and is_flashinfer_available():
@@ -1520,9 +1561,12 @@ def flashinfer_deepgemm_w8a8_block_fp8_linear_with_fallback(
 
     For SM90 (Hopper), this uses the DeepGEMM JIT with automatic swapAB selection.
     """
-    if input_scale is not None:
+    if input_scale is not None or block_size != [128, 128]:
         # fp8_blockscale_gemm_sm90 quantizes the activation itself and takes no
-        # static per-tensor input scale; DeepGEMM covers those checkpoints.
+        # static per-tensor input scale, and it assumes 128x128 block scales (the
+        # call below passes no block size). DeepGEMM serves both, so a
+        # pre-quantized or [64, 128] / [32, 32] checkpoint keeps exactly the
+        # backend `auto` used before this change instead of misindexing scales.
         return deepgemm_w8a8_block_fp8_linear_with_fallback(
             input, weight, block_size, weight_scale, input_scale, bias
         )

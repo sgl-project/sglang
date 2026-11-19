@@ -988,9 +988,13 @@ class Gemma4TextModel(PreTrainedModel):
         self.post_init()
 
     # Block-FP8 linears that take the fused site's pre-quantized (fp8, scales)
-    # input (see compressed_tensors_w8a8_fp8.apply_weights).
+    # input (see compressed_tensors_w8a8_fp8.apply_weights). The FlashInfer hybrid
+    # qualifies because it hands a pre-quantized (input_scale != None) call back to
+    # DeepGEMM, so on H20 -- where ``auto`` resolves to it -- enabling this fusion
+    # still works instead of being dropped.
     _AR_FUSION_LINEARS = (
         "deepgemm_w8a8_block_fp8_linear_with_fallback",
+        "flashinfer_deepgemm_w8a8_block_fp8_linear_with_fallback",
         "triton_w8a8_block_fp8_linear",
     )
 

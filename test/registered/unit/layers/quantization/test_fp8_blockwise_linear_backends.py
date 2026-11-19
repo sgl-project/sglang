@@ -311,6 +311,24 @@ class TestFp8BlockwiseLinearBackends(_LinearBackendCheck):
         get_device_sm() == 90 and fp8_utils._HAS_FLASHINFER_SM90_SWAPAB,
         "the swapAB half of flashinfer's SM90 block-FP8 GEMM is SM90-only",
     )
+    def test_h20_opt_out_keeps_deep_gemm(self):
+        """A feature that needs one kernel for every M keeps DeepGEMM on H20."""
+        with (
+            mock.patch.object(fp8_utils, "_is_h20", return_value=True),
+            mock.patch.object(fp8_utils, "_h20_swapab_opt_out", return_value=True),
+            mock.patch.object(
+                fp8_utils,
+                "get_fp8_gemm_runner_backend",
+                return_value=Fp8GemmRunnerBackend.AUTO,
+            ),
+        ):
+            fn = fp8_utils.dispatch_w8a8_block_fp8_linear(weight_block_size=[128, 128])
+        self.assertIs(fn, fp8_utils.deepgemm_w8a8_block_fp8_linear_with_fallback)
+
+    @unittest.skipUnless(
+        get_device_sm() == 90 and fp8_utils._HAS_FLASHINFER_SM90_SWAPAB,
+        "the swapAB half of flashinfer's SM90 block-FP8 GEMM is SM90-only",
+    )
     def test_explicit_deep_gemm_wins_over_h20(self):
         """An explicit backend flag is not overridden by the H20 default."""
         with mock.patch.object(
