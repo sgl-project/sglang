@@ -30,7 +30,7 @@ BS_LIST = get_benchmark_range(
     ci_range=[16, 32],
 )
 HIDDEN_SIZE_LIST = get_benchmark_range(
-    full_range=sorted([1536, *range(1024, 8192 + 1, 1024)]),
+    full_range=sorted([512, 1536, *range(1024, 8192 + 1, 1024)]),
     ci_range=[512, 2048],
 )
 
