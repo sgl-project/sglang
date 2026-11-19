@@ -287,7 +287,7 @@ def moe_wna16_marlin_gemm(
         use_atomic_add,
         use_fp32_reduce,
         is_zp_float,
-        *_host_copy_args(host, b_q_weight, b_scales),
+        *_host_copy_args(host=host, b_q_weight=b_q_weight, b_scales=b_scales),
     )
 
     return c

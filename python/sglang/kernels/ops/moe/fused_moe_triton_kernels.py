@@ -1085,7 +1085,8 @@ def invoke_fused_moe_kernel(
             else {}
         )
         host_kwargs = host_copy_kwargs(
-            B, not b_use_tma and bias is None and B_scale is None and not swap_ab
+            B=B,
+            plain=not b_use_tma and bias is None and B_scale is None and not swap_ab,
         )
         fused_moe_kernel[grid](
             A,

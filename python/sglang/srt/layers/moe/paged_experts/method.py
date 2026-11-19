@@ -337,7 +337,7 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
                 routed_scaling_factor=self.routed_scaling_factor,
             )
             if get_exec().moe.paged_experts_fused_host_copy:
-                self._fuse_host_copy(layer, residency)
+                self._fuse_host_copy(layer=layer, residency=residency)
         self.executor = EagerExecutor(
             base_method=self.format.runner_method(self.base_method),
             store=self.store,
@@ -362,9 +362,9 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
                 "not support the disk tier"
             )
         if self.contract is TRITON:
-            self._fuse_host_copy_triton(layer, residency)
+            self._fuse_host_copy_triton(layer=layer, residency=residency)
         else:
-            self._fuse_host_copy_marlin(layer, residency)
+            self._fuse_host_copy_marlin(layer=layer, residency=residency)
         self.device_executor.fused_host_copy = True
 
     def _fuse_host_copy_triton(self, layer, residency) -> None:
@@ -415,8 +415,8 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
         for weight, (scales, global_scale) in tables.items():
             gpu = getattr(layer, weight).data
             HOST_COPIES[gpu.data_ptr()] = HostCopy(
-                weight=address(weight, gpu),
-                scales=address(scales, getattr(layer, scales).data),
+                weight=address(name=weight, gpu=gpu),
+                scales=address(name=scales, gpu=getattr(layer, scales).data),
                 global_scale=(
                     paged_experts_host_device_pointer(host[global_scale])
                     if global_scale in host
