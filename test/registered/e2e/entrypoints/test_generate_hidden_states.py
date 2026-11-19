@@ -1,7 +1,8 @@
 """HTTP `/generate` returns hidden states when the server allows the mode:
 one vector for `return_hidden_states="last"`, and for `True` a matrix for the
-prefill step followed by one vector per decode step. The Python frontend and
-the Rust server return the same shapes."""
+prefill step followed by one vector per decode step. A mode the server does not
+allow is a 400. The Python frontend and the Rust server answer the same, on a
+server launched with no mode, with `last` and with `full`."""
 
 import json
 import unittest
@@ -20,7 +21,7 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=300, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=360, stage="base-b", runner_config="1-gpu-small")
 
 PROMPT = "The capital of France is"
 
@@ -28,7 +29,8 @@ PROMPT = "The capital of France is"
 class HiddenStatesServerCase(CustomTestCase):
     """One server per class, launched with `server_mode` and `env`."""
 
-    server_mode = "last"
+    # None launches without `--return-hidden-states-mode`.
+    server_mode = None
     env = {"SGLANG_RUST_SERVER": "0"}
 
     @classmethod
@@ -40,7 +42,11 @@ class HiddenStatesServerCase(CustomTestCase):
             DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
             DEFAULT_URL_FOR_TEST,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--return-hidden-states-mode", cls.server_mode],
+            other_args=(
+                ["--return-hidden-states-mode", cls.server_mode]
+                if cls.server_mode is not None
+                else []
+            ),
             env=cls.env,
         )
 
@@ -78,7 +84,9 @@ class HiddenStatesServerCase(CustomTestCase):
         self.assertTrue(all(isinstance(value, float) for value in vector))
 
 
-class TestGenerateHiddenStatesLast(HiddenStatesServerCase):
+class LastCases:
+    """`return_hidden_states="last"` on any server that allows it."""
+
     def assert_one_vector(self, output):
         self.assert_vector(output["meta_info"]["hidden_states"])
 
@@ -114,13 +122,22 @@ class TestGenerateHiddenStatesLast(HiddenStatesServerCase):
             self.assert_one_vector(chunk)
 
 
-class TestGenerateHiddenStatesLastOnFullServer(TestGenerateHiddenStatesLast):
-    server_mode = "full"
+class TestGenerateHiddenStatesUnset(HiddenStatesServerCase):
+    def test_every_mode_is_refused(self):
+        for mode in ("last", True):
+            error = self._post(PROMPT, mode, status_code=400).json()["error"]
+            self.assertIn("not configured to return hidden states", error["message"])
+        # The server still serves after the refused requests.
+        self.assertNotIn("hidden_states", self._post(PROMPT, False).json()["meta_info"])
 
 
-class TestGenerateHiddenStatesFull(HiddenStatesServerCase):
+class TestGenerateHiddenStatesLast(LastCases, HiddenStatesServerCase):
+    server_mode = "last"
+
+
+class TestGenerateHiddenStatesFull(LastCases, HiddenStatesServerCase):
     """`return_hidden_states=True`: a matrix with one row per prefill token,
-    then one vector per decode step."""
+    then one vector per decode step. `"last"` is served too."""
 
     server_mode = "full"
     long_prompt = "The quick brown fox jumps over the lazy dog near the quiet river"
@@ -164,12 +181,17 @@ class TestGenerateHiddenStatesFull(HiddenStatesServerCase):
 
 
 @unittest.skipUnless(is_rust_server_built(), "embedded rust server extension not built")
-class TestGenerateHiddenStatesFullRustServer(TestGenerateHiddenStatesFull):
+class TestGenerateHiddenStatesUnsetRustServer(TestGenerateHiddenStatesUnset):
     env = {"SGLANG_RUST_SERVER": "1"}
 
 
 @unittest.skipUnless(is_rust_server_built(), "embedded rust server extension not built")
 class TestGenerateHiddenStatesLastRustServer(TestGenerateHiddenStatesLast):
+    env = {"SGLANG_RUST_SERVER": "1"}
+
+
+@unittest.skipUnless(is_rust_server_built(), "embedded rust server extension not built")
+class TestGenerateHiddenStatesFullRustServer(TestGenerateHiddenStatesFull):
     env = {"SGLANG_RUST_SERVER": "1"}
 
 
