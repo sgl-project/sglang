@@ -391,6 +391,13 @@ class StaticKVStorage:
         extra_alloc_kwargs = {}
         if req_to_token_write is not None:
             extra_alloc_kwargs["req_to_token_write"] = req_to_token_write
+        if page_interleave_shard_size(allocator) > 1:
+            assert self._batch is not None
+            rotation_bases = [req.kv_rotation_base for req in self._batch.reqs]
+            assert all(base is not None for base in rotation_bases), (
+                "sharded decode requires the rotation base recorded during prefill"
+            )
+            extra_alloc_kwargs["rotation_bases"] = rotation_bases
         if is_dsv4:
             c128_num_pages = allocator.c128_num_pages_needed(
                 (seq_lens_cpu - 1).clamp(min=0), seq_lens_cpu

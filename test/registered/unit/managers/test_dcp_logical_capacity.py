@@ -120,11 +120,12 @@ class TestDcpLogicalCapacity(CustomTestCase):
         runner.max_total_num_tokens = 64
         allocator = PageInterleavePoolAllocator.__new__(PageInterleavePoolAllocator)
         allocator.shard_size = 3
+        allocator.size = 64 * 3
         runner.token_to_kv_pool_allocator = allocator
 
         info = TpModelWorker.get_worker_info(worker)
 
-        self.assertEqual(info[0], 64)
+        self.assertEqual(info[0], 64 * 3)
         self.assertEqual(info[4], 64 * 3 - 1)
         self.assertEqual(info[5], 64 * 3 - 6)
 
