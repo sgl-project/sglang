@@ -278,6 +278,16 @@ jobs:
           retention-days: 5
           if-no-files-found: ignore
 
+      - name: Upload scoring SLO evidence
+        if: ${{ always() && hashFiles('test/score_slo_artifacts/**/*.json') != '' }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: score-slo-${{ inputs.self_name }}-${{ matrix.partition }}-${{ github.run_attempt }}
+          path: test/score_slo_artifacts/**/*.json
+          retention-days: 5
+          if-no-files-found: ignore
+
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()
         with:
