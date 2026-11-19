@@ -614,10 +614,15 @@ def tilelang_qsa_mqa_decode(
             dtype=torch.float32,
             device=q.device,
         )
-    # MI355X: four wavefronts per CTA (about 1.5x) and four consecutive groups per CTA
-    # over a page-table-wide grid (1.2-1.7x at 50k-200k context, bit-exact); other
-    # devices keep the kernel defaults.
-    gfx95_launch = {"threads": 256, "groups_per_cta": 4} if is_gfx95_supported() else {}
+    # MI355X: four wavefronts per CTA (about 1.5x) and consecutive groups per CTA over
+    # a page-table-wide grid (bit-exact); other devices keep the kernel defaults. Two
+    # groups per CTA up to 48 rows, four above: measured fastest at each row count
+    # (q.shape[0] is fixed per CUDA graph; the per-row context is not known here).
+    gfx95_launch = (
+        {"threads": 256, "groups_per_cta": 2 if q.shape[0] <= 48 else 4}
+        if is_gfx95_supported()
+        else {}
+    )
     # An empty page table would give the page-table-wide grid zero CTAs.
     if (
         not q.shape[0]
