@@ -151,7 +151,7 @@ if TYPE_CHECKING:
     from sglang.srt.configs.device_config import DeviceConfig
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
-    from sglang.srt.model_loader.snapshot.schema import LoadSpec, SnapshotManifest
+    from sglang.srt.weight_cache.schema import LoadSpec, SnapshotManifest
 
 _is_npu = is_npu()
 # ModelOpt: QUANT_CFG_CHOICES is imported from modelopt_utils.py

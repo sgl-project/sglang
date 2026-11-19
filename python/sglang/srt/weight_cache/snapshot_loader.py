@@ -27,15 +27,15 @@ from sglang.srt.model_loader.loader import (
     get_model_loader,
     on_model_constructed,
 )
-from sglang.srt.model_loader.snapshot import load_diff, validator
-from sglang.srt.model_loader.snapshot.coordinator import Ballot, vote
-from sglang.srt.model_loader.snapshot.schema import (
+from sglang.srt.model_loader.utils import set_default_torch_dtype
+from sglang.srt.weight_cache import load_diff, validator
+from sglang.srt.weight_cache.coordinator import Ballot, vote
+from sglang.srt.weight_cache.schema import (
     LoadSpec,
     SnapshotManifest,
     StorageMeta,
 )
-from sglang.srt.model_loader.snapshot.transport import WeightTransport
-from sglang.srt.model_loader.utils import set_default_torch_dtype
+from sglang.srt.weight_cache.transport import WeightTransport
 
 if TYPE_CHECKING:
     from sglang.srt.configs.device_config import DeviceConfig

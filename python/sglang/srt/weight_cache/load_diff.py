@@ -11,7 +11,7 @@ from typing import Any
 import torch
 from torch import nn
 
-from sglang.srt.model_loader.snapshot.schema import SnapshotManifest
+from sglang.srt.weight_cache.schema import SnapshotManifest
 
 
 def record_construction(model: nn.Module) -> Any:

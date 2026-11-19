@@ -1,4 +1,4 @@
-"""CPU tests for the order of snapshot loading (model_loader/snapshot/loader.py)."""
+"""CPU tests for the order of snapshot loading (weight_cache/snapshot_loader.py)."""
 
 import ast
 import contextlib
@@ -13,17 +13,11 @@ from torch import nn
 import sglang.srt.model_loader.loader as loader_mod
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
-from sglang.srt.model_loader.snapshot import load_diff
-from sglang.srt.model_loader.snapshot import loader as snapshot_loader
-from sglang.srt.model_loader.snapshot import schema, validator
-from sglang.srt.model_loader.snapshot.coordinator import Ballot
-from sglang.srt.model_loader.snapshot.schema import (
-    LoadSpec,
-    SnapshotManifest,
-    StorageMeta,
-)
-from sglang.srt.model_loader.snapshot.transport import WeightTransport
 from sglang.srt.runtime_context import get_context
+from sglang.srt.weight_cache import load_diff, schema, snapshot_loader, validator
+from sglang.srt.weight_cache.coordinator import Ballot
+from sglang.srt.weight_cache.schema import LoadSpec, SnapshotManifest, StorageMeta
+from sglang.srt.weight_cache.transport import WeightTransport
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -358,7 +352,7 @@ class TestSnapshotLoader(CustomTestCase):
 
     def test_load_diff_and_validator_share_only_the_schema(self):
         # A validator built on load-diff's logic would only check what load-diff did.
-        package = "sglang.srt.model_loader.snapshot"
+        package = "sglang.srt.weight_cache"
         diff_imports = _imported_names(load_diff)
         check_imports = _imported_names(validator)
         shared = (diff_imports & check_imports) - {package}
