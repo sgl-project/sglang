@@ -18,7 +18,8 @@ runs:
     - name: Check PR test health
       uses: actions/github-script@v8
       env:
-        SKIP_PR_TEST_HEALTH_CHECK: ${{ env.SKIP_PR_TEST_HEALTH_CHECK }}
+        # [CI trial] never fail fast: a full-coverage run needs every job to finish. Revert before merge.
+        SKIP_PR_TEST_HEALTH_CHECK: 'true'
         INDEPENDENT_TEST_JOB_PREFIX: ${{ inputs.independent-test-job-prefix }}
       with:
         github-token: ${{ inputs.github-token }}

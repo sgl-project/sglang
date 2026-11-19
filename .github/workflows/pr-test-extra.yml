@@ -107,6 +107,13 @@ jobs:
     secrets: inherit
 
   # =============================================== sgl-kernel ====================================================
+  # [CI trial] torch 2.15 builds of sgl-deep-gemm / sgl-deep-ep / sgl-flash-mla. GPU test
+  # jobs install them over the pinned releases and skip if this fails. Revert before merge.
+  dep-wheels-build:
+    needs: [check-changes, call-gate]
+    if: needs.call-gate.result == 'success' && needs.call-gate.outputs.opted-in != 'false'
+    uses: ./.github/workflows/_pr-test-dep-wheels-build.yml
+
   sgl-kernel-build-wheels:
     needs: [check-changes, call-gate]
     if: |
@@ -174,7 +181,7 @@ jobs:
     # No `secrets: inherit`: this hosted CPU job has no secret consumer.
 
   simulator-test-gpu:
-    needs: [check-changes, call-gate, sgl-kernel-build-wheels, rust-ext-build]
+    needs: [check-changes, call-gate, sgl-kernel-build-wheels, dep-wheels-build, rust-ext-build]
     if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') && needs.call-gate.outputs.opted-in != 'false' }}
     uses: ./.github/workflows/_pr-test-simulator-gpu.yml
     with:
@@ -186,7 +193,7 @@ jobs:
   # `name:` keeps the job names wait-for-jobs and check-pr-test-health match on.
   extra-test:
     name: ${{ matrix.stage }}-test-${{ matrix.runner_config }}
-    needs: [check-changes, call-gate, sgl-kernel-build-wheels, rust-ext-build, sgl-router-build, sgl-router-build-aarch64]
+    needs: [check-changes, call-gate, sgl-kernel-build-wheels, dep-wheels-build, rust-ext-build, sgl-router-build, sgl-router-build-aarch64]
     if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') && needs.call-gate.outputs.opted-in != 'false' }}
     strategy:
       fail-fast: false
@@ -244,6 +251,7 @@ jobs:
         call-gate,
         sgl-kernel-build-wheels,
         rust-ext-build,
+        dep-wheels-build,
         sgl-router-build,
         sgl-router-build-aarch64,
         simulator-test-cpu,

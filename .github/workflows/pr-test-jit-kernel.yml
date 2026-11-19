@@ -114,6 +114,18 @@ jobs:
         with:
           artifact_name: ${{ inputs.rust_ext_artifact }}
 
+      # [CI trial] torch 2.15 builds of sgl-deep-gemm / sgl-deep-ep / sgl-flash-mla from
+      # this run (_pr-test-dep-wheels-build.yml), installed over the pinned releases.
+      - name: Download dependency wheels
+        uses: actions/download-artifact@v4
+        with:
+          path: dep-wheels/
+          merge-multiple: true
+          pattern: dep-wheel-*
+
+      - name: Use dependency wheels
+        run: echo "SGLANG_CI_DEP_WHEELS_DIR=$GITHUB_WORKSPACE/dep-wheels" >> "$GITHUB_ENV"
+
       - name: Install dependencies
         timeout-minutes: 20
         run: |

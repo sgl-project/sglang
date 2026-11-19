@@ -656,6 +656,29 @@ install_sglang() {
     mark_step_done "${FUNCNAME[0]}"
 }
 
+# [CI trial] Swap in sgl-deep-gemm / sgl-deep-ep / sgl-flash-mla wheels built in this
+# run against torch 2.15 (_pr-test-dep-wheels-build.yml), so tests exercise those
+# binaries rather than PyPI's torch 2.14 builds. No-op unless the job downloaded them.
+install_pr_dep_wheels() {
+    local dir="${SGLANG_CI_DEP_WHEELS_DIR:-}"
+    if [ -z "$dir" ]; then
+        return
+    fi
+    local wheels=()
+    shopt -s nullglob
+    wheels=("$dir"/*"$(uname -m)".whl)
+    shopt -u nullglob
+    if [ "${#wheels[@]}" -ne 3 ]; then
+        echo "FATAL: expected 3 dependency wheels for $(uname -m) in $dir, found ${#wheels[@]}"
+        ls -l "$dir" || true
+        exit 1
+    fi
+    $PIP_CMD install --no-deps --force-reinstall "${wheels[@]}" $PIP_INSTALL_SUFFIX
+    $PIP_CMD list 2>/dev/null | grep -E "sgl-deep-gemm|sgl-deep-ep|sgl-flash-mla"
+
+    mark_step_done "${FUNCNAME[0]}"
+}
+
 install_nccl() {
     # DeepEP needs NCCL 2.30.7 whatever torch pins, so this must run
     # after every command that resolves Python dependencies (including lmms-eval).
@@ -1028,6 +1051,7 @@ main() {
     stabilize_flashinfer_jit_paths
     install_extra_deps
     install_msa
+    install_pr_dep_wheels
     install_nccl
     prepare_runner
     setup_ld_library_path

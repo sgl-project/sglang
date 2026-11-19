@@ -114,6 +114,27 @@ jobs:
           merge-multiple: true
           pattern: wheel-python3.11-cuda*
 
+      # [CI trial] torch 2.15 builds of sgl-deep-gemm / sgl-deep-ep / sgl-flash-mla from
+      # this run (_pr-test-dep-wheels-build.yml), installed over the pinned releases.
+      - name: Download dependency wheels (v4)
+        if: steps.rc.outputs.artifact_version == 'v4'
+        uses: actions/download-artifact@v4
+        with:
+          path: dep-wheels/
+          merge-multiple: true
+          pattern: dep-wheel-*
+
+      - name: Download dependency wheels (v6)
+        if: steps.rc.outputs.artifact_version == 'v6'
+        uses: actions/download-artifact@v6
+        with:
+          path: dep-wheels/
+          merge-multiple: true
+          pattern: dep-wheel-*
+
+      - name: Use dependency wheels
+        run: echo "SGLANG_CI_DEP_WHEELS_DIR=$GITHUB_WORKSPACE/dep-wheels" >> "$GITHUB_ENV"
+
       - name: Install dependencies
         timeout-minutes: ${{ fromJson(steps.rc.outputs.install_timeout) }}
         run: |
