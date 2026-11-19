@@ -183,6 +183,12 @@ class TestWNA16MoENoLinearGroup(CustomTestCase):
         # The native scheme subclasses the Triton one, so isinstance can't tell them apart.
         self.assertIs(type(scheme), CompressedTensorsWNA16TritonMoE)
 
+    def test_xpu_native_scheme_refuses_triton_quant_info(self):
+        scheme = self._xpu_moe_scheme(MoeRunnerBackend.AUTO)
+
+        with self.assertRaisesRegex(NotImplementedError, "--moe-runner-backend triton"):
+            scheme.get_triton_quant_info(torch.nn.Module())
+
     def test_xpu_rejects_unvalidated_layouts(self):
         rejected_by_both = {
             "asymmetric": (4, {"symmetric": False}),
