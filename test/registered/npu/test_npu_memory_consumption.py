@@ -60,7 +60,8 @@ class TestMemoryConsumptionAscend(CustomTestCase):
                 "--max-total-tokens",
                 "1024",
                 "--disable-radix-cache",
-                "--disable-cuda-graph",
+                "--disable-decode-cuda-graph",
+                "--disable-prefill-cuda-graph",
             ],
             env={
                 "TRANSFORMERS_VERBOSITY": "error",

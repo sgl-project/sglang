@@ -69,7 +69,8 @@ class TestDeepSeekOCR2OlmBenchXPU(CustomTestCase):
         "--enable-mixed-chunk",
         "--chunked-prefill-size",
         "8192",
-        "--disable-cuda-graph",
+        "--disable-decode-cuda-graph",
+        "--disable-prefill-cuda-graph",
     ]
     env = {}
 
