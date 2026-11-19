@@ -1841,29 +1841,21 @@ class ServingChatTestCase(CustomTestCase):
             with self.subTest(field=field), self.assertRaisesRegex(ValueError, field):
                 self.chat._convert_to_internal_request(req, self.fastapi_request)
 
-    def test_validate_request_rejects_sampling_mask_without_meta_info(self):
-        req = ChatCompletionRequest(
-            model="x",
-            messages=[{"role": "user", "content": "Hi?"}],
-            return_sampling_mask=True,
-        )
-
-        self.assertEqual(
-            self.chat._validate_request(req),
-            "return_sampling_mask requires return_meta_info=true.",
-        )
-
-    def test_validate_request_rejects_sampling_logprobs_mode_without_meta_info(self):
-        req = ChatCompletionRequest(
-            model="x",
-            messages=[{"role": "user", "content": "Hi?"}],
-            sampling_logprobs_mode="selected",
-        )
-
-        self.assertEqual(
-            self.chat._validate_request(req),
-            "sampling_logprobs_mode requires return_meta_info=true.",
-        )
+    def test_validate_request_rejects_sampling_outputs_without_meta_info(self):
+        for field, value in (
+            ("return_sampling_mask", True),
+            ("sampling_logprobs_mode", "selected"),
+        ):
+            req = ChatCompletionRequest(
+                model="x",
+                messages=[{"role": "user", "content": "Hi?"}],
+                **{field: value},
+            )
+            with self.subTest(field=field):
+                self.assertEqual(
+                    self.chat._validate_request(req),
+                    f"{field} requires return_meta_info=true.",
+                )
 
     def test_validate_request_bounds_top_logprobs_to_vocab(self):
         """top_logprobs outside [0, vocab_size] must be a 400, not a topk that

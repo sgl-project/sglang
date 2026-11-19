@@ -793,15 +793,16 @@ class TestSamplingMaskPacking(CustomTestCase):
     def test_overflow_never_materializes_a_partial_mask(self):
         # Simulate a top-k cutoff tie: a nominal top_k below the cap can still
         # produce more positive weights than the fixed transport can hold.
+        # Row 1 returns no mask, so it has no support to overflow.
         capture = _SamplingMaskCapture(
-            batch_rows=torch.tensor([0]),
-            weights=torch.tensor([[0.2, 0.2, 0.2, 0.2, 0.2]]),
+            batch_rows=torch.tensor([0, 1]),
+            weights=torch.full((2, 5), 0.2),
             token_ids=None,
-            selected_weight=torch.tensor([0.2]),
+            selected_weight=torch.tensor([0.2, 0.2]),
         )
 
         sampling_output = self.sampler._build_sampling_mask_output(
-            torch.tensor([0]),
+            torch.tensor([0, 1]),
             capture,
             support_capture_indices=torch.tensor([0]),
         )
@@ -816,42 +817,12 @@ class TestSamplingMaskPacking(CustomTestCase):
                     return_sampling_mask=True,
                     return_sampling_logprobs=True,
                     sampling_logprobs_mode="support",
-                )
-            ],
-            output,
-        )
-        self.assertEqual(
-            output.next_token_sampling_mask_status,
-            [SamplingMaskStatus.OVERFLOW],
-        )
-        self.assertEqual(output.next_token_sampling_mask_idx, [None])
-        self.assertEqual(output.next_token_sampling_logprobs, [None])
-
-    def test_only_requests_that_return_the_mask_can_overflow(self):
-        # Both rows have five positive weights against a cap of three; only row 0 returns the mask.
-        capture = _SamplingMaskCapture(
-            batch_rows=torch.tensor([0, 1]),
-            weights=torch.full((2, 5), 0.2),
-            token_ids=None,
-            selected_weight=torch.tensor([0.2, 0.2]),
-        )
-
-        sampling_output = self.sampler._build_sampling_mask_output(
-            torch.tensor([0, 1]), capture, support_capture_indices=None
-        )
-
-        output = LogitsProcessorOutput(
-            next_token_logits=None,
-            sampling_mask_output=sampling_output,
-        )
-        SchedulerBatchResultProcessor.materialize_sampling_mask_output(
-            [
+                ),
                 SimpleNamespace(
-                    return_sampling_mask=returns_mask,
+                    return_sampling_mask=False,
                     return_sampling_logprobs=True,
                     sampling_logprobs_mode="selected",
-                )
-                for returns_mask in (True, False)
+                ),
             ],
             output,
         )
@@ -859,6 +830,8 @@ class TestSamplingMaskPacking(CustomTestCase):
             output.next_token_sampling_mask_status,
             [SamplingMaskStatus.OVERFLOW, SamplingMaskStatus.OK],
         )
+        self.assertIsNone(output.next_token_sampling_mask_idx[0])
+        self.assertIsNone(output.next_token_sampling_logprobs[0])
         self.assertEqual(len(output.next_token_sampling_mask_idx[1]), 0)
         self.assertAlmostEqual(
             float(output.next_token_sampling_logprobs[1][0]), math.log(0.2), places=6
