@@ -811,7 +811,9 @@ class TestIpcParameterTies(CustomTestCase):
                 elif alias == "attribute":
                     model.alias = view
                 if alias:
-                    with self.assertRaisesRegex(RuntimeError, "storage alias alias"):
+                    with self.assertRaisesRegex(
+                        RuntimeError, "IPC parameter shared with alias"
+                    ):
                         privatize_ipc_parameter(model, parameter)
                     self.assertEqual(parameter.data_ptr(), owner.data_ptr())
                     self.assertEqual(model.alias.data_ptr(), view.data_ptr())

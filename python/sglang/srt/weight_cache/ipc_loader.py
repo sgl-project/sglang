@@ -55,17 +55,23 @@ def privatize_ipc_parameter(model: nn.Module, parameter: nn.Parameter) -> None:
     imported = getattr(model, "_ipc_imported_tensors", ())
     if not imported:
         return
-    source = parameter.untyped_storage()
-    if not any(t.untyped_storage()._cdata == source._cdata for t in imported):
+
+    storage = parameter.untyped_storage()
+    if not any(t.untyped_storage()._cdata == storage._cdata for t in imported):
         return
 
-    if not parameter.is_contiguous() or source.nbytes() != (
-        parameter.numel() * parameter.element_size()
-    ):
-        raise RuntimeError(
-            "Cannot privatize an IPC parameter that views part of a storage"
-        )
+    if not parameter.is_contiguous() or parameter.nbytes != storage.nbytes():
+        raise RuntimeError("Expected a contiguous IPC parameter covering its storage")
 
+    alias = _find_direct_storage_alias(model, parameter)
+    if alias is not None:
+        raise RuntimeError(f"Cannot privatize IPC parameter shared with {alias}")
+
+    parameter.data = parameter.detach().clone()
+
+
+def _find_direct_storage_alias(model: nn.Module, parameter: nn.Parameter) -> str | None:
+    storage_id = parameter.untyped_storage()._cdata
     for path, module in model.named_modules():
         for attrs in (module._parameters, module._buffers, vars(module)):
             for name, tensor in attrs.items():
@@ -73,15 +79,10 @@ def privatize_ipc_parameter(model: nn.Module, parameter: nn.Parameter) -> None:
                     tensor is not parameter
                     and isinstance(tensor, torch.Tensor)
                     and tensor.layout == torch.strided
-                    and tensor.untyped_storage()._cdata == source._cdata
+                    and tensor.untyped_storage()._cdata == storage_id
                 ):
-                    raise RuntimeError(
-                        f"Cannot privatize IPC parameter with storage alias "
-                        f"{path + '.' if path else ''}{name}"
-                    )
-
-    with torch.no_grad():
-        parameter.data = parameter.detach().clone(memory_format=torch.preserve_format)
+                    return f"{path}.{name}" if path else name
+    return None
 
 
 class IpcModelLoader(BaseModelLoader):
