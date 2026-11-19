@@ -1202,15 +1202,6 @@ class DFlashWorkerV2(BaseSpecWorker):
                     "device graph capture.",
                     type(current_platform).__name__,
                 )
-            if _is_npu and target_dp_enabled and capture_decode_cuda_graph:
-                # Idle DP ranks skip the draft step and cannot join a shared replay;
-                # CUDA avoids this by keying the draft's graphs on the local batch size.
-                capture_decode_cuda_graph = False
-                if self._target_tp_rank == 0:
-                    logger.warning(
-                        "Disable DFLASH draft cuda graph because dp attention "
-                        "is enabled (draft runs eager)."
-                    )
             if is_cuda() and capture_decode_cuda_graph:
                 available_mem = self._tp_sync.available_memory_gb(
                     SpecTpSyncSite.DFLASH_MEM,
@@ -3837,17 +3828,13 @@ class DFlashWorkerV2(BaseSpecWorker):
                         batch, self._target_worker, defer_metadata_init=True
                     )
                 )
-                if _is_npu:
-                    # Matches the active ranks, which go eager when any DP rank is idle.
-                    idle_verify_forward_batch.can_run_decode_cuda_graph = False
-                    idle_can_run_cuda_graph = False
-                # On CUDA every rank pads to max(original_global_num_tokens_cpu), so
-                # the idle rank replays the active ranks' graph with zero real rows.
+                # Idle rank replays the active ranks' graph with zero real rows;
+                # metadata is planned by the graph runner's load_batch, so no
+                # skip_attn_backend_init marking here.
                 self._target_worker.forward_batch_generation(
                     batch=None,
                     forward_batch=idle_verify_forward_batch,
                     is_verify=True,
-                    skip_attn_backend_init=True if _is_npu else None,
                 )
             empty_ids = torch.empty((0,), dtype=torch.int64, device=self.device)
             empty_lens = torch.empty((0,), dtype=torch.int32, device=self.device)
@@ -4298,19 +4285,10 @@ class DFlashWorkerV2(BaseSpecWorker):
             batch.seq_lens_cpu = seq_lens_cpu_backup
             batch.seq_lens_sum = seq_lens_sum_backup
 
-            # Idle-DP guard (NPU): an eager idle rank's raw counts and a replaying rank's
-            # padded bucket disagree on DP-gather offsets, so any idle rank forces eager.
-            if (
-                _is_npu
-                and get_parallel().attn_dp_enabled
-                and verify_forward_batch.original_global_num_tokens_cpu is not None
-                and min(verify_forward_batch.original_global_num_tokens_cpu) == 0
-            ):
-                verify_forward_batch.can_run_decode_cuda_graph = False
-
             # Mixed-round guard: an extend rank's raw token counts disagree with
             # the verify batch's spec-scaled counts on the DP-gather layout; run
-            # eager, symmetric with the idle guard above.
+            # eager (an idle rank's replay is rejected by the same oversized
+            # max(raw counts) bucket check).
             if get_parallel().attn_dp_enabled and batch.is_extend_in_batch:
                 verify_forward_batch.can_run_decode_cuda_graph = False
 

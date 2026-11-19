@@ -35,10 +35,12 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_gfx1250_supported,
     is_hip,
+    is_npu,
 )
 
 _is_hip = is_hip()
 _is_gfx1250 = _is_hip and is_gfx1250_supported()
+_is_npu = is_npu()
 
 logger = logging.getLogger(__name__)
 
@@ -846,6 +848,14 @@ def _decode_grouped_att_m_fwd(
     extra_kargs = {}
     num_stages = 2
     num_warps = 4
+    if _is_npu:
+        # Ascend NPU lowers tl tiles into the 256KB unified buffer (~192KB
+        # usable). At MLA dims the 32-wide streamed K/V tile plus the stage-1
+        # pipelining overflows it in the BiShengHIR pipeline, so halve the
+        # tile and keep a single in-flight stage.
+        num_stages = 1
+        if Lk >= 576:
+            BLOCK = 16
     if _is_hip:
         # https://rocm.docs.amd.com/en/docs-6.2.0/how-to/llm-fine-tuning-optimization/optimizing-triton-kernel.html
         # https://github.com/triton-lang/triton/blob/main/third_party/amd/backend/compiler.py

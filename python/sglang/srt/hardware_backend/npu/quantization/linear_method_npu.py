@@ -29,6 +29,16 @@ logger = logging.getLogger(__name__)
 MXFP8_BLOCK_SIZE = 32
 
 
+def _empty_quant_matmul_output(
+    x: torch.Tensor, layer: torch.nn.Module, dtype: torch.dtype
+) -> torch.Tensor:
+    # npu_quant_matmul raises "QuantMatmul not support to process empty tensor
+    # currently" on 0-row inputs, which attn-DP idle ranks legitimately produce
+    # (0-token keep-alive batches). Mirror GEMM semantics ([M, K] x [K, N] ->
+    # [M, N]) using the pre-transposed [K, N] NPU weight layout.
+    return x.new_empty((*x.shape[:-1], layer.weight.shape[1]), dtype=dtype)
+
+
 def _prepare_mxfp4_w4a8_bias(
     bias: Optional[torch.Tensor],
 ) -> Optional[torch.Tensor]:
@@ -74,6 +84,8 @@ class NPUW8A8Int8LinearMethod(_NPULinearMethodBase):
         from sglang.srt.layers.linear import RowParallelLinear
 
         original_dtype = x.dtype
+        if x.numel() == 0:
+            return _empty_quant_matmul_output(x, layer, original_dtype)
         if original_dtype != torch.int8:
             x = torch.ops.npu.npu_quantize(
                 x,
@@ -120,6 +132,8 @@ class NPUW8A8Int8DynamicLinearMethod(_NPULinearMethodBase):
         else:
             original_dtype = x.dtype
             quant_out, dynamic_scale = torch.ops.npu.npu_dynamic_quant(x)
+        if quant_out.numel() == 0:
+            return _empty_quant_matmul_output(quant_out, layer, original_dtype)
         return torch.ops.npu.npu_quant_matmul(
             quant_out,
             layer.weight,

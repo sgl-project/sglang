@@ -269,7 +269,14 @@ class EagerRunner(BaseRunner):
         if (
             forward_batch.needs_forward_metadata_init()
             or cp_active
-            or forward_batch.forward_mode.is_target_verify()
+            or (
+                forward_batch.forward_mode.is_target_verify()
+                # The DFLASH idle-rank verify batch is empty by construction
+                # (zero real rows): skip_attn_backend_init marked the metadata
+                # ready and there is nothing to plan.  Re-planning would choke
+                # on the empty seq_lens (ascend's seq_lens.max()).
+                and forward_batch.batch_size > 0
+            )
         ):
             if (
                 get_parallel().attn_dcp_size > 1

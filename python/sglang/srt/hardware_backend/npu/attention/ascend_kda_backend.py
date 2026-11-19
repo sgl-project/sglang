@@ -12,6 +12,81 @@ from sglang.srt.layers.attention.linear.kda_backend import (
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.utils import get_bool_env_var
+
+_KDA_INPUT_DEBUG = get_bool_env_var("SGLANG_DEBUG_KDA_INPUT_DUMP", "False")
+_KDA_DEBUG_STATE = {"calls": 0}
+
+
+def _debug_kda_input_check(
+    *,
+    q: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    ssm_states: torch.Tensor,
+    source_indices: torch.Tensor,
+    initial_state: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    intermediate: bool,
+    kwargs: dict,
+) -> None:
+    """Sanity-check chunk_kda_fwd inputs; the operator dead-loops on the
+    device (AI core 100%, never returns) when fed corrupted state/index
+    data, so dump everything suspicious before the call."""
+    _KDA_DEBUG_STATE["calls"] += 1
+    calls = _KDA_DEBUG_STATE["calls"]
+    if calls % 2000 == 0:
+        print(
+            f"[kda-debug] {calls} extend calls survived, "
+            f"q={tuple(q.shape)} nseq={query_start_loc.numel() - 1}",
+            flush=True,
+        )
+
+    def _stat(t: torch.Tensor):
+        if t.numel() == 0:
+            return "empty"
+        ft = t.float()
+        if not torch.isfinite(ft).all().item():
+            return "NON-FINITE"
+        return f"absmax={ft.abs().max().item():.3e}"
+
+    problems = []
+    pool = ssm_states.shape[0]
+    si_min = source_indices.min().item() if source_indices.numel() else -1
+    si_max = source_indices.max().item() if source_indices.numel() else -1
+    if si_max >= pool or si_min < -1:
+        problems.append(f"source_indices out of range [{si_min},{si_max}] pool={pool}")
+    qsl = query_start_loc.tolist()
+    if qsl[0] != 0 or any(b < a for a, b in zip(qsl, qsl[1:])) or qsl[-1] > q.shape[1]:
+        problems.append(
+            f"query_start_loc bad/monotonic-violating {qsl} qlen={q.shape[1]}"
+        )
+    st = _stat(initial_state)
+    if st == "NON-FINITE" or (st != "empty" and float(st.split("=")[1]) > 1e4):
+        problems.append(f"initial_state {st}")
+    for name in ("g", "beta"):
+        t = g if name == "g" else beta
+        s = _stat(t)
+        if s == "NON-FINITE":
+            problems.append(f"{name} NON-FINITE")
+    hs = kwargs.get("track_ssm_h_src")
+    if hs is not None and hs.numel():
+        h_min, h_max = hs.min().item(), hs.max().item()
+        if h_min < 0 or h_max > 1 << 20:
+            problems.append(
+                f"track_ssm_h_src range [{h_min},{h_max}] numel={hs.numel()}"
+            )
+
+    if problems:
+        print(
+            f"[kda-debug] CALL #{calls} SUSPICIOUS: {'; '.join(problems)} | "
+            f"q={tuple(q.shape)} qsl={qsl} src={source_indices.tolist()} "
+            f"initial_state={_stat(initial_state)} g={_stat(g)} beta={_stat(beta)} "
+            f"inter={intermediate} "
+            f"track_h_src={(hs.tolist() if hs is not None and hs.numel() else hs)}",
+            flush=True,
+        )
+
 
 _LOG2_E = math.log2(math.e)
 
@@ -20,8 +95,6 @@ class _AscendKDAExtendKernel:
     """Ascend-only KDA prefill decomposition backed by sgl-kernel-npu."""
 
     uses_state_checkpoints: bool = False
-    wants_int64_query_start_loc: bool = False
-
     wants_int64_query_start_loc: bool = False
 
     def extend(
@@ -62,6 +135,19 @@ class _AscendKDAExtendKernel:
         )
         scale = k.shape[-1] ** -0.5
         query_start_loc = query_start_loc.to(dtype=torch.int64).contiguous()
+
+        if _KDA_INPUT_DEBUG:
+            _debug_kda_input_check(
+                q=q,
+                query_start_loc=query_start_loc,
+                ssm_states=ssm_states,
+                source_indices=source_indices,
+                initial_state=initial_state,
+                g=g,
+                beta=beta,
+                intermediate=return_intermediate_states,
+                kwargs=kwargs,
+            )
 
         outputs = torch.ops.npu.chunk_kda_fwd(
             q,

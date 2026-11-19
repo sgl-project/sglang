@@ -745,8 +745,10 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         indexer_quant_mode: Optional[int] = None,
         use_combined_kv_buffer: bool = False,
         # Accepted to stay compatible with the generic hybrid DSA pool
-        # contract; both are inert on NPU (no Kimi-K3.1 fp8 scales / fp4 indexer).
+        # contract; all three are inert on NPU (no Kimi-K3.1 fp8 scales /
+        # fp4 indexer; fp8 casts are gated on CUDA in the in-tree DSA pool).
         kv_scale_ue8m0: bool = False,
+        fp8_cast_on_write: bool = False,
         use_fp4_indexer: bool = False,
         modelslim_cache_layout=None,
     ):
@@ -1284,6 +1286,17 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         loc, _, _ = unwrap_write_loc(loc_info)
         self._raise_if_native_kv_cache_disabled()
         layer_id = layer.layer_id
+        self._set_kv_buffer_npu(layer, layer_id, loc, cache_k, cache_v)
+
+    def _set_kv_buffer_npu(
+        self,
+        layer: "RadixAttention",
+        layer_id: int,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: Optional[torch.Tensor],
+    ):
+        """Write a layer's KV on the separated/combined/NZ ascend layouts."""
         if self.dsa_kv_cache_store_fp8:
             if cache_v is None:
                 cache_k, cache_v = cache_k.split(
@@ -1344,6 +1357,24 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 loc.view(-1, 1),
                 cache_v.view(-1, 1, self.qk_rope_head_dim),
             )
+
+    def set_mla_kv_buffer(
+        self,
+        layer,
+        loc_info,
+        cache_k_nope: torch.Tensor,
+        cache_k_rope: torch.Tensor,
+        layer_id_override: Optional[int] = None,
+    ):
+        # Ascend separated/combined/NZ layouts carry no fused kv_buffer;
+        # write through the ordinary NPU path (the GPU base class would
+        # touch self.kv_buffer and crash).
+        loc, _, _ = unwrap_write_loc(loc_info)
+        self._raise_if_native_kv_cache_disabled()
+        layer_id = (
+            layer_id_override if layer_id_override is not None else layer.layer_id
+        )
+        self._set_kv_buffer_npu(layer, layer_id, loc, cache_k_nope, cache_k_rope)
 
     def _set_fia_nz_kv_buffer(
         self,
@@ -1502,3 +1533,68 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                     assert cpu.shape[0] == len(target_indices)
                     buffer[target_indices] = cpu.to(buffer.device, non_blocking=True)
         torch.npu.synchronize()
+
+
+class NPUDSATokenToKVPool(NPUMLATokenToKVPool):
+    """DSA full-attention leaf for hybrid-linear models (Kimi K3.1) on Ascend.
+
+    Translates the in-tree ``DSATokenToKVPool`` keyword contract that
+    ``HybridLinearKVPool`` passes (index_kpool / skip_topk_layers / ...) into
+    the NPU DSA buffer layout the Ascend indexer kernels expect.
+    """
+
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        kv_lora_rank: int,
+        dtype: torch.dtype,
+        qk_rope_head_dim: int,
+        layer_num: int,
+        device: str,
+        index_head_dim: int,
+        enable_memory_saver: bool,
+        kv_cache_dim: Optional[int] = None,
+        index_kpool: int = 1,
+        index_kpool_compress: bool = False,
+        tail_extra_slots: int = 0,
+        max_running_requests: Optional[int] = None,
+        skip_topk_layers: Optional[Sequence[bool]] = None,
+        kv_scale_ue8m0: bool = False,
+        fp8_cast_on_write: bool = False,
+        use_fp4_indexer: bool = False,
+    ):
+        # Accepted for signature compatibility with the in-tree DSATokenToKVPool
+        # contract; the NPU indexer kernels manage fp8 latent + fp32 per-tile
+        # scales internally and do not use the GPU-side ue8m0 / fp4 layouts.
+        # fp8_cast_on_write is CUDA-only upstream (gated on _is_cuda), so it
+        # stays inert here.
+        self.kv_scale_ue8m0 = kv_scale_ue8m0
+        self.fp8_cast_on_write = False
+        self.use_fp4_indexer = use_fp4_indexer
+        assert index_kpool == 1, (
+            "The Ascend hybrid DSA pool does not support index_kpool > 1 yet"
+        )
+        if skip_topk_layers is None:
+            # Default (and draft-worker) pools index every full-attention layer.
+            indexer_layer_ids = None
+        else:
+            # Compact full-attention ids that compute their own top-k; layers
+            # reusing the previous layer's top-k get no index buffer.
+            indexer_layer_ids = [
+                i for i, skip in enumerate(skip_topk_layers) if not skip
+            ]
+        super().__init__(
+            size=size,
+            page_size=page_size,
+            dtype=dtype,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            layer_num=layer_num,
+            device=device,
+            enable_memory_saver=enable_memory_saver,
+            index_head_dim=index_head_dim,
+            index_page_size=page_size // index_kpool,
+            indexer_layer_ids=indexer_layer_ids,
+            kv_cache_dim=kv_cache_dim,
+        )

@@ -2045,6 +2045,19 @@ class AscendAttnBackend(AttentionBackend):
             and not forward_batch.forward_mode.is_target_verify()
         )
 
+        # attn-DP idle ranks run the target-verify keep-alive forward on pure
+        # padding rows: prepare_mlp_sync_batch relabels IDLE as TARGET_VERIFY
+        # and pads seq_lens with this backend's fill value (0), leaving the
+        # block table with zero pages, which aclnnSparseFlashAttention
+        # rejects with a tiling error (561002). The padded out_cache_loc is
+        # zeros as well, so skip the KV write below to avoid corrupting pool
+        # slot 0. Every padding row is discarded by the DP gather downstream.
+        if (
+            forward_batch._original_forward_mode is not None
+            and forward_batch._original_forward_mode.is_idle()
+        ):
+            return q.new_zeros(q.shape)
+
         if save_kv_cache:
             k = k.view(-1, layer.tp_k_head_num, self.kv_lora_rank)
             k_rope = k_rope.reshape(
@@ -2166,6 +2179,29 @@ class AscendAttnBackend(AttentionBackend):
                     actual_seq_lengths_kv,
                 )
             else:
+                # npu_sparse_flash_attention requires the GQA group size
+                # (num_q_heads / num_kv_heads) to be a power of two; Kimi K3.1
+                # has 96 q heads / 32 kv heads (group size 3), so pad the query
+                # heads to the next power of two by duplicating the last head
+                # and slice the padding off the output.
+                num_q_heads = q_nope.shape[1]
+                pad_heads = next_power_of_2(num_q_heads)
+                if pad_heads != num_q_heads:
+                    extra = pad_heads - num_q_heads
+                    q_nope = torch.cat(
+                        (
+                            q_nope,
+                            q_nope[:, -1:, :].expand(-1, extra, -1),
+                        ),
+                        dim=1,
+                    ).contiguous()
+                    q_pe = torch.cat(
+                        (
+                            q_pe,
+                            q_pe[:, -1:, :].expand(-1, extra, -1),
+                        ),
+                        dim=1,
+                    ).contiguous()
                 attn_out, _, _ = torch_npu.npu_sparse_flash_attention(
                     query=q_nope,
                     key=k_nope,
@@ -2188,6 +2224,8 @@ class AscendAttnBackend(AttentionBackend):
                     attention_mode=2,
                     return_softmax_lse=False,
                 )
+                if pad_heads != num_q_heads:
+                    attn_out = attn_out[:, :num_q_heads]
 
         return attn_out
 
@@ -3717,6 +3755,37 @@ class AscendAttnBackend(AttentionBackend):
                     value_quant_mode=0,
                 )
             else:
+                # DFLASH draft blocks are ENCODER_ONLY: the draft rows are
+                # mutually visible (non-causal) with a per-layer look-back
+                # sliding window over the prefix. sparse_mode=4 anchors its
+                # band edges on the tril diagonal in atten_mask and widens
+                # them by pre/next tokens, so the tril mtp_mask with
+                # pre_tokens=window / next_tokens=FULL yields keys in
+                # [p - window, end] per query row (verified against the
+                # triton window semantics; a maskless sparse_mode=4 is
+                # rejected by the kernel and a non-tril mask loses the band
+                # anchor). Non-sliding non-causal layers take plain full
+                # attention.
+                if layer.attn_type == AttentionType.ENCODER_ONLY:
+                    is_swa_verify = layer.sliding_window_size != -1
+                    verify_sparse_mode = 4 if is_swa_verify else 0
+                    verify_mask = self.mtp_mask if is_swa_verify else None
+                    verify_pre_tokens = (
+                        layer.sliding_window_size if is_swa_verify else 0
+                    )
+                    verify_next_tokens = FULL_ATTENTION_WINDOW if is_swa_verify else 0
+                else:
+                    # Causal verify chain (MTP/DSPARK): tril mask, full
+                    # look-back; a causal sliding layer narrows the left edge
+                    # (mirrors the non-MLA branch above).
+                    verify_sparse_mode = 4 if layer.sliding_window_size != -1 else 3
+                    verify_mask = self.mtp_mask
+                    verify_pre_tokens = (
+                        layer.sliding_window_size
+                        if layer.sliding_window_size != -1
+                        else FULL_ATTENTION_WINDOW
+                    )
+                    verify_next_tokens = 0
                 workspace = (
                     torch_npu._npu_fused_infer_attention_score_get_max_workspace(
                         q_nope,
@@ -3732,10 +3801,12 @@ class AscendAttnBackend(AttentionBackend):
                         antiquant_scale=None,
                         block_table=block_table,
                         block_size=self.page_size,
-                        sparse_mode=3,
-                        atten_mask=self.mtp_mask,
+                        sparse_mode=verify_sparse_mode,
+                        atten_mask=verify_mask,
                         actual_seq_lengths=actual_seq_lengths,
                         actual_seq_lengths_kv=actual_seq_lengths_kv,
+                        pre_tokens=verify_pre_tokens,
+                        next_tokens=verify_next_tokens,
                     )
                 )
                 attn_output = torch.empty_like(q_nope, dtype=q.dtype, device=q.device)
@@ -3754,10 +3825,12 @@ class AscendAttnBackend(AttentionBackend):
                     antiquant_scale=None,
                     block_table=block_table,
                     block_size=self.page_size,
-                    sparse_mode=3,
-                    atten_mask=self.mtp_mask,
+                    sparse_mode=verify_sparse_mode,
+                    atten_mask=verify_mask,
                     actual_seq_lengths=actual_seq_lengths,
                     actual_seq_lengths_kv=actual_seq_lengths_kv,
+                    pre_tokens=verify_pre_tokens,
+                    next_tokens=verify_next_tokens,
                     workspace=workspace,
                     out=[attn_output, softmax_lse],
                 )
