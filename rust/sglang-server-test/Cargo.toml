@@ -1,0 +1,14 @@
+[package]
+name = "sglang-server-test"
+description = "A scheduler-less sglang-server frontend for tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+bytes = { workspace = true }
+rmp-serde = "1"
+rmpv = "1"
+serde_json = { workspace = true }
+sglang-server = { path = "../sglang-server", features = ["test-utils"] }
