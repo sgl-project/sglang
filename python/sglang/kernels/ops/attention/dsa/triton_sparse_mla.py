@@ -960,6 +960,7 @@ def _sparse_mla_split_k_kernel(
         tile_start = pid_k * tiles_per_segment
         tile_end = tl.minimum(tile_start + tiles_per_segment, num_tiles)
     else:
+        valid_topk = topk
         tiles_per_segment = tl.cdiv(topk, KV_SPLITS * BLOCK_K)
         if pid_k * tiles_per_segment * BLOCK_K >= topk:
             return
@@ -982,7 +983,7 @@ def _sparse_mla_split_k_kernel(
     for j in tl.range(tile_start, tile_end, num_stages=3):
         k_start = j * BLOCK_K
         k_pos = k_start + k_offs
-        valid = k_pos < topk
+        valid = k_pos < valid_topk
 
         slot = tl.load(idx_ptr + t * topk + k_pos, mask=valid, other=0)
         valid = valid & (slot >= 0)

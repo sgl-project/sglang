@@ -91,6 +91,7 @@ def triton_sparse_mla_decode_splitk(
     expected_topk: int | None = None,
     natural_lse: bool = False,
     attn_sink: torch.Tensor | None = None,
+    lengths_tail_invalid: bool = True,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Split-K Triton sparse MLA decode (DSv4 pattern).
 
@@ -107,6 +108,8 @@ def triton_sparse_mla_decode_splitk(
     natural_lse: return the LSE in natural log, -inf for a row with no key
     attn_sink: optional [H] fp32 per-head sink logits added to the softmax
                denominator (the returned LSE excludes them)
+    lengths_tail_invalid: False when entries past lengths[i] may be stale slots;
+               lengths is then only a scan bound
     returns: [1, bs, H, d_v] bf16, plus a [bs, H] fp32 base-2 LSE if return_lse
     """
     if attn_sink is not None:
@@ -221,7 +224,7 @@ def triton_sparse_mla_decode_splitk(
                 STRIDE_QR_H=stride_qr_h,
                 USE_FP8_DOT=use_fp8_dot,
                 USE_TOPK_LENGTH=lengths is not None,
-                TOPK_TAIL_INVALID=lengths is not None,
+                TOPK_TAIL_INVALID=lengths is not None and lengths_tail_invalid,
                 KV_SCALED=kv_scaled,
                 BLOCK_H=BLOCK_H,
                 BLOCK_K=BLOCK_K,

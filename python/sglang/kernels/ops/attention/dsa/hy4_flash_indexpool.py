@@ -37,7 +37,6 @@ def _rope_quant_row(x, pos, inv_freq_ptr):
     freq = pos.to(tl.float32) * inv
     c = tl.cos(freq)
     s = tl.sin(freq)
-    # Gather the even/odd elements of each pair from x.
     even_idx = 64 + 2 * pair
     odd_idx = even_idx + 1
     xe = tl.gather(x, even_idx, 0)

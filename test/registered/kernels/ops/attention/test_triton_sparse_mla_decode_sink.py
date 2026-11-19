@@ -31,7 +31,7 @@ def _reference(q_nope, q_rope, kv, indices, lengths, sink):
 
 @unittest.skipUnless(torch.cuda.is_available(), "Triton sparse MLA needs CUDA")
 class TestTritonSparseMlaDecodeSink(CustomTestCase):
-    def _run(self, bs, heads, topk, kv_splits, with_sink):
+    def _run(self, bs, heads, topk, kv_splits, with_sink, stale_tail=False):
         torch.manual_seed(bs * 131 + heads * 7 + topk + (kv_splits or 0))
         num_slots = 4 * topk
         q_nope = torch.randn(bs, heads, D_V, device="cuda", dtype=torch.bfloat16)
@@ -41,7 +41,11 @@ class TestTritonSparseMlaDecodeSink(CustomTestCase):
         )
         lengths = torch.randint(1, topk + 1, (bs,), device="cuda", dtype=torch.int32)
         lengths[0] = topk
-        indices = torch.full((bs, 1, topk), -1, device="cuda", dtype=torch.int32)
+        indices = (
+            torch.randint(0, num_slots, (bs, 1, topk), device="cuda", dtype=torch.int32)
+            if stale_tail
+            else torch.full((bs, 1, topk), -1, device="cuda", dtype=torch.int32)
+        )
         for b in range(bs):
             n = int(lengths[b])
             indices[b, 0, :n] = torch.randperm(num_slots, device="cuda")[:n].int()
@@ -60,6 +64,7 @@ class TestTritonSparseMlaDecodeSink(CustomTestCase):
             kv_splits=kv_splits,
             lengths=lengths,
             attn_sink=sink,
+            lengths_tail_invalid=not stale_tail,
         )
         expected = _reference(q_nope, q_rope, kv, indices, lengths, sink)
         torch.testing.assert_close(
@@ -71,6 +76,11 @@ class TestTritonSparseMlaDecodeSink(CustomTestCase):
             for kv_splits in (1, None):
                 with self.subTest(bs=bs, heads=heads, topk=topk, kv_splits=kv_splits):
                     self._run(bs, heads, topk, kv_splits, with_sink=True)
+
+    def test_stale_tail_is_not_scanned(self):
+        for kv_splits in (1, None):
+            with self.subTest(kv_splits=kv_splits):
+                self._run(9, 16, 1024, kv_splits, with_sink=True, stale_tail=True)
 
     def test_without_sink_unchanged(self):
         for kv_splits in (1, None):
