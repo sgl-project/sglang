@@ -26,6 +26,22 @@ export HF_MODULES_CACHE="${HF_MODULES_CACHE:-/tmp/hf_modules}"
 echo "NPU info:"
 npu-smi info
 
+# =======temp install the Mooncake store client and upgrade memfabric-hybrid=====
+# The release image ships no mooncake_master on PATH, so install the store
+# client (mooncake_master lives in the package directory) together with the
+# matching memfabric transport. Both are forced so the wheel's build wins over
+# whatever the image bundled.
+MOONCAKE_WHEEL_BASE=https://sglang-npu.obs.cn-southwest-2.myhuaweicloud.com/memfabric/1.3.1
+pip install --force-reinstall --no-deps \
+    "${MOONCAKE_WHEEL_BASE}/mooncake_transfer_engine_memfabric-0.3.14-cp312-cp312-manylinux_2_35_aarch64.whl" \
+    "${MOONCAKE_WHEEL_BASE}/memfabric_hybrid-1.3.1-cp312-cp312-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl"
+# mooncake_master ships inside the package directory rather than on PATH;
+# expose it so the test helpers can keep launching it by name.
+MOONCAKE_MASTER_BIN="$(python -c 'import os, mooncake; print(os.path.join(os.path.dirname(mooncake.__file__), "mooncake_master"))' 2>/dev/null || true)"
+if [ -n "${MOONCAKE_MASTER_BIN}" ] && [ -f "${MOONCAKE_MASTER_BIN}" ]; then
+    export PATH="$(dirname "${MOONCAKE_MASTER_BIN}"):${PATH}"
+fi
+
 # Apply the container patches prepared by the workflow: every entry in
 # SGLANG_NPU_CONTAINER_PATCHES is a directory (relative to the repo root) whose
 # install.sh ships with that patch archive. The workflow downloads and extracts
@@ -200,16 +216,6 @@ echo "Finished test case ${test_case}"
 
 if [ -n "${METRICS_DATA_FILE}" ]; then
     mkdir -p "${METRICS_DATA_FILE}"
-    # Archive the test log into the output directory for result collection
-    cp "${log_path}/${tc_name}.log" "${METRICS_DATA_FILE}/test_output.log"
-    echo "Metrics log saved to ${METRICS_DATA_FILE}/test_output.log"
-    # Keep each pod's log under its own hostname directory so the prefill,
-    # decode and router logs all travel with the metrics artifact instead of
-    # overwriting the shared test_output.log above.
-    # Do not clear the directory first: the runner already archived this pod's
-    # log here as "<pod>.log" from kubectl, and removing it makes
-    # upload-artifact fail with ENOENT while zipping (run 44525399750). The two
-    # copies have different names, so they coexist.
     node_log_dir="${METRICS_DATA_FILE}/node_logs/${HOSTNAME}"
     mkdir -p "${node_log_dir}"
     cp -a "${log_path}/." "${node_log_dir}/"

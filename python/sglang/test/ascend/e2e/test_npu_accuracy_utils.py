@@ -584,8 +584,6 @@ class TestNpuAccuracyTestCaseBase(CustomTestCase):
     def setUpClass(cls):
         cls._setup_per_case_output()
         cls.base_url = DEFAULT_URL_FOR_TEST
-        # Start the storage service first: it may export MOONCAKE_* variables
-        # that the server environment copy below has to pick up.
         other_args = list(cls.other_args)
         cls.storage_service_process = maybe_start_hicache_storage_service(other_args)
 

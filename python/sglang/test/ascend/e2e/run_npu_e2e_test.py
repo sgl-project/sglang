@@ -554,24 +554,21 @@ def _parse_metric_labels(raw):
 def generate_metrics_json(
     metrics_data_file, test_case, status, streamed_metrics=None, streamed_labels=None
 ):
-    """Collect [METRIC] lines from the log and write metrics.json.
+    """Collect [METRIC] lines and write metrics.json.
 
     This writes ${metrics_data_file}/metrics.json only, which feeds the
     persistence-directory output (e.g. /root/.cache/tests/output/...).
     It is NOT consumed by CI artifacts (the former /tmp/metrics.json +
     'Upload metrics' path was removed).
 
-    ``streamed_metrics`` carries the [METRIC] values already parsed from the
-    live pod log; they are merged in because the archived test_output.log can
-    be missing when the pod is deleted as soon as the test finishes.
+    The [METRIC] lines are parsed from the live pod log stream
+    (``streamed_metrics``); each pod archives its own log under node_logs/ for
+    the artifact, so there is no single shared log file to read back here.
 
-    ``streamed_labels`` (merged with the labels parsed from the archived log)
-    keeps each metric's dump_metric labels -- notably the evaluation
-    ``dataset`` -- so consumers can tell gpqa_diamond from gsm8k instead of
-    reading a bare ``accuracy`` number.
+    ``streamed_labels`` keeps each metric's dump_metric labels -- notably the
+    evaluation ``dataset`` -- so consumers can tell gpqa_diamond from gsm8k
+    instead of reading a bare ``accuracy`` number.
     """
-    log_file = os.path.join(metrics_data_file, "test_output.log")
-
     metrics = {}
     baselines = {}
     metric_labels = {}
@@ -581,23 +578,6 @@ def generate_metrics_json(
             baselines[key[: -len("_baseline")]] = value
         else:
             metrics[key] = value
-
-    if os.path.exists(log_file):
-        with open(log_file, "r") as f:
-            for line in f:
-                m = re.match(r"\[METRIC\] (\S+)=(\S+)(?: labels=(.*))?$", line.strip())
-                if m:
-                    value = m.group(2)
-                    try:
-                        value = float(value)
-                    except ValueError:
-                        pass
-                    _record_metric(m.group(1), value)
-                    labels = _parse_metric_labels(m.group(3))
-                    if labels:
-                        metric_labels[m.group(1)] = labels
-    else:
-        logger.warning(f"Metrics log file not found: {log_file}")
 
     for key, value in (streamed_metrics or {}).items():
         _record_metric(key, value)

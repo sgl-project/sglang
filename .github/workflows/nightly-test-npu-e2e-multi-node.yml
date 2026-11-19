@@ -364,12 +364,9 @@ jobs:
         with:
           name: npu-metrics-${{ inputs.test_config_name }}
           # output/<branch>-<create_time>-<run_id>-<run_attempt>/<workflow>/<test_type>/<case>
-          # Pods also copy their own log into <case>/node_logs/<host>/, so every
-          # node's log travels with the metrics artifact at no extra cost.
           path: /root/.cache/tests/output/*-${{ github.run_id }}-${{ github.run_attempt }}/*/${{ inputs.test_type }}/*
           if-no-files-found: ignore
           retention-days: 7
-          # The bundle carries text logs now; the highest deflate level shrinks it.
           compression-level: 9
 
       - name: Post process
