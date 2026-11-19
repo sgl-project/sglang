@@ -1,4 +1,4 @@
-"""gfx950 one-launch Qwen3.5 MoE router for 1..8 tokens: gate GEMV (routed logits rounded to bf16, as today) +
+"""gfx950/gfx942 one-launch Qwen3.5 MoE router for 1..8 tokens: gate GEMV (routed logits rounded to bf16, as today) +
 softmax top-10 + renormalize + fused shared-expert slot, written as the [M, 11] int32 ids / fp32 weights that
 smallm_moe_gfx950 consumes. A build/load failure disables it."""
 
@@ -10,10 +10,12 @@ import subprocess
 import torch
 
 from sglang.kernels.arch import current_arch
-from sglang.kernels.jit.utils.hipcc import HipKernel, build_gfx950_module
+from sglang.kernels.jit.utils.hipcc import HipKernel, build_hip_module
 
 _SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "smallm_router.hip")
 MAX_TOK = 8  # MAX_TOK in smallm_router.hip; from 9 tokens the unfused path is faster
+# gfx942 builds the same source with the bf16 dot product as two FMAs (no dot12-insts there).
+_ARCHS = ("gfx950", "gfx942")
 _kernels: dict = {}
 _ws: dict = {}
 _disabled = False
@@ -37,7 +39,7 @@ def smallm_router_supported(x: torch.Tensor) -> bool:
     return (
         not _disabled
         and hip is not None
-        and hip.gcn_arch == "gfx950"
+        and hip.gcn_arch in _ARCHS
         and 1 <= x.shape[0] <= MAX_TOK
         and x.dtype == torch.bfloat16
         and x.shape[1] == 4096
@@ -61,7 +63,9 @@ def smallm_router(x, gate_weight, shared_gate_weight, scale=1.0):
         )
     if not _kernels:
         try:
-            mod = build_gfx950_module(_SRC, "sglang_smallm_router_")
+            mod = build_hip_module(
+                _SRC, "sglang_smallm_router_", current_arch().hip.gcn_arch
+            )
             _kernels.update({r: HipKernel(mod, f"smallm_router_r{r}") for r in (1, 2)})
         except (OSError, subprocess.CalledProcessError, RuntimeError) as e:
             logger.warning("smallm_router disabled: %s", e)

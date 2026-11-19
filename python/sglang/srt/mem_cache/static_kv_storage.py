@@ -11,6 +11,7 @@ entries each static pool family registers. All of it goes when those pools do.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 import msgspec
@@ -374,8 +375,9 @@ class StaticKVStorage:
         rows: Optional[torch.Tensor],
         seq_lens: torch.Tensor,
         seq_lens_cpu: torch.Tensor,
-        last_loc: torch.Tensor,
+        last_loc: Optional[torch.Tensor],
         make_room: Callable[[int], Any],
+        req_to_token_write: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         tree_cache: Optional[BasePrefixCache] = None,
         batch: Optional[ScheduleBatch] = None,
     ) -> Optional[torch.Tensor]:
@@ -387,6 +389,8 @@ class StaticKVStorage:
         # returns a DSV4OutCacheLoc bundle; hasattr-gated so others stay unchanged.
         is_dsv4 = rows is not None and hasattr(allocator, "c128_attn_allocator")
         extra_alloc_kwargs = {}
+        if req_to_token_write is not None:
+            extra_alloc_kwargs["req_to_token_write"] = req_to_token_write
         if is_dsv4:
             c128_num_pages = allocator.c128_num_pages_needed(
                 (seq_lens_cpu - 1).clamp(min=0), seq_lens_cpu
@@ -613,6 +617,10 @@ class StaticKVStorage:
     def take_state_slots(self, sub_pool: str, count: int) -> Optional[torch.Tensor]:
         """``count`` free state slots of ``sub_pool``; None when none are free."""
         return self._allocator.state_slots.alloc(count)
+
+    def lease_state_slots(self, sub_pool: str, count: int):
+        """A static pool's take is a free-list slice: nothing to lease."""
+        return nullcontext()
 
     def free_state_slots(self, sub_pool: str, slots: torch.Tensor) -> None:
         self._allocator.state_slots.free(slots)
