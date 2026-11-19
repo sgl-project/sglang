@@ -81,6 +81,9 @@ class RolloutRequest(BaseModel):
     rollout: bool = True
     # Streams to roll out besides the primary one, e.g. ["audio"].
     rollout_extra_streams: list[str] = []
+    # Per extra stream, the SDE kernel fields that differ from the top-level ones, e.g.
+    # {"audio": {"rollout_sde_type": "ode", "rollout_log_prob_no_const": True}}.
+    rollout_extra_stream_sde_args: dict[str, dict[str, Any]] = {}
     # "uint8": quantise the video engine-side; None: ship unchanged
     rollout_video_dtype: Optional[str] = None
     rollout_sde_type: str = "sde"

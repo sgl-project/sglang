@@ -7,12 +7,18 @@ from __future__ import annotations
 import argparse
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from sglang.multimodal_gen.runtime.utils.argparse import StoreBoolean
 
 _VALID_ROLLOUT_SDE_TYPES = ("sde", "cps", "ode")
+# The settings of a stream's SDE kernel; an extra stream may override each of them.
+_STREAM_SDE_KERNEL_FIELDS = (
+    "rollout_sde_type",
+    "rollout_noise_level",
+    "rollout_log_prob_no_const",
+)
 
 # Name of the stream the denoise loop iterates.
 PRIMARY_STREAM = "primary"
@@ -22,12 +28,24 @@ AUDIO_STREAM = "audio"
 _STREAM_NAME_PATTERN = re.compile(r"[a-z][a-z0-9_]*")
 
 
+def stream_sde_kernel_settings(params: Any, stream: str) -> dict[str, Any]:
+    """The SDE kernel settings ``stream`` is rolled out with: the top-level fields for the
+    primary stream, and for an extra stream those fields with its override applied."""
+    settings = {name: getattr(params, name) for name in _STREAM_SDE_KERNEL_FIELDS}
+    if stream != PRIMARY_STREAM:
+        settings.update(params.rollout_extra_stream_sde_args.get(stream, {}))
+    return settings
+
+
 @dataclass
 class RLRolloutArgs:
     """Rollout (log-prob trajectory) options used by SamplingParams and APIs."""
 
     rollout: bool = False
     rollout_extra_streams: tuple[str, ...] = ()
+    rollout_extra_stream_sde_args: dict[str, dict[str, Any]] = field(
+        default_factory=dict
+    )
     rollout_sde_type: str = "sde"
     rollout_noise_level: float = 0.7
     rollout_log_prob_no_const: bool = False
@@ -50,6 +68,7 @@ class RLRolloutArgs:
             )
 
         self._validate_extra_streams()
+        self._validate_extra_stream_sde_args()
 
         if not self.rollout_return_generated_output and not self.rollout:
             raise ValueError(
@@ -76,6 +95,39 @@ class RLRolloutArgs:
             ):
                 raise ValueError(f"Invalid rollout extra stream name: {stream!r}")
 
+    def _validate_extra_stream_sde_args(self) -> None:
+        overrides = self.rollout_extra_stream_sde_args
+        if not isinstance(overrides, dict):
+            raise ValueError(
+                "rollout_extra_stream_sde_args must map stream names to "
+                f"SDE kernel overrides, got {overrides!r}"
+            )
+        for stream, override in overrides.items():
+            if stream not in self.rollout_extra_streams:
+                raise ValueError(
+                    f"rollout_extra_stream_sde_args names {stream!r}, "
+                    "which is not in rollout_extra_streams "
+                    f"{list(self.rollout_extra_streams)}; the top-level fields are "
+                    "the primary stream's"
+                )
+            if not isinstance(override, dict):
+                raise ValueError(
+                    f"The override of stream {stream!r} must be a dict, got {override!r}"
+                )
+            unknown = sorted(set(override) - set(_STREAM_SDE_KERNEL_FIELDS))
+            if unknown:
+                raise ValueError(
+                    f"The override of stream {stream!r} sets {unknown}; an override may "
+                    f"set only {list(_STREAM_SDE_KERNEL_FIELDS)}"
+                )
+            _validate_override_values(stream=stream, override=override)
+        for stream in self.rollout_extra_streams:
+            _validate_stream_sde_kernel(
+                stream=stream,
+                settings=stream_sde_kernel_settings(self, stream),
+                overridden=set(overrides.get(stream, {})),
+            )
+
     @classmethod
     def validate_sampling_params(cls, params: Any) -> None:
         """Validate rollout fields on a duck-typed object (e.g. ``SamplingParams``).
@@ -86,6 +138,7 @@ class RLRolloutArgs:
         cls(
             rollout=params.rollout,
             rollout_extra_streams=params.rollout_extra_streams,
+            rollout_extra_stream_sde_args=params.rollout_extra_stream_sde_args,
             rollout_sde_type=params.rollout_sde_type,
             rollout_noise_level=params.rollout_noise_level,
             rollout_log_prob_no_const=params.rollout_log_prob_no_const,
@@ -159,6 +212,9 @@ class RLRolloutArgs:
                 if isinstance(extra_streams, str)
                 else tuple(extra_streams)
             ),
+            rollout_extra_stream_sde_args=kwargs.get(
+                "rollout_extra_stream_sde_args", {}
+            ),
             rollout_sde_type=str(kwargs.get("rollout_sde_type", cls.rollout_sde_type)),
             rollout_noise_level=float(
                 kwargs.get("rollout_noise_level", cls.rollout_noise_level)
@@ -169,4 +225,60 @@ class RLRolloutArgs:
             rollout_debug_mode=bool(
                 kwargs.get("rollout_debug_mode", cls.rollout_debug_mode)
             ),
+        )
+
+
+def _validate_override_values(*, stream: str, override: dict[str, Any]) -> None:
+    # Unlike the top-level fields, override values reach here as sent: no coercion.
+    if "rollout_sde_type" in override and (
+        override["rollout_sde_type"] not in _VALID_ROLLOUT_SDE_TYPES
+    ):
+        raise ValueError(
+            f"Stream {stream!r}: rollout_sde_type must be one of "
+            f"{_VALID_ROLLOUT_SDE_TYPES}, got {override['rollout_sde_type']!r}"
+        )
+    if "rollout_noise_level" in override:
+        noise = override["rollout_noise_level"]
+        if (
+            isinstance(noise, bool)
+            or not isinstance(noise, (int, float))
+            or not math.isfinite(noise)
+            or noise < 0
+        ):
+            raise ValueError(
+                f"Stream {stream!r}: rollout_noise_level must be a finite "
+                f"non-negative number, got {noise!r}"
+            )
+    if "rollout_log_prob_no_const" in override and not isinstance(
+        override["rollout_log_prob_no_const"], bool
+    ):
+        raise ValueError(
+            f"Stream {stream!r}: rollout_log_prob_no_const must be a bool, "
+            f"got {override['rollout_log_prob_no_const']!r}"
+        )
+
+
+def _validate_stream_sde_kernel(
+    *, stream: str, settings: dict[str, Any], overridden: set[str]
+) -> None:
+    """Reject the SDE kernels FlowRolloutController would reject at its first step."""
+
+    def described(name: str) -> str:
+        source = "override" if name in overridden else "inherited from the top level"
+        return f"{name}={settings[name]!r} ({source})"
+
+    sde_type = settings["rollout_sde_type"]
+    if settings["rollout_log_prob_no_const"]:
+        return
+    if sde_type == "ode":
+        raise ValueError(
+            f"Stream {stream!r}: {described('rollout_sde_type')} has no log-prob "
+            f"with constants, so it needs rollout_log_prob_no_const=True, got "
+            f"{described('rollout_log_prob_no_const')}"
+        )
+    if not float(settings["rollout_noise_level"]) > 0:
+        raise ValueError(
+            f"Stream {stream!r}: {described('rollout_sde_type')} with "
+            f"{described('rollout_log_prob_no_const')} needs rollout_noise_level > 0, "
+            f"got {described('rollout_noise_level')}"
         )

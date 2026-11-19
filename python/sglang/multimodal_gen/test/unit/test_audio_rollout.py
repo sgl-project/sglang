@@ -188,6 +188,99 @@ def test_audio_step_does_not_advance_the_request_generators(batch):
             )
 
 
+def _coupled_rollout(batch, overrides):
+    """Roll out both streams with model outputs that read the other stream's latents, as LTX-2's audio-video cross-attention does."""
+    batch.rollout_extra_stream_sde_args = overrides
+    batch.scheduler = FlowMatchEulerDiscreteScheduler(shift=1.0)
+    batch.scheduler.set_timesteps(sigmas=[0.8, 0.4])
+    batch.timesteps = batch.scheduler.timesteps
+    batch.latents = torch.zeros(2, 4, 2)
+    batch.audio_latents = torch.ones(2, 5, 3)
+    batch.generator = [torch.Generator().manual_seed(10 + i) for i in range(2)]
+    with rollout_scope(batch):
+        audio_scheduler = _prepare_both_streams(batch)
+        sde_kernels = {
+            stream: (
+                controller.sde_type,
+                controller.noise_level,
+                controller.log_prob_no_const,
+                controller.sde_step_indices,
+            )
+            for stream, controller in batch.rollout_controllers.items()
+        }
+        for timestep in batch.timesteps:
+            primary_output = batch.latents + batch.audio_latents.mean()
+            audio_output = batch.audio_latents - batch.latents.mean()
+            batch.latents = batch.scheduler.step(
+                primary_output,
+                timestep,
+                batch.latents,
+                **rollout_step_kwargs(batch, stream=PRIMARY_STREAM),
+                return_dict=False,
+            )[0]
+            batch.audio_latents = audio_scheduler.step(
+                audio_output,
+                timestep,
+                batch.audio_latents,
+                **rollout_step_kwargs(batch, stream=AUDIO_STREAM),
+                return_dict=False,
+            )[0]
+        _finalize_stream(batch, PRIMARY_STREAM, batch.latents)
+        _finalize_stream(batch, AUDIO_STREAM, batch.audio_latents)
+        publish_rollout_if_enabled(batch=batch, pipeline_config=_PIPELINE_CONFIG)
+    generator_states = [g.get_state() for g in batch.generator]
+    return (
+        batch.rollout_trajectory_data.streams[PRIMARY_STREAM],
+        sde_kernels,
+        generator_states,
+    )
+
+
+@pytest.mark.parametrize(
+    "top_level,audio_override",
+    [
+        (("sde", 0.7, False), ("ode", 0.0, True)),
+        (("sde", 0.7, False), ("cps", 0.3, True)),
+        (("cps", 0.5, False), ("sde", 0.2, True)),
+    ],
+)
+def test_audio_override_reaches_only_the_audio_controller(
+    batch, top_level, audio_override
+):
+    """An audio override sets the audio SDE kernel only: the primary keeps the top-level SDE kernel, its noise and its log-probs, though its trajectory follows the changed audio."""
+    names = ("rollout_sde_type", "rollout_noise_level", "rollout_log_prob_no_const")
+    for name, value in zip(names, top_level):
+        setattr(batch, name, value)
+    batch.rollout_debug_mode = True
+    # Step 0 is stochastic, so the audio SDE kernel changes the latents the primary's step 1 reads.
+    batch.rollout_sde_step_indices = [0]
+    overrides = {AUDIO_STREAM: dict(zip(names, audio_override))}
+    sent_overrides = copy.deepcopy(overrides)
+
+    inherited, inherited_sde_kernels, inherited_states = _coupled_rollout(batch, {})
+    overridden, sde_kernels, states = _coupled_rollout(batch, overrides)
+
+    assert overrides == sent_overrides
+    assert sde_kernels[PRIMARY_STREAM] == (*top_level, [0])
+    assert sde_kernels[AUDIO_STREAM] == (*audio_override, [0])
+    assert inherited_sde_kernels[AUDIO_STREAM] == (*top_level, [0])
+    for state, inherited_state in zip(states, inherited_states):
+        torch.testing.assert_close(state, inherited_state, rtol=0, atol=0)
+    torch.testing.assert_close(
+        overridden.rollout_log_probs, inherited.rollout_log_probs, rtol=0, atol=0
+    )
+    for name in ("rollout_variance_noises", "rollout_noise_std_devs"):
+        torch.testing.assert_close(
+            getattr(overridden.rollout_debug_tensors, name),
+            getattr(inherited.rollout_debug_tensors, name),
+            rtol=0,
+            atol=0,
+        )
+    assert not torch.equal(
+        overridden.dit_trajectory.latents, inherited.dit_trajectory.latents
+    )
+
+
 @pytest.mark.parametrize("stop_step_index,kept_steps", [(None, [0, 2]), (0, [0, 1])])
 def test_audio_rollout_reaches_the_response_through_select_and_merge(
     batch, stop_step_index, kept_steps
@@ -439,6 +532,39 @@ def test_invalid_extra_stream_names_are_rejected_up_front(kwargs, error):
         RLRolloutArgs.from_dict(kwargs).validate()
 
 
+@pytest.mark.parametrize(
+    "overrides,error",
+    [
+        ({PRIMARY_STREAM: {}}, "not in rollout_extra_streams"),
+        ({"audio": "ode"}, "must be a dict"),
+        ({"audio": {"rollout_sde_step_indices": [0]}}, "may set only"),
+        ({"audio": {"rollout_sde_type": "SDE"}}, "rollout_sde_type must be one of"),
+        ({"audio": {"rollout_noise_level": True}}, "finite non-negative number"),
+        ({"audio": {"rollout_log_prob_no_const": "true"}}, "must be a bool"),
+        (
+            {"audio": {"rollout_sde_type": "ode"}},
+            r"rollout_sde_type='ode' \(override\).*rollout_log_prob_no_const=False "
+            r"\(inherited from the top level\)",
+        ),
+        (
+            {"audio": {"rollout_noise_level": 0}},
+            r"needs rollout_noise_level > 0, got rollout_noise_level=0 \(override\)",
+        ),
+    ],
+)
+def test_invalid_extra_stream_overrides_are_rejected_up_front(overrides, error):
+    """An override is checked before any model work, as sent and against the rules the stream's controller would assert at its first step."""
+    kwargs = {
+        "rollout": True,
+        "rollout_extra_streams": (AUDIO_STREAM,),
+        "rollout_extra_stream_sde_args": overrides,
+    }
+    with pytest.raises(ValueError, match=error):
+        SamplingParams(prompt="test", **kwargs)
+    with pytest.raises(ValueError, match=error):
+        RLRolloutArgs.from_dict(kwargs).validate()
+
+
 def test_batched_noise_rows_match_single_sample_draws(batch):
     """With B>1 each row's noise is its own seed's B=1 draw."""
     _prepare_primary_stream(batch)
@@ -602,6 +728,18 @@ def test_http_rejects_extra_streams_without_rollout(monkeypatch):
     _assert_rejected(
         request, forward, match="rollout_extra_streams requires rollout=True"
     )
+
+
+def test_http_rejects_an_override_for_a_stream_it_does_not_roll_out(monkeypatch):
+    """A misspelled stream name must not be dropped, leaving audio on the primary's SDE kernel."""
+    forward = _patch_served_pipeline_and_forward(monkeypatch, LTX2Pipeline, None, None)
+    request = RolloutRequest(
+        prompt="test",
+        seed=42,
+        rollout_extra_streams=[AUDIO_STREAM],
+        rollout_extra_stream_sde_args={"audoi": {"rollout_noise_level": 0.3}},
+    )
+    _assert_rejected(request, forward, match="not in rollout_extra_streams")
 
 
 def test_audio_rollout_requires_generated_audio():

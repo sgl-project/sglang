@@ -570,6 +570,7 @@ def _build_sampling_kwargs(request: RolloutRequest) -> dict:
         image_path=request.image_path,
         rollout=request.rollout,
         rollout_extra_streams=tuple(request.rollout_extra_streams),
+        rollout_extra_stream_sde_args=request.rollout_extra_stream_sde_args,
         rollout_sde_type=request.rollout_sde_type,
         rollout_noise_level=request.rollout_noise_level,
         rollout_log_prob_no_const=request.rollout_log_prob_no_const,
