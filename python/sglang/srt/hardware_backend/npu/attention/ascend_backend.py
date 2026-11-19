@@ -566,17 +566,12 @@ class AscendAttnBackend(AttentionBackend):
             and envs.SGLANG_NPU_PREPARE_METADATA_IN_GRAPH.get()
             and get_disagg().disaggregation_mode != "prefill"
         )
+        # Ordinary read-done events do not require the external-event API.
         self.shared_read_enabled = (
             supports_shared_read
             and envs.SGLANG_ENABLE_WAR_BARRIER.get()
             and not get_schedule().disable_overlap_schedule
         )
-        if self.shared_read_enabled:
-            from sglang.srt.hardware_backend.npu.graph_runner.npu_cudagraph_backend import (
-                get_npu_shared_read_event_api,
-            )
-
-            self.shared_read_enabled = get_npu_shared_read_event_api() is not None
         self._shared_read_runner = model_runner
 
     def _supports_shared_read(self, model_runner: ModelRunner) -> bool:
@@ -1202,6 +1197,13 @@ class AscendAttnBackend(AttentionBackend):
                 dtype=torch.int32,
                 device=self.device,
             ),
+            "page_offsets": torch.arange(
+                0,
+                self.req_to_token.shape[1],
+                self.page_size,
+                dtype=torch.int64,
+                device=self.device,
+            ),
         }
         if self.dense_mla_dcp_target and self.speculative_num_draft_tokens is not None:
             self.graph_metadata["dcp_mtp_attn_mask"] = torch.ones(
@@ -1416,8 +1418,10 @@ class AscendAttnBackend(AttentionBackend):
             block_tables.shape[1],
             (self.req_to_token.shape[1] + self.page_size - 1) // self.page_size,
         )
+        # Index both dimensions to avoid copying the full pool's strided view.
         full_page_locs = self.req_to_token[
-            req_pool_indices, : total_pages * self.page_size : self.page_size
+            req_pool_indices[:, None],
+            self.graph_metadata["page_offsets"][None, :total_pages],
         ]
         block_tables[:, :total_pages].copy_(full_page_locs // self.page_size)
         block_tables[:, total_pages:].fill_(0)
