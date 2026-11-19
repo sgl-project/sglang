@@ -3,6 +3,7 @@
 Detailed behavior of the features summarized in [README.md](README.md). Routing
 design, policies and bucket configuration are in [ARCHITECTURE.md](ARCHITECTURE.md).
 
+- [Per-model routing](#per-model-routing)
 - [Discovery and KV signals](#discovery-and-kv-signals)
 - [Bucket file membership](#bucket-file-membership)
 - [Routing and reliability](#routing-and-reliability)
@@ -15,6 +16,57 @@ design, policies and bucket configuration are in [ARCHITECTURE.md](ARCHITECTURE.
 - [HTTP/2](#http2)
 - [Native gRPC](#native-grpc)
 - [Upgrading from `cache_aware_zmq`](#upgrading-from-cache_aware_zmq)
+
+## Per-model routing
+
+Declare models with `--model-id` and repeatable `--additional-model`, then pass
+`--model-config models.json` to override their routing defaults:
+
+```json
+{
+  "models": [
+    {
+      "id": "second",
+      "policy": "load_based",
+      "decode_policy": "legacy_host_affinity",
+      "dp_aware": true,
+      "dp_rank_policy": "round_robin",
+      "bucket_config": {
+        "buckets": [
+          {"id": "second-prefill", "stage": "prefill", "rank": 0,
+           "worker_ids": ["http://second-worker:30000"]}
+        ]
+      }
+    }
+  ]
+}
+```
+
+Only `id`, `policy`, `decode_policy`, `dp_aware`, `dp_rank_policy`,
+`bucket_config` and `reorg_admission` are accepted in each entry. Omitted or null
+fields inherit CLI defaults; partial `reorg_admission` objects retain unspecified
+CLI limits. IDs must name already-declared models and may appear once. Unknown
+models, unknown fields and invalid combinations fail startup. Bucket configuration
+cannot be cleared with null; it retains the inherited configuration.
+
+`bucket_config` uses the existing legacy schema above, or the existing reorg
+schema under `--chat-routing reorg` (for example
+`{"buckets":[{"id":"second-plain","plain":{}}]}`). Reorg entries may set
+`reorg_admission` using the existing admission fields: `max_running_usage`,
+`max_kv_usage`, `max_waiting_requests`, `max_pending_prefill_tokens` and
+`max_inflight_requests`. Legacy routing rejects `reorg_admission`.
+
+Policy-specific settings remain CLI-configured. Changing policy clears settings
+that do not apply, retains compatible CLI affinity tuning, and fills missing
+session/cache settings from existing defaults. Switching to session-aware clears
+cache-only uncached-token bucketing; switching to cache-aware clears session-only
+stable-pair and session-lookup settings. Sticky and score-composition policies require an existing CLI sticky or
+score configuration. Decode policy accepts `power_of_two` or
+`legacy_host_affinity`; `round_robin` is a DP-rank policy. Reorg retains its existing
+supported policy and decode-policy restrictions. Cache-aware prefix source,
+Indexer endpoint and cache/bootstrap settings are shared across models; mixed
+cache-source settings are rejected. Tokenizer, sampling, proxy, circuit-breaker
+and discovery settings are outside this override format.
 
 ## Discovery and KV signals
 
@@ -493,6 +545,9 @@ how much tokenization work the cache reuses.
 
 ## Native `/generate`
 
+`/generate`, Embeddings, Classify and Rerank retain JSON last-value-wins behavior
+for repeated keys. Chat and Completions reject repeated routing fields.
+
 `/generate` (`POST` or `PUT`) has the engine's interface: the same
 `GenerateReqInput` body and the same response, buffered or SSE. The body names no
 model, so requests go to the one this router serves. Worker selection
@@ -554,8 +609,9 @@ unset. `sgl_router_openai_route_total` counts each outcome.
 ## Embeddings
 
 `/v1/embeddings` has the engine's interface: the same OpenAI `EmbeddingRequest`
-body and response. As for chat completions, any `model` name is served as
-`--model-id`. A PD fleet answers 400, since prefill and decode engines serve no
+body and response. As for chat completions, the request selects its configured
+model when `--additional-model` is used; single-model deployments route any model
+name to `--model-id`. A PD fleet answers 400, since prefill and decode engines serve no
 embeddings.
 
 Text `input` (a string or a list) is tokenized and forwarded as token IDs, as for

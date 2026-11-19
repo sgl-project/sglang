@@ -2,7 +2,7 @@
 
 Slim, KV-aware router for SGLang workers.
 
-A router serves one model and spreads its requests across that model's SGLang
+A router serves one or more models and spreads each model's requests across its SGLang
 engines. It picks an engine per request from live engine load, global KV-cache prefix
 matches, or session affinity, supports prefill/decode (P/D) disaggregation, bucketed deployments, and
 discovers engines from a static URL list or Kubernetes EndpointSlices.
@@ -92,15 +92,38 @@ curl http://localhost:30000/v1/chat/completions \
   -d '{"model": "qwen3", "messages": [{"role": "user", "content": "Hello"}]}'
 ```
 
-`--model-id` is required. Any `model` name is served as `--model-id`, and the
-engine receives it as sent. `--model-alias` (repeatable) forwards another `model`
-name as `--model-id`, for example a gateway that sends the engine's
-`--model-path`. Aliases are forwarded as `--model-id`, preserving an optional
-`:adapter` LoRA suffix; names containing colons, such as `s3://bucket/model`,
-are matched in full. `/v1/models` lists only `--model-id`. `--tokenizer-path` takes a local `tokenizer.json` or a
-HuggingFace repo id; when omitted, the tokenizer for `--model-id` is downloaded
-from HuggingFace (honoring `HF_TOKEN` / `HF_HOME`). `sgl-router --help` lists
-every flag.
+`--model-id` is required and names the default model. Without additional models,
+any request `model` name routes to this model, preserving the engine's naming
+behavior. `--model-alias` (repeatable) rewrites an alias to `--model-id`, preserving
+an optional `:adapter` LoRA suffix. Names containing colons, such as
+`s3://bucket/model`, are matched in full.
+
+Add a model with repeatable `--additional-model MODEL=TOKENIZER_PATH`:
+
+```bash
+./target/release/sgl-router \
+  --model-id first --tokenizer-path /models/first \
+  --additional-model second=/models/second \
+  --worker-urls http://first-worker:30000 http://second-worker:30000 \
+  --policy cache_aware
+```
+
+Each model loads its own tokenizer, chat template, model configuration and
+generation configuration from its source. CLI routing parameters provide defaults;
+[`--model-config`](REFERENCE.md#per-model-routing) overrides each model's policy,
+buckets and supported admission limits. Sampling overrides, tokenizer backend and
+template kwargs remain shared, with separate policy and tokenizer state per model. The default model's aliases are retained. In this mode,
+requests select the configured model or alias (and optional LoRA suffix); unknown
+model names return 404. `/v1/models` lists every configured model, excluding aliases.
+Workers are pooled by `served_model_name` from `/model_info` (falling back to
+`/server_info`), so those names must match the configured IDs. Static URLs may contain workers for
+different models. No worker-management API is required.
+
+Native `/generate` and native gRPC requests without a model select `--model-id`.
+Additional models require tokenizers; `--no-tokenizer` remains available for
+single-model deployments. `--tokenizer-path` accepts a local `tokenizer.json` or
+HuggingFace repo ID; when omitted, the default model's tokenizer is downloaded
+from HuggingFace (honoring `HF_TOKEN` / `HF_HOME`). `sgl-router --help` lists every flag.
 
 ## Key interfaces
 
@@ -113,7 +136,7 @@ every flag.
 | `POST /v1/messages`, `/v1/messages/count_tokens` | [Anthropic Messages](#anthropic-messages) |
 | `POST /v1/embeddings`, `/v1/classify`, `/v1/rerank` | [Embeddings, classify and rerank](#embeddings-classify-and-rerank) |
 | `POST /v1/tokenize`, `/v1/detokenize` | Tokenize with the router's tokenizer |
-| `GET /v1/models` | The served model |
+| `GET /v1/models` | All configured models |
 | `POST /flush_cache` | Fan out a cache flush to every worker, with the caller's `timeout` |
 | `GET /server_info` | Answered by one healthy worker (a decode worker under P/D, which reports decode's state); `/get_server_info` is an alias |
 | `GET /model_info`, `/health_generate` | Answered by one healthy worker (a prefill worker under P/D; `/health_generate` also runs on one of its decode peers and returns the decode's answer when both pass); `/get_model_info` is an alias |
@@ -132,7 +155,7 @@ engine's [native gRPC](#native-grpc) API.
 
 | Area | Flags |
 | --- | --- |
-| Model | `--model-id`, `--model-alias`, `--tokenizer-path`, `--no-tokenizer` |
+| Model | `--model-id`, `--additional-model`, `--model-config`, `--model-alias`, `--tokenizer-path`, `--no-tokenizer` |
 | Engines | `--worker-urls`, or `--service-discovery` with `--selector` (plain) or `--prefill-selector` + `--decode-selector` (P/D) |
 | Routing | `--chat-routing reorg`, `--policy`, `--bucket-config`, `--affinity-*`, `--session-id-header` |
 | Admission | `--max-inflight-requests`, `--max-waiting-requests`, `--max-pending-prefill-tokens`, `--max-running-usage`, `--max-kv-usage` |
