@@ -216,7 +216,9 @@ class TestDerivedBufferIpcContract(CustomTestCase):
         self.assertFalse(entries[name]["is_param"])
         self.assertFalse(entries[name]["persistent"])
         self.assertTrue(entries["linear.calibration"]["persistent"])
-        loader = ipc_loader.IpcModelLoader.__new__(ipc_loader.IpcModelLoader)
+        loader = ipc_loader.WeightCacheModelLoader.__new__(
+            ipc_loader.WeightCacheModelLoader
+        )
         loader.load_config = SimpleNamespace(model_loader_extra_config=None)
         loader._transport_backend = daemon.transport_backend
         with patch.object(ipc_loader, "_initialize_model", side_effect=make_model):
