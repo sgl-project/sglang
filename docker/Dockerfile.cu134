@@ -19,6 +19,7 @@ ARG DEEPGEMM_REF=v0.2.9
 ARG SGL_DEEP_GEMM_VERSION=0.2.9
 ARG DEEPEP_SOURCE_REF=sgl-deepep
 ARG SGL_DEEP_EP_VERSION=0.1.3rc5
+ARG SGL_NCCL_VERSION=2.31.2
 # MSA has no versioned release yet; pin a commit with the multi-head q8kv4 indexer,
 # strided cache views, and the SGLang monokernel plugin.
 ARG MSA_COMMIT=1e7bf76f26a5f53cfc2d4d297e1ec2e40955e431
@@ -36,7 +37,7 @@ ARG SGL_KERNEL_VERSION
 ARG SGL_VERSION
 ARG USE_LATEST_SGLANG=0
 ARG GDRCOPY_VERSION=2.5.1
-ARG SGL_NCCL_VERSION=2.31.2
+ARG SGL_NCCL_VERSION
 ARG PIP_DEFAULT_INDEX
 ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
@@ -329,6 +330,7 @@ FROM cu134_wheel_base AS cu134_wheel_deepep
 
 ARG DEEPEP_SOURCE_REF
 ARG SGL_DEEP_EP_VERSION
+ARG SGL_NCCL_VERSION
 ARG GDRCOPY_VERSION=2.5.1
 ARG MAX_JOBS=8
 
@@ -349,6 +351,12 @@ RUN set -eux; \
 
 RUN --mount=type=cache,id=cu134-wheels-pip,target=/root/.cache/pip \
     ${PYTHON_ROOT_PATH}/bin/pip install "auditwheel>=6.0" build ninja packaging setuptools wheel
+
+# Build against the runtime NCCL headers, not the NCCL torch pins: DeepEP built
+# against NCCL < 2.31 asserts that the runtime NCCL matches at startup.
+RUN --mount=type=cache,id=cu134-wheels-pip,target=/root/.cache/pip \
+    ${PYTHON_ROOT_PATH}/bin/pip install --force-reinstall --no-deps \
+        "nvidia-nccl-cu13==${SGL_NCCL_VERSION}"
 
 RUN git clone --recursive --depth 1 --branch "${DEEPEP_SOURCE_REF}" \
         https://${GITHUB_ARTIFACTORY}/sgl-project/DeepEP.git /deepep-source
