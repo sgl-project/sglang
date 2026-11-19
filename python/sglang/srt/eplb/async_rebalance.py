@@ -125,6 +125,7 @@ class AsyncEplbCoordinator:
                 self.layers = self.runtime.prepare(self._future.result())
             except Exception as error:
                 self._error = error
+            self._future = None
             self.phase = Phase.PREPARING
             return False
         if self.phase == Phase.PREPARING:

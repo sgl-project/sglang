@@ -104,51 +104,35 @@ class NpuEplbRuntime:
         self.device = self.staging[0].device
         self.device_module = torch.get_device_module(self.device)
         self._p2p_stream = self.device_module.Stream(device=self.device)
-        self._prepared = self.device_module.Event()
-        self._prepared.record()
         self._owner_stream = self.device_module.current_stream()
+        self._owner_ready = self.device_module.Event()
         self._new_metadata = None
-        self._placements = {}
         self._install_weights = None
         self.stage_seconds = self.install_enqueue_seconds = 0.0
 
     def planner(self, counts):
         self.stage_seconds = self.install_enqueue_seconds = 0.0
-        # Snapshot on the caller's inference stream before recorder buffers reuse.
         self._owner_stream = self.device_module.current_stream()
-        snapshot_error = None
-        try:
-            host = torch.empty(
-                counts.shape, dtype=counts.dtype, device="cpu", pin_memory=True
-            )
-            host.copy_(counts, non_blocking=True)
-            event = self.device_module.Event()
-            event.record(self._owner_stream)
-        except Exception as error:
-            snapshot_error = error
-        spec, rank, group = self.spec, self.rank, self.plan_group
+        # dump_record returns a fresh, globally reduced tensor. Keep it in the
+        # worker closure and copy it on the migration stream only on rank 0.
+        payload = [None]
+        if self.rank == 0:
+            try:
+                self._owner_ready.record(self._owner_stream)
+            except Exception as error:
+                payload[0] = (str(error), None)
 
         def compute():
-            error = snapshot_error
-            if error is None:
+            if self.rank == 0 and payload[0] is None:
                 try:
                     self.device_module.set_device(self.device)
-                    event.synchronize()
-                except Exception as exc:
-                    error = exc
-            # Keep counts alive until the D2H finishes, then release the capture.
-            _ = counts
-            failed = torch.tensor([int(error is not None)], dtype=torch.int32)
-            dist.all_reduce(failed, op=dist.ReduceOp.MAX, group=group)
-            if failed.item():
-                raise RuntimeError("EPLB statistics snapshot failed") from error
-            payload = [None]
-            if rank == 0:
-                try:
-                    payload[0] = (None, spec.compute(host))
+                    with self.device_module.stream(self._p2p_stream):
+                        self._p2p_stream.wait_event(self._owner_ready)
+                        host = counts.cpu()
+                    payload[0] = (None, self.spec.compute(host))
                 except Exception as error:
                     payload[0] = (str(error), None)
-            dist.broadcast_object_list(payload, src=0, group=group)
+            dist.broadcast_object_list(payload, src=0, group=self.plan_group)
             error, result = payload[0]
             if error is not None:
                 raise RuntimeError(f"EPLB CPU planner failed: {error}")
@@ -158,17 +142,14 @@ class NpuEplbRuntime:
 
     def prepare(self, placement):
         physical, logical = placement
-        if physical.shape != self.metadata.physical_to_logical_map_cpu.shape:
-            raise ValueError("EPLB plan changed physical capacity")
         old = self.metadata.physical_to_logical_map_cpu
-        changed = tuple(
-            layer
-            for layer in self.layer_ids
-            if not torch.equal(old[layer], physical[layer])
-        )
-        self._placements = {
-            layer: (old[layer].tolist(), physical[layer].tolist()) for layer in changed
-        }
+        if physical.shape != old.shape:
+            raise ValueError("EPLB plan changed physical capacity")
+        moved = (physical != old).any(dim=1).tolist()
+        changed = tuple(layer for layer in self.layer_ids if moved[layer])
+        if not changed:
+            return ()
+        self._last_layer = changed[-1]
         # Reuse main's exact dispatch construction on CPU. Building it on NPU
         # would immediately copy it back to CPU and synchronize the forward.
         cpu_metadata = ExpertLocationMetadata._init_raw(
@@ -191,11 +172,11 @@ class NpuEplbRuntime:
             },
         )
         self._owner_stream = self.device_module.current_stream()
-        self._prepared.record(self._owner_stream)
+        self._owner_ready.record(self._owner_stream)
         return changed
 
     def preparation_ready(self):
-        return self._prepared.query()
+        return self._new_metadata is None or self._owner_ready.query()
 
     def _check_stream(self):
         if self.device_module.current_stream() != self._owner_stream:
@@ -203,11 +184,9 @@ class NpuEplbRuntime:
 
     def stage(self, layer):
         self._check_stream()
-        old, new = self._placements[layer]
-        self._install_weights = None
-        # Record on the current owner stream, including across epoch boundaries.
-        source_ready = self.device_module.Event()
-        source_ready.record(self._owner_stream)
+        # Single-flight staging lets each layer reuse the event after the
+        # previous transfer finishes and its install is on the owner stream.
+        self._owner_ready.record(self._owner_stream)
 
         def transfer():
             self.device_module.set_device(self.device)
@@ -216,12 +195,12 @@ class NpuEplbRuntime:
             # advertise readiness only after that dependency has completed.
             handles = []
             with self.device_module.stream(self._p2p_stream):
-                self._p2p_stream.wait_event(source_ready)
+                self._p2p_stream.wait_event(self._owner_ready)
                 install, _ = stage_expert_weights_single_layer(
                     self.weights[layer],
                     self.staging,
-                    old,
-                    new,
+                    self.metadata.physical_to_logical_map_cpu[layer].tolist(),
+                    self._new_metadata.physical_to_logical_map_cpu[layer].tolist(),
                     self.spec.local_experts,
                     self.ranks_per_node,
                     self.rank,
@@ -229,6 +208,7 @@ class NpuEplbRuntime:
                     log_metrics=self.log_metrics,
                     group=self.p2p_group,
                     work_handles=handles,
+                    coalesce=True,
                 )
                 self._p2p_stream.synchronize()
             self.stage_seconds += time.perf_counter() - start
@@ -239,15 +219,18 @@ class NpuEplbRuntime:
     def install(self, layer):
         self._check_stream()
         start = time.perf_counter()
-        self._install_weights(coalesce=True)
+        self._install_weights()
         self._install_weights = None
         self.metadata.update(self._new_metadata, update_layer_ids=[layer])
+        if layer == self._last_layer:
+            self._new_metadata = None
         self.install_enqueue_seconds += time.perf_counter() - start
 
     def synchronize(self):
         # The coordinator joins the worker before draining both streams.
         self._p2p_stream.synchronize()
         self._owner_stream.synchronize()
+        self._install_weights = self._new_metadata = None
 
     def close(self):
         dist.destroy_process_group(self.p2p_group)

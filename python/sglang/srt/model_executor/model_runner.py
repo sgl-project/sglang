@@ -802,7 +802,7 @@ class ModelRunner:
                 raise ValueError(
                     "Async EPLB requires completed weight loading before migration setup"
                 )
-            self.eplb_manager.on_model_loaded()
+            self.eplb_manager.init_async_rebalance()
             # Reuse the existing rank-uniform online-update rejection mechanism.
             if getattr(self.model, "_derived_weight_cache_error", None) is None:
                 self.model._derived_weight_cache_error = (

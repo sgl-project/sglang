@@ -276,6 +276,7 @@ def stage_expert_weights_single_layer(
     group: Optional[torch.distributed.ProcessGroup] = None,
     *,
     work_handles: Optional[list[torch.distributed.Work]] = None,
+    coalesce: bool = False,
 ):
     """Stage a layer and return the writeback to run after transfers complete."""
     assert all(
@@ -579,9 +580,8 @@ def stage_expert_weights_single_layer(
                         p2p_op_infos[i] = (logical_expert_id, [])
 
     def _execute_p2p_ops(p2p_op_infos):
-        sorted_infos = sorted(p2p_op_infos, key=lambda info: info[0])
-        p2p_ops = [op for _, ops in sorted_infos for op in ops]
-        if len(p2p_ops) == 0:
+        ops_by_expert = dict(p2p_op_infos)
+        if not any(ops_by_expert.values()):
             return
 
         # Submit P2P ops in batches to prevent NCCL/RCCL GPU-side accumulation
@@ -589,7 +589,6 @@ def stage_expert_weights_single_layer(
         # (based on num_physical_experts) so matching send/recv pairs land in
         # the same batch. Set batch_chunk_size >= num_physical_experts to disable.
         batch_chunk_size = envs.SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE.get()
-        ops_by_expert = {eid: ops for eid, ops in sorted_infos}
         for start in range(0, num_physical_experts, batch_chunk_size):
             batch_ops = []
             for eid in range(
@@ -627,22 +626,23 @@ def stage_expert_weights_single_layer(
 
     copies = _entrypoint()
 
-    def install(coalesce: bool = False):
-        if not coalesce:
-            _execute_buffer2weight_copies(copies)
-            return
-        # The NPU adapter exposes dense, physical byte rows. Only merge runs
-        # that are contiguous in both the staging and live storage.
-        ranges = []
-        for source, destination in copies:
-            source = _get_local_expert_location(source)
-            destination = _get_local_expert_location(destination)
-            if ranges:
-                prev_source, prev_dest, length = ranges[-1]
-                if source == prev_source + length and destination == prev_dest + length:
-                    ranges[-1] = (prev_source, prev_dest, length + 1)
-                    continue
-            ranges.append((source, destination, 1))
+    if not coalesce:
+        return lambda: _execute_buffer2weight_copies(copies), output_logs
+
+    # The NPU adapter exposes dense, physical byte rows. Only merge runs
+    # that are contiguous in both the staging and live storage.
+    ranges = []
+    for source, destination in copies:
+        source = _get_local_expert_location(source)
+        destination = _get_local_expert_location(destination)
+        if ranges:
+            prev_source, prev_dest, length = ranges[-1]
+            if source == prev_source + length and destination == prev_dest + length:
+                ranges[-1] = (prev_source, prev_dest, length + 1)
+                continue
+        ranges.append((source, destination, 1))
+
+    def install():
         for source, destination, length in ranges:
             for weight, buffer in zip(
                 routed_experts_weights, temp_buffers, strict=True

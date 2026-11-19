@@ -88,9 +88,7 @@ class EPLBManager:
             )
         self._main_generator = self._entrypoint()
 
-    def on_model_loaded(self):
-        if not self._async_enabled:
-            return
+    def init_async_rebalance(self):
         from sglang.srt.hardware_backend.npu.eplb_async import create_npu_async_eplb
 
         self._async_coordinator = create_npu_async_eplb(
