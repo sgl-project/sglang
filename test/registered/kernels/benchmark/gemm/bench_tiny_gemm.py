@@ -16,7 +16,6 @@ from sglang.kernels.jit.benchmark.utils import create_random
 from sglang.kernels.jit.utils import parallel_compile
 from sglang.kernels.ops.gemm import tiny_gemm as tg
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.utils import is_in_ci
 
 register_cuda_ci(
     est_time=15, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
@@ -84,7 +83,7 @@ def _build_all():
     """Build every module the benchmark reaches in parallel, before timing."""
     builders = []
     for (n, k), out_dtype in itertools.product(
-        CI_SHAPES if is_in_ci() else SHAPES, OUT_DTYPES
+        CI_SHAPES if marker.CI_MODE else SHAPES, OUT_DTYPES
     ):
         for impl in ("simt", "mma"):
             if _supported(impl, n, k):

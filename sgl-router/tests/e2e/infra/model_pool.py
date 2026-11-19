@@ -1,8 +1,6 @@
 """Minimal SGLang worker spawner for sgl-router e2e tests.
 
-Adapted from SMG's e2e_test/infra/model_pool.py — the 1200-line original
-manages a pool of long-lived workers across many tests; here we only
-need a thin wrapper around ``sglang.launch_server`` that:
+A thin wrapper around ``sglang.launch_server`` that:
 
   - binds the worker to GPU(s) inside this process's own
     ``CUDA_VISIBLE_DEVICES`` allotment,
@@ -119,25 +117,10 @@ def resolve_device_ids(gpu_ids: list[int]) -> list[str]:
 
 
 def _get_open_port() -> int:
-    """Allocate an ephemeral TCP port in the range [20000, 55535].
-
-    SGLang derives its internal gRPC port as ``http_port + 10000``; if the
-    kernel hands us an ephemeral port above 55535, that derivation overflows
-    65535 and ``ServerArgs.__post_init__`` rejects it. Retrying a bounded
-    number of times keeps us safely below the ceiling without hand-rolling
-    a port registry.
-    """
-    for _ in range(50):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(("127.0.0.1", 0))
-            port = s.getsockname()[1]
-        if 20000 <= port <= 55535:
-            return port
-    raise RuntimeError(
-        "could not allocate an ephemeral port in [20000, 55535] after 50 tries; "
-        "SGLang derives its internal gRPC port as http_port + 10000 and "
-        "rejects values above 65535"
-    )
+    """Reserve an ephemeral TCP port."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
 
 
 @dataclass

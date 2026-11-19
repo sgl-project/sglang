@@ -1672,6 +1672,95 @@ class TestIdeogram4(unittest.TestCase):
             set_global_server_args(prev_args)
 
 
+class TestIdeogram4RequestSizeAlignment(unittest.TestCase):
+    @staticmethod
+    def _server_args():
+        return SimpleNamespace(
+            model_path="ideogram-ai/ideogram-4-fp8",
+            model_id=None,
+            backend="sglang",
+            performance_mode="manual",
+            pipeline_class_name=None,
+            pipeline_config=Ideogram4PipelineConfig(),
+            output_path=None,
+            comfyui_mode=False,
+            enable_cfg_parallel=False,
+            enable_breakable_cuda_graph=False,
+            enable_torch_compile=False,
+            enable_trace=False,
+            attention_backend_config={},
+            num_gpus=1,
+            warmup_steps=1,
+            warmup_num_frames=None,
+        )
+
+    def test_http_size_aligns_to_the_patch_grid(self):
+        import sglang.multimodal_gen.runtime.server_args as server_args_module
+        from sglang.multimodal_gen.configs.sample.sampling_params import (
+            SamplingParams,
+        )
+        from sglang.multimodal_gen.configs.task_type import DataType
+        from sglang.multimodal_gen.runtime.entrypoints.openai import (
+            utils as openai_utils,
+        )
+
+        cases = [
+            ({"size": "1920x1080"}, (1920, 1072)),
+            ({"size": "854x480"}, (848, 480)),
+            ({"size": "1000x1000"}, (992, 992)),
+            ({"width": 1080, "height": 1920}, (1072, 1920)),
+            ({"size": "1280x720"}, (1280, 720)),
+            ({"size": "1024x1024"}, (1024, 1024)),
+        ]
+        args = self._server_args()
+        prev_args = server_args_module._global_server_args
+        try:
+            set_global_server_args(args)
+            stage = Ideogram4TextEncodingStage(
+                text_encoder=None, tokenizer=DummyTokenizer()
+            )
+            for fields, expected in cases:
+                with self.subTest(fields=fields):
+                    with (
+                        patch.object(
+                            openai_utils, "get_global_server_args", return_value=args
+                        ),
+                        patch.object(
+                            SamplingParams,
+                            "from_pretrained",
+                            return_value=Ideogram4SamplingParams(),
+                        ),
+                    ):
+                        sampling = openai_utils.build_sampling_params(
+                            "size",
+                            prompt="11",
+                            request_data_type=DataType.IMAGE,
+                            num_frames=1,
+                            **fields,
+                        )
+                    self.assertEqual((sampling.width, sampling.height), expected)
+                    stage._build_inputs(["11"], sampling.height, sampling.width, args)
+        finally:
+            set_global_server_args(prev_args)
+
+    def test_warmup_resolution_aligns_to_the_patch_grid(self):
+        from sglang.multimodal_gen.runtime.warmup_request_builder import (
+            build_warmup_reqs,
+        )
+
+        with patch(
+            "sglang.multimodal_gen.runtime.warmup_request_builder.get_model_sampling_defaults",
+            return_value=Ideogram4SamplingParams(),
+        ):
+            reqs = build_warmup_reqs(
+                self._server_args(),
+                warmup_resolutions=["1920x1080"],
+                warmup_input_path=None,
+                server_based_warmup=True,
+            )
+        self.assertEqual([(r.width, r.height) for r in reqs], [(1920, 1072)])
+
+
 def _tiny_ideogram_dit():
     config = Ideogram4DistilledDiTConfig()
     for key, value in dict(

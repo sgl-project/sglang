@@ -14,6 +14,7 @@ from sglang.kernels.ops.sampling.topk import radix_topk
 from sglang.kernels.ops.speculative.verify_sampling import (
     tree_speculative_sampling_target_only,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import (
     apply_custom_logit_processor,
@@ -24,7 +25,13 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.runner_utils.pool import borrow_graph_pool
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.spec_utils import sample_simulated_acc_len
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_cuda, is_npu
+
+_is_cuda = is_cuda()
+if _is_cuda:
+    from sglang.kernels.ops.speculative.dflash_simulated_accept import (
+        dflash_simulated_accept,
+    )
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
 _DFLASH_ATTENTION_MODES = frozenset({"gqa", "mha", "mla"})
@@ -594,6 +601,60 @@ def validate_dflash_mla_draft_config(draft_hf_config: Any) -> None:
         )
 
 
+def mla_draft_compact_window_narrows(
+    *, dcp_size: int, page_size: int, megakernel: bool
+) -> bool:
+    return (
+        megakernel
+        # dcp_size must divide page_size so each compact slot keeps its owner.
+        and (dcp_size == 1 or page_size % dcp_size == 0)
+        and not envs.SGLANG_DISABLE_DFLASH_COMPACT_SWA_WINDOW.get()
+    )
+
+
+def resolve_mla_draft_compact_window(
+    draft_hf_config: Any,
+    *,
+    window_size: int,
+    dcp_size: int,
+    page_size: int = 1,
+    megakernel: bool = False,
+) -> Optional[int]:
+    """The ``--speculative-draft-window-size`` an MLA draft keeps on trtllm_mla
+    or cutedsl_mla, or None to serve the draft without the compact table."""
+    layer_types = get_dflash_layer_types(draft_hf_config)
+    if layer_types is not None and "sliding_attention" in layer_types:
+        if any(layer_type != "sliding_attention" for layer_type in layer_types):
+            raise ValueError(
+                "--speculative-draft-window-size with an MLA draft that mixes "
+                "full and sliding_attention layers is not supported on trtllm_mla "
+                "or cutedsl_mla: the compact draft table would narrow the full "
+                f"layers, and the native window cannot read it (layer_types="
+                f"{list(layer_types)})."
+            )
+        window_left = get_dflash_attention_sliding_window_size(draft_hf_config)
+        if window_left > window_size:
+            if mla_draft_compact_window_narrows(
+                dcp_size=dcp_size, page_size=page_size, megakernel=megakernel
+            ):
+                return window_size
+            raise ValueError(
+                f"--speculative-draft-window-size {window_size} is narrower than "
+                f"the draft's own sliding window (window_left={window_left}); "
+                "trtllm_mla and cutedsl_mla apply the draft's window and cannot "
+                "narrow it. Use a window size >= window_left or drop the flag."
+            )
+        return None
+    if dcp_size > 1:
+        raise ValueError(
+            "--speculative-draft-window-size with a full-attention MLA draft is "
+            "not supported under --dcp-size > 1: the compact draft table starts "
+            "on a page boundary, but the DCP page table walks pages of "
+            f"page_size * dcp_size positions (dcp_size={dcp_size})."
+        )
+    return window_size
+
+
 @dataclass(frozen=True)
 class DFlashDraftConfig:
     num_hidden_layers: Optional[int]
@@ -949,13 +1010,14 @@ def apply_dflash_simulated_acceptance(
     next_token_logits: Optional[torch.Tensor] = None,
     fixed_token_id: int = 100,
     generator: Optional[torch.Generator] = None,
-) -> None:
+    prefix_lens: Optional[torch.Tensor] = None,
+    new_seq_lens: Optional[torch.Tensor] = None,
+) -> Optional[torch.Tensor]:
     """Forces the DFlash acceptance length (SGLANG_SIMULATE_ACC_LEN benchmark knob).
-    ``next_token_logits`` gives the target argmax when ``target_predict`` is None."""
+    ``next_token_logits`` gives the target argmax when ``target_predict`` is None.
+    Returns ``new_seq_lens`` if it was rewritten from the forced lengths, else None."""
     bs, block_size = candidates.shape
-    if simulate_acc_token_mode == "real-draft-token" and target_predict is None:
-        # The sampling-verify branch does not materialize the target argmax.
-        target_predict = sampling_argmax(next_token_logits).view(bs, block_size)
+    real_draft_tokens = simulate_acc_token_mode == "real-draft-token"
 
     # sample_simulated_acc_len clamps to [1, block_size].
     forced_commit_len = sample_simulated_acc_len(
@@ -963,19 +1025,46 @@ def apply_dflash_simulated_acceptance(
     )
     forced_accept_len = forced_commit_len - 1
 
+    target_bonus_tokens = None
+    if real_draft_tokens and target_predict is None:
+        # The sampling and selector branches do not materialize the target
+        # argmax; only the forced row of each request is read.
+        vocab_size = next_token_logits.shape[-1]
+        target_bonus_tokens = sampling_argmax(
+            next_token_logits.view(bs, block_size, vocab_size)[:, forced_accept_len]
+        )
+    elif real_draft_tokens:
+        target_bonus_tokens = target_predict[:, forced_accept_len]
+
+    if _is_cuda and candidates.is_cuda:
+        dflash_simulated_accept(
+            candidates=candidates,
+            target_bonus_tokens=target_bonus_tokens,
+            forced_num_accept_tokens=forced_commit_len,
+            num_correct_drafts_out=accept_len,
+            num_accept_tokens_out=commit_lens,
+            bonus_tokens_out=bonus,
+            out_tokens=out_tokens,
+            fixed_token=fixed_token_id,
+            prefix_lens=prefix_lens,
+            new_seq_lens_out=new_seq_lens,
+        )
+        return new_seq_lens
+
     accept_len.fill_(forced_accept_len)
     commit_lens.fill_(forced_commit_len)
 
-    if simulate_acc_token_mode != "real-draft-token":
+    if not real_draft_tokens:
         bonus.fill_(fixed_token_id)
         out_tokens.fill_(fixed_token_id)
-        return
+        return None
 
     out_tokens.zero_()
     if forced_accept_len > 0:
         out_tokens[:, :forced_accept_len].copy_(candidates[:, 1:forced_commit_len])
-    bonus.copy_(target_predict[:, forced_accept_len].to(dtype=bonus.dtype))
+    bonus.copy_(target_bonus_tokens.to(dtype=bonus.dtype))
     out_tokens[:, forced_accept_len].copy_(bonus.to(dtype=out_tokens.dtype))
+    return None
 
 
 def compute_dflash_sampling_correct_drafts_and_bonus(
