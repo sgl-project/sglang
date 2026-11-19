@@ -79,12 +79,14 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_hip,
     is_npu,
+    is_xpu,
 )
 from sglang.srt.utils.log_utils import rank0_log
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_npu = is_npu()
+_is_xpu = is_xpu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -107,7 +109,9 @@ _is_sm100_supported = is_cuda() and get_platform().is_sm100
 class DsV3MLA(DeepseekV2AttentionMLA):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        if kwargs["rope_scaling"]:
+        # forward_cuda calls a rope kernel that rotary_embedding/base.py imports on
+        # CUDA only; XPU keeps its own forward_xpu dispatch.
+        if kwargs["rope_scaling"] and not _is_xpu:
             self.rotary_emb.forward = self.rotary_emb.forward_cuda
 
 

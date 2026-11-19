@@ -703,6 +703,10 @@ class Glm4MoeLiteForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
     ) -> None:
         super().__init__()
         config.moe_layer_freq = 1
+        # Must run before the layers are built: per-layer quant lookups (AutoRound
+        # extra_config) resolve fused names through this mapping (as DeepseekV2 does).
+        if quant_config is not None:
+            quant_config.update_packed_modules_mapping(self.packed_modules_mapping)
         self.config = config
         self.quant_config = quant_config
         self.pp_group = get_parallel().pp_group

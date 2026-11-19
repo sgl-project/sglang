@@ -235,6 +235,7 @@ class TestFp8MoETpBlockRefine(CustomTestCase):
                 }
             ),
             hf_text_config=SimpleNamespace(moe_intermediate_size=I),
+            is_fp4_experts=False,
         )
         check_quantized_moe_compatibility(
             model_config=model_config, tp_size=TP, moe_ep_size=1, moe_dp_size=1

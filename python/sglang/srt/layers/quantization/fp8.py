@@ -1635,6 +1635,16 @@ def _tp_refined_moe_block_sizes(
     return [w13_block_n, block_k], [block_n, w2_block_k]
 
 
+def _xpu_fused_experts_supports(moe_runner_config: MoeRunnerConfig) -> bool:
+    """sgl-kernel-xpu's FP8 MoE takes a SwiGLU clamp only with the GPT-OSS alpha;
+    its silu_and_mul_clamp clamps before SiLU, while gemm1_clamp_limit alone
+    (BailingMoeV3) clamps after it, as the triton runner does."""
+    return (
+        moe_runner_config.gemm1_clamp_limit is None
+        or moe_runner_config.gemm1_alpha is not None
+    )
+
+
 def _refined_block_scale_loader(weight_loader, *, repeats: tuple[int, int]):
     """Repeat checkpoint block scales onto the finer grid before TP sharding."""
 
@@ -1803,9 +1813,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             block_n, block_k = weight_block_size[0], w2_weight_block_size[1]
 
             padding_size = get_moe_padding_size(_use_aiter)
+            # weight_block_size describes the FP8 tensors only: MXFP4 routed experts
+            # carry 32-wide scale groups, so a 128-unaligned TP shard is fine for them.
             if not (
                 (_use_aiter and padding_size == block_n == block_k)
                 or allow_fp8_blockwise_tail
+                or is_fp4_expert
             ):
                 # NOTE(HandH1998): To ensure proper alignment of the block-wise quantization scales, the output_size of the weights for both the gate and up layers must be divisible by block_n.
                 # Required by column parallel or enabling merged weights
@@ -3427,7 +3440,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             if quant_info is not None:
                 return self.runner.run(dispatch_output, quant_info)
 
-        if _is_xpu and not get_moe_runner_backend().is_triton():
+        if (
+            _is_xpu
+            and not get_moe_runner_backend().is_triton()
+            and _xpu_fused_experts_supports(moe_runner_config)
+        ):
             # sgl-kernel-xpu path
             from sgl_kernel import fused_experts
 

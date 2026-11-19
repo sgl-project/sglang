@@ -1,4 +1,4 @@
-"""Regression tests for Quark block-FP8 weights in the DeepSeek loader."""
+"""Regression tests for quantized (Quark block-FP8, GPTQ int4) weights in the DeepSeek loader."""
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -16,6 +16,7 @@ from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     _resolve_layer_weight_block_size,
     _resolve_quark_fp8_block_scale_name,
 )
+from sglang.srt.models.deepseek_common.utils import dequantize_gptq_int4
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -181,6 +182,40 @@ class TestQuarkBlockFp8WeightLoading(CustomTestCase):
         )
         torch.testing.assert_close(fused_param[:2], dequantized)
         self.assertEqual(pending, {})
+
+
+class TestGptqInt4KvBDequant(CustomTestCase):
+    def test_round_trips_packed_codes_zeros_and_scales(self):
+        """MLA builds w_kc/w_vc from this dense kv_b_proj weight, so a packing-order,
+        sign-extension (codes >= 8 in the top nibble) or zero-point slip corrupts the
+        absorbed decode path while the int4 prefill kernel still looks correct."""
+        torch.manual_seed(0)
+        k, n, group_size = 256, 16, 128
+        codes = torch.randint(0, 16, (k, n), dtype=torch.int32)
+        zeros = torch.randint(1, 16, (k // group_size, n), dtype=torch.int32)
+        scales = (torch.rand(k // group_size, n) + 0.01).to(torch.bfloat16)
+        qweight = torch.zeros(k // 8, n, dtype=torch.int32)
+        for nibble in range(8):
+            qweight |= codes[nibble::8] << (4 * nibble)
+        expected = (
+            (codes - zeros.repeat_interleave(group_size, 0)).float()
+            * scales.float().repeat_interleave(group_size, 0)
+        ).to(torch.bfloat16)
+
+        for stored_minus_one in (True, False):
+            with self.subTest(gptq_v1=stored_minus_one):
+                stored = zeros - 1 if stored_minus_one else zeros
+                qzeros = torch.zeros(k // group_size, n // 8, dtype=torch.int32)
+                for nibble in range(8):
+                    qzeros |= stored[:, nibble::8] << (4 * nibble)
+                weight = dequantize_gptq_int4(
+                    qweight=qweight,
+                    qzeros=qzeros,
+                    scales=scales,
+                    group_size=group_size,
+                    zeros_stored_minus_one=stored_minus_one,
+                )
+                torch.testing.assert_close(weight, expected, rtol=0, atol=0)
 
 
 if __name__ == "__main__":
