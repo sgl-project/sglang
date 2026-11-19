@@ -671,3 +671,68 @@ def test_modelopt_config_patch_does_not_write_through_cache_symlink(tmp_path):
     patched = json.loads((component / "config.json").read_text())
     assert patched["quantization_config"]["quant_type"] == "FP8"
     assert blob.read_text() == original
+
+
+def _hub_repo_without_model_index(monkeypatch, files, card_data=None):
+    """An online Hub repo that has no model_index.json and lists ``files``."""
+
+    def missing(**kwargs):
+        raise huggingface_hub.errors.EntryNotFoundError("missing")
+
+    class FakeApi:
+        def model_info(self, repo_id):
+            return SimpleNamespace(
+                siblings=[SimpleNamespace(rfilename=f) for f in files],
+                card_data=card_data,
+            )
+
+    monkeypatch.setattr(
+        hf_diffusers_utils, "maybe_load_overlay_model_index", lambda *a, **k: None
+    )
+    monkeypatch.setattr(hf_diffusers_utils, "hf_hub_download", missing)
+    monkeypatch.setattr(hf_diffusers_utils, "HfApi", FakeApi)
+
+
+def test_repo_without_config_fails_before_download(
+    monkeypatch, tmp_path, recording_snapshot_download
+):
+    """A checkpoint repo with neither model_index.json nor config.json used to be
+    downloaded in full before failing; now it fails first and names its files."""
+    _hub_repo_without_model_index(
+        monkeypatch,
+        ["README.md", "model-Q4_K.gguf", "lora/style.safetensors"],
+        card_data={"base_model": "org/base"},
+    )
+    calls = recording_snapshot_download(tmp_path)
+
+    with pytest.raises(hf_diffusers_utils.MissingModelConfigError) as err:
+        hf_diffusers_utils.maybe_download_model_index("org/ckpt")
+
+    assert calls == []
+    message = str(err.value)
+    assert "lora/style.safetensors, model-Q4_K.gguf" in message
+    assert "--component-weights-paths.transformer org/ckpt/<file>" in message
+    assert "base model as org/base" in message
+
+
+@pytest.mark.parametrize("listing_fails", [False, True])
+def test_single_model_repo_still_downloads(
+    monkeypatch, tmp_path, recording_snapshot_download, listing_fails
+):
+    """A repo with a root config.json, or one whose files cannot be listed, keeps
+    the single-model path."""
+    _hub_repo_without_model_index(monkeypatch, ["config.json", "model.safetensors"])
+    if listing_fails:
+
+        class OfflineApi:
+            def model_info(self, repo_id):
+                raise OSError("Hub unreachable")
+
+        monkeypatch.setattr(hf_diffusers_utils, "HfApi", OfflineApi)
+    (tmp_path / "config.json").write_text(json.dumps({"architectures": ["M"]}))
+    calls = recording_snapshot_download(tmp_path)
+
+    config = hf_diffusers_utils.maybe_download_model_index("org/model")
+
+    assert config == {"architectures": ["M"]}
+    assert calls == ["probe"]  # reached maybe_download_model

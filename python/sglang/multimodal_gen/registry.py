@@ -53,6 +53,7 @@ from sglang.multimodal_gen.runtime.utils.external_model_package import (
     load_external_model_package,
 )
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
+    MissingModelConfigError,
     load_dict,
     maybe_download_model_index,
 )
@@ -663,6 +664,9 @@ def get_model_info(
         # Try to get from model_index.json
         try:
             config = maybe_download_model_index(model_path)
+        except MissingModelConfigError:
+            # the diffusers backend needs model_index.json as well
+            raise
         except Exception as e:
             logger.error(f"Could not read model config for '{model_path}': {e}")
             if backend == Backend.AUTO:
