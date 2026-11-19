@@ -1356,9 +1356,10 @@ def _grid_ctas(m: int, n: int, cta_m: int, cta_n: int, num_mma_ctas: int) -> int
 def _pick_tactic(m: int, n: int, k: int) -> int:
     """Pick the first ladder tactic whose grid fits one wave of the SMs."""
     num_sms = current_arch().num_sms
-    if current_arch().is_sm(10, 7):
+    if current_arch().is_sm(10, 7) and n >= 4096:
         # Measured on SM107 up to M = 128: one token tile covering all M rows (64-row feature tiles)
-        # beats the one-wave rule, even when the grid takes more than one wave.
+        # beats the one-wave rule, even when the grid takes more than one wave. Smaller N keeps the
+        # one-wave rule: its single token tile leaves too few CTAs.
         for tactic, cta_m, cta_n, _ in _TGV_TACTIC_LADDER_SM107:
             if cta_m == 64 and cta_n >= m:
                 return tactic
