@@ -1,4 +1,4 @@
-"""AMD/gfx950 test for the DSA indexer "skip redundant -inf pre-fill" change (#28757).
+"""AMD/gfx950 tests for skipping redundant DSA logits initialization.
 
 #28757 passes ``clean_logits=False`` to the HIP aiter ``fp8_mqa_logits`` call in
 the DSA indexer, skipping the ``-inf`` pre-fill of the
@@ -9,12 +9,12 @@ downstream topk transform re-masks the invalid positions ``[ks, ke)`` via
 leaves at the invalid positions is overwritten, and the final topk selection is
 identical whether or not the buffer was pre-filled with ``-inf``.
 
-This test verifies that property end to end on the real kernels: the aiter
-``fp8_mqa_logits`` is run with ``clean_logits=True`` and ``clean_logits=False``,
-each followed by the same masked topk (``sgl_kernel.fast_topk_v2``, the
-production HIP topk path), and the selected KV positions must be identical. A
-sanity assertion confirms ``clean_logits=False`` genuinely leaves non-``-inf``
-values at the invalid positions (otherwise the test would be vacuous).
+These tests verify that property end to end on the real kernels for both the
+ordinary and KPool indexers: aiter ``fp8_mqa_logits`` is run with
+``clean_logits=True`` and ``clean_logits=False``, each followed by the matching
+masked top-k kernel, and the selected KV positions must be identical. A sanity
+assertion confirms ``clean_logits=False`` genuinely leaves non-``-inf`` values
+at invalid positions (otherwise the test would be vacuous).
 """
 
 import unittest
@@ -34,6 +34,10 @@ if _RUNNABLE:
         from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
         from aiter.ops.triton.utils.types import get_fp8_dtypes
         from sgl_kernel import fast_topk_v2
+
+        from sglang.kernels.ops.attention.dsa.kpool_topk_transform import (
+            fast_kpool_topk_transform_fused,
+        )
     except Exception:
         _RUNNABLE = False
 
@@ -51,6 +55,14 @@ def _cast_kv_to_fp8(kv: torch.Tensor, e4m3: torch.dtype):
     _RUNNABLE, "requires HIP gfx950 with aiter fp8_mqa_logits + sgl_kernel"
 )
 class TestDSASkipLogitsClean(CustomTestCase):
+    @staticmethod
+    def _assert_same_selection(topk_clean, topk_dirty):
+        for i in range(topk_clean.shape[0]):
+            sel_clean = sorted(x for x in topk_clean[i].tolist() if x >= 0)
+            sel_dirty = sorted(x for x in topk_dirty[i].tolist() if x >= 0)
+            if sel_clean != sel_dirty:
+                raise AssertionError(f"top-k selection differs at row {i}")
+
     def _run_case(self, s_q, s_k, num_heads, head_dim, topk, seed=0):
         torch.manual_seed(seed)
         dev = "cuda"
@@ -97,15 +109,7 @@ class TestDSASkipLogitsClean(CustomTestCase):
 
         # The final topk SELECTION (set of valid indices per row; -1 == unfilled)
         # must be identical -- this is what the indexer consumes.
-        for i in range(s_q):
-            sel_clean = sorted(x for x in topk_clean[i].tolist() if x >= 0)
-            sel_dirty = sorted(x for x in topk_dirty[i].tolist() if x >= 0)
-            self.assertEqual(
-                sel_clean,
-                sel_dirty,
-                f"topk selection differs at row {i} "
-                f"(s_q={s_q}, s_k={s_k}); skipping the -inf fill changed the result",
-            )
+        self._assert_same_selection(topk_clean, topk_dirty)
 
     def test_skip_logits_clean_topk_equivalence(self):
         # Decode-like (small s_q) and prefill-like (larger s_q) shapes, topk=2048
@@ -113,6 +117,45 @@ class TestDSASkipLogitsClean(CustomTestCase):
         for s_q, s_k in [(1, 4096), (16, 4096), (128, 4096)]:
             with self.subTest(s_q=s_q, s_k=s_k):
                 self._run_case(s_q=s_q, s_k=s_k, num_heads=64, head_dim=128, topk=2048)
+
+    def test_kpool_skip_logits_clean_topk_equivalence(self):
+        torch.manual_seed(41)
+        dev = "cuda"
+        _, e4m3 = get_fp8_dtypes()
+        s_q, s_k, num_heads, head_dim = 64, 8192, 32, 128
+
+        q_fp8 = torch.randn(
+            s_q, num_heads, head_dim, device=dev, dtype=torch.bfloat16
+        ).to(e4m3)
+        kv_fp8, scales = _cast_kv_to_fp8(
+            torch.randn(s_k, head_dim, device=dev, dtype=torch.bfloat16), e4m3
+        )
+        weights = torch.randn(s_q, num_heads, device=dev, dtype=torch.float32)
+        ks = torch.randint(0, s_k // 4, (s_q,), dtype=torch.int32, device=dev)
+        lengths = torch.randint(2049, s_k // 2, (s_q,), dtype=torch.int32, device=dev)
+        ke = ks + lengths
+
+        logits_clean = fp8_mqa_logits(
+            q_fp8, kv_fp8, scales, weights, ks, ke, clean_logits=True
+        )
+        logits_dirty = fp8_mqa_logits(
+            q_fp8, kv_fp8, scales, weights, ks, ke, clean_logits=False
+        )
+        topk_clean = fast_kpool_topk_transform_fused(
+            logits_clean,
+            lengths,
+            kpool=4,
+            topk=2048,
+            row_starts=ks,
+        )
+        topk_dirty = fast_kpool_topk_transform_fused(
+            logits_dirty,
+            lengths,
+            kpool=4,
+            topk=2048,
+            row_starts=ks,
+        )
+        self._assert_same_selection(topk_clean, topk_dirty)
 
 
 if __name__ == "__main__":
