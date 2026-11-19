@@ -1809,8 +1809,8 @@ class Envs:
     SGLANG_OPT_SPEC_PACKED_VERIFY_BCAST = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
-    # The scheduler's per-pass TP syncs (request broadcast size, HiCache ready counts)
-    # through a shared-memory table when the group shares a host (shm_tag_exchange.py).
+    # The scheduler's per-pass TP syncs (request broadcast size, HiCache ready counts,
+    # PD decode queue flags) through a shared-memory table (shm_tag_exchange.py).
     SGLANG_OPT_SCHEDULER_SHM_SYNC = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
