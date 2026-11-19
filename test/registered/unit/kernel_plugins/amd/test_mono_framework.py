@@ -492,6 +492,7 @@ class TestMonokernelFramework(CustomTestCase):
     def test_the_nvidia_megakernel_flag_selects_the_msa_backend(self):
         for field, backend in (
             ("enable_amd_monokernel", BACKEND),
+            ("enable_t_head_monokernel", "t_head"),
             ("enable_nvidia_megakernel", binding.MSA_BACKEND),
         ):
             with self.subTest(field=field):
@@ -503,6 +504,21 @@ class TestMonokernelFramework(CustomTestCase):
         ):
             self.assertTrue(binding.msa_serves([ARCH]))
             self.assertFalse(binding.msa_serves(["OtherForCausalLM"]))
+
+    def test_two_monokernel_flags_are_refused(self):
+        # the flags decide, never the order of _VENDORS
+        publish(
+            ServerArgs(
+                model_path="dummy",
+                enable_amd_monokernel=True,
+                enable_t_head_monokernel=True,
+            ),
+            role="test",
+        )
+        with self.assertRaisesRegex(
+            ValueError, "monokernel flags conflict in this setup"
+        ):
+            mono._backend()
 
     def test_the_amd_binding_only_names_isa_on_hip(self):
         # off HIP the vendor defers, and mono's sm_<capability> fallback stands
