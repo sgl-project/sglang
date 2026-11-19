@@ -23,7 +23,7 @@ def _skip_reason():
 
 
 SKIP = _skip_reason()
-register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=60, suite="base-b-test-1-gpu-small-amd-mi35x")
 
 
 @unittest.skipIf(SKIP is not None, SKIP or "")
