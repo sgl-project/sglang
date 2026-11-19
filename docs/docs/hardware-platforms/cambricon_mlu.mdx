@@ -135,8 +135,8 @@ Install the test dependencies, then run the single-device RMSNorm and two-device
 
 ```bash
 pip install -e "python[dev_mlu]"
-python test/run_suite.py --hw mlu --suite pr-test-1-mlu
-python test/run_suite.py --hw mlu --suite pr-test-2-mlu
+python test/run_suite.py --hw mlu --suite extra-test-1-mlu
+python test/run_suite.py --hw mlu --suite extra-test-2-mlu
 ```
 
 These tests validate the MLU RMSNorm implementation and SGLang communicator collectives without loading a model or starting an inference server.

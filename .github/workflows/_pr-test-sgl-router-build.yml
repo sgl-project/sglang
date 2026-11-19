@@ -56,7 +56,7 @@ jobs:
         with:
           path: sgl-router-bin/sgl-router
           # The arch is the compile runner's, as download-sgl-router reads it.
-          key: sgl-router-${{ contains(inputs.runs_on, '-arm') && 'aarch64' || 'x86_64' }}-${{ hashFiles('sgl-router/**', 'rust/Cargo.toml', 'rust/sglang-api-types/**', 'rust/sglang-processor/**', 'rust/sglang-runtime-v1-types/**', '.github/workflows/_pr-test-sgl-router-build.yml', 'scripts/ci/utils/build_sgl_router.sh') }}
+          key: sgl-router-${{ contains(inputs.runs_on, '-arm') && 'aarch64' || 'x86_64' }}-${{ hashFiles('sgl-router/**', 'rust/Cargo.toml', 'rust/sglang-api-types/**', 'rust/sglang-processor/**', 'rust/sglang-runtime-v1-types/**', '.github/workflows/_pr-test-sgl-router-build.yml') }}
 
       - name: Upload binary
         if: steps.cache.outputs.cache-hit == 'true'
@@ -91,7 +91,7 @@ jobs:
         run: bash scripts/ci/utils/install_rustup.sh
 
       - name: Build sgl-router
-        run: bash scripts/ci/utils/build_sgl_router.sh sgl-router-bin
+        run: bash sgl-router/scripts/build.sh sgl-router-bin/sgl-router
 
       # The key names the rust/ crates the router builds instead of hashing all of
       # rust/; this fails when that list falls behind sgl-router's path dependencies.

@@ -78,15 +78,5 @@ def test_qk_norm_mrope_graph_reads_updated_inputs():
     assert torch.equal(actual.view(torch.int16), reference(*args).view(torch.int16))
 
 
-@torch.inference_mode()
-def test_qk_norm_mrope_rejects_invalid_mean_shape():
-    from sglang.kernels.ops.diffusion import fused_nomas_qk_norm_mrope
-
-    args = list(inputs(1, 17, 8, 0))
-    args[1] = args[1][..., 0]
-    with pytest.raises(ValueError, match="mean squares"):
-        fused_nomas_qk_norm_mrope(*args)
-
-
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

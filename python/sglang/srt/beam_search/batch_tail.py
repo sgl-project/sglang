@@ -117,6 +117,13 @@ def strip_beam_tail(batch: ScheduleBatch) -> None:
     batch.seq_lens_sum = None
 
 
+def beam_launch_complete(req: Req) -> bool:
+    """A launch-complete group leaves the batch: the overlap scheduler would
+    otherwise run a forward for a group with no step left."""
+    group = req.beam_group
+    return group is not None and group.launch_complete()
+
+
 def num_beam_member_rows(reqs) -> int:
     """Extra decode-slot demand: one slot per member row per step (beam
     requires page_size == 1)."""
@@ -131,3 +138,9 @@ def beam_retraction_order(sorted_indices: List[int], reqs: List[Req]) -> List[in
     return [i for i in sorted_indices if reqs[i].beam_group is not None] + [
         i for i in sorted_indices if reqs[i].beam_group is None
     ]
+
+
+def beam_decode_budget(req: Req, normal_budget: int) -> int:
+    group = req.beam_group
+    beam_budget = None if group is None else group.decode_slot_budget()
+    return normal_budget if beam_budget is None else beam_budget

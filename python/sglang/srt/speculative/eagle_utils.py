@@ -12,7 +12,6 @@ import torch
 
 from sglang.kernels.ops.sampling import argmax as sampling_argmax
 from sglang.kernels.ops.sampling import softmax as sampling_softmax
-from sglang.kernels.ops.speculative import multi_cta_verify_sampling
 from sglang.kernels.ops.speculative.spec_tree import (
     TreeMaskMode,
     build_tree_kernel_efficient_func,
@@ -403,6 +402,12 @@ def eagle_prepare_for_verify(
     if not batch.forward_mode.is_idle():
         # Assign cache locations
         bs = len(batch.req_pool_indices)
+        # Host upper bound of this batch's final KV lengths: bounds the
+        # backend's replay page-table copies in mirrorless mode without a D2H sync.
+        batch.max_seq_len_host = (
+            max((req.seqlen for req in batch.reqs), default=0)
+            + verify_input.draft_token_num
+        )
         batch.input_ids = verify_input.draft_token
         maybe_detect_oob(
             batch.input_ids,
@@ -1079,13 +1084,6 @@ def eagle_sample(
             top_p_renorm_prob,
         )
         target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
-        if not use_rejection_sampling and multi_cta_verify_sampling.applies(
-            target_probs
-        ):
-            # Bitwise to the stock tree sampler.
-            sampling_fn = (
-                multi_cta_verify_sampling.tree_speculative_sampling_target_only
-            )
         draft_probs = (
             verify_input.draft_probs
             if use_rejection_sampling

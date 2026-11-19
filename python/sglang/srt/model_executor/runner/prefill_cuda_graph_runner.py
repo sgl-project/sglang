@@ -52,7 +52,7 @@ import tqdm
 from sglang.kernels.ops.attention.kv_indices import (
     create_chunked_prefix_cache_kv_indices,
 )
-from sglang.srt.configs.model_config import is_qwen4_exp
+from sglang.srt.configs.model_config import is_kimi_k31, is_qwen4_exp
 from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
@@ -177,7 +177,12 @@ from sglang.srt.runtime_context import (
     get_schedule,
 )
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
-from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_npu
+from sglang.srt.utils import (
+    get_available_gpu_memory,
+    is_cuda,
+    is_gfx95_supported,
+    is_npu,
+)
 from sglang.srt.utils.aiter import maybe_pre_warm_aiter_chip_info
 
 if TYPE_CHECKING:
@@ -346,6 +351,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     _backend_vote_prefill_cuda_graph = None
     _captured_attn_metadata_max_bs: Optional[int] = None
     _dcp_extend_active = False
+    _kimi_k31_rocm_bcg = False
     dllm_attention = None
 
     @property
@@ -354,6 +360,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         # DSA sets use_mha=False inside piecewise/breakable graphs, so the MHA
         # companion never runs there and any prefix goes through sparse MLA.
+        if self._kimi_k31_rocm_bcg:  # KDA + DSA: the hybrid backend wraps DSA
+            backend = self.model_runner.attn_backend.full_attn_backend
+            return isinstance(backend, DeepseekSparseAttnBackend)
         return isinstance(self.model_runner.attn_backend, DeepseekSparseAttnBackend)
 
     def __init__(self, model_runner: ModelRunner):
@@ -662,14 +671,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self.backend, BreakableCudaGraphBackend
         ) and supports_prefill_cp_bcg(server_args)
         if self.enable_cp_bcg_capture:
-            if self.max_context_size is not None:
-                # TODO(SYChen123): Preserve max_seq_len_override through CP's padded
-                # metadata preparation before enabling the fixed context limit.
-                self._ignore_max_context_size("CP breakable prefill CUDA graph")
             self.capture_num_tokens = filter_prefill_cp_bcg_capture_num_tokens(
                 self.capture_num_tokens, server_args
             )
             self.prefill_cp_bcg_input = PrefillCPBCGInput.create(self)
+            if (
+                self.max_context_size is not None
+                and not self.prefill_cp_bcg_input.supports_max_context_size
+            ):
+                self._ignore_max_context_size("CP breakable prefill CUDA graph")
             logger.info(
                 "Prefill CP breakable CUDA graph enabled: strategy=%s, cp_size=%d",
                 get_parallel().cp_strategy,
@@ -747,6 +757,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self._dcp_extend_active = get_parallel().attn_dcp_size > 1 and hasattr(
             model_runner.model, "prepare_context_parallel_metadata_for_dcp"
         )
+        if is_gfx95_supported() and is_kimi_k31(model_runner.model_config.hf_config):
+            self._kimi_k31_rocm_bcg = True
+            # Kimi-K3.1's DSA layers never read that gather buffer.
+            self._dcp_extend_active = False
 
         # --- aiter chip info pre-warming (AMD) -------------------------
         maybe_pre_warm_aiter_chip_info()
@@ -957,6 +971,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 # BCG / Full: capture the transformer body only.
                 positions = self._get_layer_model_positions(forward_batch)
                 input_ids = forward_batch.input_ids
+                if self.enable_cp_bcg_capture:
+                    input_ids = self.prefill_cp_bcg_input.model_input_ids(forward_batch)
                 kwargs = _build_layer_model_forward_kwargs(
                     self.layer_model, forward_batch, pp_proxy_tensors
                 )
@@ -1598,6 +1614,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         if getattr(self, "enable_cp_bcg_capture", False):
             if not is_cp_active(forward_batch):
                 return False
+            # CP BCG embeds tokens before replay. Image spans need the vision
+            # encoder and ID normalization performed by the eager CP runner.
+            if (
+                getattr(self.model_runner.model, "vision", None) is not None
+                and forward_batch.mm_inputs is not None
+                and any(item is not None for item in forward_batch.mm_inputs)
+            ):
+                return False
             assert self.prefill_cp_bcg_input is not None
             if (
                 self.prefill_cp_bcg_input.select_replay_bucket_for_batch(
@@ -1666,6 +1690,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         capture_start_locs = [0]
         for seq_len in capture_seq_lens[:-1]:
             capture_start_locs.append(capture_start_locs[-1] + seq_len)
+        if self._kimi_k31_rocm_bcg:
+            from sglang.srt.layers.attention.dsa.dsa_dcp_sharded_hip import (
+                fill_capture_slots_by_dcp_owner,
+            )
+
+            fill_capture_slots_by_dcp_owner(self.model_runner, capture_seq_lens)
 
         with torch.device(self.device):
             shape_inputs = {
@@ -2517,9 +2547,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self._wait_for_layer_loads()
 
             if self.enable_cp_bcg_capture:
-                assert self.max_context_size is None, (
-                    "CP-v2 BCG replay does not support a fixed prefill context size"
-                )
+                # assert self.max_context_size is None, (
+                #     "CP-v2 BCG replay does not support a fixed prefill context size"
+                # )
                 output = execute_prefill_cp_bcg(
                     self,
                     forward_batch,
