@@ -2,7 +2,7 @@
 server-argument resolution imports it without torch."""
 
 import dataclasses
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 
 class EngramPlacement:
@@ -14,13 +14,24 @@ class EngramPlacement:
 class EngramReplication:
     NONE = "none"
     PER_NODE = "per_node"
-    ALL = (NONE, PER_NODE)
+    GROUP_SHARDS = "group_shards"
+    ALL = (NONE, PER_NODE, GROUP_SHARDS)
 
 
 class EngramLookup:
-    COLLECTIVE = "collective"
+    AUTO = "auto"
+    ALL_REDUCE = "all_reduce"
+    REDUCE_SCATTER = "reduce_scatter"
+    ALL_TO_ALL = "all_to_all"
     PEER_READ = "peer_read"
-    ALL = (COLLECTIVE, PEER_READ)
+    ALL = (AUTO, ALL_REDUCE, REDUCE_SCATTER, ALL_TO_ALL, PEER_READ)
+    # Read as AUTO.
+    COLLECTIVE = "collective"
+
+
+def cols_per_rank(columns: int, tp_size: int) -> Optional[int]:
+    """Hash columns each TP rank owns when they divide evenly, else None."""
+    return columns // tp_size if columns % tp_size == 0 else None
 
 
 def _choice(default: str, choices: tuple):
@@ -31,17 +42,49 @@ def _choice(default: str, choices: tuple):
 class EngramConfig:
     placement: str = _choice(EngramPlacement.GPU, EngramPlacement.ALL)
     replication: str = _choice(EngramReplication.NONE, EngramReplication.ALL)
-    lookup: str = _choice(EngramLookup.COLLECTIVE, EngramLookup.ALL)
+    lookup: str = _choice(EngramLookup.AUTO, EngramLookup.ALL)
+    # Replication group_shards only: the GPU count of the servers sharing the
+    # tables, and a directory all of them see, empty for each deployment.
+    group_size: int = 0
+    group_store: str = ""
 
     @classmethod
     def from_dict(cls, raw: Dict[str, Any]) -> "EngramConfig":
-        choices = {f.name: f.metadata["choices"] for f in dataclasses.fields(cls)}
-        invalid = [f"{k}={v!r}" for k, v in raw.items() if v not in choices.get(k, ())]
+        if raw.get("lookup") == EngramLookup.COLLECTIVE:
+            raw = {**raw, "lookup": EngramLookup.AUTO}
+        fields = {f.name: f for f in dataclasses.fields(cls)}
+        choices = {n: f.metadata["choices"] for n, f in fields.items() if f.metadata}
+        invalid = [
+            f"{k}={v!r}"
+            for k, v in raw.items()
+            if k not in fields
+            or (k in choices and v not in choices[k])
+            or (k not in choices and type(v) is not type(fields[k].default))
+        ]
         if invalid:
             raise ValueError(
                 f"--engram-config: invalid {', '.join(invalid)}; choices: {choices}"
             )
         config = cls(**raw)
+        if config.replication == EngramReplication.GROUP_SHARDS:
+            if config.lookup not in (EngramLookup.AUTO, EngramLookup.PEER_READ):
+                raise ValueError(
+                    "--engram-config: replication 'group_shards' reads the shards "
+                    "in place; lookup must be 'auto' or 'peer_read'."
+                )
+            if config.group_size <= 0 or not config.group_store:
+                raise ValueError(
+                    "--engram-config: replication 'group_shards' needs 'group_size', "
+                    "the GPU count of the servers sharing the tables, and "
+                    "'group_store', a directory all of them see, empty for each "
+                    "deployment."
+                )
+            return dataclasses.replace(config, lookup=EngramLookup.PEER_READ)
+        if config.group_size or config.group_store:
+            raise ValueError(
+                "--engram-config: 'group_size' and 'group_store' apply to "
+                "replication 'group_shards' only."
+            )
         if (
             config.lookup == EngramLookup.PEER_READ
             and config.placement != EngramPlacement.GPU

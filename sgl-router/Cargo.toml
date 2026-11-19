@@ -23,11 +23,11 @@ unused_qualifications = "warn"
 
 [dependencies]
 # Pin Dynamo versions and commit Cargo.lock so builds are reproducible.
-dynamo-tokenizers = "=3.1.0"
+dynamo-tokenizers = "=4.3.1"
 # Renders the model's chat template (HF Jinja, or Dynamo's built-in encoder for
 # template-less models like DeepSeek-V4) so cache-aware routing hashes the same
 # tokens the engine caches.
-dynamo-renderer = "=7.1.1"
+dynamo-renderer = "=10.4.3"
 # `OAIChatLikeRequest` speaks minijinja values.
 minijinja = "2.24"
 # SGLang chat rendering shared with the Rust server; DeepSeek-V4 renders through it.
@@ -56,13 +56,15 @@ reqwest = { version = "0.12", features = ["stream", "json", "rustls-tls", "http2
 # Named directly for `Error::is_incomplete_message`, which reqwest does not expose.
 hyper = "1"
 sgl-kv-indexer = { path = "sgl-kv-indexer" }
-# Native SglangService gRPC types, shared with the engine (proto/sglang/runtime/v1).
+# sglang.api.v1 types for the typed generate response.
 sglang-api-types = { path = "../rust/sglang-api-types" }
+# Native SglangService gRPC types, shared with the engine (proto/sglang/runtime/v1).
+sglang-runtime-v1-types = { path = "../rust/sglang-runtime-v1-types" }
 tonic = { version = "0.14.6", features = ["transport"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["preserve_order"] }
+serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
 
 # Tokenizer auto-download from HuggingFace when --tokenizer-path is omitted.
 # Sync (`ureq`) API only — it runs once at startup; `ureq` is on rustls, so
@@ -96,11 +98,21 @@ rmp-serde = "1"
 # hashes, u64 node ids), off the routing hot path's SipHash cost. The
 # keys are client-derivable, not trusted; what bounds a collision attack
 # is that planting a key costs a real request — see the DoS note in
-# src/policies/kv_events/tree.rs.
+# src/state/kv_events/tree.rs.
 rustc-hash = "2"
 sha2 = "0.10"
 url = "2"
 zeromq = { version = "0.6", default-features = false, features = ["tokio-runtime", "tcp-transport"] }
+
+# FIPS 140-3 builds only (`--features fips`): aws-lc-rs's FIPS module becomes the
+# process-wide rustls provider, which reqwest and kube use for every TLS
+# connection. Both are optional, so default builds compile neither.
+aws-lc-rs = { version = "1.18.2", optional = true, features = ["fips"] }
+rustls = { version = "0.23", optional = true, default-features = false, features = ["fips", "std"] }
+
+[features]
+default = []
+fips = ["dep:aws-lc-rs", "dep:rustls"]
 
 [dev-dependencies]
 base64 = "0.22"
@@ -128,9 +140,7 @@ tonic-prost = "0.14.6"
 # Low-level msgpack encoder used to hand-construct wire bytes in
 # kv_events golden-bytes tests (decode-only path uses rmp-serde).
 rmp = "0.8"
-# Criterion benches that mirror the SMG `radix_tree_benchmark` +
-# `manual_policy_benchmark` so routing-decision latency can be compared
-# apples-to-apples against the gateway being deprecated.
+# Criterion benches for routing-decision latency (benches/, BENCHMARKS.md).
 criterion = { version = "0.5", features = ["html_reports"] }
 rand = "0.8"
 

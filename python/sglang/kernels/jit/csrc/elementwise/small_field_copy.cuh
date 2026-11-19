@@ -4,7 +4,6 @@
 #include <sgl_kernel/utils.cuh>  // For LaunchKernel
 
 #include <dlpack/dlpack.h>
-#include <tvm/ffi/container/array.h>
 #include <tvm/ffi/container/tensor.h>
 
 #include <cstddef>
@@ -156,43 +155,16 @@ constexpr int64_t kSmallFieldCopyVecMaxBlocks = 128;
 struct SmallFieldCopy {
   /// \brief Copies every field described in `desc` with one launch on the current stream.
   /// \param anchor Any CUDA tensor on the target device; selects the device and its stream.
-  /// \param desc Per field: src_ptr, dst_ptr, rows, cols, src_row_stride, dst_row_stride, kind
-  ///             (strides in elements; unit column stride on both sides).
+  /// \param desc Contiguous host int64 tensor, per field: src_ptr, dst_ptr, rows, cols,
+  ///             src_row_stride, dst_row_stride, kind (strides in elements; unit column stride on
+  ///             both sides).
   /// \return 0 after launching (or when there is nothing to copy); 1 without launching when two
   ///         different fields overlap, so the caller can fall back to ordered copies.
-  static int64_t run(tvm::ffi::TensorView anchor, tvm::ffi::Array<int64_t> desc) {
-    using namespace host;
-
-    const int64_t num_entries = static_cast<int64_t>(desc.size());
-    CHECK_HOST(num_entries <= kSmallFieldCopyMaxFields * kSmallFieldCopyEntries)
-        << "too many fields " << num_entries / kSmallFieldCopyEntries;
-    int64_t entries[kSmallFieldCopyMaxFields * kSmallFieldCopyEntries];
-    for (int64_t i = 0; i < num_entries; ++i) {
-      entries[i] = desc[i];
-    }
-    return launch(anchor, entries, num_entries, false);
-  }
-
-  /// \brief Same as `run`, with the descriptor in a host int64 tensor of 7 entries per field.
   static int64_t run_host_desc(tvm::ffi::TensorView anchor, tvm::ffi::TensorView desc) {
     return launch(anchor, host_desc(desc), desc.size(0), false);
   }
 
-  /// \brief `run` through small_field_copy_vec_kernel: same bytes, same refusals.
-  static int64_t run_vec(tvm::ffi::TensorView anchor, tvm::ffi::Array<int64_t> desc) {
-    using namespace host;
-
-    const int64_t num_entries = static_cast<int64_t>(desc.size());
-    CHECK_HOST(num_entries <= kSmallFieldCopyMaxFields * kSmallFieldCopyEntries)
-        << "too many fields " << num_entries / kSmallFieldCopyEntries;
-    int64_t entries[kSmallFieldCopyMaxFields * kSmallFieldCopyEntries];
-    for (int64_t i = 0; i < num_entries; ++i) {
-      entries[i] = desc[i];
-    }
-    return launch(anchor, entries, num_entries, true);
-  }
-
-  /// \brief `run_host_desc` through small_field_copy_vec_kernel.
+  /// \brief `run_host_desc` through small_field_copy_vec_kernel: same bytes, same refusals.
   static int64_t run_host_desc_vec(tvm::ffi::TensorView anchor, tvm::ffi::TensorView desc) {
     return launch(anchor, host_desc(desc), desc.size(0), true);
   }
@@ -234,7 +206,7 @@ struct SmallFieldCopy {
     using namespace host;
 
     SymbolicDevice device_;
-    device_.set_options<kDLCUDA, kDLROCM>();
+    device_.set_options<kDLGPU, kDLROCM>();
     device_.verify(anchor.device());
 
     CHECK_HOST(num_entries % kSmallFieldCopyEntries == 0) << "bad descriptor length " << num_entries;

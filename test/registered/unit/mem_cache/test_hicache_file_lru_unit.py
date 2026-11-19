@@ -746,6 +746,8 @@ class TestDcpStorage(unittest.TestCase):
             cc.storage_backend = backend
             cc.page_size = 128
             cc.prefetch_hits_sync_groups = []
+            cc.mem_pool_host = SimpleNamespace(entry_map={})
+            cc._host_pool_schemas = []
             op = PrefetchOperation(
                 CacheRequestHandle("test", 0), tokens, pool_transfers=[transfer]
             )
@@ -760,9 +762,11 @@ class TestDcpStorage(unittest.TestCase):
             peer[0] = 1
             peer[other.pool_storage_result.restorable_prefix_pages] = 1
 
-            def reduce(tensor, op, groups, peer=peer):
+            schema = cc._host_pool_schema(cc.prefetch_hits_sync_groups)
+
+            def reduce(tensor, op, groups, peer=peer, schema=schema):
                 # Restorable flags lead; per-pool verdicts trail them.
-                self.assertEqual(tensor.numel(), peer.numel() + len(PoolName))
+                self.assertEqual(tensor.numel(), peer.numel() + len(schema))
                 self.assertEqual(op, torch.distributed.ReduceOp.MIN)
                 tensor[: peer.numel()] = torch.minimum(tensor[: peer.numel()], peer)
 
@@ -845,7 +849,9 @@ class TestDcpStorage(unittest.TestCase):
             cc = HiCacheController.__new__(HiCacheController)
             cc.enable_storage = False
             cc.host_memory_mode = "cache"
-            cc.storage_host_pool = object() if case == "non_mla" else host
+            cc.storage_host_pool = (
+                SimpleNamespace(layout=host.layout) if case == "non_mla" else host
+            )
             entries = [SimpleNamespace(name=PoolName.KV, host_pool=host)]
             if case in ("extra_pool", "wrong_pool", "file_kda", "mooncake_kda"):
                 entries.append(
@@ -863,6 +869,12 @@ class TestDcpStorage(unittest.TestCase):
             )
             with (
                 self.subTest(case=case),
+                mock.patch(
+                    "sglang.srt.managers.cache_controller.get_memory",
+                    return_value=SimpleNamespace(
+                        hicache_storage_key_scheme="rank-suffix"
+                    ),
+                ),
                 mock.patch(
                     "sglang.srt.managers.cache_controller.get_parallel",
                     return_value=SimpleNamespace(attn_dcp_size=2),

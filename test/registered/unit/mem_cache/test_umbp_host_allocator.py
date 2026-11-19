@@ -195,7 +195,7 @@ class TestUMBPHostAllocator(unittest.TestCase):
 
         with mock.patch.object(builtins, "__import__", fake_import):
             with self.assertLogs(level="WARNING") as cm:
-                from sglang.srt.mem_cache.memory_pool_host import (
+                from sglang.srt.mem_cache.pool_host.common import (
                     get_allocator_from_storage,
                 )
 
