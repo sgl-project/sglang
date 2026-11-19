@@ -134,7 +134,9 @@ class TestHealthWarmupGate(unittest.IsolatedAsyncioTestCase, CustomTestCase):
                                 self.assertFalse(aborted.is_set())
                                 self.assertEqual(response, {"status": "ok"})
                             else:
-                                self.assertFalse(ready)
+                                self.assertTrue(
+                                    ready
+                                )  # warmup_done wakes in-flight waiters on failure
                                 self.assertTrue(aborted.is_set())
                                 self.assertIn("Scheduler worker", client.failure_reason)
                                 self.assertEqual(response.status_code, 503)
@@ -263,6 +265,34 @@ class TestHealthWarmupGate(unittest.IsolatedAsyncioTestCase, CustomTestCase):
                 self.assertEqual(
                     (await http.get("/completed")).json(), {"result": "saved"}
                 )
+
+    async def test_waiting_models_request_wakes_with_503_on_warmup_failure(self):
+        client = AsyncSchedulerClient()
+        args = SimpleNamespace(
+            enable_metrics=False,
+            pipeline_config=mock.Mock(
+                supports_action_endpoint=lambda: False,
+                supports_openpi_endpoint=lambda: False,
+            ),
+        )
+        with mock.patch.object(http_server, "async_scheduler_client", client):
+            app = http_server.create_app(args)
+            warmup_done = asyncio.Event()
+            app.state.server_warmup_done = warmup_done
+            async with http_server.httpx.AsyncClient(
+                transport=http_server.httpx.ASGITransport(app=app),
+                base_url="http://test",
+            ) as http:
+                req_task = asyncio.create_task(http.get("/v1/models"))
+                await asyncio.sleep(0.01)
+                self.assertFalse(req_task.done())
+
+                client.mark_failed("Scheduler worker exited; restart the server.")
+                warmup_done.set()
+
+                resp = await asyncio.wait_for(req_task, timeout=5)
+                self.assertEqual(resp.status_code, 503)
+                self.assertIn("Scheduler worker", resp.json()["error"])
 
     async def test_liveness_returns_200_before_warmup(self):
         self.assertEqual(await liveness(), {"status": "ok"})

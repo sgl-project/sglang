@@ -2093,7 +2093,7 @@ def test_only_the_layers_the_budget_covers_are_pinned(tmp_path, monkeypatch):
     # The pin budget covers two of the four layers. Available host memory sits
     # above the copy reserve by less than all four layers but more than the
     # two pins, so the rest is demoted to the mapping and the pins stand.
-    budget = 2 * 1024**3 + 2 * _BLOCK_BYTES
+    budget = host_memory_budget.MIN_HOST_RESERVE_BYTES + 2 * _BLOCK_BYTES
     manager = _mapped_manager(
         tmp_path,
         monkeypatch,
@@ -2120,7 +2120,7 @@ def test_pins_are_given_back_when_they_do_not_fit_the_host(tmp_path, monkeypatch
         tmp_path,
         monkeypatch,
         available_bytes=available,
-        pin_budget_bytes=2 * 1024**3 + 2 * _BLOCK_BYTES,
+        pin_budget_bytes=host_memory_budget.MIN_HOST_RESERVE_BYTES + 2 * _BLOCK_BYTES,
         num_blocks=4,
     )
     on_mapping = {i for i in range(4) if manager._mapped_cpu_weights.get(i)}
@@ -2155,7 +2155,7 @@ def test_replacing_an_anonymous_original_is_not_charged_as_new(tmp_path, monkeyp
         enabled=True,
         pin_cpu_memory=True,
         pin_budget=host_memory_budget.HostPinBudget(
-            available_bytes=2 * 1024**3 + 3 * block
+            available_bytes=host_memory_budget.MIN_HOST_RESERVE_BYTES + 3 * block
         ),
         prefetch_size=1,
     )

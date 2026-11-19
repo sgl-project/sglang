@@ -144,6 +144,9 @@ async def _run_server_warmup_after_http_live(app: FastAPI) -> None:
         raise
     except Exception as e:
         logger.error("Server warmup failed; aborting startup: %s", e, exc_info=True)
+        if not async_scheduler_client.failure_reason:
+            async_scheduler_client.mark_failed(str(e))
+        warmup_done.set()
         os.kill(os.getpid(), signal.SIGTERM)
 
 
@@ -702,7 +705,9 @@ def create_app(
     @app.middleware("http")
     async def wait_for_server_warmup(request: Request, call_next):
         # Keep GETs available for completed results and failure diagnostics.
-        if request.method == "POST" and async_scheduler_client.failure_reason:
+        if (
+            request.method == "POST" or request.url.path in ("/v1/models", "/models")
+        ) and async_scheduler_client.failure_reason:
             return orjson_response(
                 {"error": async_scheduler_client.failure_reason}, status_code=503
             )
@@ -713,6 +718,10 @@ def create_app(
             and request.url.path not in SERVER_WARMUP_BYPASS_PATHS
         ):
             await warmup_done.wait()
+            if async_scheduler_client.failure_reason:
+                return orjson_response(
+                    {"error": async_scheduler_client.failure_reason}, status_code=503
+                )
         return await call_next(request)
 
     app.include_router(health_router)
