@@ -448,7 +448,7 @@ class TestConfigureKvCacheDtypeOnNpu(_NpuPatchedTestCase):
         for decode_graph in (True, False):
             with self.subTest(decode_graph=decode_graph):
                 self._publish_int8_indexer(decode_graph=decode_graph)
-                self.assertEqual(self._configure("bf16"), (None, torch.bfloat16))
+                self.assertEqual(self._configure("bf16"), ("bf16", torch.bfloat16))
                 cap = kv_capability.resolve_npu_kv_capability(torch.bfloat16)
                 self.assertTrue(cap.supported)
                 self.assertEqual(cap.indexer_kv_dtype, torch.int8)
@@ -515,7 +515,9 @@ class TestConfigureKvCacheDtypeOnNpu(_NpuPatchedTestCase):
 
     def test_an_unquantized_indexer_off_npu_is_accepted(self):
         self._publish_indexer_kv_dtype("bf16")
-        self.assertEqual(self._configure("bf16", is_npu=False), (None, torch.bfloat16))
+        self.assertEqual(
+            self._configure("bf16", is_npu=False), ("bf16", torch.bfloat16)
+        )
 
 
 class TestMlaKvCacheDim(_NpuPatchedTestCase):

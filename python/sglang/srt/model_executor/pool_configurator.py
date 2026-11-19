@@ -726,18 +726,34 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             DSATokenToKVPool.index_k_with_scale_buffer_dtype
         )
         if _is_npu:
-            from sglang.srt.hardware_backend.npu.kv_capability import resolve_npu_kv_capability
-            from sglang.srt.mem_cache.kv_cache_dtype import QUANT_MODE_TOKEN_INT8, resolve_indexer_quant_mode
+            from sglang.srt.hardware_backend.npu.kv_capability import (
+                resolve_npu_kv_capability,
+            )
+            from sglang.srt.mem_cache.kv_cache_dtype import (
+                QUANT_MODE_TOKEN_INT8,
+                resolve_indexer_quant_mode,
+            )
 
-            capability = resolve_npu_kv_capability(kvc.kv_cache_dtype, is_draft_worker=is_draft_worker)
-            legacy_int8 = resolve_indexer_quant_mode(
-                kvc.server_args.indexer_kv_cache_dtype, kvc.kv_cache_dtype
-            ) == QUANT_MODE_TOKEN_INT8
+            capability = resolve_npu_kv_capability(
+                kvc.kv_cache_dtype, is_draft_worker=is_draft_worker
+            )
+            legacy_int8 = (
+                resolve_indexer_quant_mode(
+                    kvc.server_args.indexer_kv_cache_dtype, kvc.kv_cache_dtype
+                )
+                == QUANT_MODE_TOKEN_INT8
+            )
             compression = get_dsa_index_kpool(kvc.model_config.hf_config)
-            if (legacy_int8 or capability.indexer_kv_dtype == torch.int8) and compression > 1:
-                raise ValueError("INT8 indexer KV cache is not supported with NPU KPool.")
+            if (
+                legacy_int8 or capability.indexer_kv_dtype == torch.int8
+            ) and compression > 1:
+                raise ValueError(
+                    "INT8 indexer KV cache is not supported with NPU KPool."
+                )
             index_dtype = torch.int8 if legacy_int8 else capability.indexer_kv_dtype
-            scale_dtype = torch.float16 if legacy_int8 else capability.indexer_scale_dtype
+            scale_dtype = (
+                torch.float16 if legacy_int8 else capability.indexer_scale_dtype
+            )
             index_bytes = index_head_dim * torch._utils._element_size(index_dtype)
             if scale_dtype is not None:
                 index_bytes += torch._utils._element_size(scale_dtype)

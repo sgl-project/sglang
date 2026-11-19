@@ -155,7 +155,9 @@ class TestInt8IndexerResolution(CustomTestCase):
             p = object.__new__(cls)
             p.index_k_scale_buffer = scale
             p.indexer_kv_dtype = dtype
-            p.kv_capability = SimpleNamespace(indexer_quant=scale is not None, indexer_kv_dtype=dtype)
+            p.kv_capability = SimpleNamespace(
+                indexer_quant=scale is not None, indexer_kv_dtype=dtype
+            )
             return p
 
         scale = torch.zeros(1)
