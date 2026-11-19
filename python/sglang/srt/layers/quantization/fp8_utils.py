@@ -846,34 +846,33 @@ def can_use_xpu_fp8_moe(
     use_mxfp8: bool = False,
 ) -> bool:
     """Check FP8 layouts and runner options supported by native XPU MoE."""
-    valid_block_size = (
+    valid_block = (
         weight_block_size in (None, [1, 32])
         if use_mxfp8
         else weight_block_size in (None, [128, 128])
     )
-    if not (
-        valid_block_size
+    supported_act = (config.activation, config.is_gated) in (
+        ("silu", True),
+        ("gelu_tanh", True),
+        ("relu2", False),
+    )
+    try:
+        ep_active = get_parallel().moe_ep_size > 1
+    except (RuntimeError, ValueError):
+        ep_active = False
+
+    return (
+        valid_block
+        and supported_act
         and not config.apply_router_weight_on_input
         and not config.no_combine
-        and (config.activation, config.is_gated)
-        in (("silu", True), ("gelu_tanh", True), ("relu2", False))
-    ):
-        return False
-
-    if (
-        config.num_experts is not None
-        and config.num_local_experts is not None
-        and config.num_experts != config.num_local_experts
-    ):
-        return False
-
-    try:
-        if get_parallel().moe_ep_size > 1:
-            return False
-    except (RuntimeError, ValueError):
-        pass
-
-    return True
+        and not ep_active
+        and not (
+            config.num_experts is not None
+            and config.num_local_experts is not None
+            and config.num_experts != config.num_local_experts
+        )
+    )
 
 
 def prepare_xpu_block_scale_for_scaled_mm(
