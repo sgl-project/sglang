@@ -13,6 +13,7 @@ from sglang.srt.configs.cosmos3 import (
 )
 from sglang.srt.configs.dbrx import DbrxConfig
 from sglang.srt.configs.deepseekvl2 import DeepseekVL2Config
+from sglang.srt.configs.dory import DoryConfig
 from sglang.srt.configs.dots3 import Dots3Config
 from sglang.srt.configs.dots_ocr import DotsOCRConfig
 from sglang.srt.configs.dots_vlm import DotsVLMConfig
@@ -152,6 +153,7 @@ __all__ = [
     "InternS2MobiusVisionConfig",
     "DotsVLMConfig",
     "DotsOCRConfig",
+    "DoryConfig",
     "Dots3Config",
     "FalconH1Config",
     "FalconMambaConfig",

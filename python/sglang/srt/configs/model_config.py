@@ -2459,6 +2459,10 @@ class ModelConfig:
         default_sampling_params = {
             p: config.get(p) for p in available_params if config.get(p) is not None
         }
+        # HF writes top_k=0 to mean "disabled"; sglang accepts only -1, so a model whose
+        # generation_config sets it would 400 every chat request that leaves top_k default.
+        if default_sampling_params.get("top_k") == 0:
+            default_sampling_params["top_k"] = -1
 
         return default_sampling_params
 
