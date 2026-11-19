@@ -1353,6 +1353,7 @@ class TestMooncakeLinkerPPLookup(CustomTestCase):
                     storage.mem_pool_host = group
                     storage.registered_pools = group.entry_map
                     storage.config_prefix = "model"
+                    storage.unified_suffixes = None
                     storage._has_request_context_support = False
                     storage.mla_suffix = _storage_suffix(
                         rank_replicated=replicated,
