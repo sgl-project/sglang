@@ -447,44 +447,19 @@ def _checkpoint_tensor_readers(
         and module.moe_ep_size > 1
         and get_layer_id(name + ".") == module.layer_id
     }
-    parallel = get_parallel()
-    config = getattr(model, "config", None)
-    config = getattr(config, "text_config", None) or config
-    num_experts = next(  # Stacked expert tensors lead with this dimension.
-        (
-            getattr(config, a)
-            for a in ("n_routed_experts", "num_experts", "num_local_experts")
-            if isinstance(getattr(config, a, None), int)
-        ),
-        None,
-    )
-    stacked = (
-        num_experts is not None
-        and parallel.moe_ep_size > 1
-        and num_experts % parallel.moe_ep_size == 0
-    )
-    if not moe_layers and not stacked:
+    if not moe_layers:
         return None
 
-    node_peers = _node_local_peers(parallel.world_group.ranks)
-    expert_peers = _node_local_peers(parallel.moe_tp_group.ranks)
+    node_peers = _node_local_peers(get_parallel().world_group.ranks)
+    expert_peers = _node_local_peers(get_parallel().moe_tp_group.ranks)
 
     @functools.lru_cache(maxsize=None)
     def is_local_expert(layer_id: int, expert_id: int) -> bool:
         local_ids = moe_layers[layer_id]._weight_loader_expert_ids(None, expert_id)
         return next(local_ids, None) is not None
 
-    def readers(name: str, nbytes: int, shape=()) -> Optional[Tuple[int, ...]]:
+    def readers(name: str, nbytes: int) -> Optional[Tuple[int, int]]:
         match = _EXPERT_ID_RE.search(name)
-        # Stacked experts: under EP each rank holds a contiguous block of them.
-        if (
-            stacked
-            and match is None
-            and ".experts." in name
-            and shape
-            and shape[0] == num_experts
-        ):
-            return expert_peers + ((parallel.moe_ep_rank, parallel.moe_ep_size),)
         layer_id = get_layer_id(name)
         # Some backends read per-expert scalars, e.g. input scales, on every rank.
         if match is None or layer_id not in moe_layers or nbytes <= 8:
@@ -493,7 +468,6 @@ def _checkpoint_tensor_readers(
             return expert_peers
         return None
 
-    readers.stacked = stacked  # Whether a checkpoint may stack experts.
     return readers
 
 

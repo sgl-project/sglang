@@ -152,9 +152,7 @@ def probe_routed_expert_weight_dtype(model_path: str) -> Optional[str]:
 
 
 # (name, nbytes) -> (index, count) of this rank among the node's readers, or None.
-# A third item (part, parts) means the rank reads only that part of the tensor's
-# leading dimension, e.g. its block of stacked experts.
-CheckpointTensorReaders = Callable[[str, int, List[int]], Optional[Tuple[int, ...]]]
+CheckpointTensorReaders = Callable[[str, int], Optional[Tuple[int, int]]]
 
 # Block size for sequential checkpoint prefetch reads (page cache warming).
 _PREFETCH_BLOCK_SIZE = None
@@ -1113,30 +1111,19 @@ def np_cache_weights_iterator(
 def _prefetch_checkpoint_file(
     file_path: str,
     cancel_event: Optional[threading.Event] = None,
-    select: Optional[Callable[[str, int, List[int]], object]] = None,
+    select: Optional[Callable[[str, int], bool]] = None,
 ) -> None:
     """Prefetch a checkpoint file into the OS page cache.
 
-    Reads the file, or only the tensors ``select(name, nbytes, shape)`` picks
-    (or the ``(part, parts)`` of their leading dimension it returns),
+    Reads the file, or only the tensors ``select(name, nbytes)`` picks,
     sequentially in 16 MB blocks so the kernel caches its pages before workers
     load the same file via mmap.
     """
     with open(file_path, "rb") as f:
         ranges = [(0, os.fstat(f.fileno()).st_size)]
         if select is not None:
-            ranges = []
-            for k, (begin, end, shape) in _safetensors_offsets(file_path).items():
-                if not (part := select(k, end - begin, shape)):
-                    continue
-                if part is not True:  # (part, parts) of the leading dimension
-                    row = (end - begin) // shape[0]
-                    begin, end = (
-                        begin + shape[0] * p // part[1] * row
-                        for p in (part[0], part[0] + 1)
-                    )
-                ranges.append((begin, end))
-            ranges.sort()
+            offsets = _safetensors_offsets(file_path)
+            ranges = sorted(r for k, r in offsets.items() if select(k, r[1] - r[0]))
         for start, end in ranges:
             f.seek(start)
             while start < end and (cancel_event is None or not cancel_event.is_set()):
@@ -1146,19 +1133,14 @@ def _prefetch_checkpoint_file(
                 start += n
 
 
-def _safetensors_offsets(path: str) -> Dict[str, Tuple[int, int, List[int]]]:
-    """Return each tensor's byte range and shape in a safetensors file."""
+def _safetensors_offsets(path: str) -> Dict[str, Tuple[int, int]]:
+    """Return each tensor's byte range in a safetensors file."""
     with open(path, "rb") as f:
         (size,) = struct.unpack("<Q", f.read(8))
         header = json.loads(f.read(size))
     header.pop("__metadata__", None)
     return {
-        k: (
-            8 + size + v["data_offsets"][0],
-            8 + size + v["data_offsets"][1],
-            v["shape"],
-        )
-        for k, v in header.items()
+        k: tuple(8 + size + o for o in v["data_offsets"]) for k, v in header.items()
     }
 
 
@@ -1195,12 +1177,11 @@ def _read_tensors(
         info = header[name]
         begin, end = info["data_offsets"]
         begin, end = begin + 8 + size, end + 8 + size
-        peers = readers(name, end - begin, info["shape"])
-        if peers is None:
+        if readers(name, end - begin) is None:
             continue
         dtype = _SAFETENSORS_DTYPES.get(info["dtype"])
-        read = (  # Not stacked experts, of which the rank copies only its part.
-            len(peers) == 2
+        read = (  # Experts stacked in one tensor stay mapped; a rank copies its part.
+            not re.search(r"\.experts\.(?!\d+\.)", name)
             and dtype is not None
             and math.prod(info["shape"]) * dtype.itemsize == end - begin > 0
         )
@@ -1344,30 +1325,14 @@ def _prefetch_all_checkpoints(
         local_world_size = 1
 
     # Whole shards are read faster; prefetch only what the node reads when they
-    # do not fit in RAM or experts are stacked.
-    if readers is None or (
-        sum(map(os.path.getsize, sorted_files))
-        <= 0.9 * psutil.virtual_memory().available
-        and not (
-            getattr(readers, "stacked", False)
-            and any(
-                len(readers(k, end - begin, shape) or ()) > 2
-                for path in sorted_files
-                for k, (begin, end, shape) in _safetensors_offsets(path).items()
-            )
-        )
+    # do not fit in RAM.
+    if readers is None or sum(map(os.path.getsize, sorted_files)) <= (
+        0.9 * psutil.virtual_memory().available
     ):
         my_files = [(path, None) for path in sorted_files[local_rank::local_world_size]]
     else:  # Prefetch only what the node reads, split by file among its readers.
         my_files = [
-            (
-                path,
-                lambda name, n, shape, i=i: (
-                    (r := readers(name, n, shape))
-                    and i % r[1] == r[0]
-                    and (r[2:] or (True,))[0]
-                ),
-            )
+            (path, lambda name, n, i=i: (r := readers(name, n)) and i % r[1] == r[0])
             for i, path in enumerate(sorted_files)
         ]
     total_for_rank = len(my_files)
