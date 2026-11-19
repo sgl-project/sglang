@@ -26,6 +26,9 @@ use crate::message::config::ServerArgs;
 pub(crate) type ResponsesEvent = (String, Value);
 pub(crate) type Events = Pin<Box<dyn Stream<Item = ResponsesEvent> + Send + 'static>>;
 
+// TODO(rainj-me): move `plan`, `shape_unary` and `responses_events` into
+// sglang-processor as a lower-and-respond pair, as chat and score are.
+
 /// The per-listener facts a Responses call needs; both transports build one
 /// from their own state.
 pub(crate) struct Responses<'a> {

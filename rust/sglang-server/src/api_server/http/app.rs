@@ -14,7 +14,7 @@ use super::{
 };
 use crate::HttpLayer;
 use crate::api_server::core::{DrainEnd, FLUSH_INTERVAL};
-use crate::api_server::disaggregation::bootstrap as pd_bootstrap;
+use crate::api_server::disaggregation as pd_bootstrap;
 use crate::api_server::handlers::{CoreHandle, HiCacheManager};
 use crate::api_server::log;
 use crate::message::config::ServerArgs;
