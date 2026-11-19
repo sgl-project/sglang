@@ -32,6 +32,7 @@ from sglang.srt.mem_cache.kv.decl import (
 )
 from sglang.srt.mem_cache.kv.plan import plan_kv_storage
 from sglang.srt.mem_cache.kv.sizing import KVSizingInputs, size_plan
+from sglang.srt.mem_cache.layout.conv_window import deduplicated_conv_window_axis
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.runtime_context import get_parallel, mamba_cache_chunk_size
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -93,6 +94,8 @@ def _build(
     derived=(),
     state=False,
     gamma=None,
+    conv_shape=(3, 8),
+    conv_window_axis=None,
     replay=None,
     ple=False,
     fused_draft=None,
@@ -110,7 +113,7 @@ def _build(
         head_num=1, head_dim=8, v_head_dim=8, kv_cache_dtype=torch.bfloat16
     )
     geometry = StateGeometry(
-        conv_state_shapes=((3, 8),),
+        conv_state_shapes=(conv_shape,),
         conv_dtype=torch.bfloat16,
         temporal_state_shape=(1, 4, 8),
         temporal_dtype=torch.float32,
@@ -145,6 +148,7 @@ def _build(
         decls,
         page_size=4,
         speculative_num_draft_tokens=gamma,
+        conv_window_axis=conv_window_axis,
         derived_parts=derived,
         fused_draft=fused_draft,
     )
@@ -1878,6 +1882,75 @@ class TestDeclaredParts(CustomTestCase):
         self.assertEqual(
             state.get_device_pool_infos()[0].buffer_info.extra_checkpoint_buffers, ()
         )
+
+    def test_overlapping_verify_windows_share_only_within_a_request_and_layer(self):
+        for axis, conv_shape in enumerate(((3, 8), (8, 3))):
+            with self.subTest(axis=axis):
+                storage, _, sized = _build(
+                    state=True, gamma=8, conv_shape=conv_shape, conv_window_axis=axis
+                )
+                name = "mamba.intermediate_conv_window.0"
+                physical = storage.scratch.tensors[name]
+                view = storage.view("mamba").mamba_cache.intermediate_conv_window[0]
+                self.assertTrue(physical.is_contiguous())
+                self.assertEqual(physical.shape[2 + axis], 10)
+                self.assertEqual(view.shape, (2, 4, 8, *conv_shape))
+                self.assertEqual(view.data_ptr(), physical.data_ptr())
+                self.assertEqual(view.stride(2), view.stride(3 + axis))
+                nbytes = 2 * 4 * 10 * 8 * physical.element_size()
+                self.assertEqual(physical.untyped_storage().nbytes(), nbytes)
+                self.assertEqual(
+                    next(p.bytes for p in sized.fixed if p.name == name), nbytes
+                )
+                state = storage.view("mamba")
+                self.assertEqual(state.conv_window_axis, axis)
+                cache = state.mamba_cache
+                charged = sum(
+                    t.nbytes
+                    for t in (*cache.conv, cache.temporal, cache.intermediate_ssm)
+                )
+                self.assertEqual(state.get_kv_size_bytes(), charged + nbytes)
+                self.assertEqual(
+                    cache.at_layer_idx(0).mem_usage_bytes(), (charged + nbytes) // 2
+                )
+                # Move the window axis last to compare the two channel layouts.
+                windows = view.movedim(3 + axis, -1)
+                cols = torch.arange(10, dtype=physical.dtype).expand(8, 10)
+                physical[1, 2].movedim(axis, -1).copy_(cols)
+                expected = cols.unfold(1, 3, 1).transpose(0, 1)
+                torch.testing.assert_close(windows[1, 2], expected)
+                storage.scratch.copy_rows(torch.tensor([1]), torch.tensor([2]))
+                storage.scratch.reset_rows([2])
+                torch.testing.assert_close(windows[1, 1], expected)
+                self.assertFalse(windows[0].any())
+                self.assertFalse(windows[1, 2:].any())
+                self.assertFalse(windows[1, 0].any())
+
+    def test_conv_window_layout_eligibility(self):
+        shape = SimpleNamespace(
+            conv=((8, 3),), conv_kernel=4, disable_conv_window_dedup=False
+        )
+        params = SimpleNamespace(shape=shape, is_kda=False)
+
+        def axis(topk=1, supported=True):
+            return deduplicated_conv_window_axis(
+                params, supported_device=supported, speculative_eagle_topk=topk
+            )
+
+        self.assertEqual(axis(), 1)
+        self.assertEqual(axis(topk=None), 1)
+        self.assertIsNone(axis(topk=2))
+        self.assertIsNone(axis(supported=False))
+        params.is_kda = True
+        self.assertIsNone(axis())
+        params.is_kda = False
+        shape.disable_conv_window_dedup = True
+        self.assertIsNone(axis())
+        shape.disable_conv_window_dedup = False
+        shape.conv = ((3, 8),)
+        self.assertEqual(axis(), 0)
+        del shape.disable_conv_window_dedup
+        self.assertIsNone(axis())
 
     def test_owner_only_plan_allocates_reuses_and_checkpoints_pages(self):
         setup_allocator_context()

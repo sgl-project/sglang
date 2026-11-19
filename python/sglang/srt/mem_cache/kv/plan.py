@@ -47,6 +47,7 @@ from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.request import RequestSubPoolSpec
 from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
+from sglang.srt.mem_cache.layout.conv_window import conv_window_storage_shape
 from sglang.srt.mem_cache.layout.fused_draft import (
     LAYER_STATE,
     LAYER_WINDOW,
@@ -231,6 +232,7 @@ class KVStoragePlan(msgspec.Struct, frozen=True, kw_only=True):
     sub_pools: Tuple[PlannedSubPool, ...]
     fused_draft: Optional[FusedDraftPlacement] = None
     scratch: Tuple[ScratchDecl, ...] = ()
+    conv_window_axis: Optional[int] = None
     derived_parts: Tuple[DerivedPartDecl, ...] = ()
 
     def storage_format_tag(self) -> Optional[str]:
@@ -665,6 +667,7 @@ def plan_kv_storage(
     page_size: int,
     fused_draft: Optional[FusedDraftPlacement] = None,
     speculative_num_draft_tokens: Optional[int] = None,
+    conv_window_axis: Optional[int] = None,
     derived_parts: Sequence[DerivedPartDecl] = (),
 ) -> KVStoragePlan:
     """The unified-buffer plan for these declarations."""
@@ -783,11 +786,17 @@ def plan_kv_storage(
             for name, shape, dtype in (
                 (
                     "intermediate_ssm",
-                    geometry.temporal_state_shape,
+                    (speculative_num_draft_tokens, *geometry.temporal_state_shape),
                     geometry.temporal_dtype,
                 ),
                 *(
-                    (f"intermediate_conv_window.{i}", shape, geometry.conv_dtype)
+                    (
+                        f"intermediate_conv_window.{i}",
+                        conv_window_storage_shape(
+                            shape, speculative_num_draft_tokens, conv_window_axis
+                        ),
+                        geometry.conv_dtype,
+                    )
                     for i, shape in enumerate(geometry.conv_state_shapes)
                 ),
             ):
@@ -801,7 +810,7 @@ def plan_kv_storage(
                     ScratchDecl(
                         part=TensorPartDecl(
                             name=f"{sub_pool.name}.{name}",
-                            shape=(speculative_num_draft_tokens, *shape),
+                            shape=shape,
                             dtype=dtype,
                             layer_ids=sub_pool.layer_ids,
                         )
@@ -829,5 +838,6 @@ def plan_kv_storage(
         sub_pools=tuple(sub_pools),
         fused_draft=fused_draft,
         scratch=tuple(scratch),
+        conv_window_axis=conv_window_axis,
         derived_parts=tuple(derived_parts),
     )

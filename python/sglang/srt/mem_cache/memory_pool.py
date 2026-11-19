@@ -80,6 +80,12 @@ from sglang.srt.mem_cache.kv.memory.views import MHAKVView, MLAKVView
 from sglang.srt.mem_cache.kv.router import KVLayerRouter, PlainPoolRouter
 from sglang.srt.mem_cache.kv.state_storage import StateStorage
 from sglang.srt.mem_cache.kv_vmm_backing import KvVmmBufferOwner
+from sglang.srt.mem_cache.layout.conv_window import (
+    conv_window_storage_bytes,
+    conv_window_storage_shape,
+    conv_window_view,
+    deduplicated_conv_window_axis,
+)
 from sglang.srt.mem_cache.layout.token_major import (
     build_mamba_entry_views,
     mamba_entry_bytes,
@@ -136,24 +142,6 @@ _use_aiter = bool(envs.SGLANG_USE_AITER.get()) and _is_hip
 
 if _is_xpu:
     from sgl_kernel import store_cache_xpu
-
-
-def conv_window_dedup_enabled(
-    is_npu: bool, is_cpu: bool, speculative_eagle_topk: Optional[int], is_kda: bool
-) -> bool:
-    """Whether the deduplicated sliding-window conv-intermediate layout is safe.
-
-    It is safe for CUDA linear draft chains whose kernels consume the window raw.
-    Tree verify, NPU/CPU, and KDA keep dense windows: tree ancestors need independent
-    windows, platform kernels expect contiguous steps, and KDA transposes the window
-    before conv so the overlapping ``as_strided`` layout would corrupt stores.
-    """
-    return (
-        not is_npu
-        and not is_cpu
-        and not is_kda
-        and (speculative_eagle_topk is None or speculative_eagle_topk <= 1)
-    )
 
 
 def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
@@ -571,9 +559,11 @@ class MambaPool:
 
         def mem_usage_bytes(self):
             return sum(
-                get_tensor_size_bytes(getattr(self, f.name))
+                conv_window_storage_bytes(value)
+                if f.name == "intermediate_conv_window"
+                else get_tensor_size_bytes(value)
                 for f in dataclasses.fields(self)
-                if getattr(self, f.name) is not None
+                if (value := getattr(self, f.name)) is not None
             )
 
     @dataclass(frozen=True, kw_only=True)
@@ -584,34 +574,6 @@ class MambaPool:
         intermediate_ssm: Optional[torch.Tensor]
         intermediate_conv_window: List[torch.Tensor]
 
-    def _detect_conv_window_axis(
-        self, conv_state_shape: List[Tuple[int, int]], win_len: int
-    ) -> int:
-        """Prefer GDN's trailing axis when both match; mixed layer layouts cannot
-        share one overlapping conv-window buffer.
-        """
-        axis = None
-        for conv_shape in conv_state_shape:
-            if conv_shape[-1] == win_len:
-                shape_axis = len(conv_shape) - 1
-            elif conv_shape[0] == win_len:
-                shape_axis = 0
-            else:
-                raise ValueError(
-                    f"conv_state shape {conv_shape} has no axis of length "
-                    f"conv_kernel-1={win_len}; cannot build the deduplicated "
-                    "sliding-window conv-intermediate view."
-                )
-            if axis is None:
-                axis = shape_axis
-            elif axis != shape_axis:
-                raise ValueError(
-                    "inconsistent conv-window axis across conv shapes "
-                    f"{conv_state_shape}; a single conv_window_axis cannot serve "
-                    "mixed layouts."
-                )
-        return axis
-
     def _allocate_deduplicated_conv_window(
         self,
         *,
@@ -621,36 +583,15 @@ class MambaPool:
         speculative_num_draft_tokens: int,
         conv_dtype: torch.dtype,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        window_axis = self.conv_window_axis % len(conv_shape)
-        win = conv_shape[window_axis]
-        physical_conv_shape = list(conv_shape)
-        physical_conv_shape[window_axis] = speculative_num_draft_tokens + win - 1
+        shape = conv_window_storage_shape(
+            conv_shape, speculative_num_draft_tokens, self.conv_window_axis
+        )
         phys = torch.zeros(
-            (
-                num_mamba_layers,
-                spec_state_size + 1,
-                *physical_conv_shape,
-            ),
+            (num_mamba_layers, spec_state_size + 1, *shape),
             dtype=conv_dtype,
             device=self.device,
         )
-        physical_conv_strides = phys.stride()[2:]
-        window_stride = physical_conv_strides[window_axis]
-        view = phys.as_strided(
-            (
-                phys.shape[0],
-                phys.shape[1],
-                speculative_num_draft_tokens,
-                *conv_shape,
-            ),
-            (
-                phys.stride(0),
-                phys.stride(1),
-                window_stride,
-                *physical_conv_strides,
-            ),
-        )
-        return phys, view
+        return phys, conv_window_view(phys, conv_shape, self.conv_window_axis)
 
     def __init__(
         self,
@@ -934,50 +875,25 @@ class MambaPool:
                         dtype=ssm_dtype,
                         device=device,
                     )
-                # Cache intermediate conv windows (last K-1 inputs) per draft token
-                # during target verify.
-                #
-                # On CUDA (Triton conv kernel + Triton scatter) we use a
-                # *deduplicated sliding-window* layout: consecutive draft tokens'
-                # (K-1)-wide windows overlap by (K-2), so instead of D separate
-                # [dim, K-1] windows we store one shared [dim, D+K-2] buffer per
-                # (layer, slot) and expose an overlapping `as_strided` view of
-                # logical shape [num_layers, size+1, draft_tokens, dim, K-1] where
-                # step `t`'s window is the slice shared[..., :, t:t+K-1]. This
-                # halves the conv-intermediate footprint (D*(K-1) -> D+K-2 columns)
-                # with no numerical change: both the conv kernel write (one tile
-                # store per row for width-4 chains, idempotent overlapping stores
-                # otherwise) and `fused_conv_window_scatter_with_mask` consume the
-                # view through its strides.
-                #
-                # Dedup the sliding-window conv-intermediate only when it is safe:
-                # CUDA + a linear draft chain (topk <= 1). NPU/CPU and EAGLE tree
-                # verify (topk > 1) keep the dense layout -- see
-                # `conv_window_dedup_enabled` for the full rationale. The
-                # `fused_conv_window_scatter_with_mask` scatter is layout-agnostic,
-                # so the dense fallback reads correctly through the same code path.
-                dedup_conv_window = (
-                    not cache_params.shape.disable_conv_window_dedup
-                    and conv_window_dedup_enabled(
-                        _is_npu, _is_cpu, speculative_eagle_topk, cache_params.is_kda
-                    )
+                # A linear verify chain shares the K-2 columns common to
+                # adjacent windows. The conv update and accept scatter both
+                # consume the resulting view through its strides.
+                axis = deduplicated_conv_window_axis(
+                    cache_params,
+                    supported_device=not (_is_npu or _is_cpu),
+                    speculative_eagle_topk=speculative_eagle_topk,
                 )
-                self._intermediate_conv_window_phys = []
-                if dedup_conv_window:
-                    win_len = cache_params.shape.conv_kernel - 1
-                    self.conv_window_axis = self._detect_conv_window_axis(
-                        conv_state_shape, win_len
-                    )
+                if axis is not None:
+                    self.conv_window_axis = axis
                     intermediate_conv_window_cache = []
                     for conv_shape in conv_state_shape:
-                        phys, view = self._allocate_deduplicated_conv_window(
+                        _, view = self._allocate_deduplicated_conv_window(
                             conv_shape=conv_shape,
                             num_mamba_layers=num_mamba_layers,
                             spec_state_size=spec_state_size,
                             speculative_num_draft_tokens=speculative_num_draft_tokens,
                             conv_dtype=conv_dtype,
                         )
-                        self._intermediate_conv_window_phys.append(phys)
                         intermediate_conv_window_cache.append(view)
                 else:
                     # Original dense layout (NPU/CPU, or EAGLE tree verify): one
@@ -1005,7 +921,6 @@ class MambaPool:
                         )
                         for conv_shape in dense_conv_shapes
                     ]
-                    self._intermediate_conv_window_phys = intermediate_conv_window_cache
                 self.mamba_cache = self.SpeculativeState(
                     conv=conv_state,
                     temporal=temporal_state,
@@ -1031,7 +946,7 @@ class MambaPool:
                     f"intermediate_ssm_state_cache size: {intermediate_ssm_gb:.2f}GB "
                     # Report the deduplicated PHYSICAL conv-window buffers (the view
                     # over-reports its logical, un-deduplicated size).
-                    f"intermediate_conv_window_cache size: {get_tensor_size_bytes(self._intermediate_conv_window_phys) / GB:.2f}GB "
+                    f"intermediate_conv_window_cache size: {conv_window_storage_bytes(intermediate_conv_window_cache) / GB:.2f}GB "
                 )
             else:
                 self.mamba_cache = self.State(
@@ -1095,19 +1010,7 @@ class MambaPool:
                 if enable_linear_replayssm_spec and not self.replayssm_spec_fold
                 else None
             )
-            mem_usage_bytes = self.mamba_cache.mem_usage_bytes()
-            if isinstance(self.mamba_cache, self.SpeculativeState):
-                # `intermediate_conv_window` is an as_strided view whose logical
-                # shape over-reports its real footprint; charge the physical buffers
-                # instead. No-op for the dense layout, where the view and the
-                # physical tensors coincide.
-                mem_usage_bytes -= get_tensor_size_bytes(
-                    self.mamba_cache.intermediate_conv_window
-                )
-                mem_usage_bytes += get_tensor_size_bytes(
-                    self._intermediate_conv_window_phys
-                )
-            self.mem_usage = mem_usage_bytes / GB
+            self.mem_usage = self.mamba_cache.mem_usage_bytes() / GB
             self.num_mamba_layers = num_mamba_layers
         # Full (unsharded) conv sub-block dims for PD transfer across different
         # attn_tp_size (GDN: [key_dim, key_dim, value_dim]); None otherwise.

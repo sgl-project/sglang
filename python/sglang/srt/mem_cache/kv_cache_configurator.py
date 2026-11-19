@@ -71,6 +71,7 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
 )
 from sglang.srt.mem_cache.draft_kv_budget import resolve_dflash_draft_cell_size
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
+from sglang.srt.mem_cache.layout.conv_window import deduplicated_conv_window_axis
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
     HybridLinearKVPool,
@@ -3534,13 +3535,25 @@ class KVCacheConfigurator:
                     "Unified KV sizing requires the draft payload in the storage "
                     "plan; a separate private draft pool is not budgeted."
                 )
+            draft_tokens = (
+                None
+                if _pd_prefill_skips_mamba_spec_state()
+                else max_speculative_num_draft_tokens()
+            )
             self._unified_plan = plan_kv_storage(
                 self._kv_layer_decls(),
                 page_size=self.page_size,
                 fused_draft=placement,
-                speculative_num_draft_tokens=None
-                if _pd_prefill_skips_mamba_spec_state()
-                else max_speculative_num_draft_tokens(),
+                speculative_num_draft_tokens=draft_tokens,
+                conv_window_axis=(
+                    deduplicated_conv_window_axis(
+                        self.mambaish_config.mamba2_cache_params,
+                        supported_device=torch.device(self.device).type == "cuda",
+                        speculative_eagle_topk=get_spec().speculative_eagle_topk,
+                    )
+                    if has_state and draft_tokens is not None
+                    else None
+                ),
             )
         from sglang.srt.mem_cache.kv.decl import StateLifetime, WindowLifetime
 

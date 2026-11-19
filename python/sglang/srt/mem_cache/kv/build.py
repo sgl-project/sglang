@@ -164,6 +164,7 @@ def _build_state_storage(
             if ctx.speculative_num_draft_tokens is not None and layer_ids
             else None
         ),
+        conv_window_axis=plan.conv_window_axis,
     )
     part_scratch = {
         name.removeprefix(f"{state.name}."): tensor
@@ -441,6 +442,7 @@ def build_unified_pools(
     sizing: KVSizingInputs,
     ctx: UnifiedBuildContext,
     fused_draft: Optional[FusedDraftPlacement] = None,
+    conv_window_axis: Optional[int] = None,
 ) -> KVStorage:
     """Declarations -> plan -> sizing -> the unified KV storage."""
     plan = plan_kv_storage(
@@ -448,6 +450,7 @@ def build_unified_pools(
         page_size=page_size,
         fused_draft=fused_draft,
         speculative_num_draft_tokens=ctx.speculative_num_draft_tokens,
+        conv_window_axis=conv_window_axis,
     )
     sizing = msgspec.structs.replace(
         sizing,

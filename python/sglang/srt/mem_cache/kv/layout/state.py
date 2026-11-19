@@ -15,6 +15,7 @@ from sglang.srt.mem_cache.device_pool_info import MambaStateBufferInfo
 from sglang.srt.mem_cache.kv.decl import StateReplay, TensorPartDecl
 from sglang.srt.mem_cache.kv.layout.base import HostPoolOptions, SubPoolSpec
 from sglang.srt.mem_cache.kv.layout.parts import TensorEntryLayout
+from sglang.srt.mem_cache.layout.conv_window import conv_window_view
 from sglang.srt.mem_cache.layout.fused_draft import DraftStateRegion
 from sglang.srt.mem_cache.layout.token_major import (
     align_entry_bytes,
@@ -217,7 +218,7 @@ class StateView:
     # The state containers the attention backends read (`mamba_cache`).
     State = MambaPool.State
     SpeculativeState = MambaPool.SpeculativeState
-    # Each conv state is laid out (dim, K-1), its window last.
+    # The default conv layout is (dim, K-1).
     conv_window_axis = -1
     host_capacity_tokens: Optional[int] = None
     host_capacity_bytes: Optional[int] = None
@@ -247,6 +248,7 @@ class StateView:
         request_parts: Optional[dict[str, torch.Tensor]] = None,
         intermediate_ssm: Optional[torch.Tensor] = None,
         intermediate_conv_window: Optional[List[torch.Tensor]] = None,
+        conv_window_axis: Optional[int] = None,
     ):
         assert spec.layer_num == len(mamba_layer_ids)
         self._has_draft_parts = spec.draft_region is not None
@@ -320,6 +322,14 @@ class StateView:
                 conv=list(conv_views), temporal=temporal_view, **ring_fields
             )
         else:
+            if conv_window_axis is not None:
+                self.conv_window_axis = conv_window_axis
+                intermediate_conv_window = [
+                    conv_window_view(storage, shape, conv_window_axis)
+                    for storage, shape in zip(
+                        intermediate_conv_window, spec.conv_state_shapes, strict=True
+                    )
+                ]
             self.mamba_cache = self.SpeculativeState(
                 conv=list(conv_views),
                 temporal=temporal_view,
