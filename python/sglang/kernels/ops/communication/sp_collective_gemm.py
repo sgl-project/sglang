@@ -52,6 +52,13 @@ def _rs_tile(n: int):
     return _pick_tile(_RS_TILES, n)
 
 
+def matmul_reduce_scatter_rows(rows: int, n: int) -> int:
+    """Rows per rank that matmul_reduce_scatter pads each shard to at width n."""
+    mma_m, _, use_2cta, _ = _rs_tile(n)
+    tile = mma_m // (2 if use_2cta else 1)
+    return -(-rows // tile) * tile
+
+
 def _pad_shards(
     x: torch.Tensor, world_size: int, tile_m: int = _TILE_M
 ) -> torch.Tensor:

@@ -526,19 +526,20 @@ def _prefill_sp_o_proj_reduce_scatter(
 ) -> torch.Tensor:
     from sglang.kernels.ops.communication.sp_collective_gemm import (
         matmul_reduce_scatter,
+        matmul_reduce_scatter_rows,
     )
     from sglang.srt.layers.communication.sp_collective_gemm_workspace import (
         sp_collective_gemm_workspace,
     )
 
-    if sp.padded != x.shape[0]:
-        x = torch.nn.functional.pad(x, (0, 0, 0, sp.padded - x.shape[0]))
-    return matmul_reduce_scatter(
-        x,
+    rows = matmul_reduce_scatter_rows(sp.local, o_proj.weight.shape[0])
+    out = matmul_reduce_scatter(
+        sp.tile_shards(x, rows).view(-1, x.shape[1]),
         o_proj.weight,
         get_parallel().tp_group.device_group,
         workspace=sp_collective_gemm_workspace,
     )
+    return out[: sp.local]
 
 
 class _PrefillSP:
@@ -578,6 +579,22 @@ class _PrefillSP:
         return k3_sp_collective.prefill_sp_reduce_scatter(
             x, out, residual, num_blocks=num_blocks
         )
+
+    def tile_shards(self, x: torch.Tensor, rows: int) -> torch.Tensor:
+        world = self.padded // self.local
+        if self.num_tokens == world * rows:
+            return x.reshape(world, rows, -1)
+        shards = x.new_empty((world, rows, x.shape[1]))
+        full, rem = divmod(self.num_tokens, self.local)
+        shards[:full, : self.local].copy_(
+            x[: full * self.local].reshape(full, self.local, -1)
+        )
+        shards[:full, self.local :].zero_()
+        if full < world:
+            shards[full, :rem].copy_(x[full * self.local :])
+            shards[full, rem:].zero_()
+            shards[full + 1 :].zero_()
+        return shards
 
     def padded_rows(self, x: torch.Tensor, name: str) -> torch.Tensor:
         full = k3_ar_fusion.symm_buffer(name, self.padded, x.shape[1], x.dtype)
