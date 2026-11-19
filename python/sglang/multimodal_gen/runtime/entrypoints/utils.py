@@ -30,13 +30,13 @@ try:
 except ImportError:  # pragma: no cover
     scipy_wavfile = None
 
+from sglang.multimodal_gen import envs as diffusion_envs
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.configs.task_type import DataType
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import CYAN, RESET, init_logger
 from sglang.multimodal_gen.runtime.utils.profiler import maybe_record_function
-from sglang.srt.environ import envs
 from sglang.srt.observability.trace import TraceReqContext
 
 logger = init_logger(__name__)
@@ -648,7 +648,7 @@ def _try_save_cuda_video_direct(
 ) -> bool:
     """Save CUDA frames, or CPU tensor frames with NVENC enabled."""
     video, audio = _split_sample_audio(sample)
-    use_nvenc = envs.SGLANG_USE_NVENC.get()
+    use_nvenc = diffusion_envs.SGLANG_USE_NVENC
     if not (
         isinstance(video, torch.Tensor)
         and video.dim() in (3, 4)
@@ -682,7 +682,7 @@ def _try_save_cuda_video_direct(
             x264_preset=x264_preset,
         )
         if use_nvenc:
-            from sglang.multimodal_gen.runtime.entrypoints.nvenc_video_encoder import (
+            from sglang.multimodal_gen.runtime.utils.nvenc_video_encoder import (
                 NvencVideoEncoder,
             )
 
@@ -746,7 +746,7 @@ def _try_save_cuda_videos_direct(
 ) -> list[bool] | None:
     """Save independent CUDA videos concurrently when memory permits."""
     if (
-        envs.SGLANG_USE_NVENC.get()
+        diffusion_envs.SGLANG_USE_NVENC
         or len(samples) < 2
         or len(samples) != len(save_file_paths)
     ):

@@ -322,10 +322,9 @@ def test_video_direct_save_short_circuits_materialization(tmp_path, monkeypatch)
 
 
 def test_nvenc_saves_cpu_tensor_with_audio(tmp_path, monkeypatch):
-    from sglang.multimodal_gen.runtime.entrypoints.nvenc_video_encoder import (
+    from sglang.multimodal_gen.runtime.utils.nvenc_video_encoder import (
         supports_nvenc,
     )
-    from sglang.srt.environ import envs
 
     if not torch.cuda.is_available() or not supports_nvenc(
         torch.device("cuda", torch.cuda.current_device())
@@ -343,16 +342,16 @@ def test_nvenc_saves_cpu_tensor_with_audio(tmp_path, monkeypatch):
         "_save_video_ffmpeg",
         lambda *_args, **_kwargs: pytest.fail("NVENC output fell back to CPU"),
     )
-    with envs.SGLANG_USE_NVENC.override(True):
-        paths = output_utils.save_outputs(
-            [frames],
-            DataType.VIDEO,
-            fps=24,
-            save_output=True,
-            build_output_path=lambda _idx: str(output_path),
-            audio=audio,
-            audio_sample_rate=16000,
-        )
+    monkeypatch.setenv("SGLANG_USE_NVENC", "1")
+    paths = output_utils.save_outputs(
+        [frames],
+        DataType.VIDEO,
+        fps=24,
+        save_output=True,
+        build_output_path=lambda _idx: str(output_path),
+        audio=audio,
+        audio_sample_rate=16000,
+    )
 
     assert paths == [str(output_path)]
     with av.open(str(output_path)) as container:
@@ -363,10 +362,9 @@ def test_nvenc_saves_cpu_tensor_with_audio(tmp_path, monkeypatch):
 def test_nvenc_unavailable_preserves_cuda_audio_encoder(tmp_path, monkeypatch):
     from unittest import mock
 
-    from sglang.multimodal_gen.runtime.entrypoints.nvenc_video_encoder import (
+    from sglang.multimodal_gen.runtime.utils.nvenc_video_encoder import (
         NvencVideoEncoder,
     )
-    from sglang.srt.environ import envs
 
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
@@ -377,14 +375,14 @@ def test_nvenc_unavailable_preserves_cuda_audio_encoder(tmp_path, monkeypatch):
     open_cpu = mock.Mock(return_value=writer)
     monkeypatch.setattr(NvencVideoEncoder, "open", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(output_utils.CudaVideoEncoder, "open", open_cpu)
-    with envs.SGLANG_USE_NVENC.override(True):
-        saved = output_utils._try_save_cuda_video_direct(
-            save_file_path=str(tmp_path / "fallback.mp4"),
-            sample=(frames, audio),
-            fps=24,
-            audio_sample_rate=16000,
-            output_compression=None,
-        )
+    monkeypatch.setenv("SGLANG_USE_NVENC", "1")
+    saved = output_utils._try_save_cuda_video_direct(
+        save_file_path=str(tmp_path / "fallback.mp4"),
+        sample=(frames, audio),
+        fps=24,
+        audio_sample_rate=16000,
+        output_compression=None,
+    )
 
     assert saved
     assert open_cpu.call_args.kwargs["audio"] is audio

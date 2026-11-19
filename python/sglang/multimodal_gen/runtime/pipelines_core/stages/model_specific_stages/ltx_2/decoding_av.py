@@ -3,6 +3,7 @@ from collections.abc import Callable
 import torch
 from diffusers.video_processor import VideoProcessor
 
+from sglang.multimodal_gen import envs as diffusion_envs
 from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
     get_replica_group,
@@ -32,7 +33,6 @@ from sglang.multimodal_gen.runtime.utils.precision import (
     resolve_precision,
     temporary_module_dtype,
 )
-from sglang.srt.environ import envs
 
 logger = init_logger(__name__)
 
@@ -185,7 +185,7 @@ class LTX2AVDecodingStage(DecodingStage):
                 finish_frames=lambda frames: (frames / 2 + 0.5).clamp(0, 1).float(),
                 audio=output_batch.audio,
                 audio_sample_rate=output_batch.audio_sample_rate,
-                use_nvenc=envs.SGLANG_USE_NVENC.get(),
+                use_nvenc=diffusion_envs.SGLANG_USE_NVENC,
             )
         try:
             video = self._decode_video(batch, server_args, on_frames=stream)

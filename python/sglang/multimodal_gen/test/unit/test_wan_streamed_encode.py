@@ -105,7 +105,7 @@ def _video_request(**overrides) -> SimpleNamespace:
 class TestStreamedEncode(CustomTestCase):
     def test_nvenc_stream_muxes_the_frames_actually_written(self):
         from sglang.multimodal_gen.runtime.entrypoints import utils
-        from sglang.multimodal_gen.runtime.entrypoints.nvenc_video_encoder import (
+        from sglang.multimodal_gen.runtime.utils.nvenc_video_encoder import (
             NvencVideoEncoder,
         )
 

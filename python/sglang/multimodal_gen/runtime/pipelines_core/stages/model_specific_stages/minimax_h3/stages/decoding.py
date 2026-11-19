@@ -7,6 +7,7 @@ from contextlib import contextmanager, nullcontext
 
 import torch
 
+from sglang.multimodal_gen import envs as diffusion_envs
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     quality_allows,
 )
@@ -46,7 +47,6 @@ from sglang.multimodal_gen.runtime.utils.precision import (
 from sglang.multimodal_gen.runtime.utils.torch_compile import (
     ActiveTargetCompiledCallable,
 )
-from sglang.srt.environ import envs
 
 logger = init_logger(__name__)
 
@@ -556,7 +556,7 @@ class MiniMaxH3DecodingStage(DecodingStage):
                         finish_frames,
                         output_audio_waveform[0],
                         audio_sample_rate,
-                        use_nvenc=envs.SGLANG_USE_NVENC.get(),
+                        use_nvenc=diffusion_envs.SGLANG_USE_NVENC,
                     )
                     decode_kwargs["on_frames"] = stream
                 try:
