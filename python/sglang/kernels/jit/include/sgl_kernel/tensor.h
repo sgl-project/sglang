@@ -74,7 +74,7 @@ struct DLDataTypeTrait<T> {
       .code = DLDataTypeCode::kDLFloat, .bits = static_cast<std::uint8_t>(sizeof(T) * 8), .lanes = 1};
 };
 
-#ifdef __CUDACC__
+#if defined(__CUDACC__) || defined(__MUSACC__)
 template <>
 struct DLDataTypeTrait<fp16_t> {
   inline static constexpr DLDataType value = {.code = DLDataTypeCode::kDLFloat, .bits = 16, .lanes = 1};

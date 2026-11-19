@@ -159,8 +159,6 @@ def gpu_arch_name() -> str:
     CUDA-shaped ``(major, minor)`` capability: the latter maps gfx940/gfx941/
     gfx942 onto a single ``9.4``, which are three different compile targets.
     """
-    if is_musa_runtime():
-        return f"mp_{get_compile_arch().major}{get_compile_arch().minor}"
     if not is_hip_runtime():
         return get_compile_arch().target_name
     try:
