@@ -32,8 +32,6 @@ _BF16_LASER_SCALE = 256.0
 
 
 class LaserAttentionBackend(AttentionBackend):
-    accept_output_buffer: bool = True
-
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
         return [32, 64, 96, 128]
