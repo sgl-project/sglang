@@ -84,11 +84,9 @@ curl http://${HOST}:${PORT}/v1/images/generations \
 
 ## Deployment Assumptions & Limitations
 
-:::warning
-**Network Latency & Timeouts:** In SGLang backend mode, the Diffusion server sends an HTTP request to `--srt-encoder-url` for **every auto-regressive (AR) step**.
-- To prevent requests from breaking during long model generations, increase `--srt-encoder-timeout` (e.g., set to 100 seconds).
-- To protect the system against temporary network delays or brief drops in connection, use `--srt-encoder-connection-timeout`.
-:::
+<Warning>
+**Network latency and timeouts:** In SGLang backend mode, the diffusion server sends one `/generate` request to `--srt-encoder-url` per generation (one per group when requests are batched). That request returns all AR image tokens, so `--srt-encoder-timeout` (default 100 s) must cover the full AR generation. Increase it for large resolutions or a slow AR server. `--srt-encoder-connection-timeout` (default 3.05 s) bounds only the TCP connect.
+</Warning>
 
 - **Recommended Setup:** Run both servers on the same machine or inside the same fast local network.
 - **Cross-Region Warning:** Running the Diffusion server and the AR server in different geographic regions will slow down token generation and heavily reduce performance.

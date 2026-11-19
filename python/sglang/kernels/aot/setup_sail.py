@@ -67,17 +67,9 @@ _FLASHINFER_REPO = _RepoInfo(
     git_shallow=False,
 )
 
-_TRITON_REPO = _RepoInfo(
-    name="triton",
-    git_repository="https://github.com/triton-lang/triton",
-    git_tag="v3.7.0",
-    git_shallow=False,
-)
-
 ALL_REPOS = [
     _ACTLIZE_REPO,
     _FLASHINFER_REPO,
-    _TRITON_REPO,
 ]
 
 
@@ -216,8 +208,6 @@ flashinfer_sources = [
     str(_FLASHINFER_REPO.source_dir / "csrc" / "norm.cu"),
     str(_FLASHINFER_REPO.source_dir / "csrc" / "renorm.cu"),
 ]
-
-all_common_sources = common_sources + flashinfer_sources
 
 # Libraries to link.
 #
@@ -512,25 +502,8 @@ class _CustomBuildExt(BuildExtension):
 
 
 # ======================= Package Discovery ======================= #
-_triton_kernels_root = _TRITON_REPO.source_dir / "python" / "triton_kernels"
-
 _packages = find_namespace_packages(where="python")
 _package_dir = {"": "python"}
-
-# Discover triton_kernels packages (may not exist before first clone)
-if _triton_kernels_root.exists():
-    _triton_pkgs = find_namespace_packages(
-        where=str(_triton_kernels_root),
-        exclude=["tests", "tests.*"],
-    )
-else:
-    _triton_pkgs = ["triton_kernels"]
-
-for pkg in _triton_pkgs:
-    _package_dir[pkg] = os.path.relpath(
-        _triton_kernels_root / pkg.replace(".", os.sep), root
-    )
-_packages += _triton_pkgs
 
 
 # ======================= Setup ======================= #

@@ -8,9 +8,11 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
+    ADMIN_LAUNCH_ARGS_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    admin_post,
     popen_launch_server,
 )
 
@@ -43,15 +45,17 @@ class TestExpertDistribution(CustomTestCase):
                     str(tp_size),
                     "--expert-distribution-recorder-mode",
                     mode,
-                    "--disable-cuda-graph",
+                    "--disable-decode-cuda-graph",
+                    "--disable-prefill-cuda-graph",
                     "--disable-overlap-schedule",
+                    *ADMIN_LAUNCH_ARGS_FOR_TEST,
                 ],
             )
 
             try:
                 # Start recording
-                response = requests.post(
-                    f"{DEFAULT_URL_FOR_TEST}/start_expert_distribution_record"
+                response = admin_post(
+                    f"{DEFAULT_URL_FOR_TEST}/start_expert_distribution_record",
                 )
                 self.assertEqual(response.status_code, 200)
 
@@ -69,14 +73,14 @@ class TestExpertDistribution(CustomTestCase):
                 self.assertEqual(response.status_code, 200)
 
                 # Stop recording
-                response = requests.post(
-                    f"{DEFAULT_URL_FOR_TEST}/stop_expert_distribution_record"
+                response = admin_post(
+                    f"{DEFAULT_URL_FOR_TEST}/stop_expert_distribution_record",
                 )
                 self.assertEqual(response.status_code, 200)
 
                 # Dump the recorded data
-                response = requests.post(
-                    f"{DEFAULT_URL_FOR_TEST}/dump_expert_distribution_record"
+                response = admin_post(
+                    f"{DEFAULT_URL_FOR_TEST}/dump_expert_distribution_record",
                 )
                 self.assertEqual(response.status_code, 200)
 

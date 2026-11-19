@@ -39,6 +39,7 @@ from sglang.srt.layers.rotary_embedding.yarn import (
     yarn_find_correction_range,
     yarn_get_mscale,
 )
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.models.qwen2_moe import Qwen2MoeMLP as Qwen3MoeMLP
@@ -55,7 +56,7 @@ from sglang.srt.models.utils import (
     enable_fused_set_kv_buffer,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel
-from sglang.srt.utils import add_prefix, is_cuda
+from sglang.srt.utils import is_cuda
 
 _is_cuda = is_cuda()
 

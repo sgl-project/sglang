@@ -25,6 +25,7 @@ from transformers.models.ernie4_5_moe.configuration_ernie4_5_moe import (
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -32,7 +33,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.ernie4 import Ernie4_5_ForCausalLM, Ernie4DecoderLayer
-from sglang.srt.utils import add_prefix
+from sglang.srt.models.utils import keeps_no_quant_config
 
 
 class Ernie4ModelMTP(nn.Module):
@@ -99,6 +100,8 @@ class Ernie4ModelMTP(nn.Module):
 
 
 class Ernie4_5_MoeForCausalLMMTP(nn.Module):
+    own_quant_config = staticmethod(keeps_no_quant_config)
+
     def __init__(
         self,
         config: Ernie4_5_MoeConfig,
