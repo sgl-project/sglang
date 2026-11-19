@@ -83,11 +83,15 @@ class ExternalCorpusManager:
         thread.start()
         return None  # response sent later by check_pending_load
 
-    # FIXME(kpham-sgl): remove a corpus during a pending load is an undefined behaviour
-    # and should be explicitly prevented.
     def remove(
         self, recv_req: RemoveExternalCorpusReqInput
     ) -> RemoveExternalCorpusReqOutput:
+        # A finished thread may still have uncommitted corpus bookkeeping.
+        if self._pending_load is not None:
+            return RemoveExternalCorpusReqOutput(
+                success=False,
+                message="Cannot remove a corpus while a corpus load is pending.",
+            )
         try:
             self._worker.remove_external_corpus(recv_req.corpus_id)
             return RemoveExternalCorpusReqOutput(
