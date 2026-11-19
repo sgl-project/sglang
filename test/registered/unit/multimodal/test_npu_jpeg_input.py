@@ -347,12 +347,12 @@ class TestNpuJpegInput(unittest.TestCase):
     def test_warning_uses_encoded_pixel_area(self):
         for size, should_warn in (
             ((105, 105), True),
-            ((375, 377), True),
-            ((376, 376), True),
-            ((377, 377), False),
-            ((188, 752), True),
-            ((752, 188), True),
-            ((188, 753), False),
+            ((359, 361), True),
+            ((360, 360), True),
+            ((361, 361), False),
+            ((180, 720), True),
+            ((720, 180), True),
+            ((180, 721), False),
         ):
             with (
                 self.subTest(size=size),
@@ -385,7 +385,7 @@ class TestNpuJpegInput(unittest.TestCase):
             for _ in range(2):
                 with self.assertRaisesRegex(RuntimeError, "decoder failure"):
                     self.jpeg.decode_jpeg(data)
-            self.assertIn("141,376", warning.call_args.args[0])
+            self.assertIn("129,600", warning.call_args.args[0])
 
     def test_public_noncontiguous_input_and_device_restore(self):
         encoded = _encoded_tensor(_jpeg())

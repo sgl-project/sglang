@@ -8,7 +8,7 @@ from sglang.srt.hardware_backend.npu.jpeg_header import prepare_jpeg
 
 logger = logging.getLogger(__name__)
 # Lower end of the measured crossover for square JPEGs with four CPU threads.
-SMALL_IMAGE_WARNING_PIXELS = 376 * 376
+SMALL_IMAGE_WARNING_PIXELS = 360 * 360
 
 
 def decode_jpeg(
@@ -39,7 +39,7 @@ def decode_jpeg(
     if info.width * info.height <= SMALL_IMAGE_WARNING_PIXELS:
         logger.warning_once(
             "NPU JPEG decoding may be slower than CPU/PIL for images "
-            "with up to 141,376 pixels (376x376). "
+            "with up to 129,600 pixels (360x360). "
             "Actual performance depends on CPU configuration and workload."
         )
     with torch.npu.device(device_index):
