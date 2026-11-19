@@ -16,7 +16,7 @@ from sglang.srt.utils import is_gfx95_supported
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.mem_cache_utils import routed
 
-register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=60, stage="base-b", runner_config="1-gpu-small-amd-mi35x")
 
 
 def _gfx950_available() -> bool:

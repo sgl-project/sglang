@@ -18,7 +18,7 @@ from sglang.kernels.jit.benchmark import marker
 from sglang.srt.utils import is_gfx95_supported
 from sglang.test.ci.ci_register import register_amd_ci
 
-register_amd_ci(est_time=120, stage="jit-kernel-benchmark", runner_config="amd")
+register_amd_ci(est_time=120, stage="base-a-jit-kernel-benchmark", runner_config="amd")
 
 DIM = 256
 TOPK = 2051  # Qwen3.8-Flash-Next: 512 compressed blocks x ratio 4 + 3
@@ -64,13 +64,8 @@ def _gather_triton(q, k, v, req_to_token, row_req, indices, seq_lens, splits, ws
     )
 
     batch, topk = indices.shape
-    counts = torch.empty(batch, dtype=torch.int32, device=q.device)
-    cu_k = torch.empty(batch + 1, dtype=torch.int32, device=q.device)
+    counts, cu_q, cu_k, packed_k, packed_v = ws
     qwen_sparse_fa2_cu_seqlens_triton(seq_lens, indices, counts, cu_k, batch, topk)
-    packed_k = torch.empty(
-        batch * topk, k.shape[1], DIM, dtype=q.dtype, device=q.device
-    )
-    packed_v = torch.empty_like(packed_k)
     qwen_sparse_kv_extraction_compact_triton(
         k,
         v,
@@ -86,7 +81,6 @@ def _gather_triton(q, k, v, req_to_token, row_req, indices, seq_lens, splits, ws
     )
     relative = torch.arange(topk, dtype=torch.int32, device=q.device).expand(batch, -1)
     relative = relative.masked_fill(relative >= counts[:, None], -1).contiguous()
-    cu_q = torch.arange(batch + 1, dtype=torch.int32, device=q.device)
     return sparse_gqa_packed_decode_triton(
         q, packed_k, packed_v, relative, cu_q, cu_k, counts, DIM**-0.5
     )
@@ -142,6 +136,18 @@ def benchmark(num_kv_heads: int, group: int, batch: int, impl: str):
             torch.empty(partials, device="cuda"),
             torch.empty(partials, device="cuda"),
             torch.empty(partials * DIM, device="cuda"),
+        )
+    else:
+        # Serving prebuilds these as CUDA graph metadata and FA2 scratch.
+        packed = torch.empty(
+            batch * TOPK, num_kv_heads, DIM, dtype=q.dtype, device="cuda"
+        )
+        workspace = (
+            torch.empty(batch, dtype=torch.int32, device="cuda"),
+            torch.arange(batch + 1, dtype=torch.int32, device="cuda"),
+            torch.empty(batch + 1, dtype=torch.int32, device="cuda"),
+            packed,
+            torch.empty_like(packed),
         )
     fn = FN_MAP[impl]
     rotation = itertools.cycle(row_reqs)
