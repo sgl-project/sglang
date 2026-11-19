@@ -38,7 +38,7 @@ export const GLMGlyphDeployment = () => {
         { id: 'enabled', label: 'Enabled', default: true },
         { id: 'disabled', label: 'Disabled', default: false }
       ],
-      commandRule: (value) => value === 'enabled' ? '--tool-call-parser glm45' : null
+      commandRule: (value) => value === 'enabled' ? '--tool-call-parser glm' : null
     }
   };
 

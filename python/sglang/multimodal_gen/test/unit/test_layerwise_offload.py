@@ -3142,6 +3142,10 @@ def test_finish_offload_writeback_is_noop_when_idle():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA graphs")
+@pytest.mark.skipif(
+    torch.version.hip is not None,
+    reason="ROCm PyTorch rejects Event(external=True), so the capture runs eager",
+)
 @torch.no_grad()
 def test_layerwise_breakable_graph_preserves_copies_and_event_lifetimes():
     from sglang.multimodal_gen.runtime.breakable_cuda_graph.runner import (

@@ -72,7 +72,7 @@ pub(super) fn chat_delta(
 /// the content passes through untouched. With a parser, a successful parse
 /// returns the leftover non-tool text and the calls; `parallel_tool_calls`
 /// false truncates the batch to the first call, mirroring Python.
-pub(super) async fn parse_chat_tool_calls(
+pub(crate) async fn parse_chat_tool_calls(
     content: String,
     parser: Option<&str>,
     tools: Option<&[ToolDefinition]>,
@@ -110,7 +110,7 @@ pub(super) async fn parse_chat_tool_calls(
 /// Map the scheduler's finish kind onto the OpenAI wire values. Length and
 /// content-filter keep their names; everything else (including a bare abort)
 /// reports as `stop`, matching Python's fallback.
-pub(super) fn chat_finish_reason(output: &CoreOutput) -> Option<OpenAIFinishReason> {
+pub(crate) fn chat_finish_reason(output: &CoreOutput) -> Option<OpenAIFinishReason> {
     let kind = output
         .finish_reason
         .as_ref()

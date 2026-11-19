@@ -78,6 +78,7 @@ if is_flashinfer_available():
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.speculative.dflash_draft_ring import DFlashDraftKVRing
     from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
     from sglang.srt.speculative.spec_info import SpecInput
 
@@ -220,6 +221,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
     # Set in __init__ when decode length-group plans are reused within a forward.
     decode_split_hoist: bool = False
     _decode_group_plans: Optional[DecodeGroupPlans] = None
+    _draft_kv_ring: Optional[DFlashDraftKVRing] = None
+    _ring_page_cols: Optional[torch.Tensor] = None
 
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         # Prefill metadata init snapshots all scheduler-shared inputs pre-replay.
@@ -683,6 +686,34 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             full_to_swa=self._swa_full_to_swa_mapping if has_swa else None,
         )
 
+    def set_draft_kv_ring(self, ring: DFlashDraftKVRing) -> None:
+        if not ring.paged or self._swa_kv_pool is not None:
+            raise ValueError("trtllm_mha reads only a paged ring on a plain MHA pool.")
+        self._draft_kv_ring = ring
+        self._ring_page_cols = (
+            torch.arange(self.max_num_pages, device=self.device) % ring.pages_per_req
+        ).to(torch.int32)
+
+    def _ring_seq_lens(
+        self,
+        forward_mode: ForwardMode,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+    ) -> torch.Tensor:
+        # The draft only runs TARGET_VERIFY; other modes (warmup, autotune) just
+        # stay inside the ring through its page table.
+        ring = self._draft_kv_ring
+        if ring is None or not forward_mode.is_target_verify():
+            return seq_lens
+        return ring.relative_seq_lens(req_pool_indices, seq_lens)
+
+    def _fill_ring_page_table(
+        self, req_pool_indices: torch.Tensor, page_table: torch.Tensor
+    ) -> None:
+        self._draft_kv_ring.fill_page_table(
+            req_pool_indices, self._ring_page_cols, page_table
+        )
+
     def _is_window_layer(self, layer: RadixAttention) -> bool:
         return self._swa_kv_pool.layer_router.plays(
             layer.layer_id, IdSpaceKind.SLIDING_WINDOW
@@ -1081,6 +1112,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         """
         seq_lens = seq_lens[:bs]
         req_pool_indices = req_pool_indices[:bs]
+        seq_lens = self._ring_seq_lens(forward_mode, req_pool_indices, seq_lens)
 
         metadata = None
         seqlen_offset = 0
@@ -1129,13 +1161,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         # bound only — never a host max / seq_lens_cpu D2H sync.
         max_seq_pages = self.max_num_pages
         unified = self.runner_ids.is_translating
+        ring = self._draft_kv_ring is not None
         update_trtllm_mha_graph_metadata(
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
             req_to_token=self.req_to_token,
             cache_seqlens=metadata.cache_seqlens_int32,
             cu_seqlens_k=metadata.cu_seqlens_k,
-            page_table=None if unified else metadata.page_table,
+            page_table=None if unified or ring else metadata.page_table,
             bs=bs,
             seqlen_offset=seqlen_offset,
             max_seq_pages=max_seq_pages,
@@ -1148,8 +1181,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             qlens=qlens,
             q_stride=q_stride,
             q_mode=q_mode,
-            skip_page_table=unified,
+            skip_page_table=unified or ring,
         )
+        if ring:
+            self._fill_ring_page_table(req_pool_indices, metadata.page_table)
 
         if self._needs_encoder_only_expand(forward_mode, metadata):
             # Recorded into the graph: refresh the expanded rows from the
@@ -1323,6 +1358,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         """
         seq_lens = forward_batch.seq_lens[:bs]
         req_pool_indices = forward_batch.req_pool_indices[:bs]
+        seq_lens = self._ring_seq_lens(
+            forward_batch.forward_mode, req_pool_indices, seq_lens
+        )
         padded_layout = ragged_layout.padded_to_bucket(padded_bs=bs)
         geometry = build_ragged_target_verify_geometry(
             seq_lens=seq_lens, layout=padded_layout
@@ -1332,9 +1370,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         metadata.cu_seqlens_k[1:].copy_(
             torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
         )
-        self._fill_page_table_device(
-            metadata, req_pool_indices, metadata.cache_seqlens_int32
-        )
+        if self._draft_kv_ring is not None:
+            self._fill_ring_page_table(req_pool_indices, metadata.page_table)
+        else:
+            self._fill_page_table_device(
+                metadata, req_pool_indices, metadata.cache_seqlens_int32
+            )
         # The fused in-graph kernel also skips ragged batches, so refill the
         # SWA write-target buffer here, from the plan.
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
@@ -1367,7 +1408,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             self._decode_group_plans.reset()
 
         metadata = TRTLLMMHAMetadata()
-        seqlens_in_batch = forward_batch.seq_lens
+        seqlens_in_batch = self._ring_seq_lens(
+            forward_batch.forward_mode,
+            forward_batch.req_pool_indices,
+            forward_batch.seq_lens,
+        )
         batch_size = forward_batch.batch_size
         device = seqlens_in_batch.device
 
@@ -1416,9 +1461,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 metadata.is_ragged_verify = True
             else:
                 tokens_per_req = forward_batch.input_ids.shape[0] // batch_size
-                metadata.cache_seqlens_int32 = (
-                    forward_batch.seq_lens + tokens_per_req
-                ).to(torch.int32)
+                metadata.cache_seqlens_int32 = (seqlens_in_batch + tokens_per_req).to(
+                    torch.int32
+                )
                 metadata.max_seq_len_q = tokens_per_req
                 metadata.cu_seqlens_q = torch.arange(
                     0,
@@ -1471,24 +1516,18 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         )
         if kv_view.is_translated:
             # No fill kernel: the kernels bound their reads by cache_seqlens.
-            metadata.page_table = kv_view.ids
+            # XQA and fmha_v2 take a page table's row length from its width and
+            # ignore its strides. A captured reader that built the plan's table
+            # first left it as a view into its own wider buffer, so pack it.
+            metadata.page_table = kv_view.ids.contiguous()
             metadata.swa_page_table = (
                 self.runner_ids.read_table(
                     forward_batch.iteration_ids,
                     kind=IdSpaceKind.SLIDING_WINDOW,
                     rows=forward_batch.batch_size,
-                ).ids
+                ).ids.contiguous()
                 if self.runner_ids.space(IdSpaceKind.SLIDING_WINDOW) is not None
                 else None
-            )
-            # XQA and fmha_v2 take a page table's row length from its width and
-            # ignore its strides, so a view into a wider table would be misread.
-            assert metadata.page_table.is_contiguous() and (
-                metadata.swa_page_table is None
-                or metadata.swa_page_table.is_contiguous()
-            ), (
-                "trtllm_mha reads its page tables as packed rows, but the plan's "
-                "table is a strided view of a wider buffer"
             )
         else:
             has_swa = self._swa_kv_pool is not None
@@ -1502,9 +1541,16 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 if has_swa
                 else None
             )
-            self._fill_page_table_device(
-                metadata, forward_batch.req_pool_indices, metadata.cache_seqlens_int32
-            )
+            if self._draft_kv_ring is not None:
+                self._fill_ring_page_table(
+                    forward_batch.req_pool_indices, metadata.page_table
+                )
+            else:
+                self._fill_page_table_device(
+                    metadata,
+                    forward_batch.req_pool_indices,
+                    metadata.cache_seqlens_int32,
+                )
         self._maybe_build_cp_zigzag_page_tables(metadata, forward_batch)
 
         if self._needs_encoder_only_expand(forward_batch.forward_mode, metadata):

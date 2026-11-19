@@ -37,7 +37,12 @@ _CASES = {
     "aiter-aiter_env": ("aiter", True, "none", True),
     "auto-aiter_env": ("auto", True, "none", True),
     "auto": ("auto", False, "none", False),
-    "auto-aiter_env-unsupported_a2a": ("auto", True, "flashinfer", False),
+    "auto-aiter_env-unsupported_a2a": (
+        "auto",
+        True,
+        "flashinfer_nvlink_one_sided",
+        False,
+    ),
 }
 
 

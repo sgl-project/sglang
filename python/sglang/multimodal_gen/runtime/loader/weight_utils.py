@@ -228,9 +228,6 @@ def safetensors_weights_iterator(
         device = str(checkpoint_device)
     else:
         device = "cpu" if to_cpu else str(get_local_torch_device())
-    # The caller may still pass the old boolean; map it onto a backend name so
-    # there is one place that decides, and it is the place that knows which
-    # backends can skip keys.
     requested = None
     if use_runai_model_streamer is not None:
         requested = (

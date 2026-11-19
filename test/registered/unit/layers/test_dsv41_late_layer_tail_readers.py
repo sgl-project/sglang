@@ -190,8 +190,7 @@ class TestLateLayerRowsUnderDpAttention(CustomTestCase):
     def setUp(self):
         override = get_context().override_server_args(
             tp_size=2,
-            dp_size=2,
-            enable_dp_attention=True,
+            attn_dp_size=2,
             cuda_graph_config=CudaGraphConfig(prefill=PhaseConfig(bs=[])),
         )
         override.install()

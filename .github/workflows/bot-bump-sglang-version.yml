@@ -53,7 +53,7 @@ jobs:
     needs: bump-sglang-version
     uses: ./.github/workflows/nightly-test-nvidia.yml
     with:
-      ref: ${{ needs.bump-sglang-version.outputs.branch_name }}
+      git_ref: ${{ needs.bump-sglang-version.outputs.branch_name }}
     secrets: inherit
 
   run-nightly-tests-amd:

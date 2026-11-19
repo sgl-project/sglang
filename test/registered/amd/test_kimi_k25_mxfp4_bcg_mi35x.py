@@ -44,7 +44,7 @@ from sglang.test.test_utils import (
 # the PR's changed BCG code path is exercised on every run-ci.
 register_amd_ci(
     est_time=2100,
-    suite="nightly-amd-8-gpu-mi35x",
+    suite="nightly-test-8-gpu-amd-mi35x",
     nightly=True,
     disabled="Older model generation; AMD nightly keeps the latest two per family",
 )

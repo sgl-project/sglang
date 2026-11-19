@@ -22,7 +22,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 # backend-specific: XPU runs the torch.compile align fallback in production and
 # builds the Triton topk remap with its own backend.
-register_xpu_ci(est_time=20, suite="stage-a-test-1-gpu-xpu")
+register_xpu_ci(est_time=20, suite="extra-test-1-gpu-xpu")
 
 
 def _require_accelerator_device():

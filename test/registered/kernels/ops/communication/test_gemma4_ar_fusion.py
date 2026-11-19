@@ -28,6 +28,7 @@ from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.communication import gemma4_ar_fusion as fusion_glue
 from sglang.srt.layers.quantization.fp8_utils import (
     deepgemm_w8a8_block_fp8_linear_with_fallback,
+    requant_weight_ue8m0,
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -233,6 +234,11 @@ def test_site_reads_a_gemm_written_partial(rows: int):
         torch.float8_e4m3fn
     )
     weight_scale = torch.full((hidden // GROUP, k // GROUP), 1e-3, device="cuda")
+    if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+        # Blackwell DeepGEMM reads packed UE8M0 scales, which the loader requantizes to
+        weight, weight_scale = requant_weight_ue8m0(
+            weight, weight_scale, [GROUP, GROUP]
+        )
     x = torch.randn(rows, k, device="cuda").bfloat16() * (coord.rank + 1) / 4
     gemm = dict(input=x, weight=weight, block_size=[GROUP, GROUP])
     gemm["weight_scale"] = weight_scale

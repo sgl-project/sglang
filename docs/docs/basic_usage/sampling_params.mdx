@@ -117,6 +117,8 @@ The `/generate` endpoint accepts the following parameters in JSON format. For de
   </tbody>
 </table>
 
+With `return_routed_experts`, a non-streaming request aborted while it holds no KV cache (queued, retracted or mid-chunk) returns no output tokens, no output logprobs and an empty `routed_experts`, because the routing of its earlier tokens is gone.
+
 ## Sampling parameters
 
 The object is defined at `sampling_params.py::SamplingParams`. You can also read the source code to find more arguments and docs.

@@ -141,7 +141,8 @@ class Test03(CustomTestCase):
                 "8",
                 "--moe-dense-tp-size",
                 "1",
-                "--enable-flashinfer-allreduce-fusion",
+                "--flashinfer-allreduce-fusion-backend",
+                "auto",
             ],
         )
 

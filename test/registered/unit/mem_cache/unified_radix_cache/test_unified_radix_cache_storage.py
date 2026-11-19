@@ -95,7 +95,7 @@ def _window_hit(req):
 
 
 register_cuda_ci(est_time=28, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=28, suite="stage-b-test-1-gpu-small-amd")
+register_amd_ci(est_time=28, suite="base-b-test-1-gpu-small-amd")
 
 
 # About 0.15 s on a 2 GHz GPU, far longer than any admission step.

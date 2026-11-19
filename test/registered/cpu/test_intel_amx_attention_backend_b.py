@@ -14,7 +14,7 @@ from sglang.test.test_utils import (
     intel_amx_benchmark,
 )
 
-register_cpu_ci(est_time=47, suite="stage-a-test-cpu-intel")
+register_cpu_ci(est_time=47, suite="extra-test-cpu-intel")
 
 
 class TestIntelAMXAttnBackendQuant(CustomTestCase):
