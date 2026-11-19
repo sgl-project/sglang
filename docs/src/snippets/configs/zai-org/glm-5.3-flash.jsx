@@ -350,7 +350,7 @@ sgl-eval run gsm8k \\
             disableReason: "CP=8 is available on the eight-GPU B200 and B300 recipes. Set TP=8 first.",
           }],
           disable: { pdMode: ["prefill", "decode"] },
-          disableReason: "GLM-5.3-Flash CP/TP group sharing does not support PD disaggregation. Set PD mode to Off to enable CP.",
+          disableReason: "The Playground does not generate prefill CP for PD roles. A PD prefill worker can run CP with DFlash2 (see section 3.6). Set PD mode to Off to enable CP here.",
         },
         {
           id: "dpAttn",
@@ -434,7 +434,7 @@ sgl-eval run gsm8k \\
       notes: [{ mode: ["prefill", "decode"], when: { hw: ["tpu7x"] },
         text: "PD disaggregation is not qualified for GLM-5.3-Flash on TPU7x." },
         { mode: ["prefill", "decode"], when: { pdMode: ["prefill", "decode"] },
-        text: "PD serving is a preview. Prefill CP is disabled: CP/TP group sharing cannot currently transfer the KDA state between PD workers." }],
+        text: "PD serving is a preview. The Playground removes prefill CP for PD roles; a PD prefill worker can run CP with DFlash2 (see section 3.6)." }],
     },
 
     parsers: {
