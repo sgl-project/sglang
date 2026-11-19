@@ -8,7 +8,9 @@ standing in for the VMM allocations:
   - the packing plan: slots, alignment, allocation sizes, aliasing
   - the daemon's export path (WeightCacheDaemon._export_state ->
     VmmFdTransportBackend.prepare_export): values, ties, and freeing every
-    original as its allocation is filled
+    original as its allocation is filled, including originals that only
+    several garbage collections free, and the warning when the collections
+    stop at their limit
   - the packing plan's sizes and the free device memory, logged before
     anything is allocated or copied, and the warning when the free memory is
     below the largest allocation
@@ -197,6 +199,19 @@ class _TinyModel(torch.nn.Module):
             torch.arange(12, dtype=torch.bfloat16).reshape(3, 4),
             persistent=False,
         )
+
+
+class _ConvWithBoundLoader(torch.nn.Module):
+    """As GLM-5.3-Flash's qkv_conv1d: the weight's weight_loader is a method
+    bound to the layer, so the weight and its layer form a reference cycle."""
+
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.randn(6, 1, 4), requires_grad=False)
+        self.weight.weight_loader = self.weight_loader
+
+    def weight_loader(self, param, loaded_weight):
+        param.data.copy_(loaded_weight)
 
 
 def _cache_config() -> CacheConfig:
@@ -525,6 +540,119 @@ class TestVmmExportAndImport(CustomTestCase):
         )
         self.assertEqual(registry, {})
         daemon.transport_backend.close()
+
+    def test_a_cached_rotary_module_the_model_does_not_use_is_freed(self):
+        # Its buffer is not exported, so packing never sees it and cannot
+        # report it; clearing the cache frees it.
+        from sglang.srt.layers.rotary_embedding import factory
+
+        unused = torch.nn.Module()
+        unused.register_buffer("cos_sin_cache", torch.randn(256), persistent=False)
+        original = StorageWeakRef(unused.cos_sin_cache.untyped_storage())
+        cache = {"unused": unused}
+        daemon = _make_daemon(
+            _TinyModel(), VmmFdTransportBackend(device=CPU, granularity=GRANULARITY)
+        )
+        self.addCleanup(daemon.transport_backend.close)
+        del unused
+        with mock.patch.object(factory, "_ROPE_DICT", cache), _host_vmm():
+            daemon._export_state()
+        self.assertTrue(original.expired())
+
+    def test_a_viewed_parameter_in_a_reference_cycle_is_released_before_packing(
+        self,
+    ):
+        # As in GLM-5.3-Flash's linear attention: a plain attribute holds a
+        # view of a conv weight whose weight_loader is bound to its layer, and
+        # the model is only freed by the cycle collector (its root keeps a
+        # lambda over itself). The collection that frees the view cannot free
+        # the weight: the view holds it from C++ until then.
+        model = _TinyModel()
+        model.conv = _ConvWithBoundLoader()
+        model.attn = torch.nn.Module()
+        model.attn.conv_weights = model.conv.weight.squeeze(1)
+        model.self_ref = [model]
+        original = StorageWeakRef(model.conv.weight.untyped_storage())
+        daemon = _make_daemon(
+            model,
+            VmmFdTransportBackend(device=CPU, granularity=GRANULARITY),
+        )
+        self.addCleanup(daemon.transport_backend.close)
+        del model
+        # Only the daemon's own collections run, as in an idle daemon; an
+        # automatic one triggered by the test's allocations would hide this.
+        gc.disable()
+        self.addCleanup(gc.enable)
+        with _host_vmm():
+            daemon._export_state()
+        self.assertTrue(original.expired())
+
+    def test_reference_cycles_that_take_several_passes_are_freed(self):
+        # A chain of two such cycles: the first weight's view lives in the
+        # model, the second weight's view in the first weight's layer. Each
+        # pass of the collector frees one link, so two passes are not enough.
+        model = _TinyModel()
+        model.first = _ConvWithBoundLoader()
+        model.second = _ConvWithBoundLoader()
+        model.attn = torch.nn.Module()
+        model.attn.conv_weights = model.first.weight.squeeze(1)
+        model.first.next_conv_weights = model.second.weight.squeeze(1)
+        model.self_ref = [model]
+        originals = [
+            StorageWeakRef(model.first.weight.untyped_storage()),
+            StorageWeakRef(model.second.weight.untyped_storage()),
+        ]
+        daemon = _make_daemon(
+            model,
+            VmmFdTransportBackend(device=CPU, granularity=GRANULARITY),
+        )
+        self.addCleanup(daemon.transport_backend.close)
+        del model
+        # Only the daemon's own collections run, as in an idle daemon.
+        gc.disable()
+        self.addCleanup(gc.enable)
+        with _host_vmm():
+            daemon._export_state()
+        self.assertEqual([ref.expired() for ref in originals], [True, True])
+
+    def test_hitting_the_collection_limit_is_reported(self):
+        from sglang.srt.weight_cache import daemon as daemon_module
+
+        # A chain of four such cycles needs five passes; allow two.
+        model = _TinyModel()
+        convs = [_ConvWithBoundLoader() for _ in range(4)]
+        model.attn = torch.nn.Module()
+        model.attn.conv_weights = convs[0].weight.squeeze(1)
+        for this, after in zip(convs, convs[1:]):
+            this.next_conv_weights = after.weight.squeeze(1)
+        model.convs = torch.nn.ModuleList(convs)
+        model.self_ref = [model]
+        del convs, this, after
+        daemon = _make_daemon(
+            model,
+            VmmFdTransportBackend(device=CPU, granularity=GRANULARITY),
+        )
+        self.addCleanup(daemon.transport_backend.close)
+        del model
+        gc.disable()
+        self.addCleanup(gc.enable)
+        with (
+            mock.patch.object(daemon_module, "_MAX_GC_PASSES", 2),
+            _host_vmm(),
+            self.assertLogs("sglang.srt.weight_cache", "WARNING") as logs,
+        ):
+            daemon._export_state()
+        limit, first, summary = logs.output
+        self.assertIn("2 garbage collections still found", limit)
+        # The weights that the remaining cycles hold stay next to their
+        # copies, and packing names them.
+        for line in (first, summary):
+            self.assertIn(
+                "3 copied slot(s) (288 packed bytes) still have source storages "
+                "referenced elsewhere, e.g. convs.1.weight, convs.2.weight, "
+                "convs.3.weight;",
+                line,
+            )
 
     def test_export_log_reports_the_allocations(self):
         # vmm_fd entries carry no handle blob, so a handle-size estimate would
