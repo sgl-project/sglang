@@ -153,6 +153,8 @@ class TestAiterFP8QUnifiedAttention(CustomTestCase):
                 backend = object.__new__(AiterAttnBackend)
                 backend.use_mla = False
                 backend.use_triton_unified_attention = True
+                # Mirrors AiterAttnBackend.__init__ for the unified decode path.
+                backend.decode_uses_page_table = True
                 backend.use_sliding_window_kv_pool = False
                 backend.max_context_len = req_to_token.shape[1]
                 backend.page_size = page_size
