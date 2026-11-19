@@ -5993,8 +5993,8 @@ class TestRustServerUnsupportedArgs(CustomTestCase):
         )
 
 
-class TestPdDecodeTailBudget(CustomTestCase):
-    def test_tail_uses_hardware_resolved_chunk_size(self):
+class TestPdDecodeTailAdmission(CustomTestCase):
+    def test_tail_uses_final_chunk_size_and_parallel_layout(self):
         with tempfile.TemporaryDirectory() as checkpoint:
             Path(checkpoint, "config.json").write_text(
                 json.dumps(
@@ -6020,7 +6020,7 @@ class TestPdDecodeTailBudget(CustomTestCase):
                 ),
             ):
 
-                def args_for(tail):
+                def args_for(tail, **parallel):
                     return ServerArgs(
                         model_path=checkpoint,
                         device="cuda",
@@ -6029,6 +6029,7 @@ class TestPdDecodeTailBudget(CustomTestCase):
                         disaggregation_decode_tail_tokens=tail,
                         max_prefill_tokens=16384,
                         chunked_prefill_size=None,
+                        **parallel,
                     )
 
                 with self.assertRaisesRegex(ValueError, "token budget \\(4096\\)"):
@@ -6036,6 +6037,12 @@ class TestPdDecodeTailBudget(CustomTestCase):
                 valid = args_for(4096)
                 valid.resolve_once()
                 self.assertEqual(resolution_result(valid, "chunked_prefill_size"), 4096)
+                # Replica width alone is insufficient: attention-DP has
+                # separate schedulers and a shared MLP synchronization path.
+                with self.assertRaisesRegex(ValueError, "attention data parallelism"):
+                    args_for(4, tp_size=2, attn_dp_size=2).resolve_once()
+                args_for(4, tp_size=2, attn_dp_size=1).resolve_once()
+                args_for(0, tp_size=2, attn_dp_size=2).resolve_once()
 
 
 class TestPrefillWeightVersionCompatibility(CustomTestCase):

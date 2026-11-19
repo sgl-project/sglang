@@ -91,7 +91,8 @@ placeholder; clients should consume the decode response, as in ordinary HTTP PD.
 The default value zero preserves prefill-owned sampling.
 
 This initial mode supports the Python frontend, dense full attention and Mooncake,
-with tensor parallelism and PP/DP/CP/EP sizes of one. Both pools must use the same W and compatible
+with tensor parallelism. Replica DP, attention DP, PP, CP and EP must each have
+size one. Both pools must use the same W and compatible
 model/KV layouts. W must fit the prefill token budget; tail batches obey both the
 chunked-prefill and maximum-prefill token budgets.
 

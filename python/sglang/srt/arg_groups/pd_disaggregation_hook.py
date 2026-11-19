@@ -129,8 +129,6 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
             )
         if cfg.pp_size != 1:
             unsupported.append("pipeline parallelism")
-        if cfg.dp_size != 1:
-            unsupported.append("data parallelism")
         if cfg.ep_size != 1:
             unsupported.append("expert parallelism")
         if cfg.attn_cp_size != 1 or cfg.dcp_size != 1:
@@ -272,12 +270,18 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                 )
 
 
-def validate_pd_decode_tail_budget(server_args: ServerArgs) -> None:
-    """Validate the tail against the final hardware/model-resolved budget."""
+def validate_pd_decode_tail_admission(server_args: ServerArgs) -> None:
+    """Validate final parallel layout and hardware/model-resolved tail budget."""
     cfg = resolving_view(server_args)
     tail = cfg.disaggregation_decode_tail_tokens
     if not tail:
         return
+    # A real tail extend is admitted before the ordinary decode MLP sync.
+    if cfg.dp_size != 1 or attn_dp_enabled_of(cfg):
+        raise ValueError(
+            "--disaggregation-decode-tail-tokens does not support replica or "
+            "attention data parallelism"
+        )
     budget = cfg.max_prefill_tokens
     if cfg.chunked_prefill_size is not None and cfg.chunked_prefill_size > 0:
         budget = min(budget, cfg.chunked_prefill_size)

@@ -156,7 +156,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     from sglang.srt.arg_groups.pd_disaggregation_hook import (
         handle_encoder_disaggregation,
         handle_pd_disaggregation,
-        validate_pd_decode_tail_budget,
+        validate_pd_decode_tail_admission,
     )
 
     run_hook(handle_pd_disaggregation, server_args)
@@ -402,6 +402,6 @@ def run_resolution_pipeline(server_args: Any) -> None:
     # Validate after all batch-size declarations are visible.
     run_hook(validate_deepep_v2_speculative_draft, server_args)
     run_hook(validate_deepep_v2_dispatch_token_budget, server_args)
-    run_hook(validate_pd_decode_tail_budget, server_args)
+    run_hook(validate_pd_decode_tail_admission, server_args)
 
     server_args._resolution_finished = True
