@@ -1021,10 +1021,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     if obj.return_prompt_token_ids:
                         state.prompt_token_ids = list(tokenized_obj.input_ids)
                     await self._send_one_request(tokenized_obj)
-                    if isinstance(obj.input_ids, list) and isinstance(
-                        tokenized_obj.input_ids, array
-                    ):
-                        obj.input_ids = tokenized_obj.input_ids
+                    if obj.input_ids is not None and not self._reads_input_ids_late():
+                        obj.input_ids = None
                     async for response in self._wait_one_response(obj, request):
                         yield response
                 else:
@@ -1918,6 +1916,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 (not get_parallel().attn_dp_enabled)
                 and (not self._batch_has_text(batch_size, requests))
             )
+        )
+
+    def _reads_input_ids_late(self) -> bool:
+        logger = self.request_logger
+        return (
+            (logger.log_requests and "input_ids" not in (logger.metadata[1] or ()))
+            or self.request_metrics_exporter_manager.exporter_enabled()
+            or bool(self.dump_requests_folder)
+            or bool(self.crash_dump_folder)
         )
 
     async def _send_one_request(

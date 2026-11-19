@@ -49,6 +49,7 @@ from sglang.srt.observability.req_time_stats import (  # noqa: E402
     APIServerReqTimeStats,
     SchedulerReqTimeStats,
 )
+from sglang.srt.observability.request_logger import RequestLogger  # noqa: E402
 from sglang.srt.runtime_context import get_context
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -992,7 +993,7 @@ def _make_tm_for_generate(case, enable_lora=False) -> TokenizerManager:
     tm.server_args.enable_strict_thinking = False
     tm.auto_create_handle_loop = Mock()
     tm._set_default_priority = Mock()
-    tm.request_logger = Mock()
+    tm.request_logger = Mock(log_requests=False)
     tm.tokenizer = None
     tm.is_pause = False
     tm.is_pause_cond = asyncio.Condition()
@@ -2006,6 +2007,41 @@ class TestChatStreamDisconnect(CustomTestCase):
             self.assertFalse(live.abort_sent)
 
         asyncio.run(drive())
+
+
+class TestReadsInputIdsLate(CustomTestCase):
+    def _manager(self, *, log=False, level=2, exporter=False, dump="", crash=None):
+        return SimpleNamespace(
+            request_logger=RequestLogger(
+                log_requests=log,
+                log_requests_level=level,
+                log_requests_format="text",
+                log_requests_target=None,
+            ),
+            request_metrics_exporter_manager=Mock(
+                exporter_enabled=Mock(return_value=exporter)
+            ),
+            dump_requests_folder=dump,
+            crash_dump_folder=crash,
+        )
+
+    def test_prompt_is_kept_only_while_something_reads_it(self):
+        cases = [
+            ({}, False),
+            ({"log": True, "level": 0}, False),
+            ({"log": True, "level": 1}, False),
+            ({"log": True, "level": 2}, True),
+            ({"log": True, "level": 3}, True),
+            ({"exporter": True}, True),
+            ({"dump": "/tmp/dump"}, True),
+            ({"crash": "/tmp/crash"}, True),
+        ]
+        for kwargs, expected in cases:
+            with self.subTest(**kwargs):
+                manager = self._manager(**kwargs)
+                self.assertEqual(
+                    TokenizerManager._reads_input_ids_late(manager), expected
+                )
 
 
 if __name__ == "__main__":
