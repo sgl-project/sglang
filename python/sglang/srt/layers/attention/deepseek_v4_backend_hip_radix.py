@@ -1716,6 +1716,9 @@ class DeepseekV4HipRadixBackend(
         if isinstance(metadata, DSV4Metadata):
             # the bucket object outlives the step; a warmup's length-fold cache must not be replayed
             metadata.core_attn_metadata._aiter_sparse_masked_indices = None
+            # likewise the prefill index streams: capture must record their build
+            if metadata.core_attn_metadata.unified is not None:
+                metadata.core_attn_metadata.unified.pf_indices = {}
 
         window = self.token_to_kv_pool.request_window
         if window is not None and isinstance(metadata, DSV4Metadata):

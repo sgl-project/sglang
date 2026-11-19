@@ -92,6 +92,8 @@ class InterleaveContextParallelMetadata(BaseContextParallelMetadata):
     per_rank_logical_token: Optional[List[int]] = None
     # Tail row -> packed all-gather slot; local tail metadata rows include padding.
     gather_index: Optional[torch.Tensor] = None
+    # Read only by the CP all-gather; the reorders keep their own index path.
+    cp_gather_index: Optional[torch.Tensor] = None
     local_index: Optional[torch.Tensor] = None
     moe_local_token_count: Optional[torch.Tensor] = None
     # Only sequence-dependent graph segments use this capacity. Eager cache
@@ -364,12 +366,14 @@ class InterleaveCPStrategy(ContextParallelStrategy):
                 .reshape(total_tokens, *x.shape[1:])
             )
 
+        if metadata.cp_gather_index is not None:
+            return gathered.index_select(0, metadata.cp_gather_index)
         flat_indices = torch.arange(total_tokens, device=x.device)
         gather_indices = (
             flat_indices % self.cp_size
         ) * physical_rank_len + flat_indices // self.cp_size
         if _FAST_CP_GATHER:
-            metadata.gather_index = gather_indices
+            metadata.cp_gather_index = gather_indices
         return gathered.index_select(0, gather_indices)
 
     def get_supported_attention_backend(self):
