@@ -30,33 +30,6 @@ SGL_DEVICE float ex2_approx(float x) {
   return y;
 }
 
-SGL_DEVICE uint32_t cluster_ctarank() {
-#if SGL_ARCH_HOPPER_OR_GREATER
-  uint32_t rank;
-  asm("mov.u32 %0, %%cluster_ctarank;" : "=r"(rank));
-  return rank;
-#else
-  return 0;
-#endif
-}
-
-SGL_DEVICE uint32_t cluster_nctarank() {
-#if SGL_ARCH_HOPPER_OR_GREATER
-  uint32_t num;
-  asm("mov.u32 %0, %%cluster_nctarank;" : "=r"(num));
-  return num;
-#else
-  return 1;
-#endif
-}
-
-/// \brief Address of the same shared variable in CTA `rank` of this cluster.
-SGL_DEVICE uint32_t mapa_shared(uint32_t addr, uint32_t rank) {
-  uint32_t result;
-  asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(result) : "r"(addr), "r"(rank));
-  return result;
-}
-
 /// \brief Makes this thread's `mbarrier.init` visible to the cluster without a `MEMBAR.GPU`.
 SGL_DEVICE void fence_mbarrier_init_cluster() {
   asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
@@ -70,12 +43,29 @@ SGL_DEVICE void barrier_cluster_wait() {
   asm volatile("barrier.cluster.wait.aligned;" ::: "memory");
 }
 
-/// \brief Async store of 8 bytes into a peer's shared memory, completing `remote_bar`'s tx count.
-SGL_DEVICE void st_async_v2(uint32_t remote_addr, float x, float y, uint32_t remote_bar) {
-  asm volatile("st.async.shared::cluster.mbarrier::complete_tx::bytes.v2.f32 [%0], {%1, %2}, [%3];" ::"r"(remote_addr),
-               "f"(x),
-               "f"(y),
-               "r"(remote_bar)
+template <typename T>
+SGL_DEVICE void st_async_v2(uint32_t addr, const T& val, uint32_t bar) {
+  static_assert(alignof(T) == 8 && sizeof(T) == 8);
+  const auto packed = reinterpret_cast<const uint2&>(val);
+  asm volatile("st.async.shared::cluster.mbarrier::complete_tx::bytes.v2.b32 [%0], {%1, %2}, [%3];"  //
+               ::"r"(addr),
+               "r"(packed.x),
+               "r"(packed.y),
+               "r"(bar)
+               : "memory");
+}
+
+template <typename T>
+SGL_DEVICE void st_async_v4(uint32_t addr, const T& val, uint32_t bar) {
+  static_assert(alignof(T) == 16 && sizeof(T) == 16);
+  const auto packed = reinterpret_cast<const uint4&>(val);
+  asm volatile("st.async.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"  //
+               ::"r"(addr),
+               "r"(packed.x),
+               "r"(packed.y),
+               "r"(packed.z),
+               "r"(packed.w),
+               "r"(bar)
                : "memory");
 }
 
@@ -184,17 +174,18 @@ __global__ __launch_bounds__(kSoftmaxThreads, kSoftmaxBlocksPerSM<kSoftmaxThread
     for (uint32_t n = 0; n < kVecsPerThread; ++n) {
       const auto vid = vec_base + n * kSoftmaxThreads;
       vecs[n].fill(fp32x2_t{kNegInf, kNegInf});
-      // nvcc 13.2-13.4 loses the global space across the PDL / cluster asm and emits 2x LD.E.128.
-      __builtin_assume(__isGlobal(input));
-      if (vid < num_vecs) vecs[n].load(input, vid);
+      if (vid < num_vecs) {
+        vecs[n].load(assume_global(input), vid);
+      }
     }
   } else {
     // Every load is issued before the first convert, which would otherwise wait on its load.
     in_vec_t raw[kVecsPerThread];
 #pragma unroll
     for (uint32_t n = 0; n < kVecsPerThread; ++n) {
-      __builtin_assume(__isGlobal(input));
-      if (vec_base + n * kSoftmaxThreads < num_vecs) raw[n].load(input, vec_base + n * kSoftmaxThreads);
+      if (vec_base + n * kSoftmaxThreads < num_vecs) {
+        raw[n].load(assume_global(input), vec_base + n * kSoftmaxThreads);
+      }
     }
 #pragma unroll
     for (uint32_t n = 0; n < kVecsPerThread; ++n) {
@@ -240,8 +231,7 @@ __global__ __launch_bounds__(kSoftmaxThreads, kSoftmaxBlocksPerSM<kSoftmaxThread
     if (lane_id < cluster_size) {
       const auto slot = ptx::to_shared(&s_pool[rank * kNumWarps + warp_id]);
       const auto bar = ptx::to_shared(&s_bar);
-      const auto [v_lo, v_hi] = warp_stats;
-      ptx::st_async_v2(ptx::mapa_shared(slot, lane_id), v_lo, v_hi, ptx::mapa_shared(bar, lane_id));
+      ptx::st_async_v2(ptx::mapa_shared(slot, lane_id), warp_stats, ptx::mapa_shared(bar, lane_id));
     }
     ptx::mbar_wait_parity_acquire_cta(&s_bar, 0);
   } else {
@@ -289,11 +279,11 @@ __global__ __launch_bounds__(kSoftmaxThreads, kSoftmaxBlocksPerSM<kSoftmaxThread
 template <bool kUsePDL, uint32_t kSoftmaxThreads, uint32_t kVecsPerThread, uint32_t kMaxCluster, typename InT>
 struct SoftmaxKernel {
   static constexpr uint32_t kVecSize = device::kMaxVecBytes / sizeof(float);
-  static constexpr auto kKernel = softmax_kernel<kUsePDL, kSoftmaxThreads, kVecsPerThread, kMaxCluster, InT>;
+  static constexpr auto kernel = softmax_kernel<kUsePDL, kSoftmaxThreads, kVecsPerThread, kMaxCluster, InT>;
 
   /// \brief CTAs per SM the compiled kernel reaches; `__launch_bounds__` only sets a floor.
   static uint32_t occupancy() {
-    return host::runtime::get_blocks_per_sm(kKernel, kSoftmaxThreads);
+    return host::runtime::get_blocks_per_sm(kernel, kSoftmaxThreads);
   }
 
   static void
@@ -361,13 +351,13 @@ struct SoftmaxKernel {
     if (cluster > 1) {
       if constexpr (kMaxCluster > 8) {
         runtime::init_per_device(device.device_id, [] {
-          const auto kernel_ptr = reinterpret_cast<const void*>(kKernel);
+          const auto kernel_ptr = reinterpret_cast<const void*>(kernel);
           CHECK_CUDA(cudaFuncSetAttribute(kernel_ptr, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
         });
       }
-      launcher.config({.use_pdl = kUsePDL, .cluster_dim = dim3{cluster}})(kKernel, params);
+      launcher.config({.use_pdl = kUsePDL, .cluster_dim = dim3{cluster}})(kernel, params);
     } else {
-      launcher.config({.use_pdl = kUsePDL})(kKernel, params);
+      launcher.config({.use_pdl = kUsePDL})(kernel, params);
     }
   }
 };
