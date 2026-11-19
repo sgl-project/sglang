@@ -12,6 +12,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 )
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
+from sglang.srt.layers.moe.utils import get_moe_runner_backend
 from sglang.srt.layers.parameter import ChannelQuantScaleParameter, ModelWeightParameter
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
@@ -24,6 +25,10 @@ from sglang.srt.layers.quantization.fp8_utils import (
     cutlass_fp8_supported,
     input_to_float8,
     normalize_e4m3fn_to_e4m3fnuz,
+)
+from sglang.srt.layers.quantization.marlin_utils_fp8 import (
+    check_lora_marlin_fp8_moe_layer,
+    repack_moe_fp8_layer_for_marlin,
 )
 from sglang.srt.layers.utils.common import set_weight_attrs
 
@@ -206,6 +211,8 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
 
     def __init__(self, quant_config: W8A8Fp8Config):
         self.quant_config = quant_config
+        # lora_marlin: the LoRA MoE runner serves the experts W8A16 from Marlin tiles.
+        self.use_marlin = get_moe_runner_backend().is_lora_marlin()
 
     def create_weights(
         self,
@@ -217,6 +224,11 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
         **extra_weight_attrs,
     ):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+
+        if self.use_marlin:
+            check_lora_marlin_fp8_moe_layer(
+                params_dtype, with_bias=extra_weight_attrs.get("with_bias", False)
+            )
 
         # WEIGHTS
         w13_weight = torch.nn.Parameter(
@@ -278,11 +290,15 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
         layer.w2_weight_scale = Parameter(
             layer.w2_weight_scale.data, requires_grad=False
         )
+        if self.use_marlin:
+            repack_moe_fp8_layer_for_marlin(layer, "channel")
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
+        if self.use_marlin:
+            return
         self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
 
     def get_triton_quant_info(self, layer: torch.nn.Module) -> TritonMoeQuantInfo:

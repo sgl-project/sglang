@@ -81,6 +81,12 @@ class TestMxfp8MoeRunnerBackend(CustomTestCase):
         with _platform(is_hip=True, is_gfx95=False):
             self.assertEqual(_resolve("marlin"), "flashinfer_trtllm")
 
+    def test_cuda_admits_the_lora_runners_but_not_ordinary_marlin(self):
+        with _platform(is_hip=False):
+            self.assertEqual(_resolve("marlin"), "flashinfer_trtllm")
+            self.assertEqual(_resolve("lora_marlin"), "lora_marlin")
+            self.assertEqual(_resolve("lora_cutedsl"), "lora_cutedsl")
+
     def test_non_mxfp8_quantization_is_untouched(self):
         with _platform(is_hip=True, is_gfx95=False):
             self.assertEqual(_resolve("triton", quantization="fp8"), "triton")

@@ -1428,6 +1428,9 @@ class Envs:
     # SGLang needs to know FlashInfer NVFP4 4over6 config to compute the global scale factor.
     FLASHINFER_NVFP4_4OVER6 = EnvBool(False)
     FLASHINFER_NVFP4_4OVER6_E4M3_USE_256 = EnvBool(False)
+    # The rest of flashinfer's 4over6 recipe, read by the MoE LoRA NVFP4 quant info.
+    FLASHINFER_NVFP4_4OVER6_ERR_MODE = EnvStr("MAE")
+    FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH = EnvBool(False)
     # Skip-softmax threshold scale factor for TRT-LLM attention (prefill and decode separately).
     # None = standard attention. See https://arxiv.org/abs/2512.12087
     SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR = EnvFloat(None)
