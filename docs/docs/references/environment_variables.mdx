@@ -203,6 +203,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Follows the NVIDIA runtime master (both unset: <code>false</code>)</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_ENABLE_HICACHE_WB_EVICT_RELAXED_FENCE`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Let a PP disaggregated prefill with HiCache `write_back` fence the device-to-host copies of a device eviction walk's victims on the forward-done event of the last micro-batch whose result was processed, instead of on the forward in flight; a victim whose transfers read another node keeps the forward fence. The PP disaggregated-prefill loop reads it once when it starts and logs one INFO line naming the fence in use. Set it to `0` to keep the forward fence for every copy.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_ENABLE_TORCH_INFERENCE_MODE`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Control whether to use torch.inference_mode</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`false`</td>

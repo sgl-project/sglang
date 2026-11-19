@@ -314,6 +314,7 @@ class TestPPProxyRecvAfterForward(CustomTestCase):
                     _pp_proxy_recv_after_forward=False,
                     init_pp_loop_state=lambda: None,
                     increment_scheduler_iterations=stop,
+                    enable_hierarchical_cache=False,
                 )
                 with (
                     envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True),

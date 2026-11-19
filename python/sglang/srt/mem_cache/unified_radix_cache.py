@@ -1305,14 +1305,14 @@ class UnifiedRadixCache(BasePrefixCache):
                     backup_kv = self._evict_device_leaf(node_id, tracker)
                     if backup_kv is not None:
                         written = self._execute_and_commit_kv_backup(
-                            backup_kv, write_back=True
+                            backup_kv, write_back=True, victim=True
                         )
                         if written == 0 and pending:
                             # Make the queued victims host-evictable, as the
                             # per-victim walk would have by now, and retry once.
                             demote_queued()
                             written = self._execute_and_commit_kv_backup(
-                                backup_kv, write_back=True
+                                backup_kv, write_back=True, victim=True
                             )
                         if written > 0:
                             pending.append(node_id)
@@ -1407,7 +1407,9 @@ class UnifiedRadixCache(BasePrefixCache):
         backup_kv = self._evict_device_leaf(node_id, tracker)
         if backup_kv is None:
             return
-        written = self._execute_and_commit_kv_backup(backup_kv, write_back=True)
+        written = self._execute_and_commit_kv_backup(
+            backup_kv, write_back=True, victim=True
+        )
         if written > 0:
             self.writing_check(write_back=True)
             self._demote(node_id, tracker)
@@ -2225,9 +2227,10 @@ class UnifiedRadixCache(BasePrefixCache):
         )
 
     def _execute_and_commit_kv_backup(
-        self, action: BackupKV, write_back: bool = False
+        self, action: BackupKV, write_back: bool = False, victim: bool = False
     ) -> int:
-        """Run a backup action top-down, stopping at the first failed backup."""
+        """Run a backup action top-down, stopping at the first failed backup.
+        ``victim``: the action is a device eviction walk's own victim."""
         if self.buffer_pipeline is not None:
             # Buffer mode bypasses the host-backup contiguity below: nothing
             # is ever host-backuped here. Contiguity comes from end-to-end
@@ -2244,8 +2247,13 @@ class UnifiedRadixCache(BasePrefixCache):
             if device_value.numel() == 0 and not comp_xfers:
                 continue
             sidecar_xfers = self._build_backup_sidecar(device_value, comp_xfers)
+            settled = victim and self._victim_copy_settled(
+                node_id=node_id, comp_xfers=comp_xfers
+            )
+            # Only a settled copy passes the flag, so overrides keep their signature.
+            settled_kwargs = {"settled": True} if settled else {}
             host_indices = self._execute_kv_backup(
-                node_id, device_value, comp_xfers, sidecar_xfers
+                node_id, device_value, comp_xfers, sidecar_xfers, **settled_kwargs
             )
             if host_indices is None:
                 return 0
@@ -2280,7 +2288,23 @@ class UnifiedRadixCache(BasePrefixCache):
             CacheTransferPhase.BACKUP_HOST, kv_xfer, comp_xfers
         )
 
-    def _execute_kv_backup(self, node_id, device_value, comp_xfers, sidecar_xfers):
+    def _victim_copy_settled(
+        self, node_id: NodeId, comp_xfers: dict[ComponentType, list[PoolTransfer]]
+    ) -> bool:
+        """Whether an eviction victim's copy may skip the forward in flight: the walk
+        takes only unlocked nodes, and no component transfer reads another node."""
+        if self.cache_controller.write_settle_event is None:
+            return False
+        return all(
+            covered == node_id
+            for transfers in comp_xfers.values()
+            for transfer in transfers
+            for covered in transfer.nodes_to_load or ()
+        )
+
+    def _execute_kv_backup(
+        self, node_id, device_value, comp_xfers, sidecar_xfers, settled=False
+    ):
         """Execute Backup action."""
         kv_tokens = len(device_value)
         anchor_entry = self.cache_controller.mem_pool_host.anchor_entry
@@ -2298,6 +2322,8 @@ class UnifiedRadixCache(BasePrefixCache):
         # Preserve the ordinary controller API when no shard owner is present.
         start_owner = self.tree_core.rotation_phase_of(node_id)
         shard_kwargs = {} if start_owner is None else {"start_owner": start_owner}
+        # Likewise only a settled copy passes the flag.
+        settled_kwargs = {"settled": True} if settled else {}
         # Defer submission so the next flush can merge pending node backups.
         return self.cache_controller.write(
             device_value,
@@ -2305,6 +2331,7 @@ class UnifiedRadixCache(BasePrefixCache):
             extra_pools=aux_xfers or None,
             flush=False,
             **shard_kwargs,
+            **settled_kwargs,
         )
 
     def _track_write_through_node(

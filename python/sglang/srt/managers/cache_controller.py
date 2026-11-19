@@ -136,12 +136,15 @@ class CacheOperation:
         node_id: int,
         priority: Optional[int] = None,
         pool_transfers: Optional[List[PoolTransfer]] = None,
+        settled: bool = False,
     ):
         self.host_indices = host_indices
         self.device_indices = device_indices
         self.node_ids = [node_id]
         self.data = None
         self.pool_transfers = pool_transfers
+        # A write-back eviction copy that may skip the forward in flight.
+        self.settled = settled
 
         self.id = CacheOperation.counter
         CacheOperation.counter += 1
@@ -194,6 +197,7 @@ class CacheOperation:
             -1,
             priority,
             pool_transfers=CacheOperation._merge_pool_transfers(ops),
+            settled=all(op.settled for op in ops),
         )
         merged_op.node_ids = node_ids
         return merged_op
@@ -459,6 +463,9 @@ class HiCacheController:
         # write D2H behind in-flight forwards (see start_loading, start_writing).
         self.load_fence_stream = None
         self.write_fence_stream = None
+        # Set by the PP disaggregated-prefill loop: the forward-done event of the
+        # last micro-batch whose result was processed (see start_writing).
+        self.write_settle_event = None
         self.ack_write_queue: List[HiCacheAck] = []
 
         self.l2_transfer_engine = L2TransferEngine(io_backend)
@@ -1057,6 +1064,8 @@ class HiCacheController:
         self.load_queue.clear()
         self.ack_write_queue.clear()
         self.ack_load_queue.clear()
+        # A PD role switch resets the cache; only a PP prefill loop republishes.
+        self.write_settle_event = None
         if self.enable_storage:
             self.prefetch_queue.queue.clear()
             self.backup_queue.queue.clear()
@@ -1102,7 +1111,17 @@ class HiCacheController:
         host_indices, device_indices, pool_transfers = self._move_write_operation(op)
         self.write_queue.clear()
 
-        if self.write_fence_stream is not None:
+        if (
+            self.write_fence_stream is not None
+            and op.settled
+            and self.write_settle_event is not None
+        ):
+            # Every part is an unlocked eviction victim, inserted when a result was
+            # processed, so forwards up to write_settle_event wrote all it reads.
+            self.l2_transfer_engine.device_to_host_stream.wait_event(
+                self.write_settle_event
+            )
+        elif self.write_fence_stream is not None:
             # The copy may read KV a forward is still writing: under overlap
             # scheduling a finished request is cached while the next forward
             # writes its last token, and an evicted SWA page can belong to an

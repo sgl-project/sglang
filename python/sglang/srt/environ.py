@@ -945,6 +945,9 @@ class Envs:
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
     SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM = EnvBool(False)
+    # PP disaggregated prefill + write_back: an eviction victim's D2H backup waits for
+    # the last forward whose result was processed; 0 waits for the forward in flight.
+    SGLANG_ENABLE_HICACHE_WB_EVICT_RELAXED_FENCE = EnvBool(True)
     # gfx950: override --hicache-ratio for Mamba states in ratio mode; a cached KV
     # prefix cannot be reused after its host state is evicted.
     SGLANG_HICACHE_MAMBA_HOST_RATIO = EnvFloat(None)

@@ -84,6 +84,7 @@ def _make_scheduler(pending_req, *, chunked_req, running_reqs) -> Scheduler:
     sched.beam_coordinator = Mock()
     sched.output_streamer = Mock()
     sched.enable_hisparse = False
+    sched.enable_hierarchical_cache = False
     sched.tree_cache = Mock()
     sched.hisparse_coordinator = None
     sched.uocr_runtime = None

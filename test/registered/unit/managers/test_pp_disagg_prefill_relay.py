@@ -99,6 +99,7 @@ class _Stage:
         s.disagg_prefill_bootstrap_queue = SimpleNamespace(kv_manager=None)
         s.output_streamer = None
         s.enable_staging = False
+        s.enable_hierarchical_cache = False
         s.pause_state = SimpleNamespace(may_launch=lambda: True)
         s.invariant_checker = SimpleNamespace(run=lambda phase, batch: None)
         s.dp_attn_adapter = SimpleNamespace(maybe_prepare_mlp_sync_batch=lambda b: b)
@@ -111,6 +112,8 @@ class _Stage:
             "_pp_check_capacity_digest",
             "_pp_send_capacity_digest",
             "_pp_answer_release_requests",
+            "_pp_write_settle_controller",
+            "_pp_publish_write_settle_event",
         ):
             setattr(s, name, MethodType(getattr(SchedulerPPMixin, name), s))
         for name in (
@@ -423,6 +426,7 @@ class TestLoopEntry(CustomTestCase):
                     init_pp_loop_state=lambda: None,
                     pp_loop_size=1,
                     increment_scheduler_iterations=stop,
+                    _pp_write_settle_controller=lambda: None,
                 )
                 environ = {
                     **{k: v for k, v in os.environ.items() if k not in (master, child)},

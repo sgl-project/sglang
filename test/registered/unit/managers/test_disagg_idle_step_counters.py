@@ -219,6 +219,50 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
                             0 if pending_transfer else 1 + (pattern == "idle_cycle"),
                         )
 
+    def test_pp_prefill_hands_each_forward_to_hicache_before_its_result(self):
+        """Write-back eviction copies may wait for the last processed forward only
+        if the loop publishes it before that result's tree inserts run."""
+        for relaxed in (True, False):
+            with self.subTest(relaxed=relaxed):
+                batches = self.make_batches(ForwardMode.EXTEND)
+                scheduler = self.make_scheduler(batches + [None, None])
+                self.prepare_pp_scheduler(scheduler)
+                controller = SimpleNamespace(
+                    write_policy="write_back", write_settle_event=None
+                )
+                scheduler.enable_hierarchical_cache = True
+                scheduler.tree_cache = SimpleNamespace(cache_controller=controller)
+                published = []
+                process = scheduler._pp_process_batch_result
+
+                def record(batch, result):
+                    (mb_id,) = [i for i, mb in enumerate(scheduler.mbs) if mb is batch]
+                    forward_done = scheduler.mb_metadata[mb_id].forward_done
+                    published.append(controller.write_settle_event is forward_done)
+                    process(batch, result)
+
+                scheduler._pp_process_batch_result = record
+                with (
+                    envs.SGLANG_ENABLE_HICACHE_WB_EVICT_RELAXED_FENCE.override(relaxed),
+                    get_parallel().override(pp_size=2, pp_async_batch_depth=0),
+                    patch(
+                        f"{PP_MODULE}.get_disagg",
+                        return_value=SimpleNamespace(
+                            disaggregation_decode_enable_offload_kvcache=False
+                        ),
+                    ),
+                    patch(f"{PP_MODULE}.set_time_batch"),
+                ):
+                    self.run_and_check(
+                        scheduler,
+                        Scheduler.event_loop_pp_disagg_prefill,
+                        ForwardMode.EXTEND,
+                        after_idle=False,
+                    )
+                self.assertEqual(published, [relaxed] * 4)
+                if not relaxed:
+                    self.assertIsNone(controller.write_settle_event)
+
     @parameterized.expand([("fresh", False), ("chained", True)])
     def test_mlx_idle_gap(self, name, chained):
         module = load_mlx_scheduler_module()
@@ -610,6 +654,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
             queue=[], staging_handler=None
         )
         scheduler.enable_staging = False
+        scheduler.enable_hierarchical_cache = False
         scheduler.request_receiver = SimpleNamespace(
             recv_requests=Mock(side_effect=[[]] * len(schedule) + [StopIteration])
         )

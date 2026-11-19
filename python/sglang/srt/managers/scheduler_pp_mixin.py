@@ -56,6 +56,7 @@ logger = logging.getLogger(__name__)
 _RELEASE_VERDICT_TAG = 1
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.cache_controller import HiCacheController
     from sglang.srt.managers.io_struct import (
         ReleaseMemoryOccupationReqInput,
         ReleaseMemoryOccupationReqOutput,
@@ -365,6 +366,7 @@ class SchedulerPPMixin:
         send_transfer_work = []
         send_release_work = []
         send_relay_work = []
+        write_settle_controller = self._pp_write_settle_controller()
 
         while True:
             server_is_idle = True
@@ -477,6 +479,9 @@ class SchedulerPPMixin:
                 # post-process the coming microbatch
                 if self.mbs[next_mb_id] is not None:
                     d2h_event.synchronize()
+                    self._pp_publish_write_settle_event(
+                        controller=write_settle_controller, mb_id=next_mb_id
+                    )
                     self._pp_process_batch_result(
                         self.mbs[next_mb_id],
                         next_batch_result,
@@ -735,6 +740,36 @@ class SchedulerPPMixin:
         Result processing may run first: its result is another micro-batch's, and
         what it releases is only reused at the next schedule, behind this wait."""
         self._apply_war_barrier()
+
+    def _pp_write_settle_controller(self: Scheduler) -> Optional[HiCacheController]:
+        """The HiCache controller whose write_back eviction copies may wait for the
+        last processed forward instead of the one in flight, or None."""
+        if not self.enable_hierarchical_cache:
+            return None
+        controller = self.tree_cache.cache_controller
+        if controller is None or controller.write_policy != "write_back":
+            return None
+        if not envs.SGLANG_ENABLE_HICACHE_WB_EVICT_RELAXED_FENCE.get():
+            logger.info(
+                "HiCache write_back eviction copies wait for the forward in flight "
+                "(SGLANG_ENABLE_HICACHE_WB_EVICT_RELAXED_FENCE=0)"
+            )
+            return None
+        logger.info(
+            "HiCache write_back eviction copies wait for the last processed forward"
+        )
+        return controller
+
+    def _pp_publish_write_settle_event(
+        self: Scheduler, controller: Optional[HiCacheController], mb_id: int
+    ) -> None:
+        """Hand the controller the forward-done event of micro-batch ``mb_id`` before
+        its result is processed: tree inserts happen while results are processed."""
+        if controller is None:
+            return
+        metadata = self.mb_metadata[mb_id]
+        if metadata is not None and metadata.forward_done is not None:
+            controller.write_settle_event = metadata.forward_done
 
     def _pp_retract_microbatches(self: Scheduler) -> None:
         """Retract the requests of every micro-batch, none of them in flight."""

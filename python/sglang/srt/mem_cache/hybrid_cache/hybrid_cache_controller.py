@@ -739,6 +739,7 @@ class HybridCacheController(BaseHiCacheController):
         extra_pools: Optional[list[PoolTransfer]] = None,
         flush: bool = True,
         start_owner: Optional[int] = None,
+        settled: bool = False,
     ) -> Optional[torch.Tensor]:
         allocation = self.allocate_host_transfers(
             device_indices, extra_pools, start_owner=start_owner
@@ -754,6 +755,7 @@ class HybridCacheController(BaseHiCacheController):
                 node_id,
                 priority,
                 pool_transfers=pool_transfers or None,
+                settled=settled,
             )
         )
         if flush:
