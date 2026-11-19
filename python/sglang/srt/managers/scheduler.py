@@ -351,6 +351,7 @@ from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard
 from sglang.srt.mem_cache.capacity import shares_memory
 from sglang.srt.mem_cache.common import checkpoint_kv_cache, storage_prefetch_end
 from sglang.srt.mem_cache.events import KvEventLoraNames
+from sglang.srt.mem_cache.in_batch_prefix_sharing import InBatchPrefixSharing
 from sglang.srt.mem_cache.kv.alloc.demand import window_retirement
 from sglang.srt.mem_cache.kv.alloc.forward_steps import (
     ForwardLaunch,
@@ -718,6 +719,8 @@ class Scheduler(
 
         # Init diffusion LLM
         self.init_diffusion_llm()
+
+        self.maybe_init_in_batch_prefix_sharing()
 
         self.init_metrics_reporter()
         self.scheduler_stage_metrics = self.metrics_reporter.scheduler_stage_metrics
@@ -1380,6 +1383,24 @@ class Scheduler(
             // self.token_to_kv_pool_allocator.page_size,
             context_len=self.model_config.context_len,
             startup_available_gpu_memory_gb=self.startup_available_gpu_memory_gb,
+        )
+
+    def maybe_init_in_batch_prefix_sharing(self) -> None:
+        """Share prompt KV among the requests of one prefill batch."""
+        self.in_batch_prefix_sharing: Optional[InBatchPrefixSharing] = None
+        if not get_schedule().enable_in_batch_prefix_sharing:
+            return
+        reason = InBatchPrefixSharing.unsupported_reason(
+            tree_cache=self.tree_cache,
+            disable_radix_cache=self.disable_radix_cache,
+            attn_backend=self.tp_worker.model_runner.attn_backend,
+            spec_algorithm=self.spec_algorithm,
+            is_dllm=self.dllm_config is not None,
+        )
+        if reason is not None:
+            raise ValueError(f"--enable-in-batch-prefix-sharing: {reason}")
+        self.in_batch_prefix_sharing = InBatchPrefixSharing(
+            tree_cache=self.tree_cache, page_size=self.page_size
         )
 
     def init_hisparse_coordinator(self) -> None:
@@ -4726,6 +4747,11 @@ class Scheduler(
         )
         # Requests no memory will ever come back for; aborted after the loop.
         unschedulable: List[Req] = []
+        share_planner = (
+            self.in_batch_prefix_sharing.new_planner()
+            if self.in_batch_prefix_sharing is not None
+            else None
+        )
         # Get requests from the waiting queue to a new prefill batch
         bounded_active = self.policy._bounded_active
         candidates = (
@@ -4828,11 +4854,18 @@ class Scheduler(
                     if bounded_active:
                         self.policy.mark_admission_skipped(req)
                     continue
+            if share_planner is not None:
+                share_planner.propose(req)
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
                 truncation_align_size=self.truncation_align_size,
             )
+            if share_planner is not None:
+                share_planner.settle(
+                    req,
+                    admitted=bool(adder.can_run_list) and adder.can_run_list[-1] is req,
+                )
 
             if self.enable_lora:
                 running_loras.add(req.lora_id)
@@ -4930,6 +4963,8 @@ class Scheduler(
             self.chunked_req in can_run_set
         )
         new_batch.hisparse_coordinator = self.hisparse_coordinator
+        if share_planner is not None:
+            new_batch.prefix_shares = share_planner.shares(new_batch.reqs)
 
         if self.enable_hierarchical_cache or self.enable_unified_cache_external_linker:
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered

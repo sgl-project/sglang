@@ -118,6 +118,10 @@ class Schedule(msgspec.Struct):
         bool,
         "Disable priority scheduling preemption.",
     ] = False
+    enable_in_batch_prefix_sharing: A[
+        bool,
+        "Let requests admitted to one prefill batch share their common prompt prefix: a request reuses the full KV pages that an earlier request of the batch computes in the same forward, instead of computing them again. Helps when samples of one prompt arrive as separate requests (e.g. RL rollout groups). Requires the radix cache and an attention backend that stores a batch's new KV before reading cached prefixes; not supported with hybrid (mamba / sliding-window) models, speculative decoding, hierarchical or external KV caches, PD disaggregation, or pipeline / context parallelism.",
+    ] = False
     default_priority_value: A[
         Optional[int], "Default priority for requests without explicit priority."
     ] = None

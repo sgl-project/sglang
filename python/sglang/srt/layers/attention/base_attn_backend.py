@@ -109,6 +109,11 @@ class AttentionBackend(ABC):
     # attention takes the padded queries rather than only the real rows.
     plans_padded_extend_rows: bool = False
 
+    # Whether every extend layer stores the batch's new KV before it reads any
+    # cached prefix KV, so a row may take as prefix slots another row of the
+    # batch writes (--enable-in-batch-prefix-sharing).
+    stores_extend_kv_before_reading_prefix: bool = False
+
     # Resolved per-mode backend names, stamped by ModelRunner.init_attention_backend
     prefill_attention_backend_str: Optional[str] = None
     decode_attention_backend_str: Optional[str] = None

@@ -129,6 +129,7 @@ from sglang.srt.mem_cache.common import (
     evict_from_tree_cache,
     match_kv_cache,
 )
+from sglang.srt.mem_cache.in_batch_prefix_sharing import PrefixShare
 from sglang.srt.mem_cache.kv.advance import TrackingAdvance
 from sglang.srt.mem_cache.kv.alloc.demand import windows_retire_by_forward
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -1976,6 +1977,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # Tracks process_prefill_chunk() on the original scheduler batch only.
     prefill_chunk_processed: bool = False
+
+    # Rows of this extend batch that take their prefix from an earlier row
+    # (--enable-in-batch-prefix-sharing); their prefix_len already covers it.
+    prefix_shares: Tuple[PrefixShare, ...] = ()
 
     # The requests this batch was launched with; the in-flight counts are kept
     # over these.

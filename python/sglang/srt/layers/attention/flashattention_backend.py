@@ -193,6 +193,11 @@ class FlashAttentionBackend(AttentionBackend):
     _draft_kv_ring: Optional[DFlashDraftKVRing] = None
     _ring_page_cols: Optional[torch.Tensor] = None
 
+    @property
+    def stores_extend_kv_before_reading_prefix(self) -> bool:
+        # With fa_skip_kv_cache, extend attends to the new tokens only.
+        return not self.fa_skip_kv_cache
+
     # Chunked-prefix attention reads the stable ForwardBatch cu-seqlens and
     # KV-index buffers directly, so it needs no backend-private replay state.
     supports_full_cuda_graph_chunked_prefix = True

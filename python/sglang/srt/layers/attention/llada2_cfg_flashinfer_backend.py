@@ -40,6 +40,9 @@ def _build_llada_image_custom_mask(
 class LLaDA2CFGFlashInferAttnBackend(FlashInferAttnBackend):
     """Stock FlashInfer plus LLaDA-specific ragged attention masks."""
 
+    # Its own forward_extend; not audited for the store-before-read order.
+    stores_extend_kv_before_reading_prefix = False
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._llada_image_conditioning_mask_active = False
