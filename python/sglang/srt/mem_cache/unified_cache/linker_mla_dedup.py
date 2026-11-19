@@ -79,7 +79,17 @@ class LinkerMLADedupBroadcaster(MLAHostDedupBroadcaster):
             indices, _ = prepared[name]
             if indices.is_cuda:
                 indices.record_stream(device_module.current_stream())
+            # layer_mapping values are an int, or a tuple of ints when draft
+            # layers are packed into the pool (MTP/EAGLE/DSpark, see
+            # _with_packed_draft_mapping in linker_pool_assembler.py). Broadcast
+            # every packed physical layer, mirroring get_prepared_layer_range_meta.
+            physical_layers = [layer] if isinstance(layer, int) else list(layer)
             for buffers in self.buffers[name]:
-                self._bcast_layer(
-                    buffers, self.kv_staging, indices, buffers[layer].shape[1], layer
-                )
+                for buf_layer in physical_layers:
+                    self._bcast_layer(
+                        buffers,
+                        self.kv_staging,
+                        indices,
+                        buffers[buf_layer].shape[1],
+                        buf_layer,
+                    )
