@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 from typing import List, Optional
 
 from sglang.srt.entrypoints.openai.protocol import Tool
@@ -29,11 +30,16 @@ def _parse_gemma4_value(value_str: str) -> object:
         return True
     if value_str == "false":
         return False
+    if value_str == "null":
+        return None
 
-    # Number (int or float)
+    # Number (int or float, including exponent notation)
     try:
-        if "." in value_str:
-            return float(value_str)
+        if "." in value_str or ("e" in value_str.lower() and "_" not in value_str):
+            number = float(value_str)
+            # An out-of-range literal such as 1e999 overflows to inf, which
+            # json.dumps would serialize as the invalid JSON token Infinity.
+            return number if math.isfinite(number) else value_str
         return int(value_str)
     except ValueError:
         pass
