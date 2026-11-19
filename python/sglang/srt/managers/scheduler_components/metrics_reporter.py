@@ -351,8 +351,17 @@ class SchedulerMetricsReporter:
                 # _consume_device_gpu_time below -- tracking every category
                 # here (decode, idle, eagle_draft, ...) would queue entries
                 # that nothing consumes, growing unboundedly for the life of
-                # the process.
-                if kwargs.get("category") == "extend":
+                # the process. Also gate on the same conditions that let
+                # report_prefill_stats() reach _consume_device_gpu_time at all
+                # (mirrors its own early-return check): on TP ranks other than
+                # attn_tp_rank 0 (without --enable-metrics-for-all-schedulers),
+                # or with --enable-mfu-metrics off, report_prefill_stats()
+                # returns before ever draining this queue, so appending here
+                # unconditionally leaks the same way the all-categories
+                # version used to.
+                if kwargs.get("category") == "extend" and self.enable_mfu_metrics and (
+                    self.is_stats_logging_rank or self.current_scheduler_metrics_enabled
+                ):
                     self._device_timer_elapsed_by_category["extend"].append(
                         kwargs["t"]
                     )
