@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+from typing import Optional
+
 from sglang.srt.entrypoints.openai.protocol import (
     TranscriptionRequest,
     TranscriptionUsage,
@@ -34,6 +37,17 @@ class Qwen3ASRAdapter(TranscriptionAdapter):
     @property
     def prompt_template(self) -> str:
         return DEFAULT_ASR_PROMPT
+
+    @property
+    def max_audio_clip_s(self) -> Optional[float]:
+        # The single-request path caps generation at ``max_new_tokens=256``
+        # (see ``build_sampling_params``), so audio longer than about a minute
+        # is silently truncated: 300 s audio decodes only ~27% of its words.
+        # 60 s keeps every chunk's transcript under that cap.
+        # ``SGLANG_ASR_MAX_CLIP_S=0`` disables chunking.
+        raw = os.environ.get("SGLANG_ASR_MAX_CLIP_S", "60")
+        value = float(raw)
+        return value if value > 0 else None
 
     def build_sampling_params(self, request: TranscriptionRequest) -> dict:
         temperature = request.temperature

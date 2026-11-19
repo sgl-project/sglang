@@ -69,35 +69,40 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
     def get_audio_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         device = next(self.audio_tower.parameters()).device
 
+        # Items in one encoder batch may have different mel lengths (long audio
+        # split into chunks, or several concurrent requests batched together).
+        # Pad every item to the longest one and carry an explicit mask: the old
+        # code assumed a fixed window and crashed with
+        # "Sizes of tensors must match except in dimension 0".
+        max_len = max(item.feature.shape[-1] for item in items)
+        padded_features = []
+        masks = []
+        for item in items:
+            feature = item.feature
+            pad = max_len - feature.shape[-1]
+            if pad > 0:
+                feature = torch.nn.functional.pad(feature, (0, pad))
+            padded_features.append(feature)
+
+            mask = getattr(item, "feature_attention_mask", None)
+            if mask is None:
+                mask = torch.ones((1, item.feature.shape[-1]), dtype=torch.long)
+            mask = mask.type(torch.long)
+            if mask.shape[-1] < max_len:
+                mask = torch.nn.functional.pad(mask, (0, max_len - mask.shape[-1]))
+            masks.append(mask)
+
         input_features = (
-            torch.cat([item.feature for item in items])
-            .type(self.audio_tower.dtype)
-            .to(device)
+            torch.cat(padded_features).type(self.audio_tower.dtype).to(device)
         )
+        feature_attention_mask = torch.cat(masks, dim=0).to(device)
+        audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
 
-        has_mask = all(
-            getattr(item, "feature_attention_mask", None) is not None for item in items
-        )
-
-        if has_mask:
-            feature_attention_mask = (
-                torch.cat([item.feature_attention_mask for item in items], dim=0)
-                .type(torch.long)
-                .to(device)
-            )
-            audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
-            input_features = input_features.permute(0, 2, 1)[
-                feature_attention_mask.bool()
-            ].permute(1, 0)
-        else:
-            audio_feature_lengths = torch.tensor(
-                [input_features.shape[-1]] * input_features.shape[0],
-                dtype=torch.long,
-                device=device,
-            )
-            input_features = input_features.permute(0, 2, 1).reshape(
-                -1, input_features.shape[1]
-            )
+        # (batch, num_mel_bins, frames) -> (num_mel_bins, valid_frames), the
+        # frame-minor layout the encoder expects (it transposes back itself).
+        input_features = input_features.permute(0, 2, 1)[
+            feature_attention_mask.bool()
+        ].permute(1, 0)
 
         audio_outputs = self.audio_tower(
             input_features,

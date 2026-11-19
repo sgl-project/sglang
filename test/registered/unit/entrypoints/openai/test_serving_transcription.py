@@ -17,6 +17,7 @@ maybe_stub_sgl_kernel()  # must precede any import that pulls in sgl_kernel
 import asyncio
 import io
 import json
+import os
 import unittest
 from typing import List
 from unittest.mock import AsyncMock, Mock, patch
@@ -371,7 +372,9 @@ class TestLongAudioChunkedNonStreaming(CustomTestCase):
         self.assertEqual(result.text, " part one. part two. part three.")
         self.assertEqual(result.usage.seconds, 65)
         self.assertEqual(len(tm.requests), 3)
-        self.assertEqual(tm.max_active_dispatches, 1)
+        # Chunks are dispatched concurrently, but the fan-out stays bounded.
+        self.assertGreater(tm.max_active_dispatches, 1)
+        self.assertLessEqual(tm.max_active_dispatches, 4)
 
         # Each chunk request is independent: own audio payload, own
         # sampling_params dict (the multimodal processor pops keys out of
@@ -388,10 +391,27 @@ class TestLongAudioChunkedNonStreaming(CustomTestCase):
             total_samples += len(data)
         self.assertEqual(total_samples, 65 * 16000)
 
-    def test_chunk_failure_returns_error_and_stops_dispatch(self):
+    def test_chunk_concurrency_is_bounded_by_env(self):
+        # 3 chunks, fan-out capped at 2: the cap must be honoured (and not
+        # silently degrade to the sequential behaviour it replaced).
+        texts = [" part one.", " part two.", " part three."]
+        tm = _MockChunkTokenizerManager(
+            [
+                [{"text": t, "meta_info": {"finish_reason": {"type": "stop"}}}]
+                for t in texts
+            ]
+        )
+        with patch.dict(os.environ, {"SGLANG_ASR_CHUNK_CONCURRENCY": "2"}):
+            result = self._create_transcription(tm, _long_wav_bytes(65.0))
+
+        self.assertIsInstance(result, TranscriptionResponse, result)
+        self.assertEqual(result.text, "".join(texts))
+        self.assertEqual(tm.max_active_dispatches, 2)
+
+    def test_chunk_failure_returns_error_and_aborts_chunks(self):
         # When one chunk request fails, create_transcription must return an
-        # error response (not a partial transcript), abort the in-flight
-        # request, and leave later chunks undispatched.
+        # error response (not a partial transcript) and abort every chunk,
+        # including the ones already in flight.
         tm = _MockChunkTokenizerManager(
             [
                 [
@@ -412,10 +432,9 @@ class TestLongAudioChunkedNonStreaming(CustomTestCase):
         result = self._create_transcription(tm, _long_wav_bytes(65.0))
         # Error response, not a TranscriptionResponse.
         self.assertNotIsInstance(result, TranscriptionResponse)
-        # Sequential dispatch means the third chunk never reaches the engine.
-        self.assertEqual(len(tm.requests), 2)
-        self.assertIn(tm.requests[-1].rid, tm.aborted)
-        self.assertEqual(tm.max_active_dispatches, 1)
+        # Chunks are dispatched up front, so all of them are aborted.
+        self.assertEqual(len(tm.requests), 3)
+        self.assertEqual(sorted(tm.aborted), sorted(req.rid for req in tm.requests))
 
     def test_split_failure_returns_error_without_dispatch(self):
         tm = _MockChunkTokenizerManager([])
