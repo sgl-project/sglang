@@ -110,6 +110,26 @@ class TestLIMState(CustomTestCase):
         self.assertEqual(plan.device_kv_bytes, identity.device_kv_bytes)
         self.assertEqual(plan.batch_capacity, identity.batch_capacity)
 
+    def test_a5_c8_keeps_receive_and_null_rows_out_of_resident_payload(self):
+        options = self.options(resident_rows=3, max_query_width=4)
+        options.update(
+            request_rows=9, kv_bytes_per_token=656, kv_dtype=torch.float8_e4m3fn
+        )
+        plan = resolve_sparse_kv_budget(**options)
+        self.assertEqual(plan.request_rows, 9)
+        self.assertEqual(plan.manager_buffers["request_to_resident"].shape, (9,))
+        self.assertEqual(
+            plan.manager_buffers["device_kv_buffer"].shape, (2, 8192, 1, 656)
+        )
+        self.assertEqual(plan.device_kv_bytes, 2 * 8192 * 656 * options["num_layers"])
+        self.assertNotIn("device_rope_buffer", plan.manager_buffers)
+        key = torch.empty((5, 128, 1, 128), dtype=torch.float8_e4m3fn)
+        plan.bind_native_pool(
+            SimpleNamespace(start_layer=0, get_index_k_buffer=lambda _: key)
+        )
+        self.assertEqual(plan.host_token_capacity, 5 * 128)
+        self.assertEqual(plan.host_kv_bytes, 5 * 128 * 656 * options["num_layers"])
+
     def test_optional_prefill_workspace_budget_and_fallback(self):
         base = resolve_sparse_kv_budget(**self.options())
         plan = resolve_sparse_kv_budget(**self.options(prefill_workspace_tokens=129))

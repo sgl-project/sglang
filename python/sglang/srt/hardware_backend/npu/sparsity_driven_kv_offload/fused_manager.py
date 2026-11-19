@@ -65,11 +65,12 @@ class FusedSparseKVCacheManager:
         self.host_token_capacity = self.budget.host_token_capacity
         self.device_cache_size = self.budget.cache_tokens
         logger.info(
-            "Sparse KV: K=%d C=%d, managed HBM/rank=%.2f MiB, shared host payload=%.2f MiB, host_layout=paged_split",
+            "Sparse KV: K=%d C=%d, managed HBM/rank=%.2f MiB, shared host payload=%.2f MiB, host_layout=%s",
             self.sparse_topk,
             self.device_cache_size,
             self.budget.managed_hbm_bytes / 1024**2,
             self.budget.host_kv_bytes / 1024**2,
+            "packed_c8" if self.budget.packed_c8 else "paged_split",
         )
         logger.info(
             "Sparse KV prefill workspace: enabled=%s capacity_tokens=%d persistent_bytes=%d",
@@ -78,27 +79,53 @@ class FusedSparseKVCacheManager:
             self.budget.prefill_workspace_bytes,
         )
         self.cache_capacity = self.device_cache_size
-        self._copy_sfa_operator = load_copy_sfa_operator()
+        self._copy_sfa_operator = self._load_copy_sfa_operator()
 
         # Allocate exactly the persistent shapes reserved by the plan.
         self.request_to_resident: Optional[torch.Tensor] = None
         try:
             for name, spec in self.budget.manager_buffers.items():
                 fill_value = None
-                if name in ("device_slot_map", "resident_begin", "resident_end"):
+                if name in (
+                    "device_slot_map",
+                    "slot_to_source",
+                    "resident_begin",
+                    "resident_end",
+                ):
                     fill_value = -1
                 elif name == "request_to_resident":
                     fill_value = 0
                 value = (
                     [spec.allocate(self.device, fill_value) for _ in range(spec.count)]
                     if name
-                    in ("device_kv_buffer", "device_rope_buffer", "device_slot_map")
+                    in (
+                        "device_kv_buffer",
+                        "device_rope_buffer",
+                        "device_slot_map",
+                        "slot_to_source",
+                    )
                     else spec.allocate(self.device, fill_value)
                 )
                 setattr(self, name, value)
         except Exception as e:
             self._raise_buffer_allocation_error(name, e)
 
+        self._init_host_pool()
+        self.lim_adapter = self._make_decode_adapter()
+
+        if self.request_to_resident is None:
+            self._install_req_alloc_hook(req_to_token_pool)
+        else:
+            self._clear_resident_rows()
+            req_to_token_pool.admit_sparse_resident_rows = self._admit_resident_rows
+            req_to_token_pool.release_sparse_resident_row = self._release_resident_row
+            req_to_token_pool.clear_sparse_resident_rows = self._clear_resident_rows
+
+    @staticmethod
+    def _load_copy_sfa_operator():
+        return load_copy_sfa_operator()
+
+    def _init_host_pool(self):
         # Shared host components use [physical_pages, page_size, head_num, width].
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
 
@@ -174,19 +201,13 @@ class FusedSparseKVCacheManager:
             self.kv_lora_rank,
             self.qk_rope_head_dim,
         )
+
+    def _make_decode_adapter(self):
         from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_lim import (
             LIMDecodeAdapter,
         )
 
-        self.lim_adapter = LIMDecodeAdapter(self)
-
-        if self.request_to_resident is None:
-            self._install_req_alloc_hook(req_to_token_pool)
-        else:
-            self._clear_resident_rows()
-            req_to_token_pool.admit_sparse_resident_rows = self._admit_resident_rows
-            req_to_token_pool.release_sparse_resident_row = self._release_resident_row
-            req_to_token_pool.clear_sparse_resident_rows = self._clear_resident_rows
+        return LIMDecodeAdapter(self)
 
     def _raise_buffer_allocation_error(
         self,

@@ -190,6 +190,12 @@ def get_sparse_kv_budget(
     query_heads = model_config.num_attention_heads // get_parallel().attn_tp_size
     # Native SFA accepts 1..64 or 128 query heads per KV head.
     copy_sfa_query_heads = 128 if 64 < query_heads < 128 else query_heads
+    if kv_dtype == torch.float8_e4m3fn:
+        from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+
+        if not is_npu_arch35():
+            raise ValueError("Packed C8 fused KV offload requires Ascend950.")
+        copy_sfa_query_heads = max(8, 1 << (query_heads - 1).bit_length())
     disagg = get_disagg()
     prefill_rows = request_rows - 1
     if disagg.disaggregation_mode == "decode":

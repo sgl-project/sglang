@@ -19,6 +19,7 @@ def _lim_copy_sfa_metadata_kernel(
     Q: tl.constexpr,
     C: tl.constexpr,
     HBM_PAGES: tl.constexpr,
+    HBM_ROW_OFFSET: tl.constexpr,
 ):
     row_id = tl.program_id(0).to(tl.int32)
 
@@ -27,7 +28,7 @@ def _lim_copy_sfa_metadata_kernel(
     is_valid = tl.load(valid_rows_ptr + row_id) != 0
     is_sparse = tl.load(sparse_rows_ptr + row_id) != 0
     request_slot = tl.load(request_slots_ptr + row_id).to(tl.int32)
-    base_request = tl.where(is_valid, request_slot, 0).to(tl.int32)
+    base_request = tl.where(is_valid, request_slot - HBM_ROW_OFFSET, 0).to(tl.int32)
 
     col = tl.arange(0, K).to(tl.int32)
     for route in range(Q):
@@ -66,6 +67,7 @@ def prepare_copy_sfa_metadata(
     hbm_block_table: torch.Tensor,
     capacity: int,
     query_width: int = 1,
+    hbm_row_offset: int = 0,
 ) -> None:
     """Update scheduling lengths in place and prepare HBM pages and invalid source IDs."""
     batch = source_ids.shape[0] // query_width
@@ -81,6 +83,7 @@ def prepare_copy_sfa_metadata(
         query_width,
         capacity,
         hbm_pages,
+        hbm_row_offset,
     )
 
 

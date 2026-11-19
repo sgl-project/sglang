@@ -335,10 +335,14 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                             model_config=kvc.model_config
                         ),
                         kv_bytes_per_token=(
-                            kvc.model_config.kv_lora_rank
-                            + kvc.model_config.qk_rope_head_dim
-                        )
-                        * torch._utils._element_size(kvc.kv_cache_dtype),
+                            656
+                            if kvc.kv_cache_dtype == torch.float8_e4m3fn
+                            else (
+                                kvc.model_config.kv_lora_rank
+                                + kvc.model_config.qk_rope_head_dim
+                            )
+                            * torch._utils._element_size(kvc.kv_cache_dtype)
+                        ),
                     )
                     kvc.sparse_kv_budget_plan = get_sparse_kv_budget(
                         num_layers=num_layers,
@@ -351,6 +355,15 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     budget.context_len, 2 * (budget.request_rows - 1)
                 )
                 self._fixed_overhead_bytes += budget.managed_hbm_bytes
+                if budget.packed_c8:
+                    scale_bytes = (
+                        len(kvc.get_dsa_indexer_layer_ids()) * torch.float32.itemsize
+                    )
+                    self._cell_size += scale_bytes
+                    self._fixed_overhead_bytes += (
+                        scale_bytes * get_schedule().page_size
+                        + 128 * 128 * torch.bfloat16.itemsize
+                    )
 
         # EAGLE/STANDALONE: assumes the draft shares the target's per-layer KV size,
         # which holds for EAGLE/MTP drafts that reuse the target's attention config.

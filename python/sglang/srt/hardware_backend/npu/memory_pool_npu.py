@@ -687,14 +687,21 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             and get_disagg().disaggregation_mode == "decode"
             and (
                 (kv_lora_rank, qk_rope_head_dim, page_size) != (512, 64, 128)
-                or dtype != torch.bfloat16
+                or not (
+                    dtype == torch.bfloat16
+                    or (
+                        dtype == torch.float8_e4m3fn
+                        and kv_cache_dim == 656
+                        and index_head_dim == 128
+                    )
+                )
                 or modelslim_cache_layout is not None
                 or self.use_fia_nz
             )
         ):
             raise ValueError(
-                "Ascend PD split KV requires row-major BF16 MLA with "
-                "512/64 features and page size 128."
+                "Ascend PD sparse KV requires row-major MLA with 512/64 "
+                "features, page size 128, and BF16 or packed C8 FP8 storage."
             )
         if self.enable_sparsity_driven_kv_offload and self.index_head_dim is None:
             raise ValueError("Sparsity-driven KV offload requires an index KV cache.")
@@ -908,6 +915,38 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             kv_size_bytes += get_tensor_size_bytes(self.index_k_scale_buffer)
         return kv_size_bytes
 
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        """Mirror accepted-token moves only for the packed Ascend950 pool."""
+        manager = getattr(self, "sparse_kv_manager", None)
+        if not getattr(manager, "packed_c8", False):
+            return super().move_kv_cache(tgt_loc, src_loc)
+
+        size_limit = self.size + self.page_size
+        maybe_detect_oob(tgt_loc, 0, size_limit, "move_kv_cache tgt_loc")
+        maybe_detect_oob(src_loc, 0, size_limit, "move_kv_cache src_loc")
+        if tgt_loc.numel() == 0:
+            return
+        target = tgt_loc.view(-1).long()
+        source = src_loc.view(-1).long()
+        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.a5_pd import (
+            move_packed_kv,
+        )
+
+        move_packed_kv(manager, target, source)
+        # Packed attention bytes live in registered host memory, while LI keys
+        # and their real FP32 scales remain in the native device pool.
+        for buffers, raw_bytes in (
+            (getattr(self, "index_k_buffer", None), True),
+            (getattr(self, "index_k_scale_buffer", None), False),
+        ):
+            if buffers is None:
+                continue
+            for buffer in buffers:
+                flat = buffer.flatten(0, 1)
+                if raw_bytes:
+                    flat = flat.view(torch.uint8)
+                flat[target] = flat[source]
+
     def _raise_if_native_kv_cache_disabled(self):
         if (
             getattr(self, "k_buffer", None) is None
@@ -1039,7 +1078,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     def get_kv_layer_ids(self):
         return (
             list(range(self.start_layer, self.start_layer + self.layer_num))
-            * (1 if self.use_combined_kv_buffer else 2)
+            * (1 if self.use_combined_kv_buffer or self.dsa_kv_cache_store_fp8 else 2)
             + self.get_state_layer_ids()
         )
 
@@ -1245,6 +1284,13 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
 
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         torch.npu.synchronize()
+        manager = getattr(self, "sparse_kv_manager", None)
+        if getattr(manager, "packed_c8", False):
+            from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.a5_pd import (
+                snapshot_packed_kv,
+            )
+
+            return snapshot_packed_kv(self, indices)
         buf_of_layers = [
             self._get_cpu_offload_layer_buffers(i) for i in range(self.layer_num)
         ]
@@ -1267,6 +1313,13 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
     ):
         torch.npu.synchronize()
+        manager = getattr(self, "sparse_kv_manager", None)
+        if getattr(manager, "packed_c8", False):
+            from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.a5_pd import (
+                restore_packed_kv,
+            )
+
+            return restore_packed_kv(self, kv_cache_cpu, indices, req_pool_index)
         chunk_size = self.cpu_offloading_chunk_size
         for local_layer_id in range(self.layer_num):
             buffers = self._get_cpu_offload_layer_buffers(local_layer_id)

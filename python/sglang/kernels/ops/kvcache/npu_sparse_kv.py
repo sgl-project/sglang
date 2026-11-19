@@ -72,14 +72,14 @@ def _prepare_sparse_kv_offload_kernel(
     tl.store(valid + t, live, in_bounds)
 
 
-def prepare_sparse_kv_offload(
-    k,
-    k_rope,
+def prepare_sparse_kv_rows(
     request_ids,
     seq_lens,
     positions,
     out_cache_loc,
     *,
+    tokens,
+    device,
     request_rows,
     context_len,
     host_capacity,
@@ -88,14 +88,13 @@ def prepare_sparse_kv_offload(
     extend_prefix_lens=None,
     compact_prefill=False,
 ):
-    """Prepare offload rows and, for target decode/verify, concatenate KV."""
-    tokens, batch = k.shape[0], request_ids.numel()
+    """Prepare row addressing for split and packed offloaded KV."""
+    batch = request_ids.numel()
     prefill = extend_seq_lens is not None
-    source = torch.empty(tokens, dtype=torch.int64, device=k.device)
+    source = torch.empty(tokens, dtype=torch.int64, device=device)
     destination = torch.empty_like(source)
     token_positions = torch.empty_like(source)
-    valid = torch.empty(tokens, dtype=torch.bool, device=k.device)
-    current = (k, k_rope) if prefill else torch.cat((k, k_rope), dim=-1)
+    valid = torch.empty(tokens, dtype=torch.bool, device=device)
     if tokens:
         token_block = 32
         _prepare_sparse_kv_offload_kernel[(triton.cdiv(tokens, token_block),)](
@@ -128,4 +127,12 @@ def prepare_sparse_kv_offload(
             triton.next_power_of_2(batch),
             token_block,
         )
-    return source, destination, token_positions, valid, current
+    return source, destination, token_positions, valid
+
+
+def prepare_sparse_kv_offload(k, k_rope, *args, **kwargs):
+    """Prepare split KV rows and the current decode/verify payload."""
+    rows = prepare_sparse_kv_rows(*args, tokens=k.shape[0], device=k.device, **kwargs)
+    prefill = kwargs.get("extend_seq_lens") is not None
+    current = (k, k_rope) if prefill else torch.cat((k, k_rope), dim=-1)
+    return (*rows, current)

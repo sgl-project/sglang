@@ -32,6 +32,7 @@ class LIMSelection:
     request_safe_slots: torch.Tensor
     resident_safe_slots: torch.Tensor
     query_width: int = 1
+    owner_layer: int = -1
 
 
 class LIMDecodeAdapter:
@@ -44,7 +45,7 @@ class LIMDecodeAdapter:
         self.rows = manager.size
         self.batch_capacity = manager.batch_capacity
         self.max_query_width = manager.max_query_width
-        self.operator = load_fused_lim_operator()
+        self.operator = self._load_operator()
         self._fused_prepare_lim_metadata = fused_prepare_lim_metadata
         device = manager.device
         for name, spec in manager.budget.adapter_buffers.items():
@@ -66,13 +67,14 @@ class LIMDecodeAdapter:
     def reset_requests(self, request_slots):
         self.last_prefix[:, request_slots] = -1
 
-    def select(
-        self, manager, *, query, weights, key, block_table, forward_batch, layer_id
-    ):
+    @staticmethod
+    def _load_operator():
+        return load_fused_lim_operator()
+
+    def prepare(self, manager, block_table, forward_batch, layer_index):
         batch = forward_batch.batch_size
         width = sparse_query_width(forward_batch)
         rows = batch * width
-        layer_index = layer_id - manager.start_layer
         self._fused_prepare_lim_metadata(
             seq_lens=forward_batch.seq_lens[:batch],
             positions=forward_batch.positions[:rows],
@@ -94,6 +96,14 @@ class LIMDecodeAdapter:
             request_to_resident=manager.request_to_resident,
             resident_rows=manager.budget.resident_rows,
         )
+        return batch, width
+
+    def select(
+        self, manager, *, query, weights, key, block_table, forward_batch, layer_id
+    ):
+        layer_index = layer_id - manager.start_layer
+        batch, width = self.prepare(manager, block_table, forward_batch, layer_index)
+        rows = batch * width
         sources = self.source_ids[:rows]
         fused_lightning_indexer_manage(
             weights=weights[:rows].contiguous(),
@@ -116,11 +126,15 @@ class LIMDecodeAdapter:
             operator=self.operator,
             full_visible=True,
         )
+        return self.finish(layer_index, batch, width)
+
+    def finish(self, layer_index, batch, width):
+        rows = batch * width
         self.last_prefix[layer_index].index_copy_(
             0, self.resident_safe_slots[:batch].long(), self._pre_next_prefix[:batch]
         )
         return LIMSelection(
-            sources,
+            self.source_ids[:rows],
             self.device_slots[:rows],
             self.topk_misses[:rows],
             self.miss_sources[:batch],
@@ -131,4 +145,5 @@ class LIMDecodeAdapter:
             self.request_safe_slots[:batch],
             self.resident_safe_slots[:batch],
             width,
+            layer_index,
         )

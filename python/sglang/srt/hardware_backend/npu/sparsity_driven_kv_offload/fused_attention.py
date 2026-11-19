@@ -46,6 +46,15 @@ def forward_fused_sparse_kv_offload(
             return torch.nn.functional.pad(result, (0, 0, 0, q.shape[0] - rows))
         return result
 
+    if getattr(manager, "packed_c8", False):
+        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.c8_prefill import (
+            forward_packed_prefill,
+        )
+
+        return forward_packed_prefill(
+            backend, q, q_rope, layer, forward_batch, topk_indices
+        )
+
     actual_q = backend.forward_metadata.actual_seq_lengths_q
     if actual_q is None:
         actual_q = torch.cumsum(forward_batch.extend_seq_lens, dim=0)

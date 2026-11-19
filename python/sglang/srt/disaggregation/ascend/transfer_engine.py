@@ -41,7 +41,9 @@ class AscendTransferEngine(MooncakeTransferEngine):
         self.npu_id = npu_id
 
         # Centralized storage address of the AscendTransferEngine
-        self.store_url = os.getenv("ASCEND_MF_STORE_URL")
+        self.store_url = os.getenv("MF_CONFIG_STORE_URL") or os.getenv(
+            "ASCEND_MF_STORE_URL"
+        )
         if disaggregation_mode == DisaggregationMode.PREFILL:
             self.role = "Prefill"
         elif disaggregation_mode == DisaggregationMode.DECODE:

@@ -312,14 +312,25 @@ class DSANPUIndexerMixin:
             backend = get_attn_backend()
             if not is_prefill and getattr(backend, "use_fused_sparse_kv", False):
                 manager = backend.sparse_kv_manager
+                query = q.view(-1, self.n_heads, self.head_dim)
+                scales = {}
+                if getattr(manager, "packed_c8", False):
+                    query, query_scale = _quantize_npu_indexer_activation(
+                        query, pool.indexer_hadamard_128, pool.dtype
+                    )
+                    scales = {
+                        "query_scale": query_scale,
+                        "key_scale": pool.get_index_k_scale_buffer(layer_id),
+                    }
                 plan = manager.lim_adapter.select(
                     manager,
-                    query=q.view(-1, self.n_heads, self.head_dim),
+                    query=query,
                     weights=weights,
                     key=past_key_states,
                     block_table=block_table,
                     forward_batch=forward_batch,
                     layer_id=layer_id,
+                    **scales,
                 )
                 backend.forward_metadata.sparse_kv_lim_plan = plan
                 return plan.source_ids
@@ -330,7 +341,14 @@ class DSANPUIndexerMixin:
                     pool.indexer_hadamard_128,
                     pool.dtype,
                 )
-                topk_indices = torch_npu.npu_quant_lightning_indexer(
+                # Ascend950 FP8 uses the stock dispatcher. Recipes can replace
+                # torch_npu's Python symbol with a different output schema.
+                quant_li = (
+                    torch.ops.npu.npu_quant_lightning_indexer
+                    if query.dtype == torch.float8_e4m3fn
+                    else torch_npu.npu_quant_lightning_indexer
+                )
+                topk_indices = quant_li(
                     query=query,
                     key=past_key_states,
                     weights=weights,

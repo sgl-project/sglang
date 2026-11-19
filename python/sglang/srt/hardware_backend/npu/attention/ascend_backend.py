@@ -424,7 +424,14 @@ class AscendAttnBackend(AttentionBackend):
                         FusedSparseKVCacheManager,
                     )
 
-                    self.sparse_kv_manager = FusedSparseKVCacheManager(
+                    Manager = FusedSparseKVCacheManager
+                    if self.token_to_kv_pool.sparse_kv_budget_plan.packed_c8:
+                        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.c8_manager import (
+                            C8SparseKVCacheManager,
+                        )
+
+                        Manager = C8SparseKVCacheManager
+                    self.sparse_kv_manager = Manager(
                         model_runner.req_to_token_pool,
                         sparse_topk,
                         paged_kv_cache=self.token_to_kv_pool,
