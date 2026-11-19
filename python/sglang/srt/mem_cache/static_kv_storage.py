@@ -427,6 +427,7 @@ class StaticKVStorage:
         eviction_interval: int = 1,
         tracking: Optional[TrackingAdvance] = None,
         window_sub_pool: Optional[str] = None,
+        reprefill_tail_tokens: int = 0,
     ) -> None:
         if tracking is not None:
             advance_tracking(self, req, tracking)
@@ -445,6 +446,7 @@ class StaticKVStorage:
             supports_prefix_sharing=shares_prefixes,
             retain_floor=retain_floor,
             eviction_interval=eviction_interval,
+            reprefill_tail_tokens=reprefill_tail_tokens,
             window_sub_pool=window_sub_pool or _WINDOW,
         )
 

@@ -1043,6 +1043,7 @@ class SWAComponent(TreeComponent):
                 req, window=self.sliding_window_size
             ),
             window_sub_pool=self.window_sub_pool,
+            reprefill_tail_tokens=self.cache.window_reprefill_tail_tokens(req),
             shares_prefixes=True,
         )
 

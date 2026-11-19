@@ -68,6 +68,7 @@ def retire_window_rows(
     retain_floor: int | None = None,
     free_segment: Callable[..., None] | None = None,
     eviction_interval: int = 1,
+    reprefill_tail_tokens: int = 0,
 ) -> None:
     """Free the rows of a request's ``window_sub_pool`` that fell out of its
     window since its cursor, keeping what a prefix-sharing cache needs and
@@ -102,6 +103,13 @@ def retire_window_rows(
         page_size,
         supports_prefix_sharing=supports_prefix_sharing,
     )
+    if reprefill_tail_tokens and supports_prefix_sharing:
+        # Matching excludes the replay tail before page alignment, so a match
+        # can end a page below the window kept above. Keep the window behind
+        # that boundary too, or the first repeat falls back to an older
+        # checkpoint despite a Full-KV hit.
+        replay_boundary = (pre_len - reprefill_tail_tokens) // page_size * page_size
+        evict_threshold = min(evict_threshold, replay_boundary - sliding_window_size)
     if retain_floor is not None and supports_prefix_sharing:
         # The caller owns where the floor is (see BasePrefixCache.swa_retain_floor);
         # this only promises not to free past it. Without prefix sharing a retained
