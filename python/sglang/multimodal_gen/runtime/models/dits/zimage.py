@@ -42,6 +42,9 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config i
     is_nunchaku_available,
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import RotaryEmbedding
+from sglang.multimodal_gen.runtime.managers.forward_context import (
+    request_allows_lossless,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
@@ -1782,8 +1785,11 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             device,
         )
         ulysses_size = get_ulysses_parallel_world_size()
+        # Joint sharding changes the BF16 rounding order, so an exact request
+        # keeps the replicated caption layout.
         shard_unified = (
-            ulysses_size > 1
+            request_allows_lossless()
+            and ulysses_size > 1
             and get_sp_world_size() == ulysses_size
             and unified_attn_mask is None
             and cap_seq_len % ulysses_size == 0

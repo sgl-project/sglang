@@ -20,6 +20,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 MODULE = "sglang.multimodal_gen.configs.pipeline_configs.zimage"
+MODEL = "sglang.multimodal_gen.runtime.models.dits.zimage"
 
 
 class TestZImageSPPadding(CustomTestCase):
@@ -111,7 +112,8 @@ class TestZImageSPPadding(CustomTestCase):
         self.config._allow_unpadded_sp = False
         self.assertEqual(self._plan()["img_seq_target"], 1024)
 
-    def test_forward_redistribution_and_cache_transitions(self):
+    @staticmethod
+    def _bare_transformer():
         class Embed(torch.nn.Module):
             def forward(self, x):
                 return x, None
@@ -135,21 +137,31 @@ class TestZImageSPPadding(CustomTestCase):
         model._rope_caches = {}
         model._unified_freqs_cis = None
         model._sharded_unified_freqs = None
-        module = "sglang.multimodal_gen.runtime.models.dits.zimage"
+        return model
+
+    @staticmethod
+    def _enter_ulysses8(stack, *, allows_lossless):
+        stack.enter_context(patch(f"{MODEL}.get_sp_world_size", return_value=8))
+        stack.enter_context(
+            patch(f"{MODEL}.get_ulysses_parallel_world_size", return_value=8)
+        )
+        stack.enter_context(
+            patch(
+                f"{MODEL}.get_sp_group",
+                return_value=SimpleNamespace(ulysses_group=None),
+            )
+        )
+        stack.enter_context(
+            patch("torch.cuda.is_current_stream_capturing", return_value=False)
+        )
+        stack.enter_context(
+            patch(f"{MODEL}.request_allows_lossless", return_value=allows_lossless)
+        )
+
+    def test_forward_redistribution_and_cache_transitions(self):
+        model = self._bare_transformer()
         with ExitStack() as stack:
-            stack.enter_context(patch(f"{module}.get_sp_world_size", return_value=8))
-            stack.enter_context(
-                patch(f"{module}.get_ulysses_parallel_world_size", return_value=8)
-            )
-            stack.enter_context(
-                patch(
-                    f"{module}.get_sp_group",
-                    return_value=SimpleNamespace(ulysses_group=None),
-                )
-            )
-            stack.enter_context(
-                patch("torch.cuda.is_current_stream_capturing", return_value=False)
-            )
+            self._enter_ulysses8(stack, allows_lossless=True)
             previous_tables = None
             for target_len in (1020, 1024, 1020):
                 image = torch.arange(136 * 240).reshape(1, 1, 1, 136, 240).float()
@@ -206,7 +218,7 @@ class TestZImageSPPadding(CustomTestCase):
                         )
 
                     with (
-                        patch(f"{module}.get_ulysses_parallel_rank", return_value=rank),
+                        patch(f"{MODEL}.get_ulysses_parallel_rank", return_value=rank),
                         patch("torch.distributed.all_gather", side_effect=gather),
                         patch(
                             "torch.distributed.all_to_all_single", side_effect=exchange
@@ -230,6 +242,35 @@ class TestZImageSPPadding(CustomTestCase):
                     )
                     self.assertIsNot(model._sharded_unified_freqs[2], previous_tables)
                     previous_tables = model._sharded_unified_freqs[2]
+
+    def test_exact_quality_keeps_replicated_caption_layout(self):
+        """Joint sharding only reorders rounding, so an exact request runs the
+        replicated caption layout, still on unrounded local image rows."""
+        model = self._bare_transformer()
+        image = torch.arange(136 * 240).reshape(1, 1, 1, 136, 240).float()
+        images = list(image.chunk(8, dim=4))
+        image_freq = torch.arange(1020 * 4).reshape(1020, 4).float()
+        cap_freq = torch.zeros(32, 4)
+        with ExitStack() as stack:
+            self._enter_ulysses8(stack, allows_lossless=False)
+            stack.enter_context(
+                patch(f"{MODEL}.get_ulysses_parallel_rank", return_value=3)
+            )
+            gather = stack.enter_context(patch("torch.distributed.all_gather"))
+            exchange = stack.enter_context(patch("torch.distributed.all_to_all_single"))
+            output = model.forward(
+                images[3],
+                [torch.zeros(32, 4)],
+                torch.zeros(1),
+                image_seq_len_target=1020,
+                image_sp_unpadded=True,
+                freqs_cis=((cap_freq, cap_freq), (image_freq, image_freq)),
+            )
+
+        torch.testing.assert_close(output, -images[3], rtol=0, atol=0)
+        gather.assert_not_called()
+        exchange.assert_not_called()
+        self.assertIsNone(model._sharded_unified_freqs)
 
     def test_compile_and_graph_configs_keep_local_padding(self):
         for compile_enabled, graph_enabled in (
