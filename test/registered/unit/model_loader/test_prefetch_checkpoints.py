@@ -224,8 +224,9 @@ class TestPrefetchCheckpoints(CustomTestCase):
             patch("threading.Thread", _InlineThread),
             patch("concurrent.futures.ThreadPoolExecutor", _InlineExecutor),
             patch("concurrent.futures.wait", side_effect=_wait_all),
-            get_parallel().override(world_group=FakeWorldGroup(), nnodes=4),
-            patch.object(type(get_parallel()), "launch_world_size", 16),
+            get_parallel().override(
+                world_group=FakeWorldGroup(), nnodes=4, launch_world_size=16
+            ),
             patch(
                 "sglang.srt.model_loader.weight_utils._prefetch_checkpoint_file",
                 side_effect=lambda path, cancel_event: loaded_paths.append(path),
