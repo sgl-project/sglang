@@ -20,7 +20,7 @@
 #include <utility>
 
 #if defined(__MUSACC__)
-#include <musa_runtime.h>
+#include <cuda_runtime.h>
 #elif !defined(USE_ROCM)
 #include <cuda_runtime.h>
 #else

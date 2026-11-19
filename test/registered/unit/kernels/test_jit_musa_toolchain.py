@@ -25,6 +25,11 @@ def test_musa_toolchain_paths_and_flags(monkeypatch):
     )
     monkeypatch.setattr(toolchain, "musa_home", lambda: "/opt/musa")
     monkeypatch.setattr(
+        toolchain,
+        "torchada_cxx_compat_include_dir",
+        lambda: "/torchada/stable_compat",
+    )
+    monkeypatch.setattr(
         toolchain, "tvm_ffi_paths", lambda: (("/tvm/include",), "/tvm/lib", "tvm")
     )
 
@@ -33,6 +38,7 @@ def test_musa_toolchain_paths_and_flags(monkeypatch):
     assert toolchain.target_flags() == ["--offload-arch=mp_31"]
     assert toolchain.base_cuda_flags() == ["-fPIC", "-x", "musa"]
     assert toolchain.base_include_paths() == [
+        "/torchada/stable_compat",
         "/tvm/include",
         "/opt/musa/include",
     ]
