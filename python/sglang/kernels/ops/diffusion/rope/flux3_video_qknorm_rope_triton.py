@@ -13,7 +13,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.numerics import cuda_rsqrtf, round_bf16_to_fp32
+from sglang.kernels.numerics import cuda_rsqrtf, mul_rn_f32, round_bf16_to_fp32
 from sglang.srt.utils.custom_op import register_custom_op
 
 
@@ -27,12 +27,15 @@ def _fold_sum(x, rows: tl.constexpr, width: tl.constexpr):
 def _rms_norm64(x, rows: tl.constexpr, eps):
     # ATen vectorized RMSNorm: four consecutive elements per thread,
     # serial FMA accumulation, then shuffle-down reduction. Keep this order
-    # and the BF16 normalization boundary before the RoPE products.
+    # and the BF16 normalization boundary before the RoPE products. Multiplies go
+    # through mul_rn_f32 so the compiler emits one scalar mul.rn.f32 per product
+    # rather than packed or otherwise rewritten forms (Triton 3.9 packs them into
+    # f32x2 on sm_120).
     vec = tl.reshape(x, (rows, 16, 2, 2))
     a02, a13 = tl.split(vec)
     a0, a2 = tl.split(a02)
     a1, a3 = tl.split(a13)
-    s = a0 * a0
+    s = mul_rn_f32(a0, a0)
     s = tl.fma(a1, a1, s)
     s = tl.fma(a2, a2, s)
     s = tl.fma(a3, a3, s)
@@ -40,8 +43,8 @@ def _rms_norm64(x, rows: tl.constexpr, eps):
     s = _fold_sum(s, rows, 4)
     s = _fold_sum(s, rows, 2)
     s = _fold_sum(s, rows, 1)
-    rstd = cuda_rsqrtf(s * (1.0 / 64) + eps)
-    return round_bf16_to_fp32(x * rstd)
+    rstd = cuda_rsqrtf(mul_rn_f32(s, tl.full(s.shape, 1.0 / 64, tl.float32)) + eps)
+    return round_bf16_to_fp32(mul_rn_f32(x, tl.broadcast_to(rstd, x.shape)))
 
 
 @triton.jit
@@ -75,10 +78,18 @@ def _qknorm_rope_kernel(
     c2 = tl.load(C + cache + 32, mask, 0).to(tl.float32)
     s1 = tl.load(S + cache, mask, 0).to(tl.float32)
     s2 = tl.load(S + cache + 32, mask, 0).to(tl.float32)
-    qo1 = round_bf16_to_fp32(q1 * c1) + round_bf16_to_fp32(-q2 * s1)
-    qo2 = round_bf16_to_fp32(q2 * c2) + round_bf16_to_fp32(q1 * s2)
-    ko1 = round_bf16_to_fp32(k1 * c1) + round_bf16_to_fp32(-k2 * s1)
-    ko2 = round_bf16_to_fp32(k2 * c2) + round_bf16_to_fp32(k1 * s2)
+    qo1 = round_bf16_to_fp32(mul_rn_f32(q1, c1)) + round_bf16_to_fp32(
+        mul_rn_f32(-q2, s1)
+    )
+    qo2 = round_bf16_to_fp32(mul_rn_f32(q2, c2)) + round_bf16_to_fp32(
+        mul_rn_f32(q1, s2)
+    )
+    ko1 = round_bf16_to_fp32(mul_rn_f32(k1, c1)) + round_bf16_to_fp32(
+        mul_rn_f32(-k2, s1)
+    )
+    ko2 = round_bf16_to_fp32(mul_rn_f32(k2, c2)) + round_bf16_to_fp32(
+        mul_rn_f32(k1, s2)
+    )
     out = row[:, None] * 64 + halfcol[None, :]
     tl.store(Q + out, qo1, mask)
     tl.store(Q + out + 32, qo2, mask)
