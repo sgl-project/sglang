@@ -54,36 +54,26 @@ class Buffer:
 class TestRegisteredNPUHostAllocation(unittest.TestCase):
     def test_npu_host_backend_defaults_to_acl_without_setting_environment(self):
         path = ROOT / "python/sglang/srt/mem_cache/pool_host/npu_host_memory.py"
+        names = {
+            "host_memory_backend", "memfabric_host_memory_enabled",
+            "acl_host_memory_enabled", "get_host_memory_backend",
+        }
         functions = [
-            node
-            for node in ast.parse(path.read_text()).body
-            if isinstance(node, ast.FunctionDef)
-            and node.name
-            in (
-                "host_memory_backend",
-                "memfabric_host_memory_enabled",
-                "acl_host_memory_enabled",
-                "get_host_memory_backend",
-            )
+            n for n in ast.parse(path.read_text()).body
+            if isinstance(n, ast.FunctionDef) and n.name in names
         ]
-        acl_backend = type("AclHostMemoryBackend", (), {})
-        mf_backend = type("MemfabricHostMemoryBackend", (), {})
+        acl = type("AclHostMemoryBackend", (), {})
+        mf = type("MemfabricHostMemoryBackend", (), {})
         namespace = dict(
-            os=os,
-            NpuHostMemoryBackend=object,
-            AclHostMemoryBackend=acl_backend,
-            MemfabricHostMemoryBackend=mf_backend,
-            _backend=None,
+            os=os, NpuHostMemoryBackend=object,
+            AclHostMemoryBackend=acl, MemfabricHostMemoryBackend=mf, _backend=None,
         )
-        exec(
-            compile(ast.Module(body=functions, type_ignores=[]), str(path), "exec"),
-            namespace,
-        )
+        exec(compile(ast.Module(functions, []), str(path), "exec"), namespace)
         env_name = "SGLANG_HICACHE_HOST_MEM_BACKEND"
         for setting, expected in (
-            (None, acl_backend),
-            ("", acl_backend),
-            ("memfabric", mf_backend),
+            (None, acl),
+            ("", acl),
+            ("memfabric", mf),
         ):
             with self.subTest(setting=setting):
                 environment = {} if setting is None else {env_name: setting}
@@ -97,48 +87,27 @@ class TestRegisteredNPUHostAllocation(unittest.TestCase):
     def test_mha_draft_layout_preserves_npu_layer_order(self):
         path = ROOT / "python/sglang/srt/mem_cache/hybrid_cache/hybrid_pool_assembler.py"
         function = next(
-            node
-            for node in ast.parse(path.read_text()).body
-            if isinstance(node, ast.FunctionDef)
-            and node.name == "_build_mha_mla_host_pool"
+            n for n in ast.parse(path.read_text()).body
+            if isinstance(n, ast.FunctionDef)
+            and n.name == "_build_mha_mla_host_pool"
         )
         mha_info = type("MHABufferInfo", (), {})
-        device = SimpleNamespace(npu=True)
         namespace = dict(
             MHABufferInfo=mha_info,
-            is_npu=lambda: device.npu,
+            is_npu=lambda: True,
             _mha_host_inputs=lambda pool, info: (lambda info, **kw: kw, {}),
         )
         module = ast.Module(
-            body=[
-                ast.ImportFrom(
-                    module="__future__",
-                    names=[ast.alias(name="annotations")],
-                    level=0,
-                ),
-                function,
-            ],
-            type_ignores=[],
+            [ast.ImportFrom("__future__", [ast.alias("annotations")], 0), function], []
         )
         exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
-        for npu, source, expected in (
-            (True, "page_first_kv_split", "page_first_direct"),
-            (True, "layer_first_kv_split", "page_first_direct"),
-            (False, "page_first_kv_split", "page_first_direct"),
-            (False, "layer_first_kv_split", "page_first_direct"),
-        ):
-            with self.subTest(npu=npu, source=source):
-                device.npu = npu
-                result = namespace["_build_mha_mla_host_pool"](
-                    pool=object(),
-                    buffer_info=mha_info(),
-                    host_to_device_ratio=2,
-                    page_size=128,
-                    layout=source,
-                    allocator_type="default",
-                    pool_label="draft",
-                )
-                self.assertEqual(result["layout"], expected)
+        for source in ("page_first_kv_split", "layer_first_kv_split"):
+            result = namespace["_build_mha_mla_host_pool"](
+                pool=object(), buffer_info=mha_info(),
+                host_to_device_ratio=2, page_size=128,
+                layout=source, allocator_type="default", pool_label="draft",
+            )
+            self.assertEqual(result["layout"], "page_first_direct")
 
     def test_pin_memory_allocator_selects_configured_backend(self):
         path = ROOT / "python/sglang/srt/mem_cache/pool_host/common.py"

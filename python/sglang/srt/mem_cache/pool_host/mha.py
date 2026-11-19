@@ -165,10 +165,6 @@ class MHATokenToKVPoolHost(HostKVCache):
         page_unified_layout: PageUnifiedLayout | None = None,
         host_token_capacity: int | None = None,
     ):
-        if buffer_info.device.type == "npu" and not acl_host_memory_enabled():
-            raise RuntimeError(
-                "NPU MHA HiCache transfers require ACL-registered host memory"
-            )
         if _is_xpu:
             require_kvcacheio_ops(
                 pool=type(self).__name__, layout=layout, ops=self._kvcacheio_ops

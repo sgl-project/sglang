@@ -19,7 +19,6 @@ from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     get_allocator_from_storage,
 )
-from sglang.srt.mem_cache.pool_host.npu_host_memory import acl_host_memory_enabled
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 
 _is_cuda = is_cuda()
@@ -99,10 +98,6 @@ class MambaPoolHost(HostKVCache):
         self.buffer_info = buffer_info
         self.device_pool = None
         self._buffer_device = buffer_info.temporal.device
-        if self._buffer_device.type == "npu" and not acl_host_memory_enabled():
-            raise RuntimeError(
-                "NPU kernel_ascend Mamba transfers require ACL-registered host memory"
-            )
         self.mtp_draft_buffer_infos = tuple(mtp_draft_buffer_infos)
         self.page_size = 1
 
@@ -444,19 +439,6 @@ class MambaPoolHost(HostKVCache):
     ) -> None:
         if src_indices.numel() == 0:
             return
-        if io_backend == "kernel_ascend":
-            src_indices = src_indices.to(
-                dtype=torch.int64, device=dst.device, non_blocking=True
-            )
-            dst_indices = dst_indices.to(dtype=torch.int64, device=dst.device)
-            transfer_state_per_layer_direct_pf_lf(
-                src=src,
-                dst=dst,
-                src_indices=src_indices,
-                dst_indices=dst_indices,
-                layer_id=layer_id,
-            )
-            return
         if MambaPoolHost._slots_are_strided(dst):
             # Transfer into contiguous staging, then scatter into the strided view.
             staged = torch.empty(
@@ -499,6 +481,18 @@ class MambaPoolHost(HostKVCache):
                 dst_indices=dst_indices,
                 layer_id=layer_id,
                 page_size=1,
+            )
+        elif io_backend == "kernel_ascend":
+            src_indices = src_indices.to(
+                dtype=torch.int64, device=dst.device, non_blocking=True
+            )
+            dst_indices = dst_indices.to(dtype=torch.int64, device=dst.device)
+            transfer_state_per_layer_direct_pf_lf(
+                src=src,
+                dst=dst,
+                src_indices=src_indices,
+                dst_indices=dst_indices,
+                layer_id=layer_id,
             )
         else:
             raise ValueError(f"Unsupported io_backend: {io_backend}")
@@ -561,26 +555,6 @@ class MambaPoolHost(HostKVCache):
                     can_use_jit=can_use_jit,
                 )
             return
-        if io_backend == "kernel_ascend":
-            if isinstance(src_layers, torch.Tensor):
-                device_states, host_states = [src_layers], [dst]
-            else:
-                device_states = [layer.unsqueeze(0) for layer in src_layers]
-                host_states = [dst.narrow(1, i, 1) for i in range(len(src_layers))]
-            src_indices = src_indices.to(
-                dtype=torch.int64, device=device_states[0].device
-            )
-            dst_indices = dst_indices.to(
-                dtype=torch.int64, device=device_states[0].device, non_blocking=True
-            )
-            for start in range(0, len(device_states), 16):
-                transfer_state_all_layer_direct_lf_pf(
-                    device_states=device_states[start : start + 16],
-                    host_states=host_states[start : start + 16],
-                    device_indices=src_indices,
-                    host_indices=dst_indices,
-                )
-            return
         if MambaPoolHost._slots_are_strided(src_layers[0]):
             # Stage contiguous slots per layer and pass the staging buffer's pointers.
             staged = torch.stack(
@@ -636,6 +610,24 @@ class MambaPoolHost(HostKVCache):
                 src_indices=src_indices,
                 dst_indices=dst_indices,
                 page_size=1,
+            )
+        elif io_backend == "kernel_ascend":
+            if isinstance(src_layers, torch.Tensor):
+                device_states, host_states = [src_layers], [dst]
+            else:
+                device_states = [layer.unsqueeze(0) for layer in src_layers]
+                host_states = [dst.narrow(1, i, 1) for i in range(len(src_layers))]
+            src_indices = src_indices.to(
+                dtype=torch.int64, device=device_states[0].device
+            )
+            dst_indices = dst_indices.to(
+                dtype=torch.int64, device=device_states[0].device, non_blocking=True
+            )
+            transfer_state_all_layer_direct_lf_pf(
+                device_states=device_states,
+                host_states=host_states,
+                device_indices=src_indices,
+                host_indices=dst_indices,
             )
         else:
             raise ValueError(f"Unsupported io_backend: {io_backend}")

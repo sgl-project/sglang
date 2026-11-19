@@ -1707,7 +1707,7 @@ def _build_mha_mla_host_pool(
     is_mha = isinstance(buffer_info, MHABufferInfo)
     # The global layout is page_first_kv_split only when the target model
     # uses MLA; that layout is MLA-specific, so MHA draft pools must use
-    # the non-MLA layout.
+    # the non-MLA layout (NPU default: page_first_direct).
     if is_mha and layout in ("page_first_kv_split", "layer_first_kv_split"):
         layout = "page_first_direct"
 
