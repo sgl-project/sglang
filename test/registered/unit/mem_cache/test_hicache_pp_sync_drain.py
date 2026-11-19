@@ -150,6 +150,7 @@ class TestUnifiedPPSyncBatching(CustomTestCase):
         # means it issues no collective, which the asserts below pin.
         cache.prefetch_stop_policy = "timeout"
         cache.ongoing_prefetch = {}
+        cache.storage_prefetch_retries = StoragePrefetchRetries()
         cache.enable_storage_metrics = False
         cache.storage_metrics_collector = None
         cache.buffer_pipeline = None

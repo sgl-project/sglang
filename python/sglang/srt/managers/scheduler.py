@@ -3826,6 +3826,14 @@ class Scheduler(
         retries = self.tree_cache.storage_prefetch_retries
         if retries is None:
             return
+        if retries.capacity_deferred:
+            for req, storage_hit_end in retries.pop_capacity_ready(
+                self.waiting_queue,
+                self.tree_cache.cache_controller.prefetch_rate_limited,
+            ):
+                # Capacity deferral did not issue a lookup and must not consume
+                # the budget for re-querying genuine storage misses.
+                self._prefetch_kvcache(req, storage_hit_end)
         memory = get_memory()
         for req, storage_hit_end in retries.pop_ready(
             self.waiting_queue,
@@ -4303,6 +4311,17 @@ class Scheduler(
             or self.enable_unified_cache_external_linker
             or self.enable_lmcache
         ):
+            if (
+                self.enable_hicache_storage
+                and self.disaggregation_mode == DisaggregationMode.PREFILL
+            ):
+                self.tree_cache.set_prefetch_admission_ready(
+                    req.cache_request_handle
+                    for req in self.waiting_queue
+                    if not req.pending_bootstrap
+                    or get_disagg().disaggregation_decode_allocation_policy
+                    == "prefill_complete"
+                )
             self.tree_cache.check_hicache_events()
             if self.enable_hicache_storage and should_retry_storage_prefetch:
                 self._process_storage_prefetch_retries()
