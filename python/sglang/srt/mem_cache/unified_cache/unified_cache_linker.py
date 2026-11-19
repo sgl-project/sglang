@@ -1367,18 +1367,29 @@ class _LinkerPPTickets:
         start = ticket.start // self.page
         if upper <= start:
             return start
+        # PP0 can ask us to reserve before our lookup worker returns.
+        hashes = state.hashes or get_storage_hash_str(
+            ticket.key[ticket.start : upper * self.page],
+            ticket.last_hash,
+            page_size=self.page,
+        )
         return self.linker.reserve_pp_prefetch(
             ticket.handle,
             state.pin[0],
             ticket.key,
             ticket.start,
-            state.hashes[: upper - start],
+            hashes[: upper - start],
         )
 
     def _ready_word(self, state):
         if state.capacity is None:
-            return 0 if state.lookup is None else state.lookup + 1
-        return int((state.end if state.read is None else state.landed) is not None)
+            value = state.lookup
+        elif state.read is None:
+            value = state.end
+        else:
+            value = state.landed
+        # Followers can poll before their worker records the same collective result.
+        return 0 if value is None else value + 1
 
     def _keep_waiting(self, state, now):
         if state.discard:
@@ -1438,7 +1449,7 @@ class _LinkerPPTickets:
                     state.hashes = []
                     self.arrival.notify_all()
             elif self.prefetch and state.read is None:
-                end = state.end
+                end = flag - 1
                 read = self.linker.submit_pp_prefetch(
                     handle, 0 if state.discard else end
                 )
@@ -1449,10 +1460,10 @@ class _LinkerPPTickets:
             else:
                 if self.prefetch:
                     self.linker._finish_prefetch(
-                        handle, publish=state.landed and not state.discard
+                        handle, publish=bool(flag - 1) and not state.discard
                     )
                 else:
-                    end = 0 if state.discard else state.end
+                    end = 0 if state.discard else flag - 1
                     if end:
                         state.req.external_cache_hit_length = end
                         state.req.pp_linker_verdict_end = end

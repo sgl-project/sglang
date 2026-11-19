@@ -1835,7 +1835,8 @@ def _alloc_pp_extend(cache, req, seq_len):
         maybe_evict_swa=lambda: None,
         is_dllm=req.is_dllm,
     )
-    out_cache_loc, _, _ = alloc_for_extend(batch)
+    with get_context().override_server_args(attention_backend="torch_native"):
+        out_cache_loc, _, _ = alloc_for_extend(batch)
     return out_cache_loc
 
 

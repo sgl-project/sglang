@@ -1208,38 +1208,64 @@ def _check_overlapping_reads(cache, store, allocator):
 
 def _check_blocked_follower_lookup(cache, store):
     tickets = cache.linker.pp_tickets
-    for policy in ("best_effort", "timeout"):
+    for policy in ("wait_complete", "best_effort", "timeout"):
         cache.prefetch_stop_policy = policy
         cache.prefetch_timeout_base = cache.prefetch_timeout_per_page = 0
-        entered, resume, timed_out = (threading.Event() for _ in range(3))
+        resume = threading.Event()
         lookup = store.lookup
 
         def blocked_lookup(rid, transfers):
             result = lookup(rid, transfers)
-            entered.set()
-            if store.rank == 1 and not resume.wait(10):
-                timed_out.set()
+            if store.rank == 1:
+                assert resume.wait(10), "scheduler waited on follower lookup"
             return result
 
-        with patch.object(store, "lookup", blocked_lookup):
-            req = _request(policy, 60)
+        # Hold PP1 between the worker collective and its local state update.
+        submitted, published = threading.Event(), threading.Event()
+        reduce = dist.all_reduce
+
+        def delay_result(tensor, *args, group=None, **kwargs):
+            result = reduce(tensor, *args, group=group, **kwargs)
+            if policy == "wait_complete" and store.rank == 1:
+                if group is tickets.query_groups[-1]:
+                    assert submitted.wait(10)
+                elif group is tickets.ack_groups[-1]:
+                    assert published.wait(10)
+            return result
+
+        with (
+            patch.object(store, "lookup", blocked_lookup),
+            patch.object(dist, "all_reduce", delay_result),
+        ):
+            req = _request(policy, 60 if policy != "wait_complete" else 160)
             handle = req.cache_request_handle
             assert tickets.bind(req, expected=True)
+            state = tickets.pending[handle]
             try:
-                assert entered.wait(10)
-                dist.barrier()
-                # Only PP0 polls this request for admission while PP1 is still querying.
-                cache.check_hicache_events()
+                _drain_until(cache, lambda: state.capacity is not None)
+                capacity = torch.tensor(state.capacity)
+                dist.all_reduce(capacity, op=dist.ReduceOp.MIN)
+                assert capacity.item() == 2, (
+                    "a stage discarded the hit before lookup finished"
+                )
                 if store.rank == 0:
                     assert not tickets.can_admit(handle)
-
                 cache.check_hicache_events()
-                assert tickets.can_admit(handle)
+                assert tickets.can_admit(handle) == (policy != "wait_complete")
             finally:
                 resume.set()
-            _drain_until(cache)
-            assert not timed_out.is_set(), "scheduler waited on follower lookup"
-            assert all(rid != policy for rid, _ in store.reads)
+            if policy == "wait_complete":
+                try:
+                    _drain_until(cache, lambda: state.read is not None)
+                finally:
+                    submitted.set()
+            try:
+                _drain_until(cache)
+            finally:
+                published.set()
+            hit = fixtures.match_prefix(cache, req.origin_input_ids[:-1])
+            assert hit.device_prefix_len == (2 if policy == "wait_complete" else 0)
+            assert ((policy, 2) in store.reads) == (policy == "wait_complete")
 
 
 def _check_layer_wise(cache, allocator, rank):
