@@ -8,6 +8,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+from collections import OrderedDict
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -872,6 +873,7 @@ class TestFlux3TextEncoder(unittest.TestCase):
         encoder.pad_multiple = 4
         encoder.processor = FakeProcessor()
         encoder.model = base_model
+        encoder._forward_graphs = None
 
         result = encoder.encode_batch(["short", "long", "tiny", "short"])
 
@@ -897,6 +899,56 @@ class TestFlux3TextEncoder(unittest.TestCase):
         self.assertIs(result[0], result[3])
         self.assertEqual(result[0][1][-1, -1].item(), 3)
         self.assertEqual(result[1][1][-1, -1].item(), 7)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs a CUDA device")
+    def test_repeated_pad_bucket_replays_a_cuda_graph(self):
+        """A bucket seen twice is captured; replays match the eager forward and a
+        move drops the graphs, which hold the old weights."""
+        from sglang.multimodal_gen.runtime.models.encoders.flux3_text_encoder import (
+            Flux3TextEncoder,
+        )
+
+        class TinyModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embed = torch.nn.Embedding(32, 8)
+                self.mix = torch.nn.Linear(8, 8)
+
+            def forward(self, input_ids, attention_mask, position_ids, **_kwargs):
+                hidden = self.embed(input_ids) * attention_mask[..., None]
+                hidden = hidden + position_ids[0][..., None]
+                return SimpleNamespace(hidden_states=(hidden, self.mix(hidden)))
+
+        encoder = Flux3TextEncoder.__new__(Flux3TextEncoder)
+        torch.nn.Module.__init__(encoder)
+        encoder.embed_dtype = torch.float32
+        encoder.output_layers = (0, 1)
+        encoder.model = TinyModel()
+        encoder._forward_graphs = OrderedDict()
+        encoder._seen_buckets = set()
+        encoder.cuda()
+
+        def inputs(seed, tokens=6):
+            generator = torch.Generator().manual_seed(seed)
+            ids = torch.randint(0, 32, (1, tokens), generator=generator).cuda()
+            mask = torch.ones(1, tokens, dtype=torch.long, device="cuda")
+            mask[:, tokens - 2 :] = 0
+            return ids, mask
+
+        with torch.no_grad():
+            first = encoder._context(*inputs(0))
+            self.assertEqual(len(encoder._forward_graphs), 0)
+            self.assertTrue(torch.equal(first, encoder._forward_context(*inputs(0))))
+            for seed in (1, 2):
+                replayed = encoder._context(*inputs(seed))
+                eager = encoder._forward_context(*inputs(seed))
+                self.assertTrue(torch.equal(replayed, eager))
+            self.assertEqual(list(encoder._forward_graphs), [(1, 6)])
+            encoder._context(*inputs(3, tokens=8))
+            self.assertEqual(list(encoder._forward_graphs), [(1, 6)])
+        encoder.cpu()
+        self.assertEqual(len(encoder._forward_graphs), 0)
+        self.assertEqual(len(encoder._seen_buckets), 0)
 
     def test_constructor_truncates_and_compiles_language_model(self):
         from sglang.multimodal_gen.runtime.models.encoders.flux3_text_encoder import (
