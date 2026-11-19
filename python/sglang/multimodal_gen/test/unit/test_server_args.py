@@ -44,6 +44,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config impo
 )
 from sglang.multimodal_gen.configs.pipeline_configs.mova import MOVAPipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
+    QwenImageEditPlus_2511_PipelineConfig,
     QwenImageLayeredPipelineConfig,
     QwenImagePipelineConfig,
 )
@@ -1240,6 +1241,27 @@ class TestDiffusionModelDetection(unittest.TestCase):
 
 
 class TestMiniMaxH3Routing(unittest.TestCase):
+    def test_quantized_fa_preserves_text_encoder_backend(self):
+        for components, roles in (
+            ({}, {}),
+            ({"text_encoder": "fa"}, {}),
+            ({}, {"text_encoder": {"self": "fa"}}),
+        ):
+            with (
+                self.subTest(components=components, roles=roles),
+                patch.object(current_platform, "is_npu", return_value=True),
+            ):
+                args = ServerArgs.__new__(ServerArgs)
+                args.pipeline_config = MiniMaxH3PipelineConfig()
+                args.ring_degree = 1
+                args.attention_backend = "fa"
+                args.attention_backend_config = {"precision": "fp8"}
+                args.component_attention_backends = dict(components)
+                args.component_attention_backend_roles = dict(roles)
+                args._adjust_attention_backend()
+                self.assertEqual(args.component_attention_backends, components)
+                self.assertEqual(args.component_attention_backend_roles, roles)
+
     def test_semantic_variants_map_to_checkpoint_partitions(self):
         self.assertEqual(
             MiniMaxH3Pipeline.model_subfolder_for_variant("fl2va"), "FL2VA"
@@ -2459,6 +2481,26 @@ class TestOffloadDefaults(_CudaPlatformTestCase):
 
                 self.assertEqual(args.residency_mode("transformer"), LAYERWISE_OFFLOAD)
                 self.assertEqual(args.layerwise_offload_components[0], "dit")
+
+    def test_auto_qwen_image_streams_a_dit_that_overflows_the_card(self):
+        """Flagless, every Qwen-Image-Edit-2511 request OOMed with 24 GiB free."""
+        for pipeline_config, model_path in (
+            (QwenImagePipelineConfig(), "Qwen/Qwen-Image"),
+            (QwenImageEditPlus_2511_PipelineConfig(), "Qwen/Qwen-Image-Edit-2511"),
+            (QwenImageLayeredPipelineConfig(), "Qwen/Qwen-Image-Layered"),
+        ):
+            for memory_gb in (24, 32):
+                with self.subTest(model_path=model_path, memory_gb=memory_gb):
+                    args = self._from_dict_with_pipeline_config(
+                        pipeline_config,
+                        memory_gb=memory_gb,
+                        dit_parameter_count=20_430_401_088,
+                        kwargs={"model_path": model_path, "performance_mode": "auto"},
+                    )
+
+                    self.assertEqual(
+                        args.residency_mode("transformer"), LAYERWISE_OFFLOAD
+                    )
 
     def test_auto_sizes_the_dit_at_the_precision_it_loads_in(self):
         # 16B parameters fit a 48 GB card in BF16 but not in FP32

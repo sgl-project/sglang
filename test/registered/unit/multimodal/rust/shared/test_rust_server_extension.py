@@ -393,7 +393,9 @@ def build_rust_frame_metadata_fixture() -> dict:
                 send_to_detokenizer=send_to_detokenizer,
                 tree_cache=None,
                 server_args=SimpleNamespace(
-                    enable_hierarchical_cache=False, enable_lmcache=False
+                    enable_hierarchical_cache=False,
+                    enable_lmcache=False,
+                    enable_unified_cache_external_linker=False,
                 ),
                 is_generation=True,
                 spec_algorithm=SpeculativeAlgorithm.EAGLE,
@@ -671,12 +673,6 @@ def launch_context(server_cls, cores=(None, None)):
             return_value=SimpleNamespace(
                 host="::", port=30000, warmups=None, api_key=None
             ),
-        ),
-        # No GC warning, no `--warmups`.
-        patch.object(
-            server_module,
-            "get_observability",
-            return_value=SimpleNamespace(gc_warning_threshold_secs=0.0),
         ),
         patch.object(
             server_module,
