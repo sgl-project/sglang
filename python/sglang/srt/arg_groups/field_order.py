@@ -561,8 +561,6 @@ POSITIONAL_FIELD_ORDER = (
     "allow_local_media_files",
     "layernorm_sp_min_tokens",
     "paged_experts_host_memory_gb",
-    "uniboost_gamma",
-    "enable_uniboost_gamma_ada",
     "_max_running_requests_explicitly_set",
     "hybrid_cache_checkpoints_level",
     "disaggregation_max_top_logprobs_num",
@@ -575,5 +573,7 @@ POSITIONAL_FIELD_ORDER = (
     "enable_dsa_fp4_indexer",
     "kda_dwdp_size",
     "weight_cache_transport",
+    "uniboost_gamma",
+    "enable_uniboost_gamma_ada",
 )
 # fmt: on
