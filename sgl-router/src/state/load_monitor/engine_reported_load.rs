@@ -81,8 +81,6 @@ pub struct RankLoad {
     pub num_tokens: u64,
     /// Requests running or waiting on the rank.
     pub num_reqs: u64,
-    /// KV token capacity of the rank; 0 when the publisher did not report it.
-    pub capacity: u64,
     /// When the router received the reading.
     pub at: Instant,
 }
@@ -606,7 +604,6 @@ impl EngineReportedLoadTable {
                     .as_ref()
                     .map_or(load.num_tokens, |native| native.num_total_tokens),
                 num_reqs: load.num_running_reqs.saturating_add(load.num_waiting_reqs),
-                capacity: load.max_total_num_tokens,
                 at: *at,
             };
             observed.insert(reading.rank, (reading, fresh));

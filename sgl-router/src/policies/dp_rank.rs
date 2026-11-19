@@ -14,16 +14,10 @@ use crate::state::load_monitor::engine_reported_load::RankLoad;
 use crate::workers::Worker;
 use sha2::{Digest, Sha256};
 
-/// Set on a rank's `rank_tokens` when its reported capacity cannot take the
-/// requests sent since the reading and one more at a typical size, so it
-/// ranks after every rank with room; among full ranks the expected KV in the
-/// low bits still orders, so one just over its cap beats one far over it.
-pub const NO_ROOM_BIT: u64 = 1 << 63;
-
 /// `rank_tokens` for [`select_dp_rank`]: the KV each rank is expected to
 /// hold, its committed tokens plus every request it holds, and every stamped
-/// request this router sent it since the reading, at a typical request's KV,
-/// with [`NO_ROOM_BIT`] set when one more would not fit. KV in use lags: a rank whose requests are all young holds
+/// request this router sent it since the reading, at a typical request's KV.
+/// KV in use lags: a rank whose requests are all young holds
 /// little now and the most later, so ranking by it herds. Charging each
 /// request its expected size ranks by where the rank is heading instead, and
 /// a request dispatched between two reports counts before the engine has seen
@@ -61,16 +55,10 @@ pub fn expected_rank_tokens(worker: &Worker, loads: &[RankLoad]) -> Vec<(u32, u6
         .map(|load| {
             let sent = worker.dp_rank_dispatched_since(load.rank, load.at) as u64;
             let held = load.num_reqs.saturating_add(sent);
-            let expected = load.num_tokens.saturating_add(held.saturating_mul(per_req));
-            let needed = load
-                .num_tokens
-                .saturating_add(sent.saturating_add(1).saturating_mul(per_req));
-            let tokens = if load.capacity > 0 && needed > load.capacity {
-                (expected & !NO_ROOM_BIT) | NO_ROOM_BIT
-            } else {
-                expected & !NO_ROOM_BIT
-            };
-            (load.rank, tokens)
+            (
+                load.rank,
+                load.num_tokens.saturating_add(held.saturating_mul(per_req)),
+            )
         })
         .collect()
 }
@@ -78,8 +66,7 @@ pub fn expected_rank_tokens(worker: &Worker, loads: &[RankLoad]) -> Vec<(u32, u6
 /// `None` for a single-rank worker. `prefix_depths` is `(rank, cached blocks)`;
 /// `rank_tokens` is `(rank, expected KV tokens)` from the engine's load feed, read
 /// only under `least_tokens`, and ignored unless it covers every candidate so a
-/// rank with no reading never looks idle; a rank without room ranks last
-/// ([`NO_ROOM_BIT`]).
+/// rank with no reading never looks idle.
 pub fn select_dp_rank(
     worker: &Worker,
     affinity_key: Option<&str>,
@@ -215,7 +202,6 @@ mod tests {
             rank,
             num_tokens,
             num_reqs,
-            capacity: 0,
             at,
         };
         let at = Instant::now();
@@ -255,57 +241,5 @@ mod tests {
         // its three queued requests count at the other rank's 1000 each.
         let loads = [reading(0, 0, 3, newer), reading(1, 5_000, 5, newer)];
         assert_eq!(expected_rank_tokens(&w, &loads), [(0, 3_000), (1, 10_000)]);
-    }
-
-    #[test]
-    fn a_rank_without_room_for_one_more_typical_request_ranks_last() {
-        let w = worker(2);
-        let at = Instant::now();
-        let reading = |rank, num_tokens, num_reqs, capacity| RankLoad {
-            rank,
-            num_tokens,
-            num_reqs,
-            capacity,
-            at,
-        };
-        // Typical request 500. Rank 0 is expected to hold the least by far,
-        // but has committed 39_800 of 40_000: one more request would not fit.
-        let loads = [reading(0, 39_800, 1, 40_000), reading(1, 4_000, 8, 40_000)];
-        let tokens = expected_rank_tokens(&w, &loads);
-        assert_eq!(tokens, [(0, 40_300 | NO_ROOM_BIT), (1, 8_000)]);
-        assert_eq!(select_dp_rank(&w, None, &[], &tokens, TOKENS), Some(1));
-        // Requests sent since the reading take their room first.
-        let loads = [reading(0, 4_000, 8, 40_000), reading(1, 38_500, 1, 40_000)];
-        let _sent = [1, 1, 1].map(|rank| w.dp_rank_timestamped_guard(rank));
-        assert_eq!(
-            expected_rank_tokens(&w, &loads),
-            [(0, 8_000), (1, 40_500 | NO_ROOM_BIT)]
-        );
-        // Every rank full, as under sustained overload: expected KV still
-        // orders them, ahead of the in-flight count. Typical request 4_100;
-        // rank 1 is over its cap by less and wins although it has three
-        // requests in flight.
-        drop(_sent);
-        let _busy = [1, 1, 1].map(|rank| w.dp_rank_guard(rank));
-        let loads = [
-            reading(0, 42_000, 10, 40_000),
-            reading(1, 41_000, 10, 40_000),
-        ];
-        let tokens = expected_rank_tokens(&w, &loads);
-        assert_eq!(
-            tokens,
-            [(0, 83_000 | NO_ROOM_BIT), (1, 82_000 | NO_ROOM_BIT)]
-        );
-        assert_eq!(select_dp_rank(&w, None, &[], &tokens, TOKENS), Some(1));
-        let loads = [
-            reading(0, 41_000, 10, 40_000),
-            reading(1, 42_000, 10, 40_000),
-        ];
-        let tokens = expected_rank_tokens(&w, &loads);
-        assert_eq!(select_dp_rank(&w, None, &[], &tokens, TOKENS), Some(0));
-        // An unreported capacity never marks a rank full.
-        drop(_busy);
-        let loads = [reading(0, 39_800, 1, 0), reading(1, 4_000, 8, 0)];
-        assert_eq!(expected_rank_tokens(&w, &loads), [(0, 40_300), (1, 8_000)]);
     }
 }
