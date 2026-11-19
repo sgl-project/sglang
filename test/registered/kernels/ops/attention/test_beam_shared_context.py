@@ -16,6 +16,7 @@
 
 import itertools
 import math
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -155,6 +156,17 @@ def _case(
         softmax_scale=softmax_scale,
         reference=reference,
     )
+
+
+def _spread(tensor, dim=0):
+    """The same values and shape, with twice the stride along `dim`."""
+    shape = list(tensor.shape)
+    shape[dim] *= 2
+    index = [slice(None)] * tensor.ndim
+    index[dim] = slice(None, None, 2)
+    view = torch.zeros(shape, dtype=tensor.dtype, device=tensor.device)[tuple(index)]
+    view.copy_(tensor)
+    return view
 
 
 def _run(kernel, case, **kwargs):
@@ -402,6 +414,104 @@ class TestBeamSharedContextAttention(CustomTestCase):
                     torch.testing.assert_close(
                         output.float(), expected.float(), rtol=1e-2, atol=1e-2
                     )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_plans_follow_the_strides(self):
+        """A launch plan is reused for equal shapes and strides only: the same shapes
+        at other strides, after a contiguous call, must not launch with its strides."""
+        case = _case({8: ([33, 70], [2, 1])})
+        bucket = case.buckets[0]
+        tail = (
+            bucket.context_slots,
+            bucket.context_cu_seqlens,
+            bucket.decode_slots,
+            bucket.decode_lens,
+        )
+        for module, kernel in (
+            (beam_shared_context_split_kv, shared_context_attention_split_kv),
+            (beam_shared_context_stream_k, shared_context_attention_stream_k),
+        ):
+            with self.subTest(kernel=kernel.__name__):
+                module._PLANS.clear()
+                for _ in range(2):
+                    output = kernel(
+                        case.q,
+                        case.k_buffer,
+                        case.v_buffer,
+                        bucket.row_indices,
+                        *tail,
+                        output=torch.full_like(case.q, SENTINEL),
+                        softmax_scale=case.softmax_scale,
+                    )
+                    torch.testing.assert_close(
+                        output.float(), case.reference, rtol=1e-2, atol=1e-2
+                    )
+                self.assertEqual(len(module._PLANS), 1)
+                output = kernel(
+                    _spread(case.q),
+                    _spread(case.k_buffer),
+                    _spread(case.v_buffer),
+                    _spread(bucket.row_indices, dim=1),
+                    *tail,
+                    output=_spread(torch.full_like(case.q, SENTINEL)),
+                    softmax_scale=case.softmax_scale,
+                )
+                torch.testing.assert_close(
+                    output.float(), case.reference, rtol=1e-2, atol=1e-2
+                )
+                self.assertEqual(len(module._PLANS), 2)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_launches_write_every_partial_they_read(self):
+        """Eager launches reuse their partial buffers without clearing them, so a
+        launch must write every partial it reads: NaNs left there must not show."""
+        from sglang.kernels.ops.attention.beam_shared_context import partial_buffers
+
+        case = _case({4: ([1, 70, 300], [2, 1, 2])})
+        launches = [
+            (shared_context_attention_split_kv, {"num_splits": n}) for n in (None, 3, 8)
+        ] + [
+            (shared_context_attention_stream_k, {"num_ctas": n})
+            for n in (None, 3, 7, 40, 200)
+        ]
+        for kernel, kwargs in launches:
+            with self.subTest(kernel=kernel.__name__, **kwargs):
+                # The first run sizes the kept buffers for this launch.
+                _run(kernel, case, **kwargs)
+                for buffer in partial_buffers(case.q.device, 1, 1):
+                    buffer.fill_(float("nan"))
+                output = _run(kernel, case, **kwargs)
+                torch.testing.assert_close(
+                    output.float(), case.reference, rtol=1e-2, atol=1e-2
+                )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_partial_buffers_are_kept_per_thread_and_stream(self):
+        """Eager launches of one thread on one stream reuse a pair of partial
+        buffers. Another thread or stream could write it between a launch's two
+        kernels, and a graph replays the pointers it captured: each gets its own."""
+        from sglang.kernels.ops.attention.beam_shared_context import partial_buffers
+
+        device = torch.device("cuda", torch.cuda.current_device())
+        eager = partial_buffers(device, 4096, 64)
+        self.assertEqual(
+            partial_buffers(device, 1024, 16)[0].data_ptr(), eager[0].data_ptr()
+        )
+        # `eager` and `others` stay alive, so equal pointers mean a shared pair.
+        others = []
+        thread = threading.Thread(
+            target=lambda: others.append(partial_buffers(device, 4096, 64))
+        )
+        thread.start()
+        thread.join()
+        for graph in (torch.cuda.CUDAGraph(), torch.cuda.CUDAGraph()):
+            with torch.cuda.graph(graph):
+                others.append(partial_buffers(device, 4096, 64))
+                others[-1][0].zero_()
+        with torch.cuda.stream(torch.cuda.Stream()):
+            others.append(partial_buffers(device, 4096, 64))
+        pointers = {buffers[0].data_ptr() for buffers in (eager, *others)}
+        self.assertEqual(len(pointers), 5)
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
     def test_forward_runs_the_selected_kernel(self):

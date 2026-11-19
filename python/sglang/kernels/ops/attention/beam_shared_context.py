@@ -13,14 +13,15 @@
 # ==============================================================================
 """Native Triton shared-context attention for wide beam decoding.
 
-The online-softmax steps, the input checks and the SM count are shared with the
-opt-in split-KV and stream-K kernels (beam_shared_context_split_kv.py and
-beam_shared_context_stream_k.py).
+The online-softmax steps, the input checks, the SM count, the launch-plan cache
+and the partial buffers are shared with the opt-in split-KV and stream-K kernels
+(beam_shared_context_split_kv.py and beam_shared_context_stream_k.py).
 """
 
 from __future__ import annotations
 
 import functools
+import threading
 from typing import Callable
 
 import torch
@@ -305,6 +306,97 @@ def wave_ctas(
         wave = num_sms(device_index) * resident_ctas_per_sm(compile_kernel())
         _WAVE_CTAS[key] = wave
     return wave
+
+
+def launch_plan_key(
+    q: torch.Tensor,
+    k_buffer: torch.Tensor,
+    v_buffer: torch.Tensor,
+    row_indices: torch.Tensor,
+    context_cu_seqlens: torch.Tensor,
+    decode_slots: torch.Tensor,
+    decode_lens: torch.Tensor,
+    output: torch.Tensor,
+) -> tuple:
+    """All that the input checks and a launch plan read: equal keys share a plan."""
+    return (
+        q.shape,
+        q.stride(),
+        q.dtype,
+        q.device.index,
+        k_buffer.shape,
+        k_buffer.stride(),
+        k_buffer.dtype,
+        v_buffer.shape,
+        v_buffer.stride(),
+        row_indices.shape,
+        row_indices.stride(),
+        context_cu_seqlens.shape,
+        decode_slots.shape,
+        decode_slots.stride(),
+        decode_lens.shape,
+        output.shape,
+        output.stride(),
+    )
+
+
+# Arbitrary. The decode capacity is part of the key, so each step of a long
+# generation adds a plan; a full cache starts over.
+_MAX_PLANS = 256
+
+
+def remember_plan(plans: dict, key: tuple, plan):
+    if len(plans) >= _MAX_PLANS:
+        plans.clear()
+    plans[key] = plan
+    return plan
+
+
+class _KeptPartials(threading.local):
+    """Each thread's kept pair per device: (stream, partial outputs, log-sum-exps)."""
+
+    def __init__(self):
+        self.by_device: dict[int, tuple[int, torch.Tensor, torch.Tensor]] = {}
+
+
+_KEPT_PARTIALS = _KeptPartials()
+
+
+def partial_buffers(
+    device: torch.device,
+    output_numel: int,  # fp32 elements of the launch's partial outputs
+    lse_numel: int,  # fp32 elements of its partial log-sum-exps
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Flat fp32 workspaces for a launch's partials, kept between eager launches.
+
+    A thread's launches on one stream run in order, so each launch reads its
+    partials before the next one writes them: a thread keeps one pair per device,
+    as large as the largest launch so far on the pair's stream, and replaces it
+    when its current stream changes. The contents are undefined.
+    """
+    if torch.cuda.is_current_stream_capturing():
+        # A graph replays the pointers it captured, so it must own its buffers.
+        return (
+            torch.empty(output_numel, dtype=torch.float32, device=device),
+            torch.empty(lse_numel, dtype=torch.float32, device=device),
+        )
+    stream = triton.runtime.driver.active.get_current_stream(device.index)
+    kept = _KEPT_PARTIALS.by_device.get(device.index)
+    if kept is not None and kept[0] == stream:
+        if kept[1].numel() >= output_numel and kept[2].numel() >= lse_numel:
+            return kept[1], kept[2]
+        output_numel = max(output_numel, kept[1].numel())
+        lse_numel = max(lse_numel, kept[2].numel())
+    # Release the old pair first. Its queued launches stay safe: PyTorch gives a
+    # freed block only to the stream it was allocated on.
+    kept = None
+    _KEPT_PARTIALS.by_device.pop(device.index, None)
+    kept = _KEPT_PARTIALS.by_device[device.index] = (
+        stream,
+        torch.empty(output_numel, dtype=torch.float32, device=device),
+        torch.empty(lse_numel, dtype=torch.float32, device=device),
+    )
+    return kept[1], kept[2]
 
 
 def check_shared_context_inputs(

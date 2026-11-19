@@ -26,6 +26,7 @@ from __future__ import annotations
 
 from typing import Optional
 
+import msgspec
 import torch
 import triton
 import triton.language as tl
@@ -35,7 +36,10 @@ from sglang.kernels.ops.attention.beam_shared_context import (
     attend_prompt_block,
     check_shared_context_inputs,
     empty_softmax_state,
+    launch_plan_key,
     max_element_offset,
+    partial_buffers,
+    remember_plan,
     wave_ctas,
 )
 
@@ -342,27 +346,35 @@ def num_kv_splits(
     return best_splits
 
 
-def shared_context_attention_split_kv(
-    q: torch.Tensor,  # [rows, q_heads, head_dim]
-    k_buffer: torch.Tensor,  # [kv_slots, kv_heads, head_dim], the layer's K cache
-    v_buffer: torch.Tensor,  # [kv_slots, kv_heads, head_dim], the layer's V cache
-    row_indices: torch.Tensor,  # [groups, beam_width] int32, each beam's row of q
-    context_slots: torch.Tensor,  # [>= total prompt tokens] int32 KV slots
-    context_cu_seqlens: torch.Tensor,  # [groups + 1] int32 offsets into context_slots
-    decode_slots: torch.Tensor,  # [groups, capacity * beam_width] int32, step-major
-    decode_lens: torch.Tensor,  # [groups] int32, decode steps per group
-    *,
-    output: torch.Tensor | None = None,  # like q; allocated when None
-    softmax_scale: float,  # scales q.k before the softmax
-    num_splits: Optional[int] = None,  # prompt splits; None picks num_kv_splits
-) -> torch.Tensor:
-    """Shared prompt and per-beam suffix attention, split along the prompt.
+class _Plan(msgspec.Struct, frozen=True):
+    # The part of a call fixed by `launch_plan_key` and the split count asked for.
+    grid: tuple[int, int, int]
+    args: tuple  # the kernel's arguments after softmax_scale: split count, strides
+    constexprs: dict
+    partial_numel: int  # fp32 elements of the partial outputs; 0 with one split
+    lse_numel: int  # fp32 elements of the partial log-sum-exps
+    merge_grid: tuple[int]
+    merge_args: tuple  # the merge kernel's arguments after output
+    merge_constexprs: dict
 
-    Same contract as `shared_context_attention`: `row_indices` [groups, beam_width]
-    maps each beam to its row of Q and of the output, and `decode_slots` is
-    [groups, capacity * beam_width], step-major. Only those rows are written.
-    """
-    output = check_shared_context_inputs(
+
+_PLANS: dict[tuple, _Plan] = {}
+
+
+def _make_plan(
+    q: torch.Tensor,
+    k_buffer: torch.Tensor,
+    v_buffer: torch.Tensor,
+    row_indices: torch.Tensor,
+    context_slots: torch.Tensor,
+    context_cu_seqlens: torch.Tensor,
+    decode_slots: torch.Tensor,
+    decode_lens: torch.Tensor,
+    output: torch.Tensor,
+    softmax_scale: float,
+    num_splits: Optional[int],
+) -> _Plan:
+    check_shared_context_inputs(
         q,
         k_buffer,
         v_buffer,
@@ -397,50 +409,48 @@ def shared_context_attention_split_kv(
         num_warps=_NUM_WARPS,
         num_stages=_NUM_STAGES,
     )
-
-    def kernel_args(partial_output, partial_lse, splits, partial_strides):
-        return (
-            q,
-            k_buffer,
-            v_buffer,
-            row_indices,
-            context_slots,
-            context_cu_seqlens,
-            decode_slots,
-            decode_lens,
-            output,
-            partial_output,
-            partial_lse,
-            softmax_scale,
-            splits,
-            q.stride(0),
-            q.stride(1),
-            row_indices.stride(0),
-            row_indices.stride(1),
-            k_buffer.stride(0),
-            k_buffer.stride(1),
-            v_buffer.stride(0),
-            v_buffer.stride(1),
-            decode_slots.stride(0),
-            output.stride(0),
-            output.stride(1),
-            *partial_strides,
-        )
+    strides = (
+        q.stride(0),
+        q.stride(1),
+        row_indices.stride(0),
+        row_indices.stride(1),
+        k_buffer.stride(0),
+        k_buffer.stride(1),
+        v_buffer.stride(0),
+        v_buffer.stride(1),
+        decode_slots.stride(0),
+        output.stride(0),
+        output.stride(1),
+    )
+    # The partials are contiguous: [splits, rows, q_heads, head_dim] and
+    # [splits, rows, q_heads].
+    partial_strides = (rows * q_heads * head_dim, q_heads * head_dim, head_dim) + (
+        rows * q_heads,
+        q_heads,
+    )
 
     if num_splits is None:
         # Any split count above 1 compiles to the same kernel: probe it with the
-        # partials' dtype and contiguous strides, before they are allocated.
+        # partials' dtype, before they are allocated.
         wave = wave_ctas(
             key=("split_kv", q.device.index, q.dtype, k_buffer.dtype)
             + tuple(sorted(constexprs.items())),
             compile_kernel=lambda: _shared_context_split_kv_kernel.warmup(
-                *kernel_args(
-                    torch.float32,
-                    torch.float32,
-                    2,
-                    (rows * q_heads * head_dim, q_heads * head_dim, head_dim)
-                    + (rows * q_heads, q_heads),
-                ),
+                q,
+                k_buffer,
+                v_buffer,
+                row_indices,
+                context_slots,
+                context_cu_seqlens,
+                decode_slots,
+                decode_lens,
+                output,
+                torch.float32,
+                torch.float32,
+                softmax_scale,
+                2,
+                *strides,
+                *partial_strides,
                 WRITE_PARTIALS=True,
                 grid=(1,),
                 **constexprs,
@@ -451,51 +461,118 @@ def shared_context_attention_split_kv(
     if max(q.numel(), num_splits * rows * q_heads * head_dim) >= _MAX_OFFSET:
         raise ValueError("Q and the split partials must have fewer than 2^31 elements")
     write_partials = num_splits > 1
-    if write_partials:
-        partial_output = torch.empty(
-            (num_splits, rows, q_heads, head_dim),
-            dtype=torch.float32,
-            device=q.device,
-        )
-        partial_lse = torch.empty(
-            (num_splits, rows, q_heads),
-            dtype=torch.float32,
-            device=q.device,
-        )
-    else:
-        partial_output = partial_lse = output.new_empty((1, 1, 1))
-
-    _shared_context_split_kv_kernel[(num_groups * num_splits, q_heads, beam_blocks)](
-        *kernel_args(
-            partial_output,
-            partial_lse,
+    if not write_partials:
+        # Unread with one split; Triton compiles strides of 1 in as constants.
+        partial_strides = (1, 1, 1, 1, 1)
+    return _Plan(
+        grid=(num_groups * num_splits, q_heads, beam_blocks),
+        args=(num_splits, *strides, *partial_strides),
+        constexprs=dict(WRITE_PARTIALS=write_partials, **constexprs),
+        partial_numel=num_splits * rows * q_heads * head_dim * write_partials,
+        lse_numel=num_splits * rows * q_heads * write_partials,
+        merge_grid=(rows,),
+        merge_args=(
             num_splits,
-            partial_output.stride()[:3] + partial_lse.stride()[:2],
-        ),
-        WRITE_PARTIALS=write_partials,
-        **constexprs,
-    )
-    if write_partials:
-        _merge_splits_kernel[(num_groups * beam_width,)](
-            partial_output,
-            partial_lse,
-            row_indices,
-            output,
-            num_splits,
-            partial_output.stride(0),
-            partial_output.stride(1),
-            partial_output.stride(2),
-            partial_lse.stride(0),
-            partial_lse.stride(1),
+            *partial_strides,
             row_indices.stride(0),
             row_indices.stride(1),
             output.stride(0),
             output.stride(1),
+        ),
+        merge_constexprs=dict(
             BEAM_WIDTH=beam_width,
             Q_HEADS=q_heads,
             HEAD_DIM=head_dim,
             BLOCK_H=triton.next_power_of_2(q_heads),
             BLOCK_D=block_d,
             num_warps=4,
+        ),
+    )
+
+
+def shared_context_attention_split_kv(
+    q: torch.Tensor,  # [rows, q_heads, head_dim]
+    k_buffer: torch.Tensor,  # [kv_slots, kv_heads, head_dim], the layer's K cache
+    v_buffer: torch.Tensor,  # [kv_slots, kv_heads, head_dim], the layer's V cache
+    row_indices: torch.Tensor,  # [groups, beam_width] int32, each beam's row of q
+    context_slots: torch.Tensor,  # [>= total prompt tokens] int32 KV slots
+    context_cu_seqlens: torch.Tensor,  # [groups + 1] int32 offsets into context_slots
+    decode_slots: torch.Tensor,  # [groups, capacity * beam_width] int32, step-major
+    decode_lens: torch.Tensor,  # [groups] int32, decode steps per group
+    *,
+    output: torch.Tensor | None = None,  # like q; allocated when None
+    softmax_scale: float,  # scales q.k before the softmax
+    num_splits: Optional[int] = None,  # prompt splits; None picks num_kv_splits
+) -> torch.Tensor:
+    """Shared prompt and per-beam suffix attention, split along the prompt.
+
+    Same contract as `shared_context_attention`: `row_indices` [groups, beam_width]
+    maps each beam to its row of Q and of the output, and `decode_slots` is
+    [groups, capacity * beam_width], step-major. Only those rows are written.
+    """
+    if output is None:
+        output = torch.empty_like(q)
+    # The checks and the plan repeat for every layer of a decode step.
+    key = launch_plan_key(
+        q,
+        k_buffer,
+        v_buffer,
+        row_indices,
+        context_cu_seqlens,
+        decode_slots,
+        decode_lens,
+        output,
+    ) + (num_splits,)
+    plan = _PLANS.get(key)
+    if plan is None:
+        plan = remember_plan(
+            _PLANS,
+            key,
+            _make_plan(
+                q,
+                k_buffer,
+                v_buffer,
+                row_indices,
+                context_slots,
+                context_cu_seqlens,
+                decode_slots,
+                decode_lens,
+                output,
+                softmax_scale,
+                num_splits,
+            ),
+        )
+    if plan.partial_numel:
+        partial_output, partial_lse = partial_buffers(
+            q.device, plan.partial_numel, plan.lse_numel
+        )
+    else:
+        # Unread with one split, which writes the output itself.
+        partial_output = partial_lse = output
+
+    _shared_context_split_kv_kernel[plan.grid](
+        q,
+        k_buffer,
+        v_buffer,
+        row_indices,
+        context_slots,
+        context_cu_seqlens,
+        decode_slots,
+        decode_lens,
+        output,
+        partial_output,
+        partial_lse,
+        softmax_scale,
+        *plan.args,
+        **plan.constexprs,
+    )
+    if plan.partial_numel:
+        _merge_splits_kernel[plan.merge_grid](
+            partial_output,
+            partial_lse,
+            row_indices,
+            output,
+            *plan.merge_args,
+            **plan.merge_constexprs,
         )
     return output

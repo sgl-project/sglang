@@ -34,6 +34,7 @@ from __future__ import annotations
 
 from typing import Optional
 
+import msgspec
 import torch
 import triton
 import triton.language as tl
@@ -43,8 +44,11 @@ from sglang.kernels.ops.attention.beam_shared_context import (
     attend_prompt_block,
     check_shared_context_inputs,
     empty_softmax_state,
+    launch_plan_key,
     max_element_offset,
     num_sms,
+    partial_buffers,
+    remember_plan,
     wave_ctas,
 )
 
@@ -462,29 +466,38 @@ def _merge_segments_kernel(
         )
 
 
-def shared_context_attention_stream_k(
-    q: torch.Tensor,  # [rows, q_heads, head_dim]
-    k_buffer: torch.Tensor,  # [kv_slots, kv_heads, head_dim], the layer's K cache
-    v_buffer: torch.Tensor,  # [kv_slots, kv_heads, head_dim], the layer's V cache
-    row_indices: torch.Tensor,  # [groups, beam_width] int32, each beam's row of q
-    context_slots: torch.Tensor,  # [>= total prompt tokens] int32 KV slots
-    context_cu_seqlens: torch.Tensor,  # [groups + 1] int32 offsets into context_slots
-    decode_slots: torch.Tensor,  # [groups, capacity * beam_width] int32, step-major
-    decode_lens: torch.Tensor,  # [groups] int32, decode steps per group
-    *,
-    output: torch.Tensor | None = None,  # like q; allocated when None
-    softmax_scale: float,  # scales q.k before the softmax
-    num_ctas: Optional[int] = None,  # persistent grid size
-) -> torch.Tensor:
-    """Shared prompt and per-beam suffix attention on a persistent stream-K grid.
+class _Plan(msgspec.Struct, frozen=True):
+    # The part of a call fixed by `launch_plan_key` and the CTA count asked for.
+    num_ctas: int
+    args: tuple  # the kernel's arguments after softmax_scale: groups, CTAs, strides
+    constexprs: dict
+    partial_numel: int  # fp32 elements of the partial outputs
+    lse_numel: int  # fp32 elements of the partial log-sum-exps
+    merge_grid: tuple[int, int]
+    merge_args: tuple  # the merge kernel's arguments after decode_lens
+    merge_constexprs: dict
+    tiles_per_group: int
+    # Work units of the groups' setup and decode capacity: all but the prompts'.
+    max_units_without_prompts: int
 
-    Same contract as `shared_context_attention`: `row_indices` [groups, beam_width]
-    maps each beam to its row of Q and of the output, and `decode_slots` is
-    [groups, capacity * beam_width], step-major. Only those rows are written.
-    Every group needs a prompt token or a decode step; the output of a group with
-    neither is undefined. `num_ctas` defaults to the CTAs the GPU holds at once.
-    """
-    output = check_shared_context_inputs(
+
+_PLANS: dict[tuple, _Plan] = {}
+
+
+def _make_plan(
+    q: torch.Tensor,
+    k_buffer: torch.Tensor,
+    v_buffer: torch.Tensor,
+    row_indices: torch.Tensor,
+    context_slots: torch.Tensor,
+    context_cu_seqlens: torch.Tensor,
+    decode_slots: torch.Tensor,
+    decode_lens: torch.Tensor,
+    output: torch.Tensor,
+    softmax_scale: float,
+    num_ctas: Optional[int],
+) -> _Plan:
+    check_shared_context_inputs(
         q,
         k_buffer,
         v_buffer,
@@ -525,35 +538,19 @@ def shared_context_attention_stream_k(
         num_warps=_NUM_WARPS,
         num_stages=_NUM_STAGES,
     )
-
-    def kernel_args(partial_output, partial_lse, ctas):
-        return (
-            q,
-            k_buffer,
-            v_buffer,
-            row_indices,
-            context_slots,
-            context_cu_seqlens,
-            decode_slots,
-            decode_lens,
-            output,
-            partial_output,
-            partial_lse,
-            softmax_scale,
-            num_groups,
-            ctas,
-            q.stride(0),
-            q.stride(1),
-            row_indices.stride(0),
-            row_indices.stride(1),
-            k_buffer.stride(0),
-            k_buffer.stride(1),
-            v_buffer.stride(0),
-            v_buffer.stride(1),
-            decode_slots.stride(0),
-            output.stride(0),
-            output.stride(1),
-        )
+    strides = (
+        q.stride(0),
+        q.stride(1),
+        row_indices.stride(0),
+        row_indices.stride(1),
+        k_buffer.stride(0),
+        k_buffer.stride(1),
+        v_buffer.stride(0),
+        v_buffer.stride(1),
+        decode_slots.stride(0),
+        output.stride(0),
+        output.stride(1),
+    )
 
     if num_ctas is None:
         # Persistent: one full wave. The probe passes the partials' dtype before they
@@ -562,67 +559,154 @@ def shared_context_attention_stream_k(
             key=("stream_k", q.device.index, q.dtype, k_buffer.dtype)
             + tuple(sorted(constexprs.items())),
             compile_kernel=lambda: _shared_context_stream_k_kernel.warmup(
-                *kernel_args(torch.float32, torch.float32, num_sms(q.device.index)),
+                q,
+                k_buffer,
+                v_buffer,
+                row_indices,
+                context_slots,
+                context_cu_seqlens,
+                decode_slots,
+                decode_lens,
+                output,
+                torch.float32,
+                torch.float32,
+                softmax_scale,
+                num_groups,
+                num_sms(q.device.index),
+                *strides,
                 grid=(1,),
                 **constexprs,
             ),
             device_index=q.device.index,
         )
     num_tiles = num_groups * q_heads * beam_blocks
-    # Unit counts are bounded by the static slot capacities, which CUDA graphs fix.
-    decode_capacity = decode_slots.shape[1] // beam_width
-    max_units = (
-        q_heads
-        * beam_blocks
-        * (
-            num_groups * (_SETUP_UNITS + 1 + decode_capacity)
-            + triton.cdiv(context_slots.numel(), _BLOCK_N)
-        )
-    )
-    if (max_units + 1) * num_ctas >= _MAX_OFFSET:
-        raise ValueError(
-            f"Up to {max_units} work units on {num_ctas} CTAs overflow 32-bit unit offsets"
-        )
     if (num_tiles + num_ctas) * _BLOCK_M * head_dim >= _MAX_OFFSET:
         raise ValueError("The stream-K partials must have fewer than 2^31 elements")
-    # One partial row per (tile, CTA) segment: partial_idx = tile + cta < tiles + CTAs.
-    partial_output = torch.empty(
-        (num_tiles + num_ctas, _BLOCK_M, head_dim),
-        dtype=torch.float32,
-        device=q.device,
-    )
-    partial_lse = torch.empty(
-        (num_tiles + num_ctas, _BLOCK_M),
-        dtype=torch.float32,
-        device=q.device,
+    decode_capacity = decode_slots.shape[1] // beam_width
+    return _Plan(
+        num_ctas=num_ctas,
+        args=(num_groups, num_ctas, *strides),
+        constexprs=constexprs,
+        # One partial row per (tile, CTA) segment: partial_idx = tile + cta < tiles + CTAs.
+        partial_numel=(num_tiles + num_ctas) * _BLOCK_M * head_dim,
+        lse_numel=(num_tiles + num_ctas) * _BLOCK_M,
+        merge_grid=(num_tiles, triton.cdiv(_BLOCK_M, _MERGE_ROWS)),
+        merge_args=(
+            num_groups,
+            num_ctas,
+            row_indices.stride(0),
+            row_indices.stride(1),
+            output.stride(0),
+            output.stride(1),
+        ),
+        merge_constexprs=dict(
+            BEAM_WIDTH=beam_width,
+            Q_HEADS=q_heads,
+            BEAM_BLOCKS=beam_blocks,
+            HEAD_DIM=head_dim,
+            BLOCK_M=_BLOCK_M,
+            BLOCK_N=_BLOCK_N,
+            BLOCK_D=block_d,
+            SETUP_UNITS=_SETUP_UNITS,
+            MERGE_ROWS=_MERGE_ROWS,
+            num_warps=4,
+        ),
+        tiles_per_group=q_heads * beam_blocks,
+        max_units_without_prompts=num_tiles * (_SETUP_UNITS + 1 + decode_capacity),
     )
 
-    _shared_context_stream_k_kernel[(num_ctas,)](
-        *kernel_args(partial_output, partial_lse, num_ctas),
-        **constexprs,
+
+def shared_context_attention_stream_k(
+    q: torch.Tensor,  # [rows, q_heads, head_dim]
+    k_buffer: torch.Tensor,  # [kv_slots, kv_heads, head_dim], the layer's K cache
+    v_buffer: torch.Tensor,  # [kv_slots, kv_heads, head_dim], the layer's V cache
+    row_indices: torch.Tensor,  # [groups, beam_width] int32, each beam's row of q
+    context_slots: torch.Tensor,  # [>= total prompt tokens] int32 KV slots
+    context_cu_seqlens: torch.Tensor,  # [groups + 1] int32 offsets into context_slots
+    decode_slots: torch.Tensor,  # [groups, capacity * beam_width] int32, step-major
+    decode_lens: torch.Tensor,  # [groups] int32, decode steps per group
+    *,
+    output: torch.Tensor | None = None,  # like q; allocated when None
+    softmax_scale: float,  # scales q.k before the softmax
+    num_ctas: Optional[int] = None,  # persistent grid size
+) -> torch.Tensor:
+    """Shared prompt and per-beam suffix attention on a persistent stream-K grid.
+
+    Same contract as `shared_context_attention`: `row_indices` [groups, beam_width]
+    maps each beam to its row of Q and of the output, and `decode_slots` is
+    [groups, capacity * beam_width], step-major. Only those rows are written.
+    Every group needs a prompt token or a decode step; the output of a group with
+    neither is undefined. `num_ctas` defaults to the CTAs the GPU holds at once.
+    """
+    if output is None:
+        output = torch.empty_like(q)
+    # The checks and the plan repeat for every layer of a decode step.
+    key = launch_plan_key(
+        q,
+        k_buffer,
+        v_buffer,
+        row_indices,
+        context_cu_seqlens,
+        decode_slots,
+        decode_lens,
+        output,
+    ) + (num_ctas,)
+    plan = _PLANS.get(key)
+    if plan is None:
+        plan = remember_plan(
+            _PLANS,
+            key,
+            _make_plan(
+                q,
+                k_buffer,
+                v_buffer,
+                row_indices,
+                context_slots,
+                context_cu_seqlens,
+                decode_slots,
+                decode_lens,
+                output,
+                softmax_scale,
+                num_ctas,
+            ),
+        )
+    # Unit counts are bounded by the static slot capacities, which CUDA graphs fix.
+    # The prompt capacity is not part of the plan's key: it changes with every batch.
+    max_units = plan.max_units_without_prompts + plan.tiles_per_group * triton.cdiv(
+        context_slots.numel(), _BLOCK_N
     )
-    _merge_segments_kernel[(num_tiles, triton.cdiv(_BLOCK_M, _MERGE_ROWS))](
+    if (max_units + 1) * plan.num_ctas >= _MAX_OFFSET:
+        raise ValueError(
+            f"Up to {max_units} work units on {plan.num_ctas} CTAs overflow 32-bit unit offsets"
+        )
+    partial_output, partial_lse = partial_buffers(
+        q.device, plan.partial_numel, plan.lse_numel
+    )
+
+    _shared_context_stream_k_kernel[(plan.num_ctas,)](
+        q,
+        k_buffer,
+        v_buffer,
+        row_indices,
+        context_slots,
+        context_cu_seqlens,
+        decode_slots,
+        decode_lens,
+        output,
+        partial_output,
+        partial_lse,
+        softmax_scale,
+        *plan.args,
+        **plan.constexprs,
+    )
+    _merge_segments_kernel[plan.merge_grid](
         partial_output,
         partial_lse,
         row_indices,
         output,
         context_cu_seqlens,
         decode_lens,
-        num_groups,
-        num_ctas,
-        row_indices.stride(0),
-        row_indices.stride(1),
-        output.stride(0),
-        output.stride(1),
-        BEAM_WIDTH=beam_width,
-        Q_HEADS=q_heads,
-        BEAM_BLOCKS=beam_blocks,
-        HEAD_DIM=head_dim,
-        BLOCK_M=_BLOCK_M,
-        BLOCK_N=_BLOCK_N,
-        BLOCK_D=block_d,
-        SETUP_UNITS=_SETUP_UNITS,
-        MERGE_ROWS=_MERGE_ROWS,
-        num_warps=4,
+        *plan.merge_args,
+        **plan.merge_constexprs,
     )
     return output
