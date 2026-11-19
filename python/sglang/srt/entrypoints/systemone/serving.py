@@ -13,10 +13,9 @@ from urllib.parse import unquote, urlparse
 
 import orjson
 import pybase64
-from fastapi import HTTPException, Request
+from fastapi import Request
 from fastapi.responses import ORJSONResponse
 from PIL import Image
-from pydantic import ValidationError
 
 from sglang.srt.entrypoints.openai.serving_decisions import (
     EncodedQuestion,
@@ -36,7 +35,6 @@ from sglang.srt.entrypoints.systemone.joint_schema import (
 )
 from sglang.srt.entrypoints.systemone.kev import encode_kev
 from sglang.srt.entrypoints.systemone.protocol import (
-    NemotronDecisionRequest,
     SystemOneChoiceAnswer,
     SystemOneChoiceQuestion,
     SystemOneNoulAnswer,
@@ -83,13 +81,6 @@ class SystemOneServing(OpenAIServingDecisions):
         return "systemone-"
 
     def _validate_request(self, request: SystemOneRequest) -> Optional[str]:
-        if self.question_encoder is None and isinstance(
-            request, NemotronDecisionRequest
-        ):
-            try:
-                SystemOneRequest.model_validate(request.model_dump())
-            except ValidationError as error:
-                raise HTTPException(status_code=422, detail=str(error)) from error
         if self.joint_head_config is not None or self.pointer_head is not None:
             return self._validate_joint_schema_request(request)
         if self.question_encoder is not None:

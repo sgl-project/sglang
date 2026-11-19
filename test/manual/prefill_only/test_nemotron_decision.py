@@ -6,15 +6,12 @@ from concurrent.futures import ThreadPoolExecutor
 import requests
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
 )
-
-register_cuda_ci(est_time=180, stage="base-b", runner_config="1-gpu-large")
 
 MODEL = "nvidia/NVIDIA-Nemotron-3.5-Decision-8B-BF16"
 REVISION = "40c36c022455a731f1226594108dac296098102f"
@@ -38,10 +35,6 @@ CASES = (
 )
 
 
-@unittest.skipUnless(
-    os.environ.get("NEMOTRON_DECISION_MODEL_PATH"),
-    "Set NEMOTRON_DECISION_MODEL_PATH to an accessible Decision BF16 checkpoint",
-)
 class TestNemotronDecisionServing(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -50,7 +43,7 @@ class TestNemotronDecisionServing(CustomTestCase):
         cls.process = None
         if "NEMOTRON_DECISION_TEST_URL" not in os.environ:
             cls.process = popen_launch_server(
-                os.environ["NEMOTRON_DECISION_MODEL_PATH"],
+                os.environ.get("NEMOTRON_DECISION_MODEL_PATH", MODEL),
                 cls.url,
                 timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
                 other_args=[

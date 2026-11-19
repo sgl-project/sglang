@@ -18,7 +18,7 @@ from sglang.srt.entrypoints.systemone.nemotron_decide import NemotronDecideEncod
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 
 class TestNemotronDecisionEncoding(CustomTestCase):
@@ -239,47 +239,83 @@ class TestNemotronDecisionEncoding(CustomTestCase):
             with self.assertRaisesRegex(ValueError, "max_questions"):
                 load_nemotron_decision_config(path, None)
 
-    def test_expanded_score_schema_preserves_other_models_limits(self):
-        from fastapi import HTTPException
+    def test_http_schema_selection_preserves_errors_and_extra_field_policy(self):
+        from fastapi import FastAPI
+        from fastapi.exceptions import RequestValidationError
+        from fastapi.testclient import TestClient
 
-        from sglang.srt.entrypoints.systemone.protocol import NemotronDecisionRequest
-        from sglang.srt.entrypoints.systemone.serving import SystemOneServing
-
-        handler = object.__new__(SystemOneServing)
-        handler.joint_head_config = None
-        handler.pointer_head = None
-        handler._validate_server = lambda model: None
-        handler._validate_images = lambda images: None
-        handler._validate_reasoning = lambda kwargs: None
-        self.metadata["labels"]["score"] = list("ABCDEFGHIJKLM")
-        self.metadata["max_candidates_per_read"] = 13
-        handler.question_encoder = NemotronDecideEncoder(
-            config=self.config,
-            metadata=self.metadata,
-            tokenizer=self.tokenizer,
-            max_prompt_tokens=4096,
+        from sglang.srt.entrypoints.http_server import (
+            systemone_decisions,
+            validation_exception_handler,
         )
-        payload = dict(
-            model="test",
-            state="rating",
-            questions={
-                "q": dict(
-                    type="score",
-                    instructions="Rate it",
-                    criteria=list(map(str, range(11))),
+        from sglang.srt.entrypoints.openai.chat_encoding_adapters import (
+            OPENAI_CHAT_WIRE,
+        )
+
+        async def handle(request, raw_request):
+            return request.model_dump()
+
+        for native in (False, True):
+            app = FastAPI()
+            app.add_exception_handler(
+                RequestValidationError, validation_exception_handler
+            )
+            serving = SimpleNamespace(
+                question_encoder=self.encoder if native else None, handle_request=handle
+            )
+            app.state.systemone_serving = serving
+            app.state.openai_serving_chat = SimpleNamespace(chat_wire=OPENAI_CHAT_WIRE)
+            app.add_api_route("/v1/systemone", systemone_decisions, methods=["POST"])
+            with TestClient(app) as client:
+                response = client.post(
+                    "/v1/systemone", json={"model": "test", "state": "s"}
                 )
-            },
-        )
-        request = NemotronDecisionRequest.model_validate(payload)
-        self.assertIsNone(handler._validate_request(request))
-        handler.question_encoder = None
-        with self.assertRaises(HTTPException) as error:
-            handler._validate_request(request)
-        self.assertEqual(error.exception.status_code, 422)
-        payload["questions"]["q"]["criteria"] = ["low", "high"]
-        self.assertIsNone(
-            handler._validate_request(NemotronDecisionRequest.model_validate(payload))
-        )
+                self.assertEqual(response.status_code, 422)
+                self.assertEqual(len(response.json()["detail"]), 1)
+                self.assertEqual(
+                    response.json()["detail"][0]["loc"], ["body", "questions"]
+                )
+                for count in (100, 300):
+                    payload = {
+                        "model": "test",
+                        "state": "s",
+                        "questions": {
+                            "q": {
+                                "type": "choice",
+                                "instructions": "Which?",
+                                "criteria": {str(i): str(i) for i in range(count)},
+                            }
+                        },
+                    }
+                    valid = client.post("/v1/systemone", json=payload)
+                    self.assertEqual(
+                        valid.status_code, 200 if native or count == 100 else 422
+                    )
+                    response = client.post(
+                        "/v1/systemone", json={**payload, "extra": True}
+                    )
+                    self.assertEqual(
+                        response.status_code, 422 if native or count == 300 else 200
+                    )
+                score = {
+                    "model": "test",
+                    "state": "s",
+                    "questions": {
+                        "q": {
+                            "type": "score",
+                            "instructions": "Rate it",
+                            "criteria": list(map(str, range(11))),
+                        }
+                    },
+                }
+                response = client.post("/v1/systemone", json=score)
+                self.assertEqual(response.status_code, 200 if native else 422)
+                schema = client.get("/openapi.json").json()
+                for route in ("/v1/systemone",):
+                    body = schema["paths"][route]["post"]["requestBody"]["content"][
+                        "application/json"
+                    ]["schema"]
+                    self.assertNotIn("anyOf", body)
 
 
 if __name__ == "__main__":

@@ -22,8 +22,8 @@ Other chat models are served when the answer labels are single tokens at the ans
 
 [NVIDIA-Nemotron-3.5-Decision-8B-BF16](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Decision-8B-BF16)
 uses a trained prompt and fully bidirectional attention. Serve it through
-`/v1/systemone`. The default prefill budget is 32K tokens, bounded by the
-configured context and checkpoint input limit. Set `--max-prefill-tokens` to
+`/v1/systemone`. The default prefill budget is 32K tokens (16K on GPUs below
+60 GiB), bounded by the configured context and checkpoint input limit. Set `--max-prefill-tokens` to
 change that budget.
 
 ```bash Command
@@ -60,7 +60,7 @@ print(response.json())
 
 The server reads the checkpoint's `decision.json` and `decision_template.jinja`
 for answer labels, prompt formatting, calibration temperatures and request
-limits. Options retain their input order. The BF16 checkpoint allows up to
+limits. Unknown request fields are rejected for this checkpoint. Options retain their input order. The BF16 checkpoint allows up to
 512 questions per request, 2–501 options or score levels per question, and
 131,072 input tokens per question. The server's context, prefill budget and
 available KV capacity can impose a smaller limit. Longer inputs are rejected
@@ -70,6 +70,8 @@ Each question gets a separate complete read, including its state. Prefix caching
 and chunked prefill are disabled for this model because every input token must
 attend to the whole question. No output tokens are generated. Images, shared-state
 packing, speculative decoding and multi-token generation are unsupported.
+ROCm serving is rejected because its default attention backend does not honor
+this model's bidirectional attention.
 `/v1/decisions` keeps its generic prompt and directs this checkpoint to
 `/v1/systemone` instead.
 

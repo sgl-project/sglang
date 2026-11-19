@@ -72,7 +72,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 from fastapi.routing import APIRoute
-from pydantic import ValidationError
+from pydantic import SkipValidation, ValidationError
 from uvicorn.supervisors.multiprocess import Multiprocess
 
 from sglang.srt.configs.model_config import load_joint_head_config, load_pointer_head
@@ -2186,18 +2186,33 @@ async def anthropic_v1_count_tokens(
     )
 
 
+def _validate_decision_body(body, request_type):
+    # Choose the checkpoint schema before validation, without an OpenAPI union.
+    try:
+        return request_type.model_validate(body)
+    except ValidationError as error:
+        raise RequestValidationError(
+            errors=[
+                {**item, "loc": ("body", *item["loc"])}
+                for item in error.errors(include_url=False)
+            ]
+        ) from error
+
+
 ## System One compatible decision API
 @app.post("/v1/systemone", dependencies=[Depends(validate_json_request)])
 async def systemone_decisions(
-    request: Annotated[
-        Union[SystemOneRequest, NemotronDecisionRequest],
-        Body(union_mode="left_to_right"),
-    ],
-    raw_request: Request,
+    request: SkipValidation[SystemOneRequest], raw_request: Request
 ):
     """System One compatible decisions, answered by candidate scoring without generation."""
-    return await raw_request.app.state.systemone_serving.handle_request(
-        request, raw_request
+    serving = raw_request.app.state.systemone_serving
+    request_type = (
+        SystemOneRequest
+        if serving.question_encoder is None
+        else NemotronDecisionRequest
+    )
+    return await serving.handle_request(
+        _validate_decision_body(request, request_type), raw_request
     )
 
 

@@ -4665,7 +4665,11 @@ class TestNemotronDecisionStartup(CustomTestCase):
                     context_len=context,
                     nemotron_decision_config={"max_input_tokens": sidecar_limit},
                 )
-                apply_nemotron_decision_prefill_defaults(args, args._model_config)
+                with patch(
+                    "sglang.srt.arg_groups.model_overrides.nemotron_decision.get_device_memory_capacity",
+                    return_value=80 * 1024,
+                ):
+                    apply_nemotron_decision_prefill_defaults(args, args._model_config)
                 self.assertEqual(
                     resolution_result(args, "max_prefill_tokens"), expected
                 )
@@ -4673,6 +4677,62 @@ class TestNemotronDecisionStartup(CustomTestCase):
                 self.assertEqual(
                     resolution_result(args, "chunked_prefill_size"),
                     -1 if architecture == "NemotronForDecision" else 2048,
+                )
+
+    def test_small_gpu_prefill_budget_preserves_explicit_settings(self):
+        from sglang.srt.arg_groups.model_overrides.nemotron_decision import (
+            apply_nemotron_decision_prefill_defaults,
+        )
+        from sglang.srt.server_args import ServerArgs
+
+        for memory, supplied, expected in (
+            (48 * 1024, None, 16384),
+            (60 * 1024 - 1, None, 16384),
+            (60 * 1024, None, 32768),
+            (None, None, 32768),
+            (48 * 1024, 8192, 8192),
+        ):
+            with self.subTest(memory=memory, supplied=supplied):
+                args = ServerArgs(model_path="dummy", max_prefill_tokens=supplied)
+                config = SimpleNamespace(
+                    hf_config=SimpleNamespace(architectures=["NemotronForDecision"]),
+                    context_len=262144,
+                    nemotron_decision_config={"max_input_tokens": 131072},
+                )
+                with patch(
+                    "sglang.srt.arg_groups.model_overrides.nemotron_decision.get_device_memory_capacity",
+                    return_value=memory,
+                ):
+                    apply_nemotron_decision_prefill_defaults(args, config)
+                self.assertEqual(
+                    resolution_result(args, "max_prefill_tokens"), expected
+                )
+
+    def test_rocm_is_rejected_before_causal_attention_can_run(self):
+        config = SimpleNamespace(is_causal=False, sliding_window=None)
+        args = SimpleNamespace(dllm_algorithm=None, speculative_algorithm=None)
+        for is_hip in (False, True):
+            with patch(
+                "sglang.srt.arg_groups.model_overrides.nemotron_decision.get_platform",
+                return_value=SimpleNamespace(is_hip=is_hip),
+            ):
+                if is_hip:
+                    with self.assertRaisesRegex(ValueError, "not supported on ROCm"):
+                        collect_model_override_declarations(
+                            "NemotronForDecision", args, config
+                        )
+                else:
+                    self.assertEqual(
+                        collect_model_override_declarations(
+                            "NemotronForDecision", args, config
+                        ),
+                        [],
+                    )
+                self.assertEqual(
+                    collect_model_override_declarations(
+                        "Ministral3ForCausalLM", args, config
+                    ),
+                    [],
                 )
 
     def test_registered_guard_rejects_generation_modes(self):
