@@ -41,13 +41,13 @@ def _inkling_overrides(server_args: Any, hf_config: Any) -> dict:
         if cfg.reasoning_parser is None:
             overrides["reasoning_parser"] = "inkling"
         moe_ranks = cfg.tp_size // cfg.moe_dp_size
-        # On SM100 / SM103, quantized experts above the routed-kernel batch run
-        # only on MegaMoE at full speed.
+        # On SM100 / SM103 / SM107, quantized experts above the routed-kernel batch
+        # run only on MegaMoE at full speed.
         if (
             cfg.moe_a2a_backend == "none"
             and moe_ranks > 1
             and get_platform().is_cuda
-            and get_platform().device_sm in (100, 103)
+            and get_platform().device_sm in (100, 103, 107)
             and not cfg.encoder_only
             and not (cfg.enable_two_batch_overlap or cfg.enable_single_batch_overlap)
             and model_config_of(server_args).quantization == "inkling2"

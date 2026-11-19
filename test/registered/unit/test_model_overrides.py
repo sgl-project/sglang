@@ -1292,8 +1292,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
 
     def test_inkling2_megamoe_default(self):
-        """Quantized Inkling2 experts with EP on SM100 / SM103 default to MegaMoE;
-        an explicit backend, BF16 experts, SM107 and TP1 keep theirs."""
+        """Quantized Inkling2 experts with EP on SM100 / SM103 / SM107 default to
+        MegaMoE; an explicit backend, BF16 experts, SM90 and TP1 keep theirs."""
         from sglang.srt.arg_groups.model_overrides.inkling import _inkling_overrides
 
         hf = SimpleNamespace(architectures=["Inkling2ForConditionalGeneration"])
@@ -1325,7 +1325,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
 
         self.assertEqual(backend(), ("megamoe", True))
         self.assertEqual(backend(sm=103), ("megamoe", True))
-        self.assertEqual(backend(sm=107), ("none", None))
+        self.assertEqual(backend(sm=107), ("megamoe", True))
+        self.assertEqual(backend(sm=90), ("none", None))
         self.assertEqual(backend(tp=1), ("none", None))
         self.assertEqual(backend(quantization=None), ("none", None))
         self.assertEqual(backend(a2a="deepep"), ("deepep", None))
