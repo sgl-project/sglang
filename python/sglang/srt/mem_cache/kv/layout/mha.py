@@ -3,7 +3,7 @@ typed view that reads and stores them over a band of a `KVArena`."""
 
 from dataclasses import dataclass
 from functools import cached_property
-from typing import TYPE_CHECKING, ClassVar, List, Optional, Tuple
+from typing import TYPE_CHECKING, ClassVar, List, Optional, Sequence, Tuple
 
 import msgspec
 import torch
@@ -805,6 +805,26 @@ class DraftMHAView(MHAView):
             end_layer=start_layer + len(layer_ids) - 1,
             enable_alt_stream=True,
         )
+
+    def stacked_kv_buffers(
+        self, layer_ids: Sequence[int]
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """Writable [layer, physical slot, head, dim] views for consecutive draft lanes."""
+        lanes = [self.layer_lanes[layer_id] for layer_id in layer_ids]
+        if not lanes or lanes != list(range(lanes[0], lanes[0] + len(lanes))):
+            return None
+
+        def stack(buffers):
+            first = buffers[layer_ids[0] - self.start_layer]
+            layer_stride = 0
+            if len(lanes) > 1:
+                second = buffers[layer_ids[1] - self.start_layer]
+                layer_stride = second.storage_offset() - first.storage_offset()
+            return first.as_strided(
+                (len(lanes), *first.shape), (layer_stride, *first.stride())
+            )
+
+        return stack(self.k_buffer), stack(self.v_buffer)
 
     def get_contiguous_buf_infos(self):
         raise NotImplementedError(

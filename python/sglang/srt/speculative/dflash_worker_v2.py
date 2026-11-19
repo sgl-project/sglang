@@ -839,6 +839,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_greedy_index_cap: int = 0
         self._use_fused_kv_materialize = is_cuda() or is_hip() or is_xpu()
         self._fused_kv_helper: Optional[object] = None
+        self._draft_kv_cache_buffers = None
+        self._draft_kv_cache_uses_window = False
         if self._use_fused_kv_materialize:
             self._init_fused_kv_helper()
 
@@ -1124,8 +1126,40 @@ class DFlashWorkerV2(BaseSpecWorker):
                 ),
                 token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             )
+        self._bind_draft_kv_cache_buffers()
         if get_spec().speculative_dflash_draft_kv_ring:
             self._init_draft_kv_ring()
+
+    def _bind_draft_kv_cache_buffers(self) -> None:
+        """Bind direct prefix writes after draft KV placement, before graph capture."""
+        from sglang.srt.mem_cache.kv.layout.mha import DraftMHAView
+
+        self._draft_kv_cache_buffers = None
+        helper = self._fused_kv_helper
+        if helper is None:
+            return
+        router = self.draft_model_runner.token_to_kv_pool.layer_router
+        routes = [
+            router.layer(layer.self_attn.attn.layer_id)
+            for layer in self.draft_model.layers
+        ]
+        view = routes[0].view
+        if (
+            isinstance(view, DraftMHAView)
+            and view.dtype in (torch.bfloat16, torch.float16)
+            and view.dtype == helper.flat_kv_weight.dtype
+            and view.head_num == helper.num_kv_heads
+            and view.head_dim == view.v_head_dim == helper.head_dim
+            and all(r.view is view and r.owner == routes[0].owner for r in routes)
+        ):
+            self._draft_kv_cache_buffers = view.stacked_kv_buffers(
+                [r.view_layer_id for r in routes]
+            )
+            self._draft_kv_cache_uses_window = not routes[0].owner
+            if self._draft_kv_cache_buffers is not None and get_parallel().tp_rank == 0:
+                logger.info(
+                    "DFLASH fused prefix writes bound to %s.", routes[0].route.sub_pool
+                )
 
     def _init_draft_kv_ring(self) -> None:
         parallel = get_parallel()
@@ -2987,6 +3021,26 @@ class DFlashWorkerV2(BaseSpecWorker):
         token_to_kv_pool = self.draft_model_runner.token_to_kv_pool
         if self._fused_kv_helper is None:
             raise RuntimeError("DFLASH fused KV helper is not initialized.")
+
+        if (
+            self._draft_kv_cache_buffers is not None
+            and ctx_cache_loc_2d is not None
+            and commit_lens is not None
+        ):
+            locs = (
+                ctx_swa_cache_loc
+                if self._draft_kv_cache_uses_window
+                else ctx_cache_loc_2d
+            )
+            if locs is not None:
+                self._fused_kv_helper.materialize(
+                    ctx_hidden,
+                    ctx_positions,
+                    cache_buffers=self._draft_kv_cache_buffers,
+                    cache_locs=locs.reshape_as(ctx_cache_loc_2d),
+                    commit_lens=commit_lens,
+                )
+                return
 
         def _write_layer_kv(
             layer_idx: int,

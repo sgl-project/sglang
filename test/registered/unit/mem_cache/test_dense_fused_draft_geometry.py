@@ -198,12 +198,12 @@ class TestDraftPartAlignment(unittest.TestCase):
             self.assertTrue(torch.all(tensor[:, 6] == 0))
 
 
-class TestDraftMHAView(unittest.TestCase):
+class TestDraftMHAView(CustomTestCase):
     PS = 2
     PAGES = 8
 
-    def _pool(self):
-        spec = _host_spec(_draft_region())
+    def _pool(self, region=None):
+        spec = _host_spec(region or _draft_region())
         swa = MHASubPoolSpec(
             name="swa",
             layer_num=1,
@@ -246,6 +246,25 @@ class TestDraftMHAView(unittest.TestCase):
         self.assertEqual(
             dp.k_buffer[0].stride(0) * dp.k_buffer[0].element_size(), spec.entry_bytes()
         )
+
+    def test_stacked_draft_buffers_follow_the_bound_lanes(self):
+        region = DenseDraftRegion(
+            lane_num=5, head_num=2, head_dim=8, store_dtype=_DTYPE
+        )
+        pool = self._pool(region)
+        view = DraftMHAView(
+            arena=pool,
+            host_spec=pool.spec("full"),
+            layer_lanes={4: 3, 5: 1, 6: 2},
+            page_size=self.PS,
+        )
+        self.assertIsNone(view.stacked_kv_buffers([4, 5, 6]))
+        k, v = view.stacked_kv_buffers([5, 6, 4])
+        keys, values = pool.spec("full").draft_views(pool)
+        for i, lane in enumerate((1, 2, 3)):
+            for stack, rows in ((k, keys), (v, values)):
+                self.assertEqual(stack[i].data_ptr(), rows[lane].data_ptr())
+                self.assertEqual(stack[i].stride(), rows[lane].stride())
 
     def test_host_page_move_carries_the_draft_bytes(self):
         # Compaction relocates whole page envelopes on the HOST pool: a draft
@@ -807,6 +826,7 @@ class TestRoutedDraftPool(CustomTestCase):
 
         arena, pool, full, swa, values = self._write_fixture(symmetric=True)
         worker = object.__new__(DFlashWorkerV2)
+        worker._draft_kv_cache_buffers = None
         worker.model_runner = SimpleNamespace(device=torch.device("cpu"))
         worker.draft_model_runner = SimpleNamespace(token_to_kv_pool=pool)
         worker.draft_parallel_layout = None

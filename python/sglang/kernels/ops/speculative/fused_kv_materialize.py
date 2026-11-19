@@ -13,7 +13,8 @@
 # ==============================================================================
 """Fused Triton kernel for DFlash KV materialization.
 
-Combines: KV projection + RMSNorm + RoPE, then pool-managed KV writes.
+Projects all layers together, then applies RMSNorm and RoPE. A strided
+cache can receive the committed prefix in the norm/RoPE kernel itself.
 """
 
 from typing import Callable, List, Optional
@@ -38,8 +39,8 @@ def _fused_norm_rope_kernel_stacked(
     eps_ptr,  # [n_layers]
     cos_sin_cache_ptr,  # [max_pos, rotary_dim]
     positions_ptr,  # [total_ctx]
-    k_out_ptr,  # [n_layers, total_ctx, num_kv_heads, head_dim]
-    v_out_ptr,  # [n_layers, total_ctx, num_kv_heads, head_dim]
+    k_out_ptr,  # [n_layers, output_rows, num_kv_heads, head_dim]
+    v_out_ptr,  # [n_layers, output_rows, num_kv_heads, head_dim]
     kv_stride_ctx,
     kv_stride_layer,
     k_norm_weight_stride_layer,
@@ -58,6 +59,12 @@ def _fused_norm_rope_kernel_stacked(
     rotary_dim: tl.constexpr,
     half_rotary_dim: tl.constexpr,
     BLOCK_HD: tl.constexpr,
+    loc_ptr,
+    commit_len_ptr,
+    WIDTH: tl.constexpr,
+    loc_batch_stride,
+    loc_col_stride,
+    commit_stride,
 ):
     """Fused RMSNorm(K) + RoPE(K) materialization. Grid: (total_ctx, num_kv_heads, n_layers)."""
     ctx_id = tl.program_id(0)
@@ -66,6 +73,15 @@ def _fused_norm_rope_kernel_stacked(
     if ctx_id >= total_ctx or layer_id >= n_layers:
         return
 
+    dst_row = ctx_id
+    if loc_ptr is not None:
+        batch, col = ctx_id // WIDTH, ctx_id % WIDTH
+        if col >= tl.load(commit_len_ptr + batch * commit_stride):
+            return
+        # The arena's strided row offset can exceed signed int32.
+        dst_row = tl.load(loc_ptr + batch * loc_batch_stride + col * loc_col_stride).to(
+            tl.int64
+        )
     position = tl.load(positions_ptr + ctx_id)
     eps = tl.load(eps_ptr + layer_id).to(tl.float32)
     kv_base = kv_ptr + ctx_id * kv_stride_ctx + layer_id * kv_stride_layer
@@ -74,13 +90,13 @@ def _fused_norm_rope_kernel_stacked(
     k_write = (
         k_out_ptr
         + layer_id * k_out_stride_layer
-        + ctx_id * k_out_stride_ctx
+        + dst_row * k_out_stride_ctx
         + head_id * k_out_stride_head
     )
     v_write = (
         v_out_ptr
         + layer_id * v_out_stride_layer
-        + ctx_id * v_out_stride_ctx
+        + dst_row * v_out_stride_ctx
         + head_id * v_out_stride_head
     )
 
@@ -142,6 +158,8 @@ def _fused_norm_rope_stacked(
     rotary_dim: int,
     k_out: Optional[torch.Tensor] = None,
     v_out: Optional[torch.Tensor] = None,
+    cache_locs: Optional[torch.Tensor] = None,
+    commit_lens: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused RMSNorm + RoPE materialization for all layers."""
     if kv.ndim != 3:
@@ -187,7 +205,33 @@ def _fused_norm_rope_stacked(
     elif positions.dtype != torch.int64:
         positions = positions.to(torch.int64)
 
-    expected_shape = (n_layers, total_ctx, num_kv_heads, head_dim)
+    output_rows = total_ctx
+    if cache_locs is not None:
+        if k_out is None or v_out is None or commit_lens is None:
+            raise ValueError(
+                "Prefix writes require both cache buffers and commit lengths."
+            )
+        if (
+            cache_locs.ndim != 2
+            or cache_locs.numel() != total_ctx
+            or commit_lens.shape != (cache_locs.size(0),)
+        ):
+            raise ValueError(
+                "Physical cache locations and commit lengths must cover the batch."
+            )
+        if (
+            cache_locs.device != kv.device
+            or commit_lens.device != kv.device
+            or cache_locs.dtype not in (torch.int32, torch.int64)
+            or commit_lens.dtype not in (torch.int32, torch.int64)
+        ):
+            raise ValueError(
+                "Prefix locations and lengths must be integer tensors on the KV device."
+            )
+        if k_out.stride(-1) != 1 or v_out.stride(-1) != 1:
+            raise ValueError("Cache rows must have a contiguous head dimension.")
+        output_rows = k_out.size(1)
+    expected_shape = (n_layers, output_rows, num_kv_heads, head_dim)
     if k_out is None:
         k_out = torch.empty(expected_shape, dtype=kv.dtype, device=kv.device)
     else:
@@ -243,6 +287,12 @@ def _fused_norm_rope_stacked(
         rotary_dim,
         half_rotary_dim,
         BLOCK_HD,
+        cache_locs,
+        commit_lens,
+        cache_locs.size(1) if cache_locs is not None else 1,
+        cache_locs.stride(0) if cache_locs is not None else 0,
+        cache_locs.stride(1) if cache_locs is not None else 0,
+        commit_lens.stride(0) if commit_lens is not None else 0,
     )
     return k_out, v_out
 
@@ -399,7 +449,13 @@ class FusedKVMaterializeHelper:
         self,
         ctx_hidden: torch.Tensor,
         positions: torch.Tensor,
-        write_layer_kv: Callable[[int, torch.Tensor, torch.Tensor], None],
+        write_layer_kv: Optional[
+            Callable[[int, torch.Tensor, torch.Tensor], None]
+        ] = None,
+        *,
+        cache_buffers: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        cache_locs: Optional[torch.Tensor] = None,
+        commit_lens: Optional[torch.Tensor] = None,
     ) -> None:
         """Materialize KV cache for all layers using batched projection."""
         total_ctx = ctx_hidden.shape[0]
@@ -450,8 +506,12 @@ class FusedKVMaterializeHelper:
             proj_out_2d = torch.mm(ctx_hidden, self.flat_kv_weight.t())
 
         proj_out = proj_out_2d.view(total_ctx, self.n_layers, self.layer_out_dim)
-        tmp_k = self._k_workspace[:, :total_ctx]
-        tmp_v = self._v_workspace[:, :total_ctx]
+        if cache_buffers is None:
+            tmp_k = self._k_workspace[:, :total_ctx]
+            tmp_v = self._v_workspace[:, :total_ctx]
+        else:
+            assert cache_locs is not None and commit_lens is not None
+            tmp_k, tmp_v = cache_buffers
         cache_k, cache_v = _fused_norm_rope_stacked(
             proj_out,
             self.k_norm_weights,
@@ -463,6 +523,11 @@ class FusedKVMaterializeHelper:
             self.rotary_dim,
             k_out=tmp_k,
             v_out=tmp_v,
+            cache_locs=cache_locs,
+            commit_lens=commit_lens,
         )
+        if cache_buffers is not None:
+            return
+        assert write_layer_kv is not None
         for layer_idx in range(self.n_layers):
             write_layer_kv(layer_idx, cache_k[layer_idx], cache_v[layer_idx])
