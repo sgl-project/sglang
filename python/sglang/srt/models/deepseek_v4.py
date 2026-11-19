@@ -3993,6 +3993,8 @@ class DeepseekV4Model(nn.Module):
             if _is_cuda
             else None,
         )
+        self.layer_ids = tuple(range(self.start_layer, self.end_layer))
+
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
@@ -4906,14 +4908,15 @@ class DeepseekV4ForCausalLM(
         self._routed_experts_weights_of_layer = LazyValue(
             lambda: {
                 layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
-                for layer_id in range(self.model.start_layer, self.model.end_layer)
+                for layer_id in self.model.layer_ids
                 if isinstance(
                     self.model.layers[layer_id].mlp, deepseek_v2.DeepseekV2MoE
                 )
             }
         )
 
-        # Expose start_layer/end_layer for model_runner PP support
+        # Expose local layer ownership and the existing PP range.
+        self.layer_ids = self.model.layer_ids
         self.start_layer = self.model.start_layer
         self.end_layer = self.model.end_layer
 
@@ -5259,7 +5262,7 @@ class DeepseekV4ForCausalLM(
         else:
             layers = [
                 self.model.layers[layer_id]
-                for layer_id in range(self.model.start_layer, self.model.end_layer)
+                for layer_id in self.model.layer_ids
             ]
         for layer in layers:
             attn = layer.self_attn
@@ -5315,7 +5318,7 @@ class DeepseekV4ForCausalLM(
 
         if is_nextn:
             return
-        for layer_id in range(self.model.start_layer, self.model.end_layer):
+        for layer_id in self.model.layer_ids:
             layer = self.model.layers[layer_id]
             self_attn = layer.self_attn
             if (
@@ -5611,11 +5614,8 @@ class DeepseekV4ForCausalLM(
                     layer_id = get_layer_id(name)
                     if (
                         layer_id is not None
-                        and hasattr(self.model, "start_layer")
-                        and (
-                            layer_id < self.model.start_layer
-                            or layer_id >= self.model.end_layer
-                        )
+                        and not is_nextn
+                        and layer_id not in self.model.layer_ids
                     ):
                         continue
                     if (
