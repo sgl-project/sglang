@@ -18,6 +18,7 @@ from typing import Literal, Optional
 import torch
 
 from sglang.kernels.ops.moe.eplb_map_record import eplb_map_and_record
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 from sglang.srt.runtime_context import get_exec
 
@@ -38,6 +39,8 @@ class ExpertLocationDispatchInfo:
     # logical expert several times. With one, each rank dispatches only its own
     # tokens and is free to disagree.
     rank_invariant: bool = False
+    # This layer's MegaGate int32 (physical map, replica count); None casts per call.
+    mega_gate_maps: Optional[tuple[torch.Tensor, torch.Tensor]] = None
 
     @classmethod
     def init_new(cls, layer_id: int, *, is_draft: bool = False):
@@ -69,6 +72,17 @@ class ExpertLocationDispatchInfo:
                 layer_id, :
             ],
             num_physical_experts=expert_location_metadata.num_physical_experts,
+            mega_gate_maps=(
+                tuple(
+                    m[layer_id]
+                    for m in expert_location_metadata.mega_gate_maps(
+                        ep_dispatch_algorithm
+                    )
+                )
+                if envs.SGLANG_OPT_DEEPGEMM_MEGA_GATE.get()
+                and ep_dispatch_algorithm in ("static", "dynamic")
+                else None
+            ),
         )
 
 

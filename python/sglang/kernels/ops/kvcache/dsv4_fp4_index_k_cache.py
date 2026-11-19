@@ -18,16 +18,26 @@ def _store_fp4_index_k_cache_kernel(
     loc,
     page_size: tl.constexpr,
     cache_stride: tl.constexpr,
+    dcp_size: tl.constexpr,
+    dcp_rank: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     token_id = tl.program_id(0)
     offsets = tl.arange(0, BLOCK)
-    cache_loc = tl.load(loc + token_id)
+    # int64: a strided page offset can exceed int32 range.
+    cache_loc = tl.load(loc + token_id).to(tl.int64)
+    # DCP: loc holds widened slots; this rank stores slot // dcp_size of the slots it owns.
+    owned = (cache_loc >= 0) & (cache_loc % dcp_size == dcp_rank)
+    cache_loc = cache_loc // dcp_size
     page = cache_loc // page_size
     page_offset = cache_loc - page * page_size
 
     k = tl.load(k_fp4 + token_id * BLOCK + offsets)
-    tl.store(cache + page * cache_stride + page_offset * BLOCK + offsets, k)
+    tl.store(
+        cache + page * cache_stride + page_offset * BLOCK + offsets,
+        k,
+        mask=owned & (offsets >= 0),
+    )
 
     sf = tl.load(k_sf + token_id)
     sf_offsets = tl.arange(0, 4)
@@ -35,6 +45,7 @@ def _store_fp4_index_k_cache_kernel(
     tl.store(
         cache + page * cache_stride + page_size * BLOCK + page_offset * 4 + sf_offsets,
         sf_bytes,
+        mask=owned & (sf_offsets >= 0),
     )
 
 
@@ -45,13 +56,18 @@ def store_fp4_index_k_cache(
     *,
     page_size: int,
     rne: bool = False,
+    dcp_size: int = 1,
+    dcp_rank: int = 0,
 ) -> None:
     assert input.shape[-1] == 128
+    assert 0 <= dcp_rank < dcp_size, f"{dcp_rank=} {dcp_size=}"
     k_fp4, k_sf = quantize_fp4_indexer_tensor(input.contiguous(), rne=rne)
     n_tokens = input.numel() // input.shape[-1]
     assert k_fp4.shape == (n_tokens, 64)
     assert k_sf.shape == (n_tokens,)
     assert cache.shape[1] == page_size * INDEX_K_SLOT_BYTES
+    # Pages may be slices of larger per-page entries; the kernel follows stride(0).
+    assert cache.stride(1) == 1, f"{cache.stride()=}"
 
     if n_tokens == 0:
         return
@@ -62,6 +78,8 @@ def store_fp4_index_k_cache(
         loc,
         page_size,
         cache.stride(0),
+        dcp_size,
+        dcp_rank,
         BLOCK=64,
     )
 

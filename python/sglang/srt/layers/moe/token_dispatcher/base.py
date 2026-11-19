@@ -125,12 +125,6 @@ class DispatchOutputChecker:
         return dispatch_output.format.is_standard()
 
     @staticmethod
-    def format_is_triton_kernels(
-        dispatch_output: DispatchOutput,
-    ) -> TypeGuard[StandardDispatchOutput]:
-        return dispatch_output.format.is_standard()
-
-    @staticmethod
     def format_is_ascend_ops(
         dispatch_output: DispatchOutput,
     ) -> TypeGuard[AscendOpsDispatchOutput]:
@@ -437,3 +431,27 @@ class BaseDispatcher(ABC):
     def clear_overlap_args(self) -> None:
         self.overlap_args = None
         self.meta_overlap_args = None
+
+
+def build_dispatcher_quant_config(
+    layer: torch.nn.Module,
+    weight_dtype: Optional[torch.dtype],
+    quant_type: Optional[Any] = None,
+    gate_up_interleaved: Optional[bool] = None,
+) -> dict:
+    """Describe a MoE layer's numerics to its dispatcher.
+
+    ``quant_type`` is the ``AiterQuantType`` the layer will hand AITER; it is
+    what separates the two fp8 activation formats. ``weight_dtype`` is semantic,
+    not storage: MXFP4 is stored as uint8 but reported as float4_e2m1fn_x2.
+    Consumers must tolerate every key but ``weight_dtype`` being absent.
+    """
+    runner_config = getattr(layer, "moe_runner_config", None)
+    return {
+        "weight_dtype": weight_dtype,
+        "quant_type": quant_type,
+        "runner_config": runner_config,
+        "gate_up_interleaved": gate_up_interleaved,
+        "swiglu_limit": getattr(runner_config, "swiglu_limit", None)
+        or getattr(runner_config, "gemm1_clamp_limit", None),
+    }

@@ -40,14 +40,12 @@ from sglang.srt.model_executor.cuda_graph_config import (
     CudaGraphConfig,
     PhaseConfig,
 )
-from sglang.srt.model_executor.forward_batch_info import (  # noqa: E402
-    ForwardBatch,
-    ForwardMode,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (  # noqa: E402
     ForwardContext,
     forward_context,
 )
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner  # noqa: E402
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm  # noqa: E402
 
@@ -458,6 +456,7 @@ class MockMamba2ModelRunner(ModelRunner):
             page_size=case.page_size,
             hands_out_virtual_ids=False,
             state_id_spaces=lambda: {},
+            request_id_spaces=lambda: {},
         )
         self.is_draft_worker = False
         self.init_runner_ids()

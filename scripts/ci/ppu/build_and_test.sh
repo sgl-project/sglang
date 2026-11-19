@@ -103,6 +103,8 @@ fi
 : "${PPU_CI_TARGET_MODEL_PATH:?}"
 : "${PPU_CI_EAGLE3_MODEL_PATH:?}"
 : "${PPU_CI_DFLASH_MODEL_PATH:?}"
+: "${PPU_CI_MLA_MODEL_PATH:?}"
+: "${PPU_CI_SMALL_MODEL_PATH:?}"
 : "${PPU_CI_EVAL_CACHE:?}"
 export HOME
 HOME=$(mktemp -d)
@@ -156,7 +158,7 @@ PY
 python3 "$repo/scripts/ci/ppu/prepare_runtime.py"
 
 cd "$artifacts"
-python3 "$repo/test/run_suite.py" --hw ppu --suite stage-a-test-1-gpu-ppu --timeout-per-file 1200 \
+python3 "$repo/test/run_suite.py" --hw ppu --suite extra-test-1-gpu-ppu --timeout-per-file 1200 \
     2>&1 | tee "$artifacts/sanity.log"
-# Require both sanity files; update this count when extending the suite.
-grep -Fxq 'Test Summary: 2/2 passed' "$artifacts/sanity.log"
+# Require every registered PPU model sanity file to pass.
+grep -Fxq 'Test Summary: 5/5 passed' "$artifacts/sanity.log"

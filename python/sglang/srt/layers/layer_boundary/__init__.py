@@ -22,10 +22,8 @@ from sglang.srt.layers.layer_boundary.boundary import (
     bind_exit,
     tbo_split_moves,
 )
-from sglang.srt.layers.layer_boundary.construction import (
-    BatchVariant,
-)
 from sglang.srt.layers.layer_boundary.contracts import (
+    BatchVariant,
     EdgeContract,
     EntryPath,
     ExitRows,

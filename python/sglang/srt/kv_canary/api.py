@@ -28,7 +28,6 @@ from sglang.srt.runtime_context import (
 if TYPE_CHECKING:
     from sglang.srt.kv_canary.token_oracle.oracle_manager import TokenOracleManager
     from sglang.srt.model_executor.model_runner import ModelRunner
-    from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
 
@@ -50,11 +49,10 @@ def torch_reference_conflicts_with_decode_graph(device: torch.device) -> bool:
 
 def install_canary(
     *,
-    server_args: ServerArgs,
     model_runner: ModelRunner,
     token_oracle_manager: Optional[TokenOracleManager] = None,
 ) -> Optional[CanaryManager]:
-    config = CanaryConfig.from_env(server_args)
+    config = CanaryConfig.from_env()
     if config.mode is CanaryMode.NONE:
         return None
 
@@ -69,7 +67,7 @@ def install_canary(
     if torch_reference_conflicts_with_decode_graph(device):
         raise ValueError(
             f"kv-canary: {device.type} has no canary CUDA kernels and its torch reference "
-            "cannot be graph-captured; pass --disable-cuda-graph (or "
+            "cannot be graph-captured; pass --disable-decode-cuda-graph --disable-prefill-cuda-graph (or "
             "--cuda-graph-backend-decode=disabled) when canary is enabled"
         )
     # EAGLE draft worker pools rotate input_ids so slot ``p`` stores K/V for the token at position ``p+1``;

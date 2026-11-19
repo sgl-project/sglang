@@ -31,8 +31,8 @@ from typing import Callable, Iterator
 from sglang.srt.runtime_context import (
     get_serving,
 )
-from sglang.srt.utils.common import kill_itself_when_parent_died, kill_process_tree
 from sglang.srt.utils.network import NetworkAddress
+from sglang.srt.utils.process import kill_itself_when_parent_died, kill_process_tree
 from sglang.srt.utils.watchdog import SubprocessWatchdog
 
 logger = logging.getLogger(__name__)
