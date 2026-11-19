@@ -398,6 +398,23 @@ class TestDisaggFlux3Image(_DisaggTestBase):
         role: ["--warmup-mode", "off"] for role in (*gpu_layout, "server")
     }
 
+    @classmethod
+    def setUpClass(cls) -> None:
+        from huggingface_hub import get_token, hf_hub_download
+        from huggingface_hub.errors import GatedRepoError
+
+        _require_gpus(cls.required_gpus)
+        # Fork CI can run from the runner's HF cache without a token. Check
+        # the manifest before starting four roles and retrying cluster setup.
+        if not get_token():
+            try:
+                hf_hub_download(cls.model, "manifest.json")
+            except GatedRepoError as exc:
+                raise unittest.SkipTest(
+                    f"Anonymous runner lacks access to {cls.model}"
+                ) from exc
+        super().setUpClass()
+
     def test_t2i_and_edit_match_monolithic(self):
         from io import BytesIO
 

@@ -1037,6 +1037,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
         elif (
             _use_aiter
             and not _skip_aiter_unquant
+            and x.is_cuda
             and type(layer.weight.data) is torch.Tensor
         ):
             if (
