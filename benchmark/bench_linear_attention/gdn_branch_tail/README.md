@@ -136,6 +136,9 @@ continuation and combined latency separately. The directed sample establishes
 a conditional benefit. Coverage and overall service performance require their
 own workload measurements.
 
+[Validation notes](validation-notes.md) retain model revisions, test conditions,
+per-round measurements and the zero-trigger controls.
+
 ## Other Linear backends
 
 The recovery constraint applies across hybrid Linear backends, while snapshot
