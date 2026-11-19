@@ -6302,50 +6302,52 @@ class Scheduler(
 
         return DetachHiCacheStorageReqOutput(success=False, message=msg)
 
-    def flush_cache(self, empty_cache: bool = True):
+    def flush_cache(
+        self, empty_cache: bool = True, *, pp_all_idle: bool = False
+    ) -> bool:
         """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache."""
-        if self.is_fully_idle(ignore_waiting=self.pause_state.paused):
-            return self._flush_idle_cache(empty_cache)
-        logging.warning(
-            f"Cache not flushed because there are pending requests. "
-            f"#queue-req: {len(self.waiting_queue)}, "
-            f"#running-req: {len(self.running_batch.reqs)}"
-        )
-        return False
+        # After the PP vote, every stage must enter reset on the same iteration.
+        if pp_all_idle or self.is_fully_idle(ignore_waiting=self.pause_state.paused):
+            self.cur_batch_for_debug = None
+            self.last_batch = None
+            if self.uocr_runtime is not None:
+                # Before the pool clear, which returns the retained windows' KV.
+                self._abort_uocr_doc_windows(
+                    self.uocr_runtime.reset(),
+                    finished_reason={
+                        "type": "abort",
+                        "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                        "message": "The cache was flushed while this document "
+                        "window waited for the previous one.",
+                    },
+                )
+            self.tree_cache.reset()
+            self.req_to_token_pool.clear()
+            self.token_to_kv_pool_allocator.clear()
+            self.req_to_token_pool.reset_aux_cache_allocator()
+            self.grammar_manager.clear()
+            self.metrics_reporter.reset_metrics()
 
-    def _flush_idle_cache(self, empty_cache: bool = True) -> bool:
-        self.cur_batch_for_debug = None
-        self.last_batch = None
-        if self.uocr_runtime is not None:
-            # Before the pool clear, which returns the retained windows' KV.
-            self._abort_uocr_doc_windows(
-                self.uocr_runtime.reset(),
-                finished_reason={
-                    "type": "abort",
-                    "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
-                    "message": "The cache was flushed while this document "
-                    "window waited for the previous one.",
-                },
+            if self.draft_worker:
+                self.draft_worker.clear_cache_pool()
+
+            if empty_cache:
+                current_platform.empty_cache()
+            # Per-DP-group leader logs once: ranks within a DP group are
+            # state-synchronous, but DP groups may diverge.
+            if self.metrics_reporter.is_stats_logging_rank:
+                logger.info("Cache flushed successfully!")
+            self.invariant_checker.run(CheckPhase.FLUSH)
+            self.gc_freezer.on_cache_reset()
+            success = True
+        else:
+            logging.warning(
+                f"Cache not flushed because there are pending requests. "
+                f"#queue-req: {len(self.waiting_queue)}, "
+                f"#running-req: {len(self.running_batch.reqs)}"
             )
-        self.tree_cache.reset()
-        self.req_to_token_pool.clear()
-        self.token_to_kv_pool_allocator.clear()
-        self.req_to_token_pool.reset_aux_cache_allocator()
-        self.grammar_manager.clear()
-        self.metrics_reporter.reset_metrics()
-
-        if self.draft_worker:
-            self.draft_worker.clear_cache_pool()
-
-        if empty_cache:
-            current_platform.empty_cache()
-        # Per-DP-group leader logs once: ranks within a DP group are
-        # state-synchronous, but DP groups may diverge.
-        if self.metrics_reporter.is_stats_logging_rank:
-            logger.info("Cache flushed successfully!")
-        self.invariant_checker.run(CheckPhase.FLUSH)
-        self.gc_freezer.on_cache_reset()
-        return True
+            success = False
+        return success
 
     def get_internal_state(self, recv_req: GetInternalStateReq):
         return self.internal_state.get_internal_state(recv_req)

@@ -11,7 +11,10 @@ import torch
 import torch.distributed
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
+from sglang.srt.disaggregation.utils import (
+    all_reduce_flags,
+    poll_and_all_reduce_attn_cp_tp_group,
+)
 from sglang.srt.distributed.communication_op import attn_cp_tp_broadcast_pyobj
 from sglang.srt.distributed.parallel_state import P2PWork
 from sglang.srt.environ import InvariantCheckLevel, envs
@@ -655,37 +658,6 @@ class SchedulerPPMixin:
         unprocessed."""
         has_unprocessed_mb = any(mb is not None for mb in self.mbs)
         received = self.ingest_requests(stop_at_pause=has_unprocessed_mb)
-        return self._pp_prepare_flush(received)
-
-    def _pp_flush_idle(self: Scheduler) -> bool:
-        return self.is_fully_idle(ignore_waiting=self.pause_state.paused)
-
-    def _pp_flush_vote(self: Scheduler, values, *, across_stages=False):
-        # A DP replica receives its own probe on the work channel. Only the
-        # ranks that share its queue may enter these conditional collectives.
-        groups = (
-            [self.attn_tp_group, self.attn_cp_group]
-            if get_parallel().attn_dp_enabled
-            else [self.tp_group]
-        )
-        if across_stages:
-            groups.append(self.pp_group)
-        votes = torch.tensor(values, dtype=torch.int, device="cpu")
-        for group in groups:
-            if group.world_size > 1:
-                torch.distributed.all_reduce(
-                    votes, op=torch.distributed.ReduceOp.MIN, group=group.cpu_group
-                )
-        return votes.tolist()
-
-    def _pp_vote_on_flush_probe(self: Scheduler, deadline: float):
-        parallel = get_parallel()
-        leader = parallel.attn_tp_rank == 0 and parallel.attn_cp_rank == 0
-        return self._pp_flush_vote(
-            [self._pp_flush_idle(), not leader or time.monotonic() < deadline]
-        )
-
-    def _pp_prepare_flush(self: Scheduler, received: List) -> List:
         if self.pp_group.is_first_rank:
             self._pp_flush_probe = self.flush_wrapper.prepare_pp_probe(
                 self._pp_vote_on_flush_probe
@@ -700,6 +672,33 @@ class SchedulerPPMixin:
             )
         return received
 
+    def _pp_flush_idle(self: Scheduler) -> bool:
+        return self.is_fully_idle(ignore_waiting=self.pause_state.paused)
+
+    def _pp_flush_vote(self: Scheduler, values, *, across_stages=False):
+        # A DP replica receives its own probe on the work channel. Only the
+        # ranks that share its queue may enter these conditional collectives.
+        groups = (
+            [self.attn_tp_group, self.attn_cp_group]
+            if get_parallel().attn_dp_enabled
+            else [self.tp_group]
+        )
+        if across_stages:
+            groups.append(self.pp_group)
+        for group in groups:
+            if group.world_size > 1:
+                values = all_reduce_flags(
+                    values, group.cpu_group, torch.distributed.ReduceOp.MIN
+                )
+        return values
+
+    def _pp_vote_on_flush_probe(self: Scheduler, deadline: float):
+        parallel = get_parallel()
+        leader = parallel.attn_tp_rank == 0 and parallel.attn_cp_rank == 0
+        return self._pp_flush_vote(
+            [self._pp_flush_idle(), not leader or time.monotonic() < deadline]
+        )
+
     def _pp_finish_flush(self: Scheduler) -> None:
         if not self._pp_flush_probe:
             return
@@ -708,7 +707,8 @@ class SchedulerPPMixin:
         # busy PP0 never waits here while later stages still need its sends.
         (idle,) = self._pp_flush_vote([self._pp_flush_idle()], across_stages=True)
         if idle:
-            success = self._flush_idle_cache()
+            # Fence every reset before PP0 can enqueue another storage ticket.
+            success = self.flush_cache(pp_all_idle=True)
             (idle,) = self._pp_flush_vote([success], across_stages=True)
         if self.pp_group.is_first_rank:
             self.flush_wrapper.finish_pp_probe(bool(idle))
