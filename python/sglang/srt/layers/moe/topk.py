@@ -2986,13 +2986,16 @@ def select_experts(
         else:
             from sglang.srt.layers.moe import route_quant_handoff
 
+            fused_routing_ok = (
+                expert_location_dispatch_info is None
+                and not routing_overridden
+                and num_shared_topk_slots == 0
+            )
             route_quant_handoff.bind_select_experts(
-                num_token_non_padded,
-                fused_routing_ok=(
-                    expert_location_dispatch_info is None
-                    and not routing_overridden
-                    and num_shared_topk_slots == 0
-                ),
+                num_token_non_padded, fused_routing_ok=fused_routing_ok
+            )
+            route_sort.bind_select_experts(
+                num_token_non_padded, fused_routing_ok=fused_routing_ok
             )
             topk_weights, topk_ids = biased_grouped_topk(
                 hidden_states=hidden_states,

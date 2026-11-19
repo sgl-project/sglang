@@ -12,7 +12,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers import zero_copy_context
-from sglang.srt.layers.moe import route_quant_handoff
+from sglang.srt.layers.moe import route_sort
 from sglang.srt.layers.moe.moe_runner import aiter_route_sort
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
@@ -367,7 +367,7 @@ class AiterRunnerCore(MoeRunnerCore):
         # The consumer learns which batch sizes take the router's sort from the
         # arguments of its layer's own fused_moe call.
         consumer = self._route_sort_consumer
-        if consumer is not None and route_quant_handoff.staged_route_sort() is consumer:
+        if consumer is not None and route_sort.staged() is consumer:
             consumer.observe(fused_moe_args)
         output = fused_moe(**fused_moe_args)
         return AiterRunnerOutput(hidden_states=output)

@@ -10,15 +10,16 @@ RouteSortConsumer from MoeRunnerCore.route_sort_consumer(); that consumer says
 per batch size at which block_m, if any, the runner's next experts call takes
 the sort; the router builds it only at a block_m the kernel is built for
 (moe_route_radix4.SORT_BLOCK_MS). A model layer asks its experts' runner for
-one and stages it through the consume-once stash in route_quant_handoff, so the
-shared routing functions keep their signatures:
+one and stages it through this module's consume-once stash, so the shared
+routing functions keep their signatures:
 
-    KimiK3MoE.forward           stage(consumer) before routing, clear() after
-                                the layer
+    the model layer             stage(consumer) before routing, clear(consumer)
+                                after the layer
+    select_experts              bind_select_experts() records whether the
+                                router's ids and weights stay as they are
     biased_grouped_topk_gpu     try_route_sort_fused() replaces route_radix4
                                 when the staged consumer takes the batch
-    the consuming runner core   reads staged_route_sort() to see its own
-                                consumer staged
+    the consuming runner core   reads staged() to see its own consumer staged
 """
 
 from __future__ import annotations
@@ -26,12 +27,12 @@ from __future__ import annotations
 import logging
 from typing import Optional, Protocol, Tuple
 
+import msgspec
 import torch
 
 from sglang.kernels.jit.utils import cache_once
 from sglang.kernels.ops.moe import moe_route_radix4
 from sglang.srt.layers import zero_copy_context
-from sglang.srt.layers.moe import route_quant_handoff
 from sglang.srt.runtime_context import get_buffer
 from sglang.srt.utils import is_device_stream_capturing
 
@@ -52,17 +53,58 @@ class RouteSortConsumer(Protocol):
         """Drop a sort that no experts call consumed."""
 
 
+class _RouteSortHandoff(msgspec.Struct):
+    # staged by the model layer: the consumer whose batch sizes may take the sort
+    consumer: Optional[RouteSortConsumer] = None
+    taken: bool = False
+    # bound by select_experts before the routing call
+    num_token_non_padded: Optional[torch.Tensor] = None
+    fused_routing_ok: bool = False
+
+
+_handoff = _RouteSortHandoff()
+
+
 def stage(consumer: RouteSortConsumer) -> None:
     """Ask the next radix-4 routing call for the fused sort, on the batch sizes
     the layer's consumer takes. The caller pairs this with clear() after the
     layer (try/finally)."""
-    route_quant_handoff.stage_route_sort(consumer)
+    global _handoff
+    _handoff = _RouteSortHandoff(consumer=consumer)
 
 
 def clear(consumer: RouteSortConsumer) -> None:
     """Drop the request and a sort that no experts call consumed."""
-    route_quant_handoff.clear()
+    global _handoff
+    _handoff = _RouteSortHandoff()
     consumer.drop()
+
+
+def staged() -> Optional[RouteSortConsumer]:
+    """The staged consumer, until clear(), for the MoE runner that consumes the
+    sort to show it the layer's experts call."""
+    return _handoff.consumer
+
+
+def bind_select_experts(
+    num_token_non_padded: Optional[torch.Tensor], fused_routing_ok: bool
+) -> None:
+    """Record the padding row count and whether select_experts leaves the
+    router's ids and weights as they are, which a sort of them needs."""
+    if _handoff.consumer is None:
+        return
+    _handoff.num_token_non_padded = num_token_non_padded
+    _handoff.fused_routing_ok = fused_routing_ok
+
+
+def _take() -> Tuple[Optional[RouteSortConsumer], Optional[torch.Tensor]]:
+    """Consume the staged request: its consumer if the routing may be sorted
+    (else None), and the padding row count bound for it."""
+    consumer = None
+    if not _handoff.taken and _handoff.fused_routing_ok:
+        consumer = _handoff.consumer
+    _handoff.taken = True
+    return consumer, _handoff.num_token_non_padded
 
 
 class _SortWorkspaces:
@@ -132,7 +174,7 @@ def try_route_sort_fused(
 
     Caller must have checked moe_route_radix4.covered().
     """
-    consumer, num_token_non_padded = route_quant_handoff.take_route_sort()
+    consumer, num_token_non_padded = _take()
     block_m = None if consumer is None else consumer.sort_block_m(scores.shape[0])
     if block_m not in moe_route_radix4.SORT_BLOCK_MS:
         return None
