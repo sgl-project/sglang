@@ -357,9 +357,15 @@ class CommonKVManager(BaseKVManager):
         self.customized_info_enabled = (
             envs.SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES.get() > 0
         )
-        self.exchange_aux_item_lens = self.customized_info_enabled or (
-            get_disagg().disaggregation_max_top_logprobs_num
-            != MetadataBuffers.DEFAULT_TOP_LOGPROBS_NUM
+        # With the sampling-mask buffer on, a prefill refuses a decode whose build
+        # has no sampled-logprob slot; an older prefill still passes src <= dst.
+        self.exchange_aux_item_lens = (
+            self.customized_info_enabled
+            or (
+                get_disagg().disaggregation_max_top_logprobs_num
+                != MetadataBuffers.DEFAULT_TOP_LOGPROBS_NUM
+            )
+            or envs.SGLANG_ENABLE_DISAGG_SAMPLING_MASK.get()
         )
         self.kv_cache_dtype_str = args.kv_cache_dtype_str
         self.kv_layout = args.kv_layout
