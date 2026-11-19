@@ -26,10 +26,6 @@ export HF_MODULES_CACHE="${HF_MODULES_CACHE:-/tmp/hf_modules}"
 echo "NPU info:"
 npu-smi info
 
-# =======temp install memfabric-hybrid and memcache-hybrid=====
-pip install memfabric-hybrid==1.5.0+b013 --trusted-host ascend.devcloud.huaweicloud.com -i https://ascend.devcloud.huaweicloud.com/pypi/simple
-pip install memcache-hybrid==1.5.0+b013 --trusted-host ascend.devcloud.huaweicloud.com -i https://ascend.devcloud.huaweicloud.com/pypi/simple
-
 # Apply the container patches prepared by the workflow: every entry in
 # SGLANG_NPU_CONTAINER_PATCHES is a directory (relative to the repo root) whose
 # install.sh ships with that patch archive. The workflow downloads and extracts
