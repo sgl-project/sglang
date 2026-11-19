@@ -493,17 +493,16 @@ def _get_pod_ip_by_keyword(configmap_data, keyword):
     return None
 
 
-# Pod name suffixes of the node that runs the memcache meta service, checked in
-# order. PD separation uses the first prefill pod, PD mix uses the master node.
-MEMCACHE_META_SERVICE_NODE_SUFFIXES = ("prefill-0", "sglang-node-0")
+# Pod name suffixes of the node that runs the HiCache L3 storage service
+# (Ascend MemCache MetaService or Mooncake master), checked in order. PD
+# separation uses the first prefill pod, PD mix uses the master node.
+STORAGE_SERVICE_NODE_SUFFIXES = ("prefill-0", "sglang-node-0")
 
 
-def _get_memcache_meta_service_ip(
-    timeout: int = LOCAL_TIMEOUT, poll_interval: int = 15
-):
-    """Get the IP of the memcache meta service host.
+def _get_storage_service_node_ip(timeout: int = LOCAL_TIMEOUT, poll_interval: int = 15):
+    """Get the IP of the node that hosts the HiCache L3 storage service.
 
-    The meta service always runs on the first prefill node:
+    The service always runs on the first prefill node:
     - single-machine run: the local node itself;
     - multi-node PD mix: the master node (``*-sglang-node-0``);
     - multi-node PD separation: the first prefill node (``*-prefill-0``).
@@ -513,37 +512,37 @@ def _get_memcache_meta_service_ip(
         poll_interval (int): Interval between checks in seconds.
 
     Returns:
-        str: IP of the node that hosts the meta service.
+        str: IP of the node that hosts the storage service.
 
     Raises:
         RuntimeError: If the node entry is not published in time.
     """
     if not (CONFIGMAP_NAME and NAMESPACE):
-        # Single-machine run: the meta service binds the local pod IP.
+        # Single-machine run: the service binds the local pod IP.
         from sglang.test.ascend.test_ascend_utils import resolve_local_ip
 
         node_ip = resolve_local_ip()
-        logger.info(f"Single-machine run, memcache meta service IP: {node_ip}")
+        logger.info(f"Single-machine run, HiCache storage service IP: {node_ip}")
         return node_ip
 
     start_time = time.time()
     while time.time() - start_time < timeout:
         configmap = query_configmap(CONFIGMAP_NAME, NAMESPACE)
         if configmap and configmap.data:
-            for suffix in MEMCACHE_META_SERVICE_NODE_SUFFIXES:
+            for suffix in STORAGE_SERVICE_NODE_SUFFIXES:
                 node_ip = _get_pod_ip_by_keyword(configmap.data, suffix)
                 if node_ip:
-                    logger.info(f"Memcache meta service IP ({suffix}): {node_ip}")
+                    logger.info(f"HiCache storage service IP ({suffix}): {node_ip}")
                     return node_ip
         logger.info(
-            "The memcache meta service node is not published in ConfigMap yet, "
+            "The HiCache storage service node is not published in ConfigMap yet, "
             "waiting ..."
         )
         time.sleep(poll_interval)
 
     raise RuntimeError(
-        f"Failed to get the memcache meta service IP "
-        f"({', '.join(MEMCACHE_META_SERVICE_NODE_SUFFIXES)}) "
+        f"Failed to get the HiCache storage service IP "
+        f"({', '.join(STORAGE_SERVICE_NODE_SUFFIXES)}) "
         f"from ConfigMap within {timeout}s"
     )
 
@@ -555,8 +554,8 @@ def get_memcache_meta_service_url(
 ):
     """Get the URL of a memcache meta service endpoint.
 
-    The host is the node that runs the meta service (see
-    ``_get_memcache_meta_service_ip``). The port is owned by the common helpers:
+    The host is the node that runs the storage service (see
+    ``_get_storage_service_node_ip``). The port is owned by the common helpers:
     it defaults to ``MEMCACHE_META_SERVICE_PORT``, and callers pass
     ``MEMCACHE_CONFIG_STORE_PORT`` for the config store endpoint, so the ports
     stay in one place instead of being hardcoded in each test case.
@@ -573,9 +572,7 @@ def get_memcache_meta_service_url(
         from sglang.test.ascend.test_ascend_utils import MEMCACHE_META_SERVICE_PORT
 
         port = MEMCACHE_META_SERVICE_PORT
-    host_ip = _get_memcache_meta_service_ip(
-        timeout=timeout, poll_interval=poll_interval
-    )
+    host_ip = _get_storage_service_node_ip(timeout=timeout, poll_interval=poll_interval)
     return f"tcp://{host_ip}:{port}"
 
 
@@ -663,6 +660,14 @@ def launch_pd_mix_node(model_config):
     for key, value in model_config["node_envs"].items():
         logger.info(f"ENV_VAR_CASE {key}:{value}")
         os.environ[key] = value
+
+    from sglang.test.ascend.test_ascend_utils import (
+        get_hicache_storage_backend,
+        set_mooncake_master_env,
+    )
+
+    if get_hicache_storage_backend(other_args) == "mooncake":
+        set_mooncake_master_env(master_node_ip)
 
     host_ip = get_host_ip()
     logger.info(f"Starting node, {host_ip=} {other_args=}")
@@ -869,6 +874,14 @@ def launch_pd_separation_node(model_config):
     #     other_args.extend(["--model-type", "llm"])
 
     other_args.extend(service_args)
+
+    from sglang.test.ascend.test_ascend_utils import (
+        get_hicache_storage_backend,
+        set_mooncake_master_env,
+    )
+
+    if get_hicache_storage_backend(service_args) == "mooncake":
+        set_mooncake_master_env(master_prefill_ip)
 
     try:
         process = popen_launch_server(

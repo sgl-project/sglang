@@ -14,6 +14,7 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
 from sglang.test.ascend.test_ascend_utils import (
     MEMCACHE_CONFIG_STORE_PORT,
     append_ld_library_path,
+    resolve_local_ip,
     write_memfabric_tent_conf,
 )
 from sglang.test.ci.ci_register import register_npu_ci
@@ -27,12 +28,18 @@ register_npu_ci(
 MOONCAKE_INSTALLED = importlib.util.find_spec("mooncake") is not None
 DISAGGREGATION_TRANSFER_BACKEND = "mooncake" if MOONCAKE_INSTALLED else "ascend"
 
+# Total host memory the prefill instance contributes to the Mooncake store; it
+# is split across the TP/PP ranks. Matches the MemCache max_dram_size default.
+MOONCAKE_GLOBAL_SEGMENT_SIZE = "64gb"
+
 # Mooncake + TENT + MemFabric, only used when the Mooncake package is present.
 MOONCAKE_ENVS = {
     "MC_USE_TENT": "1",
     "MF_PROTOCOL": "device_sdma",
     "MF_TRANSFER_TIMEOUT": "10000",
     "ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE": "true",
+    # Env form of the store capacity, read by MooncakeStoreConfig.load_from_env().
+    "MOONCAKE_GLOBAL_SEGMENT_SIZE": MOONCAKE_GLOBAL_SEGMENT_SIZE,
 }
 
 # Common environment variables for DSV4-Flash PD-Sep 128k1k deployment
@@ -116,15 +123,59 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_SPECULATIVE_ARGS = [
     5,
 ]
 
-# MemCache L3 storage config. Endpoint hosts and ports come from the common
-# helpers, so the meta service node (the first prefill node) is resolved at
-# setup time by get_memcache_meta_service_url().
-META_SERVICE_EXTRA_CONFIG_TEMPLATE = (
+# HiCache L3 storage config. Mooncake is used when the package is installed,
+# otherwise the case falls back to Ascend MemCache. The Mooncake master address
+# is exported as MOONCAKE_MASTER by the framework when it starts the master; the
+# MemCache endpoints come from the common helpers, so the storage service node
+# (the first prefill node) is resolved at setup time.
+MEMCACHE_EXTRA_CONFIG_TEMPLATE = (
     '{{"meta_service_url":"{meta_service_url}", '
     '"config_store_url":"{config_store_url}", '
     '"log_level":"info", "world_size":32, "protocol": "device_sdma", '
     '"prefetch_threshold": 1, "dram_size": "10GB"}}'
 )
+# SGLang reads this key itself (it never reaches the storage backend) and keeps
+# the L3 prefetch behavior of the previous MemCache setup.
+HICACHE_EXTRA_CONFIG = '{"prefetch_threshold": 1}'
+
+
+def build_hicache_args():
+    """Build the HiCache args for the backend available in this image.
+
+    Mooncake is preferred. Images without the package fall back to Ascend
+    MemCache, whose endpoints are resolved from the storage service node at
+    setup time.
+    """
+    args = [
+        "--enable-hierarchical-cache",
+        "--hicache-io-backend",
+        "kernel_ascend",
+        "--hicache-ratio",
+        1.2,
+        "--hicache-write-policy",
+        "write_through",
+    ]
+    if MOONCAKE_INSTALLED:
+        args += [
+            "--hicache-storage-backend",
+            "mooncake",
+            "--hicache-storage-backend-extra-config",
+            HICACHE_EXTRA_CONFIG,
+        ]
+    else:
+        args += [
+            "--hicache-storage-backend",
+            "npu_memcache",
+            "--hicache-storage-backend-extra-config",
+            MEMCACHE_EXTRA_CONFIG_TEMPLATE.format(
+                meta_service_url=get_memcache_meta_service_url(),
+                config_store_url=get_memcache_meta_service_url(
+                    port=MEMCACHE_CONFIG_STORE_PORT
+                ),
+            ),
+        ]
+    return args
+
 
 # Prefill node launch arguments for DSV4-Flash PD-Sep 128k1k
 DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_PREFILL_ARGS = [
@@ -189,17 +240,6 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_PREFILL_ARGS = [
     "--expert-distribution-recorder-buffer-size",
     512,
     *DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_SPECULATIVE_ARGS,
-    "--enable-hierarchical-cache",
-    "--hicache-io-backend",
-    "kernel_ascend",
-    "--hicache-storage-backend",
-    "mooncake",
-    "--hicache-ratio",
-    1.2,
-    "--hicache-write-policy",
-    "write_through",
-    "--hicache-storage-backend-extra-config",
-    META_SERVICE_EXTRA_CONFIG_TEMPLATE,
 ]
 
 # Decode node launch arguments for DSV4-Flash PD-Sep 128k1k
@@ -296,22 +336,18 @@ class TestNPUDeepSeekV4FlashW8A81P1D16PIn128kOut1k20msAisBench(
         if MOONCAKE_INSTALLED:
             common_envs.update(MOONCAKE_ENVS)
             common_envs["MC_TENT_CONF"] = write_memfabric_tent_conf()
+            # Each node registers itself with the Mooncake store under its own
+            # hostname instead of the shared "localhost" default.
+            common_envs["MOONCAKE_LOCAL_HOSTNAME"] = resolve_local_ip()
             common_envs["LD_LIBRARY_PATH"] = append_ld_library_path(
                 ("memfabric_hybrid", "lib"), ("mooncake", None)
             )
-        prefill_args = list(DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_PREFILL_ARGS)
-        extra_config_index = (
-            prefill_args.index("--hicache-storage-backend-extra-config") + 1
-        )
-        prefill_args[extra_config_index] = META_SERVICE_EXTRA_CONFIG_TEMPLATE.format(
-            meta_service_url=get_memcache_meta_service_url(),
-            config_store_url=get_memcache_meta_service_url(
-                port=MEMCACHE_CONFIG_STORE_PORT
-            ),
-        )
         cls.model_config = {
             **DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_MODEL_CONFIG,
-            "prefill_args": prefill_args,
+            "prefill_args": [
+                *DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_PREFILL_ARGS,
+                *build_hicache_args(),
+            ],
             "decode_args": list(DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_DECODE_ARGS),
             "prefill_envs": {
                 **common_envs,

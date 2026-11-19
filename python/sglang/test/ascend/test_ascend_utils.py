@@ -1001,39 +1001,107 @@ def start_memcache_meta_service(
 
 
 HICACHE_STORAGE_BACKEND_ARG = "--hicache-storage-backend"
-# HiCache storage backends that connect through the memcache meta service.
-MEMCACHE_STORAGE_BACKENDS = ("mooncake", "npu_memcache")
+
+# Default port of the Mooncake master service. It avoids the ports the test
+# framework already uses: --dist-init-addr (5000), the PD separation worker
+# HTTP server (8000) and the MemCache components (5007/6007/8007).
+MOONCAKE_MASTER_PORT = 50051
 
 
-def maybe_start_memcache_meta_service(other_args):
-    """Start the memcache meta service when HiCache L3 uses memcache storage.
+def get_hicache_storage_backend(other_args):
+    """Return the ``--hicache-storage-backend`` value in ``other_args``."""
+    args = [str(arg) for arg in other_args or []]
+    for i, arg in enumerate(args):
+        if arg == HICACHE_STORAGE_BACKEND_ARG:
+            return args[i + 1] if i + 1 < len(args) else None
+        if arg.startswith(f"{HICACHE_STORAGE_BACKEND_ARG}="):
+            return arg.split("=", 1)[1]
+    return None
 
-    The ``mooncake`` and ``npu_memcache`` storage backends connect through the
-    meta service, so every other backend is skipped.
+
+def start_mooncake_master(
+    master_port=MOONCAKE_MASTER_PORT,
+    eviction_high_watermark_ratio=0.95,
+):
+    """Start the Mooncake master service on the current node.
+
+    SGLang servers are Mooncake store clients: with a non-zero
+    ``global_segment_size`` they contribute their own memory, so no separate
+    store service is needed and the master is the only required process. The
+    metadata server keeps its ``P2PHANDSHAKE`` default, which avoids needing a
+    shared metadata endpoint (and its auth token) for multi-node runs.
+
+    Args:
+        master_port (int): Port the master service listens on.
+        eviction_high_watermark_ratio (float): Watermark that triggers eviction.
+
+    Returns:
+        subprocess.Popen: The Mooncake master process.
+    """
+    command = [
+        "mooncake_master",
+        f"--port={master_port}",
+        f"--eviction_high_watermark_ratio={eviction_high_watermark_ratio}",
+    ]
+    logger.info(f"Starting mooncake master: {' '.join(command)}")
+    try:
+        process = subprocess.Popen(command)
+        logger.info(f"Mooncake master started with PID: {process.pid}")
+    except Exception as e:
+        raise RuntimeError(f"Failed to start mooncake master: {e}")
+
+    return process
+
+
+def set_mooncake_master_env(host_ip=None):
+    """Point the SGLang servers launched next at the Mooncake master.
+
+    ``MOONCAKE_MASTER`` is the environment form of
+    ``master_server_address``: the store reads it through
+    ``MooncakeStoreConfig.load_from_env()`` when
+    ``--hicache-storage-backend-extra-config`` carries no explicit address, so
+    each launching node only needs the resolved master address in its
+    environment.
+
+    Args:
+        host_ip (str): Node that runs the master. Defaults to this node.
+
+    Returns:
+        str: The ``<host>:<port>`` address written to the environment.
+    """
+    address = f"{host_ip or resolve_local_ip()}:{MOONCAKE_MASTER_PORT}"
+    os.environ["MOONCAKE_MASTER"] = address
+    logger.info(f"Setting ENV_VAR MOONCAKE_MASTER={address}")
+    return address
+
+
+def maybe_start_hicache_storage_service(other_args):
+    """Start the external service required by the HiCache L3 backend.
+
+    ``npu_memcache`` connects through the Ascend MemCache MetaService, while
+    ``mooncake`` connects through the Mooncake master service. Other backends
+    need no external process and are skipped.
+
+    For ``mooncake`` the master address is also exported as
+    ``MOONCAKE_MASTER`` so the server launched from this process picks it up
+    from the environment.
 
     Args:
         other_args (list): Server launch args.
 
     Returns:
-        subprocess.Popen: The meta service process, or None if not started.
+        subprocess.Popen: The storage service process, or None if not started.
     """
-    if not other_args:
-        return None
-    args = [str(arg) for arg in other_args]
-    backend = None
-    for i, arg in enumerate(args):
-        if arg == HICACHE_STORAGE_BACKEND_ARG:
-            backend = args[i + 1] if i + 1 < len(args) else None
-            break
-        if arg.startswith(f"{HICACHE_STORAGE_BACKEND_ARG}="):
-            backend = arg.split("=", 1)[1]
-            break
-    if backend not in MEMCACHE_STORAGE_BACKENDS:
-        return None
-
-    process = start_memcache_meta_service()
-    logger.info(f"Memcache meta service started with PID: {process.pid}")
-    return process
+    backend = get_hicache_storage_backend(other_args)
+    if backend == "npu_memcache":
+        process = start_memcache_meta_service()
+        logger.info(f"Memcache meta service started with PID: {process.pid}")
+        return process
+    if backend == "mooncake":
+        process = start_mooncake_master()
+        set_mooncake_master_env()
+        return process
+    return None
 
 
 def append_ld_library_path(*module_specs):

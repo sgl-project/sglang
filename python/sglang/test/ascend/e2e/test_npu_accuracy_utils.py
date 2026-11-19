@@ -22,7 +22,7 @@ from sglang.test.ascend.e2e.test_npu_multi_node_utils import (
     start_router_thread,
     wait_server_ready,
 )
-from sglang.test.ascend.test_ascend_utils import maybe_start_memcache_meta_service
+from sglang.test.ascend.test_ascend_utils import maybe_start_hicache_storage_service
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -584,6 +584,11 @@ class TestNpuAccuracyTestCaseBase(CustomTestCase):
     def setUpClass(cls):
         cls._setup_per_case_output()
         cls.base_url = DEFAULT_URL_FOR_TEST
+        # Start the storage service first: it may export MOONCAKE_* variables
+        # that the server environment copy below has to pick up.
+        other_args = list(cls.other_args)
+        cls.storage_service_process = maybe_start_hicache_storage_service(other_args)
+
         env = os.environ.copy()
         for key, value in env.items():
             logger.info(f"ENV_VAR_SYS {key}:{value}")
@@ -591,9 +596,6 @@ class TestNpuAccuracyTestCaseBase(CustomTestCase):
             for key, value in cls.envs.items():
                 logger.info(f"ENV_VAR_CASE {key}:{value}")
                 env[key] = value
-
-        other_args = list(cls.other_args)
-        cls.meta_service_process = maybe_start_memcache_meta_service(other_args)
 
         cls.process = popen_launch_server(
             cls.model,
@@ -610,12 +612,12 @@ class TestNpuAccuracyTestCaseBase(CustomTestCase):
                 kill_process_tree(cls.process.pid)
             except Exception as e:
                 logger.error(f"Error during tearDown: {e}")
-        meta_service_process = getattr(cls, "meta_service_process", None)
-        if meta_service_process:
+        storage_service_process = getattr(cls, "storage_service_process", None)
+        if storage_service_process:
             try:
-                kill_process_tree(meta_service_process.pid)
+                kill_process_tree(storage_service_process.pid)
             except Exception as e:
-                logger.error(f"Error during meta service teardown: {e}")
+                logger.error(f"Error during storage service teardown: {e}")
         cls._save_metrics_json()
         cls._backup_plog()
 
@@ -665,17 +667,17 @@ class TestNpuAccuracyMultiNodePdMixTestCaseBase(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        meta_service_process = getattr(cls, "meta_service_process", None)
-        if meta_service_process:
+        storage_service_process = getattr(cls, "storage_service_process", None)
+        if storage_service_process:
             try:
-                kill_process_tree(meta_service_process.pid)
+                kill_process_tree(storage_service_process.pid)
             except Exception as e:
-                logger.error(f"Error during meta service teardown: {e}")
+                logger.error(f"Error during storage service teardown: {e}")
 
     @classmethod
     @check_role(allowed_roles=["master"])
     def start_pd_mix_master_node(cls):
-        cls.meta_service_process = maybe_start_memcache_meta_service(
+        cls.storage_service_process = maybe_start_hicache_storage_service(
             cls.model_config.get("other_args")
         )
         sglang_thread = threading.Thread(
@@ -758,12 +760,12 @@ class TestNpuAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
                 kill_process_tree(cls.process.pid)
             except Exception as e:
                 logger.error(f"Error during tearDown: {e}")
-        meta_service_process = getattr(cls, "meta_service_process", None)
-        if meta_service_process:
+        storage_service_process = getattr(cls, "storage_service_process", None)
+        if storage_service_process:
             try:
-                kill_process_tree(meta_service_process.pid)
+                kill_process_tree(storage_service_process.pid)
             except Exception as e:
-                logger.error(f"Error during meta service teardown: {e}")
+                logger.error(f"Error during storage service teardown: {e}")
 
     @classmethod
     @check_role(allowed_roles=["router"])
@@ -779,7 +781,7 @@ class TestNpuAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
     @check_role(allowed_roles=["prefill", "decode"])
     def start_pd_server(cls):
         if cls.hostname.endswith("prefill-0"):
-            cls.meta_service_process = maybe_start_memcache_meta_service(
+            cls.storage_service_process = maybe_start_hicache_storage_service(
                 cls.model_config.get("prefill_args")
             )
         logger.info(f"Starting pd separation node...")
