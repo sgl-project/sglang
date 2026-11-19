@@ -255,7 +255,8 @@ install_gdrcopy() {
                 awk 'NF {count++} END {print count + 0}'
         )
     fi
-    if [ "${gpu_count}" -lt 4 ]; then
+    # INSTALL_GDRCOPY=1 forces the build where nvidia-smi sees no GPUs, e.g. docker/ci.Dockerfile.
+    if [ "${gpu_count}" -lt 4 ] && [ "${INSTALL_GDRCOPY:-0}" != "1" ]; then
         echo "Skipping GDRCopy install on ${gpu_count}-GPU runner"
         mark_step_done "${FUNCNAME[0]}"
         return
