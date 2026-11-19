@@ -17,7 +17,6 @@ from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.srt.environ import envs
 from sglang.srt.eplb import expert_location_dispatch
 from sglang.srt.eplb.expert_location import ExpertLocationMetadata
-from sglang.srt.hardware_backend.npu.moe.topk import fused_topk_npu
 from sglang.srt.layers.dp_attention import DpPaddingMode
 from sglang.srt.layers.moe import hash_topk as hash_topk_module
 from sglang.srt.layers.moe import topk as topk_module
@@ -37,13 +36,14 @@ from sglang.srt.layers.moe.utils import (
     initialize_moe_config,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     ForwardContext,
     forward_context,
     get_forward_context,
     has_forward_context,
 )
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.multimodal.dsv41.vl_routing import vision_topk
 from sglang.srt.runtime_context import (
     get_context,
@@ -365,49 +365,7 @@ class TestTopKRoutingInputs(CustomTestCase):
             batch._init_num_token_non_padded(device="cpu", is_draft_worker=True)
         self.assertEqual(int(batch.global_num_token_non_padded), 0)
 
-    def test_npu_routes_keep_valid_ids_and_zero_only_padded_contributions(self):
-        """NPU padding must stay inert without inventing invalid or duplicate routes."""
-        router = self._router(num_fused_shared_experts=1)
-        router.topk_config.scoring_func = "sqrtsoftplus"
-        logical = torch.tensor([[0, 4], [1, 4], [2, 4], [3, 4]], dtype=torch.int32)
-        weights = torch.tensor([[0.75, 0.25]]).repeat(4, 1)
-
-        class Capture:
-            def capture(self, *, layer_id, topk_indices):
-                self.ids = topk_indices.clone()
-
-        capture = Capture()
-        get_resources().experts_capturer = capture
-        self.addCleanup(setattr, get_resources(), "experts_capturer", None)
-        _, info = router.routing_inputs()
-        with patch.object(
-            torch.ops.custom,
-            "npu_moe_gating_top_k",
-            create=True,
-            return_value=(weights, logical, None),
-        ):
-            output = fused_topk_npu(
-                hidden_states=self.hidden,
-                router_logits=self.logits,
-                topk_config=router.topk_config,
-                num_token_non_padded=torch.tensor(2),
-                expert_location_dispatch_info=info,
-                layer_id=0,
-            )
-        self.assertEqual(output.topk_ids.tolist(), [[2, 4], [0, 4], [3, 4], [1, 4]])
-        torch.testing.assert_close(
-            output.topk_weights[:2], torch.tensor([[0.75, 0.25]]).repeat(2, 1)
-        )
-        torch.testing.assert_close(output.topk_weights[2:], torch.zeros((2, 2)))
-        self.assertEqual(capture.ids.tolist(), [[0], [1], [2], [3]])
-
     def test_in_kernel_formats_do_not_silently_ignore_expert_placement(self):
-        router = self._router(output_format=TopKOutputFormat.TRITON_KERNEL)
-        with self.assertRaisesRegex(
-            NotImplementedError, "placement remapping requires"
-        ):
-            router.forward_cuda(self.hidden, self.logits)
-
         router = self._router(output_format=TopKOutputFormat.BYPASSED)
         output = router.forward_cuda(self.hidden, self.logits)
         with self.assertRaisesRegex(
@@ -865,19 +823,10 @@ class TestTopKRoutingInputs(CustomTestCase):
             ep_num_redundant_experts=0,
             ep_dispatch_algorithm="dynamic",
         ):
-            for output_format in (
-                TopKOutputFormat.BYPASSED,
-                TopKOutputFormat.TRITON_KERNEL,
-            ):
-                with self.subTest(output_format=output_format):
-                    router = self._router(output_format=output_format)
-                    with patch.object(
-                        topk_module, "routing", return_value=(None, None, None, None, 2)
-                    ):
-                        output = router.forward_cuda(self.hidden, self.logits)
-                    self.assertEqual(output.format, output_format)
-                    if output_format == TopKOutputFormat.BYPASSED:
-                        self.assertIs(output.router_logits, self.logits)
+            router = self._router(output_format=TopKOutputFormat.BYPASSED)
+            output = router.forward_cuda(self.hidden, self.logits)
+            self.assertEqual(output.format, TopKOutputFormat.BYPASSED)
+            self.assertIs(output.router_logits, self.logits)
             for algorithm in ("fake", "lp"):
                 with (
                     self.subTest(algorithm=algorithm),

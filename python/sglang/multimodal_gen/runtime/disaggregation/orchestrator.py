@@ -20,6 +20,7 @@ import zmq
 from transformers import AutoProcessor
 from zmq.utils.monitor import recv_monitor_message
 
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.disaggregation.dispatch_policy import (
     DispatchPolicy,
     PoolDispatcher,
@@ -42,6 +43,10 @@ from sglang.multimodal_gen.runtime.disaggregation.transport.protocol import (
     decode_transfer_msg,
     encode_transfer_msg,
     is_transfer_message,
+)
+from sglang.multimodal_gen.runtime.disaggregation.transport.request import (
+    RequestUnpickler,
+    request_pickle_globals,
 )
 from sglang.multimodal_gen.runtime.observability.metrics import init_metrics
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
@@ -186,7 +191,9 @@ class DiffusionServer:
         image_encoder_work_endpoints: list[str] | None = None,
         prompt_encoder_result_endpoint: str | None = None,
         image_encoder_result_endpoint: str | None = None,
+        sampling_params_cls: type = SamplingParams,
     ):
+        self._request_pickle_globals = request_pickle_globals(sampling_params_cls)
         split_encoding = bool(
             prompt_encoder_work_endpoints or image_encoder_work_endpoints
         )
@@ -337,14 +344,6 @@ class DiffusionServer:
         self._assignments: dict[str, dict[RoleType, int]] = {}
 
     @property
-    def tracker(self) -> RequestTracker:
-        return self._tracker
-
-    @property
-    def dispatcher(self) -> PoolDispatcher:
-        return self._dispatcher
-
-    @property
     def is_alive(self) -> bool:
         return self._running and self._thread is not None and self._thread.is_alive()
 
@@ -419,16 +418,20 @@ class DiffusionServer:
         poller.register(frontend, zmq.POLLIN)
         result_roles = {}
         all_sockets = [frontend]
+        # bind fixed listeners before outbound connections can claim their ports
         for role, pool in self._pools.items():
-            for endpoint in pool.endpoints:
-                sock, _ = get_zmq_socket(self._context, zmq.PUSH, endpoint, bind=False)
-                pool.pushes.append(sock)
             result, _ = get_zmq_socket(
                 self._context, zmq.PULL, pool.result_endpoint, bind=True, same_port=True
             )
             poller.register(result, zmq.POLLIN)
             result_roles[result] = role
-            all_sockets.extend([result, *pool.pushes])
+            all_sockets.append(result)
+
+        for pool in self._pools.values():
+            for endpoint in pool.endpoints:
+                sock, _ = get_zmq_socket(self._context, zmq.PUSH, endpoint, bind=False)
+                pool.pushes.append(sock)
+            all_sockets.extend(pool.pushes)
 
         self._encoder_pushes = self._pools[self._input_role].pushes
         self._denoiser_pushes = self._pools[RoleType.DENOISER].pushes
@@ -551,7 +554,7 @@ class DiffusionServer:
         payload = parts[-1]
 
         try:
-            reqs = pickle.loads(payload)
+            reqs = RequestUnpickler(payload, self._request_pickle_globals).load()
             if not isinstance(reqs, list):
                 reqs = [reqs]
             if len(reqs) != 1:

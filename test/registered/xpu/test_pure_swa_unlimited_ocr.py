@@ -19,7 +19,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_xpu_ci(est_time=180, suite="stage-b-test-1-gpu-xpu")
+register_xpu_ci(est_time=180, suite="extra-test-1-gpu-xpu")
 
 # Every layer of Unlimited-OCR is sliding-window (window 128), so it runs on
 # PureSWATokenToKVPoolAllocator, which is page_size 1 only.

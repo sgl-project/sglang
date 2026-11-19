@@ -16,7 +16,7 @@ import torch
 from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_xpu_ci(est_time=30, suite="stage-b-test-1-gpu-xpu")
+register_xpu_ci(est_time=30, suite="extra-test-1-gpu-xpu")
 
 PAGE, H, HKV, D = 128, 8, 4, 128
 
@@ -230,7 +230,7 @@ class TestXPUGemma4ImageBlockIds(CustomTestCase):
         from unittest import mock
 
         from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.model_executor.forward_mode import ForwardMode
         from sglang.srt.models import gemma4_mm
 
         backend = XPUAttentionBackend.__new__(XPUAttentionBackend)
