@@ -466,6 +466,8 @@ class TestStreamOrderedMmFeaturePool(CustomTestCase):
     def test_complete_group_acknowledges_each_consumer_slot(self):
         from sglang.srt.multimodal.transport import memory_pool
 
+        # Pin the CUDA value-write ack branch so the test stays host-platform
+        # independent; the NPU plain-fill branch has its own test.
         consumer = memory_pool.StreamOrderedPoolConsumerMixin()
         # NPU stamps 64-bit control words, so both the ack offset and the stride
         # follow the platform's CONTROL_WORD_BYTES rather than a hardcoded 4.
@@ -482,7 +484,10 @@ class TestStreamOrderedMmFeaturePool(CustomTestCase):
             1000 + ack_byte_offset + rank * memory_pool.CONTROL_WORD_BYTES
             for rank in range(4)
         ]
-        with patch.object(memory_pool, "stream_write_value") as write:
+        with (
+            patch.object(memory_pool, "_is_npu", False),
+            patch.object(memory_pool, "stream_write_value") as write,
+        ):
             consumer._acknowledge_on_stream(1000, 0, consumer_count=4)
 
         self.assertEqual(
@@ -508,6 +513,100 @@ class TestStreamOrderedMmFeaturePool(CustomTestCase):
 
         acl_module.return_value.rt.value_wait.assert_called_once_with(4096, 5, 0, 7)
         acl_module.return_value.rt.value_write.assert_called_once_with(4096, 5, 0, 7)
+
+    def test_npu_consumer_wait_relies_on_producer_fence(self):
+        from sglang.srt.multimodal.transport import memory_pool
+
+        consumer = memory_pool.StreamOrderedPoolConsumerMixin()
+        consumer._init_stream_ordered_consumer(
+            ready_byte_offset=0,
+            ack_byte_offset=memory_pool.CONTROL_WORD_BYTES,
+            generation=5,
+            total_consumer_count=1,
+            transport_name="test",
+        )
+        with (
+            patch.object(memory_pool, "_is_npu", True),
+            patch.object(memory_pool, "stream_wait_value") as wait,
+        ):
+            consumer._wait_until_ready(4096, 0)
+
+        wait.assert_not_called()
+
+    def test_npu_consumer_ack_writes_pool_words_with_plain_fill(self):
+        from sglang.srt.multimodal.transport import memory_pool
+
+        consumer = memory_pool.StreamOrderedPoolConsumerMixin()
+        consumer._init_stream_ordered_consumer(
+            ready_byte_offset=64,
+            ack_byte_offset=64 + memory_pool.CONTROL_WORD_BYTES,
+            generation=3,
+            total_consumer_count=4,
+            transport_name="test",
+        )
+        pool_bytes = MagicMock()
+        with (
+            patch.object(memory_pool, "_is_npu", True),
+            patch.object(memory_pool, "stream_write_value") as write,
+        ):
+            consumer._acknowledge_on_stream(
+                1000, 0, consumer_count=4, pool_bytes=pool_bytes
+            )
+
+        # One contiguous plain-kernel fill over all four ack words replaces the
+        # per-rank runtime value writes of the CUDA protocol.
+        write.assert_not_called()
+        start = 64 + memory_pool.CONTROL_WORD_BYTES
+        stop = start + 4 * memory_pool.CONTROL_WORD_BYTES
+        pool_bytes.__getitem__.assert_called_once_with(slice(start, stop))
+        words = pool_bytes.__getitem__.return_value
+        words.view.assert_called_once_with(memory_pool.CONTROL_WORD_DTYPE)
+        words.view.return_value.fill_.assert_called_once_with(3)
+        self.assertTrue(consumer._consumer_acknowledged)
+
+    def test_npu_consumer_ack_requires_the_pool_view(self):
+        from sglang.srt.multimodal.transport import memory_pool
+
+        consumer = memory_pool.StreamOrderedPoolConsumerMixin()
+        consumer._init_stream_ordered_consumer(
+            ready_byte_offset=0,
+            ack_byte_offset=memory_pool.CONTROL_WORD_BYTES,
+            generation=1,
+            total_consumer_count=1,
+            transport_name="test",
+        )
+        with patch.object(memory_pool, "_is_npu", True):
+            with self.assertRaisesRegex(RuntimeError, "pool bytes view"):
+                consumer._acknowledge_on_stream(1000, 0, consumer_count=1)
+
+    def test_fence_for_dispatch_drains_recorded_copy_streams(self):
+        from sglang.srt.multimodal.transport import memory_pool
+        from sglang.srt.multimodal.transport.memory_pool import (
+            StreamOrderedMmFeaturePool,
+        )
+
+        pool = object.__new__(StreamOrderedMmFeaturePool)
+        streams = {11: MagicMock(), 13: MagicMock()}
+        pool._copy_streams = dict(streams)
+        pool._lock = threading.Lock()
+        with patch.object(memory_pool, "_is_npu", True):
+            pool.fence_for_dispatch()
+
+        for stream in streams.values():
+            stream.synchronize.assert_called_once_with()
+        self.assertEqual(pool._copy_streams, {})
+
+    def test_fence_for_dispatch_is_a_no_op_on_cuda(self):
+        from sglang.srt.multimodal.transport import memory_pool
+        from sglang.srt.multimodal.transport.memory_pool import (
+            StreamOrderedMmFeaturePool,
+        )
+
+        pool = object.__new__(StreamOrderedMmFeaturePool)
+        pool._copy_streams = {}
+        pool._lock = threading.Lock()
+        with patch.object(memory_pool, "_is_npu", False):
+            pool.fence_for_dispatch()  # must not raise or touch streams
 
     def test_reused_pool_slot_gets_new_generation(self):
         from sglang.srt.multimodal.transport.memory_pool import (

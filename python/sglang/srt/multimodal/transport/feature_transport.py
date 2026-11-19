@@ -6,6 +6,7 @@ import torch
 
 from sglang.srt.managers.req_types import MultimodalDataItem
 from sglang.srt.multimodal.transport.cuda_ipc import (
+    _TRANSPORT_NAME,
     MM_FEATURE_CACHE_SIZE,
     MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
     CudaIpcTensorTransportProxy,
@@ -44,7 +45,7 @@ class MultimodalFeatureTransport:
             self.use_cuda_ipc and envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.get()
         )
         self.cudaipc_mmfeature_pool = (
-            _create_cuda_ipc_pool(base_gpu_id, self.mm_feature_transport)
+            _create_cuda_ipc_pool(base_gpu_id)
             if self.use_cuda_ipc and not skip_mm_pool
             else None
         )
@@ -105,6 +106,11 @@ class MultimodalFeatureTransport:
                 )
                 raise error from rollback_errors[0]
             raise
+
+        # NPU: proxies must not leave this process before their pool copies
+        # have completed; the fence is a no-op on CUDA.
+        if self.cudaipc_mmfeature_pool is not None:
+            self.cudaipc_mmfeature_pool.fence_for_dispatch()
         return mm_items
 
     def _wrap_tensor_for_cuda_ipc(self, tensor: torch.Tensor):
@@ -119,9 +125,7 @@ class MultimodalFeatureTransport:
         return proxy if proxy is not None else tensor.cpu()
 
 
-def _create_cuda_ipc_pool(
-    base_gpu_id: int, mm_feature_transport: str
-) -> MmItemMemoryPool:
+def _create_cuda_ipc_pool(base_gpu_id: int) -> MmItemMemoryPool:
     # SGLANG_MM_FEATURE_CACHE_MB is the total pool budget across all
     # tokenizer workers. Each worker gets an equal share so that adding
     # workers doesn't multiply the GPU-side footprint.
@@ -134,7 +138,7 @@ def _create_cuda_ipc_pool(
         "%s multimodal feature pools reserve %.0f MiB total on "
         "device %d (%.0f MiB per tokenizer worker × %d; configured "
         "budget %.0f MiB).",
-        "NPU IPC" if mm_feature_transport == "npu_ipc" else "CUDA IPC",
+        _TRANSPORT_NAME,
         total_pool_size / (1024 * 1024),
         base_gpu_id,
         per_worker_pool_size / (1024 * 1024),

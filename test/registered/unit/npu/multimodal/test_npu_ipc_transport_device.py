@@ -34,10 +34,13 @@ def _produce_pooled_tensor(proxy_queue, consumer_done, result_queue):
         proxy = pool.wrap_tensor(source, use_pool_handle_cache=True)
         if proxy is None:
             raise RuntimeError("test tensor did not fit in the NPU IPC pool")
+        # Handing the proxy to another process is the dispatch point, mirroring
+        # prepare_mm_items_for_transport: the consumer reads with no wait.
+        pool.fence_for_dispatch()
         proxy_queue.put((proxy, expected))
-        if not consumer_done.wait(timeout=60):
+        if not consumer_done.wait(timeout=120):
             raise TimeoutError("consumer did not acknowledge the NPU IPC tensor")
-        deadline = time.monotonic() + 30
+        deadline = time.monotonic() + 60
         while time.monotonic() < deadline:
             if pool.active_lease_count == 0:
                 break
@@ -61,7 +64,9 @@ def _consume_pooled_tensor(proxy_queue, result_queue, rebuild_device=0):
     try:
         torch.npu.set_device(rebuild_device)
         try:
-            proxy, expected = proxy_queue.get(timeout=60)
+            # Generous: the producer is a freshly spawned process whose cold
+            # torch/torch_npu/CANN initialization can outlast short timeouts.
+            proxy, expected = proxy_queue.get(timeout=300)
         except queue.Empty:
             raise TimeoutError("consumer never received the NPU IPC proxy")
         reconstructed = proxy.reconstruct_on_target_device(rebuild_device)
@@ -72,6 +77,21 @@ def _consume_pooled_tensor(proxy_queue, result_queue, rebuild_device=0):
         result_queue.put(("error", repr(exc)))
         return
     result_queue.put(("ok", None))
+
+
+def _describe_producer_outcome(producer, producer_results) -> str:
+    """A consumer timeout usually just mirrors a producer-side failure."""
+    try:
+        outcome = producer_results.get(timeout=5)
+    except queue.Empty:
+        outcome = None
+    if outcome is None:
+        state = (
+            "still running" if producer.is_alive() else f"exitcode {producer.exitcode}"
+        )
+        return f"producer status: {state}, no result reported"
+    status, detail = outcome
+    return f"producer status: {status}" + (f" ({detail})" if detail else "")
 
 
 def _run_producer_consumer_test(test, consumer_device=0):
@@ -92,17 +112,23 @@ def _run_producer_consumer_test(test, consumer_device=0):
     consumer.start()
     try:
         try:
-            consumer_result = consumer_results.get(timeout=120)
+            consumer_result = consumer_results.get(timeout=360)
         except queue.Empty:
-            test.fail("NPU IPC consumer did not report in time")
+            test.fail(
+                "NPU IPC consumer did not report in time. "
+                + _describe_producer_outcome(producer, producer_results)
+            )
         consumer.join(timeout=10)
         if consumer_result[0] != "ok":
-            test.fail(f"NPU IPC consumer failed: {consumer_result[1]}")
+            test.fail(
+                f"NPU IPC consumer failed: {consumer_result[1]}. "
+                + _describe_producer_outcome(producer, producer_results)
+            )
         test.assertEqual(consumer.exitcode, 0)
 
         consumer_done.set()
         try:
-            producer_result = producer_results.get(timeout=120)
+            producer_result = producer_results.get(timeout=240)
         except queue.Empty:
             test.fail("NPU IPC producer did not finish after the consumer exited")
         test.assertEqual(producer_result[0], "ok", producer_result[1])
@@ -129,12 +155,8 @@ class TestNpuIpcTransportOnDevice(CustomTestCase):
         "requires two NPUs",
     )
     def test_pooled_tensor_reconstructs_across_devices(self):
-        """The consumer waits and acknowledges through a cross-device mapping.
-
-        TP deployments put scheduler ranks on other devices than the pool's
-        base NPU; the control-word wait/write must work over that peer view
-        of the imported pool, not only on the pool's home device.
-        """
+        """The plain-kernel acknowledgement must work over a cross-device
+        peer view of the imported pool, as TP deployments require."""
         _run_producer_consumer_test(self, consumer_device=1)
 
 

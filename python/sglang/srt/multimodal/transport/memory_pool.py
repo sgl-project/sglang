@@ -53,7 +53,12 @@ def _acl_module():
 def stream_wait_value(
     device_id: int, address: int, value: int, transport_name: str
 ) -> None:
-    """Enqueue a stream-ordered wait until the pool word at ``address`` reaches ``value``."""
+    """Enqueue a stream-ordered wait until the pool word at ``address`` reaches ``value``.
+
+    NPU: producer-local addresses only (A5 CANN rejects value ops on
+    IPC-imported memory); consumers never wait, the producer fence orders
+    their reads instead.
+    """
     if _is_npu:
         acl = _acl_module()
         stream = get_device_module().current_stream(device_id).npu_stream
@@ -74,7 +79,11 @@ def stream_wait_value(
 def stream_write_value(
     device_id: int, address: int, value: int, transport_name: str
 ) -> None:
-    """Enqueue a stream-ordered write of ``value`` to the pool word at ``address``."""
+    """Enqueue a stream-ordered write of ``value`` to the pool word at ``address``.
+
+    NPU: producer-local addresses only; consumers acknowledge through the
+    imported pool view with a plain kernel write instead.
+    """
     if _is_npu:
         acl = _acl_module()
         stream = get_device_module().current_stream(device_id).npu_stream
@@ -140,6 +149,16 @@ class StreamOrderedPoolConsumerMixin:
         self._consumer_acknowledged = False
 
     def _wait_until_ready(self, base_address: int, device_id: int) -> None:
+        if _is_npu:
+            # The producer fence made the bytes complete before the proxy was
+            # dispatched; aclrtValueWait cannot check that on an imported
+            # address anyway.
+            logger.debug(
+                "%s producer fence replaces the ready wait (generation=%d)",
+                self.transport_name,
+                self.generation,
+            )
+            return
         stream_wait_value(
             device_id,
             base_address + self.ready_byte_offset,
@@ -153,6 +172,8 @@ class StreamOrderedPoolConsumerMixin:
         device_id: int,
         consumer_count: int,
         consumer_rank: Optional[int] = None,
+        *,
+        pool_bytes: Optional[torch.Tensor] = None,
     ) -> None:
         if self._consumer_acknowledged:
             return
@@ -172,6 +193,24 @@ class StreamOrderedPoolConsumerMixin:
                 "or the complete consumer group, got "
                 f"{consumer_count}/{self.total_consumer_count}"
             )
+
+        if _is_npu:
+            # aclrtValueWrite rejects the imported address: acknowledge with a
+            # plain stream-ordered kernel write instead.
+            if pool_bytes is None:
+                raise RuntimeError(
+                    f"{self.transport_name} acknowledgement requires the "
+                    "imported pool bytes view on NPU"
+                )
+            first_rank = min(consumer_ranks)
+            word_count = len(consumer_ranks)
+            start = self.ack_byte_offset + first_rank * CONTROL_WORD_BYTES
+            ack_words = pool_bytes[
+                start : start + word_count * CONTROL_WORD_BYTES
+            ].view(CONTROL_WORD_DTYPE)
+            ack_words.fill_(self.generation)
+            self._consumer_acknowledged = True
+            return
 
         for rank in consumer_ranks:
             stream_write_value(
@@ -260,6 +299,9 @@ class StreamOrderedMmFeaturePool:
         self._available_slots = list(reversed(range(max_inflight_slices)))
         self._slot_generations = [0] * max_inflight_slices
         self._occupied: dict[int, PoolLease] = {}
+        # NPU only: streams that carried pool copies since the last dispatch
+        # fence, keyed by raw stream handle.
+        self._copy_streams: dict[int, object] = {}
         self._lock = threading.Lock()
         self._recycle_interval = recycle_interval
         self._recycler_stop_event = threading.Event()
@@ -397,12 +439,34 @@ class StreamOrderedMmFeaturePool:
                     lease.generation,
                     self.transport_name,
                 )
+                if _is_npu:
+                    # NPU consumers never wait on the ready word: the dispatch
+                    # fence drains this stream before proxies leave instead.
+                    stream = get_device_module().current_stream(self.device_id)
+                    with self._lock:
+                        self._copy_streams[stream.npu_stream] = stream
         except Exception:
             with self._lock:
                 self._release_locked(lease)
                 self._merge_ranges_locked()
             raise
         return lease, destination
+
+    def fence_for_dispatch(self) -> None:
+        """Make every pool copy issued so far complete before proxies ship.
+
+        A5 (950PR/DT) CANN rejects value ops on IPC-imported addresses, so
+        NPU consumers issue none: this producer fence guarantees the bytes
+        are complete once a proxy is received. A no-op on CUDA, where the
+        consumer-side ready/ack value protocol orders everything.
+        """
+        if not _is_npu:
+            return
+        with self._lock:
+            streams = list(self._copy_streams.values())
+            self._copy_streams.clear()
+        for stream in streams:
+            stream.synchronize()
 
     def cancel_lease(
         self,

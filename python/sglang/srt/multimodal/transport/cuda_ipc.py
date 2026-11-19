@@ -140,6 +140,10 @@ class MmItemMemoryPool:
     def shutdown(self):
         self._pool.shutdown()
 
+    def fence_for_dispatch(self) -> None:
+        """See StreamOrderedMmFeaturePool.fence_for_dispatch."""
+        self._pool.fence_for_dispatch()
+
     @property
     def active_lease_count(self) -> int:
         return self._pool.active_lease_count
@@ -249,6 +253,7 @@ class CudaIpcTensorTransportProxy(StreamOrderedPoolConsumerMixin):
         # stream has completed.
         self._pool_storage = None
         self._borrowed_storage = None
+        self._borrowed_pool_bytes = None
         self._borrowed_base_address = None
         self._borrowed_device_id = None
 
@@ -288,7 +293,9 @@ class CudaIpcTensorTransportProxy(StreamOrderedPoolConsumerMixin):
                 + ipc_extra["storage_offset"],
             )
 
-        return slice_tensor, storage
+        # pool_bytes spans the control words that NPU consumers acknowledge
+        # through.
+        return slice_tensor, storage, pool_bytes
 
     def _open_pool_slice(self, rebuild_device_idx: int):
         ipc_extra = self.proxy_state["ipc_extra"]
@@ -338,11 +345,15 @@ class CudaIpcTensorTransportProxy(StreamOrderedPoolConsumerMixin):
             return
         device_id = get_device_module().current_device()
         with get_device_module().device(device_id):
-            _, storage = self._open_pool_slice(device_id)
+            _, storage, pool_bytes = self._open_pool_slice(device_id)
             base_address = storage.data_ptr()
             self._wait_until_ready(base_address, device_id)
             self._acknowledge_on_stream(
-                base_address, device_id, consumer_count, consumer_rank
+                base_address,
+                device_id,
+                consumer_count,
+                consumer_rank,
+                pool_bytes=pool_bytes,
             )
         self._retain_storage_until_stream_completes(storage, device_id)
 
@@ -355,7 +366,9 @@ class CudaIpcTensorTransportProxy(StreamOrderedPoolConsumerMixin):
             return None
 
         with get_device_module().device(rebuild_device_idx):
-            slice_tensor, storage = self._open_pool_slice(rebuild_device_idx)
+            slice_tensor, storage, pool_bytes = self._open_pool_slice(
+                rebuild_device_idx
+            )
             base_address = storage.data_ptr()
             self._wait_until_ready(base_address, rebuild_device_idx)
             borrowed = slice_tensor.view(ipc_extra["recons_dtype"]).reshape(
@@ -363,6 +376,7 @@ class CudaIpcTensorTransportProxy(StreamOrderedPoolConsumerMixin):
             )
 
         self._borrowed_storage = storage
+        self._borrowed_pool_bytes = pool_bytes
         self._borrowed_base_address = base_address
         self._borrowed_device_id = rebuild_device_idx
         return borrowed
@@ -377,10 +391,15 @@ class CudaIpcTensorTransportProxy(StreamOrderedPoolConsumerMixin):
         device_id = self._borrowed_device_id
         with get_device_module().device(device_id):
             self._acknowledge_on_stream(
-                self._borrowed_base_address, device_id, consumer_count, consumer_rank
+                self._borrowed_base_address,
+                device_id,
+                consumer_count,
+                consumer_rank,
+                pool_bytes=self._borrowed_pool_bytes,
             )
         self._retain_storage_until_stream_completes(storage, device_id)
         self._borrowed_storage = None
+        self._borrowed_pool_bytes = None
         self._borrowed_base_address = None
         self._borrowed_device_id = None
 
@@ -406,7 +425,9 @@ class CudaIpcTensorTransportProxy(StreamOrderedPoolConsumerMixin):
 
         ipc_extra = self.proxy_state["ipc_extra"]
         with get_device_module().device(rebuild_device):
-            slice_tensor, storage = self._open_pool_slice(rebuild_device_idx)
+            slice_tensor, storage, pool_bytes = self._open_pool_slice(
+                rebuild_device_idx
+            )
             base_address = storage.data_ptr()
             self._wait_until_ready(base_address, rebuild_device_idx)
             reconstructed_tensor = torch.empty(
@@ -416,7 +437,11 @@ class CudaIpcTensorTransportProxy(StreamOrderedPoolConsumerMixin):
             ).contiguous()
             reconstructed_tensor.view(torch.uint8).reshape(-1).copy_(slice_tensor)
             self._acknowledge_on_stream(
-                base_address, rebuild_device_idx, consumer_count, consumer_rank
+                base_address,
+                rebuild_device_idx,
+                consumer_count,
+                consumer_rank,
+                pool_bytes=pool_bytes,
             )
 
         self._retain_storage_until_stream_completes(storage, rebuild_device_idx)

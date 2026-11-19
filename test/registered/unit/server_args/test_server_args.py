@@ -1314,17 +1314,13 @@ class TestMultimodalFeatureTransport(CustomTestCase):
             base_gpu_id=2,
         )
 
-        with (
-            patch.dict(os.environ, {"SGLANG_USE_CUDA_IPC_TRANSPORT": "0"}),
-            envs.SGLANG_MM_FEATURE_CACHE_MB.override(512),
-        ):
+        with envs.SGLANG_MM_FEATURE_CACHE_MB.override(512):
             with self.assertLogs(serving_hook.logger, level="INFO") as logs:
                 handle_multimodal_feature_transport(server_args)
 
             self.assertEqual(
                 resolution_result(server_args, "mm_feature_transport"), "npu_ipc"
             )
-            self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
 
         output = "\n".join(logs.output)
         self.assertIn("Using NPU IPC for multimodal features", output)
