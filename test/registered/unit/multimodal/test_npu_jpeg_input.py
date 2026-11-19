@@ -37,23 +37,30 @@ def _encoded_tensor(data):
     return torch.frombuffer(bytearray(data), dtype=torch.uint8)
 
 
-def _load_modules():
+def _load_modules(test_class):
     repository = Path(__file__).resolve().parents[4]
     directory = repository / "python/sglang/srt/hardware_backend/npu"
     package = "sglang.srt.hardware_backend.npu"
     loaded = []
-    with patch.dict(sys.modules):
+    with patch.dict(
+        sys.modules,
+        {"acl": types.ModuleType("acl"), "torch_npu": types.SimpleNamespace(npu=None)},
+    ):
         for name, filename in (
             (package + ".jpeg_header", "jpeg_header.py"),
             (package + ".dvpp", "dvpp.py"),
             (package + ".jpeg", "jpeg/__init__.py"),
+            (package + ".jpeg._cache", "jpeg/_cache.py"),
         ):
             spec = importlib.util.spec_from_file_location(name, directory / filename)
             module = importlib.util.module_from_spec(spec)
             sys.modules[name] = module
             spec.loader.exec_module(module)
             loaded.append(module)
-        atexit.unregister(loaded[-1]._close_cached_dvpp)
+        atexit.unregister(loaded[-1].cached_decoders.close)
+    test_class.enterClassContext(
+        patch.dict(sys.modules, {module.__name__: module for module in loaded})
+    )
     return loaded
 
 
@@ -150,23 +157,21 @@ class _ACL:
 class TestNpuJpegInput(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.normalizer, cls.dvpp, cls.jpeg = _load_modules()
+        cls.normalizer, cls.dvpp, cls.jpeg, cls.cache_module = _load_modules(cls)
 
     def _decoder(self, data, owner=None, memcpy_error=0):
         info = self.normalizer.inspect_jpeg(data)
         acl = _ACL(info, owner, memcpy_error)
         resources = self.dvpp.Dvpp.__new__(self.dvpp.Dvpp)
-        resources.acl = acl
+        self.enterContext(patch.object(self.dvpp, "acl", acl))
         resources.pid = os.getpid()
         resources.owner = threading.current_thread()
         resources.lock = threading.RLock()
         resources.context, resources.stream = 1, 2
         resources.closed = resources.poisoned = False
         resources._images = set()
-        decoder = self.dvpp.Jpegd(resources)
-        decoder.channel = 3
-        decoder.channel_created = True
-        return decoder, acl
+        resources._jpegd_channel = 3
+        return resources, acl
 
     @contextmanager
     def _decode(self, decoder, data):
@@ -174,7 +179,7 @@ class TestNpuJpegInput(unittest.TestCase):
         prepared = self.normalizer.prepare_jpeg(data)
         self.assertIsNotNone(prepared)
         data, info = prepared
-        image = decoder.decode(data, info=info)
+        image = decoder._decode_jpeg_to_nv12(data, info)
         try:
             yield image
         finally:
@@ -210,16 +215,12 @@ class TestNpuJpegInput(unittest.TestCase):
         with (
             patch.object(torch, "device", side_effect=device),
             patch.object(torch, "npu", backend, create=True),
-            patch.dict(
-                sys.modules,
-                {
-                    "torch_npu": types.ModuleType("torch_npu"),
-                    "acl": types.SimpleNamespace(
-                        rt=types.SimpleNamespace(
-                            get_device_info=backend.architecture_query
-                        )
-                    ),
-                },
+            patch.object(
+                self.dvpp,
+                "acl",
+                types.SimpleNamespace(
+                    rt=types.SimpleNamespace(get_device_info=backend.architecture_query)
+                ),
             ),
         ):
             yield state, backend
@@ -249,7 +250,7 @@ class TestNpuJpegInput(unittest.TestCase):
     def test_odd_tensor_h2d_uses_private_normalized_buffer(self):
         original = _jpeg((65, 49))
         data = _encoded_tensor(original)
-        offset = self.normalizer.inspect_420_sof(memoryview(data.numpy()), 65, 49)
+        offset = self.normalizer.inspect_jpeg(memoryview(data.numpy())).dimension_offset
         decoder, acl = self._decoder(memoryview(data.numpy()))
         with self._decode(decoder, data):
             self.assertNotEqual(acl.host_pointer, data.data_ptr())
@@ -285,7 +286,7 @@ class TestNpuJpegInput(unittest.TestCase):
     def test_odd_bytes_input_uses_private_normalized_buffer(self):
         data = _jpeg((65, 49))
         original = bytes(bytearray(data))
-        offset = self.normalizer.inspect_420_sof(data, 65, 49)
+        offset = self.normalizer.inspect_jpeg(data).dimension_offset
         pointer = ctypes.pythonapi.PyBytes_AsString
         pointer.argtypes = [ctypes.py_object]
         pointer.restype = ctypes.c_void_p
@@ -356,13 +357,15 @@ class TestNpuJpegInput(unittest.TestCase):
             with (
                 self.subTest(size=size),
                 self._npu(),
-                patch.object(self.jpeg, "_get_dvpp") as factory,
+                patch.object(self.cache_module.cached_decoders, "get") as factory,
                 patch.object(self.jpeg.logger, "warning_once") as warning,
             ):
                 data = _jpeg(size)
                 self.jpeg.decode_jpeg(data)
                 self.assertEqual(warning.call_count, int(should_warn))
-                factory.return_value.process_jpeg_dec.assert_called_once_with(data)
+                factory.return_value._decode_prepared_jpeg.assert_called_once_with(
+                    data, self.normalizer.inspect_jpeg(data)
+                )
 
     def test_warns_once_before_attempt_even_if_decode_fails(self):
         data = _jpeg()
@@ -371,14 +374,14 @@ class TestNpuJpegInput(unittest.TestCase):
             self._npu(),
             patch.object(self.jpeg, "logger", logger),
             patch.object(logger, "warning") as warning,
-            patch.object(self.jpeg, "_get_dvpp") as factory,
+            patch.object(self.cache_module.cached_decoders, "get") as factory,
         ):
 
-            def fail_decode(_):
+            def fail_decode(data, info):
                 warning.assert_called_once()
                 raise RuntimeError("decoder failure")
 
-            factory.return_value.process_jpeg_dec.side_effect = fail_decode
+            factory.return_value._decode_prepared_jpeg.side_effect = fail_decode
             for _ in range(2):
                 with self.assertRaisesRegex(RuntimeError, "decoder failure"):
                     self.jpeg.decode_jpeg(data)
@@ -391,7 +394,7 @@ class TestNpuJpegInput(unittest.TestCase):
         data = storage[::2]
         observed = []
 
-        def decode(value):
+        def decode(value, info):
             observed.append(
                 (value.is_contiguous(), bytes(value.tolist()), state.current)
             )
@@ -400,9 +403,9 @@ class TestNpuJpegInput(unittest.TestCase):
         with (
             self._npu() as (state, _),
             patch.object(
-                self.jpeg,
-                "_get_dvpp",
-                return_value=types.SimpleNamespace(process_jpeg_dec=decode),
+                self.cache_module.cached_decoders,
+                "get",
+                return_value=types.SimpleNamespace(_decode_prepared_jpeg=decode),
             ) as factory,
         ):
             self.assertEqual(self.jpeg.decode_jpeg(data, device="npu:1"), "decoded")
@@ -410,20 +413,12 @@ class TestNpuJpegInput(unittest.TestCase):
         factory.assert_called_once_with(1)
         self.assertEqual(observed, [(True, bytes(encoded.tolist()), 1)])
 
-    def test_decoder_factory_import_and_reuse(self):
-        # Exercise the real no-argument factory and same-thread reuse.
-        # Only construction is mocked; the lazy import and cache are real.
-        package = "sglang.srt.hardware_backend.npu"
-        with (
-            patch.dict(sys.modules, {package + ".dvpp": self.dvpp}),
-            patch.object(self.dvpp, "Dvpp") as constructor,
-            patch.object(self.jpeg, "_local", threading.local()),
-            patch.object(self.jpeg, "_live", {}),
-        ):
+    def test_decoder_factory_and_reuse(self):
+        cache = self.cache_module._DvppCache()
+        with patch.object(self.cache_module, "Dvpp") as constructor:
             constructor.return_value.closed = False
-            decoder = self.jpeg._get_dvpp(1)
-            self.assertIs(decoder, constructor.return_value)
-            self.assertIs(self.jpeg._get_dvpp(1), decoder)
+            constructor.return_value.device_index = 1
+            self.assertIs(cache.get(1), cache.get(1))
             constructor.assert_called_once_with()
 
     def test_public_default_device_and_failure_restore(self):
@@ -431,13 +426,13 @@ class TestNpuJpegInput(unittest.TestCase):
         for device, target in (("npu", 3), ("npu:1", 1)):
             with self.subTest(device=device), self._npu() as (state, backend):
 
-                def fail(value, expected_device=target):
+                def fail(value, info, expected_device=target):
                     self.assertEqual(state.current, expected_device)
                     raise RuntimeError("decoder failure")
 
-                failing = types.SimpleNamespace(process_jpeg_dec=fail)
+                failing = types.SimpleNamespace(_decode_prepared_jpeg=fail)
                 with patch.object(
-                    self.jpeg, "_get_dvpp", return_value=failing
+                    self.cache_module.cached_decoders, "get", return_value=failing
                 ) as factory:
                     with self.assertRaisesRegex(RuntimeError, "decoder failure"):
                         self.jpeg.decode_jpeg(data, device=device)
@@ -462,8 +457,8 @@ class TestNpuJpegInput(unittest.TestCase):
         with (
             patch.object(self.jpeg.logger, "warning_once") as warning,
             patch.object(
-                self.jpeg,
-                "_get_dvpp",
+                self.cache_module.cached_decoders,
+                "get",
                 side_effect=AssertionError("decoder constructed"),
             ),
         ):
@@ -479,7 +474,9 @@ class TestNpuJpegInput(unittest.TestCase):
             torch.empty(8, dtype=torch.uint8, device="meta"),
         )
         with patch.object(
-            self.jpeg, "_get_dvpp", side_effect=AssertionError("decoder constructed")
+            self.cache_module.cached_decoders,
+            "get",
+            side_effect=AssertionError("decoder constructed"),
         ):
             for data in cases:
                 with (
@@ -497,7 +494,7 @@ class TestNpuJpegInput(unittest.TestCase):
                 self.subTest(arch=arch),
                 self._npu(arch=arch) as (state, backend),
                 patch.object(self.jpeg.logger, "warning_once") as warning,
-                patch.object(self.jpeg, "_get_dvpp") as factory,
+                patch.object(self.cache_module.cached_decoders, "get") as factory,
             ):
                 self.assertIsNone(self.jpeg.decode_jpeg(data, device="npu:1"))
                 backend.architecture_query.assert_called_once_with(1, 601)
@@ -511,7 +508,7 @@ class TestNpuJpegInput(unittest.TestCase):
         data = _encoded_tensor(_jpeg())
         with (
             self._npu(arch_error=17) as (state, backend),
-            patch.object(self.jpeg, "_get_dvpp") as factory,
+            patch.object(self.cache_module.cached_decoders, "get") as factory,
         ):
             with self.assertRaisesRegex(self.dvpp.ACLFailure, "query NPU architecture"):
                 self.jpeg.decode_jpeg(data, device="npu:1")

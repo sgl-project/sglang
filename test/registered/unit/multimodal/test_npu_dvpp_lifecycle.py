@@ -9,6 +9,7 @@ import threading
 import types
 import unittest
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -22,24 +23,31 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
-def _load_modules():
+def _load_modules(test_class):
     directory = (
         Path(__file__).resolve().parents[4] / "python/sglang/srt/hardware_backend/npu"
     )
     package = "sglang.srt.hardware_backend.npu"
     loaded = []
-    with patch.dict(sys.modules):
+    with patch.dict(
+        sys.modules,
+        {"acl": types.ModuleType("acl"), "torch_npu": types.SimpleNamespace(npu=None)},
+    ):
         for name, filename in (
             (package + ".jpeg_header", "jpeg_header.py"),
             (package + ".dvpp", "dvpp.py"),
             (package + ".jpeg", "jpeg/__init__.py"),
+            (package + ".jpeg._cache", "jpeg/_cache.py"),
         ):
             spec = importlib.util.spec_from_file_location(name, directory / filename)
             module = importlib.util.module_from_spec(spec)
             sys.modules[name] = module
             spec.loader.exec_module(module)
             loaded.append(module)
-        atexit.unregister(loaded[-1]._close_cached_dvpp)
+        atexit.unregister(loaded[-1].cached_decoders.close)
+    test_class.enterClassContext(
+        patch.dict(sys.modules, {module.__name__: module for module in loaded})
+    )
     return loaded
 
 
@@ -286,8 +294,11 @@ def _runtime(failures=(), arch=2201):
         patch.object(torch, "device", side_effect=device),
         patch.object(torch, "empty", side_effect=empty),
         patch.object(torch, "npu", backend, create=True),
-        patch.dict(
-            sys.modules, {"acl": runtime, "torch_npu": types.ModuleType("torch_npu")}
+        patch.object(
+            sys.modules["sglang.srt.hardware_backend.npu.dvpp"], "acl", runtime
+        ),
+        patch.object(
+            sys.modules["sglang.srt.hardware_backend.npu.dvpp"], "npu", backend
         ),
     ):
         yield runtime
@@ -296,7 +307,7 @@ def _runtime(failures=(), arch=2201):
 class TestNpuDvppLifecycle(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.header, cls.dvpp, cls.jpeg = _load_modules()
+        cls.header, cls.dvpp, cls.jpeg, cls.cache_module = _load_modules(cls)
 
     def assert_released(self, runtime):
         self.assertFalse(runtime.allocations)
@@ -307,13 +318,8 @@ class TestNpuDvppLifecycle(unittest.TestCase):
 
     @contextmanager
     def cached_decoders(self):
-        with (
-            patch.dict(
-                sys.modules, {"sglang.srt.hardware_backend.npu.dvpp": self.dvpp}
-            ),
-            patch.object(self.jpeg, "_local", threading.local()),
-            patch.object(self.jpeg, "_live", {}),
-            patch.object(self.jpeg, "_closed", False),
+        with patch.object(
+            self.cache_module, "cached_decoders", self.cache_module._DvppCache()
         ):
             yield
 
@@ -508,7 +514,7 @@ class TestNpuDvppLifecycle(unittest.TestCase):
             data, info = self.header.prepare_jpeg(_jpeg())
             with decoder.lock, decoder._use_context():
                 decoder._ensure_resources()
-                nv12 = decoder._jpegd.decode(data, info=info)
+                nv12 = decoder._decode_jpeg_to_nv12(data, info=info)
                 self.assertEqual(nv12.pixel_format, self.dvpp.PixelFormat.NV12)
                 self.assertEqual((nv12.width, nv12.height), (65, 49))
                 self.assertEqual((nv12.storage_width, nv12.storage_height), (66, 50))
@@ -520,9 +526,7 @@ class TestNpuDvppLifecycle(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "RGB888"):
                     nv12.to_tensor()
 
-                rgb = decoder._vpc.convert_color(
-                    nv12, output_format=self.dvpp.PixelFormat.RGB888
-                )
+                rgb = decoder._convert_nv12_to_rgb(nv12)
                 self.assertEqual(rgb.pixel_format, self.dvpp.PixelFormat.RGB888)
                 self.assertEqual((rgb.width, rgb.height), (65, 49))
                 self.assertEqual(decoder._images, {nv12, rgb})
@@ -558,28 +562,23 @@ class TestNpuDvppLifecycle(unittest.TestCase):
     def test_vpc_rejects_invalid_images_and_formats_before_allocation(self):
         with _runtime() as runtime:
             decoder, other = self.dvpp.Dvpp(), self.dvpp.Dvpp()
-            formats = self.dvpp.PixelFormat
             data, info = self.header.prepare_jpeg(_jpeg())
             with decoder.lock, decoder._use_context():
                 decoder._ensure_resources()
-                nv12 = decoder._jpegd.decode(data, info=info)
-                rgb = decoder._vpc.convert_color(nv12, output_format=formats.RGB888)
+                nv12 = decoder._decode_jpeg_to_nv12(data, info=info)
+                rgb = decoder._convert_nv12_to_rgb(nv12)
                 event_count = len(runtime.events)
                 with self.assertRaisesRegex(ValueError, "same Dvpp"):
-                    other._vpc.convert_color(nv12, output_format=formats.RGB888)
+                    other._convert_nv12_to_rgb(nv12)
                 with self.assertRaisesRegex(ValueError, "same Dvpp"):
-                    decoder._vpc.convert_color(object(), output_format=formats.RGB888)
+                    decoder._convert_nv12_to_rgb(object())
                 with self.assertRaisesRegex(ValueError, "NV12 to RGB888"):
-                    decoder._vpc.convert_color(rgb, output_format=formats.RGB888)
-                with self.assertRaisesRegex(ValueError, "NV12 to RGB888"):
-                    decoder._vpc.convert_color(nv12, output_format=formats.NV12)
-                with self.assertRaises(NotImplementedError):
-                    decoder._vpc.crop(nv12, (0, 0, 32, 32))
+                    decoder._convert_nv12_to_rgb(rgb)
                 self.assertEqual(len(runtime.events), event_count)
                 nv12.close()
                 event_count = len(runtime.events)
                 with self.assertRaisesRegex(RuntimeError, "closed"):
-                    decoder._vpc.convert_color(nv12, output_format=formats.RGB888)
+                    decoder._convert_nv12_to_rgb(nv12)
                 self.assertEqual(len(runtime.events), event_count)
             # The owner also reclaims images not explicitly closed by the caller.
             decoder.close()
@@ -642,9 +641,7 @@ class TestNpuDvppLifecycle(unittest.TestCase):
                     with self.assertRaisesRegex(self.dvpp.ACLFailure, "poisoned"):
                         image.to_tensor()
                     with self.assertRaisesRegex(self.dvpp.ACLFailure, "poisoned"):
-                        decoder._vpc.convert_color(
-                            image, output_format=self.dvpp.PixelFormat.RGB888
-                        )
+                        decoder._convert_nv12_to_rgb(image)
                 self.assertEqual(len(runtime.events), event_count)
                 self.assertEqual((runtime.current, runtime.context), (3, 777))
 
@@ -753,31 +750,63 @@ class TestNpuDvppLifecycle(unittest.TestCase):
             decoder.close()
             self.assert_released(runtime)
 
+    def test_cache_reclaims_sessions_on_device_switch_and_thread_exit(self):
+        with _runtime() as runtime, self.cached_decoders():
+            cache = self.cache_module.cached_decoders
+            self.jpeg.decode_jpeg(_jpeg(), device="npu:1")
+            first = cache.get(1)
+            self.jpeg.decode_jpeg(_jpeg(), device="npu:2")
+            self.assertTrue(first.closed)
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                pool.submit(self.jpeg.decode_jpeg, _jpeg(), "npu:1").result()
+            cache.get(2)
+            self.assertEqual(len(runtime.streams), 1)
+            cache.close()
+            self.assert_released(runtime)
+
+    def test_failed_step_release_retried_on_close(self):
+        for failure in (("free", 1), ("destroy_pic_desc", 1)):
+            with self.subTest(failure=failure), _runtime((failure,)) as runtime:
+                decoder = self.dvpp.Dvpp()
+                with self.assertRaises(self.dvpp.ACLFailure):
+                    decoder.process_jpeg_dec(_jpeg())
+                decoder.close()
+                self.assert_released(runtime)
+
     def test_cache_replaces_object_closed_by_failed_initialization(self):
         with _runtime((("create_stream", 1),)) as runtime, self.cached_decoders():
             with self.assertRaises(self.dvpp.ACLFailure):
                 self.jpeg.decode_jpeg(_jpeg(), device="npu:1")
-            first = self.jpeg._local.slot[1]
+            first = self.cache_module.cached_decoders._sessions[
+                threading.current_thread()
+            ]
             self.assertTrue(first.closed)
             result = self.jpeg.decode_jpeg(_jpeg(), device="npu:1")
-            second = self.jpeg._local.slot[1]
+            second = self.cache_module.cached_decoders._sessions[
+                threading.current_thread()
+            ]
             self.assertIsNot(first, second)
             self.assertEqual(second.device_index, 1)
             self.assertEqual(runtime.current, 3)
             self.assertTrue(torch.all(result == 1))
             self.assertEqual(runtime.calls["create_stream"], 2)
-            self.jpeg._close_cached_dvpp()
+            self.cache_module.cached_decoders.close()
             self.assert_released(runtime)
 
     def test_cache_does_not_replace_poisoned_object(self):
         with _runtime((("synchronize", 1),)) as runtime, self.cached_decoders():
             with self.assertRaises(self.dvpp.ACLFailure):
                 self.jpeg.decode_jpeg(_jpeg())
-            first = self.jpeg._local.slot[1]
+            first = self.cache_module.cached_decoders._sessions[
+                threading.current_thread()
+            ]
             self.assertTrue(first.poisoned)
             with self.assertRaisesRegex(self.dvpp.ACLFailure, "terminate"):
                 self.jpeg.decode_jpeg(_jpeg())
-            self.assertIs(self.jpeg._local.slot[1], first)
+            self.assertIs(
+                self.cache_module.cached_decoders._sessions[threading.current_thread()],
+                first,
+            )
             self.assertEqual(runtime.calls["create_stream"], 1)
             for pointer in runtime.inflight[1:]:
                 self.assertIn(pointer, runtime.allocations)

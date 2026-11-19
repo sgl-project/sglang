@@ -10,6 +10,7 @@ from __future__ import annotations
 import struct
 from dataclasses import dataclass
 
+import torch
 from PIL import Image, JpegImagePlugin
 
 
@@ -21,7 +22,7 @@ class UnsupportedSOF(ValueError):
     """A valid frame outside the supported baseline 4:2:0 contract."""
 
 
-def inspect_420_sof(
+def _frame_dimension_offset(
     data: bytes | bytearray | memoryview, width: int, height: int
 ) -> int:
     """Validate baseline 8-bit 4:2:0 headers and locate their dimension fields.
@@ -98,24 +99,6 @@ def inspect_420_sof(
     raise ValueError("JPEG has no complete frame header")
 
 
-def normalize_420_sof(
-    data: bytes | bytearray | memoryview, width: int, height: int
-) -> bytes | bytearray | memoryview:
-    """Prepare even decode dimensions while preserving the caller's JPEG bytes.
-
-    Already-even inputs retain their storage. Otherwise validate the SOF0
-    header, copy the encoded buffer, and round only its width/height fields up
-    by one. The caller retains the original dimensions for the final RGB crop.
-    Eligibility checks belong to inspect_jpeg, including for the even fast path.
-    """
-    if not (width % 2 or height % 2):
-        return data
-    offset = inspect_420_sof(data, width, height)
-    normalized = bytearray(data)
-    struct.pack_into(">HH", normalized, offset, height + height % 2, width + width % 2)
-    return normalized
-
-
 def align_up(value, alignment):
     return (value + alignment - 1) // alignment * alignment
 
@@ -126,6 +109,21 @@ class JPEGInfo:
     height: int
     width_stride: int
     height_stride: int
+    dimension_offset: int
+
+    def normalized_header(self, encoded):
+        """Round odd dimensions in a private copy; keep even inputs zero-copy."""
+        if self.width == self.decode_width and self.height == self.decode_height:
+            return encoded
+        normalized = bytearray(encoded)
+        struct.pack_into(
+            ">HH",
+            normalized,
+            self.dimension_offset,
+            self.decode_height,
+            self.decode_width,
+        )
+        return normalized
 
     @property
     def decode_width(self):
@@ -187,12 +185,12 @@ def inspect_jpeg(data: bytes | bytearray | memoryview):
         if not (32 <= w <= 4096 and 32 <= h <= 4096):
             raise UnsupportedJPEG("JPEGD/VPC requires dimensions in [32, 4096]")
         try:
-            inspect_420_sof(data, w, h)
+            offset = _frame_dimension_offset(data, w, h)
         except UnsupportedSOF as error:
             raise UnsupportedJPEG(str(error)) from error
         if im.getexif() or im.info.get("icc_profile") or im.info.get("exif"):
             raise UnsupportedJPEG("EXIF/ICC metadata uses CPU fallback")
-    return JPEGInfo(w, h, align_up(w, 64), align_up(h, 16))
+    return JPEGInfo(w, h, align_up(w, 64), align_up(h, 16), offset)
 
 
 def prepare_jpeg(data):
@@ -201,8 +199,6 @@ def prepare_jpeg(data):
     Return the contiguous input and its metadata, or None for supported PIL
     fallback cases. Keep contiguous storage; malformed input errors propagate.
     """
-    import torch
-
     if not isinstance(data, bytes):
         if not isinstance(data, torch.Tensor):
             raise TypeError("NPU JPEG input must be bytes or a CPU uint8 tensor")
