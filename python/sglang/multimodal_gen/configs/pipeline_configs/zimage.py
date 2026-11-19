@@ -102,6 +102,10 @@ class ZImagePipelineConfig(ZImageRolloutPipelineMixin, ImagePipelineConfig):
     PATCH_SIZE: int = 2
     F_PATCH_SIZE: int = 1
 
+    def supports_sequential_multi_output_inference(self):
+        # The DiT pairs one caption with each latent; n > 1 runs the outputs one by one.
+        return True
+
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         return ModelDeploymentConfig(
             keep_resident_min_available_gb=30,
