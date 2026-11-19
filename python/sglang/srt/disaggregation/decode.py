@@ -56,6 +56,10 @@ from sglang.srt.disaggregation.checksum import (
     state_indices_for_request,
 )
 from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
+from sglang.srt.disaggregation.decode_freed_slots import (
+    freed_slot_admission_on,
+    num_freed_slots,
+)
 from sglang.srt.disaggregation.decode_hicache_mixin import (
     DecodeHiCachePreallocMixin,
     DecodeHiCacheTransferMixin,
@@ -4059,6 +4063,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
 
 class SchedulerDisaggregationDecodeMixin:
+    # SGLANG_OPT_PD_DECODE_ADMIT_FREED_SLOTS, set by the overlap loop; every other
+    # loop keeps the stock admission room.
+    enable_freed_slot_admission: bool = False
+
     @torch.no_grad()
     def event_loop_normal_disagg_decode(self: Scheduler):
         """A normal scheduler loop for decode worker in disaggregation mode."""
@@ -4112,6 +4120,7 @@ class SchedulerDisaggregationDecodeMixin:
             envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
             and envs.SGLANG_ENABLE_NV_MEGA_PDDEC_RUNTIME_OPTIMIZATION.get()
         )
+        self.enable_freed_slot_admission = freed_slot_admission_on()
 
         def pop_and_process():
             tmp_batch, tmp_result = self.result_queue.popleft()
@@ -4401,6 +4410,9 @@ class SchedulerDisaggregationDecodeMixin:
             restores_ready = self._host_restores_ready()
 
         curr_batch_size = running_batch.batch_size()
+        if self.enable_freed_slot_admission:
+            # Finished requests leave in this pass's update_running_batch.
+            curr_batch_size -= num_freed_slots(running_batch)
 
         batch_size = min(self.req_to_token_pool.size, self.max_running_requests)
 

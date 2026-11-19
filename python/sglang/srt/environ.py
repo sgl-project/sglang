@@ -728,6 +728,11 @@ class Envs:
     SGLANG_PREFILL_DELAYER_MAX_PREFILL_BS_WINDOW_SIZE = EnvInt(16)
     # UniBoost: estimated prefill cost per uncached prompt token, in microseconds.
     SGLANG_UNIBOOST_ALPHA_US_PER_TOKEN = EnvFloat(64.0)
+    # PD decode overlap loop: a finished running request's slot is free for admission
+    # in the pass that filters it out, so a waiting request starts one pass earlier.
+    SGLANG_OPT_PD_DECODE_ADMIT_FREED_SLOTS = EnvBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
 
     # ===================================================================
     # Scheduler polling, timeouts, and output

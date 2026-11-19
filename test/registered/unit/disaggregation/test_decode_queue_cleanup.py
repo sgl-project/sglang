@@ -17,16 +17,19 @@ from sglang.srt.disaggregation.decode import (
     SchedulerDisaggregationDecodeMixin,
     _PendingPublish,
 )
+from sglang.srt.disaggregation.decode_freed_slots import freed_slot_admission_on
 from sglang.srt.disaggregation.decode_hicache_mixin import (
     HiCacheRestoreGatedKVReceiver,
     HiCacheRestoreResult,
 )
-from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST
+from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.disaggregation.utils import ReqToMetadataIdxAllocator
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.managers.scheduler import _dispatch_event_loop_once
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
+    KeyedReqList,
     ListKind,
     move,
 )
@@ -34,7 +37,7 @@ from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.scheduler_test_utils import FakeReq, decode_queue, leaving_retirer
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, published_topology
 
 register_cpu_ci(est_time=13, suite="base-a-test-cpu")
 
@@ -970,6 +973,132 @@ class TestAdmissionOverlap(CustomTestCase):
                     scheduler.forward_stream
                 )
                 scheduler.forward_stream.wait_stream.assert_not_called()
+
+
+def _decode_req(rid, finished=False):
+    return FakeReq(
+        rid=rid,
+        kv=SimpleNamespace(restore_done_event=None, kv_committed_len=None),
+        time_stats=MagicMock(),
+        init_next_round_input=lambda tree_cache: None,
+        finished=lambda: finished,
+    )
+
+
+class TestFreedSlotAdmission(CustomTestCase):
+    def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
+    def _admit(self, *, enabled, running_finished, cap=2):
+        waiting = IndexedReqList(ListKind.WAITING)
+        move([_decode_req("w0"), _decode_req("w1")], waiting)
+        scheduler = SimpleNamespace(
+            grammar_manager=SimpleNamespace(has_waiting_grammars=lambda: False),
+            waiting_queue=waiting,
+            running_reqs=KeyedReqList(ListKind.DECODING),
+            enable_priority_scheduling=False,
+            enable_freed_slot_admission=enabled,
+            req_to_token_pool=SimpleNamespace(size=cap + 2),
+            max_running_requests=cap,
+            token_to_kv_pool_allocator=None,
+            tree_cache=None,
+            model_config=None,
+            enable_overlap=True,
+            spec_algorithm=None,
+            sampler_params_pool=MagicMock(),
+            penalty_status_pool=MagicMock(),
+        )
+        running = [
+            _decode_req(f"r{i}", finished=done)
+            for i, done in enumerate(running_finished)
+        ]
+        running_batch = SimpleNamespace(reqs=running, batch_size=lambda: len(running))
+        with patch(
+            "sglang.srt.disaggregation.decode.ScheduleBatch.init_new"
+        ) as init_new:
+            batch = SchedulerDisaggregationDecodeMixin._get_new_prebuilt_batch(
+                scheduler, running_batch
+            )
+        if batch is None:
+            return []
+        return [req.rid for req in init_new.call_args.args[0]]
+
+    def test_finished_requests_free_their_slots_in_the_same_pass(self):
+        """A full running batch with finished requests admits into their slots in
+        this pass, in waiting order; an in-flight request keeps its slot."""
+        for running_finished, expected in (
+            ((True, False), ["w0"]),
+            ((True, True), ["w0", "w1"]),
+            ((False, False), []),
+        ):
+            with self.subTest(running_finished=running_finished):
+                self.assertEqual(
+                    self._admit(enabled=True, running_finished=running_finished),
+                    expected,
+                )
+                # Off, the finished requests hold their slots until they leave.
+                self.assertEqual(
+                    self._admit(enabled=False, running_finished=running_finished), []
+                )
+
+    def test_switch_declines_with_decode_radix_cache(self):
+        """The decode radix cache declines it even when switched on."""
+        for radix, expected in ((False, True), (True, False)):
+            with self.subTest(radix=radix):
+                disagg = SimpleNamespace(disaggregation_decode_enable_radix_cache=radix)
+                with (
+                    envs.SGLANG_OPT_PD_DECODE_ADMIT_FREED_SLOTS.override(True),
+                    patch(
+                        "sglang.srt.disaggregation.decode_freed_slots.get_disagg",
+                        return_value=disagg,
+                    ),
+                ):
+                    self.assertIs(freed_slot_admission_on(), expected)
+
+    def test_only_the_overlap_loop_turns_it_on(self):
+        """The overlap loop resolves the switch on entry; the normal decode loop
+        keeps the stock admission room even with the switch on."""
+        disagg = SimpleNamespace(disaggregation_decode_enable_radix_cache=False)
+        with (
+            envs.SGLANG_OPT_PD_DECODE_ADMIT_FREED_SLOTS.override(True),
+            patch(
+                "sglang.srt.disaggregation.decode_freed_slots.get_disagg",
+                return_value=disagg,
+            ),
+        ):
+            for loop, expected in (
+                (
+                    SchedulerDisaggregationDecodeMixin.event_loop_overlap_disagg_decode,
+                    True,
+                ),
+                (
+                    SchedulerDisaggregationDecodeMixin.event_loop_normal_disagg_decode,
+                    False,
+                ),
+            ):
+                with self.subTest(loop=loop.__name__):
+                    scheduler = SimpleNamespace(
+                        gracefully_exit=True,
+                        enable_freed_slot_admission=False,
+                    )
+                    loop(scheduler)
+                    self.assertIs(scheduler.enable_freed_slot_admission, expected)
+
+    def test_dispatch_clears_it_before_selecting_a_loop(self):
+        """A PD role switch can select a prefill loop on the same scheduler; the
+        decode loop's setting does not carry over."""
+        scheduler = SimpleNamespace(
+            disaggregation_mode=DisaggregationMode.PREFILL,
+            enable_overlap=True,
+            enable_freed_slot_admission=True,
+            event_loop_overlap_disagg_prefill=MagicMock(),
+        )
+        with published_topology():
+            _dispatch_event_loop_once(scheduler)
+        scheduler.event_loop_overlap_disagg_prefill.assert_called_once_with()
+        self.assertFalse(scheduler.enable_freed_slot_admission)
 
 
 class TestPreallocRequired(CustomTestCase):

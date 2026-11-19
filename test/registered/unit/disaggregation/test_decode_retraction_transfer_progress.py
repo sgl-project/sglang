@@ -175,6 +175,7 @@ class _DecodeNode:
             enable_decode_hicache=False,
             enable_priority_scheduling=False,
             enable_skip_finishing_decode=False,
+            enable_freed_slot_admission=False,
             scheduler_stage_metrics=None,
             uocr_runtime=None,
             decode_offload_manager=None,
