@@ -1060,12 +1060,10 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             from sglang.srt.hardware_backend.npu.ple import create_ple_uva_table
 
             self._npu_uva_table = create_ple_uva_table(self.weight, backend=backend)
+            self._file_prefetcher = None
             logger.info("NPU PLE lookup route: uva (backend=%s)", backend)
-        # The CUDA file kernel can issue CPU prefetch hints; NPU UVA lookup
-        # keeps IDs on the device and needs no CPU prefetch worker or ID copy.
-        self._file_prefetcher = (
-            None if _is_npu else make_ple_file_prefetcher(host_table)
-        )
+        else:
+            self._file_prefetcher = make_ple_file_prefetcher(host_table)
         self._file_rss_trimmer = make_ple_file_rss_trimmer(host_table)
         # The scale is tiny; keep it with the model instead of offloading it
         # with the table.
