@@ -532,12 +532,21 @@ def _prefill_sp_o_proj_reduce_scatter(
         sp_collective_gemm_workspace,
     )
 
-    rows = matmul_reduce_scatter_rows(sp.local, o_proj.weight.shape[0])
+    tp = get_parallel().tp_group
+    width = o_proj.weight.shape[0]
+    # Allocate the workspace once, sized for the largest batch.
+    largest = -(-k3_ar_fusion.symm_buffer_max_rows() // (2 * tp.world_size)) * 2
+    capacity = tp.world_size * matmul_reduce_scatter_rows(largest, width)
+
+    def workspace(kind, group, rows, *args):
+        return sp_collective_gemm_workspace(kind, group, max(rows, capacity), *args)
+
+    rows = matmul_reduce_scatter_rows(sp.local, width)
     out = matmul_reduce_scatter(
         sp.tile_shards(x, rows).view(-1, x.shape[1]),
         o_proj.weight,
-        get_parallel().tp_group.device_group,
-        workspace=sp_collective_gemm_workspace,
+        tp.device_group,
+        workspace=workspace,
     )
     return out[: sp.local]
 
