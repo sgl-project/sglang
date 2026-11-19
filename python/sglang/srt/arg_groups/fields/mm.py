@@ -55,6 +55,31 @@ class Mm(msgspec.Struct):
     # -------------------------------------------------------------------------
     # Multi-modal optimization configs
     # -------------------------------------------------------------------------
+    disable_vision_cuda_graph: A[
+        bool, "Disable CUDA graphs for the DeepSeek V4.1 vision encoder."
+    ] = False
+    vision_cuda_graph_sizes: A[
+        List[int],
+        Arg(
+            help="Patch-count buckets for DeepSeek V4.1 vision CUDA graphs. "
+            "The model's maximum image patch count is also captured.",
+            nargs="+",
+        ),
+    ] = msgspec.field(
+        default_factory=lambda: [
+            64,
+            128,
+            256,
+            512,
+            1024,
+            1536,
+            2048,
+            3072,
+            4096,
+            6144,
+            8192,
+        ]
+    )
     enable_broadcast_mm_inputs_process: A[
         bool,
         "Enable broadcast mm-inputs process in scheduler.",

@@ -48,6 +48,7 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
     get_flags,
+    get_mm,
     get_model,
     get_observability,
     get_parallel,
@@ -403,6 +404,35 @@ def drop_elastic_cuda_graph_state(
     current_platform.empty_cache()
 
 
+def maybe_capture_vision_encoder_graphs(model_runner: ModelRunner) -> None:
+    if (
+        get_mm().disable_vision_cuda_graph
+        or model_runner.is_draft_worker
+        or model_runner.device != "cuda"
+        or torch.version.hip is not None
+        or get_disagg().disaggregation_mode == "decode"
+    ):
+        return
+    vision = getattr(model_runner.model, "vision", None)
+    if vision is None:
+        return
+    from sglang.srt.models.deepseek_v41_vit import ViT
+
+    if not isinstance(vision, ViT) or vision.cuda_graph_runner is not None:
+        return
+    if any(
+        block.attn.qkv_backend_name not in ("fa3", "fa4", "triton_attn")
+        for block in vision.blocks
+    ):
+        logger.info("Skipping DeepSeek vision CUDA graphs for this attention backend")
+        return
+    # A maximum-size V4.1 image can exceed the generic 8192-patch bucket.
+    config = model_runner.model.config
+    max_patches = config.vision_max_n_token * config.vision_downsample_ratio**2
+    logger.info("Capturing DeepSeek V4.1 vision CUDA graphs")
+    vision.capture_cuda_graphs([*get_mm().vision_cuda_graph_sizes, max_patches])
+
+
 def capture_cuda_graphs(
     *,
     model_runner: ModelRunner,
@@ -432,6 +462,8 @@ def capture_cuda_graphs(
 
     if not defer_distributed_setup:
         refresh_deep_gemm_layout_memory_budget(model_runner)
+
+    maybe_capture_vision_encoder_graphs(model_runner)
 
     # cuda-graph capture: prefill before decode, so both coalesce onto the
     # eager buffer allocated above. (capture_prefill_graph routes prefill
