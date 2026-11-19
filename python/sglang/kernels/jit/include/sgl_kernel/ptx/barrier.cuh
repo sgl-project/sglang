@@ -1,80 +1,108 @@
-// Barriers: mbarrier, named barriers and the barrier-init fence. `sglang::device::ptx` is the one namespace for
-// inline PTX; ptx/async.cuh and ptx/tcgen05.cuh add the copy and tensor-core primitives, distributed/ptx.cuh the
-// collective ones.
+// Barriers: mbarrier, named barriers, cluster barriers and the barrier-init fence.
 
 #pragma once
 
 #include <sgl_kernel/utils.cuh>
 
+#include <sgl_kernel/ptx/utils.cuh>
+
 #include <cstdint>
+#include <type_traits>
 
 namespace sglang {
 
 namespace device::ptx {
 
-// Inline-PTX `.shared` instructions take a 32-bit byte offset in the shared
-// window, not a generic 64-bit pointer.
-template <typename T>
-SGL_DEVICE uint32_t to_shared(T* ptr) {
-  return static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
+// Inline-PTX `.shared` instructions take a 32-bit byte offset in the shared window, not a generic 64-bit pointer.
+template <SmemAddress T>
+SGL_DEVICE uint32_t to_shared(T addr) {
+  if constexpr (std::is_pointer_v<T>) {
+    return static_cast<uint32_t>(__cvta_generic_to_shared(addr));
+  } else {
+    return static_cast<uint32_t>(addr);
+  }
 }
 
-// ---- mbarrier (PTX ISA §9.7.13.15) -----------------------------------------
-//
-// Only the `try_wait.parity` waiter is wrapped: state-token waits couple
-// arriver and waiter, and mixing state- and parity-tracked codepaths in one
-// kernel is a deadlock risk. The caller owns the phase counter and flips it at
-// the stage wrap (`phase ^= (stage == 0)`).
-//
-// Initial parity, the easy-to-flip part: after `mbar_init` the bar is at
-// parity 0, and each full cycle (count arrivals -> fire -> reset) flips it.
-//   - consumer-first (waits for an external producer's first signal) -> 0.
-//   - producer-first (waits for a consumer to release a slot that no consumer
-//     has touched yet) -> 1, so the first wait is a no-op skip.
-// A consumer-first wait initialized to 1 skips the producer's first signal and
-// blocks forever on the second.
-SGL_DEVICE void mbar_init(uint64_t* bar, uint32_t count) {
-  asm volatile("mbarrier.init.shared.b64 [%0], %1;" ::"r"(to_shared(bar)), "r"(count));
+// This CTA's rank in its cluster (0 below Hopper, where every CTA is its own cluster).
+SGL_DEVICE uint32_t cluster_ctarank() {
+#if SGL_ARCH_HOPPER_OR_GREATER
+  uint32_t rank;
+  asm("mov.u32 %0, %%cluster_ctarank;" : "=r"(rank));
+  return rank;
+#else
+  return 0;
+#endif
 }
 
-SGL_DEVICE uint64_t mbar_arrive(uint64_t* bar) {
+// The number of CTAs in this cluster (1 below Hopper).
+SGL_DEVICE uint32_t cluster_nctarank() {
+#if SGL_ARCH_HOPPER_OR_GREATER
+  uint32_t num;
+  asm("mov.u32 %0, %%cluster_nctarank;" : "=r"(num));
+  return num;
+#else
+  return 1;
+#endif
+}
+
+// The shared::cluster address of the same smem location in the CTA of cluster rank `rank`.
+template <SmemAddress Addr>
+SGL_DEVICE uint32_t mapa_shared(Addr addr, uint32_t rank) {
+  uint32_t result;
+  asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(result) : "r"(to_shared(addr)), "r"(rank));
+  return result;
+}
+
+// ---- mbarrier (PTX ISA 9.7.13.15) ------------------------------------------
+// Only parity waits are wrapped; the caller owns the phase bit. A fresh mbarrier waits on parity 0:
+// a consumer waiting for the producer's first signal starts at 0, a producer waiting on a never-used slot at 1.
+template <MBarAddress Bar>
+SGL_DEVICE void mbar_init(Bar bar, uint32_t count) {
+  asm volatile("mbarrier.init.shared.b64 [%0], %1;" ::"r"(to_shared(bar)), "r"(count) : "memory");
+}
+
+template <MBarAddress Bar>
+SGL_DEVICE uint64_t mbar_arrive(Bar bar) {
   uint64_t state;
-  asm volatile("mbarrier.arrive.shared.b64 %0, [%1];" : "=l"(state) : "r"(to_shared(bar)));
+  asm volatile("mbarrier.arrive.shared.b64 %0, [%1];" : "=l"(state) : "r"(to_shared(bar)) : "memory");
   return state;
 }
 
-SGL_DEVICE uint64_t mbar_arrive_relaxed(uint64_t* bar) {
+template <MBarAddress Bar>
+SGL_DEVICE uint64_t mbar_arrive_relaxed(Bar bar) {
   uint64_t state;
-  asm volatile("mbarrier.arrive.relaxed.cta.shared::cta.b64 %0, [%1];" : "=l"(state) : "r"(to_shared(bar)));
+  asm volatile("mbarrier.arrive.relaxed.cta.shared::cta.b64 %0, [%1];" : "=l"(state) : "r"(to_shared(bar)) : "memory");
   return state;
 }
 
 // Combined arrive + set tx-count, for TMA-load completion.
-SGL_DEVICE void mbar_arrive_expect_tx(uint64_t* bar, uint32_t bytes) {
-  asm volatile("mbarrier.arrive.expect_tx.shared.b64 _, [%0], %1;" ::"r"(to_shared(bar)), "r"(bytes));
+template <MBarAddress Bar>
+SGL_DEVICE void mbar_arrive_expect_tx(Bar bar, uint32_t bytes) {
+  asm volatile("mbarrier.arrive.expect_tx.shared.b64 _, [%0], %1;" ::"r"(to_shared(bar)), "r"(bytes) : "memory");
 }
 
 // Sets the transaction count of the current phase without arriving (the arrivals come separately).
-SGL_DEVICE void mbar_expect_tx(uint64_t* bar, uint32_t bytes) {
+template <MBarAddress Bar>
+SGL_DEVICE void mbar_expect_tx(Bar bar, uint32_t bytes) {
   asm volatile("mbarrier.expect_tx.relaxed.cta.shared::cta.b64 [%0], %1;" ::"r"(to_shared(bar)), "r"(bytes) : "memory");
 }
 
-// Wait for phase `parity` to complete. Looped because the spec allows spurious
-// early wakeups. Default `.acquire` semantics mean prior `cp.async.bulk` writes
-// tracked by this mbarrier are visible to later generic-proxy reads on this
-// thread with no `fence.proxy.async` (spec §9.7.13.15.16 point 3).
-SGL_DEVICE void mbar_wait_parity(uint64_t* bar, uint32_t parity) {
+// The default `.acquire.cta` makes the `cp.async.bulk` writes tracked by this mbarrier visible to later generic
+// reads, with no `fence.proxy.async`.
+template <MBarAddress Bar>
+SGL_DEVICE void mbar_wait_parity(Bar bar, uint32_t parity) {
   asm volatile(
       "{\n\t.reg .pred p;\n\t"
       "WAIT_%=: mbarrier.try_wait.parity.shared.b64 p, [%0], %1;\n\t"
       "@!p bra WAIT_%=;\n\t}\n" ::"r"(to_shared(bar)),
-      "r"(parity));
+      "r"(parity)
+      : "memory");
 }
 
-// The same wait with the PTX suspendTimeHint (nanoseconds): a thread that finds the phase incomplete may be suspended
-// by the hardware until it completes (or the hint elapses) instead of re-polling, which keeps the shared-memory pipe
-// free for the warps that work. Default 10 ms, as CUTLASS.
-SGL_DEVICE void mbar_wait_parity_suspend(uint64_t* bar, uint32_t parity, uint32_t suspend_ns = 10'000'000u) {
+// With a suspendTimeHint (ns): the thread may sleep until the phase completes instead of re-polling smem.
+// Default 10 ms, as CUTLASS.
+template <MBarAddress Bar>
+SGL_DEVICE void mbar_wait_parity_suspend(Bar bar, uint32_t parity, uint32_t suspend_ns = 10'000'000u) {
   asm volatile(
       "{\n\t.reg .pred p;\n\t"
       "WAIT_%=: mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1, %2;\n\t"
@@ -84,26 +112,27 @@ SGL_DEVICE void mbar_wait_parity_suspend(uint64_t* bar, uint32_t parity, uint32_
       : "memory");
 }
 
+// Cluster-scope acquire: needed when peer CTAs deliver the data (st.async, remote release arrives).
+template <MBarAddress Bar>
+SGL_DEVICE void mbar_wait_parity_cluster(Bar bar, uint32_t parity) {
+  asm volatile(
+      "{\n\t.reg .pred p;\n\t"
+      "WAIT_%=: mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 p, [%0], %1;\n\t"
+      "@!p bra WAIT_%=;\n\t}\n" ::"r"(to_shared(bar)),
+      "r"(parity)
+      : "memory");
+}
+
 // Makes the mbarrier initializations visible to the async proxy (TMA, tcgen05.commit) and the cluster.
+// Usually pairs with `bar_cluster_arrive_relaxed` + `bar_cluster_wait_acquire`.
 SGL_DEVICE void fence_barrier_init() {
   asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
 }
 
-// ---- named barriers (PTX ISA §9.7.13.1, bar / barrier) ----------------------
-// CTA-level hardware barriers `id` 0-15 (barrier 0 is also __syncthreads). A barrier completes once `num_threads`
-// threads arrived; `num_threads` must be a multiple of the warp size, and every use of one id in one phase must pass
-// the same count.
-//
-// kAligned = true (default) is the `.aligned` form; `bar.sync` / `bar.arrive` are its aliases. It requires every
-// thread of the warp to execute this same instruction: under a condition, the condition must be warp-uniform (no
-// lane may skip it, take another path to a different barrier instruction, or arrive divergently), otherwise the
-// behavior is undefined. Use kAligned = false (plain `barrier.sync` / `barrier.arrive`) wherever lanes of a warp may
-// reach the barrier divergently.
-//
-// Memory ordering: when the barrier completes, the prior memory accesses of every arriving thread (sync or arrive)
-// are performed relative to all participating threads; a sync additionally issues no new memory access before the
-// completion. So arrive is the producer side (it does not wait) and sync the consumer side of a producer / consumer
-// handoff.
+// ---- named barriers (PTX ISA 9.7.13.1) -------------------------------------
+// `id` 0-15 (0 is __syncthreads); `num_threads` is a multiple of 32 and the same for every use of an id in a phase.
+// kAligned: the whole warp must execute the same instruction (warp-uniform condition), otherwise UB;
+// use kAligned = false where lanes may reach it divergently. Arrive is the producer side, sync the consumer side.
 
 template <bool kAligned = true>
 SGL_DEVICE void bar_sync(uint32_t id, uint32_t num_threads) {
@@ -121,6 +150,47 @@ SGL_DEVICE void bar_arrive(uint32_t id, uint32_t num_threads) {
   } else {
     asm volatile("barrier.arrive %0, %1;" ::"r"(id), "r"(num_threads) : "memory");
   }
+}
+
+// ---- cluster barrier (barrier.cluster), kAligned as above ------------------
+
+template <bool kAligned = true>
+SGL_DEVICE void bar_cluster_arrive_relaxed() {
+  if constexpr (kAligned) {
+    asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
+  } else {
+    asm volatile("barrier.cluster.arrive.relaxed;" ::: "memory");
+  }
+}
+
+template <bool kAligned = true>
+SGL_DEVICE void bar_cluster_arrive_release() {
+  if constexpr (kAligned) {
+    asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
+  } else {
+    asm volatile("barrier.cluster.arrive.release;" ::: "memory");
+  }
+}
+
+// `barrier.cluster.wait` has only the acquire form.
+template <bool kAligned = true>
+SGL_DEVICE void bar_cluster_wait_acquire() {
+  if constexpr (kAligned) {
+    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+  } else {
+    asm volatile("barrier.cluster.wait.acquire;" ::: "memory");
+  }
+}
+
+// Same as `cg::this_cluster().sync()`; kRelaxed drops the release (e.g. after `fence_barrier_init`).
+template <bool kAligned = true, bool kRelaxed = false>
+SGL_DEVICE void bar_cluster_sync() {
+  if constexpr (kRelaxed) {
+    bar_cluster_arrive_relaxed<kAligned>();
+  } else {
+    bar_cluster_arrive_release<kAligned>();
+  }
+  bar_cluster_wait_acquire<kAligned>();
 }
 
 }  // namespace device::ptx

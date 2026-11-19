@@ -218,6 +218,19 @@ class Model(msgspec.Struct):
             resolvable=True,
         ),
     ] = "auto"
+    indexer_kv_cache_dtype: A[
+        Optional[str],
+        Arg(
+            help=(
+                "Quantization recipe for the DSA lightning-indexer KV cache "
+                "(Ascend NPU only). None disables the quantized indexer cache "
+                'and keeps the default indexer behavior. "int8" stores the '
+                "indexer keys in INT8 with FP16 scales to speed up the "
+                "lightning indexer."
+            ),
+            choices=["int8"],
+        ),
+    ] = None
     qsa_indexer_dtype: A[
         str,
         Arg(
@@ -400,3 +413,17 @@ class Model(msgspec.Struct):
             help="Timeout in seconds for weight cache daemon readiness (default: 1800).",
         ),
     ] = 1800
+    weight_cache_transport: A[
+        str,
+        Arg(
+            help="How the weight cache daemon shares weights with engines: "
+            "'torch_ipc' (CUDA IPC handles; the engine dies with the daemon) or "
+            "'vmm_fd' (CUDA VMM allocations passed as file descriptors; the "
+            "engine maps them at addresses it reserves and keeps them if the "
+            "daemon exits). The daemon's setting picks the transport, and "
+            "'auto' means torch_ipc there for now. On an engine, 'auto' accepts "
+            "whatever the daemon serves, while 'torch_ipc' or 'vmm_fd' refuses "
+            "a daemon serving the other.",
+            choices=["auto", "torch_ipc", "vmm_fd"],
+        ),
+    ] = "auto"

@@ -5,9 +5,9 @@ Qwen3.8-Flash-Next) out of device memory and lets the Triton gather kernel read
 rows straight from a host pointer. Two backends provide that pointer:
 
 ``pinned`` (default)
-    ``torch.empty(..., pin_memory=True)``. On a discrete GPU this frees VRAM.
-    With ``SGLANG_OPT_PLE_PINNED_HUGEPAGE`` the table is an anonymous mapping on
-    transparent huge pages, page-locked with ``cudaHostRegister`` instead.
+    Page-locked host memory of exactly the table's size (``cudaHostAlloc``;
+    ``torch.empty(..., pin_memory=True)`` on non-CUDA builds). On a discrete
+    GPU this frees VRAM.
 
 ``file``
     A file-backed, shared ``mmap`` of a sparse file under
@@ -59,10 +59,7 @@ _CUDA_DEV_ATTR_PAGEABLE_MEMORY_ACCESS = 88
 _CUDA_DEV_ATTR_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES = 100
 _MADV_RANDOM = 1
 _MADV_DONTNEED = 4
-_MADV_HUGEPAGE = 14
 _PAGE_SHIFT = 12
-# A PMD huge page with 64 KiB base pages; the pinned huge-page mapping starts aligned to it.
-_HUGEPAGE_ALIGN = 512 << 20
 # One MADV_DONTNEED call takes mmap_lock for its whole range; over the full
 # 47.7 GiB table that is ~3.5 s during which every fault in the process --
 # including the ones the gather kernel takes -- stalls. Trim in slices.
@@ -249,10 +246,8 @@ def allocate_ple_host_table(
             f"unknown PLE offload backend {backend!r}; choose from {PLE_OFFLOAD_BACKENDS}"
         )
     if backend == "pinned":
-        if envs.SGLANG_OPT_PLE_PINNED_HUGEPAGE.get():
-            table = _pinned_hugepage_table(shape, dtype)
-            if table is not None:
-                return table
+        if torch.version.cuda is not None:
+            return _alloc_cuda_host_table(tuple(shape), dtype)
         return torch.empty(tuple(shape), dtype=dtype, device="cpu", pin_memory=True)
 
     numel = 1
@@ -490,74 +485,22 @@ def _madvise_random(storage: torch.Tensor, nbytes: int) -> None:
         logger.warning("PLE table: madvise(MADV_RANDOM) not applied")
 
 
-def _pinned_hugepage_table(
-    shape: Sequence[int], dtype: torch.dtype
-) -> Optional[torch.Tensor]:
-    """A page-locked, huge-page-backed host tensor of ``shape``/``dtype``; None (with a warning)
-    when the mapping, the advice or the registration fails, so the caller takes cudaHostAlloc."""
-    import mmap
-
-    numel = 1
-    for d in shape:
-        numel *= int(d)
-    nbytes = numel * torch.empty(0, dtype=dtype).element_size()
-    try:
-        mapping = mmap.mmap(
-            -1, nbytes + _HUGEPAGE_ALIGN, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS
-        )
-        raw = (ctypes.c_char * (nbytes + _HUGEPAGE_ALIGN)).from_buffer(mapping)
-        base = ctypes.addressof(raw)
-        offset = -base % _HUGEPAGE_ALIGN
-        if not _madvise(base + offset, nbytes, _MADV_HUGEPAGE):
-            raise OSError("madvise(MADV_HUGEPAGE) failed")
-        storage = torch.frombuffer(raw, dtype=torch.uint8, count=nbytes, offset=offset)
-        rc = int(torch.cuda.cudart().cudaHostRegister(base + offset, nbytes, 0))
-        if rc != 0:
-            _clear_cuda_last_error()
-            raise OSError(f"cudaHostRegister returned {rc}")
-    except Exception as exc:  # noqa: BLE001 - fall back to cudaHostAlloc
-        logger.warning(
-            "SGLANG_OPT_PLE_PINNED_HUGEPAGE: kept cudaHostAlloc for the PLE table (%s)",
-            exc,
-        )
-        return None
-    table = storage.view(dtype).view(*[int(d) for d in shape])
-    # The mapping must outlive the tensor; it is never unregistered (one per process).
-    table._sglang_ple_mapping = (mapping, raw)
-    logger.info(
-        "SGLANG_OPT_PLE_PINNED_HUGEPAGE: PLE table on transparent huge pages, page-locked "
-        "(%.1f GiB, %s; process AnonHugePages %s)",
-        nbytes / 2**30,
-        dtype,
-        _anon_huge_pages(),
+def _alloc_cuda_host_table(shape: tuple, dtype: torch.dtype) -> torch.Tensor:
+    # torch's pinned allocator rounds each block up to a power of two, pinning up
+    # to ~2x the requested size; cudaHostAlloc pins exactly nbytes and is freed
+    # with the table. Same call and flags as torch's (cudaHostAllocDefault).
+    from sglang.srt.distributed.device_communicators.cuda_wrapper import (
+        CudaRTLibrary,
     )
-    return table
+    from sglang.srt.mem_cache.pool_host.common import alloc_owned_host_tensor
 
-
-def _clear_cuda_last_error() -> None:
-    """A failed cudaHostRegister leaves the runtime's last error set, and torch's next launch
-    check would raise it; clear it in every libcudart this process loaded."""
-    try:
-        with open("/proc/self/maps") as f:
-            paths = sorted({ln.split()[-1] for ln in f if "libcudart.so" in ln})
-    except OSError:
-        paths = []
-    for path in paths:
-        try:
-            ctypes.CDLL(path).cudaGetLastError()
-        except (OSError, AttributeError):
-            continue
-
-
-def _anon_huge_pages() -> str:
-    try:
-        with open("/proc/self/smaps_rollup") as f:
-            for line in f:
-                if line.startswith("AnonHugePages:"):
-                    return line.split(":", 1)[1].strip()
-    except OSError:
-        pass
-    return "unknown"
+    cudart = CudaRTLibrary()
+    return alloc_owned_host_tensor(
+        dims=shape,
+        dtype=dtype,
+        alloc=lambda nbytes: cudart.cudaHostAlloc(nbytes).value,
+        free=lambda ptr: cudart.cudaFreeHost(ctypes.c_void_p(ptr)),
+    )
 
 
 def _libc() -> Optional[ctypes.CDLL]:
