@@ -2168,8 +2168,10 @@ class Envs:
     # Prefill index top-k by the sampled-threshold indexers of kernels/ops/attention/dsa/litetopk_prefill
     # (after LiteTopK, https://arxiv.org/abs/2607.11976) instead of dense logits + top-k, on SM100.
     SGLANG_OPT_USE_PREFILL_LITE_TOPK = EnvBool(False)
+    SGLANG_OPT_DSV41_TRITON_PREFILL_SELECTION = EnvBool(False)
     # Raise the per-rank prefill Indexer score tile limit to 2 GiB.
     SGLANG_OPT_DSV41_LARGE_PREFILL_SCORE_BUDGET = EnvBool(False)
+    SGLANG_OPT_DSV41_VERIFY_INDEXER_BF16_K_REUSE = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
     # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16
@@ -2252,6 +2254,9 @@ class Envs:
     # Draft sampler uses the Gumbel-max trick (argmax(probs / Exp(1))) instead of
     # torch.multinomial, whose device-side validity assert breaks draft-graph replay.
     SGLANG_OPT_USE_GUMBEL_SAMPLE = EnvBool(True)
+    # Rejection-sampling draft proposal as one fused kernel (softmax + exponential-race draw on
+    # torch's Philox state + greedy argmax). Same distribution as the Gumbel sampler.
+    SGLANG_OPT_USE_FUSED_DRAFT_SAMPLE = EnvBool(False)
     # Multi-layer chain-MTP boundary-KV fix: widen the draft-extend window to
     # rewrite rejected-draft KV rows before reuse (acc_len repair; on by default).
     SGLANG_ENABLE_MTP_BOUNDARY_KV_FIX = EnvBool(True)
