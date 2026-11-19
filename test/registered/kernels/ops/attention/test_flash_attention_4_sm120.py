@@ -1459,6 +1459,7 @@ def test_sm120_paged_prefill_reuses_cached_host_plan(
         torch.testing.assert_close(generic, cached, atol=0.0, rtol=0.0)
 
     # Tile selection reads the exact max_seqlen_k, so another value needs its own plan.
+    q, k_cache, v_cache, _ = layers[0]
     cache_hits.clear()
     for _ in range(2):
         run(q, k_cache, v_cache, torch.empty_like(q), max_seqlen_k=max(lengths) + 64)
@@ -1539,6 +1540,241 @@ def test_sm120_paged_prefill_full_and_swa_layers_keep_separate_plans(monkeypatch
     # The bitwise checks catch a shared plan only if the settings' outputs differ.
     q, k_cache, v_cache, _ = layers[0]
     assert not torch.equal(run(q, k_cache, v_cache, swa), outputs[0])
+
+
+def _paged_prefill_batch(lengths, page_size, num_q_heads, num_kv_heads, head_dim):
+    """Q, a paged KV cache and the metadata of a prefill over `lengths`."""
+    pages = [-(-length // page_size) for length in lengths]
+    page_ids = torch.randperm(sum(pages), device="cuda").to(torch.int32)
+    page_table = torch.zeros(len(lengths), max(pages), device="cuda", dtype=torch.int32)
+    offsets = [0]
+    for i, num_pages in enumerate(pages):
+        page_table[i, :num_pages] = page_ids[offsets[-1] : offsets[-1] + num_pages]
+        offsets.append(offsets[-1] + num_pages)
+    q_offsets = [0]
+    for length in lengths:
+        q_offsets.append(q_offsets[-1] + length)
+    q = torch.randn(
+        sum(lengths), num_q_heads, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    k_cache = torch.randn(
+        sum(pages),
+        page_size,
+        num_kv_heads,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    return dict(
+        q=q,
+        k_cache=k_cache,
+        v_cache=torch.randn_like(k_cache),
+        page_table=page_table,
+        cache_seqlens=torch.tensor(lengths, device="cuda", dtype=torch.int32),
+        cu_seqlens_q=torch.tensor(q_offsets, device="cuda", dtype=torch.int32),
+    )
+
+
+@pytest.mark.parametrize("paged", [True, False])
+def test_sm120_omitted_max_seqlen_q_keeps_its_own_plan(monkeypatch, paged):
+    """Tile selection sees an omitted max_seqlen_q as None and picks another tile
+    for one GQA sequence than for the same value passed, so the two calls must not
+    share a launch plan."""
+    sm120_forward_host.clear_launch_plans()
+    cache_hits = []
+    name = "try_paged" if paged else "try_varlen"
+    original_try = getattr(sm120_forward_host, name)
+
+    def record_cache_hit(**kwargs):
+        result = original_try(**kwargs)
+        cache_hits.append(result is not None)
+        return result
+
+    monkeypatch.setattr(sm120_forward_host, name, record_cache_hit)
+    torch.manual_seed(20261118)
+    length, num_q_heads, num_kv_heads, head_dim = 300, 16, 2, 128
+    batch = _paged_prefill_batch((length,), 64, num_q_heads, num_kv_heads, head_dim)
+    q, cu_seqlens = batch["q"], batch["cu_seqlens_q"]
+    k = torch.randn(length, num_kv_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+
+    def run(max_seqlen_q):
+        if paged:
+            return flash_attn_with_kvcache(
+                **batch, max_seqlen_q=max_seqlen_q, causal=True, num_splits=1
+            )
+        return flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=length,
+            causal=True,
+        )
+
+    cached = {}
+    for max_seqlen_q in (None, length):
+        cache_hits.clear()
+        run(max_seqlen_q)
+        cached[max_seqlen_q] = run(max_seqlen_q)
+        # The first call misses, also when the other setting has left a plan.
+        assert not cache_hits[0] and cache_hits[-1]
+    for max_seqlen_q, output in cached.items():
+        sm120_forward_host.clear_launch_plans()
+        torch.testing.assert_close(run(max_seqlen_q), output, atol=0.0, rtol=0.0)
+    # The bitwise checks catch a shared plan only if the two tiles' outputs differ.
+    assert not torch.equal(cached[None], cached[length])
+
+
+def test_sm120_float32_output_launch_stores_no_plan(monkeypatch):
+    """A plan lookup hands the launch an output of Q's dtype. A SplitKV decode into
+    a float32 output must therefore store no plan: the next call of the same shapes
+    would replay its float32 combine step and fail."""
+    sm120_forward_host.clear_launch_plans()
+    registrations = []
+    original_register_paged = sm120_forward_host.register_paged
+
+    def record_registration(**kwargs):
+        registrations.append(kwargs)
+        return original_register_paged(**kwargs)
+
+    monkeypatch.setattr(sm120_forward_host, "register_paged", record_registration)
+    torch.manual_seed(20261118)
+    batch_size, num_q_heads, num_kv_heads, head_dim = 2, 8, 2, 128
+    max_seqlen, page_size = 512, 64
+    pages_per_request = max_seqlen // page_size
+    q = torch.randn(
+        batch_size, num_q_heads, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    k_cache = torch.randn(
+        batch_size * pages_per_request,
+        page_size,
+        num_kv_heads,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    v_cache = torch.randn_like(k_cache)
+    page_table = torch.arange(
+        batch_size * pages_per_request, device="cuda", dtype=torch.int32
+    ).view(batch_size, pages_per_request)
+    cache_seqlens = torch.full(
+        (batch_size,), max_seqlen, device="cuda", dtype=torch.int32
+    )
+    cu_seqlens_q = torch.arange(batch_size + 1, device="cuda", dtype=torch.int32)
+
+    def run(out):
+        return flash_attn_with_kvcache(
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=1,
+            max_seqlen_k=max_seqlen,
+            causal=True,
+            num_splits=2,
+            out=out,
+        )
+
+    in_float32 = run(torch.empty(q.shape, device="cuda", dtype=torch.float32))
+    torch.cuda.synchronize()
+    assert in_float32.dtype == torch.float32
+    assert registrations == []
+    # The next launch of the same shapes compiles for Q's dtype and stores its plan.
+    in_bf16 = run(None)
+    assert in_bf16.dtype == q.dtype
+    assert [call["actual_num_splits"] for call in registrations] == [2]
+    _assert_attention_close(in_bf16, in_float32)
+
+
+def test_sm120_explicit_tile_paged_launch_neither_stores_nor_takes_a_plan(monkeypatch):
+    """A paged launch with an explicit tile_mn must not store a plan, and must not
+    replay the plan that a default launch of the same shapes stored."""
+    sm120_forward_host.clear_launch_plans()
+    lookups, registrations = [], []
+    original_try_paged = sm120_forward_host.try_paged
+    original_register_paged = sm120_forward_host.register_paged
+
+    def record_lookup(**kwargs):
+        lookups.append(kwargs)
+        return original_try_paged(**kwargs)
+
+    def record_registration(**kwargs):
+        registrations.append(kwargs)
+        return original_register_paged(**kwargs)
+
+    monkeypatch.setattr(sm120_forward_host, "try_paged", record_lookup)
+    monkeypatch.setattr(sm120_forward_host, "register_paged", record_registration)
+    torch.manual_seed(20261118)
+    lengths = (192, 128, 77)
+    batch = _paged_prefill_batch(lengths, 64, 16, 2, 128)
+
+    def run(tile_mn):
+        return _flash_attn_fwd(
+            batch["q"],
+            batch["k_cache"],
+            batch["v_cache"],
+            cu_seqlens_q=batch["cu_seqlens_q"],
+            seqused_k=batch["cache_seqlens"],
+            page_table=batch["page_table"],
+            max_seqlen_q=max(lengths),
+            causal=True,
+            tile_mn=tile_mn,
+        )[0]
+
+    explicit = run((64, 64))
+    torch.cuda.synchronize()
+    assert (len(lookups), len(registrations)) == (0, 0)
+    default = run(None)
+    assert (len(lookups), len(registrations)) == (1, 1)
+    explicit_again = run((64, 64))
+    assert (len(lookups), len(registrations)) == (1, 1)
+    torch.testing.assert_close(explicit_again, explicit, atol=0.0, rtol=0.0)
+    _assert_attention_close(explicit, default)
+
+
+def test_sm120_split_kv_paged_prefill_stores_no_plan(monkeypatch):
+    """A prefill plan replays one launch. A SplitKV prefill also needs its combine
+    step, so it must store no plan and keep the generic path."""
+    sm120_forward_host.clear_launch_plans()
+    cache_hits, registrations = [], []
+    original_try_paged = sm120_forward_host.try_paged
+    original_register_paged = sm120_forward_host.register_paged
+
+    def record_cache_hit(**kwargs):
+        result = original_try_paged(**kwargs)
+        cache_hits.append(result is not None)
+        return result
+
+    def record_registration(**kwargs):
+        registrations.append(kwargs)
+        return original_register_paged(**kwargs)
+
+    monkeypatch.setattr(sm120_forward_host, "try_paged", record_cache_hit)
+    monkeypatch.setattr(sm120_forward_host, "register_paged", record_registration)
+    torch.manual_seed(20261118)
+    lengths = (512, 448, 400)
+    batch = _paged_prefill_batch(lengths, 64, 16, 2, 128)
+
+    def run(num_splits):
+        return flash_attn_with_kvcache(
+            **batch, max_seqlen_q=max(lengths), causal=True, num_splits=num_splits
+        )
+
+    split = run(2)
+    split_again = run(2)
+    torch.cuda.synchronize()
+    # Both launches were SplitKV, and both missed in the wrapper and the generic path.
+    assert [call["actual_num_splits"] for call in registrations] == [2, 2]
+    assert cache_hits == [False] * 4
+    assert not sm120_forward_host._paged_prefill_plans
+    assert not sm120_forward_host._paged_plans
+    torch.testing.assert_close(split_again, split, atol=0.0, rtol=0.0)
+    _assert_attention_close(split, run(1))
 
 
 @pytest.mark.parametrize(

@@ -436,6 +436,7 @@ def _flash_attn_fwd(
     arch = _get_device_arch() if _arch is None else _arch
     arch_forward_host = get_forward_host(arch)
     requested_num_splits = num_splits
+    max_seqlen_q_given = max_seqlen_q is not None
     # Launch plans key on the default tile choice; explicit tiles bypass them.
     uses_default_tiles = (
         tile_mn is None and mma_pv_is_rs is None and intra_wg_overlap is None
@@ -1871,6 +1872,8 @@ def _flash_attn_fwd(
                 and not requires_grad
                 and (learnable_sink is None or not learnable_sink.requires_grad)
                 and lse is None
+                # A plan lookup hands the launch an output of Q's dtype.
+                and out.dtype == q.dtype
                 and softcap is None
                 and score_mod is None
                 and mask_mod is None
@@ -1895,6 +1898,7 @@ def _flash_attn_fwd(
                     cu_seqlens_q=cu_seqlens_q,
                     cu_seqlens_k=cu_seqlens_k,
                     max_seqlen_q=max_seqlen_q,
+                    max_seqlen_q_given=max_seqlen_q_given,
                     max_seqlen_k=max_seqlen_k,
                     causal=causal,
                     window_size_left=window_size_left,
@@ -1928,6 +1932,8 @@ def _flash_attn_fwd(
         and not requires_grad
         and (learnable_sink is None or not learnable_sink.requires_grad)
         and lse is None
+        # A plan lookup hands the launch an output of Q's dtype.
+        and out.dtype == q.dtype
         and softcap is None
         and score_mod is None
         and mask_mod is None
@@ -1969,6 +1975,7 @@ def _flash_attn_fwd(
             seqused_k=seqused_k,
             page_table=page_table,
             max_seqlen_q=max_seqlen_q,
+            max_seqlen_q_given=max_seqlen_q_given,
             max_seqlen_k=max_seqlen_k,
             causal=causal,
             window_size_left=window_size_left,

@@ -1028,6 +1028,8 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
     def __init__(self) -> None:
         self._varlen_plans: OrderedDict[tuple, _VarlenLaunchPlan] = OrderedDict()
         self._paged_plans: OrderedDict[tuple, _PagedLaunchPlan] = OrderedDict()
+        # One-launch plans keyed on the exact max_seqlen_k: prefill, and the decode
+        # shapes that _supports_cached_paged_decode leaves out.
         self._paged_prefill_plans: OrderedDict[tuple, _PagedLaunchPlan] = OrderedDict()
         self._paged_plan_tiles: OrderedDict[tuple, tuple[int, int]] = OrderedDict()
         self._paged_workspaces: OrderedDict[
@@ -1048,6 +1050,7 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
         cu_seqlens_q: torch.Tensor,
         cu_seqlens_k: torch.Tensor,
         max_seqlen_q: int,
+        max_seqlen_q_given: bool,
         max_seqlen_k: int,
         causal: bool,
         window_size_left: Optional[int],
@@ -1064,6 +1067,8 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
             tuple(_tensor_signature(t) for t in (q, k, v, cu_seqlens_q, cu_seqlens_k)),
             sink_signature,
             max_seqlen_q,
+            # Tile selection sees an omitted max_seqlen_q as None, not as its default.
+            max_seqlen_q_given,
             max_seqlen_k,
             causal,
             window_size_left,
@@ -1122,6 +1127,7 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
             max_seqlen_q=actual_max_seqlen_q,
+            max_seqlen_q_given=max_seqlen_q is not None,
             max_seqlen_k=actual_max_seqlen_k,
             causal=causal,
             window_size_left=window_size_left,
@@ -1174,6 +1180,7 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
         cu_seqlens_q: torch.Tensor,
         cu_seqlens_k: torch.Tensor,
         max_seqlen_q: int,
+        max_seqlen_q_given: bool,
         max_seqlen_k: int,
         causal: bool,
         window_size_left: Optional[int],
@@ -1189,6 +1196,7 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
             max_seqlen_q=max_seqlen_q,
+            max_seqlen_q_given=max_seqlen_q_given,
             max_seqlen_k=max_seqlen_k,
             causal=causal,
             window_size_left=window_size_left,
@@ -1212,6 +1220,7 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
         seqused_k: torch.Tensor,
         page_table: torch.Tensor,
         max_seqlen_q: int,
+        max_seqlen_q_given: bool,
         causal: bool,
         window_size_left: Optional[int],
         window_size_right: Optional[int],
@@ -1231,6 +1240,8 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
             ),
             sink_signature,
             max_seqlen_q,
+            # Tile selection sees an omitted max_seqlen_q as None, not as its default.
+            max_seqlen_q_given,
             causal,
             window_size_left,
             window_size_right,
@@ -1428,7 +1439,7 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
         effective_q_rows = actual_max_seqlen_q * (
             qhead_per_kvhead if actual_pack_gqa else 1
         )
-        is_decode = self._supports_cached_paged_decode(
+        keys_on_kv_blocks = self._supports_cached_paged_decode(
             head_dim=q.shape[-1],
             head_dim_v=v.shape[-1],
             effective_q_rows=effective_q_rows,
@@ -1447,6 +1458,7 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
             seqused_k=seqused_k,
             page_table=page_table,
             max_seqlen_q=actual_max_seqlen_q,
+            max_seqlen_q_given=max_seqlen_q is not None,
             causal=causal,
             window_size_left=window_size_left,
             window_size_right=window_size_right,
@@ -1454,7 +1466,7 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
             pack_gqa=actual_pack_gqa,
             requested_num_splits=requested_num_splits,
         )
-        if is_decode:
+        if keys_on_kv_blocks:
             plan = self._paged_decode_plan(
                 base_key,
                 max_seqlen_k=actual_max_seqlen_k,
@@ -1532,6 +1544,7 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
         seqused_k: torch.Tensor,
         page_table: torch.Tensor,
         max_seqlen_q: int,
+        max_seqlen_q_given: bool,
         max_seqlen_k: int,
         causal: bool,
         window_size_left: Optional[int],
@@ -1544,13 +1557,13 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
     ) -> None:
         qhead_per_kvhead = q.shape[1] // k.shape[-2]
         effective_q_rows = max_seqlen_q * (qhead_per_kvhead if pack_gqa else 1)
-        is_decode = self._supports_cached_paged_decode(
+        keys_on_kv_blocks = self._supports_cached_paged_decode(
             head_dim=q.shape[-1],
             head_dim_v=v.shape[-1],
             effective_q_rows=effective_q_rows,
         )
         # A prefill plan replays one launch; SplitKV prefill keeps the generic path.
-        if not is_decode and actual_num_splits != 1:
+        if not keys_on_kv_blocks and actual_num_splits != 1:
             return
         base_key = self._paged_base_key(
             arch=arch,
@@ -1561,6 +1574,7 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
             seqused_k=seqused_k,
             page_table=page_table,
             max_seqlen_q=max_seqlen_q,
+            max_seqlen_q_given=max_seqlen_q_given,
             causal=causal,
             window_size_left=window_size_left,
             window_size_right=window_size_right,
@@ -1568,7 +1582,7 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
             pack_gqa=pack_gqa,
             requested_num_splits=requested_num_splits,
         )
-        if not is_decode:
+        if not keys_on_kv_blocks:
             self._register_paged_prefill_plan(
                 self._paged_prefill_key(base_key, max_seqlen_k),
                 _PagedLaunchPlan(
