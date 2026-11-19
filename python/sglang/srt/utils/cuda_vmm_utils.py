@@ -1077,6 +1077,8 @@ def map_fabric_import(
         if read_only:
             access.flags = drv.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READ
         check_drv(drv.cuMemSetAccess(va, size, [access], 1), "cuMemSetAccess(import)")
+        # The mapping keeps the physical allocation alive; the import handle is not needed.
+        check_drv(drv.cuMemRelease(handle), "cuMemRelease(import)")
     except BaseException as error:
         if mapped and drv.cuMemUnmap(va, size)[0] != drv.CUresult.CUDA_SUCCESS:
             error.add_note("cuMemUnmap(import rollback) also failed")
@@ -1084,8 +1086,6 @@ def map_fabric_import(
             drv.cuMemAddressFree(va, size)
         drv.cuMemRelease(handle)
         raise
-    # The mapping keeps the physical allocation alive; the import handle is not needed.
-    check_drv(drv.cuMemRelease(handle), "cuMemRelease(import)")
     return va
 
 
