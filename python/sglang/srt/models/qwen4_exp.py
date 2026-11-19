@@ -1611,8 +1611,16 @@ class Qwen4ExpPLELayer(nn.Module):
                 self.short_conv_dilation,
                 short_conv.view.layer_intermediate_cache(short_conv.view_layer_id),
             )
-            if can_fuse_qwen4_verify_conv(*conv_args):
-                output = fused_qwen4_verify_conv(*conv_args)
+            intermediate_rows = None
+            if conv_args[-1] is not None:
+                intermediate_rows = select_verify_intermediate_state_indices(
+                    None,
+                    forward_batch.req_pool_indices,
+                    lambda: batch.lengths.ne(0),
+                    get_req_to_token_pool().size,
+                )
+            if can_fuse_qwen4_verify_conv(*conv_args, intermediate_rows):
+                output = fused_qwen4_verify_conv(*conv_args, intermediate_rows)
                 return _pad_token_rows(output, batch.physical_tokens)
         if sp_active:
             full_conv_input = layernorm_sp.all_gather_token_rows(

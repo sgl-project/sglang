@@ -1220,6 +1220,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
             forward_batch.seq_lens,
             is_target_verify=forward_batch.forward_mode.is_target_verify(),
             draft_token_num=draft_token_num,
+            req_pool_indices=forward_batch.req_pool_indices,
         )
         # `forward` slices the track destinations from ([-num_decodes:])
         assert self.forward_metadata.num_decodes == forward_batch.batch_size, (

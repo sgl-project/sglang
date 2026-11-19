@@ -15,6 +15,9 @@ from sglang.srt.configs.mamba_utils import (
 from sglang.srt.distributed import (
     divide,
 )
+from sglang.srt.layers.attention.linear.utils import (
+    select_verify_intermediate_state_indices,
+)
 from sglang.srt.layers.attention.mamba.mamba2_metadata import Mamba2Metadata
 from sglang.srt.layers.attention.mamba.mixer2_rms_norm_gated import Mixer2RMSNormGated
 from sglang.srt.layers.dp_attention import (
@@ -657,8 +660,22 @@ class MambaMixer2(torch.nn.Module):
                     "layer_cache must be SpeculativeState for speculative decoding"
                 )
                 draft_token_num = metadata.draft_token_num
-                self.intermediate_state_indices = torch.arange(
-                    num_decodes, dtype=torch.int32, device=state_indices_tensor_d.device
+                if (
+                    not hasattr(self, "intermediate_state_indices")
+                    or self.intermediate_state_indices.numel() < num_decodes
+                ):
+                    self.intermediate_state_indices = torch.arange(
+                        num_decodes,
+                        dtype=torch.int32,
+                        device=state_indices_tensor_d.device,
+                    )
+                intermediate_state_indices = select_verify_intermediate_state_indices(
+                    self.intermediate_state_indices[:num_decodes],
+                    metadata.req_pool_indices[num_prefills : num_prefills + num_decodes]
+                    if metadata.req_pool_indices is not None
+                    else None,
+                    lambda: state_indices_tensor_d >= 0,
+                    layer_cache.intermediate_ssm.shape[0] - 1,
                 )
 
                 # Reshape for batch processing
@@ -674,7 +691,7 @@ class MambaMixer2(torch.nn.Module):
                     self.activation,
                     conv_state_indices=state_indices_tensor_d[:num_decodes],
                     intermediate_conv_window=layer_cache.intermediate_conv_window[0],
-                    intermediate_state_indices=self.intermediate_state_indices,
+                    intermediate_state_indices=intermediate_state_indices,
                     retrieve_next_token=metadata.retrieve_next_token,
                     retrieve_next_sibling=metadata.retrieve_next_sibling,
                     retrieve_parent_token=metadata.retrieve_parent_token,
@@ -746,7 +763,7 @@ class MambaMixer2(torch.nn.Module):
                     intermediate_states_buffer=layer_cache.intermediate_ssm,
                     cache_steps=draft_token_num,
                     retrieve_parent_token=metadata.retrieve_parent_token,
-                    intermediate_state_indices=self.intermediate_state_indices,
+                    intermediate_state_indices=intermediate_state_indices,
                 )
             else:
                 selective_state_update(

@@ -22,6 +22,9 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_update as causal_conv1d_update_triton,
 )
 from sglang.srt.configs.lfm2 import Lfm2Config
+from sglang.srt.layers.attention.linear.utils import (
+    select_verify_intermediate_state_indices,
+)
 from sglang.srt.layers.attention.mamba.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
@@ -244,6 +247,12 @@ def shortconv_target_verify(
         conv._intermediate_state_indices = torch.arange(
             bs, dtype=torch.int32, device=Bx.device
         )
+    intermediate_state_indices = select_verify_intermediate_state_indices(
+        conv._intermediate_state_indices[:bs],
+        meta.req_pool_indices,
+        lambda: meta.cache_indices >= 0,
+        meta.layer_cache.intermediate_conv_window[0].shape[0] - 1,
+    )
     conv_out = causal_conv1d_update_triton(
         Bx_reshaped,
         meta.layer_cache.conv[0],
@@ -252,7 +261,7 @@ def shortconv_target_verify(
         activation=None,
         conv_state_indices=meta.cache_indices,
         intermediate_conv_window=meta.layer_cache.intermediate_conv_window[0],
-        intermediate_state_indices=conv._intermediate_state_indices[:bs],
+        intermediate_state_indices=intermediate_state_indices,
     )
     return conv_out.transpose(1, 2).reshape(bs * draft_token_num, -1)
 
