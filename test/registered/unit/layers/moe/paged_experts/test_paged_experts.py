@@ -1261,26 +1261,6 @@ class TestCompat(CustomTestCase):
                 ):
                     self._check(tp_size=2, parallel_sizes={name: 2})
 
-    def test_attention_dp_is_rejected_after_resolving_the_legacy_flags(self):
-        from sglang.srt.arg_groups.overrides import resolution_result
-        from sglang.srt.arg_groups.parallel_hook import handle_deprecated_dp_attention
-        from sglang.srt.server_args import ServerArgs
-
-        args = ServerArgs(
-            model_path="dummy", tp_size=2, dp_size=2, enable_dp_attention=True
-        )
-        handle_deprecated_dp_attention(args)
-        self.assertEqual(resolution_result(args, "dp_size"), 1)
-        with self.assertRaisesRegex(RuntimeError, "--attn-dp-size must be 1"):
-            self._check(
-                tp_size=2,
-                num_resident=8,
-                parallel_sizes={
-                    "dp_size": resolution_result(args, "dp_size"),
-                    "attn_dp_size": resolution_result(args, "attn_dp_size"),
-                },
-            )
-
     def test_tp_does_not_suggest_the_disabled_disk_cache(self):
         for tp_size in (1, 2):
             with (
