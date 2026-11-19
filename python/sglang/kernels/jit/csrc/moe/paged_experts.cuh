@@ -24,6 +24,7 @@
 
 #include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/utils.cuh>
+#include <sgl_kernel/warp.cuh>
 
 #include <climits>
 #include <cmath>
@@ -246,9 +247,7 @@ __global__ void paged_experts_precopy_plan_kernel(
     if (idx == best_idx[r]) v = -INFINITY, idx = INT_MAX;  // taken
   }
   {  // softmax: the denominator over every expert
-    float sum = i < E ? expf(x - best_val[0]) : 0.f;
-    for (int o = 16; o > 0; o /= 2)
-      sum += __shfl_xor_sync(0xffffffff, sum, o);
+    const float sum = sglang::device::warp::reduce_sum(i < E ? expf(x - best_val[0]) : 0.f);
     if (lane == 0) warp_val[warp] = sum;
     __syncthreads();
     if (i == 0) {

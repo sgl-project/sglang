@@ -228,10 +228,6 @@ def install(model) -> int:
     del precopies[:]
     if len(moes) < 2:
         return 0
-    config = getattr(model, "config", None)
-    if hasattr(config, "get_text_config"):
-        config = config.get_text_config()
-    top_k = int(config.num_experts_per_tok)
     stream = None
     skipped = {}
     for (_, method), (nxt, nxt_method) in zip(moes, moes[1:]):
@@ -239,10 +235,17 @@ def install(model) -> int:
         if why is None and not _copies_ahead(nxt_method.device_executor.store):
             why = "a store that plans its own copies"
         weight = nxt.gate.weight
+        experts = nxt_method.device_executor.residency.expert_slot.numel()
+        # Each layer's own routing width (some models set it per layer).
+        top_k = int(nxt.topk.topk_config.top_k or 0) if why is None else 0
         if why is None and weight.dtype not in (torch.bfloat16, torch.float16):
             why = f"a {weight.dtype} router"
-        if why is None and weight.shape[0] > 1024:
-            why = f"{weight.shape[0]} experts (at most 1024)"
+        if why is None and weight.shape[0] != experts:
+            why = "a router width other than the expert count (redundant experts)"
+        if why is None and experts > 1024:
+            why = f"{experts} experts (at most 1024)"
+        if why is None and not 1 <= top_k <= min(32, experts - 1):
+            why = f"top-{top_k} routing (1 to 32)"
         if why is None and nxt_method.num_resident <= top_k:
             why = "no slot beyond the routed ones"
         if why is not None:

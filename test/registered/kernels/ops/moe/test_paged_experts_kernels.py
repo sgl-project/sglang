@@ -827,9 +827,11 @@ class TestPrecopyInstall(CustomTestCase):
     """``precopy.install`` links each paged MoE layer to the next one whose router the plan can
     predict (plain softmax top-k) and whose store copies with the host store's own ``gather``; a
     layer otherwise gets no pre-copy, logged, and nothing raises (pre-copy is on wherever it
-    applies). Control: all softmax, every pair linked."""
+    applies). Control: all softmax, every pair linked. Each layer's routing width comes from its
+    own TopK config: the model config need not have ``num_experts_per_tok`` (HunYuan sets
+    ``moe_topk``, possibly per layer) and has none here."""
 
-    def _model(self, scoring, stores=None):
+    def _model(self, scoring, stores=None, top_ks=None, routers=None):
         from types import SimpleNamespace
 
         from sglang.srt.layers.moe.paged_experts.executor import DeviceExecutor
@@ -854,6 +856,7 @@ class TestPrecopyInstall(CustomTestCase):
                 routed_scaling_factor=1.0,
             )
             config = SimpleNamespace(
+                top_k=(top_ks or {}).get(i, 4),
                 scoring_func=func,
                 use_grouped_topk=False,
                 custom_routing_function=None,
@@ -862,14 +865,19 @@ class TestPrecopyInstall(CustomTestCase):
             mlp = SimpleNamespace(
                 experts=SimpleNamespace(quant_method=method),
                 gate=SimpleNamespace(
-                    weight=torch.zeros(E, 64, dtype=torch.bfloat16, device="cuda")
+                    weight=torch.zeros(
+                        (routers or {}).get(i, E),
+                        64,
+                        dtype=torch.bfloat16,
+                        device="cuda",
+                    )
                 ),
                 topk=SimpleNamespace(topk_config=config),
             )
             layers.append(SimpleNamespace(mlp=mlp))
         return SimpleNamespace(
             model=SimpleNamespace(layers=layers),
-            config=SimpleNamespace(num_experts_per_tok=4),
+            config=SimpleNamespace(),
         ), [l.mlp.experts.quant_method for l in layers]
 
     def test_links_softmax_layers_and_skips_the_others(self):
@@ -899,6 +907,26 @@ class TestPrecopyInstall(CustomTestCase):
             self.assertEqual(
                 len(skipped), 0 if all(f == "softmax" for f in scoring) else 1
             )
+
+    def test_each_layer_routes_with_its_own_width(self):
+        """The target layer's own top_k drives its plan; a width the plan kernel cannot take
+        (above 32) or a router whose width is not the expert count (a redundant expert gives
+        the slot map one entry more than the router has logits) gets no pre-copy instead of
+        failing in capture. Control: the first pair, top-2 on a full-width router, is linked."""
+        from sglang.srt.layers.moe.paged_experts import precopy
+
+        model, methods = self._model(
+            ["softmax"] * 4, top_ks={1: 2, 3: 33}, routers={2: E - 1}
+        )
+        with self.assertLogs(precopy.logger, "INFO") as logs:
+            n = precopy.install(model)
+        self.assertEqual(n, 1)
+        links = [m.device_executor.precopy_next for m in methods]
+        self.assertEqual([p is not None for p in links], [True, False, False, False])
+        self.assertEqual(links[0].top_k, 2)
+        skipped = "".join(r for r in logs.output if "no pre-copy into" in r)
+        self.assertIn("redundant experts", skipped)
+        self.assertIn("top-33 routing", skipped)
 
     def test_skips_a_store_that_replaces_gather(self):
         """A store with its own ``gather`` (one that plans more than the copy, as a tiered store
