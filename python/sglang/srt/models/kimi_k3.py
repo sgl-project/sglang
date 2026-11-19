@@ -257,6 +257,17 @@ def _qkvg_gate_shard_is_float(
     )
 
 
+def _qkvg_forward(attention: "KimiK3DeltaAttention", hidden_states: torch.Tensor):
+    """Wide in-proj forward; returns the (qkv, g) split."""
+    if attention._qkvg_gate_float_shard:
+        # K3.1 ModelSlim: g rides a separate BF16 linear.
+        qkv, _ = attention.fused_qkv_proj(hidden_states)
+        return qkv, attention.g_proj(hidden_states)[0]
+    fused_states, _ = attention.fused_qkvg_proj(hidden_states)
+    qkv, g_proj_states = torch.split(fused_states, attention.split_sizes, dim=-1)
+    return qkv, g_proj_states
+
+
 def _maybe_map_fp8_pb_scale_name(name: str, params_dict: dict) -> str:
     """Map ModelOpt FP8_PB_WO scale keys to SGLang block-FP8 params."""
     if name.endswith(".weight_scale"):
@@ -2475,16 +2486,6 @@ class KimiK3DeltaAttention(nn.Module):
             layer._k3_fused_decode_args = fused_decode_args
         self._kda_fused_decode_ready = True
 
-    def _qkvg_forward(self, hidden_states: torch.Tensor):
-        """Wide in-proj forward; returns the (qkv, g) split."""
-        if self._qkvg_gate_float_shard:
-            # K3.1 ModelSlim: g rides a separate BF16 linear.
-            qkv, _ = self.fused_qkv_proj(hidden_states)
-            return qkv, self.g_proj(hidden_states)[0]
-        fused_states, _ = self.fused_qkvg_proj(hidden_states)
-        qkv, g_proj_states = torch.split(fused_states, self.split_sizes, dim=-1)
-        return qkv, g_proj_states
-
     def forward_qkvbfg_fused(
         self, hidden_states: torch.Tensor, defer_f_b: bool = False
     ):
@@ -2524,7 +2525,7 @@ class KimiK3DeltaAttention(nn.Module):
                     alt = self._bfa_alt_stream
                     cur = torch.cuda.current_stream()
                     alt.wait_stream(cur)
-                    qkv, g_proj_states = self._qkvg_forward(hidden_states)
+                    qkv, g_proj_states = _qkvg_forward(self, hidden_states)
                     m_ranges = self._bfa_side_tgv_m_ranges
                     tgv_tactic = (
                         None if m_ranges is None else m_ranges(hidden_states.shape[0])
@@ -2547,7 +2548,7 @@ class KimiK3DeltaAttention(nn.Module):
                     cur.wait_stream(alt)
                     return qkv, beta, forget_gate, g_proj_states
 
-                qkv, g_proj_states = self._qkvg_forward(hidden_states)
+                qkv, g_proj_states = _qkvg_forward(self, hidden_states)
                 bfa = gemm(hidden_states, w)
                 forget_gate = (
                     bfa[..., :n_fa]
@@ -2556,7 +2557,7 @@ class KimiK3DeltaAttention(nn.Module):
                 )
                 beta = bfa[..., n_fa : n_fa + n_b]
             else:
-                qkv, g_proj_states = self._qkvg_forward(hidden_states)
+                qkv, g_proj_states = _qkvg_forward(self, hidden_states)
                 beta = self.b_proj(hidden_states)[0]
                 f_a = self.f_a_proj(hidden_states)[0]
                 forget_gate = f_a if defer_f_b else self.f_b_proj(f_a)[0]
