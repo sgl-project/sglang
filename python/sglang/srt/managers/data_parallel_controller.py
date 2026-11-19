@@ -924,7 +924,7 @@ class DataParallelController:
             return
 
         # Keyed by hash, so the capacity also bounds memory for long keys.
-        key = None if req.routing_key is None else hash(req.routing_key)
+        key = hash(req.routing_key) if req.routing_key else None
         target_rank = self.routing_key_to_rank.get(key)
         if target_rank in self._active_workers:
             self.dp_budget.total_requests[target_rank] += 1

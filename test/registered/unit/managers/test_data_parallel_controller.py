@@ -447,6 +447,7 @@ class TestFollowRoutingKeyScheduler(CustomTestCase):
         for case, req, rank in (
             ("routed_dp_rank wins", _req(routing_key="session", routed_dp_rank=0), 0),
             ("no key is balanced", _req(), 1),
+            ("an empty key is no key", _req(routing_key=""), 1),
         ):
             with self.subTest(case):
                 ctl = _make_controller(num_dp_ranks=2)
