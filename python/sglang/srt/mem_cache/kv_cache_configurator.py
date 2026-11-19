@@ -401,6 +401,60 @@ def draft_loc_space_scale(*, hf_config, use_mla_backend: bool, dcp_size: int) ->
     return dcp_size // execution_width
 
 
+def kv_cache_oom_message(
+    *,
+    mem_fraction_static: float,
+    available_gpu_memory: float,
+    pre_model_load_memory: float,
+    rest_before_state_cache: float,
+    rest_after_state_cache: float,
+    max_mamba_cache_size: Optional[int],
+    speculative_num_draft_tokens: Optional[int],
+) -> str:
+    """Explain which term exhausted the KV budget.
+
+    The fraction suggestion only prices weights against free memory; it cannot
+    shrink the hybrid state cache charged after it. When that cache is what
+    leaves no KV room, name it and the flags that size it instead of advising
+    a fraction the user already exceeds.
+    """
+    minimum_mem_fraction_static = 1 - available_gpu_memory / pre_model_load_memory
+    suggested_mem_fraction_static = math.ceil(minimum_mem_fraction_static * 1000) / 1000
+    message = (
+        f"Loaded weights leave no GPU memory for the KV cache under "
+        f"--mem-fraction-static={mem_fraction_static}. "
+        f"Raise --mem-fraction-static above "
+        f"{suggested_mem_fraction_static:.3f} "
+        f"(minimum viable = 1 - available/pre = "
+        f"{minimum_mem_fraction_static:.4f}). If using speculative "
+        f"decoding, draft weights are now counted."
+    )
+    # Only blame the state cache when it, and not the weights, crossed zero:
+    # a negative starting budget means the weights were already the binding term.
+    if not (rest_before_state_cache > 0 >= rest_after_state_cache):
+        return message
+    state_cache_gb = rest_before_state_cache - rest_after_state_cache
+    if max_mamba_cache_size is not None:
+        knobs = [f"lower --max-mamba-cache-size (currently {max_mamba_cache_size})"]
+    else:
+        knobs = [
+            "set --max-mamba-cache-size below the auto-sized pool "
+            "(or lower --max-running-requests)"
+        ]
+    if speculative_num_draft_tokens:
+        knobs.append(
+            f"lower --speculative-num-draft-tokens "
+            f"(currently {speculative_num_draft_tokens})"
+        )
+    return (
+        message + " The hybrid state cache charge after the weights was "
+        f"{state_cache_gb:.2f} GB, more than the {rest_before_state_cache:.2f} "
+        "GB left there (under speculation this includes "
+        "intermediate_ssm_state_cache), and --mem-fraction-static does not "
+        f"shrink it. To fit it, {' or '.join(knobs)}."
+    )
+
+
 @dataclass(slots=True, kw_only=True)
 class KVCacheConfigurator:
     device: str
@@ -3303,26 +3357,29 @@ class KVCacheConfigurator:
             mm_feature_transport=get_mm().mm_feature_transport,
         )
         rest_memory = available_gpu_memory - slack_gb - mm_reservation_gb
+        rest_before_state_cache = rest_memory
         if self.mambaish_config is not None and not get_memory().enable_unified_memory:
             rest_memory = self._handle_max_mamba_cache(rest_memory)
+        rest_after_state_cache = rest_memory
         rest_memory -= self._dflash_draft_kv_ring_bytes() / (1 << 30)
 
-        # Loaded weights (target + draft) can exceed the static budget
+        # Loaded weights (target + draft), or the state cache charged after
+        # them, can exceed the static budget.
         if rest_memory <= 0:
-            minimum_mem_fraction_static = (
-                1 - available_gpu_memory / pre_model_load_memory
-            )
-            suggested_mem_fraction_static = (
-                math.ceil(minimum_mem_fraction_static * 1000) / 1000
-            )
             raise ValueError(
-                f"Loaded weights leave no GPU memory for the KV cache under "
-                f"--mem-fraction-static={get_schedule().mem_fraction_static}. "
-                f"Raise --mem-fraction-static above "
-                f"{suggested_mem_fraction_static:.3f} "
-                f"(minimum viable = 1 - available/pre = "
-                f"{minimum_mem_fraction_static:.4f}). If using speculative "
-                f"decoding, draft weights are now counted."
+                kv_cache_oom_message(
+                    mem_fraction_static=get_schedule().mem_fraction_static,
+                    available_gpu_memory=available_gpu_memory,
+                    pre_model_load_memory=pre_model_load_memory,
+                    rest_before_state_cache=rest_before_state_cache,
+                    rest_after_state_cache=rest_after_state_cache,
+                    max_mamba_cache_size=get_schedule().max_mamba_cache_size,
+                    speculative_num_draft_tokens=(
+                        None
+                        if self.spec_algorithm.is_none()
+                        else get_spec().speculative_num_draft_tokens
+                    ),
+                )
             )
 
         return int(rest_memory * (1 << 30))  # return in bytes
