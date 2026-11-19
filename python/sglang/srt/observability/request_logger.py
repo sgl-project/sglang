@@ -310,7 +310,7 @@ class RequestLogger:
                     "lora_path",
                     "sampling_params",
                 }
-                out_skip_names = {"text", "output_ids", "embedding"}
+                out_skip_names = {"text", "output_ids", "prompt_token_ids", "embedding"}
             elif self.log_requests_level == 1:
                 max_length = 1 << 30
                 skip_names = {
@@ -322,7 +322,7 @@ class RequestLogger:
                     "video_data",
                     "lora_path",
                 }
-                out_skip_names = {"text", "output_ids", "embedding"}
+                out_skip_names = {"text", "output_ids", "prompt_token_ids", "embedding"}
             elif self.log_requests_level == 2:
                 max_length = 2048
             elif self.log_requests_level == 3:
