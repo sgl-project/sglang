@@ -304,6 +304,8 @@ class ReqState:
 
     dispatched: bool = False
     abort_sent: bool = False
+    # obj.input_ids was dropped after dispatch, so the request cannot be dumped.
+    prompt_released: bool = False
     # Held at generate_request's pause gate; an abort_all leaves it to run
     # after the pause.
     waiting_at_pause_gate: bool = False
@@ -1023,6 +1025,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     await self._send_one_request(tokenized_obj)
                     if obj.input_ids is not None and not self._reads_input_ids_late():
                         obj.input_ids = None
+                        state.prompt_released = True
                     async for response in self._wait_one_response(obj, request):
                         yield response
                 else:
@@ -3097,9 +3100,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             if self.enable_metrics and state.obj.log_metrics:
                 self.collect_metrics(state, recv_obj, i, request_stats)
-            if self.dump_requests_folder and state.finished and state.obj.log_metrics:
+            dumpable = (
+                state.finished and state.obj.log_metrics and not state.prompt_released
+            )
+            if self.dump_requests_folder and dumpable:
                 self.dump_requests(state, out_dict)
-            if self.crash_dump_folder and state.finished and state.obj.log_metrics:
+            if self.crash_dump_folder and dumpable:
                 self.record_request_for_crash_dump(state, out_dict)
 
         # handle_loop awaits next recv immediately
@@ -3679,7 +3685,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # Add unfinished requests from rid_to_state
             unfinished_requests = []
             for rid, state in self.rid_to_state.items():
-                if not state.finished:
+                if not state.finished and not state.prompt_released:
                     state.time_stats.set_finished_time()
                     unfinished_requests.append(
                         (

@@ -2043,6 +2043,25 @@ class TestReadsInputIdsLate(CustomTestCase):
                     TokenizerManager._reads_input_ids_late(manager), expected
                 )
 
+    def test_dumps_turned_on_later_skip_released_prompts(self):
+        """Dumps enabled at runtime must not record a request whose prompt is gone."""
+        for released in (False, True):
+            with self.subTest(released=released):
+                tm = _make_tokenizer_manager(self)
+                tm.dump_requests_folder = "/tmp/dump"
+                tm.crash_dump_folder = "/tmp/crash"
+                tm.dump_requests = Mock()
+                tm.record_request_for_crash_dump = Mock()
+                state = _make_req_state("released_rid")
+                state.obj.log_metrics = True
+                state.prompt_released = released
+                tm.rid_to_state["released_rid"] = state
+                asyncio.run(
+                    tm._handle_batch_output(_make_batch_str_output("released_rid"))
+                )
+                self.assertEqual(tm.dump_requests.called, not released)
+                self.assertEqual(tm.record_request_for_crash_dump.called, not released)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
