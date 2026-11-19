@@ -5327,21 +5327,21 @@ class Scheduler(
         forward_done = self.device_module.Event()
         forward_done.record(stream=stream)
         writes_unknown = not batch.spec_algorithm.is_none()
-        with self.device_module.stream(self.schedule_stream):
-            kv_storage_of(
-                self.req_to_token_pool, self.token_to_kv_pool_allocator
-            ).record_forward(
-                forward_done,
-                written_tokens=written_tokens,
-                token_writes_unknown=writes_unknown,
-                req_pool_indices=batch.req_pool_indices,
-                state_slots=(
-                    ()
-                    if writes_unknown
-                    else (batch.mamba_track_indices, batch.mamba_cow_dst_indices)
-                ),
-                state_writes_unknown=writes_unknown,
-            )
+        kv_storage_of(
+            self.req_to_token_pool, self.token_to_kv_pool_allocator
+        ).record_forward(
+            forward_done,
+            written_tokens=written_tokens,
+            token_writes_unknown=writes_unknown,
+            req_pool_indices=batch.req_pool_indices,
+            state_slots=(
+                ()
+                if writes_unknown
+                else (batch.mamba_track_indices, batch.mamba_cow_dst_indices)
+            ),
+            state_writes_unknown=writes_unknown,
+            schedule_stream=self.schedule_stream,
+        )
         self._on_step_forward_recorded(forward_done)
         return forward_done
 

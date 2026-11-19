@@ -9,7 +9,7 @@ code outside the KV package loops over them instead of naming a combination.
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -1158,6 +1158,7 @@ class KVStorage:
         req_pool_indices: torch.Tensor,
         state_slots: Sequence[Optional[torch.Tensor]],
         state_writes_unknown: bool = False,
+        schedule_stream=None,
     ) -> None:
         """Record a just-launched forward so that no page move races it: its
         done event and the virtual ids it writes. State kernels write the
@@ -1165,26 +1166,43 @@ class KVStorage:
         slots in ``state_slots``. ``token_writes_unknown``: the token write ids
         are produced by the forward itself and cannot be read before it ends.
         ``state_writes_unknown``: the state slot ids cannot be read safely here
-        either. Gathers on the current stream, which must be the one compaction
-        runs on."""
-        state = None
-        if self._allocator.mamba_allocator is not None and not state_writes_unknown:
-            written = [self.requests.get_mamba_indices(req_pool_indices)]
-            written += [slots for slots in state_slots if slots is not None]
-            pieces = [slots.reshape(-1).to(torch.int64) for slots in written]
-            # The table gather is a fresh tensor, and so is a cat: the state
-            # band's ledger keeps it without a copy of its own.
-            state = pieces[0] if len(pieces) == 1 else torch.cat(pieces)
-        self._allocator.set_latest_forward_done_event(forward_done)
-        self._allocator.set_inflight_forward(
-            forward_done,
-            written_tokens,
-            state,
-            request_rows=req_pool_indices.reshape(-1).to(torch.int64),
-            token_writes_unknown=token_writes_unknown,
-            state_writes_unknown=state_writes_unknown,
-            state_slots_owned=True,
-        )
+        either. Gather known ids on the compaction stream (the current stream
+        when the caller already selected it)."""
+        if (
+            token_writes_unknown
+            and state_writes_unknown
+            and not self._allocator.request_allocators
+        ):
+            self._allocator.record_unknown_forward(forward_done)
+            return
+
+        with (
+            torch.get_device_module(schedule_stream.device).stream(schedule_stream)
+            if schedule_stream is not None
+            else nullcontext()
+        ):
+            state = None
+            if self._allocator.mamba_allocator is not None and not state_writes_unknown:
+                written = [self.requests.get_mamba_indices(req_pool_indices)]
+                written += [slots for slots in state_slots if slots is not None]
+                pieces = [slots.reshape(-1).to(torch.int64) for slots in written]
+                # The table gather is a fresh tensor, and so is a cat: the state
+                # band's ledger keeps it without a copy of its own.
+                state = pieces[0] if len(pieces) == 1 else torch.cat(pieces)
+            self._allocator.set_latest_forward_done_event(forward_done)
+            self._allocator.set_inflight_forward(
+                forward_done,
+                written_tokens,
+                state,
+                request_rows=(
+                    req_pool_indices.reshape(-1).to(torch.int64)
+                    if self._allocator.request_allocators
+                    else None
+                ),
+                token_writes_unknown=token_writes_unknown,
+                state_writes_unknown=state_writes_unknown,
+                state_slots_owned=True,
+            )
 
     def move_epoch(self) -> int:
         """How many page-move batches may have moved a held receive row (see

@@ -188,8 +188,14 @@ class _SharedMemory:
         return self.tokens_fit(allocator, num_tokens)
 
     def check_decode_capacity(self, tree_cache, allocator, *, num_tokens, **_):
-        self.evict_to_free_tokens(tree_cache, allocator, num_tokens)
-        return allocator.ensure_capacity(KVDemand.same_tokens(allocator, num_tokens))
+        demand = KVDemand.same_tokens(allocator, num_tokens)
+        if _shares_prefixes(tree_cache):
+            # Reclaim starts with this same fit check after applying grouped
+            # frees. A decode step that fits needs just one arena snapshot.
+            if allocator.fits_after_frees(allocator.page_demands(demand)):
+                return True
+            tree_cache.evict_for_alloc(demand)
+        return allocator.ensure_capacity(demand)
 
     def create_prefill_budget(self, allocator, tree_cache, num_mixed_decode_tokens):
         from sglang.srt.mem_cache.prefill_budget import ChainPrefillBudget

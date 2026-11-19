@@ -64,6 +64,15 @@ class TestTriJointReclaim(CustomTestCase):
 
     build = staticmethod(build_tri_cache)
 
+    def test_zero_page_demand_still_obeys_the_live_token_cap(self):
+        _, allocator, _ = self.build()
+        slots = allocator.alloc(2)
+        owner = allocator.full_attn_allocator
+        owner.max_live_tokens = owner.allocated_count() - 1
+        self.assertFalse(allocator.units_fit({owner.sub_pool_name: 0}))
+        allocator.free(slots)
+        self.assertTrue(allocator.fits_after_frees({owner.sub_pool_name: 0}))
+
     # Pressure budgets below include the arena and three request-table rows:
     # two requests (eight state slots / three per request), plus the sink row.
 
@@ -476,6 +485,10 @@ class TestTriJointReclaim(CustomTestCase):
             for _ in range(4)
         ]
         self.assertTrue(batch.check_decode_mem())
+        # Rechecking the same demand now fits without another reclaim pass.
+        with patch.object(a, "units_fit", wraps=a.units_fit) as fits:
+            self.assertTrue(batch.check_decode_mem())
+            fits.assert_called_once()
         self.assertIsNotNone(a.alloc(4))
         self.assertEqual(c.full_evictable_size(), 95)
         self.check_payload(b, a, slots[1:], states[1:], states)

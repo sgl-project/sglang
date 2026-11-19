@@ -725,6 +725,10 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         state = self.mamba_allocator
         if state is not None and state.sub_pool_name in demands:
             self._settle_state_free_group()
+        # On a single stage the live layout already fits. A step inside its
+        # reserved pages only needs to respect the owner's logical live cap.
+        if self.stage_capacity is None and not any(demands.values()):
+            return self._full_cap_reclaim(0) == 0
         return self._ask(
             "units_fit",
             lambda: _units_key(demands),
@@ -1569,6 +1573,12 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         with record_function("ChainAllocator.set_latest_forward_done_event"):
             for member in self.members:
                 member.set_latest_forward_done_event(event)
+
+    def record_unknown_forward(self, event: torch.cuda.Event) -> None:
+        """Every band may be written until this forward retires. No device ids to gather."""
+        for member in self.members:
+            member.usage.record_forward(event, None, writes_unknown=True)
+            member.usage.latest_forward = event
 
     def set_inflight_forward(
         self,

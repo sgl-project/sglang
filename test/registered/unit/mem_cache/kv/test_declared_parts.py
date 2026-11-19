@@ -1041,6 +1041,29 @@ class TestDeclaredParts(CustomTestCase):
         unit = int(ids.ids(torch.tensor([row]))[0])
         self.assertEqual(int(cursor[unit]), 0)
 
+    def test_speculative_forward_keeps_the_request_row_write_set(self):
+        storage, plan, _ = _build(state=True, gamma=3, replay=_GDN_SPEC_REPLAY)
+        (request,) = plan.requests()
+        allocator = storage.allocator
+        rows = torch.tensor([1, 3], dtype=torch.int32)
+        event = object()
+        storage.record_forward(
+            event,
+            written_tokens=None,
+            token_writes_unknown=True,
+            req_pool_indices=rows,
+            state_slots=(),
+            state_writes_unknown=True,
+        )
+        rows.zero_()
+        band = allocator.request_allocators[request.name]
+        (use,) = band.usage.forwards()
+        self.assertEqual(use.ids.tolist(), [1, 3])
+        self.assertIs(band.usage.latest_forward, event)
+        self.assertTrue(allocator.full_attn_allocator.usage.writes_unknown())
+        storage.retire_forward(event)
+        self.assertEqual(band.usage.forwards(), [])
+
     def test_request_usage_counts_rows_past_a_larger_state_entry(self):
         """Usage lists every sub-pool, the request sub-pool included, though
         views and the prefix tree's components leave it out; its usage is the
