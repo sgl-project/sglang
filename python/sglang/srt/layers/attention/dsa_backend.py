@@ -136,14 +136,12 @@ from sglang.srt.utils import (
     is_cuda,
     is_gfx95_supported,
     is_hip,
-    is_npu,
     is_xpu,
     print_warning_once,
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 _IS_GFX95 = is_gfx95_supported()
-_is_npu = is_npu()
 if _IS_GFX95:
     from sglang.srt.layers.attention.dsa import dsa_backend_hip
 
@@ -459,7 +457,7 @@ class DSAMetadata:
     kpool_write_plan: Optional[KPoolWritePlan] = None
 
 
-@torch.compile(disable=_is_npu)
+@torch.compile
 def _compiled_cat(tensors: list[torch.Tensor], dim: int = -1) -> torch.Tensor:
     return torch.cat(tensors, dim=dim)
 
