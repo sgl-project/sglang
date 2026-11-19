@@ -25,12 +25,16 @@ use sha2::{Digest, Sha256};
 /// A typical request is the lower median of the ranks' mean KV per request,
 /// not the worker-wide mean: one rank holding a few long-context requests
 /// would otherwise inflate what every short request on the others is charged,
-/// and a rank near its KV cap would outrank one that is nearly empty.
+/// and a rank near its KV cap would outrank one that is nearly empty. Ranks
+/// whose requests hold no KV yet (queued on an older publisher, which reports
+/// KV in use only) do not vote, or a two-rank worker would charge nothing and
+/// send every request to that rank until its KV shows up.
 pub fn expected_rank_tokens(worker: &Worker, loads: &[RankLoad]) -> Vec<(u32, u64)> {
     let mut means: Vec<u64> = loads
         .iter()
         .filter(|load| load.num_reqs > 0)
         .map(|load| load.num_tokens / load.num_reqs)
+        .filter(|&mean| mean > 0)
         .collect();
     means.sort_unstable();
     let per_req = means
@@ -212,5 +216,9 @@ mod tests {
         // cap would look lighter than the nearly empty one.
         let loads = [reading(0, 30_000, 1, newer), reading(1, 4_000, 8, newer)];
         assert_eq!(expected_rank_tokens(&w, &loads), [(0, 30_500), (1, 8_000)]);
+        // A rank whose requests hold no KV yet does not set the charge to 0:
+        // its three queued requests count at the other rank's 1000 each.
+        let loads = [reading(0, 0, 3, newer), reading(1, 5_000, 5, newer)];
+        assert_eq!(expected_rank_tokens(&w, &loads), [(0, 3_000), (1, 10_000)]);
     }
 }
