@@ -14,7 +14,7 @@ VLMs tested here:
 Note: NVILA models are excluded (NVIDIA-specific).
 Note: This test runs only on MI30x runners (linux-mi325-gpu-2), not on MI35x.
 
-Registry: nightly-amd-accuracy-2-gpu-vlm suite (2-GPU VLM tests)
+Registry: nightly-accuracy-test-2-gpu-amd-vlm suite (2-GPU VLM tests)
 """
 
 import os
@@ -36,7 +36,9 @@ from sglang.test.test_utils import (
 )
 
 # Register for AMD CI - VLM MMMU evaluation tests (~120 min)
-register_amd_ci(est_time=7200, suite="nightly-amd-accuracy-2-gpu-vlm", nightly=True)
+register_amd_ci(
+    est_time=7200, suite="nightly-accuracy-test-2-gpu-amd-vlm", nightly=True
+)
 
 # AMD-verified VLM models with conservative thresholds on 100 MMMU samples
 # Format: (model_path, tp_size, accuracy_threshold, extra_args)
@@ -95,7 +97,8 @@ AMD_VLM_MODELS = [
         "accuracy_threshold": 0.25,
         "extra_args": [
             "--trust-remote-code",
-            "--disable-cuda-graph",
+            "--disable-decode-cuda-graph",
+            "--disable-prefill-cuda-graph",
             "--mem-fraction-static",
             "0.70",
             "--max-total-tokens",

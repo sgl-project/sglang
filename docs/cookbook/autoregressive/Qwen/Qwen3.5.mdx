@@ -106,7 +106,7 @@ docker pull lmsysorg/sglang:latest
 docker pull lmsysorg/sglang-rocm:v0.5.22-rocm720-mi30x-20261020
 
 # Or use Docker (AMD MI355X)
-docker pull lmsysorg/sglang-rocm:v0.5.22-rocm720-mi35x-20261020
+docker pull lmsysorg/sglang-rocm:v0.5.23-rocm720-mi35x-20261109
 ```
 
 For the full Docker setup and other installation methods, please refer to the [official SGLang installation guide](../../../docs/get-started/install).
@@ -127,7 +127,7 @@ This section provides deployment configurations optimized for different hardware
 - **H100 / B200 / B300 FP8:** Add `--enable-symm-mem` to enable NCCL symmetric memory for faster collectives and better performance under multi-GPU settings. It only helps when tp > 1, so on B200/B300 it applies to the 397B-A17B FP8 recipe (tp=4); the 122B-A10B and 35B-A3B FP8 recipes are single-GPU there.
 - **AMD GPUs (MI300X / MI325X / MI355X):** Use `SGLANG_USE_AITER=1` and `SGLANG_USE_AITER_UNIFIED_ATTN=1` with `--attention-backend aiter`, which requires `--page-size 16` and can also enable `--enable-aiter-allreduce-fusion`. Additionally set `AITER_FLYDSL_FORCE=1` to force the AITER FlyDSL MoE kernels and `SGLANG_MAMBA_SSM_DTYPE=bfloat16` to store the Mamba SSM state in bfloat16 (instead of the default float32). For the **MXFP4 checkpoint on MI355X**, set `ROCM_QUICK_REDUCE_QUANTIZATION=INT4` to route multi-GPU collectives through INT4-quantized ROCm quick all-reduce, and drop `--enable-aiter-allreduce-fusion` (the two are mutually exclusive; quick all-reduce is preferred for this recipe). If the MXFP4 checkpoint keeps its shared expert unquantized, `--enforce-shared-experts-fusion` quantizes it to MXFP4 at load time so it can be fused into the routed experts; an already-MXFP4 shared expert is fused without the flag, so there it changes nothing. The fused slot runs through the routed experts' W4A4 grouped GEMM, so the shared expert's weights and its input activations are both quantized to MXFP4, where the standalone path it replaces ran in BF16; validate accuracy before using it.
 - **KV cache offloading (MXFP4 on MI355X):** Selecting **Host DRAM (HiCache)** adds a host-memory tier below the device KV cache, which lets long-context agentic workloads keep more prefix cached and reach higher concurrency than the device KV pool alone allows. It emits `--enable-hierarchical-cache --hicache-ratio 1.5 --hicache-write-policy write_through --hicache-io-backend kernel --hicache-mem-layout page_first`. HiCache extends the radix cache, so the generated command drops `--disable-radix-cache` — the two options are mutually exclusive and SGLang rejects them together at startup. `--hicache-ratio 1.5` sizes the host tier at 1.5x the device KV cache, so make sure the node has that much free CPU DRAM per server on top of the model weights. Leave this **Disabled** for fixed-length throughput serving, where the extra host traffic buys nothing.
-- **KV cache offloading (397B FP8 on MI355X):** A separate recipe from the MXFP4 one above, for long-context agentic serving of the FP8 checkpoint. Selecting **Host DRAM (HiCache)** emits `--tp 4` instead of the tp=2 that merely fits the weights, `--enable-hierarchical-cache --hicache-ratio 1.5 --hicache-write-policy write_through --hicache-io-backend kernel --hicache-mem-layout page_first`, `--kv-cache-dtype fp8_e4m3` to halve device KV bytes, and the scheduler and tokenizer tuning `--chunked-prefill-size 16384 --max-prefill-tokens 16384 --scheduler-recv-interval 60 --stream-interval 50 --tokenizer-worker-num 6`. `write_through` mirrors every page to the host tier as it is written. `--hicache-ratio 1.5` is the default sizing; the benchmarked high-concurrency points instead pin `--hicache-size` per rank (253 GB at concurrency 32-56, 374 GB at 64-80), which overrides the ratio — add it if you want a fixed host tier. This arm keeps `--enable-aiter-allreduce-fusion` and does not set `ROCM_QUICK_REDUCE_QUANTIZATION`; the MXFP4 recipe does the opposite. The full agentic recipe, including the GPU-resident concurrency 1-14 band that runs without HiCache, is in section 3.3.1. Read the FP8 KV cache warning below before using it for reasoning-heavy work.
+- **KV cache offloading (397B FP8 on MI355X):** A separate recipe from the MXFP4 one above, for long-context agentic serving of the FP8 checkpoint. Selecting **Host DRAM (HiCache)** emits `--tp 4` instead of the tp=2 that merely fits the weights, `--enable-hierarchical-cache --hicache-ratio 1.5 --hicache-write-policy write_through --hicache-io-backend kernel --hicache-mem-layout page_first`, `--kv-cache-dtype fp8_e4m3` to halve device KV bytes, the `SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION=1` env var so `--mem-fraction-static 0.8` is not scaled down to 0.68, and the scheduler and tokenizer tuning `--chunked-prefill-size 16384 --max-prefill-tokens 16384 --scheduler-recv-interval 60 --stream-interval 50 --tokenizer-worker-num 6`. `write_through` mirrors every page to the host tier as it is written. `--hicache-ratio 1.5` is the default sizing; the benchmarked high-concurrency points instead pin `--hicache-size` per rank (253 GB at concurrency 32-56, 374 GB at 64-80), which overrides the ratio — add it if you want a fixed host tier. This arm keeps `--enable-aiter-allreduce-fusion` and does not set `ROCM_QUICK_REDUCE_QUANTIZATION`; the MXFP4 recipe does the opposite. The full agentic recipe, including the GPU-resident concurrency 1-14 band that runs without HiCache, is in section 3.3.1. Read the FP8 KV cache warning below before using it for reasoning-heavy work.
 - **Watchdog timeout:** Increase `--watchdog-timeout` to `1200` or higher for this large model, as weight loading can take significant time.
 - **Mamba Radix Cache**: Qwen3.5's hybrid Gated Delta Networks architecture supports two mamba scheduling strategies via `--mamba-radix-cache-strategy`:
   - **V1 (`no_buffer`)**: Default. No overlap scheduler, lower memory usage. Required for AMD MI GPUs.
@@ -135,9 +135,9 @@ This section provides deployment configurations optimized for different hardware
 - The `--mem-fraction-static` flag is recommended for optimal memory utilization, adjust it based on your hardware and workload.
 - Context length defaults to 262,144 tokens. If you encounter OOM errors, consider reducing it, but maintain at least 128K to preserve thinking capabilities.
 - To speed up weight loading for this large model, add `--model-loader-extra-config='{"enable_multithread_load": "true","num_threads": 64}'` to the launch command.
-- **CUDA IPC Transport**: Add `SGLANG_USE_CUDA_IPC_TRANSPORT=1` as an environment variable to use CUDA IPC for transferring multimodal features, significantly improving TTFT (Time To First Token). Note: this consumes additional memory proportional to image size, so you may need to lower `--mem-fraction-static` or `--max-running-requests`.
+- **CUDA IPC Transport**: Pass `--mm-feature-transport cuda_ipc` to use CUDA IPC for transferring multimodal features, significantly improving TTFT (Time To First Token). Note: this consumes additional memory proportional to image size, so you may need to lower `--mem-fraction-static` or `--max-running-requests`.
 - **Multimodal Attention Backend**: Use `--mm-attention-backend fa3` on H100/H200 for better vision performance, or `--mm-attention-backend fa4` on B200/B300.
-- **B200 (FP8)**: Add `--enable-flashinfer-allreduce-fusion` for optimized throughput on Blackwell.
+- **B200 (FP8)**: Add `--flashinfer-allreduce-fusion-backend auto` for optimized throughput on Blackwell.
 - **B200 / B300 (FP8 MoE)**: Add `--moe-runner-backend flashinfer_trtllm` to route the fused MoE through the trtllm-gen kernels on Blackwell. This is not picked up automatically — SGLang's auto-selection of `flashinfer_trtllm` is limited to the DeepSeek architecture family, so an FP8 Qwen3.5 MoE run otherwise falls back to the Triton MoE runner. It applies to the MoE sizes (397B-A17B / 122B-A10B / 35B-A3B); the dense sizes have no MoE layers. The NVFP4 recipes already set it.
 - **B200 / B300 (FP8)**: Add `--linear-attn-prefill-backend flashinfer` to run GDN (linear attention) prefill on the FlashInfer CuTe-DSL kernel. SGLang auto-selects it only inside a narrow validated domain (a chunked prefill size of at most 8192 and a bfloat16 mamba state pool, among other conditions), which these FP8 recipes fall outside of, so the override has to be explicit. Requires CUDA 13+ and flashinfer >= 0.6.14 — SGLang raises at startup on SM100 with an older CUDA. Applies to every Qwen3.5 size, since all of them are hybrid GDN models.
 - For processing large images or videos, you may need to lower `--mem-fraction-static` to leave room for image feature tensors.
@@ -249,7 +249,7 @@ import { agentx } from "/src/snippets/agentx/Qwen/qwen3.5.jsx";
 
 #### 3.3.1 Agentic Long-Context on MI355X (FP8, MTP)
 
-Agentic replay on MI355X serves `Qwen/Qwen3.5-397B-A17B-FP8` with MTP on four GPUs (TP4), benchmarked on the `lmsysorg/sglang-rocm:v0.5.22-rocm720-mi35x-20261020` image. Concurrency below counts live sessions, not requests.
+Agentic replay on MI355X serves `Qwen/Qwen3.5-397B-A17B-FP8` with MTP on four GPUs (TP4), benchmarked on the `lmsysorg/sglang-rocm:v0.5.23-rocm720-mi35x-20261109` image. Concurrency below counts live sessions, not requests.
 
 **Concurrency 1-14, GPU-resident:** the sessions fit the device KV pool, so no HiCache tier is added.
 
@@ -284,6 +284,7 @@ SGLANG_USE_AITER=1 \
 SGLANG_USE_AITER_UNIFIED_ATTN=1 \
 AITER_FLYDSL_FORCE=1 \
 SGLANG_MAMBA_SSM_DTYPE=bfloat16 \
+SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION=1 \
 sglang serve \
   --model-path Qwen/Qwen3.5-397B-A17B-FP8 \
   --trust-remote-code \
@@ -322,7 +323,8 @@ For **concurrency 16-80**, add the HiCache flags to the command above, and `--hi
 A few notes on the command:
 
 - `--speculative-algorithm EAGLE` is the same algorithm the command generator in section 3.1 emits as `NEXTN`; SGLang resolves `NEXTN` to `EAGLE`.
-- AITER allreduce fusion stays on, and `ROCM_QUICK_REDUCE_QUANTIZATION` is not set. The two are mutually exclusive, and quick all-reduce belongs to the MXFP4 recipe.
+- `SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION=1` makes the AITER backend use `--mem-fraction-static 0.8` as-is. Without it, AITER multiplies an explicit value by 0.85 when the context length is above 8192, so 0.8 runs as 0.68. With it set, the KV pool grows from 7.83M to 11.32M tokens per GPU (+45%). The reserve it skips holds non-static attention workspace, so lowering `--mem-fraction-static` is the first thing to try if you run out of memory on a different workload or GPU.
+- AITER allreduce fusion stays on, and `ROCM_QUICK_REDUCE_QUANTIZATION` is not set. The two are mutually exclusive, and quick all-reduce belongs to the MXFP4 recipe. On images older than `v0.5.23`, `ROCM_QUICK_REDUCE_QUANTIZATION` defaults to INT8, so set `ROCM_QUICK_REDUCE_QUANTIZATION=NONE` explicitly there.
 - Weights load with multiple threads by default, so `--model-loader-extra-config '{"enable_multithread_load": true}'` is not needed.
 - `--kv-cache-dtype fp8_e4m3` carries the same accuracy caveat as the FP8 KV cache warning in section 3.2.
 
@@ -1044,7 +1046,8 @@ Overall accuracy: 0.978
 
 Server Launch Command:
 ```bash Command
-SGLANG_USE_CUDA_IPC_TRANSPORT=1 python -m sglang.launch_server \
+python -m sglang.launch_server \
+  --mm-feature-transport cuda_ipc \
   --model Qwen/Qwen3.5-397B-A17B \
   --tp 8 \
   --reasoning-parser qwen3 \
