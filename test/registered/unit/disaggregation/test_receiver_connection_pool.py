@@ -474,7 +474,7 @@ class TestCommonReceiverLifecycle(CustomTestCase):
         )
         self.assertTrue(manager.handle_chunk_ready(frames))
         manager._staging_handler.handle_chunk_arrived.assert_called_once_with(
-            17, 2, 8, 4, "peer_name_with_underscores"
+            17, 2, 8, 4, "peer_name_with_underscores", writer_rank=3
         )
 
     def test_completion_racing_clear_cannot_recreate_rank_tracker(self):
