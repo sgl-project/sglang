@@ -1,6 +1,5 @@
 import math
 from functools import partial
-from importlib.metadata import version
 from itertools import groupby
 from types import SimpleNamespace
 from typing import NamedTuple
@@ -8,8 +7,7 @@ from typing import NamedTuple
 import torch
 from torch import nn
 
-from sglang.kernels.ops.inkling2 import experts_sm90, marlin_sm90
-from sglang.kernels.ops.inkling2.comm import (
+from sglang.kernels.ops.communication.inkling2_comm import (
     ROUTED_EXCHANGE_MIN_ROWS,
     all_reduce,
     multicast_all_reduce,
@@ -21,41 +19,29 @@ from sglang.kernels.ops.inkling2.comm import (
     prepare_routed_exchange,
     routed_exchange,
 )
-from sglang.kernels.ops.inkling2.linear import (
+from sglang.kernels.ops.gemm import inkling2_marlin_sm90 as marlin_sm90
+from sglang.kernels.ops.gemm.inkling2_linear import (
     linear,
     linear_k_group_partials,
     uses_k_groups,
 )
-from sglang.kernels.ops.inkling2.moe import (
-    routed_partial,
-    routed_rows,
-    routed_swiglu,
-    swiglu,
-    unweighted_post_reorder,
-)
-from sglang.kernels.ops.inkling2.mxfp8 import (
-    cutlass_weight_scales,
-)
-from sglang.kernels.ops.inkling2.mxfp8 import expert_matmul as mxfp8_matmul
-from sglang.kernels.ops.inkling2.mxfp8 import (
-    prefill_expert_matmul as mxfp8_prefill_matmul,
-)
-from sglang.kernels.ops.inkling2.mxfp8 import (
-    prefill_swiglu_expert_matmul as mxfp8_prefill_swiglu_matmul,
-)
-from sglang.kernels.ops.inkling2.mxfp8 import (
+from sglang.kernels.ops.gemm.inkling2_mxfp8 import (
     routed_expert_matmul as mxfp8_routed_matmul,
 )
-from sglang.kernels.ops.inkling2.mxfp8 import (
+from sglang.kernels.ops.gemm.inkling2_mxfp8 import (
     routed_swiglu_expert_matmul as mxfp8_routed_swiglu_matmul,
 )
-from sglang.kernels.ops.inkling2.nvfp4 import expert_matmul as nvfp4_matmul
-from sglang.kernels.ops.inkling2.nvfp4 import (
+from sglang.kernels.ops.gemm.inkling2_nvfp4 import (
     routed_expert_matmul,
     routed_swiglu_expert_matmul,
-    swizzle_weight_scales,
 )
-from sglang.kernels.ops.inkling2.route import (
+from sglang.kernels.ops.moe import inkling2_experts_sm90 as experts_sm90
+from sglang.kernels.ops.moe.inkling2_moe import (
+    routed_partial,
+    routed_rows,
+    unweighted_post_reorder,
+)
+from sglang.kernels.ops.moe.inkling2_route import (
     ROUTE_MAX_IDS,
     ROUTE_MAX_ROWS,
     route_metadata,
@@ -72,15 +58,33 @@ from sglang.kernels.ops.moe.inkling_moe import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.quantization.inkling2 import Inkling2QuantConfig
+from sglang.srt.layers.quantization.utils import swizzle_blockscale
+from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.models.inkling_common.moe import renorm_topk_logits_scaled
 from sglang.srt.runtime_context import (
     cutedsl_moe_max_num_tokens,
     get_parallel,
     get_platform,
 )
-from sglang.srt.utils import set_weight_attrs
 
 BF16_COMBINE_MIN_TOKENS = 512
+
+
+def _capped_swiglu(gate_up, gammas, gate_cap, up_cap, offsets=None):
+    """swiglu of interleaved (gate, up) columns, each capped as cap * tanh(x / cap),
+    with the sigmoid of the uncapped gate; rows outside [offsets[0], offsets[-1])
+    are zero. Only BF16 experts take this path."""
+    gate, up = gate_up.float().unflatten(-1, (-1, 2)).unbind(-1)
+    sigmoid = torch.sigmoid(gate)
+    if gate_cap > 0:
+        gate = gate_cap * torch.tanh(gate / gate_cap)
+    if up_cap > 0:
+        up = up_cap * torch.tanh(up / up_cap)
+    out = gate * sigmoid * up * gammas.float()[:, None]
+    if offsets is not None:
+        rows = torch.arange(out.shape[0], device=out.device)
+        out[(rows < offsets[0]) | (rows >= offsets[-1])] = 0
+    return out.to(gate_up.dtype)
 
 
 class RoutedOutput(NamedTuple):
@@ -264,6 +268,12 @@ class Inkling2Experts(nn.Module):
             and dtype in (torch.uint8, torch.float8_e4m3fn)
             else None
         )
+        quantized = {self.w13_weight.dtype, self.w2_weight.dtype} - {
+            torch.get_default_dtype()
+        }
+        self._lacks_routed_kernels = bool(quantized) and (
+            self.ep_size == 1 or self._routed_kernels is None
+        )
 
     def _empty_weight(self, shape, dtype):
         if (
@@ -303,7 +313,7 @@ class Inkling2Experts(nn.Module):
             loaded if dim is None else loaded.chunk(self.tp_size, dim=dim)[self.tp_rank]
         )
         if swizzled:
-            param.data.copy_(swizzle_weight_scales(target))
+            param.data.copy_(swizzle_blockscale(target).flatten(1))
         if reorder is not None:
             # One expert at a time bounds the temporary.
             for expert in param.data:
@@ -318,11 +328,7 @@ class Inkling2Experts(nn.Module):
         return order
 
     def _mega_covers(self, low, high):
-        return self.mega is not None and (
-            low > high
-            or self.mega.min_tokens <= low
-            and high <= self.mega.max_tokens * self.ep_size
-        )
+        return self.mega is not None and (low > high or self.mega.min_tokens <= low)
 
     def prepare_routed_exchange(self):
         if self.ep_size == 1 or self.sm90 or self.hip:
@@ -340,25 +346,29 @@ class Inkling2Experts(nn.Module):
             prepare_prefill_exchange(group, prefill_tokens, self.top_k, hidden)
 
     def prepare_mxfp8_cutlass_scales(self):
-        """CUTLASS-layout copies of the MXFP8 weight scales for the prefill GEMMs,
+        """CUTLASS-layout copies of the MXFP8 weight scales for MegaMoE,
         rewritten in place on reload (captured CUDA graphs hold the addresses)."""
         if not (
-            self.ep_size > 1
-            and not (self.sm90 or self.hip)
+            get_moe_a2a_backend().is_megamoe()
+            and self.ep_size > 1
+            and not self.sm90
             and self.w13_weight.dtype == self.w2_weight.dtype == torch.float8_e4m3fn
         ):
             return
         for name in ("w13", "w2"):
-            current = getattr(self, name + "_cutlass_scale", None)
-            setattr(
-                self,
-                name + "_cutlass_scale",
-                cutlass_weight_scales(getattr(self, name + "_scale"), current),
+            swizzled = swizzle_blockscale(
+                getattr(self, name + "_scale").view(torch.uint8)
             )
+            current = getattr(self, name + "_cutlass_scale", None)
+            if current is None:
+                setattr(self, name + "_cutlass_scale", swizzled)
+            else:
+                current.copy_(swizzled)
 
     def prepare_mega_moe(self):
-        """DeepGEMM MegaMoE over the loaded expert tensors in place (`inkling2`
-        layout); runs after the NVFP4 scale swizzle and the MXFP8 CUTLASS scales."""
+        """DeepGEMM MegaMoE over the loaded expert tensors in place
+        (`gate_up_interleaved` layout); runs after the NVFP4 scale swizzle and the
+        MXFP8 CUTLASS scales."""
         if not (
             get_moe_a2a_backend().is_megamoe()
             and self.ep_size > 1
@@ -368,11 +378,6 @@ class Inkling2Experts(nn.Module):
             return
         if (self.gate_cap, self.up_cap) != (4.0, 25.0):
             raise ValueError("MegaMoE SiTU needs MLP softcaps (4, 25)")
-        if version("sgl-deep-gemm") != MEGA_MOE_DEEP_GEMM_VERSION:
-            raise RuntimeError(
-                f"Inkling2 MegaMoE needs sgl-deep-gemm {MEGA_MOE_DEEP_GEMM_VERSION} "
-                "(docker/inkling2/apply_deep_gemm_patches.sh)"
-            )
         import deep_gemm
 
         from sglang.srt.layers.moe.mega_moe import (
@@ -382,7 +387,10 @@ class Inkling2Experts(nn.Module):
         max_tokens = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
 
         nvfp4 = self.w13_weight.dtype == torch.uint8
-        kwargs = {"recipe": (1, 1, 16 if nvfp4 else 32), "weight_layout": "inkling2"}
+        kwargs = {
+            "recipe": (1, 1, 16 if nvfp4 else 32),
+            "weight_layout": "gate_up_interleaved",
+        }
         if nvfp4:
             l1 = (self.w13_weight.view(torch.int8), self.w13_scale.view(torch.int32))
             l2 = (self.w2_weight.view(torch.int8), self.w2_scale.view(torch.int32))
@@ -425,9 +433,17 @@ class Inkling2Experts(nn.Module):
 
     def _forward_mega(self, x, weights, ids, combine):
         """Each EP rank feeds its slice of the (replicated) tokens to MegaMoE, which
-        writes the combined rows of every slice to every rank."""
+        writes the combined rows of every slice to every rank. A forward larger than
+        the MegaMoE buffer runs in buffer-sized pieces."""
         mega, deep_gemm = self.mega, self.mega.deep_gemm
         tokens = x.shape[0]
+        cap = mega.max_tokens * self.ep_size
+        if tokens > cap:
+            out = torch.empty_like(x)
+            for s in range(0, tokens, cap):
+                rows = slice(s, s + cap)
+                out[rows] = self._forward_mega(x[rows], weights[rows], ids[rows], True)
+            return out if combine else RoutedOutput(out, None, 0)
         per_rank = -(-tokens // self.ep_size)
         start = min(self.ep_rank * per_rank, tokens)
         local = min(tokens - start, per_rank)
@@ -502,20 +518,7 @@ class Inkling2Experts(nn.Module):
                     raise ValueError(
                         "NVFP4 expert computation requires an SM100, SM103 or SM107 GPU"
                     )
-                scale.data = swizzle_weight_scales(scale.data)
-
-    def _quantized_matmul(self, name, x, metadata=None):
-        weight, scale = getattr(self, name + "_weight"), getattr(self, name + "_scale")
-        if weight.dtype == torch.uint8:
-            return nvfp4_matmul(
-                x,
-                weight,
-                scale,
-                getattr(self, name + "_amax"),
-                getattr(self, name + "_outer_scale_denominator"),
-                metadata=metadata,
-            )
-        return mxfp8_matmul(x, weight, scale, metadata=metadata)
+                scale.data = swizzle_blockscale(scale.data).flatten(1)
 
     def uses_hip_path(self):
         """Whether the experts (and Inkling2MoE's routing) run inkling2_moe_hip."""
@@ -535,12 +538,15 @@ class Inkling2Experts(nn.Module):
             combine = True
         if self._marlin:
             return self._forward_source(x, weights, ids, combine)
-        if (
-            self.mega is not None
-            and self.mega.min_tokens
-            <= x.shape[0]
-            <= self.mega.max_tokens * self.ep_size
-        ):
+        if self._lacks_routed_kernels:
+            raise ValueError(
+                "Inkling2 quantized experts run only on the routed kernels, which need "
+                "expert parallelism and one NVFP4 or MXFP8 precision with 128 x 64 "
+                f"aligned weights; got ep_size={self.ep_size}, "
+                f"w13 {tuple(self.w13_weight.shape)} {self.w13_weight.dtype}, "
+                f"w2 {tuple(self.w2_weight.shape)} {self.w2_weight.dtype}"
+            )
+        if self.mega is not None and self.mega.min_tokens <= x.shape[0]:
             return self._forward_mega(x, weights, ids, combine)
         # ROCm: BF16 experts take the grouped Triton path below (no routed or
         # prefill exchange, which are CUDA-only).
@@ -553,6 +559,12 @@ class Inkling2Experts(nn.Module):
         )
         if exchange is not None and self._routed_kernels is not None:
             return self._forward_prefill(x, weights, ids, exchange)
+        if self._routed_kernels is not None:
+            raise ValueError(
+                f"Inkling2 quantized experts got a {x.shape[0]}-token MoE forward, "
+                "beyond the prefill exchange and MegaMoE capacity; lower "
+                f"--chunked-prefill-size to at most {PREFILL_EXCHANGE_MAX_TOKENS}"
+            )
         sorted_ids, permutation = torch.sort(ids.to(torch.int16).flatten(), stable=True)
         src2dst = get_src2dst(permutation)
         counts, offsets, block_offsets, schedule = compute_grouped_gemm_metadata(
@@ -569,40 +581,14 @@ class Inkling2Experts(nn.Module):
             )
         inputs = pre_reorder(x, src2dst, ids.shape[1])
         metadata = (counts, offsets, schedule)
-        gate_up = (
-            self._quantized_matmul("w13", inputs, metadata)
-            if self.quantize_w13
-            else grouped_gemm_triton(
-                inputs,
-                self.w13_weight,
-                self.w13_weight.shape[0],
-                counts,
-                offsets,
-                block_offsets,
-                schedule,
-                block_size_m=128,
-            )
-        )
+        gate_up = self._bf16_matmul("w13", inputs, metadata, block_offsets)
         if self.ep_size > 1:
             rows = torch.arange(gate_up.shape[0], device=x.device)
             outside = (rows < offsets[0]) | (rows >= offsets[-1])
             gate_up.masked_fill_(outside[:, None], 0)
         gammas = pre_reorder(weights.reshape(-1, 1), src2dst, 1).flatten()
-        activated = swiglu(gate_up, gammas, self.gate_cap, self.up_cap)
-        down = (
-            self._quantized_matmul("w2", activated, metadata)
-            if self.quantize_w2
-            else grouped_gemm_triton(
-                activated,
-                self.w2_weight,
-                self.w2_weight.shape[0],
-                counts,
-                offsets,
-                block_offsets,
-                schedule,
-                block_size_m=128,
-            )
-        )
+        activated = _capped_swiglu(gate_up, gammas, self.gate_cap, self.up_cap)
+        down = self._bf16_matmul("w2", activated, metadata, block_offsets)
         if self.ep_size > 1:
             down.masked_fill_(outside[:, None], 0)
             down = get_parallel().moe_ep_group.all_reduce(down)
@@ -651,32 +637,16 @@ class Inkling2Experts(nn.Module):
         start, end = self.ep_rank * num_local, (self.ep_rank + 1) * num_local
         counts, offsets = counts[start:end], offsets[start : end + 1]
         gammas = weights.flatten()[dst2src]
+        _, schedule = compute_expert_block_metadata(
+            counts, ids.numel(), block_size_m=128
+        )
         if self._routed_kernels == torch.uint8:
-            _, schedule = compute_expert_block_metadata(
-                counts, ids.numel(), block_size_m=128
-            )
             accumulator, nvfp4_scales = self._nvfp4_routed(
                 x, dst2src, top_k, gammas, counts, offsets, schedule
             )
         else:
-            gate_up = mxfp8_prefill_matmul(
-                x,
-                dst2src,
-                top_k,
-                self.w13_weight,
-                self.w13_cutlass_scale,
-                counts,
-                offsets,
-            )
-            accumulator = mxfp8_prefill_swiglu_matmul(
-                gate_up,
-                gammas,
-                self.gate_cap,
-                self.up_cap,
-                self.w2_weight,
-                self.w2_cutlass_scale,
-                counts,
-                offsets,
+            accumulator = self._mxfp8_routed(
+                x, dst2src, top_k, gammas, (counts, offsets, schedule), x.shape[0]
             )
             nvfp4_scales = None
         routed_rows(
@@ -773,28 +743,23 @@ class Inkling2Experts(nn.Module):
             return RoutedOutput(combined, self._identity[:tokens], 1)
         return combined.to(x.dtype)
 
-    def _routed_matmul(self, name, x, metadata, block_offsets):
+    def _mxfp8_routed(self, x, dst2src, top_k, gammas, metadata, tokens):
+        gate_up = mxfp8_routed_matmul(
+            x, dst2src, top_k, self.w13_weight, self.w13_scale, metadata
+        )
+        return mxfp8_routed_swiglu_matmul(
+            gate_up,
+            gammas,
+            self.gate_cap,
+            self.up_cap,
+            self.w2_weight,
+            self.w2_scale,
+            metadata,
+            tokens,
+        )
+
+    def _bf16_matmul(self, name, x, metadata, block_offsets):
         weight = getattr(self, name + "_weight")
-        if weight.dtype == torch.uint8:
-            accumulator, x_amax = nvfp4_matmul(
-                x,
-                weight,
-                getattr(self, name + "_scale"),
-                getattr(self, name + "_amax"),
-                getattr(self, name + "_outer_scale_denominator"),
-                metadata=metadata,
-                raw=True,
-            )
-            scales = (
-                x_amax,
-                getattr(self, name + "_amax"),
-                getattr(self, name + "_outer_scale_denominator"),
-            )
-            return accumulator, scales
-        if weight.dtype == torch.float8_e4m3fn:
-            return mxfp8_matmul(
-                x, weight, getattr(self, name + "_scale"), metadata=metadata
-            ), None
         counts, offsets, schedule = metadata
         return grouped_gemm_triton(
             x,
@@ -805,7 +770,7 @@ class Inkling2Experts(nn.Module):
             block_offsets,
             schedule,
             block_size_m=128,
-        ), None
+        )
 
     def _forward_routed(self, x, weights, ids, combine):
         num_local = self.w13_weight.shape[0]
@@ -847,36 +812,18 @@ class Inkling2Experts(nn.Module):
             )
         metadata = (counts, offsets, schedule)
         if self._routed_kernels == torch.float8_e4m3fn:
-            gate_up = mxfp8_routed_matmul(
-                x, dst2src, ids.shape[1], self.w13_weight, self.w13_scale, metadata
+            down = self._mxfp8_routed(
+                x, dst2src, ids.shape[1], gammas, metadata, ids.shape[0]
             )
-            down = mxfp8_routed_swiglu_matmul(
-                gate_up,
-                gammas,
-                self.gate_cap,
-                self.up_cap,
-                self.w2_weight,
-                self.w2_scale,
-                metadata,
-                ids.shape[0],
+        else:
+            inputs = pre_reorder(x, src2dst, ids.shape[1])
+            gate_up = self._bf16_matmul("w13", inputs, metadata, block_offsets)
+            activated = _capped_swiglu(
+                gate_up, gammas, self.gate_cap, self.up_cap, offsets
             )
-            return self._routed_output(
-                down, offsets, src2dst, ids.shape[1], x.dtype, None, combine, route
-            )
-        inputs = pre_reorder(x, src2dst, ids.shape[1])
-        gate_up, scales = self._routed_matmul("w13", inputs, metadata, block_offsets)
-        activated = routed_swiglu(
-            gate_up,
-            gammas,
-            offsets,
-            self.gate_cap,
-            self.up_cap,
-            out_dtype=x.dtype,
-            nvfp4_scales=scales,
-        )
-        down, scales = self._routed_matmul("w2", activated, metadata, block_offsets)
+            down = self._bf16_matmul("w2", activated, metadata, block_offsets)
         return self._routed_output(
-            down, offsets, src2dst, ids.shape[1], x.dtype, scales, combine, route
+            down, offsets, src2dst, ids.shape[1], x.dtype, None, combine, route
         )
 
     def _routed_output(
@@ -908,7 +855,6 @@ class Inkling2Experts(nn.Module):
 
 PREFILL_EXCHANGE_MAX_TOKENS = 32768
 PARTIAL_COMBINE_MIN_TOKENS = 16
-MEGA_MOE_DEEP_GEMM_VERSION = "0.2.6+inkling2.0f96f72.1"
 
 _MEGA_MOE_BUFFERS = {}
 _MEGA_MOE_MMA_TYPES = ("nvfp4xnvfp4", "fp8xfp8")

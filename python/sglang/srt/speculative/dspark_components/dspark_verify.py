@@ -51,8 +51,8 @@ from sglang.srt.speculative.dflash_utils import (
     apply_dflash_verify_logits_adjustments,
     build_speculative_verify_target_probs,
 )
-from sglang.srt.speculative.dspark_components.dspark_deferred_commit import (
-    DeferredContextCommit,
+from sglang.srt.speculative.dspark_components.dspark_deferred_draft_kv import (
+    DeferredDraftKVStore,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
@@ -80,10 +80,31 @@ _is_npu = is_npu()
 # in-kernel NaN-q guard in reject_sampling.py, so this is signal-only.
 _VERIFY_DRAFT_PROBS = Invariant("dspark.verify.draft_probs", Bucket.GUARD, NotNaN())
 
+_PADDING_LOGIT = -1.0e4
+
 
 def target_model_type(target_worker) -> Optional[str]:
     return getattr(
         target_worker.model_runner.model_config.hf_text_config, "model_type", None
+    )
+
+
+def draft_folds_static_commit(
+    *, draft_model, kv_injector: Optional[TargetHiddenKvInjector]
+) -> bool:
+    """The draft opts in and its FULL slots are the target's, unremapped, so it
+    can store the verify commit at the target's cache locations."""
+    if kv_injector is None or not getattr(
+        draft_model, "folds_static_verify_commit", False
+    ):
+        return False
+    target = kv_injector.model_runner.runner_ids.space(IdSpaceKind.FULL)
+    draft = kv_injector.draft_model_runner.runner_ids.space(IdSpaceKind.FULL)
+    return (
+        target is not None
+        and draft is not None
+        and draft.key == target.key
+        and target.write is None
     )
 
 
@@ -143,7 +164,7 @@ class TargetVerifyExecutor:
         gamma: int,
         verify_num_draft_tokens: int,
         model_runner,
-        kv_injector: TargetHiddenKvInjector,
+        kv_injector: Optional[TargetHiddenKvInjector] = None,
         tp_sync: SpecTpSync,
         verify_epilogue=None,
         simulate_acc_len: float = 0.0,
@@ -198,7 +219,6 @@ class TargetVerifyExecutor:
         override drawn by begin_simulated_step.
         """
         if folded_accept:
-            self.verify_epilogue.note_static_verify(bs)
             return self.verify_epilogue.read_accept(bs)
 
         correct_len, bonus, cap_trim_lens = accept_draft_tokens(
@@ -327,7 +347,12 @@ class TargetVerifyExecutor:
         batch.out_cache_loc = verify_cache_loc
         seq_lens_cpu_backup = batch.seq_lens_cpu
         seq_lens_sum_backup = batch.seq_lens_sum
-        if not self._verify_backend_self_adds_seq_lens():
+        if (
+            getattr(
+                self.target_worker.model_runner.attn_backend, "needs_cpu_seq_lens", True
+            )
+            and not self._verify_backend_self_adds_seq_lens()
+        ):
             if seq_lens_cpu_backup is not None:
                 batch.seq_lens_cpu = seq_lens_cpu_backup + verify_w
                 batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
@@ -392,6 +417,7 @@ class TargetVerifyExecutor:
         bs: int,
         run_compact: bool,
     ) -> None:
+        assert self.kv_injector is not None, "commit_hidden needs a kv_injector"
         if run_compact:
             self.kv_injector.inject_ragged(
                 batch=batch,
@@ -482,16 +508,29 @@ class TargetVerifyExecutor:
         verify_window: VerifyWindow,
         inject_gate: bool = False,
     ) -> tuple[TargetVerifyResult, torch.Tensor]:
-        ragged_window = BuildRaggedVerifyWindow.execute(
-            batch=batch,
-            layout=layout,
-            draft_block_ids=draft_block_ids,
-            draft_tokens=draft_tokens,
-            bs=bs,
-            device=device,
-            verify_num_draft_tokens=self.verify_num_draft_tokens,
-            model_runner=self.model_runner,
-        )
+        stride = self.verify_num_draft_tokens
+        full_block = layout.is_full_block(stride)
+        if full_block:
+            # Nothing to pack: the verify rows are the verify window.
+            ragged_window = RaggedVerifyWindow(
+                positions=verify_window.positions_2d.reshape(-1),
+                verify_cache_loc=verify_window.verify_cache_loc,
+                verify_ids=torch.cat((draft_block_ids[:, :1], draft_tokens), dim=1)
+                .reshape(-1)
+                .to(torch.int64),
+                window_index=None,
+            )
+        else:
+            ragged_window = BuildRaggedVerifyWindow.execute(
+                batch=batch,
+                layout=layout,
+                draft_block_ids=draft_block_ids,
+                draft_tokens=draft_tokens,
+                bs=bs,
+                device=device,
+                verify_num_draft_tokens=stride,
+                model_runner=self.model_runner,
+            )
         if self.verify_epilogue is not None:
             self.verify_epilogue.begin_step(layout.verify_lens, armed=inject_gate)
         target_verify = self._run_ragged(
@@ -503,7 +542,6 @@ class TargetVerifyExecutor:
         )
         logits_output = target_verify.logits_output
 
-        stride = self.verify_num_draft_tokens
         if self.verify_epilogue is not None and target_verify.can_run_cuda_graph:
             strided_logits = self.verify_epilogue.strided_logits
             hidden_strided = self.verify_epilogue.strided_hidden
@@ -515,23 +553,27 @@ class TargetVerifyExecutor:
             hidden_strided = hidden_strided[: bs * stride]
         else:
             compact_logits = logits_output.next_token_logits
-            strided_logits = ScatterCompactToStrided.execute(
-                compact=compact_logits,
-                layout=layout,
-                fill_value=0.0,
-                verify_num_draft_tokens=stride,
-            )
             compact_hidden = logits_output.hidden_states
             if compact_hidden is None:
                 raise RuntimeError(
                     "DSpark verify requires target hidden states, got None."
                 )
-            hidden_strided = ScatterCompactToStrided.execute(
-                compact=compact_hidden,
-                layout=layout,
-                fill_value=0.0,
-                verify_num_draft_tokens=stride,
-            )
+            if full_block:
+                strided_logits, hidden_strided = compact_logits, compact_hidden
+            else:
+                strided_logits = ScatterCompactToStrided.execute(
+                    compact=compact_logits,
+                    layout=layout,
+                    fill_value=_PADDING_LOGIT,
+                    point_mass_fill=True,
+                    verify_num_draft_tokens=stride,
+                )
+                hidden_strided = ScatterCompactToStrided.execute(
+                    compact=compact_hidden,
+                    layout=layout,
+                    fill_value=0.0,
+                    verify_num_draft_tokens=stride,
+                )
         apply_logits_adjustments_strided(
             next_token_logits=strided_logits,
             sampling_info=sampling_info,
@@ -596,7 +638,7 @@ class DsparkVerifyEpilogue:
         fused_accept_tail: bool = False,
         accept_tail_min_bs: int = 1,
         accept_tail_max_bs: int = 0,
-        deferred_commit: Optional[DeferredContextCommit] = None,
+        deferred_draft_kv: Optional[DeferredDraftKVStore] = None,
         post_fold: bool = False,
     ) -> None:
         self.max_bs = int(max_bs)
@@ -605,8 +647,8 @@ class DsparkVerifyEpilogue:
         self._post_fold = bool(post_fold)
         self.future_relay: Optional[FutureRelayBuffers] = None
         # SGLANG_DSPARK_DEFER_CONTEXT_KV: static graphs join its forked projection and
-        # stage the commit's stores into it; the next draft forward runs them.
-        self.deferred_commit = deferred_commit
+        # stage its stores; the next draft forward runs them.
+        self.deferred_draft_kv = deferred_draft_kv
         # SGLANG_SIMULATE_ACC_LEN with a sampled bonus inside the graph too: the bonus
         # is drawn at the simulated correct_len from these buffers, which
         # begin_sim_bonus writes before replay (<= 0 temperature: argmax).
@@ -783,11 +825,16 @@ class DsparkVerifyEpilogue:
         state_slot = None
         if self.commit_ctx.kv_injector.swa_ring_size is not None:
             state_slot = (
-                io.req_pool_indices.view(-1, 1).expand(bs, self.stride).reshape(-1)
+                io.req_pool_indices.view(-1, 1)
+                .expand(bs, self.stride)
+                .reshape(-1)
+                .contiguous()
             )
-        commit = self.deferred_commit
-        if commit is not None and (kv_projected or commit.join_projection()):
-            commit.stage(
+        deferred_draft_kv = self.deferred_draft_kv
+        if deferred_draft_kv is not None and (
+            kv_projected or deferred_draft_kv.join_projection()
+        ):
+            deferred_draft_kv.stage(
                 cache_loc=cache_loc,
                 positions=io.positions,
                 commit_lens=gated_commit_lens,
@@ -908,11 +955,6 @@ class DsparkVerifyEpilogue:
             "sim-fold" if self.simulate_fold else "argmax",
         )
 
-    def note_static_verify(self, bs: int) -> None:
-        """Host, after a static verify graph replayed ``bs`` requests."""
-        if self.deferred_commit is not None:
-            self.deferred_commit.note_static_verify(bs)
-
     def _commit_engram_history(
         self, candidates, req_pool_indices, commit_lens, verify_lens, gate
     ) -> bool:
@@ -981,18 +1023,10 @@ class DsparkVerifyEpilogue:
         return self._draft_folds_static_commit_cache
 
     def _resolve_draft_folds_static_commit(self) -> bool:
-        if (
-            self.commit_ctx is None
-            or self.commit_ctx.kv_injector is None
-            or not getattr(
-                self.commit_ctx.draft_model, "folds_static_verify_commit", False
-            )
-        ):
-            return False
-        injector = self.commit_ctx.kv_injector
-        target = injector.model_runner.runner_ids.space(IdSpaceKind.FULL)
-        draft = injector.draft_model_runner.runner_ids.space(IdSpaceKind.FULL)
-        return draft.key == target.key and target.write is None
+        return self.commit_ctx is not None and draft_folds_static_commit(
+            draft_model=self.commit_ctx.draft_model,
+            kv_injector=self.commit_ctx.kv_injector,
+        )
 
     @property
     def folds_static_commit(self) -> bool:
@@ -1064,7 +1098,8 @@ class DsparkVerifyEpilogue:
             verify_lens=verify_lens,
             out=self.strided_logits[: bs * self.stride],
             stride=self.stride,
-            fill_value=0.0,
+            fill_value=_PADDING_LOGIT,
+            point_mass_fill=True,
         )
         scatter_compact_to_strided_into(
             compact=compact_hidden,

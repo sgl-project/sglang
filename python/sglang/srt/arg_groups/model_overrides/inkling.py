@@ -7,11 +7,12 @@ from typing import Any, Dict
 from sglang.srt.arg_groups.model_override_base import (
     _register_for,
     is_attention_backend_not_set,
+    model_config_of,
     resolving_view,
 )
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils.common import is_gfx95_supported
+from sglang.srt.utils import is_gfx95_supported
 
 logger = logging.getLogger(__name__)
 
@@ -77,13 +78,26 @@ def _inkling_overrides(server_args: Any, hf_config: Any) -> dict:
                     "SGLANG_INKLING2_ALLOW_QUICK_REDUCE=1 to keep it)."
                 )
                 os.environ["ROCM_QUICK_REDUCE_QUANTIZATION"] = "NONE"
+        moe_ranks = cfg.tp_size // cfg.moe_dp_size
+        # On SM100 / SM103 / SM107, quantized experts above the routed-kernel batch
+        # run only on MegaMoE at full speed.
+        if (
+            cfg.moe_a2a_backend == "none"
+            and moe_ranks > 1
+            and get_platform().is_cuda
+            and get_platform().device_sm in (100, 103, 107)
+            and not cfg.encoder_only
+            and not (cfg.enable_two_batch_overlap or cfg.enable_single_batch_overlap)
+            and model_config_of(server_args).quantization == "inkling2"
+        ):
+            overrides["moe_a2a_backend"] = "megamoe"
         # Inkling2's MegaMoE path slices the replicated attention-TP tokens itself;
         # the scheduler-side attn-TP gather would only pad batches to attn_tp_size.
-        if cfg.moe_a2a_backend == "megamoe" and not cfg.enable_dp_attention:
+        megamoe = overrides.get("moe_a2a_backend", cfg.moe_a2a_backend) == "megamoe"
+        if megamoe and cfg.attn_dp_size == 1:
             overrides["disable_attn_tp_gather"] = True
         # NVFP4 experts need expert parallelism. ep_size == 1 is the field
         # default; any other value is the user's and wins.
-        moe_ranks = cfg.tp_size // cfg.moe_dp_size
         if cfg.ep_size == 1 and moe_ranks > 1:
             overrides["ep_size"] = moe_ranks
     # NOTE: the full-graph prefill default is NOT set here. cuda-graph config is

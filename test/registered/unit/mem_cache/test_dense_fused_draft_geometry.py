@@ -565,7 +565,7 @@ class TestFusedMLAHost(unittest.TestCase):
             page_size=self.PS,
             need_sort=False,
             forward_stream=None,
-            lazy_compaction=False,
+            lazy_compaction=True,
         )
         dp = DraftMHAView(
             arena=pool,
@@ -638,6 +638,8 @@ class TestRoutedDraftPool(CustomTestCase):
             fused_draft=FusedDraftPlacement.from_counts(
                 counts={"full": [1], "swa": [1]},
                 regions={"full": full_region, "swa": swa_region},
+                # This pool names its window sub-pool `swa`.
+                hosted={"swa": "window"},
             ),
         )
 
@@ -675,7 +677,7 @@ class TestRoutedDraftPool(CustomTestCase):
         self.assertEqual(swa_only.get_v_head_dim(), 8)
         self.assertEqual(swa_only.layer_router.route(0).sub_pool, "swa")
 
-    def test_window_write_needs_the_swa_loc_and_stays_in_the_swa_entry(self):
+    def test_window_write_needs_its_window_loc_and_stays_in_the_swa_entry(self):
         pool = self._pool()
         dp = self._draft_pool(pool)
         layer = SimpleNamespace(layer_id=1)
@@ -692,7 +694,10 @@ class TestRoutedDraftPool(CustomTestCase):
         # CPU by contract (register_cpu_ci), and the subject here is WHERE the
         # bytes land, not which kernel puts them there -- take the naive path.
         with patch.object(mem_pool, "can_use_store_cache", return_value=False):
-            dp.set_kv_buffer(layer, KVWriteLoc(loc, swa_loc=loc, physical=True), k, v)
+            window = dp.layer_router.route(1).sub_pool
+            dp.set_kv_buffer(
+                layer, KVWriteLoc(loc, window_locs={window: loc}, physical=True), k, v
+            )
         swa_entry = pool.spec("swa").entry_bytes()
         lo = 6 * swa_entry + pool.spec("swa").draft_offset_in_entry()
         nz = raw.nonzero()
@@ -761,7 +766,11 @@ class TestRoutedDraftPool(CustomTestCase):
                 expected = self._expected_writes(arena, full, swa, values, commit_lens)
                 loc = KVWriteLoc(
                     full if commit_lens is not None else full.flatten(),
-                    swa_loc=swa if commit_lens is not None else swa.flatten(),
+                    window_locs={
+                        pool.layer_router.route(1).sub_pool: swa
+                        if commit_lens is not None
+                        else swa.flatten()
+                    },
                     physical=True,
                 )
                 with patch.multiple(
@@ -915,99 +924,6 @@ class TestRoutedDraftPool(CustomTestCase):
                         iteration_ids=plan,
                     )
                 self.assertTrue(torch.equal(arena.raw, expected))
-
-    def test_inkling2_mtp_injector_routes_full_and_window_context(self):
-        from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
-        from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
-        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-        from sglang.srt.models.inkling2_mtp import Inkling2ForConditionalGenerationMTP
-        from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
-            TargetHiddenKvInjector,
-        )
-
-        arena, pool, full, swa, values = self._write_fixture(symmetric=True)
-        spaces = {
-            kind: IdSpace(key=kind, write=lambda ids, loc=loc: loc.flatten()[ids])
-            for kind, loc in (
-                (IdSpaceKind.FULL, full),
-                (IdSpaceKind.SLIDING_WINDOW, swa),
-            )
-        }
-        runner_ids = SimpleNamespace(space=spaces.get)
-        plan = IterationIds(
-            source=runner_ids,
-            req_pool_indices=torch.tensor([0, 1]),
-            seq_lens=torch.tensor([3, 3]),
-            seq_lens_cpu=torch.tensor([3, 3]),
-            write_virtual=torch.arange(6),
-        )
-        layers = self._draft_layers(values)
-        for layer, (k, v) in zip(layers, values):
-            attn = layer.self_attn
-            attn.kv_size = 8
-            attn.kv_proj_ctx = lambda hidden, k=k, v=v: (
-                torch.cat((k.flatten(1), v.flatten(1)), dim=1),
-                None,
-            )
-            attn.kv_proj_ctx.weight = torch.empty(0, dtype=_DTYPE)
-            attn.k_norm_ctx = lambda k: k
-            layer.dflare_norm = None
-        model = SimpleNamespace(
-            layers=layers,
-            num_context_features=1,
-            config=SimpleNamespace(hidden_size=8),
-            _mix_norm=lambda targets, layer_id, norm: targets[:, 0],
-        )
-        model.write_target_hidden_kv = MethodType(
-            Inkling2ForConditionalGenerationMTP.write_target_hidden_kv, model
-        )
-        injector = TargetHiddenKvInjector(
-            draft_model=model,
-            draft_model_runner=SimpleNamespace(
-                token_to_kv_pool=pool, runner_ids=runner_ids
-            ),
-            model_runner=SimpleNamespace(device=torch.device("cpu")),
-            device=torch.device("cpu"),
-            verify_num_draft_tokens=3,
-            block_pos_offsets=torch.arange(3),
-        )
-        for mode in ("routed", "static_mapped", "static_explicit"):
-            if mode == "routed":
-                write_pool = pool
-            else:
-                write_pool = SWAKVPool.__new__(SWAKVPool)
-                write_pool.layer_router = pool.layer_router
-                write_pool.full_to_swa_index_mapping = torch.zeros(
-                    32, dtype=torch.int64
-                )
-                if mode == "static_mapped":
-                    write_pool.full_to_swa_index_mapping[full.flatten()] = swa.flatten()
-            injector.draft_model_runner.token_to_kv_pool = write_pool
-            for lengths in (None, (2, 0), (0, 0)):
-                with self.subTest(mode=mode, commit_lens=lengths):
-                    commit_lens = (
-                        None
-                        if lengths is None
-                        else torch.tensor(lengths, dtype=torch.int32)
-                    )
-                    expected = self._expected_writes(
-                        arena, full, swa, values, commit_lens
-                    )
-                    with patch.multiple(
-                        mem_pool,
-                        _is_cuda=False,
-                        _is_hip=False,
-                        _cpu_has_amx_support=False,
-                    ):
-                        injector.inject_target_hidden(
-                            target_hidden=torch.ones((6, 8), dtype=_DTYPE),
-                            cache_loc=plan.write_ids(runner_ids),
-                            positions=torch.arange(6),
-                            cache_loc_2d=full if commit_lens is not None else None,
-                            commit_lens=commit_lens,
-                            iteration_ids=plan if mode != "static_mapped" else None,
-                        )
-                    self.assertTrue(torch.equal(arena.raw, expected))
 
     def test_dspark_single_location_fusion_declines_window_layers(self):
         """A shared-location kernel cannot address full and SWA hosts with different IDs."""

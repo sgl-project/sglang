@@ -111,7 +111,7 @@ def encode_simple_chat(
         )
 
         if tokenizer is not None:
-            check_served_tokenizer(tokenizer, spec)
+            check_served_tokenizer(tokenizer, spec=spec)
         return render_inkling_messages(messages, spec=spec)
 
     if spec in ("dsv4", "dsv41"):

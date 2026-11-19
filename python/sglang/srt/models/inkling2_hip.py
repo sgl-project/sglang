@@ -3,7 +3,7 @@ residual kernel instead of after it."""
 
 import torch
 
-from sglang.kernels.ops.inkling2.norm_hip import attn_res
+from sglang.kernels.ops.layernorm.inkling2_norm_hip import attn_res
 from sglang.srt.models.inkling_common.inkling2_attn import AttentionSources
 
 
@@ -41,7 +41,9 @@ def _attention_inputs(layer, state, norms, out=None):
         queries = scaled = state.partial.new_zeros(
             (len(norms), state.partial.shape[-1]), dtype=torch.float32
         )
-    return _normed_attn_res(state, state.blocks, state.partial, queries, scaled, norms, out)
+    return _normed_attn_res(
+        state, state.blocks, state.partial, queries, scaled, norms, out
+    )
 
 
 def attention_input(layer, state):

@@ -319,6 +319,38 @@ def test_batched_colliding_hashes_with_different_lengths_are_not_deduplicated():
     encoder.assert_called_once()
 
 
+@pytest.mark.parametrize("backend", ["cuda", "npu", "hip", "xpu"])
+def test_cross_request_image_batching_by_backend(monkeypatch, backend):
+    """CUDA/NPU merge misses; HIP/XPU keep per-request encoding and output order."""
+    for name in ("hip", "npu", "xpu"):
+        monkeypatch.setattr(mm_schedule, f"_is_{name}", backend == name)
+    mm_schedule.init_mm_embedding_cache(1 << 30)
+    items = _make_items()[:2]
+    encoder = Mock(side_effect=_encoder_tensor)
+
+    def encode():
+        embedding, _ = mm_schedule._get_chunked_prefill_embedding(
+            encoder,
+            items,
+            [0, 1, 2],
+            [0, 0],
+            [TOTAL_LEN, TOTAL_LEN],
+            [[item.offsets[0]] for item in items],
+            torch.zeros(2 * TOTAL_LEN, dtype=torch.long),
+        )
+        return embedding
+
+    expected = _encoder_tensor(items)
+    torch.testing.assert_close(encode(), expected, rtol=0, atol=0)
+    expected_calls = (
+        [items] if backend in ("cuda", "npu") else [[item] for item in items]
+    )
+    assert [call.args[0] for call in encoder.call_args_list] == expected_calls
+    encoder.reset_mock()
+    torch.testing.assert_close(encode(), expected, rtol=0, atol=0)
+    encoder.assert_not_called()
+
+
 def test_full_mismatched_cache_entry_is_reencoded(caplog):
     mm_schedule.init_mm_embedding_cache(1 << 30)
     items = _make_items()
@@ -342,6 +374,44 @@ def test_full_mismatched_cache_entry_is_reencoded(caplog):
     assert "Discarding cached multimodal embedding" in caplog.text
     assert "expected_tokens=15" in caplog.text
     assert "cached_tokens=1" in caplog.text
+
+
+def test_multimodal_static_cache_reuses_precomputed_combined_hash(monkeypatch):
+    mm_schedule.init_mm_embedding_cache(1 << 30)
+    items = _make_items()
+    for index, item in enumerate(items):
+        item.feature = torch.tensor([float(index)])
+    item_hashes = [item.cache_key for item in items]
+    combined_hash = mm_schedule.MultiModalStaticCache.combine_hashes(item_hashes)
+    expected = torch.ones((sum(_num_tokens(item) for item in items), HIDDEN))
+    mm_schedule.embedding_cache.set(
+        combined_hash,
+        mm_schedule.EmbeddingResult(embedding=expected),
+    )
+
+    combine_spy = Mock(wraps=mm_schedule.MultiModalStaticCache.combine_hashes)
+    monkeypatch.setattr(
+        mm_schedule.MultiModalStaticCache, "combine_hashes", combine_spy
+    )
+
+    cached = mm_schedule.embedding_cache.get(item_hashes, combined_hash=combined_hash)
+    assert cached is not None
+    assert torch.equal(cached.embedding, expected)
+    combine_spy.assert_not_called()
+
+    input_ids = torch.zeros(TOTAL_LEN, dtype=torch.long)
+    encoder = Mock(side_effect=AssertionError("cache hit should not call encoder"))
+    chunk, _ = mm_schedule._get_chunked_embedding_full(
+        encoder, items, ITEM_OFFSETS, 0, TOTAL_LEN, input_ids, _CPU
+    )
+    assert torch.equal(chunk, expected)
+    assert combine_spy.call_count == 1
+
+    # order remains part of the full identity even with a precomputed key
+    reordered = item_hashes[::-1]
+    reordered_key = mm_schedule.MultiModalStaticCache.combine_hashes(reordered)
+    assert mm_schedule.embedding_cache.get(reordered, reordered_key) is None
+    assert mm_schedule.embedding_cache.get(item_hashes).embedding is expected
 
 
 @pytest.mark.parametrize("per_request", [False, True])

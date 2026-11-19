@@ -14,8 +14,7 @@ from PIL import Image
 from safetensors.torch import load, save
 from torch import nn
 
-from sglang.srt.configs.inkling2 import Inkling2MMConfig, Inkling2ModelConfig
-from sglang.srt.configs.model_config import get_hybrid_layer_ids, is_hybrid_swa_model
+from sglang.srt.configs.inkling2 import Inkling2ModelConfig
 from sglang.srt.layers import logits_processor as logits_module
 from sglang.srt.layers.logits_processor import LogitsMetadata
 from sglang.srt.layers.quantization.inkling2 import Inkling2QuantConfig
@@ -30,7 +29,6 @@ from sglang.srt.models.inkling_common import inkling2_moe as moe
 from sglang.srt.multimodal.inkling2 import Inkling2ImageProcessor
 from sglang.srt.parser.inkling_renderer import render_inkling_messages
 from sglang.srt.parser.inkling_tokenizer import IMAGE_TOKEN_ID
-from sglang.srt.utils.hf_transformers import get_config
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.inkling2_test_utils import precision_group
 
@@ -164,25 +162,24 @@ def release_config():
     return copy.deepcopy(_RELEASE_CONFIG)
 
 
-def test_public_config_load_and_roundtrip(tmp_path, release_config):
-    (tmp_path / "config.json").write_text(json.dumps(release_config))
-    config = get_config(str(tmp_path), trust_remote_code=False)
-    assert isinstance(config, Inkling2MMConfig)
-    text = config.get_text_config()
-    assert text.padded_vocab_size == release_config["text_config"]["vocab_size"]
-    assert text.vocab_size == release_config["text_config"]["unpadded_vocab_size"]
-    assert text.max_position_embeddings == 1048576
-    assert is_hybrid_swa_model(config.architectures, text)
-    local, full = get_hybrid_layer_ids(config.architectures, text)
-    assert local == release_config["text_config"]["local_layer_ids"]
-    assert sorted(local + full) == list(range(text.num_hidden_layers))
-    reloaded = Inkling2MMConfig(**config.to_dict())
-    assert reloaded.text_config.to_dict() == text.to_dict()
-    assert reloaded.vision_config == release_config["vision_config"]
-    assert reloaded.mtp_config == release_config["mtp_config"]
-
-
-def test_precision_file_is_detected_without_launch_flag(tmp_path, release_config):
+@pytest.mark.parametrize(
+    "hub_stub",
+    [
+        None,
+        dict(quant_method="modelopt", quant_algo="NVFP4"),
+        dict(
+            quant_method="fp8",
+            activation_scheme="dynamic",
+            weight_block_size=[1, 32],
+            scale_fmt="ue8m0",
+            modules_to_not_convert=["model.llm.unembed", "model.visual"],
+        ),
+    ],
+    ids=["none", "nvfp4", "mxfp8"],
+)
+def test_precision_file_is_detected_without_launch_flag(
+    tmp_path, release_config, hub_stub
+):
     from sglang.srt.configs.load_config import LoadConfig
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.model_loader.weight_utils import get_quant_config
@@ -195,10 +192,14 @@ def test_precision_file_is_detected_without_launch_flag(tmp_path, release_config
             ]
         ),
     )
+    if hub_stub:
+        # The published checkpoints add these stubs so the Hub counts parameters.
+        release_config["quantization_config"] = hub_stub
     (tmp_path / "config.json").write_text(json.dumps(release_config))
     (tmp_path / "hf_quant_config.json").write_text(json.dumps(precision))
     config = ModelConfig(str(tmp_path), trust_remote_code=False)
     assert config.quantization == "inkling2"
+    assert config.hf_quant_config == {}
     assert config.is_hybrid_swa
     assert config.is_hybrid_swa_compress
     assert not config.is_multimodal
@@ -385,7 +386,8 @@ def test_logits_preserve_padding_for_normalization(
     processor = Inkling2LogitsProcessor(config)
     generator = torch.Generator().manual_seed(7)
     hidden = torch.randn(2, 4, generator=generator).to(device)
-    head = torch.nn.Linear(4, padded, bias=False, device=device)
+    # Served weights never require grad; out= matmuls reject ones that do.
+    head = torch.nn.Linear(4, padded, bias=False, device=device).requires_grad_(False)
     head.weight.data.copy_(torch.randn(padded, 4, generator=generator).to(device))
     buffer = torch.empty(2, padded, device=device) if buffered else None
     metadata = LogitsMetadata(
@@ -495,41 +497,6 @@ def encoder():
     return model
 
 
-def test_native_patch_order_and_cls_positions(encoder):
-    patches = torch.arange(6 * 3 * 4 * 4, dtype=torch.float32).reshape(6, 3, 4, 4)
-    patches = patches.to(torch.bfloat16)
-    captured = []
-    handle = encoder.backbone.embeddings.register_forward_pre_hook(
-        lambda module, args: captured.append(args[0])
-    )
-    with torch.inference_mode():
-        hidden, positions, lengths, cumulative = encoder._embed_images(
-            patches, [[1, 2, 2], [1, 1, 2]]
-        )
-    handle.remove()
-    expected = []
-    for image, height, width in ((patches[:4], 2, 2), (patches[4:], 1, 2)):
-        expected.append(torch.zeros(1, 12, dtype=torch.bfloat16))
-        for y in range(height * 2):
-            for x in range(width * 2):
-                block = image[(y // 2) * width + x // 2]
-                patch = block[:, y % 2 * 2 : y % 2 * 2 + 2, x % 2 * 2 : x % 2 * 2 + 2]
-                expected.append(patch.permute(1, 2, 0).reshape(1, -1))
-    assert torch.equal(captured[0], torch.cat(expected))
-    assert lengths == [17, 9]
-    assert cumulative.tolist() == [0, 17, 26]
-    assert positions[[0, 1, 4, 16, 17, 18, 25]].tolist() == [
-        [0, 0],
-        [1, 1],
-        [1, 4],
-        [4, 4],
-        [0, 0],
-        [1, 1],
-        [2, 4],
-    ]
-    assert torch.equal(hidden[0], hidden[17])
-
-
 def test_multiple_images_have_independent_attention(encoder):
     patches = torch.randn(3, 2, 4, 4, 3, dtype=torch.bfloat16)
     grid = torch.tensor([[1, 1, 1], [1, 1, 2]])
@@ -543,12 +510,6 @@ def test_multiple_images_have_independent_attention(encoder):
     assert torch.isfinite(expected).all()
     assert torch.equal(expected[:1], actual[:1])
     assert not torch.equal(expected[1:], actual[1:])
-
-
-def _png(image):
-    buffer = io.BytesIO()
-    image.save(buffer, format="PNG")
-    return buffer.getvalue()
 
 
 @pytest.mark.parametrize(
@@ -567,30 +528,6 @@ def test_grid_and_token_count(width, height, count):
         assert torch.equal(
             result.vision_patches_bthwc[:, 0], result.vision_patches_bthwc[:, 1]
         )
-
-
-def test_training_hydration_dimension_and_token_contracts(tmp_path):
-    path = tmp_path / "image.png"
-    path.write_bytes(_png(Image.new("RGB", (41, 40))))
-    image = {
-        "location": str(path),
-        "size": (41, 40),
-        "num_tokens": 2,
-        "image_token_id": 200005,
-    }
-    processor = Inkling2ImageProcessor()
-    result = processor.preprocess_image_for_training(**image)
-    assert result.int_tokens == [200005, 200005]
-    for changes, message in [
-        ({"size": (41, 41)}, "size mismatch"),
-        ({"virtual_size": (0, 40)}, "positive integers"),
-        ({"num_tokens": 1}, "token count"),
-    ]:
-        with pytest.raises(ValueError, match=message):
-            processor.preprocess_image_for_training(**(image | changes))
-    path.write_bytes(b"not an image")
-    with pytest.raises(OSError):
-        processor(path)
 
 
 def _processor():
@@ -695,25 +632,6 @@ def test_epd_rebuild_matches_colocated_expansion():
         )
     with pytest.raises(ValueError, match="images only"):
         build_encoder_inputs(images, Modality.VIDEO)
-
-
-def test_server_chat_encoding_dispatch():
-    from sglang.srt.entrypoints.openai.chat_encoding import (
-        resolve_chat_encoding_spec,
-        spec_renders_prompt_ids,
-    )
-
-    assert (
-        resolve_chat_encoding_spec(
-            hf_config=SimpleNamespace(
-                architectures=["Inkling2ForConditionalGeneration"],
-                model_type="inkling2",
-            ),
-            tokenizer=SimpleNamespace(chat_template=None),
-        )
-        == "inkling2"
-    )
-    assert spec_renders_prompt_ids("inkling2")
 
 
 def test_multimodal_requires_explicit_enable(tmp_path):

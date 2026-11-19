@@ -4,8 +4,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.arch.triton_portability import pdl_launch
 from sglang.kernels.jit.utils import is_arch_support_pdl
-from sglang.kernels.ops.inkling2.portability import pdl_launch
 from sglang.srt.utils import is_cuda
 
 _PDL = is_arch_support_pdl()

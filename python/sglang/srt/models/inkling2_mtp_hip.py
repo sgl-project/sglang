@@ -4,13 +4,15 @@ store after verify in one launch."""
 
 import torch
 
-from sglang.kernels.ops.inkling2.mtp_hip import (
+from sglang.kernels.ops.layernorm.inkling2_rmsnorm_triton import (
+    rmsnorm as triton_rmsnorm,
+)
+from sglang.kernels.ops.speculative.inkling2_mtp_hip import (
     ctx_kv_store,
     mix_rmsnorm_last,
     rnn_step,
     rnn_step_fits,
 )
-from sglang.kernels.ops.inkling2.rmsnorm_triton import rmsnorm as triton_rmsnorm
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.layers import layernorm
 from sglang.srt.layers.layernorm import RMSNorm

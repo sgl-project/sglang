@@ -76,6 +76,7 @@ class RadixAttention(nn.Module):
         use_irope: bool = False,
         prefix: str = "",
         use_prefill_attention_wrapper: bool = True,
+        graph_layer_id: Optional[int] = None,
         out_dtype: Optional[torch.dtype] = None,
         num_splits: Optional[int] = None,
         pack_gqa: Optional[bool] = None,
@@ -96,6 +97,7 @@ class RadixAttention(nn.Module):
         self.window_anchor_at_start = window_anchor_at_start
         self.strided_lse = strided_lse
         self.layer_id = layer_id
+        self._graph_layer_id = graph_layer_id
         self.logit_cap = logit_cap
         self.sliding_window_size = sliding_window_size or -1
         self.is_cross_attention = is_cross_attention
@@ -120,6 +122,11 @@ class RadixAttention(nn.Module):
         self.pos_encoding_mode = pos_encoding_mode
         self.logit_capping_method = logit_capping_method
         self.xai_temperature_len = -1
+
+    @property
+    def graph_layer_id(self) -> int:
+        # Shared KV cache does not make two decoder layers the same graph layer.
+        return self.layer_id if self._graph_layer_id is None else self._graph_layer_id
 
     def forward(
         self,
@@ -181,7 +188,7 @@ class RadixAttention(nn.Module):
             if return_lse:
                 return output.view(-1, self.tp_q_head_num, self.v_head_dim), lse
             return output
-        real_num_tokens = padded_extend_real_tokens(q, forward_batch)
+        real_num_tokens = padded_extend_real_tokens(q.shape[0], forward_batch)
         if real_num_tokens is not None:
             return _attention_on_real_rows(
                 self,

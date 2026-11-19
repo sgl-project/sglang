@@ -23,10 +23,8 @@ def _mxfp8_quant_store_qkv_kernel(
     skh,
     svt,
     svh,
-    skct: tl.constexpr,
-    svct: tl.constexpr,
-    sskt: tl.constexpr,
-    ssvt: tl.constexpr,
+    cache_stride: tl.constexpr,
+    sf_stride: tl.constexpr,
     INTERLEAVED: tl.constexpr,
     NQ: tl.constexpr,
     NKV: tl.constexpr,
@@ -35,6 +33,10 @@ def _mxfp8_quant_store_qkv_kernel(
 ):
     t = tl.program_id(0)
     r = tl.program_id(1)
+    myloc = tl.load(loc_ptr + t).to(tl.int64)
+    # Slot 0 is the reserved CUDA-graph padding sink; skip writes to it.
+    if (r >= NQ) & (myloc == 0):
+        return
     SF: tl.constexpr = D // 32
     blk = tl.arange(0, SF)
     off2 = blk[:, None] * 32 + tl.arange(0, 32)[None, :]
@@ -58,32 +60,25 @@ def _mxfp8_quant_store_qkv_kernel(
         tl.store(q8_ptr + (t * NQ + r) * D + off2, xq)
         tl.store(sfq_ptr + (t * NQ + r) * SF + blk, sf)
     else:
-        myloc = tl.load(loc_ptr + t).to(tl.int64)
-        # Slot 0 is the reserved CUDA-graph padding sink; skip writes to it.
-        if myloc == 0:
-            return
         if r < NQ + NKV:
             h = r - NQ
             cache = kc_ptr
             sfb = sfk_ptr
-            cache_stride = skct
-            sf_stride = sskt
         else:
             h = r - NQ - NKV
             cache = vc_ptr
             sfb = sfv_ptr
-            cache_stride = svct
-            sf_stride = ssvt
         tl.store(cache + myloc * cache_stride + h * D + off2, xq)
-        # BlockScaledBasicChunk byte layout (see mxfp8_interleave_sf.py):
-        # a page block is (NKV, 32, PAGE//32, SF) bytes.
-        po = myloc % PAGE
-        base = (
-            ((myloc // PAGE) * NKV + h) * (32 * (PAGE // 32) * SF)
-            + (po % 32) * ((PAGE // 32) * SF)
-            + (po // 32) * SF
-        )
-        if not INTERLEAVED:
+        if INTERLEAVED:
+            # BlockScaledBasicChunk byte layout (see mxfp8_interleave_sf.py):
+            # a page block is (NKV, 32, PAGE//32, SF) bytes.
+            po = myloc % PAGE
+            base = (
+                ((myloc // PAGE) * NKV + h) * (32 * (PAGE // 32) * SF)
+                + (po % 32) * ((PAGE // 32) * SF)
+                + (po // 32) * SF
+            )
+        else:
             base = myloc * sf_stride + h * SF
         tl.store(sfb + base + blk, sf)
 
@@ -101,8 +96,10 @@ def quant_store_kv_mxfp8(
     """One kernel quantizes bf16 K/V rows, scatters the fp8 payload into the paged
     cache at `loc`, and writes interleaved or token-major UE8M0 scale rows."""
     T, NKV, D = k.shape
-    assert D % 32 == 0 and page_size % 32 == 0
+    interleaved = sfk.ndim == 5
+    assert D % 32 == 0 and (not interleaved or page_size % 32 == 0)
     assert k.stride(2) == 1 and v.stride(2) == 1
+    assert k_cache.stride(0) == v_cache.stride(0) and sfk.stride(0) == sfv.stride(0)
     assert k_cache.stride(1) == v_cache.stride(1) == D
     assert k_cache.stride(2) == v_cache.stride(2) == 1
     if T == 0:
@@ -124,11 +121,9 @@ def quant_store_kv_mxfp8(
         k.stride(1),
         v.stride(0),
         v.stride(1),
-        skct=k_cache.stride(0),
-        svct=v_cache.stride(0),
-        sskt=sfk.stride(0),
-        ssvt=sfv.stride(0),
-        INTERLEAVED=sfk.ndim == 5,
+        cache_stride=k_cache.stride(0),
+        sf_stride=sfk.stride(0),
+        INTERLEAVED=interleaved,
         NQ=0,
         NKV=NKV,
         D=D,

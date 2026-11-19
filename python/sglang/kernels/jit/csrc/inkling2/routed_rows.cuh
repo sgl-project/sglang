@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// This rank's routed expert rows, equal to the Triton _routed_rows in moe.py:
+// This rank's routed expert rows, equal to the Triton _routed_rows in inkling2_moe.py:
 // rows in [offsets[0], offsets[E]) of x, scaled like the NVFP4 GEMM output when
 // scales are given, rounded to bfloat16; written into a routed exchange slot,
 // or into a dense output whose other rows are zero.

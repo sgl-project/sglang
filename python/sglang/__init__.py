@@ -30,6 +30,7 @@ if _sys.platform == "darwin" and _platform.machine() == "arm64":
 
     _install_platform_stubs()
 
+from sglang._lazy_import import LazyImport
 from sglang.lang.api import (
     Runtime,
     assistant,
@@ -60,11 +61,9 @@ from sglang.lang.choices import (
     unconditional_likelihood_normalized,
 )
 from sglang.lang.global_config import global_config
-
-# Lazy backend clients
-from sglang.utils import LazyImport
 from sglang.version import __version__
 
+# Lazy backend clients
 Anthropic = LazyImport("sglang.lang.backend.anthropic", "Anthropic")
 Crusoe = LazyImport("sglang.lang.backend.crusoe", "Crusoe")
 LiteLLM = LazyImport("sglang.lang.backend.litellm", "LiteLLM")

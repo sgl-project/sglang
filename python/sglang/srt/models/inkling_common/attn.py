@@ -20,6 +20,7 @@ from sglang.srt.layers.linear import MergedColumnParallelLinear, RowParallelLine
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 from sglang.srt.models.inkling_common.kernels.comm import (
@@ -37,16 +38,20 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_spec,
 )
-from sglang.srt.utils import add_prefix, get_current_device_stream_fast
+from sglang.srt.utils import get_current_device_stream_fast
 
 try:
     import cutlass.cute as cute
     from cutlass.cute import Float32
 
+    from sglang.kernels.ops.attention.flash_attn.cute.batch_invariance import (
+        is_batch_invariant,
+    )
     from sglang.kernels.ops.attention.flash_attn.cute.seqlen_info import SeqlenInfoQK
 except Exception as _import_error:
     cute = None
     Float32 = None
+    is_batch_invariant = None
     SeqlenInfoQK = None
     _cute_import_error = _import_error
 else:
@@ -924,15 +929,12 @@ class InklingAttention(nn.Module):
         # follows the query count, so the same absolute (q, k) pair accumulates in
         # a different order for a few-query decode step than for a many-query
         # prefill. Deterministic mode takes the score_mod path instead.
-        sheared_bias = envs.SGLANG_OPT_USE_INKLING_SHEARED_BIAS.get() and fa4
-        if sheared_bias:
-            # FA4-only: the CuTe package does not import on ROCm.
-            from sglang.kernels.ops.attention.flash_attn.cute.batch_invariance import (
-                is_batch_invariant,
-            )
-
-            sheared_bias = not is_batch_invariant()
-        if sheared_bias:
+        if (
+            envs.SGLANG_OPT_USE_INKLING_SHEARED_BIAS.get()
+            and fa4
+            and is_batch_invariant is not None
+            and not is_batch_invariant()
+        ):
             # FA4 sheared-bias kernel: pass rel_logits directly; the kernel shears
             # it into a column-aligned pre-softmax bias.
             attn_output = self.attn(

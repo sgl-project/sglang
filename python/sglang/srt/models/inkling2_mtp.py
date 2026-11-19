@@ -3,7 +3,7 @@ from collections.abc import Iterable
 import torch
 from torch import nn
 
-from sglang.kernels.ops.inkling2.mtp import (
+from sglang.kernels.ops.speculative.inkling2_mtp import (
     mix_rmsnorm,
     rnn_gates,
     rnn_inputs,
@@ -14,7 +14,7 @@ from sglang.srt.distributed.device_communicators.vocab_gather import (
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import QKVParallelLinear
 from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc, layer_window_locs
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models import inkling2_mtp_hip
@@ -135,7 +135,9 @@ class Inkling2ForConditionalGenerationMTP(DSparkDraftModel):
             raise ValueError(
                 "Inkling2 MTP does not support attention projection biases"
             )
-        DFlashDraftModel.__init__(self, config, quant_config=None, prefix=prefix)
+        DFlashDraftModel.__init__(
+            self, config, quant_config=quant_config, prefix=prefix
+        )
         hidden, eps = config.hidden_size, config.rms_norm_eps
         self.block_size = config.block_size
         self.gamma = self.block_size - 1
@@ -349,9 +351,11 @@ class Inkling2ForConditionalGenerationMTP(DSparkDraftModel):
                     attn.attn,
                     KVWriteLoc(
                         cache_loc_2d,
-                        swa_loc=None
-                        if swa_loc is None
-                        else swa_loc.view_as(cache_loc_2d),
+                        window_locs=layer_window_locs(
+                            pool,
+                            attn.attn.layer_id,
+                            None if swa_loc is None else swa_loc.view_as(cache_loc_2d),
+                        ),
                         physical=True,
                     ),
                     commit_lens,
@@ -363,7 +367,13 @@ class Inkling2ForConditionalGenerationMTP(DSparkDraftModel):
             else:
                 pool.layer_router.layer(attn.attn.layer_id).store(
                     attn.attn,
-                    KVWriteLoc(cache_loc, swa_loc=swa_loc, physical=True),
+                    KVWriteLoc(
+                        cache_loc,
+                        window_locs=layer_window_locs(
+                            pool, attn.attn.layer_id, swa_loc
+                        ),
+                        physical=True,
+                    ),
                     k,
                     v,
                     attn.attn.k_scale,

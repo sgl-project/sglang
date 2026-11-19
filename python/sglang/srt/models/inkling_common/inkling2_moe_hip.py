@@ -3,10 +3,15 @@ and its fused decode routing."""
 
 import torch
 
-from sglang.kernels.ops.inkling2 import experts_hip, experts_sm90, marlin_sm90
-from sglang.kernels.ops.inkling2.comm import all_reduce
-from sglang.kernels.ops.inkling2.linear import linear_k_group_partials, uses_k_groups
-from sglang.kernels.ops.inkling2.route_hip import (
+from sglang.kernels.ops.communication.inkling2_comm import all_reduce
+from sglang.kernels.ops.gemm import inkling2_marlin_sm90 as marlin_sm90
+from sglang.kernels.ops.gemm.inkling2_linear import (
+    linear_k_group_partials,
+    uses_k_groups,
+)
+from sglang.kernels.ops.moe import inkling2_experts_hip as experts_hip
+from sglang.kernels.ops.moe import inkling2_experts_sm90 as experts_sm90
+from sglang.kernels.ops.moe.inkling2_route_hip import (
     ROUTE_FUSED_MAX_TOKENS,
     ROUTE_QUANT_MAX_IDS,
     route_metadata_quantize,

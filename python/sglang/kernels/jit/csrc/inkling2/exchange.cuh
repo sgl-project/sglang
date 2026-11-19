@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
-// RoutedExchange combine: per-CTA flag barrier with every peer, then each token's
+// RoutedExchange combine: grid barrier with every peer, then each token's
 // top-k rows summed in top-k order (FP32), each row read from its owner rank.
 
 #include <sgl_kernel/utils.cuh>
 
 #include <tvm/ffi/container/tensor.h>
 
+#include "../inkling/inkling_ar_barrier.cuh"
 #include <cstdint>
 #include <cuda_bf16.h>
 
@@ -15,51 +16,7 @@ constexpr int threads(int hidden) {
   return (hidden / 16 + 31) / 32 * 32;
 }
 
-// Grid-wide barrier with every peer: the last CTA to arrive exchanges epoch
-// flags with the peers (one thread per peer), then releases the other CTAs.
-// state: [arrivals, releases, epoch]; flags: one word per peer.
-template <int WORLD>
-__device__ __forceinline__ void grid_barrier(uint32_t* state, int64_t const* flag_ptrs, int rank) {
-  __shared__ uint32_t s_released, s_epoch;
-  __shared__ bool s_leader;
-  if (threadIdx.x == 0) {
-    s_released = *reinterpret_cast<uint32_t volatile*>(state + 1);
-    uint32_t old;
-    asm volatile("atom.acq_rel.gpu.global.inc.u32 %0, [%1], %2;"
-                 : "=r"(old)
-                 : "l"(state), "r"(gridDim.x - 1)
-                 : "memory");
-    s_leader = old == gridDim.x - 1;
-    if (s_leader) {
-      s_epoch = state[2] + 1;
-      state[2] = s_epoch;
-      __threadfence_system();
-    }
-  }
-  __syncthreads();
-  if (s_leader) {
-    if (threadIdx.x < WORLD) {
-      int const peer = threadIdx.x;
-      uint32_t* flag = reinterpret_cast<uint32_t*>(flag_ptrs[peer]) + rank;
-      asm volatile("st.release.sys.global.u32 [%0], %1;" ::"l"(flag), "r"(s_epoch) : "memory");
-      uint32_t const* own = reinterpret_cast<uint32_t const*>(flag_ptrs[rank]) + peer;
-      uint32_t seen;
-      do {
-        asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(seen) : "l"(own) : "memory");
-      } while (static_cast<int32_t>(seen - s_epoch) < 0);
-    }
-    __syncthreads();
-    if (threadIdx.x == 0) asm volatile("red.release.gpu.global.add.u32 [%0], %1;" ::"l"(state + 1), "r"(1u) : "memory");
-  } else if (threadIdx.x == 0) {
-    uint32_t seen;
-    do {
-      asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(seen) : "l"(state + 1) : "memory");
-    } while (seen == s_released);
-  }
-  __syncthreads();
-}
-
-template <int H, int TOPK, int WORLD>
+template <int H, int TOPK, int WORLD, bool USE_PDL>
 __global__ void __launch_bounds__(threads(H)) combine_kernel(
     int64_t const* __restrict__ buffer_ptrs,
     int64_t const* __restrict__ flag_ptrs,
@@ -73,14 +30,13 @@ __global__ void __launch_bounds__(threads(H)) combine_kernel(
     int rank,
     int num_local) {
   __shared__ __nv_bfloat16 const* rows[TOPK];
-  asm volatile("griddepcontrol.wait;" ::: "memory");
-  asm volatile("griddepcontrol.launch_dependents;");
-  int const block = blockIdx.x;
+  device::PDLWaitPrimary<USE_PDL>();
+  device::PDLTriggerSecondary<USE_PDL>();
   int64_t const call = calls[0];
   int64_t const slot = (call & 1) * slot_size;
-  grid_barrier<WORLD>(state, flag_ptrs, rank);
+  inkling_ar::grid_system_barrier<WORLD>(state, reinterpret_cast<void* const*>(flag_ptrs), rank, 0, false);
   bool const active = threadIdx.x < H / 16;
-  for (int token = block; token < tokens; token += gridDim.x) {
+  for (int token = blockIdx.x; token < tokens; token += gridDim.x) {
     if (threadIdx.x < TOPK) {
       int dst = src2dst[token * TOPK + threadIdx.x];
       int owner = sorted_ids[dst] / num_local;
@@ -95,10 +51,7 @@ __global__ void __launch_bounds__(threads(H)) combine_kernel(
         raw[k][0] = src[0];
         raw[k][1] = src[1];
       }
-      float total[16];
-#pragma unroll
-      for (int i = 0; i < 16; ++i)
-        total[i] = 0.0f;
+      float total[16] = {};
 #pragma unroll
       for (int k = 0; k < TOPK; ++k) {
         __nv_bfloat16 const* h = reinterpret_cast<__nv_bfloat16 const*>(raw[k]);
@@ -123,7 +76,7 @@ __global__ void __launch_bounds__(threads(H)) combine_kernel(
   }
 }
 
-template <int H, int TOPK, int WORLD>
+template <int H, int TOPK, int WORLD, bool USE_PDL>
 void combine(
     tvm::ffi::TensorView buffer_ptrs,
     tvm::ffi::TensorView flag_ptrs,
@@ -140,8 +93,8 @@ void combine(
   int tokens = out.size(0);
   host::RuntimeCheck(out.size(1) == H && src2dst.size(0) == tokens * TOPK, "Unsupported routed exchange shape");
   host::LaunchKernel(blocks, threads(H), out.device())
-      .enable_pdl(true)(
-          combine_kernel<H, TOPK, WORLD>,
+      .enable_pdl(USE_PDL)(
+          combine_kernel<H, TOPK, WORLD, USE_PDL>,
           static_cast<int64_t const*>(buffer_ptrs.data_ptr()),
           static_cast<int64_t const*>(flag_ptrs.data_ptr()),
           static_cast<uint32_t*>(state.data_ptr()),

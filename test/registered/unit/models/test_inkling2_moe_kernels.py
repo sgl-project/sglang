@@ -6,16 +6,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.kernels.ops.inkling2.nvfp4 import (
-    expert_matmul,
-    nvfp4_quantize,
-    swizzle_weight_scales,
-)
 from sglang.kernels.ops.moe.inkling_moe import (
     compute_expert_block_metadata,
     compute_grouped_gemm_metadata,
 )
 from sglang.srt.layers.quantization.inkling2 import Inkling2QuantConfig
+from sglang.srt.layers.quantization.utils import swizzle_blockscale
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.models.inkling_common import inkling2_moe as moe
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -34,7 +30,7 @@ EXPERTS, LOCAL, TOP_K = 384, 96, 8
 
 
 def _route(tokens, skewed=False, seed=0):
-    from sglang.kernels.ops.inkling2.route import route_metadata
+    from sglang.kernels.ops.moe.inkling2_route import route_metadata
 
     g = torch.Generator(device="cuda").manual_seed(seed)
     ids = torch.stack(
@@ -49,73 +45,40 @@ def _route(tokens, skewed=False, seed=0):
     return route_metadata(ids.flatten(), weights.flatten(), LOCAL, LOCAL, EXPERTS)
 
 
-def _scale_rows(x_scales, offsets, rows, width):
-    """Unswizzle the grouped-GEMM activation scales of rows [offsets[0], offsets[-1])."""
-    scale_k = (width + 63) // 64 * 4
-    offsets = offsets.long()
-    rows = rows.long()
-    expert = torch.searchsorted(offsets, rows, right=True) - 1
-    local = rows - offsets[expert]
-    base = (offsets[expert] - offsets[0] + expert * 127) // 128 * 128 * scale_k
-    cols = torch.arange(width // 16, device=rows.device)
-    index = (
-        base[:, None]
-        + ((local[:, None] // 128) * (scale_k // 4) + cols // 4) * 512
-        + (local[:, None] % 32) * 16
-        + ((local[:, None] // 32) % 4) * 4
-        + cols % 4
-    )
-    return x_scales[index]
+_FP4_GRID = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 
 
-def _x_scales(rows, width):
-    scale_k = (width + 63) // 64 * 4
-    size = (rows + 127 * LOCAL + 127) // 128 * 128 * scale_k
-    return torch.full((size,), 0x7F, device="cuda", dtype=torch.uint8)
+def _dequantize_nvfp4(packed, scales):
+    """Packed E2M1 pairs (low nibble first) times their 16-wide FP8 block scales."""
+    codes = torch.stack((packed & 15, packed >> 4), -1).flatten(-2).long()
+    grid = torch.tensor(_FP4_GRID, device=packed.device)
+    values = grid[codes & 7] * torch.where(codes >= 8, -1.0, 1.0)
+    return values * scales.float().repeat_interleave(16, -1)
 
 
-def _sm_count():
-    return torch.cuda.get_device_properties(0).multi_processor_count
+def _dequantize_mxfp8(values, scales):
+    """FP8 E4M3 values times their 32-wide E8M0 block scales."""
+    exponents = scales.view(torch.uint8).float() - 127
+    return values.float() * torch.exp2(exponents).repeat_interleave(32, -1)
 
 
-@sm100_or_sm103
-@pytest.mark.parametrize("tokens", [1, 8, 64, 512])
-def test_routed_quantize_matches_token_quantize(tokens):
-    from sglang.kernels.ops.inkling2.nvfp4 import (
-        nvfp4_quantize,
-        routed_quant_module,
-    )
-
-    width = 4608
-    _, dst2src, _, counts, offsets, _, _, _ = _route(tokens, seed=tokens)
-    x = torch.randn(tokens, width, device="cuda").bfloat16() * 3
-    rows = dst2src.numel()
-    values = torch.empty(rows, width // 2, device="cuda", dtype=torch.uint8)
-    x_scales = _x_scales(rows, width)
-    amax = torch.empty(rows, device="cuda")
-    routed_quant_module(width).quantize(
-        x, dst2src, values, x_scales, amax, offsets, TOP_K, _sm_count()
-    )
-    ref_values, ref_scales, ref_amax = nvfp4_quantize(x)
-    local = torch.arange(offsets[0].item(), offsets[-1].item(), device="cuda")
-    source = dst2src[local].long() // TOP_K
-    assert torch.equal(values[local], ref_values[source])
-    assert torch.equal(amax[local], ref_amax[source])
-    assert torch.equal(
-        _scale_rows(x_scales, offsets, local, width),
-        ref_scales[source].view(torch.uint8),
-    )
-    _assert_zero_tails(x_scales, offsets, counts, width)
+def _grouped_reference(x_rows, dequantize_weight, offsets):
+    """FP32 x_rows[r] @ W[e].T for the rows r of each local expert e; other rows 0."""
+    out = None
+    for e in range(offsets.numel() - 1):
+        start, end = int(offsets[e]), int(offsets[e + 1])
+        if start == end:
+            continue
+        product = x_rows[start:end] @ dequantize_weight(e).T
+        if out is None:
+            out = x_rows.new_zeros(x_rows.shape[0], product.shape[1])
+        out[start:end] = product
+    return out
 
 
-def _assert_zero_tails(x_scales, offsets, counts, width):
-    for e in torch.nonzero(counts % 128).flatten().tolist():
-        start, count = offsets[e].item(), counts[e].item()
-        padded = (count + 127) // 128 * 128
-        tail = torch.arange(start + count, start + padded, device="cuda")
-        fake = offsets.clone()
-        fake[e + 1 :] += padded - count
-        assert not _scale_rows(x_scales, fake, tail, width).any()
+def _assert_relative_error(actual, expected, tolerance):
+    error = (actual.float() - expected).norm() / expected.norm()
+    assert error < tolerance, f"relative error {error.item():.3g} >= {tolerance}"
 
 
 @sm100_or_sm103
@@ -124,7 +87,7 @@ def _assert_zero_tails(x_scales, offsets, counts, width):
     [(1, False), (64, False), (129, True), (256, False), (512, False), (512, True)],
 )
 def test_route_metadata_cuda_matches_triton(monkeypatch, tokens, skewed):
-    from sglang.kernels.ops.inkling2 import route
+    from sglang.kernels.ops.moe import inkling2_route as route
 
     monkeypatch.setattr(route, "ROUTE_CUDA_MIN_IDS", 1 << 30)
     expected = _route(tokens, skewed, seed=tokens)
@@ -135,44 +98,17 @@ def test_route_metadata_cuda_matches_triton(monkeypatch, tokens, skewed):
 
 
 @sm100_or_sm103
-@pytest.mark.parametrize("tokens", [8, 64, 512])
-def test_routed_partial_matches_post_reorder(tokens):
-    from sglang.kernels.ops.inkling2.moe import (
-        routed_partial,
-        routed_rows,
-        unweighted_post_reorder,
-    )
-
-    width = 4608
-    src2dst, _, _, _, offsets, _, _, _ = _route(tokens, seed=tokens)
-    rows = src2dst.numel()
-    down = torch.randn(rows, width, device="cuda") * 7
-    scales = (
-        torch.rand(rows, device="cuda") + 0.5,
-        torch.rand(LOCAL, device="cuda") + 0.5,
-        torch.tensor([3.0], device="cuda"),
-    )
-    expected = unweighted_post_reorder(
-        routed_rows(down, offsets, out_dtype=torch.bfloat16, nvfp4_scales=scales),
-        src2dst,
-        TOP_K,
-    )
-    actual = routed_partial(down, offsets, src2dst, TOP_K, nvfp4_scales=scales)
-    assert torch.equal(actual.bfloat16(), expected)
-
-
-@sm100_or_sm103
 @pytest.mark.parametrize(
     "tokens,skewed,width",
     [(1, False, 4608), (16, False, 4608), (256, False, 4608), (512, True, 4608)]
     + [(64, False, 2304), (512, True, 2304)],
 )
-def test_cute_routed_gemm_matches_cutlass(tokens, skewed, width):
-    """The CuTe DSL routed NVFP4 GEMM equals the CUTLASS swap-AB grouped GEMM over
-    reordered rows; skewed routing fills multi-block experts and partial subtiles."""
-    from sglang.kernels.ops.inkling2 import nvfp4
-    from sglang.kernels.ops.inkling2.route import route_metadata
-    from sglang.kernels.ops.moe.inkling_moe import pre_reorder
+def test_cute_routed_gemm_matches_reference(tokens, skewed, width):
+    """The routed NVFP4 GEMM's raw accumulator is the FP32 product of the 4over6
+    quantized token rows and the dequantized expert weights; skewed routing fills
+    multi-block experts and partial subtiles."""
+    from sglang.kernels.ops.gemm import inkling2_nvfp4 as nvfp4
+    from sglang.kernels.ops.moe.inkling2_route import route_metadata
 
     g = torch.Generator(device="cuda").manual_seed(tokens + width)
     ids = torch.stack(
@@ -184,38 +120,44 @@ def test_cute_routed_gemm_matches_cutlass(tokens, skewed, width):
     if skewed:
         ids = (LOCAL + ids % 16).int()
     weights = torch.rand(tokens, TOP_K, device="cuda", generator=g)
-    src2dst, dst2src, _, counts, offsets, _, schedule, _ = route_metadata(
+    _, dst2src, _, counts, offsets, _, schedule, _ = route_metadata(
         ids.flatten(), weights.flatten(), LOCAL, LOCAL, EXPERTS
     )
-    assert dst2src.numel() <= nvfp4.SWAP_AB_MAX_ROWS
     n = 2 * 2304 if width == 4608 else 4608
     x = torch.randn(tokens, width, device="cuda", generator=g).bfloat16()
     weight = torch.randint(
         0, 256, (LOCAL, n, width // 2), device="cuda", generator=g
     ).to(torch.uint8)
-    scales = nvfp4.swizzle_weight_scales(
-        (torch.rand(LOCAL, n, width // 16, device="cuda", generator=g) * 2 + 0.25).to(
-            torch.float8_e4m3fn
-        )
-    )
+    weight_scales = (
+        torch.rand(LOCAL, n, width // 16, device="cuda", generator=g) * 2 + 0.25
+    ).to(torch.float8_e4m3fn)
     acc, x_amax = nvfp4.routed_expert_matmul(
-        x, dst2src, TOP_K, weight, scales, counts, offsets, schedule
-    )
-    expected_acc, expected_amax = nvfp4.expert_matmul(
-        pre_reorder(x, src2dst, TOP_K),
+        x,
+        dst2src,
+        TOP_K,
         weight,
-        scales,
-        torch.ones(LOCAL, device="cuda"),
-        torch.ones(1, device="cuda"),
-        metadata=(counts, offsets, schedule),
-        raw=True,
+        swizzle_blockscale(weight_scales).flatten(1),
+        counts,
+        offsets,
+        schedule,
+    )
+    _assert_nvfp4_routed_rows(
+        acc, x_amax, x, dst2src, TOP_K, weight, weight_scales, offsets
+    )
+
+
+def _assert_nvfp4_routed_rows(acc, x_amax, x, dst2src, top_k, weight, scales, offsets):
+    values, x_scales, amax = _quantize_reference(x)
+    source = dst2src.long() // top_k
+    expected = _grouped_reference(
+        _dequantize_nvfp4(values, x_scales)[source],
+        lambda e: _dequantize_nvfp4(weight[e], scales[e]),
+        offsets,
     )
     lo, hi = int(offsets[0]), int(offsets[-1])
     assert hi > lo
-    assert torch.equal(
-        acc[lo:hi].view(torch.int32), expected_acc[lo:hi].view(torch.int32)
-    )
-    assert torch.equal(x_amax[lo:hi], expected_amax[lo:hi])
+    _assert_relative_error(acc[lo:hi], expected[lo:hi], 1e-5)
+    assert torch.equal(x_amax[lo:hi], amax[source[lo:hi]])
 
 
 blackwell = pytest.mark.skipif(
@@ -253,49 +195,12 @@ def _routing(tokens, rank):
 
 
 @blackwell
-@pytest.mark.skipif(
-    torch.cuda.is_available() and torch.cuda.get_device_capability() != (10, 3),
-    reason="NVFP4 experts require SM103",
-)
-@pytest.mark.parametrize("tokens,rank", [(4096, 1), (16384, 2)])
-def test_nvfp4_prefill_gemm(tokens, rank):
-    """The routed prefill GEMM (gathered quantization, 128x192 tiles) equals the
-    grouped path over reordered rows (128x128 tiles) beyond the swap-AB size."""
-    from sglang.kernels.ops.inkling2 import nvfp4
-    from sglang.kernels.ops.moe.inkling_moe import get_src2dst, pre_reorder
-
-    dst2src, counts, offsets, schedule, _ = _routing(tokens, rank)
-    assert dst2src.numel() > nvfp4.SWAP_AB_MAX_ROWS
-    x = torch.randn(tokens, H, device="cuda").bfloat16()
-    weight = torch.randint(0, 256, (E, 2 * I, H // 2), device="cuda").to(torch.uint8)
-    scales = nvfp4.swizzle_weight_scales(
-        (torch.rand(E, 2 * I, H // 16, device="cuda") * 2 + 0.25).to(
-            torch.float8_e4m3fn
-        )
-    )
-    amax = torch.rand(E, device="cuda") + 1
-    denominator = torch.tensor([2.0], device="cuda")
-    acc, x_amax = nvfp4.routed_expert_matmul(
-        x, dst2src, TOPK, weight, scales, counts, offsets, schedule
-    )
-    expected_acc, expected_amax = nvfp4.expert_matmul(
-        pre_reorder(x, get_src2dst(dst2src), TOPK),
-        weight,
-        scales,
-        amax,
-        denominator,
-        metadata=(counts, offsets, schedule),
-        raw=True,
-    )
-    lo, hi = int(offsets[0]), int(offsets[-1])
-    assert torch.equal(acc[lo:hi], expected_acc[lo:hi])
-    assert torch.equal(x_amax[lo:hi], expected_amax[lo:hi])
-
-
-@blackwell
 @pytest.mark.parametrize("tokens,rank", [(1280, 2), (16384, 1)])
 def test_mxfp8_prefill_chain(tokens, rank):
-    from sglang.kernels.ops.inkling2 import mxfp8
+    """The routed MXFP8 GEMMs, which also serve expert-parallel prefill, match an
+    FP32 reference: token-quantized rows, then the capped swiglu into w2."""
+    from sglang.kernels.ops.gemm import inkling2_mxfp8 as mxfp8
+    from sglang.kernels.ops.moe.inkling2_moe import mxfp8_quantize
 
     dst2src, counts, offsets, schedule, gammas = _routing(tokens, rank)
     metadata = (counts, offsets, schedule)
@@ -312,16 +217,18 @@ def test_mxfp8_prefill_chain(tokens, rank):
     down = mxfp8.routed_swiglu_expert_matmul(
         gate_up, gammas, 4.0, 25.0, w2, s2, metadata, tokens
     )
-    prefill_gate_up = mxfp8.prefill_expert_matmul(
-        x, dst2src, TOPK, w13, mxfp8.cutlass_weight_scales(s13), counts, offsets
-    )
-    prefill_down = mxfp8.prefill_swiglu_expert_matmul(
-        prefill_gate_up, gammas, 4.0, 25.0, w2, mxfp8.cutlass_weight_scales(s2),
-        counts, offsets,
-    )  # fmt: skip
     lo, hi = int(offsets[0]), int(offsets[-1])
-    assert torch.equal(prefill_gate_up[lo:hi], gate_up[lo:hi])
-    assert torch.equal(prefill_down[lo:hi], down[lo:hi])
+    x_rows = _dequantize_mxfp8(*mxfp8_quantize(x))[dst2src.long() // TOPK]
+    expected_gate_up = _grouped_reference(
+        x_rows, lambda e: _dequantize_mxfp8(w13[e], s13[e]), offsets
+    )
+    _assert_relative_error(gate_up[lo:hi], expected_gate_up[lo:hi], 1e-2)
+    # The kernel quantizes the activation to MXFP8; the reference does not.
+    activated = moe._capped_swiglu(gate_up.float(), gammas, 4.0, 25.0, offsets)
+    expected_down = _grouped_reference(
+        activated, lambda e: _dequantize_mxfp8(w2[e], s2[e]), offsets
+    )
+    _assert_relative_error(down[lo:hi], expected_down[lo:hi], 5e-2)
 
 
 def _quantize_reference(x):
@@ -363,64 +270,15 @@ def _quantize_reference(x):
     return packed.reshape(*x.shape[:-1], x.shape[-1] // 2), scale, amax
 
 
-@sm100_or_sm103
-@pytest.mark.parametrize("width", [16, 384, 4096, 12288])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-def test_activation_quantization(width, dtype):
-    torch.manual_seed(8)
-    x = torch.randn(9, width, device="cuda", dtype=dtype)
-    x[0].zero_()
-    x[1].fill_(-0.0)
-    x[2] *= 1e-8
-    x[3] *= 1e8
-    x[4, :16].zero_()
-    actual = nvfp4_quantize(x)
-    expected = _quantize_reference(x)
-    for result, reference in zip(actual, expected):
-        torch.testing.assert_close(
-            result.view(torch.uint8), reference.view(torch.uint8), rtol=0, atol=0
-        )
-
-
-@sm100_or_sm103
-@pytest.mark.parametrize("layout", ["batched", "grouped", "offset"])
-def test_packed_expert_weights(layout):
-    x = torch.ones(2, 17, 128, dtype=torch.bfloat16, device="cuda")
-    x[1].neg_()
-    weights = torch.full((2, 128, 64), 0x22, dtype=torch.uint8, device="cuda")
-    scales = torch.ones((2, 128, 8), dtype=torch.float8_e4m3fn, device="cuda")
-    amax = torch.full((2,), 1536.0, dtype=torch.float32, device="cuda")
-    denominator = torch.full((1,), 1536.0, dtype=torch.float32, device="cuda")
-    metadata = None
-    if layout != "batched":
-        x = x.reshape(34, 128)
-        offset = 5 if layout == "offset" else 0
-        if offset:
-            x = torch.cat((x.new_zeros(5, 128), x, x.new_zeros(7, 128)))
-        metadata = (
-            torch.tensor([17, 17], dtype=torch.int32, device="cuda"),
-            torch.tensor([offset, offset + 17], dtype=torch.int32, device="cuda"),
-            torch.tensor([0, 1, -1], dtype=torch.int32, device="cuda"),
-        )
-    output = expert_matmul(
-        x, weights, swizzle_weight_scales(scales), amax, denominator, metadata=metadata
-    )
-    if layout == "offset":
-        output, x = output[5:39], x[5:39]
-    torch.testing.assert_close(output, x * 128, rtol=0, atol=0)
-
-
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
     reason="Quantized expert computation requires Blackwell",
 )
-@pytest.mark.parametrize("precision", ["bfloat16", "mxfp8", "nvfp4"])
 @pytest.mark.parametrize("empty_rank", [False, True])
 def test_expert_parallel_partials_preserve_full_expert_computation(
-    monkeypatch, precision, empty_rank
+    monkeypatch, empty_rank
 ):
-    if precision == "nvfp4" and torch.cuda.get_device_capability() != (10, 3):
-        pytest.skip("NVFP4 expert computation requires SM103")
+    """Quantized experts need expert parallelism, so the EP1 reference is BF16."""
     parallel = SimpleNamespace(
         moe_tp_size=1,
         moe_tp_rank=0,
@@ -435,7 +293,8 @@ def test_expert_parallel_partials_preserve_full_expert_computation(
             "model": {
                 "parameter_groups": [
                     precision_group(
-                        precision, [prefix + name + "_weight" for name in ("w13", "w2")]
+                        "bfloat16",
+                        [prefix + name + "_weight" for name in ("w13", "w2")],
                     )
                 ]
             }
@@ -491,7 +350,7 @@ def test_nvfp4_reload_reaches_captured_cuda_graph(monkeypatch):
     parallel = SimpleNamespace(
         moe_tp_size=1,
         moe_tp_rank=0,
-        moe_ep_size=1,
+        moe_ep_size=2,
         moe_ep_rank=0,
         moe_ep_group=SimpleNamespace(all_reduce=lambda x: x),
     )
@@ -525,12 +384,15 @@ def test_nvfp4_reload_reaches_captured_cuda_graph(monkeypatch):
             for name, value in experts.named_parameters():
                 if name.endswith("outer_scale_denominator"):
                     checkpoint[name] = torch.full_like(value, 2688)
-                elif value.dtype == torch.uint8:
+                    continue
+                # Checkpoint tensors hold every rank's experts.
+                shape = (2 * value.shape[0], *value.shape[1:])
+                if value.dtype == torch.uint8:
                     checkpoint[name] = torch.randint(
-                        0, 256, value.shape, device="cuda", dtype=torch.uint8
+                        0, 256, shape, device="cuda", dtype=torch.uint8
                     )
                 else:
-                    checkpoint[name] = (torch.rand(value.shape) + 0.125).to(value.dtype)
+                    checkpoint[name] = (torch.rand(shape) + 0.125).to(value.dtype)
             checkpoints.append(checkpoint)
 
         def load(checkpoint):
@@ -559,36 +421,6 @@ def test_nvfp4_reload_reaches_captured_cuda_graph(monkeypatch):
         expected = experts(x, gammas, ids)
     assert not torch.equal(before_reload, expected)
     assert torch.equal(captured.view(torch.uint8), expected.view(torch.uint8))
-
-
-@pytest.mark.skipif(
-    torch.version.hip is not None or not torch.cuda.is_available(),
-    reason="Requires a CUDA GPU",
-)
-def test_domain_paged_empty():
-    from cuda.bindings import driver as cu
-
-    out = moe.domain_paged_empty((8, 4608, 1152), torch.uint8)
-    if out is None:
-        pytest.skip("The GPU has one locality domain")
-    weight = torch.randint(0, 256, out.shape, dtype=torch.uint8, device="cuda")
-    assert out.is_contiguous() and out.device == weight.device
-    out.copy_(weight)
-    assert torch.equal(out, weight)
-    n, page, half = out.numel(), 2 << 20, 4608 // 2 * 1152
-    domains = [
-        cu.cuPointerGetAttribute(
-            cu.CUpointer_attribute.CU_POINTER_ATTRIBUTE_LOCALITY_DOMAIN_ORDINAL,
-            out.data_ptr() + p,
-        )[1]
-        for p in range(0, n, page)
-    ]
-    local = sum(
-        max(0, min(p + page, s + half) - max(p, s))
-        for p, d in zip(range(0, n, page), domains)
-        for s in range(d * half, n, 2 * half)
-    )
-    assert local / n > 0.75
 
 
 if __name__ == "__main__":

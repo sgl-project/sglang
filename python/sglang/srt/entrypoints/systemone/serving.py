@@ -47,8 +47,12 @@ from sglang.srt.entrypoints.systemone.protocol import (
 )
 from sglang.srt.layers.joint_schema_head import max_joint_prompt_tokens
 from sglang.srt.managers.io_struct import EmbeddingReqInput
+from sglang.srt.multimodal.media_io import (
+    CLIENT_MEDIA_EXCEPTIONS,
+    ImageData,
+    get_image_bytes,
+)
 from sglang.srt.runtime_context import get_schedule
-from sglang.srt.utils import CLIENT_MEDIA_EXCEPTIONS, ImageData, get_image_bytes
 
 # Beyond A to Z, every option gets a two-letter label, in this fixed order.
 _PAIR_LABELS = [a + b for a in string.ascii_uppercase for b in string.ascii_uppercase]

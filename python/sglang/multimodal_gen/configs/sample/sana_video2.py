@@ -12,6 +12,9 @@ class SanaVideo2SamplingParams(SanaVideoSamplingParams):
     width: int = 1280
     num_frames: int = 193
     fps: int = 24
+    # Video tokens are sharded inside the model, so the frame count needs no
+    # alignment to the GPU count.
+    adjust_frames: bool = False
     guidance_scale: float = 8.0
     motion_score: int = 10
     high_motion: bool = False

@@ -23,13 +23,6 @@ from cutlass.pipeline import (
     CooperativeGroup,
 )
 from cutlass.pipeline import NamedBarrier as nbar
-
-for _compat_name in ("ThrMma", "ThrCopy"):
-    if not hasattr(cute.core, _compat_name):
-        setattr(cute.core, _compat_name, getattr(cute, _compat_name))
-if not hasattr(cute, "make_fragment"):
-    cute.make_fragment = cute.make_rmem_tensor
-
 from cutlass.cute.typing import (
     BFloat16,
     Float8E4M3FN,
@@ -137,9 +130,7 @@ class FlashAttentionDecodeSm100Bias:
         grouped_head_tile: Rounded number of query heads per KV head in a CTA.
         prediction_tile: Rounded query-token tile size.
         sequence_tile: Logical KV-token tile size.
-        reduction_mode: Direct, deterministic workspace, or atomic reduction.
-        rel_bias_layout: ``compact`` for (B, Sq, Hq, R), or ``sheared`` for
-            Prefill ShearingBias output (B, round_up(Sq, 128), Hq, R + 256).
+        reduction_mode: Direct (single split) or deterministic workspace reduction.
         qk_blockscaled: Store Q/K as FP8 plus UE8M0 and use block-scaled GEMM1.
         qk_sf_vec_size: Q/K scale vector width; currently 32.
         v_dequant: Static V-storage gate. When false, V must be BF16/FP16 and
@@ -161,10 +152,8 @@ class FlashAttentionDecodeSm100Bias:
         reduction_mode: Literal[  # split-K reduction algorithm
             "direct",  # Single split, normalized output written directly
             "kernel",  # Deterministic kernel reduction with partial result workspace
-            "atomic",  # Cluster reduction with atomic adds, no workspace
         ] = "kernel",
         *,
-        rel_bias_layout: Literal["compact", "sheared"] = "compact",
         bias_smem_extent=None,  # Static compact-bias slab R staged in smem (None = gmem reads)
         qk_blockscaled=False,
         qk_sf_vec_size=32,
@@ -182,10 +171,6 @@ class FlashAttentionDecodeSm100Bias:
         self.sequence_tile = sequence_tile
         self.do_direct_red = reduction_mode == "direct"
         self.do_kernel_red = reduction_mode == "kernel"
-        self.do_atomic_red = reduction_mode == "atomic"
-        self.do_cluster_red = self.do_direct_red or self.do_atomic_red
-        self.rel_bias_layout = rel_bias_layout
-        self.bias_is_sheared = rel_bias_layout == "sheared"
         self.bias_smem_extent = bias_smem_extent
         self.bias_smem = bias_smem_extent is not None
         self.qk_blockscaled = qk_blockscaled
@@ -203,9 +188,8 @@ class FlashAttentionDecodeSm100Bias:
         assert headdim > 0 and headdim % 64 == 0
         assert grouped_head_tile * prediction_tile in (1, 2, 4, 8, 16, 32)
         assert sequence_tile > 0 and sequence_tile % 128 == 0
-        assert sum((self.do_direct_red, self.do_kernel_red, self.do_atomic_red)) == 1
-        assert rel_bias_layout in ("compact", "sheared")
-        assert bias_smem_extent is None or (rel_bias_layout == "compact" and bias_smem_extent > 0)
+        assert reduction_mode in ("direct", "kernel")
+        assert bias_smem_extent is None or bias_smem_extent > 0
         assert not qk_blockscaled or qk_sf_vec_size == 32
         assert not v_dequant or v_sf_vec_size == 32
         assert not v_dequant or v_mma_dtype in (BFloat16, Float16)
@@ -241,9 +225,7 @@ class FlashAttentionDecodeSm100Bias:
             kv_splits: Number of sequence splits in the launch grid.
             qo_shape_bshd: Logical Q/O shape (B, Sq, Hq, D).
             kv_shape_bshd: Logical dense K shape or physical paged-K shape.
-            bias_shape_bshr: Optional compact shape (B, Sq, Hq, R), or
-                Prefill-sheared shape (B, round_up(Sq, 128), Hq, R + 256).
-                ``None`` selects the static no-relative-bias specialization.
+            bias_shape_bshr: Compact bias shape (B, Sq, Hq, R).
             qk_dtype: Q/K storage dtype.
             v_dtype: V storage dtype.
             o_dtype: Output storage dtype.
@@ -372,51 +354,23 @@ class FlashAttentionDecodeSm100Bias:
         if not self.is_paged_kv and b_k != b_q:
             raise ValueError(f"batches_k({b_k}) and batches_q({b_q}) mismatch")
 
-        if bias_shape_bshr is None:
-            rel_extent = None
-        elif self.bias_is_sheared:
-            b_bias, s_bias, h_bias, bias_storage_extent = bias_shape_bshr
-            expected_q = math.ceil(s_q / 128) * 128
-            rel_extent = bias_storage_extent - 256
-            expected_prefix = (b_q, expected_q, h_q)
-            if (b_bias, s_bias, h_bias) != expected_prefix:
-                raise ValueError(
-                    "sheared bias shape must be "
-                    "(batch, round_up(prediction, 128), heads_q, rel_extent + 256); "
-                    f"got {bias_shape_bshr} for Q shape {qo_shape_bshd}"
-                )
-            grouped_heads = h_q // h_k
-            if grouped_heads <= 0 or 128 % grouped_heads != 0:
-                raise ValueError("sheared Pack-GQA bias requires heads_q/heads_k to divide 128")
-            if rel_extent <= 0 or rel_extent % 128 != 0:
-                raise ValueError("sheared bias requires positive 128-aligned rel_extent")
-        else:
-            b_bias, s_bias, h_bias, bias_storage_extent = bias_shape_bshr
-            rel_extent = bias_storage_extent
-            if (b_bias, s_bias, h_bias) != (b_q, s_q, h_q):
-                raise ValueError(
-                    "compact bias shape must be (batch, prediction, heads_q, relative_extent); "
-                    f"got {bias_shape_bshr} for Q shape {qo_shape_bshd}"
-                )
-            if rel_extent <= 0:
-                raise ValueError("relative bias extent must be positive")
-            if self.bias_smem and rel_extent != self.bias_smem_extent:
-                raise ValueError(
-                    f"bias_smem_extent({self.bias_smem_extent}) must equal the "
-                    f"compact bias extent({rel_extent})"
-                )
+        b_bias, s_bias, h_bias, bias_storage_extent = bias_shape_bshr
+        rel_extent = bias_storage_extent
+        if (b_bias, s_bias, h_bias) != (b_q, s_q, h_q):
+            raise ValueError(
+                "compact bias shape must be (batch, prediction, heads_q, relative_extent); "
+                f"got {bias_shape_bshr} for Q shape {qo_shape_bshd}"
+            )
+        if rel_extent <= 0:
+            raise ValueError("relative bias extent must be positive")
+        if self.bias_smem and rel_extent != self.bias_smem_extent:
+            raise ValueError(
+                f"bias_smem_extent({self.bias_smem_extent}) must equal the "
+                f"compact bias extent({rel_extent})"
+            )
 
         if self.do_direct_red and kv_splits != 1:
             raise ValueError(f"direct reduction requires kv_splits=1, got {kv_splits}")
-
-        if self.do_atomic_red:
-            if kv_splits not in (1, 2, 4, 8, 16):
-                raise ValueError(f"atomic reduction requires kv_splits po2 <= 16, got {kv_splits}")
-
-            if o_dtype not in (Float32, BFloat16, Float16):
-                raise TypeError(
-                    f"atomic reduction requires (Float32, BFloat16, Float16) o_dtype, got {o_dtype}"
-                )
 
     # Pack grouped heads with predicted tokens (s_q)
     @staticmethod
@@ -432,42 +386,6 @@ class FlashAttentionDecodeSm100Bias:
         gqa_stride = (stride_b, (stride_h, stride_s), stride_h * h_g, stride_d)
         gqa_layout = cute.make_layout(gqa_shape, stride=gqa_stride)
         return cute.make_tensor(t_bshd.iterator, gqa_layout)
-
-    @staticmethod
-    def packed_gqa_view(t_thd: cute.Tensor, h_k: int, s_first: bool):
-        total, h_q, d = t_thd.shape
-        stride_t, stride_h, stride_d = t_thd.stride
-        h_g = h_q // h_k
-        if s_first:
-            shape = ((h_g, total), d, h_k)
-            stride = ((stride_h, stride_t), stride_d, stride_h * h_g)
-        else:
-            shape = (d, (h_g, total), h_k)
-            stride = (stride_d, (stride_h, stride_t), stride_h * h_g)
-        return cute.make_tensor(t_thd.iterator, cute.make_layout(shape, stride=stride))
-
-    @staticmethod
-    def packed_kv_view(t_thd: cute.Tensor, s_first: bool):
-        if s_first:
-            modes = (0, 2, 1)
-        else:
-            modes = (2, 0, 1)
-        layout = cute.select(t_thd.layout, modes)
-        return cute.make_tensor(t_thd.iterator, layout)
-
-    @staticmethod
-    def packed_ragged_o_view(t_thd: cute.Tensor, h_k: int):
-        ragged = copy_utils.create_ragged_tensor_for_tma(t_thd, ragged_dim=0, ptr_shift=True)
-        big, h_q, d, extra = ragged.shape
-        stride_big, stride_h, stride_d, stride_extra = ragged.stride
-        h_g = h_q // h_k
-        shape = (d, (h_g, big), (h_k, extra))
-        stride = (
-            stride_d,
-            (stride_h, stride_big),
-            (stride_h * h_g, stride_extra),
-        )
-        return cute.make_tensor(ragged.iterator, cute.make_layout(shape, stride=stride))
 
     # Reorder and group modes for GEMM
     @staticmethod
@@ -527,7 +445,7 @@ class FlashAttentionDecodeSm100Bias:
             kv_splits: Number of KV sequence splits.
             q_bshd, k_bshd, v_bshd: Dense BF16 Q/K/V tensors.
             o_bshd: BF16 output tensor.
-            bias_bshr: Compact or statically selected Prefill-sheared BF16 bias.
+            bias_bshr: Compact BF16 bias.
             o_partial_bshd: FP32 partial outputs by split.
             m_partial_bsh, l_partial_bsh: FP32 split max/sum workspaces.
             scale_s: Softmax scale.
@@ -559,9 +477,6 @@ class FlashAttentionDecodeSm100Bias:
             None,
             None,
             None,
-            None,
-            None,
-            None,
             stream,
         )
 
@@ -581,7 +496,7 @@ class FlashAttentionDecodeSm100Bias:
         Args:
             q_bshd, k_bshd, v_bshd: Dense BF16 Q/K/V tensors.
             o_bshd: BF16 output tensor written by the main kernel.
-            bias_bshr: Compact or statically selected Prefill-sheared BF16 bias.
+            bias_bshr: Compact BF16 bias.
             scale_s: Softmax scale.
             stream: CUDA stream for the launch.
 
@@ -611,76 +526,6 @@ class FlashAttentionDecodeSm100Bias:
             None,
             None,
             None,
-            None,
-            None,
-            None,
-            stream,
-        )
-
-    @cute.jit
-    def paged_bf16_no_bias(
-        self,
-        kv_splits: Int32,
-        mSeqUsedK: cute.Tensor,
-        mPageTableOffsets: cute.Tensor,
-        mPageTable: cute.Tensor,
-        k_bshd: cute.Tensor,
-        v_bshd: cute.Tensor,
-        q_bshd: cute.Tensor,
-        o_bshd: cute.Tensor,
-        o_partial_bshd: cute.Tensor,
-        m_partial_bsh: cute.Tensor,
-        l_partial_bsh: cute.Tensor,
-        scale_s: Float32,
-        stream: cuda.CUstream,
-    ):
-        """Launch the paged BF16 deterministic no-bias specialization.
-
-        This narrow ABI avoids per-call adaptation of unrelated MXFP8, bias,
-        dense, and packed-varlen operands. The device kernels are shared with
-        the general entry point.
-
-        Args:
-            kv_splits: Number of KV sequence splits.
-            mSeqUsedK: Per-batch logical KV lengths.
-            mPageTableOffsets: Per-batch offsets into the flattened page table.
-            mPageTable: Logical-to-physical page indices.
-            k_bshd, v_bshd, q_bshd: BF16 paged K/V pools and fixed Q.
-            o_bshd: BF16 output tensor.
-            o_partial_bshd: FP32 partial outputs by split.
-            m_partial_bsh, l_partial_bsh: FP32 split max/sum workspaces.
-            scale_s: Softmax scale.
-            stream: CUDA stream for both launches.
-
-        Returns:
-            None. The main and deterministic reduction kernels write o_bshd.
-        """
-        assert self.is_paged_kv and self.do_kernel_red
-        assert not self.qk_blockscaled and not self.v_dequant
-        assert q_bshd.dtype == k_bshd.dtype == v_bshd.dtype == BFloat16
-        assert o_bshd.dtype == BFloat16
-        return self.__call__(
-            kv_splits,
-            q_bshd,
-            k_bshd,
-            v_bshd,
-            None,
-            None,
-            None,
-            o_bshd,
-            None,
-            o_partial_bshd,
-            m_partial_bsh,
-            l_partial_bsh,
-            scale_s,
-            None,
-            None,
-            None,
-            mSeqUsedK,
-            None,
-            None,
-            mPageTable,
-            mPageTableOffsets,
             stream,
         )
 
@@ -712,7 +557,7 @@ class FlashAttentionDecodeSm100Bias:
             mPageTable: Logical-to-physical page indices.
             k_bshd, v_bshd, q_bshd: BF16 paged K/V pools and fixed Q.
             o_bshd: BF16 output tensor.
-            bias_bshr: Compact or statically selected Prefill-sheared BF16 bias.
+            bias_bshr: Compact BF16 bias.
             o_partial_bshd: FP32 partial outputs by split.
             m_partial_bsh, l_partial_bsh: FP32 split max/sum workspaces.
             scale_s: Softmax scale.
@@ -739,12 +584,7 @@ class FlashAttentionDecodeSm100Bias:
             m_partial_bsh,
             l_partial_bsh,
             scale_s,
-            None,
-            None,
-            None,
             mSeqUsedK,
-            None,
-            None,
             mPageTable,
             mPageTableOffsets,
             lse_bsh,
@@ -761,39 +601,23 @@ class FlashAttentionDecodeSm100Bias:
         q_sf: Optional[cute.Tensor],
         k_sf: Optional[cute.Tensor],
         v_sf: Optional[cute.Tensor],
-        o_bshd: cute.Tensor,  # must be zero initialized for atomic reduction
-        bias_bshr: Optional[cute.Tensor],  # None, compact, or Prefill-sheared bias
+        o_bshd: cute.Tensor,
+        bias_bshr: cute.Tensor,  # compact (B, Sq, Hq, R)
         # Workspace tensors for kernel reduction
         o_partial_bshd: Optional[cute.Tensor],  # partial O per kv split
         m_partial_bsh: Optional[cute.Tensor],  # partial colmax_s per kv split
         l_partial_bsh: Optional[cute.Tensor],  # partial colsum_p per kv split
         scale_s: Float32,
-        mCuSeqlensQ: Optional[cute.Tensor] = None,
-        mCuSeqlensK: Optional[cute.Tensor] = None,
-        mSeqUsedQ: Optional[cute.Tensor] = None,
         mSeqUsedK: Optional[cute.Tensor] = None,
-        max_seqlen_q: Int32 | int | None = None,
-        max_seqlen_k: Int32 | int | None = None,
         mPageTable: Optional[cute.Tensor] = None,
         mPageTableOffsets: Optional[cute.Tensor] = None,
         lse_bsh: Optional[cute.Tensor] = None,
         stream: cuda.CUstream = None,
     ):
-        """Launch fixed-length, native packed-varlen, or paged-KV Decode.
+        """Launch fixed-length dense or paged-KV Decode.
 
-        ``bias_bshr=None`` selects static no-relative-bias codegen.
-        ``rel_bias_layout="compact"`` consumes (B, Sq, Hq, R).
-        ``rel_bias_layout="sheared"`` consumes the corresponding Prefill
-        ShearingBias allocation (B, round_up(Sq, 128), Hq, R + 256). The layout
-        selection is static and is never inferred from the tensor shape.
-
-        Packed varlen uses rank-3 Q/K/V/O and rank-3 bias tensors. Both
-        ``mCuSeqlensQ`` and ``mCuSeqlensK`` are CUDA int32 prefix sums, and the
-        corresponding maximum sequence lengths size the launch grid. The
-        initial packed path requires ``reduction_mode="direct"``, one KV split,
-        and leaves ``mSeqUsedQ/K`` unset. MXFP8 callers provide one padded SF
-        plane per ``(batch, KV head)``. ``stream`` remains the final argument,
-        matching the Prefill calling convention.
+        ``bias_bshr`` is the compact relative bias (B, Sq, Hq, R). MXFP8
+        callers provide one padded SF plane per ``(batch, KV head)``.
 
         Paged KV uses rank-4 physical K/V pools with shape
         ``(physical_pages, page_size, heads_k, head_dim)``. ``mPageTable`` is a
@@ -824,22 +648,15 @@ class FlashAttentionDecodeSm100Bias:
         acc_dtype = Float32
         is_paged_kv = self.is_paged_kv
         parallel_v_dequant = self.v_dequant
-        is_varlen_q = (mCuSeqlensQ is not None or mSeqUsedQ is not None) and not is_paged_kv
-        is_varlen_k = (mCuSeqlensK is not None or mSeqUsedK is not None) and not is_paged_kv
         assert k_bshd.dtype == qk_dtype
-        if cutlass.const_expr(bias_bshr is not None):
-            assert bias_bshr.dtype == v_mma_dtype
+        assert bias_bshr.dtype == v_mma_dtype
         if cutlass.const_expr(is_paged_kv):
             assert mPageTable is not None
             assert cute.rank(mPageTable) == 2 or mPageTableOffsets is not None
             assert mSeqUsedK is not None
-            assert mCuSeqlensQ is None and mCuSeqlensK is None
-            assert mSeqUsedQ is None
-            assert max_seqlen_q is None and max_seqlen_k is None
             assert cute.rank(q_bshd) == cute.rank(o_bshd) == 4
             assert cute.rank(k_bshd) == cute.rank(v_bshd) == 4
-            if cutlass.const_expr(bias_bshr is not None):
-                assert cute.rank(bias_bshr) == 4
+            assert cute.rank(bias_bshr) == 4
             if cutlass.const_expr(cute.rank(mPageTable) == 1):
                 assert cute.rank(mPageTableOffsets) == 1
                 assert mPageTableOffsets.dtype == Int32
@@ -854,24 +671,11 @@ class FlashAttentionDecodeSm100Bias:
                 assert qk_dtype in (BFloat16, Float16)
             if cutlass.const_expr(self.v_dequant):
                 assert v_sf is not None and cute.rank(v_sf) == 4
-        if cutlass.const_expr(is_varlen_q or is_varlen_k):
-            assert self.do_direct_red, "varlen decode initially requires direct reduction"
-            assert mCuSeqlensQ is not None and mCuSeqlensK is not None
-            assert mSeqUsedQ is None and mSeqUsedK is None
-            assert max_seqlen_q is not None and max_seqlen_k is not None
-            assert cute.rank(q_bshd) == cute.rank(k_bshd) == 3
-            assert cute.rank(v_bshd) == cute.rank(o_bshd) == 3
-            if cutlass.const_expr(bias_bshr is not None):
-                assert cute.rank(bias_bshr) == 3
-            if cutlass.const_expr(self.v_dequant):
-                assert v_sf is not None and cute.rank(v_sf) == 6
         if cutlass.const_expr(self.qk_blockscaled):
             assert q_sf is not None and k_sf is not None
             assert q_sf.dtype == k_sf.dtype == Float8E8M0FNU
             assert qk_dtype in (Float8E4M3FN, Float8E5M2)
             assert not self.v_dequant or v_dtype in (Float8E4M3FN, Float8E5M2)
-            if cutlass.const_expr(is_varlen_q):
-                assert cute.rank(q_sf) == cute.rank(k_sf) == 6
         else:
             assert q_sf is None and k_sf is None
             assert self.v_dequant or qk_dtype == v_dtype
@@ -1066,7 +870,7 @@ class FlashAttentionDecodeSm100Bias:
         # staged compact bias slab (bias dtype is asserted == v_mma_dtype)
         if cutlass.const_expr(self.bias_smem):
             smem_alloc_bits += self.bias_smem_extent * blk_tile_n * self.v_mma_dtype.width
-        if cutlass.const_expr(self.do_cluster_red):
+        if cutlass.const_expr(self.do_direct_red):
             smem_alloc_bits += max_reduction_iters * blk_tile_n * acc_dtype.width * 2
             smem_alloc_bits += max_reduction_iters * mbarrier_bits * 2
         # Q, S, P, O
@@ -1089,55 +893,23 @@ class FlashAttentionDecodeSm100Bias:
         kv_stages -= 1 if (kv_stages * pipe_stage_bits * kv_pipeline_count > alignment_bits) else 0
         assert kv_stages >= 2, f"smem overcommitted: kv_stages({kv_stages}) < 2"
 
-        print(f"\ts stages: {s_stages}\tkv stages: {kv_stages}")
-        print(
-            f"\tDEBUG2 types: k={type(k_stage_bits)} ksf={type(ksf_stage_bits)} "
-            f"vq={type(vq_stage_bits)} vsf={type(vsf_stage_bits)} v={type(v_stage_bits)} "
-            f"scr={type(ksf_scratch_stage_bits)} alloc={type(smem_alloc_bits)} "
-            f"rem={type(remaining_bits)} bias_ext={type(self.bias_smem_extent)} "
-            f"blkn={type(blk_tile_n)} vals: alloc={smem_alloc_bits} kvbits={kv_stage_bits}"
-        )
-
         ##############################
         # TMA creation
         ##############################
-        o_bshd_ = o_bshd if self.do_cluster_red else o_partial_bshd
-        if cutlass.const_expr(is_varlen_q):
-            h_k = k_bshd.shape[1]
-            mQ_nkl = self.packed_gqa_view(q_bshd, h_k, True)
-            mK_mkl = self.packed_kv_view(k_bshd, True)
-            mV_mkl = self.packed_kv_view(v_bshd, False)
-            mO_mnl = self.packed_ragged_o_view(o_bshd_, h_k)
-        else:
-            h_k = k_bshd.shape[2]
-            # ((h_g, s_q), d, (h_k, b))
-            mQ_nkl = self.gemm_view(self.gqa_pack(q_bshd, h_k), True)
-            mK_mkl = self.gemm_view(k_bshd, True)
-            mV_mkl = self.gemm_view(v_bshd, False)
-            # (d, (h_g, s_q), (h_k, b_partial))
-            mO_mnl = self.gemm_view(self.gqa_pack(o_bshd_, h_k), False)
+        o_bshd_ = o_bshd if self.do_direct_red else o_partial_bshd
+        h_k = k_bshd.shape[2]
+        # ((h_g, s_q), d, (h_k, b))
+        mQ_nkl = self.gemm_view(self.gqa_pack(q_bshd, h_k), True)
+        mK_mkl = self.gemm_view(k_bshd, True)
+        mV_mkl = self.gemm_view(v_bshd, False)
+        # (d, (h_g, s_q), (h_k, b_partial))
+        mO_mnl = self.gemm_view(self.gqa_pack(o_bshd_, h_k), False)
         if cutlass.const_expr(self.qk_blockscaled):
-            if cutlass.const_expr(is_varlen_q):
-                # A block-scaled TMA tile cannot start in the middle of its
-                # 128-row scale-factor atom.  Keep one padded SF plane per
-                # (batch, KV head), while Q/K/V themselves remain packed.
-                # Recover each plane's capacity from blocked SF storage.
-                qsf_m_capacity = q_sf.shape[1] * 128
-                sf_l = (h_k, mCuSeqlensQ.shape[0] - 1)
-                qsf_shape = (
-                    (
-                        self.grouped_head_tile,
-                        qsf_m_capacity // self.grouped_head_tile,
-                    ),
-                    mQ_nkl.shape[1],
-                    sf_l,
-                )
-            else:
-                qsf_shape = (
-                    (self.grouped_head_tile, mQ_nkl.shape[0][1]),
-                    mQ_nkl.shape[1],
-                    mQ_nkl.shape[2],
-                )
+            qsf_shape = (
+                (self.grouped_head_tile, mQ_nkl.shape[0][1]),
+                mQ_nkl.shape[1],
+                mQ_nkl.shape[2],
+            )
             mQSF_nkl = cute.make_tensor(
                 q_sf.iterator,
                 blockscaled_utils.tile_atom_to_shape_SF(qsf_shape, self.qk_sf_vec_size),
@@ -1145,15 +917,7 @@ class FlashAttentionDecodeSm100Bias:
             if cutlass.const_expr(is_paged_kv):
                 mKSF_mkl = self.paged_ksf_view(k_sf)
             else:
-                ksf_shape = (
-                    (
-                        k_sf.shape[1] * 128,
-                        mK_mkl.shape[1],
-                        sf_l,
-                    )
-                    if cutlass.const_expr(is_varlen_q)
-                    else mK_mkl.shape
-                )
+                ksf_shape = mK_mkl.shape
                 mKSF_mkl = cute.make_tensor(
                     k_sf.iterator,
                     blockscaled_utils.tile_atom_to_shape_SF(ksf_shape, self.qk_sf_vec_size),
@@ -1167,14 +931,7 @@ class FlashAttentionDecodeSm100Bias:
                 # Compact physical-page SFV: (pages, groups, heads, D).
                 mVSF_mkl = self.gemm_view(v_sf, False)
             else:
-                if cutlass.const_expr(is_varlen_q):
-                    vsf_shape = (
-                        self.headdim,
-                        max_seqlen_k,
-                        (h_k, mCuSeqlensK.shape[0] - 1),
-                    )
-                else:
-                    vsf_shape = mV_mkl.shape
+                vsf_shape = mV_mkl.shape
                 mVSF_mkl = cute.make_tensor(
                     v_sf.iterator,
                     blockscaled_utils.tile_atom_to_shape_SF(vsf_shape, self.v_sf_vec_size),
@@ -1293,11 +1050,7 @@ class FlashAttentionDecodeSm100Bias:
         smem_layout_o = cute.select(smem_layout_o, (0, 1, 2))
 
         tma_load_op = cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp()
-        tma_store_op = (
-            cute.nvgpu.cpasync.CopyReduceBulkTensorTileS2GOp()
-            if self.do_atomic_red
-            else cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp()
-        )
+        tma_store_op = cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp()
 
         # Construct multimode gmem tiler
         tma_tile_n = (blk_tile_h, mma_tile_n // blk_tile_h)
@@ -1421,18 +1174,9 @@ class FlashAttentionDecodeSm100Bias:
         # device code sees the same operand kinds.
         scale_log2 = Float32(log2_e)
 
-        if cutlass.const_expr(is_varlen_q):
-            tiles_hp = (
-                cute.ceil_div(mQ_nkl.shape[0][0], blk_tile_h),
-                cute.ceil_div(max_seqlen_q, blk_tile_p),
-            )
-            n_tiles = cute.size(tiles_hp)
-            l_tiles = h_k * (mCuSeqlensQ.shape[0] - 1)
-        else:
-            n_tiles = cute.size(cute.ceil_div(mQ_nkl.shape[0], (blk_tile_h, blk_tile_p)))
-            l_tiles = cute.size(mQ_nkl.shape[2])
+        n_tiles = cute.size(cute.ceil_div(mQ_nkl.shape[0], (blk_tile_h, blk_tile_p)))
+        l_tiles = cute.size(mQ_nkl.shape[2])
         grid = (kv_splits, n_tiles, l_tiles)
-        cluster_x = kv_splits if self.do_atomic_red else 1
 
         self.decode(
             # MMA
@@ -1482,11 +1226,7 @@ class FlashAttentionDecodeSm100Bias:
             tma_atom_o,
             tma_tensor_o,
             bias_bshr,
-            mCuSeqlensQ,
-            mCuSeqlensK,
-            mSeqUsedQ,
             mSeqUsedK,
-            max_seqlen_q,
             mPageTable,
             mPageTableOffsets,
             # Rest
@@ -1497,7 +1237,7 @@ class FlashAttentionDecodeSm100Bias:
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
-            cluster=[cluster_x, 1, 1],
+            cluster=[1, 1, 1],
             stream=stream,
             min_blocks_per_mp=1,
             use_pdl=self.use_pdl,
@@ -1514,27 +1254,6 @@ class FlashAttentionDecodeSm100Bias:
                 self.use_pdl,
                 lse_bsh,
             )
-
-    @cute.jit
-    def sheared_bias_column(
-        self,
-        query_idx: Int32,
-        key_idx: Int32,
-        query_head_in_group: Int32,
-        grouped_heads: int,
-        prediction: Int32,
-        seqlen: Int32,
-        bias_storage_extent: int,
-    ) -> Int32:
-        """Map one logical score to Prefill ShearingBias's physical column."""
-        packed_m = query_idx * grouped_heads + query_head_in_group
-        attn_m_block = packed_m // 128
-        m_idx_max = cute.ceil_div((attn_m_block + 1) * 128, grouped_heads)
-        attn_n_block_max = cutlass.min(
-            cute.ceil_div(seqlen, 128),
-            cute.ceil_div(m_idx_max + seqlen - prediction, 128),
-        )
-        return key_idx + bias_storage_extent - attn_n_block_max * 128
 
     @cute.jit
     def dequant_v_stage_dense_contiguous(
@@ -1847,13 +1566,8 @@ class FlashAttentionDecodeSm100Bias:
         smem_layout_o: cute.ComposedLayout,
         tma_atom_o: cute.CopyAtom,
         mO: cute.Tensor,
-        # Optional bias, compact or Prefill-sheared as selected by rel_bias_layout
-        mBias: Optional[cute.Tensor],
-        mCuSeqlensQ: Optional[cute.Tensor],
-        mCuSeqlensK: Optional[cute.Tensor],
-        mSeqUsedQ: Optional[cute.Tensor],
+        mBias: cute.Tensor,  # compact (B, Sq, Hq, R)
         mSeqUsedK: Optional[cute.Tensor],
-        max_seqlen_q: Int32 | int | None,
         mPageTable: Optional[cute.Tensor],
         mPageTableOffsets: Optional[cute.Tensor],
         # Rest
@@ -1901,17 +1615,11 @@ class FlashAttentionDecodeSm100Bias:
 
         # Static control flow
         do_kernel_red = self.do_kernel_red
-        do_atomic_red = self.do_atomic_red
-        do_cluster_red = self.do_cluster_red
+        do_direct_red = self.do_direct_red
         window_size_left = self.window_size_left
         is_local = window_size_left is not None
         is_paged_kv = self.is_paged_kv
         parallel_v_dequant = self.v_dequant
-        is_varlen_q = mCuSeqlensQ is not None or mSeqUsedQ is not None
-        is_varlen_k = mCuSeqlensK is not None or mSeqUsedK is not None
-        if cutlass.const_expr(is_paged_kv):
-            is_varlen_q = False
-            is_varlen_k = False
 
         ##############################
         # Warp specialization
@@ -1959,42 +1667,15 @@ class FlashAttentionDecodeSm100Bias:
         # Unpack multimodes
         grouped_heads = mQ.shape[0][0]
         heads_k = mK.shape[2]
-        heads_q = bias_storage_extent = bias_extent = 0
-        if cutlass.const_expr(is_varlen_q):
-            batches = mCuSeqlensQ.shape[0] - 1
-            tiles_hb = (heads_k, batches)
-            tiles_hp = (
-                cute.ceil_div(grouped_heads, blk_tile_h),
-                cute.ceil_div(max_seqlen_q, blk_tile_p),
-            )
-        else:
-            _, prediction = mQ.shape[0]
-            heads_k, batches = tiles_hb = mQ.shape[2]
-            tiles_hp = cute.ceil_div(mQ.shape[0], blk_tile_hp)
-        if cutlass.const_expr(mBias is not None):
-            if cutlass.const_expr(is_varlen_q):
-                _, heads_q, bias_storage_extent = mBias.shape
-            else:
-                _, _, heads_q, bias_storage_extent = mBias.shape
-            bias_extent = (
-                bias_storage_extent - 256
-                if cutlass.const_expr(self.bias_is_sheared)
-                else bias_storage_extent
-            )
+        _, prediction = mQ.shape[0]
+        heads_k, batches = tiles_hb = mQ.shape[2]
+        tiles_hp = cute.ceil_div(mQ.shape[0], blk_tile_hp)
+        _, _, heads_q, bias_extent = mBias.shape
         coord_hb = cute.idx2crd(coord_hb, tiles_hb)
         coord_hp = cute.idx2crd(coord_hp, tiles_hp)
         coord_hg, coord_p = coord_hp
         coord_hk, coord_b = coord_hb
-        if cutlass.const_expr(is_varlen_q):
-            offset_q = mCuSeqlensQ[coord_b]
-            offset_k = mCuSeqlensK[coord_b]
-            prediction = mCuSeqlensQ[coord_b + 1] - offset_q
-            seqlen = mCuSeqlensK[coord_b + 1] - offset_k
-            table_offset = Int32(0)
-            page_count = Int32(0)
-        elif cutlass.const_expr(is_paged_kv):
-            offset_q = Int32(0)
-            offset_k = Int32(0)
+        if cutlass.const_expr(is_paged_kv):
             seqlen = mSeqUsedK[coord_b]
             if cutlass.const_expr(cute.rank(mPageTable) == 2):
                 table_offset = coord_b
@@ -2002,8 +1683,6 @@ class FlashAttentionDecodeSm100Bias:
                 table_offset = mPageTableOffsets[coord_b]
             page_count = cute.ceil_div(seqlen, self.page_size)
         else:
-            offset_q = Int32(0)
-            offset_k = Int32(0)
             seqlen = mK.shape[0]
             table_offset = Int32(0)
             page_count = Int32(0)
@@ -2097,7 +1776,7 @@ class FlashAttentionDecodeSm100Bias:
         correction_group = warpgroup_cooperative
 
         # Initialize cluster colmax + colsum mbar (even if this split exits early)
-        if cutlass.const_expr(do_cluster_red):
+        if cutlass.const_expr(do_direct_red):
             reduction_mbars_ptr = smem.allocate_array(Int64, max_reduction_iters * 2)
             if warp_idx == init_warp:
                 if lane_idx < max_reduction_iters * 2:
@@ -2298,7 +1977,7 @@ class FlashAttentionDecodeSm100Bias:
 
         # Staged compact bias slab, r fastest so lanes (keys) read coalesced
         sBias = None
-        if cutlass.const_expr(self.bias_smem and mBias is not None):
+        if cutlass.const_expr(self.bias_smem):
             sBias_layout = cute.make_layout((self.bias_smem_extent, blk_tile_h, blk_tile_p))
             sBias = smem.allocate_tensor(mBias.element_type, sBias_layout, svector_align)
 
@@ -2317,7 +1996,7 @@ class FlashAttentionDecodeSm100Bias:
         tCtL = thrblk_mma_kq.make_fragment_C(tCtL_shape)
 
         # R - cluster reduction buffers for colmax + colsum
-        if cutlass.const_expr(do_cluster_red):
+        if cutlass.const_expr(do_direct_red):
             sR_layout = cute.make_layout((blk_tile_n, max_reduction_iters, 2))
             sR = smem.allocate_tensor(acc_dtype, sR_layout, svector_align)
 
@@ -2325,7 +2004,7 @@ class FlashAttentionDecodeSm100Bias:
         # Sync
         ##############################
         # Ensure visibility of cluster mbarriers
-        if cutlass.const_expr(do_cluster_red):
+        if cutlass.const_expr(do_direct_red):
             cute.arch.cluster_wait()
 
         # Ensure visibility of local mbarrier inits and tmem alloc
@@ -2490,26 +2169,15 @@ class FlashAttentionDecodeSm100Bias:
                 pages_k = pv_mma_tile_k // v_tma_tokens
                 v_chunks_per_page = self.page_size // v_tma_tokens
             else:
-                # Apply block tiler and slice for contiguous or packed KV.
-                if cutlass.const_expr(is_varlen_k):
-                    mK_cur = cute.domain_offset((offset_k, 0, 0), mK)
-                    mV_cur = cute.domain_offset((0, offset_k, 0), mV)
-                    coord_kv = coord_hk
-                    if cutlass.const_expr(self.v_dequant):
-                        mVSF_cur = mVSF
-                        coord_vsf = (
-                            0,
-                            coord_hk + heads_k * coord_b,
-                        )
-                else:
-                    mK_cur, mV_cur = mK, mV
-                    coord_kv = coord_hb
-                    if cutlass.const_expr(self.v_dequant):
-                        mVSF_cur = mVSF
-                        coord_vsf = (
-                            0,
-                            coord_hk + heads_k * coord_b,
-                        )
+                # Apply block tiler and slice for contiguous KV.
+                mK_cur, mV_cur = mK, mV
+                coord_kv = coord_hb
+                if cutlass.const_expr(self.v_dequant):
+                    mVSF_cur = mVSF
+                    coord_vsf = (
+                        0,
+                        coord_hk + heads_k * coord_b,
+                    )
                 gK = cute.local_tile(
                     mK_cur,
                     tiler=(blk_tile_s, blk_tile_d),
@@ -2726,12 +2394,8 @@ class FlashAttentionDecodeSm100Bias:
                 cute.arch.setmaxregister_decrease(mma_tma_regs)
 
             # Slice and partition Q
-            if cutlass.const_expr(is_varlen_q):
-                mQ_cur = cute.domain_offset(((0, offset_q), 0, 0), mQ)
-                coord_q = coord_hk
-            else:
-                mQ_cur = mQ
-                coord_q = coord_hb
+            mQ_cur = mQ
+            coord_q = coord_hb
             # (TILE_H, TILE_D)
             gQ = cute.local_tile(
                 mQ_cur,
@@ -2793,14 +2457,9 @@ class FlashAttentionDecodeSm100Bias:
 
             # Slice and partition O
             # (TILE_D, TILE_H)
-            if cutlass.const_expr(is_varlen_q):
-                ragged_big = mO.shape[1][1]
-                mO_cur = cute.domain_offset((0, (0, ragged_big - prediction), (0, 0)), mO)
-                coord_o_l = (coord_hk, offset_q + prediction)
-            else:
-                mO_cur = mO
-                coord_b_partial = coord_b if do_cluster_red else kv_split_idx * batches + coord_b
-                coord_o_l = (coord_hk, coord_b_partial)
+            mO_cur = mO
+            coord_b_partial = coord_b if do_direct_red else kv_split_idx * batches + coord_b
+            coord_o_l = (coord_hk, coord_b_partial)
             gO = cute.local_tile(
                 mO_cur,
                 tiler=(blk_tile_d, blk_tile_hp),
@@ -3029,7 +2688,7 @@ class FlashAttentionDecodeSm100Bias:
             # unroll of independent loads so they overlap; source rows/heads
             # are clamped to stay in bounds and clamped values are never
             # consumed (the per-score guards below still apply).
-            if cutlass.const_expr(self.bias_smem and mBias is not None):
+            if cutlass.const_expr(self.bias_smem):
                 fill_tile_max = tile_begin_s + kv_split_idx + (iters_s - 1) * kv_splits
                 fill_window_begin = seqlen - prediction - bias_extent
                 if iters_s > 0 and (fill_tile_max + 1) * blk_tile_s > fill_window_begin:
@@ -3051,14 +2710,9 @@ class FlashAttentionDecodeSm100Bias:
                                 coord_hk * grouped_heads + coord_hg * blk_tile_h + fill_h,
                                 heads_q - 1,
                             )
-                            if cutlass.const_expr(is_varlen_q):
-                                sBias[fill_r, fill_h, fill_p] = mBias[
-                                    offset_q + fill_q, fill_head, fill_r
-                                ]
-                            else:
-                                sBias[fill_r, fill_h, fill_p] = mBias[
-                                    coord_b, fill_q, fill_head, fill_r
-                                ]
+                            sBias[fill_r, fill_h, fill_p] = mBias[
+                                coord_b, fill_q, fill_head, fill_r
+                            ]
                     cute.arch.fence_view_async_shared()
                     bias_fill_nbar.arrive_and_wait()
 
@@ -3197,55 +2851,37 @@ class FlashAttentionDecodeSm100Bias:
                                 tail_score_p = scores_scaled_rmem[None, p, sm]
                                 tail_mask = -Float32.inf if tail_is_oob else Float32(0)
                                 tail_score_p.store(tail_score_p.load() + tail_mask)
-                if cutlass.const_expr(mBias is not None):
-                    # Almost all tiles in a long decode sequence precede the
-                    # compact bias window. Skip the per-score coordinate/load
-                    # path for those tiles with a warpgroup-uniform branch.
-                    bias_window_begin = seqlen - prediction - bias_extent
-                    tile_end = (score_tile_s + 1) * blk_tile_s
-                    if tile_end > bias_window_begin:
-                        for sm in cutlass.range_constexpr(tiles_sm):
-                            key_idx = score_tile_s * blk_tile_s + sm * mma_tile_m + warpgroup_tidx
-                            for p in cutlass.range_constexpr(blk_tile_p):
-                                query_idx = coord_p * blk_tile_p + p
-                                rel_idx = query_idx + (seqlen - prediction) - key_idx
-                                for h in cutlass.range_constexpr(blk_tile_h):
-                                    query_head = (
-                                        coord_hk * grouped_heads + coord_hg * blk_tile_h + h
-                                    )
-                                    score_scaled = scores_scaled_rmem[h, p, sm]
-                                    if query_idx < prediction:
-                                        if query_head < heads_q:
-                                            if rel_idx >= 0:
-                                                if rel_idx < bias_extent:
-                                                    bias_idx = rel_idx
-                                                    if cutlass.const_expr(self.bias_is_sheared):
-                                                        bias_idx = self.sheared_bias_column(
-                                                            query_idx,
-                                                            key_idx,
-                                                            coord_hg * blk_tile_h + h,
-                                                            grouped_heads,
-                                                            prediction,
-                                                            seqlen,
-                                                            bias_storage_extent,
-                                                        )
-                                                    if cutlass.const_expr(self.bias_smem):
-                                                        bias_value = sBias[bias_idx, h, p]
-                                                    elif cutlass.const_expr(is_varlen_q):
-                                                        bias_value = mBias[
-                                                            offset_q + query_idx,
-                                                            query_head,
-                                                            bias_idx,
-                                                        ]
-                                                    else:
-                                                        bias_value = mBias[
-                                                            coord_b,
-                                                            query_idx,
-                                                            query_head,
-                                                            bias_idx,
-                                                        ]
-                                                    score_scaled += bias_value.to(acc_dtype)
-                                    scores_scaled_rmem[h, p, sm] = score_scaled
+                # Almost all tiles in a long decode sequence precede the
+                # compact bias window. Skip the per-score coordinate/load
+                # path for those tiles with a warpgroup-uniform branch.
+                bias_window_begin = seqlen - prediction - bias_extent
+                tile_end = (score_tile_s + 1) * blk_tile_s
+                if tile_end > bias_window_begin:
+                    for sm in cutlass.range_constexpr(tiles_sm):
+                        key_idx = score_tile_s * blk_tile_s + sm * mma_tile_m + warpgroup_tidx
+                        for p in cutlass.range_constexpr(blk_tile_p):
+                            query_idx = coord_p * blk_tile_p + p
+                            rel_idx = query_idx + (seqlen - prediction) - key_idx
+                            for h in cutlass.range_constexpr(blk_tile_h):
+                                query_head = (
+                                    coord_hk * grouped_heads + coord_hg * blk_tile_h + h
+                                )
+                                score_scaled = scores_scaled_rmem[h, p, sm]
+                                if query_idx < prediction:
+                                    if query_head < heads_q:
+                                        if rel_idx >= 0:
+                                            if rel_idx < bias_extent:
+                                                if cutlass.const_expr(self.bias_smem):
+                                                    bias_value = sBias[rel_idx, h, p]
+                                                else:
+                                                    bias_value = mBias[
+                                                        coord_b,
+                                                        query_idx,
+                                                        query_head,
+                                                        rel_idx,
+                                                    ]
+                                                score_scaled += bias_value.to(acc_dtype)
+                                scores_scaled_rmem[h, p, sm] = score_scaled
                 scores_scaled = scores_scaled_rmem.load().reshape((blk_tile_n, tiles_sm))
 
                 # Reduce colmax in thread RF
@@ -3545,7 +3181,7 @@ class FlashAttentionDecodeSm100Bias:
             output_final += correction * output_prev
 
             # Apply final correction
-            if cutlass.const_expr(do_cluster_red):
+            if cutlass.const_expr(do_direct_red):
                 # final correction stored in sM
                 sM_final_nbar.arrive_and_wait()
                 correction = sM.load()
@@ -4009,7 +3645,6 @@ def paged_rel_bias_decode(
             prediction_tile=prediction_tile,
             sequence_tile=sequence_tile,
             reduction_mode="kernel",
-            rel_bias_layout="compact",
             bias_smem_extent=bias_smem_extent,
             window_size_left=window_size_left,
             page_size=page_size,

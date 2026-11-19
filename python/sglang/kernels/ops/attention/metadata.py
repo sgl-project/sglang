@@ -6,6 +6,71 @@ import triton.language as tl
 
 
 @triton.jit
+def _prepare_tree_spec_metadata_kernel(
+    req_to_token,
+    req_indices,
+    seq_lens,
+    cu_seqlens,
+    custom_mask,
+    page_table,
+    cache_seqlens,
+    req_stride,
+    table_stride,
+    num_actual_tokens,
+    WIDTH: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    batch, token = row // WIDTH, row % WIDTH
+    cols = tl.arange(0, BLOCK)
+    seq_len = tl.load(seq_lens + batch).to(tl.int64)
+    seq_start = tl.load(cu_seqlens + batch).to(tl.int64)
+    req = tl.load(req_indices + batch)
+    mask_offset = (
+        (seq_start + batch * WIDTH) * WIDTH + token * (seq_len + WIDTH) + seq_len + cols
+    )
+    # Graph padding has no corresponding rows in the input mask.
+    mask_offset = tl.where(row < num_actual_tokens, mask_offset, 0)
+    valid = tl.load(custom_mask + mask_offset, cols < WIDTH, 0).to(tl.int32)
+    rank = tl.cumsum(valid)
+    count = tl.sum(valid, 0)
+    # Stable partition: visible slots first, preserving order in both groups.
+    destination = tl.where(valid != 0, rank - 1, count + cols - rank)
+    slots = tl.load(req_to_token + req * req_stride + seq_len + cols, cols < WIDTH, 0)
+    tl.store(page_table + row * table_stride + destination, slots, cols < WIDTH)
+    tl.store(cache_seqlens + row, count)
+
+
+def prepare_tree_spec_metadata(
+    req_to_token: torch.Tensor,
+    req_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    custom_mask: torch.Tensor,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    num_actual_tokens: int,
+):
+    """Build per-query suffix slots and lengths from a full verify mask."""
+    width = page_table.shape[1]
+    _prepare_tree_spec_metadata_kernel[(page_table.shape[0],)](
+        req_to_token,
+        req_indices,
+        seq_lens,
+        cu_seqlens,
+        custom_mask,
+        page_table,
+        cache_seqlens,
+        req_to_token.stride(0),
+        page_table.stride(0),
+        num_actual_tokens,
+        WIDTH=width,
+        BLOCK=triton.next_power_of_2(width),
+        num_warps=4,
+    )
+
+
+@triton.jit
 def get_num_kv_splits_triton(
     num_kv_splits_ptr,
     seq_lens_ptr,
@@ -69,12 +134,19 @@ def get_num_kv_splits_by_length_triton(
     max_splits,
     MIN_TOKENS: tl.constexpr,
     MAX_NUM_SEQ: tl.constexpr,
+    INDPTR: tl.constexpr = False,
 ):
     """Each request takes cdiv(seq_len, MIN_TOKENS) splits, at least 1 and at most
-    max_splits (the caller's bound for this batch)."""
+    max_splits (the caller's bound for this batch). With INDPTR, seq_lens_ptr is a
+    kv_indptr and the lengths are its differences."""
     offs_seq = tl.arange(0, MAX_NUM_SEQ)
     mask_seq = offs_seq < num_seq
-    seq_lens = tl.load(seq_lens_ptr + offs_seq, mask=mask_seq, other=1)
+    if INDPTR:
+        seq_lens = tl.load(
+            seq_lens_ptr + offs_seq + 1, mask=mask_seq, other=1
+        ) - tl.load(seq_lens_ptr + offs_seq, mask=mask_seq, other=0)
+    else:
+        seq_lens = tl.load(seq_lens_ptr + offs_seq, mask=mask_seq, other=1)
     num_kv_splits = tl.minimum(tl.maximum(tl.cdiv(seq_lens, MIN_TOKENS), 1), max_splits)
     offs_token = offs_seq * num_group
     mask_token = offs_token < num_seq * num_group

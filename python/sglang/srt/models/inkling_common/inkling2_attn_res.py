@@ -21,7 +21,9 @@ def block_attn_res(
     if isinstance(partial_block, tuple):
         partial_block, partial_addend = partial_block
     if get_platform().is_hip and partial_block is not None:
-        from sglang.kernels.ops.inkling2.norm_hip import attn_res as attn_res_hip
+        from sglang.kernels.ops.layernorm.inkling2_norm_hip import (
+            attn_res as attn_res_hip,
+        )
 
         sources = [*blocks, partial_block]
         return attn_res_hip(
@@ -43,7 +45,7 @@ def block_attn_res(
         if scaled_queries is not None
         else queries.float() * (hidden_size**-0.5)
     )
-    from sglang.kernels.ops.inkling2.attn_res import attn_res
+    from sglang.kernels.ops.attention.inkling2_attn_res import attn_res
 
     return attn_res(
         [x.contiguous() for x in sources],
@@ -165,7 +167,9 @@ class Inkling2AttnResState:
             self.blocks.append(self.partial)
             self.partial = attn_output + mlp_output
         else:
-            from sglang.kernels.ops.inkling2.residual import residual_add
+            from sglang.kernels.ops.elementwise.inkling2_residual_add import (
+                residual_add,
+            )
 
             self.partial = residual_add(self.partial, attn_output, mlp_output)
 

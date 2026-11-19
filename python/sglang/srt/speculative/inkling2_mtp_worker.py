@@ -6,7 +6,7 @@ from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.runtime_context import get_disagg, get_platform
 from sglang.srt.speculative.dspark_components.dspark_verify import TargetVerifyExecutor
 from sglang.srt.speculative.dspark_components.dspark_worker_v2 import DSparkWorkerV2
-from sglang.srt.utils.common import async_h2d
+from sglang.srt.utils.device import async_h2d
 
 
 class Inkling2MTPVerifyExecutor(TargetVerifyExecutor):
@@ -63,7 +63,9 @@ class Inkling2MTPWorker(DSparkWorkerV2):
     def init_attention_backends(self):
         super().init_attention_backends()
         draft_runner = self.draft_model_runner
-        backend, name = ("triton", "Triton") if get_platform().is_hip else ("fa4", "FA4")
+        backend, name = (
+            ("triton", "Triton") if get_platform().is_hip else ("fa4", "FA4")
+        )
         if (
             draft_runner.prefill_attention_backend_str != backend
             or draft_runner.decode_attention_backend_str != backend

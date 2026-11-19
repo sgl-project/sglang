@@ -4,26 +4,27 @@ from typing import NamedTuple
 import torch
 from torch import nn
 
-from sglang.kernels.ops.inkling2.attention import (
+from sglang.kernels.ops.attention.inkling2_attn import (
     combine_gate_sink,
     compute_log_scaling_tau,
     gate_sink,
     pad_head_groups,
 )
-from sglang.kernels.ops.inkling2.comm import (
+from sglang.kernels.ops.attention.inkling2_attn_prologue import attention_prologue
+from sglang.kernels.ops.communication.inkling2_comm import (
     all_reduce,
     oneshot_all_reduce,
     oneshot_all_reduce_input,
 )
-from sglang.kernels.ops.inkling2.linear import (
+from sglang.kernels.ops.gemm.inkling2_linear import (
     linear,
     linear_k_group_partials_pair,
     uses_k_groups,
 )
-from sglang.kernels.ops.inkling2.prologue import attention_prologue
 from sglang.srt.environ import envs
 from sglang.srt.layers.linear import MergedColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.utils.common import add_prefix, set_weight_attrs
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.models.inkling_common.attn import (
     RelLogitsProj,
@@ -33,7 +34,7 @@ from sglang.srt.models.inkling_common.attn import (
 from sglang.srt.models.inkling_common.inkling2_sconv import ShortConvolution
 from sglang.srt.models.inkling_common.sconv import SconvType
 from sglang.srt.runtime_context import get_model, get_parallel, get_platform
-from sglang.srt.utils import add_prefix, get_device_core_count, set_weight_attrs
+from sglang.srt.utils import get_device_core_count
 
 PADDED_DECODE_MIN_TOKENS = 8
 # linear() sums split-K partials up to this many rows (its tiles < 256 branch).
@@ -101,12 +102,14 @@ class QKL2Clip(nn.Module):
 
     def forward(self, x, *, output_scale=None):
         if self.hip:
-            from sglang.kernels.ops.inkling2.norm_hip import l2_clip
+            from sglang.kernels.ops.layernorm.inkling2_norm_hip import l2_clip
 
             return l2_clip(
                 x, self.threshold, self.eps, scale=self.scale, output_scale=output_scale
             ).view(x.shape)
-        from sglang.kernels.ops.inkling2.qk_l2_clip import qk_l2_clip_fwd_cutedsl
+        from sglang.kernels.ops.layernorm.inkling2_qk_l2_clip import (
+            qk_l2_clip_fwd_cutedsl,
+        )
 
         output = qk_l2_clip_fwd_cutedsl(
             x, self.threshold, self.eps, scale=self.scale, output_scale=output_scale
@@ -511,9 +514,7 @@ class Inkling2Attention(nn.Module):
                 q_descale=quantized_q.scale.view(torch.float8_e8m0fnu),
             )
         else:
-            attention_kwargs = dict(
-                rel_bias=rel_bias, rel_bias_scale_after_add=True, **bias_kwargs
-            )
+            attention_kwargs = dict(rel_bias=rel_bias, **bias_kwargs)
         if compact:
             output = self.attn(
                 q,

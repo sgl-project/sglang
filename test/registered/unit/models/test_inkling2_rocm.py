@@ -101,7 +101,7 @@ def _paged_problem(prefix, ext, window, page=128, seed=0):
 @pytest.mark.parametrize("window", [None, 1023])
 @pytest.mark.parametrize("kernel", ["rel_extend", "rel_verify", "rel_verify_int64"])
 def test_relative_bias_attention(kernel, window):
-    from sglang.kernels.ops.inkling2 import attention_hip
+    from sglang.kernels.ops.attention import inkling2_attn_hip as attention_hip
 
     if kernel == "rel_extend":
         prefix, ext, fn = (
@@ -148,7 +148,7 @@ def test_rel_extend_padded_request_slots(prefix, ext, pad, window):
     empty request slots and the bucket's token count as max_extend_len leave the real
     rows bitwise unchanged while the block height stays (a single request and its
     bucket never straddle the 128-token switch)."""
-    from sglang.kernels.ops.inkling2 import attention_hip
+    from sglang.kernels.ops.attention import inkling2_attn_hip as attention_hip
 
     slots = 16
     q, k_ext, v_ext, kc, vc, bias, qo, kvp, kvi, _, _ = _paged_problem(
@@ -179,8 +179,8 @@ def test_decode_gate_sink_epilogue():
     """Decode with gate_sink applies the gate and sink in its reduction bitwise as
     gate_sink() does after the LSE-returning launch."""
     from sglang.kernels.ops.attention.decode_attention import decode_attention_fwd
+    from sglang.kernels.ops.attention.inkling2_attn import gate_sink
     from sglang.kernels.ops.attention.score_mod import relative_bias_score_mod
-    from sglang.kernels.ops.inkling2.attention import gate_sink
 
     torch.manual_seed(3)
     seq_lens, splits = (5, 700, 3000), 8
@@ -315,7 +315,7 @@ def test_block_attention_residual(tokens, n, nq, split):
     one-CTA kernel either way)."""
     from functools import partial
 
-    from sglang.kernels.ops.inkling2 import norm_hip
+    from sglang.kernels.ops.layernorm import inkling2_norm_hip as norm_hip
 
     attn_res = partial(norm_hip.attn_res, split=bool(split), split_chunk=split or None)
 
@@ -359,7 +359,7 @@ def test_split_attention_residual_graph_replay_is_deterministic():
     """The split kernel's row counters persist across launches and graph replays. A
     graph mixing rows, sources, chunk widths and one or two barriers per launch
     (without and with the fused norm) replays bitwise equal to its eager run."""
-    from sglang.kernels.ops.inkling2 import norm_hip
+    from sglang.kernels.ops.layernorm import inkling2_norm_hip as norm_hip
 
     torch.manual_seed(0)
     calls = []
@@ -410,7 +410,7 @@ def test_conv_epilogue_takes_fp32_expert_sums(seqs, mode, with_partial):
     """ROCm decode and small verify pass the FP32 expert sums to the conv epilogue
     as Hopper does (identity src2dst, top_k 1, rounded to BF16 on load): equal to
     rounding them to BF16 values first and convolving those FP32 rows."""
-    from sglang.kernels.ops.inkling2.sconv import routed_sconv_epilogue
+    from sglang.kernels.ops.mamba.inkling2_sconv import routed_sconv_epilogue
 
     torch.manual_seed(seqs)
     hidden, width, rows_per_seq = 4608, 4, 1 if mode == "decode" else 8
@@ -459,7 +459,7 @@ def test_conv_epilogue_takes_fp32_expert_sums(seqs, mode, with_partial):
 
 def test_rms_norm_and_l2_clip():
     """norm_hip's RMSNorm with a pre-weight and its scaled L2 clip match float64."""
-    from sglang.kernels.ops.inkling2 import norm_hip
+    from sglang.kernels.ops.layernorm import inkling2_norm_hip as norm_hip
 
     torch.manual_seed(0)
     x = torch.randn(37, 4608, device="cuda", dtype=torch.bfloat16) * 3
@@ -510,7 +510,8 @@ def _sum_splits(partials, dtype):
 def test_expert_gemm(fmt, tokens):
     """NVFP4: products of e2m1, e4m3 scales and NVFP4-fake-quantized activations are
     exact in FP16, so the FP32 accumulator equals float64 up to summation order."""
-    from sglang.kernels.ops.inkling2 import experts_hip, experts_sm90
+    from sglang.kernels.ops.moe import inkling2_experts_hip as experts_hip
+    from sglang.kernels.ops.moe import inkling2_experts_sm90 as experts_sm90
 
     torch.manual_seed(tokens)
     nexp, n, k, top_k, start = 16, 512, 1024, 8, 8
@@ -579,8 +580,9 @@ def test_expert_gemm_software_nvfp4_tile(monkeypatch, warps, gather):
     import triton
     import triton.language as tl
 
-    from sglang.kernels.ops.inkling2 import experts_hip, experts_sm90
-    from sglang.kernels.ops.inkling2.experts_hip import GemmConfig
+    from sglang.kernels.ops.moe import inkling2_experts_hip as experts_hip
+    from sglang.kernels.ops.moe import inkling2_experts_sm90 as experts_sm90
+    from sglang.kernels.ops.moe.inkling2_experts_hip import GemmConfig
 
     fn = experts_hip._grouped_dequant_gemm.fn
     software = dict(fn.__globals__, NATIVE_CVT=tl.constexpr(False))
@@ -622,7 +624,9 @@ def test_expert_gemm_software_nvfp4_tile(monkeypatch, warps, gather):
 def test_consumers_sum_split_k_partials(fmt, tokens):
     """The SwiGLU and combine kernels sum expert_gemm's split-K partials in split order:
     bitwise equal to summing them first, with several splits and with one."""
-    from sglang.kernels.ops.inkling2 import experts_hip, experts_sm90, marlin_sm90
+    from sglang.kernels.ops.gemm import inkling2_marlin_sm90 as marlin_sm90
+    from sglang.kernels.ops.moe import inkling2_experts_hip as experts_hip
+    from sglang.kernels.ops.moe import inkling2_experts_sm90 as experts_sm90
 
     torch.manual_seed(tokens)
     nexp, n2, k, top_k, start, caps = 16, 512, 1024, 8, 8, (7.0, 7.0)
@@ -705,7 +709,7 @@ def test_prologue_stores_kv_pool(m, local):
     """The ROCm decode prologue with kv_pool writes each row's K and V into the KV
     cache pool at its loc: bitwise what the attention backend's save stores (the
     same rows, padding rows included), with its other outputs unchanged."""
-    from sglang.kernels.ops.inkling2.prologue import attention_prologue
+    from sglang.kernels.ops.attention.inkling2_attn_prologue import attention_prologue
 
     torch.manual_seed(m + local)
     H, KVH, D, DR, W = 6, 1, 128, 16, 4
@@ -770,8 +774,8 @@ def test_fused_route_matches_separate_kernels(rank, with_bias, local_heavy, toke
     """route_topk_metadata (up to four tokens, ROCm decode) is bitwise route_topk
     followed by route_metadata: weights, ids and every routing metadata tensor
     (local_heavy routes all eight ids to this rank's experts, filling the schedule)."""
-    from sglang.kernels.ops.inkling2.route import route_metadata, route_topk
-    from sglang.kernels.ops.inkling2.route_hip import route_topk_metadata
+    from sglang.kernels.ops.moe.inkling2_route import route_metadata, route_topk
+    from sglang.kernels.ops.moe.inkling2_route_hip import route_topk_metadata
 
     experts, num_local, block_m = 384, 48, 16
     one = torch.ones((), device="cuda")
@@ -807,8 +811,8 @@ def test_fused_route_matches_separate_kernels(rank, with_bias, local_heavy, toke
 def test_fused_route_quantizes_activations(quant, out_dtype, width, tokens):
     """route_topk_metadata's extra programs fake-quantize the token's activations
     bitwise as fake_quantize / fake_quantize_mxfp8, with the routing unchanged."""
-    from sglang.kernels.ops.inkling2 import experts_sm90
-    from sglang.kernels.ops.inkling2.route_hip import route_topk_metadata
+    from sglang.kernels.ops.moe import inkling2_experts_sm90 as experts_sm90
+    from sglang.kernels.ops.moe.inkling2_route_hip import route_topk_metadata
 
     one = torch.ones((), device="cuda")
     for seed in range(10):
@@ -839,7 +843,7 @@ def test_fused_route_quantizes_activations(quant, out_dtype, width, tokens):
 def test_router_matches_exact_sigmoid_selection():
     """route_topk (the gate's top-k at every row count) selects the experts of torch's
     sigmoid plus bias, with renorm_topk_logits_scaled's weights for them."""
-    from sglang.kernels.ops.inkling2.route import route_topk
+    from sglang.kernels.ops.moe.inkling2_route import route_topk
     from sglang.srt.models.inkling_common.moe import renorm_topk_logits_scaled
 
     torch.manual_seed(0)
@@ -859,7 +863,7 @@ def test_dynamic_conv_projection_partials():
     """On ROCm the global layers' dynamic conv projections (4 outputs per rank) take
     the paired split-K partials path, which uses_k_groups otherwise leaves to
     hipBLASLt; the summed partials match a float64 reference."""
-    from sglang.kernels.ops.inkling2.linear import (
+    from sglang.kernels.ops.gemm.inkling2_linear import (
         linear_k_group_partials_pair,
         uses_k_groups,
     )
@@ -975,7 +979,7 @@ def test_rel_verify_attention_without_bias_matches_attention(causal):
     """The DSpark draft's short blocks on ROCm: rel_verify_attention with a
     zero-extent bias is plain attention over the cached prefix plus the block's own
     keys (bidirectional, or causal), against a float64 reference."""
-    from sglang.kernels.ops.inkling2.attention_hip import rel_verify_attention
+    from sglang.kernels.ops.attention.inkling2_attn_hip import rel_verify_attention
 
     torch.manual_seed(causal)
     H, HKV, D, ext = 6, 1, 128, 8
@@ -1025,7 +1029,7 @@ def test_verify_prologue_stores_kv_pool(seqs, local):
     """The MTP verify prologue (verify_windows, 4 rows per sequence) with kv_pool
     writes each row's K and V into the pool at its loc: bitwise the backend's save,
     with the prologue's other outputs and windows unchanged."""
-    from sglang.kernels.ops.inkling2.prologue import attention_prologue
+    from sglang.kernels.ops.attention.inkling2_attn_prologue import attention_prologue
 
     torch.manual_seed(seqs + 10 * local)
     H, KVH, D, DR, W, per = 6, 1, 128, 16, 4, 4
@@ -1086,8 +1090,8 @@ def test_rel_verify_gate_sink_in_combine(batch, ext):
     """rel_verify_attention(gate_sink=...) writes, from its own reduction, bitwise
     what gate_sink(o, gate, lse, sinks) gives after it (the ROCm MTP verify path),
     with o and lse unchanged."""
-    from sglang.kernels.ops.inkling2.attention import gate_sink
-    from sglang.kernels.ops.inkling2.attention_hip import rel_verify_attention
+    from sglang.kernels.ops.attention.inkling2_attn import gate_sink
+    from sglang.kernels.ops.attention.inkling2_attn_hip import rel_verify_attention
 
     torch.manual_seed(batch * 10 + ext)
     H, HKV, D = 6, 1, 128
@@ -1134,9 +1138,9 @@ def test_rel_verify_gate_sink_in_combine(batch, ext):
 def test_route_metadata_quantize_matches_separate(quant, out_dtype, tokens):
     """route_metadata_quantize is bitwise route_metadata followed by the rows' fake
     quantization (fake_quantize / fake_quantize_mxfp8), for 16 to 1024 ids."""
-    from sglang.kernels.ops.inkling2 import experts_sm90
-    from sglang.kernels.ops.inkling2.route import route_metadata
-    from sglang.kernels.ops.inkling2.route_hip import route_metadata_quantize
+    from sglang.kernels.ops.moe import inkling2_experts_sm90 as experts_sm90
+    from sglang.kernels.ops.moe.inkling2_route import route_metadata
+    from sglang.kernels.ops.moe.inkling2_route_hip import route_metadata_quantize
 
     torch.manual_seed(tokens + len(quant))
     ids = torch.stack(
@@ -1166,7 +1170,7 @@ def test_ctx_kv_store_matches_separate(heads, reqs, width):
     """ctx_kv_store writes the DSpark draft's context K / V rows bitwise as
     write_target_hidden_kv's separate kernels do: k_norm_ctx (Triton RMSNorm), the
     rotary kernel through apply_k_rope, and set_kv_buffer_prefix_valid's store."""
-    from sglang.kernels.ops.inkling2.mtp_hip import ctx_kv_store
+    from sglang.kernels.ops.speculative.inkling2_mtp_hip import ctx_kv_store
     from sglang.srt.layers import layernorm
     from sglang.srt.layers.rotary_embedding import get_rope
     from sglang.srt.mem_cache.memory_pool import _set_kv_buffer_prefix_valid_impl
@@ -1221,8 +1225,8 @@ def test_mix_rmsnorm_last_matches_gather_and_copy(reqs):
     """mix_rmsnorm_last equals gathering each request's last committed row,
     mix_rmsnorm and index_copy_ into the f_rnn buffer (Inkling2 MTP's
     store_f_rnn after verify), bitwise."""
-    from sglang.kernels.ops.inkling2.mtp import mix_rmsnorm
-    from sglang.kernels.ops.inkling2.mtp_hip import mix_rmsnorm_last
+    from sglang.kernels.ops.speculative.inkling2_mtp import mix_rmsnorm
+    from sglang.kernels.ops.speculative.inkling2_mtp_hip import mix_rmsnorm_last
 
     torch.manual_seed(reqs)
     width, taps, hidden, slots = 8, 8, 4608, 64
@@ -1251,7 +1255,8 @@ def test_fused_kv_write_declines_translated_locs(monkeypatch):
     k_buffer = torch.zeros(4, 1, 8, dtype=torch.bfloat16)
     v_buffer = torch.zeros(4, 1, 8, dtype=torch.bfloat16)
     kv_layers = SimpleNamespace(
-        read=lambda layer_id: SimpleNamespace(kv=lambda: (k_buffer, v_buffer))
+        read=lambda layer_id: SimpleNamespace(kv=lambda: (k_buffer, v_buffer)),
+        route=lambda layer_id: SimpleNamespace(sub_pool="full"),
     )
     layer = SimpleNamespace(
         layer_id=0, is_cross_attention=False, k_scale=None,
@@ -1265,10 +1270,10 @@ def test_fused_kv_write_declines_translated_locs(monkeypatch):
             token_to_kv_pool=SimpleNamespace(dtype=torch.bfloat16),
             kv_layers=kv_layers,
             use_mla=False,
-            use_sliding_window_kv_pool=False,
+            window_write_sub_pools=(),
             dcp_size=1,
             runner_ids=SimpleNamespace(is_translating=translating),
-            forward_metadata=SimpleNamespace(swa_out_cache_loc=None),
+            _window_write_locs=lambda: None,
         )
         buffers = triton_backend.TritonAttnBackend.get_fused_kv_write_buffers(
             backend, layer, batch
@@ -1312,7 +1317,8 @@ def test_apply_wo_ud_matches_hipblaslt(rows):
 def test_expert_gemm_large_batch_tiles(fmt, tokens):
     """1,280-4,096 routed rows over 384 experts (MTP verify above c16): the
     large-batch tile equals float64 up to summation order."""
-    from sglang.kernels.ops.inkling2 import experts_hip, experts_sm90
+    from sglang.kernels.ops.moe import inkling2_experts_hip as experts_hip
+    from sglang.kernels.ops.moe import inkling2_experts_sm90 as experts_sm90
 
     torch.manual_seed(tokens)
     nexp, n, k, top_k, start, num_experts = 48, 512, 1024, 8, 48, 384
@@ -1357,7 +1363,8 @@ def test_expert_gemm_mfma_order(monkeypatch, fmt, tokens, gather):
     """Weights in MFMA order: 16-row tiles run the Gluon kernel and the others the
     Triton tile on that order, both bitwise the checkpoint layout's partials in
     every default_config band (8-8,192 rows over 64 experts), and run to run."""
-    from sglang.kernels.ops.inkling2 import experts_hip, experts_sm90
+    from sglang.kernels.ops.moe import inkling2_experts_hip as experts_hip
+    from sglang.kernels.ops.moe import inkling2_experts_sm90 as experts_sm90
 
     if not experts_hip.MFMA_ORDER:
         pytest.skip("MFMA-order experts need gfx950 and Gluon")
@@ -1420,7 +1427,7 @@ def test_experts_load_in_mfma_order(monkeypatch, precision, tokens):
     written in the checkpoint layout, and a reload rewrites the buffers in place."""
     from types import SimpleNamespace
 
-    from sglang.kernels.ops.inkling2 import experts_hip
+    from sglang.kernels.ops.moe import inkling2_experts_hip as experts_hip
     from sglang.srt.layers.quantization.inkling2 import Inkling2QuantConfig
     from sglang.srt.model_loader.utils import set_default_torch_dtype
     from sglang.srt.models.inkling_common import inkling2_moe as moe
@@ -1532,8 +1539,8 @@ def test_rnn_step_matches_gemm_path(rows):
     sum rounds differently, and repeats bitwise."""
     import torch.nn.functional as F
 
-    from sglang.kernels.ops.inkling2.mtp import rnn_gates, rnn_inputs
-    from sglang.kernels.ops.inkling2.mtp_hip import rnn_step, rnn_step_fits
+    from sglang.kernels.ops.speculative.inkling2_mtp import rnn_gates, rnn_inputs
+    from sglang.kernels.ops.speculative.inkling2_mtp_hip import rnn_step, rnn_step_fits
 
     torch.manual_seed(rows)
     rank, hidden, vocab = 256, 4608, 4096

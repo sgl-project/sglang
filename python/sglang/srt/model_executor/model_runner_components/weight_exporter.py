@@ -9,7 +9,7 @@ import torch.distributed as dist
 
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils import init_custom_process_group
-from sglang.srt.utils.common import is_npu
+from sglang.srt.utils.device import is_npu
 from sglang.srt.utils.network import NetworkAddress
 
 logger = logging.getLogger(__name__)

@@ -9,10 +9,10 @@ from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcesso
 from sglang.srt.multimodal.cache import resolve_multimodal_item_hash
 from sglang.srt.multimodal.encoder_preprocessing import EncoderPreprocessOutput
 from sglang.srt.multimodal.inkling2 import Inkling2ImageProcessor
+from sglang.srt.multimodal.media_io import download_remote_media
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.parser.inkling_tokenizer import IMAGE_TOKEN_ID
-from sglang.srt.utils.common import download_remote_media
 
 
 class Inkling2Processor:
@@ -22,7 +22,7 @@ class Inkling2Processor:
 
     @classmethod
     def from_pretrained(cls, path, *, tokenizer_path=None, revision=None, **kwargs):
-        from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
+        from sglang.srt.hf_transformers.tokenizer import get_tokenizer
 
         return cls(
             get_tokenizer(tokenizer_path or path, revision=revision, **kwargs),

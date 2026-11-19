@@ -33,6 +33,7 @@ from sglang.srt.mem_cache.layout.token_major import (
     replicated_token_layout,
 )
 from sglang.srt.mem_cache.memory_pool import (
+    KVWriteLoc,
     _set_kv_buffer_impl,
     _set_mha_kv_buffer_prefix_valid,
     masked_set_kv_buffer_kernel,
@@ -191,14 +192,14 @@ class MHASubPoolSpec(SubPoolSpec):
             parts += self.draft_region.parts(self.draft_offset_in_entry())
         return DenseEntryLayout(entry_bytes=self.entry_bytes(), parts=parts)
 
-    def views(self, arena) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-        """Per-layer K and V views over this sub-pool's band of ``arena``,
-        indexed by the physical token id."""
+    def views(self, arena, parts=("k", "v")) -> Tuple[List[torch.Tensor], ...]:
+        """Per-layer views of ``parts`` (K and V by default) over this
+        sub-pool's band of ``arena``, indexed by the physical token id."""
         if not self.layer_num:
-            return [], []
+            return tuple([] for _ in parts)
         rows = dense_rows(arena, self.name)
         check_physical_id_bound(sub_pool=self.name, n_rows=rows)
-        return self._part_views(arena, rows, "k"), self._part_views(arena, rows, "v")
+        return tuple(self._part_views(arena, rows, part) for part in parts)
 
     def draft_views(self, arena) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
         """Per-layer K and V views of the draft parts fused into this
@@ -283,13 +284,9 @@ class MHAView(MHAKVView):
     ):
         self.is_mxfp8 = spec.is_mxfp8
         if self.is_mxfp8:
-            rows = dense_rows(arena, spec.name)
             self.k_scale_buffer, self.v_scale_buffer = (
-                [
-                    x.view(torch.float8_e8m0fnu)
-                    for x in spec._part_views(arena, rows, name)
-                ]
-                for name in ("k_scale", "v_scale")
+                [x.view(torch.float8_e8m0fnu) for x in family]
+                for family in spec.views(arena, ("k_scale", "v_scale"))
             )
         self._has_draft_parts = spec.draft_region is not None
         k_buffer, v_buffer = spec.views(arena)
@@ -502,36 +499,22 @@ class MHAView(MHAKVView):
                     self.v_scale_buffer[idx],
                     page_size=self.page_size,
                 )
-            else:
-                if (
-                    k_scale is None
-                    or v_scale is None
-                    or cache_k.dtype != self.dtype
-                    or cache_v.dtype != self.dtype
-                ):
-                    raise ValueError(
-                        "Prequantized MXFP8 writes require E4M3 K/V and both scale tensors."
-                    )
-                from sglang.kernels.ops.kvcache.mxfp8_interleave_sf import (
-                    store_sf_token_major,
+                return
+            if (
+                k_scale is None
+                or v_scale is None
+                or cache_k.dtype != self.dtype
+                or cache_v.dtype != self.dtype
+            ):
+                raise ValueError(
+                    "Prequantized MXFP8 writes require E4M3 K/V and both scale tensors."
                 )
+            from sglang.kernels.ops.kvcache.mxfp8_interleave_sf import (
+                store_sf_token_major,
+            )
 
-                _set_kv_buffer_impl(
-                    cache_k.view(self.store_dtype),
-                    cache_v.view(self.store_dtype),
-                    self.k_buffer[idx],
-                    self.v_buffer[idx],
-                    loc,
-                    row_dim=self.row_dim,
-                    v_row_dim=self.v_row_dim,
-                    store_dtype=self.store_dtype,
-                    device_module=self.device_module,
-                    size_limit=self.size + self.page_size,
-                    alt_stream=self.alt_stream,
-                )
-                store_sf_token_major(k_scale, self.k_scale_buffer[idx], loc)
-                store_sf_token_major(v_scale, self.v_scale_buffer[idx], loc)
-            return
+            store_sf_token_major(k_scale, self.k_scale_buffer[idx], loc)
+            store_sf_token_major(v_scale, self.v_scale_buffer[idx], loc)
         if cache_k.dtype != self.dtype:
             if k_scale is not None:
                 cache_k.div_(k_scale)
@@ -593,8 +576,6 @@ class MHAView(MHAKVView):
     ):
         """Commit each request's live prefix at physical slot ids."""
         if self.is_mxfp8:
-            from sglang.srt.mem_cache.memory_pool import KVWriteLoc
-
             if loc_2d.ndim != 2 or commit_lens.shape != (loc_2d.shape[0],):
                 raise ValueError(
                     "Prefix commit lengths must match the physical row table."
@@ -750,8 +731,6 @@ class MHAView(MHAKVView):
                         family[layer_id]
                         .view(torch.uint8)[chunk]
                         .to("cpu", non_blocking=True)
-                        if self.is_mxfp8
-                        else family[layer_id][chunk].to("cpu", non_blocking=True)
                         for family in self._row_buffers()
                     ]
                 )
@@ -769,9 +748,7 @@ class MHAView(MHAKVView):
                 saved = kv_cache_cpu[layer_id][i // chunk_size]
                 assert len(saved) == len(self._row_buffers())
                 for family, cpu in zip(self._row_buffers(), saved):
-                    dst = family[layer_id]
-                    if self.is_mxfp8:
-                        dst = dst.view(torch.uint8)
+                    dst = family[layer_id].view(torch.uint8)
                     assert cpu.shape[0] == len(chunk)
                     dst[chunk] = cpu.to(dst.device, non_blocking=True)
         current_platform.synchronize()

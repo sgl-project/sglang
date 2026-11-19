@@ -1,6 +1,6 @@
 """ROCm forward of Inkling2Attention: the Triton backend's relative-bias attention."""
 
-from sglang.kernels.ops.inkling2.attention import gate_sink
+from sglang.kernels.ops.attention.inkling2_attn import gate_sink
 from sglang.srt.layers.quantization.unquant import _prefer_triton_a16w16
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.runtime_context import get_parallel

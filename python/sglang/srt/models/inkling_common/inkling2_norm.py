@@ -26,9 +26,9 @@ class RMSNorm(nn.Module):
 
     def forward(self, x: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
         if self.hip:
-            from sglang.kernels.ops.inkling2.norm_hip import rms_norm
+            from sglang.kernels.ops.layernorm.inkling2_norm_hip import rms_norm
         else:
-            from sglang.kernels.ops.inkling2.norm import rms_norm
+            from sglang.kernels.ops.layernorm.inkling2_rms_norm import rms_norm
 
         return rms_norm(
             x,

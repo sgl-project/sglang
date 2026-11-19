@@ -1,5 +1,11 @@
-"""ROCm paths of TritonAttnBackend: Inkling2's relative-bias attention kernels, the
-DSpark draft's block-anchored windows and the one-launch verify indptrs."""
+"""ROCm glue of triton_backend, bound there under _is_hip as _hip: TritonAttnBackend's
+state for the gfx950 M3.1 DSpark draft (its grouped-head verify kernel reads a sliding
+window, its target verify reads only the window KV indices, and its KV store skips the
+defensive k/v clone when the pool stores them as given), and Inkling2's relative-bias
+attention kernels, the DSpark draft's block-anchored windows and the one-launch verify
+indptrs."""
+
+from __future__ import annotations
 
 import functools
 
@@ -7,14 +13,94 @@ import torch
 import triton
 
 from sglang.kernels.ops.attention.metadata import verify_indptrs
-from sglang.kernels.ops.attention.score_mod import relative_bias_score_mod
+from sglang.srt.configs.model_config import is_dspark_draft
 from sglang.srt.layers.radix_attention import AttentionType
-from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc, MHATokenToKVPool
+from sglang.srt.runtime_context import get_model
+from sglang.srt.utils import is_gfx95_supported
+
+
+def _windows_every_layer(hf_config) -> bool:
+    from sglang.srt.speculative.dflash_utils import get_dflash_layer_types
+
+    layer_types = get_dflash_layer_types(hf_config)
+    return bool(layer_types) and all(t == "sliding_attention" for t in layer_types)
+
+
+def is_minimax_m31_dspark_draft(hf_config) -> bool:
+    """The DSpark draft of an M3.1 target (NVFP4 or Quark MXFP4); the MXFP8 M3 base
+    target shares its arch."""
+    # is_dspark_draft first, so other models never call get_model() here.
+    return (
+        is_dspark_draft(hf_config)
+        and hf_config.architectures[0] == "DSparkMiniMaxDraftModel"
+        and get_model().quantization in ("minimax_m3_nvfp4", "quark")
+    )
+
+
+def init_m31_draft(backend, hf_config) -> None:
+    """The ROCm state of TritonAttnBackend.__init__; reads backend.sliding_window_size."""
+    from sglang.kernels.ops.attention.verify_mla import verify_shared_kv_fwd
+
+    m31_draft = is_minimax_m31_dspark_draft(hf_config)
+    # The sliding-window path is validated only on the M3.1 draft (window 4095).
+    backend.verify_shared_kv_fwd = torch.compiler.disable(
+        functools.partial(verify_shared_kv_fwd, allow_sliding_window=m31_draft)
+    )
+    backend.is_gfx950_m31_draft = is_gfx95_supported() and m31_draft
+    # The M3.1 draft windows every layer and reads only window_kv_indices; its
+    # target-verify steps skip packing the full-context index stream.
+    backend.verify_reads_window_kv_only = (
+        backend.is_gfx950_m31_draft
+        and backend.sliding_window_size is not None
+        and backend.sliding_window_size > 0
+        and _windows_every_layer(hf_config)
+    )
+
+
+def stores_kv_as_given(backend, k: torch.Tensor) -> bool:
+    """Whether set_kv_buffer stores k and v as given: a plain MHA pool of their
+    dtype ignores the layer's scales."""
+    pool = backend.token_to_kv_pool
+    return (
+        type(pool) is MHATokenToKVPool
+        and pool.dtype == k.dtype
+        and not pool.is_quantized_kv_cache
+    )
+
+
+def init_inkling2_state(backend, model_runner, max_bs) -> None:
+    """The ROCm state of TritonAttnBackend.__init__ for Inkling2 and DSpark drafts."""
+    backend.anchor_max_bs = max_bs
+    # (indptr, indices) buffers of block-anchored windows, sized on first use, and
+    # (forward_batch, forward_metadata, width, (indptr, indices)) of the last fill.
+    backend.anchor_window_buffers = None
+    backend._anchor_window_fill = None
+    backend._zero_extent_biases = {}
+    # (forward_metadata, kv_indptr, (window, capturing), splits, bound) of the last fill
+    backend._window_splits_fill = None
+    backend.window_num_kv_splits_buf = None
+    # ROCm DSpark drafts run their short blocks on the split-KV verify kernel
+    backend.is_hip_dspark_draft = (
+        model_runner.is_draft_worker and model_runner.spec_algorithm.is_dspark()
+    )
+
+
+def _window_rail(backend):
+    """(name, window) of the backend's one window rail, or (None, None) without one;
+    the ROCm paths here build a single rail."""
+    if not backend.window_lengths:
+        return None, None
+    if len(backend.window_lengths) > 1:
+        raise NotImplementedError(
+            "The ROCm Triton verify and full-graph prefill paths build one window rail"
+        )
+    ((name, window),) = backend.window_lengths.items()
+    return name, window
 
 
 def rel_verify_max_extend():
-    from sglang.kernels.ops.inkling2.attention_hip import REL_VERIFY_MAX_EXTEND
+    from sglang.kernels.ops.attention.inkling2_attn_hip import REL_VERIFY_MAX_EXTEND
 
     return REL_VERIFY_MAX_EXTEND
 
@@ -27,48 +113,39 @@ def update_target_verify_buffers(
     from sglang.srt.layers.attention.triton_backend import pack_sliding_window_indices
 
     num_tokens_per_req = backend._target_verify_num_tokens_per_req(spec_info)
-    windowed = (
-        backend.sliding_window_size is not None and backend.sliding_window_size > 0
-    )
+    name, window = _window_rail(backend)
     qo_indptr = backend.qo_indptr[: bs + 1]
     kv_indptr = backend.kv_indptr[: bs + 1]
     mask_indptr = backend.mask_indptr[: bs + 1]
-    window_kv_indptr = backend.window_kv_indptr
-    window_kv_indices = None
-    window_num_kv_splits = None
-    window_kv_offsets = None
-    if windowed:
-        window_kv_indices = backend.cuda_graph_window_kv_indices
-        window_num_kv_splits = backend.cuda_graph_window_num_kv_splits
-        window_kv_offsets = backend.cuda_graph_window_kv_offsets
     window_kv_lens, window_kv_start_idx = verify_indptrs(
         seq_lens[:bs],
         num_tokens_per_req,
         qo_indptr,
         kv_indptr,
         mask_indptr,
-        backend.sliding_window_size if windowed else None,
-        backend.window_kv_indptr,
-        window_kv_offsets,
+        window,
+        backend.window_kv_indptr[name] if name is not None else None,
+        backend.cuda_graph_window_kv_offsets[name] if name is not None else None,
     )
-    backend.runner_ids.pack_read_stream(
-        plan,
-        req_pool_indices=req_pool_indices,
-        seq_lens=seq_lens[:bs],
-        indptr=kv_indptr,
-        out=backend.cuda_graph_kv_indices,
-    )
-    if windowed:
-        window_kv_indptr = backend.window_kv_indptr[: bs + 1]
-        window_kv_indices = pack_sliding_window_indices(
-            window_kv_indptr,
+    if not backend.verify_reads_window_kv_only:
+        backend.runner_ids.pack_read_stream(
+            plan,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens[:bs],
+            indptr=kv_indptr,
+            out=backend.cuda_graph_kv_indices,
+        )
+    if name is not None:
+        pack_sliding_window_indices(
+            backend.window_kv_indptr[name][: bs + 1],
             backend.runner_ids,
             plan,
             req_pool_indices,
             window_kv_lens,
             window_kv_start_idx,
             token_to_kv_pool=backend.token_to_kv_pool,
-            window_kv_indices=window_kv_indices,
+            window_kv_indices=backend.cuda_graph_window_kv_indices[name],
+            kind=name,
         )
     custom_mask = (
         backend._verify_mask.buffer if backend._verify_mask is not None else None
@@ -77,16 +154,7 @@ def update_target_verify_buffers(
         custom_mask[: spec_info.custom_mask.shape[0]] = spec_info.custom_mask
     else:
         custom_mask = None
-    return (
-        qo_indptr,
-        kv_indptr,
-        custom_mask,
-        mask_indptr,
-        window_kv_indptr,
-        window_kv_indices,
-        window_num_kv_splits,
-        window_kv_offsets,
-    )
+    return qo_indptr, kv_indptr, custom_mask, mask_indptr
 
 
 def init_full_cg_extend_metadata(backend, forward_batch, in_capture):
@@ -98,6 +166,7 @@ def init_full_cg_extend_metadata(backend, forward_batch, in_capture):
     the kernels read real extents from qo_indptr."""
     from sglang.srt.layers.attention.triton_backend import (
         ForwardMetadata,
+        WindowRail,
         update_sliding_window_buffer,
     )
 
@@ -106,9 +175,7 @@ def init_full_cg_extend_metadata(backend, forward_batch, in_capture):
             "Full-graph prefill on the Triton backend has no DCP or deterministic mode"
         )
     bs = forward_batch.batch_size
-    windowed = (
-        backend.sliding_window_size is not None and backend.sliding_window_size > 0
-    )
+    name, window = _window_rail(backend)
     bufs = getattr(backend, "full_cg_extend_buffers", None)
     if bufs is None:
         assert in_capture
@@ -118,7 +185,7 @@ def init_full_cg_extend_metadata(backend, forward_batch, in_capture):
                 bs * backend.max_context_len, dtype=torch.int64, device=backend.device
             ),
             torch.empty(
-                bs * backend.sliding_window_size if windowed else 0,
+                bs * window if name is not None else 0,
                 dtype=torch.int64,
                 device=backend.device,
             ),
@@ -134,26 +201,30 @@ def init_full_cg_extend_metadata(backend, forward_batch, in_capture):
     )
     qo_indptr = backend.qo_indptr[: bs + 1]
     qo_indptr[1:] = torch.cumsum(forward_batch.extend_seq_lens[:bs], dim=0)
-    window_kv_indptr = backend.window_kv_indptr
-    if windowed:
+    windows = {}
+    if name is not None:
         window_kv_indptr, _, _, window_kv_start_idx = update_sliding_window_buffer(
-            backend.window_kv_indptr,
+            backend.window_kv_indptr[name],
             backend.runner_ids,
             plan,
             req_pool_indices,
-            backend.sliding_window_size,
+            window,
             prefix_lens,
             bs,
             token_to_kv_pool=backend.token_to_kv_pool,
             window_kv_indices=window_kv_indices,
+            kind=name,
         )
         window_kv_offsets = window_kv_offsets[:bs]
         window_kv_offsets.copy_(window_kv_start_idx)
-    else:
-        window_kv_indices = window_kv_offsets = None
-    swa_out_cache_loc = _fill_full_cg_extend_swa_out_cache_loc(
-        backend, forward_batch, in_capture
-    )
+        windows[name] = WindowRail(
+            kv_indptr=window_kv_indptr,
+            kv_indices=window_kv_indices,
+            kv_offsets=window_kv_offsets,
+            out_cache_loc=_fill_full_cg_extend_window_out_cache_loc(
+                backend, forward_batch, name, in_capture
+            ),
+        )
     if not in_capture:
         return
     backend.forward_metadata = ForwardMetadata(
@@ -166,11 +237,7 @@ def init_full_cg_extend_metadata(backend, forward_batch, in_capture):
         qo_indptr=qo_indptr,
         custom_mask=None,
         mask_indptr=None,
-        window_kv_indptr=window_kv_indptr,
-        window_kv_indices=window_kv_indices,
-        window_num_kv_splits=None,
-        window_kv_offsets=window_kv_offsets,
-        swa_out_cache_loc=swa_out_cache_loc,
+        windows=windows,
     )
 
 
@@ -188,6 +255,55 @@ def decode_split_bound(backend, num_token, window=None):
     if window is not None:
         bound = min(bound, triton.cdiv(window + 1, backend.decode_split_min_tokens))
     return bound
+
+
+def window_num_kv_splits(backend, layer, kv_indptr, num_token):
+    """(num_kv_splits, bound) of a sliding-window decode layer: cdiv(window length,
+    decode_split_min_tokens) splits per request. The first window layer of a forward
+    (or of a captured graph) computes them from the rail's indptr; the rest reuse."""
+    from sglang.kernels.ops.attention.metadata import (
+        get_num_kv_splits_by_length_triton,
+    )
+
+    window = layer.sliding_window_size
+    # A capture's eager warmup shares its forward_metadata: key on capturing too.
+    capturing = torch.cuda.is_current_stream_capturing()
+    fill = backend._window_splits_fill
+    if (
+        fill is not None
+        and fill[0] is backend.forward_metadata
+        and fill[1] is kv_indptr
+        and fill[2] == (window, capturing)
+    ):
+        return fill[3], fill[4]
+    num_seq = kv_indptr.shape[0] - 1
+    bound = decode_split_bound(backend, num_token, window)
+    if capturing:
+        if backend.window_num_kv_splits_buf is None:
+            backend.window_num_kv_splits_buf = torch.empty_like(
+                backend.cuda_graph_num_kv_splits
+            )
+        splits = backend.window_num_kv_splits_buf[:num_token]
+    else:
+        splits = torch.empty(num_token, dtype=torch.int32, device=backend.device)
+    get_num_kv_splits_by_length_triton[(1,)](
+        splits,
+        kv_indptr,
+        num_seq,
+        num_token // max(1, num_seq),
+        bound,
+        MIN_TOKENS=backend.decode_split_min_tokens,
+        MAX_NUM_SEQ=max(256, triton.next_power_of_2(num_seq)),
+        INDPTR=True,
+    )
+    backend._window_splits_fill = (
+        backend.forward_metadata,
+        kv_indptr,
+        (window, capturing),
+        splits,
+        bound,
+    )
+    return splits, bound
 
 
 def check_extend(backend, rel_bias, sinks, layer, gate_sink):
@@ -214,26 +330,25 @@ def check_extend(backend, rel_bias, sinks, layer, gate_sink):
         )
 
 
-def _fill_full_cg_extend_swa_out_cache_loc(backend, forward_batch, in_capture):
-    """The sliding-window write ids of a full-graph prefill in a buffer sized at the
-    first (largest) capture; the bucket's padded tail writes SWA's zero dummy slot."""
+def _fill_full_cg_extend_window_out_cache_loc(backend, forward_batch, name, in_capture):
+    """The window rail's write ids of a full-graph prefill in a buffer sized at the
+    first (largest) capture; the bucket's padded tail writes the window's zero dummy
+    slot."""
     out_cache_loc = forward_batch.out_cache_loc
-    if not backend.use_sliding_window_kv_pool or out_cache_loc is None:
+    if name not in backend.window_write_sub_pools or out_cache_loc is None:
         return None
     n = out_cache_loc.shape[0]
-    buf = getattr(backend, "full_cg_extend_swa_out_cache_loc", None)
+    buf = getattr(backend, "full_cg_extend_window_out_cache_loc", None)
     if buf is None:
         assert in_capture
-        buf = backend.full_cg_extend_swa_out_cache_loc = torch.zeros(
+        buf = backend.full_cg_extend_window_out_cache_loc = torch.zeros(
             (n,), dtype=torch.int64, device=backend.device
         )
     assert n <= buf.shape[0], (n, buf.shape[0])
     if in_capture:
         buf[:n].zero_()
     else:
-        buf[:n].copy_(
-            backend.runner_ids.write_ids(forward_batch, IdSpaceKind.SLIDING_WINDOW)
-        )
+        buf[:n].copy_(backend.runner_ids.write_ids(forward_batch, name))
     buf[n:].zero_()
     return buf[:n]
 
@@ -270,7 +385,7 @@ def forward_rel_extend(
     extends (MTP verify, and the bidirectional MTP draft blocks) split the
     prefix keys across programs instead. Returns o, or with gate_sink (short
     extends) the gated output of the split-KV reduction."""
-    from sglang.kernels.ops.inkling2.attention_hip import (
+    from sglang.kernels.ops.attention.inkling2_attn_hip import (
         REL_VERIFY_MAX_EXTEND,
         rel_extend_attention,
         rel_verify_attention,
@@ -372,6 +487,7 @@ def anchored_window_kv(backend, layer, forward_batch):
         backend.device,
         backend.token_to_kv_pool,
         window_kv_indices=indices[: bs * width],
+        kind=backend.kv_layers.route(layer.layer_id).sub_pool,
     )
     backend._anchor_window_fill = (
         forward_batch,
@@ -393,13 +509,12 @@ def fused_kv_write_buffers(backend, layer, forward_batch):
     ):
         return None
     write_loc = KVWriteLoc.for_layer(
-        forward_batch, layer, swa_loc=backend.forward_metadata.swa_out_cache_loc
+        forward_batch, layer, window_locs=backend._window_write_locs()
     )
+    sub_pool = backend.kv_layers.route(layer.layer_id).sub_pool
     locations = (
-        write_loc.swa_loc
-        if backend.use_sliding_window_kv_pool
-        and backend.kv_layers.route(layer.layer_id).sub_pool
-        == IdSpaceKind.SLIDING_WINDOW
+        (write_loc.window_locs or {}).get(sub_pool)
+        if sub_pool in backend.window_write_sub_pools
         else write_loc.loc
     )
     if locations is None:
@@ -457,14 +572,3 @@ def forward_draft_block(backend, q, k, v, o, lse, layer, kv_indptr, kv_indices, 
         -1,
         causal,
     )
-
-
-def rel_bias_score_mod(rel_bias, score_mod, aux_tensors):
-    """FA4's rel_bias as the Triton score_mod: logits qk * scale + rel_bias[t, h, d]
-    for query-key distance d < rel_bias.shape[-1]. Scale-after-add and GQA packing
-    are FA4 kernel choices with the same math, so they need no counterpart here."""
-    if rel_bias is None:
-        return score_mod, aux_tensors
-    if score_mod is not None or aux_tensors is not None:
-        raise ValueError("rel_bias cannot be combined with score_mod")
-    return relative_bias_score_mod, [rel_bias]

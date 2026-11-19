@@ -244,7 +244,6 @@ class FlashAttentionForwardSm100:
         kv_sf_interleaved: bool = False,
         batch_invariant: bool = False,
         tmem_load_red_max: bool = True,
-        rel_bias_scale_after_add: bool = False,
     ):
         # MXFP8 block-scaled attention (see interface._flash_attn_fwd):
         #   qk_blockscaled: Q/K fp8 e4m3 + per-32 UE8M0 scales; QK^T runs as
@@ -334,7 +333,6 @@ class FlashAttentionForwardSm100:
         self.pack_gqa = pack_gqa
         # relative (sheared) bias
         self.has_bias = has_bias
-        self.rel_bias_scale_after_add = rel_bias_scale_after_add
         self.batch_invariant = batch_invariant
         self.rel_extent_padded = rel_extent_padded
         assert rel_extent_padded % n_block_size == 0
@@ -1543,16 +1541,11 @@ class FlashAttentionForwardSm100:
 
         self.shared_storage = SharedStorage
 
-        if const_expr(self.has_bias and self.rel_bias_scale_after_add):
-            base_softmax_scale = 1.0 / softmax_scale
-            softmax_scale_log2, softmax_scale = utils.compute_softmax_scale_log2(
-                softmax_scale, self.score_mod
-            )
-        elif const_expr(self.has_bias):
-            # rel_bias needs to match the score_mod arithmetic domain: qk is scaled first,
-            # then bias is added, then softmax applies the base-2 conversion. Route LOG2_E
-            # through the same runtime kernel argument as the score_mod path so the device
-            # code sees identical operand kinds (constant vs register changes codegen).
+        # rel_bias needs to match the score_mod arithmetic domain: qk is scaled first,
+        # then bias is added, then softmax applies the base-2 conversion. Route LOG2_E
+        # through the same runtime kernel argument as the score_mod path so the device
+        # code sees identical operand kinds (constant vs register changes codegen).
+        if const_expr(self.has_bias):
             base_softmax_scale = softmax_scale
             softmax_scale_log2, softmax_scale = utils.LOG2_E, None
         else:
@@ -4403,15 +4396,13 @@ class FlashAttentionForwardSm100:
                     for j in cutlass.range(
                         0, cute.size(tBrS_cur.shape), 2, unroll_full=True
                     ):
-                        scores = (tBrS_cur[j], tBrS_cur[j + 1])
-                        biases = (
-                            tS2RrBias_cur[j].to(self.qk_acc_dtype),
-                            tS2RrBias_cur[j + 1].to(self.qk_acc_dtype),
-                        )
                         tBrS_cur[j], tBrS_cur[j + 1] = cute.arch.fma_packed_f32x2(
-                            biases if const_expr(self.rel_bias_scale_after_add) else scores,
+                            (tBrS_cur[j], tBrS_cur[j + 1]),
                             (bias_softmax_scale, bias_softmax_scale),
-                            scores if const_expr(self.rel_bias_scale_after_add) else biases,
+                            (
+                                tS2RrBias_cur[j].to(self.qk_acc_dtype),
+                                tS2RrBias_cur[j + 1].to(self.qk_acc_dtype),
+                            ),
                         )
             cute.arch.fence_view_async_shared()
             cute.arch.barrier(
@@ -4420,9 +4411,7 @@ class FlashAttentionForwardSm100:
             )
             pipeline_bias.consumer_release_w_index(bias_si_stage)
 
-        if const_expr(
-            self.has_bias and not apply_bias and not self.rel_bias_scale_after_add
-        ):
+        if const_expr(self.has_bias and not apply_bias):
             # Blocks beyond the bias band: the score_mod reference still scales qk there
             # (its bias contribution is 0), so scale to stay in the same domain.
             assert cute.size(tSrS_t2r.shape) % 2 == 0

@@ -96,8 +96,8 @@ class InklingOutputParser:
         return delta.build()
 
     def abort(self, token_ids: Sequence[int] = ()) -> InklingOutputDelta:
-        """Parses tokens generated before an abort without finalizing, so an open
-        call is never completed into an executable one."""
+        # Parses tokens generated before an abort without finalizing, so an open
+        # call is never completed into an executable one.
         if self._finished:
             return InklingOutputDelta()
         self._finished = True
@@ -139,10 +139,8 @@ class InklingOutputParser:
     def _cut_at_stop_string(
         self, token_ids: Sequence[int], stop: str, *, keep_stop: bool
     ) -> tuple[list[int], bytes]:
-        """Returns the whole tokens kept plus the kept byte prefix of the token the
-        cut falls in; those bytes may continue a character from earlier tokens."""
-        # The scheduler matched ``stop`` on the decoded ids, framing included,
-        # and ended on the token completing it; cut the raw stream there.
+        # The scheduler matched ``stop`` on the decoded ids, framing included; keep the
+        # bytes of the token it splits, which may continue an earlier character.
         tokenizer = self._tml.tokenizer
         if not token_ids:
             return [], b""
@@ -241,8 +239,8 @@ class InklingOutputParser:
         elif isinstance(update, chat.StreamingContent):
             if self._model_authored:
                 self._emit_text(
-                    update.content.text,
-                    delta,
+                    text=update.content.text,
+                    delta=delta,
                     thinking=isinstance(update.content, chat.Thinking),
                 )
                 self._streamed += update.content.text
@@ -260,8 +258,8 @@ class InklingOutputParser:
         elif isinstance(content, (chat.Text, chat.Thinking)):
             if content.text.startswith(self._streamed):
                 self._emit_text(
-                    content.text[len(self._streamed) :],
-                    delta,
+                    text=content.text[len(self._streamed) :],
+                    delta=delta,
                     thinking=isinstance(content, chat.Thinking),
                 )
             self._release_held_reasoning(delta)
@@ -274,7 +272,7 @@ class InklingOutputParser:
             else:
                 delta.content.append(self._payload_text())
 
-    def _emit_text(self, text: str, delta: _DeltaBuilder, *, thinking: bool) -> None:
+    def _emit_text(self, *, text: str, delta: _DeltaBuilder, thinking: bool) -> None:
         if not (self._separate_reasoning and thinking):
             delta.content.append(text)
         elif self._hold_reasoning:
@@ -290,7 +288,7 @@ class InklingOutputParser:
 
     def _tool_call(self, message: Any) -> InklingToolCall:
         chat = self._tml.chat
-        oss = chat.OpenAIMessage.to_oss_messages(
+        oss = chat.OpenAIMessage.to_openai_chat_dicts(
             chat.OpenAIMessage.from_messages([message])
         )
         function = oss[0]["tool_calls"][0]["function"]
@@ -326,7 +324,9 @@ class InklingOutputParser:
                 self._release_held_reasoning(delta)
         elif kind_id == self._thinking_id:
             if text.startswith(self._streamed):
-                self._emit_text(text[len(self._streamed) :], delta, thinking=True)
+                self._emit_text(
+                    text=text[len(self._streamed) :], delta=delta, thinking=True
+                )
         else:
             emitted = "" if self._held_reasoning else self._streamed
             if text.startswith(emitted):
