@@ -65,7 +65,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.runtime.utils.precision import precision_to_dtype
+from sglang.multimodal_gen.runtime.utils.precision import (
+    precision_to_dtype,
+    resolve_component_precision_override,
+)
 from sglang.srt.environ import envs
 
 logger = init_logger(__name__)
@@ -285,6 +288,14 @@ def exact_vae_convolutions(exact: bool):
         yield
     finally:
         cudnn.deterministic, cudnn.benchmark = previous
+
+
+def flux3_vae_dtype(server_args: ServerArgs, package_config) -> torch.dtype:
+    """--component-precisions.vae, else the package's dtype"""
+    override = resolve_component_precision_override(server_args, "vae")
+    if override is not None:
+        return override
+    return precision_to_dtype(package_config.vae.dtype)
 
 
 def vae_encode(vae, image: Tensor) -> tuple[Tensor, Tensor]:
@@ -615,7 +626,7 @@ class Flux3ImageConditionEncodeStage(ConditionEncodingStage):
                 self._component_stage_name(stage_name),
                 "vae",
                 phase="condition_encode",
-                target_dtype=precision_to_dtype(self.package_config.vae.dtype),
+                target_dtype=flux3_vae_dtype(server_args, self.package_config),
                 memory_intensive=True,
                 skip_empty_cache_on_release=True,
             )
@@ -915,7 +926,7 @@ class Flux3ImageDecodeStage(PipelineStage):
                 self._component_stage_name(stage_name),
                 "vae",
                 phase="decode",
-                target_dtype=precision_to_dtype(self.package_config.vae.dtype),
+                target_dtype=flux3_vae_dtype(server_args, self.package_config),
                 memory_intensive=True,
                 keep_ready_after_warmup=True,
                 preferred_ready_after_request=keep,

@@ -55,9 +55,10 @@ if TYPE_CHECKING:
     # back to NCCL when unavailable. Set 0 to force NCCL. Keep this in step with
     # the resolver below -- that is the value the runtime reads.
     SGLANG_DIFFUSION_IPC_A2A: bool = True
-    # copy-engine all-to-all for Ulysses groups of any size on one host; off by
-    # default while it is validated. Falls back to NCCL when unavailable.
-    SGLANG_DIFFUSION_IPC_A2A_MULTI: bool = False
+    # copy-engine transport for the plain Ulysses all-to-all on one host: unset
+    # picks it where it measured faster than NCCL (see plain_exchange_ready),
+    # 1 forces it for every exchange, 0 keeps NCCL
+    SGLANG_DIFFUSION_IPC_A2A_MULTI: bool | None = None
     # Ordinary unquantized FlashInfer Ulysses; overrides the IPC pipeline.
     # Set identically on every rank. Uneven sequence shards retain their transport.
     SGLANG_DIFFUSION_FLASHINFER_ULYSSES: bool = False
@@ -177,6 +178,15 @@ def _lazy_optional_float(key: str) -> Callable[[], float | None]:
 
 def _lazy_bool(key: str, default: str = "false") -> Callable[[], bool]:
     return lambda: get_bool_env_var(key, default)
+
+
+def _lazy_optional_bool(key: str) -> Callable[[], bool | None]:
+    def _getter():
+        if os.getenv(key) is None:
+            return None
+        return get_bool_env_var(key)
+
+    return _getter
 
 
 def _lazy_path(
@@ -411,8 +421,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_FLASHINFER_ULYSSES_BACKEND": lambda: os.getenv(
         "SGLANG_DIFFUSION_FLASHINFER_ULYSSES_BACKEND", "auto"
     ),
-    "SGLANG_DIFFUSION_IPC_A2A_MULTI": _lazy_bool(
-        "SGLANG_DIFFUSION_IPC_A2A_MULTI", "false"
+    "SGLANG_DIFFUSION_IPC_A2A_MULTI": _lazy_optional_bool(
+        "SGLANG_DIFFUSION_IPC_A2A_MULTI"
     ),
     "SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS": _lazy_int(
         "SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS", -1
