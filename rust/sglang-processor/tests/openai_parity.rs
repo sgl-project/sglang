@@ -17,8 +17,7 @@ use sglang_processor::openai::{
     lower_completion,
 };
 use sglang_processor::{
-    ChatFormatter, ChatFormatterOptions, TokenizerBackend, load_tokenizer, resolve_model_file,
-    select_chat_formatter,
+    ChatFormatter, ChatFormatterOptions, load_tokenizer, resolve_model_file, select_chat_formatter,
 };
 
 struct FixtureTokenizer {
@@ -55,21 +54,9 @@ impl Checkpoint {
         let json = std::fs::read_to_string(tokenizer_file).unwrap();
         Self {
             formatter: formatter.unwrap_or_else(|| panic!("{error:?}")),
-            tokenizer: load_tokenizer(
-                Some(tokenizer_file),
-                None,
-                true,
-                TokenizerBackend::HuggingFace,
-            )
-            .unwrap(),
+            tokenizer: load_tokenizer(Some(tokenizer_file), None, true).unwrap(),
             openai: Arc::new(FixtureTokenizer {
-                tokenizer: load_tokenizer(
-                    Some(tokenizer_file),
-                    None,
-                    false,
-                    TokenizerBackend::HuggingFace,
-                )
-                .unwrap(),
+                tokenizer: load_tokenizer(Some(tokenizer_file), None, false).unwrap(),
                 pieces: TokenPieces::from_tokenizer_json(&serde_json::from_str(&json).unwrap()),
             }),
         }

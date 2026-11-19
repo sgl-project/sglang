@@ -11,7 +11,7 @@ use serde_json::Value;
 use sglang_processor::dynamo_renderer::RenderedPrompt;
 use sglang_processor::dynamo_tokenizers::Tokenizer;
 use sglang_processor::{
-    ChatFormatter, ChatFormatterOptions, TokenizerBackend, load_tokenizer, resolve_tokenizer_file,
+    ChatFormatter, ChatFormatterOptions, load_tokenizer, resolve_tokenizer_file,
     select_chat_formatter,
 };
 use sha2::{Digest, Sha256};
@@ -151,9 +151,7 @@ fn cached_tokenizers(model: &str, revision: &str) -> Option<Tokenizers> {
         eprintln!("{model}@{revision} is not in the HF cache: token ids not checked");
         return None;
     };
-    let load = |specials| {
-        load_tokenizer(Some(&file), None, specials, TokenizerBackend::HuggingFace).unwrap()
-    };
+    let load = |specials| load_tokenizer(Some(&file), None, specials).unwrap();
     Some(Tokenizers {
         plain: load(false),
         specials: load(true),

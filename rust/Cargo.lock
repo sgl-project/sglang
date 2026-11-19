@@ -1258,12 +1258,14 @@ dependencies = [
 
 [[package]]
 name = "fastokens"
-version = "0.3.1"
+version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "35ff8cf975d8f772e7d4c3be439659b0b23b1ae1086ebee7204573807053ff7f"
+checksum = "d915324fcf00aa9cade45192ffb7eb49f44a66eb9e7059914d87a2a34b58d88d"
 dependencies = [
+ "aho-corasick",
  "daachorse 1.0.1",
  "fancy-regex 0.17.0",
+ "fastrand",
  "hf-hub",
  "icu_normalizer",
  "libc",
@@ -1275,6 +1277,7 @@ dependencies = [
  "serde_json",
  "strum 0.27.2",
  "thiserror 2.0.19",
+ "unicode-normalization-alignments",
  "ureq",
 ]
 
@@ -4038,6 +4041,7 @@ dependencies = [
  "dynamo-protocols",
  "dynamo-renderer",
  "dynamo-tokenizers",
+ "fastokens",
  "futures",
  "hf-hub",
  "minijinja",
@@ -4047,6 +4051,7 @@ dependencies = [
  "sglang-api-types",
  "sha2",
  "thiserror 2.0.19",
+ "tokenizers 0.21.4",
  "tokenizers 0.23.2",
  "tracing",
  "uuid",

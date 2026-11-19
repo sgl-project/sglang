@@ -79,6 +79,16 @@ pub(super) fn load_chat_support(server_args: &ServerArgs) -> Option<ChatFormatte
         tracing::warn!(%error, "OpenAI chat completions disabled");
         return None;
     }
+    if server_args.tokenizer_backend == "fastokens"
+        && matches!(
+            &formatter,
+            Some(ChatFormatter::DeepSeekV4(Some(_)) | ChatFormatter::DeepSeekV41(Some(_)))
+        )
+    {
+        tracing::warn!(
+            "DeepSeek V4/V4.1 chat uses the checkpoint tokenizer regardless of --tokenizer-backend"
+        );
+    }
     formatter
 }
 

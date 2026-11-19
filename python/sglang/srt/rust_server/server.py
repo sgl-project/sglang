@@ -464,6 +464,9 @@ class RustServer:
 
         # Force turn off HF tokenizers rayon's unpinned global thread pool.
         os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+        if get_serving().tokenizer_backend == "fastokens":
+            # The frontend already parallelizes across tokenizer workers.
+            os.environ.setdefault("FASTOKENS_BPE_THREADS", "1")
         warmup_names = rust_server_warmup_names(get_serving().warmups)
         check_rust_server_warmups(warmup_names)
 
