@@ -402,6 +402,12 @@ def eagle_prepare_for_verify(
     if not batch.forward_mode.is_idle():
         # Assign cache locations
         bs = len(batch.req_pool_indices)
+        # Host upper bound of this batch's final KV lengths: bounds the
+        # backend's replay page-table copies in mirrorless mode without a D2H sync.
+        batch.max_seq_len_host = (
+            max((req.seqlen for req in batch.reqs), default=0)
+            + verify_input.draft_token_num
+        )
         batch.input_ids = verify_input.draft_token
         maybe_detect_oob(
             batch.input_ids,

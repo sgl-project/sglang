@@ -28,6 +28,9 @@ runtime_common = [
   "einops",
   "fastapi",
   "gguf",
+  "grpcio>=1.81.1",
+  "grpcio-health-checking>=1.81.1",
+  "grpcio-reflection>=1.81.1",
   "hf_transfer",
   "huggingface_hub",
   "interegular",
@@ -45,6 +48,7 @@ runtime_common = [
   "partial_json_parser",
   "pillow",
   "prometheus-client>=0.20.0",
+  "protobuf>=6.33.5",
   "psutil",
   "py-spy",
   "pybase64",
@@ -63,7 +67,6 @@ runtime_common = [
   "uvicorn",
   "uvloop",
   "xgrammar==0.2.7",
-  "smg-grpc-servicer>=0.9.0",
 ]
 
 # ROCm specific packages (https://repo.radeon.com/rocm/manylinux/)

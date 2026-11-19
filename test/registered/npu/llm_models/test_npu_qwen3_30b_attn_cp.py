@@ -8,7 +8,7 @@ from sglang.test.test_utils import CustomTestCase
 
 register_npu_ci(
     est_time=500,
-    suite="full-4-npu-a3",
+    suite="full-test-4-npu-a3",
     nightly=True,
     disabled="Prefill CP on HIP/NPU/MUSA is deprecated; CP support will be refactored soon.",
 )
