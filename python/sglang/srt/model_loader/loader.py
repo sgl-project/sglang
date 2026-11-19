@@ -7,6 +7,7 @@ from __future__ import annotations
 # ruff: noqa: SIM117
 import collections
 import concurrent.futures
+import contextvars
 import dataclasses
 import fnmatch
 import gc
@@ -27,9 +28,11 @@ from contextlib import contextmanager, suppress
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     Dict,
     Generator,
     Iterable,
+    Iterator,
     List,
     Optional,
     Tuple,
@@ -148,6 +151,7 @@ if TYPE_CHECKING:
     from sglang.srt.configs.device_config import DeviceConfig
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
+    from sglang.srt.model_loader.snapshot.schema import LoadSpec, SnapshotManifest
 
 _is_npu = is_npu()
 # ModelOpt: QUANT_CFG_CHOICES is imported from modelopt_utils.py
@@ -321,6 +325,23 @@ def built_quant_config(
     return own_quant_config(model_config.hf_config, quant_config)
 
 
+# Set only inside on_model_constructed.
+_on_model_constructed: contextvars.ContextVar[Optional[Callable[[nn.Module], None]]] = (
+    contextvars.ContextVar("on_model_constructed", default=None)
+)
+
+
+@contextmanager
+def on_model_constructed(callback: Callable[[nn.Module], None]) -> Iterator[None]:
+    """Call ``callback`` with each model _initialize_model builds in this scope,
+    right after construction and before any weights load."""
+    token = _on_model_constructed.set(callback)
+    try:
+        yield
+    finally:
+        _on_model_constructed.reset(token)
+
+
 def _initialize_model(
     model_config: ModelConfig,
     load_config: LoadConfig,
@@ -348,6 +369,9 @@ def _initialize_model(
         model = model_class(**kwargs)
         check_stage_producers(model)
     model.shared_experts_config = shared_experts
+    callback = _on_model_constructed.get()
+    if callback is not None:
+        callback(model)
     return model
 
 
@@ -381,6 +405,20 @@ class BaseModelLoader(ABC):
 
     def __init__(self, load_config: LoadConfig):
         self.load_config = load_config
+
+    def lookup(
+        self, *, spec: LoadSpec, device_config: DeviceConfig
+    ) -> Optional[SnapshotManifest]:
+        """Return the snapshot published for exactly ``spec``, or None to load raw.
+
+        Every rank calls it before load_model, and the ranks vote on the results
+        before any bytes move, so it is read-only and bounded in time. It raises if
+        this rank cannot load at all. load_model then loads exactly what it returned.
+        """
+        return None
+
+    def close(self) -> None:
+        """Release what lookup or load_model holds, once the ranks rejected the load."""
 
     @abstractmethod
     def download_model(self, model_config: ModelConfig) -> None:
