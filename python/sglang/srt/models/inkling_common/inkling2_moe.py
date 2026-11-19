@@ -245,6 +245,8 @@ class Inkling2Experts(nn.Module):
         self.top_k = config.num_experts_per_tok
         self.route_scale = config.route_scale
         self.mega = None
+        self.w13_cutlass_scale = None
+        self.w2_cutlass_scale = None
         aligned = all(
             w.shape[1] % 128 == 0 and w.shape[2] % 64 == 0
             for w in (self.w13_weight, self.w2_weight)
@@ -334,7 +336,7 @@ class Inkling2Experts(nn.Module):
             swizzled = swizzle_blockscale(
                 getattr(self, name + "_scale").view(torch.uint8)
             )
-            current = getattr(self, name + "_cutlass_scale", None)
+            current = getattr(self, name + "_cutlass_scale")
             if current is None:
                 setattr(self, name + "_cutlass_scale", swizzled)
             else:

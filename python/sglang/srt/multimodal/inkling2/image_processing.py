@@ -4,10 +4,10 @@ import base64
 import io
 import json
 import os
-from dataclasses import dataclass
 from pathlib import Path
 from urllib.request import urlopen
 
+import msgspec
 import numpy as np
 import torch
 from PIL import Image
@@ -27,8 +27,7 @@ _MEAN = np.array([0.48145466, 0.4578275, 0.40821073], dtype=np.float32)
 _STD = np.array([0.26862954, 0.2613026, 0.2757771], dtype=np.float32)
 
 
-@dataclass(frozen=True)
-class HydratedVisionTokenSpan:
+class HydratedVisionTokenSpan(msgspec.Struct, frozen=True):
     int_tokens: list[int]
     vision_patches_bthwc: torch.Tensor
     vision_grid_thw: torch.Tensor

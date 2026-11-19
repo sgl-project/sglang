@@ -9,7 +9,7 @@ from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcesso
 from sglang.srt.multimodal.cache import resolve_multimodal_item_hash
 from sglang.srt.multimodal.encoder_preprocessing import EncoderPreprocessOutput
 from sglang.srt.multimodal.inkling2 import Inkling2ImageProcessor
-from sglang.srt.multimodal.media_io import download_remote_media
+from sglang.srt.multimodal.media_io import ImageData, download_remote_media
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.parser.inkling_tokenizer import IMAGE_TOKEN_ID
@@ -33,7 +33,7 @@ class Inkling2Processor:
 def _resolve_image(image):
     if isinstance(image, Mapping):
         image = image["url"]
-    elif hasattr(image, "url"):
+    elif isinstance(image, ImageData):
         image = image.url
     if isinstance(image, str) and image.startswith(("http://", "https://")):
         return download_remote_media(image, timeout=30)
@@ -171,9 +171,9 @@ class Inkling2MultimodalProcessor(BaseMultimodalProcessor):
         request_obj=None,
         **kwargs,
     ):
-        if audio_data or video_data or getattr(request_obj, "video_data", None):
+        if audio_data or video_data or request_obj.video_data:
             raise ValueError("Inkling2 supports text and images only")
-        input_ids = getattr(request_obj, "input_ids", None)
+        input_ids = request_obj.input_ids
         if input_ids is None:
             input_ids = (
                 self._tokenizer.encode(input_text, add_special_tokens=False)

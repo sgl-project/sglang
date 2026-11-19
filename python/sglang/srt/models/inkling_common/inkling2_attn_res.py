@@ -1,5 +1,4 @@
-from dataclasses import dataclass, field
-
+import msgspec
 import torch
 from torch import nn
 
@@ -71,11 +70,12 @@ class Inkling2AttnRes(nn.Module):
             ]
         )
         self.output_query = nn.Parameter(torch.zeros(hidden_dim, dtype=torch.float32))
+        self._scaled_queries: list[torch.Tensor] | None = None
 
     def scale_queries(self) -> None:
         """Cache queries * hidden**-0.5, updating in place on weight reload."""
         queries = [*self.attn_queries, *self.mlp_queries, self.output_query]
-        scaled = getattr(self, "_scaled_queries", None)
+        scaled = self._scaled_queries
         if scaled is None or len(scaled) != len(queries):
             self._scaled_queries = [q.float() * (q.shape[-1] ** -0.5) for q in queries]
             return
@@ -83,7 +83,7 @@ class Inkling2AttnRes(nn.Module):
             target.copy_(q.float() * (q.shape[-1] ** -0.5))
 
     def scaled_query(self, kind: str, layer_idx: int) -> torch.Tensor | None:
-        scaled = getattr(self, "_scaled_queries", None)
+        scaled = self._scaled_queries
         if scaled is None:
             return None
         n_attn = len(self.attn_queries)
@@ -112,11 +112,10 @@ class Inkling2AttnRes(nn.Module):
         )[0]
 
 
-@dataclass
-class Inkling2AttnResState:
+class Inkling2AttnResState(msgspec.Struct):
     attn_res: Inkling2AttnRes
     partial: torch.Tensor
-    blocks: list[torch.Tensor] = field(default_factory=list)
+    blocks: list[torch.Tensor] = []
 
     def attention_input(self, layer_idx: int) -> tuple[torch.Tensor, ...]:
         if not self.blocks:
