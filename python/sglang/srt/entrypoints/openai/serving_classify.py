@@ -12,7 +12,6 @@ from fastapi.responses import ORJSONResponse
 from sglang.srt.configs.embedding_model_spec import EmbeddingTask
 from sglang.srt.entrypoints.openai.protocol import (
     DEFAULT_CLASSIFICATION_THRESHOLD,
-    ClassifyData,
     ClassifyRequest,
     ClassifyResponse,
     ErrorResponse,
@@ -165,65 +164,6 @@ class OpenAIServingClassify(OpenAIServingBase):
         response = self._build_classify_response(ret, threshold=request.threshold)
         return response
 
-    def _get_positive_labels(self, probs: List[float], threshold: float) -> List[str]:
-        return [
-            self.id2label[class_id]
-            for class_id, prob in enumerate(probs)
-            if prob >= threshold and class_id in self.id2label
-        ]
-
-    def _classify_result(
-        self,
-        index: int,
-        scores: Union[float, List[float], List[List[float]]],
-        threshold: float,
-    ) -> ClassifyData:
-        is_multi_label = self.problem_type == "multi_label_classification"
-        # Single-score sequence heads may return scalars, including 0.0.
-        if isinstance(scores, (int, float)):
-            scores = [scores]
-        if not scores and not self.is_token_classifier:
-            return ClassifyData(
-                index=index,
-                label=[] if is_multi_label else "Default",
-                probs=[1.0],
-                num_classes=1,
-            )
-
-        expected_shape = (
-            "[tokens, classes]" if self.is_token_classifier else "[classes]"
-        )
-        expected_rank = 2 if self.is_token_classifier else 1
-        try:
-            logits = torch.tensor(scores, dtype=torch.float32)
-        except (TypeError, ValueError) as exc:
-            raise RuntimeError(
-                f"Expected classifier scores shaped {expected_shape}"
-            ) from exc
-        if logits.ndim != expected_rank or not logits.numel():
-            raise RuntimeError(
-                f"Expected nonempty classifier scores shaped {expected_shape}, "
-                f"got {tuple(logits.shape)}"
-            )
-
-        probs = self.activation(logits).tolist()
-        if is_multi_label:
-            label = (
-                [self._get_positive_labels(row, threshold) for row in probs]
-                if self.is_token_classifier
-                else self._get_positive_labels(probs, threshold)
-            )
-        else:
-            top_classes = logits.argmax(dim=-1).tolist()
-            label = (
-                [self.id2label[class_id] for class_id in top_classes]
-                if self.is_token_classifier
-                else self.id2label[top_classes]
-            )
-        return ClassifyData(
-            index=index, label=label, probs=probs, num_classes=logits.shape[-1]
-        )
-
     def _build_classify_response(
         self,
         ret: List[Dict[str, Any]],
@@ -235,6 +175,7 @@ class OpenAIServingClassify(OpenAIServingBase):
         classify_objects = []
         prompt_tokens = 0
         total_latency = 0.0
+        is_multi_label = self.problem_type == "multi_label_classification"
 
         for i, item in enumerate(ret):
             embedding = item.get("embedding", [])
@@ -243,7 +184,42 @@ class OpenAIServingClassify(OpenAIServingBase):
             prompt_tokens += meta_info.get("prompt_tokens", 0)
             total_latency += meta_info.get("e2e_latency", 0.0)
 
-            classify_objects.append(self._classify_result(i, embedding, threshold))
+            if isinstance(embedding, (int, float)):
+                embedding = [embedding]
+            if embedding or self.is_token_classifier:
+                # Treat a sequence as a single score row for activation and labeling.
+                rows = embedding if self.is_token_classifier else [embedding]
+                try:
+                    embedding_tensor = torch.tensor(rows, dtype=torch.float32)
+                    if embedding_tensor.ndim != 2 or not embedding_tensor.numel():
+                        raise ValueError("expected nonempty score rows")
+                except (TypeError, ValueError) as e:
+                    shape = (
+                        "[tokens, classes]" if self.is_token_classifier else "[classes]"
+                    )
+                    raise RuntimeError(f"Expected {shape} scores for item {i}") from e
+
+                probs = self.activation(embedding_tensor).tolist()
+                if is_multi_label:
+                    label = [self._get_positive_labels(row, threshold) for row in probs]
+                else:
+                    class_ids = embedding_tensor.argmax(dim=-1).tolist()
+                    label = [self.id2label[class_id] for class_id in class_ids]
+                num_classes = len(probs[0])
+                if not self.is_token_classifier:
+                    probs, label = probs[0], label[0]
+            else:
+                probs = [1.0]
+                label = [] if is_multi_label else "Default"
+                num_classes = 1
+
+            classify_obj = {
+                "index": i,
+                "label": label,
+                "probs": probs,
+                "num_classes": num_classes,
+            }
+            classify_objects.append(classify_obj)
 
         response = {
             "id": request_id,
@@ -260,3 +236,10 @@ class OpenAIServingClassify(OpenAIServingBase):
         }
 
         return ClassifyResponse(**response)
+
+    def _get_positive_labels(self, probs: List[float], threshold: float) -> List[str]:
+        return [
+            self.id2label[class_id]
+            for class_id, prob in enumerate(probs)
+            if prob >= threshold and class_id in self.id2label
+        ]
