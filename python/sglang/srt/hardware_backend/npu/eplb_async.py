@@ -23,6 +23,7 @@ from sglang.srt.hardware_backend.npu.eplb_coordinator import (
     AsyncEplbCoordinator,
     WeightWriteback,
 )
+from sglang.srt.hardware_backend.npu.eplb_placement import plan_migration
 from sglang.srt.utils import get_bool_env_var
 
 logger = logging.getLogger(__name__)
@@ -198,17 +199,13 @@ class NpuEplbRuntime:
         if not host.any().item():
             return None
 
-        physical, logical = self.spec.compute(host)
-        old = self.metadata.physical_to_logical_map_cpu
-        if physical.shape != old.shape:
-            raise ValueError("EPLB plan changed physical capacity")
-        moved = (physical != old).any(dim=1).tolist()
-        changed = tuple(layer for layer in self.layer_ids if moved[layer])
-        # All ranks start with the same layout and commit layers together.
-        # An unchanged plan only needs the completion message.
-        if not changed:
-            return None
-        return changed, physical, logical
+        return plan_migration(
+            host,
+            self.metadata.physical_to_logical_map_cpu,
+            self.spec,
+            self.ranks_per_node,
+            self.layer_ids,
+        )
 
     def prepare(self, placement):
         if placement is None:
