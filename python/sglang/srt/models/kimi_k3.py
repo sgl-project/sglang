@@ -48,6 +48,7 @@ from sglang.srt.layers.cp.interleave import (
 from sglang.srt.layers.dcp.layout import set_dsa_shards_index_k
 from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
 from sglang.srt.layers.dp_attention import (
+    _note_dp_gather_in_prefill_graph,
     is_allocation_symmetric,
     is_dp_attention_enabled,
 )
@@ -158,6 +159,7 @@ from sglang.srt.runtime_context import (
     linear_attn_parallel_group,
     linear_attn_tp_rank,
     linear_attn_tp_size,
+    shared_experts_tp_spans_dp,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import is_gfx95_supported, is_hip, is_npu
@@ -717,6 +719,16 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
             self._ep_a2a and shared_tp is not None and shared_tp > 1
         )
         self._shared_experts_tp_group = None
+        # Spans DP ranks: rows differ per rank and idle ranks must join the collectives.
+        self._shared_experts_tp_across_dp = (
+            self._shared_experts_tp_comm
+            and requested_shared_tp is not None
+            and shared_experts_tp_spans_dp(
+                attn_tp_size=parallel.attn_tp_size,
+                attn_cp_size=parallel.attn_cp_size,
+                attn_dp_size=parallel.attn_dp_size,
+            )
+        )
         shared_experts_parallel_group = None
         if self._shared_experts_tp1:
             shared_experts_parallel_group = "replicated"
@@ -735,6 +747,12 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
             # The full TP group, which _reduce_shared sums over, whatever the
             # dense MLP's sharding.
             shared_experts_parallel_group = "tp"
+        self._shared_experts_tp_sp_comm = self._shared_experts_tp_across_dp and list(
+            self._shared_experts_tp_group.ranks
+        ) == list(parallel.tp_group.ranks)
+        if self._shared_experts_tp_sp_comm:
+            # Collective workspace request: every rank, before graph capture.
+            k3_sp_collective.tp_group_state()
         if self.num_shared_experts is not None and self.num_shared_experts > 0:
             shared_intermediate_size = moe_intermediate_size * self.num_shared_experts
             if shared_tp is not None and shared_intermediate_size % shared_tp != 0:
@@ -1255,23 +1273,41 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
             return self._latent_norm(latent)
         return self._latent_norm(tensor_model_parallel_all_reduce(latent))
 
+    def _shared_tp_sp_state(self, rows: int):
+        if not self._shared_experts_tp_sp_comm:
+            return None
+        return k3_sp_collective.tp_rows_state(
+            rows * self._shared_experts_tp_group.world_size
+        )
+
     def _gather_shared_expert_inputs(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        group = self._shared_experts_tp_group
-        # The attention DP buffer spans the entire attention-TP replica.
-        # Size this buffer from the subgroup's actual token shards instead.
-        with use_symmetric_memory(group, disabled=not is_allocation_symmetric()):
-            gathered = hidden_states.new_empty(
-                (hidden_states.shape[0] * group.world_size, *hidden_states.shape[1:])
-            )
-        group.all_gather_into_tensor(gathered, hidden_states)
-        return gathered
+        rows = hidden_states.shape[0]
+        if self._shared_experts_tp_across_dp:
+            rows = k3_sp_collective.dp_max_rows(rows)
+            # A prefill graph holding this replays only when every DP rank runs its bucket.
+            _note_dp_gather_in_prefill_graph()
+        # The direct strategy's output stays valid until the next layer's gather.
+        return k3_sp_collective.all_gather_rows(
+            hidden_states,
+            rows,
+            self._shared_experts_tp_group,
+            self._shared_tp_sp_state(rows),
+            "shared_tp_all_gather",
+            symmetric_fallback=True,
+        )
 
     def _reduce_scatter_shared_experts(
         self, shared_output: torch.Tensor, hidden_states: torch.Tensor
     ) -> torch.Tensor:
-        output = torch.empty_like(hidden_states)
-        self._shared_experts_tp_group.reduce_scatter_tensor(output, shared_output)
-        return output
+        group = self._shared_experts_tp_group
+        # The down_proj output is not in symmetric storage.
+        return k3_sp_collective.reduce_scatter_rows(
+            shared_output,
+            hidden_states.shape[0],
+            group,
+            self._shared_tp_sp_state(shared_output.shape[0] // group.world_size),
+            input_symmetric=False,
+        )
 
     def _forward_shared_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Run TP-sharded shared experts while DeepEP tokens stay scattered."""
@@ -1336,7 +1372,9 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
 
         def issue_shared():
             nonlocal shared_input, shared_output, shared_event
-            if self.shared_experts is None or hidden_states.shape[0] == 0:
+            if self.shared_experts is None or (
+                hidden_states.shape[0] == 0 and not self._shared_experts_tp_across_dp
+            ):
                 return
             if fine_grained_overlap:
                 # Fork before the routed front so HCCL's completion wait is
