@@ -8,7 +8,7 @@ from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
 from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_xpu_ci(est_time=10, suite="stage-b-test-1-gpu-xpu")
+register_xpu_ci(est_time=10, suite="extra-test-1-gpu-xpu")
 
 DEVICE = "xpu"
 
