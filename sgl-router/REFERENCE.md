@@ -213,11 +213,25 @@ client sent. The router picks the first of these that applies:
 1. A hash of the sticky routing key or session id, so a conversation keeps
    its rank and router replicas agree.
 2. The rank with the deepest cached prefix in the local KV tree.
-3. The rank with the fewest requests this router has in flight on it, or with
-   `--dp-rank-policy round_robin`, the worker's ranks in turn.
+3. The rank with the fewest requests this router has in flight on it; with
+   `--dp-rank-policy round_robin`, the worker's ranks in turn; or with
+   `--dp-rank-policy least_tokens`, the rank expected to hold the fewest KV
+   tokens: the tokens it has committed, in use plus the prompts of requests
+   still queued, as the engine reports them on its `--load-publish-endpoint`
+   feed, which sees every router replica's traffic, plus every request it
+   holds, and every request this router has sent it since that reading, at
+   a typical request's KV (the median request's KV, from the ranks' mean KV
+   per request weighted by the requests each holds, so a few long-context
+   requests do not inflate what short requests are charged). Expected rather
+   than current KV because KV in use lags: a rank whose requests are all
+   young holds little now and the most later. Ties, and a worker without a
+   fresh reading for every one of its ranks, fall back to the in-flight
+   count.
 
-In PD mode, decode is ranked by step 3 only. The decode request names the
-prefill rank in `disagg_prefill_dp_rank`, and the bootstrap room satisfies
+In PD mode, decode is ranked by step 3 only, under `--decode-dp-rank-policy`
+when set and `--dp-rank-policy` otherwise, so prefill and decode can balance
+by different signals. The decode request names the prefill rank in
+`disagg_prefill_dp_rank`, and the bootstrap room satisfies
 `room % prefill_dp_size == prefill_rank`.
 
 A decode rank picked on arrival only starts decoding once prefill has queued,

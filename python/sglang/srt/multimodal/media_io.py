@@ -36,7 +36,7 @@ import torch
 from PIL import Image, ImageOps, UnidentifiedImageError
 from typing_extensions import Literal
 
-from sglang.srt.utils.device import is_cuda
+from sglang.srt.utils.device import is_cuda, is_npu
 from sglang.srt.utils.video_decoder import _BACKEND, VideoDecoderWrapper
 
 logger = logging.getLogger(__name__)
@@ -560,7 +560,7 @@ def _load_image(
     gpu_image_decode: GPUImageDecodeMode = True,
 ) -> Union[torch.Tensor, Image.Image]:
     """
-    Try to decode JPEG with nvJPEG on GPU and return a torch device tensor,
+    Try device JPEG decoding and return a torch device tensor,
     otherwise fallback to decode with PIL on CPU and return a PIL Image.
     Keep the fallback path since nvJPEG may fail on some JPEG images that are not strictly compliant with the standard, while PIL is more tolerant.
     """
@@ -587,6 +587,15 @@ def _load_image(
                     "Failed to decode JPEG on GPU, falling back to CPU. Error: %s",
                     e,
                 )
+    elif is_npu() and gpu_image_decode is True:
+        # DVPP supports ordinary decoding; models requesting "nvjpeg_fancy" use PIL.
+        from sglang.srt.hardware_backend.npu.jpeg import (
+            decode_jpeg as decode_jpeg_with_dvpp,
+        )
+
+        image_tensor = decode_jpeg_with_dvpp(image_bytes)
+        if image_tensor is not None:
+            return image_tensor
     try:
         image = Image.open(BytesIO(image_bytes))
     except (OSError, SyntaxError) as e:

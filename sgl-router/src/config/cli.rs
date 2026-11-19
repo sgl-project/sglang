@@ -265,10 +265,17 @@ pub struct RoutingArgs {
     #[arg(long)]
     pub dp_aware: bool,
 
-    /// How --dp-aware picks a rank that no routing key or cached prefix decides,
-    /// which in PD mode is every decode rank. Defaults to least_in_flight.
+    /// How --dp-aware picks a rank that no routing key or cached prefix decides.
+    /// Defaults to least_in_flight; least_tokens needs the engine's
+    /// --load-publish-endpoint feed. In PD mode this is the prefill rank; the
+    /// decode rank follows --decode-dp-rank-policy.
     #[arg(long, value_enum, requires = "dp_aware")]
     pub dp_rank_policy: Option<DpRankPolicy>,
+
+    /// How --dp-aware picks the PD decode rank, which no routing key or cached
+    /// prefix ever decides. Defaults to --dp-rank-policy.
+    #[arg(long, value_enum, requires = "dp_aware")]
+    pub decode_dp_rank_policy: Option<DpRankPolicy>,
 
     /// Static bucket configuration JSON; the reorg schema with --chat-routing reorg.
     /// Omit to use the global candidate domain (default buckets with reorg).
@@ -673,6 +680,7 @@ impl Cli {
                 decode_policy: self.routing.decode_policy,
                 dp_aware: self.routing.dp_aware,
                 dp_rank_policy: self.routing.dp_rank_policy.unwrap_or_default(),
+                decode_dp_rank_policy: self.routing.decode_dp_rank_policy,
                 bucket_config,
                 reorg_buckets,
                 reorg_admission,
@@ -3156,6 +3164,42 @@ mod tests {
             legacy_config.model.decode_policy,
             DecodePolicyKind::LegacyHostAffinity
         );
+    }
+
+    #[test]
+    fn dp_rank_policy_requires_dp_aware_and_accepts_least_tokens() {
+        assert_eq!(
+            cfg_of("--policy power_of_two --dp-aware")
+                .unwrap()
+                .model
+                .dp_rank_policy,
+            DpRankPolicy::LeastInFlight
+        );
+        assert_eq!(
+            cfg_of("--policy power_of_two --dp-aware --dp-rank-policy least_tokens")
+                .unwrap()
+                .model
+                .dp_rank_policy,
+            DpRankPolicy::LeastTokens
+        );
+        assert!(cfg_of("--policy power_of_two --dp-rank-policy least_tokens").is_err());
+    }
+
+    #[test]
+    fn decode_dp_rank_policy_defaults_to_dp_rank_policy_and_can_differ() {
+        let model = |args: &str| cfg_of(args).unwrap().model;
+        let inherited = model("--policy power_of_two --dp-aware --dp-rank-policy least_tokens");
+        assert_eq!(inherited.decode_dp_rank_policy(), DpRankPolicy::LeastTokens);
+        let split = model("--policy power_of_two --dp-aware --decode-dp-rank-policy least_tokens");
+        assert_eq!(split.dp_rank_policy, DpRankPolicy::LeastInFlight);
+        assert_eq!(split.decode_dp_rank_policy(), DpRankPolicy::LeastTokens);
+        let both = model(
+            "--policy power_of_two --dp-aware --dp-rank-policy round_robin \
+             --decode-dp-rank-policy least_in_flight",
+        );
+        assert_eq!(both.dp_rank_policy, DpRankPolicy::RoundRobin);
+        assert_eq!(both.decode_dp_rank_policy(), DpRankPolicy::LeastInFlight);
+        assert!(cfg_of("--policy power_of_two --decode-dp-rank-policy least_tokens").is_err());
     }
 
     #[test]
