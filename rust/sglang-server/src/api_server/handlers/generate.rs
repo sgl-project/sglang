@@ -106,9 +106,9 @@ impl CoreHandle {
         self.inner.request_log.as_ref()?.crash_dump_snapshot()
     }
 
-    /// [`Self::hold_generation`] once [`Self::admit_count`] has passed the
-    /// pause gate. The count comes from that one gate, so a request that
-    /// arrives during an update waits it out.
+    /// Register `rid` once [`Self::admit_count`] has passed the pause gate.
+    /// The count comes from that one gate, so a request that arrives during
+    /// an update waits it out.
     pub(crate) async fn hold_admitted_generation(&self, rid: &str) -> PendingGeneration {
         let in_flight = self.admit_count(1).await.remove(0);
         PendingGeneration {
@@ -121,12 +121,10 @@ impl CoreHandle {
     }
 
     /// Register a generation under the public ID `rid` before its request
-    /// exists, so an explicit cancellation in the meantime is kept for
-    /// [`Self::generate_pending`]. The hold counts as in flight: the drain
-    /// waits for the work before `/generate` as for media prefetch.
-    /// Does not wait out a pause. Production admission goes through
-    /// [`Self::hold_admitted_generation`], which drops the count if an
-    /// update paused in between.
+    /// exists, and count it in flight immediately. Does not wait out a pause.
+    /// Unit tests use this. Production admission goes through
+    /// [`Self::hold_admitted_generation`].
+    #[cfg(test)]
     pub(crate) fn hold_generation(&self, rid: &str) -> PendingGeneration {
         PendingGeneration {
             generation: self
@@ -137,9 +135,9 @@ impl CoreHandle {
         }
     }
 
-    /// [`Self::generate`] for a request held by [`Self::hold_generation`]
-    /// and claimed by it ([`PendingGeneration::claim`]): a cancellation that
-    /// selected the hold ends the call without starting the request.
+    /// [`Self::generate`] for a request already held and claimed by it
+    /// ([`PendingGeneration::claim`]): a cancellation that selected the hold
+    /// ends the call without starting the request.
     pub(crate) async fn generate_pending(
         &self,
         request: GenerateRequest,
@@ -883,7 +881,7 @@ impl Drop for Generation {
 }
 
 /// A generation registered for explicit cancellation before its request
-/// exists ([`CoreHandle::hold_generation`]). Dropping it unregisters it.
+/// exists. Dropping it unregisters it.
 pub(crate) struct PendingGeneration {
     generation: Generation,
     /// Holds the drain open until the request ends or the hold drops.
