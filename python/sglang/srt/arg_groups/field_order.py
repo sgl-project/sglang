@@ -537,6 +537,7 @@ POSITIONAL_FIELD_ORDER = (
     "enable_megamoe_for_layernorm_sp",
     "enable_http_worker_reuseport",
     "prefill_decode_interval_min_bs",
+    "prefill_decode_interval_scale_with_backlog",
     "unified_cache_external_linker_config",
     "enable_return_aux_hidden_states",
     "aux_hidden_state_capture",

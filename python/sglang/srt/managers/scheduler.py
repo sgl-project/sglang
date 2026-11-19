@@ -1444,6 +1444,9 @@ class Scheduler(
         self.prefill_decode_interval_min_bs = (
             get_schedule().prefill_decode_interval_min_bs
         )
+        self.prefill_decode_interval_scale_with_backlog = (
+            get_schedule().prefill_decode_interval_scale_with_backlog
+        )
         uses_transformers_backend = (
             get_resolved_model_impl(self.model_config) == ModelImpl.TRANSFORMERS
         )
@@ -1531,7 +1534,20 @@ class Scheduler(
             else batch.forward_mode.is_extend()
         )
         if is_extend:
-            self._prefill_decode_interval_remaining = self.prefill_decode_interval
+            self._prefill_decode_interval_remaining = self._backlog_scaled_interval()
+
+    def _backlog_scaled_interval(self) -> int:
+        if not self.prefill_decode_interval_scale_with_backlog:
+            return self.prefill_decode_interval
+        # A full interval under a long queue caps admission below what decode
+        # can absorb; shrink it by the share of requests already running.
+        running = len(self.running_reqs)
+        waiting = len(self.waiting_queue)
+        if waiting == 0:
+            return self.prefill_decode_interval
+        return max(
+            1, round(self.prefill_decode_interval * running / (running + waiting))
+        )
 
     def init_metrics_reporter(self) -> None:
         # Override point for deployments that need a specialized reporter.
