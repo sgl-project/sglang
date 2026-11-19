@@ -9,6 +9,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+from pydantic import ValidationError
 from transformers import PreTrainedConfig
 
 from sglang.srt.entrypoints.openai.protocol import ClassifyRequest, ClassifyResponse
@@ -42,6 +43,7 @@ class TestServingClassify(CustomTestCase):
             self.assertAlmostEqual(actual, expected, places=6)
         self.assertGreater(sum(item.probs), 1.0)
         self.assertEqual(item.label, "category_0")
+        self.assertEqual(item.labels, ["category_0", "category_1"])
         self.assertEqual(item.num_classes, 3)
 
     def test_single_label_and_unset_problem_types_use_softmax(self):
@@ -52,6 +54,7 @@ class TestServingClassify(CustomTestCase):
                     [{"embedding": [2.0, 2.0]}]
                 ).data[0]
                 self.assertEqual(item.probs, [0.5, 0.5])
+                self.assertNotIn("labels", item.model_dump(mode="json"))
 
     def test_regression_returns_raw_scores(self):
         for embedding, scores in (
@@ -66,6 +69,7 @@ class TestServingClassify(CustomTestCase):
                 ).data[0]
                 self.assertEqual(item.probs, scores)
                 self.assertEqual(item.num_classes, len(scores))
+                self.assertNotIn("labels", item.model_dump(mode="json"))
 
     def test_missing_problem_type_keeps_softmax(self):
         serving = self._serving(
@@ -90,6 +94,12 @@ class TestServingClassify(CustomTestCase):
         ).data[0]
         self.assertEqual(item.probs, [0.0, 0.5, 1.0])
         self.assertEqual(item.label, "category_2")
+        self.assertEqual(item.labels, ["category_1", "category_2"])
+
+    def test_threshold_must_be_between_zero_and_one(self):
+        for threshold in (-0.01, 1.01, float("nan"), float("inf")):
+            with self.subTest(threshold=threshold), self.assertRaises(ValidationError):
+                ClassifyRequest(input="example", threshold=threshold)
 
     def test_single_and_batched_requests(self):
         for batched in (False, True):
@@ -105,8 +115,10 @@ class TestServingClassify(CustomTestCase):
                     yield outputs if batched else outputs[0]
 
                 serving.tokenizer_manager.generate_request = generate_request
-                request = ClassifyRequest(
-                    input=["first", "second"] if batched else "first"
+                request = (
+                    ClassifyRequest(input=["first", "second"], threshold=0.9)
+                    if batched
+                    else ClassifyRequest(input="first")
                 )
                 response = asyncio.run(serving.handle_request(request, None))
                 self.assertIsInstance(response, ClassifyResponse)
@@ -119,6 +131,7 @@ class TestServingClassify(CustomTestCase):
                 for i, item in enumerate(payload["data"]):
                     self.assertEqual(item["index"], i)
                     self.assertEqual(item["label"], f"category_{1 - i}")
+                    self.assertEqual(item["labels"], [] if batched else ["category_1"])
                     self.assertEqual(item["num_classes"], 2)
                     self.assertAlmostEqual(item["probs"][1 - i], 0.880797, places=6)
                     self.assertAlmostEqual(item["probs"][i], 0.119203, places=6)

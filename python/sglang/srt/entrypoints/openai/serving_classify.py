@@ -10,6 +10,7 @@ from fastapi import Request
 from fastapi.responses import ORJSONResponse
 
 from sglang.srt.entrypoints.openai.protocol import (
+    DEFAULT_CLASSIFICATION_THRESHOLD,
     ClassifyRequest,
     ClassifyResponse,
     ErrorResponse,
@@ -35,6 +36,8 @@ class OpenAIServingClassify(OpenAIServingBase):
         super().__init__(tokenizer_manager)
         self.template_manager = template_manager
         self.id2label = self._get_id2label_mapping()
+        hf_config = tokenizer_manager.model_config.hf_config
+        self.problem_type = getattr(hf_config, "problem_type", None)
         self.activation = self._get_clf_activation()
         self.model_name = (
             self.tokenizer_manager.served_model_name
@@ -110,11 +113,9 @@ class OpenAIServingClassify(OpenAIServingBase):
 
     def _get_clf_activation(self) -> torch.nn.Module:
         """Select the output activation from the loaded checkpoint config."""
-        hf_config = self.tokenizer_manager.model_config.hf_config
-        problem_type = getattr(hf_config, "problem_type", None)
-        if problem_type == "regression":
+        if self.problem_type == "regression":
             return torch.nn.Identity()
-        if problem_type == "multi_label_classification":
+        if self.problem_type == "multi_label_classification":
             return torch.nn.Sigmoid()
         # Single-label classification and the legacy default normalize across labels.
         return torch.nn.Softmax(dim=-1)
@@ -156,18 +157,25 @@ class OpenAIServingClassify(OpenAIServingBase):
         if not isinstance(ret, list):
             ret = [ret]
 
-        response = self._build_classify_response(ret)
+        response = self._build_classify_response(ret, threshold=request.threshold)
         return response
 
-    def _build_classify_response(self, ret: List[Dict[str, Any]]) -> ClassifyResponse:
+    def _build_classify_response(
+        self,
+        ret: List[Dict[str, Any]],
+        *,
+        threshold: float = DEFAULT_CLASSIFICATION_THRESHOLD,
+    ) -> ClassifyResponse:
         request_id = f"{self._request_id_prefix()}{uuid.uuid4().hex}"
         created_time = int(time.time())
         classify_objects = []
         prompt_tokens = 0
         total_latency = 0.0
+        is_multi_label = self.problem_type == "multi_label_classification"
 
         for i, item in enumerate(ret):
             embedding = item.get("embedding", [])
+            labels = [] if is_multi_label else None
             # Single-score model heads may return scalars, including 0.0.
             if isinstance(embedding, (int, float)):
                 embedding = [embedding]
@@ -184,6 +192,12 @@ class OpenAIServingClassify(OpenAIServingBase):
                     predicted_class = torch.argmax(embedding_tensor).item()
 
                     label = self.id2label[predicted_class]
+                    if is_multi_label:
+                        labels = [
+                            self.id2label[class_id]
+                            for class_id, prob in enumerate(probs)
+                            if prob >= threshold and class_id in self.id2label
+                        ]
 
                 except Exception as e:
                     logger.error(f"Error processing embedding for item {i}: {e}")
@@ -196,6 +210,7 @@ class OpenAIServingClassify(OpenAIServingBase):
             classify_obj = {
                 "index": i,
                 "label": label,
+                "labels": labels,
                 "probs": probs,
                 "num_classes": len(probs),
             }
