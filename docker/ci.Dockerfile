@@ -4,13 +4,13 @@
 # scripts/ci/cuda/ci_install_dependency.sh builds, so a job's install step only
 # installs the PR's checkout. It is not a runner; the host provides one.
 
-ARG CUDA_VERSION=13.0.3
+ARG CUDA_VERSION=13.4.1
 
 FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu22.04
 
 # Must match the CU_VERSION the rest of the fleet installs, or these runners test
-# a different torch and kernel stack.
-ARG CU_VERSION=cu130
+# a different torch and kernel stack; cu134 needs main on torch 2.15.
+ARG CU_VERSION=cu134
 # 1 for SM100+ (B200, B300, GB300), 0 for older GPUs; at job time the install
 # script detects the GPU, and a mismatch reinstalls the dependency set.
 ARG IS_BLACKWELL=1

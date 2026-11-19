@@ -20,11 +20,11 @@ on:
       cu_version:
         description: "CU_VERSION the install script uses; keep in step with the fleet"
         required: false
-        default: "cu130"
+        default: "cu134"
       cuda_version:
         description: "CUDA base image version"
         required: false
-        default: "13.0.3"
+        default: "13.4.1"
       tag:
         description: "Custom tag suffix, e.g. 'my-test' -> dev-ci-blackwell-my-test. Empty publishes the rolling and nightly tags."
         required: false
@@ -99,8 +99,8 @@ jobs:
       - name: Build and push ${{ matrix.arch }} image
         env:
           IS_BLACKWELL: ${{ env.GPU_FAMILY == 'blackwell' && '1' || '0' }}
-          CU_VERSION: ${{ inputs.cu_version || 'cu130' }}
-          CUDA_VERSION: ${{ inputs.cuda_version || '13.0.3' }}
+          CU_VERSION: ${{ inputs.cu_version || 'cu134' }}
+          CUDA_VERSION: ${{ inputs.cuda_version || '13.4.1' }}
         run: |
           set -euo pipefail
           docker buildx build \
