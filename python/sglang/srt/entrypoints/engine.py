@@ -138,6 +138,7 @@ from sglang.srt.runtime_context import (
     get_observability,
     get_parallel,
     get_serving,
+    is_control_broadcast_local,
     publish,
     restore_context,
     snapshot_context,
@@ -1941,6 +1942,13 @@ class Engine(EngineScoreMixin, EngineBase):
     """
 
     def collective_rpc(self, method: str, **kwargs):
+        if is_control_broadcast_local():
+            raise ValueError(
+                "collective_rpc needs the global control broadcast, but each "
+                "attention-DP group broadcasts its own control requests here "
+                "(dp_attention_local_control_broadcast, set by its flag or "
+                "implied by the deployment, or an elastic EP joiner)."
+            )
         obj = RpcReqInput(method=method, parameters=kwargs)
         sock_send(self.send_to_rpc, obj)
         recv_req = sock_recv(self.send_to_rpc, flags=zmq.BLOCKY)

@@ -55,6 +55,7 @@ from sglang.srt.runtime_context import (
     get_serving,
     get_spec,
     is_scheduler_io_rank,
+    is_scheduler_rpc_rank,
     publish,
     spawn_world_rank,
 )
@@ -67,7 +68,6 @@ import psutil  # isort: skip
 import setproctitle
 import torch
 import torch.distributed
-from torch.distributed import barrier
 
 if TYPE_CHECKING:
     from torch.cuda import Stream as CudaStream
@@ -893,6 +893,7 @@ class Scheduler(
         self.ipc_channels = SchedulerIpcChannels.create(
             port_args=port_args,
             is_rank_zero=is_rank_zero,
+            is_rpc_rank=is_scheduler_rpc_rank(),
             # The snapshot taken at construction, not a second bag read: this
             # scheduler gates its tokenizer init on the same value, and the two
             # must not be able to disagree.
@@ -930,11 +931,12 @@ class Scheduler(
             and get_parallel().attn_cp_rank == 0
             and get_device().sleep_on_idle
         ):
+            io_sockets = (
+                self.ipc_channels.recv_from_tokenizer,
+                self.ipc_channels.recv_from_rpc,
+            )
             self.idle_sleeper = IdleSleeper(
-                sockets=[
-                    self.ipc_channels.recv_from_tokenizer,
-                    self.ipc_channels.recv_from_rpc,
-                ],
+                sockets=[s for s in io_sockets if s is not None],
                 can_empty_cache=lambda: not self.pause_state.paused,
             )
         else:
@@ -6470,8 +6472,7 @@ class Scheduler(
             f"handle_rpc_request: {recv_req.method}, param: {recv_req.parameters}"
         )
 
-        success = True
-        exec = None
+        error = None
         try:
             func = getattr(self, recv_req.method)
             if recv_req.parameters is not None:
@@ -6479,12 +6480,16 @@ class Scheduler(
             else:
                 func()
         except Exception as e:
-            success = False
-            exec = e
-            logger.error(f"Failed to call rpc {recv_req.method}: {str(e)}")
+            error = str(e)
+            logger.error(f"Failed to call rpc {recv_req.method}: {error}")
 
-        barrier(group=self.tp_group.cpu_group)
-        return RpcReqOutput(success=success, message="" if not exec else str(exec))
+        # Only the RPC rank replies, so it collects every rank's error.
+        rank_errors = [None] * self.tp_group.world_size
+        torch.distributed.all_gather_object(
+            rank_errors, error, group=self.tp_group.cpu_group
+        )
+        errors = [e for e in dict.fromkeys(rank_errors) if e is not None]
+        return RpcReqOutput(success=not errors, message="; ".join(errors))
 
     def handle_update_weight_version(
         self, recv_req: UpdateWeightVersionReqInput
