@@ -2370,6 +2370,39 @@ class TestEstimatedPerfConstants(CustomTestCase):
             self.reporter._linear_flops_per_token, 6.0 * 256 * 1024 * 2
         )
 
+    def test_every_known_non_gated_architecture_is_still_recognized(self):
+        # Regression guard, one per real non-gated sglang model class: a
+        # previous version of this fix switched from an activation-name
+        # heuristic (hidden_act in a denylist) to an architecture-name
+        # heuristic, but only ported over the architectures covered by the
+        # motivating examples in the diff (StarCoder2, Apertus) -- silently
+        # dropping ArceeForCausalLM (arcee.py: up_proj-only, hidden_act
+        # "relu2"), OPTForCausalLM (opt.py: fc1+fc2, hidden_act "relu"), and
+        # PhiForCausalLM (phi.py: fc1+fc2, hidden_act "gelu_new"), all of
+        # which the old activation-based heuristic classified correctly.
+        # Each entry here must independently resolve to non-gated.
+        for arch in (
+            "GPT2LMHeadModel",
+            "GPTBigCodeForCausalLM",
+            "Starcoder2ForCausalLM",
+            "ApertusForCausalLM",
+            "ArceeForCausalLM",
+            "OPTForCausalLM",
+            "PhiForCausalLM",
+        ):
+            with self.subTest(arch=arch):
+                config = _fake_model_config(
+                    hidden_size=256,
+                    num_attention_layers=2,
+                    head_dim=0,
+                    hf_text_config_overrides={"intermediate_size": 1024},
+                    hf_config=types.SimpleNamespace(architectures=[arch]),
+                )
+                self._init(config)
+                self.assertAlmostEqual(
+                    self.reporter._linear_flops_per_token, 4.0 * 256 * 1024 * 2
+                )
+
     def test_pure_ssm_has_zero_mlp_cost(self):
         # FalconMamba/Mamba/Mamba2 layers are a Mamba mixer only -- no MLP
         # sublayer at all (see PURE_SSM_ARCHITECTURES in model_config.py).

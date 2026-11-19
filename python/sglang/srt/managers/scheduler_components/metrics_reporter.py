@@ -834,6 +834,9 @@ class SchedulerMetricsReporter:
                 "GPTBigCodeForCausalLM",
                 "Starcoder2ForCausalLM",
                 "ApertusForCausalLM",
+                "ArceeForCausalLM",
+                "OPTForCausalLM",
+                "PhiForCausalLM",
             }
             model_architectures = (
                 getattr(getattr(model_config, "hf_config", None), "architectures", None)
