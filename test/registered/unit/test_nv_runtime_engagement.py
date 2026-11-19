@@ -22,8 +22,10 @@ from unittest.mock import patch
 import msgspec
 
 from sglang.srt.arg_groups import overrides
+from sglang.srt.disaggregation import decode_freed_slots
 from sglang.srt.environ import nv_mega_runtime_switches
 from sglang.srt.models.qwen3_5 import Qwen3_5MoeForConditionalGeneration
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, published_topology
@@ -220,7 +222,25 @@ SHAPES = {
 }
 
 
-RESOLVERS: Dict[str, Callable[[Shape], bool]] = {}
+def _overlap_loop(shape: Shape) -> bool:
+    return not shape.args.get("disable_overlap_schedule", False)
+
+
+def _pd_decode_overlap_loop(shape: Shape) -> bool:
+    return (
+        shape.role == "decode" and _overlap_loop(shape) and get_parallel().pp_size == 1
+    )
+
+
+def _freed_slots(shape: Shape) -> bool:
+    return (
+        _pd_decode_overlap_loop(shape) and decode_freed_slots.freed_slot_admission_on()
+    )
+
+
+RESOLVERS: Dict[str, Callable[[Shape], bool]] = {
+    "SGLANG_OPT_PD_DECODE_ADMIT_FREED_SLOTS": _freed_slots,
+}
 
 
 @contextmanager
@@ -292,7 +312,7 @@ def _children(*names: str) -> FrozenSet[str]:
 
 
 # Every PD decode loop with the overlap scheduler.
-_PD_DECODE = _children()
+_PD_DECODE = _children("PD_DECODE_ADMIT_FREED_SLOTS")
 # A PD decode without attention DP.
 _PD_DECODE_TP = _children()
 _TWO_HOSTS = _children()

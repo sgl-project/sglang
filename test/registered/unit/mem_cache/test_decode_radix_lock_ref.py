@@ -593,6 +593,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
             waiting_queue=waiting_queue,
             running_reqs=KeyedReqList(ListKind.DECODING),
             enable_priority_scheduling=False,
+            enable_freed_slot_admission=False,
             req_to_token_pool=SimpleNamespace(size=4),
             max_running_requests=4,
             token_to_kv_pool_allocator=None,
