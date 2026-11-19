@@ -4,14 +4,14 @@ Run in an installed SGLang NPU environment from the repository root:
     export PYTHONPATH=python
     timeout 180s python -m pytest test/manual/ascend/test_npu_shared_read_war.py -v -s
 
-Real Ascend metadata, scheduler barriers and graph event hooks are exercised
+Real Ascend metadata, scheduler barriers and ordinary read-done events are exercised
 with small runner fixtures. The delayed tail consumes only the metadata
 snapshot, like DSA attention; this is not a model-accuracy or throughput test.
 Negative controls MUST observe overwritten page IDs. If they do not, the
 device delay did not expose the race and the test must not report success.
-Graph-marker cases require the external-event API; missing-marker and eager
-cases do not. The MTP fixture exercises plan-stream hand-offs and last-reader
-selection, not the full EAGLE worker or an attention kernel.
+Metadata stays outside the graph; only the snapshot-consuming tail is captured.
+The MTP fixture exercises plan-stream hand-offs and last-reader selection,
+not the full EAGLE worker or an attention kernel.
 """
 
 from types import SimpleNamespace
@@ -35,18 +35,23 @@ class _SharedReadCase:
         from sglang.srt.hardware_backend.npu.graph_runner.npu_cudagraph_backend import (
             NPUCudaGraphBackend,
         )
+        from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
         from sglang.srt.managers.scheduler import Scheduler
+        from sglang.srt.model_executor.forward_context import (
+            ForwardContext,
+            forward_context,
+        )
         from sglang.srt.model_executor.forward_mode import ForwardMode
         from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
             DecodeCudaGraphRunner,
         )
-        from sglang.srt.model_executor.runner_utils.shared_read_event import (
-            make_external_event,
-        )
         from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
+        from sglang.srt.speculative.spec_info import SpecInputType
         from sglang.srt.speculative.spec_utils import get_plan_stream
 
         self.envs = envs
+        self.forward_context = forward_context
+        self.ForwardContext = ForwardContext
         self.graph_enabled = graph
         self.marker = marker
         self.early = early
@@ -66,46 +71,70 @@ class _SharedReadCase:
         self.input_requests = self.request_orders[0].clone()
         self.verify_requests = self.input_requests.clone()
         self.batch = SimpleNamespace(
+            batch_size=2,
             forward_mode=ForwardMode[mode],
             req_pool_indices=self.input_requests.clone(),
-            seq_lens=torch.full((2,), 128, dtype=torch.int32, device="npu"),
+            seq_lens=torch.full(
+                (2,),
+                125 if mode == "TARGET_VERIFY" else 128,
+                dtype=torch.int32,
+                device="npu",
+            ),
+            seq_lens_cpu=None,
+            extend_seq_lens=None,
+            extend_seq_lens_cpu=[],
+            out_cache_loc=None,
+            spec_algorithm=None,
+            spec_info=(
+                None
+                if mode == "DECODE"
+                else SimpleNamespace(
+                    draft_token_num=3,
+                    spec_input_type=(
+                        SpecInputType.EAGLE_VERIFY
+                        if mode == "TARGET_VERIFY"
+                        else SpecInputType.EAGLE_DRAFT_EXTEND
+                    ),
+                )
+            ),
         )
         self.attn = AscendAttnBackend.__new__(AscendAttnBackend)
-        self.attn.prepare_in_graph = True
         self.attn.shared_read_enabled = True
+        self.attn.device = torch.device("npu")
         self.attn.is_draft_worker = self.mtp
+        self.attn.use_mla = self.attn.use_dsa = True
+        self.attn.use_flash_mla = self.attn.use_paged_mtp = False
+        self.attn.use_quant_flash_attn = False
+        self.attn.is_hybrid_swa = self.attn.use_sliding_window_kv_pool = False
+        self.attn.dense_mla_dcp_target = False
         self.attn.dsa_dcp_target = False
+        self.attn.needs_cpu_seq_lens = False
         self.attn.speculative_num_draft_tokens = 3
         self.attn.page_size = self.PAGE_SIZE
         self.attn.req_to_token = self.old_table.clone()
-        self.attn.graph_metadata = {
-            "page_offsets": torch.arange(
-                0,
-                self.old_table.shape[1],
-                self.PAGE_SIZE,
-                dtype=torch.int64,
-                device="npu",
-            ),
-        }
+        self.attn.req_to_token_pool = SimpleNamespace(
+            req_to_token=self.attn.req_to_token
+        )
         self.attn.forward_metadata = ForwardMetadata(
             block_tables=torch.empty((2, 2), dtype=torch.int32, device="npu"),
             seq_lens=torch.empty_like(self.batch.seq_lens),
         )
+        self.attn.graph_metadata = {2: self.attn.forward_metadata}
         self.observed = torch.empty_like(self.attn.forward_metadata.block_tables)
 
         self.runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
         self.runner.device_module = torch.npu
         self.runner.model_runner = SimpleNamespace(shared_read_done_event=None)
+        self.attn._shared_read_runner = self.runner.model_runner
         self.runner.attn_backend = self.attn
         self.runner.capture_forward_mode = self.batch.forward_mode
-        self.runner.in_graph_metadata_prep_done = None
         self.runner.backend = NPUCudaGraphBackend.__new__(NPUCudaGraphBackend)
         self.runner.backend._decode_runner = self.runner
-        if graph and marker:
-            event = make_external_event(torch.npu)
-            if event is None:
-                pytest.skip("NPU graph read-done needs the CANN external-event API")
-            self.runner.in_graph_metadata_prep_done = event
+        assert self.runner.backend.supports_shared_read_events
+        assert (
+            self.runner._resolve_shared_read_ends(self.attn, self.batch.forward_mode)
+            is SharedReadEnds.PRE_REPLAY
+        )
 
         self.target = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
         self.target.device_module = torch.npu
@@ -137,7 +166,8 @@ class _SharedReadCase:
         self.forward.wait_stream(torch.npu.current_stream())
         with torch.npu.stream(self.forward):
             for _ in range(2):
-                self._forward_body()
+                self._prepare_metadata()
+                self._compute_tail()
             self.forward.synchronize()
         self.graph = None
         if graph:
@@ -145,7 +175,7 @@ class _SharedReadCase:
             with torch.npu.graph(
                 self.graph, stream=self.forward, auto_dispatch_capture=True
             ):
-                self._forward_body()
+                self._compute_tail()
             self.forward.synchronize()
 
     def _delay(self):
@@ -155,19 +185,24 @@ class _SharedReadCase:
             for _ in range(128):
                 torch.mm(self.delay_input, self.delay_input, out=self.delay_output)
 
-    def _record_read_done(self):
-        if self.graph_enabled:
-            self.runner._record_in_graph_metadata_prep_done()
-        else:
-            self.runner._publish_read_done(in_graph=False)
-
-    def _forward_body(self):
+    def _prepare_metadata(self):
+        early_event = None
         if self.marker and self.early:
-            self._record_read_done()
+            self.runner._publish_read_done(in_graph=False)
+            early_event = self.runner.model_runner.shared_read_done_event
         self._delay()
-        self.attn.init_forward_metadata_in_graph(self.batch)
-        if self.marker and not self.early:
-            self._record_read_done()
+        if self.graph_enabled:
+            self.attn.init_forward_metadata_out_graph(self.batch)
+            self.runner._publish_read_done(in_graph=False)
+        else:
+            with self.forward_context(self.ForwardContext(attn_backend=self.attn)):
+                self.attn.init_forward_metadata(self.batch)
+        assert self.runner.model_runner.shared_read_done_event is not None
+        if not self.marker or self.early:
+            # Negative controls suppress or replace the real publication.
+            self.runner.model_runner.shared_read_done_event = early_event
+
+    def _compute_tail(self):
         self._delay()
         # No live req_to_token reads after the marker: only the private snapshot.
         self.observed.copy_(self.attn.forward_metadata.block_tables)
@@ -209,14 +244,16 @@ class _SharedReadCase:
                     self.batch.req_pool_indices,
                     self.verify_requests,
                 )
+                with self.extend_plan_ctx:
+                    self.attn._publish_eager_shared_read_done(self.batch)
+                assert self.runner.model_runner.shared_read_done_event is None
             else:
                 self.batch.req_pool_indices.copy_(self.input_requests)
+            self._prepare_metadata()
             if self.graph is not None:
                 self.graph.replay()
-                if self.marker:
-                    self.runner._publish_read_done(in_graph=True)
             else:
-                self._forward_body()
+                self._compute_tail()
             forward_done.record()
             if wrong_phase:
                 # Negative control: a verify event cannot cover draft-extend reads.
@@ -250,6 +287,8 @@ def make_case():
     pytest.importorskip("torch_npu")
     if not torch.npu.is_available():
         pytest.skip("requires one NPU")
+    from sglang.srt.environ import envs
+
     cases = []
 
     def create(**kwargs):
@@ -257,14 +296,16 @@ def make_case():
         cases.append(case)
         return case
 
-    yield create
+    with envs.SGLANG_FORCE_COARSE_WAR_BARRIER.override(False):
+        yield create
     # Keep captured buffers/events alive until all submitted work has completed.
     torch.npu.synchronize()
 
 
 @pytest.mark.parametrize("graph", [False, True], ids=["eager", "graph"])
 def test_without_war_exposes_overwrite(make_case, graph):
-    case = make_case(graph=graph, marker=False)
+    # Verify uses device-only length preparation, keeping the race observable.
+    case = make_case(graph=graph, mode="TARGET_VERIFY", marker=False)
     observed, expected, _ = case.run("off")
     assert torch.equal(observed, expected + 4), "failed to expose the overwrite window"
 
@@ -303,7 +344,7 @@ def test_read_done_preserves_snapshot_and_releases_tail(make_case, graph, mode):
 
 @pytest.mark.parametrize("graph", [False, True], ids=["eager", "graph"])
 def test_marker_before_shared_read_exposes_overwrite(make_case, graph):
-    case = make_case(graph=graph, early=True)
+    case = make_case(graph=graph, mode="TARGET_VERIFY", early=True)
     observed, expected, _ = case.run()
     assert torch.equal(observed, expected + 4), "failed to expose premature read-done"
 

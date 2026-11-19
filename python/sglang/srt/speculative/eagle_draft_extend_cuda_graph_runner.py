@@ -544,14 +544,10 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             self._run_capture_tail_hooks(ret, forward_batch, num_tokens)
             return ret
 
-        npu_read_done = (
-            self.device == "npu" and self.backend.supports_shared_read_events
-        )
-
         def run_once():
             self.draft_extend_attn_backend.init_forward_metadata_in_graph(forward_batch)
             if (
-                (self._runtime_optimization or npu_read_done)
+                self._runtime_optimization
                 and self.draft_extend_attn_backend.shared_read_ends(self.forward_mode)
                 is SharedReadEnds.IN_REPLAY
                 and not self._pd_reuse_needs_full_replay
