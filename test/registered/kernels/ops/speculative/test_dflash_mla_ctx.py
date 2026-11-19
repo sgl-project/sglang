@@ -4,9 +4,9 @@ from types import SimpleNamespace
 import torch
 import torch.nn.functional as F
 
-from sglang.kernels.ops.speculative.dflash_mla_ctx import MlaContextKV
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.speculative.dflash_mla_ctx import MlaContextKV
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 

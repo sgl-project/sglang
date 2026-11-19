@@ -336,6 +336,127 @@ class InputMessageConstructionTestCase(CustomTestCase):
         )
         self.assertEqual(messages[-1]["tool_calls"][0]["id"], "call_weather")
 
+    def test_replay_keeps_commentary_with_ordered_tool_calls(self):
+        """Splitting commentary from its calls inserts an assistant sampling
+        boundary before those calls, so replay must preserve one logical turn."""
+        for call_count in (1, 2):
+            with self.subTest(call_count=call_count):
+                serving = make_serving()
+                calls = [
+                    {
+                        "type": "function_call",
+                        "call_id": f"call_{index}",
+                        "name": f"tool_{index}",
+                        "arguments": f'{{"index":{index}}}',
+                    }
+                    for index in range(call_count)
+                ]
+                outputs = [
+                    {
+                        "type": "function_call_output",
+                        "call_id": f"call_{index}",
+                        "output": f"result {index}",
+                    }
+                    for index in range(call_count)
+                ]
+                request = ResponsesRequest(
+                    model="x",
+                    input=[
+                        {
+                            "type": "reasoning",
+                            "summary": [{"type": "summary_text", "text": "plan"}],
+                        },
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": "working",
+                            "phase": "commentary",
+                        },
+                        *calls,
+                        *outputs,
+                        {
+                            "type": "reasoning",
+                            "summary": [{"type": "summary_text", "text": "conclusion"}],
+                        },
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": "answer",
+                            "phase": "final_answer",
+                        },
+                    ],
+                    store=False,
+                )
+
+                messages = serving._construct_input_messages(request)
+
+                self.assertEqual(
+                    messages,
+                    [
+                        {
+                            "role": "assistant",
+                            "reasoning_content": "plan",
+                            "phase": "commentary",
+                            "content": "working",
+                            "tool_calls": [
+                                {
+                                    "id": f"call_{index}",
+                                    "type": "function",
+                                    "function": {
+                                        "name": f"tool_{index}",
+                                        "arguments": f'{{"index":{index}}}',
+                                    },
+                                }
+                                for index in range(call_count)
+                            ],
+                        },
+                        *[
+                            {
+                                "role": "tool",
+                                "tool_call_id": f"call_{index}",
+                                "content": f"result {index}",
+                            }
+                            for index in range(call_count)
+                        ],
+                        {
+                            "role": "assistant",
+                            "reasoning_content": "conclusion",
+                            "phase": "final_answer",
+                            "content": "answer",
+                        },
+                    ],
+                )
+
+        boundary_request = ResponsesRequest(
+            model="x",
+            input=[
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": "intermediate",
+                    "phase": "commentary",
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": "done",
+                    "phase": "final_answer",
+                },
+            ],
+            store=False,
+        )
+        self.assertEqual(
+            serving._construct_input_messages(boundary_request),
+            [
+                {
+                    "role": "assistant",
+                    "content": "intermediate",
+                    "phase": "commentary",
+                },
+                {"role": "assistant", "content": "done", "phase": "final_answer"},
+            ],
+        )
+
     def test_input_parts_normalized_for_chat_templates(self):
         serving = make_serving()
         request = ResponsesRequest(
@@ -1793,7 +1914,7 @@ class ChatEncodingAdapterDispatchTestCase(CustomTestCase):
             patch.object(
                 OpenAIServingChat, "_resolve_chat_encoding_spec", return_value="inkling"
             ),
-            patch.object(serving_inkling, "_check_served_tokenizer"),
+            patch.object(serving_inkling, "check_served_tokenizer"),
             patch.object(
                 chat_encoding_adapters,
                 "build_chat_encoding_adapter",

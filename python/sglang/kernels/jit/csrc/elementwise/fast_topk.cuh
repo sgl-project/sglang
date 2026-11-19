@@ -1,6 +1,7 @@
 // Radix-select fast top-k with the AOT fast_topk_v2 semantics: for each row b,
 // select the kTopK largest scores in [row_starts[b], row_starts[b] + lengths[b])
 // and write their indices relative to row_starts[b]; order within a row is unspecified.
+// Without row_starts, every row starts at 0.
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
@@ -217,7 +218,7 @@ __global__ __launch_bounds__(fast_topk_detail::kThreadsPerBlock) void fast_topk_
   device::PDLWaitPrimary<kUsePDL>();
 
   const auto bid = static_cast<uint64_t>(blockIdx.x);
-  const auto row_start = params.row_starts[bid];
+  const auto row_start = params.row_starts != nullptr ? params.row_starts[bid] : 0;
   const auto length = params.lengths[bid];
   const auto indice = params.indices + bid * kTopK;
   const auto score = params.input + bid * params.input_stride;
@@ -238,7 +239,7 @@ __global__ __launch_bounds__(fast_topk_detail::kThreadsPerBlock) void fast_topk_
  * Row b selects the kTopK largest values in
  * score[b, row_starts[b] : row_starts[b] + lengths[b]) and writes their
  * indices (relative to row_starts[b]) into indices[b]. Unfilled slots are
- * -1 when lengths[b] < kTopK.
+ * -1 when lengths[b] < kTopK. Without row_starts, every row starts at 0.
  */
 template <int kTopK, bool kUsePDL>
 struct FastTopKKernel {
@@ -246,7 +247,7 @@ struct FastTopKKernel {
 
   static void
   run(const tvm::ffi::TensorView score,
-      const tvm::ffi::TensorView row_starts,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> row_starts,
       const tvm::ffi::TensorView indices,
       const tvm::ffi::TensorView lengths) {
     using namespace host;
@@ -261,10 +262,14 @@ struct FastTopKKernel {
         .with_dtype<fp32_t>()
         .with_device(device)
         .verify(score);
-    TensorMatcher({B})  // row_starts
-        .with_dtype<int32_t>()
-        .with_device(device)
-        .verify(row_starts);
+    const int32_t* row_starts_ptr = nullptr;
+    if (row_starts.has_value()) {
+      TensorMatcher({B})  // row_starts
+          .with_dtype<int32_t>()
+          .with_device(device)
+          .verify(row_starts.value());
+      row_starts_ptr = static_cast<const int32_t*>(row_starts.value().data_ptr());
+    }
     TensorMatcher({B, kTopK})  // indices
         .with_dtype<int32_t>()
         .with_device(device)
@@ -276,7 +281,7 @@ struct FastTopKKernel {
 
     const auto params = fast_topk_detail::FastTopKParams{
         .input = static_cast<const float*>(score.data_ptr()),
-        .row_starts = static_cast<const int32_t*>(row_starts.data_ptr()),
+        .row_starts = row_starts_ptr,
         .indices = static_cast<int32_t*>(indices.data_ptr()),
         .lengths = static_cast<const int32_t*>(lengths.data_ptr()),
         .input_stride = S.unwrap(),

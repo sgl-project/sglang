@@ -102,7 +102,9 @@ def allocate_attention_outputs(layer, query, value, index_query):
     rows = query.shape[0]
     sparse = index_query is not None
     # Follow v, not q: qk-norm may emit q in FP8 while the backend writes bf16.
-    dtype = query.dtype if value is None else value.dtype
+    # Callers pass layers that may not declare a per-layer output dtype.
+    out_dtype = getattr(layer, "out_dtype", None)
+    dtype = out_dtype or (query.dtype if value is None else value.dtype)
     if dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
         dtype = torch.bfloat16
     shape = (
@@ -132,7 +134,9 @@ def _new_attention_output(
     sizing the buffer off an fp8 dtype would silently cast-copy the result to
     fp8.
     """
-    out_dtype = v.dtype if v is not None else q.dtype
+    out_dtype = getattr(layer, "out_dtype", None) or (
+        v.dtype if v is not None else q.dtype
+    )
     if out_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
         out_dtype = torch.bfloat16
     if layer.qk_head_dim != layer.v_head_dim:

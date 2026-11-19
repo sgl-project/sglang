@@ -374,6 +374,8 @@ def handle_environment_variables(server_args: Any):
         raise ValueError(
             "--enable-fp4-indexer requires SM100 GPUs with FP4 indexer support."
         )
+    if cfg.enable_dsa_fp4_indexer and not is_gfx95_supported():
+        raise ValueError("--enable-dsa-fp4-indexer requires gfx950 GPUs.")
     # FP8 W_o GEMM needs DeepGEMM JIT. Enable exactly where the runtime can
     # run it, mirroring the forward scale split: the default sm100 UE8M0
     # path, or explicit opt-in on sm90 (FP32 scales) and sm120 (UE8M0).

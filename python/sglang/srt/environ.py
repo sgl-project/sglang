@@ -919,6 +919,9 @@ class Envs:
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
     SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM = EnvBool(False)
+    # gfx950: override --hicache-ratio for Mamba states in ratio mode; a cached KV
+    # prefix cannot be reused after its host state is evicted.
+    SGLANG_HICACHE_MAMBA_HOST_RATIO = EnvFloat(None)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
     # File-backend LRU eviction (opt-in; sizes accept SI/IEC suffixes, "0" disables).
     SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE = EnvStr(None)
@@ -1087,6 +1090,12 @@ class Envs:
     # Enabled by default for supported configurations; set to 0 to disable.
     SGLANG_M3_USE_AITER_FUSED_QKNORM = EnvBool(True)
     SGLANG_USE_AITER_AG = EnvBool(True)
+    # Kimi-K3 gfx950 prefill: the MoE front on row shards, shared experts TP-sharded
+    SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT = EnvBool(False)
+    # Kimi-K3 gfx950 prefill: leave the stream on each rank's rows after the row-sharded tail
+    SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM = EnvBool(False)
+    # GiB of gfx950 memory kept out of torch's allocator for HSA queue scratch (0: none)
+    SGLANG_ROCM_RUNTIME_RESERVE_GB = EnvFloat(0.0)
     # Run the gfx950 TP4 quick all-reduce on the JIT build (quick_all_reduce_hip) instead of
     # sgl-kernel's; off by default, MiniMax-M3.1 turns it on at TP4 under INT4 or INT8.
     SGLANG_ROCM_QUICK_ALL_REDUCE_JIT = EnvBool(False)
@@ -1590,6 +1599,16 @@ class Envs:
     # Drop the GB/s and TFLOPS columns from the benchmark marker's table.
     SGLANG_JIT_BENCHMARK_DISABLE_LOG_BANDWIDTH = EnvBool(False)
     SGLANG_JIT_BENCHMARK_DISABLE_LOG_FLOPS = EnvBool(False)
+    # Directory the benchmark marker appends one JSONL record per case to.
+    # Unset: no records.
+    SGLANG_JIT_BENCHMARK_OUTPUT = EnvStr(None)
+    # Run the full `vals` of every parametrize axis even when SGLANG_IS_IN_CI picks `ci_vals`.
+    SGLANG_JIT_BENCHMARK_FORCE_FULL = EnvBool(False)
+    # Comma-separated case_ids (from the records); when set, only those cases run.
+    SGLANG_JIT_BENCHMARK_CASE_FILTER = EnvTuple(tuple())
+    # Run kind stamped on the records (nightly / main / pr); default derives from
+    # GITHUB_EVENT_NAME, else "local".
+    SGLANG_JIT_BENCHMARK_RUN_KIND = EnvStr(None)
     # The hgcc --gpu-architecture target used by JIT builds on SAIL (hgcc
     # cannot read CUDA sources, so they are converted by sailify first).
     # One of: native, all, all-ppu,
@@ -1812,7 +1831,7 @@ class Envs:
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
     # The DFLASH draft KV ring (speculative/dflash_draft_ring.py); resolved at
     # startup to off where it does not fit.
-    SGLANG_ENABLE_DFLASH_DRAFT_KV_RING = EnvBool(True)
+    SGLANG_ENABLE_DFLASH_DRAFT_KV_RING = EnvBool(False)
     # Disable the compact-slot SWA window lookup for compact MLA drafts.
     SGLANG_DISABLE_DFLASH_COMPACT_SWA_WINDOW = EnvBool(False)
     # Gather DFLASH candidate top-k in one multicast all-gather.
@@ -2144,9 +2163,15 @@ class Envs:
     # of fp32 (the reference ranks bf16 scores); every consumer of those logits must take bf16.
     # Unset: bf16 on SM100 (with bf16 head weights), fp32 elsewhere.
     SGLANG_OPT_DSV41_BF16_INDEX_LOGITS = EnvBool(None)
+    # Use the shared FP8 scorer and ragged top-k for Hopper prefill candidates.
+    SGLANG_OPT_DSV41_SM90_DEEPGEMM_PREFILL = EnvBool(False)
     # Prefill index top-k by the sampled-threshold indexers of kernels/ops/attention/dsa/litetopk_prefill
     # (after LiteTopK, https://arxiv.org/abs/2607.11976) instead of dense logits + top-k, on SM100.
     SGLANG_OPT_USE_PREFILL_LITE_TOPK = EnvBool(False)
+    SGLANG_OPT_DSV41_TRITON_PREFILL_SELECTION = EnvBool(False)
+    # Raise the per-rank prefill Indexer score tile limit to 2 GiB.
+    SGLANG_OPT_DSV41_LARGE_PREFILL_SCORE_BUDGET = EnvBool(False)
+    SGLANG_OPT_DSV41_VERIFY_INDEXER_BF16_K_REUSE = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
     # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16
@@ -2229,6 +2254,9 @@ class Envs:
     # Draft sampler uses the Gumbel-max trick (argmax(probs / Exp(1))) instead of
     # torch.multinomial, whose device-side validity assert breaks draft-graph replay.
     SGLANG_OPT_USE_GUMBEL_SAMPLE = EnvBool(True)
+    # Rejection-sampling draft proposal as one fused kernel (softmax + exponential-race draw on
+    # torch's Philox state + greedy argmax). Same distribution as the Gumbel sampler.
+    SGLANG_OPT_USE_FUSED_DRAFT_SAMPLE = EnvBool(False)
     # Multi-layer chain-MTP boundary-KV fix: widen the draft-extend window to
     # rewrite rejected-draft KV rows before reuse (acc_len repair; on by default).
     SGLANG_ENABLE_MTP_BOUNDARY_KV_FIX = EnvBool(True)
@@ -2496,12 +2524,11 @@ class Envs:
     # Gemma 4
     # ===================================================================
     # Fused TP all-reduce + RMSNorm -> residual add -> RMSNorm -> per-128 FP8
-    # quant of the dense layer stack as one NVLS kernel per site, for extend
-    # batches of MIN..MAX tokens (SM90 with NVLink multicast, block-FP8 weights).
-    # MIN_TOKENS 0 takes the per-TP-size default (DEFAULT_MIN_TOKENS in
-    # srt/layers/communication/gemma4_ar_fusion.py).
+    # quant of the dense layer stack as one NVLS kernel per site, for extend,
+    # mixed and decode batches of up to MAX tokens (SM90 with NVLink multicast,
+    # block-FP8 weights). MAX also sizes the symmetric buffers; keep it at least
+    # the chunked prefill size so every prefill chunk is fused.
     SGLANG_GEMMA4_AR_FUSION = EnvBool(False)
-    SGLANG_GEMMA4_AR_FUSION_MIN_TOKENS = EnvInt(0)
     SGLANG_GEMMA4_AR_FUSION_MAX_TOKENS = EnvInt(8192)
 
     # ===================================================================

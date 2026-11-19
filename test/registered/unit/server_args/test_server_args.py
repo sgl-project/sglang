@@ -1854,7 +1854,12 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
         )
         defaults.update(kw)
         view = ResolvedView(
-            SimpleNamespace(_model_config=SimpleNamespace(hf_config=hf), **defaults)
+            SimpleNamespace(
+                _model_config=SimpleNamespace(
+                    hf_config=hf, kv_lora_rank=512, qk_rope_head_dim=64
+                ),
+                **defaults,
+            )
         )
         with (
             patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
@@ -5006,6 +5011,15 @@ class TestKvCacheShardingCompatibility(CustomTestCase):
         ):
             self.assertFalse(post_capture_kv_sizing_planned(args))
             args.enable_kv_cache_sharding = False
+            self.assertTrue(post_capture_kv_sizing_planned(args))
+            args.disaggregation_transfer_backend = "nixl"
+            for mode in ("prefill", "decode"):
+                args.disaggregation_mode = mode
+                args.enable_unified_memory = False
+                self.assertTrue(post_capture_kv_sizing_planned(args))
+                args.enable_unified_memory = True
+                self.assertFalse(post_capture_kv_sizing_planned(args))
+            args.disaggregation_mode = "null"
             self.assertTrue(post_capture_kv_sizing_planned(args))
 
     def test_chunk_rounding_expands_automatic_activation_headroom(self):
