@@ -848,7 +848,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             )
         self.indexer_kv_store_int8 = (
             indexer_quant_mode == QUANT_MODE_TOKEN_INT8
-            and not self.dsa_kv_cache_store_fp8
+            and dtype != torch.float8_e4m3fn
             and index_head_dim is not None
         )
         self.indexer_quant = index_head_dim is not None and (
