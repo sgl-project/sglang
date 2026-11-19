@@ -90,7 +90,7 @@ python3 -m sglang.launch_server \
 
 ### AITER configuration
 
-On AMD ROCm Linux, the AITER arena path supports MHA/GQA full-attention and sliding-window layers with BF16 queries and BF16 or native FP8 KV. GQA is included in SGLang's MHA branch: query heads may share KV heads. MLA uses compressed latent KV and is not supported by this adapter. This path requires equal K/V head dimensions. The SGLang HIP KV writer must compile and load successfully; this path refuses the fallback writer because it can overwrite the reserved padding sink.
+On AMD ROCm Linux, the AITER arena path supports MHA/GQA full-attention and sliding-window layers with BF16 queries and BF16 or native FP8 KV. GQA is included in SGLang's MHA branch: query heads may share KV heads. MLA uses compressed latent KV and is not supported by this adapter. This path requires equal K/V head dimensions. The SGLang HIP KV writer must compile and load successfully; this path refuses the fallback writer because it can overwrite the reserved padding sink. That refusal covers the backend's own writer. On a full-attention-only arena, a model that fuses rotary position encoding with the KV write keeps using the fused writer, which does write the reserved padding slot; this is existing behaviour on main and is not changed by this adapter.
 
 Use an AITER build containing the strided-cache address-span fix [#6661](https://github.com/ROCm/aiter/pull/6661), the Triton and Gluon V-page-tail fixes [#6475](https://github.com/ROCm/aiter/pull/6475) and [#6755](https://github.com/ROCm/aiter/pull/6755), and the Gluon block-table-prefetch fix [#7539](https://github.com/ROCm/aiter/pull/7539).
 
