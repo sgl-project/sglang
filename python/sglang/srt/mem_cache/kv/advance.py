@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Tuple, Union
 
 import msgspec
 
-from sglang.srt.utils.common import ceil_align
+from sglang.srt.mem_cache.kv.alloc.demand import retained_window_tokens
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -93,17 +93,15 @@ def retire_window_rows(
     evicted_seqlen = max(evicted_seqlen, req.kv.window_dead_lo(window_page_size))
     req.kv.set_evicted_seqlen(window_sub_pool, evicted_seqlen)
 
-    if not supports_prefix_sharing:
-        # Nothing is inserted into a tree, so no tombstone-leaf concern; evict
-        # up to the window boundary (the trailing floor keeps it page-aligned).
-        evict_threshold = pre_len - sliding_window_size
-    else:
-        # Prefix-sharing cache: keep max(window, page) rounded up to whole pages, so
-        # a key that ends at page_floor(pre_len) still has a full window of live SWA,
-        # and the last leaf, below page_floor(seq_len), is never all-tombstone.
-        evict_threshold = pre_len - ceil_align(
-            max(sliding_window_size, page_size), page_size
-        )
+    # Without prefix sharing nothing enters a tree: evict up to the window
+    # (the trailing floor keeps it page-aligned). A prefix-sharing cache keeps
+    # whole pages, so the last leaf, below page_floor(seq_len), is never
+    # all-tombstone.
+    evict_threshold = pre_len - retained_window_tokens(
+        sliding_window_size,
+        page_size,
+        supports_prefix_sharing=supports_prefix_sharing,
+    )
     if retain_floor is not None and supports_prefix_sharing:
         # The caller owns where the floor is (see BasePrefixCache.swa_retain_floor);
         # this only promises not to free past it. Without prefix sharing a retained

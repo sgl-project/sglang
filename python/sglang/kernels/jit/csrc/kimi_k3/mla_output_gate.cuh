@@ -6,6 +6,7 @@
 #include <sgl_kernel/tensor.h>  // For TensorMatcher, SymbolicSize, SymbolicDevice
 #include <sgl_kernel/utils.h>   // For RuntimeCheck
 
+#include <sgl_kernel/activation.cuh>
 #include <sgl_kernel/type.cuh>   // For bf16_t, fp32_t, device::cast
 #include <sgl_kernel/utils.cuh>  // For LaunchKernel
 #include <sgl_kernel/vec.cuh>    // For AlignedVector
@@ -43,7 +44,7 @@ __global__ void mla_output_gate_kernel(const MlaOutputGateParams __grid_constant
     // Match torch.sigmoid(bf16): fp32 sigmoid, round to bf16, then the bf16
     // multiply upcasts both operands to fp32 and rounds once more.
     const float g = cast<fp32_t>(gv[i]);
-    const bf16_t s = cast<bf16_t>(1.0f / (1.0f + expf(-g)));
+    const bf16_t s = cast<bf16_t>(activation::sigmoid<false>(g));
     ov[i] = cast<bf16_t>(cast<fp32_t>(xv[i]) * cast<fp32_t>(s));
   }
   ov.store(params.out, v);

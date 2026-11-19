@@ -250,6 +250,13 @@ def check_pods_ready(namespace, pod_name_key_str, timeout=300):
             status = pod.status
             phase = status.phase
             logger.info(f"Pod: {pod_name}, status: {phase}")
+            if phase in ("Succeeded", "Failed"):
+                raise RuntimeError(
+                    f"Pod {pod_name} entered terminal state {phase!r} before "
+                    "becoming Ready; this usually means the container exited "
+                    "early (import error, crash, missing binary, ...). Check "
+                    "the pod logs above for the root cause."
+                )
             if phase != "Running":
                 all_running = False
                 break
@@ -332,13 +339,24 @@ def prepare_cm_data(namespace, pod_string, run_id=None):
 
 
 def monitor_pod_logs(
-    kube_job_type, kube_job_prefix_name, namespace, timeout=LOCAL_TIMEOUT
+    kube_job_type,
+    kube_job_prefix_name,
+    namespace,
+    timeout=LOCAL_TIMEOUT,
+    streamed_metrics=None,
+    streamed_labels=None,
 ):
-    """Monitor the logs of the specified pod until the special pattern is matched or reaches its timeout."""
+    """Monitor the logs of the specified pod until the special pattern is matched or reaches its timeout.
+
+    ``streamed_metrics`` and ``streamed_labels`` are updated in place while the
+    log streams. Callers pass their own dicts so the metrics survive the
+    "test result was FAILED" exception raised below and can still be written to
+    metrics.json by the caller's finally block.
+    """
     monitor_pod_name = {
         KUBE_JOB_SINGLE: f"{kube_job_prefix_name}-pod-0",
         KUBE_JOB_MULTI_PD_MIX: f"{kube_job_prefix_name}-sglang-node-0",
-        KUBE_JOB_MULTI_PD_SEPARATION: f"{kube_job_prefix_name}-sglang-router-0",
+        KUBE_JOB_MULTI_PD_SEPARATION: f"{kube_job_prefix_name}-sgl-router-0",
     }
     pod_name = monitor_pod_name.get(kube_job_type)
 
@@ -354,6 +372,15 @@ def monitor_pod_logs(
     ]
     patterns = [re.compile(line_pattern) for line_pattern in pattern_lines]
     pattern_ok = re.compile(r"^OK$")
+
+    # [METRIC] lines are printed by dump_metric while the test runs, i.e. before
+    # the pod-side log is archived. Collect them from the stream so results do
+    # not depend on the pod winning the race against delete_pod() below.
+    if streamed_metrics is None:
+        streamed_metrics = {}
+    if streamed_labels is None:
+        streamed_labels = {}
+    metric_pattern = re.compile(r"^\[METRIC\] (\S+)=(\S+)(?: labels=(.*))?$")
 
     process = None
     try:
@@ -386,6 +413,17 @@ def monitor_pod_logs(
                 if line:
                     line = line.rstrip("\n")
                     print(line)
+                    metric_match = metric_pattern.match(line)
+                    if metric_match:
+                        key, raw_value = metric_match.group(1), metric_match.group(2)
+                        try:
+                            raw_value = float(raw_value)
+                        except ValueError:
+                            pass
+                        streamed_metrics[key] = raw_value
+                        labels = _parse_metric_labels(metric_match.group(3))
+                        if labels:
+                            streamed_labels[key] = labels
                     # Check if current line matches expected pattern
                     if match_state < len(patterns) and patterns[match_state].match(
                         line
@@ -499,37 +537,77 @@ def monitor_pod_logs(
             except subprocess.TimeoutExpired:
                 process.kill()
 
+    return streamed_metrics, streamed_labels
 
-def generate_metrics_json(metrics_data_file, test_case, status):
+
+def _parse_metric_labels(raw):
+    """Decode the `labels=` JSON that dump_metric appends; None when absent."""
+    if not raw:
+        return None
+    try:
+        labels = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    return labels if isinstance(labels, dict) else None
+
+
+def generate_metrics_json(
+    metrics_data_file, test_case, status, streamed_metrics=None, streamed_labels=None
+):
     """Collect [METRIC] lines from the log and write metrics.json.
 
     This writes ${metrics_data_file}/metrics.json only, which feeds the
     persistence-directory output (e.g. /root/.cache/tests/output/...).
     It is NOT consumed by CI artifacts (the former /tmp/metrics.json +
     'Upload metrics' path was removed).
+
+    ``streamed_metrics`` carries the [METRIC] values already parsed from the
+    live pod log; they are merged in because the archived test_output.log can
+    be missing when the pod is deleted as soon as the test finishes.
+
+    ``streamed_labels`` (merged with the labels parsed from the archived log)
+    keeps each metric's dump_metric labels -- notably the evaluation
+    ``dataset`` -- so consumers can tell gpqa_diamond from gsm8k instead of
+    reading a bare ``accuracy`` number.
     """
     log_file = os.path.join(metrics_data_file, "test_output.log")
 
     metrics = {}
     baselines = {}
+    metric_labels = {}
+
+    def _record_metric(key, value):
+        if key.endswith("_baseline"):
+            baselines[key[: -len("_baseline")]] = value
+        else:
+            metrics[key] = value
 
     if os.path.exists(log_file):
         with open(log_file, "r") as f:
             for line in f:
-                m = re.match(r"\[METRIC\] (\S+)=(\S+)", line.strip())
+                m = re.match(r"\[METRIC\] (\S+)=(\S+)(?: labels=(.*))?$", line.strip())
                 if m:
-                    key = m.group(1)
                     value = m.group(2)
                     try:
                         value = float(value)
                     except ValueError:
                         pass
-                    if key.endswith("_baseline"):
-                        baselines[key[:-9]] = value
-                    else:
-                        metrics[key] = value
+                    _record_metric(m.group(1), value)
+                    labels = _parse_metric_labels(m.group(3))
+                    if labels:
+                        metric_labels[m.group(1)] = labels
     else:
         logger.warning(f"Metrics log file not found: {log_file}")
+
+    for key, value in (streamed_metrics or {}).items():
+        _record_metric(key, value)
+    metric_labels.update(streamed_labels or {})
+    # Baseline rows are folded into `baselines`; keep only metric labels.
+    metric_labels = {
+        name: labels
+        for name, labels in metric_labels.items()
+        if not name.endswith("_baseline")
+    }
 
     tc_name = test_case.rsplit("/", 1)[-1].rsplit(".", 1)[0]
 
@@ -553,6 +631,7 @@ def generate_metrics_json(metrics_data_file, test_case, status):
         "status": status,
         "metrics": metrics,
         "baselines": baselines,
+        "labels": metric_labels,
     }
 
     output_path = os.path.join(metrics_data_file, "metrics.json")
@@ -571,11 +650,14 @@ def run_npu_e2e_test_case(
     metrics_data_file: str,
     test_case: str,
     sglang_is_in_ci=False,
-    install_sglang_from_source=False,
     env="debug",
     trouble_shotting=False,
     transformers_version="",
     run_id: str = "",
+    container_patches: str = "",
+    accuracy_dataset: str = "",
+    use_image_sglang: str = "false",
+    test_method: str = "",
 ):
     """The method for running a npu e2e test case.
     Args:
@@ -589,10 +671,13 @@ def run_npu_e2e_test_case(
         metrics_data_file (str): the output path of the metrics data file, only for performance testing.
         test_case (str): the test case relative path in sglang source root path. like test/registered/...
         sglang_is_in_ci (bool): whether running in CI environment.
-        install_sglang_from_source (bool): whether installing sglang from source or use docker image directly.
         env (str): the environment to run the test on.  Choose one in ["debug", "ci"]
         run_id (str): the GitHub Actions run_id, used to label pods for run-scoped
             isolation when multiple runs share the same k8s namespace.
+        accuracy_dataset (str): dataset name injected into multi-node pods as
+            NPU_ACCURACY_DATASET (gsm8k on weekdays, gpqa_diamond on weekends).
+        test_method (str): single unittest method ("Class.method") injected into
+            pods as NPU_TEST_METHOD; empty runs every test in test_case.
     """
     random_str = get_unique_random_string(16, True)
 
@@ -639,12 +724,14 @@ def run_npu_e2e_test_case(
                 "metrics_data_file": metrics_data_file,
                 "test_case": test_case,
                 "sglang_is_in_ci": sglang_is_in_ci,
-                "install_sglang_from_source": install_sglang_from_source,
                 "env": env,
                 "trouble_shotting": trouble_shotting,
                 "transformers_version": transformers_version,
                 "run_label": run_label,
                 "run_id": run_id,
+                "use_image_sglang": use_image_sglang,
+                "test_method": test_method,
+                "container_patches": container_patches,
             }
             create_kube_yaml(
                 kube_yaml_template=KUBE_YAML_TEMPLATE.get(kube_job_type),
@@ -663,12 +750,15 @@ def run_npu_e2e_test_case(
                 "metrics_data_file": metrics_data_file,
                 "test_case": test_case,
                 "sglang_is_in_ci": sglang_is_in_ci,
-                "install_sglang_from_source": install_sglang_from_source,
                 "env": env,
                 "trouble_shotting": trouble_shotting,
                 "transformers_version": transformers_version,
                 "run_label": run_label,
                 "run_id": run_id,
+                "accuracy_dataset": accuracy_dataset,
+                "use_image_sglang": use_image_sglang,
+                "test_method": test_method,
+                "container_patches": container_patches,
             }
             template_key = (
                 KUBE_JOB_MULTI_PD_MIX_GREEN if env == "green" else kube_job_type
@@ -688,16 +778,19 @@ def run_npu_e2e_test_case(
                 "prefill_size": resource_info["prefill_size"],
                 "decode_size": resource_info["decode_size"],
                 "router_size": resource_info["router_size"],
+                "container_patches": container_patches,
                 "sglang_source_relative_path": sglang_source_relative_path,
                 "metrics_data_file": metrics_data_file,
                 "test_case": test_case,
                 "sglang_is_in_ci": sglang_is_in_ci,
-                "install_sglang_from_source": install_sglang_from_source,
                 "env": env,
                 "trouble_shotting": trouble_shotting,
                 "transformers_version": transformers_version,
                 "run_label": run_label,
                 "run_id": run_id,
+                "accuracy_dataset": accuracy_dataset,
+                "use_image_sglang": use_image_sglang,
+                "test_method": test_method,
             }
             template_key = (
                 KUBE_JOB_MULTI_PD_SEPARATION_GREEN if env == "green" else kube_job_type
@@ -733,9 +826,16 @@ def run_npu_e2e_test_case(
             logger.info("Pod not ready, maybe not enough resource")
 
         monitor_success = False
+        streamed_metrics = {}
+        streamed_labels = {}
         try:
             monitor_pod_logs(
-                kube_job_type, final_kube_job_name, kube_name_space, LOCAL_TIMEOUT
+                kube_job_type,
+                final_kube_job_name,
+                kube_name_space,
+                LOCAL_TIMEOUT,
+                streamed_metrics,
+                streamed_labels,
             )
             monitor_success = True
         except Exception:
@@ -745,7 +845,13 @@ def run_npu_e2e_test_case(
             if metrics_data_file:
                 status = "pass" if monitor_success else "fail"
                 try:
-                    generate_metrics_json(metrics_data_file, test_case, status)
+                    generate_metrics_json(
+                        metrics_data_file,
+                        test_case,
+                        status,
+                        streamed_metrics,
+                        streamed_labels,
+                    )
                 except Exception as e:
                     logger.error(f"Failed to generate metrics JSON: {e}", exc_info=True)
     finally:
@@ -841,12 +947,6 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
-        "--install-sglang-from-source",
-        action="store_true",
-        help="Used to set env var INSTALL_SGLANG_FROM_SOURCE in pod",
-    )
-
-    parser.add_argument(
         "--kube-name-space",
         type=str,
         required=True,
@@ -898,6 +998,45 @@ if __name__ == "__main__":
         help="GitHub Actions run_id, used to label pods for run-scoped isolation.",
     )
 
+    parser.add_argument(
+        "--container-patches",
+        type=str,
+        required=False,
+        default="",
+        help="Comma separated directories (relative to the repo root) holding the "
+        "container patch archives the workflow already extracted. Each pod runs "
+        "the install.sh found in them before the test. Empty keeps the image "
+        "untouched.",
+    )
+
+    parser.add_argument(
+        "--accuracy-dataset",
+        type=str,
+        required=False,
+        default="",
+        help="Dataset injected into multi-node pods as NPU_ACCURACY_DATASET "
+        "(gsm8k on weekdays, gpqa_diamond on weekends).",
+    )
+
+    parser.add_argument(
+        "--use-image-sglang",
+        type=str,
+        required=False,
+        default="false",
+        help="If 'true', pods import sglang from the image's site-packages "
+        "instead of the checkout mounted at /root/sglang/python. Test "
+        "case scripts still come from the mounted source tree.",
+    )
+
+    parser.add_argument(
+        "--test-method",
+        type=str,
+        required=False,
+        default="",
+        help="Single unittest method ('Class.method') to run inside the test "
+        "case; empty runs every test in the file.",
+    )
+
     args = parser.parse_args()
 
     docker_image_url = args.image
@@ -910,11 +1049,14 @@ if __name__ == "__main__":
     metrics_data_file = args.metrics_data_file
     test_case = args.test_case
     sglang_is_in_ci = args.sglang_is_in_ci
-    install_sglang_from_source = args.install_sglang_from_source
     env = args.env
     trouble_shotting = args.trouble_shotting
     transformers_version = args.transformers_version
     run_id = args.run_id
+    container_patches = args.container_patches
+    accuracy_dataset = args.accuracy_dataset
+    use_image_sglang = args.use_image_sglang
+    test_method = args.test_method
 
     kube_name_space = args.kube_name_space
     kube_job_type = args.kube_job_type
@@ -940,9 +1082,12 @@ if __name__ == "__main__":
         metrics_data_file=metrics_data_file,
         test_case=test_case,
         sglang_is_in_ci=sglang_is_in_ci,
-        install_sglang_from_source=install_sglang_from_source,
         env=env,
         trouble_shotting=trouble_shotting,
         transformers_version=transformers_version,
         run_id=run_id,
+        container_patches=container_patches,
+        accuracy_dataset=accuracy_dataset,
+        use_image_sglang=use_image_sglang,
+        test_method=test_method,
     )

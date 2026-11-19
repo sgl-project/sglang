@@ -452,6 +452,9 @@ def fused_muse_spark_routing_op(
 
     grid = (num_tokens,)
 
+    # launch_pdl is a CUDA-only Triton launch kwarg. Omit it entirely on HIP.
+    launch_kwargs = {"launch_pdl": True} if launch_pdl else {}
+
     if topk == 8:
         fused_muse_spark_routing_kernel_topk8[grid](
             gating_output,
@@ -480,7 +483,7 @@ def fused_muse_spark_routing_op(
             HAS_LOCAL_EXPERT_MAPPING=has_local_expert_mapping,
             HAS_NUM_VALID=has_num_valid,
             HAS_PACKED=has_packed,
-            launch_pdl=launch_pdl,
+            **launch_kwargs,
         )
     else:
         fused_muse_spark_routing_kernel[grid](
@@ -508,7 +511,7 @@ def fused_muse_spark_routing_op(
             USE_GDC=launch_pdl,
             HAS_LOCAL_EXPERT_MAPPING=has_local_expert_mapping,
             HAS_NUM_VALID=has_num_valid,
-            launch_pdl=launch_pdl,
+            **launch_kwargs,
         )
         if has_packed:
             packed_topk_ids.copy_(pack_topk_ids_native(topk_ids, topk_weights))
@@ -652,6 +655,7 @@ class FusedMuseSparkRouting(BaseFusedOp):
         KernelBackend.JIT: {CapabilityRequirement.CUDA},
         KernelBackend.TRITON: {
             CapabilityRequirement.CUDA,
+            CapabilityRequirement.HIP,
         },
     }
 
