@@ -255,8 +255,6 @@ pub fn piece_id(piece: &str) -> i64 {
 pub fn fused_dir() -> &'static str {
     static DIR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     DIR.get_or_init(|| {
-        let dir = std::env::temp_dir().join(format!("sglang-it-fused-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
         let mut vocab = serde_json::Map::new();
         vocab.insert("[UNK]".into(), 0.into());
         for (id, piece) in PIECES.iter().enumerate() {
@@ -268,8 +266,7 @@ pub fn fused_dir() -> &'static str {
             "pre_tokenizer": {"type": "Whitespace"},
             "decoder": {"type": "Fuse"},
         });
-        std::fs::write(dir.join("tokenizer.json"), config.to_string()).unwrap();
-        dir.to_string_lossy().into_owned()
+        checkpoint("fused", &[("tokenizer.json", &config)])
     })
 }
 
@@ -279,8 +276,6 @@ pub fn fused_dir() -> &'static str {
 pub fn byte_level_deepseek_dir() -> &'static str {
     static DIR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     DIR.get_or_init(|| {
-        let dir = std::env::temp_dir().join(format!("sglang-it-bytes-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
         // Byte-level vocabularies spell a byte as the character of that code point.
         let vocab = serde_json::json!({"\u{c3}": 0, "!": 1, "h": 2, "i": 3});
         let config = serde_json::json!({
@@ -288,31 +283,44 @@ pub fn byte_level_deepseek_dir() -> &'static str {
             "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true, "use_regex": true},
             "decoder": {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true, "use_regex": true},
         });
-        std::fs::write(dir.join("tokenizer.json"), config.to_string()).unwrap();
         let model = serde_json::json!({"model_type": "deepseek_v41"});
-        std::fs::write(dir.join("config.json"), model.to_string()).unwrap();
-        dir.to_string_lossy().into_owned()
+        checkpoint(
+            "bytes",
+            &[("tokenizer.json", &config), ("config.json", &model)],
+        )
     })
 }
 
 fn checkpoint_dir(name: &str, model_type: Option<&str>) -> String {
-    {
-        let dir = std::env::temp_dir().join(format!("sglang-it-{name}-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        if let Some(model_type) = model_type {
-            let config = serde_json::json!({"model_type": model_type});
-            std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
-        }
-        let mut vocab = serde_json::Map::new();
-        vocab.insert("[UNK]".into(), 0.into());
-        for (id, word) in WORDS.iter().enumerate() {
-            vocab.insert((*word).into(), (id + 1).into());
-        }
-        let model = serde_json::json!({"type": "WordLevel", "vocab": vocab, "unk_token": "[UNK]"});
-        let config = serde_json::json!({"model": model, "pre_tokenizer": {"type": "Whitespace"}});
-        std::fs::write(dir.join("tokenizer.json"), config.to_string()).unwrap();
-        dir.to_string_lossy().into_owned()
+    let mut vocab = serde_json::Map::new();
+    vocab.insert("[UNK]".into(), 0.into());
+    for (id, word) in WORDS.iter().enumerate() {
+        vocab.insert((*word).into(), (id + 1).into());
     }
+    let model = serde_json::json!({"type": "WordLevel", "vocab": vocab, "unk_token": "[UNK]"});
+    let tokenizer = serde_json::json!({"model": model, "pre_tokenizer": {"type": "Whitespace"}});
+    let config = model_type.map(|model_type| serde_json::json!({"model_type": model_type}));
+    let mut files = vec![("tokenizer.json", &tokenizer)];
+    files.extend(config.as_ref().map(|config| ("config.json", config)));
+    checkpoint(name, &files)
+}
+
+/// Write `files` into the checkpoint directory `name`, a fixed path per user
+/// under the temp dir that every run rewrites, so runs leave nothing new
+/// behind. Each file lands whole (written aside, then renamed), so a run
+/// concurrent with this one reads one complete copy or the other.
+fn checkpoint(name: &str, files: &[(&str, &serde_json::Value)]) -> String {
+    let user = std::env::var("USER").unwrap_or_else(|_| "shared".into());
+    let dir = std::env::temp_dir()
+        .join(format!("sglang-it-{user}"))
+        .join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    for (file, content) in files {
+        let partial = dir.join(format!("{file}.{}", std::process::id()));
+        std::fs::write(&partial, content.to_string()).unwrap();
+        std::fs::rename(partial, dir.join(file)).unwrap();
+    }
+    dir.to_string_lossy().into_owned()
 }
 
 /// A streaming `POST` whose server-sent events are read one at a time;

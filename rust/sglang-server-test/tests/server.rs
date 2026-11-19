@@ -52,7 +52,6 @@ fn generation_round_trips_through_the_ring() {
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
     assert!(response.contains(r#""output_ids":[9,10]"#), "{response}");
     server.shutdown();
-    assert!(std::net::TcpStream::connect(addr).is_err());
 }
 
 /// A scheduler error for a generation fails its HTTP request.
@@ -110,9 +109,10 @@ fn control_request_is_answered_from_the_ring() {
     );
 }
 
-/// A graceful drain with nothing in flight ends and closes the listener.
+/// A graceful drain with nothing in flight ends. (Whether the port is then
+/// free is not asserted: a sibling test in this process may bind it first.)
 #[test]
-fn drain_ends_and_closes_the_listener() {
+fn drain_with_nothing_in_flight_ends() {
     let [addr, grpc_addr] = free_loopback_addrs();
     let server = SchedulerlessServer::builder(addr)
         .grpc_addr(grpc_addr)
@@ -126,5 +126,4 @@ fn drain_ends_and_closes_the_listener() {
         assert!(std::time::Instant::now() < deadline, "drain did not end");
         std::thread::sleep(Duration::from_millis(10));
     }
-    assert!(std::net::TcpStream::connect(addr).is_err());
 }
