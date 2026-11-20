@@ -193,6 +193,9 @@ GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
 BUILT_IN_SAMPLING_BACKENDS = frozenset({"flashinfer", "pytorch", "ascend", "intel_xpu"})
 SAMPLING_BACKEND_CHOICES = set(BUILT_IN_SAMPLING_BACKENDS)
 
+# Each name has an adapter in sampling/watermarking/runtime.py.
+WATERMARK_ALGORITHM_CHOICES = ["gumbel"]
+
 MOE_RUNNER_BACKEND_CHOICES = [
     "auto",
     "deep_gemm",
