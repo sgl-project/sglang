@@ -43,15 +43,12 @@ from sglang.srt.runtime_context import (
     get_serving,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.gauge_histogram import GaugeHistogram
 
 if TYPE_CHECKING:
     from prometheus_client import Gauge
 
     from sglang.srt.managers.schedule_batch import Req
-
-SGLANG_TEST_REQUEST_TIME_STATS = get_bool_env_var("SGLANG_TEST_REQUEST_TIME_STATS")
 
 logger = logging.getLogger(__name__)
 
@@ -89,13 +86,18 @@ class SchedulerStats:
     # Memory pool usage ratios (0.0–1.0).
     # Each pool tracks: used = total - available - evictable, usage = used / total.
     #
-    # token_usage:      max(full, swa, mamba) — the bottleneck across all pools.
-    #                   FIXME: misleadingly named "token_usage"; rename requires API deprecation.
-    # full_token_usage: full-attention KV cache pool usage (always active).
-    # swa_token_usage:  sliding-window attention KV cache pool usage (hybrid SWA models only, e.g. Gemma2).
-    # mamba_usage:      Mamba SSM state pool usage (hybrid SSM models only, e.g. Jamba).
+    # token_usage:        max(full, every window, mamba) — the bottleneck across all pools.
+    #                     FIXME: misleadingly named "token_usage"; rename requires API deprecation.
+    # full_token_usage:   full-attention KV cache pool usage (always active).
+    # window_token_usage: each sliding-window KV pool's usage, by the window's
+    #                     name (`window_<length>`); empty without window layers.
+    # swa_token_usage:    the target's own window's usage (the longest window
+    #                     its layers declare); 0 without one. Kept for readers
+    #                     of the single-window name.
+    # mamba_usage:        Mamba SSM state pool usage (hybrid SSM models only, e.g. Jamba).
     token_usage: float = 0.0
     full_token_usage: float = 0.0
+    window_token_usage: Dict[str, float] = field(default_factory=dict)
     swa_token_usage: float = 0.0
     mamba_usage: float = 0.0
 
@@ -107,13 +109,18 @@ class SchedulerStats:
     # kv_available_tokens:  free (unallocated) slots in the pool.
     # kv_evictable_tokens:  slots holding radix-cached KV data that can be evicted for new requests.
     # kv_used_tokens:       actively used slots (locked by running requests). Equals full_num_used.
-    # num_used_tokens:      max(full_num_used, swa_num_used) for hybrid-SWA models, else full_num_used.
-    #                       Does NOT include the mamba pool.
+    # num_used_tokens:      max(full_num_used, every window's num_used); full_num_used
+    #                       without windows. Does NOT include the mamba pool.
     num_used_tokens: int = 0
     kv_available_tokens: int = 0
     kv_evictable_tokens: int = 0
     kv_used_tokens: int = 0
 
+    # The same three counts for each window pool, by the window's name.
+    window_available_tokens: Dict[str, int] = field(default_factory=dict)
+    window_evictable_tokens: Dict[str, int] = field(default_factory=dict)
+    window_used_tokens: Dict[str, int] = field(default_factory=dict)
+    # The three counts of the target's own window, as `swa_token_usage`.
     swa_available_tokens: int = 0
     swa_evictable_tokens: int = 0
     swa_used_tokens: int = 0
@@ -144,10 +151,13 @@ class SchedulerStats:
     kv_transfer_speed_gb_s: float = 0.0
     kv_transfer_latency_ms: float = 0.0
     pending_prealloc_token_usage: float = 0.0
-    # Share of the full / SWA KV pool held by decode requests whose KV transfer
-    # is still pending (preallocated, not yet running), on the capacity basis of
-    # full_token_usage / swa_token_usage; the difference is the running batch's share.
+    # Share of the full / each window KV pool held by decode requests whose KV
+    # transfer is still pending (preallocated, not yet running), on the capacity
+    # basis of full_token_usage / window_token_usage; the difference is the
+    # running batch's share.
     prealloc_full_token_usage: float = 0.0
+    prealloc_window_token_usage: Dict[str, float] = field(default_factory=dict)
+    # The target's own window's share, as `swa_token_usage`.
     prealloc_swa_token_usage: float = 0.0
 
     # Utilization
@@ -357,6 +367,9 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self.enable_streaming_session = enable_streaming_session
         self.last_log_time = time.perf_counter()
         self._known_priorities: Set[int] = set()
+        # Window pool series carry the window's name (`window_<length>`); a
+        # custom label of that name is overridden on them (`_log_window_gauge`).
+        window_labelnames = [name for name in labels if name != "window"] + ["window"]
 
         # =================================================================
         # Basics
@@ -413,6 +426,12 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
+        self.window_token_usage = Gauge(
+            name="sglang:window_token_usage",
+            documentation="The token usage of each sliding-window KV pool, by window.",
+            labelnames=window_labelnames,
+            multiprocess_mode="mostrecent",
+        )
         self.swa_token_usage = Gauge(
             name="sglang:swa_token_usage",
             documentation="The token usage for SWA layers.",
@@ -451,6 +470,24 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             name="sglang:kv_used_tokens",
             documentation="Number of actively used token slots in the KV cache pool.",
             labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.window_available_tokens = Gauge(
+            name="sglang:window_available_tokens",
+            documentation="Number of free token slots in each sliding-window KV pool, by window.",
+            labelnames=window_labelnames,
+            multiprocess_mode="mostrecent",
+        )
+        self.window_evictable_tokens = Gauge(
+            name="sglang:window_evictable_tokens",
+            documentation="Number of evictable (radix-cached) token slots in each sliding-window KV pool, by window.",
+            labelnames=window_labelnames,
+            multiprocess_mode="mostrecent",
+        )
+        self.window_used_tokens = Gauge(
+            name="sglang:window_used_tokens",
+            documentation="Number of actively used token slots in each sliding-window KV pool, by window.",
+            labelnames=window_labelnames,
             multiprocess_mode="mostrecent",
         )
         self.swa_available_tokens = Gauge(
@@ -661,6 +698,12 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             name="sglang:prealloc_full_token_usage",
             documentation="Share of the full-attention KV pool held by decode requests whose KV transfer is pending (preallocated, not yet running); same capacity basis as sglang:full_token_usage.",
             labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.prealloc_window_token_usage = Gauge(
+            name="sglang:prealloc_window_token_usage",
+            documentation="Share of each sliding-window KV pool held by decode requests whose KV transfer is pending, by window; same capacity basis as sglang:window_token_usage.",
+            labelnames=window_labelnames,
             multiprocess_mode="mostrecent",
         )
         self.prealloc_swa_token_usage = Gauge(
@@ -1297,6 +1340,12 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
+        self.max_total_num_tokens_window = Gauge(
+            name="sglang:max_total_num_tokens_window",
+            documentation="Maximum total number of tokens in each sliding-window KV cache pool, by window.",
+            labelnames=window_labelnames,
+            multiprocess_mode="mostrecent",
+        )
         self.max_total_num_tokens_swa = Gauge(
             name="sglang:max_total_num_tokens_swa",
             documentation="Maximum total number of tokens in the SWA KV cache pool.",
@@ -1418,6 +1467,13 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
     def _log_gauge(self, gauge: Gauge, data: Union[int, float]) -> None:
         # Convenience function for logging a scalar to gauge.
         gauge.labels(**self.labels).set(data)
+
+    def _log_window_gauge(self, gauge: Gauge, data: Mapping[str, float]) -> None:
+        # One sample per window pool, under the window's name.
+        labels = dict(self.labels)
+        for window, value in data.items():
+            labels["window"] = window
+            gauge.labels(**labels).set(value)
 
     def _log_gauge_queue_count(self, gauge: Gauge, data: QueueCount) -> None:
         # Log a QueueCount to gauge: total under default labels, per-priority breakdown under priority="<int>".
@@ -1663,6 +1719,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         # Memory pool usage ratios
         self._log_gauge(self.token_usage, stats.token_usage)
         self._log_gauge(self.full_token_usage, stats.full_token_usage)
+        self._log_window_gauge(self.window_token_usage, stats.window_token_usage)
         self._log_gauge(self.swa_token_usage, stats.swa_token_usage)
         self._log_gauge(self.mamba_usage, stats.mamba_usage)
 
@@ -1671,6 +1728,13 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self._log_gauge(self.kv_available_tokens, stats.kv_available_tokens)
         self._log_gauge(self.kv_evictable_tokens, stats.kv_evictable_tokens)
         self._log_gauge(self.kv_used_tokens, stats.kv_used_tokens)
+        self._log_window_gauge(
+            self.window_available_tokens, stats.window_available_tokens
+        )
+        self._log_window_gauge(
+            self.window_evictable_tokens, stats.window_evictable_tokens
+        )
+        self._log_window_gauge(self.window_used_tokens, stats.window_used_tokens)
         self._log_gauge(self.swa_available_tokens, stats.swa_available_tokens)
         self._log_gauge(self.swa_evictable_tokens, stats.swa_evictable_tokens)
         self._log_gauge(self.swa_used_tokens, stats.swa_used_tokens)
@@ -1716,6 +1780,9 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             self.pending_prealloc_token_usage, stats.pending_prealloc_token_usage
         )
         self._log_gauge(self.prealloc_full_token_usage, stats.prealloc_full_token_usage)
+        self._log_window_gauge(
+            self.prealloc_window_token_usage, stats.prealloc_window_token_usage
+        )
         self._log_gauge(self.prealloc_swa_token_usage, stats.prealloc_swa_token_usage)
 
         # Utilization
@@ -1777,6 +1844,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
     def emit_constants(
         self,
         max_total_num_tokens: int,
+        max_total_num_tokens_window: Mapping[str, int],
         max_total_num_tokens_swa: Optional[int],
         weight_memory_usage_gb: float,
         kv_cache_memory_usage_gb: float,
@@ -1788,6 +1856,9 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         startup_available_gpu_memory_gb: float,
     ) -> None:
         self._log_gauge(self.max_total_num_tokens, max_total_num_tokens)
+        self._log_window_gauge(
+            self.max_total_num_tokens_window, max_total_num_tokens_window
+        )
         if max_total_num_tokens_swa is not None:
             self._log_gauge(self.max_total_num_tokens_swa, max_total_num_tokens_swa)
         self._log_gauge(self.weight_memory_usage_gb, weight_memory_usage_gb)
@@ -2249,7 +2320,9 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             "request's view at splice time, so the span beyond it was released; "
             "cache_admission_shortfall means an L3-loaded L2 span was no longer "
             "reusable when cache-mode admission ran; deadline means the "
-            "storage prefetch stop policy ended the read before it completed.",
+            "storage prefetch stop policy ended the read before it completed; "
+            "already_cached means another request cached the span while the "
+            "read was in flight, so the loaded copy was freed as a duplicate.",
             labelnames=list(labels.keys()) + ["reason"],
         )
         for reason in (
@@ -2264,6 +2337,7 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             "device_overlap",
             "cache_admission_shortfall",
             "dropped",
+            "already_cached",
         ):
             self.storage_prefetch_unfulfilled_tokens_total.labels(
                 **self.labels, reason=reason
@@ -2295,6 +2369,15 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             documentation="Prefetch tokens abandoned because an aux pool "
             "(e.g. the SWA trailing window) could not allocate host staging "
             "— the whole storage fetch is forfeited, not just the aux part.",
+            labelnames=labels.keys(),
+        )
+
+        self.storage_backup_failed_tokens_total = Counter(
+            name="sglang:hicache_storage_backup_failed_tokens_total",
+            documentation="Tokens of a storage backup span that were not "
+            "written when the span was settled at its rank-agreed written "
+            "prefix. The tail stays un-backed until a later write-through "
+            "covers it.",
             labelnames=labels.keys(),
         )
 
@@ -2384,6 +2467,12 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
     def log_prefetch_aux_alloc_failed_tokens(self, num_tokens: int):
         if num_tokens > 0:
             self.prefetch_aux_alloc_failed_tokens_total.labels(**self.labels).inc(
+                num_tokens
+            )
+
+    def log_storage_backup_failed_tokens(self, num_tokens: int) -> None:
+        if num_tokens > 0:
+            self.storage_backup_failed_tokens_total.labels(**self.labels).inc(
                 num_tokens
             )
 
@@ -2560,7 +2649,7 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
         self.load_back_num_tokens = Counter(
             name="sglang:load_back_tokens_total",
             documentation="The number of tokens loaded back from local host "
-            "DRAM (L2) to GPU, by host pool (kv, swa, mamba, ...). Every TP "
+            "DRAM (L2) to GPU, by host pool (kv, mamba, each window's, ...). Every TP "
             "rank reports the same logical count under its own rank labels; "
             "read one rank rather than summing ranks.",
             labelnames=list(labels.keys()) + ["pool"],
@@ -2603,7 +2692,7 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
         self.backup_num_tokens = Counter(
             name="sglang:hicache_backup_tokens_total",
             documentation="The number of tokens backed up from GPU to local "
-            "host DRAM (L2), by host pool (kv, swa, mamba, ...). Covers all "
+            "host DRAM (L2), by host pool (kv, mamba, each window's, ...). Covers all "
             "D->H backups regardless of --hicache-write-policy. Distinct from "
             "the host-to-storage (L3) sglang:backuped_tokens_total. Every TP "
             "rank reports the same logical count under its own rank labels; "
@@ -2649,6 +2738,137 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
         self.hicache_dropped_tokens.labels(**self.labels, reason=reason, pool=pool).inc(
             num_tokens
         )
+
+    def init_linker_metrics(self) -> None:
+        """Create the external cache linker series; only caches with a linker call this."""
+        from prometheus_client import Counter as _PromCounter
+        from prometheus_client import Gauge as _PromGauge
+        from prometheus_client import Histogram as _PromHistogram
+
+        Counter = self._counter_cls or _PromCounter
+        Gauge = self._gauge_cls or _PromGauge
+        Histogram = self._histogram_cls or _PromHistogram
+        labels = self.labels
+
+        self.linker_lookup_tokens = Counter(
+            name="sglang:linker_lookup_tokens_total",
+            documentation="Device-uncached prefix tokens probed in the external "
+            "store, per lookup. A waiting request is probed again on each "
+            "scheduling pass that matches it.",
+            labelnames=labels.keys(),
+        )
+        self.linker_hit_tokens = Counter(
+            name="sglang:linker_hit_tokens_total",
+            documentation="Probed tokens every rank can restore from the external "
+            "store, per lookup.",
+            labelnames=labels.keys(),
+        )
+        self.linker_load_tokens = Counter(
+            name="sglang:linker_load_tokens_total",
+            documentation="External-store KV tokens successfully restored by load "
+            "mode: layer_wise counts tokens after all ranks confirm loading "
+            "succeeded; prefetch counts tokens successfully published into "
+            "the cache. Cancelled and failed loads are excluded.",
+            labelnames=list(labels.keys()) + ["mode"],
+        )
+        for mode in ("layer_wise", "prefetch"):
+            self.linker_load_tokens.labels(**labels, mode=mode)
+        self.linker_offload_tokens = Counter(
+            name="sglang:linker_offload_tokens_total",
+            documentation="KV tokens queued for writing to the external store.",
+            labelnames=labels.keys(),
+        )
+        self.linker_failures = Counter(
+            name="sglang:linker_failures_total",
+            documentation="External store operations that failed, by stage: lookup "
+            "(a prefetch lookup raised), load (requests aborted because their "
+            "layer-wise load did not land), offload (accepted writes whose "
+            "asynchronous completion failed).",
+            labelnames=list(labels.keys()) + ["stage"],
+        )
+        for stage in ("lookup", "load", "offload"):
+            self.linker_failures.labels(**labels, stage=stage)
+        self.linker_prefetch_requests = Counter(
+            name="sglang:linker_prefetch_requests_total",
+            documentation="Prefetch-mode reads that ended, by outcome: published "
+            "(joined the cache), stopped (the prefetch stop policy ended the wait), "
+            "rejected (a rank could not submit the read), released (the request "
+            "left the queue or the cache reset), failed (the read did not land).",
+            labelnames=list(labels.keys()) + ["outcome"],
+        )
+        for outcome in ("published", "stopped", "rejected", "released", "failed"):
+            self.linker_prefetch_requests.labels(**labels, outcome=outcome)
+
+        # Same coarse boundaries as the backup histogram: downstream metrics
+        # gateways with a fixed bucket preset drop series with other boundaries.
+        bucket_wait = [0.001, 0.005, 0.01, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0]
+        self.linker_forward_wait_seconds = Histogram(
+            name="sglang:linker_forward_wait_seconds",
+            documentation="Per batch, the time the forward pass blocked on "
+            "layer-wise loads that had not landed yet: the load-back cost the "
+            "forward actually pays.",
+            labelnames=labels.keys(),
+            buckets=bucket_wait,
+        )
+        self.linker_finish_wait_seconds = Histogram(
+            name="sglang:linker_finish_wait_seconds",
+            documentation="Per batch, the time spent after the forward waiting for "
+            "its layer-wise loads to stop writing device memory.",
+            labelnames=labels.keys(),
+            buckets=bucket_wait,
+        )
+        self.linker_offload_duration_seconds = Histogram(
+            name="sglang:linker_offload_duration_seconds",
+            documentation="Time from queuing a write to the external store until "
+            "the cache consumes its completion.",
+            labelnames=labels.keys(),
+            buckets=bucket_wait + [30.0, 60.0],
+        )
+        self.linker_offloads_in_flight = Gauge(
+            name="sglang:linker_offloads_in_flight",
+            documentation="Writes to the external store queued and not yet "
+            "completed; each pins its tree node until it lands.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
+    def increment_linker_lookup_tokens(
+        self, lookup_tokens: int, hit_tokens: int
+    ) -> None:
+        self.linker_lookup_tokens.labels(**self.labels).inc(lookup_tokens)
+        if hit_tokens > 0:
+            self.linker_hit_tokens.labels(**self.labels).inc(hit_tokens)
+
+    def increment_linker_load_tokens(self, num_tokens: int, mode: str) -> None:
+        self.linker_load_tokens.labels(**self.labels, mode=mode).inc(num_tokens)
+
+    def increment_linker_offload_tokens(self, num_tokens: int) -> None:
+        self.linker_offload_tokens.labels(**self.labels).inc(num_tokens)
+
+    def increment_linker_failures(self, stage: str, count: int = 1) -> None:
+        self.linker_failures.labels(**self.labels, stage=stage).inc(count)
+
+    def increment_linker_prefetch_requests(self, outcome: str) -> None:
+        self.linker_prefetch_requests.labels(**self.labels, outcome=outcome).inc()
+
+    def observe_linker_load_waits(
+        self, forward_wait_seconds: Optional[float], finish_wait_seconds: float
+    ) -> None:
+        if forward_wait_seconds is not None:
+            self.linker_forward_wait_seconds.labels(**self.labels).observe(
+                forward_wait_seconds
+            )
+        self.linker_finish_wait_seconds.labels(**self.labels).observe(
+            finish_wait_seconds
+        )
+
+    def observe_linker_offload_duration(self, duration_seconds: float) -> None:
+        self.linker_offload_duration_seconds.labels(**self.labels).observe(
+            duration_seconds
+        )
+
+    def set_linker_offloads_in_flight(self, count: int) -> None:
+        self.linker_offloads_in_flight.labels(**self.labels).set(count)
 
 
 class EncoderMetricsCollector(_StatLoggerDIMixin):

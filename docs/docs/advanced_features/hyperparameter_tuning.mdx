@@ -72,7 +72,7 @@ Note that CUDA graph consumes more memory, so you may need to reduce `--mem-frac
 
 ### Tune `--dp-size` and `--tp-size`
 
-Data parallelism is better for throughput. When there is enough GPU memory, always favor data parallelism for throughput. Refer to [SGLang Model Gateway (former Router)](../advanced_features/sgl_model_gateway) for a better data parallelism rather than using `dp_size` parameter.
+Data parallelism is better for throughput. When there is enough GPU memory, always favor data parallelism for throughput. Refer to [DP, DPA and sgl-router](../advanced_features/dp_dpa_router_guide) for a better data parallelism with separate servers behind `sgl-router` rather than using `dp_size` parameter.
 
 ### Try other options
 
@@ -80,3 +80,22 @@ Data parallelism is better for throughput. When there is enough GPU memory, alwa
 - Try other quantization (e.g. FP8 quantization with `--quantization fp8`)
 - Try other parallelism strategies (e.g. [expert parallelism](https://lmsys.org/blog/2025-05-05-large-scale-ep/)) or DP attention for deepseek models (with `--attn-dp-size 8`).
 - If the workload has many shared prefixes, try `--schedule-policy lpm`. Here, `lpm` stands for longest prefix match. It reorders requests to encourage more cache hits but introduces more scheduling overhead.
+
+
+### LPM under long waiting queues
+
+With prefix caching enabled, `lpm` keeps its existing matching and sorting behavior for queues of at most 128 requests. Above 128, it checks the first 64 waiting requests for a prefix-reuse opportunity on the first eligible scheduling pass and every 32 eligible passes thereafter. A pass is eligible when the queue exceeds 128 and no committed batch remains. This deterministic cadence keeps ranks sharing the queue independent of local clock differences. The gate requires threatened reuse of at least 1.5 times the KV capacity. Candidate requests are grouped by cache namespace and their first 4096 tokens. Threatened reuse counts long shared prefixes whose intervening unique input working set, including the reusable prefix, exceeds the KV capacity. This is a heuristic input-based signal, not a guarantee of cache savings or latency improvement. If the gate rejects, LPM retains its FCFS fallback. Otherwise, it selects a fixed batch of up to 64 waiting requests. Each pass rematches and reorders the remaining members. Members are not replenished, and the batch finishes admission or cancellation before the queue threshold is evaluated again.
+
+Temporarily skipped members (prefetch, staging, LoRA availability, or pooling compatibility) may allow one additional fixed batch of up to 64 requests to be attempted. Resource and budget breaks still end the pass. This additional batch is never replenished while the current batch remains active; its survivors are promoted when the current batch clears. All committed batches must drain before short-queue LPM resumes. This bounds the set of later requests considered during temporary blocking, not their execution time.
+
+The gate currently supports ordinary RadixCache and FULL-only UnifiedRadixCache configurations. Hierarchical, session, sliding-window, Mamba, and other unsupported cache modes retain the existing fallback.
+
+Non-members retain the existing periodic, capped prefix refresh. dLLM retains the original LPM large-queue FCFS fallback because its separate transfer path does not use this admission loop. Disabling prefix caching still uses FCFS. No new policy name or server argument is required.
+
+### Reduce tail latency with `--schedule-policy uniboost`
+
+For mixed prompt lengths, such as agentic RL rollouts, `uniboost` admits requests with little uncached prefill work ahead of long ones. Each request gets a bounded boost, so long requests keep their place in line and are not starved.
+
+- `--uniboost-gamma` (default `10.0`) sets the boost decay rate. Lower values behave more like shortest-job-first; higher values behave more like `fcfs`.
+- `--enable-uniboost-gamma-ada` tunes gamma online from the observed p95/p99 latency, so you do not have to pick it per workload.
+- With `--tp-size` or `--pp-size` above 1, a request's arrival is measured in prefill tokens processed before it was queued, not wall time, so every rank admits the same batch.

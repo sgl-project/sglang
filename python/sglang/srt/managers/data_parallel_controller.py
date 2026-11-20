@@ -19,6 +19,7 @@ import multiprocessing as mp
 import signal
 import threading
 import time
+import traceback
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -37,6 +38,7 @@ from sglang.srt.elastic_ep.topology import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import (
+    AbortReq,
     ActiveRanksOutput,
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
@@ -75,20 +77,18 @@ from sglang.srt.server_args import (
     ServerArgs,
 )
 from sglang.srt.utils import numa_utils
-from sglang.srt.utils.common import (
-    configure_logger,
-    kill_itself_when_parent_died,
-    maybe_reindex_device_id,
-)
+from sglang.srt.utils.common import TypeBasedDispatcher
+from sglang.srt.utils.device import maybe_reindex_device_id
+from sglang.srt.utils.log_utils import configure_logger
 from sglang.srt.utils.network import (
     NetworkAddress,
     bind_port,
     get_zmq_socket,
     get_zmq_socket_on_host,
 )
+from sglang.srt.utils.process import kill_itself_when_parent_died
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.watchdog import Watchdog
-from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 logger = logging.getLogger(__name__)
 
@@ -395,6 +395,9 @@ class DataParallelController:
                 (BatchTokenizedEmbeddingReqInput, self.dispatch_batch_embedding),
                 (BlockReqInput, self.send_to_all_workers),
                 (ProfileReq, self.send_to_all_workers),
+                # A scheduler ignores an abort for a rid it has not received yet,
+                # so every DP rank gets the abort on the socket its requests use.
+                (AbortReq, self.send_to_all_workers),
                 (ActiveRanksOutput, self.update_active_ranks),
                 (
                     ElasticScaleUpdateReq,
@@ -827,6 +830,9 @@ class DataParallelController:
                     for info in self._scheduler_init_infos
                 ]
             )
+            for info in self._scheduler_init_infos:
+                if info.get("router_l3_layout"):
+                    init_info["router_l3_layout"] = info["router_l3_layout"]
         if layout is not None:
             init_info["hicache_object_layout"] = layout
         return init_info
@@ -972,9 +978,7 @@ def run_data_parallel_controller_process(
             **controller.get_init_info(),
             SCHEDULER_PIDS_ARG: scheduler_pids,
         }
-        if get_serving().grpc_port is not None and not (
-            get_serving().smg_grpc_mode or get_serving().grpc_mode
-        ):
+        if get_serving().grpc_port is not None:
             init_info["kv_event_sources"] = sorted(
                 controller.local_kv_event_sources, key=lambda source: source["dp_rank"]
             )
@@ -991,6 +995,7 @@ def run_data_parallel_controller_process(
                 f"Scheduler or DataParallelController {proc.pid} terminated with {proc.exitcode}"
             )
     except Exception:
-        traceback = get_exception_traceback()
-        logger.error(f"DataParallelController hit an exception: {traceback}")
+        logger.error(
+            f"DataParallelController hit an exception: {traceback.format_exc()}"
+        )
         parent_process.send_signal(signal.SIGQUIT)

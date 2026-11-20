@@ -162,7 +162,7 @@ class ServerArgsAutoTuner:
 
     def _resolve_keep_resident_min_available_gb(
         self, deployment_config: ModelDeploymentConfig
-    ) -> float | None:
+    ) -> float:
         # explicit per-model > task-type default > global default
         explicit = deployment_config.keep_resident_min_available_gb
         if explicit is not None:
@@ -259,9 +259,7 @@ class ServerArgsAutoTuner:
         )
         all_resident = self._keeps_all_components_resident()
         if all_resident or (
-            min_available_gb is not None
-            and disable_threshold_gb is not None
-            and min_available_gb >= disable_threshold_gb
+            min_available_gb is not None and min_available_gb >= disable_threshold_gb
         ):
             changed = []
             components = set(
@@ -477,6 +475,7 @@ class ServerArgsAutoTuner:
             or args.use_fsdp_inference
             or args.layerwise_offload_components is not None
             or args.dit_layerwise_offload is True
+            or not self._deployment_config().auto_auxiliary_layerwise_offload
         ):
             return
 
@@ -719,7 +718,8 @@ class ServerArgsAutoTuner:
         components = [
             component_name
             for component_name, arg_name in DEFAULT_LAYERWISE_COMPONENT_ARG_NAMES
-            if args.explicit_residency_mode(component_name) is None
+            if self._deployment_config().auto_auxiliary_layerwise_offload
+            and args.explicit_residency_mode(component_name) is None
         ]
         components = self._filter_high_memory_resident_components(components)
         if self._should_auto_enable_dit_layerwise_offload():
@@ -738,9 +738,6 @@ class ServerArgsAutoTuner:
 
         deployment_config = self._deployment_config()
         threshold_gb = self._resolve_keep_resident_min_available_gb(deployment_config)
-        if threshold_gb is None:
-            return components
-
         min_available_gb = self._get_min_available_device_memory_gb()
         if min_available_gb is None or min_available_gb < threshold_gb:
             return components
@@ -927,7 +924,9 @@ class ServerArgsAutoTuner:
                 empty_cache=False,
             )
             for device_id in range(
-                args.base_gpu_id, args.base_gpu_id + max(1, args.num_gpus)
+                args.base_gpu_id,
+                # num_gpus is the total across nodes; probe only this node's GPUs.
+                args.base_gpu_id + max(1, args.num_gpus // max(1, args.nnodes)),
             )
         )
 

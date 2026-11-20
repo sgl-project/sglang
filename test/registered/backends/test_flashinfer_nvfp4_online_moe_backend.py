@@ -146,7 +146,7 @@ class TestFlashinferCuteDSLMoeBackendNvFp4OnlineW4A16(
         "4",
         "--enable-dp-lm-head",
         "--moe-a2a-backend",
-        "flashinfer",
+        "flashinfer_nvlink_one_sided",
         "--cuda-graph-backend-prefill",
         "disabled",
     ]
