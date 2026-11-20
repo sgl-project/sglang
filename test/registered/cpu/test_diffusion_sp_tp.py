@@ -6,7 +6,7 @@ from pathlib import Path
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, get_tp_cpu_bind
 
 register_cpu_ci(est_time=5, suite="extra-tp-test-cpu-intel")
 
@@ -65,7 +65,16 @@ class TestDiffusionCPUParallel(CustomTestCase):
                 SGLANG_DIFFUSION_PLATFORM_OVERRIDE="cpu",
                 SGLANG_DIFFUSION_TARGET_DEVICE="cpu",
             )
-            env.pop("SGLANG_CPU_OMP_THREADS_BIND", None)
+            num_workers = tp_size * sp_degree
+            bind = get_tp_cpu_bind(num_workers)
+            if bind is not None:
+                bind_groups = bind.split("|")
+                if len(bind_groups) != num_workers:
+                    raise RuntimeError(
+                        f"SGLANG_CPU_OMP_THREADS_BIND provides {len(bind_groups)} "
+                        f"groups, but the diffusion run needs {num_workers} workers."
+                    )
+                env["SGLANG_CPU_OMP_THREADS_BIND"] = bind
 
             with log_path.open("w", encoding="utf-8") as log:
                 process = subprocess.Popen(
