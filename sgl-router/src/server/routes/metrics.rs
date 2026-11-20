@@ -340,7 +340,7 @@ fn render_kv_tiers(kv: &KvIndexMetrics, block_size: u32) -> String {
         kv.tree.media().hits(),
     ));
     out.push_str(
-        "# HELP sgl_router_cache_media_affinity_tiebreaks_total Lookups of a chat with images, with no remembered placement, where workers or DP ranks tied on the confirmed prefix and the conversation's rendezvous hash chose one.\n",
+        "# HELP sgl_router_cache_media_affinity_tiebreaks_total Lookups of a chat with images, with no remembered placement, where workers tied on the confirmed prefix and the conversation's rendezvous hash ordered them.\n",
     );
     out.push_str("# TYPE sgl_router_cache_media_affinity_tiebreaks_total counter\n");
     out.push_str(&format!(
