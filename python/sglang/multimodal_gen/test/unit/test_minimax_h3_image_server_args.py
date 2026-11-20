@@ -3,6 +3,7 @@
 
 import pytest
 
+from sglang.multimodal_gen.configs.pipeline_configs import minimax_h3 as video_config
 from sglang.multimodal_gen.configs.pipeline_configs import (
     minimax_h3_image as image_config,
 )
@@ -64,6 +65,7 @@ def make_server(monkeypatch, tmp_path):
         monkeypatch.setattr(args_module, "current_platform", platform)
         monkeypatch.setattr(auto_tune_module, "current_platform", platform)
         monkeypatch.setattr(image_config, "current_platform", platform)
+        monkeypatch.setattr(video_config, "current_platform", platform)
         monkeypatch.setattr(
             image_config.torch.cuda,
             "get_device_name",
