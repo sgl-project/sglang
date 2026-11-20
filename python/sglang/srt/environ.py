@@ -839,6 +839,10 @@ class Envs:
     SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL = EnvFloat(5.0)
     SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE = EnvInt(2)
     SGLANG_DISAGGREGATION_WAITING_TIMEOUT = EnvInt(300)
+    # Prefill: fail a room whose KV transfer has not finished this many seconds
+    # after its last chunk was queued, and bound the Mooncake transfer worker's
+    # CUDA waits by it. 0 disables.
+    SGLANG_DISAGGREGATION_TRANSFER_TIMEOUT = EnvFloat(0.0)
     # Seconds a unified-memory page move waits for network transfers before it
     # fails; unset: past the bootstrap, waiting and deferred-release timeouts.
     SGLANG_DISAGGREGATION_PAGE_MOVE_WAIT_TIMEOUT = EnvFloat(None)

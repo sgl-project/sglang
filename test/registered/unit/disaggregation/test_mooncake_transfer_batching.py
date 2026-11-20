@@ -2,8 +2,9 @@ import concurrent.futures
 import ctypes
 import unittest
 from collections import defaultdict
+from functools import partial
 from queue import SimpleQueue
-from threading import Event, Lock
+from threading import Event, Lock, Thread
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
@@ -11,6 +12,7 @@ import numpy as np
 import torch
 
 from sglang.srt.disaggregation.base.conn import KVPoll, StateType
+from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager, MooncakeKVSender
@@ -601,6 +603,21 @@ class TestDcpPackLifetime(CustomTestCase):
         self.assertEqual(observed, [11])
 
 
+class _NeverDoneEvent:
+    """A device event whose work does not finish until the test sets `done`."""
+
+    def __init__(self):
+        self.polled = Event()
+        self.done = Event()
+
+    def query(self) -> bool:
+        self.polled.set()
+        return self.done.is_set()
+
+    def synchronize(self) -> None:
+        self.done.wait()
+
+
 class TestMooncakeEarlySend(CustomTestCase):
     def test_sender_queues_event_once_without_waiting_on_scheduler(self):
         for last in (False, True):
@@ -690,6 +707,7 @@ class TestMooncakeEarlySend(CustomTestCase):
             enable_trace=False,
             enable_staging=False,
             enable_deferred_decode_kv_release=True,
+            transfer_timeout=0,
             _staging_outstanding=defaultdict(int),
             request_status={1: KVPoll.WaitingForInput},
             transfer_infos={1: {"peer": peer}},
@@ -793,6 +811,61 @@ class TestMooncakeEarlySend(CustomTestCase):
                 manager, queue, MagicMock(), staging_buffer=object()
             )
         self.assertEqual(order, ["wait", "gather"])
+
+    def _run_worker_on_a_stuck_room(self, timeout):
+        """Room 1 waits on a device event that never completes; room 2 is queued
+        behind it on the same worker."""
+        stuck = _NeverDoneEvent()
+        self.addCleanup(stuck.done.set)
+        manager, queue = self._worker(stuck)
+        manager.transfer_timeout = timeout
+        manager.pp_rank = 0
+        manager.fail_transfer_on_timeout = partial(
+            CommonKVManager.fail_transfer_on_timeout, manager
+        )
+        manager.conclude_failure = MagicMock(
+            side_effect=lambda bootstrap_room, failure_reason: (
+                manager.request_status.update({bootstrap_room: KVPoll.Failed})
+            )
+        )
+        manager.request_status[2] = KVPoll.WaitingForInput
+        manager.transfer_infos[2] = manager.transfer_infos[1]
+        stuck_chunk = queue.get_nowait()
+        queue.get_nowait()  # Queue room 2 behind room 1, ahead of the stop sentinel.
+        for chunk in (
+            stuck_chunk,
+            TransferKVChunk(2, [0], slice(0, 1), False, None, None),
+            None,
+        ):
+            queue.put(chunk)
+        worker = Thread(
+            target=MooncakeKVManager.transfer_worker,
+            args=(manager, queue, MagicMock()),
+            daemon=True,
+        )
+        worker.start()
+        return manager, worker, stuck
+
+    def test_transfer_timeout_fails_a_stuck_room_and_serves_the_rooms_behind(self):
+        manager, worker, _ = self._run_worker_on_a_stuck_room(timeout=0.2)
+        worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(manager.request_status[1], KVPoll.Failed)
+        reason = manager.conclude_failure.call_args.kwargs["failure_reason"]
+        self.assertIn("transfer worker's wait on wait_event", reason)
+        # Only room 2 was read and sent; room 1's chunk was dropped.
+        manager.send_kvcache.assert_called_once()
+        manager._maybe_ack_drained_abort.assert_any_call(1)
+
+    def test_transfer_timeout_stops_the_wait_once_the_room_failed(self):
+        # An abort during the wait frees the worker long before the timeout.
+        manager, worker, stuck = self._run_worker_on_a_stuck_room(timeout=600)
+        self.assertTrue(stuck.polled.wait(5))
+        manager.request_status[1] = KVPoll.Failed
+        worker.join(5)
+        self.assertFalse(worker.is_alive())
+        manager.conclude_failure.assert_not_called()
+        manager.send_kvcache.assert_called_once()
 
 
 class TestMooncakeStagingDeviceType(unittest.TestCase):
