@@ -64,7 +64,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 bash "${SCRIPT_DIR}/../utils/install_rustup.sh"
 export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:${PATH}"
 
-${UV_PIP_INSTALL} pybind11 pyyaml decorator scipy attrs psutil evalscope
+${UV_PIP_INSTALL} pybind11 decorator attrs evalscope
 
 ${PIP_INSTALL} cannbot-dsl==0.8.0
 

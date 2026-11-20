@@ -130,9 +130,15 @@ RUN git lfs install --system
 ### Install MemFabric and MemCache
 RUN ${PIP_INSTALL} memfabric-hybrid==1.5.0.dev20261119 --trusted-host ascend.devcloud.huaweicloud.com -i https://ascend.devcloud.huaweicloud.com/pypi/simple
 
-RUN ${PIP_INSTALL} modelscope evalscope pytest blake3 deepseek-recipe msgpack
-
-RUN ${PIP_INSTALL} cannbot-dsl==0.8.0
+RUN ${PIP_INSTALL} \
+    wheel==0.45.1 \
+    pybind11 \
+    decorator \
+    attrs \
+    evalscope \
+    pytest \
+    msgpack \
+    cannbot-dsl==0.8.0
 
 RUN ${PIP_INSTALL} https://github.com/kvcache-ai/Mooncake/releases/download/v0.3.14/mooncake_transfer_engine_memfabric-0.3.14-cp312-cp312-manylinux_2_35_$(arch).whl --force --no-deps
 
@@ -151,8 +157,7 @@ RUN set -eux; \
     ${PIP_INSTALL} "${TORCH_NPU_WHEEL}"
 
 ## Install triton-ascend
-RUN ${PIP_INSTALL} pybind11 && \
-    if [ "$TARGETARCH" = "arm64" ]; then \
+RUN if [ "$TARGETARCH" = "arm64" ]; then \
         ${PIP_INSTALL} "${TRITON_AARCH64}"; \
     elif [ "$TARGETARCH" = "amd64" ]; then \
         ${PIP_INSTALL} "${TRITON_X86_64}"; \
@@ -194,7 +199,6 @@ RUN set -eux; \
     ldconfig -p | grep libmmpa.so
 
 RUN set -eux; \
-    ${PIP_INSTALL} wheel==0.45.1 pybind11 pyyaml decorator scipy attrs psutil; \
     mkdir /tmp/sgl-kernel-npu; \
     cd /tmp/sgl-kernel-npu; \
     wget \
