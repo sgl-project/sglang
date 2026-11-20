@@ -602,6 +602,15 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         self._draft_sampler = None
         self.draft_model = bundle.draft_model
+        if hasattr(self.draft_model, "prepare_refinement"):
+            from sglang.srt.arg_groups.overrides import resolved_view
+            from sglang.srt.configs.dspine import validate_dspine_runtime
+
+            validate_dspine_runtime(resolved_view(server_args), self.draft_model.config)
+            target_model = self.target_worker.model_runner.model
+            self.draft_model.prepare_refinement(
+                unwrap_lora_layer(getattr(target_model, "lm_head", None))
+            )
         self.selector = self.draft_model.candidate_selector
         # Ascend keeps selector proposal aligned with its greedy-only verify path.
         self._selector_sampling_enabled = not _is_npu
@@ -1093,7 +1102,20 @@ class DFlashWorkerV2(BaseSpecWorker):
                     self.draft_model_runner.capture_tail_hooks.append(
                         make_draft_sampler_capture_hook(self._draft_sampler)
                     )
-                if is_cuda() and envs.SGLANG_OPT_DFLASH_DRAFT_L2_PREFETCH.get():
+                elif getattr(
+                    self.draft_model, "requires_draft_sampler_for_graph", False
+                ):
+                    # DSpine publishes refinement tensors during forward. A replay
+                    # cannot refresh that Python state for an out-of-graph sampler.
+                    capture_decode_cuda_graph = False
+                    logger.info(
+                        "DFLASH draft runs eager because its sampler must be captured."
+                    )
+                if (
+                    capture_decode_cuda_graph
+                    and is_cuda()
+                    and envs.SGLANG_OPT_DFLASH_DRAFT_L2_PREFETCH.get()
+                ):
                     self._install_draft_l2_prefetch()
             self._draft_worker.init_cuda_graphs(
                 capture_decode_cuda_graph=capture_decode_cuda_graph

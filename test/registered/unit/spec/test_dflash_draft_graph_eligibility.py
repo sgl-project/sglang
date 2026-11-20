@@ -18,6 +18,58 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestDFlashDraftGraphEligibility(unittest.TestCase):
+    def test_dspine_graph_requires_captured_sampler(self):
+        worker = object.__new__(DFlashWorkerV2)
+        worker._hosts_draft = True
+        worker.device = "cuda"
+        worker.gpu_id = 0
+        worker._tp_sync = Mock()
+        worker._tp_sync.available_memory_gb.return_value = 2.0
+        worker.draft_parallel_layout = None
+        worker.draft_model = SimpleNamespace(requires_draft_sampler_for_graph=True)
+        worker._draft_worker = Mock()
+        worker.draft_model_runner = SimpleNamespace(capture_tail_hooks=[])
+        with (
+            patch.object(
+                dflash_worker_v2, "draft_pp_context", return_value=nullcontext()
+            ),
+            patch.object(
+                dflash_worker_v2, "draft_tp_context", return_value=nullcontext()
+            ),
+            patch.object(dflash_worker_v2, "get_parallel") as get_parallel,
+            patch.object(dflash_worker_v2, "get_exec") as get_exec,
+            patch.object(dflash_worker_v2, "current_platform") as platform,
+            patch.object(dflash_worker_v2, "is_cuda", return_value=True),
+            patch.object(
+                dflash_worker_v2,
+                "envs",
+                SimpleNamespace(
+                    SGLANG_OPT_DFLASH_DRAFT_L2_PREFETCH=SimpleNamespace(
+                        get=lambda: True
+                    )
+                ),
+            ),
+            patch.object(worker, "_install_draft_l2_prefetch") as install_prefetch,
+            patch.object(dflash_worker_v2, "is_gfx95_supported", return_value=False),
+            patch.object(worker, "_maybe_attach_megakernel_embed", return_value=None),
+            patch.object(worker, "_maybe_build_draft_sampler") as build_sampler,
+        ):
+            get_parallel.return_value.attn_dp_enabled = False
+            get_exec.return_value.graph.cuda_graph_config.decode.backend = object()
+            platform.is_out_of_tree.return_value = False
+            for sampler in (None, Mock()):
+                with self.subTest(has_sampler=sampler is not None):
+                    build_sampler.return_value = sampler
+                    install_prefetch.reset_mock()
+                    worker.init_cuda_graphs()
+                    worker._draft_worker.init_cuda_graphs.assert_called_with(
+                        capture_decode_cuda_graph=sampler is not None
+                    )
+                    self.assertEqual(
+                        install_prefetch.call_count, int(sampler is not None)
+                    )
+            self.assertEqual(len(worker.draft_model_runner.capture_tail_hooks), 1)
+
     def test_scheduler_admission_reaches_the_draft_forward_batch(self):
         worker = object.__new__(DFlashWorkerV2)
         worker.device = "cpu"

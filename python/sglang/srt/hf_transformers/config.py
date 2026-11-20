@@ -25,6 +25,7 @@ from sglang.srt.configs.deepseek_v41 import (
     DeepseekV41Config,
     normalize_deepseek_v41_config,
 )
+from sglang.srt.configs.dspine import is_dspine_config, normalize_dspine_config
 from sglang.srt.configs.model_config_parser_registry import (
     ModelConfigParserBase,
     get_model_config_parser,
@@ -158,10 +159,13 @@ _LONGCAT_ARCHS = {
 }
 
 
-def _try_load_longcat_config(model, revision: Optional[str], **kwargs):
-    config_dict, _ = PretrainedConfig.get_config_dict(
-        model, revision=revision, **kwargs
-    )
+def _try_load_longcat_config(
+    model, revision: Optional[str], config_dict=None, **kwargs
+):
+    if config_dict is None:
+        config_dict, _ = PretrainedConfig.get_config_dict(
+            model, revision=revision, **kwargs
+        )
     architectures = config_dict.get("architectures") or []
     if not any(arch in _LONGCAT_ARCHS for arch in architectures):
         return None
@@ -221,7 +225,18 @@ class HfModelConfigParser(ModelConfigParserBase):
         revision: Optional[str] = None,
         **kwargs,
     ):
-        config = _try_load_longcat_config(model, revision, **kwargs)
+        config_dict, _ = PretrainedConfig.get_config_dict(
+            model, revision=revision, **kwargs
+        )
+        if is_dspine_config(config_dict):
+            from transformers import Qwen3Config
+
+            config = Qwen3Config(**normalize_dspine_config(config_dict))
+            config._name_or_path = str(model)
+            return config
+        config = _try_load_longcat_config(
+            model, revision, config_dict=config_dict, **kwargs
+        )
         if config is None:
             config = _try_load_raw_mamba_config(model, revision, **kwargs)
         if config is None:
