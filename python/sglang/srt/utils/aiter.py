@@ -98,8 +98,8 @@ def aiter_dspark_draft_reject_reason(
     enable_unified_memory: bool,
     enable_deterministic_inference: bool,
 ) -> Optional[str]:
-    """Why the aiter backend cannot run a DSpark draft, or None when it can; the draft
-    verifies its block bidirectionally on unified_attention (causal=False), 4D NHD pool."""
+    """Why the aiter backend cannot run a DSpark draft, or None when it can;
+    the draft verify is unified_attention(causal=False) over a 4D NHD pool."""
     if draft_is_mla:
         return "MLA draft (the aiter MLA verify is causal-only)"
     if draft_has_sliding_window:
