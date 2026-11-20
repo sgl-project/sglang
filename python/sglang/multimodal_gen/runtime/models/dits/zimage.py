@@ -54,6 +54,7 @@ except Exception:
 
 logger = init_logger(__name__)
 _is_cuda = current_platform.is_cuda()
+_is_xpu = current_platform.is_xpu()
 
 ADALN_EMBED_DIM = 256
 SEQ_MULTI_OF = 32
@@ -444,7 +445,8 @@ class ZImageAttention(nn.Module):
 
         # Off CUDA only the batched 3D table (the one with positions) may take the
         # fused QKNorm+RoPE kernels; a 2D table gets qk-norm, then the class.
-        rope_in_qk_norm = _is_cuda or rope_positions is not None
+        # Eligible XPU 2D tables with matching Q/K shapes may also fuse.
+        rope_in_qk_norm = _is_cuda or _is_xpu or rope_positions is not None
         if self.qk_norm and fused_qk is None and rope_in_qk_norm:
             q, k = apply_qk_norm_with_optional_rope(
                 q=q.contiguous(),
@@ -453,6 +455,7 @@ class ZImageAttention(nn.Module):
                 k_norm=self.norm_k,
                 head_dim=self.head_dim,
                 cos_sin_cache=rope_cos_sin_cache,
+                freqs_complex=rope_freqs_complex if _is_xpu else None,
                 is_neox=False,
                 positions=rope_positions,
                 # CUDA lands here when native qk-norm is refused; keep it unfused.
