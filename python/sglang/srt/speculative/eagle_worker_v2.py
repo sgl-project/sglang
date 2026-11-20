@@ -750,9 +750,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         binding = getattr(self.draft_runner, "ascend_binding", None)
         chain = None
         if binding is not None and not forward_batch.forward_mode.is_idle():
-            from sglang.srt.hardware_backend.npu.megakernel.draft import draft_chain
+            from sglang.kernels.plugin_kernels.npu.spec import DraftLoopIO
 
-            chain = draft_chain(self, binding, batch, forward_batch)
+            chain = binding.draft_loop(DraftLoopIO(batch, forward_batch, self.draft_attn_backend.attn_backends[0], self.hot_token_id))
         with canary_outside_ctx:
             # Run draft
             if chain is not None:
@@ -1238,15 +1238,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     ):
         self.draft_runtime.note_draft_extend()
         binding = getattr(self.draft_runner, "ascend_binding", None)
-        fused = False
-        if binding is not None and not batch.forward_mode.is_idle():
-            if binding.mode == "fused_extend":
-                from sglang.srt.hardware_backend.npu.megakernel.draft import can_fuse
-
-                fused = can_fuse(self, binding, batch, batch_result)
-            elif binding.pd_decode and len(batch.reqs) == 1:
-                # A successful local extend supplies the seed for the next round.
-                batch.reqs[0].ascend_seed_ready = True
+        fused = binding is not None and not batch.forward_mode.is_idle() and binding.plan_extend(batch, batch_result, self.hot_token_id)
         # Cast to int64 before entering plan stream to avoid cross-stream
         # synchronization issues with .to() inside the plan stream context.
         if batch_result.prepared_draft_extend_inputs is not None:
@@ -1313,14 +1305,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             )
 
         if fused:
-            from sglang.srt.hardware_backend.npu.megakernel.draft import publish
-
             backend = self.draft_extend_attn_backend or self.draft_runner.attn_backend
             with forward_context(
                 ForwardContext(attn_backend=backend), forward_batch=forward_batch
             ):
-                publish(
-                    binding,
+                binding.run_extend(
                     batch,
                     forward_batch,
                     select_index,
