@@ -16,6 +16,7 @@ import torch.distributed as dist
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.distributed import get_world_group
+from sglang.multimodal_gen.runtime.distributed.utils import all_gather_single
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 # below this a tensor is copied by every rank itself: the collective's fixed
@@ -69,5 +70,5 @@ def replicated_copy_to_device(
     end = min(begin + per_rank, nbytes)
     local = gathered[rank * per_rank : (rank + 1) * per_rank]
     local[: end - begin].copy_(raw[begin:end])
-    dist.all_gather_into_tensor(gathered, local, group=group)
+    all_gather_single(gathered, local, group=group)
     return gathered[:nbytes].view(tensor.dtype).view(tensor.shape)
