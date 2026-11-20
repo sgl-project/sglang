@@ -41,7 +41,6 @@ __all__ = [
     "disable_transparent_hugepages",
 ]
 
-# From <linux/prctl.h>.
 _PR_SET_THP_DISABLE = 41
 
 
@@ -245,24 +244,11 @@ def kill_itself_when_parent_died():
 
 
 def disable_transparent_hugepages() -> bool:
-    """Turn off transparent huge pages (THP) for this process.
-
-    With THP on, the first write into an eligible region allocates and zeroes a
-    whole huge page in the faulting thread, and khugepaged collapses small pages
-    into huge ones while holding the process's mmap lock, which every page fault
-    in the process then waits for. On kernels with 64K base pages a huge page is
-    512 MB, so either can stop a thread for tens of milliseconds.
-    PR_SET_THP_DISABLE stops both for the whole process, including regions marked
-    MADV_HUGEPAGE; huge pages already mapped stay, hugetlbfs mappings are not
-    affected, and child processes inherit the setting. Returns whether it took
-    effect.
-    """
     if sys.platform != "linux":
         logger.warning("Transparent huge pages can only be disabled on Linux.")
         return False
     try:
         libc = ctypes.CDLL(None, use_errno=True)
-        # The kernel reads each argument as an unsigned long.
         args = [ctypes.c_ulong(value) for value in (1, 0, 0, 0)]
         if libc.prctl(_PR_SET_THP_DISABLE, *args) != 0:
             logger.warning(
