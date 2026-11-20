@@ -398,7 +398,6 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> convert_weight_packed_scale_zp(
     bool is_symmetric);
 
 std::tuple<at::Tensor, at::Tensor> per_token_quant_fp8_cpu(at::Tensor& input);
-
 #endif
 
 // gemm
