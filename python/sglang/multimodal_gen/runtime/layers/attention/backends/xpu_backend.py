@@ -43,11 +43,6 @@ class XPUAttentionBackend(AttentionBackend):
         return XPUAttentionImpl
 
     @staticmethod
-    def get_metadata_cls() -> type["AttentionMetadata"]:
-        """XPU backend does not require special metadata."""
-        return AttentionMetadata
-
-    @staticmethod
     def get_builder_cls() -> type["AttentionMetadataBuilder"]:
         return FlashAttentionMetadataBuilder
 

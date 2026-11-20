@@ -320,6 +320,62 @@ def test_multipart_upload_is_sanitized_before_generation(
     assert not (tmp_path / "evil.png").exists()
 
 
+def test_mesh_upload_is_temporary_when_input_saving_is_disabled(monkeypatch, tmp_path):
+    """With `--input-save-path ""` the mesh route keeps the uploaded image only
+    for the lifetime of its background job, and never under the working directory."""
+    monkeypatch.chdir(tmp_path)
+    store = AsyncDictStore()
+    mesh_path = tmp_path / "mesh.glb"
+    seen = {}
+
+    def build_sampling_params(request_id, req, image_path):
+        seen["upload"] = Path(image_path)
+        return SimpleNamespace(output_file_path=lambda: str(mesh_path))
+
+    async def run_job(scheduler_client, batch):
+        seen["alive_during_job"] = seen["upload"].read_bytes() == b"image"
+        mesh_path.write_bytes(b"mesh")
+        return [str(mesh_path)], OutputBatch()
+
+    monkeypatch.setattr(mesh_api, "MESH_STORE", store)
+    monkeypatch.setattr(
+        mesh_api,
+        "get_global_server_args",
+        lambda: SimpleNamespace(input_save_path=None, output_path=str(tmp_path)),
+    )
+    monkeypatch.setattr(mesh_api, "generate_request_id", lambda: "request")
+    monkeypatch.setattr(
+        mesh_api, "_build_sampling_params_from_request", build_sampling_params
+    )
+    monkeypatch.setattr(mesh_api, "prepare_request", lambda **kwargs: SimpleNamespace())
+    monkeypatch.setattr(mesh_api, "process_generation_batch", run_job)
+    app = FastAPI()
+    app.include_router(mesh_api.router)
+
+    async def run_test():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.post(
+                "/v1/meshes",
+                data={"prompt": "test"},
+                files={"image": ("input.png", b"image", "image/png")},
+            )
+            assert response.status_code == 200, response.text
+
+            async def job_left_the_queue():
+                while (await store.get("request"))["status"] == "queued":
+                    await asyncio.sleep(0)
+
+            await asyncio.wait_for(job_left_the_queue(), 5)
+        assert (await store.get("request"))["status"] == "completed"
+
+    asyncio.run(run_test())
+    assert seen["alive_during_job"]
+    assert not seen["upload"].exists()
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["mesh.glb"]
+
+
 @pytest.mark.parametrize("status", ["queued", "in_progress", "failed", "completed"])
 def test_mesh_content_is_not_published_before_success(monkeypatch, tmp_path, status):
     """A partial mesh may exist while generation is running or after it fails."""

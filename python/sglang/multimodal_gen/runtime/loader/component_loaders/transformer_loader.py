@@ -47,9 +47,6 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     get_diffusers_component_config,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import get_log_level, init_logger
-from sglang.srt.utils import is_npu
-
-_is_npu = is_npu()
 
 logger = init_logger(__name__)
 
