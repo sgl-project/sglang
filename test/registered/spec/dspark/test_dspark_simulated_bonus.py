@@ -153,6 +153,19 @@ class TestResidualSimulatedBonus(unittest.TestCase):
         ref = target.view(bs, rows, vocab).argmax(-1)[torch.arange(bs), correct_len]
         self.assertTrue(torch.equal(out, ref))
 
+    def test_residual_with_empty_vocab_splits(self):
+        # 5 vocab blocks pad to 8 splits; the empty splits must not poison the logsumexp.
+        torch.manual_seed(12)
+        vocab, rows, n = 20480, 3, 4096
+        base_t = torch.randn(vocab, device="cuda")
+        target = base_t.repeat(n * rows, 1)
+        draft = (base_t + torch.randn(vocab, device="cuda")).repeat(n, rows - 1, 1)
+        correct_len = torch.ones(n, dtype=torch.int64, device="cuda")
+        out = _residual_draw(target, draft, correct_len, rows, 1.0, 1.0, seed=2)
+        p = torch.softmax(base_t, -1)
+        q = torch.softmax(draft[0, 0], -1)
+        self.assertTrue(torch.all((p - q)[out] > 0))
+
     def test_narrow_draft_vocab_and_graph_capture(self):
         torch.manual_seed(6)
         vocab, rows, bs, width = 129280, 4, 8, 129280 - 280

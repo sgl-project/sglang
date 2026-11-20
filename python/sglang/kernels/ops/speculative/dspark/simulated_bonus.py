@@ -78,7 +78,7 @@ def _residual_lse_partial_kernel(
         / t
     )
     m_t = tl.max(x, axis=0)
-    s_t = tl.sum(tl.exp(x - m_t), axis=0)
+    s_t = tl.where(m_t > float("-inf"), tl.sum(tl.exp(x - m_t), axis=0), 0.0)
     d = (
         tl.load(
             draft_ptr + req.to(tl.int64) * draft_stride0 + dc * draft_stride1 + offs,
