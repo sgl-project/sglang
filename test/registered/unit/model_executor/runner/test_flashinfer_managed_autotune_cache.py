@@ -144,7 +144,7 @@ class TestManagedAutotuneCache(_PublishedConfig):
         autotune.attach_flashinfer_managed_autotune_cache(self.target)
 
     def _root(self):
-        return autotune.flashinfer_managed_autotune_cache_root(self.target)
+        return autotune.flashinfer_managed_autotune_cache_root()
 
     def _entries(self):
         return sorted(self._root().glob("v2/*/entries/*.json"))
@@ -309,7 +309,7 @@ class TestManagedAutotuneCacheAttach(_PublishedConfig):
             self.attach()
         self.autotune_v2.assert_called_once_with(
             mode="replay",
-            cache_root=autotune.flashinfer_managed_autotune_cache_root(self.runner),
+            cache_root=autotune.flashinfer_managed_autotune_cache_root(),
         )
 
     def test_runners_that_decline_tuning_do_not_attach(self):

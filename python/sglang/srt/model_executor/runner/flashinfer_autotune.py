@@ -51,7 +51,7 @@ logger = logging.getLogger(__name__)
 FLASHINFER_AUTOTUNE_WORKAROUND_SKIPS = frozenset()
 
 
-def get_flashinfer_autotune_skip_ops(model_runner: ModelRunner) -> set[str]:
+def get_flashinfer_autotune_skip_ops() -> set[str]:
     skip_ops = set(get_exec().kernel.flashinfer_autotune_skip_ops or ())
     skip_ops.update(FLASHINFER_AUTOTUNE_WORKAROUND_SKIPS)
     return skip_ops
@@ -192,7 +192,7 @@ def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
     model_key_parts.append("candidate_selection=v2_default")
     model_key_parts.append("dummy_tokens=varied")
     # A different skip policy must not reuse previously tuned tactics.
-    skip_ops = get_flashinfer_autotune_skip_ops(mr)
+    skip_ops = get_flashinfer_autotune_skip_ops()
     model_key_parts.append("skip_ops=" + ",".join(sorted(skip_ops)))
     if mr.is_draft_worker:
         model_key_parts.append(f"draft_quant={mr.model_config.quantization}")
@@ -229,22 +229,14 @@ _MANAGED_AUTOTUNE_CACHE_SM_MAJORS = (9, 10)
 
 
 def uses_flashinfer_managed_autotune_cache() -> bool:
-    """Whether this process keeps tuned tactics in FlashInfer's managed store.
-
-    The store attaches for the whole process, and serving then reads only the
-    winners tuned under it, so this is one decision per process, shared by the
-    target and the draft. It reads static configuration and platform facts
-    only, so every call in a process answers alike. The rest keeps the per-rank
-    JSON cache: a deployment that can span more than one rank, elastic EP
-    capacity included, until the store is validated with FlashInfer's
-    per-profile agreement across ranks; MegaMoE, for its namespaced per-GPU
-    records; disabled reuse, for its fresh per-run file; and GPUs the store has
-    not been validated on.
-    """
+    """One answer per process: the store attaches process-wide, for target and draft."""
+    # Disabled reuse writes a fresh per-run JSON file instead.
     if not envs.SGLANG_FLASHINFER_AUTOTUNE_CACHE.get():
         return False
+    # MegaMoE's namespaced records need one writer per GPU file.
     if get_exec().moe.moe_runner_backend == "flashinfer_megamoe":
         return False
+    # Not yet validated across ranks; elastic EP capacity counts as ranks.
     if get_parallel().max_world_size > 1:
         return False
     platform = get_platform()
@@ -254,22 +246,13 @@ def uses_flashinfer_managed_autotune_cache() -> bool:
     )
 
 
-def flashinfer_managed_autotune_cache_root(model_runner: ModelRunner) -> Path:
-    """Root of FlashInfer's managed autotune store for this deployment.
-
-    Below the root, FlashInfer namespaces entries by its software and GPU
-    environment and keys each one by op, runner and shape bucket. The root only
-    decides how widely tactics are reused: per model and parallel layout, from
-    the same fields as the JSON cache's key less the FlashInfer version and GPU
-    that the store's environment covers. It has no rank, so data-parallel
-    replicas of one model share it, and after a restart each serves the last
-    tactic published for a shape. Only process-wide configuration goes into
-    it, because the target and the draft must resolve the same root: a process
-    serves from the one store it attached.
-    """
-    skip_ops = get_flashinfer_autotune_skip_ops(model_runner)
+def flashinfer_managed_autotune_cache_root() -> Path:
+    """Process-wide config only, so the target and draft resolve one store."""
+    skip_ops = get_flashinfer_autotune_skip_ops()
     model_key = "|".join(
         [
+            # FlashInfer keys its version and the GPU below the root. No rank
+            # either, so data-parallel replicas share one store.
             str(get_model().model_path),
             str(get_model().dtype),
             str(get_model().quantization),
@@ -294,18 +277,11 @@ def flashinfer_managed_autotune_cache_root(model_runner: ModelRunner) -> Path:
 
 
 def attach_flashinfer_managed_autotune_cache(model_runner: ModelRunner) -> None:
-    """Attach the managed store before this runner's warmup can tune.
-
-    Serving reads the attached store's winners only, so a tactic tuned before
-    the attach stays in memory where serving no longer looks. Warmup calls this
-    first, ahead of the workspace and model preparation that can tune, and
-    attaching the root a process already has is a no-op. A runner that will
-    not tune does not attach: the store would also serve its winners to a
-    process that declines tuned tactics, such as deterministic inference.
-    """
+    """Attach before anything tunes; serving reads only the attached store."""
     mr = model_runner
     if not uses_flashinfer_managed_autotune_cache():
         return
+    # Else the store would serve tuned tactics to a process that declines them.
     if not (
         should_run_flashinfer_autotune(mr)
         or should_run_flashinfer_autotune(mr, for_speculative_draft=True)
@@ -313,8 +289,9 @@ def attach_flashinfer_managed_autotune_cache(model_runner: ModelRunner) -> None:
         return
     from flashinfer import autotune_v2
 
-    root = flashinfer_managed_autotune_cache_root(mr)
-    # Replay mode tunes nothing; the process scope leaves the store attached.
+    root = flashinfer_managed_autotune_cache_root()
+    # Replay mode tunes nothing; the process scope leaves the store attached,
+    # and attaching the root a process already has is a no-op.
     with autotune_v2(mode="replay", cache_root=root):
         pass
 
@@ -399,13 +376,13 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
 
     mr = model_runner
     if uses_flashinfer_managed_autotune_cache():
-        root = flashinfer_managed_autotune_cache_root(mr)
+        root = flashinfer_managed_autotune_cache_root()
         logger.info("Running FlashInfer autotune with managed cache: %s", root)
         # The process scope keeps the store attached for serving after warmup.
         tuning = autotune_v2(
             mode="tune",
             cache_root=root,
-            skip_ops=get_flashinfer_autotune_skip_ops(mr),
+            skip_ops=get_flashinfer_autotune_skip_ops(),
         )
     else:
         tuning = _json_cache_autotune(mr)
@@ -454,7 +431,7 @@ def _json_cache_autotune(model_runner: ModelRunner):
             autotune_cache,
         )
 
-    skip_ops = get_flashinfer_autotune_skip_ops(mr)
+    skip_ops = get_flashinfer_autotune_skip_ops()
     # autotune(cache=...) clears all file-loaded tactics on entry, which would drop
     # the target's tactics when the draft worker loads; load and save them by hand.
     tuner = AutoTuner.get()
