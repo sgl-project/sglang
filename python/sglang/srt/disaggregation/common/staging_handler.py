@@ -192,7 +192,7 @@ class DecodeStagingHandler:
     # ------------------------------------------------------------------
 
     def register_decode_req(self, room: int, decode_req: DecodeRequest) -> None:
-        # Called once per room from pop_preallocated, before send_metadata.
+        # Called once per room from move_preallocated, before send_metadata.
         decode_req._staging_all_success = False
         decode_req._staging_success_ts = 0.0
         decode_req._staging_failed = False
@@ -452,7 +452,7 @@ class DecodeStagingHandler:
         return True
 
     # ------------------------------------------------------------------
-    # Event check + free: called from main thread (pop_transferred)
+    # Event check + free: called from main thread (move_transferred)
     # ------------------------------------------------------------------
 
     def is_done(self, decode_req: DecodeRequest) -> bool:

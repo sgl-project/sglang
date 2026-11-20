@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::message::buffers::{Buffer, BufferData, find};
+use crate::message::config::{HiddenStatesMode, ServerArgs};
 use crate::message::request::{GenerateRequest, TokenizeInput};
 use crate::message::response::ResponseSink;
 use crate::message::sampling::SamplingParams;
@@ -214,7 +215,7 @@ fn test_limits() -> Limits {
         context_len: NO_CONTEXT_CEILING,
         num_reserved_tokens: 0,
         allow_auto_truncate: false,
-        enable_return_hidden_states: false,
+        return_hidden_states_mode: HiddenStatesMode::Null,
     }
 }
 
@@ -472,9 +473,8 @@ fn auto_truncate_cannot_invert_min_and_max_new_tokens() {
     assert_eq!(g.sampling_params.max_new_tokens, Some(7));
 }
 
-/// `return_hidden_states` on a server not launched for it is a 400: the
-/// scheduler never computes them, so the request would otherwise 200 with
-/// `meta_info.hidden_states` silently missing.
+/// A request above the server's hidden-states mode is a 400
+/// (Python `TokenizerManager._validate_one_request`).
 #[test]
 fn hidden_states_gated_on_server_support() {
     let req = |want| {
@@ -488,18 +488,54 @@ fn hidden_states_gated_on_server_support() {
     let err = validate(&mut req(true), &disabled).unwrap_err();
     assert!(matches!(err, Error::Validation(_)));
     assert!(
-        err.to_string().contains("--enable-return-hidden-states"),
-        "message must name the flag: {err}"
+        err.to_string().contains(
+            "not configured to return hidden states. Please set `--return-hidden-states-mode last`"
+        ),
+        "message must name the flags: {err}"
     );
     // Not asking for them (the client sent `false`, or sent nothing and
     // `into_requests` resolved the default), or asking on a server that
     // supports them, is fine.
     assert!(validate(&mut req(false), &disabled).is_ok());
     let enabled = Limits {
-        enable_return_hidden_states: true,
+        return_hidden_states_mode: HiddenStatesMode::Full,
         ..test_limits()
     };
     assert!(validate(&mut req(true), &enabled).is_ok());
+    // `true` asks for `full`, above a server launched with `last`.
+    let last = Limits {
+        return_hidden_states_mode: HiddenStatesMode::Last,
+        ..test_limits()
+    };
+    let err = validate(&mut req(true), &last).unwrap_err();
+    assert!(matches!(err, Error::Validation(_)));
+    assert!(
+        err.to_string()
+            .contains("exceeds the server maximum `last`. Please launch with `--return-hidden-states-mode full`"),
+        "message must name the mode and the flag: {err}"
+    );
+    assert!(validate(&mut req(false), &last).is_ok());
+}
+
+/// The server's hidden-state mode survives the handoff from Python's resolved `server_args`
+/// (Python `get_server_return_hidden_states_mode`).
+#[test]
+fn limits_resolve_the_hidden_states_mode() {
+    let mode = |mode: Option<&str>, enable| {
+        Limits::from(&ServerArgs {
+            return_hidden_states_mode: mode.map(str::to_owned),
+            enable_return_hidden_states: enable,
+            ..Default::default()
+        })
+        .return_hidden_states_mode
+    };
+    assert_eq!(mode(None, false), HiddenStatesMode::Null);
+    assert_eq!(mode(Some("last"), true), HiddenStatesMode::Last);
+    assert_eq!(mode(Some("full"), true), HiddenStatesMode::Full);
+    // The legacy `--enable-return-hidden-states` alone means `full`.
+    assert_eq!(mode(None, true), HiddenStatesMode::Full);
+    // `--enable-return-aux-hidden-states` alone resolves to `full` and leaves the bool unset.
+    assert_eq!(mode(Some("full"), false), HiddenStatesMode::Full);
 }
 
 /// End-to-end through `drive`: an over-context request is rejected on the way
@@ -774,7 +810,7 @@ fn one_way_control_bypasses_request_ring_capacity() {
 #[test]
 fn oversized_rid_is_rejected() {
     let mut req = generate_req(51, SamplingParams::default());
-    req.rid = "x".repeat(MAX_RID_LEN + 1).into();
+    req.rid = Rid::from_client(&"x".repeat(MAX_RID_LEN + 1));
     let err = validate(&mut req, &test_limits()).expect_err("must be rejected");
     assert!(matches!(err, Error::Validation(_)));
     assert!(err.to_string().contains("over the"), "{err}");
@@ -783,6 +819,47 @@ fn oversized_rid_is_rejected() {
     let mut req = generate_req(52, SamplingParams::default());
     req.rid = "0123456789abcdef0123456789abcdef".into();
     assert!(validate(&mut req, &test_limits()).is_ok());
+}
+
+#[test]
+fn namespaced_rids_are_accepted_without_rewriting() {
+    for byte_len in [32, 128, 129, 200, MAX_RID_LEN] {
+        let public_id = format!("caller_namespace_{}", "x".repeat(byte_len - 17));
+        assert_eq!(public_id.len(), byte_len);
+        let mut req = generate_req(53, SamplingParams::default());
+        req.rid = Rid::from_client(&public_id);
+        assert!(validate(&mut req, &test_limits()).is_ok(), "{byte_len}");
+        assert_eq!(req.rid.client_facing(), public_id);
+    }
+}
+
+#[test]
+fn rid_limit_counts_client_utf8_bytes_not_private_suffix() {
+    let public_id = "é".repeat(MAX_RID_LEN / 2);
+    let mut req = generate_req(54, SamplingParams::default());
+    req.rid = Rid::from_client(&public_id);
+    assert!(req.rid.len() > MAX_RID_LEN);
+    assert!(validate(&mut req, &test_limits()).is_ok());
+    assert_eq!(req.rid.client_facing(), public_id);
+
+    let oversized = format!("{public_id}x");
+    req.rid = Rid::from_client(&oversized);
+    let error = validate(&mut req, &test_limits()).expect_err("one extra byte exceeds the cap");
+    assert!(
+        error
+            .to_string()
+            .contains(&format!("rid is {} bytes", MAX_RID_LEN + 1))
+    );
+}
+
+#[test]
+fn oversized_client_rid_never_registers_or_reaches_scheduler() {
+    let (mut intake, detok_rx, consumer, _tm_tx, _mm_rx) = make_intake();
+    let mut req = generate_req(55, SamplingParams::default());
+    req.rid = Rid::from_client(&"x".repeat(MAX_RID_LEN + 1));
+    intake.drive(req);
+    assert!(detok_rx.try_recv().is_err());
+    assert!(consumer.drain(8).is_empty());
 }
 
 /// A request rejected BEFORE `register_detok` must not send `Deregister`: the
@@ -866,6 +943,49 @@ fn out_of_vocab_input_ids_rejected() {
     }
 }
 
+/// A request refused as the client's fault logs why once, with its rid, as
+/// Python's `[http_server] Error:` line does, and the client reads the bare
+/// message, as Python's `ValueError` text: an intake check, and media the MM
+/// pool refused (which hands the request back failed, unlogged).
+#[test]
+fn client_rejection_logs_its_reason_and_answers_unprefixed() {
+    let (mut intake, _detok_rx, _consumer, _tm_tx, _mm_rx) = make_intake();
+    let mut out_of_vocab = generate_req(23, SamplingParams::default());
+    if let RequestKind::Generate(g) = &mut out_of_vocab.kind {
+        g.input_ids = Some(vec![2_000_000_000]);
+    }
+    let mut refused_media = generate_req(24, SamplingParams::default());
+    refused_media.state =
+        RequestState::Failed(Error::Encode(MediaError::Client("bad media".into())));
+    for (mut req, rid, reason) in [
+        (
+            out_of_vocab,
+            "rid=23",
+            "input_ids contains out-of-vocabulary",
+        ),
+        (refused_media, "rid=24", "bad media"),
+    ] {
+        let (tx, mut rx) = mpsc::channel(8);
+        req.sink = ResponseSink::Local(tx);
+        let logs = crate::utils::logging::capture_logs();
+        intake.drive(req);
+        let Ok(ResponseItem::Error(err)) = rx.try_recv() else {
+            panic!("the client must get the rejection");
+        };
+        let message = err.client_fault_reason().expect("the client's fault");
+        assert!(message.starts_with(reason), "{message}");
+        let rejections = logs.rejections();
+        assert!(
+            matches!(
+                rejections.as_slice(),
+                [line] if line.contains("WARN") && line.contains(rid)
+                    && line.ends_with(&format!("error={message}"))
+            ),
+            "{rejections:?}"
+        );
+    }
+}
+
 /// Same guard for negative ids and for `token_ids_logprob` entries.
 #[test]
 fn negative_and_logprob_token_ids_rejected() {
@@ -929,6 +1049,38 @@ fn admitted_request_keeps_registration() {
     assert!(
         detok_rx.try_recv().is_err(),
         "admitted request must not be deregistered",
+    );
+}
+
+/// A request's dispatch finish time is stamped once the scheduler channel
+/// takes it, and never for one a full channel refuses.
+#[test]
+fn dispatch_finish_time_is_stamped_when_the_channel_takes_the_request() {
+    let (mut intake, _detok_rx, consumer, _tm_tx, _mm_rx) = make_intake();
+    let dispatch_finish_time = |req: &Request| match &req.kind {
+        RequestKind::Generate(g) => g.dispatch_finish_time.clone(),
+        other => panic!("not a generate request: {other:?}"),
+    };
+    let before = std::time::SystemTime::now();
+    // The test channel holds 16; the 17th request is refused.
+    let stamps: Vec<_> = (0..17)
+        .map(|id| {
+            let req = generate_req(id, SamplingParams::default());
+            let stamp = dispatch_finish_time(&req);
+            assert_eq!(stamp.get(), None, "unstamped before dispatch");
+            intake.drive(req);
+            stamp
+        })
+        .collect();
+    assert_eq!(consumer.drain(32).len(), 16);
+    for stamp in &stamps[..16] {
+        let stamped = stamp.get().expect("dispatched");
+        assert!(before <= stamped && stamped <= std::time::SystemTime::now());
+    }
+    assert_eq!(
+        stamps[16].get(),
+        None,
+        "a refused request was never dispatched"
     );
 }
 
@@ -1017,6 +1169,82 @@ fn tokenize_pool_gone_deregisters() {
     assert!(detok_rx.try_recv().is_err(), "no further shard messages");
 }
 
+/// A full tokenizer pool queue rejects instead of parking intake, as a full
+/// mm pool does: a text generate request (registered, so deregistered) and a
+/// `Tokenize` request (never registered) both fail with `QueueFull`.
+#[test]
+fn full_tokenizer_pool_rejects_without_blocking_intake() {
+    let (tok_tx, tok_rx) = flume::bounded(1);
+    tok_tx
+        .send(generate_req(1, SamplingParams::default()))
+        .unwrap();
+    let (detok_tx, detok_rx) = flume::unbounded();
+    let (to_scheduler_tx, consumer) = to_scheduler(16);
+    let (sd_tx, sd_rx) = flume::unbounded::<()>();
+    std::mem::forget(sd_tx);
+    let mut intake = Intake::new(
+        flume::unbounded().1,
+        flume::unbounded().1,
+        Senders {
+            tok_manager_tx: flume::unbounded().0,
+            abort_tx: flume::unbounded().0,
+            tokenizer_tx: tok_tx,
+            detokenizer_tx: vec![detok_tx],
+        },
+        to_scheduler_tx,
+        test_limits(),
+        test_mm(flume::unbounded().0, true),
+        sd_rx,
+    );
+    let (generate_tx, mut generate_rx) = mpsc::channel(8);
+    let mut generate = generate_req(2, SamplingParams::default());
+    generate.sink = ResponseSink::Local(generate_tx);
+    if let RequestKind::Generate(g) = &mut generate.kind {
+        g.input_ids = None;
+        g.text = Some("hi".into());
+    }
+    let (tokenize_tx, mut tokenize_rx) = mpsc::channel(8);
+    let tokenize = Request {
+        rid: "3".into(),
+        state: RequestState::Received,
+        sink: ResponseSink::Local(tokenize_tx),
+        kind: RequestKind::Tokenize(TokenizeInput::Text {
+            text: "hi".into(),
+            add_special_tokens: false,
+        }),
+    };
+    // On its own thread, so a blocking hand-off fails the test, not hangs it.
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        intake.drive(generate);
+        intake.drive(tokenize);
+        let _ = done_tx.send(());
+    });
+    done_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("intake must not wait on a full tokenizer pool");
+
+    for rx in [&mut generate_rx, &mut tokenize_rx] {
+        let Ok(ResponseItem::Error(err)) = rx.try_recv() else {
+            panic!("expected a terminal error frame");
+        };
+        assert!(
+            matches!(err, Error::QueueFull(QueueStage::Tokenizer)),
+            "{err}"
+        );
+    }
+    assert!(
+        matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { rid, .. }) if rid.as_str() == "2")
+    );
+    assert!(matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { rid }) if rid.as_str() == "2"));
+    assert!(
+        detok_rx.try_recv().is_err(),
+        "the tokenize request was never registered"
+    );
+    assert_eq!(tok_rx.len(), 1, "only the filler reached the pool");
+    assert!(consumer.drain(16).is_empty(), "nothing queued");
+}
+
 /// The mm pool gone (receiver dropped) hands the request back: rejected with
 /// a 500 and deregistered, like the tokenizer pool's edge.
 #[test]
@@ -1039,6 +1267,52 @@ fn mm_pool_gone_deregisters() {
         Ok(DetokMsg::Deregister { .. })
     ));
     assert!(consumer.drain(16).is_empty(), "nothing queued");
+}
+
+/// A full mm pool queue and a full request ring each refuse with `QueueFull`
+/// naming their stage, as the tokenizer pool's does.
+#[test]
+fn full_mm_pool_and_request_ring_name_their_stage() {
+    let (detok_tx, _detok_rx) = flume::unbounded();
+    let (to_scheduler_tx, consumer) = to_scheduler(1);
+    // A rendezvous channel with no worker waiting: every hand-off finds it full.
+    let (mm_tx, _mm_rx) = flume::bounded(0);
+    let (sd_tx, sd_rx) = flume::unbounded::<()>();
+    std::mem::forget(sd_tx);
+    let mut intake = Intake::new(
+        flume::unbounded().1,
+        flume::unbounded().1,
+        Senders {
+            tok_manager_tx: flume::unbounded().0,
+            abort_tx: flume::unbounded().0,
+            tokenizer_tx: flume::unbounded().0,
+            detokenizer_tx: vec![detok_tx],
+        },
+        to_scheduler_tx,
+        test_limits(),
+        test_mm(mm_tx, true),
+        sd_rx,
+    );
+    let refused_at = |intake: &mut Intake, mut req: Request| {
+        let (tx, mut rx) = mpsc::channel(8);
+        req.sink = ResponseSink::Local(tx);
+        intake.drive(req);
+        match rx.try_recv() {
+            Ok(ResponseItem::Error(Error::QueueFull(stage))) => Some(stage),
+            _ => None,
+        }
+    };
+    let generate = |id| generate_req(id, SamplingParams::default());
+    assert_eq!(
+        refused_at(&mut intake, mm_pretokenized_req("mm")),
+        Some(QueueStage::Mm)
+    );
+    assert_eq!(refused_at(&mut intake, generate(1)), None);
+    assert_eq!(
+        refused_at(&mut intake, generate(2)),
+        Some(QueueStage::Scheduler)
+    );
+    assert_eq!(consumer.drain(4).len(), 1, "only the first fit the ring");
 }
 
 /// Build a generate request carrying an image and a text prompt.
@@ -1120,6 +1394,7 @@ fn encode_like_worker(req: &mut Request, input_ids: Vec<i64>, buffers: Vec<Buffe
         req.state
     );
     if let RequestKind::Generate(g) = &mut req.kind {
+        g.mm = None;
         g.input_ids = Some(input_ids);
         g.mm_buffers = buffers;
     }
@@ -1170,6 +1445,37 @@ fn abort_while_in_mm_pool_drops_on_return() {
     );
     assert!(rx.try_recv().is_err(), "no frame for a client that left");
     assert!(detok_rx.try_recv().is_err(), "deregistered exactly once");
+}
+
+/// A request whose client left while it was in the mm pool, and whose media
+/// then failed as the server's fault, is dropped on return without a log line:
+/// the client's abort is not a server failure (the worker logs nothing either).
+#[test]
+fn abort_while_in_mm_pool_then_server_fault_is_not_logged() {
+    let (mut intake, detok_rx, consumer, _tm_tx, mm_rx) = make_intake();
+    let (tx, mut rx) = mpsc::channel(8);
+    let mut req = mm_pretokenized_req("mm-left");
+    req.sink = ResponseSink::Local(tx);
+    intake.drive(req);
+    let mut req = mm_rx.try_recv().expect("sent to the mm pool");
+    assert!(matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { .. })));
+    intake.on_abort(AbortSource::Guard("mm-left".to_string().into()));
+    assert!(matches!(
+        detok_rx.try_recv(),
+        Ok(DetokMsg::Deregister { .. })
+    ));
+
+    req.state
+        .apply(Event::Error(Error::Encode(MediaError::Server(
+            "video decode: out of memory".into(),
+        ))))
+        .unwrap();
+    let logs = crate::utils::logging::capture_logs();
+    intake.drive(req);
+    assert_eq!(logs.text(), "");
+    assert!(rx.try_recv().is_err(), "no frame for a client that left");
+    assert!(detok_rx.try_recv().is_err(), "deregistered exactly once");
+    assert!(consumer.drain(16).is_empty());
 }
 
 /// The same for the tokenizer stage: an abort while the request is in the
@@ -1260,6 +1566,85 @@ fn mm_request_goes_to_pool_then_encoded_pushes_to_channel() {
         4,
         "expanded ids ride the input_ids buffer"
     );
+}
+
+/// A request that asks for its prompt ids finds the final (expanded) ids in
+/// its slot once pushed to the scheduler, or once back from the mm pool after
+/// an abort, which then reports them; none are left before, or for a request
+/// that did not ask.
+#[test]
+fn requested_prompt_ids_are_left_once_final() {
+    for (requested, aborted) in [(false, false), (true, false), (true, true)] {
+        let case = format!("requested={requested} aborted={aborted}");
+        let (mut intake, _detok_rx, consumer, _tm_tx, mm_rx) = make_intake();
+        let mut req = mm_pretokenized_req("mm-ids");
+        let slot = requested.then(crate::message::request::PromptTokenIdsSlot::default);
+        if let RequestKind::Generate(g) = &mut req.kind {
+            g.prompt_token_ids = slot.clone();
+        }
+        intake.drive(req);
+        let mut req = mm_rx.try_recv().expect("mm pool must receive the request");
+        assert!(
+            slot.as_ref().is_none_or(|slot| slot.get().is_none()),
+            "{case}"
+        );
+        if aborted {
+            intake.on_abort(AbortSource::Guard("mm-ids".to_string().into()));
+        }
+        encode_like_worker(&mut req, vec![5, 6, 7, 8], Vec::new());
+        intake.drive(req);
+
+        assert_eq!(consumer.drain(16).len(), usize::from(!aborted), "{case}");
+        if let Some(slot) = slot {
+            assert_eq!(
+                slot.get().map(|ids| &ids[..]),
+                Some(&[5, 6, 7, 8][..]),
+                "{case}"
+            );
+        }
+    }
+}
+
+/// A text prompt's ids from the tokenizer pool are final once intake has
+/// fitted them to the context: they are left as it pushes the request, or as
+/// it drops one aborted while in the pool, truncated under auto-truncation.
+#[test]
+fn tokenizer_pool_return_leaves_fitted_prompt_ids() {
+    for (aborted, truncating) in [(false, false), (true, false), (false, true), (true, true)] {
+        let case = format!("aborted={aborted} truncating={truncating}");
+        let (mut intake, tok_rx, _mm_rx, consumer, _detok_rx) = make_intake_with_tokenizer(false);
+        if truncating {
+            intake.limits.context_len = 2;
+            intake.limits.allow_auto_truncate = true;
+        }
+        let (tx, _rx) = mpsc::channel(8);
+        let slot = crate::message::request::PromptTokenIdsSlot::default();
+        intake.drive(Request {
+            rid: "text-ids".to_string().into(),
+            state: RequestState::Received,
+            sink: ResponseSink::Local(tx),
+            kind: RequestKind::Generate(Box::new(GenerateRequest {
+                rid: "text-ids".to_string().into(),
+                text: Some("hi".into()),
+                prompt_token_ids: Some(slot.clone()),
+                ..Default::default()
+            })),
+        });
+        let mut req = tok_rx.try_recv().expect("text goes to the tokenizer pool");
+        if aborted {
+            intake.on_abort(AbortSource::Guard("text-ids".to_string().into()));
+        }
+        // The pool fills the ids and advances the FSM, as `TokenizerWorker` does.
+        if let RequestKind::Generate(g) = &mut req.kind {
+            g.input_ids = Some(vec![7, 1, 8]);
+        }
+        req.state.apply(Event::TokenizeDone).unwrap();
+        intake.drive(req);
+
+        assert_eq!(consumer.drain(16).len(), usize::from(!aborted), "{case}");
+        let expected: &[i64] = if truncating { &[7, 1] } else { &[7, 1, 8] };
+        assert_eq!(slot.get().map(|ids| &ids[..]), Some(expected), "{case}");
+    }
 }
 
 /// A multimodal *text* prompt visits the tokenizer pool first
@@ -1410,4 +1795,21 @@ fn mm_text_prompt_under_skip_tokenizer_init_is_a_400() {
     intake.drive(req);
     assert!(rx.try_recv().is_err(), "no error frame");
     assert!(mm_rx.try_recv().is_ok(), "submitted to the mm pool");
+}
+
+/// The detok shard learns about stop strings at `Register`, which runs before
+/// `normalize`: both the API aliases and the normalized fields count, and empty
+/// strings do not.
+#[test]
+fn has_stop_strings_reads_aliases_and_normalized_fields() {
+    let parse = |json: &str| serde_json::from_str::<SamplingParams>(json).expect("parses");
+    assert!(!has_stop_strings(&parse("{}")));
+    assert!(!has_stop_strings(&parse(r#"{"stop": [""]}"#)));
+    assert!(has_stop_strings(&parse(r#"{"stop": "STéOP"}"#)));
+    assert!(has_stop_strings(&parse(r#"{"stop": ["", "x"]}"#)));
+    assert!(has_stop_strings(&parse(r#"{"stop_regex": "\\d{3}"}"#)));
+    let mut normalized = parse(r#"{"stop": "x"}"#);
+    normalized.normalize(false, 1000).expect("normalizes");
+    assert!(normalized.stop.is_none());
+    assert!(has_stop_strings(&normalized));
 }

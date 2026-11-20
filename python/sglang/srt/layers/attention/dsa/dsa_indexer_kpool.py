@@ -504,7 +504,6 @@ class IndexerKPool(MultiPlatformOp):
 
         kpool = self.index_kpool
         block_tables = metadata.get_page_table_64()
-        kpool_write_locs = getattr(attn_metadata, "kpool_extend_write_locs", None)
         q_offset = 0
         compressed_by_batch = (
             [None for _ in range(forward_batch.batch_size)]
@@ -541,41 +540,27 @@ class IndexerKPool(MultiPlatformOp):
             if n_pools > 0:
                 slot_k = key_chunk[:n_drain].view(n_pools, kpool, self.head_dim)
                 slot_score = score_chunk[:n_drain].view(n_pools, kpool, self.head_dim)
-                write_locs = (
-                    kpool_write_locs[i] if kpool_write_locs is not None else None
+                from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
+                    compute_pooled_write_locs,
                 )
-                if write_locs is None:
-                    from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
-                        compute_pooled_write_locs,
-                    )
 
-                    num_token_pages = (seq_len + page_size - 1) // page_size
-                    token_page_table = block_tables[i, :num_token_pages].contiguous()
-                    pool_ids = pool_start_id + torch.arange(
-                        n_pools, dtype=torch.int64, device=key.device
-                    )
-                    write_locs = compute_pooled_write_locs(
-                        token_page_table, pool_ids, kpool
-                    )
-                    compressed = self._write_compressed_pooled_index_cache(
-                        slot_k,
-                        slot_score,
-                        write_locs,
-                        forward_batch,
-                        layer_id,
-                        return_compressed=use_returned_compressed,
-                        write_cache=write_cache,
-                    )
-                else:
-                    compressed = self._write_compressed_pooled_index_cache(
-                        slot_k,
-                        slot_score,
-                        write_locs,
-                        forward_batch,
-                        layer_id,
-                        return_compressed=use_returned_compressed,
-                        write_cache=write_cache,
-                    )
+                num_token_pages = (seq_len + page_size - 1) // page_size
+                token_page_table = block_tables[i, :num_token_pages].contiguous()
+                pool_ids = pool_start_id + torch.arange(
+                    n_pools, dtype=torch.int64, device=key.device
+                )
+                write_locs = compute_pooled_write_locs(
+                    token_page_table, pool_ids, kpool
+                )
+                compressed = self._write_compressed_pooled_index_cache(
+                    slot_k,
+                    slot_score,
+                    write_locs,
+                    forward_batch,
+                    layer_id,
+                    return_compressed=use_returned_compressed,
+                    write_cache=write_cache,
+                )
                 if compressed_by_batch is not None and compressed is not None:
                     compressed_by_batch[i] = (
                         pool_start_id,
@@ -1291,13 +1276,6 @@ class IndexerKPool(MultiPlatformOp):
         topk_method = metadata.topk_transform_method
         attn_metadata = metadata.attn_metadata
         topk_offsets = attn_metadata.topk_indices_offset
-        pooled_page_tables = getattr(
-            attn_metadata, "kpool_extend_pooled_page_tables", None
-        )
-        zero_starts_by_batch = getattr(attn_metadata, "kpool_extend_zero_starts", None)
-        pooled_seq_lens_expanded = getattr(
-            attn_metadata, "kpool_seqlens_expanded", None
-        )
 
         q_offset = 0
         cache_write_stream = None
@@ -1322,12 +1300,9 @@ class IndexerKPool(MultiPlatformOp):
 
             q_slice = slice(q_offset, q_offset + q_len)
             local_seqlens = seq_lens_expanded[q_slice]
-            if pooled_seq_lens_expanded is None:
-                local_pool_lens = torch.div(
-                    local_seqlens, kpool, rounding_mode="floor"
-                ).to(torch.int32)
-            else:
-                local_pool_lens = pooled_seq_lens_expanded[q_slice]
+            local_pool_lens = torch.div(local_seqlens, kpool, rounding_mode="floor").to(
+                torch.int32
+            )
 
             if pool_seq_len > 0:
                 cached_current = (
@@ -1382,22 +1357,16 @@ class IndexerKPool(MultiPlatformOp):
                     and curr_pool_start + curr_pool_len == pool_seq_len
                 ):
                     if curr_pool_start > 0:
-                        pooled_page_table = (
-                            pooled_page_tables[i]
-                            if pooled_page_tables is not None
-                            else None
-                        )
-                        if pooled_page_table is None:
-                            num_token_pages = (seq_len + page_size - 1) // page_size
-                            token_page_table = block_tables[
-                                i, :num_token_pages
-                            ].contiguous()
-                            pool_pages = (
-                                curr_pool_start + index_page_size - 1
-                            ) // index_page_size
-                            pooled_page_table = build_pooled_page_table_64(
-                                token_page_table, kpool
-                            )[:pool_pages].contiguous()
+                        num_token_pages = (seq_len + page_size - 1) // page_size
+                        token_page_table = block_tables[
+                            i, :num_token_pages
+                        ].contiguous()
+                        pool_pages = (
+                            curr_pool_start + index_page_size - 1
+                        ) // index_page_size
+                        pooled_page_table = build_pooled_page_table_64(
+                            token_page_table, kpool
+                        )[:pool_pages].contiguous()
                         k_u8 = torch.empty(
                             (pool_seq_len, self.head_dim),
                             dtype=torch.uint8,
@@ -1424,22 +1393,12 @@ class IndexerKPool(MultiPlatformOp):
                         k_fp8 = curr_k_fp8
                         k_scale = curr_k_scale
                 else:
-                    pooled_page_table = (
-                        pooled_page_tables[i]
-                        if pooled_page_tables is not None
-                        else None
-                    )
-                    if pooled_page_table is None:
-                        num_token_pages = (seq_len + page_size - 1) // page_size
-                        token_page_table = block_tables[
-                            i, :num_token_pages
-                        ].contiguous()
-                        pool_pages = (
-                            pool_seq_len + index_page_size - 1
-                        ) // index_page_size
-                        pooled_page_table = build_pooled_page_table_64(
-                            token_page_table, kpool
-                        )[:pool_pages].contiguous()
+                    num_token_pages = (seq_len + page_size - 1) // page_size
+                    token_page_table = block_tables[i, :num_token_pages].contiguous()
+                    pool_pages = (pool_seq_len + index_page_size - 1) // index_page_size
+                    pooled_page_table = build_pooled_page_table_64(
+                        token_page_table, kpool
+                    )[:pool_pages].contiguous()
                     seq_len_t = torch.tensor(
                         [pool_seq_len], dtype=torch.int32, device=q_fp8.device
                     )
@@ -1452,11 +1411,8 @@ class IndexerKPool(MultiPlatformOp):
                     )
                     k_fp8 = k_fp8.view(torch.float8_e4m3fn)
                     k_scale = k_scale.view(torch.float32).squeeze(-1)
-                row_starts = (
-                    zero_starts_by_batch[i]
-                    if zero_starts_by_batch is not None
-                    and zero_starts_by_batch[i] is not None
-                    else torch.zeros((q_len,), dtype=torch.int32, device=q_fp8.device)
+                row_starts = torch.zeros(
+                    (q_len,), dtype=torch.int32, device=q_fp8.device
                 )
                 local_kv_fp8 = (k_fp8.contiguous(), k_scale.contiguous())
             else:
@@ -1886,3 +1842,76 @@ class IndexerKPool(MultiPlatformOp):
                 "kpool indexer is only supported on CUDA and ROCm"
             )
         return topk_result
+
+    def forward_npu(
+        self,
+        x: torch.Tensor,
+        q_lora: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        layer_scatter_modes=None,
+        dynamic_scale: torch.Tensor = None,
+        return_indices: bool = True,
+    ) -> Optional[torch.Tensor]:
+        """BF16 compression and request-level pooled-key selection on A3/A5."""
+
+        metadata = get_attn_backend().get_indexer_metadata(layer_id, forward_batch)
+        if metadata is None:
+            return None
+
+        assert forward_batch.seq_lens_cpu is not None
+        mode = forward_batch.forward_mode
+        if mode.is_idle() or len(forward_batch.seq_lens_cpu) == 0 or x.shape[0] == 0:
+            return torch.full(
+                (x.shape[0], self.index_topk + self.index_kpool - 1),
+                -1,
+                dtype=torch.int,
+                device=x.device,
+            )
+
+        key, _ = self.wk(x)
+        key = self.k_norm(key)
+        gate_score = F.linear(x, self.index_kpool_compress_gate)
+        query, _ = self.wq_b(q_lora)  # [T,H*D]
+        query = rearrange(query, "l (h d) -> l h d", d=self.head_dim)  # [T,H,D]
+        if self.rope_head_dim > 0 and not self.skip_rope:  # with RoPE
+            q_rope = query[..., : self.rope_head_dim]
+            k_rope = key[..., : self.rope_head_dim]
+            q_rope, k_rope = self.rotary_emb(positions, q_rope, k_rope)
+            query[..., : self.rope_head_dim] = q_rope
+            key[..., : self.rope_head_dim] = k_rope
+
+        from sglang.srt.hardware_backend.npu.attention.ascend_dsa_backend import (
+            _compress_write_npu,
+            _get_topk_npu,
+        )
+
+        # --- Write Phase ---
+        _compress_write_npu(
+            key=key,
+            gate_score=gate_score,
+            positions=positions,
+            forward_batch=forward_batch,
+            layer_id=layer_id,
+            metadata=metadata,
+            compress_ape=self.index_kpool_compress_ape,
+            index_kpool=self.index_kpool,
+        )
+
+        if not return_indices:
+            return None
+
+        # --- Read Phase ---
+        # Get model weights. Here only apply 1/sqrt(H). PoolKeyIndexer will apply 1/sqrt(D)
+        weights, _ = self.weights_proj(x.float())  # [T,H]
+        weights = (weights * self.n_heads**-0.5).to(torch.bfloat16).contiguous()
+        return _get_topk_npu(
+            layer_id=layer_id,
+            query=query,
+            weights=weights,
+            positions=positions,
+            metadata=metadata,
+            index_topk=self.index_topk,
+            index_kpool=self.index_kpool,
+        )  # [T, index_topk + index_kpool - 1]

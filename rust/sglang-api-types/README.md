@@ -8,7 +8,7 @@ SGLang's own Rust server uses this same crate.
 
 ```toml
 [dependencies]
-sglang-api-types = "0.1"
+sglang-api-types = "0.2"
 ```
 
 The gRPC client lives at
