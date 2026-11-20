@@ -129,6 +129,23 @@ jobs:
       skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true }}
     secrets: inherit
 
+  # The GB300 rows run on aarch64 and need their own wheel when sgl-kernel changes.
+  sgl-kernel-build-wheels-arm:
+    needs: [check-changes, call-gate]
+    if: |
+      needs.check-changes.result == 'success' &&
+      (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') &&
+      needs.check-changes.outputs.sgl_kernel == 'true'
+      && needs.call-gate.outputs.opted-in != 'false'
+    uses: ./.github/workflows/_pr-test-sgl-kernel-build.yml
+    with:
+      runs_on: arm-kernel-build-node
+      job_display_name: Build Wheel Arm
+      arch_suffix: '-aarch64'
+      git_ref: ${{ inputs.git_ref || '' }}
+      skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true }}
+    secrets: inherit
+
   # =============================================== Rust extensions ====================================================
 
   # Own build job because artifacts are per-run: a standalone `run-ci-nv-extra` run
@@ -193,7 +210,7 @@ jobs:
   # `name:` keeps the job names wait-for-jobs and check-pr-test-health match on.
   extra-test:
     name: ${{ matrix.stage }}-test-${{ matrix.runner_config }}
-    needs: [check-changes, call-gate, sgl-kernel-build-wheels, dep-wheels-build, rust-ext-build, sgl-router-build, sgl-router-build-aarch64]
+    needs: [check-changes, call-gate, sgl-kernel-build-wheels, sgl-kernel-build-wheels-arm, dep-wheels-build, rust-ext-build, sgl-router-build, sgl-router-build-aarch64]
     if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') && needs.call-gate.outputs.opted-in != 'false' }}
     strategy:
       fail-fast: false
@@ -250,6 +267,7 @@ jobs:
         check-changes,
         call-gate,
         sgl-kernel-build-wheels,
+        sgl-kernel-build-wheels-arm,
         rust-ext-build,
         dep-wheels-build,
         sgl-router-build,
