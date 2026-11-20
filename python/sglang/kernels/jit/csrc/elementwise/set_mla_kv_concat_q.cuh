@@ -48,7 +48,6 @@ __global__ void set_mla_kv_concat_q_kernel(const __grid_constant__ SetMlaKVConca
   using namespace device;
   static_assert((kNopeBytes + kRopeBytes) % 16 == 0, "TMA bulk store requires total row to be 16-byte aligned");
 
-  constexpr int64_t kRowBytes = kNopeBytes + kRopeBytes;
   constexpr int kQNopeDim = static_cast<int>(kNopeBytes / sizeof(bf16_t));
   constexpr int kQRopeDim = static_cast<int>(kRopeBytes / sizeof(bf16_t));
 
@@ -59,7 +58,7 @@ __global__ void set_mla_kv_concat_q_kernel(const __grid_constant__ SetMlaKVConca
   PDLWaitPrimary<kUsePDL>();
 
   if (flat_warp < params.batch_size) {
-    // --- KV scatter role: one warp per token (smem staging + TMA bulk store) ---
+    // --- KV scatter role: one warp per token (16B per lane load / store) ---
     const uint32_t item_id = flat_warp;
     const auto loc = static_cast<const TLoc*>(params.loc)[item_id];
 
@@ -153,7 +152,7 @@ struct SetMlaKVConcatQKernel {
     auto S1_qo = SymbolicSize{"q_out_stride_1"};
     auto loc_dtype = SymbolicDType{};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     D_qn.set_value(kQNopeDim);
     D_qr.set_value(kQRopeDim);
@@ -325,10 +324,10 @@ struct SetMlaKVConcatQFp8Params {
   int32_t qo_stride_1;
 };
 
-// 2x bf16 -> 2x fp8 e4m3, float-mediated cvt.rn NOSAT (matches aten: overflow -> NaN).
+// Native packed E4M3 conversion: clamp overflow/infinity to +/-448, preserve NaN.
 SGL_DEVICE uint16_t bf16x2_to_fp8x2(const bf16x2_t v) {
   const float2 f = __bfloat1622float2(v);
-  return __nv_cvt_float2_to_fp8x2(f, __NV_NOSAT, __NV_E4M3);
+  return __nv_cvt_float2_to_fp8x2(f, __NV_SATFINITE, __NV_E4M3);
 }
 
 // Convert 8 bf16 (one int4 load) to 8 fp8 packed in a uint2.
@@ -462,7 +461,7 @@ struct SetMlaKVConcatQFp8Kernel {
     auto S1_qo = SymbolicSize{"q_out_stride_1"};
     auto loc_dtype = SymbolicDType{};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     D_nope.set_value(kFp8NopeDim);
     D_rope.set_value(kFp8RopeDim);

@@ -14,12 +14,13 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP, _mtp_quant_config
+from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP
 from sglang.srt.models.qwen4_exp import Qwen4ExpModel
 from sglang.srt.runtime_context import get_model, get_parallel
-from sglang.srt.utils import add_prefix, is_npu
+from sglang.srt.utils import is_npu
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +33,7 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
         prefix: str = "",
     ) -> None:
         nn.Module.__init__(self)
+        quant_config = self.own_quant_config(config, quant_config)
 
         self.is_multimodal = hasattr(config, "text_config")
         if self.is_multimodal:
@@ -44,13 +46,14 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
         config.full_attention_interval = 1
         config.ple_layer_ids = []
 
-        quant_config = _mtp_quant_config(quant_config)
-
         self.config = config
         self.quant_config = quant_config
         self.pp_group = get_parallel().pp_group
         self.hidden_size = config.hidden_size
         self.hc_count = config.hc_count
+        # The draft passes the fused HC stream in the inputs_embeds position.
+        # Register the replay slot at HC width, not the token embedding width.
+        self.input_embeds_hidden_size = self.hidden_size * self.hc_count
         self._mtp_input_fusion = self._init_mtp_input_fusion(config)
 
         self.model = Qwen4ExpModel(

@@ -3,13 +3,13 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.kernels.ops.diffusion import can_use_joint_qkv_cat, joint_qkv_cat
+from sglang.kernels.ops.diffusion import joint_qkv_cat
 from sglang.kernels.ops.diffusion.sites.bitexact_gate import BitExactFusionGate
 from sglang.multimodal_gen.runtime.models.dits import joy_image
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 
 def make_inputs(batch, image_tokens, text_tokens, heads, dim, dtype):
@@ -46,7 +46,6 @@ class TestJointQKVCat(CustomTestCase):
                     for value in inputs:
                         value.view(torch.int16)[0, 0, 0, :8].copy_(bits)
                     before = tuple(x.clone() for x in inputs)
-                    self.assertTrue(can_use_joint_qkv_cat(*inputs))
                     out = joint_qkv_cat(*inputs)
                     self.assert_bits_equal(out, reference(inputs))
                     self.assert_bits_equal(

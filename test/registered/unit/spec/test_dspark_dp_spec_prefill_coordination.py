@@ -5,7 +5,8 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.models.deepseek_v4_dspark import DSparkAttention
 from sglang.srt.speculative.dp_spec_prefill_coordination import (
     DPSpecPrefillCoordinationPlan,
 )
@@ -14,12 +15,29 @@ from sglang.srt.speculative.dspark_components.dspark_worker_v2 import DSparkWork
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 MODULE = "sglang.srt.speculative.dspark_components.dspark_worker_v2"
 
 
 class TestDSparkDPSpecPrefillCoordination(CustomTestCase):
+    def test_v4_idle_draft_attention_returns_empty_rows_without_kv_work(self):
+        """A peer prefill has no local draft KV rows or attention metadata.
+
+        Its empty HC output can have arbitrary strides; sending it through
+        MXFP8 projection fails before the rank can join the peer's MoE pass.
+        """
+        attention = object.__new__(DSparkAttention)
+        hidden = torch.empty_strided((0, 5120), (1, 1), dtype=torch.bfloat16)
+        output = attention.forward(
+            torch.empty(0, dtype=torch.int64),
+            hidden,
+            SimpleNamespace(forward_mode=ForwardMode.IDLE),
+        )
+        self.assertEqual(output.shape, hidden.shape)
+        self.assertEqual(output.dtype, hidden.dtype)
+        self.assertEqual(output.device, hidden.device)
+
     def test_draft_counts_are_not_scaled_twice(self):
         for width in (6, 7):
             for rank, local_tokens in ((0, 0), (1, 3 * width), (2, 0)):
@@ -32,6 +50,10 @@ class TestDSparkDPSpecPrefillCoordination(CustomTestCase):
                     proposer = object.__new__(DraftBlockProposer)
                     proposer._dp_moe_sync = True
                     proposer._num_token_non_padded = None
+                    proposer._dp_meta_host = None
+                    proposer._dp_meta_device = None
+                    proposer._dp_meta_copied = []
+                    proposer._dp_meta_slot = 0
                     proposer.draft_model_runner = SimpleNamespace(device="cpu")
                     proposer._draft_block_spec_info = SimpleNamespace(
                         num_tokens_per_req=width, num_tokens_for_logprob_per_req=1
@@ -45,6 +67,13 @@ class TestDSparkDPSpecPrefillCoordination(CustomTestCase):
                     self.assertEqual(forward.global_num_tokens_cpu, [0, 3 * width, 0])
                     self.assertEqual(
                         forward.global_num_tokens_for_logprob_cpu, [0, 3 * width, 0]
+                    )
+                    self.assertEqual(
+                        forward.global_num_tokens_gpu.tolist(), [0, 3 * width, 0]
+                    )
+                    self.assertEqual(
+                        forward.global_num_tokens_for_logprob_gpu.tolist(),
+                        [0, 3 * width, 0],
                     )
                     self.assertTrue(forward.dp_spec_prefill_coordination_applied)
                     self.assertTrue(forward.is_extend_in_batch)
@@ -65,7 +94,7 @@ class TestDSparkDPSpecPrefillCoordination(CustomTestCase):
                 )
                 events = []
                 worker = object.__new__(DSparkWorkerV2)
-                worker._draft_dp_context_enabled = local_draft
+                worker.draft_parallel_layout = SimpleNamespace(local_dp=local_draft)
                 worker._draft_context = nullcontext
                 worker._verify_planner = MagicMock()
                 worker._observers = MagicMock()

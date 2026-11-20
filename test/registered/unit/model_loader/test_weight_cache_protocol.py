@@ -27,7 +27,6 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.weight_cache.protocol import (
-    IPC_QUANT_ALLOWLIST,
     CacheConfig,
     UnsupportedQuantForIPCError,
     check_ipc_quant_support,
@@ -377,10 +376,6 @@ class TestIpcQuantAllowlist(CustomTestCase):
             "fp8", {"weight_block_size": [128, 128]}, where="daemon"
         )
 
-    def test_allowlist_registry_shape(self):
-        # Guard against accidentally widening the allowlist without review.
-        self.assertEqual(set(IPC_QUANT_ALLOWLIST), {"", "fp8"})
-
 
 class TestCleanupStaleDaemonFiles(CustomTestCase):
     # A key no real daemon would ever compute, so this never collides with
@@ -477,13 +472,13 @@ class TestDaemonModeRefusesDiskLoad(CustomTestCase):
 
     def test_daemon_mode_missing_daemon_raises_instead_of_disk_load(self):
         from sglang.srt.configs.load_config import LoadConfig, LoadFormat
-        from sglang.srt.weight_cache.ipc_loader import IpcModelLoader
+        from sglang.srt.weight_cache.ipc_loader import WeightCacheModelLoader
 
         missing_socket = get_socket_path(self.KEY)
         if os.path.exists(missing_socket):
             os.unlink(missing_socket)
 
-        loader = IpcModelLoader(
+        loader = WeightCacheModelLoader(
             load_config=LoadConfig(load_format=LoadFormat.IPC_CACHE),
             socket_path=missing_socket,
             weight_cache_mode="daemon",
@@ -503,9 +498,9 @@ class TestDaemonModeRefusesDiskLoad(CustomTestCase):
         from unittest import mock
 
         from sglang.srt.configs.load_config import LoadConfig, LoadFormat
-        from sglang.srt.weight_cache.ipc_loader import IpcModelLoader
+        from sglang.srt.weight_cache.ipc_loader import WeightCacheModelLoader
 
-        loader = IpcModelLoader(
+        loader = WeightCacheModelLoader(
             load_config=LoadConfig(load_format=LoadFormat.IPC_CACHE),
             weight_cache_mode="client",
             fallback_load_format="auto",

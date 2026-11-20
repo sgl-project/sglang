@@ -15,6 +15,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.srt.distributed.utils import get_group_rank_size
 from sglang.test.test_utils import CustomTestCase
 
 _WORLD = 2
@@ -130,7 +131,10 @@ def _worker() -> int:
 
     fold_group = get_world_group()
     assert folded._encoder_tp_group is fold_group
-    assert folded.text_model.encoder.layers[0].mlp.fc2.tp_size == world_size
+    assert (
+        get_group_rank_size(folded.text_model.encoder.layers[0].mlp.fc2.tp_group)[1]
+        == world_size
+    )
     assert get_tp_group().world_size == 1
 
     input_ids = torch.tensor([[1, 7, 11, 2]], device=device)

@@ -76,12 +76,9 @@ class _NegotiateOutput(NamedTuple):
 class PrefillDelayer:
     def __init__(
         self,
-        cpu_group,
         max_delay_passes: int,
         token_usage_low_watermark: Optional[float],
         metrics_collector: Optional["SchedulerMetricsCollector"] = None,
-        device: Optional["torch.device"] = "cpu",
-        device_group=None,
         debug_log_enabled: bool = True,
     ):
         self._max_delay_passes = max_delay_passes
@@ -117,22 +114,20 @@ class PrefillDelayer:
             get_schedule().disable_overlap_schedule
             or envs.SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH.get()
         )
+        tp_group = parallel.tp_group
         if use_nccl:
-            assert device_group is not None, (
-                "device_group is required when using NCCL for PrefillDelayer all-gather"
-            )
-            self._gather_group = device_group
-            self._gather_device = device
+            self._gather_group = tp_group.device_group
+            self._gather_device = tp_group.device
         else:
-            self._gather_group = cpu_group
+            self._gather_group = tp_group.cpu_group
             self._gather_device = "cpu"
 
         # Fields packed per rank into the all-gather tensor: prefillable,
         # token_watermark_force_allow, running_batch, max_prefill_bs,
-        # waiting_queue_len. The gather spans the TP group, whose ranks are
-        # laid out DP-major over attn_cp_size * attn_tp_size.
+        # waiting_queue_len, queue_timeout_expired. The gather spans the TP
+        # group, whose ranks are laid out DP-major over attn_cp_size * attn_tp_size.
         self._global_info_buffer = torch.empty(
-            (dp_size_dim, parallel.attn_cp_size * parallel.attn_tp_size, 5),
+            (dp_size_dim, parallel.attn_cp_size * parallel.attn_tp_size, 6),
             dtype=torch.int64,
             device=self._gather_device,
         )
@@ -192,6 +187,12 @@ class PrefillDelayer:
             running_batch=running_batch,
             max_prefill_bs=max_prefill_bs,
             waiting_queue_len=waiting_queue_len,
+            queue_timeout_expired=(
+                self._queue_trigger_enabled
+                and prev_state is not None
+                and (time.perf_counter() - prev_state.start_time) * 1000.0
+                >= self._max_delay_ms
+            ),
         )
         global_prefillable = tp0_info[:, 0]
         global_token_watermark_force_allow = tp0_info[:, 1]
@@ -267,10 +268,8 @@ class PrefillDelayer:
                     queue_min_effective > 0
                     and global_waiting_queue_max < queue_min_effective
                 )
-                if queue_condition and prev_state is not None:
-                    elapsed_ms = (time.perf_counter() - prev_state.start_time) * 1000.0
-                    if elapsed_ms >= self._max_delay_ms:
-                        queue_condition = False
+                if queue_condition and tp0_info[:, 5].max().item() > 0:
+                    queue_condition = False
 
             slot_condition = (
                 max_running_requests - global_running_batch_max
@@ -359,6 +358,7 @@ class PrefillDelayer:
         running_batch: int = 0,
         max_prefill_bs: int = 0,
         waiting_queue_len: int = 0,
+        queue_timeout_expired: bool = False,
     ):
         local_info = torch.tensor(
             [
@@ -367,6 +367,7 @@ class PrefillDelayer:
                 running_batch,
                 max_prefill_bs,
                 waiting_queue_len,
+                int(queue_timeout_expired),
             ],
             device=self._gather_device,
             dtype=torch.int64,

@@ -27,8 +27,8 @@ A new unit test case must fall into one of these categories:
 3. **Critical-path bookkeeping.** Defends conventions that are easy to break by
    forgetting to sync -- registry completeness, field lifecycle, serialization
    compatibility. Enumerating assertions are fine here; the guarded failure
-   mode is "someone extended X without updating Y". Example: the ratchet tests
-   (`test/registered/unit/test_module_state_ratchet.py`).
+   mode is "someone extended X without updating Y". Example:
+   `test/registered/unit/test_global_config_read_ratchet.py`.
 
 Not admissible:
 

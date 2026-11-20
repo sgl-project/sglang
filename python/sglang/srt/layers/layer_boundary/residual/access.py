@@ -17,14 +17,9 @@ from typing import Optional, Tuple, Union
 
 import torch
 
-from sglang.srt.distributed import GroupCoordinator
-from sglang.srt.layers.layer_boundary.output import (
-    DeferredFinalize,
-    UnreducedOutput,
-    complete_owed,
-)
-from sglang.srt.layers.layer_boundary.residual.stream import OwedOutput, ResidualStream
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.layers.layer_boundary.output import DeferredFinalize, UnreducedOutput
+from sglang.srt.layers.layer_boundary.residual.stream import OwedOutput
+from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 
 
 def buffer(
@@ -40,67 +35,6 @@ def buffer(
     if isinstance(hidden_states, DeferredFinalize):
         return None
     return hidden_states
-
-
-def add_to_output(hidden_states, residual, extra: torch.Tensor) -> Tuple:
-    """Complete the output before adding an extra contribution exactly once.
-    Leave its residual update for the next prepare call."""
-    hidden_states = (
-        residual.complete(hidden_states)
-        if isinstance(residual, ResidualStream)
-        else complete_owed(hidden_states)
-    )
-    hidden_states.add_(extra)
-    return hidden_states, residual
-
-
-def fold(hidden_states, residual):
-    """Finish a plain layer output and fold its residual into a complete value.
-    The following stage receives it with no outstanding residual addition."""
-    stream = residual if isinstance(residual, ResidualStream) else None
-    if stream is not None:
-        if stream.pending is not None and not stream.pending.update.is_plain_add:
-            raise NotImplementedError("fold requires a plain residual update")
-        hidden_states, residual = stream.export(hidden_states)
-    hidden_states = complete_owed(hidden_states)
-    if residual is not None:
-        hidden_states = hidden_states + residual
-    return (
-        (stream.write(hidden_states), stream)
-        if stream is not None
-        else (hidden_states, None)
-    )
-
-
-def written(hidden_states):
-    """Re-enter after a computation that already updated the full residual."""
-    return hidden_states, ResidualStream(hidden_states)
-
-
-def export_output(
-    hidden_states: Union[torch.Tensor, UnreducedOutput, DeferredFinalize],
-    residual: Optional[torch.Tensor],
-    forward_batch: ForwardBatch,
-    *,
-    final_norm_takes_handoff: bool = False,
-    preserve_declared: bool = False,
-) -> Tuple[Union[torch.Tensor, DeferredFinalize], Optional[torch.Tensor]]:
-    """Complete what this layer left for a next layer, for callers that carry
-    an explicit residual tensor or merge TBO microbatches. Stage-boundary
-    decoders use residual_batch.final_norm(), to_pp() or take_output() instead:
-    to_pp() keeps a declared partial sum for the receiving from_pp(), which
-    this helper would complete early. A final norm that does a producer's
-    handoff together with its own work (``final_norm_takes_handoff``)
-    receives it as it is."""
-    if isinstance(residual, ResidualStream):
-        return residual.export(
-            hidden_states,
-            takes_handoff=final_norm_takes_handoff,
-            preserve_declared=preserve_declared,
-        )
-    if final_norm_takes_handoff and isinstance(hidden_states, DeferredFinalize):
-        return hidden_states, residual
-    return complete_owed(hidden_states), residual
 
 
 def final_norm_pair(hidden_states, residual, norm, capture=None, **read_kwargs):
@@ -136,20 +70,3 @@ def from_pp(
     else:
         residual = tensors["residual"]
     return tensors["hidden_states"], residual
-
-
-def snapshot(
-    hidden_states: torch.Tensor,
-    residual: Optional[torch.Tensor],
-    *,
-    group: Optional[GroupCoordinator] = None,
-) -> torch.Tensor:
-    """Copy a complete output with its plain residual. A statically declared
-    sum is reduced on a copy; the main output and residual remain unchanged."""
-    if isinstance(residual, ResidualStream):
-        if group is not None:
-            raise ValueError("a residual stream carries its own reduction")
-        return residual.snapshot(hidden_states)
-    if group is not None:
-        hidden_states = group.all_reduce(hidden_states.clone())
-    return hidden_states.clone() if residual is None else hidden_states + residual

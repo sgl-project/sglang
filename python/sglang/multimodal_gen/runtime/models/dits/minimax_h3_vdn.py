@@ -47,8 +47,8 @@ from sglang.kernels.ops.diffusion import (
     vdn_silu_l2norm,
     vdn_temporal_conv_act,
 )
-from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
-    MiniMaxH3DiTArchConfig,
+from sglang.multimodal_gen.configs.models.dits.minimax_h3 import MiniMaxH3DiTArchConfig
+from sglang.multimodal_gen.configs.models.dits.minimax_h3_vdn import (
     VDNHybridAttentionArchConfig,
 )
 from sglang.multimodal_gen.runtime.distributed import (
@@ -520,7 +520,7 @@ def delta_factor_apply(
             B32.contiguous(),
             alpha.float().contiguous(),
         )
-        if can_use_vdn_delta_factors(A32, B32, alpha32):
+        if can_use_vdn_delta_factors(A32.device, A32.dtype, A32.shape[-1]):
             return vdn_delta_factors(A32, B32, alpha32)
     chol = torch.linalg.cholesky(A32 + eye)
     # (I+A)^-1 = L^-T L^-1: a batched trsm at 128x128 is far slower than the GEMM

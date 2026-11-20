@@ -200,9 +200,6 @@ class ModelSlimConfig(QuantizationConfig):
         assert is_skipped is not None
         return is_skipped
 
-    def get_scaled_act_names(self) -> List[str]:
-        return []
-
 
 class ModelSlimLinearMethod(LinearMethodBase):
     def __init__(self, quantization_config: ModelSlimConfig):

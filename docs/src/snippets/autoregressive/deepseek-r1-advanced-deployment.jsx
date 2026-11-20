@@ -469,7 +469,6 @@ const fieldToFlag = {
   kv_cache_dtype: 'kv-cache-dtype',
   chunked_prefill_size: 'chunked-prefill-size',
   max_prefill_tokens: 'max-prefill-tokens',
-  enable_flashinfer_allreduce_fusion: 'enable-flashinfer-allreduce-fusion',
   scheduler_recv_interval: 'scheduler-recv-interval',
   enable_symm_mem: 'enable-symm-mem',
   enforce_disable_flashinfer_allreduce_fusion: 'enforce-disable-flashinfer-allreduce-fusion',

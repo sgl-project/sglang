@@ -5,12 +5,8 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.diffusion.norm.rmsnorm_preserve_reduction import (
-    can_use_rmsnorm_preserve_reduction,
-)
 from sglang.kernels.ops.diffusion.rope.complex_rope_triton import (
     _fuse_real_sin,
-    can_use_fused_complex_rope,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -80,16 +76,29 @@ def _qknorm_complex_rope_onepass_kernel(
     )
 
 
-def can_use_qknorm_complex_rope(x, weight, rope):
-    return (
-        can_use_rmsnorm_preserve_reduction(x, weight)
-        and can_use_fused_complex_rope(x, rope)
+def _validate_qknorm_complex_rope(x, weight, rope):
+    if not (
+        x.is_cuda
+        and torch.version.hip is None
+        and x.dtype in (torch.float16, torch.bfloat16)
+        and x.ndim == 4
         and x.shape[-1] == 128
-    )
+        and x.numel() > 0
+        and x.is_contiguous()
+        and weight.device == x.device
+        and weight.dtype == x.dtype
+        and weight.shape == (128,)
+        and weight.is_contiguous()
+        and rope.dtype == torch.complex64
+        and rope.device == x.device
+        and rope.shape == (x.shape[1], 64)
+        and rope.is_contiguous()
+    ):
+        raise RuntimeError("invalid input for qknorm_complex_rope")
 
 
 def _fake_qknorm_complex_rope(x, weight, rope, eps):
-    return torch.empty_like(x)
+    return torch.empty(x.shape, dtype=x.dtype, device=x.device)
 
 
 @register_custom_op(
@@ -103,7 +112,8 @@ def qknorm_complex_rope(
     rope: torch.Tensor,
     eps: float,
 ) -> torch.Tensor:
-    assert can_use_qknorm_complex_rope(x, weight, rope)
+    x = x.contiguous()
+    _validate_qknorm_complex_rope(x, weight, rope)
     out = torch.empty_like(x)
     with torch.cuda.device(x.device):
         _qknorm_complex_rope_onepass_kernel[(triton.cdiv(x.numel() // 128, 4),)](

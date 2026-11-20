@@ -3,11 +3,11 @@ from typing import List, Optional, Tuple
 
 import torch
 
-from sglang.kernels.ops.gemm.embedding_lora_a import embedding_lora_a_fwd
-from sglang.kernels.ops.gemm.gate_up_lora_b import gate_up_lora_b_fwd
-from sglang.kernels.ops.gemm.qkv_lora_b import qkv_lora_b_fwd
-from sglang.kernels.ops.gemm.sgemm_lora_a import sgemm_lora_a_fwd
-from sglang.kernels.ops.gemm.sgemm_lora_b import sgemm_lora_b_fwd
+from sglang.kernels.ops.lora.dense.embedding_lora_a import embedding_lora_a_fwd
+from sglang.kernels.ops.lora.dense.gate_up_lora_b import gate_up_lora_b_fwd
+from sglang.kernels.ops.lora.dense.qkv_lora_b import qkv_lora_b_fwd
+from sglang.kernels.ops.lora.dense.sgemm_lora_a import sgemm_lora_a_fwd
+from sglang.kernels.ops.lora.dense.sgemm_lora_b import sgemm_lora_b_fwd
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -377,7 +377,7 @@ class TritonLoRABackend(BaseLoRABackend):
             permutation=torch.zeros(max_tokens, dtype=torch.int32, device=self.device),
         )
 
-    def init_cuda_graph_batch_info(
+    def init_decode_cuda_graph_batch_info(
         self,
         max_bs_in_cuda_graph: int,
         num_tokens_per_req: int,
@@ -414,7 +414,7 @@ class TritonLoRABackend(BaseLoRABackend):
     def init_dp_attention_cuda_graph_batch_info(self, max_num_tokens: int) -> None:
         local_batch_info = getattr(self, "cuda_graph_batch_info", None)
         assert local_batch_info is not None, (
-            "init_cuda_graph_batch_info must run before DP-attention graph init"
+            "init_decode_cuda_graph_batch_info must run before DP-attention graph init"
         )
         max_global_num_tokens = max_num_tokens * get_parallel().attn_dp_size
         self.cuda_graph_global_batch_info = build_token_lora_batch_info(
@@ -626,44 +626,50 @@ class TritonLoRABackend(BaseLoRABackend):
                 self.cuda_graph_sgemm_batch_info if use_cuda_graph else None,
             )
         else:
-            self.sgemm_batch_info = None
-            if use_prefill_cuda_graph:
-                sgemm = self.prefill_cuda_graph_sgemm_batch_info
-                chunk_size = PREFILL_CUDA_GRAPH_LORA_CHUNK_SIZE
-                num_tokens = max(1, forward_batch.extend_num_tokens)
-                num_chunks = min(
-                    num_tokens,
-                    (num_tokens + chunk_size - 1) // chunk_size
-                    + self.prefill_cuda_graph_max_bs
-                    - 1,
+            self.sgemm_batch_info = (
+                self._prepare_prefill_cuda_graph_sgemm_batch_info(
+                    forward_batch, weight_indices
                 )
-                # Larger grids keep the request view to fit CUDA's y/z limit.
-                if num_chunks <= sgemm.seg_lens.numel():
-                    indices, lengths = merge_and_chunk_segments(
-                        weight_indices, forward_batch.extend_seq_lens_cpu, chunk_size
-                    )
-                    num_segments = len(lengths)
-                    sgemm.bs = num_chunks
-                    sgemm.num_segments = num_segments
-                    sgemm.weight_indices[:num_segments].copy_(
-                        torch.tensor(
-                            indices, dtype=torch.int32, pin_memory=True, device="cpu"
-                        ),
-                        non_blocking=True,
-                    )
-                    sgemm.seg_lens[:num_segments].copy_(
-                        torch.tensor(
-                            lengths, dtype=torch.int32, pin_memory=True, device="cpu"
-                        ),
-                        non_blocking=True,
-                    )
-                    sgemm.seg_lens[num_segments:].zero_()
-                    torch.cumsum(sgemm.seg_lens, dim=0, out=sgemm.seg_indptr[1:])
-                    self.sgemm_batch_info = sgemm
+                if use_prefill_cuda_graph
+                else None
+            )
 
         self.lm_head_batch_info, self.lm_head_pass_batch_infos = (
             self._prepare_lm_head_batch_info(forward_batch, weight_indices, batch_info)
         )
+
+    def _prepare_prefill_cuda_graph_sgemm_batch_info(
+        self, forward_batch: ForwardBatch, weight_indices: List[int]
+    ) -> Optional[LoRABatchInfo]:
+        sgemm = self.prefill_cuda_graph_sgemm_batch_info
+        chunk_size = PREFILL_CUDA_GRAPH_LORA_CHUNK_SIZE
+        num_tokens = max(1, forward_batch.extend_num_tokens)
+        num_chunks = min(
+            num_tokens,
+            (num_tokens + chunk_size - 1) // chunk_size
+            + self.prefill_cuda_graph_max_bs
+            - 1,
+        )
+        # Larger grids keep the request view to fit CUDA's y/z limit.
+        if num_chunks > sgemm.seg_lens.numel():
+            return None
+        indices, lengths = merge_and_chunk_segments(
+            weight_indices, forward_batch.extend_seq_lens_cpu, chunk_size
+        )
+        num_segments = len(lengths)
+        sgemm.bs = num_chunks
+        sgemm.num_segments = num_segments
+        sgemm.weight_indices[:num_segments].copy_(
+            torch.tensor(indices, dtype=torch.int32, pin_memory=True, device="cpu"),
+            non_blocking=True,
+        )
+        sgemm.seg_lens[:num_segments].copy_(
+            torch.tensor(lengths, dtype=torch.int32, pin_memory=True, device="cpu"),
+            non_blocking=True,
+        )
+        sgemm.seg_lens[num_segments:].zero_()
+        torch.cumsum(sgemm.seg_lens, dim=0, out=sgemm.seg_indptr[1:])
+        return sgemm
 
     def prepare_global_lora_batch(self, forward_batch: ForwardBatch) -> None:
         assert self.batch_info is not None

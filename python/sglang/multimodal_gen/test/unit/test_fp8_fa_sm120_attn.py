@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """fp8_fa_sm120 attention backend against cuDNN SDPA on MiniMax-H3 style inputs.
 
-Needs an SM120 GPU; skipped elsewhere. Shapes are kept small (8 heads) so the
+Needs an SM120/SM121 GPU; skipped elsewhere. Shapes are kept small (8 heads) so the
 CuTe-DSL compile and the runs stay in seconds.
 """
 
@@ -9,8 +9,9 @@ import pytest
 import torch
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
-    reason="fp8_fa_sm120 attention needs an SM120 GPU",
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in ((12, 0), (12, 1)),
+    reason="fp8_fa_sm120 attention needs SM120/SM121",
 )
 
 HEADS = 8
@@ -63,8 +64,9 @@ def _error_metrics(candidate, reference):
 
 
 @pytest.mark.parametrize("sequence", [4096, 5980])
-def test_forward_matches_cudnn(sequence):
+def test_forward_matches_cudnn(sequence, monkeypatch):
     ours, reference = _make_impls()
+    monkeypatch.setattr(ours, "_report_fallback", pytest.fail)
     q, k, v = _fused_qkv_views(sequence)
 
     output = ours.forward(q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0), None)
@@ -108,8 +110,9 @@ def test_kernel_is_reused_across_calls():
     assert not torch.equal(first, second)
 
 
-def test_varlen_trailing_padding_keeps_tail_zero():
+def test_varlen_trailing_padding_keeps_tail_zero(monkeypatch):
     ours, _ = _make_impls()
+    monkeypatch.setattr(ours, "_report_fallback", pytest.fail)
     used = 5980
     total = 6016  # 64-aligned tail padding, as MiniMax-H3 packs it
     q, k, v = _fused_qkv_views(total)
@@ -190,6 +193,20 @@ def test_prep_defines_every_padded_byte():
     for buffer in (workspace.q_fp8, workspace.k_fp8, workspace.v_fp8):
         raw = buffer.view(torch.uint8)
         assert not ((raw == 0xFF) | (raw == 0x7F)).any()
+
+
+def test_block_scaled_mma_is_bit_equal():
+    """Unit UE8M0 scales must not move one output bit; S=1052 also covers the key mask."""
+    from sglang.kernels.ops.attention.fp8_fa_sm120.plan import _fp8_attention
+
+    for sequence in (1052, 4096):
+        q, k, v = _fused_qkv_views(sequence)
+        output, lse = _fp8_attention(q, k, v, SOFTMAX_SCALE, block_scaled_mma=False)
+        scaled_output, scaled_lse = _fp8_attention(
+            q, k, v, SOFTMAX_SCALE, block_scaled_mma=True
+        )
+        assert torch.equal(output.view(torch.int16), scaled_output.view(torch.int16))
+        assert torch.equal(lse.view(torch.int32), scaled_lse.view(torch.int32))
 
 
 def test_causal_falls_back_to_cudnn():

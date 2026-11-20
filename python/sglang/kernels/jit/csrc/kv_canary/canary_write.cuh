@@ -26,7 +26,6 @@ struct WriteKernelParams {
   const int64_t* write_offsets;
   const int64_t* write_seed_slot_indices;
   const int32_t* write_num_valid_reqs;
-  int32_t write_req_capacity;
 
   // ForwardBatch passthroughs. out_cache_loc is caller-pre-translated for SWA groups; the kernel
   // treats it opaquely and skips entries with slot < 0.
@@ -251,24 +250,28 @@ inline void canary_write_step_cuda(
   SymbolicSize N_real_kv_rows_0 = {"real_kv_rows_0"};
   SymbolicSize N_real_kv_cols_0 = {"real_kv_cols_0"};
   TensorMatcher({N_real_kv_rows_0, N_real_kv_cols_0})
+      .with_strides({-1, 1})
       .with_dtype<uint8_t>()
       .with_device<kDLGPU>(device_)
       .verify(real_kv_buf_0);
   SymbolicSize N_real_kv_rows_1 = {"real_kv_rows_1"};
   SymbolicSize N_real_kv_cols_1 = {"real_kv_cols_1"};
   TensorMatcher({N_real_kv_rows_1, N_real_kv_cols_1})
+      .with_strides({-1, 1})
       .with_dtype<uint8_t>()
       .with_device<kDLGPU>(device_)
       .verify(real_kv_buf_1);
   SymbolicSize N_real_kv_rows_2 = {"real_kv_rows_2"};
   SymbolicSize N_real_kv_cols_2 = {"real_kv_cols_2"};
   TensorMatcher({N_real_kv_rows_2, N_real_kv_cols_2})
+      .with_strides({-1, 1})
       .with_dtype<uint8_t>()
       .with_device<kDLGPU>(device_)
       .verify(real_kv_buf_2);
   SymbolicSize N_real_kv_rows_3 = {"real_kv_rows_3"};
   SymbolicSize N_real_kv_cols_3 = {"real_kv_cols_3"};
   TensorMatcher({N_real_kv_rows_3, N_real_kv_cols_3})
+      .with_strides({-1, 1})
       .with_dtype<uint8_t>()
       .with_device<kDLGPU>(device_)
       .verify(real_kv_buf_3);
@@ -307,7 +310,6 @@ inline void canary_write_step_cuda(
   p.write_offsets = static_cast<const int64_t*>(write_offsets.data_ptr());
   p.write_seed_slot_indices = static_cast<const int64_t*>(write_seed_slot_indices.data_ptr());
   p.write_num_valid_reqs = static_cast<const int32_t*>(write_num_valid_reqs.data_ptr());
-  p.write_req_capacity = write_req_capacity;
   p.input_ids = static_cast<const int64_t*>(input_ids.data_ptr());
   p.positions = static_cast<const int64_t*>(positions.data_ptr());
   p.out_cache_loc = static_cast<const int64_t*>(out_cache_loc.data_ptr());
@@ -329,7 +331,7 @@ inline void canary_write_step_cuda(
   tvm::ffi::TensorView source_bufs[kMaxRealKvSources] = {real_kv_buf_0, real_kv_buf_1, real_kv_buf_2, real_kv_buf_3};
   for (int s = 0; s < kMaxRealKvSources; ++s) {
     p.sources[s].tensor = static_cast<const uint8_t*>(source_bufs[s].data_ptr());
-    p.sources[s].row_stride_bytes = static_cast<int32_t>(source_bufs[s].size(1));
+    p.sources[s].row_stride_bytes = static_cast<int32_t>(source_bufs[s].stride(0));
     p.sources[s].page_size = params[s * kRealKvSourceFieldsPerEntry + kRealKvSourceFieldPageSize];
     p.sources[s].num_bytes_per_token = params[s * kRealKvSourceFieldsPerEntry + kRealKvSourceFieldNumBytesPerToken];
     p.sources[s].read_bytes = params[s * kRealKvSourceFieldsPerEntry + kRealKvSourceFieldReadBytes];

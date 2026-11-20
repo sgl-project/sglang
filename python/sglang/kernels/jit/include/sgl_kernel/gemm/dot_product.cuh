@@ -35,6 +35,16 @@ SGL_DEVICE void dot_product_vec(AlignedVector<bf16x2_t, N> a, AlignedVector<bf16
   }
 }
 
+/// Accumulate mixed BF16 activations and unmodified FP32 weights in FP32.
+template <std::size_t N>
+SGL_DEVICE void dot_product_vec(AlignedVector<bf16x2_t, N> a, AlignedVector<fp32x2_t, N> b, float& acc) {
+#pragma unroll
+  for (uint32_t i = 0; i < N; ++i) {
+    acc = math::fma_f32_bf16(a[i].x, b[i].x, acc);
+    acc = math::fma_f32_bf16(a[i].y, b[i].y, acc);
+  }
+}
+
 }  // namespace device
 
 }  // namespace sglang

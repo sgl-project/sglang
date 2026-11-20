@@ -13,7 +13,7 @@ import argparse
 import torch
 import triton
 
-from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_fold import (
+from sglang.kernels.ops.attention.linear.gdn_replayssm_spec_fold import (
     commit_gdn_replayssm_fold_all_layers,
 )
 
