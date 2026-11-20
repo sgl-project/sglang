@@ -908,9 +908,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._check_bench_drafter_temperature()
 
     def _check_bench_drafter_temperature(self) -> None:
-        """Refuse the draft temperature (default under simulated acceptance) for drafts
-        it cannot sample. The env-only preconditions (simulated acceptance, static
-        verify) are checked with the server args, before any weights load."""
+        """Refuses the draft temperature (default under simulated acceptance) for drafts
+        it cannot sample, and logs on TP rank 0 what it changes. The env-only
+        preconditions (simulated acceptance, static verify) are checked with the
+        server args, before any weights load."""
         temperature = bench_drafter_temperature()
         if temperature <= 0.0:
             return
