@@ -143,20 +143,27 @@ class SchedulerProfilerManager:
         if start_step:
             self.profiler_start_forward_ct = max(start_step, self.get_forward_ct() + 1)
 
-        if num_steps:
-            if self.profile_by_stage:
-                self.profiler_prefill_ct = 0
-                self.profiler_decode_ct = 0
+        if self.profile_by_stage:
+            # Counters must exist even when num_steps is omitted. Otherwise
+            # the first prefill does None += 1 and kills every scheduler.
+            self.profiler_prefill_ct = 0
+            self.profiler_decode_ct = 0
+            if num_steps:
                 self.profiler_target_prefill_ct = num_steps
                 self.profiler_target_decode_ct = num_steps
-            elif start_step:
+            else:
+                self.profiler_target_prefill_ct = None
+                self.profiler_target_decode_ct = None
+
+        if num_steps and not self.profile_by_stage:
+            if start_step:
                 self.profiler_target_forward_ct = (
                     self.profiler_start_forward_ct + num_steps
                 )
             else:
                 self.profiler_target_forward_ct = self.get_forward_ct() + num_steps + 1
             # The caller will be notified when reaching profiler_target_forward_ct
-        else:
+        elif not self.profile_by_stage:
             self.profiler_target_forward_ct = None
 
         return ProfileReqOutput(success=True, message="Succeeded")
@@ -420,7 +427,10 @@ class SchedulerProfilerManager:
                 if self.profiler_prefill_ct == 0:
                     self._start_profile(batch.forward_mode)
                 self.profiler_prefill_ct += 1
-                if self.profiler_prefill_ct > self.profiler_target_prefill_ct:
+                if (
+                    self.profiler_target_prefill_ct is not None
+                    and self.profiler_prefill_ct > self.profiler_target_prefill_ct
+                ):
                     if self.profile_in_progress:
                         self._stop_profile(stage=ForwardMode.EXTEND)
             elif batch.forward_mode.is_decode():
@@ -434,7 +444,10 @@ class SchedulerProfilerManager:
                         return
                     self._start_profile(batch.forward_mode)
                 self.profiler_decode_ct += 1
-                if self.profiler_decode_ct > self.profiler_target_decode_ct:
+                if (
+                    self.profiler_target_decode_ct is not None
+                    and self.profiler_decode_ct > self.profiler_target_decode_ct
+                ):
                     if self.profile_in_progress:
                         self._stop_profile(stage=ForwardMode.DECODE)
             elif batch.forward_mode.is_idle() or batch.forward_mode.is_prebuilt():
