@@ -339,7 +339,10 @@ class DSANPUIndexerMixin:
             q = q.view(bs, self.n_heads, self.head_dim)  # [bs, 64, 128]
 
             k_proj = self.wk(x)[0]  # [bs, 7168] @ [7168, 128] = [bs, 128]
-            k = self.k_norm(k_proj).unsqueeze(1)  # [bs, 1, 128]
+            k = self.k_norm(k_proj)
+            if _use_ag_after_qlora and input_on_attn_tp_slices:
+                k = scattered_to_tp_attn_full(k, forward_batch)
+            k = k.unsqueeze(1)
 
         elif self.rotary_emb.is_neox_style:
             if not hasattr(forward_batch, "npu_indexer_sin_cos_cache"):
@@ -498,9 +501,8 @@ class DSANPUIndexerMixin:
         # full-attn pool, which is keyed by compact (dense) layer ids;
         # translate the global layer id before unwrapping the wrapper.
         if hasattr(pool, "full_kv_pool"):
-            pool._wait_for_layer(layer_id)
-            layer_id = pool._transfer_full_attention_id(layer_id)
-            pool = pool.full_kv_pool
+            kv = pool.layer_router.read(layer_id)
+            pool, layer_id = kv.view, kv.view_layer_id
         use_quant_indexer = pool.index_k_scale_buffer is not None
         if use_quant_indexer and (self.num_init_tokens or self.num_local_tokens):
             raise NotImplementedError(

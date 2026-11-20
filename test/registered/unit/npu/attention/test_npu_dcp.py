@@ -39,7 +39,10 @@ try:
     from sglang.srt.hardware_backend.npu.attention.dsa_dcp import (
         forward_dcp_sparse_attention,
     )
-    from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
+    from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+        NPUDSATokenToKVPool,
+        NPUMLATokenToKVPool,
+    )
     from sglang.srt.layers.dcp.comm import cp_lse_ag_out_rs_mla_npu
     from sglang.srt.layers.dcp.layout import (
         filter_dcp_local_chunk_kv_indices,
@@ -324,6 +327,39 @@ class TestNpuDcpSparseAttentionContract(unittest.TestCase):
             torch.equal(call["actual_seq_lengths_kv"], metadata.dcp_spec_seq_lens)
         )
 
+    def test_padded_query_heads_are_removed_from_output_and_lse(self):
+        q = torch.ones(2, 96, 4, dtype=torch.bfloat16)
+        _, _, k, k_rope, topk = self._inputs()
+
+        def fake_sparse_attention(**kwargs):
+            self.assertEqual(kwargs["query"].shape, (2, 128, 4))
+            self.assertEqual(kwargs["query_rope"].shape, (2, 128, 4))
+            stats = torch.arange(256, dtype=torch.float32).view(1, 2, 128)
+            return kwargs["query"], stats, torch.ones_like(stats)
+
+        with patch.object(
+            torch.ops.npu,
+            "sgl_sparse_flash_attention",
+            fake_sparse_attention,
+            create=True,
+        ):
+            out, lse = forward_dcp_sparse_attention(
+                q_nope=q,
+                q_rope=q,
+                k_nope=k,
+                k_rope=k_rope,
+                topk_indices=topk,
+                actual_seq_lengths_query=torch.tensor([1, 2]),
+                forward_metadata=self._metadata(),
+                forward_batch=SimpleNamespace(forward_mode=_Mode(False)),
+                speculative_num_draft_tokens=None,
+                scaling=1.0,
+            )
+        torch.testing.assert_close(out, q)
+        torch.testing.assert_close(
+            lse, torch.arange(256, dtype=torch.float32).view(2, 128)[:, :96]
+        )
+
     def test_missing_rank_local_metadata_fails_loudly(self):
         q, rope, _, _, topk = self._inputs()
         bad = SimpleNamespace(dcp_block_tables=None, dcp_seq_lens=None)
@@ -437,6 +473,32 @@ class TestNpuDcpSparseAttentionContract(unittest.TestCase):
 
 
 class TestNpuDcpBufferAndLseHelpers(unittest.TestCase):
+    def test_hybrid_dsa_allocates_indexer_in_global_slot_space(self):
+        with (
+            patch.object(NPUMLATokenToKVPool, "__init__", return_value=None) as init,
+            patch(
+                "sglang.srt.hardware_backend.npu.memory_pool_npu.get_parallel",
+                return_value=SimpleNamespace(attn_dcp_size=2),
+            ),
+        ):
+            for is_draft_worker, size in [(False, 256), (True, 512)]:
+                NPUDSATokenToKVPool(
+                    size=size,
+                    page_size=128,
+                    kv_lora_rank=512,
+                    dtype=torch.bfloat16,
+                    qk_rope_head_dim=64,
+                    layer_num=2,
+                    device="cpu",
+                    index_head_dim=128,
+                    enable_memory_saver=False,
+                    skip_topk_layers=[False, True],
+                    is_draft_worker=is_draft_worker,
+                )
+                self.assertEqual(init.call_args.kwargs["size"], size)
+                self.assertEqual(init.call_args.kwargs["index_size"], 512)
+                self.assertEqual(init.call_args.kwargs["indexer_layer_ids"], [0])
+
     def test_retraction_indices_map_target_kv_to_rank_local_slots(self):
         pool = SimpleNamespace(dcp_size=4, dcp_rank=2, page_size=2)
         indices = torch.tensor([0, 1, 4, 5, 6, 7, 12, 13], dtype=torch.int64)

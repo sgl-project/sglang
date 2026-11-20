@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 
 import sgl_kernel_npu  # noqa: F401  Registers torch.ops.npu sparse attention ops.
 import torch
+import torch.nn.functional as F
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -70,7 +71,14 @@ def forward_dcp_sparse_attention(
         actual_seq_lengths_kv=local_lens,
         block_table=block_tables,
     )
+    num_heads = q_nope.shape[1]
     if fp8_attention is None:
+        # The BF16 kernel accepts 1–64 or 128 MLA query heads. Kimi K3.1
+        # gathers 96 heads when the DCP group spans its attention TP group.
+        if 64 < num_heads < 128:
+            padding = (0, 0, 0, 128 - num_heads)
+            q_nope = F.pad(q_nope, padding)
+            q_rope = F.pad(q_rope, padding)
         attn_out, softmax_max, softmax_sum = torch.ops.npu.sgl_sparse_flash_attention(
             query=q_nope,
             key=k_nope,
@@ -95,4 +103,8 @@ def forward_dcp_sparse_attention(
             **kwargs,
         )
     lse = softmax_max.float() + torch.log(softmax_sum.float())
-    return attn_out, lse.permute(1, 0, 2).reshape(lse.shape[1], -1)
+    lse = lse.permute(1, 0, 2).reshape(lse.shape[1], -1)
+    if attn_out.shape[1] != num_heads:
+        attn_out = attn_out[:, :num_heads].contiguous()
+        lse = lse[:, :num_heads].contiguous()
+    return attn_out, lse

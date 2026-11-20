@@ -13,7 +13,9 @@ from sglang.srt.arg_groups.model_override_base import (
     resolving_view,
 )
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_platform
+from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.runtime_context import attn_tp_size_of, get_platform
+from sglang.srt.utils.common import get_bool_env_var
 
 logger = logging.getLogger(__name__)
 
@@ -181,6 +183,37 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
 def _kimi_k31_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
     overrides = {}
+    if get_platform().is_npu:
+        if cfg.dcp_size > 1:
+            if attn_tp_size_of(cfg) % cfg.dcp_size != 0:
+                raise ValueError("Kimi-K3.1 Ascend DCP must divide attention TP size.")
+            if cfg.kv_cache_dtype not in ("auto", "bfloat16"):
+                raise ValueError("Kimi-K3.1 Ascend DCP requires bfloat16 KV cache.")
+            if (
+                cfg.cuda_graph_config.prefill.backend != Backend.DISABLED
+                or cfg.cuda_graph_config.decode.backend != Backend.DISABLED
+            ):
+                raise ValueError(
+                    "Kimi-K3.1 Ascend DCP requires eager execution. Set "
+                    "--disable-prefill-cuda-graph and --disable-decode-cuda-graph."
+                )
+            if (
+                cfg.speculative_algorithm is not None
+                or cfg.disaggregation_mode != "null"
+                or cfg.enable_hierarchical_cache
+                or cfg.enable_hisparse
+                or cfg.enable_return_indexer_topk
+            ):
+                raise ValueError(
+                    "Kimi-K3.1 Ascend DCP currently supports unified serving "
+                    "without speculative decoding, HiCache, HiSparse, or "
+                    "--enable-return-indexer-topk."
+                )
+            if envs.SGLANG_NPU_USE_MLAPO.get() or get_bool_env_var("SGLANG_USE_FIA_NZ"):
+                raise ValueError("Kimi-K3.1 Ascend DCP requires unfused ND KV writes.")
+            overrides["kv_cache_dtype"] = "bfloat16"
+        overrides["decode_state_free_radix_default"] = True
+        return overrides
     if cfg.dcp_size > 1:
         if cfg.speculative_algorithm not in (None, "DSPARK", "DFLASH"):
             raise ValueError(

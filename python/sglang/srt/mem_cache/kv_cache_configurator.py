@@ -3016,7 +3016,9 @@ class KVCacheConfigurator:
                     NPUDSATokenToKVPool,
                 )
 
-                return NPUDSATokenToKVPool
+                return partial(
+                    NPUDSATokenToKVPool, is_draft_worker=self.is_draft_worker
+                )
             return dsa_pool_class
         if _is_npu:
             self._reject_registered_kv_cache_dtype(pool="the NPU KV pool")

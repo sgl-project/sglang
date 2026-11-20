@@ -1549,6 +1549,8 @@ class NPUDSATokenToKVPool(NPUMLATokenToKVPool):
         kv_scale_ue8m0: bool = False,
         fp8_cast_on_write: bool = False,
         use_fp4_indexer: bool = False,
+        is_draft_worker: bool = False,
+        modelslim_cache_layout=None,
     ):
         # Accepted for signature compatibility with the in-tree DSATokenToKVPool
         # contract; the NPU indexer kernels manage fp8 latent + fp32 per-tile
@@ -1570,6 +1572,9 @@ class NPUDSATokenToKVPool(NPUMLATokenToKVPool):
             indexer_layer_ids = [
                 i for i, skip in enumerate(skip_topk_layers) if not skip
             ]
+        # A target shards MLA KV, but its indexer writes allocator-global IDs.
+        # Draft capacity already spans the global address space.
+        index_size = size if is_draft_worker else size * get_parallel().attn_dcp_size
         super().__init__(
             size=size,
             page_size=page_size,
@@ -1580,7 +1585,10 @@ class NPUDSATokenToKVPool(NPUMLATokenToKVPool):
             device=device,
             enable_memory_saver=enable_memory_saver,
             index_head_dim=index_head_dim,
+            index_size=index_size,
             index_page_size=page_size // index_kpool,
             indexer_layer_ids=indexer_layer_ids,
             kv_cache_dim=kv_cache_dim,
+            is_draft_worker=is_draft_worker,
+            modelslim_cache_layout=modelslim_cache_layout,
         )
