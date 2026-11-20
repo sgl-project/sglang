@@ -67,7 +67,6 @@ logger = logging.getLogger(__name__)
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerRequestReceiver:
     recv_from_tokenizer: Union[zmq.Socket, ScriptedTokenizerRecvProxy, RustServer]
-    recv_from_rpc: Optional[zmq.Socket]
     recv_skipper: Any
     input_blocker: Any
     mm_receiver: Any
@@ -154,15 +153,6 @@ class SchedulerRequestReceiver:
                     except zmq.ZMQError:
                         break
                     recv_reqs.append(recv_req)
-
-                while True:
-                    try:
-                        if self.recv_limit_reached(len(recv_reqs)):
-                            break
-                        recv_rpc = sock_recv(self.recv_from_rpc, zmq.NOBLOCK)
-                    except zmq.ZMQError:
-                        break
-                    recv_reqs.append(recv_rpc)
             else:
                 recv_reqs = None
         else:
@@ -341,6 +331,8 @@ class SchedulerRequestReceiver:
                 req.mm_inputs = error
 
     def _split_work_and_control_reqs(self, recv_reqs: List):
+        # An AbortReq arrives behind its request on this DP group's own socket;
+        # the work channel keeps that order, the broadcast from global rank 0 does not.
         work_reqs = [
             req
             for req in recv_reqs
@@ -351,6 +343,7 @@ class SchedulerRequestReceiver:
                     TokenizedEmbeddingReqInput,
                     BatchTokenizedGenerateReqInput,
                     BatchTokenizedEmbeddingReqInput,
+                    AbortReq,
                 ),
             )
         ]
@@ -364,6 +357,7 @@ class SchedulerRequestReceiver:
                     TokenizedEmbeddingReqInput,
                     BatchTokenizedGenerateReqInput,
                     BatchTokenizedEmbeddingReqInput,
+                    AbortReq,
                 ),
             )
         ]

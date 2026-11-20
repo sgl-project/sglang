@@ -105,6 +105,41 @@ class TestSampleDraftBlock(CustomTestCase):
         self.assertIsNone(block.corrected_logits)
         self.assertTrue(block.greedy_draft)
 
+    def test_one_row_greedy_draft_keeps_the_step_logit_transforms(self):
+        """A one-row greedy draft must pick the argmax of the softcapped, vocab-limited
+        step logits: never a token past the limit, and the first of a softcap tie."""
+        limit = VOCAB - 11
+        tail = torch.zeros(VOCAB)
+        tail[limit:] = 100.0
+        tie = torch.zeros(VOCAB)
+        # Both cap to 1.0 in fp32; the uncapped argmax is token 1.
+        tie[0], tie[1] = 20.0, 21.0
+        cases = (
+            ("vocab_limit", dict(step_vocab_limit=limit), tail, limit - 1),
+            ("softcap", dict(step_softcap=1.0), tie, 0),
+        )
+        for name, transforms, logits, max_token in cases:
+            with self.subTest(name):
+                head = VanillaMarkov(vocab_size=VOCAB, markov_rank=RANK)
+                head = head.to(torch.bfloat16)
+                with torch.no_grad():
+                    head.markov_w2.weight.zero_()
+                self.assertIsNotNone(head.greedy_w2_weight())
+                for attr, value in transforms.items():
+                    setattr(head, attr, value)
+                block = sample_draft_block(
+                    base_logits=logits.expand(1, GAMMA, VOCAB).to(torch.bfloat16),
+                    anchor_tokens=torch.zeros(1, dtype=torch.long),
+                    draft_hidden=None,
+                    sampling_info=None,
+                    markov_head=head,
+                    noise=DraftNoise(key=3, offset=torch.zeros(1, dtype=torch.int64)),
+                    device="cpu",
+                    tp_sync=SimpleNamespace(sync=lambda site, tokens: tokens),
+                    greedy_draft=True,
+                )
+                self.assertTrue(bool((block.draft_tokens <= max_token).all()))
+
 
 class TestFusedGreedyEligibility(CustomTestCase):
     def test_only_the_plain_w2_gemv_head_fuses(self):

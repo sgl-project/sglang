@@ -29,12 +29,22 @@ DYNAMIC_SUITES = {"1-gpu", "2-gpu"}
 
 
 def load_execution_reports(reports_dir: Path) -> list[dict]:
-    """Load all execution report JSON files from the given directory."""
-    reports = []
+    """Load the latest artifact report for each suite partition."""
+    reports = {}
     for json_file in reports_dir.glob("**/execution_report_*.json"):
         with open(json_file, "r", encoding="utf-8") as f:
-            reports.append(json.load(f))
-    return reports
+            report = json.load(f)
+        artifact = json_file.relative_to(reports_dir).parts[0]
+        attempt = (
+            int(artifact.rsplit("-", 1)[1])
+            if artifact.startswith("diffusion-report-")
+            else 0
+        )
+        key = (report["suite"], report["partition_id"])
+        # a rerun replaces the whole partition, including its coverage and failures
+        if key not in reports or attempt > reports[key][0]:
+            reports[key] = (attempt, report)
+    return [report for _, report in reports.values()]
 
 
 def get_expected_cases(repo_root: Path) -> dict[str, set[str]]:

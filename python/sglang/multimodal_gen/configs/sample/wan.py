@@ -48,8 +48,58 @@ def _wan_14b_coefficients(p: TeaCacheParams) -> list[float]:
     return [-5784.54975374, 5449.50911966, -1811.16591783, 256.27178429, -13.02252404]
 
 
+class _WanT2VResolutionAlignment:
+    """Rounds T2V sizes down to the latent patch grid.
+
+    The DiT floors an odd latent side when it splits it into 2x2 patches, so its
+    output no longer matches the latents. Image-to-video configs size the
+    output from the input image, and the diffusers backend keeps its own size
+    handling.
+    """
+
+    def _adjust_visual_fields(self, server_args, pipeline_config) -> None:
+        super()._adjust_visual_fields(server_args, pipeline_config)
+        self._align_resolution(pipeline_config)
+
+    def prepare_synthetic_warmup_request_for_queue(self, req, server_args) -> None:
+        super().prepare_synthetic_warmup_request_for_queue(req, server_args)
+        # Warmup overwrites the dimensions after _adjust has run.
+        self._align_resolution(server_args.pipeline_config)
+
+    def _align_resolution(self, pipeline_config) -> None:
+        from sglang.multimodal_gen.configs.pipeline_configs.wan import (
+            WanI2VCommonConfig,
+            WanT2V480PConfig,
+        )
+
+        if not isinstance(pipeline_config, WanT2V480PConfig) or isinstance(
+            pipeline_config, WanI2VCommonConfig
+        ):
+            return
+        if self.width is None or self.height is None:
+            return
+        if self.width <= 0 or self.height <= 0:
+            return
+        multiple = (
+            pipeline_config.vae_config.arch_config.spatial_compression_ratio
+            * pipeline_config.dit_config.arch_config.patch_size[1]
+        )
+        requested_size = (self.width, self.height)
+        self.width = max(multiple, self.width // multiple * multiple)
+        self.height = max(multiple, self.height // multiple * multiple)
+        if (self.width, self.height) != requested_size:
+            logger.warning(
+                "Wan T2V requires dimensions divisible by %s; adjusted requested "
+                "resolution from %sx%s to %sx%s",
+                multiple,
+                *requested_size,
+                self.width,
+                self.height,
+            )
+
+
 @dataclass
-class WanT2V_1_3B_SamplingParams(SamplingParams):
+class WanT2V_1_3B_SamplingParams(_WanT2VResolutionAlignment, SamplingParams):
     # Video parameters
     height: int = 480
     width: int = 832
@@ -81,7 +131,7 @@ class WanT2V_1_3B_SamplingParams(SamplingParams):
 
 
 @dataclass
-class WanT2V_14B_SamplingParams(SamplingParams):
+class WanT2V_14B_SamplingParams(_WanT2VResolutionAlignment, SamplingParams):
     # Video parameters
     height: int = 720
     width: int = 1280
@@ -233,9 +283,50 @@ class Wan2_2_TI2V_5B_SamplingParam(Wan2_2_Base_SamplingParams):
         ]
     )
 
+    def _adjust_visual_fields(self, server_args, pipeline_config) -> None:
+        super()._adjust_visual_fields(server_args, pipeline_config)
+        self._align_resolution(pipeline_config)
+
+    def prepare_synthetic_warmup_request_for_queue(self, req, server_args) -> None:
+        # Warmup overwrites the dimensions after _adjust has run.
+        self._align_resolution(server_args.pipeline_config)
+
+    def _align_resolution(self, pipeline_config) -> None:
+        from sglang.multimodal_gen.configs.pipeline_configs.wan import (
+            Wan2_2_TI2V_5B_Config,
+        )
+
+        # The DiT floors an odd latent side when it splits it into 2x2 patches,
+        # so its output no longer matches the latents. The diffusers backend
+        # keeps its own size handling.
+        if not isinstance(pipeline_config, Wan2_2_TI2V_5B_Config):
+            return
+        if self.width is None or self.height is None:
+            return
+        if self.width <= 0 or self.height <= 0:
+            return
+        multiple = (
+            pipeline_config.vae_stride[1]
+            * pipeline_config.dit_config.arch_config.patch_size[1]
+        )
+        requested_size = (self.width, self.height)
+        self.width = max(multiple, self.width // multiple * multiple)
+        self.height = max(multiple, self.height // multiple * multiple)
+        if (self.width, self.height) != requested_size:
+            logger.warning(
+                "Wan2.2 TI2V requires dimensions divisible by %s; adjusted "
+                "requested resolution from %sx%s to %sx%s",
+                multiple,
+                *requested_size,
+                self.width,
+                self.height,
+            )
+
 
 @dataclass
-class Wan2_2_T2V_A14B_SamplingParam(Wan2_2_Base_SamplingParams):
+class Wan2_2_T2V_A14B_SamplingParam(
+    _WanT2VResolutionAlignment, Wan2_2_Base_SamplingParams
+):
     guidance_scale: float = 4.0  # high_noise
     guidance_scale_2: float = 3.0  # low_noise
     num_inference_steps: int = 40
@@ -272,6 +363,39 @@ class Wan2_2_I2V_A14B_SamplingParam(Wan2_2_Base_SamplingParams):
             (480, 832),  # 9:16
         ]
     )
+
+
+# Wan2.2-S2V's default negative prompt (Chinese, as in the Wan2.2 reference).
+WAN_S2V_NEGATIVE_PROMPT = "画面模糊，最差质量，画面模糊，细节模糊不清，情绪激动剧烈，手快速抖动，字幕，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
+
+
+@dataclass
+class Wan2_2_S2V_14B_SamplingParam(Wan2_2_Base_SamplingParams):
+    """Sampling parameters for Wan2.2 S2V 14B model."""
+
+    height: int = 704
+    width: int = 1024
+    num_frames: int = 81
+    fps: int = 16
+    negative_prompt: str | None = WAN_S2V_NEGATIVE_PROMPT
+    guidance_scale: float = 4.5
+    num_inference_steps: int = 40
+
+    supported_resolutions: list[tuple[int, int]] | None = field(
+        default_factory=lambda: [
+            (1024, 704),
+            (704, 1024),
+        ]
+    )
+
+    def __post_init__(self) -> None:
+        # The S2V DiT is not a CachableDiT, so the denoising stage would accept both
+        # flags and never consult them.
+        if self.enable_teacache or self.enable_spectrum:
+            raise ValueError(
+                "Wan2.2-S2V does not support enable_teacache or enable_spectrum."
+            )
+        super().__post_init__()
 
 
 @dataclass

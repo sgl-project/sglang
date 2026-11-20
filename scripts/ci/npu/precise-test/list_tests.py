@@ -9,7 +9,7 @@ excluded), then write the selected test file paths (one per line) to the
 output file.
 
 Usage:
-    python3 list_tests.py --hw npu --suite base-b-test-1-npu-a3 \
+    python3 list_tests.py --hw npu --suite extra-b-test-1-npu-a3 \
         [--auto-partition-id N --auto-partition-size M] \
         -o /tmp/selected_tests.txt
 """

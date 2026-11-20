@@ -26,6 +26,7 @@ struct Params {
 };
 
 inline constexpr uint32_t kVec = 8;  // bf16 per 16B
+using Lamport = device::distributed::LamportTrait<bf16_t, kVec, /*kAtom=*/4>;
 
 SGL_DEVICE fp32x2_t mul_pair(fp32x2_t a, fp32x2_t b) {
   return {a.x * b.x, a.y * b.y};
@@ -42,20 +43,10 @@ SGL_DEVICE void push_local_slice(const Params& params, uint32_t half_off) {
   const uint32_t stride = gridDim.x * kNumThreads * kVec;
   for (uint32_t elem = worker * kVec; elem < num_local; elem += stride) {
     uint4 raw = *reinterpret_cast<const uint4*>(params.local + elem);
-    uint32_t* w = reinterpret_cast<uint32_t*>(&raw);
-#pragma unroll
-    for (uint32_t j = 0; j < 4; ++j) {
-      if ((w[j] & 0xffffu) == 0) w[j] |= 0x8000u;
-      if ((w[j] >> 16) == 0) w[j] |= 0x80000000u;
-    }
+    Lamport::clear_pos_zero(&raw);
     const uint32_t byte_off = half_off + (params.rank * num_local + elem) * sizeof(bf16_t);
     device::ptx::st_multimem_16B(raw, params.ws_mc + byte_off, 0);
   }
-}
-
-SGL_DEVICE bool vector_pending(uint4 raw) {
-  return (raw.x & 0xffffu) == 0 || (raw.x >> 16) == 0 || (raw.y & 0xffffu) == 0 || (raw.y >> 16) == 0 ||
-         (raw.z & 0xffffu) == 0 || (raw.z >> 16) == 0 || (raw.w & 0xffffu) == 0 || (raw.w >> 16) == 0;
 }
 
 // Spins until every rank's copy of the vector at (row, col) arrived, then clears the slot.
@@ -66,7 +57,7 @@ SGL_DEVICE uint4 take_gathered(bf16_t* gathered, uint32_t num_rows, uint32_t row
   bool pending;
   do {
     device::ptx::ld_relaxed_16B(raw, src, 0);
-    pending = vector_pending(raw);
+    pending = Lamport::has_pos_zero(&raw);
   } while (pending);
   device::AlignedVector<uint32_t, 4> zero;
   zero.fill(0);
@@ -86,7 +77,7 @@ receive_pack(bf16_t* gathered, uint32_t num_rows, uint32_t row, uint32_t col, in
       do {
         device::ptx::ld_relaxed_16B(cache[0], src0, 0);
         device::ptx::ld_relaxed_16B(cache[1], src1, 0);
-        pending = vector_pending(cache[0]) | vector_pending(cache[1]);
+        pending = Lamport::has_pos_zero(&cache[0]) | Lamport::has_pos_zero(&cache[1]);
       } while (pending);
       device::AlignedVector<uint32_t, 4> zero;
       zero.fill(0);

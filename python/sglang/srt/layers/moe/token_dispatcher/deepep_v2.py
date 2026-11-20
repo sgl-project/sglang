@@ -534,6 +534,10 @@ class DeepEPv2Dispatcher(BaseDispatcher):
             )
         return self._impl.combine(combine_input)
 
+    @property
+    def prebuild_pending(self) -> bool:
+        return DeepEPv2Buffer._state().buffer is None
+
     def prebuild(self) -> None:
         """Build the ElasticBuffer eagerly at deployment time (no forward needed)."""
         self._impl.prebuild_buffer()

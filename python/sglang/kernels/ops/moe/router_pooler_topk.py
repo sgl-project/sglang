@@ -26,6 +26,8 @@ from aiter.ops.triton._triton_kernels.quant.quant import _mxfp4_quant_op
 from sglang.kernels.ops.gemm.bf16_splitk_gemm import bf16_splitk_gemm_partials
 from sglang.kernels.ops.gemm.bf16_tiled_small_m_gemm import (
     _bm,
+    flydsl_gemm,
+    flydsl_gemm_applies,
     rowmajor_gemm_applies,
     rowmajor_gemm_partials,
     rowmajor_gemm_partials_split,
@@ -369,7 +371,10 @@ def joint_router_pooler_topk(
     ``quant_out`` as in ``router_pooler_topk``."""
     m, k = x.shape
     assert k == 8192 and packed.shape == (4608, 8192)
-    if m not in (8, 16, 24):
+    if flydsl_gemm_applies(x, packed, torch.float32):
+        partial = flydsl_gemm(x, packed)[None]
+        sk = 1
+    elif m not in (8, 16, 24):
         partial = rowmajor_gemm_partials(x, packed)
         sk = partial.shape[0]
     elif m == 24:

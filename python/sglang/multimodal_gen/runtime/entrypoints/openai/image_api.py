@@ -1,12 +1,12 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
-import base64
 import contextlib
 import io
 import os
 import time
 from typing import List, Optional
 
+import pybase64
 from fastapi import (
     APIRouter,
     File,
@@ -17,7 +17,7 @@ from fastapi import (
     Request,
     UploadFile,
 )
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from PIL import Image
 from pydantic import Json
 
@@ -59,6 +59,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBa
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.srt.observability.trace import extract_trace_headers
+from sglang.srt.utils.json_response import orjson_response
 
 router = APIRouter(prefix="/v1/images", tags=["images"])
 
@@ -77,7 +78,12 @@ def _resolve_image_output_format(
 
 
 def _b64_encode_images(images: list[bytes]) -> list[str]:
-    return [base64.b64encode(image).decode("utf-8") for image in images]
+    return [pybase64.b64encode(image).decode("utf-8") for image in images]
+
+
+def _json_response(response: ImageResponse) -> Response:
+    # fastapi's response_model pass would re-encode the multi-MB base64 body
+    return orjson_response(response.model_dump(mode="json"))
 
 
 def _fallback_image_urls(
@@ -365,7 +371,7 @@ async def generations(
             resize=response_resize,
         )
 
-    return ImageResponse(**response_kwargs)
+    return _json_response(ImageResponse(**response_kwargs))
 
 
 @router.post("/edits", response_model=ImageResponse)
@@ -564,7 +570,7 @@ async def edits(
             resize=response_resize,
         )
 
-    return ImageResponse(**response_kwargs)
+    return _json_response(ImageResponse(**response_kwargs))
 
 
 @router.get("/{image_id}/content")

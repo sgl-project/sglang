@@ -112,6 +112,23 @@ class XGrammarGrammar(BaseGrammarObject):
         self.matcher.rollback(k)
         self.accepted_tokens = self.accepted_tokens[:-k]
 
+    def try_accept_tokens(self, tokens: List[int]) -> bool:
+        if self.is_terminated():
+            return False
+        current_token = self.current_token
+        accepted = 0
+        for token in tokens:
+            # A rejected token leaves the xgrammar matcher state unchanged.
+            if not self.matcher.accept_token(token):
+                if accepted:
+                    self.rollback(accepted)
+                self.current_token = current_token
+                return False
+            self.accepted_tokens.append(token)
+            self.current_token = token
+            accepted += 1
+        return True
+
     def is_terminated(self):
         return self.matcher.is_terminated()
 
@@ -134,9 +151,9 @@ class XGrammarGrammar(BaseGrammarObject):
             else:
                 apply_token_bitmask_inplace_triton(logits, vocab_mask)
         elif logits.device.type == "npu":
-            import sgl_kernel_npu  # noqa: F401
+            from sgl_kernel_npu.operators.sampler import apply_token_bitmask
 
-            torch.ops.npu.apply_token_bitmask(logits, vocab_mask)
+            apply_token_bitmask(logits, vocab_mask)
         elif logits.device.type == "cpu":
             # Used by the MLX backend, which builds its additive mask rows
             # on the CPU before inserting them into the lazy graph.
@@ -271,9 +288,9 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
             else:
                 apply_token_bitmask_inplace_triton(logits, vocab_mask)
         elif logits.device.type == "npu":
-            import sgl_kernel_npu  # noqa: F401
+            from sgl_kernel_npu.operators.sampler import apply_token_bitmask
 
-            torch.ops.npu.apply_token_bitmask(logits, vocab_mask)
+            apply_token_bitmask(logits, vocab_mask)
         else:
             raise RuntimeError(f"Unsupported device: {logits.device.type}")
 

@@ -8,6 +8,7 @@ import torch
 
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
 from sglang.srt.environ import envs
+from sglang.srt.kernel_plugins.nvidia.binding import megakernel_entry
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     deployment_attn_dp_size,
@@ -213,7 +214,16 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             topk_index = torch.zeros((self.max_bs, self.topk), dtype=torch.int64)
             draft_probs = (
                 torch.zeros(
-                    (self.max_bs, self.model_runner.model_config.vocab_size),
+                    # Replay copies draft probabilities into this buffer, so its
+                    # width must match the worker's pre-verification q.
+                    (
+                        self.max_bs,
+                        getattr(
+                            self.eagle_worker,
+                            "draft_probs_vocab_size",
+                            self.model_runner.model_config.vocab_size,
+                        ),
+                    ),
                     dtype=torch.float32,
                 )
                 if get_spec().speculative_use_rejection_sampling
@@ -311,6 +321,10 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             batch_sizes=self.specialized_batches,
         )
         self.attention_variant_sizes = self.specialized_batches
+        self.make_draft_step_fold = megakernel_entry(
+            model_runner.model, "draft_step_fold"
+        )
+        self.draft_step_folds = []  # keeps the captured graphs' folds alive
 
         # Capture
         try:
@@ -406,6 +420,25 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
     # -----------------------------------------------------------------
     # Capture (per-shape)
     # -----------------------------------------------------------------
+    def _run_capture_tail_hooks(self, out, forward_batch, num_tokens: int) -> None:
+        """The model runner's capture tail hooks, after the draft forwards of a captured
+        batch size. The draft steps ran under the per-step attention backends, which
+        share the draft's KV pool (checked here when a hook exists); a hook that reads
+        the running backend sees the first."""
+        hooks = self.model_runner.capture_tail_hooks
+        if not hooks:
+            return
+        backends = self.draft_attn_backend.attn_backends
+        pool = getattr(backends[0], "token_to_kv_pool", None)
+        if any(getattr(b, "token_to_kv_pool", None) is not pool for b in backends):
+            raise RuntimeError(
+                "the draft's per-step attention backends do not share one KV pool; "
+                "the capture tail hooks check the running backend's"
+            )
+        with forward_context(ForwardContext(attn_backend=backends[0])):
+            for capture_hook in hooks:
+                capture_hook(self, out, forward_batch, num_tokens)
+
     def capture_one_shape(
         self,
         size: int,
@@ -527,6 +560,15 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             ),
         )
         self.model_runner.runner_ids.bind_runner_slots(forward_batch)
+        if (
+            self.make_draft_step_fold is not None
+            and self.topk == 1
+            and self.captured_req_width == 1
+        ):
+            forward_batch.draft_step_fold = self.make_draft_step_fold(
+                batch_size=num_seqs, num_steps=self.speculative_num_steps
+            )
+            self.draft_step_folds.append(forward_batch.draft_step_fold)
 
         def run_stock():
             output_cache_loc_backup = forward_batch.out_cache_loc
@@ -539,6 +581,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             forward_batch.spec_info.hidden_states = hidden_states_backup
             forward_batch.spec_info.dsa_topk_indices = dsa_topk_indices_backup
             forward_batch.positions.sub_(self.eagle_worker.speculative_num_steps - 1)
+            self._run_capture_tail_hooks(ret, forward_batch, num_tokens)
             return ret
 
         def run_once():

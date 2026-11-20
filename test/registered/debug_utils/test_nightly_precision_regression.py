@@ -37,8 +37,10 @@ import torch
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
+    ADMIN_LAUNCH_ARGS_FOR_TEST,
     DEFAULT_URL_FOR_TEST,
     ModelLaunchSettings,
+    admin_post,
     is_in_ci,
     parse_models,
     popen_launch_server,
@@ -610,11 +612,13 @@ def _run_server_and_dump(
         "4096",
         "--mem-fraction-static",
         "0.9",
-        "--disable-cuda-graph",
+        "--disable-decode-cuda-graph",
+        "--disable-prefill-cuda-graph",
         "--cuda-graph-backend-prefill=disabled",
         "--disable-radix-cache",
         "--flashinfer-allreduce-fusion-backend",
         PRECISION_FUSION_BACKEND,
+        *ADMIN_LAUNCH_ARGS_FOR_TEST,
     ]
 
     proc = popen_launch_server(
@@ -625,7 +629,7 @@ def _run_server_and_dump(
         env=env,
     )
     try:
-        requests.post(
+        admin_post(
             f"{base_url}/dumper/configure",
             json={
                 "enable": True,

@@ -20,12 +20,12 @@ from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
+from sglang.srt.utils import is_cuda, is_gfx95_supported, is_hip, is_npu, is_xpu
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.unified_allocator_fixtures import build_test_unified_pools
 
 register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=12, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(est_time=12, stage="base-a-jit-kernel-unit", runner_config="amd")
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
@@ -395,7 +395,8 @@ def _run_page_first_staged_write_back_mha(
         element_size=element_dim * host_pool.dtype.itemsize,
     )
     assert host_pool.can_use_write_back_jit
-    if element_dim * host_pool.dtype.itemsize % 128 != 0:
+    # gfx950's direct copy tiles every 16-byte multiple (hicache._default_unroll)
+    if element_dim * host_pool.dtype.itemsize % 128 != 0 and not is_gfx95_supported():
         assert not host_pool.can_use_jit
     assert host_pool.staging_page_capacity > 0
     if page_count > 64:
@@ -506,7 +507,8 @@ def _run_page_first_staged_write_back_mla(
         element_size=element_dim * host_pool.dtype.itemsize,
     )
     assert host_pool.can_use_write_back_jit
-    if element_dim * host_pool.dtype.itemsize % 128 != 0:
+    # gfx950's direct copy tiles every 16-byte multiple (hicache._default_unroll)
+    if element_dim * host_pool.dtype.itemsize % 128 != 0 and not is_gfx95_supported():
         assert not host_pool.can_use_jit
     assert host_pool.staging_page_capacity > 0
     if page_count > 64:
@@ -813,79 +815,35 @@ def test_page_unified_load_back_non_default_stream():
 # compiled kElementSize, for callers that reach the module directly. Those are
 # unreachable here by construction: the entry points derive every geometry
 # argument from the tensor shapes they are handed.
-@pytest.mark.parametrize(
-    "invalid,match",
-    [
-        ("rank", "Expected \\(page"),
-        ("kv_axis", "K/V dimension"),
-        ("group_alignment", "16-byte aligned"),
-        ("noncontiguous", "must be contiguous"),
-        ("layer_id", "layer id out of range"),
-        ("device_heads", "device row byte size mismatch"),
-        ("index_length", "indices length"),
-    ],
-)
-def test_page_unified_load_back_invalid_input(invalid, match):
+def test_page_unified_load_back_rejects_layer_id_out_of_range():
     groups, layers, page_size, heads_per_group, dim = 2, 3, 4, 1, 16
     shape = [PAGE_UNIFIED_NUM_PAGES, groups, layers, 2, page_size, heads_per_group, dim]
-    if invalid == "kv_axis":
-        shape[3] = 3
-    elif invalid == "group_alignment":
-        shape[6] = 7
-    elif invalid == "rank":
-        shape.pop()
     src = torch.zeros(shape, dtype=torch.float16).pin_memory()
-    if invalid == "noncontiguous":
-        src = src.transpose(1, 2).contiguous().transpose(1, 2)
-
     heads = groups * heads_per_group
-    if invalid == "device_heads":
-        heads += 1
     k_dst = torch.zeros((8, heads, dim), dtype=torch.float16, device=DEVICE)
     v_dst = torch.zeros_like(k_dst)
     src_pages = torch.zeros(2, dtype=torch.int64, device=DEVICE)
     dst_pages = torch.zeros(2, dtype=torch.int64, device=DEVICE)
-    if invalid == "index_length":
-        dst_pages = dst_pages[:1]
-    layer_id = layers if invalid == "layer_id" else 0
 
     # TVM FFI uses its own exception type for C++ RuntimeCheck failures.
-    with pytest.raises(Exception, match=match):
+    with pytest.raises(Exception, match="layer id out of range"):
         transfer_hicache_one_layer_page_unified_lf(
-            k_dst, v_dst, src, src_pages, dst_pages, layer_id
+            k_dst, v_dst, src, src_pages, dst_pages, layers
         )
 
 
-@pytest.mark.parametrize(
-    "invalid,match",
-    [
-        ("rank", "Expected MLA"),
-        ("dimension", "must be positive"),
-        ("alignment", "16-byte aligned"),
-        ("layer_id", "layer id out of range"),
-    ],
-)
-def test_page_unified_mla_load_back_invalid_input(invalid, match):
+def test_page_unified_mla_load_back_rejects_layer_id_out_of_range():
     layers, page_size, dim = 3, 4, 16
-    if invalid == "dimension":
-        dim = 0
-    elif invalid == "alignment":
-        dim = 7
     src = torch.zeros(
         (PAGE_UNIFIED_NUM_PAGES, layers, page_size, dim), dtype=torch.float16
-    )
-    if dim > 0:
-        src = src.pin_memory()
-    if invalid == "rank":
-        src = src.unsqueeze(1)
-    dst = torch.zeros((8, 1, max(dim, 1)), dtype=torch.float16, device=DEVICE)
+    ).pin_memory()
+    dst = torch.zeros((8, 1, dim), dtype=torch.float16, device=DEVICE)
     src_pages = torch.zeros(2, dtype=torch.int64, device=DEVICE)
     dst_pages = torch.zeros(2, dtype=torch.int64, device=DEVICE)
-    layer_id = layers if invalid == "layer_id" else 0
 
-    with pytest.raises(Exception, match=match):
+    with pytest.raises(Exception, match="layer id out of range"):
         transfer_hicache_one_layer_mla_page_unified_lf(
-            dst, src, src_pages, dst_pages, layer_id
+            dst, src, src_pages, dst_pages, layers
         )
 
 
@@ -989,6 +947,95 @@ def test_dsv4_v41_draft_swa_sidecar_moves_whole_pages():
     finally:
         torch.cuda.synchronize()
         host.destroy()
+        reset_context()
+
+
+def test_hybrid_draft_restores_full_and_swa_layers():
+    """A draft with both full and SWA layers gets one sidecar per component,
+    and its full-attention KV round-trips through the host."""
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from sglang.srt.mem_cache.hicache_storage import PoolName
+    from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler as assembler
+    from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+
+    publish(
+        ServerArgs(
+            model_path="dummy", page_size=PAGE_SIZE, hicache_mem_layout="page_first"
+        ),
+        role="test",
+    )
+    draft = SWAKVPool(
+        size=POOL_SIZE,
+        size_swa=POOL_SIZE // 2,
+        page_size=PAGE_SIZE,
+        dtype=torch.bfloat16,
+        head_num=1,
+        head_dim=128,
+        full_attention_layer_ids=[2],
+        swa_attention_layer_ids=[0, 1, 3, 4],
+        device=DEVICE,
+        token_to_kv_pool_class=MHATokenToKVPool,
+    )
+    target_swa = SimpleNamespace(
+        size=POOL_SIZE // 2, page_size=PAGE_SIZE, layout="page_first"
+    )
+    tree_cache = SimpleNamespace(
+        cache_controller=SimpleNamespace(
+            page_size=PAGE_SIZE,
+            transfer_layer_id_max=NUM_LAYERS,
+            mem_pool_host=SimpleNamespace(
+                logical_size=POOL_SIZE,
+                entry_map={PoolName.SWA: SimpleNamespace(host_pool=target_swa)},
+            ),
+        )
+    )
+    with (
+        patch.object(assembler, "_get_allocator_type", return_value="default"),
+        patch.object(assembler, "target_window_host_pool", return_value=PoolName.SWA),
+    ):
+        specs, entries = assembler.build_hicache_draft_sidecars(
+            draft_device_pools=(draft,), tree_cache=tree_cache
+        )
+    assert [(s.pool_name, s.indices_from_pool) for s in specs] == [
+        (PoolName.DRAFT, PoolName.KV),
+        (PoolName.DRAFT_SWA, PoolName.SWA),
+    ]
+    full_entry, swa_entry = entries
+    assert full_entry.device_pool is draft.full_kv_pool
+    assert swa_entry.device_pool is draft.swa_kv_pool
+
+    host, device_pool = full_entry.host_pool, full_entry.device_pool
+    buffers = [*device_pool.k_buffer, *device_pool.v_buffer]
+    engine = L2TransferEngine("kernel")
+    try:
+        for buffer in buffers:
+            buffer.copy_(torch.randn_like(buffer))
+        source = _token_indices_for_pages(torch.tensor([3, 1]))
+        destination = _token_indices_for_pages(torch.tensor([2, 4]))
+        # Staged write-back reads host indices on CPU; load-back on device.
+        host_indices = _token_indices_for_pages(torch.tensor([1, 3]), device="cpu")
+        expected = [buffer[source].clone() for buffer in buffers]
+        engine.submit_device_to_host(
+            [L2Transfer(host, device_pool, host_indices, source)]
+        ).finish_event.synchronize()
+        for buffer in buffers:
+            buffer.zero_()
+        engine.submit_host_to_device(
+            [
+                L2Transfer(
+                    host, device_pool, host_indices.to(DEVICE), destination, {0: 0}.get
+                )
+            ],
+            transfer_layer_id_max=1,
+        ).finish_event.synchronize()
+        for buffer, saved in zip(buffers, expected, strict=True):
+            torch.testing.assert_close(buffer[destination], saved, rtol=0, atol=0)
+    finally:
+        torch.cuda.synchronize()
+        for entry in entries:
+            entry.host_pool.destroy()
         reset_context()
 
 

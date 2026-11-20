@@ -14,14 +14,14 @@ from sglang.srt.layers.linear import ColumnParallelLinear, MergedColumnParallelL
 from sglang.srt.layers.offloader import OffloaderV1, OffloaderV2
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.model_loader.loader import PreshardedModelLoader
-from sglang.srt.weight_cache.ipc_loader import IpcModelLoader
+from sglang.srt.weight_cache.ipc_loader import WeightCacheModelLoader
 from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 # backend-specific: XPU CPU-offload loads host Gemma weights into device buffers
 # and must retain cached GDN/KDA views after checkpoint loading.
-register_xpu_ci(est_time=10, suite="stage-b-test-1-gpu-xpu")
+register_xpu_ci(est_time=10, suite="extra-test-1-gpu-xpu")
 
 
 class CachedConvolution(nn.Module):
@@ -248,7 +248,7 @@ class TestCpuOffloader(CustomTestCase):
     def test_loaders_rebuild_replaced_convolution_view(self) -> None:
         for rebind in (
             PreshardedModelLoader._rebind_parameter_aliases,
-            IpcModelLoader._rebuild_stale_views,
+            WeightCacheModelLoader._rebuild_stale_views,
         ):
             with self.subTest(loader=rebind.__qualname__), torch.no_grad():
                 model = CachedConvolution("conv1d", self.device)

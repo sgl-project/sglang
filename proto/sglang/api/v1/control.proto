@@ -1,0 +1,229 @@
+// Scheduler control APIs shared by HTTP JSON and gRPC: one request per
+// operation, fanned out to every DP rank by the Rust frontend, with the
+// per-rank replies merged the way the Python TokenizerManager merges them.
+syntax = "proto3";
+
+package sglang.api.v1;
+
+import "sglang/api/v1/common.proto";
+import "sglang/json/v1/options.proto";
+
+// `/set_internal_state`: numeric scheduler knobs to override at runtime.
+message SetInternalStateRequest {
+  // Python's `SetInternalStateReq.server_args: Dict[str, int | float]`. The
+  // key set is the scheduler's (`Scheduler.set_internal_state` rejects
+  // unknown keys), so the object passes through as JSON text.
+  optional string server_args = 1 [(sglang.json.v1.field_json).raw_json = true];
+}
+
+// One `updated` flag per DP rank, in rank order; Python's `List[bool]`.
+message SetInternalStateResponse {
+  option (sglang.json.v1.message_json).shape = MESSAGE_SHAPE_BARE_LIST;
+  repeated bool updated = 1;
+}
+
+// `/start_profile`: begin a profiler capture on every DP rank. Python's
+// `ProfileReq` minus `req_type`, which the operation implies. The frontend
+// fills `with_stack`/`record_shapes` from `SGLANG_PROFILE_WITH_STACK` /
+// `SGLANG_PROFILE_RECORD_SHAPES` when unset and mints `profile_id` when
+// absent, as Python's TokenizerManager does.
+message StartProfileRequest {
+  optional string output_dir = 1;
+  optional int64 start_step = 2;
+  // Stop automatically after this many steps; no `/stop_profile` needed.
+  optional int64 num_steps = 3;
+  // Among "CPU", "GPU", "MEM", "RPD"; the scheduler's default when unset.
+  optional StringList activities = 4;
+  bool profile_by_stage = 5;
+  optional bool with_stack = 6;
+  optional bool record_shapes = 7;
+  optional string profile_id = 8;
+  bool merge_profiles = 9;
+  optional string profile_prefix = 10;
+  optional StringList profile_stages = 11;
+  bool detailed_annotations = 12;
+}
+
+message StopProfileRequest {}
+
+// The merged outcome of a profile start or stop across DP ranks.
+message ProfileResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// `/start_expert_distribution_record`, `/stop_expert_distribution_record`,
+// `/dump_expert_distribution_record`: the MoE expert-distribution recorder
+// on every DP rank. The operation implies the action.
+message ExpertDistributionRecordRequest {}
+message ExpertDistributionRecordResponse {}
+
+// `/slow_down`: sleep this long before every forward, for testing; unset or
+// non-positive clears the delay.
+message SlowDownRequest {
+  optional double forward_sleep_time = 1;
+}
+message SlowDownResponse {}
+
+// `/release_memory_occupation` and `/resume_memory_occupation`: free or
+// reclaim the GPU memory of the tagged regions (`weights`, `kv_cache`); every
+// region when `tags` is unset.
+message ReleaseMemoryOccupationRequest {
+  optional StringList tags = 1;
+}
+message ResumeMemoryOccupationRequest {
+  optional StringList tags = 1;
+}
+message MemoryOccupationResponse {}
+
+// `/freeze_gc`: freeze the Python garbage collector on every DP rank's
+// scheduler, with the launch's `--gc-threshold`.
+message FreezeGcRequest {}
+message FreezeGcResponse {}
+
+// `/pause_generation`. `in_place` holds the scheduler loop with its batches
+// intact; `retract` returns running requests to the waiting queue; `abort`
+// cancels them and is handled by the frontend alone.
+message PauseGenerationRequest {
+  optional string mode = 1 [
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
+    (sglang.json.v1.field_json).default_string = "abort"
+  ];
+}
+
+// `/continue_generation`.
+message ContinueGenerationRequest {
+  optional bool torch_empty_cache = 1 [
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
+    (sglang.json.v1.field_json).default_bool = true
+  ];
+}
+
+// Python's `{"message": ..., "status": "ok"}` body for pause and continue.
+message GenerationPauseResponse {
+  string message = 1;
+  string status = 2;
+}
+
+// `/pd_role_switch`: flip this instance between prefill and decode at
+// runtime (`--enable-pd-role-switch`). With several DP ranks the frontend
+// first runs a `prepare_only` preflight on every rank.
+message PdRoleSwitchRequest {
+  optional string new_role = 1 [
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
+    (sglang.json.v1.field_json).default_string = ""
+  ];
+  optional Int64List decode_cuda_graph_bs = 2;
+  optional double decode_cuda_graph_memory_gb = 3;
+  bool prepare_only = 4;
+}
+
+// Python's `PdRoleSwitchReqOutput`.
+message PdRoleSwitchResponse {
+  bool success = 1;
+  string message = 2;
+  string old_role = 3;
+  string new_role = 4;
+  bool safe_to_restore = 5;
+}
+
+// `/update_weight_version`: relabel the served weights on every DP rank.
+message UpdateWeightVersionRequest {
+  string new_version = 1;
+  optional bool abort_all_requests = 2 [
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
+    (sglang.json.v1.field_json).default_bool = true
+  ];
+}
+
+message UpdateWeightVersionResponse {
+  bool success = 1;
+  string message = 2;
+  optional string new_version = 3;
+}
+
+// `/get_hicache_l3_cache_layout`: the HiCache L3 (object storage) layout,
+// read from every DP rank and merged as Python's `merge_l3_layouts` merges
+// them (replicas must agree, pipeline stages concatenate).
+message GetHiCacheL3CacheLayoutRequest {}
+
+// The merged layout as JSON text: Python's scheduler-sanitized dict, or the
+// `disabled_l3_layout` envelope with its reason.
+message GetHiCacheL3CacheLayoutResponse {
+  optional string layout = 1 [(sglang.json.v1.field_json).raw_json = true];
+}
+
+// `/configure_logging`: Python's `ConfigureLoggingReq`. `log_level` reaches
+// every scheduler rank; the other fields configure the Python frontend's
+// own request logging and dumps, which the Rust frontend does not apply.
+message ConfigureLoggingRequest {
+  optional bool log_requests = 1;
+  optional int64 log_requests_level = 2;
+  optional string log_requests_format = 3;
+  optional string log_level = 4;
+  optional string dump_requests_folder = 5;
+  optional int64 dump_requests_threshold = 6;
+  optional string crash_dump_folder = 7;
+  optional StringList dump_requests_exclude_meta_keys = 8;
+}
+message ConfigureLoggingResponse {}
+
+// `/dumper/{method}`: a method of the debug dumper's control surface
+// (`get_state`, `configure`, `reset`) with the request's JSON object as its
+// body, on every rank. Served only when the frontend runs with
+// `DUMPER_SERVER_PORT=reuse`, as Python mounts it.
+message DumperControlRequest {
+  string method = 1;
+  optional string body = 2 [(sglang.json.v1.field_json).raw_json = true];
+}
+
+// Python's success body: every rank's per-worker responses flattened, as
+// JSON text; a failure is a status carrying the ranks' errors.
+message DumperControlResponse {
+  optional string responses = 1 [(sglang.json.v1.field_json).raw_json = true];
+}
+
+// `/scale_elastic_ep` and `/is_scaling_elastic_ep`. Both answer Python's
+// "elastic EP is not enabled" without `--elastic-ep-backend`; the Rust
+// frontend does not serve a scale on a deployment that has it.
+message ScaleElasticEpRequest {
+  int64 new_ep_size = 1;
+}
+
+message ScaleElasticEpResponse {
+  string message = 1;
+  int64 old_ep_size = 2;
+  int64 new_ep_size = 3;
+}
+
+message ElasticEpStateRequest {}
+
+// Python's `get_elastic_ep_state`.
+message ElasticEpStateResponse {
+  bool is_scaling_elastic_ep = 1;
+  int64 effective_ep_size = 2;
+  optional int64 pending_ep_size = 3 [(sglang.json.v1.field_json).emit_null_when_absent = true];
+  string scale_phase = 4;
+  optional string last_error = 5 [(sglang.json.v1.field_json).emit_null_when_absent = true];
+}
+
+// `/open_session`: open a multi-turn session on every DP rank's scheduler.
+// Python's `OpenSessionReqInput`; the frontend mints `session_id` when unset.
+message OpenSessionRequest {
+  int64 capacity_of_str_len = 1;
+  optional string session_id = 2;
+  // A streaming session needs `--enable-streaming-session`.
+  optional bool streaming = 3;
+  optional double timeout = 4;
+}
+
+// The session's id; HTTP answers it as a bare JSON string, as Python does.
+message OpenSessionResponse {
+  string session_id = 1;
+}
+
+// `/close_session`.
+message CloseSessionRequest {
+  string session_id = 1;
+}
+message CloseSessionResponse {}

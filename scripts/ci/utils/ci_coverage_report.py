@@ -254,7 +254,7 @@ def get_test_basename(filename: str) -> str:
 
 
 # Suite names carry the runner shape as a `<n>-gpu` / `<n>-npu` token, e.g.
-# `base-b-test-1-gpu-small`, `base-c-test-acc-16-npu-a3`. The token is the
+# `base-b-test-1-gpu-small`, `extra-c-acc-test-16-npu-a3`. The token is the
 # only machine-readable record of how many accelerators a test asks for, so
 # the GPU-count grouping parses it back out. Anchored on a dash (or the
 # string start/end) so a trailing `-tp4` or a model name like `qwen3-235b`
@@ -266,7 +266,7 @@ def get_accel_count(test: CIRegistry) -> Optional[int]:
     """Number of GPUs/NPUs a test's suite runs on, or None if unencoded.
 
     Returns None for suites whose name has no size token -- `stress`,
-    `nightly-amd`, the CPU suites, and the synthesized `mm-gen-*`
+    `nightly-test-amd`, the CPU suites, and the synthesized `mm-gen-*`
     suites (multimodal_gen spreads one suite across 1-gpu and 2-gpu
     runners, so there is no single answer to report).
     """

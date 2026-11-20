@@ -27,6 +27,7 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.layernorm import GemmaRMSNorm
+from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.kv_cache import add_kv_cache_quant_methods
@@ -93,6 +94,24 @@ def _mtp_quant_config(quant_config):
         ]
         if mtp_excludes and any("mlp.experts" in layer for layer in mtp_excludes):
             return None
+    # ModelSlim (NPU) ships the MTP module of an otherwise-quantized checkpoint
+    # in bf16: every `mtp.*` entry in quant_model_description.json is "FLOAT".
+    # Drop the quant config so the whole draft model -- not just the layers that
+    # individually fall back -- takes the unquantized path, including the bf16
+    # MoE dispatch overrides in Qwen3_5ForCausalLMMTP.forward().
+    if quant_config and quant_config.get_name() == "modelslim":
+        quant_description = getattr(quant_config, "quant_description", {})
+        mtp_schemes = [
+            value
+            for key, value in quant_description.items()
+            if isinstance(key, str) and key.startswith("mtp.")
+        ]
+        if mtp_schemes and all(scheme == "FLOAT" for scheme in mtp_schemes):
+            logger.info_once(
+                "ModelSlim checkpoint stores the MTP module unquantized; "
+                "loading the draft model in bf16."
+            )
+            return None
     return quant_config
 
 
@@ -152,7 +171,6 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         self.quant_config = quant_config
         self.pp_group = get_parallel().pp_group
 
-        self.fc = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
         RMSNorm_cls = GemmaRMSNorm
         self.pre_fc_norm_embedding = RMSNorm_cls(
             config.hidden_size, config.rms_norm_eps
@@ -169,6 +187,13 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         )
         add_kv_cache_quant_methods(
             self.model, kv_cache_quant_config, add_prefix("mtp", prefix)
+        )
+        self.fc = ReplicatedLinear(
+            2 * config.hidden_size,
+            config.hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=add_prefix("mtp.fc", prefix),
         )
 
         if get_parallel().pp_group.is_last_rank:
@@ -271,7 +296,12 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
 
             hidden_states = torch.cat([input_embeds, hidden_states], dim=-1)
 
-            hidden_states = self.fc(hidden_states)
+            if forward_batch.forward_mode.is_idle():
+                hidden_states = hidden_states.new_zeros(
+                    (hidden_states.shape[0], self.config.hidden_size)
+                )
+            else:
+                hidden_states, _ = self.fc(hidden_states)
 
             with get_global_expert_distribution_recorder().disable_this_region():
                 hidden_states = self.model(

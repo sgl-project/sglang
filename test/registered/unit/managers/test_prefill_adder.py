@@ -176,6 +176,7 @@ class TestPrefillAdder(CustomTestCase):
             max_new_tokens=max_new_tokens, ignore_eos=False
         )
         req.time_stats = SimpleNamespace(wait_queue_entry_time=wait_time)
+        req.arrival_processed_tokens = 0
         req.retracted_stain = False
         req.host_hit_length = 0
         req.window_host_hit_lengths = {}
@@ -188,6 +189,7 @@ class TestPrefillAdder(CustomTestCase):
         req.fulfilled_storage_hit_len.return_value = 0
         req.finished.return_value = False
         req.needs_host_load_back.return_value = False
+        req.beam_group = None
         req.last_node = MagicMock()
         return req
 
@@ -251,9 +253,10 @@ class TestPrefillAdder(CustomTestCase):
         req.full_untruncated_fill_ids = list(range(12))
         return req
 
-    def create_shortest_prefill_adder(self, *, chunk_tokens=4096):
+    def create_shortest_prefill_adder(self, *, chunk_tokens=4096, encoder_replay=False):
         override = get_context().override_server_args(
-            schedule_policy="shortest-prefill-first"
+            schedule_policy="shortest-prefill-first",
+            enable_encoder_swa_bounded_replay=encoder_replay,
         )
         override.install()
         self.addCleanup(override.restore)
@@ -282,7 +285,11 @@ class TestPrefillAdder(CustomTestCase):
             req.full_untruncated_fill_ids = list(range(length))
             req.num_matched_prefix_tokens = 0
         adder.chunked_req_limit = policy.shortest_prefill_chunk_limit(
-            continuation, waiting, adder.rem_chunk_tokens, adder.page_size
+            continuation,
+            waiting,
+            adder.rem_chunk_tokens,
+            adder.page_size,
+            processed_tokens=0,
         )
         self.assertIs(adder.add_chunked_req(continuation), continuation)
         self.assertEqual(continuation.extend_len, 2560)
@@ -292,6 +299,40 @@ class TestPrefillAdder(CustomTestCase):
         self.assertIsNone(adder.new_chunked_req)
         self.assertEqual(adder.rem_chunk_tokens, 0)
         self.assertGreaterEqual(adder.rem_total_tokens, 0)
+
+    def test_shortest_prefill_reserves_encoder_replay_rows_of_hits(self):
+        # Admission charges a hit's replay rows to the chunk. A reservation
+        # without them leaves the hit unable to fit whole, so it waits and the
+        # room reserved for it goes unused.
+        adder = self.create_shortest_prefill_adder(encoder_replay=True)
+        policy = SchedulePolicy(
+            policy="shortest-prefill-first",
+            tree_cache=RadixCache.create_simulated(),
+            enable_hierarchical_cache=True,
+            enable_priority_scheduling=False,
+            schedule_low_priority_values_first=False,
+        )
+        continuation = self.create_shared_req("continuation")
+        continuation.full_untruncated_fill_ids = list(range(16384))
+        hit = self.create_shared_req("hit")
+        hit.origin_input_ids = list(range(4096 + 1024))
+        hit.full_untruncated_fill_ids = hit.origin_input_ids
+        hit.num_matched_prefix_tokens = 4096
+        hit.prefix_len = 4096
+        hit.kv.req_pool_idx = None
+        hit.is_retracted = False
+        adder.chunked_req_limit = policy.shortest_prefill_chunk_limit(
+            continuation,
+            [hit],
+            adder.rem_chunk_tokens,
+            adder.page_size,
+            processed_tokens=0,
+        )
+        adder.add_chunked_req(continuation)
+        # 1024 extend + 128 replay rows reserved, page-floored: 4096 - 1280.
+        self.assertEqual(continuation.extend_len, 2816)
+        adder.add_one_req(hit, has_chunked_req=True, truncation_align_size=None)
+        self.assertEqual(adder.can_run_list, [continuation, hit])
 
     def test_shortest_prefill_rejects_second_unfinished_chunk(self):
         adder = self.create_shortest_prefill_adder(chunk_tokens=512)
@@ -1286,6 +1327,25 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(adder.can_run_list, [])
         self.assertIsNone(req.extend_end)
 
+    def test_ignore_eos_chunks_a_streaming_session_turn_after_its_prefix(self):
+        self.mock_tree_cache.disable = True
+        self.mock_tree_cache.supports_mamba.return_value = False
+        self.mock_token_allocator.available_size.return_value = 4096
+        adder = self.create_adder(self.create_running_batch(), rem_chunk_tokens=128)
+
+        req = self.create_mock_req("session-turn", priority=0, max_new_tokens=8)
+        req.sampling_params.ignore_eos = True
+        req.origin_input_ids = list(range(512))
+        req.full_untruncated_fill_ids = list(range(512))
+        req.prefix_len = 64
+
+        adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
+
+        self.assertEqual(adder.can_run_list, [req])
+        self.assertIs(adder.new_chunked_req, req)
+        self.assertEqual(req.extend_end, 64 + 128)
+        self.assertEqual(adder.rem_chunk_tokens, 0)
+
     def create_sharded_adder(
         self,
         *,
@@ -1671,6 +1731,7 @@ class TestPrefillAdder(CustomTestCase):
             prefill_retire_lag=0, decode_retire_lag=0, eviction_interval=1
         )
         budget.checkpoint_interval = 0
+        budget._demands = {}
         # 48 owner tokens free; nothing else holds memory to give back.
         budget._fits = lambda full, windows, state_slots, request_rows=0, **kwargs: (
             full <= 48

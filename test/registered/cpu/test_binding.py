@@ -19,7 +19,7 @@ from sglang.test.test_utils import (
     get_available_cpu_ids,
 )
 
-register_cpu_ci(est_time=6, suite="stage-a-tp-test-cpu-intel")
+register_cpu_ci(est_time=6, suite="extra-tp-test-cpu-intel")
 
 
 class TestBinding(CustomTestCase):

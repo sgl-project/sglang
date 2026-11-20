@@ -131,6 +131,7 @@ mod tests {
                 decode_policy: Default::default(),
                 dp_aware: false,
                 dp_rank_policy: Default::default(),
+                decode_dp_rank_policy: None,
                 bucket_config: None,
                 reorg_buckets: None,
                 reorg_admission: Default::default(),
@@ -230,7 +231,6 @@ mod tests {
         );
     }
 
-    /// Ported from SMG tests/api/parser_endpoints_test.rs (parse_function_call_missing_fields):
     /// DetokenizeRequest has `deny_unknown_fields`; an extra field must yield 422
     /// Unprocessable Entity from axum's JSON extractor, not 200 with the field silently ignored.
     /// Gap: the existing `tokenize_request_does_not_advertise_add_special_tokens` test only

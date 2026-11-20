@@ -5,7 +5,9 @@ Qwen3.8-Flash-Next) out of device memory and lets the Triton gather kernel read
 rows straight from a host pointer. Two backends provide that pointer:
 
 ``pinned`` (default)
-    ``torch.empty(..., pin_memory=True)``. On a discrete GPU this frees VRAM.
+    Page-locked host memory of exactly the table's size (``cudaHostAlloc``;
+    ``torch.empty(..., pin_memory=True)`` on non-CUDA builds). On a discrete
+    GPU this frees VRAM.
 
 ``file``
     A file-backed, shared ``mmap`` of a sparse file under
@@ -46,6 +48,7 @@ from sglang.srt.environ import envs
 logger = logging.getLogger(__name__)
 
 _LIBC: Optional[ctypes.CDLL] = None
+_WILLNEED_FAILED = False
 _SMAPS_HEADER = re.compile(r"^([0-9a-f]+)-([0-9a-f]+) ")
 _SMAPS_RSS = re.compile(r"^Rss:\s+(\d+) kB")
 
@@ -53,6 +56,7 @@ PLE_OFFLOAD_BACKENDS = ("pinned", "file")
 
 # cudaDeviceAttr enum values (cuda_runtime_api.h).
 _CUDA_DEV_ATTR_PAGEABLE_MEMORY_ACCESS = 88
+_CUDA_DEV_ATTR_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES = 100
 _MADV_RANDOM = 1
 _MADV_DONTNEED = 4
 _PAGE_SHIFT = 12
@@ -242,6 +246,8 @@ def allocate_ple_host_table(
             f"unknown PLE offload backend {backend!r}; choose from {PLE_OFFLOAD_BACKENDS}"
         )
     if backend == "pinned":
+        if torch.version.cuda is not None:
+            return _alloc_cuda_host_table(tuple(shape), dtype)
         return torch.empty(tuple(shape), dtype=dtype, device="cpu", pin_memory=True)
 
     numel = 1
@@ -372,6 +378,24 @@ def device_reads_pageable_memory(device_index: int = 0) -> Optional[bool]:
 
     Returns None when the CUDA runtime library cannot be queried.
     """
+    value = _device_attribute(_CUDA_DEV_ATTR_PAGEABLE_MEMORY_ACCESS, device_index)
+    return None if value is None else bool(value)
+
+
+def device_faults_pageable_pages(device_index: int = 0) -> bool:
+    """Whether the GPU reaches pageable host memory through page faults the driver
+    serves (HMM on a discrete GPU), rather than through the host's page tables (ATS, as
+    on GB10). False when either attribute cannot be queried."""
+    reads = _device_attribute(_CUDA_DEV_ATTR_PAGEABLE_MEMORY_ACCESS, device_index)
+    host_tables = _device_attribute(
+        _CUDA_DEV_ATTR_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES, device_index
+    )
+    return reads == 1 and host_tables == 0
+
+
+def _device_attribute(attribute: int, device_index: int) -> Optional[int]:
+    """``cudaDeviceGetAttribute`` through the CUDA runtime library; None when it
+    cannot be queried."""
     candidates = [ctypes.util.find_library("cudart")]
     torch_lib = os.path.join(os.path.dirname(torch.__file__), "lib")
     if os.path.isdir(torch_lib):
@@ -398,14 +422,55 @@ def device_reads_pageable_memory(device_index: int = 0) -> Optional[bool]:
             value = ctypes.c_int()
             rc = cudart.cudaDeviceGetAttribute(
                 ctypes.byref(value),
-                ctypes.c_int(_CUDA_DEV_ATTR_PAGEABLE_MEMORY_ACCESS),
+                ctypes.c_int(attribute),
                 ctypes.c_int(device_index),
             )
             if rc == 0:
-                return bool(value.value)
+                return value.value
         except OSError:
             continue
     return None
+
+
+def advise_rows_willneed(fd: int, rows: torch.Tensor, row_bytes: int) -> int:
+    """Queue the page-cache reads of ``rows`` of the file-backed table open as ``fd``
+    and return once they are queued: ``posix_fadvise(WILLNEED)``, one call per run
+    of adjacent pages.
+
+    The host gather copies its rows on one thread (the server runs torch with one
+    thread) from a ``MADV_RANDOM`` mapping, so without this each cold row is its own
+    4 KiB read from storage, one after another. Advised first, the reads are in flight
+    together and the copy finds the rows in the page cache. Advisory: returns the number
+    of pages advised, and stops at the first call that fails.
+    """
+    global _WILLNEED_FAILED
+    if rows.numel() == 0:
+        return 0
+    first = rows.to(torch.int64) * row_bytes
+    pages = torch.cat(
+        [first >> _PAGE_SHIFT, (first + row_bytes - 1) >> _PAGE_SHIFT]
+    ).unique(sorted=True)
+    run_starts = torch.ones_like(pages, dtype=torch.bool)
+    run_starts[1:] = pages[1:] != pages[:-1] + 1
+    starts = torch.nonzero(run_starts).flatten()
+    lengths = torch.diff(starts, append=starts.new_tensor([pages.numel()]))
+    advised = 0
+    for page, count in zip(pages[starts].tolist(), lengths.tolist()):
+        try:
+            os.posix_fadvise(
+                fd, page << _PAGE_SHIFT, count << _PAGE_SHIFT, os.POSIX_FADV_WILLNEED
+            )
+        except OSError as exc:
+            if not _WILLNEED_FAILED:
+                _WILLNEED_FAILED = True
+                logger.warning(
+                    "PLE table: posix_fadvise(WILLNEED) failed (%s); host gathers "
+                    "read cold rows one at a time",
+                    exc,
+                )
+            break
+        advised += count
+    return advised
 
 
 def _madvise_random(storage: torch.Tensor, nbytes: int) -> None:
@@ -418,6 +483,24 @@ def _madvise_random(storage: torch.Tensor, nbytes: int) -> None:
     exists for."""
     if not _madvise(storage.data_ptr(), nbytes, _MADV_RANDOM):
         logger.warning("PLE table: madvise(MADV_RANDOM) not applied")
+
+
+def _alloc_cuda_host_table(shape: tuple, dtype: torch.dtype) -> torch.Tensor:
+    # torch's pinned allocator rounds each block up to a power of two, pinning up
+    # to ~2x the requested size; cudaHostAlloc pins exactly nbytes and is freed
+    # with the table. Same call and flags as torch's (cudaHostAllocDefault).
+    from sglang.srt.distributed.device_communicators.cuda_wrapper import (
+        CudaRTLibrary,
+    )
+    from sglang.srt.mem_cache.pool_host.common import alloc_owned_host_tensor
+
+    cudart = CudaRTLibrary()
+    return alloc_owned_host_tensor(
+        dims=shape,
+        dtype=dtype,
+        alloc=lambda nbytes: cudart.cudaHostAlloc(nbytes).value,
+        free=lambda ptr: cudart.cudaFreeHost(ctypes.c_void_p(ptr)),
+    )
 
 
 def _libc() -> Optional[ctypes.CDLL]:

@@ -1,5 +1,4 @@
 import argparse
-import random
 from dataclasses import dataclass
 from typing import List, Tuple
 
@@ -111,7 +110,6 @@ def bench_deepgemm(
     # run
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
-    latencies: list[float] = []
     start_event.record()
     for _ in range(num_run):
         run_deepgemm()
@@ -243,21 +241,9 @@ def bench_cutlass(
     return avg, expert_offsets[-1]
 
 
-def bench_sglang_triton(
-    expected_m_per_group: int,
-    n: int,
-    k: int,
-    num_groups: int,
-    num_warmup: int,
-    num_run: int,
-) -> Tuple[float, int]:
-    pass
-
-
 benchmark_kernels = {
     "deepgemm": bench_deepgemm,
     "cutlass": bench_cutlass,
-    # "triton": bench_sglang_triton,
 }
 
 

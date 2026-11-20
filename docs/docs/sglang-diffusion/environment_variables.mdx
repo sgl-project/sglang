@@ -56,7 +56,12 @@ description: "Configure SGLang diffusion behavior with environment variables."
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DIFFUSION_IPC_A2A</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>true</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Enable CUDA-IPC all-to-all for eligible same-host, peer-accessible TP1 + two-rank Ulysses groups. Unsupported topology falls back to NCCL; set <code>0</code> to force NCCL.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Enable the dedicated CUDA-IPC path for eligible same-host, peer-accessible TP1 + two-rank Ulysses groups. Set <code>0</code> to disable this path.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DIFFUSION_IPC_A2A_MULTI</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>unset (automatic)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Select the copy engine for the plain Ulysses all-to-all. See <a href="/docs/sglang-diffusion/parallelism#the-ulysses-transport">The Ulysses transport</a> for payload thresholds and overrides. Does not disable pipelined attention.</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DIFFUSION_IPC_A2A_TIMEOUT_MS</code></td>
@@ -170,7 +175,7 @@ description: "Configure SGLang diffusion behavior with environment variables."
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>not set</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Optional FlashInfer FP4 GEMM backend override for diffusion NVFP4. When unset, SGLang defaults to <code>flashinfer_trtllm</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Optional FlashInfer FP4 GEMM backend override for diffusion NVFP4. When unset, SGLang uses <code>flashinfer_trtllm</code> (<code>auto</code> on SM120 GPUs).</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DIFFUSION_ENABLE_W8A8_FP8_GEMM</code></td>

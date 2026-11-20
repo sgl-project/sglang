@@ -4,7 +4,6 @@ from typing import List, Optional, Sequence, Union
 
 import torch
 
-from sglang.kernels.ops.memory.adler32 import adler32_strided_checksum
 from sglang.srt.constants import is_health_check_request
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
@@ -43,6 +42,11 @@ def page_indices_for_request(
     kv_indices = scheduler.req_to_token_pool.req_to_token[
         req.kv.req_pool_idx, start_idx:end_idx
     ]
+    # req_to_token contains virtual IDs with unified memory. Digest the same
+    # physical pages as the transfer, including after arena compaction.
+    kv_indices = scheduler.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
+        kv_indices
+    )
     return _to_page_indices_gpu(kv_indices, page_size)
 
 
@@ -93,10 +97,15 @@ def _state_indices(
     router = pool.layer_router
     # A pool wrapping one token KV view keeps its other layers' state per request.
     if router.wrapped_view() is not None:
+        state_ids = scheduler.token_to_kv_pool_allocator.state_ids(
+            scheduler.req_to_token_pool.state_sub_pool
+        )
         return (
-            scheduler.req_to_token_pool.req_index_to_mamba_index_mapping[
-                req.kv.req_pool_idx
-            ]
+            state_ids.ids(
+                scheduler.req_to_token_pool.req_index_to_mamba_index_mapping[
+                    req.kv.req_pool_idx
+                ]
+            )
             .to(torch.int64)
             .contiguous()
             .reshape(-1)
@@ -174,7 +183,10 @@ class KvChecksumComputer:
     ) -> int:
         """``state_indices_gpu`` is one tensor for every state buffer, or one
         per state entry (`state_indices_for_request`)."""
-        assert kv_page_indices_gpu.is_cuda and kv_page_indices_gpu.is_contiguous()
+        expected_device = kv_page_indices_gpu.device.type
+        assert (
+            expected_device in ("cuda", "npu") and kv_page_indices_gpu.is_contiguous()
+        )
         all_ptrs = list(self._kv_data_ptrs)
         all_lens = list(self._kv_item_lens)
         all_indices: List[torch.Tensor] = [kv_page_indices_gpu] * len(
@@ -188,8 +200,15 @@ class KvChecksumComputer:
                 per_entry = list(state_indices_gpu)
                 assert len(per_entry) == len(self._state_entry_sizes)
             for indices, size in zip(per_entry, self._state_entry_sizes):
-                assert indices.is_cuda and indices.is_contiguous()
+                assert (
+                    indices.device.type == expected_device and indices.is_contiguous()
+                )
                 all_indices += [indices] * size
             all_ptrs += self._state_data_ptrs
             all_lens += self._state_item_lens
+        if expected_device == "npu":
+            from sgl_kernel_npu.operators.mem_cache import adler32_strided_checksum
+        else:
+            from sglang.kernels.ops.memory.adler32 import adler32_strided_checksum
+
         return adler32_strided_checksum(all_ptrs, all_lens, all_indices)

@@ -10,7 +10,7 @@ from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=90, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=90, suite="base-b-test-1-gpu-small-amd-mi35x")
 
 # (N, K) of bf16 linear layers: dense and MoE projections, a router (N = 32), and
 # K = 2880, which is not a multiple of the segment size.
@@ -66,6 +66,8 @@ class TestSegmentedMatmul(CustomTestCase):
         launches = [
             (32, 64, 4, 2, True),
             (64, 64, 4, 2, True),
+            (32, 128, 4, 3, True),
+            (64, 128, 8, 3, True),
             (128, 128, 8, 3, True),
             (32, 64, 4, 1, False),
             (128, 128, 8, 1, False),

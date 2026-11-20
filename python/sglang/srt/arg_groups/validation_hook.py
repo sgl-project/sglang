@@ -13,7 +13,12 @@ from sglang.srt.arg_groups.arg_utils import (
     _field_to_cli_name,
     record_fields,
 )
-from sglang.srt.arg_groups.choices import BUILT_IN_SAMPLING_BACKENDS
+from sglang.srt.arg_groups.choices import (
+    BUILT_IN_SAMPLING_BACKENDS,
+    REMOVED_CHOICES,
+    WATERMARK_ALGORITHM_CHOICES,
+    removed_choice_message,
+)
 from sglang.srt.arg_groups.model_override_base import resolved_view, resolving_view
 from sglang.srt.arg_groups.overrides import (
     _hisparse_validation,
@@ -24,12 +29,15 @@ from sglang.srt.configs.unlimited_ocr_v2 import UocrDocumentConfig
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     parse_ib_device_config,
 )
-from sglang.srt.environ import envs
-from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform, num_dp_ranks_of
-from sglang.srt.sampling.watermarking.config import (
-    MAX_WATERMARK_CONTEXT_WINDOW,
-    parse_watermark_key,
+from sglang.srt.environ import REMOVED_ENVS, envs
+from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.runtime_context import (
+    attn_dp_enabled_of,
+    describe_kv_events_publisher,
+    get_platform,
+    num_dp_ranks_of,
 )
+from sglang.srt.sampling.watermarking.config import ALGORITHM_CONFIG_FIELDS
 from sglang.srt.utils.runai_utils import is_runai_obj_uri
 
 logger = logging.getLogger(__name__)
@@ -39,6 +47,13 @@ def check_watermark_server_args(server_args: Any) -> None:
     cfg = resolving_view(server_args)
     if cfg.watermark_config is not None and not cfg.enable_watermark:
         raise ValueError("--watermark-config requires --enable-watermark")
+    # Checked even with watermarking off: every request resolves its watermark
+    # policy through the configured algorithm.
+    if cfg.watermark_algorithm not in WATERMARK_ALGORITHM_CHOICES:
+        raise ValueError(
+            f"unknown --watermark-algorithm {cfg.watermark_algorithm!r}; "
+            f"choose from {WATERMARK_ALGORITHM_CHOICES}"
+        )
 
     if not cfg.enable_watermark:
         return
@@ -46,34 +61,6 @@ def check_watermark_server_args(server_args: Any) -> None:
     if cfg.device != "cuda":
         raise ValueError(
             f"--enable-watermark requires --device cuda, got {cfg.device!r}"
-        )
-    if cfg.watermark_key is not None:
-        parse_watermark_key(cfg.watermark_key)
-    if cfg.watermark_key_b is not None:
-        parse_watermark_key(cfg.watermark_key_b)
-    if (
-        isinstance(cfg.watermark_context_window, bool)
-        or not isinstance(cfg.watermark_context_window, int)
-        or not 1 <= cfg.watermark_context_window <= MAX_WATERMARK_CONTEXT_WINDOW
-    ):
-        raise ValueError("watermark context_window must be an integer from 1 to 64")
-    if cfg.watermark_key_b is not None and cfg.watermark_key is None:
-        raise ValueError("watermark key_b requires a server key")
-    if not 0 < cfg.watermark_mixing_probability < 1:
-        raise ValueError(
-            "watermark mixing_probability must be strictly between 0 and 1"
-        )
-    if cfg.watermark_key_b is None and cfg.watermark_mixing_probability != 0.5:
-        raise ValueError("watermark mixing_probability requires key_b")
-    if not 0 < cfg.watermark_max_probability <= 1:
-        raise ValueError(
-            "watermark max_probability must be greater than 0 and at most 1"
-        )
-    if (
-        cfg.watermark_default_enabled or cfg.watermark_enforce_all
-    ) and cfg.watermark_key is None:
-        raise ValueError(
-            "watermark default_enabled and enforce_all require a server key"
         )
     if cfg.enable_custom_logit_processor:
         raise ValueError(
@@ -101,13 +88,28 @@ def check_watermark_server_args(server_args: Any) -> None:
             "--enable-watermark is not supported with pipeline-parallel "
             "speculative decoding"
         )
-    if cfg.speculative_use_rejection_sampling:
-        raise ValueError(
-            "--enable-watermark is incompatible with "
-            "--speculative-use-rejection-sampling"
-        )
     if envs.SGLANG_RUST_SERVER.get():
         raise ValueError("--enable-watermark is not supported with SGLANG_RUST_SERVER")
+    # Another algorithm's fields, set directly as server arguments; the config
+    # loader refuses them in the file.
+    allowed = ALGORITHM_CONFIG_FIELDS[cfg.watermark_algorithm]
+    others = sorted(
+        f"watermark_{name}"
+        for name in set().union(*ALGORITHM_CONFIG_FIELDS.values()) - allowed
+    )
+    fields = {field.name: field for field in record_fields(type(server_args))}
+    unread = [
+        name for name in others if getattr(cfg, name) != _field_default(fields[name])
+    ]
+    if unread:
+        raise ValueError(
+            f"server arguments {unread} are not supported with "
+            f"--watermark-algorithm {cfg.watermark_algorithm}"
+        )
+    # lazy: the algorithm's adapter imports torch and its kernels.
+    from sglang.srt.sampling.watermarking.runtime import check_watermark_algorithm_args
+
+    check_watermark_algorithm_args(cfg)
 
 
 # Server arguments Rust-server mode (SGLANG_RUST_SERVER=1) does not honor, or
@@ -125,7 +127,6 @@ RUST_SERVER_UNSUPPORTED_ARGS = (
     # The Rust media fetcher caps a download at this field's default, 64 MiB.
     "media_url_max_file_size_mb",
     "enable_trace",
-    "warmups",
     "completion_template",
     "hf_chat_template_name",
     "enable_custom_logit_processor",
@@ -134,11 +135,7 @@ RUST_SERVER_UNSUPPORTED_ARGS = (
     "lora_paths",
     "tokenizer_mode",
     "tokenizer_backend",
-    # Python warns on long GCs only when this is positive.
-    "gc_warning_threshold_secs",
     "tokenizer_metrics_allowed_custom_labels",
-    # The Rust listener speaks HTTP/1 only.
-    "enable_http2",
     # The Rust multimodal pipelines keep no preprocessing-artifact cache, and
     # Python's changes the pad values of the items it serves. A model package
     # whose Rust server caches honors it (`rust_server_unsupported_args`).
@@ -162,7 +159,6 @@ def rust_server_unsupported_args(
 
     An argument counts as set when it differs from its default; where the
     default is off (``None``, ``False`` or empty), any falsy value is off too.
-    A threshold Python disables when not positive is set only when positive.
     """
     cfg = resolving_view(server_args)
     defaults = {
@@ -173,9 +169,7 @@ def rust_server_unsupported_args(
         if name in honored:
             continue
         value, default = getattr(cfg, name), defaults[name]
-        if name == "gc_warning_threshold_secs":
-            is_set = value > 0
-        elif default is None or default is False or default == []:
+        if default is None or default is False or default == []:
             is_set = bool(value)
         else:
             is_set = value != default
@@ -228,12 +222,14 @@ def check_pipeline_parallel_compat(cfg: Any) -> None:
     assert cfg.disable_overlap_schedule, (
         "Pipeline parallelism is not compatible with overlap schedule"
     )
-    if cfg.speculative_algorithm == "DSPARK":
+    if cfg.speculative_algorithm in ("DSPARK", "DFLASH"):
         assert cfg.disaggregation_mode == "prefill", (
-            "Pipeline parallel DSPARK requires disaggregation-mode=prefill"
+            f"Pipeline parallel {cfg.speculative_algorithm} requires "
+            "disaggregation-mode=prefill"
         )
         assert not envs.SGLANG_ENABLE_PP_SPEC.get(), (
-            "SGLANG_ENABLE_PP_SPEC does not support DSPARK PD prefill"
+            f"SGLANG_ENABLE_PP_SPEC does not support {cfg.speculative_algorithm} "
+            "PD prefill"
         )
     elif cfg.speculative_algorithm is not None:
         assert (
@@ -303,6 +299,30 @@ def check_server_args(server_args: Any):
         f"Got: {cfg.pp_max_micro_batch_size}"
     )
 
+    if cfg.device == "npu":
+        from sglang.srt.hardware_backend.npu.compile_backend import (
+            validate_npugraph_ex_config,
+        )
+
+        # Local import: server_args imports this module at load time.
+        from sglang.srt.server_args import compute_world_size
+
+        # cuda_graph_config stays None until handle_cuda_graph_config runs, which
+        # the resolution pipeline skips for a "none"/"dummy" model path.
+        graph_cfg = cfg.cuda_graph_config
+
+        validate_npugraph_ex_config(
+            enable_compile=cfg.enable_torch_compile,
+            graph_enabled=(
+                graph_cfg is not None and graph_cfg.decode.backend != Backend.DISABLED
+            ),
+            world_size=compute_world_size(
+                dp_size=cfg.dp_size,
+                tp_size=cfg.tp_size,
+                pp_size=cfg.pp_size,
+            ),
+        )
+
     assert not (cfg.disable_cuda_graph_padding and cfg.enable_torch_compile), (
         "--disable-cuda-graph-padding is incompatible with --enable-torch-compile. "
         "With padding disabled, every distinct batch size gets its own torch.compile + "
@@ -333,6 +353,11 @@ def check_server_args(server_args: Any):
             "--port listener, so the other replicas' listeners advertise "
             "registries that never become ready. Launch one prefill server per "
             "replica, or unset SGLANG_RUST_SERVER."
+        )
+
+    if cfg.disable_multimodal and cfg.enable_multimodal:
+        raise ValueError(
+            "--disable-multimodal cannot be combined with --enable-multimodal"
         )
 
     assert cfg.base_gpu_id >= 0, "base_gpu_id must be non-negative"
@@ -387,6 +412,14 @@ def check_server_args(server_args: Any):
     validate_buckets_rule("--generation-tokens-buckets", cfg.generation_tokens_buckets)
 
     # Check scheduling policy
+    # A PP stage whose transfer poll lags releases requests later, so its gamma diverges.
+    assert not (
+        cfg.enable_uniboost_gamma_ada
+        and cfg.pp_size > 1
+        and cfg.disaggregation_mode == "prefill"
+    ), (
+        "--enable-uniboost-gamma-ada is not supported with --pp-size > 1 on a PD prefill server"
+    )
     if cfg.enable_priority_scheduling:
         assert cfg.schedule_policy in [
             "fcfs",
@@ -482,10 +515,11 @@ def check_server_args(server_args: Any):
         raise ValueError("Communications quantization is only supported for NPU device")
 
     validate_device_sampling_backend(cfg.sampling_backend, cfg.device)
+    validate_device_lora_backend(cfg.lora_backend, cfg.device)
 
     # grpc_port is None for HTTP-only launches, so the == comparison is
     # already False there; no explicit None check needed.
-    if not (cfg.smg_grpc_mode or cfg.grpc_mode) and cfg.grpc_port == cfg.port:
+    if cfg.grpc_port == cfg.port:
         raise ValueError(
             f"--grpc-port ({cfg.grpc_port}) must differ from --port ({cfg.port})"
         )
@@ -499,6 +533,8 @@ def check_server_args(server_args: Any):
             raise ValueError(
                 "When setting gc_threshold, it must contain 1 to 3 integers."
             )
+    if cfg.gc_freeze_on_idle_secs < 0:
+        raise ValueError("--gc-freeze-on-idle-secs must be >= 0.")
 
     if cfg.kv_canary_sweep_interval > 0 and cfg.kv_canary == "none":
         raise ValueError(
@@ -508,6 +544,7 @@ def check_server_args(server_args: Any):
     check_watermark_server_args(server_args)
 
     check_load_publish_args(server_args)
+    warn_multi_node_kv_events(server_args)
 
 
 def validate_buckets_rule(arg_name: str, buckets_rule: List[str]):
@@ -603,6 +640,57 @@ def check_load_publish_args(server_args: Any):
         raise ValueError(reason)
 
 
+def warn_multi_node_kv_events(server_args: Any) -> None:
+    """Warn when /server_info's kv_events block cannot reach every
+    publishing rank: it advertises one host and one port base, while rank
+    ``r`` binds ``base + r`` on the node it runs on. Not an error, since
+    serving is unaffected; a subscriber just misses the remote ranks."""
+    descriptor = describe_kv_events_publisher(server_args)
+    if descriptor is None or descriptor["dp_size"] < 2:
+        return
+    cfg = resolving_view(server_args)
+    # Publishers are pp_rank 0 schedulers. PP stages take whole nodes first
+    # (`_calculate_rank_ranges` in engine.py), so pp_rank 0's TP group, and
+    # its attention-DP publishers with it, spans nnodes // pp_size nodes.
+    # Only the head node serves /server_info, so only its launcher warns.
+    if cfg.node_rank != 0 or cfg.nnodes // cfg.pp_size < 2:
+        return
+    from sglang.srt.disaggregation.kv_events import (
+        KVEventsConfig,
+        parse_bindable_tcp,
+    )
+
+    kv_config = KVEventsConfig.from_cli(cfg.kv_events_config)
+    # The publisher's own default: bind a wildcard host, connect to a
+    # concrete one. A connecting rank dials that host from any node.
+    kv_binds = kv_config.bind
+    if kv_binds is None:
+        kv_binds = parse_bindable_tcp(kv_config.endpoint) is not None
+    published = [
+        name
+        for name, binds in (
+            ("KV events", kv_binds),
+            # The load range always binds a wildcard host.
+            (
+                "load reports (--load-publish-endpoint)",
+                "load_endpoint_port_base" in descriptor,
+            ),
+        )
+        if binds
+    ]
+    if not published:
+        return
+    logger.warning(
+        f"{' and '.join(published)} are published per DP rank, and the "
+        f"{descriptor['dp_size']} publishing ranks span several of the "
+        f"{cfg.nnodes} nodes, but /server_info advertises one host and one "
+        f"port base for all of them. Only the ranks on the head node are "
+        f"reachable at the advertised address, so a router subscribing "
+        f"through /server_info (e.g. sgl-router's cache_aware policy) sees "
+        f"only part of the KV cache. Serving is unaffected."
+    )
+
+
 def validate_device_sampling_backend(
     sampling_backend: Optional[str], device: str
 ) -> None:
@@ -612,6 +700,15 @@ def validate_device_sampling_backend(
     if sampling_backend == "intel_xpu" and device != "xpu":
         raise ValueError(
             f"--sampling-backend intel_xpu requires --device xpu, got --device {device}"
+        )
+
+
+def validate_device_lora_backend(lora_backend: str, device: str) -> None:
+    # The intel_xpu LoRA kernels ship only in sgl-kernel-xpu; on another device the
+    # backend import fails late, inside LoRAManager init.
+    if lora_backend == "intel_xpu" and device != "xpu":
+        raise ValueError(
+            f"--lora-backend intel_xpu requires --device xpu, got --device {device}"
         )
 
 
@@ -837,14 +934,30 @@ def default_unset_prefill_decode_interval(server_args: Any):
         )
 
 
+def validate_removed_options(server_args: Any):
+    """Stop on a removed choice value or environment variable, naming what to use.
+
+    The CLI rejects a removed value while parsing; this covers the Python API.
+    """
+    cfg = resolving_view(server_args)
+    for field in REMOVED_CHOICES:
+        message = removed_choice_message(field, getattr(cfg, field))
+        if message is not None:
+            raise ValueError(f"--{field.replace('_', '-')}: {message}.")
+    for name in os.environ:
+        if name in REMOVED_ENVS:
+            raise ValueError(
+                f"Environment variable {name} was removed in SGLang 1.0; "
+                f"{REMOVED_ENVS[name]}."
+            )
+        if name.startswith("SGL_") and hasattr(envs, "SGLANG_" + name[4:]):
+            raise ValueError(
+                f"Environment variable {name} was removed in SGLang 1.0; use "
+                f"SGLANG_{name[4:]}."
+            )
+
+
 def validate_sampling_mask_max_tokens(server_args: Any):
-    if envs.SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS.is_set():
-        raise ValueError(
-            "SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS is no longer supported. "
-            "Unset it. To enable sampling masks for disaggregated serving, set "
-            "SGLANG_ENABLE_DISAGG_SAMPLING_MASK=1 and use the same positive "
-            "--sampling-mask-max-tokens value on both prefill and decode servers."
-        )
     cfg = resolving_view(server_args)
     if cfg.sampling_mask_max_tokens <= 0:
         raise ValueError(

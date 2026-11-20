@@ -6,7 +6,7 @@ for attention projections (q_a_proj, q_b_proj, kv_a_proj_with_mqa, kv_b_proj,
 o_proj). The per-channel fp8 detection fix ensures the correct kernel path is
 selected for each layer type.
 
-Registry: nightly-amd-4-gpu-mi35x-kimi-k27-code-mxfp4-aiter-mla suite
+Registry: nightly-test-4-gpu-amd-mi35x-kimi-k27-code-mxfp4-aiter-mla suite
 """
 
 import os
@@ -26,7 +26,7 @@ from sglang.test.test_utils import (
 
 register_amd_ci(
     est_time=7200,
-    suite="nightly-amd-4-gpu-mi35x-kimi-k27-code-mxfp4-aiter-mla",
+    suite="nightly-test-4-gpu-amd-mi35x-kimi-k27-code-mxfp4-aiter-mla",
     nightly=True,
     disabled="Older model generation; AMD nightly keeps the latest two per family",
 )

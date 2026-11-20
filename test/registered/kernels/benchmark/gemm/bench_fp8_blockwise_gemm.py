@@ -18,7 +18,7 @@ register_cuda_ci(
 )
 register_amd_ci(
     est_time=5,
-    stage="jit-kernel-benchmark",
+    stage="base-a-jit-kernel-benchmark",
     runner_config="amd",
     disabled="requires SM120; self-skips on ROCm",
 )

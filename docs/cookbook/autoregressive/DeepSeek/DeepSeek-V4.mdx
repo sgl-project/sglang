@@ -138,7 +138,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 Agentic workloads, such as coding agents and other multi-turn, tool-using assistants, send long prompts whose prefixes grow and repeat from turn to turn. Serving them well depends on reusing the KV cache across turns, offloading it beyond GPU memory, and keeping each session on the workers that already hold its prefix. This section gives complete launch commands for such deployments, each benchmarked in [SemiAnalysis InferenceX](https://inferencex.semianalysis.com/) and linked to the run that measured it. Pick a hardware platform, checkpoint, deployment shape, concurrency, KV cache offloading mechanism and router to get every process of the deployment as a raw command, one tab per process in launch order.
 
-- **Router.** Each configuration was submitted behind one front door: Dynamo (`dynamo.frontend` with `dynamo.sglang` workers) or SGLang (`sglang.launch_server`, behind `sglang_router` when there are several workers or DP-attention ranks).
+- **Router.** Each configuration was submitted behind one front door: Dynamo (`dynamo.frontend` with `dynamo.sglang` workers) or SGLang (`sglang.launch_server`, behind a router when there are several workers or DP-attention ranks).
 - **KV offload.** Choose among these KV cache offloading mechanisms: none (GPU KV only), HiCache (host DRAM), or a Mooncake store attached through the external linker. The Mooncake option needs an image whose SGLang build includes `--enable-unified-cache-external-linker`.
 - **Container image.** Run the commands inside the image listed for each configuration. Several are SGLang nightly images, so flag names follow that image.
 
@@ -891,7 +891,7 @@ python3 -m sglang.launch_server \
   --watchdog-timeout 3600
 ```
 
-`--chunked-prefill-size` is a global budget divided by `--attn-dp-size`, so 131072 keeps 16384 tokens per rank. `--enable-dp-lm-head` is required for DSpark under DP attention. Front the DP ranks with `sglang_router --policy cache_aware`, so a multi-turn session lands on the rank already holding its prefix; above concurrency 160 add `--balance-abs-threshold 32`. Both apply to the MegaMoE command below as well.
+`--chunked-prefill-size` is a global budget divided by `--attn-dp-size`, so 131072 keeps 16384 tokens per rank. `--enable-dp-lm-head` is required for DSpark under DP attention. Front the DP ranks with `sgl-router --policy cache_aware --dp-aware`, so a multi-turn session lands on the rank already holding its prefix. The router learns prefixes only from the server's KV events, so add `--kv-events-config '{"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:5557"}' --load-publish-endpoint auto` to the server; each DP rank publishes on its own port from 5557. Both apply to the MegaMoE command below as well.
 
 **DP8 EP8 MegaMoE, concurrency 128–384:**
 ```bash Command
@@ -974,7 +974,7 @@ docker run \
     python3 -m sglang.launch_server <role args below>
 ```
 
-Use this image for the **MI355X Pro / Pro Official FP4 multi-node** workers and router, including the additional concurrency points below. The Deployment and Playground Docker outputs select it for all three PD roles. It supports the documented `SGLANG_DSV4_DENSE_MXSCALE` and `SGLANG_ROUTER_P2C_LOAD_METRIC` settings. `--network host` replaces the single-node `-p` mapping because the two roles run on different hosts.
+Use this image for the **MI355X Pro / Pro Official FP4 multi-node** workers and router, including the additional concurrency points below. The Deployment and Playground Docker outputs select it for all three PD roles. It supports the documented `SGLANG_DSV4_DENSE_MXSCALE` setting. `--network host` replaces the single-node `-p` mapping because the two roles run on different hosts.
 
 For the **MI355X Pro / Pro Official FP4** presets, **High-Throughput** sets `MORI_IO_QP_MAX_SEND_WR=32767` and `MORI_IO_QP_MAX_CQE=32768` on both MORI roles. Low-Latency and Balanced use the transport's default queue sizes. The send-queue backoff timeout uses MORI's default of 5 seconds.
 
@@ -1008,7 +1008,7 @@ The decode role's `--cuda-graph-bs-decode` then has to cover `N*2 / attn_dp_size
 
 Two things then differ between the two roles regardless of strategy:
 
-- **CUDA graphs.** Prefill runs `--disable-cuda-graph`, because the FP4 indexer's prefill path is not captured. Decode captures `--cuda-graph-bs-decode`.
+- **CUDA graphs.** Prefill runs `--disable-decode-cuda-graph --disable-prefill-cuda-graph`, because the FP4 indexer's prefill path is not captured. Decode captures `--cuda-graph-bs-decode`.
 - **Speculative decoding** is the same on both. Keep `--speculative-dspark-block-size` equal on the two roles. The original Flash and Pro checkpoints have no DSpark head and use their MTP head instead: `--speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4`.
 
 **MoE parallelism differs too, on the high-throughput pair.** Each role uses what suits its batch size. Prefill runs **EP8**, with the experts split across the 8 ranks: it processes a 65536-token chunk, so the split pays for the all-to-all it costs. Decode runs **TP8**, with the experts replicated on every rank, because a few tokens per request per step would not pay for it.
@@ -1032,8 +1032,7 @@ python3 -m sglang.launch_server \
   --disaggregation-bootstrap-port 7200 \
   --disaggregation-transfer-backend mori \
   --disaggregation-ib-device rdma3,rdma0,rdma2,rdma1,rdma7,rdma4,rdma6,rdma5 \
-  --tp-size 8 --dp-size 8 --ep-size 8 \
-  --enable-dp-attention \
+  --tp-size 8 --attn-dp-size 8 --ep-size 8 \
   --enable-dp-attention-local-control-broadcast \
   --enable-dp-lm-head \
   --moe-a2a-backend megamoe \
@@ -1048,7 +1047,7 @@ python3 -m sglang.launch_server \
   --chunked-prefill-size 65536 \
   --max-running-requests 512 \
   --context-length 1048576 \
-  --disable-cuda-graph \
+  --disable-decode-cuda-graph --disable-prefill-cuda-graph \
   --speculative-algorithm DSPARK \
   --speculative-dspark-block-size 3 \
   --speculative-num-steps 1 \
@@ -1084,8 +1083,7 @@ python3 -m sglang.launch_server \
   --disaggregation-mode decode \
   --disaggregation-transfer-backend mori \
   --disaggregation-ib-device rdma3,rdma0,rdma2,rdma1,rdma7,rdma4,rdma6,rdma5 \
-  --tp-size 8 --dp-size 8 \
-  --enable-dp-attention \
+  --tp-size 8 --attn-dp-size 8 \
   --enable-dp-attention-local-control-broadcast \
   --enable-dp-lm-head \
   --enforce-shared-experts-fusion \
@@ -1116,7 +1114,7 @@ Decode sets neither `--ep-size` nor `--moe-a2a-backend`. `--moe-a2a-backend` nam
 
 The shared-expert, `SGLANG_DP_USE_GATHERV`, and `SGLANG_DP_USE_REDUCE_SCATTER` settings control the `all_gatherv` / `reduce_scatterv` path. Shared-expert locality and gatherv default to off; reduce-scatter defaults to on for ROCm. The commands only set the values that differ from those defaults. That is what decode's TP MoE uses and what prefill's all-to-all replaces, so leaving them on under EP8 would run both over the same tokens.
 
-The rest of the difference is the prefill-only set already described above: `--chunked-prefill-size`, `--disable-cuda-graph`, and the linker flags with `--optimistic-prefill-attempts` / `--enable-cache-report`. Decode replaces the first two with `--cuda-graph-bs-decode`.
+The rest of the difference is the prefill-only set already described above: `--chunked-prefill-size`, `--disable-decode-cuda-graph --disable-prefill-cuda-graph`, and the linker flags with `--optimistic-prefill-attempts` / `--enable-cache-report`. Decode replaces the first two with `--cuda-graph-bs-decode`.
 
 On the prefill env:
 
@@ -1132,30 +1130,21 @@ These recipes leave `MORI_SHMEM_MODE` unset and use MORI's default `STATIC_HEAP`
 
 #### Router configuration
 
-Run the two roles on separate nodes with the same transport and IB device, then front them with the router the card prints. On MI355X it is cache-aware: `--policy consistent_hashing` keeps a conversation on the prefill worker that already holds its prefix, and `--balance-abs-threshold 2` / `--balance-rel-threshold 1.1` stop that affinity from starving the peer. The TP-only presets keep `--decode-policy round_robin`. Pro Official's DP-attention presets (concurrency 192–512, including the High-Throughput preset at 256) instead use:
+Run the two roles on separate nodes with the same transport and IB device, then front them with the router the card prints. On MI355X it is cache-aware: `--policy cache_aware --dp-aware` keeps a conversation on the prefill DP rank that already holds its prefix, and decode keeps the default `power_of_two`. The router learns prefixes only from the prefill worker's KV events, so the MI355X prefill role publishes them, with its load reports, through `--kv-events-config '{"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:5557"}' --load-publish-endpoint auto`; the router finds both through the worker's `/server_info`, one port per DP rank. `cache_aware` also needs a tokenizer, so this router runs without `--no-tokenizer`. For Pro Official:
 
 ```bash Router settings
-SGLANG_ROUTER_P2C_LOAD_METRIC=least_requests \
-python3 -m sglang_router.launch_router \
-  --pd-disaggregation \
-  --prefill http://<prefill-host>:30000 \
-  --decode http://<decode-host>:30100 \
+sgl-router \
+  --model-id deepseek-ai/DeepSeek-V4-Pro-0813 \
+  --worker-urls http://<prefill-host>:30000 http://<decode-host>:30100 \
   --host 0.0.0.0 --port 8000 \
-  --policy consistent_hashing --dp-aware \
-  --decode-policy power_of_two \
-  --worker-startup-check-interval 1 \
-  --cache-threshold 0.3 \
-  --balance-abs-threshold 2 --balance-rel-threshold 1.1 \
-  --disable-circuit-breaker --health-failure-threshold 100 \
-  --health-check-timeout-secs 600 --health-check-interval-secs 30
+  --policy cache_aware --dp-aware \
+  --disable-circuit-breaker
 ```
 
-Power-of-two compares in-flight request counts across decode DP ranks. The one-second load polling interval replaces the 30-second default. Check for `Power-of-two load metric: LeastRequests` in the router startup log.
-
-The multi-node router presets retain the default request timeout. The standalone high-throughput Playground preset uses `--request-timeout-secs 14400`. At high concurrency the prefill role queues many requests. When the default 1800 s passes the router aborts the request, and an abort that lands while MORI is writing KV cache over RDMA leaves the transfer neither finished nor failed: that prefill worker can no longer send KV cache to decode, and you have to restart it.
+The multi-node router presets keep sgl-router's default timeouts: 300 s to the first response bytes and 600 s per request. The standalone high-throughput Playground preset sets `--request-timeout-secs`, `--stream-idle-timeout-secs` and `--stale-request-timeout-secs` to 14400. At high concurrency the prefill role queues many requests. When a timeout passes the router aborts the request, and an abort that lands while MORI is writing KV cache over RDMA leaves the transfer neither finished nor failed: that prefill worker can no longer send KV cache to decode, and you have to restart it.
 
 <Warning>
-`--request-timeout-secs` is the timeout of the HTTP request from the router to the worker, not a limit on queue time. At 14400 the router also waits four hours before giving up on a worker that has stopped responding. That is acceptable where prefill queues are long, which is why the lower-concurrency recipes keep the default. Lower it again if you lower the concurrency.
+These timeouts bound the whole request from the router to the worker, not only its time in the queue. At 14400 the router also waits four hours before giving up on a worker that has stopped responding. That is acceptable where prefill queues are long, which is why the lower-concurrency recipes keep the defaults. Lower them again if you lower the concurrency.
 </Warning>
 
 #### Additional Pro Official concurrency points
@@ -1168,7 +1157,7 @@ For c1, use `lmsysorg/sglang-rocm:v0.5.22-rocm10-mi35x-20261028` for the serving
 
 **c32:** start from Low-Latency, keep TP4 → TP8 and block size 6, set both admission limits to 64, and capture decode graph sizes 1–64. Both roles use FP8 KV and mxscale, as at c16 and c48.
 
-**c192 / c384 / c512:** start from High-Throughput. Keep TP8+DP8+EP8 prefill → TP8+DP8 decode, DSpark block size 3 (4 draft tokens), and decode dispatch budget 256. Set both admission limits to 384 / 768 / 1024 and capture decode graph sizes 1–48 / 1–96 / 1–128, respectively. Keep FP8 KV on both roles, mxscale on decode only, and the power-of-two router settings above. At c384 and c512, add `--request-timeout-secs 14400` to the router.
+**c192 / c384 / c512:** start from High-Throughput. Keep TP8+DP8+EP8 prefill → TP8+DP8 decode, DSpark block size 3 (4 draft tokens), and decode dispatch budget 256. Set both admission limits to 384 / 768 / 1024 and capture decode graph sizes 1–48 / 1–96 / 1–128, respectively. Keep FP8 KV on both roles, mxscale on decode only, and the router settings above. At c384 and c512, add the high-throughput preset's three 14400 s timeouts to the router.
 
 **c512 prefill EPLB:** additionally set these environment variables on the prefill worker:
 

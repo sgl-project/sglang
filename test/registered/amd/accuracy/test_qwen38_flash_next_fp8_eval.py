@@ -9,8 +9,8 @@ core model correctness gate does not depend on an unreleased AITER API; with it
 off, the FP8 MoE layers resolve to the Triton runner.
 
 Registries:
-  nightly-amd-2-gpu-mi30x-qwen38-flash-next-fp8 suite
-  nightly-amd-1-gpu-mi35x-qwen38-flash-next-fp8 suite
+  nightly-test-2-gpu-amd-mi30x-qwen38-flash-next-fp8 suite
+  nightly-test-1-gpu-amd-mi35x-qwen38-flash-next-fp8 suite
 """
 
 import base64
@@ -35,12 +35,12 @@ from sglang.test.test_utils import (
 
 register_amd_ci(
     est_time=1800,
-    suite="nightly-amd-2-gpu-mi30x-qwen38-flash-next-fp8",
+    suite="nightly-test-2-gpu-amd-mi30x-qwen38-flash-next-fp8",
     nightly=True,
 )
 register_amd_ci(
     est_time=1800,
-    suite="nightly-amd-1-gpu-mi35x-qwen38-flash-next-fp8",
+    suite="nightly-test-1-gpu-amd-mi35x-qwen38-flash-next-fp8",
     nightly=True,
 )
 

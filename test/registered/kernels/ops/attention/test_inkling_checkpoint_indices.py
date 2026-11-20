@@ -865,6 +865,7 @@ class TestInklingCheckpointIndices(CustomTestCase):
             spec_algorithm=SimpleNamespace(is_standalone=lambda: False),
             device_timer=None,
             canary_manager=None,
+            capture_tail_hooks=[],
             # The KV side is not under test: a static pool's runner_ids binds
             # the captured batch to its own write ids.
             runner_ids=RunnerIds(

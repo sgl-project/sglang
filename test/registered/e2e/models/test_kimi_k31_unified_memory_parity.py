@@ -181,7 +181,7 @@ class TestKimiK31UnifiedMemoryParity(CustomTestCase):
     def test_unified_matches_static(self):
         for name, extra in (
             ("cuda graph", []),
-            ("eager", ["--disable-cuda-graph"]),
+            ("eager", ["--disable-decode-cuda-graph", "--disable-prefill-cuda-graph"]),
         ):
             with self.subTest(mode=name):
                 static = self._run(extra)

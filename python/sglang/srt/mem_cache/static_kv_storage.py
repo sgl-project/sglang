@@ -11,6 +11,7 @@ entries each static pool family registers. All of it goes when those pools do.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 import msgspec
@@ -374,8 +375,9 @@ class StaticKVStorage:
         rows: Optional[torch.Tensor],
         seq_lens: torch.Tensor,
         seq_lens_cpu: torch.Tensor,
-        last_loc: torch.Tensor,
+        last_loc: Optional[torch.Tensor],
         make_room: Callable[[int], Any],
+        req_to_token_write: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         tree_cache: Optional[BasePrefixCache] = None,
         batch: Optional[ScheduleBatch] = None,
     ) -> Optional[torch.Tensor]:
@@ -387,6 +389,8 @@ class StaticKVStorage:
         # returns a DSV4OutCacheLoc bundle; hasattr-gated so others stay unchanged.
         is_dsv4 = rows is not None and hasattr(allocator, "c128_attn_allocator")
         extra_alloc_kwargs = {}
+        if req_to_token_write is not None:
+            extra_alloc_kwargs["req_to_token_write"] = req_to_token_write
         if is_dsv4:
             c128_num_pages = allocator.c128_num_pages_needed(
                 (seq_lens_cpu - 1).clamp(min=0), seq_lens_cpu
@@ -613,6 +617,10 @@ class StaticKVStorage:
     def take_state_slots(self, sub_pool: str, count: int) -> Optional[torch.Tensor]:
         """``count`` free state slots of ``sub_pool``; None when none are free."""
         return self._allocator.state_slots.alloc(count)
+
+    def lease_state_slots(self, sub_pool: str, count: int):
+        """A static pool's take is a free-list slice: nothing to lease."""
+        return nullcontext()
 
     def free_state_slots(self, sub_pool: str, slots: torch.Tensor) -> None:
         self._allocator.state_slots.free(slots)
@@ -960,18 +968,6 @@ def _static_state_entries(
             )
         )
 
-    def append_dsa_tail(pool) -> None:
-        if not pool.kpool_use_compress:
-            return
-        tail_ptrs, tail_lens, tail_item_lens = pool.get_compress_tail_buf_infos()
-        if tail_ptrs:
-            add(
-                StateType.DSA_TAIL,
-                tail_ptrs,
-                tail_lens,
-                tail_item_lens,
-            )
-
     if isinstance(token_to_kv_pool, MHATokenToKVPoolMXFP8):
         add(
             StateType.BLOCK_SCALE,
@@ -1091,13 +1087,27 @@ def _static_state_entries(
             if getattr(token_to_kv_pool, "use_dsa", False):
                 dsa_pool = token_to_kv_pool.full_kv_pool
                 dsa_ptrs, dsa_lens, dsa_item_lens = dsa_pool.get_state_buf_infos()
-                add(
-                    StateType.DSA,
-                    dsa_ptrs,
-                    dsa_lens,
-                    dsa_item_lens,
+                tail_ptrs, tail_lens, tail_item_lens = (
+                    dsa_pool.get_compress_tail_buf_infos()
                 )
-                append_dsa_tail(dsa_pool)
+                # The draft's index cache and tail follow the target's in the
+                # same components, as in the plain DSA branch below.
+                if isinstance(draft_token_to_kv_pool, DSATokenToKVPool):
+                    draft_ptrs, draft_lens, draft_item_lens = (
+                        draft_token_to_kv_pool.get_state_buf_infos()
+                    )
+                    dsa_ptrs = list(dsa_ptrs) + list(draft_ptrs)
+                    dsa_lens = list(dsa_lens) + list(draft_lens)
+                    dsa_item_lens = list(dsa_item_lens) + list(draft_item_lens)
+                    draft_tail_ptrs, draft_tail_lens, draft_tail_item_lens = (
+                        draft_token_to_kv_pool.get_compress_tail_buf_infos()
+                    )
+                    tail_ptrs = list(tail_ptrs) + list(draft_tail_ptrs)
+                    tail_lens = list(tail_lens) + list(draft_tail_lens)
+                    tail_item_lens = list(tail_item_lens) + list(draft_tail_item_lens)
+                add(StateType.DSA, dsa_ptrs, dsa_lens, dsa_item_lens)
+                if tail_ptrs:
+                    add(StateType.DSA_TAIL, tail_ptrs, tail_lens, tail_item_lens)
             if isinstance(token_to_kv_pool, QSATokenToKVPool):
                 qsa_ptrs, qsa_lens, qsa_item_lens = (
                     token_to_kv_pool.get_qsa_pending_state_buf_infos()

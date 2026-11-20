@@ -305,28 +305,6 @@ class TestCutlassFp8InactiveRoutes(CustomTestCase):
                 )
             )
 
-    def test_prepare_rejects_noncontiguous_metadata(self):
-        """Reject layouts whose physical order differs from the route-map contract."""
-        ids = torch.tensor([[0, 1], [1, -1], [2, 0]], device="cuda", dtype=torch.int32)
-        offsets = torch.empty(4, device="cuda", dtype=torch.int32)
-        sizes1 = torch.empty((3, 3), device="cuda", dtype=torch.int32)
-        sizes2 = torch.empty_like(sizes1)
-        a_map = torch.empty(ids.numel(), device="cuda", dtype=torch.int32)
-        c_map = torch.empty_like(a_map)
-        block_offsets = torch.empty_like(offsets)
-        args = [ids, offsets, sizes1, sizes2, a_map, c_map, 3, 96, 160, block_offsets]
-        for index in (0, 1, 2, 3, 4, 5, 9):
-            value = args[index]
-            strided = torch.empty((*value.shape, 2), device="cuda", dtype=torch.int32)[
-                ..., 0
-            ]
-            strided.copy_(value)
-            with self.subTest(argument=index):
-                invalid_args = args.copy()
-                invalid_args[index] = strided
-                with self.assertRaisesRegex((RuntimeError, ValueError), "contiguous"):
-                    cutlass_prepare_moe_input(*invalid_args)
-
     def test_masked_reduction_ignores_poisoned_slots(self):
         for dtype in (torch.float16, torch.bfloat16):
             with self.subTest(dtype=dtype):

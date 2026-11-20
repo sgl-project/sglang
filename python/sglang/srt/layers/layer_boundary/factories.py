@@ -729,7 +729,10 @@ def _resolve_stage(stage, variant, arrival, following=None, *, final_read=None):
         if exit_rows is ExitRows.ATTENTION or (
             following is not None and following.read.reads_after_attn_tp_gather
         ):
-            returned = attention
+            # "Attention rows" means the active variant's attention input:
+            # full attention rows normally, or the local TP row shard while
+            # LayerNorm SP owns the token axis.
+            returned = local if variant is BatchVariant.SEQUENCE_PARALLEL else attention
         elif exit_rows is ExitRows.SLICE:
             # The residual's rows during the FFN: this rank's slice for an FFN
             # on its own rows, else the attention's.
@@ -750,6 +753,13 @@ def _resolve_stage(stage, variant, arrival, following=None, *, final_read=None):
         if variant is BatchVariant.ORDINARY and stage.ordinary_tp_group is not None
         else stage.tp_group
     )
+    if (
+        tp_group is SumGroup.TP
+        and sp
+        and get_parallel().attn_tp_size == get_parallel().tp_size
+    ):
+        # The compute gathers and reduce-scatters over the one TP group.
+        tp_group = SumGroup.ATTN_TP
     if tp_group is SumGroup.TP:
         parallel = get_parallel()
         if parallel.attn_dp_size != 1 or sp or scattered:

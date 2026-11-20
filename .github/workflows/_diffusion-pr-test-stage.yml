@@ -1,14 +1,22 @@
 name: PR Test Stage (Diffusion)
 
-# One diffusion lane: run the `base-b-test-<runner_config>` suite on the runner
-# and with the install that scripts/ci/runner_configs.yml gives runner_config.
+# One diffusion lane: run the `<stage>-test-<runner_config>` suite on the runner
+# and with the install that scripts/ci/runner_configs.yml gives the pair.
 # Called by pr-test-multimodal-gen.yml, which owns the per-lane gating.
 
 on:
   workflow_call:
     inputs:
+      job_display_name:
+        description: 'Diffusion lane name shown in GitHub; independent of the internal suite key.'
+        required: true
+        type: string
+      stage:
+        description: 'Diffusion stage (base-b-diffusion, base-b-diffusion-unit, ...); its kind picks the install. The suite run is <stage>-test-<runner_config>, which also names its artifacts.'
+        required: true
+        type: string
       runner_config:
-        description: 'Key in scripts/ci/runner_configs.yml; the suite run is base-b-test-<runner_config>. Also names the lane in artifact names.'
+        description: 'Key in scripts/ci/runner_configs.yml.'
         required: true
         type: string
       caller_inputs:
@@ -54,7 +62,7 @@ env:
 
 jobs:
   run:
-    name: ${{ inputs.runner_config }} (${{ matrix.part }})
+    name: ${{ inputs.job_display_name }} (${{ matrix.part }})
     runs-on: ${{ fromJson(fromJson(inputs.caller_inputs).runs_on_map)[inputs.runner_config] }}
     timeout-minutes: ${{ inputs.job_timeout_minutes }}
     strategy:
@@ -62,6 +70,8 @@ jobs:
       matrix:
         # One job per plan part; an unpartitioned lane runs as a single part 0.
         part: ${{ fromJson(inputs.partition_plan || '{"partitions":[{"part":0}]}').partitions.*.part }}
+    env:
+      SUITE: ${{ inputs.stage }}-test-${{ inputs.runner_config }}
     steps:
       - name: Record retry deadline
         if: inputs.retry_deadline_seconds > 0
@@ -77,7 +87,7 @@ jobs:
         run: |
           python3 -c 'import yaml' 2>/dev/null ||
             python3 -m pip install --disable-pip-version-check pyyaml
-          python3 scripts/ci/runner_configs.py '${{ inputs.runner_config }}' >> "$GITHUB_OUTPUT"
+          python3 scripts/ci/runner_configs.py '${{ inputs.runner_config }}' '${{ inputs.stage }}' >> "$GITHUB_OUTPUT"
 
       - uses: ./.github/actions/check-pr-test-health
         with:
@@ -117,7 +127,8 @@ jobs:
           HF_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN }}
           HUGGING_FACE_HUB_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN }}
           RUNAI_STREAMER_MEMORY_LIMIT: 0
-          DIFFUSION_CONTINUE_ON_ERROR: ${{ fromJson(inputs.caller_inputs).continue_on_error }}
+          # Finish independent files sharing a shard. The suite returns the first failure.
+          DIFFUSION_CONTINUE_ON_ERROR: ${{ inputs.partition_plan != '' && 'true' || fromJson(inputs.caller_inputs).continue_on_error }}
           # Empty when unpartitioned, so diffusion_suite_bridge.py omits the flags;
           # format() keeps part 0 from reading as false.
           DIFFUSION_PARTITION_ID: ${{ inputs.partition_plan != '' && format('{0}', matrix.part) || '' }}
@@ -127,14 +138,14 @@ jobs:
         run: |
           python3 test/run_suite.py \
             --hw cuda \
-            --suite base-b-test-${{ inputs.runner_config }} \
+            --suite "$SUITE" \
             --timeout-per-file $(( ${{ inputs.run_timeout_minutes }} * 60 ))
 
       - name: Upload execution report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: diffusion-report-${{ inputs.runner_config }}-${{ matrix.part }}-${{ github.run_attempt }}
+          name: diffusion-report-${{ env.SUITE }}-${{ matrix.part }}-${{ github.run_attempt }}
           path: |
             python/sglang/multimodal_gen/test/execution_report_*.json
             python/diffusion-results.json
@@ -145,7 +156,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: diffusion-failures-${{ inputs.runner_config }}-${{ matrix.part }}-${{ github.run_attempt }}
+          name: diffusion-failures-${{ env.SUITE }}-${{ matrix.part }}-${{ github.run_attempt }}
           path: diffusion-failures/
           if-no-files-found: ignore
           retention-days: 7
@@ -153,4 +164,4 @@ jobs:
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()
         with:
-          artifact-suffix: ${{ inputs.runner_config }}-${{ matrix.part }}
+          artifact-suffix: ${{ env.SUITE }}-${{ matrix.part }}

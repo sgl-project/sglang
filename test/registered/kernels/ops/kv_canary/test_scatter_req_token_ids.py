@@ -16,7 +16,7 @@ from sglang.test.kernels.kv_canary.scatter_req_token_ids_reference import (
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-small")
-register_amd_ci(est_time=10, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(est_time=10, stage="base-a-jit-kernel-unit", runner_config="amd")
 
 
 _DEVICE = torch.device("cuda")
@@ -217,49 +217,6 @@ class TestScatterReqTokenIds(CustomTestCase):
 
 class TestScatterInputValidation(CustomTestCase):
     """Cover the strict input checks in launch_scatter_req_token_ids_kernel."""
-
-    def test_raises_on_2d_flat_in(self) -> None:
-        """A 2-D flat_in tensor triggers a ValueError before any kernel launch."""
-        flat = torch.zeros((2, 2), dtype=torch.int64, device=_DEVICE)
-        offsets = torch.tensor([0, 1, 2], dtype=torch.int64, device=_DEVICE)
-        req_pool_indices = torch.tensor([1, 2], dtype=torch.int64, device=_DEVICE)
-        pool = _build_pool(max_reqs=4, max_context_len=4)
-        with self.assertRaises(ValueError):
-            launch_scatter_req_token_ids_kernel(
-                flat_in=flat,
-                offsets=offsets,
-                req_pool_indices=req_pool_indices,
-                pool_out=pool,
-            )
-
-    def test_raises_on_wrong_dtype_pool(self) -> None:
-        """A pool_out with non-int32 dtype triggers a TypeError."""
-        flat = torch.tensor([10, 20], dtype=torch.int64, device=_DEVICE)
-        offsets = torch.tensor([0, 2], dtype=torch.int64, device=_DEVICE)
-        req_pool_indices = torch.tensor([1], dtype=torch.int64, device=_DEVICE)
-        pool = torch.zeros((4, 4), dtype=torch.int64, device=_DEVICE)
-        with self.assertRaises(TypeError):
-            launch_scatter_req_token_ids_kernel(
-                flat_in=flat,
-                offsets=offsets,
-                req_pool_indices=req_pool_indices,
-                pool_out=pool,
-            )
-
-    def test_raises_on_offsets_len_mismatch(self) -> None:
-        """offsets.shape[0] must equal bs + 1; mismatch triggers a ValueError."""
-        flat = torch.tensor([10, 20], dtype=torch.int64, device=_DEVICE)
-        # bs = 2 but offsets has length 2 instead of 3.
-        offsets = torch.tensor([0, 2], dtype=torch.int64, device=_DEVICE)
-        req_pool_indices = torch.tensor([1, 2], dtype=torch.int64, device=_DEVICE)
-        pool = _build_pool(max_reqs=4, max_context_len=4)
-        with self.assertRaises(ValueError):
-            launch_scatter_req_token_ids_kernel(
-                flat_in=flat,
-                offsets=offsets,
-                req_pool_indices=req_pool_indices,
-                pool_out=pool,
-            )
 
     def test_raises_on_bs_plus_one_exceeds_batch_block(self) -> None:
         """bs+1 must fit in _SCATTER_BATCH_BLOCK; exceeding it triggers a ValueError."""

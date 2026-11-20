@@ -23,11 +23,11 @@ unused_qualifications = "warn"
 
 [dependencies]
 # Pin Dynamo versions and commit Cargo.lock so builds are reproducible.
-dynamo-tokenizers = "=3.1.0"
+dynamo-tokenizers = "=4.3.1"
 # Renders the model's chat template (HF Jinja, or Dynamo's built-in encoder for
 # template-less models like DeepSeek-V4) so cache-aware routing hashes the same
 # tokens the engine caches.
-dynamo-renderer = "=7.1.1"
+dynamo-renderer = "=10.4.3"
 # `OAIChatLikeRequest` speaks minijinja values.
 minijinja = "2.24"
 # SGLang chat rendering shared with the Rust server; DeepSeek-V4 renders through it.
@@ -80,6 +80,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 futures = "0.3"
 bytes = "1"
 # Gzips the /internal/kv_snapshot body once per build and inflates a peer's (see `fetch_body` in state/kv_events/bootstrap/fetch.rs).
+base64 = "0.22"
 flate2 = "1"
 rand = "0.8"
 tokio-stream = { version = "0.1", features = ["net"] }
@@ -98,7 +99,7 @@ rmp-serde = "1"
 # hashes, u64 node ids), off the routing hot path's SipHash cost. The
 # keys are client-derivable, not trusted; what bounds a collision attack
 # is that planting a key costs a real request — see the DoS note in
-# src/policies/kv_events/tree.rs.
+# src/state/kv_events/tree.rs.
 rustc-hash = "2"
 sha2 = "0.10"
 url = "2"
@@ -115,7 +116,6 @@ default = []
 fips = ["dep:aws-lc-rs", "dep:rustls"]
 
 [dev-dependencies]
-base64 = "0.22"
 dirs = "5"
 http-body-util = "0.1"
 # HTTP/2-only mock server for the proxy h2c forwarding tests (tests/proxy/h2c_forward.rs).
@@ -140,9 +140,7 @@ tonic-prost = "0.14.6"
 # Low-level msgpack encoder used to hand-construct wire bytes in
 # kv_events golden-bytes tests (decode-only path uses rmp-serde).
 rmp = "0.8"
-# Criterion benches that mirror the SMG `radix_tree_benchmark` +
-# `manual_policy_benchmark` so routing-decision latency can be compared
-# apples-to-apples against the gateway being deprecated.
+# Criterion benches for routing-decision latency (benches/, BENCHMARKS.md).
 criterion = { version = "0.5", features = ["html_reports"] }
 rand = "0.8"
 

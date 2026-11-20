@@ -107,6 +107,17 @@ message OptionalStringList {
   repeated OptionalString items = 1;
 }
 
+// A nullable double list element (e.g. a completion token logprob).
+message OptionalDouble {
+  option (sglang.json.v1.message_json).shape = MESSAGE_SHAPE_TRANSPARENT;
+  optional double value = 1;
+}
+
+message DoubleList {
+  option (sglang.json.v1.message_json).shape = MESSAGE_SHAPE_BARE_LIST;
+  repeated double items = 1;
+}
+
 message OptionalInt64 {
   option (sglang.json.v1.message_json).shape = MESSAGE_SHAPE_TRANSPARENT;
   optional int64 value = 1;
@@ -127,8 +138,12 @@ message OptionalInt64List {
 
 // The native error body: `{"error": {"message", "code"}}` (Python
 // `http_server.generate_request` parity). Transports frame it themselves
-// (unary status + body, SSE error frame, gRPC status detail).
+// (unary status + body, SSE error frame, gRPC status detail). A streamed
+// error also carries `type` and `retryable`, as Python's `stream_results()`
+// frame does; a unary body leaves them unset.
 message ErrorBody {
   string message = 1;
   uint32 code = 2;
+  optional string type = 3;
+  optional bool retryable = 4;
 }

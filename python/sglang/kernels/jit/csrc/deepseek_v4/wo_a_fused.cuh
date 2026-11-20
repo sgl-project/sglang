@@ -55,12 +55,6 @@ SGL_DEVICE uint32_t mapa(uint32_t addr, uint32_t rank) {
   return out;
 }
 
-SGL_DEVICE uint32_t cluster_ctarank() {
-  uint32_t r;
-  asm("mov.u32 %0, %%cluster_ctarank;" : "=r"(r));
-  return r;
-}
-
 // Publishes mbarrier initialization to the whole cluster. Because this fence
 // carries the release, the cluster arrive below needs no ordering of its own.
 SGL_DEVICE void fence_mbarrier_init_release_cluster() {
