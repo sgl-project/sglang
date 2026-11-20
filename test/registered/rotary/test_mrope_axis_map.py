@@ -184,7 +184,7 @@ class TestMRopeAxisMap(CustomTestCase):
         multimodal = torch.tensor([[0, 1], [2, 3], [4, 5]])
         with patch.object(
             qwen3_5,
-            "triton_split_qkv_rmsnorm_mrope",
+            "split_qkv_rmsnorm_mrope",
             create=True,
             return_value=(None, None, None, None),
         ) as fused:
