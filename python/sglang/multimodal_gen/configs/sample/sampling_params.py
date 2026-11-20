@@ -235,6 +235,50 @@ def align_num_frames_for_num_gpus(
     return new_latent_num_frames
 
 
+class MissingSidePolicy(Enum):
+    """How request-size alignment treats an unset or non-positive side."""
+
+    # Align only when both sides are set and positive.
+    KEEP = "keep"
+    # Align each set, positive side on its own.
+    PER_SIDE = "per_side"
+    # Derive an unset side from 16:9 first, as InputValidationStage does, then KEEP.
+    FILL_16_9 = "fill_16_9"
+
+
+def _fill_missing_side_16_9(
+    *, width: int | None, height: int | None
+) -> tuple[int | None, int | None]:
+    if height is None and width is not None:
+        return width, width * 720 // 1280
+    if width is None and height is not None:
+        return height * 1280 // 720, height
+    return width, height
+
+
+def _floor_to_multiple(size: int, multiple: int) -> int:
+    return max(multiple, size // multiple * multiple)
+
+
+def _round_down_request_size(
+    *, width: int | None, height: int | None, multiple: int, per_side: bool
+) -> tuple[int | None, int | None] | None:
+    """Round a request size down to ``multiple``; None leaves it unchanged.
+
+    A non-positive side is never rounded up, so request validation still rejects it.
+    """
+    if per_side:
+        return tuple(
+            _floor_to_multiple(size, multiple)
+            if size is not None and size > 0
+            else size
+            for size in (width, height)
+        )
+    if width is None or height is None or width <= 0 or height <= 0:
+        return None
+    return _floor_to_multiple(width, multiple), _floor_to_multiple(height, multiple)
+
+
 # Arbitrary upper bounds; upscaling_scale squares the pixel count.
 _FRAME_INTERPOLATION_SCALE_RANGE = (0.25, 4.0)
 _MAX_UPSCALING_SCALE = 8
@@ -371,6 +415,13 @@ class SamplingParams:
     # A prompt-free pipeline (e.g. a text-free SR / video-to-video DiT) sets this to
     # ``True`` so the multipart video-generation route does not require ``prompt``.
     prompt_optional: ClassVar[bool] = False
+
+    # A model whose pipeline rejects sizes off its grid names itself here (for the
+    # warning) and overrides _request_size_multiple; None means no alignment rule.
+    _request_size_model_name: ClassVar[str | None] = None
+    _request_size_missing_side: ClassVar[MissingSidePolicy] = MissingSidePolicy.KEEP
+    # True aligns in __post_init__ instead of _adjust_visual_fields.
+    _request_size_aligned_at_init: ClassVar[bool] = False
 
     height: int | None = None
     width: int | None = None
@@ -548,6 +599,9 @@ class SamplingParams:
 
             self.spectrum_params = SpectrumParams()
 
+        if self._request_size_aligned_at_init:
+            self._align_request_size(pipeline_config=None)
+
     def build_request_extra(self) -> dict[str, Any]:
         """Return optional request-scoped extras for downstream pipeline stages."""
         extra = {}
@@ -646,7 +700,44 @@ class SamplingParams:
         self, req: Any, server_args: Any
     ) -> None:
         """Resolve model-specific facts for one synthetic warmup request."""
-        del req, server_args
+        del req
+        if self._request_size_model_name is not None:
+            # Warmup overwrites the dimensions after _adjust has run.
+            self._align_request_size(server_args.pipeline_config)
+
+    def _request_size_multiple(self, pipeline_config: Any) -> int | None:
+        """The grid request sizes round down to, or None to leave them as is."""
+        del pipeline_config
+        return None
+
+    def _align_request_size(self, pipeline_config: Any) -> None:
+        multiple = self._request_size_multiple(pipeline_config)
+        if multiple is None:
+            return
+        requested_size = (self.width, self.height)
+        if self._request_size_missing_side is MissingSidePolicy.FILL_16_9:
+            # Kept even when the size is then left to validation.
+            self.width, self.height = _fill_missing_side_16_9(
+                width=self.width, height=self.height
+            )
+        aligned_size = _round_down_request_size(
+            width=self.width,
+            height=self.height,
+            multiple=multiple,
+            per_side=self._request_size_missing_side is MissingSidePolicy.PER_SIDE,
+        )
+        if aligned_size is None:
+            return
+        self.width, self.height = aligned_size
+        if aligned_size != requested_size:
+            logger.warning(
+                "%s requires dimensions divisible by %s; adjusted requested "
+                "resolution from %sx%s to %sx%s",
+                self._request_size_model_name,
+                multiple,
+                *requested_size,
+                *aligned_size,
+            )
 
     def project_video_queued_job_fields(self, req: Any) -> dict[str, str]:
         """Return model-resolved fields to publish with the queued video job."""
@@ -1063,6 +1154,10 @@ class SamplingParams:
 
         if not server_args.comfyui_mode:
             self._set_output_file_name()
+
+        # After the output name, which hashes the requested size.
+        if not self._request_size_aligned_at_init:
+            self._align_request_size(pipeline_config)
 
     @classmethod
     def from_pretrained(cls, model_path: str, **kwargs) -> "SamplingParams":
