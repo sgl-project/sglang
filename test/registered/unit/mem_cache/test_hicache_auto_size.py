@@ -147,8 +147,8 @@ class TestHiCacheAutoSize(CustomTestCase):
         self.assertEqual(sizing._estimate_hicache_bytes(params, None), 4096 + 1024)
 
     def test_mamba_state_is_sized_by_what_its_host_pool_mirrors(self):
-        """The estimate must cover every byte the Mamba host pool mirrors, packed draft
-        layers and side states registered after the pool, and no spec scratch."""
+        """The estimate must cover every byte the Mamba host pool mirrors:
+        packed draft layers, side states registered after the pool, no spec scratch."""
 
         def make_pool(layer_ids, draft_tokens=None):
             return MambaPool(
@@ -188,9 +188,9 @@ class TestHiCacheAutoSize(CustomTestCase):
             mtp_draft_mamba_pools=(draft,),
         )
         host = MambaPoolHost(
-            target.get_device_pool_infos()[0].buffer_info,
-            2,
-            0,
+            buffer_info=target.get_device_pool_infos()[0].buffer_info,
+            host_to_device_ratio=2,
+            host_size=0,
             device_capacity=target.size,
             pin_memory=False,
             layout="page_first",

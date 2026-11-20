@@ -1101,8 +1101,8 @@ class MambaPool:
 
     @property
     def host_capacity_bytes(self) -> int:
-        # Host bytes per device capacity, counting side states registered after
-        # __init__; spec verify scratch and ReplaySSM rings are device-only.
+        # Host mirror bytes, including side states registered after __init__;
+        # spec verify scratch and ReplaySSM rings are device-only, so excluded.
         from sglang.srt.mem_cache.device_pool_info import device_capacity_tokens
 
         return (
