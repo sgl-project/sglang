@@ -8,6 +8,7 @@
 use sglang_api_types::api::v1::sglang_service_server::SglangServiceServer;
 use tokio_stream::wrappers::TcpListenerStream;
 
+use super::health::{self, NodePeer};
 use super::service::GrpcService;
 use crate::api_server::handlers::CoreHandle;
 
@@ -52,6 +53,8 @@ fn max_message_size() -> usize {
 pub(crate) async fn serve(
     listener: std::net::TcpListener,
     service: GrpcService,
+    // Set on the node's first listener, which then serves `grpc.health.v1`.
+    node_peers: Option<Vec<NodePeer>>,
     core: CoreHandle,
     shutdown: flume::Receiver<()>,
 ) {
@@ -64,12 +67,25 @@ pub(crate) async fn serve(
         }
     };
     let incoming = TcpListenerStream::new(listener);
+    let health = match node_peers {
+        Some(peers) => Some(
+            health::inference_service(
+                core.clone(),
+                peers,
+                service.health_timeout(),
+                health::POLL_INTERVAL,
+            )
+            .await,
+        ),
+        None => None,
+    };
     let max_message_size = max_message_size();
     let service = SglangServiceServer::new(service)
         .max_decoding_message_size(max_message_size)
         .max_encoding_message_size(max_message_size);
     let serve = tonic::transport::Server::builder()
         .add_service(service)
+        .add_optional_service(health)
         .serve_with_incoming_shutdown(incoming, {
             let core = core.clone();
             async move {

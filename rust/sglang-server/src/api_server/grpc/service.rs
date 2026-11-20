@@ -87,6 +87,10 @@ impl GrpcService {
         }
     }
 
+    pub(super) fn health_timeout(&self) -> Duration {
+        self.config.health_timeout
+    }
+
     #[cfg(test)]
     pub(super) fn for_test(
         core: CoreHandle,
