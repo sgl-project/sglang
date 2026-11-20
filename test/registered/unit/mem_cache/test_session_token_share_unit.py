@@ -292,6 +292,21 @@ class TestSessionTeardown(CustomTestCase):
                 self.assertNotIn("s", self.controller)
                 self.assertIsNone(item.feature)
 
+    def test_close_waits_for_a_finished_reader_a_step_still_carries(self):
+        """A turn finished while a launched step still reads its media keeps
+        the session until that step is processed."""
+        parent = self._create("parent", image=b"A")
+        [item] = parent.multimodal_inputs.mm_items
+        parent.inflight_steps = 1
+        self._finish(parent)
+        self._close()
+        self.assertIn("s", self.controller)
+        self.assertIsNotNone(item.feature)
+        parent.inflight_steps = 0
+        self._reap()
+        self.assertNotIn("s", self.controller)
+        self.assertIsNone(item.feature)
+
 
 if __name__ == "__main__":
     unittest.main()
