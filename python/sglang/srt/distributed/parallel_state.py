@@ -2734,10 +2734,8 @@ def initialize_model_parallel(
                 dcp_group_ranks.append(
                     tp_group[start : start + decode_context_parallel_size]
                 )
-        if is_hip() and dcp_group_ranks == group_ranks:
-            # DCP spans each whole TP group: share its communicators rather than
-            # allocate a second RCCL communicator and custom all-reduce (about
-            # 5 GiB a GPU at TP8 on MI355X). ROCm only, where it is validated.
+        if is_hip() and decode_context_parallel_size == tensor_model_parallel_size:
+            # Full-width DCP preserves TP rank order.
             _DCP = _TP
         else:
             _DCP = init_model_parallel_group(
@@ -3308,6 +3306,7 @@ def destroy_model_parallel():
         _SHARED_EXPERTS_TP.destroy()
     _SHARED_EXPERTS_TP = None
 
+    tp_group_destroyed = _TP
     if _TP:
         _TP.destroy()
     _TP = None
@@ -3318,7 +3317,7 @@ def destroy_model_parallel():
     _PP = None
 
     global _DCP
-    if _DCP:
+    if _DCP and _DCP is not tp_group_destroyed:
         _DCP.destroy()
     _DCP = None
 
