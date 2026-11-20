@@ -320,8 +320,7 @@ class PendingNPUSeqLensCopy:
 
     def result(self) -> tuple[torch.Tensor, int]:
         if self._result is None:
-            with profile_range("npu.seq_lens.d2h_wait"):
-                self.copy_done.synchronize()
+            self.copy_done.synchronize()
             # Keep a private snapshot for the batch across future staging writes.
             lengths = self.staging.clone()
             self._result = lengths, int(lengths.sum())
@@ -728,19 +727,18 @@ class FutureMap:
         device_module = torch.get_device_module(self.device)
         copy_stream = self._npu_seq_lens_copy_stream
         staging = self._npu_seq_lens_cpu_pinned[: seq_lens.numel()]
-        with profile_range("npu.seq_lens.d2h_enqueue"):
-            # The producer stream has already waited for publish_ready and
-            # gathered the live rows. Only the copy stream waits for this event.
-            gather_done = device_module.Event()
-            gather_done.record()
-            copy_done = device_module.Event()
-            seq_lens.record_stream(copy_stream)
-            with device_module.stream(copy_stream):
-                copy_stream.wait_event(gather_done)
-                # Forward dispatch consumes the previous snapshot before the
-                # next dispatch, and the copy stream orders staging writes.
-                staging.copy_(seq_lens, non_blocking=True)
-                copy_done.record()
+        # The producer stream has already waited for publish_ready and
+        # gathered the live rows. Only the copy stream waits for this event.
+        gather_done = device_module.Event()
+        gather_done.record()
+        copy_done = device_module.Event()
+        seq_lens.record_stream(copy_stream)
+        with device_module.stream(copy_stream):
+            copy_stream.wait_event(gather_done)
+            # Forward dispatch consumes the previous snapshot before the
+            # next dispatch, and the copy stream orders staging writes.
+            staging.copy_(seq_lens, non_blocking=True)
+            copy_done.record()
         return PendingNPUSeqLensCopy(staging, copy_done)
 
     def resolve_seq_lens_cpu(
