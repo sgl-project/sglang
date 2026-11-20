@@ -2609,6 +2609,87 @@ fn evict_excess_path_states_without_a_cap_is_a_no_op() {
     assert!(tc.arena.node(a).try_device_value(MAMBA).is_some());
 }
 
+// a: host-only state (in the host LRU), b: device + host copy, c: the device tail.
+fn capped_path_with_host_copies() -> (UnifiedTreeCore<Vec<i64>>, [NodeIdx_; 3]) {
+    let mut tc = mamba_core_with_cap(1);
+    tc.set_hicache_enabled();
+    let [a, b, c] = chain::<3>(&mut tc);
+    set_mamba_host(&mut tc, a, 70);
+    tc.host_lru_list_mut(MAMBA).insert_mru(a);
+    set_mamba_device(&mut tc, b, 8);
+    set_mamba_host(&mut tc, b, 80);
+    set_mamba_device(&mut tc, c, 9);
+    (tc, [a, b, c])
+}
+
+#[test]
+fn evict_excess_path_states_leaves_host_copies_without_host_counting() {
+    let (mut tc, [a, b, c]) = capped_path_with_host_copies();
+    let result = tc
+        .evict_excess_path_states(tc.arena.node(c).id)
+        .expect("live test node");
+    assert_eq!(result.device_frees[&MAMBA].len(), 1);
+    assert!(result.host_frees.is_empty());
+    assert!(tc.arena.node(a).has_host_value(MAMBA));
+    assert!(!tc.arena.node(b).has_device_value(MAMBA));
+    assert!(tc.arena.node(b).has_host_value(MAMBA));
+    // The capped state's host copy becomes the host LRU's most recent entry.
+    assert_eq!(lru_order(tc.host_lru_list(MAMBA)), vec![b, a]);
+}
+
+#[test]
+fn evict_excess_path_states_counts_and_frees_host_copies_when_counting_host() {
+    let (mut tc, [a, b, c]) = capped_path_with_host_copies();
+    tc.set_mamba_path_cap_counts_host(true);
+    let mut result = tc
+        .evict_excess_path_states(tc.arena.node(c).id)
+        .expect("live test node");
+    let device = result.device_frees.remove(&MAMBA).unwrap();
+    assert_eq!(device.len(), 1);
+    assert!(device[0].equal(&Tensor::from_slice(&[8i64])));
+    let host = result.host_frees.remove(&MAMBA).unwrap();
+    assert_eq!(host.len(), 2);
+    assert!(host[0].equal(&Tensor::from_slice(&[70i64])));
+    assert!(host[1].equal(&Tensor::from_slice(&[80i64])));
+    for node in [a, b] {
+        assert!(!tc.arena.node(node).has_device_value(MAMBA));
+        assert!(!tc.arena.node(node).has_host_value(MAMBA));
+    }
+    assert!(tc.arena.node(c).has_device_value(MAMBA));
+    assert!(lru_order(tc.host_lru_list(MAMBA)).is_empty());
+}
+
+#[test]
+fn evict_excess_path_states_keeps_host_copies_that_are_locked_or_in_flight() {
+    type Guard = fn(&mut UnifiedTreeCore<Vec<i64>>, NodeIdx_);
+    let guards: [(&str, Guard); 3] = [
+        ("host_lock", |tc, a| {
+            tc.arena
+                .node_mut(a)
+                .set_lock_ref_(ValueSlotIdx::host(MAMBA), 1);
+        }),
+        ("backup", |tc, a| {
+            tc.arena.node_mut(a).write_through_pending_id = Some(1);
+        }),
+        ("load_back", |tc, a| {
+            tc.arena.node_mut(a).load_back_pending_id = Some(1);
+        }),
+    ];
+    for (guard, set_guard) in guards {
+        let (mut tc, [a, b, c]) = capped_path_with_host_copies();
+        tc.set_mamba_path_cap_counts_host(true);
+        set_guard(&mut tc, a);
+        let result = tc
+            .evict_excess_path_states(tc.arena.node(c).id)
+            .expect("live test node");
+        assert!(tc.arena.node(a).has_host_value(MAMBA), "{guard}");
+        // b still goes: the guarded copy does not count as a removal.
+        assert_eq!(result.host_frees[&MAMBA].len(), 1, "{guard}");
+        assert!(!tc.arena.node(b).has_host_value(MAMBA), "{guard}");
+        assert!(tc.arena.node(c).has_device_value(MAMBA), "{guard}");
+    }
+}
+
 #[test]
 fn insert_commit_emits_the_path_cap_action_only_when_capped() {
     let mut tc = mamba_core_with_cap(1);

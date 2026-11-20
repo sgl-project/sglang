@@ -925,6 +925,9 @@ class Envs:
     # gfx950: override --hicache-ratio for Mamba states in ratio mode; a cached KV
     # prefix cannot be reused after its host state is evicted.
     SGLANG_HICACHE_MAMBA_HOST_RATIO = EnvFloat(None)
+    # Opt-in: the per-path Mamba state cap also counts HiCache host copies, and a
+    # capped state loses its host copy too. Off (default) caps device states only.
+    SGLANG_MAMBA_PATH_CAP_COUNTS_HOST = EnvBool(False)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
     # File-backend LRU eviction (opt-in; sizes accept SI/IEC suffixes, "0" disables).
     SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE = EnvStr(None)
