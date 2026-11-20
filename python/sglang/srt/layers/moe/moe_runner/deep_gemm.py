@@ -237,6 +237,13 @@ def _should_use_masked_standard_layout(
     if mode != "auto":
         return mode == "masked"
 
+    # Dual-Runner only enters DeepGEMM at high token counts; force compact layout.
+    if (
+        runner_config.dual_runner_threshold > 0
+        and hidden_states.shape[0] >= runner_config.dual_runner_threshold
+    ):
+        return False
+
     global _masked_standard_layout_memory_budget_bytes
     if _masked_standard_layout_memory_budget_bytes is None:
         # Serving sets an all-rank budget before capture. Direct eager callers
