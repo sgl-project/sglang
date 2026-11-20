@@ -205,7 +205,7 @@ class TestLateReadsUseTheForwardSlots(CustomTestCase):
         """`AscendHybridLinearAttnBackend.update_mamba_state_after_mtp_verify` writes
         the working and checkpoint slots the forward resolved, not the ids its
         caller passes, after the request table changed."""
-        npu_ops = ModuleType("sgl_kernel_npu.mamba.mamba_state_update_triton")
+        npu_ops = ModuleType("sgl_kernel_npu.operators.mamba")
         npu_ops.conv_state_rollback = None
         npu_ops.move_intermediate_cache = None
         with patch.dict("sys.modules", {npu_ops.__name__: npu_ops}):

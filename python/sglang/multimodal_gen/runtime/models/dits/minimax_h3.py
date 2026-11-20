@@ -1120,6 +1120,10 @@ def _minimax_h3_attention_core_impl(
         q, k, v = _usp_input_all_to_all_packed_qkv(q, k, v)
 
     if attention._attention_backend_enum is AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3:
+        from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn_h3 import (
+            vsa_h3_fold_gate,
+        )
+
         attn_metadata = (
             get_forward_context().attn_metadata
             if attention.prefix.startswith("blocks.")
@@ -1365,7 +1369,12 @@ class MiniMaxH3Attention(nn.Module):
         if (
             backend.get_enum() is AttentionBackendEnum.CUBE_SPARSE_ATTN
             and not self._cube_sparse_capable
+        ) or (
+            backend.get_enum() is AttentionBackendEnum.ASCEND_SPARSE_ATTN
+            and "token_refiner" in self.prefix.split(".")
         ):
+            # The text-only refiner has its own packed sequence and stays on
+            # dense FA; Ascend sparse attention applies to multimodal DiT blocks.
             backend = get_attn_backend(
                 self.head_dim,
                 _BF16_DTYPE,

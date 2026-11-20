@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use crate::message::config::{DisaggregationMode, MetricsConfig};
 use crate::message::finish_reason::FinishReason;
 use crate::message::request::GenerateRequest;
-use crate::message::response::{CachedTokensSplit, ChunkEvent, ResponseItem};
+use crate::message::response::{CachedTokensSplit, ChunkEvent, RequestStats, ResponseItem};
 use crate::utils::prometheus::{self, Entry};
 
 /// How often the frontend's files are rewritten for other readers of the
@@ -413,6 +413,9 @@ struct RequestSeries {
     /// Cached tokens by [`CACHE_SOURCES`], each series registered at its
     /// source's first hit, as Python labels a source only once it counts one.
     cached_tokens: [OnceLock<Arc<Counter>>; 3],
+    /// Registered at the first request that ran a verify step, as Python
+    /// labels it only once it counts one.
+    spec_verify_calls: OnceLock<Arc<Counter>>,
     prompt_tokens_histogram: Arc<Histogram>,
     uncached_prompt_tokens_histogram: Arc<Histogram>,
     generation_tokens_histogram: Arc<Histogram>,
@@ -440,6 +443,7 @@ pub(crate) struct FrontendMetrics {
     num_so_requests: CounterFamily,
     num_aborted_requests: CounterFamily,
     cached_tokens: CounterFamily,
+    spec_verify_calls: CounterFamily,
     prompt_tokens_histogram: HistogramFamily,
     uncached_prompt_tokens_histogram: HistogramFamily,
     generation_tokens_histogram: HistogramFamily,
@@ -500,6 +504,10 @@ impl FrontendMetrics {
             cached_tokens: CounterFamily::new(
                 "sglang:cached_tokens_total",
                 "Number of cached prompt tokens by source (device/host/storage).",
+            ),
+            spec_verify_calls: CounterFamily::new(
+                "sglang:spec_verify_calls_total",
+                "Number of speculative decoding verification calls.",
             ),
             prompt_tokens_histogram: HistogramFamily::new(
                 "sglang:prompt_tokens_histogram",
@@ -619,6 +627,7 @@ impl FrontendMetrics {
             generation_tokens: self.generation_tokens.series(&stream_labels),
             num_so_requests: self.num_so_requests.series(&labels),
             cached_tokens: Default::default(),
+            spec_verify_calls: OnceLock::new(),
             prompt_tokens_histogram: self.prompt_tokens_histogram.series(&labels),
             uncached_prompt_tokens_histogram: self.uncached_prompt_tokens_histogram.series(&labels),
             generation_tokens_histogram: self.generation_tokens_histogram.series(&labels),
@@ -637,7 +646,7 @@ impl FrontendMetrics {
             .clone()
     }
 
-    fn counters(&self) -> [&CounterFamily; 6] {
+    fn counters(&self) -> [&CounterFamily; 7] {
         [
             &self.num_requests,
             &self.prompt_tokens,
@@ -645,6 +654,7 @@ impl FrontendMetrics {
             &self.num_so_requests,
             &self.num_aborted_requests,
             &self.cached_tokens,
+            &self.spec_verify_calls,
         ]
     }
 
@@ -815,6 +825,28 @@ impl RequestMetrics {
                 self.observe_first_token(first_token_at);
             }
             self.observe_finished(finish_type, first_token_at, now);
+            self.observe_spec_verify_calls(extras.and_then(|extras| extras.request_stats.as_ref()));
+        }
+    }
+
+    /// `observe_one_finished_request`'s `spec_verify_ct`: the verify steps a
+    /// finished request ran, which its terminal row's stats report (under
+    /// the `meta_info` key Python's `populate_spec_info` sets).
+    fn observe_spec_verify_calls(&self, stats: Option<&RequestStats>) {
+        let Some(verify_ct) = stats.and_then(|RequestStats(stats)| stats.get("spec_verify_ct"))
+        else {
+            return;
+        };
+        let Some(verify_ct) = verify_ct.as_u64() else {
+            tracing::error!(%verify_ct, "spec_verify_ct is not a count; not recorded");
+            return;
+        };
+        if verify_ct > 0 {
+            let series = &self.series;
+            series
+                .spec_verify_calls
+                .get_or_init(|| self.metrics.spec_verify_calls.series(&series.labels))
+                .inc(verify_ct);
         }
     }
 
@@ -930,8 +962,6 @@ mod tests {
         // Startup phases are reported to the main process, not the frontend.
         "sglang:startup_time_seconds",
         "sglang:startup_cuda_graph_time_seconds",
-        // Speculative verify counts are not on the output frames.
-        "sglang:spec_verify_calls_total",
     ];
 
     fn fixture() -> Fixture {
@@ -1066,8 +1096,9 @@ mod tests {
     /// inter-token latency per new token after it, and the finished-request
     /// families at the end; a non-streaming request's first token is the
     /// terminal output less the scheduler's decode latency; cached tokens count
-    /// as device hits; a dropped call counts an abort, and a finished request
-    /// once it had an output.
+    /// as device hits; verify calls count from the terminal row's stats, and a
+    /// label set with none has no series; a dropped call counts an abort, and
+    /// a finished request once it had an output.
     #[test]
     fn records_request_lifecycles() {
         let dir = temp_dir("lifecycle");
@@ -1090,6 +1121,10 @@ mod tests {
         let mut unary = metrics.start_request(&request(false, None), created);
         let decoded = ChunkExtras {
             decode_latency: Some(0.02),
+            request_stats: Some(RequestStats(serde_json::Map::from_iter([(
+                "spec_verify_ct".to_string(),
+                4.into(),
+            )]))),
             ..Default::default()
         };
         unary.observe(Some(&ResponseItem::Done(ChunkEvent {
@@ -1157,6 +1192,20 @@ mod tests {
                 r#"sglang:cached_tokens_total{cache_source="device",engine_type="unified",model_name="m",priority=""}"#
             ),
             Some(3.0)
+        );
+        assert_eq!(
+            sample(
+                &text,
+                r#"sglang:spec_verify_calls_total{engine_type="unified",model_name="m",priority=""}"#
+            ),
+            Some(4.0)
+        );
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.starts_with("sglang:spec_verify_calls_total{"))
+                .count(),
+            1,
+            "{text}"
         );
         // The unary request's 7 - 3, and the dropped one's 7.
         assert_eq!(
