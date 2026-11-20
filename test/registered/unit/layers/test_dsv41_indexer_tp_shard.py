@@ -79,7 +79,7 @@ class TestIndexerRowShardDispatch(CustomTestCase):
         x = torch.empty(rows, 1)
         pos = torch.arange(rows)
         with (
-            envs.SGLANG_OPT_DSV4_INDEXER_TP_SHARD.override(enabled),
+            envs.SGLANG_OPT_DSV4_PREFILL_INDEXER_TP_SHARD.override(enabled),
             patch.object(deepseek_v4_backend, "get_parallel", return_value=parallel),
         ):
             if graph:

@@ -4121,6 +4121,24 @@ class DeepseekV4AttnBackend(
             inputs = self._make_low_ratio_decode_indexer_inputs(
                 layer, x, q_lora, req, pos, mode
             )
+            if (
+                mode.is_target_verify()
+                and envs.SGLANG_OPT_DSV41_VERIFY_INDEXER_SHARDING.get()
+                and read_ragged_verify_mode() is RaggedVerifyMode.STATIC
+            ):
+                from sglang.srt.layers.attention.dsv4.v41_indexer.verify_shard import (
+                    try_sharded_verify,
+                )
+
+                if try_sharded_verify(
+                    self,
+                    forward_batch.batch_size,
+                    inputs,
+                    is_source,
+                    is_consumer,
+                    published,
+                ):
+                    return
             if is_source:
                 published = self.decode_candidates.publish_decode(inputs)
                 self._publish_candidate_metadata(published)
@@ -4262,7 +4280,7 @@ class DeepseekV4AttnBackend(
         # of them reach the all-gather or none does.
         parallel = get_parallel()
         if (
-            not envs.SGLANG_OPT_DSV4_INDEXER_TP_SHARD.get()
+            not envs.SGLANG_OPT_DSV4_PREFILL_INDEXER_TP_SHARD.get()
             or parallel.attn_tp_size == 1
             or parallel.attn_cp_size != 1
             or num_rows < _INDEXER_TP_SHARD_MIN_ROWS

@@ -2152,7 +2152,10 @@ class Envs:
     # scoring every row. Identical to the replicated path under fp32 logits;
     # bf16 logits vary with the tile's row count, so picks near the selection
     # floor can differ there.
-    SGLANG_OPT_DSV4_INDEXER_TP_SHARD = EnvBool(False)
+    SGLANG_OPT_DSV4_PREFILL_INDEXER_TP_SHARD = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_OPT_DSV4_INDEXER_TP_SHARD"
+    )
+    SGLANG_OPT_DSV41_VERIFY_INDEXER_SHARDING = EnvBool(False)
     SGLANG_OPT_DSV4_NONPAGED_INDEXER = EnvBool(True)
     # Per-rank local query rows (after DP-attention sharding when enabled),
     # not request ISL.
