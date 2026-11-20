@@ -414,10 +414,18 @@ Mooncake also supports high availability mode. This mode enhances fault toleranc
 
 On multi-node NVLink systems such as GB200 and GB300 NVL72, a GPU can read and write the host memory of another node in its NVLink domain through Extended GPU Memory (EGM). Mooncake can back a Store segment with such memory: it allocates the segment with `cuMemCreate` on a host NUMA node with a fabric handle, and other nodes reach it over NVLink instead of the NIC.
 
-Enable it for the segment each SGLang rank contributes:
+Enable it for the segment each SGLang rank contributes (a provider):
 
 ```bash
 --hicache-storage-backend-extra-config '{"master_server_address": "<master-ip>:50051", "metadata_server": "http://<master-ip>:8080/metadata", "global_segment_size": "64gb", "protocol": "nvlink", "enable_egm_store_pool": true}'
+```
+
+Also set `SGLANG_HICACHE_MOONCAKE_REUSE_TE=0`: the store reuses SGLang's shared transfer engine only for `"rdma"`, so otherwise each rank starts an engine it never uses.
+
+A node that only reads from the pool (a consumer) contributes no segment. Set `global_segment_size` to `0`, since Mooncake can place objects on an ordinary host segment that other nodes cannot reach:
+
+```bash
+--hicache-storage-backend-extra-config '{"master_server_address": "<master-ip>:50051", "metadata_server": "http://<master-ip>:8080/metadata", "global_segment_size": 0, "protocol": "nvlink"}'
 ```
 
 * `enable_egm_store_pool`, `MOONCAKE_ENABLE_EGM_STORE_POOL`: Back the segment with EGM host memory. Default `false`. Requires `protocol` set to `"nvlink"` and cannot be combined with `standalone_storage`.
@@ -428,9 +436,11 @@ Requirements:
 * Mooncake 0.3.14 or later, built with `USE_MNNVL=ON` (the published aarch64 CUDA wheels are) and without TENT (`MC_USE_TENT` unset).
 * EGM enabled in the GPU driver, and an IMEX domain that spans the nodes.
 * `MOONCAKE_LOCAL_HOSTNAME` set to an address that the other nodes can reach, as for `"rdma"`.
-* For the direct linker, which reads into GPU memory: a Mooncake release with [kvcache-ai/Mooncake#4951](https://github.com/kvcache-ai/Mooncake/pull/4951). In 0.3.14 a GPU read from an EGM segment is staged through the local buffer, which is slower and fails for objects larger than `local_buffer_size`.
+* `MC_MS_AUTO_DISC` unset or `0` on every node, so the `nvlink` transport is installed as requested. With `MC_MS_AUTO_DISC=1` on hosts with RDMA NICs, also set `MC_FORCE_MNNVL=1`.
 
-Every client of the pool, including a dedicated `store service` or another SGLang instance, must be in the same NVLink domain and use `protocol` `"nvlink"`. Only the nodes that contribute EGM memory set `enable_egm_store_pool`.
+Every client of the pool, including a dedicated `store service` or another SGLang instance, must be in the same NVLink domain and use `protocol` `"nvlink"`. Only the nodes that contribute EGM memory set `enable_egm_store_pool`. The multimodal embedding cache (`--enable-mm-global-cache`) does not support it.
+
+In Mooncake 0.3.14, a `get_into` read from an EGM segment into GPU memory is staged through the local buffer, which is slower and fails for objects larger than `local_buffer_size` ([kvcache-ai/Mooncake#4951](https://github.com/kvcache-ai/Mooncake/pull/4951) fixes this). The reads SGLang issues, `batch_get_into` for HiCache and `batch_get_into_multi_buffer_ranges` for the direct linker, do not take that path.
 
 ### Deployment with Dummy Client (Experimental)
 

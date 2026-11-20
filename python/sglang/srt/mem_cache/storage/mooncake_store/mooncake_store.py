@@ -103,17 +103,6 @@ def _normalize_tenant_id(value) -> str:
     return tenant_id if tenant_id else DEFAULT_TENANT_ID
 
 
-def _parse_bool(value) -> bool:
-    if isinstance(value, bool):
-        return value
-    text = str(value).strip().lower()
-    if text in ("true", "1"):
-        return True
-    if text in ("false", "0"):
-        return False
-    raise ValueError(f"Invalid boolean value: {value!r}")
-
-
 def _normalize_egm_numa_nodes(value) -> Optional[str]:
     if value is None:
         return None
@@ -263,11 +252,13 @@ class MooncakeStoreConfig:
                 "local_buffer_size", DEFAULT_LOCAL_BUFFER_SIZE
             ),
             # Like "protocol", fall back to the env vars when the keys are omitted.
-            enable_egm_store_pool=_parse_bool(
-                config.get(
-                    "enable_egm_store_pool",
-                    envs.MOONCAKE_ENABLE_EGM_STORE_POOL.get(),
-                )
+            enable_egm_store_pool=envs.MOONCAKE_ENABLE_EGM_STORE_POOL.parse(
+                str(
+                    config.get(
+                        "enable_egm_store_pool",
+                        envs.MOONCAKE_ENABLE_EGM_STORE_POOL.get(),
+                    )
+                ).strip()
             ),
             egm_numa_nodes=_normalize_egm_numa_nodes(
                 config.get("egm_numa_nodes", envs.MOONCAKE_EGM_NUMA_NODES.get())
@@ -362,11 +353,13 @@ class MooncakeStoreConfig:
                 "local_buffer_size", DEFAULT_LOCAL_BUFFER_SIZE
             ),
             # Like "protocol", fall back to the env vars when the keys are omitted.
-            enable_egm_store_pool=_parse_bool(
-                extra_config.get(
-                    "enable_egm_store_pool",
-                    envs.MOONCAKE_ENABLE_EGM_STORE_POOL.get(),
-                )
+            enable_egm_store_pool=envs.MOONCAKE_ENABLE_EGM_STORE_POOL.parse(
+                str(
+                    extra_config.get(
+                        "enable_egm_store_pool",
+                        envs.MOONCAKE_ENABLE_EGM_STORE_POOL.get(),
+                    )
+                ).strip()
             ),
             egm_numa_nodes=_normalize_egm_numa_nodes(
                 extra_config.get("egm_numa_nodes", envs.MOONCAKE_EGM_NUMA_NODES.get())
@@ -435,6 +428,20 @@ class MooncakeBaseStore:
         else:
             config = MooncakeStoreConfig.load_from_env()
             logger.info("Mooncake Configuration loaded from env successfully.")
+
+        # The EGM keys configure this rank's own segment, so an explicit value in
+        # extra_config applies even when the endpoint comes from a file or env.
+        if extra_config:
+            if "enable_egm_store_pool" in extra_config:
+                config.enable_egm_store_pool = (
+                    envs.MOONCAKE_ENABLE_EGM_STORE_POOL.parse(
+                        str(extra_config["enable_egm_store_pool"]).strip()
+                    )
+                )
+            if "egm_numa_nodes" in extra_config:
+                config.egm_numa_nodes = _normalize_egm_numa_nodes(
+                    extra_config["egm_numa_nodes"]
+                )
 
         return config
 

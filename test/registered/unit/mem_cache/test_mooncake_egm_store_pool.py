@@ -1,6 +1,9 @@
 """Unit tests for the EGM-backed Mooncake Store pool (enable_egm_store_pool)."""
 
 import contextlib
+import json
+import os
+import tempfile
 import types
 import unittest
 from types import SimpleNamespace
@@ -174,6 +177,9 @@ class TestMooncakeEgmStorePoolConfig(CustomTestCase):
             ({"enable_egm_store_pool": "true"}, None, True, None),
             ({}, True, True, None),
             ({"enable_egm_store_pool": False}, True, False, None),
+            ({"enable_egm_store_pool": "yes"}, None, True, None),
+            ({"enable_egm_store_pool": " true "}, None, True, None),
+            ({}, "yes", True, None),
             ({"egm_numa_nodes": [0, 1]}, None, False, "0,1"),
             ({"egm_numa_nodes": " auto "}, None, False, "auto"),
         ]
@@ -190,6 +196,92 @@ class TestMooncakeEgmStorePoolConfig(CustomTestCase):
                     )
                 self.assertEqual(cfg.enable_egm_store_pool, expected_enabled)
                 self.assertEqual(cfg.egm_numa_nodes, expected_nodes)
+
+    def test_env_and_extra_config_accept_the_same_spellings(self):
+        """The env var and the extra_config key go through the same EnvBool
+        parser, so "yes" enables the pool from either source."""
+        with (
+            envs.MOONCAKE_MASTER.override("127.0.0.1:50051"),
+            envs.MOONCAKE_ENABLE_EGM_STORE_POOL.override("yes"),
+        ):
+            self.assertTrue(MooncakeStoreConfig.load_from_env().enable_egm_store_pool)
+        cfg = MooncakeStoreConfig.load_from_extra_config(
+            {**self._BASE, "enable_egm_store_pool": "yes"}
+        )
+        self.assertTrue(cfg.enable_egm_store_pool)
+
+
+def _storage_config_with(extra_config):
+    cfg = _make_storage_config()
+    cfg.extra_config = extra_config
+    return cfg
+
+
+def _is_egm_setup(store):
+    (args, kwargs) = store.setup_calls[0]
+    return len(args) == 1 and args[0].get("enable_egm_store_pool") == "true"
+
+
+class TestMooncakeEgmKeysOverrideEndpointSource(CustomTestCase):
+    """The EGM keys in extra_config configure this rank's own segment, so they
+    apply even when the master endpoint comes from the env or a config file
+    (extra_config then carries no server address)."""
+
+    def test_extra_config_enables_egm_with_env_endpoint(self):
+        with (
+            envs.MOONCAKE_MASTER.override("127.0.0.1:50051"),
+            envs.MOONCAKE_PROTOCOL.override("nvlink"),
+            envs.MOONCAKE_CHECK_SERVER.override(False),
+        ):
+            store = _build_store(
+                _EgmMooncakeStore,
+                _storage_config_with(
+                    {"enable_egm_store_pool": True, "egm_numa_nodes": "1"}
+                ),
+            )
+        self.assertTrue(_is_egm_setup(store))
+        self.assertEqual(store.setup_calls[0][0][0]["egm_numa_nodes"], "1")
+
+    def test_extra_config_disables_egm_from_config_file(self):
+        file_config = {
+            "master_server_address": "127.0.0.1:50051",
+            "metadata_server": "http://127.0.0.1:8080/metadata",
+            "protocol": "nvlink",
+            "check_server": False,
+            "enable_egm_store_pool": True,
+            "egm_numa_nodes": "0",
+        }
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump(file_config, f)
+        self.addCleanup(os.remove, f.name)
+        with envs.SGLANG_HICACHE_MOONCAKE_CONFIG_PATH.override(f.name):
+            from_file = _build_store(_EgmMooncakeStore, _storage_config_with({}))
+            overridden = _build_store(
+                _EgmMooncakeStore,
+                _storage_config_with({"enable_egm_store_pool": False}),
+            )
+        self.assertTrue(_is_egm_setup(from_file))
+        self.assertFalse(_is_egm_setup(overridden))
+
+
+class TestMooncakeEmbeddingStoreRejectsEgm(CustomTestCase):
+    def test_embedding_store_refuses_egm_before_mounting_a_segment(self):
+        """The embedding store mounts its segment through the positional setup(),
+        which builds an ordinary pool that NVLink peers cannot read."""
+        _EgmMooncakeStore.instances = []
+        with (
+            patch.dict("sys.modules", _fake_mooncake_modules(_EgmMooncakeStore)),
+            envs.MOONCAKE_MASTER.override("127.0.0.1:50051"),
+            envs.MOONCAKE_PROTOCOL.override("nvlink"),
+            envs.MOONCAKE_ENABLE_EGM_STORE_POOL.override(True),
+        ):
+            from sglang.srt.mem_cache.storage.mooncake_store.mooncake_embedding_store import (
+                MooncakeEmbeddingStore,
+            )
+
+            with self.assertRaisesRegex(ValueError, "enable_egm_store_pool"):
+                MooncakeEmbeddingStore()
+        self.assertEqual(_EgmMooncakeStore.instances[-1].setup_calls, [])
 
 
 if __name__ == "__main__":
