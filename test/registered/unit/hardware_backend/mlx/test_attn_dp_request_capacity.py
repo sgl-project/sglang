@@ -58,6 +58,7 @@ def _stub_for_initialize(
         max_running_requests=max_running_requests,
         max_mamba_cache_size=max_mamba_cache_size,
         disable_radix_cache=False,
+        page_size=1,
     )
     server_args = override.install()
     test.addCleanup(override.restore)
