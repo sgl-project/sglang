@@ -135,6 +135,11 @@ Currently, DeepEP, Mooncake, NIXL-EP, `ascend_fuseep`, `pplx` and MORI only supp
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>FlashInfer with a custom DSL for flexible and efficient MoE kernel generation, integrated with ModelOpt FP4 quantization. Compatible with flashinfer all-to-all.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Low-precision models with NVFP4.</td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>nvfp4_w4a16_sm90</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Grouped NVFP4 weight, BF16 activation GEMMs for ModelOpt NVFP4 MoE checkpoints on Hopper, with the weights repacked once at load. Standard dispatch only, without EPLB or CPU weight offload.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>NVFP4 MoE models on Hopper, in place of the default Marlin path.</td>
+    </tr>
   </tbody>
 </table>
 

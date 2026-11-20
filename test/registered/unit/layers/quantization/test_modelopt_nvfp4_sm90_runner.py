@@ -1,0 +1,413 @@
+"""ModelOptNvFp4FusedMoEMethod with --moe-runner-backend nvfp4_w4a16_sm90 on a synthetic NVFP4 MoE layer: create
+weights, load, repack, run through the MoE runner, and reload in place, against an FP32 reference with exact NVFP4
+dequantization."""
+
+import math
+import unittest
+from types import SimpleNamespace
+
+import torch
+
+from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
+from sglang.srt.layers.moe.topk import StandardTopKOutput
+from sglang.srt.layers.moe.utils import MoeRunnerBackend
+from sglang.srt.layers.quantization.modelopt_quant import (
+    ModelOptNvFp4FusedMoEMethod,
+    _check_nvfp4_sm90_runner_config,
+)
+from sglang.srt.runtime_context import get_context, get_exec, get_flags
+from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
+
+register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+
+E, H, I, TOPK = 16, 1024, 384, 4
+E2M1 = [
+    0.0,
+    0.5,
+    1.0,
+    1.5,
+    2.0,
+    3.0,
+    4.0,
+    6.0,
+    -0.0,
+    -0.5,
+    -1.0,
+    -1.5,
+    -2.0,
+    -3.0,
+    -4.0,
+    -6.0,
+]
+
+
+def _dequant(w, sf):
+    tab = torch.tensor(E2M1, device=w.device)
+    v = torch.stack((tab[(w & 15).long()], tab[(w >> 4).long()]), dim=-1).flatten(-2)
+    return v * sf.float().repeat_interleave(16, dim=-1)
+
+
+def _fill(layer, seed):
+    """Random checkpoint values written into the registered parameters, as the weight loader would."""
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    for name in ("w13", "w2"):
+        w = getattr(layer, name + "_weight")
+        w.data.copy_(
+            torch.randint(
+                0, 256, w.shape, dtype=torch.uint8, generator=g, device="cuda"
+            )
+        )
+        sf = getattr(layer, name + "_weight_scale")
+        sf.data.copy_(
+            torch.exp2(6.5 + torch.rand(sf.shape, generator=g, device="cuda")).to(
+                sf.dtype
+            )
+        )
+        k = w.shape[2] * 2
+        gs = getattr(layer, name + "_weight_scale_2")
+        gs.data.copy_(
+            torch.exp(0.5 * torch.randn(gs.shape, generator=g, device="cuda"))
+            / math.sqrt(8.6 * 1.3e4 * k)
+        )
+    return {n: p.data.clone() for n, p in layer.named_parameters()}
+
+
+def _reference(ck, x, ids, w, scale, swiglu_limit=None):
+    out = torch.zeros(x.shape, dtype=torch.float32, device="cuda")
+    n = ck["w2_weight"].shape[2] * 2
+    for e in range(ck["w2_weight"].shape[0]):
+        t, k = (ids == e).nonzero(as_tuple=True)
+        if t.numel() == 0:
+            continue
+        h = x.float()[t] @ _dequant(ck["w13_weight"][e], ck["w13_weight_scale"][e]).T
+        gs = ck["w13_weight_scale_2"][e]
+        gate, up = h[:, :n] * gs[0], h[:, n:] * gs[1]
+        if swiglu_limit is not None:
+            gate = gate.clamp(max=swiglu_limit)
+            up = up.clamp(-swiglu_limit, swiglu_limit)
+        a = torch.nn.functional.silu(gate) * up
+        y = (
+            a
+            @ (
+                _dequant(ck["w2_weight"][e], ck["w2_weight_scale"][e])
+                * ck["w2_weight_scale_2"][e]
+            ).T
+        )
+        out.index_add_(0, t, y * w[t, k].unsqueeze(1))
+    return out * scale
+
+
+class TestRunnerConfigRefusals(CustomTestCase):
+    """The op computes SiLU(gate) * up, clamped by swiglu_limit when the layer sets it, with router weights applied
+    after the down projection. Any other expert math must be refused, not run without it."""
+
+    def test_plain_and_swiglu_limit_pass(self):
+        _check_nvfp4_sm90_runner_config(MoeRunnerConfig())
+        _check_nvfp4_sm90_runner_config(MoeRunnerConfig(swiglu_limit=10.0))
+
+    def test_refuses_each_unsupported_variant(self):
+        for field, value in (
+            ("gemm1_clamp_limit", 10.0),
+            ("gemm1_alpha", 1.702),
+            ("gemm1_beta", 1.0),
+            ("apply_router_weight_on_input", True),
+        ):
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(ValueError, field):
+                    _check_nvfp4_sm90_runner_config(MoeRunnerConfig(**{field: value}))
+
+    def test_refuses_other_activations(self):
+        with self.assertRaisesRegex(ValueError, "gated SiLU"):
+            _check_nvfp4_sm90_runner_config(MoeRunnerConfig(activation="gelu"))
+
+
+@unittest.skipIf(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0),
+    "needs an sm_90 GPU",
+)
+class TestModelOptNvfp4Sm90Runner(CustomTestCase):
+    def setUp(self):
+        self.server_args = get_context().override_server_args(model_path="dummy")
+        self.server_args.install()
+        self.backend = get_flags().moe.override(
+            runner_backend=MoeRunnerBackend.NVFP4_W4A16_SM90
+        )
+        self.backend.__enter__()
+
+    def tearDown(self):
+        self.backend.__exit__(None, None, None)
+        self.server_args.restore()
+
+    def test_load_keeps_one_copy_of_the_experts(self):
+        """Loading must not leave the checkpoint-layout copy behind in the allocator: a model's KV pool is sized from
+        the memory left after loading, and on DeepSeek-R1 EP8 a repack into separately allocated buffers left 10.8GB
+        per GPU unusable (162,615 KV tokens against 493,518 on Marlin). Fails on a repack into new buffers."""
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        start = torch.cuda.memory_reserved()
+        layers = [self._layer(32, 2048, 768) for _ in range(4)]
+        e, h, i = 32, 2048, 768
+        per_layer = (
+            e * (2 * i // 256) * (h // 64) * 9216 + e * (h // 256) * (i // 64) * 9216
+        )
+        for k, (method, layer) in enumerate(layers):
+            _fill(layer, seed=k)
+            method.process_weights_after_loading(layer)
+        torch.cuda.synchronize()
+        grown = torch.cuda.memory_reserved() - start
+        # The four layers' experts, one layer's transient copy and the allocator's rounding.
+        self.assertLess(grown, 4 * per_layer + 1.5 * per_layer + (64 << 20))
+
+    def test_load_leaves_no_split_free_segments(self):
+        """Weight setup must not free memory between persistent allocations: each later layer then splits the freed
+        segments, and empty_cache cannot return a split segment, so the KV pool loses it. On Qwen3.8-Flash-Next-NVFP4
+        at TP2 EP2 that cost 1.25GB per GPU against Marlin. Fails when create_weights allocates the checkpoint-layout
+        experts and then rebinds them to the repacked buffers. Shapes are Qwen3.8-Flash-Next at EP2 and GLM-5.3 at
+        TP8, with a 30MB allocation per layer for the rest of the layer's weights."""
+        for e, h, i in ((256, 2560, 640), (256, 6144, 256), (512, 2560, 160)):
+            with self.subTest(hidden=h, intermediate=i):
+                self.assertLess(self._split_bytes_after_load(e, h, i), 8 << 20)
+
+    def _split_bytes_after_load(self, e, h, i):
+        """Inactive split bytes left by building, loading and repacking four layers. Every tensor dies on return, so
+        the next call starts from an empty cache."""
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        key = "inactive_split_bytes.all.current"
+        start = torch.cuda.memory_stats()[key]
+        held = []
+        for _ in range(4):
+            method, layer = self._layer(e, h, i)
+            other = torch.empty(30 << 20, dtype=torch.uint8, device="cuda")
+            held.append((method, layer, other))
+        for k, (method, layer, _) in enumerate(held):
+            _fill(layer, seed=k)
+            method.process_weights_after_loading(layer)
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        return torch.cuda.memory_stats()[key] - start
+
+    def test_repack_in_place_matches_a_separate_repack_bitwise(self):
+        """The loader writes checkpoint bytes into the repacked buffers, so the repack must read a copy, never bytes it
+        has already overwritten. At real shapes, after load and after an in-place reload under a captured graph, the
+        buffers must equal a repack of separate checkpoint tensors into new buffers bit for bit, and the graph must
+        replay the eager output bit for bit. Fails on a repack that reads the views it writes."""
+        from sglang.kernels.ops.quantization.nvfp4_sm90_repack import (
+            repack_modelopt_nvfp4_moe_for_sm90,
+        )
+
+        names = (
+            "w13_weight",
+            "w13_weight_scale",
+            "w13_weight_scale_2",
+            "w2_weight",
+            "w2_weight_scale",
+            "w2_weight_scale_2",
+        )
+        # Qwen3.8-Flash-Next at EP2 and TP2, TP8 (a half block, then 48 columns of padding), GLM-5.3 at TP8.
+        for e, h, i in (
+            (256, 2560, 640),
+            (512, 2560, 320),
+            (512, 2560, 80),
+            (256, 6144, 256),
+        ):
+            with self.subTest(hidden=h, intermediate=i):
+                method, layer = self._layer(e, h, i)
+                experts = layer.nvfp4_sm90_experts
+                g = torch.Generator(device="cuda").manual_seed(0)
+                x = torch.randn((64, h), generator=g, device="cuda").bfloat16()
+                ids = torch.randint(0, e, (64, TOPK), generator=g, device="cuda")
+                w = torch.rand((64, TOPK), generator=g, device="cuda")
+                topk = StandardTopKOutput(
+                    topk_weights=w,
+                    topk_ids=ids.int(),
+                    router_logits=torch.zeros((64, e), device="cuda"),
+                )
+                dispatch = StandardDispatchOutput(
+                    hidden_states=x, hidden_states_scale=None, topk_output=topk
+                )
+                graph = None
+                for seed in (1, 2):
+                    if seed == 2:
+                        method.restore_weights_before_loading(layer)
+                    ck = _fill(layer, seed=seed)
+                    method.process_weights_after_loading(layer)
+                    self.assertIs(layer.nvfp4_sm90_experts, experts)
+                    ref = repack_modelopt_nvfp4_moe_for_sm90(
+                        *(ck[n].clone() for n in names)
+                    )
+                    for f in ("w13", "w2", "gs13", "gs2", "gsr"):
+                        self.assertTrue(
+                            torch.equal(getattr(experts, f), getattr(ref, f)), f
+                        )
+                    del ref, ck
+                    eager = method.apply(layer, dispatch).hidden_states.clone()
+                    if graph is None:
+                        graph = torch.cuda.CUDAGraph()
+                        with torch.cuda.graph(graph):
+                            graph_out = method.apply(layer, dispatch).hidden_states
+                    graph.replay()
+                    torch.cuda.synchronize()
+                    self.assertTrue(torch.equal(graph_out, eager))
+                del method, layer, experts, graph, graph_out
+                torch.cuda.empty_cache()
+
+    def test_rejects_eplb(self):
+        with get_exec().moe.override(enable_eplb=True):
+            with self.assertRaisesRegex(ValueError, "enable-eplb"):
+                self._layer()
+
+    def test_swiglu_limit_at_a_narrow_width(self):
+        """GLM-5.3-Flash-style layer (swiglu_limit 10) at a per-GPU width of 160, with gate and up large enough that
+        the clamp binds often: the runner must pass the limit to the op. Fails on: a runner that drops the limit
+        (about 3x the bound off), a create_weights or repack that still needs a multiple of 128."""
+        e, h, i = 16, 1024, 160
+        method, layer = self._layer(e, h, i, swiglu_limit=10.0)
+        ck = _fill(layer, seed=5)
+        ck["w13_weight_scale_2"] *= 20.0  # gate and up about 20 wide
+        layer.w13_weight_scale_2.data.copy_(ck["w13_weight_scale_2"])
+        method.process_weights_after_loading(layer)
+        g = torch.Generator(device="cuda").manual_seed(9)
+        for T in (1, 300):
+            x = torch.randn((T, h), generator=g, device="cuda").bfloat16()
+            ids = torch.argsort(torch.rand((T, e), generator=g, device="cuda"), dim=1)[
+                :, :TOPK
+            ].int()
+            w = torch.rand((T, TOPK), generator=g, device="cuda")
+            out = self._apply(method, layer, x, ids, w)
+            ref = _reference(ck, x, ids, w, 2.5, swiglu_limit=10.0)
+            free = _reference(ck, x, ids, w, 2.5)
+            self.assertLess(float((out.float() - ref).norm() / ref.norm()), 0.01)
+            self.assertGreater(float((free - ref).norm() / ref.norm()), 0.5)
+
+    def _layer(self, e=E, h=H, i=I, swiglu_limit=None):
+        method = ModelOptNvFp4FusedMoEMethod(
+            SimpleNamespace(
+                is_checkpoint_nvfp4_serialized=True,
+                group_size=16,
+                get_name=lambda: "modelopt_fp4",
+            )
+        )
+        config = MoeRunnerConfig(
+            num_experts=e,
+            num_local_experts=e,
+            hidden_size=h,
+            intermediate_size_per_partition=i,
+            top_k=TOPK,
+            activation="silu",
+            is_gated=True,
+            routed_scaling_factor=2.5,
+            swiglu_limit=swiglu_limit,
+        )
+        layer = torch.nn.Module()
+        layer.num_experts = layer.num_local_experts = e
+        layer.moe_runner_config = config
+        layer._mega_moe_nvfp4 = False  # FusedMoE.__init__ sets it
+        with torch.device("cuda"):
+            method.create_weights(layer, e, h, i, torch.bfloat16, weight_loader=None)
+        method.create_moe_runner(layer, config)
+        return method, layer
+
+    def _inputs(self, T, seed):
+        g = torch.Generator(device="cuda").manual_seed(seed)
+        x = torch.randn((T, H), generator=g, device="cuda").bfloat16()
+        ids = torch.argsort(torch.rand((T, E), generator=g, device="cuda"), dim=1)[
+            :, :TOPK
+        ].int()
+        ids[0, 0] = -1  # another rank's route
+        w = torch.rand((T, TOPK), generator=g, device="cuda")
+        return x, ids, w
+
+    def _apply(self, method, layer, x, ids, w):
+        topk = StandardTopKOutput(
+            topk_weights=w,
+            topk_ids=ids,
+            router_logits=torch.zeros((x.shape[0], layer.num_experts), device="cuda"),
+        )
+        return method.apply(
+            layer,
+            StandardDispatchOutput(
+                hidden_states=x, hidden_states_scale=None, topk_output=topk
+            ),
+        ).hidden_states
+
+    def _assert_close(self, out, ck, x, ids, w):
+        ref = _reference(ck, x, ids, w, 2.5)
+        rel = float((out.float() - ref).norm() / ref.norm())
+        self.assertLess(rel, 0.01)
+
+    def _check(self, method, layer, ck, T, seed):
+        x, ids, w = self._inputs(T, seed)
+        self._assert_close(self._apply(method, layer, x, ids, w), ck, x, ids, w)
+
+    def test_load_run_and_reload(self):
+        """Fails on: a repack that drops the up global scale or the routed scaling factor, a method that keeps the
+        checkpoint copy (memory doubles), a reload that skips the restore (the loader writes into empty tensors) or
+        the repack (the graph keeps the old weights), a restore that allocates a second copy of the experts, or a
+        reload that repacks into new buffers (the captured graph keeps reading the old ones)."""
+        method, layer = self._layer()
+        ck = _fill(layer, seed=1)
+        ck["w13_weight_scale_2"][:, 1] *= 3.0  # gate and up global scales differ
+        layer.w13_weight_scale_2.data.copy_(ck["w13_weight_scale_2"])
+        method.process_weights_after_loading(layer)
+        self.assertEqual(layer.w13_weight.numel() + layer.w2_weight_scale.numel(), 0)
+        experts = layer.nvfp4_sm90_experts
+        for T in (1, 37, 1024):
+            self._check(method, layer, ck, T, seed=T)
+
+        # A CUDA graph captured on the first weights must serve the reloaded ones.
+        x, ids, w = self._inputs(64, seed=4)
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            self._apply(method, layer, x, ids, w)
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            graph_out = self._apply(method, layer, x, ids, w)
+        graph.replay()
+        self._assert_close(graph_out, ck, x, ids, w)
+
+        torch.cuda.synchronize()
+        allocated = torch.cuda.memory_allocated()
+        method.restore_weights_before_loading(layer)
+        self.assertEqual(torch.cuda.memory_allocated(), allocated)
+        for name in ("w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale"):
+            param = getattr(layer, name)
+            self.assertEqual(param.shape, ck[name].shape)
+            self.assertEqual(param.dtype, ck[name].dtype)
+            buf = experts.w13 if name.startswith("w13") else experts.w2
+            self.assertEqual(
+                param.untyped_storage().data_ptr(), buf.untyped_storage().data_ptr()
+            )
+        ck2 = _fill(layer, seed=2)
+        method.process_weights_after_loading(layer)
+        self.assertIs(layer.nvfp4_sm90_experts, experts)
+        self.assertEqual(layer.w13_weight.numel() + layer.w2_weight_scale.numel(), 0)
+        self._check(method, layer, ck2, 300, seed=3)
+        graph.replay()
+        self._assert_close(graph_out, ck2, x, ids, w)
+
+
+class TestRoutedScalingPlacement(CustomTestCase):
+    def test_runner_scales_the_combined_output(self):
+        """The runner applies the routed scaling factor to its output, so top-k must not fold it in as well."""
+        from sglang.srt.layers.moe.fused_moe_triton.layer import (
+            _fuses_routed_scaling_factor_in_topk,
+        )
+
+        method = object.__new__(ModelOptNvFp4FusedMoEMethod)
+        self.assertFalse(
+            _fuses_routed_scaling_factor_in_topk(
+                method, MoeRunnerBackend.NVFP4_W4A16_SM90
+            )
+        )
+        self.assertTrue(
+            _fuses_routed_scaling_factor_in_topk(method, MoeRunnerBackend.TRITON)
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
