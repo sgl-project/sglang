@@ -109,9 +109,8 @@ executed sequentially.
 
 On Ascend NPU, SenseNova-U1 automatically uses fused inference attention,
 RMSNorm, and SwiGLU MLP operators for supported inputs. FIA and SwiGLU fall back
-when their requirements are not met. Run one complete warmup request before
-benchmarking because the fused MLP packs its gate and up projection weights on
-first use.
+when their requirements are not met. The gate and up projection weights that the
+fused MLP consumes are packed once at load time, on CUDA and NPU alike.
 
 ## 6. Benchmark
 
