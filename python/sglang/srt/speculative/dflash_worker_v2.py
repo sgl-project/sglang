@@ -67,7 +67,10 @@ from sglang.srt.runtime_context import (
     get_spec,
     mamba_track_grid,
 )
-from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.sampling.sampling_batch_info import (
+    SamplingBatchInfo,
+    has_acc_penalties,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, HiCacheDraftPlan
 from sglang.srt.speculative.dflash_dp import gather_draft_embedding
@@ -307,6 +310,7 @@ def _verify_logits_unadjusted(sampling_info) -> bool:
     return not (
         sampling_info.has_custom_logit_processor
         or (penalizer is not None and penalizer.is_required)
+        or has_acc_penalties(sampling_info)
         or sampling_info.grammar_mask is not None
         or sampling_info.logit_bias is not None
         or sampling_info.sampling_mask_batch_indices is not None
