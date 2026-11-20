@@ -139,7 +139,7 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
                     self.kr_cache_dim,
                 ),
                 dtype=(
-                    torch.bfloat16 if self.dsa_kv_cache_store_fp8 else self.store_dtype
+                    torch.bfloat16 if self.dsa_kv_cache_store_c8 else self.store_dtype
                 ),
                 device=self.device,
             )
@@ -156,7 +156,7 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
                     dtype=self.store_dtype,
                     device=self.device,
                 )
-                if self.dsa_kv_cache_store_fp8 and self.num_indexer_layers > 0:
+                if self.dsa_kv_cache_store_c8 and self.num_indexer_layers > 0:
                     from sglang.srt.layers.attention.dsa.dsa_npu_indexer import (
                         create_npu_hadamard_128,
                     )
@@ -174,7 +174,7 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
             # live in ONE flat byte allocation (one allocation, two dtype
             # views).
             _v_dtype = (
-                torch.bfloat16 if self.dsa_kv_cache_store_fp8 else self.store_dtype
+                torch.bfloat16 if self.dsa_kv_cache_store_c8 else self.store_dtype
             )
             _k_bytes = (
                 kv_pages
@@ -196,7 +196,7 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
                 .view(self.store_dtype)
                 .view(kv_pages, self.page_size, 1, self.kv_cache_dim)
             )
-            # v_buffer is always materialized (bfloat16 in fp8 mode), so the
+            # v_buffer is always materialized (bfloat16 in c8 mode), so the
             # remote v scratch mirrors that dtype instead of store_dtype.
             self.remote_v_buffer = (
                 self.remote_kv_all[_k_bytes:]
@@ -544,7 +544,7 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
         if self.use_combined_kv_buffer or self.use_fia_nz:
             return
         loc, _, _ = unwrap_write_loc(loc_info)
-        if self.dsa_kv_cache_store_fp8:
+        if self.dsa_kv_cache_store_c8:
             if cache_v is None:
                 cache_k, cache_v = cache_k.split(
                     [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
@@ -695,17 +695,17 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
         """Layer count covered by ``num_entries`` contiguous buf entries.
 
         ``get_contiguous_buf_infos`` reports one entry per layer per buffer
-        group (the groups of ``_get_disagg_buffer_entries``: latent k, non-fp8
-        v, indexer k, fp8 index scale), so the owned layer count is the entry
+        group (the groups of ``_get_disagg_buffer_entries``: latent k, non-c8
+        v, indexer k, index scale), so the owned layer count is the entry
         count divided by the group count — not the raw entry count.
         """
-        groups = 1  # latent k (v stays packed into k in fp8 mode)
-        if not self.dsa_kv_cache_store_fp8:
+        groups = 1  # latent k (v stays packed into k in c8 mode)
+        if not self.dsa_kv_cache_store_c8:
             groups += 1  # v
         if self.index_head_dim is not None:
             groups += 1  # indexer k
             if self.index_k_scale_buffer is not None:
-                groups += 1  # fp8 index scale
+                groups += 1  # index scale
         assert groups > 0 and num_entries % groups == 0, (
             f"layer-split transfer reported {num_entries} entries, "
             f"not a multiple of {groups} buffer groups"

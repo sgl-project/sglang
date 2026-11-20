@@ -128,12 +128,12 @@ class TestShardBookkeeping(CustomTestCase):
         pool.index_k_scale_buffer = None
         pool.indexer_layer_ids = (5, 7)
         cases = [
-            # (dsa_kv_cache_store_fp8, expected ids)
+            # (dsa_kv_cache_store_c8, expected ids)
             (False, [5, 6, 7, 5, 6, 7, 5, 7]),  # k + v + indexer k
             (True, [5, 6, 7, 5, 7]),  # packed k/v + indexer k
         ]
         for packed, expected in cases:
-            pool.dsa_kv_cache_store_fp8 = packed
+            pool.dsa_kv_cache_store_c8 = packed
             ptrs, _, _ = pool.get_contiguous_buf_infos()
             self.assertEqual(pool.get_kv_layer_ids(), expected)
             self.assertEqual(len(ptrs), len(expected))
@@ -141,19 +141,19 @@ class TestShardBookkeeping(CustomTestCase):
     def test_get_kv_transfer_layer_span_counts_buffer_groups(self):
         pool = _make_pool()
         cases = [
-            # (dsa_kv_cache_store_fp8, has_scale, expected_groups)
+            # (dsa_kv_cache_store_c8, has_scale, expected_groups)
             (False, False, 3),  # k + v + indexer k
             (True, False, 2),  # packed k/v + indexer k
             (True, True, 3),  # packed k/v + indexer k + fp32 scale
         ]
-        for fp8, has_scale, groups in cases:
-            pool.dsa_kv_cache_store_fp8 = fp8
+        for c8, has_scale, groups in cases:
+            pool.dsa_kv_cache_store_c8 = c8
             pool.index_k_scale_buffer = object() if has_scale else None
             self.assertEqual(pool.get_kv_transfer_layer_span(6 * groups), 6)
 
         # Non-multiple entry counts are a registration bug: refuse silently
         # mis-slicing the layer span.
-        pool.dsa_kv_cache_store_fp8 = False
+        pool.dsa_kv_cache_store_c8 = False
         pool.index_k_scale_buffer = None
         with self.assertRaises(AssertionError):
             pool.get_kv_transfer_layer_span(7)
@@ -164,7 +164,7 @@ class TestShardBookkeeping(CustomTestCase):
         from sglang.srt.hardware_backend.npu import dsa_cache_layer_split
 
         pool = _make_pool(kv_dim=6)
-        pool.dsa_kv_cache_store_fp8 = True
+        pool.dsa_kv_cache_store_c8 = True
         loc = torch.tensor([0, 1])
         packed = torch.zeros((2, 6))
         with (
