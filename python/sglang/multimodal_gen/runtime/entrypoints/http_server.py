@@ -1,7 +1,6 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 import asyncio
-import base64
 import os
 import signal
 import uuid
@@ -10,6 +9,7 @@ from typing import TYPE_CHECKING, Optional
 
 import httpx
 import psutil
+import pybase64
 import torch
 from fastapi import APIRouter, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -569,7 +569,7 @@ def encode_video_to_base64(file_path: str):
         content = f.read()
     if not content:
         raise ValueError(f"Empty model output file: {file_path}")
-    return base64.b64encode(content).decode("utf-8")
+    return pybase64.b64encode(content).decode("utf-8")
 
 
 async def forward_to_scheduler(
