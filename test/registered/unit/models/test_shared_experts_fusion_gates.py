@@ -886,6 +886,9 @@ class TestQwen3_5Gate(_FusionGateCase):
 class _StubExperts(torch.nn.Module):
     def __init__(self, **kwargs):
         super().__init__()
+        # The block binds its TopK to these.
+        self.runner_backend = None
+        self.routing_method_type = kwargs.get("routing_method_type")
 
 
 class TestQwen2MoeSharedExpertUnderDwdp(_FusionGateCase):
