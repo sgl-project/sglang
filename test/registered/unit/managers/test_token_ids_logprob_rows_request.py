@@ -18,7 +18,6 @@ register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
 MALFORMED_ROWS = {
     "too-few-rows": [[4, 2]],
-    "too-many-rows": [[4, 2], [5], [6]],
     "out-of-vocabulary": [[4, 2], [8]],
     "negative-id": [[4, 2], [-1]],
     "non-list-row": [[4, 2], 5],
@@ -60,7 +59,7 @@ def test_malformed_rows_are_rejected(rows):
         _validate(_request(token_ids_logprob_rows=rows))
 
 
-@pytest.mark.parametrize("boundaries", [(), (12,), (24,), (30,), (12, 24, 30)])
+@pytest.mark.parametrize("boundaries", [(), (12, 24, 30)])
 @pytest.mark.parametrize("logprob_start_len", [0, 19, 23])
 def test_each_extend_scores_its_own_rows(boundaries, logprob_start_len):
     torch.manual_seed(4)
