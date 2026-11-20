@@ -80,7 +80,7 @@ def pool_at_delimiter_positions(
     data: torch.Tensor,
     forward_batch: ForwardBatch,
     device: torch.device,
-) -> List[torch.Tensor]:
+) -> tuple[torch.Tensor, List[int]]:
     """Pool a tensor at the position before each MIS delimiter for every request.
 
     Uses pre-computed delimiter indices from ForwardBatch (CPU tensors),
@@ -93,7 +93,7 @@ def pool_at_delimiter_positions(
         device: Device for the index tensor.
 
     Returns:
-        One tensor per request, shaped [num_delimiters, dim].
+        Gathered rows and the delimiter count for each request.
     """
     all_index_tensors: List[torch.Tensor] = []
     delim_counts: List[int] = []
@@ -113,7 +113,7 @@ def pool_at_delimiter_positions(
         index_tensor = torch.cat(all_index_tensors).to(device, non_blocking=True)
     else:
         index_tensor = torch.tensor([], dtype=torch.long, device=device)
-    return list(data[index_tensor].split(delim_counts))
+    return data[index_tensor], delim_counts
 
 
 def pool_at_positions(
@@ -121,7 +121,7 @@ def pool_at_positions(
     per_request_indices: List[torch.Tensor],
     forward_batch: ForwardBatch,
     device: torch.device,
-) -> List[torch.Tensor]:
+) -> tuple[torch.Tensor, List[int]]:
     """Pool a tensor exactly AT the given token positions for every request.
 
     Unlike ``pool_at_delimiter_positions`` (which pools at delimiter - 1), this
@@ -135,7 +135,7 @@ def pool_at_positions(
         device: Device for the index tensor.
 
     Returns:
-        One tensor per request, shaped [num_anchors, dim].
+        Gathered rows and the anchor count for each request.
     """
     all_index_tensors: List[torch.Tensor] = []
     counts: List[int] = []
@@ -152,7 +152,7 @@ def pool_at_positions(
         index_tensor = torch.cat(all_index_tensors).to(device, non_blocking=True)
     else:
         index_tensor = torch.empty(0, dtype=torch.long, device=device)
-    return list(data[index_tensor].split(counts))
+    return data[index_tensor], counts
 
 
 def score_and_pool(
@@ -182,21 +182,21 @@ def score_and_pool(
         and forward_batch.is_prefill_only
     ):
         # Setwise readout: pool the head AT each requested position (no -1 shift,
-        # no discarded boundary row). Concat to call the head once, then split.
-        per_request_phs = pool_at_positions(
+        # no discarded boundary row). Score the gathered rows before splitting.
+        phs_flat, pos_counts = pool_at_positions(
             hidden_states,
             forward_batch.token_indices_to_pool,
             forward_batch,
             input_ids.device,
         )
-        phs_flat = torch.cat(per_request_phs, dim=0)
         scores_flat = score_head(phs_flat)
-        pos_counts = [t.shape[0] for t in per_request_phs]
         per_request_scores = list(scores_flat.split(pos_counts))
         return EmbeddingPoolerOutput(
             embeddings=per_request_scores,
             pooled_hidden_states=(
-                per_request_phs if forward_batch.return_pooled_hidden_states else None
+                list(phs_flat.split(pos_counts))
+                if forward_batch.return_pooled_hidden_states
+                else None
             ),
         )
 
@@ -206,19 +206,18 @@ def score_and_pool(
     ):
         # Pool hidden states at pre-delimiter positions, score only those —
         # avoids wasting compute on tokens that never contribute to the output.
-        # pool_at_delimiter_positions returns one tensor per request; we concat
-        # to call score_head once, then split back per request.
-        per_request_phs = pool_at_delimiter_positions(
+        # Score the gathered rows once, then split back per request.
+        phs_flat, delim_counts = pool_at_delimiter_positions(
             hidden_states, forward_batch, input_ids.device
         )
-        phs_flat = torch.cat(per_request_phs, dim=0)
         scores_flat = score_head(phs_flat)
-        delim_counts = [t.shape[0] for t in per_request_phs]
         per_request_scores = list(scores_flat.split(delim_counts))
         return EmbeddingPoolerOutput(
             embeddings=per_request_scores,
             pooled_hidden_states=(
-                per_request_phs if forward_batch.return_pooled_hidden_states else None
+                list(phs_flat.split(delim_counts))
+                if forward_batch.return_pooled_hidden_states
+                else None
             ),
         )
 
