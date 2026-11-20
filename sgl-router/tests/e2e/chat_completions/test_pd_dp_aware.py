@@ -5,7 +5,8 @@
 
 The router picks the prefill rank (cached prefix, else fewest in flight) and the
 decode rank (fewest in flight) and pins each with ``X-Data-Parallel-Rank``. Which
-rank served a request is read from the engine's own ``/metrics`` ``dp_rank`` label.
+rank served a request is read from the engine's own ``/metrics`` ``dp_rank`` label
+on the scheduler histograms (the request counter is the tokenizer's, unranked).
 """
 
 from __future__ import annotations
@@ -35,12 +36,15 @@ RANKS = frozenset(range(DP_SIZE))
 _METRIC_RE = re.compile(r"^([\w:]+)\{([^}]*)\}\s+(-?\d+(?:\.\d+)?)\s*$")
 _LABEL_RE = re.compile(r'(\w+)="([^"]*)"')
 
-# Same env as the engine's PD CI fixture.
+# Same env as the engine's PD CI fixture, plus the prefill-side override: a plain
+# dp2 prefill defaults to follow_bootstrap_room and checks the room against
+# attn_dp_rank, which is 0 on every replica, so a room for rank 1 is rejected.
 _MOONCAKE_ENV = {
     "MC_TCP_ENABLE_CONNECTION_POOL": "true",
     "MC_MIN_RPC_PORT": "61000",
     "MC_MAX_RPC_PORT": "65000",
     "SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1",
+    "SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK": "1",
 }
 
 
@@ -163,8 +167,14 @@ def _per_rank(text: str, name: str) -> dict[int, float]:
     return out
 
 
-def _served(url: str) -> dict[int, float]:
-    return _per_rank(_scrape(url), "sglang:num_requests_total")
+def _prefilled(url: str) -> dict[int, float]:
+    """Requests whose KV a prefill rank finished sending."""
+    return _per_rank(_scrape(url), "sglang:kv_transfer_latency_ms_count")
+
+
+def _decoded(url: str) -> dict[int, float]:
+    """Requests a decode rank bootstrapped a KV transfer for."""
+    return _per_rank(_scrape(url), "sglang:kv_transfer_bootstrap_ms_count")
 
 
 def _running(url: str) -> dict[int, float]:
@@ -173,6 +183,20 @@ def _running(url: str) -> dict[int, float]:
 
 def _delta(before: dict[int, float], after: dict[int, float]) -> dict[int, int]:
     return {r: int(after.get(r, 0) - before.get(r, 0)) for r in RANKS}
+
+
+def _settled(read, before: dict[int, float], total: int) -> dict[int, int]:
+    """Per-rank delta once ``total`` more requests are counted (or 10s pass).
+
+    The scheduler observes a request a loop iteration after the client has its
+    reply, so a read taken immediately can be one short.
+    """
+    deadline = time.time() + 10.0
+    while True:
+        delta = _delta(before, read())
+        if sum(delta.values()) >= total or time.time() >= deadline:
+            return delta
+        time.sleep(0.1)
 
 
 def _only_rank(delta: dict[int, int]) -> int:
@@ -234,7 +258,7 @@ def test_concurrent_requests_use_every_prefill_and_decode_rank(topology):
     """Eight in flight at once land on both prefill and both decode ranks."""
     topo = topology
     max_tokens = 48
-    p0, d0 = _served(topo.prefill.url), _served(topo.decode.url)
+    p0, d0 = _prefilled(topo.prefill.url), _decoded(topo.decode.url)
     results: list[httpx.Response | Exception] = [None] * 8  # type: ignore[list-item]
 
     def one(i: int) -> None:
@@ -252,10 +276,8 @@ def test_concurrent_requests_use_every_prefill_and_decode_rank(topology):
         assert isinstance(r, httpx.Response), r
         _assert_completed(r, max_tokens)
 
-    prefill, decode = (
-        _delta(p0, _served(topo.prefill.url)),
-        _delta(d0, _served(topo.decode.url)),
-    )
+    prefill = _settled(lambda: _prefilled(topo.prefill.url), p0, 8)
+    decode = _settled(lambda: _decoded(topo.decode.url), d0, 8)
     assert sum(prefill.values()) == 8, prefill
     assert sum(decode.values()) == 8, decode
     assert all(prefill[r] > 0 for r in RANKS), f"a prefill rank sat idle: {prefill}"
@@ -269,10 +291,10 @@ def test_repeated_prefix_sticks_to_the_prefill_rank_that_cached_it(topology):
     """Once a rank's KV events reach the router, repeats of the prompt go to it."""
     topo = topology
     prompt = _long_prompt("affinity")
-    before = _served(topo.prefill.url)
+    before = _prefilled(topo.prefill.url)
     blocks = _prefill_tree_blocks(topo.router.base_url, topo.prefill.url)
     _assert_completed(_chat(topo, prompt, max_tokens=8), 8)
-    owner = _only_rank(_delta(before, _served(topo.prefill.url)))
+    owner = _only_rank(_settled(lambda: _prefilled(topo.prefill.url), before, 1))
 
     # Before the KV events land a repeat would be placed by load, not by cache.
     deadline = time.time() + 60.0
@@ -281,10 +303,10 @@ def test_repeated_prefix_sticks_to_the_prefill_rank_that_cached_it(topology):
         time.sleep(0.5)
 
     repeats = 8
-    before = _served(topo.prefill.url)
+    before = _prefilled(topo.prefill.url)
     for _ in range(repeats):
         _assert_completed(_chat(topo, prompt, max_tokens=8), 8)
-    delta = _delta(before, _served(topo.prefill.url))
+    delta = _settled(lambda: _prefilled(topo.prefill.url), before, repeats)
     # By load alone eight sequential repeats on one rank is a 1-in-256 accident.
     assert delta == {owner: repeats, 1 - owner: 0}, f"owner={owner} delta={delta}"
 
@@ -338,9 +360,9 @@ def test_decode_rank_avoids_the_rank_holding_a_long_request(topology):
         assert len(busy) == 1, f"long request on several decode ranks: {busy}"
         holder = busy[0]
 
-        before = _served(topo.decode.url)
+        before = _decoded(topo.decode.url)
         _assert_completed(_chat(topo, _long_prompt("short"), max_tokens=8), 8)
-        delta = _delta(before, _served(topo.decode.url))
+        delta = _settled(lambda: _decoded(topo.decode.url), before, 1)
         assert delta[1 - holder] == 1, f"holder={holder} delta={delta}"
     finally:
         thread.join(timeout=300)
