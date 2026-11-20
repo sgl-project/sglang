@@ -1,11 +1,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
-"""SM100 FP8 GEMM derived from kernel_sm100_bf16.py.
+"""SM100 FP8 grouped GEMM with block-128 or row scales.
 
-Each 128-element K partial is drained from tensor memory, scaled in FP32,
-and accumulated in registers. Software scaling preserves checkpoint values
-and permits 8-wide token tiles.
-
-Scale layouts after swap_ab: weights [N/128, K/128, E], tokens [M, K/128, E|1].
+Block scales apply to each K tile. Row scales apply once in the epilogue.
 """
 
 from typing import Type
@@ -28,20 +24,25 @@ from sglang.kernels.ops.lora.moe.cutedsl.scheduler import (
 )
 
 
-class GroupedGemmKernelSm100Fp8(GroupedGemmKernelSm100Bf16):
+class _ScaledFp8Kernel:
+    """The FP8 kernel of both scale layouts; ``ROW_SCALED`` picks one."""
+
+    ROW_SCALED: bool
+    _NAME: str
+    _TILE_REASON: str
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         if not self.swap_ab:
-            raise ValueError("the software-scaled FP8 kernel ships swap_ab only")
+            raise ValueError(f"the {self._NAME} FP8 kernel ships swap_ab only")
         if self.use_2cta_instrs or self.cluster_shape_mn != (1, 1):
             raise ValueError(
-                "the software-scaled FP8 kernel ships (1, 1) single-CTA only"
+                f"the {self._NAME} FP8 kernel ships (1, 1) single-CTA only"
             )
         if self.mma_tiler_mn[0] != 128 or self.mma_tiler_mn[1] > 128:
             raise ValueError(
-                "the software-scaled FP8 kernel indexes weight scales per 128-wide "
-                "output tile and stages one column scale per epilogue thread, so "
-                f"mma_tiler_mn must be (128, <=128); got {self.mma_tiler_mn}"
+                f"the {self._NAME} FP8 kernel {self._TILE_REASON}, so mma_tiler_mn "
+                f"must be (128, <=128); got {self.mma_tiler_mn}"
             )
 
     def check_supported_dtypes(
@@ -52,7 +53,7 @@ class GroupedGemmKernelSm100Fp8(GroupedGemmKernelSm100Bf16):
     ):
         if a_dtype is not cutlass.Float8E4M3FN or b_dtype is not cutlass.Float8E4M3FN:
             raise testing.CantImplementError(
-                f"the software-scaled GEMM takes e4m3 A/B; got {a_dtype}, {b_dtype}"
+                f"the {self._NAME} GEMM takes e4m3 A/B; got {a_dtype}, {b_dtype}"
             )
         if c_dtype is not cutlass.BFloat16:
             raise testing.CantImplementError(f"C must be BF16; got {c_dtype}")
@@ -66,8 +67,8 @@ class GroupedGemmKernelSm100Fp8(GroupedGemmKernelSm100Bf16):
         self,
         a: cute.Tensor,
         b: cute.Tensor,
-        sf_a: cute.Tensor,  # weight scales [NT, KT, E] fp32
-        sf_b: cute.Tensor,  # token scales [M, KT, E|1] fp32
+        sf_a: cute.Tensor,  # weight scales: [NT, KT, E] block, [N, E] row fp32
+        sf_b: cute.Tensor,  # token scales: [M, KT, E|1] block, [M, E|1] row fp32
         c: cute.Tensor,
         group_m: cute.Tensor,
         direct_schedule: cute.Tensor,
@@ -86,7 +87,7 @@ class GroupedGemmKernelSm100Fp8(GroupedGemmKernelSm100Bf16):
         tiled_mma = self._create_tiled_mma()
         self._setup_attributes()
         # One k_tile must cover exactly one 128-element scale group.
-        if cutlass.const_expr(self.mma_tiler[2] != 128):
+        if cutlass.const_expr(not self.ROW_SCALED and self.mma_tiler[2] != 128):
             raise ValueError(
                 f"k_tile must equal the 128-element scale group; got "
                 f"{self.mma_tiler[2]} (mma_inst_tile_k={self.mma_inst_tile_k})"
@@ -164,6 +165,26 @@ class GroupedGemmKernelSm100Fp8(GroupedGemmKernelSm100Bf16):
         )
         return
 
+    def _shared_storage(self):
+        """Build the struct outside the traced class body because CuTe rewrites class-body ifs."""
+        row_scaled = self.ROW_SCALED
+
+        @cute.struct
+        class SharedStorage:
+            ab_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
+            acc_full_mbar_ptr: cute.struct.MemRange[
+                cutlass.Int64, self.num_acc_stage * 2
+            ]
+            if row_scaled:
+                row_scale: cute.struct.MemRange[
+                    cutlass.Float32, self.cta_tile_shape_mnk[0]
+                ]
+            col_scale: cute.struct.MemRange[cutlass.Float32, self.cta_tile_shape_mnk[1]]
+            tmem_dealloc_mbar: cutlass.Int64
+            tmem_holding_buf: cutlass.Int32
+
+        return SharedStorage
+
     @cute.kernel
     def kernel(
         self,
@@ -196,20 +217,11 @@ class GroupedGemmKernelSm100Fp8(GroupedGemmKernelSm100Bf16):
             cpasync.prefetch_descriptor(tma_atom_c)
 
         tidx, _, _ = cute.arch.thread_idx()
+        cta_m = self.cta_tile_shape_mnk[0]
         cta_n = self.cta_tile_shape_mnk[1]
 
-        @cute.struct
-        class SharedStorage:
-            ab_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
-            acc_full_mbar_ptr: cute.struct.MemRange[
-                cutlass.Int64, self.num_acc_stage * 2
-            ]
-            col_scale: cute.struct.MemRange[cutlass.Float32, self.cta_tile_shape_mnk[1]]
-            tmem_dealloc_mbar: cutlass.Int64
-            tmem_holding_buf: cutlass.Int32
-
         smem = utils.SmemAllocator()
-        storage = smem.allocate(SharedStorage)
+        storage = smem.allocate(self._shared_storage())
 
         ab_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
         ab_pipeline_consumer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, 1)
@@ -262,6 +274,10 @@ class GroupedGemmKernelSm100Fp8(GroupedGemmKernelSm100Bf16):
             byte_alignment=128,
             swizzle=b_smem_layout_staged.inner,
         )
+        if cutlass.const_expr(self.ROW_SCALED):
+            sRowScale = cute.make_tensor(
+                storage.row_scale.data_ptr(), cute.make_layout(cta_m)
+            )
         sColScale = cute.make_tensor(
             storage.col_scale.data_ptr(), cute.make_layout(cta_n)
         )
@@ -377,38 +393,75 @@ class GroupedGemmKernelSm100Fp8(GroupedGemmKernelSm100Bf16):
                 pipeline.PipelineUserType.Producer, self.num_acc_stage
             )
 
-            while work_tile.is_valid_tile:
-                ab_consumer.reset()
-                peek_ab_full_status = ab_consumer.try_wait()
-
-                # Hand each 128-K partial to the epilogue warps for scaling.
-                for k_tile in range(work_tile.k_tile_cnt):
+            if cutlass.const_expr(self.ROW_SCALED):
+                # The scale is K-invariant: accumulate the whole tile in TMEM.
+                while work_tile.is_valid_tile:
                     tCtAcc = tCtAcc_base[(None, None, None, acc_producer_state.index)]
+
+                    ab_consumer.reset()
+                    peek_ab_full_status = ab_consumer.try_wait()
                     acc_pipeline.producer_acquire(acc_producer_state)
-
-                    handle = ab_consumer.wait_and_advance(peek_ab_full_status)
                     tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
-                    num_kblocks = cute.size(tCrA, mode=[2])
-                    for kblk_idx in cutlass.range(num_kblocks, unroll_full=True):
-                        kblk_crd = (None, None, kblk_idx, handle.index)
-                        cute.gemm(
-                            tiled_mma,
-                            tCtAcc,
-                            tCrA[kblk_crd],
-                            tCrB[kblk_crd],
-                            tCtAcc,
-                        )
-                        tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
-                    handle.release()
 
-                    peek_ab_full_status = cutlass.Boolean(1)
-                    if handle.count + 1 < work_tile.k_tile_cnt:
-                        peek_ab_full_status = ab_consumer.try_wait()
+                    for k_tile in range(work_tile.k_tile_cnt):
+                        handle = ab_consumer.wait_and_advance(peek_ab_full_status)
+                        num_kblocks = cute.size(tCrA, mode=[2])
+                        for kblk_idx in cutlass.range(num_kblocks, unroll_full=True):
+                            kblk_crd = (None, None, kblk_idx, handle.index)
+                            cute.gemm(
+                                tiled_mma,
+                                tCtAcc,
+                                tCrA[kblk_crd],
+                                tCrB[kblk_crd],
+                                tCtAcc,
+                            )
+                            tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                        handle.release()
+
+                        peek_ab_full_status = cutlass.Boolean(1)
+                        if handle.count + 1 < work_tile.k_tile_cnt:
+                            peek_ab_full_status = ab_consumer.try_wait()
 
                     acc_pipeline.producer_commit(acc_producer_state)
                     acc_producer_state.advance()
 
-                work_tile = tile_sched.advance_to_next_work()
+                    work_tile = tile_sched.advance_to_next_work()
+
+            else:
+                while work_tile.is_valid_tile:
+                    ab_consumer.reset()
+                    peek_ab_full_status = ab_consumer.try_wait()
+
+                    # Hand each 128-K partial to the epilogue warps for scaling.
+                    for k_tile in range(work_tile.k_tile_cnt):
+                        tCtAcc = tCtAcc_base[
+                            (None, None, None, acc_producer_state.index)
+                        ]
+                        acc_pipeline.producer_acquire(acc_producer_state)
+
+                        handle = ab_consumer.wait_and_advance(peek_ab_full_status)
+                        tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+                        num_kblocks = cute.size(tCrA, mode=[2])
+                        for kblk_idx in cutlass.range(num_kblocks, unroll_full=True):
+                            kblk_crd = (None, None, kblk_idx, handle.index)
+                            cute.gemm(
+                                tiled_mma,
+                                tCtAcc,
+                                tCrA[kblk_crd],
+                                tCrB[kblk_crd],
+                                tCtAcc,
+                            )
+                            tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                        handle.release()
+
+                        peek_ab_full_status = cutlass.Boolean(1)
+                        if handle.count + 1 < work_tile.k_tile_cnt:
+                            peek_ab_full_status = ab_consumer.try_wait()
+
+                        acc_pipeline.producer_commit(acc_producer_state)
+                        acc_producer_state.advance()
+
+                    work_tile = tile_sched.advance_to_next_work()
 
             acc_pipeline.producer_tail(acc_producer_state)
 
@@ -442,7 +495,7 @@ class GroupedGemmKernelSm100Fp8(GroupedGemmKernelSm100Bf16):
                 num_threads=32 * len(self.epilogue_warp_id),
             )
 
-            # Match accumulator elements to token columns for scale lookup.
+            # Match accumulator elements to (weight row, token) for scale lookup.
             tCgC_t = utils.gemm.sm100.transform_partitioned_tensor_layout(tCgC)
             tCtAcc_t = utils.gemm.sm100.transform_partitioned_tensor_layout(tCtAcc_base)
             tiled_copy_t2r, tTR_tAcc_base, tTR_rAcc = (
@@ -501,22 +554,16 @@ class GroupedGemmKernelSm100Fp8(GroupedGemmKernelSm100Bf16):
                         seg_base_tile + mma_tile_coord_mnl[1],
                         cutlass.Int32(0),
                     )
-                k_tile_cnt = work_tile.k_tile_cnt
-                nt_idx = mma_tile_coord_mnl[0]
-                token_base = mma_tile_coord_mnl[1] * cta_n
-                token_rest_l = mma_tile_coord_mnl[2]
-                work_tile = tile_sched.advance_to_next_work()
+                if cutlass.const_expr(self.ROW_SCALED):
+                    row_base = mma_tile_coord_mnl[0] * cta_m
+                    token_base = mma_tile_coord_mnl[1] * cta_n
+                    token_rest_l = mma_tile_coord_mnl[2]
+                    work_tile = tile_sched.advance_to_next_work()
 
-                for i in cutlass.range_constexpr(frag_size):
-                    for st in cutlass.range_constexpr(subtile_cnt):
-                        tTR_rTotal[(i, st)] = cutlass.Float32(0.0)
-
-                for k_tile in range(k_tile_cnt):
-                    sw = sf_a[(nt_idx, k_tile, weight_expert)]
+                    if tidx < cta_m:
+                        sRowScale[tidx] = sf_a[(row_base + tidx, weight_expert)]
                     if tidx < cta_n:
-                        sColScale[tidx] = (
-                            sw * sf_b[(token_base + tidx, k_tile, token_rest_l)]
-                        )
+                        sColScale[tidx] = sf_b[(token_base + tidx, token_rest_l)]
                     epilog_sync_barrier.arrive_and_wait()
 
                     acc_pipeline.consumer_wait(acc_consumer_state)
@@ -531,14 +578,56 @@ class GroupedGemmKernelSm100Fp8(GroupedGemmKernelSm100Bf16):
                             tTR_rAcc,
                         )
                         for i in cutlass.range_constexpr(frag_size):
-                            col = tTR_cC[(i, st)][1]
-                            tTR_rTotal[(i, st)] = (
-                                tTR_rTotal[(i, st)] + tTR_rAcc_flat[i] * sColScale[col]
+                            coord = tTR_cC[(i, st)]
+                            tTR_rTotal[(i, st)] = tTR_rAcc_flat[i] * (
+                                sRowScale[coord[0]] * sColScale[coord[1]]
                             )
+                    # The next tile restages the scales only after the store
+                    # loop's barriers, which follow these reads.
                     with cute.arch.elect_one():
                         acc_pipeline.consumer_release(acc_consumer_state)
                     acc_consumer_state.advance()
-                    epilog_sync_barrier.arrive_and_wait()
+
+                else:
+                    k_tile_cnt = work_tile.k_tile_cnt
+                    nt_idx = mma_tile_coord_mnl[0]
+                    token_base = mma_tile_coord_mnl[1] * cta_n
+                    token_rest_l = mma_tile_coord_mnl[2]
+                    work_tile = tile_sched.advance_to_next_work()
+
+                    for i in cutlass.range_constexpr(frag_size):
+                        for st in cutlass.range_constexpr(subtile_cnt):
+                            tTR_rTotal[(i, st)] = cutlass.Float32(0.0)
+
+                    for k_tile in range(k_tile_cnt):
+                        sw = sf_a[(nt_idx, k_tile, weight_expert)]
+                        if tidx < cta_n:
+                            sColScale[tidx] = (
+                                sw * sf_b[(token_base + tidx, k_tile, token_rest_l)]
+                            )
+                        epilog_sync_barrier.arrive_and_wait()
+
+                        acc_pipeline.consumer_wait(acc_consumer_state)
+                        tTR_tAcc = tTR_tAcc_base[
+                            (None, None, None, None, None, acc_consumer_state.index)
+                        ]
+                        tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
+                        for st in cutlass.range_constexpr(subtile_cnt):
+                            cute.copy(
+                                tiled_copy_t2r,
+                                tTR_tAcc[(None, None, None, st)],
+                                tTR_rAcc,
+                            )
+                            for i in cutlass.range_constexpr(frag_size):
+                                col = tTR_cC[(i, st)][1]
+                                tTR_rTotal[(i, st)] = (
+                                    tTR_rTotal[(i, st)]
+                                    + tTR_rAcc_flat[i] * sColScale[col]
+                                )
+                        with cute.arch.elect_one():
+                            acc_pipeline.consumer_release(acc_consumer_state)
+                        acc_consumer_state.advance()
+                        epilog_sync_barrier.arrive_and_wait()
 
                 num_prev_subtiles = num_tiles_executed * subtile_cnt
                 bSG_gC = bSG_gC_partitioned[(None, None, None, *mma_tile_coord_mnl)]
@@ -572,3 +661,18 @@ class GroupedGemmKernelSm100Fp8(GroupedGemmKernelSm100Bf16):
             c_pipeline.producer_tail()
             tmem.relinquish_alloc_permit()
             tmem.free(tmem_ptr)
+
+
+class GroupedGemmKernelSm100Fp8(_ScaledFp8Kernel, GroupedGemmKernelSm100Bf16):
+    ROW_SCALED = False
+    _NAME = "software-scaled"
+    _TILE_REASON = (
+        "indexes weight scales per 128-wide output tile and stages one column "
+        "scale per epilogue thread"
+    )
+
+
+class GroupedGemmKernelSm100Fp8Rowwise(_ScaledFp8Kernel, GroupedGemmKernelSm100Bf16):
+    ROW_SCALED = True
+    _NAME = "row-scaled"
+    _TILE_REASON = "stages one weight-row scale and one token scale per epilogue thread"
