@@ -452,6 +452,84 @@ def _handle_dflash(server_args: ServerArgs) -> None:
         )
 
 
+DEFAULT_DFLY_BLOCK_SIZE = 6
+
+
+def _dfly_block_size_from_checkpoint(cfg) -> Optional[int]:
+    from sglang.srt.hf_transformers import get_config
+
+    hf_config = get_config(
+        cfg.model_path,
+        trust_remote_code=cfg.trust_remote_code,
+        revision=cfg.revision,
+    )
+    block_size = getattr(hf_config, "dfly_block_size", None)
+    if block_size is not None:
+        return int(block_size)
+    spec = getattr(hf_config, "speculative_config", None)
+    if isinstance(spec, dict) and spec.get("num_speculative_tokens") is not None:
+        return int(spec["num_speculative_tokens"]) + 1
+    return None
+
+
+def _handle_hy4_flash_dfly(server_args: ServerArgs) -> None:
+    cfg = resolving_view(server_args)
+    if not cfg.device.startswith("cuda"):
+        raise ValueError("DFLY speculative decoding requires CUDA.")
+    if attn_dp_enabled_of(cfg) or cfg.pp_size != 1 or cfg.attn_cp_size != 1:
+        raise ValueError("DFLY does not support DP attention, PP or CP.")
+    if cfg.disaggregation_mode != "null":
+        raise ValueError("DFLY does not support PD disaggregation.")
+    if cfg.enable_lora:
+        raise ValueError("DFLY does not support LoRA.")
+    if cfg.speculative_draft_model_path not in (None, cfg.model_path):
+        raise ValueError("DFLY drafts live in the target checkpoint.")
+    if cfg.speculative_draft_attention_backend is not None:
+        raise ValueError("DFLY drafts run on the target attention backend.")
+    for name in ("speculative_num_steps", "speculative_eagle_topk"):
+        if getattr(cfg, name) not in (None, 1):
+            raise ValueError(f"DFLY requires {name} == 1.")
+        declare_resolution(server_args, "_handle_dfly", **{name: 1})
+    if cfg.speculative_dfly_block_size is not None:
+        block_size = int(cfg.speculative_dfly_block_size)
+        if block_size <= 0:
+            raise ValueError(
+                "DFLY requires --speculative-dfly-block-size to be positive, "
+                f"got {block_size}."
+            )
+        if cfg.speculative_num_draft_tokens not in (None, block_size):
+            raise ValueError(
+                "--speculative-num-draft-tokens and --speculative-dfly-block-size "
+                f"differ ({cfg.speculative_num_draft_tokens} vs {block_size}); "
+                "for DFLY they must match."
+            )
+        declare_resolution(
+            server_args, "_handle_dfly", speculative_num_draft_tokens=block_size
+        )
+    elif cfg.speculative_num_draft_tokens is None:
+        block_size = _dfly_block_size_from_checkpoint(cfg)
+        if block_size is None:
+            block_size = DEFAULT_DFLY_BLOCK_SIZE
+            logger.warning(
+                "The checkpoint declares no DFly block size; defaulting to %d.",
+                block_size,
+            )
+        declare_resolution(
+            server_args, "_handle_dfly", speculative_num_draft_tokens=block_size
+        )
+    if not 2 <= int(cfg.speculative_num_draft_tokens) <= 17:
+        raise ValueError("DFLY requires a block size in [2, 17].")
+    if cfg.enable_mixed_chunk:
+        declare_resolution(server_args, "_handle_dfly", enable_mixed_chunk=False)
+        logger.warning("Mixed chunked prefill is disabled for DFLY.")
+    if cfg.max_running_requests is None:
+        declare_resolution(server_args, "_handle_dfly", max_running_requests=48)
+        logger.warning(
+            "Max running requests is reset to 48 for speculative decoding. You "
+            "can override this by explicitly setting --max-running-requests."
+        )
+
+
 def _handle_uno(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
 
@@ -1146,6 +1224,107 @@ def _resolve_dflash_draft_kv_ring(server_args: ServerArgs) -> None:
     )
 
 
+def _handle_dfly(server_args: ServerArgs) -> None:
+    from sglang.srt.speculative.dfly_validation import dfly_targets_hy4_flash
+
+    if dfly_targets_hy4_flash(model_config_of(server_args).hf_config.architectures):
+        _handle_hy4_flash_dfly(server_args)
+    else:
+        _handle_hy4_dfly(server_args)
+
+
+def _handle_hy4_dfly(server_args: ServerArgs) -> None:
+    from sglang.srt.configs.hy_v4 import HYV4VLConfig
+    from sglang.srt.configs.hy_v4_dfly import (
+        build_hyv4_dfly_draft_config,
+        check_hyv4_dfly_quant_config,
+        check_hyv4_dfly_serving,
+        has_hyv4_dfly_mxfp4_groups,
+        resolve_hyv4_dfly_spec,
+    )
+    from sglang.srt.model_executor.cuda_graph_config import Phase
+
+    cfg = resolving_view(server_args)
+    if not cfg.device.startswith("cuda"):
+        raise ValueError(f"DFLY runs on CUDA only, got device {cfg.device!r}.")
+    if cfg.speculative_draft_model_path not in (None, cfg.model_path):
+        raise ValueError(
+            "DFLY drafts with the layers bundled in the target checkpoint; "
+            "leave --speculative-draft-model-path unset."
+        )
+    if cfg.speculative_num_steps not in (None, 1):
+        raise ValueError(
+            "DFLY drafts one block per step; --speculative-num-steps must be 1, "
+            f"got {cfg.speculative_num_steps}."
+        )
+    hf_config = model_config_of(server_args).hf_config
+    text_config = (
+        hf_config.text_config if isinstance(hf_config, HYV4VLConfig) else hf_config
+    )
+    num_draft_tokens = cfg.speculative_num_draft_tokens
+    if cfg.speculative_dfly_block_size is not None:
+        if num_draft_tokens not in (None, cfg.speculative_dfly_block_size):
+            raise ValueError(
+                "--speculative-num-draft-tokens and --speculative-dfly-block-size "
+                f"differ ({num_draft_tokens} vs {cfg.speculative_dfly_block_size}); "
+                "for DFLY they must match."
+            )
+        num_draft_tokens = cfg.speculative_dfly_block_size
+    spec = resolve_hyv4_dfly_spec(
+        text_config, speculative_num_draft_tokens=num_draft_tokens
+    )
+    quantization_config = getattr(hf_config, "quantization_config", None)
+    check_hyv4_dfly_quant_config(quantization_config)
+    if has_hyv4_dfly_mxfp4_groups(quantization_config):
+        from sglang.srt.models.hunyuan_v4_dfly import check_hyv4_dfly_mxfp4_placement
+
+        check_hyv4_dfly_mxfp4_placement(
+            quantization_config, hf_config=hf_config, spec=spec
+        )
+    check_hyv4_dfly_serving(
+        spec=spec,
+        draft_config=build_hyv4_dfly_draft_config(text_config, spec),
+        dtype=cfg.dtype,
+        tp_size=cfg.tp_size,
+        attn_dp_size=cfg.attn_dp_size,
+        pp_size=cfg.pp_size,
+        attn_cp_size=cfg.attn_cp_size,
+        dcp_size=cfg.dcp_size,
+        disaggregation_mode=cfg.disaggregation_mode,
+        enable_lora=bool(cfg.enable_lora),
+        enable_two_batch_overlap=cfg.enable_two_batch_overlap,
+        kv_cache_dtype=cfg.kv_cache_dtype,
+        draft_kv_cache_dtype=cfg.speculative_draft_kv_cache_dtype,
+        draft_quantization=(
+            cfg.speculative_draft_model_quantization
+            if cfg.speculative_draft_model_quantization not in (None, cfg.quantization)
+            else None
+        ),
+        draft_attention_backend=cfg.speculative_draft_attention_backend,
+        speculative_eagle_topk=cfg.speculative_eagle_topk,
+        decode_cuda_graph_backend=cfg.cuda_graph_config[Phase.DECODE].backend,
+        prefill_cuda_graph_backend=cfg.cuda_graph_config[Phase.PREFILL].backend,
+        enable_mixed_chunk=cfg.enable_mixed_chunk,
+    )
+    # The request state and verify buffers are sized from it before the KV pool.
+    if cfg.max_running_requests is None:
+        declare_resolution(server_args, "_handle_dfly", max_running_requests=48)
+        logger.warning(
+            "Max running requests is reset to 48 for speculative decoding. You "
+            "can override this by explicitly setting --max-running-requests."
+        )
+    # One draft forward and one target verify over the anchor plus N drafts.
+    declare_resolution(
+        server_args,
+        "_handle_dfly",
+        speculative_draft_model_path=cfg.model_path,
+        speculative_draft_model_revision=cfg.revision,
+        speculative_num_draft_tokens=spec.query_width,
+        speculative_num_steps=1,
+        speculative_eagle_topk=1,
+    )
+
+
 def _handle_frozen_kv_mtp(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
     if cfg.max_running_requests is None:
@@ -1336,6 +1515,7 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
         "HYV3ForCausalLM",
         "Xing4_0ForCausalLM",
         "HYV4ForCausalLM",
+        "HYV4VLForConditionalGeneration",
         # Qwen4-Exp ships its NEXTN draft layer inside the target checkpoint.
         "Qwen4ExpForConditionalGeneration",
     ]:

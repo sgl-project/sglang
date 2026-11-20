@@ -5,6 +5,7 @@ including content format detection and message processing.
 """
 
 import logging
+from typing import Optional
 
 import jinja2
 import transformers.utils.chat_template_utils as hf_chat_utils
@@ -180,6 +181,87 @@ def jinja_template_may_reorder_tool_results(chat_template: str) -> bool:
     return False
 
 
+def _append_image_data(chunk: dict, image_data: list, modalities: list) -> None:
+    image_obj = chunk.get("image_url") or {}
+    if isinstance(image_obj, str):
+        image_obj = {"url": image_obj, "detail": chunk.get("detail")}
+    mdp = image_obj.get("max_dynamic_patch", None)
+    image_data.append(
+        ImageData(
+            url=image_obj["url"],
+            detail=image_obj.get("detail") or "auto",
+            max_dynamic_patch=mdp,
+            content_hash=image_obj.get("content_hash"),
+            max_long_side_pixel=image_obj.get("max_long_side_pixel"),
+        )
+    )
+    if chunk.get("modalities"):
+        modalities.append(chunk.get("modalities"))
+
+
+def _append_video_data(chunk: dict, video_data: list, modalities: list) -> None:
+    video_obj = chunk.get("video_url") or {}
+    mdp = video_obj.get("max_dynamic_patch", None)
+    preprocess_kwargs = {
+        key: video_obj[key]
+        for key in GLM_MEDIA_CONFIG_KEYS
+        if video_obj.get(key) is not None
+    }
+    if mdp is not None:
+        preprocess_kwargs["max_dynamic_patch"] = mdp
+    max_long_side_pixel = video_obj.get("max_long_side_pixel")
+    if not preprocess_kwargs and max_long_side_pixel is None:
+        video_data.append(chunk["video_url"]["url"])
+    else:
+        # VideoData survives load_video on every processor; a
+        # plain dict only the GLM consumer understands.
+        video_data.append(
+            VideoData(
+                url=video_obj["url"],
+                preprocess_kwargs=preprocess_kwargs or None,
+                max_long_side_pixel=max_long_side_pixel,
+            )
+        )
+    if chunk.get("modalities"):
+        modalities.append(chunk.get("modalities"))
+
+
+def _flatten_content_with_media_placeholders(
+    content: list,
+    media_placeholders: dict[str, str],
+    image_data: list,
+    video_data: list,
+    audio_data: list,
+    modalities: list,
+) -> str:
+    parts = []
+    previous_is_text = False
+    for chunk in content:
+        if not isinstance(chunk, dict):
+            continue
+        chunk_type = chunk.get("type")
+        if chunk_type in ("text", "input_text"):
+            if previous_is_text:
+                parts.append(" ")
+            parts.append(chunk["text"])
+            previous_is_text = True
+            continue
+        if chunk_type in ("image_url", "input_image"):
+            _append_image_data(chunk, image_data, modalities)
+            modality = "image"
+        elif chunk_type == "video_url":
+            _append_video_data(chunk, video_data, modalities)
+            modality = "video"
+        elif chunk_type == "audio_url":
+            audio_data.append(chunk["audio_url"]["url"])
+            modality = "audio"
+        else:
+            continue
+        parts.append(media_placeholders.get(modality, ""))
+        previous_is_text = False
+    return "".join(parts)
+
+
 def jinja_template_reads_reasoning_content(chat_template: str) -> bool:
     if not isinstance(chat_template, str):
         return False
@@ -220,6 +302,7 @@ def process_content_for_template_format(
     audio_data: list,
     modalities: list,
     use_dpsk_v32_encoding: bool = False,
+    media_placeholders: Optional[dict[str, str]] = None,
 ) -> dict:
     """
     Process message content based on detected template format.
@@ -232,6 +315,8 @@ def process_content_for_template_format(
         audio_data: List to append extracted audio URLs
         modalities: List to append modalities
         use_dpsk_v32_encoding: If True, extract multimodal data and convert content to string (for DeepSeek-V3.2 encoding)
+        media_placeholders: For 'string' format, modality -> placeholder text. When set,
+            media parts are kept and replaced by their placeholder in content order.
 
     Returns:
         Processed message dictionary
@@ -250,50 +335,11 @@ def process_content_for_template_format(
                 chunk_type = chunk.get("type")
 
                 if chunk_type in ("image_url", "input_image"):
-                    image_obj = chunk.get("image_url") or {}
-                    if isinstance(image_obj, str):
-                        image_obj = {"url": image_obj, "detail": chunk.get("detail")}
-                    mdp = image_obj.get("max_dynamic_patch", None)
-                    # Also allow flat style: chunk["max_dynamic_patch"]
-                    image_data.append(
-                        ImageData(
-                            url=image_obj["url"],
-                            detail=image_obj.get("detail") or "auto",
-                            max_dynamic_patch=mdp,
-                            content_hash=image_obj.get("content_hash"),
-                            max_long_side_pixel=image_obj.get("max_long_side_pixel"),
-                        )
-                    )
-
-                    if chunk.get("modalities"):
-                        modalities.append(chunk.get("modalities"))
+                    _append_image_data(chunk, image_data, modalities)
                     # Normalize to simple 'image' type for template compatibility
                     processed_content_parts.append({"type": "image"})
                 elif chunk_type == "video_url":
-                    video_obj = chunk.get("video_url") or {}
-                    mdp = video_obj.get("max_dynamic_patch", None)
-                    preprocess_kwargs = {
-                        key: video_obj[key]
-                        for key in GLM_MEDIA_CONFIG_KEYS
-                        if video_obj.get(key) is not None
-                    }
-                    if mdp is not None:
-                        preprocess_kwargs["max_dynamic_patch"] = mdp
-                    max_long_side_pixel = video_obj.get("max_long_side_pixel")
-                    if not preprocess_kwargs and max_long_side_pixel is None:
-                        video_data.append(chunk["video_url"]["url"])
-                    else:
-                        # VideoData survives load_video on every processor; a
-                        # plain dict only the GLM consumer understands.
-                        video_data.append(
-                            VideoData(
-                                url=video_obj["url"],
-                                preprocess_kwargs=preprocess_kwargs or None,
-                                max_long_side_pixel=max_long_side_pixel,
-                            )
-                        )
-                    if chunk.get("modalities"):
-                        modalities.append(chunk.get("modalities"))
+                    _append_video_data(chunk, video_data, modalities)
                     # Normalize to simple 'video' type for template compatibility
                     processed_content_parts.append({"type": "video"})
                 elif chunk_type == "audio_url":
@@ -320,6 +366,18 @@ def process_content_for_template_format(
             new_msg["content"] = " ".join(text_parts) if text_parts else ""
         else:
             new_msg["content"] = processed_content_parts
+        return new_msg
+
+    elif content_format == "string" and media_placeholders is not None:
+        new_msg = {k: v for k, v in msg_dict.items() if v is not None}
+        new_msg["content"] = _flatten_content_with_media_placeholders(
+            msg_dict["content"],
+            media_placeholders,
+            image_data,
+            video_data,
+            audio_data,
+            modalities,
+        )
         return new_msg
 
     elif content_format == "string":

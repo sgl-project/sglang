@@ -223,7 +223,8 @@ class TestDraftModelConfig(CustomTestCase):
 
     def test_qwen4_exp_spec_hidden_size_keeps_hc_width(self):
         """Qwen4-Exp's MTP draft consumes the hc-flattened target stream,
-        so spec_hidden_size must stay hidden_size * hc_mult; hy_v4 collapses first."""
+        so spec_hidden_size must stay hidden_size * hc_mult; hy_v4 collapses
+        first for its draft but hands pipeline stages the flattened streams."""
         hidden_size, hc_mult = 2560, 4
         self.assertEqual(Qwen4ExpTextConfig(hc_count=hc_mult).hc_mult, hc_mult)
         for arch in ("Qwen4ExpForConditionalGeneration", "Qwen4ExpForCausalLMMTP"):
@@ -234,13 +235,14 @@ class TestDraftModelConfig(CustomTestCase):
                 ),
                 (hidden_size * hc_mult, hidden_size * hc_mult),
             )
-        hy_v4 = SimpleNamespace(architectures=["HYV4ForCausalLM"])
-        self.assertEqual(
-            resolve_spec_hidden_size(
-                hf_config=hy_v4, hidden_size=hidden_size, hc_mult=hc_mult
-            ),
-            (hidden_size, None),
-        )
+        for arch in ("HYV4ForCausalLM", "HYV4VLForConditionalGeneration"):
+            hy_v4 = SimpleNamespace(architectures=[arch])
+            self.assertEqual(
+                resolve_spec_hidden_size(
+                    hf_config=hy_v4, hidden_size=hidden_size, hc_mult=hc_mult
+                ),
+                (hidden_size, hidden_size * hc_mult),
+            )
 
 
 class TestExternalModelConfig(CustomTestCase):

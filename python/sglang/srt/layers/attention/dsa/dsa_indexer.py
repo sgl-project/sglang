@@ -1171,8 +1171,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     f"_get_k_bf16 received a {len(x)}-tuple; expected a plain tensor "
                     "or a 3-tuple (fp8, scale, bf16) from fused_rms_fp8_group_quant."
                 )
-        # Non-fusion path only; self.wk does not exist when fusion is on.
-        key, _ = self.wk(x)
+        if self.use_dsa_indexer_fusion:
+            key, _ = self._fused_k_weights(x)
+        else:
+            key, _ = self.wk(x)
         key = self.k_norm(key)
         if not self.skip_rope:
             k_rope, _ = torch.split(
@@ -2284,7 +2286,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 act_quant=act_quant,
                 out_cache_loc=out_cache_loc,
             )
-        elif self.use_dsa_indexer_fusion:
+        elif self.use_dsa_indexer_fusion and positions.ndim == 1:
             key_raw, _ = self._fused_k_weights(x)
             if num_tokens is not None:
                 assert num_tokens <= key_raw.shape[0]
@@ -2299,7 +2301,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 out_cache_loc=out_cache_loc,
             )
         else:
-            key = self._get_k_bf16(x, positions)
+            key = self._get_k_bf16(x, positions, rotate=not self.use_dsa_indexer_fusion)
             if num_tokens is not None:
                 assert num_tokens <= key.shape[0]
                 key = key[:num_tokens]
@@ -2592,6 +2594,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             self.use_dsa_indexer_fusion
             and not in_piecewise_or_breakable_cuda_graph
             and forward_batch.attn_cp_metadata is None
+            # The fused rope kernels index the cache with 1-D positions only.
+            and positions.ndim == 1
         ) or (
             self._wk_gate_weight is not None
             and (

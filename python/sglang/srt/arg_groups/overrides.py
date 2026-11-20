@@ -547,9 +547,14 @@ def _dsa_kv_cache_dtype_default(view: Any) -> dict:
 
     kv_cache_dtype = view.kv_cache_dtype
     has_attention_sinks = bool(getattr(hf_config, "learnable_sink", False))
-    if has_attention_sinks and kv_cache_dtype not in ("auto", "bf16", "bfloat16"):
+    if has_attention_sinks and kv_cache_dtype not in (
+        "auto",
+        "bf16",
+        "bfloat16",
+        "fp8_e4m3",
+    ):
         raise ValueError(
-            "Learnable DSA attention sinks require a bfloat16 KV cache; "
+            "Learnable DSA attention sinks require a bfloat16 or fp8_e4m3 KV cache; "
             f"got kv_cache_dtype={kv_cache_dtype}."
         )
     if kv_cache_dtype == "auto":
@@ -671,6 +676,85 @@ def _check_tilelang_dsa_fp8_kv(
     )
 
 
+# FlashInfer v0.7.0.post1-v0.7.4 TllmGenFmhaRunner (fmhaRunner.cuh) accepts only these SMs;
+# SM12x has a separate sparse MLA backend that the DSA trtllm path does not request.
+_TRTLLM_GEN_CAPABILITIES = frozenset({(10, 0), (10, 3), (10, 7)})
+
+
+def _reject_unsupported_sink_fp8_kv(
+    view: Any, *, model_arch: str, capability: tuple[int, int]
+) -> None:
+    unsupported = []
+    if capability not in _TRTLLM_GEN_CAPABILITIES:
+        unsupported.append("SM{}{}".format(*capability))
+    if (getattr(view, "dcp_size", 1) or 1) > 1:
+        unsupported.append(f"dcp_size={view.dcp_size!r}")
+    if view.enable_prefill_cp:
+        unsupported.append("--enable-prefill-cp")
+    if unsupported:
+        raise ValueError(
+            f"--kv-cache-dtype fp8_e4m3 for {model_arch} with learnable attention "
+            "sinks is supported only on SM100, SM103 and SM107, where the TRT-LLM-gen "
+            "sparse MLA kernel reads the FP8 cache, and without decode or prefill "
+            "context parallelism. Got " + ", ".join(unsupported) + "."
+        )
+
+
+def _learnable_sink_dsa_backends(
+    view: Any, *, model_arch: str, kv_cache_dtype: str, capability: tuple[int, int]
+) -> dict:
+    fp8_kv = kv_cache_dtype == "fp8_e4m3"
+    if fp8_kv:
+        _reject_unsupported_sink_fp8_kv(
+            view, model_arch=model_arch, capability=capability
+        )
+    dcp = (getattr(view, "dcp_size", 1) or 1) > 1
+    # Only TRT-LLM returns the LSE that DCP merges the sink through, and it is the
+    # only sink backend that reads FP8 KV; flashmla_sparse decode reads it as bf16.
+    trtllm_only = dcp or fp8_kv
+    backend = "trtllm" if trtllm_only else "flashmla_sparse"
+    allowed = ("trtllm",) if trtllm_only else ("flashmla_sparse", "trtllm")
+    if dcp:
+        condition = " under --dcp-size > 1"
+    elif fp8_kv:
+        condition = " with --kv-cache-dtype fp8_e4m3"
+    else:
+        condition = ""
+    for field in ("dsa_prefill_backend", "dsa_decode_backend"):
+        value = getattr(view, field)
+        if value is not None and value not in allowed:
+            option = "--" + field.replace("_", "-")
+            raise ValueError(
+                f"{model_arch} uses learnable attention sinks and requires "
+                f"{option} in {allowed!r}{condition}; got {value!r}"
+            )
+    declared: Dict[str, Any] = {}
+    if view.dsa_prefill_backend is None:
+        declared["dsa_prefill_backend"] = backend
+    if view.dsa_decode_backend is None:
+        declared["dsa_decode_backend"] = backend
+    prefill = declared.get("dsa_prefill_backend", view.dsa_prefill_backend)
+    decode = declared.get("dsa_decode_backend", view.dsa_decode_backend)
+    if "trtllm" in (prefill, decode) and capability not in _TRTLLM_GEN_CAPABILITIES:
+        remedy = (
+            "drop --dcp-size, since no other sink backend returns the LSE the DCP "
+            "merge needs"
+            if dcp
+            else "use the default flashmla_sparse DSA backends"
+        )
+        raise ValueError(
+            f"{model_arch} uses learnable attention sinks and resolved DSA backends "
+            f"prefill={prefill}, decode={decode}{condition}, but the TRT-LLM-gen "
+            "sparse MLA kernel runs only on SM100, SM103 and SM107. "
+            f"Got SM{capability[0]}{capability[1]}; {remedy}."
+        )
+    logger.warning(
+        "Set DSA backends for learnable attention sinks: "
+        f"prefill={prefill}, decode={decode}."
+    )
+    return declared
+
+
 @register_post_process
 def _dsa_split_backend_resolution(view: Any) -> dict:
     """Resolve DSA split backends from KV-cache dtype and device capability.
@@ -703,7 +787,7 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
 
     import torch
 
-    major, _ = torch.cuda.get_device_capability()
+    major, minor = torch.cuda.get_device_capability()
     if kimi_k31:
         return _kimi_k31_dsa_backends(view)
 
@@ -720,21 +804,12 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
     )
 
     if getattr(hf_config, "learnable_sink", False):
-        backend = "flashmla_sparse"
-        declared = _pin_dsa_backends(
+        return _learnable_sink_dsa_backends(
             view,
-            backend,
-            lambda option, value: (
-                f"{model_arch} uses learnable attention sinks and requires "
-                f"{option} {backend!r}; got {value!r}"
-            ),
+            model_arch=model_arch,
+            kv_cache_dtype=kv_cache_dtype,
+            capability=(major, minor),
         )
-        logger.warning(
-            "Set DSA backends for learnable attention sinks: "
-            f"prefill={declared.get('dsa_prefill_backend', view.dsa_prefill_backend)}, "
-            f"decode={declared.get('dsa_decode_backend', view.dsa_decode_backend)}."
-        )
-        return declared
 
     if is_glm_sm12_fp8:
         backend = "flashinfer_sparse_mla"
@@ -930,6 +1005,8 @@ _DEEPSEEK_FAMILY_ARCHS = frozenset(
         "Glm5NextForConditionalGeneration",
         "HYV4ForCausalLM",
         "HYV4ForCausalLMNextN",
+        "HYV4VLForConditionalGeneration",
+        "HYV4FlashForConditionalGeneration",
         "LongcatFlashForCausalLM",
         "LongcatFlashForCausalLMNextN",
         "Dots3NoteForCausalLM",

@@ -351,6 +351,13 @@ class EagerRunner(BaseRunner):
         rank-local slice, then gather hidden states before the logits step.
         """
         model = self.model_runner.model
+        # VLM wrappers without a `.model` keep the text body, head and logits
+        # processor on `.language_model` (same order as resolve_language_model).
+        text_model = (
+            model
+            if hasattr(model, "model")
+            else getattr(model, "language_model", model)
+        )
 
         input_ids = forward_batch.input_ids
         if prepare_inputs := getattr(model, "prepare_cp_inputs", None):
@@ -377,7 +384,7 @@ class EagerRunner(BaseRunner):
             input_ids,
         ) as (sharded_input_embeds, sharded_positions, model_input_ids):
             model_kwargs["input_embeds"] = sharded_input_embeds
-            body = model.model
+            body = getattr(model, "model", text_model.model)
             if hasattr(body, "logits_processor"):
                 # A multimodal wrapper exposes its causal LM as `.model`; run
                 # that LM's text body, as the gather/logits tail below does.
@@ -422,10 +429,10 @@ class EagerRunner(BaseRunner):
             # DSpark aux capture is on, else it overrides the packed aux.
             if aux_hidden_states is None:
                 logits_kwargs["hidden_states_before_norm"] = hidden_states_before_norm
-        return model.logits_processor(
+        return text_model.logits_processor(
             input_ids,
             hidden_states,
-            model.lm_head,
+            text_model.lm_head,
             forward_batch,
             aux_hidden_states,
             **logits_kwargs,

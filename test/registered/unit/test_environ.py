@@ -1,14 +1,17 @@
 """Unit tests for sglang.srt.environ: EnvField semantics and the deprecated-env registry."""
 
+import importlib.machinery
 import os
 import re
 import subprocess
 import sys
+import tempfile
 import unittest
 import warnings
 from contextlib import ExitStack
 from unittest.mock import patch
 
+from sglang.srt import environ
 from sglang.srt.environ import EnvField, _DeprecatedEnv, envs
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -245,6 +248,104 @@ class TestDocumentedBooleanKnobs(unittest.TestCase):
                 ):
                     os.environ[name] = value
                     self.assertIs(field.get(), expected)
+
+
+class TestKeepTritonBlackwellPtxas(unittest.TestCase):
+    """FlashInfer's import must not swap Triton's bundled Blackwell ptxas for an
+    older ptxas on PATH (13.0 fuses f32x2 mul/add despite --fmad=false)."""
+
+    @staticmethod
+    def _version(release, build=0):
+        return f"echo 'Cuda compilation tools, release {release}, V{release}.{build}'"
+
+    @staticmethod
+    def _write_ptxas(path, script):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write(f"#!/bin/sh\n{script}\n")
+        os.chmod(path, 0o755)
+
+    def _fake_toolchain(self, tmp, path_script):
+        triton_dir = os.path.join(tmp, "triton")
+        bundled = os.path.join(
+            triton_dir, "backends", "nvidia", "bin", "ptxas-blackwell"
+        )
+        self._write_ptxas(bundled, self._version("13.3", 73))
+        self._write_ptxas(os.path.join(tmp, "bin", "ptxas"), path_script)
+        env_path = os.path.join(tmp, "bin") + os.pathsep + os.environ["PATH"]
+        return os.path.join(triton_dir, "__init__.py"), bundled, env_path
+
+    def _resolve(self, path_script, preset=None):
+        with tempfile.TemporaryDirectory() as tmp:
+            origin, bundled, env_path = self._fake_toolchain(tmp, path_script)
+            spec = importlib.machinery.ModuleSpec("triton", None, origin=origin)
+            with (
+                patch.dict(os.environ, {"PATH": env_path}),
+                patch.object(environ.importlib.util, "find_spec", return_value=spec),
+                patch.object(environ, "_PTXAS_PROBE_TIMEOUT_S", 0.5),
+            ):
+                os.environ.pop("TRITON_PTXAS_BLACKWELL_PATH", None)
+                if preset is not None:
+                    os.environ["TRITON_PTXAS_BLACKWELL_PATH"] = preset
+                environ.keep_triton_blackwell_ptxas()
+                return os.environ.get("TRITON_PTXAS_BLACKWELL_PATH"), bundled
+
+    def test_older_path_ptxas_keeps_the_bundled_one(self):
+        for stream in ("", " >&2"):
+            with self.subTest(stream=stream):
+                selected, bundled = self._resolve(self._version("13.0", 88) + stream)
+                self.assertEqual(selected, bundled)
+
+    def test_path_ptxas_not_provably_older_is_left_to_flashinfer(self):
+        older = self._version("13.0", 88)
+        for case, script in (
+            ("newer release", self._version("13.4", 10)),
+            ("same release, newer build", self._version("13.3", 99)),
+            ("unparsable", "echo 'ptxas wrapper'"),
+            ("failed", f"{older}; exit 1"),
+            ("hung", f"sleep 3; {older}"),
+        ):
+            with self.subTest(case=case):
+                selected, _ = self._resolve(script)
+                self.assertIsNone(selected)
+
+    def test_explicit_setting_is_kept(self):
+        selected, _ = self._resolve(
+            self._version("13.0", 88), preset="/opt/cuda/bin/ptxas"
+        )
+        self.assertEqual(selected, "/opt/cuda/bin/ptxas")
+
+    def test_import_sglang_runs_before_flashinfer_patch(self):
+        """Importing sglang alone must pin the bundled ptxas, so a later FlashInfer
+        import keeps it instead of adopting the older ptxas on PATH."""
+        with tempfile.TemporaryDirectory() as tmp:
+            origin, bundled, env_path = self._fake_toolchain(
+                tmp, self._version("13.0", 88)
+            )
+            script = f"""
+import importlib.machinery, importlib.util, os, shutil
+find_spec = importlib.util.find_spec
+fake = importlib.machinery.ModuleSpec("triton", None, origin={origin!r})
+importlib.util.find_spec = lambda name, package=None: (
+    fake if name == "triton" else find_spec(name, package)
+)
+import sglang
+# Mirrors flashinfer/triton/__init__.py _patch_triton_ptxas_blackwell for a CUDA 13 PATH ptxas.
+if not os.environ.get("TRITON_PTXAS_BLACKWELL_PATH"):
+    os.environ["TRITON_PTXAS_BLACKWELL_PATH"] = shutil.which("ptxas")
+print(os.environ["TRITON_PTXAS_BLACKWELL_PATH"])
+"""
+            env = dict(os.environ, PATH=env_path)
+            env.pop("TRITON_PTXAS_BLACKWELL_PATH", None)
+            result = subprocess.run(
+                [sys.executable, "-c", script],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip().splitlines()[-1], bundled)
 
 
 if __name__ == "__main__":

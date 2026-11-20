@@ -37,6 +37,7 @@ VISION_MODELS = (
     "minimax_encoder",
     "moonvit",
     "step3",
+    "hyv4",
 )
 
 
@@ -103,6 +104,18 @@ def build_vision(model, use_data_parallel=False, width=32, quant_config=None):
             **options,
         )
         layers = (module.fc0, module.fc1)
+    elif model == "hyv4":
+        from sglang.srt.models.hunyuan_v4_vl import HYV4VisionBlock
+
+        module = HYV4VisionBlock(
+            SimpleNamespace(**vars(config), rms_norm_eps=1e-6), quant_config
+        )
+        layers = (
+            module.self_attn.qkv_proj,
+            module.self_attn.proj,
+            module.mlp.dense_h_to_4h,
+            module.mlp.dense_4h_to_h,
+        )
     elif model == "step3":
         from sglang.srt.models.step3_vl import Step3VisionMLP
 
@@ -234,7 +247,7 @@ class TestVisionParallelGroups(CustomTestCase):
             attn.all_reduce.side_effect = lambda x: x * (4 // dp_size)
             for model in VISION_MODELS:
                 for replicated in (
-                    (False,) if model in ("moonvit", "step3") else (False, True)
+                    (False,) if model in ("moonvit", "step3", "hyv4") else (False, True)
                 ):
                     with self.subTest(dp=dp_size, model=model, replicated=replicated):
                         if dp_size == 2 and model in ("moonvit", "step3"):
@@ -301,6 +314,8 @@ class TestVisionParallelGroups(CustomTestCase):
                                 torch.testing.assert_close(layer(inputs)[0], expected)
                             if row:
                                 self.assertTrue(layer.reduce_results)
+                                if 1 < size < 4 and model != "vision_legacy":
+                                    self.assertTrue(layer.use_dp_attention_reduce)
                                 reduction = (
                                     attn if layer.use_dp_attention_reduce else tp
                                 )

@@ -23,7 +23,8 @@ from sglang.srt.configs.flint import FlintConfig
 from sglang.srt.configs.gigachat35 import GigaChat35Config
 from sglang.srt.configs.glm5_next import Glm5NextConfig, Glm5NextTextConfig
 from sglang.srt.configs.granitemoehybrid import GraniteMoeHybridConfig
-from sglang.srt.configs.hy_v4 import HYV4Config
+from sglang.srt.configs.hy_v4 import HYV4Config, HYV4VLConfig, HYV4VLVisionConfig
+from sglang.srt.configs.hy_v4_flash import HYV4FlashConfig, HYV4FlashTextConfig
 from sglang.srt.configs.inkling import (
     InklingAudioConfig,
     InklingMMConfig,
@@ -158,6 +159,10 @@ __all__ = [
     "GigaChat35Config",
     "GraniteMoeHybridConfig",
     "HYV4Config",
+    "HYV4VLConfig",
+    "HYV4VLVisionConfig",
+    "HYV4FlashConfig",
+    "HYV4FlashTextConfig",
     "MambaConfig",
     "Mamba2Config",
     "Lfm2Config",

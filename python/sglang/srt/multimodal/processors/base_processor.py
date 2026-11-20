@@ -241,6 +241,9 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
     # Artifact-based processors may keep their prompt/M-RoPE fast path even
     # when artifact retention is disabled.
     uses_media_artifacts_without_cache = False
+    # Modality -> placeholder text inserted where a 'string'-format chat template
+    # would drop media parts; None keeps the text-only flattening.
+    string_content_media_placeholders: Optional[Dict[str, str]] = None
     # Placeholder tokens that the loader matches per modality; a processor without
     # them reads media its own way, so callers cannot tell which media it reads.
     mm_tokens: Optional[MultimodalSpecialTokens] = None

@@ -399,6 +399,10 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_utils import validate_dflash_request
+from sglang.srt.speculative.dfly_validation import (
+    dfly_targets_hy4_flash,
+    validate_dfly_request,
+)
 from sglang.srt.speculative.eagle_utils import (
     get_draft_recurrent_hidden_state_spec_from_config,
 )
@@ -3541,8 +3545,17 @@ class Scheduler(
             )
             return
 
-        if self.spec_algorithm.is_dflash_family():
-            error_msg = validate_dflash_request(req, self.enable_overlap)
+        if self.spec_algorithm.uses_block_verify():
+            if self.spec_algorithm.is_dfly():
+                error_msg = validate_dfly_request(
+                    req,
+                    enable_overlap=self.enable_overlap,
+                    targets_hy4_flash=dfly_targets_hy4_flash(
+                        self.model_config.hf_config.architectures
+                    ),
+                )
+            else:
+                error_msg = validate_dflash_request(req, self.enable_overlap)
             if error_msg is not None:
                 req.set_finish_with_abort(error_msg)
                 self.init_req_max_new_tokens(req)
