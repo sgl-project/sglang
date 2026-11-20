@@ -1,9 +1,15 @@
+import sys
 import unittest
 from types import MethodType, SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.kernels.ops.attention.dsa.fp4_index_hip import (
+    Fp4IndexKeys,
+    Fp4IndexQuery,
+    fp4_ragged_mqa_logits,
+)
 from sglang.srt.layers.attention import dsa_backend as module
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
 from sglang.srt.model_executor.forward_mode import ForwardMode
@@ -44,7 +50,7 @@ class TestDsaEagerMetadataNoHostSync(unittest.TestCase):
             dsa_index_topk=4,
             physical_page_size=1,
             get_device_int32_arange=lambda n: torch.arange(n, dtype=torch.int32),
-            _cal_indexer_k_start_end=lambda *args: (None, None),
+            _cal_indexer_k_start_end=lambda *args: (None, None, None),
             _transform_table_1_to_real=lambda table: table,
             _build_topk_v2_plan=lambda _: None,
             _dcp_topk_length_buffer=lambda *args: None,
@@ -113,6 +119,39 @@ class TestDsaEagerMetadataNoHostSync(unittest.TestCase):
         for mode in (ForwardMode.DECODE, ForwardMode.DRAFT_EXTEND_V2):
             with self.subTest(mode=mode):
                 self.check_metadata(mode, True)
+
+    def test_fp4_prefill_logits_split_requests_from_host_ks(self):
+        # Three requests at k_start 0, 100 and 300: rows [0, 4), [4, 7), [7, 10)
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            batch_size=3,
+            seq_lens_cpu=torch.tensor([100, 200, 70]),
+            extend_seq_lens_cpu=[4, 3, 3],
+        )
+        backend = SimpleNamespace(device="cpu", speculative_num_draft_tokens=0)
+        (ks, ke), _, ks_cpu = module.DeepseekSparseAttnBackend._cal_indexer_k_start_end(
+            backend, batch
+        )
+        self.assertTrue(torch.equal(ks_cpu, ks))
+
+        keys = Fp4IndexKeys(torch.zeros(6, 4096), torch.zeros(6, 256), 370)
+        query = Fp4IndexQuery(torch.zeros(10, 16, 64), torch.zeros(10, 1, 4, 16, 4))
+        aiter = MagicMock()
+        aiter.compute_prefill_schedule.return_value = (None, None, 0)
+        aiter_module = "aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_prefill"
+        with (
+            patch.dict(sys.modules, {aiter_module: aiter}),
+            patch.object(ks, "cpu", side_effect=AssertionError("device ks copy")),
+        ):
+            fp4_ragged_mqa_logits(
+                query, torch.ones(10, 16), 1.0, keys, ks, ke, ks_cpu=ks_cpu
+            )
+        calls = aiter.flydsl_pa_mqa_logits_fp4_prefill.call_args_list
+        # (rows, table width) of each kernel launch
+        self.assertEqual(
+            [(len(c.args[0]), c.args[9]) for c in calls],
+            [(4, 370), (3, 306), (3, 114)],
+        )
 
 
 if __name__ == "__main__":

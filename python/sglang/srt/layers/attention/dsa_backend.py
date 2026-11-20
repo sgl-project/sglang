@@ -437,6 +437,8 @@ class DSAMetadata:
 
     # k_start and k_end in kv cache for each token.
     indexer_k_start_end: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+    # k_start on the host; None under the prefill CP split, which shards only the device one.
+    indexer_k_start_cpu: Optional[torch.Tensor] = None
     # Pool-managed index reads take logical page IDs and translate them once.
     # Raw attention/indexer kernels instead use the scratch-addressed tables.
     indexer_logical_page_table: Optional[torch.Tensor] = None
@@ -1824,8 +1826,8 @@ class DeepseekSparseAttnBackend(
         else:
             assert False, f"Unsupported {forward_batch.forward_mode = }"
 
-        indexer_k_start_end, token_to_batch_idx = self._cal_indexer_k_start_end(
-            forward_batch, bs_idx_cpu
+        indexer_k_start_end, token_to_batch_idx, indexer_k_start_cpu = (
+            self._cal_indexer_k_start_end(forward_batch, bs_idx_cpu)
         )
         # 1D, expanded seqlens (1D means cheap to compute, so always compute it)
         dsa_cache_seqlens_int32 = compute_dsa_seqlens(
@@ -1911,6 +1913,7 @@ class DeepseekSparseAttnBackend(
                 else None
             ),
             indexer_k_start_end=indexer_k_start_end,
+            indexer_k_start_cpu=indexer_k_start_cpu,
             indexer_logical_page_table=indexer_logical_page_table,
             indexer_seq_lens_cpu=indexer_seq_lens_cpu,
             indexer_seq_lens=indexer_seq_lens,
@@ -1936,10 +1939,10 @@ class DeepseekSparseAttnBackend(
         bs_idx: Optional[List[int]] = None,
     ):
         if not forward_batch.forward_mode.is_extend_without_speculative():
-            return None, None
+            return None, None, None
         if forward_batch.batch_size == 0 or (bs_idx is not None and len(bs_idx) == 0):
             empty_t = torch.empty(0, dtype=torch.int32, device=self.device)
-            return (empty_t, empty_t), empty_t
+            return (empty_t, empty_t), empty_t, None
 
         # Suppose there are two requests, with extend_seq_len = [3, 2]
         # and seq_lens = [10, 4]
@@ -1955,6 +1958,7 @@ class DeepseekSparseAttnBackend(
         # ks = [0, 0, 0, 10, 10]
         # ke = [8, 9, 10, 13, 14]
         ks_list = []
+        ks_cpu_list = []
         ke_list = []
         token_to_batch_idx = []
 
@@ -1971,6 +1975,9 @@ class DeepseekSparseAttnBackend(
             extend_seq_len = forward_batch.extend_seq_lens_cpu[i]
             ks = torch.full(
                 (extend_seq_len,), k_offset, dtype=torch.int32, device=self.device
+            )
+            ks_cpu_list.append(
+                torch.full((extend_seq_len,), k_offset, dtype=torch.int32)
             )
             kv_len = seq_len
             if forward_batch.forward_mode.is_target_verify():
@@ -1997,6 +2004,7 @@ class DeepseekSparseAttnBackend(
                 k_offset += seq_len
 
         ks = torch.cat(ks_list, dim=0)
+        ks_cpu = None if bs_idx is not None else torch.cat(ks_cpu_list)
         ke = torch.cat(ke_list, dim=0)
         token_to_batch_idx = torch.cat(token_to_batch_idx, dim=0)
         if bs_idx is not None:
@@ -2005,7 +2013,7 @@ class DeepseekSparseAttnBackend(
             ks = split_per_token(ks)
             ke = split_per_token(ke)
             token_to_batch_idx = split_per_token(token_to_batch_idx)
-        return (ks, ke), token_to_batch_idx
+        return (ks, ke), token_to_batch_idx, ks_cpu
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         """Initialize CUDA graph state for the attention backend.
