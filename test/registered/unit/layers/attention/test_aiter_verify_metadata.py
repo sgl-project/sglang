@@ -280,7 +280,9 @@ class TestAiterCprrKernelHeads(CustomTestCase):
             ),
             patch.object(aiter_backend, "resolve_window_kv_pool", return_value=None),
             patch.object(aiter_backend, "resolve_window_id_space", return_value=None),
-            patch.object(aiter_backend, "_kv_cache_is_vectorized_5d", return_value=False),
+            patch.object(
+                aiter_backend, "_kv_cache_is_vectorized_5d", return_value=False
+            ),
             patch.object(aiter_backend, "_require_untranslated_storage"),
             patch.object(aiter_backend, "fast_mode", False),
             patch.object(aiter_backend, "intra_batch_mode", True),
