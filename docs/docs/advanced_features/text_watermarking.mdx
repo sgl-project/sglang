@@ -89,7 +89,7 @@ A low p-value is evidence that the text carries the keyed watermark. It is not a
 
 ## Server configuration
 
-`--enable-watermark` turns the feature on; every other watermark setting lives in one JSON object passed with `--watermark-config`, either as a file path or inline. Restrict the file to the server account and launch a CUDA server:
+`--enable-watermark` turns the feature on and `--watermark-algorithm` selects the algorithm; `gumbel` (Aaronson-Gumbel, described on this page) is the default and the only choice. Every other watermark setting lives in one JSON object passed with `--watermark-config`, either as a file path or inline. Restrict the file to the server account and launch a CUDA server:
 
 ```json
 {
