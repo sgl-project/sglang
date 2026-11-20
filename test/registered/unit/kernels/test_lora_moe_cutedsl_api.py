@@ -1,10 +1,12 @@
 """CPU contracts for grouped-GEMM kernel selection and FP8 prepare arguments."""
 
+import ast
 import importlib.util
+import inspect
 import sys
 import types
 import unittest
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -184,6 +186,169 @@ class TestFp8Prepares(CustomTestCase):
                 for view, scale in zip(result.operand_args[2:4], scales):
                     self.assertIs(view.tensor, scale)
                     self.assertEqual(view.leading_dim, axis)
+
+
+class TestBlockScaledQuantArgs(CustomTestCase):
+    def test_quantized_launch_arguments_match_kernel_signatures(self):
+        from sglang.kernels.ops.lora.moe.quant_blockscaled import (
+            BlockScaledRows,
+            act_quant_args,
+            quantize_rows,
+        )
+
+        codes = torch.empty((128, 64), dtype=torch.uint8)
+        storage = dict(
+            data=codes,
+            scales=torch.empty(1024, dtype=torch.uint8),
+            sf_vec_size=16,
+            rows_per_slab=128,
+        )
+        rows = BlockScaledRows(
+            **storage,
+            row_scales=torch.ones(128),
+            row_denominator=1536.0,
+            use_4over6=True,
+            err_mode="MSE",
+        )
+        static_rows = BlockScaledRows(**storage, global_scale=0.25)
+        # An empty row map returns before any launch.
+        quantize_rows(
+            torch.empty(128, 128, dtype=torch.bfloat16),
+            rows,
+            torch.zeros(0, dtype=torch.int32),
+        )
+        quant_args = rows.kernel_args()
+        consumers = (
+            ("quant_blockscaled", "_quant_rows_kernel", (quant_args,)),
+            (
+                "dispatch_contiguous",
+                "_fill_rows_contiguous_blockscaled_kernel",
+                (quant_args,),
+            ),
+            (
+                "dispatch_masked",
+                "_dispatch_fill_masked_blockscaled_kernel",
+                (quant_args,),
+            ),
+            (
+                "activation_delta",
+                "_act_delta_kernel",
+                tuple(
+                    act_quant_args(target, fallback=codes) for target in (rows, None)
+                ),
+            ),
+            (
+                "fused_act",
+                "_b_act_kernel",
+                tuple(act_quant_args(target) for target in (static_rows, None)),
+            ),
+        )
+        sources = _API.parents[1]
+        launch_options = {"num_warps", "num_stages", "num_ctas", "maxnreg"}
+        for module, kernel, variants in consumers:
+            tree = ast.parse((sources / f"{module}.py").read_text())
+            signature = next(
+                node.args
+                for node in tree.body
+                if isinstance(node, ast.FunctionDef) and node.name == kernel
+            )
+            positional = [arg.arg for arg in (*signature.posonlyargs, *signature.args)]
+            allowed = set(positional) | {arg.arg for arg in signature.kwonlyargs}
+            required = set(positional[: len(positional) - len(signature.defaults)])
+            required.update(
+                arg.arg
+                for arg, default in zip(signature.kwonlyargs, signature.kw_defaults)
+                if default is None
+            )
+            (launch,) = (
+                node
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Subscript)
+                and getattr(node.func.value, "id", None) == kernel
+            )
+            self.assertEqual(sum(arg.arg is None for arg in launch.keywords), 1, kernel)
+            explicit = positional[: len(launch.args)] + [
+                arg.arg
+                for arg in launch.keywords
+                if arg.arg and arg.arg not in launch_options
+            ]
+            for quant in variants:
+                with self.subTest(kernel=kernel, keys=set(quant)):
+                    supplied = explicit + list(quant)
+                    # Optional parameters may be absent; each supplied key occurs once.
+                    self.assertCountEqual(
+                        supplied, required | (allowed & set(supplied))
+                    )
+
+    def test_unsafe_arguments_are_refused_before_any_launch(self):
+        from msgspec.structs import replace
+
+        from sglang.kernels.ops.lora.common import lora_a
+        from sglang.kernels.ops.lora.moe import (
+            dispatch_contiguous,
+            fused_act,
+            quant_blockscaled,
+        )
+
+        # One row scale for two data rows: the row-scale prepass would write
+        # past it, so the target must be refused before anything launches.
+        rows = quant_blockscaled.BlockScaledRows(
+            data=torch.empty((2, 64), dtype=torch.uint8),
+            scales=torch.empty(1024, dtype=torch.uint8),
+            sf_vec_size=16,
+            rows_per_slab=2,
+            row_scales=torch.ones(1),
+            row_denominator=1536.0,
+        )
+        per_token = replace(rows, row_scales=torch.ones(2))
+        x = torch.empty(2, 128, dtype=torch.bfloat16)
+        pair_to_row = torch.arange(2, dtype=torch.int32)
+        routing = SimpleNamespace(num_rows=2)
+        # fused_b_act reads its other arguments only after the check.
+        b_act_args = dict.fromkeys(inspect.signature(fused_act.fused_b_act).parameters)
+        b_act_args.update(activation="silu", routing=routing, act_quant=per_token)
+        kernels = (
+            (quant_blockscaled, "_row_scale_kernel"),
+            (quant_blockscaled, "_quant_rows_kernel"),
+            (dispatch_contiguous, "_token_scale_kernel"),
+            (dispatch_contiguous, "_fill_rows_contiguous_blockscaled_kernel"),
+            (lora_a, "_grouped_lora_a_kernel"),
+            (fused_act, "_b_act_kernel"),
+        )
+        with ExitStack() as patches:
+            launches = [patches.enter_context(mock.patch.object(*k)) for k in kernels]
+            with self.assertRaises(AssertionError):
+                quant_blockscaled.quantize_rows(x, rows, pair_to_row)
+            for rows_out, token_scales, error, message in (
+                (rows, torch.empty(2), AssertionError, ""),
+                (per_token, torch.empty(1), ValueError, "token_scales"),
+                (per_token, torch.empty(1).expand(2), ValueError, "token_scales"),
+            ):
+                with self.assertRaisesRegex(error, message):
+                    dispatch_contiguous.dispatch_fill_rows_contiguous_blockscaled(
+                        x,
+                        pair_to_row.view(2, 1),
+                        pair_to_row,
+                        rows_out=rows_out,
+                        token_scales=token_scales,
+                    )
+            # place_rows stores at mapped rows, up to the last input row.
+            for row_map, output_rows in ((None, 2), (pair_to_row, 1)):
+                with self.assertRaisesRegex(ValueError, "place_rows"):
+                    lora_a.grouped_lora_a(
+                        x,
+                        None,
+                        torch.empty(output_rows, 16),
+                        routing,
+                        config={},
+                        pair_to_row=row_map,
+                        place_rows=True,
+                    )
+            with self.assertRaisesRegex(ValueError, "per-token"):
+                fused_act.fused_b_act(**b_act_args)
+        for launch in launches:
+            launch.__getitem__.assert_not_called()
 
 
 if __name__ == "__main__":
