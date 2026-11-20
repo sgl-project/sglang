@@ -190,8 +190,7 @@ class TestLateLayerRowsUnderDpAttention(CustomTestCase):
     def setUp(self):
         override = get_context().override_server_args(
             tp_size=2,
-            dp_size=2,
-            enable_dp_attention=True,
+            attn_dp_size=2,
             cuda_graph_config=CudaGraphConfig(prefill=PhaseConfig(bs=[])),
         )
         override.install()
@@ -243,7 +242,8 @@ class TestLateLayerRowsUnderDpAttention(CustomTestCase):
         runner.attn_tp_sequence_sharded.return_value = False
 
         def idle_peer(out, local, group):
-            out.copy_(torch.cat([local, local.new_zeros(1)]))
+            # The idle peer has no tail rows and permits replay.
+            out.copy_(torch.cat([local, local.new_tensor([0, 1])]))
 
         with (
             self._dp_rank(0),

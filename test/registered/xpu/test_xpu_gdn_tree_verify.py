@@ -11,7 +11,7 @@ from sglang.srt.layers.attention.linear.kernels.gdn_xpu import XpuGDNKernel
 from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_xpu_ci(est_time=30, suite="stage-b-test-1-gpu-xpu")
+register_xpu_ci(est_time=30, suite="extra-test-1-gpu-xpu")
 
 # parent[i] is the in-request index of draft node i's parent; node 0 is the
 # root (parent unused). Nodes 1 and 2 are siblings, as are 3/4 and 5/6.

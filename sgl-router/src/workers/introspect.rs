@@ -81,6 +81,9 @@ pub struct ServerInfo {
     /// arrived, so a prefill without either never starts. `None` when
     /// `/server_info` predates the field or did not answer.
     pub prefill_before_bootstrap: Option<bool>,
+    /// Whether the engine's chat template renders a system message after the
+    /// first; `false` when `/server_info` predates the field or did not answer.
+    pub supports_inline_system: bool,
 }
 
 /// PD classification derived from a worker's `/server_info` response.
@@ -212,6 +215,7 @@ impl WorkerIntrospector {
                     || parsed.disaggregation_decode_allocation_policy.as_deref()
                         == Some("prefill_complete")
             }),
+            supports_inline_system: parsed.supports_inline_system,
         }
     }
 
@@ -333,7 +337,7 @@ fn resolve_disaggregation_role(
 }
 
 /// Substitute a wildcard bind host (`*`, `0.0.0.0`, `::`, `[::]`) with
-/// the host parsed from the worker URL — the gateway has to connect to
+/// the host parsed from the worker URL — the router has to connect to
 /// a routable address.  An unparsable worker URL leaves the host
 /// unchanged: the subsequent ZMQ connect will fail visibly with the
 /// wildcard literal, which is the same observable failure mode that
@@ -436,12 +440,16 @@ struct ServerInfoBody {
     /// `ServerArgs.disaggregation_decode_allocation_policy`.
     #[serde(default)]
     disaggregation_decode_allocation_policy: Option<String>,
+    /// `OpenAIServingChat.supports_inline_system`, which the engine's own
+    /// `/v1/messages` acts on; only its HTTP `/server_info` reports it.
+    #[serde(default)]
+    supports_inline_system: bool,
 }
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct KvEventsBlock {
     // Forward-compatibility: the only publisher implementation
-    // supported on the gateway side is ZMQ. Keeping the field optional
+    // supported on the router side is ZMQ. Keeping the field optional
     // means a future SGLang that adds a non-ZMQ publisher string won't
     // fail deserialize; the resulting subscriber will still try to open
     // a ZMQ connection and fail visibly.
@@ -869,6 +877,21 @@ mod tests {
         let (url, _shutdown) = spawn_fake_worker(json!({"served_model_name": "m"})).await;
         let got = fast_introspector().fetch(&url).await;
         assert_eq!(got.enable_http2, None);
+    }
+
+    /// An engine that predates the field reads as no, so `/v1/messages` lifts
+    /// inline system turns rather than send one its template may reject.
+    #[tokio::test]
+    async fn fetch_reads_supports_inline_system() {
+        for (body, want) in [
+            (json!({"supports_inline_system": true}), true),
+            (json!({"supports_inline_system": false}), false),
+            (json!({}), false),
+        ] {
+            let (url, _shutdown) = spawn_fake_worker(body).await;
+            let info = fast_introspector().fetch(&url).await;
+            assert_eq!(info.supports_inline_system, want);
+        }
     }
 
     #[tokio::test]

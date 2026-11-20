@@ -185,7 +185,7 @@ if _is_npu:
     import torch_npu
 
     try:
-        from sgl_kernel_npu.norm.gemma_rmsnorm import npu_gemma_rms_norm
+        from sgl_kernel_npu.operators.norm import gemma_rmsnorm as npu_gemma_rms_norm
     except ImportError:
         # sgl-kernel-npu wheels built before the target-specific Gemma provider
         # landed expose only the torch_npu operator, which is exactly what that
@@ -289,7 +289,7 @@ def _forward_with_allreduce_fusion_quant_per_group(
 ):
     """Fused AR + RMSNorm + per-group FP8 quant with graceful staged fallback.
 
-    The single-kernel quantized backend dispatch is ROCm + aiter + gfx95-only.
+    The single-kernel quantized backend dispatch is ROCm + aiter on gfx942 and gfx95.
     Other HIP/aiter runs can still use the 2-kernel fallback below to preserve
     the existing tuple handoff behavior.
 
@@ -1663,26 +1663,3 @@ class Gemma4RMSNorm(BaseFusedOp):
         # sgl_kernel's gemma_rmsnorm is not available on ROCm;
         # delegate to the pure-PyTorch implementation.
         return self.forward_native(x)
-
-
-class RMSNormWithoutScale(BaseFusedOp):
-    def __init__(self, hidden_size: int, eps=1e-6):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.eps = eps
-
-    def _norm(self, x):
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-
-    def forward_native(self, x):
-        orig_dtype = x.dtype
-        x = x.float()
-        variance = x.pow(2).mean(dim=-1, keepdim=True)
-        x = x * torch.rsqrt(variance + self.eps)
-        return x.to(orig_dtype)
-
-    def forward_cuda(self, x):
-        return self.forward_native(x)
-
-    def extra_repr(self):
-        return f"{self.hidden_size}, eps={self.eps}"

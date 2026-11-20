@@ -46,7 +46,7 @@ pub enum Resampler {
     /// `Qwen2VLImageProcessor` / `…Fast` — torchvision on a uint8 tensor.
     #[default]
     AtenU8,
-    /// `Qwen2VLImageProcessorPil`, behind `--disable-fast-image-processor`.
+    /// `Qwen2VLImageProcessorPil`, behind `--image-processor-backend pil`.
     Pil,
 }
 

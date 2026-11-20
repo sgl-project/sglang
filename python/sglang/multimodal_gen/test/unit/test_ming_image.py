@@ -152,6 +152,77 @@ def test_cpu_noise_draw_preserves_official_frame_order():
     assert config.get_classifier_free_guidance_scale(batch, 2.0) == 3.0
 
 
+@torch.no_grad()
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA PTX")
+@pytest.mark.parametrize("shape", [(1, 17, 3840), (2, 19, 3840), (1, 4416, 3840)])
+@pytest.mark.parametrize("with_residual", [False, True])
+def test_ming_norm_epilogue_matches_native(shape, with_residual, monkeypatch):
+    from sglang.kernels.ops.diffusion import BitExactFusionGate
+    from sglang.multimodal_gen.runtime.models.dits import ming_image
+    from sglang.srt.layers.layernorm import RMSNorm
+
+    state = BitExactFusionGate("Ming epilogue test", per_signature=True)
+    monkeypatch.setattr(ming_image, "_MING_NORM_SCALE_FUSION", state)
+    norm = MingRMSNorm(3840).to("cuda", torch.bfloat16)
+    norm.weight.copy_(torch.randn_like(norm.weight))
+    for _ in range(2):
+        x = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
+        scale = torch.randn(shape[0], 1, 4 * 3840, device="cuda", dtype=x.dtype).chunk(
+            4, -1
+        )[1]
+        residual = torch.randn_like(x) if with_residual else None
+        expected = RMSNorm.forward_native(norm, x) * scale
+        if residual is not None:
+            expected = residual + expected
+        actual = ming_image._ming_norm_scale(x, scale, norm, True, residual)
+        assert torch.equal(actual, expected)
+    assert state.verified and not state.disabled
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = ming_image._ming_norm_scale(x, scale, norm, True, residual)
+    x.copy_(torch.randn_like(x))
+    scale.copy_(torch.randn_like(scale))
+    graph.replay()
+    expected = RMSNorm.forward_native(norm, x) * scale
+    if residual is not None:
+        expected = residual + expected
+    assert torch.equal(captured, expected)
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("case", ["cpu", "strided", "small", "disabled", "compile"])
+def test_ming_norm_epilogue_fallback(case, monkeypatch):
+    from sglang.kernels.ops.diffusion import BitExactFusionGate
+    from sglang.multimodal_gen.runtime.models.dits import ming_image
+
+    if case != "cpu" and not torch.cuda.is_available():
+        pytest.skip("CUDA needed to isolate the layout/compile guard")
+    device = "cpu" if case == "cpu" else "cuda"
+    x = torch.randn(
+        1,
+        8 if case == "small" else 17,
+        7680 if case == "strided" else 3840,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    if case == "strided":
+        x = x[..., ::2]
+    norm = MingRMSNorm(3840).to(device, x.dtype)
+    scale = torch.randn(1, 1, 3840, device=device, dtype=x.dtype)
+    residual = torch.randn_like(x)
+    expected = residual + norm(x) * scale
+    state = BitExactFusionGate("Ming fallback test", per_signature=True)
+    monkeypatch.setattr(ming_image, "_MING_NORM_SCALE_FUSION", state)
+
+    def run():
+        return ming_image._ming_norm_scale(x, scale, norm, case != "disabled", residual)
+
+    if case == "compile":
+        run = torch.compile(run, backend="eager", fullgraph=True)
+    assert torch.equal(run(), expected)
+    assert not state.verified and not state.disabled
+
+
 def test_centered_video_rope_with_reference_and_query_tokens():
     ids = [10, 11] + [99] * 4 + [12, 13] + [99] * 3 + [14]
     positions = ming_position_ids(ids, [(1, 4, 4), (1, 2, 6)], 99)[:, 0]

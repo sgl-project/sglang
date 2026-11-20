@@ -43,8 +43,9 @@ BCG_CAPTURE_MARKER = "[Diffusion BCG] captured"
 # regression: capture ran, registration did not.
 GRAPH_BUFFER_REGISTRATION_MARKER = "cuda graph addresses"
 # CustomAllReduceV2 registers graph inputs only for its zero-copy pull algorithms,
-# which this workload does not select, so the marker only applies to v1.
-CUSTOM_ALL_REDUCE_V2_MARKER = "All Reduce config:"
+# which this workload does not select, so the marker only applies to v1. V2 is
+# detected by its request in the symmetric workspace log.
+CUSTOM_ALL_REDUCE_V2_MARKER = "custom_all_reduce_v2: slot = "
 ILLEGAL_MEMORY_MARKER = "illegal memory access"
 
 # The regression fails during warmup within ~1 min; the timeout only has to be
@@ -107,6 +108,9 @@ class TestDiffusionBCGTP2ZImageTurbo(CustomTestCase):
 
         env = os.environ.copy()
         env.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
+        # this guard exercises legacy graph-buffer registration; v2 uses a
+        # symmetric workspace and does not emit the registration marker
+        env["SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2"] = "0"
 
         try:
             result = subprocess.run(

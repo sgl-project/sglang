@@ -38,9 +38,11 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool_host import LogicalHostPool
     from sglang.srt.mem_cache.pool_host import HostKVCache
 
+from sglang.srt.arg_groups.hicache_hook import UNIFIED_KEY_SCHEME_STORAGE_BACKENDS
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
+from sglang.srt.mem_cache.cpp_utils.native_hash import ensure_native_hash
 from sglang.srt.mem_cache.hicache_key_scheme import (
     UnifiedKVPlan,
     namespace_digest,
@@ -52,6 +54,7 @@ from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.srt.runtime_context import get_memory, get_parallel
 from sglang.srt.utils import get_device_module
+from sglang.srt.utils.device import async_h2d_tensor
 
 logger = logging.getLogger(__name__)
 
@@ -59,14 +62,22 @@ device_module = get_device_module()
 
 
 def storage_model_name(
-    model_name: Optional[str], host_pool: HostKVCache | LogicalHostPool
-) -> Optional[str]:
-    """The model name storage backends key pages on, tagged with the host
-    pool's page format when it has one of its own."""
-    tag = host_pool.storage_format_tag
-    if tag is None:
-        return model_name
-    return f"{model_name}-{tag}" if model_name else tag
+    model_name: Optional[str],
+    host_pool: HostKVCache | LogicalHostPool,
+    kv_cache_dtype: torch.dtype,
+) -> str:
+    """Namespace storage keys by page format and the server's logical KV dtype."""
+    if not isinstance(kv_cache_dtype, torch.dtype):
+        raise ValueError(
+            "HiCache storage keys require a resolved logical KV cache dtype, "
+            f"got {kv_cache_dtype!r}."
+        )
+    parts = [
+        model_name,
+        host_pool.storage_format_tag,
+        f"dtype_{normalize_dtype(kv_cache_dtype)}",
+    ]
+    return "-".join(part for part in parts if part)
 
 
 class LayerLoadingEvent:
@@ -330,6 +341,17 @@ def check_dcp_l3_extra_pool(entry: Any, anchor: Any) -> None:
         and pool.size == anchor.size
     ):
         return  # index-K row-sharded like the MLA KV (Kimi-K3.1)
+    if (
+        entry.name == PoolName.INDEXER
+        and isinstance(pool, DSAIndexerPoolHost)
+        and not dsa_shards_index_k()
+        and pool.dcp_size == 1
+        and pool.size == anchor.logical_size
+        and pool.storage_page_span == anchor.logical_page_size
+    ):
+        # index-K replicated (DeepSeek-V3.2, GLM): the mirror holds every
+        # rank's slots, so one key is dcp_size of its pages, not one per rank.
+        return
     if (
         entry.name == PoolName.DRAFT
         and isinstance(pool, MLATokenToKVPoolHost)
@@ -676,9 +698,14 @@ class HiCacheController:
                 "The page_unified host layout requires unified storage keys "
                 "to distinguish its byte order."
             )
-        if key_scheme == "unified" and storage_backend != "file":
+        if (
+            key_scheme == "unified"
+            and storage_backend not in UNIFIED_KEY_SCHEME_STORAGE_BACKENDS
+        ):
             raise NotImplementedError(
-                "The unified key scheme supports only the file storage backend."
+                f"The unified key scheme supports the "
+                f"{', '.join(UNIFIED_KEY_SCHEME_STORAGE_BACKENDS)} storage "
+                f"backends; got {storage_backend!r}."
             )
         if get_parallel().attn_dcp_size > 1:
             if self.host_memory_mode == "buffer_only":
@@ -710,6 +737,9 @@ class HiCacheController:
                 raise NotImplementedError(
                     "HiCache L3 with DCP requires a generic MLA page layout."
                 )
+        # Storage page keys come from the native hash extension;
+        # load it before creating the backend, so attach raises if it cannot build.
+        ensure_native_hash()
 
         # Defensive: a previous partial detach may have flipped `enable_storage` but
         # left background threads alive. Attaching on top of them is unsafe.
@@ -926,7 +956,11 @@ class HiCacheController:
 
         attn_cp_rank, attn_cp_size = self.get_attn_cp_rank_and_size()
         dcp_size = get_parallel().attn_dcp_size
-        model_name = storage_model_name(model_name, self.storage_host_pool)
+        # Token KV views carry the server's resolved logical dtype, including
+        # FP8 variants that share a uint8 backing buffer.
+        model_name = storage_model_name(
+            model_name, self.storage_host_pool, getattr(anchor, "dtype", None)
+        )
         unified_plan = self._build_unified_plan(model_name, attn_cp_size)
         unified_chunk_spans = None
         if unified_plan is not None:
@@ -934,11 +968,7 @@ class HiCacheController:
             # Keep each key paired with its byte span instead of slicing pages
             # consecutively in key order.
             layout = self.storage_host_pool.page_unified_layout
-            unified_chunk_spans = [
-                layout.chunk_span(layer_range, head_group)
-                for layer_range in unified_plan.layer_ranges
-                for head_group in range(unified_plan.head_group_num)
-            ]
+            unified_chunk_spans = unified_plan.chunk_spans(layout)
 
         return HiCacheStorageConfig(
             tp_rank=tp_rank,
@@ -1015,14 +1045,6 @@ class HiCacheController:
             head_group=memory.hicache_storage_head_partition,
             layer_partition=memory.hicache_storage_layer_partition,
         )
-        # The pool was sized from the same server arg before any backend
-        # attached; if the two disagree the objects would not match their keys.
-        pool_groups = getattr(host_pool, "head_group_num", 1)
-        if plan.head_group_num != pool_groups:
-            raise ValueError(
-                f"the unified plan cuts {plan.head_group_num} head groups but "
-                f"the host pool was allocated with {pool_groups}."
-            )
         logger.info(
             "HiCache unified L3 keys: namespace=%s chunks=%s",
             namespace_digest(plan.namespace),
@@ -1142,7 +1164,7 @@ class HiCacheController:
         # move indices to GPU if using kernels, to host if using direct indexing
         if self.io_backend == "kernel":
             if not host_indices.is_cuda:
-                host_indices = host_indices.to(self.device, non_blocking=True)
+                host_indices = async_h2d_tensor(host_indices, device=self.device)
             return host_indices, device_indices
         elif self.io_backend == "direct":
             if self.mem_pool_host.layout == "layer_first":
@@ -1156,7 +1178,7 @@ class HiCacheController:
                     f"Unsupported layout {self.mem_pool_host.layout!r} for io backend 'direct'"
                 )
         elif self.io_backend == "kernel_ascend":
-            from sglang.srt.mem_cache.pool_host.npu_memfabric import (
+            from sglang.srt.mem_cache.pool_host.npu_host_memory import (
                 ascendc_io_enabled,
                 to_device_no_sync,
             )
@@ -1517,10 +1539,16 @@ class HiCacheController:
         return False
 
     def alloc_prefetch_host_buffers(
-        self, operation: StorageOperation, need_size: int
+        self,
+        operation: StorageOperation,
+        need_size: int,
+        *,
+        start_owner: Optional[int] = None,
     ) -> Optional[torch.Tensor]:
         """Allocate the host bounce for a storage hit."""
-        return self.mem_pool_host.alloc(need_size)
+        if start_owner is None:
+            return self.mem_pool_host.alloc(need_size)
+        return self.mem_pool_host.alloc(need_size, start_owner=start_owner)
 
     def can_fit_prefetch_host_buffers(
         self, operation: StorageOperation, need_size: int

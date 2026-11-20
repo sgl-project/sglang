@@ -213,11 +213,25 @@ client sent. The router picks the first of these that applies:
 1. A hash of the sticky routing key or session id, so a conversation keeps
    its rank and router replicas agree.
 2. The rank with the deepest cached prefix in the local KV tree.
-3. The rank with the fewest requests this router has in flight on it, or with
-   `--dp-rank-policy round_robin`, the worker's ranks in turn.
+3. The rank with the fewest requests this router has in flight on it; with
+   `--dp-rank-policy round_robin`, the worker's ranks in turn; or with
+   `--dp-rank-policy least_tokens`, the rank expected to hold the fewest KV
+   tokens: the tokens it has committed, in use plus the prompts of requests
+   still queued, as the engine reports them on its `--load-publish-endpoint`
+   feed, which sees every router replica's traffic, plus every request it
+   holds, and every request this router has sent it since that reading, at
+   a typical request's KV (the median request's KV, from the ranks' mean KV
+   per request weighted by the requests each holds, so a few long-context
+   requests do not inflate what short requests are charged). Expected rather
+   than current KV because KV in use lags: a rank whose requests are all
+   young holds little now and the most later. Ties, and a worker without a
+   fresh reading for every one of its ranks, fall back to the in-flight
+   count.
 
-In PD mode, decode is ranked by step 3 only. The decode request names the
-prefill rank in `disagg_prefill_dp_rank`, and the bootstrap room satisfies
+In PD mode, decode is ranked by step 3 only, under `--decode-dp-rank-policy`
+when set and `--dp-rank-policy` otherwise, so prefill and decode can balance
+by different signals. The decode request names the prefill rank in
+`disagg_prefill_dp_rank`, and the bootstrap room satisfies
 `room % prefill_dp_size == prefill_rank`.
 
 A decode rank picked on arrival only starts decoding once prefill has queued,
@@ -276,6 +290,24 @@ worker's breaker is open the router fails open: it closes them all and routes
 to the whole pool rather than rejecting every request, and failures reopen
 them. `--disable-circuit-breaker` turns it off; a worker that stops answering
 then keeps its share of traffic.
+
+### Request body size
+
+The router buffers each inference request body in full before routing it, so
+it caps the body: `/v1/chat/completions`, `/v1/completions`, `/generate`,
+`/v1/embeddings`, `/v1/classify`, `/v1/rerank` and `/v1/messages` (with
+`count_tokens`) answer `413` past it. The cap is 32 MiB by default; set
+`SGLANG_ROUTER_MAX_BODY_BYTES` to a positive byte count (for example
+`268435456` for 256 MiB) to accept larger multimodal requests carrying several
+base64 images or audio clips. Raising it raises the router's worst-case memory
+too: the body is held in full and parsed (and often rebuilt) while the request
+is prepared, so peak memory per in-flight request is a few times its size. The
+value is bytes, so `256` is a 256-byte cap, not 256 MiB. An empty value keeps
+the default; zero or a value that is not a plain decimal integer (no unit
+suffix) keeps the default and logs a warning. The router logs the effective cap
+at startup. The cap does not change the native gRPC server's inbound message
+limit (half of the 64 MiB engine channel), or the 32 MiB cap on a buffered
+non-streaming Anthropic Messages reply.
 
 ### Engines with `--api-key`
 
@@ -489,6 +521,11 @@ a single prompt that has none, and `--override-sampling-params` defaults. Under
 batch or `n > 1` request leaves the prefill rank to the engine, which gives item
 `i` the bootstrap room `room + i`.
 
+Under PD, a buffered request with `return_logprob: true` waits for prefill as
+well, and its response carries prefill's `meta_info.input_token_logprobs` ahead
+of decode's, since only prefill computed the prompt. A streamed, batch, or
+`n > 1` request returns decode's logprobs alone.
+
 ## OpenAI over /generate
 
 `/v1/completions` and `/v1/chat/completions` behave as the engine's own routes,
@@ -521,8 +558,9 @@ unset. `sgl_router_openai_route_total` counts each outcome.
 ## Embeddings
 
 `/v1/embeddings` has the engine's interface: the same OpenAI `EmbeddingRequest`
-body and response. As for chat completions, `model` must name the served model.
-A PD fleet answers 400, since prefill and decode engines serve no embeddings.
+body and response. As for chat completions, any `model` name is served as
+`--model-id`. A PD fleet answers 400, since prefill and decode engines serve no
+embeddings.
 
 Text `input` (a string or a list) is tokenized and forwarded as token IDs, as for
 [`/generate`](#native-generate), plus the EOS SGLang appends for EmbeddingGemma.
@@ -551,6 +589,49 @@ forwarded as sent, since the engine renders and tokenizes each query-document
 pair. Routing is on load, with each pair's size estimated from its text. As for
 embeddings, a PD fleet answers 400 and `--dp-aware` pins no rank.
 
+## OpenAI Responses
+
+`/v1/responses` converts each request to a chat completion at ingress, so it is
+routed exactly like `/v1/chat/completions`, and converts the reply (or stream)
+back to a Response object or the Responses event sequence, with a gapless
+`sequence_number` and `usage` (including `cached_tokens`) on every finished
+Response. Conversion works on the raw JSON, so sglang chat extensions such as
+`top_k` and `chat_template_kwargs` pass through.
+
+Input: a string or input items; `message` items (`developer` is sent as
+`system`, its text labelled `Developer instructions:` as the engine's own
+`/v1/responses` does), `reasoning`, `function_call` / `function_call_output`
+and their `custom_tool_call` forms; `input_text` and `input_image` parts.
+Consecutive reasoning, assistant and function-call items form one assistant
+turn. `instructions`, `max_output_tokens`, `reasoning.effort`, `text.format`
+(JSON schema) and `tool_choice` (including `allowed_tools`) are translated.
+
+Tools: `function`, plus the shapes Codex sends: `namespace` groups, flattened
+to `<namespace>__<name>` chat functions, and `custom` freeform tools, shimmed
+into a function with one `input` string (a grammar is described to the model,
+not enforced). Calls map back to namespaced `function_call` /
+`custom_tool_call` items. Built-in tools (`web_search`, ...) are rejected.
+
+A developer item after the first turn stays in place only when every worker of
+the model reports `supports_inline_system` in `/server_info`; otherwise its
+text joins the leading system message, where the engine's own `/v1/responses`
+puts it, and the turns either side of it stay apart.
+
+Reasoning items carry the trace in `content`; `reasoning.summary` mirrors it
+into `summary`, and `include: ["reasoning.encrypted_content"]` also packs it
+into `encrypted_content` in the engine's own encoding, so a `store: false`
+client (Codex) can replay reasoning across turns through either the router or
+the engine. Replayed items are read as `summary`, then `content`, then the
+blob.
+
+The router is stateless: `previous_response_id`, `conversation`, `background`,
+stored `prompt` templates and `item_reference` items are rejected with 400, as
+are `top_logprobs` and `include: ["message.output_text.logprobs"]`. The
+stored-response routes under `/v1/responses/` answer 501. Every error uses the
+OpenAI `{"error": {...}}` envelope; 5xx messages are replaced with a generic
+one. A generation cut off by `max_output_tokens` ends `incomplete`; an engine
+abort or a broken stream ends `failed`, with open items closed `incomplete`.
+
 ## Anthropic Messages
 
 `/v1/messages` converts each request to a chat completion at ingress, so it is
@@ -562,6 +643,14 @@ the Messages API does, and a final assistant turn is sent as a prefill
 Every error uses the Anthropic error envelope; 5xx messages are replaced with a
 generic one, and a failed stream still closes its open block and ends with
 `message_stop`.
+
+A `system` turn inside `messages`, as Claude Code sends, stays in place only
+when every worker of the model reports `supports_inline_system` in
+`/server_info`: its chat template renders a system message after the first.
+Otherwise its text joins the leading system message, where the engine's own
+`/v1/messages` puts it, and the turns either side of it stay apart. An engine
+that predates the field counts as not supporting it, and a request that ends
+with a system turn is never a prefill.
 
 `/v1/messages/count_tokens` is answered by the router from the model's chat
 template, without calling an engine. Image tokens are not counted, and a model

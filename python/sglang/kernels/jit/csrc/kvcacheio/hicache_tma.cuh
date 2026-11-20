@@ -31,6 +31,7 @@
 #include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/warp.cuh>
 
+#include <sgl_kernel/ptx/async.cuh>
 #include <sgl_kernel/ptx/barrier.cuh>
 
 #include <dlpack/dlpack.h>
@@ -44,16 +45,6 @@
 namespace sglang {
 
 namespace device::ptx {
-
-// global -> shared::cta, completion counted on `bar` (arm with mbar_arrive_expect_tx).
-SGL_DEVICE void bulk_g2s(void* dst_smem, const void* src_gmem, uint32_t bytes, uint64_t* bar) {
-  asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];" ::"r"(
-                   to_shared(dst_smem)),
-               "l"(src_gmem),
-               "r"(bytes),
-               "r"(to_shared(bar))
-               : "memory");
-}
 
 // 2D tiled tensor-map box at element coords (x, y) -> shared::cta.
 SGL_DEVICE void bulk_tensor_2d_g2s(void* dst_smem, const CUtensorMap* map, int32_t x, int32_t y, uint64_t* bar) {
@@ -92,10 +83,6 @@ SGL_DEVICE void bulk_wait_group_read_one() {
 // Block until every committed bulk group has fully landed in global memory.
 SGL_DEVICE void bulk_wait_group_all() {
   asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
-}
-
-SGL_DEVICE void fence_mbarrier_init() {
-  asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
 }
 
 }  // namespace device::ptx
@@ -181,7 +168,7 @@ __global__ void __launch_bounds__((1 + kStoreWarps) * device::kWarpThreads, 1)
       ptx::mbar_init(&smem.full[s], 1);
       ptx::mbar_init(&smem.empty[s], kStoreWarps);
     }
-    ptx::fence_mbarrier_init();
+    ptx::fence_barrier_init();
   }
   __syncthreads();
 
@@ -287,7 +274,8 @@ __global__ void __launch_bounds__((1 + kStoreWarps) * device::kWarpThreads, 1)
       uint8_t* stage = smem.stages[s];
       if (contiguous) {
         if (lane == 0) {
-          ptx::bulk_g2s(stage, pointer::offset(cur.src_base, src_offset(first)), c.rows * p.row_bytes, &smem.full[s]);
+          ptx::cp_async_bulk_g2s(
+              stage, pointer::offset(cur.src_base, src_offset(first)), c.rows * p.row_bytes, &smem.full[s]);
         }
       } else if (boxed) {
         if (lane == 0) {
@@ -298,7 +286,7 @@ __global__ void __launch_bounds__((1 + kStoreWarps) * device::kWarpThreads, 1)
         for (uint32_t k = 0; k < kHicacheTmaRowsPerLane; ++k) {
           const uint32_t r = lane + k * kWarpThreads;
           if (r < c.rows) {
-            ptx::bulk_g2s(
+            ptx::cp_async_bulk_g2s(
                 stage + r * p.row_bytes,
                 pointer::offset(cur.src_base, src_offset(cur.src[k])),
                 p.row_bytes,

@@ -1,3 +1,4 @@
+from collections import OrderedDict
 from collections.abc import Iterable
 from typing import Any
 
@@ -7,7 +8,10 @@ from torch import nn
 from sglang.kernels.ops.diffusion import BitExactFusionGate
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
 from sglang.multimodal_gen.configs.models.encoders.qwen3 import Qwen3TextConfig
-from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
+from sglang.multimodal_gen.runtime.distributed import (
+    get_tp_world_size,
+    model_parallel_is_initialized,
+)
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm as MMGenRMSNorm
 from sglang.multimodal_gen.runtime.layers.linear import (
@@ -36,6 +40,21 @@ from sglang.multimodal_gen.runtime.models.encoders.base import (
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    BreakableCUDAGraph,
+    BreakableCUDAGraphCapture,
+    eager_on_graph,
+)
+
+
+class _ReplayLengths:
+    """Valid prompt lengths, read by the attention breaks when a graph replays."""
+
+    __slots__ = ("value",)
+
+    def __init__(self):
+        self.value = None
+
 
 logger = init_logger(__name__)
 
@@ -270,13 +289,19 @@ class Qwen3Attention(nn.Module):
         q = q.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
         k = k.reshape(batch_size, seq_len, self.num_kv_heads, self.head_dim)
 
-        # Attention
-        attn_output = self._masked_causal_attention(q, k, v, attention_lengths)
+        if isinstance(attention_lengths, _ReplayLengths):
+            attn_output = self._attention_break(q, k, v, attention_lengths)
+        else:
+            attn_output = self._masked_causal_attention(q, k, v, attention_lengths)
         attn_output = attn_output.reshape(batch_size, seq_len, -1)
 
         # Output projection
         output, _ = self.o_proj(attn_output)
         return output
+
+    @eager_on_graph(output_factory=lambda self, q, k, v, lengths: q.new_empty(q.shape))
+    def _attention_break(self, q, k, v, lengths: _ReplayLengths) -> torch.Tensor:
+        return self._masked_causal_attention(q, k, v, lengths.value)
 
     def _masked_causal_attention(
         self,
@@ -400,6 +425,114 @@ class Qwen3DecoderLayer(nn.Module):
         return hidden_states, residual
 
 
+class EncoderGraphs:
+    """Breakable CUDA graphs of the encoder forward, one per input shape.
+
+    The eager forward is host-bound: hundreds of small kernels for a few ms of
+    GPU work. Everything but the masked attention is captured; the attention
+    runs eagerly between segments and reads each request's valid lengths, so
+    prompts padded to one length (FLUX.2-klein, Z-Image) share one graph. The
+    replayed kernels are the eager ones, so the output is bit-identical. A shape
+    is captured on its second request; moved or replaced weights, and
+    /release_memory_occupation, drop every graph. A replay overwrites the previous output, so callers copy what they
+    keep (the Qwen3 text postprocessors all build new tensors).
+    """
+
+    max_graphs = 8
+
+    def __init__(self):
+        self.graphs = OrderedDict()
+        self.seen = set()
+        self.weights = None
+        self.pool = None
+        self.disabled = False
+        self.lengths = _ReplayLengths()
+
+    def __call__(self, model, input_ids, attention_lengths, output_hidden_states):
+        def eager():
+            return model._forward(
+                input_ids, None, None, output_hidden_states, attention_lengths
+            )
+
+        if (
+            self.disabled
+            or input_ids is None
+            or not input_ids.is_cuda
+            or input_ids.shape[0] != 1
+            or torch.compiler.is_compiling()
+            or torch.cuda.is_current_stream_capturing()
+            or (model_parallel_is_initialized() and get_tp_world_size() > 1)
+        ):
+            return eager()
+        tensors = [*model.parameters(), *model.buffers()]
+        if not all(t.is_cuda for t in tensors):
+            return eager()
+        # a replay skips module hooks, such as layerwise offload's weight loads
+        if any(m._forward_pre_hooks or m._forward_hooks for m in model.modules()):
+            return eager()
+        # graphs read weights by address; offload, reload or replacement moves them
+        weights = tuple(t.data_ptr() for t in tensors)
+        if weights != self.weights:
+            self.clear()
+            self.weights = weights
+        key = (*input_ids.shape, output_hidden_states)
+        entry = self.graphs.get(key)
+        if entry is None:
+            if key not in self.seen:
+                self.seen.add(key)
+                return eager()
+            try:
+                entry = self._capture(
+                    model, input_ids, attention_lengths, output_hidden_states
+                )
+            except Exception as e:
+                logger.warning("Qwen3 text encoder CUDA graph disabled: %s", e)
+                self.disabled = True
+                return eager()
+            logger.info("Captured Qwen3 text encoder CUDA graph for shape %s", key)
+            self.graphs[key] = entry
+            if len(self.graphs) > self.max_graphs:
+                self.graphs.popitem(last=False)
+        self.graphs.move_to_end(key)
+        graph, static_ids, output = entry
+        static_ids.copy_(input_ids)
+        self.lengths.value = attention_lengths
+        graph.replay()
+        return output
+
+    def clear(self):
+        self.graphs.clear()
+        self.seen.clear()
+        self.weights = None
+        self.pool = None
+
+    def _capture(self, model, input_ids, attention_lengths, output_hidden_states):
+        static_ids = input_ids.clone()
+        self.lengths.value = attention_lengths
+
+        def run():
+            return model._forward(
+                static_ids, None, None, output_hidden_states, self.lengths
+            )
+
+        # the side-stream warmup settles lazy allocations before capture
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            run()
+        torch.cuda.current_stream().wait_stream(stream)
+        torch.cuda.synchronize()
+        if self.pool is None:
+            self.pool = torch.cuda.graph_pool_handle()
+        graph = BreakableCUDAGraph()
+        # thread_local: an async output-save thread may use CUDA during capture
+        with BreakableCUDAGraphCapture(
+            graph, pool=self.pool, stream=stream, capture_error_mode="thread_local"
+        ):
+            output = run()
+        return graph, static_ids, output
+
+
 class Qwen3ForCausalLM(TextEncoder):
     """Qwen3 causal language model for text encoding in diffusion models.
 
@@ -449,6 +582,10 @@ class Qwen3ForCausalLM(TextEncoder):
 
         # Final layer norm
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self._cuda_graphs = EncoderGraphs()
+
+    def release_cuda_graphs(self) -> None:
+        self._cuda_graphs.clear()
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -467,7 +604,31 @@ class Qwen3ForCausalLM(TextEncoder):
             if output_hidden_states is not None
             else self.config.output_hidden_states
         )
+        attention_lengths = None
+        if attention_mask is not None:
+            attention_lengths = tuple(
+                int(valid_len)
+                for valid_len in attention_mask.sum(dim=-1).detach().cpu().tolist()
+            )
+        graphs = getattr(self, "_cuda_graphs", None)
+        if graphs is not None and inputs_embeds is None and position_ids is None:
+            return graphs(self, input_ids, attention_lengths, output_hidden_states)
+        return self._forward(
+            input_ids,
+            position_ids,
+            inputs_embeds,
+            output_hidden_states,
+            attention_lengths,
+        )
 
+    def _forward(
+        self,
+        input_ids: torch.Tensor | None,
+        position_ids: torch.Tensor | None,
+        inputs_embeds: torch.Tensor | None,
+        output_hidden_states: bool,
+        attention_lengths: tuple[int, ...] | _ReplayLengths | None,
+    ) -> BaseEncoderOutput:
         if inputs_embeds is not None:
             hidden_states = inputs_embeds
         else:
@@ -480,13 +641,6 @@ class Qwen3ForCausalLM(TextEncoder):
                 torch.arange(0, hidden_states.shape[1], device=hidden_states.device)
                 .unsqueeze(0)
                 .expand(hidden_states.shape[0], -1)
-            )
-
-        attention_lengths = None
-        if attention_mask is not None:
-            attention_lengths = tuple(
-                int(valid_len)
-                for valid_len in attention_mask.sum(dim=-1).detach().cpu().tolist()
             )
 
         all_hidden_states: tuple[Any, ...] | None = () if output_hidden_states else None

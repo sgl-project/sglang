@@ -706,7 +706,7 @@ mod tests {
     #[test]
     fn qwen_tool_calls_drop_split_terminal_special_tokens() {
         let events = futures::executor::block_on(
-            processor(Some("qwen25"), None, 1)
+            processor(Some("qwen"), None, 1)
                 .process_stream(stream::iter(vec![
                     chunk(
                         0,
@@ -730,7 +730,7 @@ mod tests {
     #[test]
     fn glm_tool_calls_drop_post_call_special_tokens() {
         let events = futures::executor::block_on(
-            processor(Some("glm45"), None, 1)
+            processor(Some("glm"), None, 1)
                 .process_stream(stream::iter(vec![
                     chunk(
                         0,

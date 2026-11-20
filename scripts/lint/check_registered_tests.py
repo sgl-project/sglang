@@ -12,6 +12,7 @@ import importlib.util
 import os
 import re
 import sys
+from pathlib import Path
 
 # Exactly what stage=/runner_config= produces, so a legacy suite= of this shape
 # is always expressible the modern way.
@@ -22,6 +23,24 @@ _MODERN_SHAPE = re.compile(r"^(.+)-test-(.+)$")
 _LEGACY_CUDA_PREFIXES = ("stress",)
 
 _KERNEL_LAYOUT = "test/registered/kernels/{ops,benchmark}/<group>/"
+
+# Where CI names the suites it runs, or a test file it runs by path.
+_CI_SOURCES = (
+    ".github/workflows/*.yml",
+    ".github/actions/**/*.yml",
+    "scripts/ci/**/*.sh",
+)
+
+
+def _ci_text() -> str:
+    """CI sources without full-line comments, which can name a suite nothing runs."""
+    paths = {p for pattern in _CI_SOURCES for p in glob.glob(pattern, recursive=True)}
+    return "\n".join(
+        line
+        for p in sorted(paths)
+        for line in Path(p).read_text(encoding="utf-8").splitlines()
+        if not line.lstrip().startswith("#")
+    )
 
 
 def _defines_testcase(tree: ast.AST) -> bool:
@@ -127,6 +146,9 @@ def main() -> int:
     nightly_flagged = []  # (file, backend, suite) -- nightly=True on CUDA/CPU
     unknown_runner_config = []  # (file, runner_config) -- absent from runner_configs.yml
     dead_tests = []  # (file) -- TestCase classes that `python3 file.py` never runs
+    # (file, backend, suite) -- non-CUDA; CUDA suites are built from stage and
+    # runner_config, which the checks above cover.
+    unrun_candidates = []
     taxonomy_violations = []
     for f in files:
         try:
@@ -144,6 +166,8 @@ def main() -> int:
         if _defines_testcase(tree) and not _main_runs_tests(tree):
             dead_tests.append(f)
         for r in registries:
+            if r.backend != cuda and r.disabled is None:
+                unrun_candidates.append((f, r.backend.name, r.effective_suite))
             if r.nightly and r.backend in no_nightly_flag:
                 nightly_flagged.append((f, r.backend.name, r.effective_suite))
             if (
@@ -168,7 +192,25 @@ def main() -> int:
             else:
                 non_dispatchable.append((f, r.suite))
 
+    ci_text = _ci_text()
+    unrun = [
+        (f, backend, suite)
+        for f, backend, suite in unrun_candidates
+        if not re.search(rf"(?<![\w-]){re.escape(suite)}(?![\w.-])", ci_text)
+        and f.removeprefix("test/") not in ci_text
+    ]
+
     exit_code = 0
+    if unrun:
+        print(
+            "ERROR: Test(s) register a suite that no workflow runs, and no "
+            "workflow runs the file by path, so they never run. Add the suite to "
+            'a workflow, register an existing suite, or set disabled="<reason>":\n'
+        )
+        for f, backend, suite in unrun:
+            print(f'  {f}\n    {backend} suite="{suite}"')
+        print()
+        exit_code = 1
     if missing:
         print("ERROR: Files in test/registered/ missing CI registry call:")
         print("  Move manual-only tests to test/manual/.\n")

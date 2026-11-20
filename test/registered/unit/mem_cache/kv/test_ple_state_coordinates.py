@@ -176,7 +176,7 @@ class TestPLEStateCoordinates(unittest.TestCase):
         setup_allocator_context()
         # Import-only NPU kernel dependencies; this test executes the production
         # Ascend metadata methods and PLE tensor writes on CPU.
-        npu_ops = ModuleType("sgl_kernel_npu.mamba.mamba_state_update_triton")
+        npu_ops = ModuleType("sgl_kernel_npu.operators.mamba")
         npu_ops.conv_state_rollback = None
         npu_ops.move_intermediate_cache = None
         with patch.dict("sys.modules", {npu_ops.__name__: npu_ops}):
@@ -214,7 +214,8 @@ class TestPLEStateCoordinates(unittest.TestCase):
                     get_mamba_indices=lambda rows: mapping[rows],
                 )
                 reader = SimpleNamespace(
-                    state_ids=lambda _: SimpleNamespace(ids=lambda indices: indices)
+                    state_ids=lambda _: SimpleNamespace(ids=lambda indices: indices),
+                    request_ids=lambda: SimpleNamespace(ids=lambda rows: rows),
                 )
                 backend = AscendMambaAttnBackendBase(
                     SimpleNamespace(

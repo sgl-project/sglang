@@ -1,8 +1,8 @@
 from dataclasses import dataclass
 from typing import Any
 
-import attentions  # noqa: F401
 import torch
+from sgl_kernel_npu.operators.attention import sparse_block_estimate
 
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,
@@ -13,16 +13,27 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
 from sglang.multimodal_gen.runtime.layers.attention.backends.laser_attn import (
     LaserAttentionBackend,
 )
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 BSA_BLOCK_SIZE = 128
+_is_npu = current_platform.is_npu()
+
+if _is_npu:
+    from sgl_kernel_npu.operators.attention import ada_block_sparse_attention
+
+
+def _ada_block_sparse_attention(**kwargs) -> torch.Tensor:
+    if _is_npu:
+        return ada_block_sparse_attention(**kwargs)
+    return torch.ops.attentions.ada_block_sparse_attention(**kwargs)
 
 
 class BlockSparseAttentionBackend(AttentionBackend):
-    accept_output_buffer: bool = True
-
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
         return [32, 64, 96, 128]
@@ -153,7 +164,7 @@ class BlockSparseAttentionImpl(AttentionImpl):
         key: torch.Tensor,
         sparsity: float,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return torch.ops.attentions.sparse_block_estimate(
+        return sparse_block_estimate(
             query=query,
             key=key,
             actual_seq_lengths=None,
@@ -179,7 +190,7 @@ class BlockSparseAttentionImpl(AttentionImpl):
         smask: torch.Tensor,
         sct: torch.Tensor,
     ) -> torch.Tensor:
-        return torch.ops.attentions.ada_block_sparse_attention(
+        return _ada_block_sparse_attention(
             query=query,
             key=key,
             value=value,

@@ -28,6 +28,7 @@ class TestSchedulePolicyWaitingQueueMatching(unittest.TestCase):
     def make_policy(self, policy, supports_fast_match_prefix):
         schedule_policy = object.__new__(SchedulePolicy)
         schedule_policy.policy = policy
+        schedule_policy._bounded_active = False
         schedule_policy.tree_cache = SimpleNamespace(
             supports_fast_match_prefix=lambda: supports_fast_match_prefix
         )
@@ -40,6 +41,9 @@ class TestSchedulePolicyWaitingQueueMatching(unittest.TestCase):
 
         policy.tree_cache = SimpleNamespace(supports_fast_match_prefix=lambda: True)
         self.assertTrue(policy.waiting_queue_prefix_matched([None] * 129))
+
+        policy._bounded_active = True
+        self.assertFalse(policy.waiting_queue_prefix_matched([None] * 129))
 
 
 class TestSchedulerLoadInquirer(unittest.TestCase):
@@ -114,13 +118,14 @@ class TestSchedulerLoadInquirer(unittest.TestCase):
                     CacheRequestHandle("waiting", 0)
                 )
 
-    def test_decode_loads_count_prealloc_requests_waiting_for_input(self):
-        """A preallocated request whose input has arrived is ready, with its tokens."""
+    def decode_loads(self, host_pool_blocked=False, input_arrived=True):
         ready, pending = FakeReq(seqlen=30), FakeReq(seqlen=70)
         prealloc = decode_queue(
             ListKind.PD_PREALLOC,
             [
-                DecodeRequest(req=ready, kv_receiver=None, waiting_for_input=True),
+                DecodeRequest(
+                    req=ready, kv_receiver=None, waiting_for_input=input_arrived
+                ),
                 DecodeRequest(req=pending, kv_receiver=None),
             ],
         )
@@ -134,7 +139,11 @@ class TestSchedulerLoadInquirer(unittest.TestCase):
             spec_algorithm=SimpleNamespace(is_none=lambda: True),
             get_running_batch=lambda: SimpleNamespace(reqs=[]),
             get_stats=SchedulerStats,
-            get_disagg_decode_prealloc_queue=lambda: SimpleNamespace(queue=prealloc),
+            get_disagg_decode_prealloc_queue=lambda: SimpleNamespace(
+                queue=prealloc,
+                host_pool_blocked=host_pool_blocked,
+                transfer_queue=SimpleNamespace(num_host_staged_landed=2),
+            ),
             get_request_lists=lambda: {
                 ListKind.WAITING: [],
                 ListKind.PD_PREALLOC: prealloc,
@@ -152,11 +161,26 @@ class TestSchedulerLoadInquirer(unittest.TestCase):
             ),
             patch(f"{module}.get_parallel", return_value=SimpleNamespace(dp_rank=0)),
         ):
-            loads = inquirer.get_loads()
+            return inquirer.get_loads()
 
+    def test_decode_loads_count_prealloc_requests_waiting_for_input(self):
+        """A preallocated request whose input has arrived is ready, with its tokens."""
+        loads = self.decode_loads()
         self.assertEqual(loads.disaggregation.decode_prealloc_queue_reqs, 2)
         self.assertEqual(loads.queues.prealloc_ready, 1)
         self.assertEqual(loads.num_prealloc_ready_tokens, 30)
+        self.assertEqual(loads.disaggregation.decode_host_pool_blocked, 0)
+        self.assertEqual(loads.disaggregation.decode_host_staged_landed_reqs, 2)
+
+    def test_decode_loads_report_a_full_host_pool_holding_a_ready_request(self):
+        loads = self.decode_loads(host_pool_blocked=True)
+        self.assertEqual(loads.disaggregation.decode_host_pool_blocked, 1)
+
+    def test_decode_loads_report_no_host_pool_block_without_a_ready_request(self):
+        """A block from the last admission pass is not reported once nothing is ready."""
+        loads = self.decode_loads(host_pool_blocked=True, input_arrived=False)
+        self.assertEqual(loads.queues.prealloc_ready, 0)
+        self.assertEqual(loads.disaggregation.decode_host_pool_blocked, 0)
 
     def test_storage_exclusion_requires_per_request_matching(self):
         for prefix_matched, expected in ((True, 60), (False, 65)):

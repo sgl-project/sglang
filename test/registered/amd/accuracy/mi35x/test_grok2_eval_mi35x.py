@@ -2,7 +2,7 @@
 
 Tests Grok-2 model using few-shot completion benchmark on MI35x.
 
-Registry: nightly-amd-accuracy-8-gpu-mi35x-grok2 suite
+Registry: nightly-accuracy-test-8-gpu-amd-mi35x-grok2 suite
 """
 
 import ast
@@ -25,7 +25,7 @@ from sglang.utils import download_and_cache_file, read_jsonl
 
 # Register for AMD CI - GROK2 accuracy tests on MI35x (~25 min)
 register_amd_ci(
-    est_time=1500, suite="nightly-amd-accuracy-8-gpu-mi35x-grok2", nightly=True
+    est_time=1500, suite="nightly-accuracy-test-8-gpu-amd-mi35x-grok2", nightly=True
 )
 
 INVALID = -9999999

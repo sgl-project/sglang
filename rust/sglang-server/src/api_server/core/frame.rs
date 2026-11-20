@@ -33,7 +33,8 @@ pub(crate) struct CoreOutput {
     /// The launch weight version, which frames report until a terminal one's
     /// spans name the last; stamped by the core call.
     pub(crate) weight_version: Option<Arc<str>>,
-    /// This listener's data-parallel rank; stamped by the core call.
+    /// This listener's data-parallel rank, `None` without data parallelism;
+    /// stamped by the core call.
     pub(crate) dp_rank: Option<u32>,
     pub(crate) text: String,
     pub(crate) completion_tokens: u64,

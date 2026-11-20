@@ -29,6 +29,17 @@ register_kernel(
 
 register_kernel(
     KernelSpec(
+        op="moe.beam_decode_gemv",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.moe.beam_decode_gemv:beam_decode_gemv",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(10, 3), max_sm=(10, 3))}
+        ),
+    )
+)
+
+register_kernel(
+    KernelSpec(
         op="moe.bf16_mega_gate",
         backend=KernelBackend.DEEPGEMM,
         target="sglang.kernels.ops.moe.mega_gate:bf16_mega_gate",
@@ -354,6 +365,35 @@ for _mod, _fn, _desc in _MUSE_SPARK_GFX950_KERNELS:
         KernelSpec(
             op=f"moe.{_fn}",
             backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.moe.{_mod}:{_fn}",
+            capabilities=frozenset({CapabilityRequirement.HIP}),
+        )
+    )
+del _mod, _fn, _desc
+
+# Muse Spark on gfx950 (MI355X): FlyDSL expert GEMMs and finalize (builders return the compiled launch).
+_MUSE_SPARK_GFX950_FLYDSL_KERNELS = [
+    (
+        "muse_moe_gemm",
+        "launch_muse_moe_gemm",
+        "grouped expert GEMM, BF16 or row-major packed MXFP4 weights (gate/up and down)",
+    ),
+    (
+        "muse_moe_finalize",
+        "build_finalize",
+        "per-expert RMSNorm (with gain) + routing-weight reduction",
+    ),
+    (
+        "muse_moe_finalize",
+        "build_splitk_silu",
+        "split-K partial sum + SiLU-and-mul of the gate/up output",
+    ),
+]
+for _mod, _fn, _desc in _MUSE_SPARK_GFX950_FLYDSL_KERNELS:
+    register_kernel(
+        KernelSpec(
+            op=f"moe.{_fn}",
+            backend=KernelBackend.FLYDSL,
             target=f"sglang.kernels.ops.moe.{_mod}:{_fn}",
             capabilities=frozenset({CapabilityRequirement.HIP}),
         )

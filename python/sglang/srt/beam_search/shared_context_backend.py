@@ -1,0 +1,84 @@
+# Copyright 2026 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+"""FlashInfer backend that routes all-beam decode batches to shared-context
+attention; every other batch runs the parent unchanged."""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+import torch
+
+from sglang.srt.beam_search import shared_context_attention
+from sglang.srt.environ import envs
+from sglang.srt.layers.attention.flashinfer_backend import (
+    DecodeMetadata,
+    FlashInferAttnBackend,
+)
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.radix_attention import RadixAttention
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+
+def _has_shared_context(forward_batch: ForwardBatch) -> bool:
+    return (
+        forward_batch.beam is not None
+        and forward_batch.beam.attention_metadata is not None
+    )
+
+
+def flashinfer_backend_cls(base: type[FlashInferAttnBackend]):
+    if envs.SGLANG_ENABLE_BEAM_SHARED_CONTEXT_ATTENTION.get():
+        return BeamSharedContextFlashInferAttnBackend
+    return base
+
+
+class BeamSharedContextFlashInferAttnBackend(FlashInferAttnBackend):
+    def __init__(self, model_runner, *args, **kwargs):
+        super().__init__(model_runner, *args, **kwargs)
+        shared_context_attention.supports_shared_context(model_runner)
+
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
+        if not _has_shared_context(forward_batch):
+            return super().init_forward_metadata(forward_batch)
+        self.forward_metadata = DecodeMetadata([])
+
+    def forward_decode(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache=True,
+    ):
+        if not _has_shared_context(forward_batch) or layer.is_cross_attention:
+            return super().forward_decode(
+                q, k, v, layer, forward_batch, save_kv_cache=save_kv_cache
+            )
+
+        if k is not None:
+            assert v is not None
+            if save_kv_cache:
+                self.kv_layers.layer(layer.layer_id).store(
+                    layer,
+                    KVWriteLoc.for_layer(forward_batch, layer),
+                    k,
+                    v,
+                    *self._kv_write_scales(layer),
+                )
+
+        return shared_context_attention.forward(q, layer, forward_batch, self.kv_layers)

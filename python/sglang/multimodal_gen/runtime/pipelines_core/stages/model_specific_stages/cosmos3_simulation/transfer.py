@@ -32,6 +32,7 @@ from sglang.multimodal_gen.configs.models.dits.cosmos_dreams import (
     CosmosDreamsManifest,
     CosmosDreamsTransferHistoryProfile,
 )
+from sglang.multimodal_gen.runtime.cache.conditioning import use_gpu_conditioning_hash
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
@@ -389,7 +390,7 @@ def encode_control_latent(
         dtype=vae_dtype,
         float32_first=float32_normalization,
     )
-    with torch.no_grad():
+    with torch.no_grad(), use_gpu_conditioning_hash():
         latent = vae.encode(pixels).mode()
     mean = torch.as_tensor(vae.config.latents_mean).view(1, -1, 1, 1, 1).to(latent)
     std = torch.as_tensor(vae.config.latents_std).view(1, -1, 1, 1, 1).to(latent)
@@ -502,7 +503,6 @@ class CosmosDreamsControlVideoStage(PipelineStage):
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         manifest = self.manifest
-        sampling_params = batch.sampling_params
         frames, hint, fps, control_path = self._load_control(batch)
         source_hw = (int(frames.shape[2]), int(frames.shape[3]))
         frames = self._fit_control(batch, frames, hint=hint, source_hw=source_hw)
@@ -599,7 +599,6 @@ class CosmosDreamsTransferPrepareStage(PipelineStage):
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         device = get_local_torch_device()
-        manifest = self.manifest
         geometry: CosmosDreamsGeometry = batch.extra[EXTRA_GEOMETRY]
         target_frame: int = batch.extra[EXTRA_TARGET_LATENT_FRAMES]
 

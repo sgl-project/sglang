@@ -47,6 +47,11 @@ _AUTO_PIPELINE_GROUPS = (7, 5, 4, 3, 2)
 # overlaps the next: MiniMax-H3 at Ulysses 4 runs 7 two-head groups (3.5 waves
 # at 1280x704, 3.9 at 1344x768) faster than 2, under FA4 and cuDNN alike.
 _MIN_GROUP_WAVES = 3
+# plain exchange, bytes per rank from which the copy engine is no slower than
+# NCCL on B300 (0.77x of its time at 3 ranks; even at 4, 0.85x by twice that):
+# below, 30 us per peer loses to NCCL's one kernel. Pairs have ipc_a2a; larger
+# groups are not measured
+_AUTO_PLAIN_MIN_BYTES = {3: 48 << 20, 4: 128 << 20}
 
 
 @functools.lru_cache(maxsize=None)
@@ -388,20 +393,42 @@ class IpcA2AMultiState:
             torch.cuda.synchronize()
         self.staging.clear()
         self.pools.clear()
+        if torch.cuda.is_available():
+            torch.cuda.ipc_collect()
+
+    def _release_shared(self) -> None:
+        """Free the buffers just dropped on every rank; a group collective.
+
+        A shared block outlives its last local reference until each peer has
+        closed its mapping, and then only when the IPC limbo is collected.
+        """
+        torch.cuda.synchronize()
+        dist.barrier(group=self.group)
+        torch.cuda.ipc_collect()
 
     def _share(self, t: torch.Tensor, group) -> list[torch.Tensor]:
         """Every member's `t`, peers' re-opened in the LOCAL device context
-        (a mapping is only dereferenceable from the context that opened it)."""
+        (a mapping is only dereferenceable from the context that opened it).
+
+        Each peer gets its own handle: torch counts one reference per handle and
+        frees `t` only once that count is back to zero, so one handle opened by
+        world - 1 peers never frees it (every dropped pool or staging buffer
+        stayed allocated)."""
         from torch.multiprocessing.reductions import reduce_tensor
 
+        mine = [
+            None if member == self.rank else reduce_tensor(t)
+            for member in range(self.world)
+        ]
         handles: list = [None] * self.world
-        dist.all_gather_object(handles, reduce_tensor(t), group=group)
+        dist.all_gather_object(handles, mine, group=group)
         dev = torch.cuda.current_device()
         out = []
-        for member, (fn, args) in enumerate(handles):
+        for member, theirs in enumerate(handles):
             if member == self.rank:
                 out.append(t)
                 continue
+            fn, args = theirs[self.rank]
             args = list(args)
             for i, v in enumerate(args):
                 if isinstance(v, torch.device):
@@ -481,6 +508,7 @@ class IpcA2AMultiState:
             # queued copies may still target the evicted peer mappings
             torch.cuda.synchronize()
             self.staging.popitem(last=False)
+            self._release_shared()
         self.staging[key] = value
 
     def pipelined_attention(
@@ -617,6 +645,7 @@ class IpcA2AMultiState:
                 torch.cuda.synchronize()
                 del self.pools[q.dtype]
                 pool = None
+                self._release_shared()
             if check is not None:
                 reference = sequential()
             pool = self.pools[q.dtype] = _PipelinePool(self, q.dtype, *sizes)
@@ -1066,12 +1095,12 @@ class IpcA2AMultiState:
 IPC_A2A_MULTI = IpcA2AMultiState()
 
 
-def ipc_a2a_multi_ready(group, enabled: bool | None = None) -> bool:
+def ipc_a2a_multi_ready(group, enabled: bool) -> bool:
     """True when the N-rank transport is enabled and initialized on every
     member of `group` (initializes lazily on the first eager call)."""
     from sglang.multimodal_gen.runtime.platforms import current_platform
 
-    if not (envs.SGLANG_DIFFUSION_IPC_A2A_MULTI if enabled is None else enabled):
+    if not enabled:
         return False
     if IPC_A2A_MULTI.group is not None and IPC_A2A_MULTI.group is not group:
         IPC_A2A_MULTI.reset()
@@ -1099,6 +1128,24 @@ def ipc_a2a_multi_ready(group, enabled: bool | None = None) -> bool:
         IPC_A2A_MULTI.failed = True
         return False
     return True
+
+
+def plain_exchange_ready(group, nbytes: int) -> bool:
+    """True when a plain all-to-all of `nbytes` per rank should take the copy
+    engine: SGLANG_DIFFUSION_IPC_A2A_MULTI when it is set, else where it
+    measured faster than NCCL. Every rank sends the same bytes, so every rank
+    decides the same."""
+    from sglang.multimodal_gen.runtime.platforms import current_platform
+
+    enabled = envs.SGLANG_DIFFUSION_IPC_A2A_MULTI
+    if enabled is None:
+        threshold = _AUTO_PLAIN_MIN_BYTES.get(dist.get_world_size(group))
+        enabled = (
+            threshold is not None
+            and nbytes >= threshold
+            and current_platform.is_blackwell()
+        )
+    return ipc_a2a_multi_ready(group, enabled)
 
 
 def ulysses_pipelined_attention(

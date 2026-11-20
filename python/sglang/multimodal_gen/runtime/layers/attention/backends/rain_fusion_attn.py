@@ -2,9 +2,9 @@ import math
 from dataclasses import dataclass
 from typing import Any, List, Optional
 
-import attentions  # noqa: F401
 import torch
 from einops import rearrange
+from sgl_kernel_npu.operators.attention import rain_fusion_attention
 
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,
@@ -22,8 +22,6 @@ logger = init_logger(__name__)
 
 
 class RainFusionAttentionBackend(AttentionBackend):
-    accept_output_buffer: bool = True
-
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
         return [32, 64, 96, 128]
@@ -312,7 +310,7 @@ class RainFusionAttentionImpl(AttentionImpl):
         actual_seq_lengths=Optional[torch.Tensor],
         actual_seq_lengths_kv=Optional[torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return torch.ops.attentions.rainfusionattention(
+        return rain_fusion_attention(
             query=query,
             key=key,
             value=value,

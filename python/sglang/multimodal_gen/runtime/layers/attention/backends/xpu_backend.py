@@ -30,8 +30,6 @@ class XPUAttentionBackend(AttentionBackend):
     def supports_ring_rotation(cls) -> bool:
         return True
 
-    accept_output_buffer: bool = True
-
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
         return [64, 96, 128, 192, 256]
@@ -70,8 +68,13 @@ def _as_fa_input(t: torch.Tensor, rows: int, heads: int, head_dim: int) -> torch
 
     The kernel reads rows through their stride, so a head-packed row-strided view
     (e.g. q/k/v slices of a fused projection output) is used in place; measured
-    bit-identical to the contiguous input.
+    bit-identical to the contiguous input. Under torch.compile the input is always
+    copied.
     """
+    if torch.compiler.is_compiling():
+        # data_ptr() below is untraceable; its graph break leaves aliased q/k views as
+        # inputs of an in-place QK-norm+RoPE graph, whose dynamic recompile then fails.
+        return t.contiguous().view(rows, heads, head_dim)
     try:
         view = t.view(rows, heads, head_dim)
     except RuntimeError:

@@ -169,6 +169,13 @@ pub enum DpRankPolicy {
     /// The worker's ranks in turn.
     #[value(name = "round_robin")]
     RoundRobin,
+    /// The rank expected to hold the fewest KV tokens by the engine's
+    /// `--load-publish-endpoint` feed: tokens in use plus queued, with every
+    /// request the rank holds charged a typical request's KV. Ties,
+    /// and a worker without a fresh reading for every rank, fall back to
+    /// `least_in_flight`.
+    #[value(name = "least_tokens")]
+    LeastTokens,
 }
 
 /// Role served by a static bucket.
@@ -381,7 +388,8 @@ impl Default for ObservabilityConfig {
 #[derive(Debug, Clone)]
 pub struct ModelConfig {
     pub id: String,
-    /// Extra `model` values served as `id` (`--model-alias`); only `id` is advertised.
+    /// Extra `model` values rewritten to `id` in the forwarded body (`--model-alias`);
+    /// only `id` is advertised.
     pub aliases: Vec<String>,
     /// Local tokenizer.json or HuggingFace repo id; defaults to `id`.
     /// Resolved by [`crate::tokenizer::adapter::load`]; `None` (`--no-tokenizer`) disables it.
@@ -396,8 +404,12 @@ pub struct ModelConfig {
     pub decode_policy: DecodePolicyKind,
     /// Send a DP rank as `X-Data-Parallel-Rank`; see [`crate::policies::dp_rank`].
     pub dp_aware: bool,
-    /// Rank choice under `dp_aware` when no routing key or cached prefix decides it.
+    /// Rank choice under `dp_aware` when no routing key or cached prefix decides it;
+    /// in PD mode, the prefill rank.
     pub dp_rank_policy: DpRankPolicy,
+    /// Rank choice under `dp_aware` for the PD decode rank, which no routing key
+    /// or cached prefix ever decides; `None` follows `dp_rank_policy`.
+    pub decode_dp_rank_policy: Option<DpRankPolicy>,
     /// Optional static bucket configuration. `None` uses the global domain.
     pub bucket_config: Option<BucketConfig>,
     /// Reorg `--bucket-config`; `None` builds the default plain and P/D buckets.
@@ -424,6 +436,13 @@ pub struct ModelConfig {
 }
 
 impl ModelConfig {
+    /// The PD decode rank policy: `--decode-dp-rank-policy`, else `--dp-rank-policy`.
+    pub fn decode_dp_rank_policy(&self) -> DpRankPolicy {
+        self.decode_dp_rank_policy.unwrap_or(self.dp_rank_policy)
+    }
+}
+
+impl ModelConfig {
     /// Canonicalize an alias, preserving an optional LoRA suffix. Match whole
     /// names before suffixes, then the longest name, so URI colons and aliases
     /// that extend another alias are not mistaken for adapter separators.
@@ -444,15 +463,6 @@ impl ModelConfig {
             })
             .max_by_key(|(name, _)| name.len())?;
         (name != &self.id).then(|| format!("{}:{adapter}", self.id))
-    }
-
-    /// `model` as served: a `--model-alias` names `id`.
-    pub fn served_name<'a>(&'a self, model: &'a str) -> &'a str {
-        if self.aliases.iter().any(|alias| alias == model) {
-            &self.id
-        } else {
-            model
-        }
     }
 }
 
@@ -548,6 +558,8 @@ pub struct CacheAwareConfig {
     /// Max requests one pending stake may attract before later requests fall
     /// through to the confirmed tree and the load policy; 0 = unlimited.
     pub pending_prefix_max_followers: u64,
+    /// `--cache-media-affinity-ttl-ms`; 0 disables media affinity.
+    pub media_affinity_ttl_ms: u64,
     /// Confirmed-first mode when set: consult and stake pending prefixes only
     /// where a stake is strictly deeper than the confirmed match and while that
     /// match covers less than this share of the prompt. `None` keeps the
@@ -565,6 +577,7 @@ impl Default for CacheAwareConfig {
             bootstrap_seed_required: false,
             pending_prefix_ttl_ms: 0,
             pending_prefix_max_followers: 0,
+            media_affinity_ttl_ms: 0,
             pending_prefix_consult_below: None,
         }
     }
@@ -594,8 +607,9 @@ pub const MIN_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS: u64 = 30_000;
 /// Duration` can overflow and panic.
 pub const MAX_KV_BOOTSTRAP_TIMEOUT_MS: u64 = 3_600_000;
 
-/// Default request header for sticky routing.
-pub const DEFAULT_STICKY_HEADER: &str = "x-sgl-routing-key";
+/// Default request header for sticky routing: the one the engine reads its
+/// routing key from.
+pub const DEFAULT_STICKY_HEADER: &str = sglang_processor::openai::ROUTING_KEY_HEADER;
 
 /// Default request header for session-aware routing.
 pub const DEFAULT_SESSION_ID_HEADER: &str = "x-session-id";

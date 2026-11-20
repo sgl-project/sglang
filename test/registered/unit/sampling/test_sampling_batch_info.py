@@ -3,7 +3,7 @@
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=26, suite="base-a-test-cpu")
-register_cpu_ci(est_time=6, suite="stage-b-test-cpu-intel")
+register_cpu_ci(est_time=6, suite="extra-test-cpu-intel")
 
 import unittest
 from types import SimpleNamespace
@@ -573,6 +573,23 @@ class TestFilterBatch(CustomTestCase):
         self.assertFalse(info.has_custom_logit_processor)
         self.assertIsNone(info.custom_logit_processor)
 
+    def test_seeds_follow_rows_through_merge_and_filter(self):
+        """A merged-in unseeded side gets filler seeds; once the last seeded row
+        leaves, the batch returns to the unseeded samplers."""
+        info = _make_info(batch_size=1)
+        seeded = _make_info(
+            batch_size=1,
+            sampling_seed=torch.tensor([123], dtype=torch.int64),
+            rows_with_seed=[True],
+        )
+        info.merge_batch(seeded)
+        self.assertEqual(info.sampling_seed[1].item(), 123)
+        self.assertEqual(info.rows_with_seed, [False, True])
+
+        info.filter_batch([0], torch.tensor([0]))
+        self.assertIsNone(info.sampling_seed)
+        self.assertIsNone(info.rows_with_seed)
+
     def test_filter_with_none_sampling_seed(self):
         """Test that filter preserves None sampling_seed without error."""
         info = _make_info(batch_size=3)
@@ -713,6 +730,13 @@ class TestFromScheduleBatch(CustomTestCase):
         )
         exec_patch.start()
         self.addCleanup(exec_patch.stop)
+        self._spec_ns = SimpleNamespace(speculative_algorithm=None)
+        spec_patch = patch(
+            "sglang.srt.sampling.sampling_batch_info.get_spec",
+            return_value=self._spec_ns,
+        )
+        spec_patch.start()
+        self.addCleanup(spec_patch.stop)
 
     def _make_req(
         self,
@@ -795,6 +819,28 @@ class TestFromScheduleBatch(CustomTestCase):
         self.assertEqual(info.sampling_seed[0].item(), 123)
         self.assertEqual(info.sampling_seed[1].item(), 42)  # default
 
+    def test_seed_without_deterministic_inference(self):
+        """A non-greedy request's seed applies and the other rows get seeds too; a
+        greedy seed, or speculative decoding, leaves the batch unseeded."""
+        batch = MagicMock()
+        batch.device = DEVICE
+        batch.reqs = [self._make_req(seed=123, top_k=50), self._make_req(seed=None)]
+        info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
+        self.assertEqual(info.sampling_seed.shape[0], 2)
+        self.assertEqual(info.sampling_seed[0].item(), 123)
+        self.assertEqual(info.rows_with_seed, [True, False])
+
+        batch.reqs = [self._make_req(seed=123, top_k=1)]
+        self.assertIsNone(
+            SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE).sampling_seed
+        )
+
+        self._spec_ns.speculative_algorithm = "EAGLE"
+        batch.reqs = [self._make_req(seed=123, top_k=50)]
+        self.assertIsNone(
+            SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE).sampling_seed
+        )
+
     def test_from_schedule_batch_sampling_flags(self):
         """Test that sampling flags (need_top_p/top_k/min_p) are set correctly."""
 
@@ -839,6 +885,64 @@ class TestFromScheduleBatch(CustomTestCase):
                 info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
 
                 self.assertEqual(info.max_top_k, expected)
+
+    def _top_k_flags(self, info):
+        return (
+            info.is_all_greedy,
+            info.is_any_greedy,
+            info.need_top_k_sampling,
+            info.npu_top_k_top_p_eligible,
+            info.max_top_k,
+        )
+
+    def test_refresh_top_k_flags_after_filter_matches_a_fresh_batch(self):
+        """A finished greedy row (top_k=1) must not keep the running batch on the
+        top-k path: refresh_top_k_flags gives the kept rows the flags a batch
+        built from them would have."""
+        cases = (
+            # (top_ks, kept row, need_top_k_sampling, max_top_k after refresh)
+            ((1, TOP_K_ALL), 1, False, None),
+            ((TOP_K_ALL, 20), 1, True, 20),
+            ((1, 20, 50), 2, True, 50),
+        )
+        for top_ks, kept, need_top_k, max_top_k in cases:
+            with self.subTest(top_ks=top_ks, kept=kept):
+                reqs = [self._make_req(top_k=top_k) for top_k in top_ks]
+                batch = MagicMock()
+                batch.reqs = reqs
+                batch.device = DEVICE
+                info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
+                before = self._top_k_flags(info)
+
+                info.filter_batch([kept], torch.tensor([kept]))
+                # SamplingBatchInfo.filter_batch alone keeps the old, safe flags.
+                self.assertEqual(self._top_k_flags(info), before)
+
+                info.refresh_top_k_flags([top_ks[kept]])
+                self.assertEqual(info.need_top_k_sampling, need_top_k)
+                self.assertEqual(info.max_top_k, max_top_k)
+                self.assertFalse(info.is_any_greedy)
+                fresh_batch = MagicMock()
+                fresh_batch.reqs = [reqs[kept]]
+                fresh_batch.device = DEVICE
+                fresh = SamplingBatchInfo.from_schedule_batch(fresh_batch, VOCAB_SIZE)
+                self.assertEqual(self._top_k_flags(info), self._top_k_flags(fresh))
+
+    def test_refresh_top_k_flags_reads_only_the_given_top_ks(self):
+        """The flags come from the requests' top_k, not from the top_ks tensor, so
+        a reassigned tensor cannot leave them stale."""
+        batch = MagicMock()
+        batch.reqs = [self._make_req(top_k=TOP_K_ALL), self._make_req(top_k=1)]
+        batch.device = DEVICE
+        info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
+        info.top_ks = torch.tensor([5, 5], dtype=torch.int32)
+
+        info.refresh_top_k_flags([TOP_K_ALL, 1])
+
+        self.assertTrue(info.is_any_greedy)
+        self.assertFalse(info.is_all_greedy)
+        self.assertTrue(info.need_top_k_sampling)
+        self.assertIsNone(info.max_top_k)
 
     def test_no_logit_bias_when_all_none(self):
         """Test that logit_bias stays None when no request has logit_bias set."""

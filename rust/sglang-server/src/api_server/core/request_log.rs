@@ -41,7 +41,7 @@ use super::frame::CoreOutput;
 use crate::message::config::{RequestLogConfig, ServerArgs};
 use crate::message::multimodal::MmItem;
 use crate::message::request::GenerateRequest;
-use crate::message::response::ResponseItem;
+use crate::message::response::{ChunkEvent, ResponseItem};
 
 /// Python's `record_request_for_crash_dump` keeps a finished request this long.
 const CRASH_DUMP_WINDOW_SECS: f64 = 300.0;
@@ -57,6 +57,9 @@ pub(crate) struct RequestLog {
     default_priority: Option<i64>,
     /// The launch weight version the core stamps on every output.
     weight_version: Option<Arc<str>>,
+    /// This listener's data-parallel rank, which the core stamps on every
+    /// output; `None` without data parallelism.
+    dp_rank: Option<u32>,
     /// `--incremental-streaming-output`: a stream's `Finish` shows its last
     /// delta, as Python's does.
     incremental_streaming_output: bool,
@@ -74,17 +77,6 @@ pub(crate) struct BodySnapshot {
     /// The whole body for a crash dump (`None` when not recording).
     dump: Option<Arc<DumpBody>>,
     headers: LoggedHeaders,
-    /// When an HTTP layer started the request before `/generate` ran (work
-    /// an `HttpLayer` does before the handler), so the `Finish` latency
-    /// includes that wait.
-    started_at: Option<Instant>,
-}
-
-impl BodySnapshot {
-    pub(crate) fn started_at(mut self, at: Option<Instant>) -> Self {
-        self.started_at = at;
-        self
-    }
 }
 
 /// A native `/generate` body's bytes as received, and the header overrides
@@ -99,7 +91,12 @@ pub(crate) struct RawBody {
 /// How a generation request reached the core.
 pub(crate) enum ReceivedAs {
     /// A native `/generate` body ([`CoreHandle::snapshot_body`](crate::api_server::handlers::CoreHandle::snapshot_body)).
-    Body(Option<BodySnapshot>),
+    Body {
+        snapshot: Option<BodySnapshot>,
+        /// When an HTTP layer started the request before `/generate` ran
+        /// (work an `HttpLayer` does before the handler).
+        started_at: Option<Instant>,
+    },
     /// Built by an adapter (OpenAI, gRPC) or by the core itself, with the
     /// headers of the HTTP request it came from.
     Typed(LoggedHeaders),
@@ -109,6 +106,21 @@ impl ReceivedAs {
     /// A built request with no HTTP headers (gRPC, the startup warmup).
     pub(crate) fn without_headers() -> Self {
         Self::Typed(LoggedHeaders::default())
+    }
+
+    /// When the request started: when an HTTP layer started it before
+    /// `/generate` ran, else now. The `Finish` latency, `/generate`'s
+    /// `e2e_latency` and the latency metrics count from it, as Python's
+    /// TokenizerManager counts from before the work such a layer takes over
+    /// from it.
+    pub(crate) fn created_at(&self) -> Instant {
+        match self {
+            Self::Body {
+                started_at: Some(at),
+                ..
+            } => *at,
+            _ => Instant::now(),
+        }
     }
 }
 
@@ -141,6 +153,7 @@ impl RequestLog {
             server_added_custom_params: args.server_added_custom_params.clone(),
             default_priority: args.default_priority_value,
             weight_version: args.weight_version.as_deref().map(Arc::from),
+            dp_rank: args.deployment_info.reported_dp_rank(),
             incremental_streaming_output: args.incremental_streaming_output,
         })))
     }
@@ -167,6 +180,7 @@ impl RequestLog {
             server_added_custom_params: omitted,
             default_priority: None,
             weight_version: Some(Arc::from("default")),
+            dp_rank: None,
             incremental_streaming_output: false,
         })
     }
@@ -220,7 +234,6 @@ impl RequestLog {
             fields,
             dump,
             headers: self.logged_headers(headers),
-            started_at: None,
         })
     }
 
@@ -279,16 +292,17 @@ impl RequestLog {
         batch: bool,
         log_metrics: bool,
     ) -> Vec<RequestRecord> {
-        let created_at = match &received {
-            ReceivedAs::Body(Some(snapshot)) => snapshot.started_at,
-            _ => None,
-        }
-        .unwrap_or_else(Instant::now);
+        let created_at = received.created_at();
         let created_time = unix_time();
         let (obj, items, dumps, headers) = match received {
-            ReceivedAs::Body(Some(snapshot)) => self.body_views(snapshot, requests, batch),
+            ReceivedAs::Body {
+                snapshot: Some(snapshot),
+                ..
+            } => self.body_views(snapshot, requests, batch),
             // A body that is not a JSON object fails to decode before this.
-            ReceivedAs::Body(None) => self.typed_views(requests, batch, LoggedHeaders::default()),
+            ReceivedAs::Body { snapshot: None, .. } => {
+                self.typed_views(requests, batch, LoggedHeaders::default())
+            }
             ReceivedAs::Typed(headers) => self.typed_views(requests, batch, headers),
         };
         if let Some(logger) = &self.logger {
@@ -301,6 +315,7 @@ impl RequestLog {
             .map(|((obj, dump), request)| {
                 let output = Arc::new(Mutex::new(CoreOutput {
                     weight_version: self.weight_version.clone(),
+                    dp_rank: self.dp_rank,
                     ..Default::default()
                 }));
                 let rid = request.rid.client_facing().to_owned();
@@ -345,7 +360,6 @@ impl RequestLog {
             fields,
             dump,
             headers,
-            ..
         } = snapshot;
         let logging = self.logger.is_some();
         // Held once for the whole batch, as Python's items share them.
@@ -416,9 +430,6 @@ impl RequestLog {
     /// Python's single-request normalization of the fields the request
     /// carries.
     fn normalize(&self, item: &mut Map<String, Value>, request: &GenerateRequest) {
-        // The deprecated `data_parallel_rank` moves to `routed_dp_rank`, as
-        // `/generate` decodes it.
-        crate::message::request::move_deprecated_dp_rank(item);
         if item.get("sampling_params").is_none_or(Value::is_null) {
             item.insert("sampling_params".into(), Value::Object(Map::new()));
         }
@@ -792,6 +803,12 @@ fn media_item(item: &MmItem) -> Value {
             if let Some(detail) = &hints.detail {
                 item.insert("detail".into(), detail.as_str().into());
             }
+            if let Some(max_frames) = hints.max_frames {
+                item.insert("max_frames".into(), max_frames.into());
+            }
+            if let Some(max_tokens_per_frame) = hints.max_tokens_per_frame {
+                item.insert("max_tokens_per_frame".into(), max_tokens_per_frame.into());
+            }
             Value::Object(item)
         }
     }
@@ -829,11 +846,11 @@ impl RequestRecord {
     pub(crate) fn observe(&mut self, item: &ResponseItem) {
         match item {
             ResponseItem::Frame(chunk) => {
-                let delta = CoreOutput::from(chunk.clone());
+                let delta = self.delta(chunk);
                 lock(&self.output).append_delta(&delta);
             }
             ResponseItem::Done(chunk) => {
-                let delta = CoreOutput::from(chunk.clone());
+                let delta = self.delta(chunk);
                 let output = {
                     let mut output = lock(&self.output);
                     output.append_delta(&delta);
@@ -852,6 +869,15 @@ impl RequestRecord {
                 self.finish(output);
             }
             _ => self.unregister(),
+        }
+    }
+
+    /// `chunk` as an output of the call, which the core stamps with the
+    /// listener's DP rank.
+    fn delta(&self, chunk: &ChunkEvent) -> CoreOutput {
+        CoreOutput {
+            dp_rank: self.log.dp_rank,
+            ..CoreOutput::from(chunk.clone())
         }
     }
 
@@ -921,10 +947,6 @@ fn unix_time() -> f64 {
 
 // --- the log lines ----------------------------------------------------------
 
-/// Kept with each batch item, whose normalization moves `data_parallel_rank`
-/// to `routed_dp_rank`.
-const DP_RANK_FIELDS: [&str; 2] = ["data_parallel_rank", "routed_dp_rank"];
-
 struct RequestLogger {
     config: RequestLogConfig,
     skip_names: HashSet<String>,
@@ -982,22 +1004,18 @@ impl RequestLogger {
     }
 
     /// Item `i`'s own fields of a batch body, as Python's `obj[i]` takes
-    /// them: its entry of each per-item field, and the dp rank fields the
-    /// item's normalization reads.
+    /// them: its entry of each per-item field.
     fn batch_item(&self, fields: &Map<String, Value>, i: usize) -> Map<String, Value> {
         fields
             .iter()
             .filter_map(|(name, value)| {
-                let value = if self.batch_item_fields.contains(name) {
-                    match value {
-                        Value::Array(values) => values.get(i)?.clone(),
-                        // One value for every item.
-                        value => value.clone(),
-                    }
-                } else if DP_RANK_FIELDS.contains(&name.as_str()) {
-                    value.clone()
-                } else {
+                if !self.batch_item_fields.contains(name) {
                     return None;
+                }
+                let value = match value {
+                    Value::Array(values) => values.get(i)?.clone(),
+                    // One value for every item.
+                    value => value.clone(),
                 };
                 Some((name.clone(), value))
             })
@@ -1008,10 +1026,7 @@ impl RequestLogger {
     fn batch_shared(&self, fields: &Map<String, Value>) -> Map<String, Value> {
         fields
             .iter()
-            .filter(|(name, _)| {
-                self.batch_shared_fields.contains(name.as_str())
-                    && !DP_RANK_FIELDS.contains(&name.as_str())
-            })
+            .filter(|(name, _)| self.batch_shared_fields.contains(name.as_str()))
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect()
     }
@@ -1079,11 +1094,6 @@ impl RequestLogger {
         mut body: Map<String, Value>,
     ) -> Map<String, Value> {
         let is_null = |value: Option<&Value>| value.is_none_or(Value::is_null);
-        // `_migrate_deprecated_dp_rank`.
-        if !is_null(body.get("data_parallel_rank")) && is_null(body.get("routed_dp_rank")) {
-            let rank = body["data_parallel_rank"].clone();
-            body.insert("routed_dp_rank".into(), rank);
-        }
         let fields = match request {
             OpenAiRequest::ChatCompletion => {
                 // `set_tool_choice_default`.

@@ -5,7 +5,8 @@
 
 use serde_json::{json, Value};
 
-use super::{new_id, stop_reason, tool_input, usage_from_chat, EchoContext};
+use super::{stop_reason, tool_input, usage_from_chat, EchoContext};
+use crate::protocol::new_id;
 
 pub fn chat_to_message(chat: &Value, echo: &EchoContext) -> Value {
     let choice = chat.pointer("/choices/0");

@@ -17,7 +17,7 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 # Nightly is not redundant here: it sets SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1 to expand get_ci_test_range sweeps.
 register_cuda_ci(est_time=20, stage="nightly", runner_config="1-gpu-large")
-register_amd_ci(est_time=20, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(est_time=20, stage="base-a-jit-kernel-unit", runner_config="amd")
 
 
 OPS = SUPPORTED_ACTIVATIONS
@@ -306,6 +306,32 @@ def test_rounded_silu_clamp_graph(dtype, limit):
     x.neg_()
     graph.replay()
     torch.testing.assert_close(actual, reference(), rtol=0, atol=0, equal_nan=True)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_rounded_silu_table_matches_the_computed_kernel(dtype):
+    """The table path must reproduce the expf/divide kernel's bytes for every
+    gate bit pattern, out of place and in place."""
+    from sglang.kernels.ops.activation import activation as act
+
+    if act._silu_rounding_table(torch.empty(1, dtype=dtype, device="cuda")) is None:
+        pytest.skip("the SiLU table runs on sm_10x only")
+    gate = (
+        torch.arange(65536, device="cuda", dtype=torch.int32)
+        .to(torch.int16)
+        .view(dtype)
+        .view(-1, 512)
+    )
+    up = torch.randn(gate.shape, device="cuda").to(dtype)
+    x = torch.cat((gate, up), dim=1)
+    expected = torch.empty_like(gate)
+    act.activation_module(dtype, fast_math=False).run_activation_with_rounding(
+        x, expected, "silu", 0.0
+    )
+    actual = silu_and_mul_with_activation_rounding(x)
+    assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+    in_place = act.silu_and_mul_with_activation_rounding_(x.clone())
+    assert torch.equal(in_place.view(torch.int16), expected.view(torch.int16))
 
 
 def test_swiglu_oai_split_is_the_marlin_gpt_oss_activation() -> None:

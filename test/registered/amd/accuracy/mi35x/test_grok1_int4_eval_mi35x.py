@@ -2,7 +2,7 @@
 
 Tests Grok-1 INT4 (W4A8KV8) model using few-shot completion benchmark on MI35x.
 
-Registry: nightly-amd-accuracy-8-gpu-mi35x-grok1-int4 suite
+Registry: nightly-accuracy-test-8-gpu-amd-mi35x-grok1-int4 suite
 """
 
 import ast
@@ -25,7 +25,9 @@ from sglang.utils import download_and_cache_file, read_jsonl
 
 # Register for AMD CI - GROK1-INT4 accuracy tests on MI35x (~70 min)
 register_amd_ci(
-    est_time=4200, suite="nightly-amd-accuracy-8-gpu-mi35x-grok1-int4", nightly=True
+    est_time=4200,
+    suite="nightly-accuracy-test-8-gpu-amd-mi35x-grok1-int4",
+    nightly=True,
 )
 
 INVALID = -9999999

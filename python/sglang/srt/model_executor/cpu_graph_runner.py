@@ -516,8 +516,7 @@ def set_torch_compile_config():
 
 def get_batch_sizes_to_capture(model_runner: ModelRunner):
     # CPU decode graph buckets are normalized into decode.bs by ServerArgs.
-    # Users can customize them with --cuda-graph-bs-decode or its legacy alias
-    # --cuda-graph-bs.
+    # Users can customize them with --cuda-graph-bs-decode.
     capture_bs = get_exec().graph.cuda_graph_config.decode.bs
     assert capture_bs and min(capture_bs) > 0, f"{capture_bs=}"
     capture_bs = [bs for bs in capture_bs if bs <= model_runner.req_to_token_pool.size]
@@ -786,6 +785,35 @@ def register_fake_ops(tp_size: int):
         Aq = input.new_empty(input.shape, dtype=torch.uint8)
         As = input.new_empty(M, dtype=torch.float32)
         return Aq, As
+
+    @register_cpu_compile_fake("sgl_per_token_group_quant_8bit_cpu")
+    def _(input, group_size, eps):
+        scale_shape = (*input.shape[:-1], input.shape[-1] // group_size)
+        return (
+            torch.empty_like(input, dtype=torch.float8_e4m3fn),
+            input.new_empty(scale_shape, dtype=torch.float32),
+        )
+
+    @register_cpu_compile_fake("sgl_per_token_quant_fp8_cpu")
+    def _(input):
+        return (
+            torch.empty_like(input, dtype=torch.float8_e4m3fn),
+            input.new_empty(input.shape[0], 1, dtype=torch.float32),
+        )
+
+    @register_cpu_compile_fake("sgl_per_tensor_quant_fp8_cpu")
+    def _(input, scale):
+        return (
+            torch.empty_like(input, dtype=torch.float8_e4m3fn),
+            input.new_empty(1, dtype=torch.float32),
+        )
+
+    @register_cpu_compile_fake("mxfp8_group_quantize_cpu")
+    def _(input):
+        return (
+            torch.empty_like(input, dtype=torch.float8_e4m3fn),
+            input.new_empty(input.shape[0], input.shape[1] // 32, dtype=torch.uint8),
+        )
 
     @register_cpu_compile_fake("int8_scaled_mm_cpu")
     def _(mat1, mat2, scales1, scales2, bias, out_dtype, is_vnni):

@@ -110,6 +110,8 @@ class PoolName(str, Enum):
     MAMBA = "mamba"
     SWA = "swa"
     INDEXER = "indexer"
+    # the ue8m0 exponents of FP4 index keys, beside INDEXER's e2m1 bytes
+    INDEXER_SCALE = "indexer_scale"
     # TODO(hzh0425): Current DeepSeek V4 pool naming is verbose; will be normalized to
     # 'COMPRESSED_KV / COMPRESSED_INDEXER / COMPRESSED_STATE' in the next PR.
     DEEPSEEK_V4_C1 = "deepseek_v4_c1"
@@ -274,7 +276,11 @@ class PoolTransferResult:
 def l3_page_span(host_pool: Any) -> int:
     """Logical slots one L3 key covers for this host pool. Under DCP a key is a
     widened (logical) page backed by one physical page on each rank; pools
-    without DCP (or with a page of 1, like KDA state) are unchanged."""
+    without DCP (or with a page of 1, like KDA state) are unchanged. A pool
+    whose physical layout is not row-sharded reports its own span."""
+    span = getattr(host_pool, "storage_page_span", None)
+    if span:
+        return int(span)
     page_size = getattr(host_pool, "page_size", 1) or 1
     return page_size * (getattr(host_pool, "dcp_size", 1) or 1)
 
@@ -879,8 +885,8 @@ class HiCacheFile(HiCacheStorage):
             if storage_config.is_rank_replicated
             else self.tp_config_suffix
         )
-        # TODO: Include KV dtype and stored layout in keys for both DCP and
-        # non-DCP caches; raw file payloads do not describe their format.
+        # The controller includes the logical KV dtype and any storage_format_tag
+        # in model_name. Other layout differences still need extra_backend_tag.
         if storage_config.dcp_size > 1:
             # Equivalent MLA shards in different DCP groups share a file.
             dcp_suffix = (

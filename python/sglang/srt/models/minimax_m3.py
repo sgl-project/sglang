@@ -181,9 +181,7 @@ if _is_hip:
     from sglang.srt.models.minimax_common.amd import minimax_m3_hip as _hip
 
 if _is_npu:
-    from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope_pos_cache_half_npu import (
-        split_qkv_rmsnorm_rope_pos_cache_half_npu,
-    )
+    from sgl_kernel_npu.operators.norm import split_qkv_rmsnorm_rope_pos_cache_half_npu
 
     from sglang.srt.hardware_backend.npu.utils import (
         process_shared_expert,
@@ -302,7 +300,7 @@ class MiniMaxM3MLP(nn.Module):
     @staticmethod
     def _swigluoai_fused(x: torch.Tensor, alpha: float, limit: float) -> torch.Tensor:
         """swiglu_oai using fused Triton kernel (sgl_kernel_npu), no quant."""
-        from sgl_kernel_npu.activation.swiglu_oai_quant import swiglu_oai_quant
+        from sgl_kernel_npu.operators.activation import swiglu_oai_quant
 
         out, _ = swiglu_oai_quant(x, alpha, limit, need_quant=False)
         return out
@@ -466,7 +464,9 @@ class MiniMaxM3MoE(nn.Module):
             # DeepEP all-gathers (not all-reduces) the layer output, so a TP-sharded
             # shared MLP would leave an unreduced partial; replicate (tp_size=1), like GLM4 / DSV2.
             shared_experts_tp1 = (
-                get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_megamoe()
+                get_moe_a2a_backend().is_deepep()
+                or get_moe_a2a_backend().is_ascend_ops()
+                or get_moe_a2a_backend().is_megamoe()
             )
             self.shared_experts = MiniMaxM3MLP(
                 config=config,
@@ -531,7 +531,7 @@ class MiniMaxM3MoE(nn.Module):
     ) -> torch.Tensor:
         if get_moe_a2a_backend().is_megamoe():
             return self.forward_mega_moe(hidden_states, forward_batch)
-        if get_moe_a2a_backend().is_deepep():
+        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_ascend_ops():
             return self.forward_deepep(hidden_states, forward_batch)
         else:
             return self.forward_normal(hidden_states)
@@ -549,7 +549,20 @@ class MiniMaxM3MoE(nn.Module):
                 "M3.1 NVFP4 MegaMoE weights are not ready on this device"
             )
         num_tokens = hidden_states.shape[0]
-        shared = self._forward_shared_experts(hidden_states) if num_tokens else None
+        # Overlap with the router and MegaMoE in any capture. Breakable capture
+        # joins forked streams before each segment ends, so a break stays correct.
+        fork_shared = (
+            self.alt_stream is not None
+            and self.shared_experts is not None
+            and num_tokens > 0
+            and get_is_capture_mode()
+        )
+        if fork_shared:
+            self.alt_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(self.alt_stream):
+                shared = self._forward_shared_experts(hidden_states)
+        else:
+            shared = self._forward_shared_experts(hidden_states) if num_tokens else None
         topk_ids = topk_weights = None
         if num_tokens:
             output = self.topk(
@@ -567,7 +580,7 @@ class MiniMaxM3MoE(nn.Module):
             if not num_tokens:
                 return hidden_states
             output = self._forward_trtllm_decode(hidden_states, topk_ids, topk_weights)
-            return output + shared if shared is not None else output
+            return self._add_shared(output, shared, fork_shared)
         output = run_mega_routed_experts(
             self.experts,
             hidden_states,
@@ -580,6 +593,16 @@ class MiniMaxM3MoE(nn.Module):
             activation=self.experts._minimax_activation,
             activation_clamp=self.config.swiglu_limit,
         )
+        return self._add_shared(output, shared, fork_shared)
+
+    def _add_shared(
+        self,
+        output: torch.Tensor,
+        shared: Optional[torch.Tensor],
+        forked: bool,
+    ) -> torch.Tensor:
+        if forked:
+            torch.cuda.current_stream().wait_stream(self.alt_stream)
         return output + shared if shared is not None else output
 
     def _forward_trtllm_decode(
@@ -2119,9 +2142,7 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
             )
 
             # Decode and verify batches up to 341 rows at hidden 6144.
-            register_fused_all_reduce_comm(
-                max_push_size=4 * 1024 * 1024, max_push_blocks=512
-            )
+            register_fused_all_reduce_comm(max_push_size=4 * 1024 * 1024)
 
     @torch.no_grad()
     def forward(
