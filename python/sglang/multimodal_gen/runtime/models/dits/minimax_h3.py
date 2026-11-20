@@ -1249,7 +1249,11 @@ def _minimax_h3_attention_core_impl(
                 k,
                 v,
                 cu_seqlens=cu_seqlens,
-                max_seqlen=max_seqlen,
+                # The BCG prompt padder widens max_seqlen to the packed length;
+                # Sol reads the live length from it to drop the alignment tail.
+                max_seqlen=(
+                    max_seqlen if cu_seqlens_host is None else cu_seqlens_host[1]
+                ),
                 cu_seqlens_host=cu_seqlens_host,
                 exact_kv_tokens=_minimax_h3_sol_exact_kv_tokens(),
             )

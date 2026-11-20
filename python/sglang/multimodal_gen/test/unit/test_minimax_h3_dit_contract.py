@@ -14,6 +14,7 @@ from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
 from sglang.multimodal_gen.runtime.breakable_cuda_graph.runner import (
     BaseBreakableCudaGraphRunner,
 )
+from sglang.multimodal_gen.runtime.layers.attention.backends import aiter_sol
 from sglang.multimodal_gen.runtime.layers.attention.backends.aiter_sol import (
     AITERSolMetadata,
 )
@@ -717,6 +718,48 @@ def test_attention_core_hands_sol_the_context_key_mask():
 
     assert seen[0]["exact_kv_tokens"] is mask
     assert seen[1]["exact_kv_tokens"] is None
+
+
+def test_attention_core_serves_sol_the_bcg_padded_pack():
+    """The breakable CUDA graph prompt padder widens max_seqlen to the packed
+    length; Sol must still drop only the alignment tail instead of refusing."""
+    config = aiter_sol._SolConfig(
+        recipe="fp8", beta=0.5, beta_schedule=None, block_tile=None, tilt_rank=0
+    )
+    with (
+        patch.object(aiter_sol, "_resolve_config", return_value=config),
+        patch.object(aiter_sol, "check_sol_attn_build"),
+        patch.object(aiter_sol, "sol_attn_routing_mode", return_value="fused"),
+    ):
+        impl = aiter_sol.AITERSolImpl(
+            num_heads=2, head_size=128, softmax_scale=128**-0.5
+        )
+    attention = SimpleNamespace(
+        _attention_impl=impl,
+        _attention_backend_enum=AttentionBackendEnum.AITER_SOL,
+        prefix="blocks.0.attn",
+    )
+    q = torch.ones(8, 2, 128, dtype=torch.bfloat16)
+    seen = []
+
+    def fake_sol_attn_bshd(query, key, value, **kwargs):
+        seen.append(query.shape[1])
+        return query, None
+
+    with patch.object(aiter_sol, "sol_attn_bshd", fake_sol_attn_bshd):
+        out = _minimax_h3_attention_core_impl(
+            attention,
+            q,
+            q,
+            q,
+            cu_seqlens=torch.tensor([0, 6, 8], dtype=torch.int32),
+            cu_seqlens_host=(0, 6, 8),
+            max_seqlen=8,
+            ulysses_active=False,
+        )
+
+    assert seen == [6]
+    assert out[:6].eq(1).all() and out[6:].eq(0).all()
 
 
 def test_meta_model_captures_component_attention_override():
