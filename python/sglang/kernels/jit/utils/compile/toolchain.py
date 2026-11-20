@@ -99,19 +99,18 @@ def musa_home() -> str:
 
 
 @cache_once
-def torchada_cxx_compat_include_dir() -> str:
-    """Torchada's CUDA-to-MUSA C++ compatibility headers."""
+def torchada_cuda_compat_include_dir() -> str:
+    """Torchada's CUDA-named headers for direct JIT compiler consumers."""
     import torchada
 
     version = tuple(int(part) for part in torchada.__version__.split(".")[:3])
     if version < (0, 1, 113):
         raise RuntimeError(
-            "SGLang MUSA JIT requires torchada>=0.1.113 for stable-compat "
-            "runtime aliases"
+            "SGLang MUSA JIT requires torchada>=0.1.113 for cuda_compat headers"
         )
-    from torchada.utils.cpp_extension import stable_compat_include_dir
+    from torchada.cuda_compat import cuda_compat_include_dir
 
-    return stable_compat_include_dir()
+    return cuda_compat_include_dir()
 
 
 @cache_once
@@ -275,7 +274,7 @@ def base_include_paths() -> List[str]:
     includes, _, _ = tvm_ffi_paths()
     if is_musa_runtime():
         return [
-            torchada_cxx_compat_include_dir(),
+            torchada_cuda_compat_include_dir(),
             *includes,
             f"{musa_home()}/include",
         ]

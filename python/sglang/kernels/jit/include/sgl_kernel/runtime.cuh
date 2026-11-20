@@ -161,7 +161,11 @@ inline auto get_cc_major(int device_id, bool use_cache = true) -> int {
   static DeviceCacheMap<int, -1> cc_major_cache;
   return cc_major_cache.get_cached(device_id, use_cache, [](int32_t device_id) {
     int cc_major;
+#ifdef USE_MUSA
+    CHECK_CUDA(musaDeviceGetAttribute(&cc_major, musaDevAttrComputeCapabilityMajor, device_id));
+#else
     CHECK_CUDA(cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor, device_id));
+#endif
     return cc_major;
   });
 }
@@ -171,7 +175,11 @@ inline auto get_cc_minor(int device_id, bool use_cache = true) -> int {
   static DeviceCacheMap<int, -1> cc_minor_cache;
   return cc_minor_cache.get_cached(device_id, use_cache, [](int32_t device_id) {
     int cc_minor;
+#ifdef USE_MUSA
+    CHECK_CUDA(musaDeviceGetAttribute(&cc_minor, musaDevAttrComputeCapabilityMinor, device_id));
+#else
     CHECK_CUDA(cudaDeviceGetAttribute(&cc_minor, cudaDevAttrComputeCapabilityMinor, device_id));
+#endif
     return cc_minor;
   });
 }
@@ -184,7 +192,11 @@ inline auto get_sm_version(int device_id, bool use_cache = true) -> int {
 // Return the runtime version
 inline auto get_runtime_version() -> int {
   int runtime_version;
+#ifdef USE_MUSA
+  CHECK_CUDA(musaRuntimeGetVersion(&runtime_version));
+#else
   CHECK_CUDA(cudaRuntimeGetVersion(&runtime_version));
+#endif
   return runtime_version;
 }
 
@@ -208,7 +220,11 @@ inline auto get_available_dynamic_smem_per_block(T kernel, int num_blocks, int b
 inline auto get_max_smem_per_block(int device_id, bool opt_in = true, bool use_cache = true) -> std::size_t {
   /// NOTE: we all know this is no larger than 1MB for all GPU, so use uint32_t
   static DeviceCacheMap<uint32_t, 0> smem_cache[2];
+#ifdef USE_MUSA
+  const auto attr = opt_in ? musaDevAttrMaxSharedMemoryPerBlockOptin : musaDevAttrMaxSharedMemoryPerBlock;
+#else
   const auto attr = opt_in ? cudaDevAttrMaxSharedMemoryPerBlockOptin : cudaDevAttrMaxSharedMemoryPerBlock;
+#endif
   return smem_cache[opt_in].get_cached(device_id, use_cache, [attr](int32_t device_id) {
     int value = 0;
     CHECK_CUDA(cudaDeviceGetAttribute(&value, attr, device_id));
@@ -225,6 +241,8 @@ template <typename T>
 inline void set_smem_carveout(T kernel, int percent) {
 #ifdef USE_ROCM
   (void)kernel, (void)percent;
+#elif defined(USE_MUSA)
+  CHECK_CUDA(::musaFuncSetAttribute(kernel, musaFuncAttributePreferredSharedMemoryCarveout, percent));
 #else
   CHECK_CUDA(::cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, percent));
 #endif
@@ -244,11 +262,18 @@ inline auto set_prefer_l1_carveout_with_occupancy(
 #else
   const auto kernel_ptr = reinterpret_cast<const void*>(kernel);
   // The attribute and the occupancy query both act on the current device.
-  static_assert(cudaSharedmemCarveoutMaxL1 <= cudaSharedmemCarveoutMaxShared);
+#ifdef USE_MUSA
+  constexpr auto kCarveoutMaxL1 = musaSharedmemCarveoutMaxL1;
+  constexpr auto kCarveoutMaxShared = musaSharedmemCarveoutMaxShared;
+#else
+  constexpr auto kCarveoutMaxL1 = cudaSharedmemCarveoutMaxL1;
+  constexpr auto kCarveoutMaxShared = cudaSharedmemCarveoutMaxShared;
+#endif
+  static_assert(kCarveoutMaxL1 <= kCarveoutMaxShared);
   CHECK_HOST(
       min_occupancy > 0 && lower_bound_percent <= upper_bound_percent  //
-      && lower_bound_percent >= cudaSharedmemCarveoutMaxL1             //
-      && upper_bound_percent <= cudaSharedmemCarveoutMaxShared);
+      && lower_bound_percent >= kCarveoutMaxL1                         //
+      && upper_bound_percent <= kCarveoutMaxShared);
   for (int p = lower_bound_percent; p <= upper_bound_percent; ++p) {
     set_smem_carveout(kernel_ptr, p);
     const auto occupancy = get_blocks_per_sm(kernel_ptr, block_threads, dyn_smem_bytes);
@@ -270,6 +295,17 @@ inline auto set_prefer_l1_carveout(T kernel, uint32_t block_threads, std::size_t
   return {-1, get_blocks_per_sm(kernel, block_threads, dyn_smem_bytes)};
 #else
   const auto kernel_ptr = reinterpret_cast<const void*>(kernel);
+#ifdef USE_MUSA
+  set_smem_carveout(kernel_ptr, musaSharedmemCarveoutDefault);
+  const auto default_occupancy = get_blocks_per_sm(kernel_ptr, block_threads, dyn_smem_bytes);
+  return set_prefer_l1_carveout_with_occupancy(
+      musaSharedmemCarveoutMaxL1,
+      musaSharedmemCarveoutMaxShared,
+      default_occupancy,
+      kernel_ptr,
+      block_threads,
+      dyn_smem_bytes);
+#else
   set_smem_carveout(kernel_ptr, cudaSharedmemCarveoutDefault);
   const auto default_occupancy = get_blocks_per_sm(kernel_ptr, block_threads, dyn_smem_bytes);
   return set_prefer_l1_carveout_with_occupancy(
@@ -279,6 +315,7 @@ inline auto set_prefer_l1_carveout(T kernel, uint32_t block_threads, std::size_t
       kernel_ptr,
       block_threads,
       dyn_smem_bytes);
+#endif
 #endif
 }
 
