@@ -172,6 +172,13 @@ staging memory. Startup checks both decode graph buckets and the maximum running
 against this limit. If you omit `--max-running-requests`, the backend bounds
 it by the communication capacity before memory sizing.
 
+The communication buffers retain this reserved capacity. For decode and fixed-width
+verification, the compact expert-compute views are bounded by the sum of this
+forward's DP token rows times top-k. CUDA Graphs use their padded bucket sizes.
+Ragged/adaptive speculation or unavailable/inconsistent DP sizes retain the full
+bound. Packing and unpacking read device-side receive counts and visit only valid
+payload rows; invalid rows are excluded through routing metadata.
+
 Prefill uses eager BF16 AllGather, local expert computation and ReduceScatter;
 it does not use the fixed decode RDMA workspace. Selecting this backend
 disables prefill CUDA Graphs, overlap scheduling and shared expert fusion. The unquantized
@@ -179,6 +186,10 @@ speculative draft defaults to `--speculative-moe-a2a-backend none`; the
 target model still uses RDMA during verification. Overlap, dynamic expert
 placement, redundant experts, EPLB, elastic EP and paged experts are not
 supported by this backend.
+
+A static, non-redundant expert permutation supplied with `--init-expert-location`
+is supported. It uses the existing logical-to-physical expert mapping; dynamic
+placement and EPLB remain unsupported.
 
 `SGLANG_FLASHINFER_RDMA_WIRE_DTYPE=bf16|nvfp4` (default: `nvfp4`) selects
 combine precision and, unless overridden, dispatch precision. ModelOpt experts

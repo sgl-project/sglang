@@ -81,6 +81,16 @@ class TestFlashinferRdmaArgs(CustomTestCase):
             _a2a_fusion_adjustments(cfg), {"disable_shared_experts_fusion": True}
         )
 
+    def test_static_expert_placement_is_accepted(self):
+        # A permutation of the experts keeps every slot on a fixed rank.
+        cfg = self.config(init_expert_location="placement.pt")
+        with (
+            patch.object(moe_hook, "resolved_view", return_value=cfg),
+            patch.object(moe_hook, "declare_resolution") as declare,
+        ):
+            moe_hook.handle_flashinfer_rdma(cfg)
+        declare.assert_called_once()
+
     def test_native_mxfp4_dspark_resolves_target_and_draft_rdma(self):
         from sglang.srt.arg_groups.model_override_base import dspark_dp_a2a_backends
 
@@ -159,6 +169,7 @@ class TestFlashinferRdmaArgs(CustomTestCase):
             dict(enable_single_batch_overlap=True),
             dict(enable_eplb=True),
             dict(ep_num_redundant_experts=4),
+            dict(ep_dispatch_algorithm="dynamic"),
             dict(moe_runner_backend="triton"),
             dict(speculative_moe_a2a_backend="deepep"),
             dict(flashinfer_rdma_max_tokens_per_rank=0),

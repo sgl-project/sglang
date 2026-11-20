@@ -1845,7 +1845,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 and self.spec_info is not None
                 and not self.spec_info.is_draft_input()
             ):
-                if self.forward_mode.is_idle():
+                # An idle rank that MLP sync left without rows (SUM_LEN) stays
+                # IDLE and skips attention planning, as non-hybrid targets do;
+                # a zero-row TARGET_VERIFY batch cannot be planned.
+                if self.forward_mode.is_idle() and num_tokens > 0:
                     self._original_forward_mode = self.forward_mode
                     self.forward_mode = ForwardMode.TARGET_VERIFY
                 # Invert the spec_scale_global_num_tokens scaling.

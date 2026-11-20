@@ -359,7 +359,8 @@ def main():
         counts = state.outputs[2].cpu().tolist()
         source_ids = state.outputs[3].cpu()
         ranges = state.outputs[4].cpu()
-        reference = torch.zeros_like(state.packed, dtype=torch.bfloat16)
+        rows = latest_dispatch.hidden_states.shape[0]
+        reference = torch.zeros((rows, hidden), dtype=torch.bfloat16, device=device)
         offset = 0
         for expert, count in enumerate(counts):
             for source in range(ep):
@@ -378,14 +379,16 @@ def main():
         torch.testing.assert_close(
             state.packed[:offset], q.view(torch.uint8)[:offset], rtol=0, atol=0
         )
-        mask = torch.zeros_like(state.packed_sf)
+        mask = torch.zeros_like(state.packed_sf[:rows])
         mask[:offset] = 1
         mask = nvfp4_block_scale_interleave(mask).bool()
         torch.testing.assert_close(
             latest_dispatch.hidden_states_scale[mask], sf[mask], rtol=0, atol=0
         )
-        assert torch.count_nonzero(state.packed[offset:]) == 0
-        assert torch.count_nonzero(state.packed_sf[offset:]) == 0
+        # Invalid payload may be stale; metadata excludes it from compute.
+        assert torch.all(state.ids[offset:rows] == experts)
+        assert torch.all(state.weights[offset:rows] == 0)
+        assert torch.all(state.slot_map[offset:rows] == -1)
 
     def check(actual, expected, name, phase, *, partials=None):
         torch.cuda.synchronize()
@@ -469,6 +472,7 @@ def main():
 
             with (
                 patch.object(rdma, "get_is_extend_in_batch", return_value=False),
+                patch.object(rdma, "get_dp_global_num_tokens", return_value=sizes),
                 patch(
                     "sglang.srt.layers.moe.moe_runner.flashinfer_cutlass._cutlass_moe_tune_max_num_tokens",
                     return_value=4096,

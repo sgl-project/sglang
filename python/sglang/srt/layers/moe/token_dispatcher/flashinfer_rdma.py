@@ -29,7 +29,7 @@ from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
     FlashinferDispatchOutput,
 )
 from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKOutputChecker
-from sglang.srt.runtime_context import get_parallel, get_resources
+from sglang.srt.runtime_context import get_parallel, get_resources, get_spec
 
 _BUFFER_KEY = "flashinfer_rdma_alltoall"
 logger = logging.getLogger(__name__)
@@ -151,8 +151,9 @@ def _shared_state(
             torch.empty((local_experts, cap), dtype=torch.int32, device=device),
             torch.empty((local_experts, ep), dtype=torch.int64, device=device),
         ),
-        packed=torch.empty((rows, width), dtype=dtype, device=device),
-        packed_sf=torch.empty((rows, sf_width), dtype=torch.uint8, device=device),
+        # Invalid compact rows retain payload; their expert IDs mask them out.
+        packed=torch.zeros((rows, width), dtype=dtype, device=device),
+        packed_sf=torch.zeros((rows, sf_width), dtype=torch.uint8, device=device),
         ids=torch.empty((rows, 1), dtype=torch.int32, device=device),
         weights=torch.empty((rows, 1), dtype=torch.float32, device=device),
         slot_map=torch.empty(rows, dtype=torch.int32, device=device),
@@ -221,6 +222,11 @@ class FlashinferRdmaDispatcher(BaseDispatcher):
         self.topk = router_topk
         self.hidden = hidden_size
         self.capacity = max_tokens_per_rank
+        # Published DP sizes need not bound per-rank verify widths in these modes.
+        self.rows_follow_batch = (
+            envs.SGLANG_RAGGED_VERIFY_MODE.get() == "static"
+            and not get_spec().speculative_adaptive
+        )
         self.wire_dtype = envs.SGLANG_FLASHINFER_RDMA_WIRE_DTYPE.get()
         if self.wire_dtype not in ("nvfp4", "bf16"):
             raise ValueError("FlashInfer RDMA wire dtype must be nvfp4 or bf16")
@@ -349,6 +355,24 @@ class FlashinferRdmaDispatcher(BaseDispatcher):
     def set_overlap_args(self, combine_overlap_args, meta_overlap_args):
         raise ValueError("FlashInfer RDMA requires serial dispatch/compute/combine")
 
+    def _live_rows(self, tokens):
+        """Bound compact compute rows by this forward's published DP sizes.
+
+        Each source row can reach at most top-k experts. CUDA graph capture
+        publishes padded sizes for the bucket, keeping this bound replay-safe.
+        Keep the full workspace if the metadata does not describe this forward.
+        """
+        full = self.state.packed.shape[0]
+        sizes = get_dp_global_num_tokens()
+        if (
+            not self.rows_follow_batch
+            or sizes is None
+            or len(sizes) != self.group.size()
+            or sizes[self.ep_rank] != tokens
+        ):
+            return full
+        return min(max(int(sum(sizes)), 1) * self.topk, full)
+
     def dispatch(self, hidden_states, topk_output):
         if self._pending is not None or self.state.owner is not None:
             raise RuntimeError(
@@ -440,47 +464,48 @@ class FlashinferRdmaDispatcher(BaseDispatcher):
                 out=state.outputs,
                 return_recv_hook=False,
             )
+        rows = self._live_rows(hidden_states.shape[0])
+        packed = state.packed[:rows]
+        packed_sf = state.packed_sf[:rows]
+        compact_ids = state.ids[:rows]
+        compact_weights = state.weights[:rows]
         pack_expert_rows(
             recv,
             recv_sf,
             counts,
-            state.packed,
-            state.packed_sf,
-            state.ids,
-            state.weights,
-            state.slot_map,
+            packed,
+            packed_sf,
+            compact_ids,
+            compact_weights,
+            state.slot_map[:rows],
             ep_rank=self.ep_rank,
             num_experts=self.num_experts,
         )
         if self.dispatch_dtype == "mxfp8":
             from flashinfer import nvfp4_block_scale_interleave
 
-            packed = state.packed.view(torch.float8_e4m3fn)
+            packed = packed.view(torch.float8_e4m3fn)
             # MXFP8 UE8M0 bytes use the same 128x4 scale permutation as NVFP4.
-            packed_sf = nvfp4_block_scale_interleave(state.packed_sf)
+            packed_sf = nvfp4_block_scale_interleave(packed_sf)
         elif self.native_mxfp4:
-            packed = (
-                state.buffer.dequantize_nvfp4_to_bf16(
-                    state.packed, self.packed_global_scales, state.packed_sf
+            if self.dispatch_dtype == "nvfp4":
+                packed = state.buffer.dequantize_nvfp4_to_bf16(
+                    packed, self.packed_global_scales[:rows], packed_sf
                 )
-                if self.dispatch_dtype == "nvfp4"
-                else state.packed
-            )
             packed_sf = None
         else:
             from flashinfer import nvfp4_block_scale_interleave
 
-            packed = state.packed
-            packed_sf = nvfp4_block_scale_interleave(state.packed_sf)
-        self._pending = ("decode", ids, weights, handle, hidden_states.shape[0])
+            packed_sf = nvfp4_block_scale_interleave(packed_sf)
+        self._pending = ("decode", ids, weights, handle, hidden_states.shape[0], counts)
         state.owner = self
         # Compact rows use unit weights. Original routing weights are applied
         # exactly once, by combine after expert computation.
         return FlashinferDispatchOutput(
             packed,
             packed_sf,
-            StandardTopKOutput(state.weights, state.ids, None),
-            state.compact_output,
+            StandardTopKOutput(compact_weights, compact_ids, None),
+            state.compact_output[:rows],
             torch.bfloat16,
         )
 
@@ -529,11 +554,12 @@ class FlashinferRdmaDispatcher(BaseDispatcher):
                 unpack_expert_rows,
             )
 
-            _, ids, weights, handle, tokens = pending
+            _, ids, weights, handle, tokens, counts = pending
             state = self.state
             unpack_expert_rows(
                 combine_input.hidden_states,
                 state.slot_map,
+                counts,
                 state.expert_output,
                 state.combine_scales,
             )

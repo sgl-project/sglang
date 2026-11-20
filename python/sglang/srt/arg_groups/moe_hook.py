@@ -888,13 +888,14 @@ def handle_flashinfer_rdma(server_args: Any) -> None:
             raise ValueError(
                 f"flashinfer_rdma does not support --{name.replace('_', '-')}."
             )
-    if (
-        cfg.ep_num_redundant_experts
-        or cfg.init_expert_location != "trivial"
-        or cfg.ep_dispatch_algorithm not in (None, "static")
+    # A static permutation of the experts keeps slot p on rank p // local experts,
+    # which is all the dispatcher relies on, so --init-expert-location is allowed.
+    if cfg.ep_num_redundant_experts or cfg.ep_dispatch_algorithm not in (
+        None,
+        "static",
     ):
         raise ValueError(
-            "flashinfer_rdma requires contiguous, non-redundant expert placement."
+            "flashinfer_rdma requires non-redundant, statically placed experts."
         )
     if cfg.elastic_ep_backend is not None:
         raise ValueError("flashinfer_rdma does not support elastic expert parallelism.")

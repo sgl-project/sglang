@@ -58,6 +58,10 @@ class TestFlashinferRdmaDispatcher(CustomTestCase):
             envs.SGLANG_FLASHINFER_RDMA_DISPATCH_DTYPE.override(None),
             patch(f"{MODULE}.get_parallel", return_value=parallel),
             patch(
+                f"{MODULE}.get_spec",
+                return_value=SimpleNamespace(speculative_adaptive=False),
+            ),
+            patch(
                 f"{MODULE}.dist.get_process_group_ranks", return_value=list(range(4))
             ),
             patch(f"{MODULE}.dist.all_reduce") as reduce,
@@ -156,6 +160,148 @@ class TestFlashinferRdmaDispatcher(CustomTestCase):
                 states[-1],
             )
             self.assertEqual(buffer.call_count, 6)
+
+    def test_live_rows_bound_and_metadata_fallback(self):
+        dispatcher = object.__new__(FlashinferRdmaDispatcher)
+        dispatcher.group = Mock()
+        dispatcher.topk, dispatcher.ep_rank = 6, 0
+        for ep in (4, 8, 16, 32):
+            dispatcher.group.size.return_value = ep
+            full = ep * 54 * dispatcher.topk
+            dispatcher.state = SimpleNamespace(packed=torch.empty(full, 1))
+            dispatcher.rows_follow_batch = True
+            cases = [
+                ([6] * ep, 6, ep * 6 * dispatcher.topk),
+                ([0, 3] + [1] * (ep - 2), 0, (ep + 1) * dispatcher.topk),
+                ([0] * ep, 0, dispatcher.topk),
+                ([54] * ep, 54, full),
+                (None, 6, full),
+                ([6] * (ep - 1), 6, full),
+                ([6] * ep, 12, full),
+            ]
+            for sizes, tokens, expected in cases:
+                with (
+                    self.subTest(ep=ep, sizes=sizes, tokens=tokens),
+                    patch(f"{MODULE}.get_dp_global_num_tokens", return_value=sizes),
+                ):
+                    self.assertEqual(dispatcher._live_rows(tokens), expected)
+            dispatcher.rows_follow_batch = False
+            with patch(f"{MODULE}.get_dp_global_num_tokens", return_value=[6] * ep):
+                self.assertEqual(dispatcher._live_rows(6), full)
+
+    def test_live_rows_reach_all_codecs_and_combine(self):
+        from sglang.srt.layers.moe.topk import StandardTopKOutput
+
+        hidden, tokens, rows, full = 64, 2, 12, 64
+        for native, codec in (
+            (False, "nvfp4"),
+            (True, "bf16"),
+            (True, "nvfp4"),
+            (True, "mxfp8"),
+        ):
+            with self.subTest(native=native, codec=codec):
+                width = hidden // 2 if codec == "nvfp4" else hidden
+                sf_width = {"bf16": 0, "nvfp4": 4, "mxfp8": 2}[codec]
+                dispatcher = object.__new__(FlashinferRdmaDispatcher)
+                dispatcher.hidden, dispatcher.topk = hidden, 2
+                dispatcher.capacity, dispatcher.ep_rank, dispatcher.num_experts = (
+                    8,
+                    0,
+                    8,
+                )
+                dispatcher.native_mxfp4, dispatcher.dispatch_dtype = native, codec
+                dispatcher.combine_dtype = "nvfp4"
+                dispatcher.wire_global_scale = 1.0
+                dispatcher.quant_config = {"input_global_scale": torch.ones(1)}
+                dispatcher.rows_follow_batch = True
+                dispatcher.group = Mock()
+                dispatcher.group.size.return_value = 4
+                dispatcher._pending = None
+                counts = torch.tensor([1, 0], dtype=torch.int32)
+                state = SimpleNamespace(
+                    owner=None,
+                    buffer=Mock(),
+                    outputs=(),
+                    packed=torch.zeros(
+                        full,
+                        width,
+                        dtype=torch.bfloat16 if codec == "bf16" else torch.uint8,
+                    ),
+                    packed_sf=torch.zeros(full, sf_width, dtype=torch.uint8),
+                    ids=torch.zeros(full, 1, dtype=torch.int32),
+                    weights=torch.ones(full, 1),
+                    slot_map=torch.zeros(full, dtype=torch.int32),
+                    compact_output=torch.zeros(full, hidden, dtype=torch.bfloat16),
+                    expert_output=torch.zeros(2, 32, hidden, dtype=torch.bfloat16),
+                    combine_scales=torch.ones(2, 32, 1),
+                )
+                dispatcher.state = state
+                dispatcher.packed_global_scales = torch.ones(full, 1)
+                state.buffer.dispatch.return_value = (
+                    None,
+                    None,
+                    counts,
+                    object(),
+                    None,
+                )
+                state.buffer.dequantize_nvfp4_to_bf16.side_effect = (
+                    lambda x, scales, sf: torch.zeros(
+                        x.shape[0], hidden, dtype=torch.bfloat16
+                    )
+                )
+                state.buffer.combine.return_value = (torch.zeros(tokens, hidden), None)
+                quantize = Mock(
+                    return_value=(
+                        torch.zeros(tokens, width, dtype=torch.uint8),
+                        torch.zeros(tokens, sf_width, dtype=torch.uint8),
+                    )
+                )
+                interleave = Mock(side_effect=lambda x: x)
+                kernels = SimpleNamespace(
+                    pack_expert_rows=Mock(), unpack_expert_rows=Mock()
+                )
+                topk = StandardTopKOutput(
+                    torch.ones(tokens, 2),
+                    torch.zeros(tokens, 2, dtype=torch.int32),
+                    None,
+                )
+                with (
+                    patch(f"{MODULE}.get_is_extend_in_batch", return_value=False),
+                    patch(
+                        f"{MODULE}.get_dp_global_num_tokens", return_value=[2, 0, 1, 3]
+                    ),
+                    patch.dict(
+                        "sys.modules",
+                        {
+                            "flashinfer": SimpleNamespace(
+                                mxfp8_quantize=quantize,
+                                nvfp4_block_scale_interleave=interleave,
+                            ),
+                            "sglang.srt.layers.quantization.fp4_utils": SimpleNamespace(
+                                fp4_quantize=quantize
+                            ),
+                            "sglang.srt.layers.moe.token_dispatcher.flashinfer_rdma_kernels": kernels,
+                        },
+                    ),
+                ):
+                    output = dispatcher.dispatch(
+                        torch.zeros(tokens, hidden, dtype=torch.bfloat16), topk
+                    )
+                    self.assertEqual(output.hidden_states.shape[0], rows)
+                    self.assertEqual(output.topk_output.topk_ids.shape[0], rows)
+                    self.assertEqual(output.moe_output.shape[0], rows)
+                    for tensor in kernels.pack_expert_rows.call_args.args[3:]:
+                        self.assertEqual(tensor.shape[0], rows)
+                    if native and codec == "nvfp4":
+                        for (
+                            tensor
+                        ) in state.buffer.dequantize_nvfp4_to_bf16.call_args.args:
+                            self.assertEqual(tensor.shape[0], rows)
+                    if interleave.called:
+                        self.assertEqual(interleave.call_args.args[0].shape[0], rows)
+                    dispatcher.combine(FlashinferCombineInput(output.moe_output))
+                    self.assertIs(kernels.unpack_expert_rows.call_args.args[2], counts)
+                    self.assertIsNone(state.owner)
 
     def test_mxfp8_runner_uses_transmitted_scales_without_requantization(self):
         from sglang.srt.layers.moe.moe_runner import flashinfer_cutlass as runner
