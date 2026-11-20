@@ -1,15 +1,18 @@
 import asyncio
 import logging
 import secrets
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import httpx
 import pytest
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, Request
 
 from sglang.multimodal_gen.runtime.entrypoints.openai.media_privacy import (
-    gateway_tenant_dependency,
+    MediaGatewayMiddleware,
+    read_gateway_key,
+    validate_gateway_payload,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.stores import (
     VideoJobStore,
@@ -28,24 +31,28 @@ def gateway_key(tmp_path):
 def test_gateway_key_required_at_startup(tmp_path):
     path = tmp_path / "missing"
     with pytest.raises(FileNotFoundError):
-        gateway_tenant_dependency(str(path))
+        read_gateway_key(str(path))
     path.write_text("invalid")
     with pytest.raises(ValueError, match="64-digit"):
-        gateway_tenant_dependency(str(path))
+        read_gateway_key(str(path))
 
 
 def test_gateway_scope_and_background_task_lifetime(gateway_key):
     store = VideoJobStore()
     path, key = gateway_key
     header = ("x-sglang-gateway-key", key)
-    app = FastAPI(dependencies=[Depends(gateway_tenant_dependency(path))])
+    app = FastAPI(dependencies=[Depends(validate_gateway_payload)])
+    app.add_middleware(MediaGatewayMiddleware, key=read_gateway_key(path))
 
     async def run():
         release = asyncio.Event()
         tasks = []
 
-        @app.post("/{key}")
-        async def create(key: str):
+        @app.post("/v1/images/{key}")
+        async def create(key: str, request: Request):
+            assert "x-sglang-gateway-key" not in request.headers
+            assert "x-sglang-tenant" not in request.headers
+
             async def finish():
                 await release.wait()
                 await store.update_fields(key, {"status": "completed"})
@@ -66,12 +73,38 @@ def test_gateway_scope_and_background_task_lifetime(gateway_key):
                 [header, header, ("x-sglang-tenant", "a")],
             ):
                 assert (
-                    await client.post("/invalid", headers=headers)
+                    await client.post("/v1/images/invalid", headers=headers)
                 ).status_code == 403
             assert not tasks
+
+            async def unread_body():
+                raise AssertionError("Unauthenticated body was consumed")
+                yield b""
+
+            assert (
+                await client.post("/v1/images/test", content=unread_body())
+            ).status_code == 403
+            valid_headers = [header, ("x-sglang-tenant", "a")]
+            assert (
+                await client.post("/admin", headers=valid_headers)
+            ).status_code == 404
+            for payload in (
+                {"output_path": "synthetic"},
+                {"extra_body": {}},
+                {"input_reference": "example.png"},
+            ):
+                assert (
+                    await client.post(
+                        "/v1/images/test", json=payload, headers=valid_headers
+                    )
+                ).status_code == 400
             responses = await asyncio.gather(
                 *(
-                    client.post(f"/{t}", headers=[header, ("x-sglang-tenant", t)])
+                    client.post(
+                        f"/v1/images/{t}",
+                        json={"prompt": "fixture", "seed": [1]},
+                        headers=[header, ("x-sglang-tenant", t)],
+                    )
                     for t in ("a", "b")
                 )
             )
@@ -143,6 +176,10 @@ def test_media_http_ownership_and_private_cache(tmp_path, scoped, gateway_key):
                 root = f"/v1/{route}"
                 try:
                     if scoped:
+                        assert (await client.get("/liveness")).status_code == 200
+                        assert (
+                            await client.get("/stats", headers=owner)
+                        ).status_code == 404
                         assert (
                             await client.get(f"{root}/{key}/content")
                         ).status_code == 403
@@ -264,3 +301,69 @@ def test_request_logger_requires_opt_in_for_reproduction_inputs():
         assert ("seed" in record.get("sampling_params", {})) == (level >= 1)
         assert ("prompt" in record) == (level >= 2)
         assert "secret-text" not in str(logger._result_view(result))
+
+
+@pytest.mark.parametrize("success", [True, False])
+def test_ephemeral_mesh_upload_lives_exactly_as_long_as_job(
+    monkeypatch, tmp_path, success, gateway_key
+):
+    from sglang.multimodal_gen.runtime.entrypoints.openai import mesh_api
+
+    args = SimpleNamespace(input_save_path=None, output_path=str(tmp_path / "out"))
+    monkeypatch.setattr(mesh_api, "get_global_server_args", lambda: args)
+    monkeypatch.setattr(
+        mesh_api,
+        "_build_sampling_params_from_request",
+        lambda _, req, path: SimpleNamespace(source=Path(path)),
+    )
+    monkeypatch.setattr(mesh_api, "prepare_request", lambda **kw: kw["sampling_params"])
+    app = FastAPI()
+    app.include_router(
+        mesh_api.router, dependencies=[Depends(validate_gateway_payload)]
+    )
+    app.add_middleware(MediaGatewayMiddleware, key=read_gateway_key(gateway_key[0]))
+
+    async def run():
+        release = asyncio.Event()
+        started = asyncio.get_running_loop().create_future()
+
+        async def generate(client, batch):
+            started.set_result((batch.source, asyncio.current_task()))
+            await release.wait()
+            assert batch.source.read_bytes() == b"synthetic reference"
+            if not success:
+                raise RuntimeError("fixture failure")
+            artifact = Path(batch.output_path) / "mesh.glb"
+            artifact.write_bytes(b"synthetic mesh")
+            return [str(artifact)], SimpleNamespace()
+
+        monkeypatch.setattr(mesh_api, "process_generation_batch", generate)
+        monkeypatch.setattr(mesh_api.cloud_storage, "enabled", False)
+        monkeypatch.setattr(
+            mesh_api, "add_common_data_to_response", lambda fields, **_: fields
+        )
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            result = await client.post(
+                "/v1/meshes",
+                headers={
+                    "x-sglang-tenant": "mesh-client",
+                    "x-sglang-gateway-key": gateway_key[1],
+                },
+                files={"image": ("reference.png", b"synthetic reference", "image/png")},
+            )
+            assert result.status_code == 200
+            path, task = await asyncio.wait_for(started, 2)
+            assert path.is_file()
+            release.set()
+            await asyncio.wait_for(task, 2)
+            assert not path.parent.exists()
+            token = media_tenant.set("mesh-client")
+            try:
+                job = await mesh_api.MESH_STORE.pop(result.json()["id"])
+            finally:
+                media_tenant.reset(token)
+            assert job["status"] == ("completed" if success else "failed")
+
+    asyncio.run(run())

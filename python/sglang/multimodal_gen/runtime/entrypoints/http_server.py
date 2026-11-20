@@ -28,7 +28,9 @@ from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
 from sglang.multimodal_gen.runtime.entrypoints.openai import image_api, video_api
 from sglang.multimodal_gen.runtime.entrypoints.openai.media_privacy import (
     PRIVATE_CACHE_CONTROL,
-    gateway_tenant_dependency,
+    MediaGatewayMiddleware,
+    read_gateway_key,
+    validate_gateway_payload,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.prompt_enhancement import (
     PromptEnhancer,
@@ -260,7 +262,7 @@ async def health(request: Request):
     """Report readiness for normal inference traffic."""
     error = async_scheduler_client.failure_reason or _backend_failure(request.app)
     if error is not None:
-        return orjson_response({"status": "unhealthy", "error": error}, status_code=503)
+        return orjson_response({"status": "unhealthy"}, status_code=503)
     if not request.app.state.server_warmup_done.is_set():
         return Response(status_code=503)
     return {"status": "ok"}
@@ -726,28 +728,34 @@ def create_app(
     )
 
     app.add_middleware(_ServingHTTPMiddleware)
+    gateway = server_args.media_gateway_key_file is not None
+    if gateway:
+        app.add_middleware(
+            MediaGatewayMiddleware,
+            key=read_gateway_key(server_args.media_gateway_key_file),
+        )
+        app.add_api_route("/liveness", liveness, methods=["GET"])
+        app.add_api_route("/health", health, methods=["GET"])
+    else:
+        from sglang.multimodal_gen.runtime.entrypoints.openai import common_api
 
-    app.include_router(health_router)
-    app.include_router(vertex_router)
+        app.include_router(health_router)
+        app.include_router(vertex_router)
+        app.include_router(common_api.router)
+        app.include_router(realtime_video_api.router)
+        if server_args.pipeline_config.supports_action_endpoint():
+            app.include_router(action_api.router)
+        if server_args.pipeline_config.supports_openpi_endpoint():
+            app.include_router(openpi.router)
+        app.include_router(weights_api.router)
+        app.include_router(rollout_api.router)
 
-    from sglang.multimodal_gen.runtime.entrypoints.openai import common_api, mesh_api
+    from sglang.multimodal_gen.runtime.entrypoints.openai import mesh_api
 
-    app.include_router(common_api.router)
-    media_dependencies = (
-        [Depends(gateway_tenant_dependency(server_args.media_gateway_key_file))]
-        if server_args.media_gateway_key_file is not None
-        else []
-    )
+    media_dependencies = [Depends(validate_gateway_payload)] if gateway else []
     app.include_router(image_api.router, dependencies=media_dependencies)
     app.include_router(video_api.router, dependencies=media_dependencies)
-    app.include_router(realtime_video_api.router)
-    if server_args.pipeline_config.supports_action_endpoint():
-        app.include_router(action_api.router)
-    if server_args.pipeline_config.supports_openpi_endpoint():
-        app.include_router(openpi.router)
     app.include_router(mesh_api.router, dependencies=media_dependencies)
-    app.include_router(weights_api.router)
-    app.include_router(rollout_api.router)
 
     app.state.server_args = server_args
     app.state.prompt_enhancer = None

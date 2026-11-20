@@ -285,7 +285,7 @@ def test_video_upload_sanitizes_filename_and_preserves_metadata(tmp_path):
             mesh_api,
             "/v1/meshes",
             "_build_sampling_params_from_request",
-            "outputs/uploads/request_evil.png",
+            "uploads/request_evil.png",
         ),
     ],
 )
@@ -377,7 +377,11 @@ def test_rejected_mesh_preparation_does_not_create_a_queued_job(monkeypatch, tmp
     """Failure before scheduler submission must not leave a permanently queued job."""
     store = AsyncDictStore()
     monkeypatch.setattr(mesh_api, "MESH_STORE", store)
-    monkeypatch.setattr(mesh_api, "get_global_server_args", lambda: SimpleNamespace())
+    monkeypatch.setattr(
+        mesh_api,
+        "get_global_server_args",
+        lambda: SimpleNamespace(input_save_path=None, output_path=str(tmp_path)),
+    )
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(
         mesh_api,

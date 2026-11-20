@@ -252,13 +252,16 @@ credentials unless you have isolated all other data and control paths.
   Invalid keys, missing IDs and ambiguous headers are rejected. Image,
   video and mesh job operations are tenant-scoped; other tenants' IDs return
   the same 404 as unknown IDs. Jobs are process-local: route subsequent
-  requests to the owning replica. This does **not** authenticate end users or
-  other routes, or sandbox filesystem access.
+  requests to the owning replica. In this mode only the OpenAI image, video
+  and mesh HTTP route families are accessible. Only health and liveness probes
+  are unauthenticated. Realtime WebSockets, administrative endpoints and
+  the metrics endpoint are not exposed on this listener.
 - **Ingress:** Publish only the required media routes. Do not expose scheduler,
   admin, profiling, weight-loading, or realtime endpoints through the same
-  public catch-all. Allowlist request fields; do not pass client-supplied
-  filesystem paths, diagnostic dumps, or arbitrary fetch URLs to a shared
-  worker. Limit input bytes, decoded pixels/frames, runtime and concurrency.
+  public catch-all. Gateway mode accepts common scalar sampling options and
+  multipart media uploads; client-selected paths, remote media URLs, diagnostics
+  and backend-specific kwargs are not accepted. Independently limit input bytes,
+  decoded pixels/frames, runtime and concurrency at ingress.
 - **Data retention:** Leave request logging off (or explicitly use level 0).
   Treat seeds, reference media, embeddings, signed URLs, enhanced prompts and
   outputs as customer data. Disable body capture in proxies, traces and error
