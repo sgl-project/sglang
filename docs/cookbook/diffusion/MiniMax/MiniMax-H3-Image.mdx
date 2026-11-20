@@ -65,8 +65,9 @@ The heads are served from `pdd_fused_heads.safetensors`, outside the
 transformer's parameters. See
 [PDD acceleration LoRAs](/cookbook/diffusion/MiniMax/MiniMax-H3#pdd-acceleration-loras)
 for how a weight update reaches them. Such an update needs a server that keeps
-the AdaLN projection weights: pass `--minimax-h3-adaln-online false` on the
-GPUs where Auto precomputes them.
+the AdaLN projection weights: pass `--minimax-h3-adaln-online false` where
+Auto would release them. A resident GB10 cannot keep them (see
+[DGX Spark](#dgx-spark-128-gb)).
 
 | Task | Endpoint | Input |
 | --- | --- | --- |
