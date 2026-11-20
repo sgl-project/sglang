@@ -92,3 +92,34 @@ def test_musubi_wan_normalizes_like_the_official_wan_layout():
 def test_other_kohya_layouts_are_not_musubi_wan(extra_key):
     sd = _musubi(MODULES) | {extra_key: torch.zeros(RANK, DIM)}
     assert detect_lora_format_from_state_dict(sd) != LoRAFormat.MUSUBI_WAN
+
+
+def _loader_names(state_dict):
+    """Adapter names as LoRAPipeline.load_lora_adapter maps them for Wan."""
+    from sglang.multimodal_gen.configs.models.dits.wanvideo import WanVideoArchConfig
+    from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
+
+    config = WanVideoArchConfig()
+    lora_map = get_param_names_mapping(config.lora_param_names_mapping)
+    param_map = get_param_names_mapping(config.param_names_mapping)
+    names = set()
+    for key in state_dict:
+        if ".lora_" not in key:
+            continue
+        name = key.replace("diffusion_model.", "").removesuffix(".weight")
+        name, _, _ = lora_map(name)
+        names.add(param_map(name)[0])
+    return names
+
+
+def test_musubi_wan_lands_on_the_same_layers_as_a_diffusers_wan_lora():
+    out = normalize_lora_state_dict(_musubi(MODULES), LOG)
+    diffusers_layout = {
+        f"blocks.{i}.{name}.lora_{ab}.weight": torch.zeros(1)
+        for i in range(2)
+        for _, name in MODULES.values()
+        for ab in "AB"
+    }
+    names = _loader_names(out)
+    assert len(names) == 2 * len(MODULES) * 2
+    assert names == _loader_names(diffusers_layout)
