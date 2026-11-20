@@ -1759,8 +1759,9 @@ OutputHiddenStates = Optional[
     List[Optional[List[Optional[Union[float, HiddenStateChunk]]]]]
 ]
 CachedTokensDetails = Dict[str, Union[int, str]]
-# Serialized form of BaseFinishReason.to_json() — all values are primitives.
-FinishReasonDict = Dict[str, Optional[Union[str, int, List[int]]]]
+# Serialized form of BaseFinishReason.to_json() — all values are primitives,
+# except a length finish's ignored_stop object.
+FinishReasonDict = Dict[str, Optional[Union[str, int, List[int], Dict[str, int]]]]
 
 
 class RequestOutputStats(

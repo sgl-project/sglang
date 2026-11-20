@@ -559,9 +559,15 @@ fn finish_reason(reason: &FinishReason) -> api::FinishReason {
         FinishReason::Known(FinishKind::Stop { matched }) => Kind::Stop(api::FinishStop {
             matched: matched.as_ref().map(matched_value),
         }),
-        FinishReason::Known(FinishKind::Length { length }) => {
-            Kind::Length(api::FinishLength { length: *length })
-        }
+        FinishReason::Known(FinishKind::Length {
+            length,
+            ignored_stop,
+        }) => Kind::Length(api::FinishLength {
+            length: *length,
+            ignored_stop: ignored_stop.as_deref().map(|stop| api::IgnoredStop {
+                position: stop.position,
+            }),
+        }),
         FinishReason::Known(FinishKind::Abort(abort)) => Kind::Abort(Box::new(api::FinishAbort {
             message: abort.message.clone(),
             status_code: abort.status_code.map(u32::from),
