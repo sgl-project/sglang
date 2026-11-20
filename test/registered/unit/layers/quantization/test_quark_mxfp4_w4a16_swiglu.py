@@ -4,6 +4,10 @@ Covers the activation added for MiniMax-M3 / gpt-oss MXFP4 MoE on the W4A16 path
 Fails on base (the helper does not exist there).
 """
 
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
 import pytest
 import torch
 
