@@ -1254,7 +1254,7 @@ class DsparkVerifyEpilogue:
 
 def accept_split_group():
     """The TP2 group the eager verify accept splits its requests over, or None."""
-    if not envs.SGLANG_DSPARK_OPT_ACCEPT_TP_SPLIT.get() or _is_hip or _is_npu:
+    if _is_hip or _is_npu:
         return None
     group = get_dp_tp_group()
     return group if group.world_size == 2 else None
