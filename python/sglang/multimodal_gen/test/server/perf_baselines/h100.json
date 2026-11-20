@@ -349,7 +349,10 @@
                 "expected_load_ms": 60590.2
             },
             "hunyuan3d_shape_gen": {
-                "expected_load_ms": 47635.42
+                "expected_load_ms": 47635.42,
+                "stages_ms": {
+                    "Hunyuan3DShapeDenoisingStage": 1990.09
+                }
             },
             "hunyuanvideo_modelopt_fp8_t2v": {
                 "expected_load_ms": 35041.87
