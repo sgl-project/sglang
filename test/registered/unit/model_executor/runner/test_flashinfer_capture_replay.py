@@ -2,9 +2,10 @@
 
 Each shape is captured under strict replay, where a lookup without a stored winner
 raises instead of baking FlashInfer's default into the graph. On such a miss the
-shape's forward is tuned under the store and the capture runs once more. The
-lifecycle cases use FlashInfer's real AutoTuner and store, with GPU timing replaced
-by a table.
+shape's forward is tuned under the store and the capture runs once more; a miss
+that survives the retry is logged as a warning and captured as it would be without
+the check. The lifecycle cases use FlashInfer's real AutoTuner and store, with GPU
+timing replaced by a table.
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
@@ -191,12 +192,15 @@ class TestCaptureReplayLifecycle(_PublishedConfig):
         self.assertEqual(self._capture(OP, OTHER_OP), [1, 1])
         self.assertEqual((self.captures, self.profiled), (1, []))
 
-    def test_a_miss_the_forward_does_not_tune_raises(self):
+    def test_a_miss_the_retry_cannot_fix_warns_and_captures_the_default(self):
+        # Never worse than without the check: the unfixable lookup gets the default.
         self._startup(OP)
         self.profiled.clear()
-        with self.assertRaisesRegex(RuntimeError, "strict replay miss"):
-            self._capture(OP, OTHER_OP, fill_ops=(OP,))
-        self.assertEqual((self.captures, self.profiled), (2, []))
+        with self.assertLogs(autotune.logger, "WARNING") as logs:
+            served = self._capture(OP, OTHER_OP, fill_ops=(OP,))
+        self.assertEqual(served, [1, -1])
+        self.assertIn("strict replay miss", logs.output[0])
+        self.assertEqual((self.captures, self.profiled), (3, []))
 
     def test_a_skipped_op_is_neither_tuned_nor_a_miss(self):
         with get_exec().kernel.override(flashinfer_autotune_skip_ops=[OTHER_OP]):
@@ -303,7 +307,10 @@ class TestCaptureReplayContexts(_PublishedConfig):
         @contextmanager
         def autotune_v2(**kw):
             self.events.append(kw["mode"])
-            yield SimpleNamespace(misses=self.misses.pop(0) if self.misses else 0)
+            strict = kw.get("strict_replay", False)
+            yield SimpleNamespace(
+                misses=self.misses.pop(0) if strict and self.misses else 0
+            )
 
         self.autotune_v2 = Mock(side_effect=autotune_v2)
         self.enter(
@@ -315,17 +322,17 @@ class TestCaptureReplayContexts(_PublishedConfig):
         self.forward = Mock(side_effect=lambda: self.events.append("forward"))
         self.hook = Mock(side_effect=lambda: self.events.append("hook"))
 
-    def capture(self, eligible, miss_first=False):
+    def capture(self, eligible, misses=0):
+        """``misses``: how many strict captures in a row miss."""
         attempts = []
 
         def capture():
             attempts.append(1)
             self.events.append("capture")
-            if miss_first and len(attempts) == 1:
+            if len(attempts) <= misses:
                 raise RuntimeError("autotune strict replay miss for op")
 
-        if miss_first:
-            self.misses = [1]
+        self.misses = [1] * misses
         with patch.object(
             autotune, "uses_flashinfer_capture_replay", return_value=eligible
         ):
@@ -352,7 +359,7 @@ class TestCaptureReplayContexts(_PublishedConfig):
         self.assertIn(OP, store["skip_ops"])
 
     def test_a_miss_tunes_then_captures_again(self):
-        self.capture(eligible=True, miss_first=True)
+        self.capture(eligible=True, misses=1)
         store = self.store()
         self.assertEqual(
             self.events,
@@ -365,6 +372,15 @@ class TestCaptureReplayContexts(_PublishedConfig):
                 call(mode="tune", **store),
                 call(mode="replay", strict_replay=True, **store),
             ],
+        )
+
+    def test_a_second_miss_captures_outside_any_context(self):
+        with self.assertLogs(autotune.logger, "WARNING"):
+            self.capture(eligible=True, misses=2)
+        self.assertEqual(
+            self.events,
+            ["replay", "capture", "tune", "forward", "hook", "replay", "capture"]
+            + ["capture"],
         )
 
     def test_ineligible_capture_enters_no_context(self):

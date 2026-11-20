@@ -365,16 +365,10 @@ def capture_with_flashinfer_replay(
         cache_scope="context",
         skip_ops=get_flashinfer_autotune_skip_ops(),
     )
-    report = None
-    try:
-        # A lookup without a stored winner raises instead of capturing the default.
-        with autotune_v2(mode="replay", strict_replay=True, **store) as report:
-            capture()
+    miss = _capture_strictly(autotune_v2, store, capture)
+    if miss is None:
         return
-    except RuntimeError as exc:
-        if report is None or not report.misses:
-            raise
-        logger.info("FlashInfer autotune: %s; tuning this decode shape.", exc)
+    logger.info("FlashInfer autotune: %s; tuning this decode shape.", miss)
     # The miss raised in an eager warmup or in capture, neither of which kept a graph.
     try:
         with autotune_v2(mode="tune", **store):
@@ -382,8 +376,31 @@ def capture_with_flashinfer_replay(
     finally:
         if post_warmup_hook is not None:
             post_warmup_hook()
-    with autotune_v2(mode="replay", strict_replay=True, **store):
-        capture()
+    miss = _capture_strictly(autotune_v2, store, capture)
+    if miss is None:
+        return
+    # A bug, not an expected state; capture as without this check rather than fail.
+    logger.warning(
+        "FlashInfer autotune: %s even after tuning this decode shape; "
+        "capturing it with the default tactic.",
+        miss,
+    )
+    capture()
+
+
+def _capture_strictly(
+    autotune_v2, store: dict, capture: Callable[[], None]
+) -> Optional[RuntimeError]:
+    """Capture under strict replay; return FlashInfer's miss error instead of raising it."""
+    report = None
+    try:
+        with autotune_v2(mode="replay", strict_replay=True, **store) as report:
+            capture()
+    except RuntimeError as exc:
+        if report is None or not report.misses:
+            raise
+        return exc
+    return None
 
 
 def _autotune_tactic_sync_group(
