@@ -35,6 +35,7 @@ from sglang.multimodal_gen.configs.task_type import DataType
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import CYAN, RESET, init_logger
+from sglang.multimodal_gen.runtime.utils.process import local_media_subprocess_env
 from sglang.multimodal_gen.runtime.utils.profiler import maybe_record_function
 from sglang.srt.observability.trace import TraceReqContext
 
@@ -505,6 +506,7 @@ class CudaVideoEncoder:
         try:
             self._process = subprocess.Popen(
                 command,
+                env=local_media_subprocess_env(),
                 stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL,
                 stderr=self._stderr,
@@ -806,6 +808,7 @@ def _mux_audio_np_into_mp4(
                 "experimental",
                 merged_path,
             ],
+            env=local_media_subprocess_env(),
             check=True,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -917,6 +920,7 @@ def _save_video_ffmpeg(
     with tempfile.TemporaryFile() as stderr:
         with subprocess.Popen(
             command,
+            env=local_media_subprocess_env(),
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
             stderr=stderr,
