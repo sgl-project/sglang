@@ -13,7 +13,7 @@ from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_xpu_ci(est_time=10, suite="stage-b-test-1-gpu-xpu")
+register_xpu_ci(est_time=10, suite="extra-test-1-gpu-xpu")
 
 # The fused fp32 sum differs from torch's in the last bit, so a few outputs move by up to two
 # rounding steps; measured on B60 and A100 (also CUDA's fused kernel): <= 3.6e-5 and 1.85 steps.
