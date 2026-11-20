@@ -327,13 +327,18 @@ class TestTritonGDNBackendCorrectness(CustomTestCase):
             run_gdn_eagle_verify_case(self, case, topk=topk, spec_kind=spec_kind)
 
     def test_triton_prefill_keeps_contiguous_qkv_materialization(self):
+        # HIP folds Q/K L2-norm and gating into fused_gdn_prefill_prepare;
+        # CUDA/XPU still materialize QKV through fused_qkv_split_gdn_prefill.
+        prepare_name = (
+            "fused_gdn_prefill_prepare" if is_hip() else "fused_qkv_split_gdn_prefill"
+        )
         with patch.object(
             gdn_backend,
-            "fused_qkv_split_gdn_prefill",
-            wraps=gdn_backend.fused_qkv_split_gdn_prefill,
-        ) as split_spy:
+            prepare_name,
+            wraps=getattr(gdn_backend, prepare_name),
+        ) as materialize_spy:
             run_gdn_attention_case(self, self.CASES[0])
-        split_spy.assert_called()
+        materialize_spy.assert_called()
 
     def test_runner_mode_eagle_verify_cuda_graph_cases(self):
         for case, topk, spec_kind in self.EAGLE_VERIFY_CUDA_GRAPH_CASES:

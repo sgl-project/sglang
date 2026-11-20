@@ -956,3 +956,38 @@ def _prepare_gdn_prefill(
         num_stages=3,
     )
     return q, k, v, g, beta_output
+
+
+def fused_gdn_prefill_prepare(
+    mixed_qkv: torch.Tensor,
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    dt_bias: torch.Tensor,
+    num_qk_heads: int,
+    num_v_heads: int,
+    head_qk: int,
+    head_v: int,
+    eps: float = 1e-6,
+):
+    """HIP extend helper: split/normalize QKV and gates with identity row map.
+
+    Thin wrapper over `_prepare_gdn_prefill` for the equal-QK-head extend path.
+    `eps` is accepted for call-site compatibility; the shared kernel uses 1e-6.
+    """
+    del eps
+    token_indices = torch.arange(
+        mixed_qkv.shape[0], device=mixed_qkv.device, dtype=torch.int32
+    )
+    return _prepare_gdn_prefill(
+        mixed_qkv,
+        num_qk_heads,
+        num_qk_heads,
+        num_v_heads,
+        head_qk,
+        head_qk,
+        head_v,
+        normalize_qk=True,
+        gating=(A_log, a, b, dt_bias),
+        token_indices=token_indices,
+    )

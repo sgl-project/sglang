@@ -1022,6 +1022,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             else:
                 num_k_heads_tp = triton.cdiv(self.num_k_heads, self.attn_tp_size)
                 num_v_heads_tp = triton.cdiv(self.num_v_heads, self.attn_tp_size)
+            # HIP Triton conv1d, fused_qkv_split_gdn_prefill, fused_gdn_gating,
+            # and 3D-Z rms_norm_gated already honor these strides.
+            # Speculative extend/verify still unpacks.
             # The strided views feed only prefill GDN; DP-relabeled decode rows
             # run the decode kernels, so pick the layout from the logical mode.
             use_strided_prefill_z = (

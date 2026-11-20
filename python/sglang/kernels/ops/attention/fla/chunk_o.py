@@ -11,7 +11,7 @@ import triton.language as tl
 from sglang.kernels.ops.attention.fla.index import prepare_chunk_indices
 from sglang.kernels.ops.attention.fla.op import exp, safe_exp
 from sglang.kernels.ops.attention.fla.utils import check_shared_mem, is_nvidia_hopper
-from sglang.srt.utils import use_gfx115_kernels
+from sglang.srt.utils import is_hip, use_gfx115_kernels
 
 BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
@@ -267,7 +267,13 @@ def chunk_fwd_o(
 
     if (out is None) != (output_indices is None):
         raise ValueError("out and output_indices must be supplied together")
-    o = torch.zeros_like(v) if out is None else out
+    use_hip_gdn_tuning = is_hip() and g is not None and K == V == 128
+    if out is None:
+        o = torch.empty_like(v) if use_hip_gdn_tuning else torch.zeros_like(v)
+    else:
+        o = out
+    config = (64, 128, 2, 3) if use_hip_gdn_tuning else (128, 64, 4, 2)
+    BK, BV, num_warps, num_stages = config
 
     use_grouped = output_indices is None and _use_grouped_three_head(
         q, k, v, h, g, cu_seqlens, chunk_size, NT
@@ -311,13 +317,13 @@ def chunk_fwd_o(
             K=K,
             V=V,
             BT=BT,
-            BK=128,
-            BV=64,
+            BK=BK,
+            BV=BV,
             USE_G=g is not None,
             IS_VARLEN=cu_seqlens is not None,
             output_indices=output_indices,
             HAS_OUTPUT_INDICES=output_indices is not None,
-            num_warps=4,
-            num_stages=2,
+            num_warps=num_warps,
+            num_stages=num_stages,
         )
     return o
