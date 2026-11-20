@@ -114,6 +114,29 @@ def mask_cpu_expert_ids(topk_ids: torch.Tensor, num_gpu_experts: int) -> torch.T
     return topk_ids
 
 
+def kt_swiglu_kwargs(moe_runner_config: Optional["MoeRunnerConfig"]) -> dict:
+    """The gated activation's parameters for kt-kernel's CPU experts, as KTMoEWrapper
+    takes them: ``swiglu_limit`` for a clamped SwiGLU (DeepSeek-V4, GLM-5: gate <=
+    limit, |up| <= limit), ``swiglu_alpha`` (with the clamp as ``swiglu_limit``) for
+    SwiGLU-OAI (MiniMax-M3: gate * sigmoid(alpha * gate) * (up + 1)). Empty for plain
+    SiLU, so kt-kernel builds without these arguments keep working."""
+    cfg = moe_runner_config
+    alpha = getattr(cfg, "gemm1_alpha", None)
+    if alpha is not None:
+        beta = getattr(cfg, "gemm1_beta", None)
+        if beta is not None and float(beta) != 1.0:
+            raise ValueError(
+                f"kt-kernel's SwiGLU-OAI adds 1 to up; this layer's gemm1_beta is {beta}"
+            )
+        limit = getattr(cfg, "gemm1_clamp_limit", None)
+        kwargs = {"swiglu_alpha": float(alpha)}
+        if limit:
+            kwargs["swiglu_limit"] = float(limit)
+        return kwargs
+    limit = getattr(cfg, "swiglu_limit", None)
+    return {"swiglu_limit": float(limit)} if limit else {}
+
+
 class KTEPWrapperMethod(FusedMoEMethodBase):
     """Wrapper for any MoE quantization method to enable CPU-GPU expert parallelism.
 
@@ -229,6 +252,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 chunked_prefill_size=self.kt_config.chunked_prefill_size,
                 method=self.kt_config.method,
                 max_deferred_experts_per_token=layer_max_deferred,
+                **kt_swiglu_kwargs(getattr(layer, "moe_runner_config", None)),
             )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
