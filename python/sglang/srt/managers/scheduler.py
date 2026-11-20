@@ -1827,6 +1827,16 @@ class Scheduler(
                 self.draft_worker.get_confidence_budget_prepare()
             )
 
+        self._defer_npu_seq_lens_d2h = (
+            _is_npu
+            and self.enable_overlap
+            and get_parallel().pp_size == 1
+            and self._confidence_budget_prepare is None
+            and self.spec_algorithm.is_dflash()
+            and getattr(self.model_worker, "supports_deferred_npu_seq_lens_d2h", False)
+            and self.future_map.enable_deferred_npu_seq_lens_d2h()
+        )
+
         # If enable async D2H copy when overlap is enabled
         # Currently used by NVIDIA Confidential Computing (CC) only
         self.enable_async_d2h_copy = False
@@ -5365,8 +5375,19 @@ class Scheduler(
                     and self._confidence_budget_prepare is None
                     and not getattr(self.future_map, "needs_cpu_seq_lens", True)
                 )
+                pending_seq_lens = None
                 if not gpu_only_lens:
-                    self.future_map.resolve_seq_lens_cpu(batch)
+                    if (
+                        self._defer_npu_seq_lens_d2h
+                        and batch.forward_mode.is_decode()
+                        and not batch.is_extend_in_batch
+                        and batch.prefill_input_ids_cpu is None
+                    ):
+                        pending_seq_lens = self.future_map.resolve_seq_lens_cpu(
+                            batch, defer_npu_d2h=True
+                        )
+                    else:
+                        self.future_map.resolve_seq_lens_cpu(batch)
                 if self._confidence_budget_prepare is not None:
                     self._confidence_budget_prepare(batch, self.future_map)
 
@@ -5406,6 +5427,8 @@ class Scheduler(
 
                         if input_ids_from_graph:
                             fwd_kwargs["input_ids_from_graph"] = True
+                        if pending_seq_lens is not None:
+                            fwd_kwargs["pending_seq_lens"] = pending_seq_lens
 
                         # FIXME: pp is not compatible with overlap
                         batch_result = self.model_worker.forward_batch_generation(
@@ -5447,6 +5470,11 @@ class Scheduler(
                                 self._copy_result_to_cpu(batch_result, batch)
                         else:
                             batch_result.future_indices = future_indices
+
+                if pending_seq_lens is not None:
+                    # Forward isolation restores the pre-forward snapshot. Keep
+                    # the resolved lengths as in the synchronous scheduler path.
+                    batch.seq_lens_cpu, batch.seq_lens_sum = pending_seq_lens.result()
 
                 # Next-iter input_ids relayed via future_map.
                 batch.input_ids = None

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import logging
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional, Sequence
 
 import msgspec
@@ -69,6 +70,7 @@ def decide_needs_confidence_relay() -> bool:
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
+logger = logging.getLogger(__name__)
 
 # Token-buf consume tracking: init to -1, assert non-negative on gather,
 # write -1 back. Catches "gather without intermediate stash" bugs. CI enables
@@ -308,6 +310,24 @@ class ConfidenceRelay(msgspec.Struct):
         )
 
 
+@dataclass
+class PendingNPUSeqLensCopy:
+    """One scheduler forward's view of the shared pinned readback buffer."""
+
+    staging: torch.Tensor
+    copy_done: torch.Event
+    _result: Optional[tuple[torch.Tensor, int]] = field(default=None, init=False)
+
+    def result(self) -> tuple[torch.Tensor, int]:
+        if self._result is None:
+            with profile_range("npu.seq_lens.d2h_wait"):
+                self.copy_done.synchronize()
+            # Keep a private snapshot for the batch across future staging writes.
+            lengths = self.staging.clone()
+            self._result = lengths, int(lengths.sum())
+        return self._result
+
+
 class FutureMap:
     """Always-on pool-indexed relay for cross-iter values. Forward writes via
     publish/stash; next iter reads via resolve_forward_inputs / resolve_seq_lens_cpu.
@@ -352,8 +372,7 @@ class FutureMap:
             )
         # Pinned host copy of new_seq_lens_buf + private stream for fwd-prepare
         # D2H pulls (gated only on publish, off the schedule stream). CUDA-only:
-        # recovers occupancy lost to the WAR barrier (also CUDA-only); other
-        # platforms have no barrier and use the plain .cpu() bootstrap path.
+        # recovers occupancy lost to the WAR barrier (also CUDA-only).
         if _is_cuda:
             self.new_seq_lens_cpu_pinned = torch.empty(
                 (self.req_pool_size,), dtype=torch.int64, pin_memory=True
@@ -364,6 +383,8 @@ class FutureMap:
         else:
             self.new_seq_lens_cpu_pinned = None
             self.fwd_prepare_d2h_stream = None
+        self._npu_seq_lens_cpu_pinned = None
+        self._npu_seq_lens_copy_stream = None
         self.need_topk = False
         self.need_hidden_states = False
         self.topk_p_buf = None
@@ -686,19 +707,59 @@ class FutureMap:
             int(x) for x in fresh_cpu.tolist()
         ]
 
+    def enable_deferred_npu_seq_lens_d2h(self) -> bool:
+        if not self.needs_cpu_seq_lens:
+            return False
+        try:
+            staging = torch.empty(
+                self.req_pool_size, dtype=torch.int64, device="cpu", pin_memory=True
+            )
+            stream = torch.get_device_module(self.device).Stream()
+        except RuntimeError as exc:
+            logger.warning("Using synchronous NPU seq_lens readback: %s", exc)
+            return False
+        self._npu_seq_lens_cpu_pinned = staging
+        self._npu_seq_lens_copy_stream = stream
+        return True
+
+    def _enqueue_npu_seq_lens_d2h(
+        self, seq_lens: torch.Tensor
+    ) -> PendingNPUSeqLensCopy:
+        device_module = torch.get_device_module(self.device)
+        copy_stream = self._npu_seq_lens_copy_stream
+        staging = self._npu_seq_lens_cpu_pinned[: seq_lens.numel()]
+        with profile_range("npu.seq_lens.d2h_enqueue"):
+            # The producer stream has already waited for publish_ready and
+            # gathered the live rows. Only the copy stream waits for this event.
+            gather_done = device_module.Event()
+            gather_done.record()
+            copy_done = device_module.Event()
+            seq_lens.record_stream(copy_stream)
+            with device_module.stream(copy_stream):
+                copy_stream.wait_event(gather_done)
+                # Forward dispatch consumes the previous snapshot before the
+                # next dispatch, and the copy stream orders staging writes.
+                staging.copy_(seq_lens, non_blocking=True)
+                copy_done.record()
+        return PendingNPUSeqLensCopy(staging, copy_done)
+
     def resolve_seq_lens_cpu(
-        self, batch: ScheduleBatch, stream_ordered: bool = False
-    ) -> None:
+        self,
+        batch: ScheduleBatch,
+        stream_ordered: bool = False,
+        *,
+        defer_npu_d2h: bool = False,
+    ) -> Optional[PendingNPUSeqLensCopy]:
         # Lazy pull from new_seq_lens_buf for spec_v2 (accept_lens not known to
         # schedule). The CPU mirror is gated by needs_cpu_seq_lens; backends that
         # opt out take the GPU-only path below. A private D2H stream overlaps the copy.
         draft_input = batch.spec_info
         if draft_input is None:
-            return
+            return None
 
         fi = draft_input.future_indices
         if fi is None:
-            return
+            return None
         if self.publish_ready is not None and stream_ordered:
             self._publish_fresh = False
         elif self.publish_ready is not None:
@@ -724,7 +785,20 @@ class FutureMap:
                 # before the next resolve gathers it (safe here: the forward's
                 # re-publish is fenced behind this stream via wait_stream).
                 _assert_nonneg_and_invalidate(batch.seq_lens, self.new_seq_lens_buf, fi)
-            return
+            return None
+
+        if (
+            defer_npu_d2h
+            and self._npu_seq_lens_copy_stream is not None
+            and self.publish_ready is not None
+            and 0 < fi.numel() <= self.req_pool_size
+        ):
+            pending = self._enqueue_npu_seq_lens_d2h(batch.seq_lens)
+            batch.seq_lens_cpu = None
+            batch.seq_lens_sum = None
+            if _DEBUG_ASSERT:
+                _assert_nonneg_and_invalidate(batch.seq_lens, self.new_seq_lens_buf, fi)
+            return pending
 
         if self.fwd_prepare_d2h_stream is None or self.publish_ready is None:
             with profile_range("npu.seq_lens.d2h") if _is_npu else nullcontext():
@@ -732,7 +806,7 @@ class FutureMap:
             batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
             if _DEBUG_ASSERT:
                 _assert_nonneg_and_invalidate(batch.seq_lens, self.new_seq_lens_buf, fi)
-            return
+            return None
 
         # Mechanism: don't sync the schedule stream; gate a private stream on the
         # publish event and copy into the static pinned buffer.
@@ -748,6 +822,7 @@ class FutureMap:
             # After the D2H copy completed (synchronize above), so the pinned
             # mirror is not poisoned.
             _assert_nonneg_and_invalidate(batch.seq_lens, self.new_seq_lens_buf, fi)
+        return None
 
     def publish(
         self,

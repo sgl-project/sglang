@@ -21,6 +21,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_accept import (
     accept_sampling,
 )
 from sglang.srt.configs.hybrid_arch import mambaish_config
+from sglang.srt.configs.model_config import is_kimi_k31
 from sglang.srt.environ import envs
 from sglang.srt.kernel_plugins.nvidia.binding import (
     built_megakernel,
@@ -175,6 +176,7 @@ _is_npu = is_npu()
 
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.overlap_utils import PendingNPUSeqLensCopy
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
@@ -1090,6 +1092,28 @@ class DFlashWorkerV2(BaseSpecWorker):
         return (
             self._target_worker.model_runner.attn_backend,
             self.draft_model_runner.attn_backend,
+        )
+
+    @property
+    def supports_deferred_npu_seq_lens_d2h(self) -> bool:
+        if (
+            not _is_npu
+            or not self._hosts_draft
+            or read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
+            or not is_kimi_k31(self.target_worker.model_runner.model_config.hf_config)
+        ):
+            return False
+
+        from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
+            AscendAttnBackend,
+        )
+
+        backend = self.draft_model_runner.attn_backend
+        return (
+            isinstance(backend, AscendAttnBackend)
+            and backend.use_mla
+            and not backend.use_dsa
+            and backend.needs_cpu_seq_lens
         )
 
     def alloc_memory_pool(
@@ -3675,6 +3699,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         on_publish=None,
         grammar_barrier=None,
         pp_proxy_tensors=None,
+        pending_seq_lens: Optional["PendingNPUSeqLensCopy"] = None,
     ) -> GenerationBatchResult:
         if not self._hosts_draft:
             batch_output = self.target_worker.forward_batch_generation(
@@ -3967,6 +3992,10 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         positions = positions_2d.reshape(-1)
         verify_out_cache_loc = verify_out_cache_loc_2d.reshape(-1)
+        if pending_seq_lens is not None:
+            # Draft input preparation above uses device lengths only. The plan
+            # and FIA metadata below require the committed host lengths.
+            batch.seq_lens_cpu, batch.seq_lens_sum = pending_seq_lens.result()
         # The iteration's window -- the draft block, the verify and the
         # target-hidden KV writes all write it -- planned once.
         iteration_ids = self.target_worker.model_runner.runner_ids.plan(
