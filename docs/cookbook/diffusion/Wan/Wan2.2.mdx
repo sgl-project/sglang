@@ -248,11 +248,23 @@ sglang serve --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers
     </tr>
   </tbody>
 </table>
+Both repos ship one file for the high-noise expert and one for the low-noise expert, so load them with the [LoRA management API](/docs/sglang-diffusion/api/openai_api#lora-management) after the server starts, one per target. A bare repo id fails here because it holds several weight files.
+
 **Example**:
 ```shell Command
-sglang serve --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers --port 3000 \
-    --lora-path Cseti/wan2.2-14B-Arcane_Jinx-lora-v1
+sglang serve --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers --port 3000
+
+curl -X POST http://localhost:3000/v1/set_lora -H "Content-Type: application/json" -d '{
+  "lora_nickname": ["jinx_high", "jinx_low"],
+  "lora_path": [
+    "Cseti/wan2.2-14B-Arcane_Jinx-lora-v1/985347-wan22_14B-high-Nfj1nx-e71.safetensors",
+    "Cseti/wan2.2-14B-Arcane_Jinx-lora-v1/985347-wan22_14B-low-Nfj1nx-e65.safetensors"
+  ],
+  "target": ["transformer", "transformer_2"]
+}'
 ```
+
+For `lightx2v/Wan2.2-Distill-Loras` with Wan2.2-I2V-A14B, use `wan2.2_i2v_A14b_high_noise_lora_rank64_lightx2v_4step_1022.safetensors` and `wan2.2_i2v_A14b_low_noise_lora_rank64_lightx2v_4step_1022.safetensors` the same way.
 
 ## 5. Benchmark
 
