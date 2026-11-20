@@ -254,6 +254,7 @@ class TestKimiK3QuarkFp8KDAInProj(CustomTestCase):
             _qkvg_gate_float_shard=False,
             _bfa_f_b_w=None,
             _derived_weight_cache_error=None,
+            o_norm=SimpleNamespace(weight=torch.ones(1, dtype=torch.bfloat16)),
         )
         cls.merged_rows = KimiK3DeltaAttention._merge_kda_inproj_fp8(merged)
         # The loader's process_weights_after_loading pass, after post_load_weights.
