@@ -203,35 +203,38 @@ def benchmark_config(
                 block_shape=block_shape,
             )
 
+    device_module = torch.get_device_module()
+    graph_cls = torch.xpu.XPUGraph if _is_xpu else torch.cuda.CUDAGraph
+
     # JIT compilation & warmup
     run()
-    torch.cuda.synchronize()
+    device_module.synchronize()
 
-    # Capture 10 invocations with CUDA graph
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
+    # Capture 10 invocations with a device graph
+    graph = graph_cls()
+    with device_module.graph(graph):
         for _ in range(10):
             run()
-    torch.cuda.synchronize()
+    device_module.synchronize()
 
     # Warmup
     for _ in range(5):
         graph.replay()
-    torch.cuda.synchronize()
+    device_module.synchronize()
 
     # Flush L2 cache with 256 MB data
-    cache_flush = torch.empty(int(256e6 // 4), dtype=torch.int, device="cuda")
+    cache_flush = torch.empty(int(256e6 // 4), dtype=torch.int, device=get_device())
     cache_flush.zero_()
 
-    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
-    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
+    start_events = [device_module.Event(enable_timing=True) for _ in range(num_iters)]
+    end_events = [device_module.Event(enable_timing=True) for _ in range(num_iters)]
 
     for i in range(num_iters):
         prepare(i)
         start_events[i].record()
         graph.replay()
         end_events[i].record()
-    torch.cuda.synchronize()
+    device_module.synchronize()
 
     latencies: List[float] = []
     for i in range(num_iters):
@@ -250,8 +253,9 @@ class BenchmarkWorker:
         # Get the device ID to allocate tensors and kernels
         # on the respective GPU. Ray isolates each worker to a single visible
         # GPU via CUDA_VISIBLE_DEVICES, so the local ordinal is always 0. On
-        # ROCm using the global ray gpu id here raises "invalid device ordinal".
-        self.device_id = 0 if is_hip() else int(ray.get_gpu_ids()[0])
+        # ROCm and XPU using the global ray gpu id here raises an out-of-range
+        # device ordinal.
+        self.device_id = 0 if (is_hip() or _is_xpu) else int(ray.get_gpu_ids()[0])
         set_global_server_args_for_scheduler(server_args)
 
     def benchmark(
@@ -269,7 +273,7 @@ class BenchmarkWorker:
         per_channel_quant: bool,
         block_shape: List[int],
     ) -> Tuple[Dict[str, int], float]:
-        torch.cuda.manual_seed_all(0)
+        torch.get_device_module().manual_seed_all(0)
         dtype_str = get_config_dtype_str(
             dtype,
             use_int8_w8a16=use_int8_w8a16,

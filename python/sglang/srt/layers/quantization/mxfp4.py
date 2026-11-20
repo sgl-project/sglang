@@ -1040,6 +1040,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # fused_moe selects the preshuffle_on kernel family.
             layer.w13_weight.is_shuffled = True
             layer.w2_weight.is_shuffled = True
+            # K3 SiTU w13 is GU-interleaved; only gfx950's INTERLEAVE reads this layout
+            if is_gfx95_supported() and k3_situ and use_aiter_gu_interleave:
+                layer.situ_gate_up_interleaved = True
 
             layer.w13_weight_scale = torch.nn.Parameter(
                 shuffled_w13_scale, requires_grad=False
@@ -1085,9 +1088,30 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # uint8_t*, and decodes each nibble (sign bit included) as
             # float_e2m1_t -- a path selected by the explicit
             # use_mxfp4_w4a16=True that apply() passes, not by the weight dtype.
-            # Biases stay bf16 (the launcher promotes them to fp32, which is how
-            # the kernel accumulates them). Crucially there is no bf16 upcast of
-            # the weights -- the whole point of MXFP4 on XPU.
+            # Crucially there is no bf16 upcast of the weights -- the whole
+            # point of MXFP4 on XPU.
+            #
+            # The bias is the one operand whose dtype does not already match: the
+            # Xe2 grouped GEMMs accumulate it in fp32 and take an [E, N] fp32
+            # operand, while create_weights() allocates it bf16. Promote it here,
+            # once, instead of leaving it to the launcher -- which had no choice
+            # but to cast on every forward, and at gpt-oss-120b decode (tp=4,
+            # E=128, I_p=736) that pair of casts was ~21 us of device time per
+            # fused_experts call, 72 of the 73 elementwise-copy launches per
+            # decode step. The aiter and CPU-AMX branches above already do this;
+            # XPU was the outlier. bf16 -> fp32 is exactly representable, so the
+            # promotion is bit-identical to the per-forward cast it replaces.
+            #
+            # Cost is 2 extra bytes per bias element, all of it weights: at the
+            # shapes above, [128, 1472] + [128, 2880] = 557k elements, so 1.06
+            # MiB per layer and ~38 MiB per rank across 36 layers.
+            for bias_name in ("w13_weight_bias", "w2_weight_bias"):
+                bias = getattr(layer, bias_name, None)
+                if bias is not None and bias.dtype != torch.float32:
+                    # Rebind .data in place (as the aiter branch does) so the
+                    # Parameter keeps its weight_loader attrs: online updates
+                    # then copy_ into this fp32 storage and stay current.
+                    bias.data = bias.data.to(torch.float32)
             return
         else:
             w13_weight = _dequant_mxfp4_to_bf16(
@@ -1433,6 +1457,17 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             "cutlass_sm120",
             "trtllm_sm100",
         ):
+            if (
+                self._fi_kernel != "trtllm_sm100"
+                and moe_runner_config.activation == "situ"
+            ):
+                # The CUTLASS runners read gemm1_alpha/gemm1_clamp_limit as
+                # GPT-OSS SwiGLU scalars; SiTU needs flashinfer-ai/flashinfer#4209.
+                raise NotImplementedError(
+                    f"moe_runner_backend=flashinfer_mxfp4 ({self._fi_kernel}) does "
+                    "not implement the SiTU activation; use "
+                    "--moe-runner-backend marlin."
+                )
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
         else:
             raise NotImplementedError(
@@ -1721,6 +1756,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             x_padded = torch.nn.functional.pad(
                 x, (0, self.hidden_pad), mode="constant", value=0.0
             )
+        fused_moe_kwargs = None
+        if getattr(layer, "situ_gate_up_interleaved", False):
+            from aiter.ops.flydsl.moe_common import GateMode
+
+            fused_moe_kwargs = {"gate_mode": GateMode.INTERLEAVE.value}
         quant_info = AiterMoeQuantInfo(
             w13_weight=w13_weight,
             w2_weight=w2_weight,
@@ -1733,6 +1773,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             doweight_stage1=self.moe_runner_config.apply_router_weight_on_input,
             hidden_pad=self.hidden_pad,
             intermediate_pad=self.intermediate_pad,
+            fused_moe_kwargs=fused_moe_kwargs,
             # Applies swiglu clamp for GPT-OSS-style activations. K3 SiTU
             # uses gemm1_clamp_limit as linear_beta, which is forwarded by
             # the AITER runner and must not be treated as swiglu_limit.

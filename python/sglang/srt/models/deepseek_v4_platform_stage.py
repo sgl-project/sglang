@@ -39,13 +39,14 @@ from sglang.srt.models.deepseek_common.moe_transport import (
 from sglang.srt.models.deepseek_v2 import MoEOutput
 from sglang.srt.models.deepseek_v4_mhc import MHC_POST_MULT_VALUE, AttnOutput
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import is_gfx95_supported
+from sglang.srt.utils import is_gfx95_supported, is_gfx1250_supported
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.models import deepseek_v2
 
 _is_gfx95_supported = is_gfx95_supported()
+_is_gfx1250_supported = is_gfx1250_supported()
 
 
 def _prepare_ffn_input(layer, hidden_states, residual, post, comb, forward_batch):
@@ -269,7 +270,7 @@ class NonCudaDecoderMixin:
                 self.hc_sinkhorn_iters,
                 input_norm_weight,
                 self.input_layernorm.variance_epsilon,
-                fn_transpose=False,
+                fn_transpose=_is_gfx1250_supported,
             )
         if fused is not None:
             residual, hidden_states, post, comb, norm_fused = fused
@@ -569,11 +570,12 @@ class NonCudaDSparkMixin(NonCudaDecoderMixin):
 
         residual = hidden_states
         mhc.fork_stats_stream(stats_stream)
-        x = mhc.combine(self.attn_hc, mhc.HcState(hidden_states, prev_pre))
+        attn_state = mhc.HcState(hidden_states, prev_pre)
+        x = mhc.combine(self.attn_hc, attn_state)
         with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
             x = self.self_attn(positions, x, forward_batch)
-        attn_pre, attn_post, attn_comb = mhc.mix_stats(
-            self.attn_hc, hidden_states, stats_stream
+        attn_pre, attn_post, attn_comb = mhc.mix_stats_from_state(
+            self.attn_hc, hidden_states, attn_state, stats_stream
         )
         if stats_stream is not None:
             torch.cuda.current_stream().wait_stream(stats_stream)
@@ -581,10 +583,11 @@ class NonCudaDSparkMixin(NonCudaDecoderMixin):
 
         residual = hidden_states
         mhc.fork_stats_stream(stats_stream)
-        x = mhc.combine(self.ffn_hc, mhc.HcState(hidden_states, attn_pre))
+        ffn_state = mhc.HcState(hidden_states, attn_pre)
+        x = mhc.combine(self.ffn_hc, ffn_state)
         x = self._run_ffn(x, forward_batch)
-        ffn_pre, ffn_post, ffn_comb = mhc.mix_stats(
-            self.ffn_hc, hidden_states, stats_stream
+        ffn_pre, ffn_post, ffn_comb = mhc.mix_stats_from_state(
+            self.ffn_hc, hidden_states, ffn_state, stats_stream
         )
         if stats_stream is not None:
             torch.cuda.current_stream().wait_stream(stats_stream)

@@ -7,7 +7,9 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.utils.device import is_hip
+from sglang.srt.utils.device import is_gfx942_supported, is_hip, is_npu
+
+_is_npu = is_npu()
 
 try:
     import flashinfer.comm  # noqa: F401
@@ -114,6 +116,26 @@ _TILELANG_DTYPES = {
     torch.bfloat16: "bfloat16",
     torch.float8_e4m3fn: "float8_e4m3fn",
 }
+
+
+# gfx942 (MI300X/MI325X) has 64 KiB of LDS per workgroup; gfx950 has 160 KiB.
+_GFX942_LDS_BYTES = 64 * 1024
+
+
+def _prefill_num_stages(
+    block_q: int, heads: int, block_n: int, head_dim: int, dtype: torch.dtype
+) -> int:
+    """Pipeline depth for the prefill kernels. The default 3 stages need
+    (block_q * heads + 3 * block_n) * head_dim elements of shared memory, which
+    overflows gfx942's LDS for bf16 at head_dim 128; use the deepest that fits."""
+    if not is_gfx942_supported():
+        return 3
+    itemsize = torch.empty((), dtype=dtype).element_size()
+    for stages in (3, 2, 1):
+        lds_bytes = (block_q * heads + stages * block_n) * head_dim * itemsize
+        if lds_bytes <= _GFX942_LDS_BYTES:
+            return stages
+    return 1
 
 
 def _scoring_dtype(q: torch.Tensor, k: torch.Tensor) -> torch.dtype:
@@ -422,6 +444,7 @@ def tilelang_qsa_mqa_prefill(
         heads=heads,
         head_dim=head_dim,
         block_q=block_q,
+        num_stages=_prefill_num_stages(block_q, heads, 64, head_dim, scoring_dtype),
         dtype=_TILELANG_DTYPES[scoring_dtype],
     )(
         q_padded.reshape(-1, head_dim),
@@ -522,6 +545,9 @@ def tilelang_qsa_mqa_prefill_relative(
         block_q=block_q,
         key_splits=_prefill_key_splits(
             padded_rows // block_q, width, block_n, q.device
+        ),
+        num_stages=_prefill_num_stages(
+            block_q, heads, block_n, head_dim, scoring_dtype
         ),
         dtype=_TILELANG_DTYPES[scoring_dtype],
     )(
@@ -636,6 +662,12 @@ def qsa_mqa_prefill(
     row_ends: torch.Tensor,
     score_scale: Optional[float] = None,
 ) -> torch.Tensor:
+    if _is_npu:
+        if score_scale is not None:
+            raise ValueError("Custom MQA scale is outside the model contract")
+        from sgl_kernel_npu.operators.indexer import qsa_mqa_packed
+
+        return qsa_mqa_packed(q, k, row_starts, row_ends)
     if q.is_cuda and HAS_TILELANG:
         return tilelang_qsa_mqa_prefill(q, k, row_starts, row_ends, score_scale)
     return torch_qsa_mqa_prefill(q, k, row_starts, row_ends, score_scale)
@@ -669,6 +701,12 @@ def qsa_mqa_decode(
     *,
     min_scored_len: int = 0,
 ) -> torch.Tensor:
+    if _is_npu:
+        if score_scale is not None:
+            raise ValueError("Custom MQA scale is outside the model contract")
+        from sgl_kernel_npu.operators.indexer import qsa_mqa_paged
+
+        return qsa_mqa_paged(q, k_cache, page_table, context_lens, max_model_len)
     if q.is_cuda and HAS_TILELANG:
         return tilelang_qsa_mqa_decode(
             q,

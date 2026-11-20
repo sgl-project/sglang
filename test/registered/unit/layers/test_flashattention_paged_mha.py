@@ -192,6 +192,33 @@ class TestFlashAttentionPagedMHA(unittest.TestCase):
             self.assertTrue(torch.equal(k_descale, torch.full((2, 1), 2.0)))
             self.assertTrue(torch.equal(v_descale, torch.full((2, 1), 4.0)))
 
+    def test_an_auto_draft_over_an_fp8_target_passes_no_descales(self):
+        """BUG REGRESSION. A draft whose own `auto` KV cache dtype resolves to
+        its compute dtype under an FP8 target holds a BF16 cache, and its layers
+        may still carry KV scales (FP8 weight quantization installs them). It
+        was labelled with the target's FP8 flag, so the backend passed descales
+        for BF16 inputs, which FA4 rejects."""
+        backend = _backend()
+        backend.kv_cache_dtype = torch.bfloat16
+        backend.kv_cache_dtype_str = "auto"
+        layer = SimpleNamespace(
+            head_dim=128, k_scale=torch.tensor(1.0), v_scale=torch.tensor(1.0)
+        )
+        q = torch.ones(2, 128, dtype=torch.bfloat16)
+        q_out, _, _, k_descale, v_descale = backend.prepare_paged_mha_query(
+            q,
+            None,
+            None,
+            layer,
+            logical_batch_size=2,
+            kv_head_num=1,
+            is_prefill=False,
+            ver=3,
+        )
+        self.assertIs(q_out, q)
+        self.assertIsNone(k_descale)
+        self.assertIsNone(v_descale)
+
     def test_kvcache_descales_follow_each_calls_batch_layout(self):
         # topk > 1 target verify: the cascade's suffix call runs every draft
         # token as its own sequence (B=1, 12 draft tokens -> 12 sequences), while
