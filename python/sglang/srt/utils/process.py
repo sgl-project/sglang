@@ -38,7 +38,10 @@ __all__ = [
     "delete_directory",
     "set_gpu_proc_affinity",
     "kill_itself_when_parent_died",
+    "disable_transparent_hugepages",
 ]
+
+_PR_SET_THP_DISABLE = 41
 
 
 def _still_holding_resources(procs):
@@ -238,3 +241,26 @@ def kill_itself_when_parent_died():
         logger.warning(
             "kill_itself_when_parent_died is only supported on linux and macOS."
         )
+
+
+def disable_transparent_hugepages() -> bool:
+    if sys.platform != "linux":
+        logger.warning("Transparent huge pages can only be disabled on Linux.")
+        return False
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        args = [ctypes.c_ulong(value) for value in (1, 0, 0, 0)]
+        if libc.prctl(_PR_SET_THP_DISABLE, *args) != 0:
+            logger.warning(
+                "prctl(PR_SET_THP_DISABLE) failed: %s",
+                os.strerror(ctypes.get_errno()),
+            )
+            return False
+    except (OSError, AttributeError) as e:
+        logger.warning(
+            "Cannot disable transparent huge pages: prctl(PR_SET_THP_DISABLE) is "
+            "unavailable in libc (%s). THP stays enabled for this process.",
+            e,
+        )
+        return False
+    return True
