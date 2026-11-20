@@ -177,8 +177,8 @@ class DFlashDraftInputV2(SpecInput):
         self.max_top_k = max(max_top_k, 1)
         self.uniform_top_k_value = uniform_top_k_value if uniform_top_k else None
 
-        # Only a growing reservation writes req_to_token. While the current
-        # pages suffice, subsequent forwards can use their existing mapping.
+        # Only a growing reservation writes req_to_token.
+        # While the current pages suffice, the next forward uses the existing mapping.
         if num_needed_tokens:
             assert self._prepare_cur_kv_lens_cpu_buf is not None
             assert self._prepare_cur_kv_lens_gpu_buf is not None
