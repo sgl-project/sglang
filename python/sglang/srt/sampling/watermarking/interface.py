@@ -56,6 +56,15 @@ def merge_watermark_rows(
     return a.concat(b, a_len, b_len)
 
 
+def num_prefill_rows(batch: ScheduleBatch) -> int:
+    """The leading rows of an extend batch that prefill; the rest decode."""
+    if batch.forward_mode.is_mixed():
+        return len(batch.reqs) - len(batch.mix_running_indices_cpu)
+    if batch.decoding_reqs is not None:
+        return 0
+    return len(batch.reqs)
+
+
 @dataclass(frozen=True)
 class SampleStep:
     # What the stock sampler must sample with.
@@ -137,6 +146,16 @@ class WatermarkEngine(Protocol):
         accept_tokens: Tensor,
         accept_lens: Tensor,
     ) -> None: ...
+
+
+# Provider ABI v2 (``VerifySamplingView.watermark_*``) fields of a batch without
+# watermark rows.
+NO_WATERMARK_VIEW_FIELDS: dict[str, Any] = {
+    "watermark_keys": None,
+    "watermark_context_windows": None,
+    "watermark_enabled": None,
+    "has_watermark_candidates": False,
+}
 
 
 class WatermarkAdapter(Protocol):

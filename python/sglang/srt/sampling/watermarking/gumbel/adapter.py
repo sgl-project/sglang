@@ -13,7 +13,7 @@ from ..config import (
     WatermarkRequestConfig,
     parse_watermark_key,
 )
-from ..interface import SampleStep
+from ..interface import SampleStep, num_prefill_rows
 from .detector import hash_context
 from .state import WatermarkState
 
@@ -246,12 +246,7 @@ class GumbelEngine:
         if not batch.forward_mode.is_extend_without_speculative():
             return None
 
-        num_prefill_reqs = len(batch.reqs)
-        if batch.forward_mode.is_mixed():
-            num_prefill_reqs -= len(batch.mix_running_indices_cpu)
-        elif batch.decoding_reqs is not None:
-            num_prefill_reqs = 0
-
+        num_prefill_reqs = num_prefill_rows(batch)
         if num_prefill_reqs == 0:
             return None
 

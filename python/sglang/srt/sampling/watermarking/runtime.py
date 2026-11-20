@@ -13,6 +13,7 @@ import torch
 
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.sampling.watermarking.gumbel import adapter as gumbel_adapter
+from sglang.srt.sampling.watermarking.interface import NO_WATERMARK_VIEW_FIELDS
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -24,15 +25,6 @@ if TYPE_CHECKING:
     )
 
 _ADAPTERS: dict[str, WatermarkAdapter] = {"gumbel": gumbel_adapter}
-
-# Provider ABI v2 (`VerifySamplingView.watermark_*`) fields of a batch without
-# watermark rows.
-_NO_WATERMARK_VIEW_FIELDS: dict[str, Any] = {
-    "watermark_keys": None,
-    "watermark_context_windows": None,
-    "watermark_enabled": None,
-    "has_watermark_candidates": False,
-}
 
 
 def make_watermark_engine(
@@ -81,7 +73,7 @@ def check_watermark_algorithm_args(cfg: Any) -> None:
 def watermark_view_fields(rows: Optional[WatermarkRows]) -> dict[str, Any]:
     """The provider ABI v2 watermark fields of ``VerifySamplingView`` for these rows."""
     if rows is None:
-        return _NO_WATERMARK_VIEW_FIELDS
+        return NO_WATERMARK_VIEW_FIELDS
     return _ADAPTERS[get_exec().features.watermark_algorithm].watermark_view_fields(
         rows
     )
