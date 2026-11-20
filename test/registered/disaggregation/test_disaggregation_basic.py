@@ -23,8 +23,8 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 )
 from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
-    ADMIN_API_KEY_FOR_TEST,
     ADMIN_HEADERS_FOR_TEST,
+    ADMIN_LAUNCH_ARGS_FOR_TEST,
     DEFAULT_DRAFT_MODEL_EAGLE3,
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TARGET_MODEL_EAGLE3,
@@ -40,8 +40,8 @@ class TestDisaggregationAccuracy(PauseResumeInPlaceMixin, PDDisaggregationServer
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         cls.pause_generate_url = cls.lb_url
         cls.pause_target_urls = [cls.prefill_url, cls.decode_url]
-        cls.extra_prefill_args = ["--admin-api-key", ADMIN_API_KEY_FOR_TEST]
-        cls.extra_decode_args = ["--admin-api-key", ADMIN_API_KEY_FOR_TEST]
+        cls.extra_prefill_args = [*ADMIN_LAUNCH_ARGS_FOR_TEST]
+        cls.extra_decode_args = [*ADMIN_LAUNCH_ARGS_FOR_TEST]
         cls.launch_all()
 
     def test_gsm8k(self):
@@ -441,7 +441,7 @@ class TestDisaggregationPauseResumeDecodeRetract(PDDisaggregationServerBase):
     def setUpClass(cls):
         super().setUpClass()
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
-        cls.extra_decode_args = ["--admin-api-key", ADMIN_API_KEY_FOR_TEST]
+        cls.extra_decode_args = [*ADMIN_LAUNCH_ARGS_FOR_TEST]
         cls.launch_all()
 
     def test_retract_pause_decode_running_batch(self):
@@ -619,8 +619,7 @@ class TestDisaggregationPauseResumePrefillLeak(PDDisaggregationServerBase):
             "--max-running-requests",
             str(cls.MAX_RUNNING),
             "--enable-metrics",
-            "--admin-api-key",
-            ADMIN_API_KEY_FOR_TEST,
+            *ADMIN_LAUNCH_ARGS_FOR_TEST,
         ]
         cls.launch_all()
 

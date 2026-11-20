@@ -24,7 +24,7 @@ class RaggedVerifyWindow(msgspec.Struct, frozen=True):
     verify_cache_loc: torch.Tensor
     verify_ids: torch.Tensor
     # Each packed lane's flat position in the `[bs, verify_num_draft_tokens]`
-    # verify window, -1 on a padded lane; None when the lanes are that window.
+    # verify window, -1 on a padded lane.
     window_index: Optional[torch.Tensor]
 
 

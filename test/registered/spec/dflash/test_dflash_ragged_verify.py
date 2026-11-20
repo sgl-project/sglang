@@ -17,9 +17,7 @@ register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 DEVICE = torch.device("cuda")
 
 
-def _selector_accept(
-    candidates, target_tokens, cutoff_verify_lens, *, block_verification=False
-):
+def _selector_accept(candidates, target_tokens, cutoff_verify_lens):
     """Selector sampling acceptance with a one-hot draft q on each drawn token
     and a target that puts all of its mass on target_tokens, so every
     acceptance and bonus is determined."""
@@ -35,8 +33,9 @@ def _selector_accept(
     worker = types.SimpleNamespace(
         _selector_sample=(candidate_ids, q_rows),
         _draft_probs_buf=None,
-        _block_verification=block_verification,
+        _block_verification=False,
         _tp_sync=types.SimpleNamespace(sync=lambda site, tensor: tensor),
+        _megakernel_bcast=None,
         block_size=block,
     )
     worker._selector_sampling_accept = types.MethodType(
@@ -60,11 +59,6 @@ def _selector_accept(
 
 class TestDFlashRaggedVerify(CustomTestCase):
     def test_selector_sampling_accept_stops_at_planned_verify_len(self):
-        for block in (False, True):
-            with self.subTest(block_verification=block):
-                self._check_selector_cutoff(block=block)
-
-    def _check_selector_cutoff(self, *, block):
         # Rows 0 and 2 draft the target's tokens; row 1 misses its second draft.
         candidates = torch.tensor(
             [[9, 1, 2, 3, 4], [9, 5, 6, 7, 8], [9, 10, 11, 12, 13]], device=DEVICE
@@ -74,9 +68,7 @@ class TestDFlashRaggedVerify(CustomTestCase):
             device=DEVICE,
         )
 
-        full = _selector_accept(
-            candidates, target_tokens, None, block_verification=block
-        )
+        full = _selector_accept(candidates, target_tokens, None)
         self.assertEqual(full[0].tolist(), [4, 1, 4])
         self.assertEqual(full[2].tolist(), [20, 21, 23])
 
@@ -84,7 +76,6 @@ class TestDFlashRaggedVerify(CustomTestCase):
             candidates,
             target_tokens,
             torch.tensor([3, 5, 1], dtype=torch.int32, device=DEVICE),
-            block_verification=block,
         )
         # Each request accepts at most verify_len - 1 drafts and takes its bonus
         # from its last verified row; the cutoff trims the rest.

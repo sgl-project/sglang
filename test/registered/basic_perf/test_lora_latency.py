@@ -4,20 +4,19 @@ import asyncio
 import itertools
 import unittest
 
-import requests
-
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.perf_bench_kit import at_most, check_perf
 from sglang.test.test_utils import (
     ADMIN_API_KEY_FOR_TEST,
-    ADMIN_HEADERS_FOR_TEST,
+    ADMIN_LAUNCH_ARGS_FOR_TEST,
     DEFAULT_MODEL_NAME_FOR_TEST,
     CustomTestCase,
+    admin_post,
     run_bench_serving,
 )
 
 register_cuda_ci(est_time=270, stage="nightly", runner_config="1-gpu-large")
-register_amd_ci(est_time=430, suite="nightly-amd-1-gpu", nightly=True)
+register_amd_ci(est_time=430, suite="nightly-test-1-gpu-amd", nightly=True)
 
 
 class TestLoRALatency(CustomTestCase):
@@ -77,10 +76,9 @@ class TestLoRALatency(CustomTestCase):
             while not stop_event.is_set():
                 lora_path = next(path_cycler)
                 response = await asyncio.to_thread(
-                    requests.post,
+                    admin_post,
                     load_url,
                     json={"lora_name": lora_path, "lora_path": lora_path},
-                    headers=ADMIN_HEADERS_FOR_TEST,
                 )
                 self.assertTrue(
                     response.ok, f"Failed to load LoRA adapter: {response.text}"
@@ -93,10 +91,9 @@ class TestLoRALatency(CustomTestCase):
                 await asyncio.sleep(1)
 
                 response = await asyncio.to_thread(
-                    requests.post,
+                    admin_post,
                     unload_url,
                     json={"lora_name": lora_path},
-                    headers=ADMIN_HEADERS_FOR_TEST,
                 )
                 self.assertTrue(
                     response.ok, f"Failed to unload LoRA adapter: {response.text}"
@@ -123,8 +120,7 @@ class TestLoRALatency(CustomTestCase):
                 "nvidia/llama-3.1-nemoguard-8b-topic-control",
                 "--max-lora-rank",
                 "256",
-                "--admin-api-key",
-                ADMIN_API_KEY_FOR_TEST,
+                *ADMIN_LAUNCH_ARGS_FOR_TEST,
             ],
             dataset_name="random",
             random_input_len=256,

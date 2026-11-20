@@ -1339,6 +1339,16 @@ class SchedulerPPMixin:
                 new_seq_lens=batch.seq_lens,
             )
             batch.spec_info = next_draft_input
+        elif batch.spec_algorithm.is_dflash():
+            from sglang.srt.speculative.draft_worker_common import (
+                make_draft_input_v2,
+            )
+
+            next_draft_input = make_draft_input_v2(
+                bonus_tokens=next_token_ids,
+                new_seq_lens=batch.seq_lens,
+            )
+            batch.spec_info = next_draft_input
 
         if self._pp_spec_relay:
             # Gated single-instance PP+spec: the sampled first token roots

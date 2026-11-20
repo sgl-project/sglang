@@ -8,9 +8,7 @@ Tests verify that:
 3. After a simulated watch-connection interruption (router restarted), the
    registry converges back to the correct worker set.
 
-Note: sgl-router does not currently expose a Prometheus /metrics endpoint,
-so the SMG-style metric assertions are not used here. Disconnect/reconnect
-coverage is provided by test_lifecycle.TestRouterRestart.
+Disconnect/reconnect coverage is provided by test_lifecycle.TestRouterRestart.
 """
 
 from __future__ import annotations

@@ -36,7 +36,9 @@ _SPLIT_ACCEPT = (
 _is_npu = is_npu()
 
 if _is_npu:
-    from sgl_kernel_npu.sample import chain_speculative_sampling_triton
+    from sgl_kernel_npu.operators.speculative import (
+        chain_speculative_sampling as chain_speculative_sampling_triton,
+    )
 else:
     from sglang.kernels.ops.speculative.reject_sampling import (
         chain_speculative_sampling_triton,
@@ -772,7 +774,7 @@ class AcceptGreedy:
         cls,
         *,
         candidates: torch.Tensor,
-        target_logits: Optional[torch.Tensor],
+        target_logits: torch.Tensor,
         verify_num_draft_tokens: int,
         cutoff_verify_lens: Optional[torch.Tensor] = None,
         target_predict: Optional[torch.Tensor] = None,
@@ -790,7 +792,7 @@ class AcceptGreedy:
         cls,
         *,
         candidates: torch.Tensor,
-        target_logits: Optional[torch.Tensor],
+        target_logits: torch.Tensor,
         verify_num_draft_tokens: int,
         cutoff_verify_lens: Optional[torch.Tensor] = None,
         target_predict: Optional[torch.Tensor] = None,
@@ -807,7 +809,7 @@ class AcceptGreedy:
 def accept_greedy(
     *,
     candidates: torch.Tensor,
-    target_logits: Optional[torch.Tensor],
+    target_logits: torch.Tensor,
     verify_num_draft_tokens: int,
     cutoff_verify_lens: Optional[torch.Tensor] = None,
     target_predict: Optional[torch.Tensor] = None,
@@ -861,7 +863,7 @@ def gather_row_bonus_triton(*, table: torch.Tensor, idx: torch.Tensor) -> torch.
 def accept_greedy_triton(
     *,
     candidates: torch.Tensor,
-    target_logits: Optional[torch.Tensor],
+    target_logits: torch.Tensor,
     verify_num_draft_tokens: int,
     cutoff_verify_lens: Optional[torch.Tensor] = None,
     target_predict: Optional[torch.Tensor] = None,

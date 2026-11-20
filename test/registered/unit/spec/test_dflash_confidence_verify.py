@@ -2,6 +2,7 @@
 confidence, acceptance stops at the planned verify length, and the confidence
 feature reads the selector row each draft token came from."""
 
+import sys
 import types
 
 import pytest
@@ -29,7 +30,7 @@ def _greedy_accept(candidates, target_predict, cutoff_verify_lens):
         next_token_logits=None,
         sampling_info=None,
         draft_input=None,
-        prefix_lens=torch.arange(candidates.shape[0]) * 10 + 10,
+        prefix_lens=torch.tensor([10, 20]),
         bs=candidates.shape[0],
         target_predict=target_predict,
         cutoff_verify_lens=cutoff_verify_lens,
@@ -57,24 +58,10 @@ def test_greedy_accept_stops_at_planned_verify_len():
     assert out_tokens[:, :3].tolist() == [[1, 2, 3], [7, 8, 12]]
 
 
-def test_greedy_accept_with_full_verify_len_matches_static():
-    torch.manual_seed(0)
-    candidates = torch.randint(0, 4, (16, 8))
-    target_predict = torch.randint(0, 4, (16, 8))
-    static = _greedy_accept(candidates, target_predict, None)
-    capped = _greedy_accept(
-        candidates, target_predict, torch.full((16,), 8, dtype=torch.int32)
-    )
-    for got, ref in zip(capped[:4], static[:4]):
-        torch.testing.assert_close(got.long(), ref.long())
-    assert capped[5].tolist() == [0] * 16
-
-
 class _RecordingEstimator:
-    def predict(self, *, logits, temperatures):
-        scores = logits
-        self.scores, self.temperatures = scores, temperatures
-        return scores.amax(dim=-1), scores.amax(dim=-1).sigmoid()
+    def predict(self, *, logits, temperatures, features_out, predictions_out):
+        self.scores, self.temperatures = logits, temperatures
+        return logits.amax(dim=-1), logits.amax(dim=-1).sigmoid()
 
 
 def test_feature_scores_the_selector_row_each_token_was_drawn_from():
@@ -133,7 +120,7 @@ def _patch_planner_context(monkeypatch):
     monkeypatch.setattr(dspark_planner, "is_dp_attention_enabled", lambda: False)
 
 
-def _planner(*, external_confidence):
+def _planner(*, online_confidence):
     return dspark_planner.DSparkVerifyPlanner(
         draft_model=types.SimpleNamespace(),
         gamma=3,
@@ -142,16 +129,16 @@ def _planner(*, external_confidence):
         tp_rank=1,
         verify_num_draft_tokens=4,
         tp_sync=types.SimpleNamespace(sync=lambda site, tensor: tensor),
-        online_confidence=external_confidence,
+        online_confidence=online_confidence,
     )
 
 
-def test_planner_schedules_external_confidence_without_a_head(monkeypatch):
+def test_planner_schedules_online_confidence_without_a_head(monkeypatch):
     _patch_planner_context(monkeypatch)
     with envs.SGLANG_RAGGED_VERIFY_MODE.override("cap-accept"):
         with pytest.raises(ValueError, match="confidence head"):
-            _planner(external_confidence=False)
-        planner = _planner(external_confidence=True)
+            _planner(online_confidence=False)
+        planner = _planner(online_confidence=True)
         assert planner.schedules_verify_budget and planner.carries_confidence
 
         confidence = torch.tensor(
@@ -184,9 +171,8 @@ def test_compact_plan_on_the_full_block_graph_verifies_every_draft(monkeypatch):
     runner = types.SimpleNamespace(
         ragged_verify_mode=True, capture_num_tokens=[4, 8, 12, 16], max_bs=4
     )
-
-    def make_planner(*, verify_every_draft_on_full_tier):
-        return dspark_planner.DSparkVerifyPlanner(
+    with envs.SGLANG_RAGGED_VERIFY_MODE.override("compact"):
+        planner = dspark_planner.DSparkVerifyPlanner(
             draft_model=types.SimpleNamespace(),
             gamma=3,
             model_runner=types.SimpleNamespace(decode_cuda_graph_runner=runner),
@@ -195,45 +181,35 @@ def test_compact_plan_on_the_full_block_graph_verifies_every_draft(monkeypatch):
             verify_num_draft_tokens=4,
             tp_sync=types.SimpleNamespace(sync=lambda site, tensor: tensor),
             online_confidence=True,
-            verify_every_draft_on_full_tier=verify_every_draft_on_full_tier,
         )
 
-    def plan(planner, bs, budget):
-        return planner.schedule_layout(
-            req_pool_indices=torch.arange(1, bs + 1),
-            prefix_lens=torch.full((bs,), 5),
-            device=torch.device("cpu"),
-            confidence=torch.tensor([[0.9, 0.5, 0.1]] * bs),
-            budget=budget,
-        )
-
-    with envs.SGLANG_RAGGED_VERIFY_MODE.override("compact"):
-        planner = make_planner(verify_every_draft_on_full_tier=True)
+        def plan(bs, budget):
+            return planner.schedule_layout(
+                req_pool_indices=torch.arange(1, bs + 1),
+                prefix_lens=torch.full((bs,), 5),
+                device=torch.device("cpu"),
+                confidence=torch.tensor([[0.9, 0.5, 0.1]] * bs),
+                budget=budget,
+            )
 
         # Any plan of a single request replays the 4-token graph of its block.
         assert not planner.plans_verify_budget(num_reqs=1)
-        single = plan(planner, 1, 0)
-        assert single.is_full_block(4) and plan(planner, 1, 2) is single
+        single = plan(1, 0)
+        assert single.is_full_block(4) and plan(1, 2) is single
 
         # Three requests: 9 planned tokens replay the 12-token graph of the
         # full blocks, so every draft is verified; 7 fit the 8-token graph.
         assert planner.plans_verify_budget(num_reqs=3)
-        full = plan(planner, 3, 6)
+        full = plan(3, 6)
         assert full.is_full_block(4) and full.verify_lens.tolist() == [4, 4, 4]
-        trimmed = plan(planner, 3, 4)
+        trimmed = plan(3, 4)
         assert not trimmed.is_full_block(4)
         assert trimmed.graph_num_tokens == 8 and int(trimmed.verify_lens.sum()) == 7
 
-        # Off (DSpark's default), the same plans keep their budget-exact lengths.
-        exact = make_planner(verify_every_draft_on_full_tier=False)
-        assert exact.plans_verify_budget(num_reqs=1)
-        padded = plan(exact, 3, 6)
-        assert padded.graph_num_tokens == 12 and int(padded.verify_lens.sum()) == 9
 
-
-def test_observe_counts_the_drafts_the_target_verified():
+def test_observe_grades_verified_drafts_and_counts_uncapped_correct_drafts():
     class Recorder:
-        def observe(self, *, features, num_graded_drafts, num_correct_drafts):
+        def observe(self, *, features, num_correct_drafts, num_graded_drafts):
             self.calls.append(
                 (features, num_graded_drafts.tolist(), num_correct_drafts.tolist())
             )
@@ -244,108 +220,24 @@ def test_observe_counts_the_drafts_the_target_verified():
     worker = types.SimpleNamespace(
         _acceptance_estimator=estimator, _draft_feature=feature, block_size=5
     )
-    num_correct_drafts = torch.tensor([2, 4, 0], dtype=torch.int32)
+    correct_len = torch.tensor([2, 4, 0], dtype=torch.int32)
+    cap_trim_lens = torch.tensor([1, 0, 0], dtype=torch.int32)
     worker_mod.DFlashWorkerV2._observe_acceptance(
-        worker, num_correct_drafts=num_correct_drafts, layout=None
+        worker, correct_len=correct_len, cap_trim_lens=cap_trim_lens, layout=None
     )
     layout = types.SimpleNamespace(
         verify_lens=torch.tensor([3, 5, 1], dtype=torch.int32)
     )
     worker_mod.DFlashWorkerV2._observe_acceptance(
-        worker, num_correct_drafts=num_correct_drafts, layout=layout
+        worker, correct_len=correct_len, cap_trim_lens=None, layout=layout
     )
-    # Without a layout every draft was verified; with one, verify_lens - 1.
+    # cap-accept verifies the whole block, so the drafts the cutoff trimmed are
+    # still correct; compact grades only the verify_lens - 1 drafts it ran.
     assert [call[1:] for call in estimator.calls] == [
-        ([4, 4, 4], [2, 4, 0]),
+        ([4, 4, 4], [3, 4, 0]),
         ([2, 4, 0], [2, 4, 0]),
     ]
     assert all(call[0] is feature for call in estimator.calls)
-
-
-@pytest.mark.parametrize("needs_cpu_lengths", [False, True])
-def test_ragged_verify_reads_lengths_on_host_only_when_required(needs_cpu_lengths):
-    from sglang.srt.speculative.dspark_components.dspark_verify import (
-        TargetVerifyExecutor,
-    )
-
-    class Lengths:
-        def cpu(self):
-            if not needs_cpu_lengths:
-                raise AssertionError("device-driven verification synchronized lengths")
-            return torch.tensor([1, 6, 3], dtype=torch.int32)
-
-    batch = types.SimpleNamespace(
-        seq_lens_cpu=torch.tensor([10, 20, 30], dtype=torch.int32),
-        seq_lens_sum=60,
-    )
-    layout = types.SimpleNamespace(verify_lens_cpu=None, verify_lens=Lengths())
-    window = types.SimpleNamespace(
-        verify_ids=torch.zeros(10, dtype=torch.int64),
-        positions=torch.zeros(10, dtype=torch.int64),
-        verify_cache_loc=torch.zeros(10, dtype=torch.int64),
-        window_index=None,
-    )
-    executor = types.SimpleNamespace(
-        verify_num_draft_tokens=6,
-        target_worker=types.SimpleNamespace(
-            model_runner=types.SimpleNamespace(
-                attn_backend=types.SimpleNamespace(needs_cpu_seq_lens=needs_cpu_lengths)
-            )
-        ),
-    )
-
-    def forward(**kwargs):
-        expected = [11, 26, 33] if needs_cpu_lengths else [16, 26, 36]
-        assert batch.seq_lens_cpu.tolist() == expected
-        assert batch.seq_lens_sum == sum(expected)
-        assert kwargs["seq_lens_cpu_backup"].tolist() == [10, 20, 30]
-        assert kwargs["seq_lens_sum_backup"] == 60
-
-    executor._forward_prepared_verify = forward
-    TargetVerifyExecutor._run_ragged(
-        executor,
-        batch=batch,
-        layout=layout,
-        ragged_window=window,
-        sampling_info=None,
-        iteration_ids=None,
-    )
-
-
-def test_compact_forward_preserves_target_kv_version_record(monkeypatch):
-    from sglang.srt.speculative.dspark_components.dspark_verify import (
-        TargetVerifyExecutor,
-    )
-
-    version_record = object()
-    target_result = types.SimpleNamespace(
-        logits_output=object(),
-        can_run_cuda_graph=True,
-        kv_weight_version_record=version_record,
-    )
-    executor = types.SimpleNamespace(
-        _target_is_dsv41=False,
-        target_worker=types.SimpleNamespace(
-            forward_batch_generation=lambda **_: target_result
-        ),
-    )
-    verify_input = types.SimpleNamespace(
-        live_seq_lens_cpu=None,
-        prepare_for_verify=lambda *args: (object(), True),
-    )
-    batch = types.SimpleNamespace(seq_lens_cpu=None, seq_lens_sum=0)
-    saved_lengths = torch.tensor([10, 20])
-    result = TargetVerifyExecutor._forward_prepared_verify(
-        executor,
-        batch=batch,
-        verify_input=verify_input,
-        seq_lens_cpu_backup=saved_lengths,
-        seq_lens_sum_backup=30,
-    )
-    assert result.kv_weight_version_record is version_record
-    assert result.logits_output is target_result.logits_output
-    assert result.can_run_cuda_graph
-    assert batch.seq_lens_cpu is saved_lengths and batch.seq_lens_sum == 30
 
 
 def test_ragged_verify_gates_open_for_dflash_outside_static(monkeypatch):
@@ -369,24 +261,12 @@ def test_ragged_verify_gates_open_for_dflash_outside_static(monkeypatch):
     assert not needs_relay("EAGLE", "compact")
 
 
-def test_confidence_relay_unpublished_slots_have_deterministic_fallback(monkeypatch):
-    from sglang.srt.managers import overlap_utils
-
-    monkeypatch.setattr(overlap_utils, "_is_cuda", False)
-    relay = overlap_utils.ConfidenceRelay(
-        device=torch.device("cpu"), req_pool_size=5, pool=None
-    )
-    relay.scatter(torch.tensor([2]), torch.tensor([[0.7, 0.3]]))
-    torch.testing.assert_close(relay.confidence_buf[[0, 1, 3, 4]], torch.ones(4, 2))
-    torch.testing.assert_close(relay.confidence_buf[2], torch.tensor([0.7, 0.3]))
-
-
 def test_forced_budget_frac_trims_a_compact_plan_without_a_table(monkeypatch):
     from sglang.srt.managers.scheduler_components import internal_state
 
     _patch_planner_context(monkeypatch)
     with envs.SGLANG_RAGGED_VERIFY_MODE.override("compact"):
-        planner = _planner(external_confidence=True)
+        planner = _planner(online_confidence=True)
     # Compact without a profiled table verifies every draft, unless the
     # profiler pins a budget.
     assert planner.is_verify_all
@@ -416,24 +296,6 @@ def test_forced_budget_frac_trims_a_compact_plan_without_a_table(monkeypatch):
             validate(controller, "dspark_force_budget_frac", 0.5)
 
 
-def test_internal_state_reads_no_records_from_a_worker_that_keeps_none():
-    """A DFLASH-family worker with only the BaseSpecWorker interface, as an
-    out-of-tree worker may have, must not break the internal-state readback."""
-    from sglang.srt.managers.scheduler_components import internal_state
-    from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
-
-    controller = types.SimpleNamespace(
-        scheduler=types.SimpleNamespace(
-            spec_algorithm=worker_mod.SpeculativeAlgorithm.DFLASH,
-            draft_worker=BaseSpecWorker(),
-        ),
-        _average_accept_length=lambda: None,
-    )
-    state = {}
-    internal_state.SchedulerInternalStateController._add_speculative(controller, state)
-    assert state == {}
-
-
 def test_compact_is_refused_on_a_target_backend_without_ragged_verify(monkeypatch):
     import contextlib
 
@@ -442,19 +304,13 @@ def test_compact_is_refused_on_a_target_backend_without_ragged_verify(monkeypatc
         worker_mod, "draft_tp_context", lambda *_: contextlib.nullcontext()
     )
     monkeypatch.setattr(worker_mod, "mambaish_config", lambda _: None)
-    features = types.SimpleNamespace(
-        enable_return_routed_experts=False, enable_return_indexer_topk=False
-    )
-    monkeypatch.setattr(
-        worker_mod, "get_exec", lambda: types.SimpleNamespace(features=features)
-    )
 
     def init_backends(supports_ragged_verify_graph):
         worker = types.SimpleNamespace(
             _draft_worker=types.SimpleNamespace(init_attention_backends=lambda: None),
-            draft_kv_ring=None,
+            _hosts_draft=True,
             draft_parallel_layout=None,
-            draft_owns_attention=False,
+            draft_kv_ring=None,
             model_runner=types.SimpleNamespace(
                 model_config=None,
                 attn_backend=types.SimpleNamespace(
@@ -468,65 +324,9 @@ def test_compact_is_refused_on_a_target_backend_without_ragged_verify(monkeypatc
         init_backends(True)
         with pytest.raises(ValueError, match="compact"):
             init_backends(False)
-        for field in ("enable_return_routed_experts", "enable_return_indexer_topk"):
-            setattr(features, field, True)
-            with pytest.raises(ValueError, match="captures"):
-                init_backends(True)
-            setattr(features, field, False)
     with envs.SGLANG_RAGGED_VERIFY_MODE.override("cap-accept"):
         init_backends(False)
 
 
-@pytest.mark.parametrize(
-    "verify_lens,num_tokens,expected_deltas",
-    [
-        (None, 6, [0, 0, 20, 20, -3, -3]),
-        ([1, 3, 2], 8, [0, 20, 20, 20, -3, -3, 0, 0]),
-    ],
-)
-def test_spec_mrope_mixed_batch_preserves_request_and_padding_deltas(
-    verify_lens, num_tokens, expected_deltas
-):
-    """A nonblocking stacked transfer must still expand one delta per request
-    over ragged query rows, with no delta applied to graph-padding rows."""
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-    from sglang.srt.model_executor.forward_mode import ForwardMode
-    from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
-
-    positions = torch.arange(10, 10 + num_tokens, dtype=torch.int64)
-    layout = (
-        None
-        if verify_lens is None
-        else RaggedVerifyLayout.from_verify_lens_device(
-            verify_lens=torch.tensor(verify_lens), graph_num_tokens=num_tokens
-        )
-    )
-    batch = types.SimpleNamespace(
-        multimodal_inputs=[
-            None,
-            types.SimpleNamespace(mrope_position_delta=torch.tensor([[20]])),
-            types.SimpleNamespace(mrope_position_delta=torch.tensor([[-3]])),
-        ],
-        spec_info=types.SimpleNamespace(positions=positions),
-    )
-    forward = ForwardBatch(
-        forward_mode=ForwardMode.TARGET_VERIFY,
-        batch_size=3,
-        input_ids=torch.zeros(num_tokens, dtype=torch.int64),
-        req_pool_indices=torch.arange(3),
-        seq_lens=torch.tensor([4, 5, 6]),
-        out_cache_loc=torch.arange(num_tokens),
-        seq_lens_sum=15,
-        ragged_verify_layout=layout,
-    )
-    forward.compute_spec_mrope_positions(
-        types.SimpleNamespace(device=torch.device("cpu")), batch
-    )
-    expected = positions + torch.tensor(expected_deltas)
-    torch.testing.assert_close(forward.mrope_positions, expected.repeat(3, 1))
-
-
 if __name__ == "__main__":
-    import sys
-
     sys.exit(pytest.main([__file__, "-v"]))

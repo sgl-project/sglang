@@ -26,6 +26,78 @@ register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-l
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class TestGDNMISOutput(CustomTestCase):
     @torch.inference_mode()
+    def test_mis_reset_preserves_other_slots_without_host_synchronization(self):
+        """Reset request slots in place without synchronizing the host,
+        including strided state pools and repeated padding slots."""
+        for device in ("cpu", "cuda"):
+            for index_dtype in (torch.int32, torch.int64):
+                for selected in ([0, 3, 3, 5], []):
+                    for strided in (False, True):
+                        with self.subTest(
+                            device=device,
+                            index_dtype=index_dtype,
+                            selected=selected,
+                            strided=strided,
+                        ):
+                            conv_storage = torch.full(
+                                (2, 6, 8, 6), 7, device=device, dtype=torch.bfloat16
+                            )
+                            ssm_storage = torch.full((2, 6, 2, 4, 8), 11, device=device)
+                            conv = conv_storage[1]
+                            ssm = ssm_storage[1]
+                            if strided:
+                                conv = conv[:, :, ::2]
+                                ssm = ssm[:, :, :, ::2]
+                            expected_conv = conv_storage.clone()
+                            expected_ssm = ssm_storage.clone()
+                            for slot in set(selected):
+                                expected_conv[1, slot, :, :: 2 if strided else 1] = 0
+                                expected_ssm[1, slot, :, :, :: 2 if strided else 1] = 0
+                            slots = torch.tensor(
+                                selected, device=device, dtype=index_dtype
+                            )
+                            backend = object.__new__(gdn_backend.GDNAttnBackend)
+                            backend.mis_metadata = gdn_backend.build_gdn_mis_metadata(
+                                SimpleNamespace(
+                                    is_prefill_only=True,
+                                    extend_prefix_lens_cpu=[0] * len(selected),
+                                    extend_seq_lens_cpu=[2] * len(selected),
+                                    multi_item_delimiter_indices=[
+                                        torch.tensor([0, 1]) for _ in selected
+                                    ],
+                                    input_ids=torch.zeros(
+                                        len(selected) * 2, device=device
+                                    ),
+                                ),
+                                cache_indices=slots,
+                            )
+                            packed = torch.zeros(len(selected) * 2, 8, device=device)
+                            layer = SimpleNamespace(num_v_heads=2, head_v_dim=4)
+                            previous_debug_mode = torch.cuda.get_sync_debug_mode()
+                            try:
+                                torch.cuda.set_sync_debug_mode("error")
+                                with patch.object(
+                                    backend, "_forward_mis_segments", return_value=None
+                                ):
+                                    backend._forward_extend_mis(
+                                        layer=layer,
+                                        mixed_qkv=packed,
+                                        a=packed,
+                                        b=packed,
+                                        conv_states=conv,
+                                        ssm_states=ssm,
+                                        cache_indices=slots,
+                                    )
+                            finally:
+                                torch.cuda.set_sync_debug_mode(previous_debug_mode)
+                            torch.testing.assert_close(
+                                conv_storage, expected_conv, rtol=0, atol=0
+                            )
+                            torch.testing.assert_close(
+                                ssm_storage, expected_ssm, rtol=0, atol=0
+                            )
+
+    @torch.inference_mode()
     def test_mapped_chunk_output_preserves_unmapped_positions_and_state(self):
         for dtype in (torch.bfloat16, torch.float16):
             for dimension, index_dtype in ((64, torch.int32), (128, torch.int64)):
@@ -321,29 +393,6 @@ class TestGDNMISOutput(CustomTestCase):
             actual, expected = prepare(packed), prepare(packed.contiguous())
             for result, reference in zip(actual, expected):
                 torch.testing.assert_close(result, reference, rtol=0, atol=0)
-
-    @torch.inference_mode()
-    def test_prepare_rejects_malformed_gate_mapping(self):
-        packed = torch.empty(3, 384, device="cuda", dtype=torch.bfloat16)
-        a = torch.empty(5, 2, device="cuda", dtype=packed.dtype)
-        args = dict(
-            A_log=torch.zeros(2, device="cuda"),
-            a=a,
-            b=a,
-            dt_bias=torch.zeros(2, device="cuda"),
-            token_indices=torch.arange(3, device="cuda"),
-        )
-        for override in (
-            {"token_indices": torch.arange(2, device="cuda")},
-            {"token_indices": torch.arange(3, device="cuda").float()},
-            {"token_indices": torch.arange(6, device="cuda")[::2]},
-            {"token_indices": torch.arange(3)},
-        ):
-            with self.subTest(fields=tuple(override)):
-                with self.assertRaisesRegex(ValueError, "GDN preparation requires"):
-                    fused_qkv_gating_gdn_prefill(
-                        packed, 2, 2, 2, 64, 64, 64, **(args | override)
-                    )
 
     def _assert_within_ulp(self, actual, expected, max_ulp=1):
         self.assertTrue(bool(torch.isfinite(actual).all()))
@@ -667,20 +716,6 @@ class TestGDNMISOutput(CustomTestCase):
             {"out": None},
             {"output_indices": None},
             {"cu_seqlens": None},
-            {"out": out.float()},
-            {"out": out.transpose(1, 2)},
-            {"out": torch.empty(1, 3, 2, 128, device="cuda", dtype=q.dtype)[..., ::2]},
-            {"out": out.cpu()},
-            {"output_indices": indices.float()},
-            {"output_indices": indices[:2]},
-            {"output_indices": indices.cpu()},
-            {"output_indices": torch.arange(6, device="cuda")[::2]},
-            {"q": q.detach().requires_grad_()},
-            {
-                "initial_state": torch.empty(
-                    1, 2, 64, 64, device="cuda", requires_grad=True
-                )
-            },
         ):
             with self.subTest(fields=tuple(override)):
                 with self.assertRaisesRegex(

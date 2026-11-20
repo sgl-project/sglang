@@ -89,7 +89,6 @@ class DSparkVerifyPlanner:
         verify_num_draft_tokens: int,
         tp_sync: SpecTpSync,
         online_confidence: bool = False,
-        verify_every_draft_on_full_tier: bool = False,
     ) -> None:
         self.draft_model = draft_model
         self.gamma = gamma
@@ -102,10 +101,7 @@ class DSparkVerifyPlanner:
         )
 
         self._confidence_head = getattr(self.draft_model, "confidence_head", None)
-        # The worker supplies the confidence itself, so ragged modes need no head.
         self._online_confidence = online_confidence
-        # Off keeps DSpark's budget-exact layouts; see plans_verify_budget.
-        self._verify_every_draft_on_full_tier = verify_every_draft_on_full_tier
 
         sts_path = get_spec().speculative_dspark_confidence_sts_path
         if sts_path and self._confidence_head is not None:
@@ -324,8 +320,7 @@ class DSparkVerifyPlanner:
         graph of the full block, as for a single request: the step then
         verifies every draft and prices no budget."""
         if (
-            not self._verify_every_draft_on_full_tier
-            or self._ragged_verify_mode is not RaggedVerifyMode.COMPACT
+            self._ragged_verify_mode is not RaggedVerifyMode.COMPACT
             or not self._dynamic_graph_tier
         ):
             return True
@@ -341,8 +336,6 @@ class DSparkVerifyPlanner:
         """Whether the plan of ``budget`` replays the compact graph of the full
         block. Trimming it would only turn verified drafts into padding rows of
         the same graph, so the step verifies every draft."""
-        if not self._verify_every_draft_on_full_tier:
-            return False
         if budget is None:
             return True
         if not self._dynamic_graph_tier:

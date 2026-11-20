@@ -82,9 +82,7 @@ const HOP_BY_HOP: [HeaderName; 8] = [
 pub(super) enum HintRoute {
     /// `/generate`: the router's `x-override-routed-dp-rank` header when
     /// header overrides are on (`http_server.serve_generate_request`), then
-    /// the body's `routed_dp_rank`, then its deprecated `data_parallel_rank`
-    /// (`GenerateReqInput.normalize_batch_and_arguments`). One rank for the
-    /// whole of a batch body.
+    /// the body's `routed_dp_rank`. One rank for the whole of a batch body.
     Generate,
     /// `/v1/chat/completions`: the override header as for `/generate`
     /// (`OpenAIServingChat`'s `apply_header_overrides`), then
@@ -161,14 +159,13 @@ fn python_int(text: &str) -> Option<i64> {
     Some(value.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64)
 }
 
-/// The body fields every hinted route reads the rank from, the last of a
+/// The body field every hinted route reads the rank from, the last of a
 /// repeated key winning, as the routes' JSON decoding keeps it. Anything that
 /// does not decode (not a JSON object, a final rank that is no integer)
 /// names no rank here; the route's handler answers it.
 #[derive(Default)]
 struct BodyRank {
     routed_dp_rank: Option<serde_json::Value>,
-    data_parallel_rank: Option<serde_json::Value>,
 }
 
 impl<'de> Deserialize<'de> for BodyRank {
@@ -189,7 +186,6 @@ impl<'de> Deserialize<'de> for BodyRank {
                 while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
                     match key.as_ref() {
                         "routed_dp_rank" => ranks.routed_dp_rank = map.next_value()?,
-                        "data_parallel_rank" => ranks.data_parallel_rank = map.next_value()?,
                         _ => {
                             map.next_value::<serde::de::IgnoredAny>()?;
                         }
@@ -203,13 +199,11 @@ impl<'de> Deserialize<'de> for BodyRank {
 }
 
 /// The rank `route`'s body names. A field set to null is unset, as Python's
-/// `Optional[int]` reads it, and only the field that names the rank is
-/// read: a set `routed_dp_rank` discards `data_parallel_rank`, whatever it
-/// holds. The OpenAI routes read it as their handlers do ([`lax_rank`]).
+/// `Optional[int]` reads it. The OpenAI routes read it as their handlers do
+/// ([`lax_rank`]).
 fn body_rank(route: HintRoute, body: &[u8]) -> Option<i64> {
     let ranks: BodyRank = serde_json::from_slice(body).ok()?;
-    let set = |value: Option<serde_json::Value>| value.filter(|value| !value.is_null());
-    let value = set(ranks.routed_dp_rank).or_else(|| set(ranks.data_parallel_rank))?;
+    let value = ranks.routed_dp_rank.filter(|value| !value.is_null())?;
     match route {
         HintRoute::Generate => value.as_i64(),
         HintRoute::ChatCompletions | HintRoute::Completions => pydantic_int(&value),
@@ -563,23 +557,15 @@ mod tests {
                 .is_err()
         );
 
-        assert_eq!(
-            body_rank(
-                HintRoute::Generate,
-                br#"{"routed_dp_rank": 1, "data_parallel_rank": 0}"#
-            ),
-            Some(1)
-        );
         // A repeated key: the last wins, as the routes decode it.
         for repeated in [
             &br#"{"routed_dp_rank": 0, "routed_dp_rank": 1}"#[..],
             br#"{"routed_dp_rank": "discarded", "routed_dp_rank": 1}"#,
-            br#"{"routed_dp_rank": 1, "data_parallel_rank": "discarded"}"#,
         ] {
             assert_eq!(body_rank(HintRoute::Generate, repeated), Some(1));
         }
         // The OpenAI routes read a string of an integer, as pydantic does.
-        let text = br#"{"routed_dp_rank": null, "data_parallel_rank": "1"}"#;
+        let text = br#"{"routed_dp_rank": "1"}"#;
         assert_eq!(body_rank(HintRoute::Completions, text), Some(1));
         for (value, rank) in [
             (serde_json::json!(1.0), Some(1)),
@@ -592,16 +578,9 @@ mod tests {
         ] {
             assert_eq!(pydantic_int(&value), rank, "{value}");
         }
-        assert_eq!(body_rank(HintRoute::Generate, text), None);
-        assert_eq!(
-            body_rank(
-                HintRoute::Generate,
-                br#"{"routed_dp_rank": null, "data_parallel_rank": 1}"#
-            ),
-            Some(1)
-        );
         for unread in [
             &br#"{"text": "hi"}"#[..],
+            br#"{"routed_dp_rank": null}"#,
             br#"{"routed_dp_rank": [1]}"#,
             br#"{"routed_dp_rank": "1"}"#,
             br#"[{"routed_dp_rank": 1}]"#,
@@ -765,7 +744,7 @@ mod tests {
         }
 
         for (path, sent, body, served_by_peer) in [
-            ("/generate", vec![], r#"{"data_parallel_rank": 1}"#, true),
+            ("/generate", vec![], r#"{"routed_dp_rank": 1}"#, true),
             (
                 "/generate",
                 vec![(OVERRIDE_HEADER, "1")],

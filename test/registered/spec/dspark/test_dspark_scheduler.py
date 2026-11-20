@@ -425,8 +425,9 @@ def _fake_compact_planner(
     planner._ragged_verify_mode = RaggedVerifyMode.COMPACT
     planner._schedule_cfg = DSparkScheduleConfig(gamma=verify_num_draft_tokens - 1)
     planner._dynamic_graph_tier = False
-    planner._verify_every_draft_on_full_tier = False
     planner._is_verify_all = False
+    planner._budget_planner = None
+    planner._uniform_layout_cache = {}
     planner._align_verify_tokens_to_graph_tier = align
     return planner
 

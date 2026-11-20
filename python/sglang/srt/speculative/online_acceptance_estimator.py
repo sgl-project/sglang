@@ -170,30 +170,15 @@ class OnlineAcceptanceEstimator:
         )
         num_graded = graded.sum(dim=1)
         denom = num_graded.clamp(min=1.0)
-        # Logging is infrequent, but collect all diagnostics in one host
-        # transfer instead of synchronizing separately for each log field.
-        diagnostics = torch.cat(
-            (
-                self.slope,
-                self.intercepts,
-                num_graded,
-                correct.sum(dim=1) / denom,
-                (graded * predictions).sum(dim=1) / denom,
-            )
-        ).cpu()
-        slope = float(diagnostics[0])
-        intercepts, graded_counts, observed, predicted = diagnostics[1:].split(
-            self.num_positions
-        )
         logger.info(
             "Online acceptance estimator refit %d: slope=%.4f intercepts=%s "
             "graded=%s observed_accept=%s refit_mean_pred=%s",
             self.refit_ct,
-            slope,
-            _fmt(intercepts),
-            graded_counts.to(torch.int64).tolist(),
-            _fmt(observed),
-            _fmt(predicted),
+            float(self.slope.item()),
+            _fmt(self.intercepts),
+            num_graded.to(torch.int64).tolist(),
+            _fmt(correct.sum(dim=1) / denom),
+            _fmt((graded * predictions).sum(dim=1) / denom),
         )
 
 

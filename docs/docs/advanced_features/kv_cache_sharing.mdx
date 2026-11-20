@@ -170,11 +170,10 @@ source ./kv-shard.env
 curl --fail "http://${PREFILL_HOST}:30001/health"
 curl --fail "http://${DECODE_HOST}:30003/health"
 
-python -m sglang_router.launch_router \
-  --pd-disaggregation \
-  --prefill "http://${PREFILL_HOST}:30001" 30200 \
-  --decode "http://${DECODE_HOST}:30003" \
-  --policy cache_aware \
+sgl-router \
+  --model-id glm-kv-shard \
+  --no-tokenizer \
+  --worker-urls "http://${PREFILL_HOST}:30001" "http://${DECODE_HOST}:30003" \
   --host 0.0.0.0 \
   --port 30000
 ```

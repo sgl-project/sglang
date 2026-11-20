@@ -16,6 +16,7 @@ use futures::future::try_join_all;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
+use super::super::auth::DeclaredRoute;
 use super::chat::{ChatBody, ChatRequest};
 use super::template::{RenderedChat, render_chat};
 use super::{AppState, contains_media, lowered};
@@ -24,10 +25,10 @@ use crate::message::types::{OneOrMany, TokenIds};
 
 pub(super) fn routes() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/v1/tokenize", post(tokenize))
-        .route("/tokenize", post(tokenize))
-        .route("/v1/detokenize", post(detokenize))
-        .route("/detokenize", post(detokenize))
+        .declared_route("/v1/tokenize", post(tokenize))
+        .declared_route("/tokenize", post(tokenize))
+        .declared_route("/v1/detokenize", post(detokenize))
+        .declared_route("/detokenize", post(detokenize))
 }
 
 fn default_true() -> bool {
