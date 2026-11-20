@@ -1,7 +1,8 @@
 {
   "_metadata": {"note": "gfx1250 (wave32), H 8192: fused_norm_residual 16 warps at every M"},
   "fused_norm_residual": [
-    {"num_warps": 16, "num_stages": 1}
+    {"when": {"m_bucket": 0}, "num_warps": 16, "num_stages": 1},
+    {"when": {"post_norm_is_input_scale": true}, "num_warps": 16, "num_stages": 1}
   ],
   "rms_norm_gate": [
     {"when": {"n_rows_ge": 65536}, "block_m": 16, "num_warps": 2}

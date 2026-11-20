@@ -70,6 +70,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor as OSSLogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.unquant import (
+    gfx1250_tuned_gemms,
     register_gfx950_unquantized_gemm_shapes,
 )
 from sglang.srt.layers.quantization.utils import is_layer_skipped
@@ -97,7 +98,10 @@ from sglang.srt.rocm_muse_spark.expert_placement import ExpertPlacement
 from sglang.srt.rocm_muse_spark.fp4_moe import MuseSpark1xFp4Experts
 from sglang.srt.rocm_muse_spark.fused_muse_spark_routing import FusedMuseSparkRouting
 from sglang.srt.rocm_muse_spark.fused_norm_gate import FusedRMSNormGate
-from sglang.srt.rocm_muse_spark.fused_norm_residual import FusedPostNormResidualPreNorm
+from sglang.srt.rocm_muse_spark.fused_norm_residual import (
+    FusedPostNormResidualPreNorm,
+    embed_attn_norms,
+)
 from sglang.srt.rocm_muse_spark.layers import (
     MuseSpark1xNormPreservingResidualConnection,
     MuseSpark1xRMSNorm,
@@ -106,7 +110,10 @@ from sglang.srt.rocm_muse_spark.layers import (
 )
 from sglang.srt.rocm_muse_spark.muse_qk_norm import fused_qk_norm, qk_norm_supported
 from sglang.srt.rocm_muse_spark.sequence_parallel import (
+    LOCAL_DISPATCH_MAX_ROWS,
+    ROUTED_MX_WIDTH,
     SPShape,
+    local_routed_dispatch,
     prepare_ulysses,
     sp_gather,
     sp_gather_routed,
@@ -365,33 +372,6 @@ _FINALIZE_PUSH_MAX_BYTES = 1 << 20
 # weight copies through aiter's CK GEMM from each weight's own minimum width (kernels/ops/gemm/fp8_prefill_gemm);
 # the O projection's copy and the pooler / unpooler copies exist for this path only.
 _PREFILL_DENSE_FP8 = _DENSE_FP8 and envs.SGLANG_ROCM_MUSE_PREFILL_DENSE_FP8.get()
-# gfx1250 SP prefill: the BF16 dense GEMMs at the shard widths (Ulysses QKV+gate / O, pooler, unpooler) run the
-# hipBLASLt / rocBLAS solutions torch TunableOp picked for them on gfx1250; any GEMM without a row keeps the default
-# heuristic.
-_PREFILL_GEMM_TUNABLEOP = (
-    os.path.join(
-        os.path.dirname(__file__), "configs", "gfx1250_prefill_gemm_tunableop.csv"
-    )
-    if mxfp4_moe._is_gfx1250()
-    else None
-)
-
-
-@contextlib.contextmanager
-def _prefill_tuned_gemms():
-    """TunableOp lookups (tuning off: the file is only read) for the GEMMs launched inside."""
-    tunable = torch.cuda.tunable
-    if tunable.get_filename() != _PREFILL_GEMM_TUNABLEOP:
-        tunable.tuning_enable(False)
-        tunable.set_filename(_PREFILL_GEMM_TUNABLEOP, insert_device_ordinal=False)
-        tunable.read_file(_PREFILL_GEMM_TUNABLEOP)
-    tunable.enable(True)
-    try:
-        yield
-    finally:
-        tunable.enable(False)
-
-
 # gfx1250 A8W4 experts under SP prefill: re-place the experts across EP ranks once from the counted prefill routing
 # (expert_placement); SGLANG_ROCM_MUSE_EXPERT_PLACEMENT=0 keeps the checkpoint order.
 _EXPERT_PLACEMENT = (
@@ -1189,12 +1169,24 @@ class MuseSpark1xMoE(nn.Module):
             and self.uses_a4w4(sp.padded, target_verify)
             and mxfp4_moe.GFX1250_SP_MX_GATHER
         )
-        topk_scores, topk_ids, expert_input, quantized = self.route(
+        gfx1250_a8w4 = getattr(self.experts, "gfx1250_a8w4", None) is not None
+        # The routed-MX rows the verify-SP gather sends, or (small unsharded batches) the experts dispatch from in
+        # one launch: written by the joint router / pooler epilogue instead of a pack launch.
+        pack = gfx1250_a8w4 and (
+            (sp is not None and sp.verify and mxfp4_moe.GFX1250_SP_MX_GATHER)
+            or (
+                sp is None
+                and not quantize_a4
+                and 0 < hidden_states.shape[0] <= LOCAL_DISPATCH_MAX_ROWS
+            )
+        )
+        topk_scores, topk_ids, expert_input, quantized, packed = self.route(
             hidden_states,
             quantize_a4=quantize_a4,
             x_fp8=x_fp8,
             prefill_fp8=prefill_fp8,
             defer_norm=defer_norm,
+            pack=pack,
         )
         rows = topk_ids.shape[0] if sp is None else sp.padded
         use_a4w4 = self.uses_a4w4(rows, target_verify)
@@ -1205,11 +1197,12 @@ class MuseSpark1xMoE(nn.Module):
                 and getattr(self.experts, "gfx1250_a8w4", None) is not None
                 and mxfp4_moe.GFX1250_SP_MX_GATHER
             ):
-                # The rows stay packed (aiter's pre-quantized input, scattered straight from them) and the gather
-                # also hands back this rank's local expert ids for aiter's small-batch route.
+                # The rows stay packed (aiter's pre-quantized input, scattered straight from them). Small batches get
+                # this rank's local expert ids for aiter's small-batch route; larger ones unpack, route and scatter in
+                # one launch inside the experts (sequence_parallel.RoutedDispatch).
                 routed_mx, topk_ids, topk_scores = sp_gather_routed_mx(
                     expert_input, topk_ids, topk_scores, rows, self.expert_load_verify, mx=True,
-                    local_experts=(self.local_expert_start, self.num_local_experts),
+                    local_experts=(self.local_expert_start, self.num_local_experts), dispatch=True, packed=packed,
                 )  # fmt: skip
                 expert_input = None
             else:
@@ -1261,6 +1254,15 @@ class MuseSpark1xMoE(nn.Module):
                 self.expert_load.index_add_(
                     0, ids, torch.ones_like(ids, dtype=torch.int32)
                 )
+        if sp is None and packed is not None and use_a4w4:
+            routed_mx = local_routed_dispatch(
+                packed,
+                topk_ids,
+                topk_scores,
+                self.local_expert_start,
+                self.num_local_experts,
+            )
+            expert_input = None
         if (
             sp is None
             and self._finalize_ar is not None
@@ -1323,10 +1325,13 @@ class MuseSpark1xMoE(nn.Module):
         x_fp8: tuple[torch.Tensor, torch.Tensor] | None = None,
         prefill_fp8: bool = False,
         defer_norm: bool = False,
+        pack: bool = False,
     ):
         """Router top-k, the expert input (pooler + pre-expert norm) of these rows and, when ``quantize_a4`` and
         the shared epilogue runs, that input's compact A4 MXFP4 form (else None). ``x_fp8`` / ``prefill_fp8`` as in
-        ``forward``. ``defer_norm``: the expert input stops before the pre-expert norm (the caller applies it)."""
+        ``forward``. ``defer_norm``: the expert input stops before the pre-expert norm (the caller applies it).
+        ``pack``: also the routed-MX rows (``sequence_parallel.pack_routed_mx``) when the shared front runs, else
+        None in their place."""
         if (
             router_pooler.SHARED_ROUTER_POOLER
             and _USE_ROUTER_GEMV
@@ -1345,9 +1350,14 @@ class MuseSpark1xMoE(nn.Module):
                 if quantize_a4
                 else None
             )
-            return router_pooler.route_with_shared_pooler(
-                self, hidden_states, quant_out=quant_out, x_fp8=x_fp8
+            pack_out = (
+                hidden_states.new_empty((m, ROUTED_MX_WIDTH), dtype=torch.int32)
+                if pack
+                else None
             )
+            return *router_pooler.route_with_shared_pooler(
+                self, hidden_states, quant_out=quant_out, x_fp8=x_fp8, pack_out=pack_out
+            ), pack_out
         if (
             _USE_ROUTER_GEMV
             and self.router_in_fp32
@@ -1382,7 +1392,7 @@ class MuseSpark1xMoE(nn.Module):
         )
         if self.pre_expert_norm is not None and not defer_norm:
             expert_input = self.pre_expert_norm(expert_input)
-        return topk_scores, topk_ids, expert_input, None
+        return topk_scores, topk_ids, expert_input, None, None
 
     def uses_compact_a4(self, rows: int, target_verify: bool) -> bool:
         return (
@@ -1855,9 +1865,22 @@ class MuseSpark1xModel(nn.Module):
             )
         else:
             hidden_states = self.embed_tokens(input_ids)
-        if input_embeds is None and self.embed_norm is not None:
-            hidden_states = self.embed_norm(hidden_states)
-        stream = hidden_states.to(self.residual_dtype)
+        attn_input = None
+        if (
+            input_embeds is None
+            and self._ffn_boundaries is not None
+            and self._fused_embed_norms(hidden_states)
+        ):
+            stream, attn_input = embed_attn_norms(
+                hidden_states,
+                self.embed_norm.eps,
+                self.layers[0].self_attn.pre_attn_norm._get_effective_weight(),
+                self.layers[0].self_attn.pre_attn_norm.eps,
+            )
+        else:
+            if input_embeds is None and self.embed_norm is not None:
+                hidden_states = self.embed_norm(hidden_states)
+            stream = hidden_states.to(self.residual_dtype)
         # DFLASH draft context: the residual stream after each listed layer, read
         # in operator dtype (bf16) like the CUDA model does.
         aux_hidden_states: list[torch.Tensor] = []
@@ -1865,14 +1888,14 @@ class MuseSpark1xModel(nn.Module):
             if sp is not None and input_embeds is not None:
                 stream = sp_shard(stream, sp)
             final_pre_norm_dtype = torch.bfloat16
-            attn_input = self.layers[0].self_attn_input_norm(stream)
+            if attn_input is None:
+                attn_input = self.layers[0].self_attn_input_norm(stream)
             attn_input_fp8 = None
             last = len(self.layers) - 1
+            # gfx1250 SP prefill: the BF16 dense GEMMs at the shard widths run unquant's TunableOp picks.
             tuned = (
-                _prefill_tuned_gemms()
-                if _PREFILL_GEMM_TUNABLEOP is not None
-                and sp is not None
-                and not sp.verify
+                gfx1250_tuned_gemms()
+                if mxfp4_moe._is_gfx1250() and sp is not None and not sp.verify
                 else contextlib.nullcontext()
             )
             with tuned:
@@ -1907,6 +1930,19 @@ class MuseSpark1xModel(nn.Module):
         if self.layers_to_capture:
             return hidden_states, aux_hidden_states
         return hidden_states
+
+    def _fused_embed_norms(self, hidden_states: torch.Tensor) -> bool:
+        """Whether ``embed_attn_norms`` replaces the embedding norm, the FP32 cast and layer 0's attention pre-norm."""
+        norm = self.layers[0].self_attn.pre_attn_norm
+        return (
+            self.embed_norm is not None
+            and not self.embed_norm.has_weight
+            and norm.has_weight
+            and self.residual_dtype == torch.float32
+            and hidden_states.dim() == 2
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.shape[1] == self.config.hidden_size == 8192
+        )
 
 
 class MuseSparkModel(nn.Module):

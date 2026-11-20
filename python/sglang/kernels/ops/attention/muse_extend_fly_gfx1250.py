@@ -70,7 +70,6 @@ from aiter.ops.flydsl.kernels.fmha_gfx1250.fmha_utils import (
     NUM_Q_TILES_CHOICES,
     NUM_WAVES,
     WMMA_M,
-    _alloc_lds,
     _bare_barrier,
     _block_m,
     _concat,
@@ -94,6 +93,7 @@ from aiter.ops.flydsl.kernels.fmha_gfx1250.fmha_utils import (
     _warp_id,
     _wg_kv_span,
     schedule_bank,
+    supported_num_q_tiles,
     supports_gqa_ratio,
 )
 from aiter.ops.flydsl.kernels.kernels_common import LOG2E
@@ -830,7 +830,7 @@ def _attention_prologue(
     q_dtype,
     kv_dtype,
     warp_idx,  # runtime fx.Int32 wave index
-    lds_base,  # LDS base (fx.Int32), allocated once by the caller (_alloc_lds)
+    lds_base,  # LDS base (fx.Int32), allocated once by the caller (_alloc_lds_bytes)
 ):
     """Everything both halves do before the first body, traced once per build.
 
@@ -866,10 +866,14 @@ def _attention_prologue(
     k_blk_bytes = k_mgr.get_lds_size_in_byte()
     v_blk_bytes = v_mgr.get_lds_size_in_byte()
     assert k_blk_bytes % KV_LDS_SPLITS == 0 and v_blk_bytes % KV_LDS_SPLITS == 0
+    LDS_CHUNK_BYTES, LDS_QO_BYTES = _lds_map(
+        qk_hdim, v_hdim, n_block, gqa_ratio, num_q_tiles_per_wave, q_dtype, kv_dtype
+    )
     # Chunk stride between a tile's two n_block halves (K[slot_idx][0] -> K[slot_idx][1]) and between
     # consecutive slots. Slot slot_idx occupies chunks 2pp, 2pp+1 low and 2pp+6, 2pp+7 high.
-    _SPLIT_STRIDE = 6 * LDS_CHUNK_BYTES  # 156 KB
-    slot_bytes = 2 * LDS_CHUNK_BYTES  # 52 KB: one slot's K|V pair in one half
+    _SPLIT_STRIDE = 6 * LDS_CHUNK_BYTES  # 156 KB at the 26 KB chunk
+    # one slot's K|V pair in one half (52 KB at the 26 KB chunk)
+    slot_bytes = 2 * LDS_CHUNK_BYTES
     for _label, _bytes in (("K", k_blk_bytes), ("V", v_blk_bytes)):
         assert _bytes // KV_LDS_SPLITS <= LDS_CHUNK_BYTES, (
             f"{_label} split {_bytes // KV_LDS_SPLITS}B exceeds the {LDS_CHUNK_BYTES}B chunk "
@@ -1114,6 +1118,7 @@ def _attention_prologue(
         "v_lds_bufs": _v_lds_bufs,
         "kv_swap_delta": _kv_swap_delta,
         "split_stride": _SPLIT_STRIDE,
+        "qo_bytes": LDS_QO_BYTES,
         "physical_slot": _PHYSICAL_SLOT,
         "m_tile_idx": m_tile_idx,
         "causal_off": causal_off,
@@ -1175,7 +1180,7 @@ def _attention_core_multi_kv_tiles(
     window_right,
     warp_idx,  # runtime fx.Int32 wave index
     warp_type,  # compile-time WarpType (LO/HI x SIMD parity)
-    lds_base,  # LDS base (fx.Int32), allocated once by the caller (_alloc_lds)
+    lds_base,  # LDS base (fx.Int32), allocated once by the caller (_alloc_lds_bytes)
     prologue,  # dict from _attention_prologue: managers, LDS map, KV span, Q fragments
     q_dtype,  # compile-time Q fragment type; K/V are kv_dtype, P is P_DTYPE, O is O_DTYPE
     kv_dtype,  # compile-time K/V fragment type (may differ from q_dtype; both 8-bit)
@@ -1204,6 +1209,7 @@ def _attention_core_multi_kv_tiles(
     _v_lds_bufs = prologue["v_lds_bufs"]
     _kv_swap_delta = prologue["kv_swap_delta"]
     _SPLIT_STRIDE = prologue["split_stride"]
+    LDS_QO_BYTES = prologue["qo_bytes"]
     _PHYSICAL_SLOT = prologue["physical_slot"]
     m_tile_idx = prologue["m_tile_idx"]
     causal_off = prologue["causal_off"]
@@ -1862,6 +1868,9 @@ def _attention_core_one_kv_tile(
         q_dtype=q_dtype,
         kv_dtype=kv_dtype,
     )
+    LDS_CHUNK_BYTES, LDS_QO_BYTES = _lds_map(
+        qk_hdim, v_hdim, n_block, gqa_ratio, num_q_tiles, q_dtype, kv_dtype
+    )
     _SPLIT_STRIDE = 6 * LDS_CHUNK_BYTES
     slot_bytes = 2 * LDS_CHUNK_BYTES
     for _label, _bytes in (
@@ -2405,6 +2414,45 @@ def pick_n_block(qk_hdim, v_hdim, kv_dtype):
 
 
 @functools.cache
+def _lds_map(
+    qk_hdim, v_hdim, n_block, gqa_ratio, num_q_tiles_per_wave, q_dtype, kv_dtype
+):
+    """(chunk, qo) bytes of the 12-chunk K|V map sized for this config: a chunk holds the larger K / V split half
+    and two waves' Q / O slices (O above its qo slice, clear of the next chunk). The shipped 26 KB / 17 KB map fits
+    every hdim up to 256 but takes the whole 320 KB LDS (one workgroup per CU); D=64 FP8 needs ~12 KB chunks, so
+    two workgroups share a CU."""
+    q_mgr, k_mgr, v_mgr = _build_managers(
+        qk_hdim=qk_hdim,
+        v_hdim=v_hdim,
+        n_block=n_block,
+        gqa_ratio=gqa_ratio,
+        num_q_tiles_per_wave=num_q_tiles_per_wave,
+        q_dtype=q_dtype,
+        kv_dtype=kv_dtype,
+    )
+    o_bytes = _o_manager(
+        v_hdim=v_hdim,
+        gqa_ratio=gqa_ratio,
+        num_q_tiles_per_wave=num_q_tiles_per_wave,
+        elem_dtype=fx.BFloat16,
+    ).warp_lds_size_in_byte()
+    qo = -(-max(q_mgr.warp_lds_size_in_byte(), o_bytes) // 256) * 256
+    half = (
+        max(k_mgr.get_lds_size_in_byte(), v_mgr.get_lds_size_in_byte()) // KV_LDS_SPLITS
+    )
+    chunk = -(-max(half, qo + o_bytes) // 1024) * 1024
+    if chunk > LDS_CHUNK_BYTES:
+        return LDS_CHUNK_BYTES, LDS_QO_BYTES
+    return chunk, qo
+
+
+def _alloc_lds_bytes(nbytes):
+    """The kernel's one SharedAllocator allocation, sized by ``_lds_map``."""
+    smem = fx.SharedAllocator().allocate(nbytes)
+    return fx.Int32(fx.ptrtoint(smem.peek().ptr))
+
+
+@functools.cache
 def build_fmha_fwd_prefill_a8w8_m32x8(
     *,
     layout: str = "thd",
@@ -2458,6 +2506,20 @@ def build_fmha_fwd_prefill_a8w8_m32x8(
     HAS_SINK = bool(has_sink)
     GQA_RATIO = int(gqa_ratio)
     NUM_Q_TILES = int(num_q_tiles_per_wave)
+    LDS_BYTES = (
+        2
+        * N_KV_PP
+        * 2
+        * _lds_map(
+            QK_HDIM,
+            V_HDIM,
+            N_BLOCK,
+            GQA_RATIO,
+            NUM_Q_TILES,
+            Q_ELEM_DTYPE,
+            KV_ELEM_DTYPE,
+        )[0]
+    )
 
     if layout == "thd":
 
@@ -2563,7 +2625,7 @@ def build_fmha_fwd_prefill_a8w8_m32x8(
                 }
                 # Exactly one core reaches the binary: the host decides from the shape (bshd) or
                 # from max_seqlen_k (thd) whether every WG sees a single KV tile.
-                lds_base = _alloc_lds()
+                lds_base = _alloc_lds_bytes(LDS_BYTES)
                 warp_idx = _warp_id()
 
                 _epi_state_out = _epi_state_zeros(
@@ -2718,7 +2780,7 @@ def build_fmha_fwd_prefill_a8w8_m32x8(
         }
         # Exactly one core reaches the binary: the host decides from the shape (bshd) or
         # from max_seqlen_k (thd) whether every WG sees a single KV tile.
-        lds_base = _alloc_lds()
+        lds_base = _alloc_lds_bytes(LDS_BYTES)
         warp_idx = _warp_id()
 
         _epi_state_out = _epi_state_zeros(
@@ -2775,6 +2837,23 @@ def _pick_one_kv_tile(max_seqlen_k, qk_hdim, v_hdim, kv_dtype_str):
     """True when the launch bounds every WG to a single KV tile."""
     n_block = pick_n_block(qk_hdim, v_hdim, DTYPE_MAP[kv_dtype_str])
     return int(max_seqlen_k) <= n_block
+
+
+@functools.cache
+def _pick_thd_num_q_tiles(
+    nheads_k, batch, max_seqlen_q, gqa_ratio, qk_hdim, v_hdim, q_dtype_str, kv_dtype_str
+):
+    """BLOCK_M 128 whenever its _lds_map footprint lets two workgroups share a CU (D=64 FP8, full and sliding
+    window), else _pick_num_q_tiles."""
+    kv_dtype = DTYPE_MAP[kv_dtype_str]
+    n_block = pick_n_block(qk_hdim, v_hdim, kv_dtype)
+    if 1 in supported_num_q_tiles(gqa_ratio, v_hdim):
+        chunk = _lds_map(
+            qk_hdim, v_hdim, n_block, gqa_ratio, 1, DTYPE_MAP[q_dtype_str], kv_dtype
+        )[0]
+        if 2 * (2 * N_KV_PP * 2 * chunk) <= get_lds_capacity_bytes("gfx1250"):
+            return 1
+    return _pick_num_q_tiles(nheads_k, batch, max_seqlen_q, gqa_ratio, v_hdim)
 
 
 def _ensure_thd_kernel(
@@ -3208,8 +3287,15 @@ def flash_attn_varlen_a8w8_m32x8(
     stride_o_head = out.stride(1)
 
     if num_q_tiles_per_wave is None:
-        num_q_tiles_per_wave = _pick_num_q_tiles(
-            nheads_k, batch, max_seqlen_q, gqa, v_hdim
+        num_q_tiles_per_wave = _pick_thd_num_q_tiles(
+            nheads_k,
+            batch,
+            max_seqlen_q,
+            gqa,
+            qk_hdim,
+            v_hdim,
+            q_dtype_str,
+            kv_dtype_str,
         )
     num_q_tiles_per_wave = int(num_q_tiles_per_wave)
 

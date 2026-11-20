@@ -134,14 +134,26 @@ _GFX1250_ROW_MAJOR = {
     (1024, 40960, 64): (64, 128, 16, 4, 3),
 }
 # gfx1250: aiter's FlyDSL a16w16 GEMM (TDM pipeline, split-K summed in-kernel in a fixed order) where it beats the
-# incumbent, (N, K, BM) -> (out dtype, launch): the joint router / pooler [4608, 8192] with an FP32 output at 16 rows
-# (one split for the epilogue to sum instead of eight), the unpooler [8192, 4096] at 16 and 64 rows, and the DFlash
-# draft gate/up [7168, 8192] and down [8192, 3584] at 65..128 rows (vs aiter tgemm).
+# incumbent, (N, K, BM) -> (out dtype, launch): the joint router / pooler [4608, 8192] with an FP32 output at 16 and
+# 64 rows (one split for the epilogue to sum instead of eight / four), the unpooler [8192, 4096] at 16 and 64 rows,
+# and the DFlash draft gate/up [7168, 8192] and down [8192, 3584] at 65..128 rows (vs aiter tgemm).
 FLYDSL: dict = {}
 _GFX1250_FLYDSL = {
     (4608, 8192, 16): (
         torch.float32,
         dict(tile_m=16, tile_n=64, tile_k=256, m_warp=1, n_warp=2, num_buffers=6),
+    ),
+    (4608, 8192, 64): (
+        torch.float32,
+        dict(
+            tile_m=64,
+            tile_n=64,
+            tile_k=128,
+            m_warp=2,
+            n_warp=1,
+            num_buffers=3,
+            split_k=4,
+        ),
     ),
     (8192, 4096, 16): (
         torch.bfloat16,

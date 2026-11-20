@@ -299,7 +299,8 @@ def prepare_gfx1250_a8w4_weights(experts) -> None:
 import threading as _threading
 
 _GFX1250_FINALIZE = _threading.local()
-# (packed rows, routing words per row) of a run_gfx1250_a8w4(routed_mx=...) call while it runs
+# (packed rows, routing words per row, local ids or a deferred RoutedDispatch) of a
+# run_gfx1250_a8w4(routed_mx=...) call while it runs
 _GFX1250_DISPATCH = _threading.local()
 
 
@@ -314,6 +315,53 @@ def _install_gfx1250_gather_hook():
         return
     orig = mk.flydsl_moe_gather_reduce
     orig_quant = kernels.flydsl_moe_fused_quant_preshuffle
+    orig_lut = mk._build_g2l_lut
+    orig_route = kernels.flydsl_moe_topids_to_rows
+    orig_psum = mk.contiguous_psum_remap
+
+    def _deferred():
+        routed = getattr(_GFX1250_DISPATCH, "ctx", None)
+        return (
+            routed[3]
+            if routed is not None and len(routed) > 3 and not torch.is_tensor(routed[3])
+            else None
+        )
+
+    # A deferred dispatch (sequence_parallel.RoutedDispatch) launches nothing for aiter's EP route: the LUT, route
+    # and psum calls hand back the buffers dispatch_routed_mx fills in the input scatter, which aiter runs after them
+    # and before anything reads them.
+    def build_g2l_lut(expert_mask, E, device, nvt=None, topk=None):
+        d = _deferred()
+        if d is None:
+            return orig_lut(expert_mask, E, device, nvt=nvt, topk=topk)
+        return d.ids, None, nvt
+
+    def topids_to_rows(topk_ids, E, max_m, **kw):
+        d = _deferred()
+        if (
+            d is None
+            or kw.get("ep_rowmap") is not None
+            or kw.get("expert_mask") is not None
+        ):
+            return orig_route(topk_ids, E, max_m, **kw)
+        d.t2r = torch.empty(topk_ids.shape, dtype=torch.int32, device=topk_ids.device)
+        d.masked = torch.empty(E, dtype=torch.int32, device=topk_ids.device)
+        return d.masked, d.t2r
+
+    def psum_remap(masked_m, topids_to_rows, experts, route_max_m, tile_m, **kw):
+        d = _deferred()
+        if (
+            d is None
+            or masked_m is not d.masked
+            or kw.get("ep_scatter_params") is not None
+        ):
+            return orig_psum(
+                masked_m, topids_to_rows, experts, route_max_m, tile_m, **kw
+            )
+        d.starts = torch.empty_like(d.masked)
+        d.psum = torch.empty_like(d.masked)
+        d.align_m = int(tile_m)
+        return d.starts, d.psum, d.starts[:1]
 
     def gather_reduce(
         grouped_out, topids_to_rows, gather_w, out=None, num_valid_tokens=None, **kw
@@ -358,9 +406,15 @@ def _install_gfx1250_gather_hook():
             or kw.get("payload_preshuffled")
         ):
             return orig_quant(grouped_in, E, max_m, **kw)
-        from sglang.srt.rocm_muse_spark.sequence_parallel import scatter_routed_mx
+        from sglang.srt.rocm_muse_spark.sequence_parallel import (
+            dispatch_routed_mx,
+            scatter_routed_mx,
+        )
 
-        packed, idw, scw = routed
+        d = _deferred()
+        if d is not None and d.psum is not None:
+            return dispatch_routed_mx(d, max_m, kw["wmma_rep"])
+        packed, idw, scw = routed[:3]
         return scatter_routed_mx(
             packed, kw["topids_to_rows"], kw.get("num_valid_routes"), max_m, kw["wmma_rep"],
             grouped_in.shape[-1], idw, scw, kw["source_topk"],
@@ -368,6 +422,9 @@ def _install_gfx1250_gather_hook():
 
     mk.flydsl_moe_gather_reduce = gather_reduce
     kernels.flydsl_moe_fused_quant_preshuffle = quant_preshuffle
+    mk._build_g2l_lut = build_g2l_lut
+    kernels.flydsl_moe_topids_to_rows = topids_to_rows
+    mk.contiguous_psum_remap = psum_remap
     mk._muse_gfx1250_hooked = True
 
 
@@ -552,7 +609,8 @@ def run_gfx1250_a8w4(
 ):
     """gfx1250 experts of this rank, finalized. aiter's A8W4 TDM MoE reads token rows directly (source_topk) and
     its GEMM2 rows stay per (token, slot); the gather step is replaced by Muse's per-expert norm + weighted sum.
-    ``routed_mx``: (rows, id words, score words, local ids or None) as ``sp_gather_routed_mx(mx=True)`` returned them
+    ``routed_mx``: (rows, id words, score words, local ids, a deferred RoutedDispatch or None) as
+    ``sp_gather_routed_mx(mx=True)`` returned them
     (MXFP8 + routing words, int32 [rows, width]); aiter runs its pre-quantized dispatch and the hook scatters straight
     from them. ``push``: a ``sequence_parallel.sp_push_target``; the finalize then pushes the rows into the owners'
     slots instead of returning them, and ``finalize_pushed()`` tells the caller whether it did (else reduce the
@@ -572,8 +630,15 @@ def run_gfx1250_a8w4(
         quantized = (u8[:, :k].view(torch.float8_e4m3fn), u8[:, k : k + k // 32])
     ids32 = ids.to(torch.int32).contiguous()
     route_ids = ids32
+    # a deferred dispatch keeps aiter's EP route, whose launches the hooks replace by dispatch_routed_mx
+    deferred = (
+        routed_mx is not None
+        and routed_mx[3] is not None
+        and not torch.is_tensor(routed_mx[3])
+    )
     if (
-        ids32.numel() <= _FUSED_ROUTE_PSUM_MAX_NUMEL
+        not deferred
+        and ids32.numel() <= _FUSED_ROUTE_PSUM_MAX_NUMEL
         and (quantized is None or routed_mx is not None)
         and num_local_tokens is None
     ):
@@ -603,7 +668,7 @@ def run_gfx1250_a8w4(
         push,
     )
     _GFX1250_FINALIZE.pushed = False
-    _GFX1250_DISPATCH.ctx = None if routed_mx is None else routed_mx[:3]
+    _GFX1250_DISPATCH.ctx = None if routed_mx is None else routed_mx[:4]
     try:
         a1_scale, out_dtype = None, None
         if quantized is not None:

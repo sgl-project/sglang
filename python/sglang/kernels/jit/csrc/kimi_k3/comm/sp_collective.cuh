@@ -390,6 +390,79 @@ __launch_bounds__(kUnrolledThreads, 1) void reduce_scatter_res_unrolled_kernel(c
   if (threadIdx.x == 0) params.counter->commit();
 }
 
+/// `all_gather_push_kernel` on the 2shot_push_unrolled pipeline (one warp group per peer). The rank's own rows get
+/// the same zero-word rewrite as the peers', so every rank holds `all_gather_push_kernel`'s bits.
+template <uint32_t kWorldSize, bool kUsePDL>
+__global__
+__launch_bounds__(kUnrolledThreads, 1) void all_gather_push_unrolled_kernel(const __grid_constant__ Params params) {
+  using vec_t = device::AlignedVector<bf16x2_t, 4>;  // 16 B
+  constexpr uint32_t kHunk = device::kWarpThreads * kUnrolledUnroll;
+
+  device::PDLWaitPrimary<kUsePDL>();
+
+  const auto r = params.rank;
+  const auto len = params.local_vecs;
+  const auto g = PeerGroup::make<kWorldSize>(r);
+  const uint32_t phase = params.counter->load();
+  const auto phase_offset = phase * kWorldSize * params.stride_bytes;
+  const auto input = reinterpret_cast<const vec_t*>(params.input);
+  const auto output = reinterpret_cast<vec_t*>(params.output);
+
+  push_rows_unrolled(
+      g, input, reinterpret_cast<vec_t*>(params.push_workspaces[g.peer] + phase_offset + r * params.stride_bytes), len);
+
+  device::PDLTriggerSecondary<kUsePDL>();
+
+  for (auto j = g.tid; j < len; j += g.num_threads) {
+    vec_t vec = input[j];
+    Lamport::clear_pos_zero(vec.data());
+    output[r * len + j] = vec;
+  }
+
+  // Drain the peer's shard into its rows of the output.
+  const auto poll_ptr =
+      reinterpret_cast<vec_t*>(params.push_workspaces[r] + phase_offset + g.peer * params.stride_bytes);
+  const auto dst = g.peer * len;
+  const auto zero = empty_vec<vec_t>();
+  const auto full = len / kHunk * kHunk;
+  for (uint32_t base = g.group_warp * kHunk; base < full; base += g.group_warps * kHunk) {
+    const auto j = base + g.lane;
+    vec_t vecs[kUnrolledUnroll];
+    while (true) {
+#pragma unroll
+      for (uint32_t u = 0; u < kUnrolledUnroll; ++u) {
+        device::ptx::ld_relaxed_16B(vecs[u], poll_ptr, j + u * device::kWarpThreads);
+      }
+      bool has_zero = false;
+#pragma unroll
+      for (uint32_t u = 0; u < kUnrolledUnroll; ++u) {
+        has_zero |= Lamport::has_pos_zero(vecs[u].data());
+      }
+      if (!has_zero) break;
+      __builtin_amdgcn_s_sleep(1);
+    }
+#pragma unroll
+    for (uint32_t u = 0; u < kUnrolledUnroll; ++u) {
+      output[dst + j + u * device::kWarpThreads] = vecs[u];
+    }
+#pragma unroll
+    for (uint32_t u = 0; u < kUnrolledUnroll; ++u) {
+      device::ptx::st_global_16B(zero, poll_ptr + j, u * device::kWarpThreads);
+    }
+  }
+  for (auto j = full + g.group_tid; j < len; j += g.group_stride) {
+    vec_t vec;
+    do {
+      device::ptx::ld_relaxed_16B(vec, poll_ptr, j);
+    } while (Lamport::has_pos_zero(vec.data()));
+    output[dst + j] = vec;
+    device::ptx::st_global_16B(zero, poll_ptr, j);
+  }
+
+  __syncthreads();
+  if (threadIdx.x == 0) params.counter->commit();
+}
+
 #endif  // USE_ROCM
 
 template <uint32_t kWorldSize, bool kUsePDL>
@@ -579,6 +652,19 @@ struct SPCollectiveKernel {
     const auto kernel = residual.has_value()
                             ? sp_collective::reduce_scatter_res_unrolled_kernel<kWorldSize, true, kUsePDL>
                             : sp_collective::reduce_scatter_res_unrolled_kernel<kWorldSize, false, kUsePDL>;
+    num_blocks = unrolled_blocks(kernel, num_blocks, block_size, input.device().device_id);
+    host::LaunchKernel(num_blocks, block_size, input.device()).enable_pdl(kUsePDL)(kernel, params);
+  }
+
+  /// `all_gather_push` on the 2shot_push_unrolled pipeline.
+  static void all_gather_push_unrolled(
+      CommunicatorRef ref, TensorView input, TensorView output, int64_t num_blocks, int64_t block_size) {
+    const auto& push = ref.get()->get_push_obj();
+    auto params = make_params(*ref.get(), output, input, std::nullopt, false);
+    bind_push(params, push);
+    params.input = static_cast<const uint8_t*>(input.data_ptr());
+    params.output = static_cast<uint8_t*>(output.data_ptr());
+    const auto kernel = sp_collective::all_gather_push_unrolled_kernel<kWorldSize, kUsePDL>;
     num_blocks = unrolled_blocks(kernel, num_blocks, block_size, input.device().device_id);
     host::LaunchKernel(num_blocks, block_size, input.device()).enable_pdl(kUsePDL)(kernel, params);
   }

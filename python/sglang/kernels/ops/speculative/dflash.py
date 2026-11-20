@@ -300,6 +300,37 @@ def _prepare_dflash_draft_block_unchecked(
 
 
 @triton.jit
+def _compact_draft_window_kernel(
+    seq_lens_ptr, lens_out_ptr, start_out_ptr, n, window, page, BLOCK: tl.constexpr
+):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n
+    seq_lens = tl.load(seq_lens_ptr + offs, mask=mask, other=0).to(tl.int64)
+    start = seq_lens - tl.minimum(seq_lens, window)
+    if page > 1:
+        # page-aligned suffix start (start >= 0, so % is torch.remainder)
+        start = start - start % page
+    tl.store(lens_out_ptr + offs, (seq_lens - start).to(tl.int32), mask=mask)
+    tl.store(start_out_ptr + offs, start, mask=mask)
+
+
+def compact_draft_window(
+    seq_lens: torch.Tensor, window: int, page: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per request, the compact draft cache length (int32: the last ``window`` tokens, the start moved down to a
+    multiple of ``page`` when ``page`` > 1) and its start in the full sequence (int64), in one launch."""
+    n = seq_lens.numel()
+    lens = torch.empty(n, dtype=torch.int32, device=seq_lens.device)
+    start = torch.empty(n, dtype=torch.int64, device=seq_lens.device)
+    if n:
+        block = min(max(triton.next_power_of_2(n), 32), 1024)
+        _compact_draft_window_kernel[(triton.cdiv(n, block),)](
+            seq_lens, lens, start, n, int(window), int(page), BLOCK=block, num_warps=1
+        )
+    return lens, start
+
+
+@triton.jit
 def _selector_walk_kernel(
     scores_ptr,
     candidate_ptr,

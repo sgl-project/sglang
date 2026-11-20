@@ -166,6 +166,10 @@ def _jit_module(world_size: int) -> Module:
                         "reduce_scatter_res_unrolled",
                         f"{cls}::reduce_scatter_res_unrolled",
                     ),
+                    (
+                        "all_gather_push_unrolled",
+                        f"{cls}::all_gather_push_unrolled",
+                    ),
                 ]
                 if torch.version.hip
                 else []
@@ -289,6 +293,23 @@ def _all_gather_push_op(
     block_size: int,
 ) -> None:
     _jit_module(world_size).all_gather_push(
+        _COMMS.get(world_size),
+        input.view(-1),
+        output.view(-1),
+        num_blocks,
+        block_size,
+    )
+
+
+@register_custom_op(mutates_args=["output"])
+def _all_gather_push_unrolled_op(
+    world_size: int,
+    input: torch.Tensor,
+    output: torch.Tensor,
+    num_blocks: int,
+    block_size: int,
+) -> None:
+    _jit_module(world_size).all_gather_push_unrolled(
         _COMMS.get(world_size),
         input.view(-1),
         output.view(-1),
@@ -424,6 +445,24 @@ def all_gather_push(
 ) -> torch.Tensor:
     """``all_gather`` through unicast pushes, for push planes without multicast (ROCm)."""
     _all_gather_push_op(
+        world_size,
+        input,
+        output,
+        tuning.num_blocks,
+        tuning.block_size,
+    )
+    return output
+
+
+def all_gather_push_unrolled(
+    world_size: int,
+    input: torch.Tensor,
+    output: torch.Tensor,
+    *,
+    tuning: Tuning = DEFAULT_TUNING,
+) -> torch.Tensor:
+    """ROCm ``all_gather_push`` with one warp group per peer (unrolled); the same output bits."""
+    _all_gather_push_unrolled_op(
         world_size,
         input,
         output,
