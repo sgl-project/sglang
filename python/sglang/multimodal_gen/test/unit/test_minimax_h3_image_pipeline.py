@@ -242,6 +242,15 @@ def test_a_noise_free_rollout_takes_no_noisy_step(server, rollout_fields):
     assert not trajectory.rollout_log_probs.any()
 
 
+def test_cps_last_step_has_log_prob_zero_without_the_gaussian_constants(server):
+    """cps adds no noise on the last step; a request with every step in the window gets 0 there, not NaN."""
+    trajectory = _rollout_through_the_stages(server, rollout_log_prob_no_const=True)
+
+    log_probs = trajectory.rollout_log_probs[0]
+    assert torch.isfinite(log_probs).all()
+    assert (log_probs != 0).tolist() == [True, True, True, True, True, False]
+
+
 def test_returned_latents_are_a_subset_while_steps_stay_indexed_by_step(server):
     """miles asks back the noisy steps' latents only, then indexes log-probs and debug tensors by step number."""
     trajectory = _rollout_through_the_stages(
