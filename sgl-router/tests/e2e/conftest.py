@@ -376,4 +376,13 @@ def gpu_allocator() -> Iterator[GPUAllocator]:
     n = _detect_gpu_count()
     if n == 0:
         pytest.skip("no GPUs available to this process; tests/e2e/ is GPU-only")
+    # `acquire` skips a test that asks for more cards than the allotment, and a
+    # skipped test leaves the run green. CI states the allotment it expects so a
+    # runner with fewer cards fails instead of quietly dropping those tests.
+    required = int(os.environ.get("SGL_ROUTER_E2E_MIN_GPUS", "0"))
+    if n < required:
+        pytest.fail(
+            f"this process may use {n} GPU(s) but SGL_ROUTER_E2E_MIN_GPUS={required}: "
+            "the multi-GPU tests would skip, not fail"
+        )
     yield GPUAllocator(n)

@@ -130,6 +130,7 @@ class Router:
         worker_urls: list[str],
         policy: str = "round_robin",
         kv_indexer_endpoint: str | None = None,
+        extra_args: list[str] | None = None,
         timeout: float = 60.0,
     ) -> None:
         """Start the router in regular (non-PD) mode.
@@ -145,6 +146,7 @@ class Router:
             policy: Policy kind — ``round_robin``, ``random``, ``power_of_two``,
                     or ``cache_aware``.
             kv_indexer_endpoint: Optional external KV Indexer gRPC endpoint.
+            extra_args: Further router flags, appended verbatim.
             timeout: How long to wait for ``/readyz`` before giving up.
         """
         self._launch(
@@ -154,6 +156,7 @@ class Router:
                 urls=list(worker_urls),
                 policy=policy,
                 kv_indexer_endpoint=kv_indexer_endpoint,
+                extra_args=extra_args,
             ),
             timeout=timeout,
         )
@@ -166,6 +169,7 @@ class Router:
         prefill_urls: list[str],
         decode_urls: list[str],
         policy: str = "round_robin",
+        extra_args: list[str] | None = None,
         timeout: float = 60.0,
     ) -> None:
         """Start the router in PD-disaggregated mode.
@@ -177,7 +181,7 @@ class Router:
         must have been launched with ``--disaggregation-mode`` and
         ``--disaggregation-bootstrap-port`` for the PD role to be
         picked up (see ``model_pool.spawn_worker``); modern SGLang is
-        assumed.
+        assumed. ``extra_args`` are further router flags, e.g. ``--dp-aware``.
         """
         self._launch(
             self._build_args(
@@ -185,6 +189,7 @@ class Router:
                 tokenizer_path=tokenizer_path,
                 urls=list(prefill_urls) + list(decode_urls),
                 policy=policy,
+                extra_args=extra_args,
             ),
             timeout=timeout,
         )
@@ -254,6 +259,7 @@ class Router:
         urls: list[str],
         policy: str,
         kv_indexer_endpoint: str | None = None,
+        extra_args: list[str] | None = None,
     ) -> list[str]:
         resolved_tokenizer = _resolve_tokenizer_path(tokenizer_path)
 
@@ -280,6 +286,8 @@ class Router:
             ]
         if kv_indexer_endpoint is not None:
             args += ["--kv-indexer-endpoint", kv_indexer_endpoint]
+        if extra_args:
+            args += list(extra_args)
         # `--worker-urls` is multi-valued; keep it last so clap doesn't
         # absorb a following flag as a URL.
         args += ["--worker-urls", *urls]
