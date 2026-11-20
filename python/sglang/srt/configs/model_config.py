@@ -2757,6 +2757,8 @@ multimodal_breakable_cuda_graph_supported_model_archs = [
     "Qwen3_5MoeForConditionalGeneration",
     "Qwen4ExpForConditionalGeneration",
     "MuseGlimmerForConditionalGeneration",
+    "Qwen3VLForConditionalGeneration",
+    "Qwen3VLMoeForConditionalGeneration",
     "MuseSparkForConditionalGeneration",
     "KimiK3ForConditionalGeneration",
     "KimiK31ForConditionalGeneration",
