@@ -312,8 +312,14 @@ class RayEngine(Engine):
 
         task = asyncio.create_task(send_probe())
         try:
-            # Compared against real_time(), which is time.time().
-            while tokenizer_manager.last_receive_tstamp <= sent_at:
+            while True:
+                # Checked on every poll: a scheduler that exits during the probe
+                # fails it even if outputs it sent earlier still arrive.
+                if self._scheduler_exit_error is not None:
+                    raise self._scheduler_exit_error
+                # Compared against real_time(), which is time.time().
+                if tokenizer_manager.last_receive_tstamp > sent_at:
+                    return
                 if task.done() and task.exception() is not None:
                     raise task.exception()
                 if time.monotonic() >= deadline:
@@ -341,12 +347,15 @@ class RayEngine(Engine):
         logger.error(f"{error}; failing pending and new requests")
         self._scheduler_exit_error = error
         tokenizer_manager = self.tokenizer_manager
+        # Set before reading event_loop. generate_request starts the handle loop
+        # and then checks this flag, so a request either sees the flag and gets
+        # 503, or has started the loop and is failed by handle_scheduler_exit.
+        tokenizer_manager.scheduler_exit_error = str(error)
         loop = tokenizer_manager.event_loop
         if loop is None:
             # No request has started the handle loop, so none is pending.
-            tokenizer_manager.handle_scheduler_exit(str(error))
             return
-        # Request events belong to the handle loop and are not thread-safe.
+        # Request state belongs to the handle loop and is not thread-safe.
         loop.call_soon_threadsafe(tokenizer_manager.handle_scheduler_exit, str(error))
 
     def shutdown(self):
