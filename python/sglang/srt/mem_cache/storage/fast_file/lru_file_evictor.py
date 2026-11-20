@@ -437,15 +437,18 @@ class LRUFileEvictor:
         # Credit reclaimed bytes instead of re-probing statvfs per victim;
         # the final probe below catches filesystems that free space lazily.
         free = fs[1]
+        # Pending writes may not have allocated their disk space yet. Charging
+        # their full size is conservative until commit/abort releases them.
+        needed_bytes = value_bytes + sum(self._lru[key] for key in self._pending_writes)
         before_entries = len(self._lru)
         self._evict_while(
-            lambda reclaimed: (free + reclaimed) - value_bytes < self.min_free_bytes
+            lambda reclaimed: (free + reclaimed) - needed_bytes < self.min_free_bytes
         )
         self._foreground_evicted_entries += before_entries - len(self._lru)
         fs = self._fs_stats()
         if fs is None:
             return False
-        return fs[1] - value_bytes >= self.min_free_bytes
+        return fs[1] - needed_bytes >= self.min_free_bytes
 
     def _scan_existing_files(self, *, track_entries: bool) -> None:
         """Remove stale temp files and optionally seed the LRU (oldest first)."""

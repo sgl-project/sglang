@@ -985,6 +985,38 @@ class TestMinFreeSpace(FastFileTestBase):
         self.assertFalse(b.set("nope", _t(100)))
         self.assertFalse(b.exists("nope"))
 
+    def test_pending_writes_hold_free_space_until_released(self):
+        for release in ("commit", "abort", "clear_storage"):
+            with self.subTest(release=release):
+                b = self.make_backend(min_free="100")
+                pending = b._get_suffixed_key("pending")
+                with mock.patch.object(
+                    b._evictor, "_fs_stats", return_value=(1024, 250)
+                ):
+                    self.assertTrue(b._evictor.reserve(pending, 100))
+                    self.assertFalse(b.set("blocked", _t(100)))
+                    self.assertFalse(b.exists("blocked"))
+                    if release == "clear_storage":
+                        self.assertTrue(b._evictor.clear_storage())
+                    else:
+                        getattr(b._evictor, release)(pending)
+                    self.assertTrue(b.set("admitted", _t(100)))
+
+    def test_pending_writes_are_included_when_selecting_eviction_victims(self):
+        b = self.make_backend(min_free="100")
+        self.assertTrue(b.set("victim", _t(80)))
+        pending = b._get_suffixed_key("pending")
+        self.assertTrue(b._evictor.reserve(pending, 40))
+        victim_path = b._page_path(b._get_suffixed_key("victim"))
+        with mock.patch.object(
+            b._evictor,
+            "_fs_stats",
+            side_effect=lambda: (1024, 180 if os.path.exists(victim_path) else 260),
+        ):
+            self.assertTrue(b.set("new", _t(60)))
+        self.assertFalse(b.exists("victim"))
+        self.assertIn(pending, b._evictor._pending_writes)
+
     def test_evicts_to_restore_the_floor(self):
         b = self.make_backend(min_free="100")
         suffixed = b._get_suffixed_key("victim")
