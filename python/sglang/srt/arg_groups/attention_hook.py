@@ -508,7 +508,7 @@ def handle_linear_attn_backend(server_args: Any):
                     f"SGLANG_RAGGED_VERIFY_MODE={ragged_mode.value} requires the "
                     "KDA fold-every-commit family (DSPARK/DFLASH) and a "
                     "ring-writing verify kernel (--linear-attn-verify-backend "
-                    "triton or nv_cutedsl); got "
+                    "triton, nv_cutedsl or aiter); got "
                     f"algorithm={cfg.speculative_algorithm!r}, "
                     f"verify={verify!r}. Use SGLANG_RAGGED_VERIFY_MODE=static."
                 )
