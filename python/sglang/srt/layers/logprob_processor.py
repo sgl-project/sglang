@@ -2,23 +2,26 @@ from __future__ import annotations
 
 import bisect
 import dataclasses
+import itertools
 import logging
 from contextlib import nullcontext
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Union
 
+import numpy as np
 import torch
 
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     is_symmetric_memory_enabled,
 )
 from sglang.srt.environ import envs
+from sglang.srt.managers.req_types import TokenIdRows
 from sglang.srt.model_executor.runner_utils.pool import (
     borrow_graph_pool,
     graph_pool_borrow_largest_run,
 )
 from sglang.srt.runtime_context import get_exec
-from sglang.srt.utils.common import async_d2h, is_pin_memory_available
+from sglang.srt.utils.device import async_d2h, is_pin_memory_available
 
 if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
@@ -298,9 +301,55 @@ def get_top_logprobs_chunk(
     return next_split_pruned_len
 
 
+@dataclasses.dataclass(slots=True)
+class _RaggedRows:
+    """Rows of differing length, stored as their concatenation and each row's size."""
+
+    values: torch.Tensor
+    lengths: List[int]
+
+    def tolist(self) -> List[List[float]]:
+        # One host copy for all rows, then cut in Python.
+        flat = self.values.tolist()
+        ends = itertools.accumulate(self.lengths)
+        return [flat[end - length : end] for length, end in zip(self.lengths, ends)]
+
+
+def _gather_token_id_rows(
+    logprobs: torch.Tensor,
+    first_row: int,
+    token_id_rows: List[List[int]],
+    log_normalizer: Optional[Tuple[torch.Tensor, torch.Tensor]],
+    copy_to_pinned_cpu: bool,
+) -> _RaggedRows:
+    """Gather each row's own token ids from ``logprobs`` with one host copy."""
+    device = logprobs.device
+    lengths = [len(row) for row in token_id_rows]
+    num_ids = sum(lengths)
+    index = torch.empty(
+        (2, num_ids), dtype=torch.long, pin_memory=is_pin_memory_available(device)
+    )
+    index[0] = torch.arange(first_row, first_row + len(lengths)).repeat_interleave(
+        torch.tensor(lengths, dtype=torch.long), output_size=num_ids
+    )
+    index[1] = torch.from_numpy(
+        np.fromiter(
+            itertools.chain.from_iterable(token_id_rows), dtype=np.int64, count=num_ids
+        )
+    )
+    rows, columns = index.to(device, non_blocking=True).unbind(0)
+    values = logprobs[rows, columns]
+    if log_normalizer is not None:
+        row_max, row_log_sum = log_normalizer
+        values = (values.float() - row_max[rows]) - row_log_sum[rows]
+    if copy_to_pinned_cpu:
+        values = async_d2h(values)
+    return _RaggedRows(values, lengths)
+
+
 def get_token_ids_logprobs_chunk(
     logprobs: torch.Tensor,
-    token_ids_logprobs: List[int],
+    token_ids_logprobs: List[Optional[Union[List[int], TokenIdRows]]],
     pruned_lens: List[int],
     token_ids_logprobs_val: List,
     token_ids_logprobs_idx: List,
@@ -314,7 +363,8 @@ def get_token_ids_logprobs_chunk(
         logprobs: Log probabilities tensor of shape [seq_len, vocab_size].
             With ``log_normalizer`` set, raw logits instead; gathered rows are
             normalized by subtraction.
-        token_ids_logprobs: List of token IDs for each sequence
+        token_ids_logprobs: For each sequence, the token IDs to report at every
+            row, or a TokenIdRows giving each row its own token IDs
         pruned_lens: List of pruned lengths for each sequence
         token_ids_logprobs_val: List to store token logprob values
         token_ids_logprobs_idx: List to store token indices
@@ -358,7 +408,18 @@ def get_token_ids_logprobs_chunk(
         # Get the token ids logprobs
         val = []
         idx = []
-        if token_ids is not None and available_len > 0:
+        if isinstance(token_ids, TokenIdRows):
+            wanted = token_ids.rows[split_pruned_len : split_pruned_len + available_len]
+            if wanted:
+                span = _gather_token_id_rows(
+                    logprobs, pt, wanted, log_normalizer, copy_to_pinned_cpu
+                )
+                if copy_to_pinned_cpu:
+                    val.append(span)
+                else:
+                    val.extend(span.tolist())
+                idx.extend(wanted)
+        elif token_ids is not None and available_len > 0:
             rows = logprobs[pt : pt + available_len, token_ids]
             if log_normalizer is not None:
                 rows = (
@@ -431,7 +492,16 @@ def compute_spec_logprobs(
         1, accepted_token_ids.long().view(-1, 1)
     ).view(bs, max_accept)
 
-    if batch.top_logprobs_nums and any(x > 0 for x in batch.top_logprobs_nums):
+    top_k = batch.top_logprobs_nums[0] if batch.top_logprobs_nums else 0
+    if top_k > 0 and all(x == top_k for x in batch.top_logprobs_nums):
+        # Every row asks for the same k: one [bs * max_accept, k] pair, so the
+        # result is copied to the host and converted to lists once per step
+        # instead of once per row.
+        (
+            logits_output.next_token_top_logprobs_val,
+            logits_output.next_token_top_logprobs_idx,
+        ) = gathered_logprobs.topk(top_k, dim=-1)
+    elif batch.top_logprobs_nums and any(x > 0 for x in batch.top_logprobs_nums):
         top_logprobs_nums_expanded = [
             num for num in batch.top_logprobs_nums for _ in range(max_accept)
         ]
@@ -818,92 +888,11 @@ class InputLogprobProcessor:
         )
 
 
-def get_token_ids_logprobs_batch_optimized(
-    logprobs: torch.Tensor,
-    token_ids_logprobs: List[List[int]],
-) -> Tuple[List, List]:
-    """
-    Vectorized batch processing for token ID logprobs extraction.
-
-    Uses a single GPU kernel call for the entire batch instead of multiple
-    separate calls, significantly improving performance for large batches.
-
-    Args:
-        logprobs: Log probabilities tensor [batch_size, vocab_size]
-        token_ids_logprobs: List of token IDs to extract logprobs for
-
-    Example:
-        # Input: batch_size=3, vocab_size=5
-        logprobs = torch.tensor([
-            [-1.2, -2.1, -0.8, -3.0, -1.5],  # batch 0
-            [-0.5, -1.8, -2.2, -1.1, -2.7],  # batch 1
-            [-2.0, -0.9, -1.4, -2.8, -1.6],  # batch 2
-        ])
-        token_ids_logprobs = [[1, 3], [2], [0, 2, 4]]
-
-        # Output:
-        # values = [tensor([-2.1, -3.0]), tensor([-2.2]), tensor([-2.0, -1.4, -1.6])]
-        # indices = [[1, 3], [2], [0, 2, 4]]
-    """
-    batch_size = len(token_ids_logprobs)
-    device = logprobs.device
-
-    # Step 1: Calculate lengths for each request, treating None as empty list
-    # Example: [[1, 3], [2], [0, 2, 4]] -> token_lengths = tensor([2, 1, 3])
-    token_lengths = torch.tensor(
-        [len(token_ids or []) for token_ids in token_ids_logprobs], device=device
-    )
-    total_tokens = int(token_lengths.sum().item())  # 2 + 1 + 3 = 6
-
-    # Handle edge case where no tokens are requested
-    if total_tokens == 0:
-        return [logprobs.new_empty(0) for _ in token_ids_logprobs], [
-            [] for _ in token_ids_logprobs
-        ]
-
-    # Step 2: Build flattened indices using torch operations
-    # Example: row_indices = [0, 0, 1, 2, 2, 2] (batch indices repeated by their lengths)
-    row_indices = torch.repeat_interleave(
-        torch.arange(batch_size, device=device), token_lengths
-    )
-    # Example: col_indices = [1, 3, 2, 0, 2, 4] (flattened token IDs from all requests)
-    col_indices = torch.tensor(
-        [
-            token_id
-            for token_ids in token_ids_logprobs
-            for token_id in (token_ids or [])
-        ],
-        device=device,
-        dtype=torch.long,
-    )
-
-    # Step 3: Single vectorized gather operation
-    # Example: logprobs[row_indices, col_indices] -> [-2.1, -3.0, -2.2, -2.0, -1.4, -1.6]
-    gathered_logprobs = logprobs[row_indices, col_indices]
-
-    # Step 4: Split results back per request using torch operations
-    # Example: split tensor [6] into chunks of sizes [2, 1, 3] -> [tensor(2), tensor(1), tensor(3)]
-    split_logprobs = torch.split_with_sizes(
-        gathered_logprobs, token_lengths.tolist(), dim=0
-    )
-
-    # Step 5: Format output to match expected return structure
-    # Example: Convert split tensors back to list format with proper empty handling
-    # i=0: [1,3] -> append split_logprobs[0] and [1,3]
-    # i=1: [2] -> append split_logprobs[1] and [2]
-    # i=2: [0,2,4] -> append split_logprobs[2] and [0,2,4]
-    output_token_ids_logprobs_val = []
-    output_token_ids_logprobs_idx = []
-
-    for i, token_ids in enumerate(token_ids_logprobs):
-        if token_ids is not None and len(token_ids) > 0:
-            output_token_ids_logprobs_val.append(split_logprobs[i])
-            output_token_ids_logprobs_idx.append(token_ids)
-        else:
-            output_token_ids_logprobs_val.append(logprobs.new_empty(0))
-            output_token_ids_logprobs_idx.append([])
-
-    return output_token_ids_logprobs_val, output_token_ids_logprobs_idx
+def _drop_token_id_rows(token_ids_logprobs: List) -> List[Optional[List[int]]]:
+    return [
+        None if isinstance(token_ids, TokenIdRows) else token_ids
+        for token_ids in token_ids_logprobs
+    ]
 
 
 class OutputLogprobProcessor:
@@ -937,7 +926,7 @@ class OutputLogprobProcessor:
                 result.token_ids_logprobs_val,
                 result.token_ids_logprobs_idx,
             ) = get_token_ids_logprobs(
-                logprobs, token_ids_logprobs, no_copy_to_cpu=True
+                logprobs, _drop_token_id_rows(token_ids_logprobs), no_copy_to_cpu=True
             )
 
         result.token_logprobs = logprobs[
@@ -964,6 +953,7 @@ class OutputLogprobProcessor:
             logger.warning("No logits available for logprob computation")
             return None
 
+        token_ids_logprobs = _drop_token_id_rows(token_ids_logprobs)
         # Check if any requests actually need logprobs computation
         needs_token_ids_logprobs = any(
             token_ids is not None and len(token_ids) > 0

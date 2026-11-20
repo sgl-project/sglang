@@ -23,12 +23,12 @@ from sglang.srt.layers.quantization.base_config import (
 )
 from sglang.srt.layers.quantization.compressed_tensors.utils import should_ignore_layer
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
     is_cuda,
     is_host_cpu_arm64,
-    set_weight_attrs,
     use_intel_amx_backend,
 )
 from sglang.srt.utils.patch_torch import register_fake_if_exists

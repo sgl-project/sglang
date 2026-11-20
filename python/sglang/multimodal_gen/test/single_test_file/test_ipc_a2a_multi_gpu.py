@@ -10,10 +10,14 @@ suite reaches them. Runs on 2 ranks, and on 4 when four GPUs are visible:
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import os
 import subprocess
 import sys
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
@@ -43,6 +47,35 @@ def _attend_rows(q, k, v):
         - v.roll(1, 1)[:, -rows:]
         + v[:, :rows] * 0.5
     ).to(q.dtype)
+
+
+def _deny_pidfd_getfd() -> None:
+    """Fail pidfd_getfd with EPERM in this process, as containers without ptrace
+    rights do; importing an expandable-segment IPC handle needs it."""
+
+    class Insn(ctypes.Structure):  # struct sock_filter
+        _fields_ = [
+            ("code", ctypes.c_uint16),
+            ("jt", ctypes.c_uint8),
+            ("jf", ctypes.c_uint8),
+            ("k", ctypes.c_uint32),
+        ]
+
+    class Prog(ctypes.Structure):  # struct sock_fprog
+        _fields_ = [("len", ctypes.c_uint16), ("filter", ctypes.POINTER(Insn))]
+
+    insns = (Insn * 4)(
+        Insn(0x20, 0, 0, 0),  # load the syscall number
+        Insn(0x15, 0, 1, 438),  # pidfd_getfd, the same number on every arch
+        Insn(0x06, 0, 0, 0x00050000 | errno.EPERM),  # SECCOMP_RET_ERRNO
+        Insn(0x06, 0, 0, 0x7FFF0000),  # SECCOMP_RET_ALLOW
+    )
+    libc = ctypes.CDLL(None, use_errno=True)
+    # PR_SET_NO_NEW_PRIVS, then PR_SET_SECCOMP with SECCOMP_MODE_FILTER
+    if libc.prctl(38, 1, 0, 0, 0) or libc.prctl(
+        22, 2, ctypes.byref(Prog(len(insns), insns)), 0, 0
+    ):
+        raise OSError(ctypes.get_errno(), "could not install the seccomp filter")
 
 
 def _worker() -> int:
@@ -151,10 +184,10 @@ def _worker() -> int:
                 )
 
     # groups=-1 picks the most groups that divide the heads per rank and whose
-    # calls still fill four waves of 128-row tiles, and still matches; a shape too
+    # calls still fill three waves of 128-row tiles, and still matches; a shape too
     # small to fill them keeps the sequential exchange
     sms = torch.cuda.get_device_properties(rank).multi_processor_count
-    s_auto = 4 * sms * 128 // world  # one head per group fills four waves
+    s_auto = 3 * sms * 128 // world  # one head per group fills three waves
     torch.manual_seed(77)
     full = [
         torch.randn(s_auto * world, 16, 64, dtype=torch.bfloat16, device="cuda")
@@ -326,7 +359,7 @@ def _worker() -> int:
 
 
 class TestIpcA2AMultiGpu(CustomTestCase):
-    def _run(self, world: int, port: int):
+    def _run(self, world: int, port: int, *worker_args: str, **env: str):
         if not current_platform.is_cuda():
             self.skipTest("CUDA-IPC transport is unavailable on this platform")
         if torch.cuda.device_count() < world:
@@ -340,10 +373,12 @@ class TestIpcA2AMultiGpu(CustomTestCase):
                 f"--master-port={port}",
                 __file__,
                 "--worker",
+                *worker_args,
             ],
             capture_output=True,
             text=True,
             timeout=1200,
+            env={**os.environ, **env},
         )
         print(proc.stdout[-4000:])
         if proc.returncode != 0:
@@ -358,8 +393,88 @@ class TestIpcA2AMultiGpu(CustomTestCase):
     def test_four_ranks_match_sequential_bitwise(self):
         self._run(4, 29537)
 
+    def test_two_ranks_engage_under_expandable_segments_without_pidfd_getfd(self):
+        self._run(
+            2,
+            29547,
+            "--deny-pidfd-getfd",
+            PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True",
+        )
+
+
+class TestAutoPipelineGroups(CustomTestCase):
+    def test_group_counts_at_known_shapes(self):
+        """148 SMs: MiniMax-H3 at Ulysses 4 runs 7 two-head groups at 1280x704
+        and 1344x768; Wan 1.3B at Ulysses 4 (one head per group) stays sequential."""
+        from sglang.multimodal_gen.runtime.distributed.device_communicators import (
+            ipc_a2a_multi,
+        )
+
+        def groups(rows, heads):
+            plan = ipc_a2a_multi._PipelinePlan(
+                batch=1,
+                s_local=rows // 4,
+                heads=(heads,) * 3,
+                head_dim=128,
+                replicated=(0, 0, 0),
+                replicated_first=True,
+                world=4,
+                groups=-1,
+            )
+            return ipc_a2a_multi._auto_pipeline_groups(plan)
+
+        with (
+            mock.patch.object(ipc_a2a_multi, "_sm_count", return_value=148),
+            mock.patch.object(torch.cuda, "current_device", return_value=0),
+        ):
+            self.assertEqual(groups(33024, 56), 7)
+            self.assertEqual(groups(37120, 56), 7)
+            self.assertEqual(groups(32768, 12), 0)
+
+
+class TestPlainExchangeTransport(CustomTestCase):
+    def test_unset_switch_picks_the_copy_engine_where_it_measured_faster(self):
+        """Unset: three- and four-rank groups on Blackwell from the payload each
+        measured ahead at. Set: the switch decides for every exchange."""
+        from sglang.multimodal_gen import envs
+        from sglang.multimodal_gen.runtime import platforms
+        from sglang.multimodal_gen.runtime.distributed.device_communicators import (
+            ipc_a2a_multi,
+        )
+
+        mib = 1 << 20
+
+        def takes_copy_engine(world, nbytes, switch=None, blackwell=True):
+            platform = SimpleNamespace(is_blackwell=lambda: blackwell)
+            with (
+                mock.patch.object(envs, "SGLANG_DIFFUSION_IPC_A2A_MULTI", switch),
+                mock.patch.object(platforms, "current_platform", platform),
+                mock.patch.object(
+                    ipc_a2a_multi.dist, "get_world_size", return_value=world
+                ),
+                mock.patch.object(
+                    ipc_a2a_multi,
+                    "ipc_a2a_multi_ready",
+                    side_effect=lambda group, enabled: enabled,
+                ),
+            ):
+                return ipc_a2a_multi.plain_exchange_ready(None, nbytes)
+
+        self.assertTrue(takes_copy_engine(4, 128 * mib))
+        self.assertFalse(takes_copy_engine(4, 128 * mib - 1))
+        self.assertTrue(takes_copy_engine(3, 48 * mib))
+        self.assertFalse(takes_copy_engine(3, 48 * mib - 1))
+        # pairs have their own transport; larger groups are not measured
+        self.assertFalse(takes_copy_engine(2, 1024 * mib))
+        self.assertFalse(takes_copy_engine(8, 1024 * mib))
+        self.assertFalse(takes_copy_engine(4, 1024 * mib, blackwell=False))
+        self.assertTrue(takes_copy_engine(2, 1, switch=True, blackwell=False))
+        self.assertFalse(takes_copy_engine(4, 1024 * mib, switch=False))
+
 
 if __name__ == "__main__":
     if "--worker" in sys.argv:
+        if "--deny-pidfd-getfd" in sys.argv:
+            _deny_pidfd_getfd()
         raise SystemExit(_worker())
     unittest.main()

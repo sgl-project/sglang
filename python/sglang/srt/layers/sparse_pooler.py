@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import PretrainedConfig
 
-from sglang.srt.model_executor.model_runner import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 @dataclass

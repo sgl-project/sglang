@@ -19,8 +19,9 @@ It takes over the control of the distributed environment from PyTorch.
 The typical workflow is:
 
 - call `init_distributed_environment` to initialize the distributed environment.
-- call `initialize_model_parallel` or `ensure_model_parallel_initialized` to
- initialize the model parallel groups.
+- call `initialize_model_parallel` or
+ `maybe_init_distributed_environment_and_model_parallel` to initialize the
+ model parallel groups.
 
 - any code dealing with the distributed stuff
 
@@ -68,6 +69,9 @@ _REPLICA: GroupCoordinator | None = None
 _ENCODER_DP: GroupCoordinator | None = None
 _SRT_MOE_EP = None
 _VAE_DECODE: GroupCoordinator | None = None
+# the CFG ranks as one Ulysses group for stages that run without CFG; a view
+# over _CFG's communicators, built only when cfg > 1 and sp == 1
+_CFG_SP: SequenceParallelGroupCoordinator | None = None
 _DIT: ProcessGroup | None = None
 _VAE: ProcessGroup | None = None
 _VAE_DECODE_PARALLEL_AXES = "tp-sp-pp-cfg"
@@ -497,31 +501,18 @@ def initialize_model_parallel(
     global _SP
     assert _SP is None, "sequence parallel group is already initialized"
 
-    try:
-        from .parallel_groups import PROCESS_GROUP as _YC_PROCESS_GROUP
-        from .parallel_groups import (
-            set_seq_parallel_pg_by_sp_groups as _set_seq_parallel_pg_by_sp_groups,
-        )
-    except ImportError:
-        _set_seq_parallel_pg_by_sp_groups = None
+    from .parallel_groups import PROCESS_GROUP, set_seq_parallel_pg_by_sp_groups
 
-        class _DummyProcessGroup:
-            ULYSSES_PG = torch.distributed.group.WORLD
-            RING_PG = torch.distributed.group.WORLD
-
-        PROCESS_GROUP = _DummyProcessGroup()
-    else:
-        # Build SGLang Diffusion SP sub-groups based on the true SP groups. This is
-        # critical when TP>1, because SP groups may be strided in global ranks
-        # (e.g., tp-sp order).
-        sp_groups = rank_generator.get_ranks("sp")
-        _set_seq_parallel_pg_by_sp_groups(
-            sp_ulysses_degree=ulysses_degree,
-            sp_ring_degree=ring_degree,
-            rank=get_world_group().rank,
-            sp_groups=sp_groups,
-        )
-        PROCESS_GROUP = _YC_PROCESS_GROUP
+    # Build SGLang Diffusion SP sub-groups based on the true SP groups. This is
+    # critical when TP>1, because SP groups may be strided in global ranks
+    # (e.g., tp-sp order).
+    sp_groups = rank_generator.get_ranks("sp")
+    set_seq_parallel_pg_by_sp_groups(
+        sp_ulysses_degree=ulysses_degree,
+        sp_ring_degree=ring_degree,
+        rank=get_world_group().rank,
+        sp_groups=sp_groups,
+    )
 
     _SP = init_parallel_group_coordinator(
         group_ranks=rank_generator.get_ranks("sp"),
@@ -531,6 +522,11 @@ def initialize_model_parallel(
         ulysses_group=PROCESS_GROUP.ULYSSES_PG,
         ring_group=PROCESS_GROUP.RING_PG,
     )
+
+    global _CFG_SP
+    assert _CFG_SP is None, "CFG sequence parallel group is already initialized"
+    if classifier_free_guidance_degree > 1 and sequence_parallel_degree == 1:
+        _CFG_SP = SequenceParallelGroupCoordinator.over_group(_CFG, _SP.ring_group)
 
     global _TP
     assert _TP is None, "Tensor parallel group is already initialized"
@@ -612,6 +608,26 @@ def initialize_model_parallel(
     if vae_parallel_size > 0:
         init_vae_group(dit_parallel_size, vae_parallel_size, backend)
     init_dit_group(dit_parallel_size, backend)
+
+
+def get_cfg_sequence_parallel_group() -> SequenceParallelGroupCoordinator | None:
+    return _CFG_SP
+
+
+@contextmanager
+def use_sequence_parallel_group(sp_group: SequenceParallelGroupCoordinator):
+    """Route every SP accessor in the scope to ``sp_group``.
+
+    Latent shards, RoPE offsets and the Ulysses all-to-alls all read the group
+    through these accessors, so a stage runs entirely on one topology.
+    """
+    global _SP
+    old_sp_group = _SP
+    _SP = sp_group
+    try:
+        yield
+    finally:
+        _SP = old_sp_group
 
 
 def get_sp_world_size() -> int:
@@ -905,6 +921,7 @@ def init_vae_group(
 def destroy_model_parallel() -> None:
     """Set the groups to none and destroy them."""
     global _TP, _SP, _DP, _CFG, _PP, _VAE_DECODE, _DIT, _VAE, _REPLICA, _ENCODER_DP
+    global _CFG_SP
 
     _clear_srt_tp_group()
     # The IPC transport keeps CUDA mappings associated with the current
@@ -959,3 +976,5 @@ def destroy_model_parallel() -> None:
     _TP, _SP, _DP, _CFG, _PP, _VAE_DECODE, _DIT, _VAE, _REPLICA, _ENCODER_DP = (
         None,
     ) * 10
+    # a view over _CFG's communicators, released with it
+    _CFG_SP = None

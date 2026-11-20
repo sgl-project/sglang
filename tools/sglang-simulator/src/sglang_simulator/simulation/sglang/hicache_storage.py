@@ -38,12 +38,20 @@ class MockHiCacheStorage:
 
         self.registered_pools = {}
 
+    def consumes_kv_hints(self) -> bool:
+        """Simulated storage tracks keys only and does not consume request hints."""
+        return False
+
     def register_mem_pool_host(self, mem_pool_host):
         pass
 
     def register_mem_host_pool_v2(self, host_pool, host_pool_name):
         """Register one pool from UnifiedRadixCache's multi-pool HiCache stack."""
         self.registered_pools[host_pool_name] = host_pool
+
+    def on_host_pools_registered(self):
+        """The initial registration burst is over (see HiCacheStorage)."""
+        pass
 
     @staticmethod
     def _pool_storage_key(key: str, pool_name) -> str:

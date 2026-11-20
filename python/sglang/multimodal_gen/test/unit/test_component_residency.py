@@ -1,4 +1,5 @@
 import sys
+import weakref
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -14,11 +15,13 @@ from sglang.multimodal_gen.runtime.loader.utils import component_residency_bytes
 from sglang.multimodal_gen.runtime.managers.memory_managers import (
     component_residency_strategies as residency_strategies,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers import (
+    host_memory_breakdown,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentResidencyManager,
     ComponentUse,
     ResidencyState,
-    WarmupPhasePeak,
     build_component_residency_strategy,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
@@ -134,6 +137,34 @@ def test_snapshot_offload_preserves_host_storage_and_live_buffers(
     assert not weight_d2h
 
 
+@pytest.mark.parametrize("free_gib, loads", [(0.5, False), (64, True)])
+def test_component_offload_xpu_prefetch_only_when_it_fits(monkeypatch, free_gib, loads):
+    # A synchronous XPU prefetch loaded the next component beside the kept one
+    # and OOMed LongCat-Image on a 24 GiB card; it must still run when it fits.
+    monkeypatch.setattr(current_platform, "is_xpu", lambda: True)
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: False)
+    monkeypatch.setattr(
+        residency_strategies, "get_local_torch_device", lambda: torch.device("cpu")
+    )
+    monkeypatch.setattr(
+        residency_strategies, "_module_ready_on_local_device", lambda *a, **k: False
+    )
+    monkeypatch.setattr(
+        current_platform,
+        "get_available_gpu_memory",
+        lambda device_id, empty_cache: free_gib,
+    )
+    load = Mock()
+    monkeypatch.setattr(ComponentOffloadStrategy, "_load_component", load)
+    strategy = ComponentOffloadStrategy()
+    use = ComponentUse("denoise", "transformer")
+
+    fetched = strategy.prefetch_for_use(torch.nn.Linear(4, 4), use, ResidencyState())
+
+    assert fetched is loads
+    assert load.called is loads
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_snapshot_offload_refit_and_lora_context_refresh_weights():
     module = torch.nn.Linear(4, 4, bias=False)
@@ -147,7 +178,10 @@ def test_snapshot_offload_refit_and_lora_context_refresh_weights():
     strategy.prepare_for_use(module, use, state)
     torch.testing.assert_close(module.weight, torch.full((4, 4), 2.0, device="cuda"))
 
-    pipeline = SimpleNamespace(modules={"transformer": module})
+    modules = {"transformer": module}
+    pipeline = SimpleNamespace(
+        modules=modules, _lora_module=lambda name: modules.get(name)
+    )
     with LoRAPipeline._temporarily_disable_offload(
         pipeline, target="transformer", use_module_names_only=True
     ):
@@ -479,6 +513,49 @@ def test_request_tail_uses_dynamic_component_instance():
     )
 
 
+def test_host_memory_debug_report_runs_at_the_request_tail(monkeypatch):
+    """With SGLANG_DIFFUSION_DEBUG_HOST_MEMORY set on a device that shares host
+    memory, the request tail reports the pipeline's components; the report must
+    not fail a request whose forward already finished."""
+    pipeline = SimpleNamespace(
+        modules={"encoder": torch.nn.Linear(2, 2)},
+        _stage_name_mapping={},
+        component_residency_strategies={},
+    )
+    manager = ComponentResidencyManager(pipeline, _server_args())
+    # The report walks every live object; a proxy to a collected object is one of them.
+    referent = torch.nn.Identity()
+    dead_proxy = weakref.proxy(referent)
+    del referent
+    reports = []
+    real_report = host_memory_breakdown.log_host_memory_breakdown
+
+    def report(modules, *, label):
+        reports.append((modules, label))
+        real_report(modules, label=label)
+
+    monkeypatch.setenv("SGLANG_DIFFUSION_DEBUG_HOST_MEMORY", "1")
+    monkeypatch.setattr(current_platform, "device_shares_host_memory", lambda: True)
+    monkeypatch.setattr(
+        torch,
+        "get_device_module",
+        lambda: SimpleNamespace(is_available=lambda: True, empty_cache=lambda: None),
+    )
+    monkeypatch.setattr(host_memory_breakdown, "log_host_memory_breakdown", report)
+
+    manager.finish_request()
+    manager.finish_request()
+
+    assert reports == [
+        (pipeline.modules, "after request 1"),
+        (pipeline.modules, "after request 2"),
+    ]
+    # The per-mapping tensor count walks the same objects.
+    count, _ = host_memory_breakdown._tensor_ptrs_inside(0, 1 << 62)
+    assert count >= 1
+    del dead_proxy
+
+
 def test_strategy_cache_replaces_stale_component_instance():
     server_args = SimpleNamespace(
         enable_layerwise_nvtx_marker=False,
@@ -721,23 +798,14 @@ def test_warmup_records_use_and_transition_peaks(monkeypatch):
     manager.finish_request()
 
     peaks = manager.take_warmup_phase_peaks()
-    inactive_peak = WarmupPhasePeak((), 7)
-    transformer_peak = WarmupPhasePeak(
-        ("transformer",), 7, used_components=("transformer",)
-    )
-    assert peaks["request:before-stage"] == inactive_peak
-    assert peaks["0:denoise:setup"] == inactive_peak
-    assert peaks["0:denoise:transition:idle->transformer"] == transformer_peak
-    assert peaks["0:denoise:use:transformer"] == transformer_peak
-    assert peaks["0:denoise:transition:transformer->idle"] == transformer_peak
-    assert peaks["0:denoise:between"] == inactive_peak
-    # A non-preferred component is being released during cleanup, so it is no
-    # longer part of the placement that follows this transition.
-    assert peaks["request:cleanup:transformer"] == inactive_peak
-    assert peaks["idle"] == WarmupPhasePeak(
-        active_components=(),
-        allocated_bytes=2,
-    )
+    assert peaks["request:before-stage"] == 7
+    assert peaks["0:denoise:setup"] == 7
+    assert peaks["0:denoise:transition:idle->transformer"] == 7
+    assert peaks["0:denoise:use:transformer"] == 7
+    assert peaks["0:denoise:transition:transformer->idle"] == 7
+    assert peaks["0:denoise:between"] == 7
+    assert peaks["request:cleanup:transformer"] == 7
+    assert peaks["idle"] == 2
 
 
 def test_warmup_skips_memory_tracking_for_unsupported_pipeline(monkeypatch):
@@ -764,44 +832,6 @@ def test_warmup_skips_memory_tracking_for_unsupported_pipeline(monkeypatch):
     assert manager._track_warmup_memory is False
     assert manager.take_warmup_phase_peaks() == {}
     device_module.reset_peak_memory_stats.assert_not_called()
-
-
-def test_warmup_records_full_weight_transition_without_preparing(monkeypatch):
-    device_module = SimpleNamespace(
-        is_available=lambda: True,
-        reset_peak_memory_stats=Mock(),
-        max_memory_allocated=lambda: 7,
-        memory_allocated=lambda: 2,
-    )
-    monkeypatch.setattr(torch, "get_device_module", lambda: device_module)
-    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
-
-    stage = _Stage()
-    module = torch.nn.Linear(2, 2)
-    pipeline = SimpleNamespace(
-        modules={"transformer": module},
-        _stage_name_mapping={"lora_switch": stage},
-        component_residency_strategies={},
-    )
-    server_args = _server_args()
-    manager = ComponentResidencyManager(pipeline, server_args)
-    manager.strategy_for = Mock()
-    manager.refresh_pipeline(pipeline)
-    manager.begin_request([stage], SimpleNamespace(is_warmup=True), server_args)
-
-    manager.before_stage(stage, 0, SimpleNamespace(is_warmup=True), server_args)
-    with manager.full_weight_transition(("transformer",)):
-        pass
-
-    assert manager._warmup_phase_peaks[
-        "0:lora_switch:full-weight-transition:transformer"
-    ] == WarmupPhasePeak(
-        (),
-        7,
-        full_weight_transition_components=("transformer",),
-    )
-    assert manager._warmup_phase_key == "0:lora_switch:setup"
-    manager.strategy_for.assert_not_called()
 
 
 def test_warmup_records_same_component_dtype_prepare_as_transition(monkeypatch):
@@ -835,9 +865,9 @@ def test_warmup_records_same_component_dtype_prepare_as_transition(monkeypatch):
     manager.begin_use(second, module=module)
 
     manager._record_warmup_phase_peak()
-    assert manager._warmup_phase_peaks[
-        "0:stage:transition:transformer->transformer"
-    ] == WarmupPhasePeak(("transformer",), 7, used_components=("transformer",))
+    assert (
+        manager._warmup_phase_peaks["0:stage:transition:transformer->transformer"] == 7
+    )
     assert strategy.prepare_for_use.call_count == 2
 
 
@@ -884,10 +914,8 @@ def test_warmup_attributes_prefetch_peak_to_prefetched_component(monkeypatch):
     manager.end_stage()
     manager.before_stage(denoise_stage, 1, SimpleNamespace(is_warmup=True), server_args)
 
-    assert manager._warmup_phase_peaks[
-        "0:encode:prefetch:transformer"
-    ] == WarmupPhasePeak(("transformer",), 7, used_components=("transformer",))
-    assert manager._warmup_phase_peaks["0:encode:between"] == WarmupPhasePeak((), 7)
+    assert manager._warmup_phase_peaks["0:encode:prefetch:transformer"] == 7
+    assert manager._warmup_phase_peaks["0:encode:between"] == 7
 
 
 def test_warmup_splits_sequential_component_transition(monkeypatch):
@@ -923,12 +951,8 @@ def test_warmup_splits_sequential_component_transition(monkeypatch):
     manager.begin_use(second)
     manager._record_warmup_phase_peak()
 
-    assert manager._warmup_phase_peaks["0:stage:transition:text_encoder->idle"] == (
-        WarmupPhasePeak(("text_encoder",), 7, used_components=("text_encoder",))
-    )
-    assert manager._warmup_phase_peaks["0:stage:transition:idle->transformer"] == (
-        WarmupPhasePeak(("transformer",), 7, used_components=("transformer",))
-    )
+    assert manager._warmup_phase_peaks["0:stage:transition:text_encoder->idle"] == 7
+    assert manager._warmup_phase_peaks["0:stage:transition:idle->transformer"] == 7
 
 
 def _manager_for_stage(stage, modules):

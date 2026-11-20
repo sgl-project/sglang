@@ -4,7 +4,7 @@ DeepSeek-R1 has 128 attention heads, so TP=2 gives 64 heads per rank. This
 covers the AITER persistent MLA decode metadata path that previously crashed
 with GPU memory access faults.
 
-Registry: nightly-amd-2-gpu-mi35x-deepseek-r1-mxfp4-tp2 suite
+Registry: nightly-test-2-gpu-amd-mi35x-deepseek-r1-mxfp4-tp2 suite
 """
 
 import ast
@@ -28,7 +28,7 @@ from sglang.utils import download_and_cache_file, read_jsonl
 
 register_amd_ci(
     est_time=1800,
-    suite="nightly-amd-2-gpu-mi35x-deepseek-r1-mxfp4-tp2",
+    suite="nightly-test-2-gpu-amd-mi35x-deepseek-r1-mxfp4-tp2",
     nightly=True,
 )
 

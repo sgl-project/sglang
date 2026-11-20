@@ -8,8 +8,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from unified_tree_core_inspection_interface import UnifiedTreeCoreInspectionInterface
-
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -26,10 +24,15 @@ from sglang.srt.mem_cache.unified_cache.tree_core_registry import (
 )
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.rust_extensions.torch_build import _MAX_SUPPORTED_TORCH
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.kits.unified_radix_cache.unified_tree_core_inspection_interface import (
+    UnifiedTreeCoreInspectionInterface,
+)
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.tree_slots import CUSTOM_WINDOW_COMPONENT, FAMILY_OF, tree_slots_of
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def _cache_init_params(**kwargs) -> CacheInitParams:
@@ -38,7 +41,7 @@ def _cache_init_params(**kwargs) -> CacheInitParams:
         req_to_token_pool=None,
         token_to_kv_pool_allocator=None,
         page_size=2,
-        tree_components=(ComponentType.FULL,),
+        tree_slots=tree_slots_of((ComponentType.FULL,)),
         **kwargs,
     )
 
@@ -53,7 +56,12 @@ class _StubFullComponent(TreeComponent):
         return None
 
     def evict_component(
-        self, node, device_frees, host_frees, target: EvictLayer = EvictLayer.DEVICE
+        self,
+        node,
+        device_frees,
+        host_frees,
+        cache_actions,
+        target: EvictLayer = EvictLayer.DEVICE,
     ) -> tuple[int, int]:
         return 0, 0
 
@@ -66,7 +74,7 @@ class _StubFullComponent(TreeComponent):
     def _evict_device_start(self, request_cnt) -> None:
         pass
 
-    def _evict_device_next_node(self, tracker, device_frees, host_frees):
+    def _evict_device_next_node(self, tracker, device_frees, host_frees, cache_actions):
         return None
 
     def _evict_device_end(self) -> None:
@@ -87,7 +95,7 @@ class _StubMambaComponent(_StubFullComponent):
 
 
 class _StubAuxiliarySWAComponent(_StubFullComponent):
-    component_type = ComponentType.AUXILIARY_SWA
+    component_type = CUSTOM_WINDOW_COMPONENT
 
 
 class TreeCoreRegistryTest(CustomTestCase):
@@ -111,6 +119,12 @@ class TreeCoreRegistryTest(CustomTestCase):
         self.assertIsInstance(core, UnifiedTreeCore)
         self.assertNotIsInstance(core, UnifiedTreeCoreInspectionInterface)
         self.assertIs(component.tree_core, core)
+
+    def test_registry_resolves_the_rust_backend_lazily(self):
+        core = create_tree_core(name="rust", params=_cache_init_params(), components={})
+        assert type(core).__name__ == "RustUnifiedTreeCore"
+        assert not isinstance(core, UnifiedTreeCoreInspectionInterface)
+        assert not any(name.startswith("inspect_") for name in dir(core._binding))
 
     def test_unknown_backend_raises_naming_the_known_backends(self):
         with self.assertRaisesRegex(ValueError, "not registered") as cm:
@@ -151,7 +165,7 @@ class UnifiedRadixCacheTreeCoreSelectionTest(CustomTestCase):
     def _cache_params(
         self,
         tree_components=(ComponentType.FULL,),
-        component_registry_override={ComponentType.FULL: _StubFullComponent},
+        component_registry_override={FAMILY_OF[ComponentType.FULL]: _StubFullComponent},
         **kwargs,
     ) -> CacheInitParams:
         return CacheInitParams(
@@ -164,7 +178,7 @@ class UnifiedRadixCacheTreeCoreSelectionTest(CustomTestCase):
             ),
             token_to_kv_pool_allocator=None,
             page_size=1,
-            tree_components=tree_components,
+            tree_slots=tree_slots_of(tree_components, checkpoint_interval=64),
             component_registry_override=component_registry_override,
             **kwargs,
         )
@@ -174,8 +188,8 @@ class UnifiedRadixCacheTreeCoreSelectionTest(CustomTestCase):
             is_eagle=True,
             tree_components=(ComponentType.FULL, ComponentType.MAMBA),
             component_registry_override={
-                ComponentType.FULL: _StubFullComponent,
-                ComponentType.MAMBA: _StubMambaComponent,
+                FAMILY_OF[ComponentType.FULL]: _StubFullComponent,
+                FAMILY_OF[ComponentType.MAMBA]: _StubMambaComponent,
             },
         )
         cache = UnifiedRadixCache(params)
@@ -238,22 +252,22 @@ class UnifiedRadixCacheTreeCoreSelectionTest(CustomTestCase):
     def test_auxiliary_component_uses_its_own_node_storage(self):
         cache = UnifiedRadixCache(
             self._cache_params(
-                tree_components=(ComponentType.FULL, ComponentType.AUXILIARY_SWA),
+                tree_components=(ComponentType.FULL, CUSTOM_WINDOW_COMPONENT),
                 component_registry_override={
-                    ComponentType.FULL: _StubFullComponent,
-                    ComponentType.AUXILIARY_SWA: _StubAuxiliarySWAComponent,
+                    FAMILY_OF[ComponentType.FULL]: _StubFullComponent,
+                    FAMILY_OF[CUSTOM_WINDOW_COMPONENT]: _StubAuxiliarySWAComponent,
                 },
                 tree_core_backend="python",
             )
         )
         node = cache.tree_core.root_node
-        auxiliary = node.component_data[ComponentType.AUXILIARY_SWA]
+        auxiliary = node.component_data[CUSTOM_WINDOW_COMPONENT]
         full = node.component_data[ComponentType.FULL]
         self.assertIsNot(auxiliary, full)
         auxiliary.metadata["boundary"] = 7
         self.assertNotIn("boundary", full.metadata)
         self.assertIs(
-            cache.components[ComponentType.AUXILIARY_SWA].tree_core, cache.tree_core
+            cache.components[CUSTOM_WINDOW_COMPONENT].tree_core, cache.tree_core
         )
 
     def test_supported_default_routes_to_rust(self):
@@ -478,14 +492,18 @@ class TreeCoreDefaultCompatibilityTest(CustomTestCase):
     def test_session_and_custom_components_use_python(self):
         for overrides in (
             {"enable_session_radix_cache": True},
-            {"component_registry_override": {ComponentType.FULL: _StubFullComponent}},
+            {
+                "component_registry_override": {
+                    FAMILY_OF[ComponentType.FULL]: _StubFullComponent
+                }
+            },
         ):
             with self.subTest(overrides=overrides):
                 self.assertEqual(
                     select_tree_core_backend(_cache_init_params(**overrides)), "python"
                 )
         params = _cache_init_params()
-        params.tree_components = (ComponentType.FULL, ComponentType.C128)
+        params.tree_slots = tree_slots_of((ComponentType.FULL, ComponentType.C128))
         self.assertEqual(select_tree_core_backend(params), "python")
 
     def test_unsupported_platform_and_torch_use_python(self):
@@ -497,7 +515,8 @@ class TreeCoreDefaultCompatibilityTest(CustomTestCase):
                 self.assertEqual(
                     select_tree_core_backend(_cache_init_params()), "python"
                 )
-        for version in ("2.10.0", "2.15.0", "unknown"):
+        too_new = f"{_MAX_SUPPORTED_TORCH[0]}.{_MAX_SUPPORTED_TORCH[1] + 1}.0"
+        for version in ("2.10.0", too_new, "unknown"):
             with (
                 self.subTest(version=version),
                 mock.patch.object(tree_core_registry.torch, "__version__", version),

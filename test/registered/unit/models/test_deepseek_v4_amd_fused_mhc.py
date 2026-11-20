@@ -1,10 +1,13 @@
 import unittest
 from unittest import mock
 
+import torch
+
 from sglang.srt.environ import envs
 from sglang.srt.models.deepseek_common.amd import deepseek_v4_fused_mhc
 from sglang.srt.runtime_context import override_platform
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -196,14 +199,14 @@ class TestAmdFusedMhcAttnBoundaryFallback(unittest.TestCase):
     layer's deferred post was never applied and every subsequent layer computed
     on corrupted activations.
 
-    Drives the real ``DeepseekV4DecoderLayer.forward`` on a mocked layer with the
+    Drives the real ``NonCudaDecoderMixin.forward`` on a mocked layer with the
     fused dispatcher forced to ``None`` and halts at ``self_attn`` via a sentinel,
     so only the boundary fallback executes.
     """
 
     def test_fallback_closes_previous_post_before_pre(self):
         try:
-            from sglang.srt.models.deepseek_v4 import DeepseekV4DecoderLayer
+            from sglang.srt.models.deepseek_v4_platform_stage import NonCudaDecoderMixin
         except Exception as e:  # pragma: no cover - env without full model deps
             self.skipTest(f"deepseek_v4 import unavailable: {e}")
 
@@ -224,12 +227,12 @@ class TestAmdFusedMhcAttnBoundaryFallback(unittest.TestCase):
 
         with (
             mock.patch(
-                "sglang.srt.models.deepseek_v4.apply_mhc_post_pre_boundary",
+                "sglang.srt.models.deepseek_v4_platform_stage.apply_mhc_post_pre_boundary",
                 return_value=None,
             ),
             self.assertRaises(_StopForward),
         ):
-            DeepseekV4DecoderLayer.forward(
+            NonCudaDecoderMixin.forward(
                 layer,
                 positions=object(),
                 hidden_states=hs_in,
@@ -263,14 +266,17 @@ class TestAmdFusedMhcNormFusedHandling(unittest.TestCase):
     silently corrupting every subsequent layer. The fix mirrors the unfused
     ``hc_pre`` branch: apply the input layernorm when ``norm_fused`` is False.
 
-    Drives the real ``DeepseekV4DecoderLayer.forward`` with the boundary forced to
+    Drives the real ``NonCudaDecoderMixin.forward`` with the boundary forced to
     return ``norm_fused=False`` and halts at ``self_attn`` via a sentinel.
     """
 
     def test_fused_success_applies_input_layernorm_when_not_norm_fused(self):
         try:
             import sglang.srt.models.deepseek_v4 as deepseek_v4
-            from sglang.srt.models.deepseek_v4 import DeepseekV4DecoderLayer
+            from sglang.srt.models.deepseek_v4 import (
+                DeepseekV4DecoderLayer,
+            )
+            from sglang.srt.models.deepseek_v4_platform_stage import NonCudaDecoderMixin
         except Exception as e:  # pragma: no cover - env without full model deps
             self.skipTest(f"deepseek_v4 import unavailable: {e}")
 
@@ -297,14 +303,13 @@ class TestAmdFusedMhcNormFusedHandling(unittest.TestCase):
         with (
             mock.patch.object(deepseek_v4, "_is_hip", False),
             mock.patch.object(deepseek_v4, "_use_aiter", False),
-            mock.patch.object(deepseek_v4, "_is_gfx95_supported", False),
             mock.patch(
-                "sglang.srt.models.deepseek_v4.apply_mhc_post_pre_boundary",
+                "sglang.srt.models.deepseek_v4_platform_stage.apply_mhc_post_pre_boundary",
                 return_value=(residual, fused_hs, post, comb, False),
             ),
             self.assertRaises(_StopForward),
         ):
-            DeepseekV4DecoderLayer.forward(
+            NonCudaDecoderMixin.forward(
                 layer,
                 positions=object(),
                 hidden_states=object(),
@@ -320,6 +325,33 @@ class TestAmdFusedMhcNormFusedHandling(unittest.TestCase):
         # layernorm before attention. Pre-fix this was never called on the
         # fused-success path.
         layer.input_layernorm.assert_called_once_with(fused_hs)
+
+
+class TestAmdFusedMhcBufferCache(CustomTestCase):
+    def test_cache_keeps_only_decode_sized_batches(self):
+        """Only batches up to the M threshold may stay cached; larger ones are
+        allocated per call, or every distinct prefill size stays alive forever."""
+        threshold = deepseek_v4_fused_mhc._FUSED_HC_POST_PRE_M_THRESHOLD
+        fake_ops = (None, lambda *args, **kwargs: ({"BLOCK_K": 64}, False))
+        cache = deepseek_v4_fused_mhc._FUSED_HC_POST_PRE_CACHE
+        with (
+            mock.patch.object(
+                deepseek_v4_fused_mhc,
+                "_get_triton_mhc_post_pre_ops",
+                return_value=fake_ops,
+            ),
+            mock.patch.dict(cache, clear=True),
+        ):
+            for num_tokens in (1, threshold, threshold + 1, 2048):
+                bufs = deepseek_v4_fused_mhc._get_fused_hc_post_pre_buffers(
+                    num_tokens=num_tokens,
+                    hidden_size=64,
+                    hc_mult=4,
+                    dtype=torch.bfloat16,
+                    device=torch.device("cpu"),
+                )
+                self.assertIsNotNone(bufs)
+            self.assertEqual(sorted(key[0] for key in cache), [1, threshold])
 
 
 def _hardware_available() -> bool:

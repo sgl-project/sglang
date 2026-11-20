@@ -17,8 +17,8 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 class TestCohere2MoeConfig(CustomTestCase):
     def test_configs_package_imports(self):
-        """Importing the configs package must not crash at module load."""
-        import sglang.srt.configs  # noqa: F401
+        """Importing every config module must not crash at module load."""
+        import sglang.srt.configs.all_configs  # noqa: F401
 
     def test_derived_defaults_num_key_value_heads(self):
         """``num_key_value_heads`` defaults to ``num_attention_heads``."""

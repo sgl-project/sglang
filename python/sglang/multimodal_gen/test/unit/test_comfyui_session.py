@@ -464,3 +464,21 @@ def test_comfyui_mode_h3_vae_post_init_without_latent_stats() -> None:
     arch = _init_vae_geometry(MiniMaxH3PipelineConfig())
     assert arch.latents_mean is None
     assert arch.latents_std is None
+
+
+def test_control_residuals_are_never_cached_across_steps() -> None:
+    sid = "run-control"
+    first = _Req()
+    first.extra = {
+        "comfyui_session_id": sid,
+        "comfyui_control": {"input": [torch.ones(1, 4, 8)]},
+        "other": 1,
+    }
+    bind_comfyui_session(first)
+
+    later = _Req()
+    later.extra = {"comfyui_session_id": sid}
+    bind_comfyui_session(later)
+    assert later.extra["other"] == 1
+    assert "comfyui_control" not in later.extra
+    release_comfyui_session(sid)
