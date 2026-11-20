@@ -14,6 +14,7 @@ import msgspec
 import torch
 import zmq
 from google.protobuf.json_format import MessageToDict
+
 from sglang.encoder.v1 import encoder_pb2 as pb
 from sglang.encoder.v1 import encoder_pb2_grpc as rpc
 from sglang.srt.disaggregation.encoder import receiver
@@ -32,7 +33,10 @@ register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 def processor():
     q = QwenVLImageProcessor.__new__(QwenVLImageProcessor)
     q.model_type = "qwen3_vl"
-    q.hf_config = SimpleNamespace()
+    q.hf_config = SimpleNamespace(vision_config=SimpleNamespace(out_hidden_size=2))
+    q._processor = SimpleNamespace(
+        tokenizer=SimpleNamespace(encode=lambda text, **_: [51, 52])
+    )
     q.IM_TOKEN_ID, q.IM_START_TOKEN_ID, q.IM_END_TOKEN_ID = 8, 7, 9
     q.vision_start_token_id, q.vision_end_token_id = 7, 9
     q.VIDEO_TOKEN_ID = 10
@@ -65,6 +69,7 @@ def request(rid):
 def bridge(external=True):
     rust = RustServer(Mock(), http_port=0)
     rust._external_image_token_id = 8 if external else None
+    rust._external_video_token_id = 10 if external else None
     rust._encoder_dispatcher = Mock()
     return rust
 
@@ -88,24 +93,31 @@ def scheduler(context):
 
 
 @asynccontextmanager
-async def staged_encoder(sock, grids, tensor, identities, writer=None):
+async def staged_encoder(
+    sock, grids, tensor, identities, writer=None, video_layouts=()
+):
     """Only the model forward is represented by a deterministic CPU tensor."""
     calls, held = [], set()
 
-    async def encode(part_id, images):
-        calls.append(("encode", images))
+    async def encode(part_id, images, videos):
+        calls.append(("encode", images, videos))
         held.add(part_id)
         return [
             pb.ImageLayout(t=t, h=h, w=w, identity=identity.hex())
             for (t, h, w), identity in zip(grids, identities)
-        ]
+        ], video_layouts
 
     async def send(part_id, receive_url):
         assert part_id in held
         calls.append(("send", receive_url))
         sock.connect("tcp://" + receive_url)
         frame = receiver.EmbeddingData(
-            part_id, 1, 0, grids, Modality.IMAGE, embedding=tensor
+            part_id,
+            1,
+            0,
+            grids if grids else [[v.t, v.h, v.w] for v in video_layouts],
+            Modality.IMAGE if grids else Modality.VIDEO,
+            embedding=tensor,
         ).copy_without_embedding()
         sock.send_multipart([pickle.dumps(frame), tensor.numpy().tobytes()])
 
@@ -131,7 +143,7 @@ async def staged_encoder(sock, grids, tensor, identities, writer=None):
         write=write if writer is not None else None,
         release=release,
         make_part_id=receiver.create_part_req_id,
-        info=pb.GetEncoderInfoResponse(),
+        info=pb.GetEncoderInfoResponse(supports_staged_video=True),
         ttl=10,
         stage_timeout=5,
         capacity=1,
@@ -143,7 +155,11 @@ async def staged_encoder(sock, grids, tensor, identities, writer=None):
     try:
         async with grpc.aio.insecure_channel(f"127.0.0.1:{port}") as channel:
             response = await rpc.SglangEncoderStub(channel).Stage(
-                pb.StageRequest(request_id="public", mm_items=["first", "second"]),
+                pb.StageRequest(
+                    request_id="public",
+                    mm_items=["first", "second"] if grids else [],
+                    video_urls=["clip"] if video_layouts else [],
+                ),
                 timeout=3,
             )
         metadata = MessageToDict(
@@ -166,6 +182,7 @@ class TestStagedImageReceiver(unittest.TestCase):
         rust = bridge()
         for buffers in [
             {"input_ids": array("q", [7, 8, 9])},
+            {"input_ids": array("q", [7, 10, 9])},
             {"input_ids": array("q", [1]), "epd.media": msgspec.msgpack.encode(["x"])},
         ]:
             with self.assertRaisesRegex(NoEncoderError, "requires a staged"):
@@ -178,6 +195,110 @@ class TestStagedImageReceiver(unittest.TestCase):
             bridge(False)._attach_buffers(
                 text, {"input_ids": array("q", [8]), "epd.handoff": b"{}"}
             )
+
+    def test_video_only_limits_timing_and_cache_identity(self):
+        rid = "09" * 16
+        meta = {
+            "version": 2,
+            "peer": "grpc://127.0.0.1:1234",
+            "request_id": "v",
+            "transfer_id": rid,
+            "part_id": rid + "_local_part_0",
+            "part_idx": 0,
+            "num_parts": 1,
+            "image_count": 0,
+            "images": [],
+        }
+        video = {
+            "t": 2,
+            "h": 2,
+            "w": 2,
+            "identities": ["ab" * 32],
+            "second_per_grid_ts": 0.5,
+        }
+
+        def descriptor(**change):
+            return msgspec.json.encode(meta | {"videos": [video | change]})
+
+        q = processor()
+        q.model_type = "qwen2_5_vl"
+        q._tokens_per_second = 4
+        prompt = [42, 7, 10, 9, 44]
+        with self.assertRaisesRegex(ValueError, "placeholders"):
+            EncoderHandoff.parse(descriptor(), 0, 2)
+        with self.assertRaisesRegex(ValueError, "sampling interval"):
+            EncoderHandoff.parse(descriptor(second_per_grid_ts=0), 0, 1)
+        rust = bridge()
+        rust._external_media_limits = {"video": 0}
+        with patch(
+            "sglang.srt.rust_server.server.msgpack_decode_explained",
+            side_effect=lambda _: request("v"),
+        ):
+            for bad, error in ((descriptor(), ValueError), (b"{", msgspec.DecodeError)):
+                with self.assertRaises(error):
+                    rust._admit(
+                        b"", {"input_ids": array("q", prompt), "epd.handoff": bad}
+                    )
+                wire, _ = rust.server.push_decode_result_batch.call_args.args
+                finish = msgspec.msgpack.decode(wire)[1][0]
+                self.assertEqual(finish["status_code"], 400)
+                self.assertEqual(finish["type"], "abort")
+            rust.server.push_error.assert_not_called()
+
+        layouts = []
+        for interval in (0.5, 1.5):
+            handoff = EncoderHandoff.parse(
+                descriptor(second_per_grid_ts=interval), 0, 1
+            )
+            mm = handoff.build_layout(q, prompt, 100)
+            handoff.bind_identities(mm.mm_items, [])
+            layouts.append(mm)
+        self.assertNotEqual(
+            layouts[0].mm_items[0].identity, layouts[1].mm_items[0].identity
+        )
+        self.assertFalse(
+            torch.equal(layouts[0].mrope_positions, layouts[1].mrope_positions)
+        )
+
+        q.model_type = "qwen3_vl"
+        with self.assertRaisesRegex(ValueError, "metadata differs"):
+            handoff.build_layout(q, prompt, 100)
+        timed_video = descriptor(
+            timestamps=[0.0, 1.0],
+            identities=["ab" * 32, "cd" * 32],
+            second_per_grid_ts=None,
+        )
+        handoff = EncoderHandoff.parse(timed_video, 0, 1)
+        q.model_type = "qwen3_5"
+        with self.assertRaisesRegex(ValueError, "unsupported for qwen3_5"):
+            handoff.build_layout(q, prompt, 100)
+        q.model_type = "qwen3_vl"
+        # The two embedding rows fit; the per-frame timestamp and marker tokens do not.
+        with self.assertRaisesRegex(ValueError, "input length"):
+            handoff.build_layout(q, prompt, 8)
+        self.assertEqual(handoff.native_transfer().videos[0].timestamps[:], [0, 1])
+        leading_video = handoff.build_layout(q, [10, 44], 100)
+        self.assertEqual(
+            leading_video.input_ids, [51, 52, 7, 10, 9, 51, 52, 7, 10, 9, 44]
+        )
+        self.assertEqual(
+            [i.offsets for i in leading_video.mm_items], [[(3, 3)], [(8, 8)]]
+        )
+
+        obj = request("v")
+        bridge()._attach_buffers(
+            obj, {"input_ids": array("q", prompt), "epd.handoff": timed_video}
+        )
+        rx = scheduler(None)
+        rx.scheduler.max_req_input_len = 8
+        rx.create_req = lambda req: req
+        admitted, errors = rx.process_waiting_requests([obj])
+        self.assertFalse(admitted)
+        self.assertEqual(len(errors), 1)
+        self.assertIs(errors[0][0], obj)
+        self.assertIn("input length", errors[0][1])
+        self.assertEqual(errors[0][2], 400)
+        self.assertFalse(rx.waiting_list or rx.waiting_by_rid)
 
     def test_abort_and_unavailable_encoder_retire_receiver_once(self):
         async def run(fail):
@@ -313,7 +434,7 @@ class TestStagedImageReceiver(unittest.TestCase):
                 asyncio.run(run(fenced))
 
     def test_native_part_to_prefill_and_decode_layout_only(self):
-        async def run(backend):
+        async def run(backend, video_model=None, video_only=False):
             prompt = [42, 7, 8, 9, 43, 7, 8, 9, 44]
             grids = [[1, 2, 2], [1, 4, 2]]
             tensor = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
@@ -323,11 +444,47 @@ class TestStagedImageReceiver(unittest.TestCase):
                 ).cache_key
                 for e in [tensor[:1], tensor[1:]]
             ]
+            video_layouts = []
+            requested_images = ["first", "second"]
+            requested_videos = []
+            hints = [22, 33]
+            if video_model:
+                # Packing is [image 1, image 2, video], prompt order is [image 1, video, image 2].
+                prompt[5:5] = [7, 10, 9]
+                requested_videos = ["clip"]
+                hints = [22, 101, 33]
+                video = torch.tensor([[7.0, 8.0], [9.0, 10.0]])
+                if video_only:
+                    grids, identities, requested_images = [], [], []
+                    prompt, hints, tensor = [10, 44], [101], video
+                else:
+                    tensor = torch.cat((tensor, video))
+                timed_frames = video_model == "qwen3_vl"
+                segments = video.split(1) if timed_frames else [video]
+                vid_keys = [
+                    MultimodalDataItem(
+                        modality=Modality.VIDEO, precomputed_embeddings=t
+                    ).cache_key.hex()
+                    for t in segments
+                ]
+                video_layouts = [
+                    pb.VideoLayout(
+                        t=2,
+                        h=2,
+                        w=2,
+                        identities=vid_keys,
+                        timestamps=[0.25, 1.25] if timed_frames else [],
+                        second_per_grid_ts=0.5 if video_model == "qwen2_5_vl" else None,
+                    )
+                ]
             rust = bridge()
             prefill, decode = request("p-incarnation"), request("d-incarnation")
             with zmq.Context() as ctx, ctx.socket(zmq.PUSH) as sock:
                 sock.linger = 0
                 rx = scheduler(ctx)
+                if video_model:
+                    rx.mm_processor.model_type = rx.model_type = video_model
+                    rx.mm_processor._tokens_per_second = 4
                 use_nixl = backend != "zmq_to_scheduler"
                 rx.encoder_transfer_backend = "nixl" if use_nixl else backend
                 writer = None
@@ -361,17 +518,21 @@ class TestStagedImageReceiver(unittest.TestCase):
                         return target
 
                     rx.nixl_receiver = SimpleNamespace(allocate=allocate)
-                async with staged_encoder(sock, grids, tensor, identities, writer) as (
+                async with staged_encoder(
+                    sock, grids, tensor, identities, writer, video_layouts
+                ) as (
                     metadata,
                     calls,
                     held,
                 ):
                     self.assertEqual(held, {metadata["part_id"]})
-                    self.assertEqual(calls, [("encode", ["first", "second"])])
+                    self.assertEqual(
+                        calls, [("encode", requested_images, requested_videos)]
+                    )
                     buffers = {
                         "input_ids": array("q", prompt),
                         "epd.handoff": msgspec.json.encode(metadata),
-                        "epd.hashes": msgspec.msgpack.encode([22, 33]),
+                        "epd.hashes": msgspec.msgpack.encode(hints),
                     }
                     for obj in (prefill, decode):
                         rust._attach_buffers(obj, buffers)
@@ -397,7 +558,11 @@ class TestStagedImageReceiver(unittest.TestCase):
                             self.assertTrue(waiting.recv_socket.poll(2000))
                             delivery = ("send", f"127.0.0.1:{waiting.embedding_port}")
                         self.assertEqual(
-                            calls, [("encode", ["first", "second"]), delivery]
+                            calls,
+                            [
+                                ("encode", requested_images, requested_videos),
+                                delivery,
+                            ],
                         )
                         self.assertFalse(held)
                         self.assertEqual(
@@ -416,24 +581,66 @@ class TestStagedImageReceiver(unittest.TestCase):
                         rx.process_waiting_requests([decode]), ([decode], [])
                     )
 
-            self.assertEqual(list(prefill.input_ids), [42, 7, 8, 9, 43, 7, 8, 8, 9, 44])
             self.assertEqual(prefill.input_ids, decode.input_ids)
             p, d = prefill.mm_inputs, decode.mm_inputs
             torch.testing.assert_close(p.mrope_positions, d.mrope_positions)
             torch.testing.assert_close(p.mrope_position_delta, d.mrope_position_delta)
-            for mm in (p, d):
-                self.assertEqual(
-                    [item.offsets for item in mm.mm_items], [[(2, 2)], [(6, 7)]]
-                )
-                self.assertEqual([item.identity for item in mm.mm_items], identities)
-                self.assertEqual([item.hash for item in mm.mm_items], [22, 33])
             self.assertEqual(
-                [item.pad_values for item in p.mm_items],
-                [item.pad_values for item in d.mm_items],
+                [i.pad_values for i in p.mm_items], [i.pad_values for i in d.mm_items]
             )
-            torch.testing.assert_close(
-                torch.cat([item.precomputed_embeddings for item in p.mm_items]), tensor
-            )
+            if video_model:
+                # Use ordinary Qwen EPD reconstruction as an independent reference.
+                kwargs = {"video_grid_thw": torch.tensor([[2, 2, 2]])}
+                native_embeddings = {Modality.VIDEO: video}
+                if grids:
+                    kwargs["img_grid_thw"] = torch.tensor(grids)
+                    native_embeddings[Modality.IMAGE] = tensor[:3]
+                if video_model == "qwen3_vl":
+                    kwargs["video_timestamps"] = [[0.25, 1.25]]
+                elif video_model == "qwen2_5_vl":
+                    kwargs["second_per_grid_ts"] = torch.tensor([0.5])
+                reference = rx.mm_processor.get_validated_mm_data(
+                    prompt,
+                    native_embeddings,
+                    **kwargs,
+                )
+                expected_hashes = (
+                    [22, 101, 101, 33] if video_model == "qwen3_vl" else [22, 101, 33]
+                )
+                if video_only:
+                    expected_hashes = [101, 101]
+                self.assertEqual(list(prefill.input_ids), reference.input_ids)
+                for mm in (p, d):
+                    self.assertEqual([i.hash for i in mm.mm_items], expected_hashes)
+                    self.assertEqual(
+                        [i.offsets for i in mm.mm_items],
+                        [i.offsets for i in reference.mm_items],
+                    )
+                    torch.testing.assert_close(
+                        mm.mrope_positions, reference.mrope_positions
+                    )
+                for staged, expected in zip(
+                    p.mm_items, reference.mm_items, strict=True
+                ):
+                    torch.testing.assert_close(
+                        staged.precomputed_embeddings, expected.precomputed_embeddings
+                    )
+            else:
+                self.assertEqual(
+                    list(prefill.input_ids), [42, 7, 8, 9, 43, 7, 8, 8, 9, 44]
+                )
+                for mm in (p, d):
+                    self.assertEqual(
+                        [item.offsets for item in mm.mm_items], [[(2, 2)], [(6, 7)]]
+                    )
+                    self.assertEqual(
+                        [item.identity for item in mm.mm_items], identities
+                    )
+                    self.assertEqual([item.hash for item in mm.mm_items], [22, 33])
+                torch.testing.assert_close(
+                    torch.cat([item.precomputed_embeddings for item in p.mm_items]),
+                    tensor,
+                )
             self.assertTrue(
                 all(item.precomputed_embeddings is None for item in d.mm_items)
             )
@@ -443,8 +650,14 @@ class TestStagedImageReceiver(unittest.TestCase):
         if importlib.util.find_spec("nixl") is not None:
             backends.append("nixl-native")
         for backend in backends:
-            with self.subTest(backend=backend):
-                asyncio.run(run(backend))
+            for model, video_only in (
+                (None, False),
+                ("qwen3_vl", False),
+                ("qwen2_5_vl", False),
+                ("qwen3_vl", True),
+            ):
+                with self.subTest(backend=backend, model=model, video_only=video_only):
+                    asyncio.run(run(backend, model, video_only))
 
 
 if __name__ == "__main__":

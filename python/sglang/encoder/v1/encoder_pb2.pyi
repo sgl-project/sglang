@@ -11,22 +11,38 @@ class GetEncoderInfoRequest(_message.Message):
     def __init__(self) -> None: ...
 
 class GetEncoderInfoResponse(_message.Message):
-    __slots__ = ("model_path", "tokenizer_path", "served_model_name")
+    __slots__ = ("model_path", "tokenizer_path", "served_model_name", "supports_staged_video", "staged_media_policy")
     MODEL_PATH_FIELD_NUMBER: _ClassVar[int]
     TOKENIZER_PATH_FIELD_NUMBER: _ClassVar[int]
     SERVED_MODEL_NAME_FIELD_NUMBER: _ClassVar[int]
+    SUPPORTS_STAGED_VIDEO_FIELD_NUMBER: _ClassVar[int]
+    STAGED_MEDIA_POLICY_FIELD_NUMBER: _ClassVar[int]
     model_path: str
     tokenizer_path: str
     served_model_name: str
-    def __init__(self, model_path: _Optional[str] = ..., tokenizer_path: _Optional[str] = ..., served_model_name: _Optional[str] = ...) -> None: ...
+    supports_staged_video: bool
+    staged_media_policy: StagedMediaPolicy
+    def __init__(self, model_path: _Optional[str] = ..., tokenizer_path: _Optional[str] = ..., served_model_name: _Optional[str] = ..., supports_staged_video: _Optional[bool] = ..., staged_media_policy: _Optional[_Union[StagedMediaPolicy, _Mapping]] = ...) -> None: ...
+
+class StagedMediaPolicy(_message.Message):
+    __slots__ = ("allowed_domains", "max_bytes", "timeout_secs")
+    ALLOWED_DOMAINS_FIELD_NUMBER: _ClassVar[int]
+    MAX_BYTES_FIELD_NUMBER: _ClassVar[int]
+    TIMEOUT_SECS_FIELD_NUMBER: _ClassVar[int]
+    allowed_domains: _containers.RepeatedScalarFieldContainer[str]
+    max_bytes: int
+    timeout_secs: float
+    def __init__(self, allowed_domains: _Optional[_Iterable[str]] = ..., max_bytes: _Optional[int] = ..., timeout_secs: _Optional[float] = ...) -> None: ...
 
 class StageRequest(_message.Message):
-    __slots__ = ("request_id", "mm_items")
+    __slots__ = ("request_id", "mm_items", "video_urls")
     REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
     MM_ITEMS_FIELD_NUMBER: _ClassVar[int]
+    VIDEO_URLS_FIELD_NUMBER: _ClassVar[int]
     request_id: str
     mm_items: _containers.RepeatedScalarFieldContainer[str]
-    def __init__(self, request_id: _Optional[str] = ..., mm_items: _Optional[_Iterable[str]] = ...) -> None: ...
+    video_urls: _containers.RepeatedScalarFieldContainer[str]
+    def __init__(self, request_id: _Optional[str] = ..., mm_items: _Optional[_Iterable[str]] = ..., video_urls: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class ImageLayout(_message.Message):
     __slots__ = ("t", "h", "w", "identity")
@@ -40,8 +56,24 @@ class ImageLayout(_message.Message):
     identity: str
     def __init__(self, t: _Optional[int] = ..., h: _Optional[int] = ..., w: _Optional[int] = ..., identity: _Optional[str] = ...) -> None: ...
 
+class VideoLayout(_message.Message):
+    __slots__ = ("t", "h", "w", "identities", "timestamps", "second_per_grid_ts")
+    T_FIELD_NUMBER: _ClassVar[int]
+    H_FIELD_NUMBER: _ClassVar[int]
+    W_FIELD_NUMBER: _ClassVar[int]
+    IDENTITIES_FIELD_NUMBER: _ClassVar[int]
+    TIMESTAMPS_FIELD_NUMBER: _ClassVar[int]
+    SECOND_PER_GRID_TS_FIELD_NUMBER: _ClassVar[int]
+    t: int
+    h: int
+    w: int
+    identities: _containers.RepeatedScalarFieldContainer[str]
+    timestamps: _containers.RepeatedScalarFieldContainer[float]
+    second_per_grid_ts: float
+    def __init__(self, t: _Optional[int] = ..., h: _Optional[int] = ..., w: _Optional[int] = ..., identities: _Optional[_Iterable[str]] = ..., timestamps: _Optional[_Iterable[float]] = ..., second_per_grid_ts: _Optional[float] = ...) -> None: ...
+
 class StagedImageTransfer(_message.Message):
-    __slots__ = ("version", "request_id", "transfer_id", "part_id", "part_idx", "num_parts", "image_count", "images")
+    __slots__ = ("version", "request_id", "transfer_id", "part_id", "part_idx", "num_parts", "image_count", "images", "videos")
     VERSION_FIELD_NUMBER: _ClassVar[int]
     REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
     TRANSFER_ID_FIELD_NUMBER: _ClassVar[int]
@@ -50,6 +82,7 @@ class StagedImageTransfer(_message.Message):
     NUM_PARTS_FIELD_NUMBER: _ClassVar[int]
     IMAGE_COUNT_FIELD_NUMBER: _ClassVar[int]
     IMAGES_FIELD_NUMBER: _ClassVar[int]
+    VIDEOS_FIELD_NUMBER: _ClassVar[int]
     version: int
     request_id: str
     transfer_id: str
@@ -58,7 +91,8 @@ class StagedImageTransfer(_message.Message):
     num_parts: int
     image_count: int
     images: _containers.RepeatedCompositeFieldContainer[ImageLayout]
-    def __init__(self, version: _Optional[int] = ..., request_id: _Optional[str] = ..., transfer_id: _Optional[str] = ..., part_id: _Optional[str] = ..., part_idx: _Optional[int] = ..., num_parts: _Optional[int] = ..., image_count: _Optional[int] = ..., images: _Optional[_Iterable[_Union[ImageLayout, _Mapping]]] = ...) -> None: ...
+    videos: _containers.RepeatedCompositeFieldContainer[VideoLayout]
+    def __init__(self, version: _Optional[int] = ..., request_id: _Optional[str] = ..., transfer_id: _Optional[str] = ..., part_id: _Optional[str] = ..., part_idx: _Optional[int] = ..., num_parts: _Optional[int] = ..., image_count: _Optional[int] = ..., images: _Optional[_Iterable[_Union[ImageLayout, _Mapping]]] = ..., videos: _Optional[_Iterable[_Union[VideoLayout, _Mapping]]] = ...) -> None: ...
 
 class StageResponse(_message.Message):
     __slots__ = ("transfer",)

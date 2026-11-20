@@ -24435,6 +24435,11 @@ impl ::serde::Serialize for GetServerInfoResponse {
             "accepts_encoder_handoff",
             &self.accepts_encoder_handoff,
         )?;
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "supports_staged_video",
+            &self.supports_staged_video,
+        )?;
         ::serde::ser::SerializeMap::end(map)
     }
 }
@@ -24468,6 +24473,7 @@ impl<'de> ::serde::Deserialize<'de> for GetServerInfoResponse {
                 let mut f_num_reserved_tokens = None;
                 let mut f_instance_id = None;
                 let mut f_accepts_encoder_handoff = None;
+                let mut f_supports_staged_video = None;
                 while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
                     match key.as_ref() {
                         "model_path" => {
@@ -24601,6 +24607,14 @@ impl<'de> ::serde::Deserialize<'de> for GetServerInfoResponse {
                             }
                             f_accepts_encoder_handoff = Some(map.next_value::<bool>()?);
                         }
+                        "supports_staged_video" => {
+                            if f_supports_staged_video.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "supports_staged_video",
+                                ));
+                            }
+                            f_supports_staged_video = Some(map.next_value::<bool>()?);
+                        }
                         _ => {
                             map.next_value::<::serde::de::IgnoredAny>()?;
                         }
@@ -24625,6 +24639,7 @@ impl<'de> ::serde::Deserialize<'de> for GetServerInfoResponse {
                     num_reserved_tokens: f_num_reserved_tokens.unwrap_or_default(),
                     instance_id: f_instance_id.unwrap_or_default(),
                     accepts_encoder_handoff: f_accepts_encoder_handoff.unwrap_or_default(),
+                    supports_staged_video: f_supports_staged_video.unwrap_or_default(),
                 })
             }
         }

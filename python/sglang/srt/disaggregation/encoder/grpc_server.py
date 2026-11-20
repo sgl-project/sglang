@@ -9,19 +9,23 @@ Usage:
 
 import asyncio
 import logging
+import math
 import multiprocessing as mp
 import traceback
 from concurrent import futures
 from http import HTTPStatus
+from itertools import pairwise
 from typing import List
 
 import grpc
+import torch
 import zmq
 import zmq.asyncio
 from grpc_health.v1 import health_pb2, health_pb2_grpc
 from grpc_reflection.v1alpha import reflection
 
 from sglang.encoder.v1 import encoder_pb2, encoder_pb2_grpc
+from sglang.srt.disaggregation.encoder.handoff import STAGED_VIDEO_MODEL_TYPES
 from sglang.srt.disaggregation.encoder.receiver import create_part_req_id
 from sglang.srt.disaggregation.encoder.runtime import validate_encode_request
 from sglang.srt.disaggregation.encoder.server import (
@@ -29,11 +33,13 @@ from sglang.srt.disaggregation.encoder.server import (
     SendDestination,
     await_task_completion_on_cancel,
     launch_encoder,
+    meta_registry,
 )
 from sglang.srt.disaggregation.encoder.staged import StagedImageService
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import async_sock_send, wrap_as_pickle
 from sglang.srt.managers.req_types import MultimodalDataItem
+from sglang.srt.multimodal.media_io import media_url_security_config, media_url_timeout
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import (
     get_disagg,
@@ -45,6 +51,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import random_uuid
 from sglang.srt.utils.network import NetworkAddress, get_zmq_socket
+from sglang.srt.utils.video_decoder import video_decoder_available
 
 logger = logging.getLogger(__name__)
 SGLangEncoderServicer = encoder_pb2_grpc.SglangEncoderServicer
@@ -102,18 +109,29 @@ class SGLangEncoderServer(StagedImageService, SGLangEncoderServicer):
         if (
             encoder.transfer_backend in ("zmq_to_scheduler", "nixl")
             and get_parallel().tp_size == get_parallel().num_dp_ranks == 1
-            and encoder.model_type
-            in {"qwen2_vl", "qwen2_5_vl", "qwen3_vl", "qwen3_vl_moe"}
+            and encoder.model_type in STAGED_VIDEO_MODEL_TYPES
         ):
             model = get_model().model_path
+            domains, max_mb, _, _ = media_url_security_config()
+            # With no configured timeout, media I/O uses per-modality defaults.
+            remote_timeout = media_url_timeout(0) or None
             info = encoder_pb2.GetEncoderInfoResponse(
                 model_path=model,
                 tokenizer_path=get_serving().tokenizer_path or model,
                 served_model_name=get_serving().served_model_name or model,
+                supports_staged_video=(
+                    encoder.preprocessor.supports_modality(Modality.VIDEO)
+                    and video_decoder_available()
+                ),
+                staged_media_policy=encoder_pb2.StagedMediaPolicy(
+                    allowed_domains=domains,
+                    max_bytes=max_mb * 1024 * 1024,
+                    timeout_secs=remote_timeout,
+                ),
             )
         nixl_enabled = encoder.transfer_backend == "nixl"
         super().__init__(
-            encode=self._stage_ordered_images,
+            encode=self._stage_media,
             send=None if nixl_enabled else self._deliver_part,
             describe=self._describe_part if nixl_enabled else None,
             write=self._write_part if nixl_enabled else None,
@@ -125,44 +143,115 @@ class SGLangEncoderServer(StagedImageService, SGLangEncoderServicer):
             capacity=envs.SGLANG_ENCODER_MAX_STAGED_REQUESTS.get(),
         )
 
-    async def _stage_ordered_images(self, part_id, images):
+    async def _stage_media(self, part_id, images, videos):
+        # The existing encoder batches one modality at a time. Only the root
+        # part is published, so both transports can deliver a single tensor.
+        async with self.encoder.encode_dispatch_lock:
+            if not images:
+                video = await self._encode_modality(part_id, videos, Modality.VIDEO)
+                return [], self._video_layouts(video)
+
+            image = await self._encode_modality(part_id, images, Modality.IMAGE)
+            image_layouts = [
+                encoder_pb2.ImageLayout(
+                    t=int(t),
+                    h=int(h),
+                    w=int(w),
+                    identity=self._item_identity(Modality.IMAGE, tensor),
+                )
+                for (t, h, w), tensor in self._item_embeddings(image)
+            ]
+            if not videos:
+                return image_layouts, []
+
+            video_id = f"{part_id}_video"
+            try:
+                video = await self._encode_modality(video_id, videos, Modality.VIDEO)
+                video_layouts = self._video_layouts(video)
+                if image.dtype != video.dtype or image.shape[1:] != video.shape[1:]:
+                    raise RuntimeError("Incompatible image and video embedding formats")
+                packed = torch.cat((image.embedding, video.embedding))
+                image.embedding = packed
+                image.shape = list(packed.shape)
+                await meta_registry.publish(part_id, packed.nbytes, *packed.shape)
+            finally:
+                # Cancellation can arrive after preprocessing published the
+                # temporary video state, or during its global-cache cleanup.
+                await await_task_completion_on_cancel(
+                    asyncio.create_task(self._release_staged_part(video_id)),
+                    f"Retire staged video {video_id}",
+                )
+            return image_layouts, video_layouts
+
+    async def _encode_modality(self, part_id, items, modality):
         request = {
-            "modality": Modality.IMAGE.name,
+            "modality": modality.name,
             "req_id": part_id,
             "num_parts": 1,
             "part_idx": 0,
-            "mm_items": images,
+            "mm_items": items,
         }
-        # Stage is single-rank. A timeout can cancel queueing and preprocessing
-        # directly. Once the global cache owns native copy handles it must drain
-        # those copies before releasing its buffers.
-        async with self.encoder.encode_dispatch_lock:
-            (result,) = await self.encoder.batch_encode(
-                [request], Modality.IMAGE, drain_global_cache_on_cancel=True
-            )
+        (result,) = await self.encoder.batch_encode(
+            [request], modality, drain_global_cache_on_cancel=True
+        )
         _, _, _, error_msg, error_code = result
         if error_msg is not None:
             if error_code == HTTPStatus.BAD_REQUEST:
                 raise ValueError(error_msg)
             raise RuntimeError(error_msg)
-        data = self.encoder.req_states[part_id].embedding_data
+        return self.encoder.req_states[part_id].embedding_data
+
+    def _item_embeddings(self, data):
         grids = data.get_grid()
-        counts = [
-            self.encoder.preprocessor.get_num_tokens(g, Modality.IMAGE) for g in grids
-        ]
-        slices = self.encoder.slice_embedding(data.embedding, counts)
-        # Match QwenVL's get_mm_data: identity is over each image's native
-        # precomputed tensor (dtype, shape and content). Router labels never
-        # substitute for content identity. This lets D reproduce P's pads.
+        counts = (
+            self.encoder.preprocessor.get_num_tokens(grid, data.modality)
+            for grid in grids
+        )
+        return zip(grids, self.encoder.slice_embedding(data.embedding, counts))
+
+    @staticmethod
+    def _item_identity(modality, tensor):
+        return MultimodalDataItem(
+            modality=modality, precomputed_embeddings=tensor
+        ).cache_key.hex()
+
+    def _video_layouts(self, data):
+        timestamps = getattr(data, "video_timestamps", None)
+        seconds = getattr(data, "second_per_grid_ts", None)
+        timed_grid = self.encoder.model_type == "qwen2_5_vl"
+        frame_items = self.encoder.model_type in {"qwen3_vl", "qwen3_vl_moe"}
+        count = len(data.get_grid())
+        if frame_items and (timestamps is None or len(timestamps) != count):
+            raise RuntimeError("Missing Qwen3-VL timestamps for staged video")
+        if timed_grid and (seconds is None or len(seconds) != count):
+            raise RuntimeError("Missing Qwen2.5-VL grid duration for staged video")
         layouts = []
-        for grid, tensor in zip(grids, slices):
+        for i, (grid, tensor) in enumerate(self._item_embeddings(data)):
             t, h, w = map(int, grid)
-            item = MultimodalDataItem(
-                modality=Modality.IMAGE, precomputed_embeddings=tensor
+            if min(t, h, w) <= 0 or tensor.shape[0] % t:
+                raise RuntimeError("Invalid staged video grid or embedding length")
+            layout = encoder_pb2.VideoLayout(t=t, h=h, w=w)
+            if frame_items:
+                times = [float(x) for x in timestamps[i]]
+                if (
+                    len(times) != t
+                    or any(not math.isfinite(x) or x < 0 for x in times)
+                    or any(a > b for a, b in pairwise(times))
+                ):
+                    raise RuntimeError("Invalid staged video frame timestamps")
+                layout.timestamps.extend(times)
+                chunks = tensor.tensor_split(t)
+            else:
+                chunks = (tensor,)
+            if timed_grid:
+                duration = float(seconds[i])
+                if not math.isfinite(duration) or duration <= 0:
+                    raise RuntimeError("Invalid staged video grid duration")
+                layout.second_per_grid_ts = duration
+            layout.identities.extend(
+                self._item_identity(Modality.VIDEO, chunk) for chunk in chunks
             )
-            layouts.append(
-                encoder_pb2.ImageLayout(t=t, h=h, w=w, identity=item.cache_key.hex())
-            )
+            layouts.append(layout)
         return layouts
 
     def _describe_part(self, part_id):

@@ -5,6 +5,7 @@ import unittest
 
 import grpc
 import msgspec
+
 from sglang.encoder.v1 import encoder_pb2 as pb
 from sglang.encoder.v1 import encoder_pb2_grpc as rpc
 from sglang.srt.disaggregation.encoder.handoff import EncoderHandoff

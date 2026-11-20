@@ -1275,7 +1275,7 @@ pub struct GenerateRequest {
     pub return_sampling_mask: ::core::option::Option<BoolOrList>,
     #[prost(message, optional, tag = "40")]
     pub modalities: ::core::option::Option<OptionalStringList>,
-    /// Private language-only ingress. A versioned staged image descriptor from
+    /// Private language-only ingress. A versioned staged media descriptor from
     /// the selected native encoder, consumed alongside unexpanded token IDs.
     #[prost(string, optional, tag = "41")]
     pub encoder_handoff: ::core::option::Option<::prost::alloc::string::String>,
@@ -3919,6 +3919,9 @@ pub struct GetServerInfoResponse {
     /// This private language listener accepts version-1 staged image descriptors.
     #[prost(bool, tag = "17")]
     pub accepts_encoder_handoff: bool,
+    /// Accepts version-2 encoder handoffs containing video layouts.
+    #[prost(bool, tag = "18")]
+    pub supports_staged_video: bool,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct DeploymentInfo {

@@ -4260,6 +4260,7 @@ class GetServerInfoResponse(msgspec.Struct, kw_only=True, frozen=True):
     num_reserved_tokens: int = 0
     instance_id: str = ""
     accepts_encoder_handoff: bool = False
+    supports_staged_video: bool = False
 
     @classmethod
     def from_json_value(cls, value: Any) -> "GetServerInfoResponse":
@@ -12102,6 +12103,8 @@ def decode_GetServerInfoResponse(value: Any) -> GetServerInfoResponse:
             kw["instance_id"] = _expect_str(x, expected="a string")
         elif key == "accepts_encoder_handoff":
             kw["accepts_encoder_handoff"] = _expect_bool(x, expected="a boolean")
+        elif key == "supports_staged_video":
+            kw["supports_staged_video"] = _expect_bool(x, expected="a boolean")
     return GetServerInfoResponse(**kw)
 
 
@@ -12127,6 +12130,7 @@ def encode_GetServerInfoResponse(v: GetServerInfoResponse) -> Dict[str, Any]:
     d["num_reserved_tokens"] = v.num_reserved_tokens
     d["instance_id"] = v.instance_id
     d["accepts_encoder_handoff"] = v.accepts_encoder_handoff
+    d["supports_staged_video"] = v.supports_staged_video
     return d
 
 

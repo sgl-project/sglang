@@ -1,6 +1,7 @@
 import asyncio
 import pickle
 import socket
+import sys
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -240,13 +241,20 @@ class TestEncoderCacheIdentity(CustomTestCase):
 
 class TestStagedNativeTransfer(CustomTestCase):
     @contextmanager
-    def native_encoder(self, backend="zmq_to_scheduler"):
+    def native_encoder(
+        self,
+        backend="zmq_to_scheduler",
+        model_type="qwen3_vl",
+        *,
+        video_processor=True,
+        video_decoder=True,
+    ):
         from sglang.srt.disaggregation.encoder import grpc_server
 
         grids = [[1, 2, 2], [1, 4, 2]]
         tensor = torch.arange(12, dtype=torch.float32).reshape(3, 4)
         enc = MMEncoder.__new__(MMEncoder)
-        enc.model_type = "qwen3_vl"
+        enc.model_type = model_type
         enc.transfer_backend = backend
         enc.use_mooncake = enc.mm_global_cache_enabled = False
         enc.rank = 0
@@ -256,6 +264,9 @@ class TestStagedNativeTransfer(CustomTestCase):
         enc.encode_dispatch_lock = asyncio.Lock()
         enc.preprocessor = EncoderPreprocessor.__new__(EncoderPreprocessor)
         enc.preprocessor.model_type = enc.model_type
+        enc.preprocessor._supported_modalities = {Modality.IMAGE}
+        if video_processor:
+            enc.preprocessor._supported_modalities.add(Modality.VIDEO)
         enc.preprocessor.image_processor = SimpleNamespace(merge_size=2)
         enc.send_timeout = 1
         if backend == "nixl":
@@ -263,27 +274,44 @@ class TestStagedNativeTransfer(CustomTestCase):
         else:
             enc.delivery = encoder_server.ZmqDelivery(enc, cleanup_receive_state=True)
 
-        enc._embedding_dims = {Modality.IMAGE: 4}
+        enc._embedding_dims = {Modality.IMAGE: 4, Modality.VIDEO: 4}
         enc._embedding_dtype = tensor.dtype
         enc._element_size = tensor.element_size()
 
         async def prepare(requests, modality, **kwargs):
+            item_grids, counts, aux = grids, [1, 2], {}
+            if modality == Modality.VIDEO:
+                item_grids, counts = [[2, 2, 2], [3, 2, 2]], [2, 3]
+                if model_type in {"qwen3_vl", "qwen3_vl_moe"}:
+                    aux["video_timestamps"] = [[0.0, 0.5], [0.0, 0.6, 1.2]]
+                elif model_type == "qwen2_5_vl":
+                    aux["second_per_grid_ts"] = torch.tensor([0.5, 0.75])
             ctx = SimpleNamespace(
                 req_id=requests[0]["req_id"],
-                items_per_req=[2],
-                preprocess_result=SimpleNamespace(grid_thw=grids, token_counts=[1, 2]),
+                items_per_req=[len(requests[0]["mm_items"])],
+                preprocess_result=SimpleNamespace(
+                    grid_thw=item_grids, token_counts=counts
+                ),
                 modality=modality,
-                aux_data={},
+                aux_data=aux,
             )
             # Publish the same early metadata as native preprocessing.
             await enc._publish_preprocess_metadata(ctx, requests)
             return ctx
 
-        enc._compute_embedding = AsyncMock(return_value=tensor)
+        video_tensor = torch.arange(20, dtype=tensor.dtype).reshape(5, 4) + 100
+        enc._compute_embedding = AsyncMock(
+            side_effect=lambda ctx, **kwargs: (
+                tensor if ctx.modality == Modality.IMAGE else video_tensor
+            )
+        )
         enc._prepare_encode_context_on_all_ranks = AsyncMock(side_effect=prepare)
         cfg = SimpleNamespace(encoder_transfer_backend=enc.transfer_backend)
         with (
             patch.object(encoder_server, "get_disagg", return_value=cfg),
+            patch.object(
+                grpc_server, "video_decoder_available", return_value=video_decoder
+            ),
             patch.object(
                 grpc_server,
                 "get_parallel",
@@ -410,6 +438,195 @@ class TestStagedNativeTransfer(CustomTestCase):
                 enc._compute_embedding.assert_awaited_once()
 
         asyncio.run(run())
+
+    def test_video_capability_checks_native_torchcodec_once(self):
+        from sglang.srt.utils import video_decoder
+
+        query_versions = Mock(side_effect=RuntimeError("cannot load libavformat"))
+        with (
+            patch.object(video_decoder, "_BACKEND", "torchcodec"),
+            patch.dict(
+                sys.modules,
+                {
+                    "torchcodec._core": SimpleNamespace(
+                        get_ffmpeg_library_versions=query_versions
+                    )
+                },
+            ),
+        ):
+            video_decoder.video_decoder_available.cache_clear()
+            self.addCleanup(video_decoder.video_decoder_available.cache_clear)
+            self.assertFalse(video_decoder.video_decoder_available())
+            self.assertFalse(video_decoder.video_decoder_available())
+            query_versions.assert_called_once_with()
+            query_versions.side_effect = None
+            video_decoder.video_decoder_available.cache_clear()
+            self.assertTrue(video_decoder.video_decoder_available())
+
+    def test_staging_images_without_a_usable_video_pipeline(self):
+        from sglang.encoder.v1 import encoder_pb2 as pb
+
+        async def run(processor, decoder):
+            with self.native_encoder(
+                video_processor=processor, video_decoder=decoder
+            ) as (svc, _, _, _, _):
+                info = await svc.GetEncoderInfo(pb.GetEncoderInfoRequest(), Mock())
+                self.assertFalse(info.supports_staged_video)
+                transfer = (
+                    await svc.Stage(
+                        pb.StageRequest(request_id="img", mm_items=["i1", "i2"]), Mock()
+                    )
+                ).transfer
+                self.assertEqual(transfer.version, 1)
+                await svc.Release(
+                    pb.ReleaseRequest(transfer_id=transfer.transfer_id), Mock()
+                )
+
+        for processor, decoder in ((False, True), (True, False)):
+            with self.subTest(processor=processor, decoder=decoder):
+                asyncio.run(run(processor, decoder))
+
+    def test_video_stage_matches_native_identities_and_packs_one_transfer(self):
+        from sglang.encoder.v1 import encoder_pb2 as pb
+        from sglang.srt.disaggregation.encoder import nixl
+        from sglang.srt.managers.req_types import MultimodalDataItem
+
+        async def run(backend, model, images):
+            with self.native_encoder(backend, model) as (svc, enc, receivers, _, image):
+                info = await svc.GetEncoderInfo(pb.GetEncoderInfoRequest(), Mock())
+                self.assertTrue(info.supports_staged_video)
+                transfer = (
+                    await svc.Stage(
+                        pb.StageRequest(
+                            request_id="video", mm_items=images, video_urls=["a", "b"]
+                        ),
+                        Mock(),
+                    )
+                ).transfer
+                self.assertEqual(
+                    (transfer.version, transfer.image_count), (2, len(images))
+                )
+                self.assertEqual(len(transfer.images), len(images))
+                self.assertEqual(list(enc.req_states), [transfer.part_id])
+                self.assertEqual(len(svc._leases), 1)
+                video = torch.arange(20, dtype=image.dtype).reshape(5, 4) + 100
+                expected = torch.cat((image, video)) if images else video
+                for i, (layout, tensor) in enumerate(
+                    zip(transfer.videos, video.split([2, 3]))
+                ):
+                    self.assertEqual(
+                        (layout.t, layout.h, layout.w), (tensor.shape[0], 2, 2)
+                    )
+                    if model.startswith("qwen3"):
+                        self.assertEqual(
+                            list(layout.timestamps), [[0.0, 0.5], [0.0, 0.6, 1.2]][i]
+                        )
+                        chunks = tensor.split(1)
+                    else:
+                        self.assertEqual(list(layout.timestamps), [])
+                        chunks = [tensor]
+                    self.assertEqual(
+                        list(layout.identities),
+                        [
+                            MultimodalDataItem(
+                                modality=Modality.VIDEO, precomputed_embeddings=chunk
+                            ).cache_key.hex()
+                            for chunk in chunks
+                        ],
+                    )
+                    self.assertEqual(
+                        layout.HasField("second_per_grid_ts"), model == "qwen2_5_vl"
+                    )
+                    if model == "qwen2_5_vl":
+                        self.assertEqual(layout.second_per_grid_ts, [0.5, 0.75][i])
+                state = enc.req_states[transfer.part_id]
+                if backend == "nixl":
+                    spec = await svc.Describe(
+                        pb.DescribeRequest(transfer=transfer), Mock()
+                    )
+                    self.assertEqual(tuple(spec.shape), tuple(expected.shape))
+                    with patch.object(
+                        nixl, "write_embedding", new_callable=AsyncMock
+                    ) as write:
+                        await svc.Deliver(
+                            pb.DeliverRequest(transfer=transfer, nixl_target=b"target"),
+                            Mock(),
+                        )
+                        torch.testing.assert_close(write.await_args.args[0], expected)
+                else:
+                    with receivers.socket(zmq.PULL) as sock:
+                        port = sock.bind_to_random_port("tcp://127.0.0.1")
+                        await svc.Deliver(
+                            pb.DeliverRequest(
+                                transfer=transfer, receive_url=f"127.0.0.1:{port}"
+                            ),
+                            Mock(),
+                        )
+                        header, data = await asyncio.wait_for(sock.recv_multipart(), 2)
+                        envelope = safe_pickle_loads(header)
+                        self.assertEqual(envelope.req_id, transfer.part_id)
+                        self.assertEqual(tuple(envelope.shape), tuple(expected.shape))
+                        self.assertEqual(data, expected.numpy().tobytes())
+                self.assert_retired(svc, enc, [state])
+
+        for model in ("qwen2_vl", "qwen2_5_vl", "qwen3_vl", "qwen3_vl_moe"):
+            for backend in ("nixl", "zmq_to_scheduler"):
+                for images in ([], ["i1", "i2"]):
+                    with self.subTest(model=model, backend=backend, mixed=bool(images)):
+                        asyncio.run(run(backend, model, images))
+
+    def test_failed_or_cancelled_mixed_stage_retires_both_native_parts(self):
+        from sglang.encoder.v1 import encoder_pb2 as pb
+
+        async def run(cancel):
+            with self.native_encoder() as (svc, enc, _, _, _):
+                original_compute = enc._compute_embedding
+                enc.mm_global_cache_enabled = True
+                enc.mm_global_cache = Mock()
+                enc._lookup_global_cache = AsyncMock(return_value=([], []))
+                started, resume = asyncio.Event(), asyncio.Event()
+                states = []
+
+                async def compute(ctx, **kwargs):
+                    if ctx.modality == Modality.VIDEO:
+                        states.extend(enc.req_states.values())
+                        started.set()
+                        if cancel:
+                            await resume.wait()
+                        raise RuntimeError("video forward failed")
+                    return await original_compute(ctx, **kwargs)
+
+                enc._compute_embedding = compute
+                request = pb.StageRequest(
+                    request_id="abort", mm_items=["i1", "i2"], video_urls=["v1", "v2"]
+                )
+                context = AsyncMock()
+                context.abort.side_effect = RuntimeError("video forward failed")
+                call = asyncio.create_task(svc.Stage(request, context))
+                await asyncio.wait_for(started.wait(), 2)
+                if cancel:
+                    call.cancel()
+                    await asyncio.sleep(0)
+                    self.assertEqual(svc._active, 1)
+                    resume.set()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await call
+                else:
+                    with self.assertRaisesRegex(RuntimeError, "video forward failed"):
+                        await call
+                self.assertEqual(len(states), 2)
+                self.assertCountEqual(
+                    [
+                        c.args[0]
+                        for c in enc.mm_global_cache.discard_prefetch_waiter.call_args_list
+                    ],
+                    [state.req_id for state in states],
+                )
+                self.assert_retired(svc, enc, states)
+
+        for cancel in (False, True):
+            with self.subTest(cancel=cancel):
+                asyncio.run(run(cancel))
 
     def assert_retired(self, svc, enc, states):
         self.assertEqual(svc._leases, {})

@@ -280,6 +280,8 @@ message GetServerInfoResponse {
   string instance_id = 16;
   // This private language listener accepts version-1 staged image descriptors.
   bool accepts_encoder_handoff = 17;
+  // Accepts version-2 encoder handoffs containing video layouts.
+  bool supports_staged_video = 18;
 }
 
 message DeploymentInfo {

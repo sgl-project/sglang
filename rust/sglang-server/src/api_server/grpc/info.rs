@@ -74,6 +74,10 @@ pub(super) fn server_info(info: ServerInfo) -> Result<api::GetServerInfoResponse
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("internal_states are not JSON: {error}"))?;
     Ok(api::GetServerInfoResponse {
+        supports_staged_video: launch_fields
+            .get("supports_staged_video")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
         accepts_encoder_handoff: launch_fields
             .get("accepts_encoder_handoff")
             .and_then(serde_json::Value::as_bool)

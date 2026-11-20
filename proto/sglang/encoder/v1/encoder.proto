@@ -40,11 +40,22 @@ message GetEncoderInfoResponse {
   string model_path = 1;
   string tokenizer_path = 2;
   string served_model_name = 3;
+  bool supports_staged_video = 4;
+  // Source policy applied by the native encoder when fetching remote URLs.
+  // A sidecar that fetches bytes on its behalf must honor these bounds.
+  StagedMediaPolicy staged_media_policy = 5;
+}
+
+message StagedMediaPolicy {
+  repeated string allowed_domains = 1;
+  uint64 max_bytes = 2; // zero means unlimited on the native encoder
+  optional double timeout_secs = 3;
 }
 
 message StageRequest {
   string request_id = 1;
   repeated string mm_items = 2; // image URLs in prompt order
+  repeated string video_urls = 3; // video URLs in prompt order, requires supports_staged_video
 }
 
 message ImageLayout {
@@ -52,6 +63,18 @@ message ImageLayout {
   uint32 h = 2;
   uint32 w = 3;
   string identity = 4; // native full EPD cache key, lowercase hex
+}
+
+// Video grids are reported by the encoder after sampling. Qwen3-VL returns
+// one identity and timestamp per temporal group, Qwen2/2.5-VL one identity
+// per video. Qwen2.5-VL also uses seconds per temporal grid for M-RoPE.
+message VideoLayout {
+  uint32 t = 1;
+  uint32 h = 2;
+  uint32 w = 3;
+  repeated string identities = 4;
+  repeated double timestamps = 5;
+  optional double second_per_grid_ts = 6;
 }
 
 message StagedImageTransfer {
@@ -63,6 +86,9 @@ message StagedImageTransfer {
   uint32 num_parts = 6;
   uint32 image_count = 7;
   repeated ImageLayout images = 8;
+  // Version 2 packs image embedding rows first, followed by video rows.
+  // Within each modality, item order matches that of the original prompt.
+  repeated VideoLayout videos = 9;
 }
 
 message StageResponse { StagedImageTransfer transfer = 1; }

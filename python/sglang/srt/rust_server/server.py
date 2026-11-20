@@ -263,7 +263,8 @@ class RustServer:
         self._encoder_dispatcher: Optional[MMReceiverBase] = None
         self._encoder_bootstrap_server = None
         self._external_image_token_id = None
-        self._external_image_limit = None
+        self._external_video_token_id = None
+        self._external_media_limits = {}
         self._encoder_dispatch_ready: List[threading.Event] = []
         self._encoder_dispatch_errors: deque[EncoderDispatchErrorReq] = deque()
 
@@ -551,9 +552,10 @@ class RustServer:
             instance._external_image_token_id = (
                 scheduler.model_config.hf_config.image_token_id
             )
-            instance._external_image_limit = (
-                get_mm().limit_mm_data_per_request or {}
-            ).get("image")
+            instance._external_video_token_id = (
+                scheduler.model_config.hf_config.video_token_id
+            )
+            instance._external_media_limits = get_mm().limit_mm_data_per_request or {}
         elif get_disagg().language_only:
             instance._start_encoder_dispatch()
 
@@ -1013,23 +1015,6 @@ class RustServer:
             raise
         try:
             self._attach_buffers(obj, buffers)
-        except NoEncoderError as e:
-            logger.warning("rust ingress: rejecting request %s: %s", obj.rid, e)
-            abort = AbortReq(
-                rid=obj.rid,
-                finished_reason={
-                    "type": "abort",
-                    "message": str(e),
-                    "status_code": 503,
-                },
-            )
-            self._push_abort_frame(
-                abort,
-                prompt_tokens=len(obj.input_ids),
-                cached_tokens=0,
-                reasoning_tokens=0,
-            )
-            raise
         except Exception as e:
             logger.warning(
                 "rust ingress: rejecting request %s: %s: %s",
@@ -1037,7 +1022,28 @@ class RustServer:
                 type(e).__name__,
                 e,
             )
-            self.server.push_error(obj.rid, f"invalid request: {e}")
+            if isinstance(e, NoEncoderError):
+                status = 503
+            elif "epd.handoff" in buffers and isinstance(
+                e, (ValueError, msgspec.DecodeError)
+            ):
+                status = 400
+            else:
+                self.server.push_error(obj.rid, f"invalid request: {e}")
+                raise
+            self._push_abort_frame(
+                AbortReq(
+                    rid=obj.rid,
+                    finished_reason={
+                        "type": "abort",
+                        "message": str(e),
+                        "status_code": status,
+                    },
+                ),
+                prompt_tokens=len(obj.input_ids),
+                cached_tokens=0,
+                reasoning_tokens=0,
+            )
             raise
         return obj
 
@@ -1081,26 +1087,32 @@ class RustServer:
                     "encoder_handoff requires SGLANG_EXTERNAL_ENCODER_HANDOFF=1"
                 )
             obj.encoder_handoff = EncoderHandoff.parse(
-                memoryview(handoff), obj.input_ids.count(self._external_image_token_id)
+                memoryview(handoff),
+                obj.input_ids.count(self._external_image_token_id),
+                obj.input_ids.count(self._external_video_token_id),
             )
-            if (
-                self._external_image_limit is not None
-                and obj.encoder_handoff.image_count > self._external_image_limit
+            for modality, count in (
+                ("image", obj.encoder_handoff.image_count),
+                ("video", len(obj.encoder_handoff.videos)),
             ):
-                raise ValueError(
-                    "staged image count exceeds --limit-mm-data-per-request"
-                )
+                limit = self._external_media_limits.get(modality)
+                if limit is not None and count > limit:
+                    raise ValueError(
+                        f"staged {modality} count exceeds --limit-mm-data-per-request"
+                    )
             hashes = buffers.get("epd.hashes")
             if hashes is not None:
                 obj.encoder_routing_hashes = msgspec.msgpack.decode(memoryview(hashes))
             obj.need_wait_for_mm_inputs = True
         elif self._external_image_token_id is not None:
             if media is not None or (
-                ids is not None and self._external_image_token_id in obj.input_ids
-            ):
-                raise NoEncoderError(
-                    "An image prompt requires a staged encoder_handoff"
+                ids is not None
+                and (
+                    self._external_image_token_id in obj.input_ids
+                    or self._external_video_token_id in obj.input_ids
                 )
+            ):
+                raise NoEncoderError("A media prompt requires a staged encoder_handoff")
         elif media is not None:
             self._dispatch_to_encoders(obj, media)
 

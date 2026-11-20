@@ -12,6 +12,7 @@ from types import ModuleType
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 from sglang.srt.arg_groups.model_override_base import resolving_view
+from sglang.srt.disaggregation.encoder.handoff import STAGED_VIDEO_MODEL_TYPES
 from sglang.srt.disaggregation.kv_events import select_kv_publisher_dp_rank
 from sglang.srt.entrypoints.server_utils import (
     build_model_info_fields,
@@ -504,6 +505,9 @@ def _launch_server_info(scheduler: Scheduler) -> str:
     )
     if envs.SGLANG_EXTERNAL_ENCODER_HANDOFF.get():
         info["accepts_encoder_handoff"] = True
+        info["supports_staged_video"] = (
+            scheduler.model_config.hf_config.model_type in STAGED_VIDEO_MODEL_TYPES
+        )
     _redact_api_keys(info, scheduler.server_args)
     return json.dumps(info, default=str)
 

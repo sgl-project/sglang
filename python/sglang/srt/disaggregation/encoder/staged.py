@@ -1,4 +1,4 @@
-"""One-shot gRPC handoff of an encoder-owned, already-produced image part."""
+"""One-shot gRPC handoff of an encoder-owned, already-produced multimodal part."""
 
 import asyncio
 import logging
@@ -64,7 +64,7 @@ class StagedImageService:
         ):
             await context.abort(
                 grpc.StatusCode.FAILED_PRECONDITION,
-                "Staged images require Qwen-VL, zmq_to_scheduler or nixl, TP=DP=1 "
+                "Staged media require Qwen-VL, zmq_to_scheduler or nixl, TP=DP=1 "
                 "and positive staging limits",
             )
 
@@ -74,9 +74,20 @@ class StagedImageService:
 
     async def Stage(self, request, context):
         await self._check_config(context)
-        if not request.request_id or not request.mm_items or not all(request.mm_items):
+        images, videos = list(request.mm_items), list(request.video_urls)
+        if (
+            not request.request_id
+            or not (images or videos)
+            or not all(images)
+            or not all(videos)
+        ):
             await context.abort(
-                grpc.StatusCode.INVALID_ARGUMENT, "request_id and images are required"
+                grpc.StatusCode.INVALID_ARGUMENT,
+                "request_id and nonempty media are required",
+            )
+        if videos and not self._info.supports_staged_video:
+            await context.abort(
+                grpc.StatusCode.FAILED_PRECONDITION, "staged video is unavailable"
             )
         if self._active >= self._capacity:
             await context.abort(
@@ -89,31 +100,33 @@ class StagedImageService:
         try:
             loop = asyncio.get_running_loop()
             deadline = loop.time() + self._stage_timeout
-            layouts = await asyncio.wait_for(
-                self._encode(part_id, list(request.mm_items)), self._stage_timeout
+            image_layouts, video_layouts = await asyncio.wait_for(
+                self._encode(part_id, images, videos), self._stage_timeout
             )
             if loop.time() >= deadline:
                 raise asyncio.TimeoutError
-            if len(layouts) != len(request.mm_items):
-                raise ValueError("staged grid count differs from image count")
+            if len(image_layouts) != len(images) or len(video_layouts) != len(videos):
+                raise ValueError("staged grid count differs from media count")
             transfer = pb.StagedImageTransfer(
-                version=1,
+                version=2 if videos else 1,
                 request_id=request.request_id,
                 transfer_id=transfer_id,
                 part_id=part_id,
                 part_idx=0,
                 num_parts=1,
-                image_count=len(layouts),
-                images=layouts,
+                image_count=len(images),
+                images=image_layouts,
+                videos=video_layouts,
             )
             response = pb.StageResponse(transfer=transfer)
             expiry = loop.call_later(self._ttl, self._expire, transfer_id)
             self._leases[transfer_id] = _Lease(transfer, expiry)
             logger.debug(
-                "Stage complete request_id=%s part_id=%s images=%d",
+                "Stage complete request_id=%s part_id=%s images=%d videos=%d",
                 transfer.request_id,
                 part_id,
                 transfer.image_count,
+                len(transfer.videos),
             )
             return response
         except asyncio.CancelledError:

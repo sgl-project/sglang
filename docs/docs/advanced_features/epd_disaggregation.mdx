@@ -19,6 +19,21 @@ When launching a language-only model, you must additionally specify the encoder 
 
 We support multiple encoder transfer backends, including zmq_to_scheduler, zmq_to_tokenizer, and mooncake (the default is zmq_to_scheduler). The backend can be selected using `--encoder-transfer-backend`.
 
+### External encoder selection for Qwen-VL
+
+An external router can select an encoder before it selects the prefill worker.
+Start the encoder with `--encoder-only --grpc-mode`, and enable
+`SGLANG_EXTERNAL_ENCODER_HANDOFF=1` on the Rust language-only workers.
+Use the same `--encoder-transfer-backend nixl` or
+`--encoder-transfer-backend zmq_to_scheduler` on E and P/PD. NIXL requires
+the UCX plugin on both ends.
+
+This mode supports Qwen2-VL, Qwen2.5-VL and Qwen3-VL (including MoE) with
+TP=PP=DP=1. Images use the v1 handoff. Video-only and mixed image/video
+requests require video decoding on E and v2 support on E, P/PD and D.
+P/PD receives the embeddings. D uses the grids and video timing to rebuild the
+same token positions for KV transfer. The P→D KV backend is configured separately.
+
 ### Encoder transfer with Mooncake
 
 `--encoder-transfer-backend mooncake` controls **how encoder outputs are transferred** between encoder and language/prefill services. It is an encoder transfer option and can be used independently of the global multimodal embedding cache.

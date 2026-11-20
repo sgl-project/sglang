@@ -1327,6 +1327,27 @@ class WaitingStagedImage(WaitingZmqRequest):
             handoff.deliver(receive_url, envs.SGLANG_ENCODER_GRPC_TIMEOUT_SECS.get())
         )
 
+    def __init__(self, *args, staged_layout, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.staged_layout = staged_layout
+
+    def _embedding_shape(self):
+        handoff = self.recv_req.encoder_handoff
+        merge = self.mm_processor.spatial_merge_size
+        rows = sum(
+            layout.t * (layout.h // merge) * (layout.w // merge)
+            for layout in (*handoff.images, *handoff.videos)
+        )
+        vision = self.mm_processor.hf_config.vision_config
+        if self.model_type == "qwen2_vl":
+            width = vision.hidden_size
+        elif getattr(vision, "disable_merger_proj", False):
+            width = vision.hidden_size * merge**2
+        else:
+            width = vision.out_hidden_size
+        width *= 1 + len(getattr(vision, "deepstack_visual_indexes", None) or ())
+        return rows, width
+
     def _is_valid_embedding_part(self, recv_obj):
         handoff = self.recv_req.encoder_handoff
         if (
@@ -1334,25 +1355,54 @@ class WaitingStagedImage(WaitingZmqRequest):
             or recv_obj.req_id != handoff.part_id
         ):
             return False  # A stale frame from an earlier user of this port.
+        packed_modality = Modality.IMAGE if handoff.images else Modality.VIDEO
         if (recv_obj.num_parts, recv_obj.part_idx, recv_obj.modality) != (
             1,
             0,
-            Modality.IMAGE,
+            packed_modality,
         ):
             raise ValueError("received part metadata differs from staged descriptor")
-        if (
-            not recv_obj.error_msg
-            and _cat_grid([recv_obj.grid_dim]).tolist() != handoff.grids()
-        ):
-            raise ValueError("received image grid differs from staged descriptor")
+        if not recv_obj.error_msg:
+            if (
+                handoff.version == 1
+                and _cat_grid([recv_obj.grid_dim]).tolist() != handoff.grids()
+            ):
+                raise ValueError("received image grid differs from staged descriptor")
+            if handoff.version == 2 and (
+                tuple(recv_obj.shape) != self._embedding_shape()
+                or recv_obj.dtype not in (torch.float16, torch.bfloat16, torch.float32)
+            ):
+                raise ValueError(
+                    "received tensor differs from staged media layout/model"
+                )
         recv_obj.req_id = self.rid
         return True
 
     def _finish_assemble(self, recv_embedding):
-        super()._finish_assemble(recv_embedding)
-        self.recv_req.encoder_handoff.bind_identities(
-            self.recv_req.mm_inputs.mm_items, self.recv_req.encoder_routing_hashes
-        )
+        # One lease owns a contiguous tensor: image rows first, then video rows.
+        # The processor's spans run in prompt order, possibly interleaving both.
+        handoff = self.recv_req.encoder_handoff
+        (packed,) = recv_embedding.values()
+        merge = self.mm_processor.spatial_merge_size
+        image_rows = sum(v.t * (v.h // merge) * (v.w // merge) for v in handoff.images)
+        offsets = {Modality.IMAGE: 0, Modality.VIDEO: image_rows}
+        mm = self.staged_layout
+        for item in mm.mm_items:
+            ((start, end),) = item.offsets
+            cursor = offsets[item.modality]
+            offsets[item.modality] = cursor + end - start + 1
+            item.precomputed_embeddings = packed[cursor : offsets[item.modality]]
+        if (
+            offsets[Modality.IMAGE] != image_rows
+            or offsets[Modality.VIDEO] != packed.shape[0]
+        ):
+            raise ValueError("staged media rows differ from rebuilt prompt")
+        handoff.bind_identities(mm.mm_items, self.recv_req.encoder_routing_hashes)
+        attach_mm_routing_labels(mm.mm_items, self.recv_req.mm_routing_labels)
+        self._bind_pool_slot_to_mm_inputs(mm)
+        self.recv_req.mm_inputs = mm
+        self.recv_req.input_ids = array("q", mm.input_ids)
+        self.status = WaitingMMRequestStatus.SUCCESS
 
     async def _release_transfer(self):
         try:
@@ -1361,7 +1411,7 @@ class WaitingStagedImage(WaitingZmqRequest):
             )
         except Exception as exc:
             logger.warning(
-                "Early release of staged image for rid=%s failed; encoder lease will expire: %s",
+                "Early release of staged media for rid=%s failed; encoder lease will expire: %s",
                 self.rid,
                 exc,
             )
@@ -1384,20 +1434,10 @@ class WaitingStagedNixlImage(WaitingStagedImage):
 
     def send_encode_request(self):
         handoff = self.recv_req.encoder_handoff
-        merge = self.mm_processor.spatial_merge_size
-        rows = sum(t * (h // merge) * (w // merge) for t, h, w in handoff.grids())
-        vision = self.mm_processor.hf_config.vision_config
-        if self.model_type == "qwen2_vl":
-            width = vision.hidden_size
-        elif getattr(vision, "disable_merger_proj", False):
-            width = vision.hidden_size * merge**2
-        else:
-            width = vision.out_hidden_size
-        width *= 1 + len(getattr(vision, "deepstack_visual_indexes", None) or ())
         self._start_registration(
             handoff.receive_nixl(
                 self.nixl_receiver,
-                (rows, width),
+                self._embedding_shape(),
                 envs.SGLANG_ENCODER_GRPC_TIMEOUT_SECS.get(),
             )
         )
@@ -1418,7 +1458,12 @@ class WaitingStagedNixlImage(WaitingStagedImage):
                 tensor = future.result()
                 handoff = self.recv_req.encoder_handoff
                 part = EmbeddingData(
-                    self.rid, 1, 0, handoff.grids(), Modality.IMAGE, embedding=tensor
+                    self.rid,
+                    1,
+                    0,
+                    None,
+                    Modality.IMAGE if handoff.images else Modality.VIDEO,
+                    embedding=tensor,
                 )
                 self.recv_embedding_data = _aggregate_embedding_part(
                     None, part, self.model_type
@@ -2506,17 +2551,15 @@ class MMReceiverBase(ABC):
 
                 waiting_req = None
                 local_error = None
+                error_code = HTTPStatus.INTERNAL_SERVER_ERROR
                 try:
                     if handoff is not None:
-                        handoff.validate_layout(
-                            self.mm_processor.spatial_merge_size,
-                            len(recv_req.input_ids),
+                        mm = handoff.build_layout(
+                            self.mm_processor,
+                            recv_req.input_ids,
                             self.scheduler.max_req_input_len,
                         )
                         if get_disagg().disaggregation_mode == "decode":
-                            mm = self.mm_processor.get_decode_image_layout(
-                                list(recv_req.input_ids), torch.tensor(handoff.grids())
-                            )
                             handoff.bind_identities(
                                 mm.mm_items, recv_req.encoder_routing_hashes
                             )
@@ -2525,15 +2568,16 @@ class MMReceiverBase(ABC):
                             new_recv_reqs.append(recv_req)
                             continue
                         cls = WaitingStagedImage
+                        transport_kwargs = {**extra_kwargs, "staged_layout": mm}
                         if self.encoder_transfer_backend == "nixl":
                             cls = WaitingStagedNixlImage
                             transport_kwargs = {
-                                **extra_kwargs,
+                                **transport_kwargs,
                                 "nixl_receiver": self.nixl_receiver,
                             }
                     elif self.encoder_transfer_backend == "nixl":
                         raise ValueError(
-                            "NIXL embedding receive requires a staged image handoff"
+                            "NIXL embedding receive requires a staged media handoff"
                         )
                     waiting_req = cls(
                         rid=recv_req.rid,
@@ -2558,6 +2602,12 @@ class MMReceiverBase(ABC):
                     waiting_req.send_encode_request()
                 except Exception as error:
                     local_error = f"{type(error).__name__}: {error}"
+                    if (
+                        handoff is not None
+                        and waiting_req is None
+                        and isinstance(error, ValueError)
+                    ):
+                        error_code = HTTPStatus.BAD_REQUEST
                     logger.exception(
                         "Failed to start multimodal receive for rid=%s", recv_req.rid
                     )
@@ -2599,7 +2649,7 @@ class MMReceiverBase(ABC):
                         (
                             self.create_req(recv_req),
                             error_msg,
-                            HTTPStatus.INTERNAL_SERVER_ERROR,
+                            error_code,
                         )
                     )
                     continue

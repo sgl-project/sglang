@@ -38,7 +38,7 @@ class FakeEncoder(StagedImageService, rpc.SglangEncoderServicer):
             capacity=2,
         )
 
-    async def encode_images(self, rid, images):
+    async def encode_images(self, rid, images, videos):
         self.encoded.append((rid, images))
         self.parts[rid] = [image.encode() for image in images]
         self.encoding.set()
@@ -49,7 +49,7 @@ class FakeEncoder(StagedImageService, rpc.SglangEncoderServicer):
         return [
             pb.ImageLayout(t=1, h=2, w=2, identity=hashlib.sha256(data).hexdigest())
             for data in self.parts[rid]
-        ]
+        ], []
 
     async def release_images(self, rid):
         self.parts.pop(rid, None)
@@ -244,6 +244,16 @@ class TestStagedImages(unittest.IsolatedAsyncioTestCase):
                 pb.DeliverRequest(transfer=transfer, receive_url="late")
             ),
         )
+
+    async def test_video_requires_capability_and_nonempty_inputs(self):
+        peer = self.peers[0]
+        for videos, status in (
+            (["video.mp4"], grpc.StatusCode.FAILED_PRECONDITION),
+            ([""], grpc.StatusCode.INVALID_ARGUMENT),
+        ):
+            request = pb.StageRequest(request_id="bad-video", video_urls=videos)
+            await self.error(status, peer.Stage(request))
+        self.assertEqual(self.backends[0].encoded, [])
 
     async def test_failure_abort_and_invalid_handle(self):
         backend = self.backends[0]

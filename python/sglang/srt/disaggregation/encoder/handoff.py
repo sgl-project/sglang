@@ -1,10 +1,15 @@
-"""Version 1 of the private, single-receiver image handoff."""
+"""Private, single-receiver Qwen image and video handoffs."""
 
 import asyncio
+import math
 import re
 from urllib.parse import urlsplit
 
 import msgspec
+
+STAGED_VIDEO_MODEL_TYPES = frozenset(
+    {"qwen2_vl", "qwen2_5_vl", "qwen3_vl", "qwen3_vl_moe"}
+)
 
 # Keep one recovery task per ambiguous registered destination until the original
 # write completes or E fences it. The receiver's admission limit bounds this set
@@ -19,6 +24,15 @@ class ImageLayout(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     identity: str
 
 
+class VideoLayout(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
+    t: int
+    h: int
+    w: int
+    identities: list[str]
+    timestamps: list[float] = msgspec.field(default_factory=list)
+    second_per_grid_ts: float | None = None
+
+
 class EncoderHandoff(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     version: int
     peer: str
@@ -29,11 +43,14 @@ class EncoderHandoff(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     num_parts: int
     image_count: int
     images: list[ImageLayout]
+    videos: list[VideoLayout] = msgspec.field(default_factory=list)
 
     @classmethod
-    def parse(cls, data, placeholder_count: int) -> "EncoderHandoff":
+    def parse(
+        cls, data, placeholder_count: int, video_count: int = 0
+    ) -> "EncoderHandoff":
         transfer = msgspec.json.decode(data, type=cls)
-        if transfer.version != 1:
+        if transfer.version != (2 if transfer.videos else 1):
             raise ValueError("unsupported encoder_handoff version")
         peer = urlsplit(transfer.peer)
         if (
@@ -57,66 +74,166 @@ class EncoderHandoff(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
             0,
             transfer.transfer_id + "_local_part_0",
         ):
-            raise ValueError("invalid staged image part")
+            raise ValueError("invalid staged media part")
         if (
-            not transfer.images
+            (not transfer.images and not transfer.videos)
             or len(transfer.images) != transfer.image_count
             or transfer.image_count != placeholder_count
+            or len(transfer.videos) != video_count
         ):
             raise ValueError(
-                "staged image count differs from layout or prompt placeholders"
+                "staged media counts differ from layout or prompt placeholders"
             )
         for image in transfer.images:
             if min(image.t, image.h, image.w) < 1 or not re.fullmatch(
                 "[0-9a-f]{64}", image.identity
             ):
                 raise ValueError("invalid staged image grid or identity")
+        for video in transfer.videos:
+            if (
+                min(video.t, video.h, video.w) < 1
+                or not video.identities
+                or any(
+                    not re.fullmatch("[0-9a-f]{64}", identity)
+                    for identity in video.identities
+                )
+            ):
+                raise ValueError("invalid staged video grid or identities")
+            if any(not math.isfinite(t) or t < 0 for t in video.timestamps) or any(
+                a > b for a, b in zip(video.timestamps, video.timestamps[1:])
+            ):
+                raise ValueError("invalid staged video timestamps")
+            interval = video.second_per_grid_ts
+            if interval is not None and (not math.isfinite(interval) or interval <= 0):
+                raise ValueError("invalid staged video sampling interval")
         return transfer
 
     def validate_layout(
         self, merge_size: int, prompt_len: int, max_length: int
     ) -> None:
         rows = 0
-        for image in self.images:
-            if image.h % merge_size or image.w % merge_size:
-                raise ValueError("staged image grid is incompatible with the model")
-            rows += image.t * (image.h // merge_size) * (image.w // merge_size)
-        if prompt_len - self.image_count + rows >= max_length:
-            raise ValueError("staged images exceed the model's input length limit")
+        for layout in (*self.images, *self.videos):
+            if layout.h % merge_size or layout.w % merge_size:
+                raise ValueError("staged media grid is incompatible with the model")
+            rows += layout.t * (layout.h // merge_size) * (layout.w // merge_size)
+        if prompt_len - self.image_count - len(self.videos) + rows >= max_length:
+            raise ValueError("staged media exceed the model's input length limit")
 
     def grids(self):
         return [[image.t, image.h, image.w] for image in self.images]
 
+    def build_layout(self, processor, prompt, max_length):
+        import torch
+
+        self.validate_layout(processor.spatial_merge_size, len(prompt), max_length)
+        kwargs = {}
+        if self.images:
+            kwargs["img_grid_thw"] = torch.tensor(self.grids())
+        if self.videos:
+            if processor.model_type not in STAGED_VIDEO_MODEL_TYPES:
+                raise ValueError(
+                    f"staged video is unsupported for {processor.model_type}"
+                )
+            frame_items = processor.model_type in ("qwen3_vl", "qwen3_vl_moe")
+            timed_grid = processor.model_type == "qwen2_5_vl"
+            for video in self.videos:
+                segments = video.t if frame_items else 1
+                if (
+                    len(video.identities) != segments
+                    or len(video.timestamps) != (video.t if frame_items else 0)
+                    or (video.second_per_grid_ts is not None) != timed_grid
+                ):
+                    raise ValueError("staged video metadata differs from model layout")
+            kwargs["video_grid_thw"] = torch.tensor(
+                [[v.t, v.h, v.w] for v in self.videos]
+            )
+            if frame_items:
+                kwargs["video_timestamps"] = [v.timestamps for v in self.videos]
+            if timed_grid:
+                kwargs["second_per_grid_ts"] = torch.tensor(
+                    [v.second_per_grid_ts for v in self.videos], dtype=torch.float32
+                )
+        mm = processor.get_staged_media_layout(list(prompt), **kwargs)
+        # Qwen3 inserts timestamp text and delimiters for each temporal slice.
+        if len(mm.input_ids) >= max_length:
+            raise ValueError("staged media exceed the model's input length limit")
+        return mm
+
     def bind_identities(self, mm_items, routing_hashes):
         from sglang.srt.environ import envs
+        from sglang.srt.multimodal.cache.digest import structured_digest
+        from sglang.srt.multimodal.modality import Modality
 
-        if len(mm_items) != self.image_count:
-            raise ValueError("staged image count differs from rebuilt prompt")
-        for index, (image, item) in enumerate(zip(self.images, mm_items)):
-            identity = bytes.fromhex(image.identity)
+        image_index = 0
+        media_index = -1
+        hints = routing_hashes or ()
+        all_media_hints = len(hints) == self.image_count + len(self.videos)
+        video_segments = iter(
+            (video, index, identity)
+            for video in self.videos
+            for index, identity in enumerate(video.identities)
+        )
+        if len(mm_items) != self.image_count + sum(
+            len(v.identities) for v in self.videos
+        ):
+            raise ValueError("staged media count differs from rebuilt prompt")
+        for item in mm_items:
+            hint = None
+            if self.videos and item.modality == Modality.VIDEO:
+                segment = next(video_segments, None)
+                if segment is None:
+                    raise ValueError("too many staged video segments in prompt")
+                video, index, raw_identity = segment
+                if index == 0:
+                    media_index += 1
+                identity = bytes.fromhex(raw_identity)
+                # Video time and geometry affect M-RoPE even for identical tensors.
+                cache_identity = structured_digest(
+                    (
+                        "staged-video-v2",
+                        identity,
+                        video.t,
+                        video.h,
+                        video.w,
+                        index,
+                        video.timestamps[index] if video.timestamps else None,
+                        video.second_per_grid_ts,
+                    )
+                )
+            else:
+                if image_index >= self.image_count:
+                    raise ValueError("too many staged image placeholders in prompt")
+                identity = cache_identity = bytes.fromhex(
+                    self.images[image_index].identity
+                )
+                if len(hints) == self.image_count:
+                    hint = hints[image_index]
+                image_index += 1
+                media_index += 1
+            if all_media_hints:
+                hint = hints[media_index]
             if (
                 item.precomputed_embeddings is not None
                 and not envs.SGLANG_MM_SKIP_COMPUTE_HASH.get()
                 and item.cache_key != identity
             ):
-                raise ValueError("staged image embedding identity mismatch")
-            item.set_identity(identity)
-            if routing_hashes and len(routing_hashes) == self.image_count:
-                hint = routing_hashes[index]
-                if hint is not None:
-                    # The legacy scalar is for routing. Prefix keys and padded
-                    # token IDs continue to use the full embedding digest.
-                    item.hash = hint
+                raise ValueError("staged media embedding identity mismatch")
+            item.set_identity(cache_identity)
+            if hint is not None:
+                item.hash = hint
 
     def native_transfer(self):
         from sglang.encoder.v1.encoder_pb2 import StagedImageTransfer
 
         fields = msgspec.to_builtins(self)
         del fields["peer"]
+        if not self.videos:
+            del fields["videos"]
         return StagedImageTransfer(**fields)
 
     async def deliver(self, receive_url: str, timeout: float):
         import grpc
+
         from sglang.encoder.v1 import encoder_pb2, encoder_pb2_grpc
 
         async with grpc.aio.insecure_channel(urlsplit(self.peer).netloc) as channel:
@@ -131,6 +248,7 @@ class EncoderHandoff(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     async def receive_nixl(self, receiver, shape: tuple[int, int], timeout: float):
         import grpc
         import torch
+
         from sglang.encoder.v1 import encoder_pb2, encoder_pb2_grpc
 
         deadline = asyncio.get_running_loop().time() + timeout
@@ -142,7 +260,7 @@ class EncoderHandoff(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
             )
             if tuple(spec.shape) != shape:
                 raise ValueError(
-                    "NIXL embedding shape differs from staged image layout/model"
+                    "NIXL embedding shape differs from staged media layout/model"
                 )
             if spec.dtype not in ("bfloat16", "float16", "float32"):
                 raise ValueError(f"unsupported staged embedding dtype: {spec.dtype}")
@@ -204,6 +322,7 @@ class EncoderHandoff(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
 
     async def release(self, timeout: float):
         import grpc
+
         from sglang.encoder.v1 import encoder_pb2, encoder_pb2_grpc
 
         async with grpc.aio.insecure_channel(urlsplit(self.peer).netloc) as channel:
