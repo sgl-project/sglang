@@ -3508,10 +3508,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 )
             else:
                 # Positional pairing: decode PP is 1 or matches prefill's, so a
-                # peer holding every layer runs no PP and pulls every stage.
+                # peer with exactly every layer's pointers runs no PP and pulls
+                # every stage. Any other count (extra per-layer or draft pointers)
+                # keeps the aux here.
                 ptrs_per_layer = 1 if self.is_mla_backend else 2
-                num_layers = len(peer.dst_kv_ptrs) // ptrs_per_layer
-                pulls_last = num_layers >= last_stage_layers.stop
+                pulls_last = (
+                    len(peer.dst_kv_ptrs) == ptrs_per_layer * last_stage_layers.stop
+                )
             if not pulls_last:
                 return False
         return True
@@ -3535,7 +3538,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         assert (
             not is_last_chunk
             or aux_index is not None
-            or envs.SGLANG_PP_PD_PREFILL_EARLY_SEND.get()
+            or envs.SGLANG_ENABLE_PP_PD_PREFILL_EARLY_SEND.get()
         )
 
         if (

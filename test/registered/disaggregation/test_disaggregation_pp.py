@@ -2,6 +2,7 @@ import time
 import unittest
 from types import SimpleNamespace
 
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
@@ -14,7 +15,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=246, stage="extra-b", runner_config="8-gpu-h20")
+register_cuda_ci(est_time=370, stage="extra-b", runner_config="8-gpu-h20")
 
 
 class TestDisaggregationPrefillPPDynamicChunkAccuracy(PDDisaggregationServerBase):
@@ -92,6 +93,26 @@ class TestDisaggregationPrefillPPDynamicChunkAccuracy(PDDisaggregationServerBase
         self.assertGreater(metrics["score"], 0.24)
         # Wait a little bit so that the memory check happens.
         time.sleep(5)
+
+
+class TestDisaggregationPrefillPPEarlySendAccuracy(
+    TestDisaggregationPrefillPPDynamicChunkAccuracy
+):
+    """The same PP prefill with each stage sending its last KV chunk when its
+    forward ends (SGLANG_ENABLE_PP_PD_PREFILL_EARLY_SEND)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._early_send_ctx = envs.SGLANG_ENABLE_PP_PD_PREFILL_EARLY_SEND.override(True)
+        cls._early_send_ctx.__enter__()
+        super().setUpClass()
+
+    @classmethod
+    def tearDownClass(cls):
+        try:
+            super().tearDownClass()
+        finally:
+            cls._early_send_ctx.__exit__(None, None, None)
 
 
 class TestDisaggregationDecodePPAccuracy(PDDisaggregationServerBase):

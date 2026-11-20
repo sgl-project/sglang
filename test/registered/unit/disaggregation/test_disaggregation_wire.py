@@ -2885,6 +2885,17 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                 buffers.set_buf(req)
                 self.assertEqual(buffers.get_customized_info(0), value)
 
+    def test_metadata_buffer_takes_an_early_sent_first_token(self):
+        # A PP early send writes the sampled token before the result appends it.
+        buffers = self._make_buffers()
+        req = self._make_req(None)
+        req.output_ids = []
+        buffers.set_buf(req, first_output_id=7)
+        self.assertEqual(int(buffers.output_ids[0][0]), 7)
+        req.output_ids = [101]
+        buffers.set_buf(req)
+        self.assertEqual(int(buffers.output_ids[0][0]), 101)
+
     def test_customized_info_buffers_are_opt_in(self):
         for capacity in (None, 0, 4096):
             with (

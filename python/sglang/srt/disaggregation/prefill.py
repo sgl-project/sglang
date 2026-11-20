@@ -173,6 +173,25 @@ def _uses_write_through_cache(cache: object) -> bool:
     )
 
 
+def _sender_takes_host_indices(sender) -> bool:
+    """Whether sender takes host-tensor indices and waits on their copy's event
+    itself. CP and shard filtering read the indices on the scheduler before that
+    wait, so those paths need a completed host copy even with CP-TP group sharing."""
+    return (
+        getattr(sender, "supports_host_tensor_indices", False)
+        and sender.kv_mgr.kv_shard_size <= 1
+        and not (
+            sender.kv_mgr.enable_all_cp_ranks_for_transfer
+            and not get_parallel().enable_dsa_cache_layer_split
+        )
+    )
+
+
+# Layouts a token-exact PD check covered with SGLANG_ENABLE_PP_PD_PREFILL_EARLY_SEND
+# on: no MLA, and no transferred state but these. Others keep the result path.
+_PP_PD_EARLY_SEND_STATE_TYPES: frozenset = frozenset()
+
+
 def _transfer_start_layer(*, pool, hf_text_config) -> int:
     # A pool wrapping one token KV view (its other layers hold state) counts all
     # layers in start_layer, but peer KV lists contain only full-attention
@@ -680,7 +699,7 @@ class SchedulerDisaggregationPrefillMixin:
     """
 
     # Rids whose last KV chunk this stage sent when its forward ended
-    # (SGLANG_PP_PD_PREFILL_EARLY_SEND); the PP prefill loop sets a real set.
+    # (SGLANG_ENABLE_PP_PD_PREFILL_EARLY_SEND); the PP prefill loop sets a real set.
     disagg_prefill_early_sent_rids: frozenset = frozenset()
     # Their results' checkpoint device frees, held until the transfer ends.
     disagg_prefill_deferred_frees: Mapping[str, list] = MappingProxyType({})
@@ -1767,12 +1786,19 @@ class SchedulerDisaggregationPrefillMixin:
         self.send_kv_chunk(req, last_chunk=False, end_idx=cached_end)
 
     def _pp_pd_early_send_enabled(self: Scheduler) -> bool:
-        """SGLANG_PP_PD_PREFILL_EARLY_SEND, where the last chunk needs nothing that
-        only the result brings and the engine can leave the aux to another stage."""
-        return (
-            envs.SGLANG_PP_PD_PREFILL_EARLY_SEND.get()
+        """SGLANG_ENABLE_PP_PD_PREFILL_EARLY_SEND, where the last chunk needs nothing
+        that only the result brings and the engine can leave the aux to another stage
+        (only the Mooncake sender takes ``send_aux``), on a verified layout."""
+        if not (
+            envs.SGLANG_ENABLE_PP_PD_PREFILL_EARLY_SEND.get()
             and get_parallel().pp_size > 1
-            and get_disagg().disaggregation_transfer_backend == "mooncake"
+        ):
+            return False
+        kv_mgr = self.disagg_prefill_bootstrap_queue.kv_manager
+        return (
+            get_disagg().disaggregation_transfer_backend == "mooncake"
+            and not kv_mgr.is_mla_backend
+            and set(kv_mgr.kv_args.state_types) <= _PP_PD_EARLY_SEND_STATE_TYPES
             and get_disagg().disaggregation_decode_allocation_policy
             != "prefill_complete"
             and self.kv_checksum_computer is None
@@ -1796,7 +1822,8 @@ class SchedulerDisaggregationPrefillMixin:
             and not req.return_sampling_mask
             and req.grammar is None
             and req.bootstrap_host != FAKE_BOOTSTRAP_HOST
-            and getattr(req.disagg_kv_sender, "supports_host_tensor_indices", False)
+            # Without host indices the send would read them on this thread.
+            and _sender_takes_host_indices(req.disagg_kv_sender)
         )
 
     def _pp_pd_early_send_last_chunks(
@@ -1876,13 +1903,12 @@ class SchedulerDisaggregationPrefillMixin:
         self.disagg_prefill_early_sent_rids.add(req.rid)
         stats = self.disagg_prefill_early_send_stats
         stats["early"] += 1
-        if stats["early"] & (stats["early"] - 1) == 0:  # 1, 2, 4, ... sends
-            logger.info(
-                "PP PD prefill early send: %d last chunks sent at forward end; "
-                "%d results held their checkpoint frees until the transfer's end.",
-                stats["early"],
-                stats["deferred"],
-            )
+        (logger.info if stats["early"] == 1 else logger.debug)(
+            "PP PD prefill early send: %d last chunks sent at forward end; "
+            "%d results held their checkpoint frees until the transfer's end.",
+            stats["early"],
+            stats["deferred"],
+        )
 
     def _checkpoint_early_sent(self: Scheduler, req: Req) -> None:
         """Checkpoint a result whose last chunk left at forward end. The transfer
@@ -1951,7 +1977,7 @@ class SchedulerDisaggregationPrefillMixin:
         """
         Send a prefilled chunk to the decode server. A last chunk sent before its
         result passes the first token, or send_aux=False to leave the aux to the
-        last PP stage (SGLANG_PP_PD_PREFILL_EARLY_SEND).
+        last PP stage (SGLANG_ENABLE_PP_PD_PREFILL_EARLY_SEND).
         """
         page_size = self.token_to_kv_pool_allocator.page_size
         start_idx = req.start_send_idx
@@ -1984,18 +2010,8 @@ class SchedulerDisaggregationPrefillMixin:
             return
 
         sender = req.disagg_kv_sender
-        # The schedule stream may wait on the in-flight forward. A sender that takes
-        # host-tensor indices waits on their copy's event itself. CP and shard
-        # filtering read the indices on the scheduler before that wait, so those
-        # paths need a completed host copy even with CP-TP group sharing.
-        host_indices = (
-            getattr(sender, "supports_host_tensor_indices", False)
-            and sender.kv_mgr.kv_shard_size <= 1
-            and not (
-                sender.kv_mgr.enable_all_cp_ranks_for_transfer
-                and not get_parallel().enable_dsa_cache_layer_split
-            )
-        )
+        # The schedule stream may wait on the in-flight forward.
+        host_indices = _sender_takes_host_indices(sender)
 
         def page_indices_of(kv_indices: torch.Tensor):
             """The pages a send takes, and the same pages for the page-move

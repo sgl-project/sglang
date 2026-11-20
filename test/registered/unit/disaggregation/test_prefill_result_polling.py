@@ -15,9 +15,14 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.disaggregation.base import KVPoll
+from sglang.srt.disaggregation.base.conn import StateType
+from sglang.srt.disaggregation.common.conn import CommonKVSender
 from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
-from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
+from sglang.srt.disaggregation.prefill import (
+    _PP_PD_EARLY_SEND_STATE_TYPES,
+    SchedulerDisaggregationPrefillMixin,
+)
 from sglang.srt.disaggregation.utils import ReqToMetadataIdxAllocator
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
@@ -1495,6 +1500,8 @@ def _early_req(
     kv_mgr = SimpleNamespace(
         request_status={room: status},
         decode_pulls_last_pp_stage=lambda bootstrap_room, layers: pulls_every_stage,
+        kv_shard_size=1,
+        enable_all_cp_ranks_for_transfer=False,
     )
     fields = dict(
         rid=rid,
@@ -1629,19 +1636,105 @@ class TestPPPrefillEarlySend(CustomTestCase):
         self.assertFalse(pulls(list(range(8)), room=8))
 
         # Positional pairing (no layer ids): decode PP is 1 or matches prefill's,
-        # so only a peer with every layer's K and V pointers pulls the last stage.
-        def positional(num_dst_layers):
+        # so only a peer with exactly every layer's K and V pointers pulls the last
+        # stage; any other count keeps the aux here (fails closed).
+        def positional(num_dst_ptrs):
             peer = manager([])
-            peer.decode_kv_args_table["s0"].dst_kv_ptrs = [0] * 2 * num_dst_layers
+            peer.decode_kv_args_table["s0"].dst_kv_ptrs = [0] * num_dst_ptrs
             return MooncakeKVManager.decode_pulls_last_pp_stage(peer, 7, range(6, 8))
 
-        self.assertTrue(positional(8))
-        self.assertFalse(positional(2))
+        self.assertTrue(positional(2 * 8))
+        self.assertFalse(positional(2 * 2))  # a PP-matched rank's layers
+        self.assertFalse(positional(3 * 8))  # an extra pointer per layer
+        self.assertFalse(positional(2 * 8 + 2))  # draft entries appended
 
-    def test_early_send_is_off_by_default(self):
+    def test_gate_needs_the_flag_and_a_verified_layout(self):
+        self.enterContext(
+            published_topology(
+                pp_size=2,
+                disaggregation_transfer_backend="mooncake",
+                disaggregation_decode_allocation_policy="early",
+            )
+        )
+
+        def enabled(is_mla=False, state_types=()):
+            stage = _PPEarlySendScheduler(is_last_rank=False)
+            stage.disagg_prefill_bootstrap_queue = SimpleNamespace(
+                kv_manager=SimpleNamespace(
+                    is_mla_backend=is_mla,
+                    kv_args=SimpleNamespace(state_types=list(state_types)),
+                )
+            )
+            stage.kv_checksum_computer = None
+            stage.enable_staging = False
+            stage.enable_unified_cache_external_linker = False
+            stage.spec_algorithm = SimpleNamespace(is_eagle=lambda: False)
+            return stage._pp_pd_early_send_enabled()
+
+        self.assertFalse(enabled())  # off by default
+        with envs.SGLANG_ENABLE_PP_PD_PREFILL_EARLY_SEND.override(True):
+            self.assertTrue(enabled())
+            # Layouts no token-exact check covered keep the result path.
+            self.assertFalse(enabled(is_mla=True))
+            for state_type in (StateType.SWA, StateType.DSA, StateType.MAMBA):
+                with self.subTest(state_type=state_type):
+                    self.assertEqual(
+                        enabled(state_types=[state_type]),
+                        state_type in _PP_PD_EARLY_SEND_STATE_TYPES,
+                    )
+
+    def test_flush_before_a_result_waits_only_for_that_results_forward(self):
+        # The result of forward 5 is next: its sends must go out first, while the
+        # later forward 6 stays queued on the GPU instead of being waited for.
+        self.enterContext(published_topology(pp_size=4))
+        last = _PPEarlySendScheduler(is_last_rank=True)
+        for rid, forward_iter, token in (("older", 5, 3), ("newer", 6, 4)):
+            last._pp_pd_early_send_last_chunks(
+                _launched([_early_req(rid, forward_iter)], forward_iter),
+                _sampled(token),
+                _ForwardEvent(),
+            )
+        (_, older, _, _), (_, newer, _, _) = last.disagg_prefill_early_send_pending
+        last._pp_pd_flush_early_sends(block_upto_forward_iter=5)
+        self.assertTrue(older.ready)
+        self.assertFalse(newer.ready)
+        self.assertEqual([s[0] for s in last.sent], ["older"])
+        self.assertEqual(len(last.disagg_prefill_early_send_pending), 1)
+
+    def test_sender_without_host_indices_keeps_the_result_path(self):
+        # CP all-rank transfer or KV sharding reads the indices on the scheduler,
+        # which an early send right after launch would block on.
+        self.enterContext(published_topology(pp_size=2))
         stage = _PPEarlySendScheduler(is_last_rank=False)
-        with published_topology(pp_size=2):
-            self.assertFalse(stage._pp_pd_early_send_enabled())
+        for field, value in (
+            ("enable_all_cp_ranks_for_transfer", True),
+            ("kv_shard_size", 2),
+        ):
+            with self.subTest(field=field):
+                req = _early_req("r", 1)
+                setattr(req.disagg_kv_sender.kv_mgr, field, value)
+                batch = _launched([req], 1)
+                self.assertFalse(stage._pp_pd_early_send_eligible(batch, req))
+
+    def test_sender_leaves_the_aux_index_out_only_when_told(self):
+        for send_aux, aux_index in ((True, 9), (False, None)):
+            with self.subTest(send_aux=send_aux):
+                sender = object.__new__(CommonKVSender)
+                sender.conclude_state = None
+                sender.bootstrap_room = 7
+                sender.aux_index = 9
+                sender._transfer_start_time = None
+                sender._early_send_wait_event = None
+                sender.trace_ctx = Mock()
+                sender._record_transfer_indices = Mock()
+                sender._prepare_send_indices = Mock(
+                    return_value=([1], slice(0, 1), True, False)
+                )
+                sender.kv_mgr = Mock()
+                sender.kv_mgr.prepare_send_state_indices.side_effect = lambda s: s
+                CommonKVSender.send(sender, [1], send_aux=send_aux)
+                kwargs = sender.kv_mgr.add_transfer_request.call_args.kwargs
+                self.assertEqual(kwargs["aux_index"], aux_index)
 
 
 if __name__ == "__main__":

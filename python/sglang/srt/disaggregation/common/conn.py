@@ -2548,7 +2548,9 @@ class CommonKVSender(BaseKVSender):
             kv_indices,
             index_slice,
             is_last_chunk,
-            # send_aux=False: another PP stage writes this room's aux (Mooncake).
+            # send_aux=False: another PP stage writes this room's aux. Only the
+            # Mooncake manager accepts a last chunk without one; the early-send
+            # gate requires that backend.
             aux_index=self.aux_index if is_last_chunk and send_aux else None,
             state_indices=state_indices if is_last_chunk else None,
             num_kv_tokens=num_kv_tokens,

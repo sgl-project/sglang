@@ -245,7 +245,7 @@ class TestMooncakeAbortNotification(
 
 class TestMooncakeLastChunkWithoutAux(CustomTestCase):
     """A PP prefill stage that sends its last chunk before its first token
-    (SGLANG_PP_PD_PREFILL_EARLY_SEND) leaves the aux write to the last stage."""
+    (SGLANG_ENABLE_PP_PD_PREFILL_EARLY_SEND) leaves the aux write to the last stage."""
 
     def test_last_chunk_without_aux_sends_state_and_concludes(self):
         manager = _manager()
@@ -256,7 +256,7 @@ class TestMooncakeLastChunkWithoutAux(CustomTestCase):
         manager.note_send_enqueued = MagicMock()
         (info,) = manager.transfer_infos[ROOM].values()
         manager.transfer_infos[ROOM] = {f"{DECODE_IP}:{DECODE_PORT}": info}
-        with envs.SGLANG_PP_PD_PREFILL_EARLY_SEND.override(True):
+        with envs.SGLANG_ENABLE_PP_PD_PREFILL_EARLY_SEND.override(True):
             manager.add_transfer_request(
                 ROOM,
                 np.array([1], dtype=np.int32),
@@ -275,6 +275,39 @@ class TestMooncakeLastChunkWithoutAux(CustomTestCase):
         manager.maybe_send_extra.assert_called_once()
         manager.send_aux.assert_not_called()
         self.assertEqual(manager.request_status[ROOM], KVPoll.Success)
+
+    def test_only_the_request_peer_writes_the_aux(self):
+        # Under KV sharding a non-peer rank sends KV pages only, even when its last
+        # chunk carries an aux index; the peer writes it.
+        for is_peer in (True, False):
+            with self.subTest(is_peer=is_peer):
+                manager = _manager()
+                TestMooncakeAbortNotification._prepare_worker(self, manager)
+                manager.disaggregation_mode = DisaggregationMode.PREFILL
+                manager.transfer_queues = [MagicMock()]
+                manager.send_record = MagicMock()
+                manager.note_send_enqueued = MagicMock()
+                (info,) = manager.transfer_infos[ROOM].values()
+                manager.transfer_infos[ROOM] = {f"{DECODE_IP}:{DECODE_PORT}": info}
+                manager.add_transfer_request(
+                    ROOM,
+                    np.array([1], dtype=np.int32),
+                    slice(0, 1),
+                    True,
+                    aux_index=3,
+                    state_indices=[[1]],
+                )
+                chunk = manager.transfer_queues[0].put.call_args.args[0]
+                self.assertEqual(chunk.prefill_aux_index, 3)
+
+                manager.transfer_infos[ROOM] = {(DECODE_IP, DECODE_PORT): info}
+                manager.kv_shard_state_peer_only = True
+                manager._is_request_peer = MagicMock(return_value=is_peer)
+                queue = MagicMock()
+                queue.get.side_effect = [chunk, None]
+                manager.transfer_worker(queue, MagicMock())
+                self.assertEqual(manager.send_aux.called, is_peer)
+                self.assertEqual(manager.request_status[ROOM], KVPoll.Success)
 
 
 if __name__ == "__main__":
