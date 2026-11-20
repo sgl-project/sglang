@@ -63,6 +63,14 @@ class TestPPUCISuite(CustomTestCase):
                 "core/test_basic_sanity.py",
                 "radix_cache/test_radix_attention.py",
                 "ppu/test_sail_attention_backends.py",
+                "e2e/moe/test_sail_deepgemm_fused_moe.py",
+                "kernels/ops/activation/test_silu_and_mul_masked_post_per_token_quant_fp8.py",
+                "kernels/ops/activation/test_silu_and_mul_masked_post_quant_mxfp4.py",
+                "kernels/ops/activation/test_silu_and_mul_post_per_token_quant_fp8.py",
+                "kernels/ops/activation/test_silu_and_mul_post_quant_mxfp4.py",
+                "kernels/ops/activation/test_situ_and_mul.py",
+                "kernels/ops/moe/test_mask_topk_ids_to_int64.py",
+                "kernels/ops/quantization/test_sail_mxfp4.py",
             ],
         )
 
@@ -89,9 +97,12 @@ class TestPPUCISuite(CustomTestCase):
             for summary, exit_code, expected in (
                 ("Test Summary: 5/5 passed", 0, 0),
                 ("Test Summary: 0/0 passed", 0, 1),
-                ("Test Summary: 1/1 passed", 0, 1),
+                # The suite size may vary, but it must be nonempty and fully pass.
+                ("Test Summary: 1/1 passed", 0, 0),
                 ("Test Summary: 1/2 passed", 0, 1),
-                ("Test Summary: 6/6 passed", 0, 1),
+                ("Test Summary: 6/6 passed", 0, 0),
+                ("Test Summary: 13/13 passed", 0, 0),
+                ("Test Summary: 13/14 passed", 0, 1),
                 ("Test Summary: 5/5 passed", 7, 7),
                 ("Test Summary: 5/5 passed (incomplete)", 0, 1),
                 ("", 0, 1),

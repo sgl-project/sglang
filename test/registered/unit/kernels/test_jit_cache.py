@@ -17,6 +17,7 @@ import pytest
 
 from sglang.kernels.jit.utils.compile import cache, ninja, toolchain
 from sglang.kernels.jit.utils.compile.paths import KERNEL_PATH
+from sglang.kernels.jit.utils.compile.sail_flags import filter_hgcc_flags
 from sglang.kernels.jit.utils.compile.spec import BuildSpec
 from sglang.srt.utils import is_xpu
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -570,6 +571,61 @@ def test_relative_sources_resolve_against_csrc():
         str(KERNEL_PATH / "csrc" / "elementwise" / "activation.cuh"),
     )
     assert resolve_sources(["/usr/include/stdio.h"]) == ("/usr/include/stdio.h",)
+
+
+@pytest.mark.parametrize(
+    "option,operand",
+    [
+        ("-gencode", "arch=compute_89,code=sm_89"),
+        ("--generate-code", "arch=compute_89,code=sm_89"),
+        ("-Xptxas", "--split-compile=0"),
+        ("--ptxas-options", "-v,--register-usage-level=10"),
+    ],
+)
+@pytest.mark.parametrize("joined", [False, True])
+def test_hgcc_removes_nvcc_options_without_leaving_operands(option, operand, joined):
+    """Orphaned arch=... operands and joined ptxas flags break HGCC builds."""
+    flags = ["--ftz=false", "-DSGL_TOPK_MODE=1"]
+    flags += [f"{option}={operand}"] if joined else [option, operand]
+    flags += ["--fmad=false", "-O3", "-Xcompiler", "-fPIC"]
+    original = flags.copy()
+    assert filter_hgcc_flags(flags) == [
+        "--ftz=false",
+        "-DSGL_TOPK_MODE=1",
+        "--fmad=false",
+        "-O3",
+        "-Xcompiler",
+        "-fPIC",
+    ]
+    assert flags == original
+
+
+def test_hgcc_unsupported_warning_option_preserves_math_flags():
+    """TileLang's v2 diagnostic switch is rejected by the HGCC 2.2 driver."""
+    assert filter_hgcc_flags(
+        ["--ftz=false", "-Wno-deprecated-declarations", "--fmad=false"]
+    ) == ["--ftz=false", "--fmad=false"]
+
+
+def test_hgcc_mixed_nvcc_flags_preserve_math_option_order():
+    """Dropping CUDA-only tuning must not weaken explicit FTZ/FMA settings."""
+    flags = [
+        "--use_fast_math",
+        "-gencode",
+        "arch=compute_89,code=sm_89",
+        "--ftz=false",
+        "-Xptxas=-v",
+        "--ptxas-options",
+        "--register-usage-level=10",
+        "--fmad=false",
+        "--expt-relaxed-constexpr",
+    ]
+    assert filter_hgcc_flags(flags) == [
+        "--use_fast_math",
+        "--ftz=false",
+        "--fmad=false",
+        "--expt-relaxed-constexpr",
+    ]
 
 
 if __name__ == "__main__":

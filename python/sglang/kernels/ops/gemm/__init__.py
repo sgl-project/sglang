@@ -40,7 +40,6 @@ for _name, _backend in (
     )
 del _name, _backend
 
-
 for _name in ("npu_w8a8_block_fp8_linear", "npu_w8a8_block_fp8_grouped_matmul"):
     register_kernel(
         KernelSpec(

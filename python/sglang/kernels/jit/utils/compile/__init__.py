@@ -8,6 +8,7 @@ Modules, in dependency order (there are no cycles)::
 
     paths      where the in-tree sources live, and the default flags
     cpp_args   rendering Python values as C++ template arguments
+    flags      HGCC option compatibility shared with other JIT backends
     spec       BuildSpec: one fully-resolved build
     toolchain  compilers, tvm-ffi locations, platform base flags
     ninja      generating and running build.ninja, reading its depfiles

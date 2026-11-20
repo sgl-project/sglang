@@ -27,7 +27,7 @@ from sglang.srt.layers.quantization.utils import (
     swap_w13_to_w31,
 )
 from sglang.srt.layers.utils.common import set_weight_attrs
-from sglang.srt.utils import get_bool_env_var, is_hip
+from sglang.srt.utils import get_bool_env_var, is_hip, is_sail
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
@@ -39,6 +39,7 @@ if TYPE_CHECKING:
 __all__ = ["CompressedTensorsW8A8Fp8MoE"]
 
 _is_hip = is_hip()
+_is_sail = is_sail()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _use_aiter:
@@ -354,13 +355,33 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
     ):
         self.moe_runner_config = moe_runner_config
         moe_runner_backend = get_moe_runner_backend()
-        if moe_runner_backend.is_auto():
+        # The SAIL engines' selection rules (DeepEP-family, opt-in) live with
+        # them in the SAIL package; this chain only places the result.
+        use_sail_deepgemm_for_a2a = False
+        use_sail_deepgemm_for_auto = False
+        if _is_sail:
+            from sglang.srt.hardware_backend.sail.moe.deepgemm_moe import (
+                deepgemm_moe_selected_for_a2a,
+                deepgemm_moe_selected_for_auto,
+            )
+
+            use_sail_deepgemm_for_a2a = deepgemm_moe_selected_for_a2a()
+            use_sail_deepgemm_for_auto = deepgemm_moe_selected_for_auto()
+
+        if use_sail_deepgemm_for_a2a:
+            moe_runner_backend = MoeRunnerBackend.DEEP_GEMM
+        elif moe_runner_backend.is_auto():
             if (
                 _use_aiter
                 and self.weight_quant.strategy == QuantizationStrategy.CHANNEL
                 and get_moe_a2a_backend().supports_aiter()
             ):
                 moe_runner_backend = MoeRunnerBackend.AITER
+            elif (
+                use_sail_deepgemm_for_auto
+                and self.weight_quant.strategy == QuantizationStrategy.CHANNEL
+            ):
+                moe_runner_backend = MoeRunnerBackend.DEEP_GEMM
             else:
                 moe_runner_backend = MoeRunnerBackend.TRITON
 
@@ -369,6 +390,9 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             or moe_runner_backend.is_triton()
             or moe_runner_backend.is_flashinfer_trtllm()
             or moe_runner_backend.is_flashinfer_trtllm_routed()
+            # Only SAIL ships a DeepGEMM path for this scheme; elsewhere deep_gemm
+            # keeps falling through to the unhandled branch below.
+            or (_is_sail and moe_runner_backend.is_deep_gemm())
         ):
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
         else:
@@ -382,7 +406,6 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
     ) -> CombineInput:
 
         x = dispatch_output.hidden_states
-        topk_output = dispatch_output.topk_output
 
         moe_runner_config = self.moe_runner_config
 
@@ -431,7 +454,24 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 quant_info = self.get_triton_quant_info(layer)
             return self.runner.run(dispatch_output, quant_info)
         else:
-            return self.runner.run(dispatch_output, self.get_triton_quant_info(layer))
+            if self.runner.runner_backend.is_deep_gemm():
+                from sglang.srt.layers.moe.moe_runner.deep_gemm import (
+                    DeepGemmMoeQuantInfo,
+                )
+
+                quant_info = DeepGemmMoeQuantInfo(
+                    w13_weight=layer.w13_weight,
+                    w2_weight=layer.w2_weight,
+                    use_fp8=True,
+                    per_channel_quant=self.weight_quant.strategy
+                    == QuantizationStrategy.CHANNEL,
+                    w13_scale=layer.w13_weight_scale,
+                    w2_scale=layer.w2_weight_scale,
+                    block_shape=None,
+                )
+            else:
+                quant_info = self.get_triton_quant_info(layer)
+            return self.runner.run(dispatch_output, quant_info)
 
     def get_triton_quant_info(self, layer: torch.nn.Module) -> TritonMoeQuantInfo:
         # Shared with FusedMoEWithLoRA so both runners use the same base quantization.

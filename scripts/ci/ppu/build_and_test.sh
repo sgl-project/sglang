@@ -89,6 +89,7 @@ PY
     cd "$work/source/python/sglang/kernels/aot"
     cp pyproject_sail.toml pyproject.toml
     python3 setup_sail.py bdist_wheel --dist-dir "$wheel_dir"
+    python3 "$checker" collect-dev-sail "$wheel_dir"
     cd "$wheel_dir"
     printf '%s\n' "$PPU_CI_SOURCE_SHA" > source-sha.txt
     sha256sum source-sha.txt ./*.whl ./runtime-deps/*.whl > SHA256SUMS
@@ -113,13 +114,15 @@ export UMD_ENABLE_COREDUMP_ON_EXCEPTION=1 UMD_ENABLE_LIGHTWEIGHT_COREDUMP=1
 mkdir -p "$artifacts/eval-results"
 ln -s "$artifacts/eval-results" "$HOME/.sgl_eval"
 python3 "$checker" snapshot "$artifacts/dependencies-before.json"
+additions="$artifacts/dependency-additions.json"
+printf '{}\n' > "$additions"
 finalize() {
     code=$?
     trap - EXIT
     set +e
     if ! python3 "$checker" snapshot "$artifacts/dependencies-after.json"; then
         code=1
-    elif ! python3 "$checker" check "$artifacts/dependencies-before.json" "$artifacts/dependencies-after.json"; then
+    elif ! python3 "$checker" check "$artifacts/dependencies-before.json" "$artifacts/dependencies-after.json" --protected-only --additions "$additions"; then
         code=1
     fi
     if ! verify_wheels; then
@@ -136,13 +139,15 @@ python3 "$repo/scripts/ci/ppu/check_ppu_environment.py"
 python3 -c 'import torch; print("Runtime Torch:", torch.__version__, "SAIL build marker:", getattr(torch.version, "sail", None)); assert torch.cuda.device_count() == 1'
 python3 -m pip uninstall -y sgl-kernel
 python3 -m pip install --no-deps --no-index --force-reinstall "$wheel_dir/"*.whl
-missing_wheels=$(python3 "$checker" missing-wheels "$wheel_dir/runtime-deps")
+# Plan required dev_sail dependency changes while preserving PPU platform packages.
+missing_wheels=$(python3 "$checker" missing-dev-sail "$wheel_dir" "$additions" --upgrade-all)
 if [[ -n "$missing_wheels" ]]; then
     mapfile -t runtime_wheels <<< "$missing_wheels"
-    python3 -m pip install --no-deps --no-index "${runtime_wheels[@]}"
+    # Install only planned offline wheels; do not let pip replace platform packages.
+    python3 -m pip install --upgrade --no-deps --no-index "${runtime_wheels[@]}"
 fi
 python3 "$checker" snapshot "$artifacts/dependencies-installed.json"
-python3 "$checker" check "$artifacts/dependencies-before.json" "$artifacts/dependencies-installed.json"
+python3 "$checker" check "$artifacts/dependencies-before.json" "$artifacts/dependencies-installed.json" --protected-only --additions "$additions"
 python3 - <<'PY'
 from sailify.sailify_python import sailify_extra_files_recursive
 import sgl_kernel
@@ -160,5 +165,5 @@ python3 "$repo/scripts/ci/ppu/prepare_runtime.py"
 cd "$artifacts"
 python3 "$repo/test/run_suite.py" --hw ppu --suite extra-test-1-gpu-ppu --timeout-per-file 1200 \
     2>&1 | tee "$artifacts/sanity.log"
-# Require every registered PPU model sanity file to pass.
-grep -Fxq 'Test Summary: 5/5 passed' "$artifacts/sanity.log"
+# Require a non-empty suite and every registered PPU file to pass.
+grep -Exq 'Test Summary: ([1-9][0-9]*)/\1 passed' "$artifacts/sanity.log"

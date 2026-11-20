@@ -7,8 +7,10 @@ import tilelang.language as T
 import torch
 
 from sglang.kernels.arch import current_arch
+from sglang.kernels.jit.utils.compile.sail_flags import filter_hgcc_flags
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.utils import is_gfx95_supported, is_hip
+from sglang.srt.utils.device import is_sail
 
 tilelang.set_log_level("WARNING")
 
@@ -267,9 +269,8 @@ def sparse_attention_fwd_kernel_v1(
     return main
 
 
-@tilelang.jit(
-    out_idx=[-1],
-    compile_flags=[
+def _sparse_attention_v2_compile_flags() -> list[str]:
+    flags = [
         "-O3",
         "-Wno-deprecated-declarations",
         "-U__CUDA_NO_HALF_OPERATORS__",
@@ -280,7 +281,15 @@ def sparse_attention_fwd_kernel_v1(
         "--expt-extended-lambda",
         "--ptxas-options=-v,--register-usage-level=10",
         "-DNDEBUG",
-    ],
+    ]
+    # TileLang compiles through its own backend, bypassing load_jit's filter.
+    # Preserve CUDA's ptxas tuning while using the same HGCC rules on SAIL.
+    return filter_hgcc_flags(flags) if is_sail() else flags
+
+
+@tilelang.jit(
+    out_idx=[-1],
+    compile_flags=_sparse_attention_v2_compile_flags(),
 )  # type: ignore
 def sparse_attention_fwd_kernel_v2(
     num_heads: int,
