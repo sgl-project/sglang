@@ -762,8 +762,8 @@ struct RouteRadix4SortKernel {
     CHECK_HOST(S_.unwrap() % kRadix4SortBlockM == 0 && S_.unwrap() / kRadix4SortBlockM <= sorted_expert_ids.size(0))
         << "sorted rows must hold whole BM=16 blocks, one expert id each";
 
+    CHECK_HOST(M_.unwrap() > 0) << "route_radix4_with_sort needs at least one token";
     const auto M = static_cast<uint32_t>(M_.unwrap());
-    if (M == 0) return;
     // The kernel writes these without bounds checks; sizes mirror _sorted_capacity.
     const int64_t routes = static_cast<int64_t>(M) * kRadix4TopK;
     const int64_t active = routes < kRadix4NumExperts ? routes : kRadix4NumExperts;
