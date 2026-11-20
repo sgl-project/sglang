@@ -502,6 +502,12 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
         _CUDA,
     ),
     (
+        "diffusion.pixel_norm_silu",
+        KernelBackend.KDA,
+        "sglang.kernels.kda_kernels.pixel_norm_silu:pixel_norm_silu",
+        _CUDA,
+    ),
+    (
         "diffusion.channel_rmsnorm_finish_silu",
         KernelBackend.JIT,
         "norm.channel_rmsnorm_finish_silu_jit:channel_rmsnorm_finish_silu",
@@ -646,6 +652,12 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
         _CUDA,
     ),
     (
+        "diffusion.replicate_reflect_pad3d",
+        KernelBackend.KDA,
+        "sglang.kernels.kda_kernels.replicate_reflect_pad3d:replicate_reflect_pad3d",
+        _CUDA,
+    ),
+    (
         "diffusion.nearest_upsample_nhwc",
         KernelBackend.TRITON,
         "layout.nearest_upsample_nhwc_triton:nearest_upsample_nhwc",
@@ -725,6 +737,7 @@ _EXPORTS: dict[str, str] = {
     "can_use_flux2_strided_qknorm_rope": "rope.flux2_qknorm_rope_triton",
     "flux2_strided_qknorm_rope": "rope.flux2_qknorm_rope_triton",
     "can_use_channel_rmsnorm_finish_silu": "norm.channel_rmsnorm_finish_silu_jit",
+    "pixel_norm_silu": "sglang.kernels.kda_kernels.pixel_norm_silu",
     "channel_rmsnorm_finish_silu": "norm.channel_rmsnorm_finish_silu_jit",
     "can_use_channel_rmsnorm_silu_nhwc": "norm.channel_rmsnorm_silu_nhwc_jit",
     "channel_rmsnorm_silu_nhwc": "norm.channel_rmsnorm_silu_nhwc_jit",
@@ -893,6 +906,7 @@ _EXPORTS: dict[str, str] = {
     "dup_up3d_add": "layout.wan_causal_cache_triton",
     "conv_bias_epilogue": "modulate.conv_bias_epilogue_triton",
     "can_use_conv_bias_epilogue": "modulate.conv_bias_epilogue_triton",
+    "replicate_reflect_pad3d": "sglang.kernels.kda_kernels.replicate_reflect_pad3d",
     "nearest_upsample_nhwc": "layout.nearest_upsample_nhwc_triton",
     "can_use_nearest_upsample_nhwc": "layout.nearest_upsample_nhwc_triton",
     "try_flux2_token_cat_nvfp4": "layout.flux2_token_cat_nvfp4_jit",
