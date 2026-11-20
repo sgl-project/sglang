@@ -44,6 +44,42 @@ class _ModelRegistry:
                     )
                 self.models[arch] = cls
 
+    def register_class(
+        self, arch: str, cls: Type[nn.Module], overwrite: bool = False
+    ) -> None:
+        """Register a model class under an explicit architecture name.
+
+        The name need not match ``cls.__name__``. The class is stored without
+        being instantiated and does not need a model package or ``EntryClass``.
+        Duplicate registered names raise ``ValueError`` unless ``overwrite=True``.
+
+        Checking for duplicates may load deferred built-in models. Explicit
+        overwrites keep those imports deferred and take precedence when the
+        built-in models are later loaded, just like external package models.
+
+        As with package registration, built-in discovery uses ``strict=False``
+        and skips modules that fail to import. Duplicate checks therefore only
+        cover discovered or explicitly registered names, not every built-in
+        architecture across environments.
+
+        Example::
+
+            import torch.nn as nn
+            from sglang.srt.models.registry import ModelRegistry
+
+            RuntimeModel = type("RuntimeModel", (nn.Module,), {})
+            ModelRegistry.register_class("CustomArchitecture", RuntimeModel)
+        """
+        if not isinstance(arch, str):
+            raise TypeError("Model architecture must be a string.")
+        if not isinstance(cls, type) or not issubclass(cls, nn.Module):
+            raise TypeError("Model class must be a subclass of torch.nn.Module.")
+        if not overwrite and self.is_arch_supported(arch):
+            raise ValueError(
+                f"Model architecture {arch} already registered. Set overwrite=True to replace."
+            )
+        self.models[arch] = cls
+
     def get_supported_archs(self) -> AbstractSet[str]:
         self._load_default_models()
         return self.models.keys()
