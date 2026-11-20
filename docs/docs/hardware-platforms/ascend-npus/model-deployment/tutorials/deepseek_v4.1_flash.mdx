@@ -84,15 +84,9 @@ fi
 sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
 unset https_proxy http_proxy HTTPS_PROXY HTTP_PROXY ASCEND_LAUNCH_BLOCKING || true
-export ASCEND_LAUNCH_BLOCKING=1
-export HCCL_CONNECT_TIMEOUT=300
-export HCCL_EXEC_TIMEOUT=68
 export HCCL_OP_EXPANSION_MODE=AIV
-export ACL_DEVICE_SYNC_TIMEOUT=60
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export STREAMS_PER_DEVICE=32
-export TRANSFORMERS_VERBOSITY=error
-export HCCL_HOST_SOCKET_PORT_RANGE=auto
 export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-data0.3001}"
 export SGLANG_SET_CPU_AFFINITY=1
 export TASK_QUEUE_ENABLE=1
@@ -101,8 +95,6 @@ export SGLANG_DEFAULT_THINKING=1
 export SGLANG_DSV4_REASONING_EFFORT=max
 export HCCL_BUFFSIZE=400
 export DEEPEP_HCCL_BUFFSIZE=1800
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/custom_transformer/bin/set_env.bash
 source /usr/local/Ascend/ascend-toolkit/latest/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
 
@@ -116,7 +108,6 @@ export DEEPEP_NORMAL_LONG_SEQ_ROUND=16
 export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=2048
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=150
 export SGLANG_OPT_USE_OVERLAP_STORE_CACHE=False
-export FORCE_DRAFT_MODEL_NON_QUANT=1
 export SGLANG_DSV4_FP4_EXPERTS=True
 export SGLANG_OPT_FUSE_WQA_WKV=0
 export SGLANG_OPT_BF16_FP32_GEMM_ALGO=torch
@@ -125,26 +116,9 @@ export SGLANG_OPT_USE_TILELANG_MHC_PRE=False
 export SGLANG_OPT_DEEPGEMM_HC_PRENORM=False
 export SGLANG_OPT_USE_TILELANG_MHC_POST=False
 export SGLANG_OPT_FP8_WO_A_GEMM=False
-export SGLANG_DSV4_NATIVE_ATTN=0
-export SGLANG_DSV4_DBG_ATTN=1
-export SGLANG_SHALLOW_FUSED_ROPE_FQ4=0
-export SGLANG_COMPRESSOR_PREFILL_USE_TRITON=1
-export SGLANG_COMPRESSOR_DECODE_USE_TRITON=1
-export SGLANG_OPT_USE_HC_TRITON=0
-export SGLANG_OPT_USE_HC_TILELANG=0
-export SGLANG_DSV4_GRAPH_MAX_SEQ=131072
-
-export PYTHONPATH="/path/to/sglang/python:${PYTHONPATH:-}"
-
-ENABLE_DSPARK="${ENABLE_DSPARK:-0}"
-if [[ "$ENABLE_DSPARK" == "1" ]]; then
-  export SGLANG_ENABLE_SPEC_V2=1
-  export SGLANG_RAGGED_VERIFY_MODE=static
-  export SGLANG_DSPARK_FAST_KERNEL=0
-fi
 
 export MODEL_PATH="/path/to/dsv4.1-1017"
-SERVED_MODEL_NAME="dsv4"
+SERVED_MODEL_NAME="dsv41"
 NUM_NPUS_PER_NODE=8
 PORT=30000
 DIST_PORT=5567
@@ -163,7 +137,12 @@ MASTER_ADDR="${NODE_IPS[0]}"
 DIST_INIT_ADDR="${MASTER_ADDR}:${DIST_PORT}"
 export HCCL_SOCKET_IFNAME="$HCCL_IF"
 DSPARK_ARGS=()
+ENABLE_DSPARK="${ENABLE_DSPARK:-0}"
 if [[ "$ENABLE_DSPARK" == "1" ]]; then
+  export SGLANG_ENABLE_SPEC_V2=1
+  export SGLANG_RAGGED_VERIFY_MODE=static
+  export SGLANG_DSPARK_FAST_KERNEL=0
+
   DSPARK_ARGS+=(
     --speculative-algorithm DSPARK
     --speculative-draft-attention-backend ascend
