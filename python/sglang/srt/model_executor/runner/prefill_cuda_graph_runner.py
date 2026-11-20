@@ -489,6 +489,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # (e.g. a residual-stream merge) writes a wider tensor than
         # `config.hidden_size`, so let it declare that width.
         input_embeds_hidden_size = self._input_embeds_hidden_size()
+        input_embeds_dtype = self._input_embeds_dtype()
         self.buffers: PrefillInputBuffers = PrefillInputBuffers.create(
             device=self.device,
             max_bs=self.max_bs,
@@ -511,6 +512,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             pp_proxy_dspark_hidden_size=(
                 self.model_runner.get_pp_proxy_dspark_hidden_size()
             ),
+            input_embeds_dtype=input_embeds_dtype,
         )
         self.buffers.share_buffers()
         # Token-axis FB-shared slot registry adopting PrefillInputBuffers
@@ -522,7 +524,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             cache_loc_dtype=self._cache_loc_dtype(),
             is_multimodal=self.is_multimodal,
             hidden_size=input_embeds_hidden_size,
-            embed_dtype=self.model_runner.dtype,
+            embed_dtype=input_embeds_dtype,
             enable_mamba_track=self.mamba_track_enabled,
             # FullCG always pads to a capture bucket. Models that mask padded
             # hidden rows need the live boundary even without expert parallelism.
@@ -804,6 +806,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self.model_runner.model,
             "input_embeds_hidden_size",
             self.model_runner.model_config.hidden_size,
+        )
+
+    def _input_embeds_dtype(self) -> torch.dtype:
+        """Use the model's declared embedding dtype, defaulting to its weight dtype."""
+        return getattr(
+            self.model_runner.model, "input_embeds_dtype", self.model_runner.dtype
         )
 
     def _next_token_logits_buffer(self, rows: int) -> Optional[torch.Tensor]:
