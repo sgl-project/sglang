@@ -1086,6 +1086,7 @@ class LoRAPipeline(ComposedPipelineBase):
         transformer = self.modules["transformer"]
         if isinstance(transformer, BaseDiT):
             new_adapter = transformer.prepare_lora_adapter(new_adapter)
+        self._check_adapter_matches_lora_layers(new_adapter, lora_path, rank)
         self.lora_adapters[lora_nickname] = new_adapter
 
         self.loaded_adapter_paths[lora_nickname] = lora_path
@@ -1094,6 +1095,47 @@ class LoRAPipeline(ComposedPipelineBase):
         self.loaded_adapter_fingerprints[lora_nickname] = adapter_fingerprint
         self.loaded_adapter_alphas[lora_nickname] = adapter_lora_alpha
         logger.info("Rank %d: loaded LoRA adapter %s", rank, lora_path)
+
+    def _check_adapter_matches_lora_layers(
+        self, adapter: dict[str, torch.Tensor], lora_path: str, rank: int
+    ) -> None:
+        """Reject an adapter that matches no LoRA layer, before it replaces the
+        previous one; it would otherwise load "successfully" with no effect."""
+        layer_names = {
+            name
+            for layers in (
+                getattr(self, "lora_layers", None),
+                getattr(self, "lora_layers_transformer_2", None),
+                getattr(self, "lora_layers_critic", None),
+            )
+            if layers
+            for name in layers
+        }
+        if not layer_names:
+            return
+        suffixes = (".lora_A", ".lora_output_offset")
+        adapter_layers = {
+            key.rsplit(".", 1)[0] for key in adapter if key.endswith(suffixes)
+        }
+        unmatched = sorted(adapter_layers - layer_names)
+        examples = ", ".join(unmatched[:8]) + (", ..." if len(unmatched) > 8 else "")
+        if len(unmatched) == len(adapter_layers):
+            raise ValueError(
+                f"LoRA adapter {lora_path} matches none of the model's "
+                f"{len(layer_names)} LoRA layers, so it would have no effect. "
+                f"Its format or key names are not supported for this model. "
+                f"Adapter layers: {examples or '(none)'}"
+            )
+        if unmatched and rank == 0:
+            # INFO: common Wan files also carry keys of excluded embedder layers
+            logger.info(
+                "LoRA adapter %s: %d of %d adapter layers match no LoRA layer and "
+                "are ignored. Examples: %s",
+                lora_path,
+                len(unmatched),
+                len(adapter_layers),
+                examples,
+            )
 
     def _invalidate_lora_conditioning(self):
         # LoRA targets DiTs; unrelated text and VAE weights remain unchanged
