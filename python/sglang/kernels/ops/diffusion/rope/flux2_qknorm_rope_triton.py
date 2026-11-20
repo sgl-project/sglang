@@ -14,7 +14,7 @@ def can_use_flux2_strided_qknorm_rope(q, k, q_weight, k_weight, cache) -> bool:
         or torch.is_grad_enabled()
         or torch.version.hip is not None
         or not q.is_cuda
-        or not current_arch().is_sm(9, 0)
+        or not current_arch().is_sm_at_least(9, 0)
         or q.ndim != 4
         or q.shape[-2:] != (24, 128)
         or q.numel() == 0
