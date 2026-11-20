@@ -327,10 +327,22 @@ class TestMuseSparkLaunchDefaults(CustomTestCase):
                     ).speculative_draft_attention_backend
                 )
 
-    def test_minimal_local_recipe_resolves_through_the_full_pipeline(self):
-        """Omitted flags must reach later validators for both ModelOpt formats."""
+    @staticmethod
+    def _write_nvfp4_checkpoint(target, standalone_quant_config=False):
         from sglang.srt.configs.muse_spark import MuseSparkConfig
 
+        quant = {"quant_method": "modelopt", "quant_algo": "NVFP4", "group_size": 16}
+        config = MuseSparkConfig(architectures=["MuseSparkForConditionalGeneration"])
+        if not standalone_quant_config:
+            config.quantization_config = quant
+        config.save_pretrained(target)
+        if standalone_quant_config:
+            (target / "hf_quant_config.json").write_text(
+                json.dumps({"quantization": quant})
+            )
+
+    def test_minimal_local_recipe_resolves_through_the_full_pipeline(self):
+        """Omitted flags must reach later validators for both ModelOpt formats."""
         for platform in ("blackwell", "hopper"):
             for standalone_quant_config in (False, True):
                 with (
@@ -339,21 +351,7 @@ class TestMuseSparkLaunchDefaults(CustomTestCase):
                     patch.dict(os.environ),
                 ):
                     target, draft = Path(folder) / "target", Path(folder) / "draft"
-                    quant = {
-                        "quant_method": "modelopt",
-                        "quant_algo": "NVFP4",
-                        "group_size": 16,
-                    }
-                    config = MuseSparkConfig(
-                        architectures=["MuseSparkForConditionalGeneration"]
-                    )
-                    if not standalone_quant_config:
-                        config.quantization_config = quant
-                    config.save_pretrained(target)
-                    if standalone_quant_config:
-                        (target / "hf_quant_config.json").write_text(
-                            json.dumps({"quantization": quant})
-                        )
+                    self._write_nvfp4_checkpoint(target, standalone_quant_config)
                     draft.mkdir()
                     (draft / "config.json").write_text(
                         json.dumps(
@@ -425,6 +423,39 @@ class TestMuseSparkLaunchDefaults(CustomTestCase):
                         self.assertTrue(
                             envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.get()
                         )
+
+    def test_expert_lora_takes_precedence_over_the_nvfp4_runner_default(self):
+        """Expert LoRA must claim auto before Muse Spark selects FlashInfer."""
+        with (
+            tempfile.TemporaryDirectory() as model,
+            patch.dict(os.environ),
+            override_platform(
+                is_cuda=True,
+                is_hip=False,
+                is_sm100=True,
+                is_sm90=False,
+                is_blackwell=True,
+            ),
+            patch(
+                "sglang.srt.arg_groups.memory_hook.get_device_memory_capacity",
+                return_value=183000,
+            ),
+        ):
+            self._write_nvfp4_checkpoint(Path(model))
+            args = ServerArgs(
+                model_path=model,
+                device="cuda",
+                tp_size=4,
+                ep_size=4,
+                enable_lora=True,
+                lora_backend="triton_v2",
+                max_lora_rank=16,
+                lora_target_modules=["gate_up_proj", "down_proj"],
+            )
+            args.resolve_once()
+            self.assertEqual(
+                resolution_result(args, "moe_runner_backend"), "lora_marlin"
+            )
 
     def test_megamoe_cli_distinguishes_auto_from_explicit_disable(self):
         parser = argparse.ArgumentParser()

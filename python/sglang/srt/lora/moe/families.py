@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 import torch
 
 if TYPE_CHECKING:
+    from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
 logger = logging.getLogger(__name__)
@@ -29,6 +30,10 @@ _SAME_LAYOUT_VENDOR = {
     "fp8_tensor": "triton",
     "mxfp8": "cutedsl",
 }
+
+
+def default_vendor(family: str) -> str:
+    return _VENDORS[family][0]
 
 
 def resolve_vendor(family: str, vendor: str) -> str:
@@ -68,6 +73,37 @@ _COMPRESSED_TENSORS_FP8_FAMILIES = {
 _COMPRESSED_TENSORS = "compressed-tensors"
 # Every ModelConfig.quantization a lora_* runner accepts; layers check the layout.
 CONFIG_QUANTIZATIONS = (*_CONFIG_FAMILIES, _COMPRESSED_TENSORS)
+
+
+def _compressed_tensors_family(model_config: ModelConfig) -> str | None:
+    """Return a family only if all config groups agree on a supported FP8 format."""
+    from sglang.srt.model_loader.checkpoint_quantization import (
+        resolve_checkpoint_quant_spec,
+    )
+
+    spec = resolve_checkpoint_quant_spec(model_config.hf_config)
+    if spec is None:
+        return None
+    families = set()
+    for group in (spec.config.get("config_groups") or {}).values():
+        weights = group.get("weights") or {}
+        if weights.get("type") != "float" or weights.get("num_bits") != 8:
+            return None
+        strategy = weights.get("strategy")
+        activations = group.get("input_activations") or {}
+        if strategy != "tensor" and not activations.get("dynamic"):
+            return None
+        families.add(_COMPRESSED_TENSORS_FP8_FAMILIES.get(strategy))
+    return families.pop() if len(families) == 1 else None
+
+
+def family_of_config(model_config: ModelConfig) -> str | None:
+    """Provisional: picks a default runner before any layer exists; layers decide."""
+    if model_config.is_fp4_experts:
+        return "mxfp4"
+    if model_config.quantization == _COMPRESSED_TENSORS:
+        return _compressed_tensors_family(model_config)
+    return _CONFIG_FAMILIES.get(model_config.quantization)
 
 
 def family_of_layer(base_layer: FusedMoE) -> str:

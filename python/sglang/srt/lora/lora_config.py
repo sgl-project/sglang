@@ -15,11 +15,18 @@
 import json
 import logging
 import os
-from typing import Dict, Optional
+from typing import Dict, Iterable, Optional, Union
 
 from huggingface_hub import snapshot_download
 
 logger = logging.getLogger(__name__)
+
+
+def load_adapter_config(path: str) -> dict:
+    if not os.path.isdir(path):
+        path = snapshot_download(path, allow_patterns=["adapter_config.json"])
+    with open(os.path.join(path, "adapter_config.json"), "r") as f:
+        return json.load(f)
 
 
 class LoRAConfig:
@@ -75,14 +82,7 @@ class LoRAConfig:
     def get_lora_config(self, dummy=False):
         if dummy:
             raise NotImplementedError()
-        else:
-            if not os.path.isdir(self.path):
-                weights_dir = snapshot_download(self.path, allow_patterns=["*.json"])
-            else:
-                weights_dir = self.path
-            config_name = "adapter_config.json"
-            with open(os.path.join(weights_dir, config_name), "r") as f:
-                return json.load(f)
+        return load_adapter_config(self.path)
 
     def get_added_tokens_config(self):
         """Load added tokens from the LoRA adapter if the file exists."""
@@ -106,3 +106,67 @@ class LoRAConfig:
         except json.JSONDecodeError as e:
             logger.warning(f"Failed to parse added_tokens.json: {e}")
             return None
+
+
+# Preserve the parent because the leaf alone names an MLP projection.
+PRESERVED_LORA_TARGET_NAMES = frozenset({"self_attn.gate_proj"})
+
+
+def get_normalized_target_modules(
+    target_modules: Union[str, Iterable[str]],
+) -> set[str]:
+    """
+    Mapping a list of target module name to names of the normalized LoRA weights.
+    Handles both base module names (e.g., "gate_proj") and prefixed module names (e.g., "feed_forward.gate_proj").
+
+    The attention gate must be named "self_attn.gate_proj"; bare "gate_proj"
+    maps only to the MLP/MoE gate_up_proj.
+
+    Also handles PEFT shorthand strings like "all-linear" or "all" by returning
+    {"all"} as a sentinel value.  Callers that need a concrete module set
+    should use :func:`auto_detect_lora_target_modules` to resolve the shorthand
+    against the loaded base model.
+    """
+    # Handle PEFT shorthand strings — return {"all"} as sentinel.
+    # Callers can resolve to concrete names via auto_detect_lora_target_modules().
+    if isinstance(target_modules, str):
+        if target_modules not in ["all", "all-linear"]:
+            raise ValueError(
+                "Only 'all' or 'all-linear' can be used as the string for target module"
+            )
+        return {"all"}
+
+    params_mapping = {
+        "q_proj": "qkv_proj",
+        "k_proj": "qkv_proj",
+        "v_proj": "qkv_proj",
+        "gate_proj": "gate_up_proj",
+        "up_proj": "gate_up_proj",
+        "out_proj": "out_proj",
+        "embed_tokens": "embed_tokens",
+        "vocab_emb": "embed_tokens",
+        "embeddings": "embed_tokens",
+        "word_embeddings": "embed_tokens",
+        "lm_head": "lm_head",
+        "output": "lm_head",
+        "unembed_tokens": "lm_head",
+        "q_a_proj": "fused_qkv_a_proj_with_mqa",
+        "kv_a_proj_with_mqa": "fused_qkv_a_proj_with_mqa",
+        # DSA indexer projections are qualified with their parent module name
+        # because the bare leaf names collide with unrelated modules in other
+        # models (e.g. DeepSeek-V4 attention `wq_b`, Pixtral vision `wk`).
+        "wq_b": "indexer.wq_b",
+        "wk": "indexer.wk",
+        "weights_proj": "indexer.weights_proj",
+    }
+
+    result = set()
+    for name in target_modules:
+        qualified_name = ".".join(name.split(".")[-2:])
+        if qualified_name in PRESERVED_LORA_TARGET_NAMES:
+            result.add(qualified_name)
+            continue
+        base_name = name.split(".")[-1]
+        normalized_name = params_mapping.get(base_name, base_name)
+        result.add(normalized_name)
+    return result
