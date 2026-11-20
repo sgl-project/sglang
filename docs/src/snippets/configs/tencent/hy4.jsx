@@ -177,7 +177,7 @@ export const config = {
     },
     {
       match: { hw: "h200", quant: "fp8", strategy: "high-throughput" },
-      verified: false,
+      verified: true,
       nnodes: 1,
       env: [],
       flags: [
