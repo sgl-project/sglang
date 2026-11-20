@@ -54,11 +54,10 @@ from sglang.benchmark.utils import (
     remove_prefix,
     set_ulimit,
 )
+from sglang.srt.constants import ROUTING_KEY_HEADER
 from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST
 from sglang.srt.utils.auth import admin_auth_headers
 from sglang.srt.utils.network import resolve_base_url, resolve_host_port
-
-_ROUTING_KEY_HEADER = "X-SMG-Routing-Key"
 
 _EMBEDDING_UNSUPPORTED_DATASETS = {"image", "mmmu", "mooncake"}
 
@@ -333,7 +332,7 @@ async def async_request_openai_completions(
 
         headers = get_request_headers()
         if request_func_input.routing_key:
-            headers[_ROUTING_KEY_HEADER] = request_func_input.routing_key
+            headers[ROUTING_KEY_HEADER] = request_func_input.routing_key
 
         output = RequestFuncOutput.init_new(request_func_input)
 
@@ -489,7 +488,7 @@ async def async_request_openai_chat_completions(
 
         headers = get_request_headers()
         if request_func_input.routing_key:
-            headers[_ROUTING_KEY_HEADER] = request_func_input.routing_key
+            headers[ROUTING_KEY_HEADER] = request_func_input.routing_key
 
         output = RequestFuncOutput.init_new(request_func_input)
 
@@ -726,7 +725,7 @@ async def async_request_sglang_generate(
 
         headers = get_request_headers()
         if request_func_input.routing_key:
-            headers[_ROUTING_KEY_HEADER] = request_func_input.routing_key
+            headers[ROUTING_KEY_HEADER] = request_func_input.routing_key
 
         output = RequestFuncOutput.init_new(request_func_input)
 
@@ -840,7 +839,7 @@ async def async_request_openai_embeddings(
 
         headers = get_request_headers()
         if request_func_input.routing_key:
-            headers[_ROUTING_KEY_HEADER] = request_func_input.routing_key
+            headers[ROUTING_KEY_HEADER] = request_func_input.routing_key
 
         output = RequestFuncOutput.init_new(request_func_input)
 
@@ -2775,7 +2774,7 @@ def cli_main():
     group.add_argument(
         "--gsp-send-routing-key",
         action="store_true",
-        help="Send routing key in requests via X-SMG-Routing-Key header. Requests with the same prefix share the same routing key.",
+        help="Send routing key in requests via X-SGL-Routing-Key header. Requests with the same prefix share the same routing key.",
     )
     group.add_argument(
         "--gsp-num-turns",

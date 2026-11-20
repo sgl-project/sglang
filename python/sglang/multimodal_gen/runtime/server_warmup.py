@@ -4,6 +4,7 @@
 import asyncio
 import os
 import tempfile
+import wave
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Awaitable, Callable
 
@@ -25,6 +26,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.warmup_request_builder import (
     build_warmup_reqs,
     lighten_warmup_req,
+    should_include_warmup_audio,
     should_include_warmup_image,
     supports_synthetic_warmup,
 )
@@ -34,6 +36,7 @@ logger = init_logger(__name__)
 # a 64x64 image because some pipelines reject smaller inputs (e.g. FLUX.2's
 # diffusers image processor requires both dimensions >= 64px)
 MINIMUM_PICTURE_BASE64_FOR_WARMUP = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAS0lEQVR42u3PMQ0AAAwDoEqv9ErYvQQckD4XAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAYHLAB8+AWnmfUycAAAAAElFTkSuQmCC"
+WARMUP_AUDIO_SAMPLE_RATE = 16000
 
 
 def _is_ci_log_env() -> bool:
@@ -190,6 +193,7 @@ def build_client_warmup_reqs(
     server_args: ServerArgs,
     *,
     warmup_input_path: str | None = None,
+    warmup_audio_path: str | None = None,
     rewarm: bool = False,
     step_limit: int | None = None,
 ) -> list[Req]:
@@ -197,6 +201,7 @@ def build_client_warmup_reqs(
         server_args,
         warmup_resolutions=server_args.warmup_resolutions,
         warmup_input_path=warmup_input_path,
+        warmup_audio_path=warmup_audio_path,
         return_warmup_result=True,
         server_based_warmup=True,
     )
@@ -253,10 +258,14 @@ async def run_async_client_warmup(
         warmup_input_path = None
         if should_include_warmup_image(server_args, server_based_warmup=True):
             warmup_input_path = prepare_warmup_image_path(server_args)
+        warmup_audio_path = None
+        if should_include_warmup_audio(server_args):
+            warmup_audio_path = prepare_warmup_audio_path(server_args)
 
         warmup_reqs = build_client_warmup_reqs(
             server_args,
             warmup_input_path=warmup_input_path,
+            warmup_audio_path=warmup_audio_path,
             rewarm=rewarm,
             step_limit=step_limit,
         )
@@ -309,9 +318,14 @@ def run_sync_client_warmup(
     warmup_input_path = None
     if should_include_warmup_image(server_args, server_based_warmup=True):
         warmup_input_path = prepare_warmup_image_path(server_args)
+    warmup_audio_path = None
+    if should_include_warmup_audio(server_args):
+        warmup_audio_path = prepare_warmup_audio_path(server_args)
 
     warmup_reqs = build_client_warmup_reqs(
-        server_args, warmup_input_path=warmup_input_path
+        server_args,
+        warmup_input_path=warmup_input_path,
+        warmup_audio_path=warmup_audio_path,
     )
     replicas = range(len(server_args.scheduler_endpoints))
     # leaving the pool waits for every replica, so a failed one does not leave
@@ -325,17 +339,33 @@ def run_sync_client_warmup(
         future.result()
 
 
-def prepare_warmup_image_path(server_args: ServerArgs) -> str:
+def _warmup_uploads_dir(server_args: ServerArgs) -> str:
     if server_args.input_save_path is not None:
         uploads_dir = server_args.input_save_path
         os.makedirs(uploads_dir, exist_ok=True)
     else:
         uploads_dir = tempfile.mkdtemp(prefix="sglang_input_")
+    return uploads_dir
 
-    warmup_image_base = os.path.join(uploads_dir, "warmup_image")
+
+def prepare_warmup_image_path(server_args: ServerArgs) -> str:
+    warmup_image_base = os.path.join(_warmup_uploads_dir(server_args), "warmup_image")
     return save_base64_image_to_path(
         MINIMUM_PICTURE_BASE64_FOR_WARMUP, warmup_image_base
     )
+
+
+def prepare_warmup_audio_path(server_args: ServerArgs) -> str:
+    warmup_audio_path = os.path.join(
+        _warmup_uploads_dir(server_args), "warmup_audio.wav"
+    )
+    # One second of 16-bit mono silence; audio shorter than a clip is zero-padded by the encoder.
+    with wave.open(warmup_audio_path, "wb") as f:
+        f.setnchannels(1)
+        f.setsampwidth(2)
+        f.setframerate(WARMUP_AUDIO_SAMPLE_RATE)
+        f.writeframes(bytes(2 * WARMUP_AUDIO_SAMPLE_RATE))
+    return warmup_audio_path
 
 
 class SchedulerWarmupMixin:

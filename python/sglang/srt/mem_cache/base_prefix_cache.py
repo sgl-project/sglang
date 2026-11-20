@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import time
 from abc import ABC, abstractmethod
+from contextlib import nullcontext
 from enum import Enum, auto
 from types import MappingProxyType
 from typing import (
@@ -579,6 +580,11 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         component state the request no longer needs. Nothing here frees a
         slot: ``release_kv_cache`` frees ``[cache_protected_len, up_to)`` and
         everything after, and unpins."""
+
+    def lease_checkpoint_state_slots(self, reqs: Sequence[Req]):
+        """A context in which checkpointing the unfinished ``reqs`` takes the
+        state slots it needs from one take made ahead; nothing here."""
+        return nullcontext()
 
     def free_kv_row(self, kv: Any, ranges: list[tuple[int, int]]) -> None:
         """Give back ascending, disjoint, half-open row-position ranges

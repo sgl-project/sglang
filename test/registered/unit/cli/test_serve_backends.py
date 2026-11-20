@@ -3,13 +3,16 @@
 import contextlib
 import io
 import json
+import shlex
 import sys
 import unittest
 from importlib import resources
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from sglang.cli import interactive
 from sglang.cli.interactive import (
+    EDITOR_HEADER,
     NO_MODE_MESSAGE,
     NO_RECIPE_MESSAGE,
     command_argv,
@@ -485,31 +488,89 @@ def _launch_argv(argv):
     return [sys.executable, "-m", "sglang.cli.main", "serve", *argv]
 
 
+# Recipes with CLI options only available on a model-support branch. A model
+# may have both parseable and branch-only recipes; parsing does not prove it runs.
+BRANCH_ONLY_CLI_MODES = {
+    "stepfun-ai/Step-5-Preview": None,  # every recipe
+    # The Hy4-flash low-latency recipes need the DFly arguments from #51159.
+    "tencent/Hy4-flash": {"low-latency"},
+    "tencent/Hy4-flash-FP8": {"low-latency"},
+}
+
+
+def _requires_branch_cli(model, entry):
+    modes = BRANCH_ONLY_CLI_MODES.get(model, ())
+    return modes is None or entry["mode"] in modes
+
+
+def _main_cli_recipes():
+    """(model, entry) for commands expected to parse on main."""
+    return [
+        (model, entry)
+        for model, entries in _exported().items()
+        for entry in entries
+        if not _requires_branch_cli(model, entry)
+    ]
+
+
 class TestExportedCookbookCommands(CustomTestCase):
-    def test_every_command_parses_as_server_args(self):
+    def test_every_hardware_is_detected(self):
+        """A Cookbook hardware id the Guide cannot detect ships commands it never
+        picks; add its device name to _HARDWARE or skip it in export_commands.mjs."""
+        detected = {hw for _, hardware in interactive._HARDWARE for hw in hardware}
+        exported = {e["hw"] for entries in _exported().values() for e in entries}
+        self.assertLessEqual(exported, detected)
+
+    def test_guide_sees_one_command_per_pick(self):
+        """Two spellings of one GPU (rtx6000, rtx-pro-6000) must not give the Guide
+        two commands for one pick, of which it would silently run the first."""
+        device = {
+            hw: name for name, hardware in interactive._HARDWARE for hw in hardware
+        }
+        for model, entries in _exported().items():
+            picks = [(device[e["hw"]], e["gpus"], e["mode"]) for e in entries]
+            with self.subTest(model):
+                self.assertEqual(len(picks), len(set(picks)))
+
+    def test_branch_only_commands_still_fail_to_parse(self):
+        """Drop an exception once the branch-specific CLI options land in main."""
         exported = _exported()
-        self.assertTrue(exported)
-        for model, entries in exported.items():
+        for model in BRANCH_ONLY_CLI_MODES:
+            entries = [
+                entry for entry in exported[model] if _requires_branch_cli(model, entry)
+            ]
+            self.assertTrue(entries, model)
             for entry in entries:
-                with self.subTest(entry["url"]):
-                    server_args = prepare_server_args(command_argv(entry["command"]))
-                    self.assertEqual(server_args.model_path, model)
-                    gpus = compute_world_size(
-                        dp_size=server_args.dp_size,
-                        tp_size=server_args.tp_size,
-                        pp_size=server_args.pp_size,
-                    )
-                    self.assertEqual(entry["gpus"], gpus)
-                    prefix = entry["command"].split("sglang serve")[0]
-                    env_lines = [
-                        line.rstrip(" \\")
-                        for line in prefix.splitlines()
-                        if line.strip() and not line.startswith("#")
-                    ]
-                    self.assertEqual(
-                        env_lines,
-                        [f"{key}={value}" for key, value in entry["env"].items()],
-                    )
+                with (
+                    self.subTest(entry["url"]),
+                    contextlib.redirect_stderr(io.StringIO()),
+                    self.assertRaises(SystemExit),
+                ):
+                    prepare_server_args(command_argv(entry["command"]))
+
+    def test_every_command_parses_as_server_args(self):
+        recipes = _main_cli_recipes()
+        self.assertTrue(recipes)
+        for model, entry in recipes:
+            with self.subTest(entry["url"]):
+                server_args = prepare_server_args(command_argv(entry["command"]))
+                self.assertEqual(server_args.model_path, model)
+                gpus = compute_world_size(
+                    dp_size=server_args.dp_size,
+                    tp_size=server_args.tp_size,
+                    pp_size=server_args.pp_size,
+                )
+                self.assertEqual(entry["gpus"], gpus)
+                prefix = entry["command"].split("sglang serve")[0]
+                env_lines = [
+                    line.rstrip(" \\")
+                    for line in prefix.splitlines()
+                    if line.strip() and not line.startswith("#")
+                ]
+                self.assertEqual(
+                    env_lines,
+                    [f"{key}={value}" for key, value in entry["env"].items()],
+                )
 
 
 class _PipedStdout(io.StringIO):
@@ -687,6 +748,78 @@ class TestCliGuide(CustomTestCase):
             execvpe.call_args.args[1], _launch_argv(command_argv(recipe["command"]))
         )
 
+    def test_terminal_edits_the_whole_command_in_an_editor(self):
+        """What the user saves in $VISUAL launches, env lines included."""
+        recipe = _recipe(QWEN_NVFP4, "rtx6000", "low-latency")
+        argv = edit_flags(
+            argv=command_argv(recipe["command"]),
+            edits="--port 8000 !--reasoning-parser",
+        )
+        opened = []
+
+        def editor(args):
+            path = Path(args[-1])
+            opened.append((args[:-1], path.read_text()))
+            path.write_text(
+                "# Rewritten on one line, one env var dropped.\n"
+                f"PYTORCH_CUDA_ALLOC_CONF='a b' sglang serve {shlex.join(argv)}\n"
+            )
+            return 0
+
+        with (
+            patch.dict(interactive.os.environ, {"VISUAL": "code --wait"}),
+            patch.object(interactive.subprocess, "call", side_effect=editor),
+        ):
+            execvpe, stdout, _, _ = self._guide(
+                QWEN_NVFP4,
+                device="NVIDIA RTX PRO 6000 Blackwell Server Edition",
+                gpus=1,
+                answers=["", "e", ""],
+            )
+
+        original = format_command(
+            env=recipe["env"], argv=command_argv(recipe["command"])
+        )
+        self.assertEqual(
+            opened, [(["code", "--wait"], EDITOR_HEADER + original + "\n")]
+        )
+        _, launched, env = execvpe.call_args.args
+        self.assertEqual(launched, _launch_argv(argv))
+        self.assertEqual(env["PYTORCH_CUDA_ALLOC_CONF"], "a b")
+        self.assertNotIn("SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK", env)
+        edited = {"PYTORCH_CUDA_ALLOC_CONF": "a b"}
+        self.assertTrue(stdout.endswith(format_command(env=edited, argv=argv) + "\n"))
+
+    def test_failed_edit_keeps_the_command(self):
+        recipe = _recipe(QWEN, "h200", "low-latency")
+
+        def saves(text):
+            def editor(args):
+                Path(args[-1]).write_text(text)
+                return 0
+
+            return editor
+
+        for name, call, message in (
+            ("no editor", FileNotFoundError(2, "No such file"), "No such file"),
+            ("editor fails", lambda args: 1, "exited with code 1"),
+            ("no sglang serve", saves("python -m sglang.launch_server"), 'No "'),
+            ("not an env line", saves("export A=1 sglang serve"), "KEY=VALUE"),
+        ):
+            with (
+                self.subTest(name),
+                patch.object(interactive.subprocess, "call", side_effect=call),
+            ):
+                execvpe, _, stderr, _ = self._guide(
+                    QWEN, device=H200, gpus=4, answers=["", "e", ""]
+                )
+                self.assertIn(message, stderr)
+                self.assertIn("the command is unchanged", stderr)
+                self.assertEqual(
+                    execvpe.call_args.args[1],
+                    _launch_argv(command_argv(recipe["command"])),
+                )
+
     def test_eof_or_ctrl_c_cancels_without_launching(self):
         for error in (EOFError, KeyboardInterrupt):
             for answers in ([error()], ["", error()]):
@@ -697,6 +830,16 @@ class TestCliGuide(CustomTestCase):
                     execvpe.assert_not_called()
                     self.assertEqual(exit.code, 130)
                     self.assertIn("Cancelled", stderr)
+        with (
+            self.subTest("Ctrl-C in the editor"),
+            patch.object(interactive.subprocess, "call", side_effect=KeyboardInterrupt),
+        ):
+            execvpe, _, stderr, exit = self._guide(
+                QWEN, device=H200, gpus=4, answers=["", "e"]
+            )
+            execvpe.assert_not_called()
+            self.assertEqual(exit.code, 130)
+            self.assertIn("Cancelled", stderr)
 
     def test_model_without_modes_uses_the_default_command(self):
         recipe = dict(_recipe(QWEN, "h200", "low-latency"), mode=None)
@@ -708,21 +851,29 @@ class TestCliGuide(CustomTestCase):
         self.assertNotIn("Mode [", stderr)
         execvpe.assert_called_once()
 
-    def test_hardware_id_from_device_name(self):
-        for device, hw in (
-            ("NVIDIA GB300", "gb300"),
-            ("NVIDIA B300 SXM6 AC", "b300"),
-            ("NVIDIA GB200", "gb200"),
-            ("NVIDIA B200", "b200"),
-            ("NVIDIA GB10", "dgx-spark"),
-            ("NVIDIA H200", "h200"),
-            ("NVIDIA GH200 480GB", None),
-            ("AMD Instinct MI355X", "mi355x"),
-            ("NVIDIA A100-SXM4-80GB", None),
-            (None, None),
+    def test_hardware_ids_from_device_name(self):
+        for device, hardware in (
+            ("NVIDIA GB300", ("gb300",)),
+            ("NVIDIA B300 SXM6 AC", ("b300",)),
+            ("NVIDIA GB200", ("gb200",)),
+            ("NVIDIA B200", ("b200",)),
+            ("NVIDIA GB10", ("dgx-spark",)),
+            (
+                "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+                ("rtx6000", "rtx-pro-6000"),
+            ),
+            ("NVIDIA GeForce RTX 5090", ("rtx5090",)),
+            ("NVIDIA H20-3e", ("h20-3e",)),
+            ("NVIDIA H200", ("h200",)),
+            ("NVIDIA H20", ()),
+            ("NVIDIA L20", ("l20",)),
+            ("NVIDIA GH200 480GB", ()),
+            ("AMD Instinct MI355X", ("mi355x",)),
+            ("NVIDIA A100-SXM4-80GB", ()),
+            (None, ()),
         ):
             with self.subTest(device):
-                self.assertEqual(interactive._hardware_id(device), hw)
+                self.assertEqual(interactive._hardware_ids(device), hardware)
 
 
 class TestFlagEdits(unittest.TestCase):
@@ -741,15 +892,14 @@ class TestFlagEdits(unittest.TestCase):
                     edit_flags(argv=self.ARGV, edits=edits)
 
     def test_format_matches_every_cookbook_command(self):
-        for entries in _exported().values():
-            for entry in entries:
-                with self.subTest(entry["url"]):
-                    lines = entry["command"].splitlines()
-                    command = "\n".join(l for l in lines if not l.startswith("#"))
-                    formatted = format_command(
-                        env=entry["env"], argv=command_argv(entry["command"])
-                    )
-                    self.assertEqual(formatted, command)
+        for _, entry in _main_cli_recipes():
+            with self.subTest(entry["url"]):
+                lines = entry["command"].splitlines()
+                command = "\n".join(l for l in lines if not l.startswith("#"))
+                formatted = format_command(
+                    env=entry["env"], argv=command_argv(entry["command"])
+                )
+                self.assertEqual(formatted, command)
 
 
 if __name__ == "__main__":

@@ -230,7 +230,7 @@ class CollectSuiteFiles(unittest.TestCase):
                 ),
                 # AMD only -> never in CUDA inventory
                 "c/test_c.py": self.REG.format(
-                    calls='register_amd_ci(est_time=1, suite="nightly-amd")',
+                    calls='register_amd_ci(est_time=1, suite="nightly-test-amd")',
                     model="google/gemma-3-4b-it",
                 ),
             },
@@ -247,7 +247,7 @@ class CollectSuiteFiles(unittest.TestCase):
             self.assertTrue(nightly["nightly-y"])
             self.assertFalse(nightly["base-x-test-1-gpu"])
             # AMD suite never appears for the CUDA backend.
-            self.assertNotIn("nightly-amd", suites)
+            self.assertNotIn("nightly-test-amd", suites)
             # Modern registrations carry their runner_config; legacy suite= has none.
             self.assertEqual(runner_configs["base-x-test-1-gpu"], "1-gpu")
             self.assertIsNone(runner_configs["nightly-y"])
