@@ -23,6 +23,13 @@ if "SGLANG_DIFFUSION_TRACE_FUNCTION" in os.environ:
 if TYPE_CHECKING:
     SGLANG_DIFFUSION_NCCL_SO_PATH: str | None = None
     LOCAL_RANK: int = 0
+    SGLANG_DIFFUSION_ATTENTION_CONFIG: str | None = None
+    SGLANG_DIFFUSION_COSMOS3_MULTIVIEW_ATTENTION_BACKEND: str | None = None
+    SGLANG_DIFFUSION_DEBUG_COSMOS3_MULTIVIEW_SP_CHECK: bool = False
+    SGLANG_DIFFUSION_COSMOS3_LIDAR_USE_NATTEN: bool = False
+    SGLANG_DIFFUSION_WAN_ANIMATE_2_FP8_REFERENCE_KV: bool = False
+    SGLANG_DIFFUSION_ENABLE_MXFP8_ATTENTION: bool = False
+    SGLANG_DIFFUSION_TORCH_PROFILER_DIR: str | None = None
     SGLANG_DIFFUSION_CACHE_ROOT: str = os.path.expanduser("~/.cache/sgl_diffusion")
     SGLANG_DIFFUSION_DISABLE_EARLY_VAE_DECODER_CAST: bool = False
     SGLANG_DIFFUSION_DISABLE_VAE_DECODER_STORE: bool = False
@@ -42,6 +49,7 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_DISABLE_HOST_SPILL: bool = False
     SGLANG_DIFFUSION_TEST_FORCE_HOST_AVAILABLE_GIB: float | None = None
     SGLANG_DIFFUSION_TEST_CAP_DEVICE_MEMORY_GIB: float | None = None
+    SGLANG_TEST_NUM_INFERENCE_STEPS: int | None = None
     SGLANG_DIFFUSION_STAGE_LOGGING: bool = False
     SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY: bool = False
     SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS: int = 64
@@ -51,14 +59,14 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_FLUX3_NATTEN_BACKEND: str | None = None
     SGLANG_DIFFUSION_CFG_GATE_STEP: float = 1.0
     SGLANG_DIFFUSION_WAN_TEXT_PADDING: str = "max"
-    # cache-dit env vars (primary transformer)
     # on by default; engages only on 2 ranks with peer-to-peer access and falls
     # back to NCCL when unavailable. Set 0 to force NCCL. Keep this in step with
     # the resolver below -- that is the value the runtime reads.
     SGLANG_DIFFUSION_IPC_A2A: bool = True
-    # copy-engine all-to-all for Ulysses groups of any size on one host; off by
-    # default while it is validated. Falls back to NCCL when unavailable.
-    SGLANG_DIFFUSION_IPC_A2A_MULTI: bool = False
+    # copy-engine transport for the plain Ulysses all-to-all on one host: unset
+    # picks it where it measured faster than NCCL (see plain_exchange_ready),
+    # 1 forces it for every exchange, 0 keeps NCCL
+    SGLANG_DIFFUSION_IPC_A2A_MULTI: bool | None = None
     # head groups for pipelining the Ulysses exchange against dense attention
     # over the copy-engine transport (MiniMax-H3, and USPAttention's plain path),
     # or over the collective one for MiniMax-H3 on aiter:
@@ -77,6 +85,7 @@ if TYPE_CHECKING:
     # two-rank TP on one host: a row-parallel layer's epilogue kernel reads both
     # ranks' partial sums instead of an all-reduced tensor. Set 0 to all-reduce.
     SGLANG_DIFFUSION_TP_PEER_PARTIALS: bool = True
+    # cache-dit env vars (primary transformer)
     SGLANG_CACHE_DIT_ENABLED: bool = False
     SGLANG_CACHE_DIT_FN: int = 1
     SGLANG_CACHE_DIT_BN: int = 0
@@ -175,6 +184,15 @@ def _lazy_bool(key: str, default: str = "false") -> Callable[[], bool]:
     return lambda: get_bool_env_var(key, default)
 
 
+def _lazy_optional_bool(key: str) -> Callable[[], bool | None]:
+    def _getter():
+        if os.getenv(key) is None:
+            return None
+        return get_bool_env_var(key)
+
+    return _getter
+
+
 def _lazy_path(
     key: str, default_func: Callable[[], str] | None = None
 ) -> Callable[[], str | None]:
@@ -189,8 +207,8 @@ def _lazy_path(
     return _getter
 
 
-# The begin-* and end* here are used by the documentation generator
-# to extract the used env vars.
+# Diffusion env vars are declared in this dict and read lazily as attributes
+# of this module (e.g. envs.SGLANG_DIFFUSION_IPC_A2A).
 
 # begin-env-vars-definition
 
@@ -269,8 +287,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Import an installed package that registers out-of-tree diffusion models
     # and pipelines. This is shared with the SRT model plugin mechanism.
     "SGLANG_EXTERNAL_MODEL_PACKAGE": _lazy_str("SGLANG_EXTERNAL_MODEL_PACKAGE", ""),
-    # Enables torch profiler if set. Path to the directory where torch profiler
-    # traces are saved. Note that it must be an absolute path.
+    # Trace directory for requests sent with profile=True; it does not enable
+    # profiling. Falls back to SGLANG_TORCH_PROFILER_DIR, then ./logs.
     "SGLANG_DIFFUSION_TORCH_PROFILER_DIR": _lazy_path(
         "SGLANG_DIFFUSION_TORCH_PROFILER_DIR"
     ),
@@ -305,6 +323,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_TEST_CAP_DEVICE_MEMORY_GIB": _lazy_optional_float(
         "SGLANG_DIFFUSION_TEST_CAP_DEVICE_MEMORY_GIB"
     ),
+    # Test hook: run every request with this many denoising steps instead of
+    # its own count, so CI on slow runners stays short.
+    "SGLANG_TEST_NUM_INFERENCE_STEPS": _lazy_int("SGLANG_TEST_NUM_INFERENCE_STEPS"),
     # If set, sgl_diffusion will enable stage logging, which will print the time
     # taken for each stage
     "SGLANG_DIFFUSION_STAGE_LOGGING": _lazy_bool("SGLANG_DIFFUSION_STAGE_LOGGING"),
@@ -398,12 +419,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_DISABLE_LORA_MERGE_CACHE": _lazy_bool(
         "SGLANG_DIFFUSION_DISABLE_LORA_MERGE_CACHE"
     ),
-    # ================== cache-dit Env Vars ==================
-    # Enable cache-dit acceleration for DiT inference
+    # ================== Ulysses / IPC all-to-all ==================
     # CUDA-IPC transport for 2-rank Ulysses all-to-all (NVLink same-node)
     "SGLANG_DIFFUSION_IPC_A2A": _lazy_bool("SGLANG_DIFFUSION_IPC_A2A", "true"),
-    "SGLANG_DIFFUSION_IPC_A2A_MULTI": _lazy_bool(
-        "SGLANG_DIFFUSION_IPC_A2A_MULTI", "false"
+    "SGLANG_DIFFUSION_IPC_A2A_MULTI": _lazy_optional_bool(
+        "SGLANG_DIFFUSION_IPC_A2A_MULTI"
     ),
     "SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS": _lazy_int(
         "SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS", -1
@@ -417,6 +437,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_TP_PEER_PARTIALS": _lazy_bool(
         "SGLANG_DIFFUSION_TP_PEER_PARTIALS", "true"
     ),
+    # ================== cache-dit Env Vars ==================
+    # Enable cache-dit acceleration for DiT inference
     "SGLANG_CACHE_DIT_ENABLED": _lazy_bool("SGLANG_CACHE_DIT_ENABLED"),
     # Number of first blocks to always compute (DBCache F parameter)
     "SGLANG_CACHE_DIT_FN": _lazy_int("SGLANG_CACHE_DIT_FN", 1),
@@ -472,13 +494,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "SGLANG_LINGBOT_LAZY_VAE_ENCODE_BLACK_FRAMES"
     ),
     # FlashInfer FP4 GEMM backend override for diffusion NVFP4.
-    # When unset, diffusion ModelOpt NVFP4 defaults to flashinfer_trtllm.
-    # Supported values:
-    # - auto
-    # - flashinfer_cudnn
-    # - flashinfer_cutlass
-    # - flashinfer_trtllm
-    # Legacy aliases `cudnn` and `trtllm` are also accepted.
+    # When unset: trtllm (auto on SM120).
+    # Values: auto, cudnn|flashinfer_cudnn, cutlass|flashinfer_cutlass,
+    # trtllm|flashinfer_trtllm.
     "SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND": _lazy_str(
         "SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND"
     ),

@@ -15,29 +15,26 @@ use crate::utils::error::Error;
 /// Python's OpenAI PDRoutingFields, using generated API carriers. Unlike the
 /// native API, OpenAI allows null list elements only for bootstrap_port.
 #[derive(Deserialize)]
-pub(super) struct PDRoutingFields {
-    bootstrap_host: Option<StringOrList>,
-    bootstrap_port: Option<OptionalInt64OrList>,
-    bootstrap_room: Option<Int64OrList>,
+pub(crate) struct PDRoutingFields {
+    pub(crate) bootstrap_host: Option<StringOrList>,
+    pub(crate) bootstrap_port: Option<OptionalInt64OrList>,
+    pub(crate) bootstrap_room: Option<Int64OrList>,
     #[serde(default, deserialize_with = "lax_rank")]
-    routed_dp_rank: Option<i64>,
-    /// Python's deprecated spelling of `routed_dp_rank`, read when it is unset.
-    #[serde(default, deserialize_with = "lax_rank")]
-    data_parallel_rank: Option<i64>,
-    disagg_prefill_dp_rank: Option<i64>,
+    pub(crate) routed_dp_rank: Option<i64>,
+    pub(crate) disagg_prefill_dp_rank: Option<i64>,
 }
 
 /// Validated per-prompt columns, ready for admission.
-pub(super) struct NormalizedPDRouting {
-    pub(super) bootstrap: BootstrapColumns,
-    pub(super) routed_dp_rank: Option<i64>,
-    pub(super) disagg_prefill_dp_rank: Option<i64>,
+pub(crate) struct NormalizedPDRouting {
+    pub(crate) bootstrap: BootstrapColumns,
+    pub(crate) routed_dp_rank: Option<i64>,
+    pub(crate) disagg_prefill_dp_rank: Option<i64>,
 }
 
 impl PDRoutingFields {
     /// Normalize bootstrap fields per prompt and bound the handlers' host clones
     /// across choices. DP hints remain scalar.
-    pub(super) fn normalize(
+    pub(crate) fn normalize(
         self,
         prompt_count: usize,
         choices_per_prompt: usize,
@@ -76,7 +73,7 @@ impl PDRoutingFields {
         }
         Ok(NormalizedPDRouting {
             bootstrap,
-            routed_dp_rank: self.routed_dp_rank.or(self.data_parallel_rank),
+            routed_dp_rank: self.routed_dp_rank,
             disagg_prefill_dp_rank: self.disagg_prefill_dp_rank,
         })
     }
@@ -129,10 +126,10 @@ mod tests {
         assert_eq!(routing.disagg_prefill_dp_rank, Some(3));
     }
 
-    /// The deprecated `data_parallel_rank` names the rank when
-    /// `routed_dp_rank` does not, and a header the route reads wins over both.
+    /// `routed_dp_rank` names the rank, and a header the route reads wins
+    /// over it.
     #[test]
-    fn dp_rank_reads_the_deprecated_field_then_the_route_headers() {
+    fn dp_rank_reads_the_body_then_the_route_headers() {
         use super::HintRoute;
         let routing = |body| {
             serde_json::from_value::<PDRoutingFields>(body)
@@ -140,17 +137,9 @@ mod tests {
                 .normalize(1, 1)
                 .unwrap()
         };
-        assert_eq!(
-            routing(json!({"data_parallel_rank": 1})).routed_dp_rank,
-            Some(1)
-        );
-        assert_eq!(
-            routing(json!({"routed_dp_rank": 0, "data_parallel_rank": 1})).routed_dp_rank,
-            Some(0)
-        );
         // Pydantic reads a string of an integer.
         assert_eq!(
-            routing(json!({"routed_dp_rank": "1", "data_parallel_rank": "0"})).routed_dp_rank,
+            routing(json!({"routed_dp_rank": "1"})).routed_dp_rank,
             Some(1)
         );
         assert!(serde_json::from_value::<PDRoutingFields>(json!({"routed_dp_rank": "x"})).is_err());
