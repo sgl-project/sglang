@@ -10,21 +10,21 @@ tag: NEW
 
 <Accordion title="Install SGLang">
 
-Start an interactive container with GPU access, shared memory, the Hugging Face cache, port 30000, and your checkpoint token. Replace `<your-hf-token>` before running this command:
+For all methods and hardware platforms, see the [official SGLang installation guide](/docs/get-started/install).
+
+<Tabs>
+
+<Tab title="Docker">
 
 ```bash Command
-export HF_TOKEN=<your-hf-token>
-docker run --gpus all -it \
-  --shm-size 32g \
-  -p 30000:30000 \
-  -v ~/.cache/huggingface:/root/.cache/huggingface \
-  --env HF_TOKEN \
-  --ipc=host \
-  lmsysorg/sglang:hy4 \
-  bash
+docker pull lmsysorg/sglang:hy4
 ```
 
-At the resulting container shell, run the **Python** panel's `sglang serve` command. Alternatively, run the **Docker** panel's complete `docker run` command directly on the host. Keep the server running while you send requests to port 30000.
+For how to launch the image, see [Install → Method 3: Using Docker](/docs/get-started/install#method-3-using-docker) and use the `hy4` tag; the command generator below supplies the `sglang serve` command. Run its **Python** output inside that container, or its **Docker** output directly on the host. The **Docker** output passes `HF_TOKEN`; set it in **⚙ Env** before copying.
+
+</Tab>
+
+</Tabs>
 
 </Accordion>
 
