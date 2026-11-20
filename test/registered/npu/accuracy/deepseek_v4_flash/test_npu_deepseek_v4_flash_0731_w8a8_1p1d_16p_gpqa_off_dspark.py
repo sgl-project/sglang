@@ -1,22 +1,12 @@
-import json
 import unittest
 
 from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
     TestNpuAccuracyMultiNodePdSepTestCaseBase,
 )
-from sglang.test.ascend.e2e.test_npu_multi_node_utils import (
-    NIC_NAME,
-    get_mooncake_master_server_address,
-)
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
     DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH,
     assert_metrics,
     run_bench_serving,
-)
-from sglang.test.ascend.test_ascend_utils import (
-    append_ld_library_path,
-    resolve_local_ip,
-    write_memfabric_tent_conf,
 )
 from sglang.test.ci.ci_register import register_npu_ci
 
@@ -32,8 +22,8 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_COMMON_ENVS = {
     "STREAMS_PER_DEVICE": "32",
     "INF_NAN_MODE_FORCE_DISABLE": "1",
     "SGLANG_SET_CPU_AFFINITY": "1",
-    "HCCL_SOCKET_IFNAME": NIC_NAME,
-    "GLOO_SOCKET_IFNAME": NIC_NAME,
+    "HCCL_SOCKET_IFNAME": "lo",
+    "GLOO_SOCKET_IFNAME": "lo",
     "HCCL_OP_EXPANSION_MODE": "AIV",
     # skip gpu branch
     "SGLANG_OPT_FP8_WO_A_GEMM": "0",
@@ -59,19 +49,11 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ENVS = {
     "DEEPEP_NORMAL_LONG_SEQ_ROUND": "8",
     "DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ": "1",
     "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK": "0",
-    "SGLANG_ENABLE_WAR_BARRIER": "0",
-    "SGLANG_FORCE_COARSE_WAR_BARRIER": "0",
+    "SGLANG_ENABLE_WAR_BARRIER": "1",
+    "SGLANG_FORCE_COARSE_WAR_BARRIER": "1",
     "SGLANG_PROFILE_WITH_STACK": "False",
     # send cached prefix to decode early for radix-cache hits
     "SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX": "1",
-    # L3 store client: MemFabric TENT transport over the NPU device path, as in
-    # the standalone deployment scripts. The store endpoint travels in the
-    # extra-config JSON and MC_TENT_CONF, both built in setUpClass.
-    "MC_USE_TENT": "1",
-    "MF_PROTOCOL": "device_sdma",
-    "MF_STORE_PROTOCOL": "device_sdma",
-    "MF_TRANSFER_TIMEOUT": "10000",
-    "SGLANG_HICACHE_MOONCAKE_REUSE_TE": "0",
 }
 
 # Decode node environment variables for DSV4-Flash-0731 PD-Sep deployment.
@@ -133,19 +115,16 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
     "--disable-prefill-cuda-graph",
     "--load-balance-method",
     "round_robin",
+    "--enable-prefill-cp",
+    "--cp-strategy",
+    "interleave",
     "--enable-hierarchical-cache",
-    "--hicache-ratio",
-    0.5,
     "--hicache-io-backend",
     "kernel_ascend",
-    "--hicache-mem-layout",
-    "page_first",
+    "--hicache-ratio",
+    1.5,
     "--hicache-write-policy",
     "write_through",
-    "--hicache-storage-prefetch-policy",
-    "wait_complete",
-    "--hicache-storage-backend",
-    "mooncake",
     "--enable-cache-report",
     "--max-total-tokens",
     140000,
@@ -194,6 +173,17 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_DECODE_ARGS = [
     6,
 ]
 
+# Model config for DSV4-Flash-0731 W8A8 1P+1D PD-Sep deployment.
+DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_MODEL_CONFIG = {
+    "model_path": DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH,
+    "prefill_args": DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS,
+    "decode_args": DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_DECODE_ARGS,
+    "prefill_envs": DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ENVS,
+    "decode_envs": DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_DECODE_ENVS,
+    "router_args": [],
+    "router_envs": {},
+}
+
 # Generation config for Think High mode (thinking=true, reasoning_effort=high).
 DEEPSEEK_V4_FLASH_0731_W8A8_GENERATION_CONFIG_HIGH = {
     "max_tokens": 125000,
@@ -211,6 +201,7 @@ class TestNPUDeepSeekV4Flash0731W8A8PDSEPGPQAHigh(
 ):
     """Test NPU accuracy for DeepSeek-V4-Flash W8A8 16p 1P1D GPQA."""
 
+    model_config = DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_MODEL_CONFIG
     # (reference: Flash W8A8 GPQA Diamond baseline is 0.874).
     accuracy = 0.874
     datasets = ["gpqa_diamond"]
@@ -223,51 +214,6 @@ class TestNPUDeepSeekV4Flash0731W8A8PDSEPGPQAHigh(
     generation_config = DEEPSEEK_V4_FLASH_0731_W8A8_GENERATION_CONFIG_HIGH
     eval_batch_size = 128
     min_hit_rate_pcts = {"host": 0}  # percent: L2 host hit rate must exceed 0%
-
-    @classmethod
-    def setUpClass(cls):
-        # Only the prefill node runs the L3 store client; the decode node has no
-        # storage backend. Everything deployment-specific is assembled here: the
-        # TENT config and MemFabric library path of this pod, plus the Mooncake
-        # store config, which is one JSON passed through
-        # --hicache-storage-backend-extra-config (once it carries
-        # master_server_address the client ignores the MOONCAKE_* env vars).
-        # The master runs on the first prefill pod, not necessarily this one, and
-        # the segment is requested per scheduler rank: keep it small, because
-        # 16-20 GiB made the Ascend driver reject the last rank's HalMemCreate
-        # and the prefill server died with "Failed to setup Mooncake store,
-        # error code: -600".
-        l3_config = json.dumps(
-            {
-                "master_server_address": get_mooncake_master_server_address(),
-                "metadata_server": "P2PHANDSHAKE",
-                "protocol": "ascend",
-                "global_segment_size": "8gb",
-                "local_hostname": resolve_local_ip(),
-                "extra_backend_tag": "pd-1p1d-dsv4-flash-0731",
-            }
-        )
-        cls.model_config = {
-            "model_path": DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH,
-            "prefill_args": [
-                *DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS,
-                "--hicache-storage-backend-extra-config",
-                l3_config,
-            ],
-            "decode_args": list(DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_DECODE_ARGS),
-            "prefill_envs": {
-                **DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ENVS,
-                "MC_TENT_CONF": write_memfabric_tent_conf(),
-                "LD_LIBRARY_PATH": append_ld_library_path(("memfabric_hybrid", "lib")),
-            },
-            "decode_envs": dict(DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_DECODE_ENVS),
-            # DSV4-Flash GPQA High streams up to 125k tokens per request, which
-            # takes over an hour; the default 1800s router timeout cuts those
-            # responses off mid-stream ("incomplete chunked read" in evalscope).
-            "router_args": ["--request-timeout-secs", "10800"],
-            "router_envs": {},
-        }
-        super().setUpClass()
 
     def test_npu_deepseek_v4_flash_0731_w8a8_pd_sep_gpqa_high(self):
         """Run NPU accuracy test for DSV4-Flash-0731 PD-Sep GPQA High mode."""

@@ -8,11 +8,6 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
     assert_metrics,
     run_bench_serving,
 )
-from sglang.test.ascend.test_ascend_utils import (
-    append_ld_library_path,
-    resolve_local_ip,
-    write_memfabric_tent_conf,
-)
 from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
@@ -20,21 +15,6 @@ register_npu_ci(
     suite="",
     nightly=True,
 )
-
-# Mooncake L3 store client config: the store runs on the MemFabric TENT
-# transport over the NPU device path, as in the standalone Mooncake deployment.
-# The segment is requested per prefill rank: 8 GiB x 16 ranks = 128 GiB pinned
-# host memory per node. Larger values (16-20 GiB) made the Ascend driver reject
-# the last rank's HalMemCreate and the prefill server died with
-# "Failed to setup Mooncake store, error code: -600".
-MOONCAKE_ENVS = {
-    "MOONCAKE_PROTOCOL": "ascend",
-    "MOONCAKE_GLOBAL_SEGMENT_SIZE": "8gb",
-    "MC_USE_TENT": "1",
-    "MF_PROTOCOL": "device_sdma",
-    "MF_STORE_PROTOCOL": "device_sdma",
-    "MF_TRANSFER_TIMEOUT": "10000",
-}
 
 DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_COMMON_ENVS = {
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
@@ -114,12 +94,6 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_SPECULATIVE_ARGS = [
     6,
 ]
 
-# SGLang reads this key itself (it never reaches the storage backend) and keeps
-# the L3 prefetch behavior of the previous MemCache setup. The Mooncake master
-# address is exported as MOONCAKE_MASTER by the framework when it starts the
-# master on the first prefill node.
-HICACHE_EXTRA_CONFIG = '{"prefetch_threshold": 1}'
-
 # Prefill node launch arguments.
 DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
     "--page-size",
@@ -169,16 +143,10 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
     "--enable-hierarchical-cache",
     "--hicache-io-backend",
     "kernel_ascend",
-    "--hicache-storage-backend",
-    "mooncake",
     "--hicache-ratio",
-    0.5,
+    1.5,
     "--hicache-write-policy",
     "write_through",
-    "--hicache-storage-prefetch-policy",
-    "wait_complete",
-    "--hicache-storage-backend-extra-config",
-    HICACHE_EXTRA_CONFIG,
     "--enable-cache-report",
     "--max-total-tokens",
     140000,
@@ -270,28 +238,6 @@ class TestNPUDeepSeekV4Flash0731W8A8PDSEPGPQAHigh(
     generation_config = DEEPSEEK_V4_FLASH_0731_W8A8_GENERATION_CONFIG_HIGH
     eval_batch_size = 128
     min_hit_rate_pcts = {"host": 0}  # percent: L2 host hit rate must exceed 0%
-
-    @classmethod
-    def setUpClass(cls):
-        # Only the prefill node opens the Mooncake L3 store; the decode node has
-        # no HiCache storage backend, so it keeps its own env untouched.
-        prefill_envs = dict(DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ENVS)
-        prefill_envs.update(MOONCAKE_ENVS)
-        # Per-node values: the TENT config, the registered store hostname and
-        # the MemFabric library path must describe the pod this node runs on.
-        prefill_envs["MC_TENT_CONF"] = write_memfabric_tent_conf()
-        prefill_envs["MOONCAKE_LOCAL_HOSTNAME"] = resolve_local_ip()
-        prefill_envs["LD_LIBRARY_PATH"] = append_ld_library_path(
-            ("memfabric_hybrid", "lib"), ("mooncake", None)
-        )
-        cls.model_config = {
-            **DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_MODEL_CONFIG,
-            "prefill_args": list(DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS),
-            "decode_args": list(DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_DECODE_ARGS),
-            "prefill_envs": prefill_envs,
-            "decode_envs": dict(DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_DECODE_ENVS),
-        }
-        super().setUpClass()
 
     def test_npu_deepseek_v4_flash_0731_w8a8_pd_sep_gpqa_high(self):
         """Run NPU accuracy test for DSV4-Flash-0731 PD-Sep GPQA High mode."""
