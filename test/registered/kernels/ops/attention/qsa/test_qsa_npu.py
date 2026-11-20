@@ -143,7 +143,9 @@ def test_qsa_graph_request_updates(mode, batch_size, heads, runtime_context):
     backend.init_forward_metadata_out_graph(batch, in_capture=False)
     metadata = backend.forward_metadata
     index_metadata = metadata.indexer_metadata
-    indexer = SimpleNamespace(token_topk=2048, block_topk=512, compress_ratio=4)
+    indexer = SimpleNamespace(
+        token_topk=2048, block_topk=512, compress_ratio=4, index_n_heads=4
+    )
     layer = SimpleNamespace(
         layer_id=0, scaling=1 / 16, tp_q_head_num=heads, head_dim=256
     )
