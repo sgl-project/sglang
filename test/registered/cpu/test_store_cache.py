@@ -59,6 +59,43 @@ def test_store_cache(batch_size, num_heads, head_dim, dtype):
     assert torch.equal(v_cache, v_cache_ref)
 
 
+def test_store_cache_edge_indices(batch_size=4, num_heads=2, head_dim=64):
+    shape = (batch_size, num_heads, head_dim)
+    cache_shape = (CACHE_SIZE, num_heads, head_dim)
+    k = _random_tensor(shape, torch.float16)
+    v = _random_tensor(shape, torch.float16)
+    k_cache = _random_tensor(cache_shape, torch.float16)
+    v_cache = _random_tensor(cache_shape, torch.float16)
+    # first and last pool rows: the inclusive bounds of the validated range
+    indices = torch.tensor([0, CACHE_SIZE - 1, 1, CACHE_SIZE - 2], dtype=torch.int64)
+
+    k_cache_ref = k_cache.clone()
+    v_cache_ref = v_cache.clone()
+    k_cache_ref[indices] = k
+    v_cache_ref[indices] = v
+
+    _store_cache_cpu(k, v, k_cache, v_cache, indices)
+
+    assert torch.equal(k_cache, k_cache_ref)
+    assert torch.equal(v_cache, v_cache_ref)
+
+
+@pytest.mark.parametrize(
+    "idx_dtype", [torch.int64, torch.int32], ids=["int64", "int32"]
+)
+@pytest.mark.parametrize("bad_idx", [-1, CACHE_SIZE], ids=["neg-one", "num-pages"])
+def test_store_cache_out_of_range_indices_rejected(bad_idx, idx_dtype):
+    shape = (4, 2, 64)
+    k = _random_tensor(shape, torch.bfloat16)
+    v = _random_tensor(shape, torch.bfloat16)
+    k_cache = _random_tensor((CACHE_SIZE, 2, 64), torch.bfloat16)
+    v_cache = _random_tensor((CACHE_SIZE, 2, 64), torch.bfloat16)
+    indices = torch.tensor([0, 1, 2, bad_idx], dtype=idx_dtype)
+
+    with pytest.raises(RuntimeError, match="out of range"):
+        _store_cache_cpu(k, v, k_cache, v_cache, indices)
+
+
 @pytest.mark.parametrize("dtype", DTYPES, ids=DTYPE_IDS)
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("num_heads", [1, 8])
