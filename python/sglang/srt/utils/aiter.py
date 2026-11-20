@@ -82,7 +82,7 @@ def aiter_unified_attention_supports_non_causal() -> bool:
 
 def aiter_dspark_draft_default_on_this_device() -> bool:
     """Whether a model hook may pick aiter for a DSpark draft unasked here: the aiter
-    DSpark draft was validated on gfx950 only (#47437), so other gfx95x and gfx942
+    DSpark draft was validated on gfx950 only, so other gfx95x and gfx942
     keep their default draft backend."""
     from sglang.kernels.arch import current_arch
 
@@ -97,13 +97,8 @@ def aiter_dspark_draft_reject_reason(
     enable_unified_memory: bool,
     enable_deterministic_inference: bool,
 ) -> Optional[str]:
-    """Why the aiter backend cannot run a DSpark draft, or None when it can.
-
-    The aiter DSpark draft verifies its block bidirectionally on unified_attention
-    (causal=False) over a 4D NHD pool. AiterAttnBackend asks it directly; the
-    draft-backend resolver and the Kimi-K3 hook ask it through aiter's
-    NonCausalDraftAttention registration in attention_registry.
-    """
+    """Why the aiter backend cannot run a DSpark draft, or None when it can; the draft
+    verifies its block bidirectionally on unified_attention (causal=False), 4D NHD pool."""
     if draft_is_mla:
         return "MLA draft (the aiter MLA verify is causal-only)"
     if draft_has_sliding_window:

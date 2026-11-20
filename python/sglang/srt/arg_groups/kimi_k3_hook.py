@@ -59,7 +59,7 @@ def apply_kimi_k3_spec_backend_defaults(server_args: ServerArgs) -> None:
 
     # A target attention backend that declared NonCausalDraftAttention also runs the
     # DSpark draft (8 Q / 2 KV heads, head dim 64, no window) where it declares itself
-    # the default (aiter: gfx950 only, #47437); elsewhere the draft keeps triton.
+    # the default (aiter: gfx950 only); elsewhere the draft keeps triton.
     if (
         cfg.speculative_algorithm == "DSPARK"
         and cfg.speculative_draft_attention_backend is None
