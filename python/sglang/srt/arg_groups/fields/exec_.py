@@ -910,18 +910,18 @@ class ExecMoe(msgspec.Struct):
             "mori",
             "ascend_fuseep",
             "flashinfer_nvlink_one_sided",
-            "flashinfer_rdma",
             "flashinfer",  # Deprecated alias for "flashinfer_nvlink_one_sided"
             "megamoe",
             "deepep_v2",
             "ascend_ops",
             "pplx",
             "flashinfer_megamoe",
+            "flashinfer_rdma",
         ],
         Arg(
             help="Choose the backend for MoE A2A. 'flashinfer_nvlink_one_sided' is "
             "FlashInfer's NVLink one-sided all-to-all; 'flashinfer' is a deprecated "
-            "alias for it. 'flashinfer_rdma' uses pure RDMA NVFP4 dispatch/combine on SM120.",
+            "alias for it.",
             choices=[
                 "none",
                 "deepep",
@@ -930,13 +930,13 @@ class ExecMoe(msgspec.Struct):
                 "mori",
                 "ascend_fuseep",
                 "flashinfer_nvlink_one_sided",
-                "flashinfer_rdma",
                 "flashinfer",  # Deprecated alias for "flashinfer_nvlink_one_sided"
                 "megamoe",
                 "deepep_v2",
                 "pplx",
                 "ascend_ops",
                 "flashinfer_megamoe",
+                "flashinfer_rdma",
             ],
             resolvable=True,
         ),

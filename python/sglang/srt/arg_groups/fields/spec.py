@@ -213,12 +213,12 @@ class Spec(msgspec.Struct):
                 "mori",
                 "ascend_fuseep",
                 "flashinfer_nvlink_one_sided",
-                "flashinfer_rdma",
                 "flashinfer",  # Deprecated alias for "flashinfer_nvlink_one_sided"
                 "megamoe",
                 "deepep_v2",
                 "pplx",
                 "ascend_ops",
+                "flashinfer_rdma",
             ],
             resolvable=True,
         ),
