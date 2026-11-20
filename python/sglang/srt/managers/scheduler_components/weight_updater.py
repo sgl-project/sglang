@@ -391,11 +391,18 @@ class SchedulerWeightUpdaterManager:
             )
         run_post_load = not self._session.loaded_weights
         self.scheduler.wait_for_launched_forward()
-        for _, runner in self._select_runners(self._session.selector):
-            runner.weight_updater.end_weight_update(run_post_load=run_post_load)
+        errors = []
+        for role, runner in self._select_runners(self._session.selector):
+            error = runner.weight_updater.end_weight_update(run_post_load=run_post_load)
+            if error is not None:
+                errors.append(f"{role}: {error}")
         self._session = None
-        torch.distributed.barrier(group=self.tp_cpu_group)
-        return EndWeightUpdateReqOutput(success=True, message="Success")
+        error = " | ".join(errors) or None
+        if error is not None:
+            logger.error(error)
+        # only TP rank 0 replies, so its reply must carry every rank's outcome
+        success, message, _ = self._agree_across_tp_ranks(error=error, count=0)
+        return EndWeightUpdateReqOutput(success=success, message=message)
 
     def plugin_weight_update(self, recv_req: PluginWeightUpdateReqInput):
         """Receive weights through a platform transport, then load them as update_weights_from_distributed does."""
@@ -468,7 +475,10 @@ class SchedulerWeightUpdaterManager:
         torch.distributed.all_gather_object(
             outcomes, (count, error), group=self.tp_cpu_group
         )
-        errors = [error for _, error in outcomes if error is not None]
+        # an error several ranks hit (the same missing half, say) shows once
+        errors = list(
+            dict.fromkeys(error for _, error in outcomes if error is not None)
+        )
         return (
             not errors,
             " | ".join(errors) or "Success",
