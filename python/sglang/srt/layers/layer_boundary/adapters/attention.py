@@ -100,8 +100,7 @@ class AttnTpContext:
     def use_input_scattered(self, forward_batch: ForwardBatch):
         return (
             self.allow_input_scattered
-            # A prefill graph is captured outside the input-scattered scope,
-            # so its replay (eager embedding and tail included) is not scattered.
+            # Prefill graphs are captured unscattered.
             and not get_forward().prefill_graph_replay
             and forward_batch.forward_mode.is_extend()
             and not forward_batch.forward_mode.is_target_verify()

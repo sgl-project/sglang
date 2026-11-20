@@ -2629,8 +2629,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self._rank_barrier_scope(
                 self._every_rank_reaches_rank_barrier(forward_batch)
             ),
-            # The captured body was recorded outside maybe_input_scattered, so
-            # the eager embedding and tail of this replay must not scatter.
+            # The body was captured outside maybe_input_scattered; keep the
+            # replay's eager embedding unscattered to match it.
             get_forward().scoped(prefill_graph_replay=True),
         ):
             static_forward_batch, shared_read_ends = self.load_batch(
