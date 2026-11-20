@@ -239,7 +239,6 @@ def _asm_cprr_shape_verdict(
     intra_batch_mode: bool,
     v_head_dim: int,
 ) -> tuple[bool, str]:
-    """Whether aiter runs this head count natively at this query length, and why not."""
     in_table = _in_asm_cprr_native_table(heads=heads, q_len=q_len)
     table_verdict = (in_table, "" if in_table else "not in the copied gfx950 table")
     if not ask_aiter or get_mla_decode_shape_support is None:
@@ -2337,9 +2336,6 @@ class AiterAttnBackend(AttentionBackend):
         )
 
     def _asm_cprr_verify_requested(self) -> bool:
-        """Whether this topology asks for DCP target verify on the asm cp kernel."""
-        # Fixed for the backend's lifetime, unlike _use_mla_ps_kernel, which the
-        # persist block of __init__ may still turn off from the answer to this.
         return (
             self.mla_verify_backend == "asm"
             and self.dcp_world_size > 1
@@ -2347,7 +2343,6 @@ class AiterAttnBackend(AttentionBackend):
         )
 
     def _asm_cprr_verify_enabled(self) -> bool:
-        """Whether this topology may run DCP target verify on the asm cp kernel."""
         return _use_mla_ps_kernel and self._asm_cprr_verify_requested()
 
     def _asm_cprr_supports_verify_shape(self, q_len: Optional[int]) -> bool:
@@ -2359,7 +2354,6 @@ class AiterAttnBackend(AttentionBackend):
         )
 
     def _init_cprr_verify(self, *, kv_lora_rank: int) -> None:
-        """Pick the head count the MLA DCP target verify pads its gathered query to."""
         self._cprr_supports_cache: dict[tuple[int, int], tuple[bool, str]] = {}
         self.cprr_v_head_dim = 0
         self.cprr_kernel_heads = 0
@@ -2379,7 +2373,6 @@ class AiterAttnBackend(AttentionBackend):
         )
 
     def _asm_cprr_supports(self, *, heads: int, q_len: int) -> bool:
-        """Whether aiter runs the DCP verify natively at this padded head count."""
         # Cached: target verify asks on every step, and the answer is fixed.
         if heads <= 0:
             return False
@@ -2397,7 +2390,6 @@ class AiterAttnBackend(AttentionBackend):
         return self._cprr_supports_cache[key][0]
 
     def _asm_cprr_rejections(self, q_len: int) -> str:
-        """Why each padded head count tried at this query length was turned down."""
         return "; ".join(
             f"{heads} heads: {why}"
             for (heads, tried_q_len), (ok, why) in sorted(
