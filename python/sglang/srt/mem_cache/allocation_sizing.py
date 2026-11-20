@@ -159,21 +159,16 @@ def add_spec_decode_headroom_pages(
 def get_req_to_token_extra_context_len() -> int:
     """req_to_token row headroom beyond the model context length.
 
-    Sized to hold the decode over-allocation; the spec v2 page>1 topk>1 holey
-    draft footprint can outgrow the default num_draft_tokens headroom. The row
-    headroom and the pools it sits next to derive from the same bag leaves, so
-    they cannot disagree after a post-publish override.
+    Sized to hold the decode over-allocation: a spec decode step allocates up to
+    committed + get_alloc_reserve_per_decode() at every page size, which can
+    outgrow the default num_draft_tokens headroom. The row headroom and the pools
+    it sits next to derive from the same bag leaves, so they cannot disagree
+    after a post-publish override.
     """
     # FIXME(lsyin): temporary fix for the context length issue under spec decoding
     extra = 4 + (max_speculative_num_draft_tokens() or 0)
-    page_size = get_alloc_page_size()
-    spec_algorithm = get_spec().speculative_algorithm
-    if spec_algorithm is not None:
-        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-
-        spec_algo = SpeculativeAlgorithm.from_string(spec_algorithm)
-        if page_size > 1 or spec_algo.is_uno():
-            # UNO's double-buffer reserve applies at every page size. Larger
-            # pages may additionally round the allocation up by page_size - 1.
-            extra = max(extra, get_alloc_reserve_per_decode() + page_size - 1)
+    if get_spec().speculative_algorithm is not None:
+        # Larger pages may round the allocation up by page_size - 1.
+        page_size = get_alloc_page_size()
+        extra = max(extra, get_alloc_reserve_per_decode() + page_size - 1)
     return extra

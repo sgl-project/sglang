@@ -1309,16 +1309,12 @@ class KVCacheConfigurator:
         running set, by the rules the static request pools follow."""
         disagg = get_disagg()
         if has_state:
-            extra_max_context_len = 4
-            draft_tokens = max_speculative_num_draft_tokens()
-            if draft_tokens is not None:
-                extra_max_context_len += draft_tokens
             pre_alloc_size = (
                 disagg.disaggregation_decode_extra_slots
                 if disagg.disaggregation_mode == "decode"
                 else 0
             )
-            return extra_max_context_len, pre_alloc_size
+            return get_req_to_token_extra_context_len(), pre_alloc_size
         return get_req_to_token_extra_context_len(), self._req_pool_pre_alloc_size()
 
     def _unified_swa_head_geometry(self) -> _UnifiedSWAHeadGeometry:
