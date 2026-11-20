@@ -9,8 +9,8 @@ from unittest import mock
 import torch
 
 from sglang.kernels.ops.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
+from sglang.srt.managers.prefill_adder import PrefillAdder
 from sglang.srt.managers.schedule_batch import ReqKvInfo
-from sglang.srt.managers.schedule_policy import PrefillAdder
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     InsertParams,

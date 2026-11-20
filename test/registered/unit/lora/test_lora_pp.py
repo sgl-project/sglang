@@ -31,7 +31,7 @@ from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.mem_pool import EMPTY_SLOT, LoRAMemoryPool
 from sglang.srt.lora.utils import LoRAType
-from sglang.srt.managers.schedule_policy import AddReqResult
+from sglang.srt.managers.prefill_adder import AddReqResult
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.metrics_reporter import (
     SchedulerMetricsReporter,

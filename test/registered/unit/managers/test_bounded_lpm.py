@@ -19,7 +19,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
-def policy(name="lpm", disabled=False, enabled=True):
+def planner(name="lpm", disabled=False, enabled=True):
     cache = RadixCache.create_simulated()
     cache.disable = disabled
     p = SchedulePlanner(name, cache, False, False, False, bounded_lpm_enabled=enabled)
@@ -46,7 +46,7 @@ class TestBoundedLPM(CustomTestCase):
     def test_threshold_and_stable_sort(self):
         for n in (0, 1, 63, 64, 65, 127, 128, 129, 512):
             with self.subTest(n=n):
-                p, q = policy(), requests(n)
+                p, q = planner(), requests(n)
                 with patch.object(
                     p, "_compute_prefix_matches", return_value=set()
                 ) as match:
@@ -63,7 +63,7 @@ class TestBoundedLPM(CustomTestCase):
                 self.assertEqual(len(match.call_args.args[0]), k)
 
     def test_drain_below_threshold_then_restore_short_lpm(self):
-        p, q = policy(), requests(150)
+        p, q = planner(), requests(150)
         with patch.object(p, "_compute_prefix_matches", return_value=set()) as match:
             p.calc_priority(q)
             p.retire_waiting_members(q[:30])
@@ -79,7 +79,7 @@ class TestBoundedLPM(CustomTestCase):
             self.assertTrue(p.waiting_queue_prefix_matched(q[64:]))
 
     def test_short_long_short_long_transitions(self):
-        p, q = policy(), requests(200)
+        p, q = planner(), requests(200)
         with patch.object(p, "_compute_prefix_matches", return_value=set()):
             p.calc_priority(q[:128])
             self.assertFalse(p.bounded_lpm_active)
@@ -92,7 +92,7 @@ class TestBoundedLPM(CustomTestCase):
             self.assertEqual(len(p._lpm._bounded_members), 64)
 
     def test_member_rematches_and_newcomer_does_not_replace_it(self):
-        p, q = policy(), requests(150)
+        p, q = planner(), requests(150)
         with patch.object(p, "_compute_prefix_matches", return_value=set()):
             p.calc_priority(q)
             q[0].num_matched_prefix_tokens = 100
@@ -104,7 +104,7 @@ class TestBoundedLPM(CustomTestCase):
     def test_departure_before_retraction_without_priority_call(self):
         for operation in ("move", "bulk_move"):
             with self.subTest(operation=operation):
-                p, q = policy(), requests(150)
+                p, q = planner(), requests(150)
                 waiting = IndexedReqList(
                     ListKind.WAITING, on_leave=p.retire_waiting_members
                 )
@@ -127,7 +127,7 @@ class TestBoundedLPM(CustomTestCase):
 
         s = Scheduler.__new__(Scheduler)
         s.schedule_policy = "lpm"
-        s.schedule_planner = policy()
+        s.schedule_planner = planner()
         s.tree_cache = s.schedule_planner.tree_cache
         with patch(
             "sglang.srt.managers.scheduler.get_parallel",
@@ -138,7 +138,7 @@ class TestBoundedLPM(CustomTestCase):
         s.enable_priority_scheduling = False
         s.schedule_low_priority_values_first = False
         s.dllm_config = None
-        s.init_schedule_policy()
+        s.init_schedule_planner()
         s.schedule_planner._lpm._should_start_bounded_batch = lambda waiting: True
         self.assertIsNone(s.waiting_queue._on_leave)
         q = requests(150)
@@ -158,10 +158,10 @@ class TestBoundedLPM(CustomTestCase):
     def test_dllm_legacy_fallback_and_other_policies(self):
         q = requests(200)
         for p in (
-            policy(enabled=False),
-            policy("hrrn"),
-            policy("fcfs"),
-            policy(disabled=True),
+            planner(enabled=False),
+            planner("hrrn"),
+            planner("fcfs"),
+            planner(disabled=True),
         ):
             with patch.object(p, "_compute_prefix_matches") as match:
                 self.assertEqual(p.calc_priority(q), q)
@@ -183,7 +183,7 @@ class TestBoundedLPM(CustomTestCase):
             parser.parse_args(["--model", "dummy", "--schedule-policy", "bounded-lpm"])
 
     def test_matching_failure_propagates(self):
-        p = policy()
+        p = planner()
         with patch.object(
             p, "_compute_prefix_matches", side_effect=RuntimeError("expected")
         ):

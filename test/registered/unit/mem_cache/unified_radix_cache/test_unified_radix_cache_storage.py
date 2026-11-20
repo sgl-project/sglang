@@ -2097,7 +2097,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         """The admission lock must cover every window row a staged repair keeps,
         even when the FULL match ends inside a longer node: the reclaim the
         admission runs before the load may not strip those rows."""
-        from sglang.srt.managers.schedule_policy import PrefillAdder
+        from sglang.srt.managers.prefill_adder import PrefillAdder
         from sglang.srt.mem_cache.base_prefix_cache import InitLoadBackParams
 
         page_size = self.cfg.page_size

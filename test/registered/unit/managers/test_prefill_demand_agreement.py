@@ -11,10 +11,10 @@ import torch
 
 from sglang.srt.disaggregation.decode import DecodePreallocQueue
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
-from sglang.srt.managers.schedule_policy import (
+from sglang.srt.managers.prefill_adder import (
     PrefillAdder,
 )
+from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     DecLockRefResult,

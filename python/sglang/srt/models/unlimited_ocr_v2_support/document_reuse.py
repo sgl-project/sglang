@@ -40,8 +40,8 @@ if TYPE_CHECKING:
     from sglang.srt.layers.attention.unlimited_ocr_v2_backend import (
         UnlimitedOCRV2AttnBackend,
     )
+    from sglang.srt.managers.prefill_adder import PrefillAdder
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
-    from sglang.srt.managers.schedule_policy import PrefillAdder
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
 logger = logging.getLogger(__name__)
@@ -998,7 +998,7 @@ class DocReuse:
         return True
 
     def _admission_need(self, req) -> int:
-        from sglang.srt.managers.schedule_policy import CLIP_MAX_NEW_TOKENS
+        from sglang.srt.managers.prefill_adder import CLIP_MAX_NEW_TOKENS
 
         max_new = max(req.sampling_params.max_new_tokens - len(req.output_ids), 0)
         return (

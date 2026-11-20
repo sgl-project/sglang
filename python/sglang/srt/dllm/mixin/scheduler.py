@@ -6,9 +6,9 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Set
 
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.req import DllmReqPhase
+from sglang.srt.managers.prefill_adder import AddReqResult, PrefillAdder
 from sglang.srt.managers.req_types import FINISH_LENGTH
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
-from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     ListKind,

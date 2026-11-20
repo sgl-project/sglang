@@ -9,8 +9,8 @@ import torch
 
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
+from sglang.srt.managers.prefill_adder import AddReqResult, PrefillAdder
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
-from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.mem_cache.allocation import _alloc_extend_loc_with_kv_reuse
 from sglang.srt.mem_cache.prefill_budget import SWAPrefillBudget
 from sglang.srt.model_executor.forward_mode import ForwardMode
@@ -191,7 +191,7 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
         adder.can_run_list = []
         adder._state_slots_for_req = lambda req: 0
         adder._request_rows_for_req = lambda req: 0
-        adder._replay_len = lambda req, prefix_len: 0
+        adder.replay_len = lambda req, prefix_len: 0
         adder._update_prefill_budget = Mock()
         adder._account_prefill_cache_admission = Mock()
 

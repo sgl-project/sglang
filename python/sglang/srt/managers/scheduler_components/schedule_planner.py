@@ -7,10 +7,13 @@ from typing import TYPE_CHECKING, Callable, Iterable, List, Optional, Set
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.managers.prefill_adder import PrefillAdder
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.managers.schedule_policies.base import BaseRanker, FullMatch, NoMatch
-from sglang.srt.managers.schedule_policies.common import (
+from sglang.srt.managers.schedule_policies.base import (
     WAITING_QUEUE_PREFIX_MATCH_MAX,
+    BaseRanker,
+    FullMatch,
+    NoMatch,
     prefill_work,
 )
 from sglang.srt.managers.schedule_policies.dfs_weight import DfsWeightRanker
@@ -25,7 +28,6 @@ from sglang.srt.managers.schedule_policies.shortest_prefill import (
     ShortestPrefillFirstRanker,
 )
 from sglang.srt.managers.schedule_policies.uniboost import UniBoostRanker
-from sglang.srt.managers.schedule_policy import PrefillAdder
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     InsertParams,
@@ -134,9 +136,7 @@ class SchedulePlanner:
             )
         self._lpm = self.ranker if isinstance(self.ranker, LpmRanker) else None
         self.uniboost_gamma_ada: Optional[GammaAdaController] = (
-            self.ranker.uniboost_gamma_ada
-            if isinstance(self.ranker, UniBoostRanker)
-            else None
+            self.ranker.gamma_ada if isinstance(self.ranker, UniBoostRanker) else None
         )
         # What a ranker ranks as above its fcfs_fallback_queue_len.
         self._fcfs_fallback = FcfsRanker()
@@ -154,7 +154,7 @@ class SchedulePlanner:
     ) -> List[Req]:
         """The waiting requests in the order the policy admits them."""
         waiting_queue = list(waiting)
-        if self.bounded_lpm_engaged(len(waiting_queue)):
+        if self._lpm is not None and self._lpm.bounded_engaged(len(waiting_queue)):
             if (
                 self._lpm.refresh_bounded_members(waiting_queue)
                 and self.on_bounded_lpm_state_change is not None
@@ -220,10 +220,6 @@ class SchedulePlanner:
     def bounded_lpm_active(self) -> bool:
         """Whether admission is limited to bounded LPM's current batch."""
         return self._lpm is not None and self._lpm.bounded_active
-
-    def bounded_lpm_engaged(self, num_waiting: int) -> bool:
-        """Whether bounded LPM manages a pass over ``num_waiting`` requests."""
-        return self._lpm is not None and self._lpm.bounded_engaged(num_waiting)
 
     def retire_waiting_members(self, reqs: Iterable[Req]) -> None:
         if self._lpm is not None:
@@ -431,7 +427,7 @@ class SchedulePlanner:
             [req.cache_request_handle for req in waiting_queue]
         )
 
-    def shortest_prefill_chunk_limit(
+    def chunked_req_limit(
         self,
         chunked_req: Req,
         waiting_queue: List[Req],
@@ -456,7 +452,7 @@ class SchedulePlanner:
             # re-matches the prefix, but a longer page-aligned match adds at most
             # as many replay rows as it drops extend tokens, so this still fits.
             cached = len(req.origin_input_ids) + len(req.output_ids) - work
-            charge += PrefillAdder._replay_len(req, cached)
+            charge += PrefillAdder.replay_len(req, cached)
             if (
                 self.ranker.prefill_rank(req, work, processed_tokens) >= chunked_rank
                 or reserved + charge > budget - page_size

@@ -4,7 +4,10 @@ from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from sglang.srt.managers.lpm_opportunity import RECHECK_PASSES, competition_opportunity
+from sglang.srt.managers.schedule_policies.lpm_opportunity import (
+    RECHECK_PASSES,
+    competition_opportunity,
+)
 from sglang.srt.managers.scheduler_components.schedule_planner import SchedulePlanner
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.runtime_context import publish, reset_context
@@ -50,8 +53,8 @@ class TestOpportunity(unittest.TestCase):
             self.p.calc_priority(rs)
         self.assertTrue(self.p.bounded_lpm_active)
         self.assertEqual(len(self.p._lpm._bounded_members), 64)
-        self.assertEqual(self.p._lpm._lpm_gate_competition["risk_tokens"], 6144)
-        self.assertEqual(self.p._lpm._lpm_gate_competition["ratio"], 1.5)
+        self.assertEqual(self.p._lpm._gate_competition["risk_tokens"], 6144)
+        self.assertEqual(self.p._lpm._gate_competition["ratio"], 1.5)
 
     def test_risk_threshold_is_inclusive(self):
         rs = [req(i, False, size=4096) for i in range(3)]
@@ -64,7 +67,7 @@ class TestOpportunity(unittest.TestCase):
         rs = [req(i) for i in range(129)]
         self.cache.token_to_kv_pool_allocator.size = 1000000
         self.assertFalse(self.p._lpm._should_start_bounded_batch(rs))
-        self.assertEqual(self.p._lpm._lpm_gate_competition["risk_tokens"], 0)
+        self.assertEqual(self.p._lpm._gate_competition["risk_tokens"], 0)
 
     def test_namespaces_not_combined(self):
         rs = [req(i) for i in range(64)]
@@ -115,47 +118,47 @@ class TestOpportunity(unittest.TestCase):
         # Independent policy/cache state models two ranks sharing a TP queue.
         other_cache = RadixCache.create_simulated()
         other_cache.token_to_kv_pool_allocator = SimpleNamespace(size=32768)
-        policies = [self.p, SchedulePlanner("lpm", other_cache, False, False, False)]
-        queues = [[req(i, False) for i in range(150)] for _ in policies]
+        planners = [self.p, SchedulePlanner("lpm", other_cache, False, False, False)]
+        queues = [[req(i, False) for i in range(150)] for _ in planners]
         with ExitStack() as stack:
-            for policy in policies:
-                stack.enter_context(patch.object(policy, "_touch_waiting_prefixes"))
+            for planner in planners:
+                stack.enter_context(patch.object(planner, "_touch_waiting_prefixes"))
                 stack.enter_context(
-                    patch.object(policy, "_compute_prefix_matches", return_value=set())
+                    patch.object(planner, "_compute_prefix_matches", return_value=set())
                 )
             # Reject once, then present a qualifying queue during the cooldown.
             # The clocks straddle the former one-second retry deadline.
             for call in range(RECHECK_PASSES + 1):
                 if call == 1:
-                    queues = [[req(i) for i in range(150)] for _ in policies]
+                    queues = [[req(i) for i in range(150)] for _ in planners]
                     for queue in queues:
                         for i, request in enumerate(queue):
                             request.num_matched_prefix_tokens = i % 8
                 snapshots = []
-                for rank, (policy, queue) in enumerate(zip(policies, queues)):
+                for rank, (planner, queue) in enumerate(zip(planners, queues)):
                     clock = (0.0 if rank == 0 else 100.0) + call * (
                         0.001 if rank == 0 else 2.0
                     )
                     with patch("time.monotonic", return_value=clock):
-                        ordered = policy.calc_priority(queue)
+                        ordered = planner.calc_priority(queue)
                     snapshots.append(
                         (
-                            policy.bounded_lpm_active,
-                            [r.rid for r in policy._lpm._bounded_members],
+                            planner.bounded_lpm_active,
+                            [r.rid for r in planner._lpm._bounded_members],
                             [r.rid for r in ordered],
-                            [policy.allows_admission(r) for r in ordered],
+                            [planner.allows_admission(r) for r in ordered],
                         )
                     )
                 self.assertEqual(snapshots[0], snapshots[1], f"pass {call + 1}")
                 self.assertEqual(snapshots[0][0], call == RECHECK_PASSES)
-            self.assertEqual(len(policies[0]._lpm._bounded_members), 64)
+            self.assertEqual(len(planners[0]._lpm._bounded_members), 64)
             # Membership survives a short queue; departures are applied on both ranks.
-            for policy, queue in zip(policies, queues):
-                policy.retire_waiting_members(queue[:60])
-                policy.calc_priority(queue[60:])
-                self.assertEqual(policy._lpm._lpm_gate_calls, RECHECK_PASSES + 1)
+            for planner, queue in zip(planners, queues):
+                planner.retire_waiting_members(queue[:60])
+                planner.calc_priority(queue[60:])
+                self.assertEqual(planner._lpm._gate_calls, RECHECK_PASSES + 1)
                 self.assertEqual(
-                    {r.rid for r in policy._lpm._bounded_members},
+                    {r.rid for r in planner._lpm._bounded_members},
                     {str(i) for i in range(60, 64)},
                 )
 
@@ -167,7 +170,7 @@ class TestOpportunity(unittest.TestCase):
             self.p.calc_priority([req(i, False) for i in range(129)])
             for _ in range(RECHECK_PASSES):
                 self.p.calc_priority([req(i) for i in range(128)])
-            self.assertEqual(self.p._lpm._lpm_gate_calls, 1)
+            self.assertEqual(self.p._lpm._gate_calls, 1)
             qualifying = [req(i) for i in range(129)]
             for _ in range(RECHECK_PASSES - 1):
                 self.p.calc_priority(qualifying)

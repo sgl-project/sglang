@@ -4,8 +4,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, List, Optional, Set
 
-from sglang.srt.managers.schedule_policies.base import BaseRanker, FullMatch
-from sglang.srt.managers.schedule_policies.common import WAITING_QUEUE_PREFIX_MATCH_MAX
+from sglang.srt.managers.schedule_policies.base import (
+    WAITING_QUEUE_PREFIX_MATCH_MAX,
+    BaseRanker,
+    FullMatch,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req

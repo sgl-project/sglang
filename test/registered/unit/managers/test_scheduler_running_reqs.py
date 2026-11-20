@@ -18,9 +18,9 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.environ import envs
+from sglang.srt.managers.prefill_adder import AddReqResult, PrefillAdder
 from sglang.srt.managers.req_types import FINISH_LENGTH
 from sglang.srt.managers.schedule_batch import NextBatchPlan, Req, ScheduleBatch
-from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.invariant_checker import (
     SchedulerInvariantChecker,
@@ -475,7 +475,7 @@ class TestPriorityPreemptionUnderUnifiedMemory(CustomTestCase):
         s.schedule_low_priority_values_first = False
         s.metrics_reporter = SimpleNamespace(enable_metrics=False)
         s.dllm_config = None
-        Scheduler.init_schedule_policy(s)
+        Scheduler.init_schedule_planner(s)
         return s.enable_priority_preemption
 
     def test_off_with_unified_memory(self):

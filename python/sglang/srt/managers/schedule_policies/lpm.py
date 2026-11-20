@@ -4,8 +4,15 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Iterable, List, Optional, Set, Tuple
 
-from sglang.srt.managers.schedule_policies.base import BaseRanker, FullMatch
-from sglang.srt.managers.schedule_policies.common import WAITING_QUEUE_PREFIX_MATCH_MAX
+from sglang.srt.managers.schedule_policies.base import (
+    WAITING_QUEUE_PREFIX_MATCH_MAX,
+    BaseRanker,
+    FullMatch,
+)
+from sglang.srt.managers.schedule_policies.lpm_opportunity import (
+    RECHECK_PASSES,
+    competition_opportunity,
+)
 from sglang.srt.mem_cache.radix_cache import RadixCache
 
 if TYPE_CHECKING:
@@ -24,12 +31,12 @@ class LpmRanker(BaseRanker):
         self,
         tree_cache: BasePrefixCache,
         enable_hierarchical_cache: bool,
-        bounded_lpm_enabled: bool,
+        bounded_enabled: bool,
     ):
         self.tree_cache = tree_cache
         self.enable_hierarchical_cache = enable_hierarchical_cache
-        self._lpm_gate_calls = 0
-        self._bounded_lpm_enabled = bounded_lpm_enabled
+        self._gate_calls = 0
+        self._bounded_enabled = bounded_enabled
         self._bounded_active = False
         self._bounded_members: List[Req] = []
         self._bounded_next_members: List[Req] = []
@@ -59,7 +66,7 @@ class LpmRanker(BaseRanker):
 
     def bounded_engaged(self, num_waiting: int) -> bool:
         return self._bounded_active or (
-            num_waiting > WAITING_QUEUE_PREFIX_MATCH_MAX and self._bounded_lpm_enabled
+            num_waiting > WAITING_QUEUE_PREFIX_MATCH_MAX and self._bounded_enabled
         )
 
     def refresh_bounded_members(self, waiting_queue: List[Req]) -> bool:
@@ -88,18 +95,14 @@ class LpmRanker(BaseRanker):
         return self._bounded_active != was_active
 
     def _should_start_bounded_batch(self, waiting_queue: List[Req]) -> bool:
-        from sglang.srt.managers.lpm_opportunity import (
-            RECHECK_PASSES,
-            competition_opportunity,
-        )
         from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
         # Ranks sharing a queue execute the same eligible scheduling passes.
         # Wall-clock deadlines can disagree across TP ranks and split admission.
-        self._lpm_gate_calls += 1
-        if (self._lpm_gate_calls - 1) % RECHECK_PASSES:
+        self._gate_calls += 1
+        if (self._gate_calls - 1) % RECHECK_PASSES:
             return False
-        self._lpm_gate_competition = None
+        self._gate_competition = None
         cache = self.tree_cache
         # Fail closed for cache modes not represented in the observation study.
         if type(cache) not in (RadixCache, UnifiedRadixCache):
@@ -118,10 +121,10 @@ class LpmRanker(BaseRanker):
         if not isinstance(capacity, int) or capacity <= 0:
             return False
         candidates = waiting_queue[:BOUNDED_LPM_WINDOW_SIZE]
-        self._lpm_gate_competition = competition_opportunity(
+        self._gate_competition = competition_opportunity(
             candidates, capacity, include_pairs=False
         )
-        return self._lpm_gate_competition["allowed"]
+        return self._gate_competition["allowed"]
 
     def split_waiting(self, waiting_queue: List[Req]) -> Tuple[List[Req], List[Req]]:
         """The current batch, and the waiting requests outside it."""

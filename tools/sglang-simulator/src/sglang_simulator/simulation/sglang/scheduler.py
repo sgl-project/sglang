@@ -61,7 +61,7 @@ def block_on_l2_load(mode: SimulationMode, delay: float) -> float:
 
 class C_SglangPrefillAdderHook(BaseHook):
     HOOK_CLASS_NAME = "PrefillAdder"
-    HOOK_MODULE_NAME = "sglang.srt.managers.schedule_policy"
+    HOOK_MODULE_NAME = "sglang.srt.managers.prefill_adder"
 
     @classmethod
     def hook(cls, target):

@@ -7,6 +7,7 @@ import itertools
 import unittest
 from unittest.mock import patch
 
+from sglang.srt.managers.prefill_adder import PrefillAdder
 from sglang.srt.managers.req_types import FINISH_ABORT, FINISH_LENGTH
 from sglang.srt.managers.schedule_policies import uniboost_gamma_ada
 from sglang.srt.managers.schedule_policies.policy import SchedulePolicy
@@ -16,7 +17,6 @@ from sglang.srt.managers.schedule_policies.uniboost_gamma_ada import (
     GAMMA_ADA_REFIT_EVERY,
     GammaAdaController,
 )
-from sglang.srt.managers.schedule_policy import PrefillAdder
 from sglang.srt.managers.scheduler_components import schedule_planner
 from sglang.srt.managers.scheduler_components.schedule_planner import SchedulePlanner
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
@@ -77,7 +77,7 @@ class FakeTreeCache:
         return 0
 
 
-def make_policy(policy_name="uniboost", tree_cache=None, **kwargs):
+def make_planner(policy_name="uniboost", tree_cache=None, **kwargs):
     return SchedulePlanner(
         policy_name,
         tree_cache if tree_cache is not None else FakeTreeCache(),
@@ -88,8 +88,8 @@ def make_policy(policy_name="uniboost", tree_cache=None, **kwargs):
     )
 
 
-def sorted_rids(policy, queue):
-    return [r.rid for r in policy.calc_priority(queue)]
+def sorted_rids(planner, queue):
+    return [r.rid for r in planner.calc_priority(queue)]
 
 
 def finish(ctl, latencies, now=1000.0):
@@ -160,19 +160,19 @@ class TestGammaAdaController(CustomTestCase):
 class TestUniboostOrdering(UniboostTestBase):
     def test_short_job_jumps_ahead_at_same_arrival(self):
         q = [FakeReq("long", 20000), FakeReq("short", 100)]
-        self.assertEqual(sorted_rids(make_policy(), q), ["short", "long"])
+        self.assertEqual(sorted_rids(make_planner(), q), ["short", "long"])
 
     def test_equal_work_keeps_fcfs(self):
         q = [FakeReq("second", 5000, arrival=100.5), FakeReq("first", 5000)]
-        self.assertEqual(sorted_rids(make_policy(), q), ["first", "second"])
+        self.assertEqual(sorted_rids(make_planner(), q), ["first", "second"])
 
     def test_bounded_boost_cannot_starve_an_old_request(self):
         q = [FakeReq("new_short", 100), FakeReq("old_long", 20000, arrival=-900.0)]
-        self.assertEqual(sorted_rids(make_policy(), q), ["old_long", "new_short"])
+        self.assertEqual(sorted_rids(make_planner(), q), ["old_long", "new_short"])
 
     def test_cached_prefix_counts_as_no_work(self):
         q = [FakeReq("cold", 20000), FakeReq("hot", 20000, cached=19900)]
-        self.assertEqual(sorted_rids(make_policy(), q), ["hot", "cold"])
+        self.assertEqual(sorted_rids(make_planner(), q), ["hot", "cold"])
 
     def test_rank_invariant_arrival_ignores_wall_time(self):
         # Two ranks see the same requests with different local wall stamps.
@@ -182,42 +182,44 @@ class TestUniboostOrdering(UniboostTestBase):
                 FakeReq("a", 3000, arrival=wall_offset + 2.0, arrival_tokens=0),
             ]
 
-        policy = make_policy(uniboost_rank_invariant=True)
-        self.assertEqual(sorted_rids(policy, queue(0.0)), ["a", "b"])
-        self.assertEqual(sorted_rids(policy, queue(5.0)), ["a", "b"])
+        planner = make_planner(uniboost_rank_invariant=True)
+        self.assertEqual(sorted_rids(planner, queue(0.0)), ["a", "b"])
+        self.assertEqual(sorted_rids(planner, queue(5.0)), ["a", "b"])
         # The wall clock would admit "b" first.
-        self.assertEqual(sorted_rids(make_policy(), queue(0.0)), ["b", "a"])
+        self.assertEqual(sorted_rids(make_planner(), queue(0.0)), ["b", "a"])
 
 
 class TestUniboostConfig(UniboostTestBase):
     def test_disabled_tree_cache_keeps_uniboost(self):
-        self.assertEqual(make_policy().policy, SchedulePolicy.UNIBOOST)
-        self.assertEqual(make_policy("lpm").policy, SchedulePolicy.FCFS)
+        self.assertEqual(make_planner().policy, SchedulePolicy.UNIBOOST)
+        self.assertEqual(make_planner("lpm").policy, SchedulePolicy.FCFS)
 
     def test_invalid_config_is_rejected(self):
         for gamma in (0.0, float("inf"), 1e-320, 1e-310):
             with self.assertRaises(ValueError):
-                make_policy(uniboost_gamma=gamma)
+                make_planner(uniboost_gamma=gamma)
         with self.assertRaises(ValueError):
-            make_policy("fcfs", enable_uniboost_gamma_ada=True)
+            make_planner("fcfs", enable_uniboost_gamma_ada=True)
 
     def test_gamma_ada_clock_follows_rank_invariance(self):
         def clock():
             return 0
 
-        policy = make_policy(enable_uniboost_gamma_ada=True, uniboost_step_clock=clock)
-        self.assertIsNone(policy.uniboost_gamma_ada.step_clock)
-        policy = make_policy(
+        planner = make_planner(
+            enable_uniboost_gamma_ada=True, uniboost_step_clock=clock
+        )
+        self.assertIsNone(planner.uniboost_gamma_ada.step_clock)
+        planner = make_planner(
             enable_uniboost_gamma_ada=True,
             uniboost_rank_invariant=True,
             uniboost_step_clock=clock,
         )
-        self.assertIs(policy.uniboost_gamma_ada.step_clock, clock)
-        self.assertIsNone(make_policy().uniboost_gamma_ada)
+        self.assertIs(planner.uniboost_gamma_ada.step_clock, clock)
+        self.assertIsNone(make_planner().uniboost_gamma_ada)
 
 
 class TestUniboostMatching(UniboostTestBase):
-    def run_pass(self, policy, queue):
+    def run_pass(self, planner, queue):
         matched = []
 
         def fake_match(req, tree_cache, token_ids=None):
@@ -225,34 +227,34 @@ class TestUniboostMatching(UniboostTestBase):
             req.last_node = object()
 
         with patch.object(schedule_planner, "match_kv_cache", side_effect=fake_match):
-            queue[:] = policy.calc_priority(queue)
+            queue[:] = planner.calc_priority(queue)
         return matched
 
     def test_short_queue_is_matched_every_pass(self):
-        policy = make_policy(tree_cache=FakeTreeCache(disable=False))
+        planner = make_planner(tree_cache=FakeTreeCache(disable=False))
         queue = [FakeReq(f"r{i}", 1000, arrival=100.0 + i) for i in range(8)]
-        self.assertEqual(len(self.run_pass(policy, queue)), 8)
-        self.assertEqual(len(self.run_pass(policy, queue)), 8)
+        self.assertEqual(len(self.run_pass(planner, queue)), 8)
+        self.assertEqual(len(self.run_pass(planner, queue)), 8)
 
     def test_deep_queue_matches_each_request_once_then_the_window(self):
-        policy = make_policy(tree_cache=FakeTreeCache(disable=False))
+        planner = make_planner(tree_cache=FakeTreeCache(disable=False))
         n = UNIBOOST_MATCH_WINDOW_SIZE + 30
         queue = [FakeReq(f"r{i}", 1000, arrival=100.0 + i) for i in range(n)]
-        first = self.run_pass(policy, queue)
+        first = self.run_pass(planner, queue)
         self.assertEqual(set(first), {r.rid for r in queue})
-        second = self.run_pass(policy, queue)
+        second = self.run_pass(planner, queue)
         window = {r.rid for r in queue[:UNIBOOST_MATCH_WINDOW_SIZE]}
         self.assertEqual(
             (len(second), set(second)), (UNIBOOST_MATCH_WINDOW_SIZE, window)
         )
         # A retraction clears last_node, so the next pass matches it again.
         queue[-1].last_node = None
-        self.assertIn(queue[-1].rid, self.run_pass(policy, queue))
+        self.assertIn(queue[-1].rid, self.run_pass(planner, queue))
 
     def test_shared_uncached_prefix_runs_once_led_by_its_best_member(self):
         # "long" and "short" share an uncached prefix: "short" leads it, and
         # "long" waits at the end of the whole queue until the prefix is cached.
-        policy = make_policy(tree_cache=FakeTreeCache(disable=False))
+        planner = make_planner(tree_cache=FakeTreeCache(disable=False))
         others = [
             FakeReq(f"r{i}", 1000, arrival=101.0 + i)
             for i in range(UNIBOOST_MATCH_WINDOW_SIZE)
@@ -261,29 +263,29 @@ class TestUniboostMatching(UniboostTestBase):
             FakeReq("long", 20000, shared_prefix=True),
             FakeReq("short", 1050, shared_prefix=True),
         ] + others
-        self.run_pass(policy, queue)
+        self.run_pass(planner, queue)
         self.assertEqual(queue[0].rid, "short")
         self.assertEqual(queue[-1].rid, "long")
 
     def test_disabled_tree_cache_never_matches(self):
-        policy = make_policy()
+        planner = make_planner()
         queue = [FakeReq(f"r{i}", 1000) for i in range(UNIBOOST_MATCH_WINDOW_SIZE + 5)]
-        self.assertEqual(self.run_pass(policy, queue), [])
+        self.assertEqual(self.run_pass(planner, queue), [])
 
 
 class TestUniboostChunkLimit(UniboostTestBase):
-    def chunk_limit(self, policy, waiting_queue):
+    def chunk_limit(self, planner, waiting_queue):
         chunked = FakeReq("chunked", 0)
         chunked.full_untruncated_fill_ids = list(range(30000))
         chunked.prefix_len = 0
-        with patch.object(PrefillAdder, "_replay_len", return_value=0):
-            return policy.shortest_prefill_chunk_limit(
+        with patch.object(PrefillAdder, "replay_len", return_value=0):
+            return planner.chunked_req_limit(
                 chunked, waiting_queue, 8192, 16, processed_tokens=0
             )
 
     def test_reserves_budget_for_requests_ranked_ahead(self):
         self.assertEqual(
-            self.chunk_limit(make_policy(), [FakeReq("short", 1000)]), 8192 - 1008
+            self.chunk_limit(make_planner(), [FakeReq("short", 1000)]), 8192 - 1008
         )
 
 

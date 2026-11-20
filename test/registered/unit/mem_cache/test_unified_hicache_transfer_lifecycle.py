@@ -30,8 +30,8 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.managers.prefill_adder import AddReqResult, PrefillAdder
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
-from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     EvictParams,

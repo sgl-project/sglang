@@ -52,7 +52,7 @@ class TestSchedulePolicyHRRN(CustomTestCase):
 
         waiting_queue = [r_long, r_aged, r_short]
 
-        policy = SchedulePlanner(
+        planner = SchedulePlanner(
             policy="hrrn",
             tree_cache=tree_cache,
             enable_hierarchical_cache=True,
@@ -62,7 +62,7 @@ class TestSchedulePolicyHRRN(CustomTestCase):
         # processed_tokens=1000 -> waited_tokens is 1000 for every req here.
         # Ratios: short = 1000/1 = 1000; aged = 1000/3 ~= 333; long = 1000/10 = 100.
         # Highest ratio first -> short, aged, long.
-        waiting_queue = policy.calc_priority(waiting_queue, processed_tokens=1000)
+        waiting_queue = planner.calc_priority(waiting_queue, processed_tokens=1000)
 
         self.assertEqual(waiting_queue[0].rid, "short")
         self.assertEqual(waiting_queue[1].rid, "aged")
@@ -83,7 +83,7 @@ class TestSchedulePolicyHRRN(CustomTestCase):
 
         waiting_queue = [r_short_new, r_long_old]
 
-        policy = SchedulePlanner(
+        planner = SchedulePlanner(
             policy="hrrn",
             tree_cache=tree_cache,
             enable_hierarchical_cache=True,
@@ -93,7 +93,7 @@ class TestSchedulePolicyHRRN(CustomTestCase):
         # processed_tokens=100000 -> long_old.waited = 100000, ratio = 100000/100 = 1000.
         #                            short_new.waited = 0, ratio = 0.
         # long_old should now be first.
-        waiting_queue = policy.calc_priority(waiting_queue, processed_tokens=100000)
+        waiting_queue = planner.calc_priority(waiting_queue, processed_tokens=100000)
 
         self.assertEqual(waiting_queue[0].rid, "long_old")
         self.assertEqual(waiting_queue[1].rid, "short_new")
@@ -134,7 +134,7 @@ class TestShortestPrefillFirst(CustomTestCase):
         override = get_context().override_server_args()
         override.install()
         self.addCleanup(override.restore)
-        self.policy = SchedulePlanner(
+        self.planner = SchedulePlanner(
             policy="shortest-prefill-first",
             tree_cache=RadixCache.create_simulated(),
             enable_hierarchical_cache=True,
@@ -155,15 +155,15 @@ class TestShortestPrefillFirst(CustomTestCase):
         short = self.make_req("short", 32)
         long = self.make_req("long", 1024)
         queue = [long, short, cached]
-        with patch.object(self.policy, "_compute_prefix_matches", return_value=set()):
-            queue = self.policy.calc_priority(queue)
+        with patch.object(self.planner, "_compute_prefix_matches", return_value=set()):
+            queue = self.planner.calc_priority(queue)
         self.assertEqual([req.rid for req in queue], ["cached", "short", "long"])
 
     def test_equal_work_uses_arrival_time(self):
         older = self.make_req("z", 32, arrived=1)
         newer = self.make_req("a", 32, arrived=2)
         queue = [newer, older]
-        self.policy.ranker.sort(queue, set(), processed_tokens=0)
+        self.planner.ranker.sort(queue, set(), processed_tokens=0)
         self.assertEqual(queue, [older, newer])
 
     def test_duplicate_prefix_is_deprioritized(self):
@@ -171,9 +171,9 @@ class TestShortestPrefillFirst(CustomTestCase):
         other = self.make_req("other", 1024)
         queue = [duplicate, other]
         with patch.object(
-            self.policy, "_compute_prefix_matches", return_value={duplicate.rid}
+            self.planner, "_compute_prefix_matches", return_value={duplicate.rid}
         ):
-            queue = self.policy.calc_priority(queue)
+            queue = self.planner.calc_priority(queue)
         self.assertEqual(queue, [other, duplicate])
 
     def test_shared_prefix_holds_the_longer_request_not_the_shorter(self):
@@ -185,7 +185,7 @@ class TestShortestPrefillFirst(CustomTestCase):
         for arrived, req in enumerate([long, other, short]):
             req.full_untruncated_fill_ids = req.origin_input_ids[:]
             req.time_stats.wait_queue_entry_time = arrived
-        queue = self.policy.calc_priority([long, other, short])
+        queue = self.planner.calc_priority([long, other, short])
         self.assertEqual([req.rid for req in queue], ["short", "other", "long"])
 
     def test_retracted_output_is_part_of_uncached_work(self):
@@ -193,14 +193,14 @@ class TestShortestPrefillFirst(CustomTestCase):
         replay.output_ids.extend([0] * 64)
         short = self.make_req("short", 32)
         queue = [replay, short]
-        self.policy.ranker.sort(queue, set(), processed_tokens=0)
+        self.planner.ranker.sort(queue, set(), processed_tokens=0)
         self.assertEqual(queue, [short, replay])
 
     def test_chunk_limit_reserves_complete_short_prefills(self):
         continuation = self.make_req("continuation", 16384)
         waiting = [self.make_req("a", 512), self.make_req("b", 1024)]
         self.assertEqual(
-            self.policy.shortest_prefill_chunk_limit(
+            self.planner.chunked_req_limit(
                 continuation, waiting, 4096, 256, processed_tokens=0
             ),
             2560,
@@ -209,7 +209,7 @@ class TestShortestPrefillFirst(CustomTestCase):
     def test_reservation_rounds_to_pages_and_keeps_continuation_progress(self):
         continuation = self.make_req("continuation", 16384)
         self.assertEqual(
-            self.policy.shortest_prefill_chunk_limit(
+            self.planner.chunked_req_limit(
                 continuation,
                 [self.make_req("short", 257)],
                 4096,
@@ -219,7 +219,7 @@ class TestShortestPrefillFirst(CustomTestCase):
             3584,
         )
         self.assertEqual(
-            self.policy.shortest_prefill_chunk_limit(
+            self.planner.chunked_req_limit(
                 continuation,
                 [self.make_req("short", 3840)],
                 4096,
@@ -239,15 +239,15 @@ class TestShortestPrefillFirst(CustomTestCase):
         ]:
             with self.subTest(budget=budget, waiting=[req.rid for req in waiting]):
                 self.assertIsNone(
-                    self.policy.shortest_prefill_chunk_limit(
+                    self.planner.chunked_req_limit(
                         continuation, waiting, budget, 256, processed_tokens=0
                     )
                 )
 
     def test_other_policy_keeps_normal_chunk_limit(self):
-        self.policy.ranker = HrrnRanker()
+        self.planner.ranker = HrrnRanker()
         self.assertIsNone(
-            self.policy.shortest_prefill_chunk_limit(
+            self.planner.chunked_req_limit(
                 self.make_req("continuation", 8192),
                 [self.make_req("short", 512)],
                 4096,
@@ -260,7 +260,7 @@ class TestShortestPrefillFirst(CustomTestCase):
         # A buffer-mode storage hit stays outside the tree until admission.
         staged = self.make_req("staged", 4096, cached=512)
         short = self.make_req("short", 1024)
-        tree_cache = self.policy.tree_cache
+        tree_cache = self.planner.tree_cache
         staged_end = {staged.cache_request_handle: 4600}
         with (
             patch.object(
@@ -274,11 +274,11 @@ class TestShortestPrefillFirst(CustomTestCase):
             ),
         ):
             queue = [short, staged]
-            self.policy.poll_storage_prefetches(queue)
-            self.policy.ranker.sort(queue, set(), processed_tokens=0)
+            self.planner.poll_storage_prefetches(queue)
+            self.planner.ranker.sort(queue, set(), processed_tokens=0)
             self.assertEqual(queue, [staged, short])
             self.assertEqual(
-                self.policy.shortest_prefill_chunk_limit(
+                self.planner.chunked_req_limit(
                     self.make_req("continuation", 16384),
                     [staged],
                     4096,
@@ -290,16 +290,16 @@ class TestShortestPrefillFirst(CustomTestCase):
             # Neither a stop policy that polling would cut short nor another
             # schedule policy polls.
             can_poll.return_value = False
-            self.policy.poll_storage_prefetches(queue)
+            self.planner.poll_storage_prefetches(queue)
             can_poll.return_value = True
-            self.policy.ranker = FcfsRanker()
-            self.policy.poll_storage_prefetches(queue)
+            self.planner.ranker = FcfsRanker()
+            self.planner.poll_storage_prefetches(queue)
         poll.assert_called_once_with(
             [short.cache_request_handle, staged.cache_request_handle]
         )
 
     def test_aging_promotes_waiting_long_requests(self):
-        policy = SchedulePlanner(
+        planner = SchedulePlanner(
             policy="shortest-prefill-first",
             tree_cache=RadixCache.create_simulated(),
             enable_hierarchical_cache=True,
@@ -312,14 +312,14 @@ class TestShortestPrefillFirst(CustomTestCase):
         new_short.arrival_processed_tokens = 3000
         queue = [new_short, old_long]
         # Rank = uncached work - 0.5 * prefill tokens processed while waiting.
-        policy.ranker.sort(queue, set(), processed_tokens=1000)
+        planner.ranker.sort(queue, set(), processed_tokens=1000)
         self.assertEqual(queue, [new_short, old_long])
-        policy.ranker.sort(queue, set(), processed_tokens=3000)
+        planner.ranker.sort(queue, set(), processed_tokens=3000)
         self.assertEqual(queue, [old_long, new_short])
 
         continuation = self.make_req("continuation", 16384)
         self.assertEqual(
-            policy.shortest_prefill_chunk_limit(
+            planner.chunked_req_limit(
                 continuation, [new_short], 4096, 256, processed_tokens=3000
             ),
             3840,
@@ -327,7 +327,7 @@ class TestShortestPrefillFirst(CustomTestCase):
         fresh_short = self.make_req("fresh_short", 10)
         fresh_short.arrival_processed_tokens = 40000
         self.assertIsNone(
-            policy.shortest_prefill_chunk_limit(
+            planner.chunked_req_limit(
                 continuation, [fresh_short], 4096, 256, processed_tokens=40000
             )
         )

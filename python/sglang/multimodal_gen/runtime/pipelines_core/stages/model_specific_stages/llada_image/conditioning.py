@@ -228,9 +228,9 @@ class LLaDAImageTextEncoderRunner:
         self, prompts: list[str], max_sequence_length: int, component_context
     ):
         from sglang.srt.managers.overlap_utils import resolve_forward_inputs
+        from sglang.srt.managers.prefill_adder import AddReqResult, PrefillAdder
         from sglang.srt.managers.schedule_batch import Req as SRTReq
         from sglang.srt.managers.schedule_batch import ScheduleBatch
-        from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
         from sglang.srt.mem_cache.common import release_kv_cache
         from sglang.srt.model_executor.forward_batch_info import ForwardBatch
         from sglang.srt.model_executor.forward_mode import ForwardMode

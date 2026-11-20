@@ -24,25 +24,25 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestSchedulePolicyWaitingQueueMatching(unittest.TestCase):
-    def make_lpm_policy(self, supports_fast_match_prefix):
-        schedule_policy = object.__new__(SchedulePlanner)
-        schedule_policy.ranker = schedule_policy._lpm = LpmRanker(None, False, True)
-        schedule_policy._fcfs_fallback = FcfsRanker()
-        schedule_policy.tree_cache = SimpleNamespace(
+    def make_lpm_planner(self, supports_fast_match_prefix):
+        planner = object.__new__(SchedulePlanner)
+        planner.ranker = planner._lpm = LpmRanker(None, False, True)
+        planner._fcfs_fallback = FcfsRanker()
+        planner.tree_cache = SimpleNamespace(
             supports_fast_match_prefix=lambda: supports_fast_match_prefix
         )
-        return schedule_policy
+        return planner
 
     def test_lpm_queue_limit_respects_fast_matching_capability(self):
-        policy = self.make_lpm_policy(False)
-        self.assertTrue(policy.waiting_queue_prefix_matched([None] * 128))
-        self.assertFalse(policy.waiting_queue_prefix_matched([None] * 129))
+        planner = self.make_lpm_planner(False)
+        self.assertTrue(planner.waiting_queue_prefix_matched([None] * 128))
+        self.assertFalse(planner.waiting_queue_prefix_matched([None] * 129))
 
-        policy.tree_cache = SimpleNamespace(supports_fast_match_prefix=lambda: True)
-        self.assertTrue(policy.waiting_queue_prefix_matched([None] * 129))
+        planner.tree_cache = SimpleNamespace(supports_fast_match_prefix=lambda: True)
+        self.assertTrue(planner.waiting_queue_prefix_matched([None] * 129))
 
-        policy._lpm._bounded_active = True
-        self.assertFalse(policy.waiting_queue_prefix_matched([None] * 129))
+        planner._lpm._bounded_active = True
+        self.assertFalse(planner.waiting_queue_prefix_matched([None] * 129))
 
 
 class TestSchedulerLoadInquirer(unittest.TestCase):

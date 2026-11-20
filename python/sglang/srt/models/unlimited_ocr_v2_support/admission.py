@@ -1,6 +1,6 @@
 """prefill admission for retained Unlimited-OCR v2 document windows"""
 
-from sglang.srt.managers.schedule_policy import PrefillAdder
+from sglang.srt.managers.prefill_adder import PrefillAdder
 
 
 class UocrPrefillAdder(PrefillAdder):

@@ -232,6 +232,11 @@ from sglang.srt.managers.overlap_utils import (
     decide_needs_cpu_seq_lens,
     resolve_forward_inputs,
 )
+from sglang.srt.managers.prefill_adder import (
+    AddReqResult,
+    PrefillAdder,
+    mamba_prefill_chunk_grid,
+)
 from sglang.srt.managers.prefill_delayer import (
     PrefillDelayer,
     PrefillDelayerSinglePassExecutor,
@@ -247,11 +252,6 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
     retract_all,
-)
-from sglang.srt.managers.schedule_policy import (
-    AddReqResult,
-    PrefillAdder,
-    mamba_prefill_chunk_grid,
 )
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
@@ -725,8 +725,8 @@ class Scheduler(
         # frontend starts.
         self.init_kv_events_publisher()
 
-        # Init schedule policy and new token estimation
-        self.init_schedule_policy()
+        # Init the schedule planner and new token estimation
+        self.init_schedule_planner()
 
         # Init watchdog, memory saver, input blocker and recv skipper
         self.init_watch_dog_memory_saver_input_blocker()
@@ -1538,8 +1538,8 @@ class Scheduler(
             metrics_collector=self.metrics_collector,
         )
 
-    def init_schedule_policy(self):
-        # Init schedule policy and new token estimation
+    def init_schedule_planner(self):
+        # Init the schedule planner and new token estimation
         self.schedule_planner = SchedulePlanner(
             self.schedule_policy,
             self.tree_cache,
@@ -4685,14 +4685,12 @@ class Scheduler(
         resumed_req = self.chunked_req
         if resumed_req is not None:
             resumed_req.init_next_round_input()
-            adder.chunked_req_limit = (
-                self.schedule_planner.shortest_prefill_chunk_limit(
-                    resumed_req,
-                    self.waiting_queue,
-                    adder.rem_chunk_tokens or 0,
-                    self.page_size,
-                    processed_tokens=self.processed_tokens_counter,
-                )
+            adder.chunked_req_limit = self.schedule_planner.chunked_req_limit(
+                resumed_req,
+                self.waiting_queue,
+                adder.rem_chunk_tokens or 0,
+                self.page_size,
+                processed_tokens=self.processed_tokens_counter,
             )
             if adder.add_chunked_req(resumed_req) is None:
                 # Its last chunk is in this batch.

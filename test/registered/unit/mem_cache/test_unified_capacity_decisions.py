@@ -14,7 +14,7 @@ from test_prefill_memory_budget import (
 )
 
 from sglang.srt.environ import InvariantCheckLevel, envs
-from sglang.srt.managers.schedule_policy import PrefillAdder
+from sglang.srt.managers.prefill_adder import PrefillAdder
 from sglang.srt.mem_cache.allocation_sizing import add_spec_decode_headroom_pages
 from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,

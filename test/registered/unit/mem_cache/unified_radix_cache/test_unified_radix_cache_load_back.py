@@ -5,10 +5,10 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.managers.prefill_adder import PrefillAdder
 from sglang.srt.managers.schedule_batch import (
     Req,
 )
-from sglang.srt.managers.schedule_policy import PrefillAdder
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     InitLoadBackParams,

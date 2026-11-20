@@ -465,7 +465,7 @@ class TestCachedStateHitMakesProgress(unittest.TestCase):
             self.assertIs(UnifiedRadixCache.transfers_in_flight(cache), not idle)
 
     def test_an_unschedulable_refusal_reaches_the_scheduler(self):
-        from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
+        from sglang.srt.managers.prefill_adder import AddReqResult, PrefillAdder
 
         for unschedulable, result in (
             (True, AddReqResult.UNSCHEDULABLE),

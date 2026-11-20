@@ -6,8 +6,11 @@ import logging
 from functools import partial
 from typing import TYPE_CHECKING, List, Optional, Set
 
-from sglang.srt.managers.schedule_policies.base import BaseRanker, FullMatch
-from sglang.srt.managers.schedule_policies.common import prefill_work
+from sglang.srt.managers.schedule_policies.base import (
+    BaseRanker,
+    FullMatch,
+    prefill_work,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -19,12 +22,10 @@ logger = logging.getLogger(__name__)
 class ShortestPrefillFirstRanker(BaseRanker):
     ranks_by_prefill_work = True
 
-    def __init__(
-        self, tree_cache: BasePrefixCache, shortest_prefill_aging_factor: float
-    ):
+    def __init__(self, tree_cache: BasePrefixCache, aging_factor: float):
         self.tree_cache = tree_cache
-        self.shortest_prefill_aging_factor = shortest_prefill_aging_factor
-        self._shortest_prefill_calls = 0
+        self.aging_factor = aging_factor
+        self._sort_calls = 0
         # The first of a shared-prefix group runs: make it the shortest, or a
         # short request waits behind a long one that SPF defers.
         self.match_plan = FullMatch(leader_key=partial(prefill_work, tree_cache))
@@ -33,7 +34,7 @@ class ShortestPrefillFirstRanker(BaseRanker):
         # Aging lowers the rank by the prefill work done while the request
         # waited, bounding its wait to about work / factor processed tokens.
         waited_tokens = max(0, processed_tokens - r.arrival_processed_tokens)
-        return work - self.shortest_prefill_aging_factor * waited_tokens
+        return work - self.aging_factor * waited_tokens
 
     def sort(
         self,
@@ -53,8 +54,8 @@ class ShortestPrefillFirstRanker(BaseRanker):
                 r.time_stats.wait_queue_entry_time,
             )
         )
-        self._shortest_prefill_calls += 1
-        if waiting_queue and self._shortest_prefill_calls % 128 == 1:
+        self._sort_calls += 1
+        if waiting_queue and self._sort_calls % 128 == 1:
             logger.info(
                 "Experimental shortest-prefill-first: queue=%d shortest_uncached=%d",
                 len(waiting_queue),

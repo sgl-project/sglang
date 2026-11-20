@@ -11,8 +11,8 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.managers.prefill_adder import AddReqResult, PrefillAdder
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
@@ -90,7 +90,7 @@ class TestHeldRowAdmission(CustomTestCase):
             calc_priority=lambda waiting, *args, **kwargs: list(waiting),
             admission_candidates=lambda waiting: iter(waiting),
         )
-        s.schedule_planner.shortest_prefill_chunk_limit.return_value = None
+        s.schedule_planner.chunked_req_limit.return_value = None
         s.processed_tokens_counter = 0
         s.chunked_prefill_size = 8192
         s.dynamic_chunk_sizer = None
@@ -220,9 +220,7 @@ class TestBoundedV2SkippedAdmission(TestHeldRowAdmission):
                 )
                 s.schedule_planner._compute_prefix_matches = Mock(return_value=set())
                 s.schedule_planner._touch_waiting_prefixes = Mock()
-                s.schedule_planner.shortest_prefill_chunk_limit = Mock(
-                    return_value=None
-                )
+                s.schedule_planner.chunked_req_limit = Mock(return_value=None)
                 if reason == "lora":
                     s.enable_lora = True
                     s.lora_drainer = None

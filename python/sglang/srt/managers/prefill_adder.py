@@ -602,7 +602,7 @@ class PrefillAdder:
             self.reprocessed_log_input_tokens += raw_extend_input_len
 
     @staticmethod
-    def _replay_len(req: Req, prefix_len: int) -> int:
+    def replay_len(req: Req, prefix_len: int) -> int:
         if (
             get_exec().features.enable_encoder_swa_bounded_replay
             and encoder_swa_replay.resets_swa_window(req)
@@ -742,7 +742,7 @@ class PrefillAdder:
             req.retracted_stain,
             state_slots=self._state_slots_for_req(req),
             request_rows=self._request_rows_for_req(req),
-            replay_len=self._replay_len(req, prefix_len),
+            replay_len=self.replay_len(req, prefix_len),
         )
         self._account_prefill_cache_admission(req, prefix_len)
 
@@ -1369,7 +1369,7 @@ class PrefillAdder:
                         extend_len,
                         max_new_tokens,
                         is_chunked,
-                        self._replay_len(req, prefix_len),
+                        self.replay_len(req, prefix_len),
                         admission.chunk_limit,
                     )
                 elif req.host_loaded_length < promised_host_hit:
@@ -1443,7 +1443,7 @@ class PrefillAdder:
         # exact-chunk-fill, so a request whose ceiled length would spill is
         # not needlessly split into a second chunk.
         chunk_fit_tokens = extend_len if self.exact_chunk_fill else input_tokens
-        replay_len = self._replay_len(req, prefix_len)
+        replay_len = self.replay_len(req, prefix_len)
         chunk_limit = self.rem_chunk_tokens
         if chunk_limit is not None and replay_len:
             # The replay rows share the chunk with the extend.

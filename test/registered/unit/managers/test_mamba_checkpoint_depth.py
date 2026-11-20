@@ -14,14 +14,14 @@ from array import array
 from types import SimpleNamespace
 from unittest.mock import MagicMock, create_autospec, patch
 
+from sglang.srt.managers.prefill_adder import (
+    PrefillAdder,
+    mamba_prefill_chunk_grid,
+)
 from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
     _MambaRadixCacheV2TrackEntry,
-)
-from sglang.srt.managers.schedule_policy import (
-    PrefillAdder,
-    mamba_prefill_chunk_grid,
 )
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.runtime_context import get_context, mamba_track_grid
@@ -286,9 +286,9 @@ class TestChunkedPrefillStaysOnTheChunkGrid(unittest.TestCase):
         override = get_context().override_server_args()
         override.install()
         self.addCleanup(override.restore)
-        policy = object.__new__(SchedulePlanner)
-        policy.tree_cache = SimpleNamespace(staged_storage_prefix_end=lambda handle: 0)
-        policy.ranker = ShortestPrefillFirstRanker(policy.tree_cache, 0.0)
+        planner = object.__new__(SchedulePlanner)
+        planner.tree_cache = SimpleNamespace(staged_storage_prefix_end=lambda handle: 0)
+        planner.ranker = ShortestPrefillFirstRanker(planner.tree_cache, 0.0)
         adder = self._adder(strict=True)
         prompt, prefix, chunks = 4096, 0, []
         while prefix < prompt:
@@ -304,7 +304,7 @@ class TestChunkedPrefillStaysOnTheChunkGrid(unittest.TestCase):
                 cache_request_handle=None,
                 arrival_processed_tokens=0,
             )
-            limit = policy.shortest_prefill_chunk_limit(
+            limit = planner.chunked_req_limit(
                 chunked, [arrival], 64, 16, processed_tokens=0
             )
             self.assertEqual(limit, 32)

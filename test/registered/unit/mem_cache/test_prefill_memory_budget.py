@@ -12,8 +12,8 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.managers.prefill_adder import AddReqResult, PrefillAdder
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache import prefill_budget
 from sglang.srt.mem_cache.allocator.hisparse import (
