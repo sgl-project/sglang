@@ -37,7 +37,6 @@ from sglang.srt.model_executor.runner_backend.base_graph_backend import (
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import empty_context, get_bool_env_var, get_compiler_backend
-from sglang.srt.utils.nvtx_utils import profile_range
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
@@ -589,17 +588,13 @@ class NPUCudaGraphBackend(BaseGraphBackend):
         graph = self._graphs[shape_key]
 
         if self._rebind_fence is not None:
-            with profile_range("npu.graph_update.wait_fence"):
-                self._rebind_fence.synchronize()
+            self._rebind_fence.synchronize()
 
-        with profile_range("npu.graph_update.enqueue"):
-            update_future = self._update_executor.submit(
-                graph.update, cpu_update_input=cpu_update_input
-            )
-        with profile_range("npu.graph_replay.submit"):
-            graph.replay()
-        with profile_range("npu.graph_update.wait_future"):
-            update_future.result()
+        update_future = self._update_executor.submit(
+            graph.update, cpu_update_input=cpu_update_input
+        )
+        graph.replay()
+        update_future.result()
 
         fence = self._device_module.Event()
         fence.record()
