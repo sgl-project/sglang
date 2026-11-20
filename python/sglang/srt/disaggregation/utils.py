@@ -609,6 +609,25 @@ def poll_and_all_reduce_with_staging(
 #########################
 
 
+def decode_metadata_buffer_size(
+    *, max_running_requests: int, prealloc_slots: int, rows_per_request: int
+) -> int:
+    """Rows of a PD decode's metadata buffers. A request holds one from its
+    preallocation until its KV has landed, so the rows cap the transfers in flight;
+    every preallocation slot (--disaggregation-decode-extra-slots) gets one."""
+    stock_rows = max_running_requests * rows_per_request
+    if prealloc_slots <= stock_rows:
+        return stock_rows
+    logger.info(
+        "PD decode metadata rows %d: one per preallocation slot "
+        "(--disaggregation-decode-extra-slots), above %d per running request x %d",
+        prealloc_slots,
+        rows_per_request,
+        max_running_requests,
+    )
+    return prealloc_slots
+
+
 class ReqToMetadataIdxAllocator:
     """A memory pool that maps a request to its first output token location."""
 

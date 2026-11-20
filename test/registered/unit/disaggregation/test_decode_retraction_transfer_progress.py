@@ -99,19 +99,24 @@ class _Receiver:
 
 
 class _DecodeNode:
-    """A single-rank PD decode scheduler: real queues, pools, batches and retraction."""
+    """A single-rank PD decode scheduler: real queues, pools, batches and retraction.
+    `rows` running requests, `extra_slots` request rows for transfers and
+    `metadata_rows` metadata rows."""
 
-    def __init__(self, pool_size):
+    def __init__(
+        self, pool_size, *, rows=ROWS, extra_slots=ROWS, metadata_rows=4 * ROWS
+    ):
         self.pool_size = pool_size
+        self.rows = rows
         self.step_count = 0
         self.retractions = []
         self.next_room = 1000
         self.req_to_token_pool = DecodeReqToTokenPool(
-            size=ROWS,
+            size=rows,
             max_context_len=pool_size,
             device="cpu",
             enable_memory_saver=False,
-            pre_alloc_size=ROWS,
+            pre_alloc_size=extra_slots,
         )
         kv_pool = MHATokenToKVPool(
             size=pool_size,
@@ -150,13 +155,13 @@ class _DecodeNode:
             )
         )
         self.metadata_buffers = MetadataBuffers(
-            size=4 * ROWS,
+            size=metadata_rows,
             hidden_size=2,
             hidden_states_dtype=torch.float32,
             max_sampling_mask_tokens=0,
         )
         self.scheduler = self._build_scheduler()
-        meta_alloc = ReqToMetadataIdxAllocator(4 * ROWS)
+        meta_alloc = ReqToMetadataIdxAllocator(metadata_rows)
         self.scheduler.disagg_decode_transfer_queue = self._build_transfer_queue(
             meta_alloc
         )
@@ -184,7 +189,7 @@ class _DecodeNode:
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.allocator,
             spec_algorithm=SpeculativeAlgorithm.NONE,
-            max_running_requests=ROWS,
+            max_running_requests=self.rows,
             model_config=SimpleNamespace(
                 context_len=self.pool_size,
                 vocab_size=16,
