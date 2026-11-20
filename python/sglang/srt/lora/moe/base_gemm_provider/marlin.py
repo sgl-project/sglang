@@ -13,6 +13,7 @@ from sglang.srt.lora.moe.base_gemm_provider.pair_row_domain import (
     PairRowState,
 )
 from sglang.srt.lora.moe.quant_info import (
+    MoeLoraFp8MarlinQuantInfo,
     MoeLoraMarlinQuantInfo,
     MoeLoraMxfp4MarlinQuantInfo,
     MoeLoraNvFp4MarlinQuantInfo,
@@ -30,6 +31,7 @@ class MarlinRowState(PairRowState, kw_only=True):
 
 class MarlinPairProvider(PairRowDomainProvider):
     _use_atomic_add = True
+    _is_fp8 = False
     derived_base_weights = "the Marlin-repacked expert weights"
 
     def __init__(self, quant_info: MoeLoraMarlinQuantInfo):
@@ -41,7 +43,9 @@ class MarlinPairProvider(PairRowDomainProvider):
         self._padded_intermediate_size = quant_info.w2_qweight.shape[1] * 16
         from sgl_kernel.scalar_type import scalar_types
 
-        self._scalar_type = scalar_types.float4_e2m1f
+        self._scalar_type = (
+            scalar_types.float8_e4m3fn if self._is_fp8 else scalar_types.float4_e2m1f
+        )
 
     def _block_size_m(self, num_tokens: int, top_k: int, num_experts: int) -> int:
         # fused_marlin_moe's M block size rule.
@@ -181,6 +185,13 @@ class MarlinPairProvider(PairRowDomainProvider):
             global_scale=qi.w2_global_scale,
             top_k=1,
         )
+
+
+class MarlinFp8PairProvider(MarlinPairProvider):
+    contract = MoeBaseProviderContract(
+        key="marlin_fp8_contiguous", quant_info_cls=MoeLoraFp8MarlinQuantInfo
+    )
+    _is_fp8 = True
 
 
 class MarlinMxfp4PairProvider(MarlinPairProvider):

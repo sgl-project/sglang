@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import math
 from typing import TYPE_CHECKING, Literal
 
 import msgspec
@@ -298,6 +299,11 @@ class MoeLoraNvFp4QuantInfo(MoeLoraBlockScaledQuantInfo):
 
     @classmethod
     def from_layer(cls, base_layer: FusedMoE) -> MoeLoraNvFp4QuantInfo:
+        if getattr(base_layer.quant_method.quant_config, "is_w4a16", False):
+            raise ValueError(
+                "lora_cutedsl does not support W4A16_NVFP4 experts. "
+                "Use --moe-runner-backend lora_marlin."
+            )
         mode = nvfp4_activation_scale_mode(base_layer)
         recipe = None
         if mode == "per_token":
@@ -308,6 +314,11 @@ class MoeLoraNvFp4QuantInfo(MoeLoraBlockScaledQuantInfo):
                 w13_input_scale=float(base_layer.w13_input_scale.max()),
                 w2_input_scale=float(base_layer.w2_input_scale.max()),
             )
+            for name, scale in input_scales.items():
+                if not math.isfinite(scale) or scale <= 0:
+                    raise ValueError(
+                        f"static NVFP4 {name} must be finite and positive, got {scale}"
+                    )
         return cls._from_layer(
             base_layer,
             scheme="NVFP4",
@@ -365,13 +376,6 @@ class MoeLoraNvFp4MarlinQuantInfo(MoeLoraMarlinQuantInfo):
 
     @classmethod
     def from_layer(cls, base_layer: FusedMoE) -> MoeLoraNvFp4MarlinQuantInfo:
-        if base_layer.params_dtype != torch.bfloat16:
-            raise NotImplementedError("NVFP4 MoE LoRA requires BF16 activations.")
-        for name in ("w13_weight", "w2_weight"):
-            if getattr(base_layer, name).dtype != torch.int32:
-                raise ValueError(
-                    f"NVFP4 MoE LoRA requires already-prepared Marlin {name}."
-                )
         return cls(
             w13_global_scale=base_layer.w13_weight_scale_2,
             w2_global_scale=base_layer.w2_weight_scale_2,
@@ -393,3 +397,11 @@ class MoeLoraMxfp4MarlinQuantInfo(MoeLoraMarlinQuantInfo):
                 f"{quant_info.hidden_size} (padded to {padded_hidden})"
             )
         return quant_info
+
+
+class MoeLoraFp8MarlinQuantInfo(MoeLoraMarlinQuantInfo):
+    """E4M3 Marlin tiles with exponent-compensated BF16 scales per K group."""
+
+    @classmethod
+    def from_layer(cls, base_layer: FusedMoE) -> MoeLoraFp8MarlinQuantInfo:
+        return cls(**cls._prepared_fields(base_layer))

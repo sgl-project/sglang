@@ -49,6 +49,108 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 _ACTIVATION_PARAMS = ("gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit")
 
 
+class TestFp8MoEMarlinOwnership(CustomTestCase):
+    @staticmethod
+    def _methods():
+        from compressed_tensors.quantization import QuantizationArgs
+
+        from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_fp8_moe import (
+            CompressedTensorsW8A8Fp8MoE,
+        )
+        from sglang.srt.layers.quantization.w8a8_fp8 import W8A8FP8MoEMethod
+
+        for family, config in (
+            ("fp8", dict(weight_block_size=[128, 128])),
+            ("mxfp8", dict(use_mxfp8=True)),
+        ):
+            yield (
+                family,
+                Fp8MoEMethod(Fp8Config(is_checkpoint_fp8_serialized=True, **config)),
+            )
+        yield "fp8_channel", W8A8FP8MoEMethod(None)
+        for family, weights, inputs in (
+            (
+                "fp8",
+                dict(strategy="block", block_structure=[128, 128]),
+                dict(strategy="group", group_size=128),
+            ),
+            ("fp8_channel", dict(strategy="channel"), dict(strategy="token")),
+            ("fp8_tensor", dict(strategy="tensor"), dict(strategy="tensor")),
+        ):
+            yield (
+                family,
+                CompressedTensorsW8A8Fp8MoE(
+                    QuantizationArgs(num_bits=8, type="float", **weights),
+                    QuantizationArgs(num_bits=8, type="float", dynamic=True, **inputs),
+                ),
+            )
+
+    def test_only_lora_marlin_owns_and_repacks_fp8_experts(self):
+        from sglang.srt.layers.quantization import marlin_utils_fp8
+        from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+            CompressedTensorsFusedMoEMethod,
+        )
+        from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_fp8_moe import (
+            CompressedTensorsW8A8Fp8MoE,
+        )
+        from sglang.srt.lora.moe.families import family_of_layer
+        from sglang.srt.lora.moe.quant_info import MoeLoraFp8MarlinQuantInfo
+
+        with get_flags().moe.override(runner_backend=MoeRunnerBackend.MARLIN):
+            for _, method in self._methods():
+                self.assertFalse(method.use_marlin, type(method).__name__)
+
+        with (
+            get_flags().moe.override(runner_backend=MoeRunnerBackend.LORA_MARLIN),
+            patch.object(
+                marlin_utils_fp8,
+                "gptq_marlin_repack",
+                lambda b_q_weight, perm, size_k, size_n, num_bits: b_q_weight.reshape(
+                    size_k // 16, size_n * 4
+                ),
+                create=True,
+            ),
+        ):
+            for family, method in self._methods():
+                with self.subTest(family=family, method=type(method).__name__):
+                    layer = torch.nn.Module()
+                    layer.moe_tp_size = 1
+                    layer.use_presharded_weights = False
+                    layer.hidden_size = 256
+                    layer.intermediate_size_per_partition = 128
+                    layer.num_local_experts = 2
+                    layer.params_dtype = torch.bfloat16
+                    layer.moe_runner_config = MoeRunnerConfig()
+                    layer.quant_method = method
+                    if isinstance(method, CompressedTensorsW8A8Fp8MoE):
+                        layer.quant_method = CompressedTensorsFusedMoEMethod(None)
+                        layer.scheme = method
+                    loader = layer.quant_method
+                    loader.create_weights(layer, 2, 256, 128, torch.bfloat16)
+                    loader.create_moe_runner(layer, layer.moe_runner_config)
+                    self.assertIsNone(method.runner)
+                    if isinstance(method, CompressedTensorsW8A8Fp8MoE):
+                        self.assertEqual(
+                            layer.w2_weight_scale.shape,
+                            {
+                                "fp8": (2, 2, 1),
+                                "fp8_channel": (2, 256, 1),
+                                "fp8_tensor": (2,),
+                            }[family],
+                        )
+                    for param in layer.parameters():
+                        param.data.fill_(127 if param.dtype == torch.uint8 else 1)
+                    loader.process_weights_after_loading(layer)
+                    self.assertEqual(layer.w13_weight.shape, (2, 16, 1024))
+                    self.assertEqual(layer.w2_weight.shape, (2, 8, 1024))
+                    self.assertEqual(layer.w13_weight.dtype, torch.int32)
+                    self.assertEqual(layer.w2_weight_scale.dtype, torch.bfloat16)
+                    self.assertEqual(family_of_layer(layer), family)
+                    if family == "mxfp8":
+                        info = MoeLoraFp8MarlinQuantInfo.from_layer(layer)
+                        self.assertTrue((info.w2_scales == 2.0**120).all())
+
+
 class TestFp8MoERunnerOwnership(CustomTestCase):
     def setUp(self):
         moe = get_flags().moe
@@ -84,6 +186,47 @@ class TestFp8MoERunnerOwnership(CustomTestCase):
     def _assert_activation_params_absent(self, layer: SimpleNamespace) -> None:
         for name in _ACTIVATION_PARAMS:
             self.assertFalse(hasattr(layer, f"_flashinfer_trtllm_{name}"))
+
+    def test_fp4_weight_creation_preserves_e8m0_scales(self):
+        """Both FP4 loaders create E8M0 scales without duplicate dtype arguments."""
+        from sglang.srt.lora.moe.families import family_of_layer
+
+        with (
+            get_context().override_server_args(model_path="dummy", device="cpu"),
+            patch.object(cutlass_mxfp4, "is_flashinfer_available", return_value=True),
+        ):
+            for backend, use_mxfp8, dtype in (
+                (MoeRunnerBackend.FLASHINFER_MXFP4, False, torch.float8_e8m0fnu),
+                (MoeRunnerBackend.LORA_CUTEDSL, False, torch.float8_e8m0fnu),
+                (MoeRunnerBackend.LORA_CUTEDSL, True, torch.float8_e8m0fnu),
+                (MoeRunnerBackend.AUTO, False, torch.float32),
+            ):
+                with (
+                    self.subTest(backend=backend, use_mxfp8=use_mxfp8),
+                    get_flags().moe.override(runner_backend=backend),
+                ):
+                    method = Fp8MoEMethod(
+                        Fp8Config(
+                            is_checkpoint_fp8_serialized=True,
+                            weight_block_size=None if use_mxfp8 else [128, 128],
+                            use_mxfp8=use_mxfp8,
+                            is_fp4_experts=True,
+                        )
+                    )
+                    if backend.is_flashinfer_mxfp4():
+                        method = cutlass_mxfp4.Mxfp4FlashinferCutlassMoEMethod(
+                            method, prefix=""
+                        )
+                    layer = torch.nn.Module()
+                    layer.moe_tp_size = 1
+                    layer.moe_runner_config = MoeRunnerConfig()
+                    method.create_weights(layer, 2, 128, 128, torch.bfloat16)
+                    self.assertEqual(layer.w13_weight_scale_inv.dtype, dtype)
+                    self.assertEqual(layer.w2_weight_scale_inv.dtype, dtype)
+                    if use_mxfp8:
+                        layer.quant_method = method
+                        layer.params_dtype = torch.bfloat16
+                        self.assertEqual(family_of_layer(layer), "mxfp4")
 
     def test_borrowed_delegate_skips_trtllm_activation_params(self):
         """A method with no MoeRunner must not read moe_runner_config; doing so
@@ -234,15 +377,61 @@ class TestMxfp4MoEMethodContract(CustomTestCase):
                     self.assertIs(
                         layer.moe_runner_config.routing_method_type, requested
                     )
-                    self.assertEqual(layer.runner_backend, backend)
+                    expected_backend = (
+                        MoeRunnerBackend.MARLIN
+                        if backend is MoeRunnerBackend.EXPERIMENTAL_SGL_MARLIN
+                        else backend
+                    )
+                    self.assertEqual(layer.runner_backend, expected_backend)
                     self.assertIs(layer.quant_method._fp8.quant_config, config)
                     self.assertFalse(layer.quant_method._fp8._owns_moe_runner)
+
+    def test_mxfp4_merge_applies_routed_scale_once(self):
+        from sglang.srt.layers.moe.fused_moe_triton.layer import (
+            _fuses_routed_scaling_factor_in_topk,
+        )
+        from sglang.srt.layers.quantization.expert_pack import ExpertPackMoEMethod
+        from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
+            maybe_fuse_routed_scale_and_shared_add,
+        )
+
+        marlin = Mxfp4MarlinMoEMethod(None, "")
+        for method, backend, folded_in_topk, routed in (
+            (marlin, MoeRunnerBackend.LORA_MARLIN, False, 5.0),
+            (marlin, MoeRunnerBackend.LORA_CUTEDSL, False, 5.0),
+            (marlin, MoeRunnerBackend.LORA_TRITON, False, 5.0),
+            (marlin, MoeRunnerBackend.MARLIN, True, 5.0),
+            (ExpertPackMoEMethod(None, ""), None, False, 2.0),
+        ):
+            self.assertEqual(
+                _fuses_routed_scaling_factor_in_topk(method, backend), folded_in_topk
+            )
+            experts = SimpleNamespace(
+                quant_method=method,
+                moe_runner_config=MoeRunnerConfig(runner_backend=backend),
+                should_fuse_routed_scaling_factor_in_topk=folded_in_topk,
+            )
+            for has_shared in (False, True):
+                with self.subTest(backend=backend, has_shared=has_shared):
+                    shared = torch.tensor([1.0]) if has_shared else None
+                    actual = maybe_fuse_routed_scale_and_shared_add(
+                        experts, torch.tensor([routed]), shared, 2.5
+                    )
+                    torch.testing.assert_close(
+                        actual, torch.tensor([6.0 if has_shared else 5.0])
+                    )
 
     def test_fp4_expert_adapters_preserve_routing_policy(self):
         """Each selected MXFP4 adapter must construct without borrowing its FP8
         loader's routing policy, including an explicit zero-valued policy."""
         cases = (
             (MoeRunnerBackend.MARLIN, False, False, Mxfp4MarlinMoEMethod),
+            (
+                MoeRunnerBackend.EXPERIMENTAL_SGL_MARLIN,
+                True,
+                False,
+                Mxfp4MarlinMoEMethod,
+            ),
             (MoeRunnerBackend.HUMMING, False, False, Mxfp4HummingMoEMethod),
             (
                 MoeRunnerBackend.FLASHINFER_MXFP4,
@@ -288,6 +477,40 @@ class TestMxfp4MoEMethodContract(CustomTestCase):
             expected_type=Mxfp4FlashinferTrtllmMoEMethod,
             prefix=prefix,
         )
+
+
+class TestMxfp4MarlinPlatformGate(CustomTestCase):
+    def test_sm100_is_admitted_under_lora_marlin_only(self):
+        from sglang.srt.layers.quantization import mxfp4_marlin_moe
+
+        method = Mxfp4MarlinMoEMethod(
+            SimpleNamespace(process_weights_after_loading=lambda layer: None),
+            prefix="model.layers.0.mlp.experts",
+        )
+        with (
+            patch.object(
+                mxfp4_marlin_moe,
+                "get_platform",
+                return_value=SimpleNamespace(
+                    is_sm90=False, is_sm100=True, is_sm120=False
+                ),
+            ),
+            # Stop after the platform gate, before CUDA repacking.
+            patch(
+                "sglang.srt.layers.quantization.marlin_utils."
+                "check_moe_marlin_supports_layer",
+                return_value=False,
+            ),
+        ):
+            for backend, error in (
+                (MoeRunnerBackend.MARLIN, "requires SM90 or SM120"),
+                (MoeRunnerBackend.LORA_MARLIN, "does not satisfy Marlin"),
+            ):
+                with (
+                    get_flags().moe.override(runner_backend=backend),
+                    self.assertRaisesRegex(RuntimeError, error),
+                ):
+                    method.process_weights_after_loading(SimpleNamespace())
 
 
 class TestFp8MoEAiterQuantInfo(CustomTestCase):
