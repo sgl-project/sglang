@@ -58,8 +58,8 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=30, stage="nightly", runner_config="2-gpu-large")
-register_amd_ci(est_time=60, suite="nightly-amd", nightly=True)
-register_xpu_ci(est_time=400, suite="nightly-xpu-kernel-main-2-gpu", nightly=True)
+register_amd_ci(est_time=60, suite="nightly-test-amd", nightly=True)
+register_xpu_ci(est_time=400, suite="nightly-kernel-main-test-2-gpu-xpu", nightly=True)
 
 
 @contextmanager
