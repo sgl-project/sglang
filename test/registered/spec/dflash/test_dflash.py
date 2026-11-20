@@ -155,7 +155,7 @@ class TestDFlashServerChunkedPrefill(TestDFlashServerBase):
 
 
 class TestDFlashServerNoCudaGraph(TestDFlashServerBase):
-    other_launch_args = ["--disable-cuda-graph"]
+    other_launch_args = ["--disable-decode-cuda-graph", "--disable-prefill-cuda-graph"]
 
 
 class TestDFlashServerOverlap(TestDFlashServerBase):

@@ -177,7 +177,7 @@ export const GLM5Deployment = () => {
         cmd += ' \\\n  --dsa-decode-backend trtllm';
         cmd += ' \\\n  --dsa-prefill-backend trtllm';
         cmd += ' \\\n  --moe-runner-backend flashinfer_trtllm';
-        cmd += ' \\\n  --enable-flashinfer-allreduce-fusion';
+        cmd += ' \\\n  --flashinfer-allreduce-fusion-backend auto';
         cmd += ' \\\n  --enable-dp-lm-head';
         cmd += ' \\\n  --disable-radix-cache';
         cmd += ' \\\n  --max-prefill-tokens 32768';
@@ -221,7 +221,7 @@ export const GLM5Deployment = () => {
       cmd += ' \\\n  --dsa-decode-backend trtllm';
       cmd += ' \\\n  --dsa-prefill-backend trtllm';
       cmd += ' \\\n  --moe-runner-backend flashinfer_trtllm';
-      cmd += ' \\\n  --enable-flashinfer-allreduce-fusion';
+      cmd += ' \\\n  --flashinfer-allreduce-fusion-backend auto';
     }
 
     if (hardware === 'b300' && effectiveQuant === 'fp8') {
@@ -232,7 +232,7 @@ export const GLM5Deployment = () => {
 
     // H200 FP8: flashinfer allreduce fusion.
     if (hardware === 'h200' && effectiveQuant === 'fp8') {
-      cmd += ' \\\n  --enable-flashinfer-allreduce-fusion';
+      cmd += ' \\\n  --flashinfer-allreduce-fusion-backend auto';
     }
 
     cmd += ` \\\n  --mem-fraction-static ${memFraction}`;

@@ -71,8 +71,7 @@ def make_processor(case, config, image_processor_cls=None):
         model_impl="sglang",
         mm_feature_transport="cpu",
         mm_enable_dp_encoder=False,
-        image_processor_backend="auto",
-        disable_fast_image_processor=True,
+        image_processor_backend="pil",
         skip_tokenizer_init=False,
         mm_preprocess_cache_size_mb=0,
         trust_mm_content_hashes=False,
@@ -102,7 +101,7 @@ def make_processor(case, config, image_processor_cls=None):
             mm_feature_transport=server_args.mm_feature_transport,
             mm_process_config=server_args.mm_process_config,
             allowed_media_domains=server_args.allowed_media_domains,
-            disable_fast_image_processor=server_args.disable_fast_image_processor,
+            image_processor_backend=server_args.image_processor_backend,
         ),
         role="tokenizer",
     )
