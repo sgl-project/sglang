@@ -2504,6 +2504,11 @@ class Envs:
     # TP4 / TP8 compact A4 verify: one kernel runs the MoE finalize and pushes the all-reduce over xGMI (bitwise the
     # FlyDSL finalize + aiter two-stage all-reduce).
     SGLANG_ROCM_MUSE_FINALIZE_AR_PUSH = EnvBool(True)
+    # gfx950, TP = EP: re-place the MXFP4 experts across the EP ranks, per layer, from the counted load
+    # (rocm_muse_spark/expert_placement). Off by default: it changes the summation order of the MoE output.
+    SGLANG_ROCM_MUSE_GFX950_EXPERT_PLACEMENT = EnvBool(False)
+    # Target-verify rows counted before the re-placement on the verify load.
+    SGLANG_ROCM_MUSE_GFX950_EXPERT_PLACEMENT_VERIFY_ROWS = EnvInt(262144)
     SGLANG_ROCM_MUSE_DENSE_TUNED = EnvBool(True)
     SGLANG_ROCM_MUSE_SHARED_ROUTER_POOLER = EnvBool(True)
     SGLANG_ROCM_MUSE_JOINT_ROUTER_POOLER = EnvBool(True)

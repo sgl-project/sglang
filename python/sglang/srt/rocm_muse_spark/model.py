@@ -464,6 +464,8 @@ _EXPERT_PLACEMENT = (
     os.environ.get("SGLANG_ROCM_MUSE_EXPERT_PLACEMENT", "1") == "1"
     and envs.SGLANG_ROCM_MUSE_PREFILL_SP.get()
 )
+# gfx950 MXFP4 experts at TP = EP: the same re-placement, from the SP prefill rows and the compact A4 verify blocks.
+_GFX950_EXPERT_PLACEMENT = envs.SGLANG_ROCM_MUSE_GFX950_EXPERT_PLACEMENT.get()
 # Target verify: the attention partials' split-KV merge runs inside the output norm-gate kernel.
 _VERIFY_REDUCE_NORM_GATE = envs.SGLANG_ROCM_MUSE_VERIFY_REDUCE_NORM_GATE.get()
 # Decode-sized fp32 router as one split-K Triton GEMV (+reduce); MUSE_ROUTER_GEMV=0 restores torch.mm.
@@ -1370,6 +1372,7 @@ class MuseSpark1xMoE(nn.Module):
                 self.post_expert_norm.eps,
                 gain,
                 quantized=quantized,
+                load=self.expert_load_verify,
             )
             if skip_post_expert_proj:
                 return output
@@ -1620,6 +1623,7 @@ class MuseSpark1xMoE(nn.Module):
                 self.post_expert_norm.eps,
                 gain,
                 quantized=quantized,
+                load=self.expert_load_verify,
             )
         if self.nvfp4_checkpoint:
             return self.experts(
@@ -2639,6 +2643,31 @@ class MuseSparkTextForCausalLM(nn.Module):
             keep_native = bool(experts) and _a4w4_keeps_native(experts)
             for module in experts:
                 mxfp4_moe.prepare_a4w4_weights(module, keep_native=keep_native)
+            if _GFX950_EXPERT_PLACEMENT:
+                placed = [
+                    moe
+                    for moe in moe_layers
+                    if moe.mxfp4_checkpoint
+                    and moe.ep_size > 1
+                    and moe.tp_size == moe.ep_size
+                ]
+                for moe in placed:
+                    moe.expert_load = torch.zeros(
+                        moe.num_experts,
+                        dtype=torch.int32,
+                        device=moe.expert_bias.device,
+                    )
+                    moe.expert_load_verify = torch.zeros_like(moe.expert_load)
+                if placed:
+                    self.expert_placement = ExpertPlacement(
+                        placed,
+                        verify_blocks=True,
+                        min_verify_rows=envs.SGLANG_ROCM_MUSE_GFX950_EXPERT_PLACEMENT_VERIFY_ROWS.get(),
+                    )
+                    logger.info(
+                        "Muse MXFP4 experts: gfx950 expert placement on (%d layers)",
+                        len(placed),
+                    )
         if _DENSE_TILED:
             for moe in moe_layers:
                 for proj in (moe.pre_expert_proj, moe.post_expert_proj):

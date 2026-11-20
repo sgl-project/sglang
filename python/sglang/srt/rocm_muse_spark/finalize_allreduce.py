@@ -286,14 +286,16 @@ def run_compact_a4_allreduce(
     eps,
     gain,
     quantized=None,
+    load=None,
 ):
-    """Compact A4 experts of this rank, then the fused finalize + TP all-reduce: the reduced MoE output."""
+    """Compact A4 experts of this rank, then the fused finalize + TP all-reduce: the reduced MoE output. ``load``:
+    the per-expert block counter of ``compact_a4_experts``."""
     from sglang.kernels.ops.moe.mxfp4_compact_a4_moe import compact_a4_experts
     from sglang.srt.rocm_muse_spark.mxfp4_moe import _compact_a4_operands
 
     y = compact_a4_experts(
         x, ids, *_compact_a4_operands(experts), local_start=local_start,
-        shuffled=experts.native_dropped, quantized=quantized,
+        shuffled=experts.native_dropped, quantized=quantized, load=load,
     )  # fmt: skip
     return op(
         y, norm_weight, scores, ids, local_start, experts.num_local_experts, eps, gain
