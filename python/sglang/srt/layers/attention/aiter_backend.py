@@ -1327,9 +1327,7 @@ class AiterAttnBackend(AttentionBackend):
         return "fp8_e4m3"
 
     def _mla_ps_kernel_enabled(self) -> bool:
-        """Whether this instance plans and launches decode and target verify on the
-        persistent asm kernel (SGLANG_AITER_MLA_PERSIST after the __init__ shape gates);
-        draft extend reads _use_mla_ps_kernel directly."""
+        # Draft extend reads _use_mla_ps_kernel directly.
         return _use_mla_ps_kernel
 
     def _quantize_q_fp8(self, q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1404,7 +1402,6 @@ class AiterAttnBackend(AttentionBackend):
         )
 
     def _mla_decode_metadata_modes(self) -> tuple[bool, bool]:
-        """(fast_mode, intra_batch_mode) for decode and non-cp verify metadata."""
         if self.use_mla_dcp_asm and self.dcp_world_size > 1:
             # Match the AITER/vLLM DCP path: persistent scheduling with the
             # gathered-head tensor folded internally to qh16.
@@ -1414,7 +1411,6 @@ class AiterAttnBackend(AttentionBackend):
     def _mla_verify_metadata_modes(
         self, use_asm_cprr_verify: bool
     ) -> tuple[bool, bool]:
-        """(fast_mode, intra_batch_mode) for target verify metadata."""
         if use_asm_cprr_verify:
             return self.cprr_fast_mode, self.cprr_intra_batch_mode
         return self._mla_decode_metadata_modes()
@@ -2409,7 +2405,6 @@ class AiterAttnBackend(AttentionBackend):
     def _mla_decode_launch_schedule(
         self, *, default_num_kv_splits: Optional[int]
     ) -> dict:
-        """Schedule kwargs for the persistent mla_decode_fwd launch."""
         return dict(
             intra_batch_mode=intra_batch_mode, num_kv_splits=default_num_kv_splits
         )
