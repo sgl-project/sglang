@@ -294,7 +294,7 @@ def handle_linear_attn_backend(server_args: Any):
 
     # SM100+: default to FlashInfer GDN decode (and MTP verify, via pool API)
     # when the user hasn't explicitly chosen a decode backend and
-    # mamba-ssm-dtype is bf16 (required by FlashInfer GDN on SM100+).
+    # mamba-ssm-dtype is bf16.
     # Fixed in FlashInfer v0.6.7: flashinfer-ai/flashinfer#2810
     if (
         cfg.linear_attn_decode_backend is None
@@ -368,7 +368,8 @@ def handle_linear_attn_backend(server_args: Any):
     ):
         raise ValueError(
             "--linear-attn-decode-backend flashinfer on SM100+ requires "
-            "--mamba-ssm-dtype bfloat16, "
+            "--mamba-ssm-dtype bfloat16 except for explicit SM120 GDN FP32 "
+            "decode with 128-dimensional key/value heads; "
             f"got {cfg.mamba_ssm_dtype!r}"
         )
 
