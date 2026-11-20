@@ -17,7 +17,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.io_struct import (
     BatchTokenizedGenerateReqInput,
     GenerateReqInput,
@@ -66,7 +66,9 @@ def _scheduler(sessions, queued):
     scheduler.session_controller = sessions
     scheduler.enable_session_radix_cache = False
     scheduler.disaggregation_mode = DisaggregationMode.NULL
-    scheduler.model_config = SimpleNamespace(hf_eos_token_id=None, vocab_size=VOCAB)
+    scheduler.model_config = SimpleNamespace(
+        hf_eos_token_id=None, vocab_size=VOCAB, token_id_vocab_size=VOCAB
+    )
     scheduler.metrics_reporter = SimpleNamespace(enable_metrics=False)
     scheduler.kv_events_publisher = SimpleNamespace(enable_kv_cache_events=False)
     scheduler.tokenizer = None
@@ -124,10 +126,12 @@ class TestRequestClassOverridePoints(CustomTestCase):
         manager.preferred_sampling_params = None
         manager.sampling_params_class = SamplingParams
         manager.tokenizer = None
-        manager.model_config = SimpleNamespace(vocab_size=VOCAB)
+        manager.model_config = SimpleNamespace(
+            vocab_size=VOCAB, token_id_vocab_size=VOCAB
+        )
         manager.fake_bootstrap_room_counter = 0
         manager.rid_to_state = {
-            "r0": SimpleNamespace(time_stats=APIServerReqTimeStats())
+            "r0": SimpleNamespace(time_stats=APIServerReqTimeStats(), abort_sent=False)
         }
         obj = GenerateReqInput(input_ids=[1, 2], rid="r0", sampling_params={})
 

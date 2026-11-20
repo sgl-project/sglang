@@ -207,7 +207,7 @@ class GPUEnv(BaseEnv):
         """
         Get CUDA driver version.
         """
-        from sglang.srt.utils.common import get_nvidia_driver_version_str
+        from sglang.srt.utils.device import get_nvidia_driver_version_str
 
         ver = get_nvidia_driver_version_str()
         if ver is None:

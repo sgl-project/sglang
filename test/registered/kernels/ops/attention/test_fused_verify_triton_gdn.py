@@ -32,7 +32,9 @@ except ImportError:
     KERNELS_AVAILABLE = False
 
 register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_amd_ci(est_time=10, suite="nightly-amd-kernel-1-gpu", nightly=True)
+register_amd_ci(est_time=10, suite="nightly-kernel-test-1-gpu-amd", nightly=True)
+# backend-specific: the gfx95 TP4 launch config only applies on MI35x.
+register_amd_ci(est_time=10, suite="nightly-test-1-gpu-amd-mi35x", nightly=True)
 
 
 def _make_tensors(N, T, H, HV, K, V, device="cuda", seed=2025):

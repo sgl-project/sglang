@@ -7,6 +7,7 @@ from typing import Iterable, List, Optional, Tuple
 import torch
 import torch.nn as nn
 
+from sglang.srt.hf_transformers import get_rope_config
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.utils import (
     get_moe_a2a_backend,
@@ -14,20 +15,22 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import PPMissingLayer
-from sglang.srt.layers.utils.common import get_layer_id
+from sglang.srt.layers.utils.common import add_prefix, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
     pad_mm_tokens,
 )
-from sglang.srt.managers.schedule_batch import (
-    MultimodalDataItem,
-    MultimodalInputs,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
+)
+from sglang.srt.models.deepseek_common.utils import quant_blocks_shared_experts_fusion
+from sglang.srt.models.minimax_common.minimax_weight_loader import (
+    mxfp8_linear_scale_alias,
+    remap_llm_compressor_nvfp4_expert,
 )
 from sglang.srt.models.minimax_m3 import (
     MiniMaxM3Model,
@@ -47,14 +50,12 @@ from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.multimodal.encoder_preprocessing import EncoderMediaProcessorConfig
 from sglang.srt.runtime_context import get_mm, get_parallel
 from sglang.srt.utils import (
-    add_prefix,
     get_device_sm,
     is_cuda,
     is_gfx95_supported,
     is_hip,
     log_info_on_rank0,
 )
-from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 logger = logging.getLogger(__name__)
 
@@ -177,6 +178,12 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
             return (
                 "Shared and routed experts may use different quantization formats "
                 "in mixed-precision checkpoints."
+            )
+        if quant_blocks_shared_experts_fusion(quant_config):
+            return (
+                "Quantization keeps shared experts at a higher precision than the "
+                "routed experts, so they cannot be fused into the quantized "
+                "routed-expert path."
             )
         if not (_is_cuda or _is_hip):
             return "Shared experts fusion currently requires CUDA or ROCm devices."
@@ -425,6 +432,16 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
         ):
             return
 
+        # minimax_m3_nvfp4 reads weight_global_scale itself; remapping it inverts the scale twice.
+        # The Quark remap and scale alias are ROCm-only, like Quark's MXFP8 loading.
+        if (
+            _is_hip
+            and self.quant_config is not None
+            and self.quant_config.get_name() == "quark"
+            and "mlp.experts." in name
+        ):
+            name, loaded_weight = remap_llm_compressor_nvfp4_expert(name, loaded_weight)
+
         for param_name, weight_name, shard_id in llm_stacked_params_mapping:
             if weight_name not in name:
                 continue
@@ -433,6 +450,8 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
             new_name = name.replace(weight_name, param_name)
             if new_name.endswith(".bias") and new_name not in params_dict:
                 continue
+            if _is_hip:
+                new_name = mxfp8_linear_scale_alias(new_name, params_dict)
             if new_name not in params_dict:
                 continue
             param = params_dict[new_name]
@@ -465,6 +484,8 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
         remapped = maybe_remap_kv_scale_name(name, params_dict)
         if remapped is None:
             return
+        if _is_hip:
+            remapped = mxfp8_linear_scale_alias(remapped, params_dict)
         if remapped not in params_dict:
             logger.warning(f"Parameter {remapped} not found in params_dict")
             return

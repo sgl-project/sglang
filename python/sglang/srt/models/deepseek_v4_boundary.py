@@ -37,9 +37,10 @@ from sglang.srt.models.deepseek_common.moe_transport import (
 )
 from sglang.srt.models.deepseek_v2 import MoEOutput
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import is_gfx95_supported
+from sglang.srt.utils import is_gfx95_supported, is_gfx1250_supported
 
 _is_gfx95_supported = is_gfx95_supported()
+_is_gfx1250_supported = is_gfx1250_supported()
 
 
 class LayerCall(msgspec.Struct, frozen=True):
@@ -196,6 +197,7 @@ class HcReadCall(HcRead):
                 if self.attention
                 else mhc.mega_moe_input_of(self.layer, self.batch)
             ),
+            extend=mhc.is_local_extend(self.batch),
         )
 
     def _after_post(self, residual, norm):
@@ -220,7 +222,14 @@ class HcReadCall(HcRead):
                 if mhc.use_stats_stream(layer.hc_cfg, self.batch, streams)
                 else None
             )
-            mhc.fork_stats_stream(stream)
+            if (
+                self.attention
+                and stream is not None
+                and layer.self_attn.use_mega_attention
+            ):
+                mhc.defer_attn_stats_fork(stream)
+            else:
+                mhc.fork_stats_stream(stream)
             quantized = (
                 []
                 if self.attention and layer.self_attn.accepts_mxfp8_swizzled_input()
@@ -296,7 +305,7 @@ class HcReadCall(HcRead):
                 layer.hc_sinkhorn_iters,
                 cached if cached is not None else norm.weight.data,
                 norm.variance_epsilon,
-                fn_transpose=not self.attention,
+                fn_transpose=_is_gfx1250_supported or not self.attention,
             )
             if fused is not None:
                 streams, x, post, comb, norm_fused = fused
@@ -411,10 +420,10 @@ def stages(config, layer_id, *, layer=None):
                 None if ep else SumGroup.MOE_OUTPUT,
             )
     if layer is None:
-        from sglang.srt.models.deepseek_v4 import (
-            _is_fused_mhc_post_pre_enabled_xpu,
+        from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
             is_cross_layer_mhc_fusion_enabled,
         )
+        from sglang.srt.models.deepseek_v4 import _is_fused_mhc_post_pre_enabled_xpu
 
         lagged = config.hc_pre_from_prev_sublayer
         fused = (

@@ -130,14 +130,16 @@ class TestDFlashDraftBackendResolution(CustomTestCase):
             patch(f"{HOOK_MODULE}.current_platform", platform),
             patch(
                 f"{HOOK_MODULE}.get_platform",
-                return_value=SimpleNamespace(is_xpu=False, is_hip=False, is_sm100=True),
+                return_value=SimpleNamespace(
+                    is_xpu=False, is_hip=False, is_gfx95=False, is_sm100=True
+                ),
             ),
             patch(
                 f"{HOOK_MODULE}.attention_backends_of",
                 return_value=(target_backend, target_backend),
             ),
             patch(
-                "sglang.srt.utils.hf_transformers_utils.get_config",
+                "sglang.srt.hf_transformers.get_config",
                 return_value=config,
             ),
         ):

@@ -10,15 +10,17 @@ from typing import Any
 from sglang.srt.arg_groups.cp_tp_group_sharing_hook import (
     resolve_cp_tp_group_sharing,
 )
+from sglang.srt.arg_groups.model_override_base import (
+    model_config_of,
+    resolved_view,
+    resolving_view,
+)
 from sglang.srt.arg_groups.overrides import (
     _data_parallelism_defaults,
     _dcp_comm_backend_default,
     _dp_lm_head_validation,
     _tp_lm_head_all_to_all_default,
     declare_resolution,
-    model_config_of,
-    resolved_view,
-    resolving_view,
     run_post_process_pass,
     should_report_expert_balancedness,
 )
@@ -36,31 +38,6 @@ from sglang.srt.utils.common import parse_connector_type
 logger = logging.getLogger(__name__)
 
 
-def handle_deprecated_dp_attention(server_args: Any):
-    """Turn the deprecated `--dp-size N --enable-dp-attention` into
-    `--attn-dp-size N`.
-
-    Runs before any handler reads the DP layout. The old spelling counted
-    attention-DP groups with `dp_size`; that width moves to `attn_dp_size`, and
-    `dp_size` counts replicas again. Next to `--attn-dp-size` the flag adds
-    nothing: a serialized config reports it set whenever attention DP runs
-    (`ServerArgs.resolved_dict`), so reading one back resolves the same layout.
-    """
-    cfg = resolving_view(server_args)
-    if not cfg.enable_dp_attention:
-        return
-    if cfg.attn_dp_size == 1:
-        declare_resolution(
-            server_args,
-            "_handle_deprecated_dp_attention",
-            attn_dp_size=cfg.dp_size,
-            dp_size=1,
-        )
-    declare_resolution(
-        server_args, "_handle_deprecated_dp_attention", enable_dp_attention=False
-    )
-
-
 def _boundary_parallelism_overrides(cfg, model_type: str, architecture: str) -> dict:
     """Resolve the token-row modes the model's forward actually enters."""
     nemotron = model_type in ("nemotron_h", "nemotron_h_puzzle")
@@ -71,6 +48,7 @@ def _boundary_parallelism_overrides(cfg, model_type: str, architecture: str) -> 
     )
     kimi_k3 = architecture in (
         "KimiK3ForConditionalGeneration",
+        "KimiK31ForConditionalGeneration",
         "KimiK3LinearForCausalLM",
     )
     if nemotron and cfg.attn_cp_size > 1:
@@ -191,13 +169,20 @@ def handle_context_parallelism(server_args: Any):
             "attn_cp_size != moe_dp_size is only supported when moe_dp_size == 1"
         )
 
-    from sglang.srt.layers.cp.base import init_cp_strategy
+    from sglang.srt.layers.cp.base import init_cp_strategy, is_cp_sharded_padded
 
     init_cp_strategy(
         enable_prefill_cp=bool(cfg.enable_prefill_cp),
         cp_size=cfg.attn_cp_size,
         cp_strategy=cfg.cp_strategy,
+        cp_kv_layout=cfg.cp_kv_layout,
     )
+    if cfg.enable_unified_memory and is_cp_sharded_padded():
+        raise ValueError(
+            f"--cp-kv-layout {cfg.cp_kv_layout} keeps each rank's KV sharded "
+            "and padded, which --enable-unified-memory does not support; "
+            "drop one of them."
+        )
 
 
 def handle_shared_experts_tp(server_args: Any):
@@ -212,17 +197,24 @@ def handle_shared_experts_tp(server_args: Any):
         attn_cp_size=view.attn_cp_size,
         attn_dp_size=cfg.attn_dp_size,
     )
-    if size < 1 or attn_tp_size % size != 0:
+    # Shared experts can gather token rows across CP as well as attention TP,
+    # then reduce-scatter to the original shards. A subgroup must still fit
+    # inside one attention-DP replica / PP stage.
+    replica_size = attn_tp_size * view.attn_cp_size
+    if size < 1 or replica_size % size != 0:
         raise ValueError(
             f"--shared-experts-tp-size ({size}) must be a positive divisor "
-            f"of attention TP size ({attn_tp_size})."
+            f"of attention replica size ({replica_size}, attention TP x CP)."
         )
     if parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE:
         raise ValueError(
             "--shared-experts-tp-size requires a Kimi-K3 model configuration."
         )
     model_arch = model_config_of(server_args).hf_config.architectures[0]
-    if model_arch != "KimiK3ForConditionalGeneration":
+    if model_arch not in (
+        "KimiK3ForConditionalGeneration",
+        "KimiK31ForConditionalGeneration",
+    ):
         raise ValueError("--shared-experts-tp-size is only supported for Kimi-K3.")
     if cfg.moe_a2a_backend not in (
         "deepep",
@@ -235,6 +227,77 @@ def handle_shared_experts_tp(server_args: Any):
             "--shared-experts-tp-size requires an expert-parallel all-to-all "
             "backend (deepep, megamoe, mooncake, ascend_fuseep or mori)."
         )
+
+
+_KDA_DWDP_LOAD_FORMATS_REFUSED = (
+    "sharded_state",
+    "presharded",
+    "remote",
+    "remote_instance",
+    "ipc_cache",
+)
+
+
+def handle_kda_dwdp(server_args: Any):
+    cfg = resolving_view(server_args)
+    size = cfg.kda_dwdp_size
+    if size is None:
+        return
+    if cfg.disaggregation_mode != "prefill":
+        raise ValueError(
+            "--kda-dwdp-size runs on PD prefill workers only "
+            f"(--disaggregation-mode prefill; got {cfg.disaggregation_mode!r}): a "
+            "decoding server would re-gather the sharded weights every step (about "
+            "54 GB per rank for K3 at attention TP 1 and N=8)."
+        )
+    if size < 2 or cfg.tp_size % size != 0:
+        raise ValueError(
+            f"--kda-dwdp-size ({size}) must be >= 2 and divide TP size ({cfg.tp_size})."
+        )
+    view = resolved_view(server_args)
+    attn_tp_size = derive_attn_tp_size(
+        tp_size=cfg.tp_size,
+        attn_cp_size=view.attn_cp_size,
+        attn_dp_size=cfg.attn_dp_size,
+    )
+    if cfg.attn_dp_size <= 1 or cfg.attn_dp_size % size != 0:
+        raise ValueError(
+            f"--kda-dwdp-size ({size}) needs attention DP and must divide the "
+            f"attention-DP size ({cfg.attn_dp_size}; attention TP {attn_tp_size})."
+        )
+    if view.attn_cp_size > 1:
+        raise ValueError("--kda-dwdp-size does not support --attn-cp-size > 1.")
+    if cfg.pp_size > 1:
+        raise ValueError("--kda-dwdp-size does not support pipeline parallelism.")
+    if cfg.load_format in _KDA_DWDP_LOAD_FORMATS_REFUSED:
+        raise ValueError(
+            f"--kda-dwdp-size does not support --load-format {cfg.load_format}: "
+            "the shards are filled by the model's load_weights (use a checkpoint format "
+            "such as auto or safetensors, or dummy)."
+        )
+    if cfg.weight_cache_mode != "off":
+        raise ValueError(
+            "--kda-dwdp-size does not support --weight-cache-mode "
+            f"{cfg.weight_cache_mode}: cached weights skip the shard loaders."
+        )
+    if parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE:
+        raise ValueError("--kda-dwdp-size requires a Kimi-K3 model configuration.")
+    from sglang.srt.configs.model_config import is_kimi_k3
+
+    hf_config = model_config_of(server_args).hf_config
+    if not is_kimi_k3(hf_config):
+        raise ValueError(
+            "--kda-dwdp-size is only supported for Kimi-K3 "
+            f"(got {hf_config.architectures[0]})."
+        )
+    graph = cfg.cuda_graph_config
+    for phase in ("prefill", "decode"):
+        if graph is not None and getattr(graph, phase).backend == Backend.FULL:
+            raise ValueError(
+                "--kda-dwdp-size issues its layer-weight gathers between graph "
+                f"segments and cannot run inside a full {phase} CUDA graph; use "
+                f"--cuda-graph-backend-{phase} breakable or disabled."
+            )
 
 
 def handle_decode_context_parallelism(server_args: Any):
@@ -716,9 +779,6 @@ def handle_elastic_ep(server_args: Any):
             assert not cfg.forward_hooks, (
                 "Elastic EP CUDA graph recapture does not support forward hooks."
             )
-            assert not cfg.enable_pdmux, (
-                "Elastic EP CUDA graph recapture does not support PDMux."
-            )
         assert attn_dp_enabled_of(resolved), (
             "Elastic EP scale-up requires attention DP (--attn-dp-size); "
             "without it the TP group is not equivalent to WORLD and the "
@@ -757,6 +817,16 @@ def handle_eplb_and_dispatch(server_args: Any):
         )
         logger.warning(
             "EPLB is enabled. The expert_distribution_recorder_mode is automatically set."
+        )
+
+    if cfg.enable_eplb and cfg.expert_distribution_recorder_mode in (
+        "per_pass",
+        "per_token",
+    ):
+        raise ValueError(
+            "--enable-eplb needs --expert-distribution-recorder-mode stat or "
+            "stat_approx; the detailed recorder modes (per_pass/per_token) only "
+            f"support file dumps (got {cfg.expert_distribution_recorder_mode})."
         )
 
     # Without an a2a backend all EP ranks run the MoE over the same tokens and

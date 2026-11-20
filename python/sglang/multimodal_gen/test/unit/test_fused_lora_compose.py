@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Fused-layer LoRA groups: stack-vs-compose decision, loader wiring, IPC resolution."""
 
+import os
+import tempfile
 from collections import defaultdict
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -8,9 +10,12 @@ from unittest.mock import patch
 import pytest
 import torch
 import torch.nn.functional as F
+from safetensors.torch import save_file
 
+from sglang.multimodal_gen.runtime.layers.linear import QKVParallelLinear
 from sglang.multimodal_gen.runtime.layers.lora.linear import (
     MergedColumnParallelLinearWithLoRA,
+    QKVParallelLinearWithLoRA,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import (
     LoRAPipeline,
@@ -237,6 +242,57 @@ def test_mis_sized_fused_lora_b_is_rejected():
         layer.slice_lora_b_weights(torch.zeros(sum(OUTPUT_SIZES) + 1, 2))
 
 
+def _make_qkv_layer(tp_size, tp_rank, num_heads, num_kv_heads):
+    return QKVParallelLinear(
+        hidden_size=IN_DIM,
+        head_size=2,
+        total_num_heads=num_heads,
+        total_num_kv_heads=num_kv_heads,
+        bias=False,
+        tp_group=SimpleNamespace(world_size=tp_size, rank_in_group=tp_rank),
+    )
+
+
+@pytest.mark.parametrize(
+    "tp_size,num_heads,num_kv_heads", [(1, 4, 2), (2, 4, 2), (4, 4, 2), (2, 4, 4)]
+)
+def test_qkv_lora_b_is_sharded_like_the_base_weight(tp_size, num_heads, num_kv_heads):
+    """A fused LoRA B must give each TP rank the rows its base weight holds,
+    including a key/value head replicated across ranks; the base layer's own
+    weight loader is the reference."""
+    torch.manual_seed(0)
+    full = torch.randn((num_heads + 2 * num_kv_heads) * 2, IN_DIM)
+    for tp_rank in range(tp_size):
+        base = _make_qkv_layer(tp_size, tp_rank, num_heads, num_kv_heads)
+        base.weight.weight_loader(base.weight, full)
+        layer = QKVParallelLinearWithLoRA(base)
+        with patch(_TP_RANK_PATCH, return_value=tp_rank):
+            sliced = layer.slice_lora_b_weights(full)
+            if num_heads == num_kv_heads:
+                # Equal sections may also arrive stacked as [3, rows, rank].
+                stacked = layer.slice_lora_b_weights(full.reshape(3, -1, IN_DIM))
+                assert torch.equal(stacked.reshape(-1, IN_DIM), base.weight)
+        assert torch.equal(sliced, base.weight)
+
+
+def test_qkv_unmerged_forward_applies_fused_lora():
+    torch.manual_seed(0)
+    base = _make_qkv_layer(1, 0, 4, 2)
+    full = torch.randn(base.weight.shape)
+    base.weight.weight_loader(base.weight, full)
+    layer = QKVParallelLinearWithLoRA(base, lora_rank=3, lora_alpha=3)
+    lora_a = torch.randn(3, IN_DIM)
+    lora_b = torch.randn(full.shape[0], 3)
+    layer.set_lora_weights(lora_a, lora_b, merge_weights=False)
+
+    x = torch.randn(5, IN_DIM)
+    with patch(_TP_RANK_PATCH, return_value=0):
+        out, _ = layer.forward(x)
+    torch.testing.assert_close(
+        out, x @ full.T + x @ lora_a.T @ lora_b.T, rtol=1e-5, atol=1e-5
+    )
+
+
 def test_ipc_key_resolution_returns_fused_merge_index():
     module = torch.nn.Module()
     module.param_names_mapping = {
@@ -287,6 +343,9 @@ def _make_loader_pipeline() -> _TestLoRAPipeline:
     pipeline = object.__new__(_TestLoRAPipeline)
     pipeline.lora_adapters = defaultdict(dict)
     pipeline.loaded_adapter_paths = {}
+    pipeline.loaded_adapter_files = {}
+    pipeline.loaded_adapter_configs = {}
+    pipeline.loaded_adapter_fingerprints = {}
     pipeline.loaded_adapter_alphas = {}
     pipeline.device = "cpu"
     pipeline.modules = {"transformer": torch.nn.Module()}
@@ -309,12 +368,18 @@ def _make_loader_pipeline() -> _TestLoRAPipeline:
 
 def _load_adapter(pipeline, state_dict, lora_alpha=None):
     loader_mod = "sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline"
-    with (
-        patch(f"{loader_mod}.maybe_download_lora", return_value="/adapter"),
-        patch(f"{loader_mod}.load_file", return_value=state_dict),
-        patch(f"{loader_mod}.dist.is_initialized", return_value=False),
-    ):
-        pipeline.load_lora_adapter("/adapter", "adapter", rank=0, lora_alpha=lora_alpha)
+    # The loader stats the adapter file, so it must exist on disk.
+    with tempfile.TemporaryDirectory() as tmp:
+        adapter_file = os.path.join(tmp, "adapter.safetensors")
+        save_file({"placeholder": torch.zeros(1)}, adapter_file)
+        with (
+            patch(f"{loader_mod}.maybe_download_lora", return_value=adapter_file),
+            patch(f"{loader_mod}.load_file", return_value=state_dict),
+            patch(f"{loader_mod}.dist.is_initialized", return_value=False),
+        ):
+            pipeline.load_lora_adapter(
+                "/adapter", "adapter", rank=0, lora_alpha=lora_alpha
+            )
 
 
 def _qkv_state_dict(rank=2):
@@ -339,6 +404,54 @@ def test_loader_composes_unequal_fused_sections():
         "attn.to_qkv.lora_B",
         "attn.to_qkv.alpha",
     }
+
+
+def test_alpha_override_reloads_fused_sections(tmp_path):
+    pipeline = _make_loader_pipeline()
+    adapter_file = str(tmp_path / "adapter.safetensors")
+    save_file(_qkv_state_dict(), adapter_file)
+    pipeline.lora_initialized = True
+    for attr in (
+        "cur_adapter_name",
+        "cur_adapter_path",
+        "cur_adapter_strength",
+        "cur_adapter_config",
+        "lora_layers",
+        "lora_layers_critic",
+        "lora_layers_transformer_2",
+        "is_lora_merged",
+        "auto_merge_rounding_loss",
+    ):
+        setattr(pipeline, attr, {})
+    loader_mod = "sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline"
+    with (
+        patch(f"{loader_mod}.maybe_download_lora", return_value=adapter_file),
+        patch(f"{loader_mod}.dist.is_initialized", return_value=False),
+        patch(f"{loader_mod}.dist.get_rank", return_value=0),
+    ):
+        pipeline.load_lora_adapter(adapter_file, "adapter", rank=0, lora_alpha=8)
+        expected = pipeline.lora_adapters["adapter"]["attn.to_qkv.lora_B"].clone()
+        pipeline.load_lora_adapter(adapter_file, "adapter", rank=0, lora_alpha=4)
+        assert not torch.equal(
+            pipeline.lora_adapters["adapter"]["attn.to_qkv.lora_B"], expected
+        )
+        # only alpha changes; the same file stays available for the reload
+        with patch.object(
+            pipeline, "load_lora_adapter", wraps=pipeline.load_lora_adapter
+        ) as reload_adapter:
+            pipeline.set_lora(
+                "adapter",
+                None,
+                target="transformer",
+                merge_mode="dynamic",
+                lora_alpha=8,
+            )
+        reload_adapter.assert_called_once_with(adapter_file, "adapter", 0, lora_alpha=8)
+
+    # the GQA composition bakes alpha into lora_B, so an override must reload
+    torch.testing.assert_close(
+        pipeline.lora_adapters["adapter"]["attn.to_qkv.lora_B"], expected
+    )
 
 
 def test_loader_stacks_equal_fused_sections():
@@ -407,6 +520,29 @@ def test_apply_composed_adapter_end_to_end():
         + _reference_delta(x, a_list, b_list, adapter_alpha) * strength
     )
     torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-5)
+
+
+def test_failed_reload_keeps_previous_adapter():
+    pipeline = _make_loader_pipeline()
+    _load_adapter(pipeline, _qkv_state_dict(), lora_alpha=4)
+    before = pipeline.lora_adapters["adapter"]
+    tensors = dict(before)
+
+    replacement = {k: v + 1 for k, v in _qkv_state_dict().items()}
+    with (
+        patch(
+            "sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline."
+            "_store_fused_lora_groups",
+            side_effect=RuntimeError("boom"),
+        ),
+        pytest.raises(RuntimeError, match="boom"),
+    ):
+        _load_adapter(pipeline, replacement, lora_alpha=8)
+
+    assert pipeline.lora_adapters["adapter"] is before
+    assert before.keys() == tensors.keys()
+    assert all(before[k] is tensors[k] for k in tensors)
+    assert pipeline.loaded_adapter_alphas["adapter"] == 4
 
 
 @pytest.mark.parametrize(

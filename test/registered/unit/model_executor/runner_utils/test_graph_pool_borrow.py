@@ -208,7 +208,10 @@ class TestGraphPoolBorrow(CustomTestCase):
             sampling_info=sampling_info,
             forward_mode=SimpleNamespace(is_idle=lambda: False),
         )
-        logits_output = SimpleNamespace(next_token_logits=torch.randn((2, 8)))
+        logits_output = SimpleNamespace(
+            next_token_logits=torch.randn((2, 8)),
+            next_token_logits_vocab_shard=None,
+        )
         spec_config = SimpleNamespace(
             speculative_use_rejection_sampling=False,
             speculative_accept_threshold_single=1.0,

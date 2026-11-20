@@ -2,8 +2,9 @@ name: Nightly Test Miles (AMD ROCm 10)
 
 on:
   schedule:
-    # Runs after the 12:00 UTC miles image build has pushed the dated image.
-    - cron: "30 17 * * *"
+    # Runs after the 11:00 UTC miles image build has pushed the dated image,
+    # and after the 16:00/21:00 UTC sglang nightlies have claimed their runners.
+    - cron: "0 22 * * *"
   workflow_dispatch:
     inputs:
       image_tag:
@@ -75,7 +76,7 @@ jobs:
           base="miles-rocm10-mi35x"
           tag="${{ inputs.image_tag }}"
           if [ -z "${tag}" ]; then
-            # Walk back from today; the build job pushes a dated tag at 12:00 UTC.
+            # Walk back from today; the build job pushes a dated tag at 11:00 UTC.
             # Probe with `manifest inspect` so we don't pull a multi-GB image just
             # to test existence; the real pull happens in amd_ci_start_container.sh.
             for i in $(seq 0 6); do
@@ -108,7 +109,8 @@ jobs:
           touch "${GITHUB_WORKSPACE}/github_summary.md"
           TEST_EXIT_CODE=0
           bash scripts/ci/amd/amd_ci_exec.sh -w /root/miles \
-            -e PYTHONPATH=/root/miles:/opt/tilelang \
+            -e PYTHONPATH=/root/miles:/sgl-workspace/sglang/python:/opt/tilelang \
+            -e CI=true \
             -e GITHUB_STEP_SUMMARY=/sglang-checkout/github_summary.md \
             python3 tests/ci/run_suite.py --hw rocm --suite ${{ matrix.suite }} --cadence nightly \
             ${{ matrix.partition_size && format('--auto-partition-id {0} --auto-partition-size {1}', matrix.partition_id, matrix.partition_size) || '' }} \

@@ -39,7 +39,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.managers.schedule_batch import ReqKvInfo
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_mlx_ci
 from sglang.test.test_utils import CustomTestCase
@@ -47,7 +47,7 @@ from sglang.test.test_utils import CustomTestCase
 # CPU marker is AST-parsed "this test exists"; actual CPU-side execution is
 # gated by the @skipUnless guard below. MLX marker runs for real on the MLX
 # lane's stage-a (model-free: mocks the runner, loads no model).
-register_mlx_ci(est_time=10, suite="stage-a-unit-test-mlx")
+register_mlx_ci(est_time=10, suite="extra-unit-test-mlx")
 
 _IS_APPLE_SILICON = platform.system() == "Darwin" and platform.machine() == "arm64"
 _HAS_MLX = importlib.util.find_spec("mlx") is not None

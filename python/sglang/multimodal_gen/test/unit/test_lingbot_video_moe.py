@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import json
+import logging
 import os
 import tempfile
 from types import SimpleNamespace
@@ -31,7 +32,6 @@ from sglang.multimodal_gen.runtime.models.dits.lingbot_video_moe import (
     LingBotVideoAttention,
     LingBotVideoTransformer3DModel,
     _joint_position_ids,
-    make_joint_position_ids,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe.text_encoding import (
     PROMPT_TEMPLATE,
@@ -208,6 +208,44 @@ def test_attention_single_sample_matches_direct_attention(monkeypatch):
     torch.testing.assert_close(out, expected)
 
 
+def test_failed_norm_modulate_kernel_is_reported_and_not_retried(monkeypatch, caplog):
+    """A failing fused RMSNorm+modulate kernel is reported once and the site
+    then stays on the reference chain instead of relaunching the kernel on
+    every call."""
+    module = dits_lingbot_video_moe
+    launches = []
+
+    def failing_kernel(*args):
+        launches.append(args)
+        raise RuntimeError("kernel build failed")
+
+    # restores the process-wide latch after the test
+    monkeypatch.setattr(module, "_norm_modulate_fusion_failed", False, raising=False)
+    monkeypatch.setattr(
+        module, "can_use_rmsnorm_scale_shift_per_token", lambda *args: True
+    )
+    monkeypatch.setattr(module, "rmsnorm_scale_shift_per_token", failing_kernel)
+    site = torch.nn.Module()
+    module.LINGBOT_VIDEO_GATED_RESIDUAL.mark(site)
+    assert module.LINGBOT_VIDEO_GATED_RESIDUAL.mount(site)
+    torch.manual_seed(0)
+    norm = module.LingBotVideoRMSNorm(8)
+    x, scale, shift = torch.randn(3, 2, 4, 8)
+    reference = norm(x) * (1.0 + scale) + shift
+
+    with caplog.at_level(logging.WARNING, logger=module.logger.name):
+        for _ in range(2):
+            out = module._lingbot_norm_modulate(
+                site, norm, x, scale, shift, torch.float32
+            )
+            torch.testing.assert_close(out, reference, rtol=0, atol=0)
+
+    assert len(launches) == 1
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1, warnings
+    assert "kernel build failed" in warnings[0]
+
+
 class _FakeBatchEncoding(dict):
     def to(self, _device):
         return self
@@ -364,6 +402,19 @@ def test_preprocess_packs_w1_w3_into_w13_weight():
     torch.testing.assert_close(out["blocks.0.ffn.experts.w2"], w2)
 
 
+def _one_prompt_position_ids(text_len, grid_t, grid_h, grid_w, device):
+    """The per-sample (video; text) positions: video t after the prompt, text on t."""
+    tt = torch.arange(grid_t, device=device, dtype=torch.int32) + (text_len + 1)
+    hh = torch.arange(grid_h, device=device, dtype=torch.int32)
+    ww = torch.arange(grid_w, device=device, dtype=torch.int32)
+    grid = torch.stack(torch.meshgrid(tt, hh, ww, indexing="ij"), dim=-1).flatten(0, 2)
+    text_t = torch.arange(text_len, device=device, dtype=torch.int32) + 1
+    text_pos = torch.stack(
+        [text_t, torch.zeros_like(text_t), torch.zeros_like(text_t)], dim=-1
+    )
+    return torch.cat([grid, text_pos], dim=0)
+
+
 def test_joint_position_ids_match_reference_and_cover_padding():
     dev = torch.device("cpu")
     gt, gh, gw = 2, 3, 4
@@ -371,13 +422,13 @@ def test_joint_position_ids_match_reference_and_cover_padding():
 
     # B==1, no padding: byte-identical to the per-sample reference.
     vec = _joint_position_ids(torch.tensor([5]), gt, gh, gw, 5, dev)
-    torch.testing.assert_close(vec, make_joint_position_ids(5, gt, gh, gw, dev))
+    torch.testing.assert_close(vec, _one_prompt_position_ids(5, gt, gh, gw, dev))
 
     # B==1 with padding: real tokens match the text_len=4 reference; the extra
     # padding row is (0,0,0). vec has n_video+L rows (matches q for B*S).
     vec_p = _joint_position_ids(torch.tensor([4]), gt, gh, gw, 5, dev)
     torch.testing.assert_close(
-        vec_p[: n_video + 4], make_joint_position_ids(4, gt, gh, gw, dev)
+        vec_p[: n_video + 4], _one_prompt_position_ids(4, gt, gh, gw, dev)
     )
     torch.testing.assert_close(
         vec_p[n_video + 4 :], torch.zeros((1, 3), dtype=torch.int32)
@@ -392,5 +443,5 @@ def test_joint_position_ids_match_reference_and_cover_padding():
         start = i * (n_video + L)
         real = n_video + t
         torch.testing.assert_close(
-            vec_b[start : start + real], make_joint_position_ids(t, gt, gh, gw, dev)
+            vec_b[start : start + real], _one_prompt_position_ids(t, gt, gh, gw, dev)
         )

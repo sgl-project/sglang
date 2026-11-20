@@ -13,7 +13,6 @@ from sglang.multimodal_gen.configs.models.encoders.qwen3 import Qwen3TextConfig
 from sglang.multimodal_gen.configs.models.vaes.flux import FluxVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ImagePipelineConfig,
-    ModelTaskType,
     TextConditioningOutput,
     pad_text_embeddings_with_mask,
 )
@@ -23,6 +22,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config impo
 from sglang.multimodal_gen.configs.post_training.pipeline_configs import (
     ZImageRolloutPipelineMixin,
 )
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 from sglang.multimodal_gen.runtime.distributed.cfg_policy import (
     CFGPolicy,
     _apply_cfg_postprocess,
@@ -101,6 +101,10 @@ class ZImagePipelineConfig(ZImageRolloutPipelineMixin, ImagePipelineConfig):
     SEQ_LEN_MULTIPLE: int = 32
     PATCH_SIZE: int = 2
     F_PATCH_SIZE: int = 1
+
+    def supports_sequential_multi_output_inference(self):
+        # The DiT pairs one caption with each latent; n > 1 runs the outputs one by one.
+        return True
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         return ModelDeploymentConfig(

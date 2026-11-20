@@ -29,6 +29,7 @@ from transformers import (
 )
 
 from sglang.srt.distributed.utils import get_group_rank_size
+from sglang.srt.hf_transformers.common import _resolve_local_or_cached_file
 from sglang.srt.layers.activation import GeluAndMul
 from sglang.srt.layers.layernorm import Gemma3RMSNorm
 from sglang.srt.layers.linear import (
@@ -42,6 +43,8 @@ from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import apply_rotary_pos_emb, get_rope
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -52,8 +55,7 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, cpu_has_amx_support, is_cpu, make_layers
-from sglang.srt.utils.hf_transformers.common import _resolve_local_or_cached_file
+from sglang.srt.utils import cpu_has_amx_support, is_cpu
 
 _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -115,10 +117,15 @@ class Gemma3MLP(nn.Module):
         self.act_fn = GeluAndMul()
         self.prefix = prefix
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, output_tensor: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """``output_tensor``: optional caller-owned storage for down_proj's result."""
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
+        # pass output_tensor only when given: LoRA-wrapped layers do not take it
+        kwargs = {} if output_tensor is None else {"output_tensor": output_tensor}
+        x, _ = self.down_proj(x, **kwargs)
         return x
 
 
@@ -791,69 +798,6 @@ class Gemma3ForCausalLM(PreTrainedModel):
             forward_batch,
             aux_hidden_states,
         )
-
-    @torch.no_grad()
-    def forward_split_prefill(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        split_interval: Tuple[int, int],  # [start, end) 0-based
-        input_embeds: torch.Tensor = None,
-    ):
-        start, end = split_interval
-        # embed
-        if start == 0:
-            if input_embeds is None:
-                hidden_states = self.model.embed_tokens(input_ids)
-            else:
-                hidden_states = input_embeds
-
-            if positions.dim() == 1:
-                positions = einops.rearrange(positions, "s -> 1 s")
-            position_embeddings_global = self.model.rotary_emb(hidden_states, positions)
-            position_embeddings_local = self.model.rotary_emb_local(
-                hidden_states, positions
-            )
-
-            forward_batch.hidden_states = hidden_states
-            forward_batch.model_specific_states = {
-                "positions": positions,
-                "position_embeddings_global": position_embeddings_global,
-                "position_embeddings_local": position_embeddings_local,
-            }
-
-        # decoder layer
-        for i in range(start, end):
-            layer = self.model.layers[i]
-            layer_output = layer(
-                positions=forward_batch.model_specific_states["positions"],
-                position_embeddings_global=forward_batch.model_specific_states[
-                    "position_embeddings_global"
-                ],
-                position_embeddings_local=forward_batch.model_specific_states[
-                    "position_embeddings_local"
-                ],
-                hidden_states=forward_batch.hidden_states,
-                forward_batch=forward_batch,
-            )
-            forward_batch.hidden_states = layer_output[0]
-
-        if end == self.model.config.num_hidden_layers:
-            # norm
-            forward_batch.hidden_states = self.model.norm(forward_batch.hidden_states)
-
-            # logits process
-            result = self.logits_processor(
-                input_ids,
-                forward_batch.hidden_states,
-                self.model.embed_tokens,
-                forward_batch,
-            )
-        else:
-            result = None
-
-        return result
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

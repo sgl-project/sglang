@@ -19,7 +19,7 @@ class TestPipelineCompletion(unittest.TestCase):
         from sglang.srt.layers.layer_boundary import append_stages, layer_stack
         from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
         from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.model_executor.forward_mode import ForwardMode
         from sglang.srt.models import deepseek_v4
         from sglang.srt.models.deepseek_v2 import MoEOutput
         from sglang.test import boundary_fixtures as fixture

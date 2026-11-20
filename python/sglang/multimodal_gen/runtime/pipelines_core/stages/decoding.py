@@ -102,7 +102,9 @@ def _ensure_tensor_decode_output(decode_output):
     return decode_output
 
 
-def _to_unit_range(image: torch.Tensor) -> torch.Tensor:
+def _to_unit_range(image: torch.Tensor, *, in_place: bool = False) -> torch.Tensor:
+    if in_place:
+        return image.div_(2).add_(0.5).clamp_(0, 1)
     return (image / 2 + 0.5).clamp(0, 1)
 
 
@@ -249,7 +251,9 @@ class DecodingStage(PipelineStage):
             vae_dtype=vae_dtype,
             on_frames=normalized_on_frames,
         )
-        image = _to_unit_range(image)
+        # Safe in place: image is decode_raw's fresh output, with no other
+        # live reference to its pre-normalization values.
+        image = _to_unit_range(image, in_place=True)
         if (
             on_frames is not None
             and normalized_on_frames is None
@@ -421,15 +425,18 @@ class DecodingStage(PipelineStage):
                 vae,
                 quality_allows(batch.sampling_params.quality, "lossless"),
             ):
+                decode_latents = server_args.pipeline_config.prepare_decoding_latents(
+                    batch, server_args=server_args, vae=vae
+                )
                 try:
                     if stream is None:
                         # Model-specific decode overrides need not support streaming.
                         frames = self.decode(
-                            batch.latents, server_args, vae_dtype=vae_dtype
+                            decode_latents, server_args, vae_dtype=vae_dtype
                         )
                     else:
                         frames = self.decode(
-                            batch.latents,
+                            decode_latents,
                             server_args,
                             vae_dtype=vae_dtype,
                             on_frames=stream,
@@ -469,6 +476,9 @@ class DecodingStage(PipelineStage):
 
         if output_file_paths is None:
             frames = server_args.pipeline_config.post_decoding(frames, server_args)
+            frames = server_args.pipeline_config.postprocess_decoded_batch(
+                frames, batch, server_args
+            )
         else:
             frames = None
 
@@ -476,6 +486,8 @@ class DecodingStage(PipelineStage):
         output_batch = OutputBatch(
             output=frames,
             output_file_paths=output_file_paths,
+            audio=batch.audio,
+            audio_sample_rate=batch.audio_sample_rate,
             trajectory_timesteps=batch.trajectory_timesteps,
             trajectory_latents=batch.trajectory_latents,
             rollout_trajectory_data=batch.rollout_trajectory_data,

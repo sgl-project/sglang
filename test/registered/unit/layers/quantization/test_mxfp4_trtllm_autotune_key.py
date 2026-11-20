@@ -38,6 +38,7 @@ def _layer():
         output1_scale_scalar=None,
         output1_scale_gate_scalar=None,
         output2_scale_scalar=None,
+        use_cuda_mxfp4_decode_moe=False,
     )
     method = object.__new__(mxfp4.Mxfp4FlashinferTrtllmMoEMethod)
     method.flashinfer_mxfp4_moe_precision = "bf16"
