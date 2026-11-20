@@ -1,7 +1,7 @@
+pub mod expansion;
 pub mod fetch;
 pub mod par;
 pub mod resize;
-pub mod token_layout;
 
 #[cfg(feature = "parallel")]
 use std::sync::OnceLock;
@@ -41,6 +41,10 @@ fn pool_threads_override(var: impl Fn(&str) -> Option<String>) -> Option<usize> 
 pub fn content_hash_u64(data: &[u8]) -> u64 {
     let digest = blake3::hash(data);
     u64::from_be_bytes(digest.as_bytes()[..8].try_into().unwrap())
+}
+
+pub fn content_digest(data: &[u8]) -> String {
+    format!("blake3:{}", blake3::hash(data).to_hex())
 }
 
 pub fn decode_rgb(data: &[u8]) -> Result<(Vec<u8>, usize, usize), String> {
@@ -155,6 +159,39 @@ mod python {
     }
 
     #[pyfunction]
+    pub fn content_digest(py: Python<'_>, data: &[u8]) -> String {
+        py.detach(|| super::content_digest(data))
+    }
+
+    #[pyfunction]
+    #[pyo3(signature = (input_ids, mm_token_expansion_spec, mm_token_expansion_start_len=0))]
+    pub fn expand_token_placeholders(
+        py: Python<'_>,
+        input_ids: Vec<i64>,
+        mm_token_expansion_spec: &Bound<'_, PyAny>,
+        mm_token_expansion_start_len: i64,
+    ) -> PyResult<Vec<i64>> {
+        let spec = mm_token_expansion_spec
+            .call_method0("items")?
+            .try_iter()?
+            .map(|item| item?.extract::<(i64, Vec<Vec<i64>>)>())
+            .collect::<PyResult<Vec<_>>>()?;
+        let start_len = usize::try_from(mm_token_expansion_start_len).unwrap_or(usize::MAX);
+        Ok(py
+            .detach(|| super::expansion::expand_token_placeholders(&input_ids, &spec, start_len))?)
+    }
+
+    #[pyfunction]
+    pub fn locate_media(
+        py: Python<'_>,
+        input_ids: Vec<i64>,
+        token_id: i64,
+        expansions: Vec<Vec<i64>>,
+    ) -> PyResult<Vec<Vec<(usize, usize)>>> {
+        Ok(py.detach(|| super::expansion::locate_media(&input_ids, token_id, &expansions))?)
+    }
+
+    #[pyfunction]
     pub fn fetch_bytes<'py>(py: Python<'py>, source: String) -> PyResult<Bound<'py, PyBytes>> {
         let data = py
             .detach(move || super::fetch::fetch_bytes(&source))
@@ -168,6 +205,9 @@ mod python {
         m.add_function(wrap_pyfunction!(scaled_dims, &m)?)?;
         m.add_function(wrap_pyfunction!(image_decode_rgb, &m)?)?;
         m.add_function(wrap_pyfunction!(content_hash, &m)?)?;
+        m.add_function(wrap_pyfunction!(content_digest, &m)?)?;
+        m.add_function(wrap_pyfunction!(expand_token_placeholders, &m)?)?;
+        m.add_function(wrap_pyfunction!(locate_media, &m)?)?;
         m.add_function(wrap_pyfunction!(fetch_bytes, &m)?)?;
         parent.add_submodule(&m)?;
         Ok(())
@@ -179,7 +219,7 @@ pub use python::register;
 
 #[cfg(test)]
 mod tests {
-    use super::decode_rgb;
+    use super::{content_digest, decode_rgb};
     use image::ImageFormat;
 
     fn encode(img: &image::DynamicImage, fmt: ImageFormat) -> Vec<u8> {
@@ -199,6 +239,14 @@ mod tests {
             assert_eq!((h, w), (4, 6), "{fmt:?}");
             assert_eq!(rgb.len(), 4 * 6 * 3, "{fmt:?}");
         }
+    }
+
+    #[test]
+    fn content_digest_is_prefixed_full_blake3() {
+        assert_eq!(
+            content_digest(b""),
+            "blake3:af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+        );
     }
 
     /// Samples deeper than 8 bits stay rejected (PIL clips; we refuse).

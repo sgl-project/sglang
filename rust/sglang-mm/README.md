@@ -4,6 +4,9 @@ Rust-accelerated multimodal preprocessing for SGLang. Fused image decode,
 fetch, resize, patchify, normalize, and content hash — all parallel and
 GIL-released.
 
+The processing stages and their dependencies are in
+[docs/pipeline.md](docs/pipeline.md).
+
 Built two ways:
 
 - **PyO3 extension** `sglang.srt.rust_extensions._multimodal` (features
@@ -26,7 +29,7 @@ src/
 │   ├── fetch.rs              # media source → bytes (data:/base64/file/http)
 │   ├── par.rs                # the only fan-out seam (rayon, or inline)
 │   ├── resize.rs             # PIL-exact Lanczos + Bicubic resize
-│   └── token_layout.rs       # TokenLayout mechanics (apply_layout + helpers)
+│   └── expansion.rs          # Placeholder expansion and media spans in token ids
 └── <model>/
     └── mod.rs                # model-specific processor (inkling, qwen_vl, ...)
 ```
@@ -51,7 +54,10 @@ common.resize_rgb(arr, out_w, out_h)
 common.scaled_dims(w, h, rescale_frac, rescale_cap)
 common.image_decode_rgb(bytes)          # -> (h, w, ndarray)
 common.content_hash(bytes)              # -> u64 (blake3, truncated)
+common.content_digest(bytes)            # -> "blake3:<64 hex>" (full blake3)
 common.fetch_bytes(source)              # -> bytes (data:/base64/file/http)
+common.expand_token_placeholders(input_ids, spec, start_len=0)  # -> list[int]
+common.locate_media(input_ids, token_id, expansions)           # -> [[(start, end), ...], ...]
 
 # Model-specific
 inkling.preprocess_images(list[bytes], ps, frac, cap)  # -> [(h, w, bits, hash), ...]
