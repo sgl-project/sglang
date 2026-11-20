@@ -235,7 +235,7 @@ def _load_mha_v4():
 
     MHA v4 is 8-9% faster than fmha v3 (flash_attn_func) at MiniMax-H3's MI350X
     shapes; both are BF16 flash attention with FP32 softmax and accumulation.
-    Before aiter#6841 the kernel had RAW races: on 8 MI350X about 1 call in 800
+    Before ROCm/aiter#6841 it had RAW races: on 8 MI350X about 1 call in 800
     returned wrong rows (up to 0.25 off), so outputs varied run to run. That
     change also dropped ``sparse`` from ``_check_lse_capable``, which tells the
     builds apart.
@@ -258,11 +258,13 @@ _MHA_V4 = _load_mha_v4()
 # fmha v3 and MHA v4 run one 256-row query tile per CU per wave. When the last
 # wave holds only a few tiles (Pika H3 Flex 5 s on 8 GPUs: 7 heads x 148 tiles
 # = 4 waves + 12 tiles on 256 CUs), the tail rows finish sooner with their keys
-# split over every CU and the partial results merged by LSE.
+# split over every CU and the partial results merged by LSE. Adapted from
+# tail_plan in github.com/Pika-Labs/Pika-H3-Flex, branch contrib/amd-mi350x
+# (src/pika_h3/sp_model.py, Apache-2.0).
 _TILE_ROWS = 256
 _TAIL_MAX_TILES = 96
-# Pika measured no gain at 8+ waves: a nearly idle last wave runs at a higher
-# clock under the power cap.
+# that branch reports no gain at 8+ waves: a nearly idle last wave runs at a
+# higher clock under the power cap
 _TAIL_MAX_WAVES = 6
 _TAIL_KEY_CHUNKS = 8
 
