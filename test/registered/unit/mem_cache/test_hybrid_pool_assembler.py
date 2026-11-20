@@ -71,6 +71,7 @@ from sglang.srt.mem_cache.pool_host.mha import (
     MHATokenToKVPoolHost,
 )
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import build_test_unified_pools
@@ -1637,11 +1638,16 @@ class TestHicacheMambaSize(CustomTestCase):
             host_capacity_bytes=None, get_kv_size_bytes=lambda: nbytes
         )
 
-    def _split(self, hicache_size, mamba_size, kv_pools, mamba_pools):
-        memory = SimpleNamespace(
-            hicache_size=hicache_size, hicache_mamba_size=mamba_size
+    @staticmethod
+    def _hicache_args(*, hicache_size=192, mamba_size):
+        return get_context().override_server_args(
+            enable_hierarchical_cache=True,
+            hicache_size=hicache_size,
+            hicache_mamba_size=mamba_size,
         )
-        with patch.object(hybrid_pool_assembler, "get_memory", return_value=memory):
+
+    def _split(self, *, hicache_size, mamba_size, kv_pools, mamba_pools):
+        with self._hicache_args(hicache_size=hicache_size, mamba_size=mamba_size):
             return _split_hicache_size_with_mamba(
                 kv_pools=kv_pools, mamba_pools=mamba_pools
             )
@@ -1650,38 +1656,48 @@ class TestHicacheMambaSize(CustomTestCase):
         mamba = self._pool(6 << 30)
         for kv_bytes in (8 << 30, 12 << 30):
             self.assertEqual(
-                self._split(192, 70, (self._pool(kv_bytes),), (mamba,)), (122, 70)
+                self._split(
+                    hicache_size=192,
+                    mamba_size=70,
+                    kv_pools=(self._pool(kv_bytes),),
+                    mamba_pools=(mamba,),
+                ),
+                (122, 70),
             )
 
     def test_unset_keeps_proportional_split(self):
         self.assertEqual(
-            self._split(192, 0, (self._pool(10 << 30),), (self._pool(6 << 30),)),
+            self._split(
+                hicache_size=192,
+                mamba_size=0,
+                kv_pools=(self._pool(10 << 30),),
+                mamba_pools=(self._pool(6 << 30),),
+            ),
             (120.0, 72.0),
         )
 
     def test_unset_gives_every_packed_mamba_pool_its_device_share(self):
-        """Draft Mamba pools packed into the one Mamba host pool add their device
-        bytes to its share instead of dropping out of the split."""
+        """Draft Mamba pools packed into the one Mamba host pool
+        add their device bytes to its share instead of dropping out of the split."""
         self.assertEqual(
             self._split(
-                192,
-                0,
-                (self._pool(10 << 30),),
-                (self._pool(4 << 30), self._pool(2 << 30)),
+                hicache_size=192,
+                mamba_size=0,
+                kv_pools=(self._pool(10 << 30),),
+                mamba_pools=(self._pool(4 << 30), self._pool(2 << 30)),
             ),
             (120.0, 72.0),
         )
 
     def test_mamba_swa_stack_gives_the_pin_to_mamba_and_the_rest_by_kv_bytes(self):
-        """The full and SWA host pools split the remainder by device bytes, in
-        that order; the Mamba host pool gets exactly the pin."""
+        """The full and SWA host pools split the remainder by device bytes;
+        the Mamba host pool gets exactly the pin."""
         params = SimpleNamespace(
             page_size=1,
             token_to_kv_pool_allocator=SimpleNamespace(swa_attn_allocator=None),
         )
-        memory = SimpleNamespace(hicache_size=192, hicache_mamba_size=70)
         with (
-            patch.object(hybrid_pool_assembler, "get_memory", return_value=memory),
+            self._hicache_args(mamba_size=70),
             patch.object(hybrid_pool_assembler, "_mamba_info"),
             patch.object(
                 hybrid_pool_assembler, "_mamba_layer_mapping", return_value={2: 0}
@@ -1709,8 +1725,8 @@ class TestHicacheMambaSize(CustomTestCase):
         self.assertEqual(mamba_entry.call_args.kwargs["host_size"], 70)
 
     def test_pin_below_one_mamba_slot_is_rejected(self):
-        """Host sizing pads by one slot, so a pin smaller than one state slot
-        would otherwise build a one-slot Mamba host pool without complaint."""
+        """Host sizing pads by one slot,
+        so a pin smaller than one state slot would silently build a one-slot pool."""
         params = SimpleNamespace(
             mtp_draft_mamba_pools=(),
             token_to_kv_pool_allocator=SimpleNamespace(state_slots=MagicMock()),
@@ -1718,11 +1734,7 @@ class TestHicacheMambaSize(CustomTestCase):
         for pin_gb, rejected in ((1, True), (2, False)):
             with (
                 self.subTest(pin_gb=pin_gb),
-                patch.object(
-                    hybrid_pool_assembler,
-                    "get_memory",
-                    return_value=SimpleNamespace(hicache_mamba_size=pin_gb),
-                ),
+                self._hicache_args(mamba_size=pin_gb),
                 patch.object(
                     hybrid_pool_assembler,
                     "build_mamba_host_pool",
@@ -1749,8 +1761,8 @@ class TestHicacheMambaSize(CustomTestCase):
                     build()
 
     def test_pin_holds_the_packed_mtp_draft_layers(self):
-        """The pinned share sizes a host pool whose slots also carry every packed
-        MTP draft Mamba layer, so a pin buys fewer slots with a draft than without."""
+        """Each pinned host slot also carries every packed MTP draft Mamba layer,
+        so a pin buys fewer slots with a draft than without."""
 
         def make_pool(layer_ids):
             return MambaPool(
@@ -1781,9 +1793,9 @@ class TestHicacheMambaSize(CustomTestCase):
                 patch.dict(ALLOC_MEMORY_FUNCS, {"cpu": meta_alloc}),
             ):
                 host = MambaPoolHost(
-                    info(target),
-                    2,
-                    1,
+                    buffer_info=info(target),
+                    host_to_device_ratio=2,
+                    host_size=1,
                     device_capacity=target.size,
                     pin_memory=False,
                     layout="page_first",
@@ -1796,8 +1808,7 @@ class TestHicacheMambaSize(CustomTestCase):
     def test_pin_warns_only_for_a_model_without_mamba_state(self):
         """Every HiCache build checks the pin, not only the hybrid stacks."""
         logger = kv_cache_builder.logger
-        memory = SimpleNamespace(hicache_mamba_size=70)
-        with patch.object(kv_cache_builder, "get_memory", return_value=memory):
+        with self._hicache_args(mamba_size=70):
             with self.assertLogs(logger, "WARNING") as logs:
                 kv_cache_builder._warn_unused_hicache_mamba_size(is_hybrid_ssm=False)
             self.assertIn("--hicache-mamba-size has no effect", logs.output[0])
