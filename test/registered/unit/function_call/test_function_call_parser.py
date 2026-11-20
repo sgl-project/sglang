@@ -5944,13 +5944,13 @@ class TestGemma4Detector(unittest.TestCase):
         ]
         text = (
             'Some text <|tool_call>call:get_weather{location:<|"|>Tokyo<|"|>}<tool_call|>'
-            ' more text <|tool_call>call:get_time{timezone:<|"|>UTC<|"|>}<tool_call|>'
+            'More text <|tool_call>call:get_time{timezone:<|"|>UTC<|"|>}<tool_call|>Done.'
         )
         result = self.detector.detect_and_parse(text, extra_tools)
         self.assertEqual(len(result.calls), 2)
         self.assertEqual(result.calls[0].name, "get_weather")
         self.assertEqual(result.calls[1].name, "get_time")
-        self.assertEqual(result.normal_text, "Some text ")
+        self.assertEqual(result.normal_text, "Some text More text Done.")
 
     def test_parse_gemma4_args_empty(self):
         self.assertEqual(_parse_gemma4_args(""), {})
