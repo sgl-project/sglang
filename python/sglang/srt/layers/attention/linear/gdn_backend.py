@@ -285,6 +285,53 @@ elif is_xpu():
     causal_conv1d_update = causal_conv1d_update_xpu_dispatch
 
 
+def _gdn_prefill_graph_extend_captures(model_runner: ModelRunner) -> bool:
+    """Whether a breakable prefill CUDA graph would capture the GDN extend here.
+
+    GDNAttnBackend._prefill_graph_extend_supported() cannot be reused: it reads
+    the extend kernel this dispatch is still choosing.
+    """
+    if not envs.SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND.get():
+        return False
+    try:
+        # Both disable the capture in the backend. MIS also requires Triton, so
+        # returning None here would hide validate_gdn_mis_backend's error and
+        # start the server on an eager Triton extend instead.
+        if get_exec().features.enable_mis:
+            return False
+        if not model_runner.spec_algorithm.is_none():
+            return False
+        prefill = get_exec().graph.cuda_graph_config.prefill
+        if getattr(prefill, "backend", None) != "breakable":
+            return False
+        capture_tokens = prefill.bs or []
+        if not capture_tokens:
+            return False
+        # State-layout conditions the backend checks; the pool exists by now.
+        mamba_cache = model_runner.token_to_kv_pool.layer_router.part_view(
+            STATE_PART
+        ).mamba_cache
+        if (
+            getattr(model_runner.model_config.hf_text_config, "mamba_chunk_size", 64)
+            != FLA_CHUNK_SIZE
+            or not all(conv.is_contiguous() for conv in mamba_cache.conv)
+            or not mamba_cache.temporal.is_contiguous()
+        ):
+            return False
+        from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
+            get_prefill_num_tokens_to_capture,
+        )
+        return buckets_keep_chunk_o_block_size(
+            get_prefill_num_tokens_to_capture(capture_tokens)
+        )
+    except Exception as e:
+        rank0_log(
+            f"GDN prefill graph-extend probe failed ({type(e).__name__}: {e}); "
+            "keeping the FlashInfer default."
+        )
+        return False
+
+
 def flashinfer_gdn_prefill_default(model_runner: ModelRunner) -> Optional[str]:
     """FlashInfer for the narrow SM90/SM100 GDN prefill domains we validated, else None."""
     sm_major = torch.cuda.get_device_capability()[0] if is_cuda() else 0
@@ -331,6 +378,10 @@ def flashinfer_gdn_prefill_default(model_runner: ModelRunner) -> Optional[str]:
     if not is_flashinfer_gdn_prefill_available():
         return None
 
+    # SM100 keeps FlashInfer: the capture was benchmarked on SM90 only.
+    if sm_major == 9 and _gdn_prefill_graph_extend_captures(model_runner):
+        rank0_log("Using Triton GDN prefill for breakable CUDA graph capture.")
+        return None
     rank0_log(f"Defaulting SM{sm_major}0 GDN prefill backend to FlashInfer.")
     return "flashinfer"
 
