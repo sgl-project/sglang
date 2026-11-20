@@ -21,7 +21,6 @@ from sglang.kernels.ops.attention.msa_v1.indexer_decode_cp import (
     gather_scores,
     scatter_scores,
 )
-from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_parallel
 
 # Private MSA entry points: the score-only GEMM and the stock top-k.
@@ -261,8 +260,6 @@ def make_msa_v1_indexer_decode_cp(
     qmul4_available: bool,
     device: torch.device,
 ) -> MSAV1IndexerDecodeCP | None:
-    if not envs.SGLANG_OPT_MSA_V1_INDEXER_DECODE_CP.get():
-        return None
     parallel = get_parallel()
     group = parallel.attn_tp_group
     why = None
