@@ -699,8 +699,10 @@ class MultimodalInputs:
             else None
         )
 
-        for item in mm_items:
-            item.set_pad_value()
+        hash_rdma_images = obj.__dict__.pop("_hash_rdma_images", None)
+        if hash_rdma_images is None or not hash_rdma_images(mm_items):
+            for item in mm_items:
+                item.set_pad_value()
 
         from sglang.srt.mem_cache.events import register_mm_routing_labels
 

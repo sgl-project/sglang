@@ -11,6 +11,7 @@ from array import array
 from collections import OrderedDict, defaultdict
 from contextlib import asynccontextmanager
 from enum import IntEnum
+from functools import cached_property, partial
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
@@ -1363,6 +1364,55 @@ class WaitingZmqRequestGrpc(WaitingZmqRequest):
         )
 
 
+def _covers_rdma_image_buffer(buffer: torch.Tensor, items) -> bool:
+    if not items:
+        return False
+    start = offset = buffer.data_ptr()
+    for item in items:
+        tensor = item.precomputed_embeddings
+        if (
+            not item.is_image()
+            or item.feature is not None
+            or item.model_specific_data
+            or item.identity is not None
+            or item.hash is not None
+            or type(tensor) is not torch.Tensor
+            or tensor.device != buffer.device
+            or tensor.dtype != torch.bfloat16
+            or tensor.ndim != 2
+            or not tensor.is_contiguous()
+            or tensor.nbytes == 0
+            or tensor.data_ptr() != offset
+        ):
+            return False
+        offset += tensor.nbytes
+    return offset == start + buffer.nbytes
+
+
+def _hash_rdma_images(items, *, stream, buffer, finalizer) -> bool:
+    if not finalizer.alive:
+        raise RuntimeError("Mooncake slot released before embedding hashing")
+    if not _covers_rdma_image_buffer(buffer, items):
+        return False
+
+    try:
+        # The encoder sends completion only after the RDMA writes finish.
+        # Hashing copies the digest back to the host before returning.
+        with torch.cuda.stream(stream):
+            for item in items:
+                item.set_pad_value()
+    except BaseException:
+        try:
+            stream.synchronize()
+        except BaseException:
+            # Pending GPU reads may still reference the slot.
+            finalizer.detach()
+            logger.exception("Could not drain the RDMA embedding digest stream")
+            raise
+        raise
+    return True
+
+
 class WaitingRDMARequest(WaitingMMRequestBase):
     def __init__(
         self,
@@ -1381,6 +1431,7 @@ class WaitingRDMARequest(WaitingMMRequestBase):
         model_type: Optional[str] = None,
         embedding_pool=None,
         embedding_port=None,
+        digest_stream: Optional[torch.cuda.Stream] = None,
     ):
         super().__init__(
             rid=rid,
@@ -1394,6 +1445,7 @@ class WaitingRDMARequest(WaitingMMRequestBase):
             zmq_context=zmq_context,
             embedding_port=embedding_port,
         )
+        self.digest_stream = digest_stream
         self.embeddings_engine = embeddings_engine
         self.dtype = dtype
         self.device_type = device_type
@@ -1586,6 +1638,28 @@ class WaitingRDMARequest(WaitingMMRequestBase):
             if not await self._check_encoder_responses(send_responses, "/send"):
                 return
             logger.info(f"RDMA transfers completed for rid={self.rid}")
+
+    def _bind_pool_slot_to_mm_inputs(self, mm_inputs) -> bool:
+        buffer = self.embeddings_buffer
+        if not super()._bind_pool_slot_to_mm_inputs(mm_inputs):
+            return False
+
+        stream = self.digest_stream
+        if (
+            stream is not None
+            and buffer is not None
+            and buffer.device == stream.device
+            and self.recv_embedding_data.ready
+        ):
+            # The scheduler consumes this process-local callback at its usual
+            # hashing point. The slot and stream never enter IPC.
+            mm_inputs.__dict__["_hash_rdma_images"] = partial(
+                _hash_rdma_images,
+                stream=stream,
+                buffer=buffer,
+                finalizer=self._mm_finalizer,
+            )
+        return True
 
     def _extract_embedding_from_buffer(self, recv_obj, parts) -> None:
         # The embedding already landed in the pre-registered GPU buffer via
@@ -2717,6 +2791,45 @@ class MMReceiverHTTP(MMReceiverBase):
             encode_urls=encode_urls,
         )
 
+    @cached_property
+    def _rdma_digest_stream(self) -> Optional[torch.cuda.Stream]:
+        scheduler = self.scheduler
+        if (
+            self.embedding_pool is None
+            or self.device_type != "cuda"
+            or torch.version.cuda is None
+            or self.tp_size != 1
+            or self.nnodes != 1
+            or scheduler is None
+            or scheduler.disaggregation_mode.value != "prefill"
+            or not scheduler.enable_overlap
+            or self.model_type != "qwen3_vl"
+            or self.dtype != torch.bfloat16
+            or envs.SGLANG_MM_SKIP_COMPUTE_HASH.get()
+            or envs.SGLANG_MM_BUFFER_SIZE_MB.get() != 0
+        ):
+            return None
+
+        from sglang.srt.managers.utils import allocate_distinct_stream
+        from sglang.srt.multimodal.processors.qwen_vl import QwenVLImageProcessor
+
+        if type(self.mm_processor) is not QwenVLImageProcessor:
+            return None
+        try:
+            return allocate_distinct_stream(
+                torch.cuda,
+                (
+                    scheduler.schedule_stream,
+                    scheduler.forward_stream,
+                    scheduler.copy_stream,
+                ),
+            )
+        except RuntimeError:
+            logger.warning(
+                "Could not allocate an RDMA embedding digest stream", exc_info=True
+            )
+            return None
+
     # For zmq_to_scheduler and mooncake
     def process_waiting_requests(self, recv_reqs):
         if self.encoder_transfer_backend == "mooncake":
@@ -2728,6 +2841,7 @@ class MMReceiverHTTP(MMReceiverBase):
                 device_type=self.device_type,
                 gpu_id=self.gpu_id,
                 embedding_pool=self.embedding_pool,
+                digest_stream=self._rdma_digest_stream,
             )
         return self._process_waiting_requests(
             recv_reqs,

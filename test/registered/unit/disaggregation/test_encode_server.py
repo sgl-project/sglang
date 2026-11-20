@@ -1,8 +1,10 @@
 import asyncio
+import gc
 import pickle
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -17,7 +19,11 @@ from sglang.srt.disaggregation.encoder.preprocessor import (
     EncoderPreprocessResult,
     _convert,
 )
-from sglang.srt.disaggregation.encoder.receiver import EmbeddingData
+from sglang.srt.disaggregation.encoder.receiver import (
+    EmbeddingData,
+    EmbeddingPool,
+    WaitingRDMARequest,
+)
 from sglang.srt.disaggregation.encoder.runtime import (
     _DP_RELEASE_AFTER_ENCODE,
     DPDispatcher,
@@ -35,6 +41,11 @@ from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import
     MooncakeTransferEngine,
 )
 from sglang.srt.managers.io_struct import unwrap_from_pickle
+from sglang.srt.managers.req_types import (
+    MultimodalDataItem,
+    MultimodalInputs,
+    MultimodalProcessorOutput,
+)
 from sglang.srt.mem_cache.multimodal_cache import MultiModalStaticCache
 from sglang.srt.multimodal.encoder_preprocessing import EncoderMediaProcessorConfig
 from sglang.srt.multimodal.modality import Modality
@@ -748,6 +759,102 @@ class TestMooncakeTransferShutdown(CustomTestCase):
             self.assertEqual(deregistration, [(embedding.data_ptr(), True)])
 
         asyncio.run(run())
+
+
+class TestMooncakeDigestStream(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        self.buffer = torch.arange(24, dtype=torch.bfloat16).view(6, 4)
+        self.waiting = WaitingRDMARequest.__new__(WaitingRDMARequest)
+        self.waiting.embedding_pool = EmbeddingPool.__new__(EmbeddingPool)
+        self.waiting.embedding_pool.release = Mock()
+        self.waiting._pool_slot_id = 17
+        self.waiting.embeddings_buffer = self.buffer
+        self.waiting._buffer_lock = threading.Lock()
+        self.waiting._receive_running = False
+        self.waiting.registration_future = None
+        self.waiting.recv_embedding_data = SimpleNamespace(ready=True)
+        self.waiting.digest_stream = Mock(device=self.buffer.device)
+
+    def make_output(self):
+        return MultimodalProcessorOutput(
+            mm_items=[
+                MultimodalDataItem(
+                    modality=Modality.IMAGE,
+                    processor_fingerprint="sha256:" + "a" * 64,
+                    precomputed_embeddings=view,
+                )
+                for view in (self.buffer[:2], self.buffer[2:])
+            ],
+            input_ids=[42],
+        )
+
+    def test_ordered_slices_keep_the_same_identities_and_slot_owner(self):
+        original = MultimodalInputs.from_processor_output(self.make_output())
+        output = self.make_output()
+        self.assertTrue(self.waiting._bind_pool_slot_to_mm_inputs(output))
+        self.assertTrue(all(item.identity is None for item in output.mm_items))
+        with patch.object(torch.cuda, "stream", return_value=nullcontext()) as enter:
+            fast = MultimodalInputs.from_processor_output(output)
+        enter.assert_called_once_with(self.waiting.digest_stream)
+        for expected, actual in zip(original.mm_items, fast.mm_items):
+            self.assertEqual(actual.identity, expected.identity)
+            self.assertEqual(actual.hash, expected.hash)
+            self.assertEqual(actual.pad_values, expected.pad_values)
+            self.assertEqual(
+                actual.precomputed_embeddings.data_ptr(),
+                expected.precomputed_embeddings.data_ptr(),
+            )
+        self.assertNotEqual(fast.mm_items[0].identity, fast.mm_items[1].identity)
+        self.waiting.embedding_pool.release.assert_not_called()
+        self.waiting.release_resources()
+        del output
+        gc.collect()
+        self.waiting.embedding_pool.release.assert_called_once_with(17)
+
+    def test_reordered_views_fall_back_to_normal_hashing(self):
+        output = self.make_output()
+        output.mm_items.reverse()
+        self.assertTrue(self.waiting._bind_pool_slot_to_mm_inputs(output))
+        with patch.object(torch.cuda, "stream") as enter:
+            inputs = MultimodalInputs.from_processor_output(output)
+        enter.assert_not_called()
+        self.assertTrue(all(item.identity is not None for item in inputs.mm_items))
+
+    def test_hash_failure_drains_before_releasing_pool_slot(self):
+        output = self.make_output()
+        release = self.waiting.embedding_pool.release
+        stream = self.waiting.digest_stream
+        stream.synchronize.side_effect = lambda: release.assert_not_called()
+        self.assertTrue(self.waiting._bind_pool_slot_to_mm_inputs(output))
+        with (
+            patch.object(torch.cuda, "stream", return_value=nullcontext()),
+            patch.object(
+                MultimodalDataItem, "set_pad_value", side_effect=ValueError("hash")
+            ),
+            self.assertRaisesRegex(ValueError, "hash"),
+        ):
+            MultimodalInputs.from_processor_output(output)
+        stream.synchronize.assert_called_once_with()
+        self.waiting.release_resources()
+        release.assert_called_once_with(17)
+
+    def test_failed_drain_quarantines_the_pool_slot(self):
+        output = self.make_output()
+        self.waiting.digest_stream.synchronize.side_effect = RuntimeError("drain")
+        self.assertTrue(self.waiting._bind_pool_slot_to_mm_inputs(output))
+        with (
+            patch.object(torch.cuda, "stream", return_value=nullcontext()),
+            patch.object(
+                MultimodalDataItem, "set_pad_value", side_effect=ValueError("hash")
+            ),
+            self.assertRaisesRegex(RuntimeError, "drain"),
+        ):
+            MultimodalInputs.from_processor_output(output)
+        self.waiting.release_resources()
+        del output
+        gc.collect()
+        self.waiting.embedding_pool.release.assert_not_called()
 
 
 class TestMooncakeRegistration(CustomTestCase):
