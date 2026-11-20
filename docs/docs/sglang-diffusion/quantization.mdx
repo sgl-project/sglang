@@ -154,6 +154,14 @@ backend.
       <td>Auto-detected; reuses the SRT GPTQ/Marlin backend. No <code>--quantization</code> flag is needed; use TP/sequence parallelism rather than FSDP.</td>
     </tr>
     <tr>
+      <td><code>auto-round</code> MXFP8 (W8A8)</td>
+      <td>Full model repo whose transformers carry a self-describing <code>quantization_config</code> with <code>data_type: mx_fp</code> and <code>auto_round:llm_compressor</code> packing</td>
+      <td><code>--model-path</code></td>
+      <td>Wan2.2-T2V-A14B (tested with <code>intel-ai/Wan2.2-T2V-A14B-Diffusers-MXFP8-AutoRound</code>); <code>block_name_to_quantize</code> must name the model's own module prefixes (e.g. Wan's <code>blocks</code>)</td>
+      <td>None</td>
+      <td>Intel XPU only. Auto-detected; reuses the SRT compressed-tensors MXFP8 scheme (block-scaled <code>scaled_mm</code> GEMM). No <code>--quantization</code> flag is needed; use TP/sequence parallelism rather than FSDP.</td>
+    </tr>
+    <tr>
       <td><code>modelopt-nvfp4</code></td>
       <td>Mixed transformer directory/repo with <code>config.json</code>, raw or Comfy layer-marked NVFP4 safetensors, or full ModelOpt Diffusers repo</td>
       <td><code>--component-paths.&lt;component&gt;</code> for component repos; <code>--component-weights-paths.&lt;component&gt;</code> for raw files; <code>--model-path</code> for full repos</td>
@@ -1278,6 +1286,29 @@ sglang generate \
   --prompt "a beautiful sunset" \
   --save-output
 ```
+
+## MXFP8 Offline Quantization (AutoRound)
+
+AutoRound `mx_fp` W8A8 checkpoints (`packing_format: auto_round:llm_compressor`) are
+auto-detected from the `quantization_config` in the transformer's `config.json` on Intel XPU. Tested with
+[intel-ai/Wan2.2-T2V-A14B-Diffusers-MXFP8-AutoRound](https://huggingface.co/intel-ai/Wan2.2-T2V-A14B-Diffusers-MXFP8-AutoRound).
+Linears under `block_name_to_quantize` load as e4m3 weights with UE8M0 block-32
+scales; activations are quantized dynamically to the same format, and the GEMM is
+the block-scaled `torch.nn.functional.scaled_mm` (SRT's compressed-tensors MXFP8 scheme), the same GEMM
+as `--quantization mxfp8` on XPU.
+Other linears (e.g. `condition_embedder`, `proj_out`) stay BF16. No `--quantization`
+flag is needed:
+
+```bash
+sglang generate \
+  --model-path intel-ai/Wan2.2-T2V-A14B-Diffusers-MXFP8-AutoRound \
+  --prompt "a fox walking through neon rain" \
+  --save-output
+```
+
+Only dynamic block-32 W8A8 MXFP8 is supported; other AutoRound `mx_fp` layouts (e.g.
+MXFP4), per-layer `extra_config` and other platforms are rejected at load. AutoRound GPTQ
+checkpoints keep the existing `auto-round` path.
 
 ## MXFP4 Online Quantization
 
