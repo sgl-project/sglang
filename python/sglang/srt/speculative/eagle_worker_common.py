@@ -24,6 +24,7 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.runtime_context import mamba_track_grid
+from sglang.srt.sampling.watermarking.runtime import watermark_view_fields
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_utils import (
     build_tree_kernel_efficient,
@@ -66,8 +67,7 @@ def _fallback_post_verify(io: Any) -> Any:
         io.logits,
         io.grammar_mask,
         uno_target_max_top_k=io.sparse_target_max_top_k,
-        watermark_state=io.watermark,
-        watermark_full_mask=io.watermark_full_mask,
+        watermark=io.watermark,
         simulated_acc_len=io.simulated_accept_length,
         simulated_acc_len_rng=io.simulated_accept_length_rng,
         sparse_bonus_argmax=io.sparse_bonus_argmax,
@@ -237,10 +237,7 @@ def make_post_verify_io(
             need_top_k_sampling=bool(sampling_info.need_top_k_sampling),
             need_top_p_sampling=bool(sampling_info.need_top_p_sampling),
             need_min_p_sampling=bool(sampling_info.need_min_p_sampling),
-            watermark_keys=sampling_info.watermark_keys,
-            watermark_context_windows=sampling_info.watermark_context_windows,
-            watermark_enabled=sampling_info.watermark_enabled,
-            has_watermark_candidates=bool(sampling_info.has_watermark_candidates),
+            **watermark_view_fields(sampling_info.watermark),
             max_top_k=sampling_info.max_top_k,
             device=torch.device(device),
         ),
@@ -942,12 +939,20 @@ def run_eagle_verify(
     # Sample
     maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
     maybe_detect_inf(logits_output.next_token_logits, "verify: target model logits")
-    if envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get():
-        watermark_full_mask = (
-            target_worker.model_runner.attn_backend.verify_mask is None
-            or target_worker.model_runner.attn_backend.verify_mask.mode
-            == TreeMaskMode.FULL_MASK
+    watermark_full_mask = (
+        target_worker.model_runner.attn_backend.verify_mask is None
+        or target_worker.model_runner.attn_backend.verify_mask.mode
+        == TreeMaskMode.FULL_MASK
+    )
+    watermark_engine = target_worker.model_runner.watermark
+    watermark = (
+        watermark_engine.bind_verify(
+            batch.sampling_info.watermark, full_mask=watermark_full_mask
         )
+        if watermark_engine is not None
+        else None
+    )
+    if envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get():
         # Without its forced length on the device, eagle_sample would leave the fused
         # chain for the tree kernels and draw the length on the host instead.
         simulated_accept_length = None
@@ -964,7 +969,7 @@ def run_eagle_verify(
                 device=batch.device,
                 logits_output=logits_output,
                 grammar_mask=grammar_mask,
-                watermark=target_worker.model_runner.watermark_state,
+                watermark=watermark,
                 watermark_full_mask=watermark_full_mask,
                 return_logprob=batch.return_logprob,
                 is_idle=batch.forward_mode.is_idle(),
@@ -988,12 +993,7 @@ def run_eagle_verify(
             logits_output,
             grammar_mask,
             uno_target_max_top_k=uno_target_max_top_k,
-            watermark_state=target_worker.model_runner.watermark_state,
-            watermark_full_mask=(
-                target_worker.model_runner.attn_backend.verify_mask is None
-                or target_worker.model_runner.attn_backend.verify_mask.mode
-                == TreeMaskMode.FULL_MASK
-            ),
+            watermark=watermark,
             simulated_acc_len_rng=simulated_acc_len_rng,
             sparse_bonus_argmax=sparse_bonus_argmax,
         )
@@ -1044,12 +1044,9 @@ def run_eagle_verify(
         prepared_step_indices=prepared_commit_steps,
     )
 
-    if (
-        not batch.forward_mode.is_idle()
-        and target_worker.model_runner.watermark_state is not None
-        and batch.sampling_info.has_watermark_candidates
-    ):
-        target_worker.model_runner.watermark_state.append_speculative(
+    if not batch.forward_mode.is_idle() and watermark is not None:
+        target_worker.model_runner.watermark.append_accept_tokens(
+            batch.sampling_info.watermark,
             batch.req_pool_indices,
             predict[accept_index],
             accept_lens,
