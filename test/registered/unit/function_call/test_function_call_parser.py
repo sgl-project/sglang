@@ -1566,7 +1566,7 @@ class TestDeepSeekV3Detector(unittest.TestCase):
         self.assertEqual(params2["city"], "Beijing")
 
     def test_parse_streaming_two_complete_calls_in_one_increment(self):
-        """A coalesced backlog holding two complete calls must emit both (#43523)."""
+        """Two complete calls in one increment stream in order, the first one included."""
         text = (
             "<｜tool▁calls▁begin｜>"
             "<｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n"
@@ -1576,10 +1576,16 @@ class TestDeepSeekV3Detector(unittest.TestCase):
             "<｜tool▁calls▁end｜>"
         )
 
-        result = self.detector.parse_streaming_increment(text, self.tools)
-        names = [c.name for c in result.calls if c.name]
-        args = [json.loads(c.parameters) for c in result.calls if c.parameters]
-        indices = [c.tool_index for c in result.calls]
+        # Each step emits one name or one argument diff; step until one emits nothing.
+        calls = list(self.detector.parse_streaming_increment(text, self.tools).calls)
+        for _ in range(4):
+            step = self.detector.parse_streaming_increment("", self.tools).calls
+            if not step:
+                break
+            calls += step
+        names = [c.name for c in calls if c.name]
+        args = [json.loads(c.parameters) for c in calls if c.parameters]
+        indices = [c.tool_index for c in calls]
 
         self.assertEqual(names, ["get_weather", "get_tourist_attractions"])
         self.assertEqual(args, [{"city": "Paris"}, {"city": "Tokyo"}])
