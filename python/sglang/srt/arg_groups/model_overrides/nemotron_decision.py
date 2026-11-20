@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, Optional
 
 from sglang.srt.arg_groups.model_override_base import (
     register_model_override,
@@ -23,13 +23,33 @@ def apply_nemotron_decision_prefill_defaults(
     if server_args.max_prefill_tokens is None:
         gpu_mem = get_device_memory_capacity(resolving_view(server_args).device)
         # Smaller GPUs need a smaller activation reserve for a complete read.
-        budget = 16384 if gpu_mem is not None and gpu_mem < 60 * 1024 else 32768
+        if gpu_mem is not None and gpu_mem >= 60 * 1024:
+            budget = 131072
+        else:
+            budget = 16384
         updates["max_prefill_tokens"] = min(
             budget,
             model_config.context_len,
             model_config.nemotron_decision_config["max_input_tokens"],
         )
     declare_resolution(server_args, "nemotron_decision_prefill_defaults", **updates)
+
+
+def nemotron_decision_activation_reserve_mb(
+    model_config: Any, activation_tokens: int, gpu_mem: Optional[float]
+) -> Optional[float]:
+    if not is_nemotron_decision(model_config.hf_config):
+        return None
+
+    if gpu_mem is None or gpu_mem < 60 * 1024:
+        return None
+
+    config = model_config.hf_config
+    # Full reads need room for MLP intermediates, residuals and attention buffers.
+    elements_per_token = 4 * config.intermediate_size + 12 * config.hidden_size
+    return (
+        activation_tokens * elements_per_token * model_config.dtype.itemsize / 1024**2
+    )
 
 
 @register_model_override("NemotronForDecision")
