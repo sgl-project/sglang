@@ -792,6 +792,23 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "does not support HiSparse"):
             _build_deepseek_v4_device_pool_group(kvcache, 2)
 
+    def test_deepseek_v4_refuses_pages_beside_the_compressed_layout(self):
+        """Ernie 5.5 keeps its MLA layers' pages in extra host regions; a linker
+        that does not store them would restore those layers from stale pages."""
+        from sglang.srt.mem_cache.ernie55_memory_pool import Ernie5_5TokenToKVPool
+
+        region = SimpleNamespace(pool_name=PoolName.ERNIE5_5_MLA)
+        with patch.object(
+            Ernie5_5TokenToKVPool, "extra_host_regions", return_value=(region,)
+        ):
+            ernie = _dsv4_pool(Ernie5_5TokenToKVPool, c4_kv_pool=None)
+            target = _dsv4_pool(DeepSeekV4TokenToKVPool, c4_kv_pool=None)
+            for kvcache, drafts in ((ernie, ()), (target, (ernie,))):
+                with self.assertRaisesRegex(
+                    ValueError, "beside its compressed-KV layout"
+                ):
+                    _build_deepseek_v4_device_pool_group(kvcache, 2, drafts)
+
     def test_dsa_uses_hybrid_assembler_strategy(self):
         from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 
