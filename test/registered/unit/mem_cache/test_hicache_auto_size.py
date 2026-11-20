@@ -247,6 +247,11 @@ class TestHiCacheAutoSize(CustomTestCase):
         )
         # Four ranks per host; this rank's ~8 KB pool fits its 10 KB share.
         free = [base.HICACHE_HOST_MEMORY_RESERVE_BYTES + 4 * 10_000]
+
+        def node_mates_allocate(**_):
+            free[0] = base.HICACHE_HOST_MEMORY_RESERVE_BYTES
+
+        world = SimpleNamespace(world_group=SimpleNamespace(cpu_group=None))
         with (
             # What an explicit --hicache-ratio or --hicache-size resolves to.
             get_context().override_server_args(
@@ -256,9 +261,14 @@ class TestHiCacheAutoSize(CustomTestCase):
             patch.object(
                 base, "available_host_memory_bytes", side_effect=lambda **_: free[0]
             ),
+            patch.object(torch.distributed, "is_initialized", return_value=True),
+            patch.object(sizing, "get_parallel", return_value=world),
+            patch.object(
+                torch.distributed, "barrier", side_effect=node_mates_allocate
+            ) as barrier,
             sizing.auto_size_hicache(params, None, enabled=True),
         ):
-            free[0] = base.HICACHE_HOST_MEMORY_RESERVE_BYTES  # node mates allocated
+            barrier.assert_called_once()
             MHATokenToKVPoolHost(
                 pool.get_device_pool_infos()[0].buffer_info,
                 1.0,
