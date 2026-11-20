@@ -130,6 +130,61 @@ class TestCommonSenderLifecycle(unittest.TestCase):
         self.assertEqual(sender.poll_pp_consensus(), KVPoll.Success)
         self.assertEqual(sender.conclude_state, KVPoll.Success)
 
+    def test_transfer_latency_ends_at_worker_success_not_at_poll(self):
+        """A busy scheduler polls long after the worker finished; the reported
+        latency must not absorb that poll delay."""
+        sender, manager, _ = make_sender(NixlKVManager)
+        manager.request_status[42] = KVPoll.WaitingForInput
+        sender.init(2, aux_index=0)
+        clock = "sglang.srt.disaggregation.common.conn.time.perf_counter"
+        with patch(clock, return_value=10.0):
+            sender.send(np.array([10, 11], dtype=np.int32), num_kv_tokens=128)
+        with patch(clock, return_value=10.5):
+            manager.update_status(42, KVPoll.Success)
+        with patch(clock, return_value=13.0):
+            self.assertEqual(sender.poll(), KVPoll.Success)
+        self.assertAlmostEqual(sender._transfer_metric.transfer_latency_s, 0.5)
+
+    def test_transfer_latency_includes_a_staging_chunk_drained_after_success(self):
+        """A staging chunk deferred past the last one ends the transfer at its
+        drain, even when no poll lands while it is outstanding."""
+        sender, manager, _ = make_sender(NixlKVManager)
+        manager.request_status[42] = KVPoll.WaitingForInput
+        sender.init(2, aux_index=0)
+        clock = "sglang.srt.disaggregation.common.conn.time.perf_counter"
+        with patch(clock, return_value=10.0):
+            sender.send(np.array([10, 11], dtype=np.int32), num_kv_tokens=128)
+        manager._staging_outstanding[42] = 1
+        with patch(clock, return_value=10.5):
+            manager.update_status(42, KVPoll.Success)
+        self.assertIsNone(manager.pop_success_time(42))
+        # The NIXL worker stamps the drain, then releases the room.
+        with patch(clock, return_value=12.0):
+            manager.record_success_time(42)
+        manager._staging_outstanding.pop(42)
+        with patch(clock, return_value=13.0):
+            self.assertEqual(sender.poll(), KVPoll.Success)
+        self.assertAlmostEqual(sender._transfer_metric.transfer_latency_s, 2.0)
+
+    def test_success_time_is_not_recorded_for_failed_or_untimed_rooms(self):
+        sender, manager, _ = make_sender(NixlKVManager)
+        manager.request_status[42] = KVPoll.Transferring
+        manager.update_status(42, KVPoll.Failed)
+        self.assertIsNone(manager.pop_success_time(42))
+        # Mooncake does not report its own latency, so it records nothing.
+        _, mooncake, _ = make_sender(MooncakeKVManager)
+        mooncake.request_status[42] = KVPoll.Transferring
+        mooncake.update_status(42, KVPoll.Success)
+        self.assertIsNone(mooncake.pop_success_time(42))
+
+    def test_reused_room_drops_a_stale_success_time(self):
+        _, manager, _ = make_sender(NixlKVManager)
+        manager.request_status[42] = KVPoll.Transferring
+        manager.update_status(42, KVPoll.Success)
+        manager.request_status.pop(42)
+        manager.update_status(42, KVPoll.Bootstrapping)
+        self.assertIsNone(manager.pop_success_time(42))
+
     def test_mooncake_trace_context_reaches_worker_and_finishes(self):
         trace = Mock(tracing_enable=True)
         with (
