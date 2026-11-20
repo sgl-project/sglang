@@ -110,20 +110,6 @@ class TestTokenIdsLogprobRows(DefaultServerBase):
         response = self._score(input_ids, 999, token_ids_logprob_rows=rows)
         self.assertEqual(response.status_code, 400, response.text)
 
-    def test_malformed_requests_are_rejected(self):
-        input_ids, rows = self._case(length=40, logprob_start_len=19, seed=3)
-        bad = {
-            "too few rows": dict(token_ids_logprob_rows=rows[:-1]),
-            "with flat ids": dict(token_ids_logprob_rows=rows, token_ids_logprob=[5]),
-            "out of vocabulary": dict(token_ids_logprob_rows=[[10**9]] + rows[1:]),
-            "decoding": dict(
-                token_ids_logprob_rows=rows, sampling_params={"max_new_tokens": 4}
-            ),
-        }
-        for name, ask in bad.items():
-            with self.subTest(name):
-                self.assertEqual(self._score(input_ids, 19, **ask).status_code, 400)
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -24,12 +24,14 @@ UNSUPPORTED = {
     "negative-id": {"token_ids_logprob_rows": [[4, 2], [-1]]},
     "boolean-id": {"token_ids_logprob_rows": [[4, 2], [True]]},
     "non-list-row": {"token_ids_logprob_rows": [[4, 2], 5]},
+    "non-list-rows": {"token_ids_logprob_rows": 5},
     "no-logprobs": {"return_logprob": False},
     "decoding": {"sampling_params": {"max_new_tokens": 1}},
     "no-start": {"logprob_start_len": -1},
     "streaming": {"stream": True},
     "multi-item": {"multi_item_delimiter_indices": [1, 2]},
     "pooled-positions": {"token_indices_to_pool": [1, 2]},
+    "session": {"session_params": {"id": "s"}},
     "text-input": {"input_ids": None, "text": "hello"},
 }
 
@@ -47,9 +49,13 @@ def _request(**overrides):
     return request
 
 
-def _validate(request, disaggregation_mode=DisaggregationMode.NULL):
+def _validate(
+    request, disaggregation_mode=DisaggregationMode.NULL, is_encoder_decoder=False
+):
     manager = TokenizerManager.__new__(TokenizerManager)
-    manager.model_config = SimpleNamespace(vocab_size=8)
+    manager.model_config = SimpleNamespace(
+        token_id_vocab_size=8, is_encoder_decoder=is_encoder_decoder
+    )
     manager.disaggregation_mode = disaggregation_mode
     manager._validate_token_ids_logprob_rows(request)
 
@@ -62,7 +68,7 @@ def test_valid_requests():
 
 @pytest.mark.parametrize("overrides", UNSUPPORTED.values(), ids=UNSUPPORTED.keys())
 def test_unsupported_request_is_rejected(overrides):
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="token_ids_logprob_rows"):
         _validate(_request(**overrides))
 
 
@@ -72,8 +78,13 @@ def test_batched_input_is_rejected():
 
 
 def test_pd_disaggregation_is_rejected():
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="token_ids_logprob_rows"):
         _validate(_request(), DisaggregationMode.PREFILL)
+
+
+def test_encoder_decoder_model_is_rejected():
+    with pytest.raises(ValueError, match="token_ids_logprob_rows"):
+        _validate(_request(), is_encoder_decoder=True)
 
 
 @pytest.mark.parametrize("boundaries", [(), (12,), (24,), (30,), (12, 24, 30)])

@@ -578,11 +578,11 @@ def wait_for_schedulers_to_exit() -> None:
         )
 
 
-def _requested_token_ids(obj) -> Optional[list]:
+def _requested_token_ids(obj: GenerateReqInput) -> Optional[list]:
     """The token ids a request asked log-probabilities at, in either form."""
     if obj.token_ids_logprob is not None:
         return obj.token_ids_logprob
-    return getattr(obj, "token_ids_logprob_rows", None)
+    return obj.token_ids_logprob_rows
 
 
 class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
@@ -1548,9 +1548,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Validate generation-specific fields
         if isinstance(obj, GenerateReqInput):
             self._validate_token_ids_logprob(obj)
-            self._validate_token_ids_logprob_rows(obj)
             self._validate_top_logprobs_num(obj)
             self._validate_logprob_start_len(obj)
+            self._validate_token_ids_logprob_rows(obj)
             requested_hidden_mode = get_request_return_hidden_states_mode(
                 obj.return_hidden_states
             )
@@ -1689,6 +1689,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             or obj.token_ids_logprob is not None
             or obj.multi_item_delimiter_indices is not None
             or obj.token_indices_to_pool is not None
+            or obj.session_params is not None
+            or self.model_config.is_encoder_decoder
             or self.disaggregation_mode != DisaggregationMode.NULL
         ):
             raise ValueError(
@@ -1697,9 +1699,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
         # The first reported position has no predecessor in the scored range.
         scored = len(obj.input_ids) - obj.logprob_start_len - 1
-        vocab_size = self.model_config.vocab_size
+        vocab_size = self.model_config.token_id_vocab_size
         if (
-            len(rows) != scored
+            not isinstance(rows, list)
+            or len(rows) != scored
             or not all(isinstance(row, list) for row in rows)
             or any(
                 type(i) is not int or not 0 <= i < vocab_size

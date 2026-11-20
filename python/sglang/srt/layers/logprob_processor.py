@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import bisect
 import dataclasses
+import itertools
 import logging
 from contextlib import nullcontext
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Union
 
+import numpy as np
 import torch
 
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -307,7 +309,10 @@ class _RaggedRows:
     lengths: List[int]
 
     def tolist(self) -> List[List[float]]:
-        return [row.tolist() for row in self.values.split(self.lengths)]
+        # One host copy for all rows, then cut in Python.
+        flat = self.values.tolist()
+        ends = itertools.accumulate(self.lengths)
+        return [flat[end - length : end] for length, end in zip(self.lengths, ends)]
 
 
 def _gather_token_id_rows(
@@ -319,19 +324,27 @@ def _gather_token_id_rows(
 ) -> _RaggedRows:
     """Gather each row's own token ids from ``logprobs`` with one host copy."""
     device = logprobs.device
-    index = torch.tensor(
-        [(first_row + r, t) for r, row in enumerate(token_id_rows) for t in row],
-        dtype=torch.long,
-        pin_memory=is_pin_memory_available(device),
-    ).to(device, non_blocking=True)
-    rows, columns = index.reshape(-1, 2).unbind(1)
+    lengths = [len(row) for row in token_id_rows]
+    num_ids = sum(lengths)
+    index = torch.empty(
+        (2, num_ids), dtype=torch.long, pin_memory=is_pin_memory_available(device)
+    )
+    index[0] = torch.arange(first_row, first_row + len(lengths)).repeat_interleave(
+        torch.tensor(lengths, dtype=torch.long), output_size=num_ids
+    )
+    index[1] = torch.from_numpy(
+        np.fromiter(
+            itertools.chain.from_iterable(token_id_rows), dtype=np.int64, count=num_ids
+        )
+    )
+    rows, columns = index.to(device, non_blocking=True).unbind(0)
     values = logprobs[rows, columns]
     if log_normalizer is not None:
         row_max, row_log_sum = log_normalizer
         values = (values.float() - row_max[rows]) - row_log_sum[rows]
     if copy_to_pinned_cpu:
         values = async_d2h(values)
-    return _RaggedRows(values, [len(row) for row in token_id_rows])
+    return _RaggedRows(values, lengths)
 
 
 def get_token_ids_logprobs_chunk(
@@ -351,7 +364,7 @@ def get_token_ids_logprobs_chunk(
             With ``log_normalizer`` set, raw logits instead; gathered rows are
             normalized by subtraction.
         token_ids_logprobs: For each sequence, the token IDs to report at every
-            row, or a TokenIdRows giving each of its rows its own
+            row, or a TokenIdRows giving each row its own token IDs
         pruned_lens: List of pruned lengths for each sequence
         token_ids_logprobs_val: List to store token logprob values
         token_ids_logprobs_idx: List to store token indices
@@ -866,7 +879,7 @@ class InputLogprobProcessor:
         )
 
 
-def _next_token_ids(token_ids_logprobs: List) -> List[Optional[List[int]]]:
+def _drop_token_id_rows(token_ids_logprobs: List) -> List[Optional[List[int]]]:
     return [
         None if isinstance(token_ids, TokenIdRows) else token_ids
         for token_ids in token_ids_logprobs
@@ -904,7 +917,7 @@ class OutputLogprobProcessor:
                 result.token_ids_logprobs_val,
                 result.token_ids_logprobs_idx,
             ) = get_token_ids_logprobs(
-                logprobs, _next_token_ids(token_ids_logprobs), no_copy_to_cpu=True
+                logprobs, _drop_token_id_rows(token_ids_logprobs), no_copy_to_cpu=True
             )
 
         result.token_logprobs = logprobs[
@@ -931,7 +944,7 @@ class OutputLogprobProcessor:
             logger.warning("No logits available for logprob computation")
             return None
 
-        token_ids_logprobs = _next_token_ids(token_ids_logprobs)
+        token_ids_logprobs = _drop_token_id_rows(token_ids_logprobs)
         # Check if any requests actually need logprobs computation
         needs_token_ids_logprobs = any(
             token_ids is not None and len(token_ids) > 0
