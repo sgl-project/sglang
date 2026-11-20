@@ -40,6 +40,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_available_gpu_memory,
+    is_gfx95_supported,
     is_host_cpu_arm64,
     is_npu,
     monkey_patch_p2p_access_check,
@@ -139,7 +140,7 @@ def init_parallel_runtime(
             get_parallel().tp_rank,
         )
         raise
-    if current_platform.is_rocm():
+    if current_platform.is_rocm() and is_gfx95_supported():
         from sglang.srt.distributed.bootstrap_rocm import reserve_runtime_memory
 
         reserve_runtime_memory(device=device, gpu_id=get_device().gpu_id)
