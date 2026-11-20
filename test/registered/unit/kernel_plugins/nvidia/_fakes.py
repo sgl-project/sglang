@@ -121,7 +121,7 @@ class FakeDFlashRuntime:
     """A DFLASH runtime (kimi_k31_dflash_binding.py) recording what it was built with."""
 
     exports = frozenset({"block_size", "mask_token_id"})
-    invariants = {"block_size": 8, "selector_sampling": True, "tp_size": 4}
+    guards = {"block_size": 8, "selector_sampling": True, "tp_size": 4}
 
     def __init__(self, binding, built):
         self.binding, self.built = binding, built

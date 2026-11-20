@@ -317,13 +317,13 @@ class TestDFlashBinding(CustomTestCase):
         wrong_tp = type(
             "Runtime",
             (FakeDFlashRuntime,),
-            {"invariants": {"tp_size": 16, "block_size": 8}},
+            {"guards": {"tp_size": 16, "block_size": 8}},
         )
         with self.assertLogs(kimi_k31_dflash_binding.logger, "WARNING") as logs:
             self.assertIsNone(self._bind(names, runtime=wrong_tp, block_size=5))
         (warning,) = logs.output
         self.assertRegex(warning, r"does not serve this DFLASH setup \(block_size is 5")
-        self.assertRegex(warning, r"tp_size is 4 .*expected 16")
+        self.assertRegex(warning, r"tp_size is 4, expected 16\)")
         self.assertIn("DFlash phases run stock", warning)
         with (
             get_parallel().override(tp_rank=1),
@@ -337,10 +337,12 @@ class TestDFlashBinding(CustomTestCase):
         def runtime(**attrs):
             return type("Runtime", (FakeDFlashRuntime,), attrs)
 
-        with self.assertRaisesRegex(RuntimeError, r"does not export \['draft_kv'"):
+        with self.assertRaisesRegex(
+            RuntimeError, r"binding has no export \['draft_kv'\]"
+        ):
             self._bind(names, runtime=runtime(exports=frozenset({"draft_kv"})))
-        unknown_key = runtime(invariants={"draft_kv": 1})
-        with self.assertRaisesRegex(RuntimeError, "guard key draft_kv"):
+        unknown_key = runtime(guards={"draft_kv": 1})
+        with self.assertRaisesRegex(RuntimeError, r"guard has no key \['draft_kv'\]"):
             self._bind(names, runtime=unknown_key)
 
         def guard_differs_on_rank_1(value, group=None):
