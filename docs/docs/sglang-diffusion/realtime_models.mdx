@@ -47,6 +47,58 @@ details:
 For the complete model list, see
 [Supported Models](./compatibility_matrix).
 
+## Session Protocol
+
+Every realtime pipeline uses the same WebSocket protocol at
+`/v1/realtime_video/generate`. The model cookbooks list each model's `init`
+fields and event kinds. This section covers what is the same for all of them.
+
+Send every client message as a binary WebSocket frame containing a MessagePack
+map. Server messages are binary MessagePack maps as well, except for the raw
+payload that follows a `frame_batch_header`.
+
+### Message Flow
+
+1. The client opens the WebSocket and sends one `init` message (`type: "init"`).
+2. The server generates chunks back to back. For each chunk it sends the
+   chunk's frames as one or more frame-batch messages, then one `chunk_stats`
+   message.
+3. After `init`, the client may send `event` messages (`type: "event"`) at any
+   time. The server samples pending events when it prepares a chunk, so an
+   event that arrives while a chunk is being generated applies to the chunk
+   after it. Frame batches carry the `event_id` of the latest event their chunk
+   sampled; compare it with the `event_id` you sent to measure input-to-frame
+   latency.
+4. The session ends when it reaches `max_chunks`, including when the model ends
+   it (HY-Nomas after an `end` event, SANA-WM after a chunk with no frames), or
+   when the client disconnects.
+
+### Server Messages
+
+| `type` | Sent | Contents |
+| --- | --- | --- |
+| `frame_batch` | For each frame batch whose payload is under 64 KiB | The encoded frames in `payload`. |
+| `frame_batch_header` | For each larger frame batch | The same metadata without `payload`. The next WebSocket message is the payload itself: `total_size` bytes, not MessagePack. The server never sends another message between the two. |
+| `chunk_stats` | After the last frame batch of each chunk | Server-side timing and size for the chunk, including `request_prepare_ms`, `scheduler_forward_ms`, `pace_wait_ms`, `ws_write_ms`, `chunk_total_ms`, `num_frames`, and `ws_payload_bytes`. |
+| `error` | When a message is rejected or generation fails | A text description in `content`. |
+
+Frame-batch metadata includes `request_id`, `chunk_index`, `content_type`,
+`num_frames`, `total_size`, `frame_batch_index`, `num_frame_batches`, and
+`is_final_frame_batch`; the last batch of a chunk has
+`is_final_frame_batch: true`. Raw RGB and encoded preview batches also carry
+`width` and `height`. The payload layout for each output format is described
+with `realtime_output_format` in the model cookbooks.
+
+### Errors and Session End
+
+| Situation | Server behavior |
+| --- | --- |
+| Invalid `init` | Sends `error` and waits for another `init` on the same connection. |
+| Invalid `event` | Sends `error`; the session keeps generating. |
+| Session reaches `max_chunks` | Sends the last chunk, then closes with code `1000` and reason `generation complete`. |
+| Another session holds the GPU slot for more than one second | Sends `error`, then closes with code `1008`. |
+| Client disconnects | Stops requesting chunks and releases the session's state on the scheduler. |
+
 ## Causal Cache Controls
 
 Realtime requests expose two causal-cache overrides where supported by the
