@@ -236,16 +236,16 @@ class ForwardBatchDeepSeekMHAMixin:
         # Here we compute chunk lens twice to avoid stream sync, once on gpu and once on cpu.
         prefix_chunk_starts_cuda, prefix_chunk_seq_lens_cuda = (
             compute_prefix_chunk_seq_lens(
-                self.extend_prefix_lens,
-                self.num_prefix_chunks,
-                self.prefix_chunk_len,
+                prefix_lens=self.extend_prefix_lens,
+                num_prefix_chunks=self.num_prefix_chunks,
+                prefix_chunk_len=self.prefix_chunk_len,
             )
         )
         prefix_chunk_starts_cpu, prefix_chunk_seq_lens_cpu = (
             compute_prefix_chunk_seq_lens(
-                torch.tensor(self.extend_prefix_lens_cpu),
-                self.num_prefix_chunks,
-                self.prefix_chunk_len,
+                prefix_lens=torch.tensor(self.extend_prefix_lens_cpu),
+                num_prefix_chunks=self.num_prefix_chunks,
+                prefix_chunk_len=self.prefix_chunk_len,
             )
         )
         self.prefix_chunk_starts = prefix_chunk_starts_cuda
