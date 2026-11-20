@@ -278,11 +278,21 @@ class DecodeReqToTokenPool:
     def available_size(self):
         return len(self.free_slots)
 
+    def attach_aux_cache(self, cache):
+        if self._aux_cache is not None:
+            raise ValueError("Decode request pool already owns an auxiliary cache")
+        self._aux_cache = cache
+
     def reset_aux_cache_allocator(self) -> None:
-        pass
+        if self._aux_cache is not None:
+            self._aux_cache.reset_allocator()
 
     def schedulable_token_capacity(self, physical_capacity: int) -> int:
-        return physical_capacity
+        return (
+            min(physical_capacity, self._aux_cache.dense_capacity)
+            if self._aux_cache is not None
+            else physical_capacity
+        )
 
     def alloc_aux_to_lengths(
         self,
@@ -290,7 +300,11 @@ class DecodeReqToTokenPool:
         req_pool_indices_cpu: torch.Tensor,
         target_seq_lens_cpu: torch.Tensor,
     ) -> None:
-        pass
+        if self._aux_cache is not None:
+            self._aux_cache.alloc_to_lengths(
+                req_pool_indices_cpu=req_pool_indices_cpu,
+                target_seq_lens_cpu=target_seq_lens_cpu,
+            )
 
     def alloc(self, reqs: List[Req]) -> Optional[List[int]]:
         # Indices of reqs that already have a req_pool_idx and will reuse
@@ -317,12 +331,16 @@ class DecodeReqToTokenPool:
 
     def free(self, req: Req):
         assert req.kv.holds_kv, "request must have req_pool_idx"
+        if self._aux_cache is not None:
+            self._aux_cache.free(req.kv.req_pool_idx)
         self.free_slots.append(req.kv.req_pool_idx)
         req.kv.req_pool_idx = None
 
     def clear(self):
         self.free_slots = list(range(1, self._alloc_size))
         # req_generation must stay monotonic; see ReqToTokenPool.clear().
+        if self._aux_cache is not None:
+            self._aux_cache.clear()
 
     def register_on_alloc_rows(self, hook: Callable[[List[int]], None]) -> None:
         assert self._on_alloc_rows is None
@@ -496,7 +514,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.token_to_kv_pool = token_to_kv_pool_allocator.get_kvcache()
-        self.draft_token_to_kv_pool = draft_token_to_kv_pool
+        # The typed lane owns private regions, independently of target MLA IDs.
+        self.draft_token_to_kv_pool = (
+            None if get_spec().speculative_draft_pd_lane else draft_token_to_kv_pool
+        )
         self.draft_kv_ring = draft_kv_ring
         self.is_mla_backend = is_mla_backend(self.token_to_kv_pool)
         # Whether the last move_preallocated stopped on a full host staging pool.
@@ -1069,12 +1090,21 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         kv_args.ib_device = get_disagg().disaggregation_ib_device
         kv_args.gpu_id = get_device().gpu_id
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
+        if get_spec().speculative_draft_pd_lane:
+            from sglang.srt.disaggregation.draft_lane_runtime import DraftPDLane
+
+            kv_args.draft_lane = DraftPDLane(
+                self.scheduler.draft_worker, self.scheduler, prefill=False
+            )
+            kv_args.draft_lane_regions = kv_args.draft_lane.registerable_regions()
         kv_manager = kv_manager_class(
             kv_args,
             DisaggregationMode.DECODE,
             self.scheduler.server_args,
             self.is_mla_backend,
         )
+        if kv_args.draft_lane is not None:
+            kv_args.draft_lane.start()
         if (
             get_disagg().disaggregation_decode_host_receive_threshold < 1
             and not kv_manager.supports_host_destination
@@ -1958,6 +1988,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 self.draft_kv_ring.reset_floor(
                     int(decode_req.req.kv.req_pool_idx),
                     pre_alloc_fill_len(decode_req.req),
+                )
+            if self.kv_manager.draft_lane is not None:
+                self.kv_manager.draft_lane.begin_lease(
+                    decode_req.req, decode_req.kv_receiver, fill_len
                 )
             decode_req.prefix_match = prefix_match
             hisparse_req_budget -= 1
@@ -3564,9 +3598,21 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         return
 
     def _pollers(self) -> list:
-        if self.scheduler.enable_decode_hicache:
-            return [HiCacheRestoreGatedKVReceiver(dr) for dr in self.queue.items()]
-        return [dr.kv_receiver for dr in self.queue.items()]
+        requests = list(self.queue.items())
+        pollers = (
+            [HiCacheRestoreGatedKVReceiver(dr) for dr in requests]
+            if self.scheduler.enable_decode_hicache
+            else [dr.kv_receiver for dr in requests]
+        )
+        lane = self.scheduler.disagg_decode_prealloc_queue.kv_manager.draft_lane
+        if lane is not None:
+            from sglang.srt.disaggregation.draft_lane_runtime import DraftReadyPoller
+
+            pollers = [
+                DraftReadyPoller(p, lane, dr.req.bootstrap_room)
+                for p, dr in zip(pollers, requests)
+            ]
+        return pollers
 
     def _poll_with_metadata_gate(self) -> List[int]:
         return poll_and_all_reduce(
@@ -4536,6 +4582,7 @@ class SchedulerDisaggregationDecodeMixin:
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
     def process_decode_queue(self: Scheduler, defer_prealloc: bool = False) -> bool:
         """Return whether the overlap loop must preallocate after its launch."""
+        self.disagg_decode_prealloc_queue.kv_manager.service_draft_lane()
         if self.enable_decode_hicache:
             self.tree_cache.check_hicache_events()
         elif (

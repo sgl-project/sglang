@@ -61,7 +61,7 @@ from sglang.srt.models.utils import (
     bind_or_assign,
     keeps_no_quant_config,
 )
-from sglang.srt.runtime_context import get_parallel, get_spec
+from sglang.srt.runtime_context import get_disagg, get_parallel, get_spec
 from sglang.srt.speculative.dflash_utils import (
     can_dflash_slice_qkv_weight,
     get_dflash_attention_sliding_window_size,
@@ -274,13 +274,19 @@ def candidate_topk(
             "DFlash candidate top-k requires a dense FP16/BF16/FP32 target lm_head "
             "or a supported lm_head.quant_method."
         )
-    if lm_head.tp_size > 1 and lm_head.tp_size != get_parallel().tp_size:
-        raise RuntimeError(
-            "DFlash candidate top-k: the target lm_head is vocab-sharded over a "
-            "group other than the draft's; with dp attention, pass "
-            "--enable-dp-lm-head."
-        )
-    tp = lm_head.tp_size == 1
+    layout = getattr(lm_head, "draft_head_layout", None)
+    if layout is not None:
+        group = layout.group
+        tp = layout.replicated or group.world_size == 1
+    else:
+        if lm_head.tp_size > 1 and lm_head.tp_size != get_parallel().tp_size:
+            raise RuntimeError(
+                "DFlash candidate top-k: the target lm_head is vocab-sharded over a "
+                "group other than the draft's; with dp attention, pass "
+                "--enable-dp-lm-head."
+            )
+        tp = lm_head.tp_size == 1
+        group = lm_head.tp_group
     num_org = (
         int(lm_head.org_vocab_size)
         if tp
@@ -292,7 +298,7 @@ def candidate_topk(
     if merged_unary_transform is not None and not tp and not with_partition:
         multiplier, softcap = merged_unary_transform
         start = int(lm_head.shard_indices.org_vocab_start_index)
-        gathered = lm_head.tp_group.all_gather(topk_packed(logits, k, start), dim=-1)
+        gathered = group.all_gather(topk_packed(logits, k, start), dim=-1)
         ids, vals = merge_candidates(
             gathered, k, multiplier=multiplier, softcap=softcap
         )
@@ -306,17 +312,15 @@ def candidate_topk(
     if tp:
         return ids.long(), vals, lse
     global_ids = ids.long() + int(lm_head.shard_indices.org_vocab_start_index)
-    gathered = _fused_candidate_all_gather(lm_head.tp_group, vals, global_ids)
+    gathered = _fused_candidate_all_gather(group, vals, global_ids)
     if gathered is not None:
         gathered_vals, gathered_ids = gathered
     else:
-        gathered_vals = lm_head.tp_group.all_gather(vals.float(), dim=-1)
-        gathered_ids = lm_head.tp_group.all_gather(global_ids, dim=-1)
+        gathered_vals = group.all_gather(vals.float(), dim=-1)
+        gathered_ids = group.all_gather(global_ids, dim=-1)
     top_vals, sel = torch.topk(gathered_vals, k, dim=-1)
     if lse is not None:
-        lse = torch.logsumexp(
-            lm_head.tp_group.all_gather(lse.unsqueeze(-1), dim=-1), dim=-1
-        )
+        lse = torch.logsumexp(group.all_gather(lse.unsqueeze(-1), dim=-1), dim=-1)
     return torch.gather(gathered_ids, -1, sel).long(), top_vals, lse
 
 
@@ -824,9 +828,11 @@ class DFlashMLAAttention(DeepseekV2AttentionMLA):
                     window_locs=layer_window_locs(
                         pool,
                         self.attn_mqa.layer_id,
-                        None
-                        if swa_cache_loc is None
-                        else swa_cache_loc.view_as(cache_loc_2d),
+                        (
+                            None
+                            if swa_cache_loc is None
+                            else swa_cache_loc.view_as(cache_loc_2d)
+                        ),
                     ),
                     physical=True,
                 ),
@@ -1414,6 +1420,10 @@ class DFlashDraftModel(nn.Module):
         get_embedding: bool = False,
         pp_proxy_tensors=None,
     ) -> LogitsProcessorOutput:
+        if getattr(self, "context_only", False):
+            raise RuntimeError(
+                "A slim DFlash context encoder cannot execute draft decoding"
+            )
         if input_embeds is None:
             if self.embed_tokens is not None:
                 input_embeds = self.embed_tokens(input_ids)
@@ -1463,6 +1473,10 @@ class DFlashDraftModel(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        if getattr(self, "context_only", False):
+            from sglang.srt.models.dflash_context import load_context_encoder_weights
+
+            return load_context_encoder_weights(self, weights)
         stacked_params_mapping = [
             # (param_name, weight_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -1886,6 +1900,15 @@ class DFlash2DraftModel(DFlashDraftModel):
     """DFlash backbone + candidate selector. Reuses the DFLASH speculative worker."""
 
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
+        if (
+            get_disagg().disaggregation_mode == "prefill"
+            and get_spec().speculative_prefill_context_mode == "slim"
+        ):
+            nn.Module.__init__(self)
+            from sglang.srt.models.dflash_context import initialize_context_encoder
+
+            initialize_context_encoder(self, config, quant_config)
+            return
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
         # On the ROCm Muse attention path the block attends to its own K/V directly, and the
         # worker rewrites the block's committed cache rows from the target's hidden states

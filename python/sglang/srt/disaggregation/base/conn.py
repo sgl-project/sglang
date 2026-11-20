@@ -137,6 +137,8 @@ class KVArgs:
     # Only used of npu, for decode total kv layers
     draft_kv_layers: int
     num_draft_entries: int = 0
+    draft_lane: Optional[object] = None
+    draft_lane_regions: Tuple[Tuple[int, int], ...] = ()
 
 
 class KVPoll:

@@ -1814,6 +1814,30 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         sampling_params.normalize(self.tokenizer)
         sampling_params.verify(self.model_config.token_id_vocab_size)
         _validate_watermark_request(sampling_params)
+        if (
+            isinstance(obj, GenerateReqInput)
+            and self.server_args.speculative_algorithm == "DFLASH"
+            and self.server_args.speculative_draft_kv_layout != "shared"
+        ):
+            from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST
+
+            if obj.bootstrap_host == FAKE_BOOTSTRAP_HOST:
+                sampling_params.top_k = 1
+                sampling_params.top_p = 1.0
+                sampling_params.temperature = 1.0
+        if (
+            isinstance(obj, GenerateReqInput)
+            and self.server_args.speculative_algorithm == "DFLASH"
+            and self.server_args.speculative_draft_kv_layout != "shared"
+            and sampling_params.top_k != 1
+            and (
+                sampling_params.max_new_tokens is None
+                or sampling_params.max_new_tokens > 1
+            )
+        ):
+            raise ValueError(
+                "Experimental independent DFlash currently requires greedy sampling (temperature=0 or top_k=1)"
+            )
 
         # Build return object
         if isinstance(obj, GenerateReqInput):

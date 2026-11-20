@@ -3306,7 +3306,7 @@ class DeepseekV2Model(nn.Module):
             )
             with ctx:
                 layer = self.layers[i]
-                (hidden_states, topk_indices) = layer(
+                hidden_states, topk_indices = layer(
                     positions,
                     hidden_states,
                     forward_batch,
@@ -3314,9 +3314,9 @@ class DeepseekV2Model(nn.Module):
                     gemm_output_zero_allocator,
                     llama_4_scaling,
                     prev_topk_indices=index_topk_share.topk_indices,
-                    captured_last_layer_outputs=aux_hidden_states
-                    if i in self.layers_to_capture
-                    else None,
+                    captured_last_layer_outputs=(
+                        aux_hidden_states if i in self.layers_to_capture else None
+                    ),
                     next_full_attention_layer_id=self.next_full_attention_layer_id.get(
                         i
                     ),
@@ -3545,6 +3545,41 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
+            if (
+                get_spec().speculative_prefill_context_mode != "legacy"
+                and forward_batch.forward_mode.is_context_parallel_extend()
+                and getattr(forward_batch, "attn_cp_metadata", None) is not None
+            ):
+                # Capture follows attention compute-input rows. Restore their
+                # canonical logical token order before handing them to the
+                # context encoder, including odd lengths and CP padding.
+                from sglang.srt.layers.cp.base import get_cp_strategy
+
+                strategy = get_cp_strategy()
+                if strategy is None:
+                    raise RuntimeError(
+                        "DFlash CP context capture requires an active CP strategy"
+                    )
+                if aux_hidden_states is None:
+                    metadata = forward_batch.attn_cp_metadata
+                    rank_lens = (
+                        metadata.per_rank_logical_token
+                        or metadata.per_rank_actual_token
+                    )
+                    if rank_lens[strategy.cp_rank] != 0:
+                        raise RuntimeError(
+                            "DFlash CP context capture lost nonempty feature rows"
+                        )
+                    aux_hidden_states = hidden_states.new_empty(
+                        (
+                            0,
+                            len(self.model.layers_to_capture)
+                            * int(self.config.hidden_size),
+                        )
+                    )
+                aux_hidden_states = strategy.gather_hidden_states(
+                    aux_hidden_states.contiguous(), forward_batch
+                )
 
         if self.pp_group.is_last_rank:
             return self.logits_processor(

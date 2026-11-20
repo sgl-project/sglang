@@ -74,3 +74,42 @@ def legacy_draft_attn_tp_size(spec_algorithm: SpeculativeAlgorithm) -> int:
     if spec_algorithm.is_dflash():
         return getattr(parallel, f"{draft_attn_parallel_group()}_size")
     return parallel.attn_tp_size
+
+
+def resolve_prefill_context_parallel_layout(width: int) -> DraftParallelLayout:
+    """Build encoder groups from actual DP/CP/attention-TP memberships."""
+    import torch
+
+    from sglang.srt.distributed.parallel_state import init_model_parallel_group
+
+    parallel = get_parallel()
+    records = parallel.tp_group.all_gather_object(
+        (
+            parallel.attn_dp_rank,
+            parallel.attn_cp_rank,
+            parallel.attn_tp_rank,
+            parallel.tp_group.ranks[parallel.tp_group.rank_in_group],
+        )
+    )
+    lanes = {}
+    for dp, cp, atp, rank in sorted(records):
+        lanes.setdefault(dp, []).append(rank)
+    if width < 1 or any(len(ranks) % width for ranks in lanes.values()):
+        raise ValueError("Context encoder TP must divide each target DP lane")
+    groups = [
+        ranks[i : i + width]
+        for ranks in lanes.values()
+        for i in range(0, len(ranks), width)
+    ]
+    group = init_model_parallel_group(
+        groups,
+        local_rank=parallel.tp_group.local_rank,
+        backend=torch.distributed.get_backend(parallel.tp_group.device_group),
+        use_pynccl=False,
+        use_custom_allreduce=False,
+        use_quick_allreduce=False,
+        use_mscclpp=False,
+        use_torch_symm_mem_allreduce=False,
+        group_name="dflash_prefill_context",
+    )
+    return DraftParallelLayout(tp_group=group, attn_tp_size=width, disable_cp=True)
