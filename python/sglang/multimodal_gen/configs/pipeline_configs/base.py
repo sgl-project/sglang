@@ -165,6 +165,9 @@ class PipelineConfig:
     should_use_guidance: bool = True
     embedded_cfg_scale: float = 6.0
     cfg_policy: CFGPolicy = field(default_factory=CFGPolicy)
+    # Model-specific quality bound on how long a frozen CFG delta can be reused.
+    # None preserves the request's gate fraction without a model-specific cap.
+    cfg_gate_max_reused_steps: int | None = None
     generator_device: str | None = None
     flow_shift: float | None = None
     scheduler_class_override: str | None = None
