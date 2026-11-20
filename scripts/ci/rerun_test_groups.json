@@ -179,6 +179,7 @@
     "registered/kernels/ops/lora/test_fused_moe_lora_kernel.py",
     "registered/kernels/ops/lora/test_moe_lora_align_block_size.py",
     "registered/kernels/ops/lora/test_moe_lora_contiguous_row_domain.py",
+    "registered/kernels/ops/lora/test_moe_lora_cutedsl_blockscaled_numerics.py",
     "registered/kernels/ops/lora/test_moe_lora_down_b_into_base.py",
     "registered/kernels/ops/lora/test_moe_lora_down_b_into_base_matrix.py",
     "registered/kernels/ops/lora/test_moe_lora_fp8_provider_numerics.py",

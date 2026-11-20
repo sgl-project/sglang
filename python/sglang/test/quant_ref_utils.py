@@ -103,3 +103,151 @@ def nvfp4_kv_quantize(
     )
     codes = (mag | torch.where(v < 0, 8, 0)).to(torch.uint8).view(rows, dim // 2, 2)
     return codes[..., 0] | (codes[..., 1] << 4), scale.view(torch.uint8)
+
+
+# The block-scaled (MX and NVFP4) row quantizers of the MoE LoRA kernels.
+# Rounding midpoints between consecutive kE2M1ToFloat values.
+_E2M1_MIDPOINTS = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0])
+
+
+def e2m1_codes(magnitude: torch.Tensor) -> torch.Tensor:
+    """Nearest E2M1 code; ties go to the even code, as the hardware cvt.rn does."""
+    mid = _E2M1_MIDPOINTS.to(magnitude.device)
+    idx = torch.bucketize(magnitude, mid)  # a tie lands on the lower code
+    tie = (idx < 7) & (magnitude == mid[idx.clamp(max=6)]) & (idx % 2 == 1)
+    return idx + tie.long()
+
+
+def quantize_mx_ref(x: torch.Tensor, vec: int, elem: str):
+    """[..., K] -> (data, scale bytes [..., K/vec] uint8, exact dequant fp32)."""
+    *lead, k = x.shape
+    groups = x.float().reshape(*lead, k // vec, vec)
+    amax = groups.abs().amax(dim=-1)
+    elem_max, elem_max_log2 = (6.0, 2) if elem == "e2m1" else (448.0, 8)
+    # Smallest power of two with amax <= elem_max * 2**e, as the row quantizer.
+    floor_log2 = torch.frexp(amax)[1].float() - 1
+    exponent = floor_log2 - elem_max_log2
+    exponent = exponent + (amax > elem_max * torch.exp2(exponent)).float()
+    exponent = torch.where(amax > 0, exponent, torch.zeros_like(amax))
+    exponent = exponent.clamp(-126.0, 127.0)
+    scale = torch.exp2(exponent)
+    scaled = groups / scale[..., None]
+    if elem == "e2m1":
+        idx = e2m1_codes(scaled.abs())
+        sign = scaled < 0
+        table = kE2M1ToFloat.to(x.device)
+        values = torch.where(sign, -table[idx], table[idx])
+        codes = (idx | (sign.long() << 3)).to(torch.uint8).reshape(*lead, k)
+        data = codes[..., 0::2] | (codes[..., 1::2] << 4)
+    else:
+        q = scaled.clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+        values = q.float()
+        data = q.reshape(*lead, k)
+    dequant = (values * scale[..., None]).reshape(*lead, k)
+    return data, (exponent + 127).to(torch.uint8), dequant
+
+
+def quantize_nvfp4_static_ref(
+    x: torch.Tensor,
+    global_scale: float | torch.Tensor,
+    dequant_dtype: torch.dtype = torch.float32,
+):
+    """Return packed codes, E4M3 scale bytes, and dequant for scalar or per-slab scales."""
+    *lead, k = x.shape
+    groups = x.float().reshape(*lead, k // 16, 16)
+    amax = groups.abs().amax(dim=-1)
+    gs = (
+        global_scale.view(-1, *([1] * (len(lead) - 1)), 1).float()
+        if isinstance(global_scale, torch.Tensor)
+        else global_scale
+    )
+    block_scale = (
+        (amax / (6.0 * gs)).clamp(min=2.0**-6, max=448.0).to(torch.float8_e4m3fn)
+    )
+    denom = block_scale.float() * gs
+    scaled = (groups * (1.0 / denom)[..., None]).clamp(-6.0, 6.0)
+    idx = e2m1_codes(scaled.abs())
+    sign = scaled < 0
+    table = kE2M1ToFloat.to(x.device)
+    values = torch.where(sign, -table[idx], table[idx])
+    codes = (idx | (sign.long() << 3)).to(torch.uint8).reshape(*lead, k)
+    data = codes[..., 0::2] | (codes[..., 1::2] << 4)
+    denom = block_scale.to(dequant_dtype) * gs
+    dequant = (values.to(dequant_dtype) * denom[..., None]).reshape(*lead, k)
+    return data, block_scale.view(torch.uint8), dequant
+
+
+def nvfp4_per_token_denominator(recipe=None) -> float:
+    """Return D for the per-token row scale row_amax / D."""
+    return 6.0 * (448 if recipe is None else recipe.e4m3_max)
+
+
+def quantize_nvfp4_per_token_ref(x: torch.Tensor, recipe=None):
+    """Use FP32 tensor division and lane-order 4over6 sums; ties keep the 6-based scale.
+    Zero-scale blocks have zero codes. Return packed codes, E4M3 scale bytes
+    [..., K/16], FP32 row scales, FP64 dequantization, and choice details."""
+    *lead, k = x.shape
+    device = x.device
+    xf = x.float()
+    denominator = torch.tensor(nvfp4_per_token_denominator(recipe), device=device)
+    row_amax = xf.abs().amax(dim=-1)
+    s = row_amax / denominator
+    s_safe = torch.where(s > 0, s, torch.ones_like(s))
+    groups = xf.reshape(*lead, k // 16, 16)
+    amax = groups.abs().amax(dim=-1)
+    scaled = groups / s_safe[..., None, None]
+    sf6 = amax / (6.0 * s_safe)[..., None]
+    table = kE2M1ToFloat.to(device)
+
+    def candidate(sf_float):
+        sf = sf_float.clamp(max=448.0).to(torch.float8_e4m3fn)
+        decoded = sf.float()
+        live = decoded > 0
+        denom = torch.where(live, decoded, torch.ones_like(decoded))
+        q = scaled / denom[..., None]
+        q = torch.where(live[..., None], q, torch.zeros_like(q)).clamp(-6.0, 6.0)
+        idx = e2m1_codes(q.abs())
+        # Preserve signed zero as the hardware E2M1 conversion does.
+        sign = torch.signbit(q)
+        values = torch.where(sign, -table[idx], table[idx])
+        codes = (idx | (sign.long() << 3)).to(torch.uint8)
+        return sf.view(torch.uint8), decoded, values, codes
+
+    sf_bytes, decoded, values, codes = candidate(sf6)
+    detail = dict(sf6=sf_bytes)
+    if recipe is not None:
+        sf4_bytes, decoded4, values4, codes4 = candidate(sf6 * 1.5)
+        # Use the source amax as the reference for the kernel's reconstructed BF16 amax.
+        amax_eff = torch.where(row_amax > 0, row_amax, denominator.expand_as(row_amax))
+        encode = torch.minimum(
+            denominator / amax_eff,
+            torch.full_like(amax_eff, torch.finfo(torch.float32).max),
+        )
+
+        def error(values_c, decoded_c):
+            cand = values_c * decoded_c[..., None]
+            if recipe.err_use_fast_math:
+                orig = groups * encode[..., None, None]
+            else:
+                cand = (cand * amax_eff[..., None, None]) / denominator
+                orig = groups
+            diff = cand - orig
+            term = diff * diff if recipe.err_mode == "MSE" else diff.abs()
+            err = term[..., 0]
+            for lane in range(1, 16):
+                err = err + term[..., lane]
+            return err
+
+        err6, err4 = error(values, decoded), error(values4, decoded4)
+        use4 = err4 < err6
+        sf_bytes = torch.where(use4, sf4_bytes, sf_bytes)
+        decoded = torch.where(use4, decoded4, decoded)
+        values = torch.where(use4[..., None], values4, values)
+        codes = torch.where(use4[..., None], codes4, codes)
+        detail.update(sf4=sf4_bytes, err6=err6, err4=err4, use4=use4)
+    codes = codes.reshape(*lead, k)
+    data = codes[..., 0::2] | (codes[..., 1::2] << 4)
+    dequant = (
+        values.double() * decoded.double()[..., None] * s.double()[..., None, None]
+    ).reshape(*lead, k)
+    return data, sf_bytes, s, dequant, detail
