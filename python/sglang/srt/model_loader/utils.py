@@ -244,6 +244,11 @@ def supports_cuda_vmm_feature_transport(model_config: ModelConfig) -> bool:
     return bool(getattr(model_cls, "supports_cuda_vmm_feature_transport", False))
 
 
+def supports_input_embeds(model_config: ModelConfig) -> bool:
+    model_cls, _ = get_model_architecture(model_config)
+    return bool(getattr(model_cls, "supports_input_embeds", True))
+
+
 def get_resolved_model_impl(model_config: ModelConfig) -> ModelImpl:
     resolved_model_impl = getattr(model_config, "_resolved_model_impl", None)
     if resolved_model_impl is not None:
