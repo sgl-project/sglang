@@ -1,0 +1,52 @@
+{
+  "capture_profile": {
+    "component_realization": "global_worker_observer_excluded_v1",
+    "decode_graph_backend": "full",
+    "fallback_policy": "reject",
+    "full_forward_realization": "dsv41_native_forward_v1",
+    "graph_batch_policy": "pad_to_capture",
+    "graph_capture_batches": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8
+    ],
+    "kv_page_size": 256,
+    "profile_id": "8fbe55b0c7311dbbd5ce15b11d121403e3708b88c5e4526e44e0bc3e583251c3",
+    "runtime_compatibility_id": "CPU-contract-unqualified",
+    "runtime_compatibility_manifest_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "schema_version": 1
+  },
+  "cohort": {
+    "path": "_meta/dsv41-native-segment-cohort-8d4f44a36a53ac4e48134c68cb2d5d01cbec139b150a234df68be4b1f08dc7c7.json",
+    "sha256": "8d4f44a36a53ac4e48134c68cb2d5d01cbec139b150a234df68be4b1f08dc7c7"
+  },
+  "fixture_scope": "CPU source-contract fixture; no qualified timings or performance rows",
+  "profile": {
+    "path": "_meta/dsv41-native-segment-profile-f8e6302a02e61dd6039d8751bc15b3a5edd4fbc02fc0955011302302b0e8a0a3.json",
+    "sha256": "f8e6302a02e61dd6039d8751bc15b3a5edd4fbc02fc0955011302302b0e8a0a3"
+  },
+  "stack": {
+    "path": "_meta/dsv41-native-segment-stack-45a45b889184c4e57117195a3e1960f01fa9edd8786113e66c19a2204cc90a2c.json",
+    "sha256": "45a45b889184c4e57117195a3e1960f01fa9edd8786113e66c19a2204cc90a2c"
+  },
+  "stack_meta": {
+    "collection": {
+      "run_id": "0"
+    },
+    "gpu_sku": "mi355x",
+    "inference": {
+      "backend": "sglang",
+      "runtime_version": "0.5.22.dev20261021+g2815eed49c"
+    },
+    "operator_libs": {
+      "amd_driver": "CPU-structure-only",
+      "scope": "CPU structural protocol only"
+    },
+    "schema_version": 1
+  }
+}
