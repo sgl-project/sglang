@@ -1141,26 +1141,56 @@ def cohort_vote_via_store(
     if store is None:
         return ok
     ns = f"sglang_cohort_vote_{tag}_n{cohort_size}"
-    seq_key, cast_key = f"{ns}_seq", f"{ns}_cast"
-    rnd = (int(store.add(seq_key, 1)) - 1) // cohort_size
-    yes_key = f"{ns}_r{rnd}_yes"
-    # Tally before announcing, else the last arrival may read a tally missing a peer.
-    store.add(yes_key, 1 if ok else 0)
-    store.add(cast_key, 1)
-    target = (rnd + 1) * cohort_size
+    rnd = (int(store.add(f"{ns}_seq", 1)) - 1) // cohort_size
+    key = f"{ns}_r{rnd}"
+    # Tally before casting, else the last caster may read a tally missing a peer.
+    store.add(f"{key}_yes", 1 if ok else 0)
+    _close_vote_round(store, key, int(store.add(f"{key}_cast", 1)), cohort_size)
+    verdict_key = f"{key}_verdict"
     deadline = time.monotonic() + timeout_s
-    while (cast := _store_int(store, cast_key)) < target:
-        if time.monotonic() >= deadline:
-            # Realign to the round boundary, or a short round offsets every later vote.
-            for key in (seq_key, cast_key):
-                with contextlib.suppress(Exception):
-                    store.set(key, str(target))
-            raise RuntimeError(
-                f"[Elastic EP][vote] {tag} r{rnd} timeout after {timeout_s}s "
-                f"({cast}/{target} voted)"
-            )
+    aborted_at = None
+    while not store.check([verdict_key]):
+        now = time.monotonic()
+        if aborted_at is None and now >= deadline:
+            aborted_at = now
+            cast = int(store.add(f"{key}_cast", _VOTE_ABORT_MARK))
+            _close_vote_round(store, key, cast, cohort_size, abort=True)
+        elif aborted_at is not None and now - aborted_at > _VOTE_VERDICT_GRACE_S:
+            raise RuntimeError(f"[Elastic EP][vote] {tag} r{rnd} never closed")
         time.sleep(_BARRIER_STORE_POLL_S)
-    return _store_int(store, yes_key) == cohort_size
+    verdict = store.get(verdict_key)
+    verdict = verdict.decode() if isinstance(verdict, bytes) else verdict
+    if verdict == "abort":
+        # Every rank of the round raises, the late ones included, so all abort alike.
+        raise RuntimeError(
+            f"[Elastic EP][vote] {tag} r{rnd} aborted: a rank timed out after "
+            f"{timeout_s}s before all {cohort_size} voted"
+        )
+    return verdict == "yes"
+
+
+# Added to a round's cast counter by a timed-out rank; votes stay in the low bits.
+_VOTE_ABORT_MARK = 1 << 20
+_VOTE_VERDICT_GRACE_S = 10.0
+
+
+def _close_vote_round(
+    store, key: str, cast: int, cohort_size: int, *, abort: bool = False
+) -> None:
+    """Publish the verdict if ``cast`` (this rank's add result) closed the round: the
+    last vote before any abort mark, or the first abort mark before the last vote.
+    The counter orders the two, so exactly one rank publishes and none disagree."""
+    votes, aborts = cast % _VOTE_ABORT_MARK, cast // _VOTE_ABORT_MARK
+    if abort:
+        if aborts != 1 or votes >= cohort_size:
+            return
+        verdict = "abort"
+    else:
+        if aborts or votes != cohort_size:
+            return
+        unanimous = _store_int(store, f"{key}_yes") == cohort_size
+        verdict = "yes" if unanimous else "no"
+    store.set(f"{key}_verdict", verdict)
 
 
 def _wait_for_peer_state(backend, ranks: List[int], *, budget_s: float = 60.0) -> bool:
@@ -1474,22 +1504,19 @@ def try_retire_ranks(global_ranks: List[int]) -> None:
 
 # Departure is read off the mlp_sync gather, not the barrier: arrival proves a rank
 # reached DRAIN, not that it acted, and every rank reads the gather at once.
-_departure_announced_at: Optional[float] = None
+_departure_announced = False
 _departure_cleared = False
-# Backstop for a gather not carrying the flag, where a staggered exit beats a hang.
-_DEPARTURE_ALIGN_BUDGET_S = 30.0
 
 
 def departure_announce() -> None:
-    """Declare this rank done with DRAIN. Idempotent: the deadline is set once."""
-    global _departure_announced_at
-    if _departure_announced_at is None:
-        _departure_announced_at = time.monotonic()
+    """Declare this rank done with DRAIN. Idempotent."""
+    global _departure_announced
+    _departure_announced = True
 
 
 def departure_pending() -> bool:
     """Our mlp_sync gather element: True while this rank still holds the cohort."""
-    return _departure_announced_at is None
+    return not _departure_announced
 
 
 def departure_observe(cleared: bool) -> None:
@@ -1499,23 +1526,14 @@ def departure_observe(cleared: bool) -> None:
 
 
 def departure_cleared() -> bool:
-    if _departure_cleared:
-        return True
-    if _departure_announced_at is None:
-        return False
-    if time.monotonic() - _departure_announced_at < _DEPARTURE_ALIGN_BUDGET_S:
-        return False
-    logger.warning(
-        "[Elastic EP] departing DRAIN unaligned after %.0fs: the mlp_sync gather never "
-        "reported cohort readiness, so peers may still be in the serving loop",
-        _DEPARTURE_ALIGN_BUDGET_S,
-    )
-    return True
+    """Only the gather clears DRAIN; a cohort that never aligns stays in the serving
+    loop until the scale timeout fails the shrink."""
+    return _departure_cleared
 
 
 def departure_reset() -> None:
-    global _departure_announced_at, _departure_cleared
-    _departure_announced_at = None
+    global _departure_announced, _departure_cleared
+    _departure_announced = False
     _departure_cleared = False
 
 

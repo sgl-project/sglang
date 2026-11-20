@@ -373,6 +373,9 @@ class ExpertLocationMetadata:
                 mask_update = mask_update.to(self_field.device, non_blocking=True)
                 self_field[...] = torch.where(mask_update, other_field, self_field)
 
+        self._refresh_mega_gate_maps()
+
+    def _refresh_mega_gate_maps(self) -> None:
         for algorithm, (to_physical_map, logical_count) in self._mega_gate_maps.items():
             if algorithm == "static":
                 to_physical_map[..., 0].copy_(
@@ -402,6 +405,8 @@ class ExpertLocationMetadata:
         self.physical_to_logical_map = other.physical_to_logical_map
         self.physical_to_logical_map_cpu = other.physical_to_logical_map_cpu
         self.ep_size = other.ep_size
+        # MegaGate's cached int32 copies are not aliases; graphs replay them too.
+        self._refresh_mega_gate_maps()
 
     # -------------------------------- usage ------------------------------------
 

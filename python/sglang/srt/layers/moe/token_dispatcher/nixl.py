@@ -175,9 +175,10 @@ class NixlEPBuffer:
 
         for rank in suspects:
             # Both sides of a stall mark each other, so a mark alone would partition
-            # the cohort. Retire only once the peer's scheduler has stopped beating.
-            tick, since = state.heartbeats.get(rank, (0, now))
-            if not tick or now - since < _FAULT_HEARTBEAT_STALE_S:
+            # the cohort. Retire only once the peer's scheduler has stopped beating;
+            # a tick of 0 that stays put is a peer that died before its first beat.
+            _, since = state.heartbeats.get(rank, (0, now))
+            if now - since < _FAULT_HEARTBEAT_STALE_S:
                 if rank not in state.held_marks:
                     state.held_marks.add(rank)
                     logger.warning(

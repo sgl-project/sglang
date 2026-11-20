@@ -6102,7 +6102,7 @@ class Scheduler(
         model_runner.maybe_retire_ep_ranks(
             is_idle=lambda: self.is_fully_idle(ignore_idle_batches=True)
         )
-        # Here, not in the shrink finalize: that can run at the tail of forward().
+        # Between forward passes; a failed scale can owe a rebuild from inside forward().
         model_runner.maybe_recapture_elastic_graphs()
         from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 

@@ -16,6 +16,7 @@ import torch.distributed as dist
 import sglang.srt.elastic_ep.elastic_ep as eep
 from sglang.srt.elastic_ep.elastic_ep import (
     _BARRIER_NS,
+    _close_vote_round,
     _StoreBarrier,
     cohort_vote_via_store,
     reset_barriers_after_failure,
@@ -146,6 +147,37 @@ class TestCohortVote(StoreBackedTestCase):
         self.assertEqual(
             self._vote_concurrently([True, False], tag="r"), [False, False]
         )
+
+    def test_a_timeout_aborts_the_round_for_the_late_voter_too(self):
+        """A late voter must not read a finished round the timed-out rank gave up on."""
+        with self.assertRaisesRegex(RuntimeError, "aborted"):
+            cohort_vote_via_store(True, 2, tag="late", timeout_s=0.2)
+        with self.assertRaisesRegex(RuntimeError, "aborted"):
+            cohort_vote_via_store(True, 2, tag="late", timeout_s=30.0)
+        # The late voter spent the aborted round's last slot, so the next one is clean.
+        self.assertEqual(
+            self._vote_concurrently([True, True], tag="late"), [True, True]
+        )
+
+    def test_an_abort_after_the_last_vote_keeps_the_verdict(self):
+        key = "unit_close"
+        self._store.add(f"{key}_yes", 2)
+        for _ in range(2):
+            _close_vote_round(
+                self._store, key, int(self._store.add(f"{key}_cast", 1)), 2
+            )
+        late = int(self._store.add(f"{key}_cast", eep._VOTE_ABORT_MARK))
+        _close_vote_round(self._store, key, late, 2, abort=True)
+        self.assertEqual(self._store.get(f"{key}_verdict"), b"yes")
+
+    def test_reshuffle_reads_a_vote_timeout_as_a_cohort_wide_no(self):
+        from sglang.srt.eplb.eplb_manager import EPLBManager
+
+        def timed_out(*args, **kwargs):
+            raise RuntimeError("vote timed out")
+
+        with mock.patch.object(eep, "cohort_vote_via_store", timed_out):
+            self.assertFalse(EPLBManager._cohort_accepts(True, 2, "dims"))
 
     def _vote_concurrently(self, votes, *, tag):
         results, errors = [None] * len(votes), []

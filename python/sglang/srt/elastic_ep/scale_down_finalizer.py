@@ -133,8 +133,8 @@ def finalize_scale_down(
             slot_count=effective_size - target_size,
             direction="shrink",
         )
-    # Rebuilt later from tick_elastic_scale: this may run at forward()'s tail, whose
-    # output lives in the pool a capture frees. Reused graphs mask retired slots to 0.
+    # Rebuilt by maybe_recapture_elastic_graphs on a later tick, between forward
+    # passes. Reused graphs mask retired slots to 0.
     if reuse_graphs:
         logger.info(
             "[Elastic EP] keeping decode CUDA graphs across %d -> %d",

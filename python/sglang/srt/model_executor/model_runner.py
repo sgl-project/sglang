@@ -2097,9 +2097,6 @@ class ModelRunner:
             and not self._elastic_cuda_graph_enabled()
         ):
             self.maybe_join_ep_ranks()
-            # The scheduler ticks the target runner only; a draft has no is_idle.
-            if not self.is_draft_worker:
-                self.maybe_retire_ep_ranks()
 
         return output
 
@@ -2911,10 +2908,8 @@ class ModelRunner:
         logger.info("[Elastic EP] recover ranks %s done", ranks_to_recover)
 
     def maybe_retire_ep_ranks(self, is_idle: Optional[Callable] = None) -> None:
-        """Advance a Mooncake-native scale-down one step. ``is_idle`` is cached: the
-        forward() caller has none, and defaulting to idle would retire mid-decode."""
-        if is_idle is not None:
-            self._elastic_is_idle = is_idle
+        """Advance a Mooncake-native scale-down one step, from tick_elastic_scale only so
+        every backend shares one stage cadence."""
         if (
             self.server_args.elastic_ep_backend != "mooncake"
             or not ElasticEPStateManager.is_shrink_pending()
@@ -2928,7 +2923,7 @@ class ModelRunner:
                     my_global_rank=self._elastic_global_rank(),
                     park_hook=self.elastic_park_hook,
                 ),
-                getattr(self, "_elastic_is_idle", None),
+                is_idle,
             ),
             pending_size=ElasticEPStateManager.get_pending_ep_size(),
             effective_size=ElasticEPStateManager.get_effective_ep_size(),

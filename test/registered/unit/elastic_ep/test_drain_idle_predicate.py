@@ -23,7 +23,10 @@ def _gate(*, closed, retiring):
     if not closed:
         event.set()
     return SimpleNamespace(
-        _elastic_shrink_pause_event=event, _elastic_shrink_retiring=set(retiring)
+        _elastic_shrink_pause_event=event,
+        _elastic_shrink_retiring=set(retiring),
+        elastic_worker_count=4,
+        update_control_communicator_fan_out=Mock(),
     )
 
 
@@ -78,9 +81,12 @@ class TestShrinkGateScope(CustomTestCase):
         TokenizerManager._close_elastic_shrink_gate(tm, range(2, 4))
         self.assertEqual(tm._elastic_shrink_retiring, {2, 3})
         self.assertFalse(tm._elastic_shrink_pause_event.is_set())
+        fan_out = tm.update_control_communicator_fan_out
+        fan_out.assert_called_once_with(2, keep_scale_fan_out=True)
         TokenizerManager._open_elastic_shrink_gate(tm)
         self.assertEqual(tm._elastic_shrink_retiring, set())
         self.assertTrue(tm._elastic_shrink_pause_event.is_set())
+        fan_out.assert_called_with(4)
 
 
 class TestRejectedStageReleasesDrainingSlots(CustomTestCase):

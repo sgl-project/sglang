@@ -219,7 +219,11 @@ class TokenizerControlMixin:
         else:
             comm.handle_recv(payload, sender=reply.sender_dp_rank)
 
-    def update_control_communicator_fan_out(self: TokenizerManager, worker_count: int):
+    def update_control_communicator_fan_out(
+        self: TokenizerManager, worker_count: int, *, keep_scale_fan_out: bool = False
+    ):
+        """``keep_scale_fan_out``: leave scale_elastic_ep wide, as it still needs the
+        retirees' acks while every other control call stops waiting on them."""
         primary_group_control = (
             get_parallel().attn_dp_enabled
             and not get_parallel().enable_dp_attention_local_control_broadcast
@@ -232,6 +236,8 @@ class TokenizerControlMixin:
             control_fan_out = worker_count
 
         for spec in _COMMUNICATOR_SPECS:
+            if keep_scale_fan_out and spec[0] == "scale_elastic_ep":
+                continue
             getattr(self, f"{spec[0]}_communicator").set_fan_out(
                 worker_count, live_senders=worker_count
             )

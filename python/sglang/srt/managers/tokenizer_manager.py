@@ -2132,10 +2132,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         """Required ``retiring``: an empty set makes the pinned-only gate a no-op."""
         self._elastic_shrink_retiring = set(retiring)
         self._elastic_shrink_pause_event.clear()
+        if self._elastic_shrink_retiring:
+            # A retiree can exit long before the shrink commits, so stop waiting on
+            # its control replies now; the reopen restores whatever width stands.
+            self.update_control_communicator_fan_out(
+                min(self._elastic_shrink_retiring), keep_scale_fan_out=True
+            )
 
     def _open_elastic_shrink_gate(self) -> None:
+        narrowed = bool(self._elastic_shrink_retiring)
         self._elastic_shrink_retiring = set()
         self._elastic_shrink_pause_event.set()
+        if narrowed:
+            self.update_control_communicator_fan_out(self.elastic_worker_count)
 
     def _clear_elastic_draining(self) -> None:
         """Tell the DPC the retiring slots are staying, so it routes to them again."""

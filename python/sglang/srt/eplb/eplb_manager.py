@@ -333,8 +333,12 @@ class EPLBManager:
         """Make a local verdict cohort-wide so aborts stay collective."""
         from sglang.srt.elastic_ep.elastic_ep import cohort_vote_via_store
 
-        if cohort_vote_via_store(ok, cohort_size, tag=f"reshuffle_{tag}"):
-            return True
+        try:
+            if cohort_vote_via_store(ok, cohort_size, tag=f"reshuffle_{tag}"):
+                return True
+        except RuntimeError as exc:
+            # A timed-out round raises on every rank, so this is still cohort-wide.
+            logger.warning("[EPLBManager] scale reshuffle vote failed: %s", exc)
         logger.warning("[EPLBManager] scale reshuffle aborted cohort-wide (%s)", tag)
         return False
 
