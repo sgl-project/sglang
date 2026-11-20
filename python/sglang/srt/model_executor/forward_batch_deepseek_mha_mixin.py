@@ -4,9 +4,10 @@
 from typing import List, Optional
 
 import torch
+import triton
 
 from sglang.kernels.ops.attention.kv_indices import (
-    create_chunked_prefix_cache_kv_indices,
+    create_chunked_prefix_cache_kv_indices_2d,
     create_flashinfer_kv_indices_triton,
 )
 from sglang.srt.environ import envs
@@ -106,7 +107,11 @@ class ForwardBatchDeepSeekMHAMixin:
                 )
                 self.prefix_chunk_kv_indices.append(chunk_kv_indices)
                 continue
-            create_chunked_prefix_cache_kv_indices[(self.batch_size,)](
+            # Divide long prefix copies over token blocks within each request.
+            max_chunk_len = max(self.prefix_chunk_max_seq_lens[idx], 1)
+            create_chunked_prefix_cache_kv_indices_2d[
+                (self.batch_size, triton.cdiv(max_chunk_len, 1024))
+            ](
                 req_to_token,
                 self.req_pool_indices,
                 chunk_starts,
@@ -114,6 +119,7 @@ class ForwardBatchDeepSeekMHAMixin:
                 chunk_cu_seq_lens,
                 chunk_kv_indices,
                 req_to_token.shape[1],
+                BLOCK_SIZE=1024,
             )
             chunk_kv_indices = filter_dcp_local_chunk_kv_indices(
                 chunk_kv_indices,
