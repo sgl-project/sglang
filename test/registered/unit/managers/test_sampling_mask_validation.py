@@ -1,8 +1,15 @@
+import asyncio
+import copy
 import unittest
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
-from sglang.srt.managers.io_struct import GenerateReqInput
-from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.environ import envs
+from sglang.srt.managers.io_struct import (
+    BatchTokenizedGenerateReqInput,
+    GenerateReqInput,
+)
+from sglang.srt.managers.tokenizer_manager import ReqState, TokenizerManager
 from sglang.srt.observability.req_time_stats import APIServerReqTimeStats
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.custom_logit_processor import (
@@ -180,13 +187,17 @@ class TestSamplingMaskValidation(CustomTestCase):
             Qwen3ThinkingBudgetLogitProcessor.to_str(), return_sampling_mask=False
         )
 
-    def test_sampling_logprobs_need_no_mask(self):
+    def test_sampling_logprobs_need_no_mask_but_need_output_logprobs(self):
         self._validate(
             None,
             return_sampling_mask=False,
             return_sampling_logprobs=True,
             return_logprob=True,
         )
+        with self.assertRaisesRegex(
+            ValueError, "return_sampling_logprobs requires return_logprob"
+        ):
+            self._validate(None, return_sampling_logprobs=True)
         with self.assertRaisesRegex(
             ValueError, "only supports DisallowedTokensLogitsProcessor"
         ):
@@ -196,6 +207,169 @@ class TestSamplingMaskValidation(CustomTestCase):
                 return_sampling_logprobs=True,
                 return_logprob=True,
             )
+
+    def _tokenize(self, sampling_params, *, watermarked=False, **request_fields):
+        self.manager.model_config.vocab_size = 32
+        self.manager.preferred_sampling_params = None
+        self.manager.sampling_params_class = SamplingParams
+        # min_new_tokens needs a tokenizer; nothing here reads it.
+        self.manager.tokenizer = SimpleNamespace()
+        self.manager.fake_bootstrap_room_counter = 0
+        req = GenerateReqInput(
+            input_ids=[1, 2, 3], sampling_params=sampling_params, **request_fields
+        )
+        req.normalize_batch_and_arguments()
+        self.manager.rid_to_state = {
+            req.rid: SimpleNamespace(time_stats=APIServerReqTimeStats())
+        }
+        with patch(
+            "sglang.srt.managers.tokenizer_manager._validate_watermark_request",
+            return_value=watermarked,
+        ):
+            return self.manager._create_tokenized_object(req, "", req.input_ids)
+
+    def test_unfiltered_sampling_output_must_describe_what_was_sampled(self):
+        """An unfiltered request is not captured: it returns its output logprobs
+        as sampling logprobs and empty mask rows. A watermark forces the token, so
+        both are wrong; SGLANG_RETURN_ORIGINAL_LOGPROB only changes the logprob.
+        A filtered request is captured from the sampler and stays admitted."""
+        logprobs = {"return_logprob": True, "return_sampling_logprobs": True}
+        mask = {"return_sampling_mask": True}
+        for watermarked, original_logprob, sampling_params, flags, rejected in (
+            (True, False, {}, logprobs, True),
+            (True, False, {}, mask, True),
+            (True, False, {"top_k": 10}, {**logprobs, **mask}, False),
+            (False, True, {}, logprobs, True),
+            (False, True, {}, mask, False),
+            (False, True, {"top_k": 10}, {**logprobs, **mask}, False),
+        ):
+            with (
+                self.subTest(
+                    watermarked=watermarked, params=sampling_params, flags=flags
+                ),
+                envs.SGLANG_RETURN_ORIGINAL_LOGPROB.override(original_logprob),
+            ):
+                if rejected:
+                    with self.assertRaisesRegex(
+                        ValueError, "without top-k/top-p/min-p"
+                    ):
+                        self._tokenize(
+                            sampling_params, watermarked=watermarked, **flags
+                        )
+                else:
+                    self._tokenize(sampling_params, watermarked=watermarked, **flags)
+
+    def test_unfiltered_sampling_output_is_refused_where_mlx_commits_argmax(self):
+        """Without --mlx-enable-sampling the MLX runner commits argmax whatever the
+        temperature is, so an unfiltered request's output logprobs and empty mask
+        rows would describe a draw that never happened."""
+        logprobs = {"return_logprob": True, "return_sampling_logprobs": True}
+        mask = {"return_sampling_mask": True}
+        for mlx, mlx_sampling, sampling_params, rejected in (
+            (True, False, {"temperature": 0.7}, True),
+            (True, True, {"temperature": 0.7}, False),
+            (False, False, {"temperature": 0.7}, False),
+            (True, False, {"top_k": 10}, False),
+        ):
+            for flags in (logprobs, mask):
+                with (
+                    self.subTest(
+                        mlx=mlx, mlx_sampling=mlx_sampling, params=sampling_params
+                    ),
+                    patch(
+                        "sglang.srt.managers.tokenizer_manager.use_mlx",
+                        return_value=mlx,
+                    ),
+                    get_context().override_server_args(
+                        mlx_enable_sampling=mlx_sampling
+                    ),
+                ):
+                    if rejected:
+                        with self.assertRaisesRegex(ValueError, "mlx-enable-sampling"):
+                            self._tokenize(sampling_params, **flags)
+                    else:
+                        self._tokenize(sampling_params, **flags)
+
+    def test_unfiltered_mask_is_refused_when_the_support_is_narrowed(self):
+        """An unfiltered request's empty mask rows stand for the whole vocabulary.
+        A grammar, a custom logit processor, logit_bias, min_new_tokens or strict
+        thinking leaves the sampler fewer tokens, so the mask must be refused. Its
+        sampling logprobs stay exact, and a finite top_k captures the real rows."""
+        disallowed = {
+            "custom_logit_processor": DisallowedTokensLogitsProcessor.to_str()
+        }
+        for sampling_params, request_fields, server_args in (
+            ({"json_schema": '{"type": "object"}'}, {}, {}),
+            ({"regex": "a+"}, {}, {}),
+            ({"ebnf": 'root ::= "a"'}, {}, {}),
+            ({"structural_tag": "{}"}, {}, {}),
+            ({}, disallowed, {}),
+            ({"logit_bias": {"3": -100.0}}, {}, {}),
+            ({"min_new_tokens": 2}, {}, {}),
+            ({}, {}, {"enable_strict_thinking": True}),
+        ):
+            with (
+                self.subTest(
+                    params=sampling_params, fields=request_fields, server=server_args
+                ),
+                get_context().override_server_args(**server_args),
+            ):
+                with self.assertRaisesRegex(ValueError, "Set a finite top_k"):
+                    self._tokenize(
+                        sampling_params, return_sampling_mask=True, **request_fields
+                    )
+                self._tokenize(
+                    sampling_params,
+                    return_logprob=True,
+                    return_sampling_logprobs=True,
+                    **request_fields,
+                )
+                self._tokenize(
+                    {**sampling_params, "top_k": 10},
+                    return_sampling_mask=True,
+                    **request_fields,
+                )
+        self._tokenize({"temperature": 0.7}, return_sampling_mask=True)
+
+    def test_dispatch_records_whether_sampling_is_filtered(self):
+        """The response reads a request's sampling output by whether its sampling
+        is filtered. A parallel-sampling copy gets a fresh state without being
+        tokenized again, so the value must reach the state at dispatch, on the
+        single and the batched path, and a request body cannot supply it."""
+        sent = []
+        self.manager.cuda_vmm_feature_transport = SimpleNamespace(
+            prepare_for_dispatch_async=AsyncMock(return_value=[]),
+            cancel_for_dispatch=lambda items: None,
+        )
+        self.manager.positional_embeds_transport = SimpleNamespace(
+            prepare_for_dispatch=lambda tokenized_objs: [],
+            cancel_for_dispatch=lambda proxies: None,
+        )
+        self.manager.canary_info_hook = None
+        self.manager.encoder_dispatch_ready = {}
+        self.manager.batch_tokenized_generate_req_type = BatchTokenizedGenerateReqInput
+        self.manager._dispatch_to_scheduler = sent.append
+
+        def fresh_state(tokenized):
+            state = ReqState([], False, asyncio.Event(), None, tokenized.time_stats)
+            self.manager.rid_to_state = {tokenized.rid: state}
+            return state
+
+        for sampling_params, filtered in (({"top_k": 10}, True), ({}, False)):
+            with self.subTest(sampling_params=sampling_params):
+                tokenized = self._tokenize(sampling_params, return_sampling_mask=True)
+                sample = copy.copy(tokenized)
+                sample.rid = f"{tokenized.rid}-sample"
+                state = fresh_state(sample)
+                asyncio.run(self.manager._send_one_request(sample))
+                self.assertIs(state.filters_sampling, filtered)
+
+                state = fresh_state(tokenized)
+                asyncio.run(self.manager._send_batch_request([tokenized]))
+                self.assertIs(state.filters_sampling, filtered)
+        self.assertEqual(len(sent), 4)
+        with self.assertRaises(TypeError):
+            GenerateReqInput(input_ids=[1], filters_sampling=True)
 
     def test_removed_sampling_logprobs_mode_is_rejected(self):
         for mode in ("selected", "support", [None, None]):

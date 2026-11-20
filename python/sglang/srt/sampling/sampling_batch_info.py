@@ -103,7 +103,8 @@ class SamplingBatchInfo:
     # CPU request flags and their derived device indices. The flags make batch
     # filtering cheap; the indices keep sampler work limited to captured rows.
     # captures_sampling is Req.captures_sampling; return_sampling_masks is the raw
-    # request flag. A row's support is captured only when both are set.
+    # request flag, also set on an unfiltered request that is not captured. A row's
+    # support is captured only when both are set.
     captures_sampling: Optional[List[bool]] = None
     return_sampling_masks: Optional[List[bool]] = None
     sampling_mask_batch_indices: Optional[torch.Tensor] = None

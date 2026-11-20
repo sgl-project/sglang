@@ -19,6 +19,9 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.scheduler_components.memory_usage import build_memory_usage
 from sglang.srt.runtime_context import get_context, get_exec, get_parallel
 from sglang.srt.server_args import compute_world_size, redact_server_args_secrets
+from sglang.srt.speculative.spec_sampling_mask import (
+    sampling_output_requires_exact_accept_thresholds,
+)
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 
 if TYPE_CHECKING:
@@ -200,7 +203,9 @@ class SchedulerInternalStateController:
     def _validate_accept_threshold(self, key: str, value: Any) -> None:
         # A relaxed threshold stops acceptance from sampling exactly from the
         # target policy, which is what the returned sampling logprobs describe.
-        if not self.scheduler.spec_algorithm.is_dflash() or float(value) == 1.0:
+        if float(value) == 1.0 or not sampling_output_requires_exact_accept_thresholds(
+            self.scheduler.spec_algorithm
+        ):
             return
         if self._has_active_sampling_output_request():
             raise UpdateRejected(

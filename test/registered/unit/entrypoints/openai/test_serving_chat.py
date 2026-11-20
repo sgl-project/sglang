@@ -1854,6 +1854,22 @@ class ServingChatTestCase(CustomTestCase):
                     f"{field} requires return_meta_info=true.",
                 )
 
+    def test_validate_request_names_the_chat_logprobs_field(self):
+        """A chat client turns logprobs on with `logprobs`; the error for sampling
+        logprobs without them must name that field, not the native `return_logprob`."""
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            return_meta_info=True,
+            return_sampling_logprobs=True,
+        )
+        self.assertEqual(
+            self.chat._validate_request(req),
+            "return_sampling_logprobs requires logprobs=true.",
+        )
+        req.logprobs = True
+        self.assertIsNone(self.chat._validate_request(req))
+
     def test_validate_request_rejects_removed_sampling_logprobs_mode(self):
         req = ChatCompletionRequest(
             model="x",

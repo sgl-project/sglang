@@ -35,7 +35,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=221, stage="extra-a", runner_config="2-gpu-large")
+register_cuda_ci(est_time=306, stage="extra-a", runner_config="2-gpu-large")
 register_amd_ci(est_time=320, suite="extra-a-test-1-gpu-small-amd")
 
 _MAX_NEW_TOKENS = 4
@@ -616,11 +616,27 @@ class TestSamplingMask(SamplingMaskTestMixin, CustomTestCase):
         self.assertEqual(len(output_ids), _MAX_NEW_TOKENS)
 
     def test_generate_rejects_unbounded_sampling_mask(self):
-        for params in ({"top_p": _TOP_P}, {"top_k": 65}, {"top_p": 1.0}):
+        for params in ({"top_p": _TOP_P}, {"top_k": 65}, {"min_p": 0.05}):
             with self.subTest(sampling_params=params):
                 response = self._post_generate(params)
                 self.assertEqual(response.status_code, 400, response.text)
                 self.assertIn(_INVALID_SAMPLING_MASK_ERROR, response.text)
+
+    def test_unfiltered_request_returns_output_logprobs_and_empty_mask_rows(self):
+        """Without top-k/top-p/min-p the tokens are drawn from the output logprob
+        distribution over the whole vocabulary: the same flags return it as is."""
+        for params in ({}, {"top_p": 1.0, "top_k": -1, "temperature": 0.7}):
+            with self.subTest(sampling_params=params):
+                response = self._post_generate(params)
+                self.assertEqual(response.status_code, 200, response.text)
+                meta_info = response.json()["meta_info"]
+                self.assertEqual(
+                    meta_info["output_token_sampling_logprobs"],
+                    [logprob for logprob, _, _ in meta_info["output_token_logprobs"]],
+                )
+                self.assertEqual(
+                    meta_info["output_sampling_mask_logprobs"], [[]] * _MAX_NEW_TOKENS
+                )
 
 
 class TestSamplingMaskPacking(CustomTestCase):
@@ -879,8 +895,23 @@ class TestSamplingMaskDeterministic(SamplingMaskTestMixin, CustomTestCase):
             with_mask["meta_info"]["output_token_sampling_logprobs"],
         )
 
+    def test_sampling_logprobs_without_mask_ignore_mask_cap(self):
+        # Top-p alone keeps a support far above the server's
+        # --sampling-mask-max-tokens; without the mask nothing overflows.
+        output = self._post_sampling_logprobs({"top_k": -1, "top_p": _TOP_P})
+        meta_info = output["meta_info"]
+        self.assertEqual(len(output["output_ids"]), _MAX_NEW_TOKENS)
+        for sampling_logprob, (logprob, *_) in zip(
+            meta_info["output_token_sampling_logprobs"],
+            meta_info["output_token_logprobs"],
+            strict=True,
+        ):
+            # Renormalizing over the nucleus can only raise a kept token's logprob.
+            self.assertGreaterEqual(sampling_logprob, logprob - 1e-4)
+            self.assertLessEqual(sampling_logprob, 0.0)
+
     def test_sampling_logprobs_without_new_tokens_are_not_aborted(self):
-        for sampling_params in ({"top_k": _TOP_K},):
+        for sampling_params in ({"top_k": _TOP_K}, {}):
             with self.subTest(sampling_params=sampling_params):
                 output = self._post_sampling_logprobs(
                     {"max_new_tokens": 0, **sampling_params}
@@ -890,6 +921,25 @@ class TestSamplingMaskDeterministic(SamplingMaskTestMixin, CustomTestCase):
                 self.assertEqual(
                     output["meta_info"]["output_token_sampling_logprobs"], []
                 )
+
+
+class TestSamplingMaskRlOnPolicy(SamplingMaskTestMixin, CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls._launch_server(
+            ("--rl-on-policy-target", "fsdp", "--attention-backend", "triton")
+        )
+
+    def test_unfiltered_sampling_logprobs_are_the_output_logprobs(self):
+        """The log-softmax sampling path captures nothing: an unfiltered request
+        gets the logprobs the trainer aligns with, not a 500."""
+        output = self._post_sampling_logprobs({"top_k": -1, "top_p": 1.0})
+        meta_info = output["meta_info"]
+        self.assertEqual(len(output["output_ids"]), _MAX_NEW_TOKENS)
+        self.assertEqual(
+            meta_info["output_token_sampling_logprobs"],
+            [logprob for logprob, _, _ in meta_info["output_token_logprobs"]],
+        )
 
 
 class TestSamplingMaskPytorch(TestSamplingMask):
@@ -972,6 +1022,7 @@ class TestDistributedSamplingMask(CustomTestCase):
                 "ignore_eos": True,
             },
             "return_sampling_mask": return_sampling_mask,
+            # The sampling logprobs ride on the output logprobs.
             "return_sampling_logprobs": return_sampling_mask and return_logprob,
             "return_logprob": return_logprob,
         }

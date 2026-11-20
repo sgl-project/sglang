@@ -6,12 +6,14 @@ register_cpu_ci(est_time=26, suite="base-a-test-cpu")
 register_cpu_ci(est_time=6, suite="extra-test-cpu-intel")
 
 import unittest
+from array import array
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
 
 from sglang.srt.constrained.base_grammar_backend import GrammarMask
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.sampling.custom_logit_processor import (
     UOCR_PAGE_GUARD_PROCESSOR,
     DisallowedTokensLogitsProcessor,
@@ -21,7 +23,7 @@ from sglang.srt.sampling.sampling_batch_info import (
     SamplingBatchInfo,
     merge_bias_tensor,
 )
-from sglang.srt.sampling.sampling_params import TOP_K_ALL
+from sglang.srt.sampling.sampling_params import TOP_K_ALL, SamplingParams
 from sglang.test.test_utils import CustomTestCase
 
 VOCAB_SIZE = 32
@@ -102,11 +104,12 @@ class TestSamplingMaskBatchIndices(CustomTestCase):
         info = _make_info(
             batch_size=3,
             captures_sampling=[True, True, False],
-            return_sampling_masks=[False, True, False],
+            # The last request returns the mask without being captured.
+            return_sampling_masks=[False, True, True],
             sampling_mask_batch_indices=torch.tensor([0, 1]),
         )
         info.filter_batch([1, 2], torch.tensor([1, 2]))
-        self.assertEqual(info.return_sampling_masks, [True, False])
+        self.assertEqual(info.return_sampling_masks, [True, True])
         self.assertEqual(info.sampling_support_logprobs_capture_indices.tolist(), [0])
 
         other = _make_info(
@@ -116,7 +119,7 @@ class TestSamplingMaskBatchIndices(CustomTestCase):
             sampling_mask_batch_indices=torch.tensor([0, 1]),
         )
         info.merge_batch(other)
-        self.assertEqual(info.return_sampling_masks, [True, False, False, True])
+        self.assertEqual(info.return_sampling_masks, [True, True, False, True])
         self.assertEqual(
             info.sampling_support_logprobs_capture_indices.tolist(), [0, 2]
         )
@@ -748,6 +751,39 @@ class TestFromScheduleBatch(CustomTestCase):
         req.tokenizer.additional_stop_token_ids = None
         req.tokenizer.eos_token_id = eos_id
         return req
+
+    def test_unfiltered_mask_request_does_not_widen_the_capture(self):
+        """An unfiltered request that returns the mask gets empty rows without being
+        captured: it must stay out of both index tensors and keep a capture width of
+        1, like the captured request that returns sampling logprobs only."""
+
+        def req(sampling_params, *, logprobs=False, mask=False):
+            params = SamplingParams(max_new_tokens=8, **sampling_params)
+            params.normalize(None)
+            return Req(
+                "r",
+                "",
+                array("q", [1, 2]),
+                params,
+                return_logprob=logprobs,
+                return_sampling_logprobs=logprobs,
+                return_sampling_mask=mask,
+            )
+
+        batch = MagicMock()
+        batch.reqs = [
+            req({"top_k": 20}, mask=True),
+            req({}, mask=True),
+            req({"top_p": 0.9}, logprobs=True),
+            req({}),
+        ]
+        batch.device = DEVICE
+        info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
+        self.assertEqual(info.captures_sampling, [True, False, True, False])
+        self.assertEqual(info.return_sampling_masks, [True, True, False, False])
+        self.assertEqual(info.sampling_mask_batch_indices.tolist(), [0, 2])
+        self.assertEqual(info.sampling_support_logprobs_capture_indices.tolist(), [0])
+        self.assertEqual(info.sampling_mask_top_ks, [20, 1, 1, 1])
 
     def test_basic_construction(self):
         """Test that from_schedule_batch correctly extracts sampling params from requests."""

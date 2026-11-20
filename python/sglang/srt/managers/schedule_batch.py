@@ -702,7 +702,12 @@ class Req(ReqDllmMixin):
         self.top_p_normalized_logprobs = False
         self.return_sampling_logprobs = return_sampling_logprobs
         self.return_sampling_mask = return_sampling_mask
-        self.captures_sampling = return_sampling_logprobs or return_sampling_mask
+        # An unfiltered request is never captured: its sampling logprob is its
+        # output token logprob and its support is the whole vocabulary.
+        filters_sampling = sampling_params.filters_sampling()
+        self.captures_sampling = filters_sampling and (
+            return_sampling_logprobs or return_sampling_mask
+        )
         self.return_flat_raw_top_logprobs = return_flat_raw_top_logprobs
 
         # Logprobs (return values)

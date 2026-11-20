@@ -71,6 +71,7 @@ from sglang.srt.elastic_ep.topology import (
     physical_ep_size_to_dp_size,
 )
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.hf_transformers import (
     get_processor,
     get_tokenizer,
@@ -247,7 +248,8 @@ _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 logger = logging.getLogger(__name__)
 
 
-def _validate_watermark_request(sampling_params: SamplingParams) -> None:
+def _validate_watermark_request(sampling_params: SamplingParams) -> bool:
+    """Whether the request is watermarked, after rejecting unsupported uses."""
     watermark = sampling_params.watermark
     features = get_exec().features
     _, _, enabled = resolve_watermark_request(
@@ -260,6 +262,67 @@ def _validate_watermark_request(sampling_params: SamplingParams) -> None:
     )
     if enabled and (sampling_params.beam_width or 1) > 1:
         raise ValueError("beam search is not supported with watermarking")
+    return enabled
+
+
+def _unfiltered_support_narrowing(
+    obj: GenerateReqInput, sampling_params: SamplingParams
+) -> Optional[str]:
+    """What, besides top-k/top-p/min-p, keeps the sampler from drawing every
+    token of the vocabulary; None when nothing does."""
+    if (
+        sampling_params.json_schema is not None
+        or sampling_params.regex is not None
+        or sampling_params.ebnf is not None
+        or sampling_params.structural_tag is not None
+    ):
+        return "a grammar constraint"
+    if obj.custom_logit_processor:
+        return "a custom logit processor"
+    if sampling_params.logit_bias:
+        return "logit_bias"
+    if sampling_params.min_new_tokens > 0:
+        return "min_new_tokens"
+    # Strict thinking filters tokens of every request through a reasoning grammar.
+    if get_serving().enable_strict_thinking:
+        return "--enable-strict-thinking"
+    return None
+
+
+def _validate_unfiltered_sampling_output(
+    obj: GenerateReqInput, sampling_params: SamplingParams, watermarked: bool
+) -> None:
+    """An unfiltered request returns its output token logprob as its sampling
+    logprob and an empty mask row, so both must describe what was sampled."""
+    if sampling_params.filters_sampling() or not returns_sampling_output(obj):
+        return
+    if use_mlx() and not get_device().mlx_enable_sampling:
+        raise ValueError(
+            "return_sampling_logprobs or return_sampling_mask without "
+            "top-k/top-p/min-p sampling is not supported on the MLX backend without "
+            "--mlx-enable-sampling: every token is the argmax, not a sample."
+        )
+    if watermarked:
+        raise ValueError(
+            "return_sampling_logprobs or return_sampling_mask without "
+            "top-k/top-p/min-p sampling is not supported with watermarking: "
+            "output token logprobs and the whole-vocabulary support exclude the "
+            "watermark."
+        )
+    if obj.return_sampling_logprobs and envs.SGLANG_RETURN_ORIGINAL_LOGPROB.get():
+        raise ValueError(
+            "return_sampling_logprobs without top-k/top-p/min-p sampling is not "
+            "supported with SGLANG_RETURN_ORIGINAL_LOGPROB=1: output token "
+            "logprobs exclude the temperature."
+        )
+    if obj.return_sampling_mask:
+        narrowing = _unfiltered_support_narrowing(obj, sampling_params)
+        if narrowing is not None:
+            raise ValueError(
+                "return_sampling_mask without top-k/top-p/min-p sampling is not "
+                f"supported with {narrowing}: the sampling support is no longer "
+                "the whole vocabulary. Set a finite top_k to receive it."
+            )
 
 
 def _reject_missing_dispatched_encoder_embedding(request_obj, mm_inputs):
@@ -307,6 +370,9 @@ class ReqState:
 
     dispatched: bool = False
     abort_sent: bool = False
+    # SamplingParams.filters_sampling() of the dispatched request: its sampling
+    # output is what the scheduler captured, else its output token logprobs.
+    filters_sampling: bool = False
     # Held at generate_request's pause gate; an abort_all leaves it to run
     # after the pause.
     waiting_at_pause_gate: bool = False
@@ -509,15 +575,29 @@ def _build_flat_sampling_mask_fields(
     return fields
 
 
+def _unfiltered_sampling_mask_chunk(num_rows: int) -> SamplingMaskChunk:
+    """Rows of an unfiltered request: its support is the whole vocabulary, left empty."""
+    return SamplingMaskChunk(
+        selected_logprobs=np.empty(0, dtype=np.float32),
+        lengths=np.zeros(num_rows, dtype=np.int32),
+        token_ids=np.empty(0, dtype=np.int32),
+        support_logprobs=np.empty(0, dtype=np.float32),
+    )
+
+
 def _add_sampling_output_to_meta_info(
     meta_info: dict,
     state: ReqState,
     chunk: Optional[SamplingMaskChunk],
+    *,
+    num_output_tokens: int,
     finished: bool,
 ):
-    """Add the sampling logprobs and mask rows a request asked for."""
+    """Add the sampling logprobs and mask rows a request asked for. A filtered
+    request reads its captured rows; an unfiltered one was not captured, and
+    returns its output token logprobs and one empty mask row per output token."""
     obj = state.obj
-    if chunk is not None:
+    if state.filters_sampling and chunk is not None:
         if obj.return_sampling_logprobs:
             state.output_token_sampling_logprobs.extend(
                 chunk.selected_logprobs.tolist()
@@ -534,18 +614,29 @@ def _add_sampling_output_to_meta_info(
     if obj.return_sampling_logprobs:
         meta_info["output_token_sampling_logprobs"] = (
             state.output_token_sampling_logprobs
+            if state.filters_sampling
+            # A request that emits no token still has the logprob of the token
+            # sampled after its prompt, when its batch sampled.
+            else state.output_token_logprobs_val[:num_output_tokens]
         )
     if obj.return_flat_raw_sampling_mask:
         # Built once on the finished response; streaming is rejected.
         if finished:
+            mask_chunks = (
+                state.output_token_sampling_mask_chunks
+                if state.filters_sampling
+                else [_unfiltered_sampling_mask_chunk(num_output_tokens)]
+            )
             meta_info.update(
                 _build_flat_sampling_mask_fields(
-                    state.output_token_sampling_mask_chunks,
-                    return_b64=obj.return_flat_raw_sampling_mask_b64,
+                    mask_chunks, return_b64=obj.return_flat_raw_sampling_mask_b64
                 )
             )
     elif obj.return_sampling_mask:
-        meta_info["output_sampling_mask_logprobs"] = state.output_sampling_mask_logprobs
+        mask_rows = state.output_sampling_mask_logprobs
+        if not state.filters_sampling:
+            mask_rows.extend([] for _ in range(num_output_tokens - len(mask_rows)))
+        meta_info["output_sampling_mask_logprobs"] = mask_rows
 
 
 class InputFormat(Enum):
@@ -1590,6 +1681,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "return_sampling_logprobs or return_sampling_mask only supports "
                     "DisallowedTokensLogitsProcessor among custom logit processors."
                 )
+            if obj.return_sampling_logprobs and not obj.return_logprob:
+                raise ValueError(
+                    "return_sampling_logprobs requires return_logprob=true."
+                )
             if obj.return_flat_raw_sampling_mask and not obj.return_sampling_mask:
                 raise ValueError(
                     "return_flat_raw_sampling_mask can only be set when "
@@ -1781,7 +1876,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         sampling_params = self.sampling_params_class(**sampling_kwargs)
         sampling_params.normalize(self.tokenizer)
         sampling_params.verify(self.model_config.vocab_size)
-        _validate_watermark_request(sampling_params)
+        watermarked = _validate_watermark_request(sampling_params)
+        if isinstance(obj, GenerateReqInput):
+            _validate_unfiltered_sampling_output(obj, sampling_params, watermarked)
 
         # Build return object
         if isinstance(obj, GenerateReqInput):
@@ -2017,6 +2114,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 (tokenized_obj,)
             )
             tokenized_obj.time_stats.set_api_server_dispatch_time()
+            self._record_filters_sampling(tokenized_obj)
             if (hook := self.canary_info_hook) is not None:
                 hook.on_request_dispatched(
                     rid_to_state=self.rid_to_state, tokenized_obj=tokenized_obj
@@ -2101,6 +2199,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     if isinstance(tensor, CudaIpcTensorTransportProxy):
                         pool.cancel_proxy(tensor)
 
+    def _record_filters_sampling(
+        self,
+        tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
+    ) -> None:
+        """Keep whether the request filters sampling for its response. Every state
+        that receives output was dispatched, a parallel-sampling copy included."""
+        state = self.rid_to_state.get(tokenized_obj.rid)
+        if state is not None:
+            state.filters_sampling = tokenized_obj.sampling_params.filters_sampling()
+
     def _mark_state_dispatched(self, rid: str):
         """Record that *rid* reached the scheduler.
 
@@ -2135,6 +2243,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
 
             set_time_batch(tokenized_objs, "set_api_server_dispatch_time")
+            for tokenized_obj in tokenized_objs:
+                self._record_filters_sampling(tokenized_obj)
             if (hook := self.canary_info_hook) is not None:
                 for tokenized_obj in tokenized_objs:
                     hook.on_request_dispatched(
@@ -2924,6 +3034,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     meta_info,
                     state,
                     None if output_sampling_mask is None else output_sampling_mask[i],
+                    num_output_tokens=len(state.output_ids)
+                    + len(row_output_ids(recv_obj, i)),
                     finished=recv_obj.finished_reasons[i] is not None,
                 )
 

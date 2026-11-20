@@ -418,12 +418,12 @@ idx = np.frombuffer(
 
 `logprobs` and `top_logprobs` describe the distribution after temperature and before top-k / top-p / min-p. Two more flags in `extra_body`, together with `return_meta_info: true`, describe the distribution each token was actually sampled from: after those filters, renormalized. Each can be set without the other.
 
-- `return_sampling_logprobs: true` adds `output_token_sampling_logprobs` to `meta_info`: one float per output token.
-- `return_sampling_mask: true` adds `output_sampling_mask_logprobs`: one row per output token, each entry `[logprob, token_id]` for a token the sampler could have drawn. Unlike a `top_logprobs` entry it carries no text, whatever `return_text_in_logprobs` is.
+- `return_sampling_logprobs: true` (requires `logprobs: true`) adds `output_token_sampling_logprobs` to `meta_info`: one float per output token. With no filter set it equals the output token logprob, so a client reads this one field whatever the sampling parameters are.
+- `return_sampling_mask: true` adds `output_sampling_mask_logprobs`: one row per output token, each entry `[logprob, token_id]` for a token the sampler could have drawn. Unlike a `top_logprobs` entry it carries no text, whatever `return_text_in_logprobs` is. With no filter set every row is empty, standing for the whole vocabulary; the request is refused when something else narrows the support (a grammar constraint such as `response_format` or tool calling, a custom logit processor, `logit_bias`, `min_new_tokens`, watermarking, or a server launched with `--enable-strict-thinking`), and a finite `top_k` then returns the actual rows. With top-p or min-p it needs a finite `top_k` within `--sampling-mask-max-tokens`.
 
-Either flag needs greedy sampling or a finite `top_k` within `--sampling-mask-max-tokens`.
+The native `/generate` API takes the same two flags, with `return_logprob` in place of `logprobs`.
 
-The native `/generate` API takes the same two flags.
+On the MLX backend without `--mlx-enable-sampling` every token is the argmax, so a request with no filter set is refused for both flags.
 
 #### Returning Flat Sampling Masks
 

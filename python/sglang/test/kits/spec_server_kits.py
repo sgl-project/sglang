@@ -757,3 +757,45 @@ class SpecSamplingMaskKit:
                 )
                 if request_idx % 2 == 0:
                     self.assertEqual(support, {output_id: 0.0})
+
+
+class SpecUnfilteredSamplingOutputKit:
+    """Sampling logprobs and mask rows of a sampled request with no top-k, top-p or
+    min-p: nothing is captured for it, so each sampling logprob is the output
+    token's logprob and each mask row is empty, standing for the whole vocabulary."""
+
+    def test_unfiltered_sampling_output(self):
+        max_new_tokens = 16
+        response = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": "The capital of France is",
+                "sampling_params": {
+                    "temperature": 0.7,
+                    "top_k": -1,
+                    "top_p": 1.0,
+                    "min_p": 0.0,
+                    "max_new_tokens": max_new_tokens,
+                    "ignore_eos": True,
+                },
+                "return_logprob": True,
+                "return_sampling_logprobs": True,
+                "return_sampling_mask": True,
+            },
+            timeout=60,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        output = response.json()
+        output_ids = output["output_ids"]
+        meta_info = output["meta_info"]
+        output_logprobs = meta_info["output_token_logprobs"]
+        sampling_logprobs = meta_info["output_token_sampling_logprobs"]
+        self.assertEqual(len(output_ids), max_new_tokens)
+        self.assertEqual([token_id for _, token_id, *_ in output_logprobs], output_ids)
+        self.assertTrue(all(isinstance(value, float) for value in sampling_logprobs))
+        self.assertEqual(
+            sampling_logprobs, [logprob for logprob, *_ in output_logprobs]
+        )
+        self.assertEqual(
+            meta_info["output_sampling_mask_logprobs"], [[]] * len(output_ids)
+        )

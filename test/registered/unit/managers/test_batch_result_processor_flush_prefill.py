@@ -58,7 +58,8 @@ class _StreamFirst(SchedulerBatchResultProcessor):
 
 
 def _req(rid, max_new_tokens=8, *, mask=False):
-    params = SamplingParams(max_new_tokens=max_new_tokens)
+    # A mask is captured only under a sampling filter.
+    params = SamplingParams(max_new_tokens=max_new_tokens, top_k=8 if mask else -1)
     params.normalize(None)
     req = Req(
         rid,

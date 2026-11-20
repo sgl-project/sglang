@@ -3589,18 +3589,18 @@ class Scheduler(
         ):
             self._reject_bad_request(
                 req,
-                "return_sampling_logprobs or return_sampling_mask requires "
-                "SGLANG_ENABLE_DISAGG_SAMPLING_MASK=1 on both prefill and decode "
-                "servers when using disaggregated serving.",
+                "return_sampling_logprobs or return_sampling_mask with top-k/top-p/"
+                "min-p sampling requires SGLANG_ENABLE_DISAGG_SAMPLING_MASK=1 on "
+                "both prefill and decode servers when using disaggregated serving.",
             )
             return
 
-        if req.captures_sampling:
+        if req.captures_sampling and req.return_sampling_mask:
             top_k = req.sampling_params.top_k
             sampling_mask_cap = self.server_args.sampling_mask_max_tokens
             if top_k != 1 and not (1 < top_k <= sampling_mask_cap):
                 error_msg = (
-                    "return_sampling_logprobs or return_sampling_mask requires "
+                    "return_sampling_mask with top-k/top-p/min-p sampling requires "
                     "top_k=1 for greedy sampling or finite 1 < top_k <= "
                     f"{sampling_mask_cap}; got top_k={top_k}. Lower top_k or "
                     "increase --sampling-mask-max-tokens."
