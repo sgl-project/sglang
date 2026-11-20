@@ -485,6 +485,17 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
 
         self.assertIs(static_batch.mm_input_embeds, mm_input_embeds)
 
+    def test_static_batch_preserves_idle_rank_original_forward_mode(self):
+        runner = _load_batch_runner(SimpleNamespace())
+        forward_batch = _three_token_extend(
+            runner, _original_forward_mode=ForwardMode.IDLE
+        )
+
+        static_batch, _ = runner.load_batch(forward_batch)
+
+        self.assertEqual(static_batch.forward_mode, ForwardMode.EXTEND)
+        self.assertEqual(static_batch._original_forward_mode, ForwardMode.IDLE)
+
     def test_breakable_static_batch_carries_the_input_logprob_request(self):
         """A Breakable replay runs the logits processor on the static batch,
         which must ask it for what the raw batch asks."""
