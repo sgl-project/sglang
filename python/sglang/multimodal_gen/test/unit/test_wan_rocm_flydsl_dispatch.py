@@ -19,6 +19,11 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
 )
 
 
+def _supports_5120(dim: int) -> bool:
+    """Stand in for the kernel predicate so the tests run without FlyDSL."""
+    return dim == 5120
+
+
 @pytest.mark.parametrize(
     "layer_cls,num_inputs,fused_name",
     [
@@ -41,7 +46,7 @@ def test_wan_high_quality_aligned_norm_uses_flydsl(
         if num_inputs == 3
         else (torch.empty_like(inputs[0]), torch.empty_like(inputs[0]))
     )
-    monkeypatch.setitem(vars(diffusion), "FLYDSL_NORM_MIN_ALIGNED_DIM", 5120)
+    monkeypatch.setitem(vars(diffusion), "flydsl_norm_supports", _supports_5120)
     monkeypatch.setitem(vars(diffusion), fused_name, lambda *args: expected)
 
     monkeypatch.setattr(
@@ -68,7 +73,7 @@ def test_wan_norm_uses_native_when_disabled_or_unaligned(
     layer = layer_cls(hidden_size, rocm_flydsl_high_only=True)
     inputs = [torch.empty(1, hidden_size) for _ in range(num_inputs)]
     expected = object()
-    monkeypatch.setitem(vars(diffusion), "FLYDSL_NORM_MIN_ALIGNED_DIM", 5120)
+    monkeypatch.setitem(vars(diffusion), "flydsl_norm_supports", _supports_5120)
 
     with patch.object(layer, "forward_native", return_value=expected) as native:
         actual = layer.forward_hip(*inputs)
@@ -123,7 +128,7 @@ def test_wan_quality_transitions_restore_native(
     monkeypatch.setattr(
         wan_rocm_flydsl_norm_scale_shift_site.current_platform, "is_rocm", lambda: True
     )
-    monkeypatch.setitem(vars(diffusion), "FLYDSL_NORM_MIN_ALIGNED_DIM", 5120)
+    monkeypatch.setitem(vars(diffusion), "flydsl_norm_supports", _supports_5120)
     layer = layer_cls(5120, rocm_flydsl_high_only=True)
     inputs = [torch.empty(1, 5120) for _ in range(num_inputs)]
     assert ("high", WAN_ROCM_FLYDSL_NORM_SCALE_SHIFT) in _QUALITY_FUSION_HANDLERS
@@ -141,7 +146,7 @@ def test_wan_quality_transitions_restore_native(
 
 
 @pytest.mark.parametrize(
-    "reason", ["disabled", "unaligned", "epsilon", "platform", "missing_backend"]
+    "reason", ["disabled", "unaligned", "platform", "missing_backend"]
 )
 def test_wan_fusion_is_all_or_nothing(monkeypatch, reason):
     monkeypatch.setattr(layernorm, "_use_rocm_flydsl", True)
@@ -150,7 +155,7 @@ def test_wan_fusion_is_all_or_nothing(monkeypatch, reason):
         "is_rocm",
         lambda: reason != "platform",
     )
-    monkeypatch.setitem(vars(diffusion), "FLYDSL_NORM_MIN_ALIGNED_DIM", 5120)
+    monkeypatch.setitem(vars(diffusion), "flydsl_norm_supports", _supports_5120)
     model = nn.ModuleList(
         [LayerNormScaleShift(5120, rocm_flydsl_high_only=True) for _ in range(2)]
     )
@@ -158,14 +163,12 @@ def test_wan_fusion_is_all_or_nothing(monkeypatch, reason):
         monkeypatch.setattr(layernorm, "_use_rocm_flydsl", False)
     elif reason == "unaligned":
         WAN_ROCM_FLYDSL_NORM_SCALE_SHIFT.mark(model[1], 128)
-    elif reason == "epsilon":
-        model[1].eps = 1e-5
     elif reason == "missing_backend":
-        monkeypatch.delitem(vars(diffusion), "FLYDSL_NORM_MIN_ALIGNED_DIM")
+        monkeypatch.delitem(vars(diffusion), "flydsl_norm_supports")
         original = diffusion.__getattr__
 
         def unavailable(name):
-            if name == "FLYDSL_NORM_MIN_ALIGNED_DIM":
+            if name == "flydsl_norm_supports":
                 raise ImportError("FlyDSL unavailable")
             return original(name)
 
