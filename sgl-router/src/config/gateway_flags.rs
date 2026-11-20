@@ -48,8 +48,9 @@ const WORKERS_REGISTER_LIVE: &str =
 const METRICS_ON_MAIN_PORT: &str = "sgl-router serves /metrics on --host and --port";
 const NO_HEALTH_CHECKS: &str = "it runs no worker health checks, \
      and its circuit breaker takes failing workers out of routing";
-const ENGINE_PARSERS: &str = "sgl-router uses the parsers each engine reports in /server_info";
-const SGLANG_ENGINES_ONLY: &str = "it routes to SGLang engines only";
+const ENGINE_PARSERS: &str =
+    "sgl-router uses the parser each engine reports in /server_info, so set it on the engines";
+const ROUTES_TO_SGLANG_ONLY: &str = "sgl-router routes to SGLang engines only";
 
 /// Flags of both sgl-model-gateway launchers, the `smg` binary and
 /// `python -m sglang_router.launch_router`, that sgl-router does not define.
@@ -78,7 +79,10 @@ const GATEWAY_ONLY_FLAGS: &[(&str, Migration)] = &[
     ),
     (
         "--assignment-mode",
-        Use("--sticky-fallback-policy with --policy sticky"),
+        Use(
+            "--sticky-fallback-policy random (or load_based for min_load) with --policy sticky; \
+             min_group has no counterpart",
+        ),
     ),
     ("--prefix-token-count", Unsupported(None)),
     ("--prefix-hash-load-factor", Unsupported(None)),
@@ -161,7 +165,10 @@ const GATEWAY_ONLY_FLAGS: &[(&str, Migration)] = &[
         Unsupported(Some("the backoff doubles per retry")),
     ),
     ("--retry-jitter-factor", Unsupported(None)),
-    ("--disable-retries", Use("--retry-max-attempts 1")),
+    (
+        "--disable-retries",
+        Omit("sgl-router retries only when --retry-max-attempts is above 1"),
+    ),
     ("--cb-failure-threshold", Use("--cb-threshold")),
     (
         "--cb-success-threshold",
@@ -222,8 +229,8 @@ const GATEWAY_ONLY_FLAGS: &[(&str, Migration)] = &[
     ("--tool-call-parser", Omit(ENGINE_PARSERS)),
     ("--mcp-config-path", Unsupported(None)),
     // Backend and history storage
-    ("--backend", Unsupported(Some(SGLANG_ENGINES_ONLY))),
-    ("--runtime", Unsupported(Some(SGLANG_ENGINES_ONLY))),
+    ("--backend", Omit(ROUTES_TO_SGLANG_ONLY)),
+    ("--runtime", Omit(ROUTES_TO_SGLANG_ONLY)),
     ("--history-backend", Unsupported(None)),
     ("--enable-wasm", Unsupported(None)),
     ("--oracle-wallet-path", Unsupported(None)),
