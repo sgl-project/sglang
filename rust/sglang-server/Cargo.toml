@@ -24,7 +24,9 @@ test-support = []
 
 [dependencies]
 async-stream = { workspace = true }
+base64 = "0.22"
 bytes = { workspace = true }
+flate2 = "1"
 futures = { workspace = true }
 pyo3 = { workspace = true }
 serde = { workspace = true }

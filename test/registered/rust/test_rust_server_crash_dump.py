@@ -90,6 +90,7 @@ def _server_args(ext, port: int):
         limit_mm_data_per_request=[],
         allow_auto_truncate=False,
         enable_return_hidden_states=False,
+        return_hidden_states_mode=None,
         num_reserved_tokens=0,
         tokenizer_model_max_length=-1,
         version="test",

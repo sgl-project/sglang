@@ -21,8 +21,8 @@ from sglang.test.test_utils import (
 )
 from sglang.utils import wait_for_server
 
-register_npu_ci(est_time=400, suite="nightly-2-npu-a3", nightly=True)
-register_npu_ci(est_time=400, suite="base-b-test-2-npu-a3")
+register_npu_ci(est_time=400, suite="nightly-test-2-npu-a3", nightly=True)
+register_npu_ci(est_time=400, suite="extra-b-test-2-npu-a3")
 
 
 # Keep the first 6 layers of the BF16 checkpoint. The first 6 V4-Flash
@@ -89,7 +89,8 @@ class TestNPUDeepSeekV4ReturnIndexerTopk(CustomTestCase):
             "--enable-dp-lm-head",
             "--kv-cache-dtype",
             "auto",
-            "--disable-cuda-graph",
+            "--disable-decode-cuda-graph",
+            "--disable-prefill-cuda-graph",
             "--enable-return-indexer-topk",
             "--json-model-override-args",
             '{"num_hidden_layers": 6, "compress_ratios": [0, 0, 4, 128, 4, 128], "quantization_config": null}',

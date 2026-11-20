@@ -12,7 +12,7 @@ from sglang.test.send_one import BenchArgs, send_one_prompt
 
 register_npu_ci(
     est_time=8400,
-    suite="nightly-acc-2-npu-a3",
+    suite="nightly-acc-test-2-npu-a3",
     nightly=True,
 )
 
@@ -34,8 +34,6 @@ QWEN3_6_27B_3K5_1K5_ENVS = {
     "HCCL_OP_EXPANSION_MODE": "AIV",
     "SGLANG_SET_CPU_AFFINITY": "1",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "0",
-    "SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE": "1",
-    "SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES": "130",
     "ASCEND_USE_FIA": "1",
 }
 
@@ -90,6 +88,9 @@ QWEN3_6_27B_3K5_1K5_OTHER_ARGS = [
     "qwen3",
     "--tool-call-parser",
     "qwen3_coder",
+    "--enable-prefill-delayer",
+    "--prefill-delayer-max-delay-passes",
+    "130",
 ]
 
 

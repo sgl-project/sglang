@@ -27,10 +27,7 @@ from transformers import PretrainedConfig
 
 from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
 from sglang.srt.environ import envs
-from sglang.srt.hf_transformers import (
-    get_processor,
-    resolve_image_processor_backend,
-)
+from sglang.srt.hf_transformers import get_processor
 from sglang.srt.managers.io_struct import (
     EncoderDispatchErrorReq,
     GenerateReqInput,
@@ -67,6 +64,13 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
+
+
+def is_epd_accelerator(device: torch.device | str) -> bool:
+    """Whether EPD copies tensors on ``device`` to CPU and syncs its stream."""
+    # Not an allowlist: on NPU, torch_npu's transfer_to_npu made the old is_cuda
+    # checks true as well, so naming devices would drop NPU's syncs.
+    return torch.device(device).type != "cpu"
 
 
 class _ReceiveRegistrationRunner:
@@ -548,7 +552,7 @@ def _cat_grid(dims, flatten_items=False):
 
     def _to_tensor(g):
         if isinstance(g, torch.Tensor):
-            return g.cpu() if g.is_cuda else g
+            return g.cpu() if is_epd_accelerator(g.device) else g
         if isinstance(g, np.ndarray):
             return torch.from_numpy(g)
         return torch.as_tensor(g)
@@ -1320,7 +1324,9 @@ class WaitingZmqRequestGrpc(WaitingZmqRequest):
                 if assigned_num == 0:
                     continue
                 encoder_url = self.encoder_urls[idx]
-                receive_url = f"{host_name}:{embedding_port}"
+                receive_url = NetworkAddress(
+                    host_name, embedding_port
+                ).to_host_port_str()
                 target_url = f"{encoder_url}/SchedulerReceiveUrl"
                 logger.info(f"Preparing to send to {target_url}")
                 tasks.append(
@@ -1369,6 +1375,8 @@ class WaitingRDMARequest(WaitingMMRequestBase):
         zmq_context,
         embeddings_engine,
         dtype,
+        *,
+        device_type: str,
         gpu_id=0,
         model_type: Optional[str] = None,
         embedding_pool=None,
@@ -1388,6 +1396,7 @@ class WaitingRDMARequest(WaitingMMRequestBase):
         )
         self.embeddings_engine = embeddings_engine
         self.dtype = dtype
+        self.device_type = device_type
         self.gpu_id = gpu_id
         # The receive thread owns the buffer while _receive_running; once
         # _terminal latches, it releases the buffer itself on exit so the
@@ -1520,7 +1529,9 @@ class WaitingRDMARequest(WaitingMMRequestBase):
                     )
                 else:
                     gpu_buffer = torch.empty(
-                        total_bytes, dtype=torch.uint8, device=f"cuda:{self.gpu_id}"
+                        total_bytes,
+                        dtype=torch.uint8,
+                        device=f"{self.device_type}:{self.gpu_id}",
                     )
                     self.embeddings_engine.register(
                         gpu_buffer.data_ptr(), gpu_buffer.nbytes
@@ -1683,11 +1694,11 @@ class EmbeddingPool:
 
     _ALIGN = 256
 
-    def __init__(self, gpu_id: int, size_bytes: int, engine=None):
+    def __init__(self, *, device_type: str, gpu_id: int, size_bytes: int, engine=None):
         self.gpu_id = gpu_id
         self.size_bytes = size_bytes
         self.buffer = torch.empty(
-            size_bytes, dtype=torch.uint8, device=f"cuda:{gpu_id}"
+            size_bytes, dtype=torch.uint8, device=f"{device_type}:{gpu_id}"
         )
         self.base = self.buffer.data_ptr()
         self.engine = engine
@@ -1933,6 +1944,7 @@ class MMReceiverBase(ABC):
                 self.scheduler_embedding_port,
             )
         self.scheduler = scheduler
+        self.device_type = torch.device(get_device().device).type
         self.gpu_id = get_device().gpu_id if scheduler is not None else 0
         self.wait_timeout = envs.SGLANG_ENCODER_RECV_TIMEOUT.get()
         self.embedding_pool = None
@@ -1961,8 +1973,9 @@ class MMReceiverBase(ABC):
             if pool_mb and pool_mb > 0 and scheduler is not None:
                 try:
                     self.embedding_pool = EmbeddingPool(
-                        self.gpu_id,
-                        pool_mb * 1024 * 1024,
+                        device_type=self.device_type,
+                        gpu_id=self.gpu_id,
+                        size_bytes=pool_mb * 1024 * 1024,
                         engine=self.embeddings_engine,
                     )
                 except Exception:
@@ -1982,7 +1995,9 @@ class MMReceiverBase(ABC):
                 if pool_mb and pool_mb > 0:
                     try:
                         self.embedding_pool = EmbeddingPool(
-                            self.gpu_id, pool_mb * 1024 * 1024
+                            device_type=self.device_type,
+                            gpu_id=self.gpu_id,
+                            size_bytes=pool_mb * 1024 * 1024,
                         )
                     except Exception:
                         logger.exception(
@@ -2021,7 +2036,7 @@ class MMReceiverBase(ABC):
             tokenizer_mode=get_serving().tokenizer_mode,
             trust_remote_code=get_model().trust_remote_code,
             revision=get_model().revision,
-            image_processor_backend=resolve_image_processor_backend(get_mm()),
+            image_processor_backend=get_mm().image_processor_backend,
             **extra_kwargs,
         )
 
@@ -2431,7 +2446,10 @@ class MMReceiverBase(ABC):
             # Per-request sockets receive here; shared-socket requests use this
             # tick to retry pool staging after _drain_scheduler_embeddings().
             waiting_req._try_recv_mm_data()
-            if current_time - waiting_req.start_time > self.wait_timeout:
+            if (
+                waiting_req.status == WaitingMMRequestStatus.PENDING
+                and current_time - waiting_req.start_time > self.wait_timeout
+            ):
                 waiting_req.status = WaitingMMRequestStatus.TIMEOUT
                 waiting_req.release_resources()
                 waiting_req.close_recv_socket()
@@ -2550,7 +2568,7 @@ class MMReceiverBase(ABC):
             disagg_mode=self.scheduler.disaggregation_mode,
             routed_dp_rank=recv_req.routed_dp_rank,
             disagg_prefill_dp_rank=recv_req.disagg_prefill_dp_rank,
-            vocab_size=self.scheduler.model_config.vocab_size,
+            vocab_size=self.scheduler.model_config.token_id_vocab_size,
             priority=recv_req.priority,
             metrics_collector=(
                 self.scheduler.metrics_collector
@@ -2707,6 +2725,7 @@ class MMReceiverHTTP(MMReceiverBase):
                 WaitingRDMARequest,
                 embeddings_engine=self.embeddings_engine,
                 dtype=self.dtype,
+                device_type=self.device_type,
                 gpu_id=self.gpu_id,
                 embedding_pool=self.embedding_pool,
             )

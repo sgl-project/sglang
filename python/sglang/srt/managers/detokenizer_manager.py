@@ -63,7 +63,12 @@ from sglang.srt.runtime_context import (
     publish,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import configure_logger, freeze_gc, kill_itself_when_parent_died
+from sglang.srt.utils import (
+    configure_gc_logging,
+    configure_logger,
+    freeze_gc,
+    kill_itself_when_parent_died,
+)
 from sglang.srt.utils.common import TypeBasedDispatcher
 from sglang.srt.utils.network import get_zmq_socket
 from sglang.srt.utils.patch_tokenizer import decode_without_hf_kwargs
@@ -140,6 +145,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             soft=True,
             test_stuck_time=envs.SGLANG_TEST_STUCK_DETOKENIZER.get(),
         )
+        configure_gc_logging("Detokenizer Manager")
 
         if get_observability().enable_metrics:
             start_cpu_monitor_thread("detokenizer")
