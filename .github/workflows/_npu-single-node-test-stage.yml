@@ -32,6 +32,11 @@ on:
         type: string
         default: 'a3'
         description: device type for dependency installation (a3 or 950)
+      sgl_kernel_npu_tag:
+        required: false
+        type: string
+        default: ''
+        description: 'TEMP: when set, override the sgl-kernel-npu wheel preinstalled in the image with the matching release build of this tag (e.g. 2026.11.0.post12).'
       transformers_version:
         required: false
         type: string
@@ -211,6 +216,30 @@ jobs:
       - name: Check npu info
         run: |
           npu-smi info
+
+      # TEMP: the A3 image ships an sgl-kernel-npu build that predates the
+      # gdn_utils module required by main, so importing the NPU attention
+      # backends fails at server startup. Override the wheels with a matching
+      # release build before running the test. Remove together with the temp
+      # validation job.
+      - name: Override sgl-kernel-npu
+        if: ${{ inputs.sgl_kernel_npu_tag != '' }}
+        shell: bash
+        env:
+          GITHUB_PROXY_URL: "https://gh-proxy.test.osinfra.cn/"
+          SGLANG_KERNEL_NPU_TAG: ${{ inputs.sgl_kernel_npu_tag }}
+        run: |
+          set -euo pipefail
+          TAG="${SGLANG_KERNEL_NPU_TAG}"
+          ZIP="sgl-kernel-npu-${TAG}-torch2.10.0-py312-cann9.1.0-${{ inputs.device_type_for_deps }}-$(arch).zip"
+          mkdir -p /tmp/sgl-kernel-npu-override
+          cd /tmp/sgl-kernel-npu-override
+          wget "${GITHUB_PROXY_URL}https://github.com/sgl-project/sgl-kernel-npu/releases/download/${TAG}/${ZIP}"
+          unzip -o ./*.zip
+          python3 -m pip install --no-cache-dir --no-deps --force-reinstall ./*.whl
+          cd "$(python3 -m pip show deep-ep | awk '/^Location:/ {print $2}')"
+          ln -sf deep_ep/deep_ep_cpp*.so
+          python3 -c "import sgl_kernel_npu.operators.attention.gdn.gdn_utils as m; print('gdn_utils:', m.__file__)"
 
       - name: Install sglang dependencies
         if: ${{ inputs.install_sglang_deps == true }}

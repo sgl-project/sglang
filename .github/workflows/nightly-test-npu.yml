@@ -336,6 +336,9 @@ jobs:
       image: ${{ needs.set-image-config.outputs.image_a3 }}
       install_sglang_deps: false
       device_type_for_deps: 'a3'
+      # TEMP: override the stale sgl-kernel-npu preinstalled in the image so
+      # that the gdn_utils module exists; remove with the temp job.
+      sgl_kernel_npu_tag: '2026.11.0.post12'
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
       test_timeout_minutes: '180'
 
