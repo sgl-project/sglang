@@ -3350,6 +3350,15 @@ class Scheduler(
         mm_input_error: Optional[str] = None,
     ):
         with ExitStack() as mm_cleanup:
+            if (
+                recv_req.pp_prefetch_ticketed is True
+                and self.enable_unified_cache_external_linker
+            ):
+                # The source already issued the ticket. An early validation
+                # return on this stage still owes the worker an empty vote.
+                mm_cleanup.callback(
+                    self.tree_cache.linker.pp_tickets.skip_unbound, recv_req.rid
+                )
             if isinstance(
                 recv_req.mm_inputs, (MultimodalInputs, MultimodalProcessorOutput)
             ):
@@ -3512,7 +3521,10 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
-        if recv_req.pp_prefetch_ticketed is True:
+        if (
+            recv_req.pp_prefetch_ticketed is True
+            and not self.enable_unified_cache_external_linker
+        ):
             self.tree_cache.bind_prefetch_ticket(req.rid)
         self._maybe_namespace_elastic_radix_cache(req)
         self._record_kv_event_lora_name(req, recv_req.lora_name)
@@ -3749,6 +3761,17 @@ class Scheduler(
     def _bind_pp_arrival_prefetch(self, req: Req, recv_req) -> None:
         """PP0 decides the request's L3 ticket on arrival; every stage takes the
         prefix match behind that decision at the same step."""
+        linker = getattr(self.tree_cache, "linker", None)
+        if linker is not None:
+            tickets = linker.pp_tickets
+            if (
+                tickets is not None
+                and self.disaggregation_mode != DisaggregationMode.DECODE
+            ):
+                recv_req.pp_prefetch_ticketed = tickets.bind(
+                    req, recv_req.pp_prefetch_ticketed
+                )
+            return
         controller = self.tree_cache.cache_controller
         if controller is None or controller.pp_prefetch_command_group is None:
             return
@@ -6061,7 +6084,7 @@ class Scheduler(
                 or self.deferred_responses.has_pending()
                 or (
                     self.enable_unified_cache_external_linker
-                    and self.tree_cache.linker.prefetches
+                    and self.tree_cache.linker.has_pending_prefetch()
                 )
             ):
                 # Storage, transfer, and deferred-output workers need the GIL
@@ -6186,7 +6209,7 @@ class Scheduler(
                 idle &= not self.tree_cache.has_pending_cache_operations()
 
             if self.enable_unified_cache_external_linker:
-                idle &= not self.tree_cache.linker.prefetches
+                idle &= not self.tree_cache.linker.has_pending_prefetch()
 
         return idle
 

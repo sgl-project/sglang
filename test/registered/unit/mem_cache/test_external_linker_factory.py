@@ -96,6 +96,7 @@ class TestExternalLinkerConfig(unittest.TestCase):
             enable_unified_cache_external_linker=True,
             unified_cache_external_linker_backend="dynamic",
             unified_cache_external_linker_config=config,
+            pp_size=2,
         )
         # Validation must not import the plugin in the frontend.
         with patch(
@@ -150,6 +151,7 @@ class TestExternalLinkerConfig(unittest.TestCase):
                 unified_cache_external_linker_backend=backend,
                 unified_cache_external_linker_config={"backend_option": "value"},
                 enable_linker_mla_dedup=backend == "mooncake",
+                pp_size=2,
             )
             with (
                 self.subTest(backend=backend),
@@ -202,7 +204,6 @@ class TestExternalLinkerConfig(unittest.TestCase):
             {"enable_linker_mla_dedup": True},
             {"disable_radix_cache": True},
             {"radix_cache_backend": "custom"},
-            {"pp_size": 2},
         ):
             fields = dict(
                 model_path="dummy",

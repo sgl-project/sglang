@@ -1156,6 +1156,11 @@ class MambaComponent(TreeComponent):
         )
         if phase == LinkerTransferPhase.LOAD:
             transfer.device_indices = self._alloc_mamba_slot()
+        elif phase == LinkerTransferPhase.RESERVE:
+            storage, sub_pool = self._state()
+            transfer.device_indices = storage.take_state_slots(sub_pool, 1)
+            if transfer.device_indices is None:
+                return None
         return transfer
 
     def update_external_linker_load(
