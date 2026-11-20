@@ -16,10 +16,30 @@ from sglang.srt.utils.custom_op import register_custom_op
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
+logger = logging.getLogger(__name__)
+
+# Mirrors device::kWarpThreads in include/sgl_kernel/utils.cuh (32 on CUDA and HIP).
+_WARP_THREADS = 32
+
 
 @cache_once
-def _jit_kvcache_module(k_row_bytes: int, v_row_bytes: int) -> Module:
-    args = make_cpp_args(k_row_bytes, v_row_bytes, is_arch_support_pdl())
+def _jit_kvcache_module(k_row_bytes: int, v_row_bytes: int, num_threads: int) -> Module:
+    if num_threads == 0:
+        num_threads = 32
+        # rare case. just don't optimize it
+        if k_row_bytes % num_threads != 0 or v_row_bytes % num_threads != 0:
+            return _jit_kvcache_module(k_row_bytes, v_row_bytes, num_threads)
+        k_bytes = k_row_bytes / num_threads
+        v_bytes = v_row_bytes / num_threads
+        # increase threads if row is too large
+        while k_bytes % 8 == 0 and v_bytes % 8 == 0 and (k_bytes + v_bytes) >= 64:
+            num_threads *= 2
+            k_bytes /= 2
+            v_bytes /= 2
+        logger.debug(f"Heuristic {num_threads = } for {k_row_bytes = }, {v_row_bytes}")
+        return _jit_kvcache_module(k_row_bytes, v_row_bytes, num_threads)
+
+    args = make_cpp_args(k_row_bytes, v_row_bytes, num_threads, is_arch_support_pdl())
     return load_jit(
         "kvcache",
         *args,
@@ -29,20 +49,14 @@ def _jit_kvcache_module(k_row_bytes: int, v_row_bytes: int) -> Module:
 
 
 @cache_once
-def can_use_store_cache(k_row_bytes: int, v_row_bytes: int = 0) -> bool:
+def can_use_store_cache(
+    k_row_bytes: int, v_row_bytes: int = 0, num_threads: int = 0
+) -> bool:
     """Whether the JIT store_cache kernel can serve these row widths.
     v_row_bytes=0 means symmetric, i.e. it defaults to k_row_bytes."""
-    logger = logging.getLogger(__name__)
     v_row_bytes = v_row_bytes or k_row_bytes
-    for name, size in (("k_row_bytes", k_row_bytes), ("v_row_bytes", v_row_bytes)):
-        if size % 4 != 0:
-            logger.warning(
-                f"Unsupported {name}={size} for JIT KV-Cache kernel:"
-                " must be multiple of 4"
-            )
-            return False
     try:
-        _jit_kvcache_module(k_row_bytes, v_row_bytes)
+        _jit_kvcache_module(k_row_bytes, v_row_bytes, num_threads)
         return True
     except Exception as e:
         logger.warning(
@@ -62,7 +76,7 @@ def store_cache(
     *,
     row_bytes: int = 0,
     v_row_bytes: int = 0,
-    num_split: int = 0,  # can be tuned for performance
+    num_split: int = 0,
     size_limit: int = 0,
     reserved_skip_index: int = 0,
 ) -> None:
@@ -77,6 +91,8 @@ def store_cache(
         row_bytes (int): Key row width in bytes. Inferred from k when 0.
         v_row_bytes (int): Value row width in bytes; differs from row_bytes for
             asymmetric KV (head_dim != v_head_dim). Inferred from v when 0.
+        num_split (int): Warps cooperating on one row. A heuristic picks it
+            when 0; it is the only knob here that exists purely for tuning.
         size_limit (int): Valid slot bound (cache row count = real slots + the
             reserved padding slot); an index outside [0, size_limit) fails fast
             (device assert) instead of an illegal memory access. Defaults to the
@@ -87,15 +103,10 @@ def store_cache(
     """
     row_bytes = row_bytes or k.shape[-1] * k.element_size()
     v_row_bytes = v_row_bytes or v.shape[-1] * v.element_size()
-    module = _jit_kvcache_module(row_bytes, v_row_bytes)
-    if num_split <= 0:
-        # A split must divide BOTH rows, so require the alignment on each.
-        if row_bytes % 2048 == 0 and v_row_bytes % 2048 == 0:
-            num_split = 4
-        elif row_bytes % 1024 == 0 and v_row_bytes % 1024 == 0:
-            num_split = 2
-        else:
-            num_split = 1
+    # One warp per split. The knob stays the split count it has always been:
+    # renaming it changes the registered op schema, and a warm inductor cache
+    # does not notice that -- it replays generated code carrying the old name.
+    module = _jit_kvcache_module(row_bytes, v_row_bytes, num_split * _WARP_THREADS)
     if size_limit <= 0:
         size_limit = k_cache.shape[0]
     module.store_cache(
@@ -104,7 +115,6 @@ def store_cache(
         k_cache,
         v_cache,
         indices,
-        num_split,
         size_limit,
         reserved_skip_index,
     )

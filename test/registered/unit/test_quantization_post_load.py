@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import unittest
+from unittest.mock import patch
 
 import torch
 from torch import nn
@@ -9,7 +10,7 @@ from sglang.srt.model_loader.loader import device_loading_context
 from sglang.srt.model_loader.post_load import stage_module_for_post_load
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 
 
 def _process_device() -> torch.device | None:
@@ -44,6 +45,23 @@ class TestModulePostLoadStaging(unittest.TestCase):
         self.assertEqual(module.scale.data_ptr(), scale_ptr)
         torch.testing.assert_close(module.weight, torch.arange(4.0).reshape(2, 2) + 1)
         torch.testing.assert_close(module.scale, torch.full((2,), 3.0))
+
+    def test_unindexed_process_device_does_not_copy_resident_views(self):
+        module = nn.Module()
+        module.weight = nn.Parameter(
+            torch.arange(24.0, device=PROCESS_DEVICE).reshape(4, 6).T
+        )
+        weight_ptr = module.weight.data_ptr()
+        with patch.object(
+            torch.Tensor, "copy_", side_effect=AssertionError("unexpected copy_")
+        ):
+            with stage_module_for_post_load(module, torch.device("cuda")):
+                module.weight.data.add_(1)
+        self.assertEqual(module.weight.data_ptr(), weight_ptr)
+        self.assertEqual(module.weight.stride(), (1, 6))
+        torch.testing.assert_close(
+            module.weight, torch.arange(24.0, device=PROCESS_DEVICE).reshape(4, 6).T + 1
+        )
 
     def test_restores_replacements_and_new_state_with_mixed_residency(self):
         module = nn.Module()
@@ -130,6 +148,49 @@ class TestModulePostLoadStaging(unittest.TestCase):
 
 
 class TestModulePostLoadValidation(unittest.TestCase):
+    def test_equivalent_device_does_not_copy_resident_storage(self):
+        # cpu:0 resolves to cpu, like cuda/npu resolve to an indexed device.
+        # Simulate Ascend's copy_ restriction without needing NPU hardware.
+        for view in (torch.arange(24).reshape(4, 6).T, torch.arange(24)[1::2]):
+            with self.subTest(stride=view.stride()):
+                module = nn.Module()
+                module.weight = nn.Parameter(view, requires_grad=False)
+                module.alias = module.weight
+                module.register_buffer("scale", torch.ones(2))
+                weight, scale = module.weight, module.scale
+                weight_ptr, scale_ptr = weight.data_ptr(), scale.data_ptr()
+                stride, offset = weight.stride(), weight.storage_offset()
+                expected = weight.detach().clone() + 1
+                with patch.object(
+                    torch.Tensor,
+                    "copy_",
+                    side_effect=AssertionError("unexpected copy_"),
+                ):
+                    with stage_module_for_post_load(module, torch.device("cpu:0")):
+                        module.weight.data.add_(1)
+                        module.scale.add_(1)
+                self.assertIs(module.weight, weight)
+                self.assertIs(module.alias, weight)
+                self.assertIs(module.scale, scale)
+                self.assertEqual(weight.data_ptr(), weight_ptr)
+                self.assertEqual(scale.data_ptr(), scale_ptr)
+                self.assertEqual(weight.stride(), stride)
+                self.assertEqual(weight.storage_offset(), offset)
+                torch.testing.assert_close(weight, expected)
+                torch.testing.assert_close(scale, torch.full((2,), 2.0))
+
+    def test_equivalent_device_does_not_mask_hook_error_with_copy(self):
+        module = nn.Module()
+        module.weight = nn.Parameter(torch.arange(24.0).reshape(4, 6).T)
+        weight_ptr = module.weight.data_ptr()
+        with patch.object(
+            torch.Tensor, "copy_", side_effect=AssertionError("unexpected copy_")
+        ):
+            with self.assertRaisesRegex(RuntimeError, "hook failed"):
+                with stage_module_for_post_load(module, torch.device("cpu:0")):
+                    raise RuntimeError("hook failed")
+        self.assertEqual(module.weight.data_ptr(), weight_ptr)
+
     @unittest.skipUnless(PROCESS_DEVICE is not None, "requires CUDA")
     def test_srt_cpu_loading_context_remains_a_noop(self):
         module = nn.Module()
@@ -140,18 +201,31 @@ class TestModulePostLoadValidation(unittest.TestCase):
 
         self.assertEqual(module.weight.device, PROCESS_DEVICE)
 
-    def test_rejects_meta_before_moving_other_state(self):
+    def test_parks_existing_meta_tensor_and_stages_the_rest(self):
         module = nn.Module()
         module.meta_weight = nn.Parameter(torch.empty(1, device="meta"))
         module.register_buffer("scale", torch.ones(1))
         scale_ptr = module.scale.data_ptr()
+        meta_weight = module.meta_weight
+
+        with stage_module_for_post_load(module, torch.device("cpu")):
+            # offloader-parked meta state passes through untouched
+            self.assertTrue(module.meta_weight.is_meta)
+            module.scale.add_(1)
+
+        self.assertIs(module.meta_weight, meta_weight)
+        self.assertTrue(module.meta_weight.is_meta)
+        self.assertEqual(module.scale.device.type, "cpu")
+        self.assertEqual(module.scale.data_ptr(), scale_ptr)
+        torch.testing.assert_close(module.scale, torch.full((1,), 2.0))
+
+    def test_rejects_meta_produced_by_post_load_processing(self):
+        module = nn.Module()
+        module.register_buffer("scale", torch.ones(1))
 
         with self.assertRaisesRegex(RuntimeError, "meta tensor"):
             with stage_module_for_post_load(module, torch.device("cpu")):
-                self.fail("context should not be entered")
-
-        self.assertEqual(module.scale.device.type, "cpu")
-        self.assertEqual(module.scale.data_ptr(), scale_ptr)
+                module.new_weight = nn.Parameter(torch.empty(1, device="meta"))
 
 
 if __name__ == "__main__":

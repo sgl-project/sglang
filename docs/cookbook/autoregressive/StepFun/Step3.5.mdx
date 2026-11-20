@@ -341,7 +341,7 @@ sglang serve \
 - Benchmark Command:
 
 ```shell Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --model stepfun-ai/Step-3.5-Flash \
   --dataset-name random \
@@ -398,7 +398,7 @@ Max ITL (ms):                            20.77
 - Benchmark Command:
 
 ```shell Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --model stepfun-ai/Step-3.5-Flash \
   --dataset-name random \
@@ -455,7 +455,7 @@ Max ITL (ms):                            460.85
 - Benchmark Command:
 
 ```shell Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --model stepfun-ai/Step-3.5-Flash \
   --dataset-name random \
@@ -514,8 +514,12 @@ Max ITL (ms):                            1359.81
 - **Benchmark Command:**
 
 ```shell Command
-python3 -m sglang.test.few_shot_gsm8k --num-questions 200
+sgl-eval run gsm8k \
+  --base-url http://127.0.0.1:30000/v1 \
+  --num-examples 200
 ```
+
+The command above uses sgl-eval. Historical scores from other harnesses are not directly comparable; rerun this command for a matching result.
 
 - **Results**:
 

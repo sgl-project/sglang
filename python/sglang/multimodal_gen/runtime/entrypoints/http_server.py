@@ -1,22 +1,32 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 import asyncio
-import base64
 import os
 import signal
 import uuid
 from contextlib import asynccontextmanager, suppress
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import httpx
+import psutil
+import pybase64
 import torch
-from fastapi import APIRouter, FastAPI, Request, Response
+from fastapi import APIRouter, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.runtime.distributed.parallel_state import get_world_rank
 from sglang.multimodal_gen.runtime.entrypoints.action import api as action_api
 from sglang.multimodal_gen.runtime.entrypoints.action import openpi
+from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
+    StartProfileReq,
+    StopProfileReq,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai import image_api, video_api
+from sglang.multimodal_gen.runtime.entrypoints.openai.prompt_enhancement import (
+    PromptEnhancer,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     VertexGenerateReqInput,
 )
@@ -24,6 +34,13 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.realtime import (
     realtime_video_api,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import build_sampling_params
+from sglang.multimodal_gen.runtime.entrypoints.openai.video_cancel import (
+    start_cancel_publisher,
+    stop_cancel_publisher,
+)
+from sglang.multimodal_gen.runtime.entrypoints.openai.video_progress import (
+    run_progress_listener,
+)
 from sglang.multimodal_gen.runtime.entrypoints.post_training import (
     rollout_api,
     weights_api,
@@ -33,7 +50,10 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     save_outputs,
 )
 from sglang.multimodal_gen.runtime.observability.metrics import configure_metrics
-from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
+from sglang.multimodal_gen.runtime.scheduler_client import (
+    async_scheduler_client,
+    run_zeromq_broker,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
 from sglang.multimodal_gen.runtime.server_warmup import (
     run_async_client_warmup,
@@ -43,14 +63,21 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     globally_suppress_loggers,
     init_logger,
 )
-from sglang.srt.utils.common import (
-    add_prometheus_middleware,
-    add_prometheus_track_response_middleware,
+from sglang.multimodal_gen.runtime.utils.perf_logger import RequestMetrics
+from sglang.srt.entrypoints.server_utils import add_prometheus_middleware
+from sglang.srt.environ import envs
+from sglang.srt.observability.http_request_metrics import (
+    add_http_request_metrics_middleware,
+    init_http_request_metrics,
 )
+from sglang.srt.observability.trace import fastapi_telemetry_disabled_kwargs
 from sglang.srt.utils.json_response import orjson_response
 from sglang.version import __version__
 
 if TYPE_CHECKING:
+    from sglang.multimodal_gen.runtime.disaggregation.orchestrator import (
+        DiffusionServer,
+    )
     from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 
 logger = init_logger(__name__)
@@ -109,24 +136,37 @@ async def _run_server_warmup_after_http_live(
         os.kill(os.getpid(), signal.SIGTERM)
 
 
+def build_route_request_models(app: FastAPI) -> None:
+    """Build the routes' pydantic models now; FastAPI otherwise builds them on the
+    first matching request (~17 ms). The OpenAPI schema resolves the same models."""
+    try:
+        app.openapi()
+    except Exception:
+        logger.debug("Route model prebuild failed", exc_info=True)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    from sglang.multimodal_gen.runtime.entrypoints.openai.video_api import (
-        shutdown_video_jobs,
-    )
-    from sglang.multimodal_gen.runtime.scheduler_client import (
-        async_scheduler_client,
-        run_zeromq_broker,
-    )
-
     # 1. Initialize the singleton client that connects to the backend Scheduler
     server_args = app.state.server_args
+    build_route_request_models(app)
     async_scheduler_client.initialize(server_args)
     warmup_done = asyncio.Event()
     app.state.server_warmup_done = warmup_done
 
     # 2. Start the ZMQ Broker in the background to handle offline requests
     broker_task = asyncio.create_task(run_zeromq_broker(server_args))
+    app.state.broker_task = broker_task
+    backend_monitor = asyncio.create_task(_monitor_backend(app))
+    # 3. Receive per-step progress of video jobs from the replica drivers
+    progress_task = None
+    if server_args.progress_endpoint is not None:
+        progress_task = asyncio.create_task(
+            run_progress_listener(server_args.progress_endpoint)
+        )
+    # 4. Send the ids of deleted video jobs to the replica drivers
+    if server_args.cancel_endpoint is not None:
+        start_cancel_publisher(server_args.cancel_endpoint, server_args.dp_size)
     warmup_task = None
     if server_args.warmup_mode == "server":
         warmup_task = asyncio.create_task(
@@ -136,8 +176,16 @@ async def lifespan(app: FastAPI):
         warmup_done.set()
 
     try:
+        app.state.prompt_enhancer = (
+            PromptEnhancer.from_file(server_args.prompt_enhancer_config)
+            if server_args.prompt_enhancer_config is not None
+            else None
+        )
         yield
     finally:
+        backend_monitor.cancel()
+        with suppress(asyncio.CancelledError):
+            await backend_monitor
         if warmup_task is not None and not warmup_task.done():
             warmup_task.cancel()
             with suppress(asyncio.CancelledError):
@@ -145,10 +193,21 @@ async def lifespan(app: FastAPI):
 
         # On shutdown
         logger.info("FastAPI app is shutting down...")
-        await shutdown_video_jobs()
+        await video_api.shutdown_video_jobs()
+        if app.state.prompt_enhancer is not None:
+            await app.state.prompt_enhancer.close()
         broker_task.cancel()
-        with suppress(asyncio.CancelledError):
+        try:
             await broker_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("Offline request broker failed")
+        if progress_task is not None:
+            progress_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await progress_task
+        stop_cancel_publisher()
         async_scheduler_client.close()
 
 
@@ -162,9 +221,40 @@ async def liveness():
     return {"status": "ok"}
 
 
+def _backend_failure(app: FastAPI) -> str | None:
+    if app.state.disagg_server is not None and not app.state.disagg_server.is_alive:
+        return "Disaggregation router exited; restart the server."
+    if app.state.broker_task is not None and app.state.broker_task.done():
+        return "Offline request broker exited; restart the server."
+    for worker in app.state.worker_processes:
+        try:
+            # is_running also detects PID reuse; an unreaped child is still a zombie
+            if worker.is_running() and worker.status() != psutil.STATUS_ZOMBIE:
+                continue
+        except psutil.NoSuchProcess:
+            pass
+        return "Scheduler worker exited; restart the server."
+    return None
+
+
+async def _monitor_backend(app: FastAPI) -> None:
+    # Do not probe through the scheduler: a dead non-output rank can leave
+    # its peers blocked in collectives, unable to answer even a health RPC.
+    while True:
+        error = _backend_failure(app)
+        if error is not None:
+            logger.error(error)
+            async_scheduler_client.mark_failed(error)
+            return
+        await asyncio.sleep(1)
+
+
 @health_router.get("/health")
 async def health(request: Request):
     """Report readiness for normal inference traffic."""
+    error = async_scheduler_client.failure_reason or _backend_failure(request.app)
+    if error is not None:
+        return orjson_response({"status": "unhealthy", "error": error}, status_code=503)
     if not request.app.state.server_warmup_done.is_set():
         return Response(status_code=503)
     return {"status": "ok"}
@@ -179,23 +269,28 @@ async def get_models(request: Request):
         Use /v1/models instead for OpenAI-compatible model discovery.
         This endpoint will be removed in a future version.
     """
-    from sglang.multimodal_gen.registry import get_model_info
+    from sglang.multimodal_gen.runtime.entrypoints.openai.common_api import (
+        get_served_pipeline_class,
+    )
 
     server_args: ServerArgs = request.app.state.server_args
-    model_info = get_model_info(server_args.model_path, model_id=server_args.model_id)
+    pipeline_cls = get_served_pipeline_class(server_args)
 
     response = {
         "model_path": server_args.model_path,
         "num_gpus": server_args.num_gpus,
         "task_type": server_args.pipeline_config.task_type.name,
+        "supported_task_types": [
+            task.name for task in server_args.pipeline_config.get_supported_task_types()
+        ],
         "dit_precision": server_args.pipeline_config.dit_precision,
         "vae_precision": server_args.pipeline_config.vae_precision,
         "vae_decode_precision": server_args.pipeline_config.vae_decode_precision,
     }
 
-    if model_info:
-        response["pipeline_name"] = model_info.pipeline_cls.pipeline_name
-        response["pipeline_class"] = model_info.pipeline_cls.__name__
+    if pipeline_cls:
+        response["pipeline_name"] = pipeline_cls.pipeline_name
+        response["pipeline_class"] = pipeline_cls.__name__
 
     return response
 
@@ -204,8 +299,8 @@ async def get_models(request: Request):
 async def server_info_endpoint(request: Request):
     """Get server information.
 
-    Returns fields compatible with the LLM engine's /server_info so that
-    the model gateway can discover diffusion workers.
+    Returns fields compatible with the LLM engine's /server_info, so a client
+    that discovers LLM workers through it discovers diffusion workers too.
     """
     server_args: ServerArgs = request.app.state.server_args
 
@@ -222,37 +317,38 @@ async def server_info_endpoint(request: Request):
 async def model_info_endpoint(request: Request):
     """Get model information.
 
-    Returns fields compatible with the LLM engine's /model_info so that
-    the model gateway can detect capabilities for diffusion workers.
+    Returns fields compatible with the LLM engine's /model_info, so a client
+    reads a diffusion worker's capabilities as it reads an LLM worker's.
     """
-    from sglang.multimodal_gen.registry import get_model_info
+    from sglang.multimodal_gen.runtime.entrypoints.openai.common_api import (
+        get_served_pipeline_class,
+    )
 
     server_args: ServerArgs = request.app.state.server_args
     task_type = server_args.pipeline_config.task_type
+    supported_tasks = server_args.pipeline_config.get_supported_task_types()
 
     try:
-        registry_info = get_model_info(
-            server_args.model_path,
-            backend=server_args.backend,
-            model_id=server_args.model_id,
-        )
+        pipeline_cls = get_served_pipeline_class(server_args)
     except Exception:
         logger.warning("Failed to resolve model info from registry", exc_info=True)
-        registry_info = None
+        pipeline_cls = None
 
     return {
-        # Fields consumed by the model gateway for worker discovery
+        # Fields that identify the worker's model
         "model_path": server_args.model_path,
         "is_generation": True,
         "model_type": "diffusion",
-        "architectures": (
-            [registry_info.pipeline_cls.__name__] if registry_info else None
-        ),
+        "architectures": [pipeline_cls.__name__] if pipeline_cls else None,
         # Fields matching the LLM engine's /model_info shape
-        "has_image_understanding": task_type.accepts_image_input(),
+        "has_image_understanding": any(
+            task.accepts_image_input() for task in supported_tasks
+        ),
         "has_audio_understanding": False,
         # Diffusion-specific fields
         "task_type": task_type.name,
+        "supported_task_types": [task.name for task in supported_tasks],
+        "output_types": sorted({task.data_type().name for task in supported_tasks}),
         "is_image_gen": task_type.is_image_gen(),
     }
 
@@ -291,10 +387,179 @@ async def stats_endpoint(request: Request):
     return response
 
 
+class ProfileReqInput(BaseModel):
+    """
+    Request input for profile endpoints.
+    Similar to LLM's ProfileReqInput for consistency.
+    """
+
+    # Directory to save traces. Uses SGLANG_TORCH_PROFILER_DIR env var if not provided.
+    output_dir: Optional[str] = None
+    # Activities to profile: ["CPU", "GPU"]
+    activities: Optional[list[str]] = None
+    # Whether to record stack traces
+    with_stack: Optional[bool] = None
+    # Whether to record tensor shapes
+    record_shapes: Optional[bool] = None
+
+
+class ProfileReqOutput(BaseModel):
+    """Response output for profile endpoints."""
+
+    success: bool
+    message: str
+
+
+# Global profiler state for online serving
+_global_profiler_state = {
+    "profiler": None,
+    "is_profiling": False,
+    "profile_id": None,
+}
+
+
+@health_router.api_route("/start_profile", methods=["GET", "POST"])
+async def start_profile(request: Request, obj: Optional[ProfileReqInput] = None):
+    """Start profiling."""
+    import time as time_module
+
+    if _global_profiler_state["is_profiling"]:
+        return Response(
+            content="Profiling is already in progress. Call /stop_profile first.\n",
+            status_code=400,
+        )
+
+    try:
+        # Get parameters
+        if obj is None:
+            obj = ProfileReqInput()
+
+        output_dir = obj.output_dir or envs.SGLANG_TORCH_PROFILER_DIR.get()
+
+        profile_id = str(int(time_module.time()))
+
+        with_stack = obj.with_stack or envs.SGLANG_PROFILE_WITH_STACK.get()
+        record_shapes = obj.record_shapes or envs.SGLANG_PROFILE_RECORD_SHAPES.get()
+
+        try:
+            rank = get_world_rank()
+        except Exception:
+            logger.warning("Failed to get world rank, defaulting to 0")
+            rank = 0
+
+        # Lazy import to reduce import time (see issue #10492)
+        from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
+
+        http_profiler = SGLDiffusionProfiler(
+            request_id=profile_id,
+            rank=rank,
+            full_profile=True,
+            activities=obj.activities,
+            num_steps=-1,
+            num_inference_steps=100,
+            log_dir=output_dir,
+            with_stack=with_stack,
+            record_shapes=record_shapes,
+            is_host=True,
+        )
+        _global_profiler_state["profiler"] = http_profiler
+        _global_profiler_state["profile_id"] = profile_id
+
+        start_req = StartProfileReq(
+            output_dir=output_dir,
+            profile_id=profile_id,
+            activities=obj.activities,
+            with_stack=with_stack,
+            record_shapes=record_shapes,
+        )
+        try:
+            response = await async_scheduler_client.forward(start_req)
+            if response.error:
+                logger.warning(f"GPU Worker profiler warning: {response.error}")
+        except Exception as e:
+            logger.warning(f"Could not start GPU Worker profiler: {e}")
+
+        _global_profiler_state["is_profiling"] = True
+
+        logger.info(
+            f"Profilers started with profile_id={profile_id}. Output: {output_dir}"
+        )
+
+        return Response(
+            content=f"Profiling started (profile_id={profile_id}). Traces will be saved to: {output_dir}\n",
+            status_code=200,
+        )
+
+    except Exception as e:
+        logger.error(f"Failed to start profiler: {e}")
+        return Response(
+            content=f"Failed to start profiler: {str(e)}\n",
+            status_code=500,
+        )
+
+
+@health_router.api_route("/stop_profile", methods=["GET", "POST"])
+async def stop_profile():
+    """Stop profiling and save traces."""
+    if not _global_profiler_state["is_profiling"]:
+        return Response(
+            content="Profiling is not in progress. Call /start_profile first.\n",
+            status_code=400,
+        )
+
+    errors = []
+    profile_id = _global_profiler_state.get("profile_id", "unknown")
+
+    host_failed = False
+    try:
+        profiler = _global_profiler_state["profiler"]
+        if profiler is not None:
+            profiler.stop(export_trace=True, dump_rank=None)
+    except Exception as e:
+        host_failed = True
+        errors.append(f"HTTP Server: {e}")
+
+    try:
+        response = await async_scheduler_client.forward(
+            StopProfileReq(export_trace=True)
+        )
+        if response.error:
+            errors.append(f"GPU Worker: {response.error}")
+    except Exception as e:
+        errors.append(f"GPU Worker: {e}")
+    finally:
+        _global_profiler_state["profiler"] = None
+        _global_profiler_state["is_profiling"] = False
+        _global_profiler_state["profile_id"] = None
+
+    if errors:
+        details = "; ".join(errors)
+        if host_failed:
+            logger.error(
+                "Failed to stop profiler (profile_id=%s): %s", profile_id, details
+            )
+            return Response(
+                content=f"Failed to stop profiler: {details}\n", status_code=500
+            )
+        message = (
+            f"Profiling stopped (profile_id={profile_id}) with warnings: {details}"
+        )
+        logger.warning(message)
+        return Response(content=f"{message}\n", status_code=200)
+
+    logger.info("Profilers stopped (profile_id=%s).", profile_id)
+    return Response(
+        content=f"Profiling stopped (profile_id={profile_id}). Traces saved to SGLANG_TORCH_PROFILER_DIR.\n",
+        status_code=200,
+    )
+
+
 def make_serializable(obj):
-    """Recursively converts Tensors to None for JSON serialization."""
+    """Serialize output metadata without copying tensors back to the CPU."""
     if isinstance(obj, torch.Tensor):
         return None
+    if isinstance(obj, RequestMetrics):
+        return obj.to_dict()
     if isinstance(obj, dict):
         return {k: make_serializable(v) for k, v in obj.items()}
     if isinstance(obj, list):
@@ -303,10 +568,11 @@ def make_serializable(obj):
 
 
 def encode_video_to_base64(file_path: str):
-    if not os.path.exists(file_path):
-        return None
     with open(file_path, "rb") as f:
-        return base64.b64encode(f.read()).decode("utf-8")
+        content = f.read()
+    if not content:
+        raise ValueError(f"Empty model output file: {file_path}")
+    return pybase64.b64encode(content).decode("utf-8")
 
 
 async def forward_to_scheduler(
@@ -316,6 +582,8 @@ async def forward_to_scheduler(
     """Forwards request to scheduler and processes the result."""
     try:
         response = await async_scheduler_client.forward(req_obj)
+        if response.error:
+            raise RuntimeError(response.error)
         if response.output is None and response.output_file_paths is None:
             raise RuntimeError("Model generation returned no output.")
 
@@ -331,6 +599,8 @@ async def forward_to_scheduler(
                 lambda _idx: output_file_path,
                 audio=response.audio,
                 audio_sample_rate=response.audio_sample_rate,
+                output_compression=sp.output_compression,
+                x264_preset=sp.x264_preset,
                 enable_frame_interpolation=sp.enable_frame_interpolation,
                 frame_interpolation_exp=sp.frame_interpolation_exp,
                 frame_interpolation_scale=sp.frame_interpolation_scale,
@@ -340,19 +610,10 @@ async def forward_to_scheduler(
                 upscaling_scale=sp.upscaling_scale,
             )
 
-        if hasattr(response, "model_dump"):
-            data = response.model_dump()
-        else:
-            data = response if isinstance(response, dict) else vars(response)
-
-        if output_file_path:
-            logger.info("Processing output file: %s", output_file_path)
-            b64_video = encode_video_to_base64(output_file_path)
-
-            if b64_video:
-                data["output"] = b64_video
-                data.pop("video_data", None)
-                data.pop("video_tensor", None)
+        data = vars(response).copy()
+        data["output"] = await asyncio.to_thread(
+            encode_video_to_base64, output_file_path
+        )
 
         return make_serializable(data)
 
@@ -372,41 +633,54 @@ async def vertex_generate(vertex_req: VertexGenerateReqInput):
     server_args = get_global_server_args()
     params = vertex_req.parameters or {}
 
-    futures = []
+    requests = []
 
     for inst in vertex_req.instances:
         rid = f"vertex_{uuid.uuid4()}"
 
-        sp = build_sampling_params(
-            rid,
-            prompt=inst.get("prompt") or inst.get("text"),
-            image_path=inst.get("image") or inst.get("image_url"),
-            num_frames=params.get("num_frames"),
-            fps=params.get("fps"),
-            width=params.get("width"),
-            height=params.get("height"),
-            guidance_scale=params.get("guidance_scale"),
-            save_output=params.get("save_output"),
-        )
+        try:
+            sp = build_sampling_params(
+                rid,
+                prompt=inst.get("prompt") or inst.get("text"),
+                image_path=inst.get("image") or inst.get("image_url"),
+                num_frames=params.get("num_frames"),
+                fps=params.get("fps"),
+                width=params.get("width"),
+                height=params.get("height"),
+                guidance_scale=params.get("guidance_scale"),
+                save_output=params.get("save_output"),
+            )
+            requests.append(prepare_request(server_args, sampling_params=sp))
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-        backend_req = prepare_request(server_args, sampling_params=sp)
-        futures.append(forward_to_scheduler(backend_req, sp))
-
-    results = await asyncio.gather(*futures)
+    # validate every instance before creating coroutines or dispatching work
+    results = await asyncio.gather(
+        *(forward_to_scheduler(req, req.sampling_params) for req in requests)
+    )
 
     return orjson_response({"predictions": results})
 
 
-def create_app(server_args: ServerArgs):
+def create_app(
+    server_args: ServerArgs,
+    *,
+    worker_pids: tuple[int, ...] = (),
+    disagg_server: "DiffusionServer | None" = None,
+):
     """
     Create and configure the FastAPI application instance.
     """
     globally_suppress_loggers()
-    app = FastAPI(lifespan=lifespan)
+    app = FastAPI(lifespan=lifespan, **fastapi_telemetry_disabled_kwargs())
+    app.state.worker_processes = [psutil.Process(pid) for pid in worker_pids]
+    app.state.disagg_server = disagg_server
+    app.state.broker_task = None
     if server_args.enable_metrics:
         configure_metrics()
         add_prometheus_middleware(app)
-        add_prometheus_track_response_middleware(app)
+        add_http_request_metrics_middleware(app)
+        init_http_request_metrics()
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -417,6 +691,11 @@ def create_app(server_args: ServerArgs):
 
     @app.middleware("http")
     async def wait_for_server_warmup(request: Request, call_next):
+        # Keep GETs available for completed results and failure diagnostics.
+        if request.method == "POST" and async_scheduler_client.failure_reason:
+            return orjson_response(
+                {"error": async_scheduler_client.failure_reason}, status_code=503
+            )
         warmup_done = getattr(request.app.state, "server_warmup_done", None)
         if (
             warmup_done is not None
@@ -444,4 +723,5 @@ def create_app(server_args: ServerArgs):
     app.include_router(rollout_api.router)
 
     app.state.server_args = server_args
+    app.state.prompt_enhancer = None
     return app

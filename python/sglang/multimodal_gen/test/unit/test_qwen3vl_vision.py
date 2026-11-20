@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 from torch import nn
 
@@ -24,6 +25,28 @@ from sglang.srt.models.qwen3_vl import (
     Qwen3VLVisionPatchEmbed,
 )
 from sglang.srt.runtime_context import get_parallel
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("dim", [36, 40, 64])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("recompute_on_device_change", [False, True])
+def test_vision_rope_device_transfer(dim, dtype, recompute_on_device_change):
+    with torch.device("cpu"):
+        transferred = Qwen3VLVisionRotaryEmbedding(dim).to(dtype=dtype)
+        assert transferred.recompute_on_device_change is False
+        transferred.recompute_on_device_change = recompute_on_device_change
+        expected_cpu = transferred(64).clone()
+    with torch.device("cuda"):
+        resident = Qwen3VLVisionRotaryEmbedding(dim).to(dtype=dtype)
+        expected_cuda = resident(64)
+
+    transferred.cuda()
+    expected = expected_cuda if recompute_on_device_change else expected_cpu.cuda()
+    torch.testing.assert_close(transferred(64), expected, atol=0, rtol=0)
+    torch.testing.assert_close(transferred(64), expected, atol=0, rtol=0)
+    transferred.cpu()
+    torch.testing.assert_close(transferred(64), expected_cpu, atol=0, rtol=0)
 
 
 def test_native_vision_layout_matches_qwen3_merge_order():
@@ -191,7 +214,7 @@ def test_qwen3vl_ties_lm_head_to_input_embeddings():
         _fsdp_shard_conditions=[],
         stacked_params_mapping=[],
     )
-    config = SimpleNamespace(arch_config=arch_config)
+    config = SimpleNamespace(arch_config=arch_config, quant_config=None)
 
     with get_parallel().override(tp_size=1, tp_rank=0):
         model = Qwen3VLForConditionalGeneration(config)
@@ -213,4 +236,26 @@ def test_qwen3_multimodal_encoders_layerwise_offload_vision_blocks():
     assert any(
         condition.__name__ == "is_block"
         for condition in Qwen3VLArchConfig()._fsdp_shard_conditions
+    )
+
+
+def test_vision_position_interpolation_preserves_bf16_rounding():
+    model = Qwen3VLVisionTransformer.__new__(Qwen3VLVisionTransformer)
+    nn.Module.__init__(model)
+    model.num_grid_per_side = 2
+    model.spatial_merge_size = 2
+    model.pos_embed = nn.Embedding.from_pretrained(
+        torch.tensor(
+            [[7.21875], [-3.359375], [2.078125], [-1.1171875]], dtype=torch.bfloat16
+        )
+    )
+    model.fp32_position_interpolation = False
+    positions = model._interpolate_position_embeddings(torch.tensor([[1, 4, 4]]))
+    # (1, 1) has corner weights 4/9, 2/9, 2/9, 1/9 in merge order
+    assert positions.dtype == torch.bfloat16
+    assert positions[3, 0].item() == 2.8125
+    model.fp32_position_interpolation = True
+    assert (
+        model._interpolate_position_embeddings(torch.tensor([[1, 4, 4]])).dtype
+        == torch.float32
     )

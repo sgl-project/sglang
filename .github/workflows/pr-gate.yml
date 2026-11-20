@@ -1,27 +1,34 @@
 on:
   workflow_call:
     inputs:
-      require-run-ci:
-        description: "Whether the PR must have the run-ci label"
-        type: boolean
-        default: true
-      require-run-ci-extra:
-        description: "Whether the PR must also have the run-ci-extra label (in addition to run-ci)"
-        type: boolean
-        default: false
+      require-label:
+        description: "Opt-in tier label (run-ci-<tier>), required besides run-ci (empty = none)"
+        type: string
+        default: ''
       cool-down-minutes:
         description: "Cooldown period in minutes for low-permission users; 0 disables rate limiting"
         type: number
         default: 120
+    outputs:
+      opted-in:
+        description: "'false' for a draft PR or one lacking run-ci or require-label; callers skip their test jobs instead of failing"
+        value: ${{ jobs.pr-gate.outputs.opted-in }}
 
 jobs:
   pr-gate:
     # 1. for commits on main: no gating needed
     # 2. for workflow_dispatch: this can only be triggered by users with write access
+    # 3. for pull_request and pull_request_target: apply the checks below.
+    #    This job only reads PR metadata through the API and never checks out
+    #    or executes PR code, so it is safe for pull_request_target callers.
     runs-on: ubuntu-latest
+    outputs:
+      opted-in: ${{ steps.skip.outcome == 'success' && 'false' || 'true' }}
+    env:
+      IS_PR_EVENT: ${{ github.event_name == 'pull_request' || github.event_name == 'pull_request_target' }}
     steps:
       - name: Fetch latest PR info
-        if: github.event_name == 'pull_request'
+        if: env.IS_PR_EVENT == 'true'
         id: pr
         uses: actions/github-script@v8
         with:
@@ -37,48 +44,36 @@ jobs:
             core.setOutput("user", pr.data.user.login);
 
       - name: Log PR info
-        if: github.event_name == 'pull_request'
+        if: env.IS_PR_EVENT == 'true'
         run: |
           echo "===== PR Info ====="
           echo "PR Event: ${{ github.event_name }}"
           echo "PR Labels: ${{ steps.pr.outputs.labels }}"
           echo "PR Draft: ${{ steps.pr.outputs.draft }}"
           echo "PR User: ${{ steps.pr.outputs.user }}"
-          echo "Require run-ci: ${{ inputs.require-run-ci }}"
-          echo "Require run-ci-extra: ${{ inputs.require-run-ci-extra }}"
+          echo "Require label: ${{ inputs.require-label }}"
           echo "Cool down minutes: ${{ inputs.cool-down-minutes }}"
           echo "==================="
 
-      - name: Block draft PR
-        if: github.event_name == 'pull_request' && fromJson(steps.pr.outputs.draft)
-        run: |
-          echo "PR is draft. Blocking CI."
-          exit 1
-
-      - name: Require run-ci label (optional)
-        if:  github.event_name == 'pull_request' && inputs.require-run-ci == true
-        run: |
-          labels='${{ steps.pr.outputs.labels }}'
-          if [[ "${{ contains(fromJson(steps.pr.outputs.labels), 'run-ci') }}" == "false" ]]; then
-            echo "Missing required label 'run-ci'. See https://docs.sglang.io/developer_guide/contribution_guide.html#how-to-trigger-ci-tests for more details."
-            exit 1
-          fi
-
-      # Live-fetch label gate for pr-test-extra.yml. Workflow-level `if`
-      # checks would read the frozen event payload, which doesn't update on
-      # rerun — so /tag-and-rerun-ci extra (slash handler adds the label
-      # then reruns) could never un-skip. A runtime step using gh-api-fetched
-      # labels lets reruns pick up the new label set.
-      - name: Require run-ci-extra label (optional)
-        if: github.event_name == 'pull_request' && inputs.require-run-ci-extra == true
-        run: |
-          if [[ "${{ contains(fromJson(steps.pr.outputs.labels), 'run-ci-extra') }}" == "false" ]]; then
-            echo "Missing required label 'run-ci-extra'. Add the label (e.g. via /tag-and-rerun-ci extra) to opt this PR into the extra test workflow."
-            exit 1
-          fi
+      # Live-fetched labels, not event-payload expressions, which do not
+      # refresh on rerun. A draft PR, a missing `run-ci`, or a missing opt-in
+      # tier label (scripts/ci/opt_in_ci_tiers.json) runs this step, and the
+      # caller's test jobs skip on opted-in=false instead of failing. The slash
+      # command handler and pr-states.yml find such runs by this step's name.
+      - name: Skip tests
+        id: skip
+        if: >-
+          env.IS_PR_EVENT == 'true' && (
+            fromJson(steps.pr.outputs.draft)
+            || !contains(fromJson(steps.pr.outputs.labels), 'run-ci')
+            || inputs.require-label != '' && !contains(fromJson(steps.pr.outputs.labels), inputs.require-label)
+          )
+        env:
+          REQUIRED_LABEL: ${{ inputs.require-label }}
+        run: echo "::notice::Tests skipped. To run them, the PR must not be a draft and needs 'run-ci'${REQUIRED_LABEL:+ and '$REQUIRED_LABEL'}."
 
       - name: Enforce rate limit for low-permission actors (optional)
-        if: github.event_name == 'pull_request' && inputs.cool-down-minutes > 0
+        if: env.IS_PR_EVENT == 'true' && inputs.cool-down-minutes > 0 && steps.skip.outcome != 'success'
         uses: actions/github-script@v8
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -87,6 +82,11 @@ jobs:
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const eventName = context.eventName;
+            // pr-test.yml runs on pull_request, so pull_request_target callers must
+            // query that event to share the same rate-limit history.
+            const rateLimitEventName = eventName === "pull_request_target"
+              ? "pull_request"
+              : eventName;
             const curRun = await github.rest.actions.getWorkflowRun({
               owner, repo, run_id: context.runId
             });
@@ -161,14 +161,14 @@ jobs:
 
             const cutoff = new Date(Date.now() - effectiveCooldownMinutes * 60 * 1000);
             core.info(
-              `Checking for workflow runs since ${cutoff.toISOString()} (last ${effectiveCooldownMinutes} minutes) for event '${eventName}'.`
+              `Checking for workflow runs since ${cutoff.toISOString()} (last ${effectiveCooldownMinutes} minutes) for event '${rateLimitEventName}'.`
             );
 
             const { data } = await github.rest.actions.listWorkflowRuns({
               owner,
               repo,
               workflow_id: 'pr-test.yml',
-              event: eventName,
+              event: rateLimitEventName,
               per_page: 100,
             });
 
@@ -178,7 +178,7 @@ jobs:
             // We only count workflow runs that actually consumed CI resources (i.e., passed the gate).
             // A run "passes the gate" if any jobs beyond the gate jobs (check-changes, pr-gate, call-gate)
             // actually executed (not skipped/cancelled). This prevents scenarios where:
-            // - User has PR A with missing 'run-ci' label (fails at gate)
+            // - User has PR A with missing 'run-ci' label (tests skipped at gate)
             // - User opens PR B with 'run-ci' label
             // - PR B should be able to run even though PR A triggered a run recently
 
@@ -254,11 +254,11 @@ jobs:
                 break;
               } else {
                 runsSkippedAtGate++;
-                core.info(`Run ${run.id} failed at gate; not counting against rate limit.`);
+                core.info(`Run ${run.id} stopped at gate; not counting against rate limit.`);
               }
             }
 
-            core.info(`Rate limit check summary: checked ${runsChecked} runs, ${runsSkippedAtGate} failed at gate.`);
+            core.info(`Rate limit check summary: checked ${runsChecked} runs, ${runsSkippedAtGate} stopped at gate.`);
 
             if (recentFound) {
               core.setFailed(

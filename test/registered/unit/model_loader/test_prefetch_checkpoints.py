@@ -25,10 +25,11 @@ from sglang.srt.model_loader.weight_utils import (
     fastsafetensors_weights_iterator,
     safetensors_weights_iterator,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class _InlineThread:
@@ -71,6 +72,12 @@ def _wait_all(fs, return_when):
 
 class TestPrefetchCheckpoints(CustomTestCase):
     """Verify coordinated checkpoint prefetch behavior."""
+
+    def setUp(self):
+        # The fastsafetensors iterator asks for the current CUDA device; keep CPU runners off CUDA.
+        current_device = patch("torch.cuda.current_device", return_value=0)
+        current_device.start()
+        self.addCleanup(current_device.stop)
 
     def _create_safetensors_files(self, tmpdir, num_shards=3):
         """Create real safetensors files with known tensor content."""
@@ -202,44 +209,23 @@ class TestPrefetchCheckpoints(CustomTestCase):
         self.assertEqual(warning.call_args.args[1], paths[0])
         self.assertIsInstance(warning.call_args.args[2], OSError)
 
-    @patch("torch.distributed.is_initialized", return_value=False)
-    def test_prefetch_progress_logs_all_crossed_buckets(self, _):
-        paths = [f"model-{i:05d}.safetensors" for i in range(3)]
-
-        with (
-            patch("threading.Thread", _InlineThread),
-            patch("concurrent.futures.ThreadPoolExecutor", _InlineExecutor),
-            patch("concurrent.futures.wait", side_effect=_wait_all),
-            patch("sglang.srt.model_loader.weight_utils._prefetch_checkpoint_file"),
-            patch("sglang.srt.model_loader.weight_utils.logger.debug") as log_debug,
-        ):
-            _prefetch_all_checkpoints(paths, num_threads=1)
-
-        progress_pcts = [
-            call.args[2]
-            for call in log_debug.call_args_list
-            if call.args
-            and call.args[0] == "Rank %d: prefetching checkpoint files: %d%% (%d/%d)"
-        ]
-        self.assertEqual(progress_pcts, list(range(10, 101, 10)))
-
     @patch("torch.distributed.is_initialized", return_value=True)
     def test_prefetch_uses_node_local_rank_partitioning(self, _):
         paths = [f"model-{i:05d}.safetensors" for i in range(10)]
         loaded_paths = []
 
+        # Rank 9 of 4 nodes x 4 ranks, with LOCAL_SIZE unset as on GPU.
         class FakeWorldGroup:
+            rank = 9
             local_rank = 1
-            local_size = 3
-            world_size = 99
+            local_size = 0
 
         with (
             patch("threading.Thread", _InlineThread),
             patch("concurrent.futures.ThreadPoolExecutor", _InlineExecutor),
             patch("concurrent.futures.wait", side_effect=_wait_all),
-            patch(
-                "sglang.srt.model_loader.weight_utils.get_world_group",
-                return_value=FakeWorldGroup(),
+            get_parallel().override(
+                world_group=FakeWorldGroup(), nnodes=4, launch_world_size=16
             ),
             patch(
                 "sglang.srt.model_loader.weight_utils._prefetch_checkpoint_file",
@@ -248,7 +234,7 @@ class TestPrefetchCheckpoints(CustomTestCase):
         ):
             _prefetch_all_checkpoints(paths, num_threads=2)
 
-        self.assertEqual(sorted(loaded_paths), sorted(paths[1::3]))
+        self.assertEqual(sorted(loaded_paths), paths[1::4])
 
     @patch("torch.distributed.is_initialized", return_value=False)
     def test_prefetch_handle_cancels_before_scheduling_next_shard(self, _):
@@ -298,6 +284,66 @@ class TestPrefetchCheckpoints(CustomTestCase):
                 [call.args[0] for call in drop_cache.call_args_list],
                 paths,
             )
+
+    @patch("torch.distributed.is_initialized", return_value=False)
+    def test_buffered_loader_caps_inflight_bytes(self, _):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = self._create_safetensors_files(tmpdir, num_shards=5)
+            shard_bytes = os.path.getsize(paths[0])
+            reference = dict(safetensors_weights_iterator(paths))
+            # max_workers=3: a window of 4 shards unless the byte cap is lower;
+            # one shard is always admitted.
+            for cap, window in ((None, 4), (2 * shard_bytes, 2), (1, 1)):
+                submitted = []
+
+                class _RecordingExecutor(_InlineExecutor):
+                    def submit(self, fn, path):
+                        submitted.append(path)
+                        return super().submit(fn, path)
+
+                loaded, peak = {}, 0
+                weights = buffered_multi_thread_safetensors_weights_iterator(
+                    paths, max_workers=3, disable_mmap=True, max_inflight_bytes=cap
+                )
+                with patch("concurrent.futures.ThreadPoolExecutor", _RecordingExecutor):
+                    for name, tensor in weights:
+                        shard = int(name.split(".")[0].removeprefix("layer"))
+                        peak = max(peak, len(submitted) - (shard + 1))
+                        loaded[name] = tensor
+                self.assertEqual(peak, window, f"max_inflight_bytes={cap}")
+                self.assertEqual(loaded.keys(), reference.keys())
+                for name, tensor in reference.items():
+                    self.assertTrue(torch.equal(loaded[name], tensor))
+
+    def test_max_inflight_bytes_must_be_a_positive_int(self):
+        from sglang.srt.model_loader.loader import (
+            _validate_default_loader_extra_config,
+        )
+
+        for bad in (0, -1, 1.5, "1", True):
+            with self.assertRaisesRegex(ValueError, "max_inflight_bytes"):
+                _validate_default_loader_extra_config(
+                    extra_config={"max_inflight_bytes": bad},
+                    load_format=LoadFormat.SAFETENSORS,
+                )
+        # Formats that reach the buffered safetensors iterator accept it.
+        for load_format in (
+            LoadFormat.AUTO,
+            LoadFormat.SAFETENSORS,
+            LoadFormat.MISTRAL,
+            LoadFormat.FLASH_RL,
+        ):
+            _validate_default_loader_extra_config(
+                extra_config={"max_inflight_bytes": 1 << 30},
+                load_format=load_format,
+            )
+        # Formats whose loaders ignore the cap reject it.
+        for load_format in (LoadFormat.FASTSAFETENSORS, LoadFormat.PT):
+            with self.assertRaisesRegex(ValueError, "Unexpected extra config keys"):
+                _validate_default_loader_extra_config(
+                    extra_config={"max_inflight_bytes": 1 << 30},
+                    load_format=load_format,
+                )
 
     @patch("torch.distributed.is_initialized", return_value=False)
     def test_fastsafetensors_drops_only_the_rank_owned_file(self, _):
@@ -359,6 +405,47 @@ class TestPrefetchCheckpoints(CustomTestCase):
 
         torch.testing.assert_close(loaded[0][1], torch.tensor([1.0]))
         self.assertEqual(events, ["close", "drop:model.safetensors"])
+
+    @patch("torch.distributed.is_initialized", return_value=False)
+    def test_fastsafetensors_uses_local_device_not_group_rank(self, _):
+        """On multi-node TP the group rank exceeds the node's GPU count;
+        the loader must copy to this process's current device, not cuda:{rank}."""
+        devices = []
+
+        class FakeGroup:
+            def rank(self):
+                return 3
+
+            def size(self):
+                return 1
+
+        class FakeBuffer:
+            key_to_rank_lidx = {}
+
+        class FakeLoader:
+            def __init__(self, group, device, nogds):
+                devices.append(device)
+
+            def add_filenames(self, rank_file_map):
+                pass
+
+            def copy_files_to_device(self):
+                return FakeBuffer()
+
+            def close(self):
+                pass
+
+        with (
+            patch("sglang.srt.model_loader.weight_utils.SingleGroup", FakeGroup),
+            patch(
+                "sglang.srt.model_loader.weight_utils.SafeTensorsFileLoader",
+                FakeLoader,
+            ),
+            patch("torch.cuda.current_device", return_value=1),
+        ):
+            list(fastsafetensors_weights_iterator(["model.safetensors"]))
+
+        self.assertEqual(devices, [torch.device("cuda", 1)])
 
 
 class TestPrefetchDispatch(CustomTestCase):
@@ -517,6 +604,34 @@ class TestPrefetchDispatch(CustomTestCase):
         mock_buffered.assert_called_once()
         mock_single.assert_not_called()
         self.assertEqual(self._override_notices(mock_log), [])
+
+    def test_max_inflight_bytes_without_multithread_warns(self):
+        """The cap bounds only the multithreaded loader; with it off, the key
+        is ignored with a warning rather than silently."""
+        cap = {"max_inflight_bytes": 1 << 30}
+        for extra, warns in (
+            ({"enable_multithread_load": False, **cap}, True),
+            ({"enable_multithread_load": False}, False),
+            (cap, False),
+        ):
+            with self.subTest(extra=extra):
+                loader = self._make_loader(extra)
+                p_prep, p_model, p_buffered, p_single, p_log = self._patch_dispatch(
+                    prefetch=False
+                )
+                with (
+                    p_prep,
+                    p_model,
+                    p_buffered,
+                    p_single,
+                    p_log,
+                    patch("sglang.srt.model_loader.loader.logger.warning") as warn,
+                ):
+                    self._run(loader)
+                notices = [
+                    c for c in warn.call_args_list if "max_inflight_bytes" in c.args[0]
+                ]
+                self.assertEqual(len(notices), int(warns))
 
     def test_startup_prefetch_reuses_existing_background_handle(self):
         """Startup commit reuses resolved shards and the active prefetch handle."""

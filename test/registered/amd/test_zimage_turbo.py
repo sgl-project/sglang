@@ -23,7 +23,9 @@ from sglang.test.ci.ci_register import register_amd_ci
 
 logger = logging.getLogger(__name__)
 
-register_amd_ci(est_time=1800, suite="nightly-amd-1-gpu-zimage-turbo", nightly=True)
+register_amd_ci(
+    est_time=1800, suite="nightly-test-1-gpu-amd-zimage-turbo", nightly=True
+)
 
 AMD_ZIMAGE_CASES = [
     DiffusionTestCase(
@@ -125,7 +127,7 @@ class TestZImageTurboAMD(DiffusionServerBase):
             diffusion_server, case.id, generate_fn
         )
 
-        self._validate_and_record(case, perf_record)
+        self._validate_and_record(diffusion_server, case, perf_record)
         self._test_v1_models_endpoint(diffusion_server, case)
 
         prompt = case.sampling_params.prompt or ""

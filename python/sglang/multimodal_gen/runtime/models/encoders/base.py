@@ -8,16 +8,19 @@ import torch
 from torch import nn
 
 from sglang.multimodal_gen.configs.models.encoders import (
+    AudioEncoderConfig,
     BaseEncoderOutput,
     EncoderConfig,
     ImageEncoderConfig,
     TextEncoderConfig,
 )
+from sglang.multimodal_gen.runtime.cache.conditioning import cached_encoder_call
 from sglang.multimodal_gen.runtime.distributed import (
     get_replica_group,
     get_sp_group,
     get_tp_group,
     get_world_group,
+    model_parallel_is_initialized,
 )
 from sglang.multimodal_gen.runtime.distributed.group_coordinator import GroupCoordinator
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
@@ -27,6 +30,18 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+
+
+def get_attention_head_partition(
+    num_heads: int, num_kv_heads: int, tp_size: int
+) -> tuple[int, int]:
+    """Partition query heads and shard or replicate KV heads across TP ranks."""
+    assert num_heads % tp_size == 0
+    if num_kv_heads >= tp_size:
+        assert num_kv_heads % tp_size == 0
+    else:
+        assert tp_size % num_kv_heads == 0
+    return num_heads // tp_size, max(1, num_kv_heads // tp_size)
 
 
 def get_folding_tp_group(config: EncoderConfig):
@@ -178,10 +193,20 @@ class EncoderTensorParallelMixin:
 
     def __call__(self, *args, **kwargs):
         tp_group = self._encoder_tp_group
+        forward = super().__call__
+        cache_group = tp_group
+        if cache_group is None and model_parallel_is_initialized():
+            cache_group = get_tp_group()
+
+        def run():
+            return cached_encoder_call(
+                self, args, kwargs, lambda: forward(*args, **kwargs), cache_group
+            )
+
         if tp_group is None:
-            return super().__call__(*args, **kwargs)
+            return run()
         with use_tensor_parallel_group(tp_group):
-            return super().__call__(*args, **kwargs)
+            return run()
 
 
 class TextEncoder(
@@ -206,7 +231,6 @@ class TextEncoder(
     # shard conditions left in the root group stays sharded unless the entry
     # point is registered; loaders read this and register each name.
     _fsdp_forward_methods: tuple[str, ...] = ()
-    _stacked_params_mapping: list[tuple[str, str, str]] = field(default_factory=list)
     _supported_attention_backends: set[AttentionBackendEnum] = (
         TextEncoderConfig()._supported_attention_backends
     )
@@ -215,7 +239,6 @@ class TextEncoder(
         super().__init__()
         self.config = config
         self._fsdp_shard_conditions = config.arch_config._fsdp_shard_conditions
-        self._stacked_params_mapping = config.arch_config.stacked_params_mapping
         if not self.supported_attention_backends:
             raise ValueError(
                 f"Subclass {self.__class__.__name__} must define _supported_attention_backends"
@@ -262,6 +285,24 @@ class ImageEncoder(
     @abstractmethod
     def forward(self, pixel_values: torch.Tensor, **kwargs) -> BaseEncoderOutput:
         pass
+
+    @property
+    def supported_attention_backends(self) -> set[AttentionBackendEnum]:
+        return self._supported_attention_backends
+
+
+class AudioEncoder(nn.Module, ABC):
+    _supported_attention_backends: set[AttentionBackendEnum] = (
+        AudioEncoderConfig()._supported_attention_backends
+    )
+
+    def __init__(self, config: AudioEncoderConfig) -> None:
+        super().__init__()
+        self.config = config
+        if not self.supported_attention_backends:
+            raise ValueError(
+                f"Subclass {self.__class__.__name__} must define _supported_attention_backends"
+            )
 
     @property
     def supported_attention_backends(self) -> set[AttentionBackendEnum]:

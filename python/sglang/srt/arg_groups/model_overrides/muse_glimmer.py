@@ -1,7 +1,4 @@
-"""Config-time override declarations for muse_glimmer.
-
-Architectures: MuseGlimmerForCausalLM, MuseGlimmerForConditionalGeneration.
-"""
+"""Config-time override declarations for muse_glimmer."""
 
 import logging
 from typing import Any

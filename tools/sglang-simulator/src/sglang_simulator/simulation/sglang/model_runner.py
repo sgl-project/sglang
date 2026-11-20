@@ -106,8 +106,6 @@ class C_ModelRunnerHook(BaseHook):
                 self.decode_attention_backend_str = resolved.decode
 
             self.attn_backend = None
-            self.decode_attn_backend = None
-            self.decode_attn_backend_group = None
 
         def wrapped_init_cuda_graphs(self, capture_decode_cuda_graph=True):
             self.graph_mem_usage = 0
@@ -175,6 +173,11 @@ class C_KVCacheConfiguratorHook(BaseHook):
                             budget_bytes, page_size
                         )
                     except RuntimeError:
+                        return 0
+                    except ValueError as error:
+                        # New runtimes reject deliberately undersized SWA probes.
+                        if "cannot hold even one request" not in str(error):
+                            raise
                         return 0
                     return config.max_total_num_tokens
 
@@ -248,6 +251,20 @@ class C_KVCacheConfiguratorHook(BaseHook):
             for name, value in original_attrs.items():
                 if hasattr(token_pool, name):
                     setattr(token_pool, name, value)
+
+            # Some pools derive their physical row widths while the dimensions
+            # above are compacted. Restore that derived geometry before host
+            # pools inspect the device-pool rows for HiCache sizing.
+            if all(
+                hasattr(token_pool, name)
+                for name in ("head_num", "head_dim", "row_dim")
+            ):
+                token_pool.row_dim = token_pool.head_num * token_pool.head_dim
+            if all(
+                hasattr(token_pool, name)
+                for name in ("head_num", "v_head_dim", "v_row_dim")
+            ):
+                token_pool.v_row_dim = token_pool.head_num * token_pool.v_head_dim
 
             if (
                 hasattr(token_pool, "kv_cache_dim")

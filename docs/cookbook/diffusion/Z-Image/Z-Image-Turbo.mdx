@@ -1,25 +1,32 @@
 ---
 title: Z-Image-Turbo
+description: "Deploy Z-Image-Turbo with SGLang - community contribution guide for Z-Image's fast image generation model."
 metatags:
     description: "Deploy Z-Image-Turbo with SGLang - community contribution guide for Z-Image's fast image generation model."
 ---
 
 import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
-import { ZImageTurboDeployment } from '/src/snippets/diffusion/zimage-turbo-deployment.jsx';
 
 <DiffusionModelTags tags={["image", "text-to-image", "6B S3-DiT", "8-step", "bilingual text"]} />
 
-## 1. Model Introduction
+import { Deployment } from '/src/snippets/_deployment.jsx';
+import { config } from '/src/snippets/configs/TongyiMAI/z-image-turbo.jsx';
+
+## 1. Quick start
+
+Follow the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation) for your GPU platform.
+
+<a id="2-sglang-diffusion-installation" />
+
+<Deployment config={config} />
+
+<a id="1-model-introduction" />
+
+## 2. Model capabilities
 
 [Z-Image-Turbo](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo) is a distilled 6B single-stream DiT for fast text-to-image generation. It reaches its intended operating point in 8 function evaluations and is particularly strong at photorealistic scenes, prompt adherence, and English/Chinese text rendering.
 
 Choose it when latency and a relatively small deployment footprint matter more than the editability or maximum capacity of larger image models. It is a generation-only checkpoint; use Qwen-Image-Edit or FLUX.2 when the request includes source images or identity-preserving edits.
-
-## 2. SGLang-diffusion Installation
-
-SGLang-diffusion offers multiple installation methods. You can choose the most suitable installation method based on your hardware platform and requirements.
-
-Please refer to the [official SGLang-diffusion installation guide](https://docs.sglang.io/docs/sglang-diffusion/installation) for installation instructions.
 
 ## 3. Model Deployment
 
@@ -29,17 +36,15 @@ This section provides deployment configurations optimized for different hardware
 
 Z-Image-Turbo is optimized for high-quality image generation with only 8 inference steps. The recommended launch configurations vary by hardware.
 
-**Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform.
-
-<ZImageTurboDeployment />
+Use the [command builder](#1-quick-start) above.
 
 ### 3.2 Configuration Tips
 
 See [Performance Optimization](/docs/sglang-diffusion/performance-optimization) for acceleration features and their runtime requirements.
 
-- `--vae-path`: Path to a custom VAE model or HuggingFace model ID (e.g., fal/FLUX.2-Tiny-AutoEncoder). If not specified, the VAE will be loaded from the main model path.
+- `--vae-path`: Path to a custom VAE model or HuggingFace model ID. If not specified, the VAE will be loaded from the main model path.
 - `--num-gpus`: Number of GPUs to use
-- `--tp-size`: Tensor parallelism size (only for the encoder; should not be larger than 1 if text encoder offload is enabled, as layer-wise offload plus prefetch is faster)
+- `--tp-size`: Tensor parallelism size. Depending on the pipeline it shards the DiT, the encoders, or both.
 - `--sp-degree`: Sequence parallelism size (typically should match the number of GPUs)
 - `--ulysses-degree`: The degree of DeepSpeed-Ulysses-style SP in USP
 - `--ring-degree`: The degree of ring attention-style SP in USP
@@ -51,6 +56,12 @@ See [Performance Optimization](/docs/sglang-diffusion/performance-optimization) 
 For complete API documentation, please refer to the [official API usage guide](/docs/sglang-diffusion/api/openai_api).
 
 ### 4.1 Generate an Image
+
+Choose a width and height divisible by 16 for the native Z-Image pipeline.
+Other positive dimensions are rounded down to the nearest multiple of 16,
+with a minimum of 16 pixels per side: `size="1000x1000"` produces `992x992`.
+Startup warmup resolutions use the same alignment. This applies to Z-Image
+and Z-Image-Turbo; the diffusers backend keeps its own size handling.
 
 ```python Example
 import base64
@@ -72,6 +83,12 @@ with open("output.png", "wb") as f:
 ```
 
 ### 4.2 Advanced Usage
+
+Z-Image uses `positive + guidance_scale * (positive - negative)` guidance, unlike
+the standard CFG convention. Any positive `guidance_scale` enables CFG; omitted
+negative prompts use an empty string. Z-Image-Turbo defaults to `guidance_scale=0`
+and does not run the negative branch. Enabling CFG adds a second DiT branch, so
+expect additional inference cost; it is not automatically recommended for Turbo.
 
 #### 4.2.1 Cache-DiT Acceleration
 
@@ -366,3 +383,9 @@ Test Environment:
     ```
   </Tab>
 </Tabs>
+
+## 6. Run in ComfyUI
+
+import { ComfyUISupport } from '/src/snippets/diffusion/comfyui-support.jsx';
+
+<ComfyUISupport model="z-image" />

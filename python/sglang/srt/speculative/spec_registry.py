@@ -5,12 +5,11 @@ should use that classmethod API; do not import from this module directly.
 from __future__ import annotations
 
 import logging
-import warnings
 from typing import TYPE_CHECKING, Callable, Dict, Optional, Type
 
 import torch
 
-from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.arg_groups.model_override_base import resolving_view
 
 if TYPE_CHECKING:
     from sglang.srt.managers.overlap_utils import FutureMap
@@ -100,6 +99,10 @@ class CustomSpecAlgo:
     def supports_target_verify_for_draft(self) -> bool:
         return False
 
+    def supports_prefill_shared_read_done(self) -> bool:
+        # Whether target EXTEND has no later speculative shared-buffer reader.
+        return False
+
     def supports_ragged_verify(self) -> bool:
         return False
 
@@ -124,7 +127,7 @@ class CustomSpecAlgo:
         runtime states never exceed their startup width. Overrides must not
         return less than ``server_args.speculative_num_draft_tokens``.
         """
-        from sglang.srt.arg_groups.overrides import resolving_view
+        from sglang.srt.arg_groups.model_override_base import resolving_view
 
         return resolving_view(server_args).speculative_num_draft_tokens
 
@@ -157,20 +160,6 @@ class CustomSpecAlgo:
         # other cases which is not target verify but fixed length prefill.
         # Here, we expose this interface to allow the other use cases.
         return num_draft_tokens
-
-    def get_num_tokens_per_bs_for_target_verify(
-        self, num_draft_tokens: int, is_draft_worker: bool
-    ) -> int:
-        # Deprecated alias; remove together with the FIXME above.
-        warnings.warn(
-            "get_num_tokens_per_bs_for_target_verify is deprecated; use "
-            "get_num_tokens_per_req_for_target_verify instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self.get_num_tokens_per_req_for_target_verify(
-            num_draft_tokens, is_draft_worker
-        )
 
     def build_disagg_draft_input(
         self,

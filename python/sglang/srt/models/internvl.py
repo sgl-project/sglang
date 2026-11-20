@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import logging
+from array import array
 from typing import Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -26,14 +28,10 @@ from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternTokenPairs,
     general_mm_embed_routine,
+    pad_mm_token_pairs,
 )
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputs,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_janus_pro import DropPath
@@ -46,9 +44,11 @@ from sglang.srt.multimodal.internvl_vit_cuda_graph_runner import (
     InternViTCudaGraphRunner,
 )
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_vision_model
-from sglang.srt.runtime_context import get_mm, get_parallel
+from sglang.srt.multimodal.modality import Modality
+from sglang.srt.runtime_context import get_mm
 from sglang.srt.utils import is_cuda
-from sglang.utils import logger
+
+logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
 
@@ -199,8 +199,7 @@ class InternMLP(nn.Module):
         use_data_parallel: bool = False,
     ):
         super().__init__()
-        self.tp_size = 1 if use_data_parallel else get_parallel().tp_size
-        self.tp_rank = 0 if use_data_parallel else get_parallel().tp_rank
+        parallel_group = "replicated" if use_data_parallel else "tp"
         self.config = config
         self.act = get_act_fn(config.hidden_act)
         self.fc1 = ColumnParallelLinear(
@@ -208,16 +207,14 @@ class InternMLP(nn.Module):
             config.intermediate_size,
             bias=True,
             quant_config=None,
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
+            parallel_group=parallel_group,
         )
         self.fc2 = RowParallelLinear(
             config.intermediate_size,
             config.hidden_size,
             bias=True,
             quant_config=None,
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
+            parallel_group=parallel_group,
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -424,29 +421,6 @@ class InternVisionModel(PreTrainedModel):
             config,
         )
         self.encoder = InternVisionEncoder(config, quant_config, use_data_parallel)
-
-    def resize_pos_embeddings(self, old_size, new_size, patch_size):
-        pos_emb = self.embeddings.position_embedding
-        _, num_positions, embed_dim = pos_emb.shape
-        cls_emb = pos_emb[:, :1, :]
-        pos_emb = (
-            pos_emb[:, 1:, :]
-            .reshape(1, old_size // patch_size, old_size // patch_size, -1)
-            .permute(0, 3, 1, 2)
-        )
-        pos_emb = F.interpolate(
-            pos_emb.float(),
-            size=new_size // patch_size,
-            mode="bicubic",
-            align_corners=False,
-        )
-        pos_emb = pos_emb.to(cls_emb.dtype).reshape(1, embed_dim, -1).permute(0, 2, 1)
-        pos_emb = torch.cat([cls_emb, pos_emb], dim=1)
-        self.embeddings.position_embedding = nn.Parameter(pos_emb)
-        self.embeddings.image_size = new_size
-        logger.info(
-            "Resized position embeddings from {} to {}".format(old_size, new_size)
-        )
 
     def get_input_embeddings(self):
         return self.embeddings
@@ -674,15 +648,16 @@ class InternVLChatModel(nn.Module):
 
         return hidden_states
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         # Get all special token IDs
         im_start_id: int = mm_inputs.im_start_id
         im_end_id: int = mm_inputs.im_end_id
 
         media_token_pairs = [(im_start_id, im_end_id)]
-        helper = MultiModalityDataPaddingPatternTokenPairs(media_token_pairs)
 
-        return helper.pad_input_tokens(input_ids, mm_inputs)
+        return pad_mm_token_pairs(
+            input_ids, mm_inputs, data_token_pairs=media_token_pairs
+        )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         expert_params_mapping = []

@@ -19,7 +19,7 @@ from sglang.test.test_utils import (
 
 register_npu_ci(
     est_time=400,
-    suite="full-4-npu-a3",
+    suite="full-test-4-npu-a3",
     nightly=True,
 )
 
@@ -76,7 +76,8 @@ class TestNpuSpeculativeAttentionMode(CustomTestCase):
             "4",
             "--mem-fraction-static",
             "0.7",
-            "--disable-cuda-graph",
+            "--disable-decode-cuda-graph",
+            "--disable-prefill-cuda-graph",
             "--dtype",
             "bfloat16",
         ]
@@ -85,7 +86,6 @@ class TestNpuSpeculativeAttentionMode(CustomTestCase):
         env.update(
             {
                 "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
-                "SGLANG_ENABLE_SPEC_V2": "1",
                 "TRANSFORMERS_VERBOSITY": "error",
             }
         )

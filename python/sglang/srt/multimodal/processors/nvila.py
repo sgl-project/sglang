@@ -1,12 +1,13 @@
 from typing import Any
 
+import torch
 import torch.nn as nn
 from transformers.configuration_utils import PretrainedConfig
 from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from sglang.srt.managers.io_struct import GenerateReqInput
-from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
+from sglang.srt.managers.req_types import MultimodalProcessorOutput
 from sglang.srt.models.jet_vlm import JetVLMForConditionalGeneration
 from sglang.srt.models.nvila import NVILAForConditionalGeneration
 from sglang.srt.models.nvila_lite import NVILALiteForConditionalGeneration
@@ -15,6 +16,7 @@ from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 
 NUM_VIDEO_FRAMES = 8
 
@@ -63,7 +65,9 @@ class NVILAMultimodalProcessor(BaseMultimodalProcessor):
         )
 
         for i, video in enumerate(base_output.videos):  # type: ignore
-            base_output.videos[i] = [x.asnumpy() for x in video]  # type: ignore
+            if isinstance(video, VideoDecoderWrapper):
+                frames = video.get_frames_at(list(range(len(video))))
+                base_output.videos[i] = list(torch.as_tensor(frames).cpu().numpy())
 
         mm_items, input_ids, _ = await self.process_and_combine_mm_data_async(
             base_output,

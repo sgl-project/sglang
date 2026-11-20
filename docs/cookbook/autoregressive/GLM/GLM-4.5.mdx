@@ -137,7 +137,7 @@ The answer is 36. To find 15% of 240, we multiply 240 by 0.15, which equals 36.
 #### 4.2.2 Tool Calling
 
 <Note>
-**Parser names by model:** GLM-4.5 and GLM-4.6 use `--tool-call-parser glm45`. GLM-4.7 and GLM-4.7-Flash use `--tool-call-parser glm47`. All GLM models use `--reasoning-parser glm45` regardless of generation.
+**Parser names by model:** GLM-4.5 and GLM-4.6 use `--tool-call-parser glm`. GLM-4.7 and GLM-4.7-Flash use `--tool-call-parser glm47`. All GLM models use `--reasoning-parser glm45` regardless of generation.
 </Note>
 
 GLM-4.5 supports tool calling capabilities. Enable the tool call parser:
@@ -146,7 +146,7 @@ GLM-4.5 supports tool calling capabilities. Enable the tool call parser:
 python -m sglang.launch_server \
   --model zai-org/GLM-4.5 \
   --reasoning-parser glm45 \
-  --tool-call-parser glm45 \
+  --tool-call-parser glm \
   --tp 8 \
   --host 0.0.0.0 \
   --port 8000
@@ -358,7 +358,7 @@ python -m sglang.launch_server \
 - Low Concurrency (Latency-Optimized)
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --model zai-org/GLM-4.5 \
   --dataset-name random \
@@ -371,7 +371,7 @@ python -m sglang.bench_serving \
 
 - Medium Concurrency (Balanced)
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --model zai-org/GLM-4.5 \
   --dataset-name random \
@@ -384,7 +384,7 @@ python -m sglang.bench_serving \
 
 - High Concurrency (Throughput-Optimized)
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --model zai-org/GLM-4.5 \
   --dataset-name random \
@@ -400,7 +400,7 @@ python -m sglang.bench_serving \
 - Low Concurrency
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --model zai-org/GLM-4.5 \
   --dataset-name random \
@@ -413,7 +413,7 @@ python -m sglang.bench_serving \
 
 - Medium Concurrency
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --model zai-org/GLM-4.5 \
   --dataset-name random \
@@ -426,7 +426,7 @@ python -m sglang.bench_serving \
 
 - High Concurrency
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --model zai-org/GLM-4.5 \
   --dataset-name random \
@@ -441,7 +441,7 @@ python -m sglang.bench_serving \
 
 - Low Concurrency
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --model zai-org/GLM-4.5 \
   --dataset-name random \
@@ -454,7 +454,7 @@ python -m sglang.bench_serving \
 
 - Medium Concurrency
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --model zai-org/GLM-4.5 \
   --dataset-name random \
@@ -467,7 +467,7 @@ python -m sglang.bench_serving \
 
 - High Concurrency
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --model zai-org/GLM-4.5 \
   --dataset-name random \
@@ -510,7 +510,9 @@ Document model accuracy on standard benchmarks:
 
 - Benchmark Command
 ```bash Command
-python -m sglang.test.few_shot_gsm8k \
-  --num-questions 200 \
-  --port 30000
+sgl-eval run gsm8k \
+  --base-url http://127.0.0.1:30000/v1 \
+  --num-examples 200
 ```
+
+The command above uses sgl-eval. Historical scores from other harnesses are not directly comparable; rerun this command for a matching result.

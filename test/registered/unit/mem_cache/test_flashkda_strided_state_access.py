@@ -25,7 +25,7 @@ pattern (the code under test) executes.
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=6, suite="base-a-test-cpu")
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import sys
 import types
@@ -34,8 +34,8 @@ import unittest
 import torch
 
 from sglang.srt.layers.attention.linear.kernels.kda_flashkda import FlashKDAKernel
-from sglang.srt.mem_cache.layout.page_major import (
-    build_page_major_mamba_views,
+from sglang.srt.mem_cache.layout.token_major import (
+    build_mamba_entry_views,
     mamba_entry_bytes,
 )
 
@@ -58,7 +58,7 @@ _SEQ_LEN = 128
 
 
 def _make_strided_temporal_views():
-    """Envelope-strided conv/temporal views, as UnifiedMambaPool / the
+    """Envelope-strided conv/temporal views, as the unified state view / the
     page-major MambaPool serve them ((num_layers, max_slots, *inner))."""
     entry = mamba_entry_bytes(
         layer_num=_LAYERS,
@@ -68,7 +68,7 @@ def _make_strided_temporal_views():
         temporal_dtype=_TEMPORAL_DTYPE,
     )
     raw = torch.zeros(_SLOTS * entry, dtype=torch.uint8, device=_DEV)
-    conv_views, temporal = build_page_major_mamba_views(
+    conv_views, temporal = build_mamba_entry_views(
         raw,
         layer_num=_LAYERS,
         conv_state_shapes=_CONV_SHAPES,

@@ -17,8 +17,9 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import BAR_FORMAT, is_hip, set_weight_attrs
+from sglang.srt.utils import BAR_FORMAT, is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import DispatchOutput
@@ -138,8 +139,6 @@ class QuarkInt4Fp8MoEMethod(FusedMoEMethodBase):
 
         self.online_quant_progress_bar = self.quant_config.online_quant_progress_bar
 
-        self.tp_rank = get_parallel().tp_rank
-
         if not _is_hip:
             raise NotImplementedError(
                 "The quark_int4fp8_moe online quantization scheme is only supported on AMD GPUs."
@@ -170,12 +169,12 @@ class QuarkInt4Fp8MoEMethod(FusedMoEMethodBase):
                 if shard_id in ["w1", "w3"]:
                     shard_dim = 0
                     loaded_weight = loaded_weight.narrow(
-                        shard_dim, shard_size * self.tp_rank, shard_size
+                        shard_dim, shard_size * layer.moe_tp_rank, shard_size
                     )
                 else:
                     shard_dim = 1
                     loaded_weight = loaded_weight.narrow(
-                        shard_dim, shard_size * self.tp_rank, shard_size
+                        shard_dim, shard_size * layer.moe_tp_rank, shard_size
                     )
 
             # We want to run online quantization on-device for speed purposes.

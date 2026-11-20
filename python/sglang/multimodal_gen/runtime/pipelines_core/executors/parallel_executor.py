@@ -4,13 +4,17 @@ from typing import Any, Callable, List
 
 import torch
 
+from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_cfg_group,
+    get_cfg_sequence_parallel_group,
     get_classifier_free_guidance_rank,
     get_world_group,
     get_world_rank,
+    use_sequence_parallel_group,
 )
 from sglang.multimodal_gen.runtime.distributed.utils import broadcast_pyobj
+from sglang.multimodal_gen.runtime.managers.request_cancel import raise_if_cancelled
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor import (
     PipelineExecutor,
@@ -24,6 +28,42 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+
+def _move_value_to_local_device(value, device: torch.device):
+    if isinstance(value, torch.Tensor):
+        if value.device.type == "cpu":
+            return value
+        return value.to(device=device)
+    if isinstance(value, torch.Generator):
+        if value.device.type == "cpu":
+            return value
+        # Keep the sender's position in the random stream, not just its seed.
+        generator = torch.Generator(device=device)
+        generator.set_state(value.get_state())
+        return generator
+    if isinstance(value, list):
+        return [_move_value_to_local_device(item, device) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_move_value_to_local_device(item, device) for item in value)
+    if isinstance(value, dict):
+        return {
+            key: _move_value_to_local_device(item, device)
+            for key, item in value.items()
+        }
+    return value
+
+
+def _relocate_batch_to_local_device(batch: Req) -> Req:
+    """Move a broadcast batch's device tensors and generators to this rank's device.
+
+    Unpickling restores them on the sender's device index.
+    """
+    device = get_local_torch_device()
+    for field_name in batch.__dataclass_fields__:
+        value = getattr(batch, field_name)
+        setattr(batch, field_name, _move_value_to_local_device(value, device))
+    return batch
 
 
 class ParallelExecutor(PipelineExecutor):
@@ -48,11 +88,14 @@ class ParallelExecutor(PipelineExecutor):
         group = get_world_group()
 
         use_nvtx = self._should_use_stage_nvtx(batch, server_args)
+        requests = batch if isinstance(batch, list) else [batch]
 
         with self._component_residency_request(stages, batch, server_args):
             # TODO: decide when to gather on main when CFG_PARALLEL -> MAIN_RANK_ONLY
             for stage_index, stage in enumerate(stages):
-                paradigm = stage.parallelism_type
+                # all ranks must check before entering rank-selective stage branches
+                raise_if_cancelled(requests)
+                paradigm = stage.parallelism_type_for(batch)
 
                 if paradigm == StageParallelismType.MAIN_RANK_ONLY:
                     if rank == 0:
@@ -120,6 +163,16 @@ class ParallelExecutor(PipelineExecutor):
                         run_stage,
                         use_nvtx,
                     )
+                elif paradigm == StageParallelismType.SEQUENCE_PARALLEL_OVER_CFG_RANKS:
+                    with use_sequence_parallel_group(get_cfg_sequence_parallel_group()):
+                        batch = self._run_stage_with_executor_hooks(
+                            stage,
+                            stage_index,
+                            batch,
+                            server_args,
+                            run_stage,
+                            use_nvtx,
+                        )
                 elif paradigm == StageParallelismType.MAIN_RANK_ONLY_AND_SEND_TO_OTHERS:
                     obj_list = []
                     if rank == 0:
@@ -150,8 +203,11 @@ class ParallelExecutor(PipelineExecutor):
 
                     if rank != 0:
                         batch = broadcasted_batch
+                        if stage.relocate_broadcast_batch:
+                            batch = _relocate_batch_to_local_device(batch)
 
                     torch.distributed.barrier()
+            raise_if_cancelled(requests)
         return batch
 
     def execute(

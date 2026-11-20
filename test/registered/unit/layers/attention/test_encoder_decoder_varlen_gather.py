@@ -5,6 +5,9 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+# Loaded before the patch.dict stub below, which unloads every module first
+# imported inside it while their torch op registrations stay.
+import sglang.srt.model_executor.forward_batch_info  # noqa: F401
 from sglang.test.ci.ci_register import register_cpu_ci
 
 with patch.dict(
@@ -22,7 +25,7 @@ with patch.dict(
     from sglang.srt.layers.attention import xpu_backend
     from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestEncoderDecoderForward(unittest.TestCase):
@@ -176,7 +179,7 @@ class TestEncoderDecoderForward(unittest.TestCase):
         # slice encoder KV per request. It must also skip the //page_size stride
         # for enc-dec (token-slot indices feed the varlen kernel). Fails on the old
         # scalar-max-offset slice (row0 would start at col 5, not 3).
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.model_executor.forward_mode import ForwardMode
 
         backend = XPUAttentionBackend.__new__(XPUAttentionBackend)
         backend.page_size = 128  # >1: also exercises the enc-dec stride-skip
@@ -185,6 +188,7 @@ class TestEncoderDecoderForward(unittest.TestCase):
         backend.use_sliding_window_kv_pool = False
         backend.attention_chunk_size = None
         backend.topk = 0
+        backend.dcp_size = 1
         # req_to_token[i, j] = 100*i + j, so gathered values reveal (row, col).
         req_to_token = torch.arange(16).unsqueeze(0) + torch.tensor([[0], [100]])
         backend.req_to_token_pool = SimpleNamespace(req_to_token=req_to_token)
@@ -218,6 +222,22 @@ class TestEncoderDecoderForward(unittest.TestCase):
             md.page_table.tolist(),
             [[3, 4, 5, 6], [105, 106, 107, 108]],
         )
+
+
+class TestPageSize1GraphCompat(unittest.TestCase):
+    """MHA page_size 1 runs sgl_kernel's gather + varlen path, which reads a
+    device scalar per call, so it must refuse graph capture -- but only then."""
+
+    def test_rejects_graph_capture(self):
+        with self.assertRaisesRegex(ValueError, "requires CUDA graph disabled"):
+            xpu_backend._check_page_size_1_graph_compat(
+                use_mla=False, graphs_disabled=False
+            )
+
+    def test_default_xpu_config_still_starts(self):
+        # Graphs are off by default on XPU; refusing here would break every
+        # default page_size 1 launch (all-SWA models need page_size 1).
+        xpu_backend._check_page_size_1_graph_compat(use_mla=False, graphs_disabled=True)
 
 
 if __name__ == "__main__":

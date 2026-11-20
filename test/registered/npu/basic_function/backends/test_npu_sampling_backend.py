@@ -6,7 +6,7 @@ import requests
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ascend.npu_eval_accuracy_kit import _is_pr_pipeline, run_npu_pr_smoke
 from sglang.test.ci.ci_register import register_npu_ci
-from sglang.test.run_eval import run_eval
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -14,8 +14,8 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_npu_ci(est_time=400, suite="base-b-test-1-npu-a3")
-register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
+register_npu_ci(est_time=400, suite="extra-b-test-1-npu-a3")
+register_npu_ci(est_time=400, suite="nightly-test-1-npu-a3", nightly=True)
 
 
 class TestAscendSamplingBackend(CustomTestCase):
@@ -31,7 +31,8 @@ class TestAscendSamplingBackend(CustomTestCase):
                 "--sampling-backend",
                 "ascend",
                 "--disable-radix-cache",
-                "--disable-cuda-graph",
+                "--disable-decode-cuda-graph",
+                "--disable-prefill-cuda-graph",
                 "--mem-fraction-static",
                 0.85,
             ],
@@ -54,7 +55,7 @@ class TestAscendSamplingBackend(CustomTestCase):
             temperature=0.1,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         self.assertGreaterEqual(metrics["score"], 0.65)
 
     def test_greedy(self):

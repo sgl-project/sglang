@@ -4,7 +4,9 @@ TP-sharded model weights in GPU memory and serves them via pluggable transport b
 
 Each GPU runs one daemon process for its TP rank. The daemon:
 1. Loads model weights from disk (full pipeline: disk → TP shard → quantize)
-2. Exports every parameter/buffer as a CUDA IPC handle
+2. Exports every parameter/buffer through the selected transport
+   (--weight-cache-transport): CUDA IPC handles (torch_ipc), or CUDA VMM
+   allocations shared as file descriptors (vmm_fd)
 3. Serves transport entries over a Unix socket to requesting engine processes
 4. Validates CacheConfig compatibility before serving
 
@@ -36,6 +38,8 @@ Usage:
 
 import argparse
 import dataclasses
+import datetime
+import gc
 import logging
 import multiprocessing
 import os
@@ -47,13 +51,15 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 import torch
 import torch.distributed as dist
 
-from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
+    SpawnRanks,
     get_exec,
     get_parallel,
     publish,
+    spawn_world_rank,
 )
 
 from .protocol import (
@@ -70,7 +76,12 @@ from .protocol import (
     recv_msg,
     send_msg,
 )
-from .transport import choose_daemon_transport_backend
+from .transport import (
+    TORCH_IPC_BACKEND,
+    VMM_FD_BACKEND,
+    create_daemon_transport_backend,
+    resolve_daemon_transport,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -141,7 +152,9 @@ class WeightCacheDaemon:
     """Persistent GPU weight cache for a single TP rank.
 
     Holds the complete post-quantization state_dict in GPU memory and
-    serves CUDA IPC handles to engine processes via Unix socket.
+    serves it to engine processes over a Unix socket, through the selected
+    transport: CUDA IPC handles (torch_ipc) or CUDA VMM allocations passed as
+    file descriptors (vmm_fd).
     """
 
     def __init__(
@@ -160,10 +173,8 @@ class WeightCacheDaemon:
         self.tp_rank = tp_rank
         self.pp_size = cfg.pp_size
         self.pp_rank = pp_rank
-        self.dp_size = cfg.dp_size
         self.ep_size = cfg.ep_size
         self.moe_dp_size = cfg.moe_dp_size
-        self.enable_dp_attention = cfg.enable_dp_attention
         self.enable_dp_lm_head = cfg.enable_dp_lm_head
         self.attn_cp_size = cfg.attn_cp_size
         self.moe_dense_tp_size = cfg.moe_dense_tp_size
@@ -176,6 +187,7 @@ class WeightCacheDaemon:
         self.trust_remote_code = cfg.trust_remote_code
         self.revision = cfg.revision
         self.dist_init_method = dist_init_method
+        self.transport_name = resolve_daemon_transport(cfg.weight_cache_transport)
 
         device_uuid = current_platform.get_device_uuid(gpu_id)
         self.socket_path = get_socket_path(device_uuid)
@@ -230,21 +242,16 @@ class WeightCacheDaemon:
                 moe_a2a_backend=self.moe_a2a_backend,
             )
 
-        initialize_model_parallel(
-            tensor_model_parallel_size=self.tp_size,
-            pipeline_model_parallel_size=self.pp_size,
-            expert_model_parallel_size=self.ep_size,
-            attention_data_parallel_size=(
-                self.dp_size if self.enable_dp_attention else 1
-            ),
-            attention_context_model_parallel_size=self.attn_cp_size,
-            moe_data_model_parallel_size=self.moe_dp_size,
-        )
+        initialize_model_parallel()
 
         # Initialize DP attention state (required by some models like Qwen3 MoE)
-        from sglang.srt.layers.dp_attention import initialize_dp_attention
+        from sglang.srt.layers.dp_attention import (
+            init_dp_gathered_buffer,
+            initialize_dp_attention,
+        )
 
-        initialize_dp_attention(server_args, model_config)
+        initialize_dp_attention(server_args)
+        init_dp_gathered_buffer(model_config)
 
         logger.info(
             f"[WeightCacheDaemon gpu={self.gpu_id} tp_rank={self.tp_rank}] "
@@ -255,22 +262,31 @@ class WeightCacheDaemon:
 
     def load(self):
         """Full loading pipeline: disk → TP shard → quantize → export IPC handles."""
-        # CUDA IPC weight sharing relies on torch's _share_cuda_ handle export,
-        # which only exists on CUDA-alike platforms (CUDA / ROCm). Fail loud here
-        # instead of dying deep inside the export with an opaque error.
-        if not current_platform.is_cuda_alike():
+        # Zero-copy IPC weight sharing requires a platform whose tensors can be
+        # exported through multiprocessing reduction: CUDA-alike platforms
+        # (CUDA / ROCm) via _share_cuda_, and NPU via native torch_npu reduction.
+        # Fail loud here instead of dying deep inside the export with an opaque
+        # error on anything else.
+        if not current_platform.is_cuda_alike() and not current_platform.is_npu():
             raise RuntimeError(
-                f"[WeightCacheDaemon] the weight cache daemon requires a CUDA-alike "
-                f"platform (CUDA or ROCm) for CUDA IPC weight sharing, but the "
-                f"active platform device type is {current_platform.device_type!r}. "
-                f"Disable the weight cache (--weight-cache-mode off)."
+                f"[WeightCacheDaemon] the weight cache daemon requires an "
+                f"IPC-capable platform (CUDA, ROCm, or NPU/Ascend) for zero-copy "
+                f"weight sharing, but the active platform device type is "
+                f"{current_platform.device_type!r}. Disable the weight cache "
+                f"(--weight-cache-mode off)."
             )
         # expandable_segments makes torch's caching allocator hand out memory
         # that cannot be exported via _share_cuda_, so the IPC export below would
         # die mid-way with an opaque CUDA error. Fail fast with an actionable
-        # message before touching the device.
-        self._assert_ipc_compatible_allocator()
+        # message before touching the device. vmm_fd copies the weights into
+        # allocations of its own, so it works with either allocator setting.
+        if self.transport_name == TORCH_IPC_BACKEND:
+            self._assert_ipc_compatible_allocator()
         current_platform.set_device(current_platform.get_device(self.gpu_id))
+        # Pick the transport before loading, so an unusable one fails fast.
+        self.transport_backend = create_daemon_transport_backend(
+            self.transport_name, self.gpu_id
+        )
 
         # Reduce thread contention during multi-process loading
         torch.set_num_threads(1)
@@ -281,7 +297,16 @@ class WeightCacheDaemon:
         from sglang.srt.model_loader.loader import get_model_loader
 
         server_args = self.server_args
-        publish(server_args, role="weight_cache_daemon")
+        publish(
+            server_args,
+            role="weight_cache_daemon",
+            ranks=SpawnRanks(
+                world_rank=spawn_world_rank(
+                    server_args, tp_rank=self.tp_rank, pp_rank=self.pp_rank
+                ),
+                gpu_id=self.gpu_id,
+            ),
+        )
 
         from sglang.srt.layers.moe import initialize_moe_config
 
@@ -332,12 +357,12 @@ class WeightCacheDaemon:
             tp_rank=self.tp_rank,
             pp_size=self.pp_size,
             pp_rank=self.pp_rank,
-            dp_size=self.dp_size,
+            dp_size=get_parallel().dp_size,
             ep_size=self.ep_size,
             moe_dp_size=self.moe_dp_size,
             moe_dp_rank=moe_dp_rank,
             moe_ep_rank=moe_ep_rank,
-            enable_dp_attention=self.enable_dp_attention,
+            attn_dp_size=get_parallel().attn_dp_size,
             enable_dp_lm_head=self.enable_dp_lm_head,
             attn_cp_size=self.attn_cp_size,
             moe_dense_tp_size=self.moe_dense_tp_size,
@@ -379,21 +404,31 @@ class WeightCacheDaemon:
         )
 
         # Ensure every post-processing kernel has retired before we export the
-        # memory: clients map these tensors read-only via IPC and would otherwise
-        # risk observing half-written weights.
+        # memory: clients map these tensors (and must treat them as read-only)
+        # and would otherwise risk observing half-written weights.
         current_platform.synchronize()
         current_platform.empty_cache()
         self.preloaded_weights_bytes = max(
             0, torch.cuda.memory_reserved(self.gpu_id) - memory_before_load
         )
 
-        # Export all parameters and buffers as IPC handles
+        # Export all parameters and buffers through the transport backend
         self._export_state()
+        if self.transport_name == VMM_FD_BACKEND:
+            # The packed weights live in cuMemCreate allocations, which the
+            # caching allocator does not count. Add them to what it still
+            # holds (originals that something else kept alive, if any).
+            current_platform.empty_cache()
+            self.preloaded_weights_bytes = (
+                max(0, torch.cuda.memory_reserved(self.gpu_id) - memory_before_load)
+                + self.transport_backend.exported_bytes
+            )
 
         logger.info(
             f"[WeightCacheDaemon gpu={self.gpu_id} tp_rank={self.tp_rank}] "
-            f"Exported {len(self.state_entries)} tensors as IPC handles. "
-            f"Ready to serve."
+            f"Exported {len(self.state_entries)} tensors "
+            f"(transport={self.transport_name}, "
+            f"preloaded_weights_bytes={self.preloaded_weights_bytes})."
         )
 
     @staticmethod
@@ -419,7 +454,7 @@ class WeightCacheDaemon:
                         f"be exported via _share_cuda_, so the IPC handle export "
                         f"would fail mid-way. Unset expandable_segments for the "
                         f"weight cache daemon process (it can stay enabled for the "
-                        f"engine itself)."
+                        f"engine itself), or use --weight-cache-transport vmm_fd."
                     )
 
     def _export_state(self):
@@ -434,37 +469,66 @@ class WeightCacheDaemon:
             name for name, _ in self.model.named_parameters(remove_duplicate=False)
         )
         state_dict_names = set(self.model.state_dict().keys())
-        state_tensors: Dict[str, Tuple[torch.Tensor, bool]] = {}
+
+        # Comprehensions below leave no loop variable behind: with vmm_fd, a
+        # leftover reference would keep its original alive while packing.
 
         # Export all items from state_dict (parameters + persistent buffers)
-        for name, tensor in self.model.state_dict().items():
-            state_tensors[name] = (tensor.data, name in param_names)
+        state_tensors: Dict[str, Tuple[torch.Tensor, bool]] = {
+            name: (tensor.data, name in param_names)
+            for name, tensor in self.model.state_dict().items()
+        }
 
         # Also export non-persistent buffers (not in state_dict but needed
         # for inference, e.g. rotary embedding cos_sin_cache)
-        non_persistent_count = 0
-        for name, buf in self.model.named_buffers():
-            if name not in state_dict_names:
-                state_tensors[name] = (buf.data, False)
-                non_persistent_count += 1
+        state_tensors.update(
+            (name, (buf.data, False))
+            for name, buf in self.model.named_buffers()
+            if name not in state_dict_names
+        )
+        non_persistent_count = len(state_tensors) - len(state_dict_names)
 
-        self.transport_backend = choose_daemon_transport_backend(state_tensors)
+        if self.transport_name == VMM_FD_BACKEND:
+            # Packing consumes detached storage aliases. The daemon never runs
+            # the model, so release its object graph before moving any bytes.
+            self.model = None
+            from sglang.srt.layers.rotary_embedding.factory import _ROPE_DICT
+            from sglang.srt.models.transformers import _TRANSFORMERS_MOE_LAYERS
+
+            # This process-wide cache also owns model buffers. The standalone
+            # daemon loads one model and does not need to construct another.
+            _ROPE_DICT.clear()
+            # The Transformers backend registers every MoE layer in this dict,
+            # which would keep the experts' original weights alive next to
+            # their packed copies.
+            _TRANSFORMERS_MOE_LAYERS.clear()
+            gc.collect()
         self.state_entries = self.transport_backend.prepare_export(state_tensors)
 
-        # Log approximate serialized metadata size (not payload-backed bytes).
-        # Only the handle blob carries real weight, so measure it directly:
-        # stringifying every entry would allocate a copy of all handles.
-        total_bytes = sum(
-            len(handle)
-            for handle in (entry.get("handle") for entry in self.state_entries.values())
-            if isinstance(handle, (str, bytes, bytearray))
-        )
+        if self.transport_name == VMM_FD_BACKEND:
+            # vmm_fd entries carry no handle blob: a client maps the packed
+            # allocations, one fd each.
+            exported = (
+                f"{self.transport_backend.num_allocations} allocation(s), "
+                f"{self.transport_backend.exported_bytes / (1 << 30):.2f} GiB"
+            )
+        else:
+            # Approximate serialized metadata size (not payload-backed bytes).
+            # Only the handle blob carries real weight, so measure it directly:
+            # stringifying every entry would allocate a copy of all handles.
+            total_bytes = sum(
+                len(handle)
+                for handle in (
+                    entry.get("handle") for entry in self.state_entries.values()
+                )
+                if isinstance(handle, (str, bytes, bytearray))
+            )
+            exported = f"metadata size ~{total_bytes / 1024 / 1024:.1f} MB"
         logger.info(
             f"[WeightCacheDaemon gpu={self.gpu_id}] "
             f"Exported {len(self.state_entries)} tensors "
             f"({non_persistent_count} non-persistent buffers), "
-            f"transport={self.transport_backend.name}, "
-            f"metadata size ~{total_bytes / 1024 / 1024:.1f} MB"
+            f"transport={self.transport_backend.name}, {exported}"
         )
 
     def _initialize_eplb_expert_location_metadata(self, model_config) -> None:
@@ -587,9 +651,10 @@ class WeightCacheDaemon:
                 conn,
                 config=self.config.to_dict(),
                 entries=self.state_entries,
-                # PID so the client can watch daemon liveness: if this
-                # process dies while clients hold IPC mappings, their
-                # param.data (and any CUDA-graph-captured addresses) dangle.
+                # PID so the client can watch daemon liveness: with
+                # torch_ipc, if this process dies while clients hold IPC
+                # mappings, their param.data (and any CUDA-graph-captured
+                # addresses) dangle.
                 pid=os.getpid(),
                 preloaded_weights_bytes=self.preloaded_weights_bytes,
             )
@@ -614,6 +679,10 @@ class WeightCacheDaemon:
             del self.model
             self.model = None
         self.state_entries.clear()
+        if self.transport_backend is not None:
+            # Release any model references before closing transport resources.
+            self.transport_backend.close()
+            self.transport_backend = None
         current_platform.empty_cache()
         self._running = False
 
@@ -648,7 +717,30 @@ def run_weight_cache_daemon(
     )
 
     daemon.load()
+    _await_cluster_ready_to_serve(
+        timeout=resolving_view(server_args).weight_cache_timeout
+    )
     daemon.serve()
+
+
+def _await_cluster_ready_to_serve(timeout: int) -> None:
+    if timeout <= 0:
+        # Gloo reads timedelta(0) as its wait-forever sentinel.
+        raise ValueError(f"--weight-cache-timeout must be positive, got {timeout}")
+
+    try:
+        # Gate publication on the full PP×TP daemon world.
+        dist.monitored_barrier(
+            group=get_parallel().world_group.cpu_group,
+            timeout=datetime.timedelta(seconds=timeout),
+            wait_all_ranks=True,
+        )
+    except RuntimeError:
+        logger.exception(
+            "[weight_cache] cluster readiness barrier failed; exiting without serving."
+        )
+        # Process-group teardown can block after a failed collective.
+        os._exit(1)
 
 
 def spawn_weight_cache_daemon(
