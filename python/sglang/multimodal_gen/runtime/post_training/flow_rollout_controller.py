@@ -483,7 +483,12 @@ class FlowRolloutController:
                 "controller's timesteps"
             )
         stream_data = RolloutStreamData(
-            rollout_log_probs=self.collect_rollout_log_probs()
+            rollout_log_probs=self.collect_rollout_log_probs(),
+            rollout_sde_kernel={
+                "rollout_sde_type": self.sde_type,
+                "rollout_noise_level": self.noise_level,
+                "rollout_log_prob_no_const": self.log_prob_no_const,
+            },
         )
         if self.debug_mode:
             stream_data.rollout_debug_tensors = self.collect_rollout_debug_tensors(

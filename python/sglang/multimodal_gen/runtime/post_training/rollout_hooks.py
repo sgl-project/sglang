@@ -20,7 +20,10 @@ from typing import Any, Callable
 
 import torch
 
-from sglang.multimodal_gen.configs.post_training.rl_rollout import PRIMARY_STREAM
+from sglang.multimodal_gen.configs.post_training.rl_rollout import (
+    PRIMARY_STREAM,
+    stream_sde_kernel_settings,
+)
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
@@ -178,10 +181,11 @@ def prepare_rollout_if_enabled(
         return
     if stream in batch.rollout_controllers:
         raise RuntimeError(f"Rollout stream {stream!r} was already prepared")
+    sde_kernel_settings = stream_sde_kernel_settings(batch, stream)
     controller = FlowRolloutController(
-        sde_type=batch.rollout_sde_type,
-        noise_level=float(batch.rollout_noise_level),
-        log_prob_no_const=batch.rollout_log_prob_no_const,
+        sde_type=sde_kernel_settings["rollout_sde_type"],
+        noise_level=float(sde_kernel_settings["rollout_noise_level"]),
+        log_prob_no_const=sde_kernel_settings["rollout_log_prob_no_const"],
         debug_mode=batch.rollout_debug_mode,
         sde_step_indices=batch.rollout_sde_step_indices,
         generator=_stream_generators(batch, stream),
