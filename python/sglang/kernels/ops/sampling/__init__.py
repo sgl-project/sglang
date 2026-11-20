@@ -212,3 +212,35 @@ register_kernel(
         capabilities=CUDA_ONLY,
     )
 )
+register_kernel(
+    KernelSpec(
+        op="sampling.synthid_tournament",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.sampling.synthid_triton:synthid_tournament_triton",
+        capabilities=CUDA_ONLY,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="sampling.synthid_sample",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.sampling.synthid_triton:synthid_sample_triton",
+        capabilities=CUDA_ONLY,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="sampling.synthid_project_state",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.sampling.synthid_triton:synthid_project_state_triton",
+        capabilities=CUDA_ONLY,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="sampling.synthid_commit_state",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.sampling.synthid_triton:synthid_commit_state_triton",
+        capabilities=CUDA_ONLY,
+    )
+)
