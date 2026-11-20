@@ -101,7 +101,7 @@ class TestNativeEagerVerify(CustomTestCase):
                     else:
                         make_io.assert_not_called()
                         hooks.post_verify.assert_not_called()
-                        kwargs = dict(watermark=scope["watermark"])
+                        kwargs = dict(watermark=scope["watermark"], row_prefixes=None)
                         if module == "eagle_worker_common":
                             kwargs.update(
                                 uno_target_max_top_k=17,

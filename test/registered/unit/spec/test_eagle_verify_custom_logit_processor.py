@@ -1,10 +1,13 @@
-"""EAGLE and NGRAM verify apply a request's custom logit processor.
+"""EAGLE and NGRAM verify apply a request's custom logit processor on each row's
+own history.
 
 Speculative verify samples the target tokens itself instead of going through the
-Sampler, so a custom logit processor reached only the prefill token: a processor
-that forces one token was ignored on every verify round, and the drafts the raw
-target logits favor were accepted."""
+Sampler, so a custom logit processor reached only the prefill token. Applied at
+verify, a processor that reads the output must see each row's draft prefix after
+the committed tokens; one that does not declare it sees the first row only, and
+its request commits one token per round."""
 
+import itertools
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -12,26 +15,40 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
+from sglang.srt.sampling.custom_logit_processor import (
+    ROW_PREFIX_KEY,
+    CustomLogitProcessor,
+)
 from sglang.srt.sampling.sampling_batch_info import ProcessorEntry, SamplingBatchInfo
 from sglang.srt.speculative import eagle_utils
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
+from sglang.srt.speculative.spec_utils import verify_row_prefixes
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
 
 VOCAB = 32
-FORCED = 7
 ROOT = 1
 
 
-class _ForceToken(CustomLogitProcessor):
+class _CountUp(CustomLogitProcessor):
+    """Forces the token after the last one the row follows, so every verify row
+    of a draft path 2, 3 agrees only if it sees its own draft prefix."""
+
+    supports_row_prefix = True
+
     def __call__(self, logits, custom_param_list):
         for i, params in enumerate(custom_param_list):
+            req = params["__req__"]
+            last = [*req.output_ids, *params.get(ROW_PREFIX_KEY, ())][-1]
             logits[i, :] = -float("inf")
-            logits[i, params["token_id"]] = 0.0
+            logits[i, last + 1] = 0.0
         return logits
+
+
+class _CountUpWithoutRowPrefix(_CountUp):
+    supports_row_prefix = False
 
 
 def _chain():
@@ -41,7 +58,7 @@ def _chain():
         next_token=[1, 2, -1],
         next_sibling=[-1, -1, -1],
         argmax=[2, 3, 4],
-        accept=[2, 3, 4],
+        row_prefixes=[[], [2], [2, 3]],
     )
 
 
@@ -52,7 +69,7 @@ def _tree():
         next_token=[1, 3, -1, -1],
         next_sibling=[-1, 2, -1, -1],
         argmax=[2, 3, 9, 4],
-        accept=[2, 3, 4],
+        row_prefixes=[[], [2], [5], [2, 3]],
     )
 
 
@@ -88,8 +105,9 @@ def _logits(layout, bs, *, peak):
     return logits
 
 
-def _sampling_info(*, greedy):
-    # Request 0 forces FORCED; request 1 has no processor.
+def _sampling_info(processor, *, greedy):
+    # Request 0 runs the processor after its committed output; request 1 has none.
+    req = SimpleNamespace(output_ids=[5, ROOT])
     return SamplingBatchInfo(
         temperatures=torch.ones((2, 1), device="cuda"),
         top_ps=torch.ones(2, device="cuda"),
@@ -102,10 +120,10 @@ def _sampling_info(*, greedy):
         need_min_p_sampling=False,
         vocab_size=VOCAB,
         has_custom_logit_processor=True,
-        custom_params=[{"token_id": FORCED}, None],
+        custom_params=[{"__req__": req}, None],
         custom_logit_processor={
             0: ProcessorEntry(
-                processor=_ForceToken(),
+                processor=processor,
                 rows=[0],
                 indices=torch.tensor([0], device="cuda"),
             )
@@ -123,7 +141,7 @@ def _accept_tokens(predict, accept_lens, accept_index):
 
 @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
 class TestVerifyCustomLogitProcessor(CustomTestCase):
-    def test_processor_forces_every_verify_row_of_its_request(self):
+    def test_processor_sees_each_row_prefix_or_commits_one_token(self):
         group = SimpleNamespace(world_size=1)
         parallel = SimpleNamespace(tp_group=group, attn_tp_group=group)
         spec = SimpleNamespace(
@@ -139,10 +157,27 @@ class TestVerifyCustomLogitProcessor(CustomTestCase):
             ("eagle-tree", _tree(), False),
             ("ngram", _tree(), False),
         ]
+        # A row-prefix processor accepts the whole path; without the declaration,
+        # its request keeps the first token only.
+        processors = [(_CountUp(), [2, 3, 4]), (_CountUpWithoutRowPrefix(), [2])]
         for kind, layout, fused in cases:
-            for greedy in (True, False):
+            n = len(layout["tokens"])
+            row_prefixes = verify_row_prefixes(
+                torch.tensor([layout["next_token"]] * 2),
+                torch.tensor([layout["next_sibling"]] * 2),
+                torch.tensor([layout["tokens"]] * 2),
+            )
+            self.assertEqual(row_prefixes[:n], layout["row_prefixes"])
+            for (processor, accept), greedy in itertools.product(
+                processors, (True, False)
+            ):
                 with (
-                    self.subTest(kind=kind, fused=fused, greedy=greedy),
+                    self.subTest(
+                        kind=kind,
+                        fused=fused,
+                        greedy=greedy,
+                        processor=type(processor).__name__,
+                    ),
                     envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(fused),
                     patch.object(eagle_utils, "get_spec", return_value=spec),
                     patch(
@@ -158,7 +193,7 @@ class TestVerifyCustomLogitProcessor(CustomTestCase):
                         device="cuda",
                         forward_mode=SimpleNamespace(is_idle=lambda: False),
                         seq_lens=torch.tensor([7, 11], device="cuda"),
-                        sampling_info=_sampling_info(greedy=greedy),
+                        sampling_info=_sampling_info(processor, greedy=greedy),
                         req_pool_indices=torch.tensor([3, 5], device="cuda"),
                         return_logprob=False,
                     )
@@ -171,10 +206,9 @@ class TestVerifyCustomLogitProcessor(CustomTestCase):
                         _verify_input(layout, kind=kind, bs=2),
                         batch,
                         logits_output,
+                        row_prefixes=row_prefixes,
                     )
-                    self.assertEqual(
-                        _accept_tokens(*outputs), [[FORCED], layout["accept"]]
-                    )
+                    self.assertEqual(_accept_tokens(*outputs), [accept, [2, 3, 4]])
 
 
 if __name__ == "__main__":

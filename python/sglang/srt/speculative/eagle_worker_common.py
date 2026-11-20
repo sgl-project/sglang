@@ -38,6 +38,7 @@ from sglang.srt.speculative.spec_utils import (
     move_accept_tokens_to_target_kvcache,
     record_stream_each,
     record_stream_for_v2_verify,
+    verify_row_prefixes,
 )
 from sglang.srt.utils import is_cpu
 from sglang.srt.utils.async_probe import (
@@ -855,13 +856,13 @@ def run_eagle_verify(
         )
 
     # Must stay ahead of the target verify launch below.
-    grammar_tree = (
+    verify_tree_host = (
         GrammarTree.from_device(
             verify_input.retrieve_next_token,
             verify_input.retrieve_next_sibling,
             verify_input.draft_token.view(verify_input.retrieve_next_token.shape),
         )
-        if batch.has_grammar
+        if batch.has_grammar or batch.sampling_info.has_custom_logit_processor
         else None
     )
 
@@ -939,7 +940,7 @@ def run_eagle_verify(
     if batch.has_grammar:
         grammar_mask = build_grammar_vocab_mask(
             reqs=batch.reqs,
-            tree=grammar_tree,
+            tree=verify_tree_host,
             sampling_info=batch.sampling_info,
             device=verify_input.retrieve_next_token.device,
             barrier=grammar_barrier,
@@ -992,6 +993,11 @@ def run_eagle_verify(
         accept_lens = post_verify_output.accepted_lengths
         accept_index = post_verify_output.accepted_indices
     else:
+        row_prefixes = (
+            verify_row_prefixes(*verify_tree_host.resolve())
+            if batch.sampling_info.has_custom_logit_processor
+            else None
+        )
         (
             predict,
             accept_lens,
@@ -1005,6 +1011,7 @@ def run_eagle_verify(
             watermark=watermark,
             simulated_acc_len_rng=simulated_acc_len_rng,
             sparse_bonus_argmax=sparse_bonus_argmax,
+            row_prefixes=row_prefixes,
         )
     fused_commit_outputs = predict.is_cuda and not batch.forward_mode.is_idle()
     prepared_commit_steps = prepared_draft_inputs = None
