@@ -14,6 +14,7 @@
 
 """LoRA attachment and target-validation contracts."""
 
+import re
 import sys
 import types
 import unittest
@@ -140,6 +141,79 @@ class TestShouldApplyLoRAGate(CustomTestCase):
         self.assertEqual(manager.embed_tokens_module, LANGUAGE_EMBED_TOKENS)
 
 
+class TestUnappliedAdapterWeights(CustomTestCase):
+    """Adapter weights for a target module that should_apply_lora rejected on
+    every layer must be reported, not served silently at partial strength."""
+
+    # Qwen3.5 full-attention layers hold qkv_proj directly on the decoder layer,
+    # so a scope regex that requires a `self_attn.` parent never admits them.
+    _STRICT_SCOPE = re.compile(
+        r"^model\.layers\.\d+\.(?:self_attn|mlp|linear_attn)\."
+        r"(?:qkv_proj|o_proj|gate_up_proj|down_proj|in_proj_qkvz|out_proj)$"
+    )
+
+    def _init_manager(self, module_names, strict_loading=False):
+        manager = LoRAManager.__new__(LoRAManager)
+        manager.base_model = SimpleNamespace(
+            named_modules=lambda: [(n, torch.nn.Module()) for n in module_names],
+            should_apply_lora=lambda name: bool(self._STRICT_SCOPE.match(name)),
+        )
+        manager.base_hf_config = SimpleNamespace(num_hidden_layers=2)
+        manager.target_modules = {"qkv_proj", "gate_up_proj"}
+        manager.lora_strict_loading = strict_loading
+        with patch.object(manager, "set_lora_module", side_effect=lambda name, _: name):
+            manager.init_lora_modules()
+        return manager
+
+    @staticmethod
+    def _adapter(*module_paths):
+        weights = {
+            f"model.layers.0.{path}.lora_{ab}.weight": torch.zeros(1)
+            for path in module_paths
+            for ab in "AB"
+        }
+        return SimpleNamespace(layers=[SimpleNamespace(weights=weights)])
+
+    _DECODER = (
+        "model.layers.0.qkv_proj",
+        "model.layers.0.mlp.gate_up_proj",
+        "model.layers.1.mlp.gate_up_proj",
+    )
+
+    def test_rejected_target_is_reported(self):
+        manager = self._init_manager(self._DECODER)
+        self.assertEqual(manager.unwrapped_target_modules, {"qkv_proj"})
+
+        adapter = self._adapter("self_attn.qkv_proj", "mlp.gate_up_proj")
+        with self.assertLogs(lora_manager_module.logger, level="WARNING") as logs:
+            manager._check_adapter_weights_are_applied(
+                lora_name="a", lora_adapter=adapter
+            )
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn("['qkv_proj']", logs.output[0])
+
+    def test_rejected_target_raises_under_strict_loading(self):
+        manager = self._init_manager(self._DECODER, strict_loading=True)
+        with self.assertRaisesRegex(ValueError, r"\['qkv_proj'\]"):
+            manager._check_adapter_weights_are_applied(
+                lora_name="a", lora_adapter=self._adapter("self_attn.qkv_proj")
+            )
+
+    def test_applied_or_absent_targets_are_not_reported(self):
+        """An adapter whose targets are all wrapped passes, and so does a target
+        absent from this rank (e.g. a pipeline stage with no such layer)."""
+        for module_names, adapter_paths in (
+            (self._DECODER, ("mlp.gate_up_proj",)),
+            (self._DECODER[1:], ("self_attn.qkv_proj", "mlp.gate_up_proj")),
+        ):
+            with self.subTest(module_names=module_names):
+                manager = self._init_manager(module_names)
+                with self.assertNoLogs(lora_manager_module.logger, level="WARNING"):
+                    manager._check_adapter_weights_are_applied(
+                        lora_name="a", lora_adapter=self._adapter(*adapter_paths)
+                    )
+
+
 class TestModelLoRAScope(CustomTestCase):
     def test_model_scope_keeps_decoder_projections(self):
         """Decoder FFN, expert, and hybrid projections stay inside LoRA scope;
@@ -147,9 +221,23 @@ class TestModelLoRAScope(CustomTestCase):
         projection a model stops admitting is served without LoRA, silently."""
         from sglang.srt.models.gemma4_mm import Gemma4ForConditionalGeneration
         from sglang.srt.models.mllama4 import Llama4ForConditionalGeneration
+        from sglang.srt.models.qwen3_5 import Qwen3_5ForConditionalGeneration
         from sglang.srt.models.qwen4_exp import Qwen4ExpForConditionalGeneration
 
         for model_class, prefix, projections, encoders in (
+            (
+                Qwen3_5ForConditionalGeneration,
+                "model.layers.0.",
+                (
+                    "qkv_proj",
+                    "o_proj",
+                    "linear_attn.in_proj_qkvz",
+                    "linear_attn.out_proj",
+                    "mlp.gate_up_proj",
+                    "mlp.down_proj",
+                ),
+                ("visual",),
+            ),
             (
                 Llama4ForConditionalGeneration,
                 "language_model.model.layers.0.",
