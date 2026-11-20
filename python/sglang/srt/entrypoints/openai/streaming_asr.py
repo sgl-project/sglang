@@ -2,9 +2,11 @@ import asyncio
 import io
 import logging
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple, Union
 
+import numpy as np
 import soundfile as sf
 from fastapi import Request
 
@@ -96,7 +98,41 @@ class StreamingASRState:
         return self._record_emit(" ".join(all_words[common_count:]))
 
 
-def split_audio_chunks(audio_data: bytes, chunk_size_sec: float) -> List[bytes]:
+class _CumulativeWavChunks(Sequence[bytes]):
+    """Lazily encodes cumulative WAV prefixes ``data[:end]`` on demand.
+
+    Materializing all ``N`` cumulative WAV prefixes up front consumes ``O(N^2)``
+    memory and blocks the event loop before the first chunk can be dispatched.
+    Holding the decoded mono ``float32`` waveform once and encoding each prefix
+    when indexed keeps retained memory ``O(N)`` and avoids encoding trailing
+    chunks when a streaming client disconnects early.
+    """
+
+    def __init__(
+        self,
+        data: np.ndarray,
+        sample_rate: int,
+        end_offsets: Tuple[int, ...],
+    ) -> None:
+        self._data = data
+        self._sample_rate = sample_rate
+        self._end_offsets = end_offsets
+
+    def __len__(self) -> int:
+        return len(self._end_offsets)
+
+    def _encode_prefix(self, end: int) -> bytes:
+        buf = io.BytesIO()
+        sf.write(buf, self._data[:end], self._sample_rate, format="WAV")
+        return buf.getvalue()
+
+    def __getitem__(self, index: Union[int, slice]) -> Union[bytes, List[bytes]]:
+        if isinstance(index, slice):
+            return [self._encode_prefix(end) for end in self._end_offsets[index]]
+        return self._encode_prefix(self._end_offsets[index])
+
+
+def split_audio_chunks(audio_data: bytes, chunk_size_sec: float) -> Sequence[bytes]:
     if not audio_data:
         raise ValueError("audio_data is empty")
     if chunk_size_sec <= 0:
@@ -108,17 +144,15 @@ def split_audio_chunks(audio_data: bytes, chunk_size_sec: float) -> List[bytes]:
         raise ValueError(f"failed to decode audio: {e}") from e
     if len(data.shape) > 1:
         data = data.mean(axis=1)
-    chunk_size_samples = int(chunk_size_sec * sample_rate)
+    chunk_size_samples = max(1, int(chunk_size_sec * sample_rate))
     total_samples = len(data)
-    chunks = []
-    for end in range(
-        chunk_size_samples, total_samples + chunk_size_samples, chunk_size_samples
-    ):
-        end = min(end, total_samples)
-        buf = io.BytesIO()
-        sf.write(buf, data[:end], sample_rate, format="WAV")
-        chunks.append(buf.getvalue())
-    return chunks
+    end_offsets = tuple(
+        min(end, total_samples)
+        for end in range(
+            chunk_size_samples, total_samples + chunk_size_samples, chunk_size_samples
+        )
+    )
+    return _CumulativeWavChunks(data, sample_rate, end_offsets)
 
 
 def normalize_whitespace(text: str) -> str:
