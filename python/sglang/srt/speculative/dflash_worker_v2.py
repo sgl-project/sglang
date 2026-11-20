@@ -627,12 +627,27 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._independent_cache = None
         self._cohort = None
         self._independent_kv_mode = get_spec().speculative_draft_kv_layout
-        if (
-            self._independent_kv_mode != "shared"
-            and get_exec().graph.cuda_graph_config.decode.backend != Backend.DISABLED
+        from sglang.srt.speculative.dflash_cohort import (
+            validate_target_verify_graph_mode,
+        )
+
+        validate_target_verify_graph_mode(
+            draft_kv_layout=self._independent_kv_mode,
+            cohort_size=get_spec().speculative_draft_cohort_size,
+            graph_enabled=(
+                get_exec().graph.cuda_graph_config.decode.backend != Backend.DISABLED
+            ),
+            cuda=is_cuda(),
+        )
+        if get_spec().speculative_draft_cohort_cuda_graph and (
+            not is_cuda()
+            or False
+            or self._independent_kv_mode == "shared"
+            or get_spec().speculative_draft_cohort_size not in (2, 4)
+            or get_exec().graph.cuda_graph_config.decode.backend == Backend.DISABLED
         ):
             raise ValueError(
-                "Independent DFlash KV currently requires --disable-cuda-graph"
+                "Draft cohort graphs require independent/hybrid CUDA cohort2/4 decode with target graphs enabled"
             )
 
         self._warned_sampling_fallback = False
@@ -1238,7 +1253,13 @@ class DFlashWorkerV2(BaseSpecWorker):
             # The target and union-draft capture grids belong to different
             # scopes. CPU PLAN/COMMIT and PD context encoding stay eager.
             with draft_pp_context(), draft_tp_context(self.draft_parallel_layout):
-                self._draft_worker.init_cuda_graphs(capture_decode_cuda_graph=False)
+                if (
+                    self._cohort is not None
+                    and get_spec().speculative_draft_cohort_cuda_graph
+                ):
+                    self._cohort.init_draft_cuda_graphs()
+                else:
+                    self._draft_worker.init_cuda_graphs(capture_decode_cuda_graph=False)
             return
         # Read outside the narrowed draft scope, which hides the target's DP flag.
         target_dp_enabled = get_parallel().attn_dp_enabled
@@ -1298,6 +1319,21 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
             if target_dp_enabled and not _is_npu and self.selector is not None:
                 self._warm_eager_selector()
+
+    def _log_cohort_target_verify_graph(self, replayed: bool, *, idle: bool) -> None:
+        if self._cohort is None or not replayed:
+            return
+        attr = "_logged_idle_target_graph" if idle else "_logged_active_target_graph"
+        if not getattr(self, attr, False):
+            setattr(self, attr, True)
+            logger.info(
+                "DFLASH target verify graph replay confirmed: gpu=%s cohort=%s "
+                "idle=%s draft_graph_enabled=%s",
+                self.gpu_id,
+                self._cohort.owner_count,
+                idle,
+                bool(getattr(self._cohort, "graph_batch_sizes", ())),
+            )
 
     def _warm_eager_selector(self) -> None:
         # Build selector kernels before serving rather than under the watchdog.
@@ -4015,6 +4051,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     skip_attn_backend_init=True if _is_npu else None,
                 )
                 idle_can_run_cuda_graph = idle_target_output.can_run_cuda_graph
+                self._log_cohort_target_verify_graph(idle_can_run_cuda_graph, idle=True)
             empty_ids = torch.empty((0,), dtype=torch.int64, device=self.device)
             if self._cohort is not None:
                 self._cohort.commit(None, None)
@@ -4511,6 +4548,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             kv_weight_version_record = target_out.kv_weight_version_record
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
+        self._log_cohort_target_verify_graph(can_run_cuda_graph, idle=False)
         target_predict = None
         accepted = None
         tail_done = False

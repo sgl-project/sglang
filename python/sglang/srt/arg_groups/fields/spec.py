@@ -52,6 +52,10 @@ class Spec(msgspec.Struct):
         int,
         "Experimental DFLASH: number of target attention-DP owners sharing one draft TP group; fixed at startup.",
     ] = 1
+    speculative_draft_cohort_cuda_graph: A[
+        bool,
+        "Experimental CUDA cohort2/4 draft-forward graphs; target decode graphs must be enabled. CPU PLAN/COMMIT, selector and B1 remain on their existing paths.",
+    ] = False
     speculative_boundary_reduction: A[
         Literal["ar", "rs", "rsv", "rs+rsv"],
         Arg(no_cli=True, resolvable=True),

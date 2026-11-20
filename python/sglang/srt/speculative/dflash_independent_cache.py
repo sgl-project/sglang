@@ -126,8 +126,9 @@ class IndependentDraftCache:
     """Owns slot generations and maps logical positions to private storage.
 
     Uses ReqToTokenPool's aux-cache lifecycle so finish, abort and retraction
-    invalidate coverage before the target slot can be reused. Graphs, overlap,
-    prefix caches are rejected; PD requires the explicit typed transfer lane.
+    invalidate coverage before the target slot can be reused. Overlap and
+    prefix caches are rejected; optional execution/transport adapters enforce
+    their own graph and PD constraints.
     """
 
     def __init__(

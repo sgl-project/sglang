@@ -21,11 +21,38 @@ from sglang.srt.model_executor.forward_batch_info import (
     enable_num_token_non_padded,
 )
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import draft_tp_context
 
 logger = logging.getLogger(__name__)
+
+
+def cohort_draft_graph_buckets(owner_count, owner_slots, target_buckets):
+    """Exact union sizes: never pad a live owner into another owner's slot."""
+    if owner_count not in (2, 4) or owner_slots < 1 or not target_buckets:
+        raise ValueError("Draft graphs require CUDA cohort2/4 and positive buckets")
+    if any(b < 1 for b in target_buckets):
+        raise ValueError("Draft graph buckets must be positive")
+    maximum = owner_count * min(owner_slots, max(target_buckets))
+    return tuple(range(1, maximum + 1))
+
+
+def validate_target_verify_graph_mode(
+    *, draft_kv_layout, cohort_size, graph_enabled, cuda
+):
+    """Only validated CUDA cohorts may use graphs with independent draft KV.
+
+    This enables the target runner. Draft capture is a separate opt-in with
+    a union grid, independent of target local batch sizes and idle owners.
+    """
+    if graph_enabled and draft_kv_layout != "shared":
+        if not cuda or cohort_size not in (2, 4):
+            raise ValueError(
+                "Independent DFLASH KV with target verify CUDA graphs requires "
+                "a CUDA draft cohort of size 2 or 4; the draft remains eager. "
+                "Use --disable-cuda-graph for other independent layouts."
+            )
 
 
 @dataclass(frozen=True)
@@ -86,6 +113,47 @@ class DFlashCohort:
         self.pending = None
         self.committed = {}
         self.head = None
+        self.graph_batch_sizes = ()
+        self._logged_graph_sizes = set()
+
+    def init_draft_cuda_graphs(self):
+        """Capture only the transformer body in the draft's TP scope.
+
+        The enclosing worker enters draft PP/TP scopes. Restore the target
+        capture grid even on failure: target and union-draft grids differ.
+        No capture-time selector/commit hooks are installed for this path.
+        """
+        from sglang.srt.model_executor.cuda_graph_config import Backend
+
+        cfg = get_exec().graph.cuda_graph_config
+        if (
+            not str(self.worker.device).startswith("cuda")
+            or cfg is None
+            or cfg.decode.backend == Backend.DISABLED
+        ):
+            raise ValueError("Cohort draft graphs require enabled CUDA decode graphs")
+        buckets = cohort_draft_graph_buckets(
+            self.owner_count, self.owner_slots, cfg.decode.bs
+        )
+        previous = cfg.decode.bs
+        try:
+            cfg.decode.bs = list(buckets)
+            self.worker._draft_worker.init_cuda_graphs(capture_decode_cuda_graph=True)
+        finally:
+            cfg.decode.bs = previous
+        captured = tuple(self.worker._draft_worker.get_decode_cuda_graph_bs())
+        if captured != buckets:
+            raise RuntimeError(
+                f"Cohort draft graph grid mismatch: {captured} != {buckets}"
+            )
+        self.graph_batch_sizes = captured
+        logger.info(
+            "DFLASH cohort draft graphs captured: rank=%s cohort=%s buckets=%s block=%s",
+            self.group.rank_in_group,
+            self.owner_count,
+            captured,
+            self.worker.block_size,
+        )
 
     def prepare_head(self):
         # Only the first owner's complete attention-TP group gathers the head.
@@ -343,11 +411,25 @@ class DFlashCohort:
                 else None
             ),
             global_num_token_non_padded_cpu=count * block,
-            can_run_decode_cuda_graph=False,
+            can_run_decode_cuda_graph=count in self.graph_batch_sizes,
         )
         plan.bind(forward, worker.draft_model_runner.runner_ids)
         with torch.inference_mode(), draft_tp_context(worker.draft_parallel_layout):
             result = worker.draft_model_runner.forward(forward)
+        expected_graph = count in self.graph_batch_sizes
+        if bool(result.can_run_graph) != expected_graph:
+            raise RuntimeError(
+                "DFLASH cohort draft graph execution differs from its exact bucket"
+            )
+        if expected_graph and count not in self._logged_graph_sizes:
+            self._logged_graph_sizes.add(count)
+            logger.info(
+                "DFLASH cohort draft graph replay confirmed: rank=%s cohort=%s union_bs=%s block=%s",
+                self.group.rank_in_group,
+                self.owner_count,
+                count,
+                block,
+            )
         next_ids = torch.empty((count, block - 1), dtype=torch.int64, device=device)
         worker._selector_sample = None
         if self.group.rank_in_group == 0:
