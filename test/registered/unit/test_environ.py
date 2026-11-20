@@ -9,7 +9,7 @@ import warnings
 from contextlib import ExitStack
 from unittest.mock import patch
 
-from sglang.srt.environ import EnvField, _DeprecatedEnv, envs
+from sglang.srt.environ import EnvField, _DeprecatedEnv, envs, validate_env_values
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
@@ -143,6 +143,22 @@ class TestEnvField(unittest.TestCase):
                 ):
                     field.get()
 
+    def test_empty_value_reads_as_unset_except_for_strings(self):
+        for field in (
+            envs.SGLANG_TEST_RETRACT,
+            envs.SGLANG_PORT,
+            envs.SGLANG_WARMUP_TIMEOUT,
+            envs.SGLANG_HUMMING_INPUT_QUANT_CONFIG,
+        ):
+            with self.subTest(name=field.name), field.override(""):
+                self.assertFalse(field.is_set())
+                self.assertEqual(field.get(), field.default)
+                validate_env_values()
+
+        for field in (envs.SGLANG_ROLE_NAMESPACES, envs.SGLANG_DISABLED_MODEL_ARCHS):
+            with self.subTest(name=field.name), field.override(""):
+                self.assertTrue(field.is_set())
+
     def test_mega_runtime_defaults_and_registry_scope(self):
         with ExitStack() as stack:
             for field in self.env_fields.values():
@@ -248,6 +264,8 @@ class TestDocumentedBooleanKnobs(unittest.TestCase):
                     ("1", True),
                     ("false", False),
                     ("0", False),
+                    ("On", True),
+                    ("off", False),
                 ):
                     os.environ[name] = value
                     self.assertIs(field.get(), expected)

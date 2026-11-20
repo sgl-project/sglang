@@ -44,6 +44,9 @@ def _default_on_in_ci() -> bool:
 
 class EnvField:
     _allow_set_name = True
+    # An empty value reads as unset for a type where "" cannot parse; a string
+    # or list field keeps "" as its value.
+    _empty_is_unset = True
 
     def __init__(self, default: Any, secret: bool = False):
         self.default = default
@@ -72,8 +75,7 @@ class EnvField:
             assert value == str(None)
             return None
 
-        # Not set, return default
-        if value is None:
+        if not self.is_set():
             return self._resolve_default()
 
         try:
@@ -82,7 +84,8 @@ class EnvField:
             raise ValueError(f"Invalid value for {self.name}: {e}") from None
 
     def is_set(self):
-        return self.name in os.environ
+        value = os.environ.get(self.name)
+        return value is not None and not (value == "" and self._empty_is_unset)
 
     def set(self, value: Any):
         self._set_to_none = value is None
@@ -119,19 +122,21 @@ class EnvField:
 
 
 class EnvTuple(EnvField):
+    _empty_is_unset = False
+
     def parse(self, value: str) -> tuple[str, ...]:
         return tuple(s.strip() for s in value.split(",") if s.strip())
 
 
 class EnvStr(EnvField):
+    _empty_is_unset = False
+
     def parse(self, value: str) -> str:
         return value
 
 
 class EnvJSON(EnvField):
-    def parse(self, value: str | None) -> list | dict | None:
-        if not value:
-            return None
+    def parse(self, value: str) -> list | dict:
         try:
             if os.path.exists(value):
                 with open(value) as f:
@@ -146,9 +151,9 @@ class EnvJSON(EnvField):
 class EnvBool(EnvField):
     def parse(self, value: str) -> bool:
         value = value.lower()
-        if value in ["true", "1", "yes", "y"]:
+        if value in ["true", "1", "yes", "y", "on"]:
             return True
-        if value in ["false", "0", "no", "n"]:
+        if value in ["false", "0", "no", "n", "off"]:
             return False
         raise ValueError(f'"{value}" is not a valid boolean value')
 
@@ -174,7 +179,7 @@ class _DeprecatedEnvFallback:
         self.deprecated_name = deprecated_name
 
     def get(self) -> Any:
-        if os.getenv(self.name) is None:
+        if not self.is_set():
             fallback = os.getenv(self.deprecated_name)
             if fallback is not None:
                 warnings.warn(
