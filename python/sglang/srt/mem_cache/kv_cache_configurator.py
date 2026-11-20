@@ -2171,7 +2171,7 @@ class KVCacheConfigurator:
         # NPU keeps its PA_ND KV-pool subclass, while Compressor state sizing
         # follows the same fixed ring ownership as GPU. Do not replace the
         # configurator's C4-SWA/C128-request budgets with a paged allocator
-        # estimate: Atlas A3 cache_mode=2 consumes explicit flat state_locs.
+        # estimate: arch22 cache_mode=2 consumes explicit flat state_locs.
         if _is_npu:
             from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
                 DSV4NPUTokenToKVPool,
@@ -2179,6 +2179,11 @@ class KVCacheConfigurator:
 
             pool_cls = DSV4NPUTokenToKVPool
             kv_layout_kwargs = {}
+            if self.is_draft_worker:
+                # Draft rows are read by the V4 sparse-attention op, so pin the
+                # pool generation instead of relying on ``compression_ratios``
+                # having been emptied to ``[0] * layers`` above.
+                kv_layout_kwargs = {"npu_window_generation": "v4"}
         else:
             pool_cls = DeepSeekV4TokenToKVPool
             kv_layout, compressed_kv_layout = select_dsv4_kv_layout()
@@ -3105,7 +3110,13 @@ class KVCacheConfigurator:
                 if self.is_hybrid_swa:
                     # DSV4 on NPU: SWA allocator subclass that also drives the
                     # c4/c128 allocators, producing a DSV4OutCacheLoc per alloc.
-                    if is_compressed_kv_model:
+                    # V4.1 (compress_ratios 1/2) is excluded: its compressed
+                    # slots are the pure function full_loc // ratio, so it needs
+                    # neither a c128 sidecar allocator nor the DSV4OutCacheLoc
+                    # bundle.
+                    ratios = getattr(self.model_config, "compress_ratios", None) or ()
+                    has_low_ratio = any(ratio in (1, 2) for ratio in ratios)
+                    if is_compressed_kv_model and not has_low_ratio:
                         from sglang.srt.hardware_backend.npu.dsv4.dsv4_allocator import (
                             DSV4NPUTokenToKVPoolAllocator,
                         )
