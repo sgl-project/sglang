@@ -82,12 +82,11 @@ def reset_sgl_kernel_graph_scratchpads() -> None:
 
 
 def _normalize_xpu_device(device: torch.device | str | None) -> torch.device:
-    if isinstance(device, torch.device):
-        if device.type == "xpu" and device.index is None:
-            idx = torch.xpu.current_device() if torch.xpu.is_available() else 0
-            return torch.device("xpu", idx)
-        return device
-    dev = torch.device("xpu" if device is None else device)
+    dev = (
+        device
+        if isinstance(device, torch.device)
+        else torch.device("xpu" if device is None else device)
+    )
     if dev.type == "xpu" and dev.index is None:
         idx = torch.xpu.current_device() if torch.xpu.is_available() else 0
         return torch.device("xpu", idx)
