@@ -39,6 +39,9 @@ from sglang.multimodal_gen.registry import (
     _discover_and_register_pipelines,
     _get_config_info,
 )
+from sglang.multimodal_gen.runtime.managers.forward_context import (
+    get_forward_context,
+)
 from sglang.multimodal_gen.runtime.models.dits import cosmos_dreams
 from sglang.multimodal_gen.runtime.models.dits.cosmos_dreams import (
     CosmosDreamsKVCache,
@@ -48,6 +51,9 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos_dreams import (
     split_interleaved_action_vision_tokens,
 )
 from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
+from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
+    FlowMatchEulerDiscreteScheduler,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3 import (
     Cosmos3DecodingStage,
 )
@@ -74,13 +80,14 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
     pad_action_rows,
     prepare_action_rows,
     resolve_geometry,
+    run_fixed_step_sde,
     sde_step_generator,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.warmup_request_builder import (
     _lighter_valid_num_frames,
 )
-from sglang.multimodal_gen.test.unit.host_sync_guard import RecordOps
+from sglang.multimodal_gen.test.unit.host_sync_guard import RecordOps, forbid_host_syncs
 from sglang.test.test_utils import CustomTestCase
 
 # ``transformer/config.json["cosmos3_nano_sim_bimanual"]`` of Cosmos3-Nano-Sim-Bimanual
@@ -691,6 +698,45 @@ class TestCosmosDreamsSdeSeeding(unittest.TestCase):
         self.assertEqual(len(seeds), 800)
 
 
+class TestCosmosDreamsFixedStepSde(CustomTestCase):
+    @staticmethod
+    def _denoise(scheduler, sigmas):
+        def transformer(latents, timestep, **kwargs):
+            return SimpleNamespace(video=latents * (timestep / 1000))
+
+        return run_fixed_step_sde(
+            transformer,
+            scheduler,
+            torch.ones(1, 2, 2, 2),
+            t_list=sigmas,
+            seed=42,
+            frame_start=5,
+            dtype=torch.float32,
+        )
+
+    def test_fixed_schedules_avoid_host_reads_without_changing_latents(self):
+        scheduler = FlowMatchEulerDiscreteScheduler(stochastic_sampling=True)
+        for sigmas in (MANIFEST.t_list, MANIFEST.t_list[::2]):
+            with self.subTest(sigmas=sigmas):
+                with mock.patch.object(scheduler, "set_begin_index"):
+                    expected = self._denoise(scheduler, sigmas)
+                with forbid_host_syncs():
+                    actual = self._denoise(scheduler, sigmas)
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    def test_duplicate_first_timestep_keeps_legacy_index_selection(self):
+        scheduler = FlowMatchEulerDiscreteScheduler(stochastic_sampling=True)
+        self._denoise(scheduler, MANIFEST.t_list)
+        # Distinct sigmas round to the same timestep, which requires the
+        # scheduler's legacy second-match rule.
+        with (
+            self.assertRaisesRegex(AssertionError, "aten.nonzero"),
+            forbid_host_syncs(),
+        ):
+            self._denoise(scheduler, (1.0, 1.0 - 1e-9, 0.625))
+        self.assertIsNone(scheduler.begin_index)
+
+
 class TestCosmosDreamsKVHistory(unittest.TestCase):
     @staticmethod
     def _frame_kv(frame: int, layers: int = 2, tokens_per_frame: int = 2):
@@ -950,10 +996,10 @@ class TestCosmosDreamsKVBuffer(CustomTestCase):
         self.assertIs(result, cache)
         for actual, expected in zip(cache[0], clean[0]):
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-        with self.assertRaisesRegex(ValueError, "one clean frame"):
+        with self.assertRaisesRegex(ValueError, "reserved capacity"):
             append_kv_history(
                 cache,
-                [(torch.zeros(1, 2, 1, 1),) * 2],
+                [(torch.zeros(1, 3, 1, 1),) * 2],
                 tokens_per_frame=1,
                 sink_frames=0,
                 window_frames=2,
@@ -1301,6 +1347,215 @@ class TestCosmosDreamsKVBuffer(CustomTestCase):
                         raise RuntimeError("request failed")
                 self.assertTrue(cache._stream.query())
                 self.assertFalse(any(cache._pending))
+
+
+class TestCosmosDreamsBatchedClean(CustomTestCase):
+    def test_batched_history_matches_sequential_eviction(self):
+        """Later layers must see frame-causal K/V, with eviction after each frame."""
+        generator = torch.Generator().manual_seed(2026)
+
+        def randn(*shape):
+            return torch.randn(*shape, dtype=torch.float64, generator=generator)
+
+        def attend(q, k, v):
+            return torch.nn.functional.scaled_dot_product_attention(
+                q.transpose(1, 2),
+                k.transpose(1, 2),
+                v.transpose(1, 2),
+                enable_gqa=True,
+            ).transpose(1, 2)
+
+        weights = []
+        for _ in range(3):
+            qkv, output = randn(8, 16) * 0.2, randn(8, 8) * 0.2
+            weights.append(
+                SimpleNamespace(
+                    local_num_attention_heads=2,
+                    local_num_key_value_heads=1,
+                    head_dim=4,
+                    norm_q=None,
+                    norm_k=None,
+                    to_qkv=lambda x, w=qkv: (x @ w, None),
+                    to_out=lambda x, w=output: (x @ w, None),
+                    attn=attend,
+                )
+            )
+
+        def transformer(
+            latent, timestep, *, history_kv, text_kv, clean_frame_ranges, **kwargs
+        ):
+            # GEMM quality dispatch must see the request in both clean paths.
+            self.assertIs(get_forward_context().forward_batch, context.forward_batch)
+            hidden = latent.permute(0, 2, 3, 4, 1).flatten(1, 3)
+            current_kv = []
+            for layer, attention in enumerate(weights):
+                buffer = (
+                    history_kv.attention_buffer(layer, hidden.shape[1])
+                    if isinstance(history_kv, CosmosDreamsKVCache)
+                    else None
+                )
+                output, k, v = cosmos_dreams._joint_attention(
+                    attention,
+                    hidden,
+                    text_kv=text_kv[layer],
+                    history_kv=(
+                        None
+                        if buffer is not None or history_kv is None
+                        else history_kv[layer]
+                    ),
+                    kv_buffer=buffer,
+                    cos_sin_cache=None,
+                    rope_positions=None,
+                    null_token_slices=[],
+                    clean_frame_ranges=clean_frame_ranges,
+                )
+                hidden = torch.tanh(hidden + output)
+                current_kv.append((k, v))
+            return SimpleNamespace(current_kv=current_kv)
+
+        stage = object.__new__(CosmosDreamsRolloutStage)
+        stage.transformer = transformer
+        tokens = 3
+        context = SimpleNamespace(
+            forward_batch=SimpleNamespace(
+                sampling_params=SimpleNamespace(quality="lossless")
+            ),
+            text_kv=[(randn(1, 2, 1, 4), randn(1, 2, 1, 4)) for _ in weights],
+            tokens_per_frame=tokens,
+            dtype=torch.float64,
+            fps=30.0,
+            domain_ids=torch.tensor([0]),
+        )
+
+        def seed_cache(initial, past, sink, window, capacity=None):
+            cache = CosmosDreamsKVCache(
+                context.text_kv,
+                tokens_per_frame=tokens,
+                sink_frames=sink,
+                window_frames=window,
+                max_current_frames=3,
+                max_history_frames=capacity,
+            )
+            for frame in range(past):
+                start = frame * tokens
+                current = [
+                    (key[:, start : start + tokens], value[:, start : start + tokens])
+                    for key, value in initial
+                ]
+                TestCosmosDreamsKVBuffer._stage(cache, current)
+                cache.commit(tokens)
+            return cache
+
+        # Compare the resident batch against sequential list-based refreshes.
+        with mock.patch.object(
+            cosmos_dreams, "_apply_qwen3_qk_norm_rope", lambda q, k, *args: (q, k)
+        ):
+            cases = []
+            for sink, window in [(0, None), (0, 1), (1, 3), (2, 1)]:
+                capacity = sink + window if window is not None else 5
+                for past in sorted({1, max(1, capacity - 1), capacity}):
+                    cases.extend((sink, window, past, f, None) for f in (1, 2, 3))
+            # Frustum reads a fixed selection while committing to the full archive.
+            # Cover empty, non-contiguous and complete selections, with archive
+            # entries omitted from attention still preserved by the commit.
+            cases.extend(
+                (2, 20, 8, f, selected)
+                for f in (1, 2, 3)
+                for selected in ([], [0, 3, 7], list(range(8)))
+            )
+            for sink, window, past, frames, selected in cases:
+                with self.subTest(
+                    sink=sink,
+                    window=window,
+                    past=past,
+                    frames=frames,
+                    selected=selected,
+                ):
+                    stage.profile = SimpleNamespace(
+                        sink_frames=sink, window_frames=window
+                    )
+                    initial = [
+                        (
+                            randn(1, past * tokens, 1, 4),
+                            randn(1, past * tokens, 1, 4),
+                        )
+                        for _ in weights
+                    ]
+                    latent = randn(1, 8, frames, 1, tokens)
+                    action = torch.zeros(1, frames, 1)
+                    if selected is None:
+                        sequential = initial
+                    else:
+                        positions = torch.tensor(
+                            [
+                                idx * tokens + offset
+                                for idx in selected
+                                for offset in range(tokens)
+                            ],
+                            dtype=torch.long,
+                        )
+                        sequential = [
+                            (
+                                key.index_select(1, positions),
+                                value.index_select(1, positions),
+                            )
+                            for key, value in initial
+                        ]
+                    for frame in range(frames):
+                        sequential = stage._commit_clean_chunk(
+                            context,
+                            sequential,
+                            latent[:, :, frame : frame + 1],
+                            frame_idx=past + frame,
+                            action=action[:, frame : frame + 1],
+                            null_indexes=(),
+                        )
+                    archive = None
+                    if selected is not None:
+                        archive = seed_cache(
+                            initial, past, 0, past + frames + 1, past + frames
+                        )
+                        history = seed_cache(
+                            [], 0, 0, len(selected) + frames + 1, len(selected) + frames
+                        )
+                        history.load_selected(
+                            archive, selected, tokens_per_frame=tokens
+                        )
+                    elif window is None:
+                        history = seed_cache(
+                            initial, past, sink, past + frames + 1, past + frames
+                        )
+                    elif frames <= window:
+                        history = seed_cache(initial, past, sink, window)
+                    else:
+                        # The rollout falls back to sequential commits for this
+                        # window. Keep the original list-path batch coverage.
+                        history = initial
+                    committed = stage._commit_clean_chunk(
+                        context,
+                        history,
+                        latent,
+                        frame_idx=past,
+                        action=action,
+                        null_indexes=(),
+                        archive=archive,
+                    )
+                    torch.testing.assert_close(
+                        list(committed), sequential, rtol=1e-12, atol=1e-12
+                    )
+                    if archive is not None:
+                        expected = [
+                            (
+                                torch.cat((old_k, new_k[:, -frames * tokens :]), dim=1),
+                                torch.cat((old_v, new_v[:, -frames * tokens :]), dim=1),
+                            )
+                            for (old_k, old_v), (new_k, new_v) in zip(
+                                initial, sequential
+                            )
+                        ]
+                        torch.testing.assert_close(
+                            list(archive), expected, rtol=1e-12, atol=1e-12
+                        )
 
 
 UNIFIED_FIELDS = [
@@ -1674,6 +1929,11 @@ class TestCosmosDreamsRuntime(unittest.TestCase):
 
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA decode stream")
     def test_overlap_and_serial_vae_inputs_match(self):
+        from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import (
+            VaeFastPathGate,
+            register_vae_fast_path_gate,
+        )
+
         class IdentityVAE(torch.nn.Module):
             def __init__(self, dtype):
                 super().__init__()
@@ -1683,11 +1943,15 @@ class TestCosmosDreamsRuntime(unittest.TestCase):
                 self.config = SimpleNamespace(
                     latents_mean=[-0.7571, -0.7089], latents_std=[2.8184, 1.4541]
                 )
+                self.gate = VaeFastPathGate()
+                register_vae_fast_path_gate(self, self.gate)
+                self.seen_gates = []
 
             def reset_causal_decode_state(self):
                 self.cached_latents = None
 
             def causal_decode(self, latents):
+                self.seen_gates.append(self.gate.enabled)
                 self.cached_latents = latents.square()
                 return latents
 
@@ -1700,16 +1964,25 @@ class TestCosmosDreamsRuntime(unittest.TestCase):
                 stage._latents_mean = stage._latents_std = None
                 expected = stage._denormalize_latents(latents)
                 with self.assertRaisesRegex(RuntimeError, "injected rollout failure"):
-                    with CausalDecodeQueue(vae, device=torch.device("cuda")) as queue:
+                    with CausalDecodeQueue(
+                        vae, device=torch.device("cuda"), quality="lossless"
+                    ) as queue:
                         queue.submit(latents[:, :, :2])
                         raise RuntimeError("injected rollout failure")
+                self.assertEqual(vae.seen_gates, [True])
+                self.assertFalse(vae.gate.enabled)
                 self.assertIsNone(vae.cached_latents)
                 self.assertTrue(queue.stream.query())
                 self.assertEqual(queue.outputs, [])
-                for _ in range(2):
-                    with CausalDecodeQueue(vae, device=torch.device("cuda")) as queue:
+                for quality, enabled in (("lossless", True), ("exact", False)):
+                    vae.seen_gates.clear()
+                    with CausalDecodeQueue(
+                        vae, device=torch.device("cuda"), quality=quality
+                    ) as queue:
                         for chunk in latents.split(2, dim=2):
                             queue.submit(chunk)
+                    self.assertEqual(vae.seen_gates, [enabled, enabled])
+                    self.assertFalse(vae.gate.enabled)
                     self.assertIsNone(vae.cached_latents)
                     torch.testing.assert_close(
                         queue.finish(), expected.cpu(), rtol=0, atol=0
