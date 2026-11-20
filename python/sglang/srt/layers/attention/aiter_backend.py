@@ -853,12 +853,11 @@ class AiterAttnBackend(AttentionBackend):
 
         self.dcp_world_size = get_parallel().attn_dcp_size
         mla_decode_backend_choice = envs.SGLANG_AITER_MLA_DECODE_BACKEND.get()
-        # asm_fp8q is asm wherever its fp8-query route does not apply.
         fp8_q_asm_requested = (
             mla_decode_backend_choice.lower() == _MLA_FP8_Q_ASM_DECODE_BACKEND
         )
         self.mla_decode_backend = resolve_aiter_mla_decode_backend(
-            "asm" if fp8_q_asm_requested else mla_decode_backend_choice,
+            mla_decode_backend_choice,
             use_mla=self.use_mla,
             input_dtype=self.input_dtype,
             dcp_world_size=self.dcp_world_size,
