@@ -4,6 +4,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import yaml
+
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -45,13 +47,16 @@ class TestAmdPartitionModel(CustomTestCase):
         # run_suite.py silently falls back to est_time when the key does not match.
         models = sorted(MODEL.MODEL_DIR.glob("partition-model-*-*.json"))
         self.assertTrue(models)
-        workflow = (REPO_ROOT / ".github/workflows/pr-test-amd.yml").read_text()
+        workflow = yaml.safe_load(
+            (REPO_ROOT / ".github/workflows/pr-test-amd.yml").read_text()
+        )
+        steps = workflow["jobs"][MODEL.SUITE]["steps"]
+        command = next(step["run"] for step in steps if step.get("name") == "Run test")
+        self.assertIn(f"run_suite.py --hw amd --suite {MODEL.SUITE} ", command)
         self.assertIn(
-            f"--suite {MODEL.SUITE} --auto-partition-id ${{{{ matrix.part }}}} "
-            "--auto-partition-size 8 --timeout-per-file 2400 --partition-model-file "
-            "/sglang-checkout/scripts/ci/amd/partition-model-"
+            "--partition-model-file /sglang-checkout/scripts/ci/amd/partition-model-"
             "${{ inputs.runner_arch || 'mi300' }}-${{ matrix.rocm_version }}.json",
-            workflow,
+            command,
         )
         self.assertIn(MODEL.SUITE, AMD_SUITES.load_suites())
         for path in models:
