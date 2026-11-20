@@ -18,7 +18,7 @@ _HGCC_DROP_PREFIX = tuple(option + "=" for option in sorted(_HGCC_DROP_WITH_ARG)
 _HGCC_DROP_FLAGS = frozenset({"-Wno-deprecated-declarations"})
 
 
-def filter_hgcc_cuda_flags(flags: List[str]) -> List[str]:
+def filter_hgcc_flags(flags: List[str]) -> List[str]:
     """Remove unsupported tuning/diagnostic options and complete operands.
 
     Keep all other options in order, especially --ftz/--fmad and fast-math:

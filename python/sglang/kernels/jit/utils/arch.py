@@ -162,7 +162,7 @@ def get_default_target_flags(arch: CompileArch | None = None) -> List[str]:
             "--expt-relaxed-constexpr",
         ]
         if is_sail_runtime():
-            flags.append("-DSGL_SAIL=1")
+            flags.append("-DUSE_SAIL=1")
         return flags
 
 

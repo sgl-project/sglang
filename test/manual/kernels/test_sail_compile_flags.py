@@ -14,7 +14,7 @@ import tilelang.language as T
 import torch
 
 from sglang.kernels.jit.utils import load_jit
-from sglang.kernels.jit.utils.compile.flags import filter_hgcc_cuda_flags
+from sglang.kernels.jit.utils.compile.sail_flags import filter_hgcc_flags
 from sglang.kernels.ops.attention import rope
 from sglang.kernels.ops.attention.dsa import tilelang_kernel as dsa
 from sglang.srt.utils.device import is_sail
@@ -45,7 +45,7 @@ class TestSailCompileFlags(CustomTestCase):
             cuda_flags = dsa._sparse_attention_v2_compile_flags()
         self.assertIn("--ptxas-options=-v,--register-usage-level=10", cuda_flags)
         sail_flags = dsa._sparse_attention_v2_compile_flags()
-        self.assertEqual(sail_flags, filter_hgcc_cuda_flags(cuda_flags))
+        self.assertEqual(sail_flags, filter_hgcc_flags(cuda_flags))
         self.assertNotIn("--ptxas-options=-v,--register-usage-level=10", sail_flags)
         flags = sail_flags + ["--ftz=false", "--fmad=false"]
         kernel = tilelang.jit(out_idx=[-1], compile_flags=flags)(_copy_prim_func)(256)
@@ -84,7 +84,7 @@ struct SailFlagsProbe {
                 with self.subTest(option=option):
                     module = load_jit(
                         "sail_compile_flags_probe",
-                        option.removeprefix("-"),
+                        option.lstrip("-"),
                         cuda_files=[str(path)],
                         cuda_wrappers=[("run", "SailFlagsProbe::run")],
                         extra_cuda_cflags=[

@@ -7,7 +7,7 @@ import tilelang.language as T
 import torch
 
 from sglang.kernels.arch import current_arch
-from sglang.kernels.jit.utils.compile.flags import filter_hgcc_cuda_flags
+from sglang.kernels.jit.utils.compile.sail_flags import filter_hgcc_flags
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.srt.utils.device import is_sail
@@ -284,7 +284,7 @@ def _sparse_attention_v2_compile_flags() -> list[str]:
     ]
     # TileLang compiles through its own backend, bypassing load_jit's filter.
     # Preserve CUDA's ptxas tuning while using the same HGCC rules on SAIL.
-    return filter_hgcc_cuda_flags(flags) if is_sail() else flags
+    return filter_hgcc_flags(flags) if is_sail() else flags
 
 
 @tilelang.jit(
