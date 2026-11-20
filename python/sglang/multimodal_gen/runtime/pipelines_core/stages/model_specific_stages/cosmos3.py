@@ -18,6 +18,7 @@ from contextlib import closing
 from fractions import Fraction
 from itertools import islice
 from typing import Any
+from urllib.parse import urlparse
 
 import numpy as np
 import PIL.Image
@@ -102,6 +103,7 @@ from sglang.multimodal_gen.runtime.utils.vision import (
     preprocess_image,
 )
 from sglang.srt.environ import envs
+from sglang.srt.multimodal.media_io import validate_remote_media_url
 from sglang.srt.utils.device import get_compiler_backend
 
 logger = init_logger(__name__)
@@ -237,6 +239,26 @@ def _pad_transfer_frames(video: torch.Tensor, target_frames: int) -> torch.Tenso
     return video.contiguous()
 
 
+def _validate_video_path_for_av(video_path: str) -> None:
+    """Reject URL-like inputs PyAV/FFmpeg would fetch as a protocol.
+
+    ``av.open`` hands its argument to FFmpeg, which interprets ``file:``,
+    ``concat:``, ``pipe:`` and other protocol prefixes in addition to
+    fetching ``http(s)`` URLs, so a bare local path is the only thing that
+    may reach it unchecked. Remote URLs must pass the shared media URL
+    policy (public http(s) hosts only); anything else with a scheme-like
+    prefix is rejected.
+    """
+    scheme = urlparse(video_path).scheme.lower()
+    if scheme in ("http", "https"):
+        validate_remote_media_url(video_path)
+    elif scheme == "data":
+        # Self-contained payload; no fetch happens.
+        return
+    elif scheme and len(scheme) > 1:
+        raise ValueError(f"Unsupported video path scheme {scheme!r}: {video_path!r}")
+
+
 def _iter_video_frames_pyav(
     video_path: str, num_frames: int, keep: str = "first"
 ) -> Iterator[np.ndarray]:
@@ -253,6 +275,7 @@ def _iter_video_frames_pyav(
     if keep not in ("first", "last"):
         raise ValueError("keep must be 'first' or 'last'")
 
+    _validate_video_path_for_av(video_path)
     with av.open(video_path) as container:
         if not container.streams.video:
             raise ValueError(f"No video stream in {video_path!r}")

@@ -11,6 +11,7 @@ import time
 from contextlib import contextmanager, suppress
 from functools import cache
 from typing import Any, Generator, List, Literal, Optional, Union
+from urllib.parse import urljoin, urlparse
 
 import httpx
 from fastapi import HTTPException, UploadFile
@@ -47,6 +48,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     log_generation_timer,
 )
 from sglang.multimodal_gen.runtime.utils.trace_wrapper import trace_req
+from sglang.srt.multimodal.media_io import validate_remote_media_url
 
 # re-export LoRA protocol types for backward compatibility
 __all__ = [
@@ -274,6 +276,58 @@ def _reject_remote_model_paths(kwargs: dict[str, Any]) -> None:
             )
 
 
+# Request fields that name client-supplied media. Their values flow to media
+# loaders (``load_video`` / ``load_image`` / ``av.open``), so every URL among
+# them is validated at the entry point, before any fetch happens.
+_MEDIA_URL_FIELDS = (
+    "video_path",
+    "video_url",
+    "image_path",
+    "input_reference",
+    "reference_url",
+    "control_path",
+)
+
+
+def _validate_remote_media_value(field_name: str, value: str) -> None:
+    """Reject a media field value that would make a loader fetch remotely.
+
+    http(s) URLs must pass the shared media URL policy (public hosts only);
+    ``data:`` URLs are self-contained and allowed; local paths and base64
+    payloads have no scheme and are allowed. Any other scheme-like prefix
+    (``file:``, ``concat:``, ``ftp:``, ...) is rejected: loaders such as
+    PyAV/FFmpeg would interpret it as a fetch protocol.
+    """
+    scheme = urlparse(value).scheme.lower()
+    if scheme in ("http", "https"):
+        try:
+            validate_remote_media_url(value)
+        except ValueError as exc:
+            raise _bad_request(
+                f"{field_name} points to a disallowed media URL: {exc}"
+            ) from exc
+    elif scheme == "data":
+        # Self-contained payload; no fetch happens.
+        return
+    elif "://" in value or (scheme and len(scheme) > 1):
+        raise _bad_request(
+            f"{field_name} must be a local path, a base64 payload, or an "
+            f"http(s) media URL, not {scheme or 'an unknown scheme'!r}"
+        )
+
+
+def _validate_remote_media_paths(kwargs: dict[str, Any]) -> None:
+    """Fail fast (400) on remote media URLs the loaders must not fetch."""
+    for name in _MEDIA_URL_FIELDS:
+        value = kwargs.get(name)
+        if value is None:
+            continue
+        values = value if isinstance(value, (list, tuple)) else [value]
+        for item in values:
+            if isinstance(item, str) and item:
+                _validate_remote_media_value(name, item)
+
+
 def build_sampling_params(request_id: str, **kwargs) -> SamplingParams:
     """Build SamplingParams from request parameters.
 
@@ -299,6 +353,7 @@ def build_sampling_params(request_id: str, **kwargs) -> SamplingParams:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     _reject_remote_model_paths(kwargs)
+    _validate_remote_media_paths(kwargs)
     has_explicit_compression = kwargs.get("output_compression") is not None
 
     # parse "WxH" size string if provided
@@ -494,6 +549,12 @@ async def _maybe_url_image(
 _MAX_IMAGE_DOWNLOAD_BYTES = 50 * 1024 * 1024
 
 
+_MAX_IMAGE_DOWNLOAD_REDIRECTS = 5
+
+
+_IMAGE_REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
+
+
 async def _download_capped_to_temp_file(
     response: httpx.Response, directory: str
 ) -> str:
@@ -519,7 +580,11 @@ async def _download_capped_to_temp_file(
 async def _save_url_image_to_path(
     image_url: str, target_path: str, *, uploads_root: str | None = None
 ) -> str:
-    """Download image from URL and save to target path."""
+    """Download image from URL and save to target path.
+
+    Redirects are followed manually so every destination is validated
+    against the media URL policy before a connection is made.
+    """
 
     def _is_retryable_download_error(error: Exception) -> bool:
         if isinstance(error, httpx.HTTPStatusError):
@@ -542,59 +607,83 @@ async def _save_url_image_to_path(
     backoff_seconds = 0.2
 
     try:
-        async with httpx.AsyncClient(follow_redirects=True) as client:
+        async with httpx.AsyncClient(follow_redirects=False) as client:
             for attempt in range(1, max_attempts + 1):
                 part_path = None
                 try:
-                    async with client.stream(
-                        "GET", image_url, timeout=10.0
-                    ) as response:
-                        response.raise_for_status()
-                        part_path = await _download_capped_to_temp_file(
-                            response, os.path.dirname(target_path)
-                        )
-
-                    # Determine file extension from content type or URL after downloading
-                    if not os.path.splitext(target_path)[1]:
-                        content_type = response.headers.get("content-type", "").lower()
-
-                        url_path = image_url.split("?")[0]
-                        _, url_ext = os.path.splitext(url_path)
-                        url_ext = url_ext.lower()
-
-                        if url_ext in {
-                            ".jpg",
-                            ".jpeg",
-                            ".png",
-                            ".webp",
-                            ".gif",
-                            ".bmp",
-                        }:
-                            ext = ".jpg" if url_ext == ".jpeg" else url_ext
-                        elif content_type.startswith("image/"):
-                            if "jpeg" in content_type or "jpg" in content_type:
-                                ext = ".jpg"
-                            elif "png" in content_type:
-                                ext = ".png"
-                            elif "webp" in content_type:
-                                ext = ".webp"
-                            else:
-                                ext = ".jpg"  # Default to jpg
-                        elif content_type == "application/octet-stream":
-                            # for octet-stream, if we couldn't get it from URL, default to jpg
-                            ext = ".jpg"
-                        else:
-                            raise ValueError(
-                                f"URL does not point to an image. Content-Type: {content_type}"
+                    current_url = validate_remote_media_url(image_url)
+                    downloaded = False
+                    for redirect_count in range(_MAX_IMAGE_DOWNLOAD_REDIRECTS + 1):
+                        async with client.stream(
+                            "GET", current_url, timeout=10.0
+                        ) as response:
+                            location = response.headers.get("Location")
+                            if (
+                                response.status_code in _IMAGE_REDIRECT_STATUS_CODES
+                                and location
+                            ):
+                                if redirect_count == _MAX_IMAGE_DOWNLOAD_REDIRECTS:
+                                    raise httpx.TooManyRedirects(
+                                        "Image URL exceeded "
+                                        f"{_MAX_IMAGE_DOWNLOAD_REDIRECTS} "
+                                        f"redirects: {image_url}"
+                                    )
+                                current_url = validate_remote_media_url(
+                                    urljoin(str(response.url), location)
+                                )
+                                continue
+                            response.raise_for_status()
+                            part_path = await _download_capped_to_temp_file(
+                                response, os.path.dirname(target_path)
                             )
-                        target_path = f"{target_path}{ext}"
 
-                    if uploads_root is not None:
-                        target_path = ensure_path_within_root(target_path, uploads_root)
-                    # same-filesystem rename publishes only a complete download
-                    os.replace(part_path, target_path)
+                            # Determine file extension from content type or URL after downloading
+                            if not os.path.splitext(target_path)[1]:
+                                content_type = response.headers.get(
+                                    "content-type", ""
+                                ).lower()
 
-                    return target_path
+                                url_path = image_url.split("?")[0]
+                                _, url_ext = os.path.splitext(url_path)
+                                url_ext = url_ext.lower()
+
+                                if url_ext in {
+                                    ".jpg",
+                                    ".jpeg",
+                                    ".png",
+                                    ".webp",
+                                    ".gif",
+                                    ".bmp",
+                                }:
+                                    ext = ".jpg" if url_ext == ".jpeg" else url_ext
+                                elif content_type.startswith("image/"):
+                                    if "jpeg" in content_type or "jpg" in content_type:
+                                        ext = ".jpg"
+                                    elif "png" in content_type:
+                                        ext = ".png"
+                                    elif "webp" in content_type:
+                                        ext = ".webp"
+                                    else:
+                                        ext = ".jpg"  # Default to jpg
+                                elif content_type == "application/octet-stream":
+                                    # for octet-stream, if we couldn't get it from URL, default to jpg
+                                    ext = ".jpg"
+                                else:
+                                    raise ValueError(
+                                        f"URL does not point to an image. Content-Type: {content_type}"
+                                    )
+                                target_path = f"{target_path}{ext}"
+
+                            if uploads_root is not None:
+                                target_path = ensure_path_within_root(
+                                    target_path, uploads_root
+                                )
+                            # same-filesystem rename publishes only a complete download
+                            os.replace(part_path, target_path)
+                            downloaded = True
+                        if downloaded:
+                            return target_path
+                    raise AssertionError("unreachable")
                 except Exception as e:
                     if attempt == max_attempts or not _is_retryable_download_error(e):
                         raise

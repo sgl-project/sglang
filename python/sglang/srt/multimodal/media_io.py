@@ -20,6 +20,7 @@ import ipaddress
 import logging
 import math
 import os
+import socket
 import stat
 import threading
 import time
@@ -73,6 +74,16 @@ _media_url_timeout: Optional[float] = None
 _allow_local_media_files = True
 
 
+# Client-supplied media URLs that resolve to private, loopback, link-local,
+# or otherwise non-public addresses are rejected by default: an unauthenticated
+# client must not be able to make the server fetch internal services or cloud
+# metadata endpoints (SSRF). Operators whose servers intentionally fetch media
+# from a private network can opt back in with
+# ``configure_media_url_security(allow_private_media_hosts=True)`` or
+# ``--allow-private-media-hosts``.
+_allow_private_media_hosts = False
+
+
 def _normalize_media_domain(domain: str) -> str:
     if not isinstance(domain, str):
         raise ValueError("allowed media domains must be strings")
@@ -110,12 +121,18 @@ def configure_media_url_security(
     max_file_size_mb: int = _DEFAULT_MEDIA_URL_MAX_FILE_SIZE_MB,
     timeout: Optional[float] = None,
     allow_local_files: bool = True,
+    allow_private_media_hosts: bool = False,
 ) -> list[str]:
     """Configure process-wide safeguards for client-supplied media URLs.
 
     A serving worker hosts one engine configuration, while media loading fans
     out to worker threads. Keeping the immutable policy here makes the same
     checks apply to image, video, audio, cache, and model-specific loaders.
+
+    ``allow_private_media_hosts`` opts back in to fetching media URLs that
+    resolve to private, loopback, link-local, or reserved addresses. It is
+    off by default; an explicitly allowlisted domain is also exempt, since
+    allowlisting a host is an operator opt-in to fetch from that host.
     """
 
     if max_file_size_mb < 0:
@@ -128,10 +145,12 @@ def configure_media_url_security(
     )
     global _allowed_media_domains, _media_url_max_file_size_bytes
     global _media_url_timeout, _allow_local_media_files
+    global _allow_private_media_hosts
     _allowed_media_domains = frozenset(normalized_domains)
     _media_url_max_file_size_bytes = max_file_size_mb * 1024 * 1024
     _media_url_timeout = timeout
     _allow_local_media_files = allow_local_files
+    _allow_private_media_hosts = allow_private_media_hosts
     return normalized_domains
 
 
@@ -142,7 +161,65 @@ def media_url_security_config() -> tuple:
         _media_url_max_file_size_bytes // (1024 * 1024),
         _media_url_timeout,
         _allow_local_media_files,
+        _allow_private_media_hosts,
     )
+
+
+def _resolve_host_ips(
+    hostname: str,
+) -> list[Union[ipaddress.IPv4Address, ipaddress.IPv6Address]]:
+    """Resolve ``hostname`` to the IP addresses a fetch would connect to.
+
+    Resolution (rather than a literal-IP check) also covers hostnames that
+    resolve to private addresses (DNS rebinding) and non-canonical IP
+    spellings the system resolver accepts, such as ``0x7f.0.0.1`` or
+    ``2130706433``. An unresolvable host fails closed: the fetch could not
+    succeed anyway.
+    """
+    if "%" in hostname:
+        # A zone id only makes sense for link-local addresses.
+        raise ValueError(f"Invalid media URL host: {hostname!r}")
+    try:
+        infos = socket.getaddrinfo(hostname, None, proto=socket.IPPROTO_TCP)
+    except (socket.gaierror, UnicodeError) as e:
+        raise ValueError(f"Could not resolve media URL host {hostname!r}") from e
+    ips: list[Union[ipaddress.IPv4Address, ipaddress.IPv6Address]] = []
+    for info in infos:
+        sockaddr = info[4]
+        if not sockaddr:
+            continue
+        try:
+            ips.append(ipaddress.ip_address(sockaddr[0]))
+        except ValueError:
+            continue
+    if not ips:
+        raise ValueError(f"Could not resolve media URL host {hostname!r}")
+    return ips
+
+
+def _ip_is_public(
+    ip: Union[ipaddress.IPv4Address, ipaddress.IPv6Address],
+) -> bool:
+    """True only for globally routable unicast addresses.
+
+    ``is_global`` alone is not enough: multicast addresses report
+    ``is_global == True`` on some Python versions, so check explicitly.
+    IPv4-mapped IPv6 addresses (``::ffff:127.0.0.1``) are unwrapped first.
+    """
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return bool(
+        ip.is_global
+        and not ip.is_multicast
+        and not ip.is_reserved
+        and not ip.is_unspecified
+    )
+
+
+def _assert_media_host_is_public(hostname: str) -> None:
+    for ip in _resolve_host_ips(hostname):
+        if not _ip_is_public(ip):
+            raise ValueError("Media URL host resolves to a non-public IP address")
 
 
 def _assert_media_url_allowed(url: str) -> None:
@@ -151,12 +228,37 @@ def _assert_media_url_allowed(url: str) -> None:
         raise ValueError(f"Invalid media URL: {url!r}")
 
     hostname = _normalize_media_domain(parsed.hostname)
-    if _allowed_media_domains and hostname not in _allowed_media_domains:
-        raise ValueError(
-            "Media URL domain is not allowed. "
-            f"Allowed domains: {sorted(_allowed_media_domains)}; "
-            f"input domain: {hostname}"
-        )
+    if _allowed_media_domains:
+        if hostname not in _allowed_media_domains:
+            raise ValueError(
+                "Media URL domain is not allowed. "
+                f"Allowed domains: {sorted(_allowed_media_domains)}; "
+                f"input domain: {hostname}"
+            )
+        # An explicit allowlist entry is an operator opt-in to that host,
+        # including a private one (e.g. an internal media server).
+        return
+    if not _allow_private_media_hosts:
+        _assert_media_host_is_public(hostname)
+
+
+def validate_remote_media_url(url: str) -> str:
+    """Validate a client-supplied media URL; return its normalized form.
+
+    Raises ValueError when the URL is not an http(s) URL, its host is not in
+    the configured domain allowlist, or it resolves to a non-public IP
+    address (unless private hosts are explicitly allowed). The returned URL
+    is the same normalized representation ``requests`` sends, so callers that
+    fetch it validate exactly what is fetched.
+    """
+    try:
+        prepared_url = requests.Request("GET", url).prepare().url
+    except requests.exceptions.RequestException as e:
+        raise ValueError(f"Invalid media URL: {url!r}") from e
+    if prepared_url is None:
+        raise ValueError(f"Invalid media URL: {url!r}")
+    _assert_media_url_allowed(prepared_url)
+    return prepared_url
 
 
 def media_url_timeout(default: float) -> float:
@@ -185,10 +287,7 @@ def download_remote_media(url: str, timeout: float) -> bytes:
         # Validate the same normalized URL representation that requests sends
         # to urllib3. This avoids parser disagreements around backslashes and
         # userinfo separators.
-        prepared_url = requests.Request("GET", current_url).prepare().url
-        if prepared_url is None:
-            raise ValueError(f"Invalid media URL: {current_url!r}")
-        _assert_media_url_allowed(prepared_url)
+        prepared_url = validate_remote_media_url(current_url)
 
         remaining = deadline - time.monotonic()
         if remaining <= 0:

@@ -7,7 +7,7 @@ import tempfile
 from collections.abc import Callable
 from contextlib import closing
 from io import BytesIO
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 
 import imageio
 import numpy as np
@@ -20,6 +20,7 @@ from packaging import version
 from sglang.kernels import get_kernel
 from sglang.srt.environ import envs
 from sglang.srt.multimodal.media_io import get_image_bytes as srt_get_image_bytes
+from sglang.srt.multimodal.media_io import validate_remote_media_url
 
 if version.parse(version.parse(PIL.__version__).base_version) >= version.parse("9.1.0"):
     PIL_INTERPOLATION = {
@@ -175,6 +176,64 @@ def load_image(
 _VIDEO_DOWNLOAD_TIMEOUT_S = 60
 
 
+# Upper bound for one client-supplied video download. Videos are much larger
+# than the 64 MiB default cap for still media, so remote videos get their own
+# cap instead of sharing it; the bound still stops a hostile URL from filling
+# server disk or memory.
+_VIDEO_DOWNLOAD_MAX_BYTES = 512 * 1024 * 1024
+
+_VIDEO_DOWNLOAD_MAX_REDIRECTS = 5
+
+_VIDEO_REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
+
+
+def _download_video_to_file(video: str, video_path: str) -> None:
+    """Fetch a remote video to ``video_path`` under the media URL policy.
+
+    Redirects are followed manually so every hop is validated (scheme and
+    resolved IP) before a connection is made, and the body is streamed to
+    disk under a size cap instead of being buffered in memory.
+    """
+    current_url = video
+    for redirect_count in range(_VIDEO_DOWNLOAD_MAX_REDIRECTS + 1):
+        prepared_url = validate_remote_media_url(current_url)
+        with closing(
+            requests.get(
+                prepared_url,
+                stream=True,
+                allow_redirects=False,
+                timeout=_VIDEO_DOWNLOAD_TIMEOUT_S,
+            )
+        ) as response:
+            location = response.headers.get("Location")
+            if response.status_code in _VIDEO_REDIRECT_STATUS_CODES and location:
+                if redirect_count == _VIDEO_DOWNLOAD_MAX_REDIRECTS:
+                    raise requests.exceptions.TooManyRedirects(
+                        f"Video URL exceeded {_VIDEO_DOWNLOAD_MAX_REDIRECTS} "
+                        f"redirects: {video}"
+                    )
+                current_url = urljoin(response.url, location)
+                continue
+            if response.status_code != 200:
+                raise ValueError(
+                    f"Failed to download video. Status code: {response.status_code}"
+                )
+            total_bytes = 0
+            with open(video_path, "wb") as temp_file:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if not chunk:
+                        continue
+                    total_bytes += len(chunk)
+                    if total_bytes > _VIDEO_DOWNLOAD_MAX_BYTES:
+                        raise ValueError(
+                            "Video exceeds the "
+                            f"{_VIDEO_DOWNLOAD_MAX_BYTES} byte download limit"
+                        )
+                    temp_file.write(chunk)
+            return
+    raise AssertionError("unreachable")
+
+
 # adapted from diffusers.utils import load_video
 def load_video(
     video: str,
@@ -215,16 +274,7 @@ def load_video(
         suffix = os.path.splitext(file_name)[1] or ".mp4"
         with tempfile.TemporaryDirectory() as temp_dir:
             video_path = os.path.join(temp_dir, f"video{suffix}")
-            with closing(
-                requests.get(video, stream=True, timeout=_VIDEO_DOWNLOAD_TIMEOUT_S)
-            ) as response:
-                if response.status_code != 200:
-                    raise ValueError(
-                        f"Failed to download video. Status code: {response.status_code}"
-                    )
-                with open(video_path, "wb") as temp_file:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        temp_file.write(chunk)
+            _download_video_to_file(video, video_path)
             pil_images = _read_video_frames(video_path, max_frames)
     else:
         pil_images = _read_video_frames(video, max_frames)

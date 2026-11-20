@@ -220,6 +220,7 @@ def handle_media_url_security(server_args: Any):
             cfg.media_url_max_file_size_mb,
             cfg.media_url_timeout,
             cfg.allow_local_media_files,
+            cfg.allow_private_media_hosts,
         ),
     )
 

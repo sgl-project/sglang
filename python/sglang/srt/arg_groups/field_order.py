@@ -373,6 +373,7 @@ POSITIONAL_FIELD_ORDER = (
     "mm_processor_worker_num",
     "mm_io_worker_num",
     "allowed_media_domains",
+    "allow_private_media_hosts",
     "media_url_max_file_size_mb",
     "mm_preprocess_cache_size_mb",
     "trust_mm_content_hashes",

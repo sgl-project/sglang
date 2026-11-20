@@ -8,6 +8,7 @@ from unittest.mock import patch
 import requests
 
 from sglang.srt.multimodal.media_io import (
+    _assert_media_url_allowed,
     _normalize_video_input,
     configure_media_url_security,
     download_remote_media,
@@ -22,6 +23,7 @@ register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 class _MediaHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/media":
+            self.server.media_hits += 1
             payload = b"remote-media"
             self.send_response(200)
             self.send_header("Content-Length", str(len(payload)))
@@ -81,6 +83,7 @@ class TestMediaURLSecurity(unittest.TestCase):
     def setUpClass(cls):
         cls.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _MediaHandler)
         cls.server.redirect_target_reached = False
+        cls.server.media_hits = 0
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.thread.start()
         cls.port = cls.server.server_port
@@ -93,6 +96,7 @@ class TestMediaURLSecurity(unittest.TestCase):
 
     def setUp(self):
         self.server.redirect_target_reached = False
+        self.server.media_hits = 0
         configure_media_url_security([], max_file_size_mb=64)
 
     def tearDown(self):
@@ -101,11 +105,49 @@ class TestMediaURLSecurity(unittest.TestCase):
     def _url(self, path, host="127.0.0.1"):
         return f"http://{host}:{self.port}{path}"
 
-    def test_unrestricted_mode_preserves_remote_media_compatibility(self):
+    def test_private_ip_urls_are_blocked_by_default(self):
+        for url in (
+            self._url("/media"),
+            self._url("/media", host="localhost"),
+            "http://169.254.169.254/latest/meta-data",
+            "http://10.0.0.5/media",
+            "http://192.168.1.1/media",
+        ):
+            with self.subTest(url=url):
+                with self.assertRaisesRegex(ValueError, "non-public IP"):
+                    download_remote_media(url, timeout=5)
+        # Validation happens before any connection is made.
+        self.assertEqual(self.server.media_hits, 0)
+
+    def test_allow_private_media_hosts_opt_in_restores_local_downloads(self):
+        configure_media_url_security(
+            [], max_file_size_mb=64, allow_private_media_hosts=True
+        )
         self.assertEqual(
             download_remote_media(self._url("/media", host="localhost"), timeout=5),
             b"remote-media",
         )
+
+    def test_ipv6_loopback_and_mapped_addresses_are_blocked(self):
+        for url in (
+            "http://[::1]/media",
+            "http://[::ffff:127.0.0.1]/media",
+            "http://[fe80::1]/media",
+            "http://[::]/media",
+        ):
+            with self.subTest(url=url):
+                with self.assertRaisesRegex(ValueError, "non-public IP"):
+                    _assert_media_url_allowed(url)
+
+    def test_noncanonical_private_ip_spellings_are_blocked(self):
+        for host in ("0x7f.0.0.1", "2130706433", "0177.0.0.1"):
+            with self.subTest(host=host):
+                with self.assertRaisesRegex(ValueError, "non-public IP"):
+                    _assert_media_url_allowed(f"http://{host}/media")
+
+    def test_public_literal_ip_is_allowed(self):
+        # A literal public IP needs no DNS lookup, so this needs no network.
+        _assert_media_url_allowed("http://93.184.216.34/media")
 
     def test_exact_domain_allowlist(self):
         configure_media_url_security(["127.0.0.1"], max_file_size_mb=64)

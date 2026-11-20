@@ -132,6 +132,7 @@ RUST_SERVER_UNSUPPORTED_ARGS = (
     "ssl_keyfile_password",
     "enable_ssl_refresh",
     "allowed_media_domains",
+    "allow_private_media_hosts",
     # The Rust media fetcher caps a download at this field's default, 64 MiB.
     "media_url_max_file_size_mb",
     "enable_trace",
