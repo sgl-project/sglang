@@ -1263,10 +1263,12 @@ class SWAComponent(TreeComponent):
             keys=tail_keys,
             hit_policy=PoolHitPolicy.TRAILING_PAGES,
         )
-        if phase == LinkerTransferPhase.LOAD:
+        if phase in (LinkerTransferPhase.LOAD, LinkerTransferPhase.RESERVE):
             num_tokens = len(tail_keys) * page
             storage, sub_pool = self.storage_and_sub_pool()
             if not storage.units_fit(sub_pool, num_tokens):
+                if phase == LinkerTransferPhase.RESERVE:
+                    return None
                 self.cache.evict_for_alloc(
                     KVDemand(window_tokens={sub_pool: num_tokens})
                 )

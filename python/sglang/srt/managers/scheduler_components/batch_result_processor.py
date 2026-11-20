@@ -799,7 +799,8 @@ class SchedulerBatchResultProcessor:
                     for req, row_still_in_batch in zip(batch.reqs, still_in_batch_rows)
                     if row_still_in_batch
                 )
-                if not has_consumed_output and len(batch.reqs) > 0:
+                # A layer-wise restore carries its storage verdict on this return trip.
+                if not has_consumed_output and batch.reqs and not batch.pp_linker_load:
                     chunked = batch.chunked_req
                     logger.warning(
                         f"PP non-skip output comm: no req consumed next_token_ids. "

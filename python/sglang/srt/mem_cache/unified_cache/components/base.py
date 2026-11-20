@@ -217,6 +217,7 @@ class CacheTransferPhase(str, Enum):
 class LinkerTransferPhase(str, Enum):
     LOOKUP = "lookup"
     LOAD = "load"
+    RESERVE = "reserve"  # speculative load using only unclaimed device slots
     OFFLOAD = "offload"
 
 
@@ -973,8 +974,8 @@ class TreeComponent(ABC):
 
         ``node`` carries the device pages to persist on OFFLOAD and is None
         otherwise. ``keys`` are the per-page hashes of the device-uncached tail
-        (page 0 is the first uncached page) on LOOKUP / LOAD, and None on
-        OFFLOAD, where the keys come from ``node.hash_value``.
+        on LOOKUP, LOAD and RESERVE. RESERVE takes the slots available before
+        agreement across PP stages. LOAD can also evict to make room.
         """
         return None
 

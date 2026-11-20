@@ -26,15 +26,18 @@ Prefetch publishes complete KV before admission and recomputes failed reads.
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
+from queue import Empty, SimpleQueue
 from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
+import torch.distributed as dist
 
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
@@ -42,10 +45,12 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.capacity import shares_memory
 from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
 )
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand, largest_fitting_chunk
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import (
     ComponentType,
@@ -55,7 +60,7 @@ from sglang.srt.mem_cache.unified_cache.components import (
 )
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.srt.session.streaming_session import is_virtual_node
-from sglang.srt.utils import get_device_module
+from sglang.srt.utils import broadcast_pyobj, get_device_module
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -280,8 +285,10 @@ class ExternalCacheHitMarker(NamedTuple):
 class _ExternalCachePrefetch:
     key: RadixKey
     anchor_node_id: NodeId
-    anchor_lock: DecLockRefParams
-    component_transfers: list[tuple[TreeComponent, PoolTransfer]]
+    anchor_lock: DecLockRefParams | None = None
+    component_transfers: list[tuple[TreeComponent, PoolTransfer]] = field(
+        default_factory=list
+    )
     future: Future[bool] | None = None
     timeout_s: float = 0.0
     wait_started: float | None = None
@@ -321,8 +328,6 @@ class UnifiedCacheLinkerWrapper:
         self.cache = cache
         self.cache_linker = cache_linker
         self.load_mode = cache_linker.load_mode
-        if self.load_mode == "prefetch" and cache.pp_size > 1:
-            raise ValueError("External linker prefetch currently requires PP=1.")
         self._windows = tuple(cache.components[slot] for slot in windows)
         # A window whose pages the store lacks tombstones restored tails instead.
         self._skipped_windows = tuple(
@@ -341,6 +346,7 @@ class UnifiedCacheLinkerWrapper:
         # Requests loading in the batch being built, then its counter index once
         # the batch starts; finish_loads consumes both after its forward.
         self.inflight_load_rids: list[str] = []
+        self.rejected_pp_loads: set[str] = set()
         # Loaded tails stay outside the tree until their forward completes.
         self.private_load_indices: dict[str, torch.Tensor] = {}
         self.inflight_load_index = -1
@@ -354,6 +360,11 @@ class UnifiedCacheLinkerWrapper:
         self.metrics = cache.metrics_collector
         if self.metrics is not None:
             self.metrics.init_linker_metrics()
+        self.pp_tickets = (
+            _LinkerPPTickets(self)
+            if cache.pp_size > 1 and cache.pp_group is not None
+            else None
+        )
 
     @property
     def layer_done_counter(self) -> object:
@@ -370,32 +381,52 @@ class UnifiedCacheLinkerWrapper:
         page = cache.page_size
         device_hit_len = result.device_prefix_len
         if self.load_mode == "prefetch":
-            # Prefetch is issued on enqueue; only completed GPU KV is matchable.
             return result
+        self.hit_markers.pop(req.rid, None)
+
+        if cache.pp_size > 1:
+            # Only the ticket worker queries storage under PP. Before its
+            # verdict arrives ordinary matches may expose the local L1 only.
+            end = req.external_cache_hit_length or 0
+            if len(key) < end:
+                # A trailing checkpoint was proved at end, not at a shorter
+                # candidate that another caller chose to probe.
+                return result
+            key = key[:end]
+
         if device_hit_len >= len(key):
+            if self.pp_tickets is not None and req.external_cache_hit_length:
+                self._finish_prefetch(req.cache_request_handle, publish=False)
+                req.external_cache_hit_length = 0
             return result
 
         tail_hashes = self._tail_hashes(key, result, device_hit_len)
         if not tail_hashes:
             return result
 
-        lookup_transfers = []
-        for component in self._components:
-            transfer = component.build_external_linker_transfer(
-                LinkerTransferPhase.LOOKUP, None, tail_hashes
+        if self.pp_tickets is not None:
+            # A longer L1 match frees surplus reserved rows before admission.
+            reserved = self._trim_pp_reservation(
+                req.cache_request_handle, len(key), tail_hashes
             )
-            if transfer is None:
+            if reserved is None:
                 return result
-            lookup_transfers.append(transfer)
+            lookup_transfers = [t for _, t in reserved.component_transfers]
+        else:
+            lookup_transfers = self._lookup_transfers(tail_hashes)
+            if not lookup_transfers:
+                return result
         by_pool = {transfer.name: transfer for transfer in lookup_transfers}
 
-        # Tail-relative: page 0 of `tail_hashes` is the first uncached page.
-        hit_pages = self._sync_restorable_prefix(
-            self.cache_linker.lookup(req.rid, lookup_transfers),
-            num_pages=len(tail_hashes),
-            device_hit_pages=0,
-        )
-        self._record_lookup(len(tail_hashes) * page, hit_pages * page)
+        # Page 0 of tail_hashes is the first uncached page.
+        hit_pages = len(tail_hashes)
+        if cache.pp_size == 1:
+            hit_pages = self._sync_restorable_prefix(
+                self.cache_linker.lookup(req.rid, lookup_transfers),
+                num_pages=len(tail_hashes),
+                device_hit_pages=0,
+            )
+            self._record_lookup(len(tail_hashes) * page, hit_pages * page)
         if hit_pages == 0:
             return result
         hit_tokens = hit_pages * page
@@ -422,8 +453,50 @@ class UnifiedCacheLinkerWrapper:
             ),
         )
 
+    def _lookup_transfers(self, hashes: list[str]) -> list[PoolTransfer]:
+        transfers = []
+        for component in self._components:
+            transfer = component.build_external_linker_transfer(
+                LinkerTransferPhase.LOOKUP, None, hashes
+            )
+            if transfer is None:
+                return []
+            transfers.append(transfer)
+        return transfers
+
+    def _prefetch_key(self, req: Req) -> RadixKey:
+        tokens = req.full_untruncated_fill_ids
+        return RadixKey(
+            tokens,
+            extra_key=req.extra_key,
+            cache_salt=req.cache_salt,
+            is_bigram=self.cache.tree_core.is_eagle,
+            limit=req._compute_max_prefix_len(len(tokens)),
+        ).page_aligned(self.cache.page_size)
+
+    def _lookup_prefetch(self, rid: str, hashes: list[str]) -> list[int]:
+        try:
+            transfers = self._lookup_transfers(hashes)
+            if not transfers:
+                return []
+            hits = self.cache_linker.lookup(rid, transfers)
+            return [pages for pages in hits if 0 < pages <= len(hashes)]
+        except Exception:
+            logger.warning(
+                "External linker prefetch lookup failed for %s", rid, exc_info=True
+            )
+            if self.metrics is not None:
+                self.metrics.increment_linker_failures("lookup")
+            return []
+
     def prefetch(self, req: Req) -> None:
         """Stage a queued request; publish only after all ranks succeed."""
+        if self.pp_tickets is not None:
+            # Arrival issued the original ticket. A retraction starts a new
+            # attempt locally on every stage without another inbound message.
+            if req.is_retracted and not req.finished():
+                self.pp_tickets.bind(req, expected=True, retracted=True)
+            return
         if self.load_mode != "prefetch":
             return
         request = req.cache_request_handle
@@ -436,34 +509,16 @@ class UnifiedCacheLinkerWrapper:
         if is_virtual_node(req.last_node) or req.positional_embed_overrides is not None:
             return
         page = self.cache.page_size
-        key = RadixKey(
-            req.full_untruncated_fill_ids,
-            extra_key=req.extra_key,
-            cache_salt=req.cache_salt,
-            is_bigram=self.cache.tree_core.is_eagle,
-            limit=req._compute_max_prefix_len(len(req.full_untruncated_fill_ids)),
-        ).page_aligned(page)
+        key = self._prefetch_key(req)
         start = req.prefix_len
         last_hash = self.cache.get_last_hash_value(req.last_node)
         if len(key) <= start or (start and last_hash is None):
             return
         hashes = get_storage_hash_str(key[start:], last_hash, page_size=page)
-        lookups = [
-            c.build_external_linker_transfer(LinkerTransferPhase.LOOKUP, None, hashes)
-            for c in self._components
-        ]
-        if any(t is None for t in lookups):
-            return
-        try:
-            # TODO: Run storage lookup asynchronously to avoid blocking scheduling.
-            restorable = self.cache_linker.lookup(req.rid, lookups)
-        except Exception:
-            logger.warning("External linker prefetch lookup failed", exc_info=True)
-            if self.metrics is not None:
-                self.metrics.increment_linker_failures("lookup")
-            restorable = []
         pages = self._sync_restorable_prefix(
-            restorable, num_pages=len(hashes), device_hit_pages=0
+            self._lookup_prefetch(req.rid, hashes),
+            num_pages=len(hashes),
+            device_hit_pages=0,
         )
         self._record_lookup(len(hashes) * page, pages * page)
         if not pages:
@@ -473,20 +528,12 @@ class UnifiedCacheLinkerWrapper:
             key[:end],
             req.last_node,
             self.cache.inc_lock_ref(req.last_node).to_dec_params(),
-            [],
             timeout_s=self.cache.prefetch_timeout_base
             + len(hashes) * self.cache.prefetch_timeout_per_page,
         )
         self.prefetches[request] = state
         try:
-            for component in self._components:
-                transfer = component.build_external_linker_transfer(
-                    LinkerTransferPhase.LOAD, None, hashes[:pages]
-                )
-                if transfer is None:
-                    break
-                state.component_transfers.append((component, transfer))
-            if len(state.component_transfers) == len(self._components):
+            if self._allocate_transfers(state.component_transfers, hashes[:pages]):
                 state.future = self.cache_linker.prefetch(
                     [t for _, t in state.component_transfers]
                 )
@@ -499,7 +546,138 @@ class UnifiedCacheLinkerWrapper:
             self._cancel_prefetch(request)
             self.check_prefetch_events()
 
+    def _allocate_transfers(
+        self, transfers, hashes, phase: LinkerTransferPhase = LinkerTransferPhase.LOAD
+    ) -> bool:
+        """Append allocated pools in order so the caller can unwind a partial take."""
+        for component in self._components:
+            transfer = component.build_external_linker_transfer(phase, None, hashes)
+            if transfer is None:
+                return False
+            transfers.append((component, transfer))
+        return True
+
+    def _pp_prefetch_fits(self, pages: int) -> bool:
+        """Whether all pools can satisfy this reservation without tree eviction."""
+        page = self.cache.page_size
+        tokens = pages * page
+        allocator = self.cache.token_to_kv_pool_allocator
+        window_tokens = {
+            w.window_sub_pool: min(
+                tokens, (w.sliding_window_size + page - 1) // page * page
+            )
+            for w in self._windows
+            if w not in self._skipped_windows
+        }
+        has_state = ComponentType.MAMBA in self.cache.components
+        if shares_memory(allocator):
+            # An owner, window and state can fit separately in the chain and
+            # still exceed the shared arena when their bytes are priced together.
+            demand = KVDemand(tokens, window_tokens, int(has_state))
+            return allocator.ensure_capacity(
+                demand.completed(allocator.window_pool_names())
+            )
+        storage = self.cache.kv_storage()
+        owner, _, _ = allocator.sub_pool_roles()
+        return (
+            storage.units_fit(owner, tokens)
+            and all(storage.units_fit(name, n) for name, n in window_tokens.items())
+            and (not has_state or allocator.state_slots.slots_fit(1))
+        )
+
+    def reserve_pp_prefetch(
+        self,
+        request: CacheRequestHandle,
+        anchor_node_id: NodeId,
+        key: RadixKey,
+        start: int,
+        hashes: list[str],
+    ) -> int:
+        """Reserve free slots below the query bound and return the absolute end page."""
+        page = self.cache.page_size
+        start_page = start // page
+        pages = len(hashes)
+        if not pages or request in self.prefetches:
+            return start_page
+        # The ticket holds the anchor through publication or discard on this stage.
+        state = _ExternalCachePrefetch(key, anchor_node_id)
+        self.prefetches[request] = state
+        try:
+            if not self._pp_prefetch_fits(pages):
+                pages = largest_fitting_chunk(self._pp_prefetch_fits, pages - 1, 1)
+            if pages:
+                state.key = key[: start + pages * page]
+                if self._allocate_transfers(
+                    state.component_transfers,
+                    hashes[:pages],
+                    LinkerTransferPhase.RESERVE,
+                ):
+                    return start_page + pages
+        except Exception:
+            logger.warning("PP linker prefetch reservation failed", exc_info=True)
+        state.stop_reason = "rejected"
+        self._finish_prefetch(request, publish=False)
+        return start_page
+
+    def _trim_pp_reservation(self, request, end, hashes=None):
+        """Retarget FULL, trailing windows and state to the agreed prefix or a later L1 match."""
+        state = self.prefetches.get(request)
+        if state is None or state.future is not None:
+            return state
+        full = state.component_transfers[0][1]
+        start = len(state.key) - len(full.device_indices)
+        if state.discard or end <= start:
+            self._finish_prefetch(request, publish=False)
+            return None
+        if hashes is None:
+            page = self.cache.page_size
+            assert end <= len(state.key) and (end - start) % page == 0
+            hashes = full.keys[: (end - start) // page]
+        if full.keys == hashes:
+            return state
+        lookups = self._lookup_transfers(hashes)
+        # A smaller boundary changes the window tail and the Mamba
+        # checkpoint key even when both need the same number of slots.
+        for (component, transfer), lookup in zip(
+            state.component_transfers, lookups, strict=True
+        ):
+            indices = transfer.device_indices
+            keep = len(lookup.keys) * (len(indices) // len(transfer.keys))
+            if keep < len(indices):
+                component.update_external_linker_load(
+                    ExternalLinkerLoadPhase.ABORT,
+                    None,
+                    full,
+                    replace(transfer, device_indices=indices[keep:]),
+                    end,
+                )
+                transfer.device_indices = indices[:keep]
+            transfer.keys = lookup.keys
+        state.key = state.key[:end]
+        return state
+
+    def submit_pp_prefetch(
+        self, request: CacheRequestHandle, end: int
+    ) -> Future[bool] | None:
+        try:
+            state = self._trim_pp_reservation(request, end)
+            if state is None:
+                return None
+            if state.future is None:
+                state.future = self.cache_linker.prefetch(
+                    [t for _, t in state.component_transfers]
+                )
+            if state.future is not None:
+                return state.future
+        except Exception:
+            logger.warning("PP linker prefetch submission failed", exc_info=True)
+        self._cancel_prefetch(request, reason="rejected")
+        self._finish_prefetch(request, publish=False)
+        return None
+
     def check_prefetch_progress(self, request: CacheRequestHandle) -> bool:
+        if self.pp_tickets is not None:
+            return self.pp_tickets.can_admit(request)
         state = self.prefetches.get(request)
         if state is None or state.discard:
             return True
@@ -546,6 +724,10 @@ class UnifiedCacheLinkerWrapper:
         )
 
     def check_prefetch_events(self) -> None:
+        if self.pp_tickets is not None:
+            self.cache._bound_async_work()
+            self.pp_tickets.poll()
+            return
         if not self.prefetches:
             return
         pending = list(self.prefetches.items())
@@ -568,6 +750,9 @@ class UnifiedCacheLinkerWrapper:
             if done:
                 self._finish_prefetch(request, publish=bool(landed))
 
+    def has_pending_prefetch(self) -> bool:
+        return bool(self.prefetches or (self.pp_tickets and self.pp_tickets.pending))
+
     def _finish_prefetch(self, request: CacheRequestHandle, *, publish: bool) -> None:
         state = self.prefetches.pop(request, None)
         if state is None:
@@ -576,7 +761,7 @@ class UnifiedCacheLinkerWrapper:
         if state.future is not None:
             assert state.future.done()
         end = len(state.key)
-        if self.metrics is not None:
+        if self.metrics is not None and self.load_mode == "prefetch":
             outcome = "published" if publish else (state.stop_reason or "failed")
             self.metrics.increment_linker_prefetch_requests(outcome)
         try:
@@ -628,7 +813,8 @@ class UnifiedCacheLinkerWrapper:
             if self.metrics is not None:
                 self.metrics.increment_linker_load_tokens(len(full), "prefetch")
         finally:
-            self.cache.dec_lock_ref(state.anchor_node_id, state.anchor_lock)
+            if state.anchor_lock is not None:
+                self.cache.dec_lock_ref(state.anchor_node_id, state.anchor_lock)
 
     def _record_lookup(self, lookup_tokens: int, hit_tokens: int) -> None:
         if self.metrics is not None:
@@ -694,41 +880,44 @@ class UnifiedCacheLinkerWrapper:
         tail_hashes = hit.tail_hashes
         prefix_len = device_hit_len + len(tail_hashes) * cache.page_size
 
-        # Build per-component linker transfers.
-        component_transfers: list[tuple[TreeComponent, PoolTransfer]] = []
-        for component in self._components:
-            transfer = component.build_external_linker_transfer(
-                LinkerTransferPhase.LOAD, None, tail_hashes
-            )
-            if transfer is None:
+        reserved = (
+            self.prefetches.pop(req.cache_request_handle, None)
+            if self.pp_tickets
+            else None
+        )
+        if reserved is not None:
+            req.external_cache_hit_length = 0
+            component_transfers = reserved.component_transfers
+        else:
+            component_transfers = []
+            if not self._allocate_transfers(component_transfers, tail_hashes):
                 self._update_load(
-                    ExternalLinkerLoadPhase.ABORT,
-                    req,
-                    component_transfers,
-                    prefix_len,
+                    ExternalLinkerLoadPhase.ABORT, req, component_transfers, prefix_len
                 )
                 return 0, req.last_node
-            component_transfers.append((component, transfer))
-
         full_transfer = component_transfers[0][1]
         assert full_transfer.name == PoolName.KV
-        # Queue before PREPARE touches the request, so a refused load only has
-        # the allocations to undo before falling back to recompute. The result
-        # depends on the transfers alone, so every rank takes the same branch.
+        # PP already agreed on the reserved shape. A local backend rejection
+        # must follow the same retirement path as an asynchronous read failure.
         try:
             queued = self.cache_linker.load(
                 req.rid, [transfer for _, transfer in component_transfers]
             )
-        except BaseException:
-            self._update_load(
-                ExternalLinkerLoadPhase.ABORT, req, component_transfers, prefix_len
-            )
-            raise
+        except BaseException as exc:
+            if reserved is None or not isinstance(exc, Exception):
+                self._update_load(
+                    ExternalLinkerLoadPhase.ABORT, req, component_transfers, prefix_len
+                )
+                raise
+            logger.exception("Could not queue PP linker load for %s", req.rid)
+            queued = False
         if not queued:
-            self._update_load(
-                ExternalLinkerLoadPhase.ABORT, req, component_transfers, prefix_len
-            )
-            return 0, req.last_node
+            if reserved is None:
+                self._update_load(
+                    ExternalLinkerLoadPhase.ABORT, req, component_transfers, prefix_len
+                )
+                return 0, req.last_node
+            self.rejected_pp_loads.add(req.rid)
         self._update_load(
             ExternalLinkerLoadPhase.PREPARE,
             req,
@@ -754,6 +943,14 @@ class UnifiedCacheLinkerWrapper:
             req.swa_branching_seqlen = None
         self.private_load_indices[req.rid] = full_transfer.device_indices
         self.inflight_load_rids.append(req.rid)
+        if cache.pp_size > 1 and req.kv is not None and req.kv.holds_kv:
+            # A later PP chunk already owns a row; the extend allocator reads
+            # its prefix from that row instead of private_load_indices.
+            # Allocation settles the KV watermarks after consuming this row.
+            cache.req_to_token_pool.write(
+                (req.kv.req_pool_idx, slice(device_hit_len, prefix_len)),
+                full_transfer.device_indices,
+            )
         # The tail comes from the external store, not a host tier.
         req.host_hit_is_storage = True
         return len(full_transfer.device_indices), req.last_node
@@ -911,56 +1108,60 @@ class UnifiedCacheLinkerWrapper:
         self.inflight_load_index = self.cache_linker.start_layer_wise_loading()
         return self.inflight_load_index
 
-    def finish_loads(self) -> list[str]:
-        """Wait for the loads of the batch that just ran; return the rids whose
-        KV did not land, identically on every rank.
+    def finish_loads(self, reqs: list[Req] | None = None) -> list[str]:
+        """Wait for local writes and agree on failed rows within this stage.
 
-        Runs after that batch's forward, so no slot it wrote to has been freed
-        or inserted yet. Every rank holds the same ``inflight_load_rids``
-        because ``match`` reduces the hit across ranks, so either all ranks or
-        none enter the reduction. The verdict is reduced because an MLA dedup
-        peer only receives the broadcast and never sees the source's error.
+        A PP stage can satisfy the same ticket from L1, or its backend can
+        refuse to queue a row. All attention ranks vote in forward row order
+        for a PP load, including ranks which had no I/O for that batch.
         """
         rids, self.inflight_load_rids = self.inflight_load_rids, []
-        if not rids:
+        if reqs is None and not rids:
             return []
         index, self.inflight_load_index = self.inflight_load_index, -1
-        start = time.perf_counter()
-        landed = torch.tensor(
-            [int(self.cache_linker.finish_layer_wise_loading(index))],
-            dtype=torch.int,
-        )
-        finish_wait = time.perf_counter() - start
-        counter = self.cache_linker.layer_done_counter
-        forward_wait = (
-            counter.pop_blocked_seconds(index)
-            if isinstance(counter, LayerWiseLoadCounter)
-            else None
-        )
-        if self.metrics is not None:
-            self.metrics.observe_linker_load_waits(forward_wait, finish_wait)
+        failed = set(rids) & self.rejected_pp_loads
+        self.rejected_pp_loads.difference_update(failed)
+        if index >= 0:
+            start = time.perf_counter()
+            if not self.cache_linker.finish_layer_wise_loading(index):
+                failed.update(rids)
+            finish_wait = time.perf_counter() - start
+            counter = self.cache_linker.layer_done_counter
+            forward_wait = (
+                counter.pop_blocked_seconds(index)
+                if isinstance(counter, LayerWiseLoadCounter)
+                else None
+            )
+            if self.metrics is not None:
+                self.metrics.observe_linker_load_waits(forward_wait, finish_wait)
+        rows = rids if reqs is None else [req.rid for req in reqs]
+        landed = torch.tensor([rid not in failed for rid in rows], dtype=torch.int)
         self.cache._all_reduce_attn_groups(landed, torch.distributed.ReduceOp.MIN)
+        failures = [rid for rid, ok in zip(rows, landed.tolist()) if not ok]
+        failed = set(failures)
         loaded_tokens = 0
         for rid in rids:
             indices = self.private_load_indices.pop(rid, None)
-            if self.metrics is not None and indices is not None:
+            if self.metrics is not None and indices is not None and rid not in failed:
                 loaded_tokens += len(indices)
-        if landed.item():
-            if self.metrics is not None:
-                self.metrics.increment_linker_load_tokens(loaded_tokens, "layer_wise")
-            return []
-        logger.error(
-            "External linker load failed; aborting %d request(s): %s", len(rids), rids
-        )
         if self.metrics is not None:
-            self.metrics.increment_linker_failures("load", len(rids))
-        return rids
+            if loaded_tokens:
+                self.metrics.increment_linker_load_tokens(loaded_tokens, "layer_wise")
+            if failures:
+                self.metrics.increment_linker_failures("load", len(failures))
+        if failures:
+            logger.error("External linker load failed for %s", failures)
+        return failures
 
     # ---- lifecycle ----
 
     def reset(self) -> None:
+        if self.pp_tickets is not None:
+            self.pp_tickets.close()
         self.cache_linker.reset()
         self._clear_state()
+        if self.pp_tickets is not None:
+            self.pp_tickets = _LinkerPPTickets(self)
 
     def _clear_state(self) -> None:
         for request, state in list(self.prefetches.items()):
@@ -968,6 +1169,7 @@ class UnifiedCacheLinkerWrapper:
             self._finish_prefetch(request, publish=False)
         self.hit_markers.clear()
         self.inflight_load_rids.clear()
+        self.rejected_pp_loads.clear()
         self.private_load_indices.clear()
         self.inflight_load_index = -1
         for pending in self.pending_offloads:
@@ -982,13 +1184,437 @@ class UnifiedCacheLinkerWrapper:
     def release_request(self, request: CacheRequestHandle) -> None:
         rid = request.rid
         self.hit_markers.pop(rid, None)
-        self._cancel_prefetch(request, reason="released")
+        if self.pp_tickets is not None:
+            self.pp_tickets.release(request)
+        else:
+            self._cancel_prefetch(request, reason="released")
         # A queued load targets slots the request owns and is about to free.
         # A started one is finished by finish_loads before anything is freed.
-        if rid in self.inflight_load_rids and self.cache_linker.cancel_queued_load(rid):
+        if rid in self.inflight_load_rids and (
+            self.cache_linker.cancel_queued_load(rid) or rid in self.rejected_pp_loads
+        ):
+            self.rejected_pp_loads.discard(rid)
             self.inflight_load_rids.remove(rid)
             self.private_load_indices.pop(rid, None)
 
     def close(self) -> None:
+        if self.pp_tickets is not None:
+            self.pp_tickets.close()
         self.cache_linker.close()
         self._clear_state()
+
+
+class _PPTicket(NamedTuple):
+    handle: CacheRequestHandle
+    key: RadixKey
+    start: int
+    last_hash: str | None
+
+
+@dataclass
+class _LocalPPTicket:
+    req: Req | None = None
+    ticket: _PPTicket | None = None
+    pin: tuple[NodeId, DecLockRefParams] | None = None
+    discard: bool = False
+    awaiting_turn: bool = False
+    wait_started: float | None = None
+    # Worker-to-scheduler query bound, scheduler-to-worker reserved capacity,
+    # then the agreed boundary and the actual GET result.
+    hashes: list[str] = field(default_factory=list)
+    lookup: int | None = None
+    capacity: int | None = None
+    end: int | None = None
+    read: Future[bool] | bool | None = None
+    landed: bool | None = None
+
+
+class _LinkerPPTickets:
+    """Agree on storage boundaries off-thread. Only the scheduler owns device rows."""
+
+    def __init__(self, linker: UnifiedCacheLinkerWrapper):
+        from sglang.srt.distributed.parallel_state import create_custom_parallel_group
+
+        self.linker = linker
+        self.cache = cache = linker.cache
+        self.page = cache.page_size
+        self.prefetch = linker.load_mode == "prefetch"
+        self.arrival = threading.Condition()
+        self.pending: dict[CacheRequestHandle, _LocalPPTicket] = {}
+        self.layer_admission: _LocalPPTicket | None = None
+        self.stopping = False
+        self.failure: BaseException | None = None
+        self.commands = SimpleQueue()
+        self.completions = SimpleQueue()
+        self.query_groups = []
+        self.ack_groups = []
+        self.command_thread = self.ack_thread = None
+
+        pp_ranks = dist.get_process_group_ranks(cache.pp_group)
+        attention = [
+            g for g in (cache.attn_cp_group, cache.attn_tp_group) if g is not None
+        ]
+        rank_sets = []
+        for group in attention or [cache.tp_group]:
+            if group is not None:
+                ranks = dist.get_process_group_ranks(group)
+                if len(ranks) > 1 and ranks != pp_ranks and ranks not in rank_sets:
+                    rank_sets.append(ranks)
+        rank_sets.append(pp_ranks)
+        try:
+            for groups in (
+                [self.query_groups, self.ack_groups]
+                if self.prefetch
+                else [self.query_groups]
+            ):
+                for ranks in rank_sets:
+                    groups.append(
+                        create_custom_parallel_group(group_ranks=ranks, backend="gloo")
+                    )
+            if self.prefetch:
+                self.ack_thread = self._start(
+                    self._complete_reads, "linker-pp-completion"
+                )
+            self.command_thread = self._start(self._prepare_tickets, "linker-pp-ticket")
+        except BaseException:
+            self.close()
+            raise
+
+    def _start(self, target, name):
+        def run():
+            try:
+                target()
+            except BaseException as error:
+                self.failure = error
+                logger.exception("%s exited", name)
+
+        thread = threading.Thread(target=run, name=name, daemon=True)
+        thread.start()
+        return thread
+
+    def _register(self, handle, state):
+        with self.arrival:
+            self.pending[handle] = state
+            self.arrival.notify_all()
+
+    def bind(self, req: Req, expected: bool, *, retracted: bool = False) -> bool:
+        handle = req.cache_request_handle
+        if handle in self.pending or (
+            self.layer_admission is not None
+            and self.layer_admission.ticket.handle == handle
+        ):
+            return True
+        req.external_cache_hit_length = 0
+        source = self.cache.pp_rank == 0
+        if not source and not expected:
+            return False
+        ticket, pin = self._local_ticket(req, pin=self.prefetch)
+        if (
+            source
+            and not retracted
+            and (not len(ticket.key) or req.positional_embed_overrides is not None)
+        ):
+            return False
+        self._register(
+            handle, _LocalPPTicket(req, ticket, pin, awaiting_turn=not self.prefetch)
+        )
+        if source:
+            self.commands.put(ticket)
+        return True
+
+    def _local_ticket(self, req: Req, *, pin: bool):
+        req.init_next_round_input(self.cache, cow_mamba=False)
+        key = self.linker._prefetch_key(req)
+        start = req.prefix_len
+        valid = (
+            bool(len(key))
+            and req.positional_embed_overrides is None
+            and not is_virtual_node(req.last_node)
+            and start <= len(key)
+            and start % self.page == 0
+        )
+        prior = self.cache.get_last_hash_value(req.last_node) if valid else None
+        lock = None
+        if pin and valid and (not start or prior):
+            lock = (
+                req.last_node,
+                self.cache.inc_lock_ref(req.last_node).to_dec_params(),
+            )
+        return _PPTicket(req.cache_request_handle, key, start, prior), lock
+
+    def skip_unbound(self, rid: str) -> None:
+        handle = CacheRequestHandle(rid, attempt_id=0)
+        if handle not in self.pending:
+            self._register(handle, _LocalPPTicket(discard=True))
+
+    def _lookup(self, ticket):
+        if ticket.start < len(ticket.key) and (not ticket.start or ticket.last_hash):
+            try:
+                hashes = get_storage_hash_str(
+                    ticket.key[ticket.start :], ticket.last_hash, page_size=self.page
+                )
+                hits = self.linker._lookup_prefetch(ticket.handle.rid, hashes)
+                self.linker._record_lookup(
+                    len(hashes) * self.page, max(hits, default=0) * self.page
+                )
+                return hashes, hits
+            except Exception:
+                logger.exception("PP linker key lookup failed for %s", ticket.handle)
+        return [], []
+
+    def _prepare_tickets(self):
+        command_group = self.query_groups[-1]
+        rank = dist.get_rank()
+        src = dist.get_process_group_ranks(command_group)[0]
+        while True:
+            commands = []
+            if rank == src:
+                try:
+                    commands = [self.commands.get(timeout=60)]
+                except Empty:
+                    pass  # Complete idle broadcasts before the group times out.
+            commands = broadcast_pyobj(commands, rank, command_group, src=src)
+            if not commands:
+                continue
+            ticket = commands[0]
+            if ticket is None:
+                return
+            with self.arrival:
+                arrived = ticket.handle in self.pending or self.stopping
+            # The first query can run before the follower receives its Req.
+            lookup = None if arrived else self._lookup(ticket)
+            with self.arrival:
+                self.arrival.wait_for(
+                    lambda: (
+                        self.stopping
+                        or (
+                            ticket.handle in self.pending
+                            and not self.pending[ticket.handle].awaiting_turn
+                        )
+                    )
+                )
+                state = self.pending.get(ticket.handle)
+            mask = torch.zeros(len(ticket.key) // self.page + 1, dtype=torch.int)
+            if state is not None and state.pin is not None and not self.stopping:
+                local = state.ticket
+                if (
+                    lookup is None
+                    or local.start != ticket.start
+                    or local.last_hash != ticket.last_hash
+                ):
+                    lookup = self._lookup(local)
+                state.hashes, hits = lookup
+                start = local.start // self.page
+                pages = [start] + [start + p for p in hits]
+                state.lookup = max(pages)
+                with self.arrival:
+                    self.arrival.wait_for(
+                        lambda: state.capacity is not None or self.stopping
+                    )
+                if state.capacity is not None:
+                    mask[[p for p in pages if p <= state.capacity]] = 1
+            elif state is not None:
+                state.lookup = 0
+            for group in self.query_groups:
+                dist.all_reduce(mask, op=dist.ReduceOp.MIN, group=group)
+            common = mask.nonzero()
+            end = int(common[-1].item()) * self.page if common.numel() else 0
+            if state is not None:
+                state.end = end
+                if self.prefetch:
+                    self.completions.put((state, end))
+
+    def _complete_reads(self):
+        # This FIFO has independent groups so an unfinished GET does not stop
+        # the next ticket from being queried, reserved, and submitted.
+        while (item := self.completions.get()) is not None:
+            state, end = item
+            landed = False
+            if end:
+                with self.arrival:
+                    self.arrival.wait_for(
+                        lambda: state.read is not None or self.stopping
+                    )
+                read = state.read
+                try:
+                    landed = read.result() if isinstance(read, Future) else read
+                except Exception:
+                    landed = False
+                ack = torch.tensor(int(bool(landed) and not state.discard))
+                for group in self.ack_groups:
+                    dist.all_reduce(ack, op=dist.ReduceOp.MIN, group=group)
+                landed = bool(ack.item())
+            state.landed = landed
+
+    def _reserve(self, state, upper):
+        if state.discard or state.pin is None:
+            return -1
+        ticket = state.ticket
+        start = ticket.start // self.page
+        if upper <= start:
+            return start
+        # PP0 can ask us to reserve before our lookup worker returns.
+        hashes = state.hashes or get_storage_hash_str(
+            ticket.key[ticket.start : upper * self.page],
+            ticket.last_hash,
+            page_size=self.page,
+        )
+        return self.linker.reserve_pp_prefetch(
+            ticket.handle,
+            state.pin[0],
+            ticket.key,
+            ticket.start,
+            hashes[: upper - start],
+        )
+
+    def _ready_word(self, state):
+        if state.capacity is None:
+            value = state.lookup
+        elif state.read is None:
+            value = state.end
+        else:
+            value = state.landed
+        # Followers can poll before their worker records the same collective result.
+        return 0 if value is None else value + 1
+
+    def _keep_waiting(self, state, now):
+        if state.discard:
+            return False
+        if state.wait_started is None or (
+            state.read is not None and state.landed is not None
+        ):
+            return True
+        if self.cache.prefetch_stop_policy == "best_effort":
+            return False
+        pages = (len(state.ticket.key) - state.ticket.start) // self.page
+        budget = (
+            self.cache.prefetch_timeout_base
+            + pages * self.cache.prefetch_timeout_per_page
+        )
+        return now - state.wait_started <= budget
+
+    def poll(self) -> None:
+        if self.failure is not None:
+            raise RuntimeError("PP linker ticket worker failed") from self.failure
+        # A layer-wise reservation is private until admission. The synchronized
+        # ticket verdict gives each stage one scheduling turn to consume it.
+        # A deferred request can recompute; it must not keep other requests out.
+        if self.layer_admission is not None:
+            self.release(self.layer_admission.ticket.handle)
+        if not self.pending:
+            return
+        # Poll in arrival order on every stage, including misses.
+        items = self.pending.items()
+        if not self.prefetch:
+            # Only the head may pin a rank-local L1 prefix against admission.
+            handle, state = next(iter(items))
+            items = [(handle, state)]
+            if state.awaiting_turn:
+                if not state.discard:
+                    state.ticket, state.pin = self._local_ticket(state.req, pin=True)
+                with self.arrival:
+                    state.awaiting_turn = False
+                    self.arrival.notify_all()
+        else:
+            items = list(items)
+        now = time.perf_counter()
+        ready = torch.tensor(
+            [(self._ready_word(s), self._keep_waiting(s, now)) for _, s in items],
+            dtype=torch.int,
+        )
+        self.cache._all_reduce(ready, torch.distributed.ReduceOp.MIN)
+        for (flag, keep), (handle, state) in zip(ready.tolist(), items):
+            if not keep and not state.discard:
+                self.release(handle, reason="stopped")
+            if not flag:
+                continue
+            if state.capacity is None:
+                capacity = self._reserve(state, flag - 1)
+                with self.arrival:
+                    state.capacity = capacity
+                    state.hashes = []
+                    self.arrival.notify_all()
+            elif self.prefetch and state.read is None:
+                end = flag - 1
+                read = self.linker.submit_pp_prefetch(
+                    handle, 0 if state.discard else end
+                )
+                local = state.pin is not None and state.ticket.start == end
+                with self.arrival:
+                    state.read = read or (local and not state.discard)
+                    self.arrival.notify_all()
+            else:
+                if self.prefetch:
+                    self.linker._finish_prefetch(
+                        handle, publish=bool(flag - 1) and not state.discard
+                    )
+                else:
+                    end = 0 if state.discard else flag - 1
+                    if end:
+                        state.req.external_cache_hit_length = end
+                        state.req.pp_linker_verdict_end = end
+                        self.layer_admission = state
+                    self.linker._trim_pp_reservation(handle, end)
+                if state.pin is not None and state is not self.layer_admission:
+                    self.cache.dec_lock_ref(*state.pin)
+                with self.arrival:
+                    del self.pending[handle]
+
+    def can_admit(self, handle: CacheRequestHandle) -> bool:
+        state = self.pending.get(handle)
+        if state is None or state.discard:
+            return True
+        if (
+            self.cache.pp_rank == 0
+            and self.prefetch
+            and self.cache.prefetch_stop_policy != "wait_complete"
+            and state.wait_started is None
+        ):
+            state.wait_started = time.perf_counter()
+        return False
+
+    def release(self, handle: CacheRequestHandle, reason: str = "released") -> None:
+        state = self.pending.get(handle)
+        if state is not None:
+            state.discard = True
+            self.linker._cancel_prefetch(handle, reason=reason)
+        ready = self.layer_admission
+        if ready is not None and ready.ticket.handle == handle:
+            if ready.req.cache_request_handle == handle:
+                ready.req.external_cache_hit_length = 0
+                self.linker.hit_markers.pop(handle.rid, None)
+            self.linker._finish_prefetch(handle, publish=False)
+            self.cache.dec_lock_ref(*ready.pin)
+            self.layer_admission = None
+
+    def close(self) -> None:
+        with self.arrival:
+            if self.stopping:
+                return
+            self.stopping = True
+            self.arrival.notify_all()
+        if self.cache.pp_rank == 0:
+            self.commands.put(None)
+        # The producer enqueues the last ACK before the completion worker stops.
+        if self.command_thread is not None:
+            self.command_thread.join()
+        if self.ack_thread is not None:
+            self.completions.put(None)
+            self.ack_thread.join()
+        for groups in (self.ack_groups, self.query_groups):
+            for group in reversed(groups):
+                dist.destroy_process_group(group)
+        for state in self.pending.values():
+            if self.failure is not None and isinstance(state.read, Future):
+                # A failed ACK worker may have left later GETs in flight.
+                try:
+                    state.read.result()
+                except Exception:
+                    pass
+            if state.pin is not None:
+                self.cache.dec_lock_ref(*state.pin)
+        if self.layer_admission is not None:
+            self.release(self.layer_admission.ticket.handle)
+        self.pending.clear()
+        if self.failure is not None:
+            raise RuntimeError("PP linker ticket worker failed") from self.failure
