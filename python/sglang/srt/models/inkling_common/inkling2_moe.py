@@ -56,13 +56,17 @@ from sglang.kernels.ops.moe.inkling_moe import (
     pre_reorder,
 )
 from sglang.srt.environ import envs
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.quantization.inkling2 import Inkling2QuantConfig
 from sglang.srt.layers.quantization.utils import swizzle_blockscale
 from sglang.srt.layers.utils.common import set_weight_attrs
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.inkling_common.moe import renorm_topk_logits_scaled
 from sglang.srt.runtime_context import (
     cutedsl_moe_max_num_tokens,
+    get_exec,
     get_parallel,
     get_platform,
 )
@@ -97,10 +101,12 @@ class RoutedOutput(NamedTuple):
 
 
 class Inkling2Gate(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, placement=None):
         super().__init__()
         self.topk = config.num_experts_per_tok
         self.route_scale = config.route_scale
+        # Router rows load in physical-slot order, so the ids it picks are physical.
+        self.placement = placement
         self.weight = nn.Parameter(
             torch.empty(config.n_routed_experts, config.hidden_size),
             requires_grad=False,
@@ -113,9 +119,17 @@ class Inkling2Gate(nn.Module):
             if config.use_gate_bias
             else None
         )
+        for param in (self.weight, self.bias):
+            if param is not None:
+                set_weight_attrs(param, {"weight_loader": self._load_routed})
         self.register_buffer(
             "_one", torch.ones((), dtype=torch.float32), persistent=False
         )
+
+    def _load_routed(self, param, loaded):
+        if self.placement is not None:
+            loaded = loaded.index_select(0, self.placement.to(loaded.device))
+        default_weight_loader(param, loaded)
 
     def forward(self, x):
         if uses_k_groups(x, self.weight):
@@ -135,7 +149,9 @@ class Inkling2Gate(nn.Module):
 
 
 class Inkling2Experts(nn.Module):
-    def __init__(self, config, num_experts, checkpoint_prefix, quant_config):
+    def __init__(
+        self, config, num_experts, checkpoint_prefix, quant_config, placement=None
+    ):
         super().__init__()
         parallel = get_parallel()
         self.tp_rank, self.tp_size = parallel.moe_tp_rank, parallel.moe_tp_size
@@ -145,6 +161,15 @@ class Inkling2Experts(nn.Module):
         if num_experts % self.ep_size:
             raise ValueError("The expert count must be divisible by expert parallelism")
         num_experts //= self.ep_size
+        # Checkpoint experts held in this rank's slots, in slot order; None keeps
+        # the contiguous range the ids-minus-start routing kernels expect.
+        self.local_logical_experts = (
+            None
+            if placement is None
+            else placement[
+                self.ep_rank * num_experts : (self.ep_rank + 1) * num_experts
+            ]
+        )
         if config.intermediate_size % self.tp_size:
             raise ValueError(
                 "Expert intermediate size must be divisible by tensor parallelism"
@@ -297,12 +322,17 @@ class Inkling2Experts(nn.Module):
                 f"Expert tensor dtype mismatch: {loaded.dtype} != {param.dtype}"
             )
         if expert_axis:
-            loaded = loaded.chunk(self.ep_size, dim=0)[self.ep_rank]
+            loaded = self._local_experts(loaded)
         target.copy_(
             loaded if dim is None else loaded.chunk(self.tp_size, dim=dim)[self.tp_rank]
         )
         if swizzled:
             param.data.copy_(swizzle_blockscale(target).flatten(1))
+
+    def _local_experts(self, loaded):
+        if self.local_logical_experts is None:
+            return loaded.chunk(self.ep_size, dim=0)[self.ep_rank]
+        return loaded.index_select(0, self.local_logical_experts.to(loaded.device))
 
     def _mega_covers(self, low, high):
         return self.mega is not None and (low > high or self.mega.min_tokens <= low)
@@ -977,6 +1007,30 @@ def domain_paged_empty(shape, dtype):
     return out.view(dtype).view(shape)
 
 
+def _expert_placement(layer_id, num_experts):
+    """The checkpoint expert in each physical slot of this layer (from
+    --init-expert-location), or None for checkpoint order."""
+    moe = get_exec().moe
+    # One weight slot per checkpoint expert; replicas or online moves would need
+    # the routing kernels to map ids at run time.
+    if moe.enable_eplb or moe.ep_num_redundant_experts:
+        raise ValueError(
+            "Inkling2 supports initial expert placement without online EPLB "
+            "or redundant experts."
+        )
+    metadata = get_global_expert_location_metadata()
+    if metadata is None:
+        return None
+    placement = metadata.physical_to_logical_map_cpu[layer_id]
+    order = torch.arange(num_experts, dtype=placement.dtype)
+    if not torch.equal(placement.sort().values, order):
+        raise ValueError(
+            f"Layer {layer_id} expert placement must hold each of its "
+            f"{num_experts} experts exactly once."
+        )
+    return None if torch.equal(placement, order) else placement
+
+
 class Inkling2MoE(nn.Module):
     def __init__(
         self, config, layer_id, prefix, quant_config: Inkling2QuantConfig | None
@@ -987,10 +1041,15 @@ class Inkling2MoE(nn.Module):
             parallel.moe_ep_size > 1 and parallel.moe_tp_size > 1
         ):
             raise ValueError("Inkling2 experts support tensor or expert parallelism")
-        self.gate = Inkling2Gate(config)
+        placement = _expert_placement(layer_id, config.n_routed_experts)
+        self.gate = Inkling2Gate(config, placement=placement)
         checkpoint_prefix = "model." + prefix + ".experts."
         self.experts = Inkling2Experts(
-            config, config.n_routed_experts, checkpoint_prefix, quant_config
+            config,
+            config.n_routed_experts,
+            checkpoint_prefix,
+            quant_config,
+            placement=placement,
         )
 
     def local_input_rows(self, tokens, combine):
@@ -1005,6 +1064,7 @@ class Inkling2MoE(nn.Module):
         if x.shape[0] == 0:
             return x
         weights, ids = self.gate(x)
+        get_global_expert_distribution_recorder().on_select_experts(topk_ids=ids)
         if total_tokens is not None:
             return self.experts._forward_mega(
                 x, weights, ids, combine, tokens=total_tokens

@@ -207,6 +207,9 @@ def test_precision_file_is_detected_without_launch_flag(
     assert loaded.quantizes_input("model.llm.layers.0.mlp.experts.w13_weight")
 
 
+_GATE = "model.llm.layers.0.mlp.gate."
+
+
 def _target(
     monkeypatch,
     tp_size=1,
@@ -214,6 +217,7 @@ def _target(
     precision=("mxfp8", "mxfp8"),
     ep_size=1,
     ep_rank=0,
+    placement=None,
 ):
     monkeypatch.setattr(
         moe,
@@ -227,16 +231,14 @@ def _target(
     )
     monkeypatch.setattr(moe.Inkling2Experts, "prepare_routed_exchange", lambda _: None)
     names = [f"model.llm.layers.0.mlp.experts.{name}_weight" for name in ("w13", "w2")]
+    groups = [precision_group(precision[i % 2], [name]) for i, name in enumerate(names)]
+    if placement is not None:
+        groups += [
+            precision_group("bfloat16", [_GATE + "weight"]),
+            precision_group("float32", [_GATE + "bias"]),
+        ]
     precision = Inkling2QuantConfig(
-        dict(
-            quant_method="inkling2",
-            model=dict(
-                parameter_groups=[
-                    precision_group(precision[i % 2], [name])
-                    for i, name in enumerate(names)
-                ]
-            ),
-        )
+        dict(quant_method="inkling2", model=dict(parameter_groups=groups))
     )
     config = SimpleNamespace(
         intermediate_size=128,
@@ -245,6 +247,8 @@ def _target(
         mlp_up_softcap=0,
         num_experts_per_tok=2,
         route_scale=8.0,
+        n_routed_experts=4,
+        use_gate_bias=True,
     )
     target = Inkling2ForConditionalGeneration.__new__(Inkling2ForConditionalGeneration)
     nn.Module.__init__(target)
@@ -255,8 +259,10 @@ def _target(
     target.llm.layers = nn.ModuleList([layer])
     with set_default_torch_dtype(torch.bfloat16):
         layer.mlp.experts = moe.Inkling2Experts(
-            config, 4, "model.llm.layers.0.mlp.experts.", precision
+            config, 4, "model.llm.layers.0.mlp.experts.", precision, placement
         )
+        if placement is not None:
+            layer.mlp.gate = moe.Inkling2Gate(config, placement)
     return target
 
 
@@ -370,6 +376,107 @@ def logits_runtime(monkeypatch):
             deterministic=SimpleNamespace(rl_on_policy_target=None),
         ),
     )
+
+
+@pytest.mark.parametrize("precision", [("mxfp8", "mxfp8"), ("nvfp4", "nvfp4")])
+@pytest.mark.parametrize("ep_size", [1, 2, 4])
+def test_placed_checkpoint_keeps_router_rows_with_their_experts(
+    monkeypatch, precision, ep_size
+):
+    """An initial expert placement permutes the router rows and the expert slots
+    together: the router's column for a physical slot scores the expert loaded there."""
+    placement = torch.tensor([2, 0, 3, 1])
+    local = 4 // ep_size
+    for rank in range(ep_size):
+        target = _target(
+            monkeypatch,
+            ep_size=ep_size,
+            ep_rank=rank,
+            precision=precision,
+            placement=placement,
+        )
+        generator = torch.Generator().manual_seed(7)
+        weights = _weights(target) | {
+            _GATE + "weight": torch.randn(4, 64, generator=generator).bfloat16(),
+            _GATE + "bias": torch.randn(4, generator=generator),
+        }
+        loaded = target.load_weights(sorted(load(save(weights)).items()))
+        assert loaded == set(dict(target.named_parameters()))
+        mlp = target.llm.layers[0].mlp
+        for slot in range(local):
+            physical = rank * local + slot
+            expert = int(placement[physical])
+            for leaf in ("weight", "bias"):
+                assert torch.equal(
+                    getattr(mlp.gate, leaf)[physical], weights[_GATE + leaf][expert]
+                )
+            for name, value in weights.items():
+                leaf = name.rsplit(".", 1)[1].replace("_weight_", "_")
+                if name.startswith(_GATE) or leaf.endswith("outer_scale_denominator"):
+                    continue
+                assert torch.equal(
+                    getattr(mlp.experts, leaf)[slot : slot + 1].view(torch.uint8),
+                    value[expert : expert + 1].contiguous().view(torch.uint8),
+                )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+@pytest.mark.parametrize("tokens", [1, 64, 4099])
+def test_placed_router_picks_the_same_experts(tokens):
+    """Router rows in physical-slot order give the same logits bit for bit, so a
+    placement changes only which slot each chosen expert sits in."""
+    config = Inkling2ModelConfig()
+    generator = torch.Generator().manual_seed(11)
+    weight = torch.randn(384, config.hidden_size, generator=generator).bfloat16()
+    bias = torch.randn(384, generator=generator) / 8
+    placement = torch.randperm(384, generator=generator)
+    x = torch.randn(tokens, config.hidden_size, generator=generator).bfloat16()
+    outputs = []
+    with torch.device("cuda"), set_default_torch_dtype(torch.bfloat16):
+        for order in (None, placement):
+            gate = moe.Inkling2Gate(config, order)
+            gate.weight.weight_loader(gate.weight, weight)
+            gate.bias.weight_loader(gate.bias, bias)
+            outputs.append(gate(x.cuda()))
+    (weights, ids), (placed_weights, placed_ids) = outputs
+    assert torch.equal(placement.cuda()[placed_ids.long()], ids.long())
+    assert torch.equal(placed_weights, weights)
+
+
+def test_expert_placement_hook_and_rejections(monkeypatch):
+    config = SimpleNamespace(text_config=Inkling2ModelConfig())
+    location = Inkling2ForConditionalGeneration.get_model_config_for_expert_location(
+        config
+    )
+    assert (location.num_layers, location.num_logical_experts) == (48, 384)
+
+    def runtime(physical_to_logical, online=False, redundant=0):
+        monkeypatch.setattr(
+            moe,
+            "get_exec",
+            lambda: SimpleNamespace(
+                moe=SimpleNamespace(
+                    enable_eplb=online, ep_num_redundant_experts=redundant
+                )
+            ),
+        )
+        monkeypatch.setattr(
+            moe,
+            "get_global_expert_location_metadata",
+            lambda: SimpleNamespace(
+                physical_to_logical_map_cpu=torch.tensor([physical_to_logical])
+            ),
+        )
+
+    runtime([0, 1, 2, 3])
+    assert moe._expert_placement(0, 4) is None
+    for online, redundant in [(True, 0), (False, 4)]:
+        runtime([0, 1, 2, 3], online, redundant)
+        with pytest.raises(ValueError, match="without online EPLB"):
+            moe._expert_placement(0, 4)
+    runtime([0, 0, 2, 3])
+    with pytest.raises(ValueError, match="exactly once"):
+        moe._expert_placement(0, 4)
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
