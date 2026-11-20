@@ -208,7 +208,7 @@ jobs:
   sgl-router-e2e:
     name: e2e
     needs: [sgl-router-test, sgl-router-build]
-    runs-on: 2-gpu-h100
+    runs-on: 4-gpu-h100  # the PD dp-aware test holds a dp2 prefill and a dp2 decode
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
