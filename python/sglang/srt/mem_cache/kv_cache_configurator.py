@@ -2194,6 +2194,12 @@ class KVCacheConfigurator:
                         self.layer_info.end_layer,
                     )
                 )
+            elif not self.is_draft_worker and self.layer_info.layer_ids is not None:
+                # Contiguous PP keeps the existing constructor call unchanged.
+                if self.layer_info.layer_ids != tuple(
+                    range(self.layer_info.start_layer, self.layer_info.end_layer)
+                ):
+                    kv_layout_kwargs["layer_ids"] = self.layer_info.layer_ids
 
         unified_fp8 = unified_fp8_for_dsv4_pool(
             is_draft_worker=self.is_draft_worker,

@@ -243,6 +243,14 @@ def _dsv4_pool(pool_type, **fields):
 
 class TestHybridDevicePoolAssembler(CustomTestCase):
     def test_deepseek_v4_maps_sparse_sidecars(self):
+        self._assert_deepseek_v4_maps_sparse_sidecars((1, 2, 3))
+
+    def test_interleaved_owners_use_dense_transfer_ids_for_all_sidecars(self):
+        """SWA, compressed KV and compressor state must agree on a dense
+        transfer id even when a later local layer has a distant global id."""
+        self._assert_deepseek_v4_maps_sparse_sidecars((1, 4, 5))
+
+    def _assert_deepseek_v4_maps_sparse_sidecars(self, stage_layer_ids):
         from sglang.srt.mem_cache.deepseek_v4_compress_state import (
             CompressStatePool,
             KVAndScore,
@@ -261,11 +269,15 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
 
         kvcache = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)
         kvcache._unified_kv = False
-        kvcache.start_layer = 1
-        kvcache.end_layer = 4
-        kvcache._stage_start = 1
-        kvcache._stage_end = 4
-        kvcache.stage_layer_ids = (1, 2, 3)
+        kvcache.start_layer = stage_layer_ids[0]
+        kvcache.end_layer = stage_layer_ids[-1] + 1
+        kvcache._stage_start = kvcache.start_layer
+        kvcache._stage_end = kvcache.end_layer
+        kvcache.stage_layer_ids = stage_layer_ids
+        if stage_layer_ids != tuple(range(kvcache.start_layer, kvcache.end_layer)):
+            kvcache._stage_layer_mapping = {
+                layer: local for local, layer in enumerate(stage_layer_ids)
+            }
         kvcache.swa_page_size = 2
         kvcache.swa_kv_pool = _dsv4_pool(
             DeepSeekV4SingleKVPool,
@@ -291,14 +303,13 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
             kv_buffer=[torch.zeros((8, 11), dtype=torch.uint8)],
             bytes_per_page_padded=11,
         )
-        kvcache.compress_state_pools = [None, state_pool(), None, state_pool()]
-        kvcache.indexer_compress_state_pools = [
-            None,
-            state_pool(),
-            None,
-            state_pool(),
-        ]
-        kvcache.sources_by_ratio = {4: [1, 3], 128: [2]}
+        c4_layers = (stage_layer_ids[0], stage_layer_ids[2])
+        kvcache.compress_state_pools = [None] * kvcache.end_layer
+        kvcache.indexer_compress_state_pools = [None] * kvcache.end_layer
+        for layer in c4_layers:
+            kvcache.compress_state_pools[layer] = state_pool()
+            kvcache.indexer_compress_state_pools[layer] = state_pool()
+        kvcache.sources_by_ratio = {4: list(c4_layers), 128: [stage_layer_ids[1]]}
         kvcache.index_pools = {4: kvcache.c4_indexer_kv_pool}
         draft_swa_buffers = [
             torch.zeros((8, 13), dtype=torch.uint8),
@@ -360,7 +371,7 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
                 pointers,
                 [
                     pools[layer].kv_score_buffer.kv_score.data_ptr() + 32
-                    for layer in (1, 3)
+                    for layer in c4_layers
                 ],
             )
             with self.assertRaisesRegex(ValueError, "exceeds buffer shapes"):

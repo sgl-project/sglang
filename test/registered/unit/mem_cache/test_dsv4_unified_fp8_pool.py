@@ -1,6 +1,6 @@
 import contextlib
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -115,6 +115,7 @@ class _StubTokenToKVPool:
 
     compressed_buffer_info = DeepSeekV4TokenToKVPool.compressed_buffer_info
     _unified_page_views = DeepSeekV4TokenToKVPool._unified_page_views
+    _owned_layer_ids = DeepSeekV4TokenToKVPool._owned_layer_ids
     unified_region_buffers = DeepSeekV4TokenToKVPool.unified_region_buffers
     unified_rope_region_buffers = DeepSeekV4TokenToKVPool.unified_rope_region_buffers
 
@@ -174,6 +175,56 @@ class TestDSV4UnifiedRegionBuffers(CustomTestCase):
             self.assertEqual(len(views), num_layers)
             self.assertEqual(item_bytes, rows_per_page * (NOPE_DIM + ROPE_DIM) * 2)
             self.assertIsNone(stub.unified_rope_region_buffers(ratio))
+
+    def test_interleaved_owners_preserve_unified_nope_and_rope_buffer_order(self):
+        """Global holes must not add phantom buffers to either PD/HiCache
+        region or change which local buffer belongs to a compression ratio."""
+        pool, stub = self._stub(fp8=True)
+        stub.compression_ratios = [4, 128, 128, 4, 4, 128]
+        stub._stage_end = 6
+        stub.stage_layer_ids = (0, 4, 5)
+        wrapper = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)
+        wrapper.compression_ratios = stub.compression_ratios
+        wrapper._stage_start = wrapper.start_layer = 0
+        wrapper._stage_end = 6
+        wrapper._set_stage_layer_ids(stub.stage_layer_ids, 3, ())
+        wrapper.unified_kv_pool = pool
+        wrapper._unified_kv = wrapper._unified_kv_fp8 = True
+        wrapper.page_size = self.PAGE_SIZE
+        wrapper.kv_pools = {4: None, 128: None}
+        wrapper.index_pools = {}
+        counter = Mock()
+        wrapper.register_layer_transfer_counter(counter)
+        for local, layer in enumerate(stub.stage_layer_ids):
+            self.assertIs(wrapper.get_unified_kv(layer), pool.kv_buffer[local])
+            self.assertIs(
+                wrapper.get_unified_kv_rope(layer), pool.kv_buffer_rope[local]
+            )
+            counter.wait_until.assert_called_with(local)
+        export_ptrs, _, _ = wrapper.get_contiguous_buf_infos()
+        self.assertEqual(
+            export_ptrs,
+            [
+                buffers[local][pool.swa_pages].data_ptr()
+                for local_ids in ((0, 1), (2,))
+                for buffers in (pool.kv_buffer, pool.kv_buffer_rope)
+                for local in local_ids
+            ],
+        )
+        for ratio, local_ids in ((4, (0, 1)), (128, (2,))):
+            for buffers, region in (
+                (pool.kv_buffer, stub.unified_region_buffers(ratio)),
+                (pool.kv_buffer_rope, stub.unified_rope_region_buffers(ratio)),
+            ):
+                views, _ = region
+                self.assertEqual(len(views), len(local_ids))
+                for view, local_id in zip(views, local_ids):
+                    buf = buffers[local_id]
+                    self.assertEqual(
+                        view.data_ptr(),
+                        buf.data_ptr()
+                        + pool.swa_pages * buf.shape[1] * buf.element_size(),
+                    )
 
     def test_fp8_pairs_a_rope_region_with_the_nope_one(self):
         _, stub = self._stub(fp8=True)

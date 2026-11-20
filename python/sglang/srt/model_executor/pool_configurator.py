@@ -1283,13 +1283,20 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             _is_hip and get_exec().kernel.enable_deepseek_v4_fp4_indexer,
         )
         self.context_len = kvc.model_config.context_len
-        # PP-local slice; matches DeepSeekV4TokenToKVPool's stage_ratios.
+        # Matches the pool's actual ownership, including interleaved VPP stages.
         stage = range(kvc.layer_info.start_layer, kvc.layer_info.end_layer)
-        self.stage_compress_ratios = cfg.compress_ratios[stage.start : stage.stop]
+        layer_ids = getattr(kvc.layer_info, "layer_ids", None)
+        if (
+            layer_ids is not None
+            and not _is_npu
+            and not getattr(cfg, "mla_layer_ids", None)
+        ):
+            stage = layer_ids
+        self.stage_compress_ratios = [cfg.compress_ratios[idx] for idx in stage]
         if kvc.pp_size > 1:
             logger.info(
-                f"DSV4 pool PP slice: rank={kvc.pp_group.rank_in_group} "
-                f"layers=[{stage.start},{stage.stop}) "
+                f"DSV4 pool stage: rank={kvc.pp_group.rank_in_group} "
+                f"layers={tuple(stage)} "
                 f"local={len(self.stage_compress_ratios)}/{len(cfg.compress_ratios)}"
             )
         # Layers of this stage that own compressed storage, per ratio. Same rule

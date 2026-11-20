@@ -293,7 +293,11 @@ def _build_deepseek_v4_device_pool_group(
                 raise ValueError("Packed DSV4 draft requires paged SWA storage")
             draft_swa_buffers.extend(draft_swa.buffer_info.buffers)
         swa_mapping = _with_packed_draft_mapping(
-            _dsv4_transfer_layer_mapping(swa.layer_ids, kvcache.start_layer),
+            _dsv4_transfer_layer_mapping(
+                swa.layer_ids,
+                kvcache.start_layer,
+                stage_layer_mapping=kvcache._stage_layer_mapping,
+            ),
             target_device_layer_num=len(swa_info.buffers),
             draft_layer_num=len(draft_swa_buffers),
         )
@@ -331,7 +335,11 @@ def _build_deepseek_v4_device_pool_group(
                 info.indices_from_pool,
                 pool,
                 info.buffer_info.buffers,
-                _dsv4_transfer_layer_mapping(info.layer_ids, kvcache.start_layer),
+                _dsv4_transfer_layer_mapping(
+                    info.layer_ids,
+                    kvcache.start_layer,
+                    stage_layer_mapping=kvcache._stage_layer_mapping,
+                ),
             )
 
     add_region(PoolName.DEEPSEEK_V4_C4, kvcache.c4_kv_pool)
@@ -369,7 +377,11 @@ def _build_deepseek_v4_device_pool_group(
             state.indices_from_pool,
             pool,
             [info.pages for info in state.buffer_info.states],
-            _dsv4_transfer_layer_mapping(state.layer_ids, kvcache.start_layer),
+            _dsv4_transfer_layer_mapping(
+                state.layer_ids,
+                kvcache.start_layer,
+                stage_layer_mapping=kvcache._stage_layer_mapping,
+            ),
         )
     if swa is None and any(
         entry.indices_from_pool == PoolName.SWA for entry in entries

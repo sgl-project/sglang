@@ -2188,7 +2188,15 @@ class TestDSV4LowRatioBudget(CustomTestCase):
 
     @contextlib.contextmanager
     def _planner(
-        self, layout, option, page_size, index_page_size, ratios, sources, stage=None
+        self,
+        layout,
+        option,
+        page_size,
+        index_page_size,
+        ratios,
+        sources,
+        stage=None,
+        layer_ids=None,
     ):
         from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
         from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
@@ -2223,6 +2231,8 @@ class TestDSV4LowRatioBudget(CustomTestCase):
         if stage is not None:
             mr.layer_info.start_layer, mr.layer_info.end_layer = stage
             mr.pp_size = 2
+        if layer_ids is not None:
+            mr.layer_info.layer_ids = layer_ids
         module = "sglang.srt.mem_cache.deepseek_v4_memory_pool"
         with (
             patch(
@@ -2326,6 +2336,31 @@ class TestDSV4LowRatioBudget(CustomTestCase):
             budget = sum(self._allocated_bytes(planner, 512, "v41", "fp4"))
             self.assertEqual(
                 planner.calculate_pool_sizes(budget, 256).max_total_num_tokens, 512
+            )
+
+    def test_interleaved_budget_matches_allocation_without_charging_holes(self):
+        """The rank owns two separated chunks; layers in the gap must add no
+        per-token charge or fixed state/page padding to its capacity budget."""
+        with self._planner(
+            "v41",
+            "fp4",
+            256,
+            128,
+            [2, 2, 2, 1, 1, 2],
+            [0, 1, 2, 3, 5],
+            stage=(0, 6),
+            layer_ids=(0, 1, 5),
+        ) as planner:
+            self.assertEqual(planner.num_layers_total, 3)
+            self.assertEqual(planner.stage_compress_ratios, [2, 2, 2])
+            self.assertEqual(planner.stage_owner_layers, {2: [0, 1, 5]})
+            budget = sum(self._allocated_bytes(planner, 512, "v41", "fp4"))
+            self.assertEqual(
+                planner.calculate_pool_sizes(budget, 256).max_total_num_tokens, 512
+            )
+            self.assertEqual(
+                planner.calculate_pool_sizes(budget - 1, 256).max_total_num_tokens,
+                256,
             )
 
     def test_no_low_ratio_owners_add_no_padding(self):

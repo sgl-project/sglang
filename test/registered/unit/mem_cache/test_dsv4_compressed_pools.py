@@ -402,6 +402,7 @@ class TestV41KVPoolLayouts(CustomTestCase):
         self.addCleanup(override.restore)
 
     def make_pool(self, ratios, kv_source_layers, kv_layout, compressed=None, **sizes):
+        layer_ids = sizes.get("layer_ids")
         return DeepSeekV4TokenToKVPool(
             max_num_reqs=16,
             swa_size=FULL_SIZE,
@@ -417,7 +418,7 @@ class TestV41KVPoolLayouts(CustomTestCase):
             qk_nope_head_dim=HEAD_DIM - ROPE_DIM,
             qk_rope_head_dim=ROPE_DIM,
             indexer_head_dim=128,
-            layer_num=len(ratios),
+            layer_num=len(layer_ids) if layer_ids is not None else len(ratios),
             start_layer=sizes.get("start_layer"),
             end_layer=sizes.get("end_layer"),
             device="cpu",
@@ -427,7 +428,61 @@ class TestV41KVPoolLayouts(CustomTestCase):
             full_size=FULL_SIZE,
             kv_layout=kv_layout,
             compressed_kv_layout=compressed,
+            **({"layer_ids": layer_ids} if layer_ids is not None else {}),
         )
+
+    def test_interleaved_ownership_aligns_buffers_states_and_transfer_waits(self):
+        """Holes between local stages must allocate no KV/state and must not
+        shift a later stage's buffer or HiCache completion index."""
+        pool = self.make_pool(
+            [128, 4, 4, 128, 4, 128],
+            [],
+            KVLayout.V41,
+            start_layer=1,
+            end_layer=6,
+            layer_ids=(1, 4, 5),
+            c4_size=PAGE_SIZE,
+            c128_size=PAGE_SIZE,
+            c4_state_pool_size=16,
+            c128_state_pool_size=16,
+        )
+        infos = {info.pool_name: info for info in pool.get_device_pool_infos()}
+        swa = infos[PoolName.SWA]
+        self.assertEqual(swa.layer_ids, (1, 4, 5))
+        self.assertEqual(len(swa.buffer_info.buffers), 3)
+        for index, layer in enumerate(swa.layer_ids):
+            self.assertIs(
+                pool.get_swa_raw_buffer(layer), swa.buffer_info.buffers[index]
+            )
+        self.assertEqual(infos[PoolName.DEEPSEEK_V4_C4].layer_ids, (1, 4))
+        self.assertEqual(infos[PoolName.DEEPSEEK_V4_C128].layer_ids, (5,))
+        self.assertEqual(pool.layer_mapping[4].compress_layer_id, 1)
+        self.assertEqual(pool.layer_mapping[5].compress_layer_id, 0)
+        for layer in (0, 2, 3):
+            self.assertIsNone(pool.layer_mapping[layer])
+            self.assertIsNone(pool.compress_state_pools[layer])
+            self.assertIsNone(pool.indexer_compress_state_pools[layer])
+        states = infos[PoolName.DEEPSEEK_V4_C4_STATE].buffer_info.states
+        for index, layer in enumerate((1, 4)):
+            self.assertEqual(
+                states[index].pages.data_ptr(),
+                pool.compress_state_pools[layer].kv_score_buffer.kv_score.data_ptr(),
+            )
+        counter = MagicMock()
+        pool.register_layer_transfer_counter(counter)
+        pool.get_swa_key_buffer_radix(5)
+        counter.wait_until.assert_called_with(2)
+        with self.assertRaises(KeyError):
+            pool.get_swa_raw_buffer(3)
+
+    def test_explicit_ownership_rejects_invalid_ids_and_remote_shared_sources(self):
+        """A reused ratio-2 layer must read its nearest global source; skipping
+        that source cannot silently bind it to an older locally owned source."""
+        for ids in ((0, 0), (2, 0), (-1, 0), (0, 3), (0, True)):
+            with self.subTest(ids=ids), self.assertRaisesRegex(ValueError, "layer_ids"):
+                self.make_pool([4, 4, 4], [], KVLayout.V41, layer_ids=ids)
+        with self.assertRaisesRegex(ValueError, "layer 2 requires a local"):
+            self.make_pool([2, 2, 2], [0, 1], KVLayout.V41, layer_ids=(0, 2))
 
     def assert_kernel_requirements(self, pool, layout):
         """Pages start on the kernel's alignment, and its

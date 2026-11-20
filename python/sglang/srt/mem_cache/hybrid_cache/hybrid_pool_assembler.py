@@ -116,8 +116,15 @@ def _stage_local_layer_mapping(
 
 
 def _dsv4_transfer_layer_mapping(
-    layer_ids: tuple[int, ...], start_layer: int
+    layer_ids: tuple[int, ...],
+    start_layer: int,
+    *,
+    stage_layer_mapping: dict[int, int] | None = None,
 ) -> dict[int, int]:
+    if stage_layer_mapping is not None:
+        return {
+            stage_layer_mapping[layer]: index for index, layer in enumerate(layer_ids)
+        }
     return {layer - start_layer: index for index, layer in enumerate(layer_ids)}
 
 
@@ -631,7 +638,11 @@ def _dsv4_low_ratio_regions(
         slots_per_page = page_size // ratio
         assert slots_per_page % key.page_slots == 0
         index_pages_per_full_page = slots_per_page // key.page_slots
-        layer_mapping = _dsv4_transfer_layer_mapping(kv.layer_ids, kvcache.start_layer)
+        layer_mapping = _dsv4_transfer_layer_mapping(
+            kv.layer_ids,
+            kvcache.start_layer,
+            stage_layer_mapping=kvcache._stage_layer_mapping,
+        )
         regions.append(
             (
                 names[0],
@@ -804,7 +815,9 @@ def build_deepseek_v4_hicache_stack(
     infos = _dsv4_pool_infos(kvcache)
     transfer_layer_id_max = len(kvcache.stage_layer_ids)
     full_layer_mapping = _dsv4_transfer_layer_mapping(
-        kvcache.stage_layer_ids, kvcache.start_layer
+        kvcache.stage_layer_ids,
+        kvcache.start_layer,
+        stage_layer_mapping=kvcache._stage_layer_mapping,
     )
     swa = infos.get(PoolName.SWA)
     swa_info = swa.buffer_info if swa is not None else None
@@ -831,7 +844,11 @@ def build_deepseek_v4_hicache_stack(
             mtp_swa_device_buffers.extend(draft_swa.buffer_info.buffers)
         # Map the SWA layers alone; the MLA layers own no SWA buffer.
         swa_layer_mapping = with_packed_draft_layer_mapping(
-            _dsv4_transfer_layer_mapping(swa.layer_ids, kvcache.start_layer),
+            _dsv4_transfer_layer_mapping(
+                swa.layer_ids,
+                kvcache.start_layer,
+                stage_layer_mapping=kvcache._stage_layer_mapping,
+            ),
             transfer_layer_start=transfer_layer_id_max,
             target_device_layer_num=len(swa.layer_ids),
             draft_layer_num=len(mtp_swa_device_buffers),
@@ -840,10 +857,14 @@ def build_deepseek_v4_hicache_stack(
     c4 = infos.get(PoolName.DEEPSEEK_V4_C4)
     c128 = infos.get(PoolName.DEEPSEEK_V4_C128)
     c4_layer_mapping = _dsv4_transfer_layer_mapping(
-        c4.layer_ids if c4 is not None else (), kvcache.start_layer
+        c4.layer_ids if c4 is not None else (),
+        kvcache.start_layer,
+        stage_layer_mapping=kvcache._stage_layer_mapping,
     )
     c128_layer_mapping = _dsv4_transfer_layer_mapping(
-        c128.layer_ids if c128 is not None else (), kvcache.start_layer
+        c128.layer_ids if c128 is not None else (),
+        kvcache.start_layer,
+        stage_layer_mapping=kvcache._stage_layer_mapping,
     )
     (
         num_host_pages,

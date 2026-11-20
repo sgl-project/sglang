@@ -103,7 +103,9 @@ def resolve_compress_state_ring_size(compress_ratio: int) -> int:
 
 
 def collect_sources_by_ratio(
-    compression_ratios: Sequence[int], kv_source_layers: Sequence[int], stage: range
+    compression_ratios: Sequence[int],
+    kv_source_layers: Sequence[int],
+    stage: Sequence[int],
 ) -> dict[int, List[int]]:
     """Layers owning compressed storage: all of ratios 4/128, kv_sources of 1/2."""
     for idx in stage:
@@ -1023,6 +1025,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     # object.__new__ stubs (disagg wire test) skip __init__; False is the env
     # default, so the fp8 PD/HiCache refuses don't AttributeError on them.
     _unified_kv_fp8 = False
+    _stage_layer_mapping: dict[int, int] | None = None
 
     def __init__(
         self,
@@ -1056,6 +1059,8 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         is_draft_worker: bool = False,
         kv_layout: Union[str, KVLayout] = KVLayout.V4,
         compressed_kv_layout: Optional[str] = None,
+        *,
+        layer_ids: Optional[Sequence[int]] = None,
     ):
         super().__init__(
             swa_size,
@@ -1170,8 +1175,8 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         else:
             self._stage_start = 0
             self._stage_end = len(compression_ratios)
-        self.stage_layer_ids = tuple(range(self._stage_start, self._stage_end))
-        stage_ratios = compression_ratios[self._stage_start : self._stage_end]
+        self._set_stage_layer_ids(layer_ids, layer_num, kv_source_layers)
+        stage_ratios = [compression_ratios[idx] for idx in self.stage_layer_ids]
 
         assert page_size % swa_page_size == 0
         self.sliding_window = sliding_window
@@ -1344,7 +1349,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.sources_by_ratio = collect_sources_by_ratio(
             self.compression_ratios,
             self.kv_source_layers,
-            range(self._stage_start, self._stage_end),
+            self.stage_layer_ids,
         )
         self._init_compressed_pools(
             stage_ratios=stage_ratios,
@@ -1371,11 +1376,13 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         # Under HiCache the compressed region is loaded H->D per layer; wait for this
         # layer's transfer before attention reads it. No-op when HiCache is off.
         self.wait_layer_transfer(layer_id)
-        return self.unified_kv_pool.get_unified_kv(layer_id - self._stage_start)
+        return self.unified_kv_pool.get_unified_kv(self._swa_local_layer_id(layer_id))
 
     def get_unified_kv_rope(self, layer_id: int) -> torch.Tensor:
         self.wait_layer_transfer(layer_id)
-        return self.unified_kv_pool.get_unified_kv_rope(layer_id - self._stage_start)
+        return self.unified_kv_pool.get_unified_kv_rope(
+            self._swa_local_layer_id(layer_id)
+        )
 
     def register_mapping(self, full_to_swa_index_mapping: torch.Tensor):
         self.full_to_swa_index_mapping = full_to_swa_index_mapping
@@ -1423,7 +1430,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             data_lens.append(compress_rows * row_bytes)
             item_lens.append(rows_per_page * row_bytes)
 
-        stage_ratios = self.compression_ratios[self._stage_start : self._stage_end]
+        stage_ratios = [self.compression_ratios[idx] for idx in self._owned_layer_ids()]
         # [C4 KV, C4 indexer, C128 KV], and under fp8 a rope group (128 B/row)
         # after each KV group. Rope keeps the KV page indices -- shift them and
         # decode reads a page whose rope half came from some other page.
@@ -1629,7 +1636,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         # Fp8 kv layout:  [rows, 512B] fp8 nope, [rows, 128B] bf16 rope
         swa_pages = self.unified_kv_pool.swa_pages
         rows_per_page = self.page_size // ratio
-        stage_ratios = self.compression_ratios[self._stage_start : self._stage_end]
+        stage_ratios = [self.compression_ratios[idx] for idx in self._owned_layer_ids()]
         local_layer_ids = [i for i, r in enumerate(stage_ratios) if r == ratio]
 
         views: List[torch.Tensor] = []
@@ -1977,7 +1984,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             None
         ] * total_L
 
-        for idx in range(self._stage_start, self._stage_end):
+        for idx in self._owned_layer_ids():
             ratio = self.compression_ratios[idx]
             if ratio in (0, 1):
                 continue
@@ -2016,7 +2023,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         total_L = len(self.compression_ratios)
         self.layer_mapping: List[Optional[DeepSeekV4LayerItem]] = [None] * total_L
 
-        for idx in range(self._stage_start, self._stage_end):
+        for idx in self._owned_layer_ids():
             ratio = self.compression_ratios[idx]
             if ratio not in layer_counts:
                 raise ValueError(f"Unsupported compression ratio: {ratio}")
@@ -2034,7 +2041,12 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
     def wait_layer_transfer(self, layer_id: int) -> None:
         if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+            local_layer_id = (
+                self._swa_local_layer_id(layer_id)
+                if self._stage_layer_mapping is not None
+                else layer_id - self.start_layer
+            )
+            self.layer_transfer_counter.wait_until(local_layer_id)
 
     def get_attention_compress_states(self, layer_id: int) -> CompressStatePool:
         self.wait_layer_transfer(layer_id)
@@ -2156,8 +2168,56 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         """Global ids of this stage's layers that own an SWA buffer, in buffer order."""
         return list(self.stage_layer_ids)
 
+    def _set_stage_layer_ids(
+        self,
+        layer_ids: Optional[Sequence[int]],
+        layer_num: int,
+        kv_source_layers: Sequence[int],
+    ) -> None:
+        if layer_ids is None:
+            self.stage_layer_ids = tuple(range(self._stage_start, self._stage_end))
+            self._stage_layer_mapping = None
+            return
+        ids = tuple(layer_ids)
+        if (
+            len(ids) != layer_num
+            or any(
+                type(idx) is not int or not 0 <= idx < len(self.compression_ratios)
+                for idx in ids
+            )
+            or tuple(sorted(set(ids))) != ids
+        ):
+            raise ValueError(
+                "DSV4 layer_ids must be increasing, unique model layer ids "
+                "and match layer_num"
+            )
+        mapping = {idx: local for local, idx in enumerate(ids)}
+        for idx in ids:
+            ratio = self.compression_ratios[idx]
+            if ratio not in (1, 2):
+                continue
+            sources = [
+                source
+                for source in kv_source_layers
+                if source <= idx and self.compression_ratios[source] == ratio
+            ]
+            if not sources or max(sources) not in mapping:
+                raise ValueError(
+                    f"DSV4 layer {idx} requires a local ratio-{ratio} KV source"
+                )
+        self.stage_layer_ids = ids
+        self._stage_layer_mapping = mapping
+
+    def _owned_layer_ids(self) -> Sequence[int]:
+        # Wire/layout test stubs may provide only the legacy stage bounds.
+        return getattr(
+            self, "stage_layer_ids", range(self._stage_start, self._stage_end)
+        )
+
     def _swa_local_layer_id(self, layer_id: int) -> int:
         """Convert absolute model layer_id to SWA-pool-local (PP-stage-local) index."""
+        if self._stage_layer_mapping is not None:
+            return self._stage_layer_mapping[layer_id]
         return layer_id - self._stage_start
 
     def extra_host_regions(self) -> tuple[ExtraHostRegion, ...]:
