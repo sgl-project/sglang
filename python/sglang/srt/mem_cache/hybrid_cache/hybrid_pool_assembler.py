@@ -241,8 +241,8 @@ def _split_hicache_size(
 def _split_hicache_size_with_mamba(
     *, kv_pools: tuple[Any, ...], mamba_pools: tuple[Any, ...]
 ) -> tuple[float, ...]:
-    # One share per KV pool, then one Mamba host share that covers every pool
-    # in mamba_pools, since the Mamba host pool packs them into each slot.
+    # One share per KV pool, then one Mamba share for all of mamba_pools;
+    # the Mamba host pool packs every one of them into each slot.
     hicache_size = get_memory().hicache_size
     mamba_size = get_memory().hicache_mamba_size
     if mamba_size == 0:
@@ -257,8 +257,8 @@ def _split_hicache_size_with_mamba(
 
 
 def _require_pinned_mamba_slot(host_pool: MambaPoolHost, *, host_size: float) -> None:
-    # Ratio sizing (host_size 0) never carries a pin. Sizing pads every host
-    # pool by one slot, so a pin below one slot would still build a 1-slot pool.
+    # Ratio sizing (host_size 0) never carries a pin;
+    # sizing pads each host pool by one slot, so a sub-slot pin builds a 1-slot pool.
     if host_size <= 0 or get_memory().hicache_mamba_size == 0:
         return
     if host_size * 1e9 >= host_pool.size_per_token:

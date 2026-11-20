@@ -2890,8 +2890,8 @@ class TestHiCacheArgs(CustomTestCase):
         self.assertIn("explicit --hicache-size", str(context.exception))
 
     def test_hicache_mamba_size_needs_hierarchical_cache(self):
-        """Without HiCache there is no host pool to size, so the flag must not
-        be accepted and silently ignored."""
+        """Without HiCache there is no host pool to size,
+        so the flag must be rejected rather than silently ignored."""
         with self.assertRaises(ValueError) as context:
             self._resolve_mamba_size(hicache_size=192, hicache_mamba_size=70)
         self.assertIn("--enable-hierarchical-cache", str(context.exception))
