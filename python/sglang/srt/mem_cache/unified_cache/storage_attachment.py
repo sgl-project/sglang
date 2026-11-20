@@ -316,6 +316,14 @@ class StorageAttachment:
         else:
             cache.storage_metrics_collector = None
 
+        # The backend classifies per-object outcomes (miss / short read /
+        # error), which only it can tell apart; hand it the same collector so
+        # those series carry the storage labels.
+        controller = cache.cache_controller
+        backend = getattr(controller, "storage_backend", None)
+        if backend is not None:
+            backend.set_metrics_collector(cache.storage_metrics_collector)
+
     def _resolve_metrics_collector(
         self,
         storage_backend: Optional[str],

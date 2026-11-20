@@ -24,6 +24,26 @@ logger = logging.getLogger(__name__)
 STORAGE_BATCH_SIZE = 128
 
 
+class StorageTransferResult(str, Enum):
+    """Outcome of one HiCache L3 backend object operation.
+
+    ``SHORT_READ`` is deliberately distinct from ``MISS``: a truncated object
+    must not be reported as a cache hit (see #50130), so the two outcomes need
+    separate series even though both make the caller treat the page as absent.
+    """
+
+    SUCCESS = "success"
+    MISS = "miss"
+    SHORT_READ = "short_read"
+    ERROR = "error"
+    # Deliberately not attempted, e.g. the object was already present.
+    SKIPPED = "skipped"
+
+
+class _ShortReadError(IOError):
+    """An object existed but was smaller than expected or read short."""
+
+
 @dataclass
 class HiCacheStorageConfig:
     tp_rank: int
@@ -383,6 +403,13 @@ class HiCacheStorage(ABC):
     It abstracts the underlying storage mechanism, allowing different implementations to be used.
     """
 
+    # Set by the owner of the cache (see StorageAttachment) when storage metrics
+    # are enabled; backends that classify outcomes report through it.
+    metrics_collector = None
+
+    def set_metrics_collector(self, collector) -> None:
+        self.metrics_collector = collector
+
     # todo, the page size of storage backend does not have to be the same as the same as host memory pool
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         self.mem_pool_host = mem_pool_host
@@ -663,6 +690,9 @@ class HiCacheStorageFailureInjector(HiCacheStorage):
                 return True
         return False
 
+    def set_metrics_collector(self, collector) -> None:
+        self._backend.set_metrics_collector(collector)
+
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         self._backend.register_mem_pool_host(mem_pool_host)
 
@@ -899,6 +929,7 @@ class HiCacheFile(HiCacheStorage):
     def __init__(
         self, storage_config: HiCacheStorageConfig, file_path: str = "/tmp/hicache"
     ):
+        self.enable_storage_metrics = storage_config.enable_storage_metrics
         self.file_path = (
             envs.SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR.get()
             or (storage_config.extra_config or {}).get("file_storage_path")
@@ -1053,25 +1084,39 @@ class HiCacheFile(HiCacheStorage):
         target_location.copy_(scratch)
         return target_location
 
+    def _record_transfer(self, op: str, result: StorageTransferResult) -> None:
+        collector = self.metrics_collector
+        if self.enable_storage_metrics and collector is not None:
+            collector.log_storage_transfer(op=op, result=result.value)
+
     def _get_file(self, suffixed: str, target_location: torch.Tensor):
         tensor_path = os.path.join(self.file_path, f"{suffixed}.bin")
         try:
             expected = target_location.numel() * target_location.element_size()
             with open(tensor_path, "rb", buffering=0) as f:
                 if os.fstat(f.fileno()).st_size != expected:
-                    raise IOError(f"Incorrect object size for {suffixed}")
+                    raise _ShortReadError(f"Incorrect object size for {suffixed}")
                 buf = memoryview(target_location.view(torch.uint8).contiguous().numpy())
                 if f.readinto(buf) != expected:
-                    raise IOError(f"Short read for {suffixed}")
+                    raise _ShortReadError(f"Short read for {suffixed}")
             self._evictor.touch(suffixed, tensor_path)
             if self.metadata_cache is not None:
                 self.metadata_cache.add(suffixed)
+            self._record_transfer("get", StorageTransferResult.SUCCESS)
             return target_location
+        except _ShortReadError:
+            # The object exists but is not the full page: reporting this as a
+            # hit would let a truncated page satisfy a prefix match (#50130).
+            result = StorageTransferResult.SHORT_READ
+        except FileNotFoundError:
+            result = StorageTransferResult.MISS
         except OSError:
-            if self.metadata_cache is not None:
-                self.metadata_cache.remove(suffixed)
-            logger.warning(f"Failed to fetch {suffixed} from HiCacheFile storage.")
-            return None
+            result = StorageTransferResult.ERROR
+        self._record_transfer("get", result)
+        if self.metadata_cache is not None:
+            self.metadata_cache.remove(suffixed)
+        logger.warning(f"Failed to fetch {suffixed} from HiCacheFile storage.")
+        return None
 
     def batch_get(
         self,
@@ -1109,6 +1154,7 @@ class HiCacheFile(HiCacheStorage):
         if self._file_exists(suffixed):
             logger.debug(f"Key {suffixed} already exists. Skipped.")
             self._evictor.touch(suffixed, tensor_path)
+            self._record_transfer("put", StorageTransferResult.SKIPPED)
             return True
 
         tmp_path = None
@@ -1117,6 +1163,7 @@ class HiCacheFile(HiCacheStorage):
             value_bytes = value.numel() * value.element_size()
             # Ask the evictor to admit + reserve disk space (evicting if needed).
             if not self._evictor.reserve(suffixed, value_bytes, key=suffixed):
+                self._record_transfer("put", StorageTransferResult.SKIPPED)
                 return False
             reserved = True
 
@@ -1126,6 +1173,7 @@ class HiCacheFile(HiCacheStorage):
             self._evictor.commit(suffixed)
             if self.metadata_cache is not None:
                 self.metadata_cache.add(suffixed)
+            self._record_transfer("put", StorageTransferResult.SUCCESS)
             return True
         except Exception as e:
             logger.error(f"Failed to save tensor {suffixed}: {e}")
@@ -1139,6 +1187,7 @@ class HiCacheFile(HiCacheStorage):
                     pass
             if self.metadata_cache is not None:
                 self.metadata_cache.remove(suffixed)
+            self._record_transfer("put", StorageTransferResult.ERROR)
             return False
 
     def batch_set(
