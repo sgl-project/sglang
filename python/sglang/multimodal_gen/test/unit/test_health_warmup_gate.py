@@ -19,6 +19,7 @@ import psutil
 import zmq.asyncio
 from fastapi import FastAPI, Response
 
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 from sglang.multimodal_gen.runtime import server_warmup
 from sglang.multimodal_gen.runtime.disaggregation.orchestrator import DiffusionServer
 from sglang.multimodal_gen.runtime.entrypoints import http_server
@@ -50,6 +51,7 @@ class TestHealthWarmupGate(unittest.IsolatedAsyncioTestCase, CustomTestCase):
             with self.subTest(outcome=outcome):
                 client = AsyncSchedulerClient()
                 args = SimpleNamespace(
+                    pipeline_config=SimpleNamespace(task_type=ModelTaskType.T2V),
                     warmup_mode="server",
                     warmup_resolutions=None,
                     scheduler_endpoints=["unused"],
@@ -83,7 +85,7 @@ class TestHealthWarmupGate(unittest.IsolatedAsyncioTestCase, CustomTestCase):
                         [sys.executable, "-c", "import time; time.sleep(60)"]
                     ) as worker,
                     mock.patch.object(http_server, "async_scheduler_client", client),
-                    mock.patch.object(client, "forward", forward),
+                    mock.patch.object(client, "forward", side_effect=forward) as probe,
                     mock.patch.object(http_server, "run_zeromq_broker", broker),
                     mock.patch.object(
                         http_server, "_wait_until_http_live", mock.AsyncMock()
@@ -92,9 +94,6 @@ class TestHealthWarmupGate(unittest.IsolatedAsyncioTestCase, CustomTestCase):
                         http_server,
                         "should_run_synthetic_server_warmup",
                         return_value=True,
-                    ),
-                    mock.patch.object(
-                        server_warmup, "should_include_warmup_image", return_value=False
                     ),
                     mock.patch.object(
                         server_warmup,
@@ -127,6 +126,7 @@ class TestHealthWarmupGate(unittest.IsolatedAsyncioTestCase, CustomTestCase):
                                     await asyncio.sleep(0)
 
                             await asyncio.wait_for(wait_for_startup(), 5)
+                            probe.assert_awaited_once()
                             ready = app.state.server_warmup_done.is_set()
                             response = await health(SimpleNamespace(app=app))
                             if outcome == "healthy_error":
