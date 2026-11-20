@@ -9,6 +9,7 @@ register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")
 
 import unittest
 from collections import defaultdict
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest import mock
 
@@ -247,15 +248,19 @@ class TestMambaPathStateCap(unittest.TestCase):
                     [v.item() for v in host_frees[ComponentType.MAMBA]], [11]
                 )
 
-    def test_host_counting_is_on_by_default_with_a_cap_and_a_cache_mode_host_tier(self):
+    def test_host_counting_is_opt_in_and_needs_a_cap_and_a_cache_mode_host_tier(self):
         for name, host_mode, env, enabled in (
-            ("default", "cache", True, True),
+            ("default", "cache", None, False),
+            ("opted_in", "cache", True, True),
             ("buffer_only", "buffer_only", True, False),
-            ("env_off", "cache", False, False),
         ):
             with (
                 self.subTest(name),
-                envs.SGLANG_MAMBA_PATH_CAP_COUNTS_HOST.override(env),
+                (
+                    nullcontext()
+                    if env is None
+                    else envs.SGLANG_MAMBA_PATH_CAP_COUNTS_HOST.override(env)
+                ),
             ):
                 cache = SimpleNamespace(
                     components={
