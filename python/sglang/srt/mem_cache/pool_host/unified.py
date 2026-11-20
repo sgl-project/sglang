@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Sequence
 from contextlib import contextmanager
 
@@ -10,6 +11,8 @@ from sglang.srt.mem_cache.kv.memory.host_backing import _SharedPageEnvelopeHostB
 from sglang.srt.mem_cache.pool_host.base import HostKVCache
 from sglang.srt.utils import is_cuda, is_hip
 from sglang.srt.utils.device import async_h2d_tensor
+
+logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -126,6 +129,7 @@ class UnifiedPageEnvelopeHostPool(HostKVCache):
         self.fd = _shared_backing.fd
         self.lock = _shared_backing.lock
         self._destroyed = False
+        self._host_memory_released = False
         _shared_backing.retain(pool_label)
 
     @classmethod
@@ -211,9 +215,14 @@ class UnifiedPageEnvelopeHostPool(HostKVCache):
         self._shared_backing.clear(self.pool_label)
 
     def available_size(self):
+        if self._host_memory_released:
+            return 0
         return self._shared_backing.available_size(self.pool_label)
 
     def alloc(self, need_size: int) -> torch.Tensor | None:
+        if self._host_memory_released:
+            # The pages are not mapped: never hand out slots into freed memory.
+            return None
         return self._shared_backing.alloc(self.pool_label, need_size)
 
     def free(self, indices: torch.Tensor) -> int:
@@ -265,6 +274,44 @@ class UnifiedPageEnvelopeHostPool(HostKVCache):
         side = self._shared_backing.sides[self.pool_label]
         raw = self._shared_backing.raw
         return raw.data_ptr(), raw.nbytes, side.page_bytes
+
+    def release_memory_occupation(self) -> None:
+        """Drop this pool's view of the shared page backing and free it if unused.
+
+        The backing is only freed once every pool sharing it has offloaded; a
+        pool that offloads alone keeps its siblings' pages mapped.
+        """
+        with self.lock:
+            if self._destroyed or self._host_memory_released:
+                return
+            self.clear()
+            self.kv_buffer = None
+            self._host_page_buffer_view = None
+            self.fd = None
+            self._shared_backing.release_memory_occupation(self.pool_label)
+            self._host_memory_released = True
+            logger.info(
+                "Released unified HiCache host pool %s (%.2f GB shared backing).",
+                self.pool_label,
+                self._shared_backing.capacity_bytes / 1e9,
+            )
+
+    def resume_memory_occupation(self) -> None:
+        """Re-attach to the (re-allocated) shared backing."""
+        with self.lock:
+            if not self._host_memory_released:
+                return
+            self._shared_backing.resume_memory_occupation(self.pool_label)
+            self._host_page_buffer_view = self._shared_backing.page_buffer(
+                self.pool_label
+            )
+            self.kv_buffer = (
+                self._shared_backing.raw
+                if self.pool_label == self._shared_backing.registration_owner
+                else None
+            )
+            self.fd = self._shared_backing.fd
+            self._host_memory_released = False
 
     def destroy(self) -> None:
         if self._destroyed:

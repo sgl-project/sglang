@@ -192,6 +192,11 @@ class Memory(msgspec.Struct):
         Optional[str],
         "A dictionary in JSON string format, or a string starting with a leading '@' and a config file in JSON/YAML/TOML format, containing extra configuration for the storage backend.",
     ] = None
+    release_hicache: A[
+        bool,
+        "Release the HiCache host KV pool together with the KV cache during "
+        "release_memory_occupation, and rebuild it on resume.",
+    ] = False
     hicache_storage_prefetch_retry_poll_interval: A[
         int,
         Arg(
