@@ -1408,8 +1408,6 @@ def megakernel_can_run_graph(
     model: torch.nn.Module, forward_batch: ForwardBatch
 ) -> bool:
     installed = _installed(model)
-    # Installation sets tensor_entry for every decode entry kind; the Protocol
-    # isinstance in _decode_entry_kind costs tens of us, too much for every step.
     if (
         installed is None
         or installed.tensor_entry is None
