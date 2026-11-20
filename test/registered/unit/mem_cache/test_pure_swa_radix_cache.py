@@ -160,8 +160,8 @@ class TestPureSWARadixCache(CustomTestCase):
         self.assertEqual(allocator.skipped, [4, 5])
 
     def test_window_evicted_slots_are_not_shared_with_the_next_request(self):
-        # Real pool and allocator: the window frees slots back to the allocator,
-        # and the next request must not get slots the tree still serves.
+        # Real pool and allocator: the window frees slots back to the allocator.
+        # The next request must not get slots the tree still serves.
         size, window = 32, 2
         kv_pool = SWAKVPool(
             size=0,
