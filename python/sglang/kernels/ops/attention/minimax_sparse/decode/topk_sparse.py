@@ -6,6 +6,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.attention.fla.utils import autotune_cache_kwargs
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils import is_gfx95_supported
 
@@ -325,6 +326,7 @@ _gqa_share_sparse_decode_kernel = triton.heuristics(_SPARSE_DECODE_HEURISTICS)(
             "BLOCK_SIZE_N",
             "HAS_SINK",
         ],
+        **autotune_cache_kwargs,
     )(_gqa_share_sparse_decode_kernel_impl)
 )
 _gqa_share_sparse_decode_pinned = triton.heuristics(_SPARSE_DECODE_HEURISTICS)(

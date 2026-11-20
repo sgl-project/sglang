@@ -6,6 +6,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.attention.fla.utils import autotune_cache_kwargs
 from sglang.srt.utils import is_gfx95_supported
 
 from ..common.nvfp4 import Nvfp4Cache
@@ -72,6 +73,7 @@ _MAX_PER_PAGE_SLOT_UNROLL = 2
         "SCORE_TYPE",
         "DISABLE_INDEX_VALUE",
     ],
+    **autotune_cache_kwargs,
 )
 @triton.jit
 def _flash_attn_fwd_with_block_score_kernel(
@@ -340,6 +342,7 @@ def _flash_attn_fwd_with_block_score_kernel(
     key=[
         "BLOCK_SIZE_T"
     ],  # use BLOCK_SIZE_T instead of topk to reduce autotune frequency
+    **autotune_cache_kwargs,
 )
 @triton.jit
 def _topk_index_kernel(
@@ -479,6 +482,7 @@ def _topk_index_kernel(
         triton.Config({"BLOCK_SIZE_Q": 128}, num_warps=8, num_stages=3),
     ],
     key=["qk_head_dim", "block_size"],
+    **autotune_cache_kwargs,
 )
 @triton.jit
 def _index_block_score_only_kernel(
