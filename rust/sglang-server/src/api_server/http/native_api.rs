@@ -19,7 +19,7 @@ use super::generate_hook::{
 use super::pre_generate::HeldGeneration;
 use super::request_headers::apply_header_overrides;
 use crate::api_server::core::{
-    BodySnapshot, CoreError, CoreEvent, CoreOutput, HealthStatus, RawBody, ReceivedAs,
+    CoreError, CoreEvent, CoreOutput, HealthStatus, RawBody, ReceivedAs,
     STREAM_INVALID_REQUEST_ERROR,
 };
 use crate::api_server::handlers::{CoreCall, PendingGeneration, recv_indexed};
@@ -490,7 +490,8 @@ impl serde::Serialize for NativeFrame {
 /// The routes this module owns, mounted by `api_server::serve`.
 pub(super) fn routes() -> Router<Arc<AppState>> {
     Router::new()
-        .declared_route("/generate", post(generate))
+        // Python takes PUT as well as POST, with the same handler.
+        .declared_route("/generate", post(generate).put(generate))
         .merge(health_routes())
 }
 
@@ -641,12 +642,10 @@ async fn generate(
         bytes: raw_body,
         overrides,
     };
-    let snapshot = state
-        .core
-        .snapshot_body(&body, Some(raw_body), &headers)
-        .map(|snapshot| {
-            snapshot.started_at(start.as_ref().map(|Extension(crate::RequestStart(at))| *at))
-        });
+    let received = ReceivedAs::Body {
+        snapshot: state.core.snapshot_body(&body, Some(raw_body), &headers),
+        started_at: start.map(|Extension(crate::RequestStart(at))| at),
+    };
     let (payloads, is_batch) = match generate_requests(&state, body) {
         Ok(requests) => requests,
         Err((code, message, stream)) => return native_error(code, &message, stream),
@@ -657,10 +656,7 @@ async fn generate(
     // equivalent boundary: into_requests() has normalized the body, while prefetch
     // and every downstream stage are still ahead of us. An HTTP layer that did
     // some of that work before this handler ran set where it started.
-    let timing = match start {
-        Some(Extension(crate::RequestStart(at))) => RequestTiming::starting_at(at),
-        None => RequestTiming::new(),
-    };
+    let timing = RequestTiming::starting_at(received.created_at());
     // Shared core admission performs media I/O (URL downloads, file reads)
     // on this async runtime before any request reaches the MM worker pool.
     if !is_batch {
@@ -674,7 +670,7 @@ async fn generate(
             .map(|held| held.claim(&mut payload));
         let client_sampling_params = item_sampling_params(client_sampling_params.as_ref(), 0);
         let request = RequestState::new(&state, &payload, &headers, client_sampling_params, timing);
-        generate_single(&state, payload, held, stream, request, snapshot).await
+        generate_single(&state, payload, held, stream, request, received).await
     } else {
         let requests = payloads
             .iter()
@@ -691,7 +687,7 @@ async fn generate(
                 )
             })
             .collect();
-        generate_batch(&state, payloads, stream, requests, snapshot).await
+        generate_batch(&state, payloads, stream, requests, received).await
     }
 }
 
@@ -809,11 +805,10 @@ async fn generate_single(
     held: Option<PendingGeneration>,
     stream: bool,
     request: RequestState,
-    snapshot: Option<BodySnapshot>,
+    received: ReceivedAs,
 ) -> Response {
     // `return_text_in_logprobs` is decoded on the detok shard into `*_txt`, so
     // the frame builder just reads them — no tokenizer needed here.
-    let received = ReceivedAs::Body(snapshot);
     let call = match held {
         Some(held) => state.core.generate_pending(req, received, held).await,
         None => state.core.generate(req, received).await,
@@ -916,16 +911,12 @@ async fn generate_batch(
     requests: Vec<GenerateRequest>,
     stream: bool,
     request_states: Vec<RequestState>,
-    snapshot: Option<BodySnapshot>,
+    received: ReceivedAs,
 ) -> Response {
     // No cross-item rid collision to worry about: `into_requests` rejected duplicate
     // rids within this batch, and `Rid::from_client` made each one unique against
     // every other in-flight request.
-    let calls = match state
-        .core
-        .generate_batch(requests, ReceivedAs::Body(snapshot))
-        .await
-    {
+    let calls = match state.core.generate_batch(requests, received).await {
         Ok(calls) => calls.into_iter().zip(request_states).collect(),
         Err(error) => return native_core_error(error, stream),
     };
@@ -2129,7 +2120,8 @@ mod tests {
             (true, true, true, true, true),
             (true, true, false, false, true),
         ] {
-            // A hooked case also runs as DP rank 1; the rest as the only rank.
+            // A hooked case also runs as DP rank 1, which frames report; the
+            // rest without DP, whose frames report null.
             let dp_rank: u32 = if hook { 1 } else { 0 };
             let server_args = crate::message::config::ServerArgs {
                 incremental_streaming_output: incremental,
@@ -2147,6 +2139,7 @@ mod tests {
                     serde_json::json!({"top_k": 7}),
                 )),
                 deployment_info: crate::message::config::DeploymentInfo {
+                    dp_size: if hook { 2 } else { 1 },
                     dp_rank: Some(dp_rank),
                     ..Default::default()
                 },
@@ -2307,7 +2300,7 @@ mod tests {
                 let terminal = !meta["finish_reason"].is_null();
                 assert_eq!(
                     meta.get("dp_rank"),
-                    Some(&serde_json::json!(dp_rank)),
+                    Some(&serde_json::json!(hook.then_some(dp_rank))),
                     "{case}"
                 );
                 let keys: Vec<&str> = meta.keys().map(String::as_str).collect();
@@ -3396,6 +3389,55 @@ mod tests {
                     axums.is_ok()
                 ),
             }
+        }
+    }
+
+    /// Python takes `PUT /generate` as well as POST, with the same handler:
+    /// a malformed body is the same 400 on both verbs.
+    #[tokio::test]
+    async fn generate_takes_put_like_post() {
+        use crate::api_server::handlers::{CoreConfig, CoreHandle, CoreMetadata};
+        let (intake_tx, _intake_rx) = flume::unbounded();
+        let (abort_tx, _abort_rx) = flume::unbounded();
+        let core = CoreHandle::new(
+            intake_tx,
+            abort_tx,
+            CoreConfig {
+                response_capacity: 8,
+                response_activity: Default::default(),
+                startup_ready: true,
+                is_disaggregation: false,
+                mm_limits: Vec::new(),
+                multimodal: false,
+                metrics: None,
+                peer_endpoints: Vec::new(),
+                metadata: CoreMetadata::default(),
+                request_log: None,
+                generate_validator: None,
+                abort_hook: None,
+            },
+        );
+        let state = Arc::new(AppState {
+            core,
+            server_args: Arc::new(crate::message::config::ServerArgs::default()),
+            generation_policy: GenerationPolicy::default(),
+            chat_formatter: None,
+            generate_hook: None,
+            openai_chat: None,
+        });
+        for method in ["POST", "PUT"] {
+            let request = Request::builder()
+                .method(method)
+                .uri("/generate")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"text": 5}"#))
+                .unwrap();
+            let response = routes()
+                .with_state(state.clone())
+                .oneshot(request)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{method}");
         }
     }
 }

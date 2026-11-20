@@ -136,6 +136,12 @@ Then your PR can be merged.
 
 ## How to Trigger CI Tests
 
+### CI Infrastructure Usage Guidelines
+
+You are responsible for any code or content you upload. You confirm that you have the right to share any code or content you submit and that it does not include confidential, sensitive, personal, or illegal information. Your code will run automatically without review in environments that are not fully secure. This service does not guarantee that your code is safe or error-free. If you discover a security issue, you must report it promptly.
+
+### Triggering tests
+
 We have a lot of open PRs but limited CI machines, so only top and trusted contributors have permission to trigger CI tests.
 Users with permission are listed in the [CI_PERMISSIONS.json](https://github.com/sgl-project/sglang/blob/main/.github/CI_PERMISSIONS.json)
 
