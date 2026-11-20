@@ -133,6 +133,7 @@ class SGLangCheckpointEngineWorkerExtensionImpl(SGLangCheckpointEngineWorkerExte
         def post_hook():
             # Perform post-processing after weight loading similar to DefaultModelLoader
             try:
+                from sglang.srt.layers.moe.topk import refresh_correction_bias_caches
                 from sglang.srt.model_loader.loader import device_loading_context
 
                 # Process quantization methods after loading weights
@@ -148,6 +149,7 @@ class SGLangCheckpointEngineWorkerExtensionImpl(SGLangCheckpointEngineWorkerExte
                 # Call model-specific post-loading hook if available
                 if hasattr(self.model_runner.model, "post_load_weights"):
                     self.model_runner.model.post_load_weights()
+                refresh_correction_bias_caches(self.model_runner.model)
             except Exception as e:
                 logger.warning(f"Post-hook processing failed: {e}")
 
