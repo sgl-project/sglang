@@ -240,6 +240,9 @@ class GigaChat35Config(PretrainedConfig):
 register_linear_attn_model(
     LinearAttnModelSpec(
         config_class=GigaChat35Config,
+        config_predicate=lambda config: (
+            config.model_type == GigaChat35Config.model_type
+        ),
         backend_class_name="sglang.srt.layers.attention.linear.gdn_backend.GDNAttnBackend",
         arch_names=[
             "GigaChat35ForCausalLM",

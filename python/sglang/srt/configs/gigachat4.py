@@ -73,6 +73,9 @@ class GigaChat4Config(GigaChat35Config):
 register_linear_attn_model(
     LinearAttnModelSpec(
         config_class=GigaChat4Config,
+        config_predicate=lambda config: (
+            "GigaChat4DFlash2DraftModel" not in (config.architectures or ())
+        ),
         backend_class_name="sglang.srt.layers.attention.linear.gdn_backend.GDNAttnBackend",
         arch_names=[
             "GigaChat4ForCausalLM",

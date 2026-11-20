@@ -28,8 +28,6 @@ if TYPE_CHECKING:
 
 
 def _get_linear_attn_registry_result(model_config: ModelConfig) -> Any:
-    if model_config.hf_config.architectures == ["GigaChat4DFlash2DraftModel"]:
-        return None
     return model_config.linear_attn_registry_result
 
 
