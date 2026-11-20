@@ -24,7 +24,9 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 def _handle_pd_request(mode, req):
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.enable_session_radix_cache = False
-    scheduler.model_config = SimpleNamespace(hf_eos_token_id={1}, vocab_size=128)
+    scheduler.model_config = SimpleNamespace(
+        hf_eos_token_id={1}, vocab_size=128, token_id_vocab_size=120
+    )
     scheduler.disaggregation_mode = mode
     scheduler.disagg_metadata_buffers = SimpleNamespace(enable_sampling_mask=False)
     scheduler.metrics_reporter = SimpleNamespace(enable_metrics=False)
@@ -58,11 +60,11 @@ def _handle_pd_request(mode, req):
             "sglang.srt.managers.scheduler.BeamCoordinator.request_beam_width",
             return_value=1,
         ),
-        patch("sglang.srt.managers.scheduler.Req", return_value=req),
+        patch("sglang.srt.managers.scheduler.Req", return_value=req) as make_req,
         patch("sglang.srt.managers.scheduler.prepare_abort") as abort,
     ):
         scheduler.handle_generate_request(recv_req)
-    return abort, scheduler._add_request_to_queue
+    return abort, scheduler._add_request_to_queue, make_req
 
 
 class TestSchedulerSamplingMaskValidation(CustomTestCase):
@@ -70,9 +72,10 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
         """Neither PD role may queue mask requests without metadata buffers."""
         for mode in (DisaggregationMode.PREFILL, DisaggregationMode.DECODE):
             with self.subTest(mode=mode):
-                abort, add_to_queue = _handle_pd_request(
+                abort, add_to_queue, make_req = _handle_pd_request(
                     mode, MagicMock(return_sampling_mask=True, return_logprob=False)
                 )
+                self.assertEqual(make_req.call_args.kwargs["vocab_size"], 120)
                 abort.assert_called_once()
                 self.assertEqual(
                     abort.call_args.kwargs["status_code"], HTTPStatus.BAD_REQUEST
@@ -93,7 +96,7 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
                 ):
                     req = MagicMock(return_sampling_mask=True, return_logprob=True)
                     req.logprob.top_logprobs_num = top_logprobs_num
-                    abort, add_to_queue = _handle_pd_request(mode, req)
+                    abort, add_to_queue, _ = _handle_pd_request(mode, req)
                     abort.assert_called_once()
                     self.assertIn(
                         (
@@ -115,7 +118,7 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
                 scheduler = Scheduler.__new__(Scheduler)
                 scheduler.enable_session_radix_cache = False
                 scheduler.model_config = SimpleNamespace(
-                    hf_eos_token_id={1}, vocab_size=128
+                    hf_eos_token_id={1}, vocab_size=128, token_id_vocab_size=128
                 )
                 scheduler.disaggregation_mode = DisaggregationMode.NULL
                 scheduler.metrics_reporter = SimpleNamespace(enable_metrics=False)

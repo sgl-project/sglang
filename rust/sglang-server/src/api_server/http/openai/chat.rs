@@ -327,7 +327,7 @@ async fn chat_completions(
         let native = GenerateRequest {
             rid: rid.clone(),
             chat_prompt: Some(choice_prompt),
-            sampling_params: sampling.clone(),
+            sampling_params: sampling.for_sample(index),
             stream,
             return_logprob: want_logprobs,
             logprob_start_len: -1,
@@ -556,6 +556,13 @@ impl SamplingDefaults {
         fallback_temperature: 1.0,
         fallback_top_p: 1.0,
     };
+    /// Python's `ResponsesRequest._DEFAULT_SAMPLING_PARAMS`: 0.7 / 1.0.
+    pub(crate) const RESPONSES: SamplingDefaults = SamplingDefaults {
+        temperature: None,
+        top_p: None,
+        fallback_temperature: 0.7,
+        fallback_top_p: 1.0,
+    };
     /// The resolved model defaults (empty in `--sampling-defaults openai`
     /// mode), which slot between the user's values and the OpenAI terminals.
     pub(super) fn with_model_defaults(mut self, model: &DefaultSamplingParams) -> SamplingDefaults {
@@ -719,6 +726,7 @@ pub(crate) async fn unary_chat_response(
                             name: call.name,
                             arguments: call.arguments,
                         },
+                        custom: None,
                     })
                     .collect();
                 // `parse_chat_response`: calls turn only a stop into `tool_calls`.
@@ -1122,6 +1130,7 @@ fn deepseek_choices(
                 name: call.name,
                 arguments: Some(call.arguments),
             }),
+            custom: None,
         };
         choice(chat_delta(None, None, Some(vec![call]), None), None);
     }
@@ -1203,6 +1212,7 @@ pub(super) fn chat_logprobs(extras: Option<&ChunkExtras>) -> ChatChoiceLogprobs 
                     bytes: Some(text.as_bytes().to_vec()),
                     token: text,
                     logprob,
+                    token_id: None,
                 }
             })
             .collect();
@@ -1219,6 +1229,15 @@ pub(super) fn chat_logprobs(extras: Option<&ChunkExtras>) -> ChatChoiceLogprobs 
         content: Some(content),
         refusal: None,
     }
+}
+
+/// V4, GLM-5.3 and Qwen3.8 prefill `<think>` (Qwen3.8 with a newline) when
+/// thinking, so the generated stream has no opening marker.
+pub(crate) fn starts_in_reasoning(reasoning_parser: Option<&str>, prompt: &str) -> bool {
+    matches!(
+        reasoning_parser,
+        Some("deepseek-v4" | "deepseek_v4" | "deepseekv4" | "glm45" | "qwen3")
+    ) && prompt.trim_end_matches('\n').ends_with("<think>")
 }
 
 #[cfg(test)]
