@@ -132,7 +132,7 @@ class TestKvBForAbsorb(CustomTestCase):
         module = _quark_fp8_linear(8)
         weight, scale = module.weight, module.weight_scale.view(-1, 1)
 
-        q, tensor_scale = k3_kv_b_for_absorb(module=module)
+        q, tensor_scale = k3_kv_b_for_absorb(module=module, w_scale=1.0)
 
         self.assertEqual((q.dtype, q.shape), (weight.dtype, weight.shape))
         self.assertEqual(tensor_scale.numel(), 1)
@@ -143,11 +143,26 @@ class TestKvBForAbsorb(CustomTestCase):
         err = (q.float() * tensor_scale - exact).abs().max()
         self.assertLess(err.item(), 0.07 * exact.abs().max().item())
 
+    def test_reload_refreshes_the_scale_in_place(self):
+        """A captured graph keeps reading the first scale tensor, so a reload must
+        write the new scale into it rather than hand back a fresh tensor."""
+        first = _quark_fp8_linear(8)
+        _, scale_1 = k3_kv_b_for_absorb(module=first, w_scale=1.0)
+        second = _quark_fp8_linear(8)
+        second.weight_scale = second.weight_scale * 4
+        _, want = k3_kv_b_for_absorb(module=second, w_scale=1.0)
+        self.assertFalse(torch.equal(scale_1, want))
+
+        _, got = k3_kv_b_for_absorb(module=second, w_scale=scale_1)
+
+        self.assertIs(got, scale_1)
+        torch.testing.assert_close(scale_1, want, rtol=0, atol=0)
+
     def test_off_keeps_the_bf16_dequant(self):
         module = _quark_fp8_linear(8)
 
         with envs.SGLANG_OPT_HIP_K3_MLA_ABSORB_FP8.override(False):
-            out, tensor_scale = k3_kv_b_for_absorb(module=module)
+            out, tensor_scale = k3_kv_b_for_absorb(module=module, w_scale=1.0)
 
         self.assertIsNone(tensor_scale)
         torch.testing.assert_close(out, _k3_channel_fp8_to_bf16(module, module.weight))
@@ -158,7 +173,7 @@ class TestKvBForAbsorb(CustomTestCase):
         module = _quark_fp8_linear(8)
 
         with mock.patch(f"{_FORWARD_MLA_ROCM}._use_aiter_gfx95", False):
-            out, tensor_scale = k3_kv_b_for_absorb(module=module)
+            out, tensor_scale = k3_kv_b_for_absorb(module=module, w_scale=1.0)
 
         self.assertIsNone(tensor_scale)
         torch.testing.assert_close(out, _k3_channel_fp8_to_bf16(module, module.weight))
@@ -169,13 +184,13 @@ class TestKvBForAbsorb(CustomTestCase):
         match the ones built from the checkpoint layout."""
         for preshuffle in (False, True):
             module = _quark_fp8_linear(32, in_features=64)
-            want_q, want_scale = k3_kv_b_for_absorb(module=module)
+            want_q, want_scale = k3_kv_b_for_absorb(module=module, w_scale=1.0)
             with (
                 self.subTest(preshuffle=preshuffle),
                 _quark_processing(fnuz=False, preshuffle=preshuffle),
             ):
                 module.scheme.process_weights_after_loading(module)
-                got_q, got_scale = k3_kv_b_for_absorb(module=module)
+                got_q, got_scale = k3_kv_b_for_absorb(module=module, w_scale=1.0)
 
                 self.assertEqual(got_q.shape, want_q.shape)
                 self.assertTrue(

@@ -20,7 +20,7 @@ the KDA in-proj merge hooks (k3_kda_inproj_fp8_tail_rows, k3_kda_inproj_fp8_f_b)
 which it calls on every platform: they decide here where the merge runs.
 """
 
-from typing import Optional
+from typing import Optional, Union
 
 import torch
 from torch import nn
@@ -84,14 +84,15 @@ def k3_fused_decode_f_b_weight(f_b_proj: nn.Module) -> Optional[torch.Tensor]:
 
 
 def k3_kv_b_for_absorb(
-    *, module: nn.Module
+    *, module: nn.Module, w_scale: Union[float, torch.Tensor]
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     """kv_b for the MLA absorb BMMs, [out, in], from a per-channel FP8 kv_b_proj.
 
     With SGLANG_OPT_HIP_K3_MLA_ABSORB_FP8 set and an absorb that runs FP8
     weights on AITER's a8w8 BMM (gfx950), requantize to per-tensor FP8 and
     return its scalar scale. Otherwise return dense BF16 and no scale. Must run
-    before the kv_b head split.
+    before the kv_b head split. The scale is written into w_scale when it is
+    already a tensor, since captured CUDA graphs keep its storage across reloads.
     """
     from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla_rocm import (
         rocm_absorb_bmm_runs_fp8,
@@ -110,7 +111,13 @@ def k3_kv_b_for_absorb(
         channel_quant_to_tensor_quant,
     )
 
-    return channel_quant_to_tensor_quant(x_q_channel=weight, x_s=module.weight_scale)
+    weight, scale = channel_quant_to_tensor_quant(
+        x_q_channel=weight, x_s=module.weight_scale
+    )
+    if isinstance(w_scale, torch.Tensor):
+        w_scale.copy_(scale)
+        return weight, w_scale
+    return weight, scale
 
 
 def _k3_channel_fp8_checkpoint_weight(module: nn.Module) -> torch.Tensor:

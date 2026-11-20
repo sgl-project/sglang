@@ -4278,7 +4278,7 @@ class KimiK3LinearForCausalLM(nn.Module):
                     # Fold the per-channel scale while dim 0 is still the
                     # channel axis it indexes, i.e. before the head split.
                     kv_b_weight, kv_b_tensor_scale = k3_kv_b_for_absorb(
-                        module=self_attn.kv_b_proj
+                        module=self_attn.kv_b_proj, w_scale=self_attn.w_scale
                     )
                     scale_folded_into_weight = kv_b_tensor_scale is None
                     num_fp8_absorb_layers += kv_b_tensor_scale is not None
