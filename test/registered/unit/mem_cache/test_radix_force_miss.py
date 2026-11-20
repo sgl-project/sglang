@@ -22,6 +22,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.common import match_kv_cache
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
+from sglang.test.test_utils import CustomTestCase
 
 
 class _StubReq:
@@ -37,7 +38,8 @@ class _StubReq:
         self.host_hit_length = None
         self.num_matched_prefix_tokens = 0
         self.swa_branching_seqlen = None
-        self.kv = SimpleNamespace(cache_protected_len=None)
+        self.bidir_prefix_len = -1
+        self.kv = SimpleNamespace(cache_protected_len=None, holds_mamba=False)
 
     def _compute_max_prefix_len(self, input_len):
         return max(input_len - 1, 0)
@@ -119,6 +121,76 @@ class TestMatchKvCacheForceMiss(unittest.TestCase):
         self.assertIs(forced_req.last_node, tree.root_node)
         self.assertIs(forced_req.last_host_node, tree.root_node)
         self.assertEqual(forced_req.host_hit_length, 0)
+
+
+class TestMatchKvCacheBidirPartialState(CustomTestCase):
+    def _tree(self):
+        tree = RadixCache.create_simulated()
+        tree.insert(InsertParams(key=RadixKey(token_ids=array("q", range(10, 18)))))
+        return tree
+
+    def test_partial_state_hit_is_a_miss(self):
+        tree = self._tree()
+        req = _StubReq(list(range(10, 14)) + [99, 100])
+        req.bidir_prefix_len = 6
+
+        match_kv_cache(req, tree)
+
+        self.assertEqual(req.prefix_len, 0)
+        self.assertIs(req.last_node, tree.root_node)
+        self.assertEqual(req.host_hit_length, 0)
+
+    def test_partial_state_hit_resets_mamba_cow(self):
+        tree = self._tree()
+        req = _StubReq(list(range(10, 14)) + [99, 100])
+        req.bidir_prefix_len = 6
+        req.kv = SimpleNamespace(
+            cache_protected_len=None,
+            holds_mamba=True,
+            mamba_cow_src_index=7,
+            mamba_needs_clear=False,
+        )
+
+        match_kv_cache(req, tree)
+
+        self.assertIsNone(req.kv.mamba_cow_src_index)
+        self.assertTrue(req.kv.mamba_needs_clear)
+
+    def test_full_state_hit_is_kept(self):
+        tree = self._tree()
+        req = _StubReq(list(range(10, 18)) + [99, 100])
+        req.bidir_prefix_len = 8
+
+        match_kv_cache(req, tree)
+
+        self.assertEqual(req.prefix_len, 8)
+        self.assertIsNot(req.last_node, tree.root_node)
+
+
+class TestBidirExtraKey(CustomTestCase):
+    def _key(self, state, question=(99, 100), extra_key=None):
+        from sglang.srt.managers.schedule_batch import Req
+        from sglang.srt.sampling.sampling_params import SamplingParams
+
+        return Req(
+            rid="r",
+            origin_input_text="",
+            origin_input_ids=array("q", [*state, *question]),
+            sampling_params=SamplingParams(max_new_tokens=0),
+            extra_key=extra_key,
+            bidir_prefix_len=len(state),
+        ).extra_key
+
+    def test_same_state_shares_a_namespace(self):
+        self.assertEqual(self._key([1, 2, 3]), self._key([1, 2, 3], question=(7,)))
+
+    def test_different_states_with_equal_length_do_not(self):
+        self.assertNotEqual(self._key([1, 2, 3]), self._key([1, 2, 4]))
+
+    def test_caller_key_cannot_collide_with_the_namespace(self):
+        self.assertNotEqual(
+            self._key([1, 2, 3], extra_key="|bidir4"), self._key([1, 2, 3])
+        )
 
 
 if __name__ == "__main__":

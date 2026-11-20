@@ -1647,6 +1647,17 @@ class UnifiedRadixCache(BasePrefixCache):
         for comp in self._components_tuple:
             effective_cache_len = comp.floor_cache_len(effective_cache_len)
 
+        if is_finished and effective_cache_len <= 0 < req.bidir_prefix_len <= len(
+            token_ids
+        ):
+            # No component checkpoint to donate (the Mamba state ran past the
+            # key after decoding); keep the state block on its own.
+            effective_cache_len = req.bidir_prefix_len
+            insert_params.mamba_value = None
+            insert_params.mamba_host_value = None
+            insert_params.mamba_host_src = None
+            insert_params.allow_missing_mamba = True
+
         radix_key = RadixKey(
             token_ids[:effective_cache_len],
             req.extra_key,
@@ -1713,6 +1724,37 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
             return
         req.kv.record_insert(page_aligned_len)
+        last_node = result.last_device_node
+
+        if is_finished and page_aligned_len < req.bidir_prefix_len <= len(token_ids):
+            # A block-bidirectional request reuses a cached state block only
+            # when all of it matched, so keep the state KV past the component
+            # checkpoint; the next hit recomputes from the checkpoint.
+            state_key = RadixKey(
+                token_ids[: req.bidir_prefix_len],
+                req.extra_key,
+                is_bigram=self.tree_core.is_eagle,
+                cache_salt=req.cache_salt,
+            ).page_aligned(self.page_size)
+            state_result = self.insert(
+                replace(
+                    insert_params,
+                    key=state_key,
+                    value=kv_indices_orig[: len(state_key)].to(
+                        dtype=torch.int64, copy=True
+                    ),
+                    mamba_value=None,
+                    mamba_host_value=None,
+                    mamba_host_src=None,
+                    allow_missing_mamba=True,
+                    prev_prefix_len=page_aligned_len,
+                    inserted_len=page_aligned_len,
+                )
+            )
+            if not state_result.rotation_tail_declined:
+                page_aligned_len = len(state_key)
+                req.kv.record_insert(page_aligned_len)
+                last_node = state_result.last_device_node
 
         # Split the leaf at the prompt boundary so eviction can drop the output
         # KV without the prompt. prev_prefix_len keeps the overlapping indices
@@ -1743,7 +1785,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # With PD decode radix caching, SWA matching can stop short of the inserted path.
         # Repoint from that path to protect all tree-owned KV.
-        new_last_node = result.last_device_node
+        new_last_node = last_node
         new_indices = self.path_device_indices(new_last_node)
         new_prefix_len = result.prefix_len
         assert req.kv.cache_protected_len <= len(new_indices) + self.page_size - 1, (
@@ -1791,9 +1833,7 @@ class UnifiedRadixCache(BasePrefixCache):
             from sglang.srt.managers.req_types import FINISH_ABORT
 
             if not isinstance(req.finished_reason, FINISH_ABORT):
-                self.session_refs.register_session_ref(
-                    req, leaf=result.last_device_node
-                )
+                self.session_refs.register_session_ref(req, leaf=last_node)
 
         # After the last prefill chunk, decode retires the request's own window, so
         # the rest of the forward must enter the tree now to keep a window at its end.

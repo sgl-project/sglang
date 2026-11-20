@@ -205,6 +205,47 @@ Qwen3.8-27B and Qwen3.5-35B-A3B think by default. `/v1/decisions` turns thinking
 
 These models mix full and linear attention. Answer probabilities can move by up to several hundredths (0.07 in our checks), and `label_mass` by up to about 0.14, between cold and prefix-cached requests and across batch compositions, while the chosen option stayed the same in our checks. On Qwen3.5-35B-A3B, `--disable-radix-cache` gave identical values across sequential repeats, at the cost of prefix reuse.
 
+## Block-bidirectional checkpoints
+
+Base Labs' [elephant-1](https://huggingface.co/baselabs/elephant-1) and [mammoth-1](https://huggingface.co/baselabs/mammoth-1) are trained with a block-bidirectional mask on their full-attention layers, declared as `modeling_overrides.attention.full_attention: "block_bidirectional"` in `config.json`. The state tokens attend to each other in both directions without seeing the question, the question tokens attend to the whole prompt, and the linear-attention (GDN) layers stay causal. SGLang does not read this declaration: a default launch serves these checkpoints with causal attention, which is not what they were trained for. To get the trained mask, launch with the Triton attention backend and send the boundary with every request.
+
+```bash Command
+python -m sglang.launch_server \
+  --model-path baselabs/elephant-1 \
+  --attention-backend triton \
+  --host 127.0.0.1 --port 30000
+```
+
+The boundary is `bidir_prefix_len`, a `/generate` field holding the number of prompt tokens in the state block. Build the prompt on the client as state tokens followed by question tokens, so the boundary falls on a token edge, and read the answer from the label logprobs at the last position, as `/v1/score` does:
+
+```python Example
+import requests
+from transformers import AutoTokenizer
+
+MODEL = "baselabs/elephant-1"
+URL = "http://127.0.0.1:30000"
+tokenizer = AutoTokenizer.from_pretrained(MODEL)
+
+state_ids = tokenizer.encode("I was charged twice this month, please refund one of them.", add_special_tokens=False)
+question_ids = tokenizer.encode("\n\nIs the customer asking for a refund? Answer yes or no.\nAnswer:", add_special_tokens=False)
+label_ids = [tokenizer.encode(" yes", add_special_tokens=False)[0], tokenizer.encode(" no", add_special_tokens=False)[0]]
+
+result = requests.post(
+    f"{URL}/generate",
+    json={
+        "input_ids": state_ids + question_ids,
+        "bidir_prefix_len": len(state_ids),
+        "sampling_params": {"max_new_tokens": 0},
+        "return_logprob": True,
+        "token_ids_logprob": label_ids,
+    },
+    timeout=60,
+).json()
+print(result["meta_info"]["output_token_ids_logprobs"][0])
+```
+
+Questions over the same state share its KV cache: a finished request keeps the KV of its whole state block, and the radix cache reuses a state block only when it matches in full, so send the same `state_ids` and the same `bidir_prefix_len` for every question, and keep the prompt inside `--chunked-prefill-size`, because a block-bidirectional prompt is never split across chunks. On a hybrid checkpoint the cached GDN state sits on a 64-token grid, so a hit recomputes at most the last 63 state tokens before the question. `bidir_prefix_len` is refused with another attention backend, with `--page-size` above 1, with `--enable-deterministic-inference`, with DCP, and with legacy `session_params`. `/v1/score`, `/v1/decisions`, and `/v1/systemone` do not take the field. The trained readout (`readout: "slot_lm"` in `config.json`) is not implemented either, so the logprobs above come from the language-model head.
+
 ## System One compatible API
 
 `POST /v1/systemone` serves the same decisions in the request and response shape of the System One API, with a `state`, a map of `noul`, `choice`, and `score` questions keyed by your ids, and one answer per id. Clients written for that API, including the official TypeSafe SDKs, get decisions by pointing their base URL at the server, with the exceptions listed below. For ordinary generation models, the route uses the same rendering, label checks, and scoring as `/v1/decisions`, and refuses the same servers, chat templates, and prompts, listed in [Errors](#errors). Its request fields are checked as described below. A decision checkpoint such as [PPLX-Decider-v1-27B](/cookbook/autoregressive/Perplexity/PPLX-Decider-v1-27B) instead gets the prompt, answer codes, and calibrated temperature it was trained with. When its `decision_config.json` sets `attention_mode` to `noncausal_full_attention`, as [PPLX-Decider-v1.1-27B](/cookbook/autoregressive/Perplexity/PPLX-Decider-v1.1-27B) does, its full-attention layers read the whole prompt, and the server turns off the radix cache and chunked prefill, which would show those layers only part of it. A joint schema checkpoint such as [Clef](/cookbook/autoregressive/Cloudflare/clef) answers all questions from one prompt in one prefill, scored by its joint schema head, and does not use the chat template. A pointer head checkpoint such as [Kev](/cookbook/autoregressive/Kev/kev) answers each question from its own prompt after the shared state, scored by its pointer head, and does not use the chat template either.
