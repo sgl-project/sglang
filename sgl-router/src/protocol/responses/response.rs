@@ -28,20 +28,32 @@ pub fn chat_to_response(chat: &Value, echo: &EchoContext) -> Value {
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
     };
-    if let Some(r) = str_field("reasoning_content") {
-        output.push(reasoning_item(&new_id("rs"), r, item_status, echo));
-    }
     let tool_calls = message
         .and_then(|m| m.get("tool_calls"))
         .and_then(Value::as_array)
         .filter(|t| !t.is_empty());
     let content = str_field("content");
+    // Only the item generated last can have been cut off: the last call,
+    // else the message, else the reasoning.
+    let reasoning_status = if content.is_some() || tool_calls.is_some() {
+        "completed"
+    } else {
+        item_status
+    };
+    let message_status = if tool_calls.is_some() {
+        "completed"
+    } else {
+        item_status
+    };
+    if let Some(r) = str_field("reasoning_content") {
+        output.push(reasoning_item(&new_id("rs"), r, reasoning_status, echo));
+    }
     // Emit a message item unless there are tool calls or only reasoning.
     if content.is_some() || (tool_calls.is_none() && output.is_empty()) {
         output.push(message_item(
             &new_id("msg"),
             content.unwrap_or(""),
-            item_status,
+            message_status,
         ));
     }
     let calls = tool_calls.map_or(&[][..], Vec::as_slice);
@@ -207,6 +219,38 @@ mod tests {
         assert_eq!(out[1]["namespace"], "mcp__fs__");
         assert_eq!(out[2]["name"], "shell");
         assert!(out[2].get("namespace").is_none());
+    }
+
+    /// Only the item generated last can have been cut off, as in streaming.
+    #[test]
+    fn only_the_last_generated_item_is_cut_off() {
+        let statuses = |message: Value| -> Vec<String> {
+            chat_to_response(
+                &json!({"choices": [{"finish_reason": "length", "message": message}]}),
+                &echo(),
+            )["output"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|i| i["status"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        let call = json!({"id": "c1", "type": "function",
+                          "function": {"name": "f", "arguments": "{\"x\":"}});
+        assert_eq!(
+            statuses(json!({"role": "assistant", "reasoning_content": "think",
+                            "content": "text", "tool_calls": [call]})),
+            ["completed", "completed", "incomplete"]
+        );
+        assert_eq!(
+            statuses(json!({"role": "assistant", "reasoning_content": "think",
+                            "content": "text"})),
+            ["completed", "incomplete"]
+        );
+        assert_eq!(
+            statuses(json!({"role": "assistant", "reasoning_content": "think"})),
+            ["incomplete"]
+        );
     }
 
     #[test]
