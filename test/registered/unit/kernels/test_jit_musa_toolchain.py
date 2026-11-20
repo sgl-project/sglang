@@ -16,7 +16,7 @@ def test_musa_home_uses_compiler_override(monkeypatch):
     monkeypatch.delenv("MUSA_HOME", raising=False)
     monkeypatch.delenv("MUSA_PATH", raising=False)
     monkeypatch.setenv("SGLANG_MUSA_MCC", "/opt/musa/bin/mcc")
-    assert toolchain.musa_home() == "/opt/musa"
+    assert toolchain.musa_home.__wrapped__() == "/opt/musa"
 
 
 def test_musa_runtime_alias_owner_is_torchada():
