@@ -7,6 +7,7 @@ import math
 from functools import cached_property
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 import torchvision
 import torchvision.transforms.v2.functional as tvF
@@ -16,6 +17,9 @@ from torchvision.transforms import InterpolationMode
 from sglang.srt.arg_groups.model_override_base import model_config_of
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.models.minimax_m3_vl import MiniMaxM3SparseForConditionalGeneration
+from sglang.srt.multimodal.cache import resolve_multimodal_item_hash
+from sglang.srt.multimodal.media_artifacts import MediaArtifactCacheMixin
+from sglang.srt.multimodal.media_artifacts.minimax_m3 import MiniMaxM3ImageArtifact
 from sglang.srt.multimodal.media_io import ImageData, VideoData
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import (
@@ -471,7 +475,9 @@ def _media_token_runs(input_ids: List[int], token_id: int) -> List[Tuple[int, in
     return runs
 
 
-class MiniMaxM3VLProcessor(BaseMultimodalProcessor):
+class MiniMaxM3VLProcessor(MediaArtifactCacheMixin, BaseMultimodalProcessor):
+    artifact_modality = Modality.IMAGE
+
     models = [MiniMaxM3SparseForConditionalGeneration]
 
     gpu_image_decode = False
@@ -643,6 +649,120 @@ class MiniMaxM3VLProcessor(BaseMultimodalProcessor):
         result["attention_mask"] = torch.ones_like(result["input_ids"])
         return result
 
+    def preprocess_fingerprint_payload(self):
+        payload = super().preprocess_fingerprint_payload()
+        payload["minimax_image_processor"] = self._processor.image_processor.to_dict()
+        return payload
+
+    def decode_media_snapshot(self, snapshot, modality):
+        image = super().decode_media_snapshot(snapshot, modality)
+        # Match BaseMultimodalProcessor._load_single_item even when callers
+        # disable the HF processor's own RGB conversion.
+        if isinstance(image, Image.Image) and image.mode != "RGB":
+            image = image.convert("RGB")
+        return image
+
+    def prepare_artifact_batch(self, entries, *, processor=None):
+        if not entries:
+            return []
+        processor, _ = self._resolve_processor(processor)
+        # Same default resize and processor kwargs as the legacy path; only
+        # requests without per-image resize options reach this point.
+        images = resize_images_for_request(
+            [entry.media for entry in entries],
+            None,
+            image_processor=processor.image_processor,
+            max_pixels=self.image_config.get("max_pixels"),
+        )
+        result = processor.image_processor(
+            images=images,
+            **{"do_resize": False, **self.image_config, "return_tensors": "pt"},
+        )
+        grids = result["image_grid_thw"]
+        features = result["pixel_values"]
+        if features.device.type != "cpu":
+            raise ValueError("MiniMax M3 image artifacts require CPU preprocessing")
+        if len(grids) != len(entries):
+            raise ValueError("Expected one MiniMax M3 grid per image")
+        lengths = [int(grid.prod()) for grid in grids]
+        if sum(lengths) != features.shape[0]:
+            raise ValueError("MiniMax M3 pixel values do not match image grids")
+        artifacts = []
+        for entry, grid, feature in zip(entries, grids, features.split(lengths)):
+            # Own each image's storage so eviction releases its memory independently.
+            # A lone image usually owns the whole batch storage already.
+            if (
+                feature.untyped_storage().nbytes()
+                != feature.numel() * feature.element_size()
+            ):
+                feature = feature.clone()
+            artifacts.append(
+                MiniMaxM3ImageArtifact(
+                    content_digest=entry.content_digest,
+                    artifact_key=entry.artifact_key,
+                    feature_hash=resolve_multimodal_item_hash(
+                        feature=feature, namespace=entry.artifact_key
+                    ),
+                    grid_thw=tuple(int(value) for value in grid),
+                    feature=feature,
+                )
+            )
+        return artifacts
+
+    def compose_image_artifacts(self, input_text, artifacts, *, processor=None):
+        processor, tokenizer = self._resolve_processor(processor)
+        # Mirror HF MiniMaxM3VLProcessor.replace_image_token from cached grids,
+        # so cache hits never call the image processor.
+        merge_length = processor.image_processor.merge_size**2
+        parts = input_text.split(self.IMAGE_TOKEN)
+        if len(parts) != len(artifacts) + 1:
+            raise ValueError("Expected one MiniMax M3 image placeholder per artifact")
+        expanded = [parts[0]]
+        for artifact, part in zip(artifacts, parts[1:]):
+            num_tokens = math.prod(artifact.grid_thw) // merge_length
+            expanded.append(
+                self.IMAGE_START_TOKEN
+                + self.IMAGE_TOKEN * num_tokens
+                + self.IMAGE_END_TOKEN
+                + part
+            )
+        input_text = "".join(expanded)
+        # Same tokenizer call and BOS handling as process_mm_data.
+        tokenizer_kwargs = {}
+        if self._tokenizer_auto_adds_specials:
+            bos = getattr(tokenizer, "bos_token", None)
+            if bos and input_text.startswith(bos):
+                tokenizer_kwargs["add_special_tokens"] = False
+        ret = tokenizer(
+            [input_text], padding=True, return_tensors="pt", **tokenizer_kwargs
+        )
+        input_ids = ret["input_ids"].flatten()
+        offsets = self.get_mm_items_offset(input_ids, self.IM_TOKEN_ID)
+        if len(offsets) != len(artifacts):
+            raise ValueError("Expected one MiniMax M3 image span per artifact")
+        items = []
+        for artifact, offset in zip(artifacts, offsets):
+            item = MultimodalDataItem(
+                modality=Modality.IMAGE,
+                feature=artifact.feature,
+                offsets=[offset],
+                model_specific_data={
+                    "image_grid_thw": torch.tensor(
+                        [artifact.grid_thw], dtype=torch.long
+                    )
+                },
+            )
+            item.set_hash(artifact.feature_hash)
+            items.append(item)
+        return MultimodalProcessorOutput(
+            input_ids=input_ids.tolist(),
+            mm_items=self._finalize_mm_items(items, images=None),
+            im_start_id=self.IM_START_TOKEN_ID,
+            im_end_id=self.IM_END_TOKEN_ID,
+            im_token_id=self.IM_TOKEN_ID,
+            video_token_id=self.VIDEO_TOKEN_ID,
+        )
+
     async def process_mm_data_async(
         self,
         image_data: Optional[list],
@@ -651,6 +771,39 @@ class MiniMaxM3VLProcessor(BaseMultimodalProcessor):
         request_obj,
         **kwargs,
     ) -> dict:
+        # Opt-in through the existing preprocessing-cache budget. Keep mixed
+        # modalities, processor-output inputs and tokenized prompts on their
+        # established path; their reconstruction contracts differ.
+        if (
+            image_data
+            and isinstance(input_text, str)
+            and not audio_data
+            and not request_obj.video_data
+            and self.mm_preprocess_cache.enabled
+            and not self.gpu_image_decode
+            # Raw tensors and arrays skip the legacy per-request resize.
+            and not any(
+                isinstance(item, (torch.Tensor, np.ndarray)) for item in image_data
+            )
+            # Per-image resize options are handled by the legacy path only.
+            and all(_max_long_side_pixel(item) is None for item in image_data)
+            and self.image_config.get("device", "cpu") == "cpu"
+            # The legacy path leaves alias placeholders such as <image> as
+            # text, so only canonical prompts can take this path unchanged.
+            and self.mm_tokens.image_token_regex.findall(input_text)
+            == [self.IMAGE_TOKEN] * len(image_data)
+            and not any(self._is_preprocessed_input(item) for item in image_data)
+        ):
+            artifacts = await self.prepare_media_artifacts(
+                image_data,
+                content_hashes=request_obj.mm_content_hashes,
+            )
+            if self.mm_processor_executor is None:
+                return self.compose_image_artifacts(input_text, artifacts)
+            return await self.mm_processor_executor.run(
+                self.compose_image_artifacts, input_text, artifacts
+            )
+
         video_data = request_obj.video_data
         base_output = await self.load_mm_data(
             prompt=input_text,
