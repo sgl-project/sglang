@@ -468,14 +468,8 @@ class TestPriorityPreemptionUnderUnifiedMemory(CustomTestCase):
         override.install()
         self.addCleanup(override.restore)
         s = Scheduler.__new__(Scheduler)
-        s.schedule_policy = "fcfs"
-        s.tree_cache = MagicMock()
-        s.enable_hierarchical_cache = False
         s.enable_priority_scheduling = True
-        s.schedule_low_priority_values_first = False
-        s.metrics_reporter = SimpleNamespace(enable_metrics=False)
-        s.dllm_config = None
-        Scheduler.init_schedule_planner(s)
+        Scheduler.init_priority_preemption(s)
         return s.enable_priority_preemption
 
     def test_off_with_unified_memory(self):

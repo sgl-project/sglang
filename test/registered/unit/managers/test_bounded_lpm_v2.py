@@ -31,7 +31,7 @@ class TestBoundedLPMV2(CustomTestCase):
         self.p = SchedulePlanner(
             "lpm", RadixCache.create_simulated(), False, False, False
         )
-        self.p._lpm._should_start_bounded_batch = lambda waiting: True
+        self.p._bounded._should_start_batch = lambda waiting: True
         self.match = patch.object(
             self.p, "_compute_prefix_matches", return_value=set()
         ).start()
@@ -54,7 +54,7 @@ class TestBoundedLPMV2(CustomTestCase):
     def test_no_skip_never_opens_second_batch(self):
         q = self.ordered(make_requests(200))
         self.assertEqual(self.pass_with_skips(q, set()), q[:64])
-        self.assertFalse(self.p._lpm._bounded_next_selected)
+        self.assertFalse(self.p._bounded._next_selected)
         self.assertEqual(self.match.call_count, 1)
 
     def test_skip_opens_only_one_fixed_batch_and_retraction_cannot_refill(self):
@@ -66,8 +66,8 @@ class TestBoundedLPMV2(CustomTestCase):
         remaining = self.ordered([blocked] + q[128:] + [retracted])
         self.assertEqual(self.pass_with_skips(remaining, {blocked}), [])
         self.assertFalse(self.p.allows_admission(retracted))
-        self.assertTrue(self.p._lpm._bounded_next_selected)
-        self.assertEqual(self.p._lpm._bounded_next_members, [])
+        self.assertTrue(self.p._bounded._next_selected)
+        self.assertEqual(self.p._bounded._next_members, [])
 
     def test_break_before_boundary_does_not_match_or_open_next_batch(self):
         q = self.ordered(make_requests(200))
@@ -75,7 +75,7 @@ class TestBoundedLPMV2(CustomTestCase):
         self.p.mark_admission_skipped(next(candidates))
         next(candidates)  # this candidate does not fit; scheduler breaks here
         candidates.close()
-        self.assertFalse(self.p._lpm._bounded_next_selected)
+        self.assertFalse(self.p._bounded._next_selected)
         self.assertEqual(self.match.call_count, 1)
 
     def test_ready_member_precedes_next_batch_and_resets_skip_state(self):
@@ -99,8 +99,8 @@ class TestBoundedLPMV2(CustomTestCase):
         self.p.retire_waiting_members(q[64:100])
         self.p.retire_waiting_members(q[:64])
         self.ordered(q[100:] + q[64:100])
-        self.assertEqual(self.p._lpm._bounded_members, q[100:128])
-        self.assertFalse(self.p._lpm._bounded_next_selected)
+        self.assertEqual(self.p._bounded.members, q[100:128])
+        self.assertFalse(self.p._bounded._next_selected)
         self.assertFalse(self.p.allows_admission(q[64]))
 
     def test_next_batch_cancel_does_not_replenish(self):

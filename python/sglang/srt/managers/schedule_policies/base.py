@@ -54,23 +54,19 @@ def prefill_work(tree_cache: BasePrefixCache, r: Req) -> int:
 class BaseRanker:
     """Orders the waiting queue for admission.
 
-    A ranker reads requests, their prefix matches, and the tree cache; it never
-    matches prefixes or writes request or tree state (except gamma-Ada's
-    first-seen stamp). `SchedulePlanner` does both,
-    following ``match_plan``.
+    A ranker reads requests, their prefix matches, and the tree cache. It never
+    matches prefixes (`SchedulePlanner` does, following ``match_plan``) and
+    writes no request or tree state.
     """
 
     match_plan: MatchPlan = NoMatch()
-    # Above this many waiting requests, rank as plain FCFS without matching.
-    fcfs_fallback_queue_len: Optional[int] = None
+    # Above WAITING_QUEUE_PREFIX_MATCH_MAX waiting requests, rank as plain FCFS
+    # without matching.
+    falls_back_to_fcfs: bool = False
     # Admission order follows uncached prefill work (``prefill_rank``):
     # `SchedulePlanner` polls storage prefetches before ranking and caps the
     # active prefill chunk to leave room for requests ranked ahead of it.
     ranks_by_prefill_work: bool = False
-
-    def before_rank(self, waiting_queue: List[Req]) -> None:
-        """Called at the start of each pass that ranks with this ranker, before
-        any matching."""
 
     def sort(
         self,

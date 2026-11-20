@@ -4,11 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, List, Optional, Set
 
-from sglang.srt.managers.schedule_policies.base import (
-    WAITING_QUEUE_PREFIX_MATCH_MAX,
-    BaseRanker,
-    FullMatch,
-)
+from sglang.srt.managers.schedule_policies.base import BaseRanker, FullMatch
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -16,7 +12,7 @@ if TYPE_CHECKING:
 
 class HrrnRanker(BaseRanker):
     match_plan = FullMatch()
-    fcfs_fallback_queue_len = WAITING_QUEUE_PREFIX_MATCH_MAX
+    falls_back_to_fcfs = True
 
     @staticmethod
     def _uncached_len(r: Req) -> int:

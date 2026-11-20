@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import TYPE_CHECKING, Callable, List, Optional, Set
+from typing import TYPE_CHECKING, List, Optional, Set
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_policies.base import (
@@ -12,12 +12,12 @@ from sglang.srt.managers.schedule_policies.base import (
     HeadWindowMatch,
     prefill_work,
 )
-from sglang.srt.managers.schedule_policies.uniboost_gamma_ada import (
-    GammaAdaController,
-)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.managers.schedule_policies.uniboost_gamma_ada import (
+        GammaAdaController,
+    )
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 
 logger = logging.getLogger(__name__)
@@ -33,17 +33,16 @@ class UniBoostRanker(BaseRanker):
         self,
         tree_cache: BasePrefixCache,
         gamma: float,
-        enable_gamma_ada: bool,
+        gamma_ada: Optional[GammaAdaController],
         rank_invariant: bool,
-        step_clock: Optional[Callable[[], int]],
     ):
-        """``step_clock`` is a step counter identical on every rank; gamma-Ada
-        measures latency with it under rank invariance."""
+        """``gamma_ada``, when given, supplies the current gamma in place of
+        ``gamma``; the ranker only reads it."""
         self.tree_cache = tree_cache
         self.gamma = gamma
         self.alpha_s_per_token = envs.SGLANG_UNIBOOST_ALPHA_US_PER_TOKEN.get() / 1e6
         self.rank_invariant = rank_invariant
-        self.gamma_ada: Optional[GammaAdaController] = None
+        self.gamma_ada = gamma_ada
         # A shared-prefix group's leader is its highest-priority member.
         self.match_plan = HeadWindowMatch(
             window=UNIBOOST_MATCH_WINDOW_SIZE, leader_key=self._rank_key
@@ -59,20 +58,16 @@ class UniBoostRanker(BaseRanker):
         # The largest boost, b(alpha) ~= -ln(gamma * alpha) / gamma, must be finite.
         if not (gamma * alpha > 0 and math.isfinite(math.log(gamma * alpha) / gamma)):
             raise ValueError(f"uniboost_gamma={gamma} is too small for alpha={alpha}")
-        if enable_gamma_ada:
-            self.gamma_ada = GammaAdaController(
-                gamma, step_clock=step_clock if rank_invariant else None
-            )
         logger.info(
             "UniBoost enabled: gamma=%.4g /s, alpha=%.1f us/token, gamma-Ada=%s, "
             "arrival clock=%s",
             self._current_gamma(),
             alpha * 1e6,
-            "on" if enable_gamma_ada else "off",
+            "on" if gamma_ada is not None else "off",
             "processed tokens" if rank_invariant else "wall",
         )
 
-    def _phi(self, r: Req, work: int) -> float:
+    def prefill_rank(self, r: Req, work: int, processed_tokens: int) -> float:
         """``Phi = arrival - b(alpha * work)`` in seconds; lower is admitted first.
 
         ``b(w) = ln(1 / (1 - e^(-gamma * w))) / gamma`` decays to 0 for long work,
@@ -94,11 +89,7 @@ class UniBoostRanker(BaseRanker):
         return self.gamma
 
     def _rank_key(self, r: Req) -> float:
-        return self._phi(r, prefill_work(self.tree_cache, r))
-
-    def before_rank(self, waiting_queue: List[Req]) -> None:
-        if self.gamma_ada is not None:
-            self.gamma_ada.stamp_first_seen(waiting_queue)
+        return self.prefill_rank(r, prefill_work(self.tree_cache, r), 0)
 
     def sort(
         self,
@@ -109,6 +100,3 @@ class UniBoostRanker(BaseRanker):
         running_reqs: Optional[List[Req]] = None,
     ) -> None:
         waiting_queue.sort(key=self._rank_key)
-
-    def prefill_rank(self, r: Req, work: int, processed_tokens: int) -> float:
-        return self._phi(r, work)

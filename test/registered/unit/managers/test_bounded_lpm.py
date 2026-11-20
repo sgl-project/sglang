@@ -2,7 +2,7 @@ import argparse
 import unittest
 from unittest.mock import patch
 
-from sglang.srt.managers.schedule_policies.fcfs import FcfsRanker
+from sglang.srt.managers.schedule_policies.cache_agnostic import FcfsRanker
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     ListKind,
@@ -23,8 +23,8 @@ def planner(name="lpm", disabled=False, enabled=True):
     cache = RadixCache.create_simulated()
     cache.disable = disabled
     p = SchedulePlanner(name, cache, False, False, False, bounded_lpm_enabled=enabled)
-    if p._lpm is not None:
-        p._lpm._should_start_bounded_batch = lambda waiting: True
+    if p._bounded is not None:
+        p._bounded._should_start_batch = lambda waiting: True
     return p
 
 
@@ -89,7 +89,7 @@ class TestBoundedLPM(CustomTestCase):
             self.assertFalse(p.bounded_lpm_active)
             p.calc_priority(q)
             self.assertTrue(p.bounded_lpm_active)
-            self.assertEqual(len(p._lpm._bounded_members), 64)
+            self.assertEqual(len(p._bounded.members), 64)
 
     def test_member_rematches_and_newcomer_does_not_replace_it(self):
         p, q = planner(), requests(150)
@@ -98,7 +98,7 @@ class TestBoundedLPM(CustomTestCase):
             q[0].num_matched_prefix_tokens = 100
             result = p.calc_priority(q[:2] + q[64:])
             self.assertIs(result[0], q[0])
-            self.assertEqual(len(p._lpm._bounded_members), 2)
+            self.assertEqual(len(p._bounded.members), 2)
             self.assertFalse(p.allows_admission(q[64]))
 
     def test_departure_before_retraction_without_priority_call(self):
@@ -139,7 +139,7 @@ class TestBoundedLPM(CustomTestCase):
         s.schedule_low_priority_values_first = False
         s.dllm_config = None
         s.init_schedule_planner()
-        s.schedule_planner._lpm._should_start_bounded_batch = lambda waiting: True
+        s.schedule_planner._bounded._should_start_batch = lambda waiting: True
         self.assertIsNone(s.waiting_queue._on_leave)
         q = requests(150)
         move(q, s.waiting_queue)

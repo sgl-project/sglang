@@ -3,7 +3,7 @@ from array import array
 from unittest.mock import patch
 
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.managers.schedule_policies.fcfs import FcfsRanker
+from sglang.srt.managers.schedule_policies.cache_agnostic import FcfsRanker
 from sglang.srt.managers.schedule_policies.hrrn import HrrnRanker
 from sglang.srt.managers.scheduler_components.schedule_planner import SchedulePlanner
 from sglang.srt.mem_cache.radix_cache import RadixCache

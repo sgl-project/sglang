@@ -725,8 +725,12 @@ class Scheduler(
         # frontend starts.
         self.init_kv_events_publisher()
 
-        # Init the schedule planner and new token estimation
+        # Init the schedule planner, prefill delayer, priority preemption, and
+        # new token estimation
         self.init_schedule_planner()
+        self.init_prefill_delayer()
+        self.init_priority_preemption()
+        self.init_new_token_ratio_tracker()
 
         # Init watchdog, memory saver, input blocker and recv skipper
         self.init_watch_dog_memory_saver_input_blocker()
@@ -1539,7 +1543,6 @@ class Scheduler(
         )
 
     def init_schedule_planner(self):
-        # Init the schedule planner and new token estimation
         self.schedule_planner = SchedulePlanner(
             self.schedule_policy,
             self.tree_cache,
@@ -1560,6 +1563,8 @@ class Scheduler(
                 self.schedule_planner.retire_waiting_members if active else None
             )
         )
+
+    def init_prefill_delayer(self):
         self.prefill_delayer: Optional[PrefillDelayer] = None
         self.prefill_bs_tracker = RecentPrefillBatchSizeTracker(
             window_size=envs.SGLANG_PREFILL_DELAYER_MAX_PREFILL_BS_WINDOW_SIZE.get()
@@ -1583,6 +1588,7 @@ class Scheduler(
                     debug_log_enabled=get_parallel().attn_tp_rank == 0,
                 )
 
+    def init_priority_preemption(self):
         # NOTE: preemption is enabled by default for priority scheduling.
         # TODO(ch-wan): a unified pool admits by pricing demands, and preemption
         # does not yet ask admission itself whether its victims make room; it
@@ -1593,6 +1599,7 @@ class Scheduler(
             and not get_memory().enable_unified_memory
         )
 
+    def init_new_token_ratio_tracker(self):
         self.new_token_ratio_tracker = NewTokenRatioTracker.from_config()
 
     def feed_watchdog(self) -> None:

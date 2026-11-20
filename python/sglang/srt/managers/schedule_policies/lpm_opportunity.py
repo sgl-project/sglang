@@ -6,22 +6,6 @@ PREFIX_TOKENS = 4096
 RECHECK_PASSES = 32
 
 
-def _lcp(a, b):
-    for index, (left, right) in enumerate(zip(a, b)):
-        if left != right:
-            return index
-    return min(len(a), len(b))
-
-
-def _union_size(sequences):
-    ordered = sorted(sequences)
-    if not ordered:
-        return 0
-    return len(ordered[0]) + sum(
-        len(right) - _lcp(left, right) for left, right in zip(ordered, ordered[1:])
-    )
-
-
 def competition_opportunity(requests, capacity, *, include_pairs=True):
     """Queue-only interference proxy, not predicted cache savings.
 

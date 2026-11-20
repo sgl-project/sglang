@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING, Callable, Iterable, List, Optional, Set
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policies.base import (
     WAITING_QUEUE_PREFIX_MATCH_MAX,
     BaseRanker,
@@ -15,18 +14,23 @@ from sglang.srt.managers.schedule_policies.base import (
     NoMatch,
     prefill_work,
 )
+from sglang.srt.managers.schedule_policies.bounded_lpm import BoundedLpmAdmission
+from sglang.srt.managers.schedule_policies.cache_agnostic import (
+    FcfsRanker,
+    LofRanker,
+    PriorityFcfsRanker,
+    RandomRanker,
+    RoutingKeyRanker,
+)
 from sglang.srt.managers.schedule_policies.dfs_weight import DfsWeightRanker
-from sglang.srt.managers.schedule_policies.fcfs import FcfsRanker, PriorityFcfsRanker
 from sglang.srt.managers.schedule_policies.hrrn import HrrnRanker
-from sglang.srt.managers.schedule_policies.lof import LofRanker
 from sglang.srt.managers.schedule_policies.lpm import LpmRanker
 from sglang.srt.managers.schedule_policies.policy import SchedulePolicy
-from sglang.srt.managers.schedule_policies.random_order import RandomRanker
-from sglang.srt.managers.schedule_policies.routing_key import RoutingKeyRanker
 from sglang.srt.managers.schedule_policies.shortest_prefill import (
     ShortestPrefillFirstRanker,
 )
 from sglang.srt.managers.schedule_policies.uniboost import UniBoostRanker
+from sglang.srt.managers.schedule_policies.uniboost_gamma_ada import GammaAdaController
 from sglang.srt.managers.schedule_policy import PrefillAdder
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
@@ -40,9 +44,7 @@ from sglang.srt.runtime_context import get_disagg, get_memory
 from sglang.srt.utils.common import ceil_div
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_policies.uniboost_gamma_ada import (
-        GammaAdaController,
-    )
+    from sglang.srt.managers.schedule_batch import Req
 
 # Threshold for in-batch prefix cache.
 # If a request has a matched prefix length (against existing cache) less than this value,
@@ -82,7 +84,15 @@ class SchedulePlanner:
         uniboost_step_clock: Optional[Callable[[], int]] = None,
     ):
         self.on_bounded_lpm_state_change: Optional[Callable[[bool], None]] = None
-        self.policy = self._validate_and_adjust_policy(policy, tree_cache)
+        try:
+            policy_enum = SchedulePolicy(policy)
+        except ValueError:
+            raise ValueError(f"Unknown schedule_policy: {policy=}")
+        cache_disabled = getattr(tree_cache, "disable", True)
+        if cache_disabled and policy_enum == SchedulePolicy.SHORTEST_PREFILL_FIRST:
+            raise ValueError(
+                "Experimental shortest-prefill-first requires prefix caching"
+            )
         if not math.isfinite(shortest_prefill_aging_factor) or (
             shortest_prefill_aging_factor < 0
         ):
@@ -91,54 +101,79 @@ class SchedulePlanner:
             )
         if (
             shortest_prefill_aging_factor
-            and self.policy != SchedulePolicy.SHORTEST_PREFILL_FIRST
+            and policy_enum != SchedulePolicy.SHORTEST_PREFILL_FIRST
         ):
             raise ValueError(
                 "shortest_prefill_aging_factor requires schedule_policy=shortest-prefill-first"
             )
         self.tree_cache = tree_cache
         priority_sign = 1 if schedule_low_priority_values_first else -1
-        if self.policy == SchedulePolicy.FCFS:
-            self.ranker = (
-                PriorityFcfsRanker(priority_sign)
-                if enable_priority_scheduling
-                else FcfsRanker()
-            )
-        elif self.policy == SchedulePolicy.LOF:
-            self.ranker = LofRanker(enable_priority_scheduling, priority_sign)
-        elif self.policy == SchedulePolicy.RANDOM:
-            self.ranker = RandomRanker()
-        elif self.policy == SchedulePolicy.ROUTING_KEY:
-            self.ranker = RoutingKeyRanker()
-        elif self.policy == SchedulePolicy.LPM:
-            self.ranker = LpmRanker(
-                tree_cache, enable_hierarchical_cache, bounded_lpm_enabled
-            )
-        elif self.policy == SchedulePolicy.DFS_WEIGHT:
-            self.ranker = DfsWeightRanker(tree_cache)
-        elif self.policy == SchedulePolicy.HRRN:
-            self.ranker = HrrnRanker()
-        elif self.policy == SchedulePolicy.SHORTEST_PREFILL_FIRST:
-            self.ranker = ShortestPrefillFirstRanker(
-                tree_cache, shortest_prefill_aging_factor
-            )
-        elif self.policy == SchedulePolicy.UNIBOOST:
-            self.ranker = UniBoostRanker(
-                tree_cache,
-                uniboost_gamma,
-                enable_uniboost_gamma_ada,
-                uniboost_rank_invariant,
-                uniboost_step_clock,
-            )
-        if enable_uniboost_gamma_ada and self.policy != SchedulePolicy.UNIBOOST:
+
+        # Owned here: the scheduler feeds it finished requests, the planner stamps
+        # first-seen steps, and the UniBoost ranker reads its gamma.
+        if enable_uniboost_gamma_ada and policy_enum != SchedulePolicy.UNIBOOST:
             raise ValueError(
                 "enable_uniboost_gamma_ada requires schedule_policy=uniboost"
             )
-        self._lpm = self.ranker if isinstance(self.ranker, LpmRanker) else None
         self.uniboost_gamma_ada: Optional[GammaAdaController] = (
-            self.ranker.gamma_ada if isinstance(self.ranker, UniBoostRanker) else None
+            GammaAdaController(
+                uniboost_gamma,
+                step_clock=uniboost_step_clock if uniboost_rank_invariant else None,
+            )
+            if enable_uniboost_gamma_ada
+            else None
         )
-        # What a ranker ranks as above its fcfs_fallback_queue_len.
+
+        def make_ranker(p: SchedulePolicy) -> BaseRanker:
+            if p == SchedulePolicy.FCFS:
+                return (
+                    PriorityFcfsRanker(priority_sign)
+                    if enable_priority_scheduling
+                    else FcfsRanker()
+                )
+            elif p == SchedulePolicy.LOF:
+                return LofRanker(priority_sign if enable_priority_scheduling else None)
+            elif p == SchedulePolicy.RANDOM:
+                return RandomRanker()
+            elif p == SchedulePolicy.ROUTING_KEY:
+                return RoutingKeyRanker()
+            elif p == SchedulePolicy.LPM:
+                return LpmRanker()
+            elif p == SchedulePolicy.DFS_WEIGHT:
+                return DfsWeightRanker(tree_cache)
+            elif p == SchedulePolicy.HRRN:
+                return HrrnRanker()
+            elif p == SchedulePolicy.SHORTEST_PREFILL_FIRST:
+                return ShortestPrefillFirstRanker(
+                    tree_cache, shortest_prefill_aging_factor
+                )
+            elif p == SchedulePolicy.UNIBOOST:
+                return UniBoostRanker(
+                    tree_cache,
+                    uniboost_gamma,
+                    self.uniboost_gamma_ada,
+                    uniboost_rank_invariant,
+                )
+            raise ValueError(f"No ranker for schedule_policy: {p}")
+
+        self.ranker = make_ranker(policy_enum)
+        # A ranker that matches prefixes falls back to FCFS without a prefix
+        # cache. UniBoost still works without one: every prompt token counts
+        # as uncached work.
+        if (
+            cache_disabled
+            and not isinstance(self.ranker.match_plan, NoMatch)
+            and policy_enum != SchedulePolicy.UNIBOOST
+        ):
+            policy_enum = SchedulePolicy.FCFS
+            self.ranker = make_ranker(policy_enum)
+        self.policy = policy_enum
+        self._bounded: Optional[BoundedLpmAdmission] = (
+            BoundedLpmAdmission(tree_cache, enable_hierarchical_cache)
+            if self.policy == SchedulePolicy.LPM and bounded_lpm_enabled
+            else None
+        )
+        # Ranks long queues for a ranker that falls_back_to_fcfs.
         self._fcfs_fallback = FcfsRanker()
         self._waiting_prefix_refresh_calls = 0
 
@@ -154,15 +189,16 @@ class SchedulePlanner:
     ) -> List[Req]:
         """The waiting requests in the order the policy admits them."""
         waiting_queue = list(waiting)
-        if self._lpm is not None and self._lpm.bounded_engaged(len(waiting_queue)):
-            if (
-                self._lpm.refresh_bounded_members(waiting_queue)
-                and self.on_bounded_lpm_state_change is not None
-            ):
-                self.on_bounded_lpm_state_change(self._lpm.bounded_active)
+        if (
+            self._bounded is not None
+            and self._bounded.refresh(waiting_queue)
+            and self.on_bounded_lpm_state_change is not None
+        ):
+            self.on_bounded_lpm_state_change(self._bounded.active)
 
         if self.bounded_lpm_active:
-            members, tail = self._lpm.split_waiting(waiting_queue)
+            self._bounded.reset_skipped()
+            members, tail = self._bounded.split(waiting_queue)
             # Keep the existing FCFS refresh cadence/cap for non-members.
             # Touch them first so matching the current batch makes its prefixes
             # more recent. Fast-match caches retain the existing match-anyway path.
@@ -176,10 +212,13 @@ class SchedulePlanner:
             if not members:
                 return waiting_queue
             deprioritized = self._compute_prefix_matches(members)
-            return self._lpm.bounded_order(deprioritized, tail)
+            self.ranker.sort(members, deprioritized)
+            return self._bounded.order(tail)
 
         ranker = self._active_ranker(waiting_queue)
-        ranker.before_rank(waiting_queue)
+        if self.uniboost_gamma_ada is not None:
+            # gamma-Ada measures latency from a request's first ranking pass.
+            self.uniboost_gamma_ada.stamp_first_seen(waiting_queue)
         plan = ranker.match_plan
         if isinstance(plan, NoMatch):
             # Cache-agnostic policies sort without matching; match anyway so the load
@@ -219,15 +258,15 @@ class SchedulePlanner:
     @property
     def bounded_lpm_active(self) -> bool:
         """Whether admission is limited to bounded LPM's current batch."""
-        return self._lpm is not None and self._lpm.bounded_active
+        return self._bounded is not None and self._bounded.active
 
     def retire_waiting_members(self, reqs: Iterable[Req]) -> None:
-        if self._lpm is not None:
-            self._lpm.retire_waiting_members(reqs)
+        if self._bounded is not None:
+            self._bounded.retire(reqs)
 
     def mark_admission_skipped(self, req: Req) -> None:
-        if self._lpm is not None:
-            self._lpm.mark_admission_skipped(req)
+        if self._bounded is not None:
+            self._bounded.mark_skipped(req)
 
     def admission_candidates(self, waiting: Iterable[Req]) -> Iterable[Req]:
         """Yield current members first, then at most one fixed fallback batch.
@@ -239,15 +278,16 @@ class SchedulePlanner:
         if not self.bounded_lpm_active:
             yield from waiting
             return
-        yield from self._lpm.admission_members()
-        next_members = self._lpm.fallback_members(waiting)
+        self._bounded.reset_skipped()
+        yield from self._bounded.members
+        next_members = self._bounded.fallback_members(waiting)
         if next_members:
             deprioritized = self._compute_prefix_matches(next_members)
-            self._lpm.sort(next_members, deprioritized)
+            self.ranker.sort(next_members, deprioritized)
             yield from next_members
 
     def allows_admission(self, req: Req) -> bool:
-        return self._lpm is None or self._lpm.allows_admission(req)
+        return self._bounded is None or self._bounded.allows_admission(req)
 
     def _touch_waiting_prefixes(
         self,
@@ -280,8 +320,10 @@ class SchedulePlanner:
             touch_waiting_prefix(r, self.tree_cache)
 
     def _active_ranker(self, waiting_queue: List[Req]) -> BaseRanker:
-        limit = self.ranker.fcfs_fallback_queue_len
-        if limit is not None and len(waiting_queue) > limit:
+        if (
+            self.ranker.falls_back_to_fcfs
+            and len(waiting_queue) > WAITING_QUEUE_PREFIX_MATCH_MAX
+        ):
             # Turn off the expensive prefix matching and sorting when the #queue is large.
             return self._fcfs_fallback
         return self.ranker
@@ -294,29 +336,6 @@ class SchedulePlanner:
             not isinstance(ranker.match_plan, NoMatch)
             or self.tree_cache.supports_fast_match_prefix()
         )
-
-    def _validate_and_adjust_policy(
-        self, policy: str, tree_cache: BasePrefixCache
-    ) -> SchedulePolicy:
-        """
-        Validates the policy and adjusts it if necessary based on tree cache settings.
-        """
-        try:
-            policy_enum = SchedulePolicy(policy)
-        except ValueError:
-            raise ValueError(f"Unknown schedule_policy: {policy=}")
-        if policy_enum.cache_aware and getattr(tree_cache, "disable", True):
-            if policy_enum == SchedulePolicy.UNIBOOST:
-                # UniBoost still works without a prefix cache: every
-                # prompt token counts as uncached work.
-                return policy_enum
-            if policy_enum == SchedulePolicy.SHORTEST_PREFILL_FIRST:
-                raise ValueError(
-                    "Experimental shortest-prefill-first requires prefix caching"
-                )
-            # If tree_cache is disabled, fall back to a cache-agnostic policy.
-            return SchedulePolicy.FCFS
-        return policy_enum
 
     def _compute_prefix_matches(
         self,
@@ -406,8 +425,9 @@ class SchedulePlanner:
         window = waiting_queue[: plan.window]
         deprioritized = self._compute_prefix_matches(window, plan.leader_key)
         rank(window, deprioritized)
-        # As in LPM and SPF, a request sharing a leader's uncached prefix waits
-        # at the end of the queue until the leader has cached it.
+        # As in LPM and shortest-prefill-first, a request sharing a leader's
+        # uncached prefix waits at the end of the queue until the leader has
+        # cached it.
         waiting_queue[:] = (
             [r for r in window if r.rid not in deprioritized]
             + waiting_queue[plan.window :]

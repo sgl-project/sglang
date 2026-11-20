@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Request scheduler policy"""
+"""Prefill admission: `PrefillAdder` and its helpers."""
 
 import os
 from contextlib import contextmanager, nullcontext

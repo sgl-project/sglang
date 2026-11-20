@@ -215,7 +215,7 @@ class TestBoundedV2SkippedAdmission(TestHeldRowAdmission):
                 s.schedule_planner = SchedulePlanner(
                     "lpm", RadixCache.create_simulated(), False, False, False
                 )
-                s.schedule_planner._lpm._should_start_bounded_batch = Mock(
+                s.schedule_planner._bounded._should_start_batch = Mock(
                     return_value=True
                 )
                 s.schedule_planner._compute_prefix_matches = Mock(return_value=set())
@@ -255,7 +255,7 @@ class TestBoundedV2SkippedAdmission(TestHeldRowAdmission):
                     with self.assertRaises(_BatchBuilt) as built:
                         s._get_new_batch_prefill_raw(None, ScheduleBatch(reqs=running))
                 self.assertEqual(built.exception.args[0], [final_chunk, waiting[64]])
-                self.assertTrue(s.schedule_planner._lpm._bounded_next_selected)
+                self.assertTrue(s.schedule_planner._bounded._next_selected)
                 self.assertTrue(
                     all(req not in blocked for req in built.exception.args[0])
                 )

@@ -5,7 +5,8 @@ from unittest.mock import Mock, patch
 
 from sglang.srt.disaggregation.decode import DecodeRequest
 from sglang.srt.disaggregation.mode import DisaggregationMode
-from sglang.srt.managers.schedule_policies.fcfs import FcfsRanker
+from sglang.srt.managers.schedule_policies.bounded_lpm import BoundedLpmAdmission
+from sglang.srt.managers.schedule_policies.cache_agnostic import FcfsRanker
 from sglang.srt.managers.schedule_policies.lpm import LpmRanker
 from sglang.srt.managers.scheduler_components.load_inquirer import (
     SchedulerLoadInquirer,
@@ -26,7 +27,8 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 class TestSchedulePolicyWaitingQueueMatching(unittest.TestCase):
     def make_lpm_planner(self, supports_fast_match_prefix):
         planner = object.__new__(SchedulePlanner)
-        planner.ranker = planner._lpm = LpmRanker(None, False, True)
+        planner.ranker = LpmRanker()
+        planner._bounded = BoundedLpmAdmission(None, False)
         planner._fcfs_fallback = FcfsRanker()
         planner.tree_cache = SimpleNamespace(
             supports_fast_match_prefix=lambda: supports_fast_match_prefix
@@ -41,7 +43,7 @@ class TestSchedulePolicyWaitingQueueMatching(unittest.TestCase):
         planner.tree_cache = SimpleNamespace(supports_fast_match_prefix=lambda: True)
         self.assertTrue(planner.waiting_queue_prefix_matched([None] * 129))
 
-        planner._lpm._bounded_active = True
+        planner._bounded.active = True
         self.assertFalse(planner.waiting_queue_prefix_matched([None] * 129))
 
 
