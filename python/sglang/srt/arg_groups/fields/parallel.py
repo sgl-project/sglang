@@ -248,6 +248,17 @@ class Parallel(msgspec.Struct):
         bool,
         "Shard dense MLP weights across the attention TP group under DP attention.",
     ] = False
+    kda_dwdp_size: A[
+        Optional[int],
+        "DWDP for Kimi-K3 KDA projection and shared-expert weights on PD prefill "
+        "workers (--disaggregation-mode prefill) under attention DP: each group of "
+        "this many attention-DP ranks holding the same attention-TP slice keeps 1/N "
+        "of every KDA layer's [q,k,v,g] in-projection and o_proj (and of the shared "
+        "experts when they would be replicated), and gathers a layer's full weights "
+        "over NVLink just before it runs. Must divide the attention-DP size. Saves "
+        "~(1 - 1/N) of those weights per rank (about 53 GB for K3 at attention TP 1, "
+        "N=8) for one layer-weight gather per sharded layer per forward.",
+    ] = None
     enable_layernorm_sp: A[
         bool,
         "Enable Megatron-style sequence parallelism (arXiv:2205.05198) for the "
@@ -288,14 +299,17 @@ class Parallel(msgspec.Struct):
     ] = None
     disable_attn_tp_gather: A[
         bool,
-        "Disable scheduler-side attn_tp_gather (the upstream SP path "
-        "that pads num_tokens to attn_tp_size and pre-allocates a gathered "
-        "buffer). Use for models that manage SP scatter/gather at the "
-        "model level (e.g., perform their own all_gather/reduce_scatter "
-        "inside attention) and do not consume the upstream gathered_buffer. "
-        "Without this, the cuda graph runner pads num_tokens to attn_tp_size, "
-        "which can cause kernel autotuners to select wrong-sized variants "
-        "at small batches.",
+        Arg(
+            help="Disable scheduler-side attn_tp_gather (the upstream SP path "
+            "that pads num_tokens to attn_tp_size and pre-allocates a gathered "
+            "buffer). Use for models that manage SP scatter/gather at the "
+            "model level (e.g., perform their own all_gather/reduce_scatter "
+            "inside attention) and do not consume the upstream gathered_buffer. "
+            "Without this, the cuda graph runner pads num_tokens to attn_tp_size, "
+            "which can cause kernel autotuners to select wrong-sized variants "
+            "at small batches.",
+            resolvable=True,
+        ),
     ] = False
     enable_p2p_check: A[
         bool,

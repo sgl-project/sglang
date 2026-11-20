@@ -31,6 +31,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
 )
 from sglang.multimodal_gen.configs.quantization.nunchaku import NunchakuSVDQuantArgs
 from sglang.multimodal_gen.configs.quantization.qvg_kv import QVGKVQuantArgs
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 from sglang.multimodal_gen.configs.utils import expand_path_fields
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
@@ -996,6 +997,9 @@ class ServerArgs(DisaggServerArgsMixin):
             and replica_size > 1
         )
 
+        if self.pipeline_config.task_type == ModelTaskType.S2V:
+            return
+
         if fold_replica:
             mode = "replica"
         elif fold_world:
@@ -1281,15 +1285,16 @@ class ServerArgs(DisaggServerArgsMixin):
         if (
             self.backend != Backend.DIFFUSERS
             and isinstance(self.pipeline_config, MiniMaxH3PipelineConfig)
-            and self.attention_backend == "laser_attn"
+            and self.attention_backend in ("laser_attn", "ascend_sparse_attn")
             and "text_encoder" not in self.component_attention_backends
             and "text_encoder" not in self.component_attention_backend_roles
         ):
-            # Laser Attention is used only by the MiniMax-H3 transformer.
-            # SDPA is faster than Ascend FA for its Qwen3-VL text encoder.
+            # Laser and Ascend sparse attention target the H3 transformer. Keep the
+            # Qwen3-VL text encoder on SDPA to preserve its causal mask semantics.
             logger.info(
                 "Automatically set torch_sdpa backend for the MiniMax H3 text "
-                "encoder; laser_attn applies to the transformer"
+                "encoder; %s applies to the transformer",
+                self.attention_backend,
             )
             self.component_attention_backends["text_encoder"] = "torch_sdpa"
 
