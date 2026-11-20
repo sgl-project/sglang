@@ -9,7 +9,7 @@ from sglang.srt.utils.xpu_vmm_utils import XpuVmmBackend, query_page_size
 from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_xpu_ci(est_time=10, suite="stage-b-test-1-gpu-xpu")
+register_xpu_ci(est_time=10, suite="extra-test-1-gpu-xpu")
 
 
 @unittest.skipUnless(torch.xpu.is_available(), "requires Intel XPU")

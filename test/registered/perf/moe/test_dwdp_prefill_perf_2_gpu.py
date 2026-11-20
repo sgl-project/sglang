@@ -7,7 +7,7 @@ from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.dwdp_test_utils import assert_prefill_perf_vs_tp
 from sglang.test.test_utils import CustomTestCase
 
-register_xpu_ci(est_time=2400, suite="nightly-xpu-kernel-main-2-gpu", nightly=True)
+register_xpu_ci(est_time=2400, suite="nightly-kernel-main-test-2-gpu-xpu", nightly=True)
 
 NUM_GPUS = 2
 

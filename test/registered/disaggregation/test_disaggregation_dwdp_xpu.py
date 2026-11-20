@@ -15,7 +15,7 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
     configure_nixl_pd_backend,
 )
 
-register_xpu_ci(est_time=1200, suite="nightly-xpu-kernel-main-4-gpu", nightly=True)
+register_xpu_ci(est_time=1200, suite="nightly-kernel-main-test-4-gpu-xpu", nightly=True)
 
 MODEL = "openai/gpt-oss-20b"
 # UCX's shared-memory transport breaks on XPU (docs/hardware-platforms/xpu.mdx)

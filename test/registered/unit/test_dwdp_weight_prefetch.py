@@ -42,7 +42,7 @@ from sglang.test.kernels.utils import (
 )
 
 register_cuda_ci(est_time=90, stage="extra-b", runner_config="4-gpu-b200")
-register_xpu_ci(est_time=60, suite="nightly-xpu-kernel-main-4-gpu", nightly=True)
+register_xpu_ci(est_time=60, suite="nightly-kernel-main-test-4-gpu-xpu", nightly=True)
 
 # DWDP has no CPU path to fall back to
 pytestmark = pytest.mark.skipif(
