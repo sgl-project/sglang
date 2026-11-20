@@ -454,6 +454,7 @@ DFlash V2 on MI355X, measured in [SemiAnalysis InferenceX](https://inferencex.se
 - **Container image.** `lmsysorg/sglang-rocm:muse-spark-open-mi355-1106`.
 - **Monokernels.** At low concurrency, add the monokernel flags below.
 - **HiCache.** At high concurrency, add the TP4 HiCache flags below instead. `--hicache-size` is the host tier in GB per rank, so 310 GB needs about 1.24 TB of host memory across the four ranks.
+- **Concurrency 58.** With the HiCache flags, also set `SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS=1` and `HSA_ENABLE_SCRATCH_ASYNC_RECLAIM=0` (block below). The first frees SWA KV slots that have left the sliding window; without it the SWA pool saturates above concurrency 40 and higher concurrency does not raise throughput. The second avoids `HSA_STATUS_ERROR_OUT_OF_RESOURCES` on the TP4 ranks. This point is submitted to InferenceX in [SemiAnalysisAI/InferenceX#5155](https://github.com/SemiAnalysisAI/InferenceX/pull/5155).
 
 ```bash Command
 SGLANG_USE_AITER=1 \
@@ -515,6 +516,11 @@ SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION=1 \
   --hicache-write-policy write_through \
   --hicache-io-backend kernel \
   --hicache-mem-layout page_first
+```
+
+```bash HiCache, concurrency 58 (add)
+SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS=1 \
+HSA_ENABLE_SCRATCH_ASYNC_RECLAIM=0 \
 ```
 
 ### TPU v7 deployment measured with SemiAnalysis InferenceX
