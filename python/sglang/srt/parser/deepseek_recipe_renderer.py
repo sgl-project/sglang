@@ -5,15 +5,12 @@ from __future__ import annotations
 
 import copy
 import functools
-import itertools
 import json
 import logging
 import re
 import uuid
 from types import ModuleType
 from typing import Any, Optional, Union
-
-import msgspec
 
 DEEPSEEK_RECIPE_INSTALL_HINT = (
     "Serving DeepSeek-V4 / V4.1 requires the `deepseek-recipe` package (DeepSeek's "
@@ -43,9 +40,6 @@ TASKS_AFTER_HEADER = ("action",)
 BUDGET_TIER, BUDGET_TIER_VALUE = "high", 75
 TOOL_SEARCH = "tool_search"
 TOOL_SEARCH_OUTPUT = "tool_search_output"
-# recipe takes one definition per tool name, so a search result's redefinition of a
-# callable function converts under such a name until restoration gives its own back.
-REDEFINED_NAME_PREFIX = "sglang_redefined_"
 # Converted in the search tool's place beside strict tools, keeping its position and
 # name check: recipe reads its search tool as non-strict and rejects mixed strictness.
 STRICT_SEARCH_STAND_IN = {
@@ -118,17 +112,16 @@ def pre_normalize(body: dict[str, Any]) -> dict[str, Any]:
 
 def loaded_tools(conversation: Any) -> list[Any]:
     """The tools the model can call after `conversation`'s history: those it does
-    not defer and the deferred ones a system message has loaded, each as the last
-    system message to load it defines it."""
+    not defer and the deferred ones a system message has loaded."""
     recipe = load_deepseek_recipe()
     loaded = {
-        tool.name: tool
+        tool.name
         for message in conversation.messages
         if isinstance(message, recipe.SystemMessage)
         for tool in message.tools or []
     }
     return [
-        loaded.get(tool.name, tool)
+        tool
         for tool in conversation.tools
         if not tool.defer_loading or tool.name in loaded
     ]
@@ -166,134 +159,121 @@ def _discovered_tools(body: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
-def _responses_namespaces(body: dict[str, Any]) -> list[dict[str, Any]]:
-    """The namespace tools a Responses body declares and its history discovers, in
-    the order recipe's conversion names their members."""
-    return [
-        tool
-        for tool in [*body["tools"], *_discovered_tools(body)]
-        if tool["type"] == "namespace"
-    ]
-
-
-def _definition(
+def _definition_key(
     tool: dict[str, Any], namespace: Optional[dict[str, Any]] = None
-) -> dict[str, Any]:
+) -> str:
     """The fields that render of `tool`, a function or custom tool or a member of
-    `namespace`."""
+    `namespace`, as JSON: unlike dict equality, it tells `true` from `1`."""
     fields = {k: v for k, v in tool.items() if k != "defer_loading" and v is not None}
     if namespace is not None:
-        fields["namespace"] = _definition(
-            {k: v for k, v in namespace.items() if k != "tools"}
-        )
-    return fields
+        fields["namespace"] = {
+            k: v
+            for k, v in namespace.items()
+            if k not in ("tools", "defer_loading") and v is not None
+        }
+    return json.dumps(fields, sort_keys=True)
 
 
-class _ResultEntry(msgspec.Struct, frozen=True):
-    """One entry of a search result, in the order its JSON array lists them: the
-    converted result's next entry when `converted`, which `alone`, if given,
-    replaces; else `alone`'s rendering as a search result's only entry."""
-
-    converted: bool
-    alone: Optional[dict[str, Any]] = None
-
-
-class _Relistings(msgspec.Struct, frozen=True, kw_only=True):
-    """A Responses body as converted when its search results list tools that are
-    already callable: a repeated definition is left out of its result, and a
-    redefined function converts under a name of its own."""
-
-    body: dict[str, Any]
-    redefined: dict[str, str]
-    """The name each redefinition converts under, mapped to the tool's own name."""
-    results: dict[str, list[_ResultEntry]]
-    """By call_id, the entries of each result that relists a tool."""
-
-
-def _relistings(body: dict[str, Any]) -> _Relistings:
-    callable_tools = {}
-    for tool in body["tools"]:
-        if tool["type"] == "namespace":
-            for member in tool["tools"]:
-                key = (tool["name"], member["name"])
-                callable_tools[key] = _definition(member, tool)
-        elif tool["type"] in ("function", "custom"):
-            callable_tools[(None, tool["name"])] = _definition(tool)
-    # A namespace member's call name always has its namespace's prefix, so only
-    # top-level names can collide with a converted redefinition's.
-    in_use = {tool.get("name") for tool in [*body["tools"], *_discovered_tools(body)]}
-    unused = (
-        name
-        for name in map(f"{REDEFINED_NAME_PREFIX}{{}}".format, itertools.count())
-        if name not in in_use
-    )
-    redefined = {}
-
-    def listed(tool: dict[str, Any]) -> tuple[list[_ResultEntry], Optional[dict]]:
-        """The entries `tool` renders as, and `tool` as converted; None when no part
-        of it is."""
-        if tool["type"] == "namespace":
-            entries, members = [], []
-            for member in tool["tools"]:
-                key, definition = (
-                    (tool["name"], member["name"]),
-                    _definition(member, tool),
-                )
-                if callable_tools.get(key) == definition:
-                    entries.append(_ResultEntry(False, {**tool, "tools": [member]}))
-                    continue
-                callable_tools[key] = definition
-                entries.append(_ResultEntry(True))
-                members.append(member)
-            converted = {**tool, "tools": members}
-            return entries, converted if members or not tool["tools"] else None
-        key, definition = (None, tool["name"]), _definition(tool)
-        earlier = callable_tools.get(key)
-        callable_tools[key] = definition
-        if earlier is None:
-            return [_ResultEntry(True)], tool
-        # recipe renders one apply_patch, whatever fields a listing gives it.
-        if earlier == definition or tool["type"] == "custom":
-            return [_ResultEntry(False, tool)], None
-        name = next(unused)
-        redefined[name] = tool["name"]
-        return [_ResultEntry(True, tool)], {**tool, "name": name}
-
-    items = []
+def _without_repeats(
+    body: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, list[Optional[tuple[str, int]]]]]:
+    """`body` without the search-result entries that repeat the definition last
+    listed under their name; and by call_id, each result's items, one per tool or
+    namespace member: None where recipe renders it, else the (call_id, index) of
+    the item to copy."""
+    listed: dict[tuple[Optional[str], str], tuple[str, tuple[str, int]]] = {}
     results = {}
+    items = []
     for item in body["input"]:
         if isinstance(item, dict) and item.get("type") == TOOL_SEARCH_OUTPUT:
-            entries, tools = [], []
+            call_id = item.get("call_id")
+            entries = results[call_id] = []
+            tools = []
             for tool in item["tools"]:
-                tool_entries, converted = listed(tool)
-                entries += tool_entries
-                if converted is not None:
-                    tools.append(converted)
-            if any(not entry.converted or entry.alone for entry in entries):
-                results[item.get("call_id")] = entries
+                namespace = tool if tool["type"] == "namespace" else None
+                kept = []
+                for member in namespace["tools"] if namespace else [tool]:
+                    key = (namespace["name"] if namespace else None, member["name"])
+                    definition = _definition_key(member, namespace)
+                    earlier = listed.get(key)
+                    if earlier is not None and earlier[0] == definition:
+                        entries.append(earlier[1])
+                        continue
+                    listed[key] = (definition, (call_id, len(entries)))
+                    entries.append(None)
+                    kept.append(member)
+                if namespace:
+                    tools.append({**tool, "tools": kept})
+                elif kept:
+                    tools.append(tool)
             item = {**item, "tools": tools}
         items.append(item)
-    return _Relistings(
-        body={**body, "input": items}, redefined=redefined, results=results
-    )
+    return {**body, "input": items}, results
+
+
+def _with_repeats(
+    conversation: Any, results: dict[str, list[Optional[tuple[str, int]]]]
+) -> Any:
+    """`conversation` whose search results list every entry again, as
+    `_without_repeats` describes them."""
+    if all(source is None for entries in results.values() for source in entries):
+        return conversation
+    recipe = load_deepseek_recipe()
+    rendered: dict[str, list[str]] = {}
+    messages = []
+    for message in conversation.messages:
+        entries = isinstance(message, recipe.ToolMessage) and results.get(
+            message.tool_call_id
+        )
+        if entries:
+            converted = _json_array_items(message.content)
+            if len(converted) != entries.count(None):
+                raise RuntimeError(
+                    f"deepseek-recipe rendered {len(converted)} tools for search "
+                    f"result {message.tool_call_id!r}, not {entries.count(None)}"
+                )
+            converted = iter(converted)
+            items = rendered[message.tool_call_id] = []
+            for source in entries:
+                items.append(
+                    next(converted)
+                    if source is None
+                    else rendered[source[0]][source[1]]
+                )
+            message = recipe.ToolMessage(
+                "[" + ",".join(items) + "]", message.tool_call_id
+            )
+        messages.append(message)
+    return _replaced(conversation, messages=messages)
 
 
 def _json_array_items(array: str) -> list[str]:
     """The items of `array`, a compact JSON array, as it spells them."""
     decoder = json.JSONDecoder()
     items, index = [], 1
-    while array[index] != "]":
+    while array[index : index + 1] not in ("]", ""):
         _, end = decoder.raw_decode(array, index)
         items.append(array[index:end])
-        index = end + (array[end] == ",")
+        index = end + (array[end : end + 1] == ",")
+    if "[" + ",".join(items) + "]" != array:
+        raise RuntimeError("deepseek-recipe rendered a malformed search result")
     return items
 
 
-def _renamed(tool: Any, name: str) -> Any:
+def _with_host_settings(
+    conversation: Any, *, response_schema: Optional[dict[str, Any]]
+) -> Any:
+    """`conversation` with what recipe's Responses and Messages conversions leave
+    out: a JSON response schema, and SGLang's reading of a trailing assistant turn,
+    re-sent as a user turn."""
     recipe = load_deepseek_recipe()
-    return recipe.ToolDefinition(
-        name, tool.description, tool.parameters, tool.strict, tool.defer_loading
-    )
+    fields = {} if response_schema is None else {"response_schema": response_schema}
+    messages = conversation.messages
+    if messages and messages[-1].role == "assistant":
+        # recipe closes the turn and opens another; SGLang, as
+        # `_handle_last_assistant_message`, re-sends it as a user turn.
+        fields["messages"] = [*messages[:-1], recipe.UserMessage(messages[-1].content)]
+    return _replaced(conversation, **fields) if fields else conversation
 
 
 def _error_message(body: Any) -> str:
@@ -529,7 +509,12 @@ class DeepSeekRecipe:
         )
 
     def convert_native(
-        self, protocol: str, body: dict[str, Any], *, thinking: bool
+        self,
+        protocol: str,
+        body: dict[str, Any],
+        *,
+        thinking: bool,
+        response_schema: Optional[dict[str, Any]],
     ) -> tuple[Any, dict[str, tuple[str, str]]]:
         """Convert a Responses or Messages request to recipe's `Conversation` in the
         host's thinking mode, with the namespace and name each namespace member's
@@ -537,8 +522,11 @@ class DeepSeekRecipe:
         recipe = load_deepseek_recipe()
         options = self._options.with_default_thinking_mode(thinking)
         if protocol == "messages":
-            return self._converted(recipe.MessagesRequest, body, options), {}
-        return self._convert_responses(body, options)
+            conversation = self._converted(recipe.MessagesRequest, body, options)
+            names = {}
+        else:
+            conversation, names = self._convert_responses(body, options)
+        return _with_host_settings(conversation, response_schema=response_schema), names
 
     def _converted(self, request_type: Any, body: dict[str, Any], options: Any) -> Any:
         recipe = load_deepseek_recipe()
@@ -552,23 +540,21 @@ class DeepSeekRecipe:
         self, body: dict[str, Any], options: Any
     ) -> tuple[Any, dict[str, tuple[str, str]]]:
         """recipe's conversion of a Responses `body`, where strict tools may stand
-        beside the search tool and a search result may list a callable tool again,
-        and the namespace and name each namespace member's call name stands for."""
+        beside the search tool and search results may repeat a definition."""
         recipe = load_deepseek_recipe()
+        body, results = _without_repeats(body)
         search = next(
             (tool for tool in body["tools"] if tool["type"] == TOOL_SEARCH), None
         )
-        strict_search = search is not None and _declares_strict_tool(
-            [*body["tools"], *_discovered_tools(body)]
-        )
-        relistings = _relistings(body)
-        converted = relistings.body
+        tools = [*body["tools"], *_discovered_tools(body)]
+        strict_search = search is not None and _declares_strict_tool(tools)
+        converted = body
         if strict_search:
             converted = {
-                **converted,
+                **body,
                 "tools": [
                     STRICT_SEARCH_STAND_IN if tool["type"] == TOOL_SEARCH else tool
-                    for tool in converted["tools"]
+                    for tool in body["tools"]
                 ],
             }
         conversation = self._converted(recipe.ResponsesRequest, converted, options)
@@ -583,112 +569,12 @@ class DeepSeekRecipe:
                     for tool in conversation.tools
                 ],
             )
-        if relistings.results:
-            conversation = self._relistings_restored(
-                conversation, relistings=relistings, options=options
-            )
-        names = self.namespace_tool_names(_responses_namespaces(converted))
+        conversation = _with_repeats(conversation, results)
+        namespaces = [tool for tool in tools if tool["type"] == "namespace"]
+        names = self._namespace_tool_names(namespaces) if namespaces else {}
         return conversation, names
 
-    def _relistings_restored(
-        self, conversation: Any, *, relistings: _Relistings, options: Any
-    ) -> Any:
-        """`conversation` whose search results list all the entries they were given,
-        and whose redefinitions load under the tools' own names."""
-        recipe = load_deepseek_recipe()
-        rendered_alone: dict[str, str] = {}
-
-        def alone(tool: dict[str, Any]) -> str:
-            key = json.dumps(tool, sort_keys=True)
-            if key not in rendered_alone:
-                rendered_alone[key] = self._rendered_alone(tool, options)
-            return rendered_alone[key]
-
-        messages = []
-        for message in conversation.messages:
-            entries = isinstance(
-                message, recipe.ToolMessage
-            ) and relistings.results.get(message.tool_call_id)
-            if entries:
-                converted = iter(_json_array_items(message.content))
-                rendered = []
-                for entry in entries:
-                    item = next(converted) if entry.converted else None
-                    rendered.append(item if entry.alone is None else alone(entry.alone))
-                message = recipe.ToolMessage(
-                    "[" + ",".join(rendered) + "]", message.tool_call_id
-                )
-            elif isinstance(message, recipe.SystemMessage) and any(
-                tool.name in relistings.redefined for tool in message.tools or []
-            ):
-                tools = [
-                    (
-                        _renamed(tool, relistings.redefined[tool.name])
-                        if tool.name in relistings.redefined
-                        else tool
-                    )
-                    for tool in message.tools
-                ]
-                message = recipe.SystemMessage(
-                    message.content, message.image_sources, tools
-                )
-            messages.append(message)
-        return _replaced(
-            conversation,
-            messages=messages,
-            tools=[
-                tool
-                for tool in conversation.tools
-                if tool.name not in relistings.redefined
-            ],
-        )
-
-    def _rendered_alone(self, tool: dict[str, Any], options: Any) -> str:
-        """recipe's rendering of `tool` as a search result's only entry; a namespace
-        lists one member."""
-        recipe = load_deepseek_recipe()
-        call_id = "rendered_alone"
-        searched = [
-            {"type": "tool_search_call", "call_id": call_id, "arguments": {}},
-            {"type": TOOL_SEARCH_OUTPUT, "call_id": call_id, "tools": [tool]},
-        ]
-        conversation = self._converted(
-            recipe.ResponsesRequest, {"input": searched}, options
-        )
-        (message,) = (
-            message
-            for message in conversation.messages
-            if isinstance(message, recipe.ToolMessage)
-        )
-        (entry,) = _json_array_items(message.content)
-        return entry
-
-    def with_host_settings(
-        self, conversation: Any, *, response_schema: Optional[dict[str, Any]]
-    ) -> Any:
-        """`conversation` with what recipe's Responses and Messages conversions
-        leave out: a JSON response schema, and SGLang's reading of a trailing
-        assistant turn, re-sent as a user turn."""
-        recipe = load_deepseek_recipe()
-        messages = conversation.messages
-        last = messages[-1] if messages else None
-        if last is not None and last.role == "assistant":
-            # recipe closes the turn and opens another; SGLang, as
-            # `_handle_last_assistant_message`, re-sends it as a user turn.
-            messages = [*messages[:-1], recipe.UserMessage(last.content)]
-        elif response_schema is None:
-            return conversation
-        return _replaced(
-            conversation,
-            messages=messages,
-            response_schema=(
-                response_schema
-                if response_schema is not None
-                else conversation.response_schema
-            ),
-        )
-
-    def namespace_tool_names(
+    def _namespace_tool_names(
         self, namespaces: list[dict[str, Any]]
     ) -> dict[str, tuple[str, str]]:
         """The name recipe's Responses conversion calls each member of `namespaces`

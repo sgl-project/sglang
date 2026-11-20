@@ -192,34 +192,28 @@ def _without_cleared_messages(
                 "'system' messages"
             )
         if message.clear_at == "next_user_message":
-            _check_turn_scoped(index=index, message=message)
-            _check_turn_scoped_placement(index=index, messages=request.messages)
+            _check_turn_scoped(index=index, messages=request.messages)
             if index < last_user:
                 continue
         rendered.append(message)
     return request.model_copy(update={"messages": rendered})
 
 
-def _check_turn_scoped(index: int, message: AnthropicMessage) -> None:
+def _check_turn_scoped(index: int, messages: list[AnthropicMessage]) -> None:
     scope = "a turn-scoped system message (clear_at: 'next_user_message')"
+    message = messages[index]
     if message.output_config is not None:
         raise ValueError(f"messages.{index}: output_config is not permitted on {scope}")
     for position, block in enumerate(
         message.content if isinstance(message.content, list) else []
     ):
         if block.type != "text":
-            raise ValueError(
-                f"messages.{index}: a turn-scoped system message supports text "
-                "blocks only (clear_at: 'next_user_message')"
-            )
+            raise ValueError(f"messages.{index}: {scope} supports text blocks only")
         if block.cache_control is not None:
             raise ValueError(
                 f"messages.{index}.content.{position}: cache_control is not "
                 f"permitted on {scope}"
             )
-
-
-def _check_turn_scoped_placement(index: int, messages: list[AnthropicMessage]) -> None:
     # Consecutive system messages are placed as one group.
     before = next(
         (m.role for m in reversed(messages[:index]) if m.role != "system"), None
@@ -227,8 +221,7 @@ def _check_turn_scoped_placement(index: int, messages: list[AnthropicMessage]) -
     after = next((m.role for m in messages[index + 1 :] if m.role != "system"), None)
     if before != "user" or after == "user":
         raise ValueError(
-            f"messages.{index}: a turn-scoped system message (clear_at: "
-            "'next_user_message') must follow a user message and either end "
+            f"messages.{index}: {scope} must follow a user message and either end "
             "messages or precede an assistant message"
         )
 

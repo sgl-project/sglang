@@ -190,10 +190,7 @@ class DeepSeekRecipeChatEncodingAdapter:
         if thinking and tier is not None:
             body = {**body, NATIVE_EFFORT_FIELDS[protocol]: {"effort": tier}}
         conversation, namespace_names = self.deepseek_recipe.convert_native(
-            protocol, body, thinking=thinking
-        )
-        conversation = self.deepseek_recipe.with_host_settings(
-            conversation, response_schema=response_schema
+            protocol, body, thinking=thinking, response_schema=response_schema
         )
         # recipe's Messages conversion drops `strict`, which SGLang's grammar enforces.
         strict = {tool.get("name") for tool in body["tools"] if tool.get("strict")}

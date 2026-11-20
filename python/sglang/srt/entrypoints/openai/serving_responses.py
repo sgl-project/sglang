@@ -149,17 +149,8 @@ def _holds_function_tools(members: Any) -> bool:
     )
 
 
-def _defers_loading(tool: ResponseTool) -> bool:
-    if tool.type == "namespace":
-        return bool(tool.defer_loading) or any(
-            isinstance(member, dict) and member.get("defer_loading")
-            for member in tool.tools or []
-        )
-    return tool.type in ("function", "custom") and bool(tool.defer_loading)
-
-
 def _defer_tool_loading(
-    tools: list[dict[str, Any]], items: list
+    tools: list[ResponseTool], items: list
 ) -> tuple[list[dict[str, Any]], list]:
     """`tools` without those that defer loading, and `items` whose
     `tool_search_output` entries naming a deferred tool, or a namespace with one,
@@ -169,7 +160,7 @@ def _defer_tool_loading(
     deferred: dict[tuple[Optional[str], str], dict[str, Any]] = {}
     namespaces: dict[str, dict[str, Any]] = {}
     shown = []
-    for tool in tools:
+    for tool in (tool.model_dump(exclude_unset=True) for tool in tools):
         if tool["type"] == "namespace":
             members = []
             for member in tool["tools"]:
@@ -198,9 +189,7 @@ def _defer_tool_loading(
                 | {k: v for k, v in tool.items() if v is not None}
                 | {"tools": members}
             )
-        declared = deferred.get((namespace, tool.get("name")))
-        if declared is None or declared["type"] != tool["type"]:
-            return tool
+        declared = deferred.get((namespace, tool["name"]), {})
         return declared | {k: v for k, v in tool.items() if v is not None}
 
     if deferred:
@@ -1567,19 +1556,14 @@ class OpenAIServingResponses(OpenAIServingChat):
         which tool search, namespace tools and deferred tools take."""
         return self.native_tool_loading and (
             any(
-                tool.type == "namespace" or _defers_loading(tool)
+                tool.type in (TOOL_SEARCH, "namespace")
+                or (tool.type in ("function", "custom") and tool.defer_loading)
                 for tool in request.tools
             )
-            or self._uses_tool_search(request)
-        )
-
-    def _uses_tool_search(self, request: ResponsesRequest) -> bool:
-        """Whether the request searches for tools, or its history has."""
-        if any(tool.type == TOOL_SEARCH for tool in request.tools):
-            return True
-        return any(
-            isinstance(item, dict) and item.get("type") in TOOL_SEARCH_ITEMS
-            for item in self._history_items(request)
+            or any(
+                isinstance(item, dict) and item.get("type") in TOOL_SEARCH_ITEMS
+                for item in self._history_items(request)
+            )
         )
 
     def _history_items(self, request: ResponsesRequest) -> list:
@@ -1588,21 +1572,15 @@ class OpenAIServingResponses(OpenAIServingChat):
         return list(stored) + (request.input if isinstance(request.input, list) else [])
 
     def _native_tools_error(self, request: ResponsesRequest) -> Optional[str]:
-        for tool in request.tools:
-            if tool.type in ("custom", "namespace") and not tool.name:
-                return f"{tool.type} tools must have a name"
-        # A tool is redefined only as the kind it already is; its calls are
-        # reported by that kind.
+        # A name keeps the kind it first has, which its calls are reported as.
         kinds = {
-            tool.name: (
-                tool.type,
-                f"tools declares it as a {'deferred ' if tool.defer_loading else ''}"
-                f"{tool.type} tool",
-            )
+            tool.name: tool.type
             for tool in request.tools
             if tool.type in ("function", "custom")
         }
         for tool in request.tools:
+            if tool.type in ("custom", "namespace") and not tool.name:
+                return f"{tool.type} tools must have a name"
             if (
                 tool.type == TOOL_SEARCH
                 and tool.model_extra.get("execution") != "client"
@@ -1629,30 +1607,21 @@ class OpenAIServingResponses(OpenAIServingChat):
                     "or custom tools, each with a name"
                 )
             for tool in tools:
-                if tool["type"] == "namespace" and not _holds_function_tools(
-                    tool.get("tools")
-                ):
-                    return NAMESPACE_MEMBERS_ERROR
+                if tool["type"] == "namespace":
+                    if not _holds_function_tools(tool.get("tools")):
+                        return NAMESPACE_MEMBERS_ERROR
+                    continue
                 # The served encoding renders no other custom tool.
-                if tool["type"] == "custom" and tool.get("name") != APPLY_PATCH:
+                if tool["type"] == "custom" and tool["name"] != APPLY_PATCH:
                     return (
                         f"tool_search_output can load only the {APPLY_PATCH!r} "
                         "custom tool"
                     )
-                if tool["type"] == "namespace":
-                    continue
-                kind, origin = kinds.setdefault(
-                    tool["name"],
-                    (
-                        tool["type"],
-                        f"an earlier tool_search_output returns it as a {tool['type']} "
-                        "tool",
-                    ),
-                )
+                kind = kinds.setdefault(tool["name"], tool["type"])
                 if kind != tool["type"]:
                     return (
                         f"tool_search_output returns {tool['name']!r} as a "
-                        f"{tool['type']} tool, but {origin}"
+                        f"{tool['type']} tool, but it is a {kind} tool"
                     )
         return None
 
@@ -1663,7 +1632,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         choice become the ones the history has loaded."""
         choice = request.effective_tool_choice()
         tools, items = _defer_tool_loading(
-            [tool.model_dump(exclude_unset=True) for tool in request.tools],
+            request.tools,
             [
                 item
                 for item in map(
@@ -1717,7 +1686,6 @@ class OpenAIServingResponses(OpenAIServingChat):
         choice: dict[str, Any],
         namespace_names: dict[str, tuple[str, str]],
     ) -> str:
-        """The call name of the loaded tool a named `choice` forces."""
         tools = request._tool_state.chat_tools
         name = choice["name"]
         if "namespace" in choice:
@@ -1777,10 +1745,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         if request._tool_state.chat_tools is not None:
             # A continuation may drop the deferred declarations that a search
             # result's name-only tools take their definitions from.
-            _, history = _defer_tool_loading(
-                [tool.model_dump(exclude_unset=True) for tool in request.tools],
-                history,
-            )
+            _, history = _defer_tool_loading(request.tools, history)
         return history + self._replayed_output_items(request, output)
 
     @staticmethod
@@ -1807,7 +1772,6 @@ class OpenAIServingResponses(OpenAIServingChat):
 
     @staticmethod
     def _client_tool_search(request: ResponsesRequest) -> bool:
-        """Whether a `tool_search` call is the client-executed search tool."""
         return request._tool_state.chat_tools is not None and any(
             tool.type == TOOL_SEARCH for tool in request.tools
         )
