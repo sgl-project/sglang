@@ -59,12 +59,15 @@ def test_qsa_decode_topk_repeatability(monkeypatch: pytest.MonkeyPatch) -> None:
     torch.manual_seed(42)
     logits = torch.randn(16, 2048, device="cuda").round()
 
-    def mock_mqa_decode(*args: object, min_scored_len: int) -> torch.Tensor:
+    def mock_mqa_decode(
+        *args: object, min_scored_len: int, rows_per_request: int, num_query_heads: int
+    ) -> torch.Tensor:
         assert min_scored_len == 0
+        assert rows_per_request == 1
         return logits
 
     monkeypatch.setattr(qsa_indexer_module, "qsa_mqa_decode", mock_mqa_decode)
-    indexer = SimpleNamespace(block_topk=512)
+    indexer = SimpleNamespace(block_topk=512, index_n_heads=4)
     lengths = torch.full((16,), 2048, dtype=torch.int32, device="cuda")
     results = [
         QSAIndexer.select_decode_tokens(
