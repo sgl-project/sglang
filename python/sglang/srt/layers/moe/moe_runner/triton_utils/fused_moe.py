@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import functools
 import logging
+import math
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
 import torch.nn.functional as F
 import triton.language as tl
+from torch.cuda import get_device_capability
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.kernels.ops.activation.silu_and_mul_block_quant import (
@@ -888,14 +890,44 @@ def _fused_moe_kernel_sequence(
     elif activation == "situ" and is_gated:
         d = N // 2
         x = intermediate_cache1.view(-1, N)
-        gate = x[..., :d].float()
-        up = x[..., d:].float()
         situ_beta = gemm1_alpha if gemm1_alpha is not None else 4.0
-        gate = situ_beta * torch.tanh(gate / situ_beta) * torch.sigmoid(gate)
         situ_linear_beta = gemm1_limit
-        if situ_linear_beta is not None:
-            up = situ_linear_beta * torch.tanh(up / situ_linear_beta)
-        intermediate_cache2.copy_((gate * up).to(intermediate_cache1.dtype))
+        # The JIT kernel reads whole 32-byte BF16 vectors and has no row mask.
+        if (
+            num_tokens >= 512
+            and _is_cuda
+            and x.is_cuda
+            and not down_moe_use_tma
+            and not filter_expert
+            and not is_batch_invariant_mode_enabled()
+            and x.dtype == torch.bfloat16
+            and intermediate_cache2.dtype == x.dtype
+            and intermediate_cache2.device == x.device
+            and intermediate_cache2.is_contiguous()
+            and x.stride(1) == 1
+            and d % 16 == 0
+            and x.stride(0) % 16 == 0
+            and x.shape[0] * (d // 16) <= 0xFFFFFFFF
+            and x.data_ptr() % 32 == 0
+            and intermediate_cache2.data_ptr() % 32 == 0
+            and math.isfinite(situ_beta)
+            and situ_beta > 0
+            and (
+                situ_linear_beta is None
+                or (math.isfinite(situ_linear_beta) and situ_linear_beta > 0)
+            )
+            and get_device_capability(x.device) == (12, 0)
+        ):
+            from sglang.kernels.ops.activation.kimi_k3_situ_and_mul import situ_and_mul
+
+            situ_and_mul(x, intermediate_cache2, situ_beta, situ_linear_beta)
+        else:
+            gate = x[..., :d].float()
+            up = x[..., d:].float()
+            gate = situ_beta * torch.tanh(gate / situ_beta) * torch.sigmoid(gate)
+            if situ_linear_beta is not None:
+                up = situ_linear_beta * torch.tanh(up / situ_linear_beta)
+            intermediate_cache2.copy_((gate * up).to(intermediate_cache1.dtype))
     elif activation in ("gelu", "gelu_tanh") and is_gated:
         assert gemm1_alpha is None, "gemm1_alpha is not supported for gelu"
         assert gemm1_limit is None, "gemm1_limit is not supported for gelu"
