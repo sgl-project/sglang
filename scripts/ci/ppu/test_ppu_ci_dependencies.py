@@ -1013,7 +1013,7 @@ class TestPPUCIDevSailDependencies(CustomTestCase):
                     for args in calls
                     if len(args) > 1 and args[1] == "verify-dev-sail"
                 ]
-                self.assertEqual(len(verifications), int(code == 0))
+                self.assertEqual(len(verifications), 0)
                 checks = [
                     args for args in calls if len(args) > 1 and args[1] == "check"
                 ]

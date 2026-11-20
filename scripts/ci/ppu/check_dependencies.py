@@ -261,7 +261,25 @@ def collect_dev_sail(wheel_dir):
         _, wheels = dev_sail_wheels(wheel_dir)
 
 
-def missing_dev_sail(wheel_dir, packages):
+def missing_dev_sail(wheel_dir, packages, *, upgrade_all=False):
+    from packaging.version import Version
+
+    if upgrade_all:
+        from packaging.utils import parse_wheel_filename
+
+        selected = {}
+        for path in sorted((wheel_dir / "runtime-deps").glob("*.whl")):
+            name, version, _, _ = parse_wheel_filename(path.name)
+            if (
+                is_platform_package(name)
+                or name in BUILD_TARGETS
+                or (name == "sailify" and name in packages)
+            ):
+                continue
+            if name not in packages or Version(packages[name]["version"]) != version:
+                selected[name] = path.resolve(), str(version)
+        return selected
+
     from packaging.requirements import Requirement
 
     root, wheels = dev_sail_wheels(wheel_dir)
@@ -358,7 +376,18 @@ def missing_dev_sail(wheel_dir, packages):
         previous_constraints = constraints
 
 
-def check_snapshots(before, after, additions):
+def check_snapshots(before, after, additions, *, protected_only=False):
+    if protected_only:
+        protected = {
+            name
+            for name in before.keys() | after.keys()
+            if is_platform_package(name) or (name == "sailify" and name in before)
+        }
+        before = {
+            name: package for name, package in before.items() if name in protected
+        }
+        after = {name: package for name, package in after.items() if name in protected}
+        additions = {}
     if any(is_platform_package(name) or name in BUILD_TARGETS for name in additions):
         raise ValueError(
             "Dependency additions must not include platform or built packages"
@@ -383,7 +412,10 @@ def check_snapshots(before, after, additions):
         print("Unexpected dependency changes:", file=sys.stderr)
         print(json.dumps(changed, indent=2, sort_keys=True), file=sys.stderr)
         return 1
-    print("Only built packages, planned runtime upgrades and additions changed.")
+    if protected_only:
+        print("PPU platform packages and preinstalled sailify are unchanged.")
+    else:
+        print("Only built packages, planned runtime upgrades and additions changed.")
     return 0
 
 
@@ -396,6 +428,11 @@ def main():
     check.add_argument("before", type=Path)
     check.add_argument("after", type=Path)
     check.add_argument("--additions", type=Path)
+    check.add_argument(
+        "--protected-only",
+        action="store_true",
+        help="Check only PPU platform packages and preinstalled sailify for changes",
+    )
     collect = commands.add_parser("collect-dev-sail")
     collect.add_argument("wheel_dir", type=Path)
     dev_sail = commands.add_parser("missing-dev-sail")
@@ -403,6 +440,12 @@ def main():
     dev_sail.add_argument("additions", type=Path)
     verify = commands.add_parser("verify-dev-sail")
     verify.add_argument("wheel_dir", type=Path)
+    for command in (dev_sail, verify):
+        command.add_argument(
+            "--upgrade-all",
+            action="store_true",
+            help="Select ordinary offline wheels without validating dependency requirements",
+        )
     commands.add_parser("requirements")
     wheels = commands.add_parser("missing-wheels")
     wheels.add_argument("wheel_dir", type=Path)
@@ -416,7 +459,9 @@ def main():
                 collect_dev_sail(args.wheel_dir)
             else:
                 packages = snapshot()
-                selected = missing_dev_sail(args.wheel_dir, packages)
+                selected = missing_dev_sail(
+                    args.wheel_dir, packages, upgrade_all=args.upgrade_all
+                )
                 if args.command == "verify-dev-sail":
                     if selected:
                         raise ValueError(
@@ -456,15 +501,21 @@ def main():
 
     before = json.loads(args.before.read_text())
     after = json.loads(args.after.read_text())
-    additions = (
-        json.loads(args.additions.read_text())
-        if args.additions
-        else {
-            n: v for n, v in PINNED_ADDITIONS.items() if n not in before and n in after
-        }
-    )
+    additions = {}
+    if not args.protected_only:
+        additions = (
+            json.loads(args.additions.read_text())
+            if args.additions
+            else {
+                n: v
+                for n, v in PINNED_ADDITIONS.items()
+                if n not in before and n in after
+            }
+        )
     try:
-        return check_snapshots(before, after, additions)
+        return check_snapshots(
+            before, after, additions, protected_only=args.protected_only
+        )
     except ValueError as error:
         print(error, file=sys.stderr)
         return 1

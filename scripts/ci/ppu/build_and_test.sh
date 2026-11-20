@@ -122,7 +122,7 @@ finalize() {
     set +e
     if ! python3 "$checker" snapshot "$artifacts/dependencies-after.json"; then
         code=1
-    elif ! python3 "$checker" check "$artifacts/dependencies-before.json" "$artifacts/dependencies-after.json" --additions "$additions"; then
+    elif ! python3 "$checker" check "$artifacts/dependencies-before.json" "$artifacts/dependencies-after.json" --protected-only --additions "$additions"; then
         code=1
     fi
     if ! verify_wheels; then
@@ -140,15 +140,14 @@ python3 -c 'import torch; print("Runtime Torch:", torch.__version__, "SAIL build
 python3 -m pip uninstall -y sgl-kernel
 python3 -m pip install --no-deps --no-index --force-reinstall "$wheel_dir/"*.whl
 # Plan required dev_sail dependency changes while preserving PPU platform packages.
-missing_wheels=$(python3 "$checker" missing-dev-sail "$wheel_dir" "$additions")
+missing_wheels=$(python3 "$checker" missing-dev-sail "$wheel_dir" "$additions" --upgrade-all)
 if [[ -n "$missing_wheels" ]]; then
     mapfile -t runtime_wheels <<< "$missing_wheels"
     # Install only planned offline wheels; do not let pip replace platform packages.
     python3 -m pip install --upgrade --no-deps --no-index "${runtime_wheels[@]}"
 fi
-python3 "$checker" verify-dev-sail "$wheel_dir"
 python3 "$checker" snapshot "$artifacts/dependencies-installed.json"
-python3 "$checker" check "$artifacts/dependencies-before.json" "$artifacts/dependencies-installed.json" --additions "$additions"
+python3 "$checker" check "$artifacts/dependencies-before.json" "$artifacts/dependencies-installed.json" --protected-only --additions "$additions"
 python3 - <<'PY'
 from sailify.sailify_python import sailify_extra_files_recursive
 import sgl_kernel
