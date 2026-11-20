@@ -205,7 +205,7 @@ def _fa_batch(extend_lens, prefix_lens, mm_items_per_req):
     )
 
 
-def _prepare_on(backend, forward_batch):
+def _prepare_on(backend, forward_batch, **kwargs):
     model = SimpleNamespace(
         config=SimpleNamespace(
             text_config=SimpleNamespace(use_bidirectional_attention="vision")
@@ -213,14 +213,19 @@ def _prepare_on(backend, forward_batch):
     )
     with patch.object(gemma4_mm, "get_attn_backend", return_value=backend):
         Gemma4ForConditionalGeneration.prepare_attn_masks(
-            model, forward_batch, torch.zeros(1, dtype=torch.int64), torch.bfloat16
+            model,
+            forward_batch,
+            torch.zeros(1, dtype=torch.int64),
+            torch.bfloat16,
+            **kwargs,
         )
 
 
 class TestGemma4Fa4ImageTokenRanges(unittest.TestCase):
     """The FA4 metadata path: fa4, and fa3 upgraded to FA4 for the 512-wide
-    global layers, both emit image_token_ranges; other non-triton backends
-    fall back to causal attention and leave the metadata alone."""
+    global layers, both emit image_token_ranges and carry sliding_layers_only;
+    other non-triton backends fall back to causal attention and leave the
+    metadata alone."""
 
     @staticmethod
     def _backend(**flags):
@@ -241,11 +246,222 @@ class TestGemma4Fa4ImageTokenRanges(unittest.TestCase):
         expected[2:6] = torch.tensor([2, 5], dtype=torch.int32)
         expected[8 + 1 : 8 + 4] = torch.tensor([5, 7], dtype=torch.int32)
         self.assertTrue(torch.equal(ranges, expected), (ranges, expected))
+        self.assertTrue(backend.forward_metadata.image_mask_sliding_layers_only)
+
+    def test_fa4_respects_sliding_layers_only_opt_out(self):
+        # DiffusionGemma opts out with sliding_layers_only=False so full layers
+        # also keep bidirectional image attention.
+        backend = self._backend(fa_impl_ver=4)
+        _prepare_on(
+            backend,
+            _fa_batch((6,), (0,), ([_image_item((1, 4))],)),
+            sliding_layers_only=False,
+        )
+        self.assertFalse(backend.forward_metadata.image_mask_sliding_layers_only)
 
     def test_plain_fa3_without_upgrade_leaves_metadata_alone(self):
         backend = self._backend(fa_impl_ver=3, fa3_upgrades_to_fa4=False)
         _prepare_on(backend, _fa_batch((4,), (0,), ([_image_item((1, 2))],)))
         self.assertFalse(hasattr(backend.forward_metadata, "image_token_ranges"))
+
+    def test_fa_forward_extend_scopes_image_mask_by_sliding_layers_only(self):
+        """Full-attention layers stay causal when image_mask_sliding_layers_only
+        is True, while sliding-window layers and DiffusionGemma (False) keep
+        the FA4 image mask_mod. On fa3->fa4 hybrid, narrow full layers also stay
+        on FA3 instead of upgrading unnecessarily."""
+        from sglang.srt.layers.attention.flashattention_backend import (
+            FlashAttentionBackend,
+            FlashAttentionMetadata,
+        )
+        from sglang.srt.layers.radix_attention import AttentionType
+        from sglang.srt.model_executor.forward_mode import ForwardMode
+
+        def _run_extend(
+            *,
+            fa_impl_ver,
+            sliding_window_size,
+            head_dim,
+            sliding_layers_only,
+            score_mod=None,
+            aux_tensors=None,
+        ):
+            recorded = {}
+            backend = FlashAttentionBackend.__new__(FlashAttentionBackend)
+            backend.fa_impl_ver = fa_impl_ver
+            backend.fa3_upgrades_to_fa4 = fa_impl_ver == 3
+            backend.use_mla = False
+            backend.num_splits = 0
+            backend.fa_skip_kv_cache = False
+            backend.kv_cache_is_mxfp8 = False
+            backend.use_sliding_window_kv_pool = False
+            backend.local_attn_builder = None
+            backend.full_cg_prefill_metadata = None
+            backend.topk = 1
+            backend.page_size = 16
+
+            cu_q = torch.tensor([0, 4], dtype=torch.int32)
+            ranges = torch.tensor(
+                [[-1, -1], [1, 2], [1, 2], [-1, -1]], dtype=torch.int32
+            )
+            backend.forward_metadata = FlashAttentionMetadata(
+                cache_seqlens_int32=torch.tensor([4], dtype=torch.int32),
+                max_seq_len_q=4,
+                max_seq_len_k=4,
+                cu_seqlens_q=cu_q,
+                cu_seqlens_k=cu_q,
+                page_table=torch.zeros((1, 1), dtype=torch.int32),
+                image_token_ranges=ranges,
+                image_mask_sliding_layers_only=sliding_layers_only,
+            )
+
+            q = torch.zeros((4, 2, head_dim), dtype=torch.bfloat16)
+            kv = torch.zeros((1, 16, 1, head_dim), dtype=torch.bfloat16)
+            backend.prepare_paged_mha_query = lambda q_in, qr, kr, lyr, **kw: (
+                q_in,
+                qr,
+                kr,
+                None,
+                None,
+            )
+            backend._mxfp8_sf_kwargs = lambda *a, **kw: {}
+            backend.get_paged_mha_kv_cache = lambda lyr: (kv, kv)
+
+            def _fake_fa(**kw):
+                recorded.update(kw)
+                return torch.zeros_like(kw["q"])
+
+            backend.flash_attn_with_kvcache = _fake_fa
+
+            layer = SimpleNamespace(
+                layer_id=0,
+                head_dim=head_dim,
+                v_head_dim=head_dim,
+                tp_q_head_num=2,
+                tp_k_head_num=1,
+                sliding_window_size=sliding_window_size,
+                is_cross_attention=False,
+                attn_type=AttentionType.DECODER,
+                num_splits=None,
+                pack_gqa=None,
+                scaling=1.0,
+                logit_cap=0.0,
+                out_dtype=None,
+                window_anchor_at_start=False,
+            )
+            fb = SimpleNamespace(
+                forward_mode=ForwardMode.EXTEND,
+                batch_size=1,
+                _attn_output=None,
+            )
+
+            with (
+                patch(
+                    "sglang.srt.layers.attention.flashattention_backend.is_cp_active",
+                    return_value=False,
+                ),
+                patch(
+                    "sglang.kernels.ops.attention.flash_attention_v4.make_image_mask_mod",
+                    side_effect=lambda w: f"image_mask_mod({w})",
+                ),
+            ):
+                backend.forward_extend(
+                    q,
+                    None,
+                    None,
+                    layer,
+                    fb,
+                    save_kv_cache=False,
+                    score_mod=score_mod,
+                    aux_tensors=aux_tensors,
+                )
+            return recorded, ranges, cu_q
+
+        # 1) Gemma 4 FA4: full-attention layers (-1 / None) stay causal without mask_mod.
+        for full_win in (-1, None):
+            rec, _, _ = _run_extend(
+                fa_impl_ver=4,
+                sliding_window_size=full_win,
+                head_dim=512,
+                sliding_layers_only=True,
+            )
+            self.assertEqual(rec["ver"], 4)
+            self.assertTrue(rec["causal"])
+            self.assertEqual(rec["window_size"], (-1, -1))
+            self.assertNotIn("mask_mod", rec)
+            self.assertNotIn("aux_tensors", rec)
+
+        # 2) Gemma 4 FA4: sliding-window layer installs image mask_mod + aux_tensors.
+        rec, ranges, cu_q = _run_extend(
+            fa_impl_ver=4,
+            sliding_window_size=512,
+            head_dim=256,
+            sliding_layers_only=True,
+        )
+        self.assertEqual(rec["ver"], 4)
+        self.assertFalse(rec["causal"])
+        self.assertEqual(rec["window_size"], (-1, -1))
+        self.assertEqual(rec["mask_mod"], "image_mask_mod(512)")
+        self.assertEqual(len(rec["aux_tensors"]), 2)
+        self.assertIs(rec["aux_tensors"][0], ranges)
+        self.assertIs(rec["aux_tensors"][1], cu_q)
+
+        # 3) DiffusionGemma (sliding_layers_only=False): full layer keeps image mask_mod.
+        rec, _, _ = _run_extend(
+            fa_impl_ver=4,
+            sliding_window_size=-1,
+            head_dim=512,
+            sliding_layers_only=False,
+        )
+        self.assertFalse(rec["causal"])
+        self.assertEqual(rec["mask_mod"], "image_mask_mod(-1)")
+
+        # 4) FA3->FA4 hybrid with sliding_layers_only=True:
+        #    - narrow full layer stays on FA3 (ver=3), causal, no image mask
+        #    - wide (512) full layer upgrades to FA4 (ver=4) for head_dim, causal, no image mask
+        #    - narrow sliding layer upgrades to FA4 (ver=4) for image mask
+        rec_narrow_full, _, _ = _run_extend(
+            fa_impl_ver=3,
+            sliding_window_size=-1,
+            head_dim=256,
+            sliding_layers_only=True,
+        )
+        self.assertEqual(rec_narrow_full["ver"], 3)
+        self.assertTrue(rec_narrow_full["causal"])
+        self.assertNotIn("mask_mod", rec_narrow_full)
+
+        rec_wide_full, _, _ = _run_extend(
+            fa_impl_ver=3,
+            sliding_window_size=-1,
+            head_dim=512,
+            sliding_layers_only=True,
+        )
+        self.assertEqual(rec_wide_full["ver"], 4)
+        self.assertTrue(rec_wide_full["causal"])
+        self.assertNotIn("mask_mod", rec_wide_full)
+
+        rec_narrow_swa, _, _ = _run_extend(
+            fa_impl_ver=3,
+            sliding_window_size=512,
+            head_dim=256,
+            sliding_layers_only=True,
+        )
+        self.assertEqual(rec_narrow_swa["ver"], 4)
+        self.assertFalse(rec_narrow_swa["causal"])
+        self.assertEqual(rec_narrow_swa["mask_mod"], "image_mask_mod(512)")
+
+        # 5) Generic score_mod on a full layer is preserved when sliding_layers_only=True.
+        sentinel_aux = [torch.tensor([1])]
+        rec_score, _, _ = _run_extend(
+            fa_impl_ver=4,
+            sliding_window_size=-1,
+            head_dim=512,
+            sliding_layers_only=True,
+            score_mod="custom_score_mod",
+            aux_tensors=sentinel_aux,
+        )
+        self.assertEqual(rec_score["score_mod"], "custom_score_mod")
+        self.assertIs(rec_score["aux_tensors"], sentinel_aux)
+        self.assertNotIn("mask_mod", rec_score)
 
 
 class TestGemma4DiffusionExpertActivation(unittest.TestCase):
