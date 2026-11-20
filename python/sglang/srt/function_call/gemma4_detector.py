@@ -244,17 +244,19 @@ class Gemma4Detector(BaseFormatDetector):
         self.parsed_pos: int = 0
         self.is_inside_tool_call: bool = False
         self.current_func_name: Optional[str] = None
-        self._tool_indices: Optional[dict] = None
 
     @staticmethod
-    def _extract_tool_calls(text: str) -> list:
-        """Extract (func_name, args_str) pairs using brace-balanced parsing."""
+    def _extract_tool_calls(text: str) -> tuple[str, list[tuple[str, str]]]:
+        """Return text outside tool blocks and the parsed (name, arguments) pairs."""
+        normal_text = []
         results = []
         search_from = 0
         while True:
             start = text.find(TOOL_CALL_START, search_from)
             if start == -1:
+                normal_text.append(text[search_from:])
                 break
+            normal_text.append(text[search_from:start])
             end = text.find(TOOL_CALL_END, start)
             if end == -1:
                 break
@@ -270,7 +272,7 @@ class Gemma4Detector(BaseFormatDetector):
                     )
                     results.append((func_name, args_str))
             search_from = end + len(TOOL_CALL_END)
-        return results
+        return "".join(normal_text), results
 
     def has_tool_call(self, text: str) -> bool:
         return self.tool_call_start_token in text
@@ -281,7 +283,7 @@ class Gemma4Detector(BaseFormatDetector):
 
         calls = []
         try:
-            matches = self._extract_tool_calls(text)
+            normal_text, matches = self._extract_tool_calls(text)
             if not matches:
                 return StreamingParseResult(normal_text=text)
 
@@ -295,10 +297,6 @@ class Gemma4Detector(BaseFormatDetector):
                         parameters=json.dumps(arguments, ensure_ascii=False),
                     )
                 )
-
-            # Content = text before first tool call
-            content_end = text.find(self.tool_call_start_token)
-            normal_text = text[:content_end] if content_end > 0 else ""
 
             return StreamingParseResult(normal_text=normal_text, calls=calls)
 
@@ -316,8 +314,6 @@ class Gemma4Detector(BaseFormatDetector):
 
         calls = []
         normal_text_chunks = []
-        if self._tool_indices is None:
-            self._tool_indices = self._get_tool_indices(tools)
 
         try:
             while True:
@@ -377,9 +373,7 @@ class Gemma4Detector(BaseFormatDetector):
 
                                 calls.append(
                                     ToolCallItem(
-                                        tool_index=self._tool_indices.get(
-                                            func_name, -1
-                                        ),
+                                        tool_index=self.current_tool_id,
                                         name=func_name,
                                         parameters="",
                                     )
@@ -408,9 +402,7 @@ class Gemma4Detector(BaseFormatDetector):
 
                             calls.append(
                                 ToolCallItem(
-                                    tool_index=self._tool_indices.get(
-                                        self.current_func_name, -1
-                                    ),
+                                    tool_index=self.current_tool_id,
                                     parameters=json.dumps(
                                         arguments, ensure_ascii=False
                                     ),

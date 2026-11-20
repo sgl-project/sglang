@@ -214,16 +214,19 @@ class TestPrefetchCheckpoints(CustomTestCase):
         paths = [f"model-{i:05d}.safetensors" for i in range(10)]
         loaded_paths = []
 
+        # Rank 9 of 4 nodes x 4 ranks, with LOCAL_SIZE unset as on GPU.
         class FakeWorldGroup:
+            rank = 9
             local_rank = 1
-            local_size = 3
-            world_size = 99
+            local_size = 0
 
         with (
             patch("threading.Thread", _InlineThread),
             patch("concurrent.futures.ThreadPoolExecutor", _InlineExecutor),
             patch("concurrent.futures.wait", side_effect=_wait_all),
-            get_parallel().override(world_group=FakeWorldGroup()),
+            get_parallel().override(
+                world_group=FakeWorldGroup(), nnodes=4, launch_world_size=16
+            ),
             patch(
                 "sglang.srt.model_loader.weight_utils._prefetch_checkpoint_file",
                 side_effect=lambda path, cancel_event: loaded_paths.append(path),
@@ -231,7 +234,7 @@ class TestPrefetchCheckpoints(CustomTestCase):
         ):
             _prefetch_all_checkpoints(paths, num_threads=2)
 
-        self.assertEqual(sorted(loaded_paths), sorted(paths[1::3]))
+        self.assertEqual(sorted(loaded_paths), paths[1::4])
 
     @patch("torch.distributed.is_initialized", return_value=False)
     def test_prefetch_handle_cancels_before_scheduling_next_shard(self, _):

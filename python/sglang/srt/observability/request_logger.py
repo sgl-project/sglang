@@ -171,6 +171,10 @@ class RequestLogger:
         self.metadata = self._compute_metadata()
         self.targets = self._setup_targets()
 
+    def logs_field_on_finish(self, name: str) -> bool:
+        _, skip_names, _ = self.metadata
+        return self.log_requests and name not in (skip_names or ())
+
     def log_received_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],

@@ -139,6 +139,29 @@ class TestGenerateRouteGate(CustomTestCase):
         finally:
             http_server._global_state = prior_state
 
+    def test_route_drops_the_parsed_body_before_serving(self):
+        """The stream holds `request` to the end; its cached body must not
+        keep the prompt list alive."""
+        cached = []
+
+        class FakeTokenizerManager:
+            async def generate_request(self, obj, request):
+                cached.append("_json" in request.__dict__)
+                yield {"text": "ok"}
+
+        app = FastAPI()
+        app.add_api_route("/generate", http_server.generate_request, methods=["POST"])
+        prior_state = http_server.get_global_state()
+        http_server.set_global_state(
+            SimpleNamespace(tokenizer_manager=FakeTokenizerManager())
+        )
+        try:
+            response = TestClient(app).post("/generate", json={"input_ids": [1, 2]})
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(cached, [False])
+        finally:
+            http_server._global_state = prior_state
+
 
 if __name__ == "__main__":
     unittest.main()

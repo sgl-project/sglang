@@ -283,12 +283,18 @@ def wait_for_server_health(
     path: str = "/health",
     timeout: float = 180.0,
     interval: float = 1.0,
+    *,
+    process: subprocess.Popen | None = None,
 ) -> None:
     """Poll ``GET <base_url><path>`` until it returns HTTP 200."""
     deadline = time.time() + timeout
     last_err: httpx.RequestError | None = None
     last_status: int | None = None
     while time.time() < deadline:
+        if process is not None and process.poll() is not None:
+            raise RuntimeError(
+                f"Server at {base_url} exited with code {process.returncode}"
+            )
         try:
             r = httpx.get(urljoin(base_url, path), timeout=5.0)
             last_status = r.status_code

@@ -70,8 +70,9 @@ class GPTQIntelAMXMoEKernel:
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
-        assert self.moe_runner_config.activation == "silu", (
-            "Only SiLU activation is supported."
+        activation = self.moe_runner_config.activation
+        assert activation in ("silu", "gelu"), (
+            f"Only SiLU and GELU activations are supported, got {activation}."
         )
 
         x = dispatch_output.hidden_states
@@ -95,5 +96,6 @@ class GPTQIntelAMXMoEKernel:
             None,  # alpha
             None,  # limit
             True,  # is_vnni
+            activation,
         )
         return StandardCombineInput(hidden_states=output)

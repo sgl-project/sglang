@@ -1615,6 +1615,7 @@ def _discover_unit_tests() -> list[str]:
 
 FILE_SUITES = {
     "unit": _discover_unit_tests(),
+    "bcg-diffusion": ["../single_test_file/test_diffusion_bcg_zimage_turbo.py"],
     "component-accuracy": [
         "../single_test_file/component_accuracy/test_component_accuracy_1_gpu.py",
         "../single_test_file/component_accuracy/test_component_accuracy_2_gpu.py",
@@ -1646,19 +1647,18 @@ PARAMETRIZED_CASE_GROUPS = {
     "2-gpu": [
         ("test_server_2_gpu.py", TWO_GPU_CASES),
     ],
-    "bcg-diffusion": [],
 }
 
 STANDALONE_FILES = {
-    "bcg-diffusion": [
-        "../single_test_file/test_diffusion_bcg_zimage_turbo.py",
-    ],
     "1-gpu": [
+        "../single_test_file/test_diffusion_bcg_zimage_turbo.py",
+        "../single_test_file/component_accuracy/test_component_accuracy_1_gpu.py",
         "../single_test_file/test_generate_zimage_turbo_cli.py",
         "../single_test_file/test_nomas_offline.py",
         "../single_test_file/test_update_weights_from_disk.py",
     ],
     "2-gpu": [
+        "../single_test_file/component_accuracy/test_component_accuracy_2_gpu.py",
         "../single_test_file/test_disagg_server.py",
         "../single_test_file/test_ar_models.py",
         "../single_test_file/test_ipc_a2a_2_gpu.py",
@@ -1682,6 +1682,34 @@ STANDALONE_FILES = {
     ],
 }
 
+# BCG and the component reference suites previously ran in dedicated CUDA jobs.
+if not current_platform.is_cuda():
+    cuda_only_files = set(
+        FILE_SUITES["bcg-diffusion"] + FILE_SUITES["component-accuracy"]
+    )
+    for suite in ("1-gpu", "2-gpu"):
+        STANDALONE_FILES[suite] = [
+            path for path in STANDALONE_FILES[suite] if path not in cuda_only_files
+        ]
+
+
+# These files also contain single-rank tests covered by the unit suite.
+# Keep each file as one partition item and one pytest process.
+TWO_GPU_UNIT_NODES = {
+    "../unit/test_async_output_save.py": [
+        "test_finalize_materializes_pixels_on_nonzero_worker_device"
+    ],
+    "../unit/test_text_encoding_cache.py": [
+        "test_fsdp_group_reuse_agrees_across_shards_and_expires"
+    ],
+    "../unit/test_kandinsky6_sr_decode_parallel.py": [
+        f"test_sr_parallel_decode[{mode}-2-{tp}-1]"
+        for mode in ("tiles", "spatial")
+        for tp in (2, 1)
+    ],
+}
+
+
 # test_update_weights_from_disk fails deterministically on ROCm: the diffusion
 # weight-update-from-disk reload path does not reconcile the diffusers
 # checkpoint layout with the sglang transformer parameters (shape mismatch ->
@@ -1704,10 +1732,9 @@ if current_platform.is_hip():
 # measured value that must be copied into STANDALONE_FILE_EST_TIMES.
 # scheduling estimates use full-process H100 CI medians, rounded up to 10s
 STANDALONE_FILE_EST_TIMES = {
-    "bcg-diffusion": {
-        "../single_test_file/test_diffusion_bcg_zimage_turbo.py": 420.0,
-    },
     "1-gpu": {
+        "../single_test_file/test_diffusion_bcg_zimage_turbo.py": 210.0,
+        "../single_test_file/component_accuracy/test_component_accuracy_1_gpu.py": 360.0,
         "../single_test_file/test_generate_zimage_turbo_cli.py": 180.0,
         # Initial H200 full-process observation: 97 s; refresh on H100 CI.
         # This is a partitioning estimate, not a performance gate.
@@ -1715,6 +1742,7 @@ STANDALONE_FILE_EST_TIMES = {
         "../single_test_file/test_update_weights_from_disk.py": 200.0,
     },
     "2-gpu": {
+        "../single_test_file/component_accuracy/test_component_accuracy_2_gpu.py": 450.0,
         "../single_test_file/test_disagg_server.py": 780.0,
         "../single_test_file/test_ar_models.py": 120.0,
         # no model load; the cost is the one-time JIT build of the sync kernels

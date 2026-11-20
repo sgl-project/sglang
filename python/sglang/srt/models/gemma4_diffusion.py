@@ -482,7 +482,6 @@ class DiffusionGemmaForBlockDiffusion(PreTrainedModel):
                 config.vision_config,
                 quant_config=quant_config,
                 prefix=add_prefix("vision_tower", prefix),
-                mask_pad_before_pool=True,
             )
             self.embed_vision = Gemma4MultimodalEmbedder(
                 config.vision_config,

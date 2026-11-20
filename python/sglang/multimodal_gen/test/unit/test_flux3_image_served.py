@@ -872,6 +872,7 @@ class TestFlux3TextEncoder(unittest.TestCase):
         encoder.pad_multiple = 4
         encoder.processor = FakeProcessor()
         encoder.model = base_model
+        encoder._forward_graphs = None
 
         result = encoder.encode_batch(["short", "long", "tiny", "short"])
 
@@ -897,6 +898,71 @@ class TestFlux3TextEncoder(unittest.TestCase):
         self.assertIs(result[0], result[3])
         self.assertEqual(result[0][1][-1, -1].item(), 3)
         self.assertEqual(result[1][1][-1, -1].item(), 7)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs a CUDA device")
+    def test_repeated_pad_bucket_replays_a_cuda_graph(self):
+        """A pad bucket seen twice is replayed with the eager forward's result;
+        replaced weights drop the graph."""
+        from sglang.multimodal_gen.runtime.models.encoders.flux3_text_encoder import (
+            Flux3TextEncoder,
+        )
+        from sglang.multimodal_gen.runtime.models.encoders.text_encoder_graphs import (
+            TextEncoderGraphs,
+        )
+
+        class FakeTokenizer:
+            lengths = {"one": 1, "two": 2, "three": 3}
+
+            def __call__(self, text, **kwargs):
+                if "return_tensors" not in kwargs:
+                    return {"input_ids": list(range(self.lengths[text]))}
+                length = kwargs["max_length"]
+                mask = torch.zeros((len(text), length), dtype=torch.long)
+                for row, prompt in enumerate(text):
+                    mask[row, : self.lengths[prompt]] = 1
+                ids = torch.arange(length)[None].expand(len(text), -1)
+                return {"input_ids": ids, "attention_mask": mask}
+
+        class TinyModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embed = torch.nn.Embedding(8, 8)
+                self.mix = torch.nn.Linear(8, 8)
+
+            def forward(self, input_ids, attention_mask, position_ids, **_kwargs):
+                hidden = self.embed(input_ids) * attention_mask[..., None]
+                hidden = hidden + position_ids[0][..., None]
+                return SimpleNamespace(hidden_states=(hidden, self.mix(hidden)))
+
+        encoder = Flux3TextEncoder.__new__(Flux3TextEncoder)
+        torch.nn.Module.__init__(encoder)
+        encoder.embed_dtype = torch.float32
+        encoder.output_layers = (0, 1)
+        encoder.max_length = 16
+        encoder.pad_multiple = 4
+        encoder.processor = SimpleNamespace(
+            tokenizer=FakeTokenizer(),
+            apply_chat_template=lambda message, **_kwargs: message[0]["content"],
+        )
+        encoder.model = TinyModel().cuda()
+        encoder._forward_graphs = TextEncoderGraphs()
+
+        def eager(prompt):
+            encoder._forward_graphs, graphs = None, encoder._forward_graphs
+            tokens = encoder.encode_batch([prompt])[0][0]
+            encoder._forward_graphs = graphs
+            return tokens
+
+        for step, prompt in enumerate(("one", "two", "three", "one")):
+            tokens = encoder.encode_batch([prompt])[0][0]
+            self.assertTrue(torch.equal(tokens, eager(prompt)))
+            self.assertEqual(
+                list(encoder._forward_graphs.graphs), [] if step == 0 else [4]
+            )
+        mix = encoder.model.mix
+        mix.weight = torch.nn.Parameter(mix.weight.detach().clone() + 1)
+        self.assertTrue(torch.equal(encoder.encode_batch(["two"])[0][0], eager("two")))
+        self.assertFalse(encoder._forward_graphs.graphs)
 
     def test_constructor_truncates_and_compiles_language_model(self):
         from sglang.multimodal_gen.runtime.models.encoders.flux3_text_encoder import (

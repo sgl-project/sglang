@@ -9,7 +9,7 @@ import msgspec
 from .config import WatermarkRequestConfig, WatermarkServerConfig
 
 WATERMARK_SECRET_FIELD_NAMES = frozenset(
-    {"watermark_key", "watermark_key_b", "watermark_config"}
+    {"watermark_key", "watermark_key_b", "watermark_keys", "watermark_config"}
 )
 WATERMARK_CONTAINER_FIELD_NAMES = frozenset(
     {"watermark", "sampling_params", "preferred_sampling_params"}
@@ -48,6 +48,7 @@ def redact_watermark_secrets(value: Any, *, in_watermark_config: bool = False) -
             value,
             key="<redacted>" if value.key is not None else None,
             key_b="<redacted>" if value.key_b is not None else None,
+            keys="<redacted>" if value.keys is not None else None,
         )
     if isinstance(value, msgspec.Struct):
         result = copy.copy(value)
@@ -68,7 +69,7 @@ def redact_watermark_secrets(value: Any, *, in_watermark_config: bool = False) -
             key: (
                 "<redacted>"
                 if key in WATERMARK_SECRET_FIELD_NAMES
-                or (in_watermark_config and key in {"key", "key_b"})
+                or (in_watermark_config and key in {"key", "key_b", "keys"})
                 else redact_watermark_secrets(
                     item,
                     in_watermark_config=in_watermark_config or key == "watermark",

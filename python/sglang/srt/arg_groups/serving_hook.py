@@ -39,7 +39,9 @@ def handle_watermark_config(server_args: Any) -> None:
     cfg = resolving_view(server_args)
     if cfg.watermark_config is None:
         return
-    config = load_watermark_config(cfg.watermark_config)
+    config = load_watermark_config(
+        cfg.watermark_config, algorithm=cfg.watermark_algorithm
+    )
     resolved = {
         f"watermark_{field}": getattr(config, field)
         for field in config.__struct_fields__
