@@ -15,7 +15,7 @@ from sglang.srt.mem_cache.pool_host import base, rocm_budget
 from sglang.srt.mem_cache.pool_host.common import HostTensorAllocator
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-from sglang.srt.runtime_context import get_context, get_memory
+from sglang.srt.runtime_context import get_context, get_memory, get_parallel
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -51,7 +51,7 @@ def _cpu_params():
 
 
 def _plain_left():
-    """Plain RAM left in the active snapshot scope."""
+    # Plain RAM left in the active snapshot scope.
     return base._host_memory_budget.get()[0]
 
 
@@ -263,15 +263,11 @@ class TestHiCacheAutoSize(CustomTestCase):
             patch.object(base, "ranks_per_host", return_value=4),
             patch.object(sizing, "ranks_per_host", return_value=4),
             patch.object(torch.distributed, "barrier"),
-            patch.object(
-                sizing,
-                "get_parallel",
-                return_value=SimpleNamespace(
-                    world_group=SimpleNamespace(cpu_group="cpu")
-                ),
-            ),
+            get_parallel().override(world_group=SimpleNamespace(cpu_group="cpu")),
             patch.object(base, "available_host_memory_bytes", free_now),
-            sizing.auto_size_hicache(_cpu_params(), None, enabled=True),
+            sizing.auto_size_hicache(
+                params=_cpu_params(), draft_plan=None, enabled=True
+            ),
         ):
             # Three peers on this host pin their pools before this rank builds its own.
             host_free["bytes"] -= 3 * pool_bytes
@@ -311,14 +307,10 @@ class TestHiCacheAutoSize(CustomTestCase):
                 patch.object(sizing, "ranks_per_host", return_value=local_ranks),
                 patch.object(base, "available_host_memory_bytes", calls.free),
                 patch.object(torch.distributed, "barrier", calls.barrier),
-                patch.object(
-                    sizing,
-                    "get_parallel",
-                    return_value=SimpleNamespace(
-                        world_group=SimpleNamespace(cpu_group="cpu")
-                    ),
+                get_parallel().override(world_group=SimpleNamespace(cpu_group="cpu")),
+                sizing.auto_size_hicache(
+                    params=_cpu_params(), draft_plan=None, enabled=True
                 ),
-                sizing.auto_size_hicache(_cpu_params(), None, enabled=True),
             ):
                 self.assertEqual(_plain_left(), 1000)
             names = [name for name, _, _ in calls.mock_calls]
@@ -359,7 +351,7 @@ class TestHiCacheAutoSize(CustomTestCase):
                 classmethod(lambda cls: hugetlb),
             ),
             patch.object(sizing, "get_allocator_type", return_value="default"),
-            sizing.auto_size_hicache(params, None, enabled=True),
+            sizing.auto_size_hicache(params=params, draft_plan=None, enabled=True),
         ):
             scope = base._host_memory_budget.get()
             result = base.host_memory_preflight(mappings, HostTensorAllocator, "cuda")
@@ -377,7 +369,6 @@ class TestHiCacheAutoSize(CustomTestCase):
         )
         self.assertLessEqual(allocation, available)
         self.assertEqual(scope, (0, 8 << 30))
-
 
     def test_explicit_size_on_gfx950_books_hugepage_pools_against_the_pinnable_share(
         self,
