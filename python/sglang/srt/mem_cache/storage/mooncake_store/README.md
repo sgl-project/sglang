@@ -420,8 +420,6 @@ Enable it for the segment each SGLang rank contributes (a provider):
 --hicache-storage-backend-extra-config '{"master_server_address": "<master-ip>:50051", "metadata_server": "http://<master-ip>:8080/metadata", "global_segment_size": "64gb", "protocol": "nvlink", "enable_egm_store_pool": true}'
 ```
 
-Also set `SGLANG_HICACHE_MOONCAKE_REUSE_TE=0`: the store reuses SGLang's shared transfer engine only for `"rdma"`, so otherwise each rank starts an engine it never uses.
-
 A node that only reads from the pool (a consumer) contributes no segment. Set `global_segment_size` to `0`, since Mooncake can place objects on an ordinary host segment that other nodes cannot reach:
 
 ```bash

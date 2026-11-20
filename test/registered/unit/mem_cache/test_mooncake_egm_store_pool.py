@@ -284,5 +284,58 @@ class TestMooncakeEmbeddingStoreRejectsEgm(CustomTestCase):
         self.assertEqual(_EgmMooncakeStore.instances[-1].setup_calls, [])
 
 
+class TestSharedEngineOnlyForRdmaHiCache(CustomTestCase):
+    """MooncakeStore reuses the shared transfer engine only with protocol "rdma",
+    so startup must not create one that HiCache alone would never use."""
+
+    _TE = "sglang.srt.distributed.device_communicators.mooncake_transfer_engine"
+
+    def _engine_created(self, *, protocol, disaggregation_mode="null"):
+        from sglang.srt.distributed.device_communicators import (
+            mooncake_transfer_engine as te,
+        )
+
+        memory = SimpleNamespace(
+            enable_hierarchical_cache=True,
+            hicache_storage_backend="mooncake",
+            hicache_storage_backend_extra_config=json.dumps(
+                {"master_server_address": "127.0.0.1:50051", "protocol": protocol}
+            ),
+        )
+        disagg = SimpleNamespace(
+            disaggregation_mode=disaggregation_mode,
+            disaggregation_transfer_backend="mooncake",
+            disaggregation_ib_device=None,
+            encoder_only=False,
+            language_only=False,
+            encoder_transfer_backend="mooncake",
+        )
+        exec_ = SimpleNamespace(
+            moe=SimpleNamespace(
+                enable_elastic_expert_backup=False,
+                elastic_ep_backend=None,
+                mooncake_ib_device=None,
+            )
+        )
+        with (
+            patch.object(te, "get_memory", return_value=memory),
+            patch.object(te, "get_disagg", return_value=disagg),
+            patch.object(te, "get_exec", return_value=exec_),
+            patch.object(te, "get_local_ip_auto", return_value="127.0.0.1"),
+            patch.object(te, "init_mooncake_transfer_engine") as init,
+        ):
+            te.maybe_init_shared_mooncake_transfer_engine(gpu_id=0)
+        return init.called
+
+    def test_hicache_only_engine_follows_the_store_protocol(self):
+        self.assertTrue(self._engine_created(protocol="rdma"))
+        self.assertFalse(self._engine_created(protocol="nvlink"))
+
+    def test_pd_transfer_still_gets_the_engine(self):
+        self.assertTrue(
+            self._engine_created(protocol="nvlink", disaggregation_mode="prefill")
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

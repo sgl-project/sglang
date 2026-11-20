@@ -367,6 +367,38 @@ class MooncakeStoreConfig:
         )
 
 
+def load_mooncake_store_config(extra_config: Optional[dict]) -> MooncakeStoreConfig:
+    """Resolve the store config from extra_config, the config file, or the env."""
+    if extra_config and (
+        extra_config.get("master_server_address") is not None
+        or extra_config.get("client_server_address") is not None
+    ):
+        config = MooncakeStoreConfig.load_from_extra_config(extra_config)
+        logger.info("Mooncake Configuration loaded from extra_config successfully.")
+
+    elif envs.SGLANG_HICACHE_MOONCAKE_CONFIG_PATH.is_set():
+        config = MooncakeStoreConfig.from_file()
+        logger.info("Mooncake Configuration loaded from file successfully.")
+
+    else:
+        config = MooncakeStoreConfig.load_from_env()
+        logger.info("Mooncake Configuration loaded from env successfully.")
+
+    # The EGM keys configure this rank's own segment, so an explicit value in
+    # extra_config applies even when the endpoint comes from a file or env.
+    if extra_config:
+        if "enable_egm_store_pool" in extra_config:
+            config.enable_egm_store_pool = envs.MOONCAKE_ENABLE_EGM_STORE_POOL.parse(
+                str(extra_config["enable_egm_store_pool"]).strip()
+            )
+        if "egm_numa_nodes" in extra_config:
+            config.egm_numa_nodes = _normalize_egm_numa_nodes(
+                extra_config["egm_numa_nodes"]
+            )
+
+    return config
+
+
 class MooncakeBaseStore:
     def __init__(self):
         self.store = None
@@ -410,40 +442,9 @@ class MooncakeBaseStore:
         return ReplicateConfig, supports_group_ids
 
     def _load_config(self, storage_config: Any = None):
-        extra_config = (
+        return load_mooncake_store_config(
             getattr(storage_config, "extra_config", None) if storage_config else None
         )
-
-        if extra_config and (
-            extra_config.get("master_server_address") is not None
-            or extra_config.get("client_server_address") is not None
-        ):
-            config = MooncakeStoreConfig.load_from_extra_config(extra_config)
-            logger.info("Mooncake Configuration loaded from extra_config successfully.")
-
-        elif envs.SGLANG_HICACHE_MOONCAKE_CONFIG_PATH.is_set():
-            config = MooncakeStoreConfig.from_file()
-            logger.info("Mooncake Configuration loaded from file successfully.")
-
-        else:
-            config = MooncakeStoreConfig.load_from_env()
-            logger.info("Mooncake Configuration loaded from env successfully.")
-
-        # The EGM keys configure this rank's own segment, so an explicit value in
-        # extra_config applies even when the endpoint comes from a file or env.
-        if extra_config:
-            if "enable_egm_store_pool" in extra_config:
-                config.enable_egm_store_pool = (
-                    envs.MOONCAKE_ENABLE_EGM_STORE_POOL.parse(
-                        str(extra_config["enable_egm_store_pool"]).strip()
-                    )
-                )
-            if "egm_numa_nodes" in extra_config:
-                config.egm_numa_nodes = _normalize_egm_numa_nodes(
-                    extra_config["egm_numa_nodes"]
-                )
-
-        return config
 
     def register_buffer(self, tensor: torch.Tensor):
         if self.store is None:
