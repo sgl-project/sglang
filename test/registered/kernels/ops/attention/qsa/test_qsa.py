@@ -834,6 +834,7 @@ def test_qsa_extend_rope_matrix_uses_mrope_coordinates():
         seq_lens_cpu=torch.tensor([num_tokens], dtype=torch.int32),
         forward_mode=ForwardMode.EXTEND,
         extend_seq_lens=torch.tensor([num_tokens], dtype=torch.int32),
+        extend_seq_lens_cpu=[num_tokens],
         extend_prefix_lens=torch.zeros(1, dtype=torch.int32),
         positions=flat,
         mrope_positions=mrope,
@@ -1141,6 +1142,7 @@ def test_qsa_extend_metadata_carries_host_sequence_lengths():
         seq_lens_cpu=torch.tensor([8, 6], dtype=torch.int32),
         forward_mode=ForwardMode.EXTEND,
         extend_seq_lens=torch.tensor([4, 6], dtype=torch.int32),
+        extend_seq_lens_cpu=[4, 6],
         extend_prefix_lens=torch.tensor([4, 0], dtype=torch.int32),
         positions=torch.tensor([4, 5, 6, 7, 0, 1, 2, 3, 4, 5]),
         mrope_positions=None,
@@ -1161,20 +1163,18 @@ def test_qsa_extend_rows_take_the_host_lens_without_a_sync():
 
     lens = [4, 0, 7, 1]
     device_lens = torch.tensor(lens, dtype=torch.int32, device="cuda")
-    with_host = SimpleNamespace(extend_seq_lens=device_lens, extend_seq_lens_cpu=lens)
-    without_host = SimpleNamespace(extend_seq_lens=device_lens)
-    want = _extend_token_to_batch_idx(without_host, len(lens), "cuda")
+    want = _extend_token_to_batch_idx(device_lens, None, len(lens), "cuda")
     torch.cuda.synchronize()
     torch.cuda.set_sync_debug_mode("error")
     try:
-        got = _extend_token_to_batch_idx(with_host, len(lens), "cuda")
+        got = _extend_token_to_batch_idx(device_lens, lens, len(lens), "cuda")
     finally:
         torch.cuda.set_sync_debug_mode("default")
     assert torch.equal(got, want)
     assert got.tolist() == [0] * 4 + [2] * 7 + [3]
     # Host lens that do not line up with the device tensor keep the device read.
-    short = SimpleNamespace(extend_seq_lens=device_lens, extend_seq_lens_cpu=lens[:2])
-    assert torch.equal(_extend_token_to_batch_idx(short, len(lens), "cuda"), want)
+    short = _extend_token_to_batch_idx(device_lens, lens[:2], len(lens), "cuda")
+    assert torch.equal(short, want)
 
 
 def test_qsa_row_ranges_do_not_cross_sequences():
