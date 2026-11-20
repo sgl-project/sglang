@@ -44,6 +44,7 @@ from sglang.kernels.ops.communication.all_reduce import (
     Communicator,
     IPCManager,
     custom_all_reduce,
+    custom_all_reduce_rmsnorm,
     get_all_reduce_module,
 )
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
@@ -51,7 +52,7 @@ from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_gfx1250_supported, is_hip
 from sglang.srt.utils.cuda_vmm_utils import (
     VmmGraphInputManager,
     compute_graph_capture_bases,
@@ -521,6 +522,58 @@ class CustomAllReduceV2:
             graph_params=graph_row,
             use_multicast=use_multicast,
         )
+
+    def fused_allreduce_rmsnorm(
+        self,
+        input: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """All-reduce ``input``, add ``residual`` and RMSNorm the sum.
+
+        Returns ``(output, residual_out)``, or None outside gfx1250 or when the
+        all-reduce would not take 2shot_push; the caller then all-reduces and
+        norms separately.
+        """
+        if self.disabled or not is_gfx1250_supported() or input.dim() != 2:
+            return None
+        if input.dtype not in (torch.bfloat16, torch.float16):
+            return None
+        if residual.shape != input.shape or residual.dtype != input.dtype:
+            return None
+        if weight.dtype != input.dtype or weight.shape != input.shape[1:]:
+            return None
+        if not (
+            input.is_contiguous()
+            and residual.is_contiguous()
+            and weight.is_contiguous()
+        ):
+            return None
+        num_rows, hidden = input.shape
+        row_bytes = hidden * input.element_size()
+        # the kernel holds a row in one 1024-thread block, 4 vectors per thread
+        if num_rows == 0 or row_bytes % 16 or row_bytes > 1024 * 4 * 16:
+            return None
+        # 1shot sizes stay unfused: on gfx1250 TP8 the fused 1shot trailed
+        # all-reduce + a separate norm
+        nbytes = num_rows * row_bytes
+        if not self.uses_two_shot_push(nbytes):
+            return None
+        # hier_2shot_push also reports TWO_SHOT_PUSH; on partition pairs its
+        # pair + cross stages beat the flat 2shot_push this kernel runs
+        if (
+            self.forced_algo is None
+            and choose_algo(
+                self.config, nbytes, can_use_graph=self._can_use_graph()
+            ).use_hier
+        ):
+            return None
+        # a slot holds the partial and the reduced copy of each rank's rows
+        rows_per_rank = -(-num_rows // self.world_size)
+        if 2 * rows_per_rank * row_bytes > self._max_push_size:
+            return None
+        return custom_all_reduce_rmsnorm(self.obj, input, residual, weight, eps)
 
     def _allocate_graph_row(self, input: torch.Tensor, nbytes: int) -> torch.Tensor:
         index = self._num_registered_rows + len(self._pending_graph_inputs)
