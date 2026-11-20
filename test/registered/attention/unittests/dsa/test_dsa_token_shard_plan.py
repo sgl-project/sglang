@@ -484,8 +484,9 @@ def _npu_mla_module():
 
     fake("torch_npu")
     fake("sgl_kernel_npu")
-    fake("sgl_kernel_npu.norm")
-    fake("sgl_kernel_npu.norm.fused_split_qk_norm", fused_split_qk_norm=None)
+    fake("sgl_kernel_npu.operators")
+    fake("sgl_kernel_npu.operators.matmul", batch_matmul_transpose=None)
+    fake("sgl_kernel_npu.operators.norm", fused_split_qk_norm=None)
     try:
         sys.modules.update(fakes)
         module = importlib.import_module(module_name)
@@ -527,14 +528,18 @@ class TestReusedTopkAcrossPpStage(CustomTestCase):
             o_proj=mock.Mock(return_value=(torch.zeros(self.TOKENS, 32), None)),
             next_skip_topk=False,
         )
-        mod.torch_npu.npu_transpose_batchmatmul = lambda attn, w, **kwargs: torch.zeros(
-            attn.shape[0], self.HEADS, self.DIM
-        )
         q = torch.zeros(self.TOKENS, self.HEADS, self.DIM)
         backend = types.SimpleNamespace(
             uses_dcp_partial_attention=lambda forward_batch: False
         )
         with (
+            mock.patch.object(
+                mod,
+                "batch_matmul_transpose",
+                side_effect=lambda attn, weight, **kwargs: torch.zeros(
+                    attn.shape[0], self.HEADS, self.DIM
+                ),
+            ),
             mock.patch.object(mod, "get_mla_dcp_backend", return_value=backend),
             mock.patch.object(mod, "get_dsa_token_shard_plan", return_value=plan),
             mock.patch.object(

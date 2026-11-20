@@ -49,6 +49,60 @@ class TestCudaPlatformDetection(unittest.TestCase):
                 self.assertEqual(platforms.cuda_platform_plugin(), expected)
 
 
+class TestRocmPlatformDetection(unittest.TestCase):
+    def test_automatic_detection_when_amdsmi_unavailable(self):
+        amdsmi_error = SimpleNamespace(
+            amdsmi_init=MagicMock(side_effect=RuntimeError("initialization failed")),
+        )
+        for amdsmi in (None, amdsmi_error):
+            with (
+                self.subTest(amdsmi=amdsmi),
+                patch.dict(os.environ, {"SGLANG_DIFFUSION_PLATFORM_OVERRIDE": ""}),
+                patch.dict("sys.modules", {"amdsmi": amdsmi}),
+                patch.object(platforms, "entry_points", return_value=[]),
+                patch.dict(
+                    platforms.builtin_platform_plugins,
+                    {"mps": lambda: None, "xpu": lambda: None},
+                ),
+                patch.object(torch.version, "hip", "7.2", create=True),
+                patch.object(torch.cuda, "is_available", return_value=True),
+                patch.object(torch.cuda, "device_count", return_value=1),
+            ):
+                self.assertEqual(
+                    platforms.resolve_current_platform_cls_qualname(),
+                    "sglang.multimodal_gen.runtime.platforms.rocm.RocmPlatform",
+                )
+
+    def test_fallback_requires_a_hip_device(self):
+        for hip_version, available, count in (
+            (None, True, 1),
+            ("7.2", False, 0),
+            ("7.2", True, 0),
+        ):
+            with (
+                self.subTest(hip_version=hip_version, available=available, count=count),
+                patch.dict("sys.modules", {"amdsmi": None}),
+                patch.object(torch.version, "hip", hip_version, create=True),
+                patch.object(torch.cuda, "is_available", return_value=available),
+                patch.object(torch.cuda, "device_count", return_value=count),
+            ):
+                self.assertIsNone(platforms.rocm_platform_plugin())
+
+    def test_amdsmi_zero_devices_does_not_use_torch_fallback(self):
+        amdsmi = SimpleNamespace(
+            amdsmi_init=MagicMock(),
+            amdsmi_get_processor_handles=MagicMock(return_value=[]),
+            amdsmi_shut_down=MagicMock(),
+        )
+        with (
+            patch.dict("sys.modules", {"amdsmi": amdsmi}),
+            patch.object(torch.version, "hip", "7.2", create=True),
+            patch.object(torch.cuda, "is_available", return_value=True),
+            patch.object(torch.cuda, "device_count", return_value=1),
+        ):
+            self.assertIsNone(platforms.rocm_platform_plugin())
+
+
 class TestDiffusionPlatformPlugins(unittest.TestCase):
     def setUp(self):
         self.env = patch.dict(

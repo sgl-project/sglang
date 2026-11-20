@@ -83,6 +83,7 @@ _OVERRIDABLE_HOOKS: FrozenSet[str] = frozenset(
         "handle_eplb_and_dispatch",
         "handle_expert_distribution_metrics",
         "handle_shared_experts_tp",
+        "handle_kda_dwdp",
         "handle_elastic_ep",
         "validate_experimental_sgl_marlin",
         "handle_speculative_decoding",

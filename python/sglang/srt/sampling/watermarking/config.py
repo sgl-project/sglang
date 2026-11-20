@@ -5,7 +5,7 @@ import logging
 import os
 import stat
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import msgspec
 
@@ -115,3 +115,48 @@ def load_watermark_config(source: str) -> WatermarkServerConfig:
         if raw.get(name) is not None and not isinstance(raw[name], bool):
             raise WatermarkConfigError(f"watermark config {name} must be a boolean")
     return WatermarkServerConfig(**raw)
+
+
+class WatermarkRequestConfig(msgspec.Struct, frozen=True, kw_only=True):
+    enabled: Optional[bool] = None
+    key: Optional[str] = None
+    context_window: Optional[int] = None
+
+    def __repr__(self) -> str:
+        return (
+            f"WatermarkRequestConfig(enabled={self.enabled!r}, key=<redacted>, "
+            f"context_window={self.context_window!r})"
+        )
+
+
+def normalize_watermark_request(value: Any) -> Optional[WatermarkRequestConfig]:
+    if value is None:
+        return None
+    if isinstance(value, WatermarkRequestConfig):
+        enabled = value.enabled
+        key = value.key
+        context_window = value.context_window
+    else:
+        if not isinstance(value, dict):
+            raise ValueError("watermark must be an object")
+        unknown = set(value) - {"enabled", "key", "context_window"}
+        if unknown:
+            raise ValueError("watermark contains unknown fields")
+        enabled = value.get("enabled")
+        key = value.get("key")
+        context_window = value.get("context_window")
+    if enabled is not None and type(enabled) is not bool:
+        raise ValueError("watermark enabled must be a boolean")
+    if key is not None:
+        parse_watermark_key(key)
+    if context_window is not None and (
+        isinstance(context_window, bool)
+        or not isinstance(context_window, int)
+        or context_window < 1
+    ):
+        raise ValueError("watermark context_window must be a positive integer")
+    return WatermarkRequestConfig(
+        enabled=enabled,
+        key=key,
+        context_window=context_window,
+    )

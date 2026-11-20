@@ -22,6 +22,14 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.gemm.bf16_tiled_small_m_gemm import (
+    rowmajor_gemm,
+    rowmajor_gemm_applies,
+)
+from sglang.srt.utils import is_hip
+
+_is_hip = is_hip()
+
 
 @triton.jit
 def _fused_norm_rope_kernel_stacked(
@@ -325,10 +333,11 @@ class FusedKVMaterializeHelper:
             k_norm_weights.append(attn.k_norm.weight)
             eps_values.append(float(attn.k_norm.variance_epsilon))
 
-        flat_kv_weight = torch.stack(kv_weights).reshape(
+        # Row-major [n_layers * 2 * kv_size, hidden]: hipBLASLt on a transposed copy picks a
+        # far slower kernel (gfx1250, Muse Spark TP8 [1280, 8192] at 8 rows).
+        self.flat_kv_weight = torch.stack(kv_weights).reshape(
             self.n_layers * self.layer_out_dim, -1
         )
-        self.flat_kv_weight_t = flat_kv_weight.transpose(0, 1).contiguous()
         self.k_norm_weights = torch.stack(k_norm_weights).contiguous()
         self.eps_values = torch.tensor(
             eps_values, dtype=torch.float32, device=self.device
@@ -407,8 +416,8 @@ class FusedKVMaterializeHelper:
 
         if ctx_hidden.device != self.device:
             ctx_hidden = ctx_hidden.to(self.device, non_blocking=True)
-        if ctx_hidden.dtype != self.flat_kv_weight_t.dtype:
-            ctx_hidden = ctx_hidden.to(self.flat_kv_weight_t.dtype)
+        if ctx_hidden.dtype != self.flat_kv_weight.dtype:
+            ctx_hidden = ctx_hidden.to(self.flat_kv_weight.dtype)
         if positions.device != self.device:
             positions = positions.to(
                 device=self.device, dtype=torch.int64, non_blocking=True
@@ -429,14 +438,16 @@ class FusedKVMaterializeHelper:
         assert self._v_workspace is not None
 
         proj_out_2d = self._proj_workspace[:total_ctx]
-        if self._mm_out_supported:
+        if _is_hip and rowmajor_gemm_applies(ctx_hidden, self.flat_kv_weight):
+            proj_out_2d = rowmajor_gemm(ctx_hidden, self.flat_kv_weight)
+        elif self._mm_out_supported:
             try:
-                torch.mm(ctx_hidden, self.flat_kv_weight_t, out=proj_out_2d)
+                torch.mm(ctx_hidden, self.flat_kv_weight.t(), out=proj_out_2d)
             except Exception:
                 self._mm_out_supported = False
-                proj_out_2d = torch.mm(ctx_hidden, self.flat_kv_weight_t)
+                proj_out_2d = torch.mm(ctx_hidden, self.flat_kv_weight.t())
         else:
-            proj_out_2d = torch.mm(ctx_hidden, self.flat_kv_weight_t)
+            proj_out_2d = torch.mm(ctx_hidden, self.flat_kv_weight.t())
 
         proj_out = proj_out_2d.view(total_ctx, self.n_layers, self.layer_out_dim)
         tmp_k = self._k_workspace[:, :total_ctx]

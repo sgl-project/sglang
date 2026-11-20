@@ -51,6 +51,7 @@ from sglang.srt.disaggregation.mooncake.utils import (
     _validate_efa_allocator_compatibility,
     check_mooncake_custom_mem_pool_enabled,
 )
+from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
 from sglang.srt.disaggregation.utils import (
     align_window_tails,
     build_dsa_tail_transfer_blocks,
@@ -549,6 +550,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self.deregister_buffer_to_engine()
         except Exception:
             logger.exception("Failed to deregister buffers during teardown")
+
+        if isinstance(self.request_status, PPConsensusStore):
+            self.request_status.close()
 
         logger.info(
             "MooncakeKVManager torn down (was role=%s)",
@@ -1824,14 +1828,26 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     if remainder or dst_width <= 0:
                         raise ValueError("Invalid PD DCP draft destination token width")
                 if src_width == dst_width:
-                    layers_params.append(
-                        (
-                            src_kv_ptrs[entry],
-                            dst_kv_ptrs[entry],
-                            src_width,
-                            draft_groups,
+                    if draft_rows_collapsed and pack_buffer is not None:
+                        # A collapsed draft takes the target's strided rows.
+                        draft_to_pack.append(
+                            (
+                                src_kv_ptrs[entry],
+                                dst_kv_ptrs[entry],
+                                src_width,
+                                dst_width,
+                                src_width,
+                            )
                         )
-                    )
+                    else:
+                        layers_params.append(
+                            (
+                                src_kv_ptrs[entry],
+                                dst_kv_ptrs[entry],
+                                src_width,
+                                draft_groups,
+                            )
+                        )
                     continue
                 if self.is_mla_backend:
                     raise ValueError(
