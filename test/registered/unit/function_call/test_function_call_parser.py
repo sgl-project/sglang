@@ -806,6 +806,47 @@ class TestPythonicDetector(unittest.TestCase):
         self.assertEqual([c.name for c in result.calls], ["get_weather"])
         self.assertEqual(json.loads(result.calls[0].parameters), {"location": "Tokyo"})
 
+    def test_signed_numeric_and_tuple_arguments(self):
+        """Signed numeric literals (ast.UnaryOp) and tuple literals (ast.Tuple)
+        should parse into JSON numbers and arrays."""
+        text = "[get_weather(location='Anchorage', temp=-12.5, offset=+3, coords=(-149.9, 61.2))]"
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(
+            json.loads(result.calls[0].parameters),
+            {
+                "location": "Anchorage",
+                "temp": -12.5,
+                "offset": 3,
+                "coords": [-149.9, 61.2],
+            },
+        )
+
+    def test_invalid_dict_keys_and_non_keyword_args_skip_only_bad_call(self):
+        """Non-constant dict keys, dict unpacking, positional args, and **kwargs
+        unpacking should skip only the offending call without dropping valid
+        sibling calls in the same block."""
+        text = (
+            "[get_weather(location='Tokyo'), "
+            "search(query={bad_key: 1}), "
+            "search(query={**other}), "
+            "search(query={b'bytes_key': 1}), "
+            "search('positional_arg'), "
+            "search(**unpacked_kwargs), "
+            "search(query='valid_query')]"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(
+            [(c.name, json.loads(c.parameters)) for c in result.calls],
+            [
+                ("get_weather", {"location": "Tokyo"}),
+                ("search", {"query": "valid_query"}),
+            ],
+        )
+
 
 class TestMistralDetector(unittest.TestCase):
     def setUp(self):
