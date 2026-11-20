@@ -29,10 +29,13 @@ are on one host, and (3) torch reports peer access between their devices. Nothin
 here distinguishes "same SoC/socket" from "same host with peer access", and there
 is no hierarchical path (IPC inside a SoC, a collective across SoCs). A group of
 more than two ranks, or one spanning hosts, keeps the NCCL gather. Failure is
-sticky: once init() fails (including an IPC handle exchange failure), this
-process stays on NCCL; a staging miss only falls back for that call.
+sticky and shared: after init() and after every handle exchange both ranks take
+a MIN all-reduce on the CPU group, and a single failure latches NCCL on both.
+A one-sided fallback would post a different collective on the NCCL group. A
+staging miss during CUDA graph capture falls back for that call only.
 """
 
+import ctypes
 import logging
 from collections import OrderedDict
 
@@ -51,6 +54,205 @@ logger = logging.getLogger(__name__)
 ENABLED = envs.SGLANG_DIFFUSION_IPC_KV_GATHER
 _CHECK = envs.SGLANG_DIFFUSION_IPC_KV_GATHER_CHECK
 
+# hipDeviceMallocUncached. A torch.zeros block is coarse-grained and stays in
+# L2, so the peer's load through the IPC mapping can see a stale line after the
+# token barrier. hipIpcGetMemHandle also rejects an uncached allocation smaller
+# than a page, so the backing store is padded up to this size.
+_HIP_DEVICE_MALLOC_UNCACHED = 0x3
+_HIP_IPC_LAZY_ENABLE_PEER_ACCESS = 0x1
+_HIP_IPC_MIN_BYTES = 4096
+
+_HIP = None
+_TYPESTR = {}
+
+
+class _HipIpcHandle(ctypes.Structure):
+    _fields_ = [("reserved", ctypes.c_char * 64)]
+
+
+class _CudaView:
+    """Object torch.as_tensor accepts without copying the allocation."""
+
+    def __init__(self, ptr, shape, typestr):
+        self.__cuda_array_interface__ = {
+            "shape": tuple(int(s) for s in shape),
+            "typestr": typestr,
+            "data": (ptr, False),
+            "version": 2,
+            "strides": None,
+        }
+
+
+class _HipAlloc:
+    """Keeps a hipExtMalloc / hipIpcOpen pointer alive with the tensor."""
+
+    def __init__(self, ptr, close):
+        self.ptr = ptr
+        self._close = close
+
+    def __del__(self):
+        close, self._close = self._close, None
+        if close is None:
+            return
+        try:
+            close(self.ptr)
+        except Exception:
+            # Interpreter shutdown may have already dropped the HIP runtime.
+            return
+
+
+def _hip():
+    global _HIP
+    if _HIP is not None:
+        return _HIP
+    last = None
+    for name in ("libamdhip64.so.7", "libamdhip64.so"):
+        try:
+            lib = ctypes.CDLL(name)
+        except OSError as e:
+            last = e
+            continue
+        lib.hipSetDevice.argtypes = [ctypes.c_int]
+        lib.hipSetDevice.restype = ctypes.c_int
+        lib.hipExtMallocWithFlags.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_size_t,
+            ctypes.c_uint,
+        ]
+        lib.hipExtMallocWithFlags.restype = ctypes.c_int
+        lib.hipFree.argtypes = [ctypes.c_void_p]
+        lib.hipFree.restype = ctypes.c_int
+        lib.hipMemset.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_size_t]
+        lib.hipMemset.restype = ctypes.c_int
+        lib.hipIpcGetMemHandle.argtypes = [
+            ctypes.POINTER(_HipIpcHandle),
+            ctypes.c_void_p,
+        ]
+        lib.hipIpcGetMemHandle.restype = ctypes.c_int
+        lib.hipIpcOpenMemHandle.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p),
+            _HipIpcHandle,
+            ctypes.c_uint,
+        ]
+        lib.hipIpcOpenMemHandle.restype = ctypes.c_int
+        lib.hipIpcCloseMemHandle.argtypes = [ctypes.c_void_p]
+        lib.hipIpcCloseMemHandle.restype = ctypes.c_int
+        lib.hipGetErrorString.argtypes = [ctypes.c_int]
+        lib.hipGetErrorString.restype = ctypes.c_char_p
+        _HIP = lib
+        return lib
+    raise RuntimeError(f"libamdhip64 is not loadable ({last})")
+
+
+def _hip_check(err, what):
+    if err == 0:
+        return
+    text = _hip().hipGetErrorString(err)
+    if isinstance(text, bytes):
+        text = text.decode()
+    raise RuntimeError(f"{what} failed: {err} {text}")
+
+
+def _typestr(dtype, device):
+    key = (dtype, device.type)
+    cached = _TYPESTR.get(key)
+    if cached is None:
+        probe = torch.empty(1, dtype=dtype, device=device)
+        cached = probe.__cuda_array_interface__["typestr"]
+        _TYPESTR[key] = cached
+    return cached
+
+
+def _wrap_device_ptr(ptr, shape, dtype, device, close):
+    owned = False
+    try:
+        with torch.cuda.device(device):
+            view = _CudaView(ptr, shape, _typestr(dtype, device))
+            tensor = torch.as_tensor(view)
+        if (
+            tensor.data_ptr() != ptr
+            or tensor.dtype != dtype
+            or tuple(tensor.shape) != tuple(shape)
+            or tensor.device != torch.device(device)
+        ):
+            raise RuntimeError("uncached staging was copied into the caching allocator")
+        tensor._ipc_alloc = _HipAlloc(ptr, close)
+        owned = True
+        return tensor
+    finally:
+        if not owned:
+            close(ptr)
+
+
+def _alloc_staging(k):
+    """Local double-buffered K/V slot the peer maps.
+
+    CUDA staging is hipDeviceMallocUncached, not a caching-allocator tensor:
+    the token collective orders the kernels but does not make a coarse-grained
+    L2 line visible to the other device. CPU tests have no HIP IPC.
+    """
+    shape = (2, 2, *k.shape)
+    if not k.is_cuda:
+        return torch.zeros(shape, dtype=k.dtype, device=k.device)
+    lib = _hip()
+    numel = 1
+    for dim in shape:
+        numel *= int(dim)
+    nbytes = max(numel * k.element_size(), _HIP_IPC_MIN_BYTES)
+    with torch.cuda.device(k.device):
+        _hip_check(lib.hipSetDevice(k.device.index), "hipSetDevice")
+        ptr = ctypes.c_void_p()
+        _hip_check(
+            lib.hipExtMallocWithFlags(
+                ctypes.byref(ptr), nbytes, _HIP_DEVICE_MALLOC_UNCACHED
+            ),
+            "hipExtMallocWithFlags",
+        )
+        err = lib.hipMemset(ptr, 0, nbytes)
+        if err != 0:
+            lib.hipFree(ptr)
+            _hip_check(err, "hipMemset")
+
+        def close(raw):
+            lib.hipFree(ctypes.c_void_p(raw))
+
+        return _wrap_device_ptr(ptr.value, shape, k.dtype, k.device, close)
+
+
+def _export_ipc(tensor):
+    handle = _HipIpcHandle()
+    _hip_check(
+        _hip().hipIpcGetMemHandle(
+            ctypes.byref(handle), ctypes.c_void_p(tensor.data_ptr())
+        ),
+        "hipIpcGetMemHandle",
+    )
+    return ctypes.string_at(ctypes.addressof(handle), ctypes.sizeof(handle))
+
+
+def _import_ipc(raw, shape, dtype, device):
+    lib = _hip()
+    handle = _HipIpcHandle()
+    if len(raw) != ctypes.sizeof(handle):
+        raise RuntimeError(
+            f"IPC handle is {len(raw)} bytes, expected {ctypes.sizeof(handle)}"
+        )
+    ctypes.memmove(ctypes.addressof(handle), raw, ctypes.sizeof(handle))
+    with torch.cuda.device(device):
+        _hip_check(lib.hipSetDevice(device.index), "hipSetDevice")
+        opened = ctypes.c_void_p()
+        _hip_check(
+            lib.hipIpcOpenMemHandle(
+                ctypes.byref(opened), handle, _HIP_IPC_LAZY_ENABLE_PEER_ACCESS
+            ),
+            "hipIpcOpenMemHandle",
+        )
+
+    def close(raw_ptr):
+        lib.hipIpcCloseMemHandle(ctypes.c_void_p(raw_ptr))
+
+    return _wrap_device_ptr(opened.value, shape, dtype, device, close)
+
 
 class _State:
     def __init__(self):
@@ -58,6 +260,7 @@ class _State:
         self.inited = False
         self.rank = None
         self.group = None
+        self.cpu_group = None
         self.token = None
         self.token_out = None
         # insertion-ordered so eviction picks the same key on every rank (all
@@ -67,14 +270,27 @@ class _State:
         self.checked = 0
         self.bad = None
 
-    def _share(self, t):
-        """Exchange ``t`` with the peer over torch IPC, re-opening the handle in
-        the LOCAL device context (a mapping is only dereferenceable from the
-        context that opened it)."""
-        from torch.multiprocessing.reductions import reduce_tensor
+    def _agree(self, ok):
+        """True only when every rank's ``ok`` is true.
 
-        fn, args = reduce_tensor(t)
-        mine, theirs = [(fn, args, tuple(t.shape))], [None]
+        MIN over the CPU group, never the NCCL group: the failure this exists
+        to absorb is the two ranks being about to post different NCCL
+        collectives. A rank that raises inside ``broadcast_object_list`` or
+        ``all_gather_object`` never reaches this, and that hang is the
+        collective itself failing, not a mismatched one.
+        """
+        flag = torch.tensor([1 if ok else 0], dtype=torch.int32)
+        dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=self.cpu_group)
+        return bool(flag.item())
+
+    def _share(self, t, handle):
+        """Exchange an already-exported handle, re-opening it in the LOCAL
+        device context (a mapping is only dereferenceable from the context
+        that opened it). Export stays outside this method so a one-sided
+        hipIpcGetMemHandle failure is agreed before either rank broadcasts.
+        """
+        mine = [[handle, tuple(t.shape), t.dtype]]
+        theirs = [None]
         r0 = dist.get_global_rank(self.group, 0)
         r1 = dist.get_global_rank(self.group, 1)
         if self.rank == 0:
@@ -83,25 +299,25 @@ class _State:
         else:
             dist.broadcast_object_list(theirs, src=r0, group=self.group)
             dist.broadcast_object_list(mine, src=r1, group=self.group)
-        pf, pa, peer_shape = theirs[0]
-        if tuple(peer_shape) != tuple(t.shape):
+        peer_handle, peer_shape, peer_dtype = theirs[0]
+        if tuple(peer_shape) != tuple(t.shape) or peer_dtype != t.dtype:
             raise RuntimeError(
-                f"unequal SP shards: local {tuple(t.shape)} vs peer {peer_shape}"
+                f"unequal SP shards: local {tuple(t.shape)} {t.dtype} vs "
+                f"peer {peer_shape} {peer_dtype}"
             )
-        pa = list(pa)
-        dev = t.device
-        for i, v in enumerate(pa):
-            if isinstance(v, torch.device):
-                pa[i] = dev
-            elif isinstance(v, int) and i == 6:
-                # rebuild_cuda_tensor positional device index
-                pa[i] = dev.index
-        return pf(*pa)
+        return _import_ipc(peer_handle, peer_shape, peer_dtype, t.device)
 
-    def init(self, device):
+    def _bind_group(self):
         from sglang.multimodal_gen.runtime.distributed.parallel_state import (
             get_sp_group,
         )
+
+        sp_group = get_sp_group()
+        self.group = sp_group.device_group
+        self.cpu_group = sp_group.cpu_group
+        self.rank = sp_group.rank_in_group
+
+    def _init_peer(self, device):
         from sglang.multimodal_gen.runtime.platforms import current_platform
 
         from .ipc_a2a import _peer_cuda_device
@@ -110,12 +326,10 @@ class _State:
         # barrier are the same on CUDA -- but gfx1250 is the only place it has
         # been measured, and the collective it replaces is already correct
         # everywhere, so another platform keeps that rather than running an
-        # unvalidated transport.
+        # unvalidated transport. This check is the same on every rank, so it
+        # cannot by itself desynchronize the group.
         if not current_platform.is_rocm():
             raise RuntimeError("validated on ROCm only")
-        sp_group = get_sp_group()
-        self.group = sp_group.device_group
-        self.rank = sp_group.rank_in_group
         if dist.get_world_size(group=self.group) != 2:
             raise RuntimeError("requires a two-rank SP group")
         # A peer mapping is only dereferenceable with peer access enabled, so a
@@ -126,15 +340,18 @@ class _State:
         # rejects a pair that is not on one host; it compares hostnames, not
         # sockets, and can_device_access_peer can be true across sockets (e.g.
         # over xGMI), so a cross-socket pair on one host is admitted.
+        # _peer_cuda_device is a paired all_gather; both ranks reach it or
+        # neither does. can_device_access_peer is local and may disagree, which
+        # the MIN all-reduce after this returns resolves.
         peer_dev = _peer_cuda_device(self.group, self.rank, device.index)
         if not torch.cuda.can_device_access_peer(device.index, peer_dev):
             raise RuntimeError(
                 "no peer-to-peer access between CUDA devices "
                 f"{device.index} and {peer_dev}"
             )
+        # NCCL consumes these. The peer never maps them, so they stay cached.
         self.token = torch.zeros(1, dtype=torch.int32, device=device)
         self.token_out = torch.zeros(2, dtype=torch.int32, device=device)
-        self.inited = True
 
     def _nccl(self, k, v):
         """The transport this replaces; also the fallback, so both produce the
@@ -154,35 +371,78 @@ class _State:
         the same call site. Returns None on a miss during CUDA graph capture:
         the handle exchange allocates and broadcasts, which is illegal inside
         capture, so the caller falls back to NCCL and the graph bakes that in.
-        A pre-warmed key keeps the IPC path, whose copies and token collective
-        are capture-safe.
+        The CPU-group agreement is also illegal inside capture, so this miss
+        stays local and both ranks have to be capturing together. A pre-warmed
+        key keeps the IPC path, whose copies and token collective are
+        capture-safe.
         """
         key = (tuple(k.shape), k.dtype)
         pair = self.staging.get(key)
-        if pair is None:
-            if k.is_cuda and torch.cuda.is_current_stream_capturing():
-                return None
-            local = torch.zeros((2, 2, *k.shape), dtype=k.dtype, device=k.device)
-            pair = (local, self._share(local))
-            max_buffers = envs.SGLANG_DIFFUSION_IPC_KV_GATHER_MAX_BUFFERS
-            if len(self.staging) >= max_buffers:
-                # Evicting drops my buffer while the peer still maps it, so both
-                # ranks must drop the same key: they share the insertion order.
-                self.staging.popitem(last=False)
-            self.staging[key] = pair
-            logger.info(
-                "IPC K/V gather: rank %d staging %s %s", self.rank, key[0], key[1]
-            )
+        if pair is not None:
+            return pair
+        if k.is_cuda and torch.cuda.is_current_stream_capturing():
+            return None
+        local = None
+        handle = None
+        try:
+            local = _alloc_staging(k)
+            # Export before the broadcast. A failure here is still local, so
+            # the MIN below keeps the peer out of broadcast_object_list.
+            if k.is_cuda:
+                handle = _export_ipc(local)
+            ready = True
+        except Exception as e:  # noqa: BLE001
+            logger.warning("IPC K/V gather staging allocation failed (%s)", e)
+            ready = False
+        if not self._agree(ready):
+            self.failed = True
+            return None
+        try:
+            peer = self._share(local, handle)
+            shared = True
+        except Exception as e:  # noqa: BLE001
+            logger.warning("IPC K/V gather handle exchange failed (%s)", e)
+            shared = False
+            peer = None
+        if not self._agree(shared):
+            # Local success with a peer failure still has to leave the NCCL
+            # group. Drop the buffer either way; the peer must not be left
+            # posting the token gather while this rank posts the 25 MB one.
+            self.failed = True
+            return None
+        pair = (local, peer)
+        max_buffers = envs.SGLANG_DIFFUSION_IPC_KV_GATHER_MAX_BUFFERS
+        if len(self.staging) >= max_buffers:
+            # Evicting drops my buffer while the peer still maps it, so both
+            # ranks must drop the same key: they share the insertion order.
+            self.staging.popitem(last=False)
+        self.staging[key] = pair
+        logger.info("IPC K/V gather: rank %d staging %s %s", self.rank, key[0], key[1])
         return pair
 
     def gather(self, k, v):
         """Runs eagerly inside the custom op, on both ranks at the same call."""
         if not self.inited and not self.failed:
             try:
-                self.init(k.device)
+                self._bind_group()
             except Exception as e:  # noqa: BLE001
                 logger.warning("IPC K/V gather unavailable (%s); using NCCL", e)
                 self.failed = True
+            if not self.failed:
+                ok = False
+                try:
+                    self._init_peer(k.device)
+                    ok = True
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("IPC K/V gather unavailable (%s); using NCCL", e)
+                if not self._agree(ok):
+                    if ok:
+                        logger.warning(
+                            "IPC K/V gather declined by the peer; using NCCL"
+                        )
+                    self.failed = True
+                else:
+                    self.inited = True
         if self.failed:
             return self._nccl(k, v)
         pair = self._get_staging(k)

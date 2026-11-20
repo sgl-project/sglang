@@ -134,7 +134,16 @@ class TestIpcKvGather(CustomTestCase):
             reached["checked"] = (a, b)
             return False
 
-        sp_group = SimpleNamespace(device_group=object(), rank_in_group=0)
+        sp_group = SimpleNamespace(
+            device_group=object(), cpu_group="cpu", rank_in_group=0
+        )
+
+        def fake_all_reduce(flag, op=None, group=None):
+            self.assertEqual(group, "cpu")
+            self.assertEqual(op, mod.dist.ReduceOp.MIN)
+            # This rank already voted 0. Leave it, which is the MIN of a
+            # one-sided failure.
+
         with (
             patch(
                 "sglang.multimodal_gen.runtime.distributed.parallel_state.get_sp_group",
@@ -151,6 +160,7 @@ class TestIpcKvGather(CustomTestCase):
             ),
             patch.object(mod.dist, "get_world_size", lambda group=None: 2),
             patch.object(mod.dist, "all_gather_into_tensor", fake_all_gather),
+            patch.object(mod.dist, "all_reduce", fake_all_reduce),
             patch.object(torch.cuda, "can_device_access_peer", fake_can_access),
         ):
             out = st.gather(k, v)
@@ -159,6 +169,7 @@ class TestIpcKvGather(CustomTestCase):
         # which is what an earlier version of it actually did.
         self.assertIn("checked", reached, "must reach the peer-access check")
         self.assertTrue(st.failed, "must latch the decline instead of retrying")
+        self.assertFalse(st.inited, "a declined init must not arm the token gather")
         self.assertEqual(st.staging, {}, "must not have exchanged any handle")
         self.assertTrue(torch.equal(out[0], torch.cat([k, peer_k], dim=1)))
         self.assertTrue(torch.equal(out[1], torch.cat([v, peer_v], dim=1)))
@@ -168,8 +179,16 @@ class TestIpcKvGather(CustomTestCase):
         st = mod._State()
         st.rank = 0
         st.inited = True
+        st.cpu_group = "cpu"
+
+        def fake_all_reduce(flag, op=None, group=None):
+            self.assertEqual(int(flag), 1)
+
         with patch.object(mod.envs, "SGLANG_DIFFUSION_IPC_KV_GATHER_MAX_BUFFERS", 2):
-            with patch.object(mod._State, "_share", lambda self, t: t):
+            with (
+                patch.object(mod._State, "_share", lambda self, t, handle=None: t),
+                patch.object(mod.dist, "all_reduce", fake_all_reduce),
+            ):
                 keys = []
                 for seq in (2, 4, 6):
                     k = torch.zeros(1, seq, HEADS, DIM)
@@ -178,6 +197,95 @@ class TestIpcKvGather(CustomTestCase):
         self.assertEqual(len(st.staging), 2)
         self.assertNotIn(keys[0], st.staging, "oldest key must be the one evicted")
         self.assertEqual(list(st.staging), keys[1:])
+
+    def test_share_failure_falls_back_on_nccl(self):
+        """A handle-exchange error must not escape the op; both sides vote."""
+        st = mod._State()
+        st.rank = 0
+        st.inited = True
+        st.cpu_group = "cpu"
+        st.group = "nccl"
+        k, v = _kv(0, 0)
+        peer_k, peer_v = _kv(1, 0)
+        votes = []
+
+        def boom(self, t, handle=None):
+            raise RuntimeError("ipc handle")
+
+        def fake_all_reduce(flag, op=None, group=None):
+            self.assertEqual(group, "cpu")
+            self.assertEqual(op, mod.dist.ReduceOp.MIN)
+            votes.append(int(flag))
+
+        def fake_all_gather(output, input_, group=None):
+            peer = next(
+                s for t, s in ((k, peer_k), (v, peer_v)) if torch.equal(t[0], input_)
+            )
+            output.copy_(torch.cat([input_.unsqueeze(0), peer[0].unsqueeze(0)], dim=0))
+
+        with (
+            patch.object(mod._State, "_share", boom),
+            patch.object(mod.dist, "all_reduce", fake_all_reduce),
+            patch.object(mod.dist, "all_gather_into_tensor", fake_all_gather),
+        ):
+            out = st.gather(k, v)
+        # Allocation voted yes, the exchange voted no.
+        self.assertEqual(votes, [1, 0])
+        self.assertTrue(st.failed)
+        self.assertEqual(st.staging, {})
+        self.assertTrue(torch.equal(out[0], torch.cat([k, peer_k], dim=1)))
+        self.assertTrue(torch.equal(out[1], torch.cat([v, peer_v], dim=1)))
+
+    def test_peer_no_vote_latches_a_local_success(self):
+        """This rank exported a handle; the peer's 0 still forces NCCL."""
+        st = mod._State()
+        st.rank = 0
+        st.inited = True
+        st.cpu_group = "cpu"
+        st.group = "nccl"
+        k, v = _kv(0, 0)
+        peer_k, peer_v = _kv(1, 0)
+        calls = {"n": 0}
+
+        def fake_all_reduce(flag, op=None, group=None):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                flag.fill_(0)
+
+        def fake_all_gather(output, input_, group=None):
+            peer = next(
+                s for t, s in ((k, peer_k), (v, peer_v)) if torch.equal(t[0], input_)
+            )
+            output.copy_(torch.cat([input_.unsqueeze(0), peer[0].unsqueeze(0)], dim=0))
+
+        with (
+            patch.object(mod._State, "_share", lambda self, t, handle=None: t),
+            patch.object(mod.dist, "all_reduce", fake_all_reduce),
+            patch.object(mod.dist, "all_gather_into_tensor", fake_all_gather),
+        ):
+            out = st.gather(k, v)
+        self.assertTrue(st.failed)
+        self.assertEqual(st.staging, {}, "must not keep a mapping the peer refused")
+        self.assertTrue(torch.equal(out[0], torch.cat([k, peer_k], dim=1)))
+        self.assertTrue(torch.equal(out[1], torch.cat([v, peer_v], dim=1)))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")
+    def test_cuda_staging_is_uncached_and_exportable(self):
+        """Staging must stay out of the caching allocator and export over HIP IPC."""
+        mod._typestr(torch.float32, torch.device("cuda"))
+        # Logical size is 16 bytes; the export path pads to a page. That
+        # page comes from hipExtMalloc, so the caching allocator must not
+        # grow by it. `k` itself is a caching-allocator tensor and is
+        # measured with the baseline.
+        k = torch.empty(1, 1, 1, 1, device="cuda")
+        before = torch.cuda.memory_allocated()
+        local = mod._alloc_staging(k)
+        self.assertEqual(torch.cuda.memory_allocated(), before)
+        self.assertEqual(local.data_ptr(), local._ipc_alloc.ptr)
+        local.view(-1)[0] = 1
+        self.assertEqual(local.view(-1)[0].item(), 1)
+        handle = mod._export_ipc(local)
+        self.assertEqual(len(handle), 64)
 
 
 if __name__ == "__main__":
