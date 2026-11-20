@@ -12,6 +12,28 @@ curl http://localhost:30000/metrics
 
 See [Production Metrics](../references/production_metrics) and [Production Request Tracing](../references/production_request_trace) for more details.
 
+### HiCache storage transfer outcomes
+
+When a HiCache L3 backend is attached with `--enable-metrics`, the file backend
+exports `sglang:hicache_storage_transfer_total{op="get|put",result="success|miss|short_read|error|skipped"}`
+alongside the existing storage token counters. Each sample counts one storage
+object operation, not one token:
+
+- `success`: the whole object was read or written.
+- `miss`: no object was found. Normal for cold prefixes.
+- `short_read`: an object existed but was smaller than expected or returned
+  fewer bytes than requested. It is kept separate from `miss` so a truncated
+  page is never mistaken for a cache hit.
+- `error`: the backend raised (permissions, I/O failure, and so on).
+- `skipped`: the operation was deliberately not attempted, for example because
+  the object was already present or the evictor refused to reserve space.
+
+To troubleshoot, compare `short_read` and `error` with `get` traffic: a rising
+`short_read` rate points at truncated or concurrently evicted objects, and
+`error` points at the storage medium or its permissions. Both make the page
+unavailable to later requests even though the metadata may still claim it
+exists, so check the backend's files and logs first.
+
 ## Logging
 
 By default, SGLang does not log any request contents. You can log them by using `--log-requests`.

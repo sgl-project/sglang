@@ -2381,6 +2381,23 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
         )
 
+        self.hicache_storage_transfer_total = Counter(
+            name="sglang:hicache_storage_transfer_total",
+            documentation="HiCache L3 backend object operations by outcome. "
+            "success: the whole object was read or written; miss: no object "
+            "was found; short_read: an object existed but was smaller than "
+            "expected or yielded fewer bytes than requested (kept separate "
+            "from miss so a truncated object is not mistaken for a cache "
+            "hit); error: the backend raised; skipped: the operation was "
+            "deliberately not attempted, e.g. the object was already present.",
+            labelnames=list(labels.keys()) + ["op", "result"],
+        )
+        for op in ("get", "put"):
+            for result in ("success", "miss", "short_read", "error", "skipped"):
+                self.hicache_storage_transfer_total.labels(
+                    **self.labels, op=op, result=result
+                )
+
         bucket_io = [
             1,
             5,
@@ -2475,6 +2492,12 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             self.storage_backup_failed_tokens_total.labels(**self.labels).inc(
                 num_tokens
             )
+
+    def log_storage_transfer(self, op: str, result: str, count: int = 1) -> None:
+        if count > 0:
+            self.hicache_storage_transfer_total.labels(
+                **self.labels, op=op, result=result
+            ).inc(count)
 
     def _log_histogram(self, histogram, data: Union[int, float]):
         histogram.labels(**self.labels).observe(data)
