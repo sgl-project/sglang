@@ -768,6 +768,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         if media_error:
             raise _MediaInputValidationError(media_error)
 
+        self._prepare_reasoning_effort(chat_request)
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
         processed_messages = self._process_messages(
             chat_request,
