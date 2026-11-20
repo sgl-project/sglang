@@ -1166,12 +1166,10 @@ def _static_state_entries(
             register_npu_indexer_state(
                 add, token_to_kv_pool, draft_token_to_kv_pool, total_kv_layers
             )
-        elif isinstance(token_to_kv_pool, (DSATokenToKVPool, NPUMLATokenToKVPool)):
-            tail_ptrs, tail_lens, tail_item_lens = [], [], []
-            if isinstance(token_to_kv_pool, DSATokenToKVPool):
-                tail_ptrs, tail_lens, tail_item_lens = (
-                    token_to_kv_pool.get_compress_tail_buf_infos()
-                )
+        elif isinstance(token_to_kv_pool, DSATokenToKVPool):
+            tail_ptrs, tail_lens, tail_item_lens = (
+                token_to_kv_pool.get_compress_tail_buf_infos()
+            )
             if draft_token_to_kv_pool is not None and isinstance(
                 draft_token_to_kv_pool, DSATokenToKVPool
             ):
@@ -1189,12 +1187,9 @@ def _static_state_entries(
                 tail_ptrs = tail_ptrs + draft_tail_ptrs
                 tail_lens = tail_lens + draft_tail_lens
                 tail_item_lens = tail_item_lens + draft_tail_item_lens
-            # An NPU MLA pool sends its index and tail with the KV (PD reads
-            # its buffer groups from the pool), so it adds no state entry.
-            if not isinstance(token_to_kv_pool, NPUMLATokenToKVPool):
-                add(StateType.DSA, data_ptrs, data_lens, item_lens)
-                if tail_ptrs:
-                    add(StateType.DSA_TAIL, tail_ptrs, tail_lens, tail_item_lens)
+            add(StateType.DSA, data_ptrs, data_lens, item_lens)
+            if tail_ptrs:
+                add(StateType.DSA_TAIL, tail_ptrs, tail_lens, tail_item_lens)
 
     if is_npu() and _is_dsv4_npu(token_to_kv_pool):
         from sglang.srt.disaggregation.ascend.conn import AscendStateType
