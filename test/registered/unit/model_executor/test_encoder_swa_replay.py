@@ -199,6 +199,7 @@ class TestFoldedExtendRows(CustomTestCase):
         folded = _fold_batch(batch=fx.batch, runner=fx.runner, rows=HITS)
         fb = SimpleNamespace(
             mm_inputs=folded.batch.multimodal_inputs,
+            rids=None,
             extend_prefix_lens_cpu=folded.batch.prefix_lens,
             extend_seq_lens_cpu=folded.batch.extend_lens,
             mm_input_embeds=None,

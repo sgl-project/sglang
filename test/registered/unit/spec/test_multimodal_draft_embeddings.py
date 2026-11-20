@@ -31,6 +31,7 @@ def test_eagle_mm_embeddings_survive_in_place_target_updates(algorithm):
         forward_mode=ForwardMode.EXTEND,
         contains_mm_inputs=lambda: True,
         mm_inputs=[SimpleNamespace()],
+        rids=["req"],
         extend_prefix_lens_cpu=[0],
         extend_seq_lens_cpu=[4],
         input_embeds=None,
