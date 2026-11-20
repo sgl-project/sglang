@@ -2316,14 +2316,12 @@ class TestMambaHostShare(CustomTestCase):
 
 
 class TestMambaHostShareForModelGeometries(CustomTestCase):
-    """--hicache-size split for real hybrid geometries, before and after the Mamba
-    share was weighed by checkpoint bytes instead of all device Mamba bytes.
+    """--hicache-size weighs the Mamba host pool by checkpoint bytes for real hybrid
+    geometries, whatever spec verify scratch sits beside them.
 
-    The sizing path has no platform branch; what differs between deployments is the
-    spec verify scratch beside the checkpoints. "mtp" is the recurrent verify with
-    per-draft-token snapshots (the CUDA MTP recipe); "replayssm" is
-    --enable-linear-replayssm-spec (the MI355X Kimi-K3.1 recipe). Pools are on the
-    meta device; the KV side is a byte count, since its weight did not change.
+    "mtp" is the recurrent verify with per-draft-token snapshots; "replayssm" is
+    --enable-linear-replayssm-spec. Pools are on the meta device; the KV side is a
+    byte count.
     """
 
     HICACHE_SIZE_GB = 100
@@ -2358,10 +2356,10 @@ class TestMambaHostShareForModelGeometries(CustomTestCase):
             dtype=Mamba2StateDType(conv=torch.bfloat16, temporal=torch.float32),
         )
 
-    def test_split_before_and_after(self):
+    def test_mamba_share_is_the_same_in_every_spec_mode(self):
         gib = 1024**3
         # (model, cache params, KV bytes, Mamba slots, draft tokens, bytes per slot,
-        #  {spec mode: (Mamba GiB before, Mamba GiB after)})
+        #  {spec mode: Mamba GiB})
         cases = (
             (
                 # TP4; 1M tokens of 12 GQA layers, one 256-dim bf16 KV head per rank.
@@ -2372,9 +2370,9 @@ class TestMambaHostShareForModelGeometries(CustomTestCase):
                 4,
                 36 * (2048 * 3 * 2 + 8 * 128 * 128 * 4),
                 {
-                    "none": (28.78, 28.70),
-                    "mtp": (66.89, 28.70),
-                    "replayssm": (34.01, 28.70),
+                    "none": 28.70,
+                    "mtp": 28.70,
+                    "replayssm": 28.70,
                 },
             ),
             (
@@ -2386,9 +2384,9 @@ class TestMambaHostShareForModelGeometries(CustomTestCase):
                 8,
                 69 * (3 * 4608 * 2 + 12 * 128 * 128 * 4),
                 {
-                    "none": (34.39, 34.22),
-                    "mtp": (82.51, 34.22),
-                    "replayssm": (46.15, 34.22),
+                    "none": 34.22,
+                    "mtp": 34.22,
+                    "replayssm": 34.22,
                 },
             ),
         )
@@ -2404,7 +2402,7 @@ class TestMambaHostShareForModelGeometries(CustomTestCase):
             kv_pool = SimpleNamespace(
                 host_capacity_bytes=None, get_kv_size_bytes=lambda b=kv_bytes: b
             )
-            for mode, (before_gib, after_gib) in shares.items():
+            for mode, after_gib in shares.items():
                 with self.subTest(model=model, mode=mode):
                     spec = (
                         {}
@@ -2427,13 +2425,12 @@ class TestMambaHostShareForModelGeometries(CustomTestCase):
                         hicache_size=self.HICACHE_SIZE_GB,
                         kv_pools=(kv_pool, mamba_pool),
                     )
-                    # The rule before: every device Mamba byte, scratch included.
-                    device_bytes = mamba_pool.get_kv_size_bytes()
-                    old_share = (
-                        self.HICACHE_SIZE_GB * device_bytes / (device_bytes + kv_bytes)
-                    )
-                    self.assertAlmostEqual(old_share, before_gib, places=2)
                     self.assertAlmostEqual(mamba_share, after_gib, places=2)
+                    if mode != "none":
+                        self.assertLess(
+                            mamba_pool.host_capacity_bytes,
+                            mamba_pool.get_kv_size_bytes(),
+                        )
 
 
 class TestHostLoadEvictsTheTargetWindowOnly(CustomTestCase):
