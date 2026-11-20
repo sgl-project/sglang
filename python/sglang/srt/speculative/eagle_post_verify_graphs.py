@@ -127,7 +127,6 @@ class EaglePostVerifyGraphs:
         from sglang.srt.speculative.spec_utils import SIMULATE_ACC_LEN
 
         info = batch.sampling_info
-        watermark = self._target_worker.model_runner.watermark_state
         if (
             not can_run_cuda_graph
             or batch.forward_mode.is_idle()
@@ -140,7 +139,7 @@ class EaglePostVerifyGraphs:
             or info.logit_bias is not None
             or info.sampling_seed is not None
             or info.need_min_p_sampling
-            or (watermark is not None and info.has_watermark_candidates)
+            or info.watermark is not None
             # compute_spec_logprobs reads the gathered logits off logits_output
             or (
                 batch.return_logprob
@@ -271,7 +270,7 @@ def _sample(slot: SimpleNamespace, speculative_runtime_hooks: Any) -> tuple:
         acc_scaling_penalties=None,
         logit_bias=None,
         sampling_seed=None,
-        has_watermark_candidates=False,
+        watermark=None,
         is_all_greedy=slot.is_all_greedy,
         need_top_k_sampling=slot.need_top_k,
         need_top_p_sampling=slot.need_top_p,
@@ -281,9 +280,6 @@ def _sample(slot: SimpleNamespace, speculative_runtime_hooks: Any) -> tuple:
         top_ps=staged.get("top_ps", unused),
         min_ps=unused,
         max_top_k=None,
-        watermark_keys=None,
-        watermark_context_windows=None,
-        watermark_enabled=None,
     )
     verify_view = SimpleNamespace(
         draft_token=staged["draft_tokens"],

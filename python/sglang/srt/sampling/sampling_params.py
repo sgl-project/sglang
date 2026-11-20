@@ -22,7 +22,7 @@ import msgspec
 
 from sglang.srt.environ import envs
 from sglang.srt.sampling.stop_regex import validate_stop_regex
-from sglang.srt.sampling.watermarking.core import (
+from sglang.srt.sampling.watermarking.config import (
     WatermarkRequestConfig,
     normalize_watermark_request,
 )

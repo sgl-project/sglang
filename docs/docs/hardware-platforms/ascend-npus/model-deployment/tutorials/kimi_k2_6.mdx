@@ -137,7 +137,7 @@ quay.io/ascend/sglang:main-cann9.1.0-a3
 Single-node deployment completes both prefill and decode within the same node (PD mixed mode), suitable for scenarios
 with limited hardware resources. This scenario is already covered in the best practice. For the complete, optimized
 deployment commands and benchmark data, see
-[Kimi K2.6 Best Practice — PD Mixed On A3 Series](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/kimi_k2_6#single-node-pd-mixed).
+[Kimi-K2.6 Best Practice — PD Mixed On A3 Series](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/kimi_k2_6#single-node-pd-mixed).
 
 ### Multi-node online deployment
 
