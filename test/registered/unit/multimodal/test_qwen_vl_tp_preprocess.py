@@ -202,6 +202,46 @@ class TestQwenVLTPPreprocess(unittest.TestCase):
                     deferred.pixel_values, original.pixel_values, rtol=0, atol=0
                 )
 
+    def test_accepts_chw_uint8_from_jpeg_decoder(self):
+        processor = Qwen2VLImageProcessor()
+        image = torch.arange(3 * 560 * 560, dtype=torch.int32)
+        image = image.to(torch.uint8).reshape(3, 560, 560)
+        pixels, grid, width = prepare_deferred_image(image, processor, {})
+        native = processor(images=[image], return_tensors="pt", device="cpu")
+        self.assertEqual(width, native.pixel_values.shape[1])
+        torch.testing.assert_close(pixels, image)
+        torch.testing.assert_close(grid, native.image_grid_thw)
+
+    def test_vit_graph_returns_owned_embeddings_for_tp_image_groups(self):
+        from sglang.srt.models.qwen3_vl import Qwen3VLMoeVisionModel
+
+        static_output = torch.empty((1, 1))
+
+        def replay(*, x, **kwargs):
+            static_output.copy_(x)
+            return static_output
+
+        vision = SimpleNamespace(
+            use_bounded_cuda_graph=True,
+            graph_runners=SimpleNamespace(
+                run=replay, admit_tp_layout=lambda *args: True
+            ),
+            _prepare_graph_inputs=lambda pixels, grid: (
+                pixels,
+                torch.tensor([0, 1], dtype=torch.int32),
+                None,
+                None,
+            ),
+        )
+        grid = torch.ones((1, 3), dtype=torch.long)
+        run = Qwen3VLMoeVisionModel.forward_with_cuda_graph
+        first = run(vision, torch.tensor([[1.0]]), grid)
+        second = run(vision, torch.tensor([[2.0]]), grid)
+        vision.use_bounded_cuda_graph = False
+        self.assertIs(run(vision, torch.tensor([[3.0]]), grid), static_output)
+        self.assertEqual(first.item(), 1)
+        self.assertEqual(second.item(), 2)
+
     def test_rank_consensus_order_and_failure(self):
         with tempfile.TemporaryDirectory() as directory:
             rendezvous = (Path(directory) / "rendezvous").as_uri()

@@ -372,6 +372,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         use_data_parallel: bool = False,
+        use_bounded_cuda_graph: bool = False,
     ) -> None:
         super().__init__()
         self.pp_group = get_parallel().pp_group
@@ -386,6 +387,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         self.spatial_merge_unit = self.spatial_merge_size**2
         self.temporal_patch_size = vision_config.temporal_patch_size
         self.use_data_parallel = use_data_parallel
+        self.use_bounded_cuda_graph = use_bounded_cuda_graph
         # layer indexes of which layer's output should be deep-stacked
         self.deepstack_visual_indexes = vision_config.deepstack_visual_indexes
         self.disable_merger_proj = getattr(vision_config, "disable_merger_proj", False)
@@ -935,7 +937,17 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         token_cu_seqlens = np.concatenate(
             [np.zeros(1, dtype=np.int32), token_cu_seqlens]
         )
+        return self._forward_vision_blocks(
+            x, token_cu_seqlens, rotary_pos_emb_cos, rotary_pos_emb_sin
+        )
 
+    def _forward_vision_blocks(
+        self,
+        x: torch.Tensor,
+        token_cu_seqlens: np.ndarray,
+        rotary_pos_emb_cos: torch.Tensor,
+        rotary_pos_emb_sin: torch.Tensor,
+    ) -> torch.Tensor:
         # ---- pre-compute attention metadata once for all layers ----
         packed_indptrs = None
         flashinfer_sequence_lengths = None
@@ -1047,22 +1059,26 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             rotary_pos_emb_sin,
         ) = self._prepare_graph_inputs(x, grid_thw)
         attention_layout_key = (tuple(cu_seqlens.tolist()), None)
-        if not isinstance(cu_seqlens, torch.Tensor):
-            cu_seqlens = torch.tensor(cu_seqlens, device=x.device, dtype=torch.int32)
-        else:
-            cu_seqlens = cu_seqlens.to(device=x.device, dtype=torch.int32)
-        cu_seqlens = cu_seqlens.contiguous()
+        if self.use_bounded_cuda_graph and not self.graph_runners.admit_tp_layout(
+            x.shape[0], attention_layout_key
+        ):
+            # Keep positional interpolation identical on captures, replays and misses.
+            return self._forward_vision_blocks(
+                x, cu_seqlens.numpy(), rotary_pos_emb_cos, rotary_pos_emb_sin
+            )
 
-        return self.graph_runners.run(
+        embeddings = self.graph_runners.run(
             x=x,
             position_embeddings=None,
             rotary_pos_emb_cos=rotary_pos_emb_cos,
             rotary_pos_emb_sin=rotary_pos_emb_sin,
-            cu_seqlens=cu_seqlens,
+            cu_seqlens=cu_seqlens.to(device=x.device, dtype=torch.int32).contiguous(),
             cu_window_seqlens=None,
             output_indices=None,
             attention_layout_key=attention_layout_key,
         )
+        # Packed groups and the embedding cache can keep views past the next replay.
+        return embeddings.clone() if self.use_bounded_cuda_graph else embeddings
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
@@ -1329,6 +1345,10 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 norm_eps=getattr(config, "rms_norm_eps", 1e-6),
                 prefix=add_prefix("model.visual", prefix),
                 use_data_parallel=self.use_data_parallel,
+                use_bounded_cuda_graph=(
+                    config.model_type in ("qwen3_vl", "qwen3_vl_moe")
+                    and envs.SGLANG_QWEN_VL_TP_IMAGE_PREPROCESS.get()
+                ),
             )
 
         # TODO: make it more elegant

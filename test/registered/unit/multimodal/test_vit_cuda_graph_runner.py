@@ -71,6 +71,26 @@ def test_vit_graph_key_includes_full_and_window_attention_boundaries():
     assert first != second
 
 
+def test_tp_vit_graph_admits_repeated_layouts_within_limits():
+    runner = _runner(use_data_parallel=False)
+    runner._attn_backend = "triton_attn"
+    layout = ((0, 4, 8), None)
+    other_layout = ((0, 2, 8), None)
+    assert not runner.admit_tp_layout(8, layout)
+    assert not runner.admit_tp_layout(8, other_layout)
+    assert runner.admit_tp_layout(8, layout)
+    runner.block_graphs[(8, layout)] = object()
+    assert runner.admit_tp_layout(8, layout)
+
+    big_layout = ((0, 8193), None)
+    assert not runner.admit_tp_layout(8193, big_layout)
+    assert not runner.admit_tp_layout(8193, big_layout)
+    for seq_len in range(1, 8):
+        runner.block_graphs[(seq_len, ((0, seq_len), None))] = object()
+    assert not runner.admit_tp_layout(8, other_layout)
+    assert runner.admit_tp_layout(8, layout)
+
+
 def test_vit_graph_keeps_rotary_workspace_address_after_growth():
     runner = _runner(use_data_parallel=True)
     runner.vit.device = torch.device("cpu")

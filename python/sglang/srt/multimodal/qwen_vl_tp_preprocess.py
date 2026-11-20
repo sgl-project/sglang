@@ -20,7 +20,14 @@ MAX_FP32_PIXEL_BATCH_BYTES = 512 << 20
 
 def prepare_deferred_image(image, processor, kwargs):
     """Build the prompt grid and CPU pixels from the same processor settings."""
-    if not isinstance(image, Image.Image):
+    is_tensor = isinstance(image, torch.Tensor)
+    if is_tensor and image.ndim == 3 and image.dtype == torch.uint8:
+        channels, height, width = image.shape
+        if channels != 3:
+            return None
+    elif isinstance(image, Image.Image):
+        height, width = image.height, image.width
+    else:
         return None
     settings = {
         key: kwargs.get(key, getattr(processor, key, None))
@@ -29,11 +36,11 @@ def prepare_deferred_image(image, processor, kwargs):
     settings.update(kwargs)
     settings = processor._standardize_kwargs(**settings)
     processor._validate_preprocess_kwargs(**settings)
-    if image.mode != "RGB" and not settings.get("do_convert_rgb"):
+    if not is_tensor and image.mode != "RGB" and not settings.get("do_convert_rgb"):
         return None
     patch = settings["patch_size"]
     factor = patch * settings["merge_size"]
-    height, width = image.height, image.width
+    raw_bytes = height * width * 3
     if settings["do_resize"]:
         size = settings["size"]
         height, width = smart_resize(
@@ -50,12 +57,17 @@ def prepare_deferred_image(image, processor, kwargs):
     expected_fp32_bytes = math.prod(grid) * patch_width * torch.float32.itemsize
     if (
         expected_fp32_bytes > MAX_FP32_PIXEL_BATCH_BYTES
-        or image.width * image.height * 3 > expected_fp32_bytes
+        or raw_bytes > expected_fp32_bytes
     ):
         return None
-    if image.mode != "RGB":
-        image = image.convert("RGB")
-    pixels = torch.from_numpy(np.array(image)).permute(2, 0, 1).contiguous()
+    if is_tensor:
+        # nvJPEG supplies CHW uint8. Transfer decoded pixels before expanding
+        # them into the processor's normalized FP32 patch matrix.
+        pixels = image.to(device="cpu").contiguous()
+    else:
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+        pixels = torch.from_numpy(np.array(image)).permute(2, 0, 1).contiguous()
     return pixels, torch.tensor([grid], dtype=torch.long), patch_width
 
 

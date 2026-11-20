@@ -306,12 +306,6 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
         ):
             return False
 
-        if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
-            raise ValueError(
-                "Qwen-VL TP image preprocessing requires "
-                "SGLANG_VIT_ENABLE_CUDA_GRAPH=0 because ViT graph replays reuse outputs"
-            )
-
         parallel = get_parallel()
         disagg = get_disagg()
         pure_tp = (
