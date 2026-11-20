@@ -1485,6 +1485,33 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # A decision layout indexes the whole prompt, so it is checked before any
         # truncation below could cut the prompt.
         self._validate_joint_schema_request(obj, input_ids)
+        if isinstance(obj, GenerateReqInput) and obj.decision_layout is not None:
+            from sglang.srt.configs.nemotron_decision import (
+                validate_packed_decision_layout,
+            )
+
+            if not self.is_single_token_read:
+                raise ValueError(
+                    "generation decision_layout requires Nemotron Decision"
+                )
+            slots = validate_packed_decision_layout(
+                obj.decision_layout,
+                input_ids,
+                self.model_config.hf_config.mask_token_id,
+                self.model_config.nemotron_decision_config["max_questions"],
+            )
+            if (
+                not obj.return_logprob
+                or obj.logprob_start_len != 0
+                or obj.token_indices_to_pool != slots
+                or not obj.token_ids_logprob
+                or obj.multi_item_delimiter_indices is not None
+                or obj.session_id is not None
+                or obj.session_params is not None
+            ):
+                raise ValueError(
+                    "packed Decision reads require prefill-only logprobs at every question mask and no session"
+                )
         if self.is_single_token_read:
             limit = max_joint_prompt_tokens(
                 context_len=self.context_len,
@@ -1849,6 +1876,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 lora_name=obj.lora_path,
                 input_embeds=input_embeds,
                 positional_embed_overrides=obj.positional_embed_overrides,
+                decision_layout=obj.decision_layout,
                 session_id=obj.session_id,
                 session_params=session_params,
                 custom_logit_processor=obj.custom_logit_processor,

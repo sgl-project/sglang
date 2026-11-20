@@ -230,7 +230,7 @@ class TestNemotronDecisionServing(CustomTestCase):
                 }
             },
         }
-        for extension in ({"packing": "shared"}, {"long_mode": "compact"}):
+        for extension in ({"packing": "invalid"}, {"long_mode": "compact"}):
             response = requests.post(
                 self.url + "/v1/systemone", json={**payload, **extension}, timeout=30
             )

@@ -70,10 +70,9 @@ for this checkpoint. The BF16 checkpoint allows up to
 available KV capacity can impose a smaller limit. Longer inputs are rejected
 without truncation or compaction.
 
-Each question gets a separate complete read, including its state. Prefix caching
-and chunked prefill are disabled for this model because every input token must
-attend to the whole question. No output tokens are generated. Images, shared-state
-packing, speculative decoding and multi-token generation are unsupported.
+Each question gets a separate complete read by default, including its state.
+Prefix caching and chunked prefill are disabled for this model. No output tokens
+are generated. Images, speculative decoding and multi-token generation are unsupported.
 ROCm serving is rejected because its default attention backend does not honor
 this model's bidirectional attention.
 For this checkpoint, `/v1/decisions` uses prompt format version 2, with the same
@@ -108,6 +107,16 @@ response = requests.post(
 response.raise_for_status()
 print(response.json())
 ```
+
+Set `"packing": "shared"` on either API to share state tokens within each packed
+group. State tokens attend only to the state; each question attends to the state
+and itself, with positions restarting after the state. This can change probabilities
+compared with separate full-attention reads. Groups must fit the complete-read
+budget. Input usage counts physical packed tokens. Packing also supports LoRA
+adapters. It uses the existing eager path for multiple readout positions and cannot be
+combined with `return_prompt_token_ids`, since token IDs do not encode its attention mask.
+See the [cookbook](/cookbook/autoregressive/NVIDIA/Nemotron3.5-Decision#5-shared-state-packing)
+for usage.
 
 To use a LoRA adapter, add `--lora-paths task=/path/to/adapter` to the launch
 command and set `"model": "decision-test:task"` in either endpoint's request. The

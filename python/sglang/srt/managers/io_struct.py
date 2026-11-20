@@ -343,6 +343,8 @@ class GenerateReqInput:
     # Runtime type: Optional[Union[PositionalEmbeds, List[Optional[PositionalEmbeds]]]]
     # Typed as Any to avoid Pydantic/FastAPI schema errors (PositionalEmbeds contains torch.Tensor).
     positional_embed_overrides: Any = None
+    # Nemotron Decision shared prefix length followed by question lengths.
+    decision_layout: Optional[Union[List[int], List[Optional[List[int]]]]] = None
 
     # For disaggregated inference
     bootstrap_host: Optional[Union[List[Optional[str]], str]] = None
@@ -489,6 +491,18 @@ class GenerateReqInput:
         if self.session_id is not None and self.session_params is not None:
             raise ValueError("session_id and session_params cannot both be set.")
         self._handle_parallel_sampling()
+        if self.decision_layout is not None:
+            if self.parallel_sample_num != 1:
+                raise ValueError("decision_layout does not support parallel sampling")
+            if not self.is_single and (
+                not isinstance(self.decision_layout, list)
+                or len(self.decision_layout) != self.batch_size
+                or any(
+                    layout is not None and not isinstance(layout, list)
+                    for layout in self.decision_layout
+                )
+            ):
+                raise ValueError("batched decision_layout needs one layout per input")
 
         if self.is_single:
             self._normalize_single_inputs()
@@ -1145,6 +1159,9 @@ class GenerateReqInput:
             ),
             mm_processor_kwargs=self.mm_processor_kwargs,
             positional_embed_overrides=self._get_positional_embed_overrides_item(i),
+            decision_layout=(
+                self.decision_layout[i] if self.decision_layout is not None else None
+            ),
             # If `__getitem__` is called, these bootstrap fields must be lists.
             bootstrap_host=(
                 self.bootstrap_host[i] if self.bootstrap_host is not None else None
@@ -1245,6 +1262,7 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     custom_logit_processor: Optional[str] = None
     # Embedding overrides to place at specific token positions.
     positional_embed_overrides: Optional[PositionalEmbeds] = None
+    decision_layout: Optional[List[int]] = None
 
     # For disaggregated inference
     bootstrap_host: Optional[str] = None

@@ -47,3 +47,23 @@ def load_nemotron_decision_config(model_path: str, revision: str | None) -> dict
     if len(config["labels"]["noul"]) != 2:
         raise ValueError("Nemotron Decision requires two noul labels")
     return config
+
+
+def validate_packed_decision_layout(layout, input_ids, mask_token_id, max_questions):
+    if (
+        not isinstance(layout, list)
+        or len(layout) < 2
+        or len(layout) > max_questions + 1
+        or any(type(length) is not int or length < 1 for length in layout)
+        or sum(layout) != len(input_ids)
+    ):
+        raise ValueError(
+            "decision_layout needs a positive shared length and valid question lengths covering the prompt"
+        )
+    slots, end = [], layout[0]
+    for length in layout[1:]:
+        end += length
+        slots.append(end - 1)
+    if [i for i, token in enumerate(input_ids) if token == mask_token_id] != slots:
+        raise ValueError("each packed question must end with its only mask token")
+    return slots

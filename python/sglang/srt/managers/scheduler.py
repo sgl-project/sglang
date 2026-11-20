@@ -3426,6 +3426,7 @@ class Scheduler(
                 time_stats=recv_req.time_stats,
                 multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
                 token_indices_to_pool=recv_req.token_indices_to_pool,
+                decision_layout=recv_req.decision_layout,
             )
             req.tokenizer = self.tokenizer
 

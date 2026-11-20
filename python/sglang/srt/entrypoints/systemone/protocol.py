@@ -166,6 +166,7 @@ class NemotronDecisionsScoreQuestion(DecisionScoreQuestion):
 
 
 class NemotronDecisionsRequest(DecisionRequest):
+    packing: Literal["none", "shared"] = "none"
     input: Any
     questions: List[
         Annotated[

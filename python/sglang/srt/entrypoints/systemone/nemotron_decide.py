@@ -7,6 +7,7 @@ import json
 import math
 import re
 
+from jinja2 import Environment, TemplateSyntaxError, nodes
 from tokenizers import Tokenizer
 
 from sglang.srt.configs.nemotron_decision import is_nemotron_decision
@@ -24,6 +25,9 @@ class NemotronDecideEncoder:
     def __init__(self, *, config, metadata, tokenizer, max_prompt_tokens):
         self.tokenizer = tokenizer
         self.metadata = metadata
+        self.packing_template_prefix = _packing_template_prefix(
+            metadata["chat_template"]
+        )
         self.mask_token_id = config.mask_token_id
         self.max_prompt_tokens = min(max_prompt_tokens, metadata["max_input_tokens"])
         self.label_ids = {}
@@ -111,23 +115,9 @@ class NemotronDecideEncoder:
             dict(code=code, label=name, meaning=description)
             for code, (name, description) in zip(labels, entries)
         ]
-        content = json.dumps(
-            dict(state=state, question=question.instructions, options=options),
-            ensure_ascii=False,
-            allow_nan=False,
+        ids = self._encode_content(
+            dict(state=state, question=question.instructions, options=options)
         )
-        content = content.replace("\U000f0000", "").replace("\U000f0001", "")
-        marked = self.control_tokens.sub(
-            lambda match: "\U000f0000" + match[0] + "\U000f0001", content
-        )
-        rendered = self.tokenizer.apply_chat_template(
-            [{"role": "user", "content": ""}],
-            chat_template=self.metadata["chat_template"],
-            decision_content=marked,
-            tokenize=False,
-            add_generation_prompt=False,
-        )
-        ids = self._encode_marked_prompt(rendered)
         if (
             not ids
             or ids[-1] != self.mask_token_id
@@ -143,6 +133,35 @@ class NemotronDecideEncoder:
         label_ids = self.label_ids[kind][: len(labels)]
         # The API's boolean view is yes/no; the trained head is false/true.
         return ids, label_ids[::-1] if kind == "noul" else label_ids, []
+
+    def packing_prefix(self, state):
+        if self.packing_template_prefix is None:
+            raise ValueError(
+                "Shared packing requires a literal template wrapper around decision_content"
+            )
+        content = json.dumps(dict(state=state), ensure_ascii=False, allow_nan=False)
+        # Actual prompts trim the string delimiter for non-string questions.
+        content = content[:-1] + ', "question": "'
+        return self._encode_marked_prompt(
+            self.packing_template_prefix + self._mark_content(content)
+        )
+
+    def _encode_content(self, content):
+        content = json.dumps(content, ensure_ascii=False, allow_nan=False)
+        rendered = self.tokenizer.apply_chat_template(
+            [{"role": "user", "content": ""}],
+            chat_template=self.metadata["chat_template"],
+            decision_content=self._mark_content(content),
+            tokenize=False,
+            add_generation_prompt=False,
+        )
+        return self._encode_marked_prompt(rendered)
+
+    def _mark_content(self, content):
+        content = content.replace("\U000f0000", "").replace("\U000f0001", "")
+        return self.control_tokens.sub(
+            lambda match: "\U000f0000" + match[0] + "\U000f0001", content
+        )
 
     def encode_decisions(self, request, chat_template_kwargs):
         questions = {}
@@ -214,6 +233,32 @@ class NemotronDecideEncoder:
         if as_text:
             return self.text_tokenizer.encode(text, add_special_tokens=False).ids
         return self.tokenizer.encode(text, add_special_tokens=False)
+
+
+def _packing_template_prefix(template):
+    # Packing needs a fixed wrapper so questions cannot change the shared prefix.
+    prefix, found_content = [], False
+    try:
+        body = Environment().parse(template).body
+    except TemplateSyntaxError:
+        return None
+    for statement in body:
+        if not isinstance(statement, nodes.Output):
+            return None
+        for item in statement.nodes:
+            if isinstance(item, nodes.Name) and item.name == "decision_content":
+                if found_content:
+                    return None
+                found_content = True
+            elif isinstance(item, nodes.TemplateData):
+                if not found_content:
+                    prefix.append(item.data)
+            elif isinstance(item, nodes.Const) and isinstance(item.value, str):
+                if not found_content:
+                    prefix.append(item.value)
+            else:
+                return None
+    return "".join(prefix) if found_content else None
 
 
 def create_decision_encoder(model_config, tokenizer, max_prompt_tokens):

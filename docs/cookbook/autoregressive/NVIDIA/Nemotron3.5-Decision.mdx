@@ -31,12 +31,12 @@ Send requests through `/v1/systemone` or `/v1/decisions`. Both use the checkpoin
 
 ## 2. Configuration tips
 
-- **Complete reads.** Each question reads its full state and question together. SGLang disables prefix caching and chunked prefill because every token must attend to the complete question. A request with several questions runs one read per question. A follow-up PR is planned for opt-in shared-state packing: state tokens would attend only to the state, while each question would attend to the state and its own tokens. This changes the attention pattern and may change answer probabilities.
+- **Complete reads.** Each question reads its full state and question together. SGLang disables prefix caching and chunked prefill because every token must attend to the complete question. By default, a request with several questions runs one read per question. Use opt-in shared-state packing below to read the state once per packed group. This changes the attention pattern and may change answer probabilities.
 - **Input budget.** The default prefill budget is 32K tokens, or 16K on GPUs below 60 GiB. The checkpoint allows up to 131,072 tokens per complete prompt, but the server's prefill budget, context length, and available memory can impose a smaller limit. Increase `--max-prefill-tokens` only when the GPU has room for the full read. Oversized prompts return an error rather than being truncated.
 - **Question limits.** The BF16 checkpoint allows up to 512 questions per request and 2–501 options or score levels per question. Options retain their input order. These limits are read from `decision.json` in the model repository.
 - **API formats.** `/v1/systemone` takes a `state` and a dictionary of named questions. `/v1/decisions` takes `input` and a list of questions with IDs. Its `prompt_format_version` is 2 for this checkpoint; requesting a different version returns an error.
 - **Calibration.** The checkpoint sets calibration temperatures by question type. `/v1/decisions` also accepts a request `temperature` to adjust answer probabilities. It does not change `label_mass`, the full-vocabulary probability assigned to the candidate labels.
-- **Supported inputs.** Requests accept text and JSON. Images, chat completions, shared-state packing, and multi-token generation are not supported. ROCm serving is rejected at startup because its default attention backend does not honor this model’s bidirectional attention.
+- **Supported inputs.** Requests accept text and JSON. Images, chat completions, and multi-token generation are not supported. ROCm serving is rejected at startup because its default attention backend does not honor this model’s bidirectional attention.
 
 See [Decision models](/docs/supported-models/decision_models) for the full API reference and error behavior.
 
@@ -169,3 +169,12 @@ sglang serve \
 The server reads the adapter rank and target modules from `adapter_config.json`. Base and adapter requests can share the server. In either Python example above, set `"model"` to `"nvidia/NVIDIA-Nemotron-3.5-Decision-8B-BF16:task"` to use the adapter. Omit `:task` to use the base weights.
 
 Adapters can change the answer probabilities and selected answer. Validate your adapter on examples from its intended task before using its scores.
+
+
+## 5. Shared-state packing
+
+Add `"packing": "shared"` to either request example to share the state across its questions. The server packs questions within the complete-read token budget, splitting them into groups when needed. `"packing": "none"` is the default.
+
+State tokens attend only to the state. Each question attends to the state and its own tokens, with question positions restarting after the state. Questions cannot attend to each other. Because the state no longer attends to each question, packed probabilities can differ from separate reads. Validate the mode on your task before relying on its scores.
+
+The same `model:adapter` selection works with packed reads. Input-token usage counts the tokens actually read across packed groups. Packed reads use the existing eager path for multiple readout positions. Ordinary reads keep their default graph behavior. `return_prompt_token_ids` is unavailable with packing because token IDs alone do not describe the attention mask.

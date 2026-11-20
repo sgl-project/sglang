@@ -154,6 +154,13 @@ class OpenAIServingDecisions(OpenAIServingBase):
             return (
                 "return_prompt_token_ids cannot replay image inputs through /v1/score"
             )
+        # Token IDs alone cannot replay the packed attention mask.
+        if (
+            self.question_encoder is not None
+            and request.packing == "shared"
+            and request.return_prompt_token_ids
+        ):
+            return "return_prompt_token_ids cannot replay shared attention through /v1/score"
         version = request.prompt_format_version
         if version is not None and version != self.prompt_format_version:
             return (
@@ -418,10 +425,26 @@ class OpenAIServingDecisions(OpenAIServingBase):
         raw_request: Request,
         temperature: float = 1.0,
         lora_path: Optional[str] = None,
+        shared_prefix: Optional[List[int]] = None,
     ):
-        """Encode every question, then score them all in one call."""
+        """Encode and score the questions."""
         prompts, label_token_ids, image_data = await _encode_all(adapted_request)
         adapter = {"lora_path": lora_path} if lora_path is not None else {}
+        if shared_prefix is not None:
+            from sglang.srt.entrypoints.systemone.nemotron_packing import (
+                score_packed_decisions,
+            )
+
+            result = await score_packed_decisions(
+                self.tokenizer_manager,
+                self.question_encoder,
+                prompts,
+                label_token_ids,
+                raw_request,
+                shared_prefix,
+                lora_path=lora_path,
+            )
+            return prompts, label_token_ids, result
         result = await self.tokenizer_manager.score_prompts(
             prompts=prompts,
             label_token_ids=label_token_ids,
@@ -445,11 +468,17 @@ class OpenAIServingDecisions(OpenAIServingBase):
             if self.question_encoder is not None
             else None
         )
+        shared_prefix = (
+            await asyncio.to_thread(self.question_encoder.packing_prefix, request.input)
+            if self.question_encoder is not None and request.packing == "shared"
+            else None
+        )
         # Checkpoint temperatures vary by question type, so calibrate after scoring.
         prompts, label_token_ids, result = await self._score(
             adapted_request=adapted_request,
             raw_request=raw_request,
             temperature=request.temperature if self.question_encoder is None else 1.0,
+            shared_prefix=shared_prefix,
             **({"lora_path": adapter} if adapter is not None else {}),
         )
         answers = {}
