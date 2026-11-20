@@ -17,6 +17,7 @@ from .awq import (
 from .schemes import (
     AWQAscendLinearScheme,
     AWQAscendMoEScheme,
+    AWQEmbeddingScheme,
     AWQLinearScheme,
     AWQMarlinLinearScheme,
     AWQMoEScheme,
@@ -31,6 +32,7 @@ __all__ = [
     "AWQEmbeddingMethod",
     "AWQMoEMethod",
     "AWQLinearScheme",
+    "AWQEmbeddingScheme",
     "AWQMarlinLinearScheme",
     "AWQAscendLinearScheme",
     "AWQMoEScheme",

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from .awq_cpu import AWQIntelAMXLinearScheme, AWQIntelAMXMoEScheme
+from .awq_embedding import AWQEmbeddingScheme
 from .awq_linear import (
     AWQAscendLinearScheme,
     AWQLinearScheme,
@@ -14,6 +15,7 @@ __all__ = [
     "AWQLinearSchemeBase",
     "AWQMoESchemeBase",
     "AWQLinearScheme",
+    "AWQEmbeddingScheme",
     "AWQAscendLinearScheme",
     "AWQXPULinearScheme",
     "AWQIntelAMXLinearScheme",
