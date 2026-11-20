@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU contracts for prepared Sage communication and its SubBlock consumer."""
 
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -10,6 +11,19 @@ from sglang.multimodal_gen.runtime.distributed import sage_ulysses as adapter
 from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse import (
     prepared_sage_attention as attention_backend,
 )
+
+
+@pytest.fixture
+def flashinfer_comm(monkeypatch):
+    """Keep CPU contracts independent of the optional CUDA package."""
+    package = ModuleType("flashinfer")
+    package.__path__ = []
+    comm = ModuleType("flashinfer.comm")
+    comm.UlyssesCommunicator = object
+    package.comm = comm
+    monkeypatch.setitem(sys.modules, "flashinfer", package)
+    monkeypatch.setitem(sys.modules, "flashinfer.comm", comm)
+    return comm
 
 
 @pytest.mark.parametrize("used", [64, 130])
@@ -152,10 +166,7 @@ def test_ulysses_accepts_an_independent_attention_consumer(monkeypatch, fail):
         assert calls == ["prepare", "exchange", "attention", "gather"]
 
 
-def test_missing_prepared_api_fails_with_actionable_error(monkeypatch):
-    import flashinfer.comm
-
-    monkeypatch.setattr(flashinfer.comm, "UlyssesCommunicator", object)
+def test_missing_prepared_api_fails_with_actionable_error(flashinfer_comm):
     with pytest.raises(ImportError, match="#4924"):
         adapter._PreparedSageTransport("group", torch.zeros(64, 8, 128), 130)
 
@@ -384,8 +395,9 @@ def test_failed_transport_replacement_can_be_retried(monkeypatch):
 
 
 @pytest.mark.parametrize("stage", ["prepare", "gather"])
-def test_transport_initialization_closes_communicator_on_failure(monkeypatch, stage):
-    import flashinfer.comm
+def test_transport_initialization_closes_communicator_on_failure(
+    monkeypatch, flashinfer_comm, stage
+):
     import torch.distributed as dist
 
     calls = []
@@ -403,7 +415,7 @@ def test_transport_initialization_closes_communicator_on_failure(monkeypatch, st
             calls.append("close")
 
     q = torch.zeros(64, 8, 128)
-    monkeypatch.setattr(flashinfer.comm, "UlyssesCommunicator", Communicator)
+    monkeypatch.setattr(flashinfer_comm, "UlyssesCommunicator", Communicator)
     monkeypatch.setattr(dist, "get_rank", lambda group: 0)
     if stage == "gather":
 
@@ -416,10 +428,11 @@ def test_transport_initialization_closes_communicator_on_failure(monkeypatch, st
     assert calls == ["close"]
 
 
-def test_transport_close_releases_owned_buffers_and_is_idempotent(monkeypatch):
+def test_transport_close_releases_owned_buffers_and_is_idempotent(
+    monkeypatch, flashinfer_comm
+):
     import weakref
 
-    import flashinfer.comm
     import torch.distributed as dist
 
     calls = []
@@ -434,7 +447,7 @@ def test_transport_close_releases_owned_buffers_and_is_idempotent(monkeypatch):
         def close(self):
             calls.append("close")
 
-    monkeypatch.setattr(flashinfer.comm, "UlyssesCommunicator", Communicator)
+    monkeypatch.setattr(flashinfer_comm, "UlyssesCommunicator", Communicator)
     monkeypatch.setattr(dist, "get_rank", lambda group: 0)
     transport = adapter._PreparedSageTransport("group", torch.zeros(64, 8, 128), 130)
     transport.encoded = torch.empty(1)
@@ -478,8 +491,9 @@ def test_hardware_admission_is_collective_and_cached(monkeypatch, local, peer):
 
 
 @pytest.mark.parametrize("rank", [0, 1, 2, 3])
-def test_prepared_exchange_zeros_only_rank_local_padding(monkeypatch, rank):
-    import flashinfer.comm
+def test_prepared_exchange_zeros_only_rank_local_padding(
+    monkeypatch, flashinfer_comm, rank
+):
     import torch.distributed as dist
 
     received = []
@@ -495,7 +509,7 @@ def test_prepared_exchange_zeros_only_rank_local_padding(monkeypatch, rank):
             received.extend(operand.clone() for operand in operands)
             return "encoded"
 
-    monkeypatch.setattr(flashinfer.comm, "UlyssesCommunicator", Communicator)
+    monkeypatch.setattr(flashinfer_comm, "UlyssesCommunicator", Communicator)
     monkeypatch.setattr(dist, "get_rank", lambda group: rank)
     packed = torch.empty((64, 8, 3, 128), dtype=torch.bfloat16)
     q, k, v = packed.unbind(dim=2)
