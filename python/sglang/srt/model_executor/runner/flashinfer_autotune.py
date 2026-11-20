@@ -345,15 +345,15 @@ def uses_flashinfer_capture_replay(runner: DecodeCudaGraphRunner) -> bool:
     )
 
 
-@contextlib.contextmanager
-def flashinfer_capture_replay(
+def capture_with_flashinfer_replay(
     runner: DecodeCudaGraphRunner,
+    capture: Callable[[], None],
     forward_fn: Callable[[], object],
     post_warmup_hook: Optional[Callable[[], None]],
-):
-    """Tune what one decode shape looks up, then capture it under strict replay."""
+) -> None:
+    """Capture one decode shape from stored tactics, tuning any it lacks first."""
     if not uses_flashinfer_capture_replay(runner):
-        yield
+        capture()
         return
     from flashinfer import autotune_v2
 
@@ -363,16 +363,25 @@ def flashinfer_capture_replay(
         cache_scope="context",
         skip_ops=get_flashinfer_autotune_skip_ops(),
     )
+    report = None
     try:
-        # Profiles startup tuning never looked up are tuned and published here.
+        # A lookup without a stored winner raises instead of capturing the default.
+        with autotune_v2(mode="replay", strict_replay=True, **store) as report:
+            capture()
+        return
+    except RuntimeError as exc:
+        if report is None or not report.misses:
+            raise
+        logger.info("FlashInfer autotune: %s; tuning this decode shape.", exc)
+    # The miss raised in an eager warmup or in capture, neither of which kept a graph.
+    try:
         with autotune_v2(mode="tune", **store):
             forward_fn()
     finally:
         if post_warmup_hook is not None:
             post_warmup_hook()
-    # A lookup the fill did not make raises instead of capturing the default.
     with autotune_v2(mode="replay", strict_replay=True, **store):
-        yield
+        capture()
 
 
 def _autotune_tactic_sync_group(

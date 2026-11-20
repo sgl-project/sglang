@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import functools
 import inspect
 import logging
 from types import SimpleNamespace
@@ -98,7 +99,7 @@ from sglang.srt.model_executor.runner.early_verify_metadata import (
     VerifyInputSources,
 )
 from sglang.srt.model_executor.runner.flashinfer_autotune import (
-    flashinfer_capture_replay,
+    capture_with_flashinfer_replay,
     flashinfer_tactics_cache_for_persistence,
     maybe_flashinfer_autotune_speculative_draft,
     uses_flashinfer_capture_replay,
@@ -1600,13 +1601,18 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     post_warmup_hook=post_warmup_hook,
                     run_lm_head=True,
                 )
-                with flashinfer_capture_replay(self, run_once, post_warmup_hook):
-                    self.backend.capture_one(
+                capture_with_flashinfer_replay(
+                    self,
+                    functools.partial(
+                        self.backend.capture_one,
                         shape_key,
                         run_once,
                         capture_inputs=None,
                         post_warmup_hook=post_warmup_hook,
-                    )
+                    ),
+                    run_once,
+                    post_warmup_hook,
+                )
 
     def _set_dp_real_num_tokens(self, raw_num_token: int) -> None:
         # An idle DP rank replays a fabricated batch whose count may not reach

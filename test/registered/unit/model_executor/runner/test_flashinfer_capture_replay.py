@@ -1,9 +1,10 @@
 """Decode graph capture is served entirely by the managed store.
 
-Each captured shape first tunes, under the store, whatever its forward looks up that
-startup did not, then captures under strict replay, where a lookup without a stored
-winner raises instead of baking FlashInfer's default into the graph. The lifecycle
-cases use FlashInfer's real AutoTuner and store with GPU timing replaced by a table.
+Each shape is captured under strict replay, where a lookup without a stored winner
+raises instead of baking FlashInfer's default into the graph. On such a miss the
+shape's forward is tuned under the store and the capture runs once more. The
+lifecycle cases use FlashInfer's real AutoTuner and store, with GPU timing replaced
+by a table.
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
@@ -14,7 +15,7 @@ register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-s
 import sys
 import tempfile
 import unittest
-from contextlib import nullcontext
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
@@ -117,6 +118,7 @@ class TestCaptureReplayLifecycle(_PublishedConfig):
         ):
             self.enter(context)
         self.profiled = []
+        self.captures = 0
         self.hook = Mock()
         self.target = _model_runner()
         self.runner = _decode_runner(model_runner=self.target)
@@ -142,55 +144,79 @@ class TestCaptureReplayLifecycle(_PublishedConfig):
             for op in ops:
                 self._choose(op)
 
-    def _capture(self, *ops):
-        """One shape: the fill runs the forward, the body stands in for capture."""
+    def _capture(self, *ops, fill_ops=None):
+        """One shape; returns the tactics its capture served."""
+        served = []
+
+        def capture():
+            self.captures += 1
+            served[:] = [self._choose(op) for op in ops]
 
         def forward():
-            for op in ops:
+            for op in ops if fill_ops is None else fill_ops:
                 self._choose(op)
 
-        with autotune.flashinfer_capture_replay(self.runner, forward, self.hook):
-            return [self._choose(op) for op in ops]
+        autotune.capture_with_flashinfer_replay(
+            self.runner, capture, forward, self.hook
+        )
+        return served
 
     def _restart(self):
         self.tuner.clear_cache()
         self.reload()
         self.profiled.clear()
+        self.captures = 0
+        self.hook.reset_mock()
 
-    def test_fill_tunes_what_startup_missed_and_capture_replays_it(self):
+    def test_a_shape_the_store_covers_captures_once_without_tuning(self):
+        self._startup(OP)
+        self.profiled.clear()
+        self.assertEqual(self._capture(OP), [1])
+        self.assertEqual((self.captures, self.profiled), (1, []))
+        self.hook.assert_not_called()
+
+    def test_a_miss_is_tuned_and_the_shape_captured_again(self):
         self._startup(OP)
         self.profiled.clear()
         self.assertEqual(self._capture(OP, OTHER_OP), [1, 1])
         # Only the profile startup never looked up was measured.
         self.assertEqual(sorted(self.profiled), [-1, 0, 1, 2])
+        self.assertEqual(self.captures, 2)
         self.hook.assert_called_once_with()
 
-    def test_warm_restart_fills_nothing(self):
+    def test_a_warm_restart_captures_once_without_tuning(self):
         self._startup(OP)
         self._capture(OP, OTHER_OP)
         self._restart()
         self._startup(OP)
         self.assertEqual(self._capture(OP, OTHER_OP), [1, 1])
-        self.assertEqual(self.profiled, [])
+        self.assertEqual((self.captures, self.profiled), (1, []))
 
-    def test_a_capture_lookup_the_fill_did_not_make_raises(self):
+    def test_a_miss_the_forward_does_not_tune_raises(self):
         self._startup(OP)
-
-        def forward():
-            self._choose(OP)
-
         self.profiled.clear()
         with self.assertRaisesRegex(RuntimeError, "strict replay miss"):
-            with autotune.flashinfer_capture_replay(self.runner, forward, self.hook):
-                self._choose(OTHER_OP)
-        self.assertEqual(self.profiled, [])
+            self._capture(OP, OTHER_OP, fill_ops=(OP,))
+        self.assertEqual((self.captures, self.profiled), (2, []))
 
     def test_a_skipped_op_is_neither_tuned_nor_a_miss(self):
         with get_exec().kernel.override(flashinfer_autotune_skip_ops=[OTHER_OP]):
             self._startup(OP)
             self.profiled.clear()
             self.assertEqual(self._capture(OP, OTHER_OP), [1, -1])
-        self.assertEqual(self.profiled, [])
+        self.assertEqual((self.captures, self.profiled), (1, []))
+
+    def test_other_capture_errors_are_not_retried(self):
+        def capture():
+            self.captures += 1
+            raise RuntimeError("capture failed")
+
+        with self.assertRaisesRegex(RuntimeError, "capture failed"):
+            autotune.capture_with_flashinfer_replay(
+                self.runner, capture, Mock(), self.hook
+            )
+        self.assertEqual(self.captures, 1)
+        self.hook.assert_not_called()
 
     def test_the_hook_runs_after_a_failed_fill(self):
         self._startup(OP)
@@ -198,12 +224,16 @@ class TestCaptureReplayLifecycle(_PublishedConfig):
         def forward():
             raise ValueError("fill failed")
 
-        body = Mock()
+        def capture():
+            self.captures += 1
+            self._choose(OTHER_OP)
+
         with self.assertRaisesRegex(ValueError, "fill failed"):
-            with autotune.flashinfer_capture_replay(self.runner, forward, self.hook):
-                body()
+            autotune.capture_with_flashinfer_replay(
+                self.runner, capture, forward, self.hook
+            )
+        self.assertEqual(self.captures, 1)
         self.hook.assert_called_once_with()
-        body.assert_not_called()
 
 
 class TestCaptureReplayEligibility(_PublishedConfig):
@@ -250,14 +280,19 @@ class TestCaptureReplayEligibility(_PublishedConfig):
 
 
 class TestCaptureReplayContexts(_PublishedConfig):
-    """The fill and the strict replay both target P1's store with the skip ops."""
+    """Every context targets P1's store, with the skip ops."""
 
     def setUp(self):
         super().setUp()
         self.events = []
-        self.autotune_v2 = Mock(
-            side_effect=lambda **kw: self.events.append(kw["mode"]) or nullcontext()
-        )
+        self.misses = []  # consumed by successive strict captures
+
+        @contextmanager
+        def autotune_v2(**kw):
+            self.events.append(kw["mode"])
+            yield SimpleNamespace(misses=self.misses.pop(0) if self.misses else 0)
+
+        self.autotune_v2 = Mock(side_effect=autotune_v2)
         self.enter(
             patch.dict(
                 sys.modules,
@@ -267,34 +302,57 @@ class TestCaptureReplayContexts(_PublishedConfig):
         self.forward = Mock(side_effect=lambda: self.events.append("forward"))
         self.hook = Mock(side_effect=lambda: self.events.append("hook"))
 
-    def capture(self, eligible):
-        with (
-            patch.object(
-                autotune, "uses_flashinfer_capture_replay", return_value=eligible
-            ),
-            autotune.flashinfer_capture_replay(
-                _decode_runner(), self.forward, self.hook
-            ),
-        ):
-            self.events.append("capture")
+    def capture(self, eligible, miss_first=False):
+        attempts = []
 
-    def test_tune_then_strict_replay_on_the_managed_root(self):
+        def capture():
+            attempts.append(1)
+            self.events.append("capture")
+            if miss_first and len(attempts) == 1:
+                raise RuntimeError("autotune strict replay miss for op")
+
+        if miss_first:
+            self.misses = [1]
+        with patch.object(
+            autotune, "uses_flashinfer_capture_replay", return_value=eligible
+        ):
+            autotune.capture_with_flashinfer_replay(
+                _decode_runner(), capture, self.forward, self.hook
+            )
+
+    def store(self):
+        return dict(
+            cache_root=autotune.flashinfer_managed_autotune_cache_root(),
+            cache_scope="context",
+            skip_ops=autotune.get_flashinfer_autotune_skip_ops(),
+        )
+
+    def test_a_covered_shape_captures_once_under_strict_replay(self):
         with get_exec().kernel.override(flashinfer_autotune_skip_ops=[OP]):
             self.capture(eligible=True)
-            store = dict(
-                cache_root=autotune.flashinfer_managed_autotune_cache_root(),
-                cache_scope="context",
-                skip_ops=autotune.get_flashinfer_autotune_skip_ops(),
-            )
-        self.assertEqual(self.events, ["tune", "forward", "hook", "replay", "capture"])
+            store = self.store()
+        self.assertEqual(self.events, ["replay", "capture"])
+        self.assertEqual(
+            self.autotune_v2.call_args_list,
+            [call(mode="replay", strict_replay=True, **store)],
+        )
+        self.assertIn(OP, store["skip_ops"])
+
+    def test_a_miss_tunes_then_captures_again(self):
+        self.capture(eligible=True, miss_first=True)
+        store = self.store()
+        self.assertEqual(
+            self.events,
+            ["replay", "capture", "tune", "forward", "hook", "replay", "capture"],
+        )
         self.assertEqual(
             self.autotune_v2.call_args_list,
             [
+                call(mode="replay", strict_replay=True, **store),
                 call(mode="tune", **store),
                 call(mode="replay", strict_replay=True, **store),
             ],
         )
-        self.assertIn(OP, store["skip_ops"])
 
     def test_ineligible_capture_enters_no_context(self):
         self.capture(eligible=False)
