@@ -116,7 +116,7 @@ class SchedulerLogprobResultProcessor:
 
     def _process_input_token_ids_logprobs(self, req: Req) -> None:
         """Process input token IDs logprobs."""
-        if req.logprob.token_ids_logprob is None:
+        if not req.logprob.scores_input_token_ids:
             return
 
         uses_scoring_positions = self._uses_scoring_positions(req)
@@ -270,7 +270,7 @@ class SchedulerLogprobResultProcessor:
             req.temp_input_top_logprobs_val.append(output.input_top_logprobs_val[i])
             req.temp_input_top_logprobs_idx.append(output.input_top_logprobs_idx[i])
 
-        if req.logprob.token_ids_logprob is not None:
+        if req.logprob.scores_input_token_ids:
             req.temp_input_token_ids_logprobs_val.append(
                 output.input_token_ids_logprobs_val[i]
             )
@@ -303,7 +303,7 @@ class SchedulerLogprobResultProcessor:
                     assert (
                         len(req.logprob.input_top_logprobs_idx) == relevant_tokens_len
                     )
-                if req.logprob.token_ids_logprob is not None:
+                if req.logprob.scores_input_token_ids:
                     assert (
                         len(req.logprob.input_token_ids_logprobs_val)
                         == relevant_tokens_len
