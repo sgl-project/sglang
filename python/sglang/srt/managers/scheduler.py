@@ -3700,6 +3700,16 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
+        if recv_req.token_ids_logprob_rows is not None:
+            scored = len(req.origin_input_ids) - req.logprob_start_len - 1
+            if len(recv_req.token_ids_logprob_rows) != scored:
+                req.set_finish_with_abort(
+                    f"token_ids_logprob_rows needs {scored} rows for the engine's input."
+                )
+                self._add_request_to_queue(req)
+                return
+            req.logprob.token_ids_logprob_rows = recv_req.token_ids_logprob_rows
+
         if (
             get_device().mlx_enable_sampling
             and req.return_logprob
