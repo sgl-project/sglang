@@ -102,6 +102,8 @@ from sglang.srt.entrypoints.openai.utils import to_openai_style_logprobs
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
+from sglang.srt.function_call.kimik3_detector import KimiK3Detector
+from sglang.srt.function_call.kimik3_format import strip_response_markers
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.parser.response_template import (
@@ -788,6 +790,9 @@ class OpenAIServingResponses(OpenAIServingChat):
             if chat_request.chat_template_kwargs is not None
             else None
         )
+        request._response_parser_thinking_end = (
+            chat_request._response_parser_thinking_end
+        )
 
         _, engine_prompt = self._engine_prompt(processed_messages, is_multimodal)
         request_prompts = [engine_prompt]
@@ -1183,6 +1188,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         """The reasoning, content and calls, and the indices of calls the
         output cut off."""
         tool_parsing = self._tool_parsing_active(request, chat_tools)
+        response_unwrapped = False
         if self.reasoning_parser:
             reasoning_parser = ReasoningParser(
                 model_type=self.reasoning_parser,
@@ -1198,6 +1204,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             )
             reasoning_content, content = reasoning_parser.parse_non_stream(final_output)
             tool_parsing = tool_parsing and not self._answer_started(reasoning_parser)
+            response_unwrapped = self.reasoning_parser == "kimi_k3"
         else:
             reasoning_content = None
             content = final_output
@@ -1219,7 +1226,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                     request._response_parser_tool_grammar,
                     request._response_parser_grammar_start,
                 ),
+                thinking_end=request._response_parser_thinking_end,
             )
+            content = parser.strip_thinking(content)
             detector_owns_format = self._tool_parser_owns_format(parser)
             should_try_native = not is_required or detector_owns_format
             if should_try_native and parser.has_tool_call(content):
@@ -1231,6 +1240,12 @@ class OpenAIServingResponses(OpenAIServingChat):
                     parsed_via_native = bool(calls)
                 except Exception as e:
                     logger.error("Tool call parsing error: %s", e)
+            elif (
+                not is_required
+                and isinstance(parser.detector, KimiK3Detector)
+                and not response_unwrapped
+            ):
+                content = strip_response_markers(content)
 
         if (
             content
@@ -2346,6 +2361,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                     request._response_parser_tool_grammar,
                     request._response_parser_grammar_start,
                 ),
+                thinking_end=request._response_parser_thinking_end,
             )
         reasoning_parser_obj: Optional[ReasoningParser] = None
         if token_stream is None and self.reasoning_parser:

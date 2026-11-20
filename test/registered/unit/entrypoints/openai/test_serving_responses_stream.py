@@ -697,6 +697,54 @@ class NonHarmonyStreamTestCase(CustomTestCase):
                 )
                 self.assertEqual(deltas, stream_item["arguments"])
 
+    def test_json_answer_without_reasoning_parser_matches_full_and_streamed(self):
+        """Without a reasoning parser, GLM's leading thinking block and the
+        Kimi-K3 response markers stay out of a JSON answer, streamed or not."""
+        cases = (
+            ("glm47", "</think>", 'Plan.</think>{"word": "a</think>b"}'),
+            (
+                "kimi_k3",
+                "",
+                '{"word": "a</think>b"}<|close|>response<|sep|><|close|>message<|sep|>',
+            ),
+        )
+        for parser_name, thinking_end, raw in cases:
+            with self.subTest(parser=parser_name):
+                serving = make_serving()
+                serving.reasoning_parser = None
+                serving.tool_call_parser = parser_name
+                request = ResponsesRequest(
+                    model="x",
+                    input="hi",
+                    stream=True,
+                    store=False,
+                    tools=[
+                        {
+                            "type": "function",
+                            "name": "read_file",
+                            "parameters": {"type": "object"},
+                        }
+                    ],
+                )
+                request._response_parser_thinking_end = thinking_end
+                (full_item,) = serving._make_response_output_items(
+                    request,
+                    raw,
+                    serving.tokenizer_manager.tokenizer,
+                    require_reasoning=False,
+                )
+                events = StreamFixture(serving, request).run(
+                    [
+                        engine_chunk(raw[:i], i, finish=i == len(raw))
+                        for i in range(1, len(raw) + 1)
+                    ]
+                )
+                (stream_item,) = find_completed_event(events)["response"]["output"]
+                for item in (full_item.model_dump(), stream_item):
+                    self.assertEqual(
+                        item["content"][0]["text"], '{"word": "a</think>b"}'
+                    )
+
     def test_final_output_preserves_text_tool_text_order(self):
         from sglang.srt.function_call.core_types import (
             StreamingParseResult,

@@ -139,9 +139,15 @@ class FunctionCallParser:
         tool_choice=None,
         prefix: str = "",
         constrained: bool = False,
+        thinking_end: str = "",
     ):
         self.tools = tools
         self.tool_strict_level = envs.SGLANG_TOOL_STRICT_LEVEL.get()
+        # The output opens with a thinking block ending at thinking_end that no
+        # reasoning parser took out, so it is dropped instead of parsed.
+        self._thinking_end = thinking_end
+        self._in_streamed_thinking = bool(thinking_end)
+        self._thinking_tail = ""
         detector_class = self.ToolCallParserEnum.get(tool_call_parser)
         if detector_class:
             kwargs = {}
@@ -177,6 +183,13 @@ class FunctionCallParser:
             or self.detector.supports_structural_tag()
             or self.detector.parses_required_natively()
         )
+
+    def strip_thinking(self, text: str) -> str:
+        """Non-streaming `text` without the thinking block it opens with; text
+        cut off inside the block has no content."""
+        if not self._thinking_end:
+            return text
+        return text.partition(self._thinking_end)[2]
 
     def has_tool_call(self, text: str) -> bool:
         """
@@ -245,6 +258,10 @@ class FunctionCallParser:
             - The normal text that should be displayed to the user
             - A list of tool calls parsed from the chunk
         """
+        if self._in_streamed_thinking:
+            chunk_text = self._skip_streamed_thinking(chunk_text)
+            if self._in_streamed_thinking:
+                return "", []
         if not self.tools and not self.detector.parses_without_tools():
             return chunk_text, []
         final_normal_text = ""
@@ -259,12 +276,25 @@ class FunctionCallParser:
 
         return final_normal_text, final_calls
 
+    def _skip_streamed_thinking(self, chunk_text: str) -> str:
+        text = self._thinking_tail + chunk_text
+        end = text.find(self._thinking_end)
+        if end == -1:
+            # Keep what may be the start of a marker split across chunks.
+            self._thinking_tail = text[-(len(self._thinking_end) - 1) :]
+            return ""
+        self._in_streamed_thinking = False
+        self._thinking_tail = ""
+        return text[end + len(self._thinking_end) :]
+
     def parse_stream_end(self) -> Tuple[str, list[ToolCallItem]]:
         """Flush detector state once the stream ends.
 
         Text a detector held back waiting for a marker (which can no longer
         arrive) is released as normal text; see BaseFormatDetector.finish().
         """
+        # A held marker prefix is still thinking, so it is not released.
+        self._thinking_tail = ""
         if not self.tools and not self.detector.parses_without_tools():
             return "", []
         sp_result = self.detector.finish(self.tools)
@@ -488,6 +518,7 @@ class FunctionCallParser:
             thinking_mode=thinking_mode,
             parallel_tool_calls=parallel_tool_calls,
             strict_arguments=strict_arguments,
+            max_whitespace_cnt=max_whitespace_cnt,
         )
         if structural_tag is None:
             return None

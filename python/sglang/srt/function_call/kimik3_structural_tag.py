@@ -683,6 +683,7 @@ def get_kimik3_answer_structural_tag(
     thinking_mode: bool = False,
     parallel_tool_calls: bool = True,
     strict_arguments: bool = False,
+    max_whitespace_cnt: Optional[int] = None,
 ) -> Optional[StructuralTag]:
     """Automatic tool choice whose final answer, when no tool is called, is
     JSON matching `answer_json_schema`."""
@@ -696,7 +697,11 @@ def get_kimik3_answer_structural_tag(
         for tool in tools
     ]
     tools_tag = _tool_calls_tag(call_tags, parallel_tool_calls)
-    answer = _response(JSONSchemaFormat(json_schema=answer_json_schema))
+    answer = _response(
+        JSONSchemaFormat(
+            json_schema=answer_json_schema, max_whitespace_cnt=max_whitespace_cnt
+        )
+    )
     suffix = OrFormat(
         elements=[
             SequenceFormat(

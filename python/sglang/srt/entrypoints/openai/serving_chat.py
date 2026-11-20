@@ -108,10 +108,11 @@ from sglang.srt.entrypoints.request_headers import apply_header_overrides
 from sglang.srt.environ import envs
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
+from sglang.srt.function_call.glm4_moe_detector import GlmSpecialTokenConfig
 from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.function_call.kimik3_detector import KimiK3Detector
-from sglang.srt.function_call.kimik3_format import strip_response_wrappers
+from sglang.srt.function_call.kimik3_format import strip_response_markers
 from sglang.srt.function_call.utils import (
     get_json_schema_constraint,
     normalize_json_schema_types,
@@ -1796,9 +1797,13 @@ class OpenAIServingChat(OpenAIServingBase):
             thinking_mode=thinking_mode,
             any_whitespace=not get_serving().constrained_json_disable_any_whitespace,
             max_whitespace_cnt=get_serving().constrained_json_max_whitespace_cnt,
-            # A full-assistant grammar owns the thinking block, so the reasoner
-            # wrapper that enforces strict thinking and thinking_budget is skipped.
-            allow_full_assistant_grammar=not get_serving().enable_strict_thinking,
+            # A full-assistant grammar skips the reasoner wrapper, which exists only
+            # with a reasoning parser and caps only a thinking request's reasoning.
+            allow_full_assistant_grammar=not (
+                get_serving().enable_strict_thinking
+                and self.reasoning_parser
+                and thinking_mode
+            ),
         )
 
     def _process_messages(
@@ -1863,17 +1868,20 @@ class OpenAIServingChat(OpenAIServingBase):
             )
             parser = FunctionCallParser(effective_tools, self.tool_call_parser)
             glm_thinking = True if enable_thinking is None else bool(enable_thinking)
+            # GLM-5.3 thinks even with enable_thinking=false, and a grammar
+            # without the block leaves the JSON in reasoning_content.
+            answer_thinking = thinking_mode if self.reasoning_parser else glm_thinking
             tool_call_constraint = self._answer_tool_call_constraint(
-                request,
-                parser,
-                answer_json_schema,
-                # GLM-5.3 thinks even with enable_thinking=false, and a grammar
-                # without the block leaves the JSON in reasoning_content.
-                thinking_mode=(
-                    thinking_mode if self.reasoning_parser else glm_thinking
-                ),
+                request, parser, answer_json_schema, thinking_mode=answer_thinking
             )
             tool_call_constraint_covers_answer = tool_call_constraint is not None
+            request._response_parser_thinking_end = (
+                GlmSpecialTokenConfig().end_of_thinking
+                if tool_call_constraint_covers_answer
+                and answer_thinking
+                and not self.reasoning_parser
+                else ""
+            )
             if tool_call_constraint is None:
                 tool_call_constraint = parser.get_structure_constraint(
                     request.tool_choice,
@@ -3074,6 +3082,7 @@ class OpenAIServingChat(OpenAIServingBase):
             reasoning_text = None
             tool_calls = None
             answer_started = False
+            response_unwrapped = False
             if encoding_output is not None:
                 reasoning_text, text, tool_calls, finish_reason = (
                     encoding_output.parse_chat_response(
@@ -3098,6 +3107,9 @@ class OpenAIServingChat(OpenAIServingBase):
                     )
                     reasoning_text, text = parser.parse_non_stream(text)
                     answer_started = self._answer_started(parser)
+                    # The kimi_k3 parser already took the answer out of its
+                    # response channel, so markers left in it are answer text.
+                    response_unwrapped = self.reasoning_parser == "kimi_k3"
                 except Exception as e:
                     logger.error(f"Reasoning parsing error: {e}")
                     return self.create_error_response(
@@ -3125,6 +3137,8 @@ class OpenAIServingChat(OpenAIServingBase):
                         request._response_parser_tool_grammar,
                         request._response_parser_grammar_start,
                     ),
+                    thinking_end=request._response_parser_thinking_end,
+                    response_unwrapped=response_unwrapped,
                 )
 
             # Extract prompt_token_ids if requested
@@ -3339,6 +3353,9 @@ class OpenAIServingChat(OpenAIServingBase):
         history_tool_calls_cnt: int = 0,
         response_parser_prefix: str = "",
         constrained: bool = False,
+        *,
+        thinking_end: str = "",
+        response_unwrapped: bool = False,
     ) -> ToolCallProcessingResult:
         """Process tool calls in the response"""
 
@@ -3355,7 +3372,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 tool_choice=tool_choice,
                 prefix=response_parser_prefix,
                 constrained=constrained,
+                thinking_end=thinking_end,
             )
+            text = parser.strip_thinking(text)
             detector_owns_format = parser.owns_tool_format()
             should_try_parser = not is_required or detector_owns_format
             if should_try_parser and parser.has_tool_call(text):
@@ -3408,10 +3427,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 logger.debug("Unparsed required tool call output: %r", text[:2000])
                 return ToolCallProcessingResult(None, text, finish_reason)
 
-            if isinstance(parser.detector, KimiK3Detector):
-                # Without the kimi_k3 reasoning parser nothing else unwraps the
-                # response channel of an answer that calls no tool.
-                text = strip_response_wrappers(text)
+            if isinstance(parser.detector, KimiK3Detector) and not response_unwrapped:
+                text = strip_response_markers(text)
 
         # json_schema constraint → JSON array output for required/named
         if is_required:
@@ -3856,6 +3873,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     tokenizer=self.tokenizer_manager.tokenizer,
                     prefix=request._response_parser_prefix,
                     constrained=constrained,
+                    thinking_end=request._response_parser_thinking_end,
                 )
 
         parser = parser_dict[index]

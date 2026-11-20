@@ -459,6 +459,7 @@ class BaseFormatDetector(ABC):
         thinking_mode: bool = False,
         parallel_tool_calls: bool = True,
         strict_arguments: bool = False,
+        max_whitespace_cnt: Optional[int] = None,
     ) -> Optional[StructuralTag]:
         """Return a structural tag for automatic tool choice that admits tool
         calls or a final answer matching ``answer_json_schema``.

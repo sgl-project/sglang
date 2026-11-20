@@ -116,6 +116,7 @@ class KimiK3Detector(BaseFormatDetector):
         thinking_mode: bool = False,
         parallel_tool_calls: bool = True,
         strict_arguments: bool = False,
+        max_whitespace_cnt: Optional[int] = None,
     ) -> Optional[StructuralTag]:
         return get_kimik3_answer_structural_tag(
             tools,
@@ -123,6 +124,7 @@ class KimiK3Detector(BaseFormatDetector):
             thinking_mode=thinking_mode,
             parallel_tool_calls=parallel_tool_calls,
             strict_arguments=strict_arguments,
+            max_whitespace_cnt=max_whitespace_cnt,
         )
 
     def get_structural_tag(
