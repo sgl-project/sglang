@@ -1601,7 +1601,7 @@ class LowRatioCompressAscendBackendMixin:
             # fused with their scales.
             ds41.indexer_prologue_k_dsl(
                 **common,
-                k_cache=self._dsv41_qsli_cache(layer),
+                k_cache=pool.get_qsli_index_k(layer.layer_id),
                 k_scale_cache=None,
                 storage_mode=1,
                 combined_block_size=indexer.candidate_block_size,
@@ -1766,41 +1766,6 @@ class LowRatioCompressAscendBackendMixin:
             cmp_ratio=ratio,
         )
 
-    def _dsv41_qsli_cache(self, layer) -> torch.Tensor:
-        """The combined index-K record QSLI reads: ``[pages, page_size/8, 1, 544]``.
-
-        ``indexer_prologue_k`` storage_mode=1 packs the same K rows eight to a
-        record, which is exactly the PA_BBND layout QSLI takes. Only the
-        candidate source layer writes it, so it is allocated per
-        (ratio, source slot) on first use.
-        """
-        pool = self.token_to_kv_pool
-        item = pool.layer_mapping[layer.layer_id]
-        key = (item.compress_ratio, item.compress_layer_id)
-        cache = self._dsv41_qsli_caches.get(key)
-        if cache is None:
-            index_k = pool.get_index_k(layer.layer_id)
-            block = self._dsv41_candidate_block_size
-            pages, page_rows = int(index_k.shape[0]), int(index_k.shape[1])
-            if block <= 0 or page_rows % block:
-                raise RuntimeError(
-                    "DeepSeek-V4.1 QSLI needs candidate_block_size to divide the "
-                    f"compressed page rows, got block={block} rows={page_rows}."
-                )
-            head_dim = int(index_k.shape[-1]) * 2
-            # 32 = the prologue's e4m3 scale group.
-            row_bytes = block * (head_dim // 2 + head_dim // 32)
-            cache = torch.zeros(
-                pages,
-                page_rows // block,
-                1,
-                row_bytes,
-                dtype=torch.uint8,
-                device=index_k.device,
-            )
-            self._dsv41_qsli_caches[key] = cache
-        return cache
-
     def _dsv41_index_qsli_topk(self, layer, x, q_lora, pos, forward_batch):
         """Level two: rescore the published candidate blocks with this layer's Q.
 
@@ -1851,7 +1816,7 @@ class LowRatioCompressAscendBackendMixin:
                 "before the index layers."
             )
         topk = self._dsv4_index_topk
-        qsli_k = self._dsv41_qsli_cache(layer)
+        qsli_k = self.token_to_kv_pool.get_qsli_index_k(layer.layer_id)
         indices, _ = _ds41_ops().quant_sparse_lightning_indexer_dsl(
             q=q_packed,
             # QSLI takes the record rows without the singleton head axis.
@@ -2944,9 +2909,6 @@ class DeepseekV4AscendAttnBackend(
         self._dsv41_index_source_layers = tuple(
             getattr(hf, "index_source_layer_ids", ())
         )
-        # QSLI's 544B/8-token K records, allocated on first write; see
-        # _dsv41_qsli_cache.
-        self._dsv41_qsli_caches: dict = {}
         # Generation, read from the model's own ratios: a draft worker empties
         # the list below, while the spec-support gate must still classify it.
         self._dsv4_is_v41_model = any(ratio in (1, 2) for ratio in hf.compress_ratios)

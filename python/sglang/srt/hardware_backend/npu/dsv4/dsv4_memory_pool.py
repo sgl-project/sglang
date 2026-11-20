@@ -434,6 +434,8 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         self,
         *args,
         npu_window_generation: Optional[str] = None,
+        candidate_source_layer_id: int = -1,
+        candidate_block_size: int = 0,
         **kwargs,
     ):
         c128_page_size = get_schedule().c128_page_size
@@ -453,6 +455,35 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             )
         self._npu_window_generation = npu_window_generation
         super().__init__(*args, **kwargs)
+        self._qsli_source = None
+        self._qsli_index_k = None
+        if (
+            is_npu_arch35()
+            and self._stage_start <= candidate_source_layer_id < self._stage_end
+            and self.compression_ratios[candidate_source_layer_id] in (1, 2)
+        ):
+            item = self.layer_mapping[candidate_source_layer_id]
+            indexer = self._indexer_pool(item.compress_ratio)
+            k = indexer.get_index_k(item.compress_layer_id)
+            scale = indexer.get_index_scale(item.compress_layer_id)
+            pages, page_rows = k.shape[:2]
+            if candidate_block_size <= 0 or page_rows % candidate_block_size:
+                raise ValueError(
+                    f"QSLI candidate_block_size ({candidate_block_size}) must "
+                    f"divide the index page size ({page_rows})"
+                )
+            self._qsli_source = (item.compress_ratio, item.compress_layer_id)
+            # One QSLI record packs a block of the same FP4 K and E8M0 scales.
+            # Allocate before PD registers the full-page buffers on either peer.
+            with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+                self._qsli_index_k = torch.zeros(
+                    pages,
+                    page_rows // candidate_block_size,
+                    1,
+                    candidate_block_size * (k.shape[-1] + scale.shape[-1]),
+                    dtype=torch.uint8,
+                    device=k.device,
+                )
 
     def _is_v41_model(self) -> bool:
         pinned = getattr(self, "_npu_window_generation", None)
@@ -701,7 +732,8 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
                 item_lens.append(buf[0].nbytes)
 
         # V4.1 has no C4 pool: its main component is the per-ratio compressed
-        # KV + index K + index scale. Both PD peers walk the V4.1 low ratios
+        # KV + index K + index scale + the candidate source's QSLI records.
+        # Both PD peers walk the V4.1 low ratios
         # against the same compression config, so entries pair up positionally;
         # pools without such layers contribute nothing.
         for ratio in NPUDSV4KVLayout.COMPRESSED_RATIOS:
@@ -725,6 +757,13 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             ):
                 if not buf.numel():
                     continue  # A3 BF16 index K has no scale payload to transfer.
+                data_ptrs.append(buf.data_ptr())
+                data_lens.append(buf.nbytes)
+                item_lens.append(buf[0].nbytes * index_pages_per_full_page)
+
+            qsli_source = getattr(self, "_qsli_source", None)
+            if qsli_source is not None and qsli_source[0] == ratio:
+                buf = self._qsli_index_k
                 data_ptrs.append(buf.data_ptr())
                 data_lens.append(buf.nbytes)
                 item_lens.append(buf[0].nbytes * index_pages_per_full_page)
@@ -849,6 +888,15 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         return self._indexer_pool(item.compress_ratio).get_index_scale(
             item.compress_layer_id
         )
+
+    def get_qsli_index_k(self, layer_id: int) -> torch.Tensor:
+        self.wait_layer_transfer(layer_id)
+        item = self.layer_mapping[layer_id]
+        if self._qsli_source != (item.compress_ratio, item.compress_layer_id):
+            raise RuntimeError(
+                f"QSLI layer {layer_id} does not share the candidate source's index K"
+            )
+        return self._qsli_index_k
 
     def get_compress_buffer(
         self,

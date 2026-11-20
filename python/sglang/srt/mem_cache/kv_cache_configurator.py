@@ -2184,6 +2184,14 @@ class KVCacheConfigurator:
                 # pool generation instead of relying on ``compression_ratios``
                 # having been emptied to ``[0] * layers`` above.
                 kv_layout_kwargs = {"npu_window_generation": "v4"}
+            else:
+                hf = self.model_config.hf_config
+                kv_layout_kwargs = dict(
+                    candidate_source_layer_id=getattr(
+                        hf, "candidate_source_layer_id", -1
+                    ),
+                    candidate_block_size=getattr(hf, "candidate_block_size", 0),
+                )
         else:
             pool_cls = DeepSeekV4TokenToKVPool
             kv_layout, compressed_kv_layout = select_dsv4_kv_layout()

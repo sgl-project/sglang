@@ -1240,6 +1240,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     # object.__new__ stubs (SWA floor tests) skip __init__
     _dspark_draft_on_bf16 = False
     _npu_low_ratio_bf16 = False
+    _npu_qsli_ratio = 0
     # A subclass that adds the draft's KV to the per-token bytes itself sets this,
     # replacing the (T+D)/T inflation.
     _draft_kv_priced_exactly = False
@@ -1295,6 +1296,12 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.context_len = kvc.model_config.context_len
         # PP-local slice; matches DeepSeekV4TokenToKVPool's stage_ratios.
         stage = range(kvc.layer_info.start_layer, kvc.layer_info.end_layer)
+        if _is_npu and not kvc.is_draft_worker and is_npu_arch35():
+            candidate = getattr(cfg.hf_config, "candidate_source_layer_id", -1)
+            if candidate in stage and candidate < len(cfg.compress_ratios):
+                ratio = cfg.compress_ratios[candidate]
+                if ratio in (1, 2):
+                    self._npu_qsli_ratio = ratio
         self.stage_compress_ratios = cfg.compress_ratios[stage.start : stage.stop]
         if kvc.pp_size > 1:
             logger.info(
@@ -1651,6 +1658,17 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     def _get_low_ratio_kv_padding_bytes(self, full_tokens: int) -> float:
         """Reserved main/indexer pages beyond the token-scaled low-ratio bytes."""
         if self._unified or _is_npu or get_exec().kernel.dsv4_attn_backend == "trtllm":
+            if self._npu_qsli_ratio:
+                from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+                    DSV41_INDEX_PAGE_SIZE,
+                )
+
+                ratio = self._npu_qsli_ratio
+                size = (full_tokens + self.page_size) // ratio
+                # Combined records mirror the split index buffer's physical pages.
+                page = DSV41_INDEX_PAGE_SIZE
+                index_slots = ((size + page + 1) // page) * page
+                return (index_slots - full_tokens // ratio) * self.low_ratio_index_bytes
             if self._npu_low_ratio_bf16:
                 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
                     DSV41_INDEX_PAGE_SIZE,
@@ -1711,9 +1729,18 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         swa_ratio = (
             0 if self._unified or self.swa_cap_tokens is not None else self.swa_ratio
         )
-        return swa_ratio * self.bytes_per_swa_token + sum(
-            self._compressed_bytes_per_full_token(ratio) * len(layers)
-            for ratio, layers in self.stage_owner_layers.items()
+        qsli_bytes = (
+            self.low_ratio_index_bytes / self._npu_qsli_ratio
+            if self._npu_qsli_ratio
+            else 0
+        )
+        return (
+            swa_ratio * self.bytes_per_swa_token
+            + qsli_bytes
+            + sum(
+                self._compressed_bytes_per_full_token(ratio) * len(layers)
+                for ratio, layers in self.stage_owner_layers.items()
+            )
         )
 
     def _get_swa_fixed_bytes(self) -> float:
