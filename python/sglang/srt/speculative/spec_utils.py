@@ -11,7 +11,9 @@ import torch
 from huggingface_hub import snapshot_download
 
 from sglang.kernels.ops.sampling import argmax as sampling_argmax
+from sglang.kernels.ops.sampling import can_softmax_sample
 from sglang.kernels.ops.sampling import softmax as sampling_softmax
+from sglang.kernels.ops.sampling import softmax_sample as sampling_softmax_sample
 from sglang.kernels.ops.speculative.cache_locs import (
     fill_front_out_cache_loc_func,
     generate_draft_decode_window_kv_indices,
@@ -56,7 +58,7 @@ from sglang.srt.utils import (
 from sglang.srt.utils.async_probe import maybe_detect_oob
 from sglang.srt.utils.common import fast_topk
 from sglang.srt.utils.device import async_d2h as _async_d2h
-from sglang.srt.utils.nvtx_utils import profile_range
+from sglang.srt.utils.nvtx_utils import forward_nvtx_range
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -233,6 +235,18 @@ def renorm_draft_probs(
     return sampling_softmax(next_token_logits, temperatures=sampling_info.temperatures)
 
 
+def use_fused_draft_sample(vocab_size: int) -> bool:
+    """Whether `sample_draft_proposal(..., fused=True)` applies: opted in
+    (SGLANG_OPT_USE_FUSED_DRAFT_SAMPLE), not deterministic inference (seeded draws),
+    Gumbel sampling on, and a device / vocabulary `softmax_sample` serves."""
+    return (
+        envs.SGLANG_OPT_USE_FUSED_DRAFT_SAMPLE.get()
+        and not get_exec().deterministic.enable_deterministic_inference
+        and envs.SGLANG_OPT_USE_GUMBEL_SAMPLE.get()
+        and can_softmax_sample(vocab_size)
+    )
+
+
 def sample_draft_proposal(
     next_token_logits: torch.Tensor,
     temperatures: torch.Tensor,
@@ -241,6 +255,7 @@ def sample_draft_proposal(
     sampling_seed: Optional[torch.Tensor] = None,
     positions: Optional[torch.Tensor] = None,
     draft_step: int = 0,
+    fused: bool = False,
 ):
     """Leviathan draft proposal: q = softmax(logits / T), X ~ q.
 
@@ -262,6 +277,9 @@ def sample_draft_proposal(
     (p - q)+ it resamples from is p itself. Both arms commit the target argmax,
     which is what greedy means. Drop that renorm and this stops holding.
     """
+    if fused:
+        # One fused kernel; callers pass the `use_fused_draft_sample` decision.
+        return sampling_softmax_sample(next_token_logits, temperatures, top_ks=top_ks)
     probs = sampling_softmax(next_token_logits, temperatures=temperatures)
     topk_p, topk_index = fast_sample(
         probs,
@@ -1006,10 +1024,11 @@ def _draft_without_cp(tp_context):
 
 
 def spec_stage_span(name: str):
-    """Profiler span for a coarse speculative-decoding stage (``draft`` /
-    ``draft_extend`` / ``verify``).
+    """Profiler span for a coarse speculative-decoding draft stage (``draft`` /
+    ``draft_extend``). The target verify forward is covered by the ``step[VERIFY ...]``
+    span in ``ModelRunner.forward``.
     """
-    return profile_range(name)
+    return forward_nvtx_range(name)
 
 
 def move_accept_tokens_to_target_kvcache(
