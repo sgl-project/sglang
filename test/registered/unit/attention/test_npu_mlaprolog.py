@@ -247,6 +247,16 @@ class TestDynamicInt8MLAProlog(CustomTestCase):
             self.vendor.npu_mla_prolog_v3.call_args.kwargs["k_nope_clip_alpha"], alpha
         )
 
+    def test_packed_cache_takes_the_pool_quant_block_size(self):
+        """MLAProlog's tile follows the pool, not a literal 128."""
+        self.use_packed_int8_cache()
+        self.pool.quant_block_size = 64
+        preprocess = self.make_preprocess(self.make_model())
+        preprocess(self.positions, self.x, self.batch, None)
+        self.assertEqual(
+            self.vendor.npu_mla_prolog_v3.call_args.kwargs["tile_size"], 64
+        )
+
     def test_unpacked_cache_passes_no_packed_arguments(self):
         preprocess = self.make_preprocess(self.make_model())
         preprocess(self.positions, self.x, self.batch, None)

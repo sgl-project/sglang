@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.hardware_backend.npu.kv_capability import DSA_KV_QUANT_BLOCK_SIZE
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35, npu_format_cast
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
@@ -669,7 +670,12 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             mla_prolog_input_args["dequant_scale_w_uq_qr"] = self.q_b_proj_weight_scale
         if packed:
             mla_prolog_input_args.update(
-                ckvkr_repo_mode=1, quant_scale_repo_mode=1, tile_size=128
+                ckvkr_repo_mode=1,
+                quant_scale_repo_mode=1,
+                # The pool's record tile, with a fallback for pool objects
+                # that do not carry the attribute.
+                tile_size=getattr(pool, "quant_block_size", None)
+                or DSA_KV_QUANT_BLOCK_SIZE,
             )
             if packed_int8:
                 mla_prolog_input_args["k_nope_clip_alpha"] = self.k_nope_clip_alpha
