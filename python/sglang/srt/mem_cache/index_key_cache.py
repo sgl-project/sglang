@@ -22,6 +22,9 @@ class IndexKeyCache:
     def __init__(self, pool: DSATokenToKVPool, index_buf_size: int):
         self.pool = pool
         num_pages = (index_buf_size + pool.page_size + 1) // pool.page_size
+        self.shard = getattr(pool, "kpool_page_shard", None)
+        if self.shard is not None:
+            num_pages = (num_pages + self.shard.size - 1) // self.shard.size
         with pool.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
                 torch.cuda.use_mem_pool(pool.custom_mem_pool)
@@ -111,6 +114,8 @@ class IndexKeyCache:
         max_seq_len: int,
     ):
         buf = self.get_buffer(layer_id)
+        if self.shard is not None:
+            buf, page_indices = self.shard.fetch_pages(buf, page_indices)
         return dsa_index_k_cache.GetKAndS.execute(
             self.pool,
             buf,
@@ -128,6 +133,17 @@ class IndexKeyCache:
         index_k_scale: torch.Tensor,
     ) -> None:
         buf = self._kernel_view(self.buffer[layer_id - self.pool.start_layer])
+        if self.shard is not None:
+            # This path writes deferred eager prefill output. Decode and
+            # capture use the fused writer and never compact a dynamic mask.
+            page_size = self.pool.index_page_size
+            pages = loc // page_size
+            owned = pages.remainder(self.shard.size) == self.shard.rank
+            loc = (pages[owned] // self.shard.size) * page_size + loc[owned] % page_size
+            if loc.numel() == 0:
+                return
+            index_k = index_k.view(torch.uint8)[owned].view(index_k.dtype)
+            index_k_scale = index_k_scale[owned]
         dsa_index_k_cache.SetKAndS.execute(
             pool=self.pool,
             buf=buf,
@@ -139,6 +155,8 @@ class IndexKeyCache:
     def cpu_copy(self, indices):
         # Retracted pages may be reused before resume, so offload index-K with KV.
         page_indices = indices[:: self.pool.page_size] // self.pool.page_size
+        if self.shard is not None:
+            page_indices = self.shard.owned_pages(page_indices)
         torch.cuda.synchronize()
         index_k_cpu = []
         chunk_size = self.pool.cpu_offloading_chunk_size
@@ -158,6 +176,8 @@ class IndexKeyCache:
 
     def load_cpu_copy(self, index_k_cpu, indices) -> None:
         page_indices = indices[:: self.pool.page_size] // self.pool.page_size
+        if self.shard is not None:
+            page_indices = self.shard.owned_pages(page_indices)
         torch.cuda.synchronize()
         chunk_size = self.pool.cpu_offloading_chunk_size
         page_chunk_size = max(1, chunk_size // self.pool.page_size)

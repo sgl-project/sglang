@@ -2843,6 +2843,7 @@ class KVCacheConfigurator:
                 extra_args.update(
                     use_dsa=True,
                     use_fp4_indexer=get_exec().kernel.enable_fp4_indexer,
+                    dcp_replicated=self.loc_space_scale > 1,
                     index_head_dim=get_dsa_index_head_dim(self.model_config.hf_config),
                     kv_cache_dim=calculate_mla_kv_cache_dim(
                         model_config=self.model_config,

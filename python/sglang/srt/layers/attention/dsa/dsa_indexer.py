@@ -252,10 +252,12 @@ def _broadcast_indexer_topk_from_rank0_impl(topk_indices: torch.Tensor) -> None:
 
 def _broadcast_indexer_topk_from_rank0(
     topk_indices: Optional[torch.Tensor],
+    *,
+    force: bool = False,
 ) -> Optional[torch.Tensor]:
     # Sync only the finalized indexer output. Internal topk_transform calls can
     # be chunked differently across ranks, which would make collectives diverge.
-    if topk_indices is None or not envs.SGLANG_DSA_TOPK_BROADCAST.get():
+    if topk_indices is None or not (force or envs.SGLANG_DSA_TOPK_BROADCAST.get()):
         return topk_indices
 
     if is_in_tc_piecewise_cuda_graph():

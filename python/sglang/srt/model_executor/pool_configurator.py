@@ -505,14 +505,23 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
             # Add indexer KV cache overhead for DSA models (DeepSeek V3.2)
             if is_deepseek_dsa(model_config.hf_config):
-                # The index-K buffer is replicated under DCP while the latent KV
-                # shards, so this term is short by dcp_size without the scale.
+                # Every DCP replica of an index page contributes to the cell
+                # cost charged per rank-local latent KV token.
                 indexer_cell_size = self._compute_dsa_indexer_cell_size(
                     kvc=kvc,
                     num_layers=num_layers,
                 )
                 if not kvc.is_draft_worker and not dsa_shards_index_k():
-                    indexer_cell_size *= dcp_size
+                    shards = (
+                        envs.SGLANG_OPT_DSA_KPOOL_INDEX_CACHE_SHARDS.get()
+                        if get_dsa_index_kpool(model_config.hf_config) > 1
+                        else 1
+                    )
+                    if shards < 1 or dcp_size % shards:
+                        raise ValueError(
+                            "Pooled index cache shards must divide DCP size"
+                        )
+                    indexer_cell_size *= dcp_size // shards
                 cell_size += indexer_cell_size
         elif is_minimax_sparse(model_config.hf_config):
             from sglang.srt.server_args import m3_fp8_attn_gemm_enabled

@@ -10,6 +10,7 @@ from sglang.srt.arg_groups.model_override_base import (
     resolving_view,
     use_mla_backend,
 )
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
 
 logger = logging.getLogger(__name__)
@@ -30,7 +31,7 @@ def _dsa_dcp_overrides(cfg: Any) -> dict:
     # NPU has its own DSA DCP attention path; these split backends are CUDA/ROCm.
     overrides = {}
     if not platform.is_npu:
-        backend = "triton" if platform.is_hip else "trtllm"
+        backend = "triton" if platform.is_hip or platform.is_sm90 else "trtllm"
         overrides.update(
             {
                 name: backend
@@ -170,11 +171,22 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
             else:
                 index_kpool = get_dsa_index_kpool(hf_config)
                 if index_kpool > 1 and cfg.dcp_size > 1:
-                    raise ValueError(
-                        "--dcp-size > 1 is not supported for DSA with "
-                        f"index_kpool={index_kpool}: a pooled index key spans "
-                        "positions owned by different DCP ranks."
+                    if envs.SGLANG_OPT_DSA_KPOOL_INDEX_CACHE_SHARDS.get() > 1 and (
+                        not get_platform().is_sm90
+                        or cfg.speculative_algorithm is not None
+                    ):
+                        raise ValueError(
+                            "Pooled index page sharding currently supports Hopper without speculative decoding"
+                        )
+                    backends = tuple(
+                        overrides.get(name, getattr(cfg, name))
+                        for name in ("dsa_prefill_backend", "dsa_decode_backend")
                     )
+                    if get_platform().is_hip or backends != ("triton", "triton"):
+                        raise ValueError(
+                            "DSA DCP with index_kpool > 1 requires the CUDA "
+                            "triton prefill and decode backends."
+                        )
                 # A logical page must own a whole pooled index group so that a
                 # prefix hit never ends inside one.
                 page_size = 64 * index_kpool

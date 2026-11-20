@@ -9,12 +9,20 @@ import torch.nn.functional as F
 from einops import rearrange
 from transformers import PretrainedConfig
 
+from sglang.srt.layers.attention.dsa.dsa_dcp import (
+    gather_kpool_topk,
+    kpool_decode_row_shard,
+    kpool_prefill_row_group,
+    kpool_selection_group,
+)
 from sglang.srt.layers.attention.dsa.dsa_indexer import (
     DUAL_STREAM_TOKEN_THRESHOLD,
+    _broadcast_indexer_topk_from_rank0,
     rotate_activation,
 )
 from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import BaseIndexerMetadata
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
+from sglang.srt.layers.attention.dsa.kpool_page_shard import padded_rows
 from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
     DSAPagedMQALogitsBackend,
 )
@@ -62,7 +70,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
     is_in_breakable_cuda_graph,
 )
 from sglang.srt.model_executor.runner_utils import capture_mode
-from sglang.srt.runtime_context import get_device, get_exec
+from sglang.srt.runtime_context import get_device, get_exec, get_parallel
 
 logger = logging.getLogger(__name__)
 
@@ -167,6 +175,7 @@ class IndexerKPool(MultiPlatformOp):
         self.alt_stream = alt_stream
         self.compress_gate_stream = None
         self.skip_rope = skip_rope
+        self._logged_decode_row_shard = False
 
         self.index_kpool = config.index_kpool
         self.index_kpool_always_select_tail = config.index_kpool_always_select_tail
@@ -431,6 +440,9 @@ class IndexerKPool(MultiPlatformOp):
                         min_loc = int(active_write_loc.min().item())
                         max_loc = int(active_write_loc.max().item())
                         max_page = max_loc // int(pool.index_page_size)
+                        cache_shard = getattr(pool, "kpool_page_shard", None)
+                        if cache_shard is not None:
+                            max_page //= cache_shard.size
                         if (
                             min_chunk < 0
                             or max_chunk >= key.shape[0]
@@ -796,6 +808,7 @@ class IndexerKPool(MultiPlatformOp):
         seqlens_32: torch.Tensor,
         blocksize: int,
         build_schedule_metadata: bool = True,
+        rows: Optional[slice] = None,
     ) -> Tuple[
         torch.Tensor,
         torch.Tensor,
@@ -810,6 +823,7 @@ class IndexerKPool(MultiPlatformOp):
         attn_metadata = metadata.attn_metadata
         plan = attn_metadata.kpool_write_plan
         if plan is not None and plan.pool_seqlens_per_q is not None:
+            assert rows is None  # Speculative per-query plans use the full layout.
             pool_seqlens = plan.pool_seqlens_per_q[: seqlens_32.shape[0]]
             pool_context_lens = pool_seqlens.contiguous().view(-1, 1)
             pool_block_tables = attn_metadata.pooled_real_page_table
@@ -860,6 +874,9 @@ class IndexerKPool(MultiPlatformOp):
                 : (block_tables.shape[1] + self.index_kpool - 1) // self.index_kpool,
             ]
 
+        if rows is not None:
+            pool_seqlens = pool_seqlens[rows]
+            pool_block_tables = pool_block_tables[rows]
         pool_context_lens = pool_seqlens.contiguous().view(-1, 1)
         if pool_schedule_metadata is None and build_schedule_metadata:
             pool_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
@@ -961,6 +978,86 @@ class IndexerKPool(MultiPlatformOp):
         num_heads = q_fp8.shape[1]
         return arch_major == 9 and num_heads not in (32, 64)
 
+    def _get_page_sharded_topk(self, layout, cache, q, weights, metadata, seq_lens):
+        attn = metadata.attn_metadata
+        local_lens, table = attn.pooled_shard_lens, attn.pooled_shard_page_table
+        page_size = 64
+        stride = (len(seq_lens) + layout.world_size - 1) // layout.world_size
+        team_start = (layout.world_rank - layout.rank) * stride
+        team_width = layout.size * stride
+        local_q = padded_rows(q[: len(seq_lens)], team_start, team_width)
+        local_weights = padded_rows(weights[: len(seq_lens)], team_start, team_width)
+        cols = table.shape[1] * page_size
+        score = deep_gemm.fp8_paged_mqa_logits
+        context_lens = local_lens.view(-1, 1)
+        if self._should_use_tilelang_paged_mqa_logits(local_q):
+            from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
+                tilelang_fp8_paged_mqa_logits,
+            )
+
+            score = tilelang_fp8_paged_mqa_logits
+            context_lens = local_lens
+        local_scores = score(
+            local_q.unsqueeze(1),
+            cache.view(-1, page_size, 1, 132),
+            local_weights.squeeze(-1),
+            context_lens,
+            table,
+            attn.pooled_paged_mqa_schedule_metadata,
+            cols,
+            clean_logits=False,
+        )
+        local_scores = local_scores[:, :cols]
+        start = layout.world_rank * stride
+        page_table, offsets, _ = self._kpool_fused_topk_mapping(metadata)
+        owner_lens = padded_rows(attn.pooled_cache_seqlens_int32, start, stride)
+        owner_seq = padded_rows(seq_lens, start, stride)
+        if page_table is not None:
+            page_table = padded_rows(page_table, start, stride)
+        if offsets is not None:
+            offsets = padded_rows(offsets, start, stride)
+        if (
+            layout.exchange == "candidates"
+            and self.index_topk == 2048
+            and self.index_kpool == 4
+            and layout.size in (2, 4, 8)
+        ):
+            from sglang.kernels.ops.communication.kpool_candidates import (
+                exchange_kpool_candidates,
+            )
+
+            selected = exchange_kpool_candidates(
+                local_scores,
+                local_lens,
+                owner_lens,
+                owner_seq,
+                page_table,
+                offsets,
+                group=layout.group,
+                shards=layout.size,
+                rank=layout.rank,
+                page_size=page_size,
+            )
+        else:
+            full_scores = layout.transpose_scores(
+                local_scores,
+                local_lens,
+                stride,
+                page_size,
+                self.index_topk // self.index_kpool,
+            )
+            selected = self._topk_from_kpool_logits(
+                logits=full_scores,
+                pool_lens=owner_lens,
+                seq_lens=owner_seq,
+                page_table=page_table,
+                topk_offsets=offsets,
+                topk_v2_plan=attn.pooled_topk_v2_plan,
+            )
+        return gather_kpool_topk(
+            kpool_selection_group(get_parallel()), selected, len(seq_lens), q.shape[0]
+        )
+
     def _get_topk_paged(
         self,
         forward_batch: ForwardBatch,
@@ -968,6 +1065,7 @@ class IndexerKPool(MultiPlatformOp):
         q_fp8: torch.Tensor,
         weights: torch.Tensor,
         metadata: BaseIndexerMetadata,
+        shard: Optional[Tuple[int, slice]] = None,
     ) -> torch.Tensor:
         if TYPE_CHECKING:
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
@@ -990,11 +1088,22 @@ class IndexerKPool(MultiPlatformOp):
         else:
             seqlens_32 = metadata.get_seqlens_int32()
         assert len(q_fp8.shape) == 3
+        page_shard = getattr(pool, "kpool_page_shard", None)
+        if page_shard is not None:
+            return self._get_page_sharded_topk(
+                page_shard, kv_cache_fp8, q_fp8, weights, metadata, seqlens_32
+            )
         num_q_padded = q_fp8.shape[0]
         n_real = seqlens_32.shape[0]
         if n_real < num_q_padded:
             q_fp8 = q_fp8[:n_real]
             weights = weights[:n_real]
+        rows = None
+        out_rows = num_q_padded if num_q_padded != n_real else None
+        if shard is not None:
+            out_rows, rows = shard
+            q_fp8 = q_fp8[rows]
+            weights = weights[rows]
         # aiter_paged_mqa_logits adds the next_n dim itself; the other two want it already there
         assert len(kv_cache_fp8.shape) == 2
         block_kv = 64
@@ -1023,6 +1132,7 @@ class IndexerKPool(MultiPlatformOp):
             seqlens_32=seqlens_32,
             blocksize=blocksize,
             build_schedule_metadata=not (use_aiter_paged_mqa or use_tilelang_paged_mqa),
+            rows=rows,
         )
         pool_max_seq_len = pool_block_tables.shape[1] * blocksize
         if use_aiter_paged_mqa:
@@ -1074,6 +1184,10 @@ class IndexerKPool(MultiPlatformOp):
             )
 
         page_table_1, topk_offsets, _ = self._kpool_fused_topk_mapping(metadata)
+        if rows is not None:
+            seqlens_32 = seqlens_32[rows]
+            page_table_1 = _slice_rows(tensor=page_table_1, rows=rows)
+            topk_offsets = _slice_rows(tensor=topk_offsets, rows=rows)
         topk_result = self._topk_from_kpool_logits(
             logits=logits,
             pool_lens=pool_seqlens,
@@ -1081,9 +1195,32 @@ class IndexerKPool(MultiPlatformOp):
             seq_lens=seqlens_32,
             page_table=page_table_1,
             topk_offsets=topk_offsets,
-            out_rows=num_q_padded if num_q_padded != n_real else None,
+            out_rows=out_rows,
         )
-        return topk_result
+        if shard is None:
+            return topk_result
+
+        group = get_parallel().dcp_group
+        gathered_rows = topk_result.shape[0] * group.world_size
+        output = topk_result.new_empty(
+            (max(num_q_padded, gathered_rows), topk_result.shape[1])
+        )
+        group.all_gather_into_tensor(output[:gathered_rows], topk_result)
+        if num_q_padded > gathered_rows:
+            output[gathered_rows:].fill_(-1)
+        if not self._logged_decode_row_shard:
+            logger.info(
+                "DSA pooled decode index layer %d, DCP rank %d/%d scores and selects "
+                "rows [%d, %d) of %d before all-gather",
+                layer_id,
+                group.rank_in_group,
+                group.world_size,
+                rows.start,
+                rows.stop,
+                n_real,
+            )
+            self._logged_decode_row_shard = True
+        return output[:num_q_padded]
 
     def _kpool_topk_by_row_chunks(
         self,
@@ -1204,6 +1341,7 @@ class IndexerKPool(MultiPlatformOp):
                 seq_len=total_k_rows,
                 k_out=k_u8,
                 scale_out=k_scale,
+                page_fetch=plan.page_fetch,
             )
             k_fp8 = k_u8.view(torch.float8_e4m3fn)
             kv_fp8 = (k_fp8.contiguous(), k_scale.contiguous())
@@ -1222,22 +1360,44 @@ class IndexerKPool(MultiPlatformOp):
         # The plan's table is req_to_token, indexed by request-pool ID.
         assert page_table_all is None or page_table_row_index_all is not None
 
-        return self._kpool_topk_by_row_chunks(
-            q_fp8=q_fp8,
-            weights=weights,
+        group = kpool_prefill_row_group()
+        rows = slice(0, n_real)
+        out_rows = total_q
+        if group is not None:
+            out_rows = (n_real + group.world_size - 1) // group.world_size
+            start = min(n_real, group.rank_in_group * out_rows)
+            rows = slice(start, min(n_real, start + out_rows))
+            if rows.start == rows.stop:
+                local = torch.full(
+                    (out_rows, self.topk_output_width),
+                    -1,
+                    dtype=torch.int32,
+                    device=device,
+                )
+                return gather_kpool_topk(group, local, n_real, total_q)
+        local = self._kpool_topk_by_row_chunks(
+            q_fp8=q_fp8[rows],
+            weights=weights[rows],
             kv_fp8=kv_fp8,
-            logits_starts=ks_per_q,
-            logits_ends=ke_per_q,
-            pool_lens=pool_lens,
-            seq_lens=seq_lens_expanded,
+            logits_starts=ks_per_q[rows],
+            logits_ends=ke_per_q[rows],
+            pool_lens=pool_lens[rows],
+            seq_lens=seq_lens_expanded[rows],
             page_table=page_table_all,
-            page_table_row_index=page_table_row_index_all,
-            topk_offsets=topk_offsets_all,
-            topk_row_starts=ks_per_q,
-            row_chunks=_mqa_logits_row_chunks(
-                num_rows=n_real, num_cols=total_k_rows, device=device
+            page_table_row_index=_slice_rows(
+                tensor=page_table_row_index_all, rows=rows
             ),
-            out_rows=total_q,
+            topk_offsets=_slice_rows(tensor=topk_offsets_all, rows=rows),
+            topk_row_starts=ks_per_q[rows],
+            row_chunks=_mqa_logits_row_chunks(
+                num_rows=rows.stop - rows.start, num_cols=total_k_rows, device=device
+            ),
+            out_rows=out_rows,
+        )
+        return (
+            gather_kpool_topk(group, local, n_real, total_q)
+            if group is not None
+            else local
         )
 
     def _get_topk_ragged_kpool(
@@ -1633,6 +1793,11 @@ class IndexerKPool(MultiPlatformOp):
         return_indices: bool = True,
         use_cuda_graph: bool = True,
     ) -> Optional[torch.Tensor]:
+        shard = (
+            kpool_decode_row_shard(forward_batch.seq_lens.shape[0])
+            if forward_batch.forward_mode.is_decode() and return_indices
+            else None
+        )
         if (
             use_cuda_graph
             and is_in_breakable_cuda_graph()
@@ -1656,14 +1821,37 @@ class IndexerKPool(MultiPlatformOp):
             bcg_kpool_indexer_prefill_with_output(
                 self, x, q_lora, positions, output, layer_id
             )
-            return output if return_indices else None
-        return self._forward_cuda_impl(
-            x,
-            q_lora,
-            positions,
-            forward_batch,
-            layer_id,
-            return_indices,
+            result = output if return_indices else None
+        else:
+            result = self._forward_cuda_impl(
+                x,
+                q_lora,
+                positions,
+                forward_batch,
+                layer_id,
+                return_indices,
+                shard=shard,
+            )
+        if (
+            forward_batch.forward_mode.is_extend_without_speculative()
+            and kpool_prefill_row_group() is not None
+        ):
+            return result
+        if shard is not None or (
+            forward_batch.forward_mode.is_decode()
+            and return_indices
+            and envs.SGLANG_OPT_DSA_KPOOL_INDEX_CACHE_SHARDS.get() > 1
+        ):
+            # Each row has one owner, and the all-gather already synchronized
+            # its finalized top-k (including unfinished-pool tails).
+            return result
+        # Pooled top-k has unspecified tie-breaking and output order. DCP
+        # partials must describe ONE selected set, including unfinished-pool
+        # tails; independently chosen tied groups cannot be LSE-merged.
+        # Sync the finalized output once, outside request-specific row chunks
+        # and the BCG eager break. Also honor the ordinary TP diagnostic flag.
+        return _broadcast_indexer_topk_from_rank0(
+            result, force=get_parallel().attn_dcp_size > 1
         )
 
     @property
@@ -1678,6 +1866,7 @@ class IndexerKPool(MultiPlatformOp):
         forward_batch: ForwardBatch,
         layer_id: int,
         return_indices: bool = True,
+        shard: Optional[Tuple[int, slice]] = None,
     ) -> Optional[torch.Tensor]:
         if is_hip() and not is_gfx1250_supported():
             from sglang.kernels.ops.quantization.act_quant_tilelang import act_quant
@@ -1740,7 +1929,7 @@ class IndexerKPool(MultiPlatformOp):
                 skip_logits_computation = max_kv_len <= self.index_topk
 
         if skip_logits_computation:
-            return self._forward_cuda_skip_logits(
+            result = self._forward_cuda_skip_logits(
                 x,
                 positions,
                 forward_batch,
@@ -1749,6 +1938,9 @@ class IndexerKPool(MultiPlatformOp):
                 metadata,
                 return_indices,
             )
+            if kpool_prefill_row_group() is not None:
+                return _broadcast_indexer_topk_from_rank0(result, force=True)
+            return result
 
         precompute_compress_gate = (
             self.index_kpool > 1
@@ -1817,7 +2009,7 @@ class IndexerKPool(MultiPlatformOp):
                 or forward_batch.forward_mode.is_draft_extend_v2()
             ):
                 topk_result = self._get_topk_paged(
-                    forward_batch, layer_id, q_fp8, weights, metadata
+                    forward_batch, layer_id, q_fp8, weights, metadata, shard=shard
                 )
             else:
                 if has_kpool_extend_plan:
@@ -1837,6 +2029,10 @@ class IndexerKPool(MultiPlatformOp):
                         metadata,
                         kpool_extend_cache=kpool_extend_cache,
                     )
+                    if is_prefill and kpool_prefill_row_group() is not None:
+                        topk_result = _broadcast_indexer_topk_from_rank0(
+                            topk_result, force=True
+                        )
         else:
             raise NotImplementedError(
                 "kpool indexer is only supported on CUDA and ROCm"

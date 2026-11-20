@@ -178,11 +178,11 @@ DeepSeek Sparse Attention attends over a top-k slice of the context, so DCP keep
 
 1. The index-K cache is addressed by the widened virtual slot and costs `c` times its usual share of each rank's KV budget (about 6% at DCP2 and 17% at DCP4 on GLM-5.3).
 2. Each layer maps the global top-k to rank-local rows with one Triton kernel; layers that share the previous layer's top-k reuse the mapping.
-3. The TRT-LLM sparse kernel returns the per-head LSE and the usual DCP merge combines the partial outputs.
+3. Each sparse attention kernel returns the per-head log-sum-exp so DCP can combine partial outputs across ranks.
 4. GLM-5.2 and GLM-5.3 with MTP: the draft (nextn) layer keeps a replicated KV cache over the widened slots and attends without the DCP group, so MTP index share feeds the draft directly.
 5. Hy4: learnable attention sinks add `exp(sink)` to each head's softmax denominator. The TRT-LLM kernel takes no sink, so the sink is folded into the partial through the returned LSE. Every rank computes all of its DCP group's gathered heads but folds only the sinks of its own heads, so the merge counts each sink once.
 
-Requirements for every model in this section: CUDA with the `trtllm` DSA backends (selected automatically) and `attn_tp_size % dcp_size == 0`. HiSparse, prefill CP, HiCache, PD disaggregation, unified memory and `index_kpool > 1` are not supported in this combination. The models then differ:
+The TRT-LLM path requires CUDA, the `trtllm` DSA backends (selected automatically on the GPUs listed below), and `attn_tp_size % dcp_size == 0`. HiSparse, prefill CP, HiCache, PD disaggregation, unified memory and `index_kpool > 1` are not supported in this combination. The models then differ:
 
 - **GLM-5.2, GLM-5.3**: SM100/SM103, an `fp8_e4m3` or `bf16` KV cache, and, with speculative decoding, the checkpoint's own MTP draft as a single EAGLE chain (`--speculative-eagle-topk 1`, draft tokens equal to steps + 1).
 - **Hy4**: SM100/SM103/SM107, a `bf16` KV cache, and no speculative decoding. The server refuses Hy4 DCP on SM90 and SM12x, with an `fp8_e4m3` KV cache, and with DP-Attention or pipeline parallelism. See the [Hy4 cookbook](/cookbook/autoregressive/Tencent/Hy4#optional-features).
@@ -200,6 +200,93 @@ sglang serve \
   --speculative-eagle-topk 1 \
   --speculative-num-draft-tokens 6
 ```
+
+On Hopper (SM90), GLM-5.3-Flash uses Triton for DSA DCP prefill and decode with a BF16 KV cache. In the replicated layout, each DCP rank stores the pooled index keys and the unfinished pool. By default, rank 0 broadcasts the selected token indices before each rank attends to its local KV rows.
+
+#### Pooled index row sharding on Hopper
+
+Set `SGLANG_OPT_DSA_KPOOL_DECODE_ROW_SHARD=1` to distribute index scoring and top-k selection by request row during decode. This command enables row sharding on eight H200 GPUs.
+
+```bash
+SGLANG_OPT_DSA_KPOOL_DECODE_ROW_SHARD=1 sglang serve \
+  --model-path "$MODEL_PATH" --trust-remote-code \
+  --tp-size 8 --dcp-size 8 \
+  --dsa-prefill-backend triton --dsa-decode-backend triton
+```
+
+Each rank scores the full index history for its assigned rows. The ranks then gather their selected token indices, including tokens from the unfinished pool. The switch defaults to `0`. DCP1, DCP groups smaller than the attention TP group, and batches whose partition would leave a rank empty use the existing replicated path.
+
+#### Experimental pooled index cache sharding
+
+On Hopper with ordinary decode, set `SGLANG_OPT_DSA_KPOOL_INDEX_CACHE_SHARDS` to a divisor of the DCP group size to distribute the physical pooled index-K cache. The default is 1. When attention TP contains multiple DCP groups, each group scores a different slice of query rows. On eight GPUs, shard counts of 2, 4 and 8 keep four, two and one copy of each page across the node, respectively. Each 64-key page carries its FP8 vectors and their FP32 scales together. The small unfinished compression pool for each request stays on every rank.
+
+Each rank scores its local history for the requests assigned to its subgroup. With `SGLANG_OPT_DSA_KPOOL_INDEX_EXCHANGE=logits`, the ranks exchange FP32 logits and the request owner selects over the complete history. With `candidates`, they exchange up to 512 local candidates per query for GLM-5.3-Flash. The owner merges them, expands the selected pools to token IDs and appends the unfinished tail. Both paths share the resulting indices across attention TP. The optional `SGLANG_OPT_DSA_KPOOL_PREFILL_ROW_SHARD=1` also splits planned prefill query rows across the ranks after staging the required key pages.
+
+```bash
+SGLANG_OPT_DSA_KPOOL_DECODE_ROW_SHARD=1 \
+SGLANG_OPT_DSA_KPOOL_INDEX_CACHE_SHARDS=8 \
+SGLANG_OPT_DSA_KPOOL_INDEX_EXCHANGE=logits \
+SGLANG_OPT_DSA_KPOOL_PREFILL_ROW_SHARD=1 \
+sglang serve --model-path "$MODEL_PATH" --trust-remote-code \
+  --tp-size 8 --dcp-size 8 --kv-cache-dtype bf16 --mem-fraction-static 0.8 \
+  --dsa-prefill-backend triton --dsa-decode-backend triton
+```
+
+For 64 independent 262,144-token prompts, the active history per GPU is
+`64 × (262144 / 4) × (128 + 4) × 11 / shards` bytes. The 11 indexing layers use 5.672, 2.836, 1.418 and 0.709 GiB per GPU at 1, 2, 4 and 8 shards. Runtime pool reservations include spare capacity and page alignment. This command checks the FP8 writers and selections, then measures latency on one eight-GPU node.
+
+```bash
+torchrun --standalone --nproc-per-node=8 \
+  test/manual/kernels/attention/bench_kpool_page_sharding.py --output /tmp/kpool-pages.json
+```
+
+The serving comparison uses one wave of independent prompts and an empty prefix cache. Set input length `N` and concurrency `C` to `32768/256`, `131072/64` or `262144/64`. Start the server above with the same environment for every arm, including `SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD=0`, `SGLANG_DSA_TOPK_BROADCAST=1` and `SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=0`. Add the following server options.
+
+```bash
+--host 127.0.0.1 --port 31035 --moe-runner-backend deep_gemm \
+--random-seed 43735 --context-length 266240 --chunked-prefill-size 8192 \
+--max-prefill-tokens 16384 --max-running-requests "$C" \
+--cuda-graph-max-bs-decode "$C" --max-mamba-cache-size "$((5 * C))" \
+--decode-log-interval 10
+```
+
+After the server is ready, run the same client seed for every arm. The client reports end-to-end output tokens per second. In the rank-zero scheduler log, take consecutive CUDA Graph decode windows at `#running-req = C` with no intervening prefill. Each window's step time in milliseconds is `1000 × C / gen_throughput`. Report the median over those windows.
+
+```bash
+python -m sglang.benchmark.serving --backend sglang --host 127.0.0.1 --port 31035 \
+  --model "$MODEL_PATH" --dataset-name random-ids --tokenize-prompt \
+  --random-input-len "$N" --random-output-len 256 --random-range-ratio 1 \
+  --num-prompts "$C" --max-concurrency "$C" --warmup-requests 0 --flush-cache \
+  --seed 43735 --temperature 0 --cache-report --output-details --output-file "$RESULT"
+```
+
+#### GLM-5.3-Flash on eight H200 GPUs
+
+These reference measurements were collected on an earlier implementation based on SGLang commit `f77064f635`, using GLM-5.3-Flash on eight H200 GPUs. They keep TP8, DCP8, prefill query-row sharding and 256 output tokens fixed. Each cell gives end-to-end output tokens per second and steady milliseconds per decode step. The 256K measurements average two independent runs per layout. Each shorter workload ran once per layout. Every run completed the configured concurrency with zero retractions and zero prefix-cache hits.
+
+| Input tokens / concurrency | Full pooled index cache | 2 page shards, logits | 8 page shards, logits |
+| --- | ---: | ---: | ---: |
+| 32K / 256 | 263.43 / 32.91 | 263.21 / 33.37 | 263.64 / 33.42 |
+| 128K / 64 | 66.29 / 23.44 | 66.01 / 23.63 | 66.21 / 23.66 |
+| 256K / 64 | 33.18 / 24.22 | 33.08 / 24.48 | 33.19 / 24.54 |
+
+The full cache gave the lowest step latency at all three points. Two shards halved the active index memory at an additional 0.18–0.46 ms per step. Eight shards reduced active index memory by 87.5% with throughput within 0.13% of the full cache. At 256K / 64 the token pool capacity reported by the server increased from 40,048,640 to 48,799,744 with eight shards. The four-shard logits configuration at this point measured 33.14 tok/s and 24.50 ms in one run.
+
+![Output throughput and additional milliseconds per decode step relative to the full cache, with active pooled index-K memory per GPU at 256K / 64](/images/dsa-pooled-index-cache-h200.png)
+
+Prefill row sharding contributed a separate throughput gain at 256K / 64. With the full index cache, the first matched run increased from 29.67 to 33.11 tok/s when prefill row sharding was enabled. Steady decode measured 24.24 and 24.23 ms, respectively.
+
+The index-layer benchmark includes FP8 scoring, global Top-K selection and sharing the selected token IDs. Values below are medians in microseconds from CUDA Graph replays on TP8/DCP8. The three physically sharded columns use FP32 logits exchange.
+
+| Input tokens / concurrency | Full cache, split query rows | 2 page shards | 4 page shards | 8 page shards |
+| --- | ---: | ---: | ---: | ---: |
+| 32K / 256 | 49.4 | 69.9 | 71.3 | 72.1 |
+| 128K / 64 | 48.1 | 68.9 | 69.9 | 71.2 |
+| 256K / 64 | 56.3 | 81.5 | 83.6 | 85.6 |
+
+At 256K / 64 the compact candidate exchange took 94.4, 91.5 and 117.8 µs per index layer at 2, 4 and 8 shards. At 8 shards it reduced each rank's outgoing buffer from 2 MiB to 256 KiB. Local candidate selection and the final merge offset that reduction on this node.
+
+An eager serving check compared both exchanges with a reconstructed full index using the same live queries, weights and page contents. Across three input lengths, eight ranks and eleven indexing layers, all 18,743,560 valid FP32 logits from FP8 scoring and all 528 sampled Top-K sets matched the reference. A further 264 prefill checks matched the stored key bytes and scales and passed the sampled Top-K cutoff and tail checks.
 
 ## References
 

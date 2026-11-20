@@ -9,8 +9,10 @@ from sglang.kernels.ops.attention.dsa.transform_index import (
     transform_index_page_table_dcp,
 )
 from sglang.kernels.ops.attention.fixup_zero_kv import fixup_zero_kv_rows
+from sglang.srt.environ import envs
 from sglang.srt.layers.dcp.layout import dsa_shards_index_k
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import is_cuda
 
 TRTLLM_MAX_BATCH_ROWS = 65535
 # FlashInfer carves heads * rows * 256 float2 softmax slots out of the workspace per call;
@@ -141,3 +143,46 @@ def dcp_all_gather_rows_(buf: torch.Tensor, per: int, slot: int) -> None:
     group = get_parallel().dcp_group
     out = buf[: group.world_size * per]
     group.all_gather_into_tensor(out, out[slot : slot + per])
+
+
+def kpool_decode_row_shard(rows: int) -> Optional[Tuple[int, slice]]:
+    if not envs.SGLANG_OPT_DSA_KPOOL_DECODE_ROW_SHARD.get() or not is_cuda():
+        return None
+    parallel = get_parallel()
+    size = parallel.attn_dcp_size
+    # The gathered selection must reach every participant in the original
+    # top-k broadcast. Use the replicated path if a group would have no work.
+    if size <= 1 or size != parallel.attn_tp_size or rows < size:
+        return None
+    per, _, lo, hi = dcp_split_rows(rows)
+    if per * (size - 1) >= rows:
+        return None
+    return per, slice(lo, hi)
+
+
+def kpool_selection_group(parallel):
+    # DCP groups nest inside attention TP. Assign different query rows to
+    # different cache replicas and deliver every final token ID to all heads.
+    if parallel.attn_dcp_size == parallel.attn_tp_size:
+        return parallel.dcp_group
+    return parallel.attn_tp_group
+
+
+def kpool_prefill_row_group():
+    if not envs.SGLANG_OPT_DSA_KPOOL_PREFILL_ROW_SHARD.get() or not is_cuda():
+        return None
+    parallel = get_parallel()
+    if parallel.attn_dcp_size > 1:
+        return kpool_selection_group(parallel)
+    return None
+
+
+def gather_kpool_topk(group, local, real_rows, output_rows):
+    gathered = local.new_empty((group.world_size * local.shape[0], local.shape[1]))
+    group.all_gather_into_tensor(gathered, local)
+    result = gathered[:real_rows]
+    if output_rows > real_rows:
+        result = torch.nn.functional.pad(
+            result, (0, 0, 0, output_rows - real_rows), value=-1
+        )
+    return result

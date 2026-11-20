@@ -53,12 +53,12 @@ class DeepseekSparseAttnBackendKPoolMixin:
         if (
             topk_indices is None
             or self.dsa_index_kpool <= 1
-            or dsa_impl in ("fa3", "tilelang", "trtllm")
+            or dsa_impl in ("fa3", "tilelang", "trtllm", "triton")
         ):
             return
         raise NotImplementedError(
             "index_kpool > 1 appends tail tokens to topk_indices and is "
-            f"currently only supported by the FA3/TileLang/TRTLLM DSA {phase} "
+            f"currently only supported by the FA3/TileLang/TRTLLM/Triton DSA {phase} "
             "backend."
         )
 
@@ -84,7 +84,9 @@ class DeepseekSparseAttnBackendKPoolMixin:
 
     def _build_kpool_paged_mqa_schedule_metadata(self) -> bool:
         if self.device_sm_major == 9:
-            return self.num_q_heads in (32, 64)
+            # Pooled queries use replicated index heads even when attention
+            # partitions its own query heads across TP.
+            return self.kpool_schedule_heads in (32, 64)
         return True
 
     def _init_kpool_metadata(
@@ -112,6 +114,7 @@ class DeepseekSparseAttnBackendKPoolMixin:
                 topk_transform_method=topk_transform_method,
                 full_real_page_table=kpool_inputs.full_real_page_table,
                 full_seqlens_expanded=kpool_inputs.full_seqlens_expanded,
+                page_shard=getattr(self.token_to_kv_pool, "kpool_page_shard", None),
                 **local_query_inputs(forward_batch, metadata),
             )
 
@@ -123,6 +126,7 @@ class DeepseekSparseAttnBackendKPoolMixin:
             physical_page_size=self.physical_page_size,
             index_page_size=index_page_size,
             build_schedule_metadata=build_schedule_metadata,
+            page_shard=getattr(self.token_to_kv_pool, "kpool_page_shard", None),
         )
 
         if forward_mode.is_decode_or_idle():
@@ -192,6 +196,7 @@ class DeepseekSparseAttnBackendKPoolMixin:
             physical_page_size=self.physical_page_size,
             index_page_size=index_page_size,
             build_schedule_metadata=build_schedule_metadata,
+            page_shard=getattr(self.token_to_kv_pool, "kpool_page_shard", None),
         )
 
         if (
@@ -239,6 +244,7 @@ class DeepseekSparseAttnBackendKPoolMixin:
             physical_page_size=self.physical_page_size,
             index_page_size=index_page_size,
             build_schedule_metadata=build_schedule_metadata,
+            page_shard=getattr(self.token_to_kv_pool, "kpool_page_shard", None),
         )
 
         if not (
@@ -290,6 +296,7 @@ class DeepseekSparseAttnBackendKPoolMixin:
             physical_page_size=self.physical_page_size,
             index_page_size=index_page_size,
             build_schedule_metadata=build_schedule_metadata,
+            page_shard=getattr(self.token_to_kv_pool, "kpool_page_shard", None),
         )
 
         if not (forward_mode.is_decode_or_idle() or forward_mode.is_target_verify()):

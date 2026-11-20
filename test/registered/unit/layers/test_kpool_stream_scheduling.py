@@ -541,6 +541,7 @@ class TestKPoolPlanChunking(CustomTestCase):
             ragged_k_u8=torch.zeros((total_k_rows, 4), dtype=torch.uint8),
             ragged_k_scale=torch.zeros((total_k_rows, 1), dtype=torch.float32),
             ragged_concat_page_table=torch.zeros(total_k_rows, dtype=torch.int32),
+            page_fetch=None,
             ragged_paged_page_table=page_table,
             ragged_paged_page_table_row_index=torch.tensor(req_ids, dtype=torch.int32),
         )

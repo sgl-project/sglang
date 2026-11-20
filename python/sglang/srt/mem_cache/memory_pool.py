@@ -4287,6 +4287,7 @@ class HybridLinearKVPool(KVCache):
         # full-attention layers instead of constructing one internally.
         full_kv_pool: Optional[KVCache] = None,
         post_capture_active: bool = False,
+        dcp_replicated: bool = False,
         # HiSparse only: forwarded to a HiSparseDSATokenToKVPool full pool.
         host_to_device_ratio: Optional[int] = None,
         use_fp4_indexer: bool = False,
@@ -4367,6 +4368,7 @@ class HybridLinearKVPool(KVCache):
                 tail_extra_slots=tail_extra_slots,
                 max_running_requests=max_running_requests,
                 skip_topk_layers=skip_topk_layers,
+                dcp_replicated=dcp_replicated,
                 kv_scale_ue8m0=kv_scale_ue8m0,
                 fp8_cast_on_write=fp8_cast_on_write,
                 **hisparse_kwargs,
@@ -4441,6 +4443,10 @@ class HybridLinearKVPool(KVCache):
     @property
     def index_kpool(self) -> int:
         return getattr(self.full_kv_pool, "index_kpool", 1)
+
+    @property
+    def kpool_page_shard(self):
+        return getattr(self.full_kv_pool, "kpool_page_shard", None)
 
     @property
     def index_kpool_compress(self) -> bool:
@@ -5544,6 +5550,15 @@ class DSATokenToKVPool(MLATokenToKVPool):
         self.index_kpool = index_kpool
         self.index_kpool_compress = index_kpool_compress
         self.tail_extra_slots = tail_extra_slots
+        self.kpool_page_shard = None
+        if index_kpool > 1 and envs.SGLANG_OPT_DSA_KPOOL_INDEX_CACHE_SHARDS.get() != 1:
+            from sglang.srt.layers.attention.dsa.kpool_page_shard import KPoolPageShard
+
+            if dcp_replicated or torch.device(device).type != "cuda":
+                raise ValueError(
+                    "Pooled index page sharding requires a CUDA DCP target"
+                )
+            self.kpool_page_shard = KPoolPageShard.create(device)
         assert self.page_size % index_kpool == 0, (
             f"page_size {self.page_size} must be a multiple of index_kpool {index_kpool}"
         )
@@ -5596,6 +5611,14 @@ class DSATokenToKVPool(MLATokenToKVPool):
                 f"with index_kpool={index_kpool}"
             )
         self.index_key_cache = self._create_index_key_cache()
+        if self.kpool_page_shard is not None:
+            logger.info(
+                "Pooled index-K shard %d/%d allocated %d bytes across %d index layers",
+                self.kpool_page_shard.rank,
+                self.kpool_page_shard.size,
+                sum(b.nbytes for b in self.index_key_cache.buffer),
+                sum(b.shape[0] > 0 for b in self.index_key_cache.buffer),
+            )
         self._init_kpool_compress_tail_buffers(
             index_kpool=index_kpool,
             index_kpool_compress=index_kpool_compress,

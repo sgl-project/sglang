@@ -17,6 +17,15 @@ __all__ = []
 
 register_kernel(
     KernelSpec(
+        op="communication.exchange_kpool_candidates",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.communication.kpool_candidates:exchange_kpool_candidates",
+        capabilities=CUDA_ONLY,
+    )
+)
+
+register_kernel(
+    KernelSpec(
         op="communication.moe_finalize_shared_gate_all_reduce",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.communication.all_reduce_fusion:moe_finalize_shared_gate_all_reduce",

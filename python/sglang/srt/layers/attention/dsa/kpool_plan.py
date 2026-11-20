@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, List, NamedTuple, Optional
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.dsa_dcp import kpool_decode_row_shard
 from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
     INDEX_HEAD_DIM,
     build_kpool_topk_v2_plan,
@@ -16,6 +17,7 @@ from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
     refresh_kpool_topk_v2_plan,
     update_kpool_write_plan_cuda_graph,
 )
+from sglang.srt.layers.attention.dsa.kpool_page_shard import KPoolPageFetch, padded_rows
 from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.model_executor.forward_context import get_req_to_token_pool
 from sglang.srt.runtime_context import get_parallel
@@ -102,6 +104,7 @@ class KPoolExtendPlan:
     ragged_paged_page_table: Optional[torch.Tensor] = None
     ragged_paged_page_table_row_index: Optional[torch.Tensor] = None
     cp: Optional[KPoolCpInfo] = None
+    page_fetch: Optional[KPoolPageFetch] = None
 
 
 @dataclass(frozen=True)
@@ -390,6 +393,7 @@ def _kpool_plan_to_gpu(
     kpool: int,
     index_page_size: int,
     topk_transform_method: TopkTransformMethod,
+    page_shard=None,
 ) -> KPoolExtendPlan:
     from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
 
@@ -534,6 +538,11 @@ def _kpool_plan_to_gpu(
         ragged_k_u8 = None
         ragged_k_scale = None
 
+    page_fetch = None
+    if page_shard is not None and ragged_total_k_rows > 0:
+        # Index layers share the page mapping. Only the key bytes vary by layer.
+        aligned = all(n % page_shard.size == 0 for n in cpu.ragged_pool_pages[:-1])
+        page_fetch = page_shard.plan_fetch(ragged_concat_page_table, aligned=aligned)
     return KPoolExtendPlan(
         writes=PoolWriteRows(
             req=pool_req_t,
@@ -560,6 +569,7 @@ def _kpool_plan_to_gpu(
         ragged_paged_page_table=ragged_paged_page_table,
         ragged_paged_page_table_row_index=ragged_paged_page_table_row_index,
         cp=_kpool_cp_owner_rank(forward_batch, n_pool, device),
+        page_fetch=page_fetch,
     )
 
 
@@ -606,6 +616,7 @@ def init_kpool_extend_metadata(
     local_seq_lens_cpu: Optional[List[int]] = None,
     local_req_pool_indices: Optional[torch.Tensor] = None,
     build_ragged_metadata: bool = True,
+    page_shard=None,
 ) -> DSAMetadata:
     mode = forward_batch.forward_mode
     is_extend_like = mode.is_extend_without_speculative() or mode.is_draft_extend_v2()
@@ -643,6 +654,7 @@ def init_kpool_extend_metadata(
             kpool,
             index_page_size,
             topk_transform_method,
+            page_shard=page_shard,
         )
     else:
         plan = _kpool_plan_to_npu(cpu, full_real_page_table, kpool, index_page_size)
@@ -684,6 +696,18 @@ def _compute_pool_schedule_metadata(
     )
 
 
+def _paged_plan_inputs(page_shard, pooled_table, pool_lens, page_size):
+    if page_shard is None:
+        rows = kpool_decode_row_shard(pool_lens.shape[0])
+        lens = pool_lens if rows is None else pool_lens[rows[1]]
+        return lens, lens, None
+    stride, _, score_lens, table = page_shard.decode_layout(
+        pooled_table, pool_lens, page_size
+    )
+    topk_lens = padded_rows(pool_lens, page_shard.world_rank * stride, stride)
+    return score_lens, topk_lens, table
+
+
 def init_pooled_paged_mqa_metadata(
     metadata: DSAMetadata,
     seqlens_32: torch.Tensor,
@@ -693,6 +717,7 @@ def init_pooled_paged_mqa_metadata(
     physical_page_size: int,
     index_page_size: int,
     build_schedule_metadata: bool = True,
+    page_shard=None,
 ) -> DSAMetadata:
     if (
         not _is_kpool_layout_enabled(kpool, physical_page_size)
@@ -712,9 +737,12 @@ def init_pooled_paged_mqa_metadata(
         )
 
     pool_seqlens = torch.div(seqlens_32, kpool, rounding_mode="floor").to(torch.int32)
+    score_lens, plan_lens, shard_table = _paged_plan_inputs(
+        page_shard, pooled_page_table, pool_seqlens, index_page_size
+    )
     schedule = (
         _compute_pool_schedule_metadata(
-            pool_seqlens,
+            score_lens,
             index_page_size=index_page_size,
         )
         if build_schedule_metadata
@@ -725,8 +753,10 @@ def init_pooled_paged_mqa_metadata(
         pooled_index_kpool=kpool,
         pooled_cache_seqlens_int32=pool_seqlens,
         pooled_real_page_table=pooled_page_table,
+        pooled_shard_lens=score_lens if shard_table is not None else None,
+        pooled_shard_page_table=shard_table,
         pooled_paged_mqa_schedule_metadata=schedule,
-        pooled_topk_v2_plan=build_kpool_topk_v2_plan(pool_seqlens),
+        pooled_topk_v2_plan=build_kpool_topk_v2_plan(plan_lens),
     )
 
 
@@ -739,6 +769,7 @@ def update_pooled_paged_mqa_metadata(
     physical_page_size: int,
     index_page_size: int,
     build_schedule_metadata: bool = True,
+    page_shard=None,
 ) -> None:
     if (
         not _is_kpool_layout_enabled(kpool, physical_page_size)
@@ -771,12 +802,21 @@ def update_pooled_paged_mqa_metadata(
         : pooled_page_table.shape[0], : pooled_page_table.shape[1]
     ].copy_(pooled_page_table)
 
+    score_lens, plan_lens, shard_table = _paged_plan_inputs(
+        page_shard,
+        metadata.pooled_real_page_table,
+        metadata.pooled_cache_seqlens_int32,
+        index_page_size,
+    )
+    if shard_table is not None:
+        metadata.pooled_shard_lens.copy_(score_lens)
+        metadata.pooled_shard_page_table.copy_(shard_table)
     if (
         build_schedule_metadata
         and metadata.pooled_paged_mqa_schedule_metadata is not None
     ):
         new_schedule = _compute_pool_schedule_metadata(
-            metadata.pooled_cache_seqlens_int32,
+            score_lens,
             index_page_size=index_page_size,
         )
         if new_schedule is not None:
@@ -785,7 +825,7 @@ def update_pooled_paged_mqa_metadata(
     if metadata.pooled_topk_v2_plan is not None:
         refresh_kpool_topk_v2_plan(
             plan=metadata.pooled_topk_v2_plan,
-            pool_lens=metadata.pooled_cache_seqlens_int32,
+            pool_lens=plan_lens,
         )
 
 
