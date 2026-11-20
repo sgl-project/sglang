@@ -11,6 +11,7 @@ from sglang.kernels.ops.attention.dsa.transform_index import (
 from sglang.kernels.ops.attention.dsa.triton_sparse_mla_decode import (
     triton_sparse_mla_decode_splitk,
 )
+from sglang.kernels.ops.communication.kpool_candidates import exchange_kpool_candidates
 from sglang.srt.distributed import parallel_state as ps
 from sglang.srt.layers.attention.dsa.dsa_indexer import (
     _broadcast_indexer_topk_from_rank0,
@@ -27,6 +28,86 @@ register_cuda_ci(est_time=180, stage="extra-b", runner_config="8-gpu-h200")
 
 
 class TestDsaDcpTritonCollectives(CustomTestCase):
+    def test_compact_kpool_candidates(self):
+        from sglang.srt.layers.dcp.layout import get_dcp_lens
+
+        group = self.group
+        size, rank = group.world_size, group.rank_in_group
+        self.assertIn(size, (2, 4, 8))
+        # Every rank owns several queries. Exercise both local enumeration and
+        # local Top-512, negative/positive scores, tail lengths, and both maps.
+        for local_cols in (64, 192, 1024):
+            cols = local_cols * size
+            lengths = (
+                torch.tensor(
+                    [0, 1, 63, 512, 513, cols - 1], device="cuda", dtype=torch.int32
+                )
+                .clamp(max=cols)
+                .repeat(size)
+            )
+            seq = (
+                lengths * 4
+                + torch.arange(len(lengths), device="cuda", dtype=torch.int32) % 4
+            )
+            stride = len(lengths) // size
+            local_lens = get_dcp_lens(lengths, size, rank, interleave_size=64)
+            # A permutation gives unique scores, allowing an exact selected set check.
+            column = torch.arange(cols, device="cuda")
+            scores = (
+                ((column * 131 % (cols + 17)) - cols // 2)
+                .float()
+                .repeat(len(lengths), 1)
+            )
+            local = (
+                scores.view(len(lengths), -1, 64)[:, rank::size]
+                .reshape(len(lengths), local_cols)
+                .contiguous()
+            )
+            owner = slice(rank * stride, (rank + 1) * stride)
+            row_ids = torch.arange(stride, device="cuda", dtype=torch.int32) * (
+                cols * 4 + 3
+            )
+            table = (
+                row_ids[:, None]
+                + torch.arange(cols * 4 + 3, device="cuda", dtype=torch.int32).flip(
+                    (0,)
+                )[None, :]
+            )
+            for mapping, offsets in ((None, None), (table, None), (None, row_ids)):
+                selected = exchange_kpool_candidates(
+                    local,
+                    local_lens,
+                    lengths[owner],
+                    seq[owner],
+                    mapping,
+                    offsets,
+                    group=group.device_group,
+                    shards=size,
+                    rank=rank,
+                    page_size=64,
+                )
+                for i, row in enumerate(range(owner.start, owner.stop)):
+                    n = int(lengths[row])
+                    groups = scores[row, :n].topk(min(512, n)).indices
+                    history = (
+                        groups[:, None] * 4 + torch.arange(4, device="cuda")
+                    ).flatten()
+                    tail = torch.arange(n * 4, int(seq[row]), device="cuda")
+                    for ids, actual in (
+                        (history, selected[i, :2048]),
+                        (tail, selected[i, 2048:]),
+                    ):
+                        expected = (
+                            mapping[i, ids]
+                            if mapping is not None
+                            else ids + (0 if offsets is None else offsets[i])
+                        )
+                        torch.testing.assert_close(
+                            actual[actual >= 0].long().sort().values,
+                            expected.long().sort().values,
+                        )
+                        self.assertTrue((actual[len(ids) :] == -1).all().item())
+
     @classmethod
     def setUpClass(cls):
         rank = int(os.environ["RANK"])

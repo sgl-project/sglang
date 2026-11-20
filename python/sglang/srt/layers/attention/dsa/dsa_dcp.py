@@ -158,3 +158,31 @@ def kpool_decode_row_shard(rows: int) -> Optional[Tuple[int, slice]]:
     if per * (size - 1) >= rows:
         return None
     return per, slice(lo, hi)
+
+
+def kpool_selection_group(parallel):
+    # DCP groups nest inside attention TP. Assign different query rows to
+    # different cache replicas and deliver every final token ID to all heads.
+    if parallel.attn_dcp_size == parallel.attn_tp_size:
+        return parallel.dcp_group
+    return parallel.attn_tp_group
+
+
+def kpool_prefill_row_group():
+    if not envs.SGLANG_OPT_DSA_KPOOL_PREFILL_ROW_SHARD.get() or not is_cuda():
+        return None
+    parallel = get_parallel()
+    if parallel.attn_dcp_size > 1:
+        return kpool_selection_group(parallel)
+    return None
+
+
+def gather_kpool_topk(group, local, real_rows, output_rows):
+    gathered = local.new_empty((group.world_size * local.shape[0], local.shape[1]))
+    group.all_gather_into_tensor(gathered, local)
+    result = gathered[:real_rows]
+    if output_rows > real_rows:
+        result = torch.nn.functional.pad(
+            result, (0, 0, 0, output_rows - real_rows), value=-1
+        )
+    return result

@@ -69,6 +69,11 @@ def build_pooled_page_table_64(
     return page_table_64[..., idx] // kpool
 
 
+def _cache_shard_args(pool):
+    shard = getattr(pool, "kpool_page_shard", None)
+    return dict(CACHE_SHARDS=shard.size, CACHE_RANK=shard.rank) if shard else {}
+
+
 def gather_index_k_scale_prefix_into(
     pool,
     buf: torch.Tensor,
@@ -76,6 +81,7 @@ def gather_index_k_scale_prefix_into(
     seq_len: int,
     k_out: torch.Tensor,
     scale_out: torch.Tensor,
+    page_fetch=None,
 ) -> None:
     assert buf.dtype == torch.uint8
     assert page_indices.dtype in (torch.int32, torch.int64)
@@ -91,6 +97,11 @@ def gather_index_k_scale_prefix_into(
     assert scale_out.is_contiguous()
     if seq_len == 0:
         return
+
+    shard = getattr(pool, "kpool_page_shard", None)
+    if shard is not None:
+        needed = (seq_len + pool.index_page_size - 1) // pool.index_page_size
+        buf, page_indices = shard.fetch_pages(buf, page_indices[:needed], page_fetch)
 
     _gather_index_k_scale_prefix_into_kernel[(seq_len,)](
         buf,
@@ -1002,6 +1013,7 @@ def kpool_softmax_rotate_write_cache(
         ape.stride(0),
         PAGE_SIZE=pool.index_page_size,
         BUF_NUMEL_PER_PAGE=buf.shape[1],
+        **_cache_shard_args(pool),
         PRESHUFFLE_TILE=_preshuffle_tile(),
         POOL_SIZE=slot_k.shape[1],
         HEAD_DIM=slot_k.shape[2],
@@ -1096,6 +1108,7 @@ def kpool_decode_update_and_maybe_write_cache(
         REQ_POOL_SIZE=tail_k.shape[0],
         PAGE_SIZE=pool.page_size,
         BUF_NUMEL_PER_PAGE=buf.shape[1],
+        **_cache_shard_args(pool),
         PRESHUFFLE_TILE=_preshuffle_tile(),
         POOL_SIZE=pool.index_kpool,
         TAIL_SIZE=tail_k.shape[1],
@@ -1157,6 +1170,8 @@ def _kpool_softmax_rotate_write_cache_kernel(
     RETURN_COMPRESSED: tl.constexpr,
     WRITE_CACHE: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    CACHE_SHARDS: tl.constexpr = 1,
+    CACHE_RANK: tl.constexpr = 0,
 ):
     row = tl.program_id(0)
     do_write = True
@@ -1226,6 +1241,8 @@ def _kpool_softmax_rotate_write_cache_kernel(
     if WRITE_CACHE:
         loc = tl.load(loc_ptr + row, mask=do_write, other=0)
         loc_page_index = loc // PAGE_SIZE
+        owned = loc_page_index % CACHE_SHARDS == CACHE_RANK
+        loc_page_index = loc_page_index // CACHE_SHARDS
         loc_token_offset_in_page = loc % PAGE_SIZE
         out_k_offsets = _kpool_cache_k_offsets(
             loc_page_index,
@@ -1241,8 +1258,8 @@ def _kpool_softmax_rotate_write_cache_kernel(
             + loc_token_offset_in_page
         )
 
-        tl.store(buf_fp8_ptr + out_k_offsets, quantized, mask=mask)
-        tl.store(buf_fp32_ptr + out_s_offset, scale, mask=do_write)
+        tl.store(buf_fp8_ptr + out_k_offsets, quantized, mask=mask & owned)
+        tl.store(buf_fp32_ptr + out_s_offset, scale, mask=do_write & owned)
     if RETURN_COMPRESSED:
         tl.store(
             compressed_k_ptr + row * HEAD_DIM + offs,
@@ -1287,6 +1304,8 @@ def _kpool_decode_update_and_maybe_write_cache_kernel(
     ROUND_SCALE: tl.constexpr,
     BLOCK_D: tl.constexpr,
     INDEX_PAGE_SIZE: tl.constexpr,
+    CACHE_SHARDS: tl.constexpr = 1,
+    CACHE_RANK: tl.constexpr = 0,
 ):
     row = tl.program_id(0)
     offs = tl.arange(0, BLOCK_D)
@@ -1395,6 +1414,8 @@ def _kpool_decode_update_and_maybe_write_cache_kernel(
             + token_page_row * block_tables_stride_1,
         )
         loc_page_index = packed_page.to(tl.int64) // POOL_SIZE
+        owned = loc_page_index % CACHE_SHARDS == CACHE_RANK
+        loc_page_index = loc_page_index // CACHE_SHARDS
         loc_token_offset_in_page = pool_id % INDEX_PAGE_SIZE
         out_k_offsets = _kpool_cache_k_offsets(
             loc_page_index,
@@ -1410,8 +1431,8 @@ def _kpool_decode_update_and_maybe_write_cache_kernel(
             + loc_token_offset_in_page
         )
 
-        tl.store(buf_fp8_ptr + out_k_offsets, quantized, mask=dim_mask)
-        tl.store(buf_fp32_ptr + out_s_offset, scale)
+        tl.store(buf_fp8_ptr + out_k_offsets, quantized, mask=dim_mask & owned)
+        tl.store(buf_fp32_ptr + out_s_offset, scale, mask=owned)
 
     tail_k_offset = req * tail_k_stride_0 + phys_slot * tail_k_stride_1 + offs
     tail_score_offset = (
@@ -1467,12 +1488,20 @@ def _kpool_assemble_softmax_rotate_write_cache_kernel(
     HAS_WRITE_MASK: tl.constexpr,
     BLOCK_D: tl.constexpr,
     INDEX_PAGE_SIZE: tl.constexpr,
+    CACHE_SHARDS: tl.constexpr = 1,
+    CACHE_RANK: tl.constexpr = 0,
 ):
     row = tl.program_id(0)
     if HAS_WRITE_MASK:
         if not tl.load(write_mask_ptr + row):
             return
 
+    loc = tl.load(loc_ptr + row)
+    loc_page_index = loc // INDEX_PAGE_SIZE
+    if CACHE_SHARDS > 1:
+        if loc_page_index % CACHE_SHARDS != CACHE_RANK:
+            return
+        loc_page_index = loc_page_index // CACHE_SHARDS
     offs = tl.arange(0, BLOCK_D)
     mask = offs < HEAD_DIM
 
@@ -1507,8 +1536,6 @@ def _kpool_assemble_softmax_rotate_write_cache_kernel(
 
     quantized, scale = _hadamard_quantize_fp8(acc, denom, ROUND_SCALE)
 
-    loc = tl.load(loc_ptr + row)
-    loc_page_index = loc // INDEX_PAGE_SIZE
     loc_token_offset_in_page = loc % INDEX_PAGE_SIZE
     out_k_offsets = _kpool_cache_k_offsets(
         loc_page_index,
@@ -1583,6 +1610,7 @@ def kpool_assemble_softmax_rotate_write_cache(
         tail_k.stride(1),
         ape.stride(0),
         BUF_NUMEL_PER_PAGE=buf.shape[1],
+        **_cache_shard_args(pool),
         PRESHUFFLE_TILE=_preshuffle_tile(),
         POOL_SIZE=kpool,
         TAIL_SIZE=tail_k.shape[1],

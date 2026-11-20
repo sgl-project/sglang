@@ -208,6 +208,8 @@ class DSAMetadataManagementMixin:
             and _match(dst.topk_v2_plan, src.topk_v2_plan)
             and _match(dst.pooled_cache_seqlens_int32, src.pooled_cache_seqlens_int32)
             and _match(dst.pooled_real_page_table, src.pooled_real_page_table)
+            and _match(dst.pooled_shard_lens, src.pooled_shard_lens)
+            and _match(dst.pooled_shard_page_table, src.pooled_shard_page_table)
             and _match(
                 dst.pooled_paged_mqa_schedule_metadata,
                 src.pooled_paged_mqa_schedule_metadata,
@@ -294,6 +296,9 @@ class DSAMetadataManagementMixin:
             )
         if metadata.pooled_real_page_table is not None:
             metadata.pooled_real_page_table.copy_(src_metadata.pooled_real_page_table)
+        if metadata.pooled_shard_lens is not None:
+            metadata.pooled_shard_lens.copy_(src_metadata.pooled_shard_lens)
+            metadata.pooled_shard_page_table.copy_(src_metadata.pooled_shard_page_table)
         if metadata.pooled_paged_mqa_schedule_metadata is not None:
             metadata.pooled_paged_mqa_schedule_metadata.copy_(
                 src_metadata.pooled_paged_mqa_schedule_metadata

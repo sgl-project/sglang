@@ -58,6 +58,7 @@ from sglang.kernels.ops.attention.utils import (
 from sglang.kernels.ops.quantization.dsa_quant_k_cache import quantize_k_cache
 from sglang.srt.configs.model_config import (
     get_dsa_index_kpool,
+    get_dsa_index_n_heads,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -452,6 +453,8 @@ class DSAMetadata:
     pooled_index_kpool: int = 1
     pooled_cache_seqlens_int32: Optional[torch.Tensor] = None
     pooled_real_page_table: Optional[torch.Tensor] = None
+    pooled_shard_lens: Optional[torch.Tensor] = None
+    pooled_shard_page_table: Optional[torch.Tensor] = None
     pooled_paged_mqa_schedule_metadata: Optional[torch.Tensor] = None
     pooled_topk_v2_plan: Optional[torch.Tensor] = None
     kpool_extend_plan: Optional[KPoolExtendPlan] = None
@@ -838,6 +841,11 @@ class DeepseekSparseAttnBackend(
         self.num_q_heads = self.local_num_q_heads * sharded_dcp_size
         self.num_dcp_q_heads = trtllm_padded_heads(
             self.local_num_q_heads * self.attn_dcp_size
+        )
+        self.kpool_schedule_heads = (
+            get_dsa_index_n_heads(hf_config)
+            if getattr(model_runner.token_to_kv_pool, "kpool_page_shard", None)
+            else self.num_q_heads
         )
         self._dcp_page_table_cache = DcpPageTableCache()
         self.kv_cache_dim = model_runner.token_to_kv_pool.kv_cache_dim
