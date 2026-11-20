@@ -137,6 +137,20 @@ class TestMRopeAxisMap(CustomTestCase):
             )
             self.assertEqual(fused.call_count, 1)
 
+    def test_cuda_dispatch_runs_text_positions_on_the_kernel(self):
+        # Text positions (--language-model-only) are the same on every axis, so
+        # the Triton kernel serves them as it serves the 3-axis ones.
+        rope = build_mrope([11, 11, 10], 64, interleaved=True)
+        rope.head_size = 256
+        positions = torch.tensor([3, 7])
+        query, key = torch.randn(2, 3072), torch.randn(2, 512)
+        with patch.object(mrope, "triton_mrope_fused") as fused:
+            rope.forward_cuda(positions, query, key)
+        fused.assert_called_once()
+        torch.testing.assert_close(
+            fused.call_args.args[3], positions.expand(3, -1), atol=0, rtol=0
+        )
+
     def test_qwen35_npu_prefill_and_decode_dispatch(self):
         from sglang.srt.model_executor.forward_mode import ForwardMode
         from sglang.srt.models import qwen3_5

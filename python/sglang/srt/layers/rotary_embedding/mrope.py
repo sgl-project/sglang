@@ -263,7 +263,11 @@ class MRotaryEmbedding(RotaryEmbedding):
         if query.shape[0] == 0:
             return query, key
         self._match_cos_sin_cache_dtype(query)
-        if positions.ndim == 2 and self.mrope_section:
+        if self.mrope_section:
+            if positions.ndim == 1:
+                # Text positions (e.g. --language-model-only) are the same on
+                # every axis; the kernel reads them through a stride-0 view.
+                positions = positions.unsqueeze(0).expand(3, -1)
             return self.forward_triton(positions, query, key)
         return self.forward_native(positions, query, key, fused_set_kv_buffer_arg)
 
