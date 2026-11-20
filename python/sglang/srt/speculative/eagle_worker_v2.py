@@ -721,13 +721,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             target_translator=self.target_worker.model_runner.runner_ids,
             num_draft_tokens=self.speculative_num_draft_tokens,
         )
-        # A batch without the draft-extend DSA seed (e.g. requests just handed
-        # off by a target-only prefill) drafts eagerly for a better first
-        # draft. Not under DP attention: the check is per rank, the draft's MoE
-        # collectives span every attention-DP rank, and one rank drafting
-        # eagerly while its peers replay the draft graph deadlocks. There every
-        # rank replays the graph and the runner zero-fills the missing seed;
-        # that round's draft is simply rejected by verify.
+        # A rank-local eager fallback can deadlock draft MoE collectives
+        # across attention-DP ranks.
         if (
             can_run_decode_cuda_graph
             and not forward_batch.forward_mode.is_idle()
