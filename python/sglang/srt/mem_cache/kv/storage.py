@@ -1166,8 +1166,8 @@ class KVStorage:
         slots in ``state_slots``. ``token_writes_unknown``: the token write ids
         are produced by the forward itself and cannot be read before it ends.
         ``state_writes_unknown``: the state slot ids cannot be read safely here
-        either. Gather known ids on the compaction stream (the current stream
-        when the caller already selected it)."""
+        either. ``schedule_stream``: the stream compaction runs on, where known
+        ids are gathered; None when the caller already made it current."""
         if (
             token_writes_unknown
             and state_writes_unknown

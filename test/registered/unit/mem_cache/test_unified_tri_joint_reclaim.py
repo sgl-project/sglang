@@ -485,7 +485,7 @@ class TestTriJointReclaim(CustomTestCase):
             for _ in range(4)
         ]
         self.assertTrue(batch.check_decode_mem())
-        # Rechecking the same demand now fits without another reclaim pass.
+        # The same demand now fits: one fit check, no reclaim.
         with patch.object(a, "units_fit", wraps=a.units_fit) as fits:
             self.assertTrue(batch.check_decode_mem())
             fits.assert_called_once()

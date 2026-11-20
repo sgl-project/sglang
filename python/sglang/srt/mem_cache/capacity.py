@@ -190,8 +190,8 @@ class _SharedMemory:
     def check_decode_capacity(self, tree_cache, allocator, *, num_tokens, **_):
         demand = KVDemand.same_tokens(allocator, num_tokens)
         if _shares_prefixes(tree_cache):
-            # Reclaim starts with this same fit check after applying grouped
-            # frees. A decode step that fits needs just one arena snapshot.
+            # The reclaim below opens with this same check; when it holds,
+            # it evicts nothing and the take succeeds.
             if allocator.fits_after_frees(allocator.page_demands(demand)):
                 return True
             tree_cache.evict_for_alloc(demand)
