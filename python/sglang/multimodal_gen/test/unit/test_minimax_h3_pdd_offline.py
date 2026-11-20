@@ -344,6 +344,13 @@ class TestMiniMaxH3PDDHeadWeightUpdate(CustomTestCase):
                 full_stack,
                 "exactly",
             ),
+            # the fused heads file's key without the layer it is served from
+            (
+                self.loaded_path,
+                "pdd_fused_heads.video_out.weight",
+                full_stack,
+                "exactly",
+            ),
         )
         for heads_path, name, update_tensor, expected_message in cases:
             with self.subTest(expected_message=expected_message):
