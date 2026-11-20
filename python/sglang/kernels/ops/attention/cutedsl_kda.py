@@ -24,9 +24,14 @@ import cutlass.cute as cute
 import torch
 from cutlass.cute.runtime import from_dlpack
 
+from sglang.kernels.jit.cute_aot_cache import get_jit_cache
+
 logger = logging.getLogger(__name__)
 
-_compiled_kernels: Dict[Tuple, object] = {}
+# Compiled without TVM-FFI: callers pass cute tensors, as at compile time.
+_compiled_kernels = get_jit_cache(
+    "cutedsl_kda_decode", source_paths=(__file__,), enable_tvm_ffi=False
+)
 _cu_seqlens_cache: Dict[Tuple, torch.Tensor] = {}
 
 TILE_K = 128

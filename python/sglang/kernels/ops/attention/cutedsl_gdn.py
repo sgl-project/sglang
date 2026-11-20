@@ -11,9 +11,14 @@ import torch
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.runtime import from_dlpack
 
+from sglang.kernels.jit.cute_aot_cache import get_jit_cache
+
 logger = logging.getLogger(__name__)
 
-_compiled_kernels: Dict[Tuple, object] = {}
+# Compiled without TVM-FFI: callers pass cute tensors, as at compile time.
+_compiled_kernels = get_jit_cache(
+    "cutedsl_gdn_decode", source_paths=(__file__,), enable_tvm_ffi=False
+)
 _cu_seqlens_cache: Dict[Tuple, torch.Tensor] = {}
 TILE_K = 128
 # K-contiguous smem rows; the 8-float pad makes each warp's 8 K x 4 V reads

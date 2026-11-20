@@ -709,5 +709,108 @@ def test_deep_select_spec_matches_wrapper_architectures():
     )
 
 
+# CuTe DSL kernels compiled in process, by file and number of `cute.compile`
+# references; every process compiles them again. New kernels compile into a
+# get_jit_cache() cache instead, and converting a file removes it from here.
+_IN_PROCESS_CUTE_COMPILES = {
+    "kernels/kda_kernels/qwen3x_nvfp4_gemm_sm120.py": 1,
+    "kernels/ops/attention/cutedsl_gdn_mtp_ring.py": 2,
+    "kernels/ops/attention/dsa/cutedsl_paged_mqa_logits.py": 1,
+    "kernels/ops/attention/dsv4/cute_sparse_mla_h16.py": 1,
+    "kernels/ops/attention/flash_attn/cute/cute_dsl_utils.py": 1,
+    "kernels/ops/attention/flash_attn/cute/flash_fwd_sm100_bias_decode.py": 1,
+    "kernels/ops/attention/fp8_fa_sm120/plan.py": 1,
+    "kernels/ops/attention/inkling2_attn_res.py": 1,
+    "kernels/ops/attention/linear/gdn_blackwell/__init__.py": 1,
+    "kernels/ops/attention/linear/gdn_blackwell/kernel_h.py": 1,
+    "kernels/ops/attention/linear/gdn_blackwell/kernel_kkt_inv_uw.py": 1,
+    "kernels/ops/attention/linear/gdn_blackwell/kernel_o.py": 1,
+    "kernels/ops/attention/linear/kda_blackwell/kernel_h.py": 1,
+    "kernels/ops/attention/linear/kda_blackwell/kernel_kkt_inv_uw.py": 1,
+    "kernels/ops/attention/linear/kda_blackwell/kernel_o.py": 1,
+    "kernels/ops/attention/linear/kda_nvidia_prefill/chunk_fwd.py": 3,
+    "kernels/ops/attention/linear/kda_nvidia_prefill/fuse_k4_only_persistent.py": 4,
+    "kernels/ops/communication/muse_spark_moe_finalize_all_reduce_cutedsl.py": 1,
+    "kernels/ops/communication/sp_collective_gemm.py": 3,
+    "kernels/ops/diffusion/norm/scale_residual_norm_cutedsl.py": 2,
+    "kernels/ops/diffusion/rope/rmsnorm_interleaved_rope_cutedsl.py": 1,
+    "kernels/ops/gemm/cutedsl_dsv3_fused_a_gemm.py": 1,
+    "kernels/ops/gemm/inkling2_cute_grouped_nvfp4.py": 1,
+    "kernels/ops/gemm/muse_spark_router_gemv_cutedsl.py": 1,
+    "kernels/ops/gemm/nvfp4_gemm_swiglu_nvfp4_quant.py": 1,
+    "kernels/ops/layernorm/inkling2_qk_l2_clip.py": 1,
+    "kernels/ops/layernorm/inkling2_rms_norm.py": 1,
+    "kernels/ops/layernorm/rmsnorm_fanout.py": 1,
+    "kernels/ops/lora/moe/cutedsl/api.py": 1,
+    "kernels/ops/mamba/cutedsl_gated_conv.py": 1,
+    "srt/rocm_muse_spark/fi_trtllm_moe_finalize_with_rmsnorm_cutedsl.py": 1,
+}
+
+# Each compile here is stored into a get_jit_cache() cache, which persists it.
+_PERSISTED_CUTE_COMPILES = {
+    "kernels/ops/attention/cutedsl_gdn.py": 1,
+    "kernels/ops/attention/cutedsl_kda.py": 1,
+    "kernels/ops/attention/flash_attention_v4.py": 1,
+    "kernels/ops/attention/flash_attn/cute/interface.py": 5,
+    "kernels/ops/attention/kda_decode_mtp.py": 1,
+}
+
+
+def _is_cute(node: ast.AST) -> bool:
+    return (isinstance(node, ast.Name) and node.id == "cute") or (
+        isinstance(node, ast.Attribute) and node.attr == "cute"
+    )
+
+
+def _cute_compile_references(tree: ast.AST) -> int:
+    # Called, subscripted (cute.compile[...]), aliased or imported all count.
+    count = 0
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and node.attr == "compile":
+            count += _is_cute(node.value)
+        elif isinstance(node, ast.ImportFrom) and (node.module or "").endswith("cute"):
+            count += any(alias.name == "compile" for alias in node.names)
+    return count
+
+
+def _names(tree: ast.AST) -> set[str]:
+    # Imported names and module path parts count, so an import alone is seen.
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name):
+            names.add(node.id)
+        elif isinstance(node, ast.Attribute):
+            names.add(node.attr)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            if isinstance(node, ast.ImportFrom) and node.module:
+                names.update(node.module.split("."))
+            for alias in node.names:
+                names.update(alias.name.split("."))
+    return names
+
+
+def test_cute_dsl_compiles_are_registered():
+    """A CuTe DSL kernel compiled outside a get_jit_cache() cache is compiled again
+    at every start; a new `cute.compile` site must be registered here to land."""
+    package = Path(K.__file__).resolve().parents[1]
+    compiles, flashinfer_cache_users = {}, set()
+    for path in package.rglob("*.py"):
+        relative = path.relative_to(package).as_posix()
+        # Test kits may reset compile caches to observe what a fresh process compiles.
+        if relative.startswith("test/"):
+            continue
+        tree = ast.parse(path.read_text())
+        if count := _cute_compile_references(tree):
+            compiles[relative] = count
+        if _names(tree) & {"custom_compile_cache", "_in_mem_compile_cache"}:
+            flashinfer_cache_users.add(relative)
+    assert compiles == {**_IN_PROCESS_CUTE_COMPILES, **_PERSISTED_CUTE_COMPILES}
+    for relative in _PERSISTED_CUTE_COMPILES:
+        tree = ast.parse((package / relative).read_text())
+        assert _names(tree) & {"get_jit_cache", "_get_jit_cache"}, relative
+    # FlashInfer's cached_compile dict is made persistent in one place only.
+    assert flashinfer_cache_users == {"kernels/jit/cute_aot_cache.py"}
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
