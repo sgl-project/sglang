@@ -165,7 +165,10 @@ class RayDataParallelController(DataParallelController):
                                 parallel.attn_cp_size,
                             )
                             rank_port_args = PortArgs.init_new(
-                                server_args, actual_dp_rank, worker_ports
+                                server_args,
+                                actual_dp_rank,
+                                worker_ports,
+                                engine_port_args=port_args,
                             )
                             # All DP ranks share the same NCCL port (reuse TP group)
                             rank_port_args.nccl_port = port_args.nccl_port
@@ -236,7 +239,10 @@ class RayDataParallelController(DataParallelController):
                         get_parallel().attn_cp_size,
                     )
                     rank_port_args = PortArgs.init_new(
-                        server_args, actual_dp_rank, worker_ports
+                        server_args,
+                        actual_dp_rank,
+                        worker_ports,
+                        engine_port_args=port_args,
                     )
                     rank_port_args.nccl_port = port_args.nccl_port
                     rank_port_args.detokenizer_ipc_name = port_args.detokenizer_ipc_name
