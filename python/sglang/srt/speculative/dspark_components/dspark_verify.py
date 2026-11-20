@@ -1324,8 +1324,14 @@ def sample_simulated_bonus(
     """The bonus token at the (simulated) correct_len row, drawn from the target
     distribution the sampling accept uses: temperature, then top-k / top-p. With
     SGLANG_SIMULATE_ACC_RESIDUAL_BONUS and a sampled draft, a stop row draws from
-    max(p - q, 0) instead, as the rejection it simulates would."""
+    max(p - q, 0) instead, as the rejection it simulates would. The residual bonus
+    applies only to unfiltered sampling; top-k / top-p rows still draw from the target."""
     if sampling_info.need_top_k_sampling or sampling_info.need_top_p_sampling:
+        if envs.SGLANG_SIMULATE_ACC_RESIDUAL_BONUS.get():
+            print_warning_once(
+                "SGLANG_SIMULATE_ACC_RESIDUAL_BONUS only applies to unfiltered sampling; "
+                "top-k / top-p rows still draw the simulated bonus from the target distribution"
+            )
         probs = build_speculative_verify_target_probs(
             next_token_logits=target_logits.index_select(
                 0, _simulated_rows(correct_len, verify_num_draft_tokens)
