@@ -234,7 +234,8 @@ def _make_final_layers(
 def _project_on_each_rank(
     layers: list[MiniMaxH3FinalLayer], *, step: int
 ) -> list[tuple[torch.Tensor, torch.Tensor]]:
-    h = torch.arange(15, dtype=torch.float32).reshape(3, 5)
+    # float64 rows: the stacks are kept in float32, so the copies a forward holds are copies, as on a GPU
+    h = torch.arange(15, dtype=torch.float64).reshape(3, 5)
     with set_forward_context(step, None):
         return [layer._project(h) for layer in layers]
 
