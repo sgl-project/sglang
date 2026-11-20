@@ -332,15 +332,17 @@ def uses_flashinfer_capture_replay(runner: DecodeCudaGraphRunner) -> bool:
     )
 
     mr = runner.model_runner
+    # Draft runners subclass the decode runner without its full field set, so they
+    # are ruled out before any runner field is read.
     # FlashInfer's strict replay is single-rank only, as is the managed store here.
     return (
-        uses_flashinfer_managed_autotune_cache()
+        not mr.is_draft_worker
+        and uses_flashinfer_managed_autotune_cache()
         and isinstance(runner.backend, FullCudaGraphBackend)
         and runner.capture_forward_mode == ForwardMode.DECODE
         and not runner.enable_torch_compile
-        and not runner.enable_two_batch_overlap
+        and not get_exec().overlap.enable_two_batch_overlap
         and not get_lora().enable_lora
-        and not mr.is_draft_worker
         and should_run_flashinfer_autotune(mr)
     )
 

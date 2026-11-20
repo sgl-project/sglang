@@ -68,7 +68,6 @@ def _decode_runner(**fields):
         backend=FullCudaGraphBackend.__new__(FullCudaGraphBackend),
         capture_forward_mode=ForwardMode.DECODE,
         enable_torch_compile=False,
-        enable_two_batch_overlap=False,
         model_runner=_model_runner(),
     )
     runner.update(fields)
@@ -257,15 +256,29 @@ class TestCaptureReplayEligibility(_PublishedConfig):
             dict(backend=SimpleNamespace()),
             dict(capture_forward_mode=ForwardMode.TARGET_VERIFY),
             dict(enable_torch_compile=True),
-            dict(enable_two_batch_overlap=True),
             dict(model_runner=_model_runner(is_draft_worker=True)),
         ):
             with self.subTest(fields=fields):
                 self.assert_eligible(_decode_runner(**fields), False)
 
-    def test_lora(self):
-        with get_lora().override(enable_lora=True):
-            self.assert_eligible(_decode_runner(), False)
+    def test_a_draft_runner_is_excluded_before_its_fields_are_read(self):
+        # The EAGLE draft runners subclass the decode runner but set only some of
+        # its fields; the capture-time check must not reach a missing one.
+        from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
+            EAGLEDraftCudaGraphRunner,
+        )
+
+        runner = EAGLEDraftCudaGraphRunner.__new__(EAGLEDraftCudaGraphRunner)
+        runner.model_runner = _model_runner(is_draft_worker=True)
+        self.assert_eligible(runner, False)
+
+    def test_config_exclusions(self):
+        for context in (
+            get_lora().override(enable_lora=True),
+            get_exec().overlap.override(enable_two_batch_overlap=True),
+        ):
+            with self.subTest(context=context), context:
+                self.assert_eligible(_decode_runner(), False)
 
     def test_processes_without_the_managed_store(self):
         # Strict replay is single-rank; so is the store here.
