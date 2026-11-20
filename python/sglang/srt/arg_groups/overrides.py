@@ -604,13 +604,18 @@ def _check_dsa_backend_constraints(
             "The prims_ts DSA backend needs CUDA and --kv-cache-dtype fp8_e4m3."
         )
 
-    rocm_only = {"triton"} & chosen
-    if not hip and rocm_only:
+    if not hip and "triton" in chosen and kv_cache_dtype != "bfloat16":
         raise ValueError(
-            f"The {'/'.join(sorted(rocm_only))} DSA backend is only supported on "
-            "ROCm/HIP. Pick an alternative DSA backend for CUDA "
-            "(flashmla_kv on Hopper, trtllm on Blackwell)."
+            "The CUDA triton DSA backend requires --kv-cache-dtype bfloat16."
         )
+
+    if not hip and dcp_size > 1:
+        no_dcp_path = chosen - {"triton", "trtllm", "prims_ts", None}
+        if no_dcp_path:
+            raise ValueError(
+                f"The {'/'.join(sorted(no_dcp_path))} DSA backend has no DCP path "
+                "on CUDA for --dcp-size > 1; use triton on Hopper or trtllm on Blackwell."
+            )
 
     if hip and dcp_size > 1:
         no_dcp_path = chosen - {"triton", None}

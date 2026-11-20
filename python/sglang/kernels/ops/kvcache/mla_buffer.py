@@ -252,7 +252,9 @@ def _set_mla_kv_buffer_impl(
         page_size, page_stride, row_stride = paged
     page_kwargs = {"PAGE_SIZE": page_size, "PAGE_STRIDE": page_stride}
 
-    if not has_rope:
+    # The no-RoPE fast path writes loc verbatim. DCP must use the general
+    # kernel below, which selects the owner and collapses the widened loc.
+    if not has_rope and dcp_world_size == 1:
         BLOCK = triton.next_power_of_2(nope_dim)
         grid = (n_loc, 1)
         pdl_kwargs = (
@@ -280,11 +282,11 @@ def _set_mla_kv_buffer_impl(
     )
 
     nope_bytes = cache_k_nope.shape[-1] * cache_k_nope.element_size()
-    rope_bytes = cache_k_rope.shape[-1] * cache_k_rope.element_size()
+    rope_bytes = cache_k_rope.shape[-1] * cache_k_rope.element_size() if has_rope else 0
     if (
-        is_arch_support_pdl()
+        dcp_world_size == 1
+        and is_arch_support_pdl()
         and can_use_set_mla_kv_buffer(nope_bytes, rope_bytes)
-        and dcp_world_size == 1
     ):
         jit_set_mla_kv_buffer(
             kv_buffer,
@@ -300,7 +302,7 @@ def _set_mla_kv_buffer_impl(
     # ``set_mla_kv_buffer_kernel`` handles the over-allocation past total_dim
     # via the offs<total_dim mask). Beats BLOCK=128 by 60-2700 ns across the
     # 2 <= bs <= 512 range on GB300.
-    rope_dim = cache_k_rope.shape[-1]
+    rope_dim = cache_k_rope.shape[-1] if has_rope else 0
     total_dim = nope_dim + rope_dim
     BLOCK = triton.next_power_of_2(total_dim)
     grid = (n_loc, 1)
@@ -308,12 +310,12 @@ def _set_mla_kv_buffer_impl(
     set_mla_kv_buffer_kernel[grid](
         kv_buffer,
         cache_k_nope,
-        cache_k_rope,
+        cache_k_rope if has_rope else cache_k_nope,
         loc,
         reserved_skip_index,
         row_stride,
         cache_k_nope.stride(0),
-        cache_k_rope.stride(0),
+        cache_k_rope.stride(0) if has_rope else 0,
         nope_dim,
         rope_dim,
         BLOCK=BLOCK,
