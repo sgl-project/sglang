@@ -24,11 +24,6 @@ from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     _mha_device_pool_entry,
     resolve_hybrid_device_pool_group,
 )
-from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
-    MooncakeDirectLinker,
-    _storage_suffix,
-)
-from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import MooncakeStore
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -1308,62 +1303,6 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
                 params=SimpleNamespace(),
                 components={ComponentType.FULL, ComponentType.SWA},
             )
-
-
-class TestMooncakeLinkerPPLookup(CustomTestCase):
-    def test_each_stage_queries_its_own_pool_keys_and_returns_sparse_boundaries(self):
-        keys = [f"page{i}" for i in range(6)]
-        group = DevicePoolGroup(
-            [
-                DevicePoolEntry(
-                    name=pool,
-                    indices_from_pool=pool,
-                    device_pool=None,
-                    components=[[torch.empty(6, 1)]],
-                    layer_mapping={0: 0},
-                    page_size=1,
-                    rows_are_pages=True,
-                )
-                for pool in (PoolName.KV, PoolName.SWA)
-            ],
-            num_layers=1,
-            page_size=1,
-        )
-        transfers = [
-            PoolTransfer(PoolName.KV, keys=keys),
-            PoolTransfer(
-                PoolName.SWA, keys=keys[-2:], hit_policy=PoolHitPolicy.TRAILING_PAGES
-            ),
-        ]
-        storage = MooncakeStore.__new__(MooncakeStore)
-        storage.mem_pool_host = group
-        storage.registered_pools = group.entry_map
-        storage.config_prefix = "model"
-        storage.unified_suffixes = None
-        storage._has_request_context_support = False
-        storage.pp_size = 2
-        linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
-        linker.pool_group, linker.storage = group, storage
-        linker.stats = {"lookup": 0}
-        for rank, replicated, suffix, swa_hits, boundaries in (
-            (0, True, "cp1_pp0", [1] * 6, [1, 2, 3, 4, 5, 6]),
-            (1, False, "tp2_cp1_pp1", [1, 1, 0, 0, 1, 1], [1, 2, 6]),
-        ):
-            with self.subTest(pp_rank=rank):
-                storage.pp_rank = rank
-                storage.mla_suffix = _storage_suffix(
-                    rank_replicated=replicated, tp_rank=2, attn_cp_rank=1, pp_rank=rank
-                )
-                exists = Mock(return_value=[1] * len(keys) + swa_hits)
-                storage.store = SimpleNamespace(batch_is_exist=exists)
-                self.assertEqual(linker.lookup("req", transfers), boundaries)
-                exists.assert_called_once_with(
-                    [
-                        f"model_{key}_{suffix}_{pool}"
-                        for pool in ("k", "swa")
-                        for key in keys
-                    ]
-                )
 
 
 if __name__ == "__main__":

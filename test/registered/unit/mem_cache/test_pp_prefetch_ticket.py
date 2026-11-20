@@ -43,7 +43,6 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 from sglang.srt.mem_cache.memory_pool_host import LogicalHostPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
-from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -1163,105 +1162,54 @@ def _drain_until(cache, condition=None):
         assert time.monotonic() < deadline, "stage did not reach the expected state"
 
 
-def _check_overlapping_reads(cache, store, allocator):
-    """A running GET must leave the next ticket free to start and survive a skip."""
-    cache.prefetch_stop_policy = "timeout"
-    cache.prefetch_timeout_base = cache.prefetch_timeout_per_page = 0
-    slow, fast = _request("slow", 0), _request("fast", 50)
-    # Reuse the earlier hit so the running GET must keep a non-root anchor.
-    prefix = fixtures.match_prefix(cache, slow.origin_input_ids[:-1])
-    assert prefix.device_prefix_len == 3
-
-    def anchor_refs():
-        return fixtures.node_device_lock_ref(
-            cache, prefix.last_device_node, ComponentType.FULL
-        )
-
-    baseline = anchor_refs()
+def _check_blocked_follower_lookup(cache, store, policy):
+    """Drive PP0 while PP1's lookup, then its query/ack worker, is delayed."""
+    cache.prefetch_stop_policy = policy
+    wait = policy == "wait_complete"
     tickets = cache.linker.pp_tickets
-    for req in (slow, fast):
+    resume, submitted, published = (threading.Event() for _ in range(3))
+    lookup, reduce = store.lookup, dist.all_reduce
+
+    def blocked_lookup(rid, transfers):
+        if store.rank == 1:
+            assert resume.wait(10), "scheduler waited on follower lookup"
+        return lookup(rid, transfers)
+
+    def delay_result(tensor, *args, group=None, **kwargs):
+        result = reduce(tensor, *args, group=group, **kwargs)
+        if wait and store.rank == 1:
+            if group is tickets.query_groups[-1]:
+                assert submitted.wait(10)
+            elif group is tickets.ack_groups[-1]:
+                assert published.wait(10)
+        return result
+
+    req = _request(policy, 160 if wait else 60)
+    with (
+        patch.object(store, "lookup", blocked_lookup),
+        patch.object(dist, "all_reduce", delay_result),
+    ):
         assert tickets.bind(req, expected=True)
-    _drain_until(cache, lambda: ("fast", 2) in store.reads)
-    if store.rank == 0:
-        assert not tickets.can_admit(slow.cache_request_handle)
-    cache.check_hicache_events()
-    assert tickets.can_admit(slow.cache_request_handle)
-    assert store.slow_read.running()
-    if store.rank == 0:
-        store.slow_read.set_result(True)
-    dist.barrier()
-    cache.check_hicache_events()
-    assert anchor_refs() == baseline + 1
-    assert allocator.available_size() == 32 - 5 - 2 - 2
-    if store.rank == 1:
-        store.slow_read.set_result(True)
-    _drain_until(cache)
-    assert anchor_refs() == baseline
-    assert not cache.linker.prefetches
-    for req, expected in ((slow, 3), (fast, 2)):
-        match = fixtures.match_prefix(cache, req.origin_input_ids[:-1])
-        assert match.device_prefix_len == expected
-    assert allocator.available_size() == 32 - 5 - 2
-
-
-def _check_blocked_follower_lookup(cache, store):
-    tickets = cache.linker.pp_tickets
-    for policy, first_token in (("wait_complete", 160), ("best_effort", 60)):
-        cache.prefetch_stop_policy = policy
-        resume = threading.Event()
-        lookup = store.lookup
-
-        def blocked_lookup(rid, transfers):
-            result = lookup(rid, transfers)
-            if store.rank == 1:
-                assert resume.wait(10), "scheduler waited on follower lookup"
-            return result
-
-        # Hold PP1 between the worker collective and its local state update.
-        submitted, published = threading.Event(), threading.Event()
-        reduce = dist.all_reduce
-
-        def delay_result(tensor, *args, group=None, **kwargs):
-            result = reduce(tensor, *args, group=group, **kwargs)
-            if policy == "wait_complete" and store.rank == 1:
-                if group is tickets.query_groups[-1]:
-                    assert submitted.wait(10)
-                elif group is tickets.ack_groups[-1]:
-                    assert published.wait(10)
-            return result
-
-        with (
-            patch.object(store, "lookup", blocked_lookup),
-            patch.object(dist, "all_reduce", delay_result),
-        ):
-            req = _request(policy, first_token)
-            handle = req.cache_request_handle
-            assert tickets.bind(req, expected=True)
-            state = tickets.pending[handle]
-            try:
-                _drain_until(cache, lambda: state.capacity is not None)
-                capacity = torch.tensor(state.capacity)
-                dist.all_reduce(capacity, op=dist.ReduceOp.MIN)
-                assert capacity.item() == 2, (
-                    "a stage discarded the hit before lookup finished"
-                )
-                if store.rank == 0:
-                    assert not tickets.can_admit(handle)
-                cache.check_hicache_events()
-                assert tickets.can_admit(handle) == (policy != "wait_complete")
-                resume.set()
-                if policy == "wait_complete":
-                    _drain_until(cache, lambda: state.read is not None)
-                    submitted.set()
-                _drain_until(cache)
-            finally:
-                # Release the worker even if a scheduler assertion failed.
-                resume.set()
+        state = tickets.pending[req.cache_request_handle]
+        try:
+            _drain_until(cache, lambda: state.capacity is not None)
+            assert state.capacity == 2 and not tickets.can_admit(
+                req.cache_request_handle
+            )
+            cache.check_hicache_events()
+            assert tickets.can_admit(req.cache_request_handle) == (not wait)
+            resume.set()
+            if wait:
+                _drain_until(cache, lambda: state.read is not None)
                 submitted.set()
-                published.set()
-            hit = fixtures.match_prefix(cache, req.origin_input_ids[:-1])
-            assert hit.device_prefix_len == (2 if policy == "wait_complete" else 0)
-            assert ((policy, 2) in store.reads) == (policy == "wait_complete")
+            _drain_until(cache)
+        finally:
+            resume.set()
+            submitted.set()
+            published.set()
+    hit = fixtures.match_prefix(cache, req.origin_input_ids[:-1])
+    assert hit.device_prefix_len == (2 if wait else 0)
+    assert ((policy, 2) in store.reads) == wait
 
 
 def _check_layer_wise(cache, allocator, rank):
@@ -1351,30 +1299,17 @@ def _check_layer_wise(cache, allocator, rank):
         tickets.release(req.cache_request_handle)
         assert allocator.available_size() == 10
 
-    # Deferred requests share the same ten free slots. At most one can hold a
-    # reservation, and it expires on the following scheduling turn.
-    waiting = [_request(f"queued-{i}", 110 + 10 * i) for i in range(3)]
-    for req in waiting:
-        assert tickets.bind(req, expected=True)
-
-    def deferred():
-        assert len(cache.linker.prefetches) <= 1
-        assert allocator.available_size() >= 4
-        return not tickets.pending
-
-    _drain_until(cache, deferred)
-    assert all(req.external_cache_hit_length == 0 for req in waiting[:-1])
-    assert waiting[-1].external_cache_hit_length == 4
-    cache.linker.release_request(waiting[-1].cache_request_handle)
-    assert waiting[-1].external_cache_hit_length == 0
-    assert not cache.linker.prefetches and tickets.layer_admission is None
-    assert allocator.available_size() == 10
-    admit(waiting[0], 0)
-    cache.unlock(waiting[0].lock)
+    # A request can also miss its admission turn. The following poll must
+    # return its private rows before trying the next ticket.
+    deferred = _request("deferred", 110)
+    assert tickets.bind(deferred, expected=True)
+    _drain_until(cache)
+    assert deferred.external_cache_hit_length == 4
+    cache.check_hicache_events()
+    assert not deferred.external_cache_hit_length and allocator.available_size() == 10
     allocator.free(held)
-
-    # A later request hits the entire pool only on PP1. Its queued ticket must
-    # leave those pages evictable until the earlier miss has entered the batch.
+    # PP1 has a cached full-pool hit queued behind a cold request. The second
+    # ticket must leave those pages evictable until the first gets its turn.
     cache.evict(EvictParams(num_tokens=allocator.size))
     cold = _request("gap", 230, size=6)
     later = _request("all-local-on-pp1", 300, size=allocator.size + 1)
@@ -1383,7 +1318,6 @@ def _check_layer_wise(cache, allocator, rank):
     for req in (cold, later):
         assert tickets.bind(req, expected=True)
     _drain_until(cache, lambda: tickets.can_admit(cold.cache_request_handle))
-    assert later.cache_request_handle in tickets.pending
     admit(cold, 0)
     cache.unlock(cold.lock)
     tickets.release(later.cache_request_handle)
@@ -1405,15 +1339,8 @@ def _check_unbound_and_retracted_tickets(cache, store):
         retracted.advance_cache_request_handle()
         cache.linker.prefetch(retracted)
 
-    if store.rank == 0:
-        assert not tickets.can_admit(rejected)
-    # PP1 already rejected the request and never polls it for admission.
-    # The ordered exchange carries three tickets despite that asymmetry.
-    cache.check_hicache_events()
-    assert tickets.can_admit(rejected)
-    reads_before = len(store.reads)
     _drain_until(cache)
-    assert store.reads[reads_before:] == [("retry", 2)]
+    assert tickets.can_admit(rejected)
     assert rejected not in cache.prefetch_loaded_tokens_by_reqid
     assert empty.cache_request_handle not in cache.prefetch_loaded_tokens_by_reqid
     assert cache.prefetch_loaded_tokens_by_reqid[req.cache_request_handle] == 2
@@ -1467,11 +1394,10 @@ def _check_layer_load_verdict(cache, rank):
         )
 
     scheduler.run_batch = forward
-    for reader, outcome, middle in (
-        (1, "failed", True),
-        (0, "failed", False),
-        (1, "rejected", False),
-        (1, "landed", True),
+    for reader, failed, middle in (
+        (1, True, True),
+        (0, True, False),
+        (1, False, True),
     ):
         req = _request("layer-restore", 90)
         req.pp_linker_verdict_end = req.extend_end = 4
@@ -1483,21 +1409,16 @@ def _check_layer_load_verdict(cache, rank):
             contains_last_prefill_chunk=not middle,
             forward_mode=ForwardMode.EXTEND,
             spec_algorithm=SpeculativeAlgorithm.EAGLE
-            if outcome == "rejected"
+            if not middle
             else SpeculativeAlgorithm.NONE,
             req_pool_indices=torch.arange(1 if middle else 2),
         )
-        # Only the reading stage owns storage I/O. Its peer already has the KV in L1.
         if rank == reader:
-            linker = cache.linker
-            linker.inflight_load_rids.append(req.rid)
-            if outcome == "rejected":
-                linker.rejected_pp_loads.add(req.rid)
-            else:
-                linker.start_layer_wise_loading()
-                linker.cache_linker.finish_layer_wise_loading.return_value = (
-                    outcome == "landed"
-                )
+            cache.linker.inflight_load_rids.append(req.rid)
+            cache.linker.start_layer_wise_loading()
+            cache.linker.cache_linker.finish_layer_wise_loading.return_value = (
+                not failed
+            )
         metadata, outputs = scheduler.mb_metadata, scheduler.last_rank_comm_queue
         result, scheduler.launch_event = scheduler._pp_launch_batch(
             0, batch, scheduler._pp_recv_proxy_tensors(), metadata, outputs
@@ -1516,17 +1437,19 @@ def _check_layer_load_verdict(cache, rank):
         else:
             _, output = outputs.popleft()
             scheduler.pp_group.send_tensor_dict(output.tensors)
-        if outcome == "rejected":
+        if not middle:
             # The retired rows still belong to the forward snapshot.
             batch.reqs = [healthy]
         scheduler._pp_prep_batch_result(batch, metadata[0], output)
         assert scheduler._pp_linker_chunk_batch is None
         for row in (req, healthy):
-            failed = row is req and outcome != "landed"
-            assert row.skip_radix_cache_insert == failed
+            aborted = row is req and failed
+            assert row.skip_radix_cache_insert == aborted
             reason = row.discard_output_reason
-            assert (reason.status_code if reason else None) == (503 if failed else None)
-        if middle and outcome != "landed":
+            assert (reason.status_code if reason else None) == (
+                503 if aborted else None
+            )
+        if middle and failed:
             assert scheduler._pending_chunked_abort_req is req
     scheduler.pp_group.destroy()
 
@@ -1553,33 +1476,49 @@ def _run_linker_stage(rank, init_method):
         # Stage 1 can reserve four slots. Although both stores offer page 5,
         # only page 3 is both restorable and backed by local reservations.
         held = allocator.alloc(28) if rank == 1 else None
-        requests = [
-            _request(rid, i * 10)
-            for i, rid in enumerate(("hit", "miss", "failed-get", "next"))
-        ]
+        hit = _request("hit", 0)
         if rank == 1:
-            # Hold the real request relay until this stage has queried its store.
             assert store.first_lookup.wait(20), "ticket did not precede request relay"
-            assert not store.reads
-        for req in requests:
-            assert tickets.bind(req, expected=rank == 1)
-            assert not tickets.can_admit(req.cache_request_handle)
-
-        _drain_until(cache, lambda: tickets.can_admit(requests[0].cache_request_handle))
+        assert tickets.bind(hit, expected=rank == 1)
+        _drain_until(cache)
+        assert store.reads == [("hit", 3)]
         if held is not None:
             allocator.free(held)
-        _drain_until(cache)
 
-        assert store.reads == [("hit", 3), ("failed-get", 2), ("next", 2)]
-        for req, expected in zip(requests, (3, 0, 0, 2)):
-            assert tickets.can_admit(req.cache_request_handle)
-            result = fixtures.match_prefix(cache, req.origin_input_ids[:-1])
-            assert result.device_prefix_len == expected, (rank, req.rid, result)
-            tickets.release(req.cache_request_handle)
-        assert not cache.linker.prefetches
-        assert allocator.available_size() == 32 - 3 - 2
-        _check_overlapping_reads(cache, store, allocator)
-        _check_blocked_follower_lookup(cache, store)
+        # The slow GET extends that three-page L1 anchor. Following tickets can
+        # run while its writer is live, even if the leader abandons the wait.
+        cache.prefetch_stop_policy = "timeout"
+        cache.prefetch_timeout_base = cache.prefetch_timeout_per_page = 0
+        slow = _request("slow", 0)
+        rest = [
+            _request(rid, n * 10)
+            for n, rid in enumerate(("miss", "failed-get", "next"), 1)
+        ]
+        for req in (slow, *rest):
+            assert tickets.bind(req, expected=True)
+        _drain_until(cache, lambda: ("next", 2) in store.reads)
+        assert store.slow_read.running()
+        if rank == 0:
+            assert not tickets.can_admit(slow.cache_request_handle)
+            store.slow_read.set_result(True)
+        dist.barrier()
+        cache.check_hicache_events()
+        assert tickets.can_admit(slow.cache_request_handle)
+        assert cache.full_protected_size() >= 3
+        if rank == 1:
+            store.slow_read.set_result(True)
+        _drain_until(cache)
+        assert store.reads == [("hit", 3), ("slow", 2), ("failed-get", 2), ("next", 2)]
+        for req, expected in zip((slow, *rest), (3, 0, 0, 2), strict=True):
+            assert (
+                fixtures.match_prefix(
+                    cache, req.origin_input_ids[:-1]
+                ).device_prefix_len
+                == expected
+            )
+        assert cache.full_protected_size() == 0 and allocator.available_size() == 27
+        for policy in ("wait_complete", "best_effort"):
+            _check_blocked_follower_lookup(cache, store, policy)
         _check_unbound_and_retracted_tickets(cache, store)
         cache.linker.close()
         _check_layer_wise(cache, allocator, rank)

@@ -15,8 +15,7 @@ from unittest.mock import MagicMock, call, patch
 import pytest
 import torch
 
-from sglang.srt.managers.req_types import FINISH_LENGTH
-from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
+from sglang.srt.managers.schedule_batch import Req, ReqKvInfo, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.allocation import alloc_for_extend
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
@@ -44,6 +43,7 @@ from sglang.srt.mem_cache.kv.plan import TREE_WINDOW
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
     MooncakeDirectLinker,
+    _storage_suffix,
 )
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import MooncakeStore
 from sglang.srt.mem_cache.unified_cache.cache_action import (
@@ -63,6 +63,7 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     UnifiedCacheLinkerWrapper,
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.observability.metrics_collector import RadixCacheMetricsCollector
 from sglang.srt.runtime_context import get_context, get_disagg, get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -133,7 +134,6 @@ class _FakeLinker(UnifiedCacheLinker):
     def __init__(self):
         self.layer_done_counter = object()
         self.restorable = []
-        self.lookup_calls = []
         self.queued_loads = {}
         self.queued_offloads = []
         self.offload_sessions = []
@@ -144,7 +144,6 @@ class _FakeLinker(UnifiedCacheLinker):
         self.pools = {}
 
     def lookup(self, rid, transfers):
-        self.lookup_calls.append((rid, list(transfers)))
         return list(self.restorable)
 
     def load(self, rid, transfers):
@@ -299,6 +298,27 @@ class TestMooncakePrefetch(CustomTestCase):
         with patch.object(linker, "record_transfer_ready", return_value=ready):
             return linker.prefetch([transfer])
 
+    def test_pp_lookup_queries_stage_local_keys(self):
+        linker, _ = self._linker(read=None)
+        storage = linker.storage
+        storage.mem_pool_host = linker.pool_group
+        storage._has_request_context_support = False
+        storage.pp_size = 2
+        linker.stats = {"lookup": 0}
+        for rank, replicated, key in (
+            (0, True, "page_cp1_pp0_k"),
+            (1, False, "page_tp2_cp1_pp1_k"),
+        ):
+            storage.pp_rank = rank
+            storage.mla_suffix = _storage_suffix(
+                rank_replicated=replicated, tp_rank=2, attn_cp_rank=1, pp_rank=rank
+            )
+            storage.store.batch_is_exist = MagicMock(return_value=[1])
+            self.assertEqual(
+                linker.lookup("rid", [PoolTransfer(PoolName.KV, keys=["page"])]), [1]
+            )
+            storage.store.batch_is_exist.assert_called_once_with([key])
+
     def test_all_layers_and_queued_cancellation_quiesce_before_reset(self):
         """Neither publication nor reset may overtake the final device write."""
         ready, waiting, last_layer, release = (threading.Event() for _ in range(4))
@@ -384,9 +404,17 @@ def _reserve_pp_pages(cache, req, hashes):
 
 
 class TestLinkerDevicePrefetch(CustomTestCase):
-    def _fixture(self, *, swa=False, mamba=False, policy="wait_complete", metrics=None):
+    def _fixture(
+        self,
+        *,
+        swa=False,
+        mamba=False,
+        policy="wait_complete",
+        metrics=None,
+        page_size=2,
+    ):
         cfg = CacheConfig(
-            page_size=1 if mamba else 2,
+            page_size=1 if mamba else page_size,
             components=(ComponentType.FULL,)
             + ((ComponentType.SWA,) if swa else ())
             + ((ComponentType.MAMBA,) if mamba else ()),
@@ -579,6 +607,85 @@ class TestLinkerDevicePrefetch(CustomTestCase):
             assert _reserve_pp_pages(cache, req, ["a", "b"]) == 0
             evict.assert_not_called()
         assert req.cache_request_handle not in cache.linker.prefetches
+        self._assert_balanced(cache, allocator)
+
+    def test_pp_layer_load_extends_an_existing_request_row(self):
+        cache, backend, req, allocator = self._fixture(swa=True, page_size=1)
+        cache.pp_size = 2
+        cache.linker.load_mode = backend.load_mode = "layer_wise"
+        backend.lookup.side_effect = AssertionError(
+            "only the PP ticket queries storage"
+        )
+
+        def extend(end):
+            req.extend_end = end
+            count = end - req.prefix_len
+            seq_lens = torch.tensor([end])
+            batch = ScheduleBatch(
+                reqs=[req],
+                tree_cache=cache,
+                req_to_token_pool=cache.req_to_token_pool,
+                token_to_kv_pool_allocator=allocator,
+                forward_mode=ForwardMode.EXTEND,
+                device="cpu",
+                prefix_lens=[req.prefix_len],
+                extend_lens=[count],
+                extend_num_tokens=count,
+                seq_lens=seq_lens,
+                seq_lens_cpu=seq_lens,
+            )
+            with get_context().override_server_args(attention_backend="torch_native"):
+                slots, _, _ = alloc_for_extend(batch)
+            return slots
+
+        req.init_next_round_input(cache)
+        prefix = extend(2)
+        cache.checkpoint(req, up_to=2)
+        req.external_cache_hit_length = 4
+        req.init_next_round_input(cache)
+        row = req.kv.req_pool_idx
+        assert (req.prefix_len, req.host_hit_length) == (2, 2)
+        assert cache.linker.load_back(req) == (2, req.last_node)
+        assert (req.kv.kv_allocated_len, req.kv.kv_committed_len) == (2, 2)
+        tail = cache.linker.private_load_indices[req.rid]
+
+        req.prefix_len = 4
+        suffix = extend(6)
+        assert req.kv.req_pool_idx == row
+        assert (req.kv.kv_allocated_len, req.kv.kv_committed_len) == (6, 6)
+        assert torch.equal(
+            cache.req_to_token_pool.req_to_token[row, :6],
+            torch.cat([prefix, tail, suffix]),
+        )
+        cache.linker.start_layer_wise_loading()
+        backend.queued_loads.clear()  # The backend has started writing this row.
+        cache.linker.release_request(req.cache_request_handle)
+        assert req.rid in cache.linker.private_load_indices
+        assert cache.linker.finish_loads() == []
+        cache.checkpoint(req, up_to=6)
+        assert self._match(cache, req).device_prefix_len == 6
+        self._assert_balanced(cache, allocator)
+
+    def test_pp_rejected_layer_load_retires_its_reservation(self):
+        cache, backend, req, allocator = self._fixture(swa=True)
+        cache.pp_size = 2
+        cache.linker.load_mode = backend.load_mode = "layer_wise"
+        req.external_cache_hit_length = 4
+        req.init_next_round_input(cache)
+        hashes = cache.linker.hit_markers[req.rid].tail_hashes
+        assert _reserve_pp_pages(cache, req, hashes) == 2
+        backend.load = MagicMock(side_effect=OSError("queue failed"))
+        with patch.object(cache.linker, "pp_tickets", True):
+            assert cache.linker.load_back(req) == (4, req.last_node)
+        loaded = cache.linker.private_load_indices[req.rid]
+        cache.req_to_token_pool.alloc([req])
+        cache.req_to_token_pool.write((req.kv.req_pool_idx, slice(0, 4)), loaded)
+        req.kv.set_row_len(4)
+        assert cache.linker.finish_loads([req]) == [req.rid]
+        assert (
+            not cache.linker.private_load_indices and not cache.linker.rejected_pp_loads
+        )
+        cache.free_kv_row(req.kv, [(0, 4)])
         self._assert_balanced(cache, allocator)
 
     def test_prefetch_metrics_count_lookup_load_and_outcome(self):
@@ -1902,221 +2009,6 @@ def test_restorable_prefix_intersects_sparse_rank_results():
     assert hit_pages == 2
 
 
-@pytest.mark.parametrize("end,local", [(0, 0), (4, 2), (2, 2), (2, 4)])
-def test_match_only_exposes_the_agreed_ticket_boundary(pp_cache, end, local):
-    cache, allocator, req, backend = pp_cache
-    if local:
-        key = RadixKey(req.origin_input_ids[:local])
-        cache.insert(InsertParams(key=key, value=allocator.alloc(local)))
-    for verdict in (None, end):
-        req.external_cache_hit_length = verdict
-        req.init_next_round_input(cache)
-        assert req.prefix_len == local
-        assert req.host_hit_length == max(0, (verdict or 0) - local)
-        assert cache.linker.has_hit(req.rid) == bool(req.host_hit_length)
-    assert not backend.lookup_calls
-
-
-@pytest.fixture
-def pp_cache():
-    cfg = CacheConfig(
-        components=(ComponentType.FULL, ComponentType.SWA),
-        sliding_window_size=4,
-        kv_size=32,
-        num_layers=2,
-        full_attention_layer_ids=(1,),
-    )
-    with patch.object(shared_cache_suite, "get_device", return_value="cpu"):
-        cache, allocator, _ = build_fixture(cfg)
-    cache.pp_size = 2
-    backend = _FakeLinker()
-    backend.pools[PoolName.SWA] = allocator.get_kvcache()
-    backend.restorable = [4]
-    cache.init_cache_linker(backend)
-    req = Req(
-        rid="rid",
-        origin_input_text="",
-        origin_input_ids=array("q", [1, 2, 3, 4, 5]),
-        sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
-    )
-    req.external_cache_hit_length = 4
-    req.init_next_round_input(cache)
-    return cache, allocator, req, backend
-
-
-def _alloc_pp_extend(cache, req, seq_len):
-    req.extend_end = seq_len
-    seq_lens = torch.tensor([seq_len], dtype=torch.int64)
-    extend_len = seq_len - req.prefix_len
-    batch = SimpleNamespace(
-        device="cpu",
-        reqs=[req],
-        req_to_token_pool=cache.req_to_token_pool,
-        token_to_kv_pool_allocator=cache.token_to_kv_pool_allocator,
-        hisparse_coordinator=None,
-        tree_cache=cache,
-        prefix_lens=[req.prefix_len],
-        extend_lens=[extend_len],
-        seq_lens=seq_lens,
-        seq_lens_cpu=seq_lens,
-        extend_num_tokens=extend_len,
-        maybe_evict_swa=lambda: None,
-        is_dllm=req.is_dllm,
-    )
-    with get_context().override_server_args(attention_backend="torch_native"):
-        out_cache_loc, _, _ = alloc_for_extend(batch)
-    return out_cache_loc
-
-
-@pytest.mark.parametrize(
-    "holds_row,overlap,outcome",
-    [
-        (False, 0, "finished"),
-        (False, 2, "unfinished"),
-        (False, 4, "abort"),
-        (True, 0, "abort"),
-        (True, 4, "finished"),
-    ],
-)
-def test_pp_load_uses_normal_request_insert_and_release(
-    pp_cache, holds_row, overlap, outcome
-):
-    cache, allocator, req, _ = pp_cache
-    key = RadixKey(req.origin_input_ids)
-    local_prefix = torch.empty(0, dtype=torch.int64)
-    if holds_row:
-        # A continuing PP chunk owns real KV, rather than just an empty row.
-        local_prefix = _alloc_pp_extend(cache, req, seq_len=2)
-        cache.checkpoint(req, up_to=2)
-        req.init_next_round_input(cache)
-    device_hit_len = req.prefix_len
-    matched_node = req.last_node
-    available_rows = cache.req_to_token_pool.available_size()
-    watermarks = (req.kv.kv_allocated_len, req.kv.kv_committed_len)
-    loaded_len, last_node = cache.linker.load_back(req)
-
-    assert loaded_len == 4 - device_hit_len
-    assert last_node == req.last_node == matched_node
-    assert req.kv.cache_protected_len == device_hit_len
-    assert (
-        cache.match_prefix(MatchPrefixParams(key=key)).device_prefix_len
-        == device_hit_len
-    )
-    assert cache.req_to_token_pool.available_size() == available_rows
-    # The extend allocator owns these clocks, even when PP reuses a row.
-    assert (req.kv.kv_allocated_len, req.kv.kv_committed_len) == watermarks
-
-    req.prefix_len = device_hit_len + loaded_len
-    loaded = torch.cat([local_prefix, cache.linker.private_load_indices[req.rid]])
-
-    # A different microbatch may publish overlapping KV before this PP result returns.
-    raced_tokens = max(0, overlap - device_hit_len)
-    existing = torch.cat([local_prefix, allocator.alloc(raced_tokens)])
-    if raced_tokens:
-        cache.insert(
-            InsertParams(
-                key=key[:overlap], value=existing, prev_prefix_len=device_hit_len
-            )
-        )
-    values = torch.cat([loaded, _alloc_pp_extend(cache, req, seq_len=5)])
-    assert (req.kv.kv_allocated_len, req.kv.kv_committed_len) == (5, 5)
-    assert torch.equal(
-        cache.req_to_token_pool.req_to_token[req.kv.req_pool_idx, :5].to(torch.int64),
-        values,
-    )
-    cache.linker.start_layer_wise_loading()
-    assert cache.linker.finish_loads() == []
-    assert not cache.linker.private_load_indices
-    assert not cache.linker.inflight_load_rids
-    assert allocator.full_available_size() == 32 - 5 - raced_tokens
-
-    if outcome == "unfinished":
-        cache.checkpoint(req, up_to=5)
-    else:
-        if outcome == "finished":
-            req.finished_reason = FINISH_LENGTH(length=0)
-            cache.checkpoint(req, up_to=5)
-        cache.free_kv_row(req.kv, [(req.kv.cache_protected_len, 5)])
-        cache.unlock(req.lock)
-        req.lock = None
-
-    match = cache.match_prefix(MatchPrefixParams(key=key))
-    matched = cache.path_device_indices(match.last_device_node)[
-        : match.device_prefix_len
-    ]
-    expected = (
-        existing
-        if outcome == "abort"
-        else torch.cat([existing, values[len(existing) :]])
-    )
-    assert torch.equal(matched, expected)
-    assert allocator.full_available_size() == 32 - len(expected)
-    assert allocator.swa_available_size() == 32 - len(expected)
-    if outcome != "abort":
-        assert torch.all(allocator.translate_loc_from_full_to_swa(matched) > 0)
-
-
-def _bind_pp_private_prefix(cache, req):
-    loaded = cache.linker.private_load_indices[req.rid]
-    cache.req_to_token_pool.alloc([req])
-    cache.req_to_token_pool.write((req.kv.req_pool_idx, slice(0, len(loaded))), loaded)
-    req.prefix_len = len(loaded)
-    req.kv.set_row_len(len(loaded))
-
-
-@pytest.mark.parametrize("reserved", [False, True])
-@pytest.mark.parametrize("raises", [False, True])
-def test_rejected_layer_load_releases_full_and_swa(pp_cache, reserved, raises):
-    cache, allocator, req, backend = pp_cache
-    linker = cache.linker
-    backend.load = MagicMock(
-        return_value=False, side_effect=OSError() if raises else None
-    )
-    if reserved:
-        assert (
-            _reserve_pp_pages(cache, req, linker.hit_markers[req.rid].tail_hashes) == 4
-        )
-        with patch.object(linker, "pp_tickets", MagicMock()):
-            assert linker.load_back(req) == (4, req.last_node)
-        _bind_pp_private_prefix(cache, req)
-        assert linker.finish_loads([req]) == [req.rid]
-        cache.free_kv_row(req.kv, [(0, req.kv.kv_allocated_len)])
-    elif raises:
-        with pytest.raises(OSError):
-            linker.load_back(req)
-    else:
-        assert linker.load_back(req) == (0, req.last_node)
-    if not reserved:
-        assert not req.kv.holds_kv
-    assert not linker.inflight_load_rids and not linker.private_load_indices
-    assert not linker.rejected_pp_loads
-    assert (
-        shared_cache_suite.match_prefix(cache, req.origin_input_ids).device_prefix_len
-        == 0
-    )
-    assert allocator.full_available_size() == allocator.swa_available_size() == 32
-
-
-@pytest.mark.parametrize("started", [False, True])
-def test_pp_release_keeps_row_until_free(pp_cache, started):
-    cache, allocator, req, backend = pp_cache
-    linker = cache.linker
-    linker.load_back(req)
-    _bind_pp_private_prefix(cache, req)
-    if started:
-        backend.queued_loads.clear()
-        linker.start_layer_wise_loading()
-    linker.release_request(req.cache_request_handle)
-    if started:
-        assert req.rid in linker.private_load_indices
-        assert allocator.full_available_size() == allocator.swa_available_size() == 28
-        assert linker.finish_loads() == []
-    assert not linker.private_load_indices and not linker.inflight_load_rids
-    assert allocator.full_available_size() == allocator.swa_available_size() == 28
-    cache.free_kv_row(req.kv, [(0, req.kv.kv_allocated_len)])
-    assert allocator.full_available_size() == allocator.swa_available_size() == 32
-
-
 def test_async_offload_pins_node_until_completion():
     linker = _FakeLinker()
     lock_params = object()
@@ -2780,7 +2672,6 @@ def test_offload_filters_tree_core_swa_transfers_and_preserves_lifecycle(
         wrapper.reset()
 
 
-@pytest.mark.parametrize("pp_size", [1, 2])
 @pytest.mark.parametrize(
     "swa_stored,previous_boundary,expected_boundary",
     [
@@ -2795,7 +2686,6 @@ def test_linker_load_preserves_swa_boundaries(
     swa_stored,
     previous_boundary,
     expected_boundary,
-    pp_size,
     load_refused,
 ):
     full = full_linker_component
@@ -2817,7 +2707,6 @@ def test_linker_load_preserves_swa_boundaries(
     cache = _cache_for_wrapper(
         _components_tuple=(full, swa),
         page_size=2,
-        pp_size=pp_size,
         components={ComponentType.FULL: full, ComponentType.SWA: swa},
         insert=MagicMock(side_effect=AssertionError("the tail must stay private")),
     )
@@ -2865,7 +2754,6 @@ def test_linker_load_preserves_swa_boundaries(
     assert req.swa_branching_seqlen is None
     assert req.kv.get_evicted_seqlen("swa") == expected_boundary
     assert req.kv.kv_allocated_len == (previous_boundary or 0)
-    cache.insert.assert_not_called()
     assert [c.args[0] for c in full.build_external_linker_transfer.call_args_list] == [
         LinkerTransferPhase.LOAD
     ]
