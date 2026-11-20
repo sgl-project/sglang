@@ -339,9 +339,20 @@ def prepare_cm_data(namespace, pod_string, run_id=None):
 
 
 def monitor_pod_logs(
-    kube_job_type, kube_job_prefix_name, namespace, timeout=LOCAL_TIMEOUT
+    kube_job_type,
+    kube_job_prefix_name,
+    namespace,
+    timeout=LOCAL_TIMEOUT,
+    streamed_metrics=None,
+    streamed_labels=None,
 ):
-    """Monitor the logs of the specified pod until the special pattern is matched or reaches its timeout."""
+    """Monitor the logs of the specified pod until the special pattern is matched or reaches its timeout.
+
+    ``streamed_metrics`` and ``streamed_labels`` are updated in place while the
+    log streams. Callers pass their own dicts so the metrics survive the
+    "test result was FAILED" exception raised below and can still be written to
+    metrics.json by the caller's finally block.
+    """
     monitor_pod_name = {
         KUBE_JOB_SINGLE: f"{kube_job_prefix_name}-pod-0",
         KUBE_JOB_MULTI_PD_MIX: f"{kube_job_prefix_name}-sglang-node-0",
@@ -365,8 +376,10 @@ def monitor_pod_logs(
     # [METRIC] lines are printed by dump_metric while the test runs, i.e. before
     # the pod-side log is archived. Collect them from the stream so results do
     # not depend on the pod winning the race against delete_pod() below.
-    streamed_metrics = {}
-    streamed_labels = {}
+    if streamed_metrics is None:
+        streamed_metrics = {}
+    if streamed_labels is None:
+        streamed_labels = {}
     metric_pattern = re.compile(r"^\[METRIC\] (\S+)=(\S+)(?: labels=(.*))?$")
 
     process = None
@@ -816,8 +829,13 @@ def run_npu_e2e_test_case(
         streamed_metrics = {}
         streamed_labels = {}
         try:
-            streamed_metrics, streamed_labels = monitor_pod_logs(
-                kube_job_type, final_kube_job_name, kube_name_space, LOCAL_TIMEOUT
+            monitor_pod_logs(
+                kube_job_type,
+                final_kube_job_name,
+                kube_name_space,
+                LOCAL_TIMEOUT,
+                streamed_metrics,
+                streamed_labels,
             )
             monitor_success = True
         except Exception:
