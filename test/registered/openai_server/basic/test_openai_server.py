@@ -1004,6 +1004,9 @@ class TestOpenAICompletionWithRust(CustomTestCase):
 class TestOpenAIChatWithRust(TestOpenAICompletionWithRust):
     """Run the existing Chat matrix unchanged through the Rust frontend."""
 
+    # Own slot: a failed setUpClass must not tear down the parent class's reaped server.
+    process = None
+
     run_chat_completion = TestOpenAIServer.run_chat_completion
     run_chat_completion_stream = TestOpenAIServer.run_chat_completion_stream
     test_chat_completion = TestOpenAIServer.test_chat_completion
