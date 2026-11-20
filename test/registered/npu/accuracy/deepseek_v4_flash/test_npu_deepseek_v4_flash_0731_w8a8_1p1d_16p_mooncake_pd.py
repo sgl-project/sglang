@@ -75,13 +75,16 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_DECODE_ENVS = {
 }
 
 # Prefill node launch arguments.
+# TP 16 without PP: the Mooncake transfer backend validates the prefill/decode
+# KV entry layout positionally, and the NPU DSV4 pool publishes several entries
+# per layer, so a PP-sliced prefill list no longer lines up with the decode
+# one (KVTransferError: PD KV layout mismatch). The decode node is TP 16 too,
+# so 16 TP ranks keep the same device count.
 DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
     "--page-size",
     128,
     "--tp-size",
-    8,
-    "--pp-size",
-    2,
+    16,
     "--trust-remote-code",
     "--device",
     "npu",
@@ -104,7 +107,7 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
     "--chunked-prefill-size",
     131072,
     "--attn-dp-size",
-    4,
+    8,
     "--tokenizer-worker-num",
     16,
     "--moe-a2a-backend",
