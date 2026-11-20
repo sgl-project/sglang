@@ -158,12 +158,29 @@ class _RemoteMapping:
             self.handle = None
 
 
-class EgmRemoteTensorAllocator(HostTensorAllocator):
-    """Back each rank's L2 with an allocation owned by its TP peer.
+def _remote_peers(localities):
+    """Select a bijection in which each rank uses a different host NUMA domain."""
+    world = len(localities)
+    if world < 2:
+        raise ValueError("remote EGM requires at least two TP ranks")
+    # Group equal domains, then rotate by half to assign each allocation once.
+    ranks = sorted(range(world), key=lambda rank: (localities[rank], rank))
+    shift = world // 2
+    peers = [0] * world
+    for position, rank in enumerate(ranks):
+        peer = ranks[(position + shift) % world]
+        if localities[rank] == localities[peer]:
+            raise ValueError("remote EGM requires distinct hosts or host NUMA nodes")
+        peers[rank] = peer
+    return peers
 
-    The two ranks exchange one allocation per pool in construction order. Each
+
+class EgmRemoteTensorAllocator(HostTensorAllocator):
+    """Back each rank's L2 with an allocation owned by a TP peer.
+
+    The ranks exchange one allocation per pool in construction order. Each
     rank alone manages the page indices of its imported pool. The owner keeps
-    its physical allocation alive until both ranks have stopped and unmapped.
+    its physical allocation alive until all ranks have stopped and unmapped.
     """
 
     @classmethod
@@ -198,8 +215,9 @@ class EgmRemoteTensorAllocator(HostTensorAllocator):
         from sglang.srt.distributed.parallel_state import get_tp_group
 
         group = get_tp_group()
-        if group.world_size != 2:
-            raise ValueError("remote EGM HiCache currently requires TP=2")
+        self.world_size = group.world_size
+        if self.world_size < 2:
+            raise ValueError("remote EGM HiCache requires at least two TP ranks")
         self.group = group.cpu_group
         self.rank = group.rank_in_group
         self.device_id = torch.cuda.current_device()
@@ -222,18 +240,17 @@ class EgmRemoteTensorAllocator(HostTensorAllocator):
         localities = self._exchange((locality, error))
         if any(item[1] is not None for item in localities):
             raise RuntimeError(f"remote EGM capability check failed: {localities}")
-        if localities[0][0] == localities[1][0]:
-            raise ValueError("remote EGM requires distinct hosts or host NUMA nodes")
+        self.peer_rank = _remote_peers([item[0] for item in localities])[self.rank]
 
     def _exchange(self, value):
         import torch.distributed as dist
 
-        values = [None, None]
+        values = [None] * self.world_size
         dist.all_gather_object(values, value, group=self.group)
         return values
 
     def preflight(self, lengths, device, *, supported=True):
-        """Make allocation budget and device failures visible to both ranks."""
+        """Make allocation budget and device failures visible to all ranks."""
         from sglang.srt.mem_cache.pool_host.base import host_memory_preflight
 
         result = None
@@ -268,7 +285,7 @@ class EgmRemoteTensorAllocator(HostTensorAllocator):
         metadata = (tuple(dims), str(dtype), device, self._preflight_complete)
         metadata_all = self._exchange(metadata)
         if (
-            metadata_all[0] != metadata_all[1]
+            any(item != metadata_all[0] for item in metadata_all)
             or device != "cpu"
             or len(dims) != 5
             or dims[0] != 2
@@ -310,7 +327,7 @@ class EgmRemoteTensorAllocator(HostTensorAllocator):
         tensor = None
         peer_size = 0
         try:
-            peer_handle, peer_size = descriptors[1 - self.rank][0]
+            peer_handle, peer_size = descriptors[self.peer_rank][0]
             if not isinstance(peer_handle, bytes) or len(peer_handle) != 64:
                 raise ValueError("invalid remote EGM FABRIC handle")
             if not isinstance(peer_size, int) or peer_size < nbytes:
@@ -371,7 +388,7 @@ class EgmRemoteTensorAllocator(HostTensorAllocator):
                 f"remote EGM import failed: {errors}; rollback: {cleanup_errors}; "
                 f"owner release: {release_errors}"
             )
-        logger.info("Mapped remote EGM host pool from TP rank %d", 1 - self.rank)
+        logger.info("Mapped remote EGM host pool from TP rank %d", self.peer_rank)
         return tensor
 
     def close(self):

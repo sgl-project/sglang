@@ -18,11 +18,12 @@ L1 and L2 are private to a single inference instance; only L3 can be shared acro
 ### Remote EGM-backed host pool on NVIDIA Grace
 
 On an EGM-capable Grace GPU system, set `SGLANG_HICACHE_EGM=1` and use
-`--tp 2 --hicache-mem-layout layer_first --hicache-io-backend kernel` with
-HiCache enabled. Each TP rank keeps its own logical L2 pages in the other
-rank's Grace memory and accesses them through a CUDA FABRIC mapping. Select
-GPUs attached to different host NUMA nodes when running on one machine; a
-multi-node deployment requires both workers in the same IMEX fabric domain.
+`--hicache-mem-layout layer_first --hicache-io-backend kernel` with HiCache
+enabled. Each TP rank keeps its own logical L2 pages in a TP peer's Grace
+memory and accesses them through a CUDA FABRIC mapping. The TP group must have
+at least two ranks and a one-to-one assignment that places each rank's pool
+in a different host NUMA domain from its GPU. A multi-node deployment requires
+all workers in the same IMEX fabric domain.
 Workers identify their host by Linux kernel boot ID, which must be readable from
 `/proc/sys/kernel/random/boot_id`.
 The current path supports matching full-attention MHA pools without an L3

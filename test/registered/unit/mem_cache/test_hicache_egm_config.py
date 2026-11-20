@@ -15,6 +15,33 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestEgmConfiguration(CustomTestCase):
+    def test_remote_peers_cover_each_owner_once(self):
+        for localities in (
+            [("host-a", 0), ("host-a", 1)],
+            [("host-a", 0), ("host-a", 0), ("host-b", 0), ("host-b", 0)],
+            [("host-a", 0), ("host-b", 0), ("host-c", 0)],
+            [("host-b", 1), ("host-a", 0), ("host-b", 0), ("host-a", 1)],
+        ):
+            with self.subTest(localities=localities):
+                peers = egm._remote_peers(localities)
+                self.assertEqual(sorted(peers), list(range(len(localities))))
+                for rank, peer in enumerate(peers):
+                    self.assertNotEqual(localities[rank], localities[peer])
+                if len({host for host, _ in localities}) == 2 and all(
+                    sum(host == h for h, _ in localities) == len(localities) // 2
+                    for host, _ in localities
+                ):
+                    for rank, peer in enumerate(peers):
+                        self.assertNotEqual(localities[rank][0], localities[peer][0])
+
+        for localities in (
+            [("host-a", 0)],
+            [("host-a", 0), ("host-a", 0)],
+            [("host-a", 0), ("host-a", 0), ("host-a", 0), ("host-b", 0)],
+        ):
+            with self.subTest(localities=localities), self.assertRaises(ValueError):
+                egm._remote_peers(localities)
+
     def test_locality_uses_kernel_identity_across_containers(self):
         group = SimpleNamespace(world_size=2, rank_in_group=0, cpu_group=object())
         with (

@@ -1,4 +1,4 @@
-"""Exercise a remote EGM host hit on a TP2 server with a 1024-token KV pool.
+"""Exercise a remote EGM host hit on a TP server with a 1024-token KV pool.
 
 Start a server with HiCache EGM enabled, layer_first/kernel I/O, a 1.2 host
 ratio, a 1024-token device pool and tokenizer initialization disabled. Pass
@@ -16,12 +16,14 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", default="http://127.0.0.1:34192")
     parser.add_argument("--server-log", required=True)
+    parser.add_argument("--tp-size", type=int, default=2)
     args = parser.parse_args()
     log = Path(args.server_log).read_text()
     if not all(
-        f"Mapped remote EGM host pool from TP rank {rank}" in log for rank in (0, 1)
+        f"Mapped remote EGM host pool from TP rank {rank}" in log
+        for rank in range(args.tp_size)
     ):
-        raise RuntimeError("server log has no two-rank remote EGM mappings")
+        raise RuntimeError("server log does not show mappings from every TP rank")
     requests.post(f"{args.url}/flush_cache", timeout=30).raise_for_status()
 
     def generate(ids):

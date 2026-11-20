@@ -1,6 +1,7 @@
-"""TP2 HiCache L2 backed by the other rank's Grace host memory."""
+"""HiCache L2 backed by Grace host memory in another NUMA domain."""
 
 import ctypes
+import itertools
 import socket
 import threading
 import unittest
@@ -17,7 +18,7 @@ import torch.multiprocessing as mp
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=220, stage="base-c", runner_config="4-gpu-gb300")
+register_cuda_ci(est_time=300, stage="base-c", runner_config="4-gpu-gb300")
 
 
 def _worker(rank, port, scenario, devices):
@@ -26,7 +27,7 @@ def _worker(rank, port, scenario, devices):
         "gloo",
         init_method=f"tcp://127.0.0.1:{port}",
         rank=rank,
-        world_size=2,
+        world_size=len(devices),
         timeout=timedelta(seconds=60),
     )
     try:
@@ -43,7 +44,7 @@ def _worker(rank, port, scenario, devices):
         from sglang.test.kits.unified_radix_cache.fixtures import build_fixture
 
         group = SimpleNamespace(
-            world_size=2, rank_in_group=rank, cpu_group=dist.group.WORLD
+            world_size=len(devices), rank_in_group=rank, cpu_group=dist.group.WORLD
         )
         with patch(
             "sglang.srt.distributed.parallel_state.get_tp_group", return_value=group
@@ -86,7 +87,12 @@ def _worker(rank, port, scenario, devices):
                 else:
                     raise AssertionError("expected synchronized pool preflight failure")
                 return
-            if scenario not in ("transfer", "transfer_page16", "controller"):
+            if scenario not in (
+                "transfer",
+                "transfer_page16",
+                "transfer_4",
+                "controller",
+            ):
                 pool = egm.EgmRemoteTensorAllocator()
                 if scenario == "preflight":
                     target = f"cuda:{devices[1]}"
@@ -99,9 +105,10 @@ def _worker(rank, port, scenario, devices):
                     pool.close()
                     return
                 pool.preflight([2 * 2 * 33 * 2 * 64 * 2], f"cuda:{devices[rank]}")
-                if scenario == "shape":
+                if scenario in ("shape", "shape_4"):
                     try:
-                        pool.allocate((2, 2, 33 + rank, 2, 64), torch.float16, "cpu")
+                        delta = (rank == 3) if scenario == "shape_4" else rank
+                        pool.allocate((2, 2, 33 + delta, 2, 64), torch.float16, "cpu")
                     except ValueError as exc:
                         assert "matching layer_first MHA" in str(exc)
                     else:
@@ -190,7 +197,7 @@ def _worker(rank, port, scenario, devices):
                     assert owner.handle is None and owner.address is None
                     assert not pool._regions
                     return
-                if scenario in ("import", "descriptor"):
+                if scenario in ("import", "import_4", "descriptor"):
                     from cuda.bindings import driver as drv
 
                     original = egm.EgmAllocation
@@ -212,7 +219,7 @@ def _worker(rank, port, scenario, devices):
                             "cuMemImportFromShareableHandle",
                             return_value=(drv.CUresult.CUDA_ERROR_INVALID_HANDLE,),
                         )
-                        if rank == 0 and scenario == "import"
+                        if rank == 0 and scenario in ("import", "import_4")
                         else nullcontext()
                     )
                     with (
@@ -303,8 +310,10 @@ def _worker(rank, port, scenario, devices):
             k.copy_(((values + rank * 71 + layer * 17) % 503).to(k.dtype))
             v.copy_(((values * 3 + rank * 83 + layer * 23) % 503).to(v.dtype))
             expected.append((k[src].cpu().tolist(), v[src].cpu().tolist()))
-        peers = [None, None]
-        dist.all_gather_object(peers, (slots.tolist(), expected))
+        peers = [None] * len(devices)
+        dist.all_gather_object(
+            peers, (slots.tolist(), expected, host.allocator.peer_rank)
+        )
         cache.insert(InsertParams(key=key, value=src))
         node = cache.match_prefix(MatchPrefixParams(key=key)).last_device_node
         cache.tree_core.set_hicache_enabled()
@@ -326,7 +335,8 @@ def _worker(rank, port, scenario, devices):
         physical = torch.frombuffer(raw, dtype=host.kv_buffer.dtype).reshape(
             host.kv_buffer.shape
         )
-        peer_slots, peer_expected = peers[1 - rank]
+        consumer = next(i for i, item in enumerate(peers) if item[2] == rank)
+        peer_slots, peer_expected, _ = peers[consumer]
         for layer in range(2):
             for kind in range(2):
                 want = torch.tensor(peer_expected[layer][kind], dtype=physical.dtype)
@@ -415,7 +425,10 @@ def _worker(rank, port, scenario, devices):
 
 class TestRemoteEgmHiCache(CustomTestCase):
     def test_two_rank_transfer_and_failures(self):
-        from sglang.srt.mem_cache.pool_host.egm import _allocation_properties
+        from sglang.srt.mem_cache.pool_host.egm import (
+            _allocation_properties,
+            _remote_peers,
+        )
 
         devices = None
         for first in range(torch.cuda.device_count()):
@@ -431,18 +444,31 @@ class TestRemoteEgmHiCache(CustomTestCase):
         self.assertIsNotNone(
             devices, "EGM test requires GPUs on distinct Grace NUMA nodes"
         )
+        four_devices = None
+        for candidate in itertools.combinations(range(torch.cuda.device_count()), 4):
+            localities = [("host", _allocation_properties(i)[1]) for i in candidate]
+            try:
+                _remote_peers(localities)
+            except ValueError:
+                continue
+            four_devices = candidate
+            break
+        self.assertIsNotNone(four_devices, "EGM test requires four placeable GPUs")
         for scenario in (
             "transfer",
             "transfer_page16",
+            "transfer_4",
             "controller",
             "same_numa",
             "pool_preflight",
             "preflight",
             "shape",
+            "shape_4",
             "allocation",
             "allocation_rollback_retry",
             "rollback_retry",
             "import",
+            "import_4",
             "descriptor",
             "drain",
             "unmap",
@@ -451,7 +477,17 @@ class TestRemoteEgmHiCache(CustomTestCase):
                 with socket.socket() as s:
                     s.bind(("127.0.0.1", 0))
                     port = s.getsockname()[1]
-                mp.spawn(_worker, args=(port, scenario, devices), nprocs=2, join=True)
+                selected = (
+                    four_devices
+                    if scenario in ("transfer_4", "import_4", "shape_4")
+                    else devices
+                )
+                mp.spawn(
+                    _worker,
+                    args=(port, scenario, selected),
+                    nprocs=len(selected),
+                    join=True,
+                )
 
     def test_runtime_storage_attach_rejects_remote_egm(self):
         from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
