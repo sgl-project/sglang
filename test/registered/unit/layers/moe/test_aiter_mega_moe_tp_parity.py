@@ -24,7 +24,7 @@ from sglang.test.quant_ref_utils import break_fp4_bytes
 from sglang.test.test_utils import run_distributed_test
 
 # gfx950 only; the test uses 2 of the lane's 8 GPUs.
-register_amd_ci(est_time=90, stage="stage-c", runner_config="large-8-gpu-amd-mi35x")
+register_amd_ci(est_time=90, stage="base-c", runner_config="large-8-gpu-amd-mi35x")
 
 HIDDEN = 512
 INTER = 256  # per rank
