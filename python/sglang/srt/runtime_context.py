@@ -677,6 +677,8 @@ class Resources(_FlagGroupBase):
     tcp_store: Any = None
     # Trace verbosity; the accessor seeds it lazily from SGLANG_TRACE_LEVEL.
     trace_level: Any = None
+    # Attention-TP2 symmetric-memory push comm (sglang.srt.layers.attn_tp_push_comm).
+    attn_tp_push_comm: Any = None
 
 
 class LoRABatchLayout(Enum):

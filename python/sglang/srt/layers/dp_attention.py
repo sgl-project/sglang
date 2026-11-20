@@ -25,6 +25,10 @@ from sglang.srt.elastic_ep.topology import (
     physical_ep_rank_to_dp_rank,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.attn_tp_push_comm import (
+    push_all_gather_into_tensor,
+    push_reduce_scatter_tensor,
+)
 from sglang.srt.runtime_context import (
     derive_attention_ranks,
     derive_attn_tp_size,
@@ -734,9 +738,7 @@ def _dp_gather_via_all_gather(
     scattered_local_tokens = local_tokens.tensor_split(get_parallel().attn_tp_size)[
         get_parallel().attn_tp_rank
     ]
-    get_parallel().attn_tp_group.reduce_scatter_tensor(
-        scattered_local_tokens, local_tokens
-    )
+    attn_tp_reduce_scatter_tensor(scattered_local_tokens, local_tokens)
     if use_world:
         all_gather_single(
             global_tokens,
@@ -1153,9 +1155,7 @@ def dp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
                 )
             parallel.attn_cp_group.all_gather_into_tensor(output, cp_local_tokens)
         else:
-            parallel.attn_tp_group.all_gather_into_tensor(
-                output, scattered_local_tokens
-            )
+            attn_tp_all_gather_into_tensor(output, scattered_local_tokens)
 
 
 # ---------------------------------------------------------------------------
@@ -1255,6 +1255,8 @@ def dp_reduce_scatterv_async(
 
 
 def attn_tp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
+    if push_reduce_scatter_tensor(output, input):
+        return output
     return get_parallel().attn_tp_group.reduce_scatter_tensor(output, input)
 
 
@@ -1267,6 +1269,8 @@ def attn_tp_all_reduce(input: torch.Tensor):
 
 
 def attn_tp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
+    if push_all_gather_into_tensor(output, input):
+        return output
     return get_parallel().attn_tp_group.all_gather_into_tensor(output, input)
 
 
