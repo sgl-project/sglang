@@ -260,12 +260,11 @@ pub(crate) fn wrap_error_body(body: &[u8], status: u16) -> Vec<u8> {
     let message = field("message")
         .and_then(Value::as_str)
         .map_or_else(|| String::from_utf8_lossy(body).into_owned(), str::to_owned);
-    let typ = field("type")
-        .and_then(Value::as_str)
-        .unwrap_or_else(|| openai_error_type(status));
     let error = json!({
         "message": scrub_message(&message, status),
-        "type": typ,
+        // The engine's own `/v1/responses` reports the OpenAI type, not the
+        // chat route's `BadRequestError`.
+        "type": openai_error_type(status),
         "param": field("param").cloned().unwrap_or(Value::Null),
         "code": field("code").cloned().unwrap_or_else(|| status.into()),
     });
@@ -340,6 +339,7 @@ mod tests {
         let w: Value = serde_json::from_slice(&wrap_error_body(flat, 400)).unwrap();
         assert_eq!(w["error"]["message"], "bad schema");
         assert_eq!(w["error"]["code"], 400);
+        assert_eq!(w["error"]["type"], "invalid_request_error");
         let own = br#"{"error":{"message":"x"}}"#;
         assert_eq!(wrap_error_body(own, 503), own);
         // Non-JSON bodies are wrapped too; 5xx text never reaches the client.
