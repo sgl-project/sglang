@@ -680,7 +680,7 @@ pub struct UnifiedTreeCore<K: ChildKeyType> {
     /// Hit count at which a node earns a host write-through backup.
     pub(crate) write_through_threshold: i64,
     /// The per-path Mamba cap also counts host copies and frees the host
-    /// copies of the states it caps (decided at HiCache init).
+    /// copies of the states it caps (opt-in, decided at HiCache init).
     pub(crate) mamba_path_cap_counts_host: bool,
 
     /// Per-component monotonic sources for lock-segment UUIDs.
@@ -3917,7 +3917,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         self.write_through_threshold = value;
     }
 
-    /// Make the per-path Mamba cap count and free host copies; decided at HiCache init.
+    /// Make the per-path Mamba cap count and free host copies; opt-in, decided at HiCache init.
     pub fn set_mamba_path_cap_counts_host(&mut self, enabled: bool) {
         self.mamba_path_cap_counts_host = enabled;
     }
