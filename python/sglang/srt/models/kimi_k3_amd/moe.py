@@ -164,21 +164,16 @@ class KimiK3MoEHipMixin:
             and self.routed_expert_up_proj.weight.dtype == torch.bfloat16
         )
 
+    # Resolved on first use, not in _prepare_hip_paths: that runs on gfx95 only
+    # while the radix-4 router also covers gfx942.
     @cached_property
     def _route_sort_consumer(self) -> Optional[RouteSortConsumer]:
-        """The experts' runner's consumer for the MoE sort the radix-4 router
-        (SGLANG_K3_RADIX4_TOPK) can also write, or None when the runner always
-        sorts on its own; the runner decides per batch size. Resolved on first
-        use rather than in _prepare_hip_paths, which runs on gfx95 only while
-        the radix-4 router also covers gfx942."""
         if not (_is_hip and envs.SGLANG_K3_RADIX4_TOPK.get()):
             return None
         runner = self.experts.runner
         return None if runner is None else runner.route_sort_consumer()
 
     def _route_sort_scope(self) -> ContextManager[None]:
-        """Stages this layer's route-sort consumer around its forward; a no-op
-        when it has none."""
         consumer = self._route_sort_consumer
         if consumer is None:
             return contextlib.nullcontext()

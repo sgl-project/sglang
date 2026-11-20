@@ -556,8 +556,8 @@ __global__ __launch_bounds__(BLOCK) void route_radix4_kernel(__grid_constant__ c
     __syncthreads();
     if (tid == 0) {
       const int ticket = atomicAdd(tail_arrival, 1);
-      // Only the last tail_ctas arrivals wait, and only for CTAs that have already
-      // taken a ticket, so waiting cannot keep any CTA of the grid from running.
+      // Only the last tail_ctas arrivals wait, for the fewer than tail_ctas CTAs still to arrive, so the wait
+      // needs tail_ctas (<= 32) co-resident CTAs, far below any GPU partition (see kRadix4MaxTailCtas).
       if (ticket >= first_helper && ticket != M - 1)
         while (__hip_atomic_load(tail_arrival, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) < M)
           __builtin_amdgcn_s_sleep(1);
