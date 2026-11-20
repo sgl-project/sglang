@@ -2,6 +2,7 @@ import unittest
 
 import torch
 
+from sglang.kernels.ops.embeddings.awq_embedding import awq_embedding
 from sglang.srt.layers.quantization.awq import AWQConfig, AWQMarlinConfig
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -152,6 +153,45 @@ class TestAWQEmbedding(CustomTestCase):
                             quant_config=config_class.from_config(config),
                             prefix="model.embed_tokens",
                         )
+
+    @torch.inference_mode()
+    def test_lookup_across_hidden_tiles(self):
+        generator = torch.Generator(device="cuda").manual_seed(42)
+        vocab_size = 19
+        for hidden_size, group_size in ((4096, 128), (1280, 32)):
+            num_groups = hidden_size // group_size
+            weights = torch.randint(
+                16, (vocab_size, hidden_size), device="cuda", generator=generator
+            )
+            zeros = torch.randint(
+                16, (vocab_size, num_groups), device="cuda", generator=generator
+            )
+            scales = torch.rand(
+                (vocab_size, num_groups), device="cuda", generator=generator
+            ).half()
+            qweight = sum(weights[:, i::8].int() << (4 * i) for i in range(8))
+            qzeros = sum(zeros[:, i::8].int() << (4 * i) for i in range(8))
+            ids = torch.tensor([[0, 18, 3], [18, 2, 0]], device="cuda").T
+            reference = (
+                (
+                    weights[ids].unflatten(-1, (num_groups, group_size))
+                    - zeros[ids].unsqueeze(-1)
+                ).float()
+                * scales[ids].float().unsqueeze(-1)
+            ).flatten(-2)
+            for dtype in (torch.bfloat16, torch.float16):
+                with self.subTest(hidden_size=hidden_size, dtype=dtype):
+                    actual = awq_embedding(
+                        input_ids=ids.to(torch.int32),
+                        qweight=qweight,
+                        qzeros=qzeros,
+                        scales=scales,
+                        group_size=group_size,
+                        dtype=dtype,
+                    )
+                    torch.testing.assert_close(
+                        actual, reference.to(dtype), rtol=0, atol=0
+                    )
 
     @torch.inference_mode()
     def test_lookup_replays_with_new_tokens_in_cuda_graph(self):

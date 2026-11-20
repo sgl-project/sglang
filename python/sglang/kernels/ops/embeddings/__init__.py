@@ -5,6 +5,15 @@ from sglang.kernels.spec import CUDA_ONLY, KernelBackend, KernelSpec
 
 register_kernel(
     KernelSpec(
+        op="embeddings.awq_embedding",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.embeddings.awq_embedding:awq_embedding",
+        capabilities=CUDA_ONLY,
+    )
+)
+
+register_kernel(
+    KernelSpec(
         op="embeddings.vocab_parallel_embedding",
         backend=KernelBackend.TRITON,
         target=(

@@ -6,12 +6,16 @@ from typing import TYPE_CHECKING
 import torch
 from torch.nn import functional as F
 
+from sglang.kernels.ops.embeddings.awq_embedding import awq_embedding
 from sglang.srt.layers.parameter import ModelWeightParameter
+from sglang.srt.utils import is_cuda
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.awq.awq import AWQConfig, AWQMarlinConfig
 
 __all__ = ["AWQEmbeddingScheme"]
+
+_is_cuda = is_cuda()
 
 
 class AWQEmbeddingScheme:
@@ -80,6 +84,15 @@ class AWQEmbeddingScheme:
         )
 
     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
+        if _is_cuda and input_.is_cuda:
+            return awq_embedding(
+                input_ids=input_,
+                qweight=layer.qweight,
+                qzeros=layer.qzeros,
+                scales=layer.scales,
+                group_size=self.group_size,
+                dtype=self.params_dtype,
+            )
         packed = F.embedding(input_, layer.qweight)
         weight = ((packed.unsqueeze(-1) >> layer.shifts) & 15).flatten(-2)
         packed_zeros = F.embedding(input_, layer.qzeros)
