@@ -551,6 +551,7 @@ def test_high_quality_request_warns_when_bcg_suppresses_cache_dit():
             enable_cache_dit=None,
             cache_dit_params=None,
             enable_spectrum=False,
+            enable_teacache=False,
         )
     )
 
@@ -624,6 +625,7 @@ def test_lossless_quality_does_not_enable_h3_cache_dit():
             enable_cache_dit=None,
             cache_dit_params=None,
             enable_spectrum=False,
+            enable_teacache=False,
         )
     )
 
@@ -633,6 +635,42 @@ def test_lossless_quality_does_not_enable_h3_cache_dit():
         stage._maybe_enable_cache_dit(50, batch)
 
     assert stage._minimax_h3_quality == "lossless"
+    assert stage._minimax_h3_cache_mode is None
+    assert not stage._cache_dit_enabled
+
+
+@pytest.mark.parametrize("quality", ["exact", "lossless"])
+def test_teacache_rejects_non_approximate_quality(quality):
+    with pytest.raises(ValueError, match="requires quality='high'"):
+        MiniMaxH3SamplingParams(prompt="cat", quality=quality, enable_teacache=True)
+
+
+def test_teacache_rejects_explicit_cache_dit():
+    with pytest.raises(ValueError, match="cannot be combined with enable_cache_dit"):
+        MiniMaxH3SamplingParams(
+            prompt="cat", quality="high", enable_teacache=True, enable_cache_dit=True
+        )
+
+
+@pytest.mark.parametrize("enable_cache_dit", [None, False])
+def test_teacache_high_quality_does_not_mount_cache_dit(enable_cache_dit):
+    stage = MiniMaxH3DenoisingStage.__new__(MiniMaxH3DenoisingStage)
+    stage.server_args = SimpleNamespace(enable_breakable_cuda_graph=False)
+    stage._cache_dit_enabled = False
+    stage._minimax_h3_cache_mode = None
+    stage._minimax_h3_quality = "exact"
+    batch = SimpleNamespace(
+        sampling_params=MiniMaxH3SamplingParams(
+            prompt="cat",
+            quality="high",
+            enable_teacache=True,
+            enable_cache_dit=enable_cache_dit,
+        )
+    )
+
+    stage._maybe_enable_cache_dit(50, batch)
+
+    assert stage._minimax_h3_quality == "high"
     assert stage._minimax_h3_cache_mode is None
     assert not stage._cache_dit_enabled
 

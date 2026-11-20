@@ -136,6 +136,7 @@ def test_adaln_dispatch_matches_per_layer_reference_across_steps(
     model = MiniMaxH3DiTModel.__new__(MiniMaxH3DiTModel)
     nn.Module.__init__(model)
     model.arch = _ARCH
+    model.enable_teacache = False
     model.blocks = (
         nn.ModuleList([_SharedKwargsStack(blocks)])
         if stack == "shared_kwargs"

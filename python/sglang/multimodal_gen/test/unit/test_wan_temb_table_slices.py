@@ -148,6 +148,7 @@ class TestWanStepHostOverhead(unittest.TestCase):
         forward_batch = SimpleNamespace(
             enable_sequence_shard=False,
             enable_teacache=False,
+            teacache_params=None,
             enable_spectrum=False,
             extra={},
         )
