@@ -20,7 +20,7 @@ from sglang.test.nightly_utils import NightlyBenchmarkRunner
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, _parse_int_list_env
 
 # Register for AMD CI - Grok-2 benchmark (~25 min)
-register_amd_ci(est_time=1500, suite="nightly-perf-8-gpu-grok2", nightly=True)
+register_amd_ci(est_time=1500, suite="nightly-perf-test-8-gpu-amd-grok2", nightly=True)
 
 
 def generate_simple_markdown_report(results: List[BenchmarkResult]) -> str:

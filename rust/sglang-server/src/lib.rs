@@ -36,11 +36,13 @@ pub use message::config::{
     MmSpec, ModelConfig, RequestLogConfig, RustServerServerArgs, ServerArgs,
 };
 pub use message::multimodal::{MediaHints, MmItem};
-pub use message::request::{GenerateRequest, MediaAdmission, MmData, ProcessorFetch};
+pub use message::request::{
+    DispatchFinishTime, GenerateRequest, MediaAdmission, MmData, ProcessorFetch,
+};
 pub use message::sampling::SamplingParams;
 pub use message::types::TokenIds;
 pub use multi_modality::encoded::{
-    MRope, MmEncodedEntry, MmEncodedItem, MmMetaValue, MmModality, MmTokenIds,
+    MRope, MmEncodedEntry, MmEncodedItem, MmMetaValue, MmModality, MmTokenIds, feature_digest,
 };
 pub use multi_modality::payload::{ResolvedMediaWork, resolve_media_work};
 pub use multi_modality::worker::{MediaError, MmProcessOutput, MmProcessor, MmRequestInfo};

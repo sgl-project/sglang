@@ -535,6 +535,7 @@ mod tests {
 
     use super::*;
     use crate::message::buffers::find;
+    use crate::message::config::HiddenStatesMode;
     use crate::utils::shm::{shm_path, unique_name};
 
     /// An external-style processor: one image item with a caller-shaped
@@ -1243,7 +1244,7 @@ mod tests {
                 context_len: 8,
                 num_reserved_tokens: 0,
                 allow_auto_truncate,
-                enable_return_hidden_states: false,
+                return_hidden_states_mode: HiddenStatesMode::Null,
             });
             let (input_ids, _) =
                 process(&ctx, NO_REQUEST, (0..12).collect(), MmData::default()).unwrap();

@@ -184,6 +184,7 @@ class SchedulerLoadInquirer:
         decode_prealloc = decode_transfer = decode_retracted = 0
         decode_prealloc_ready = 0
         num_prealloc_ready_tokens = 0
+        decode_host_pool_blocked = decode_host_staged_landed = 0
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             mode_str = "prefill"
             prefill_bootstrap = len(lists[ListKind.PD_BOOTSTRAP])
@@ -193,13 +194,20 @@ class SchedulerLoadInquirer:
             decode_prealloc = len(lists[ListKind.PD_PREALLOC])
             decode_transfer = len(lists[ListKind.PD_RECEIVING])
             decode_retracted = len(lists[ListKind.PD_RETRACTED])
+            prealloc_queue = self.get_disagg_decode_prealloc_queue()
             ready_reqs = [
                 decode_req.req
-                for decode_req in self.get_disagg_decode_prealloc_queue().queue.items()
+                for decode_req in prealloc_queue.queue.items()
                 if decode_req.waiting_for_input
             ]
             decode_prealloc_ready = len(ready_reqs)
             num_prealloc_ready_tokens = sum(req.seqlen for req in ready_reqs)
+            decode_host_pool_blocked = int(
+                prealloc_queue.host_pool_blocked and decode_prealloc_ready > 0
+            )
+            decode_host_staged_landed = (
+                prealloc_queue.transfer_queue.num_host_staged_landed
+            )
         disaggregation = DisaggregationMetrics(
             mode=mode_str,
             prefill_bootstrap_queue_reqs=prefill_bootstrap,
@@ -209,6 +217,8 @@ class SchedulerLoadInquirer:
             decode_retracted_queue_reqs=decode_retracted,
             kv_transfer_speed_gb_s=stats.kv_transfer_speed_gb_s,
             kv_transfer_latency_ms=stats.kv_transfer_latency_ms,
+            decode_host_pool_blocked=decode_host_pool_blocked,
+            decode_host_staged_landed_reqs=decode_host_staged_landed,
         )
 
         queues = QueueMetrics(
