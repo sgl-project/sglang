@@ -39,6 +39,7 @@ from sglang.srt.layers.dcp.comm import (
     dcp_a2a_lse_reduce,
     dcp_push_combine_fits,
     dcp_push_combine_reduce,
+    init_dcp_ipc_a2a,
     init_dcp_push_combine,
     init_fi_a2a_workspace,
 )
@@ -62,6 +63,7 @@ __all__ = [
     "dcp_a2a_lse_reduce",
     "dcp_push_combine_fits",
     "dcp_push_combine_reduce",
+    "init_dcp_ipc_a2a",
     "init_dcp_push_combine",
     "init_fi_a2a_workspace",
     "all_gather_kv_cache_for_dcp",

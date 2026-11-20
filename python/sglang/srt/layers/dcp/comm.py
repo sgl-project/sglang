@@ -620,6 +620,30 @@ def dcp_push_combine_reduce(
     return pc.dcp_push_combine(n, v, lse, is_lse_base_on_e=is_lse_base_on_e)
 
 
+_IPC_A2A_COMM = None
+
+
+def init_dcp_ipc_a2a(cp_group: "GroupCoordinator") -> None:
+    """A collective over the DCP group: call on every rank before CUDA-graph capture."""
+    global _IPC_A2A_COMM
+    from sglang.srt.environ import envs
+
+    # the kernel reads the gfx950 layout of AITER's CustomAllreduce
+    if _IPC_A2A_COMM is not None or not (
+        get_platform().is_gfx95 and envs.SGLANG_ENABLE_ROCM_DCP_IPC_A2A.get()
+    ):
+        return
+    from sglang.kernels.ops.communication import dcp_ipc_a2a_hip as pa
+
+    if cp_group.world_size != pa.WORLD_SIZE:
+        return
+    _IPC_A2A_COMM = pa.create_ipc_comm(
+        cp_group.cpu_group, torch.device("cuda", torch.cuda.current_device())
+    )
+    if _IPC_A2A_COMM is None:
+        logger.warning("DCP IPC all-to-all unavailable, keeping the RCCL all_to_all")
+
+
 def dcp_a2a_lse_reduce(
     cp_attn_out: torch.Tensor,
     cp_attn_lse: torch.Tensor,
@@ -640,6 +664,18 @@ def dcp_a2a_lse_reduce(
         return _dcp_fi_a2a_lse_reduce(
             cp_attn_out, cp_attn_lse, cp_group, is_lse_base_on_e
         )
+
+    if _IPC_A2A_COMM is not None:
+        from sglang.kernels.ops.communication import dcp_ipc_a2a_hip as pa
+
+        if pa.ipc_exchange_covers(cp_attn_out, cp_attn_lse):
+            recv_output, recv_lse = pa.ipc_exchange(
+                _IPC_A2A_COMM, cp_attn_out, cp_attn_lse
+            )
+            combined, _ = dcp_lse_combine_triton(
+                recv_output, recv_lse, is_lse_base_on_e=is_lse_base_on_e
+            )
+            return combined
 
     N = cp_group.world_size
     B, H, D = cp_attn_out.shape
