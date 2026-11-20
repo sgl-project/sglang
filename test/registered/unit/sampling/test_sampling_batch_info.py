@@ -744,6 +744,34 @@ class TestCopyForForward(CustomTestCase):
                 if name != "penalizer_orchestrator":
                     self.assertIs(copied.__dict__[name], value, name)
 
+    def test_speculative_copy_carries_per_row_penalties(self):
+        """Only the forward copy gets the orchestrator's per-row penalties,
+        which need an active penalty."""
+        for fast_path in (False, True):
+            with (
+                self.subTest(fast_path=fast_path),
+                patch(
+                    "sglang.srt.sampling.sampling_batch_info._fast_copy_enabled",
+                    return_value=fast_path,
+                ),
+            ):
+                orch = MagicMock(is_required=True)
+                info = _make_info(batch_size=1, penalizer_orchestrator=orch)
+                copied = info.copy_for_forward(with_speculative_penalties=True)
+                self.assertIsNone(info.speculative_penalties)
+                orch.speculative_penalties.assert_called_once_with(
+                    info.acc_additive_penalties, info.acc_scaling_penalties
+                )
+                self.assertIs(
+                    copied.speculative_penalties,
+                    orch.speculative_penalties.return_value,
+                )
+                info = _make_info(
+                    batch_size=1, penalizer_orchestrator=MagicMock(is_required=False)
+                )
+                with self.assertRaises(AssertionError):
+                    info.copy_for_forward(with_speculative_penalties=True)
+
 
 # from_schedule_batch
 class TestFromScheduleBatch(CustomTestCase):

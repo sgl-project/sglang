@@ -257,6 +257,7 @@ from sglang.srt.managers.schedule_policy import (
 )
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
+    _get_speculative_output_stride,
 )
 from sglang.srt.managers.scheduler_components.deferred_responses import (
     DeferredResponses,
@@ -396,6 +397,7 @@ from sglang.srt.rust_server.server import (
     claim_sigterm_before_compiles,
     drain_notify_name,
 )
+from sglang.srt.sampling.penalties import BatchedPenalizerOrchestrator
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.session.session_controller import SessionController
@@ -5306,7 +5308,13 @@ class Scheduler(
             self.uocr_runtime.overlap_release.defer(retired)
 
     @contextmanager
-    def _forward_isolation(self, batch: ScheduleBatch, *, overlap: bool):
+    def _forward_isolation(
+        self,
+        batch: ScheduleBatch,
+        *,
+        overlap: bool,
+        with_speculative_penalties: bool = False,
+    ):
         """Make SB transactional across one forward (overlap and non-overlap).
 
         1. Snapshot SB fields so V2's mid-forward mutations (forward_mode /
@@ -5315,7 +5323,10 @@ class Scheduler(
            next-iter draft input.
         2. Substitute sampling_info with a forward-only copy (orchestrator=None,
            shares the pre-accumulated penalty buffer) so V2's multiple init_new
-           calls don't double-accumulate penalties.
+           calls don't double-accumulate penalties. With
+           ``with_speculative_penalties``, the copy also carries the per-row
+           penalties of verify; the caller then counts the anchors before
+           entering and the accepted drafts after the forward.
         3. (overlap=True only) Pin (batch, snapshot) into batch_record_buf
            for 2 iters so GPU tensors in the snapshot survive the caching
            allocator past the forward stream. Must run AFTER the sampling_info
@@ -5334,7 +5345,11 @@ class Scheduler(
 
         # 2. sampling_info substitute
         if sched_sampling_info is not None:
-            batch.sampling_info = sched_sampling_info.copy_for_forward()
+            # The forward copy's per-row penalties also keep the tables alive
+            # (step 3) until this forward has counted the step's drafts in them.
+            batch.sampling_info = sched_sampling_info.copy_for_forward(
+                with_speculative_penalties=with_speculative_penalties
+            )
 
         # 3. pin for 2-iter tensor lifetime (overlap path only)
         if overlap:
@@ -5348,6 +5363,71 @@ class Scheduler(
                     setattr(batch, name, value)
             else:
                 batch.sampling_info = sched_sampling_info
+
+    @staticmethod
+    def _speculative_penalty_orchestrator(
+        batch: ScheduleBatch,
+    ) -> Optional[BatchedPenalizerOrchestrator]:
+        """The orchestrator that counts this forward's committed tokens, for an
+        algorithm that tracks speculative penalty history and active penalties."""
+        sampling_info = batch.sampling_info
+        if (
+            sampling_info is None
+            or not batch.spec_algorithm.tracks_speculative_penalty_history()
+            or not (batch.forward_mode.is_decode() or batch.forward_mode.is_mixed())
+            or not sampling_info.penalizer_orchestrator.is_required
+        ):
+            return None
+        return sampling_info.penalizer_orchestrator
+
+    @staticmethod
+    def _cumulate_speculative_anchors(
+        batch: ScheduleBatch, penalties: BatchedPenalizerOrchestrator
+    ) -> None:
+        """Count each request's anchor, the last committed token, before
+        ``copy_for_forward`` reads the penalty tables. Under overlap the host
+        output ids lag a step, so the anchors come from the resolved forward
+        inputs."""
+        if batch.forward_mode.is_decode():
+            anchors = batch.spec_info.bonus_tokens
+            penalties.cumulate_output_tokens(
+                anchors, torch.arange(anchors.shape[0], device=anchors.device)
+            )
+            return
+        # A mixed batch appends the running requests after its prefill rows as
+        # one-token rows whose input is their anchor; prompt tokens do not count.
+        bs = len(batch.reqs)
+        num_running = len(batch.decoding_reqs)
+        assert 0 < num_running <= bs, (num_running, bs)
+        tokens = batch.input_ids.new_zeros((bs, 1))
+        tokens[-num_running:, 0] = batch.input_ids[-num_running:]
+        lens = torch.zeros((bs,), dtype=torch.int32, device=tokens.device)
+        lens[-num_running:] = 1
+        penalties.cumulate_padded_output_tokens(tokens, lens)
+
+    @staticmethod
+    def _cumulate_speculative_drafts(
+        penalties: BatchedPenalizerOrchestrator,
+        result: GenerationBatchResult,
+        bs: int,
+    ) -> None:
+        """Count the accepted drafts of a verify step: the tokens that the result
+        processor commits (``_resolve_spec_v2_tokens``) without the bonus, which
+        the next step counts as its anchor. Results of the worker's extend path,
+        which mixed batches and some DP decode batches take while a peer rank
+        prefills, have no ``accept_lens``: each request commits one token, the
+        next anchor."""
+        if result.accept_lens is not None:
+            assert result.num_non_draft_tokens_per_req == 1, (
+                "speculative penalty history needs one bonus token per step, got "
+                f"{result.num_non_draft_tokens_per_req} non-draft tokens"
+            )
+            stride = _get_speculative_output_stride(result)
+            penalties.cumulate_padded_output_tokens(
+                result.next_token_ids[: bs * stride].view(bs, stride),
+                result.accept_lens[:bs] - 1,
+            )
+        penalties.record_commits()
 
     def _record_unified_forward(
         self,
@@ -5443,7 +5523,14 @@ class Scheduler(
                         batch, self.future_map
                     )
 
-                    with self._forward_isolation(batch, overlap=True):
+                    penalties = self._speculative_penalty_orchestrator(batch)
+                    if penalties is not None:
+                        self._cumulate_speculative_anchors(batch, penalties)
+                    with self._forward_isolation(
+                        batch,
+                        overlap=True,
+                        with_speculative_penalties=penalties is not None,
+                    ):
                         future_indices = batch.req_pool_indices
 
                         # Spec_v2 fires on_publish mid-worker (between verify and
@@ -5470,6 +5557,10 @@ class Scheduler(
                         batch_result = self.model_worker.forward_batch_generation(
                             batch, **fwd_kwargs
                         )
+                        if penalties is not None:
+                            self._cumulate_speculative_drafts(
+                                penalties, batch_result, len(batch.reqs)
+                            )
                         # Deferred decode graph I/O owns this step's relay.
                         if batch.spec_algorithm.is_none() and not input_ids_from_graph:
                             self.future_map.publish(future_indices, batch.seq_lens + 1)
@@ -5581,10 +5672,21 @@ class Scheduler(
                     # Non-overlap: drive the V2 worker synchronously (no
                     # future_map relay / on_publish).
                     self.resolve_forward_inputs(batch, self.future_map)
-                    with self._forward_isolation(batch, overlap=False):
+                    penalties = self._speculative_penalty_orchestrator(batch)
+                    if penalties is not None:
+                        self._cumulate_speculative_anchors(batch, penalties)
+                    with self._forward_isolation(
+                        batch,
+                        overlap=False,
+                        with_speculative_penalties=penalties is not None,
+                    ):
                         batch_result = self.model_worker.forward_batch_generation(
                             batch, pp_proxy_tensors=pp_proxy_tensors
                         )
+                        if penalties is not None:
+                            self._cumulate_speculative_drafts(
+                                penalties, batch_result, len(batch.reqs)
+                            )
                     # The isolation restore reverted the worker's in-forward SB edits;
                     # re-apply what must carry to the next iter. Under PP the
                     # tail draft already consumed the draft input in-round, and

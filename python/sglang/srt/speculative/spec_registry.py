@@ -90,6 +90,11 @@ class CustomSpecAlgo:
     def is_dflash_family(self) -> bool:
         return False
 
+    def tracks_speculative_penalty_history(self) -> bool:
+        # See SpeculativeAlgorithm.tracks_speculative_penalty_history. A plugin
+        # whose verify reads sampling_info.speculative_penalties overrides it.
+        return False
+
     def is_standalone(self) -> bool:
         return False
 

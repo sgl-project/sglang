@@ -45,7 +45,6 @@ from sglang.srt.managers.overlap_utils import (
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
-from sglang.srt.sampling.sampling_batch_info import has_acc_penalties
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
@@ -114,7 +113,7 @@ def verify_logits_adjustments_are_noop(sampling_info) -> bool:
         return True
     if sampling_info.has_custom_logit_processor:
         return False
-    if has_acc_penalties(sampling_info):
+    if sampling_info.speculative_penalties is not None:
         return False
     penalizer = getattr(sampling_info, "penalizer_orchestrator", None)
     if penalizer is not None and penalizer.is_required:
@@ -373,6 +372,7 @@ class TargetVerifyExecutor:
                 next_token_logits=result.logits_output.next_token_logits,
                 sampling_info=sampling_info,
                 draft_token_num=verify_w,
+                draft_tokens=verify_ids_2d[:, 1:],
             )
 
         return result
@@ -579,6 +579,8 @@ class TargetVerifyExecutor:
             next_token_logits=strided_logits,
             sampling_info=sampling_info,
             verify_num_draft_tokens=stride,
+            draft_tokens=draft_tokens,
+            num_drafts=layout.verify_lens - 1,
         )
         logits_output.next_token_logits = strided_logits
         logits_output.hidden_states = hidden_strided

@@ -40,6 +40,7 @@ def _sampling_info(**overrides):
         has_custom_logit_processor=False,
         acc_additive_penalties=None,
         acc_scaling_penalties=None,
+        speculative_penalties=None,
         penalizer_orchestrator=None,
         grammar_mask=None,
         logit_bias=None,
@@ -73,6 +74,7 @@ def test_routes_only_all_sampled_static_steps():
     assert not _eligible(worker, _sampling_info(need_top_k_sampling=True))
     assert not _eligible(worker, _sampling_info(need_top_p_sampling=True))
     assert not _eligible(worker, _sampling_info(logit_bias=torch.zeros(1)))
+    assert not _eligible(worker, _sampling_info(speculative_penalties=object()))
     assert not _eligible(worker, _sampling_info(), folded=False)
     assert not _eligible(worker, _sampling_info(), grammar=True)
     assert not _eligible(worker, _sampling_info(), sim_bonus=_sampling_info())

@@ -34,6 +34,7 @@ from sglang.srt.utils.log_utils import print_warning_once
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.sampling.sampling_observer import SamplingObserver
+    from sglang.srt.sampling.speculative_penalties import SpeculativePenalties
 
 
 logger = logging.getLogger(__name__)
@@ -161,6 +162,8 @@ class SamplingBatchInfo:
     acc_scaling_penalties: Optional[torch.Tensor] = (
         None  # Used in the overlap mode for repetition penalty
     )
+    # Per-row penalties of chain speculative verify blocks (forward copies only)
+    speculative_penalties: Optional[SpeculativePenalties] = None
 
     # Whether any request has custom logit processor
     has_custom_logit_processor: bool = False
@@ -741,15 +744,27 @@ class SamplingBatchInfo:
                 )
         return merged
 
-    def copy_for_forward(self):
+    def copy_for_forward(self, with_speculative_penalties: bool = False):
+        """A copy for one forward, without the orchestrator. With
+        ``with_speculative_penalties``, which needs an active penalty, it carries
+        the per-row penalties of chain speculative verify blocks."""
         # Accumulate the penalty into a pre-allocated buffer to get rid of the dependency of `penalizer_orchestrator` later
         self.update_penalties()
+        speculative = None
+        if with_speculative_penalties:
+            assert self.acc_additive_penalties is not None, "no active penalty"
+            speculative = self.penalizer_orchestrator.speculative_penalties(
+                self.acc_additive_penalties, self.acc_scaling_penalties
+            )
         if _fast_copy_enabled() and type(self) is SamplingBatchInfo:
             new = object.__new__(SamplingBatchInfo)
             new.__dict__.update(zip(_FIELD_NAMES, _FIELD_GETTER(self.__dict__)))
             new.penalizer_orchestrator = None
+            new.speculative_penalties = speculative
             return new
-        return dataclasses.replace(self, penalizer_orchestrator=None)
+        return dataclasses.replace(
+            self, penalizer_orchestrator=None, speculative_penalties=speculative
+        )
 
 
 @cache

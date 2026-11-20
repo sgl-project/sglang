@@ -3317,7 +3317,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if hasattr(self, "attn_cp_metadata") and self.attn_cp_metadata is not None:
             self.attn_cp_metadata = None
 
-        if self.sampling_info.penalizer_orchestrator.is_required:
+        # Algorithms that track the speculative penalty history have the
+        # scheduler count their committed tokens on the forward stream.
+        if (
+            self.sampling_info.penalizer_orchestrator.is_required
+            and not self.spec_algorithm.tracks_speculative_penalty_history()
+        ):
             self.cumulate_penalty_output_tokens()
 
         if not self.spec_algorithm.is_none():

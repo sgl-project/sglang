@@ -18,6 +18,7 @@ from sglang.srt.speculative.spec_registry import get_spec as _get_registered_spe
 from sglang.srt.speculative.spec_registry import (
     register_algorithm as _register_algorithm,
 )
+from sglang.srt.utils import is_cuda, is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.managers.overlap_utils import FutureMap
@@ -26,6 +27,12 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
     from sglang.srt.speculative.ngram_worker import NGRAMWorker
+
+
+def per_row_penalties_supported() -> bool:
+    """Whether the per-row speculative penalty kernels run on this device: they
+    are Triton kernels for CUDA and ROCm."""
+    return is_cuda() or is_hip()
 
 
 class SpeculativeAlgorithm(Enum):
@@ -124,6 +131,23 @@ class SpeculativeAlgorithm(Enum):
 
     def is_dflash_family(self) -> bool:
         return self.is_dflash() or self.is_dspark()
+
+    def tracks_speculative_penalty_history(self) -> bool:
+        """Whether sampling penalties count every committed token of a chain
+        speculative step, instead of one token per step.
+
+        The scheduler then counts each decode step's anchor (the draft input's
+        ``bonus_tokens``) before the forward, and after it the accepted drafts
+        of the result, whose ``next_token_ids`` hold ``W`` tokens per request
+        with the accepted drafts first and whose ``accept_lens`` count them plus
+        the bonus. Verify reads the penalties of each verify row from
+        ``sampling_info.speculative_penalties``.
+
+        Only where ``per_row_penalties_supported()``; elsewhere, for example on
+        NPU, verify uses the block-start penalties of
+        ``dflash_utils._apply_block_start_logits_adjustments``.
+        """
+        return self.is_dflash_family() and per_row_penalties_supported()
 
     def is_standalone(self) -> bool:
         return self == SpeculativeAlgorithm.STANDALONE

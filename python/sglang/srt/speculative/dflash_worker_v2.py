@@ -309,6 +309,7 @@ def _verify_logits_unadjusted(sampling_info) -> bool:
     penalizer = sampling_info.penalizer_orchestrator
     return not (
         sampling_info.has_custom_logit_processor
+        or sampling_info.speculative_penalties is not None
         or (penalizer is not None and penalizer.is_required)
         or has_acc_penalties(sampling_info)
         or sampling_info.grammar_mask is not None
@@ -3671,6 +3672,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 next_token_logits=logits_output.next_token_logits,
                 sampling_info=sampling_info,
                 draft_token_num=int(self.block_size),
+                draft_tokens=draft_tokens[:, 1:],
             )
 
         # Constrain every chain position before accept picks from it.

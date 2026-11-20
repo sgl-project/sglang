@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 import abc
+import dataclasses
 import weakref
 from typing import TYPE_CHECKING, Optional, Set, Type
 
 import torch
 
+from sglang.kernels.ops.sampling.penalties import (
+    MinNewTokensState,
+    TokenPenalty,
+    cumulate_padded_tokens,
+)
+from sglang.srt.sampling.speculative_penalties import SpeculativePenalties
 from sglang.srt.utils import get_compiler_backend, is_npu
 from sglang.srt.utils.device import is_pin_memory_available
 
@@ -41,6 +48,8 @@ class BatchedPenalizerOrchestrator:
             pen_is_required = penalizer.prepare_if_required()
             is_required |= pen_is_required
         self.is_required = is_required
+        # The end of the tables' writes on another stream (see record_commits).
+        self._commits_done: Optional[torch.Event] = None
 
     @property
     def batch(self) -> ScheduleBatch | None:
@@ -70,6 +79,49 @@ class BatchedPenalizerOrchestrator:
             penalizer.cumulate_output_tokens(
                 output_ids=output_ids, req_indices=req_indices
             )
+
+    def cumulate_padded_output_tokens(
+        self, output_ids: torch.Tensor, output_lens: torch.Tensor
+    ):
+        """
+        Feed a padded ``[bs, width]`` block of output tokens to the penalizers.
+
+        Args:
+            output_ids: ``[bs, width]``; row ``b`` holds request ``b``'s tokens.
+            output_lens: ``[bs]``; each request counts the first
+                ``output_lens[b]`` tokens of its row, in order, with the
+                length clamped to ``[0, width]``.
+        """
+        for penalizer in self.penalizers.values():
+            penalizer.cumulate_padded_output_tokens(output_ids, output_lens)
+
+    def record_commits(self) -> None:
+        """Mark the end of the tables' writes on the current stream.
+
+        Speculative decoding counts tokens on the forward stream; ``filter``,
+        ``merge`` and ``release`` wait for those writes on their own stream
+        before they copy or free the tables.
+        """
+        event = torch.get_device_module(self.device).Event()
+        event.record()
+        self._commits_done = event
+
+    def _wait_for_commits(self) -> None:
+        if self._commits_done is not None:
+            torch.get_device_module(self.device).current_stream().wait_event(
+                self._commits_done
+            )
+            self._commits_done = None
+
+    def speculative_penalties(
+        self, additive: torch.Tensor, scaling: Optional[torch.Tensor]
+    ) -> SpeculativePenalties:
+        """A view of the penalty state for per-row penalties of verify blocks;
+        ``additive`` and ``scaling`` are this step's block-start tables."""
+        penalties = SpeculativePenalties(additive=additive, scaling=scaling)
+        for penalizer in self.penalizers.values():
+            penalties = penalizer.add_speculative_state(penalties)
+        return penalties
 
     def apply(self, logits: torch.Tensor):
         """Apply all penalizers to the logits in-place."""
@@ -104,6 +156,7 @@ class BatchedPenalizerOrchestrator:
         if not self.is_required:
             return
 
+        self._wait_for_commits()
         if len(keep_indices) == 0:
             # No requests left in the batch, fully release orchestrator resources
             self.release()
@@ -122,6 +175,7 @@ class BatchedPenalizerOrchestrator:
     # Resource management helpers
     def release(self) -> None:
         """Release all penalizers and break references so GC can reclaim promptly."""
+        self._wait_for_commits()
         for penalizer in self.penalizers.values():
             penalizer.teardown()
         self.penalizers.clear()
@@ -150,6 +204,8 @@ class BatchedPenalizerOrchestrator:
         if not self.is_required and not their.is_required:
             return
 
+        self._wait_for_commits()
+        their._wait_for_commits()
         self.is_required = True
         for penalizer, their_penalizer in their.penalizers.items():
             self.penalizers[penalizer].merge(their_penalizer)
@@ -208,6 +264,22 @@ class _BatchedPenalizer(abc.ABC):
 
         self._cumulate_output_tokens(output_ids=output_ids, req_indices=req_indices)
 
+    def cumulate_padded_output_tokens(
+        self, output_ids: torch.Tensor, output_lens: torch.Tensor
+    ):
+        if not self._is_prepared:
+            return
+
+        self._cumulate_padded_output_tokens(output_ids, output_lens)
+
+    def add_speculative_state(
+        self, penalties: SpeculativePenalties
+    ) -> SpeculativePenalties:
+        if not self._is_prepared:
+            return penalties
+
+        return self._add_speculative_state(penalties)
+
     def apply(self, logits: torch.Tensor) -> torch.Tensor:
         if not self._is_prepared:
             return
@@ -250,6 +322,27 @@ class _BatchedPenalizer(abc.ABC):
         """
         Cumulate the output tokens; output_ids[j] belongs to batch row req_indices[j].
         Orchestrator will call this function to feed the output tokens to the penalizer.
+        """
+        pass
+
+    @abc.abstractmethod
+    def _cumulate_padded_output_tokens(
+        self, output_ids: torch.Tensor, output_lens: torch.Tensor
+    ):
+        """
+        Cumulate the first ``output_lens[b]`` tokens of each row of the padded
+        ``[bs, width]`` ``output_ids``, as ``_cumulate_output_tokens`` would one
+        column at a time; lengths outside ``[0, width]`` are clamped.
+        """
+        pass
+
+    @abc.abstractmethod
+    def _add_speculative_state(
+        self, penalties: SpeculativePenalties
+    ) -> SpeculativePenalties:
+        """
+        ``penalties`` with this penalizer's state, which the per-row penalties of
+        chain speculative verify blocks read.
         """
         pass
 
@@ -331,6 +424,28 @@ class BatchedFrequencyPenalizer(_BatchedPenalizer):
             accumulate=True,
         )
 
+    def _cumulate_padded_output_tokens(
+        self, output_ids: torch.Tensor, output_lens: torch.Tensor
+    ):
+        cumulate_padded_tokens(
+            self.cumulated_frequency_penalties,
+            self.frequency_penalties,
+            output_ids,
+            output_lens,
+            accumulate=True,
+        )
+
+    def _add_speculative_state(
+        self, penalties: SpeculativePenalties
+    ) -> SpeculativePenalties:
+        return dataclasses.replace(
+            penalties,
+            frequency=TokenPenalty(
+                coefficients=self.frequency_penalties,
+                table=self.cumulated_frequency_penalties,
+            ),
+        )
+
     def _apply(self, logits: torch.Tensor) -> torch.Tensor:
         logits.sub_(self.cumulated_frequency_penalties)
 
@@ -392,6 +507,28 @@ class BatchedPresencePenalizer(_BatchedPenalizer):
     ):
         self.cumulated_presence_penalties[req_indices, output_ids] = (
             self.presence_penalties[req_indices, 0]
+        )
+
+    def _cumulate_padded_output_tokens(
+        self, output_ids: torch.Tensor, output_lens: torch.Tensor
+    ):
+        cumulate_padded_tokens(
+            self.cumulated_presence_penalties,
+            self.presence_penalties,
+            output_ids,
+            output_lens,
+            accumulate=False,
+        )
+
+    def _add_speculative_state(
+        self, penalties: SpeculativePenalties
+    ) -> SpeculativePenalties:
+        return dataclasses.replace(
+            penalties,
+            presence=TokenPenalty(
+                coefficients=self.presence_penalties,
+                table=self.cumulated_presence_penalties,
+            ),
         )
 
     def _apply(self, logits: torch.Tensor) -> torch.Tensor:
@@ -456,6 +593,28 @@ class BatchedRepetitionPenalizer(_BatchedPenalizer):
     ):
         self.cumulated_repetition_penalties[req_indices, output_ids] = (
             self.repetition_penalties[req_indices, 0]
+        )
+
+    def _cumulate_padded_output_tokens(
+        self, output_ids: torch.Tensor, output_lens: torch.Tensor
+    ):
+        cumulate_padded_tokens(
+            self.cumulated_repetition_penalties,
+            self.repetition_penalties,
+            output_ids,
+            output_lens,
+            accumulate=False,
+        )
+
+    def _add_speculative_state(
+        self, penalties: SpeculativePenalties
+    ) -> SpeculativePenalties:
+        return dataclasses.replace(
+            penalties,
+            repetition=TokenPenalty(
+                coefficients=self.repetition_penalties,
+                table=self.cumulated_repetition_penalties,
+            ),
         )
 
     def _apply(self, logits: torch.Tensor) -> torch.Tensor:
@@ -557,6 +716,10 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
                 device=self.orchestrator.device,
             ),
         )[:, : self.orchestrator.vocab_size]
+        # The stop ids padded with -1, for per-row speculative penalties.
+        self.stop_token_ids = torch.where(
+            padded_stop_token_ids < vocab_size, padded_stop_token_ids, -1
+        )
 
         self.len_output_tokens = torch.zeros(
             size=(len(self.orchestrator.reqs()), 1),
@@ -573,6 +736,28 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
             req_indices.new_ones((len(req_indices), 1), dtype=torch.int32),
         )
 
+    def _cumulate_padded_output_tokens(
+        self, output_ids: torch.Tensor, output_lens: torch.Tensor
+    ):
+        # Clamped as the other penalizers' count kernel clamps them.
+        counted = output_lens.clamp(0, output_ids.shape[1])
+        self.len_output_tokens.add_(
+            counted.reshape(-1, 1).to(self.len_output_tokens.dtype)
+        )
+
+    def _add_speculative_state(
+        self, penalties: SpeculativePenalties
+    ) -> SpeculativePenalties:
+        return dataclasses.replace(
+            penalties,
+            min_new_tokens=MinNewTokensState(
+                min_new_tokens=self.min_new_tokens,
+                output_lengths=self.len_output_tokens,
+                stop_penalties=self.stop_token_penalties,
+                stop_token_ids=self.stop_token_ids,
+            ),
+        )
+
     def _apply(self, logits: torch.Tensor):
         # Boolean-mask indexing (logits[mask]) is data-dependent and forces a
         # device-to-host sync every decode step; torch.where is a plain
@@ -583,6 +768,7 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
     def _filter(self, keep_indices: torch.Tensor):
         self.min_new_tokens = self.min_new_tokens[keep_indices]
         self.stop_token_penalties = self.stop_token_penalties[keep_indices]
+        self.stop_token_ids = self.stop_token_ids[keep_indices]
         self.len_output_tokens = self.len_output_tokens[keep_indices]
 
     def _merge(self, their: BatchedMinNewTokensPenalizer):
@@ -592,12 +778,25 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
         self.stop_token_penalties = torch.cat(
             [self.stop_token_penalties, their.stop_token_penalties], dim=0
         )
+        width = max(self.stop_token_ids.shape[1], their.stop_token_ids.shape[1])
+        self.stop_token_ids = torch.cat(
+            [
+                torch.nn.functional.pad(ids, (0, width - ids.shape[1]), value=-1)
+                for ids in (self.stop_token_ids, their.stop_token_ids)
+            ],
+            dim=0,
+        )
         self.len_output_tokens = torch.cat(
             [self.len_output_tokens, their.len_output_tokens], dim=0
         )
 
     # Explicit resource cleanup to aid GC and free CUDA memory promptly
     def _teardown(self) -> None:
-        for name in ("min_new_tokens", "stop_token_penalties", "len_output_tokens"):
+        for name in (
+            "min_new_tokens",
+            "stop_token_penalties",
+            "stop_token_ids",
+            "len_output_tokens",
+        ):
             if hasattr(self, name):
                 delattr(self, name)
