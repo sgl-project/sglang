@@ -413,23 +413,34 @@ def get_model_dims(args: argparse.Namespace):
         from transformers import AutoConfig
 
         config = AutoConfig.from_pretrained(args.model, trust_remote_code=True)
+        # Multimodal configs keep the decoder geometry in a text sub-config.
+        config = config.get_text_config()
         hidden_size = config.hidden_size
-
-        num_heads = config.num_attention_heads
-        num_kv_heads = getattr(config, "num_key_value_heads", num_heads)
-        head_dim = getattr(config, "head_dim", hidden_size // num_heads)
         intermediate_size = config.intermediate_size
 
-        q_dim = num_heads * head_dim
-        kv_dim = num_kv_heads * head_dim
-        qkv_output_dim = q_dim + 2 * kv_dim
-
         print(f"Model: {args.model}")
-        print(
-            f"  hidden_size={hidden_size}, num_heads={num_heads}, "
-            f"num_kv_heads={num_kv_heads}, head_dim={head_dim}"
-        )
+        # Layers can differ in attention geometry (e.g. Gemma 4 sliding vs.
+        # full attention); Transformers exposes them via `per_layer_config`.
+        attn_geometries = []
+        for layer_config in getattr(config, "per_layer_config", None) or [config]:
+            num_heads = layer_config.num_attention_heads
+            geometry = (
+                num_heads,
+                getattr(layer_config, "num_key_value_heads", num_heads),
+                getattr(layer_config, "head_dim", hidden_size // num_heads),
+            )
+            if geometry not in attn_geometries:
+                attn_geometries.append(geometry)
+                print(
+                    f"  hidden_size={hidden_size}, num_heads={geometry[0]}, "
+                    f"num_kv_heads={geometry[1]}, head_dim={geometry[2]}"
+                )
         print(f"  intermediate_size={intermediate_size}")
+        attn_dims = []
+        for num_heads, num_kv_heads, head_dim in attn_geometries:
+            q_dim = num_heads * head_dim
+            kv_dim = num_kv_heads * head_dim
+            attn_dims.append((q_dim, kv_dim, q_dim + 2 * kv_dim))
     else:
         hidden_size = args.hidden_size
         intermediate_size = getattr(args, "intermediate_size", None) or hidden_size * 3
@@ -441,18 +452,23 @@ def get_model_dims(args: argparse.Namespace):
             q_dim = hidden_size * 2
             kv_dim = hidden_size
             qkv_output_dim = q_dim + 2 * kv_dim
+        attn_dims = [(q_dim, kv_dim, qkv_output_dim)]
 
     # All LoRA layer types with their dimensions:
     #   (label, shrink_K, expand_output_dim, num_slices, slice_offsets)
-    layers = [
-        (
-            "qkv",
-            hidden_size,
-            qkv_output_dim,
-            3,
-            [0, q_dim, q_dim + kv_dim, qkv_output_dim],
-        ),
-        ("o_proj", q_dim, hidden_size, 1, [0, hidden_size]),
+    layers = []
+    for q_dim, kv_dim, qkv_output_dim in attn_dims:
+        layers += [
+            (
+                "qkv",
+                hidden_size,
+                qkv_output_dim,
+                3,
+                [0, q_dim, q_dim + kv_dim, qkv_output_dim],
+            ),
+            ("o_proj", q_dim, hidden_size, 1, [0, hidden_size]),
+        ]
+    layers += [
         (
             "gate_up",
             hidden_size,
