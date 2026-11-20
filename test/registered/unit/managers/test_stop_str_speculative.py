@@ -18,6 +18,7 @@ register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 # accidental cross-matches (10-39 are lowercase letters).
 STOP_ID = 1
 EOS_ID = 2
+THINK_END_ID = 80
 ID_TO_TEXT = {
     STOP_ID: "STOP",
     EOS_ID: "",
@@ -28,6 +29,7 @@ ID_TO_TEXT = {
     63: ".",
     70: "X",
     71: "Y",
+    THINK_END_ID: "</think>",
 }
 
 # "STOP" (index 3) sits 6 tokens back: outside the old (stop_str_max_len + 1)
@@ -50,7 +52,13 @@ class _MockTokenizerForNormalize:
         return list(range(len(s)))  # One "token" per character
 
 
-def _make_req(output_ids, stop=None, stop_regex=None, eos_token_ids=frozenset()):
+def _make_req(
+    output_ids,
+    stop=None,
+    stop_regex=None,
+    eos_token_ids=frozenset(),
+    require_reasoning=False,
+):
     sp = SamplingParams(max_new_tokens=1000, stop=stop, stop_regex=stop_regex)
     sp.normalize(tokenizer=_MockTokenizerForNormalize())  # char-based stop_str_max_len
     req = Req(
@@ -60,6 +68,7 @@ def _make_req(output_ids, stop=None, stop_regex=None, eos_token_ids=frozenset())
         sampling_params=sp,
         eos_token_ids=eos_token_ids,
         vocab_size=10_000,
+        require_reasoning=require_reasoning,
     )
     req.tokenizer = _FakeTokenizer()
     req.output_ids = array("q", output_ids)
@@ -144,6 +153,69 @@ class TestStopStrSpeculative(unittest.TestCase):
         self.assertTrue(req.finished())
         self.assertEqual(req.finished_reason.matched, r"[.!?]\s*$")
         self.assertEqual(req.finished_len, 2)
+
+
+def _step(req, token_ids):
+    """One decode step as the batch result processor does it: append the
+    accepted tokens, advance the reasoning state, then check finish."""
+    req.output_ids.extend(token_ids)
+    req.update_reasoning_tokens(list(token_ids), [THINK_END_ID])
+    req.update_finish_state(len(token_ids))
+
+
+class TestStopStrSkipsReasoning(unittest.TestCase):
+    """With a reasoning parser the request starts inside the reasoning section.
+    The model often quotes the stop string while thinking; matching it there
+    ends the request before any answer is produced (content == "")."""
+
+    def _req(self, **kw):
+        return _make_req([], stop=["STOP"], require_reasoning=True, **kw)
+
+    def test_stop_inside_reasoning_is_ignored(self):
+        req = self._req()
+        for tok in [10, STOP_ID, 11]:
+            _step(req, [tok])
+        self.assertFalse(req.finished())
+
+    def test_stop_quoted_in_reasoning_does_not_match_after_think_end(self):
+        # The tail window still holds the quoted "STOP" when </think> lands; the
+        # match must be limited to text after the marker.
+        req = self._req()
+        for tok in [10, STOP_ID, THINK_END_ID, 20, 21]:
+            _step(req, [tok])
+        self.assertFalse(req.finished())
+
+    def test_stop_in_answer_matches(self):
+        req = self._req()
+        for tok in [10, STOP_ID, THINK_END_ID, 20, STOP_ID]:
+            _step(req, [tok])
+        self.assertTrue(req.finished())
+        self.assertEqual(req.finished_reason.matched, "STOP")
+        self.assertEqual(req.finished_len, 5)
+
+    def test_chunk_spanning_think_end_ignores_reasoning_part(self):
+        # Speculative decoding: one step carries the end of the reasoning, the
+        # marker and the start of the answer.
+        req = self._req()
+        _step(req, [10, 11])
+        _step(req, [STOP_ID, THINK_END_ID, 20, 21])
+        self.assertFalse(req.finished())
+
+    def test_chunk_spanning_think_end_matches_stop_in_answer_part(self):
+        req = self._req()
+        _step(req, [10, STOP_ID])
+        _step(req, [THINK_END_ID, 20, STOP_ID, 21])
+        self.assertTrue(req.finished())
+        self.assertEqual(req.finished_len, 5)
+
+    def test_stop_prefix_holdback_inactive_in_reasoning(self):
+        # Streaming holds text back while the tail could start a stop string;
+        # inside reasoning no stop can fire, so nothing should be held.
+        req = _make_req([], stop=["XY"], require_reasoning=True)
+        _step(req, [10, 70])
+        self.assertFalse(req.check_match_stop_str_prefix())
+        _step(req, [THINK_END_ID, 70])
+        self.assertTrue(req.check_match_stop_str_prefix())
 
 
 if __name__ == "__main__":
