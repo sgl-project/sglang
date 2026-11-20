@@ -157,17 +157,40 @@ impl Runtime {
         self.spawn_mm_pool(workers, ctx);
     }
 
+    /// The workers, and the processor's feature publishers
+    /// (`mm-publisher-{i}`, see `MmProcessor::feature_publishers`), likewise
+    /// unpinned.
     fn spawn_mm_pool(&self, workers: usize, ctx: Arc<crate::multi_modality::worker::MmContext>) {
+        use crate::multi_modality::worker::{MmPublisher, MmWorker};
         if !self.core.set_mm_processor(ctx.processor.clone()) {
             tracing::warn!("MM workers started again; admission keeps the first processor");
         }
+        let workers = workers.max(1);
         let mut threads = self.threads.lock().unwrap();
-        spawn_pool("mm-worker", None, workers.max(1), &mut threads, |_| {
-            crate::multi_modality::worker::MmWorker::new(
+        let publishers = ctx.processor.feature_publishers();
+        let publish_tx = (publishers > 0).then(|| {
+            // A worker hands a request on without waiting unless each
+            // worker's last one still waits for a publisher.
+            let (publish_tx, publish_rx) = flume::bounded(workers);
+            spawn_pool("mm-publisher", None, publishers, &mut threads, |_| {
+                MmPublisher::new(
+                    publish_rx.clone(),
+                    self.mm_wiring.tm_tx.clone(),
+                    ctx.clone(),
+                )
+            });
+            publish_tx
+        });
+        spawn_pool("mm-worker", None, workers, &mut threads, |_| {
+            let worker = MmWorker::new(
                 self.mm_wiring.mm_rx.clone(),
                 self.mm_wiring.tm_tx.clone(),
                 ctx.clone(),
-            )
+            );
+            match &publish_tx {
+                Some(publish_tx) => worker.publishing_to(publish_tx.clone()),
+                None => worker,
+            }
         });
     }
 
