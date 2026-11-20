@@ -12,8 +12,8 @@ import json
 import math
 import os
 from collections.abc import Iterator, Sequence
-from contextlib import nullcontext
-from typing import Any
+from contextlib import contextmanager, nullcontext
+from typing import Any, NamedTuple
 
 import msgspec
 import numpy as np
@@ -21,6 +21,7 @@ import PIL.Image
 import torch
 import torch.nn.functional as F
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.dits.cosmos_dreams import (
     HISTORY_MODE_FULL,
     TEXT_TOKENS_TRAINING_MAX,
@@ -40,21 +41,25 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
     ComponentUse,
 )
 from sglang.multimodal_gen.runtime.models.dits.cosmos_dreams import (
-    CosmosDreamsKVCache,
     CosmosDreamsTransformer,
-    HistoryKV,
     KVPair,
 )
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
 from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import use_vae_fast_path
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
     StageParallelismType,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.encode_while_decoding import (
+    EncodeWhileDecoding,
+    finish_streamed_encode,
+    streamed_video_output_path,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3 import (
+    Cosmos3DecodingStage,
     denormalize_vae_latents,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_action import (
@@ -66,6 +71,11 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
     FrustumHistorySelector,
     describe_selection,
     resolve_frustum_selector,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_simulation.kv_history import (
+    CosmosDreamsKVHistory,
+    SelectedKVHistory,
+    new_kv_history,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
@@ -95,6 +105,9 @@ EXTRA_ACTION_DOMAIN_IDS = "cosmos_dreams_action_domain_ids"
 # Decoded video handed to the decoding stage when the rollout overlapped decoding
 # (the Cosmos3 stage already honours this key for pre-decoded output).
 EXTRA_DECODED_OUTPUT = "transfer_decoded_output"
+# Paths of the MP4 the rollout encoded while it decoded; the decoding stage
+# returns them instead of frames.
+EXTRA_STREAMED_OUTPUT_PATHS = "cosmos_dreams_streamed_output_paths"
 EXTRA_TARGET_LATENT_FRAMES = "cosmos_dreams_target_latent_frames"
 # FrustumHistorySelector of the request, None without retrieval.
 EXTRA_FRUSTUM_SELECTOR = "cosmos_dreams_frustum_selector"
@@ -551,92 +564,6 @@ def actions_for_frames(
     return torch.cat(blocks, dim=0).unsqueeze(0), tuple(null_indexes)
 
 
-def _bounded_append(
-    old: torch.Tensor, new: torch.Tensor, *, sink_tokens: int, tail_tokens: int
-) -> torch.Tensor:
-    if old.shape[1] + new.shape[1] <= sink_tokens + tail_tokens:
-        return torch.cat([old, new], dim=1)
-    parts: list[torch.Tensor] = []
-    sink_from_old = min(sink_tokens, old.shape[1])
-    if sink_from_old:
-        parts.append(old[:, :sink_from_old])
-    if sink_tokens - sink_from_old:
-        parts.append(new[:, : sink_tokens - sink_from_old])
-    tail_from_new = min(tail_tokens, new.shape[1])
-    tail_from_old = tail_tokens - tail_from_new
-    if tail_from_old:
-        parts.append(old[:, -tail_from_old:])
-    if tail_from_new:
-        parts.append(new[:, -tail_from_new:])
-    return parts[0].clone() if len(parts) == 1 else torch.cat(parts, dim=1)
-
-
-def append_kv_history(
-    history: list[KVPair] | CosmosDreamsKVCache | None,
-    current_kv: list[KVPair],
-    *,
-    tokens_per_frame: int,
-    sink_frames: int,
-    window_frames: int | None,
-) -> list[KVPair] | CosmosDreamsKVCache:
-    """Append committed K/V per layer, keeping ``sink`` + latest ``window`` frames.
-
-    ``window_frames=None`` keeps everything (no eviction).
-    """
-    if not current_kv:
-        raise ValueError("Cosmos-Dreams K/V update must contain at least one layer.")
-    for key, value in current_kv:
-        if (
-            key.shape != value.shape
-            or key.shape[1] <= 0
-            or key.shape[1] % tokens_per_frame
-        ):
-            raise ValueError(
-                "Cosmos-Dreams K/V must be matching tensors whose token length is a positive "
-                f"multiple of tokens_per_frame={tokens_per_frame}, got {tuple(key.shape)}."
-            )
-    if history is None:
-        if window_frames is not None and any(
-            key.shape[1] > (sink_frames + window_frames) * tokens_per_frame
-            for key, _ in current_kv
-        ):
-            raise ValueError(
-                "The initial Cosmos-Dreams K/V block exceeds the history window."
-            )
-        return [(key.detach(), value.detach()) for key, value in current_kv]
-    if len(history) != len(current_kv):
-        raise ValueError(
-            "Cosmos-Dreams K/V layer count changed within a rollout: "
-            f"history={len(history)}, current={len(current_kv)}."
-        )
-    if isinstance(history, CosmosDreamsKVCache):
-        history.commit(current_kv[0][0].shape[1])
-        return history
-    if window_frames is None:
-        return [
-            (
-                torch.cat([old_k, new_k], dim=1).detach(),
-                torch.cat([old_v, new_v], dim=1).detach(),
-            )
-            for (old_k, old_v), (new_k, new_v) in zip(history, current_kv, strict=True)
-        ]
-    sink_tokens = sink_frames * tokens_per_frame
-    tail_tokens = window_frames * tokens_per_frame
-    updated: list[KVPair] = []
-    for (old_k, old_v), (new_k, new_v) in zip(history, current_kv, strict=True):
-        updated.append(
-            (
-                _bounded_append(
-                    old_k, new_k, sink_tokens=sink_tokens, tail_tokens=tail_tokens
-                ).detach(),
-                _bounded_append(
-                    old_v, new_v, sink_tokens=sink_tokens, tail_tokens=tail_tokens
-                ).detach(),
-            )
-        )
-    return updated
-
-
 def closest_canvas(*, height: int, width: int, tier: str) -> tuple[int, int]:
     """Trained ``(width, height)`` canvas of ``tier`` whose aspect is closest to the input."""
     if tier not in VIDEO_RES_SIZE_INFO:
@@ -850,19 +777,27 @@ def frame_domain_ids(
 class CausalDecodeQueue:
     """Decode committed latent chunks with the causal Wan VAE on a side stream.
 
-    Each chunk waits for the producing stream, decodes with the decoder's
-    feature cache carried across chunks, and lands in pinned host memory
-    asynchronously; leaving the context drains the stream and resets the VAE,
-    then ``finish`` concatenates the completed frames.
+    Each chunk waits for the producing stream and decodes with the decoder's
+    feature cache carried across chunks. Its frames go to ``encoder`` when there
+    is one, otherwise they land in pinned host memory asynchronously; leaving the
+    context drains the stream and resets the VAE, then ``finish`` concatenates
+    the completed frames.
     """
 
     def __init__(
-        self, vae: Any, *, device: torch.device, quality: str = "exact"
+        self,
+        vae: Any,
+        *,
+        device: torch.device,
+        stream: torch.cuda.Stream | None = None,
+        fast_path: bool = False,
+        encoder: EncodeWhileDecoding | None = None,
     ) -> None:
         self.vae = vae
-        self.fast_path = quality_allows(quality, "lossless")
         self.device = device
-        self.stream = torch.cuda.Stream(device=device)
+        self.fast_path = fast_path
+        self.encoder = encoder
+        self.stream = stream or torch.cuda.Stream(device=device)
         self.outputs: list[torch.Tensor] = []
         self.submitted = 0
         self.vae.reset_causal_decode_state()
@@ -883,6 +818,8 @@ class CausalDecodeQueue:
             self.vae.reset_causal_decode_state()
             if exc_type is not None:
                 self.outputs.clear()
+                if self.encoder is not None:
+                    self.encoder.abort()
         finally:
             # Drain last: freeing pinned outputs records host-allocator events
             # on this stream, so they must land before the final sync.
@@ -901,16 +838,38 @@ class CausalDecodeQueue:
             use_vae_fast_path(self.vae, self.fast_path),
         ):
             video = self.vae.causal_decode(self._denormalize(latents))
-            host = torch.empty(
-                video.shape, dtype=video.dtype, device="cpu", pin_memory=True
-            )
-            # Keep the destination referenced before the copy is enqueued.
-            self.outputs.append(host)
-            host.copy_(video, non_blocking=True)
+            if self.encoder is not None:
+                # Postprocesses ``video`` in place and queues its frames.
+                self.encoder(video)
+            else:
+                host = torch.empty(
+                    video.shape, dtype=video.dtype, device="cpu", pin_memory=True
+                )
+                # Keep the destination referenced before the copy is enqueued.
+                self.outputs.append(host)
+                host.copy_(video, non_blocking=True)
         self.submitted += 1
 
     def finish(self) -> torch.Tensor:
         return torch.cat(self.outputs, dim=2)
+
+
+@contextmanager
+def rollout_stream(
+    device: torch.device, stream: torch.cuda.Stream | None
+) -> Iterator[None]:
+    """Run the block on ``stream`` (None keeps the current one), a scheduling change only."""
+    if stream is None:
+        yield
+        return
+    entry = torch.cuda.current_stream(device)
+    stream.wait_stream(entry)
+    try:
+        with torch.cuda.stream(stream):
+            yield
+    finally:
+        # Later stages run on the entry stream and must see the block's work done.
+        entry.wait_stream(stream)
 
 
 class CosmosDreamsPrepareStage(PipelineStage):
@@ -1202,11 +1161,86 @@ def validate_fixed_step_scheduler(
     return scheduler
 
 
+class _PreparedSchedule(NamedTuple):
+    timesteps: torch.Tensor
+    sigmas: torch.Tensor
+    begin_index: int
+    # One (scalar, [1]) view pair of ``timesteps`` per step: what the scheduler
+    # and the transformer take.
+    steps: tuple[tuple[torch.Tensor, torch.Tensor], ...]
+
+
+class FixedStepSchedules:
+    """The scheduler's state for each sigma list of a rollout, built once.
+
+    ``set_timesteps`` uploads the sigmas with a blocking copy, and the first
+    ``step`` after it searches the device for its index and reads it back.
+    """
+
+    def __init__(self, scheduler: FlowMatchEulerDiscreteScheduler) -> None:
+        self.scheduler = scheduler
+        self._prepared: dict[
+            tuple[tuple[float, ...], torch.device], _PreparedSchedule
+        ] = {}
+
+    def begin_chunk(
+        self, t_list: Sequence[float], device: torch.device
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
+        scheduler = self.scheduler
+        key = (tuple(float(sigma) for sigma in t_list), device)
+        prepared = self._prepared.get(key)
+        if prepared is None:
+            scheduler.set_shift(1.0)
+            scheduler.set_timesteps(sigmas=list(key[0]), device=device)
+            prepared = _PreparedSchedule(
+                timesteps=scheduler.timesteps,
+                sigmas=scheduler.sigmas,
+                # What the first step would otherwise look up on the device.
+                begin_index=_first_step_index(scheduler, key[0]),
+                steps=tuple(
+                    (timestep, timestep.reshape(1)) for timestep in scheduler.timesteps
+                ),
+            )
+            self._prepared[key] = prepared
+        else:
+            scheduler.timesteps = prepared.timesteps
+            scheduler.sigmas = prepared.sigmas
+            scheduler.num_inference_steps = len(prepared.steps)
+            scheduler._step_index = None
+        scheduler.set_begin_index(prepared.begin_index)
+        return prepared.steps
+
+
 # The reference mixes seed, chunk start, and step into one SDE noise seed
 # (omni_mot_causal_model._run_distilled_ar_sampler); matching it keeps parity
 # runs comparable at the latent level.
 SDE_FRAME_SEED_STRIDE = 1_000_003
 SDE_STEP_SEED_STRIDE = 9_176
+
+
+def _first_step_index(
+    scheduler: FlowMatchEulerDiscreteScheduler, sigmas: Sequence[float]
+) -> int:
+    config = scheduler.config
+    if (
+        sigmas
+        and type(scheduler) is FlowMatchEulerDiscreteScheduler
+        and not (
+            config.shift_terminal
+            or config.use_karras_sigmas
+            or config.use_exponential_sigmas
+            or config.use_beta_sigmas
+            or config.invert_sigmas
+        )
+    ):
+        # With unit shift, we can check the first timestep on the host. Match
+        # the scheduler's FP32 rounding and keep its lookup for duplicate steps.
+        timesteps = np.asarray(sigmas, dtype=np.float32) * np.float32(
+            config.num_train_timesteps
+        )
+        if np.count_nonzero(timesteps == timesteps[0]) == 1:
+            return 0
+    return scheduler.index_for_timestep(scheduler.timesteps[0])
 
 
 def sde_step_generator(
@@ -1228,7 +1262,7 @@ def sde_step_generator(
 
 def run_fixed_step_sde(
     transformer: CosmosDreamsTransformer,
-    scheduler: FlowMatchEulerDiscreteScheduler,
+    schedules: FixedStepSchedules,
     noise: torch.Tensor,
     *,
     t_list: Sequence[float],
@@ -1238,39 +1272,19 @@ def run_fixed_step_sde(
     forward_batch: Req | None = None,
     **forward_kwargs: Any,
 ) -> torch.Tensor:
-    """Fixed-step SDE denoising of one chunk; history K/V is read but never written."""
-    sigmas = list(t_list)
-    scheduler.set_shift(1.0)
-    scheduler.set_timesteps(sigmas=sigmas, device=noise.device)
-    config = scheduler.config
-    if (
-        sigmas
-        and type(scheduler) is FlowMatchEulerDiscreteScheduler
-        and not (
-            config.shift_terminal
-            or config.use_karras_sigmas
-            or config.use_exponential_sigmas
-            or config.use_beta_sigmas
-            or config.invert_sigmas
-        )
-    ):
-        # With unit shift, we can check the first timestep on the host. Match
-        # the scheduler's FP32 rounding and keep its lookup for duplicate steps.
-        timesteps = np.asarray(sigmas, dtype=np.float32) * np.float32(
-            config.num_train_timesteps
-        )
-        if np.count_nonzero(timesteps == timesteps[0]) == 1:
-            scheduler.set_begin_index(0)
+    """Fixed-step SDE denoising of one chunk; history K/V is read but never committed."""
+    scheduler = schedules.scheduler
     latents = noise.float()
-    for step_index, timestep in enumerate(scheduler.timesteps):
+    for step_index, (timestep, forward_timestep) in enumerate(
+        schedules.begin_chunk(t_list, noise.device)
+    ):
         with set_forward_context(
             current_timestep=step_index, attn_metadata=None, forward_batch=forward_batch
         ):
             output = transformer(
                 latents.to(dtype),
-                timestep.reshape(1),
+                forward_timestep,
                 frame_start=frame_start,
-                condition_vision=False,
                 **forward_kwargs,
             )
         latents = scheduler.step(
@@ -1288,48 +1302,78 @@ def run_fixed_step_sde(
     return latents.to(dtype)
 
 
+def clean_frame_ranges(
+    *,
+    text_tokens: int,
+    history_frames: int,
+    frames: int,
+    tokens_per_frame: int,
+    sink_frames: int,
+    window_frames: int | None,
+) -> tuple[tuple[int, int, int], ...]:
+    """``(sink_end, window_start, frame_end)`` token offsets of each frame's read."""
+    ranges = []
+    for frame in range(frames):
+        past = history_frames + frame
+        sink_end = min(sink_frames, past)
+        window_start = (
+            max(sink_end, past - window_frames)
+            if window_frames is not None
+            else sink_end
+        )
+        # Token offsets in [text | history | current chunk]. The window
+        # advances per frame, exactly as in sequential clean commits.
+        ranges.append(
+            (
+                text_tokens + sink_end * tokens_per_frame,
+                text_tokens + window_start * tokens_per_frame,
+                text_tokens + (past + 1) * tokens_per_frame,
+            )
+        )
+    return tuple(ranges)
+
+
 def commit_clean_kv(
     transformer: CosmosDreamsTransformer,
     latent: torch.Tensor,
     *,
-    history: list[KVPair] | CosmosDreamsKVCache | None,
+    history: CosmosDreamsKVHistory | SelectedKVHistory,
     dtype: torch.dtype,
     tokens_per_frame: int,
-    sink_frames: int,
     window_frames: int | None,
-    archive: CosmosDreamsKVCache | None = None,
     forward_batch: Req | None = None,
+    frame_causal: tuple[int, int | None] | None = None,
     **forward_kwargs: Any,
-) -> list[KVPair] | CosmosDreamsKVCache:
-    """Clean-refresh ``latent`` (timestep 0, no time embedding) and commit its K/V.
+) -> None:
+    """Clean-refresh ``latent`` (no time embedding) and commit its K/V.
 
-    Frustum also copies the clean frames to its complete archive. Selected
-    history stays in the working set for the rest of the chunk.
+    The pass attends to ``history`` and writes behind it; ``window_frames`` bounds
+    what the history keeps after its sink (None keeps everything). With
+    ``frame_causal`` as the ``(sink, window)`` frames each frame reads, a
+    multi-frame chunk commits what a refresh of one frame at a time would.
     """
+    chunk_tokens = latent.shape[2] * tokens_per_frame
+    kv_slots = history.slots(chunk_tokens)
+    if frame_causal is not None:
+        text_tokens = forward_kwargs["text_length"]
+        forward_kwargs["clean_frame_ranges"] = clean_frame_ranges(
+            text_tokens=text_tokens,
+            history_frames=(int(kv_slots[0].keys.shape[1]) - text_tokens - chunk_tokens)
+            // tokens_per_frame,
+            frames=latent.shape[2],
+            tokens_per_frame=tokens_per_frame,
+            sink_frames=frame_causal[0],
+            window_frames=frame_causal[1],
+        )
     with set_forward_context(
         current_timestep=0, attn_metadata=None, forward_batch=forward_batch
     ):
-        output = transformer(
-            latent.to(dtype),
-            torch.zeros(1, device=latent.device, dtype=torch.float32),
-            history_kv=history,
-            condition_vision=True,
-            **forward_kwargs,
+        transformer.write_clean_kv(
+            latent.to(dtype), kv_slots=kv_slots, **forward_kwargs
         )
-    if archive is not None:
-        # The current K/V alias the working buffer until its next commit.
-        current_tokens = latent.shape[2] * tokens_per_frame
-        for index, (key, value) in enumerate(output.current_kv):
-            dest_k, dest_v = archive.attention_buffer(index, current_tokens)
-            dest_k[:, -current_tokens:].copy_(key)
-            dest_v[:, -current_tokens:].copy_(value)
-        archive.commit(current_tokens)
-    return append_kv_history(
-        history,
-        output.current_kv,
-        tokens_per_frame=tokens_per_frame,
-        sink_frames=sink_frames,
-        window_frames=window_frames,
+    history.commit(
+        chunk_tokens,
+        tail_tokens=None if window_frames is None else window_frames * tokens_per_frame,
     )
 
 
@@ -1348,6 +1392,10 @@ class _RolloutContext(msgspec.Struct):
     dtype: torch.dtype
     forward_batch: Req | None = None
     row_domain_ids: torch.Tensor | None = None
+
+    @property
+    def text_length(self) -> int:
+        return int(self.text_kv[0][0].shape[1])
 
     def chunk_domain_ids(
         self, frame_start: int, frame_end: int, action_count: int
@@ -1385,11 +1433,15 @@ class CosmosDreamsRolloutStage(PipelineStage):
             )
         self.transformer = transformer
         self.scheduler = validate_fixed_step_scheduler(scheduler, manifest)
+        self.schedules = FixedStepSchedules(self.scheduler)
         self.manifest = manifest
         # With a VAE the rollout decodes committed chunks on a side stream; the
         # decoding stage then only post-processes.
         self.vae = vae
         self.overlap_vae_decode = bool(overlap_vae_decode and vae is not None)
+        # Made on first use and kept: the CUDA allocator caches freed memory per stream.
+        self._decode_stream: torch.cuda.Stream | None = None
+        self._priority_stream: torch.cuda.Stream | None = None
         # Without a resolved profile the stage runs the artifact as exported:
         # its t_list on every chunk and its K/V window.
         self.profile = profile or CosmosDreamsInferenceProfile(
@@ -1434,7 +1486,7 @@ class CosmosDreamsRolloutStage(PipelineStage):
         return batch
 
     def _decode_queue(
-        self, device: torch.device, *, quality: str = "exact"
+        self, device: torch.device, batch: Req
     ) -> "CausalDecodeQueue | None":
         if (
             not self.overlap_vae_decode
@@ -1442,24 +1494,36 @@ class CosmosDreamsRolloutStage(PipelineStage):
             or self.server_args.should_start_component_on_cpu("vae")
         ):
             return None
-        return CausalDecodeQueue(self.vae, device=device, quality=quality)
+        if self._decode_stream is None:
+            self._decode_stream = torch.cuda.Stream(device=device)
+            if envs.SGLANG_DIFFUSION_COSMOS_DREAMS_ROLLOUT_STREAM_PRIORITY:
+                # 0 is the lowest CUDA stream priority; lower numbers rank higher.
+                self._priority_stream = torch.cuda.Stream(device=device, priority=-1)
+        return CausalDecodeQueue(
+            self.vae,
+            device=device,
+            stream=self._decode_stream,
+            fast_path=quality_allows(batch.sampling_params.quality, "lossless"),
+            encoder=self._streamed_encoder(batch),
+        )
 
-    def _rollout(self, batch: Req) -> torch.Tensor:
-        target_frame: int = batch.extra[EXTRA_TARGET_LATENT_FRAMES]
-        full_history = self.profile.history_mode == HISTORY_MODE_FULL
-        if full_history and target_frame > self.profile.window_frames:
-            raise ValueError(
-                "Cosmos-Dreams full history must retain the entire rollout; "
-                f"raise history_max_frames to cover {batch.num_frames} pixel frames."
-            )
-        manifest = self.manifest
-        device = get_local_torch_device()
+    def _streamed_encoder(self, batch: Req) -> EncodeWhileDecoding | None:
+        save_file_path = streamed_video_output_path(batch, self.server_args, 1)
+        if save_file_path is None:
+            return None
+        return EncodeWhileDecoding(
+            save_file_path,
+            batch,
+            finish_frames=Cosmos3DecodingStage._postprocess_tensor,
+        )
+
+    def _rollout_context(self, batch: Req, device: torch.device) -> _RolloutContext:
         text_kv, _ = self.transformer.encode_und_kv(
             batch.extra[EXTRA_TEXT_IDS], batch.extra[EXTRA_TEXT_MASK]
         )
         geometry: CosmosDreamsGeometry = batch.extra[EXTRA_GEOMETRY]
         row_domain_ids = batch.extra.get(EXTRA_ACTION_DOMAIN_IDS)
-        context = _RolloutContext(
+        return _RolloutContext(
             text_kv=text_kv,
             fps=float(batch.fps),
             domain_id=batch.extra[EXTRA_DOMAIN_ID],
@@ -1467,7 +1531,7 @@ class CosmosDreamsRolloutStage(PipelineStage):
                 [batch.extra[EXTRA_DOMAIN_ID]], device=device, dtype=torch.long
             ),
             tokens_per_frame=geometry.tokens_per_frame(
-                manifest.action_tokens_per_frame
+                self.manifest.action_tokens_per_frame
             ),
             latent_channels=self.transformer.latent_channel,
             geometry=geometry,
@@ -1476,189 +1540,234 @@ class CosmosDreamsRolloutStage(PipelineStage):
             forward_batch=batch,
             row_domain_ids=None if row_domain_ids is None else row_domain_ids.to("cpu"),
         )
-        rows: torch.Tensor | None = batch.extra[EXTRA_ACTION_ROWS]
-        seed = batch.seed
-        if not isinstance(seed, int):
-            raise ValueError(
-                f"Cosmos-Dreams requires a single integer seed, got {seed!r}."
-            )
 
+    def _new_history(
+        self, context: _RolloutContext, *, rollout_frames: int | None
+    ) -> CosmosDreamsKVHistory:
+        return new_kv_history(
+            context.text_kv,
+            tokens_per_frame=context.tokens_per_frame,
+            sink_frames=self.profile.sink_frames,
+            window_frames=self.profile.window_frames,
+            chunk_frames=self.manifest.chunk_size,
+            rollout_frames=rollout_frames,
+        )
+
+    def _rollout(self, batch: Req) -> torch.Tensor:
+        target_frame: int = batch.extra[EXTRA_TARGET_LATENT_FRAMES]
+        if (
+            self.profile.history_mode == HISTORY_MODE_FULL
+            and target_frame > self.profile.window_frames
+        ):
+            raise ValueError(
+                "Cosmos-Dreams full history must retain the entire rollout. "
+                f"Raise history_max_frames to cover {batch.num_frames} pixel frames."
+            )
+        device = get_local_torch_device()
+        if not isinstance(batch.seed, int):
+            raise ValueError(
+                f"Cosmos-Dreams requires a single integer seed, got {batch.seed!r}."
+            )
         if target_frame - 1 > self.profile.sink_frames + self.profile.window_frames:
             self.log_info(
                 f"Rollout of {target_frame} latent frames exceeds the {self.profile.describe()}; "
                 "the oldest committed frames are evicted from the K/V history once it fills."
             )
-        selector: FrustumHistorySelector | None = batch.extra[EXTRA_FRUSTUM_SELECTOR]
-        history: list[KVPair] | CosmosDreamsKVCache | None = None
-        archive = None
-        if self.profile.window_frames is not None and target_frame > 1:
-            # Full reserves all committed frames; the final latent has no commit,
-            # so the request capacity stays below this window and needs no scratch.
-            history = CosmosDreamsKVCache(
-                text_kv,
-                tokens_per_frame=context.tokens_per_frame,
-                sink_frames=0 if full_history else self.profile.sink_frames,
-                window_frames=target_frame
-                if full_history
-                else self.profile.window_frames,
-                max_current_frames=min(manifest.chunk_size, target_frame),
-                max_history_frames=target_frame - 1,
-            )
-            if selector is not None:
-                archive = history
-                current_frames = min(manifest.chunk_size, target_frame)
-                selected_frames = min(target_frame - 1, sum(selector.sizes))
-                # Leave room for this chunk's clean frames without eviction.
-                history = CosmosDreamsKVCache(
-                    text_kv,
-                    tokens_per_frame=context.tokens_per_frame,
-                    sink_frames=0,
-                    window_frames=selected_frames + current_frames + 1,
-                    max_current_frames=current_frames,
-                    max_history_frames=selected_frames + current_frames,
-                )
-        latents: list[torch.Tensor] = []
-        decode_queue = self._decode_queue(device, quality=batch.sampling_params.quality)
-        with (
-            archive if archive is not None else nullcontext(),
-            history if isinstance(history, CosmosDreamsKVCache) else nullcontext(),
-            decode_queue or nullcontext(),
-        ):
-            next_frame = 0
-            if batch.image_latent is not None:
-                initial_latent = batch.image_latent.to(
-                    device=device, dtype=context.dtype
-                )
-                action, null_indexes = self._actions(
-                    rows, frame_start=0, frame_end=1, context=context
-                )
-                if target_frame > 1:
-                    history = self._commit_clean_chunk(
-                        context,
-                        history,
-                        initial_latent,
-                        frame_idx=0,
-                        action=action,
-                        null_indexes=null_indexes,
-                        domain_ids=context.chunk_domain_ids(
-                            0, 1, manifest.action_tokens_per_frame
-                        ),
-                        archive=archive,
-                    )
-                latents.append(initial_latent)
-                if decode_queue is not None:
-                    decode_queue.submit(initial_latent)
-                next_frame = 1
-
-            for chunk_start, chunk_end in iter_ar_chunk_ranges(
-                next_frame, target_frame, manifest.chunk_size
+        decode_queue = self._decode_queue(device, batch)
+        with decode_queue or nullcontext():
+            # Only a rollout that shares the GPU with its decode has anything to outrank.
+            with rollout_stream(
+                device, None if decode_queue is None else self._priority_stream
             ):
-                action, null_indexes = self._actions(
-                    rows, frame_start=chunk_start, frame_end=chunk_end, context=context
-                )
-                generator = torch.Generator(device=device).manual_seed(
-                    seed + chunk_start
-                )
-                # The reference draws checkpoint-dtype noise, then promotes it to fp32.
-                noise = torch.randn(
-                    (
-                        1,
-                        context.latent_channels,
-                        chunk_end - chunk_start,
-                        geometry.latent_height,
-                        geometry.latent_width,
-                    ),
-                    generator=generator,
-                    device=device,
-                    dtype=context.dtype,
-                )
-                action_count = manifest.action_tokens_per_frame
-                chunk_domains = context.chunk_domain_ids(
-                    chunk_start, chunk_end, action_count
-                )
-                # One retrieval per chunk, shared by every denoising step and refresh.
-                selected = (
-                    None
-                    if selector is None
-                    else selector.select(chunk_start, chunk_end)
-                )
-                if archive is not None:
-                    history.load_selected(archive, selected, context.tokens_per_frame)
-                clean_chunk = self._denoise_chunk(
-                    context,
-                    noise,
-                    seed=seed,
-                    history=history,
-                    frame_start=chunk_start,
-                    action=action,
-                    null_indexes=null_indexes,
-                    domain_ids=chunk_domains,
-                )
-                clean_count = max(0, min(chunk_end, target_frame - 1) - chunk_start)
-                if (
-                    clean_count
-                    and not null_indexes
-                    and (
-                        not isinstance(history, CosmosDreamsKVCache)
-                        or clean_count * context.tokens_per_frame
-                        <= history.window_tokens
-                    )
-                ):
-                    history = self._commit_clean_chunk(
-                        context,
-                        history,
-                        clean_chunk[:, :, :clean_count],
-                        frame_idx=chunk_start,
-                        action=action[:, : clean_count * action_count],
-                        null_indexes=(),
-                        domain_ids=(
-                            chunk_domains
-                            if chunk_domains.ndim == 1
-                            else chunk_domains[:, : clean_count * action_count]
-                        ),
-                        archive=archive,
-                    )
-                else:
-                    # Null actions use single-frame RoPE. A clean batch wider
-                    # than the cache window also needs framewise commits.
-                    for local_idx, frame_idx in iter_clean_commit_frames(
-                        chunk_start, chunk_end, target_frame=target_frame
-                    ):
-                        history = self._commit_clean_chunk(
-                            context,
-                            history,
-                            clean_chunk[:, :, local_idx : local_idx + 1],
-                            frame_idx=frame_idx,
-                            action=action[
-                                :,
-                                local_idx * action_count : (local_idx + 1)
-                                * action_count,
-                            ],
-                            null_indexes=(0,) if local_idx in null_indexes else (),
-                            domain_ids=frame_domain_ids(
-                                chunk_domains, local_idx, action_count
-                            ),
-                            archive=archive,
-                        )
-                latents.append(clean_chunk)
-                if decode_queue is not None:
-                    decode_queue.submit(clean_chunk)
-                retrieval = (
-                    ""
-                    if selected is None
-                    else "; frustum history "
-                    + describe_selection(selector, chunk_start, selected)
-                )
-                self.log_info(
-                    f"Committed latent frames [{chunk_start}, {chunk_end}) of {target_frame} "
-                    f"({len(self.profile.sigmas_for_frame(chunk_start))} denoise steps){retrieval}"
+                latents = self._rollout_chunks(
+                    batch,
+                    self._rollout_context(batch, device),
+                    target_frame=target_frame,
+                    decode_queue=decode_queue,
                 )
         if decode_queue is not None:
+            self._hand_over_decode(batch, decode_queue)
+        return latents
+
+    def _hand_over_decode(self, batch: Req, decode_queue: "CausalDecodeQueue") -> None:
+        self.log_info("Decoded %d chunks during the rollout", decode_queue.submitted)
+        output_file_paths, encode_failed = finish_streamed_encode(decode_queue.encoder)
+        if encode_failed:
+            # A failed encode leaves nothing behind, so the decoding stage decodes
+            # the latents itself and the worker saves the frames. Ranks without
+            # the encoder keep their frames back too, to take part in that decode.
+            return
+        if output_file_paths is not None:
+            batch.extra[EXTRA_STREAMED_OUTPUT_PATHS] = output_file_paths
+        else:
             batch.extra[EXTRA_DECODED_OUTPUT] = decode_queue.finish()
+
+    def _rollout_chunks(
+        self,
+        batch: Req,
+        context: _RolloutContext,
+        *,
+        target_frame: int,
+        decode_queue: "CausalDecodeQueue | None",
+    ) -> torch.Tensor:
+        manifest = self.manifest
+        rows: torch.Tensor | None = batch.extra[EXTRA_ACTION_ROWS]
+        seed: int = batch.seed
+        action_count = manifest.action_tokens_per_frame
+        selector: FrustumHistorySelector | None = batch.extra[EXTRA_FRUSTUM_SELECTOR]
+        history = self._new_history(context, rollout_frames=target_frame)
+        # Frustum retrieval reads a gathered subset; its commits still land in ``history``.
+        retrieval = (
+            None
+            if selector is None
+            else SelectedKVHistory(
+                history,
+                context.text_kv,
+                selected_tokens=selector.budget * context.tokens_per_frame,
+                chunk_tokens=manifest.chunk_size * context.tokens_per_frame,
+            )
+        )
+        latents: list[torch.Tensor] = []
+        if batch.image_latent is not None:
+            latents.append(
+                self._commit_image_frame(
+                    batch, context, history, rows=rows, commit=target_frame > 1
+                )
+            )
+            if decode_queue is not None:
+                decode_queue.submit(latents[0])
+
+        for chunk_start, chunk_end in iter_ar_chunk_ranges(
+            len(latents), target_frame, manifest.chunk_size
+        ):
+            action, null_indexes = self._actions(
+                rows, frame_start=chunk_start, frame_end=chunk_end, context=context
+            )
+            chunk_domains = context.chunk_domain_ids(
+                chunk_start, chunk_end, action_count
+            )
+            # One retrieval per chunk, shared by every denoising step and refresh;
+            # the framewise refresh also sees the chunk's already-committed frames.
+            selected = (
+                None if selector is None else selector.select(chunk_start, chunk_end)
+            )
+            reader = (
+                history
+                if retrieval is None
+                else retrieval.select(
+                    selected, tokens_per_frame=context.tokens_per_frame
+                )
+            )
+            clean_chunk = self._denoise_chunk(
+                context,
+                self._chunk_noise(context, seed=seed, frames=(chunk_start, chunk_end)),
+                seed=seed,
+                history=reader,
+                frame_start=chunk_start,
+                action=action,
+                null_indexes=null_indexes,
+                domain_ids=chunk_domains,
+            )
+            clean_frames = list(
+                iter_clean_commit_frames(
+                    chunk_start, chunk_end, target_frame=target_frame
+                )
+            )
+            clean_count = len(clean_frames)
+            if clean_count and not null_indexes:
+                self._commit_clean_chunk(
+                    context,
+                    reader,
+                    clean_chunk[:, :, :clean_count],
+                    frame_idx=chunk_start,
+                    action=action[:, : clean_count * action_count],
+                    null_indexes=(),
+                    domain_ids=(
+                        chunk_domains
+                        if chunk_domains.ndim == 1
+                        else chunk_domains[:, : clean_count * action_count]
+                    ),
+                )
+            else:
+                # Null actions use the single-frame RoPE convention during
+                # clean refresh, so these chunks still refresh framewise.
+                for local_idx, frame_idx in clean_frames:
+                    self._commit_clean_chunk(
+                        context,
+                        reader,
+                        clean_chunk[:, :, local_idx : local_idx + 1],
+                        frame_idx=frame_idx,
+                        action=action[
+                            :, local_idx * action_count : (local_idx + 1) * action_count
+                        ],
+                        null_indexes=(0,) if local_idx in null_indexes else (),
+                        domain_ids=frame_domain_ids(
+                            chunk_domains, local_idx, action_count
+                        ),
+                    )
+            latents.append(clean_chunk)
+            if decode_queue is not None:
+                decode_queue.submit(clean_chunk)
+            retrieved = (
+                ""
+                if selected is None
+                else "; frustum history "
+                + describe_selection(selector, chunk_start, selected)
+            )
             self.log_info(
-                "Decoded %d chunks during the rollout", decode_queue.submitted
+                f"Committed latent frames [{chunk_start}, {chunk_end}) of {target_frame} "
+                f"({len(self.profile.sigmas_for_frame(chunk_start))} denoise steps){retrieved}"
             )
         return torch.cat(latents, dim=2)
+
+    def _commit_image_frame(
+        self,
+        batch: Req,
+        context: _RolloutContext,
+        history: CosmosDreamsKVHistory,
+        *,
+        rows: torch.Tensor | None,
+        commit: bool,
+    ) -> torch.Tensor:
+        latent = batch.image_latent.to(device=context.device, dtype=context.dtype)
+        if commit:
+            action, null_indexes = self._actions(
+                rows, frame_start=0, frame_end=1, context=context
+            )
+            self._commit_clean_chunk(
+                context,
+                history,
+                latent,
+                frame_idx=0,
+                action=action,
+                null_indexes=null_indexes,
+                domain_ids=context.chunk_domain_ids(
+                    0, 1, self.manifest.action_tokens_per_frame
+                ),
+            )
+        return latent
+
+    @staticmethod
+    def _chunk_noise(
+        context: _RolloutContext, *, seed: int, frames: tuple[int, int]
+    ) -> torch.Tensor:
+        chunk_start, chunk_end = frames
+        generator = torch.Generator(device=context.device).manual_seed(
+            seed + chunk_start
+        )
+        # The reference draws checkpoint-dtype noise, then promotes it to fp32.
+        return torch.randn(
+            (
+                1,
+                context.latent_channels,
+                chunk_end - chunk_start,
+                context.geometry.latent_height,
+                context.geometry.latent_width,
+            ),
+            generator=generator,
+            device=context.device,
+            dtype=context.dtype,
+        )
 
     def _actions(
         self,
@@ -1683,88 +1792,77 @@ class CosmosDreamsRolloutStage(PipelineStage):
         initial_noise: torch.Tensor,
         *,
         seed: int,
-        history: HistoryKV | None,
+        history: CosmosDreamsKVHistory | SelectedKVHistory,
         frame_start: int,
         action: torch.Tensor,
         null_indexes: tuple[int, ...],
         domain_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Fixed-step SDE updates over the chunk's schedule; history K/V is read but never written."""
+        """Fixed-step SDE updates over the chunk's schedule; history K/V is read but never committed."""
         return run_fixed_step_sde(
             self.transformer,
-            self.scheduler,
+            self.schedules,
             initial_noise,
             t_list=self.profile.sigmas_for_frame(frame_start),
             seed=seed,
             frame_start=frame_start,
             dtype=context.dtype,
             forward_batch=context.forward_batch,
-            text_kv=context.text_kv,
+            text_length=context.text_length,
             fps=context.fps,
             action_latents=action,
             action_domain_ids=context.domain_ids if domain_ids is None else domain_ids,
-            history_kv=history,
+            kv_slots=history.slots(initial_noise.shape[2] * context.tokens_per_frame),
             null_action_frame_indexes=null_indexes,
         )
 
     def _commit_clean_chunk(
         self,
         context: _RolloutContext,
-        history: list[KVPair] | CosmosDreamsKVCache | None,
+        history: CosmosDreamsKVHistory | SelectedKVHistory,
         latent: torch.Tensor,
         *,
         frame_idx: int,
         action: torch.Tensor,
         null_indexes: tuple[int, ...],
         domain_ids: torch.Tensor | None = None,
-        archive: CosmosDreamsKVCache | None = None,
-    ) -> list[KVPair] | CosmosDreamsKVCache:
+    ) -> None:
         """Batch clean projections while preserving per-frame attention and eviction."""
-        clean_frame_ranges = None
+        frame_causal = None
         if latent.shape[2] > 1:
-            tokens = context.tokens_per_frame
-            text_tokens = context.text_kv[0][0].shape[1]
-            if isinstance(history, CosmosDreamsKVCache):
-                history_frames = history.history_tokens // tokens
-                sink = history.sink_tokens // tokens
-                window = history.window_tokens // tokens
-            else:
-                history_frames = (
-                    0 if history is None else history[0][0].shape[1] // tokens
-                )
-                sink, window = self.profile.sink_frames, self.profile.window_frames
-            ranges = []
-            for frame in range(latent.shape[2]):
-                past = history_frames + frame
-                sink_end = min(sink, past)
-                window_start = (
-                    max(sink_end, past - window) if window is not None else sink_end
-                )
-                # Token offsets in [text | history | current chunk]. The window
-                # advances per frame, exactly as in sequential clean commits.
-                ranges.append(
-                    (
-                        text_tokens + sink_end * tokens,
-                        text_tokens + window_start * tokens,
-                        text_tokens + (past + 1) * tokens,
-                    )
-                )
-            clean_frame_ranges = tuple(ranges)
-        return commit_clean_kv(
+            # Frustum selection is fixed for this chunk, so every frame reads all
+            # of it and evicts nothing.
+            frame_causal = (
+                (0, None)
+                if isinstance(history, SelectedKVHistory)
+                else (self.profile.sink_frames, self.profile.window_frames)
+            )
+        commit_clean_kv(
             self.transformer,
             latent,
             history=history,
             dtype=context.dtype,
             tokens_per_frame=context.tokens_per_frame,
-            sink_frames=self.profile.sink_frames,
             window_frames=self.profile.window_frames,
-            archive=archive,
             forward_batch=context.forward_batch,
-            text_kv=context.text_kv,
+            text_length=context.text_length,
             frame_start=frame_idx,
             fps=context.fps,
             action_latents=action,
             action_domain_ids=context.domain_ids if domain_ids is None else domain_ids,
             null_action_frame_indexes=null_indexes,
-            clean_frame_ranges=clean_frame_ranges,
+            frame_causal=frame_causal,
+        )
+
+
+class CosmosDreamsDecodingStage(Cosmos3DecodingStage):
+    def forward(self, batch: Req, server_args: ServerArgs):
+        output_file_paths = batch.extra.get(EXTRA_STREAMED_OUTPUT_PATHS)
+        if output_file_paths is None:
+            return super().forward(batch, server_args)
+        return OutputBatch(
+            output=None,
+            output_file_paths=output_file_paths,
+            metrics=batch.metrics,
+            rollout_trajectory_data=batch.rollout_trajectory_data,
         )

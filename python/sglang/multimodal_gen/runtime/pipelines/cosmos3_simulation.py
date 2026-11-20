@@ -44,11 +44,11 @@ from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import 
     ComposedPipelineBase,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3 import (
-    Cosmos3DecodingStage,
     Cosmos3DenoisingStage,
     Cosmos3TimestepPreparationStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_simulation.dreams import (
+    CosmosDreamsDecodingStage,
     CosmosDreamsImageStage,
     CosmosDreamsPrepareStage,
     CosmosDreamsRolloutStage,
@@ -151,7 +151,7 @@ class CosmosDreamsPipeline(ComposedPipelineBase):
             )
         )
         self.add_stage(
-            Cosmos3DecodingStage(vae, guardrails=False, sound_tokenizer=None)
+            CosmosDreamsDecodingStage(vae, guardrails=False, sound_tokenizer=None)
         )
         self._log_profile(manifest, profile)
 

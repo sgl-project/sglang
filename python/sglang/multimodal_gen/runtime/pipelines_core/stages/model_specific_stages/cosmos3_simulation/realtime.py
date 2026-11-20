@@ -21,7 +21,6 @@ from sglang.multimodal_gen.configs.models.dits.cosmos_dreams import (
 )
 from sglang.multimodal_gen.configs.sample.sampling_params import quality_allows
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
-from sglang.multimodal_gen.runtime.models.dits.cosmos_dreams import KVPair
 from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import use_vae_fast_path
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
     OutputBatch,
@@ -45,6 +44,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
     normalize_action_rows,
     pad_action_rows,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_simulation.kv_history import (
+    CosmosDreamsKVHistory,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime.vae import (
     RealtimeVAEDecodeState,
 )
@@ -65,7 +67,7 @@ class CosmosDreamsSessionState(BaseRealtimeState):
         self.seed: int | None = None
         self.fps: float | None = None
         self.context: _RolloutContext | None = None
-        self.history: list[KVPair] | None = None
+        self.history: CosmosDreamsKVHistory | None = None
         self.next_frame: int = 0
         self.pending_image_latent: torch.Tensor | None = None
 
@@ -253,6 +255,8 @@ class CosmosDreamsRealtimeRolloutStage(CosmosDreamsRolloutStage):
             device=device,
             dtype=torch.bfloat16,
         )
+        # A session has no known length, so its history grows on demand.
+        state.history = self._new_history(state.context, rollout_frames=None)
         return state.context
 
     def _tick(self, batch: Req) -> torch.Tensor:
@@ -314,7 +318,7 @@ class CosmosDreamsRealtimeRolloutStage(CosmosDreamsRolloutStage):
             )
             # Every frame is committed: the next tick reads all of them.
             for local_idx, frame_idx in enumerate(range(chunk_start, chunk_end)):
-                state.history = self._commit_clean_chunk(
+                self._commit_clean_chunk(
                     context,
                     state.history,
                     clean_chunk[:, :, local_idx : local_idx + 1],
@@ -347,7 +351,7 @@ class CosmosDreamsRealtimeRolloutStage(CosmosDreamsRolloutStage):
             device=context.device,
             dtype=context.dtype,
         )
-        state.history = self._commit_clean_chunk(
+        self._commit_clean_chunk(
             context,
             state.history,
             latent,

@@ -17,6 +17,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
     resolve_frustum_selector,
     rot6d_to_matrix,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_simulation.kv_history import (
+    SelectedKVHistory,
+    new_kv_history,
+)
 
 IMAGE = (640, 360)
 INTRINSICS = torch.tensor(
@@ -249,6 +253,55 @@ class TestPoseRecovery(unittest.TestCase):
         )
         # ...and the second chunk re-anchors on the last pose of the first.
         self.assertAlmostEqual(absolute[POSE_CHUNK_FRAMES + 1, 2, 3].item(), 2.0)
+
+
+class TestSelectedHistory(unittest.TestCase):
+    def test_reads_selected_frames_and_commits_to_the_archive(self):
+        tokens, layers = 3, 2
+        text_kv = [
+            (torch.full((1, 2, 1, 1), -1.0), torch.full((1, 2, 1, 1), -1.0))
+            for _ in range(layers)
+        ]
+        archive = new_kv_history(
+            text_kv,
+            tokens_per_frame=tokens,
+            sink_frames=0,
+            window_frames=None,
+            chunk_frames=2,
+            rollout_frames=8,
+        )
+
+        def write(history, frame: int) -> list:
+            slots = history.slots(tokens)
+            for layer, slot in enumerate(slots):
+                slot.chunk_keys.fill_(frame + layer * 100)
+                slot.chunk_values.fill_(-frame)
+            read = slots[1].keys[0, :, 0, 0].tolist()
+            history.commit(tokens)
+            return read
+
+        for frame in range(6):
+            write(archive, frame)
+        view = SelectedKVHistory(
+            archive, text_kv, selected_tokens=3 * tokens, chunk_tokens=2 * tokens
+        )
+        view.select([0, 3, 5], tokens_per_frame=tokens)
+        # Two refreshes of one chunk: the second also reads the first's frame.
+        selected = [100.0] * 3 + [103.0] * 3 + [105.0] * 3
+        self.assertEqual(write(view, 6), [-1.0] * 2 + selected + [106.0] * 3)
+        self.assertEqual(
+            write(view, 7), [-1.0] * 2 + selected + [106.0] * 3 + [107.0] * 3
+        )
+        # Both landed in the archive, and a new selection starts from it alone.
+        self.assertEqual(
+            archive.committed(0)[1][0, ::tokens, 0, 0].tolist(),
+            [0, -1, -2, -3, -4, -5, -6, -7],
+        )
+        view.select([], tokens_per_frame=tokens)
+        self.assertEqual(view.slots(tokens)[0].keys.shape[1], 2 + tokens)
+        for bad in ([3, 0], [0, 0], [8], [-1]):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                view.select(bad, tokens_per_frame=tokens)
 
 
 class TestResolveFrustumSelector(unittest.TestCase):

@@ -612,6 +612,9 @@ class CudaVideoEncoder:
             ):
                 assert buffer.tensor is not None
                 copy_stream = torch.cuda.Stream()
+                # A blocking event lets this thread sleep until the producer
+                # reaches the recorded point.
+                copied = torch.cuda.Event(blocking=True)
                 while (item := self._queue.get()) is not None:
                     chunk, ready = item
                     del item
@@ -619,7 +622,8 @@ class CudaVideoEncoder:
                     copy_stream.wait_event(ready)
                     with torch.cuda.stream(copy_stream):
                         buffer.tensor[:count].copy_(chunk, non_blocking=True)
-                    copy_stream.synchronize()
+                    copied.record(copy_stream)
+                    copied.synchronize()
                     # the copy is done, so the allocator may hand this block out again
                     del chunk, ready
                     # write() copies into the pipe; sendfile would only lend it these

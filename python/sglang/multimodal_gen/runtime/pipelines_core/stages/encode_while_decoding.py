@@ -11,6 +11,7 @@ import torch
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.configs.task_type import DataType
 from sglang.multimodal_gen.runtime.distributed import (
+    get_decode_parallel_group_coordinator,
     get_replica_group,
     model_parallel_is_initialized,
 )
@@ -47,15 +48,39 @@ def can_encode_while_decoding(
     )
 
 
+def output_rank_video_path(
+    batch: Req, server_args: ServerArgs, batch_size: int
+) -> str | None:
+    """Where the output rank can write the MP4 during the decode, on every rank."""
+    if not can_encode_while_decoding(batch, server_args, batch_size):
+        return None
+    return batch.output_file_path(1, 0)
+
+
 def streamed_video_output_path(
     batch: Req, server_args: ServerArgs, batch_size: int
 ) -> str | None:
     """Where the output rank can write the MP4 during the decode, if anywhere."""
-    if not can_encode_while_decoding(batch, server_args, batch_size):
-        return None
     if model_parallel_is_initialized() and get_replica_group().rank_in_group != 0:
         return None
-    return batch.output_file_path(1, 0)
+    return output_rank_video_path(batch, server_args, batch_size)
+
+
+def output_rank_saved(saved: bool) -> bool:
+    """The output rank's ``saved``, on every VAE decode rank.
+
+    Every rank of the decode group calls it exactly when the output rank streams.
+    """
+    if not model_parallel_is_initialized():
+        return saved
+    group = get_decode_parallel_group_coordinator()
+    if group.world_size == 1:
+        return saved
+    decision = torch.tensor([int(saved)], dtype=torch.int32)
+    torch.distributed.broadcast(
+        decision, src=get_replica_group().first_rank, group=group.cpu_group
+    )
+    return bool(decision.item())
 
 
 class EncodeWhileDecoding:
@@ -145,3 +170,20 @@ class EncodeWhileDecoding:
             "decode instead. Enable debug logging for exception details."
         )
         logger.debug("Streamed video encode failure", exc_info=True)
+
+
+def finish_streamed_encode(
+    stream: EncodeWhileDecoding | None,
+) -> tuple[list[str] | None, bool]:
+    """Close this rank's encoder: (its saved path, whether the output rank's encode failed)."""
+    output_file_paths = None if stream is None else stream.finish()
+    failed = stream is not None and output_file_paths is None
+    if model_parallel_is_initialized():
+        group = get_replica_group()
+        if group.world_size > 1:
+            # Only the output rank has an encoder. A fallback that decodes again
+            # must run on every rank, since the VAE decode is shared across them.
+            failed = group.broadcast_object(
+                failed if group.rank_in_group == 0 else None, src=0
+            )
+    return output_file_paths, failed

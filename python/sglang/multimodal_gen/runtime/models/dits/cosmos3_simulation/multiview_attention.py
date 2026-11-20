@@ -532,6 +532,39 @@ def pack_allowed_bits(group_allowed: torch.Tensor) -> tuple[torch.Tensor, int]:
     return words.reshape(-1).to(torch.int32).contiguous(), words_per_row
 
 
+# The key-expanded FA4 mask_mod adds an int32 key position to an int32 row offset.
+MAX_KEY_EXPANDED_TABLE_BYTES = 2**31 - 1
+
+
+def fa4_mask_table(
+    group_allowed: torch.Tensor,
+    q_group_ids: torch.Tensor,
+    k_group_ids: torch.Tensor,
+    *,
+    key_expanded: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(q_table_base, allowed_table)``: the run-pair truth table as an FA4 mask_mod reads it.
+
+    Key-expanded, the int8 table holds one byte per query run and key position,
+    at ``q_table_base`` plus the key position. Past int32 offsets, with
+    ``key_expanded=False``, or when the expansion runs out of device memory, it
+    is the int32 words of :func:`pack_allowed_bits`, indexed through the key's
+    run id. Folding the row stride into ``q_table_base`` lets one compiled
+    mask_mod serve every layout.
+    """
+    kv_len = k_group_ids.numel()
+    if key_expanded and group_allowed.shape[0] * kv_len <= MAX_KEY_EXPANDED_TABLE_BYTES:
+        try:
+            table = group_allowed.to(torch.int8).index_select(1, k_group_ids.long())
+        except torch.OutOfMemoryError:
+            pass
+        else:
+            q_table_base = q_group_ids * kv_len
+            return q_table_base.to(torch.int32).contiguous(), table.reshape(-1)
+    words, words_per_row = pack_allowed_bits(group_allowed)
+    return (q_group_ids * words_per_row).to(torch.int32).contiguous(), words
+
+
 # eq=False: the fields are tensors, so a generated __eq__ would return a tensor
 # rather than a bool. Instances are cache values compared by identity.
 class MultiviewBlockSparsity(msgspec.Struct, frozen=True, eq=False):
@@ -539,19 +572,18 @@ class MultiviewBlockSparsity(msgspec.Struct, frozen=True, eq=False):
 
     ``partial_*``/``full_*`` are the FlexAttention KV-block layout, which
     FlashAttention-4 consumes unchanged. The remaining fields are the exact
-    per-element fallback used inside partially masked tiles: a token-to-run id
-    for each side plus the packed truth table over run pairs.
+    per-element fallback used inside partially masked tiles: the truth table
+    over run pairs, and FA4's form of it (see :func:`fa4_mask_table`).
     """
 
     partial_counts: torch.Tensor
     partial_indices: torch.Tensor
     full_counts: torch.Tensor
     full_indices: torch.Tensor
-    q_word_base: torch.Tensor
+    q_table_base: torch.Tensor
     k_group_ids: torch.Tensor
-    allowed_words: torch.Tensor
+    allowed_table: torch.Tensor
     group_allowed: torch.Tensor
-    words_per_row: int
     q_block_size: int
     kv_block_size: int
     metadata: MultiviewFlexMetadata
@@ -563,10 +595,6 @@ class MultiviewBlockSparsity(msgspec.Struct, frozen=True, eq=False):
     @property
     def kv_len(self) -> int:
         return self.metadata.kv_len
-
-    def aux_tensors(self) -> list[torch.Tensor]:
-        """The mask_mod auxiliary tensors, in the order the kernel indexes them."""
-        return [self.q_word_base, self.k_group_ids, self.allowed_words]
 
     def to_block_mask(self) -> BlockMask:
         metadata = self.metadata
@@ -605,12 +633,14 @@ def build_multiview_block_sparsity(
     *,
     q_block_size: int = SPARSE_Q_BLOCK_SIZE,
     kv_block_size: int = SPARSE_KV_BLOCK_SIZE,
+    key_expanded_table: bool = False,
 ) -> MultiviewBlockSparsity:
     """Compress semantic runs into a sparse block map and a mask lookup table.
 
     The projection works at semantic-run and sparse-block granularity. Its
     largest dense intermediates are block-grid sized (about 10.4M entries for
     the released 11-view geometry at 64x64), never the ~42B-pair dense mask.
+    Only the FA4 backend reads the table.
     """
     q_vectors = metadata.query_vectors()
     k_vectors = metadata.key_vectors()
@@ -652,21 +682,19 @@ def build_multiview_block_sparsity(
     partial_counts, partial_indices = _block_indices(partial_blocks)
     full_counts, full_indices = _block_indices(full_blocks)
 
-    # Fold the table row stride into the query-side id so the kernel needs no
-    # compile-time shape constant and one compiled mask_mod serves every layout.
-    allowed_words, words_per_row = pack_allowed_bits(group_allowed)
-    q_word_base = (q_group_ids * words_per_row).to(torch.int32).contiguous()
+    q_table_base, allowed_table = fa4_mask_table(
+        group_allowed, q_group_ids, k_group_ids, key_expanded=key_expanded_table
+    )
 
     return MultiviewBlockSparsity(
         partial_counts=partial_counts,
         partial_indices=partial_indices,
         full_counts=full_counts,
         full_indices=full_indices,
-        q_word_base=q_word_base,
+        q_table_base=q_table_base,
         k_group_ids=k_group_ids.to(torch.int32).contiguous(),
-        allowed_words=allowed_words,
+        allowed_table=allowed_table,
         group_allowed=group_allowed,
-        words_per_row=words_per_row,
         q_block_size=q_block_size,
         kv_block_size=kv_block_size,
         metadata=metadata,
@@ -744,6 +772,7 @@ def get_multiview_attention_plan(
         metadata,
         q_block_size=q_block_size,
         kv_block_size=kv_block_size,
+        key_expanded_table=layout.backend == "fa4",
     )
     plan = sparsity if layout.backend == "fa4" else sparsity.to_block_mask()
     context.mask_cache[key] = plan

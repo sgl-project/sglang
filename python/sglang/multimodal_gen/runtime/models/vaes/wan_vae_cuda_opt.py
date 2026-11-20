@@ -7,8 +7,9 @@ the channels_last_3d layout. Wrappers are installed once at VAE load and
 dispatch on a decode-scoped :class:`VaeFastPathGate`: ``quality="lossless"``
 and ``quality="high"`` run the fused kernel (not bitwise-identical to aten,
 hence gated). The ``"exact"`` path preserves aten's normalization reduction
-and fuses its FP32 post-ops after first-sight exactness verification.
-Install is all-or-nothing and fail-closed.
+and fuses its post-ops after first-sight exactness verification. The Wan
+encoder takes only that exact path: its latents seed the sampler.
+Install is all-or-nothing and fail-closed, per decoder and per encoder.
 """
 
 import torch
@@ -41,8 +42,13 @@ except ImportError:  # pragma: no cover
     _HAS_TRITON = False
 
 
+def _bits_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
+    bits = torch.int16 if a.dtype == torch.bfloat16 else torch.int32
+    return a.dtype == b.dtype and torch.equal(a.view(bits), b.view(bits))
+
+
 class FusedWanRMSNormSiLU(nn.Module):
-    """Quality-gated full fusion or lossless FP32 post-op fusion.
+    """Quality-gated full fusion or lossless post-op fusion.
 
     Unsupported inputs and ``torch.compile`` use the original op chain.
     """
@@ -85,15 +91,17 @@ class FusedWanRMSNormSiLU(nn.Module):
             and x.is_cuda
             and not torch.is_grad_enabled()
             and x.ndim == 5
-            and (
-                x.dtype == torch.float32
-                or (x.dtype == torch.bfloat16 and torch.is_autocast_enabled("cuda"))
-            )
+            and x.dtype in (torch.float32, torch.bfloat16)
             and (isinstance(self.bias, torch.Tensor) or self.bias == 0.0)
         ):
+            # Outside autocast a BF16 activation keeps a BF16 norm, and every
+            # op of the chain rounds to BF16.
+            half_chain = x.dtype == torch.bfloat16 and not torch.is_autocast_enabled(
+                "cuda"
+            )
             # Every element takes the same ops whatever the sizes, so exactness
             # depends only on the dtypes and on which layout the kernel runs.
-            sig = (x.device, x.dtype, x.is_contiguous(), self.gamma.dtype)
+            sig = (x.device, x.dtype, x.is_contiguous(), self.gamma.dtype, half_chain)
             verified = self._post_gate.is_verified(sig)
             if verified or not torch.cuda.is_current_stream_capturing():
                 # Keep this outside the custom op: CUDA autocast promotes the
@@ -114,9 +122,7 @@ class FusedWanRMSNormSiLU(nn.Module):
                             out,
                             ref,
                             sig=sig,
-                            equal=lambda a, b: torch.equal(
-                                a.view(torch.int32), b.view(torch.int32)
-                            ),
+                            equal=_bits_equal,
                             logger=logger,
                         )
                     except Exception as exc:
@@ -279,7 +285,7 @@ def _install_channels_last_upsample(
 
 
 def maybe_optimize_wan_vae(vae: nn.Module) -> nn.Module:
-    """Install the quality-gated CUDA Wan VAE decoder fast path."""
+    """Install the CUDA Wan VAE fast paths: quality-gated decoder, exact encoder."""
     from sglang.multimodal_gen.runtime.models.vaes.wanvae import (
         AutoencoderKLWan,
         WanAttentionBlock,
@@ -295,11 +301,20 @@ def maybe_optimize_wan_vae(vae: nn.Module) -> nn.Module:
 
     if not isinstance(vae, AutoencoderKLWan):
         return vae
-    # the spatial-parallel decoder's blocks only swap in halo-exchanging convs
+    # the spatial-parallel blocks only swap in halo-exchanging convs
+    residual_block_cls = (WanResidualBlock, WanDistResidualBlock)
+    # the exact post-op kernel is NVIDIA-only
+    if _HAS_TRITON and vae.config.load_encoder and torch.version.hip is None:
+        _install_exact_encoder_norm_silu(
+            vae.encoder,
+            residual_block_cls=residual_block_cls,
+            rms_norm_cls=WanRMS_norm,
+            label="Wan VAE encoder",
+        )
     return _maybe_optimize_wan_family_vae(
         vae,
         decoder_cls=WanDecoder3d,
-        residual_block_cls=(WanResidualBlock, WanDistResidualBlock),
+        residual_block_cls=residual_block_cls,
         rms_norm_cls=WanRMS_norm,
         upsample_cls=WanUpsample,
         gated_module_classes=(
@@ -310,6 +325,28 @@ def maybe_optimize_wan_vae(vae: nn.Module) -> nn.Module:
         ),
         label="Wan VAE",
     )
+
+
+def _install_exact_encoder_norm_silu(
+    encoder: nn.Module,
+    *,
+    residual_block_cls: tuple[type, ...],
+    rms_norm_cls: type,
+    label: str,
+) -> None:
+    """The wrappers get a gate nothing enables, so no quality level trades the
+    encode's exactness for the fully fused kernel."""
+    n_norm = _install_norm_silu(
+        encoder,
+        VaeFastPathGate(),
+        residual_block_cls=residual_block_cls,
+        rms_norm_cls=rms_norm_cls,
+        label=label,
+    )
+    if n_norm is not None:
+        logger.info(
+            "%s: installed exact fast path (%d RMSNorm+SiLU fusions).", label, n_norm
+        )
 
 
 def maybe_optimize_qwen_image_vae(vae: nn.Module) -> nn.Module:

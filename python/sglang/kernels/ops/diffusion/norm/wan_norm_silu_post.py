@@ -1,5 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""FP32 Wan normalization post-ops with the native L2 denominator supplied."""
+"""Wan normalization post-ops with the native L2 denominator supplied.
+
+Two chains, told apart by the denominator's dtype: FP32 end to end (an FP32
+activation, or a BF16 one whose norm CUDA autocast promoted), and the BF16
+chain of a BF16 activation outside autocast, which rounds to BF16 after every
+op and returns BF16.
+"""
 
 import torch
 
@@ -8,8 +14,8 @@ from sglang.srt.utils.custom_op import register_custom_op
 
 
 @cache_once
-def _module(x_dtype, affine_dtype, channels_last):
-    args = make_cpp_args(x_dtype, affine_dtype, channels_last)
+def _module(x_dtype, affine_dtype, channels_last, half_chain):
+    args = make_cpp_args(x_dtype, affine_dtype, channels_last, half_chain)
     return load_jit(
         "wan_norm_silu_post",
         *args,
@@ -34,7 +40,9 @@ def can_use_wan_norm_silu_post(x, denominator, gamma, bias=None):
             x.is_contiguous() or x.is_contiguous(memory_format=torch.channels_last_3d)
         )
         or x.data_ptr() % 16
-        or denominator.dtype != torch.float32
+        or denominator.dtype not in (torch.float32, x.dtype)
+        # the half chain rounds every op to one dtype
+        or (denominator.dtype != torch.float32 and gamma.dtype != x.dtype)
         or denominator.device != x.device
         or denominator.shape != (x.shape[0], 1, *x.shape[2:])
         or not denominator.is_contiguous()
@@ -70,7 +78,8 @@ def _wan_norm_silu_post(
     has_bias: bool,
 ) -> None:
     channels_last = not x.is_contiguous()
-    _module(x.dtype, gamma.dtype, channels_last).run(
+    half_chain = denominator.dtype != torch.float32
+    _module(x.dtype, gamma.dtype, channels_last, half_chain).run(
         _storage(x, channels_last),
         denominator.view(-1),
         gamma.view(-1),
@@ -86,7 +95,7 @@ def _wan_norm_silu_post(
 def wan_norm_silu_post(x, denominator, gamma, bias=None, *, scale=None):
     if not can_use_wan_norm_silu_post(x, denominator, gamma, bias):
         raise ValueError("unsupported Wan normalization post-op inputs")
-    out = torch.empty_like(x, dtype=torch.float32)
+    out = torch.empty_like(x, dtype=denominator.dtype)
     _wan_norm_silu_post(
         x,
         denominator,

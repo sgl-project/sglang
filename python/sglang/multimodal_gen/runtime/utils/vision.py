@@ -4,7 +4,7 @@
 
 import os
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from contextlib import closing
 from io import BytesIO
 from urllib.parse import unquote, urlparse
@@ -249,22 +249,54 @@ def _read_video_frames(
             pass
 
     else:
-        try:
-            imageio.plugins.ffmpeg.get_exe()
-        except AttributeError:
-            raise AttributeError(
-                "`Unable to find an ffmpeg installation on your machine. Please install via `pip install imageio-ffmpeg"
-            ) from None
-
-        with imageio.get_reader(video) as reader:
-            # Closing the reader early stops the ffmpeg subprocess, so a prefix
-            # costs only the frames it needs.
-            for frame in reader:
-                pil_images.append(PIL.Image.fromarray(frame))
-                if max_frames is not None and len(pil_images) >= max_frames:
-                    break
+        pil_images = [
+            PIL.Image.fromarray(frame)
+            for frame in _iter_ffmpeg_frames(video, max_frames)
+        ]
 
     return pil_images
+
+
+def _iter_ffmpeg_frames(video: str, max_frames: int | None) -> Iterator[np.ndarray]:
+    try:
+        imageio.plugins.ffmpeg.get_exe()
+    except AttributeError:
+        raise AttributeError(
+            "`Unable to find an ffmpeg installation on your machine. Please install via `pip install imageio-ffmpeg"
+        ) from None
+
+    with imageio.get_reader(video) as reader:
+        # Closing the reader early stops the ffmpeg subprocess, so a prefix
+        # costs only the frames it needs.
+        for count, frame in enumerate(reader, start=1):
+            yield frame
+            if max_frames is not None and count >= max_frames:
+                break
+
+
+def iter_video_frames(
+    video: str, max_frames: int | None = None
+) -> Iterator[np.ndarray | PIL.Image.Image]:
+    """Yield the frames :func:`load_video` returns, one at a time as they decode.
+
+    A local non-GIF clip yields the decoder's ``uint8 [H, W, C]`` arrays, and URLs
+    and GIFs yield :func:`load_video`'s PIL images.
+    """
+    if max_frames is not None and max_frames <= 0:
+        raise ValueError(f"max_frames must be positive, got {max_frames}.")
+    if video.endswith(".gif") or not os.path.isfile(video):
+        yield from load_video(video, max_frames=max_frames)
+        return
+    for frame in _iter_ffmpeg_frames(video, max_frames):
+        yield np.asarray(frame)
+
+
+def rgb_hwc_uint8(frame: np.ndarray | PIL.Image.Image) -> np.ndarray:
+    if isinstance(frame, np.ndarray):
+        if frame.dtype == np.uint8 and frame.ndim == 3 and frame.shape[2] == 3:
+            return frame
+        frame = PIL.Image.fromarray(frame)
+    return np.asarray(frame.convert("RGB"), dtype=np.uint8)
 
 
 def get_default_height_width(

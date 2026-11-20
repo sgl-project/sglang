@@ -4,10 +4,13 @@ parsing, chunk-partition alignment, prompt formatting, vision-only position
 ids, and registry wiring."""
 
 import copy
+import functools
 import json
 import os
 import tempfile
+import threading
 import unittest
+from concurrent.futures import Future
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest import mock
@@ -17,6 +20,10 @@ import torch
 from sglang.multimodal_gen.configs.models.dits.cosmos_dreams import (
     parse_cosmos_dreams_manifest,
     resolve_transfer_history_profile,
+)
+from sglang.multimodal_gen.configs.models.vaes.wanvae import (
+    WanVAEArchConfig,
+    WanVAEConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos_dreams import (
     CosmosDreamsConfig,
@@ -36,22 +43,36 @@ from sglang.multimodal_gen.registry import (
 from sglang.multimodal_gen.runtime.models.dits.cosmos_dreams import (
     build_cosmos_dreams_position_ids,
 )
+from sglang.multimodal_gen.runtime.models.vaes.wanvae import AutoencoderKLWan
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_simulation import (
+    control_clip,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_simulation.control_clip import (
+    ControlClipDecode,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_simulation.dreams import (
-    append_kv_history,
     tokenize_dreams_prompt,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_simulation.kv_history import (
+    new_kv_history,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_simulation.transfer import (
     CONTROL_EMPHASIS_TEMPLATE,
     TRANSFER_SYSTEM_PROMPT,
+    CosmosDreamsTransferDecodingStage,
     align_pixel_frames_to_chunks,
     check_direct_distortion,
+    control_frames_used,
     direct_resize_control,
+    encode_control_latent,
+    encode_decoding_control_latent,
     format_transfer_prompt,
     normalize_control_pixels,
     read_video_fps,
     resize_center_crop_uint8,
     restore_transfer_output_size,
     select_direct_canvas,
+    streams_control_encode,
     synthetic_control_frames,
     transfer_scale_ratio,
 )
@@ -104,6 +125,23 @@ MANIFEST = parse_cosmos_dreams_manifest(TRANSFER_ARTIFACT)
 
 def _artifact() -> dict:
     return copy.deepcopy(TRANSFER_ARTIFACT)
+
+
+def _fails_if_hung(test):
+    @functools.wraps(test)
+    def bounded(self):
+        outcome = Future()
+
+        def run():
+            try:
+                outcome.set_result(test(self))
+            except BaseException as exc:
+                outcome.set_exception(exc)
+
+        threading.Thread(target=run, daemon=True).start()
+        outcome.result(timeout=60)
+
+    return bounded
 
 
 class _FakeTokenizer:
@@ -169,33 +207,31 @@ class TestCosmosDreamsTransferHistory(unittest.TestCase):
             history_mode="sliding",
         )
 
-        def entry(label: float):
-            value = torch.full((1, 1, 1, 1), label)
-            return [(value.clone(), value.clone())]
-
         def labels(history):
-            return history[0][0][0, :, 0, 0].tolist()
+            return history.committed(0)[0][0, :, 0, 0].tolist()
 
-        history = None
+        def commit(history, label: float, keep_entries: int):
+            for slot in history.slots(1):
+                slot.chunk_keys.fill_(label)
+                slot.chunk_values.fill_(label)
+            history.commit(1, tail_tokens=keep_entries)
+
+        text = torch.zeros(1, 2, 1, 1)
+        history = new_kv_history(
+            [(text, text)],
+            tokens_per_frame=1,
+            sink_frames=profile.sink_entries,
+            window_frames=profile.entries_after_control_commit(),
+            chunk_frames=1,
+            rollout_frames=8,
+        )
         seen_by_rgb_target = {}
         seen_by_control_seed = {}
         for frame in range(4):
-            seen_by_control_seed[frame] = labels(history) if history else []
-            history = append_kv_history(
-                history,
-                entry(2 * frame),
-                tokens_per_frame=1,
-                sink_frames=profile.sink_entries,
-                window_frames=profile.entries_after_control_commit(),
-            )
+            seen_by_control_seed[frame] = labels(history)
+            commit(history, 2 * frame, profile.entries_after_control_commit())
             seen_by_rgb_target[frame] = labels(history)
-            history = append_kv_history(
-                history,
-                entry(2 * frame + 1),
-                tokens_per_frame=1,
-                sink_frames=profile.sink_entries,
-                window_frames=profile.entries_after_rgb_commit(),
-            )
+            commit(history, 2 * frame + 1, profile.entries_after_rgb_commit())
         # Frame 3: pinned pair of frame 0, the pair of frame 2, then its own control.
         self.assertEqual(seen_by_rgb_target[3], [0.0, 1.0, 4.0, 5.0, 6.0])
         self.assertEqual(seen_by_control_seed[3], [0.0, 1.0, 4.0, 5.0])
@@ -328,20 +364,6 @@ class TestTransferFramesAndHistory(unittest.TestCase):
                 16, temporal_compression_factor=4, chunk_size=4
             )
 
-    def test_unbounded_history_keeps_every_committed_block(self):
-        history = None
-        for block_frames in (1, 4, 1, 1):
-            kv = [
-                (
-                    torch.ones(1, block_frames * 6, 2, 4),
-                    torch.ones(1, block_frames * 6, 2, 4),
-                )
-            ]
-            history = append_kv_history(
-                history, kv, tokens_per_frame=6, sink_frames=0, window_frames=None
-            )
-        self.assertEqual(history[0][0].shape[1], 7 * 6)
-
     def test_resize_center_crop_matches_canvas(self):
         frames = torch.randint(0, 256, (3, 5, 300, 400), dtype=torch.uint8)
         out = resize_center_crop_uint8(frames, height=480, width=832)
@@ -357,6 +379,112 @@ class TestTransferFramesAndHistory(unittest.TestCase):
         self.assertEqual(frames.dtype, torch.uint8)
         with self.assertRaises(ValueError):
             synthetic_control_frames(num_frames=0, height=480, width=832)
+
+    @_fails_if_hung
+    def test_control_frames_stay_readable_while_the_clip_decodes_and_grows(self):
+        clip = torch.randint(0, 256, (9, 4, 6, 3), dtype=torch.uint8)
+        released = threading.Semaphore(0)
+
+        def frames(path, max_frames):
+            for frame in clip.numpy()[:max_frames]:
+                released.acquire()
+                yield frame
+
+        with (
+            mock.patch.object(control_clip, "iter_video_frames", frames),
+            # Room for two frames, so the buffer doubles twice.
+            mock.patch.object(control_clip, "INITIAL_BUFFER_BYTES", 2 * 4 * 6 * 3),
+        ):
+            decode = ControlClipDecode("clip.mp4", max_frames=7)
+            released.release(3)
+            self.assertEqual(decode.wait(3), 3)
+            self.assertEqual(decode.source_hw, (4, 6))
+            early = decode.frames(0, 3)
+            released.release(9)
+            self.assertEqual(decode.wait(), 7)
+            decode.close()
+        expected = clip[:7].permute(3, 0, 1, 2)
+        self.assertTrue(torch.equal(early, expected[:, :3]))
+        self.assertTrue(torch.equal(decode.frames(0, 7), expected))
+
+    @_fails_if_hung
+    def test_decode_failure_reaches_the_reader(self):
+        def frames(path, max_frames):
+            yield torch.zeros((4, 6, 3), dtype=torch.uint8).numpy()
+            raise OSError("truncated file")
+
+        with mock.patch.object(control_clip, "iter_video_frames", frames):
+            decode = ControlClipDecode("clip.mp4", max_frames=5)
+            with self.assertRaisesRegex(OSError, "truncated file"):
+                decode.wait(2)
+            decode.close()
+
+    def test_the_control_encode_streams_only_with_the_vae_feature_cache(self):
+        vae = SimpleNamespace(use_feature_cache=True)
+        self.assertTrue(streams_control_encode(vae))
+        vae.use_feature_cache = False
+        self.assertFalse(streams_control_encode(vae))
+
+    @_fails_if_hung
+    def test_encode_of_a_decoding_clip_matches_the_finished_clip(self):
+        torch.manual_seed(0)
+        vae = AutoencoderKLWan(
+            WanVAEConfig(
+                arch_config=WanVAEArchConfig(
+                    base_dim=8,
+                    z_dim=4,
+                    dim_mult=(1, 2, 2, 2),
+                    num_res_blocks=1,
+                    latents_mean=(0.0,) * 4,
+                    latents_std=(1.0,) * 4,
+                    is_residual=True,
+                    in_channels=12,
+                    out_channels=12,
+                    patch_size=2,
+                )
+            )
+        ).eval()
+        manifest = parse_cosmos_dreams_manifest(dict(_artifact(), chunk_size=1))
+        device = torch.device("cpu")
+        # Eleven frames: two whole groups after the first frame, and two left over.
+        clip = torch.randint(0, 256, (11, 48, 48, 3), dtype=torch.uint8)
+        used = control_frames_used(11, requested_frames=601, manifest=manifest)
+        self.assertEqual(used, 9)
+
+        def decoded_frames(path, max_frames):
+            yield from clip.numpy()[:max_frames]
+
+        fits = {
+            "on canvas": None,
+            "resized": lambda frames: direct_resize_control(
+                frames, height=32, width=32, hint="depth"
+            ),
+        }
+        for name, fit in fits.items():
+            with (
+                self.subTest(name),
+                mock.patch.object(control_clip, "iter_video_frames", decoded_frames),
+            ):
+                decode = ControlClipDecode("clip.mp4", max_frames=601)
+                latent, frames = encode_decoding_control_latent(
+                    vae, decode, fit=fit, device=device, float32_normalization=True
+                )
+                decode.close()
+                whole = clip[:used].permute(3, 0, 1, 2).contiguous()
+                whole = whole if fit is None else fit(whole)
+                self.assertTrue(torch.equal(frames, whole))
+                expected = encode_control_latent(
+                    vae, whole, device=device, float32_normalization=True
+                )
+                self.assertTrue(torch.equal(latent, expected))
+
+        def failing_groups():
+            yield torch.zeros((1, 3, 1, 48, 48))
+            raise OSError("truncated file")
+
+        with self.assertRaisesRegex(OSError, "truncated file"), torch.no_grad():
+            vae.encode_causal_groups(failing_groups())
+        self.assertEqual([t for t in vae._enc_feat_map if t is not None], [])
 
     def test_long_prompt_is_truncated_like_training(self):
         tokenizer = _FakeTokenizer()
@@ -691,6 +819,45 @@ class TestTransferDirectResize(unittest.TestCase):
             restore_transfer_output_size(
                 video, original_hw=(216, 384), model_hw=(480, 800)
             )
+
+    def test_only_a_composed_display_keeps_the_mp4_until_after_the_decode(self):
+        stage = CosmosDreamsTransferDecodingStage.__new__(
+            CosmosDreamsTransferDecodingStage
+        )
+        stage.vae = SimpleNamespace(supports_decode_on_frames=True)
+        stage.sound_tokenizer = None
+        stage._guardrails = False
+
+        def batch(**display):
+            options = dict(show_control_condition=False, transfer_output_size="model")
+            return SimpleNamespace(
+                latents=torch.zeros(1, 4, 5, 6, 8),
+                extra={"transfer_plan": {"total_frames": 17}},
+                sampling_params=SimpleNamespace(**options | display),
+                action_latents=None,
+                audio_latents=None,
+                use_guardrails=None,
+            )
+
+        stages = (
+            "sglang.multimodal_gen.runtime.pipelines_core.stages."
+            "model_specific_stages.cosmos3"
+        )
+        with mock.patch(
+            f"{stages}.streamed_video_output_path", return_value="/tmp/transfer.mp4"
+        ):
+            stream = stage._encode_while_decoding(batch(), SimpleNamespace())
+            self.assertEqual(stream.save_file_path, "/tmp/transfer.mp4")
+            for display in (
+                dict(show_control_condition=True),
+                dict(transfer_output_size="original"),
+            ):
+                with self.subTest(display):
+                    self.assertIsNone(
+                        stage._encode_while_decoding(
+                            batch(**display), SimpleNamespace()
+                        )
+                    )
 
     def test_config_mode_and_control_sentence_default(self):
         config = CosmosDreamsTransferConfig()

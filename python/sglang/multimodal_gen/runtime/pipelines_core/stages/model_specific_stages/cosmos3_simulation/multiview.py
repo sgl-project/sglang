@@ -17,9 +17,14 @@ from __future__ import annotations
 
 import math
 import os
-from concurrent.futures import ThreadPoolExecutor
+import threading
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
+from contextlib import contextmanager
+from itertools import chain, islice
 from typing import Any
 
+import numpy as np
 import PIL.Image
 import torch
 import torchvision.transforms.functional as TF
@@ -34,6 +39,7 @@ from sglang.multimodal_gen.configs.sample.cosmos3_multiview import (
     closest_multiview_aspect_ratio,
     multiview_canvas,
 )
+from sglang.multimodal_gen.configs.sample.sampling_params import quality_allows
 from sglang.multimodal_gen.runtime.cache.conditioning import use_gpu_conditioning_hash
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.distributed.parallel_state import get_world_rank
@@ -58,15 +64,23 @@ from sglang.multimodal_gen.runtime.models.vaes.cosmos3_lidar.encoder import (
     pad_lidar_sweeps,
     required_lidar_sweeps,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import use_vae_fast_path
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
+    OutputBatch,
+    Req,
+    RequestResource,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
     StageParallelismType,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.encode_while_decoding import (
+    output_rank_saved,
+    output_rank_video_path,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3 import (
     Cosmos3DecodingStage,
     Cosmos3TokenizationStage,
-    _pil_to_uint8_tensor,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_simulation.lidar_outputs import (
     lidar_output_payload,
@@ -80,11 +94,17 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.runtime.utils.vision import load_image, load_video
+from sglang.multimodal_gen.runtime.utils.vision import (
+    iter_video_frames,
+    load_image,
+    load_video,
+    rgb_hwc_uint8,
+)
 
 logger = init_logger(__name__)
 
-# Clips decoded concurrently by the input stage (one ffmpeg process each).
+# Most clips a request decodes at once (one ffmpeg process each); its
+# ``CameraLoadGate`` starts fewer while the encoder keeps up.
 # Arbitrary; 8 keeps a 22-clip rig within a few seconds on a 24-core host.
 COSMOS3_MULTIVIEW_MEDIA_THREADS = 8
 # Frames resized at a time by ``fit_uint8_cthw``. The resize is per frame, so
@@ -93,6 +113,9 @@ COSMOS3_MULTIVIEW_MEDIA_THREADS = 8
 # 16, with bit-identical output. Whole-clip resizes of every camera at once,
 # on every rank, took a four-GPU replica past its 660 GB limit.
 COSMOS3_MULTIVIEW_RESIZE_CHUNK_FRAMES = 16
+# Byte bound on one chunk's float32 source frames. Measured on seven 121-frame
+# 1280x720 clips: the rig loads in 2.3 s at two frames a chunk, 3.0 s at 16.
+COSMOS3_MULTIVIEW_RESIZE_CHUNK_BYTES = 32 << 20
 
 # ``batch.extra`` keys shared by the multiview stages.
 EXTRA_CONTROL_PIXELS = "multiview_control_pixels"
@@ -200,55 +223,31 @@ def media_hw(path: str) -> tuple[int, int]:
 
 
 def load_media_uint8_cthw(
-    path: str, *, height: int, width: int, max_frames: int
+    path: str,
+    *,
+    height: int,
+    width: int,
+    max_frames: int,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Load an image or the first ``max_frames`` of a clip as ``uint8 [3, T, H, W]``.
 
-    Frames are aspect-resized and center-cropped to ``height x width``. The
-    decoded frames are converted and resized a chunk at a time, so only the
-    decoder's frames and the canvas-sized result are ever whole in memory.
+    Frames are aspect-resized and center-cropped to ``height x width`` as they
+    decode, so only one resize chunk and the canvas-sized result are ever in
+    memory. ``out`` is an optional ``uint8 [3, >= T, height, width]``
+    destination, filled in place and returned narrowed to the ``T`` decoded
+    frames.
     """
     if media_kind(path) == "image":
-        frames = [load_image(path).convert("RGB")]
+        frames = [load_image(path)]
     else:
-        decoded = load_video(path, max_frames=max_frames)
-        if not decoded:
-            raise ValueError(
-                f"No frames decoded from Cosmos3 multiview media {path!r}."
-            )
-        frames = [frame.convert("RGB") for frame in decoded]
-    first = _pil_to_uint8_tensor(frames[0])
-    if first.ndim != 3 or first.shape[0] != 3:
-        raise ValueError(
-            f"Cosmos3 multiview media {path!r} must decode to RGB frames, got {tuple(first.shape)}"
-        )
-    return _fit_uint8_chunks(
-        (
-            torch.stack(
-                [
-                    _pil_to_uint8_tensor(frame)
-                    for frame in frames[start : start + chunk]
-                ],
-                dim=1,
-            )
-            for start, chunk in _chunk_spans(len(frames))
-        ),
-        num_frames=len(frames),
-        orig_h=int(first.shape[1]),
-        orig_w=int(first.shape[2]),
-        height=height,
-        width=width,
+        frames = iter_video_frames(path, max_frames=max_frames)
+    fitted = _fit_frames_uint8_cthw(
+        frames, max_frames=max_frames, height=height, width=width, out=out
     )
-
-
-def _chunk_spans(
-    num_frames: int, chunk_frames: int = COSMOS3_MULTIVIEW_RESIZE_CHUNK_FRAMES
-):
-    """``(start, length)`` of each resize chunk; the last one may be shorter."""
-    if chunk_frames < 1:
-        raise ValueError(f"chunk_frames must be positive, got {chunk_frames}")
-    for start in range(0, num_frames, chunk_frames):
-        yield start, min(chunk_frames, num_frames - start)
+    if fitted.shape[1] == 0:
+        raise ValueError(f"No frames decoded from Cosmos3 multiview media {path!r}.")
+    return fitted
 
 
 def _fit_geometry(orig_h: int, orig_w: int, height: int, width: int) -> tuple[int, int]:
@@ -257,52 +256,113 @@ def _fit_geometry(orig_h: int, orig_w: int, height: int, width: int) -> tuple[in
     return int(math.ceil(scale * orig_h)), int(math.ceil(scale * orig_w))
 
 
-def _fit_uint8_chunk(
-    chunk: torch.Tensor, *, resize_h: int, resize_w: int, height: int, width: int
-) -> torch.Tensor:
-    """Resize and crop one ``uint8 [3, t, H, W]`` chunk; the resize is per frame."""
-    chunk_tchw = chunk.permute(1, 0, 2, 3).to(dtype=torch.float32)
-    resized = TF.resize(chunk_tchw, [resize_h, resize_w])
-    cropped = TF.center_crop(resized, [height, width])
-    return cropped.round().clamp(0, 255).to(torch.uint8).permute(1, 0, 2, 3)
+def _resize_chunk_frames(orig_h: int, orig_w: int, chunk_frames: int) -> int:
+    if chunk_frames < 1:
+        raise ValueError(f"chunk_frames must be positive, got {chunk_frames}")
+    float_frame_bytes = orig_h * orig_w * 3 * 4
+    by_bytes = COSMOS3_MULTIVIEW_RESIZE_CHUNK_BYTES // max(float_frame_bytes, 1)
+    return max(1, min(chunk_frames, by_bytes))
 
 
-def _fit_uint8_chunks(
-    chunks,
+def _fit_frames_uint8_cthw(
+    frames: Iterable[np.ndarray | PIL.Image.Image],
     *,
-    num_frames: int,
-    orig_h: int,
-    orig_w: int,
+    max_frames: int,
     height: int,
     width: int,
+    chunk_frames: int = COSMOS3_MULTIVIEW_RESIZE_CHUNK_FRAMES,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Assemble ``uint8 [3, num_frames, height, width]`` from source-size uint8 chunks."""
-    resize_h, resize_w = _fit_geometry(orig_h, orig_w, height, width)
-    out = torch.empty((3, num_frames, height, width), dtype=torch.uint8)
-    start = 0
-    for chunk in chunks:
+    """Fit up to ``max_frames`` decoded frames onto the canvas: ``uint8 [3, T, height, width]``.
+
+    Same arithmetic as imaginaire4's ``_resize_and_center_crop`` (torchvision
+    resize with antialias, crop offset rounded half to even). The single-view
+    helper in cosmos3.py keeps vLLM-Omni's floor offset without antialias,
+    which lands one row off on 1720x1080 fisheye sources.
+
+    Resize, crop, round and clamp act on each frame alone, so consuming the
+    frames a chunk at a time changes no value.
+    """
+    if out is None:
+        dest = torch.empty((3, max_frames, height, width), dtype=torch.uint8)
+    else:
         if (
-            chunk.ndim != 4
-            or chunk.shape[0] != 3
-            or chunk.shape[2:] != (orig_h, orig_w)
+            out.ndim != 4
+            or out.shape[0] != 3
+            or tuple(out.shape[2:]) != (height, width)
+            or out.dtype != torch.uint8
         ):
             raise ValueError(
-                f"Multiview frame chunk must have shape [3, t, {orig_h}, {orig_w}], got {tuple(chunk.shape)}"
+                f"Multiview frame destination must be uint8 [3, T, {height}, {width}], "
+                f"got {out.dtype} {tuple(out.shape)}"
             )
-        length = int(chunk.shape[1])
-        if start + length > num_frames:
+        dest = out
+    arrays = map(rgb_hwc_uint8, islice(frames, min(max_frames, int(dest.shape[1]))))
+    first = next(arrays, None)
+    count = 0
+    if first is not None:
+        orig_h, orig_w = int(first.shape[0]), int(first.shape[1])
+        arrays = _same_size_frames(chain([first], arrays), orig_h, orig_w)
+        # At scale 1 the antialiased resize and the crop are the identity.
+        if (orig_h, orig_w) == (height, width):
+            count = _copy_frames(arrays, dest)
+        else:
+            count = _resize_frames(
+                arrays, dest, orig_h=orig_h, orig_w=orig_w, chunk_frames=chunk_frames
+            )
+    if out is None and count < max_frames:
+        return dest[:, :count].contiguous()
+    return dest[:, :count]
+
+
+def _same_size_frames(arrays: Iterable[np.ndarray], orig_h: int, orig_w: int):
+    for array in arrays:
+        if array.shape != (orig_h, orig_w, 3):
             raise ValueError(
-                f"Multiview frame chunks hold more than the declared {num_frames} frames"
+                f"Multiview frames must all decode to [{orig_h}, {orig_w}, 3], got {tuple(array.shape)}"
             )
-        out[:, start : start + length] = _fit_uint8_chunk(
-            chunk, resize_h=resize_h, resize_w=resize_w, height=height, width=width
+        yield array
+
+
+def _copy_frames(arrays: Iterable[np.ndarray], dest: torch.Tensor) -> int:
+    dest_np = dest.numpy()
+    count = 0
+    for array in arrays:
+        dest_np[:, count] = array.transpose(2, 0, 1)
+        count += 1
+    return count
+
+
+def _resize_frames(
+    arrays: Iterable[np.ndarray],
+    dest: torch.Tensor,
+    *,
+    orig_h: int,
+    orig_w: int,
+    chunk_frames: int,
+) -> int:
+    height, width = int(dest.shape[2]), int(dest.shape[3])
+    resize_h, resize_w = _fit_geometry(orig_h, orig_w, height, width)
+    chunk_frames = _resize_chunk_frames(orig_h, orig_w, chunk_frames)
+    staging = np.empty((chunk_frames, orig_h, orig_w, 3), dtype=np.uint8)
+    source = torch.empty((chunk_frames, 3, orig_h, orig_w), dtype=torch.float32)
+    arrays = iter(arrays)
+    count = 0
+    while True:
+        filled = 0
+        for array in islice(arrays, chunk_frames):
+            staging[filled] = array
+            filled += 1
+        if filled == 0:
+            return count
+        chunk = source[:filled]
+        chunk.copy_(torch.from_numpy(staging[:filled]).permute(0, 3, 1, 2))
+        resized = TF.resize(chunk, [resize_h, resize_w])
+        cropped = TF.center_crop(resized, [height, width])
+        dest[:, count : count + filled].copy_(
+            cropped.round_().clamp_(0, 255).permute(1, 0, 2, 3)
         )
-        start += length
-    if start != num_frames:
-        raise ValueError(
-            f"Multiview frame chunks hold {start} frames, {num_frames} declared"
-        )
-    return out
+        count += filled
 
 
 def fit_uint8_cthw(
@@ -312,33 +372,19 @@ def fit_uint8_cthw(
     width: int,
     chunk_frames: int = COSMOS3_MULTIVIEW_RESIZE_CHUNK_FRAMES,
 ) -> torch.Tensor:
-    """Aspect-preserving antialiased resize plus center crop of ``uint8 [3, T, H, W]``.
-
-    Same arithmetic as imaginaire4's ``_resize_and_center_crop`` (torchvision
-    resize with antialias, crop offset rounded half to even). The single-view
-    helper in cosmos3.py keeps vLLM-Omni's floor offset without antialias,
-    which lands one row off on 1720x1080 fisheye sources.
-
-    The clip is resized ``chunk_frames`` frames at a time. Resize, crop, round
-    and clamp act on each frame alone, so the chunking changes no value; it
-    bounds the float32 temporaries, which for a whole 297-frame 1924x1084 clip
-    would be eight times the clip itself.
-    """
+    """Aspect-preserving antialiased resize plus center crop of ``uint8 [3, T, H, W]``."""
     if frames.ndim != 4 or frames.shape[0] != 3:
         raise ValueError(
             f"Multiview frames must have shape [3, T, H, W], got {tuple(frames.shape)}"
         )
-    num_frames = int(frames.shape[1])
-    return _fit_uint8_chunks(
-        (
-            frames[:, start : start + length]
-            for start, length in _chunk_spans(num_frames, chunk_frames)
-        ),
-        num_frames=num_frames,
-        orig_h=int(frames.shape[2]),
-        orig_w=int(frames.shape[3]),
+    if chunk_frames < 1:
+        raise ValueError(f"chunk_frames must be positive, got {chunk_frames}")
+    return _fit_frames_uint8_cthw(
+        frames.permute(1, 2, 3, 0).numpy(),
+        max_frames=int(frames.shape[1]),
         height=height,
         width=width,
+        chunk_frames=chunk_frames,
     )
 
 
@@ -370,6 +416,109 @@ def synthetic_multiview_pixels(
     if min(num_views, num_frames, height, width) <= 0:
         raise ValueError("Synthetic multiview pixels need positive dimensions.")
     return torch.zeros((1, 3, num_views * num_frames, height, width), dtype=torch.uint8)
+
+
+class CameraLoadGate:
+    """Starts a request's camera loads in order, as many at once as their consumer needs.
+
+    A load slows the thread that drives the GPU, so one runs at a time while
+    the consumer keeps up, and each time it has to wait for a load after the
+    first, one more may run alongside.
+    """
+
+    def __init__(self) -> None:
+        self._changed = threading.Condition()
+        self._tickets = 0
+        self._next = 0
+        self._running = 0
+        self._limit = 1
+        self._cancelled = False
+
+    def ticket(self) -> int:
+        # Tickets are issued from one thread, so this needs no lock.
+        ticket = self._tickets
+        self._tickets += 1
+        return ticket
+
+    @contextmanager
+    def turn(self, ticket: int) -> Iterator[None]:
+        with self._changed:
+            self._changed.wait_for(
+                lambda: (
+                    self._cancelled
+                    or (ticket == self._next and self._running < self._limit)
+                )
+            )
+            if self._cancelled:
+                raise CancelledError
+            self._next += 1
+            self._running += 1
+            self._changed.notify_all()
+        try:
+            yield
+        finally:
+            with self._changed:
+                self._running -= 1
+                self._changed.notify_all()
+
+    def consumer_waits(self, ticket: int) -> None:
+        # Waiting for the first load says nothing about the loads falling behind.
+        if ticket == 0:
+            return
+        with self._changed:
+            self._limit += 1
+            self._changed.notify_all()
+
+    def cancel(self) -> None:
+        with self._changed:
+            self._cancelled = True
+            self._changed.notify_all()
+
+
+class PendingCameraMajorPixels(RequestResource):
+    """A camera-major ``uint8 [1, 3, V*F, H, W]`` rig whose cameras are still loading.
+
+    A failed load is raised by the call that waits for its camera.
+    """
+
+    def __init__(
+        self,
+        rig: torch.Tensor,
+        loads: Sequence[Future],
+        *,
+        gate: CameraLoadGate,
+        tickets: Sequence[int],
+    ) -> None:
+        self._rig = rig
+        self._loads = tuple(loads)
+        self._gate = gate
+        self._tickets = tuple(tickets)
+        self._frames_per_view = int(rig.shape[2]) // len(self._loads)
+
+    @property
+    def shape(self) -> torch.Size:
+        return self._rig.shape
+
+    def camera(self, view: int) -> torch.Tensor:
+        load = self._loads[view]
+        if not load.done():
+            self._gate.consumer_waits(self._tickets[view])
+        load.result()
+        frames = self._frames_per_view
+        return self._rig[:, :, view * frames : (view + 1) * frames]
+
+    def result(self) -> torch.Tensor:
+        for load in self._loads:
+            load.result()
+        return self._rig
+
+    def close(self) -> None:
+        """Skip the camera loads that have not started. One already running finishes."""
+        self._gate.cancel()
+
+
+def _is_camera_major_pixels(value: Any) -> bool:
+    return isinstance(value, PendingCameraMajorPixels) or V.is_tensor(value)
 
 
 def load_lidar_control_frames(path: str) -> torch.Tensor:
@@ -656,45 +805,116 @@ class Cosmos3MultiviewInputStage(PipelineStage):
         self,
         views: list[MultiviewViewInput],
         *,
+        pool: ThreadPoolExecutor,
+        gate: CameraLoadGate,
         field: str,
         height: int,
         width: int,
         num_frames: int,
         keep_first: bool,
         require_complete: bool = False,
-    ) -> torch.Tensor:
-        def load_one(view: MultiviewViewInput) -> torch.Tensor:
+    ) -> PendingCameraMajorPixels:
+        """One field of the rig as camera-major ``uint8 [1, 3, V*F, H, W]``, loading on ``pool``.
+
+        ``F`` is ``num_frames``, every clip truncated or padded with its last
+        frame, or 1 with ``keep_first``.
+        """
+        frames_per_view = 1 if keep_first else num_frames
+        rig = torch.empty(
+            (1, 3, len(views) * frames_per_view, height, width), dtype=torch.uint8
+        )
+
+        # The stage's inference mode is thread-local; the workers need their own
+        # to write the rig in place.
+        @torch.inference_mode()
+        def fill(index: int) -> None:
+            view = views[index]
+            dest = rig[0, :, index * frames_per_view : (index + 1) * frames_per_view]
             path = view.control if field == "control" else view.vision
             if path is None:
-                if field == "vision":
-                    return torch.full(
-                        (3, num_frames, height, width),
-                        COSMOS3_MULTIVIEW_GRAY_LEVEL,
-                        dtype=torch.uint8,
+                if field != "vision":
+                    raise ValueError(
+                        f"Cosmos3 multiview camera {view.camera_key!r} is missing {field} input."
                     )
-                raise ValueError(
-                    f"Cosmos3 multiview camera {view.camera_key!r} is missing {field} input."
-                )
-            frames = load_media_uint8_cthw(
-                path,
-                height=height,
-                width=width,
-                max_frames=1 if keep_first else num_frames,
+                dest.fill_(COSMOS3_MULTIVIEW_GRAY_LEVEL)
+                return
+            decoded = int(
+                load_media_uint8_cthw(
+                    path,
+                    height=height,
+                    width=width,
+                    max_frames=frames_per_view,
+                    out=dest,
+                ).shape[1]
             )
-            if require_complete and frames.shape[1] < num_frames:
+            if require_complete and decoded < num_frames:
                 raise ValueError(
                     f"Known camera {view.camera_key!r} requires a complete RGB video of "
                     f"{num_frames} frames for view completion."
                 )
-            return pad_view_frames_uint8(frames, num_frames=num_frames)
+            if decoded < frames_per_view:
+                dest[:, decoded:] = dest[:, decoded - 1 : decoded]
+
+        def load(index: int, ticket: int) -> None:
+            with gate.turn(ticket):
+                fill(index)
 
         # Each clip decodes in its own ffmpeg subprocess and the resize releases
-        # the GIL, so the rig's clips overlap on threads; order is preserved.
-        with ThreadPoolExecutor(
-            max_workers=min(COSMOS3_MULTIVIEW_MEDIA_THREADS, max(len(views), 1))
-        ) as pool:
-            clips = list(pool.map(load_one, views))
-        return torch.cat(clips, dim=1).unsqueeze(0).contiguous()
+        # the GIL, so the rig's clips overlap on threads, each in its own slice.
+        tickets = [gate.ticket() for _ in views]
+        loads = [
+            pool.submit(load, index, ticket) for index, ticket in enumerate(tickets)
+        ]
+        return PendingCameraMajorPixels(rig, loads, gate=gate, tickets=tickets)
+
+    def _start_pixel_loads(
+        self,
+        views: list[MultiviewViewInput],
+        *,
+        height: int,
+        width: int,
+        num_frames: int,
+        vision_keep_first: bool,
+        completion: bool,
+    ) -> tuple[PendingCameraMajorPixels, PendingCameraMajorPixels | None]:
+        """Start loading the rig's control and RGB clips; returns before they finish.
+
+        The latent stage encodes the cameras in the order they are queued here,
+        controls first, and one gate paces both rigs' loads to that consumer.
+        """
+        pool = ThreadPoolExecutor(
+            max_workers=COSMOS3_MULTIVIEW_MEDIA_THREADS,
+            thread_name_prefix="cosmos3-multiview-load",
+        )
+        gate = CameraLoadGate()
+        try:
+            control = self._pack_camera_major(
+                views,
+                pool=pool,
+                gate=gate,
+                field="control",
+                height=height,
+                width=width,
+                num_frames=num_frames,
+                keep_first=False,
+            )
+            vision = None
+            if any(view.vision is not None for view in views):
+                vision = self._pack_camera_major(
+                    views,
+                    pool=pool,
+                    gate=gate,
+                    field="vision",
+                    height=height,
+                    width=width,
+                    num_frames=num_frames,
+                    keep_first=vision_keep_first,
+                    require_complete=completion,
+                )
+        finally:
+            # Queued loads still run; the threads exit after the last one.
+            pool.shutdown(wait=False)
+        return control, vision
 
     def _load_lidar(
         self, batch: Req, num_frames: int, fps: float
@@ -790,6 +1010,9 @@ class Cosmos3MultiviewInputStage(PipelineStage):
             condition_video_as_image = (
                 sampling_params.resolved_condition_video_as_image()
             )
+            vision_is_image = (
+                has_vision and media_kind(views[known_views[0]].vision) == "image"
+            )
             lidar_frames, lidar_condition = self._load_lidar(batch, num_frames, fps)
             if lidar_frames is not None and completion:
                 raise ValueError(
@@ -802,28 +1025,6 @@ class Cosmos3MultiviewInputStage(PipelineStage):
                 raise ValueError(
                     "View completion requires complete RGB videos for the known cameras."
                 )
-            batch.extra[EXTRA_CONTROL_PIXELS] = self._pack_camera_major(
-                views,
-                field="control",
-                height=height,
-                width=width,
-                num_frames=num_frames,
-                keep_first=False,
-            )
-            batch.extra[EXTRA_VISION_PIXELS] = (
-                self._pack_camera_major(
-                    views,
-                    field="vision",
-                    height=height,
-                    width=width,
-                    num_frames=num_frames,
-                    keep_first=condition_video_as_image,
-                    require_complete=completion,
-                )
-                if has_vision
-                else None
-            )
-            batch.extra[EXTRA_VIEW_PROMPTS] = [view.prompt or "" for view in views]
             explicit_indexes = sampling_params.resolved_local_condition_indexes()
             if completion:
                 if explicit_indexes:
@@ -841,13 +1042,22 @@ class Cosmos3MultiviewInputStage(PipelineStage):
                 local_indexes = explicit_indexes
             elif not has_vision:
                 local_indexes = []
-            elif (
-                condition_video_as_image
-                or media_kind(views[known_views[0]].vision) == "image"
-            ):
+            elif condition_video_as_image or vision_is_image:
                 local_indexes = [0]
             else:
                 local_indexes = [0, 1]
+            (
+                batch.extra[EXTRA_CONTROL_PIXELS],
+                batch.extra[EXTRA_VISION_PIXELS],
+            ) = self._start_pixel_loads(
+                views,
+                height=height,
+                width=width,
+                num_frames=num_frames,
+                vision_keep_first=condition_video_as_image or vision_is_image,
+                completion=completion,
+            )
+            batch.extra[EXTRA_VIEW_PROMPTS] = [view.prompt or "" for view in views]
             if not completion:
                 known_views = []
 
@@ -1051,7 +1261,9 @@ class Cosmos3MultiviewLatentStage(PipelineStage):
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         result = VerificationResult()
         result.add_check(
-            EXTRA_CONTROL_PIXELS, batch.extra.get(EXTRA_CONTROL_PIXELS), V.is_tensor
+            EXTRA_CONTROL_PIXELS,
+            batch.extra.get(EXTRA_CONTROL_PIXELS),
+            _is_camera_major_pixels,
         )
         result.add_check("height", batch.height, V.positive_int_divisible(16))
         result.add_check("width", batch.width, V.positive_int_divisible(16))
@@ -1059,33 +1271,48 @@ class Cosmos3MultiviewLatentStage(PipelineStage):
 
     def _encode_camera_major(
         self,
-        pixels: torch.Tensor,
+        pixels: torch.Tensor | PendingCameraMajorPixels,
         *,
         num_views: int,
         frames_per_view: int,
         device: torch.device,
         dtype: torch.dtype,
+        latent_frames: int | None = None,
     ) -> torch.Tensor:
-        """Encode ``uint8 [1, 3, V*F, H, W]`` one camera at a time into ``[1, C, V*Fl, h, w]``.
+        """Encode camera-major ``uint8 [1, 3, V*P, H, W]`` one camera at a time into ``[1, C, V*Fl, h, w]``.
 
         The Wan VAE is causal in time, so the camera-major stream must never be
         encoded as one long clip.
         """
-        expected = num_views * frames_per_view
-        if pixels.ndim != 5 or pixels.shape[2] != expected:
+        pending = isinstance(pixels, PendingCameraMajorPixels)
+        if len(pixels.shape) != 5 or num_views < 1 or pixels.shape[2] % num_views:
             raise ValueError(
-                "Cosmos3 multiview pixel video must be camera-major [1, 3, V*F, H, W]: "
-                f"shape={tuple(pixels.shape)}, V={num_views}, F={frames_per_view}."
+                "Cosmos3 multiview pixel video must be camera-major [1, 3, V*P, H, W]: "
+                f"shape={tuple(pixels.shape)}, V={num_views}."
             )
+        packed_frames = pixels.shape[2] // num_views
         vae_dtype = next(self.vae.parameters()).dtype
         mean = torch.as_tensor(self.vae.config.latents_mean).view(1, -1, 1, 1, 1)
         std = torch.as_tensor(self.vae.config.latents_std).view(1, -1, 1, 1, 1)
+        encode_kwargs = (
+            {} if latent_frames is None else {"latent_frames": latent_frames}
+        )
         latents = []
         for view in range(num_views):
-            clip = pixels[:, :, view * frames_per_view : (view + 1) * frames_per_view]
-            clip = clip.to(device=device, dtype=vae_dtype).div(127.5).sub(1.0)
+            clip = (
+                pixels.camera(view)
+                if pending
+                else pixels[:, :, view * packed_frames : (view + 1) * packed_frames]
+            )
+            if packed_frames != frames_per_view:
+                clip = pad_view_frames_uint8(
+                    clip[0], num_frames=frames_per_view
+                ).unsqueeze(0)
+            # Cast on the device: 0..255 is exact in the VAE dtype, and the
+            # upload stays one byte per value.
+            clip = clip.to(device).to(vae_dtype).div(127.5).sub(1.0)
             with torch.no_grad(), use_gpu_conditioning_hash():
-                latent = self.vae.encode(clip).mode()
+                latent = self.vae.encode(clip, **encode_kwargs).mode()
             latent = (latent - mean.to(latent)) / std.to(latent)
             latents.append(latent.to(dtype))
         latent_frames = {int(latent.shape[2]) for latent in latents}
@@ -1094,6 +1321,33 @@ class Cosmos3MultiviewLatentStage(PipelineStage):
                 f"Cosmos3 multiview per-camera VAE encodes have unequal lengths: {latent_frames}."
             )
         return torch.cat(latents, dim=2)
+
+    def _encode_vision(
+        self,
+        pixels: torch.Tensor,
+        *,
+        num_views: int,
+        frames_per_view: int,
+        latent_frames_per_view: int,
+        condition_indexes: Sequence[int],
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Encode the RGB conditions. Only the latents at ``condition_indexes`` are
+        meaningful, and the rest may be filler."""
+        needed = 1 + max(index % latent_frames_per_view for index in condition_indexes)
+        latent_frames = None
+        if needed < latent_frames_per_view and self.vae.use_feature_cache:
+            frames_per_view = self.vae.causal_prefix_frames(needed)
+            latent_frames = latent_frames_per_view
+        return self._encode_camera_major(
+            pixels,
+            num_views=num_views,
+            frames_per_view=frames_per_view,
+            device=device,
+            dtype=dtype,
+            latent_frames=latent_frames,
+        )
 
     def _condition_indexes(
         self, batch: Req, *, num_views: int, latent_frames_per_view: int, latent_t: int
@@ -1158,13 +1412,21 @@ class Cosmos3MultiviewLatentStage(PipelineStage):
             )
             encoded_vision = None
             if vision_pixels is not None and condition_indexes:
-                encoded_vision = self._encode_camera_major(
+                encoded_vision = self._encode_vision(
                     vision_pixels,
                     num_views=num_views,
                     frames_per_view=frames_per_view,
+                    latent_frames_per_view=latent_frames_per_view,
+                    condition_indexes=condition_indexes,
                     device=device,
                     dtype=dtype,
                 )
+        # Later stages get plain tensors; waiting here also raises the failed
+        # load of a clip that no encode read.
+        for key in (EXTRA_CONTROL_PIXELS, EXTRA_VISION_PIXELS):
+            pixels = batch.extra.get(key)
+            if isinstance(pixels, PendingCameraMajorPixels):
+                batch.extra[key] = pixels.result()
         if tuple(control_latents.shape) != shape:
             raise ValueError(
                 "Cosmos3 multiview WSM and target latent shapes must match: "
@@ -1426,6 +1688,33 @@ class Cosmos3MultiviewDecodingStage(Cosmos3DecodingStage):
         )
         return payload
 
+    def _streams_frames(self, batch: Req) -> bool:
+        lidar_request = batch.sampling_params.resolved_lidar() or {}
+        return not lidar_request.get("decode", False) and super()._streams_frames(batch)
+
+    def _decode_views(
+        self,
+        latents: torch.Tensor,
+        *,
+        num_views: int,
+        latent_frames_per_view: int,
+        on_frames: Callable[[torch.Tensor], None] | None = None,
+    ) -> torch.Tensor | None:
+        """The camera-major clip, or ``None`` when ``on_frames`` took the frames."""
+        clips = []
+        for view in range(num_views):
+            clip = self._decode_latents(
+                latents[
+                    :,
+                    :,
+                    view * latent_frames_per_view : (view + 1) * latent_frames_per_view,
+                ],
+                on_frames=on_frames,
+            )
+            if on_frames is None:
+                clips.append(clip)
+        return torch.cat(clips, dim=2) if clips else None
+
     def forward(self, batch: Req, server_args: ServerArgs):
         num_views = int(batch.extra[EXTRA_NUM_VIEWS])
         latent_frames_per_view = int(batch.extra[EXTRA_LATENT_FRAMES_PER_VIEW])
@@ -1442,33 +1731,63 @@ class Cosmos3MultiviewDecodingStage(Cosmos3DecodingStage):
             )
         batch.latents = latents
         batch.raw_latent_shape = tuple(latents.shape)
+        # Frames reach the encoder camera by camera, the order of the clip.
+        stream = self._encode_while_decoding(batch, server_args)
+        output_rank_streams = self._streams_frames(batch) and (
+            output_rank_video_path(batch, server_args, int(latents.shape[0]))
+            is not None
+        )
+        output_file_paths = None
         with self.use_declared_component(component_name="vae", module=self.vae):
-            with torch.no_grad():
-                decoded = torch.cat(
-                    [
-                        self._decode_latents(
-                            latents[
-                                :,
-                                :,
-                                view * latent_frames_per_view : (view + 1)
-                                * latent_frames_per_view,
-                            ]
-                        )
-                        for view in range(num_views)
-                    ],
-                    dim=2,
-                )
-        # The base stage consumes a pre-decoded tensor from this key (it is the
-        # transfer pipeline's hand-off) and only post-processes it.
-        batch.extra["transfer_decoded_output"] = decoded
-        frames_per_view = int(decoded.shape[2]) // num_views
-        cameras = batch.extra.get(EXTRA_CAMERAS)
+            with (
+                torch.no_grad(),
+                use_vae_fast_path(
+                    self.vae, quality_allows(batch.sampling_params.quality, "lossless")
+                ),
+            ):
+                try:
+                    decoded = self._decode_views(
+                        latents,
+                        num_views=num_views,
+                        latent_frames_per_view=latent_frames_per_view,
+                        on_frames=stream,
+                    )
+                    if stream is not None:
+                        output_file_paths = stream.finish()
+                except BaseException:
+                    if stream is not None:
+                        stream.abort()
+                    raise
+                if output_rank_streams and not output_rank_saved(
+                    output_file_paths is not None
+                ):
+                    # The streamed encode failed, so the worker saves the clip.
+                    del decoded
+                    decoded = self._decode_views(
+                        latents,
+                        num_views=num_views,
+                        latent_frames_per_view=latent_frames_per_view,
+                    )
         if not batch.is_warmup:
+            frames_per_view = 1 + (latent_frames_per_view - 1) * int(
+                self.vae.config.scale_factor_temporal
+            )
             self.log_info(
                 f"Decoded camera-major video: {num_views} cameras x {frames_per_view} "
-                f"frames at {batch.fps} fps; camera order {list(cameras or [])}"
+                f"frames at {batch.fps} fps; camera order {list(batch.extra.get(EXTRA_CAMERAS) or [])}"
             )
-        output_batch = super().forward(batch, server_args)
+        if output_file_paths is not None:
+            output_batch = OutputBatch(
+                output=None,
+                output_file_paths=output_file_paths,
+                metrics=batch.metrics,
+                rollout_trajectory_data=batch.rollout_trajectory_data,
+            )
+        else:
+            # The base stage consumes a pre-decoded tensor from this key (it is
+            # the transfer pipeline's hand-off) and only post-processes it.
+            batch.extra["transfer_decoded_output"] = decoded
+            output_batch = super().forward(batch, server_args)
         if lidar_latents is not None and not batch.is_warmup:
             output_batch.lidar = self._decode_lidar(batch, lidar_latents)
         return output_batch
