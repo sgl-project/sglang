@@ -10,6 +10,8 @@ from pathlib import Path, PurePosixPath
 # pr-test-amd.yml passes partition-model-<runner_arch>-<rocm_version>.json to this suite,
 # so adding one file per lane needs no workflow change.
 SUITE = "base-b-test-1-gpu-small-amd"
+# Runs from before the stage-* -> base-* rename name the same job stage-b-*.
+JOB_SUITE_NAMES = (SUITE, "stage-b-test-1-gpu-small-amd")
 REPOSITORY = "sgl-project/sglang"
 MODEL_DIR = Path(__file__).resolve().parent
 
@@ -96,8 +98,9 @@ def github_api(endpoint, *, raw=False):
 
 def collect_run_timings(*, run_id, runner_arch, rocm_version, expected_shards):
     runner = runner_name(runner_arch)
+    names = "|".join(re.escape(name) for name in JOB_SUITE_NAMES)
     pattern = re.compile(
-        rf"{re.escape(SUITE)} \({re.escape(rocm_version)}, {re.escape(runner)}, (\d+)\)"
+        rf"(?:{names}) \({re.escape(rocm_version)}, {re.escape(runner)}, (\d+)\)"
     )
     jobs = []
     page = 1

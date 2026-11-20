@@ -165,6 +165,24 @@ class TestAmdPartitionModel(CustomTestCase):
             )
         self.assertEqual(result, {"test/registered/example.py": 42})
 
+    def test_runs_from_before_the_suite_rename_are_collected(self):
+        jobs = [
+            {
+                "id": 1,
+                "name": f"stage-b-test-1-gpu-small-amd (rocm10, {RUNNER}, 0)",
+                "conclusion": "success",
+            }
+        ]
+        responses = [
+            {"jobs": jobs},
+            timing_line(filename="test/registered/example.py", elapsed=42),
+        ]
+        with patch.object(MODEL, "github_api", side_effect=responses):
+            result = MODEL.collect_run_timings(
+                run_id=1, runner_arch="mi300", rocm_version="rocm10", expected_shards=1
+            )
+        self.assertEqual(result, {"test/registered/example.py": 42})
+
     def test_duplicate_files_across_shards_are_rejected(self):
         jobs = [
             {
