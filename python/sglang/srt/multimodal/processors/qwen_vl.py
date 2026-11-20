@@ -13,6 +13,7 @@ from transformers import BaseImageProcessor
 from sglang.srt.environ import envs
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.models.cosmos3 import Cosmos3ForConditionalGeneration
 from sglang.srt.models.interns2_mobius import (
     InternS2MobiusForConditionalGeneration,
@@ -55,7 +56,7 @@ from sglang.srt.multimodal.qwen_vl_media_processing import smart_resize as smart
 from sglang.srt.multimodal.transport.cuda_ipc import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
 )
-from sglang.srt.runtime_context import get_disagg, get_mm, get_parallel
+from sglang.srt.runtime_context import get_disagg, get_exec, get_mm, get_parallel
 from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_cuda
 
 logger = logging.getLogger(__name__)
@@ -336,18 +337,20 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
             and isinstance(processor.image_processor, BaseImageProcessor)
             and not envs.SGLANG_FORCE_CPU_IMAGE_PREPROCESSING.get()
         )
+        prefill_backend = get_exec().graph.cuda_graph_config.prefill.backend
         if not (
             is_cuda()
             and pure_tp
             and colocated
             and fast_gpu_preprocessing
-            and server_args.disable_prefill_cuda_graph
+            and prefill_backend in (Backend.DISABLED, Backend.BREAKABLE, Backend.FULL)
             and not envs.SGLANG_RUST_SERVER.get()
             and envs.SGLANG_MM_BUFFER_SIZE_MB.get() == 0
         ):
             raise ValueError(
                 "Qwen-VL TP image preprocessing requires single-node pure CUDA TP, "
-                "fast GPU processing with CPU feature transport, and eager prefill"
+                "fast GPU processing with CPU feature transport, "
+                "and eager, breakable, or full prefill"
             )
         logger.info("Enabled Qwen-VL rank-local TP image preprocessing")
         return True
