@@ -212,6 +212,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/download-rust-ext
       - uses: ./.github/actions/download-sgl-router
         with:
           artifact_name: ${{ needs.sgl-router-build.outputs.artifact_name }}
