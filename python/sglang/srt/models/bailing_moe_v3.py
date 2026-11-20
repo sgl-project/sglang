@@ -11,10 +11,6 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.kernels.arch import current_arch
-from sglang.kernels.ops.gemm.router_gate_matvec import (
-    ROUTER_GATE_MATVEC_MAX_M,
-    router_gate_matvec,
-)
 from sglang.kernels.ops.quantization.fp8_kernel import (
     is_fp8_fnuz,
 )
@@ -43,6 +39,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
+    RouterGate,
     get_moe_a2a_backend,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
@@ -381,47 +378,6 @@ class BailingMLP(nn.Module):
         return x
 
 
-class BailingMoEGate(nn.Module):
-    def __init__(
-        self,
-        config,
-        params_dtype: Optional[torch.dtype] = None,
-        prefix: str = "",
-    ):
-        super().__init__()
-
-        if params_dtype is None:
-            params_dtype = torch.get_default_dtype()
-        self.params_dtype = params_dtype
-        self.weight = nn.Parameter(
-            torch.empty(
-                (config.num_experts, config.hidden_size),
-                dtype=self.params_dtype,
-            ),
-        )
-
-        if getattr(config, "moe_router_enable_expert_bias", False):
-            self.expert_bias = nn.Parameter(
-                torch.empty((config.num_experts,), dtype=torch.float32),
-            )
-        else:
-            self.expert_bias = None
-
-    def forward(self, hidden_states):
-        if (
-            hidden_states.is_cuda
-            and 0 < hidden_states.shape[0] <= ROUTER_GATE_MATVEC_MAX_M
-            and self.weight.dtype in (torch.float32, torch.bfloat16)
-        ):
-            # Decode-sized M: one fp32-accumulating triton matvec for either
-            # gate dtype. Cold-cache (rotating weights) it beats the library
-            # path up to M=8 — by ~2.6-3x at the bs=1 verify shape (M=4) —
-            # and ties it at M=1; see router_gate_matvec for the numbers.
-            return router_gate_matvec(hidden_states, self.weight)
-        logits = F.linear(hidden_states.to(self.weight.dtype), self.weight, None)
-        return logits
-
-
 def _get_bailing_num_shared_experts(config: PretrainedConfig) -> int:
     shared_intermediate_size = getattr(
         config, "moe_shared_expert_intermediate_size", None
@@ -500,9 +456,13 @@ class BailingMoE(nn.Module):
 
         self.num_experts = config.num_experts
 
-        self.gate = BailingMoEGate(
-            config=config,
+        has_expert_bias = bool(getattr(config, "moe_router_enable_expert_bias", False))
+        self.gate = RouterGate(
+            hidden_size=config.hidden_size,
+            num_experts=config.num_experts,
             params_dtype=self.router_dtype,
+            has_correction_bias=has_expert_bias,
+            correction_bias_name="expert_bias",
             prefix=add_prefix("gate", prefix),
         )
         self.correction_bias = (
@@ -514,14 +474,20 @@ class BailingMoE(nn.Module):
         self.image_correction_bias = None
         self.audio_correction_bias = None
         if self.multi_gate:
-            self.image_gate = BailingMoEGate(
-                config=config,
+            self.image_gate = RouterGate(
+                hidden_size=config.hidden_size,
+                num_experts=config.num_experts,
                 params_dtype=self.router_dtype,
+                has_correction_bias=has_expert_bias,
+                correction_bias_name="expert_bias",
                 prefix=add_prefix("image_gate", prefix),
             )
-            self.audio_gate = BailingMoEGate(
-                config=config,
+            self.audio_gate = RouterGate(
+                hidden_size=config.hidden_size,
+                num_experts=config.num_experts,
                 params_dtype=self.router_dtype,
+                has_correction_bias=has_expert_bias,
+                correction_bias_name="expert_bias",
                 prefix=add_prefix("audio_gate", prefix),
             )
             self.image_correction_bias = (

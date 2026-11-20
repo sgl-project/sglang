@@ -24,7 +24,6 @@ from functools import partial
 from typing import Iterable, Optional, Tuple, Union
 
 import torch
-import torch.nn.functional as F
 import triton
 import triton.language as tl
 from torch import nn
@@ -55,6 +54,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
+    RouterGate,
     get_deepep_mode,
     get_moe_a2a_backend,
 )
@@ -476,37 +476,6 @@ class LLaDA2MoeMLP(nn.Module):
         return hidden_states
 
 
-class LLaDA2MoeGate(nn.Module):
-    def __init__(
-        self,
-        config,
-        params_dtype: Optional[torch.dtype] = None,
-        prefix: str = "",
-    ):
-        super().__init__()
-        if params_dtype is None:
-            params_dtype = torch.get_default_dtype()
-        self.params_dtype = params_dtype
-        self.weight = nn.Parameter(
-            torch.empty(
-                (config.num_experts, config.hidden_size),
-                dtype=self.params_dtype,
-            ),
-        )
-        if getattr(config, "moe_router_enable_expert_bias", False):
-            self.expert_bias = nn.Parameter(
-                torch.empty((config.num_experts,), dtype=torch.float32),
-            )
-        else:
-            self.expert_bias = None
-
-    def forward(self, hidden_states):
-        # Keep router logits in the configured router/weight dtype. In
-        # particular, router_dtype="fp32" must not be truncated back to the
-        # BF16 activation dtype before block routing.
-        return F.linear(hidden_states.to(self.weight.dtype), self.weight, None)
-
-
 class LLaDA2MoeSparseMoeBlock(nn.Module):
     def __init__(
         self,
@@ -576,9 +545,15 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
 
         self.num_experts = config.num_experts + get_exec().moe.ep_num_redundant_experts
 
-        self.gate = LLaDA2MoeGate(
-            config=config,
+        self.gate = RouterGate(
+            hidden_size=config.hidden_size,
+            num_experts=config.num_experts,
+            fp32_compute=False,
             params_dtype=self.router_dtype,
+            has_correction_bias=bool(
+                getattr(config, "moe_router_enable_expert_bias", False)
+            ),
+            correction_bias_name="expert_bias",
             prefix=add_prefix("gate", prefix),
         )
         self.correction_bias = (

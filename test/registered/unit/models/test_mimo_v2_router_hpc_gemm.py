@@ -11,25 +11,37 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.environ import envs  # noqa: E402
-from sglang.srt.models.mimo_v2 import MoEGate  # noqa: E402
+from sglang.srt.environ import envs
+from sglang.srt.layers.moe import RouterGate
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
-def _mimo_config(hidden_size, n_routed_experts, **kwargs):
+_ROUTER_DTYPES = {
+    "float32": torch.float32,
+    "bfloat16": torch.bfloat16,
+}
+
+
+def _mimo_config(hidden_size, n_routed_experts, *, moe_router_dtype="float32"):
     return SimpleNamespace(
         hidden_size=hidden_size,
         n_routed_experts=n_routed_experts,
         topk_method="noaux_tc",
-        **kwargs,
+        moe_router_dtype=moe_router_dtype,
     )
 
 
 class TestMiMoV2RouterHpcGemm(CustomTestCase):
     def _make_gate(self, config, algo):
+        router_dtype = _ROUTER_DTYPES[config.moe_router_dtype]
         with envs.SGLANG_OPT_BF16_FP32_GEMM_ALGO.override(algo):
-            return MoEGate(config, quant_config=None)
+            return RouterGate(
+                hidden_size=config.hidden_size,
+                num_experts=config.n_routed_experts,
+                params_dtype=router_dtype,
+                has_correction_bias=config.topk_method == "noaux_tc",
+            )
 
     def test_benchmarked_shape_dispatches_with_min_m(self):
         gate = self._make_gate(_mimo_config(4096, 256), "hpc")
@@ -37,7 +49,7 @@ class TestMiMoV2RouterHpcGemm(CustomTestCase):
         expected = torch.randn((4, 256), dtype=torch.float32)
 
         with patch(
-            "sglang.srt.models.mimo_v2.linear_bf16_fp32", return_value=expected
+            "sglang.srt.layers.moe.router_gate.linear_bf16_fp32", return_value=expected
         ) as mock_linear:
             out = gate(hidden_states)
 
@@ -54,7 +66,7 @@ class TestMiMoV2RouterHpcGemm(CustomTestCase):
         hidden_states = torch.randn((4, hidden_size), dtype=torch.bfloat16)
 
         with patch(
-            "sglang.srt.models.mimo_v2.linear_bf16_fp32",
+            "sglang.srt.layers.moe.router_gate.linear_bf16_fp32",
             side_effect=AssertionError("unexpected hpc kernel dispatch"),
         ):
             out = gate(hidden_states)
