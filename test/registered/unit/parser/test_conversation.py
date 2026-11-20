@@ -213,6 +213,21 @@ class TestConversationGetPrompt(CustomTestCase):
         # i=1: tag + " " + message + sep2
         self.assertIn("[/INST] A1 </s><s>", prompt)
 
+    def test_llama2_consecutive_user_messages_keep_their_roles(self):
+        """Non-alternating turns must not be relabeled by position: consecutive
+        user messages share one [INST] block and the prompt ends with [/INST]."""
+        request = ChatCompletionRequest(
+            model="m",
+            messages=[
+                ChatCompletionMessageUserParam(role="user", content="Q1"),
+                ChatCompletionMessageGenericParam(role="assistant", content="A1"),
+                ChatCompletionMessageUserParam(role="user", content="Q2"),
+                ChatCompletionMessageUserParam(role="user", content="Q3"),
+            ],
+        )
+        prompt = generate_chat_conv(request, "llama-2").get_prompt()
+        self.assertEqual(prompt, "[INST] Q1 [/INST] A1 </s><s>[INST] Q2\n\nQ3 [/INST]")
+
     def test_llama4(self):
         """Test prompt generation with LLAMA4 style."""
         conv = Conversation(
