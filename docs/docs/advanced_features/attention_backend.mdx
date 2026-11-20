@@ -328,6 +328,8 @@ GDN (Gated Delta Network) is a linear attention mechanism with O(n) complexity, 
 
 The GDN linear attention layers have their own kernel backends, selected via `--linear-attn-backend` (default: `triton`). You can override the kernel per phase with `--linear-attn-decode-backend` and `--linear-attn-prefill-backend`.
 
+On SM120 (compute capability 12.0), you can opt into FlashInfer GDN decode with FP32 recurrent state and 128-dimensional key and value heads using `--mamba-ssm-dtype float32 --linear-attn-decode-backend flashinfer`. This does not change the default decode backend. If you leave `--linear-attn-verify-backend` unset, SGLang selects Triton for target verification; FlashInfer verification is not supported for this FP32 configuration.
+
 On SM100/SM103 with CUDA 13+, SGLang automatically selects FlashInfer for GDN prefill when the per-phase override is unset, the base linear-attention backend is Triton, recurrent state is BF16, key/value head dimensions are 128, dynamic chunking and page-major KV layout are disabled, and `--chunked-prefill-size` is between 1 and 8192. Radix caching may be disabled or use `no_buffer`, `extra_buffer`, or `extra_buffer_lazy`; the extra-buffer paths use state checkpoints.
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
