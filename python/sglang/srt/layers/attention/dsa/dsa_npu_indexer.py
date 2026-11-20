@@ -25,6 +25,7 @@ from sglang.srt.utils import is_npu, print_info_once
 
 if is_npu():
     import torch_npu
+    from sgl_kernel_npu.operators.indexer import mlp_lightning_indexer
 
     from sglang.srt.hardware_backend.npu.utils import get_indexer_weight_stream
 
@@ -239,7 +240,7 @@ class DSANPUIndexerMixin:
         q_ends = actual_seq_lengths_q.to(device=query.device, dtype=torch.int64)
         kv_lengths = actual_seq_lengths_kv.to(device=query.device, dtype=torch.int64)
         zero = q_ends.new_zeros(1)
-        indices, _ = torch.ops.npu.mlp_lightning_indexer(
+        indices, _ = mlp_lightning_indexer(
             query,
             key,
             weights.float(),
