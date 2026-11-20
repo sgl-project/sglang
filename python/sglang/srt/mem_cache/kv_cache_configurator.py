@@ -1697,6 +1697,7 @@ class KVCacheConfigurator:
         from sglang.srt.disaggregation.decode import (
             HybridMambaDecodeReqToTokenPool,
         )
+        from sglang.srt.layers.attention.linear.utils import max_verify_batch_size
 
         req_to_token_pool = HybridMambaDecodeReqToTokenPool(
             size=max_num_reqs,
@@ -1730,6 +1731,7 @@ class KVCacheConfigurator:
                 host_only_mamba_checkpoint() and self.hybrid_kda_config is not None
             ),
             allocate_intermediate_ssm=self.allocate_intermediate_ssm,
+            max_verify_batch_size=max_verify_batch_size(max_num_reqs),
         )
         return req_to_token_pool
 

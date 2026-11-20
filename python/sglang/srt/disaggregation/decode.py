@@ -94,6 +94,7 @@ from sglang.srt.disaggregation.utils import (
     state_indices_per_entry,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
 from sglang.srt.layers.dcp.layout import dsa_index_k_page_tokens
 from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.schedule_batch import NextBatchPlan, ScheduleBatch
@@ -354,6 +355,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         ngram_context_len: int = 0,
         ngram_eos_token_id: int = 0,
         replayssm_request_ring: bool = False,
+        max_verify_batch_size: Optional[int] = None,
     ):
         DecodeReqToTokenPool.__init__(
             self,
@@ -393,9 +395,20 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         else:
             effective_mamba_size = max_slots_needed
         self.start_layer = start_layer if start_layer is not None else 0
+        # In-transfer reqs never verify, so the spec scratch needs one row per
+        # verify-batch row. Eager warmup, MLP sync and CUDA graphs pad that batch
+        # past `size`, and some writers (Qwen4-Exp PLE side states, positional
+        # conv tapes) index the scratch by padded row without clamping it.
+        # ReplaySSM-spec rings (GDN, KDA's request ring) and PP-spec stable rows
+        # index by req_pool_idx, so they also keep the in-transfer slots.
+        mamba_spec_state_size = (
+            size if max_verify_batch_size is None else max_verify_batch_size
+        )
+        if enable_linear_replayssm_spec or pp_spec_stable_rows_enabled():
+            mamba_spec_state_size = max(mamba_spec_state_size, size + pre_alloc_size)
         self._init_mamba_pool(
             mamba_size=effective_mamba_size,
-            mamba_spec_state_size=size + pre_alloc_size,
+            mamba_spec_state_size=mamba_spec_state_size,
             cache_params=cache_params,
             mamba_layer_ids=mamba_layer_ids,
             device=device,
