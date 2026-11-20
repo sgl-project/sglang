@@ -127,6 +127,30 @@ def validate_kv_shard_attention_backend(server_args: Any, cfg: Any = None) -> No
         raise ValueError("KV sharding with trtllm_mla requires chunked prefix caching.")
 
 
+def check_kv_shard_storage(
+    *,
+    storage_backend: str,
+    host_memory_mode: str,
+    key_scheme: str,
+) -> None:
+    """Validate built-in storage at launch and again at runtime attach."""
+    if storage_backend != "mooncake":
+        raise ValueError(
+            "--enable-kv-cache-sharding supports only the mooncake "
+            f"built-in HiCache storage backend, got {storage_backend!r}."
+        )
+    if host_memory_mode != "cache":
+        raise ValueError(
+            "--enable-kv-cache-sharding requires --hicache-host-memory-mode "
+            "cache with a storage backend."
+        )
+    if key_scheme != "rank-suffix":
+        raise ValueError(
+            "--enable-kv-cache-sharding requires --hicache-storage-key-scheme "
+            "rank-suffix with Mooncake storage."
+        )
+
+
 def handle_kv_cache_sharding(server_args: Any, gpu_mem: Optional[float] = None) -> None:
     """Validate KV sharding and declare its derived eager-prefill settings."""
     cfg = resolving_view(server_args)
@@ -226,11 +250,17 @@ def handle_kv_cache_sharding(server_args: Any, gpu_mem: Optional[float] = None) 
         and cfg.hicache_storage_backend is not None
         and not kv_shard_storage_backend_supported(cfg.hicache_storage_backend)
     ):
-        raise ValueError(
-            "--enable-kv-cache-sharding supports HiCache host offload but not "
-            "--hicache-storage-backend yet: the storage path reads and writes "
-            "whole pages per rank, not each rank's own stripe."
+        check_kv_shard_storage(
+            storage_backend=cfg.hicache_storage_backend,
+            host_memory_mode=cfg.hicache_host_memory_mode,
+            key_scheme=cfg.hicache_storage_key_scheme,
         )
+        if is_deepseek_dsa(model_config_of(server_args).hf_config):
+            raise ValueError(
+                "--enable-kv-cache-sharding does not support "
+                "--hicache-storage-backend for DSA models: sharded storage "
+                "I/O covers only the KV host pool, not the indexer pool."
+            )
     if cfg.enable_hierarchical_cache and is_deepseek_dsa(
         model_config_of(server_args).hf_config
     ):

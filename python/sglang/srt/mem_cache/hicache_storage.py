@@ -54,8 +54,16 @@ class HiCacheStorageConfig:
 
     # Whole-page replication can differ from the target's attention layout.
     rank_replicated: Optional[bool] = None
+    # Sharded Mooncake keys name the head shard, while tp_rank still identifies
+    # the process that owns the relevant buffers.
+    key_tp_rank: Optional[int] = None
 
     def __post_init__(self):
+        if self.key_tp_rank is not None:
+            if not 0 <= self.key_tp_rank < self.tp_size:
+                raise ValueError("Invalid key TP rank for KV-sharded storage.")
+            if self.dcp_size != 1:
+                raise ValueError("KV-sharded storage and DCP are mutually exclusive.")
         if self.dcp_size < 1 or not 0 <= self.dcp_rank < self.dcp_size:
             raise ValueError("Invalid DCP size or rank for HiCache storage.")
         if self.dcp_size == 1:
@@ -90,6 +98,14 @@ class HiCacheStorageConfig:
         MLA uses one writer per DCP shard in the first DCP group; with DCP
         disabled, MLA uses TP rank 0 and non-MLA uses every TP rank.
         """
+        if self.key_tp_rank is not None:
+            # Plain TP gives each MLA rank different pages. With CP, each CP
+            # rank's pages have identical bytes across attention TP replicas.
+            return (
+                not self.is_rank_replicated
+                or self.attn_cp_size == 1
+                or self.key_tp_rank == 0
+            )
         if self.unified_suffixes is not None and self.attn_cp_rank != 0:
             return False
         return not self.is_rank_replicated or self.tp_rank == self.dcp_rank

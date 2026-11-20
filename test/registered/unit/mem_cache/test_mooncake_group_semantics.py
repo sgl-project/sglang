@@ -87,6 +87,7 @@ def _fake_store_class():
         instances = []
 
         def __init__(self):
+            self.setup_calls = []
             self.batch_put_calls = []
             self.batch_exist_calls = []
             self.existing_keys = set()
@@ -94,6 +95,7 @@ def _fake_store_class():
             type(self).instances.append(self)
 
         def setup(self, *args, **kwargs):
+            self.setup_calls.append((args, kwargs))
             return 0
 
         def register_buffer(self, *args, **kwargs):
@@ -378,6 +380,33 @@ class TestMooncakeGroupSemantics(CustomTestCase):
                     self.assertEqual(
                         result.kv_hit_pages, expected[-1] if expected else 0
                     )
+
+    def test_kv_shard_keys_keep_heads_and_drop_cp_ownership(self):
+        keys = {}
+        for rank in range(4):
+            cfg = replace(
+                _make_config(tp_size=4, tp_rank=rank),
+                attn_cp_rank=rank // 2,
+                attn_cp_size=2,
+                key_tp_rank=rank % 2,
+                model_name="model-kvshard-page_first-atp2",
+            )
+            store, fake = _make_store(storage_config=cfg)
+            store.register_mem_pool_host(FakeHostKVCache(2))
+            self.assertEqual(store.batch_set_v1(["page"], torch.arange(1)), [True])
+            keys[rank] = fake.batch_put_calls[-1]["keys"]
+            self.assertEqual(store.local_rank, rank)
+            self.assertEqual(fake.setup_calls[0][0][2], 1024 * 1024 // 4)
+        self.assertEqual(keys[0], keys[2])
+        self.assertEqual(keys[1], keys[3])
+        self.assertNotEqual(keys[0], keys[1])
+        self.assertEqual(
+            keys[1],
+            [
+                "model-kvshard-page_first-atp2_page_1_k",
+                "model-kvshard-page_first-atp2_page_1_v",
+            ],
+        )
 
     def test_dcp_shard_keys_and_replicas(self):
         base = replace(

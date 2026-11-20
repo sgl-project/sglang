@@ -65,6 +65,7 @@ from sglang.srt.mem_cache.buffer_mode.storage_existence_cache import (
 from sglang.srt.mem_cache.capacity import owner_rows_ready
 from sglang.srt.mem_cache.common import RetractionBackup
 from sglang.srt.mem_cache.hicache_storage import (
+    HiCacheStorageConfig,
     PoolHitPolicy,
     PoolName,
     PoolTransfer,
@@ -119,6 +120,7 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     UnifiedCacheLinker,
     UnifiedCacheLinkerWrapper,
 )
+from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     NodeId,
     uses_joint_lru,
@@ -216,6 +218,7 @@ class _OngoingPrefetch(NamedTuple):
     operation: PrefetchOperation
     anchor_lock_params: DecLockRefParams
     comp_xfers: dict[ComponentType, list[PoolTransfer]]
+    rotation_base: Optional[int] = None
 
 
 class UnifiedRadixCache(BasePrefixCache):
@@ -2621,6 +2624,34 @@ class UnifiedRadixCache(BasePrefixCache):
             return None
         return self.tree_core.rotation_base_of(node_id)
 
+    def _uses_sharded_storage(self) -> bool:
+        config = getattr(self.cache_controller, "storage_config", None)
+        return (
+            isinstance(config, HiCacheStorageConfig) and config.key_tp_rank is not None
+        )
+
+    def _prefetch_rotation_base(
+        self, anchor_node_id: NodeId, prefetch_key: RadixKey
+    ) -> Optional[int]:
+        """Logical-page KV sharding: the rotation an L3 prefetch's host bounce is
+        drawn in. A chain keeps its anchor's base; a root anchor adopts a chain
+        that took the prefix since issue, else starts one seeded like a new
+        extend. None when sharding is off."""
+        if not self._uses_sharded_storage():
+            return None
+        tree_core = self.tree_core
+        assert isinstance(tree_core, UnifiedTreeCore)
+        if tree_core.is_root(anchor_node_id):
+            base = tree_core.rotation_base_below(anchor_node_id, prefetch_key)
+            return (
+                self.token_to_kv_pool_allocator.least_full_class()
+                if base is None
+                else base
+            )
+        base = tree_core.rotation_base_of(anchor_node_id)
+        assert base is not None, "a sharded chain node carries a rotation base"
+        return base
+
     def query_storage_hit_length(
         self,
         last_host_node_id: NodeId,
@@ -3103,6 +3134,7 @@ class UnifiedRadixCache(BasePrefixCache):
             _,
             anchor_lock_params,
             comp_xfers,
+            rotation_base,
         ) = self.ongoing_prefetch[request]
 
         # All PP/TP ranks will get the same `min_completed_tokens`, because `completed_tokens`
@@ -3134,13 +3166,20 @@ class UnifiedRadixCache(BasePrefixCache):
                 request, completed_tokens, hash_value
             )
 
-        fetched_key = prefetch_key[:completed_tokens]
-        insert_result = self.tree_core.insert_host(
+        insert_args = (
             last_host_node_id,
-            fetched_key,
+            prefetch_key[:completed_tokens],
             host_indices[:completed_tokens],
             hash_value[: completed_tokens // self.page_size],
         )
+        tree_core = self.tree_core
+        if rotation_base is None:
+            insert_result = tree_core.insert_host(*insert_args)
+        else:
+            assert isinstance(tree_core, UnifiedTreeCore)
+            insert_result = tree_core.insert_host(
+                *insert_args, rotation_base=rotation_base
+            )
 
         # Apply the host-insert walk's actions before the transfer commit.
         self._apply_cache_actions(insert_result.cache_actions)
@@ -3795,12 +3834,21 @@ class UnifiedRadixCache(BasePrefixCache):
             # shortened recovery boundary may be invalid in storage; only
             # full-only models may truncate the prefix to fit host capacity.
             allow_partial = not info.comp_xfers
+            rotation_base = self._prefetch_rotation_base(
+                info.anchor_node_id, info.prefetch_key
+            )
+            shard_args = {}
+            if rotation_base is not None:
+                shard_args["start_owner"] = (
+                    rotation_base + operation.storage_start // self.page_size
+                )
             host_indices, alloc_len = cc.allocate_storage_hit(
                 operation,
                 hit_tokens,
                 allow_partial=allow_partial,
                 min_tokens=self.prefetch_threshold if allow_partial else hit_tokens,
                 evict_host=self.evict_host,
+                **shard_args,
             )
             if host_indices is None:
                 self._finish_storage_prefetch(
@@ -3835,7 +3883,9 @@ class UnifiedRadixCache(BasePrefixCache):
             operation.storage_hit_count = alloc_len
             operation.hash_value = operation.hash_value[: alloc_len // self.page_size]
             operation.host_indices = host_indices
-            self.ongoing_prefetch[request] = info._replace(host_indices=host_indices)
+            self.ongoing_prefetch[request] = info._replace(
+                host_indices=host_indices, rotation_base=rotation_base
+            )
             cc.prefetch_buffer.put(operation)
             return True
 

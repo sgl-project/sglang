@@ -2891,6 +2891,7 @@ class TestPrefetchCommitOrdering(CustomTestCase):
                 cache.host_memory_mode = "cache"
                 cache.page_size = 4
                 cache.prefetch_threshold = 4
+                cache._prefetch_rotation_base.return_value = None
                 cc = cache.cache_controller
                 cc.page_size = cache.page_size
                 cc.mem_pool_host.anchor_entry.host_pool = object()
@@ -2970,6 +2971,7 @@ class TestPrefetchCommitOrdering(CustomTestCase):
         operation.handle = CacheRequestHandle("req", 0)
         operation.request_id = "req"
         operation.completed_tokens = 8
+        operation.hash_value = [f"h{i}" for i in range(8)]
         cache.ongoing_prefetch = {
             operation.handle: _OngoingPrefetch(
                 7,
@@ -3012,6 +3014,9 @@ class TestPrefetchCommitOrdering(CustomTestCase):
             )
         )
 
+        cache.tree_core.insert_host.assert_called_once_with(
+            7, list(range(8)), list(range(100, 108)), [f"h{i}" for i in range(8)]
+        )
         self.assertEqual([c[0] for c in order.mock_calls], ["apply", "commit", "apply"])
         self.assertEqual(applied[0], [walk_action])
         self.assertIsNot(
@@ -3273,6 +3278,47 @@ class TestUnifiedRadixPrefetchCorruption(
         cache.sanity_check()
 
 
+class TestKVShardPrefetchRotation(UnifiedRadixCacheStorageFixtures, CustomTestCase):
+    """KV sharding: an L3 hit lands in its chain's rotation."""
+
+    cfg = CacheConfig(
+        page_size=16,
+        components=(ComponentType.FULL,),
+        kv_size=4096,
+        max_context_len=4096,
+    )
+
+    @requires_hicache
+    def test_l3_hit_lands_in_the_chain_rotation(self):
+        """The host bounce is drawn at the chain's owner phase and the landed
+        host nodes carry its rotation base, as load-back and extends assume."""
+        storage_dir = self._make_storage_dir()
+        seq = self._make_seq(1, 4)
+        self._l3_produce(storage_dir, seq)
+        cons, _, _ = build_fixture(self.cfg, tree_core_backend="python")
+        self._init_hicache(
+            cons, storage_backend="file", storage_dir=storage_dir, prefetch_threshold=1
+        )
+        anchor = cons.cache_controller.mem_pool_host.anchor_entry.host_pool
+        native_alloc = anchor.alloc
+        start_owners = []
+
+        def owner_phased_alloc(need_size, start_owner=None):
+            # An unsharded pool stands in for PageInterleaveHostPool.alloc.
+            start_owners.append(start_owner)
+            return native_alloc(need_size)
+
+        with (
+            mock.patch.object(cons, "_prefetch_rotation_base", return_value=3),
+            mock.patch.object(anchor, "alloc", side_effect=owner_phased_alloc),
+        ):
+            self._consume_prefetch(cons, seq, CacheRequestHandle("rotation", 0))
+        self.assertEqual(start_owners, [3])
+        host_node = match_prefix(cons, seq).last_host_node
+        self.assertNotEqual(host_node, cons.root_node_handle())
+        self.assertEqual(cons.tree_core.rotation_base_of(host_node), 3)
+
+
 class TestUnifiedRadixCacheStorageAttachBackfill(
     UnifiedRadixCacheStorageAttachBackfillFixtures, CustomTestCase
 ):
@@ -3351,6 +3397,24 @@ class TestUnifiedRadixCacheStorageAttachBackfill(
             all(h for h in self._hashes_by_token_ids(cache).values()),
             "every node must carry a hash chain once storage is enabled",
         )
+
+    def test_prefetch_threshold_applies_page_floor_only_to_sharded_storage(self):
+        cache = self._build_two_level_tree(storage_on_from_the_start=False)
+        for sharded, threshold in ((False, 0), (True, cache.page_size)):
+            with mock.patch.object(
+                cache, "_uses_sharded_storage", return_value=sharded
+            ):
+                StorageAttachment(cache).apply_runtime_config(
+                    storage_backend="mooncake",
+                    prefetch_threshold=0,
+                    prefetch_timeout_base=1.0,
+                    prefetch_timeout_per_ki_token=0.25,
+                    hicache_storage_pass_prefix_keys=False,
+                    enable_storage=True,
+                    enable_storage_metrics=False,
+                    extra_metric_labels=None,
+                )
+            self.assertEqual(cache.prefetch_threshold, threshold)
 
 
 class TestAnchorLockOutcomePolicy(AnchorLockOutcomePolicyFixtures, CustomTestCase):

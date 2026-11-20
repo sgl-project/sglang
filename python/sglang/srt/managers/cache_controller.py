@@ -39,6 +39,10 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.pool_host import HostKVCache
 
 from sglang.srt.arg_groups.hicache_hook import UNIFIED_KEY_SCHEME_STORAGE_BACKENDS
+from sglang.srt.arg_groups.kv_shard_hook import (
+    check_kv_shard_storage,
+    kv_shard_storage_backend_supported,
+)
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
@@ -51,6 +55,7 @@ from sglang.srt.mem_cache.hicache_key_scheme import (
 )
 from sglang.srt.mem_cache.kv.memory.views import KVLayoutView, MLAKVView
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
+from sglang.srt.mem_cache.pool_host.page_interleave import PageInterleaveHostPool
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.srt.runtime_context import get_memory, get_parallel
 from sglang.srt.utils import get_device_module
@@ -63,8 +68,10 @@ device_module = get_device_module()
 
 def storage_model_name(
     model_name: Optional[str],
-    host_pool: HostKVCache | LogicalHostPool,
+    host_pool: HostKVCache | LogicalHostPool | PageInterleaveHostPool,
     kv_cache_dtype: torch.dtype,
+    *,
+    storage_format_tag: Optional[str] = None,
 ) -> str:
     """Namespace storage keys by page format and the server's logical KV dtype."""
     if not isinstance(kv_cache_dtype, torch.dtype):
@@ -74,10 +81,46 @@ def storage_model_name(
         )
     parts = [
         model_name,
-        host_pool.storage_format_tag,
+        storage_format_tag or host_pool.storage_format_tag,
         f"dtype_{normalize_dtype(kv_cache_dtype)}",
     ]
     return "-".join(part for part in parts if part)
+
+
+def _shard_storage_io(
+    *, pool: PageInterleaveHostPool, page_get: Callable, page_set: Callable
+) -> tuple[Callable, Callable]:
+    """Logical-page KV sharding: each rank reads and writes only its own
+    pages of a storage batch, as local host rows. Keys carry no owner rank."""
+
+    def get_owned(operation, hash_values, host_indices, extra_info=None) -> int:
+        positions, rows = pool.owned_storage_pages(host_indices)
+        if not positions:
+            return len(hash_values)
+        try:
+            hits = page_get(
+                operation, [hash_values[i] for i in positions], rows, extra_info
+            )
+        except Exception:
+            # Keep the prefix before this rank's first owned page.
+            logger.exception(
+                "Sharded storage read failed for request %s.", operation.request_id
+            )
+            hits = 0
+        # This rank's logical prefix; the MIN over ranks is the landed prefix.
+        return positions[hits] if hits < len(positions) else len(hash_values)
+
+    def set_owned(hash_values, host_indices, extra_info=None) -> bool:
+        positions, rows = pool.owned_storage_pages(host_indices)
+        if not positions:
+            return True
+        try:
+            return page_set([hash_values[i] for i in positions], rows, extra_info)
+        except Exception:
+            logger.exception("Sharded storage write failed.")
+            return False
+
+    return get_owned, set_owned
 
 
 class LayerLoadingEvent:
@@ -750,6 +793,40 @@ class HiCacheController:
                 "Cannot attach storage backend: previous detach did not stop storage threads cleanly."
             ) from e
 
+        # Registered out-of-tree backends read and write only owned pages themselves.
+        shard_storage_io = isinstance(
+            self.storage_host_pool, PageInterleaveHostPool
+        ) and not kv_shard_storage_backend_supported(storage_backend)
+        if shard_storage_io:
+            check_kv_shard_storage(
+                storage_backend=storage_backend,
+                host_memory_mode=self.host_memory_mode,
+                key_scheme=key_scheme,
+            )
+            if (storage_backend_extra_config or {}).get("tp_lcm_size"):
+                raise ValueError(
+                    "--enable-kv-cache-sharding does not support tp_lcm_size (split heads)."
+                )
+            if self.storage_host_pool.layout == "layer_first":
+                from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+
+                if isinstance(self.storage_host_pool.host_pool, MHATokenToKVPoolHost):
+                    raise ValueError(
+                        "KV-sharded MHA with Mooncake requires a page-oriented "
+                        "host layout. Start the server with --hicache-mem-layout page_first."
+                    )
+            if self.mem_pool_host is not self.storage_host_pool:
+                other_pools = [
+                    str(entry.name)
+                    for entry in self.mem_pool_host.entries
+                    if entry.host_pool is not self.storage_host_pool
+                ]
+                if other_pools:
+                    raise ValueError(
+                        "HiCache storage with KV sharding supports only the KV "
+                        f"host pool, not {other_pools}."
+                    )
+
         # Rollback-safe init: if creation fails, keep controller state consistent
         # for future attach attempts.
         self.storage_backend_type = storage_backend
@@ -819,6 +896,12 @@ class HiCacheController:
             ):
                 self.page_get_func = self._page_get_zero_copy
                 self.page_set_func = self._page_set_zero_copy
+            if shard_storage_io:
+                self.page_get_func, self.page_set_func = _shard_storage_io(
+                    pool=self.storage_host_pool,
+                    page_get=self.page_get_func,
+                    page_set=self.page_set_func,
+                )
 
             # Ensure stop_event is clear before starting threads.
             self.storage_stop_event.clear()
@@ -956,11 +1039,28 @@ class HiCacheController:
 
         attn_cp_rank, attn_cp_size = self.get_attn_cp_rank_and_size()
         dcp_size = get_parallel().attn_dcp_size
+        host_pool = self.storage_host_pool
+        shard_storage_io = (
+            isinstance(host_pool, PageInterleaveHostPool)
+            and self.storage_backend_type == "mooncake"
+            and not kv_shard_storage_backend_supported("mooncake")
+        )
         # Token KV views carry the server's resolved logical dtype, including
         # FP8 variants that share a uint8 backing buffer.
         model_name = storage_model_name(
-            model_name, self.storage_host_pool, getattr(anchor, "dtype", None)
+            model_name,
+            host_pool,
+            getattr(anchor, "dtype", None),
+            storage_format_tag=(
+                host_pool.sharded_storage_format_tag if shard_storage_io else None
+            ),
         )
+        key_tp_rank = None
+        if shard_storage_io:
+            # A page's owner depends on its chain's rotation, so keys name only
+            # the head shard; the tag keeps writers of other page bytes apart.
+            key_tp_rank = parallel.attn_tp_rank
+            model_name = f"{model_name}-atp{parallel.attn_tp_size}"
         unified_plan = self._build_unified_plan(model_name, attn_cp_size)
         unified_chunk_spans = None
         if unified_plan is not None:
@@ -991,6 +1091,7 @@ class HiCacheController:
             dcp_size=dcp_size,
             dcp_rank=get_parallel().attn_dcp_rank,
             logical_page_size=self.page_size if dcp_size > 1 else None,
+            key_tp_rank=key_tp_rank,
         )
 
     def _build_unified_plan(
