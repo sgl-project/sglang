@@ -111,12 +111,24 @@ class Inkling2DecoderLayer(nn.Module):
             )
         attention = self.attn(attn_input, positions, forward_batch)
         attention = self.attn_sconv(attention, positions, forward_batch)
-        mlp_input = self.mlp_norm(state.mlp_input(self.layer_id, attention))
         routed = forward_batch.forward_mode.is_decode() or (
             forward_batch.forward_mode.is_target_verify()
             and attention.shape[0] <= VERIFY_ROUTED_EPILOGUE_MAX_TOKENS
         )
-        mlp = self.mlp(mlp_input, forward_batch, combine=not routed)
+        tokens = attention.shape[0]
+        # MTP verify keeps every row.
+        rows = (
+            None
+            if forward_batch.forward_mode.is_target_verify()
+            else self.mlp.local_input_rows(tokens, combine=not routed)
+        )
+        mlp_input = self.mlp_norm(state.mlp_input(self.layer_id, attention, rows))
+        mlp = self.mlp(
+            mlp_input,
+            forward_batch,
+            combine=not routed,
+            total_tokens=tokens if rows is not None else None,
+        )
         if isinstance(mlp, torch.Tensor) and (
             forward_batch.forward_mode.is_decode()
             or forward_batch.forward_mode.is_target_verify()
