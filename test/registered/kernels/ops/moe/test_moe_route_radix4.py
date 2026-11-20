@@ -524,12 +524,24 @@ def test_fused_sort_matches_route_and_layout(m, block_m):
 # (12, 7) sorts in the last CTA. Past 64 tokens every padding row sends all 16
 # routes to expert 0, which the tail's one-route-per-token ranking cannot see, so
 # they are placed separately: none, one, a whole tail chunk, and all but one.
-# A negative count is every row padded.
+# A negative count is every row padded; (12, -3) and (1, -16) reach the last CTA.
+@pytest.mark.parametrize("block_m", BLOCK_MS)
 @pytest.mark.parametrize(
     "m, n_real",
-    [(12, 7), (80, 80), (80, 79), (80, 61), (300, 1), (300, 0), (80, -1000), (300, -1)],
+    [
+        (12, 7),
+        (80, 80),
+        (80, 79),
+        (80, 61),
+        (300, 1),
+        (300, 0),
+        (80, -1000),
+        (300, -1),
+        (12, -3),
+        (1, -16),
+    ],
 )
-def test_fused_sort_routes_padded_rows_like_the_mask(m, n_real):
+def test_fused_sort_routes_padded_rows_like_the_mask(m, n_real, block_m):
     """select_experts masks CUDA-graph padding rows to expert 0 and weight 0 in
     place after routing. AITER matches the registered sort by tensor address,
     so the sort has to describe the masked rows, not the routed ones, and give
@@ -548,7 +560,7 @@ def test_fused_sort_routes_padded_rows_like_the_mask(m, n_real):
         True,
         2.5,
         sort_ws=_sort_ws(),
-        block_m=BM,
+        block_m=block_m,
         num_token_non_padded=non_padded,
     )
 
@@ -559,8 +571,9 @@ def test_fused_sort_routes_padded_rows_like_the_mask(m, n_real):
         aux["sorted_token_ids"].cpu(),
         aux["sorted_weights"].cpu(),
         aux["sorted_expert_ids"].cpu(),
-        int(aux["num_valid_ids"][0]) // BM,
+        int(aux["num_valid_ids"][0]) // block_m,
         m,
+        block_m,
     )
     assert got == expected
     reverse = aux["reverse_sorted"].cpu()

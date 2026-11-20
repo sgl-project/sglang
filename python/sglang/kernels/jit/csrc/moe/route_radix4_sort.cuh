@@ -228,7 +228,10 @@ SGL_DEVICE void sort_resident(
     int M) {
   const int tid = threadIdx.x;
   int n_real = M;
-  if (num_non_padded != nullptr) n_real = (*num_non_padded < M) ? *num_non_padded : M;
+  if (num_non_padded != nullptr) {
+    const int n = *num_non_padded;
+    n_real = (n < 0) ? 0 : ((n < M) ? n : M);
+  }
   int eid[PAIRS_PER_ROUND];
   float w[PAIRS_PER_ROUND];
 #pragma unroll
