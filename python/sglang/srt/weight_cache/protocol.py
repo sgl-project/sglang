@@ -181,6 +181,14 @@ def check_ipc_quant_support(
     `where` is a short tag (e.g. "daemon"/"client") used only in the error
     message. Raises UnsupportedQuantForIPCError with an actionable message.
     """
+    # The checkpoint's quant config does not cover the KDA projections;
+    # they are quantized to padded per-channel FP8 at load, which the client cannot rebuild.
+    if envs.SGLANG_OPT_GLM53_KDA_PTPC_MODULES.get():
+        raise UnsupportedQuantForIPCError(
+            f"[weight_cache:{where}] SGLANG_OPT_GLM53_KDA_PTPC_MODULES quantizes "
+            f"BF16 KDA projections at load, which CUDA IPC weight sharing does not "
+            f"support. Unset it or disable the weight cache (--weight-cache-mode off)."
+        )
     if is_ipc_quant_supported(quant_method, quant_config):
         return
     verified = ", ".join(

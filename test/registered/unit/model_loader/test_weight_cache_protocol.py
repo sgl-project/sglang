@@ -376,6 +376,21 @@ class TestIpcQuantAllowlist(CustomTestCase):
             "fp8", {"weight_block_size": [128, 128]}, where="daemon"
         )
 
+    def test_kda_fp8_online_quantization_is_rejected(self):
+        # GLM-5.3-Flash's block-FP8 checkpoint passes the allowlist, but the switch
+        # quantizes its BF16 KDA projections at load.
+        with envs.SGLANG_OPT_GLM53_KDA_PTPC_MODULES.override("o_proj"):
+            for where in ("daemon", "client"):
+                with (
+                    self.subTest(where=where),
+                    self.assertRaisesRegex(
+                        UnsupportedQuantForIPCError, "SGLANG_OPT_GLM53_KDA_PTPC"
+                    ),
+                ):
+                    check_ipc_quant_support(
+                        "fp8", {"weight_block_size": [128, 128]}, where=where
+                    )
+
 
 class TestCleanupStaleDaemonFiles(CustomTestCase):
     # A key no real daemon would ever compute, so this never collides with
