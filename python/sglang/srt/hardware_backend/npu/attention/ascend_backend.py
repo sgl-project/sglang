@@ -103,6 +103,9 @@ class ForwardMetadata:
     # Current anchor plan, also consumed by following IndexShare layers. The
     # tensors are owned by the sparse manager and updated inside graph replay.
     sparse_kv_lim_plan: Optional[LIMSelection] = None
+    sparse_kv_offload_rows: Optional[
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+    ] = None
     # calculated map for kv positions [bs * maxseqlen]
     block_tables: Optional[torch.Tensor] = None
 
@@ -634,6 +637,12 @@ class AscendAttnBackend(AttentionBackend):
             origin_out_cache_loc=getattr(forward_batch, "origin_out_cache_loc", None),
             max_seq_len_host=getattr(forward_batch, "max_seq_len_host", None),
         )
+
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
+        if self.use_fused_sparse_kv:
+            # Each warmup and capture records fresh sparse-KV metadata producers.
+            self.forward_metadata.sparse_kv_lim_plan = None
+            self.forward_metadata.sparse_kv_offload_rows = None
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""

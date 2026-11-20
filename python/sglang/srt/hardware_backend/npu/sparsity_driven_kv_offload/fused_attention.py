@@ -31,9 +31,17 @@ def forward_fused_sparse_kv_offload(
     is_prefill = forward_batch.forward_mode.is_extend_without_speculative()
     k_nope = k.view(-1, layer.tp_k_head_num, backend.kv_lora_rank).contiguous()
     k_pe = k_rope.view(-1, layer.tp_k_head_num, backend.qk_rope_head_dim).contiguous()
-    current_inputs = manager.offload_v2(k_nope, k_pe, layer, forward_batch)
+    metadata = backend.forward_metadata
+    last_layer = layer.layer_id == manager.start_layer + manager.layer_num - 1
+    offload_rows = metadata.sparse_kv_offload_rows
+    if offload_rows is None or offload_rows[0].numel() != k_nope.shape[0]:
+        offload_rows = manager.prepare_offload_rows(k_nope.shape[0], forward_batch)
+    metadata.sparse_kv_offload_rows = None if last_layer else offload_rows
+    current_inputs = manager.offload_v2(
+        k_nope, k_pe, layer, forward_batch, offload_rows=offload_rows
+    )
     if not is_prefill:
-        plan = backend.forward_metadata.sparse_kv_lim_plan
+        plan = metadata.sparse_kv_lim_plan
         rows = forward_batch.batch_size * plan.query_width
         result = manager.copy_sfa_attention(
             layer,
@@ -42,6 +50,9 @@ def forward_fused_sparse_kv_offload(
             plan,
             current_inputs,
         )
+        if last_layer:
+            manager.lim_adapter.commit_forward(forward_batch.batch_size)
+            metadata.sparse_kv_lim_plan = None
         if q.shape[0] > rows:
             return torch.nn.functional.pad(result, (0, 0, 0, q.shape[0] - rows))
         return result

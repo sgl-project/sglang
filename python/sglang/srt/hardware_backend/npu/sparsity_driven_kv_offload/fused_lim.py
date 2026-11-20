@@ -46,6 +46,7 @@ class LIMDecodeAdapter:
         self.max_query_width = manager.max_query_width
         self.operator = load_fused_lim_operator()
         self._fused_prepare_lim_metadata = fused_prepare_lim_metadata
+        self._prepared_batch = None
         device = manager.device
         for name, spec in manager.budget.adapter_buffers.items():
             if name == "query_ends":
@@ -64,20 +65,15 @@ class LIMDecodeAdapter:
             setattr(self, name, value)
 
     def reset_requests(self, request_slots):
-        self.last_prefix[:, request_slots] = -1
+        self.last_prefix.index_fill_(0, request_slots, -1)
 
-    def select(
-        self, manager, *, query, weights, key, block_table, forward_batch, layer_id
-    ):
+    def _prepare_forward(self, manager, block_table, forward_batch, width):
         batch = forward_batch.batch_size
-        width = sparse_query_width(forward_batch)
-        rows = batch * width
-        layer_index = layer_id - manager.start_layer
         self._fused_prepare_lim_metadata(
             seq_lens=forward_batch.seq_lens[:batch],
-            positions=forward_batch.positions[:rows],
+            positions=forward_batch.positions[: batch * width],
             request_slots=forward_batch.req_pool_indices,
-            last_prefix=self.last_prefix[layer_index],
+            last_prefix=self.last_prefix,
             block_table=block_table,
             out_block_table=self.block_table[:batch],
             safe_slots=self.request_safe_slots[:batch],
@@ -94,6 +90,28 @@ class LIMDecodeAdapter:
             request_to_resident=manager.request_to_resident,
             resident_rows=manager.budget.resident_rows,
         )
+        self._prepared_batch = forward_batch
+
+    def select(
+        self,
+        manager,
+        *,
+        query,
+        weights,
+        key,
+        block_table,
+        forward_batch,
+        layer_id,
+        reuse_metadata=False,
+    ):
+        batch = forward_batch.batch_size
+        width = sparse_query_width(forward_batch)
+        rows = batch * width
+        layer_index = layer_id - manager.start_layer
+        # Interleaved batches share the adapter scratch. Rebuild it when a
+        # different batch has used it since this batch's preceding owner.
+        if not reuse_metadata or self._prepared_batch is not forward_batch:
+            self._prepare_forward(manager, block_table, forward_batch, width)
         sources = self.source_ids[:rows]
         fused_lightning_indexer_manage(
             weights=weights[:rows].contiguous(),
@@ -116,10 +134,7 @@ class LIMDecodeAdapter:
             operator=self.operator,
             full_visible=True,
         )
-        self.last_prefix[layer_index].index_copy_(
-            0, self.resident_safe_slots[:batch].long(), self._pre_next_prefix[:batch]
-        )
-        return LIMSelection(
+        plan = LIMSelection(
             sources,
             self.device_slots[:rows],
             self.topk_misses[:rows],
@@ -132,3 +147,12 @@ class LIMDecodeAdapter:
             self.resident_safe_slots[:batch],
             width,
         )
+        manager.prepare_copy_sfa_plan(plan)
+        return plan
+
+    def commit_forward(self, batch: int) -> None:
+        """Publish the visible lengths after the last layer has copied its KV."""
+        self.last_prefix.index_copy_(
+            0, self.resident_safe_slots[:batch].long(), self._pre_next_prefix[:batch]
+        )
+        self._prepared_batch = None

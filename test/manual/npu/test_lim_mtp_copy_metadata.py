@@ -24,6 +24,7 @@ def test_fused_copy_sfa_metadata_width_and_graph(width):
     sparse = torch.tensor([True, False, False], dtype=torch.bool, device=device)
     slots = torch.tensor([1, 2, request_rows], dtype=torch.int32, device=device)
     prefix = torch.tensor([16000, 2000, 0], dtype=torch.int32, device=device)
+    output_lengths = torch.empty_like(prefix)
     hbm = torch.empty((batch, capacity // 128), dtype=torch.int32, device=device)
 
     def run():
@@ -32,7 +33,8 @@ def test_fused_copy_sfa_metadata_width_and_graph(width):
             valid_rows=valid,
             sparse_rows=sparse,
             request_slots=slots,
-            actual_seq_lengths_kv=prefix,
+            seq_lens=prefix,
+            actual_seq_lengths_kv=output_lengths,
             hbm_block_table=hbm,
             capacity=capacity,
             query_width=width,
@@ -40,7 +42,8 @@ def test_fused_copy_sfa_metadata_width_and_graph(width):
 
     def check(valid_cpu, sparse_cpu, slots_cpu, lengths_cpu):
         torch.npu.synchronize()
-        assert prefix.cpu().tolist() == [
+        assert prefix.cpu().tolist() == lengths_cpu
+        assert output_lengths.cpu().tolist() == [
             capacity + width - 1 if sp else (lengths_cpu[row] if v else 0)
             for row, (v, sp) in enumerate(zip(valid_cpu, sparse_cpu))
         ]

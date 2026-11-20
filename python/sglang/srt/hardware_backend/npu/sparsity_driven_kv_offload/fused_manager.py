@@ -267,6 +267,25 @@ class FusedSparseKVCacheManager:
         mapping = torch.tensor(self._resident_rows_by_request, dtype=torch.int32)
         self.request_to_resident.copy_(mapping, non_blocking=True)
 
+    def prepare_copy_sfa_plan(self, plan) -> None:
+        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.npu_lim_copy_sfa_metadata import (
+            prepare_copy_sfa_metadata,
+        )
+
+        batch = plan.request_safe_slots.numel()
+        adapter = self.lim_adapter
+        prepare_copy_sfa_metadata(
+            source_ids=plan.source_ids,
+            valid_rows=plan.valid_rows,
+            sparse_rows=plan.sparse_rows,
+            request_slots=plan.resident_safe_slots,
+            seq_lens=adapter._pre_lengths[:batch],
+            actual_seq_lengths_kv=adapter._copy_lengths[:batch],
+            hbm_block_table=self.planner_hbm_block_table[:batch],
+            capacity=adapter.capacity,
+            query_width=plan.query_width,
+        )
+
     def copy_sfa_attention(
         self,
         layer,
@@ -275,25 +294,9 @@ class FusedSparseKVCacheManager:
         plan,
         current_inputs,
     ):
-        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.npu_lim_copy_sfa_metadata import (
-            prepare_copy_sfa_metadata,
-        )
-
         batch = plan.request_safe_slots.numel()
         rows = batch * plan.query_width
         adapter = self.lim_adapter
-        # LIM has consumed these lengths on this stream; reuse the scratch for CopySFA.
-        actual_seq_lengths_kv = adapter._pre_lengths[:batch]
-        prepare_copy_sfa_metadata(
-            source_ids=plan.source_ids,
-            valid_rows=plan.valid_rows,
-            sparse_rows=plan.sparse_rows,
-            request_slots=plan.resident_safe_slots,
-            actual_seq_lengths_kv=actual_seq_lengths_kv,
-            hbm_block_table=self.planner_hbm_block_table[:batch],
-            capacity=adapter.capacity,
-            query_width=plan.query_width,
-        )
         query_heads = query_nope.shape[1]
         current, positions, valid = current_inputs
         padded_heads = self.budget.copy_sfa_query_heads
@@ -319,8 +322,8 @@ class FusedSparseKVCacheManager:
             hbm_ckv=cache,
             hbm_rope=rope_cache,
             actual_seq_lengths_query=adapter.query_ends[plan.query_width - 1, :batch],
-            actual_seq_lengths_kv=actual_seq_lengths_kv,
-            num_cache_tokens=self.lim_adapter._pre_cache_sizes[:batch],
+            actual_seq_lengths_kv=adapter._copy_lengths[:batch],
+            num_cache_tokens=adapter._pre_cache_sizes[:batch],
             topk_src_ids=plan.source_ids,
             topk_dst_slots=plan.device_slots,
             topk_miss_counts=plan.topk_misses,
@@ -366,28 +369,23 @@ class FusedSparseKVCacheManager:
 
         setattr(req_to_token_pool, "alloc", alloc_with_sparse_reset)
 
-    def offload_v2(
-        self,
-        k: torch.Tensor,
-        k_rope: torch.Tensor,
-        layer: RadixAttention,
-        forward_batch: ForwardBatch,
-    ):
-        """Publish KV to paged host storage and return decode rows for CopySFA."""
-        from sglang.kernels.ops.kvcache.npu_sparse_kv import prepare_sparse_kv_offload
+    def prepare_offload_rows(
+        self, tokens: int, forward_batch: ForwardBatch
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        from sglang.kernels.ops.kvcache.npu_sparse_kv import (
+            prepare_sparse_kv_offload_rows,
+        )
         from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_lim import (
             sparse_query_width,
         )
 
-        layer_idx = layer.layer_id - self.start_layer
         is_prefill = forward_batch.forward_mode.is_extend_without_speculative()
         compact_prefill = is_prefill and (
-            sum(forward_batch.extend_seq_lens_cpu[: forward_batch.batch_size])
-            == k.shape[0]
+            sum(forward_batch.extend_seq_lens_cpu[: forward_batch.batch_size]) == tokens
         )
-        src, dst, positions, valid, current = prepare_sparse_kv_offload(
-            k,
-            k_rope,
+        return prepare_sparse_kv_offload_rows(
+            tokens,
+            self.device,
             forward_batch.req_pool_indices,
             forward_batch.seq_lens,
             None if is_prefill else forward_batch.positions,
@@ -402,6 +400,25 @@ class FusedSparseKVCacheManager:
             extend_prefix_lens=forward_batch.extend_prefix_lens if is_prefill else None,
             compact_prefill=compact_prefill,
         )
+
+    def offload_v2(
+        self,
+        k: torch.Tensor,
+        k_rope: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        *,
+        offload_rows: Optional[
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = None,
+    ):
+        """Publish this layer's KV and return its current rows for attention."""
+        layer_idx = layer.layer_id - self.start_layer
+        is_prefill = forward_batch.forward_mode.is_extend_without_speculative()
+        if offload_rows is None:
+            offload_rows = self.prepare_offload_rows(k.shape[0], forward_batch)
+        src, dst, positions, valid = offload_rows
+        current = (k, k_rope) if is_prefill else torch.cat((k, k_rope), dim=-1)
         if self.host_pool.rank == 0:
             self.host_pool.copy_rows(
                 (k, k_rope),

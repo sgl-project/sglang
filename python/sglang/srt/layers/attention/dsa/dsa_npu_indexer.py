@@ -312,6 +312,7 @@ class DSANPUIndexerMixin:
             backend = get_attn_backend()
             if not is_prefill and getattr(backend, "use_fused_sparse_kv", False):
                 manager = backend.sparse_kv_manager
+                metadata = backend.forward_metadata
                 plan = manager.lim_adapter.select(
                     manager,
                     query=q.view(-1, self.n_heads, self.head_dim),
@@ -320,8 +321,9 @@ class DSANPUIndexerMixin:
                     block_table=block_table,
                     forward_batch=forward_batch,
                     layer_id=layer_id,
+                    reuse_metadata=metadata.sparse_kv_lim_plan is not None,
                 )
-                backend.forward_metadata.sparse_kv_lim_plan = plan
+                metadata.sparse_kv_lim_plan = plan
                 return plan.source_ids
 
             if use_quant_indexer:

@@ -131,9 +131,8 @@ class BudgetPlan:
             "block_table": BufferSpec(
                 (batch_capacity, context_len // page_size), metadata_dtype
             ),
-            "last_prefix": BufferSpec((num_layers, resident_rows + 1), metadata_dtype),
+            "last_prefix": BufferSpec((resident_rows + 1,), metadata_dtype),
         }
-        # Per batch row: six int32 metadata arrays and two boolean masks.
         for name in (
             "request_safe_slots",
             "resident_safe_slots",
@@ -141,6 +140,7 @@ class BudgetPlan:
             "_pre_states",
             "_pre_next_prefix",
             "_pre_cache_sizes",
+            "_copy_lengths",
         ):
             self.adapter_buffers[name] = BufferSpec((batch_capacity,), metadata_dtype)
         for name in ("_pre_sparse", "_pre_valid"):
