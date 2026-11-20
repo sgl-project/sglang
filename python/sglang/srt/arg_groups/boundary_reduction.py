@@ -21,8 +21,6 @@ _AR_ARCHITECTURES = {
     "Qwen3ForRewardModel",
     "MossVLForCausalLM",
     "MossVLForConditionalGeneration",
-    "Qwen4ExpForConditionalGeneration",
-    "Qwen4ExpForCausalLMMTP",
 }
 
 
