@@ -37,7 +37,9 @@ Total memory usage = model weights + KV cache pool + CUDA graph buffers + activa
 
 The `--mem-fraction-static` parameter determines how much memory is allocated to the first two components:
 
-mem_fraction_static = (model weights + KV cache pool) / GPU memory capacity
+mem_fraction_static = (model weights + KV cache pool) / GPU memory free at startup
+
+The denominator is the memory free when the server starts, measured before the model weights load, not the GPU's total capacity. If other processes already hold part of the GPU (for example, a second server on the same card), the same value gives a proportionally smaller pool. For example, `0.7` on an 80 GB GPU with 40 GB already in use allocates about 28 GB to weights and KV cache, not 56 GB.
 
 To support higher concurrency, you should maximize the KV cache pool capacity by setting `--mem-fraction-static` as high as possible while still reserving enough memory for activations and CUDA graph buffers.
 

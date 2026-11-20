@@ -26,7 +26,7 @@ class Schedule(msgspec.Struct):
     # -------------------------------------------------------------------------
     mem_fraction_static: A[
         Optional[float],
-        "The fraction of the memory used for static allocation (model weights and KV cache memory pool). Use a smaller value if you see out-of-memory errors.",
+        "The fraction of the GPU memory free at startup (measured before the model weights load) used for static allocation (model weights and KV cache memory pool). On a GPU shared with other processes, this is less than the total capacity. Use a smaller value if you see out-of-memory errors.",
     ] = None
     max_running_requests: A[
         Optional[int],
