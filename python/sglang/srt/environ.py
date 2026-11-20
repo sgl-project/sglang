@@ -561,6 +561,10 @@ class Envs:
     SGLANG_SIMULATE_ACC_LEN = EnvFloat(-1)
     SGLANG_SIMULATE_ACC_METHOD = EnvStr("match-expected")
     SGLANG_SIMULATE_ACC_TOKEN_MODE = EnvStr("fixed")
+    # DSpark opt-in: at a simulated stop row (correct_len < gamma) draw the bonus from the
+    # rejection residual max(p - q, 0) instead of the target p, as the rejection being
+    # simulated would; the all-accepted row keeps the target draw.
+    SGLANG_SIMULATE_ACC_RESIDUAL_BONUS = EnvBool(False)
     # DSpark opt-in: with SGLANG_SIMULATE_ACC_LEN set, temperature-only sampling requests
     # run the greedy draft/accept path and only the bonus token is temperature-sampled.
     SGLANG_SIMULATE_ACC_GREEDY = EnvBool(False)
