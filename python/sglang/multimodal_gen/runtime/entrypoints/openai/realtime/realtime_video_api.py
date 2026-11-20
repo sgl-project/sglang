@@ -351,10 +351,18 @@ async def _await_realtime_task(task: asyncio.Task | None) -> None:
 
 async def _listen_events(ws: WebSocket, session: GenerateSession):
     """listen for user events: usually condition inputs"""
-    async for message in ws.iter_bytes():
+    while True:
+        # receive() rather than iter_bytes(): a text frame makes receive_bytes()
+        # raise KeyError, which ended the whole session without an error message
+        message = await ws.receive()
+        if message["type"] == "websocket.disconnect":
+            return
         data = None
         try:
-            data = msgspec.msgpack.decode(message)
+            payload = message.get("bytes")
+            if payload is None:
+                raise ValueError("realtime event must be a binary msgpack frame")
+            data = msgspec.msgpack.decode(payload)
             if not isinstance(data, dict):
                 raise ValueError("realtime event must be a map")
             realtime_event = RealtimeEvent.model_validate(data)

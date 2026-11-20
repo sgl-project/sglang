@@ -615,6 +615,53 @@ def test_listen_generate_request_propagates_disconnect_without_error_write():
     assert sent_messages == []
 
 
+def test_text_frame_event_is_rejected_without_ending_the_session():
+    """a text frame gets an error and the events after it still arrive"""
+
+    class _RecordingAdapter(realtime_adapter.BaseRealtimeModelAdapter):
+        def __init__(self):
+            super().__init__()
+            self.kinds = []
+
+        def create_state(self):
+            return None
+
+        def ingest_event(self, session, event):
+            self.kinds.append(event.kind)
+            return f"kind={event.kind}"
+
+    async def run():
+        incoming = asyncio.Queue()
+        for message in (
+            {"type": "websocket.connect"},
+            {"type": "websocket.receive", "text": '{"type": "event", "kind": "move"}'},
+            {
+                "type": "websocket.receive",
+                "bytes": msgspec.msgpack.encode({"type": "event", "kind": "move"}),
+            },
+            {"type": "websocket.disconnect", "code": 1000},
+        ):
+            incoming.put_nowait(message)
+        sent_messages = []
+
+        async def send(message):
+            if message["type"] == "websocket.send":
+                sent_messages.append(msgspec.msgpack.decode(message["bytes"]))
+
+        ws = WebSocket({"type": "websocket"}, incoming.get, send)
+        await ws.accept()
+        session = GenerateSession()
+        adapter = _RecordingAdapter()
+        session.set_adapter(adapter)
+        await realtime_video_api._listen_events(ws, session)
+        return sent_messages, adapter.kinds
+
+    sent_messages, kinds = asyncio.run(asyncio.wait_for(run(), timeout=5))
+
+    assert sent_messages == [{"type": "error", "content": "invalid event"}]
+    assert kinds == ["move"]
+
+
 def test_invalid_event_does_not_split_frame_header_and_payload():
     """an invalid event under send backpressure must not corrupt frame transport"""
 
