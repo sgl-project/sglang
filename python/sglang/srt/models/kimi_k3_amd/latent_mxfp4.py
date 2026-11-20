@@ -8,10 +8,8 @@ from sglang.kernels.ops.gemm import latent_mxfp4_aiter_hip
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_hip
 
-# Batches below this keep the BF16 projections, so decode and verify stay exact and
-# keep the merged front GEMM that also reads the down projection. The MXFP4 GEMM
-# alone is 2-2.7x faster than F.linear from 256 tokens up on MI355X; 2048 is the
-# threshold the GSM8K and serving A/B ran with.
+# Batches below this keep the BF16 projections and the merged front GEMM;
+# 2048 is the value the A/B ran with.
 _MIN_TOKENS = 2048
 # The latent down/up projections the packed copies replace.
 _DOWN_SHAPE = (3584, 7168)
