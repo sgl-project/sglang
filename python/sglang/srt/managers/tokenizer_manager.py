@@ -293,7 +293,7 @@ def _validate_unfiltered_sampling_output(
 ) -> None:
     """An unfiltered request returns its output token logprob as its sampling
     logprob and an empty mask row, so both must describe what was sampled."""
-    if obj.filters_sampling or not returns_sampling_output(obj):
+    if sampling_params.filters_sampling() or not returns_sampling_output(obj):
         return
     if watermarked:
         raise ValueError(
@@ -363,6 +363,9 @@ class ReqState:
 
     dispatched: bool = False
     abort_sent: bool = False
+    # SamplingParams.filters_sampling() of the dispatched request: its sampling
+    # output is what the scheduler captured, else its output token logprobs.
+    filters_sampling: bool = False
     # Held at generate_request's pause gate; an abort_all leaves it to run
     # after the pause.
     waiting_at_pause_gate: bool = False
@@ -587,7 +590,7 @@ def _add_sampling_output_to_meta_info(
     request reads its captured rows; an unfiltered one was not captured, and
     returns its output token logprobs and one empty mask row per output token."""
     obj = state.obj
-    if obj.filters_sampling and chunk is not None:
+    if state.filters_sampling and chunk is not None:
         if obj.return_sampling_logprobs:
             state.output_token_sampling_logprobs.extend(
                 chunk.selected_logprobs.tolist()
@@ -604,7 +607,7 @@ def _add_sampling_output_to_meta_info(
     if obj.return_sampling_logprobs:
         meta_info["output_token_sampling_logprobs"] = (
             state.output_token_sampling_logprobs
-            if obj.filters_sampling
+            if state.filters_sampling
             # A request that emits no token still has the logprob of the token
             # sampled after its prompt, when its batch sampled.
             else state.output_token_logprobs_val[:num_output_tokens]
@@ -614,7 +617,7 @@ def _add_sampling_output_to_meta_info(
         if finished:
             mask_chunks = (
                 state.output_token_sampling_mask_chunks
-                if obj.filters_sampling
+                if state.filters_sampling
                 else [_unfiltered_sampling_mask_chunk(num_output_tokens)]
             )
             meta_info.update(
@@ -624,7 +627,7 @@ def _add_sampling_output_to_meta_info(
             )
     elif obj.return_sampling_mask:
         mask_rows = state.output_sampling_mask_logprobs
-        if not obj.filters_sampling:
+        if not state.filters_sampling:
             mask_rows.extend([] for _ in range(num_output_tokens - len(mask_rows)))
         meta_info["output_sampling_mask_logprobs"] = mask_rows
 
@@ -1868,7 +1871,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         sampling_params.verify(self.model_config.vocab_size)
         watermarked = _validate_watermark_request(sampling_params)
         if isinstance(obj, GenerateReqInput):
-            obj.filters_sampling = sampling_params.filters_sampling()
             _validate_unfiltered_sampling_output(obj, sampling_params, watermarked)
 
         # Build return object
@@ -2105,6 +2107,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 (tokenized_obj,)
             )
             tokenized_obj.time_stats.set_api_server_dispatch_time()
+            self._record_filters_sampling(tokenized_obj)
             if (hook := self.canary_info_hook) is not None:
                 hook.on_request_dispatched(
                     rid_to_state=self.rid_to_state, tokenized_obj=tokenized_obj
@@ -2189,6 +2192,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     if isinstance(tensor, CudaIpcTensorTransportProxy):
                         pool.cancel_proxy(tensor)
 
+    def _record_filters_sampling(
+        self,
+        tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
+    ) -> None:
+        """Keep whether the request filters sampling for its response. Every state
+        that receives output was dispatched, a parallel-sampling copy included."""
+        state = self.rid_to_state.get(tokenized_obj.rid)
+        if state is not None:
+            state.filters_sampling = tokenized_obj.sampling_params.filters_sampling()
+
     def _mark_state_dispatched(self, rid: str):
         """Record that *rid* reached the scheduler.
 
@@ -2223,6 +2236,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
 
             set_time_batch(tokenized_objs, "set_api_server_dispatch_time")
+            for tokenized_obj in tokenized_objs:
+                self._record_filters_sampling(tokenized_obj)
             if (hook := self.canary_info_hook) is not None:
                 for tokenized_obj in tokenized_objs:
                     hook.on_request_dispatched(

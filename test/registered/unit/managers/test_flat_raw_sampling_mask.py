@@ -49,13 +49,13 @@ def _make_state(filters_sampling: bool = True, **obj_kwargs) -> ReqState:
         **obj_kwargs,
     )
     obj.normalize_batch_and_arguments()
-    obj.filters_sampling = filters_sampling
     return ReqState(
         out_list=[],
         finished=False,
         event=asyncio.Event(),
         obj=obj,
         time_stats=APIServerReqTimeStats(),
+        filters_sampling=filters_sampling,
     )
 
 

@@ -393,10 +393,6 @@ class GenerateReqInput:
     external_trace_header: Optional[Dict[str, Any]] = None
     received_time: Optional[float] = None
 
-    # SamplingParams.filters_sampling() of this request, overwritten by the
-    # TokenizerManager once the sampling params are normalized.
-    filters_sampling: bool = False
-
     # For EPD-disaggregated inference
     need_wait_for_mm_inputs: Optional[bool] = None
     num_items_assigned: Optional[Dict[Modality, List[int]]] = None

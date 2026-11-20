@@ -53,7 +53,6 @@ PYTHON_ONLY_REQUEST_FIELDS = frozenset(
         "conversation_id",
         "encoder_urls",
         "external_trace_header",
-        "filters_sampling",
         "http_worker_ipc",
         "image_max_dynamic_patch",
         "input_embeds",
