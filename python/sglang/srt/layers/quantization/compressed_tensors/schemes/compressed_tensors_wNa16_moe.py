@@ -21,8 +21,10 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMoEScheme,
 )
 from sglang.srt.layers.quantization.marlin_utils import (
+    gptq_marlin_unrepack,
     marlin_make_workspace,
     marlin_moe_permute_scales,
+    marlin_moe_unpermute_scales,
     moe_awq_to_marlin_zero_points,
 )
 from sglang.srt.layers.quantization.utils import replace_parameter
@@ -418,7 +420,15 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
         layer.is_marlin_converted = True
 
     def restore_weights_before_loading(self, layer: torch.nn.Module):
-        """Forcibly resize parameters back to their original shapes (e.g., GPTQ format) before loading weights."""
+        """Return the experts to checkpoint layout (bytes, not only shapes) before loading weights."""
+        if (
+            getattr(layer, "is_marlin_converted", False)
+            and self.sym
+            and self.actorder != "group"
+        ):
+            self._restore_checkpoint_layout(layer)
+            layer.is_marlin_converted = False
+            return
 
         if not hasattr(layer, "_original_shapes"):
             return
@@ -430,6 +440,40 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
                 param.resize_(orig_shape)
 
         layer.is_marlin_converted = False
+
+    def _restore_checkpoint_layout(self, layer: torch.nn.Module) -> None:
+        # Same size_k arguments as process_weights_after_loading, which permutes
+        # the w13 scales after w13_weight_packed has taken its Marlin shape.
+        w13_scale_size_k = layer.w13_weight_packed.shape[2]
+        w2_scale_size_k = layer.w2_weight_scale.shape[1] * (
+            self.group_size if self.group_size != -1 else self.packed_factor
+        )
+        for name, size_k in (
+            ("w13_weight_scale", w13_scale_size_k),
+            ("w2_weight_scale", w2_scale_size_k),
+        ):
+            scale = getattr(layer, name)
+            scale.copy_(
+                marlin_moe_unpermute_scales(
+                    scale, size_k=size_k, group_size=self.group_size
+                )
+            )
+
+        for name in ("w13_weight_packed", "w2_weight_packed"):
+            param = getattr(layer, name)
+            marlin_shape = tuple(param.shape[1:])
+            num_experts, packed_k, size_n = layer._original_shapes[name]
+            # Same storage and byte range per expert, so captured graphs stay valid.
+            param.resize_(layer._original_shapes[name])
+            for e in range(num_experts):
+                param[e].copy_(
+                    gptq_marlin_unrepack(
+                        param[e].view(marlin_shape),
+                        size_k=packed_k * self.packed_factor,
+                        size_n=size_n,
+                        num_bits=self.num_bits,
+                    )
+                )
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
