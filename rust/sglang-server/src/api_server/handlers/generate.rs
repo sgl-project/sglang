@@ -224,12 +224,12 @@ impl CoreHandle {
         // A body is a batch here even with one item (a list); the core's own
         // requests are one only when they are several.
         let batch = matches!(received, ReceivedAs::Body { .. }) || requests.len() > 1;
-        let mut records = self
+        // No records without a request log.
+        let records = self
             .receive(&requests, received, batch, true)
             .into_iter()
             .map(Some)
-            .collect::<Vec<_>>();
-        records.resize_with(requests.len(), || None);
+            .chain(std::iter::repeat_with(|| None));
         // One refused item refuses the batch before any item is prepared.
         self.validate(&requests)?;
         // Counted from admission, media prefetch included (see `generate`).
