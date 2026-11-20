@@ -13,6 +13,7 @@ from sglang.kernels.ops.lora.moe.dispatch_contiguous import (
 from sglang.kernels.ops.lora.moe.dispatch_masked import dispatch_fill_masked_fp8
 from sglang.kernels.ops.lora.moe.fp8_quant import (
     quantize_pair_rows_fp8,
+    quantize_rows_per_token_fp8,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
@@ -32,7 +33,9 @@ from sglang.srt.lora.moe.base_gemm_provider.masked_row_domain import (
     MaskedRowState,
 )
 from sglang.srt.lora.moe.quant_info import (
+    MoeLoraFp8ChannelQuantInfo,
     MoeLoraFp8QuantInfo,
+    admit_k_tiles,
 )
 
 if TYPE_CHECKING:
@@ -292,3 +295,44 @@ class CuteDslFp8ContiguousProvider(_CuteDslFp8Mixin, ContiguousRowDomainProvider
             else prepare_contiguous_fp8
         )
         self._init_tiles(quant_info)
+
+
+class _CuteDslFp8ChannelMixin:
+    _DTYPE_TAG = "fp8_channel"
+    _PER_TOKEN = True
+
+    def _bind_weights(self, quant_info: MoeLoraFp8ChannelQuantInfo) -> None:
+        # Rowwise scale loads stage one scale per weight row in a 128-row tile.
+        admit_k_tiles("CuTeDSL per-channel FP8", quant_info)
+        # [E, rows, 1] checkpoint scales -> [E, rows] for the kernel.
+        self._sf_w13 = quant_info.w13_scale.flatten(1).contiguous()
+        self._sf_w2 = quant_info.w2_scale.flatten(1).contiguous()
+
+
+class CuteDslFp8ChannelMaskedProvider(
+    _CuteDslFp8ChannelMixin, CuteDslFp8MaskedProvider
+):
+    contract = MoeBaseProviderContract(
+        key="cutedsl_fp8_channel_masked", quant_info_cls=MoeLoraFp8ChannelQuantInfo
+    )
+
+    def _down_operands(
+        self, row_state, act_out: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not row_state.act_quant_ready:
+            quantize_rows_per_token_fp8(
+                act_out,
+                q_out=row_state.act_fp8,
+                scale_out=row_state.act_scale,
+                masked_m=row_state.masked_m,
+            )
+        return row_state.act_fp8, row_state.act_scale
+
+
+class CuteDslFp8ChannelContiguousProvider(
+    _CuteDslFp8ChannelMixin, CuteDslFp8ContiguousProvider
+):
+    contract = MoeBaseProviderContract(
+        key="cutedsl_fp8_channel_contiguous",
+        quant_info_cls=MoeLoraFp8ChannelQuantInfo,
+    )
