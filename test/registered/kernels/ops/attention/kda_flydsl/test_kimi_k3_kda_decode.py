@@ -971,12 +971,17 @@ def test_verify_warmup_builds_every_wave_count(monkeypatch, ring: bool) -> None:
     assert built == [(1, n) for n in wave_counts]
 
 
-@pytest.mark.skipif(not _aiter_has_kda_verify(), reason="AITER without KDA verify")
 @pytest.mark.parametrize("ring", [False, True])
-def test_verify_covered_falls_back_instead_of_aiter_raising(ring: bool) -> None:
+def test_verify_covered_falls_back_instead_of_aiter_raising(
+    ring: bool, monkeypatch
+) -> None:
     """A draft-token count other than the warmed one would JIT-build inside graph
-    capture, and a cache dtype or ring shape AITER rejects would raise; both fall back."""
+    capture, and a cache dtype or ring shape AITER rejects would raise; both fall back.
+    Runs without the kernel: covered() reads only max_tokens from the op."""
+    from sglang.kernels.ops.attention import kda_fused_verify_aiter_hip as adapter
     from sglang.kernels.ops.attention.kda_fused_verify_aiter_hip import covered
+
+    monkeypatch.setattr(adapter, "_op", lambda: SimpleNamespace(max_tokens=8))
 
     batch, steps, slots = 3, 5, 7
     tokens = batch * steps

@@ -472,6 +472,53 @@ class TestFusedVerifyUnsupported(CustomTestCase):
                     unsupported,
                 )
 
+    def test_unsupported_batch_never_reaches_the_kernel(self):
+        """A batch the backend marks unsupported must skip the kernel entirely and
+        take the unfused gate, whose output is the plain f_b projection."""
+        weight = torch.zeros(12, 128, 128, dtype=torch.bfloat16)
+        torch.manual_seed(0)
+        weight.normal_()
+        hook = KimiK3HipFusedVerify(
+            f_b_weight=weight,
+            norm_weight=None,
+            norm_eps=1e-5,
+            a_log=None,
+            num_draft_tokens=5,
+        )
+        with (
+            mock.patch.object(
+                kda_fused_verify_aiter_hip, "covered", side_effect=AssertionError
+            ),
+            mock.patch.object(
+                kda_fused_verify_aiter_hip, "run", side_effect=AssertionError
+            ),
+            mock.patch.object(kda_fused_verify_aiter_hip, "warn_rejected_once") as warn,
+        ):
+            out = hook.forward(
+                layer=None,
+                mixed_qkv=None,
+                a=None,
+                b=None,
+                conv_states=None,
+                ssm_states=None,
+                cache_indices=None,
+                intermediate_state_indices=None,
+                intermediate_state_cache=None,
+                intermediate_conv_window_cache=None,
+                num_draft_tokens=5,
+                replay_ring=None,
+                unsupported="request-indexed ReplaySSM ring",
+            )
+
+        self.assertIsNone(out)
+        warn.assert_called_once_with("request-indexed ReplaySSM ring")
+        # 15 tokens is above the tiny-GEMM limit of 12, so this is F.linear.
+        a = torch.randn(1, 15, 128).to(torch.bfloat16)
+        gate = hook.unfused_gate(a)
+        self.assertEqual(gate.shape, (1, 15, 12, 128))
+        want = torch.nn.functional.linear(a[0], weight.flatten(0, 1))
+        torch.testing.assert_close(gate, want.reshape(1, 15, 12, 128))
+
 
 if __name__ == "__main__":
     unittest.main()
