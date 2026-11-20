@@ -1,7 +1,7 @@
 """Hyper-connection stage construction and completion across pipeline ranks."""
 
 import unittest
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -217,6 +217,326 @@ class TestVPPConstruction(CustomTestCase):
                 ):
                     module.DeepseekV4ForCausalLM(config, vpp_layout=layout)
             decoder.assert_not_called()
+
+
+class TestVPPStageForward(CustomTestCase):
+    """Stage cuts must preserve mHC state and run each global layer once."""
+
+    @contextmanager
+    def execution(self):
+        from sglang.srt.models import deepseek_v4
+
+        context = SimpleNamespace(
+            input_scattered=False,
+            maybe_input_scattered=lambda batch: nullcontext(),
+        )
+        parallel = SimpleNamespace(attn_dp_size=1, attn_cp_size=1)
+        with ExitStack() as stack:
+            for name, value in (
+                ("_is_cuda", True),
+                ("_is_npu", False),
+                ("_is_hip", False),
+            ):
+                stack.enter_context(patch.object(deepseek_v4, name, value))
+            for name, value in (
+                ("get_parallel", parallel),
+                ("get_forward", SimpleNamespace(sp_active=False)),
+                ("get_attn_tp_context", context),
+                ("is_cp_active", False),
+                ("check_cuda_graph_backend", False),
+                ("get_attn_backend", SimpleNamespace()),
+                (
+                    "get_global_expert_distribution_recorder",
+                    SimpleNamespace(with_current_layer=lambda i: nullcontext()),
+                ),
+            ):
+                stack.enter_context(patch.object(deepseek_v4, name, return_value=value))
+            stack.enter_context(
+                patch(
+                    "sglang.srt.layers.moe.mega_gate.mega_gate_forward_scope",
+                    side_effect=lambda batch: nullcontext(),
+                )
+            )
+            # The ordinary loop asks for an optional fused post/read shortcut
+            # before Engram. Keep the CPU stand-in on the unfused path.
+            stack.enter_context(
+                patch.object(
+                    boundary,
+                    "HcRead",
+                    return_value=SimpleNamespace(
+                        bind=lambda *args: SimpleNamespace(next_boundary=None)
+                    ),
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "sglang.kernels.ops.layernorm.mhc.hc_broadcast",
+                    side_effect=lambda rows, count: (
+                        rows[:, None].expand(-1, count, -1).clone()
+                    ),
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "sglang.kernels.ops.layernorm.mhc.mhc_combine",
+                    side_effect=lambda rows, pre, count, dtype: (
+                        rows.view(rows.shape[0], count, rows.shape[1] // count)
+                        * pre[:, :, None]
+                    ).sum(1),
+                )
+            )
+            yield deepseek_v4, parallel, context
+
+    def make_model(self, module, layout, rank, lagged, calls):
+        from sglang.srt.layers.layer_boundary.layout import SumGroup
+        from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
+        from sglang.srt.layers.layer_boundary.residual.stream import DeclaredSum
+        from sglang.srt.layers.utils import PPMissingLayer
+
+        class Layer(torch.nn.Module):
+            engram = None
+            hc_cfg = SimpleNamespace()
+
+            def __init__(self, index):
+                super().__init__()
+                self.index = index
+                self.reduction = Mock(side_effect=lambda value: value * 2)
+                self.fail = False
+                if lagged and index == 3:
+                    self.engram = Mock(
+                        side_effect=lambda streams, hashes, batch, **kw: (
+                            streams + hashes[:, None, None]
+                        )
+                    )
+                    self.engram.layer_hash_index = 0
+
+            def forward(self, hidden_states, forward_batch, **kw):
+                calls.append(self.index)
+                state = residual_batch.read_output(
+                    hidden_states, forward_batch, boundary.FinalRead(), None
+                )
+                residual = state.residual if lagged else state
+                # The next layer consumes the preceding layer's pre, so dropping
+                # it at a cut changes both this contribution and the final head.
+                mixed = (
+                    residual[:, 0]
+                    if not lagged or state.pre is None
+                    else (residual * state.pre[:, :, None]).sum(1)
+                )
+                value = (mixed + self.index + 1)[:, None].expand_as(residual).clone()
+                update = boundary.HcUpdate(self, False)
+                if lagged:
+                    pre = (
+                        torch.tensor([0.25, 0.5]).expand(residual.shape[0], -1).clone()
+                    )
+                    update.post = lambda output, old, **kw: mhc.HcState(
+                        old.residual + output, pre
+                    )
+                else:
+                    update.post = lambda output, old, **kw: old + output
+                residual_batch.set_written(state, forward_batch)
+                output = residual_batch.stream_of(forward_batch).record(
+                    value,
+                    update,
+                    declared_sum=DeclaredSum(SumGroup.ATTN_TP, self.reduction),
+                )
+                if self.fail:
+                    raise RuntimeError("decoder failed")
+                return output
+
+        body = module.DeepseekV4Model.__new__(module.DeepseekV4Model)
+        torch.nn.Module.__init__(body)
+        body.vpp_layout = layout
+        body.vpp_stages = layout.stages_for_rank(rank) if layout else ()
+        owned = layout.layer_ids_for_rank(rank) if layout else tuple(range(6))
+        body.start_layer, body.end_layer = min(owned), max(owned) + 1
+        body.layers = torch.nn.ModuleList(
+            Layer(i) if i in owned else PPMissingLayer() for i in range(6)
+        )
+        body.pp_group = SimpleNamespace(
+            is_first_rank=rank == 0, is_last_rank=rank == 1, world_size=2
+        )
+        if layout is None:
+            body.pp_group = SimpleNamespace(
+                is_first_rank=True, is_last_rank=True, world_size=1
+            )
+        body.hc_mult, body.hidden_size = 2, 4
+        body.hc_pre_from_prev_sublayer = lagged
+        body.dspark_layers_to_capture = body.late_layer_start = None
+        body.engram_hasher = (
+            Mock(side_effect=lambda ids, batch: ids[:, None]) if lagged else None
+        )
+        body.use_fused_mhc_post_pre = False
+        body._can_run_tbo = Mock(return_value=False)
+        body.embed_tokens = Mock(
+            side_effect=lambda ids: ids.float()[:, None].expand(-1, 4).clone()
+        )
+        body.norm = Mock(side_effect=lambda rows: rows * 3)
+        body.hc_head = Mock(side_effect=lambda rows, *args: rows.mean(1))
+        body.hc_head_fn = body.hc_head_scale = body.hc_head_base = None
+        model = module.DeepseekV4ForCausalLM.__new__(module.DeepseekV4ForCausalLM)
+        torch.nn.Module.__init__(model)
+        model.model, model.pp_group = body, body.pp_group
+        model.vision = None
+        model.capture_aux_hidden_states = False
+        model.prepare_language_model_inputs = Mock(
+            side_effect=lambda ids, batch, embeds: (ids, embeds)
+        )
+        model.lm_head = object()
+        model.logits_processor = Mock(
+            side_effect=lambda ids, rows, head, metadata, aux, **kw: SimpleNamespace(
+                logits=rows.sum(-1), before_norm=kw["hidden_states_before_norm"]
+            )
+        )
+        return model
+
+    def test_interleaved_stage_calls_match_unpartitioned_forward(self):
+        from sglang.srt.distributed.vpp_layout import VPPLayout
+        from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+
+        layout = VPPLayout(6, 2, partition=(1, 2, 1, 2))
+        for lagged in (False, True):
+            for tokens in (0, 3):
+                with (
+                    self.subTest(lagged=lagged, tokens=tokens),
+                    self.execution() as (module, _, _),
+                ):
+                    calls = []
+                    models = [
+                        self.make_model(module, layout, r, lagged, calls)
+                        for r in range(2)
+                    ]
+                    ranges = [(m.model.start_layer, m.model.end_layer) for m in models]
+                    ids = [torch.arange(tokens), torch.arange(tokens) + 10]
+                    embeds = [None, ids[1].float()[:, None].expand(-1, 4).clone() * 2]
+                    batches = [
+                        SimpleNamespace(
+                            residual_stream=None,
+                            forward_mode=SimpleNamespace(is_extend=lambda: False),
+                        )
+                        for _ in ids
+                    ]
+                    wires = [None, None]
+                    for stage in layout.stages:
+                        model = models[stage.physical_rank]
+                        for j, batch in enumerate(batches):
+                            batch.freqs_cis_c4 = batch.freqs_cis_c128 = object()
+                            wires[j] = model.forward_vpp_stage(
+                                stage.stage_id,
+                                ids[j],
+                                ids[j],
+                                batch,
+                                input_embeds=embeds[j] if stage.stage_id == 0 else None,
+                                pp_proxy_tensors=wires[j],
+                            )
+                            self.assertIsNone(batch.residual_stream)
+                            self.assertFalse(hasattr(batch, "freqs_cis_c4"))
+                            if stage.stage_id < layout.logical_size - 1:
+                                self.assertIsInstance(wires[j], PPProxyTensors)
+                                self.assertEqual(
+                                    set(wires[j].tensors),
+                                    {"hidden_states", "hc_pre"}
+                                    if lagged
+                                    else {"hidden_states"},
+                                )
+                                self.assertTrue(
+                                    all(
+                                        isinstance(t, torch.Tensor)
+                                        for t in wires[j].tensors.values()
+                                    )
+                                )
+                    self.assertEqual(
+                        calls,
+                        [i for s in layout.stages for _ in ids for i in s.layer_ids],
+                    )
+                    self.assertEqual(
+                        ranges,
+                        [(m.model.start_layer, m.model.end_layer) for m in models],
+                    )
+                    self.assertEqual(models[0].model.embed_tokens.call_count, 1)
+                    self.assertEqual(models[1].model.embed_tokens.call_count, 0)
+                    self.assertEqual(
+                        models[0].prepare_language_model_inputs.call_count, 2
+                    )
+                    self.assertEqual(
+                        models[1].prepare_language_model_inputs.call_count, 0
+                    )
+                    self.assertEqual(models[0].model.norm.call_count, 0)
+                    self.assertEqual(models[1].model.norm.call_count, 2)
+                    self.assertEqual(models[0].logits_processor.call_count, 0)
+                    self.assertEqual(models[1].logits_processor.call_count, 2)
+                    for rank, model in enumerate(models):
+                        for i in layout.layer_ids_for_rank(rank):
+                            self.assertEqual(
+                                model.model.layers[i].reduction.call_count, 2
+                            )
+                    for j, batch in enumerate(batches):
+                        serial = self.make_model(module, None, 0, lagged, [])
+                        expected = serial.forward(
+                            ids[j], ids[j], batch, input_embeds=embeds[j]
+                        )
+                        torch.testing.assert_close(wires[j].logits, expected.logits)
+                        torch.testing.assert_close(
+                            wires[j].before_norm, expected.before_norm
+                        )
+
+    def test_stage_errors_do_not_publish_or_retain_residual_state(self):
+        from sglang.srt.distributed.vpp_layout import VPPLayout
+        from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+
+        layout = VPPLayout(6, 2, partition=(1, 2, 1, 2))
+        with self.execution() as (module, _, _):
+            calls = []
+            model = self.make_model(module, layout, 0, True, calls)
+            ids = torch.arange(3)
+            batch = SimpleNamespace(residual_stream=None)
+            with self.assertRaisesRegex(ValueError, "not owned"):
+                model.forward_vpp_stage(1, ids, ids, batch)
+            with self.assertRaisesRegex(ValueError, "requires a pipeline handoff"):
+                model.forward_vpp_stage(2, ids, ids, batch)
+            wire = PPProxyTensors({"hidden_states": torch.zeros(3, 8)})
+            with self.assertRaisesRegex(ValueError, "requires hc_pre"):
+                model.forward_vpp_stage(2, ids, ids, batch, pp_proxy_tensors=wire)
+            self.assertEqual(calls, [])
+            self.assertIsNone(batch.residual_stream)
+            model.model.layers[0].fail = True
+            with self.assertRaisesRegex(RuntimeError, "decoder failed"):
+                model.forward_vpp_stage(0, ids, ids, batch)
+            self.assertIsNone(batch.residual_stream)
+            model.logits_processor.assert_not_called()
+
+    def test_unsupported_execution_paths_fail_before_running_layers(self):
+        from sglang.srt.distributed.vpp_layout import VPPLayout
+
+        layout = VPPLayout(6, 2, partition=(1, 2, 1, 2))
+        with self.execution() as (module, parallel, context):
+            calls = []
+            model = self.make_model(module, layout, 0, False, calls)
+            ids = torch.arange(3)
+            batch = SimpleNamespace(residual_stream=None)
+            for target, name, value in (
+                (module, "_is_cuda", False),
+                (parallel, "attn_dp_size", 2),
+                (parallel, "attn_cp_size", 2),
+                (context, "input_scattered", True),
+                (
+                    module,
+                    "get_forward",
+                    Mock(return_value=SimpleNamespace(sp_active=True)),
+                ),
+                (model, "capture_aux_hidden_states", True),
+                (model, "vision", object()),
+                (model.model, "dspark_layers_to_capture", [0]),
+                (model.model, "late_layer_start", 3),
+                (model.model, "decoder_replay_tail", object()),
+                (model.model, "_can_run_tbo", Mock(return_value=True)),
+            ):
+                with self.subTest(field=name), patch.object(target, name, value):
+                    with self.assertRaises(NotImplementedError):
+                        model.forward_vpp_stage(0, ids, ids, batch)
+                    self.assertEqual(calls, [])
+                    self.assertIsNone(batch.residual_stream)
+            model.logits_processor.assert_not_called()
 
 
 class TestPipelineCompletion(unittest.TestCase):

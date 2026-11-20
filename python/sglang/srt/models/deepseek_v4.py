@@ -787,7 +787,7 @@ if TYPE_CHECKING:
         Fp8GridActivation,
         Mxfp8Activation,
     )
-    from sglang.srt.distributed.vpp_layout import VPPLayout
+    from sglang.srt.distributed.vpp_layout import VPPLayout, VPPStage
     from sglang.srt.layers.attention.deepseek_v4_backend import (
         DeepseekV4AttnBackend,
         LateLayerTail,
@@ -4592,6 +4592,170 @@ class DeepseekV4Model(nn.Module):
                     residual_batch.clear(child)
 
     @torch.no_grad()
+    def forward_vpp_stage(
+        self,
+        stage_id: int,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: Optional[torch.Tensor] = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> Union[Tuple[torch.Tensor, torch.Tensor], PPProxyTensors]:
+        """Run one local logical stage; the caller owns ordering and transport."""
+        if self.vpp_layout is None:
+            raise ValueError("forward_vpp_stage requires a VPP layout")
+        stage = self.vpp_layout.stage(stage_id)
+        if stage not in self.vpp_stages:
+            raise ValueError(f"VPP stage {stage_id} is not owned by this rank")
+        parallel = get_parallel()
+        if not _is_cuda:
+            raise NotImplementedError("DSV4 VPP stage forward requires CUDA")
+        if parallel.attn_dp_size != 1 or parallel.attn_cp_size != 1:
+            raise NotImplementedError(
+                "DSV4 VPP stage forward requires attention DP1/CP1"
+            )
+        if get_forward().sp_active or get_attn_tp_context().input_scattered:
+            raise NotImplementedError("DSV4 VPP stage forward requires full token rows")
+        if self.dspark_layers_to_capture is not None:
+            raise NotImplementedError(
+                "DSV4 VPP auxiliary hidden-state capture is not wired"
+            )
+        if self.late_layer_start is not None or self.decoder_replay_tail is not None:
+            raise NotImplementedError("DSV4 VPP bounded replay is not wired")
+        if self._can_run_tbo(forward_batch):
+            raise NotImplementedError("DSV4 VPP two-batch overlap is not wired")
+        if stage_id == 0:
+            if pp_proxy_tensors is not None:
+                raise ValueError(
+                    "The first VPP stage does not accept a pipeline handoff"
+                )
+        elif pp_proxy_tensors is None or input_embeds is not None:
+            raise ValueError("A non-first VPP stage requires a pipeline handoff")
+
+        from sglang.srt.layers.moe.mega_gate import mega_gate_forward_scope
+
+        try:
+            with mega_gate_forward_scope(forward_batch):
+                return self._forward_vpp_stage_impl(
+                    stage,
+                    input_ids,
+                    positions,
+                    forward_batch,
+                    input_embeds,
+                    pp_proxy_tensors,
+                )
+        finally:
+            residual_batch.clear(forward_batch)
+
+    def _forward_vpp_stage_impl(
+        self,
+        stage: VPPStage,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: Optional[torch.Tensor],
+        pp_proxy_tensors: Optional[PPProxyTensors],
+    ) -> Union[Tuple[torch.Tensor, torch.Tensor], PPProxyTensors]:
+        if stage.stage_id == 0:
+            from sglang.kernels.ops.layernorm.mhc import hc_broadcast
+
+            hidden_states = (
+                self.embed_tokens(input_ids) if input_embeds is None else input_embeds
+            )
+            hidden_states = hc_broadcast(hidden_states, self.hc_mult)
+            state = (
+                mhc.HcState(hidden_states)
+                if self.hc_pre_from_prev_sublayer
+                else hidden_states
+            )
+        else:
+            hidden_states = pp_proxy_tensors["hidden_states"]
+            if hidden_states.ndim != 2 or hidden_states.shape[1] != (
+                self.hc_mult * self.hidden_size
+            ):
+                raise ValueError(
+                    "VPP hidden_states must have shape [tokens, hc * hidden]"
+                )
+            hidden_states = hidden_states.view(
+                hidden_states.shape[0], self.hc_mult, self.hidden_size
+            )
+            if self.hc_pre_from_prev_sublayer:
+                pre = pp_proxy_tensors.tensors.get("hc_pre")
+                if pre is None or pre.shape != hidden_states.shape[:2]:
+                    raise ValueError(
+                        "A lagged mHC VPP handoff requires hc_pre [tokens, hc]"
+                    )
+                state = mhc.HcState(hidden_states, pre)
+            else:
+                state = hidden_states
+        hidden_states = residual_batch.set_written(state, forward_batch)
+        input_ids_global = getattr(forward_batch, "input_ids_global", input_ids)
+        for attr in ("freqs_cis_c4", "freqs_cis_c128"):
+            if hasattr(forward_batch, attr):
+                delattr(forward_batch, attr)
+        hash_ids = (
+            self.engram_hasher(input_ids, forward_batch)
+            if self.hc_pre_from_prev_sublayer and self.engram_hasher is not None
+            else None
+        )
+        for i in range(stage.start_layer, stage.end_layer):
+            layer = self.layers[i]
+            if self.hc_pre_from_prev_sublayer and layer.engram is not None:
+                state = hc_boundary.materialize(hidden_states, forward_batch)
+                streams = layer.engram(
+                    state.residual,
+                    hash_ids[:, layer.engram.layer_hash_index],
+                    forward_batch,
+                    input_ids=input_ids,
+                    cp_all_tokens=False,
+                )
+                hidden_states = residual_batch.set_written(
+                    state.with_residual(streams), forward_batch
+                )
+                del state, streams
+            ctx = (
+                nullcontext()
+                if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
+                else get_global_expert_distribution_recorder().with_current_layer(i)
+            )
+            with ctx:
+                hidden_states = layer(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    forward_batch=forward_batch,
+                    input_ids=input_ids,
+                    input_ids_global=input_ids_global,
+                )
+        # Complete this stage's producer work before publishing tensors. Python
+        # boundary objects and pending reductions never cross the stage seam.
+        state = residual_batch.read_output(
+            hidden_states, forward_batch, hc_boundary.FinalRead(), None
+        )
+        if self.hc_pre_from_prev_sublayer:
+            state = state.materialized(self.layers[stage.end_layer - 1].hc_cfg)
+            hidden_states, last_pre = state.residual, state.pre
+        else:
+            hidden_states, last_pre = state, None
+        if stage.stage_id != self.vpp_layout.logical_size - 1:
+            tensors = {"hidden_states": hidden_states.flatten(1)}
+            if self.hc_pre_from_prev_sublayer:
+                tensors["hc_pre"] = last_pre
+            return PPProxyTensors(tensors)
+
+        pre_hc_head = hidden_states.flatten(1)
+        if self.hc_pre_from_prev_sublayer:
+            from sglang.kernels.ops.layernorm.mhc import mhc_combine
+
+            hidden_states = mhc_combine(
+                pre_hc_head, last_pre, self.hc_mult, hidden_states.dtype
+            )
+        else:
+            hidden_states = self.hc_head(
+                hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base
+            )
+        return self.norm(hidden_states), pre_hc_head
+
+    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -4625,8 +4789,8 @@ class DeepseekV4Model(nn.Module):
     ) -> Union[torch.Tensor, PPProxyTensors]:
         if self.vpp_layout is not None:
             raise NotImplementedError(
-                "DSV4 VPP layer construction is available, but logical-stage "
-                "forward and scheduling are not wired yet"
+                "DSV4 VPP requires explicit logical-stage execution through "
+                "forward_vpp_stage; serving scheduling is not wired yet"
             )
         if self.pp_group.is_first_rank:
             if input_embeds is None:
@@ -5172,6 +5336,39 @@ class DeepseekV4ForCausalLM(
             )
 
         return input_ids, input_embeds
+
+    def forward_vpp_stage(
+        self,
+        stage_id: int,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: Optional[torch.Tensor] = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ):
+        """Produce a stage handoff, or logits at the final logical stage."""
+        if getattr(self, "vision", None) is not None:
+            raise NotImplementedError("DSV4 VPP vision input routing is not wired")
+        if self.capture_aux_hidden_states:
+            raise NotImplementedError(
+                "DSV4 VPP auxiliary hidden-state capture is not wired"
+            )
+        if stage_id == 0:
+            input_ids, input_embeds = self.prepare_language_model_inputs(
+                input_ids, forward_batch, input_embeds
+            )
+        with get_attn_tp_context().maybe_input_scattered(forward_batch):
+            hidden_states = self.model.forward_vpp_stage(
+                stage_id,
+                input_ids,
+                positions,
+                forward_batch,
+                input_embeds,
+                pp_proxy_tensors,
+            )
+        if stage_id != self.model.vpp_layout.logical_size - 1:
+            return hidden_states
+        return self._postprocess_output(hidden_states, input_ids, forward_batch)
 
     def forward(
         self,
