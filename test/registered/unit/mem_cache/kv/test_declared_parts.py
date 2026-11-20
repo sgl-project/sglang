@@ -1949,8 +1949,6 @@ class TestDeclaredParts(CustomTestCase):
         shape.disable_conv_window_dedup = False
         shape.conv = ((3, 8),)
         self.assertEqual(axis(), 0)
-        del shape.disable_conv_window_dedup
-        self.assertIsNone(axis())
 
     def test_owner_only_plan_allocates_reuses_and_checkpoints_pages(self):
         setup_allocator_context()

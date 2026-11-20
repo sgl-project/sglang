@@ -584,14 +584,18 @@ class MambaPool:
         conv_dtype: torch.dtype,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         shape = conv_window_storage_shape(
-            conv_shape, speculative_num_draft_tokens, self.conv_window_axis
+            conv_shape,
+            draft_tokens=speculative_num_draft_tokens,
+            window_axis=self.conv_window_axis,
         )
         phys = torch.zeros(
             (num_mamba_layers, spec_state_size + 1, *shape),
             dtype=conv_dtype,
             device=self.device,
         )
-        return phys, conv_window_view(phys, conv_shape, self.conv_window_axis)
+        return phys, conv_window_view(
+            phys, conv_shape=conv_shape, window_axis=self.conv_window_axis
+        )
 
     def __init__(
         self,

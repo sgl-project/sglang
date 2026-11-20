@@ -793,7 +793,9 @@ def plan_kv_storage(
                     (
                         f"intermediate_conv_window.{i}",
                         conv_window_storage_shape(
-                            shape, speculative_num_draft_tokens, conv_window_axis
+                            shape,
+                            draft_tokens=speculative_num_draft_tokens,
+                            window_axis=conv_window_axis,
                         ),
                         geometry.conv_dtype,
                     )

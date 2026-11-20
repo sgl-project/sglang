@@ -325,7 +325,9 @@ class StateView:
             if conv_window_axis is not None:
                 self.conv_window_axis = conv_window_axis
                 intermediate_conv_window = [
-                    conv_window_view(storage, shape, conv_window_axis)
+                    conv_window_view(
+                        storage, conv_shape=shape, window_axis=conv_window_axis
+                    )
                     for storage, shape in zip(
                         intermediate_conv_window, spec.conv_state_shapes, strict=True
                     )

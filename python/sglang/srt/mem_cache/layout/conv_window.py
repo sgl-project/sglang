@@ -1,4 +1,5 @@
-"""Storage shared by consecutive speculative causal-convolution windows."""
+"""Speculative conv windows of a linear verify chain, stored as one row of
+D + K - 2 columns per channel: step t's window is columns t..t+K-2."""
 
 from typing import Optional, Sequence
 
@@ -8,12 +9,13 @@ import torch
 def deduplicated_conv_window_axis(
     cache_params, *, supported_device: bool, speculative_eagle_topk: Optional[int]
 ) -> Optional[int]:
-    # Tree nodes can have different parents. KDA and some platform/model
-    # kernels also require independently writable, contiguous step windows.
+    # Tree steps have different parents, so they cannot share columns. NPU and
+    # CPU kernels expect contiguous steps, KDA transposes the window before conv,
+    # and a shape can opt out: each needs independently written windows.
     if (
         not supported_device
         or (speculative_eagle_topk is not None and speculative_eagle_topk > 1)
-        or getattr(cache_params.shape, "disable_conv_window_dedup", True)
+        or cache_params.shape.disable_conv_window_dedup
         or cache_params.is_kda
     ):
         return None
@@ -22,6 +24,7 @@ def deduplicated_conv_window_axis(
         return None
     axis = None
     for shape in cache_params.shape.conv:
+        # A square shape matches both ends; the trailing axis (GDN's layout) wins.
         if shape[-1] == win:
             shape_axis = len(shape) - 1
         elif shape[0] == win:
@@ -60,8 +63,9 @@ def conv_window_view(
 
 
 def conv_window_storage_bytes(windows: Sequence[torch.Tensor]) -> int:
-    # Layers (or rows after selecting a layer) are consecutive blocks of
-    # physical storage. Only the step and window axes inside a block overlap.
+    # Each leading index owns one consecutive block, so size(0) * stride(0) is
+    # the physical extent; the storage bound covers empty tensors, whose strides
+    # are not zero.
     return sum(
         min(t.untyped_storage().nbytes(), t.size(0) * t.stride(0) * t.element_size())
         for t in windows
