@@ -85,6 +85,28 @@ def _is_qwen3_vl_model(model_path: str) -> bool:
     return "qwen3-vl" in model_lower or "qwen3vl" in model_lower
 
 
+def _content_has_media(content: RerankContent) -> bool:
+    """Check whether rerank content actually contains image/video parts.
+
+    A content list is not itself multimodal: text parts are representation-
+    equivalent to a plain string and must not be routed to the VL decoder,
+    whose template renders `query`/`document` parts instead of `messages`.
+    """
+    if isinstance(content, str):
+        return False
+    for part in content:
+        if getattr(part, "type", None) in ("image_url", "video_url"):
+            return True
+    return False
+
+
+def _request_has_media(request: V1RerankReqInput) -> bool:
+    """Check whether the query or any document contains image/video parts."""
+    if _content_has_media(request.query):
+        return True
+    return any(_content_has_media(doc) for doc in request.documents)
+
+
 def _detect_rerank_backend(
     *,
     request: V1RerankReqInput,
@@ -98,13 +120,15 @@ def _detect_rerank_backend(
     Returns:
         "vl_decoder" | "text_decoder" | "cross_encoder"
     """
-    is_multimodal = request.is_multimodal()
+    request_has_media = _request_has_media(request)
     is_vl_model = _is_qwen3_vl_model(model_path)
     is_vl_template = _is_qwen3_vl_reranker_template(chat_template)
     is_text_template = _is_qwen3_reranker_template(chat_template)
 
-    # Prefer VL when template/model indicates VL, or request is multimodal with reranker template.
-    if is_vl_template or is_vl_model or (is_multimodal and is_text_template):
+    # Prefer VL when template/model indicates VL, or the request actually
+    # carries image/video parts with a reranker template. Text-part lists
+    # without media stay on the text decoder so their text can be extracted.
+    if is_vl_template or is_vl_model or (request_has_media and is_text_template):
         return "vl_decoder"
     if is_text_template:
         return "text_decoder"
