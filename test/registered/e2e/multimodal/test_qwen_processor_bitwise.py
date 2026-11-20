@@ -444,11 +444,13 @@ QUESTIONS = {
 def _benchmark_media(directory):
     from datasets import Image, load_dataset
 
+    # Materialize locally before selecting rows. Stopping a remote parquet stream
+    # early can leave read-ahead I/O alive during Python interpreter shutdown.
     rows = load_dataset(
-        DATASET_ID, "default", revision=DATASET_REVISION, split="test", streaming=True
+        DATASET_ID, "default", revision=DATASET_REVISION, split="test"
     ).cast_column("image", Image(decode=False))
     images = []
-    for index, row in enumerate(rows.take(max(ROW_IDS) + 1)):
+    for index, row in enumerate(rows.select(range(max(ROW_IDS) + 1))):
         if index in ROW_IDS:
             path = directory / f"realworldqa-{index}.image"
             path.write_bytes(row["image"]["bytes"])
