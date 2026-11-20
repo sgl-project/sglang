@@ -257,6 +257,10 @@ def disable_transparent_hugepages() -> bool:
             )
             return False
     except (OSError, AttributeError) as e:
-        logger.warning("prctl(PR_SET_THP_DISABLE) unavailable: %s", e)
+        logger.warning(
+            "Cannot disable transparent huge pages: prctl(PR_SET_THP_DISABLE) is "
+            "unavailable in libc (%s). THP stays enabled for this process.",
+            e,
+        )
         return False
     return True
