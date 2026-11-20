@@ -38,6 +38,11 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.utils.device import get_device_capability, is_cuda
 
 if TYPE_CHECKING:
+    from flashinfer.fused_moe import (
+        TrtllmMoERoutingMetadata,
+        TrtllmMoERoutingMetadataSlot,
+    )
+
     from sglang.srt.layers.communication.muse_spark_finalize_workspace import (
         FinalizePushWorkspace,
     )
@@ -51,6 +56,19 @@ _NVFP4_PER_TOKEN_SCALE_INV = 1.0 / (448.0 * 6.0)
 
 _MARLIN_SHAPE_ALIGNMENT = 64
 _MARLIN_BLOCK_SIZE_M_CANDIDATES = (8, 16, 32, 48, 64)
+
+# Measured range: decode up to c = 128 with 8 draft tokens.
+_ROUTING_METADATA_MAX_TOKENS = 1024
+# Smallest token count from which routing on the router stream was measured to beat the fused
+# routing, per (compute capability, TP size); unlisted configurations keep the fused routing. GB300
+# (10, 3) is unlisted: its router stream gates the experts at nearly every token count.
+_ROUTING_METADATA_MIN_TOKENS: dict[tuple[tuple[int, int], int], int] = {
+    ((10, 7), 4): 8,
+    ((10, 7), 8): 8,
+}
+# Graph-stable routing metadata per token count and tile, shared by all layers: layers run in
+# order on both streams, so a populate never overwrites metadata a previous layer still reads.
+_routing_metadata: dict[tuple, TrtllmMoERoutingMetadata] = {}
 
 
 def _resolve_moe_runner_backend():
@@ -560,6 +578,90 @@ class MuseSpark1xFp4Experts(nn.Module):
             slot_expert_ids=local_topk_ids,
         )
 
+    def populate_routing_metadata(
+        self, packed_topk_ids: torch.Tensor, *, tp_size: int
+    ) -> Optional[TrtllmMoERoutingMetadataSlot]:
+        """Build trtllm_fp4_block_scale_routed_moe's routing_metadata on the current router stream.
+        Returns None, keeping the fused routing, outside the measured (GPU, TP, token count) range
+        and while FlashInfer autotunes (the tuner explores tiles)."""
+        from flashinfer.autotuner import AutoTuner
+
+        num_tokens, top_k = packed_topk_ids.shape
+        min_tokens = _ROUTING_METADATA_MIN_TOKENS.get(
+            (torch.cuda.get_device_capability(packed_topk_ids.device), tp_size)
+        )
+        if (
+            self.use_marlin
+            or min_tokens is None
+            or not min_tokens <= num_tokens <= _ROUTING_METADATA_MAX_TOKENS
+            or AutoTuner.get().is_tuning_mode
+        ):
+            return None
+        from flashinfer.fused_moe import (
+            RoutingInputMode,
+            populate_trtllm_moe_routing_metadata_,
+            trtllm_fp4_block_scale_moe_routing_tile_n,
+            trtllm_moe_allocate_routing_metadata_multi_tile,
+        )
+
+        # The tile forward's routed call runs: the tuned one if any, else the default.
+        # Activations are quantized later, so only their shapes and dtypes are passed.
+        hs_fp4, hs_scale, per_token_scale = self._prepared_input_meta(num_tokens)
+        tile_n = trtllm_fp4_block_scale_moe_routing_tile_n(
+            packed_topk_ids,
+            hs_fp4,
+            hs_scale,
+            self.gate_up_proj,
+            self.gate_up_proj_weight_scale.view(torch.float8_e4m3fn),
+            self.global_num_experts,
+            top_k,
+            self.intermediate_size_per_partition,
+            self.num_local_experts,
+            do_finalize=False,
+            activation_type=3,  # SwiGLU
+            per_token_scale=per_token_scale,
+        )
+        if tile_n is None:  # No tile can run; the fused routing raises the error.
+            return None
+        key = (
+            num_tokens,
+            top_k,
+            packed_topk_ids.device,
+            self.global_num_experts,
+            self.num_local_experts,
+            self.local_expert_offset,
+            tile_n,
+        )
+        metadata = _routing_metadata.get(key)
+        if metadata is None:
+            metadata = _routing_metadata[key] = (
+                trtllm_moe_allocate_routing_metadata_multi_tile(
+                    packed_topk_ids,
+                    num_experts=self.global_num_experts,
+                    top_k=top_k,
+                    local_expert_offset=self.local_expert_offset,
+                    num_local_experts=self.num_local_experts,
+                    tile_ns=(tile_n,),
+                    routing_input_mode=RoutingInputMode.PackedPrecomputed,
+                )
+            )
+        populate_trtllm_moe_routing_metadata_(metadata, packed_topk_ids)
+        return metadata.slots[0]
+
+    def _prepared_input_meta(self, num_tokens: int):
+        """prepare_input's outputs as meta tensors: shapes and dtypes, no data."""
+        meta = torch.device("meta")
+        hs_fp4 = torch.empty(
+            num_tokens, self.hidden_size // 2, dtype=torch.uint8, device=meta
+        )
+        hs_scale = torch.empty(
+            num_tokens, self.hidden_size // 16, dtype=torch.float8_e4m3fn, device=meta
+        )
+        per_token_scale = None
+        if self.quant_config.use_per_token_activation:
+            per_token_scale = torch.empty(num_tokens, dtype=torch.float32, device=meta)
+        return hs_fp4, hs_scale, per_token_scale
+
     def prepare_input(
         self,
         hidden_states: torch.Tensor,
@@ -643,6 +745,7 @@ class MuseSpark1xFp4Experts(nn.Module):
             tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]
         ] = None,
         *,
+        routing_metadata: TrtllmMoERoutingMetadataSlot | None = None,
         ar_workspace: FinalizePushWorkspace | None = None,
     ) -> torch.Tensor:
         if self.use_marlin:
@@ -707,6 +810,8 @@ class MuseSpark1xFp4Experts(nn.Module):
                 routing_method_type=1,  # unused on this path, must be 1
                 do_finalize=False,  # we need the per-expert outputs
                 activation_type=3,  # SwiGLU
+                # Built on the router stream; the call then runs only the expert GEMMs.
+                routing_metadata=routing_metadata,
             )[:3]
         )
 
