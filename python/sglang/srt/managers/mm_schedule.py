@@ -387,19 +387,24 @@ class PerImageRequestInfo:
     overlapping: List[Tuple[int, MultimodalDataItem, int]] = field(default_factory=list)
 
 
+def _uses_qwen_vl_tp_image_preprocessing(
+    data_embedding_func: DataEmbeddingFunc,
+) -> bool:
+    if not envs.SGLANG_QWEN_VL_TP_IMAGE_PREPROCESS.get():
+        return False
+    owner = getattr(data_embedding_func, "__self__", None)
+    return getattr(
+        data_embedding_func, "__name__", None
+    ) == "get_image_feature" and type(owner).__name__ in {
+        "Qwen3VLForConditionalGeneration",
+        "Qwen3VLMoeForConditionalGeneration",
+    }
+
+
 def _sync_tp_image_cache_misses(ordered_candidates, local_misses, cached_embeddings):
     """Resolve Qwen-VL image misses before any rank decides to enter the ViT."""
-    from sglang.srt.multimodal.qwen_vl_tp_preprocess import (
-        DEFERRED_IMAGE_PATCH_WIDTH_KEY,
-        agree_on_image_misses,
-    )
+    from sglang.srt.multimodal.qwen_vl_tp_preprocess import agree_on_image_misses
     from sglang.srt.runtime_context import get_parallel
-
-    if not any(
-        DEFERRED_IMAGE_PATCH_WIDTH_KEY in item.model_specific_data
-        for item, _ in ordered_candidates.values()
-    ):
-        return local_misses
 
     shared_misses = agree_on_image_misses(
         ordered_candidates, local_misses, get_parallel().tp_group
@@ -414,6 +419,8 @@ def _batch_encode_per_image_misses(
     data_embedding_func: DataEmbeddingFunc,
     per_image_requests: List[PerImageRequestInfo],
     device: torch.device,
+    *,
+    sync_tp_images: bool = False,
 ) -> Dict[Tuple[bytes, int], torch.Tensor]:
     """
     Collect cache misses across ALL per-image requests, deduplicate by hash and
@@ -429,14 +436,7 @@ def _batch_encode_per_image_misses(
     hash_to_embedding: Dict[Tuple[bytes, int], torch.Tensor] = {}
 
     prefetched = _prefetched_source(data_embedding_func)
-    ordered_image_candidates = (
-        {}
-        if (
-            envs.SGLANG_QWEN_VL_TP_IMAGE_PREPROCESS.get()
-            and getattr(data_embedding_func, "__name__", None) == "get_image_feature"
-        )
-        else None
-    )
+    ordered_image_candidates = {} if sync_tp_images else None
     # Phase 1a: find overlapping items per request and collect cache misses
     for req_info in per_image_requests:
         chunk_start = req_info.extend_prefix_len
@@ -483,7 +483,7 @@ def _batch_encode_per_image_misses(
                     item.model_specific_data[BORROW_CUDA_IPC_FEATURE_KEY] = True
                 unique_misses[cache_key] = (item, expected_token_count)
 
-    if ordered_image_candidates:
+    if ordered_image_candidates is not None:
         unique_misses = _sync_tp_image_cache_misses(
             ordered_image_candidates, unique_misses, hash_to_embedding
         )
@@ -707,9 +707,14 @@ def _get_chunked_prefill_embedding(
 
     # Phase 1: batch encode all per-image cache misses in ONE ViT call
     hash_to_embedding: Dict[Tuple[bytes, int], torch.Tensor] = {}
-    if per_image_requests:
+    sync_tp_images = _uses_qwen_vl_tp_image_preprocessing(data_embedding_func)
+    if per_image_requests or sync_tp_images:
+        # Include all-eager and empty candidate lists in the same TP agreement.
         hash_to_embedding = _batch_encode_per_image_misses(
-            data_embedding_func, per_image_requests, device
+            data_embedding_func,
+            per_image_requests,
+            device,
+            sync_tp_images=sync_tp_images,
         )
 
     # Phase 2: assemble per-request chunks in original request order
