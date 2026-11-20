@@ -3029,6 +3029,51 @@ def apply_fp8_linear_bmm_flashinfer(
     return output.view(*output_shape)
 
 
+@lru_cache(maxsize=None)
+def _sm120_torch_fp8_max_n(device: torch.device) -> int:
+    props = torch.cuda.get_device_properties(device)
+    if (props.major, props.minor) != (12, 0) or get_cuda_version() < (12, 8):
+        return 0
+    # Limit 128-column CUTLASS tiles to one third of the available SMs.
+    return props.multi_processor_count // 3 * 128
+
+
+def _should_use_sm120_torch_fp8_linear(
+    qinput: torch.Tensor,
+    weight: torch.Tensor,
+    x_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    output_dtype: torch.dtype,
+) -> bool:
+    if not _is_cuda or torch.compiler.is_compiling() or not qinput.is_cuda:
+        return False
+    max_n = _sm120_torch_fp8_max_n(qinput.device)
+    if max_n <= 0:
+        return False
+    from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+
+    if is_batch_invariant_mode_enabled():
+        return False
+    return (
+        bias is None
+        and output_dtype in (torch.bfloat16, torch.float16)
+        and 0 < qinput.shape[0] <= 128
+        and qinput.shape[1] >= 4096
+        and 1536 <= weight.shape[1] <= max_n
+        and weight.device == qinput.device
+        and qinput.dtype == torch.float8_e4m3fn
+        and weight.dtype == torch.float8_e4m3fn
+        and x_scale.dtype == torch.float32
+        and weight_scale.dtype == torch.float32
+        and qinput.is_contiguous()
+        and weight.t().is_contiguous()
+        and x_scale.shape == (qinput.shape[0], 1)
+        and x_scale.is_contiguous()
+        and weight_scale.is_contiguous()
+    )
+
+
 def apply_fp8_linear(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -3197,6 +3242,16 @@ def apply_fp8_linear(
                 use_heuristic=False,
                 num_warps=tuned_config["num_warps"],
                 num_stages=tuned_config["num_stages"],
+            )
+        elif _should_use_sm120_torch_fp8_linear(
+            qinput, weight, x_scale, weight_scale, bias, output_dtype
+        ):
+            output = torch._scaled_mm(
+                qinput,
+                weight,
+                scale_a=x_scale,
+                scale_b=weight_scale.view(1, -1),
+                out_dtype=output_dtype,
             )
         else:
             output = fp8_scaled_mm(
