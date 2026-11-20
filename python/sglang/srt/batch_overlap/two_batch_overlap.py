@@ -852,6 +852,7 @@ class TboForwardBatchPreparer:
                 top_p=None,
                 mm_inputs=None,
                 top_logprobs_nums=None,
+                input_candidate_selectors=None,
                 token_ids_logprobs=None,
                 extend_input_logprob_token_ids_gpu=None,
                 next_token_logits_buffer=None,

@@ -233,6 +233,10 @@ class ReqLogprob:
     top_logprobs_num: int
     token_ids_logprob: Optional[List[int]]
     token_ids_logprob_rows: Optional[List[List[int]]] = None
+    # Chooses the top_logprobs_num candidates of each input position in place
+    # of top-k (InputLogprobProcessor.select_input_candidates); set by a
+    # _create_generation_req override. Output positions keep top-k.
+    input_candidate_selector: Optional[Any] = None
     input_token_logprobs_val: Optional[List[float]] = None
     input_token_logprobs_idx: Optional[List[int]] = None
     input_top_logprobs_val: Optional[List[List[float]]] = None
