@@ -2,16 +2,18 @@
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention import aiter_backend
 from sglang.srt.layers.dcp import layout as dcp_layout
 from sglang.srt.layers.dcp import planner as dcp_planner
 from sglang.srt.mem_cache.kv.router import PlainPoolRouter
 from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -240,6 +242,53 @@ class TestAiterCprrKernelHeads(CustomTestCase):
         # Without speculative decoding the verify window is one token.
         self.assertEqual(_dcp_backend(num_draft_tokens=None).cprr_kernel_heads, 96)
         self.assertEqual(support.calls[-1]["max_seqlen_qo"], 1)
+
+    def test_constructor_asks_with_the_latent_width(self):
+        """The verify query must carry the 512-wide latent; with the 128-wide value
+        width aiter has no asm route and native 96 is lost."""
+        support = self._query(_ShapeSupport({(96, 8), (128, 8)}))
+        runner = Mock(
+            kv_cache_dtype=aiter_backend.fp8_dtype,
+            device="cpu",
+            decode_attention_backend_str="aiter",
+        )
+        runner.req_to_token_pool.size = 4
+        runner.model_config = Mock(
+            dtype=torch.bfloat16,
+            is_multimodal=False,
+            attention_arch=AttentionArch.MLA,
+            num_attention_heads=96,
+            head_dim=192,
+            v_head_dim=128,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            context_len=4096,
+        )
+        runner.model_config.get_num_kv_heads.return_value = 1
+        with (
+            envs.SGLANG_AITER_MLA_DECODE_BACKEND.override("asm"),
+            envs.SGLANG_AITER_MLA_VERIFY_BACKEND.override("asm"),
+            get_context().override_server_args(
+                page_size=1,
+                speculative_algorithm="EAGLE",
+                speculative_num_draft_tokens=8,
+                speculative_num_steps=7,
+                speculative_attention_mode="decode",
+            ),
+            get_parallel().override(
+                tp_size=8, attn_tp_size=8, moe_tp_size=8, attn_dcp_size=8
+            ),
+            patch.object(aiter_backend, "resolve_window_kv_pool", return_value=None),
+            patch.object(aiter_backend, "resolve_window_id_space", return_value=None),
+            patch.object(aiter_backend, "_kv_cache_is_vectorized_5d", return_value=False),
+            patch.object(aiter_backend, "_require_untranslated_storage"),
+            patch.object(aiter_backend, "fast_mode", False),
+            patch.object(aiter_backend, "intra_batch_mode", True),
+        ):
+            backend = aiter_backend.AiterAttnBackend(runner, skip_prefill=True)
+        self.assertEqual(backend.cprr_kernel_heads, 96)
+        self.assertEqual(support.calls[0]["v_head_dim"], 512)
+        self.assertEqual(backend.v_head_dim, 128)
 
     def test_init_asks_aiter_only_on_the_asm_verify_route(self):
         support = self._query(_ShapeSupport({(96, 8), (128, 8)}))
