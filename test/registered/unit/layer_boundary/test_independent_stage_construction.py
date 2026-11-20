@@ -40,6 +40,39 @@ def next_layer():
 
 
 class TestIndependentStageConstruction(CustomTestCase):
+    def test_compute_owned_cp_gather_preserves_output_sum(self):
+        # Quantized MoE transport replaces only the BF16 input gather. Losing
+        # the output sum or declaring the input gather twice corrupts results.
+        parallel = fixture.parallel_of(
+            attn_dp=1,
+            attn_tp=1,
+            attn_cp=4,
+            enable_prefill_cp=True,
+            enable_cp_tp_group_sharing=True,
+        )
+        with fixture.planning(parallel, dsa_cp=True):
+            baseline = declare_ffn(sparse=True, exit_rows=factories.ExitRows.ATTENTION)
+            deferred = replace(baseline, gathers_attn_cp_input=True)
+            for variant in (BatchVariant.ORDINARY, BatchVariant.CONTEXT_PARALLEL):
+                normal = factories._resolve_stage(baseline, variant, None)
+                actual = factories._resolve_stage(deferred, variant, None)
+                self.assertEqual(actual.contract.output, normal.contract.output)
+                self.assertEqual(actual.during, normal.during)
+                self.assertEqual(actual.returned, normal.returned)
+                if variant is BatchVariant.CONTEXT_PARALLEL:
+                    self.assertIn(
+                        factories.TokenAxis.ATTN_CP,
+                        actual.contract.input.gathered_by_compute,
+                    )
+                    self.assertIsNotNone(actual.contract.output.group)
+                else:
+                    self.assertEqual(actual.contract, normal.contract)
+            # A declaration retains the capability when recorded as facts.
+            self.assertTrue(facts_of(deferred).gathers_attn_cp_input)
+            parallel.enable_cp_tp_group_sharing = False
+            with self.assertRaisesRegex(NotImplementedError, "full-TP sparse FFN"):
+                factories._resolve_stage(deferred, BatchVariant.CONTEXT_PARALLEL, None)
+
     def test_active_variant_without_a_bound_path_never_falls_back(self):
         from sglang.srt.layers.layer_boundary import construction
         from sglang.test.boundary_fixtures import stub_plan
