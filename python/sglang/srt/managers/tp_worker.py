@@ -56,6 +56,7 @@ from sglang.srt.model_executor.graph_memory_usage import (
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.runtime_context import (
     get_device,
+    get_disagg,
     get_exec,
     get_model,
     get_parallel,
@@ -555,6 +556,13 @@ class TpModelWorker(BaseTpWorker):
         )
         if is_cp_sharded_padded():
             kv_capacity = from_cp_sharded(kv_capacity)
+        # On a decode engine a request's KV lives in logical rows and the device
+        # rows only hold its hot buffer, so budget against the logical pool.
+        if (
+            self.model_runner.enable_hisparse
+            and get_disagg().disaggregation_mode == "decode"
+        ):
+            kv_capacity = max(kv_capacity, self.model_runner.max_token_pool_size)
         # Not an error: a deployment that never sends max-length requests may
         # want a small pool. Checked here because this is the final served value.
         if kv_capacity < self.model_config.context_len:
