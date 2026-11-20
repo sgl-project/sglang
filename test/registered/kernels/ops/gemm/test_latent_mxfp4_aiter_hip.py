@@ -108,8 +108,15 @@ class TestKimiK3LatentMXFP4(CustomTestCase):
     def test_rejects_missing_or_host_scales(self):
         _, packed, scale = self.projections[0]
         x = torch.ones((1, 7168), dtype=torch.bfloat16, device=self.device)
-        for invalid_scale in (scale.cpu(), scale.flatten()[:0]):
-            with self.subTest(device=invalid_scale.device, size=invalid_scale.numel()):
+        for invalid_scale in (
+            scale.cpu(),
+            scale.flatten()[:0],
+            scale.flatten(),
+            scale.t().contiguous(),
+        ):
+            with self.subTest(
+                device=invalid_scale.device, shape=tuple(invalid_scale.shape)
+            ):
                 with self.assertRaisesRegex(ValueError, "scales must match"):
                     latent_mxfp4_aiter_hip.run(x=x, weight=packed, scale=invalid_scale)
 

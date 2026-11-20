@@ -75,7 +75,9 @@ def run(*, x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor) -> torch.
         or x.shape[1] != weight.shape[1] * 2
         or weight.device != x.device
         or scale.device != x.device
-        or scale.numel() < weight.shape[0] * x.shape[1] // 32
+        or scale.ndim != 2
+        or scale.shape[1] != x.shape[1] // 32
+        or scale.shape[0] < weight.shape[0]
         or not weight.is_contiguous()
         or not scale.is_contiguous()
     ):
