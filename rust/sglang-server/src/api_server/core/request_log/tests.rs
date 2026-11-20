@@ -294,7 +294,8 @@ fn terminal_output_logs_finish_and_keeps_the_request() {
 }
 
 /// With `--incremental-streaming-output`, a stream's `Finish` shows its
-/// terminal frame: the last delta, with the cumulative completion count.
+/// terminal frame: the last delta, with the cumulative completion count and
+/// the cached tokens by tier an earlier frame reported.
 #[test]
 fn incremental_stream_logs_last_delta() {
     let fixture: Value = serde_json::from_str(FIXTURE).unwrap();
@@ -312,13 +313,24 @@ fn incremental_stream_logs_last_delta() {
     let body = serde_json::json!({"rid": "r-inc", "text": "hi", "stream": true});
     let mut record = receive_body(&log, &body, &http::HeaderMap::new()).remove(0);
     let rid = Rid::from_client("r-inc");
-    record.observe(&ResponseItem::Frame(chunk(&rid, "a", &[1], None)));
+    let mut first = chunk(&rid, "a", &[1], None);
+    first.extras = Some(Box::new(crate::message::response::ChunkExtras {
+        cached_tokens_details: Some(crate::message::response::CachedTokensDetails {
+            device: 1,
+            host: 2,
+            storage: None,
+            storage_backend: None,
+        }),
+        ..Default::default()
+    }));
+    record.observe(&ResponseItem::Frame(first));
     record.observe(&ResponseItem::Done(chunk(&rid, "b", &[2], None)));
 
     let finish = log.logged_lines().remove(1);
     assert!(
         finish.contains(", out={'text': 'b', 'output_ids': [2], 'meta_info': {'id': 'r-inc', ")
-            && finish.contains("'completion_tokens': 2, "),
+            && finish.contains("'completion_tokens': 2, ")
+            && finish.contains("'cached_tokens_details': {'device': 1, 'host': 2}"),
         "{finish}"
     );
 }

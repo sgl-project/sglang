@@ -36,6 +36,9 @@ pub(crate) struct CoreOutput {
     /// This listener's data-parallel rank, `None` without data parallelism;
     /// stamped by the core call.
     pub(crate) dp_rank: Option<u32>,
+    /// The prompt's final token ids, when the request asked for them;
+    /// stamped by the core call.
+    pub(crate) prompt_token_ids: Option<Arc<[i64]>>,
     pub(crate) text: String,
     pub(crate) completion_tokens: u64,
     pub(crate) stop_token_trimmed: bool,
@@ -64,6 +67,7 @@ impl From<ChunkEvent> for CoreOutput {
             reasoning_tokens,
             weight_version: None,
             dp_rank: None,
+            prompt_token_ids: None,
             text,
             completion_tokens,
             stop_token_trimmed,
@@ -102,6 +106,9 @@ impl CoreOutput {
         }
         if delta.weight_version.is_some() {
             self.weight_version = delta.weight_version.clone();
+        }
+        if delta.prompt_token_ids.is_some() {
+            self.prompt_token_ids = delta.prompt_token_ids.clone();
         }
 
         let Some(delta_extras) = delta.extras.as_deref() else {
@@ -290,7 +297,9 @@ impl CoreOutput {
                 ids: self.token_ids,
             }),
             index,
-            prompt_token_ids: None,
+            prompt_token_ids: self
+                .prompt_token_ids
+                .map(|ids| api::TokenIds { ids: ids.to_vec() }),
         }
     }
 

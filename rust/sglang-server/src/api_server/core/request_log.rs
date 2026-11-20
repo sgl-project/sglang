@@ -40,7 +40,7 @@ use serde_json::{Map, Value};
 use super::frame::CoreOutput;
 use crate::message::config::{RequestLogConfig, ServerArgs};
 use crate::message::multimodal::MmItem;
-use crate::message::request::GenerateRequest;
+use crate::message::request::{GenerateRequest, PromptTokenIdsSlot};
 use crate::message::response::{ChunkEvent, ResponseItem};
 
 /// Python's `record_request_for_crash_dump` keeps a finished request this long.
@@ -339,6 +339,7 @@ impl RequestLog {
                     created_at,
                     incremental: request.stream && self.incremental_streaming_output,
                     output,
+                    prompt_token_ids: request.prompt_token_ids.clone(),
                     in_flight,
                     log_metrics,
                     admitted: false,
@@ -783,6 +784,10 @@ fn typed_fields(request: &GenerateRequest) -> Map<String, Value> {
         request.disagg_prefill_dp_rank.into(),
     );
     set("require_reasoning", request.require_reasoning.into());
+    set(
+        "return_prompt_token_ids",
+        request.prompt_token_ids.is_some().into(),
+    );
     set("priority", request.priority.into());
     set("extra_key", request.extra_key.clone().into());
     set("cache_salt", request.cache_salt.clone().into());
@@ -826,6 +831,8 @@ pub(crate) struct RequestRecord {
     incremental: bool,
     /// The output so far, shared with the crash recorder's in-flight entry.
     output: Arc<Mutex<CoreOutput>>,
+    /// The prompt ids its `out` reports, when the request asked for them.
+    prompt_token_ids: Option<PromptTokenIdsSlot>,
     /// Its in-flight entry, until it finishes or is dropped.
     in_flight: Option<u64>,
     /// Python's `log_metrics`: false for the health probe, which a crash dump
@@ -856,12 +863,10 @@ impl RequestRecord {
                     output.append_delta(&delta);
                     if self.incremental {
                         // The stream's terminal frame: the last delta, with
-                        // the cumulative completion-token count.
-                        CoreOutput {
-                            completion_tokens: output.completion_tokens,
-                            weight_version: output.weight_version.clone(),
-                            ..delta
-                        }
+                        // what an incremental frame reports cumulatively.
+                        let mut terminal = delta.with_cumulative_counts(&output);
+                        terminal.weight_version = output.weight_version.clone();
+                        terminal
                     } else {
                         output.clone()
                     }
@@ -884,13 +889,21 @@ impl RequestRecord {
     /// The `/generate` frame of the finished request is Python's `out`.
     fn finish(&mut self, output: CoreOutput) {
         let e2e_latency = self.created_at.elapsed().as_secs_f64();
-        let out = python_out(output, &self.rid, e2e_latency);
+        let out = self.python_out(output, e2e_latency);
         if let Some(logger) = &self.log.logger {
             logger.finished(&self.obj, &self.headers, &out, e2e_latency);
         }
         if let (Some(recorder), Some(id)) = (&self.log.recorder, self.in_flight.take()) {
             recorder.finish(id, self.log_metrics, &out, unix_time());
         }
+    }
+
+    fn python_out(&self, mut output: CoreOutput, e2e_latency: f64) -> Map<String, Value> {
+        output.prompt_token_ids = self
+            .prompt_token_ids
+            .as_ref()
+            .and_then(|slot| slot.get().cloned());
+        python_out(output, &self.rid, e2e_latency)
     }
 
     fn unregister(&mut self) {
@@ -908,7 +921,7 @@ impl Drop for RequestRecord {
         if self.admitted {
             // Dropped unfinished: kept with what it generated, unlogged.
             let output = lock(&self.output).clone();
-            let out = python_out(output, &self.rid, self.created_at.elapsed().as_secs_f64());
+            let out = self.python_out(output, self.created_at.elapsed().as_secs_f64());
             recorder.finish(id, self.log_metrics, &out, unix_time());
         } else {
             recorder.unregister(id);
