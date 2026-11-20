@@ -202,18 +202,18 @@ impl MmProcessor {
         let source = Video::open(&video.bytes, &limits).map_err(mm_error)?;
         let info = source.info();
         // torchcodec's `len()` and `average_fps`, which Python samples from.
-        let num_frames = sampling
-            .num_frames(&config, info.frame_count, info.average_fps)
-            .map_err(mm_error)?;
-        let indices = frame_indices(info.frame_count, num_frames);
-        let (height, width) = sampling
-            .presize(
-                &config,
+        let plan = |config: &VideoConfig| -> Result<(Vec<u64>, usize, usize), MmError> {
+            let num_frames = sampling.num_frames(config, info.frame_count, info.average_fps)?;
+            let indices = frame_indices(info.frame_count, num_frames);
+            let (height, width) = sampling.presize(
+                config,
                 indices.len(),
                 info.height as usize,
                 info.width as usize,
-            )
-            .map_err(mm_error)?;
+            )?;
+            Ok((indices, height, width))
+        };
+        let (indices, height, width) = plan(&config).map_err(mm_error)?;
         let side = |v: usize| {
             u32::try_from(v).map_err(|_| ProcessorError::InvalidRequest("video too large".into()))
         };
@@ -222,10 +222,12 @@ impl MmProcessor {
             height: side(height)?,
             filter: Resample::AtenF32Bilinear,
         };
-        // Python decodes every planned frame, and `preprocess_video` floors each frame's
-        // pixels, so the plan sets the output size; a fixed cap would refuse long clips.
-        limits.max_output_bytes =
-            (indices.len().saturating_mul(height * width * 3)).max(limits.max_output_bytes);
+        // Python decodes every frame the server's config plans, with a per-frame pixel floor;
+        // that plan sets the output budget, so a request's hints cannot raise it.
+        if let Ok((frames, height, width)) = plan(&sampling.config) {
+            limits.max_output_bytes =
+                (frames.len().saturating_mul(height * width * 3)).max(limits.max_output_bytes);
+        }
         // torchcodec converts with swscale's x86 SIMD path, except at odd
         // heights, where swscale's generic path (not reproduced) runs.
         let rgb = match info.height % 2 {

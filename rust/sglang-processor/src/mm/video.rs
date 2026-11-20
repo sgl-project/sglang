@@ -1,7 +1,7 @@
 //! SGLang's own Qwen-VL video rules, which run before Dynamo's decoder and
 //! family processor: how many frames to keep and which (`smart_nframes`, then
 //! an int64 `np.linspace`), and the pre-resize to multiples of 28
-//! (`preprocess_video`), all from `multimodal/processors/qwen_vl.py`.
+//! (`preprocess_video`), all from `multimodal/qwen_vl_media_processing.py`.
 
 use dynamo_multimodal::MmError;
 
@@ -29,7 +29,7 @@ pub struct VideoHints {
     pub max_frames: Option<i64>,
 }
 
-/// The server's [`VideoConfig`] and `qwen_vl.py`'s module constants, as
+/// The server's [`VideoConfig`] and `qwen_vl_media_processing.py`'s module constants, as
 /// `RustMmProcessor.resolve_spec` reads them at launch (`VIDEO_TOTAL_PIXELS`
 /// comes from the environment).
 #[derive(Clone, Debug, PartialEq, serde::Deserialize)]
@@ -208,7 +208,7 @@ fn floor_by_factor(number: f64, factor: f64) -> f64 {
 mod tests {
     use super::*;
 
-    /// `qwen_vl.py`'s constants with `VIDEO_MAX_PIXELS` unset.
+    /// `qwen_vl_media_processing.py`'s constants with `VIDEO_MAX_PIXELS` unset.
     fn sampling() -> VideoSampling {
         VideoSampling {
             config: VideoConfig::default(),
