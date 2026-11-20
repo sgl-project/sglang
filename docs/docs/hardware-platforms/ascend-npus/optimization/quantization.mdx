@@ -375,6 +375,7 @@ python3 -m sglang.launch_server \
 ```
 
 > **Implementation Notes:**
+>
 > - Online path: `Fp8Config.get_quant_method()` dispatches to `NPUMXFP8LinearMethod`. Weights are quantized once at load via `npu_dynamic_mx_quant(weight, dst_type=torch_npu.float8_e4m3fn)` and pre-transposed to `[in, out]`; activations are per-token quantized at inference and matmul runs via `npu_quant_matmul(..., group_sizes=[1, 1, 32])` (block_size = 32).
 > - Offline path: `ModelSlimMXFP8Scheme` loads `float8_e4m3fn` weights + `float8_e8m0fnu` block scales pre-exported by msmodelslim. Transpose is kept as a non-contiguous view (`.data` assignment) — calling `.contiguous()` would physically reorder the pre-quantized layout and break the block-scale mapping.
 > - MoE MXFP8 (FusedMoE) for LLMs is documented in **MXFP8 for LLM MoE models** below.

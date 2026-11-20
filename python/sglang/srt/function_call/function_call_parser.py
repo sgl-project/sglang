@@ -2,6 +2,7 @@ import inspect
 import logging
 from typing import Dict, List, Literal, Optional, Set, Tuple, Type, Union
 
+from sglang.srt.arg_groups.choices import removed_choice_message
 from sglang.srt.entrypoints.openai.protocol import (
     LegacyStructuralTagResponseFormat,
     StructuralTagResponseFormat,
@@ -36,6 +37,7 @@ from sglang.srt.function_call.gpt_oss_detector import GptOssDetector
 from sglang.srt.function_call.granite_toolcall_detector import GraniteToolCallDetector
 from sglang.srt.function_call.hermes_detector import HermesDetector
 from sglang.srt.function_call.hunyuan_detector import HunyuanDetector
+from sglang.srt.function_call.inkling2_detector import Inkling2Detector
 from sglang.srt.function_call.inkling_detector import InklingDetector
 from sglang.srt.function_call.internlm_detector import InternlmDetector
 from sglang.srt.function_call.iquest_q1_detector import IQuestQ1Detector
@@ -89,7 +91,6 @@ class FunctionCallParser:
         "dots": DotsToolDetector,
         "ernie55": Ernie5_5Detector,
         "glm": Glm4MoeDetector,
-        "glm45": Glm4MoeDetector,
         "glm47": Glm47MoeDetector,
         "flint": Glm47MoeDetector,
         "gpt-oss": GptOssDetector,
@@ -107,7 +108,6 @@ class FunctionCallParser:
         "poolside_v1": PoolsideV1Detector,
         "pythonic": PythonicDetector,
         "qwen": Qwen25Detector,
-        "qwen25": Qwen25Detector,
         "qwen3_coder": Qwen3CoderDetector,
         "spark25": Spark25Detector,
         "step3": Step3Detector,
@@ -124,6 +124,7 @@ class FunctionCallParser:
         "gigachat35": GigaChat35Detector,
         "gemma4": Gemma4Detector,
         "inkling": InklingDetector,
+        "inkling2": Inkling2Detector,
         "iquest_q1": IQuestQ1Detector,
         "response_template": ResponseTemplateToolDetector,
     }
@@ -154,7 +155,10 @@ class FunctionCallParser:
                 kwargs["tools"] = self.structural_tag_tools()
             detector = detector_class(**kwargs)
         else:
-            raise ValueError(f"Unsupported tool_call_parser: {tool_call_parser}")
+            message = removed_choice_message("tool_call_parser", tool_call_parser)
+            raise ValueError(
+                message or f"Unsupported tool_call_parser: {tool_call_parser}"
+            )
 
         if isinstance(detector, Glm47MoeDetector):
             detector.use_full_assistant_constraint = not any(

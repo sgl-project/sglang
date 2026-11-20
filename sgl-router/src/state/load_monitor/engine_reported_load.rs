@@ -71,6 +71,20 @@ pub struct EngineReportedWorkerLoad {
     pub captured_at: Instant,
 }
 
+/// One DP rank's fresh engine reading, for `--dp-rank-policy least_tokens`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RankLoad {
+    pub rank: u32,
+    /// KV tokens the rank has committed: in use, plus the prompt tokens of
+    /// requests it holds but has not allocated for yet (the V4 feed's
+    /// `num_total_tokens`); KV tokens in use alone from an older publisher.
+    pub num_tokens: u64,
+    /// Requests running or waiting on the rank.
+    pub num_reqs: u64,
+    /// When the router received the reading.
+    pub at: Instant,
+}
+
 /// Engine-reported per-worker scheduling load: capacity, queue pressure, and prefill estimates.
 ///
 /// Shared by cache-aware, power-of-two, session-aware, and decode selection and admission.
@@ -566,6 +580,56 @@ impl EngineReportedLoadTable {
             .collect()
     }
 
+    /// One fresh reading per DP rank of one worker, in rank order, for
+    /// `--dp-rank-policy least_tokens`. `None` unless every rank the worker
+    /// advertised (or, with no advertisement, every rank observed) is fresh,
+    /// by the same rule as [`Self::capture_snapshot`]: a silent rank must not
+    /// look idle and draw traffic. Read at selection time rather than from
+    /// the request's ingress snapshot because in PD mode the decode rank is
+    /// chosen after the admission wait.
+    pub fn fresh_rank_loads(&self, worker_url: &str, now: Instant) -> Option<Vec<RankLoad>> {
+        let mut observed: HashMap<u32, (RankLoad, bool)> = HashMap::new();
+        for entry in self.by_rank.iter() {
+            if entry.key().0 != worker_url {
+                continue;
+            }
+            let LoadEntry { load, at, .. } = entry.value();
+            let fresh = now.saturating_duration_since(*at) <= self.freshness;
+            let reading = RankLoad {
+                rank: entry.key().1,
+                // Queued requests hold no KV yet, so in-use tokens alone make
+                // a rank with a deep queue look lightest.
+                num_tokens: load
+                    .native_cache
+                    .as_ref()
+                    .map_or(load.num_tokens, |native| native.num_total_tokens),
+                num_reqs: load.num_running_reqs.saturating_add(load.num_waiting_reqs),
+                at: *at,
+            };
+            observed.insert(reading.rank, (reading, fresh));
+        }
+        let mut required: Vec<u32> = self
+            .expected
+            .iter()
+            .filter(|key| key.0 == worker_url)
+            .map(|key| key.1)
+            .collect();
+        if required.is_empty() {
+            required = observed.keys().copied().collect();
+        }
+        if required.is_empty() {
+            return None;
+        }
+        required.sort_unstable();
+        required
+            .into_iter()
+            .map(|rank| match observed.get(&rank) {
+                Some(&(reading, true)) => Some(reading),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Captures one immutable view for all routing decisions in a request.
     pub fn capture_snapshot(&self, now: Instant) -> EngineReportedLoadSnapshot {
         let mut min_rank_pending = HashMap::new();
@@ -660,6 +724,63 @@ mod tests {
                 .is_none(),
             "short frames must never be promoted to complete native monitor data"
         );
+    }
+
+    fn with_tokens(num_tokens: u64) -> LoadStat {
+        LoadStat {
+            num_tokens,
+            ..load(0, 0)
+        }
+    }
+
+    #[test]
+    fn rank_loads_need_every_advertised_rank_fresh() {
+        let t = EngineReportedLoadTable::with_freshness(Duration::from_millis(10));
+        let now = Instant::now();
+        let tokens = |at: Instant| {
+            t.fresh_rank_loads("http://w:30000", at).map(|loads| {
+                loads
+                    .iter()
+                    .map(|l| (l.rank, l.num_tokens))
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(tokens(now), None);
+        t.set("http://w:30000", 1, with_tokens(300), now);
+        t.set("http://w:30000", 0, with_tokens(700), now);
+        t.set("http://other:30000", 0, with_tokens(1), now);
+        // Nothing advertised: every observed rank counts, in rank order.
+        assert_eq!(tokens(now), Some(vec![(0, 700), (1, 300)]));
+        // An advertised rank that never published hides the whole worker.
+        for rank in 0..3 {
+            t.mark_expected_rank("http://w:30000", rank);
+        }
+        assert_eq!(tokens(now), None);
+        t.set("http://w:30000", 2, with_tokens(0), now);
+        assert_eq!(tokens(now), Some(vec![(0, 700), (1, 300), (2, 0)]));
+        // So does one whose reading went stale.
+        let later = now + Duration::from_secs(1);
+        t.set("http://w:30000", 0, with_tokens(700), later);
+        t.set("http://w:30000", 1, with_tokens(300), later);
+        assert_eq!(tokens(later), None);
+        // Each reading keeps its own timestamp and request count.
+        t.set("http://w:30000", 2, load(3, 2), later);
+        let rank_2 = t.fresh_rank_loads("http://w:30000", later).unwrap()[2];
+        assert_eq!((rank_2.num_reqs, rank_2.at), (5, later));
+        // A V4 publisher's total (in use plus queued prompts) replaces in use.
+        let native = NativeCacheRankLoad {
+            num_waiting_uncached_tokens: 0,
+            num_total_tokens: 900,
+            max_running_requests: 8,
+            total_prefill_uncached_tokens: 0,
+            total_prefill_busy_us: 0,
+        };
+        let total = LoadStat {
+            native_cache: Some(native),
+            ..with_tokens(700)
+        };
+        t.set("http://w:30000", 0, total, later);
+        assert_eq!(tokens(later).unwrap()[0], (0, 900));
     }
 
     #[test]

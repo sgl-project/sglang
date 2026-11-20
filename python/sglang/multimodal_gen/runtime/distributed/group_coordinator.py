@@ -219,7 +219,6 @@ class GroupCoordinator:
         assert self.cpu_group is not None, f"{group_ranks=}, {local_rank=}"
         assert self.device_group is not None
 
-        # TODO: fix it for other platforms
         self.device = get_local_torch_device()
         self.shm_handle = None
         global_world_size = torch.distributed.get_world_size()
