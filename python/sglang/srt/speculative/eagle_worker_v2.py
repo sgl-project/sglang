@@ -728,7 +728,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             and not forward_batch.forward_mode.is_idle()
             and self.seed_dsa_topk_from_draft_extend
             and draft_input.dsa_topk_indices is None
-            and not get_parallel().enable_dp_attention
+            and not get_parallel().attn_dp_enabled
         ):
             can_run_decode_cuda_graph = False
         self.draft_runtime.begin_draft_round(

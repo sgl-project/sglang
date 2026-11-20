@@ -83,7 +83,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.engram_staging import StagedRows
     from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-    from sglang.srt.managers.req_types import MultimodalInputs
+    from sglang.srt.managers.req_types import MultimodalInputs, TokenIdRows
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.mem_cache.kv.alloc.iteration_ids import Cols, IterationIds
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -541,7 +541,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For logprob
     top_logprobs_nums: Optional[List[int]] = None
-    token_ids_logprobs: Optional[List[List[int]]] = None
+    token_ids_logprobs: Optional[List[Optional[Union[List[int], TokenIdRows]]]] = None
 
     # For multimodal
     mm_inputs: Optional[List[MultimodalInputs]] = None
