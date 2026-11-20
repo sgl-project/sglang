@@ -9,7 +9,9 @@ its expert group from WORLD_SIZE; local rank only selects the CUDA device.
 
 Set TEST_NATIVE_MXFP4=1 to test native MXFP4 weights with an explicit
 SGLANG_FLASHINFER_RDMA_NVFP4_GLOBAL_SCALE (for example, 1.0). Set
-SGLANG_FLASHINFER_RDMA_WIRE_DTYPE=bf16 only for the explicit BF16 baseline.
+SGLANG_FLASHINFER_RDMA_WIRE_DTYPE=bf16 for BF16 combine; set
+SGLANG_FLASHINFER_RDMA_DISPATCH_DTYPE=mxfp8 for native MXFP8 raw dispatch.
+Without the override, WIRE_DTYPE controls both directions.
 
 Tests non-unit routing weights, uneven/empty ranks, eager prefill fallback and
 CUDA-graph replay with changing inputs, routes and weights. Source-order direct
@@ -38,10 +40,82 @@ def _decode_nvfp4(packed, block_scales, global_scale):
     return values * scales.repeat_interleave(16, dim=-1)
 
 
+def _check_bf16_sum(actual, partials):
+    """Check BF16 sum against independently gathered inputs, not another NCCL sum.
+
+    Any reduction tree of n BF16 inputs uses at most n-1 rounded additions.
+    With u=2^-8, |fl(sum)-sum| <= gamma_(n-1) * sum(abs(inputs)).
+    The final BF16 store is part of those additions, not an extra tolerance.
+    """
+    assert actual.dtype == partials.dtype == torch.bfloat16
+    assert partials.shape[1:] == actual.shape and partials.shape[0] >= 2
+    assert bool(torch.isfinite(actual).all() and torch.isfinite(partials).all())
+    n = partials.shape[0]
+    u = 2.0**-8
+    assert (n - 1) * u < 1
+    wide = partials.double()
+    reference = wide.sum(0)
+    absolute_sum = wide.abs().sum(0)
+    infinity = torch.full_like(absolute_sum, float("inf"))
+
+    def upward(value):
+        return torch.nextafter(value, infinity)
+
+    gamma = math.nextafter(((n - 1) * u) / (1 - (n - 1) * u), math.inf)
+    u64 = 2.0**-53
+    gamma64 = math.nextafter(((n - 1) * u64) / (1 - (n - 1) * u64), math.inf)
+    # FP64 sum is an independent, high-precision reference, not assumed exact.
+    # Recover an upper bound on the true sum(abs(inputs)), then cover both the
+    # BF16 reduction and FP64 reference rounding. Every budget operation rounds
+    # outward; there is no fixed epsilon, atol or extra BF16 final-cast budget.
+    denominator = math.nextafter(1.0 - gamma64, -math.inf)
+    absolute_sum_upper = upward(absolute_sum / denominator)
+    bound = upward(
+        upward(gamma * absolute_sum_upper) + upward(gamma64 * absolute_sum_upper)
+    )
+    error = (actual.double() - reference).abs()
+    # The subtraction also rounds in FP64. Its next lower value cannot exceed
+    # the true difference, so this comparison does not reject valid roundoff.
+    error_lower = torch.nextafter(error, -infinity).clamp_min(0)
+    if bool((error_lower > bound).any()):
+        raise AssertionError(
+            "BF16 reduction exceeds its input-dependent roundoff bound"
+        )
+    return float(error.max()) if error.numel() else 0.0
+
+
+def _check_bf16_sum_negative_controls(ep):
+    # Disjoint rank signatures and row powers of two: each nonzero output is
+    # exactly representable. Wrong owners/rows and dropped/duplicated inputs
+    # change a signature by much more than gamma*sumabs, even at EP32.
+    rows = 2 * ep
+    parts = torch.zeros((ep, rows, ep), dtype=torch.bfloat16)
+    for rank in range(ep):
+        parts[rank, :, rank] = torch.pow(2.0, torch.arange(rows) % 16 + rank % 16).to(
+            torch.bfloat16
+        )
+    exact = parts.double().sum(0).to(torch.bfloat16)
+    _check_bf16_sum(exact, parts)
+    corruptions = {
+        # Two consecutive rows belong to one source owner in this fixture.
+        "wrong_owner": exact.roll(2, 0),
+        "wrong_row": exact.roll(1, 0),
+        "missing_rank": (exact.double() - parts[ep // 2].double()).to(torch.bfloat16),
+        "duplicate_rank": (exact.double() + parts[ep // 2].double()).to(torch.bfloat16),
+    }
+    for name, corrupted in corruptions.items():
+        try:
+            _check_bf16_sum(corrupted, parts)
+        except AssertionError:
+            continue
+        raise AssertionError(f"BF16 sum negative control was accepted: {name}")
+
+
 def main():
     ep = int(os.environ.get("WORLD_SIZE", "1"))
     if ep < 2:
         raise ValueError("Run with torchrun and at least two ranks")
+    _check_bf16_sum_negative_controls(ep)
     native_mxfp4 = os.environ.get("TEST_NATIVE_MXFP4") == "1"
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -58,6 +132,7 @@ def main():
     from flashinfer.fused_moe.core import ActivationType
 
     from sglang.srt.distributed.parallel_state import GroupCoordinator
+    from sglang.srt.environ import envs
     from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
     from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
         FlashInferCutlassMoeQuantInfo,
@@ -109,6 +184,11 @@ def main():
     hidden, experts, intermediate, topk, capacity = (
         (5120, 384, 384, 6, 54) if native_mxfp4 else (4096, 288, 128, 8, 68)
     )
+    capacity = int(os.environ.get("TEST_CAPACITY", capacity))
+    intermediate = int(os.environ.get("TEST_INTERMEDIATE", intermediate))
+    tokens = int(os.environ.get("TEST_TOKENS", "8"))
+    if not 1 <= tokens <= capacity:
+        raise ValueError("TEST_TOKENS must be positive and fit TEST_CAPACITY")
     if experts % ep:
         raise ValueError(
             f"The test's {experts} experts must divide evenly across {ep} ranks"
@@ -199,7 +279,7 @@ def main():
         else [scale, sf13.view(torch.int32), alpha, scale, sf2.view(torch.int32), alpha]
     )
 
-    def direct(x, sf, ids, weights):
+    def direct(x, sf, ids, weights, *, reduce=True):
         out = torch.zeros((x.shape[0], hidden), device=device, dtype=torch.bfloat16)
         if x.shape[0]:
             if native_mxfp4:
@@ -222,19 +302,18 @@ def main():
                 activation_type=ActivationType.Swiglu,
                 enable_alltoall=False,
                 use_mxfp8_act_scaling=native_mxfp4,
-                use_fused_finalize=True,
+                use_fused_finalize=envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get(),
             )
-            dist.all_reduce(out, group=group.device_group)
+            if reduce:
+                dist.all_reduce(out, group=group.device_group)
         return out
 
-    def oracle(global_x, routes, weights, decode):
+    def decode_oracle(global_x, routes, weights):
         n = global_x.shape[0]
         if not n:
             return torch.empty((0, hidden), device=device, dtype=torch.bfloat16)
-        if not decode:
-            return direct(global_x, None, routes, weights)
         if native_mxfp4:
-            if dispatcher.wire_dtype == "nvfp4":
+            if dispatcher.dispatch_dtype == "nvfp4":
                 globals_ = torch.full(
                     (n, 1), dispatcher.wire_global_scale, device=device
                 )
@@ -252,7 +331,7 @@ def main():
         expert = direct(
             q, sf, routes.reshape(-1, 1), torch.ones((n * topk, 1), device=device)
         )
-        if dispatcher.wire_dtype == "nvfp4":
+        if dispatcher.combine_dtype == "nvfp4":
             amax = expert.float().abs().amax(-1, keepdim=True)
             output_scale = torch.where(amax > 0, 2688.0 / amax.clamp_min(1e-20), 1.0)
             wire, blocks = dispatcher.state.buffer.quantize_bf16_to_nvfp4(
@@ -270,19 +349,63 @@ def main():
             )
         return expected.to(torch.bfloat16)
 
-    def check(actual, expected, name, phase):
-        torch.cuda.synchronize()
-        error = (
-            float((actual.float() - expected.float()).abs().max())
-            if actual.numel()
-            else 0.0
+    latest_dispatch = None
+    latest_partial = None
+
+    def check_mxfp8_bytes(global_x, sizes):
+        if dispatcher.dispatch_dtype != "mxfp8":
+            return
+        state = dispatcher.state
+        counts = state.outputs[2].cpu().tolist()
+        source_ids = state.outputs[3].cpu()
+        ranges = state.outputs[4].cpu()
+        reference = torch.zeros_like(state.packed, dtype=torch.bfloat16)
+        offset = 0
+        for expert, count in enumerate(counts):
+            for source in range(ep):
+                encoded = int(ranges[expert, source])
+                length, begin = encoded & 0xFFFFFFFF, encoded >> 32
+                if length:
+                    source_rows = (
+                        source_ids[expert, begin : begin + length].long().to(device)
+                    )
+                    source_rows += sum(sizes[:source])
+                    reference[offset + begin : offset + begin + length] = global_x[
+                        source_rows
+                    ]
+            offset += count
+        q, sf = mxfp8_quantize(reference, is_sf_swizzled_layout=True, alignment=32)
+        torch.testing.assert_close(
+            state.packed[:offset], q.view(torch.uint8)[:offset], rtol=0, atol=0
         )
-        if not torch.isfinite(actual).all():
-            raise AssertionError("non-finite output")
-        # Compacted and source-order grouped GEMMs can select different tactics;
-        # communication is additionally NVFP4. Bound ordinary rounding while
-        # the non-unit routing weights reject duplicate or missing weighting.
-        torch.testing.assert_close(actual, expected, rtol=0.04, atol=0.006)
+        mask = torch.zeros_like(state.packed_sf)
+        mask[:offset] = 1
+        mask = nvfp4_block_scale_interleave(mask).bool()
+        torch.testing.assert_close(
+            latest_dispatch.hidden_states_scale[mask], sf[mask], rtol=0, atol=0
+        )
+        assert torch.count_nonzero(state.packed[offset:]) == 0
+        assert torch.count_nonzero(state.packed_sf[offset:]) == 0
+
+    def check(actual, expected, name, phase, *, partials=None):
+        torch.cuda.synchronize()
+        if phase.startswith("decode"):
+            check_mxfp8_bytes(all_x, sizes)
+        if partials is not None:
+            # Prefill error is relative to independent FP64 sum, rather than
+            # another BF16 collective with a different reduction tree.
+            error = _check_bf16_sum(actual, partials)
+        else:
+            error = (
+                float((actual.float() - expected.float()).abs().max())
+                if actual.numel()
+                else 0.0
+            )
+            if not torch.isfinite(actual).all():
+                raise AssertionError("non-finite output")
+            # Compacted and source-order grouped GEMMs can select different
+            # tactics; NVFP4 communication adds quantization error.
+            torch.testing.assert_close(actual, expected, rtol=0.04, atol=0.006)
         gathered = [None] * ep
         dist.all_gather_object(gathered, error)
         if rank == 0:
@@ -297,7 +420,8 @@ def main():
                         "native_dispatcher": True,
                         "ep_size": ep,
                         "weight_dtype": "mxfp4" if native_mxfp4 else "nvfp4",
-                        "wire_dtype": dispatcher.wire_dtype,
+                        "dispatch_dtype": dispatcher.dispatch_dtype,
+                        "combine_dtype": dispatcher.combine_dtype,
                         "wire_global_scale": dispatcher.wire_global_scale,
                     }
                 ),
@@ -306,9 +430,12 @@ def main():
 
     try:
         for name, sizes in [
-            ("uniform", [8] * ep),
-            ("uneven_empty_rank", [(0, 1, 5, 8)[r % 4] for r in range(ep)]),
-            ("all_invalid", [8] * ep),
+            ("uniform", [tokens] * ep),
+            (
+                "uneven_empty_rank",
+                [min((0, 1, 5, 8)[r % 4], tokens) for r in range(ep)],
+            ),
+            ("all_invalid", [tokens] * ep),
             ("all_empty", [0] * ep),
         ]:
             torch.manual_seed(1234)
@@ -332,8 +459,12 @@ def main():
             top = StandardTopKOutput(weights, ids, None)
 
             def cycle():
+                nonlocal latest_dispatch, latest_partial
                 d = dispatcher.dispatch(x, top)
+                latest_dispatch = d
                 y = expert_fn(d, quant, config)
+                if rdma.get_is_extend_in_batch():
+                    latest_partial = y.hidden_states.clone()
                 return dispatcher.combine(y)
 
             with (
@@ -343,7 +474,7 @@ def main():
                     return_value=4096,
                 ),
             ):
-                gold = oracle(all_x, all_ids, all_weights, True)[begin:end]
+                gold = decode_oracle(all_x, all_ids, all_weights)[begin:end]
                 actual = cycle()
                 check(actual, gold, name, "decode_eager")
                 cycle()
@@ -355,14 +486,14 @@ def main():
                     captured = cycle()
                 torch.cuda.current_stream().wait_stream(stream)
                 for phase in range(2):
-                    all_x.neg_()
-                    x.neg_()
+                    all_x.mul_(-1.75)
+                    x.mul_(-1.75)
                     all_weights.mul_(0.75)
                     weights.mul_(0.75)
                     if name not in ("all_invalid", "all_empty"):
                         all_ids.add_(1).remainder_(experts)
                         ids.copy_(all_ids[begin:end])
-                    gold = oracle(all_x, all_ids, all_weights, True)[begin:end]
+                    gold = decode_oracle(all_x, all_ids, all_weights)[begin:end]
                     graph.replay()
                     check(captured, gold, name, f"decode_graph_{phase}")
                 graph.reset()
@@ -376,9 +507,24 @@ def main():
                         return_value=4096,
                     ),
                 ):
-                    gold = oracle(all_x, all_ids, all_weights, False)[begin:end]
                     actual = cycle()
-                    check(actual, gold, name, "prefill_eager")
+                    reference_partial = direct(
+                        all_x, None, all_ids, all_weights, reduce=False
+                    )
+                    torch.testing.assert_close(
+                        latest_partial, reference_partial, rtol=0, atol=0
+                    )
+                    pieces = [torch.empty_like(reference_partial) for _ in range(ep)]
+                    # Transfer independent source-order partials unchanged;
+                    # the reference never uses production combine arithmetic.
+                    dist.all_gather(pieces, reference_partial, group=group.device_group)
+                    check(
+                        actual,
+                        None,
+                        name,
+                        "prefill_eager",
+                        partials=torch.stack(pieces)[:, begin:end],
+                    )
         if rank == 0:
             print("NATIVE_RDMA_CUTLASS_GATE_PASS", flush=True)
     finally:

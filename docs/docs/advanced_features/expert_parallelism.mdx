@@ -180,19 +180,28 @@ target model still uses RDMA during verification. Overlap, dynamic expert
 placement, redundant experts, EPLB, elastic EP and paged experts are not
 supported by this backend.
 
-ModelOpt experts use NVFP4 in both communication directions. Native MXFP4
-experts support either BF16/BF16 or NVFP4/NVFP4 communication, selected with
-`SGLANG_FLASHINFER_RDMA_WIRE_DTYPE=bf16|nvfp4` (default: `nvfp4`). Mixed
-dispatch/combine dtypes are not exposed. NVFP4 communication is lossy;
-validate model quality for your workload before deployment.
+`SGLANG_FLASHINFER_RDMA_WIRE_DTYPE=bf16|nvfp4` (default: `nvfp4`) selects
+combine precision and, unless overridden, dispatch precision. ModelOpt experts
+require NVFP4 dispatch. Native MXFP4 experts support BF16 or NVFP4 dispatch,
+and the generic dispatch extension to the FlashInfer dependency adds raw MXFP8.
+
+With that extension, set
+`SGLANG_FLASHINFER_RDMA_DISPATCH_DTYPE=bf16|nvfp4|mxfp8` to select dispatch
+independently of combine. The `mxfp8` option requires native MXFP4 experts: it
+quantizes activations once before dispatch and passes their data and UE8M0 scales
+directly to CUTLASS. Leaving the override unset preserves the original matched
+BF16/BF16 or NVFP4/NVFP4 paths. NVFP4 communication is lossy; validate model
+quality for your workload before deployment.
 
 #### DeepSeek V4.1 with native MXFP4 experts
 
 Use a FlashInfer build that includes H5120 support in both the RDMA kernels
 and quantization helpers from PR #9449. Native MXFP4 weights and their E8M0
-scales are preserved. The SM120 CUTLASS runner quantizes expert activations
-to MXFP8. With NVFP4 communication, received rows are first dequantized to
-BF16; NVFP4 block scales are not reinterpreted as MXFP4 scales.
+scales are preserved. Expert activations use MXFP8 in the SM120 CUTLASS runner.
+With NVFP4 dispatch, received rows are first dequantized to BF16 and then
+quantized to MXFP8; NVFP4 block scales are not reinterpreted as MXFP4 scales.
+Raw MXFP8 dispatch preserves the transmitted activation bytes and scales and
+skips that receive-side dequantization and requantization.
 
 The following single-node example uses BF16 communication. `MODEL_PATH`
 must refer to the native DeepSeek V4.1 checkpoint with FP8 dense weights and

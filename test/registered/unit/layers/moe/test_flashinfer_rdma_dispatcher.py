@@ -1,4 +1,5 @@
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -8,6 +9,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.moe.token_dispatcher.flashinfer import FlashinferCombineInput
 from sglang.srt.layers.moe.token_dispatcher.flashinfer_rdma import (
     FlashinferRdmaDispatcher,
+    _shared_state,
     _validate_parallel_topology,
     close_flashinfer_rdma_buffers,
 )
@@ -53,6 +55,7 @@ class TestFlashinferRdmaDispatcher(CustomTestCase):
             return tensor(*args, **kwargs)
 
         with (
+            envs.SGLANG_FLASHINFER_RDMA_DISPATCH_DTYPE.override(None),
             patch(f"{MODULE}.get_parallel", return_value=parallel),
             patch(
                 f"{MODULE}.dist.get_process_group_ranks", return_value=list(range(4))
@@ -73,7 +76,8 @@ class TestFlashinferRdmaDispatcher(CustomTestCase):
                     dispatcher = FlashinferRdmaDispatcher(
                         group, 6, 384, 96, 5120, config, 54
                     )
-                    self.assertEqual(shared.call_args.kwargs["wire_dtype"], wire)
+                    self.assertEqual(shared.call_args.kwargs["dispatch_dtype"], wire)
+                    self.assertEqual(shared.call_args.kwargs["combine_dtype"], wire)
                     dispatcher.set_quant_config({})
                     if wire == "nvfp4":
                         expected = tensor(0.1, dtype=torch.float32).item()
@@ -94,6 +98,133 @@ class TestFlashinferRdmaDispatcher(CustomTestCase):
                 ):
                     FlashinferRdmaDispatcher(group, 6, 384, 96, 5120, config, 54)
             self.assertEqual(shared.call_count, 2)
+
+    def test_dispatch_layout_and_combine_codec_are_independent(self):
+        module = "flashinfer.comm.rdma_moe_alltoall"
+        buffer = Mock()
+        fake = SimpleNamespace(
+            RdmaMoeAlltoAll=buffer,
+            RdmaMoeAlltoAllConfig=lambda **kwargs: SimpleNamespace(**kwargs),
+            RdmaDispatchLayout=lambda data, scales: SimpleNamespace(
+                data_bytes=data, scale_bytes=scales
+            ),
+        )
+        resources = SimpleNamespace(buffers={})
+        group = Mock()
+        group.size.return_value = 4
+        cpu = torch.device("cpu")
+        with (
+            patch.dict("sys.modules", {module: fake}),
+            patch(f"{MODULE}.get_resources", return_value=resources),
+            patch(f"{MODULE}.torch.cuda.current_device", return_value=0),
+            patch(f"{MODULE}.torch.device", return_value=cpu),
+        ):
+            states = []
+            for dispatch in ("bf16", "nvfp4", "mxfp8"):
+                for combine in ("bf16", "nvfp4"):
+                    state = _shared_state(
+                        group,
+                        hidden=64,
+                        num_experts=8,
+                        topk=2,
+                        capacity=8,
+                        dispatch_dtype=dispatch,
+                        combine_dtype=combine,
+                    )
+                    states.append(state)
+                    config = buffer.call_args.kwargs["config"]
+                    self.assertEqual(config.communication_dtype, combine)
+                    if dispatch == "mxfp8":
+                        self.assertEqual(config.dispatch_layout.data_bytes, 64)
+                        self.assertEqual(config.dispatch_layout.scale_bytes, 2)
+                        self.assertEqual(state.packed.shape, (64, 64))
+                        self.assertEqual(state.packed_sf.shape, (64, 2))
+                        self.assertEqual(state.packed.dtype, torch.uint8)
+                    elif dispatch != combine:
+                        self.assertEqual(config.dispatch_dtype, dispatch)
+            self.assertEqual(len({id(s) for s in states}), 6)
+            self.assertIs(
+                _shared_state(
+                    group,
+                    hidden=64,
+                    num_experts=8,
+                    topk=2,
+                    capacity=8,
+                    dispatch_dtype="mxfp8",
+                    combine_dtype="nvfp4",
+                ),
+                states[-1],
+            )
+            self.assertEqual(buffer.call_count, 6)
+
+    def test_mxfp8_runner_uses_transmitted_scales_without_requantization(self):
+        from sglang.srt.layers.moe.moe_runner import flashinfer_cutlass as runner
+        from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
+            FlashinferDispatchOutput,
+        )
+        from sglang.srt.layers.moe.topk import StandardTopKOutput
+
+        hidden = torch.zeros((3, 64), dtype=torch.float8_e4m3fn)
+        scales = torch.ones(128 * 4, dtype=torch.uint8)
+        weights = torch.zeros((1, 8, 32), dtype=torch.uint8)
+        weight_scales = torch.ones((1, 8, 4), dtype=torch.uint8)
+        quant = runner.FlashInferCutlassMxfp4MoeQuantInfo(
+            weights,
+            weights,
+            weight_scales,
+            weight_scales,
+            mxfp4_weight_global_scale=torch.ones(1),
+        )
+        topk = StandardTopKOutput(
+            torch.ones(3, 1), torch.zeros((3, 1), dtype=torch.int32), None
+        )
+        dispatch = FlashinferDispatchOutput(hidden, scales, topk, None, torch.bfloat16)
+        config = SimpleNamespace(
+            moe_tp_size=1, moe_tp_rank=0, moe_ep_size=4, moe_ep_rank=0
+        )
+        quantize = Mock(return_value=(hidden, scales))
+        compute = Mock()
+        with (
+            patch.dict(
+                "sys.modules", {"flashinfer": SimpleNamespace(mxfp8_quantize=quantize)}
+            ),
+            patch.object(
+                runner,
+                "_flashinfer_cutlass_fused_moe",
+                return_value=(compute, SimpleNamespace(Swiglu=0, SwigluStep=1)),
+            ),
+            patch.object(runner, "use_symmetric_memory", return_value=nullcontext()),
+            patch.object(
+                runner, "get_parallel", return_value=SimpleNamespace(tp_group=None)
+            ),
+            patch.object(runner, "is_allocation_symmetric", return_value=False),
+            patch.object(runner, "_cutlass_moe_tune_max_num_tokens", return_value=4096),
+        ):
+            result = runner.fused_experts_rdma_to_flashinfer_mxfp4(
+                dispatch, quant, config
+            )
+            self.assertEqual(result.hidden_states.dtype, torch.bfloat16)
+            self.assertIs(compute.call_args.kwargs["input"], hidden)
+            self.assertIs(compute.call_args.kwargs["input_sf"], scales)
+            quantize.assert_not_called()
+            for bad_scales in (None, scales[:128], scales.float()):
+                with self.assertRaisesRegex(ValueError, "Prequantized MXFP8"):
+                    runner.fused_experts_rdma_to_flashinfer_mxfp4(
+                        dispatch._replace(hidden_states_scale=bad_scales), quant, config
+                    )
+            runner.fused_experts_rdma_to_flashinfer_mxfp4(
+                dispatch._replace(
+                    hidden_states=hidden.to(torch.bfloat16), hidden_states_scale=None
+                ),
+                quant,
+                config,
+            )
+            quantize.assert_called_once()
+            empty = runner.fused_experts_rdma_to_flashinfer_mxfp4(
+                dispatch._replace(hidden_states=hidden[:0]), quant, config
+            )
+            self.assertEqual(empty.hidden_states.shape, (0, 64))
+            self.assertEqual(empty.hidden_states.dtype, torch.bfloat16)
 
     def test_topology_requires_matching_token_and_expert_owners(self):
         for ep in (4, 8, 16, 32):

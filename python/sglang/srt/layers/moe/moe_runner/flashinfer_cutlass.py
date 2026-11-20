@@ -498,13 +498,15 @@ def fused_experts_rdma_to_flashinfer_mxfp4(
         raise TypeError(
             "FlashInfer RDMA native MXFP4 requires the SM120 CUTLASS runner"
         )
-    if dispatch_output.hidden_states.dtype != torch.bfloat16:
-        raise TypeError("Native MXFP4 RDMA bridge must provide dequantized BF16 rows")
+    if dispatch_output.hidden_states.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+        raise TypeError("Native MXFP4 RDMA requires BF16 or prequantized MXFP8 rows")
     # Decode rows retain global expert IDs and unit weights. Prefill retains
     # original route weights. The existing EP finalize also zeros padding rows.
     result = _fused_experts_flashinfer_mxfp4_cutlass(
         StandardDispatchOutput(
-            dispatch_output.hidden_states, None, dispatch_output.topk_output
+            dispatch_output.hidden_states,
+            dispatch_output.hidden_states_scale,
+            dispatch_output.topk_output,
         ),
         quant_info,
         runner_config,
@@ -522,7 +524,7 @@ def _fused_experts_flashinfer_mxfp4_cutlass(
 
     x = dispatch_output.hidden_states
     if x.shape[0] == 0:
-        return StandardCombineInput(hidden_states=x)
+        return StandardCombineInput(hidden_states=x.to(torch.bfloat16))
 
     flashinfer_cutlass_fused_moe, ActivationType = _flashinfer_cutlass_fused_moe()
 
@@ -542,6 +544,10 @@ def _fused_experts_flashinfer_mxfp4_cutlass(
     padded_hidden = quant_info.padded_hidden
     do_pad = padded_hidden is not None and padded_hidden != origin_hidden
     if do_pad:
+        if x.dtype == torch.float8_e4m3fn:
+            raise ValueError(
+                "Prequantized MXFP8 activations must include hidden padding"
+            )
         x = torch.nn.functional.pad(
             x,
             (0, padded_hidden - origin_hidden),
@@ -567,17 +573,39 @@ def _fused_experts_flashinfer_mxfp4_cutlass(
         )
     if use_wfp4afp8_humming and use_mxfp8_act_scaling:
         raise ValueError("SM90 Humming and SM120 MXFP8 scaling are mutually exclusive.")
-    input_sf = None
+    input_sf = dispatch_output.hidden_states_scale
+    if x.dtype == torch.float8_e4m3fn:
+        expected_sf_size = ((x.shape[0] + 127) // 128 * 128) * (
+            (x.shape[1] // 32 + 3) // 4 * 4
+        )
+        if (
+            weight_global_scale is None
+            or do_pad
+            or input_sf is None
+            or input_sf.dtype != torch.uint8
+            or input_sf.ndim != 1
+            or x.shape[1] % 32
+            or not input_sf.is_contiguous()
+            or input_sf.device != x.device
+            or input_sf.numel() != expected_sf_size
+            or not x.is_contiguous()
+        ):
+            raise ValueError(
+                "Prequantized MXFP8 requires native SM120 weights and padded 128x4 UE8M0 scales"
+            )
+    elif input_sf is not None:
+        raise ValueError("MXFP4 BF16 activations must not carry prequantized scales")
     fc1_expert_weights = quant_info.w13_weight
     fc2_expert_weights = quant_info.w2_weight
     if weight_global_scale is not None:
         from flashinfer import mxfp8_quantize
 
-        x, input_sf = mxfp8_quantize(
-            x,
-            is_sf_swizzled_layout=True,
-            alignment=32,
-        )
+        if x.dtype != torch.float8_e4m3fn:
+            x, input_sf = mxfp8_quantize(
+                x,
+                is_sf_swizzled_layout=True,
+                alignment=32,
+            )
         fc1_expert_weights = fc1_expert_weights.view(torch.int64)
         fc2_expert_weights = fc2_expert_weights.view(torch.int64)
         quant_scales = [

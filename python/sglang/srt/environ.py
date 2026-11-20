@@ -1389,6 +1389,9 @@ class Envs:
 
     # Communication precision is independent of native MXFP4 expert weights.
     SGLANG_FLASHINFER_RDMA_WIRE_DTYPE = EnvStr("nvfp4")
+    # Override dispatch only; WIRE_DTYPE still selects the combine codec.
+    # Native MXFP4 experts can receive MXFP8 data/UE8M0 scales unchanged.
+    SGLANG_FLASHINFER_RDMA_DISPATCH_DTYPE = EnvStr(None)
     # Native MXFP4 checkpoints have no calibrated NVFP4 activation scale.
     # Require an explicit, cross-rank-agreed transport scale for this bridge.
     SGLANG_FLASHINFER_RDMA_NVFP4_GLOBAL_SCALE = EnvFloat(None)
