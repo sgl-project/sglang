@@ -544,6 +544,10 @@ class UnifiedRadixCache(BasePrefixCache):
             self.cache_controller.mem_pool_host.clear()
             self.enable_storage = self.cache_controller.enable_storage
 
+        if self.enable_storage_metrics and self.storage_metrics_collector is not None:
+            self.storage_metrics_collector.clear_hicache_gauges()
+            self._hicache_gauge_last_state = None
+            self._hicache_gauge_last_ts = 0.0
         self.tree_core.kv_events.record_all_cleared()
 
     def init_hicache(self, server_args: ServerArgs, params: CacheInitParams) -> None:
@@ -2615,6 +2619,10 @@ class UnifiedRadixCache(BasePrefixCache):
         self._backup_requested_tokens[operation_id] = (
             len(spec.hash_value) * self.page_size
         )
+        if self.enable_storage_metrics and self.storage_metrics_collector is not None:
+            self.storage_metrics_collector.log_backup_submitted_tokens(
+                self._backup_requested_tokens[operation_id]
+            )
 
     def is_backuped(self, node_id: NodeId) -> bool:
         return self.tree_core.is_backuped(node_id)
@@ -4121,6 +4129,12 @@ class UnifiedRadixCache(BasePrefixCache):
             and self.storage_metrics_collector is not None
         ):
             collector = self.storage_metrics_collector
+            if getattr(operation, "failed", False):
+                collector.log_backup_failed_op(
+                    self.page_size,
+                    operation.unwritten_pages,
+                    getattr(operation, "sidecar_unwritten_by_pool", None),
+                )
             # What this rank wrote of the agreed prefix.
             collector.log_backuped_tokens(
                 min(operation.completed_tokens, agreed_tokens)
@@ -4618,6 +4632,49 @@ class UnifiedRadixCache(BasePrefixCache):
             if not hasattr(storage_metrics, "prefetch_stats"):
                 storage_metrics.prefetch_stats = self.prefetch_outcome_stats_snapshot()
             self.storage_metrics_collector.log_storage_metrics(storage_metrics)
+        self._update_hicache_gauges()
+
+    def _update_hicache_gauges(self) -> None:
+        if not self.enable_storage_metrics or self.storage_metrics_collector is None:
+            return
+        if self.cache_controller is None:
+            return
+        if not self.enable_storage:
+            self.storage_metrics_collector.clear_hicache_gauges()
+            self._hicache_gauge_last_state = None
+            self._hicache_gauge_last_ts = 0.0
+            return
+        cc = self.cache_controller
+        thread = getattr(cc, "backup_thread", None)
+        worker_alive = int(thread is not None and thread.is_alive())
+        # Buffer mode tracks its host->L3 writes on the pipeline instead.
+        ongoing_l3_backup = (
+            self.buffer_pipeline.ongoing_backup
+            if self.buffer_pipeline is not None
+            else self.ongoing_backup
+        )
+        state = (
+            len(self.ongoing_write_through),
+            len(cc.ack_write_queue),
+            len(ongoing_l3_backup),
+            cc.backup_queue.qsize(),
+            cc.ack_backup_queue.qsize(),
+            worker_alive,
+        )
+        now = time.monotonic()
+        last = getattr(self, "_hicache_gauge_last_state", None)
+        last_ts = getattr(self, "_hicache_gauge_last_ts", 0.0)
+        if state != last or (now - last_ts) >= 1.0:
+            self._hicache_gauge_last_state = state
+            self._hicache_gauge_last_ts = now
+            self.storage_metrics_collector.set_hicache_gauges(
+                d2h_pending=state[0],
+                d2h_ack_queue=state[1],
+                l3_pending=state[2],
+                l3_backup_queue=state[3],
+                l3_ack_queue=state[4],
+                worker_alive=state[5],
+            )
 
     def transfers_in_flight(self) -> bool:
         # The buffer-mode pipeline (storage without a host pool) tracks its
