@@ -56,13 +56,12 @@ def _backend(num_heads, q_lens, extended=True):
     return backend
 
 
-def _backend_without_reduce_instance(num_heads, q_lens, extended=True):
-    """The backend as built against an AITER whose compiled mla_reduce_v1 lacks num_heads."""
+def _backend_with_probe(num_heads, q_lens, *, supported, extended=True):
     _aiter_has_mla_reduce_v1_instance.cache_clear()
     try:
         with mock.patch(
             "aiter.ops.attention.mla_reduce_v1_supports",
-            return_value=False,
+            return_value=supported,
             create=True,
         ):
             return _backend(num_heads, q_lens, extended=extended)
@@ -116,6 +115,18 @@ class TestAiterMlaFp8PrefillPs(CustomTestCase):
         lse_err = (lse[rows] - ref_lse[rows]).abs().max().item()
         self.assertLess(lse_err, 1e-2)
 
+    def test_head_count_follows_the_aiter_probe(self):
+        for supported, extended, expected in (
+            (True, True, KIMI_K3_TP8_HEADS),
+            (False, True, 16),
+            (True, False, 16),
+        ):
+            with self.subTest(supported=supported, extended=extended):
+                backend = _backend_with_probe(
+                    KIMI_K3_TP8_HEADS, [1], supported=supported, extended=extended
+                )
+                self.assertEqual(backend.fp8_prefill_num_head, expected)
+
     def test_prefill_heads_match_reference(self):
         """Heads without an mla_reduce_v1 instance pad up to one;
         padding must not perturb the real heads' output or LSE, nor reach a missing instance."""
@@ -133,13 +144,21 @@ class TestAiterMlaFp8PrefillPs(CustomTestCase):
         ):
             with self.subTest(num_heads=num_heads, pad=pad, extended=extended):
                 if pad:
-                    backend = _backend_without_reduce_instance(
-                        num_heads, q_lens, extended=extended
+                    backend = _backend_with_probe(
+                        num_heads, q_lens, supported=False, extended=extended
                     )
                     self.assertEqual(backend.fp8_prefill_num_head, 16)
                 else:
                     backend = _backend(num_heads, q_lens)
-                    self.assertGreaterEqual(backend.fp8_prefill_num_head, num_heads)
+                    if (
+                        _aiter_has_mla_reduce_v1_instance(
+                            num_head=num_heads, head_dim=V_HEAD
+                        )
+                        or num_heads == 16
+                    ):
+                        self.assertEqual(backend.fp8_prefill_num_head, num_heads)
+                    else:
+                        self.assertGreater(backend.fp8_prefill_num_head, num_heads)
                 kv_indptr = torch.zeros(len(kv_lens) + 1, dtype=torch.int32)
                 kv_indptr[1:] = torch.tensor(kv_lens).cumsum(0)
                 ps = backend._build_prefill_ps_metadata(
