@@ -15,9 +15,10 @@
 
 K3 MLA applies no RoPE. The writer runs AITER's fused RoPE/concat/cache kernel, the
 one DeepSeek MLA uses on ROCm (rocm_linear_utils), against one-row identity cos/sin
-tables with all-zero positions, which leaves Q and the cache bytes equal to the
-split concat/cache chain's. Where the attention backend reads an FP8 query padded
-to its kernel head count (mla_fp8_q_out), the same launch casts Q into that buffer.
+tables with all-zero positions, which leaves finite Q and cache values equal to the
+split concat/cache chain's (a -0.0 PE lane can come out as +0.0). Where the attention
+backend reads an FP8 query padded to its kernel head count (mla_fp8_q_out), the same
+launch casts Q into that buffer.
 
 kimi_k3 calls create_q_cache_writer on every platform; this module alone decides
 where the fused write runs (fused_q_cache_available) and returns None elsewhere.
@@ -259,17 +260,17 @@ class KimiK3RocmMlaQCacheWriter:
         if fp8_q is not None:
             _check_fp8_q_out(fp8_q, q_nope=q_nope, head_dim=self._head_dim)
         q, _, _, _ = self._fused_rope_cat_and_cache(
-            q_nope,
-            q_pe,
-            k_nope,
-            k_pe,
-            kv_cache,
-            slot_mapping,
-            positions,
-            cos,
-            sin,
-            unit_scale,
-            True,  # is_neox; identity tables make the layout moot
+            q_nope=q_nope,
+            q_pe=q_pe,
+            k_nope=k_nope,
+            k_pe=k_pe,
+            kv_cache=kv_cache,
+            slot_mapping=slot_mapping,
+            pos=positions,
+            cos=cos,
+            sin=sin,
+            k_scale=unit_scale,
+            is_neox=True,  # identity tables make the layout moot
             # The kernel casts unscaled and saturating, which is the asm verify's
             # static FP8 quant at its unit q scale; the pad heads stay zero.
             q_out=None if fp8_q is None else fp8_q[:, : q_nope.shape[1]],
