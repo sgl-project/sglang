@@ -92,6 +92,9 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
 )
 from sglang.multimodal_gen.runtime.utils.precision_types import PRECISION_TO_TYPE
+from sglang.multimodal_gen.runtime.weights.hub_file_model import (
+    apply_hub_file_model_path,
+)
 from sglang.multimodal_gen.runtime.weights.source import (
     is_explicit_weight_file_reference,
 )
@@ -3811,6 +3814,9 @@ class ServerArgs(DisaggServerArgsMixin):
         explicit_arg_names = kwargs.get("_explicit_arg_names")
         if explicit_arg_names is None:
             explicit_arg_names = set(kwargs)
+        explicit_arg_names = set(explicit_arg_names)
+        kwargs = dict(kwargs)
+        hub_file_note = apply_hub_file_model_path(kwargs, explicit_arg_names)
 
         component_paths = dict(kwargs.get("component_paths") or {})
         if component_paths:
@@ -3843,7 +3849,10 @@ class ServerArgs(DisaggServerArgsMixin):
             elif attr in kwargs:
                 server_args_kwargs[attr] = kwargs[attr]
 
-        return cls(**server_args_kwargs)
+        server_args = cls(**server_args_kwargs)
+        if hub_file_note:
+            logger.info(hub_file_note)
+        return server_args
 
     @staticmethod
     def _reject_retired_args(kwargs: dict[str, Any]) -> None:
@@ -3879,6 +3888,7 @@ class ServerArgs(DisaggServerArgsMixin):
             explicit_arg_names = set(kwargs)
         else:
             explicit_arg_names = set(explicit_arg_names)
+        hub_file_note = apply_hub_file_model_path(kwargs, explicit_arg_names)
 
         # Convert backend string to enum if necessary
         if "backend" in kwargs and isinstance(kwargs["backend"], str):
@@ -3890,7 +3900,10 @@ class ServerArgs(DisaggServerArgsMixin):
 
         kwargs["pipeline_config"] = PipelineConfig.from_kwargs(kwargs)
         kwargs["_explicit_arg_names"] = explicit_arg_names
-        return cls(**kwargs)
+        server_args = cls(**kwargs)
+        if hub_file_note:
+            logger.info(hub_file_note)
+        return server_args
 
     @staticmethod
     def get_provided_args(

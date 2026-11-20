@@ -433,6 +433,42 @@ def _match_registered_hf_path(model_path: str) -> Optional[str]:
     return None
 
 
+def get_registered_hf_model_path(model_id: str) -> Optional[str]:
+    """The registered HF id equal to ``model_id``, ignoring case."""
+    _ensure_registry_initialized()
+    model_id = model_id.lower()
+    for registered_hf_id in _MODEL_HF_PATH_TO_NAME:
+        if registered_hf_id.lower() == model_id:
+            return registered_hf_id
+    return None
+
+
+def detect_registered_hf_model_path(name: str) -> Optional[str]:
+    """The registered HF id of the one model family whose detectors match
+    ``name``, or None when no family or more than one matches."""
+    _ensure_registry_initialized()
+    matched = {
+        model_name
+        for model_name, detector in _MODEL_NAME_DETECTORS
+        if detector(name.lower())
+    }
+    if len(matched) != 1:
+        return None
+    (model_name,) = matched
+    for registered_hf_id, registered_name in _MODEL_HF_PATH_TO_NAME.items():
+        if registered_name == model_name:
+            return registered_hf_id
+    return None
+
+
+def get_registered_pipeline_config_cls(
+    registered_hf_id: str,
+) -> Optional[Type[PipelineConfig]]:
+    _ensure_registry_initialized()
+    config_info = _CONFIG_REGISTRY.get(_MODEL_HF_PATH_TO_NAME.get(registered_hf_id))
+    return config_info.pipeline_config_cls if config_info is not None else None
+
+
 def has_registered_diffusion_model_path(model_path: str) -> bool:
     _ensure_registry_initialized()
     return (

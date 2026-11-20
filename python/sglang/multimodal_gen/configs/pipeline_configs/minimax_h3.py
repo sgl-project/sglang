@@ -39,6 +39,9 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
     # generic TI2V image resize would both duplicate that work and overwrite
     # the already-resolved target canvas.
     skip_input_image_preprocess: bool = True
+    # Comfy-style single files name their partition, as the loader's
+    # validate_minimax_h3_checkpoint_variant expects.
+    weight_file_model_variants = ("fl2va", "ref2va")
     native_only_components: tuple[str, ...] = (
         "text_encoder",
         "transformer",
@@ -364,6 +367,8 @@ def vsa_h3_execution_supported(
 class FastH3PipelineConfig(MiniMaxH3PipelineConfig):
     """FastH3 8-Step V2: VSA-distilled MiniMax-H3, t2va only."""
 
+    # one weight partition; validate_server_args rejects --model-variant
+    weight_file_model_variants = ()
     # The checkpoint's trained sparsity (fastvideo_inference.json).
     vsa_sparsity: float = 0.8
 

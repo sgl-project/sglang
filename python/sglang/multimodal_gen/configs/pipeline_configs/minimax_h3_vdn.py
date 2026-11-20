@@ -19,6 +19,9 @@ class VDNH3PipelineConfig(MiniMaxH3PipelineConfig):
     distill; t2va and fl2va on one fl2va partition): the deployment envelope;
     the arch config comes from the materialized ``transformer/config.json``."""
 
+    # one weight partition; validate_server_args rejects --model-variant
+    weight_file_model_variants = ()
+
     def validate_quality_deployment(self, server_args) -> None:
         raise ValueError(
             'quality="high" is audited only for the base MiniMax-H3 50-step '
