@@ -669,7 +669,11 @@ def launch_context(server_cls, cores=(None, None)):
             server_module,
             "get_serving",
             return_value=SimpleNamespace(
-                host="::", port=30000, warmups=None, api_key=None
+                host="::",
+                port=30000,
+                warmups=None,
+                api_key=None,
+                tokenizer_backend="auto",
             ),
         ),
         patch.object(
