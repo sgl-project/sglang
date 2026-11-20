@@ -621,6 +621,7 @@ class TestMiniMaxM31Nvfp4Backend(CustomTestCase):
         )
         runner = SimpleNamespace(
             token_to_kv_pool=pool,
+            device="cpu",
             req_to_token_pool=SimpleNamespace(req_to_token=torch.zeros(1, 128)),
             model_config=SimpleNamespace(
                 context_len=128, hf_config=config, hf_text_config=config
@@ -632,6 +633,7 @@ class TestMiniMaxM31Nvfp4Backend(CustomTestCase):
             patch.object(
                 backend, "msa_v1_qmul4_decode_capability", return_value=(True, None)
             ),
+            patch.object(backend, "make_msa_v1_indexer_decode_cp", return_value=None),
         ):
             attention = backend.MiniMaxSparseNvfp4AttnBackend(runner)
         self.assertEqual(attention.speculative_num_draft_tokens, 8)
@@ -669,6 +671,7 @@ class TestMiniMaxM31Nvfp4Backend(CustomTestCase):
         obj._msa_v1_num_q_heads, obj._msa_v1_num_kv_heads = 32, 2
         obj._msa_v1_num_index_heads = 2
         obj._msa_v1_index_fp8_scratch = None
+        obj._msa_v1_indexer_cp = None
         obj._msa_v1_cuda_graph_plans = {}
         obj._msa_v1_cuda_graph_attention_plans = {}
         obj.forward_metadata = SimpleNamespace()

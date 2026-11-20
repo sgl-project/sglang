@@ -10,6 +10,7 @@ import importlib.metadata
 import logging
 import math
 import os
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -19,6 +20,11 @@ from sglang.kernels.ops.kvcache.msa_v1_compact_dequant import (
     dequant_nvfp4_page_table,
     gather_dequant_nvfp4_topk_pages_pair,
 )
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.attention.minimax_sparse_ops.msa_indexer_decode_cp import (
+        MSAV1IndexerDecodeCP,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -254,6 +260,7 @@ class MSAV1DecodeIndexerPlan:
         num_index_heads: int = 1,
         prefer_qmul4: bool = True,
         fp8_fallback_scratch: torch.Tensor | None = None,
+        indexer_cp: MSAV1IndexerDecodeCP | None = None,
     ) -> None:
         self.num_index_heads = _check_index_heads(num_index_heads)
         if prefer_qmul4:
@@ -364,6 +371,22 @@ class MSAV1DecodeIndexerPlan:
             dtype=torch.int32,
             device=self.device,
         )
+        # Graph buckets only: the CP scorer reuses this bucket's lengths and the
+        # stock wrapper's (then unused) score buffer.
+        self.indexer_cp_plan = (
+            indexer_cp.new_plan(
+                batch_size=self.batch_size,
+                query_length=self.query_length,
+                max_pages=self.max_pages,
+                num_valid_pages=self.shared_plans[0]._num_valid_pages,
+                full_scores=self.wrappers[0]._proxy_scores,
+            )
+            if indexer_cp is not None
+            and self.use_cuda_graph
+            and self.use_qmul4
+            and len(self.chunks) == 1
+            else None
+        )
 
     def plan(self, page_table: torch.Tensor, final_seq_lens: torch.Tensor) -> None:
         if tuple(page_table.shape) != (self.batch_size, self.max_pages):
@@ -389,6 +412,13 @@ class MSAV1DecodeIndexerPlan:
                 self.wrappers[chunk_idx].plan(self.page_table, seq_lens, **kwargs)
             if self.fp8_wrappers:
                 self.fp8_wrappers[chunk_idx].plan(self.page_table, seq_lens, **kwargs)
+        self._refresh_indexer_cp()
+
+    def _refresh_indexer_cp(self) -> None:
+        if self.indexer_cp_plan is not None:
+            self.indexer_cp_plan.refresh(
+                page_table=self.page_table, final_seq_lens=self.final_seq_lens
+            )
 
     def refresh(
         self,
@@ -428,6 +458,7 @@ class MSAV1DecodeIndexerPlan:
         # Each MSA schedule reads the chunk lengths just written.
         for shared_plan in self.shared_plans:
             shared_plan.update()
+        self._refresh_indexer_cp()
 
     def run(
         self,
@@ -461,6 +492,14 @@ class MSAV1DecodeIndexerPlan:
                     "MSA-v1 indexer out must match the topk shape, device and int32 dtype"
                 )
             result = out
+        if self.indexer_cp_plan is not None and self.use_qmul4 and out is not None:
+            self.indexer_cp_plan.run(
+                q=q,
+                packed_k_cache=packed_k_cache,
+                k_scale=k_scale,
+                out=result.permute(1, 0, 2),
+            )
+            return result
         q_bqhd = q.view(self.batch_size, self.query_length, self.num_index_heads, 128)
         scale_fp8 = k_scale.view(torch.float8_e4m3fn)
         if self.use_qmul4:
