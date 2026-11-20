@@ -60,6 +60,7 @@ def get_moe_configs(
     block_k: Optional[int] = 0,
     per_channel_quant: bool = False,
     down_moe: bool = False,
+    reuse_up_config: bool = True,
 ) -> Optional[Dict[int, Any]]:
     """
     Return optimized configurations for the fused MoE kernel.
@@ -140,6 +141,8 @@ def get_moe_configs(
                 return {int(key): val for key, val in json.load(f).items()}
 
     if down_moe:
+        if not reuse_up_config:
+            return None
         # A separate down-projection config enables the TMA path, but it is
         # optional. Reuse a tuned up-projection config when it is absent so
         # the second GEMM does not silently fall back to the heuristic.
@@ -275,6 +278,7 @@ def try_get_optimal_moe_config(
     from sglang.srt.layers.moe.moe_runner.triton_utils import (
         get_config,
         get_config_lookup,
+        get_down_config,
     )
 
     lookup = get_config_lookup()
@@ -285,6 +289,10 @@ def try_get_optimal_moe_config(
     override_config = get_config()
     if override_config:
         config = override_config
+        override_down_config = get_down_config()
+        if return_down_config and override_down_config is not None:
+            down_config = dict(override_down_config)
+            max_block_m = down_config["BLOCK_SIZE_M"]
     else:
         # First try to load optimal config from the file
         E, _, N = w2_shape

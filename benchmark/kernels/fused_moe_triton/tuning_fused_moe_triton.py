@@ -6,7 +6,7 @@ import json
 import time
 from contextlib import nullcontext
 from datetime import datetime
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import ray
 import torch
@@ -42,6 +42,31 @@ _is_hip = is_hip()
 _is_xpu = is_xpu()
 
 
+def get_runtime_down_config(
+    num_tokens: int,
+    num_experts: int,
+    shard_intermediate_size: int,
+    dtype_str: Optional[str],
+    per_channel_quant: bool,
+    block_shape: Optional[List[int]],
+) -> Optional[Dict[str, Any]]:
+    """The `_down` config the server pairs with any up config at this batch size, or
+    None when no `_down` config file exists and the server reuses the up config."""
+    down_configs = get_moe_configs(
+        num_experts,
+        shard_intermediate_size // 2,
+        dtype_str,
+        block_shape[0] if block_shape else 0,
+        block_shape[1] if block_shape else 0,
+        per_channel_quant=per_channel_quant,
+        down_moe=True,
+        reuse_up_config=False,
+    )
+    if down_configs is None:
+        return None
+    return down_configs[min(down_configs.keys(), key=lambda x: abs(x - num_tokens))]
+
+
 def benchmark_config(
     config: BenchmarkConfig,
     num_tokens: int,
@@ -57,6 +82,7 @@ def benchmark_config(
     per_channel_quant: bool,
     block_shape: List[int] = None,
     num_iters: int = 100,
+    down_config: Optional[Dict[str, Any]] = None,
 ) -> float:
     init_dtype = torch.float16 if use_fp8_w8a8 else dtype
     x = torch.randn(num_tokens, hidden_size, dtype=dtype)
@@ -184,7 +210,7 @@ def benchmark_config(
             swiglu_limit=10.0 if is_dsv4 else None,
         )
 
-        with override_config(config):
+        with override_config(config, down_config=down_config):
             fused_moe(
                 x,
                 w1,
@@ -306,6 +332,14 @@ class BenchmarkWorker:
             )
         else:
             config = op_config[min(op_config.keys(), key=lambda x: abs(x - num_tokens))]
+        down_config = get_runtime_down_config(
+            num_tokens,
+            num_experts,
+            shard_intermediate_size,
+            dtype_str,
+            per_channel_quant,
+            block_shape,
+        )
         with torch.cuda.device(self.device_id) if is_hip() else nullcontext():
             kernel_time = benchmark_config(
                 config,
@@ -321,6 +355,7 @@ class BenchmarkWorker:
                 use_int4_w4a16,
                 per_channel_quant,
                 block_shape,
+                down_config=down_config,
             )
         return config, kernel_time
 
@@ -342,6 +377,27 @@ class BenchmarkWorker:
     ) -> Dict[str, int]:
         best_config = None
         best_time = float("inf")
+        dtype_str = get_config_dtype_str(
+            dtype,
+            use_int8_w8a16=use_int8_w8a16,
+            use_int4_w4a16=use_int4_w4a16,
+            use_fp8_w8a8=use_fp8_w8a8,
+            use_int8_w8a8=use_int8_w8a8,
+        )
+        # Each candidate is an up config; the down GEMM keeps the config the server will
+        # pair it with, so the measured time is the one serving will see.
+        down_config = get_runtime_down_config(
+            num_tokens,
+            num_experts,
+            shard_intermediate_size,
+            dtype_str,
+            per_channel_quant,
+            block_shape,
+        )
+        print(
+            f"Tuning batch_size={num_tokens} against down config "
+            f"{down_config if down_config is not None else '(none; down reuses each candidate)'}"
+        )
         with (
             torch.get_device_module().device(self.device_id)
             if _is_xpu or _is_hip
@@ -364,6 +420,7 @@ class BenchmarkWorker:
                         per_channel_quant,
                         block_shape,
                         num_iters=10,
+                        down_config=down_config,
                     )
                 except (triton.runtime.autotuner.OutOfResources, RuntimeError):
                     # Some configurations may be invalid and fail to compile.
