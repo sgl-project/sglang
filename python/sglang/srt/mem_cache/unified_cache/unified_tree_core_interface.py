@@ -220,6 +220,13 @@ class UnifiedTreeCoreInterface(ABC):
         """Hand the queued KV placement events to the Controller."""
         return self.kv_events.take()
 
+    def storage_event_metadata(self, node_id: NodeId) -> dict:
+        """Map the node's storage pages to their BlockStored identities.
+
+        A snapshot for a publishing storage backend; publishes nothing.
+        """
+        return self.kv_events.storage_metadata(self.node_by_id(node_id))
+
     @abstractmethod
     def reset(self) -> None:
         """Drop the entire tree and reinitialize empty state."""

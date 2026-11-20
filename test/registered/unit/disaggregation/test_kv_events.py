@@ -70,6 +70,18 @@ class TestLocalKvEventSource(CustomTestCase):
                 )
                 self._assert_event_received(publisher, source)
 
+    def test_wildcard_bind_reports_the_advertised_host(self):
+        with zmq.Context.instance().socket(zmq.PUB) as probe:
+            port = probe.bind_to_random_port("tcp://127.0.0.1")
+        publisher = self._publisher(endpoint=f"tcp://*:{port}")
+        self.assertEqual(
+            publisher.describe_local_source(64, advertise_host="10.1.2.3")["endpoint"],
+            f"tcp://10.1.2.3:{port}",
+        )
+        self.assertEqual(
+            publisher.describe_local_source(64)["endpoint"], f"tcp://127.0.0.1:{port}"
+        )
+
     def _assert_event_received(self, publisher, source):
         with zmq.Context() as context, context.socket(zmq.SUB) as subscriber:
             subscriber.setsockopt_string(zmq.SUBSCRIBE, source["topic"])
@@ -172,6 +184,37 @@ class TestBlockStoredWireFormat(CustomTestCase):
         self.assertEqual([e.session_id for e in stored], [None, None, "session-a"])
         self.assertIsInstance(round_tripped.events[3], BlockRemoved)
         self.assertIsInstance(round_tripped.events[4], AllBlocksCleared)
+
+    def test_ownership_is_an_optional_map_key(self):
+        """Framework events omit it; backend-owned events name their owner."""
+        framework = [
+            self._event(),
+            BlockRemoved(block_hashes=[123], medium=StorageMedium.GPU),
+            AllBlocksCleared(),
+        ]
+        owned = [
+            self._owned_store(),
+            BlockRemoved(
+                block_hashes=[123], medium=StorageMedium.CPU, ownership="kvcr"
+            ),
+        ]
+        for event in framework:
+            encoded = msgspec.msgpack.decode(msgspec.msgpack.encode(event))
+            self.assertNotIn("ownership", encoded)
+        batch = msgspec.msgpack.decode(
+            msgspec.msgpack.encode(KVEventBatch(ts=1.0, events=framework + owned)),
+            type=KVEventBatch,
+        )
+        self.assertEqual(
+            [getattr(event, "ownership", None) for event in batch.events],
+            [None, None, None, "kvcr", "kvcr"],
+        )
+
+    def _owned_store(self):
+        event = self._event()
+        event.medium = StorageMedium.CPU
+        event.ownership = "kvcr"
+        return event
 
 
 class TestNamespacedBlockHash(CustomTestCase):

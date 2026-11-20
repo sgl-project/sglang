@@ -601,6 +601,57 @@ class TestBufferModeSidecar(unittest.TestCase):
         self.assertFalse(pipeline.backup_pending(7))
         self.assertEqual(pipeline.write_staged_tokens_, 0)
 
+    def test_backup_event_metadata_is_captured_at_staging(self):
+        """A publishing backend's page identities are read while the node is
+        pinned and reach the storage write; other backends see no new kwarg."""
+        snapshot = BufferBackupSnapshot(
+            node_id=7,
+            parent_node_id=0,
+            parent_is_root=True,
+            parent_last_hash=None,
+            hash_values=["page-0"],
+            key=RadixKey(array("q", [1, 2])),
+            prefix_keys=None,
+        )
+        for publishes in (False, True):
+            with self.subTest(publishes=publishes):
+                metadata = {"page-0": object()}
+                cache = MagicMock()
+                cache.storage_kv_events_enabled = publishes
+                cache.storage_kv_event_metadata.return_value = metadata
+                cache.cache_controller.write.return_value = torch.arange(2)
+                cache.cache_controller.write_storage.return_value = 5
+                pipeline = BufferModePipeline.__new__(BufferModePipeline)
+                pipeline._cache = cache
+                pipeline._swa_component = None
+                pipeline._further_window_components = ()
+                pipeline._backup_ack_seq = 0
+                pipeline.ongoing_write_through = {}
+                pipeline.ongoing_backup = {}
+                pipeline.write_staged_tokens_ = 0
+                pipeline._kv_shard_host_pool = lambda: None
+                pipeline.host_allocation_units = lambda host_indices, transfers: 2
+                pipeline._release_queued_span = lambda intent: None
+                intent = SimpleNamespace(snapshot=snapshot, pool=PoolName.KV)
+
+                self.assertTrue(
+                    pipeline._stage_backup_intent(
+                        intent, torch.arange(2), [], {PoolName.KV: ["page-0"]}
+                    )
+                )
+                (ack_id,) = pipeline.ongoing_write_through
+                if publishes:
+                    cache.storage_kv_event_metadata.assert_called_once_with(7)
+                else:
+                    cache.storage_kv_event_metadata.assert_not_called()
+                pipeline.finish_backup_ack(ack_id)
+
+                kwargs = cache.cache_controller.write_storage.call_args.kwargs
+                if publishes:
+                    self.assertIs(kwargs["kv_event_metadata"], metadata)
+                else:
+                    self.assertNotIn("kv_event_metadata", kwargs)
+
     def test_completed_prefetch_keeps_dsv4_full_and_swa_sidecars_for_h2d(self):
         swa = PoolTransfer(
             name=PoolName.SWA,

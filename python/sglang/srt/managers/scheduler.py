@@ -2105,7 +2105,18 @@ class Scheduler(
             result_dict["rust_server_pid"] = os.getpid()
         result_dict["hicache_object_layout"] = self._hicache_l3_layout()
 
-        if get_serving().grpc_port is not None:
+        # Reported only by a storage backend that owns a router source.
+        if self.enable_hierarchical_cache and (
+            hint_sources := self.tree_cache.storage_kv_hint_sources()
+        ):
+            result_dict["kv_hint_sources"] = hint_sources
+
+        # A backend publishing its own residency needs a discoverable raw
+        # event source even without gRPC (e.g. an in-process engine).
+        if (
+            get_serving().grpc_port is not None
+            or self.tree_cache.storage_kv_events_enabled
+        ):
             result_dict["kv_event_sources"] = (
                 self.kv_events_publisher.local_kv_event_sources(
                     self.page_size * get_parallel().dcp_size
@@ -3290,9 +3301,11 @@ class Scheduler(
     def _record_kv_event_lora_name(self, req: Req, lora_name: Optional[str]) -> None:
         # Keyed by the final extra_key, so it must run after elastic namespacing.
         # The default event format namespaces only named LoRA keys, so a rank
-        # that binds hinted storage keys to event IDs needs the name as well.
+        # that binds hinted storage keys to event IDs needs the name as well,
+        # as does every shard describing pages for backend-owned events.
         if (
             self.kv_events_publisher.enable_kv_cache_events
+            or self.kv_events_publisher.storage_publishes_kv_events
             or (
                 req.kv_hints is not None
                 and self.tree_cache.forwards_kv_hint_actions(req.kv_hints)

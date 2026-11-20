@@ -117,6 +117,15 @@ class HiCacheStorageExtraInfo:
     # PP0's entries, kept only where the local backend also opts in. Lookups
     # and other prefetches decide on each rank.
     # Decode-side lookups carry request_id "__storage_hit_query__".
+    # If the backend's publishes_kv_events is True, the writes of a tree
+    # backup and the lookups and reads of a prefetch also carry, independent
+    # of kv_hints:
+    #   "kv_event_metadata": maps each storage page key to the single-page
+    #       BlockStored the framework would publish for that page (hash,
+    #       parent, token ids, cache salt, LoRA name), without session or
+    #       multimodal routing labels. A missing page, or an empty map, means
+    #       "do not advertise that page". Hit queries outside a prefetch,
+    #       decode-offload backups and PP > 1 carry none.
     extra_info: Optional[dict] = None
 
 
@@ -411,6 +420,52 @@ class HiCacheStorage(ABC):
         """
         return False
 
+    # A backend that keys objects by its own rank (not by the shared object)
+    # must back up on every rank, even where is_storage_writer elects one
+    # writer for rank-replicated KV such as MLA.
+    requires_rank_local_backup = False
+
+    # Opt-in: the backend reports its own residency as KV events, published
+    # by the scheduler's KV event publisher. The value must be identical on
+    # every rank and fixed for the backend's lifetime: it adds a column to the
+    # HiCache cross-rank sync and, when any rank has events, an object gather
+    # over the attention groups. Such a backend must be configured at launch
+    # (no runtime attach or detach) and requires PP=1 and no DCP.
+    publishes_kv_events = False
+    # Which attention shard this rank's events describe, in
+    # [0, kv_event_shard_count), and how many shards must all hold a page
+    # before it is published. Ranks whose shard is out of range (e.g.
+    # replicas of a shard) are ignored.
+    kv_event_shard = 0
+    kv_event_shard_count = 1
+
+    def pending_kv_events(self) -> int:
+        """Count events queued for take_kv_events(); called each sync step."""
+        return 0
+
+    def take_kv_events(self) -> list:
+        """Hand over queued residency events, from the scheduler thread.
+
+        Only single-page BlockStored/BlockRemoved built from the
+        "kv_event_metadata" this backend received, with ownership set to the
+        backend's name (see BlockStored.ownership) and medium to its tier. A
+        page is published once every attention shard has stored it, and
+        removed once any shard has removed it.
+        """
+        return []
+
+    def get_kv_hint_source(self) -> Optional[dict]:
+        """Describe this rank's backend-owned router source, without starting IO.
+
+        Describes configured addresses, not socket readiness or residency.
+        Return None without one; only the owner rank of a shared source
+        reports it. Keys: "dp_rank" (int), "capabilities" (list of str, e.g.
+        "router_hint"), "source_control_endpoint" ("tcp://host:port"), and,
+        for a backend that publishes KV events, "cache_owner_id" (str, the
+        identity its events belong to; the event topic is derived from it).
+        """
+        return None
+
     # todo, the page size of storage backend does not have to be the same as the same as host memory pool
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         self.mem_pool_host = mem_pool_host
@@ -693,6 +748,31 @@ class HiCacheStorageFailureInjector(HiCacheStorage):
 
     def consumes_kv_hints(self) -> bool:
         return self._backend.consumes_kv_hints()
+
+    @property
+    def requires_rank_local_backup(self) -> bool:
+        return self._backend.requires_rank_local_backup
+
+    @property
+    def publishes_kv_events(self) -> bool:
+        return self._backend.publishes_kv_events
+
+    @property
+    def kv_event_shard(self) -> int:
+        return self._backend.kv_event_shard
+
+    @property
+    def kv_event_shard_count(self) -> int:
+        return self._backend.kv_event_shard_count
+
+    def pending_kv_events(self) -> int:
+        return self._backend.pending_kv_events()
+
+    def take_kv_events(self) -> list:
+        return self._backend.take_kv_events()
+
+    def get_kv_hint_source(self) -> Optional[dict]:
+        return self._backend.get_kv_hint_source()
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         self._backend.register_mem_pool_host(mem_pool_host)

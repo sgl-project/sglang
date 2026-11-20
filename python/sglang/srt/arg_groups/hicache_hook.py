@@ -84,6 +84,22 @@ def handle_hicache(server_args: Any):
     ):
         return
 
+    if (
+        cfg.hicache_storage_backend == "kvcr"
+        and cfg.enable_hierarchical_cache
+        and cfg.disaggregation_mode == "decode"
+        and cfg.disaggregation_decode_enable_offload_kvcache
+        and cfg.disaggregation_decode_enable_radix_cache
+    ):
+        # Decode offload builds its own backend next to the tree's, and two
+        # KVCR stores of one rank would bind the same control and NIXL ports.
+        raise ValueError(
+            "The kvcr HiCache storage backend cannot serve both decode KV "
+            "offload and the decode radix cache in one worker; disable "
+            "--disaggregation-decode-enable-offload-kvcache or "
+            "--disaggregation-decode-enable-radix-cache."
+        )
+
     validate_hicache_host_memory_mode(server_args)
 
     if cfg.disaggregation_decode_host_receive_threshold < 1:
@@ -327,7 +343,7 @@ def resolve_storage_layout_compatibility(server_args: Any):
         # and runtime attachment on the same requested host layout.
         return
     if (
-        cfg.hicache_storage_backend not in ("mooncake", "npu_memcache")
+        cfg.hicache_storage_backend not in ("mooncake", "npu_memcache", "kvcr")
         or cfg.hicache_mem_layout != "layer_first"
     ):
         return
@@ -346,7 +362,7 @@ def resolve_storage_layout_compatibility(server_args: Any):
         hicache_mem_layout=new_layout,
     )
     logger.warning(
-        f"Mooncake/Ascend MemCache storage backend does not support layer_first layout, "
+        f"{cfg.hicache_storage_backend} storage backend does not support layer_first layout, "
         f"switching to {new_layout} layout for {cfg.hicache_io_backend} io backend"
     )
 

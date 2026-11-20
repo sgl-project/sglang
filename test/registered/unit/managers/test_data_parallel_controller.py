@@ -202,6 +202,7 @@ class TestLocalKvEventSources(CustomTestCase):
         )
 
         component = SchedulerKvEventsPublisher.__new__(SchedulerKvEventsPublisher)
+        component.storage_advertise_host = None
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.max_total_num_tokens = 64
         scheduler.max_req_input_len = 32
@@ -226,6 +227,61 @@ class TestLocalKvEventSources(CustomTestCase):
                 )
         publisher.describe_local_source.assert_called_once_with(256)
 
+    def test_scheduler_reports_backend_sources_only_when_present(self):
+        from sglang.srt.managers.scheduler import Scheduler
+        from sglang.srt.managers.scheduler_components.kv_events_publisher import (
+            SchedulerKvEventsPublisher,
+        )
+        from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+
+        hint = {
+            "dp_rank": 0,
+            "capabilities": ["router_hint"],
+            "source_control_endpoint": "tcp://worker-a:29017",
+        }
+        component = SchedulerKvEventsPublisher.__new__(SchedulerKvEventsPublisher)
+        component.storage_advertise_host = None
+        component.kv_event_publisher = MagicMock()
+        component.kv_event_publisher.describe_local_source.return_value = self._source(
+            0
+        )
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.max_total_num_tokens = 64
+        scheduler.max_req_input_len = 32
+        scheduler.startup_time = {}
+        scheduler.page_size = 64
+        scheduler.enable_hierarchical_cache = True
+        scheduler.enable_unified_cache_external_linker = False
+        scheduler.kv_events_publisher = component
+        for reported, publishes in ((None, False), (hint, False), (hint, True)):
+            with self.subTest(hint=reported is not None, publishes=publishes):
+                cache = SimpleNamespace(
+                    cache_controller=SimpleNamespace(
+                        storage_backend=SimpleNamespace(
+                            get_kv_hint_source=lambda r=reported: r
+                        )
+                    ),
+                    storage_kv_events_enabled=publishes,
+                )
+                cache.storage_kv_hint_sources = lambda c=cache: (
+                    BasePrefixCache.storage_kv_hint_sources(c)
+                )
+                scheduler.tree_cache = cache
+                with (
+                    get_context().override_server_args(grpc_port=None),
+                    patch.object(Scheduler, "_hicache_l3_layout", return_value={}),
+                ):
+                    info = scheduler.get_init_info()
+                if reported is None:
+                    self.assertNotIn("kv_hint_sources", info)
+                else:
+                    self.assertEqual(info["kv_hint_sources"], [hint])
+                # Without gRPC, raw event sources follow a publishing backend.
+                if publishes:
+                    self.assertEqual(info["kv_event_sources"], [self._source(0)])
+                else:
+                    self.assertNotIn("kv_event_sources", info)
+
     def test_controller_collects_all_scheduler_sources(self):
         from sglang.srt.managers import data_parallel_controller as module
 
@@ -235,6 +291,7 @@ class TestLocalKvEventSources(CustomTestCase):
         controller._scheduler_init_infos = []
         controller.scheduler_procs = []
         controller.local_kv_event_sources = []
+        controller.local_kv_hint_sources = []
         controller.run_scheduler_process_func = MagicMock()
         controller.attn_replica_size = 1
         controller.prelaunched_schedulers = None
@@ -246,6 +303,14 @@ class TestLocalKvEventSources(CustomTestCase):
                         "max_total_num_tokens": 64,
                         "max_req_input_len": 32,
                         "kv_event_sources": sources,
+                        "kv_hint_sources": [
+                            {
+                                "dp_rank": source["dp_rank"],
+                                "capabilities": ["router_hint"],
+                                "source_control_endpoint": source["endpoint"],
+                            }
+                            for source in sources
+                        ],
                     }
                 )
             )
@@ -279,6 +344,215 @@ class TestLocalKvEventSources(CustomTestCase):
         self.assertEqual(
             controller.local_kv_event_sources, [self._source(2), self._source(3)]
         )
+        self.assertEqual(
+            [source["dp_rank"] for source in controller.local_kv_hint_sources], [2, 3]
+        )
+
+    def _run_controller_process(self, *, grpc_port, hint_sources, event_sources):
+        from sglang.srt.managers import data_parallel_controller as module
+
+        controller = SimpleNamespace(
+            scheduler_procs=[],
+            get_init_info=lambda: {
+                "max_total_num_tokens": 64,
+                "max_req_input_len": 32,
+                "startup_time": {},
+            },
+            local_kv_hint_sources=hint_sources,
+            local_kv_event_sources=event_sources,
+            event_loop=MagicMock(),
+        )
+        pipe = MagicMock()
+        with (
+            get_context().override_server_args(grpc_port=grpc_port),
+            patch.object(module, "DataParallelController", return_value=controller),
+            patch.object(module.setproctitle, "setproctitle"),
+            patch.object(module.faulthandler, "enable"),
+            patch.object(module, "kill_itself_when_parent_died"),
+            patch.object(module.psutil, "Process"),
+            patch.object(module, "load_plugins"),
+            patch.object(module, "publish"),
+            patch.object(module, "configure_logger"),
+            patch.object(
+                module,
+                "get_observability",
+                return_value=SimpleNamespace(enable_trace=False),
+            ),
+            patch.object(
+                module, "get_parallel", return_value=SimpleNamespace(node_rank=0)
+            ),
+            patch.object(
+                module,
+                "get_exec",
+                return_value=SimpleNamespace(
+                    moe=SimpleNamespace(is_ep_scale_joiner=False)
+                ),
+            ),
+        ):
+            module.run_data_parallel_controller_process(MagicMock(), MagicMock(), pipe)
+        return pipe.send.call_args.args[0]
+
+    def test_controller_forwards_backend_sources_without_grpc(self):
+        """An in-process engine discovers a publishing backend's sources."""
+        info = self._run_controller_process(
+            grpc_port=None,
+            hint_sources=[{"dp_rank": 1}, {"dp_rank": 0}],
+            event_sources=[self._source(1), self._source(0)],
+        )
+        self.assertEqual(info["kv_event_sources"], [self._source(0), self._source(1)])
+        self.assertEqual(info["kv_hint_sources"], [{"dp_rank": 0}, {"dp_rank": 1}])
+
+    def test_controller_reply_is_unchanged_without_backend_sources(self):
+        info = self._run_controller_process(
+            grpc_port=None, hint_sources=[], event_sources=[]
+        )
+        self.assertNotIn("kv_event_sources", info)
+        self.assertNotIn("kv_hint_sources", info)
+        info = self._run_controller_process(
+            grpc_port=50051, hint_sources=[], event_sources=[]
+        )
+        self.assertEqual(info["kv_event_sources"], [])
+        self.assertNotIn("kv_hint_sources", info)
+
+
+class TestStorageOwnedKvEventPublisher(CustomTestCase):
+    """A backend publishing its own residency gets an owner-scoped source."""
+
+    OWNER = "a" * 32 + ":" + "b" * 32 + "/" + "0" * 16 + "/" + "c" * 32
+
+    def _owner_source(self):
+        return {
+            "dp_rank": 0,
+            "capabilities": ["router_hint"],
+            "source_control_endpoint": "tcp://10.0.0.7:29017",
+            "cache_owner_id": self.OWNER,
+        }
+
+    def _publisher(self, kv_events_config, *, publishes, sources=(), bound=None):
+        """``bound`` is the publisher's local endpoint; None for a wildcard."""
+        from sglang.srt.managers.scheduler_components import kv_events_publisher
+
+        tree_cache = SimpleNamespace(
+            storage_kv_events_enabled=publishes,
+            storage_kv_hint_sources=lambda: list(sources),
+        )
+        created = MagicMock()
+
+        def describe(block_size, advertise_host=None):
+            if bound == "none":
+                return None
+            return {
+                "dp_rank": 0,
+                "endpoint": bound or f"tcp://{advertise_host or '127.0.0.1'}:5557",
+                "topic": "",
+                "block_size": block_size,
+            }
+
+        created.describe_local_source.side_effect = describe
+        with (
+            patch.object(
+                kv_events_publisher.EventPublisherFactory,
+                "create",
+                return_value=created,
+            ) as create,
+            patch.object(
+                kv_events_publisher,
+                "get_parallel",
+                return_value=SimpleNamespace(
+                    pp_rank=0,
+                    attn_tp_rank=0,
+                    attn_cp_rank=0,
+                    attn_dp_size=1,
+                    attn_dp_rank=0,
+                    dp_rank=0,
+                ),
+            ),
+            patch(
+                "sglang.srt.disaggregation.kv_events.get_parallel",
+                return_value=SimpleNamespace(pp_rank=0, attn_tp_rank=0, attn_cp_rank=0),
+            ),
+        ):
+            publisher = kv_events_publisher.SchedulerKvEventsPublisher(
+                kv_events_config=kv_events_config,
+                tree_cache=tree_cache,
+                send_metrics_from_scheduler=None,
+                max_running_requests=1,
+                max_total_num_tokens=1,
+                get_stats=lambda: None,
+            )
+        return publisher, create
+
+    def test_owner_source_scopes_topic_and_reports_reachable_host(self):
+        import hashlib
+        import json
+
+        owner = self.OWNER
+        config = json.dumps({"publisher": "zmq", "topic": "kv", "format": "dynamo"})
+        publisher, create = self._publisher(
+            config, publishes=True, sources=[self._owner_source()]
+        )
+        topic = json.loads(create.call_args.args[0])["topic"]
+        self.assertEqual(
+            topic, f"kv/owner/{hashlib.sha256(owner.encode()).hexdigest()}"
+        )
+        (reported,) = publisher.local_kv_event_sources(64)
+        self.assertEqual(reported["endpoint"], "tcp://10.0.0.7:5557")
+        self.assertEqual(reported["format"], "dynamo")
+
+    def test_other_configurations_keep_the_configured_source(self):
+        import json
+
+        config = json.dumps({"publisher": "zmq", "topic": "kv"})
+        router_only = {
+            "dp_rank": 0,
+            "capabilities": ["router_hint"],
+            "source_control_endpoint": "tcp://10.0.0.7:29017",
+        }
+        for publishes, sources in ((False, [router_only]), (True, [router_only])):
+            with self.subTest(publishes=publishes):
+                publisher, create = self._publisher(
+                    config, publishes=publishes, sources=sources
+                )
+                self.assertEqual(create.call_args.args[0], config)
+                (reported,) = publisher.local_kv_event_sources(64)
+                self.assertEqual(reported["endpoint"], "tcp://127.0.0.1:5557")
+                self.assertNotIn("format", reported)
+
+    def test_publishing_backend_requires_kv_events(self):
+        with self.assertRaisesRegex(ValueError, "kv-events-config"):
+            self._publisher(None, publishes=True)
+
+    def test_owner_source_rejects_unsubscribable_publishers_at_launch(self):
+        """Fail in SGLang, not later in the external state agent."""
+        import json
+
+        dynamo = json.dumps({"publisher": "zmq", "format": "dynamo"})
+        for config, bound, message in (
+            (json.dumps({"publisher": "zmq"}), None, '"format": "dynamo"'),
+            # Null, connect-mode and inproc publishers report no source.
+            (dynamo, "none", "routable TCP endpoint"),
+            (dynamo, "ipc:///tmp/kv", "routable TCP endpoint"),
+            (dynamo, "tcp://127.0.0.1:5557", "routable TCP endpoint"),
+            (dynamo, "tcp://[::1]:5557", "routable TCP endpoint"),
+            (dynamo, "tcp://localhost:5557", "routable TCP endpoint"),
+            (dynamo, "tcp://*:5557", "routable TCP endpoint"),
+        ):
+            with (
+                self.subTest(bound=bound),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                self._publisher(
+                    config, publishes=True, sources=[self._owner_source()], bound=bound
+                )
+        # A concrete routable bind is reported as is.
+        publisher, _ = self._publisher(
+            dynamo,
+            publishes=True,
+            sources=[self._owner_source()],
+            bound="tcp://10.0.0.8:5557",
+        )
+        (reported,) = publisher.local_kv_event_sources(64)
+        self.assertEqual(reported["endpoint"], "tcp://10.0.0.8:5557")
 
 
 class TestInitInfoReply(CustomTestCase):

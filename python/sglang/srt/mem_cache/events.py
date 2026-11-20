@@ -24,6 +24,8 @@ import logging
 from collections import OrderedDict
 from typing import TYPE_CHECKING, Any, Iterable, Optional
 
+import msgspec
+
 from sglang.srt.disaggregation.kv_events import (
     AllBlocksCleared,
     BlockRemoved,
@@ -33,6 +35,7 @@ from sglang.srt.disaggregation.kv_events import (
     namespaced_block_hash,
 )
 from sglang.srt.managers.req_types import MM_PAD_SHIFT_VALUE
+from sglang.srt.mem_cache.storage_key_binding import verified_storage_span
 from sglang.srt.mem_cache.utils import (
     compute_node_event_hash_values,
     compute_node_hash_values,
@@ -41,12 +44,22 @@ from sglang.srt.mem_cache.utils import (
 
 if TYPE_CHECKING:
     from sglang.srt.lora.lora_registry import LoRARef
+    from sglang.srt.mem_cache.radix_cache import RadixKey
 
 logger = logging.getLogger(__name__)
 
 # Length of LoRARef.lora_id, a uuid4 or uuid5 hex string. Req adds the id to the
 # end of extra_key, so the last 32 characters of extra_key are the id.
 _LORA_ID_LEN = 32
+
+
+class _StorageEventSpan(msgspec.Struct):
+    """A detached stand-in for a tree node: what record_store reads of one."""
+
+    key: RadixKey
+    parent: Optional[_StorageEventSpan] = None
+    hash_value: Optional[list[str]] = None
+    event_hash_value: Optional[list[str]] = None
 
 
 class LoRANameTable:
@@ -301,13 +314,14 @@ class KVCacheEventRecorder:
             tail = self._queue[-1]
 
             if isinstance(tail, BlockRemoved) and isinstance(event, BlockRemoved):
-                if tail.medium == event.medium:
+                if tail.medium == event.medium and tail.ownership == event.ownership:
                     tail.block_hashes.extend(event.block_hashes)
                     return
 
             elif isinstance(tail, BlockStored) and isinstance(event, BlockStored):
                 if (
                     tail.medium == event.medium
+                    and tail.ownership == event.ownership
                     and tail.lora_id == event.lora_id
                     and tail.block_size == event.block_size
                     and tail.cache_salt == event.cache_salt
@@ -463,6 +477,79 @@ class KVCacheEventRecorder:
 
         if block_hashes:
             self.enqueue(BlockRemoved(block_hashes=block_hashes, medium=medium))
+
+    def storage_metadata(self, node: Any) -> dict:
+        """Map each storage page of ``node`` to the BlockStored it publishes as.
+
+        Snapshots the exact wire identity without publishing anything. It
+        works with events disabled, because every attention shard, not only
+        the publishing rank, describes the pages it hands its backend.
+        """
+        recorder = KVCacheEventRecorder(
+            enabled=False,
+            page_size=self.page_size,
+            dynamo_format=self.dynamo_format,
+            lora_names=self.lora_names,
+        )
+        # Enabled only after construction, so a throwaway recorder never turns
+        # on this process's multimodal routing-label registry.
+        recorder.enabled = True
+        recorder.record_store(node, medium=StorageMedium.CPU)
+        keys = (
+            node.hash_value
+            if node.hash_value is not None
+            else compute_node_hash_values(node, self.page_size)
+        )
+        return self.metadata_for_events(keys, recorder.take())
+
+    @staticmethod
+    def metadata_for_events(keys: Iterable[str], events: list) -> dict:
+        """Split coalesced BlockStored events into one per storage page key.
+
+        Keeps only the page's identity, so every shard builds equal metadata:
+        session attribution and multimodal routing labels are dropped.
+        """
+        keys = iter(keys)
+        metadata = {}
+        for event in events:
+            parent = event.parent_block_hash
+            for index, block_hash in enumerate(event.block_hashes):
+                metadata[next(keys)] = BlockStored(
+                    block_hashes=[block_hash],
+                    parent_block_hash=parent,
+                    token_ids=event.token_ids[
+                        index * event.block_size : (index + 1) * event.block_size
+                    ],
+                    block_size=event.block_size,
+                    lora_id=event.lora_id,
+                    medium=event.medium,
+                    cache_salt=event.cache_salt,
+                    lora_name=event.lora_name,
+                )
+                parent = block_hash
+        return metadata
+
+    def prefetch_storage_metadata(
+        self,
+        key: RadixKey,
+        matched_prefix_tokens: Optional[list[int]],
+        last_hash: Optional[str],
+    ) -> dict:
+        """Describe the pages a prefetch of ``key`` may read.
+
+        Empty when the prefix cannot be verified against ``last_hash``. The
+        backend still proves actual residency before it publishes a page.
+        """
+        span = verified_storage_span(
+            key, self.page_size, matched_prefix_tokens, last_hash
+        )
+        if span is None:
+            return {}
+        full_key, storage_hashes, prefix_pages = span
+        metadata = self.storage_metadata(
+            _StorageEventSpan(full_key, hash_value=storage_hashes)
+        )
+        return {page: metadata[page] for page in storage_hashes[prefix_pages:]}
 
     def record_all_cleared(self) -> None:
         if not self.enabled:

@@ -16,6 +16,36 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.radix_cache import RadixKey
 
 
+def verified_storage_span(
+    key: RadixKey,
+    page_size: int,
+    matched_prefix_tokens: Sequence[int] | None,
+    last_hash: str | None,
+) -> tuple[RadixKey, list[str], int] | None:
+    """Rebuild the root-anchored key of a storage span that continues a prefix.
+
+    Returns the full key, its storage page hashes and the number of prefix
+    pages, or None when the prefix does not reproduce ``last_hash``.
+    """
+    prefix = matched_prefix_tokens or ()
+    if len(prefix) % page_size or (last_hash is not None and not prefix):
+        return None
+
+    tokens = array("q", prefix)
+    tokens.extend(key.raw_token_ids())
+    full_key = type(key)(
+        tokens,
+        extra_key=key.extra_key,
+        cache_salt=key.cache_salt,
+        is_bigram=key.is_bigram,
+    )
+    storage_hashes = get_storage_hash_str(full_key, page_size=page_size)
+    prefix_pages = len(prefix) // page_size
+    if prefix_pages and storage_hashes[prefix_pages - 1] != last_hash:
+        return None
+    return full_key, storage_hashes, prefix_pages
+
+
 def storage_key_to_event_hashes(
     key: RadixKey,
     page_size: int,
@@ -29,22 +59,10 @@ def storage_key_to_event_hashes(
     An empty result means the prefix needed to reproduce the event IDs could
     not be verified. A hint consumer must treat those pages as unbound.
     """
-    prefix = matched_prefix_tokens or ()
-    if len(prefix) % page_size or (last_hash is not None and not prefix):
+    span = verified_storage_span(key, page_size, matched_prefix_tokens, last_hash)
+    if span is None:
         return {}
-
-    tokens = array("q", prefix)
-    tokens.extend(key.raw_token_ids())
-    full_key = type(key)(
-        tokens,
-        extra_key=key.extra_key,
-        cache_salt=key.cache_salt,
-        is_bigram=key.is_bigram,
-    )
-    storage_hashes = get_storage_hash_str(full_key, page_size=page_size)
-    prefix_pages = len(prefix) // page_size
-    if prefix_pages and storage_hashes[prefix_pages - 1] != last_hash:
-        return {}
+    full_key, storage_hashes, prefix_pages = span
 
     event_hashes = get_event_hash_str(full_key, page_size=page_size)
     return {
