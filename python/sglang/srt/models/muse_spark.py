@@ -49,6 +49,7 @@ from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
 from sglang.srt.layers.aux_hidden_states import pack_aux_hidden_states
 from sglang.srt.layers.communication.muse_spark_gemm_ag import (
     gemm_ag,
+    gemm_ag_norm_fp4_quant,
     gemm_local,
     muse_workspace,
     reserve_projection_workspace,
@@ -636,6 +637,21 @@ class MuseSpark1xMoE(nn.Module):
             self.side_stream = torch.cuda.Stream()
         return self.side_stream
 
+    def _fuse_ag_norm_quant(self, hidden_states: torch.Tensor) -> bool:
+        """The gathered rows feed the static-scale NVFP4 experts through the pre-expert norm.
+
+        Measured on SM103 and SM107 only; B200 keeps the plain gather."""
+        return (
+            torch.cuda.get_device_capability(hidden_states.device) in ((10, 3), (10, 7))
+            and self.nvfp4_checkpoint
+            and self.pre_expert_norm is not None
+            and not self.experts.use_marlin
+            and not self.experts.quant_config.use_per_token_activation
+            and self.experts._pre_norm_weight(self.pre_expert_norm) is not None
+            # FlashInfer's rule: H = 1024 * k, k <= 8.
+            and self.pre_expert_proj.weight.shape[0] in (1024 * k for k in range(1, 9))
+        )
+
     def _routing_op(self) -> FusedMuseSparkRouting:
         """The fused router: sigmoid, biased top-k, gather, renormalise, scale.
 
@@ -815,7 +831,8 @@ class MuseSpark1xMoE(nn.Module):
                 self.tp_size in (4, 8)
                 and not sp_active
                 and (
-                    torch.cuda.get_device_capability(hidden_states.device) == (10, 3)
+                    torch.cuda.get_device_capability(hidden_states.device)
+                    in ((10, 3), (10, 7))
                     or (
                         self.tp_size == 8
                         and torch.cuda.get_device_capability(hidden_states.device)
@@ -824,12 +841,27 @@ class MuseSpark1xMoE(nn.Module):
                 )
                 and gemm_ag_supported(comm, hidden_states, self.pre_expert_proj.weight)
             ):
-                expert_input = gemm_ag(comm, hidden_states, self.pre_expert_proj.weight)
+                if self._fuse_ag_norm_quant(hidden_states):
+                    fp4, sf = gemm_ag_norm_fp4_quant(
+                        comm,
+                        hidden_states,
+                        self.pre_expert_proj.weight,
+                        self.experts._pre_norm_weight(self.pre_expert_norm),
+                        self.pre_expert_norm.eps,
+                        self.experts.w13_input_scale_quant,
+                    )
+                    prepared_input = (fp4, sf, None)
+                    # The experts read only its row count and dtype.
+                    expert_input = hidden_states
+                else:
+                    expert_input = gemm_ag(
+                        comm, hidden_states, self.pre_expert_proj.weight
+                    )
             else:
                 expert_input = bf16_gemm_dispatch(
                     hidden_states, self.pre_expert_proj.weight, None
                 )
-        if prepare_early:
+        if prepare_early and prepared_input is None:
             prepared_input = self.experts.prepare_input(
                 expert_input, self.pre_expert_norm
             )

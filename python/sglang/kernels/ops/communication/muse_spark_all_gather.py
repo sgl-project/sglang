@@ -49,6 +49,10 @@ def _jit_module(n: int, world_size: int) -> Module:
     )
 
 
+# TP4 gathers up to the 8 MB push slot (m * n * 2 bytes), measured on SM103 and SM107.
+TP4_MAX_TOKENS = 1024
+
+
 def gemm_ag_supported(
     comm: Optional[WorkspaceLease], x: torch.Tensor, weight: torch.Tensor
 ) -> bool:
@@ -59,13 +63,13 @@ def gemm_ag_supported(
     m, k = x.shape
     n = weight.shape[0]
     return (
-        1 <= m <= MAX_TOKENS
+        1 <= m <= (TP4_MAX_TOKENS if comm.world_size == 4 else MAX_TOKENS)
         and (
             m <= SMALL_PROJECTION_MAX_TOKENS
             or (
                 comm.world_size in (4, 8)
                 and n in (4096, 8192)
-                and current_arch().is_sm(10, 3)
+                and (current_arch().is_sm(10, 3) or current_arch().is_sm(10, 7))
             )
             or (
                 comm.world_size == 8
