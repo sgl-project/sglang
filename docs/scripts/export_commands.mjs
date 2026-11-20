@@ -42,6 +42,8 @@ for (const path of walk(join(docs, "cookbook")).filter((path) => path.endsWith("
   if (name && source.includes("<Deployment")) pagesByConfig.set(name, [...(pagesByConfig.get(name) || []), path]);
 }
 const exportedConfigs = [...pagesByConfig]
+  // Hy4-flash still needs its model-support image, including DFLY support.
+  .filter(([name]) => name !== "tencent/hy4-flash.jsx")
   .filter(([, paths]) => paths.some((path) => path.startsWith(`${EXPORTED_PAGES}/`)))
   .map(([name, paths]) => {
     if (paths.length !== 1) throw new Error(`${name}: expected one Cookbook page rendering it, found ${paths.length}`);
