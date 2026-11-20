@@ -58,32 +58,42 @@ def test_repeated_context_and_greedy_bypass():
         max_contexts_per_req=8,
         device=device,
     )
+    engine = GumbelEngine(state, _FEATURES)
     req_pool_indices = torch.tensor([0, 1], device=device, dtype=torch.int32)
-    state.init_from_prompt(req_pool_indices, [[10, 11], [20, 21]])
     sampling_info = SimpleNamespace(
         temperatures=torch.ones((2, 1), device=device),
         top_ks=torch.tensor([64, 1], device=device, dtype=torch.int32),
         top_ps=torch.ones(2, device=device),
         min_ps=torch.zeros(2, device=device),
         max_top_k=64,
+        watermark=_server_rows(2, 2),
     )
 
-    first_logits = torch.zeros((2, 64), device=device)
-    rows = _server_rows(2, 2)
-    _force(state, first_logits, req_pool_indices, sampling_info, rows)
+    def forward_batch(watermark_seed=None):
+        return SimpleNamespace(
+            sampling_info=sampling_info,
+            req_pool_indices=req_pool_indices,
+            watermark_seed=watermark_seed,
+        )
 
+    first_logits = torch.zeros((2, 64), device=device)
+    step = engine.bind_sample(forward_batch(([[10, 11], [20, 21]], None))).apply(
+        first_logits, keep_logits=True
+    )
+
+    assert step.sampling_info is sampling_info and step.token_ids is None
+    assert torch.equal(step.logprob_logits, torch.zeros_like(first_logits))
     assert torch.isfinite(first_logits[0]).sum().item() == 1
     assert torch.equal(first_logits[1], torch.zeros(64, device=device))
     assert state.num_watermarked_contexts.tolist() == [1, 0]
 
-    state.append(
-        req_pool_indices[:1], torch.tensor([10], device=device, dtype=torch.int32)
-    )
-    state.append(
-        req_pool_indices[:1], torch.tensor([11], device=device, dtype=torch.int32)
-    )
+    # Row 0 samples 10 then 11, back to the context it was forced in.
+    for token in (10, 11):
+        engine.bind_sample(forward_batch()).commit(
+            torch.tensor([token], device=device, dtype=torch.int32)
+        )
     repeated_logits = torch.zeros((2, 64), device=device)
-    _force(state, repeated_logits, req_pool_indices, sampling_info, rows)
+    engine.bind_sample(forward_batch()).apply(repeated_logits, keep_logits=False)
 
     assert torch.equal(repeated_logits, torch.zeros_like(repeated_logits))
     assert state.num_watermarked_contexts.tolist() == [1, 0]
@@ -136,7 +146,7 @@ def test_inactive_batch_skips_watermark_state():
 
     assert engine.seed_payload(batch) is None
     assert engine.bind_sample(batch) is None
-    assert state.lengths[0].item() == 0
+    assert engine.bind_verify(None, full_mask=True) is None
 
 
 def test_retracted_request_restores_context_history():
@@ -216,7 +226,7 @@ def test_speculative_record_stops_at_context_capacity():
     assert state.watermarked_context_hashes[0].tolist() == [10, 20]
 
 
-def test_speculative_tree_fast_path_matches_tensor_reference():
+def test_speculative_tree_paths_match_tensor_reference():
     draft_token_num = 4
     req_pool_indices = torch.tensor([1, 3], dtype=torch.int32, device="cuda")
     prompt_tails = [[10, 11, 12, 13], [20, 21, 22, 23]]
@@ -229,7 +239,7 @@ def test_speculative_tree_fast_path_matches_tensor_reference():
             mixing_probability=0.5,
             device="cuda",
         )
-        for _ in range(2)
+        for _ in range(3)
     ]
     for state in states:
         state.init_from_prompt(req_pool_indices, prompt_tails)
@@ -315,6 +325,48 @@ def test_speculative_tree_fast_path_matches_tensor_reference():
     assert torch.equal(fused_logits, reference_logits)
     assert fused_selected.view(2, draft_token_num)[:, 1].all()
     assert fused_selected.view(2, draft_token_num)[:, 2].logical_not().all()
+
+    rows = GumbelRows(
+        keys=keys,
+        context_windows=context_windows,
+        enabled=watermark_enabled,
+        candidates_host=[True, True],
+    )
+    verify = GumbelEngine(states[2], _FEATURES).bind_verify(rows, full_mask=True)
+    verify_logits, verify_sampling_info = verify.apply(
+        logits,
+        sampling_info=sampling_info,
+        req_pool_indices=req_pool_indices,
+        draft_tokens=draft_tokens,
+        positions=positions,
+        draft_token_num=draft_token_num,
+        custom_mask=custom_mask,
+        keep_logits=True,
+    )
+    assert verify_sampling_info is sampling_info
+    assert torch.equal(verify_logits, reference_logits)
+    assert torch.isfinite(logits).all()
+
+    # Accepted paths 0 -> 1 -> 3 and 4 -> 5; row 1's 7 is past its length.
+    accept_index = torch.tensor(
+        [[0, 1, 3], [4, 5, 7]], dtype=torch.int32, device="cuda"
+    )
+    accept_lens = torch.tensor([3, 2], dtype=torch.int32, device="cuda")
+    verify.record(accept_index, accept_lens)
+    states[0].record_speculative(
+        req_pool_indices,
+        reference_hashes,
+        reference_selected,
+        accept_index,
+        accept_lens,
+    )
+    assert (states[2].num_watermarked_contexts[req_pool_indices] > 0).all()
+    assert torch.equal(
+        states[2].num_watermarked_contexts, states[0].num_watermarked_contexts
+    )
+    assert torch.equal(
+        states[2].watermarked_context_hashes, states[0].watermarked_context_hashes
+    )
 
 
 @pytest.mark.parametrize("block_verification", [False, True])
