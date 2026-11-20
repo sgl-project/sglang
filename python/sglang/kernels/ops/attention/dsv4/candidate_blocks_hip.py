@@ -259,6 +259,20 @@ def _map_compact_selection_kernel(
             tl.store(raw_indices_ptr + row * out_stride + wpos, real, mask=valid)
 
 
+class CandidatePage8Table(NamedTuple):
+    """The candidate blocks of each row as a page-8 pool's row-group sequence: one row per
+    sequence, its blocks one 8-slot page each, the valid columns a prefix."""
+
+    # int32 [rows, topk_blocks]: the kept ids, the newest (partial) block last, -1 padded
+    ids: torch.Tensor
+    # int32 [rows, topk_blocks]: the 8-slot pool page of each id, 0 padded
+    block_tables: torch.Tensor
+    # int32 [rows]: the reachable columns of the compact row
+    compact_lens: torch.Tensor
+    # int32 [rows + 1]: arange, one row a sequence
+    query_start_loc: torch.Tensor
+
+
 class CandidateBlocks(NamedTuple):
     """What the candidate-source layer publishes for the decode rows of a step."""
 
@@ -270,14 +284,26 @@ class CandidateBlocks(NamedTuple):
     compact_page_table: torch.Tensor
     compact_page_size: int
     block_size: int
+    # on a page8 pool, built once and shared by the consumer layers
+    page8: Optional[CandidatePage8Table] = None
 
 
 def slice_candidate_blocks(candidates: CandidateBlocks, rows: slice) -> CandidateBlocks:
     """The rows rows of a per-request publication."""
+    ids = candidates.ids[rows]
+    page8 = candidates.page8
+    if page8 is not None:
+        page8 = CandidatePage8Table(
+            page8.ids[rows],
+            page8.block_tables[rows],
+            page8.compact_lens[rows],
+            page8.query_start_loc[: ids.shape[0] + 1],
+        )
     return candidates._replace(
-        ids=candidates.ids[rows],
+        ids=ids,
         compact_lens=candidates.compact_lens[rows],
         compact_page_table=candidates.compact_page_table[rows],
+        page8=page8,
     )
 
 
@@ -289,6 +315,7 @@ def cat_candidate_blocks(pieces: List[CandidateBlocks]) -> CandidateBlocks:
         ids=torch.cat([p.ids for p in pieces]),
         compact_lens=torch.cat([p.compact_lens for p in pieces]),
         compact_page_table=torch.cat([p.compact_page_table for p in pieces]),
+        page8=None,
     )
 
 
@@ -389,18 +416,219 @@ def topk_within_candidate_blocks_hip(
     """Level two for a consumer layer: the top-k of logits inside the published candidate
     blocks, written as the paged transform writes it (-1 padded, valid prefix first; ascending with
     sort_output, k a power of two). Runs on the compact row, so the cost stops growing with context."""
-    rows, width = logits.shape
+    seq_lens = seq_lens.to(torch.int32).contiguous()
+    compact = gather_candidate_blocks(
+        logits, seq_lens, candidates.ids, block_size=candidates.block_size
+    )
+    topk_compact_candidate_rows(
+        compact,
+        candidates.compact_lens,
+        candidates.ids,
+        candidates,
+        seq_lens,
+        page_table=page_table,
+        page_size=page_size,
+        page_indices=page_indices,
+        raw_indices=raw_indices,
+        sort_output=sort_output,
+    )
+
+
+@triton.jit
+def _candidate_page8_table_kernel(
+    ids_ptr,
+    seq_lens_ptr,
+    page_table_ptr,
+    out_ids_ptr,
+    pages_ptr,
+    lens_ptr,
+    query_start_loc_ptr,
+    ids_stride,
+    pt_stride,
+    out_stride,
+    n_pages,
+    K,
+    BLOCK_SIZE: tl.constexpr,
+    BLOCKS_PER_PAGE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """One program per row (kept ids a -1 padded prefix): moves the newest, partial block
+    last so the reachable columns are a prefix, and writes the physical page table and that
+    exact length."""
+    row = tl.program_id(0)
+    j = tl.arange(0, BLOCK)
+    in_k = j < K
+    base = ids_ptr + row * ids_stride
+    ids = tl.load(base + j, mask=in_k, other=-1)
+    live = ids >= 0
+    kept = tl.sum(live.to(tl.int32), axis=0)
+    length = tl.load(seq_lens_ptr + row)
+    newest = tl.maximum(length - 1, 0) // BLOCK_SIZE
+    at = tl.max(tl.where(live & (ids == newest), j, -1), axis=0)
+    last = kept - 1
+    swap = at >= 0
+    at_last = tl.sum(tl.where(j == last, ids, 0), axis=0)
+    ids = tl.where(swap & (j == last), newest, tl.where(swap & (j == at), at_last, ids))
+    span = tl.where(
+        swap,
+        tl.minimum(tl.maximum(length - newest * BLOCK_SIZE, 0), BLOCK_SIZE),
+        BLOCK_SIZE,
+    )
+    tl.store(lens_ptr + row, tl.where(kept > 0, last * BLOCK_SIZE + span, 0))
+    blk = tl.where(live, ids, 0)
+    page = tl.load(
+        page_table_ptr
+        + row * pt_stride
+        + tl.minimum(blk // BLOCKS_PER_PAGE, n_pages - 1),
+        mask=live,
+        other=0,
+    )
+    pages = page * BLOCKS_PER_PAGE + blk % BLOCKS_PER_PAGE
+    tl.store(out_ids_ptr + row * out_stride + j, ids, mask=in_k)
+    tl.store(pages_ptr + row * out_stride + j, tl.where(live, pages, 0), mask=in_k)
+    tl.store(query_start_loc_ptr + row + 1, row + 1)
+    if row == 0:
+        tl.store(query_start_loc_ptr, 0)
+
+
+def candidate_page8_table(
+    ids: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    *,
+    block_size: int,
+    page_size: int,
+) -> CandidatePage8Table:
+    """The CandidatePage8Table of each row's kept block ids."""
+    rows, k = ids.shape
+    assert block_size == 8 and page_size % block_size == 0, (block_size, page_size)
+    assert ids.dtype == torch.int32 and ids.stride(1) == 1
+    assert page_table.dtype == torch.int32 and page_table.stride(1) == 1
+    out_ids = torch.empty((rows, k), dtype=torch.int32, device=ids.device)
+    pages = torch.empty_like(out_ids)
+    lens = torch.empty(rows, dtype=torch.int32, device=ids.device)
+    query_start_loc = torch.empty(rows + 1, dtype=torch.int32, device=ids.device)
+    if not rows:
+        query_start_loc.zero_()
+    else:
+        _candidate_page8_table_kernel[(rows,)](
+            ids,
+            seq_lens.to(torch.int32).contiguous(),
+            page_table,
+            out_ids,
+            pages,
+            lens,
+            query_start_loc,
+            ids.stride(0),
+            page_table.stride(0),
+            out_ids.stride(0),
+            page_table.shape[1],
+            k,
+            BLOCK_SIZE=block_size,
+            BLOCKS_PER_PAGE=page_size // block_size,
+            BLOCK=triton.next_power_of_2(k),
+        )
+    return CandidatePage8Table(out_ids, pages, lens, query_start_loc)
+
+
+def with_candidate_page8_table(
+    candidates: CandidateBlocks,
+    seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    *,
+    page_size: int,
+) -> CandidateBlocks:
+    """candidates with their page8 table attached."""
+    return candidates._replace(
+        page8=candidate_page8_table(
+            candidates.ids,
+            seq_lens,
+            page_table,
+            block_size=candidates.block_size,
+            page_size=page_size,
+        )
+    )
+
+
+def topk_within_candidate_blocks_page8(
+    *,
+    q_fp4: torch.Tensor,
+    q_scale: torch.Tensor,
+    weights: torch.Tensor,
+    k_payload: torch.Tensor,
+    k_scale: torch.Tensor,
+    candidates: CandidateBlocks,
+    seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    page_size: int,
+    page_indices: torch.Tensor,
+    raw_indices: Optional[torch.Tensor],
+    is_decode: bool = True,
+) -> None:
+    """topk_within_candidate_blocks_hip on a page8 index-K pool, scoring only the candidate
+    blocks."""
+    from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
+        rowgroup_paged_mqa_logits,
+    )
+
+    block_size = candidates.block_size
+    table = candidates.page8 or candidate_page8_table(
+        candidates.ids, seq_lens, page_table, block_size=block_size, page_size=page_size
+    )
+    compact = rowgroup_paged_mqa_logits(
+        q_fp4=q_fp4,
+        q_scale=q_scale,
+        k_payload=k_payload,
+        k_scale=k_scale,
+        weights=weights,
+        weight_scale=1.0,
+        block_tables=table.block_tables,
+        query_start_loc=table.query_start_loc,
+        row_ends=table.compact_lens,
+        max_query_len=1,
+        max_seq_len=candidates.ids.shape[1] * block_size,
+        page8=True,
+        pages_per_block=1,
+        is_decode=is_decode,
+    )
+    topk_compact_candidate_rows(
+        compact,
+        table.compact_lens,
+        table.ids,
+        candidates,
+        seq_lens,
+        page_table=page_table,
+        page_size=page_size,
+        page_indices=page_indices,
+        raw_indices=raw_indices,
+    )
+
+
+def topk_compact_candidate_rows(
+    compact: torch.Tensor,
+    compact_lens: torch.Tensor,
+    ids: torch.Tensor,
+    candidates: CandidateBlocks,
+    seq_lens: torch.Tensor,
+    *,
+    page_table: torch.Tensor,
+    page_size: int,
+    page_indices: torch.Tensor,
+    raw_indices: Optional[torch.Tensor],
+    sort_output: bool = False,
+) -> None:
+    """The top-k of each compact candidate row (column j * block_size + t is position
+    ids[j] * block_size + t, valid up to compact_lens), mapped back to pool slots as
+    topk_within_candidate_blocks_hip writes them."""
+    rows = compact.shape[0]
     topk = page_indices.shape[1]
     block_size = candidates.block_size
     seq_lens = seq_lens.to(torch.int32).contiguous()
-    compact = gather_candidate_blocks(
-        logits, seq_lens, candidates.ids, block_size=block_size
-    )
     assert compact.shape[1] <= candidates.compact_page_size
-    compact_pos = torch.empty((rows, topk), dtype=torch.int32, device=logits.device)
+    compact_pos = torch.empty((rows, topk), dtype=torch.int32, device=compact.device)
     topk_transform_paged_hip(
         compact,
-        candidates.compact_lens,
+        compact_lens,
         candidates.compact_page_table,
         compact_pos,
         candidates.compact_page_size,
@@ -415,12 +643,12 @@ def topk_within_candidate_blocks_hip(
     assert not sort_output or topk & (topk - 1) == 0, topk
     _map_compact_selection_kernel[(rows,)](
         compact_pos,
-        candidates.ids,
+        ids,
         seq_lens,
         page_table,
         page_indices,
         raw_indices if write_raw else page_indices,
-        candidates.ids.stride(0),
+        ids.stride(0),
         page_table.stride(0),
         page_indices.stride(0),
         page_table.shape[1],

@@ -7,7 +7,10 @@ import triton
 import triton.language as tl
 
 
-@triton.jit
+# Callers pass page-id slices at any element offset (compaction launches a long
+# move in chunks); each program loads only one scalar id, so specializing on
+# their alignment would only compile more variants, and those mid-serving.
+@triton.jit(do_not_specialize_on_alignment=["src_pages", "dst_pages"])
 def _copy_pages_kernel(
     buf,
     src_pages,
@@ -21,7 +24,9 @@ def _copy_pages_kernel(
     src = tl.load(src_pages + pair * SRC_STRIDE).to(tl.int64)
     dst = tl.load(dst_pages + pair * DST_STRIDE).to(tl.int64)
     offsets = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < page_words
+    # A pair naming one page for both ends (a padded `sink -> sink` pair of a
+    # fixed-shape move) copies nothing.
+    mask = (offsets < page_words) & (src != dst)
     values = tl.load(buf + src * page_words + offsets, mask=mask)
     tl.store(buf + dst * page_words + offsets, values, mask=mask)
 
@@ -36,7 +41,8 @@ def copy_pages(
     num_pages: int,
     page_bytes: int,
 ) -> None:
-    """Copy src -> dst on the current stream; dst and src sets must be disjoint.
+    """Copy src -> dst on the current stream; dst and src sets must be disjoint,
+    but for pairs naming one page for both, which copy nothing.
 
     The allocator supplies unique destinations in free space. Overlapping float
     shifts are already split into ordered singleton calls by the allocator.

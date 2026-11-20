@@ -16,16 +16,15 @@ from sglang.srt.arg_groups.arg_utils import (
     A,
     Arg,
     Derived,
-)
-from sglang.srt.arg_groups.choices import (
-    LOAD_FORMAT_CHOICES,
-    QUANTIZATION_CHOICES,
-)
-from sglang.srt.utils.common import (
-    human_readable_int,
     json_list_type,
     nullable_str,
 )
+from sglang.srt.arg_groups.choices import (
+    KV_CACHE_DTYPE_CHOICES,
+    LOAD_FORMAT_CHOICES,
+    QUANTIZATION_CHOICES,
+)
+from sglang.srt.utils.common import human_readable_int
 
 
 class Model(msgspec.Struct):
@@ -37,6 +36,12 @@ class Model(msgspec.Struct):
     is_startup_weight_load_overlap = Derived(
         fn="sglang.srt.arg_groups.model_override_base.startup_weight_load_overlap_of",
         doc="Whether weight loading overlaps startup.",
+    )
+
+    # Runtime-only binding: loaders/runners scope the immutable model-owned value.
+    shared_experts = Derived(
+        fn="sglang.srt.configs.shared_experts.default_shared_experts_config",
+        doc="Shared-expert layout of the model being constructed or executed.",
     )
 
     # -------------------------------------------------------------------------
@@ -58,6 +63,8 @@ class Model(msgspec.Struct):
             "is not available. "
             '"pt" will load the weights in the pytorch bin format. '
             '"safetensors" will load the weights in the safetensors format. '
+            '"instanttensor" will load Safetensors weights using '
+            "InstantTensor's high-performance distributed loader. "
             '"npcache" will load the weights in pytorch format and store '
             "a numpy cache to speed up the loading. "
             '"dummy" will initialize the weights with random values, '
@@ -110,6 +117,13 @@ class Model(msgspec.Struct):
     is_embedding: A[
         bool,
         "Whether to use a CausalLM as an embedding model.",
+    ] = False
+    disable_normalize_embedding: A[
+        bool,
+        "Disable the L2 normalization the embedding Pooler applies after pooling, "
+        "returning the raw pooled vector. Only affects models whose Pooler is built "
+        "with normalize=True; custom poolers (cross-encoder, BERT pooler, vision "
+        "pooler) are unaffected.",
     ] = False
     revision: A[
         Optional[str],
@@ -196,21 +210,27 @@ class Model(msgspec.Struct):
                 'by the FA4 backend. "nvfp4" selects '
                 'the NVFP4 FP4 E2M1 KV cache recipe; "fp4_mx_block16" '
                 "selects the MX-style block-size-16 FP4 E2M1 KV cache "
-                "recipe. Both require CUDA 12.8+ and PyTorch 2.8.0+"
+                "recipe. Both require CUDA 12.8+ and PyTorch 2.8.0+. Out-of-tree "
+                "platform plugins can register further values for KV cache formats "
+                "that only their KV pool implements; in-tree platforms reject them."
             ),
-            choices=[
-                "auto",
-                "fp8_e5m2",
-                "fp8_e4m3",
-                "mxfp8",
-                "bf16",
-                "bfloat16",
-                "nvfp4",
-                "fp4_mx_block16",
-            ],
+            choices=KV_CACHE_DTYPE_CHOICES,
             resolvable=True,
         ),
     ] = "auto"
+    indexer_kv_cache_dtype: A[
+        Optional[str],
+        Arg(
+            help=(
+                "Quantization recipe for the DSA lightning-indexer KV cache "
+                "(Ascend NPU only). None disables the quantized indexer cache "
+                'and keeps the default indexer behavior. "int8" stores the '
+                "indexer keys in INT8 with FP16 scales to speed up the "
+                "lightning indexer."
+            ),
+            choices=["int8"],
+        ),
+    ] = None
     qsa_indexer_dtype: A[
         str,
         Arg(
@@ -393,3 +413,17 @@ class Model(msgspec.Struct):
             help="Timeout in seconds for weight cache daemon readiness (default: 1800).",
         ),
     ] = 1800
+    weight_cache_transport: A[
+        str,
+        Arg(
+            help="How the weight cache daemon shares weights with engines: "
+            "'torch_ipc' (CUDA IPC handles; the engine dies with the daemon) or "
+            "'vmm_fd' (CUDA VMM allocations passed as file descriptors; the "
+            "engine maps them at addresses it reserves and keeps them if the "
+            "daemon exits). The daemon's setting picks the transport, and "
+            "'auto' means torch_ipc there for now. On an engine, 'auto' accepts "
+            "whatever the daemon serves, while 'torch_ipc' or 'vmm_fd' refuses "
+            "a daemon serving the other.",
+            choices=["auto", "torch_ipc", "vmm_fd"],
+        ),
+    ] = "auto"

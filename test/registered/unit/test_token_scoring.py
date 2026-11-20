@@ -18,7 +18,7 @@ from sglang.srt.runtime_context import publish, restore_context, snapshot_contex
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class ScoringManager(TokenizerManagerScoreMixin):
@@ -89,6 +89,18 @@ class TestTokenScoring(unittest.IsolatedAsyncioTestCase):
                         torch.log_softmax(manager.logits, dim=0)[labels],
                     )
                 self.assertEqual(body["usage"]["completion_tokens"], 0)
+
+    async def test_rid_is_threaded_from_http_to_sub_requests(self):
+        for generation in (True, False):
+            with self.subTest(generation=generation):
+                manager = ScoringManager(generation=generation)
+                request = ScoringRequest(
+                    query=[4], items=[[5], [6]], label_token_ids=[3, 1], rid="corr"
+                )
+                await OpenAIServingScore(manager)._handle_non_streaming_request(
+                    request, request, None
+                )
+                self.assertEqual(manager.requests[-1].rid, ["corr_0", "corr_1"])
 
     async def test_default_scores_are_vocabulary_probabilities(self):
         manager = ScoringManager()

@@ -30,7 +30,7 @@ from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=15, stage="stage-b", runner_config="1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=15, stage="base-b", runner_config="1-gpu-small-amd-mi35x")
 
 pytestmark = pytest.mark.skipif(
     not (is_hip() and is_gfx95_supported()),
@@ -284,8 +284,11 @@ def test_expand_index_page_table(bpp: int):
             0, 1 << 20, (bs, n), dtype=torch.int32, device=DEVICE
         )
         ref = _expand_index_page_table(
-            page_table, full_page_size=64 * bpp, compress_ratio=1, index_page_size=64
-        )
+            page_table.cpu(),
+            full_page_size=64 * bpp,
+            compress_ratio=1,
+            index_page_size=64,
+        ).to(DEVICE)
         out = expand_index_page_table(page_table, bpp)
         assert out.dtype is torch.int32 and out.shape == ref.shape
         assert torch.equal(out, ref)
@@ -296,8 +299,8 @@ def test_expand_index_page_table(bpp: int):
     assert torch.equal(
         expand_index_page_table(page_table, 4),
         _expand_index_page_table(
-            page_table, full_page_size=256, compress_ratio=1, index_page_size=64
-        ),
+            page_table.cpu(), full_page_size=256, compress_ratio=1, index_page_size=64
+        ).to(DEVICE),
     )
 
 

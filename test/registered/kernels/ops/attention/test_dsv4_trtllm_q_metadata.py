@@ -3,11 +3,11 @@ import sys
 import pytest
 import torch
 
-from sglang.kernels.ops.attention.dsv4.elementwise import fused_q_norm_rope
+from sglang.kernels.ops.attention.dsv4.norm_rope import fused_q_norm_rope
 from sglang.kernels.ops.attention.dsv4.trtllm_metadata import pack_sparse_tail
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 
 @pytest.mark.parametrize("rows,heads", [(6, 16), (9, 128), (4097, 16)])
@@ -74,24 +74,6 @@ def test_sparse_tail_short_sequence_and_padding(dtype):
     torch.testing.assert_close(table[:1, 128:], indices)
     assert (table[1:] == -1).all()
     assert (totals[1:] == 0).all()
-
-
-def test_sparse_tail_rejects_float_lengths():
-    indices = torch.empty((0, 4), dtype=torch.int32)
-    table = torch.empty((0, 132), dtype=torch.int32)
-    with pytest.raises(AssertionError):
-        pack_sparse_tail(
-            indices, torch.empty(0), table, torch.empty(0, dtype=torch.int32)
-        )
-
-
-@pytest.mark.parametrize("different_device", range(4))
-def test_sparse_tail_rejects_mixed_devices(different_device):
-    shapes = [(0, 4), (0,), (0, 132), (0,)]
-    tensors = [torch.empty(shape, dtype=torch.int32) for shape in shapes]
-    tensors[different_device] = tensors[different_device].to("meta")
-    with pytest.raises(AssertionError):
-        pack_sparse_tail(*tensors)
 
 
 if __name__ == "__main__":

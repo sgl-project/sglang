@@ -7,7 +7,7 @@ import torch
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
 
-from sglang.kernels.ops.diffusion.common.numerics import round_bf16_to_fp32
+from sglang.kernels.numerics import round_bf16_to_fp32
 
 
 @triton.jit

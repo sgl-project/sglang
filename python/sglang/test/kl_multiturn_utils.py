@@ -89,8 +89,16 @@ def make_mamba_prefill_assert(chunk_size: int = 64) -> Callable:
     return _check
 
 
-def make_mamba_decode_assert(track_interval: int = 16) -> Callable:
-    """Mamba: cached_tokens = floor((history+output-1)/interval)*interval."""
+def make_mamba_decode_assert(
+    track_interval: int = 16, max_checkpoint_lag: int = 0
+) -> Callable:
+    """Check the decode boundary with an optional bounded checkpoint lag.
+
+    Retraction can discard the last absolute decode checkpoint. Resumed prefill
+    tracks states relative to its cached prefix, so the retained checkpoint can
+    lag the expected decode boundary by less than one prefill chunk. Pressure
+    tests can opt into this allowance; other callers remain strict by default.
+    """
 
     def _check(result: dict, history_len: int, output_len: int, label: str):
         actual = result["meta_info"]["cached_tokens"]
@@ -100,8 +108,9 @@ def make_mamba_decode_assert(track_interval: int = 16) -> Callable:
             expected = (
                 (history_len + output_len - 1) // track_interval
             ) * track_interval
+            expected = max(0, expected - max_checkpoint_lag)
         assert actual >= expected, (
-            f"{label}: expected cached_tokens={expected}, got {actual}"
+            f"{label}: expected cached_tokens>={expected}, got {actual}"
         )
 
     return _check

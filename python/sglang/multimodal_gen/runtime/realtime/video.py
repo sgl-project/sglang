@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import time
-import zlib
 from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any
 
@@ -21,85 +20,9 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 RAW_RGB_CONTENT_TYPE = "application/x-raw-rgb"
-RAW_RGB_DELTA_GZIP_CONTENT_TYPE = "application/x-raw-rgb-delta-gzip"
-RAW_RGBA_DELTA_GZIP_CONTENT_TYPE = "application/x-raw-rgba-delta-gzip"
 WEBP_FRAME_CONTENT_TYPE = "image/webp"
 JPEG_FRAME_CONTENT_TYPE = "image/jpeg"
 RAW_RGB_CHANNELS = 3
-RAW_RGBA_CHANNELS = 4
-_RAW_RGB_DELTA_GZIP_LEVEL = 0
-
-
-def build_delta_gzip_raw_rgb_payload(
-    frames: list[bytes],
-    *,
-    reference_frame: bytes | None = None,
-) -> bytes:
-    if not frames:
-        return b""
-
-    frame_size = len(frames[0])
-    if reference_frame is not None and len(reference_frame) != frame_size:
-        raise ValueError("raw RGB delta gzip reference frame size mismatch")
-
-    previous = (
-        np.frombuffer(reference_frame, dtype=np.uint8)
-        if reference_frame is not None
-        else None
-    )
-    # keep gzip framing for lossless transport without spending realtime budget on compression
-    compressor = zlib.compressobj(
-        level=_RAW_RGB_DELTA_GZIP_LEVEL, method=zlib.DEFLATED, wbits=31
-    )
-    compressed_chunks = []
-    for frame in frames:
-        if len(frame) != frame_size:
-            raise ValueError("raw RGB delta gzip requires fixed-size frames")
-        current = np.frombuffer(frame, dtype=np.uint8)
-        if previous is None:
-            delta_frame = frame
-        else:
-            delta_frame = np.bitwise_xor(current, previous).tobytes()
-        compressed_chunks.append(compressor.compress(delta_frame))
-        previous = current
-
-    compressed_chunks.append(compressor.flush())
-    return b"".join(compressed_chunks)
-
-
-def restore_delta_gzip_raw_rgb_payload(
-    payload: bytes,
-    *,
-    bytes_per_frame: int,
-    num_frames: int,
-    reference_frame: bytes | None = None,
-) -> bytes:
-    if reference_frame is not None and len(reference_frame) != bytes_per_frame:
-        raise ValueError("delta gzip reference frame size mismatch")
-
-    delta_payload = zlib.decompress(payload, wbits=31)
-    expected_size = bytes_per_frame * num_frames
-    if len(delta_payload) != expected_size:
-        raise ValueError(
-            "delta gzip payload size mismatch: "
-            f"expected {expected_size}, got {len(delta_payload)}"
-        )
-
-    restored = bytearray(delta_payload)
-    previous = (
-        np.frombuffer(reference_frame, dtype=np.uint8)
-        if reference_frame is not None
-        else None
-    )
-    for frame_idx in range(num_frames):
-        offset = frame_idx * bytes_per_frame
-        current = np.frombuffer(
-            restored, dtype=np.uint8, count=bytes_per_frame, offset=offset
-        )
-        if previous is not None:
-            current ^= previous
-        previous = current
-    return bytes(restored)
 
 
 def build_raw_rgb_frame_batches(

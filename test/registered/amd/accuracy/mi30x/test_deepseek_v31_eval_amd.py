@@ -2,7 +2,7 @@
 
 Tests DeepSeek-V3.1 model using few-shot completion benchmark on MI300X.
 
-Registry: nightly-amd-8-gpu-deepseek-v31 suite
+Registry: nightly-accuracy-test-8-gpu-amd-deepseek-v31 suite
 """
 
 import ast
@@ -25,7 +25,10 @@ from sglang.utils import download_and_cache_file, read_jsonl
 
 # Register for AMD CI - DeepSeek-V3.1 accuracy tests (~60 min)
 register_amd_ci(
-    est_time=3600, suite="nightly-amd-accuracy-8-gpu-deepseek-v31", nightly=True
+    est_time=3600,
+    suite="nightly-accuracy-test-8-gpu-amd-deepseek-v31",
+    nightly=True,
+    disabled="Older model generation; AMD nightly keeps the latest two per family",
 )
 
 INVALID = -9999999

@@ -28,6 +28,7 @@ from transformers import PretrainedConfig
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.srt.distributed.utils import get_group_rank_size
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
@@ -52,13 +53,15 @@ from sglang.srt.layers.moe import (
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
 from sglang.srt.layers.moe.utils import filter_moe_weight_param_global_expert
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_utils import dequant_mxfp4
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -84,14 +87,13 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.utils import (
     LazyValue,
-    add_prefix,
     get_device,
     is_cpu,
     is_cuda,
     is_flashinfer_available,
+    is_gfx1250_supported,
     is_hip,
     is_npu,
-    make_pp_layers,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -137,8 +139,11 @@ class TinyGemmLinear(ReplicatedLinear):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # tinygemm serves only up to 128 tokens, so with it a token's router
+        # logits would depend on how many tokens share its batch.
         self._use_tinygemm = (
             _is_tinygemm_supported
+            and not get_exec().deterministic.enable_deterministic_inference
             and not self.skip_bias_add
             and self.weight.is_contiguous()
             and self.weight.shape[0] % 16 == 0
@@ -249,6 +254,19 @@ class GptOssSparseMoeBlock(nn.Module):
             prefix=add_prefix("experts", prefix),
             **extra_kwargs,
         )
+        scheme = getattr(self.experts, "scheme", None)
+        if (
+            envs.SGLANG_GFX1250_W4A8_BYPASS_TOPK.get()
+            and is_gfx1250_supported()
+            and getattr(scheme, "routes_from_router_logits", False)
+            and get_moe_a2a_backend().is_none()
+            and get_exec().moe.expert_distribution_recorder_mode is None
+            and not get_exec().features.enable_return_routed_experts
+        ):
+            # The experts route from the raw router logits themselves; a STANDARD
+            # TopK would compute top-k ids and weights that nothing reads.
+            self.topk.topk_config.output_format = TopKOutputFormat.BYPASSED
+        self.topk.bind_runner_backend(self.experts.runner_backend)
 
         self.router = TinyGemmLinear(
             config.hidden_size,
@@ -557,9 +575,8 @@ class GptOssDecoderLayer(nn.Module):
 
         self.layer_id = layer_id
 
-        # GptOss all layers are sparse
-        self.is_layer_sparse = True
-        is_next_layer_sparse = True
+        attn, ffn = self.stage_facts(config, layer_id)
+        self.is_layer_sparse = ffn.sparse
 
         if self.is_layer_sparse:
             self.mlp = GptOssSparseMoeBlock(
@@ -590,13 +607,22 @@ class GptOssDecoderLayer(nn.Module):
         )
 
         self.attn_boundary, self.ffn_boundary = append_stages(
-            (declare_attn(), self.input_layernorm),
-            (
-                declare_ffn(
-                    sparse=self.is_layer_sparse,
-                    next_layer_sparse=is_next_layer_sparse,
-                ),
-                self.post_attention_layernorm,
+            (attn, self.input_layernorm),
+            (ffn, self.post_attention_layernorm),
+        )
+
+    @staticmethod
+    def stage_facts(config: GptOssConfig, layer_id: int):
+        """The stages the layer at ``layer_id`` declares: the model's shared
+        declaration function (see make_layers)."""
+        # GptOss all layers are sparse
+        is_layer_sparse = True
+        is_next_layer_sparse = True
+        return (
+            declare_attn(),
+            declare_ffn(
+                sparse=is_layer_sparse,
+                next_layer_sparse=is_next_layer_sparse,
             ),
         )
 
@@ -664,6 +690,7 @@ class GptOssModel(nn.Module):
                 prefix=prefix,
             ),
             prefix=add_prefix("layers", prefix),
+            stage_facts=lambda idx: decoder_layer_type.stage_facts(config, idx),
         )
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
