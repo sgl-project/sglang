@@ -19,6 +19,7 @@ import sglang.multimodal_gen.runtime.layers.quantization  # noqa: F401
 from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.base import (
     SGLDiffusionExecutor,
 )
+from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 from sglang.multimodal_gen.runtime.layers.lora.linear import BaseLayerWithLoRA
 from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import LoRAPipeline
 
@@ -121,11 +122,6 @@ def test_chained_lora_nodes_keep_every_lora() -> None:
     assert merged.model_options["sgld_lora_input"]["merge_mode"] == "merge"
 
 
-class _TupleLinear(torch.nn.Linear):
-    def forward(self, x):
-        return super().forward(x), None
-
-
 class _Pipeline(LoRAPipeline):
     def create_pipeline_stages(self, args):
         return None
@@ -133,7 +129,7 @@ class _Pipeline(LoRAPipeline):
 
 def _one_layer_pipeline():
     """Identity 2x2 layer; adapter A adds to output 0 and B to output 1."""
-    linear = _TupleLinear(2, 2, bias=False)
+    linear = ReplicatedLinear(2, 2, bias=False)
     linear.weight.data.copy_(torch.eye(2))
     layer = BaseLayerWithLoRA(linear)
     p = object.__new__(_Pipeline)
