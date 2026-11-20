@@ -22,6 +22,7 @@ from typing import Awaitable, Callable, List, NamedTuple, Optional
 import requests
 
 from sglang.benchmark.serving import run_benchmark
+from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
@@ -1003,22 +1004,22 @@ def start_memcache_meta_service(
 
 HICACHE_STORAGE_BACKEND_ARG = "--hicache-storage-backend"
 
-# Default port of the Mooncake master service. It avoids the ports the test
-# framework already uses: --dist-init-addr (5000), the PD separation worker
-# HTTP server (8000) and the MemCache components (5007/6007/8007).
+# Default port of the Mooncake master service. 
 MOONCAKE_MASTER_PORT = 50051
-# Metrics endpoint of the same master. The standalone deployment scripts set it
-# explicitly, and the store client's master_metrics_port defaults to this value.
-MOONCAKE_MASTER_METRICS_PORT = 9003
 
 
-def get_hicache_storage_backend(other_args):
-    """Return the ``--hicache-storage-backend`` value in ``other_args``."""
-    args = [str(arg) for arg in other_args or []]
+def get_server_args_value(args_list, name):
+    """Return the value of the server arg ``name`` in ``args_list``.
+
+    Accepts both ``["--key", value]`` and ``["--key=value"]`` forms and returns
+    None when the flag is absent. ``name`` must be a flag that takes a value;
+    boolean switches have no value to return.
+    """
+    args = [str(arg) for arg in args_list or []]
     for i, arg in enumerate(args):
-        if arg == HICACHE_STORAGE_BACKEND_ARG:
+        if arg == name:
             return args[i + 1] if i + 1 < len(args) else None
-        if arg.startswith(f"{HICACHE_STORAGE_BACKEND_ARG}="):
+        if arg.startswith(f"{name}="):
             return arg.split("=", 1)[1]
     return None
 
@@ -1059,7 +1060,6 @@ def _wait_for_tcp_port(process, port, timeout=30, poll_interval=0.5):
 
 def start_mooncake_master(
     master_port=MOONCAKE_MASTER_PORT,
-    metrics_port=MOONCAKE_MASTER_METRICS_PORT,
     eviction_high_watermark_ratio=0.95,
 ):
     """Start the Mooncake master service on the current node.
@@ -1076,12 +1076,12 @@ def start_mooncake_master(
 
     Args:
         master_port (int): Port the master service listens on.
-        metrics_port (int): Port the master exposes its metrics on.
         eviction_high_watermark_ratio (float): Watermark that triggers eviction.
 
     Returns:
         subprocess.Popen: The Mooncake master process.
     """
+    metrics_port = envs.MOONCAKE_MASTER_METRICS_PORT.get()
     command = [
         "mooncake_master",
         "--rpc_address=0.0.0.0",
@@ -1140,7 +1140,7 @@ def maybe_start_hicache_storage_service(other_args):
     Returns:
         subprocess.Popen: The storage service process, or None if not started.
     """
-    backend = get_hicache_storage_backend(other_args)
+    backend = get_server_args_value(other_args, HICACHE_STORAGE_BACKEND_ARG)
     if backend == "npu_memcache":
         process = start_memcache_meta_service()
         logger.info(f"Memcache meta service started with PID: {process.pid}")

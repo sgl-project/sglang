@@ -7,19 +7,17 @@ import subprocess
 import threading
 import time
 from functools import wraps
-from types import SimpleNamespace
 from typing import Iterable, Optional, Union
 
 import requests
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.few_shot_gsm8k import run_eval as run_eval_gsm8k
 from sglang.test.server_fixtures.disaggregation_fixture import (
     SGL_ROUTER_REQUEST_TIMEOUT_SECS,
     find_sgl_router_binary,
     sgl_router_command,
 )
-from sglang.test.test_utils import CustomTestCase, popen_launch_server
+from sglang.test.test_utils import popen_launch_server
 
 logging.basicConfig(
     level=logging.INFO,
@@ -494,22 +492,10 @@ def _sample_worker_server_info(ip, port, timeout=5):
     )
 
 
-def _get_arg_value(args_list, name):
-    for i, arg in enumerate(args_list):
-        # Args are not always strings: launcher-injected values (ports,
-        # sizes) are ints and must not be probed for a "--key=value" prefix.
-        if not isinstance(arg, str):
-            continue
-        if arg == name and i + 1 < len(args_list):
-            return args_list[i + 1]
-        # Also accept the --key=value form.
-        if arg.startswith(f"{name}="):
-            return arg[len(name) + 1 :]
-    return None
-
-
 def _get_nnodes_from_args(args_list):
-    nnodes = _get_arg_value(args_list, "--nnodes")
+    from sglang.test.ascend.test_ascend_utils import get_server_args_value
+
+    nnodes = get_server_args_value(args_list, "--nnodes")
     return int(nnodes) if nnodes is not None else None
 
 
@@ -733,12 +719,13 @@ def launch_pd_mix_node(model_config):
         os.environ[key] = value
 
     from sglang.test.ascend.test_ascend_utils import (
-        get_hicache_storage_backend,
+        HICACHE_STORAGE_BACKEND_ARG,
+        get_server_args_value,
         resolve_local_ip,
         set_mooncake_master_env,
     )
 
-    if get_hicache_storage_backend(other_args) == "mooncake":
+    if get_server_args_value(other_args, HICACHE_STORAGE_BACKEND_ARG) == "mooncake":
         set_mooncake_master_env(master_node_ip)
         # Each node registers its own address with the store instead of the
         # shared "localhost" default, which other nodes cannot reach.
@@ -825,7 +812,11 @@ def launch_pd_separation_node(model_config):
         if role == "prefill"
         else model_config["decode_args"]
     )
-    transfer_backend = _get_arg_value(role_args, "--disaggregation-transfer-backend")
+    from sglang.test.ascend.test_ascend_utils import get_server_args_value
+
+    transfer_backend = get_server_args_value(
+        role_args, "--disaggregation-transfer-backend"
+    )
     if transfer_backend in (None, "ascend"):
         mf_addr = f"tcp://{master_prefill_ip}:24666"
         os.environ["ASCEND_MF_STORE_URL"] = mf_addr
@@ -951,12 +942,13 @@ def launch_pd_separation_node(model_config):
     other_args.extend(service_args)
 
     from sglang.test.ascend.test_ascend_utils import (
-        get_hicache_storage_backend,
+        HICACHE_STORAGE_BACKEND_ARG,
+        get_server_args_value,
         resolve_local_ip,
         set_mooncake_master_env,
     )
 
-    if get_hicache_storage_backend(service_args) == "mooncake":
+    if get_server_args_value(service_args, HICACHE_STORAGE_BACKEND_ARG) == "mooncake":
         set_mooncake_master_env(master_prefill_ip)
         # Each node registers its own address with the store instead of the
         # shared "localhost" default, which other nodes cannot reach.
@@ -1166,211 +1158,6 @@ def wait_server_ready(
                 f"Server {url} failed to start in {timeout}s (elapsed: {elapsed_time:.2f}s)"
             )
         time.sleep(check_interval)
-
-
-class TestNpuMultiNodePdMixTestCaseBase(CustomTestCase):
-    model_config = None
-
-    @classmethod
-    def setUpClass(cls):
-        cls.process = None
-        cls.local_ip = "127.0.0.1"
-        cls.host = os.getenv("POD_IP")
-        cls.port = SERVICE_PORT
-        cls.base_url = f"http://{cls.host}:{cls.port}"
-        cls.hostname = os.getenv("HOSTNAME")
-        cls.role = "master" if cls.hostname.endswith("sglang-node-0") else "worker"
-        logger.info(f"Init {cls.host} {cls.role=}!")
-        cls.sglang_thread = None
-        cls.stop_event = threading.Event()
-
-    @classmethod
-    def tearDownClass(cls):
-        if cls.process:
-            try:
-                kill_process_tree(cls.process.pid)
-            except Exception as e:
-                logger.error(f"Error during tearDown: {e}")
-
-    @classmethod
-    @check_role(allowed_roles=["master"])
-    def launch_pd_mix_master_node(cls):
-        logger.info(f"Starting master node in thread...")
-        cls.sglang_thread = threading.Thread(
-            target=launch_pd_mix_node, args=(cls.model_config,)
-        )
-        cls.sglang_thread.daemon = True
-        cls.sglang_thread.start()
-
-        health_check_url = f"{cls.base_url}/health"
-        logger.info(f"Waiting for router to be ready at {health_check_url}")
-        wait_server_ready(health_check_url)
-
-        logger.info(
-            f"Waiting {SERVER_INITIALIZATION_DELAY} seconds for the server to fully initialize..."
-        )
-        time.sleep(SERVER_INITIALIZATION_DELAY)
-
-    @classmethod
-    @check_role(allowed_roles=["worker"])
-    def launch_pd_mix_worker_node(cls):
-        logger.info(f"Starting master node in thread...")
-        cls.sglang_thread = threading.Thread(
-            target=launch_pd_mix_node, args=(cls.model_config,)
-        )
-        cls.sglang_thread.daemon = True
-        cls.sglang_thread.start()
-        keep_alive_time = 1800
-        logger.info(
-            f"{cls.role} node started, keeping test alive for {keep_alive_time} seconds"
-        )
-        time.sleep(keep_alive_time)
-
-    @classmethod
-    @check_role(allowed_roles=["master", "worker"])
-    def stop_sglang_thread(cls):
-        if cls.sglang_thread:
-            logger.info(f"Stopping sglang thread {cls.sglang_thread}")
-            if cls.sglang_thread.is_alive():
-                logger.info("Notifying stop event...")
-                cls.stop_event.set()
-                cls.sglang_thread.join(timeout=5)
-                if cls.sglang_thread.is_alive():
-                    logger.info(
-                        "Warning: subprocess is not terminated normally, it may has been already force stopped."
-                    )
-                else:
-                    logger.info("Subprocess has been Stopped.")
-        else:
-            logger.info("No running sglang thread.")
-
-    @check_role(allowed_roles=["master"])
-    def run_gsm8k_test(
-        self,
-        expect_accuracy,
-        num_shots=8,
-        data_path=None,
-        num_questions=200,
-        max_new_tokens=512,
-        parallel=128,
-    ):
-        args = SimpleNamespace(
-            num_shots=num_shots,
-            data_path=data_path,
-            num_questions=num_questions,
-            max_new_tokens=max_new_tokens,
-            parallel=parallel,
-            host=self.host,
-            port=self.port,
-        )
-        logger.info("Starting gsm8k test...")
-        metrics = run_eval_gsm8k(args)
-        self.assertGreaterEqual(
-            metrics["accuracy"],
-            expect_accuracy,
-            f"Accuracy is {str(metrics['accuracy'])}, is lower than {expect_accuracy}",
-        )
-
-
-class TestNpuMultiNodePdSepTestCaseBase(CustomTestCase):
-    model_config = None
-
-    @classmethod
-    def setUpClass(cls):
-        cls.process = None
-        cls.local_ip = "127.0.0.1"
-        cls.host = os.getenv("POD_IP")
-        cls.port = SERVICE_PORT
-        cls.base_url = f"http://{cls.host}:{cls.port}"
-        cls.hostname = os.getenv("HOSTNAME")
-        cls.role = (
-            "router"
-            if "router" in cls.hostname
-            else "prefill"
-            if "prefill" in cls.hostname
-            else "decode"
-        )
-        logger.info(f"Init {cls.host} {cls.role=}!")
-        cls.sglang_thread = None
-        cls.stop_event = threading.Event()
-
-    @classmethod
-    def tearDownClass(cls):
-        if cls.process:
-            try:
-                kill_process_tree(cls.process.pid)
-            except Exception as e:
-                logger.error(f"Error during tearDown: {e}")
-
-    @classmethod
-    @check_role(allowed_roles=["router"])
-    def start_router_server(cls):
-        cls.sglang_thread = start_router_thread(cls.model_config, cls.base_url)
-
-        logger.info(
-            f"Waiting {SERVER_INITIALIZATION_DELAY} seconds for the server to fully initialize..."
-        )
-        time.sleep(SERVER_INITIALIZATION_DELAY)
-
-    @classmethod
-    @check_role(allowed_roles=["prefill", "decode"])
-    def start_pd_server(cls):
-        logger.info(f"Starting pd separation node in thread...")
-        cls.sglang_thread = threading.Thread(
-            target=launch_pd_separation_node, args=(cls.model_config,)
-        )
-        cls.sglang_thread.daemon = True
-        cls.sglang_thread.start()
-        keep_alive_time = 1800
-        logger.info(
-            f"{cls.role} node started, keeping test alive for {keep_alive_time} seconds"
-        )
-        time.sleep(keep_alive_time)
-
-    @classmethod
-    @check_role(allowed_roles=["prefill", "decode", "router"])
-    def stop_sglang_thread(cls):
-        if cls.sglang_thread:
-            logger.info(f"Stopping sglang thread {cls.sglang_thread}")
-            if cls.sglang_thread.is_alive():
-                logger.info("Notifying stop event...")
-                cls.stop_event.set()
-                cls.sglang_thread.join(timeout=5)
-                if cls.sglang_thread.is_alive():
-                    logger.info(
-                        "Warning: subprocess is not terminated normally, it may has been already force stopped."
-                    )
-                else:
-                    logger.info("Subprocess has been Stopped.")
-        else:
-            logger.info("No running sglang thread.")
-
-    @check_role(allowed_roles=["router"])
-    def run_gsm8k_test(
-        self,
-        expect_accuracy,
-        num_shots=8,
-        data_path=None,
-        num_questions=200,
-        max_new_tokens=512,
-        parallel=128,
-    ):
-        args = SimpleNamespace(
-            num_shots=num_shots,
-            data_path=data_path,
-            num_questions=num_questions,
-            max_new_tokens=max_new_tokens,
-            parallel=parallel,
-            host=self.host,
-            port=self.port,
-        )
-        logger.info("Starting gsm8k test...")
-        metrics = run_eval_gsm8k(args)
-        self.assertGreaterEqual(
-            metrics["accuracy"],
-            expect_accuracy,
-            f"Accuracy is {str(metrics['accuracy'])}, is lower than {expect_accuracy}",
-        )
 
 
 def kill_process_group(process):
