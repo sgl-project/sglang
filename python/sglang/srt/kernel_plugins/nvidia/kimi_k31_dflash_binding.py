@@ -150,7 +150,15 @@ GUARD: dict[str, tuple[str, Callable[[Any], Any]]] = {
     "block_verification": ("worker", lambda w: w._block_verification),
     "replicated_embed": ("worker", lambda w: w._full_embed_gpu is not None),
     "aux_graph": ("worker._use_aux_graph", lambda w: w._use_aux_graph),
-    "decode_cuda_graph_bs": ("exec cuda_graph_config", lambda w: _decode_graph_bs()),
+    "decode_cuda_graph_bs": (
+        "exec cuda_graph_config, None when disabled",
+        lambda w: (
+            None
+            if (decode := get_exec().graph.cuda_graph_config.decode).backend
+            == Backend.DISABLED
+            else tuple(sorted(decode.bs))
+        ),
+    ),
     "ragged_verify_mode": ("env", lambda w: read_ragged_verify_mode().value),
     "eager_draft_sampler": (
         "env",
@@ -171,13 +179,6 @@ GUARD: dict[str, tuple[str, Callable[[Any], Any]]] = {
     "hisparse": ("memory.enable_hisparse", lambda w: get_memory().enable_hisparse),
     "lora": ("lora.enable_lora", lambda w: bool(get_lora().enable_lora)),
 }
-
-
-def _decode_graph_bs() -> Optional[tuple[int, ...]]:
-    decode = get_exec().graph.cuda_graph_config.decode
-    if decode.backend == Backend.DISABLED:
-        return None
-    return tuple(sorted(decode.bs))
 
 
 class DFlashBinding:
