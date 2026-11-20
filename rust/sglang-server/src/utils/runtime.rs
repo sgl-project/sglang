@@ -377,6 +377,16 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
         detokenizer_rx.push(rx);
     }
 
+    if let Some(metrics) = &metrics {
+        use crate::api_server::core::queue_len;
+        metrics.watch_queues(vec![
+            ("intake", queue_len(tok_manager_tx.downgrade())),
+            ("tokenizer", queue_len(tokenizer_tx.downgrade())),
+            ("mm", queue_len(mm_worker_tx.downgrade())),
+            ("scheduler", queue_len(to_scheduler_tx.downgrade())),
+        ]);
+    }
+
     // Aborts get their own UNBOUNDED lane: on the bounded inbox they are dropped
     // exactly under the overload that makes them necessary (see `Senders::abort`).
     let (abort_tx, abort_rx) = flume::unbounded::<crate::tokenizer_manager::wiring::AbortSource>();
@@ -2222,6 +2232,42 @@ mod tests {
         );
         assert!(std::net::TcpStream::connect(http_addr).is_err());
         assert!(std::net::TcpStream::connect(grpc_addr).is_err());
+    }
+
+    /// With metrics on, the runtime exports each stage queue's depth from the
+    /// start.
+    #[test]
+    fn runtime_exports_its_queue_depths() {
+        use std::time::{Duration, Instant};
+
+        let dir = std::env::temp_dir().join(format!("runtime-queues-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (addr, _) = free_loopback_addrs();
+        let mut cfg = test_config(addr, None);
+        cfg.server_args = Arc::new(ServerArgs {
+            metrics: Some(crate::message::config::MetricsConfig::for_dir(&dir)),
+            ..test_server_args()
+        });
+        let rt = start(cfg, None).expect("start runtime");
+        take_startup_freeze_gc(&rt);
+        let metrics = Arc::clone(rt.core.metrics().unwrap());
+        let depths = || {
+            ["intake", "tokenizer", "mm", "scheduler"].map(|stage| {
+                metrics.exported(&format!(
+                    r#"sglang:frontend_queue_depth{{stage="{stage}"}}"#
+                ))
+            })
+        };
+        assert_eq!(depths(), [Some(0.0); 4]);
+        // No scheduler drains the ring here, so the request stays queued.
+        let _waiting = send_http(addr, "POST", "/generate", r#"{"input_ids":[1,2,3]}"#);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while depths()[3] != Some(1.0) && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(depths(), [Some(0.0), Some(0.0), Some(0.0), Some(1.0)]);
+        rt.request_shutdown();
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// Every abort by rid reaches the package's abort hook, from each entry:

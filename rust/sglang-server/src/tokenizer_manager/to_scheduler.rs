@@ -16,7 +16,7 @@ use crate::tokenizer_manager::to_scheduler_validation::{
 };
 use crate::tokenizer_manager::wiring::{AbortSource, Senders, TmEvent};
 use crate::utils::{
-    error::Error,
+    error::{Error, QueueStage},
     fsm::{Event, RequestState, ValidationOutcome},
 };
 
@@ -283,7 +283,9 @@ impl Intake {
                         }
                         Err(e) => {
                             let (err, mut req) = match e {
-                                flume::TrySendError::Full(req) => (Error::QueueFull, req),
+                                flume::TrySendError::Full(req) => {
+                                    (Error::QueueFull(QueueStage::Mm), req)
+                                }
                                 flume::TrySendError::Disconnected(req) => {
                                     (Error::Internal("mm worker pool gone".into()), req)
                                 }
@@ -443,7 +445,7 @@ impl Intake {
         // Flume hands the request back on either failure.
         let (err, mut req) = match self.senders.tokenizer_tx.try_send(req) {
             Ok(()) => return true,
-            Err(flume::TrySendError::Full(req)) => (Error::QueueFull, req),
+            Err(flume::TrySendError::Full(req)) => (Error::QueueFull(QueueStage::Tokenizer), req),
             // Pool gone (workers exited).
             Err(flume::TrySendError::Disconnected(req)) => {
                 (Error::Internal("tokenizer pool gone".into()), req)
@@ -475,7 +477,7 @@ impl Intake {
             header,
             buffers: Vec::new(),
         }) {
-            self.fail(&mut req, Error::QueueFull, true); // registered
+            self.fail(&mut req, Error::QueueFull(QueueStage::Scheduler), true); // registered
         }
     }
 
@@ -571,7 +573,7 @@ impl Intake {
             .try_push(SchedulerRequest { header, buffers })
         {
             dispatch_finish_time.clear();
-            self.fail(&mut req, Error::QueueFull, true); // registered
+            self.fail(&mut req, Error::QueueFull(QueueStage::Scheduler), true); // registered
         }
         // On success the scheduler owns the request (response arrives by rid); we
         // drop our `Request` here — the detok shard holds the sink.

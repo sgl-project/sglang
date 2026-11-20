@@ -452,7 +452,7 @@ pub(super) fn translate_runtime_error(error: Error) -> CoreError {
     match error {
         Error::Validation(message) => CoreError::InvalidArgument(message),
         Error::Encode(error) => error.into(),
-        Error::QueueFull => CoreError::Overloaded("to_scheduler channel full".into()),
+        Error::QueueFull(_) => CoreError::Overloaded("to_scheduler channel full".into()),
         Error::Disconnected => CoreError::Cancelled("client disconnected".into()),
         error => CoreError::Internal(error.to_string()),
     }
@@ -759,7 +759,7 @@ mod tests {
             CoreError::InvalidArgument(message) if message == "bad input"
         ));
         assert!(matches!(
-            translate_runtime_error(Error::QueueFull),
+            translate_runtime_error(Error::QueueFull(crate::utils::error::QueueStage::Scheduler)),
             CoreError::Overloaded(message) if message == "to_scheduler channel full"
         ));
         assert!(matches!(

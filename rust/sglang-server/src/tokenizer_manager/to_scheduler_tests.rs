@@ -1228,7 +1228,10 @@ fn full_tokenizer_pool_rejects_without_blocking_intake() {
         let Ok(ResponseItem::Error(err)) = rx.try_recv() else {
             panic!("expected a terminal error frame");
         };
-        assert!(matches!(err, Error::QueueFull), "{err}");
+        assert!(
+            matches!(err, Error::QueueFull(QueueStage::Tokenizer)),
+            "{err}"
+        );
     }
     assert!(
         matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { rid, .. }) if rid.as_str() == "2")
@@ -1264,6 +1267,52 @@ fn mm_pool_gone_deregisters() {
         Ok(DetokMsg::Deregister { .. })
     ));
     assert!(consumer.drain(16).is_empty(), "nothing queued");
+}
+
+/// A full mm pool queue and a full request ring each refuse with `QueueFull`
+/// naming their stage, as the tokenizer pool's does.
+#[test]
+fn full_mm_pool_and_request_ring_name_their_stage() {
+    let (detok_tx, _detok_rx) = flume::unbounded();
+    let (to_scheduler_tx, consumer) = to_scheduler(1);
+    // A rendezvous channel with no worker waiting: every hand-off finds it full.
+    let (mm_tx, _mm_rx) = flume::bounded(0);
+    let (sd_tx, sd_rx) = flume::unbounded::<()>();
+    std::mem::forget(sd_tx);
+    let mut intake = Intake::new(
+        flume::unbounded().1,
+        flume::unbounded().1,
+        Senders {
+            tok_manager_tx: flume::unbounded().0,
+            abort_tx: flume::unbounded().0,
+            tokenizer_tx: flume::unbounded().0,
+            detokenizer_tx: vec![detok_tx],
+        },
+        to_scheduler_tx,
+        test_limits(),
+        test_mm(mm_tx, true),
+        sd_rx,
+    );
+    let refused_at = |intake: &mut Intake, mut req: Request| {
+        let (tx, mut rx) = mpsc::channel(8);
+        req.sink = ResponseSink::Local(tx);
+        intake.drive(req);
+        match rx.try_recv() {
+            Ok(ResponseItem::Error(Error::QueueFull(stage))) => Some(stage),
+            _ => None,
+        }
+    };
+    let generate = |id| generate_req(id, SamplingParams::default());
+    assert_eq!(
+        refused_at(&mut intake, mm_pretokenized_req("mm")),
+        Some(QueueStage::Mm)
+    );
+    assert_eq!(refused_at(&mut intake, generate(1)), None);
+    assert_eq!(
+        refused_at(&mut intake, generate(2)),
+        Some(QueueStage::Scheduler)
+    );
+    assert_eq!(consumer.drain(4).len(), 1, "only the first fit the ring");
 }
 
 /// Build a generate request carrying an image and a text prompt.
