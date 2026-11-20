@@ -370,6 +370,59 @@ def test_relative_prefill_scores_equal_absolute(dtype, lengths, rows_per_block):
     assert torch.isneginf(reference[~window]).all()
 
 
+def _relative_prefill_stages_case():
+    """Rows straddling two requests, few enough key splits that each CTA pipelines
+    several K tiles."""
+    return _packed_prefill_case(
+        [9000, 2500], 500, torch.device("cuda"), torch.bfloat16, seed=7
+    )
+
+
+def test_relative_prefill_pipeline_stages(monkeypatch):
+    """gfx95 builds the relative prefill kernel with one K-tile pipeline stage
+    (three CTAs fit a CU's shared memory instead of two); other platforms keep
+    three."""
+    from sglang.srt.layers.attention.qsa import mqa
+    from sglang.srt.utils import is_gfx95_supported
+
+    if not mqa.HAS_TILELANG:
+        pytest.skip("tilelang unavailable")
+    build = mqa._tilelang_qsa_mqa_prefill_relative_kernel
+    stages = []
+    monkeypatch.setattr(
+        mqa,
+        "_tilelang_qsa_mqa_prefill_relative_kernel",
+        # 3 is the kernel's default.
+        lambda **kw: stages.append(kw.get("num_stages", 3)) or build(**kw),
+    )
+    q, k, starts, ends, width = _relative_prefill_stages_case()
+    mqa.tilelang_qsa_mqa_prefill_relative(q, k, starts, ends, width)
+    assert stages == [1 if is_gfx95_supported() else 3]
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_relative_prefill_scores_do_not_depend_on_stages(dtype, monkeypatch):
+    """One and three K-tile pipeline stages give the same scores, bit for bit."""
+    from sglang.srt.layers.attention.qsa import mqa
+
+    if not mqa.HAS_TILELANG:
+        pytest.skip("tilelang unavailable")
+    q, k, starts, ends, width = _relative_prefill_stages_case()
+    q, k = q.to(dtype), k.to(dtype)
+    build = mqa._tilelang_qsa_mqa_prefill_relative_kernel
+    scores = []
+    for stages in (1, 3):
+        monkeypatch.setattr(
+            mqa,
+            "_tilelang_qsa_mqa_prefill_relative_kernel",
+            lambda stages=stages, **kw: build(**{**kw, "num_stages": stages}),
+        )
+        scores.append(mqa.tilelang_qsa_mqa_prefill_relative(q, k, starts, ends, width))
+    window = torch.arange(width, device=q.device) < (ends - starts).reshape(-1, 1)
+    one, three = (s[window].view(torch.int32) for s in scores)
+    assert torch.equal(one, three)
+
+
 @pytest.mark.parametrize(
     "lengths, rows_per_block", [([700, 3000, 1500], 37), ([2600] * 8, 32)]
 )
