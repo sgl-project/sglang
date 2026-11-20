@@ -1,5 +1,5 @@
 import logging
-from typing import TYPE_CHECKING, Callable, Optional, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Callable, Optional, Protocol, runtime_checkable
 
 import torch
 
@@ -26,6 +26,7 @@ from sglang.srt.runtime_context import (
     get_spec,
     mamba_track_grid,
 )
+from sglang.srt.sampling.watermarking.interface import VerifyWatermark
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
@@ -1213,7 +1214,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             if grammar_mask is not None:
                 grammar_mask.apply(logits_output.next_token_logits)
 
-        target_logits, watermark_rows = self._force_watermark(
+        target_logits, sampling_info, watermark = self._force_watermark(
             batch=batch,
             logits_output=logits_output,
             verify_ids_2d=verify_ids_2d,
@@ -1272,13 +1273,13 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
         if graph_accept and self._deferred_draft_kv is not None:
             self._deferred_draft_kv.note_staged(batch.reqs)
-        if watermark_rows is not None:
-            self.target_worker.model_runner.watermark_state.commit_speculative_chain(
-                req_pool_indices=batch.req_pool_indices,
-                context_hashes=watermark_rows[0],
-                selected=watermark_rows[1],
-                accept_tokens=accept.out_tokens,
-                accept_lens=accept.commit_lens,
+        if watermark is not None:
+            watermark.record(None, accept.commit_lens)
+            self.target_worker.model_runner.watermark.append_accept_tokens(
+                sampling_info.watermark,
+                batch.req_pool_indices,
+                accept.out_tokens,
+                accept.commit_lens,
             )
         engram_in_graph = (
             folded_accept and not run_compact and epilogue.folds_engram_commit
@@ -1404,26 +1405,28 @@ class DSparkWorkerV2(BaseSpecWorker):
         verify_ids_2d: torch.Tensor,
         positions_2d: torch.Tensor,
         sampling_info,
-    ) -> tuple[torch.Tensor, Optional[tuple[torch.Tensor, torch.Tensor]]]:
+    ) -> tuple[torch.Tensor, Any, Optional[VerifyWatermark]]:
         target_logits = logits_output.next_token_logits
-        watermark_state = self.target_worker.model_runner.watermark_state
-        if (
-            watermark_state is None
-            or sampling_info is None
-            or not sampling_info.has_watermark_candidates
-        ):
-            return target_logits, None
-        if batch.return_logprob:
-            # compute_spec_logprobs reads logits_output after acceptance.
-            target_logits = target_logits.clone()
-        watermark_rows = watermark_state.force_speculative_chain(
-            logits=target_logits,
-            req_pool_indices=batch.req_pool_indices,
-            chain_tokens=verify_ids_2d,
-            positions=positions_2d,
-            sampling_info=sampling_info,
+        engine = self.target_worker.model_runner.watermark
+        watermark = (
+            engine.bind_verify(sampling_info.watermark, full_mask=False)
+            if engine is not None and sampling_info is not None
+            else None
         )
-        return target_logits, watermark_rows
+        if watermark is None:
+            return target_logits, sampling_info, None
+        target_logits, sampling_info = watermark.apply(
+            target_logits,
+            sampling_info=sampling_info,
+            req_pool_indices=batch.req_pool_indices,
+            draft_tokens=verify_ids_2d,
+            positions=positions_2d,
+            draft_token_num=verify_ids_2d.shape[1],
+            custom_mask=None,
+            # compute_spec_logprobs reads logits_output after acceptance.
+            keep_logits=batch.return_logprob,
+        )
+        return target_logits, sampling_info, watermark
 
     def _sampling_graph_eligible(
         self,
