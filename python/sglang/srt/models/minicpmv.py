@@ -1770,6 +1770,10 @@ class MiniCPMV:
     def __call__(self, *args, **kwargs):
         return self.minicpmv(*args, **kwargs)
 
+    def eval(self):
+        self.minicpmv.eval()
+        return self
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         # Defer to the version-specific subclass loader if it overrides the
         # base (4.6 does — it needs prefix remap + Qwen3.5 LLM delegation).
