@@ -192,10 +192,15 @@ class StorageOperation(BaseStorageOperation):
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
         pool_transfers: Optional[list[PoolTransfer]] = None,
+        *,
+        kv_event_metadata: Optional[dict] = None,
     ):
         super().__init__(host_indices, token_ids, last_hash, hash_value, prefix_keys)
         self.pool_transfers = pool_transfers
         self.pool_storage_result = PoolTransferResult.empty()
+        # Only for a backend that publishes KV events; see
+        # HiCacheStorageExtraInfo.extra_info["kv_event_metadata"].
+        self.kv_event_metadata = kv_event_metadata
 
 
 class PrefetchOperation(StorageOperation):
@@ -209,6 +214,7 @@ class PrefetchOperation(StorageOperation):
         assume_stored: bool = False,
         *,
         storage_read_metadata: Optional[dict[str, Any]] = None,
+        kv_event_metadata: Optional[dict] = None,
     ):
         self.storage_read_metadata = storage_read_metadata
         self.handle = handle
@@ -230,6 +236,7 @@ class PrefetchOperation(StorageOperation):
             last_hash,
             prefix_keys=prefix_keys,
             pool_transfers=pool_transfers,
+            kv_event_metadata=kv_event_metadata,
         )
         self.pool_transfers_done = not bool(pool_transfers)
         # The hit query's verdict per pool, as the chain prefix length (in
@@ -319,6 +326,19 @@ def _storage_read_extra(operation: PrefetchOperation) -> Optional[dict]:
     metadata = getattr(operation, "storage_read_metadata", None)
     if metadata is not None:
         fields.update(metadata)
+    # Separate from storage_read_metadata, which is gated on kv_hints actions.
+    event_metadata = getattr(operation, "kv_event_metadata", None)
+    if event_metadata is not None:
+        fields["kv_event_metadata"] = event_metadata
+    return fields or None
+
+
+def _storage_write_extra(operation: StorageOperation) -> Optional[dict]:
+    """Backup-write metadata: trace ids and, if any, the pages' event identities."""
+    fields = _storage_trace_extra(operation, include_request_id=False)
+    event_metadata = getattr(operation, "kv_event_metadata", None)
+    if event_metadata is not None:
+        fields["kv_event_metadata"] = event_metadata
     return fields or None
 
 
@@ -1324,6 +1344,7 @@ class HybridCacheController(BaseHiCacheController):
         assume_stored: bool = False,
         *,
         storage_read_metadata: Optional[dict[str, Any]] = None,
+        kv_event_metadata: Optional[dict] = None,
     ) -> PrefetchOperation:
         operation = PrefetchOperation(
             handle,
@@ -1333,6 +1354,7 @@ class HybridCacheController(BaseHiCacheController):
             pool_transfers=extra_pools,
             assume_stored=assume_stored,
             storage_read_metadata=storage_read_metadata,
+            kv_event_metadata=kv_event_metadata,
         )
         self.prefetch_queue.put(operation)
         return operation
@@ -1362,6 +1384,7 @@ class HybridCacheController(BaseHiCacheController):
         assume_stored: bool = False,
         *,
         storage_read_metadata: Optional[dict[str, Any]] = None,
+        kv_event_metadata: Optional[dict] = None,
     ) -> PrefetchSubmission:
         if self.pp_prefetch_command_group is None:
             return PrefetchSubmission(
@@ -1373,8 +1396,11 @@ class HybridCacheController(BaseHiCacheController):
                     extra_pools=pool_transfers,
                     assume_stored=assume_stored,
                     storage_read_metadata=storage_read_metadata,
+                    kv_event_metadata=kv_event_metadata,
                 )
             )
+        # PP tickets carry no kv_event_metadata: a backend that publishes KV
+        # events is rejected at PP > 1 (UnifiedRadixCache.init_hicache).
 
         if self.storage_config.pp_rank != 0:
             raise RuntimeError("Only PP0 can submit a PP prefetch ticket.")
@@ -1674,6 +1700,8 @@ class HybridCacheController(BaseHiCacheController):
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
         extra_pools: Optional[list[PoolTransfer]] = None,
+        *,
+        kv_event_metadata: Optional[dict] = None,
     ) -> int:
         operation = StorageOperation(
             host_indices,
@@ -1681,6 +1709,7 @@ class HybridCacheController(BaseHiCacheController):
             hash_value=hash_value,
             prefix_keys=prefix_keys,
             pool_transfers=extra_pools,
+            kv_event_metadata=kv_event_metadata,
         )
         self.backup_queue.put(operation)
         return operation.id
@@ -2010,10 +2039,9 @@ class HybridCacheController(BaseHiCacheController):
             batch_host_indices = operation.host_indices[
                 start * self.page_size : (start + len(batch_hashes)) * self.page_size
             ]
-            trace_extra = _storage_trace_extra(operation, include_request_id=False)
             extra_info = HiCacheStorageExtraInfo(
                 prefix_keys=prefix_keys,
-                extra_info=trace_extra or None,
+                extra_info=_storage_write_extra(operation),
             )
             success = self.page_set_func(batch_hashes, batch_host_indices, extra_info)
             if not success:
@@ -2059,8 +2087,7 @@ class HybridCacheController(BaseHiCacheController):
                 operation.prefix_keys,
                 operation.hash_value,
                 backup_transfers,
-                extra_info=_storage_trace_extra(operation, include_request_id=False)
-                or None,
+                extra_info=_storage_write_extra(operation),
             ):
                 if self.storage_stop_event.is_set():
                     # Stopping: no new backend writes.

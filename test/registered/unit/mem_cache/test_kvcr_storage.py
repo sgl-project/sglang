@@ -1,10 +1,16 @@
 """CPU contracts for indexed HiCache IO; the native NIXL transport is faked."""
 
+import atexit
 import copy
 import ctypes
 import dataclasses
+import functools
+import hashlib
+import json
 import mmap
+import re
 import sys
+import time
 import types
 import unittest
 from array import array
@@ -17,11 +23,18 @@ from unittest.mock import patch
 
 import msgspec
 import torch
+import zmq
 
-from sglang.srt.disaggregation.kv_events import namespaced_block_hash
+from sglang.srt.disaggregation.kv_events import (
+    BlockRemoved,
+    BlockStored,
+    KVEventBatch,
+    StorageMedium,
+    namespaced_block_hash,
+)
 from sglang.srt.managers.cache_controller import HiCacheController
 from sglang.srt.managers.kv_hints import decode_kv_hints_envelope
-from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
+from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, CacheRequestHandle
 from sglang.srt.mem_cache.events import KVCacheEventRecorder
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
@@ -36,7 +49,10 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     StorageOperation,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.storage.kvcr.endpoints import control_address
+from sglang.srt.mem_cache.storage.kvcr.endpoints import (
+    control_address,
+    require_routable_host,
+)
 from sglang.srt.mem_cache.storage.kvcr.hints import peer_hint
 from sglang.srt.mem_cache.storage.kvcr.host_layout import (
     block_key,
@@ -45,11 +61,13 @@ from sglang.srt.mem_cache.storage.kvcr.host_layout import (
     resume_boundaries,
     storage_namespace,
 )
+from sglang.srt.mem_cache.storage.kvcr.inventory import KVCRInventory
 from sglang.srt.mem_cache.storage.kvcr.kvcr_store import (
     KVCRStore,
     _allocate_dram_pool,
     _bool_option,
 )
+from sglang.srt.mem_cache.storage_events import StorageEventReducer
 from sglang.srt.mem_cache.storage_key_binding import storage_key_to_event_hashes
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.mem_cache.utils import (
@@ -204,7 +222,11 @@ def _hint_gate(backend, recorder, page_size=2):
     cache.tree_core = SimpleNamespace(
         enable_storage=True, page_size=page_size, kv_events=recorder
     )
-    cache.cache_controller = SimpleNamespace(storage_backend=backend)
+    cache.cache_controller = SimpleNamespace(
+        storage_backend=backend, storage_config=SimpleNamespace(dcp_size=1)
+    )
+    cache.pp_size = 1
+    cache._init_storage_kv_events()
     return cache
 
 
@@ -271,6 +293,20 @@ class TestKVCRStorage(CustomTestCase):
             [control_address(b.config, b._extra) for b in backends],
             [("source.example", 32100), ("source.example", 32102)],
         )
+        # Discovery reports each replica once, under its own DP rank.
+        for backend in backends:
+            backend._extra["enable_remote_hint"] = backend._remote_hint = True
+        self.assertEqual(
+            [b.get_kv_hint_source() for b in backends],
+            [
+                {
+                    "dp_rank": rank,
+                    "capabilities": ["router_hint"],
+                    "source_control_endpoint": f"tcp://source.example:{port}",
+                }
+                for rank, port in ((0, 32100), (1, 32102))
+            ],
+        )
 
     def test_cp_shards_without_attention_dp_use_dense_offsets(self):
         """TP4/CP2 source endpoints must cover exactly four shards."""
@@ -294,6 +330,11 @@ class TestKVCRStorage(CustomTestCase):
             [control_address(b.config, b._extra)[1] for b in backends],
             [32100, 32101, 32102, 32103],
         )
+        # The same dense shards gate inventory: all four must hold a page.
+        self.assertEqual([b.kv_event_shard for b in backends], [0, 1, 2, 3])
+        self.assertEqual([b.kv_event_shard_count for b in backends], [4] * 4)
+        batches = {backend.kv_event_shard: [] for backend in backends}
+        self.assertEqual(StorageEventReducer(4).update(batches), [])
 
     def test_whole_page_components_round_trip_to_different_slots(self):
         """A restore must move every unequal-sized component, not only primary KV."""
@@ -992,6 +1033,600 @@ class TestKVCRStorage(CustomTestCase):
     def test_trailing_window_holes_do_not_become_contiguous_prefixes(self):
         self.assertEqual(resume_boundaries([False, True, True, False], trailing=2), [3])
         self.assertEqual(resume_boundaries([True, False, True], trailing=None), [1])
+
+
+# KVCR's cache owner: <ns[:32]>:<ns[32:]>/<fixed cluster>/<process uuid>.
+_CACHE_OWNER = re.compile(r"^([0-9a-f]{32}:[0-9a-f]{32})/0{16}/[0-9a-f]{32}$")
+
+
+def _owned_store(block=17, parent=None, ownership="kvcr"):
+    return BlockStored(
+        block_hashes=[block],
+        parent_block_hash=parent,
+        token_ids=[1, 2],
+        block_size=2,
+        lora_id=None,
+        medium=StorageMedium.CPU,
+        ownership=ownership,
+    )
+
+
+def _owned_removal(block=17):
+    return BlockRemoved(
+        block_hashes=[block], medium=StorageMedium.CPU, ownership="kvcr"
+    )
+
+
+def _residency(keys, removed=False):
+    """A native KVCR InventoryEvent for the local DRAM tier."""
+    return SimpleNamespace(keys=tuple(keys), removed=removed)
+
+
+class TestKVCRInventory(CustomTestCase):
+    """KVCR's per-shard join of native residency and framework identities."""
+
+    def _inventory(self, *pools):
+        inventory = KVCRInventory()
+        inventory.configure("ns", pools)
+        return inventory
+
+    def test_native_residency_not_submission_drives_events(self):
+        inventory = self._inventory("kv", "index")
+        keys = [b"page#ns#kv", b"page#ns#index"]
+        framework = _owned_store(ownership=None)
+        held = inventory.register({"page": framework}, keys)
+        self.assertEqual(inventory.take(), [])
+        inventory.update(_residency(keys[:1]))
+        self.assertEqual(inventory.take(), [])
+        inventory.update(_residency(keys[1:]))
+        self.assertEqual(inventory.take(), [_owned_store()])
+        self.assertIsNone(framework.ownership)
+        inventory.release(held)
+        self.assertEqual(inventory.take(), [])
+        inventory.update(_residency(keys[:1], removed=True))
+        self.assertEqual(inventory.take(), [_owned_removal()])
+        inventory.update(_residency(keys[1:], removed=True))
+        self.assertEqual(inventory._metadata, {})
+
+    def test_trailing_pools_and_other_namespaces_do_not_gate_a_page(self):
+        inventory = self._inventory("kv")
+        held = inventory.register(
+            {"page": _owned_store()}, [b"page#ns#kv", b"page#ns#swa", b"page#other#kv"]
+        )
+        inventory.update(_residency([b"page#other#kv", b"page#ns#swa", b"junk"]))
+        self.assertEqual(inventory.take(), [])
+        inventory.update(_residency([b"page#ns#kv"]))
+        self.assertEqual(inventory.take(), [_owned_store()])
+        inventory.release(held)
+        inventory.update(_residency([b"page#ns#swa"], removed=True))
+        self.assertEqual(inventory.take(), [])
+
+    def test_failed_io_does_not_retain_metadata_or_advertise(self):
+        inventory = self._inventory("kv")
+        held = inventory.register({"page": _owned_store()}, [b"page#ns#kv"])
+        inventory.release(held)
+        self.assertEqual(inventory.take(), [])
+        self.assertEqual(inventory._metadata, {})
+        # Residency without an identity is never advertised.
+        inventory.update(_residency([b"page#ns#kv"]))
+        self.assertEqual(inventory.take(), [])
+
+    def test_published_page_is_removed_under_its_stored_identity(self):
+        inventory = self._inventory("kv")
+        inventory.register({"page": _owned_store(17)}, [b"page#ns#kv"])
+        inventory.update(_residency([b"page#ns#kv"]))
+        inventory.register({"page": _owned_store(18)}, [b"page#ns#kv"])
+        inventory.update(_residency([b"page#ns#kv"], removed=True))
+        self.assertEqual(inventory.take(), [_owned_store(17), _owned_removal(17)])
+
+    def test_rejects_multi_page_identities_and_trailing_only_layouts(self):
+        inventory = self._inventory("kv")
+        two_pages = _owned_store()
+        two_pages.block_hashes = [1, 2]
+        with self.assertRaisesRegex(ValueError, "one store payload per page"):
+            inventory.register({"page": two_pages}, [b"page#ns#kv"])
+        with self.assertRaisesRegex(ValueError, "ALL_PAGES pool"):
+            KVCRInventory().configure("ns", [])
+
+    def test_wire_coalescing_cannot_change_inventory_removal_identity(self):
+        inventory = self._inventory("kv")
+        keys = [b"first#ns#kv", b"second#ns#kv"]
+        held = inventory.register(
+            {"first": _owned_store(17), "second": _owned_store(18, parent=17)}, keys
+        )
+        inventory.update(_residency(keys))
+        inventory.release(held)
+        reducer = StorageEventReducer(1)
+        recorder = KVCacheEventRecorder(enabled=True, page_size=2)
+        for event in reducer.update({0: inventory.take()}):
+            recorder.enqueue(event)
+        self.assertEqual(recorder.take()[0].block_hashes, [17, 18])
+        inventory.update(_residency(keys[:1], removed=True))
+        removals = reducer.update({0: inventory.take()})
+        self.assertEqual([event.block_hashes for event in removals], [[17]])
+
+
+class _Residency(_CopyTransport):
+    """Native KVCR stand-in that reports LOCAL_G2 residency to the sink."""
+
+    def __init__(self, layouts, sink):
+        super().__init__(layouts)
+        self.sink, self.fail = sink, set()
+
+    def _report(self, keys, removed, tier="DRAM"):
+        self.sink(
+            SimpleNamespace(
+                keys=tuple(keys), tier=SimpleNamespace(value=tier), removed=removed
+            )
+        )
+
+    def deposit(self, blocks):
+        kept = {k: v for k, v in blocks.items() if k not in self.fail}
+        handle = super().deposit(kept)
+        self.completed[handle].update(
+            {k: SimpleNamespace(success=False) for k in self.fail if k in blocks}
+        )
+        # KVCR publishes committed residency before it completes the deposit.
+        self._report(kept, removed=False)
+        self._report(kept, removed=False, tier="G3")
+        return handle
+
+    def evict(self, keys):
+        for key in keys:
+            self.storage.pop(key)
+        self._report(keys, removed=True)
+
+    def close(self):
+        pass
+
+
+class TestKVCRInventoryPublication(CustomTestCase):
+    """KVCR DRAM residency reaches a KV-aware router the way Dynamo reads it."""
+
+    HOST = "10.1.2.3"
+
+    def setUp(self):
+        self.config = HiCacheStorageConfig(
+            tp_rank=0,
+            tp_size=1,
+            pp_rank=0,
+            pp_size=1,
+            attn_cp_rank=0,
+            attn_cp_size=1,
+            is_mla_model=False,
+            enable_storage_metrics=False,
+            is_page_first_layout=True,
+            model_name="glm-test",
+        )
+        self.enterContext(get_parallel().override(dp_rank=None))
+        self.pool = _HostPool()
+        types_module = types.ModuleType("kvcr.types")
+        types_module.MemoryRef, types_module.QueryStatus = _MemoryRef, _QueryStatus
+        self.enterContext(
+            patch.dict(
+                "sys.modules",
+                {"kvcr": types.ModuleType("kvcr"), "kvcr.types": types_module},
+            )
+        )
+        self.keys = [f"{i + 1:064x}" for i in range(4)]
+
+    def _extra(self, **overrides):
+        return {
+            "enable_remote_hint": True,
+            "publish_inventory": True,
+            "control_advertise_host": self.HOST,
+            "control_port": 29017,
+            **overrides,
+        }
+
+    def _backend(self, config=None, **overrides):
+        config = config or dataclasses.replace(
+            self.config, extra_config=self._extra(**overrides)
+        )
+        backend = KVCRStore(config, self.pool)
+        self.addCleanup(backend.close)
+        return backend
+
+    def _running(self, backend):
+        """Emulate _start's namespace and inventory wiring with a fake runner."""
+        backend._namespace = storage_namespace(backend.config, backend._layouts)
+        backend._inventory.configure(backend._namespace, ["kv"])
+        backend._runner = _Residency(backend._layouts, backend._record_inventory)
+        return backend._runner
+
+    def _metadata(self, pages, *, parent=None):
+        events = {}
+        for index, page in enumerate(pages):
+            events[page] = BlockStored(
+                block_hashes=[100 + index],
+                parent_block_hash=parent if index == 0 else 99 + index,
+                token_ids=[index, index],
+                block_size=2,
+                lora_id=None,
+                medium=StorageMedium.GPU,
+            )
+        return events
+
+    def _write(self, backend, keys, metadata):
+        return backend.batch_set_v1(
+            keys,
+            torch.arange(len(keys) * 2, dtype=torch.int64),
+            HiCacheStorageExtraInfo(extra_info={"kv_event_metadata": metadata}),
+        )
+
+    def test_hint_source_uses_backend_resolved_address_without_starting_io(self):
+        config = copy.copy(self.config)
+        config.tp_size = 2
+        config.extra_config = {
+            "enable_remote_hint": True,
+            "control_advertise_host": "2001:db8::1",
+            "control_port": 29017,
+        }
+        # Replica 2 of a TP2 deployment, without attention DP.
+        with get_parallel().override(dp_rank=2):
+            backend = self._backend(config)
+        source = backend.get_kv_hint_source()
+        self.assertEqual(
+            source,
+            {
+                "dp_rank": 2,
+                "capabilities": ["router_hint"],
+                "source_control_endpoint": "tcp://[2001:db8::1]:29021",
+            },
+        )
+        host, port = control_address(backend.config, backend._extra)
+        self.assertEqual(source["source_control_endpoint"], f"tcp://{host}:{port}")
+        self.assertIsNone(backend._runner)
+        # No router source without remote hints, an explicit advertised host
+        # (the default is loopback), or on any but the replica's first shard.
+        backend._remote_hint = False
+        self.assertIsNone(backend.get_kv_hint_source())
+        backend._remote_hint = True
+        backend._extra.pop("control_advertise_host")
+        self.assertIsNone(backend.get_kv_hint_source())
+        backend._extra["control_advertise_host"] = "worker-a"
+        backend._offset = 1
+        self.assertIsNone(backend.get_kv_hint_source())
+
+    def test_hint_source_rejects_invalid_advertised_coordinates(self):
+        for extra in (
+            {"control_advertise_host": "0.0.0.0"},
+            {"control_advertise_host": "tcp://worker-a"},
+            {"control_advertise_host": "worker-a", "control_port": True},
+            {"control_advertise_host": "worker-a", "control_port": 65535},
+        ):
+            with (
+                self.subTest(extra=extra),
+                self.assertRaises(ValueError),
+                get_parallel().override(dp_rank=1),
+            ):
+                config = copy.copy(self.config)
+                config.extra_config = {"enable_remote_hint": True, **extra}
+                self._backend(config).get_kv_hint_source()
+
+    def test_inventory_requires_a_routable_hint_source(self):
+        for extra in (
+            {"publish_inventory": True},
+            {"publish_inventory": True, "control_advertise_host": self.HOST},
+            {"publish_inventory": True, "enable_remote_hint": True},
+        ):
+            config = dataclasses.replace(self.config, extra_config=extra)
+            with (
+                self.subTest(extra=extra),
+                self.assertRaisesRegex(ValueError, "publish_inventory requires"),
+            ):
+                KVCRStore(config, self.pool)
+        # Dynamo's state agent subscribes from another host.
+        for host in ("127.0.0.1", "127.1", "localhost", "::1", "::ffff:127.0.0.1"):
+            with (
+                self.subTest(host=host),
+                self.assertRaisesRegex(ValueError, "must not be loopback"),
+            ):
+                self._backend(control_advertise_host=host)
+            # Loopback stays valid for hints alone.
+            self.assertTrue(
+                self._backend(
+                    control_advertise_host=host, publish_inventory=False
+                ).get_kv_hint_source()
+            )
+        with self.assertRaisesRegex(ValueError, "publish_inventory must be a boolean"):
+            self._backend(publish_inventory="true")
+
+    def test_rejects_replica_dp_combined_with_attention_dp(self):
+        """Replicas would share attention-DP ranks and control ports."""
+        module = "sglang.srt.mem_cache.storage.kvcr.kvcr_store"
+        config = dataclasses.replace(self.config, dp_rank=1, extra_config={})
+        with (
+            patch(f"{module}.is_dp_attention_enabled", return_value=True),
+            get_parallel().override(dp_size=2),
+            self.assertRaisesRegex(ValueError, "replica DP"),
+        ):
+            KVCRStore(config, self.pool)
+        with (
+            patch(f"{module}.is_dp_attention_enabled", return_value=True),
+            get_parallel().override(dp_size=1),
+        ):
+            self.assertEqual(self._backend(config).config.dp_rank, 1)
+
+    def test_routable_host_rejects_every_loopback_form(self):
+        for host in ("10.0.0.1", "worker-a", "[2001:db8::1]"):
+            with self.subTest(host=host):
+                require_routable_host(host)
+        for host in (
+            "127.0.0.1",
+            "127.1",
+            "2130706433",
+            "localhost.",
+            "0.0.0.0",
+            "[::1]",
+            "[::]",
+            "[::ffff:127.0.0.1]",
+            "*",
+        ):
+            with self.subTest(host=host), self.assertRaises(ValueError):
+                require_routable_host(host)
+
+    def test_cache_owner_is_canonical_engine_lifetime_and_inventory_only(self):
+        first, second = self._backend(), self._backend()
+        sources = [first.get_kv_hint_source(), second.get_kv_hint_source()]
+        for source in sources:
+            self.assertEqual(source["capabilities"], ["router_hint", "kvcr_inventory"])
+            self.assertRegex(source["cache_owner_id"], _CACHE_OWNER)
+        owners = [source["cache_owner_id"] for source in sources]
+        # Same model and shard: one indexer domain, the storage namespace.
+        namespace = storage_namespace(first.config, first._layouts)
+        self.assertEqual(
+            {owner.split("/", 1)[0] for owner in owners},
+            {f"{namespace[:32]}:{namespace[32:]}"},
+        )
+        # A new incarnation per engine process, fixed for its lifetime.
+        self.assertNotEqual(owners[0], owners[1])
+        self.assertEqual(first.get_kv_hint_source()["cache_owner_id"], owners[0])
+        self.assertNotIn(
+            "cache_owner_id",
+            self._backend(publish_inventory=False).get_kv_hint_source(),
+        )
+        # The advertised domain names exactly the pools it serves.
+        with self.assertRaisesRegex(ValueError, "before discovery"):
+            first.register_mem_host_pool_v2(_HostPool(), PoolName.MAMBA)
+
+    def test_native_dram_residency_drives_owned_events(self):
+        backend = self._backend()
+        transport = self._running(backend)
+        first, second = self.keys[:2]
+        metadata = self._metadata([first])
+        self.assertEqual(self._write(backend, [first, second], metadata), [True] * 2)
+        self.assertEqual(backend.pending_kv_events(), 1)
+        (stored,) = backend.take_kv_events()
+        self.assertEqual(backend.take_kv_events(), [])
+        # Identity from the framework, owner and medium from KVCR.
+        self.assertEqual(stored.block_hashes, [100])
+        self.assertEqual(stored.token_ids, [0, 0])
+        self.assertEqual((stored.ownership, stored.medium), ("kvcr", "CPU_PINNED"))
+        self.assertIsNone(metadata[first].ownership)
+        # A resident page keeps its identity after the IO; the page without
+        # metadata is resident but never advertised.
+        self.assertEqual(set(backend._inventory._metadata), {first})
+        transport.evict([block_key(first, backend._namespace, "kv")])
+        (removed,) = backend.take_kv_events()
+        self.assertEqual(
+            removed,
+            BlockRemoved(block_hashes=[100], medium="CPU_PINNED", ownership="kvcr"),
+        )
+        self.assertEqual(backend._inventory._metadata, {})
+
+    def test_failed_or_unannotated_io_advertises_nothing(self):
+        backend = self._backend()
+        transport = self._running(backend)
+        transport.fail = {block_key(self.keys[0], backend._namespace, "kv")}
+        self.assertEqual(
+            self._write(backend, self.keys[:1], self._metadata(self.keys[:1])),
+            [False],
+        )
+        self.assertEqual(backend.take_kv_events(), [])
+        self.assertEqual(backend._inventory._metadata, {})
+        # Writes without metadata (e.g. decode offload) are stored, not advertised.
+        transport.fail = set()
+        self.assertEqual(
+            backend.batch_set_v1(
+                self.keys[:1], torch.arange(2, dtype=torch.int64), None
+            ),
+            [True],
+        )
+        self.assertEqual(backend.take_kv_events(), [])
+        # A non-publishing backend never receives or keeps residency.
+        quiet = self._backend(publish_inventory=False)
+        self.assertEqual(
+            (quiet.publishes_kv_events, quiet.pending_kv_events()), (False, 0)
+        )
+        self.assertEqual(quiet.take_kv_events(), [])
+
+    def test_start_wires_inventory_sink_only_when_publishing(self):
+        class StartupError(RuntimeError):
+            pass
+
+        for publish in (True, False):
+            with self.subTest(publish=publish):
+                backend = self._backend(publish_inventory=publish, local_dram_bytes=128)
+                bindings = []
+
+                def construct(captured=bindings, **kwargs):
+                    captured.append(vars(kwargs["bindings"]))
+                    raise RuntimeError("stop after construction")
+
+                modules = {
+                    "kvcr": SimpleNamespace(
+                        KVCR=construct,
+                        KVCRBindings=SimpleNamespace,
+                        ZmqPeerControlChannel=lambda **kwargs: SimpleNamespace(
+                            endpoint="tcp://127.0.0.1:32100", close=lambda: None
+                        ),
+                    ),
+                    "kvcr.config": SimpleNamespace(
+                        KVCRBackendConfigs=SimpleNamespace,
+                        KVCRConfig=SimpleNamespace,
+                        LocalDramOptions=SimpleNamespace,
+                    ),
+                    "kvcr.types": SimpleNamespace(
+                        KVCRStartupError=StartupError,
+                        RegionDescriptor=SimpleNamespace,
+                    ),
+                }
+                with (
+                    patch.dict("sys.modules", modules),
+                    patch(
+                        "sglang.srt.mem_cache.storage.kvcr.kvcr_store.os._exit",
+                        side_effect=SystemExit(1),
+                    ),
+                    self.assertLogs(
+                        "sglang.srt.mem_cache.storage.kvcr.kvcr_store",
+                        level="CRITICAL",
+                    ),
+                    self.assertRaises(SystemExit),
+                ):
+                    backend._start()
+                if publish:
+                    self.assertEqual(
+                        bindings[0]["inventory_sink"], backend._record_inventory
+                    )
+                    self.assertEqual(backend._inventory.namespace, backend._namespace)
+                    self.assertEqual(backend._inventory.required_pools, {"kv"})
+                else:
+                    # Older KVCR builds construct without the field.
+                    self.assertNotIn("inventory_sink", bindings[0])
+
+    def test_unified_radix_cache_publishes_only_for_inventory(self):
+        for publish in (True, False):
+            with self.subTest(publish=publish):
+                backend = self._backend(publish_inventory=publish)
+                recorder = KVCacheEventRecorder(enabled=False, page_size=2)
+                cache = _hint_gate(backend, recorder)
+                self.assertIs(cache.storage_kv_events_enabled, publish)
+                (source,) = cache.storage_kv_hint_sources()
+                self.assertEqual(source, backend.get_kv_hint_source())
+                self.assertIs("kvcr_inventory" in source["capabilities"], publish)
+
+    def test_failure_injector_delegates_inventory_hooks(self):
+        backend = self._backend()
+        wrapped = HiCacheStorageFailureInjector(backend, 0.0, 0.0)
+        self.assertIs(wrapped.publishes_kv_events, True)
+        self.assertEqual((wrapped.kv_event_shard, wrapped.kv_event_shard_count), (0, 1))
+        self.assertEqual(wrapped.get_kv_hint_source(), backend.get_kv_hint_source())
+        self.assertEqual(wrapped.pending_kv_events(), 0)
+        self.assertEqual(wrapped.take_kv_events(), [])
+
+    def test_init_info_and_wire_events_report_owned_residency(self):
+        """The startup metadata and raw events an external state agent reads."""
+        from sglang.srt.managers.scheduler_components import kv_events_publisher
+
+        backend = self._backend()
+        cache = SimpleNamespace(
+            storage_kv_events_enabled=True,
+            cache_controller=SimpleNamespace(storage_backend=backend),
+        )
+        cache.storage_kv_hint_sources = functools.partial(
+            BasePrefixCache.storage_kv_hint_sources, cache
+        )
+        with zmq.Context.instance().socket(zmq.PUB) as probe:
+            port = probe.bind_to_random_port("tcp://127.0.0.1")
+        config = json.dumps(
+            {
+                "publisher": "zmq",
+                "endpoint": f"tcp://*:{port}",
+                "topic": "kv",
+                "format": "dynamo",
+            }
+        )
+        parallel = SimpleNamespace(
+            pp_rank=0,
+            attn_tp_rank=0,
+            attn_cp_rank=0,
+            attn_dp_size=1,
+            attn_dp_rank=0,
+            dp_rank=0,
+        )
+        with (
+            patch.object(kv_events_publisher, "get_parallel", return_value=parallel),
+            patch(
+                "sglang.srt.disaggregation.kv_events.get_parallel",
+                return_value=parallel,
+            ),
+        ):
+            component = kv_events_publisher.SchedulerKvEventsPublisher(
+                kv_events_config=config,
+                tree_cache=cache,
+                send_metrics_from_scheduler=None,
+                max_running_requests=1,
+                max_total_num_tokens=1,
+                get_stats=lambda: None,
+            )
+        publisher = component.kv_event_publisher
+        atexit.unregister(publisher.shutdown)
+        self.addCleanup(publisher.shutdown)
+        # As Scheduler.get_init_info reports it (page size 2, DCP 1).
+        info = {
+            "kv_hint_sources": cache.storage_kv_hint_sources(),
+            "kv_event_sources": component.local_kv_event_sources(2),
+        }
+        (hint,) = info["kv_hint_sources"]
+        owner = hint["cache_owner_id"]
+        self.assertRegex(owner, _CACHE_OWNER)
+        self.assertEqual(
+            hint,
+            {
+                "dp_rank": 0,
+                "capabilities": ["router_hint", "kvcr_inventory"],
+                "source_control_endpoint": f"tcp://{self.HOST}:29017",
+                "cache_owner_id": owner,
+            },
+        )
+        topic = f"kv/owner/{hashlib.sha256(owner.encode()).hexdigest()}"
+        self.assertEqual(
+            info["kv_event_sources"],
+            [
+                {
+                    "dp_rank": 0,
+                    "endpoint": f"tcp://{self.HOST}:{port}",
+                    "topic": topic,
+                    "block_size": 2,
+                    "format": "dynamo",
+                }
+            ],
+        )
+
+        # The events of one store and one eviction, through the real reducer
+        # and the publisher's wire: [topic, u64 BE seq, [ts, events, dp_rank]].
+        transport = self._running(backend)
+        reducer = StorageEventReducer(backend.kv_event_shard_count)
+        self._write(backend, self.keys[:1], self._metadata(self.keys[:1]))
+        events = reducer.update({backend.kv_event_shard: backend.take_kv_events()})
+        transport.evict([block_key(self.keys[0], backend._namespace, "kv")])
+        events += reducer.update({backend.kv_event_shard: backend.take_kv_events()})
+        with zmq.Context() as context, context.socket(zmq.SUB) as subscriber:
+            subscriber.setsockopt_string(zmq.SUBSCRIBE, topic)
+            subscriber.connect(f"tcp://127.0.0.1:{port}")
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                publisher.publish(KVEventBatch(ts=1.0, events=events))
+                if subscriber.poll(100):
+                    frames = subscriber.recv_multipart()
+                    break
+            else:
+                self.fail("No event received from the advertised raw source")
+        self.assertEqual(len(frames), 3)
+        self.assertEqual(frames[0], topic.encode())
+        self.assertEqual(len(frames[1]), 8)
+        ts, wire_events, dp_rank = msgspec.msgpack.decode(frames[2])
+        self.assertEqual(dp_rank, 0)
+        self.assertEqual(
+            [event["type"] for event in wire_events], ["BlockStored", "BlockRemoved"]
+        )
+        for event in wire_events:
+            self.assertEqual(
+                (event["ownership"], event["medium"]), ("kvcr", "CPU_PINNED")
+            )
+            self.assertTrue(all(type(h) is int for h in event["block_hashes"]))
+        self.assertEqual(len(wire_events[0]["token_ids"]), wire_events[0]["block_size"])
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ source lease or prove that a transfer completed.
 """
 
 import ipaddress
+import socket
 from urllib.parse import urlsplit
 
 
@@ -15,6 +16,8 @@ def control_address(config, extra_config) -> tuple[str, int]:
     host = extra_config.get("control_advertise_host", "127.0.0.1")
     if not isinstance(host, str) or not host:
         raise ValueError("KVCR requires an advertisable control host")
+    if host == "*":
+        raise ValueError("KVCR cannot advertise an unspecified control host")
     try:
         address = ipaddress.ip_address(host)
     except ValueError:
@@ -34,6 +37,31 @@ def control_address(config, extra_config) -> tuple[str, int]:
     if not 0 < first_port <= port <= last_port <= 65535:
         raise ValueError("KVCR control-port range is invalid")
     return host, port
+
+
+def require_routable_host(host: str) -> None:
+    """Reject a resolved control host other workers cannot connect to.
+
+    Takes a host as control_address() returns it. Mirrors the advertise-host
+    check of Dynamo's KV state agent, which subscribes from another host:
+    loopback, unspecified, wildcard and localhost names fail, including
+    abbreviated IPv4 forms such as 127.1 and IPv4-mapped IPv6. DNS names are
+    not resolved.
+    """
+    literal = host[1:-1] if host.startswith("[") else host
+    if literal == "*" or literal.rstrip(".").lower() == "localhost":
+        raise ValueError("KVCR control_advertise_host must not be loopback")
+    try:
+        address = ipaddress.ip_address(literal)
+    except ValueError:
+        try:
+            address = ipaddress.IPv4Address(socket.inet_aton(literal))
+        except OSError:
+            return
+    if address.version == 6 and address.ipv4_mapped is not None:
+        address = address.ipv4_mapped
+    if address.is_loopback or address.is_unspecified:
+        raise ValueError("KVCR control_advertise_host must not be loopback")
 
 
 def rank_offset(config) -> int:

@@ -236,6 +236,7 @@ class DataParallelController:
         # Launch data parallel workers
         self.scheduler_procs = []
         self.local_kv_event_sources = []
+        self.local_kv_hint_sources = []
         self.workers: list[zmq.Socket | None] = [None] * self.max_dp_size
         self.status: list[bool] = list(self.dp_active)
         self._active_workers: list[int] = list(range(self.launch_dp_size))
@@ -797,13 +798,20 @@ class DataParallelController:
             scheduler_info.append(scheduler_pipe_readers[i].recv())
 
         # Pure-DP TP groups launch concurrently. Their ready replies contain
-        # only publishers owned by schedulers on this node.
+        # only publishers and router sources owned by schedulers on this node.
+        hint_sources = [
+            source
+            for info in scheduler_info
+            for source in info.get("kv_hint_sources", [])
+        ]
         with self.env_lock:
             self.local_kv_event_sources.extend(
                 source
                 for info in scheduler_info
                 for source in info.get("kv_event_sources", [])
             )
+            # Only a storage backend owning a router source reports any.
+            self.local_kv_hint_sources.extend(hint_sources)
 
         self._record_scheduler_init_infos(scheduler_info)
 
@@ -978,7 +986,13 @@ def run_data_parallel_controller_process(
             **controller.get_init_info(),
             SCHEDULER_PIDS_ARG: scheduler_pids,
         }
-        if get_serving().grpc_port is not None:
+        if controller.local_kv_hint_sources:
+            init_info["kv_hint_sources"] = sorted(
+                controller.local_kv_hint_sources, key=lambda source: source["dp_rank"]
+            )
+        # Without gRPC, schedulers report raw event sources only for a storage
+        # backend that publishes its own residency.
+        if get_serving().grpc_port is not None or controller.local_kv_event_sources:
             init_info["kv_event_sources"] = sorted(
                 controller.local_kv_event_sources, key=lambda source: source["dp_rank"]
             )

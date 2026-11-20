@@ -84,6 +84,22 @@ def handle_hicache(server_args: Any):
     ):
         return
 
+    if (
+        cfg.hicache_storage_backend == "kvcr"
+        and cfg.enable_hierarchical_cache
+        and cfg.disaggregation_mode == "decode"
+        and cfg.disaggregation_decode_enable_offload_kvcache
+        and cfg.disaggregation_decode_enable_radix_cache
+    ):
+        # Decode offload builds its own backend next to the tree's, and two
+        # KVCR stores of one rank would bind the same control and NIXL ports.
+        raise ValueError(
+            "The kvcr HiCache storage backend cannot serve both decode KV "
+            "offload and the decode radix cache in one worker; disable "
+            "--disaggregation-decode-enable-offload-kvcache or "
+            "--disaggregation-decode-enable-radix-cache."
+        )
+
     validate_hicache_host_memory_mode(server_args)
 
     if cfg.disaggregation_decode_host_receive_threshold < 1:

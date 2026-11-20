@@ -120,6 +120,8 @@ class _UnifiedBufferBackupEntry(msgspec.Struct):
     intent); ``aux_xfers`` the staged transfers and riding sidecars; all are
     freed at the storage-write ack (host memory is never a cache tier).
     ``keys_by_pool`` are the keys the write stores, learned at the ack.
+    ``kv_event_metadata`` is captured at staging, while the node still
+    exists, for a backend that publishes KV events.
     """
 
     intent: _UnifiedBackupIntent
@@ -128,6 +130,7 @@ class _UnifiedBufferBackupEntry(msgspec.Struct):
     lock_params: DecLockRefParams
     occupied_units: int
     keys_by_pool: dict[PoolName, list[str]]
+    kv_event_metadata: Optional[dict] = None
 
 
 class _StagedPrefetch(msgspec.Struct):
@@ -1136,6 +1139,11 @@ class BufferModePipeline:
             lock_params=lock_params,
             occupied_units=occupied_units,
             keys_by_pool=keys_by_pool,
+            kv_event_metadata=(
+                cache.storage_kv_event_metadata(snapshot.node_id)
+                if cache.storage_kv_events_enabled
+                else None
+            ),
         )
         self.write_staged_tokens_ += occupied_units
         self._release_queued_span(intent)
@@ -1189,12 +1197,17 @@ class BufferModePipeline:
                 prefix_keys = self._cache.cache_controller.extend_storage_prefix(
                     prefix_keys, snapshot.hash_values[:skipped_pages]
                 )
+        # Passed only when present, keeping every other call shape.
+        event_kwargs = {}
+        if entry.kv_event_metadata is not None:
+            event_kwargs["kv_event_metadata"] = entry.kv_event_metadata
         operation_id = self._cache.cache_controller.write_storage(
             entry.host_indices,
             snapshot.key.token_ids,
             hash_value,
             prefix_keys,
             extra_pools=storage_xfers or None,
+            **event_kwargs,
         )
         self.ongoing_backup[operation_id] = entry
 

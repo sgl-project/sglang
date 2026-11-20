@@ -26,7 +26,11 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
-from sglang.srt.mem_cache.storage.kvcr.endpoints import control_address, rank_offset
+from sglang.srt.mem_cache.storage.kvcr.endpoints import (
+    control_address,
+    rank_offset,
+    require_routable_host,
+)
 from sglang.srt.mem_cache.storage.kvcr.hints import peer_hint
 from sglang.srt.mem_cache.storage.kvcr.host_layout import (
     StorageKeyAdapter,
@@ -36,6 +40,7 @@ from sglang.srt.mem_cache.storage.kvcr.host_layout import (
     resume_boundaries,
     storage_namespace,
 )
+from sglang.srt.mem_cache.storage.kvcr.inventory import KVCRInventory
 from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
@@ -118,6 +123,13 @@ class KVCRStore(HiCacheStorage):
             raise ValueError("KVCR HiCacheStorage does not support DCP yet")
         if storage_config.pp_size != 1:
             raise ValueError("KVCR HiCacheStorage currently requires PP=1")
+        if is_dp_attention_enabled() and get_parallel().dp_size > 1:
+            # Every replica would number its ranks by attention DP alone and
+            # bind the same control ports.
+            raise ValueError(
+                "KVCR HiCacheStorage does not support replica DP (--dp-size) "
+                "combined with attention DP"
+            )
         if not is_dp_attention_enabled():
             # Without attention DP, HiCache leaves the replica index at 0 and
             # numbers TP across CP. Rank endpoints need both separately.
@@ -152,10 +164,71 @@ class KVCRStore(HiCacheStorage):
             raise ValueError("startup_timeout_seconds must be a positive integer")
         self._offset = rank_offset(storage_config)
         self._agent_name = f"sglang-kvcr-{uuid.uuid4().hex}"
+        # Publish this shard's DRAM residency as KV events (ownership "kvcr")
+        # for an external KV state agent, e.g. Dynamo's.
+        self.publishes_kv_events = _bool_option(self._extra, "publish_inventory")
+        if self.publishes_kv_events:
+            if not self._remote_hint or "control_advertise_host" not in self._extra:
+                raise ValueError(
+                    "KVCR publish_inventory requires enable_remote_hint and an "
+                    "explicit control_advertise_host"
+                )
+            # The state agent subscribes to the events on this host.
+            require_routable_host(control_address(self.config, self._extra)[0])
+        self._inventory = KVCRInventory() if self.publishes_kv_events else None
+        # Each attention TP x CP rank stores its own shard (no PP, no DCP), and a
+        # page is advertised once every shard holds it.
+        self.kv_event_shard = self._offset
+        self.kv_event_shard_count = self.config.tp_size * self.config.attn_cp_size
+        # Set once advertised; fixed for this backend's (and engine's) lifetime.
+        self._cache_owner_id = None
         self.register_mem_pool_host(mem_pool_host)
 
     def consumes_kv_hints(self) -> bool:
         return self._remote_hint
+
+    def get_kv_hint_source(self):
+        """This replica's router source, reported by its first shard only.
+
+        Peers reach the other shards by rank offset from this endpoint. Only
+        with remote hints on and an explicit control_advertise_host: the
+        default host is loopback.
+        """
+        if (
+            self._offset != 0
+            or not self._remote_hint
+            or "control_advertise_host" not in self._extra
+        ):
+            return None
+        host, port = control_address(self.config, self._extra)
+        source = {
+            "dp_rank": int(self.config.dp_rank),
+            "capabilities": ["router_hint"],
+            "source_control_endpoint": f"tcp://{host}:{port}",
+        }
+        if self.publishes_kv_events:
+            source["capabilities"].append("kvcr_inventory")
+            source["cache_owner_id"] = self._owner_id()
+        return source
+
+    def _owner_id(self) -> str:
+        """Dynamo CacheOwnerId: <ns[:32]>:<ns[32:]>/<16 zeros>/<incarnation>.
+
+        The indexer domain is the 64-hex storage namespace, so engines that
+        can serve each other's pages share it; the cluster field is fixed.
+        KVCR's DRAM is process-local: the incarnation is this process's agent
+        UUID, so a new engine never inherits retained residency.
+        """
+        with self._lock:
+            if self._cache_owner_id is None:
+                if not self._layouts:
+                    raise ValueError("KVCR has no registered physical host pools")
+                namespace = storage_namespace(self.config, self._layouts)
+                self._cache_owner_id = (
+                    f"{namespace[:32]}:{namespace[32:]}/{'0' * 16}/"
+                    f"{self._agent_name.rsplit('-', 1)[-1]}"
+                )
+            return self._cache_owner_id
 
     def register_mem_pool_host(self, mem_pool_host):
         self.mem_pool_host = mem_pool_host
@@ -176,6 +249,9 @@ class KVCRStore(HiCacheStorage):
                 raise ValueError(
                     "KVCR host pools must be registered before the first IO"
                 )
+            if self._cache_owner_id is not None:
+                # The advertised owner names the namespace of these pools.
+                raise ValueError("KVCR host pools must be registered before discovery")
             self._layouts[name] = describe_pool(name, host_pool)
             self.registered_pools[name] = host_pool
 
@@ -191,6 +267,11 @@ class KVCRStore(HiCacheStorage):
         if not self._layouts:
             raise ValueError("KVCR has no registered physical host pools")
         self._namespace = storage_namespace(self.config, self._layouts)
+        if self._inventory is not None:
+            self._inventory.configure(
+                self._namespace,
+                [name for name in self._layouts if name not in _TRAILING_POOLS],
+            )
         total = sum(
             component.size * component.count
             for layout in self._layouts.values()
@@ -255,6 +336,12 @@ class KVCRStore(HiCacheStorage):
                     if "startup_timeout_seconds" in self._extra
                     else {}
                 )
+                # Likewise only wire the inventory sink when publishing.
+                inventory_options = (
+                    {"inventory_sink": self._record_inventory}
+                    if self._inventory is not None
+                    else {}
+                )
                 self._runner = KVCR(
                     config=KVCRConfig(
                         nixl_agent_name=self._agent_name,
@@ -273,6 +360,7 @@ class KVCRStore(HiCacheStorage):
                         framework_control=channel,
                         key_adapter=StorageKeyAdapter(),
                         on_resilience_event=self._resilience_event,
+                        **inventory_options,
                     ),
                     backend_configs=KVCRBackendConfigs(
                         framework_regions=regions,
@@ -378,6 +466,37 @@ class KVCRStore(HiCacheStorage):
             )
             self._stop_poll.wait(wait)
 
+    def _record_inventory(self, event):
+        # KVCR calls its sink from deposit/deliver/poll_completed, which run
+        # under self._lock. Only its local DRAM tier ("DRAM") is advertised.
+        if event.tier.value == "DRAM":
+            self._inventory.update(event)
+
+    def pending_kv_events(self):
+        # Called every scheduler step. A racy length is fine: events appended
+        # after this read are drained at the next step.
+        return len(self._inventory.events) if self._inventory is not None else 0
+
+    def take_kv_events(self):
+        # Lock-free: storage threads may hold self._lock across native calls,
+        # and this runs on the scheduler thread before a collective gather.
+        return self._inventory.take() if self._inventory is not None else []
+
+    @contextmanager
+    def _inventory_operation(self, extra_info, blocks):
+        """Hold the IO's page identities while it may change residency."""
+        if self._inventory is None:
+            yield
+            return
+        extra = getattr(extra_info, "extra_info", None) or {}
+        retained = self._inventory.register(
+            extra.get("kv_event_metadata") or {}, blocks
+        )
+        try:
+            yield
+        finally:
+            self._inventory.release(retained)
+
     def _io(self, transfers, *, is_set, extra_info):
         from kvcr.types import MemoryRef
 
@@ -410,13 +529,14 @@ class KVCRStore(HiCacheStorage):
             if not blocks:
                 return {name: [True] * len(group) for name, group in groups.items()}
             # _wait releases the condition's recursive lock while sleeping.
-            if is_set:
-                # Writes carry no kv_hints; deposits are always local.
-                result = self._wait(self._runner.deposit(blocks))
-            else:
-                with self._hint(extra_info, blocks) as request_id:
-                    handle = self._runner.deliver(blocks, request_id=request_id)
-                    result = self._wait(handle)
+            with self._inventory_operation(extra_info, blocks):
+                if is_set:
+                    # Writes carry no kv_hints; deposits are always local.
+                    result = self._wait(self._runner.deposit(blocks))
+                else:
+                    with self._hint(extra_info, blocks) as request_id:
+                        handle = self._runner.deliver(blocks, request_id=request_id)
+                        result = self._wait(handle)
         return {
             name: [
                 logical or (key in result and result[key].success)
