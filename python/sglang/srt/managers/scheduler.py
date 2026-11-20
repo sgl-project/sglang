@@ -1426,6 +1426,7 @@ class Scheduler(
             flush_cache=self.flush_cache,
             is_fully_idle=self.is_fully_idle,
             send_output=self.send_control_output,
+            pp_rank=get_parallel().pp_rank if get_parallel().pp_size > 1 else None,
         )
         self._last_logged_elastic_radix_namespace: Optional[str] = None
         self.session_controller = SessionController(self.tree_cache)
@@ -6300,9 +6301,12 @@ class Scheduler(
 
         return DetachHiCacheStorageReqOutput(success=False, message=msg)
 
-    def flush_cache(self, empty_cache: bool = True):
+    def flush_cache(
+        self, empty_cache: bool = True, *, pp_all_idle: bool = False
+    ) -> bool:
         """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache."""
-        if self.is_fully_idle(ignore_waiting=self.pause_state.paused):
+        # After the PP vote, every stage must enter reset on the same iteration.
+        if pp_all_idle or self.is_fully_idle(ignore_waiting=self.pause_state.paused):
             self.cur_batch_for_debug = None
             self.last_batch = None
             if self.uocr_runtime is not None:

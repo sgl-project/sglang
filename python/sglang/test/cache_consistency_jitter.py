@@ -119,9 +119,9 @@ def _run_scheduler_process_with_jitter(
 
         return with_jitter
 
-    def flush_cache(self: Any, empty_cache: bool = True) -> bool:
+    def flush_cache(self: Any, *args: Any, **kwargs: Any) -> bool:
         nonlocal jitter_active
-        success = original_flush_cache(self, empty_cache)
+        success = original_flush_cache(self, *args, **kwargs)
         if success and not jitter_active:
             enabled.fill_(1)
             torch.cuda.synchronize()
