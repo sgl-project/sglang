@@ -277,6 +277,9 @@ class LogitsProcessorOutput:
     # The logprobs and ids of the top-k tokens in input positions.  shape: [#seq, #token, k]
     input_top_logprobs_val: Optional[List] = None
     input_top_logprobs_idx: Optional[List] = None
+    # Per sequence, the [rows, k] float32 host spans of its input candidate
+    # selector's weights; None when the batch has no such request.
+    input_top_logprobs_weights: Optional[List[List[torch.Tensor]]] = None
     # The logprobs and ids of the requested token ids in input positions. shape: [#seq, n] (n is the number of requested token ids)
     # Can contain either lists or GPU tensors (for delayed GPU-to-CPU transfer optimization)
     input_token_ids_logprobs_val: Optional[List[Union[List[float], torch.Tensor]]] = (
