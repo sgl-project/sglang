@@ -234,3 +234,7 @@ def test_completing_read_declines_an_unsupported_partial(runtime, bad):
     read_state = boundary.ReadState(residual)
     assert reader._complete_read(owed, read_state, None, None, update=update) is None
     update.post.assert_not_called()
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
