@@ -752,7 +752,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         if binding is not None and not forward_batch.forward_mode.is_idle():
             from sglang.kernels.plugin_kernels.npu.spec import DraftLoopIO
 
-            chain = binding.draft_loop(DraftLoopIO(batch, forward_batch, self.draft_attn_backend.attn_backends[0], self.hot_token_id))
+            chain = binding.draft_loop(
+                DraftLoopIO(
+                    batch,
+                    forward_batch,
+                    self.draft_attn_backend.attn_backends[0],
+                    self.hot_token_id,
+                )
+            )
         with canary_outside_ctx:
             # Run draft
             if chain is not None:
@@ -1238,7 +1245,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     ):
         self.draft_runtime.note_draft_extend()
         binding = getattr(self.draft_runner, "ascend_binding", None)
-        fused = binding is not None and not batch.forward_mode.is_idle() and binding.plan_extend(batch, batch_result, self.hot_token_id)
+        fused = (
+            binding is not None
+            and not batch.forward_mode.is_idle()
+            and binding.plan_extend(batch, batch_result, self.hot_token_id)
+        )
         # Cast to int64 before entering plan stream to avoid cross-stream
         # synchronization issues with .to() inside the plan stream context.
         if batch_result.prepared_draft_extend_inputs is not None:

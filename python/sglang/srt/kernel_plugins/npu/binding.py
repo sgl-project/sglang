@@ -37,7 +37,12 @@ def install_megakernels(runner):
     )
     ranks = [None] * dist.get_world_size(group)
     dist.all_gather_object(ranks, signature, group=group)
-    if error or any(peer != signature for peer in ranks):
+    if any(peer[-1] for peer in ranks):
+        raise RuntimeError(f"NPU megakernel preflight failed: {ranks}")
+    if any(peer[1] is None for peer in ranks):
+        logger.info("NPU megakernel declined %s on one or more TP ranks", architecture)
+        return None
+    if any(peer != signature for peer in ranks):
         raise RuntimeError(f"NPU megakernel preflight failed: {ranks}")
     if binding is not None:
         binding.build(runner.model)

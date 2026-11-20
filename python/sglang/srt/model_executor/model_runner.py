@@ -1188,7 +1188,10 @@ class ModelRunner:
         backends = build_attention_backends(model_runner=self)
         self.attn_backend = backends.attn_backend
         self.runner_ids.bind_and_verify_backends([self.attn_backend])
-        if self.device == "npu" and (get_exec().kernel.enable_npu_megakernel or envs.SGLANG_ENABLE_NPU_MEGAKERNEL_PLUGIN.get()):
+        if self.device == "npu" and (
+            get_exec().kernel.enable_npu_megakernel
+            or envs.SGLANG_ENABLE_NPU_MEGAKERNEL_PLUGIN.get()
+        ):
             from sglang.srt.kernel_plugins.npu.binding import install_megakernels
 
             self.ascend_binding = install_megakernels(self)

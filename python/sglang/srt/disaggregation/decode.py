@@ -3558,7 +3558,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             ):
                 output_dsa_topk_indices = None
             decode_req.req.output_dsa_topk_indices = output_dsa_topk_indices
-            if get_exec().kernel.enable_npu_megakernel or envs.SGLANG_ENABLE_NPU_MEGAKERNEL_PLUGIN.get():
+            if (
+                get_exec().kernel.enable_npu_megakernel
+                or envs.SGLANG_ENABLE_NPU_MEGAKERNEL_PLUGIN.get()
+            ):
                 queue = self.scheduler.disagg_decode_prealloc_queue
                 pool = queue.draft_token_to_kv_pool
                 decode_req.req.npu_draft_kv_ready = (
