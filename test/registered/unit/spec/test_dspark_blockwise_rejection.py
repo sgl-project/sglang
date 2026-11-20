@@ -10,7 +10,6 @@ import pytest
 import torch
 
 from sglang.kernels.ops.speculative.dspark import blockwise_rejection as bwr
-from sglang.srt.speculative.dspark_components import dspark_verify
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -123,6 +122,65 @@ def test_law_matches_exact(t_temp, d_temp, one_hot, seed):
 
 
 @needs_cuda
+@pytest.mark.parametrize("proposal_logit,shift", [(0.0, 16.0), (-3.0, 0.0)])
+def test_equal_laws_accept_near_one_coin(proposal_logit, shift):
+    draft = torch.tensor([[-torch.inf, proposal_logit, 0.0, -torch.inf]], device="cuda")
+    target = torch.cat([draft + shift, draft])
+    temps = torch.ones(1, device="cuda")
+    noise = bwr.make_rejection_noise(0, "cuda")
+    # This counter gives row 0 a coin one FP32 step below 1.
+    noise.counter.fill_(620191)
+    length, bonus, _ = bwr.BlockwiseRejection.execute(
+        candidates=torch.tensor([[0, 1]], device="cuda"),
+        target_logits=target,
+        draft_logits=draft.unsqueeze(0),
+        target_temperatures=temps,
+        draft_temperatures=temps,
+        noise=noise,
+    )
+    assert length.item() == 1
+    assert bonus.item() in (1, 2)
+
+
+@needs_cuda
+@pytest.mark.parametrize("mode", ["bonus", "one_hot", "residual"])
+def test_resample_is_invariant_to_common_logit_shift(mode):
+    # Two supported tokens in different stats blocks. Both finite logits and
+    # their difference remain exactly representable after the shift.
+    rows, vocab = 128, 8195
+    temp = 2.0**-16
+    scores = torch.full((vocab,), -torch.inf, device="cuda")
+    scores[2], scores[-1] = -temp, 0.0
+    proposal = torch.full_like(scores, -torch.inf)
+    proposal[1] = 0.0
+    if mode == "residual":
+        # A genuine rejection with some draft mass on both target tokens.
+        proposal[2], proposal[-1] = -temp, -temp
+    draft = proposal.repeat(rows, 1, 1) if mode != "one_hot" else None
+    temps = torch.full((rows,), temp, device="cuda")
+    candidates = torch.tensor([[0, 1]], device="cuda").expand(rows, -1)
+
+    def run(shift):
+        selected = scores + shift
+        target = torch.stack(
+            [proposal if mode == "bonus" else selected, selected]
+        ).repeat(rows, 1)
+        length, bonus, _ = bwr.BlockwiseRejection.execute(
+            candidates=candidates,
+            target_logits=target,
+            draft_logits=draft,
+            target_temperatures=temps,
+            draft_temperatures=temps,
+            noise=bwr.make_rejection_noise(0, "cuda"),
+        )
+        assert (length == int(mode == "bonus")).all()
+        assert ((bonus == 2) | (bonus == vocab - 1)).all()
+        return bonus
+
+    assert torch.equal(run(0.0), run(128.0))
+
+
+@needs_cuda
 def test_graph_replay_equals_eager_and_advances_counter():
     stride, vocab, rows = 6, 129280, 4
     gen = torch.Generator(device="cuda").manual_seed(4)
@@ -188,6 +246,8 @@ def test_cutoff_caps_length_and_bonus_is_the_next_draft():
 
 
 def test_routes_to_blockwise_only_with_noise(monkeypatch):
+    from sglang.srt.speculative.dspark_components import dspark_verify
+
     calls = []
     monkeypatch.setattr(
         dspark_verify.BlockwiseRejection,

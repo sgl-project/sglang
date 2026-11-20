@@ -6,7 +6,7 @@ single-CTA ``speculative_sampling_classic_kernel``:
 1. per-vocab-block target / draft max and sum-exp (rows x 8,192-token blocks), no
    probability tensors;
 2. a one-warp accept per request that reads only those stats plus the draft token's
-   logits: accept iff ``log p(x) > log u + log q(x)``, i.e. ``u * q < p`` as before;
+   logits: accept iff ``log u < log p(x) - log q(x)``, i.e. ``u * q < p`` as before;
 3. a block-parallel Gumbel-max resample of the rejected row's residual
    ``max(p - q, 0)`` (or of ``p`` at the bonus row), reduced by a one-program insert.
 
@@ -119,7 +119,7 @@ def _log1p_neg_stable(value):
 
 
 @triton.jit
-def _global_lse(
+def _log_normalizer_parts(
     max_ptr, sumexp_ptr, row, NUM_BLOCKS: tl.constexpr, PADDED: tl.constexpr
 ):
     blocks = tl.arange(0, PADDED)
@@ -127,7 +127,9 @@ def _global_lse(
     maxes = tl.load(max_ptr + row * NUM_BLOCKS + blocks, mask=mask, other=float("-inf"))
     sumexps = tl.load(sumexp_ptr + row * NUM_BLOCKS + blocks, mask=mask, other=0.0)
     global_max = tl.max(maxes, axis=0)
-    return global_max + tl.log(tl.sum(sumexps * tl.exp(maxes - global_max)))
+    # Keep the shift separate: adding a small log sum to a large maximum
+    # can round it away before the caller subtracts it from a token logit.
+    return global_max, tl.log(tl.sum(sumexps * tl.exp(maxes - global_max)))
 
 
 @triton.jit
@@ -153,9 +155,6 @@ def _stats_kernel(
     row = tl.program_id(0).to(tl.int64)
     req = row // STRIDE
     step = row % STRIDE
-    if step == STRIDE - 1:
-        # Bonus row: its resample reads raw logits, no stats.
-        return
     block_idx = tl.program_id(1)
     offs = block_idx * BLOCK + tl.arange(0, BLOCK)
     t_temp = tl.load(target_temp_ptr + req).to(tl.float32)
@@ -169,6 +168,9 @@ def _stats_kernel(
     )
     t_max = tl.max(t, axis=0)
     tl.store(t_max_ptr + row * NUM_BLOCKS + block_idx, t_max)
+    if step == STRIDE - 1:
+        # The bonus Gumbel race only needs the target row maximum.
+        return
     tl.store(
         t_sumexp_ptr + row * NUM_BLOCKS + block_idx,
         tl.where(t_max > float("-inf"), tl.sum(tl.exp(t - t_max)), 0.0),
@@ -196,7 +198,7 @@ def _rejection_kernel(
     correct_len_ptr,
     raw_len_ptr,
     trim_ptr,
-    rej_lse_ptr,
+    row_stats_ptr,
     candidates_ptr,
     candidates_stride,
     verify_lens_ptr,
@@ -230,6 +232,10 @@ def _rejection_kernel(
         d_temp = tl.load(draft_temp_ptr + req).to(tl.float32)
     accepted = tl.zeros((), tl.int32)
     verifying = True
+    t_max = 0.0
+    t_log_sum = 0.0
+    d_max = 0.0
+    d_log_sum = 0.0
     for i in range(STRIDE - 1):
         if verifying:
             row = req * STRIDE + i
@@ -238,15 +244,18 @@ def _rejection_kernel(
             )
             valid = (token >= 0) & (token < target_vocab)
             token = tl.minimum(tl.maximum(token, 0), target_vocab - 1)
-            t_lse = _global_lse(t_max_ptr, t_sumexp_ptr, row, NUM_BLOCKS, PADDED_BLOCKS)
+            t_max, t_log_sum = _log_normalizer_parts(
+                t_max_ptr, t_sumexp_ptr, row, NUM_BLOCKS, PADDED_BLOCKS
+            )
             log_p = (
                 tl.load(target_logits_ptr + row * target_stride + token).to(tl.float32)
                 / t_temp
-                - t_lse
+                - t_max
+                - t_log_sum
             )
             log_q = 0.0
             if HAS_DRAFT_LOGITS:
-                d_lse = _global_lse(
+                d_max, d_log_sum = _log_normalizer_parts(
                     d_max_ptr, d_sumexp_ptr, row, NUM_BLOCKS, PADDED_BLOCKS
                 )
                 log_q = (
@@ -259,11 +268,13 @@ def _rejection_kernel(
                         other=float("-inf"),
                     ).to(tl.float32)
                     / d_temp
-                    - d_lse
+                    - d_max
+                    - d_log_sum
                 )
             u = tl.maximum(tl.rand(seed, (req * STRIDE + i).to(tl.int32)), _TL_RAND_MIN)
             # A proposal must have positive draft probability (classic kernel's guard).
-            ok = valid & (log_q > float("-inf")) & (log_p > tl.log(u) + log_q)
+            # Form the log ratio first so equal laws always accept a coin < 1.
+            ok = valid & (log_q > float("-inf")) & (tl.log(u) < log_p - log_q)
             verifying = ok
             accepted += ok.to(tl.int32)
     tl.store(raw_len_ptr + req, accepted)
@@ -273,19 +284,23 @@ def _rejection_kernel(
         capped = tl.minimum(accepted, cap)
     tl.store(correct_len_ptr + req, capped)
     tl.store(trim_ptr + req, accepted - capped)
-    t_lse_rej = 0.0
-    d_lse_rej = 0.0
-    if accepted < STRIDE - 1:
-        rej_row = req * STRIDE + accepted
-        t_lse_rej = _global_lse(
-            t_max_ptr, t_sumexp_ptr, rej_row, NUM_BLOCKS, PADDED_BLOCKS
+    # On rejection, the loop already computed both parts for the selected row.
+    if accepted == STRIDE - 1:
+        blocks = tl.arange(0, PADDED_BLOCKS)
+        row = req * STRIDE + accepted
+        t_max = tl.max(
+            tl.load(
+                t_max_ptr + row * NUM_BLOCKS + blocks,
+                mask=blocks < NUM_BLOCKS,
+                other=float("-inf"),
+            ),
+            axis=0,
         )
-        if HAS_DRAFT_LOGITS:
-            d_lse_rej = _global_lse(
-                d_max_ptr, d_sumexp_ptr, rej_row, NUM_BLOCKS, PADDED_BLOCKS
-            )
-    tl.store(rej_lse_ptr + req, t_lse_rej)
-    tl.store(rej_lse_ptr + bs + req, d_lse_rej)
+    tl.store(row_stats_ptr + req, t_max)
+    tl.store(row_stats_ptr + bs + req, t_log_sum)
+    if HAS_DRAFT_LOGITS:
+        tl.store(row_stats_ptr + 2 * bs + req, d_max)
+        tl.store(row_stats_ptr + 3 * bs + req, d_log_sum)
 
 
 @triton.jit
@@ -293,7 +308,7 @@ def _resample_kernel(
     res_max_ptr,
     res_arg_ptr,
     raw_len_ptr,
-    rej_lse_ptr,
+    row_stats_ptr,
     candidates_ptr,
     candidates_stride,
     target_logits_ptr,
@@ -330,18 +345,26 @@ def _resample_kernel(
         ).to(tl.float32)
         / t_temp
     )
+    # Use the same shift in every vocab block before adding Gumbel noise.
+    t = t - tl.load(row_stats_ptr + req)
     if is_bonus:
         residual = t
     else:
         rejected = tl.load(candidates_ptr + req * candidates_stride + r + 1)
         if HAS_DRAFT_LOGITS:
             d_temp = tl.load(draft_temp_ptr + req).to(tl.float32)
-            log_p = t - tl.load(rej_lse_ptr + req)
-            log_q = tl.load(
-                draft_logits_ptr + req * draft_stride_0 + r * draft_stride_1 + offs,
-                mask=offs < draft_vocab,
-                other=float("-inf"),
-            ).to(tl.float32) / d_temp - tl.load(rej_lse_ptr + bs + req)
+            log_p = t - tl.load(row_stats_ptr + bs + req)
+            d = (
+                tl.load(
+                    draft_logits_ptr + req * draft_stride_0 + r * draft_stride_1 + offs,
+                    mask=offs < draft_vocab,
+                    other=float("-inf"),
+                ).to(tl.float32)
+                / d_temp
+            )
+            log_q = (d - tl.load(row_stats_ptr + 2 * bs + req)) - tl.load(
+                row_stats_ptr + 3 * bs + req
+            )
             # log max(p - q, 0) = log p + log1p(-q / p), -inf where q >= p.
             ratio = tl.exp(log_q - log_p)
             residual = tl.where(
@@ -433,7 +456,9 @@ def blockwise_rejection_triton(
         (4, bs * stride, num_blocks), dtype=torch.float32, device=device
     )
     lens = torch.empty((3, bs), dtype=torch.int32, device=device)
-    rej_lse = torch.empty((2, bs), dtype=torch.float32, device=device)
+    row_stats = torch.empty(
+        (4 if has_draft else 2, bs), dtype=torch.float32, device=device
+    )
     res_blocks = triton.cdiv(target_vocab, _RESAMPLE_BLOCK)
     res_max = torch.empty((bs, res_blocks), dtype=torch.float32, device=device)
     res_arg = torch.empty((bs, res_blocks), dtype=torch.int64, device=device)
@@ -457,7 +482,7 @@ def blockwise_rejection_triton(
         cutoff_verify_lens.to(device=device).contiguous() if has_cutoff else correct_len
     )
     _rejection_kernel[(bs,)](
-        correct_len, raw_len, trim, rej_lse,
+        correct_len, raw_len, trim, row_stats,
         candidates, candidates.stride(0), verify_lens,
         t_max, t_sumexp, d_max, d_sumexp,
         target_logits, target_logits.stride(0),
@@ -470,7 +495,7 @@ def blockwise_rejection_triton(
         num_warps=1,
     )  # fmt: skip
     _resample_kernel[(bs, res_blocks)](
-        res_max, res_arg, raw_len, rej_lse,
+        res_max, res_arg, raw_len, row_stats,
         candidates, candidates.stride(0),
         target_logits, target_logits.stride(0),
         d_ptr, d_s0, d_s1,
@@ -524,7 +549,7 @@ def blockwise_rejection_torch(
     tokens = candidates[:, 1:].long()
     lp = log_p[:, :gamma].gather(-1, tokens.unsqueeze(-1)).squeeze(-1)
     lq = log_q.gather(-1, tokens.unsqueeze(-1)).squeeze(-1)
-    ok = (lq > float("-inf")) & (lp > torch.log(coins.clamp_min(4.6566127342e-10)) + lq)
+    ok = (lq > float("-inf")) & (torch.log(coins.clamp_min(4.6566127342e-10)) < lp - lq)
     raw = torch.cumprod(ok.int(), dim=-1).sum(-1).int()
     rows = torch.arange(bs, device=candidates.device)
     lp_rej = log_p[rows, raw.long()]
