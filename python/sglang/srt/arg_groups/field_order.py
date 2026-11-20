@@ -582,5 +582,7 @@ POSITIONAL_FIELD_ORDER = (
     "watermark_num_candidates",
     "watermark_context_history_size",
     "watermark_skip_first_ngram_calls",
+    "cuda_graph_persistence",
+    "cuda_graph_persistence_config",
 )
 # fmt: on
