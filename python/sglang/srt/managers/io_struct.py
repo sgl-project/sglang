@@ -1925,6 +1925,10 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     input_top_logprobs_val_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_idx_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_flat_null_prefix: Optional[List[Optional[int]]] = None
+    # float32 [rows, k] weights of the prompt top logprob candidates of
+    # requests with an input candidate selector: one row per non-null entry.
+    # None when no request in the batch has a selector.
+    input_top_logprobs_weights: Optional[List[Optional[np.ndarray]]] = None
 
 
 class DetokenizeReleaseReq(BaseReq, kw_only=True):
@@ -2010,6 +2014,7 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     input_top_logprobs_val_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_idx_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_flat_null_prefix: Optional[List[Optional[int]]] = None
+    input_top_logprobs_weights: Optional[List[Optional[np.ndarray]]] = None
 
 
 def row_output_ids(output: Union[BatchTokenIDOutput, BatchStrOutput], i: int) -> array:

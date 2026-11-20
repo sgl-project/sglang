@@ -247,6 +247,9 @@ class ReqLogprob:
     input_top_logprobs_val_flat: Optional[np.ndarray] = None
     input_top_logprobs_idx_flat: Optional[np.ndarray] = None
     input_top_logprobs_flat_null_prefix: Optional[int] = None
+    # float32 [rows, k] weights of an input candidate selector's candidates:
+    # one row per non-null entry of input_top_logprobs_val.
+    input_top_logprobs_weights: Optional[np.ndarray] = None
     input_token_ids_logprobs_val: Optional[List[List[float]]] = None
     input_token_ids_logprobs_idx: Optional[List[List[int]]] = None
     output_token_logprobs_val: Optional[list] = None
@@ -715,6 +718,7 @@ class Req(ReqDllmMixin):
         self.input_token_logprobs: Optional[List[Tuple[int]]] = None
         self.temp_input_top_logprobs_val: Optional[List[torch.Tensor]] = None
         self.temp_input_top_logprobs_idx: Optional[List[int]] = None
+        self.temp_input_top_logprobs_weights: Optional[List] = None
         self.temp_input_token_ids_logprobs_val: Optional[List[float]] = None
         self.temp_input_token_ids_logprobs_idx: Optional[List[int]] = None
 
@@ -1530,6 +1534,7 @@ class Req(ReqDllmMixin):
         self.input_token_logprobs = None
         self.temp_input_top_logprobs_val = None
         self.temp_input_top_logprobs_idx = None
+        self.temp_input_top_logprobs_weights = None
         self.temp_input_token_ids_logprobs_val = None
         self.temp_input_token_ids_logprobs_idx = None
         self.mamba_branching_seqlen = None
