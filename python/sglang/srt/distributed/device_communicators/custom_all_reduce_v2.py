@@ -537,6 +537,8 @@ class CustomAllReduceV2:
         if self.disabled:
             yield
             return
+        # Build the communicator (a JIT compile) at startup, not mid-serving.
+        self.obj
         self._in_capture = True
         try:
             yield
