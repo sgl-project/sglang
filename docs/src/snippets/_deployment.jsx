@@ -174,7 +174,7 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
     // counts feed the docker `--device` list (`npuDevices`).
     npu: [
       { id: "a3", label: "A3 Series",        vram: "64GB/die", npuDevices: 16 },
-      { id: "a5", label: "950PR/DT Series",  vram: "128GB",    npuDevices: 8  },
+      { id: "a5", label: "950PR/DT Series",  vram: "128GB / 96GB",    npuDevices: 8  },
     ],
   };
 

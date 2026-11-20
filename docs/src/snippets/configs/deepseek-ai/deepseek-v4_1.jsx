@@ -18,20 +18,20 @@ export const config = {
 
   latencyPercentile: "P50",
 
-  supportedHardware: ["h200", "b200", "b300", "gb300", "mi355x", "a5"],
+  supportedHardware: ["h200", "b200", "b300", "gb300", "mi355x", "a3", "a5"],
 
   variants: [
-    { id: "flash", label: "DeepSeek-V4.1-Flash", showWhen: (s) => s.hw !== "a5" },
+    { id: "flash", label: "DeepSeek-V4.1-Flash" },
     { id: "flash-1017", label: "DeepSeek-V4.1-Flash-1017" },
   ],
   quantizations: [
-    { id: "fp4", label: "FP4", showWhen: (s) => s.hw !== "a5" },
-    { id: "auto", label: "Checkpoint default", showWhen: (s) => s.hw === "a5" },
+    { id: "fp4", label: "FP4" },
+    { id: "w8a8", label: "W8A8" },
   ],
   strategies: [
-    { id: "low-latency", label: "Low-Latency", showWhen: (s) => s.hw !== "a5" },
-    { id: "balanced", label: "Balanced", showWhen: (s) => s.hw === "a5" },
-    { id: "high-throughput", label: "High-Throughput", showWhen: (s) => s.hw !== "a5" },
+    { id: "low-latency", label: "Low-Latency" },
+    { id: "balanced", label: "Balanced" },
+    { id: "high-throughput", label: "High-Throughput" },
   ],
   nodesOptions: [
     { id: "single", label: "Single Node" },
@@ -40,13 +40,14 @@ export const config = {
   modelNames: {
     "flash|fp4": "deepseek-ai/DeepSeek-V4.1-Flash",
     "flash-1017|fp4": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
-    "flash-1017|auto": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+    "flash-1017|w8a8": "Eco-Tech/DeepSeek-V4.1-Flash-1017-w8a8",
   },
 
   placeholders: {
     HOST_IP:   { target: "command", label: "Bind host",         default: "0.0.0.0"         },
     PORT:      { target: "command", label: "Bind port",         default: "30000"           },
     HF_TOKEN:  { target: "command", label: "HF token (Docker)", default: "<your-hf-token>" },
+    A3_MODEL_PATH: { target: "command", label: "A3 model path", default: "/path/to/DeepSeek-V4.1-Flash-1017-w8a8", showWhen: (s) => s.hw === "a3" },
     MODEL_PATH: { target: "command", label: "A5 model path", default: "/path/to/dsv4.1-1017", showWhen: (s) => s.hw === "a5" },
     NODE0_IP: { target: "command", label: "A5 node IP", default: "<node-ip>", showWhen: (s) => s.hw === "a5" },
     NODE_RANK: { target: "command", label: "A5 node rank", default: "0", showWhen: (s) => s.hw === "a5" },
@@ -56,9 +57,9 @@ export const config = {
     CURL_PORT: { target: "curl",    label: "Server port",       default: "30000"           },
   },
 
-  curl: (sel) => `curl http://{{CURL_HOST}}:{{CURL_PORT}}/v1/chat/completions \\
+  curl: (sel) => `curl http://{{CURL_HOST}}:${sel.hw === "a3" ? "8001" : "{{CURL_PORT}}"}/v1/chat/completions \\
 -H 'Content-Type: application/json' \\
--d '{ "model": "${sel.hw === "a5" ? "dsv4" : "{{MODEL_NAME}}"}", "messages": [{"role":"user","content":"Hello"}] }'`,
+-d '{ "model": "${sel.hw === "a5" ? "dsv4" : sel.hw === "a3" ? "{{A3_MODEL_PATH}}" : "{{MODEL_NAME}}"}", "messages": [{"role":"user","content":"Hello"}] }'`,
 
   dockerImages: {
     // DeepSeek-V4.1 support has not shipped in a CUDA release yet; the ROCm
@@ -71,17 +72,16 @@ export const config = {
     a5: "swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-950-dsv41",
   },
 
-  // Initialize Ascend first, then apply the recipe environment before launch.
+  // Initialize the Ascend environment before launching on A5.
   pythonSetupCommand: (sel) => sel.hw === "a5"
-    ? `source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash &&
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/custom_transformer/bin/set_env.bash &&
-source /usr/local/Ascend/ascend-toolkit/latest/set_env.sh &&
+    ? `source /usr/local/Ascend/ascend-toolkit/latest/set_env.sh &&
 source /usr/local/Ascend/nnal/atb/set_env.sh &&
 if [[ -f /usr/local/memfabric_hybrid/set_env.sh ]]; then source /usr/local/memfabric_hybrid/set_env.sh; fi`
     : "",
-  pythonCommand: (sel) => sel.hw === "a5"
+  pythonCommand: (sel) => sel.hw === "a3" || sel.hw === "a5"
     ? "python3 -m sglang.launch_server"
     : "sglang serve",
+  runModes: (sel) => sel.hw === "a3" || sel.hw === "a5" ? ["python"] : ["python", "docker"],
   dockerRunCommand: (sel, env = []) => sel.hw === "a5"
     ? `bash -lc 'source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash &&
 source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/custom_transformer/bin/set_env.bash &&
@@ -681,27 +681,54 @@ exec python3 -m sglang.launch_server "$@"' --`
     },
     // ---------- Ascend A5: single node, 8 NPUs, TP8 + DP8. ----------
     {
-      match: { hw: "a5", variant: "flash-1017", quant: "auto", strategy: "balanced", nodes: "single" },
+      match: { hw: "a3", variant: "flash-1017", quant: "w8a8", strategy: "balanced", nodes: "single" },
+      nnodes: 1,
+      verified: false,
+      verificationStatus: "in-progress",
+      flags: [
+        "--model-path {{A3_MODEL_PATH}}",
+        "--page-size 128",
+        "--tp-size 16",
+        "--trust-remote-code",
+        "--attention-backend dsv4",
+        "--device npu",
+        "--watchdog-timeout 9000",
+        "--host 0.0.0.0",
+        "--port 8001",
+        "--mem-fraction-static 0.96",
+        "--max-running-requests 16",
+        "--chunked-prefill-size 4096",
+        "--max-prefill-tokens 131072",
+        "--kv-cache-dtype auto",
+        "--enable-dp-lm-head",
+        "--cuda-graph-bs-decode 1 2",
+        "--disable-radix-cache",
+        "--attn-dp-size 8",
+        "--reasoning-parser deepseek-v4",
+        "--language-model-only",
+        `--json-model-override-args '{"architectures": ["DeepseekV4ForCausalLM"], "quantization_config": null}'`,
+        "--speculative-algorithm DSPARK",
+        "--speculative-draft-model-path {{A3_MODEL_PATH}}",
+        "--speculative-draft-model-quantization modelslim",
+        "--speculative-draft-kv-cache-dtype bf16",
+        "--speculative-dspark-block-size 5",
+      ],
+    },
+    {
+      match: { hw: "a5", variant: "flash-1017", quant: "fp4", strategy: "balanced", nodes: "single" },
       nnodes: 1,
       verified: false,
       verificationStatus: "in-progress",
       env: [
-        "ASCEND_LAUNCH_BLOCKING=1",
-        "HCCL_CONNECT_TIMEOUT=300",
-        "HCCL_EXEC_TIMEOUT=68",
         "HCCL_OP_EXPANSION_MODE=AIV",
-        "ACL_DEVICE_SYNC_TIMEOUT=60",
-        "HCCL_HOST_SOCKET_PORT_RANGE=auto",
         "HCCL_SOCKET_IFNAME={{HCCL_INTERFACE}}",
         "GLOO_SOCKET_IFNAME={{GLOO_INTERFACE}}",
         "PYTORCH_NPU_ALLOC_CONF=expandable_segments:True",
         "STREAMS_PER_DEVICE=32",
-        "TRANSFORMERS_VERBOSITY=error",
         "SGLANG_SET_CPU_AFFINITY=1",
         "TASK_QUEUE_ENABLE=1",
         "INF_NAN_MODE_FORCE_DISABLE=1",
         "SGLANG_DEFAULT_THINKING=1",
-        "SGLANG_DSV4_REASONING_EFFORT=max",
         "HCCL_BUFFSIZE=400",
         "DEEPEP_HCCL_BUFFSIZE=1800",
         "SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1",
@@ -710,7 +737,6 @@ exec python3 -m sglang.launch_server "$@"' --`
         "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=2048",
         "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=150",
         "SGLANG_OPT_USE_OVERLAP_STORE_CACHE=False",
-        "FORCE_DRAFT_MODEL_NON_QUANT=1",
         "SGLANG_DSV4_FP4_EXPERTS=True",
         "SGLANG_OPT_FUSE_WQA_WKV=0",
         "SGLANG_OPT_BF16_FP32_GEMM_ALGO=torch",
@@ -719,14 +745,6 @@ exec python3 -m sglang.launch_server "$@"' --`
         "SGLANG_OPT_DEEPGEMM_HC_PRENORM=False",
         "SGLANG_OPT_USE_TILELANG_MHC_POST=False",
         "SGLANG_OPT_FP8_WO_A_GEMM=False",
-        "SGLANG_DSV4_NATIVE_ATTN=0",
-        "SGLANG_DSV4_DBG_ATTN=1",
-        "SGLANG_SHALLOW_FUSED_ROPE_FQ4=0",
-        "SGLANG_COMPRESSOR_PREFILL_USE_TRITON=1",
-        "SGLANG_COMPRESSOR_DECODE_USE_TRITON=1",
-        "SGLANG_OPT_USE_HC_TRITON=0",
-        "SGLANG_OPT_USE_HC_TILELANG=0",
-        "SGLANG_DSV4_GRAPH_MAX_SEQ=131072",
       ],
       flags: [
         "--nnodes 1",
