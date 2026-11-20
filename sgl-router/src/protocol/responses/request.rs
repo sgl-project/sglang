@@ -566,12 +566,22 @@ fn convert_content(content: Value, i: usize) -> Result<Value, String> {
                         "input[{i}]: `input_image.file_id` is not supported; pass `image_url`"
                     ));
                 }
-                let url = url_field(part.remove("image_url"))
-                    .ok_or_else(|| format!("input[{i}]: `input_image` is missing `image_url`"))?;
-                let mut image_url = Map::new();
-                image_url.insert("url".into(), Value::String(url));
-                if let Some(d) = part.remove("detail").filter(|v| !v.is_null()) {
-                    image_url.insert("detail".into(), d);
+                const OPTIONS: &[&str] = &[
+                    "detail",
+                    "min_dynamic_patch",
+                    "max_dynamic_patch",
+                    "max_long_side_pixel",
+                ];
+                let mut image_url = match part.remove("image_url") {
+                    Some(url @ Value::String(_)) => Map::from_iter([("url".into(), url)]),
+                    Some(Value::Object(url)) if url.get("url").is_some_and(Value::is_string) => url,
+                    _ => return Err(format!("input[{i}]: `input_image` is missing `image_url`")),
+                };
+                image_url.retain(|key, _| key == "url" || OPTIONS.contains(&key.as_str()));
+                for &key in OPTIONS {
+                    if let Some(value) = part.remove(key).filter(|v| !v.is_null()) {
+                        image_url.entry(key).or_insert(value);
+                    }
                 }
                 json!({"type": "image_url", "image_url": image_url})
             }
@@ -590,17 +600,6 @@ fn convert_content(content: Value, i: usize) -> Result<Value, String> {
         }
     }
     Ok(Value::Array(out))
-}
-
-fn url_field(v: Option<Value>) -> Option<String> {
-    match v? {
-        Value::String(s) => Some(s),
-        Value::Object(mut o) => match o.remove("url")? {
-            Value::String(s) => Some(s),
-            _ => None,
-        },
-        _ => None,
-    }
 }
 
 /// `namespace` groups are flattened; a `custom` tool becomes a function taking
@@ -1061,6 +1060,25 @@ mod tests {
             json!([
                 {"type": "text", "text": "what"},
                 {"type": "image_url", "image_url": {"url": "https://x/a.png", "detail": "low"}},
+            ])
+        );
+    }
+
+    #[test]
+    fn image_parts_preserve_preprocessing_options() {
+        let c = chat(json!({"model": "m", "input": [{"role": "user", "content": [
+            {"type": "input_image", "image_url": "https://x/a.png",
+             "min_dynamic_patch": 2, "max_dynamic_patch": 4, "max_long_side_pixel": 1024},
+            {"type": "input_image", "image_url": {"url": "https://x/b.png",
+             "detail": "low", "max_dynamic_patch": 8}, "detail": "high", "max_dynamic_patch": 4},
+        ]}]}));
+        assert_eq!(
+            c["messages"][0]["content"],
+            json!([
+                {"type": "image_url", "image_url": {"url": "https://x/a.png",
+                 "min_dynamic_patch": 2, "max_dynamic_patch": 4, "max_long_side_pixel": 1024}},
+                {"type": "image_url", "image_url": {"url": "https://x/b.png",
+                 "detail": "low", "max_dynamic_patch": 8}},
             ])
         );
     }
