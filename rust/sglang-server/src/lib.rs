@@ -9,7 +9,7 @@
 //! [`IngressRequest`] and [`ShmBuffer`]. Everything behind that boundary --
 //! receiving requests, encoding multimodal inputs, tokenizing, detokenizing,
 //! SSE streaming, and so on — is implemented purely in Rust and never touches
-//! a `PyObject`.
+//! a `PyObject`, except `PythonMmProcessor`, the multimodal fallback here.
 
 mod api_server;
 mod message;
@@ -183,6 +183,61 @@ pub type HttpLayer = Arc<dyn Fn(axum::Router) -> axum::Router + Send + Sync>;
 #[derive(Clone, Copy, Debug)]
 pub struct RequestStart(pub std::time::Instant);
 
+/// `process(input_ids, images, videos, audios) -> (input_ids, payload)`, called
+/// with the GIL on each MM worker: the Python processor's expanded ids and its
+/// pickled `MultimodalProcessorOutput`. A `ValueError` is the client's (400).
+/// The payload rides the ring as the zero-padded i64 feature of one opaque item
+/// (`pickle.loads` ignores the padding), so it lives exactly as long as its request.
+struct PythonMmProcessor {
+    process: Py<PyAny>,
+}
+
+impl MmProcessor for PythonMmProcessor {
+    fn process(&self, input_ids: TokenIds, mm: MmData) -> Result<MmProcessOutput, MediaError> {
+        let media = resolve_media_work(input_ids, mm)?;
+        let (input_ids, payload): (TokenIds, PyBackedBytes) = Python::attach(|py| {
+            let bytes = |items: &[bytes::Bytes]| -> Vec<Bound<'_, PyBytes>> {
+                items.iter().map(|item| PyBytes::new(py, item)).collect()
+            };
+            let args = (
+                media.input_ids,
+                bytes(&media.images),
+                bytes(&media.videos),
+                bytes(&media.audios),
+            );
+            (self.process.call1(py, args).and_then(|out| out.extract(py))).map_err(|e| {
+                if e.is_instance_of::<pyo3::exceptions::PyValueError>(py) {
+                    MediaError::Client(e.to_string())
+                } else {
+                    MediaError::Server(e.to_string())
+                }
+            })
+        })?;
+        let mut words = vec![0i64; payload.len().div_ceil(8)];
+        bytemuck::cast_slice_mut::<i64, u8>(&mut words)[..payload.len()].copy_from_slice(&payload);
+        let item = MmEncodedItem {
+            modality: MmModality::Image,
+            feature: Tensor {
+                shape: vec![words.len()],
+                data: TensorData::I64(words),
+            },
+            hash: 0,
+            identity: None,
+            offsets: Vec::new(),
+            model_specific_data: Default::default(),
+        };
+        Ok(MmProcessOutput {
+            input_ids,
+            result: MmEncodedEntry {
+                items: vec![item],
+                token_ids: None,
+                mrope: None,
+            },
+            extension: None,
+        })
+    }
+}
+
 /// Handle owned by the Python scheduler process. Construct once via
 /// [`Server::start`], then poll it from the scheduler event loop.
 #[pyclass]
@@ -305,11 +360,21 @@ impl Server {
     /// `RustServer._build_mm_spec`). Image-only requests are processed entirely
     /// in Rust; their buffers ride the ring with the request (the `mm.*` set of
     /// [`IngressRequest::buffers`]). Anything the pipeline cannot serve is
-    /// rejected back to the client -- there is no Python fallback.
+    /// rejected back to the client -- there is no per-request Python fallback.
     pub fn start_mm_workers(&self, spec: MmSpec, workers: usize) -> PyResult<()> {
         self.rt
             .start_mm_workers(spec, workers)
             .map_err(|e| value_error("mm spec", e))
+    }
+
+    /// Spawn the MM worker pool over SGLang's Python multimodal processor, for
+    /// a model with no Rust pipeline (see `PythonMmProcessor`).
+    pub fn start_python_mm_workers(&self, process: Py<PyAny>, workers: usize) {
+        self.rt.start_mm_workers_with_processor(
+            Arc::new(PythonMmProcessor { process }),
+            workers,
+            false,
+        );
     }
 
     /// Block, without the GIL, until the startup warmup fails (its error) or
