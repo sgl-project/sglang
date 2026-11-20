@@ -55,6 +55,7 @@ from sglang.srt.model_executor.forward_context import (
     get_kv_layers,
     get_token_to_kv_pool,
 )
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
@@ -318,12 +319,13 @@ def rocm_absorb_q_bmm(
 
 def _can_fuse_rocm_mla_value_mxfp4_quant(
     attn: DeepseekV2AttentionMLA,
-    forward_batch: ForwardBatch,
+    *,
+    forward_mode: ForwardMode,
 ) -> bool:
     # The caller has already checked that w_vc is MXFP4.
     return (
         _use_fused_mla_value_mxfp4_quant
-        and forward_batch.forward_mode.is_decode_or_idle()
+        and forward_mode.is_decode_or_idle()
         and attn.current_attention_backend == "aiter"
         and not attn.use_dsa
         and not _SGLANG_EXPERIMENTAL_LORA_OPTI
@@ -337,7 +339,7 @@ def _can_fuse_rocm_mla_value_mxfp4_quant(
 def rocm_absorb_v_bmm(
     attn: DeepseekV2AttentionMLA,
     attn_output: torch.Tensor,
-    forward_batch: ForwardBatch,
+    forward_mode: ForwardMode,
 ) -> torch.Tensor:
     """Absorb ``attn_output @ w_vc`` (+ optional fused flatten quant) on HIP."""
     # TODO(haishaw): add bmm_fp8 to ROCm
@@ -346,10 +348,12 @@ def rocm_absorb_v_bmm(
         w_vc = attn.w_vc.transpose(-2, -1)
         w_scale_v = attn.w_scale_v.transpose(-2, -1)
         if _can_fuse_rocm_mla_value_mxfp4_quant(
-            attn=attn, forward_batch=forward_batch
-        ) and can_fuse_mla_value_bmm_mxfp4_quant(x, w_vc, w_scale_v):
+            attn=attn, forward_mode=forward_mode
+        ) and can_fuse_mla_value_bmm_mxfp4_quant(x=x, w=w_vc, w_scales=w_scale_v):
             # Emits the flattened MXFP4 o_proj input; there is no BF16 value output.
-            return batched_gemm_a16wfp4_flatten_mxfp4_quant(x, w_vc, w_scale_v)
+            return batched_gemm_a16wfp4_flatten_mxfp4_quant(
+                x=x, w=w_vc, w_scales=w_scale_v
+            )
         B_heads, M_batch = x.shape[0], x.shape[1]
         N_vdim = attn.w_vc.shape[2]
         # Allocate in (batch, heads, dim) so the post-GEMM
@@ -1233,7 +1237,11 @@ class DeepseekMLARocmForwardMixin:
                 attn_bmm_output[:, :expected_m, :].transpose(0, 1).flatten(1, 2)
             )
         else:
-            attn_bmm_output = rocm_absorb_v_bmm(self, attn_output, forward_batch)
+            attn_bmm_output = rocm_absorb_v_bmm(
+                attn=self,
+                attn_output=attn_output,
+                forward_mode=forward_batch.forward_mode,
+            )
 
         if _SGLANG_EXPERIMENTAL_LORA_OPTI:
             from sglang.srt.lora.trtllm_lora_temp.deepseek_mla_correction import (

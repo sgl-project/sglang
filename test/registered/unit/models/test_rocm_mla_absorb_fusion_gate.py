@@ -139,10 +139,8 @@ def _value_attn(**overrides):
     return attn
 
 
-def _forward_batch(is_decode_or_idle=True):
-    return SimpleNamespace(
-        forward_mode=SimpleNamespace(is_decode_or_idle=lambda: is_decode_or_idle)
-    )
+def _forward_mode(is_decode_or_idle=True):
+    return ForwardMode.DECODE if is_decode_or_idle else ForwardMode.EXTEND
 
 
 class TestValueQuantFusionGate(CustomTestCase):
@@ -167,14 +165,18 @@ class TestValueQuantFusionGate(CustomTestCase):
         )
 
     def test_takes_the_fused_path_when_every_term_holds(self):
-        self.assertTrue(_CAN_FUSE_VALUE_QUANT(_value_attn(), _forward_batch()))
+        self.assertTrue(
+            _CAN_FUSE_VALUE_QUANT(_value_attn(), forward_mode=_forward_mode())
+        )
 
     def test_active_kv_b_lora_turns_it_off(self):
         """The fused kernel has no hook for the kv_b_proj LoRA delta on the value output."""
         with mock.patch.object(
             forward_mla_rocm, "is_kv_b_lora_active", return_value=True
         ):
-            self.assertFalse(_CAN_FUSE_VALUE_QUANT(_value_attn(), _forward_batch()))
+            self.assertFalse(
+                _CAN_FUSE_VALUE_QUANT(_value_attn(), forward_mode=_forward_mode())
+            )
 
     def test_each_term_alone_turns_it_off(self):
         # The kernel is decode-only on the AITER MLA backend, feeds an MXFP4 o_proj,
@@ -189,19 +191,21 @@ class TestValueQuantFusionGate(CustomTestCase):
             with self.subTest(term=name):
                 self.assertFalse(
                     _CAN_FUSE_VALUE_QUANT(
-                        _value_attn(**{name: broken}), _forward_batch()
+                        _value_attn(**{name: broken}), forward_mode=_forward_mode()
                     )
                 )
         with self.subTest(term="forward_mode"):
             self.assertFalse(
-                _CAN_FUSE_VALUE_QUANT(_value_attn(), _forward_batch(False))
+                _CAN_FUSE_VALUE_QUANT(_value_attn(), forward_mode=_forward_mode(False))
             )
         # Off when the env var disables it or AITER lacks the kernel's helpers.
         with self.subTest(term="_use_fused_mla_value_mxfp4_quant"):
             with mock.patch.object(
                 forward_mla_rocm, "_use_fused_mla_value_mxfp4_quant", False
             ):
-                self.assertFalse(_CAN_FUSE_VALUE_QUANT(_value_attn(), _forward_batch()))
+                self.assertFalse(
+                    _CAN_FUSE_VALUE_QUANT(_value_attn(), forward_mode=_forward_mode())
+                )
 
 
 _ROPE_HEAD_DIM = 64
