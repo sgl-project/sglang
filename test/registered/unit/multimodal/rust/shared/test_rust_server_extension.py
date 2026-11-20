@@ -16,6 +16,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.environ import envs  # noqa: E402
 from sglang.srt.managers.io_struct import GenerateReqInput  # noqa: E402
 from sglang.srt.managers.io_struct import flatten_output_ids  # noqa: E402
 from sglang.srt.managers.schedule_batch import Req  # noqa: E402
@@ -1259,8 +1260,9 @@ class TestRustServerExtension(CustomTestCase):
 
     def test_launch_resolves_the_mm_pipeline_before_the_server_starts(self):
         """The listener answers once the server is constructed, so the MM
-        workers start before that: a model without a Rust MM pipeline gets
-        the Python processor's, a supported one the spec resolved up front."""
+        workers start before that: a model without a Rust MM pipeline, or one
+        forced by SGLANG_FORCE_PYTHON_MM_PROCESSOR, gets the Python processor;
+        a supported one gets the spec resolved up front."""
         extension = ModuleType("server")
         extension.Server = Mock()
 
@@ -1303,6 +1305,17 @@ class TestRustServerExtension(CustomTestCase):
             spec = Mock()
             spec.rust_json.return_value = "{}"
             mm_processor.return_value.resolve_spec.return_value = spec
+            with (
+                envs.SGLANG_FORCE_PYTHON_MM_PROCESSOR.override(True),
+                patch.object(server_module, "PythonMmFallback") as fallback,
+            ):
+                instance = BuiltinServer.launch(scheduler)
+            instance.server.start_python_mm_workers.assert_called_once_with(
+                fallback.return_value, 8
+            )
+            self.assertIsNone(instance.mm_spec)
+            extension.Server.reset_mock()
+
             instance = BuiltinServer.launch(scheduler)
 
         extension.Server.assert_called_once()

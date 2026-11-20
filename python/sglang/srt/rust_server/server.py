@@ -290,10 +290,17 @@ class RustServer:
     @classmethod
     def _resolve_multimodal(cls, scheduler: Scheduler) -> Optional[RustMmSpec]:
         """Resolve the built-in Rust MM pipeline for a multimodal model, or
-        ``None`` to serve it with the Python processor. A model package whose
+        ``None`` to serve it with the Python processor (no pipeline, or
+        ``SGLANG_FORCE_PYTHON_MM_PROCESSOR``). A model package whose
         ``_start_multimodal`` starts its own pipeline overrides this to return
         ``None``; its server admits no generation request until that
         pipeline starts."""
+        if envs.SGLANG_FORCE_PYTHON_MM_PROCESSOR.get():
+            logger.info(
+                "rust server: SGLANG_FORCE_PYTHON_MM_PROCESSOR is set; "
+                "the Rust MM workers run SGLang's Python multimodal processor"
+            )
+            return None
         mm_spec = RustMmProcessor(
             server_args=scheduler.server_args,
             model_config=scheduler.model_config,

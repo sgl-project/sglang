@@ -2635,6 +2635,9 @@ class Envs:
     # Rust server
     # ===================================================================
     SGLANG_RUST_SERVER = EnvBool(False)
+    # Serve a multimodal model with SGLang's Python processor on the Rust MM
+    # workers even when the model has a built-in Rust pipeline.
+    SGLANG_FORCE_PYTHON_MM_PROCESSOR = EnvBool(False)
     # Build a missing Rust extension from source (auto), require a bundled or
     # cached extension (never), or rebuild the local cache entry (force).
     SGLANG_RUST_BUILD_MODE = EnvStr("auto")
