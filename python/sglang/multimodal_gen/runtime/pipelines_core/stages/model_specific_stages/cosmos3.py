@@ -28,14 +28,17 @@ import torch.nn.functional as F
 from sglang.kernels import get_kernel
 from sglang.multimodal_gen.configs.sample.sampling_params import quality_allows
 from sglang.multimodal_gen.configs.task_type import DataType
-from sglang.multimodal_gen.runtime.cache.conditioning import _inference_cache
+from sglang.multimodal_gen.runtime.cache.conditioning import (
+    _inference_cache,
+    use_gpu_conditioning_hash,
+)
 from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
     get_world_size,
     model_parallel_is_initialized,
 )
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
-    cfg_model_parallel_all_reduce,
+    cfg_model_parallel_all_gather,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_classifier_free_guidance_rank,
@@ -49,6 +52,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
 )
 from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import (
     use_vae_fast_path,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
+    expand_request_outputs,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
@@ -449,6 +455,15 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
         raise ValueError(
             "control_path must be a string or list of strings, got "
             f"{type(control_path).__name__}"
+        )
+
+    def iter_sequential_requests(
+        self, batch: Req, server_args: ServerArgs
+    ) -> Iterator[Req]:
+        return iter(
+            expand_request_outputs(
+                batch, reuse_parent_trace_ctx=True, preserve_parent_metrics=True
+            )
         )
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
@@ -1536,10 +1551,11 @@ class Cosmos3DenoisingStage(PipelineStage):
                 :, :, current_conditional_frames - 1 : current_conditional_frames
             ].expand(-1, -1, chunk_frames - current_conditional_frames, -1, -1)
 
-        control_latents = [
-            self._encode_transfer_video(control, latent_dtype)
-            for control in control_norms
-        ]
+        with use_gpu_conditioning_hash():
+            control_latents = [
+                self._encode_transfer_video(control, latent_dtype)
+                for control in control_norms
+            ]
         condition_latents = self._encode_transfer_video(target_norm, latent_dtype)
         noise = torch.randn(
             condition_latents.shape,
@@ -1735,6 +1751,9 @@ class Cosmos3DenoisingStage(PipelineStage):
         cfg_world_size = (
             get_classifier_free_guidance_world_size() if enable_cfg_parallel else 1
         )
+        # FSDP shards span the CFG ranks, so every CFG rank must issue the same
+        # all-gathers: the same number of forwards and the same UND cache misses.
+        cfg_lockstep = enable_cfg_parallel and bool(server_args.use_fsdp_inference)
 
         sp_size = get_sp_world_size()
         sp_rank = get_sp_parallel_rank() if sp_size > 1 else 0
@@ -1771,6 +1790,8 @@ class Cosmos3DenoisingStage(PipelineStage):
         # host copy for the per-step CFG window checks: a device read per step
         # would stall the host on every step's kernels
         timestep_values = timesteps.tolist()
+        # UND cache keys of the branches the previous step split across CFG ranks.
+        prev_step_cfg_split: tuple[str, ...] | None = None
 
         for i, t in progress_bar:
             # Precision is chosen once per step, before any transformer call,
@@ -1794,12 +1815,11 @@ class Cosmos3DenoisingStage(PipelineStage):
                 and control_guidance != 1.0
                 and self._cfg_active_at(timestep_values[i], control_guidance_interval)
             )
-
-            if control_cfg_active:
-                # Control-CFG owns the step: 2 branches (text guidance off) or 3
-                # (text guidance on), distributed across CFG ranks and reduced by
-                # ``_predict_noise_cfg`` (sequential per rank, no batching).
-                branches = self._control_cfg_branches(
+            # Control-CFG owns the step: 2 branches (text guidance off) or 3
+            # (text guidance on), distributed across CFG ranks and reduced by
+            # ``_predict_noise_cfg`` (sequential per rank, no batching).
+            control_branches = (
+                self._control_cfg_branches(
                     cond_text_ids,
                     cond_text_mask,
                     uncond_text_ids,
@@ -1810,14 +1830,33 @@ class Cosmos3DenoisingStage(PipelineStage):
                     text_guidance_scale=effective_scale,
                     control_guidance_scale=control_guidance,
                 )
+                if control_cfg_active
+                else None
+            )
+            if not cfg_lockstep:
+                step_cfg_split = None
+            elif control_branches is not None:
+                step_cfg_split = tuple(b["cache_key"] for b in control_branches)
+            elif do_cfg and effective_scale != 1.0:
+                step_cfg_split = ("cond", "uncond")
+            else:
+                step_cfg_split = None
+            if i > 0 and step_cfg_split != prev_step_cfg_split:
+                # Each rank caches only its share of the split branches; once that
+                # changes, a miss on one rank alone would issue unmatched all-gathers.
+                self.transformer.reset_cache()
+            prev_step_cfg_split = step_cfg_split
+
+            if control_branches is not None:
                 noise_pred = self._predict_noise_cfg(
-                    branches,
+                    control_branches,
                     latents=latents,
                     timestep=timestep,
                     video_shape=video_shape,
                     fps=fps,
                     cfg_rank=cfg_rank,
                     cfg_world_size=cfg_world_size,
+                    cfg_lockstep=cfg_lockstep,
                     noisy_frame_mask=velocity_mask,
                     current_timestep=i,
                     sound_latents=sound_latents,
@@ -1920,6 +1959,7 @@ class Cosmos3DenoisingStage(PipelineStage):
                         fps=fps,
                         cfg_rank=cfg_rank,
                         cfg_world_size=cfg_world_size,
+                        cfg_lockstep=cfg_lockstep,
                         noisy_frame_mask=velocity_mask,
                         current_timestep=i,
                         sound_latents=sound_latents,
@@ -1928,6 +1968,7 @@ class Cosmos3DenoisingStage(PipelineStage):
                         action_noisy_mask=action_velocity_mask,
                         action_fps=action_fps,
                         action_start_frame_offset=action_start_frame_offset,
+                        combine_as_text_cfg=control_latents is None,
                     )
             else:
                 # No CFG this step (guidance off or outside the CFG window): a
@@ -2064,6 +2105,7 @@ class Cosmos3DenoisingStage(PipelineStage):
         fps: float,
         cfg_rank: int,
         cfg_world_size: int,
+        cfg_lockstep: bool = False,
         noisy_frame_mask: torch.Tensor | None = None,
         current_timestep: int | None = None,
         sound_latents: torch.Tensor | None = None,
@@ -2072,6 +2114,7 @@ class Cosmos3DenoisingStage(PipelineStage):
         action_noisy_mask: torch.Tensor | None = None,
         action_fps: float | None = None,
         action_start_frame_offset: int = 1,
+        combine_as_text_cfg: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Combine CFG branches as the weighted sum ``sum_b coeff_b * f(branch_b)``.
 
@@ -2081,14 +2124,26 @@ class Cosmos3DenoisingStage(PipelineStage):
         identical on every CFG rank.
 
         Branches are distributed round-robin across the ``cfg_world_size`` CFG
-        ranks. A rank runs its branches sequentially and a final sum all-reduce
-        combines ranks. Forwards are never batched, which preserves each text
-        branch's native length and bounds activation memory with control inputs.
+        ranks. A rank runs its branches sequentially. Forwards are never batched,
+        which preserves each text branch's native length and bounds activation
+        memory with control inputs.
+
+        Under CFG parallel the raw branch predictions are all-gathered and every
+        rank combines them in branch order, so the BF16 result is the one a
+        single rank computes; a sum all-reduce of per-rank partials adds the
+        branches in a different order. ``combine_as_text_cfg`` combines the
+        ``[cond, uncond]`` pair as ``uncond + g * (cond - uncond)``, the order
+        of the single-GPU control-free text CFG paths.
         """
-        acc = None
-        for i, branch in enumerate(branches):
-            if i % cfg_world_size != cfg_rank:
-                continue
+        local_preds: dict[int, tuple[torch.Tensor, ...]] = {}
+        for round_start in range(0, len(branches), cfg_world_size):
+            i = round_start + cfg_rank
+            # Under lockstep a rank with no branch left reruns the round's first one
+            # and discards it, so every rank runs the same number of forwards.
+            is_pad = i >= len(branches)
+            if is_pad and not cfg_lockstep:
+                break
+            branch = branches[round_start] if is_pad else branches[i]
             out = self._run_transformer(
                 latents=latents,
                 timestep=timestep,
@@ -2108,32 +2163,72 @@ class Cosmos3DenoisingStage(PipelineStage):
                 action_start_frame_offset=action_start_frame_offset,
                 control_latents=branch["control_latents"],
             )
-            coeff = branch["coeff"]
-            if isinstance(out, tuple):
-                scaled = tuple(coeff * prediction for prediction in out)
-                acc = (
-                    scaled
-                    if acc is None
-                    else tuple(
-                        total + contribution
-                        for total, contribution in zip(acc, scaled, strict=True)
-                    )
-                )
-            else:
-                scaled = coeff * out
-                acc = scaled if acc is None else acc + scaled
-
-        if acc is None:
-            # More ranks than branches: contribute zeros to the all-reduce.
-            acc = self._zero_like_output(latents, action_latents, sound_latents)
+            if is_pad:
+                continue
+            local_preds[i] = out if isinstance(out, tuple) else (out,)
 
         if cfg_world_size > 1:
-            if isinstance(acc, tuple):
-                return tuple(
-                    cfg_model_parallel_all_reduce(prediction) for prediction in acc
+            zeros = self._zero_like_output(latents, action_latents, sound_latents)
+            preds = self._all_gather_cfg_branches(
+                local_preds,
+                num_branches=len(branches),
+                cfg_rank=cfg_rank,
+                cfg_world_size=cfg_world_size,
+                zeros=zeros if isinstance(zeros, tuple) else (zeros,),
+            )
+        else:
+            preds = [local_preds[i] for i in range(len(branches))]
+
+        if combine_as_text_cfg:
+            g = branches[0]["coeff"]
+            combined = tuple(
+                u + g * (c - u) for c, u in zip(preds[0], preds[1], strict=True)
+            )
+        else:
+            combined = None
+            for branch, pred in zip(branches, preds, strict=True):
+                scaled = tuple(branch["coeff"] * p for p in pred)
+                combined = (
+                    scaled
+                    if combined is None
+                    else tuple(
+                        total + contribution
+                        for total, contribution in zip(combined, scaled, strict=True)
+                    )
                 )
-            return cfg_model_parallel_all_reduce(acc)
-        return acc
+        return combined if len(combined) > 1 else combined[0]
+
+    @staticmethod
+    def _all_gather_cfg_branches(
+        local_preds: dict[int, tuple[torch.Tensor, ...]],
+        *,
+        num_branches: int,
+        cfg_rank: int,
+        cfg_world_size: int,
+        zeros: tuple[torch.Tensor, ...],
+    ) -> list[tuple[torch.Tensor, ...]]:
+        """All-gather round-robin branch predictions back into branch order.
+
+        Slot ``s`` of rank ``r`` holds branch ``s * cfg_world_size + r``; ranks
+        with fewer branches send zeros for the empty slots.
+        """
+        num_slots = -(-num_branches // cfg_world_size)
+        gathered = []
+        for slot in range(num_slots):
+            pred = local_preds.get(slot * cfg_world_size + cfg_rank, zeros)
+            gathered.append(
+                [
+                    cfg_model_parallel_all_gather(p, dim=0, separate_tensors=True)
+                    for p in pred
+                ]
+            )
+        return [
+            tuple(
+                per_rank[bid % cfg_world_size]
+                for per_rank in gathered[bid // cfg_world_size]
+            )
+            for bid in range(num_branches)
+        ]
 
     def _predict_noise_text_cfg_serial(
         self,

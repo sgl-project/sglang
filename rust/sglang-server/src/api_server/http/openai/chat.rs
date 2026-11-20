@@ -9,10 +9,7 @@ use axum::{
     body::Bytes,
     extract::State,
     http::{HeaderMap, StatusCode},
-    response::{
-        IntoResponse, Response,
-        sse::{Event, Sse},
-    },
+    response::{IntoResponse, Response, sse::Event},
     routing::post,
 };
 use futures::StreamExt;
@@ -35,6 +32,8 @@ use sglang_processor::{
     tool_call_stream,
 };
 
+use super::super::auth::DeclaredRoute;
+use super::super::dp_relay::HintRoute;
 use super::completions::completion_usage;
 use super::lowered;
 use super::pd_routing::PDRoutingFields;
@@ -45,7 +44,7 @@ use super::{
     contains_non_image_media, error_payload, indexed_decode_stream, model_error, openai_error,
     submit_generation, unix_seconds_u32,
 };
-use crate::api_server::core::{CoreEvent, CoreOutput};
+use crate::api_server::core::{CoreEvent, CoreOutput, OpenAiRequest};
 use crate::api_server::handlers::CoreCall;
 use crate::message::config::{DefaultSamplingParams, ServerArgs};
 use crate::message::finish_reason::{FinishKind, FinishReason, Matched};
@@ -55,9 +54,10 @@ use crate::message::request::{GenerateRequest, MmData};
 use crate::message::response::ChunkExtras;
 use crate::message::sampling::SamplingParams;
 use crate::message::types::OneOrMany;
+use crate::utils::response::sse_response;
 
 pub(super) fn routes() -> Router<Arc<AppState>> {
-    Router::new().route("/v1/chat/completions", post(chat_completions))
+    Router::new().declared_route("/v1/chat/completions", post(chat_completions))
 }
 
 #[derive(Deserialize)]
@@ -113,7 +113,26 @@ async fn chat_completions(
             return openai_error(StatusCode::BAD_REQUEST, rejection.body_text(), false);
         }
     };
-    if let Some(message) = model_error(&request.model, &state.server_args.served_model_name) {
+    let tool_choice = dynamo_tool_choice(&request.tool_choice);
+    let tools =
+        sglang_processor::chat_tool_definitions(request.tools.as_deref(), &request.messages);
+    // Python logs the request once its `_validate_request` accepts it, so
+    // only the checks this server shares with it (messages, media for a
+    // text-only model, tool definitions, tool choice) come first; a request
+    // this server goes on to refuse, or to serve where Python would refuse
+    // it, is logged.
+    if state.core.logs_openai_requests()
+        && !request.messages.is_empty()
+        && (state.server_args.model_is_multimodal() || !has_media_part(&raw["messages"]))
+        && tools.as_ref().is_ok_and(|tools| {
+            sglang_processor::tool_constraint(None, &tool_choice, tools, None).is_ok()
+        })
+    {
+        state
+            .core
+            .log_openai_request(OpenAiRequest::ChatCompletion, &body, &headers);
+    }
+    if let Some(message) = model_error(&request.model, &state.core.served_model_name().await) {
         return openai_error(StatusCode::BAD_REQUEST, message, false);
     }
     if request.messages.is_empty() {
@@ -160,11 +179,7 @@ async fn chat_completions(
         );
     }
 
-    let tool_choice = dynamo_tool_choice(&request.tool_choice);
-    let tools = match sglang_processor::chat_tool_definitions(
-        request.tools.as_deref(),
-        &request.messages,
-    ) {
+    let tools = match tools {
         Ok(tools) => tools,
         Err(error) => return openai_error(StatusCode::BAD_REQUEST, error.to_string(), false),
     };
@@ -262,10 +277,17 @@ async fn chat_completions(
     let stream = request.stream.unwrap_or(false);
     let prompt_count = 1;
     let choices_per_prompt = request.n.unwrap_or(1) as usize;
-    let routing = match routing.normalize(prompt_count, choices_per_prompt) {
+    let mut routing = match routing.normalize(prompt_count, choices_per_prompt) {
         Ok(routing) => routing,
         Err(error) => return openai_error(StatusCode::BAD_REQUEST, error.to_string(), false),
     };
+    if let Err(error) = routing.apply_header_rank(
+        HintRoute::ChatCompletions,
+        &headers,
+        state.server_args.enable_request_header_overrides,
+    ) {
+        return openai_error(StatusCode::BAD_REQUEST, error, false);
+    }
     // Chat normalizes one prompt, so each bootstrap column has one entry.
     let bootstrap_host = &routing.bootstrap.bootstrap_hosts[0];
     let bootstrap_port = routing.bootstrap.bootstrap_ports[0];
@@ -305,7 +327,7 @@ async fn chat_completions(
         let native = GenerateRequest {
             rid: rid.clone(),
             chat_prompt: Some(choice_prompt),
-            sampling_params: sampling.clone(),
+            sampling_params: sampling.for_sample(index),
             stream,
             return_logprob: want_logprobs,
             logprob_start_len: -1,
@@ -327,7 +349,7 @@ async fn chat_completions(
             }),
             ..Default::default()
         };
-        let call = match submit_generation(&state, native, stream).await {
+        let call = match submit_generation(&state, &headers, native, stream).await {
             Ok(call) => call,
             Err(response) => return response,
         };
@@ -357,9 +379,10 @@ async fn chat_completions(
             uses_tool_call_structural_tag,
             parallel_tool_calls,
             service_tier,
+            state.server_args.enable_cache_report,
         )
         .map(|data| Ok::<_, Infallible>(Event::default().data(data)));
-        Sse::new(event_stream).into_response()
+        sse_response(event_stream)
     } else {
         unary_chat(
             submitted,
@@ -371,6 +394,7 @@ async fn chat_completions(
             prompt_stub_tokens,
             parallel_tool_calls,
             service_tier,
+            state.server_args.enable_cache_report,
         )
         .await
     }
@@ -401,39 +425,64 @@ pub(super) async fn prepare_chat_request(
     body: Value,
     mut request: CreateChatCompletionRequest,
 ) -> Result<(CreateChatCompletionRequest, RenderedChat), Response> {
-    let Some(formatter) = state.chat_formatter.clone() else {
+    let Some(formatter) = state.chat_formatter.as_ref() else {
         return Err(openai_error(
             StatusCode::BAD_REQUEST,
             "this model has no usable chat template",
             false,
         ));
     };
+    let rendered = prepare_chat_prompt(
+        formatter,
+        body,
+        &mut request,
+        &state.server_args.default_chat_template_kwargs,
+    )
+    .map_err(|message| openai_error(StatusCode::BAD_REQUEST, message, false))?;
+    Ok((request, rendered))
+}
+
+/// Merge the template's stops into `request` and render its prompt from the
+/// raw `body` (whose `chat_template_kwargs` the renderer reads); the
+/// chat-shaped frontends (OpenAI, Anthropic) share this step.
+pub(crate) fn prepare_chat_prompt(
+    formatter: &ChatFormatter,
+    body: Value,
+    request: &mut CreateChatCompletionRequest,
+    defaults: &super::ChatTemplateKwargs,
+) -> Result<RenderedChat, String> {
     // Template stops first, then the request's own — Python
     // `_apply_conversation_template` (`conv.stop_str` + `request.stop`). A
     // token-id stop cannot be merged into the string list (Python has no such
     // field), so it is kept alone.
-    merge_template_stops(&mut request, &formatter);
-    let rendered = render_chat(
-        &formatter,
-        body,
-        &request,
-        &state.server_args.default_chat_template_kwargs,
-    )
-    .map_err(|error| {
-        openai_error(
-            StatusCode::BAD_REQUEST,
-            format!("chat template render failed: {error}"),
-            false,
-        )
-    })?;
-    Ok((request, rendered))
+    merge_template_stops(request, formatter);
+    render_chat(formatter, body, request, defaults)
+        .map_err(|error| format!("chat template render failed: {error}"))
+}
+
+/// Python `_validate_media_content`'s test for a text-only model: a message
+/// content part of a media type, counting `input_audio`, which Python's
+/// request model turns into an `audio_url` part.
+fn has_media_part(messages: &Value) -> bool {
+    messages.as_array().is_some_and(|messages| {
+        messages.iter().any(|message| {
+            message["content"].as_array().is_some_and(|parts| {
+                parts.iter().any(|part| {
+                    matches!(
+                        part["type"].as_str(),
+                        Some("image_url" | "video_url" | "audio_url" | "input_audio")
+                    )
+                })
+            })
+        })
+    })
 }
 
 /// Full sampling resolution for an OpenAI request, mirroring the Python
 /// handler: endpoint defaults → tool-choice validation + constraint → clamp.
 /// The tool-choice checks run regardless of whether a parser is configured
 /// (see `apply_tool_constraint`).
-pub(super) fn chat_sampling(
+pub(crate) fn chat_sampling(
     request: &CreateChatCompletionRequest,
     defaults: SamplingDefaults,
     parser: Option<&str>,
@@ -489,7 +538,7 @@ fn merge_template_stops(request: &mut CreateChatCompletionRequest, formatter: &C
 /// `to_sampling_params` priority: user value > model generation_config (when
 /// `--sampling-defaults model`) > OpenAI terminal default
 /// (`_DEFAULT_SAMPLING_PARAMS`: chat uses 1.0/1.0).
-pub(super) struct SamplingDefaults {
+pub(crate) struct SamplingDefaults {
     /// Model defaults; `None` when the model config doesn't set them or when
     /// `--sampling-defaults openai` (the Python dump is then empty).
     temperature: Option<f64>,
@@ -501,10 +550,17 @@ pub(super) struct SamplingDefaults {
 
 impl SamplingDefaults {
     /// `protocol.py` chat `_DEFAULT_SAMPLING_PARAMS`: temperature 1.0, top_p 1.0.
-    pub(super) const CHAT: SamplingDefaults = SamplingDefaults {
+    pub(crate) const CHAT: SamplingDefaults = SamplingDefaults {
         temperature: None,
         top_p: None,
         fallback_temperature: 1.0,
+        fallback_top_p: 1.0,
+    };
+    /// Python's `ResponsesRequest._DEFAULT_SAMPLING_PARAMS`: 0.7 / 1.0.
+    pub(crate) const RESPONSES: SamplingDefaults = SamplingDefaults {
+        temperature: None,
+        top_p: None,
+        fallback_temperature: 0.7,
         fallback_top_p: 1.0,
     };
     /// The resolved model defaults (empty in `--sampling-defaults openai`
@@ -574,7 +630,7 @@ pub(super) fn chat_sampling_params(
 }
 
 /// How a choice's output is parsed.
-pub(super) enum OutputParsing {
+pub(crate) enum OutputParsing {
     /// `--reasoning-parser`, and `--tool-call-parser` over the request's tools,
     /// over the output text.
     Text {
@@ -598,23 +654,60 @@ pub(super) async fn unary_chat(
     prompt_stub_tokens: u32,
     parallel_tool_calls: bool,
     service_tier: Option<ChatServiceTier>,
+    cache_report: bool,
 ) -> Response {
+    match unary_chat_response(
+        submitted,
+        response_id,
+        model,
+        created,
+        want_logprobs,
+        parsing,
+        prompt_stub_tokens,
+        parallel_tool_calls,
+        service_tier,
+        cache_report,
+    )
+    .await
+    {
+        Ok(response) => Json(response).into_response(),
+        Err((status, message)) => openai_error(status, message, false),
+    }
+}
+
+/// The unary chat completion as a value, for the frontends that re-shape it
+/// (Anthropic) as well as the OpenAI route.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn unary_chat_response(
+    submitted: Vec<(usize, CoreCall)>,
+    response_id: String,
+    model: String,
+    created: u32,
+    want_logprobs: bool,
+    parsing: OutputParsing,
+    prompt_stub_tokens: u32,
+    parallel_tool_calls: bool,
+    service_tier: Option<ChatServiceTier>,
+    cache_report: bool,
+) -> Result<CreateChatCompletionResponse, (StatusCode, String)> {
     let mut choices = Vec::with_capacity(submitted.len());
     let mut prompt_tokens = 0;
+    let mut cached_tokens = 0;
     let mut completion_tokens = 0u64;
+    let mut reasoning_tokens = 0u64;
 
     for (index, call) in submitted {
-        let output = match collect_output(call).await {
-            Ok(output) => output,
-            Err((status, message)) => {
-                return openai_error(status, message, false);
-            }
-        };
+        let output = collect_output(call).await?;
 
         if prompt_tokens == 0 {
             prompt_tokens = output.prompt_tokens.saturating_sub(prompt_stub_tokens);
         }
+        // Python reports the first choice's cached tokens.
+        if index == 0 {
+            cached_tokens = output.cached_tokens;
+        }
         completion_tokens = completion_tokens.saturating_add(output.completion_tokens);
+        reasoning_tokens = reasoning_tokens.saturating_add(output.reasoning_tokens);
         let logprobs = want_logprobs.then(|| chat_logprobs(output.extras.as_deref()));
         let finish_reason = chat_finish_reason(&output);
         let (reasoning_text, content, tool_calls, finish_reason) = match &parsing {
@@ -633,6 +726,7 @@ pub(super) async fn unary_chat(
                             name: call.name,
                             arguments: call.arguments,
                         },
+                        custom: None,
                     })
                     .collect();
                 // `parse_chat_response`: calls turn only a stop into `tool_calls`.
@@ -691,7 +785,7 @@ pub(super) async fn unary_chat(
         });
     }
 
-    Json(CreateChatCompletionResponse {
+    Ok(CreateChatCompletionResponse {
         id: response_id,
         choices,
         created,
@@ -702,13 +796,14 @@ pub(super) async fn unary_chat(
         usage: Some(completion_usage(
             prompt_tokens,
             u32::try_from(completion_tokens).unwrap_or(u32::MAX),
+            reasoning_tokens,
+            cache_report.then_some(cached_tokens),
         )),
     })
-    .into_response()
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn chat_event_stream(
+pub(crate) fn chat_event_stream(
     submitted: Vec<(usize, CoreCall)>,
     response_id: String,
     model: String,
@@ -721,6 +816,7 @@ pub(super) fn chat_event_stream(
     uses_tool_call_structural_tag: bool,
     parallel_tool_calls: bool,
     service_tier: Option<ChatServiceTier>,
+    cache_report: bool,
 ) -> impl futures::Stream<Item = String> {
     let count = submitted.len();
     let (reasoning_parser, reasoning_options, parser, tools, deepseek) = match parsing {
@@ -745,7 +841,9 @@ pub(super) fn chat_event_stream(
         let count = submitted.len();
         let mut streams = Vec::with_capacity(count);
         let mut prompt_tokens = 0u32;
+        let mut cached_tokens = 0u32;
         let mut completion_tokens = 0u64;
+        let mut reasoning_tokens_by_choice = vec![0u64; count];
         // One stateful reasoning splitter per choice (Python keeps a
         // `reasoning_parser_dict` per index).
         let mut reasoning_splitters: Vec<ReasoningStreamSplitter> =
@@ -804,7 +902,12 @@ pub(super) fn chat_event_stream(
             if prompt_tokens == 0 {
                 prompt_tokens = output.prompt_tokens.saturating_sub(prompt_stub_tokens);
             }
+            // Python reports the first choice's latest cached tokens.
+            if index == 0 {
+                cached_tokens = output.cached_tokens;
+            }
             completion_tokens = completion_tokens.saturating_add(output.completion_tokens);
+            reasoning_tokens_by_choice[index] = output.reasoning_tokens;
             let mut finish_reason = chat_finish_reason(&output);
             let mut emitted = Vec::with_capacity(2);
             if let Some(parser) = deepseek_parsers.get_mut(index) {
@@ -923,6 +1026,11 @@ pub(super) fn chat_event_stream(
                     usage: Some(completion_usage(
                         prompt_tokens,
                         u32::try_from(completion_tokens).unwrap_or(u32::MAX),
+                        reasoning_tokens_by_choice
+                            .iter()
+                            .copied()
+                            .fold(0u64, u64::saturating_add),
+                        cache_report.then_some(cached_tokens),
                     )),
                 }),
                 id: None,
@@ -1022,6 +1130,7 @@ fn deepseek_choices(
                 name: call.name,
                 arguments: Some(call.arguments),
             }),
+            custom: None,
         };
         choice(chat_delta(None, None, Some(vec![call]), None), None);
     }
@@ -1103,6 +1212,7 @@ pub(super) fn chat_logprobs(extras: Option<&ChunkExtras>) -> ChatChoiceLogprobs 
                     bytes: Some(text.as_bytes().to_vec()),
                     token: text,
                     logprob,
+                    token_id: None,
                 }
             })
             .collect();
@@ -1121,6 +1231,15 @@ pub(super) fn chat_logprobs(extras: Option<&ChunkExtras>) -> ChatChoiceLogprobs 
     }
 }
 
+/// V4, GLM-5.3 and Qwen3.8 prefill `<think>` (Qwen3.8 with a newline) when
+/// thinking, so the generated stream has no opening marker.
+pub(crate) fn starts_in_reasoning(reasoning_parser: Option<&str>, prompt: &str) -> bool {
+    matches!(
+        reasoning_parser,
+        Some("deepseek-v4" | "deepseek_v4" | "deepseekv4" | "glm45" | "qwen3")
+    ) && prompt.trim_end_matches('\n').ends_with("<think>")
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -1128,7 +1247,7 @@ mod tests {
     use super::super::ChatFormatter;
     use super::super::test_utils::{
         answering_app_state_with, answering_app_state_with_item, body_json, chat_submitted, chunk,
-        post_json,
+        post_json, with_cached_tokens,
     };
     use super::{
         OutputParsing, SamplingDefaults, chat_event_stream, chat_images, chat_logprobs,
@@ -1331,8 +1450,12 @@ mod tests {
     async fn unary_chat_fans_in_choices_and_usage() {
         let (choice0, tx0) = chat_submitted(0, "r0");
         let (choice1, tx1) = chat_submitted(1, "r1");
-        tx0.send(chunk("r0", "Paris", true)).await.unwrap();
-        tx1.send(chunk("r1", "Paris", true)).await.unwrap();
+        tx0.send(with_cached_tokens(chunk("r0", "Paris", true), 3))
+            .await
+            .unwrap();
+        tx1.send(with_cached_tokens(chunk("r1", "Paris", true), 4))
+            .await
+            .unwrap();
 
         let response = unary_chat(
             vec![choice0, choice1],
@@ -1344,6 +1467,7 @@ mod tests {
             3, // Kimi K3's generation stub
             true,
             None,
+            true,
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -1359,6 +1483,12 @@ mod tests {
             "the stub is not reported"
         );
         assert_eq!(value["usage"]["completion_tokens"], 2);
+        assert_eq!(
+            value["usage"]["completion_tokens_details"]["reasoning_tokens"],
+            0
+        );
+        // `--enable-cache-report`: the first choice's cached tokens.
+        assert_eq!(value["usage"]["prompt_tokens_details"]["cached_tokens"], 3);
     }
 
     /// The first choice's message for `body`, against a core answering `text`.
@@ -1504,6 +1634,7 @@ mod tests {
             0,
             true,
             None,
+            false,
         )
         .await;
         let value = body_json(response).await;
@@ -1552,6 +1683,7 @@ mod tests {
             false,
             false,
             None,
+            false,
         );
         let frames: Vec<serde_json::Value> = stream
             .filter_map(|frame| async move { serde_json::from_str(&frame).ok() })
@@ -1614,6 +1746,7 @@ mod tests {
             0,
             true,
             None,
+            false,
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -1653,6 +1786,7 @@ mod tests {
             false,
             true,
             None,
+            false,
         );
         futures::pin_mut!(stream);
         let frames: Vec<String> = stream.collect().await;
@@ -1680,40 +1814,49 @@ mod tests {
 
     #[tokio::test]
     async fn streaming_chat_emits_role_deltas_usage_and_done() {
-        let (choice, tx) = chat_submitted(0, "r0");
-        tx.send(chunk("r0", "Par", false)).await.unwrap();
-        tx.send(chunk("r0", "is", true)).await.unwrap();
+        for cache_report in [false, true] {
+            let (choice, tx) = chat_submitted(0, "r0");
+            tx.send(chunk("r0", "Par", false)).await.unwrap();
+            tx.send(chunk("r0", "is", true)).await.unwrap();
 
-        let stream = chat_event_stream(
-            vec![choice],
-            "chatcmpl-test".into(),
-            "model".into(),
-            1,
-            false,
-            true,
-            text_parsing(None),
-            0,
-            None,
-            false,
-            true,
-            None,
-        );
-        futures::pin_mut!(stream);
-        let frames: Vec<String> = stream.collect().await;
-        assert_eq!(frames.len(), 5);
-        let role: serde_json::Value = serde_json::from_str(&frames[0]).unwrap();
-        let delta: serde_json::Value = serde_json::from_str(&frames[1]).unwrap();
-        let terminal: serde_json::Value = serde_json::from_str(&frames[2]).unwrap();
-        let usage: serde_json::Value = serde_json::from_str(&frames[3]).unwrap();
-        assert_eq!(role["choices"][0]["delta"]["role"], "assistant");
-        assert!(role["choices"][0]["delta"]["reasoning_content"].is_null());
-        assert_eq!(delta["choices"][0]["delta"]["content"], "Par");
-        assert!(delta["choices"][0]["delta"]["reasoning_content"].is_null());
-        assert_eq!(terminal["choices"][0]["delta"]["content"], "is");
-        assert!(terminal["choices"][0]["delta"]["reasoning_content"].is_null());
-        assert_eq!(terminal["choices"][0]["finish_reason"], "stop");
-        assert_eq!(usage["usage"]["completion_tokens"], 2);
-        assert_eq!(frames[4], "[DONE]");
+            let stream = chat_event_stream(
+                vec![choice],
+                "chatcmpl-test".into(),
+                "model".into(),
+                1,
+                false,
+                true,
+                text_parsing(None),
+                0,
+                None,
+                false,
+                true,
+                None,
+                cache_report,
+            );
+            futures::pin_mut!(stream);
+            let frames: Vec<String> = stream.collect().await;
+            assert_eq!(frames.len(), 5);
+            let role: serde_json::Value = serde_json::from_str(&frames[0]).unwrap();
+            let delta: serde_json::Value = serde_json::from_str(&frames[1]).unwrap();
+            let terminal: serde_json::Value = serde_json::from_str(&frames[2]).unwrap();
+            let usage: serde_json::Value = serde_json::from_str(&frames[3]).unwrap();
+            assert_eq!(role["choices"][0]["delta"]["role"], "assistant");
+            assert!(role["choices"][0]["delta"]["reasoning_content"].is_null());
+            assert_eq!(delta["choices"][0]["delta"]["content"], "Par");
+            assert!(delta["choices"][0]["delta"]["reasoning_content"].is_null());
+            assert_eq!(terminal["choices"][0]["delta"]["content"], "is");
+            assert!(terminal["choices"][0]["delta"]["reasoning_content"].is_null());
+            assert_eq!(terminal["choices"][0]["finish_reason"], "stop");
+            assert_eq!(usage["usage"]["completion_tokens"], 2);
+            assert_eq!(frames[4], "[DONE]");
+            // Python reports a zero cache hit rather than omitting it.
+            let details = &usage["usage"]["prompt_tokens_details"];
+            match cache_report {
+                true => assert_eq!(details["cached_tokens"], 0, "{usage}"),
+                false => assert!(details.is_null(), "{usage}"),
+            }
+        }
     }
 
     // A named dynamic tool must pass request validation and reach both wire formats.
@@ -1746,6 +1889,9 @@ mod tests {
                     peer_endpoints: Vec::new(),
                     metadata: CoreMetadata::from(args.as_ref()),
                     metrics: None,
+                    request_log: None,
+                    generate_validator: None,
+                    abort_hook: None,
                 },
             );
             let state = Arc::new(super::super::AppState {

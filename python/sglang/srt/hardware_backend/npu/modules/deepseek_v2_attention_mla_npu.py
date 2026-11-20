@@ -2,7 +2,8 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 import torch_npu
-from sgl_kernel_npu.norm.fused_split_qk_norm import fused_split_qk_norm
+from sgl_kernel_npu.operators.matmul import batch_matmul_transpose
+from sgl_kernel_npu.operators.norm import fused_split_qk_norm
 
 import sglang.srt.layers.dcp.comm as dcp_comm
 import sglang.srt.layers.dcp.layout as dcp_layout
@@ -18,15 +19,17 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
     is_mla_preprocess_enabled,
 )
-from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.attention.dsa.dsa_npu_indexer import scattered_to_tp_attn_full
+from sglang.srt.layers.attention.dsa.dsa_token_shard import (
+    dsa_token_shard_redistribute_heads,
+    dsa_token_shard_restore_tokens,
+    dsa_token_shard_slice,
+    get_dsa_token_shard_plan,
+)
 from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
 )
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
-from sglang.srt.layers.quantization.modelslim.modelslim import (
-    ModelSlimKVCacheMethod,
-)
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.runtime_context import get_disagg
 from sglang.srt.state_capturer.indexer_topk import maybe_capture_indexer_topk
@@ -36,26 +39,20 @@ if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
     from sglang.srt.utils import BumpAllocator
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
-_is_npu_arch35 = is_npu_arch35()
 
 
 def init_modelslim_mla_kv(m: "DeepseekV2AttentionMLA", prefix: str):
     quant_config = m.quant_config
     if quant_config is None or quant_config.get_name() != "modelslim" or m.use_dsa:
         return
-    scheme = quant_config.get_modelslim_kv_scheme(prefix)
-    if scheme is None:
-        return
-    attn = m.attn_mqa
-    attn.scheme = scheme
-    attn.quant_method = ModelSlimKVCacheMethod()
-    attn.quant_method.create_weights(
-        attn,
+    scheme = quant_config.init_kv_cache(
+        m.attn_mqa,
+        prefix,
         kv_lora_rank=m.kv_lora_rank,
         qk_rope_head_dim=m.qk_rope_head_dim,
-        params_dtype=torch.get_default_dtype(),
     )
-    m.attn_mha.scheme = scheme
+    if scheme is not None:
+        m.attn_mha.scheme = scheme
 
 
 # region MHA
@@ -360,28 +357,7 @@ def forward_mla_core_npu(
         **attn_kwargs,
     )
 
-    attn_output = attn_output.contiguous()
-    if (
-        attn_output.shape[0] >= 65536
-        or attn_output.shape[-1] * attn_output.shape[-2] >= 65536
-        or m.w_vc.shape[-1] >= 65536
-    ):
-        # npu_transpose_batchmatmul does not support dimensions >= 65536.
-        attn_bmm_output = torch.empty(
-            (attn_output.shape[0], m.num_local_heads, m.v_head_dim),
-            dtype=attn_output.dtype,
-            device=attn_output.device,
-        )
-        torch.ops.npu.batch_matmul_transpose(attn_output, m.w_vc, attn_bmm_output)
-    else:
-        # Use the numerically validated torch_npu implementation when supported.
-        attn_bmm_output = torch_npu.npu_transpose_batchmatmul(
-            attn_output,
-            m.w_vc,
-            perm_x1=(1, 0, 2),
-            perm_x2=(0, 1, 2),
-            perm_y=(1, 0, 2),
-        )
+    attn_bmm_output = batch_matmul_transpose(attn_output.contiguous(), m.w_vc)
 
     attn_bmm_output = attn_bmm_output.reshape(-1, m.num_local_heads * m.v_head_dim)
     if gate is not None:
@@ -419,6 +395,8 @@ def forward_dsa_prepare_npu(
     prev_topk_indices: torch.Tensor = None,
 ):
     dynamic_scale = None
+    # Resolved here so the core can read the cached plan back.
+    get_dsa_token_shard_plan(forward_batch)
     mla_preprocess_used = (
         is_mla_preprocess_enabled()
         and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
@@ -443,7 +421,7 @@ def forward_dsa_prepare_npu(
         )
     else:
         fused_qkv_a_proj_out = m.fused_qkv_a_proj_with_mqa(hidden_states)[0]
-        if m.rotary_emb.is_neox_style:
+        if m.rotary_emb is None or m.rotary_emb.is_neox_style:
             q, latent_cache = fused_qkv_a_proj_out.split(
                 [m.q_lora_rank, m.kv_lora_rank + m.qk_rope_head_dim], dim=-1
             )
@@ -505,25 +483,24 @@ def forward_dsa_prepare_npu(
 
         q_nope, q_pe = q.split([m.qk_nope_head_dim, m.qk_rope_head_dim], dim=-1)
 
-        q_nope_out = torch_npu.npu_transpose_batchmatmul(
-            q_nope,
-            m.w_kc,
-            perm_x1=(1, 0, 2),
-            perm_x2=(0, 1, 2),
-            perm_y=(1, 0, 2),
-        )
+        q_nope_out = batch_matmul_transpose(q_nope, m.w_kc, impl="torch_npu")
 
-        if is_mla_preprocess_enabled() and not m.rotary_emb.is_neox_style:
+        if (
+            is_mla_preprocess_enabled()
+            and m.rotary_emb is not None
+            and not m.rotary_emb.is_neox_style
+        ):
             # Match the half-layout RoPE outputs used by MLA preprocessing.
             q_pe, k_pe = _apply_interleaved_rope_with_half_output(
                 m.rotary_emb, positions, q_pe, k_pe
             )
         else:
-            if m.layer_id == get_token_to_kv_pool().start_layer:
-                m.rotary_emb.sin_cos_cache = m.rotary_emb.cos_sin_cache.index_select(
-                    0, positions
-                )
-            q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
+            if m.rotary_emb is not None:
+                if m.layer_id == get_token_to_kv_pool().start_layer:
+                    m.rotary_emb.sin_cos_cache = (
+                        m.rotary_emb.cos_sin_cache.index_select(0, positions)
+                    )
+                q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
 
         if dsa_use_prefill_cp(forward_batch):
             # support allgather+rerrange
@@ -591,38 +568,88 @@ def forward_dsa_core_npu(
     gate: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     backend = get_mla_dcp_backend(forward_context.get_attn_backend())
-    attn_output = forward_mla_attention_npu(
-        m,
-        backend,
-        forward_batch,
-        q_nope_out.contiguous(),
-        k_nope.contiguous(),
-        q_pe.contiguous(),
-        k_pe.contiguous(),
-        save_kv_cache=not mla_preprocess_used,
-        topk_indices=topk_indices,
-    )
-
-    if _is_npu_arch35 or (
-        forward_batch.forward_mode.is_extend()
-        and not forward_batch.forward_mode.is_draft_extend_v2()
-        and not forward_batch.forward_mode.is_target_verify()
-    ):
-        attn_bmm_output = torch_npu.npu_transpose_batchmatmul(
-            attn_output,
-            m.w_vc,
-            perm_x1=(1, 0, 2),
-            perm_x2=(0, 1, 2),
-            perm_y=(1, 0, 2),
+    # Never set under DCP: the plan refuses it, so a forward never takes both
+    # paths.
+    dsa_token_shard_plan = get_dsa_token_shard_plan(forward_batch)
+    if dsa_token_shard_plan is None:
+        attn_output = forward_mla_attention_npu(
+            m,
+            backend,
+            forward_batch,
+            q_nope_out.contiguous(),
+            k_nope.contiguous(),
+            q_pe.contiguous(),
+            k_pe.contiguous(),
+            save_kv_cache=not mla_preprocess_used,
+            topk_indices=topk_indices,
         )
     else:
-        attn_bmm_output = torch.empty(
-            (attn_output.shape[0], m.num_local_heads, m.v_head_dim),
-            dtype=attn_output.dtype,
-            device=attn_output.device,
+        # Not forward_mla_attention_npu: no DCP partials to merge, and that
+        # helper's closing view assumes per-rank heads, not the full-head
+        # token slice this attention returns.
+        if topk_indices is None or m.attn_mqa_for_dsa_token_shard is None:
+            raise RuntimeError(
+                "DSA token-shard planned this forward but the layer is not set up for "
+                f"it: attn_mqa_for_dsa_token_shard={m.attn_mqa_for_dsa_token_shard is not None}, "
+                f"topk_indices={topk_indices is not None}"
+            )
+        dsa_token_shard_rows = q_nope_out.shape[0]
+        q_nope_out = dsa_token_shard_redistribute_heads(
+            q_nope_out, dsa_token_shard_plan
         )
-        attn_output = attn_output.contiguous()
-        torch.ops.npu.batch_matmul_transpose(attn_output, m.w_vc, attn_bmm_output)
+        q_pe = dsa_token_shard_redistribute_heads(q_pe, dsa_token_shard_plan)
+        # A separate name is load-bearing: topk_indices is returned for the
+        # next layer, and rebinding it would hand that a slice of a slice.
+        topk_is_local = getattr(forward_batch, "npu_indexer_topk_is_local", None)
+        if topk_is_local is None:
+            # No indexer ran on this stage: a PP stage starting on a skip-top-k
+            # layer reuses the previous stage's top-k on a fresh batch, and the
+            # flag was set on that batch, not this one. Classify by width --
+            # this rank's rows or the full batch -- because slicing a local
+            # tensor again gives every rank the wrong rows with no shape error.
+            if topk_indices.shape[0] == dsa_token_shard_plan.rows:
+                topk_is_local = True
+            elif topk_indices.shape[0] == dsa_token_shard_rows:
+                topk_is_local = False
+            else:
+                raise RuntimeError(
+                    f"DSA top-k carries {topk_indices.shape[0]} rows, neither "
+                    f"this rank's {dsa_token_shard_plan.rows} nor the batch's "
+                    f"{dsa_token_shard_rows}; refusing to guess its layout"
+                )
+            forward_batch.npu_indexer_topk_is_local = topk_is_local
+        if topk_is_local:
+            # Checked, not assumed: a full-width tensor here gives every rank
+            # but 0 the wrong rows with no shape error.
+            if topk_indices.shape[0] != dsa_token_shard_plan.rows:
+                raise RuntimeError(
+                    "top-k is marked local to this rank but carries "
+                    f"{topk_indices.shape[0]} rows, not the plan's "
+                    f"{dsa_token_shard_plan.rows}"
+                )
+            attn_topk_indices = topk_indices
+        else:
+            attn_topk_indices = dsa_token_shard_slice(
+                topk_indices, dsa_token_shard_plan
+            )
+        attn_output = m.attn_mqa_for_dsa_token_shard(
+            q_nope_out.contiguous(),
+            k_nope.contiguous(),
+            k_nope.contiguous(),
+            forward_batch,
+            save_kv_cache=not mla_preprocess_used,
+            q_rope=q_pe.contiguous(),
+            k_rope=k_pe.contiguous(),
+            topk_indices=attn_topk_indices,
+        )
+        attn_output = dsa_token_shard_restore_tokens(
+            attn_output.reshape(dsa_token_shard_plan.rows, -1, m.kv_lora_rank),
+            dsa_token_shard_plan,
+            dsa_token_shard_rows,
+        )
+        attn_output = attn_output.view(-1, m.num_local_heads, m.kv_lora_rank)
+
+    attn_bmm_output = batch_matmul_transpose(attn_output, m.w_vc, impl="torch_npu")
 
     attn_bmm_output = attn_bmm_output.reshape(-1, m.num_local_heads * m.v_head_dim)
 
@@ -716,7 +743,7 @@ def npu_mla_preprocess(
                 [m.q_lora_rank, m.kv_lora_rank + m.qk_rope_head_dim], dim=-1
             )
             q_lora = m.q_a_layernorm(q)
-            torch.npu.current_stream().wait_event(m.alt_stream)
+            torch.npu.current_stream().wait_stream(m.alt_stream)
         else:
             (
                 q_pe,

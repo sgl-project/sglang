@@ -7,11 +7,16 @@ from typing import TYPE_CHECKING, Any, List, Optional
 import msgspec
 
 from sglang.srt.arg_groups.model_override_base import resolved_view
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_model,
     get_spec,
 )
 from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
+from sglang.srt.speculative.ragged_verify import (
+    RaggedVerifyMode,
+    read_ragged_verify_mode,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -19,7 +24,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 DEFAULT_DSPARK_GAMMA = 7
-SUPPORTED_DSPARK_MARKOV_HEAD_TYPES = ("vanilla", "gated", "rnn")
+SUPPORTED_DSPARK_MARKOV_HEAD_TYPES = ("vanilla", "gated", "rnn", "rnn_hidden")
 
 # The dsv4 self-drafting checkpoint runs its draft attention on the dedicated
 # DeepSeek-V4 backend instead of the generic draft-backend fallback.
@@ -29,6 +34,22 @@ DSV4_DRAFT_ATTENTION_BACKEND = "dsv4"
 def get_dspark_sample_from_anchor(draft_hf_config: Any) -> bool:
     """Return whether a DSpark checkpoint samples the anchor query row."""
     return bool(_cfg_get(draft_hf_config, "sample_from_anchor", True))
+
+
+def builds_confidence_head(draft_hf_config: Any) -> bool:
+    """Whether the draft builds its trained confidence head; ragged verify
+    without one takes its confidences from the online acceptance estimator."""
+    if read_ragged_verify_mode() is RaggedVerifyMode.STATIC:
+        return False
+    enabled = _cfg_get(draft_hf_config, "enable_confidence_head")
+    if enabled is False or envs.SGLANG_DSPARK_USE_ONLINE_ESTIMATOR.get():
+        return False
+    if enabled is None:
+        logger.warning(
+            "DSpark draft config has no enable_confidence_head field; treating the "
+            "confidence head as enabled."
+        )
+    return True
 
 
 def draft_uses_compressed_kv_attention() -> bool:
@@ -164,6 +185,10 @@ def checkpoint_bundles_dspark_draft(hf_config: Any) -> bool:
     """The checkpoint carries a bundled DSpark draft head, marked by the
     prefixed dspark_* keys on the target hf config. Single source of truth
     for the bundling convention (draft-path defaulting, draft-arch remap)."""
+    if _cfg_get(hf_config, "architectures", None) == [
+        "Inkling2ForConditionalGeneration"
+    ]:
+        return _cfg_get(hf_config, "mtp_config", None) is not None
     return any(
         _cfg_get(hf_config, key, None) is not None
         for key in (
@@ -213,6 +238,14 @@ def _get_dspark_config(config: Any) -> dict:
 
 
 def parse_dspark_draft_config(*, draft_hf_config: Any) -> DSparkDraftConfig:
+    if _cfg_get(draft_hf_config, "architectures", None) == [
+        "Inkling2ForConditionalGeneration"
+    ]:
+        from sglang.srt.configs.inkling2 import Inkling2MMConfig, Inkling2MTPConfig
+
+        if isinstance(draft_hf_config, dict):
+            draft_hf_config = Inkling2MMConfig(**draft_hf_config)
+        draft_hf_config = Inkling2MTPConfig.from_target(draft_hf_config)
     base = parse_dflash_draft_config(draft_hf_config=draft_hf_config)
 
     dspark_cfg = _get_dspark_config(draft_hf_config)

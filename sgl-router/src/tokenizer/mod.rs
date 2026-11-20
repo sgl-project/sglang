@@ -70,6 +70,76 @@ pub struct TokenizerRegistry {
     openai: Option<Arc<dyn OpenAiTokenizer>>,
     /// The model config SGLang's OpenAI chat layer reads.
     chat_model: ChatModel,
+    /// Ids of the placeholder tokens a rendered chat carries for its images.
+    media_token_ids: Vec<u32>,
+}
+
+/// Image placeholder tokens the chat renderers emit, by their spelling in
+/// `tokenizer.json`'s added tokens (DeepSeek-V4 family).
+pub(crate) const MEDIA_TOKENS: &[&str] = &["<｜deepseek_image｜>"];
+
+/// Ids that follow each image placeholder in a chat's routing ids (see
+/// [`tag_images`]): [`MEDIA_TAG_MARK`], then two from the image's identity.
+pub const MEDIA_TAG_LEN: usize = 3;
+
+/// The id that opens an image's identity tag. No tokenizer vocabulary reaches
+/// it, so it marks ids that `tag_images` produced: a placeholder a caller's
+/// `input_ids` or a `/generate` prompt spells out is not followed by it, and
+/// media affinity leaves such prompts alone (see
+/// [`crate::state::kv_events::HashTree::first_media_position`]).
+pub const MEDIA_TAG_MARK: u32 = u32::MAX;
+
+/// Routing-only ids for a chat with images: after each placeholder in `ids`,
+/// [`MEDIA_TAG_LEN`] ids derived from the image's source (`images`, in
+/// placeholder order), so chats whose text is the same but whose images differ
+/// hash differently from their first image on, as they do in the engine, whose
+/// cache keys carry each image's own hash. Nothing before the first image
+/// changes, so the prefix KV events can confirm is hashed as the engine hashes
+/// it. These ids never reach an engine nor a token count: a chat with media is
+/// ineligible for `input_ids` forwarding, and counts use the untagged ids.
+pub(crate) fn tag_images(ids: Vec<u32>, placeholders: &[u32], images: &[String]) -> Vec<u32> {
+    if placeholders.is_empty() || images.is_empty() {
+        return ids;
+    }
+    let mut tagged = Vec::with_capacity(ids.len() + images.len() * MEDIA_TAG_LEN);
+    let mut images = images.iter();
+    for id in ids {
+        tagged.push(id);
+        if placeholders.contains(&id) {
+            if let Some(source) = images.next() {
+                tagged.extend(media_tag(source));
+            }
+        }
+    }
+    tagged
+}
+
+/// An image's identity tag: [`MEDIA_TAG_MARK`], then the leading bytes of its
+/// source's SHA-256, as a URL or data URL is the identity the engine's own
+/// image hash follows.
+fn media_tag(source: &str) -> [u32; MEDIA_TAG_LEN] {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(source.as_bytes());
+    let mut tag = [MEDIA_TAG_MARK; MEDIA_TAG_LEN];
+    for (i, word) in tag[1..].iter_mut().enumerate() {
+        *word = u32::from_be_bytes(digest[i * 4..i * 4 + 4].try_into().expect("4 bytes"));
+    }
+    tag
+}
+
+/// Ids of [`MEDIA_TOKENS`] declared by a `tokenizer.json`.
+fn media_token_ids(tokenizer_json: &serde_json::Value) -> Vec<u32> {
+    tokenizer_json["added_tokens"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|token| {
+            token["content"]
+                .as_str()
+                .is_some_and(|content| MEDIA_TOKENS.contains(&content))
+        })
+        .filter_map(|token| token["id"].as_u64().and_then(|id| u32::try_from(id).ok()))
+        .collect()
 }
 
 /// `get_context_length` over the model's text config.
@@ -135,6 +205,7 @@ impl TokenizerRegistry {
             "tokenizer loaded");
         let files = adapter::ModelFiles::open(tokenizer_path);
         if let Ok(Some(json)) = files.json("tokenizer.json") {
+            me.media_token_ids = media_token_ids(&json);
             me.openai = Some(Arc::new(OpenAiTokens {
                 tokenizer: Arc::clone(&t),
                 pieces: TokenPieces::from_tokenizer_json(&json),
@@ -169,7 +240,9 @@ impl TokenizerRegistry {
             .ok();
         match ChatFormatter::load_from(&m.id, &files) {
             Ok(Some(formatter)) => {
-                let formatter = formatter.with_defaults(&m.default_chat_template_kwargs);
+                let formatter = formatter
+                    .with_defaults(&m.default_chat_template_kwargs)
+                    .with_prompt_affixes(me.prompt_affixes.as_ref());
                 me.chat_model.always_thinks = formatter.always_thinks();
                 me.chat_model.reasoning_toggle =
                     formatter
@@ -205,8 +278,9 @@ impl TokenizerRegistry {
                      and SGLANG_DSV4_REASONING_EFFORT or SGLANG_DSV41_REASONING_EFFORT"),
                 ForwardingScope::Guarded => tracing::warn!(model = %m.id,
                     "UNVERIFIED input_ids forwarding: router rendering is verified against SGLang only \
-                     for DeepSeek-V4, V4.1, GLM-5.3, Kimi-K3 and Qwen3.8, so this model forwards only guarded shapes (plain text \
-                     chat). Requires the workers' model files and --default-chat-template-kwargs; \
+                     for DeepSeek-V4, V4.1, GLM-5.3, Kimi-K3, MiniMax-M3, Qwen3.8 and StepFun, so this \
+                     model forwards only guarded shapes (plain text chat). Requires the workers' \
+                     model files and --default-chat-template-kwargs; \
                      worker parser overrides, content-format detection, and conversation-template stop \
                      strings are not replicated. Pass --disable-input-ids-forwarding unless you have \
                      verified parity for this model"),
@@ -224,6 +298,12 @@ impl TokenizerRegistry {
         &self.chat_model
     }
 
+    /// Ids of the image placeholder tokens a rendered chat can carry (empty when
+    /// the tokenizer declares none).
+    pub fn media_token_ids(&self) -> &[u32] {
+        &self.media_token_ids
+    }
+
     pub fn stats(&self) -> &stats::TokenizerStats {
         &self.stats
     }
@@ -234,6 +314,19 @@ impl TokenizerRegistry {
 
     /// Encode a raw prompt as the engine's `tokenizer(text)` does, special tokens included.
     pub fn encode_prompt(&self, model_id: &str, text: &str) -> Option<Vec<u32>> {
+        if !self.can_encode_prompt(model_id) {
+            return None;
+        }
+        crate::off_worker::run(|| self.encode_prompt_now(model_id, text))
+    }
+
+    /// Whether [`Self::encode_prompt`] can tokenize for `model_id`; callers check
+    /// it before handing a batch off the worker for nothing.
+    pub fn can_encode_prompt(&self, model_id: &str) -> bool {
+        self.prompt_affixes.is_some() && self.inner.contains_key(model_id)
+    }
+
+    fn encode_prompt_now(&self, model_id: &str, text: &str) -> Option<Vec<u32>> {
         let affixes = self.prompt_affixes.as_ref()?;
         let tokenizer = self.get(model_id)?;
         // The supported tiktoken models use Kimi's chunked encoding, also used for chat.
@@ -267,11 +360,35 @@ impl TokenizerRegistry {
 
     /// Render with dynamo-render and tokenize; return `None` when unavailable or unsuccessful.
     pub fn encode_chat(&self, model_id: &str, request: &serde_json::Value) -> Option<Vec<u32>> {
+        crate::off_worker::run(|| self.encode_chat_now(model_id, request, false))
+    }
+
+    /// [`Self::encode_chat`] for routing: a chat with images carries its images'
+    /// identity after their placeholders (see [`tag_images`]).
+    pub fn encode_chat_for_routing(
+        &self,
+        model_id: &str,
+        request: &serde_json::Value,
+    ) -> Option<Vec<u32>> {
+        crate::off_worker::run(|| self.encode_chat_now(model_id, request, true))
+    }
+
+    fn encode_chat_now(
+        &self,
+        model_id: &str,
+        request: &serde_json::Value,
+        routing: bool,
+    ) -> Option<Vec<u32>> {
         // Clone the Arc and drop the DashMap guard before the CPU-bound
         // render+encode (mirrors `get`), so no shard read-lock is held across it.
         let entry = Arc::clone(&*self.formatters.get(model_id)?);
         let tokenizer = self.get(model_id)?;
-        match entry.formatter.encode(&tokenizer, request) {
+        let ids = if routing {
+            entry.formatter.encode_for_routing(&tokenizer, request)
+        } else {
+            entry.formatter.encode(&tokenizer, request)
+        };
+        match ids {
             Ok(ids) if !ids.is_empty() => Some(ids),
             Ok(_) => {
                 entry.log_fallback(model_id, "rendered prompt tokenized to zero tokens");
@@ -339,6 +456,7 @@ mod tests {
                 decode_policy: Default::default(),
                 dp_aware: false,
                 dp_rank_policy: Default::default(),
+                decode_dp_rank_policy: None,
                 bucket_config: None,
                 reorg_buckets: None,
                 reorg_admission: Default::default(),
@@ -548,6 +666,126 @@ mod tests {
         );
     }
 
+    /// SGLang's text-only path refuses images, but routing still needs a DeepSeek
+    /// chat's tokens: an image chat renders with its placeholder instead of
+    /// falling back to raw prompt text.
+    #[test]
+    fn deepseek_image_chat_encodes_for_routing() {
+        let dir = tempfile::tempdir().unwrap();
+        let tok = dir.path().join("tokenizer.json");
+        // The tiny tokenizer, declaring DeepSeek's image placeholder.
+        const PLACEHOLDER: u32 = 257;
+        let mut json: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string("tests/fixtures/tiny_tokenizer.json").unwrap(),
+        )
+        .unwrap();
+        json["added_tokens"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "id": PLACEHOLDER, "content": MEDIA_TOKENS[0], "special": true,
+                "single_word": false, "lstrip": false, "rstrip": false, "normalized": false
+            }));
+        std::fs::write(&tok, serde_json::to_vec(&json).unwrap()).unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"model_type":"deepseek_v41"}"#,
+        )
+        .unwrap();
+        let formatter = ChatFormatter::load("m", tok.to_str().unwrap())
+            .unwrap()
+            .expect("DeepSeek-V4.1 formatter");
+        let (tokenizer, _) = adapter::load_with(
+            tok.to_str().unwrap(),
+            crate::config::TokenizerConfig::default(),
+        )
+        .unwrap();
+        let image_chat = serde_json::json!({"messages": [{"role": "user", "content": [
+            {"type": "text", "text": "look"},
+            {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}
+        ]}]});
+        let ids = formatter
+            .encode_for_routing(&tokenizer, &image_chat)
+            .expect("image chat renders for routing");
+        assert!(!ids.is_empty());
+        // Deterministic, so every turn and every router hashes it the same way.
+        assert_eq!(
+            formatter
+                .encode_for_routing(&tokenizer, &image_chat)
+                .unwrap(),
+            ids
+        );
+        // The placeholder is followed by the image's identity tag, so the same
+        // text with another image differs from the placeholder on, and only there.
+        let other_chat = serde_json::json!({"messages": [{"role": "user", "content": [
+            {"type": "text", "text": "look"},
+            {"type": "image_url", "image_url": {"url": "https://example.com/b.png"}}
+        ]}]});
+        let other = formatter
+            .encode_for_routing(&tokenizer, &other_chat)
+            .unwrap();
+        let at = ids
+            .iter()
+            .position(|&id| id == PLACEHOLDER)
+            .expect("one placeholder");
+        assert_eq!(ids.iter().filter(|&&id| id == PLACEHOLDER).count(), 1);
+        assert_eq!(other.len(), ids.len());
+        assert_eq!(other[..=at], ids[..=at]);
+        let tag = at + 1..at + 1 + MEDIA_TAG_LEN;
+        assert_eq!(ids[tag.start], MEDIA_TAG_MARK, "the tag is marked");
+        assert_ne!(other[tag.clone()], ids[tag.clone()]);
+        assert_eq!(other[tag.end..], ids[tag.end..]);
+        // Token counts see the prompt as the engine renders it: no tag.
+        let counted = formatter.encode(&tokenizer, &image_chat).unwrap();
+        assert_eq!(counted.len() + MEDIA_TAG_LEN, ids.len());
+        assert!(!counted.contains(&MEDIA_TAG_MARK));
+        assert_eq!(counted[..=at], ids[..=at]);
+        assert_eq!(counted[at + 1..], ids[tag.end..]);
+        assert_eq!(counted, formatter.encode(&tokenizer, &other_chat).unwrap());
+        // Video is still refused (and falls back as before).
+        let video_chat = serde_json::json!({"messages": [{"role": "user", "content": [
+            {"type": "video_url", "video_url": {"url": "https://example.com/a.mp4"}}
+        ]}]});
+        assert!(formatter.encode(&tokenizer, &video_chat).is_err());
+    }
+
+    #[test]
+    fn tag_images_follows_each_placeholder_with_its_image() {
+        let ids = vec![1, 9, 2, 9, 3];
+        let images = ["a".to_string(), "b".to_string()];
+        let tagged = tag_images(ids.clone(), &[9], &images);
+        assert_eq!(tagged.len(), ids.len() + 2 * MEDIA_TAG_LEN);
+        assert_eq!(&tagged[..2], &[1, 9]);
+        assert_eq!(tagged[2..2 + MEDIA_TAG_LEN], media_tag("a"));
+        assert_eq!(&tagged[2 + MEDIA_TAG_LEN..4 + MEDIA_TAG_LEN], &[2, 9]);
+        assert_eq!(
+            tagged[4 + MEDIA_TAG_LEN..4 + 2 * MEDIA_TAG_LEN],
+            media_tag("b")
+        );
+        assert_eq!(tagged.last(), Some(&3));
+        assert_ne!(media_tag("a"), media_tag("b"));
+        // Every tag opens with the marker and differs by its image.
+        assert_eq!(media_tag("a")[0], MEDIA_TAG_MARK);
+        assert_eq!(media_tag("b")[0], MEDIA_TAG_MARK);
+        assert_ne!(media_tag("a")[1..], media_tag("b")[1..]);
+        // A placeholder past the images, or no known placeholder, tags nothing.
+        assert_eq!(
+            tag_images(vec![9, 9], &[9], &images[..1]).len(),
+            2 + MEDIA_TAG_LEN
+        );
+        assert_eq!(tag_images(ids.clone(), &[], &images), ids);
+    }
+
+    #[test]
+    fn media_token_ids_come_from_added_tokens() {
+        let json = serde_json::json!({"added_tokens": [
+            {"id": 7, "content": "<｜begin▁of▁sentence｜>"},
+            {"id": 128_815, "content": "<｜deepseek_image｜>"}
+        ]});
+        assert_eq!(media_token_ids(&json), [128_815]);
+        assert!(media_token_ids(&serde_json::json!({})).is_empty());
+    }
+
     #[test]
     fn invalid_chat_template_keeps_tokenizer_available() {
         let dir = tempfile::tempdir().unwrap();
@@ -677,6 +915,38 @@ mod tests {
         assert!(
             reg.encode_chat("tiny", &request).is_none(),
             "a failing render must yield None so routing falls back to raw text"
+        );
+    }
+
+    /// A slow chat render keeps the runtime serving: with ONE worker, an
+    /// `encode_chat` from a spawned task must not keep another task's timer
+    /// from firing, whatever task calls it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn slow_chat_encode_leaves_the_runtime_serving() {
+        use crate::off_worker::test_support::{
+            slow_chat_body, slow_template_dir, time_beside_a_timer,
+        };
+        use std::time::Duration;
+
+        let dir = slow_template_dir();
+        let mut config = cfg();
+        config.model.tokenizer_path =
+            Some(dir.path().join("tokenizer.json").to_str().unwrap().into());
+        let registry = Arc::new(TokenizerRegistry::load_from_config(&config).unwrap());
+        let body = slow_chat_body(
+            |b| assert!(registry.encode_chat("tiny", b).is_some()),
+            Duration::from_millis(400),
+        );
+        let (took, ticked_after) = time_beside_a_timer(move || async move {
+            assert!(
+                registry.encode_chat("tiny", &body).is_some(),
+                "rendered nothing"
+            );
+        })
+        .await;
+        assert!(
+            ticked_after < took / 2,
+            "timer task waited {ticked_after:?} while the encode took {took:?}"
         );
     }
 }

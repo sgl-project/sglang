@@ -158,6 +158,112 @@ failed both E2E guards against the Verda defaults (1045.89 / 12062.58 ms
 limits). Under the pool rule above it reuses the `4-4567` references: 1471.19 /
 17346.65 ms.
 
+## H100 runner baselines
+
+`h100.json` keeps its references as the defaults. Since 2026-11-02 the
+`multimodal-gen-test-1-gpu` jobs run on the `h100-computable-d-*` and
+`h100-computable-e-*` hosts instead of `h100-novita-*`. Those hosts start
+servers and load weights more slowly, so the loading guard fails there for most
+cases, on `main` as well as on PRs. Its `runner_overrides` give each of the two
+pools its own loading and E2E references, keyed `h100-computable-d-` and
+`h100-computable-e-` so that a future `h100-computable-dx` pool does not match.
+Other runners keep the defaults.
+Memory references and all tolerances are unchanged. Stage/step references keep
+their defaults except for `ltx_2_3_hq_pipeline` on both pools and the
+`computable-d` denoise references, all described below.
+
+Scheduled PR Test Base runs, 2026-10-18 to 2026-11-06 (127 jobs; one `computable-d` job was still running):
+
+| Pool | Jobs passed | Load / reference (median) | E2E / reference (median) |
+| --- | ---: | ---: | ---: |
+| `h100-novita` (to 11-02) | 98 / 100 | 1.03 | 0.97 |
+| `h100-computable-e` | 8 / 15 | 1.34 | 0.98 |
+| `h100-computable-d` | 0 / 11 | 1.67 | 1.06 |
+
+The slowdown covers the whole server startup, not particular models. Median
+time from `Starting server...` to the scheduler binding is 10 s on `novita`,
+11 s on `computable-e` and 14 s on `computable-d`. From `Loading pipeline
+modules...` to `All workers are ready` it is 13 s, 19 s and 21 s. Denoise steps
+are not uniformly slower; the LTX HQ exception is described below.
+
+### Calibration
+
+Sources are the `multimodal-gen-test-1-gpu` jobs of scheduled runs
+[41542824410](https://github.com/sgl-project/sglang/actions/runs/41542824410),
+[41624885463](https://github.com/sgl-project/sglang/actions/runs/41624885463),
+[41736410757](https://github.com/sgl-project/sglang/actions/runs/41736410757),
+[41818760693](https://github.com/sgl-project/sglang/actions/runs/41818760693),
+[41931046936](https://github.com/sgl-project/sglang/actions/runs/41931046936),
+[42016279283](https://github.com/sgl-project/sglang/actions/runs/42016279283),
+[42127018428](https://github.com/sgl-project/sglang/actions/runs/42127018428),
+[42207797310](https://github.com/sgl-project/sglang/actions/runs/42207797310) and
+[42309543238](https://github.com/sgl-project/sglang/actions/runs/42309543238):
+27 jobs on 14 runners. Each case was measured in at least two jobs on each pool.
+
+For each pool and case, the reference is the minimum `load_time_ms` or `e2e_ms`
+over all attempts, the same minimum-observed rule used above. A reference is
+only raised, and only when that minimum is more than 5% above the default, so
+cases the pool runs normally keep the default guard. This gives 51 loading and
+14 E2E overrides for `computable-d`, and 46 loading and 4 E2E overrides for
+`computable-e`.
+
+Leaving out one scheduled run at a time, calibrating on the rest and checking
+the left-out jobs against the loading and E2E guards (with in-job retries): 11
+of 12 `computable-d` jobs and 15 of 15 `computable-e` jobs pass, against 0 of
+12 and 8 of 15 with the defaults.
+
+`ltx_2_3_hq_pipeline` also gets per-pool denoise references (average, median,
+steps 0-14 and `LTX2AVDenoisingStage`) by the same rule, from the same runs.
+Its denoise is slower on both pools (minimum average 1183 ms on `computable-d`
+and 996 ms on `computable-e`, against the 914 ms default), so after the E2E
+override every `computable-d` attempt failed the denoise guard instead. Checked
+against all guards on the 2026-11-07 to 11-09 PR runs, which are not in the
+calibration set, 10 of 10 `computable-d` and 11 of 11 `computable-e` jobs pass,
+against 0 of 10 and 10 of 11 without these references. Override maps such as
+`stages_ms` and `denoise_step_ms` merge into the defaults, so unlisted stages
+and steps keep their default references.
+
+These references describe observed timings on each runner pool. Calibration
+across different runs and source revisions does not by itself establish a host
+cause or rule out a code regression. In particular, passing the adjusted LTX HQ
+guard is not evidence that its denoise slowdown has been explained or fixed;
+that requires controlled same-environment comparisons. On these pools a loading
+regression must exceed the host's own minimum by 40% before it fails. When the
+hosts are fixed or leave the pool, remove their entries.
+
+### `computable-d` denoise references
+
+`computable-d` also denoises more slowly than the other H100 pools. Median
+over cases of `avg_denoise` / reference, per `multimodal-gen-test-1-gpu` job
+(at least three cases), sampled from PR Test runs 2026-10-25 to 2026-11-18:
+
+| Pool | Jobs | Denoise / reference (median) |
+| --- | ---: | ---: |
+| `h100-novita-host1`, `host3` (to 11-01) | 69 | 0.97 |
+| `h100-novita-temp` | 16 | 0.97 |
+| `h100-computable-e` | 107 | 0.97 |
+| `h100-computable-d` | 54 | 1.09 |
+
+On the same days and revisions every `computable-d` runner is slower (per-runner
+medians 1.06 to 1.20), and the other pools stay at 0.97 throughout, so this is
+treated as a pool property, as for loading above.
+
+`computable-d` gets denoise references (average, median, sampled steps and
+stages) and one more E2E reference by the same minimum-observed rule, from 64
+`computable-d` jobs from 2026-11-02 to 2026-11-19 on eight runners. A reference is
+raised only when the minimum is more than 5% above the current one and at least
+one attempt exceeded the current limit, so metrics that never failed keep their
+references. This raises 6 average, 7 median, 25 step, 24 stage and 1 E2E
+reference across 18 cases.
+
+Calibrating on the jobs before 2026-11-16 and checking the 18 later jobs against
+all guards (any passing attempt counts, as with the retry policy): 16 of 18 pass,
+against 8 of 18 with the current references. Leaving out one day at a time,
+54 of 64 pass, against 30 of 64. Six of the ten that still fail ran on
+`h100-computable-d-gpu-0`, the slowest runner, whose jobs denoise a median 11%
+to 23% above the pool's minimum; the minimum rule leaves those runs failing
+rather than widening the pool's references to cover them.
+
 ## Initial loading references
 
 The initial H100 loading references cover 28 cases with at least three distinct

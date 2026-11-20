@@ -11,6 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.kernels.ops.diffusion import (
+    WAN_ROCM_FLYDSL_NORM_SCALE_SHIFT,
     can_use_fused_inplace_qknorm_rope,
     can_use_fused_scale_residual_norm_scale_shift_triton,
     fuse_scale_shift_kernel,
@@ -54,28 +55,32 @@ _is_musa = current_platform.is_musa()
 _is_cpu = current_platform.is_cpu()
 _is_xpu = current_platform.is_xpu()
 _use_rocm_flydsl = get_bool_env_var("SGLANG_USE_ROCM_FLYDSL")
-_has_attentions = False
+_npu_layer_norm = None
 
 if _is_cuda or _is_xpu:
     from sgl_kernel import fused_add_rmsnorm, rmsnorm
 
 if _is_npu:
     import torch_npu
-    from sgl_kernel_npu.norm.rmsnorm_without_weight import (
-        fused_rmsnorm_without_weight,
-    )
+    from sgl_kernel_npu.operators.norm import fused_rmsnorm_without_weight
 
     try:
-        import attentions  # noqa: F401
+        from sgl_kernel_npu.operators.norm import layer_norm as _npu_layer_norm
 
-        _has_attentions = True
-    except ImportError:
+        # An older sgl_kernel_npu may provide the Python facade without the
+        # CANN layernorm operator, so probe the registered torch op as well.
+        if not hasattr(torch.ops.npu, "layernorm"):
+            _npu_layer_norm = None
+    except (ImportError, RuntimeError):
+        _npu_layer_norm = None
+
+    if _npu_layer_norm is None:
         from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
         logger = init_logger(__name__)  # pylint: disable=invalid-name
         logger.warning_once(
-            "The 'attentions' library is not installed. Falling back to native layernorm. "
-            "Installing this library may improve performance on NPU. "
+            "The NPU layernorm operator is unavailable. Falling back to native layernorm. "
+            "Upgrade sgl_kernel_npu to enable it. "
             "See: sgl-project/sgl-kernel-npu"
         )
 
@@ -501,7 +506,7 @@ class FP32LayerNorm(CustomOp, nn.LayerNorm):
         )
         self._forward_method = self.dispatch_forward()
 
-        if _is_npu and not _has_attentions:
+        if _is_npu and _npu_layer_norm is None:
             self._forward_method = self.forward_native
 
     def _cached_fp32_param(
@@ -552,7 +557,7 @@ class FP32LayerNorm(CustomOp, nn.LayerNorm):
         weight = self._cached_fp32_param("_weight_fp32_cache", self.weight, device)
         bias = self._cached_fp32_param("_bias_fp32_cache", self.bias, device)
 
-        output, _, _ = torch.ops.attentions.layernorm(
+        output, _, _ = _npu_layer_norm(
             input=inputs,
             normalized_shape=list(self.normalized_shape),
             weight=weight,
@@ -606,13 +611,26 @@ def _try_npu_fused_scale_shift(
     if not _can_use_npu_fused_scale_shift(x, shift, scale):
         return None
 
-    from sgl_kernel_npu.norm.scale_shift import fused_scale_shift
+    from sgl_kernel_npu.operators.elementwise import fused_scale_shift
 
     scale = scale.reshape(-1)
     if tuple(shift.shape) != tuple(x.shape):
         shift = shift.reshape(-1)
 
     return fused_scale_shift(x, scale.contiguous(), shift.contiguous())
+
+
+def _expand_npu_modulation(
+    x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    # Per-frame [B, F, 1, C] modulation has to broadcast to [B, L, C], the way
+    # fuse_scale_shift_kernel does it; a plain multiply gives [B, F, L, C] and
+    # applies every frame's modulation to every token.
+    if shift.dim() == 4:
+        shift = expand_scale_shift_cpu_param(shift, x)
+    if scale.dim() == 4:
+        scale = expand_scale_shift_cpu_param(scale, x)
+    return shift, scale
 
 
 class _ScaleResidualNormScaleShift(CustomOp):
@@ -633,10 +651,13 @@ class _ScaleResidualNormScaleShift(CustomOp):
         elementwise_affine: bool = False,
         dtype: torch.dtype = torch.float32,
         prefix: str = "",
+        rocm_flydsl_high_only: bool = False,
     ):
         super().__init__()
         self.eps = eps
         self.dtype = dtype
+        if rocm_flydsl_high_only:
+            WAN_ROCM_FLYDSL_NORM_SCALE_SHIFT.mark(self, hidden_size)
         if self.norm_type == "rms":
             self.norm = RMSNorm(hidden_size, eps=eps, dtype=dtype)
         elif self.norm_type == "layer":
@@ -693,7 +714,10 @@ class _ScaleResidualNormScaleShift(CustomOp):
         shift: torch.Tensor,
         scale: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if not _use_rocm_flydsl:
+        if not _use_rocm_flydsl or (
+            WAN_ROCM_FLYDSL_NORM_SCALE_SHIFT.metadata(self) is not None
+            and not WAN_ROCM_FLYDSL_NORM_SCALE_SHIFT.is_enabled(self)
+        ):
             return self.forward_native(residual, x, gate, shift, scale)
 
         try:
@@ -835,6 +859,7 @@ class _ScaleResidualNormScaleShift(CustomOp):
         normalized = self.norm(residual_output)
         modulated = _try_npu_fused_scale_shift(normalized, shift, scale)
         if modulated is None:
+            shift, scale = _expand_npu_modulation(normalized, shift, scale)
             modulated = normalized * (1 + scale) + shift
         return modulated, residual_output
 
@@ -896,9 +921,12 @@ class _NormScaleShift(CustomOp):
         elementwise_affine: bool = False,
         dtype: torch.dtype = torch.float32,
         prefix: str = "",
+        rocm_flydsl_high_only: bool = False,
     ):
         super().__init__()
         self.eps = eps
+        if rocm_flydsl_high_only:
+            WAN_ROCM_FLYDSL_NORM_SCALE_SHIFT.mark(self, hidden_size)
         if self.norm_type == "rms":
             self.norm = RMSNorm(hidden_size, eps=eps, dtype=dtype)
         elif self.norm_type == "layer":
@@ -938,7 +966,10 @@ class _NormScaleShift(CustomOp):
         shift: torch.Tensor,
         scale: torch.Tensor,
     ) -> torch.Tensor:
-        if not _use_rocm_flydsl:
+        if not _use_rocm_flydsl or (
+            WAN_ROCM_FLYDSL_NORM_SCALE_SHIFT.metadata(self) is not None
+            and not WAN_ROCM_FLYDSL_NORM_SCALE_SHIFT.is_enabled(self)
+        ):
             return self.forward_native(x, shift, scale)
 
         try:
@@ -1000,6 +1031,7 @@ class _NormScaleShift(CustomOp):
         if modulated is not None:
             return modulated.to(x.dtype)
 
+        shift, scale = _expand_npu_modulation(normalized, shift, scale)
         return (normalized * (1 + scale) + shift).to(x.dtype)
 
     def forward_cpu(
@@ -1301,7 +1333,7 @@ def tensor_parallel_rms_norm(x: torch.Tensor, norm: "RMSNorm") -> torch.Tensor:
     weight = norm.weight.tensor_split(tp_size)[tp_rank].float()
     x_fp32 = x.float()
     if _is_npu:
-        from sgl_kernel_npu.norm.rmsnorm_split import fused_rsqrt_mul, fused_variance
+        from sgl_kernel_npu.operators.norm import fused_rsqrt_mul, fused_variance
 
         variance = fused_variance(x_fp32)
     else:

@@ -80,7 +80,22 @@ When you need to profile prefill or decode workers in PD disaggregation mode, pl
 
 ## Router Integration
 
-For deploying PD disaggregation at scale with load balancing and fault tolerance, SGLang provides a router. The router can distribute requests between prefill and decode instances using various routing policies. For detailed information on setting up routing with PD disaggregation, including configuration options and deployment patterns, see the [SGLang Model Gateway (former Router)](./sgl_model_gateway#prefill-decode-disaggregation).
+For deploying PD disaggregation at scale with load balancing and fault tolerance, SGLang provides a router. The router can distribute requests between prefill and decode instances using various routing policies.
+
+The router is the `sgl-router` binary. It is pre-installed on the `PATH` of the SGLang Docker images; otherwise install it with `pip install sgl-router`, or see [installing sgl-router](/docs/advanced_features/dp_dpa_router_guide#quick-start-for-sgl-router) for the container image and building from source.
+
+Launch it in front of the prefill and decode servers:
+
+```bash Command
+sgl-router \
+  --model-id meta-llama/Llama-3.1-8B-Instruct \
+  --no-tokenizer \
+  --worker-urls http://127.0.0.1:30000 http://127.0.0.1:30001 \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+`--worker-urls` lists the prefill and decode servers together: the router reads each server's role and the prefill bootstrap port from the server itself. `--model-id` must match the servers' model name, which is their `--served-model-name`, or their `--model-path` when that flag is not set. `--no-tokenizer` leaves tokenization to the servers. Wait for `curl http://127.0.0.1:8000/readiness` to return HTTP 200, which means both servers are registered. For routing policies, Kubernetes service discovery, and the other flags, see `sgl-router --help` and the [sgl-router README](https://github.com/sgl-project/sglang/blob/main/sgl-router/README.md).
 
 ### Responses API under HTTP PD
 
@@ -113,32 +128,15 @@ On Intel XPU, the PyPI wheel has no XPU support. Use the XPU Docker image (`dock
 
 ### AWS EFA
 
-#### EFA Docker images
+#### EFA in the Docker images
 
-Each published CUDA 13 image has an EFA variant for EFA-enabled AWS EC2 instances, built from the same SGLang commit with `docker/efa.Dockerfile`:
+All CUDA 13 images include the AWS EFA userspace (libfabric with the EFA provider, the aws-ofi-nccl plugin, and hwloc) and a Mooncake build with the EFA transport, so the host does not need its own EFA userspace install. The host still needs the EFA kernel driver.
 
-| Base image | EFA image |
-|---|---|
-| `latest`, `v<version>` | `latest-efa`, `v<version>-efa` |
-| `latest-runtime`, `v<version>-runtime` | `latest-runtime-efa`, `v<version>-runtime-efa` |
-| `nightly-dev-<date>-<sha>` | `nightly-dev-efa-<date>-<sha>`, plus the moving `dev-efa` |
+To use EFA, pass the EFA devices into the container, lift the locked-memory limit, and set:
 
-Each EFA image matches its base and adds:
-
-- The AWS EFA userspace stack: libfabric with the EFA provider, the aws-ofi-nccl plugin, and hwloc. The host does not need its own EFA userspace install.
-- On x86_64, the EFA build of Mooncake with `MOONCAKE_PROTOCOL=efa`. On arm64 the standard Mooncake package is kept and `MOONCAKE_PROTOCOL=tcp` is set, because the EFA build is x86_64-only.
-- `SGLANG_DISAGGREGATION_NIXL_BACKEND=LIBFABRIC`, so NIXL transfers use EFA on both architectures.
+- `MOONCAKE_PROTOCOL=efa`, so Mooncake uses EFA.
+- `SGLANG_DISAGGREGATION_NIXL_BACKEND=LIBFABRIC`, so NIXL transfers use EFA.
 - `NCCL_NET_PLUGIN=ofi` and `NCCL_TUNER_PLUGIN=ofi`, so NCCL uses aws-ofi-nccl.
-
-To add EFA to another CUDA 13 SGLang image, build `docker/efa.Dockerfile` on top of it:
-
-```bash
-docker build -f docker/efa.Dockerfile \
-  --build-arg BASE_IMAGE=lmsysorg/sglang:latest-runtime \
-  -t sglang:efa docker/
-```
-
-The host still needs the EFA kernel driver. Pass the EFA devices into the container and lift the locked-memory limit:
 
 ```bash
 HF_CACHE_DIR="/path/to/huggingface-cache"
@@ -149,23 +147,22 @@ docker run -it --gpus all \
   --ulimit memlock=-1 \
   -v "$HF_CACHE_DIR:/root/.cache/huggingface" \
   --env HF_TOKEN \
-  lmsysorg/sglang:latest-runtime-efa bash
+  --env MOONCAKE_PROTOCOL=efa \
+  --env SGLANG_DISAGGREGATION_NIXL_BACKEND=LIBFABRIC \
+  --env NCCL_NET_PLUGIN=ofi \
+  --env NCCL_TUNER_PLUGIN=ofi \
+  lmsysorg/sglang:latest bash
 ```
 
 Inside the container, `fi_info -p efa -t FI_EP_RDM` lists the EFA devices.
 
 #### Install into your own environment
 
-On an x86_64 AWS EFA instance, replace the standard CUDA 13 Mooncake package with the EFA build. The two packages install the same `mooncake` Python module, so do not install them side by side.
-
-The following commands replace the package in an SGLang CUDA 13 environment while preserving its existing Python dependencies:
+`mooncake-transfer-engine-cuda13` 0.3.14 and later include the EFA transport on x86_64 and aarch64, so no separate EFA package is needed. If an environment still has `mooncake-transfer-engine-efa-cuda13`, uninstall it first: both packages install the same `mooncake` Python module.
 
 ```bash
-python3 -m pip uninstall -y \
-  mooncake-transfer-engine-cuda13 \
-  mooncake-transfer-engine-efa-cuda13
-python3 -m pip install --no-deps \
-  mooncake-transfer-engine-efa-cuda13==0.3.13.post1
+python3 -m pip uninstall -y mooncake-transfer-engine-efa-cuda13
+python3 -m pip install --no-deps "mooncake-transfer-engine-cuda13>=0.3.14"
 
 export LD_LIBRARY_PATH="/opt/amazon/efa/lib:/opt/amazon/efa/lib64:${LD_LIBRARY_PATH:-}"
 export MOONCAKE_PROTOCOL=efa
@@ -174,7 +171,7 @@ python3 -c 'from mooncake import engine; assert engine.SUPPORT_EFA'
 fi_info -p efa -t FI_EP_RDM
 ```
 
-The EFA wheel expects a compatible AWS EFA userspace installation on the host and does not bundle `libfabric` or `libefa`. The current wheel is available only for x86_64. It is built without Mooncake EP/PG and the NVLink/MNNVL components, so use the standard Mooncake CUDA package for those features.
+The Mooncake wheel does not bundle `libfabric` or `libefa`, so the host needs a compatible AWS EFA userspace installation.
 
 #### CUDA VMM limitations
 
@@ -217,7 +214,7 @@ python -m sglang.launch_server \
   --port 30001 \
   --base-gpu-id 1 \
   --disaggregation-ib-device mlx5_roce0
-python -m sglang_router.launch_router --pd-disaggregation --prefill http://127.0.0.1:30000 --decode http://127.0.0.1:30001 --host 0.0.0.0 --port 8000
+sgl-router --model-id meta-llama/Llama-3.1-8B-Instruct --no-tokenizer --worker-urls http://127.0.0.1:30000 http://127.0.0.1:30001 --host 0.0.0.0 --port 8000
 ```
 
 ### DeepSeek Multi-Node
@@ -456,10 +453,10 @@ python -m sglang.launch_server \
   --disaggregation-ib-device mlx5_3,mlx5_4
 
 # Router
-python -m sglang_router.launch_router \
-  --pd-disaggregation \
-  --prefill http://127.0.0.1:30000 \
-  --decode http://127.0.0.1:30001 \
+sgl-router \
+  --model-id $MODEL_PATH \
+  --no-tokenizer \
+  --worker-urls http://127.0.0.1:30000 http://127.0.0.1:30001 \
   --host 0.0.0.0 --port 8000
 ```
 
@@ -499,7 +496,7 @@ python -m sglang.launch_server \
   --port 30001 \
   --base-gpu-id 1 \
   --disaggregation-transfer-backend nixl
-python -m sglang_router.launch_router --pd-disaggregation --prefill http://127.0.0.1:30000 --decode http://127.0.0.1:30001 --host 0.0.0.0 --port 8000
+sgl-router --model-id meta-llama/Llama-3.1-8B-Instruct --no-tokenizer --worker-urls http://127.0.0.1:30000 http://127.0.0.1:30001 --host 0.0.0.0 --port 8000
 ```
 
 ### DeepSeek Multi-Node
@@ -670,7 +667,7 @@ python3 -m sglang.launch_server \
         --disaggregation-bootstrap-port 8996 \
         --base-gpu-id 0 \
         --disable-radix-cache \
-        --disable-cuda-graph \
+        --disable-decode-cuda-graph --disable-prefill-cuda-graph \
         --moe-a2a-backend deepep --deepep-mode normal \
         # 2>&1 | tee $SGLANG_LOG_PATH
 ```
@@ -740,14 +737,12 @@ python3 -m sglang.launch_server \
 #### router
 
 ```bash
-python -m sglang_router.launch_router \
-    --pd-disaggregation \
-    --prefill http://127.0.0.1:10000 \
-    --decode  http://127.0.0.1:10001 \
+sgl-router \
+    --model-id /path/to/MiMo-V2-Flash-w8a8-all-0512 \
+    --no-tokenizer \
+    --worker-urls http://127.0.0.1:10000 http://127.0.0.1:10001 \
     --host 127.0.0.1 \
-    --port 9903 \
-    --health-check-interval-secs 3600 \
-    --mini-lb \
+    --port 9903
 ```
 
 ### DeepSeek Multi-Node
@@ -854,9 +849,9 @@ done
 #### router
 
 ```bash
-python -m  sglang_router.launch_router --prefill ${P_IP}:8000 \
---decode ${D_IP}:8001 \
---host ${D_IP} --port 6688 \
---pd-disaggregation \
---health-check-interval-secs 3600 \
+sgl-router \
+--model-id /path/to/deepseekr1_w4a8_pertoken \
+--no-tokenizer \
+--worker-urls http://${P_IP}:8000 http://${D_IP}:8001 \
+--host ${D_IP} --port 6688
 ```

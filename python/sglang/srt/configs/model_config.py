@@ -27,6 +27,7 @@ from transformers import PretrainedConfig
 from transformers.utils import cached_file
 
 from sglang.srt.arg_groups.model_override_base import resolving_view
+from sglang.srt.beam_search.trie_config import TRIE_OUTPUT_HEAD_FILENAME
 from sglang.srt.configs.bailing_hybrid import is_bailing_multi_gate_enabled
 from sglang.srt.configs.embedding_model_spec import resolve_embedding_model_spec
 from sglang.srt.configs.ernie55 import (
@@ -46,12 +47,11 @@ from sglang.srt.hf_transformers import (
     get_context_length,
     get_generation_config,
     get_hf_text_config,
-    get_sparse_attention_config,
 )
 from sglang.srt.hf_transformers.config import POINTER_ADAPTER_BASES
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import is_hip, is_npu, retry
+from sglang.srt.utils import is_gfx95_supported, is_hip, is_npu, retry
 from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 
 logger = logging.getLogger(__name__)
@@ -223,6 +223,26 @@ def is_deepseek_dsa(config) -> bool:
     ) or is_kimi_k31(config)
 
 
+def is_q8_raw_fp8_nope_layout(
+    *,
+    prefill_backend: Optional[str],
+    decode_backend: Optional[str],
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+) -> bool:
+    """Whether Q8 prefill and TileLang decode can share raw 512-byte FP8 rows.
+
+    This checks consumers and geometry, not the model name. Callers validate
+    dtype, device and incompatible serving options separately.
+    """
+    return (
+        prefill_backend == "flashmla_sparse_q8"
+        and decode_backend == "tilelang"
+        and kv_lora_rank == 512
+        and qk_rope_head_dim == 0
+    )
+
+
 def dsa_draft_shards_under_dcp(config, dcp_size: int) -> bool:
     """Whether a DSA EAGLE/NEXTN draft shards its KV like the DCP target.
 
@@ -257,12 +277,15 @@ def is_glm_moe_dsa(config) -> bool:
     )
 
 
+KIMI_K3_ARCHS = (
+    "KimiK3ForConditionalGeneration",
+    "KimiK31ForConditionalGeneration",
+    "KimiK3LinearForCausalLM",
+)
+
+
 def is_kimi_k3(config) -> bool:
-    return _hf_arch(config) in (
-        "KimiK3ForConditionalGeneration",
-        "KimiK31ForConditionalGeneration",
-        "KimiK3LinearForCausalLM",
-    )
+    return _hf_arch(config) in KIMI_K3_ARCHS
 
 
 _KIMI_K31_ARCHS = (
@@ -499,14 +522,27 @@ def is_minimax_sparse(config: PretrainedConfig) -> bool:
 def uses_minimax_m3_nvfp4_native_stack(quantization: Optional[str]) -> bool:
     """Whether an NVFP4 checkpoint runs its native MSA-v1 stack.
 
-    The attention backend, the KV pool class and the KV cell-size budget must
-    all agree on this answer; sizing the pool for one layout while allocating
-    the other runs out of memory at startup. The MSA-v1 kernels are built for
-    SM10x only, so SM11x/SM12x Blackwell is excluded.
+    The attention backend keys on this; the KV pool class and its cell-size budget
+    key on `uses_minimax_m3_packed_nvfp4_kv`, which also covers gfx950. The MSA-v1
+    kernels are built for SM10x only, so SM11x/SM12x Blackwell is excluded.
     """
     from sglang.srt.runtime_context import get_platform
 
     return quantization == "minimax_m3_nvfp4" and get_platform().is_sm100
+
+
+def uses_minimax_m3_packed_nvfp4_kv(
+    quantization: Optional[str], *, speculative_algorithm: Optional[str]
+) -> bool:
+    """Whether the KV pool is `MiniMaxM3Nvfp4KVPool`; the pool class and the
+    cell-size budget must agree on it."""
+    if not get_platform().is_hip:
+        return uses_minimax_m3_nvfp4_native_stack(quantization)
+    from sglang.srt.arg_groups.model_overrides import minimax_m3_hip
+
+    return minimax_m3_hip.uses_nvfp4_kv(
+        quantization, speculative_algorithm=speculative_algorithm
+    )
 
 
 # v2 checkpoints reuse the v1 arch name; the DASH training stage selects this arch.
@@ -721,6 +757,15 @@ class ModelConfig:
                 **kwargs,
             )
         )
+        if (
+            get_platform().is_npu
+            and self.hf_config.model_type == "longcat_flash"
+            and not hasattr(self.hf_config, "indexer_rope_interleave")
+        ):
+            # Resolve LongCat's indexer layout after applying model overrides.
+            self.hf_config.indexer_rope_interleave = getattr(
+                self.hf_config, "rope_interleave", True
+            )
         self.pointer_head = None
         base = POINTER_ADAPTER_BASES.get((self.model_path, revision))
         if base is not None:
@@ -792,6 +837,7 @@ class ModelConfig:
                 "Llama4ForConditionalGeneration",
                 "Step3VLForConditionalGeneration",
                 "InklingForConditionalGeneration",
+                "Inkling2ForConditionalGeneration",
             ]
             if (
                 self.hf_config.architectures[0] in mm_disabled_models
@@ -996,8 +1042,11 @@ class ModelConfig:
         # Verify quantization
         self._verify_quantization()
 
-        # Verify dual-chunk attention config
-        self._verify_dual_chunk_attention_config()
+        if getattr(self.hf_config, "dual_chunk_attention_config", None) is not None:
+            logger.warning(
+                "dual_chunk_attention_config is ignored: Dual Chunk Attention is "
+                "not supported, so this model runs with standard RoPE."
+            )
 
         # Cache attributes
         self.hf_eos_token_id = self._get_hf_eos_token_id()
@@ -1067,7 +1116,9 @@ class ModelConfig:
             ),
             model_override_args=cfg.json_model_override_args,
             is_embedding=cfg.is_embedding,
-            enable_multimodal=cfg.enable_multimodal,
+            enable_multimodal=(
+                False if cfg.disable_multimodal else cfg.enable_multimodal
+            ),
             dtype=cfg.dtype,
             quantization=quantization,
             model_impl=cfg.model_impl,
@@ -1230,6 +1281,19 @@ class ModelConfig:
                 )
         if (
             is_draft_model
+            and self.hf_config.architectures[0] == "Inkling2ForConditionalGeneration"
+        ):
+            from sglang.srt.configs.inkling2 import Inkling2MTPConfig
+
+            if self.speculative_algorithm not in (None, "DSPARK"):
+                raise ValueError("Inkling2 MTP requires --speculative-algorithm DSPARK")
+            if self.quantization is not None and self.is_draft_quantization_explicit:
+                raise ValueError("Inkling2 MTP uses its checkpoint BF16 precision")
+            self.quantization = None
+            self.hf_config = Inkling2MTPConfig.from_target(self.hf_config)
+            self.hf_text_config = self.hf_config
+        if (
+            is_draft_model
             and self.hf_config.architectures[0] == "GigaChat35ForCausalLM"
         ):
             self.hf_config.architectures[0] = "GigaChat35ForCausalLMNextN"
@@ -1371,6 +1435,7 @@ class ModelConfig:
             "EmbeddingGemma2Model",
             "InklingForConditionalGeneration",
             "InklingForConditionalGenerationMTP",
+            "Inkling2ForConditionalGeneration",
             "Gemma4UnifiedForConditionalGeneration",
             "DiffusionGemmaForBlockDiffusion",
         ]
@@ -1768,15 +1833,18 @@ class ModelConfig:
         # Use vision_vocab_size for lm_head, LogitsProcessor, and graph-mode logits buffers.
         if _hf_arch(self.hf_config) == "GlmImageForConditionalGeneration":
             self.vocab_size = self.hf_text_config.vision_vocab_size
+        self.token_id_vocab_size = self.vocab_size
+        if _hf_arch(self.hf_config) in {
+            "Inkling2ForConditionalGeneration",
+            "Inkling2ForConditionalGenerationMTP",
+        }:
+            self.vocab_size = self.hf_text_config.padded_vocab_size
 
     def _init_mla_scaling(self, rope_scaling: Optional[dict]) -> None:
         """Base MLA attention scale from the head dims, then the rope mscale."""
         self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
         if rope_scaling:
             self.scaling = compute_mla_mscale_scaling(rope_scaling, self.scaling)
-
-    def get_total_num_attention_heads(self) -> int:
-        return self.num_attention_heads
 
     def get_num_attention_heads(self, tensor_parallel_size) -> int:
         # Pure-SSM (Mamba) models have no attention; num_attention_heads is None.
@@ -1886,6 +1954,8 @@ class ModelConfig:
 
     # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
     def _parse_quant_hf_config(self):
+        if self.hf_config.architectures == ["Inkling2ForConditionalGenerationMTP"]:
+            return None
         quant_cfg = _quant_config_to_dict(
             getattr(self.hf_config, "quantization_config", None)
         )
@@ -2008,6 +2078,8 @@ class ModelConfig:
 
             {"quant_algo": "FP8", "quant_method": "modelopt", ...}
         """
+        if quant_config_dict.get("quant_method") == "inkling2":
+            return quant_config_dict
         json_quant_configs = unwrap_modelopt_quantization_config(quant_config_dict)
         if not json_quant_configs:
             return None
@@ -2166,6 +2238,7 @@ class ModelConfig:
         rocm_supported_quantization = [
             "awq",
             "fp8",
+            "gptq",
             "compressed_tensors",
             "compressed-tensors",
             "w8a8_fp8",
@@ -2177,7 +2250,10 @@ class ModelConfig:
             "auto-round-int8",
             "quark_int4fp8_moe",
             "quark_mxfp4",
+            "minimax_m3_nvfp4",
         ]
+        if is_gfx95_supported():
+            rocm_supported_quantization.append("modelopt_fp8")
         optimized_quantization_methods = [
             "fp8",
             "marlin",
@@ -2334,23 +2410,6 @@ class ModelConfig:
                         self.quantization,
                     )
 
-    def _verify_dual_chunk_attention_config(self) -> None:
-        if hasattr(self.hf_config, "dual_chunk_attention_config"):
-            # Try loading the sparse attention config
-            sparse_attn_config = get_sparse_attention_config(self.model_path)
-            if not sparse_attn_config:
-                return
-            self.hf_config.dual_chunk_attention_config["sparse_attention_config"] = (
-                sparse_attn_config
-            )
-            if (
-                "sparse_attention_enabled"
-                not in self.hf_config.dual_chunk_attention_config
-            ):
-                self.hf_config.dual_chunk_attention_config[
-                    "sparse_attention_enabled"
-                ] = True
-
     def _get_hf_eos_token_id(self) -> Optional[Set[int]]:
         eos_ids = getattr(self.hf_config, "eos_token_id", None)
         if eos_ids is not None:
@@ -2429,7 +2488,9 @@ class ModelConfig:
             # with statement to avoid closing the client.
             client = create_remote_connector(self.model_path)
             if is_remote_url(self.model_path):
-                client.pull_files(allow_pattern=["*config.json"])
+                client.pull_files(
+                    allow_pattern=["*config.json", f"*{TRIE_OUTPUT_HEAD_FILENAME}"]
+                )
                 self.model_weights = self.model_path
                 self.model_path = client.get_local_dir()
 
@@ -2597,6 +2658,9 @@ multimodal_model_archs = [
     "LlavaForConditionalGeneration",
     "LlavaVidForCausalLM",
     "Lfm2VlForConditionalGeneration",
+    "Lfm3VlForConditionalGeneration",
+    "Lfm3AudioForConditionalGeneration",
+    "Lfm3OmniForConditionalGeneration",
     "LightOnOCRForConditionalGeneration",
     *MIMO_V2_MULTIMODAL_ARCHS,
     "MiMoV2ASRForCausalLM",
@@ -2627,6 +2691,7 @@ multimodal_model_archs = [
     "KimiVLForConditionalGeneration",
     "LocateAnythingForConditionalGeneration",
     "InternVLChatModel",
+    "Inkling2ForConditionalGeneration",
     "InternS1ForConditionalGeneration",
     "InternS1ProForConditionalGeneration",
     "Phi4MMForCausalLM",

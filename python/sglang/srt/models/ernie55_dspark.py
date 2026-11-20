@@ -41,6 +41,7 @@ from sglang.srt.layers.layernorm import RMSNorm, exact_rms_norm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_attn_backend
@@ -66,7 +67,6 @@ from sglang.srt.speculative.dspark_components.dspark_config import (
     get_dspark_sample_from_anchor,
     parse_dspark_draft_config,
 )
-from sglang.srt.utils import add_prefix
 
 
 class Ernie5_5DSparkAttention(Ernie5_5GatedQMixin, DSparkAttention):

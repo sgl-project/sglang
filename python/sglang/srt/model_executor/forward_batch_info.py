@@ -31,7 +31,7 @@ import hashlib
 import warnings
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 
 import torch
 
@@ -70,9 +70,13 @@ from sglang.srt.utils import (
     support_triton,
 )
 from sglang.srt.utils.common import ceil_align
-from sglang.srt.utils.device import is_pin_memory_available
+from sglang.srt.utils.device import (
+    async_h2d_stack,
+    is_pin_memory_available,
+)
 
 if TYPE_CHECKING:
+    from sglang.srt.beam_search.forward_inputs import BeamForwardInputs
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.layers.cp.base import BaseContextParallelMetadata
     from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
@@ -404,6 +408,24 @@ class NgramEmbeddingInfo:
         )
 
 
+def spec_mrope_token_deltas(
+    *,
+    deltas: torch.Tensor,
+    num_tokens: int,
+    verify_lens: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Each spec-forward token's mRoPE delta: the tokens split evenly over the
+    requests, or verify_lens[i] tokens for request i under a ragged verify,
+    then graph-padding tokens with delta 0."""
+    if verify_lens is None:
+        return deltas.repeat_interleave(num_tokens // deltas.numel())
+    ends = torch.cumsum(verify_lens.to(device=deltas.device, dtype=torch.int64), 0)
+    req = torch.searchsorted(
+        ends, torch.arange(num_tokens, device=deltas.device), right=True
+    )
+    return torch.cat((deltas, deltas.new_zeros(1)))[req]
+
+
 @dataclass
 class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     """Store all inputs of a forward pass."""
@@ -485,6 +507,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     return_logprob: bool = False
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
+    beam: Optional[BeamForwardInputs] = None
     spec_algorithm: SpeculativeAlgorithm = None
     # For matryoshka embeddings
     dimensions: Optional[list[int]] = None
@@ -561,8 +584,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # A one-request batch's committed KV length, which can lag one verify: a host-side
     # lower bound attention graph variants select on; None for several requests
     attention_kv_len_lower_bound: Optional[int] = None
-    watermark_prompt_tail_ids: Optional[List[Optional[List[int]]]] = None
-    watermark_context_hash_history: Optional[List[Optional[List[int]]]] = None
+    # Host-side state the watermark engine seeds its next sample from.
+    watermark_seed: Optional[Any] = None
 
     # === Per-forward overrides passed explicitly to init_new ===
     capture_hidden_mode: CaptureHiddenMode = None
@@ -663,6 +686,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For multimodal
     mm_input_embeds: Optional[torch.Tensor] = None
 
+    # spec.BuiltMegakernel's draft_step_fold for this EAGLE draft round
+    draft_step_fold: Optional[Any] = None
+
     # Encoder-decoder cross-attention mask
     cross_attention_custom_mask: Optional[torch.Tensor] = None
 
@@ -684,16 +710,22 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Each DP rank's rows from a late-layer row switch on; None on steps that skip
     # the exchange.
     global_late_layer_num_tokens_cpu: Optional[List[int]] = None
+    global_late_layer_tail_graph_compatible: bool = False
 
     # For Qwen2-VL
     mrope_positions: torch.Tensor = None
 
     # For two-batch overlap
     tbo_parent_token_range: Optional[Tuple[int, int]] = None
+    # This DP rank's first row in the parent's gathered layout; non-EP DP TBO only.
+    tbo_parent_dp_offset: Optional[int] = None
     tbo_padded_len: Optional[int] = None
     tbo_children: Optional[List[ForwardBatch]] = None
 
     attn_cp_metadata: Optional[BaseContextParallelMetadata] = None
+    # Capture-stable local views, populated only by PrefillCPBCGInput.prepare.
+    cp_positions: Optional[torch.Tensor] = None
+    cp_input_ids: Optional[torch.Tensor] = None
 
     # For decode context parallel.
     # NOTE: DecodeContextParallelMetadata is imported under TYPE_CHECKING only (see the
@@ -945,6 +977,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # block there). Use it directly.
         seq_lens_cpu = batch.seq_lens_cpu
 
+        beam = None
+        if batch.beam_tail is not None:
+            from sglang.srt.beam_search.forward_inputs import (
+                build_beam_forward_inputs,
+            )
+
+            beam = build_beam_forward_inputs(batch, model_runner)
+
         # TODO(seq-lens-removal): the whole ScheduleBatch seq_lens family
         # (incl. seq_lens_sum) is slated for removal in favor of kv-committed
         # lengths, so this init_new-time backfill onto the ScheduleBatch is
@@ -970,10 +1010,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         from sglang.srt.model_executor.model_runner import ModelRunner
 
         # Only a real ModelRunner owns watermark state; lightweight stand-ins skip it.
-        watermark_state = (
-            model_runner.watermark_state
-            if isinstance(model_runner, ModelRunner)
-            else None
+        watermark = (
+            model_runner.watermark if isinstance(model_runner, ModelRunner) else None
         )
         ret = cls(
             # Required core inputs
@@ -1015,6 +1053,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             encoder_lens=batch.encoder_lens,
             encoder_out_cache_loc=batch.encoder_out_cache_loc,
             input_embeds=batch.input_embeds,
+            cp_positions=None,
+            cp_input_ids=None,
             replace_embeds=batch.replace_embeds,
             replace_positions=batch.replace_positions,
             # Scalar config / flags
@@ -1026,6 +1066,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             dp_prefill_cuda_graph_max_prefix_len=batch.dp_prefill_cuda_graph_max_prefix_len,
             global_forward_mode=batch.global_forward_mode,
             is_prefill_only=batch.is_prefill_only,
+            beam=beam,
             contains_last_prefill_chunk=contains_last_prefill_chunk,
             extend_is_final_cpu=extend_is_final_cpu,
             spec_algorithm=batch.spec_algorithm,
@@ -1044,17 +1085,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             attention_kv_len_lower_bound=(
                 batch.reqs[0].kv.kv_committed_len if len(batch.reqs) == 1 else None
             ),
-            watermark_prompt_tail_ids=(
-                watermark_state.prompt_tails(batch)
-                if watermark_state is not None
-                and batch.sampling_info.has_watermark_candidates
-                else None
-            ),
-            watermark_context_hash_history=(
-                watermark_state.retracted_context_hashes(batch)
-                if watermark_state is not None
-                and batch.sampling_info.has_watermark_candidates
-                else None
+            watermark_seed=(
+                watermark.seed_payload(batch) if watermark is not None else None
             ),
             # Compound (carry their own device tensors)
             sampling_info=batch.sampling_info,
@@ -1216,6 +1248,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         if model_runner.ngram_embedding_manager.enabled:
             ret._init_ngram_embedding_info(batch, device)
+            if _is_npu and ret.forward_mode.is_target_verify():
+                # Stage verify tokens before NPU ngram lookup reads the token table.
+                model_runner.ngram_embedding_manager.prepare_for_verify(ret)
 
         if model_runner.model_config.model_is_mrope:
             if spec_mrope_positions is not None:
@@ -1469,6 +1504,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     def _init_ngram_embedding_info(self, batch: ScheduleBatch, device: torch.device):
         if self.forward_mode.is_decode():
             column_starts, req_lens = self.seq_lens - 1, 1
+        elif _is_npu and self.forward_mode.is_target_verify():
+            # Verify seq_lens excludes the window of draft_token_num input tokens.
+            column_starts = self.seq_lens
+            req_lens = self.spec_info.draft_token_num
         else:
             column_starts, req_lens = self.extend_prefix_lens, self.extend_seq_lens
         self.ngram_embedding_info = NgramEmbeddingInfo.create(
@@ -1489,31 +1528,33 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         mm_inputs = batch.multimodal_inputs
 
         # target_verify / draft_decode read spec_info.positions; draft_extend
-        # passes its own positions (uniform num_draft_tokens per request).
+        # passes its own positions (uniform num_draft_tokens per request). A
+        # ragged target verify packs verify_lens[i] positions per request.
+        ragged_layout = None
         if seq_positions is None:
             seq_positions = batch.spec_info.positions
-        seq_positions = seq_positions.view(batch_size, -1)
+            ragged_layout = self.ragged_verify_layout
+        seq_positions = seq_positions.reshape(-1)
         # Split text-only and mixed batches here because SpecV2 text-only batches can avoid an extra D2H.
         if all(mm_input is None for mm_input in mm_inputs):
             self.mrope_positions = (
-                seq_positions.to(torch.int64).flatten().unsqueeze(0).repeat(3, 1)
+                seq_positions.to(torch.int64).unsqueeze(0).repeat(3, 1)
             )
             return
-        else:
-            mrope_deltas = [
-                (
-                    torch.zeros(1, dtype=torch.int64)
-                    if mm_inputs[i] is None
-                    else mm_inputs[i].mrope_position_delta.squeeze(0)
-                )
-                for i in range(batch_size)
-            ]
-            mrope_delta_tensor = torch.stack(mrope_deltas, dim=0).to(device=device)
-        next_input_positions = (
-            (seq_positions + mrope_delta_tensor).flatten().unsqueeze(0).repeat(3, 1)
+        mrope_deltas = [
+            (
+                torch.zeros(1, dtype=torch.int64)
+                if mm_inputs[i] is None
+                else mm_inputs[i].mrope_position_delta.reshape(1)
+            )
+            for i in range(batch_size)
+        ]
+        token_deltas = spec_mrope_token_deltas(
+            deltas=async_h2d_stack(mrope_deltas, device=device).reshape(-1),
+            num_tokens=seq_positions.numel(),
+            verify_lens=None if ragged_layout is None else ragged_layout.verify_lens,
         )
-
-        self.mrope_positions = next_input_positions
+        self.mrope_positions = (seq_positions + token_deltas).unsqueeze(0).repeat(3, 1)
 
     def _expand_mrope_from_input(
         self,
@@ -1586,13 +1627,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             return
 
         if not has_precomputed_mrope:
-            # Compute all requests together to avoid per-request Python loops.
-            deltas_list = [0] * batch_size
-            for i, mm in enumerate(mm_inputs):
-                deltas_list[i] = mm.mrope_position_delta.item() if mm is not None else 0
-            deltas = torch.tensor(
-                deltas_list, dtype=torch.int64, device=model_runner.device
-            )
+            # Device-resident deltas avoid a host sync that stalls overlap scheduling.
+            device = model_runner.device
+            deltas_list = [
+                (
+                    mm.get_mrope_position_delta_on_device(device)
+                    if mm is not None
+                    else torch.zeros(1, dtype=torch.int64, device=device)
+                )
+                for mm in mm_inputs
+            ]
+            deltas = deltas_list[0] if batch_size == 1 else torch.cat(deltas_list)
             positions_1d = (deltas - 1) + seq_lens_int64
             self.mrope_positions = positions_1d.unsqueeze(0).repeat(3, 1)
             return
@@ -1756,12 +1801,24 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # Larger prefills fall back to eager and keep the memory-efficient
         # SUM_LEN. global_num_tokens is identical across ranks (all-gathered),
         # so the decision is consistent cluster-wide.
+        #
+        # Opt-in: with the env set, an idle (zero-token) DP rank keeps SUM_LEN
+        # instead of being padded to the capture bucket, so the step runs
+        # eagerly with only the rows that exist.  Off keeps the MAX_LEN path
+        # used by GPU prefill on MoE-TP; turn on for EP prefill (e.g. Ascend
+        # ascend_ops).
         prefill_cg = get_exec().graph.cuda_graph_config.prefill
+        max_len_with_idle_allowed = (
+            min(global_num_tokens) > 0
+            if envs.SGLANG_ENABLE_PREFILL_GRAPH_IDLE_RANK_EAGER.get()
+            else True
+        )
         if (
             self.can_run_dp_prefill_cuda_graph
             and self.is_extend_in_batch
             and prefill_cg.bs
             and max(global_num_tokens) <= max(prefill_cg.bs)
+            and max_len_with_idle_allowed
             and not prefill_graph_tolerates_sum_len()
         ):
             dp_padding_mode = DpPaddingMode.MAX_LEN
@@ -1931,13 +1988,21 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         ):
             local_late_rows = model_runner.attn_backend.late_layer_num_tokens(self)
             if local_late_rows is not None:
-                late_rows = torch.empty(sync_group_size, dtype=torch.int64)
+                tail_graph_compatible = (
+                    self.forward_mode.is_idle()
+                    or self.forward_mode.is_extend_without_speculative()
+                )
+                late_layout = torch.empty(2 * sync_group_size, dtype=torch.int64)
                 all_gather_single(
-                    late_rows,
-                    torch.tensor([local_late_rows], dtype=torch.int64),
+                    late_layout,
+                    torch.tensor(
+                        [local_late_rows, tail_graph_compatible], dtype=torch.int64
+                    ),
                     group=get_parallel().tp_group.cpu_group,
                 )
-                self.global_late_layer_num_tokens_cpu = late_rows.tolist()
+                late_rows, tail_graph_votes = late_layout.view(-1, 2).T.tolist()
+                self.global_late_layer_num_tokens_cpu = late_rows
+                self.global_late_layer_tail_graph_compatible = all(tail_graph_votes)
 
         TboForwardBatchPreparer.prepare(
             batch=self, is_draft_worker=model_runner.is_draft_worker
@@ -2217,12 +2282,22 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             if logits_output.hidden_states is not None:
                 logits_output.hidden_states = logits_output.hidden_states[:bs]
         elif self.forward_mode.is_extend():
-            num_tokens = self.seq_lens_sum
+            # Drop the MLP-sync pad rows: a spec draft re-pads the hidden states to
+            # its own bucket. seq_lens_sum also counts the cached prefix.
+            num_tokens = (
+                self._original_num_tokens
+                if self._original_num_tokens is not None
+                else self.seq_lens_sum
+            )
             logits_output.next_token_logits = logits_output.next_token_logits[
                 :num_tokens
             ]
             if logits_output.hidden_states is not None:
                 logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
+            if logits_output.mm_input_embeds is not None:
+                logits_output.mm_input_embeds = logits_output.mm_input_embeds[
+                    :num_tokens
+                ]
 
         # Full aux capture keeps both outputs on the same token rows.
         if (
