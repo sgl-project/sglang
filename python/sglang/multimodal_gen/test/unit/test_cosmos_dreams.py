@@ -1508,7 +1508,7 @@ class TestCosmosDreamsRuntime(unittest.TestCase):
                 expected = stage._denormalize_latents(latents)
                 with self.assertRaisesRegex(RuntimeError, "injected rollout failure"):
                     with CausalDecodeQueue(
-                        vae, device=torch.device("cuda"), quality="lossless"
+                        vae, device=torch.device("cuda"), fast_path=True
                     ) as queue:
                         queue.submit(latents[:, :, :2])
                         raise RuntimeError("injected rollout failure")
@@ -1517,10 +1517,10 @@ class TestCosmosDreamsRuntime(unittest.TestCase):
                 self.assertIsNone(vae.cached_latents)
                 self.assertTrue(queue.stream.query())
                 self.assertEqual(queue.outputs, [])
-                for quality, enabled in (("lossless", True), ("exact", False)):
+                for enabled in (True, False):
                     vae.seen_gates.clear()
                     with CausalDecodeQueue(
-                        vae, device=torch.device("cuda"), quality=quality
+                        vae, device=torch.device("cuda"), fast_path=enabled
                     ) as queue:
                         for chunk in latents.split(2, dim=2):
                             queue.submit(chunk)
@@ -1583,7 +1583,9 @@ class TestCosmosDreamsRolloutStreams(unittest.TestCase):
             ),
         ):
             first = stage._decode_queue(torch.device("cuda"), batch)
+            batch.sampling_params.quality = "lossless"
             second = stage._decode_queue(torch.device("cuda"), batch)
+            self.assertEqual((first.fast_path, second.fast_path), (False, True))
             self.assertIs(first.stream, second.stream)
             self.assertIsNone(stage._priority_stream)
             self.assertEqual(make_stream.call_count, 1)
