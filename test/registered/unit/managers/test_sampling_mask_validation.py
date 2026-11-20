@@ -37,15 +37,17 @@ class TestSamplingMaskValidation(CustomTestCase):
         self,
         processor,
         return_sampling_mask=True,
-        sampling_logprobs_mode=None,
+        return_sampling_logprobs=False,
+        return_logprob=False,
         return_flat_raw_sampling_mask=False,
     ):
         req = GenerateReqInput(
             input_ids=[1, 2, 3],
             sampling_params={"top_k": 10},
             custom_logit_processor=processor,
+            return_logprob=return_logprob,
             return_sampling_mask=return_sampling_mask,
-            sampling_logprobs_mode=sampling_logprobs_mode,
+            return_sampling_logprobs=return_sampling_logprobs,
             return_flat_raw_sampling_mask=return_flat_raw_sampling_mask,
         )
         self.manager._validate_one_request(req, req.input_ids)
@@ -178,22 +180,35 @@ class TestSamplingMaskValidation(CustomTestCase):
             Qwen3ThinkingBudgetLogitProcessor.to_str(), return_sampling_mask=False
         )
 
-    def test_sampling_logprobs_mode_requires_sampling_mask(self):
-        self._validate(None, return_sampling_mask=False)
-        for mode in ("selected", "support"):
-            with self.subTest(mode=mode):
-                with self.assertRaisesRegex(
-                    ValueError, "can only be set when return_sampling_mask=true"
-                ):
-                    self._validate(
-                        None,
-                        return_sampling_mask=False,
-                        sampling_logprobs_mode=mode,
-                    )
+    def test_sampling_logprobs_need_no_mask(self):
+        self._validate(
+            None,
+            return_sampling_mask=False,
+            return_sampling_logprobs=True,
+            return_logprob=True,
+        )
+        with self.assertRaisesRegex(
+            ValueError, "only supports DisallowedTokensLogitsProcessor"
+        ):
+            self._validate(
+                Qwen3ThinkingBudgetLogitProcessor.to_str(),
+                return_sampling_mask=False,
+                return_sampling_logprobs=True,
+                return_logprob=True,
+            )
 
-        for mode in (None, "selected", "support"):
+    def test_removed_sampling_logprobs_mode_is_rejected(self):
+        for mode in ("selected", "support", [None, None]):
             with self.subTest(mode=mode):
-                self._validate(None, sampling_logprobs_mode=mode)
+                req = GenerateReqInput(
+                    text=["a", "b"],
+                    return_sampling_mask=True,
+                    sampling_logprobs_mode=mode,
+                )
+                with self.assertRaisesRegex(
+                    ValueError, "sampling_logprobs_mode was removed"
+                ):
+                    req.normalize_batch_and_arguments()
 
     def test_flat_raw_sampling_mask_requires_sampling_mask(self):
         self._validate(None, return_flat_raw_sampling_mask=True)

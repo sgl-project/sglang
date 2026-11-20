@@ -713,6 +713,7 @@ class MetadataBuffers:
                 )
             self.output_token_sampling_mask_len = None
             self.output_token_sampling_mask_idx = None
+            self.output_sampling_mask_logprobs = None
             self.output_token_sampling_logprobs = None
             if self.enable_sampling_mask:
                 self.output_token_sampling_mask_len = torch.zeros(
@@ -721,10 +722,14 @@ class MetadataBuffers:
                 self.output_token_sampling_mask_idx = torch.zeros(
                     (size, max_sampling_mask_tokens), dtype=torch.int32, device=device
                 )
-                self.output_token_sampling_logprobs = torch.zeros(
+                # Index-aligned with output_token_sampling_mask_idx.
+                self.output_sampling_mask_logprobs = torch.zeros(
                     (size, max_sampling_mask_tokens),
                     dtype=torch.float32,
                     device=device,
+                )
+                self.output_token_sampling_logprobs = torch.zeros(
+                    (size, 16), dtype=torch.float32, device=device
                 )
             # For PD + spec decode
             self.output_topk_p = torch.zeros(
@@ -795,6 +800,7 @@ class MetadataBuffers:
             self.output_customized_info_len,
             self.output_token_sampling_mask_len,
             self.output_token_sampling_mask_idx,
+            self.output_sampling_mask_logprobs,
             self.output_token_sampling_logprobs,
             self.output_topk_p,
             self.output_topk_index,
@@ -831,6 +837,11 @@ class MetadataBuffers:
             ),
             (
                 self.output_token_sampling_mask_idx[idx].clone()
+                if self.enable_sampling_mask
+                else None
+            ),
+            (
+                self.output_sampling_mask_logprobs[idx].clone()
                 if self.enable_sampling_mask
                 else None
             ),
@@ -957,7 +968,7 @@ class MetadataBuffers:
                     dtype=torch.int32,
                     device="cpu",
                 )
-        if req.return_sampling_mask:
+        if req.captures_sampling:
             # Prefill streams a request only once its KV transfer ends or it aborts,
             # so the first token's row is the only one queued here.
             chunk = req.sampling_mask_rows.view()
@@ -966,9 +977,13 @@ class MetadataBuffers:
             self.output_token_sampling_mask_idx[
                 req.metadata_buffer_index, :mask_len
             ].copy_(torch.from_numpy(chunk.token_ids))
-            self.output_token_sampling_logprobs[
-                req.metadata_buffer_index, : len(chunk.logprobs)
-            ].copy_(torch.from_numpy(chunk.logprobs))
+            self.output_sampling_mask_logprobs[
+                req.metadata_buffer_index, :mask_len
+            ].copy_(torch.from_numpy(chunk.support_logprobs))
+            (sampling_logprob,) = chunk.selected_logprobs.tolist()
+            self.output_token_sampling_logprobs[req.metadata_buffer_index][0] = (
+                sampling_logprob
+            )
         # For PD + spec decode
         if req.hidden_states_tensor is not None:
             # speculative_eagle_topk should not be greater than 16 currently

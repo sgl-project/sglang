@@ -63,9 +63,7 @@ class TestGLM52BF16SamplingMask(CustomTestCase):
         if getattr(cls, "process", None) is not None:
             terminate_and_kill_process_tree(cls.process)
 
-    def _generate(
-        self, params, mode="support", text="The capital of France is", **kwargs
-    ):
+    def _generate(self, params, text="The capital of France is", **kwargs):
         response = requests.post(
             self.base_url + "/generate",
             timeout=60,
@@ -78,37 +76,36 @@ class TestGLM52BF16SamplingMask(CustomTestCase):
                     "ignore_eos": True,
                     **params,
                 },
+                "return_logprob": True,
+                "return_sampling_logprobs": True,
                 "return_sampling_mask": True,
-                "sampling_logprobs_mode": mode,
                 **kwargs,
             },
         )
         self.assertEqual(response.status_code, 200, response.text)
         return response.json()
 
-    def _check_output(self, body, mode, *, greedy=False, filters=None):
+    def _check_output(self, body, *, greedy=False, filters=None):
         meta = body["meta_info"]
         self.assertEqual(len(body["output_ids"]), 4)
-        for step, (token, mask, actual) in enumerate(
+        for step, (token, mask_row, sampled_logprob) in enumerate(
             zip(
                 body["output_ids"],
-                meta["output_token_sampling_mask"],
+                meta["output_sampling_mask_logprobs"],
                 meta["output_token_sampling_logprobs"],
                 strict=True,
             )
         ):
+            mask = [token_id for _, token_id in mask_row]
+            values = [logprob for logprob, _ in mask_row]
             self.assertIn(token, mask)
             self.assertEqual(len(mask), len(set(mask)))
             self.assertLessEqual(len(mask), 2048)
-            if mode == "selected":
-                self.assertIsInstance(actual, float)
-            values = actual if mode == "support" else [actual]
             self.assertTrue(all(math.isfinite(v) and v <= 0 for v in values))
-            if mode == "support":
-                self.assertEqual(len(actual), len(mask))
-                self.assertAlmostEqual(
-                    sum(math.exp(v) for v in values), 1.0, delta=1e-4
-                )
+            self.assertAlmostEqual(sum(math.exp(v) for v in values), 1.0, delta=1e-4)
+            self.assertAlmostEqual(
+                sampled_logprob, values[mask.index(token)], delta=1e-6
+            )
             if greedy:
                 self.assertEqual(mask, [token])
                 self.assertEqual(values, [0.0])
@@ -131,12 +128,7 @@ class TestGLM52BF16SamplingMask(CustomTestCase):
                     expected[int(token_id)] = weight
                     mass += weight
                 self.assertEqual(set(mask), set(expected))
-                pairs = (
-                    zip(mask, actual, strict=True)
-                    if mode == "support"
-                    else [(token, actual)]
-                )
-                for token_id, value in pairs:
+                for token_id, value in zip(mask, values, strict=True):
                     self.assertAlmostEqual(
                         value, math.log(expected[token_id] / mass), delta=1e-3
                     )
@@ -163,48 +155,51 @@ class TestGLM52BF16SamplingMask(CustomTestCase):
             ("fallback", 1025, 1.0),
             ("fallback_topp", 1025, 0.8),
         ]
-        for mode in ("support", "selected"):
-            for name, k, p in cases:
-                with self.subTest(mode=mode, case=name):
-                    params = {
-                        "temperature": 0.0 if name == "greedy" else 1.0,
-                        "top_k": k,
-                        "top_p": p,
+        for name, k, p in cases:
+            with self.subTest(case=name):
+                params = {
+                    "temperature": 0.0 if name == "greedy" else 1.0,
+                    "top_k": k,
+                    "top_p": p,
+                }
+                exact = name != "greedy"
+                if exact:
+                    # Separate cutoff values after logprob rounding.
+                    spacing, count = (0.7, 16) if k <= 1024 else (0.005, 1100)
+                    params["logit_bias"] = {
+                        str(t): 40.0 - spacing * t for t in range(count)
                     }
-                    exact = name != "greedy"
-                    if exact:
-                        # Separate cutoff values after logprob rounding.
-                        spacing, count = (0.7, 16) if k <= 1024 else (0.005, 1100)
-                        params["logit_bias"] = {
-                            str(t): 40.0 - spacing * t for t in range(count)
-                        }
-                    body = self._generate(
-                        params, mode, return_logprob=True, top_logprobs_num=2048
-                    )
-                    self._check_output(
-                        body,
-                        mode,
-                        greedy=name == "greedy",
-                        filters=(k, p) if exact else None,
-                    )
+                body = self._generate(params, top_logprobs_num=2048)
+                self._check_output(
+                    body,
+                    greedy=name == "greedy",
+                    filters=(k, p) if exact else None,
+                )
 
-    def test_mixed_batch_modes(self):
-        """Check mode, opt-in and request/token association independently."""
+    def test_mixed_batch_flags(self):
+        """Check each flag, opt-in and request/token association independently."""
         bodies = self._generate(
             {"top_k": 10},
-            mode=["support", None, "selected"],
             text=[
                 "The capital of France is",
                 "The capital of Germany is",
                 "The capital of Italy is",
             ],
+            return_sampling_logprobs=[True, False, False],
             return_sampling_mask=[True, False, True],
         )
         self.assertEqual(len(bodies), 3)
-        for key in ("output_token_sampling_mask", "output_token_sampling_logprobs"):
+        for key in ("output_sampling_mask_logprobs", "output_token_sampling_logprobs"):
             self.assertNotIn(key, bodies[1]["meta_info"])
-        self._check_output(bodies[0], "support")
-        self._check_output(bodies[2], "selected")
+        self._check_output(bodies[0])
+        mask_only = bodies[2]["meta_info"]
+        self.assertNotIn("output_token_sampling_logprobs", mask_only)
+        for token, mask_row in zip(
+            bodies[2]["output_ids"],
+            mask_only["output_sampling_mask_logprobs"],
+            strict=True,
+        ):
+            self.assertIn(token, [token_id for _, token_id in mask_row])
 
 
 if __name__ == "__main__":

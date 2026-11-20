@@ -528,7 +528,7 @@ def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
         discard_output_reason=None,
         pending_bootstrap=False,
         return_logprob=False,
-        return_sampling_mask=False,
+        captures_sampling=False,
         grammar=None,
         time_stats=SimpleNamespace(
             set_prefill_finished_time=Mock(),

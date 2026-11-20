@@ -691,15 +691,22 @@ async fn generate(
     }
 }
 
-/// Whether Python reads `sampling_logprobs_mode` as set: any value but `null`,
-/// or for a batch of `n` prompts a list naming a mode for one of them (Python
-/// reads no entry past them; an empty list is set, being no per-prompt list).
-fn sampling_logprobs_mode_set(mode: &serde_json::Value, batch: Option<usize>) -> bool {
-    match (mode, batch) {
-        (serde_json::Value::Null, _) => false,
-        (serde_json::Value::Array(modes), Some(n)) => {
-            modes.is_empty() || modes.iter().take(n).any(|mode| !mode.is_null())
-        }
+/// Python's message for the removed `sampling_logprobs_mode`.
+const SAMPLING_LOGPROBS_MODE_REMOVED: &str = "sampling_logprobs_mode was removed. Set \
+     return_sampling_logprobs for each output token's sampling logprob and \
+     return_sampling_mask for the sampling support with its logprobs.";
+
+/// Whether Python reads `return_sampling_logprobs` as set: `true`, or for a
+/// batch of `n` prompts a list with `true` for one of them (Python reads no
+/// entry past them). A list sent with a single prompt is set unless empty.
+fn return_sampling_logprobs_set(flag: &serde_json::Value, batch: Option<usize>) -> bool {
+    match (flag, batch) {
+        (serde_json::Value::Null | serde_json::Value::Bool(false), _) => false,
+        (serde_json::Value::Array(flags), Some(n)) => flags
+            .iter()
+            .take(n)
+            .any(|flag| flag.as_bool() == Some(true)),
+        (serde_json::Value::Array(flags), None) => !flags.is_empty(),
         _ => true,
     }
 }
@@ -769,8 +776,9 @@ pub(super) fn generate_requests(
     if let Err(error) = merge_preferred_sampling(&mut body, &default_max_new_tokens) {
         return Err((StatusCode::INTERNAL_SERVER_ERROR, error, false));
     }
-    // Outside the schema, so decoding drops it; checked below.
+    // Outside the schema, so decoding drops them; checked below.
     let sampling_logprobs_mode = body.get("sampling_logprobs_mode").cloned();
+    let return_sampling_logprobs = body.get("return_sampling_logprobs").cloned();
     // The schema (sglang_api_types) is the contract: decode errors carry
     // serde's field-level text, as Python's 400s do.
     let body: api::GenerateRequest = match serde_json::from_value(body) {
@@ -785,11 +793,18 @@ pub(super) fn generate_requests(
         tracing::warn!(error = %e, "rejected request");
         (StatusCode::BAD_REQUEST, e.to_string(), stream)
     })?;
-    // Python refuses a mode without `return_sampling_mask=true`, and
-    // `into_requests` refused the mask.
+    // The Rust server returns no sampling logprobs; `into_requests` refused the mask.
     let batch = is_batch.then_some(requests.len());
-    if sampling_logprobs_mode.is_some_and(|mode| sampling_logprobs_mode_set(&mode, batch)) {
-        let message = "sampling_logprobs_mode can only be set when return_sampling_mask=true.";
+    let returns_sampling_logprobs =
+        return_sampling_logprobs.is_some_and(|flag| return_sampling_logprobs_set(&flag, batch));
+    let refused = if sampling_logprobs_mode.is_some_and(|mode| !mode.is_null()) {
+        Some(SAMPLING_LOGPROBS_MODE_REMOVED)
+    } else if returns_sampling_logprobs {
+        Some("return_sampling_logprobs is not supported by the Rust server")
+    } else {
+        None
+    };
+    if let Some(message) = refused {
         tracing::warn!(error = %message, "rejected request");
         return Err((StatusCode::BAD_REQUEST, message.into(), stream));
     }
@@ -1598,15 +1613,23 @@ mod tests {
             ),
             (
                 serde_json::json!({"text": "hi", "sampling_logprobs_mode": "support"}),
-                "sampling_logprobs_mode can only be set when return_sampling_mask=true.",
+                SAMPLING_LOGPROBS_MODE_REMOVED,
             ),
             (
-                serde_json::json!({"text": "hi", "sampling_logprobs_mode": [null]}),
-                "sampling_logprobs_mode can only be set when return_sampling_mask=true.",
+                serde_json::json!({"text": ["a", "b"], "sampling_logprobs_mode": [null, null]}),
+                SAMPLING_LOGPROBS_MODE_REMOVED,
             ),
             (
-                serde_json::json!({"text": ["a", "b"], "sampling_logprobs_mode": [null, "support"]}),
-                "sampling_logprobs_mode can only be set when return_sampling_mask=true.",
+                serde_json::json!({"text": "hi", "return_sampling_logprobs": true}),
+                "return_sampling_logprobs is not supported by the Rust server",
+            ),
+            (
+                serde_json::json!({"text": "hi", "return_sampling_logprobs": [false]}),
+                "return_sampling_logprobs is not supported by the Rust server",
+            ),
+            (
+                serde_json::json!({"text": ["a", "b"], "return_sampling_logprobs": [false, true]}),
+                "return_sampling_logprobs is not supported by the Rust server",
             ),
             (
                 serde_json::json!({
@@ -1662,10 +1685,11 @@ mod tests {
                 );
             }
         }
-        // A mode Python reads as unset passes.
+        // Values Python reads as unset pass.
         for body in [
             serde_json::json!({"text": "hi", "sampling_logprobs_mode": null}),
-            serde_json::json!({"text": ["a", "b"], "sampling_logprobs_mode": [null, null, "support"]}),
+            serde_json::json!({"text": "hi", "return_sampling_logprobs": false}),
+            serde_json::json!({"text": ["a", "b"], "return_sampling_logprobs": [false, false, true]}),
         ] {
             assert!(generate_requests(&state, body.clone()).is_ok(), "{body}");
         }

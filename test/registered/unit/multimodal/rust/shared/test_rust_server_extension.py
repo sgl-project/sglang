@@ -111,7 +111,7 @@ class _StreamedReq(FakeReq):
         self.return_hidden_states = False
         self.return_routed_experts = False
         self.return_indexer_topk = False
-        self.return_sampling_mask = False
+        self.captures_sampling = False
 
     def finished(self):
         return self._finished

@@ -1088,7 +1088,7 @@ class TestDisaggregationWire(unittest.TestCase):
                             manager.validate_aux_buffers(dst_ptrs, peer_lens)
 
     def test_sampling_mask_buffer_forces_the_aux_item_length_exchange(self):
-        """A build without the sampling-logprob buffer has another layout. With the PD
+        """An older build has no buffer for the sampled token's logprob. With the PD
         sampling-mask buffers on, a prefill must refuse such a decode whether or not
         it reports its buffer sizes, and such a prefill must refuse this decode."""
         args = KVArgs()
@@ -2882,16 +2882,17 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
     def _make_req(
         seed,
         metadata_buffer_index=0,
-        sampling_mask=None,
-        sampling_logprobs=None,
-        sampling_logprobs_mode="support",
+        sampling_logprob=None,
+        sampling_mask=(),
+        sampling_mask_logprobs=(),
     ):
         sampling_mask_rows = None
-        if sampling_mask is not None:
+        if sampling_logprob is not None:
             sampling_mask_rows = SamplingMaskRows()
             sampling_mask_rows.append(
+                sampling_logprob,
                 np.array(sampling_mask, np.int32),
-                np.array(sampling_logprobs, np.float32),
+                np.array(sampling_mask_logprobs, np.float32),
             )
         return SimpleNamespace(
             metadata_buffer_index=metadata_buffer_index,
@@ -2904,8 +2905,7 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
             get_mm_token_counts=lambda: (0, 0, 0),
             multimodal_inputs=None,
             return_logprob=False,
-            return_sampling_mask=sampling_mask is not None,
-            sampling_logprobs_mode=sampling_logprobs_mode,
+            captures_sampling=sampling_logprob is not None,
             sampling_mask_rows=sampling_mask_rows,
             hidden_states_tensor=torch.tensor([1.0, 2.0]),
             output_topk_p=torch.tensor([1.0]),
@@ -3041,8 +3041,9 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                 buffers.set_buf(
                     self._make_req(
                         None,
-                        sampling_mask=[7, 8, 9] if enabled else None,
-                        sampling_logprobs=[-1.25, -1.5, -2.0] if enabled else None,
+                        sampling_logprob=-1.5 if enabled else None,
+                        sampling_mask=[7, 8, 9] if enabled else (),
+                        sampling_mask_logprobs=[-1.25, -1.5, -2.0] if enabled else (),
                     )
                 )
                 schemas.append(buffers.get_buf_infos())
@@ -3050,21 +3051,26 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                     self.assertEqual(
                         buffers.output_token_sampling_mask_idx.shape, (1, 3)
                     )
-                    length, mask, logprobs = buffers.get_buf(0)[6:9]
+                    length, mask, mask_logprobs, logprob = buffers.get_buf(0)[6:10]
                     self.assertEqual(length[0].item(), 3)
                     self.assertEqual(mask.tolist(), [7, 8, 9])
-                    self.assertEqual(logprobs.tolist(), [-1.25, -1.5, -2.0])
+                    # One logprob per mask id, and the sampled token's on its own.
+                    self.assertEqual(mask_logprobs.tolist(), [-1.25, -1.5, -2.0])
+                    self.assertEqual(logprob.tolist(), [-1.5] + [0.0] * 15)
                 else:
                     self.assertIsNone(buffers.output_token_sampling_mask_len)
                     self.assertIsNone(buffers.output_token_sampling_mask_idx)
+                    self.assertIsNone(buffers.output_sampling_mask_logprobs)
                     self.assertIsNone(buffers.output_token_sampling_logprobs)
-                    self.assertEqual(buffers.get_buf(0)[6:9], (None, None, None))
+                    self.assertEqual(buffers.get_buf(0)[6:10], (None,) * 4)
         disabled_ptrs, _, disabled_sizes = schemas[0]
         enabled_ptrs, _, enabled_sizes = schemas[1]
-        self.assertEqual(len(enabled_ptrs) - len(disabled_ptrs), 3)
-        self.assertEqual(sum(enabled_sizes) - sum(disabled_sizes), 2 * 3 * 4 + 64)
+        self.assertEqual(len(enabled_ptrs) - len(disabled_ptrs), 4)
+        self.assertEqual(sum(enabled_sizes) - sum(disabled_sizes), (3 + 3) * 4 + 128)
 
-    def test_sampling_mask_selected_logprob_uses_first_metadata_slot(self):
+    def test_sampling_logprob_is_sent_without_a_mask(self):
+        """A captured request that returns sampling logprobs only still sends its
+        first token's logprob, with an empty mask."""
         with envs.SGLANG_ENABLE_DISAGG_SAMPLING_MASK.override(True):
             buffers = MetadataBuffers(
                 size=1,
@@ -3072,27 +3078,19 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                 hidden_states_dtype=torch.float32,
                 max_sampling_mask_tokens=3,
             )
-            buffers.set_buf(
-                self._make_req(
-                    None,
-                    sampling_mask=[7, 8, 9],
-                    sampling_logprobs=[-0.5],
-                    sampling_logprobs_mode="selected",
-                )
-            )
-            length, mask, logprobs = buffers.get_buf(0)[6:9]
-            self.assertEqual(length[0].item(), 3)
-            self.assertEqual(mask.tolist(), [7, 8, 9])
-            self.assertEqual(logprobs[0].item(), -0.5)
+            buffers.set_buf(self._make_req(None, sampling_logprob=-0.5))
+            length, _, _, logprob = buffers.get_buf(0)[6:10]
+            self.assertEqual(length[0].item(), 0)
+            self.assertEqual(logprob[0].item(), -0.5)
 
     def test_sampling_mask_row_reaches_decode_unchanged(self):
         """The prefill worker's first-token row is the row the decode worker streams."""
-        for mode, logprobs, expected in (
-            ("support", [-1.25, -1.5, -2.0], [[-1.25, -1.5, -2.0]]),
-            ("selected", [-0.5], [-0.5]),
+        for logprob, mask, mask_logprobs in (
+            (-1.5, [7, 8, 9], [-1.25, -1.5, -2.0]),
+            (-0.5, [], []),
         ):
             with (
-                self.subTest(sampling_logprobs_mode=mode),
+                self.subTest(mask=mask),
                 envs.SGLANG_ENABLE_DISAGG_SAMPLING_MASK.override(True),
             ):
                 buffers = MetadataBuffers(
@@ -3104,9 +3102,9 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                 buffers.set_buf(
                     self._make_req(
                         None,
-                        sampling_mask=[7, 8, 9],
-                        sampling_logprobs=logprobs,
-                        sampling_logprobs_mode=mode,
+                        sampling_logprob=logprob,
+                        sampling_mask=mask,
+                        sampling_mask_logprobs=mask_logprobs,
                     )
                 )
                 fields = dict.fromkeys(
@@ -3129,8 +3127,7 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                     output_ids=[],
                     require_reasoning=False,
                     return_logprob=False,
-                    return_sampling_mask=True,
-                    sampling_logprobs_mode=mode,
+                    captures_sampling=True,
                     sampling_mask_rows=SamplingMaskRows(),
                     time_stats=SimpleNamespace(set_wait_queue_entry_time=lambda: None),
                 )
@@ -3144,11 +3141,10 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                 )
 
                 self.assertEqual(req.output_ids, [101])
+                chunk = req.sampling_mask_rows.take()
                 self.assertEqual(
-                    req.sampling_mask_rows.take().to_lists(
-                        support_logprobs=mode == "support"
-                    ),
-                    ([[7, 8, 9]], expected),
+                    (chunk.selected_logprobs.tolist(), *chunk.support_rows()),
+                    ([logprob], [mask], [mask_logprobs]),
                 )
 
     def test_rebootstrap_commit_keeps_emitted_output(self):
@@ -3166,8 +3162,9 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
             )
             prefill_req = self._make_req(
                 None,
+                sampling_logprob=-1.5,
                 sampling_mask=[7, 8, 9],
-                sampling_logprobs=[-1.25, -1.5, -2.0],
+                sampling_mask_logprobs=[-1.25, -1.5, -2.0],
             )
             prefill_req.customized_info = {"token_ids": [101]}
             buffers.set_buf(prefill_req)
@@ -3182,10 +3179,10 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
             queue.metadata_buffers = buffers
             sampling_mask_rows = SamplingMaskRows()
             sampling_mask_rows.append(
-                np.array([5, 1], np.int32), np.array([-0.5, -2.25], np.float32)
+                -0.5, np.array([5, 1], np.int32), np.array([-0.5, -2.25], np.float32)
             )
             sampling_mask_rows.append(
-                np.array([6, 2], np.int32), np.array([-0.25, -1.75], np.float32)
+                -0.25, np.array([6, 2], np.int32), np.array([-0.25, -1.75], np.float32)
             )
             req = SimpleNamespace(
                 rid="r0",
@@ -3194,8 +3191,7 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                 output_ids=[5, 6],
                 customized_info={"token_ids": [5, 6]},
                 return_logprob=False,
-                return_sampling_mask=True,
-                sampling_logprobs_mode="support",
+                captures_sampling=True,
                 sampling_mask_rows=sampling_mask_rows,
                 time_stats=SimpleNamespace(set_wait_queue_entry_time=lambda: None),
             )
@@ -3211,9 +3207,10 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
 
             self.assertEqual(req.output_ids, [5, 6])
             self.assertEqual(req.customized_info, {"token_ids": [5, 6]})
+            chunk = req.sampling_mask_rows.take()
             self.assertEqual(
-                req.sampling_mask_rows.take().to_lists(support_logprobs=True),
-                ([[5, 1], [6, 2]], [[-0.5, -2.25], [-0.25, -1.75]]),
+                (chunk.selected_logprobs.tolist(), *chunk.support_rows()),
+                ([-0.5, -0.25], [[5, 1], [6, 2]], [[-0.5, -2.25], [-0.25, -1.75]]),
             )
 
     def test_decode_input_requires_valid_seed_for_every_request(self):

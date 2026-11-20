@@ -1176,7 +1176,7 @@ class SchedulerDisaggregationPrefillMixin:
                     continue
 
                 sampling_mask_finish_reason = None
-                if req.return_sampling_mask:
+                if req.captures_sampling:
                     assert logits_output is not None
                     statuses = logits_output.next_token_sampling_mask_status
                     status = None if statuses is None else statuses[i]
@@ -1251,7 +1251,7 @@ class SchedulerDisaggregationPrefillMixin:
                         logits_output,
                     )
                     logprob_pt += num_input_logprobs
-                if req.return_sampling_mask:
+                if req.captures_sampling:
                     self.batch_result_processor.add_sampling_mask_return_values(
                         i, req, logits_output
                     )
@@ -2028,6 +2028,12 @@ class SchedulerDisaggregationPrefillMixin:
         release_kv_cache(req, self.tree_cache, checkpoint=False)
         req.reset_for_retract()
         req.output_ids = array("q")
+        # A parked request already recorded its first token's logprobs and queued
+        # its sampling row; the retry samples that token again.
+        if req.return_logprob:
+            req.logprob.reset_output_records()
+        if req.sampling_mask_rows is not None:
+            req.sampling_mask_rows.take()
         req.customized_info = None
         req.start_send_idx = 0
         req.tmp_end_idx = -1

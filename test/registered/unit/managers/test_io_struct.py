@@ -529,23 +529,25 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         self.assertEqual(req.sampling_params[0]["max_new_tokens"], 5)
         self.assertEqual(req[1].sampling_params["max_new_tokens"], 20)
 
-    def test_sampling_logprobs_mode_normalization(self):
+    def test_sampling_output_flags_normalization(self):
         default_req = copy.deepcopy(self.base_req)
         default_req.normalize_batch_and_arguments()
-        self.assertEqual(default_req.sampling_logprobs_mode, [None, None])
+        self.assertEqual(default_req.return_sampling_logprobs, [False, False])
+        self.assertEqual(default_req.return_sampling_mask, [False, False])
 
         req = copy.deepcopy(self.base_req)
-        req.return_sampling_mask = [True, True]
-        req.sampling_logprobs_mode = ["selected", "support"]
+        req.return_sampling_logprobs = [True, False]
+        req.return_sampling_mask = [False, True]
 
         req.normalize_batch_and_arguments()
 
         self.assertEqual(
-            req.sampling_logprobs_mode,
-            ["selected", "support"],
+            [
+                (item.return_sampling_logprobs, item.return_sampling_mask)
+                for item in req
+            ],
+            [(True, False), (False, True)],
         )
-        self.assertEqual(req[0].sampling_logprobs_mode, "selected")
-        self.assertEqual(req[1].sampling_logprobs_mode, "support")
 
     def test_single_image_to_list_of_lists(self):
         """Test that a single image is converted to a list of single-image lists."""

@@ -1037,6 +1037,16 @@ class OpenAIServingChat(OpenAIServingBase):
         if request.return_sampling_mask and not request.return_meta_info:
             return "return_sampling_mask requires return_meta_info=true."
 
+        if request.sampling_logprobs_mode is not None:
+            return (
+                "sampling_logprobs_mode was removed. Set return_sampling_logprobs "
+                "for each output token's sampling logprob and return_sampling_mask "
+                "for the sampling support with its logprobs."
+            )
+
+        if request.return_sampling_logprobs and not request.return_meta_info:
+            return "return_sampling_logprobs requires return_meta_info=true."
+
         top_logprobs_error = self._top_logprobs_error(
             "top_logprobs", request.top_logprobs
         )
@@ -1309,8 +1319,8 @@ class OpenAIServingChat(OpenAIServingBase):
             return_logprob=request.logprobs,
             logprob_start_len=-1,
             top_logprobs_num=request.top_logprobs or 0,
+            return_sampling_logprobs=request.return_sampling_logprobs,
             return_sampling_mask=request.return_sampling_mask,
-            sampling_logprobs_mode=request.sampling_logprobs_mode,
             stream=request.stream,
             return_text_in_logprobs=True,
             return_flat_raw_output_top_logprobs=request.return_flat_raw_output_top_logprobs,

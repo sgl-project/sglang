@@ -88,14 +88,16 @@ def _make_batch_str_output() -> BatchStrOutput:
         output_token_entropy_val=[0.0, 0.0],
         output_token_sampling_mask=[
             SamplingMaskChunk(
+                selected_logprobs=np.array([-0.5], np.float32),
                 lengths=np.array([2], np.int32),
                 token_ids=np.array([7, 8], np.int32),
-                logprobs=np.array([-0.5, -1.0], np.float32),
+                support_logprobs=np.array([-0.5, -1.0], np.float32),
             ),
             SamplingMaskChunk(
+                selected_logprobs=np.array([0.0], np.float32),
                 lengths=np.array([1], np.int32),
                 token_ids=np.array([9], np.int32),
-                logprobs=np.array([0.0], np.float32),
+                support_logprobs=np.array([0.0], np.float32),
             ),
         ],
         output_hidden_states=[None, None],
@@ -280,9 +282,8 @@ class TestMultiTokenizerMixin(CustomTestCase):
         single_output = _handle_output_by_index(output, 0)
 
         (chunk,) = single_output.output_token_sampling_mask
-        self.assertEqual(
-            chunk.to_lists(support_logprobs=True), ([[7, 8]], [[-0.5, -1.0]])
-        )
+        self.assertEqual(chunk.selected_logprobs.tolist(), [-0.5])
+        self.assertEqual(chunk.support_rows(), ([[7, 8]], [[-0.5, -1.0]]))
 
     def test_batch_str_output_without_weight_versions_stays_none(self):
         """An output from an older server without the field splits into None."""
