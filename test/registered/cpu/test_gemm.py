@@ -342,14 +342,20 @@ class TestGemm(CustomTestCase):
         atol = rtol = precision[ref_res.dtype]
         torch.testing.assert_close(ref_res, target_res, atol=atol, rtol=rtol)
 
-    def test_int4_awq_symmetric_mode_is_rejected(self):
-        weight = torch.zeros((128, 4), dtype=torch.int32)
-        zeros = torch.zeros((1, 4), dtype=torch.int32)
-        scales = torch.ones((1, 32), dtype=torch.bfloat16)
-        with self.assertRaisesRegex(RuntimeError, "CPU AWQ symmetric quantization"):
-            torch.ops.sgl_kernel.convert_weight_packed_scale_zp(
-                weight, zeros, scales, 0, is_symmetric=True
-            )
+    def test_int4_awq_ignores_is_symmetric(self):
+        """AWQ always reads qzeros as stored, so is_symmetric must not change the packing."""
+        torch.manual_seed(127)
+        weight = torch.randint(-128, 128, (256, 4)).to(torch.int)
+        zeros = torch.full((2, 4), 0x88888888 - (1 << 32), dtype=torch.int32)
+        scales = torch.rand(2, 32).to(torch.bfloat16)
+        asym = torch.ops.sgl_kernel.convert_weight_packed_scale_zp(
+            weight, zeros, scales, 0, is_symmetric=False
+        )
+        sym = torch.ops.sgl_kernel.convert_weight_packed_scale_zp(
+            weight, zeros, scales, 0, is_symmetric=True
+        )
+        for a, s in zip(asym, sym):
+            torch.testing.assert_close(a, s, rtol=0, atol=0)
 
     @parametrize(
         M=[1, 32], N=[4096], K=[4096], group_size=[128], has_bias=[False, True]
