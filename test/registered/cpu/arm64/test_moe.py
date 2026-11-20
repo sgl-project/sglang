@@ -92,6 +92,55 @@ class TestFusedExpertsInt8(CustomTestCase):
             atol = rtol = 0.02
         torch.testing.assert_close(ref_out, out, atol=atol, rtol=rtol)
 
+    def _int8_moe_out_of_range_topk_ids(self, bad_id):
+        M, N, K, E, topk = 1, 256, 256, 8, 4
+        dtype = torch.bfloat16
+        prepack = not IS_ARM64
+
+        a = torch.randn((M, K), dtype=dtype) / math.sqrt(K)
+        w1 = torch.randint(-128, 127, (E, 2 * N, K), dtype=torch.int8)
+        w2 = torch.randint(-128, 127, (E, K, N), dtype=torch.int8)
+        w1_s = torch.rand(E, 2 * N) * 1e-2
+        w2_s = torch.rand(E, K) * 1e-2
+
+        score = torch.randn((M, E), dtype=dtype)
+        score = torch.softmax(score, dim=-1, dtype=torch.float32)
+        topk_weight, topk_ids = torch.topk(score, topk)
+        topk_ids = topk_ids.to(torch.int32)
+        topk_ids[0, 0] = bad_id
+
+        packed_w1 = kernel.convert_weight_packed(w1) if prepack else w1
+        packed_w2 = kernel.convert_weight_packed(w2) if prepack else w2
+
+        with self.assertRaisesRegex(RuntimeError, "out of range"):
+            kernel.fused_experts_cpu(
+                a,
+                packed_w1,
+                packed_w2,
+                topk_weight,
+                topk_ids,
+                not IS_ARM64,
+                CPUQuantMethod.INT8_W8A8,
+                w1_s,
+                w2_s,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                prepack,
+            )
+
+    def test_int8_moe_negative_topk_id_is_rejected(self):
+        # lower bound of the valid expert range: -1 must be rejected
+        self._int8_moe_out_of_range_topk_ids(-1)
+
+    def test_int8_moe_topk_id_at_num_experts_is_rejected(self):
+        # upper bound of the valid expert range: id == E must be rejected
+        self._int8_moe_out_of_range_topk_ids(8)
+
     def test_int8_moe(self):
         for params in itertools.product(
             self.M,
