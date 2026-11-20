@@ -67,6 +67,10 @@ if TYPE_CHECKING:
     # picks it where it measured faster than NCCL (see plain_exchange_ready),
     # 1 forces it for every exchange, 0 keeps NCCL
     SGLANG_DIFFUSION_IPC_A2A_MULTI: bool | None = None
+    # Ordinary unquantized FlashInfer Ulysses; overrides the IPC pipeline.
+    # Set identically on every rank. Uneven sequence shards retain their transport.
+    SGLANG_DIFFUSION_FLASHINFER_ULYSSES: bool = False
+    SGLANG_DIFFUSION_FLASHINFER_ULYSSES_BACKEND: str = "auto"
     # head groups for pipelining the Ulysses exchange against dense attention
     # over the copy-engine transport (MiniMax-H3, and USPAttention's plain path),
     # or over the collective one for MiniMax-H3 on aiter:
@@ -422,6 +426,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ================== Ulysses / IPC all-to-all ==================
     # CUDA-IPC transport for 2-rank Ulysses all-to-all (NVLink same-node)
     "SGLANG_DIFFUSION_IPC_A2A": _lazy_bool("SGLANG_DIFFUSION_IPC_A2A", "true"),
+    "SGLANG_DIFFUSION_FLASHINFER_ULYSSES": _lazy_bool(
+        "SGLANG_DIFFUSION_FLASHINFER_ULYSSES", "false"
+    ),
+    "SGLANG_DIFFUSION_FLASHINFER_ULYSSES_BACKEND": lambda: os.getenv(
+        "SGLANG_DIFFUSION_FLASHINFER_ULYSSES_BACKEND", "auto"
+    ),
     "SGLANG_DIFFUSION_IPC_A2A_MULTI": _lazy_optional_bool(
         "SGLANG_DIFFUSION_IPC_A2A_MULTI"
     ),
