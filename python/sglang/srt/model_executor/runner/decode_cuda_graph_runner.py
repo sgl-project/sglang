@@ -1229,6 +1229,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.capture_hidden_mode,
             spec_info,
         )
+        self._capture_custom_mask = (
+            spec_info.custom_mask if spec_info is not None else None
+        )
 
         if self.model_runner.lora_manager is not None:
             # It is safe to capture CUDA graph using empty LoRA id, as the LoRA kernels will always be launched whenever
@@ -1752,7 +1755,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             and forward_batch.forward_mode.is_idle()
             and forward_batch.spec_info is not None
         ):
-            forward_batch.spec_info.custom_mask = buffers.custom_mask
+            # Idle replay uses the same mask mode as capture.
+            forward_batch.spec_info.custom_mask = self._capture_custom_mask
 
         self._init_replay_attn_metadata(
             forward_batch,
