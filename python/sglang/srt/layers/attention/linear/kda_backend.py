@@ -6,7 +6,7 @@ import torch
 from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.attention import kda_fused_decode
 from sglang.kernels.ops.attention.linear.kda_verify_gfx950_flydsl import (
-    kda_verify_gfx950_available,
+    kda_verify_gfx950_supported,
 )
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
@@ -1404,10 +1404,20 @@ class KDAAttnBackend(MambaAttnBackendBase):
             # kernel in the fused path below; MI355X, us per call vs the HIP kernel:
             # B6 7.2 vs 8.6, B16 9.6 vs 13.6, B64 28.2 vs 38.9, tied up to B4.
             flydsl_first = (
-                replayssm_rawv is not None
-                and layer.num_v_heads == 16
+                layer.num_v_heads == 16
                 and draft_token_num == 6
-                and kda_verify_gfx950_available()
+                and self._flydsl_ring_verify_ok(
+                    layer=layer,
+                    mixed_qkv=mixed_qkv,
+                    a=a,
+                    b=b,
+                    draft_token_num=draft_token_num,
+                    conv_states=conv_states,
+                    ssm_states=ssm_states,
+                    intermediate_state_cache=intermediate_state_cache,
+                    intermediate_conv_window_cache=intermediate_conv_window_cache,
+                    replayssm_on=replayssm_rawv is not None,
+                )
             )
             if self._hip_chain_verify_fn is not None and not flydsl_first:
                 core_attn_out = self._hip_chain_verify_fn(
@@ -1641,12 +1651,17 @@ class KDAAttnBackend(MambaAttnBackendBase):
         # gfx950 ring path, T=6 GLM-5.3-Flash TP4, us vs the pair: the Triton kernel
         # wins up to B8; the FlyDSL kernel (kda_verify_gfx950_flydsl) B6 7.4 vs 18.3,
         # B16 12.3 vs 27.2, B64 31.9 vs 64.9.
-        gfx950_ring = (
-            replayssm_on
-            and is_hip()
-            and is_gfx95_supported()
-            and draft_token_num in (6, 8)
-            and kda_verify_gfx950_available()
+        gfx950_ring = self._flydsl_ring_verify_ok(
+            layer=layer,
+            mixed_qkv=mixed_qkv,
+            a=a,
+            b=b,
+            draft_token_num=draft_token_num,
+            conv_states=conv_states,
+            ssm_states=ssm_states,
+            intermediate_state_cache=intermediate_state_cache,
+            intermediate_conv_window_cache=intermediate_conv_window_cache,
+            replayssm_on=replayssm_on,
         )
         if (
             replayssm_on
@@ -1792,6 +1807,53 @@ class KDAAttnBackend(MambaAttnBackendBase):
         if not replayssm_on:
             tensors += (intermediate_state_cache,)
         return all(tensor.device == mixed_qkv.device for tensor in tensors)
+
+    @staticmethod
+    def _flydsl_ring_verify_ok(
+        *,
+        layer: RadixLinearAttention,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        draft_token_num: int,
+        conv_states: torch.Tensor,
+        ssm_states: torch.Tensor,
+        intermediate_state_cache: Optional[torch.Tensor],
+        intermediate_conv_window_cache: torch.Tensor,
+        replayssm_on: bool,
+    ) -> bool:
+        # The check fused_kda_conv_gating_verify makes before it hands the call to the
+        # gfx950 FlyDSL kernel; anything it rejects there runs the Triton fused kernel.
+        return (
+            replayssm_on
+            and intermediate_state_cache is None
+            and is_hip()
+            and is_gfx95_supported()
+            and isinstance(layer.conv_weights, torch.Tensor)
+            and isinstance(layer.A_log, torch.Tensor)
+            and isinstance(layer.dt_bias, torch.Tensor)
+            and kda_verify_gfx950_supported(
+                mixed_qkv=mixed_qkv,
+                conv_weight=layer.conv_weights,
+                conv_bias=layer.bias,
+                conv_state=conv_states.transpose(-1, -2),
+                intermediate_conv_window=intermediate_conv_window_cache.transpose(
+                    -1, -2
+                ),
+                a=a,
+                b=b,
+                A_log=layer.A_log,
+                dt_bias=layer.dt_bias,
+                ssm_states=ssm_states,
+                T=draft_token_num,
+                num_q_heads=layer.num_q_heads,
+                num_v_heads=layer.num_v_heads,
+                head_k_dim=layer.head_k_dim,
+                head_v_dim=layer.head_v_dim,
+                lower_bound=layer.lower_bound,
+                use_qk_l2norm_in_kernel=True,
+            )
+        )
 
     @staticmethod
     def _replayssm_ring_ok(

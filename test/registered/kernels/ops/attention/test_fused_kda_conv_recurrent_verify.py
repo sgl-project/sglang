@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import sglang.kernels.ops.attention.linear.kda_verify_gfx950_flydsl as flydsl_verify
 from sglang.kernels.ops.attention.linear.fused_kda_conv_recurrent_verify import (
     fused_kda_conv_gating_verify,
 )
@@ -16,6 +17,7 @@ from sglang.kernels.ops.attention.linear.kda_verify_gfx950_flydsl import (
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_update,
 )
+from sglang.srt.layers.attention.linear.kda_backend import KDAAttnBackend
 from sglang.srt.layers.attention.linear.kda_backend_hip import kda_chain_verify_gfx950
 from sglang.srt.utils import is_gfx95_supported
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -413,6 +415,98 @@ def test_gfx950_ring_bf16_state_matches_fp32(case):
     assert torch.equal(win16, win32)
     for name in template:
         assert torch.equal(rings16[name], rings32[name]), name
+
+
+def _verify_layer(inp, H, HV, K, V, lower_bound, bias=None):
+    return SimpleNamespace(
+        conv_weights=inp["w"],
+        bias=bias,
+        A_log=inp["A_log"],
+        dt_bias=inp["dt_bias"],
+        num_q_heads=H,
+        num_k_heads=H,
+        num_v_heads=HV,
+        head_q_dim=K,
+        head_k_dim=K,
+        head_v_dim=V,
+        lower_bound=lower_bound,
+    )
+
+
+@pytest.mark.skipif(not _is_gfx950(), reason="gfx950 FlyDSL kernel")
+def test_gfx950_flydsl_gate_matches_kernel_support():
+    # kda_backend lifts the gfx950 batch cap, allows a bf16 state and skips the HIP
+    # kernel only when the FlyDSL kernel takes the call.
+    B, T, H, HV, K, V = 16, 6, 16, 16, 128, 128
+    inp = _make_inputs(B, T, H, HV, K, V, 4, True, False, 40, torch.float32)
+
+    def gate(lower_bound=-5.0, bias=None, inter_ssm=None, replayssm_on=True):
+        return KDAAttnBackend._flydsl_ring_verify_ok(
+            layer=_verify_layer(inp, H, HV, K, V, lower_bound, bias),
+            mixed_qkv=inp["mixed"],
+            a=inp["a"],
+            b=inp["b"],
+            draft_token_num=T,
+            conv_states=inp["conv_pool"],
+            ssm_states=inp["ssm"],
+            intermediate_state_cache=inter_ssm,
+            intermediate_conv_window_cache=inp["win_pool"],
+            replayssm_on=replayssm_on,
+        )
+
+    assert gate()
+    assert not gate(lower_bound=None)
+    assert not gate(bias=inp["bias"])
+    assert not gate(inter_ssm=inp["inter_ssm"])
+    assert not gate(replayssm_on=False)
+
+
+@pytest.mark.skipif(not _is_gfx950(), reason="gfx950 FlyDSL kernel")
+@pytest.mark.parametrize("lower_bound, expected", [(-5.0, True), (None, False)])
+def test_gfx950_large_batch_ring_verify_needs_flydsl(lower_bound, expected):
+    # Past 16 requests the Triton fused kernel is slower than the unfused pair, so the
+    # fused path is taken only when the FlyDSL kernel supports the call.
+    B, T, H, HV, K, V = 64, 6, 16, 16, 128, 128
+    inp = _make_inputs(B, T, H, HV, K, V, 4, False, False, 41, torch.float32)
+    rings = _make_ring_buffers(H, HV, K, V, slots=B + 2)
+    backend = KDAAttnBackend.__new__(KDAAttnBackend)
+    backend._fused_chain_verify_fn = fused_kda_conv_gating_verify
+    ok = backend._can_run_fused_chain_verify(
+        layer=_verify_layer(inp, H, HV, K, V, lower_bound),
+        mixed_qkv=inp["mixed"],
+        a=inp["a"],
+        b=inp["b"],
+        draft_token_num=T,
+        conv_states=inp["conv_pool"],
+        ssm_states=inp["ssm"],
+        intermediate_state_cache=None,
+        intermediate_conv_window_cache=inp["win_pool"],
+        cache_indices=inp["cache_indices"],
+        intermediate_state_indices=inp["inter_indices"],
+        retrieve_next_token=None,
+        retrieve_next_sibling=None,
+        retrieve_parent_token=None,
+        replayssm_rawv=rings["rawv"],
+        replayssm_rawk=rings["rawk"],
+        replayssm_g=rings["g"],
+        replayssm_beta=rings["beta"],
+    )
+    assert ok is expected
+
+
+@pytest.mark.skipif(not _is_gfx950(), reason="gfx950 FlyDSL kernel")
+def test_gfx950_flydsl_build_failure_falls_back_to_triton(monkeypatch):
+    def broken(*args, **kwargs):
+        raise RuntimeError("simulated FlyDSL build failure")
+
+    monkeypatch.setattr(flydsl_verify, "create_kda_verify_kernel", broken)
+    monkeypatch.setattr(flydsl_verify, "_disabled", False)
+    _compare_case(
+        (6, 6, 16, 16, 128, 128, 4, False, -5.0, True, 42),
+        use_ring=True,
+        weight_dtype=torch.float32,
+    )
+    assert not flydsl_verify.kda_verify_gfx950_available()
 
 
 def _gfx950_case(slots, seed, H=12, T=8):

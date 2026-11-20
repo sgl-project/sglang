@@ -110,7 +110,9 @@ def kda_verify_gfx950(
     ring_indices,
     block_v: Optional[int] = None,
 ) -> Optional[torch.Tensor]:
-    """Returns o [seq_len, HV, V], or None if the kernel is unavailable."""
+    """Returns o [seq_len, HV, V], or None if the kernel is unavailable or fails to
+    build, in which case the caller runs the Triton kernel."""
+    global _disabled
     if not kda_verify_gfx950_available():
         return None
     seq_len = mixed_qkv.shape[0]
@@ -120,51 +122,61 @@ def kda_verify_gfx950(
     o = mixed_qkv.new_empty(seq_len, HV, 128)
     iw = intermediate_conv_window
     iw_s = iw.stride() if iw is not None else (0, 0, 0, 0)
-    launch = create_kda_verify_kernel(
-        T,
-        bvc,
-        num_q_heads,
-        HV,
-        float(lower_bound),
-        float(scale),
-        iw is not None,
-        ssm_states.dtype == torch.bfloat16,
-    )
-    ptr = lambda t: 0 if t is None else t.data_ptr()
-    _run_compiled(
-        launch,
-        ptr(mixed_qkv),
-        ptr(conv_weight),
-        ptr(conv_state),
-        ptr(conv_state_indices),
-        ptr(iw),
-        ptr(intermediate_state_indices if iw is not None else conv_state_indices),
-        ptr(a2),
-        ptr(b2),
-        ptr(A_log),
-        ptr(dt_bias),
-        ptr(ssm_states),
-        ptr(cache_indices),
-        ptr(o),
-        ptr(replayssm_rawv),
-        ptr(replayssm_rawk),
-        ptr(replayssm_g),
-        ptr(replayssm_beta),
-        ptr(ring_indices if ring_indices is not None else cache_indices),
-        mixed_qkv.stride(0),
-        conv_state.stride(0),
-        conv_state.stride(2),
-        iw_s[0],
-        iw_s[1],
-        iw_s[3],
-        a2.stride(0),
-        b2.stride(0),
-        replayssm_rawv.stride(0),
-        replayssm_rawk.stride(0),
-        replayssm_g.stride(0),
-        replayssm_beta.stride(0),
-        replayssm_rawv.shape[-2],
-        B * HV,
-        torch.cuda.current_stream(),
-    )
+    # Each specialization is traced and compiled on its first call, past the import
+    # guard, so an aiter / FlyDSL API or LLVM option mismatch surfaces here. Device-side
+    # faults are asynchronous and are not caught.
+    try:
+        launch = create_kda_verify_kernel(
+            T,
+            bvc,
+            num_q_heads,
+            HV,
+            float(lower_bound),
+            float(scale),
+            iw is not None,
+            ssm_states.dtype == torch.bfloat16,
+        )
+        ptr = lambda t: 0 if t is None else t.data_ptr()
+        _run_compiled(
+            launch,
+            ptr(mixed_qkv),
+            ptr(conv_weight),
+            ptr(conv_state),
+            ptr(conv_state_indices),
+            ptr(iw),
+            ptr(intermediate_state_indices if iw is not None else conv_state_indices),
+            ptr(a2),
+            ptr(b2),
+            ptr(A_log),
+            ptr(dt_bias),
+            ptr(ssm_states),
+            ptr(cache_indices),
+            ptr(o),
+            ptr(replayssm_rawv),
+            ptr(replayssm_rawk),
+            ptr(replayssm_g),
+            ptr(replayssm_beta),
+            ptr(ring_indices if ring_indices is not None else cache_indices),
+            mixed_qkv.stride(0),
+            conv_state.stride(0),
+            conv_state.stride(2),
+            iw_s[0],
+            iw_s[1],
+            iw_s[3],
+            a2.stride(0),
+            b2.stride(0),
+            replayssm_rawv.stride(0),
+            replayssm_rawk.stride(0),
+            replayssm_g.stride(0),
+            replayssm_beta.stride(0),
+            replayssm_rawv.shape[-2],
+            B * HV,
+            torch.cuda.current_stream(),
+        )
+    except Exception:
+        logger.warning(
+            "kda_verify_gfx950_flydsl failed; falling back to Triton", exc_info=True
+        )
+        _disabled = True
+        return None
     return o
