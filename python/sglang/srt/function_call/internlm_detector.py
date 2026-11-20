@@ -158,42 +158,66 @@ class InternlmDetector(BaseFormatDetector):
         """
         Streaming incremental parsing for InternLM format.
 
-        Supports a single tool call in streaming mode.
+        Every complete call in the buffer is emitted, so a delta carrying two
+        calls yields both of them instead of only the first one. Text outside
+        tool-call blocks is streamed as normal text, and a trailing partial
+        start marker is held back for the next delta.
         """
         self._buffer += new_text
         current_text = self._buffer
 
-        # Check if we don't have a tool call start marker
-        start = current_text.find(self.bot_token)
-        if start == -1:
-            # No tool call marker found
-            # If we've already processed tool calls, don't return text again
-            if self.current_tool_id > 0:
-                self._buffer = ""
-                return StreamingParseResult(normal_text="")
+        normal_text = ""
+        calls: list[ToolCallItem] = []
 
-            # Check if buffer could be partial start of bot_token
-            if not self._ends_with_partial_token(current_text, self.bot_token):
-                # Not a partial match, return as normal text
-                normal_text = current_text
-                self._buffer = ""
-                # Clean up any stray end tokens
-                if self.eot_token in normal_text:
-                    normal_text = normal_text.replace(self.eot_token, "")
-                return StreamingParseResult(normal_text=normal_text)
-            else:
-                # Might be partial start token, keep buffering
-                return StreamingParseResult()
+        while True:
+            start = current_text.find(self.bot_token)
+            if start == -1:
+                # No start marker: emit the text, holding back a possible
+                # partial marker that a later delta could complete.
+                held_back = self._pending_start_length(current_text)
+                if held_back:
+                    normal_text += current_text[:-held_back]
+                    current_text = current_text[-held_back:]
+                else:
+                    normal_text += current_text
+                    current_text = ""
+                break
 
-        # Check if we have a complete tool call (with end marker)
-        end = current_text.find(self.eot_token)
-        if end != -1:
-            # We have a complete tool call
-            # Initialize state if this is the first tool call
+            normal_text += current_text[:start]
+
+            # Check if we have a complete tool call (with end marker)
+            end = current_text.find(self.eot_token, start + len(self.bot_token))
+            if end == -1:
+                # We have bot_token but no eot_token yet - keep the tool call
+                # part in the buffer, the text before it has been emitted.
+                current_text = current_text[start:]
+                break
+
+            # Use detect_and_parse on the complete tool call
+            section_end = end + len(self.eot_token)
+            result = self.detect_and_parse(current_text[start:section_end], tools=tools)
+            calls.extend(self._commit_streamed_calls(result.calls))
+
+            # Remove the completed tool call from buffer and keep scanning so
+            # a second call in the same delta is not delayed by one round-trip.
+            current_text = current_text[section_end:]
+
+        self._buffer = current_text
+        # Clean up any stray end tokens
+        if self.eot_token in normal_text:
+            normal_text = normal_text.replace(self.eot_token, "")
+        return StreamingParseResult(normal_text=normal_text, calls=calls)
+
+    def _commit_streamed_calls(
+        self, parsed_calls: list[ToolCallItem]
+    ) -> list[ToolCallItem]:
+        """Assign sequential indices and record per-call streaming state."""
+        committed = []
+        for call in parsed_calls:
             if self.current_tool_id == -1:
                 self.current_tool_id = 0
                 self.prev_tool_call_arr = []
-                self.streamed_args_for_tool = [""]
+                self.streamed_args_for_tool = []
 
             # Ensure we have enough entries in our tracking arrays
             while len(self.prev_tool_call_arr) <= self.current_tool_id:
@@ -201,34 +225,41 @@ class InternlmDetector(BaseFormatDetector):
             while len(self.streamed_args_for_tool) <= self.current_tool_id:
                 self.streamed_args_for_tool.append("")
 
-            # Use detect_and_parse on the complete tool call
-            complete_section = current_text[: end + len(self.eot_token)]
-            result = self.detect_and_parse(complete_section, tools=tools)
+            call.tool_index = self.current_tool_id
+            self.prev_tool_call_arr[self.current_tool_id] = {
+                "name": call.name,
+                "arguments": json.loads(call.parameters),
+            }
+            self.streamed_args_for_tool[self.current_tool_id] = call.parameters
+            committed.append(call)
+            # Increment tool ID for next tool call
+            self.current_tool_id += 1
+        return committed
 
-            if result.calls:
-                # Update the tool call index
-                result.calls[0].tool_index = self.current_tool_id
-                # Store the parsed tool call for reference
-                self.prev_tool_call_arr[self.current_tool_id] = {
-                    "name": result.calls[0].name,
-                    "arguments": json.loads(result.calls[0].parameters),
-                }
-                self.streamed_args_for_tool[self.current_tool_id] = result.calls[
-                    0
-                ].parameters
-                # Increment tool ID for next tool call
-                self.current_tool_id += 1
+    def _pending_start_length(self, text: str) -> int:
+        """Length of the longest buffer suffix that is a partial start marker.
 
-            # Remove the completed tool call from buffer
-            self._buffer = current_text[end + len(self.eot_token) :]
-            return result
+        ``_ends_with_partial_token`` returns the shortest matching suffix, which
+        would leak the earlier characters of a start marker that is still
+        arriving one token at a time.
+        """
+        max_length = min(len(text), len(self.bot_token) - 1)
+        for length in range(max_length, 0, -1):
+            if self.bot_token.startswith(text[-length:]):
+                return length
+        return 0
 
-        # We have bot_token but no eot_token yet - handle partial tool call streaming
-        # Extract normal text before the tool call
-        normal_text = current_text[:start]
-        # Keep the tool call part in buffer
-        self._buffer = current_text[start:]
-        return StreamingParseResult(normal_text=normal_text)
+    def finish(self, tools: list[Tool]) -> StreamingParseResult:
+        """Release buffered prose; an incomplete call is dropped at stream end."""
+        buffered, self._buffer = self._buffer, ""
+        start = buffered.find(self.bot_token)
+        if start != -1:
+            buffered = buffered[:start]
+        else:
+            pending = self._pending_start_length(buffered)
+            if pending:
+                buffered = buffered[:-pending]
+        return StreamingParseResult(normal_text=buffered)
 
     def structure_info(self) -> _GetInfoFunc:
         """
