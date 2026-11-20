@@ -429,6 +429,14 @@ def _dflash_worker(**overrides):
     return SimpleNamespace(**fields)
 
 
+class TestDflashTokenMode(_Case):
+    def test_benchmark_forces_real_draft_tokens(self):
+        with patch.object(dfw, "SIMULATE_ACC_TOKEN_MODE", "fixed"):
+            self.assertEqual(dfw._sim_acc_token_mode(), "fixed")
+            with _bench(1000):
+                self.assertEqual(dfw._sim_acc_token_mode(), "real-draft-token")
+
+
 class TestDflashWorkerGuard(_Case):
     def _check(self, worker, value="1000", acc_len=3.0, mode="real-draft-token"):
         with (

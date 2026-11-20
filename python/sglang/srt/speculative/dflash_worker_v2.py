@@ -368,6 +368,13 @@ def _resolve_dflash_embedding_module(draft_model, target_model):
     return target_model.get_input_embeddings()
 
 
+def _sim_acc_token_mode() -> str:
+    """SGLANG_BENCH_DRAFTER_TEMPERATURE commits the sampled drafts: the default 'fixed'
+    mode would commit one fixed token id however the drafts are drawn. A function, not
+    worker state, so the accept path also runs on worker stand-ins."""
+    return "real-draft-token" if bench_drafter_enabled() else SIMULATE_ACC_TOKEN_MODE
+
+
 def _is_all_greedy(sampling_info) -> bool:
     return sampling_info is None or sampling_info.is_all_greedy
 
@@ -705,11 +712,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         # spec broadcasts must stay within the attn-TP group.
         self._tp_sync = SpecTpSync(get_dp_tp_group())
         check_simulate_acc_token_mode()
-        # SGLANG_BENCH_DRAFTER_TEMPERATURE commits the sampled drafts: the default
-        # 'fixed' mode would commit one fixed token id however the drafts are drawn.
-        self._sim_acc_token_mode = (
-            "real-draft-token" if bench_drafter_enabled() else SIMULATE_ACC_TOKEN_MODE
-        )
         # The forced lengths overwrite accept_len after its broadcast, so every rank
         # draws them from the same server-seeded stream.
         self._simulated_acc_len_rng = (
@@ -3291,7 +3293,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         if accept is None or self._plain_deferral_refused("megakernel accept"):
             return None
         accept.attach_draft_accept(
-            sim_real_token=self._sim_acc_token_mode == "real-draft-token"
+            sim_real_token=_sim_acc_token_mode() == "real-draft-token"
         )
         self._arm_plain_deferral("megakernel accept")
         if self._target_tp_rank == 0:
@@ -3822,7 +3824,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 out_tokens=out_tokens,
                 simulate_acc_len=SIMULATE_ACC_LEN,
                 simulate_acc_method=SIMULATE_ACC_METHOD,
-                simulate_acc_token_mode=self._sim_acc_token_mode,
+                simulate_acc_token_mode=_sim_acc_token_mode(),
                 next_token_logits=next_token_logits,
                 generator=self._simulated_acc_len_rng,
                 prefix_lens=prefix_lens,
