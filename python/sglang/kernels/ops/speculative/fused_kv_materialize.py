@@ -377,9 +377,20 @@ class FusedKVMaterializeHelper:
         ):
             return
 
-        new_capacity = max(1, total_ctx)
-        if self._workspace_capacity > 0:
-            new_capacity = max(new_capacity, self._workspace_capacity * 2)
+        # Release previous workspace tensors before allocating larger ones to avoid
+        # 2x transient memory spikes, and avoid doubling past the standard 8192
+        # chunked-prefill ceiling (e.g. 8015 -> 8192 doubling to 16030).
+        self._proj_workspace = None
+        self._k_workspace = None
+        self._v_workspace = None
+        self._workspace_capacity = 0
+
+        if total_ctx <= 256:
+            new_capacity = 256
+        elif total_ctx <= 8192:
+            new_capacity = 8192
+        else:
+            new_capacity = ((total_ctx + 255) // 256) * 256
 
         self._proj_workspace = torch.empty(
             (new_capacity, self.n_layers * self.layer_out_dim),
