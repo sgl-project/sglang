@@ -108,26 +108,23 @@ class TestQwen4ShortConv(CustomTestCase):
             1, 3 * width * channels + 1, device="cuda", dtype=torch.bfloat16
         ).reshape(3 * width, channels)
         state_slots = torch.tensor([3, 5, 0], device="cuda")
-        # The padded request shares request index 0 with a live request.
-        request_rows = torch.tensor([4, 0, 0], device="cuda")
+        # Row 0 is reserved; the maximum request row must remain live.
+        request_rows = torch.tensor([4, pool_size, 0], device="cuda")
         accepted = torch.tensor([1, 2, -1], device="cuda")
         lengths = torch.tensor([width, width, 0], device="cuda")
-        valid_tokens = (torch.arange(width, device="cuda") < lengths[:, None]).flatten()
+        cache_locs = torch.arange(1, x.shape[0] + 1, device=x.device)
+        cache_locs[-width:] = 0
         mode = ForwardMode.TARGET_VERIFY
-        batch = SimpleNamespace(
-            mode=mode,
-            processed_tokens=x.shape[0],
-            physical_tokens=x.shape[0],
-            lengths=lengths,
-            state_indices=state_slots,
-            valid_tokens=valid_tokens,
-            row_width=width,
-            use_decode_fast_path=False,
-        )
         forward_batch = SimpleNamespace(
             _original_forward_mode=None,
             forward_mode=mode,
             req_pool_indices=request_rows,
+            tbo_parent_token_range=None,
+            spec_algorithm=None,
+            spec_info=SimpleNamespace(topk=1, draft_token_num=width),
+            global_num_token_non_padded_cpu=None,
+            extend_seq_lens_cpu=None,
+            out_cache_loc=cache_locs,
         )
         layer = qwen4_exp.Qwen4ExpPLELayer.__new__(qwen4_exp.Qwen4ExpPLELayer)
         torch.nn.Module.__init__(layer)
@@ -156,32 +153,49 @@ class TestQwen4ShortConv(CustomTestCase):
         expected[5] = x[width + 1 : 2 * width].T
 
         for pp_spec in (False, True):
-            with (
-                self.subTest(pp_spec=pp_spec),
-                qwen4_exp.envs.SGLANG_ENABLE_PP_SPEC.override(pp_spec),
-                patch.object(qwen4_exp.layernorm_sp, "runs_sp", return_value=False),
-                patch.object(
-                    qwen4_exp,
-                    "get_token_to_kv_pool",
-                    return_value=SimpleNamespace(layer_router=router),
-                ),
-                patch.object(
-                    qwen4_exp,
-                    "get_req_to_token_pool",
-                    return_value=SimpleNamespace(size=pool_size),
-                ),
-            ):
-                windows.zero_()
-                layer(torch.zeros_like(x), forward_batch, batch)
-                committed = state.clone().unsqueeze(0)
-                fused_mamba_state_scatter_with_mask(
-                    committed,
-                    windows.unsqueeze(0),
-                    state_slots,
-                    accepted,
-                    request_rows if pp_spec else None,
-                )
-                torch.testing.assert_close(committed[0], expected, atol=0, rtol=0)
+            for graph_padding in (False, True):
+                with (
+                    self.subTest(pp_spec=pp_spec, graph_padding=graph_padding),
+                    qwen4_exp.envs.SGLANG_ENABLE_PP_SPEC.override(pp_spec),
+                    patch.object(qwen4_exp.layernorm_sp, "runs_sp", return_value=False),
+                    patch.object(
+                        qwen4_exp,
+                        "get_token_to_kv_pool",
+                        return_value=SimpleNamespace(layer_router=router),
+                    ),
+                    patch.object(
+                        qwen4_exp,
+                        "get_req_to_token_pool",
+                        return_value=SimpleNamespace(size=pool_size),
+                    ),
+                    patch.object(
+                        qwen4_exp,
+                        "get_attn_backend",
+                        return_value=SimpleNamespace(
+                            forward_state_slots=lambda *_: SimpleNamespace(
+                                working=state_slots
+                            )
+                        ),
+                    ),
+                ):
+                    forward_batch.extend_seq_lens = None if graph_padding else lengths
+                    batch = qwen4_exp._prepare_ple_batch(
+                        x.new_zeros(x.shape[0], dtype=torch.long),
+                        forward_batch,
+                        ngram_size=None,
+                        ngram_eos_token_id=None,
+                    )
+                    windows.zero_()
+                    layer(torch.zeros_like(x), forward_batch, batch)
+                    committed = state.clone().unsqueeze(0)
+                    fused_mamba_state_scatter_with_mask(
+                        committed,
+                        windows.unsqueeze(0),
+                        state_slots,
+                        accepted,
+                        request_rows if pp_spec else None,
+                    )
+                    torch.testing.assert_close(committed[0], expected, atol=0, rtol=0)
 
     def test_packed_varlen_matches_padded_reference(self):
         lengths = [1, 2, 8, 9, 10, 33, 0]
