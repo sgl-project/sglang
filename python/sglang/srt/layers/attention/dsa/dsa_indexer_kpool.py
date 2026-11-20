@@ -11,6 +11,7 @@ from transformers import PretrainedConfig
 
 from sglang.srt.layers.attention.dsa.dsa_indexer import (
     DUAL_STREAM_TOKEN_THRESHOLD,
+    _broadcast_indexer_topk_from_rank0,
     rotate_activation,
 )
 from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import BaseIndexerMetadata
@@ -62,7 +63,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
     is_in_breakable_cuda_graph,
 )
 from sglang.srt.model_executor.runner_utils import capture_mode
-from sglang.srt.runtime_context import get_device, get_exec
+from sglang.srt.runtime_context import get_device, get_exec, get_parallel
 
 logger = logging.getLogger(__name__)
 
@@ -1656,14 +1657,23 @@ class IndexerKPool(MultiPlatformOp):
             bcg_kpool_indexer_prefill_with_output(
                 self, x, q_lora, positions, output, layer_id
             )
-            return output if return_indices else None
-        return self._forward_cuda_impl(
-            x,
-            q_lora,
-            positions,
-            forward_batch,
-            layer_id,
-            return_indices,
+            result = output if return_indices else None
+        else:
+            result = self._forward_cuda_impl(
+                x,
+                q_lora,
+                positions,
+                forward_batch,
+                layer_id,
+                return_indices,
+            )
+        # Pooled top-k has unspecified tie-breaking and output order. DCP
+        # partials must describe ONE selected set, including unfinished-pool
+        # tails; independently chosen tied groups cannot be LSE-merged.
+        # Sync the finalized output once, outside request-specific row chunks
+        # and the BCG eager break. Also honor the ordinary TP diagnostic flag.
+        return _broadcast_indexer_topk_from_rank0(
+            result, force=get_parallel().attn_dcp_size > 1
         )
 
     @property

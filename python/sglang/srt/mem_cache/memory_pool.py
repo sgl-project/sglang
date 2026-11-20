@@ -4287,6 +4287,7 @@ class HybridLinearKVPool(KVCache):
         # full-attention layers instead of constructing one internally.
         full_kv_pool: Optional[KVCache] = None,
         post_capture_active: bool = False,
+        dcp_replicated: bool = False,
         # HiSparse only: forwarded to a HiSparseDSATokenToKVPool full pool.
         host_to_device_ratio: Optional[int] = None,
         use_fp4_indexer: bool = False,
@@ -4367,6 +4368,7 @@ class HybridLinearKVPool(KVCache):
                 tail_extra_slots=tail_extra_slots,
                 max_running_requests=max_running_requests,
                 skip_topk_layers=skip_topk_layers,
+                dcp_replicated=dcp_replicated,
                 kv_scale_ue8m0=kv_scale_ue8m0,
                 fp8_cast_on_write=fp8_cast_on_write,
                 **hisparse_kwargs,

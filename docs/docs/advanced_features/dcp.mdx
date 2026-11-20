@@ -178,10 +178,10 @@ DeepSeek Sparse Attention attends over a top-k slice of the context, so DCP keep
 
 1. The index-K cache is addressed by the widened virtual slot and costs `c` times its usual share of each rank's KV budget (about 6% at DCP2 and 17% at DCP4 on GLM-5.3).
 2. Each layer maps the global top-k to rank-local rows with one Triton kernel; layers that share the previous layer's top-k reuse the mapping.
-3. The TRT-LLM sparse kernel returns the per-head LSE and the usual DCP merge combines the partial outputs.
+3. Each sparse attention kernel returns the per-head log-sum-exp so DCP can combine partial outputs across ranks.
 4. The MTP draft (nextn) layer keeps a replicated KV cache over the widened slots and attends without the DCP group, so MTP index share feeds the draft directly.
 
-Requirements: CUDA SM100/SM103 with the `trtllm` DSA backends (selected automatically), an `fp8_e4m3` or `bf16` KV cache, `attn_tp_size % dcp_size == 0`, and, with speculative decoding, the checkpoint's own MTP draft as a single EAGLE chain (`--speculative-eagle-topk 1`, draft tokens equal to steps + 1). HiSparse, prefill CP, HiCache, PD disaggregation, unified memory and `index_kpool > 1` are not supported in this combination.
+The TRT-LLM path requires CUDA SM100/SM103 with the `trtllm` DSA backends (selected automatically), an `fp8_e4m3` or `bf16` KV cache, `attn_tp_size % dcp_size == 0`, and, with speculative decoding, the checkpoint's own MTP draft as a single EAGLE chain (`--speculative-eagle-topk 1`, draft tokens equal to steps + 1). HiSparse, prefill CP, HiCache, PD disaggregation, unified memory and `index_kpool > 1` are not supported in this combination.
 
 ```bash Command
 sglang serve \
@@ -194,6 +194,8 @@ sglang serve \
   --speculative-eagle-topk 1 \
   --speculative-num-draft-tokens 6
 ```
+
+On Hopper (SM90), DSA DCP selects Triton for prefill and decode with a BF16 KV cache. For a pooled-index model such as GLM-5.3-Flash, the index keys and unfinished pool stay replicated across ranks. Rank 0 broadcasts the selected token indices before each rank attends to its local KV rows.
 
 ## References
 
