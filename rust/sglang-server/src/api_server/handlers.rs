@@ -15,6 +15,8 @@ mod parsers;
 #[cfg(test)]
 mod test_utils;
 mod tokenize;
+#[cfg(test)]
+mod weight_update_relay_tests;
 mod weights;
 
 pub(crate) use control::{DumperOutcome, ProfileOutcome};
