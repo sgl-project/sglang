@@ -98,6 +98,39 @@ class FluxArchConfig(DiTArchConfig):
             r"^(.*)\.smooth$": r"\1.smooth_factor",
             r"^(.*)\.lora_down$": r"\1.proj_down",
             r"^(.*)\.lora_up$": r"\1.proj_up",
+            # Split Q/K/V LoRA weights stacked into the fused QKV layers (FP4/FP8
+            # fused-QKV and nunchaku builds). LoRA loading keeps the split name
+            # when the DiT has separate to_q/to_k/to_v layers.
+            r"^(transformer_blocks\.\d+\.attn)\.to_q\.(lora_A|lora_B|alpha)$": (
+                r"\1.to_qkv.\2",
+                0,
+                3,
+            ),
+            r"^(transformer_blocks\.\d+\.attn)\.to_k\.(lora_A|lora_B|alpha)$": (
+                r"\1.to_qkv.\2",
+                1,
+                3,
+            ),
+            r"^(transformer_blocks\.\d+\.attn)\.to_v\.(lora_A|lora_B|alpha)$": (
+                r"\1.to_qkv.\2",
+                2,
+                3,
+            ),
+            r"^(transformer_blocks\.\d+\.attn)\.add_q_proj\.(lora_A|lora_B|alpha)$": (
+                r"\1.to_added_qkv.\2",
+                0,
+                3,
+            ),
+            r"^(transformer_blocks\.\d+\.attn)\.add_k_proj\.(lora_A|lora_B|alpha)$": (
+                r"\1.to_added_qkv.\2",
+                1,
+                3,
+            ),
+            r"^(transformer_blocks\.\d+\.attn)\.add_v_proj\.(lora_A|lora_B|alpha)$": (
+                r"\1.to_added_qkv.\2",
+                2,
+                3,
+            ),
         }
     )
 
