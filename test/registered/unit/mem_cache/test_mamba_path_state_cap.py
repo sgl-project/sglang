@@ -283,10 +283,12 @@ class TestMambaPathStateCap(unittest.TestCase):
                     self.assertIsNotNone(both.host_value)
 
     def test_host_counting_is_opt_in_and_needs_a_cap_and_a_cache_mode_host_tier(self):
-        for name, host_mode, env, enabled in (
-            ("default", "cache", None, False),
-            ("opted_in", "cache", True, True),
-            ("buffer_only", "buffer_only", True, False),
+        for name, host_mode, env, cap, host_pool, enabled in (
+            ("default", "cache", None, 1, object(), False),
+            ("opted_in", "cache", True, 1, object(), True),
+            ("buffer_only", "buffer_only", True, 1, object(), False),
+            ("no_cap", "cache", True, -1, object(), False),
+            ("no_mamba_host_pool", "cache", True, 1, None, False),
         ):
             with (
                 self.subTest(name),
@@ -299,7 +301,7 @@ class TestMambaPathStateCap(unittest.TestCase):
                 cache = SimpleNamespace(
                     components={
                         ComponentType.MAMBA: SimpleNamespace(
-                            mamba_max_states_per_path=1, _mamba_pool_host=object()
+                            mamba_max_states_per_path=cap, _mamba_pool_host=host_pool
                         )
                     },
                     host_memory_mode=host_mode,
