@@ -7,16 +7,15 @@ from sglang.test.sgl_eval_utils import run_sgl_eval
 
 class TestMMLU:
     mmlu_num_examples = 128
+    accuracy_mmlu: float
 
     def test_mmlu(self):
-        accuracy_mmlu_threshold = getattr(self, "accuracy_mmlu", 0.00)
-
         model_metrics = {
             "server": getattr(
                 self, "server_cmd", subprocess.list2cmdline(map(str, self.other_args))
             ),
             "client": "sgl-eval",
-            "accuracy_threshold": getattr(self, "accuracy_mmlu", "N/A"),
+            "accuracy_threshold": self.accuracy_mmlu,
         }
 
         try:
@@ -32,7 +31,7 @@ class TestMMLU:
             model_metrics["accuracy"] = metrics["score"]
             model_metrics["latency"] = metrics.get("latency", "-")
             model_metrics["output_throughput"] = metrics.get("output_throughput", "-")
-            self.assertGreater(metrics["score"], accuracy_mmlu_threshold)
+            self.assertGreater(metrics["score"], self.accuracy_mmlu)
         except Exception as e:
             model_metrics["error"] = e
             self.fail(f"Test failed for {self.model}: {e}")
