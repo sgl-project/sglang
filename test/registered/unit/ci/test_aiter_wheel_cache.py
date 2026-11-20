@@ -6,6 +6,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import yaml
+
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -100,6 +102,23 @@ class TestAiterWheelCache(CustomTestCase):
                     key="key",
                 )
             self.assertFalse(root.exists())
+
+    def test_jobs_that_run_from_the_aiter_checkout_skip_the_cache(self):
+        """A cache hit deletes /sgl-workspace/aiter, so a job that runs from it must opt out."""
+        checked = 0
+        for workflow in sorted((ROOT / ".github/workflows").glob("*.yml")):
+            jobs = yaml.safe_load(workflow.read_text()).get("jobs") or {}
+            for name, job in jobs.items():
+                runs = [str(step.get("run", "")) for step in job.get("steps", [])]
+                if not any("/sgl-workspace/aiter" in run for run in runs):
+                    continue
+                checked += 1
+                for line in "\n".join(runs).splitlines():
+                    if "amd_ci_install_dependency.sh" in line:
+                        self.assertIn(
+                            "--skip-aiter-cache", line, f"{workflow.name}:{name}"
+                        )
+        self.assertGreater(checked, 0)
 
 
 if __name__ == "__main__":

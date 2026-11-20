@@ -1391,7 +1391,8 @@ jobs:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
-        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
+        # The RMSNorm pre-check below runs from the AITER checkout, which a wheel-cache hit removes.
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-cache
 
       - name: Verify NIXL in Container
         run: |

@@ -8,10 +8,12 @@ GPU_ARCH="mi30x"   # default
 SKIP_TT_DEPS=""
 SKIP_SGLANG_BUILD=""
 SKIP_AITER_BUILD=""
+SKIP_AITER_CACHE=""
 
 while [[ $# -gt 0 ]]; do
   case $1 in
     --skip-aiter-build) SKIP_AITER_BUILD="1"; shift;;
+    --skip-aiter-cache) SKIP_AITER_CACHE="1"; shift;;
     --skip-sglang-build) SKIP_SGLANG_BUILD="1"; shift;;
     --skip-test-time-deps) SKIP_TT_DEPS="1"; shift;;
     -h|--help)
@@ -19,6 +21,7 @@ while [[ $# -gt 0 ]]; do
       echo "Options:"
       echo "  --skip-sglang-build         Don't build checkout sglang, use what was shipped with the image"
       echo "  --skip-aiter-build          Don't build aiter, use what was shipped with the image"
+      echo "  --skip-aiter-cache          Rebuild AITER from source; keep /sgl-workspace/aiter (jobs that run its op_tests)"
       echo "  --skip-test-time-deps       Don't build miscellaneous dependencies"
       exit 0
       ;;
@@ -441,7 +444,7 @@ AITER_CACHE_KEY=""
 AITER_CACHE_LOCK=""
 AITER_CACHE_ROOT=/sgl-data/aiter-wheels
 AITER_CACHE_TOOL=/sglang-checkout/scripts/ci/amd/aiter_wheel_cache.py
-if [[ "${NEED_REBUILD}" == "true" && -z "${AITER_COMMIT_OVERRIDE:-}" ]]; then
+if [[ "${NEED_REBUILD}" == "true" && -z "${AITER_COMMIT_OVERRIDE:-}" && -z "${SKIP_AITER_CACHE}" ]]; then
     AITER_IMAGE=$(docker inspect --format '{{.Image}}' "$CI_CONTAINER_NAME" 2>/dev/null || true)
     AITER_CACHE_HOST=$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/sgl-data"}}{{.Source}}{{end}}{{end}}' "$CI_CONTAINER_NAME" 2>/dev/null || true)
     AITER_NAMESPACE="${GITHUB_EVENT_NAME:-local}:${GITHUB_REF:-local}"
