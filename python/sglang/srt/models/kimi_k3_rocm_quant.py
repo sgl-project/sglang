@@ -206,10 +206,10 @@ def k3_kda_inproj_fp8_f_b(
     """f_b on f_a, a row slice of the merged Quark FP8 in-proj output: AITER's tuned
     GEMM reads it in place on gfx95x, the tiny GEMM runs it elsewhere."""
     if _is_gfx95:
-        return kda_f_b_gemm_hip(f_a, f_b_weight)
+        return kda_f_b_gemm_hip(f_a=f_a, f_b_weight=f_b_weight)
     from sglang.kernels.ops.gemm import kimi_k3_tiny_gemm
 
-    return kimi_k3_tiny_gemm(f_a, f_b_weight)
+    return kimi_k3_tiny_gemm(x=f_a, w=f_b_weight)
 
 
 def k3_merge_kda_inproj_fp8(
@@ -264,7 +264,9 @@ def k3_merge_kda_inproj_fp8(
     scale[fa_end:b_end].copy_(b_proj.weight_scale.data.reshape(-1))
     scale[b_end:].fill_(1.0)
     sizes = [*qkvg_sizes, n_fa, n_b, tail - n_fa - n_b]
-    f_b = _k3_channel_fp8_to_bf16(f_b_proj, f_b_proj.weight.data).contiguous()
+    f_b = _k3_channel_fp8_to_bf16(
+        module=f_b_proj, weight=f_b_proj.weight.data
+    ).contiguous()
     return sizes, f_b
 
 
