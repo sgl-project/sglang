@@ -1,0 +1,54 @@
+---
+title: "Last-layer FFN Pruning"
+metatags:
+    description: "Skip unused final-layer FFN rows during ordinary next-token prefill."
+---
+
+For ordinary next-token generation, only the hidden state at each request's last new token is needed after the final decoder layer. This path computes that layer's FFN and final normalization on those rows. Attention and every KV-cache write still run for the full prefill. Model weights are unchanged.
+
+There is no environment variable or server flag. A supported model uses the pruned path when the architecture, runtime, and input shape all match. Every other request keeps the original computation.
+
+Reduced-precision GEMM rounding can change when the number of rows changes. The requested outputs follow the same mathematical expression. Results are not guaranteed to be bitwise identical.
+
+## Architectures
+
+The gate is the model implementation, not a single checkpoint:
+
+| Implementation | `model_type` | What is included | Verified checkpoint | Minimum new tokens |
+|---|---|---|---|---:|
+| `Qwen2ForCausalLM` | `qwen2` | Qwen2 and Qwen2.5 dense models | Qwen2.5-7B-Instruct | 512 |
+| `Qwen3ForCausalLM` | `qwen3` | Qwen3 dense models | Qwen3-4B | 512 |
+| `LlamaForCausalLM` | `llama` | The Llama architecture. This includes Llama 2, Llama 3, and any other checkpoint that uses this class. It does not select Llama 3 only. | Llama-3.2-1B-Instruct | 2048 |
+
+The token minimum is the smallest newly extended total whose paired prefill-latency savings stayed positive on that verified checkpoint. It is then used for the whole architecture. A larger model of the same architecture uses the same code path. Its speed has not been measured separately.
+
+All of the following must also hold:
+
+- The model is not quantized.
+- The runtime is CUDA, with tensor, pipeline, and context parallel sizes of one, and DP attention off.
+- Prefill runs eagerly, or with the breakable prefill CUDA graph. Other prefill graph backends keep the original path.
+
+The principle is not limited to the architectures implemented here. In theory, the only case where it cannot be used is an application that needs the final layer's logits at every token position.
+
+## Input shape
+
+The token count is the number of newly extended prefill positions in the batch. Cached prefix tokens are not included. The batch must contain at most four requests, and the total must reach the architecture minimum above.
+
+With the breakable prefill CUDA graph, pruned variants are captured only for measured token buckets:
+
+- Qwen2: 512, 2048, 4096, 8192, and 16384, when that bucket is already in the server's capture list.
+- Qwen3: 512, 2048, 4096, and 8192.
+- Llama: 2048 and 8192.
+
+Each captured bucket has variants for one and four selected rows. A length that only rounds up to some other bucket uses the ordinary graph, even when its token count is above the minimum. Eager prefill uses the token minimum directly and does not require one of these buckets.
+
+## Original path
+
+These requests keep the full final-layer FFN:
+
+- Quantized weights, more than one GPU, DP attention, or a prefill graph backend other than eager or breakable.
+- Two-batch overlap.
+- Prompt logprobs, returned hidden states, embeddings, speculative decoding, LoRA, or multimodal inputs.
+- An intermediate chunk of chunked prefill. The final chunk can be pruned. Selection uses only the new rows, and cached KV is left unchanged.
+- A batch larger than four requests, or a newly extended total below that architecture's minimum.
+- A batch whose new rows do not outnumber the requests, so there is no unused final-layer row to skip.

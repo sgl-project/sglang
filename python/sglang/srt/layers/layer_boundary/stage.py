@@ -192,6 +192,17 @@ class StageBoundary:
             Compute input in the selected read's format (possibly quantized).
             Updates forward_batch.residual_stream with the resulting residual.
         """
+        if (
+            self.kind is StageKind.FFN
+            and self.declaration.terminal
+            and getattr(forward_batch, "last_layer_ffn_indices", None) is not None
+        ):
+            from sglang.srt.layers.last_layer_ffn import select_attention_rows
+
+            hidden_states = select_attention_rows(
+                hidden_states, forward_batch, forward_batch.last_layer_ffn_indices
+            )
+            forward_batch.last_layer_ffn_pruned = True
         if cache is not None:
             call["cache"] = cache
         prepare = (

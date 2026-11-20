@@ -9,6 +9,10 @@ from sglang.kernels.ops.attention.qk_norm_rope import qk_norm_rope
 from sglang.kernels.ops.attention.table_qk_norm_rope import table_qk_norm_rope_
 from sglang.srt.environ import envs
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
+from sglang.srt.layers.last_layer_ffn import (
+    configure_last_layer_ffn,
+    prepare_last_layer_ffn,
+)
 from sglang.srt.layers.layer_boundary import (
     NORM_QUANT_READOUT,
     append_stages,
@@ -634,13 +638,15 @@ class Qwen3DecoderLayer(nn.Module):
         linears = (self.self_attn.qkv_proj, self.mlp.gate_up_proj)
         if self._decode_quant_formats is None:
             self._decode_quant_formats = tuple(
-                "fp8"
-                if _use_aiter
-                and _is_gfx95
-                and aiter_takes_fp8_group_input(linear)
-                # The GEMM returns bf16 for a pre-quantized input.
-                and linear.params_dtype == torch.bfloat16
-                else ""
+                (
+                    "fp8"
+                    if _use_aiter
+                    and _is_gfx95
+                    and aiter_takes_fp8_group_input(linear)
+                    # The GEMM returns bf16 for a pre-quantized input.
+                    and linear.params_dtype == torch.bfloat16
+                    else ""
+                )
                 for linear in linears
             )
         if not any(self._decode_quant_formats) or not fp8_group_quant_fusion_allowed():
@@ -760,9 +766,9 @@ class Qwen3Model(Qwen2Model):
                 positions,
                 hidden_states,
                 forward_batch,
-                capture_output=aux_hidden_states.capture
-                if i in self.layers_to_capture
-                else None,
+                capture_output=(
+                    aux_hidden_states.capture if i in self.layers_to_capture else None
+                ),
             )
         if not self.pp_group.is_last_rank:
             return residual_batch.to_pp(hidden_states, forward_batch)
@@ -829,6 +835,13 @@ class Qwen3ForCausalLM(nn.Module):
 
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
+        configure_last_layer_ffn(
+            self,
+            supported_architecture=type(self) is Qwen3ForCausalLM
+            and config.model_type == "qwen3",
+            quant_config=quant_config,
+            model_type=config.model_type,
+        )
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.get_input_embeddings()
@@ -843,6 +856,9 @@ class Qwen3ForCausalLM(nn.Module):
         get_embedding: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
+        graph_rows = prepare_last_layer_ffn(
+            self, forward_batch, get_embedding=get_embedding, input_embeds=input_embeds
+        )
         hidden_states = self.model(
             input_ids,
             positions,
@@ -851,6 +867,8 @@ class Qwen3ForCausalLM(nn.Module):
             pp_proxy_tensors=pp_proxy_tensors,
         )
 
+        if graph_rows:
+            hidden_states = hidden_states[: forward_batch.batch_size]
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
@@ -863,6 +881,7 @@ class Qwen3ForCausalLM(nn.Module):
                     self.lm_head,
                     forward_batch,
                     aux_hidden_states,
+                    last_layer_ffn_pruned=forward_batch.last_layer_ffn_pruned,
                 )
             else:
                 return self.pooler(hidden_states, forward_batch)

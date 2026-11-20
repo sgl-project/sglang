@@ -59,6 +59,32 @@ def _filter(batch: ForwardBatch, *, lo: int, hi: int) -> ForwardBatch:
 
 
 class TestTboFilterBatchMarker(CustomTestCase):
+    def test_filter_batch_resets_last_layer_ffn_state(self):
+        # Defaults False/0 must be handled even with pruning disabled. Stale
+        # parent indices must never be inherited by either child layout.
+        for populated in (False, True):
+            with self.subTest(populated=populated):
+                parent = _make_target_verify_batch(4)
+                parent.forward_mode = ForwardMode.EXTEND
+                parent.extend_num_tokens = 4
+                if populated:
+                    parent.last_layer_ffn_indices = torch.tensor([1, 3])
+                    parent.last_layer_ffn_pruned = True
+                    parent.last_layer_ffn_graph_rows = 4
+                indices = parent.last_layer_ffn_indices
+                for lo, hi in ((0, 2), (2, 4)):
+                    child = _filter(parent, lo=lo, hi=hi)
+                    self.assertEqual(child.batch_size, 2)
+                    self.assertIsNone(child.last_layer_ffn_indices)
+                    self.assertFalse(child.last_layer_ffn_pruned)
+                    self.assertEqual(child.last_layer_ffn_graph_rows, 0)
+                    self.assertEqual(child.tbo_parent_token_range, (lo, hi))
+                self.assertIs(parent.last_layer_ffn_indices, indices)
+                self.assertEqual(parent.last_layer_ffn_pruned, populated)
+                self.assertEqual(
+                    parent.last_layer_ffn_graph_rows, 4 if populated else 0
+                )
+
     def test_filter_batch_slices_extend_completion_per_request(self):
         parent = _make_target_verify_batch(4)
         parent.forward_mode = ForwardMode.EXTEND
