@@ -157,12 +157,13 @@ def make_engine(
     vocab_size: int,
     device: str,
 ) -> SynthIDEngine:
+    watermark = SynthIDWatermark(_synthid_config(features), max_num_reqs, device)
     return SynthIDEngine(
-        SynthIDWatermark(_synthid_config(features), max_num_reqs, device),
+        watermark,
         # At TP > 1 the stock sampler all-reduces token ids under
         # SGLANG_SYNC_TOKEN_IDS_ACROSS_TP or with grammars; the fused sample
         # bypasses the stock sampler.
-        allow_fused_sample=get_parallel().tp_size == 1,
+        allow_fused_sample=get_parallel().tp_size == 1 and watermark.can_fuse_sample(),
     )
 
 
@@ -213,7 +214,7 @@ class SynthIDEngine:
         accept_tokens: torch.Tensor,
         accept_lens: torch.Tensor,
     ) -> None:
-        self.watermark.commit(
+        self.watermark.state.commit(
             rows.take(req_pool_indices),
             rows.take(accept_tokens),
             rows.take(accept_lens),
@@ -292,13 +293,13 @@ class SynthIDSample:
         if forward_batch.watermark_seed is not None:
             seed_rows, replay_token_ids = forward_batch.watermark_seed
             seed_rows = torch.tensor(seed_rows, device=req_pool_indices.device)
-            self.watermark.seed(req_pool_indices[seed_rows], replay_token_ids)
+            self.watermark.state.seed(req_pool_indices[seed_rows], replay_token_ids)
         slots = rows.take(req_pool_indices)
         temperatures = rows.take(sampling_info.temperatures)
         # The stock sampler sanitizes too, but after the candidate top-k here.
         sanitize_nan_logits(logits, "watermark: next_token_logits")
 
-        if self._can_fuse(logits, keep_logits):
+        if self._can_fuse(keep_logits):
             return SampleStep(
                 sampling_info=sampling_info,
                 logprob_logits=None,
@@ -318,11 +319,11 @@ class SynthIDSample:
 
     def commit(self, token_ids: torch.Tensor) -> None:
         req_pool_indices = self.forward_batch.req_pool_indices[: token_ids.shape[0]]
-        self.watermark.commit(
+        self.watermark.state.commit(
             self.rows.take(req_pool_indices), self.rows.take(token_ids)
         )
 
-    def _can_fuse(self, logits: torch.Tensor, keep_logits: bool) -> bool:
+    def _can_fuse(self, keep_logits: bool) -> bool:
         sampling_info = self.forward_batch.sampling_info
         return (
             self.allow_fused_sample
@@ -333,7 +334,6 @@ class SynthIDSample:
             and not sampling_info.need_min_p_sampling
             and sampling_info.sampling_seed is None
             and sampling_info.sampling_mask_batch_indices is None
-            and self.watermark.can_fuse_sample(logits)
         )
 
 

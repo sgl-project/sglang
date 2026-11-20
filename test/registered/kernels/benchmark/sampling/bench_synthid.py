@@ -26,7 +26,7 @@ def benchmark_stochastic(batch_size: int, provider: str):
     config = SynthIDConfig(keys=SYNTHID_TEST_KEYS, num_candidates=1024)
     watermark = SynthIDWatermark(config, max(BATCH_SIZES), "cuda")
     slots = torch.arange(batch_size, device="cuda")
-    watermark.seed(slots, [[] for _ in range(batch_size)])
+    watermark.state.seed(slots, [[] for _ in range(batch_size)])
     logits = torch.randn(batch_size, VOCAB_SIZE, dtype=torch.float32, device="cuda")
     temperatures = torch.ones((batch_size, 1), dtype=torch.float32, device="cuda")
 
@@ -38,13 +38,13 @@ def benchmark_stochastic(batch_size: int, provider: str):
             probs = torch.softmax(watermarked / temperatures, dim=-1)
             noise = torch.empty_like(probs).exponential_(1.0)
             token_ids = (probs / noise).argmax(dim=-1)
-            watermark.commit(slots, token_ids)
+            watermark.state.commit(slots, token_ids)
 
     elif provider == "fused":
 
         def fn():
             token_ids = watermark.sample(logits, temperatures, slots)
-            watermark.commit(slots, token_ids)
+            watermark.state.commit(slots, token_ids)
 
     else:
         raise ValueError(f"Unknown provider: {provider}")

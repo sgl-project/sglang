@@ -33,7 +33,7 @@ def _watermark(device, *, num_candidates=40, skip_first=False):
     slots = torch.tensor([1, 5], device=device)
     # Slot 5 replays two periods of a cycle as long as the context, so its next
     # context is already in its history and its first row is not watermarked.
-    watermark.seed(slots, [[11, 12], [21, 22, 23, 24] * 2])
+    watermark.state.seed(slots, [[11, 12], [21, 22, 23, 24] * 2])
     return watermark, slots
 
 
@@ -109,7 +109,7 @@ class TestSynthIDKernels(CustomTestCase):
                 )
                 self.assertEqual(sampled.cpu().tolist(), expected_tokens.tolist())
                 assert_synthid_state_equal(
-                    synthid_state(actual), synthid_state(reference)
+                    synthid_state(actual.state), synthid_state(reference.state)
                 )
 
     def test_projection_transforms_and_commit_match_cpu(self):
@@ -127,14 +127,15 @@ class TestSynthIDKernels(CustomTestCase):
                             ),
                             (torch.tensor([[104, 105], [203, 204]]), None),
                         ):
-                            reference.commit(slots, tokens, lengths)
-                            actual.commit(
+                            reference.state.commit(slots, tokens, lengths)
+                            actual.state.commit(
                                 gpu_slots,
                                 tokens.cuda(),
                                 None if lengths is None else lengths.cuda(),
                             )
                             assert_synthid_state_equal(
-                                synthid_state(actual), synthid_state(reference)
+                                synthid_state(actual.state),
+                                synthid_state(reference.state),
                             )
                     else:
                         width = 3 if stage == "verify" else 1
@@ -165,7 +166,7 @@ class TestSynthIDKernels(CustomTestCase):
                             reference.apply(expected, temperatures, slots)
                             actual.apply(watermarked, temperatures.cuda(), gpu_slots)
                         assert_synthid_state_equal(
-                            synthid_state(actual), synthid_state(reference)
+                            synthid_state(actual.state), synthid_state(reference.state)
                         )
                         row_temperatures = temperatures.repeat_interleave(width, 0)
                         torch.testing.assert_close(

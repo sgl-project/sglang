@@ -505,6 +505,17 @@ def _synthid_commit_state_kernel(
     tl.store(num_calls_ptr + slot, num_calls)
 
 
+def _check_candidates(scores: torch.Tensor, token_ids: torch.Tensor) -> None:
+    if not scores.is_cuda:
+        raise ValueError("The Triton SynthID kernels require CUDA tensors.")
+    if scores.dtype != torch.float32:
+        raise ValueError(f"Scores must be float32, got {scores.dtype}.")
+    if scores.ndim != 2 or token_ids.shape != scores.shape:
+        raise ValueError("scores and token_ids must be matching 2D tensors.")
+    if scores.stride(1) != 1 or token_ids.stride(1) != 1:
+        raise ValueError("scores and token_ids must be contiguous by row.")
+
+
 def synthid_tournament_triton(
     scores: torch.Tensor,
     token_ids: torch.Tensor,
@@ -512,29 +523,20 @@ def synthid_tournament_triton(
     keys: torch.Tensor,
     apply_mask: torch.Tensor,
 ) -> torch.Tensor:
-    if not scores.is_cuda:
-        raise ValueError("The Triton SynthID backend requires CUDA tensors.")
-    if scores.dtype != torch.float32:
-        raise ValueError(f"Scores must be float32, got {scores.dtype}.")
-    if scores.ndim != 2 or token_ids.shape != scores.shape:
-        raise ValueError("scores and token_ids must be matching 2D tensors.")
-    if scores.stride(1) != 1 or token_ids.stride(1) != 1:
-        raise ValueError("scores and token_ids must be contiguous by row.")
+    _check_candidates(scores, token_ids)
     if context_hashes.shape != (scores.shape[0],):
         raise ValueError("context_hashes must have one value per score row.")
     if apply_mask.shape != (scores.shape[0],):
         raise ValueError("apply_mask must have one value per score row.")
 
     output = torch.empty_like(scores)
-    if scores.shape[0] == 0:
-        return output
     block_size = triton.next_power_of_2(scores.shape[1])
     if block_size > MAX_BLOCK_CANDIDATES:
         if keys.numel() > MAX_KEYS:
             raise ValueError(
                 f"The wide Triton SynthID path supports at most {MAX_KEYS} keys."
             )
-        g_bits = torch.empty_like(token_ids)
+        g_bits = torch.empty_like(token_ids, dtype=torch.int64)
         _synthid_wide_tournament_kernel[(scores.shape[0],)](
             scores,
             token_ids,
@@ -588,12 +590,7 @@ def synthid_sample_triton(
 ) -> torch.Tensor:
     """Sample each row from the SynthID law with exponential noise; the state is
     read, not committed."""
-    if not scores.is_cuda:
-        raise ValueError("The fused SynthID sampling path requires CUDA tensors.")
-    if scores.dtype != torch.float32:
-        raise ValueError(f"Scores must be float32, got {scores.dtype}.")
-    if scores.ndim != 2 or token_ids.shape != scores.shape:
-        raise ValueError("scores and token_ids must be matching 2D tensors.")
+    _check_candidates(scores, token_ids)
     if exponential_noise.shape != scores.shape:
         raise ValueError("exponential_noise must match scores.")
     if exponential_noise.dtype != torch.float32:
@@ -606,9 +603,6 @@ def synthid_sample_triton(
     output_token_ids = torch.empty(
         scores.shape[0], dtype=torch.int32, device=scores.device
     )
-    if scores.shape[0] == 0:
-        return output_token_ids
-
     candidate_block_size = triton.next_power_of_2(scores.shape[1])
     history_block_size = triton.next_power_of_2(context_history.shape[1])
     if candidate_block_size > MAX_BLOCK_CANDIDATES:

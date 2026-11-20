@@ -84,12 +84,11 @@ class SynthIDStatePool:
         cursor = 0
         num_calls = 0
         for token_id in token_ids:
-            call_number = num_calls + 1
-            if not config.skip_first_ngram_calls or call_number >= config.ngram_len:
+            if not config.skip_first_ngram_calls or num_calls + 1 >= config.ngram_len:
                 history[cursor] = hash_context(context, config.hash_iv)
                 cursor = (cursor + 1) % config.context_history_size
             context = context[1:] + [int(token_id)]
-            num_calls = call_number
+            num_calls += 1
         return context, history, cursor, num_calls
 
     def current(self, slots: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -237,7 +236,9 @@ class SynthIDStatePool:
             return num_calls + 1 >= self.config.ngram_len
         return torch.ones_like(num_calls, dtype=torch.bool)
 
-    def _hashes_and_mask(self, context, history, num_calls):
+    def _hashes_and_mask(
+        self, context: torch.Tensor, history: torch.Tensor, num_calls: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         context_hashes = hash_contexts(context, self.config.hash_iv)
         repeated = torch.any(history == context_hashes[:, None], dim=1)
         return context_hashes, self._eligible(num_calls) & ~repeated

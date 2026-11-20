@@ -51,7 +51,7 @@ class WatermarkServerConfig(msgspec.Struct, frozen=True, kw_only=True):
 
 
 _SHARED_CONFIG_FIELDS = ("default_enabled", "enforce_all")
-GUMBEL_CONFIG_FIELDS = (
+_GUMBEL_CONFIG_FIELDS = (
     "key",
     "key_b",
     "context_window",
@@ -65,8 +65,9 @@ SYNTHID_CONFIG_FIELDS = (
     "context_history_size",
     "skip_first_ngram_calls",
 )
+# The config fields of each --watermark-algorithm; its keys are the choices.
 ALGORITHM_CONFIG_FIELDS = {
-    "gumbel": frozenset((*_SHARED_CONFIG_FIELDS, *GUMBEL_CONFIG_FIELDS)),
+    "gumbel": frozenset((*_SHARED_CONFIG_FIELDS, *_GUMBEL_CONFIG_FIELDS)),
     "synthid": frozenset((*_SHARED_CONFIG_FIELDS, *SYNTHID_CONFIG_FIELDS)),
 }
 

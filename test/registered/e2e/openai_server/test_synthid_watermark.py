@@ -145,7 +145,7 @@ class TestSynthIDWatermark(SynthIDServerTest):
                 self.assertGreater(z_score, 4)
 
     def test_all_watermarked_batch(self):
-        # Every row watermarked and no request filter: the fused sample.
+        # Every row watermarked, with no request filter.
         enabled = [True] * 8
         self.assert_watermarked(self.generate(enabled, top_p=1.0), enabled)
 

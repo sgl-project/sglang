@@ -15,7 +15,7 @@ top_p=1 and min_p=0.
 
 from __future__ import annotations
 
-from typing import Callable, Optional, Sequence
+from typing import Callable, Optional
 
 import torch
 
@@ -41,19 +41,6 @@ class SynthIDWatermark:
         self.config = config
         self.keys = torch.tensor(config.keys, dtype=torch.int64, device=device)
         self.state = SynthIDStatePool(config, num_slots, device)
-
-    def seed(
-        self, slots: torch.Tensor, replay_token_ids: Sequence[Sequence[int]]
-    ) -> None:
-        self.state.seed(slots, replay_token_ids)
-
-    def commit(
-        self,
-        slots: torch.Tensor,
-        token_ids: torch.Tensor,
-        lengths: Optional[torch.Tensor] = None,
-    ) -> None:
-        self.state.commit(slots, token_ids, lengths)
 
     def apply(
         self,
@@ -110,11 +97,9 @@ class SynthIDWatermark:
             filter_probs,
         )
 
-    def can_fuse_sample(self, logits: torch.Tensor) -> bool:
+    def can_fuse_sample(self) -> bool:
         return (
-            self.state.use_triton
-            and logits.dtype == torch.float32
-            and self.config.num_candidates <= MAX_BLOCK_CANDIDATES
+            self.state.use_triton and self.config.num_candidates <= MAX_BLOCK_CANDIDATES
         )
 
     def sample(
@@ -128,7 +113,7 @@ class SynthIDWatermark:
         For a batch whose rows are all watermarked and have no request filters,
         logprob, or sampling-mask outputs. ``logits`` ``[B, V]`` float32 is read
         only; returns int32 token ids ``[B]``, which the caller commits with
-        ``commit``.
+        ``state.commit``.
         """
         from sglang.kernels.ops.sampling.synthid_triton import synthid_sample_triton
 

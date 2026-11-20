@@ -17,7 +17,6 @@ from sglang.srt.sampling.watermarking.synthid.state import SynthIDStatePool
 from sglang.srt.sampling.watermarking.synthid.watermark import SynthIDWatermark
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.synthid_utils import (
-    STATE_FIELDS,
     SYNTHID_TEST_KEYS,
     assert_synthid_state_equal,
     synthid_state,
@@ -63,6 +62,7 @@ def _reference_law(logits, temperatures, context_hashes, apply_mask, keys, cap, 
 
 class TestSynthIDAlgorithm(CustomTestCase):
     def test_hash_and_tournament_goldens(self):
+        # Goldens computed with google-deepmind/synthid-text@addb4a15.
         keys = torch.tensor([1, 2])
         hashes = hash_contexts(torch.tensor([[0, 0], [0, 2]]), compute_hash_iv([1, 2]))
         self.assertEqual(
@@ -142,12 +142,11 @@ class TestSynthIDStatePool(CustomTestCase):
             for token in tokens:
                 pool.commit(torch.tensor([1]), torch.tensor([token]))
             pool.seed(torch.tensor([2]), [tokens])
-            for name in STATE_FIELDS:
-                state = getattr(pool, name)
+            for name, state in synthid_state(pool).items():
                 self.assertEqual(state[2].tolist(), state[1].tolist(), name)
             pool.seed(torch.tensor([1]), [[]])
-            for name in STATE_FIELDS:
-                self.assertFalse(getattr(pool, name)[1].any(), name)
+            for name, state in synthid_state(pool).items():
+                self.assertFalse(state[1].any(), name)
 
 
 class TestSynthIDWatermark(CustomTestCase):
@@ -163,7 +162,7 @@ class TestSynthIDWatermark(CustomTestCase):
         )
         slots = torch.arange(1, len(self._REPLAY) + 1)
         watermark = SynthIDWatermark(config, len(self._REPLAY) + 1, "cpu")
-        watermark.seed(slots, self._REPLAY)
+        watermark.state.seed(slots, self._REPLAY)
         reference = SynthIDStatePool(config, len(self._REPLAY) + 1, "cpu")
         reference.seed(slots, self._REPLAY)
         return watermark, reference, slots
@@ -193,7 +192,7 @@ class TestSynthIDWatermark(CustomTestCase):
                 )
 
                 watermarked = logits.clone()
-                state = synthid_state(watermark)
+                state = synthid_state(watermark.state)
                 watermark.apply(
                     watermarked,
                     self._TEMPERATURES[on],
@@ -201,7 +200,7 @@ class TestSynthIDWatermark(CustomTestCase):
                     rows=rows,
                     filter_probs=filt,
                 )
-                assert_synthid_state_equal(synthid_state(watermark), state)
+                assert_synthid_state_equal(synthid_state(watermark.state), state)
                 probs = torch.softmax(watermarked / self._TEMPERATURES, dim=-1)
                 torch.testing.assert_close(probs[on], expected, rtol=0, atol=1e-6)
                 off = [row for row in range(4) if row not in on.tolist()]
@@ -231,7 +230,7 @@ class TestSynthIDWatermark(CustomTestCase):
                 )
 
                 watermarked = logits.clone()
-                state = synthid_state(watermark)
+                state = synthid_state(watermark.state)
                 watermark.apply_verify(
                     watermarked,
                     self._TEMPERATURES[on],
@@ -240,7 +239,7 @@ class TestSynthIDWatermark(CustomTestCase):
                     request_rows=request_rows,
                     filter_probs=filt,
                 )
-                assert_synthid_state_equal(synthid_state(watermark), state)
+                assert_synthid_state_equal(synthid_state(watermark.state), state)
                 probs = torch.softmax(watermarked / row_temperatures, dim=-1)
                 torch.testing.assert_close(probs[rows], expected, rtol=0, atol=1e-6)
                 off = [r for r in range(4 * width) if r not in rows.tolist()]

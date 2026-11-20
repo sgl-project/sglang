@@ -86,10 +86,29 @@ def _watermarks(num_slots=8):
     watermarks = []
     for _ in range(2):
         watermark = SynthIDWatermark(config, num_slots, "cpu")
-        watermark.seed(torch.arange(num_slots), [[] for _ in range(num_slots)])
-        watermark.commit(torch.arange(num_slots), torch.arange(num_slots) + 3)
+        watermark.state.seed(torch.arange(num_slots), [[] for _ in range(num_slots)])
+        watermark.state.commit(torch.arange(num_slots), torch.arange(num_slots) + 3)
         watermarks.append(watermark)
     return watermarks
+
+
+def _top_k_top_p(top_ks, top_ps):
+    """Each row's request top-k, then top-p, over its candidates, written out:
+    walk the candidates by descending probability and keep one while fewer than
+    top-k are kept and the mass kept before it is at most top-p."""
+
+    def filter_probs(probs):
+        kept = torch.zeros_like(probs)
+        for row, (top_k, top_p) in enumerate(zip(top_ks, top_ps, strict=True)):
+            mass = 0.0
+            for rank, index in enumerate(probs[row].argsort(descending=True)):
+                if rank >= top_k or mass > top_p:
+                    break
+                kept[row, index] = probs[row, index]
+                mass += probs[row, index].item()
+        return kept / kept.sum(dim=-1, keepdim=True)
+
+    return filter_probs
 
 
 class TestSynthIDConfig(CustomTestCase):
@@ -236,12 +255,12 @@ class TestSynthIDEngine(CustomTestCase):
         torch.testing.assert_close(step.logprob_logits, original, rtol=0, atol=0)
         torch.testing.assert_close(logits[[1, 3]], original[[1, 3]], rtol=0, atol=0)
         expected = original[[0, 2]].clone()
-        twin.seed(torch.tensor([4]), [[3, 5]])
+        twin.state.seed(torch.tensor([4]), [[3, 5]])
         twin.apply(
             expected,
             info.temperatures[[0, 2]],
             torch.tensor([6, 4]),
-            filter_probs=adapter._request_filter(info, rows),
+            filter_probs=_top_k_top_p([3, TOP_K_ALL], [0.9, 1.0]),
         )
         torch.testing.assert_close(logits[[0, 2]], expected, rtol=0, atol=0)
         # Row 0's request top-k ran before the tournament.
@@ -252,8 +271,10 @@ class TestSynthIDEngine(CustomTestCase):
         self.assertAlmostEqual(info.top_ps[0].item(), 0.9, places=6)
 
         sample.commit(torch.tensor([7, 8, 9, 10]))
-        twin.commit(torch.tensor([6, 4]), torch.tensor([7, 9]))
-        assert_synthid_state_equal(synthid_state(watermark), synthid_state(twin))
+        twin.state.commit(torch.tensor([6, 4]), torch.tensor([7, 9]))
+        assert_synthid_state_equal(
+            synthid_state(watermark.state), synthid_state(twin.state)
+        )
 
     def test_verify_watermarks_on_rows_and_appends_their_tokens(self):
         watermark, twin = _watermarks()
@@ -286,7 +307,7 @@ class TestSynthIDEngine(CustomTestCase):
             info.temperatures[1:],
             torch.tensor([3, 7]),
             draft_tokens[1:],
-            filter_probs=adapter._request_filter(info, rows, width=3),
+            filter_probs=_top_k_top_p([4] * 3 + [TOP_K_ALL] * 3, [1.0] * 6),
         )
         torch.testing.assert_close(verified[3:], expected, rtol=0, atol=0)
         self.assertLessEqual(int(torch.isfinite(verified[3:6]).sum(dim=1).max()), 4)
@@ -294,8 +315,10 @@ class TestSynthIDEngine(CustomTestCase):
         accept_tokens = torch.tensor([[1, 0, 0], [4, 5, 0], [10, 11, 12]])
         accept_lens = torch.tensor([1, 2, 3], dtype=torch.int32)
         engine.append_accept_tokens(rows, req_pool_indices, accept_tokens, accept_lens)
-        twin.commit(torch.tensor([3, 7]), accept_tokens[1:], accept_lens[1:])
-        assert_synthid_state_equal(synthid_state(watermark), synthid_state(twin))
+        twin.state.commit(torch.tensor([3, 7]), accept_tokens[1:], accept_lens[1:])
+        assert_synthid_state_equal(
+            synthid_state(watermark.state), synthid_state(twin.state)
+        )
 
 
 if __name__ == "__main__":

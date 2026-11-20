@@ -92,14 +92,14 @@ def check_watermark_server_args(server_args: Any) -> None:
         raise ValueError("--enable-watermark is not supported with SGLANG_RUST_SERVER")
     # Another algorithm's fields, set directly as server arguments; the config
     # loader refuses them in the file.
-    defaults = {
-        field.name: _field_default(field) for field in record_fields(type(server_args))
-    }
-    unread = [
+    allowed = ALGORITHM_CONFIG_FIELDS[cfg.watermark_algorithm]
+    others = sorted(
         f"watermark_{name}"
-        for name in sorted(set().union(*ALGORITHM_CONFIG_FIELDS.values()))
-        if name not in ALGORITHM_CONFIG_FIELDS[cfg.watermark_algorithm]
-        and getattr(cfg, f"watermark_{name}") != defaults[f"watermark_{name}"]
+        for name in set().union(*ALGORITHM_CONFIG_FIELDS.values()) - allowed
+    )
+    fields = {field.name: field for field in record_fields(type(server_args))}
+    unread = [
+        name for name in others if getattr(cfg, name) != _field_default(fields[name])
     ]
     if unread:
         raise ValueError(

@@ -5,22 +5,23 @@ from typing import TYPE_CHECKING
 import torch
 
 if TYPE_CHECKING:
-    from sglang.srt.sampling.watermarking.synthid.watermark import SynthIDWatermark
+    from sglang.srt.sampling.watermarking.synthid.state import SynthIDStatePool
 
 SYNTHID_TEST_KEYS = tuple(range(1, 31))
 
-STATE_FIELDS = ("context", "context_history", "history_cursor", "num_calls")
 
-
-def synthid_state(watermark: SynthIDWatermark) -> dict[str, torch.Tensor]:
+def synthid_state(pool: SynthIDStatePool) -> dict[str, torch.Tensor]:
+    """A CPU copy of every state tensor of the pool."""
     return {
-        name: getattr(watermark.state, name).to("cpu", copy=True)
-        for name in STATE_FIELDS
+        name: value.to("cpu", copy=True)
+        for name, value in vars(pool).items()
+        if isinstance(value, torch.Tensor)
     }
 
 
 def assert_synthid_state_equal(
     actual: dict[str, torch.Tensor], expected: dict[str, torch.Tensor]
 ) -> None:
-    for name in STATE_FIELDS:
-        assert torch.equal(actual[name], expected[name]), name
+    assert actual.keys() == expected.keys()
+    for name, value in expected.items():
+        assert torch.equal(actual[name], value), name
