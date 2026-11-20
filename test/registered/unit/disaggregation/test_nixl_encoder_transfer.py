@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 import msgspec
 import torch
+
 from sglang.srt.disaggregation.encoder import nixl
 from sglang.test.ci.ci_register import register_cpu_ci
 
