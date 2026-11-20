@@ -1,18 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Real-GPU coverage for PD disaggregation under ``--dp-aware``.
+"""PD disaggregation under ``--dp-aware``: a dp2 prefill and a dp2 decode.
 
-Topology, four cards: one prefill server with ``--dp-size 2`` and one decode
-server with ``--dp-size 2``, behind a router in PD mode with ``--dp-aware``.
-The router then picks the prefill rank (a cached prefix first, else the fewest
-in-flight requests) and the decode rank (the fewest in-flight requests), and
-sends each as ``X-Data-Parallel-Rank``; the engine's DP controller dispatches
-straight to that rank.
-
-Which rank served a request is read from each worker's own ``/metrics``: every
-scheduler labels ``sglang:num_requests_total`` with its ``dp_rank``, so a delta
-there is the engine's word, not the router's.
+The router picks the prefill rank (cached prefix, else fewest in flight) and the
+decode rank (fewest in flight) and pins each with ``X-Data-Parallel-Rank``. Which
+rank served a request is read from the engine's own ``/metrics`` ``dp_rank`` label.
 """
 
 from __future__ import annotations
@@ -39,11 +32,10 @@ MODEL_ID = "qwen3-0.6b"
 DP_SIZE = 2
 RANKS = frozenset(range(DP_SIZE))
 
-_METRIC_RE = re.compile(r"^(\w+)\{([^}]*)\}\s+(-?\d+(?:\.\d+)?)\s*$")
+_METRIC_RE = re.compile(r"^([\w:]+)\{([^}]*)\}\s+(-?\d+(?:\.\d+)?)\s*$")
 _LABEL_RE = re.compile(r'(\w+)="([^"]*)"')
 
-# What the engine's own PD CI fixture exports: mooncake's handshake port range
-# kept off the test ports, and the TP rank-consensus checker on.
+# Same env as the engine's PD CI fixture.
 _MOONCAKE_ENV = {
     "MC_TCP_ENABLE_CONNECTION_POOL": "true",
     "MC_MIN_RPC_PORT": "61000",
@@ -63,8 +55,7 @@ class Topology(NamedTuple):
 
 
 def _free_port_pair() -> int:
-    """A port ``p`` with ``p`` and ``p + 1`` both free: the engine publishes KV
-    events for rank ``r`` on ``base + r``."""
+    """Rank ``r`` publishes KV events on ``base + r``: a base with both free."""
     for _ in range(50):
         with socket.socket() as a:
             a.bind(("", 0))
@@ -79,13 +70,7 @@ def _free_port_pair() -> int:
 
 
 def _transfer_args(gpu_ids: list[int]) -> tuple[list[str], list[str]]:
-    """Mooncake transfer args for a server on ``gpu_ids`` and the env keys this
-    call exported for it.
-
-    Reuses the engine PD fixture's NIC discovery so the server pins the RDMA
-    devices next to its cards; without any, mooncake takes its TCP path.
-    """
-    # Lazy: the module imports sglang.test, which needs the engine installed.
+    """Mooncake args for a server on ``gpu_ids``, plus the env keys exported."""
     from sglang.test.server_fixtures import disaggregation_fixture as pd_fixture
 
     args = ["--disaggregation-transfer-backend", "mooncake"]
@@ -95,8 +80,7 @@ def _transfer_args(gpu_ids: list[int]) -> tuple[list[str], list[str]]:
     devices = model_pool.resolve_device_ids(gpu_ids)
     try:
         physical: list[int] | None = [int(d) for d in devices]
-    except ValueError:
-        # UUID-shaped allotment: let the fixture read CUDA_VISIBLE_DEVICES.
+    except ValueError:  # UUID allotment: the fixture reads CUDA_VISIBLE_DEVICES
         physical = None
     ib_devices = pd_fixture.get_rdma_devices_args(physical)
     exported = []
@@ -109,7 +93,7 @@ def _transfer_args(gpu_ids: list[int]) -> tuple[list[str], list[str]]:
 
 @pytest.fixture(scope="module")
 def topology(router_binary, gpu_allocator) -> Iterator[Topology]:  # noqa: ARG001
-    """2P + 2D as dp ranks: prefill on cards 0-1, decode on cards 2-3."""
+    """Prefill dp2 on cards 0-1, decode dp2 on cards 2-3."""
     gpus = gpu_allocator.acquire(2 * DP_SIZE)
     prefill_gpus, decode_gpus = gpus[:DP_SIZE], gpus[DP_SIZE:]
     spec = get_model_spec(MODEL_ID)
@@ -129,20 +113,14 @@ def topology(router_binary, gpu_allocator) -> Iterator[Topology]:  # noqa: ARG00
                 bootstrap_port=bootstrap_port,
                 enable_kv_events=True,
                 kv_events_port=_free_port_pair(),
-                # Distinct rendezvous ports: both sides picking one at random
-                # can collide at init_process_group.
-                extra_args=common
-                + prefill_transfer
-                + ["--nccl-port", str(model_pool._get_open_port())],
+                extra_args=common + prefill_transfer,
             ) as prefill,
             spawn_worker(
                 MODEL_ID,
                 gpu_ids=decode_gpus,
                 disagg_mode="decode",
                 bootstrap_port=bootstrap_port,
-                extra_args=common
-                + decode_transfer
-                + ["--nccl-port", str(model_pool._get_open_port())],
+                extra_args=common + decode_transfer,
             ) as decode,
             Router(proxy_request_timeout_secs=180) as router,
         ):
@@ -236,14 +214,12 @@ def _assert_completed(resp: httpx.Response, max_tokens: int) -> None:
     assert resp.status_code == 200, resp.text
     choice = resp.json()["choices"][0]
     assert choice["message"]["content"], f"empty content: {choice!r}"
-    # ignore_eos: decode ran the full budget, so the reply came through PD.
     assert choice["finish_reason"] == "length", choice
     assert resp.json()["usage"]["completion_tokens"] == max_tokens
 
 
 def _long_prompt(tag: str) -> str:
-    """A few hundred tokens that no other test shares, so the prefill ranks'
-    caches start cold for it."""
+    """A few hundred tokens unique to ``tag``, so prefill caches start cold."""
     body = " ".join(f"{tag}-{i}" for i in range(160))
     return f"Read this list and reply with its length: {body}"
 
@@ -255,8 +231,7 @@ def _long_prompt(tag: str) -> str:
 @pytest.mark.pd_mode
 @pytest.mark.slow
 def test_concurrent_requests_use_every_prefill_and_decode_rank(topology):
-    """Eight requests in flight at once: least-in-flight puts work on both
-    prefill ranks and both decode ranks, and every reply completes."""
+    """Eight in flight at once land on both prefill and both decode ranks."""
     topo = topology
     max_tokens = 48
     p0, d0 = _served(topo.prefill.url), _served(topo.decode.url)
@@ -291,8 +266,7 @@ def test_concurrent_requests_use_every_prefill_and_decode_rank(topology):
 @pytest.mark.pd_mode
 @pytest.mark.slow
 def test_repeated_prefix_sticks_to_the_prefill_rank_that_cached_it(topology):
-    """The first request lands on a rank by load; once that rank's KV events
-    reach the router, every repeat of the prompt goes back to it."""
+    """Once a rank's KV events reach the router, repeats of the prompt go to it."""
     topo = topology
     prompt = _long_prompt("affinity")
     before = _served(topo.prefill.url)
@@ -300,8 +274,7 @@ def test_repeated_prefix_sticks_to_the_prefill_rank_that_cached_it(topology):
     _assert_completed(_chat(topo, prompt, max_tokens=8), 8)
     owner = _only_rank(_delta(before, _served(topo.prefill.url)))
 
-    # The prompt is new to the tree, so its KV events can only grow it; a
-    # repeat sent before they land would be placed by load, not by cache.
+    # Before the KV events land a repeat would be placed by load, not by cache.
     deadline = time.time() + 60.0
     while _prefill_tree_blocks(topo.router.base_url, topo.prefill.url) <= blocks:
         assert time.time() < deadline, "router saw no KV events for the prompt"
@@ -312,8 +285,7 @@ def test_repeated_prefix_sticks_to_the_prefill_rank_that_cached_it(topology):
     for _ in range(repeats):
         _assert_completed(_chat(topo, prompt, max_tokens=8), 8)
     delta = _delta(before, _served(topo.prefill.url))
-    # By load alone a sequential repeat picks a rank at random, so eight in a
-    # row on the owner is a 1-in-256 accident; the cached prefix makes it certain.
+    # By load alone eight sequential repeats on one rank is a 1-in-256 accident.
     assert delta == {owner: repeats, 1 - owner: 0}, f"owner={owner} delta={delta}"
 
 
@@ -321,8 +293,7 @@ def test_repeated_prefix_sticks_to_the_prefill_rank_that_cached_it(topology):
 @pytest.mark.pd_mode
 @pytest.mark.slow
 def test_decode_rank_avoids_the_rank_holding_a_long_request(topology):
-    """While one decode rank streams a long reply, a new request goes to the
-    other rank: the decode rank follows the router's in-flight count."""
+    """While one decode rank streams a long reply, a new request goes to the other."""
     topo = topology
     long_tokens = 400
     chunks: list[str] = []

@@ -208,8 +208,7 @@ jobs:
   sgl-router-e2e:
     name: e2e
     needs: [sgl-router-test, sgl-router-build]
-    # Four cards: the PD dp-aware test runs a dp2 prefill and a dp2 decode.
-    runs-on: 4-gpu-h100
+    runs-on: 4-gpu-h100  # the PD dp-aware test holds a dp2 prefill and a dp2 decode
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -229,8 +228,6 @@ jobs:
         working-directory: sgl-router
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          # A smaller allotment would skip the multi-GPU tests and stay green.
-          SGL_ROUTER_E2E_MIN_GPUS: "4"
         run: |
           export SGL_ROUTER_BINARY="${SGLANG_TEST_PD_ROUTER_BINARY}"
           python3 -m pytest tests/e2e/ -v -s --tb=short \

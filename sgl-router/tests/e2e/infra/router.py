@@ -181,7 +181,7 @@ class Router:
         must have been launched with ``--disaggregation-mode`` and
         ``--disaggregation-bootstrap-port`` for the PD role to be
         picked up (see ``model_pool.spawn_worker``); modern SGLang is
-        assumed. ``extra_args`` are further router flags, e.g. ``--dp-aware``.
+        assumed.
         """
         self._launch(
             self._build_args(
