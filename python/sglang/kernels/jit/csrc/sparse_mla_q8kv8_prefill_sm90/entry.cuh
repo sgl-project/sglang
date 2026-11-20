@@ -52,6 +52,8 @@ _run_q8kv8_for_head_dim(SparseMlaQ8Kv8PrefillParams& params, bool have_topk_leng
 }
 
 static inline void _run_q8kv8(SparseMlaQ8Kv8PrefillParams& params, bool have_topk_length, bool have_attn_sink) {
+  // An empty batch has nothing to write; a zero-size grid would fail the launch check, which exits the process.
+  if (params.s_q == 0) return;
   switch (params.d_qk) {
     case 512:
       _run_q8kv8_for_head_dim<512>(params, have_topk_length, have_attn_sink);

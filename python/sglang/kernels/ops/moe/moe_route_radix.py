@@ -50,7 +50,7 @@ def _jit_route_radix_module() -> Module:
 
 def covered(scores: torch.Tensor, bias: torch.Tensor, topk: int) -> bool:
     """Specialized for K3 decode routing: [M, 896] bf16 or fp32
-    row-contiguous scores (8B/16B-aligned rows), fp32 bias, top-16."""
+    row-contiguous scores (8B/16B-aligned rows), 16B-aligned fp32 bias, top-16."""
     return (
         scores.dim() == 2
         and scores.size(1) == _NUM_EXPERTS
@@ -59,7 +59,9 @@ def covered(scores: torch.Tensor, bias: torch.Tensor, topk: int) -> bool:
         and bias.dtype == torch.float32
         and scores.stride(1) == 1
         and scores.stride(0) % 4 == 0
+        and scores.data_ptr() % (4 * scores.element_size()) == 0
         and bias.is_contiguous()
+        and bias.data_ptr() % 16 == 0
     )
 
 

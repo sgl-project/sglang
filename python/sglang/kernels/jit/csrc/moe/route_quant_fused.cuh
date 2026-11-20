@@ -85,35 +85,50 @@ struct RouteQuantFusedKernel {
     auto device = SymbolicDevice{};
     device.set_options<kDLGPU>();
 
+    // Each thread loads 4 scores (8 B bf16 / 16 B fp32) and 4 bias values (16 B).
+    constexpr auto kVecSize = LargeRouterRadixTrait::kVecSize;
+    const auto score_bytes = is_type<fp32_t>(scores.dtype()) ? sizeof(fp32_t) : sizeof(bf16_t);
     auto score_dtype = SymbolicDType{};
-    TensorMatcher({M_, N_})
+    TensorMatcher({M_, N_})  //
         .with_dtype<bf16_t, fp32_t>(score_dtype)
         .with_device(device)
         .with_strides({-1, 1})
+        .ensure_alignment(kVecSize * score_bytes)
         .verify(scores);
-    TensorMatcher({N_}).with_dtype<fp32_t>().with_device(device).verify(bias);
-    TensorMatcher({M_, K_}).with_dtype<fp32_t>().with_device(device).verify(out_w);
-    TensorMatcher({M_, K_}).with_dtype<int32_t>().with_device(device).verify(out_i);
-    TensorMatcher({M_, K_}).with_dtype<int32_t>().with_strides({-1, 1}).with_device(device).verify(out_packed);
+    TensorMatcher({N_})  //
+        .with_dtype<fp32_t>()
+        .with_device(device)
+        .ensure_alignment(kVecSize * sizeof(fp32_t))
+        .verify(bias);
+    TensorMatcher({M_, K_})  //
+        .with_dtype<fp32_t>()
+        .with_device(device)
+        .verify(out_w);
+    TensorMatcher({M_, K_})  //
+        .with_dtype<int32_t>()
+        .with_device(device)
+        .verify(out_i);
+    TensorMatcher({M_, K_})  //
+        .with_strides({-1, 1})
+        .with_dtype<int32_t>()
+        .with_device(device)
+        .verify(out_packed);
 
-    RuntimeCheck(
-        N_.unwrap() == kNumExperts_ && K_.unwrap() == kTopK_ && topk == kTopK_,
-        "route_quant_fused is specialized for N=896, K=16");
-    RuntimeCheck(scores.stride(0) % 4 == 0, "route_quant_fused: scores row stride must be a multiple of 4");
+    CHECK_HOST(N_.unwrap() == kNumExperts_ && K_.unwrap() == kTopK_ && topk == kTopK_)
+        << "route_quant_fused is specialized for N=896, K=16";
 
     // Quant half: shape/stride/alignment checks + byte-stride munging shared
     // with the standalone flat kernel.
     auto x_dtype = SymbolicDType{};
-    TensorMatcher({M_, -1}).with_dtype<bf16_t, fp32_t>(x_dtype).with_device(device).with_strides({-1, 1}).verify(x);
+    TensorMatcher({M_, kQuantHidden_})  //
+        .with_strides({-1, 1})
+        .with_dtype<bf16_t, fp32_t>(x_dtype)
+        .with_device(device)
+        .verify(x);
     const auto quant_params =
         x_dtype.is_type<fp32_t>()
             ? build_quant_context<RouteQuantTraitT<fp32_t>, /*kMasked=*/false>(x, out_q, out_s).params
             : build_quant_context<RouteQuantTraitT<bf16_t>, /*kMasked=*/false>(x, out_q, out_s).params;
-    RuntimeCheck(
-        quant_params.hidden_size == kQuantHidden_, "route_quant_fused is specialized for a 3584-wide activation row");
-    RuntimeCheck(
-        quant_params.num_tokens == static_cast<uint32_t>(M_.unwrap()),
-        "route_quant_fused: scores and activations must have the same token count");
 
     const auto M = static_cast<uint32_t>(M_.unwrap());
     if (M == 0) return;

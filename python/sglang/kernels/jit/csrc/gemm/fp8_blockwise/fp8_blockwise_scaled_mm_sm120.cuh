@@ -44,7 +44,7 @@ using namespace host;
 #define CUTLASS_CHECK(status)                                                        \
   {                                                                                  \
     cutlass::Status error = status;                                                  \
-    RuntimeCheck(error == cutlass::Status::kSuccess, cutlassGetStatusString(error)); \
+    CHECK_HOST(error == cutlass::Status::kSuccess) << cutlassGetStatusString(error); \
   }
 
 using namespace cute;
@@ -488,40 +488,54 @@ inline void fp8_blockwise_scaled_mm_sm120(
     tvm::ffi::TensorView mat_b,
     tvm::ffi::TensorView scales_a,
     tvm::ffi::TensorView scales_b) {
-  RuntimeCheck(mat_a.device().device_type == kDLCUDA, "mat_a must be a CUDA tensor");
-  RuntimeCheck(mat_b.device().device_type == kDLCUDA, "mat_b must be a CUDA tensor");
+  auto M = SymbolicSize{"M"};
+  auto N = SymbolicSize{"N"};
+  auto K = SymbolicSize{"K"};
+  auto device = SymbolicDevice{};
+  device.set_options<kDLCUDA>();
+  // The GEMM builds packed strides from (M, N, K): A and out are row-major, B column-major.
+  TensorMatcher({M, K})  //
+      .with_dtype<fp8_e4m3_t>()
+      .with_device(device)
+      .ensure_alignment(16)
+      .verify(mat_a);
+  TensorMatcher({K, N})  //
+      .with_strides({1, K})
+      .with_dtype<fp8_e4m3_t>()
+      .with_device(device)
+      .verify(mat_b);
+  TensorMatcher({M, N})  //
+      .with_dtype<bf16_t, fp16_t>()
+      .with_device(device)
+      .ensure_alignment(16)
+      .verify(out);
+  // ensure_alignment would also require mat_b's unit stride to be aligned, and it skips
+  // the row stride of a single-row mat_a / out; the TMA descriptors need all three.
+  CHECK_HOST(std::bit_cast<uintptr_t>(mat_b.data_ptr()) % 16 == 0) << "mat_b data pointer must be 16-byte aligned";
+  CHECK_HOST(K.unwrap() % 16 == 0) << "K must be a multiple of 16, got " << K.unwrap();
+  CHECK_HOST(N.unwrap() * static_cast<int64_t>(dtype_bytes(out.dtype())) % 16 == 0)
+      << "out rows must be a multiple of 16 bytes, got N = " << N.unwrap();
 
-  RuntimeCheck(mat_a.dim() == 2, "mat_a must be a 2D tensor");
-  RuntimeCheck(mat_b.dim() == 2, "mat_b must be a 2D tensor");
-  RuntimeCheck(mat_a.stride(1) == 1, "mat_a must be a row major tensor");
-  RuntimeCheck(mat_b.stride(0) == 1, "mat_b must be a column major tensor");
-  RuntimeCheck(mat_a.size(1) == mat_b.size(0), "mat_a and mat_b shapes cannot be multiplied");
+  // Scales are packed the way the CUTLASS scale layouts read them: scales_a M-major,
+  // scales_b K-major (production passes a transposed [K/128, M] buffer and weight_scale.T).
+  const auto num_k_blocks = K.unwrap() / 128;
+  TensorMatcher({M, num_k_blocks})  //
+      .with_strides({1, M})
+      .with_dtype<fp32_t>()
+      .with_device(device)
+      .verify(scales_a);
+  TensorMatcher({num_k_blocks, N.unwrap() / 128})  //
+      .with_strides({1, num_k_blocks})
+      .with_dtype<fp32_t>()
+      .with_device(device)
+      .verify(scales_b);
 
-  RuntimeCheck(
-      (mat_a.size(1) * (mat_a.dtype().bits / 8)) % 16 == 0, "mat_a must be multiple of 16 bytes for memory alignment");
-  RuntimeCheck(
-      (mat_b.size(0) * (mat_b.dtype().bits / 8)) % 16 == 0, "mat_b must be multiple of 16 bytes for memory alignment");
-  RuntimeCheck(host::is_type<fp8_e4m3_t>(mat_a.dtype()), "mat_a must be Float8_e4m3fn");
-  RuntimeCheck(host::is_type<fp8_e4m3_t>(mat_b.dtype()), "mat_b must be Float8_e4m3fn");
+  const cudaStream_t stream = LaunchKernel::resolve_device(device.unwrap());
 
-  RuntimeCheck(mat_a.size(0) == scales_a.size(0), "size of scales_a is not matched");
-  RuntimeCheck(mat_a.size(1) / 128 == scales_a.size(1), "size of scales_a is not matched");
-  RuntimeCheck(mat_b.size(0) / 128 == scales_b.size(0), "size of scales_b is not matched");
-  RuntimeCheck(mat_b.size(1) / 128 == scales_b.size(1), "size of scales_b is not matched");
-  RuntimeCheck(host::is_type<float>(scales_a.dtype()), "scales_a must be Float32");
-  RuntimeCheck(host::is_type<float>(scales_b.dtype()), "scales_b must be Float32");
-
-  RuntimeCheck(
-      (out.size(1) * (out.dtype().bits / 8)) % 16 == 0, "out must be multiple of 16 bytes for memory alignment");
-
-  const cudaStream_t stream = LaunchKernel::resolve_device(mat_a.device());
-
-  if (host::is_type<bf16_t>(out.dtype())) {
+  if (is_type<bf16_t>(out.dtype())) {
     sm120_fp8_blockwise_dispatch_shape<cutlass::bfloat16_t>(out, mat_a, mat_b, scales_a, scales_b, stream);
-  } else if (host::is_type<fp16_t>(out.dtype())) {
-    sm120_fp8_blockwise_dispatch_shape<cutlass::half_t>(out, mat_a, mat_b, scales_a, scales_b, stream);
   } else {
-    Panic("out_dtype must be Half or BFloat16");
+    sm120_fp8_blockwise_dispatch_shape<cutlass::half_t>(out, mat_a, mat_b, scales_a, scales_b, stream);
   }
 }
 

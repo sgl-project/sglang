@@ -777,7 +777,7 @@ struct SparseMlaQ8Kv8PrefillKernel {
       constexpr int NUM_ROWS_PER_GROUP = B_TOPK / NUM_GROUPS;
       int idx_in_group = idx_in_warpgroup % GROUP_SIZE;
       int group_idx = idx_in_warpgroup / GROUP_SIZE;
-      int* gIndices = params.indices + s_q_idx * params.stride_indices_s_q;
+      int* gIndices = params.indices + s_q_idx * int64_t(params.stride_indices_s_q);
 
       int tile_shift = idx_in_group / 4;
       int col_in_tile = (idx_in_group % 4) * 16;
