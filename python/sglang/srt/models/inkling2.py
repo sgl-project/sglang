@@ -8,6 +8,8 @@ from sglang.kernels.ops.activation.softcap import (
     softcap_inplace_logits as fused_softcap,
 )
 from sglang.srt.configs.inkling2 import Inkling2MMConfig, Inkling2ModelConfig
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStatePacker
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.inkling2 import Inkling2QuantConfig
@@ -283,7 +285,8 @@ class Inkling2CausalLLM(nn.Module):
         for i, layer in enumerate(self.layers):
             if captures is not None and i in self.layers_to_capture:
                 captures.append(state.partial.to(self.lm_head.weight.dtype))
-            layer(state, positions, forward_batch)
+            with get_global_expert_distribution_recorder().with_current_layer(i):
+                layer(state, positions, forward_batch)
         hidden = self.norm(state.compute_output())
         if captures is not None:
             captures.append(hidden.to(self.lm_head.weight.dtype))
@@ -294,6 +297,13 @@ class Inkling2CausalLLM(nn.Module):
 class Inkling2ForConditionalGeneration(nn.Module):
     fall_back_to_pt_during_load = False
     allow_patterns_overrides = ["model*.safetensors"]
+
+    @staticmethod
+    def get_model_config_for_expert_location(config):
+        return ModelConfigForExpertLocation(
+            num_layers=config.text_config.num_hidden_layers,
+            num_logical_experts=config.text_config.n_routed_experts,
+        )
 
     def __init__(self, config: Inkling2MMConfig, quant_config=None, prefix: str = ""):
         super().__init__()
