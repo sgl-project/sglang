@@ -120,8 +120,8 @@ def _clear_srt_world_group() -> None:
 def _init_srt_moe_ep_group():
     """SRT's MOE EP group for FusedMoE layers.
 
-    multimodal_gen has no expert parallelism: every rank keeps all experts
-    and TP shards the weights inside each expert (``_MOE_TP = _TP``). The EP
+    SRT FusedMoE layers in multimodal_gen keep all experts on every rank, and
+    TP shards the weights inside each expert (``_MOE_TP = _TP``). The EP
     group must therefore be single-rank (``moe_ep_size=1``); aliasing
     ``_MOE_EP`` to ``_TP`` would partition experts across ranks and break
     FusedMoE dispatch.

@@ -183,7 +183,13 @@ def _sanitize_filename(name: str, replacement: str = "_", max_length: int = 150)
     return ascii_name
 
 
-_SEQUENCE_SHARD_PIPELINE_FAMILIES = ("wan", "helios", "joy", "cosmos3")
+_SEQUENCE_SHARD_PIPELINE_FAMILIES = (
+    "wan",
+    "helios",
+    "joy",
+    "cosmos3",
+    "lingbotvideomoe",
+)
 
 
 def resolve_sequence_shard(

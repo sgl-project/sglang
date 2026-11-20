@@ -300,6 +300,8 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
             raise ValueError(f"Invalid module name: {component_name}")
         dit_config = getattr(server_args.pipeline_config, pipeline_dit_config_attr)
         dit_config.update_model_arch(config)
+        if hasattr(dit_config, "ep_size"):
+            dit_config.ep_size = component_server_args.ep_size
 
         cls_name = config.pop("_class_name")
         override_cls_name = server_args.pipeline_config.transformer_class_override
