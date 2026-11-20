@@ -640,6 +640,56 @@ class ServingCompletionTestCase(unittest.TestCase):
         )["spec_tokens_details"]
         self.assertIsInstance(single_details, dict)
 
+    def test_streaming_sends_one_response_id_across_choices(self):
+        """n>1 and batched prompts give each choice its own engine rid; every
+        streamed chunk, the usage chunk included, must still carry one id."""
+
+        async def mock_generate(*args, **kwargs):
+            stop = {"type": "stop", "matched": None}
+            for index, finish in ((0, None), (1, None), (1, stop), (0, stop)):
+                yield {
+                    "text": f"choice-{index}",
+                    "meta_info": {
+                        "id": f"rid-{index}",
+                        "prompt_tokens": 10,
+                        "completion_tokens": 2,
+                        "cached_tokens": 0,
+                        "finish_reason": finish,
+                    },
+                    "index": index,
+                }
+
+        self.sc.tokenizer_manager.generate_request = mock_generate
+        for prompt, n in (("Hi", 2), (["Hi", "Bye"], 1)):
+            with self.subTest(prompt=prompt, n=n):
+                req = CompletionRequest(
+                    model="x",
+                    prompt=prompt,
+                    max_tokens=10,
+                    n=n,
+                    stream=True,
+                    stream_options={"include_usage": True},
+                )
+                adapted_request, _ = self.sc._convert_to_internal_request(req)
+
+                async def run_stream():
+                    return [
+                        chunk
+                        async for chunk in self.sc._generate_completion_stream(
+                            adapted_request, req, self.fastapi_request
+                        )
+                    ]
+
+                parsed = [
+                    json.loads(chunk[len("data: ") :])
+                    for chunk in get_or_create_event_loop().run_until_complete(
+                        run_stream()
+                    )
+                    if chunk.startswith("data: ") and chunk.strip() != "data: [DONE]"
+                ]
+                self.assertTrue(any(not c["choices"] and c["usage"] for c in parsed))
+                self.assertEqual({c["id"] for c in parsed}, {"rid-0"})
+
     def test_streaming_cached_tokens_details_emits_sglext(self):
         """Test that streaming completion responses emit cached token details in sglext."""
 

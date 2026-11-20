@@ -833,6 +833,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 ).model_dump()
             for chunk in encoding_output.stream_chat_chunks(
                 content=content,
+                chunk_id=wire.response_id(content["meta_info"]["id"]),
                 index=index,
                 request=request,
                 created=created,

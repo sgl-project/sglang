@@ -5480,6 +5480,74 @@ class ServingChatTestCase(CustomTestCase):
             [[0, 1], [1, 1]],
         )
 
+    def test_streaming_parallel_sampling_sends_one_response_id(self):
+        """n>1 gives each choice its own engine rid; every streamed chunk,
+        the usage chunk included, must still carry one response id, on the
+        text path and on the token-output path of an encoding adapter."""
+        for spec in (None, "inkling"):
+            with self.subTest(spec=spec):
+                output_ids = []
+                if spec == "inkling":
+                    from sglang.srt.parser.inkling_renderer import (
+                        load_tml_renderers,
+                    )
+
+                    self._stream_inkling_output_in_two_chunks()
+                    tokenizer = load_tml_renderers().tokenizer
+                    output_ids = [
+                        tokenizer.encode_special("message_model"),
+                        tokenizer.encode_special("content_text"),
+                        *tokenizer.encode_ordinary("Hi"),
+                        tokenizer.encode_special("end_message"),
+                    ]
+                self.tm.generate_request.return_value = self._two_choice_events(
+                    output_ids
+                )
+                parsed = self._parse_chunks(self._run_chat_route_n2())
+                self.assertEqual(
+                    {c["choices"][0]["index"] for c in parsed if c["choices"]},
+                    {0, 1},
+                )
+                self.assertTrue(
+                    any(not c["choices"] and c.get("usage") for c in parsed)
+                )
+                self.assertEqual({c["id"] for c in parsed}, {"rid-0"})
+
+    @staticmethod
+    async def _two_choice_events(output_ids):
+        stop = {"type": "stop", "matched": None}
+        for index, finish in ((0, None), (1, None), (1, stop), (0, stop)):
+            count = len(output_ids) if finish else len(output_ids) - 1
+            yield {
+                "text": f"choice-{index}",
+                "output_ids": output_ids[: max(count, 0)],
+                "meta_info": {
+                    "id": f"rid-{index}",
+                    "prompt_tokens": 10,
+                    "completion_tokens": max(count, 0),
+                    "cached_tokens": 0,
+                    "finish_reason": finish,
+                },
+                "index": index,
+            }
+
+    def _run_chat_route_n2(self):
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            n=2,
+            stream=True,
+            stream_options={"include_usage": True},
+        )
+
+        async def run_route():
+            response = await self.chat._handle_streaming_request(
+                Mock(), req, self.fastapi_request
+            )
+            return [chunk async for chunk in response.body_iterator]
+
+        return get_or_create_event_loop().run_until_complete(run_route())
+
     def _collect_continuous_usage(self, cached_tokens):
         content = {
             "text": "Hello",
