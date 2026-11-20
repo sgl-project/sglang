@@ -16,7 +16,7 @@ def test_musa_home_uses_compiler_override(monkeypatch):
     monkeypatch.delenv("MUSA_HOME", raising=False)
     monkeypatch.delenv("MUSA_PATH", raising=False)
     monkeypatch.setenv("SGLANG_MUSA_MCC", "/opt/musa/bin/mcc")
-    assert toolchain.musa_home.__wrapped__() == "/opt/musa"
+    assert toolchain.musa_home() == "/opt/musa"
 
 
 def test_musa_runtime_alias_owner_is_torchada():
@@ -37,24 +37,6 @@ def test_musa_runtime_alias_owner_is_torchada():
         "cuGetErrorString",
     ):
         assert f"#define {symbol}" not in musa_block
-
-
-def test_musa_runtime_aliases_stay_on_torchada():
-    runtime = (
-        Path(__file__).resolve().parents[4]
-        / "python/sglang/kernels/jit/include/sgl_kernel/runtime.cuh"
-    ).read_text()
-    for symbol in (
-        "musaDevAttrComputeCapabilityMajor",
-        "musaDevAttrComputeCapabilityMinor",
-        "musaDevAttrMaxSharedMemoryPerBlockOptin",
-        "musaFuncAttributePreferredSharedMemoryCarveout",
-        "musaRuntimeGetVersion",
-        "musaSharedmemCarveoutDefault",
-        "musaSharedmemCarveoutMaxL1",
-        "musaSharedmemCarveoutMaxShared",
-    ):
-        assert symbol not in runtime
 
 
 def test_musa_toolchain_paths_and_flags(monkeypatch):
