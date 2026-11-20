@@ -32,6 +32,7 @@ from sglang.srt.layers.attention.dsa.dsa_npu_indexer import (
     plan_indexer_query_shard,
 )
 from sglang.srt.layers.attention.dsa.dsa_token_shard_layout import plan_dsa_token_shard
+from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -135,7 +136,9 @@ class TestLocalTopkWithTokenShard(CustomTestCase):
     rows. Without a token shard it reads full width; with a plan for other rows
     every query gets another token's top-k, and no shape error catches it."""
 
-    def _resolve(self, prefix_lens, extend_lens, tp_size, tp_rank, plan_rank):
+    def _resolve(
+        self, prefix_lens, extend_lens, tp_size, tp_rank, plan_rank, spec_info=None
+    ):
         total = sum(extend_lens)
         shard = _shard_for(
             prefix_lens, extend_lens, tp_size, tp_rank, _ceil_align(total, tp_size)
@@ -144,7 +147,9 @@ class TestLocalTopkWithTokenShard(CustomTestCase):
         if plan_rank is not None:
             seq_lens = [p + e for p, e in zip(prefix_lens, extend_lens)]
             plan = plan_dsa_token_shard(extend_lens, seq_lens, tp_size, plan_rank)
-        batch = types.SimpleNamespace(npu_dsa_token_shard_plan=plan)
+        batch = types.SimpleNamespace(
+            npu_dsa_token_shard_plan=plan, spec_info=spec_info
+        )
         topk = torch.arange(shard.rows * 4).reshape(shard.rows, 4)
         gathered = []
 
@@ -181,6 +186,66 @@ class TestLocalTopkWithTokenShard(CustomTestCase):
         _, _, local, gathered = self._resolve([0], [16384], 16, 3, plan_rank=5)
         self.assertFalse(local)
         self.assertTrue(gathered)
+
+    def test_keeps_local_rows_without_mtp_seed_capture(self):
+        spec_info = types.SimpleNamespace(dsa_seed_topk_capture=None)
+        out, topk, local, _ = self._resolve(
+            [0], [129], 4, 2, plan_rank=2, spec_info=spec_info
+        )
+        self.assertTrue(local)
+        self.assertIs(out, topk)
+
+    def test_mtp_seed_selects_global_query_rows_on_every_rank(self):
+        """Each rank exports the same last-query seed, including shard tails."""
+        for prefix_lens, extend_lens, tp_size in (
+            ([0, 0], [257, 128], 16),  # 25 local rows, selects [256, 384].
+            ([1024], [129], 4),
+            ([0, 1024, 512], [2, 4, 11], 16),  # Includes ranks with no real rows.
+        ):
+            total = sum(extend_lens)
+            padded = _ceil_align(total, tp_size)
+            all_topk = torch.arange(padded * 8, dtype=torch.int32).reshape(padded, 8)
+            select = torch.tensor(extend_lens).cumsum(0) - 1
+            expected_seed = all_topk[select]
+            for rank in range(tp_size):
+                with self.subTest(ext=extend_lens, tp=tp_size, rank=rank):
+                    shard = _shard_for(prefix_lens, extend_lens, tp_size, rank, padded)
+                    local_topk = shard.take(all_topk)
+                    seed = torch.full_like(expected_seed, -1)
+                    batch = types.SimpleNamespace(
+                        npu_dsa_token_shard_plan=plan_dsa_token_shard(
+                            extend_lens,
+                            [p + n for p, n in zip(prefix_lens, extend_lens)],
+                            tp_size,
+                            rank,
+                        ),
+                        forward_mode=ForwardMode.EXTEND,
+                        reuse_dsa_topk_indices=False,
+                        spec_info=types.SimpleNamespace(
+                            dsa_seed_topk_capture=seed,
+                            dsa_seed_topk_select=select,
+                        ),
+                    )
+
+                    def all_gather(out, source):
+                        self.assertTrue(torch.equal(source, local_topk))
+                        out.copy_(all_topk)
+
+                    with mock.patch(
+                        "sglang.srt.layers.attention.dsa.dsa_npu_indexer."
+                        "attn_tp_all_gather_into_tensor",
+                        side_effect=all_gather,
+                    ):
+                        topk = shard.resolve(local_topk, total, batch)
+                    state = IndexTopKShareState(batch, topk)
+                    with mock.patch(
+                        "sglang.srt.models.deepseek_common.attention_forward_methods."
+                        "forward_mha.resolve_attn_backend",
+                        return_value=None,
+                    ):
+                        state.publish()
+                    self.assertTrue(torch.equal(seed, expected_seed))
+                    self.assertFalse(batch.npu_indexer_topk_is_local)
 
 
 if __name__ == "__main__":
