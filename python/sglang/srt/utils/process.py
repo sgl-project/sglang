@@ -16,7 +16,6 @@
 from __future__ import annotations
 
 import ctypes
-import itertools
 import logging
 import os
 import resource
@@ -188,7 +187,36 @@ def delete_directory(dirpath):
         logger.warning("Failed to delete directory %s: %s", dirpath, e.strerror)
 
 
-def set_gpu_proc_affinity(gpu_id: int):
+def _ranks_sharing_cpus(
+    gpu_id: int, tp_size_per_node: int, allowed: set, server_args
+) -> tuple[int, int]:
+    """How many ranks split this process's CPUs, and this rank's index among them.
+
+    Ranks on a node start from the same CPUs, except under NUMA binding (v2), which
+    starts each rank on its GPU's node: only the ranks whose GPUs share that node share
+    the mask."""
+    from sglang.srt.environ import envs
+    from sglang.srt.utils import numa_utils
+
+    if server_args is not None and envs.SGLANG_NUMA_BIND_V2.get():
+        node = numa_utils.get_numa_node_if_available(server_args, gpu_id)
+        # a binding that did not apply leaves the rank with CPUs off its node
+        if node is not None and allowed <= numa_utils._node_cpus(node):
+            gpus = [
+                server_args.base_gpu_id + i * server_args.gpu_id_step
+                for i in range(tp_size_per_node)
+            ]
+            peers = [
+                g
+                for g in gpus
+                if numa_utils.get_numa_node_if_available(server_args, g) == node
+            ]
+            if gpu_id in peers:
+                return len(peers), peers.index(gpu_id)
+    return tp_size_per_node, gpu_id
+
+
+def set_gpu_proc_affinity(gpu_id: int, server_args=None):
     # current process
     pid = os.getpid()
     p = psutil.Process(pid)
@@ -197,23 +225,23 @@ def set_gpu_proc_affinity(gpu_id: int):
     nnodes_per_tp_group = max(parallel.nnodes // parallel.pp_size, 1)
     tp_size_per_node = parallel.tp_size // nnodes_per_tp_group
 
-    # total physical cores
     total_pcores = psutil.cpu_count(logical=False)
+    # Split the cores this process may use: a cpuset narrower than the host (e.g. a
+    # container's CPU slice) does not hold every host core id. Linux numbers core c's
+    # second thread c + total_pcores; a core counts when either thread is allowed, and
+    # its allowed threads are bound together.
+    allowed = set(p.cpu_affinity())
+    cores = sorted({c % total_pcores for c in allowed})
+    num_ranks, rank = _ranks_sharing_cpus(
+        gpu_id, tp_size_per_node, allowed, server_args
+    )
     # physical cores per TP (N.B. more Cores than GPUs on node)
-    num_cores_bind = total_pcores // tp_size_per_node
+    num_cores_bind = max(len(cores) // num_ranks, 1)
 
     # able to handle multiple DP per node
-    start_cpu_id = (gpu_id * num_cores_bind) % total_pcores
-    end_cpu_id = start_cpu_id + num_cores_bind
-
-    if psutil.cpu_count() != psutil.cpu_count(logical=False):
-        # HT on
-        lower_cpu_ids = [id for id in range(start_cpu_id, end_cpu_id)]
-        upper_cpu_ids = [id + total_pcores for id in range(start_cpu_id, end_cpu_id)]
-        bind_cpu_ids = list(itertools.chain(lower_cpu_ids, upper_cpu_ids))
-    else:
-        # HT off
-        bind_cpu_ids = [id for id in range(start_cpu_id, end_cpu_id)]
+    start = (rank * num_cores_bind) % len(cores)
+    bound_cores = set(cores[start : start + num_cores_bind])
+    bind_cpu_ids = sorted(c for c in allowed if c % total_pcores in bound_cores)
 
     # set cpu_affinity to current process
     p.cpu_affinity(bind_cpu_ids)
