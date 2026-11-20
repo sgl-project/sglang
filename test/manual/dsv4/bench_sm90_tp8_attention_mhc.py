@@ -118,9 +118,15 @@ def steps(group, inputs, norm, mode):
     batch = SimpleNamespace(forward_mode=mode, can_run_tbo=False)
     reader = boundary.HcRead(layer, attention=False)
     update = boundary.HcUpdate(layer, attention=True)
+    fallback = inputs[0].shape[0] > mhc.SM90_ATTN_MHC_MAX_ROWS
 
     def baseline():
         x, residual, pre, post, comb = inputs
+        # The graph-mode 2shot_pull may consume its input in place. A real
+        # wo_b produces a new partial at every boundary. Do the same for the
+        # unmeasured fallback while keeping the measured push path clone-free.
+        if fallback:
+            x = x.clone()
         state = mhc.run_attn_post(
             hc,
             group.all_reduce(x),
@@ -134,6 +140,8 @@ def steps(group, inputs, norm, mode):
 
     def candidate():
         x, residual, pre, post, comb = inputs
+        if fallback:
+            x = x.clone()
         transport = boundary.AttentionTransport(layer, x, batch, call, rows)
         # The real boundary must reject 13 rows, not expand the push plane.
         assert transport.defers_sum == (x.shape[0] <= 12)
@@ -181,14 +189,18 @@ def oracle(group, inputs, gamma):
     return updated, (normalized * gamma.float()).bfloat16()
 
 
-def check(group, got, ref):
+def check(group, got, ref, phase):
     errors = []
-    for actual, expected in zip(got, ref):
+    for name, actual, expected in zip(("residual", "normalized"), got, ref):
         torch.testing.assert_close(
-            actual.float(), expected.float(), rtol=2e-2, atol=2e-2
+            actual.float(),
+            expected.float(),
+            rtol=2e-2,
+            atol=2e-2,
+            msg=lambda msg: f"{phase}/{name}: {msg}",
         )
         for peer in gather(group, actual):
-            assert torch.equal(actual, peer), "collective output differs across ranks"
+            assert torch.equal(actual, peer), f"{phase}/{name}: differs across ranks"
         errors.append(float((actual.float() - expected.float()).abs().max()))
     return errors
 
@@ -271,9 +283,13 @@ def main(args):
             * 0.1
         ).bfloat16()
     )
-    for rows in ROWS:
+    for rows in args.rows:
         for mode in (ForwardMode.DECODE, ForwardMode.TARGET_VERIFY):
+            label = f"{rows}/{mode.name}"
             inputs = make_inputs(rows, group.rank_in_group, 42)
+            # Keep a separate reference to the original partial; the oracle
+            # must never read a value consumed by a previous collective.
+            eager_expected = tuple(t.clone() for t in inputs)
             # Prove the comparator is the actual default AR V2 path, not NCCL fallback.
             assert group.ca_comm.should_custom_ar(inputs[0])
             assert group._resolve_outplace_all_reduce_method(inputs[0]) == "ca"
@@ -281,29 +297,78 @@ def main(args):
             baseline, candidate = steps(group, inputs, norm, mode)
             ref = baseline()
             got = candidate()
-            eager_err = check(group, got, ref)
-            oracle_err = check(group, got, oracle(group, inputs, norm.weight))
+            for tensor, original in zip(inputs, eager_expected):
+                torch.testing.assert_close(tensor, original, atol=0, rtol=0)
+            eager_err = check(group, got, ref, f"{label}/eager")
+            oracle_err = check(
+                group,
+                got,
+                oracle(group, eager_expected, norm.weight),
+                f"{label}/oracle",
+            )
 
             # Interleave fused/ordinary AR on the same push epochs, then replay
             # with changed data to catch incorrect phase reuse and stale inputs.
             def mixed():
                 result = candidate()
-                return result, group.all_reduce(inputs[0]), candidate()
+                # 13 rows exceed the V2 push slot, so its normal graph AR
+                # uses a fresh input (as the model does) for each 2shot pull.
+                partial = (
+                    inputs[0]
+                    if rows <= mhc.SM90_ATTN_MHC_MAX_ROWS
+                    else inputs[0].clone()
+                )
+                return result, group.all_reduce(partial), candidate()
 
             graph, (first, reduced, last) = capture(group, mixed)
             replay_error = []
+            replay_oracle_error = []
             for seed in (43, 97, 128):
-                for target, source in zip(
-                    inputs, make_inputs(rows, group.rank_in_group, seed)
-                ):
+                expected = make_inputs(rows, group.rank_in_group, seed)
+                for target, source in zip(inputs, expected):
                     target.copy_(source)
                 graph.replay()
                 torch.cuda.synchronize()
+                for tensor, source in zip(inputs, expected):
+                    torch.testing.assert_close(
+                        tensor,
+                        source,
+                        atol=0,
+                        rtol=0,
+                        msg=lambda msg: (
+                            f"{label}/graph seed={seed}: source mutated: {msg}"
+                        ),
+                    )
                 ref = baseline()
-                replay_error.append(check(group, first, ref))
-                replay_error.append(check(group, last, ref))
+                replay_error.append(
+                    check(group, first, ref, f"{label}/graph first seed={seed}")
+                )
+                replay_error.append(
+                    check(group, last, ref, f"{label}/graph last seed={seed}")
+                )
+                replay_ref = oracle(group, expected, norm.weight)
+                replay_oracle_error.append(
+                    check(
+                        group,
+                        first,
+                        replay_ref,
+                        f"{label}/graph oracle first seed={seed}",
+                    )
+                )
+                replay_oracle_error.append(
+                    check(
+                        group,
+                        last,
+                        replay_ref,
+                        f"{label}/graph oracle last seed={seed}",
+                    )
+                )
                 torch.testing.assert_close(
-                    reduced, group.all_reduce(inputs[0]), rtol=2e-2, atol=2e-2
+                    reduced,
+                    group.all_reduce(expected[0].clone()),
+                    rtol=2e-2,
+                    atol=2e-2,
+                    msg=lambda msg: f"{label}/graph ordinary AR seed={seed}: {msg}",
                 )
             del graph
 
@@ -314,8 +379,9 @@ def main(args):
                 eager_max_abs=eager_err,
                 oracle_max_abs=oracle_err,
                 replay_max_abs=replay_error,
+                replay_oracle_max_abs=replay_oracle_error,
             )
-            if rows <= 12:
+            if rows <= mhc.SM90_ATTN_MHC_MAX_ROWS and not args.correctness_only:
                 case["eager"] = bench(
                     group, baseline, candidate, args.iterations, args.trials
                 )
@@ -336,6 +402,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--trials", type=int, default=5)
+    parser.add_argument("--rows", type=int, nargs="+", choices=ROWS, default=ROWS)
+    parser.add_argument("--correctness-only", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     assert 0 < args.iterations <= 256 and 0 < args.trials <= 20
