@@ -90,6 +90,44 @@ class TestEmbeddingModelSpec(unittest.TestCase):
                     resolution_result(args, "prefill_only_disable_kv_cache")
                 )
 
+    def _resolve_deepseek_v3_bidirectional_args(self, attention_backend):
+        args = ServerArgs(model_path="dummy", attention_backend=attention_backend)
+        args._model_config = SimpleNamespace(
+            embedding_model_spec=resolve_embedding_model_spec(
+                ["DeepseekV3BidirectionalModel"],
+                is_embedding_requested=True,
+                is_embedding_gemma=False,
+            ),
+            joint_head_config=None,
+            pointer_head=None,
+            is_multimodal=False,
+            hf_config=SimpleNamespace(architectures=["DeepseekV3BidirectionalModel"]),
+        )
+        handle_model_capability_adjustments(args)
+        return args
+
+    def test_deepseek_v3_bidirectional_never_splits_or_reuses_a_prefill(self):
+        """Giga-Embeddings (DeepseekV3BidirectionalModel) resolved to the causal
+        decoder-embedding fallback, so chunked prefill split inputs over 4096
+        tokens and the radix cache reused prefixes: bidirectional layers then saw
+        only part of the input and mean pooling averaged only the last chunk."""
+        spec = resolve_embedding_model_spec(
+            ["DeepseekV3BidirectionalModel"],
+            is_embedding_requested=True,
+            is_embedding_gemma=False,
+        )
+        self.assertEqual(spec.attention, AttentionPattern.BIDIRECTIONAL)
+        self.assertEqual(spec.pooling, PoolingStrategy.MEAN)
+        for attention_backend in ("fa3", "triton"):
+            with self.subTest(attention_backend=attention_backend):
+                args = self._resolve_deepseek_v3_bidirectional_args(attention_backend)
+                self.assertEqual(resolution_result(args, "chunked_prefill_size"), -1)
+                self.assertTrue(resolution_result(args, "disable_radix_cache"))
+                # MLA prefill keeps the KV pool even on the FA backends.
+                self.assertFalse(
+                    resolution_result(args, "prefill_only_disable_kv_cache")
+                )
+
     def test_encoder_embedding_models_enable_embedding_mode_automatically(self):
         spec = resolve_embedding_model_spec(
             ["BertModel"],
@@ -107,7 +145,7 @@ class TestEmbeddingModelSpec(unittest.TestCase):
         matrix = embedding_support_matrix()
         by_architecture = {row["architecture"]: row for row in matrix}
 
-        self.assertEqual(len(matrix), 9)
+        self.assertEqual(len(matrix), 10)
         self.assertIn("EmbeddingGemma2Model", by_architecture)
         self.assertTrue(by_architecture["EmbeddingGemma2Model"]["supports_multimodal"])
         self.assertEqual(by_architecture["BertModel"]["family"], "bert")

@@ -1059,7 +1059,7 @@ class XPUAttentionBackend(AttentionBackend):
                         max_seqlen_q=metadata.max_seq_len_q,
                         max_seqlen_k=metadata.max_seq_len_q,
                         softmax_scale=layer.scaling,
-                        causal=True,
+                        causal=causal,
                         return_softmax_lse=forward_batch.mha_return_lse,
                     )
                 if forward_batch.mha_return_lse:

@@ -185,6 +185,12 @@ def embedding_support_matrix() -> list[dict[str, Any]]:
             **_embedding_nemotron3_spec().as_dict(),
         }
     )
+    rows.append(
+        {
+            "architecture": "DeepseekV3BidirectionalModel",
+            **_deepseek_v3_bidirectional_spec().as_dict(),
+        }
+    )
     return rows
 
 
@@ -253,6 +259,32 @@ def _embedding_nemotron3_spec() -> EmbeddingModelSpec:
         safe_disable_radix_cache=True,
         safe_disable_chunked_prefill=True,
         safe_disable_kv_cache=True,
+        encoder_only_attention=True,
+    )
+
+
+def _deepseek_v3_bidirectional_spec() -> EmbeddingModelSpec:
+    return EmbeddingModelSpec(
+        family="deepseek_v3_bidirectional",
+        task=EmbeddingTask.EMBED,
+        execution=EmbeddingExecution.ENCODER_ONLY,
+        attention=AttentionPattern.BIDIRECTIONAL,
+        pooling=PoolingStrategy.MEAN,
+        normalize=True,
+        postprocessor="model_defined",
+        tokenizer_special_tokens="model_default",
+        supports_dimensions=False,
+        supports_token_embeddings=False,
+        supports_multimodal=False,
+        requires_embedding_flag=False,
+        auto_enable_embedding=True,
+        bidirectional_attention=True,
+        bcg_prefill_policy=BCGPrefillPolicy.DEFAULT,
+        safe_disable_radix_cache=True,
+        safe_disable_chunked_prefill=True,
+        # MLA layers: the KV-pool-free FA prefill path is not validated for MLA,
+        # so prefill keeps writing the KV pool.
+        safe_disable_kv_cache=False,
         encoder_only_attention=True,
     )
 
@@ -347,6 +379,9 @@ def resolve_embedding_model_spec(
 
     if "EmbeddingNemotron3Model" in architecture_set:
         return _embedding_nemotron3_spec()
+
+    if "DeepseekV3BidirectionalModel" in architecture_set:
+        return _deepseek_v3_bidirectional_spec()
 
     if architecture_set & _CLASSIFICATION_ARCHITECTURES:
         return EmbeddingModelSpec(
