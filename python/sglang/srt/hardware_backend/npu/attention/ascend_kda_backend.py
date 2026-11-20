@@ -26,8 +26,6 @@ class _AscendKDAExtendKernel:
     uses_state_checkpoints: bool = False
     wants_int64_query_start_loc: bool = False
 
-    wants_int64_query_start_loc: bool = False
-
     def extend(
         self,
         q: torch.Tensor,
