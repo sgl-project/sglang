@@ -4513,6 +4513,8 @@ class UnifiedRadixCache(BasePrefixCache):
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
         if self.linker is not None:
+            if not self._linker_work_pending():
+                return
             finish_counts = torch.tensor(
                 [self.linker.num_completed_offloads()],
                 dtype=torch.int,
@@ -4572,6 +4574,15 @@ class UnifiedRadixCache(BasePrefixCache):
             if not hasattr(storage_metrics, "prefetch_stats"):
                 storage_metrics.prefetch_stats = self.prefetch_outcome_stats_snapshot()
             self.storage_metrics_collector.log_storage_metrics(storage_metrics)
+
+    def _linker_work_pending(self) -> bool:
+        """Return whether the external-linker drain tick has any collectives to
+        run. The counts are local reads; the next scheduler step polls again,
+        so an offload that finishes concurrently is consumed on the next tick."""
+        return (
+            self.linker.num_completed_offloads() > 0
+            or bool(self.linker.prefetches)
+        )
 
     def transfers_in_flight(self) -> bool:
         # The buffer-mode pipeline (storage without a host pool) tracks its

@@ -2683,5 +2683,45 @@ class TestTransferReadyEvents(CustomTestCase):
         self.assertEqual(linker.broadcast_loads, {})
 
 
+class TestLinkerDrainTick(TestLinkerDevicePrefetch):
+    """check_hicache_events must skip the attention TP/CP collective when the
+    external linker has no completed offloads and no pending prefetches. Under
+    TP>1 the collective blocks every rank until the slowest one arrives, even
+    when nothing finished."""
+
+    @staticmethod
+    def _run_with_reduce_count(cache):
+        calls = []
+
+        def reduce(tensor, op):
+            calls.append(int(tensor.numel()))
+
+        with patch.object(cache, "_all_reduce_attn_groups", reduce):
+            cache.check_hicache_events()
+        return calls
+
+    def test_idle_linker_skips_the_collective(self):
+        cache, backend, _, _ = self._fixture()
+        calls = self._run_with_reduce_count(cache)
+        assert calls == [], f"idle linker must not reduce, got {calls}"
+        assert backend.offload_sessions == []
+
+    def test_pending_offload_still_enters_the_collective(self):
+        cache, backend, req, _ = self._fixture()
+        self._enqueue(cache, req)
+        backend.prefetch_futures[-1].set_result(True)
+        backend.completed_offloads.append(True)
+        calls = self._run_with_reduce_count(cache)
+        assert calls, "collective must run when an offload finished"
+        assert calls[0] >= 1
+
+    def test_pending_prefetch_still_enters_the_collective(self):
+        cache, backend, req, _ = self._fixture()
+        self._enqueue(cache, req)
+        assert backend.prefetch_futures, "fixture must queue a prefetch"
+        calls = self._run_with_reduce_count(cache)
+        assert calls, "collective must run while a prefetch is in flight"
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
