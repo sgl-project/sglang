@@ -129,7 +129,7 @@ def cp_interleave_to_sequence_order(hidden_states, forward_batch):
 
 def _use_interleave_rows(x) -> bool:
     """interleave_rows is a Triton kernel: any GPU device, contiguous rows."""
-    return x.device.type != "cpu" and x.is_contiguous()
+    return x.device.type != "cpu" and x.is_contiguous() and x.ndim >= 2
 
 
 def cp_sequence_to_interleave_order(hidden_states, forward_batch, gathered_rows):
@@ -332,27 +332,17 @@ class InterleaveCPStrategy(ContextParallelStrategy):
         if metadata.gather_index is not None:
             return gathered.index_select(0, metadata.gather_index)
 
-        # Equal per-rank lengths: one interleave copy restores the original
-        # token order; cheaper than the index_select fallback below.
-        actual = metadata.per_rank_actual_token
-        if total_tokens == self.cp_size * physical_rank_len and all(
-            int(n) == physical_rank_len for n in actual
-        ):
-            if _use_interleave_rows(gathered):
-                from sglang.kernels.ops.memory.interleave_rows import interleave_rows
+        # Equal physical rank blocks use the same permutation even when their
+        # logical lengths differ. Trim padding in the existing row copy.
+        if _use_interleave_rows(gathered):
+            from sglang.kernels.ops.memory.interleave_rows import interleave_rows
 
-                return interleave_rows(gathered, self.cp_size, total_tokens)
-            return (
-                gathered.view(self.cp_size, physical_rank_len, *x.shape[1:])
-                .transpose(0, 1)
-                .reshape(total_tokens, *x.shape[1:])
-            )
-
-        flat_indices = torch.arange(total_tokens, device=x.device)
-        gather_indices = (
-            flat_indices % self.cp_size
-        ) * physical_rank_len + flat_indices // self.cp_size
-        return gathered.index_select(0, gather_indices)
+            return interleave_rows(gathered, self.cp_size, total_tokens)
+        return (
+            gathered.view(self.cp_size, physical_rank_len, *x.shape[1:])
+            .transpose(0, 1)
+            .flatten(0, 1)[:total_tokens]
+        )
 
     def get_supported_attention_backend(self):
         return [CPAttentionBackendKind.DSA]
