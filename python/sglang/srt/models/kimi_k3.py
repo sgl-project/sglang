@@ -2903,7 +2903,10 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
                 gate_input = self._gate_hidden_states
                 self._gate_hidden_states = None
                 if gate_input is not None and not isinstance(x, tuple):
-                    gate = self._compute_output_gate(gate_input)
+                    if self._front_out is not None:
+                        gate = self._front_out[1]
+                    else:
+                        gate = self._compute_output_gate(gate_input)
                     from sglang.kernels.ops.elementwise import mla_output_gate
 
                     if mla_output_gate.covered(x, gate):
@@ -2941,6 +2944,72 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             self.o_proj.forward = _gated_o_proj_forward
         if sp_moe:
             _route_sp_o_proj_output(self.o_proj)
+        self._proj_front_w: Optional[torch.Tensor] = None
+        self._proj_front_sizes: Optional[List[int]] = None
+        # (q_a + kv_a output, output gate) of the merged GEMM, during its forward
+        self._front_out: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+
+    def _merge_projection_front_hip(self) -> None:
+        """ROCm: make q_a + kv_a, g_proj and the indexer's wk + weights_proj views of
+        one weight; all four read the attention input."""
+        prologue = self.indexer.rocm_nope_prologue
+        if (
+            not envs.SGLANG_ENABLE_ROCM_K3_MLA_PROJ_FRONT.get()
+            or not self.use_output_gate
+            or not self.has_fused_proj
+            or prologue is None
+            or prologue.k_gate_weight is None
+            or self.skip_topk
+            # this indexer path runs wk itself, ahead of the prologue
+            or self.indexer.use_dsa_indexer_fusion
+        ):
+            return
+        mods = [
+            self.fused_qkv_a_proj_with_mqa,
+            self.g_proj,
+            self.indexer.wk,
+            self.indexer.weights_proj,
+        ]
+        weights = [m.weight for m in mods]
+        if not (
+            all(type(w.data) is torch.Tensor and w.dim() == 2 for w in weights)
+            and _is_unquantized_mergeable(weights)
+            and len({w.shape[1] for w in weights}) == 1
+        ):
+            return
+        self._proj_front_w, self._proj_front_sizes = _merge_weights_as_views(
+            mods, target=self._proj_front_w
+        )
+        prologue.k_gate_weight = self._proj_front_w[sum(self._proj_front_sizes[:2]) :]
+
+    def _projection_front_applies(self, hidden_states, forward_batch) -> bool:
+        return (
+            self._proj_front_w is not None
+            and isinstance(hidden_states, torch.Tensor)
+            and hidden_states.shape[0]
+            >= envs.SGLANG_ROCM_K3_MLA_PROJ_FRONT_MIN_TOKENS.get()
+            and self.indexer.rocm_nope_prologue.applies(
+                hidden_states, forward_batch, False, False
+            )
+        )
+
+    def _run_projection_front(self, hidden_states: torch.Tensor) -> None:
+        """The merged GEMM; prepare_qkv_latent, the gated o_proj and the indexer
+        prologue read its slices."""
+        fused = self.fused_qkv_a_proj_with_mqa.quant_method.apply(
+            SimpleNamespace(weight=self._proj_front_w), hidden_states, None
+        )
+        qkv, gate, key, head_gate = fused.split(self._proj_front_sizes, dim=-1)
+        # mla_output_gate takes a contiguous gate
+        self._front_out = qkv, gate.contiguous()
+        self.indexer._mono_pre = {"k": key, "w": head_gate}
+
+    def prepare_qkv_latent(
+        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+    ):
+        if self._front_out is not None:
+            return self._front_out[0]
+        return super().prepare_qkv_latent(hidden_states, forward_batch)
 
     @staticmethod
     def _split_kv_b_weight_loader(param, loaded_weight) -> None:
@@ -2995,12 +3064,21 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
         zero_allocator: BumpAllocator,
         **kwargs,
     ):
+        front = self._projection_front_applies(hidden_states, forward_batch)
         if self.use_output_gate:
             self._gate_hidden_states = hidden_states
-            self._fork_output_gate(hidden_states)
-        return super().forward(
-            positions, hidden_states, forward_batch, zero_allocator, **kwargs
-        )
+            if not front:
+                self._fork_output_gate(hidden_states)
+        if front:
+            self._run_projection_front(hidden_states)
+        try:
+            return super().forward(
+                positions, hidden_states, forward_batch, zero_allocator, **kwargs
+            )
+        finally:
+            if front:
+                self._front_out = None
+                del self.indexer._mono_pre
 
     def forward_pre_o_proj(
         self,
@@ -4278,6 +4356,8 @@ class KimiK3LinearForCausalLM(nn.Module):
                 layer.self_attn.indexer.prepare_merged_k_gate()
                 # MI355X, 140k keys: ~0.6 ms/layer unsplit at 512 rows vs ~0.16 ms at 64
                 layer.self_attn.indexer.tp_split_min_rows = 64 if _is_gfx95 else 1024
+                if _is_gfx95:
+                    layer.self_attn._merge_projection_front_hip()
 
         for layer in self.model.layers:
             if isinstance(layer, PPMissingLayer) or not isinstance(
