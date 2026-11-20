@@ -373,7 +373,10 @@ SGL_DEVICE void sort_tail_stable(
   const int t_begin = helper * chunk;
   const int t_end = (t_begin + chunk < M) ? (t_begin + chunk) : M;
   int n_real = M;
-  if (num_non_padded != nullptr) n_real = (*num_non_padded < M) ? *num_non_padded : M;
+  if (num_non_padded != nullptr) {
+    const int n = *num_non_padded;
+    n_real = (n < 0) ? 0 : ((n < M) ? n : M);
+  }
 
   int my_e[kPairsPerThread];
   float my_w[kPairsPerThread];

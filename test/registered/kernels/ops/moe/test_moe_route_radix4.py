@@ -513,8 +513,10 @@ def test_fused_sort_matches_route_and_layout(m):
 # (12, 7) sorts in the last CTA. Past 64 tokens every padding row sends all 16
 # routes to expert 0, which the tail's one-route-per-token ranking cannot see, so
 # they are placed separately: none, one, a whole tail chunk, and all but one.
+# A negative count is every row padded.
 @pytest.mark.parametrize(
-    "m, n_real", [(12, 7), (80, 80), (80, 79), (80, 61), (300, 1), (300, 0)]
+    "m, n_real",
+    [(12, 7), (80, 80), (80, 79), (80, 61), (300, 1), (300, 0), (80, -1000), (300, -1)],
 )
 def test_fused_sort_routes_padded_rows_like_the_mask(m, n_real):
     """select_experts masks CUDA-graph padding rows to expert 0 and weight 0 in
@@ -526,8 +528,8 @@ def test_fused_sort_routes_padded_rows_like_the_mask(m, n_real):
     non_padded = torch.tensor(n_real, dtype=torch.int32, device="cuda")
 
     ref_w, ref_ids = moe_route_radix4.route_radix4(scores, bias, TOPK, True, 2.5)
-    ref_ids[n_real:] = 0
-    ref_w[n_real:] = 0.0
+    ref_ids[max(n_real, 0) :] = 0
+    ref_w[max(n_real, 0) :] = 0.0
     w, ids, aux = moe_route_radix4.route_radix4_with_sort(
         scores,
         bias,
