@@ -281,8 +281,9 @@ class TestFrames(CustomTestCase):
 
     def test_generate_response_matches_frame_value_shape(self):
         """Key order (text, meta_info, output_ids), conditional keys,
-        finish_reason always present (null pre-terminal), and the cached-token
-        details without a storage tier."""
+        finish_reason and dp_rank always present (null pre-terminal, and
+        without data parallelism), and the cached-token details without a
+        storage tier."""
         frame = GenerateResponse(
             text="ok",
             output_ids=[7, 8],
@@ -298,7 +299,7 @@ class TestFrames(CustomTestCase):
         )
         self.assertEqual(
             compact(frame.to_json_value()),
-            '{"text":"ok","meta_info":{"id":"client-rid","prompt_tokens":5,"completion_tokens":2,"finish_reason":null,"cached_tokens":3,"reasoning_tokens":0,"cached_tokens_details":{"device":3,"host":0}},"output_ids":[7,8]}',
+            '{"text":"ok","meta_info":{"id":"client-rid","prompt_tokens":5,"completion_tokens":2,"finish_reason":null,"cached_tokens":3,"reasoning_tokens":0,"cached_tokens_details":{"device":3,"host":0},"dp_rank":null},"output_ids":[7,8]}',
         )
 
     def test_frame_round_trip_with_logprobs(self):
@@ -316,6 +317,7 @@ class TestFrames(CustomTestCase):
                 "cached_tokens": 1,
                 "reasoning_tokens": 0,
                 "cached_tokens_details": {"device": 1, "host": 0},
+                "dp_rank": 1,
             },
             "output_ids": [5],
             "index": 0,

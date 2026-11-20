@@ -2,7 +2,7 @@ import unittest
 from array import array
 from types import SimpleNamespace
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.io_struct import RequestOutputStats
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler_components.output_streamer import (
@@ -11,6 +11,7 @@ from sglang.srt.managers.scheduler_components.output_streamer import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import FakeReq
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -26,7 +27,7 @@ _REQUEST_STATS = RequestOutputStats(
 )
 
 
-class _FakeReq:
+class _FakeReq(FakeReq):
     def __init__(self, *, is_retracted: bool, max_new_tokens: int):
         self.rid = "req"
         self.http_worker_ipc = None
@@ -56,6 +57,7 @@ class _FakeReq:
             prefill_finished_time=0.0, enable_metrics=False
         )
         self.weight_version_events = []
+        self.prefill_weight_versions = None
         self.mm_image_tokens = 0
         self.mm_audio_tokens = 0
         self.mm_video_tokens = 0
@@ -170,8 +172,8 @@ class TestOutputStreamerReasoningUsage(unittest.TestCase):
                         self.assertEqual(accumulator.reasoning_tokens, [expected])
                         self.assertEqual(req.reasoning_tokens, original_count)
                         self.assertEqual(
-                            accumulator.output_ids,
-                            [tokens[1 if stream else 0 : retained]],
+                            accumulator.output_ids_flat,
+                            array("q", tokens[1 if stream else 0 : retained]),
                         )
                         if not rust:
                             self.assertEqual(accumulator.completion_tokens, [retained])

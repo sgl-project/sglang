@@ -54,6 +54,8 @@ class TestRocmHiSparseFusedKV(CustomTestCase):
                 lambda *args, **kwargs: args,
                 create=True,
             ),
+            # The gfx1250 fused branch excludes DSA, so these DSA pools use the gfx95 one.
+            patch.object(forward_mla_rocm, "_use_gfx1250_fused_mla_rope", False),
         ):
             args = forward_mla_rocm._fused_rope_cat_and_cache(
                 self.attn, torch.empty(0), None, None, None, None, locations

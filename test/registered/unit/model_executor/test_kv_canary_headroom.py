@@ -107,6 +107,23 @@ class TestCanaryHeadroom(CustomTestCase):
         self.assertEqual(kwargs, {"cap_tokens": 1_000_000})
         return args[0]
 
+    def test_distinct_routed_drafts_share_one_backing_charge(self):
+        from sglang.srt.mem_cache.kv.routed_cache import RoutedKVCache
+
+        arena = SimpleNamespace(backed_after_capture=True, backed_bytes=2 * _GIB)
+        pools = []
+        for _ in range(3):
+            pool = RoutedKVCache.__new__(RoutedKVCache)
+            pool._arena = arena
+            pool.dtype = "bfloat16"
+            pool.size = 1024
+            pool.finalize_backing = Mock()
+            pools.append(pool)
+        budget = self._resize(None, (None, None), pool=pools[0], draft_pools=pools[1:])
+        self.assertEqual(budget, 15 * _GIB)
+        for draft in pools[1:]:
+            draft.finalize_backing.assert_not_called()
+
     def test_canary_off_preserves_every_budget_byte(self):
         for graph_borrow, eager_gap, headroom in (
             (False, False, 6),

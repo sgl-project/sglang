@@ -83,12 +83,21 @@ The [operator guide's detector specification](../../../../../docs/docs/advanced_
 
 | File | Role |
 | --- | --- |
-| `core.py` | Request policy resolution, batch configuration, ring/history state, PyTorch reference selection, and speculative orchestration. |
-| `config.py` | Key parsing, bounded JSON configuration loading, and shared protocol limits. |
-| `detector.py` | Torch-free single-key and dual-key reference detector. |
+| `interface.py` | The algorithm-neutral contract engine code calls: per-batch rows, sample and verify hooks, and the per-server engine. |
+| `runtime.py` | Engine entry points; the one place that dispatches on `--watermark-algorithm`. |
+| `config.py` | Key parsing, bounded JSON configuration loading, request watermark objects, and shared protocol limits. |
+| `redaction.py` | Redaction of watermark secrets from logs, dumps, and the launch command. |
+| `gumbel/algorithm.py` | Hashing and the PyTorch reference selection and forcing. |
+| `gumbel/state.py` | Per-request ring and context-history state and its forcing operations. |
+| `gumbel/adapter.py` | Request policy, per-batch rows, and the engine and hooks that bind them to the state. |
+| `gumbel/detector.py` | Torch-free single-key and dual-key reference detector. |
+| `synthid/algorithm.py` | SynthID hashing, configuration, and the PyTorch reference tournament. |
+| `synthid/state.py` | Per-request context, context-history ring, and call count, with Triton and PyTorch paths. |
+| `synthid/watermark.py` | The SynthID logits transform, fused sample, and state seed and commit. |
+| `synthid/adapter.py` | Request policy, per-batch rows, server checks, and the engine and hooks that bind them to the watermark. |
 | `__init__.py` | Minimal public detector exports. |
 
-The Triton selector and state kernels live in `sglang/kernels/ops/sampling/textseal_selector.py`.
+The Gumbel Triton selector and state kernels live in `sglang/kernels/ops/sampling/textseal_selector.py`; the SynthID kernels in `sglang/kernels/ops/sampling/synthid_triton.py`, with their limits and hash constants in `synthid.py`. The SynthID operator guide is [SynthID Text Watermarking](../../../../../docs/docs/advanced_features/synthid_text_watermarking.mdx).
 
 ## Server configuration
 
@@ -106,7 +115,7 @@ The Triton selector and state kernels live in `sglang/kernels/ops/sampling/texts
 
 Default-on and enforce-all modes require a server key. A server key without either mode remains available only to requests that opt in.
 
-Use a regular config file readable only by the server account for keys; inline JSON is visible in the process command line. Launch-command, server-info, and crash-payload rendering redacts key fields and the `--watermark-config` value. Request logs redact watermark keys only when `--enable-watermark` is set. Process command lines, client request bodies, and process or GPU core dumps remain separate secret-bearing surfaces.
+Use a regular config file readable only by the server account for keys; inline JSON is visible in the process command line. Launch-command, server-info, and crash-payload rendering redacts key fields and the `--watermark-config` value. Request logs redact watermark keys whether or not `--enable-watermark` is set. Without it, the logger checks only the request's top-level `watermark` and `sampling_params.watermark` fields, so logging a request without a watermark costs nothing extra. Process command lines, client request bodies, and process or GPU core dumps remain separate secret-bearing surfaces.
 
 ## Per-request control
 
@@ -150,7 +159,7 @@ python -m pip install msgspec
 ```
 
 ```python
-from watermarking.detector import WatermarkDetector
+from watermarking.gumbel.detector import WatermarkDetector
 
 detector = WatermarkDetector("0123456789abcdef", context_window=4)
 result = detector.detect_tokens(completion_ids, prompt_token_ids=prompt_ids)

@@ -28,8 +28,8 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
-from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
-    BaseCudaGraphBackend,
+from sglang.srt.model_executor.runner_backend.base_breakable_graph_backend import (
+    BaseBreakableGraphBackend,
 )
 from sglang.srt.model_executor.runner_backend.cuda_graph_dedup_mixin import (
     DedupedCudaGraphMixin,
@@ -62,7 +62,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.runner.shape_key import ShapeKey
 
 
-class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
+class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseBreakableGraphBackend):
     """Segmented capture: graphs break at attention / mamba boundaries;
     attention metadata is recomputed at replay outside captured segments.
     """

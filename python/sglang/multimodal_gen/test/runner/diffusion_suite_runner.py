@@ -5,7 +5,6 @@ using LPT so each CI shard has a similar total runtime.
 """
 
 import argparse
-import copy
 import json
 import os
 import random
@@ -61,6 +60,7 @@ else:
         STRICT_SUITES,
         SUITES,
         TWO_GPU_CASES,
+        TWO_GPU_UNIT_NODES,
     )
 
 
@@ -91,24 +91,6 @@ def get_standalone_file_est_time(
     if standalone_file not in suite_est_times:
         return DEFAULT_STANDALONE_EST_TIME_SECONDS, True
     return suite_est_times[standalone_file], False
-
-
-def get_all_standalone_file_est_times() -> dict[str, dict[str, float]]:
-    return copy.deepcopy(STANDALONE_FILE_EST_TIMES)
-
-
-def validate_standalone_file_est_times() -> dict[str, list[str]]:
-    missing_by_suite: dict[str, list[str]] = {}
-    for suite, standalone_files in STANDALONE_FILES.items():
-        suite_est_times = STANDALONE_FILE_EST_TIMES.get(suite, {})
-        missing = [
-            standalone_file
-            for standalone_file in standalone_files
-            if standalone_file not in suite_est_times
-        ]
-        if missing:
-            missing_by_suite[suite] = missing
-    return missing_by_suite
 
 
 def get_suite_files_rel(suite: str, parametrized_only: bool = False) -> list[str]:
@@ -253,12 +235,24 @@ def _run_standalone_file(
         target_dir / f"junit_results_{suite}_{Path(standalone_rel).stem}.xml"
     )
     start_time = time.perf_counter()
-    exit_code, _, _ = run_pytest(
-        [standalone_file],
-        filter_expr=extra_filter,
-        junit_xml_path=junit_xml_path,
-        failure_summary=failure_summary,
-    )
+    if standalone_rel in FILE_SUITES.get("component-accuracy", ()):
+        # The distributed reference comparisons must run on both ranks.
+        exit_code = run_component_accuracy_files(
+            [standalone_file], filter_expr=extra_filter
+        )
+    else:
+        nodes = TWO_GPU_UNIT_NODES.get(standalone_rel) if suite == "2-gpu" else None
+        targets = (
+            [f"{standalone_file}::{node}" for node in nodes]
+            if nodes
+            else [standalone_file]
+        )
+        exit_code, _, _ = run_pytest(
+            targets,
+            filter_expr=extra_filter,
+            junit_xml_path=junit_xml_path,
+            failure_summary=failure_summary,
+        )
     measured_full_test_time_s = round(time.perf_counter() - start_time, 1)
     standalone_key = _normalize_standalone_key(standalone_rel)
     measurement = {
@@ -374,6 +368,7 @@ def run_component_accuracy_files(files, filter_expr=None, continue_on_error=Fals
                 sys.executable,
                 "-m",
                 "torch.distributed.run",
+                "--standalone",
                 f"--nproc_per_node={num_gpus}",
                 "-m",
                 "pytest",
@@ -389,7 +384,7 @@ def run_component_accuracy_files(files, filter_expr=None, continue_on_error=Fals
 
         print(f"Running command: {' '.join(cmd)}")
         file_exit_code = subprocess.call(cmd)
-        if file_exit_code == 5:
+        if file_exit_code == 5 and filter_expr:
             print(
                 "No tests collected (exit code 5). This is expected when filters "
                 "deselect all tests in a file. Treating as success."
@@ -642,7 +637,6 @@ def _run_partition_assignment(
 
 def main():
     args = parse_args()
-    validate_standalone_file_est_times()
     test_root_dir = Path(__file__).resolve().parents[1]
     target_dir = test_root_dir / args.base_dir
 

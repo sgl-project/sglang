@@ -7,14 +7,19 @@ from typing import Any
 
 import torch
 
-from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.hicache_storage import (
+    HostPoolName,
+    PoolTransfer,
+    host_pool_name,
+    merge_source_transfers,
+)
 from sglang.srt.mem_cache.kv.memory.views import MHAKVView
 from sglang.srt.mem_cache.pool_host.base import HostKVCache, shared_host_layout_domains
 
 
 @dataclass
 class PoolEntry:
-    name: PoolName
+    name: HostPoolName
     host_pool: Any
     device_pool: Any
     layer_mapper: Callable[[int], int | None]
@@ -29,6 +34,9 @@ class PoolEntry:
     # Controller ids -> the device pool's rows, for a sub-pool whose ids map
     # through its allocator (`KVStorage.host_ids`); None when they index it.
     device_translate: Callable[[torch.Tensor], torch.Tensor] | None = None
+
+    def __post_init__(self):
+        self.name = host_pool_name(self.name)
 
 
 class HostPoolGroup:
@@ -71,10 +79,12 @@ class HostPoolGroup:
         self.entry_map[entry.name] = entry
         self._refresh_transfer_capabilities()
 
-    def get_entry(self, name: PoolName | None = None) -> PoolEntry:
-        return self.anchor_entry if name is None else self.entry_map[name]
+    def get_entry(self, name: HostPoolName | None = None) -> PoolEntry:
+        return (
+            self.anchor_entry if name is None else self.entry_map[host_pool_name(name)]
+        )
 
-    def get_pool(self, name: PoolName):
+    def get_pool(self, name: HostPoolName):
         return self.get_entry(name).host_pool
 
     @contextmanager
@@ -104,7 +114,7 @@ class HostPoolGroup:
             element_sizes.add(element_size)
         return element_sizes.pop() if len(element_sizes) == 1 else None
 
-    def get_contiguous_buf_infos(self, pool_names: set[PoolName] | None = None):
+    def get_contiguous_buf_infos(self, pool_names: set[HostPoolName] | None = None):
         """Return (device_buffers, host_buffers), each (ptrs, sizes, item_sizes)."""
         host_by_device_ptr = {}
         device_infos = ([], [], [])
@@ -209,7 +219,7 @@ class HostPoolGroup:
         self,
         need_size: int,
         *,
-        pool: PoolName | None = None,
+        pool: HostPoolName | None = None,
         reclaim: Callable[[int], Any] | None = None,
         start_owner: int | None = None,
     ) -> torch.Tensor | None:
@@ -223,7 +233,7 @@ class HostPoolGroup:
             indices = host_pool.alloc(need_size, **kwargs)
         return indices
 
-    def free(self, indices: torch.Tensor, *, pool: PoolName | None = None) -> int:
+    def free(self, indices: torch.Tensor, *, pool: HostPoolName | None = None) -> int:
         return self.get_entry(pool).host_pool.free(indices)
 
     def resolve_host_transfers(
@@ -245,54 +255,64 @@ class HostPoolGroup:
         derived_transfers: list[PoolTransfer] = []
 
         def rollback() -> None:
-            for transfer, indices in allocated:
-                self.free(indices, pool=transfer.name)
+            error = None
+            while allocated:
+                transfer, indices = allocated.pop()
                 transfer.host_indices = None
+                try:
+                    self.free(indices, pool=transfer.name)
+                except BaseException as cleanup_error:
+                    # Drain the remaining allocations without retrying this one.
+                    if error is None:
+                        error = cleanup_error
+            if error is not None:
+                raise error
 
-        # Reclaiming one pool can evict another's slots. Keep allocation order
-        # identical across TP ranks even when transfers come from a Rust HashMap.
-        for transfer in sorted(transfers, key=lambda transfer: transfer.name):
-            if transfer.indices_from_pool is not None:
-                derived_transfers.append(transfer)
-                continue
-            if transfer.host_indices is not None or transfer.device_indices is None:
-                continue
-            entry = self.entry_map.get(transfer.name)
-            if entry is None:
-                continue
-            indices = self.alloc(
-                len(transfer.device_indices),
-                pool=transfer.name,
-                reclaim=entry.host_evict_fn,
-            )
-            if indices is None:
-                rollback()
-                return None
-            transfer.host_indices = indices
-            allocated.append((transfer, indices))
+        try:
+            # Reclaiming one pool can evict another's slots. Keep allocation order
+            # identical across TP ranks even when transfers come from a Rust HashMap.
+            for transfer in sorted(transfers, key=lambda transfer: transfer.name):
+                if transfer.indices_from_pool is not None:
+                    derived_transfers.append(transfer)
+                    continue
+                if transfer.host_indices is not None or transfer.device_indices is None:
+                    continue
+                entry = self.entry_map.get(transfer.name)
+                if entry is None:
+                    continue
+                indices = self.alloc(
+                    len(transfer.device_indices),
+                    pool=transfer.name,
+                    reclaim=entry.host_evict_fn,
+                )
+                if indices is None:
+                    rollback()
+                    return None
+                transfer.host_indices = indices
+                allocated.append((transfer, indices))
 
-        for transfer in derived_transfers:
-            if transfer.indices_from_pool == self.anchor_entry.name:
-                transfer.host_indices = primary_host_indices
+            for transfer in derived_transfers:
+                if transfer.indices_from_pool == self.anchor_entry.name:
+                    transfer.host_indices = primary_host_indices
+                    if transfer.device_indices is None:
+                        transfer.device_indices = primary_device_indices
+                    continue
+
+                source = merge_source_transfers(transfers, transfer.indices_from_pool)
+                if source is None:
+                    rollback()
+                    return None
+                transfer.host_indices = source.host_indices
                 if transfer.device_indices is None:
-                    transfer.device_indices = primary_device_indices
-                continue
-
-            source = next(
-                (
-                    candidate
-                    for candidate in transfers
-                    if candidate.indices_from_pool is None
-                    and candidate.name == transfer.indices_from_pool
-                ),
-                None,
-            )
-            if source is None:
+                    transfer.device_indices = source.device_indices
+        except BaseException as error:
+            # Allocation/reclaim callbacks may raise instead of returning None.
+            # Nothing has been submitted to DMA at this transaction boundary.
+            try:
                 rollback()
-                return None
-            transfer.host_indices = source.host_indices
-            if transfer.device_indices is None:
-                transfer.device_indices = source.device_indices
+            except BaseException as cleanup_error:
+                raise error from cleanup_error
+            raise
         return transfers
 
     def release_transfers(self, transfers: list[PoolTransfer] | None) -> int:
@@ -349,5 +369,5 @@ class HostPoolGroup:
         for entry in self.entries:
             entry.host_pool.destroy()
 
-    def available_size(self, pool: PoolName | None = None):
+    def available_size(self, pool: HostPoolName | None = None):
         return self.get_entry(pool).host_pool.available_size()

@@ -137,6 +137,9 @@ def prepare_humming_moe_layer(layer: FusedMoE, quant_config: dict):
             input_schema=input_schema,
             use_deepep_fp8_dispatch=use_deepep_fp8_dispatch,
         )
+        # Free the replaced blocks before later allocations split them and strand
+        # the rest.
+        torch.cuda.empty_cache()
 
     if not hasattr(layer, "locks"):
         device = layer.w13_weight.device

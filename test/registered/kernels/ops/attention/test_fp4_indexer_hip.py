@@ -92,7 +92,7 @@ from sglang.test.kernels.deepseek_v4.fp4_index_k_reference import (
     read_fp4_index_k_split,
 )
 
-register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=60, suite="base-b-test-1-gpu-small-amd-mi35x")
 
 pytestmark = pytest.mark.skipif(
     not (is_hip() and is_gfx95_supported()),
@@ -1227,9 +1227,9 @@ def _selected_slots(page_indices: torch.Tensor) -> list[list[int]]:
 
 
 # ---------------------------------------------------------------------------
-# DeepSeek-V4 C4 decode / DSpark target-verify on the row-group kernel
-# (SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP): the backend builds a row-group decode
-# workspace for both modes and the indexer scores verify rows as decode rows.
+# DeepSeek-V4 C4 decode / DSpark target-verify on the row-group kernel: the
+# backend builds a row-group decode workspace for both modes and the indexer
+# scores verify rows as decode rows.
 # ---------------------------------------------------------------------------
 
 _C4_RATIO = 4

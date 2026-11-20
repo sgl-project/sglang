@@ -1,12 +1,10 @@
 import itertools
-import os
 
-import pytest
 import torch
 import triton
 from sgl_kernel import topk_softmax
 
-from sglang.utils import is_in_ci
+from sglang.srt.environ import envs
 
 # Optional vLLM import
 try:
@@ -34,7 +32,7 @@ except ImportError:
     musa_topk_softmax = None
     MUSA_AVAILABLE = False
 
-IS_CI = is_in_ci()
+IS_CI = envs.SGLANG_IS_IN_CI.get()
 
 
 def vllm_topk_softmax(gating_output, topk):
@@ -184,13 +182,13 @@ def benchmark(num_tokens, num_experts, topk, provider):
         (num_tokens, num_experts), device="cuda", dtype=torch.float32
     )
 
-    if provider == "vllm" or provider == "vllm1":
+    if provider == "vllm":
         if not VLLM_AVAILABLE:
             return (0, 0, 0)
         fn = lambda: vllm_topk_softmax(gating_output, topk)
-    elif provider == "sglang" or provider == "sglang1":
+    elif provider == "sglang":
         fn = lambda: sglang_topk_softmax(gating_output, topk)
-    elif provider == "musa" or provider == "musa1":
+    elif provider == "musa":
         if not MUSA_AVAILABLE:
             return (0, 0, 0)
         fn = lambda: musa_topk_softmax_fn(gating_output, topk)

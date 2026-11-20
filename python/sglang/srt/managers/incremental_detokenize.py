@@ -12,7 +12,6 @@ from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
 import msgspec
 
 from sglang.srt.environ import envs
-from sglang.utils import find_printable_text
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -23,6 +22,50 @@ logger = logging.getLogger(__name__)
 PROMPT_TAIL_LEN = 5
 
 DETOKENIZER_MAX_STATES = envs.SGLANG_DETOKENIZER_MAX_STATES.get()
+
+
+def _is_chinese_char(cp: int):
+    """Checks whether CP is the codepoint of a CJK character."""
+    # This defines a "chinese character" as anything in the CJK Unicode block:
+    #   https://en.wikipedia.org/wiki/CJK_Unified_Ideographs_(Unicode_block)
+    #
+    # Note that the CJK Unicode block is NOT all Japanese and Korean characters,
+    # despite its name. The modern Korean Hangul alphabet is a different block,
+    # as is Japanese Hiragana and Katakana. Those alphabets are used to write
+    # space-separated words, so they are not treated specially and handled
+    # like the all of the other languages.
+    if (
+        (cp >= 0x4E00 and cp <= 0x9FFF)
+        or (cp >= 0x3400 and cp <= 0x4DBF)  #
+        or (cp >= 0x20000 and cp <= 0x2A6DF)  #
+        or (cp >= 0x2A700 and cp <= 0x2B73F)  #
+        or (cp >= 0x2B740 and cp <= 0x2B81F)  #
+        or (cp >= 0x2B820 and cp <= 0x2CEAF)  #
+        or (cp >= 0xF900 and cp <= 0xFAFF)
+        or (cp >= 0x2F800 and cp <= 0x2FA1F)  #
+    ):  #
+        return True
+
+    return False
+
+
+def find_printable_text(text: str):
+    """Returns the longest printable substring of text that contains only entire words."""
+    # Borrowed from https://github.com/huggingface/transformers/blob/061580c82c2db1de9139528243e105953793f7a2/src/transformers/generation/streamers.py#L99
+
+    # After the symbol for a new line, we flush the cache.
+    if text.endswith("\n"):
+        return text
+    # If the last token is a CJK character, we print the characters.
+    elif len(text) > 0 and _is_chinese_char(ord(text[-1])):
+        return text
+    # Otherwise if the penultimate token is a CJK character, we print the characters except for the last one.
+    elif len(text) > 1 and _is_chinese_char(ord(text[-2])):
+        return text[:-1]
+    # Otherwise, prints until the last space char (simple heuristic to avoid printing incomplete words,
+    # which may change with the subsequent token -- there are probably smarter ways to do this!)
+    else:
+        return text[: text.rfind(" ") + 1]
 
 
 class DetokenizeHeader(
@@ -41,12 +84,20 @@ class DetokenizeHeader(
     http_worker_ipc: Optional[str]
 
 
-def build_detokenize_header(req: Req) -> DetokenizeHeader:
+def build_detokenize_header(
+    req: Req, *, output_prefix_len: int = 0
+) -> DetokenizeHeader:
     prompt_ids = req.origin_input_ids_unpadded
     surr_offset = max(len(prompt_ids) - PROMPT_TAIL_LEN, 0)
+    prompt_tail_ids = prompt_ids[surr_offset:]
+    if output_prefix_len:
+        # tokens skipped before the first emission still provide decoding
+        # context, but must not become part of the answer
+        prompt_tail_ids = array("q", prompt_tail_ids)
+        prompt_tail_ids.extend(req.output_ids[:output_prefix_len])
     sampling_params = req.sampling_params
     return DetokenizeHeader(
-        prompt_tail_ids=prompt_ids[surr_offset:],
+        prompt_tail_ids=prompt_tail_ids,
         skip_special_tokens=sampling_params.skip_special_tokens,
         spaces_between_special_tokens=sampling_params.spaces_between_special_tokens,
         no_stop_trim=sampling_params.no_stop_trim,

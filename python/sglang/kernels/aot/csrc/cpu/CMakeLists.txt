@@ -99,6 +99,7 @@ set(SGLANG_CPU_X86_ONLY_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/moe_int4.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/moe_int8.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/qkv_proj.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/quant_fp8.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/mamba/conv.cpp
 )
 
@@ -128,6 +129,26 @@ if(MY_ARCH_DIR STREQUAL "x86_64")
         -mamx-int8
         -fopenmp
     )
+
+    include(CheckCXXSourceCompiles)
+    include(CMakePushCheckState)
+    cmake_push_check_state(RESET)
+    set(CMAKE_REQUIRED_FLAGS "-march=x86-64-v4")
+    check_cxx_source_compiles("
+        #include <immintrin.h>
+        __attribute__((target(\"avx10.2\"))) int convert(int value) {
+            return _mm_cvtsi128_si32(_mm256_cvtph_hf8(_mm256_castsi256_ph(_mm256_set1_epi16(value))));
+        }
+        int main(int argc, char**) {
+            return __builtin_cpu_supports(\"avx10.2\") ? convert(argc) : 0;
+        }
+    " SGLANG_CXX_AVX10_2_INTRINSICS_FOUND)
+    cmake_pop_check_state()
+
+    if(SGLANG_CXX_AVX10_2_INTRINSICS_FOUND)
+        message(STATUS "AVX10.2 toolchain support detected: enabling CPU AVX10.2 kernels with runtime dispatch")
+        add_compile_definitions(CPU_CAPABILITY_AVX10_2)
+    endif()
 else()
     add_compile_options(
         -O3

@@ -23,10 +23,8 @@ from typing import Any, Optional, Sequence, Union
 import PIL.Image
 import torch
 
-from sglang.multimodal_gen.configs.sample.sampling_params import (
-    DataType,
-    SamplingParams,
-)
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.task_type import DataType
 from sglang.multimodal_gen.runtime.post_training.flow_rollout_controller import (
     FlowRolloutController,
 )
@@ -99,7 +97,6 @@ class Req:
     preprocessed_image: torch.Tensor | None = None
     preprocessed_video: torch.Tensor | None = None
 
-    output_file_ext: str | None = None
     # Primary encoder embeddings
     prompt_embeds: list[torch.Tensor] | torch.Tensor = field(default_factory=list)
     negative_prompt_embeds: list[torch.Tensor] | None = None
@@ -145,7 +142,6 @@ class Req:
 
     # Audio Latents
     audio_latents: torch.Tensor | None = None
-    audio_noise: torch.Tensor | None = None
     raw_audio_latent_shape: tuple[int, ...] | None = None
     did_sp_shard_audio_latents: bool = False
     sp_audio_start_frame: int = 0
@@ -168,10 +164,6 @@ class Req:
     condition_image_latent_ids: torch.Tensor | list[torch.Tensor] | None = None
     vae_image_sizes: list[tuple[int, int]] | None = None
     c2ws_plucker_emb: torch.Tensor | None = None
-
-    # Latent dimensions
-    height_latents: list[int] | int | None = None
-    width_latents: list[int] | int | None = None
 
     # Timesteps
     timesteps: torch.Tensor | None = None

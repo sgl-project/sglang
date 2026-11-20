@@ -1,6 +1,6 @@
 ---
 name: write-sglang-test
-description: Guide for writing SGLang CI/UT tests. Covers CustomTestCase, CI registration, server fixtures, model selection, mock testing, and test placement. Always read test/README.md for the full CI layout, how to run tests, and extra tips. Use when creating new tests, adding CI test cases, writing unit tests, or when the user asks to add tests for SGLang features.
+description: Guide for writing SGLang CI/UT tests. Covers CustomTestCase, CI registration, which tier (base, extra, nightly, weekly) and runner a test belongs to, server fixtures, model selection, mock testing, and test placement. Always read test/README.md for the full CI layout, how to run tests, and extra tips. Use when creating new tests, adding CI test cases, writing unit tests, moving a test between tiers, or when the user asks to add tests for SGLang features.
 ---
 
 # Writing SGLang CI / UT Tests
@@ -49,7 +49,7 @@ JIT kernel notes:
 | **Common / backend-independent** (middleware, abort, routing, config, arg parsing) | `DEFAULT_SMALL_MODEL_NAME_FOR_TEST` (1B) | `register_cuda_ci` only | `base-b-test-1-gpu-small` |
 | **Model-agnostic functionality** (sampling, session, OpenAI API features) | `DEFAULT_SMALL_MODEL_NAME_FOR_TEST` (1B) | `register_cuda_ci` (+ AMD if relevant) | `base-b-test-1-gpu-small` |
 | **General performance** (single node, no spec/DP/parallelism) | `DEFAULT_MODEL_NAME_FOR_TEST` (8B) | `register_cuda_ci` | `base-b-test-1-gpu-large` |
-| **Bigger features** (spec, DP, TP, disaggregation) | Case by case | Case by case | See **Choosing a Suite** below |
+| **Bigger features** (spec, DP, TP, disaggregation) | Case by case | Case by case | See **Choosing a Tier** and **Choosing a Runner** below |
 
 **Key principle for E2E tests**: Do NOT add `register_amd_ci` unless the test specifically exercises AMD/ROCm code paths. Common E2E tests just need any GPU to run — duplicating across backends wastes CI time with no extra coverage.
 
@@ -70,9 +70,16 @@ Defined in `python/sglang/test/test_utils.py`:
 
 A per-commit suite name is **generated** from registration metadata as `{stage}-test-{runner_config}` — you don't hand-write it:
 
-- **`stage`** — the CI stage (e.g. `base-b`, `base-b-kernel-unit`, `base-c`).
+- **`stage`** — the CI stage, with the kind when there is one (e.g. `base-b`, `base-b-kernel-unit`, `base-b-diffusion`, `base-c`).
 - **`runner_config`** — a runner-pool key from `scripts/ci/runner_configs.yml`, which maps it to the physical runner label (so `1-gpu-large` runs on `1-gpu-h100`). AMD/NPU use their own keys (e.g. `amd`).
 - **Suite** — `register_cuda_ci(stage="base-b", runner_config="1-gpu-small")` → `base-b-test-1-gpu-small`, the name you pass to `run_suite.py --suite`. The `-test-` is just the connector; never put it in `register_*_ci`.
+
+Every hardware follows one shape, `<tier>[-<stage>]-[<kind>-]test-<runner>[-<hardware>][-<variant>]`:
+
+- **Tier** — `base` or `extra` per commit, then `nightly`, `weekly`, or NPU's `full`. NVIDIA and AMD have both `base` and `extra`; every other hardware only has `extra`, which runs on a PR with its `run-ci-<hardware>-extra` label.
+- **Stage letter** — only where jobs run in stage order (NVIDIA, AMD, NPU); suites one job runs as a single pool have none (`extra-test-cpu-intel`).
+- **Kind** — optional, what the suite holds (`kernel-unit`, `diffusion`, `diffusion-unit`, `disaggregation`). It always comes before `test`, never after; on CUDA it is part of `stage` (`stage="base-b-diffusion"` → `base-b-diffusion-test-1-gpu-large`).
+- **Hardware** — omitted for NVIDIA, otherwise a suffix after the runner (`base-b-test-1-gpu-small-amd-mi35x`, `extra-b-test-2-npu-a3`, `nightly-accuracy-test-8-gpu-amd-mi35x-kimi-k31-pro`).
 
 > CUDA nightly uses the same shape with `stage="nightly"` (e.g. `stage="nightly", runner_config="1-gpu-large"` → `nightly-test-1-gpu-large`) and **no** `nightly=True` — the stage name carries the cadence, and setting the flag makes the test silently never run. Legacy single-string `suite=` is left only for `stress` and some AMD/CPU/NPU pools.
 
@@ -96,11 +103,27 @@ named `nightly-test-{runner_config}` — one suite per machine type, holding eve
 that runs nightly on it, with `auto_partition` splitting the work. There is no
 per-purpose split; kernel, eval, perf, and precision all share their machine's suite.
 
-> **Note**: Multimodal diffusion uses `python/sglang/multimodal_gen/test/run_suite.py`, not `test/run_suite.py`.
+> **Note**: A CUDA diffusion test carries the kind in its stage and uses a generic runner_config (for example `stage="base-b-diffusion-unit", runner_config="1-gpu-large"` → `base-b-diffusion-unit-test-1-gpu-large`). The `diffusion*` kinds map to the diffusion install in `kind_installs` of `scripts/ci/runner_configs.yml`; those suites run in `pr-test-multimodal-gen.yml`. AMD diffusion uses `python/sglang/multimodal_gen/test/run_suite.py`.
 
-### Choosing a Suite
+### Choosing a Tier
 
-Use the lightest suite that meets your test's needs:
+The stage sets how often a test runs; when each tier runs is in [ci-workflow-guide, Tiers](../ci-workflow-guide/SKILL.md#tiers). Tests outside base do not run on a normal PR, but `/rerun-test` runs a test of any tier on a PR (see the [rerun-test](../rerun-test/SKILL.md) skill). As a rough guide:
+
+- **base**: core paths that most users hit with default settings, cheap unit tests, and a representative e2e for each major feature. Every PR pays for it, so keep it small.
+- **extra**: features with real users that are off the default path, the current flagship models, and important accuracy gates.
+- **nightly**: niche configurations, and accuracy or performance gates for less-used models.
+- **weekly**: older or rarely used models, kept covered at low cost.
+
+When unsure, follow where similar tests are registered and raise the choice in the PR.
+
+Across tiers:
+
+- **Change the stage, not the runner.** When the target tier lacks the test's runner, add that runner to the tier ([ci-workflow-guide](../ci-workflow-guide/SKILL.md#how-to-add-a-runner-to-a-tier)).
+- **CPU tests stay in `base-a-test-cpu`.** They are cheap and surface problems on every PR; a CPU test that is redundant or never runs is deleted, not moved to a later tier.
+
+### Choosing a Runner
+
+Use the lightest runner that meets your test's needs:
 
 - **No GPU required** → `base-a-test-cpu`
 - **Most small GPU tests** → `base-b-test-1-gpu-small` (default choice)
@@ -129,7 +152,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
-# Unit tests are CPU-only. GPU operator tests belong under `kernel/`.
+# Unit tests are CPU-only. GPU operator tests belong under `kernels/ops/`.
 
 class TestTargetClass(CustomTestCase):
     def test_basic_behavior(self):
@@ -312,8 +335,8 @@ register_cuda_ci(est_time=200, stage="nightly", runner_config="1-gpu-large")
 
 # Multi-backend test (only when testing backend-specific code paths)
 register_cuda_ci(est_time=80, stage="base-a", runner_config="1-gpu-small")
-register_amd_ci(est_time=120, suite="stage-a-test-1-gpu-small-amd")
-register_npu_ci(est_time=400, suite="nightly-8-npu-a3", nightly=True)
+register_amd_ci(est_time=120, suite="base-a-test-1-gpu-small-amd")
+register_npu_ci(est_time=400, suite="nightly-test-8-npu-a3", nightly=True)
 
 # Temporarily disabled test
 register_cuda_ci(
@@ -339,9 +362,9 @@ They are ordinary registered tests; only their stage differs:
 from sglang.test.ci.ci_register import register_cuda_ci
 
 # Correctness tests in test/registered/kernels/ops/<group>/
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
-register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="8-gpu-h200")
 
 # Benchmarks in test/registered/kernels/benchmark/<group>/
 register_cuda_ci(est_time=6, stage="base-b-kernel-benchmark", runner_config="1-gpu-large")
@@ -361,7 +384,7 @@ Every call generates a suite named `{stage}-test-{runner_config}`, e.g. `base-b-
 test/
 ├── registered/          # CI tests (auto-discovered by run_suite.py)
 │   ├── unit/<subsystem>/      # CPU-only; no server or model weights
-│   ├── kernel/<group>/        # accelerator operator correctness/benchmarks
+│   ├── kernels/{ops,benchmark}/<group>/  # accelerator operator correctness/benchmarks
 │   ├── e2e/<subsystem>/       # engine/server integration
 │   ├── accuracy/<family>/     # scheduled eval floors
 │   ├── perf/<family>/         # scheduled latency/throughput contracts

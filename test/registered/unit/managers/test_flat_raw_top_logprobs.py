@@ -433,7 +433,9 @@ class TestFlatOutputTopLogprobs(CustomTestCase):
 def _make_logprob_processor() -> SchedulerLogprobResultProcessor:
     # enable_mis comes from the published exec bag, not from here; see setUp.
     return SchedulerLogprobResultProcessor(
-        model_config=SimpleNamespace(vocab_size=1_000_000),
+        model_config=SimpleNamespace(
+            vocab_size=1_000_000, token_id_vocab_size=1_000_000
+        ),
     )
 
 
@@ -730,7 +732,8 @@ def _make_batch_token_id_output(**overrides) -> BatchTokenIDOutput:
     fields = dict(
         rids=["r0", "r1"],
         finished_reasons=[None] * n,
-        output_ids=None,
+        output_ids_flat=array("q"),
+        output_ids_offsets=[0] * (n + 1),
         reasoning_tokens=[0] * n,
         completion_tokens=[1] * n,
         input_token_logprobs_val=[[], []],
