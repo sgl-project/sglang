@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Wan2.2-S2V before-denoising stage: residency, output rate, remote-input downloads."""
 
+from contextlib import ExitStack
+from io import BytesIO
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -182,40 +185,48 @@ def test_stage_saves_at_the_checkpoint_rate_not_the_requested_one(tmp_path):
     assert batch.fps == 16
 
 
-class _Response:
-    def __init__(self, body):
-        self._body = body
+def test_remote_inputs_have_independent_lifetimes(tmp_path, monkeypatch):
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    interrupted = BytesIO()
+    interrupted.read = Mock(side_effect=[b"partial", TimeoutError()])
+    stage = _stage()
+    url = "https://example.invalid/talk.wav"
+    with patch.object(
+        stage_module, "urlopen", side_effect=[interrupted, BytesIO(b"A"), BytesIO(b"B")]
+    ):
+        with pytest.raises(TimeoutError), ExitStack() as files:
+            stage._get_single_path(url, "audio_path", files)
+        assert not list(tmp_path.iterdir())
+        with ExitStack() as first:
+            a = Path(stage._get_single_path(url, "audio_path", first))
+            with ExitStack() as second:
+                b = Path(stage._get_single_path(url, "audio_path", second))
+                assert a != b and (a.read_bytes(), b.read_bytes()) == (b"A", b"B")
+                assert a.parent.parent == b.parent.parent == tmp_path
+                assert a.parent.stat().st_mode & 0o077 == 0
+            assert a.exists() and not b.exists()
+    assert not list(tmp_path.iterdir())
 
-    def __enter__(self):
-        return self
 
-    def __exit__(self, *exc):
-        return False
-
-    def read(self):
-        if isinstance(self._body, Exception):
-            raise self._body
-        return self._body
-
-
-def test_retry_after_failed_download_gets_the_whole_file(tmp_path):
-    """The download cache returns any file already at its path, so a download that times out
-    mid-body must not leave one there for the retry to pick up."""
-    stage = object.__new__(stage_module.WanS2VBeforeDenoisingStage)
-    responses = iter(
-        [_Response(TimeoutError("read timed out")), _Response(b"RIFF-complete")]
+def test_encoder_failure_releases_owned_inputs_only(tmp_path, monkeypatch):
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    local = tmp_path / "reference.jpg"
+    local.write_bytes(b"caller owned")
+    stage = _stage()
+    stage.transformer = SimpleNamespace(supports_standard_denoising=True)
+    batch = SimpleNamespace(
+        image_path=[str(local)],
+        audio_path="https://example.invalid/audio",
+        pose_video_path=None,
     )
     with (
-        patch.object(stage_module.tempfile, "gettempdir", return_value=str(tmp_path)),
-        patch.object(stage_module, "urlopen", lambda *a, **kw: next(responses)),
+        patch.object(stage_module, "urlopen", return_value=BytesIO(b"fixture")),
+        patch.object(stage, "_encode_local_inputs", side_effect=ValueError("fixture")),
+        pytest.raises(ValueError, match="fixture"),
     ):
-        with pytest.raises(TimeoutError):
-            stage._download_remote_input("https://example.com/talk.wav", "audio_path")
-        path = stage._download_remote_input(
-            "https://example.com/talk.wav", "audio_path"
-        )
-    with open(path, "rb") as f:
-        assert f.read() == b"RIFF-complete"
+        stage.forward(batch, SimpleNamespace())
+    assert list(tmp_path.iterdir()) == [local]
+    assert local.read_bytes() == b"caller owned"
 
 
 class _T5Stub(torch.nn.Module):

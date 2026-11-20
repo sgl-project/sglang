@@ -6,6 +6,15 @@ import tempfile
 from pathlib import Path
 
 
+def temporary_media_directory() -> tempfile.TemporaryDirectory:
+    # tempfile's implicit search can fall back to another disk. A configured
+    # per-service scratch volume must either be used or fail the request.
+    root = os.environ.get("TMPDIR") or None
+    if root is not None and not os.path.isabs(root):
+        raise ValueError("TMPDIR for temporary media must be an absolute path")
+    return tempfile.TemporaryDirectory(prefix="sglang_", dir=root)
+
+
 def ensure_path_within_root(target_path: str, root_dir: str) -> str:
     root_path = Path(root_dir).resolve()
     candidate = Path(target_path).resolve()

@@ -5,7 +5,6 @@ import inspect
 import json
 import os
 import re
-import shutil
 import tempfile
 import time
 from contextlib import contextmanager, suppress
@@ -30,6 +29,7 @@ from sglang.multimodal_gen.runtime.utils.image_io import (
     ensure_path_within_root,
     save_base64_image_to_path,
     save_image_bytes_to_path,
+    temporary_media_directory,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
@@ -219,11 +219,8 @@ def temp_dir_if_disabled(
         os.makedirs(configured_path, exist_ok=True)
         yield configured_path
     else:
-        tmp = tempfile.mkdtemp(prefix="sglang_")
-        try:
+        with temporary_media_directory() as tmp:
             yield tmp
-        finally:
-            shutil.rmtree(tmp, ignore_errors=True)
 
 
 def choose_output_image_ext(
