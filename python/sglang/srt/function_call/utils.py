@@ -464,6 +464,25 @@ def _parse_finite_float(value: str) -> float:
     return number
 
 
+def json_safe_value(value: Any, raw: str, param_name: str, func_name: str) -> Any:
+    """Return ``value`` when it can be written as strict JSON, else ``raw``.
+
+    A tool call's ``arguments`` must be valid JSON. A converted value that
+    ``json.dumps`` would write as ``NaN``/``Infinity`` (a non-finite float), or
+    would refuse to write at all (``set``, ``bytes``, ``complex``, ...), cannot
+    go there, so the parameter degenerates to the text the model produced.
+    """
+    try:
+        json.dumps(value, allow_nan=False)
+    except (TypeError, ValueError):
+        logger.warning(
+            f"Parsed value '{raw}' of parameter '{param_name}' is not representable in JSON in tool "
+            f"'{func_name}', degenerating to string."
+        )
+        return raw
+    return value
+
+
 def convert_string_union_value(
     value: str, schema: Any, root_schema: Optional[dict] = None
 ) -> Any:
