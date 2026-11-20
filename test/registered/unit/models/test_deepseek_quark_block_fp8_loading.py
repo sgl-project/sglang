@@ -78,6 +78,7 @@ def _weight_updater(model):
 _FUSED_QKV_A_SCALE = (
     "model.layers.0.self_attn.fused_qkv_a_proj_with_mqa.weight_scale_inv"
 )
+_FUSED_INDEXER = "model.layers.0.self_attn.indexer.wk_weights_proj.weight"
 _Q_A_SCALE = "model.layers.0.self_attn.q_a_proj.weight_scale"
 _KV_A_SCALE = "model.layers.0.self_attn.kv_a_proj_with_mqa.weight_scale"
 
@@ -173,23 +174,6 @@ class TestQuarkBlockFp8WeightLoading(CustomTestCase):
         )
         self.assertEqual(loader.discard_pending_weight_halves(), [])
 
-    def test_discard_names_and_drops_a_half_without_its_pair(self):
-        """A session that ends with a half still pending reports the name it was
-        sent under, and the next starts clean."""
-        fused_name = "model.layers.0.self_attn.indexer.wk_weights_proj.weight"
-        fused_param = torch.zeros((4, 4), dtype=torch.bfloat16)
-        loader = _FakeDeepseekLoader({fused_name: fused_param})
-        wk_scale_name = "model.layers.0.self_attn.indexer.wk.weight_scale_inv"
-
-        loader.do_load_weights(
-            [(_Q_A_SCALE, torch.ones((2, 3))), (wk_scale_name, torch.ones((1, 1)))]
-        )
-
-        self.assertEqual(
-            loader.discard_pending_weight_halves(), sorted([_Q_A_SCALE, wk_scale_name])
-        )
-        self.assertEqual(loader.discard_pending_weight_halves(), [])
-
     def test_begin_weight_update_drops_a_half_left_by_an_earlier_load(self):
         """A half startup left must not pair with the session's other half."""
         target = _FakeParam()
@@ -281,11 +265,10 @@ class TestQuarkBlockFp8WeightLoading(CustomTestCase):
 
     def test_fp8_indexer_wk_scale_and_weight_pair_across_load_weights_calls(self):
         """The indexer wk pair is held apart from the a_proj pair, and is cloned too."""
-        fused_name = "model.layers.0.self_attn.indexer.wk_weights_proj.weight"
         fused_param = torch.nn.Parameter(
             torch.zeros((4, 4), dtype=torch.bfloat16), requires_grad=False
         )
-        loader = _FakeDeepseekLoader({fused_name: fused_param})
+        loader = _FakeDeepseekLoader({_FUSED_INDEXER: fused_param})
         loader.quant_config.weight_block_size = [128, 128]
         wk_scale = torch.ones((1, 1), dtype=torch.float32)
         wk_weight = torch.ones((2, 4), dtype=torch.float8_e4m3fn)
@@ -311,19 +294,34 @@ class TestQuarkBlockFp8WeightLoading(CustomTestCase):
         torch.testing.assert_close(fused_param[:2], dequantized)
         self.assertEqual(loader.discard_pending_weight_halves(), [])
 
+        # weights_proj, bf16 in the checkpoint, fills the bottom rows
+        weights_proj = torch.full((2, 4), 2.0, dtype=torch.bfloat16)
+        loader.do_load_weights(
+            [("model.layers.0.self_attn.indexer.weights_proj.weight", weights_proj)]
+        )
+        torch.testing.assert_close(fused_param[-2:], weights_proj)
+        torch.testing.assert_close(fused_param[:2], dequantized)
+
     def test_end_weight_update_reports_halves_held_by_a_wrapped_model(self):
         """A VLM holds the DeepSeek model as a submodule; its halves still fail the update."""
-        loader = _FakeDeepseekLoader({})
+        loader = _FakeDeepseekLoader(
+            {_FUSED_INDEXER: torch.zeros((4, 4), dtype=torch.bfloat16)}
+        )
         wrapper = torch.nn.Module()
         wrapper.language_model = loader
         names = [f"model.layers.{i}.self_attn.q_a_proj.weight" for i in range(9)]
-        loader.do_load_weights([(name, torch.ones((2, 3))) for name in names])
+        wk_scale_name = "model.layers.0.self_attn.indexer.wk.weight_scale_inv"
+        loader.do_load_weights(
+            [(name, torch.ones((2, 3))) for name in names]
+            + [(wk_scale_name, torch.ones((1, 1)))]
+        )
         updater = _weight_updater(wrapper)
 
         message = updater.end_weight_update(run_post_load=False)
 
-        self.assertIn("one half of 9 fused weights", message)
+        self.assertIn("one half of 10 fused weights", message)
         self.assertIn(names[0], message)
+        self.assertIn(wk_scale_name, message)
         self.assertIsNone(updater.end_weight_update(run_post_load=False))
 
     def test_unfused_quark_scale_loads_into_scale_inv(self):
