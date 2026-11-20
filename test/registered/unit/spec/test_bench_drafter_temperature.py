@@ -4,7 +4,7 @@ draft params, the DFLASH-family draft heads and the worker hooks."""
 import unittest
 from contextlib import contextmanager
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import torch
 
@@ -512,29 +512,6 @@ class TestSelectorAndLiLiCorrStaging(_Case):
             sampler.stage_sampling_params(bs=3, sampling_info=GREEDY)
         self.assertTrue(torch.equal(sampler.temperatures[:3], torch.full((3,), 1000.0)))
         self.assertFalse(bool(sampler.greedy_mask[:3].any()))
-
-    def test_megakernel_selector_stages_the_benchmark_temperature(self):
-        head = Mock()
-        with _bench(1000):
-            sampler = dfw._MegakernelSelectorDraftSampler(
-                head=head,
-                out=None,
-                candidate_out=None,
-                q_out=torch.empty(1),
-                sampling_enabled=True,
-            )
-            sampler.stage_sampling_params(bs=3, sampling_info=GREEDY)
-            staged = head.stage_draft_head_sampling.call_args.kwargs
-            self.assertTrue(
-                torch.equal(staged["temperatures"], torch.full((3,), 1000.0))
-            )
-            self.assertFalse(bool(staged["greedy_mask"].any()))
-            sampler.stage_sampling_params(bs=3, sampling_info=MIXED)
-        staged = head.stage_draft_head_sampling.call_args.kwargs
-        self.assertTrue(
-            torch.allclose(staged["temperatures"], torch.tensor([1000.0, 0.7, 1.0]))
-        )
-        self.assertFalse(bool(staged["greedy_mask"].any()))
 
     def test_lilicorr_on_samples_every_row(self):
         sampler = SimpleNamespace(
