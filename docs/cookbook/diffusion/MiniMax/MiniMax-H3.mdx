@@ -874,18 +874,21 @@ Keep `pdd_config.json` beside `pdd_fused_heads.safetensors`, outside the
 a separate output directory, and `--model-variant ref2va`.
 
 The fused heads are served from that file, not from `transformer/` parameters.
-A full-weight tensor update, one sent without `weight_update_mode`, replaces a
-head stack when it carries it as `final_layer.pdd_fused_heads.<key>`, with the
-key and the full tensor of `pdd_fused_heads.safetensors` (for example
+A full-weight update sent as tensors or over a distributed group, without
+`weight_update_mode`, replaces a head stack when it carries it as
+`final_layer.pdd_fused_heads.<key>`, with the key and the full tensor of
+`pdd_fused_heads.safetensors` (for example
 `final_layer.pdd_fused_heads.video_out.weight`, `[steps, out_features,
 in_features]`). The stacks of one update are checked together: a stack with
 another step count fails the update before any of them is replaced.
 
 No other update reaches the head stacks, which stay the startup file's or the
-last full-weight tensor update's:
+last such update's:
 
-- A `lora_merge` tensor update loads adapters only.
-- A server with an AdaLN cache rejects every tensor update.
+- A `lora_merge` update loads adapters only.
+- A server with an AdaLN cache rejects every full-weight tensor or distributed
+  update. To update the heads, serve with `--minimax-h3-adaln-online false`
+  and without `--minimax-h3-adaln-cache-path`.
 - A disk weight update reads module directories such as `transformer/`, never
   the fused heads file.
 
