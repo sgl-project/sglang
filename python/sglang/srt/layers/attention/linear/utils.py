@@ -134,6 +134,22 @@ def select_verify_intermediate_state_indices(
     )
 
 
+def max_verify_batch_size(pool_size: int) -> int:
+    """The most rows a verify batch over `pool_size` requests can have once
+    eager warmup, MLP sync or a CUDA graph pads it (see
+    `build_verify_intermediate_state_indices`)."""
+    from sglang.srt.layers.dp_attention import (
+        get_cuda_graph_max_batch_size,
+        get_eager_max_batch_size,
+    )
+
+    return max(
+        pool_size,
+        get_eager_max_batch_size(pool_size),
+        get_cuda_graph_max_batch_size(pool_size),
+    )
+
+
 def build_verify_intermediate_state_indices(pool_size: int, device):
     """Per-request row index into the speculative intermediate scratch
     (`intermediate_ssm` / `intermediate_conv_window`) for the MTP /
@@ -151,16 +167,7 @@ def build_verify_intermediate_state_indices(pool_size: int, device):
     """
     import torch
 
-    from sglang.srt.layers.dp_attention import (
-        get_cuda_graph_max_batch_size,
-        get_eager_max_batch_size,
-    )
-
-    padded_bs = max(
-        pool_size,
-        get_eager_max_batch_size(pool_size),
-        get_cuda_graph_max_batch_size(pool_size),
-    )
+    padded_bs = max_verify_batch_size(pool_size)
     indices = torch.arange(pool_size, dtype=torch.int32, device=device)
     if padded_bs > pool_size:
         indices = torch.cat(
