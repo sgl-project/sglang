@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 import msgspec
 from typing_extensions import Self
 
+from sglang.srt.constants import is_health_check_request
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.observability.metrics_collector import (
@@ -339,6 +340,8 @@ class ReqTimeStatsBase:
         bootstrap_room: Optional[int],
         external_trace_header: Optional[Dict[str, str]] = None,
     ):
+        if is_health_check_request(rid):
+            return
         if is_async_tracing_available():
             self.trace_ctx = TraceReqContextAsync(
                 rid=rid,
