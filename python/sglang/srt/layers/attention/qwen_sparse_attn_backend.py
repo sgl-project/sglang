@@ -98,6 +98,27 @@ def _npu_sparse_attention(
     return sparse_attention(q, k_cache, v_cache, token_slots, softmax_scale)
 
 
+def _extend_token_to_batch_idx(forward_batch, batch_size: int, device) -> torch.Tensor:
+    """repeat_interleave(arange(batch_size), extend_seq_lens), sized from the host lens
+    when they line up; without them it reads the size back (a stream sync)."""
+    extend_seq_lens = forward_batch.extend_seq_lens
+    host_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
+    output_size = None
+    if (
+        host_lens is not None
+        and len(host_lens) == batch_size
+        and extend_seq_lens.dim() == 1
+        and extend_seq_lens.shape[0] == batch_size
+        and not (torch.cuda.is_available() and torch.cuda.is_current_stream_capturing())
+    ):
+        output_size = sum(int(x) for x in host_lens)
+    return torch.repeat_interleave(
+        torch.arange(batch_size, device=device, dtype=torch.int32),
+        extend_seq_lens.to(torch.long),
+        output_size=output_size,
+    )
+
+
 @lru_cache(maxsize=1)
 def _resolve_trtllm_sparse_decode():
     """FlashInfer paged decode for the post-gather sparse attention;
@@ -743,13 +764,8 @@ class QwenSparseAttnBackend(AttentionBackend):
                 extend_seq_lens = forward_batch.extend_seq_lens
                 if extend_seq_lens is None:
                     raise ValueError("QSA extend metadata requires extend_seq_lens")
-                token_to_batch_idx = torch.repeat_interleave(
-                    torch.arange(
-                        batch_size,
-                        device=sequence_lengths.device,
-                        dtype=torch.int32,
-                    ),
-                    extend_seq_lens.to(torch.long),
+                token_to_batch_idx = _extend_token_to_batch_idx(
+                    forward_batch, batch_size, sequence_lengths.device
                 )
                 # More mapped rows than physical would index past them;
                 # fewer is fine (DP MAX_LEN padding is trimmed downstream).

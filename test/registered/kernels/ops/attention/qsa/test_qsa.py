@@ -1153,6 +1153,30 @@ def test_qsa_extend_metadata_carries_host_sequence_lengths():
     assert indexer.prefill_sequence_lengths_cpu == (8, 6)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_qsa_extend_rows_take_the_host_lens_without_a_sync():
+    from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
+        _extend_token_to_batch_idx,
+    )
+
+    lens = [4, 0, 7, 1]
+    device_lens = torch.tensor(lens, dtype=torch.int32, device="cuda")
+    with_host = SimpleNamespace(extend_seq_lens=device_lens, extend_seq_lens_cpu=lens)
+    without_host = SimpleNamespace(extend_seq_lens=device_lens)
+    want = _extend_token_to_batch_idx(without_host, len(lens), "cuda")
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        got = _extend_token_to_batch_idx(with_host, len(lens), "cuda")
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    assert torch.equal(got, want)
+    assert got.tolist() == [0] * 4 + [2] * 7 + [3]
+    # Host lens that do not line up with the device tensor keep the device read.
+    short = SimpleNamespace(extend_seq_lens=device_lens, extend_seq_lens_cpu=lens[:2])
+    assert torch.equal(_extend_token_to_batch_idx(short, len(lens), "cuda"), want)
+
+
 def test_qsa_row_ranges_do_not_cross_sequences():
     sequence_lengths = torch.tensor([10, 7], dtype=torch.int32)
     query_positions = torch.tensor([8, 9, 4, 6], dtype=torch.int32)
