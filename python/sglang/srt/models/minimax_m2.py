@@ -115,7 +115,7 @@ if not _is_xpu:
     )
 
 if _is_npu:
-    from sgl_kernel_npu.norm.split_qkv_tp_rmsnorm_rope import split_qkv_tp_rmsnorm_rope
+    from sgl_kernel_npu.operators.norm import split_qkv_tp_rmsnorm_rope
 
 
 @triton.jit

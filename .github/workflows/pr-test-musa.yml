@@ -188,6 +188,8 @@ jobs:
       - name: Checkout code
         timeout-minutes: 10
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Install dependencies
         timeout-minutes: 30

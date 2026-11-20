@@ -166,6 +166,7 @@ def validate_layernorm_sp(
 ) -> None:
     """Fail loud for unsupported / incompatible configs. Callers gate on the flag."""
     from sglang.srt.layers.layernorm_sp import (
+        KIMI_K3_SP_ARCHITECTURES,
         SP_SUPPORTED_ARCHITECTURES,
         is_muse_spark_architecture,
     )
@@ -193,6 +194,11 @@ def validate_layernorm_sp(
                 "--enable-layernorm-sp requires attn_cp_size == 1 for Qwen4Exp; "
                 f"got attn_cp_size={attn_cp_size}."
             )
+    if architecture in KIMI_K3_SP_ARCHITECTURES and attn_cp_size != 1:
+        raise ValueError(
+            "--enable-layernorm-sp requires attn_cp_size == 1 for Kimi-K3; "
+            f"got attn_cp_size={attn_cp_size}."
+        )
     if architecture == "Glm5NextForConditionalGeneration":
         _validate_glm5_next_layernorm_sp(
             attn_cp_size=attn_cp_size,
@@ -237,13 +243,18 @@ def validate_layernorm_sp(
             "SP shards the sequence across the full TP group, which under DP "
             "attention spans data-parallel groups holding different sequences."
         )
-    if speculative_algorithm is not None and not (
+    gathers_aux_hidden_states = (
         is_muse_spark_architecture(architecture) and speculative_algorithm == "DFLASH"
-    ):
+    ) or (
+        architecture in KIMI_K3_SP_ARCHITECTURES
+        and speculative_algorithm in ("DFLASH", "DSPARK")
+    )
+    if speculative_algorithm is not None and not gathers_aux_hidden_states:
         raise ValueError(
             "--enable-layernorm-sp supports speculative decoding only with "
-            "Muse Spark DFLASH: other models/algorithms do not gather the "
-            "sequence-sharded auxiliary hidden states."
+            "Muse Spark DFLASH and Kimi-K3 DFLASH / DSPARK: other "
+            "models/algorithms do not gather the sequence-sharded auxiliary "
+            "hidden states."
         )
     if pp_size > 1:
         raise ValueError(
