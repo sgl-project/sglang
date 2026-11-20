@@ -94,15 +94,18 @@ class ExecFeatures(msgspec.Struct):
     watermark_algorithm: A[
         str,
         Arg(
-            help="The text watermarking algorithm: gumbel (Aaronson-Gumbel).",
+            help="The text watermarking algorithm: gumbel (Aaronson-Gumbel) or "
+            "synthid (SynthID Text).",
             choices=WATERMARK_ALGORITHM_CHOICES,
         ),
     ] = "gumbel"
     watermark_config: A[
         Optional[str],
         "Watermark settings as a JSON file path or an inline JSON object with "
-        "optional key, key_b, context_window, mixing_probability, max_probability, "
-        "default_enabled, and enforce_all fields.",
+        "optional default_enabled and enforce_all fields; gumbel reads key, key_b, "
+        "context_window, mixing_probability, and max_probability; synthid reads "
+        "keys, ngram_len, num_candidates, context_history_size, and "
+        "skip_first_ngram_calls.",
     ] = None
     watermark_key: A[
         Optional[str],
@@ -132,6 +135,26 @@ class ExecFeatures(msgspec.Struct):
         bool,
         Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
     ] = False
+    watermark_keys: A[
+        Optional[List[int]],
+        Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
+    ] = None
+    watermark_ngram_len: A[
+        Optional[int],
+        Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
+    ] = None
+    watermark_num_candidates: A[
+        Optional[int],
+        Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
+    ] = None
+    watermark_context_history_size: A[
+        Optional[int],
+        Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
+    ] = None
+    watermark_skip_first_ngram_calls: A[
+        Optional[bool],
+        Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
+    ] = None
     enable_return_hidden_states: A[
         bool,
         "Enable returning full hidden states with responses. Equivalent to "
@@ -774,6 +797,17 @@ class ExecGraph(msgspec.Struct):
         bool,
         "Enable profiling of cuda graph capture.",
     ] = False
+    cuda_graph_persistence: A[
+        Optional[Literal["save", "load"]],
+        Arg(
+            help="Persist the CUDA graphs across restarts with Foundry (optional dependency sglang[foundry]). 'save' captures as usual and writes the graphs and the memory layout they reference to an archive; 'load' rebuilds the graphs from that archive instead of capturing. SAVE and LOAD must use the same model, flags and GPUs. Decode graphs use the full backend; prefill graphs are 'full' or 'disabled' (default disabled).",
+            choices=["save", "load"],
+        ),
+    ] = None
+    cuda_graph_persistence_config: A[
+        Optional[str],
+        "Foundry TOML for --cuda-graph-persistence (workspace_root, base_addr, region_size, scratch_space_size, ...). Its 'mode' key is ignored: the flag's mode wins. Defaults: archive in ./foundry_archive.",
+    ] = None
     enable_cudagraph_gc: A[
         bool,
         "Enable garbage collection during CUDA graph capture. If disabled (default), GC is frozen and paused during capture, which speeds it up and keeps a collection from invalidating the graph.",
