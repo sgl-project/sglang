@@ -23,7 +23,8 @@ pub struct Limits {
     /// `model_config.vocab_size`; bounds client-supplied token ids. A required
     /// field of the `ServerArgs` schema, so intake can check unconditionally.
     pub vocab_size: u64,
-    /// `model_config.context_len`, the ceiling for input + `max_new_tokens`.
+    /// `model_config.context_len`; the prompt must leave at least one output
+    /// slot, and a client-sent `max_new_tokens` may not exceed the whole value.
     pub context_len: u64,
     /// Output slots reserved on top of the input (eagle draft tokens).
     pub num_reserved_tokens: u64,
