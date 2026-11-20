@@ -2856,10 +2856,13 @@ class UnifiedRadixCache(BasePrefixCache):
             self._storage_prefetch_wait[operation.handle] = wait
 
     def _prefetch_deadline_expired(self, operation: PrefetchOperation) -> bool:
-        if operation.host_indices is not None and (
-            operation.completed_tokens >= len(operation.hash_value) * self.page_size
+        if (
+            operation.host_indices is not None
+            and not operation.pool_transfers
+            and operation.completed_tokens >= len(operation.hash_value) * self.page_size
         ):
-            # KV landed: cutting the pending sidecar read would salvage nothing.
+            # KV-only completion can wait for the ACK. A hybrid read may
+            # still be waiting on a required sidecar after KV is complete.
             return False
         wait = self._storage_prefetch_wait.get(operation.handle)
         return wait is not None and (

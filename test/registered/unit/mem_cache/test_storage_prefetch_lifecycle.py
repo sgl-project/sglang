@@ -465,6 +465,20 @@ class TestWaitingStorageSpan(unittest.TestCase):
 
 
 class TestStoragePrefetchTimeout(unittest.TestCase):
+    def test_kv_completion_does_not_exempt_pending_sidecars_from_timeout(self):
+        cache, operation = _timeout_fixture(mode="cache")
+        operation.host_indices = torch.arange(2)
+        operation.hash_value = ["kv-page"]
+        operation.completed_tokens = 2
+        with patch("time.perf_counter", return_value=100.0):
+            cache._start_storage_prefetch_wait(operation)
+
+        with patch("time.perf_counter", return_value=103.0):
+            operation.pool_transfers = []
+            self.assertFalse(cache._prefetch_deadline_expired(operation))
+            operation.pool_transfers = [PoolTransfer(name=PoolName.SWA)]
+            self.assertTrue(cache._prefetch_deadline_expired(operation))
+
     def test_polls_never_reduce_and_the_tick_votes_once(self):
         """N waiting requests polled in one pass issue no collective; the tick
         issues exactly one MAX vote packed over every live prefetch, and only
