@@ -217,6 +217,7 @@ class TestNPUSparseDispatch(unittest.TestCase):
         self.namespace = dict(
             self.ops,
             _is_npu=True,
+            is_npu=lambda: True,
             maybe_dcp_kernel_indices=self.localize,
             logger=Mock(),
             torch=SimpleNamespace(
