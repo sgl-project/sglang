@@ -487,6 +487,8 @@ def attn_res_all_gather(
 
 # Measured on GB300 TP8 at 16K rows; re-tune when the kernels change.
 _SP_RS_BLOCKS = 96
+# A low-SM launch for a reduce-scatter that overlaps GEMMs on another stream.
+SP_RS_OVERLAP_BLOCKS = 16
 _SP_AG_BLOCKS = 32
 _SP_BLOCK_SIZE = 1024
 
@@ -571,7 +573,9 @@ def sp_partial_rows(name: str, like: torch.Tensor, width: int) -> torch.Tensor:
     return like.new_empty((rows, width))
 
 
-def sp_reduce_scatter(partial: torch.Tensor) -> torch.Tensor:
+def sp_reduce_scatter(
+    partial: torch.Tensor, num_blocks: int = _SP_RS_BLOCKS
+) -> torch.Tensor:
     """Sum a TP-partial ``[rows, width]`` output onto this rank's token-row
     shard, padding the rows to whole shards."""
     world_size = get_parallel().tp_group.world_size
@@ -593,5 +597,5 @@ def sp_reduce_scatter(partial: torch.Tensor) -> torch.Tensor:
         partial.new_empty((padded // world_size, partial.shape[1])),
         None,
         input_mc_ptr=k3_ar_fusion.get_mc_ptr(full),
-        tuning=_sp_tuning(_SP_RS_BLOCKS),
+        tuning=_sp_tuning(num_blocks),
     )

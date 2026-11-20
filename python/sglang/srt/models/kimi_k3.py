@@ -1652,7 +1652,11 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
         return router_logits, routed_input
 
     def _forward_fused(
-        self, hidden_states: torch.Tensor, *, prefix_sum: Optional[torch.Tensor]
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        prefix_sum: Optional[torch.Tensor],
+        scatters: bool = False,
     ) -> torch.Tensor:
         """Fused-front pipeline: read hidden_states once through the merged
         [H, gate_up + E + latent] weight (or its TP-sharded form, see
@@ -1661,7 +1665,10 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
         its slice via out=, the MoE runner writes its top-k sum via the
         zero-copy context — and all-reduce the pair in a single collective (the
         symmetric mempool keeps the one-shot allreduce path; same trick as
-        RowParallelLinear)."""
+        RowParallelLinear).
+
+        scatters: a sequence-parallel pass. The two sums are reduce-scattered
+        onto this rank's token rows, where the tail then runs."""
         if TYPE_CHECKING:  # NOTE: precondition for this case
             assert (
                 self._front_w is not None
@@ -1679,7 +1686,9 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
         else:
             gate_up, router_logits, routed_input = self._fused_front(hidden_states)
         latent_numel = num_tokens * self.moe_hidden_size
-        if k3_ar_fusion.enabled():
+        if scatters:
+            buf = None
+        elif k3_ar_fusion.enabled():
             # the shared-expert AR is pull-only, so its input must be a
             # symm_buffer slice for every rank to resolve the same offset
             buf = k3_ar_fusion.symm_buffer(
@@ -1694,12 +1703,21 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
             ):
                 buf = hidden_states.new_empty(latent_numel + num_tokens * hidden_size)
 
-        latent = buf[:latent_numel].view(num_tokens, self.moe_hidden_size)
-        shared_output = buf[latent_numel:].view(num_tokens, hidden_size)
+        if buf is None:
+            latent = k3_sp_collective.sp_partial_rows(
+                "moe_latent", hidden_states, self.moe_hidden_size
+            )
+            shared_output = k3_sp_collective.sp_partial_rows(
+                "moe_shared", hidden_states, hidden_size
+            )
+        else:
+            latent = buf[:latent_numel].view(num_tokens, self.moe_hidden_size)
+            shared_output = buf[latent_numel:].view(num_tokens, hidden_size)
         fused_norm = False
         if self.alt_stream is not None and k3_ar_fusion.enabled():
             defer_finalize = (
-                self._defer_moe_finalize
+                not scatters
+                and self._defer_moe_finalize
                 and self.fuse_ar_norm
                 and k3_ar_fusion.finalize_push_fits(num_tokens)
             )
@@ -1715,7 +1733,12 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
                 )
                 self.alt_stream.wait_stream(current_stream)
                 with torch.cuda.stream(self.alt_stream):
-                    k3_ar_fusion.all_reduce_low_sm(shared_output)
+                    if scatters:
+                        shared_output = k3_sp_collective.sp_reduce_scatter(
+                            shared_output, k3_sp_collective.SP_RS_OVERLAP_BLOCKS
+                        )
+                    else:
+                        k3_ar_fusion.all_reduce_low_sm(shared_output)
             if defer_finalize:
                 deferred = self._forward_routed_deferred(
                     hidden_states, router_logits, routed_input
@@ -1727,13 +1750,20 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
                     self._forward_shared(gate_up, shared_output)
                     # low-SM pull so the side-stream AR leaves the SMs to the
                     # routed GEMMs it overlaps (K3 dims are fixed; tuned here)
-                    k3_ar_fusion.all_reduce_low_sm(
-                        shared_output, num_blocks=4, unroll=8
-                    )
+                    if scatters:
+                        shared_output = k3_sp_collective.sp_reduce_scatter(
+                            shared_output, k3_sp_collective.SP_RS_OVERLAP_BLOCKS
+                        )
+                    else:
+                        k3_ar_fusion.all_reduce_low_sm(
+                            shared_output, num_blocks=4, unroll=8
+                        )
             current_stream.wait_stream(self.alt_stream)
             # The latent AR must stay serialized after the shared AR (both
             # reuse the v2 pull semaphores); the join above does it.
-            if defer_finalize:
+            if scatters:
+                latent = k3_sp_collective.sp_reduce_scatter(latent)
+            elif defer_finalize:
                 # finalize folded into the push AR's staging pass; the norm
                 # covers every latent row
                 fused_norm = True
@@ -1769,7 +1799,10 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
         else:  # single collective over the flat [latent | shared] pair
             self._forward_shared(gate_up, shared_output)
             self._forward_routed(hidden_states, router_logits, routed_input, latent)
-            if self.fuse_ar_norm and k3_ar_fusion.enabled():
+            if scatters:
+                latent = k3_sp_collective.sp_reduce_scatter(latent)
+                shared_output = k3_sp_collective.sp_reduce_scatter(shared_output)
+            elif self.fuse_ar_norm and k3_ar_fusion.enabled():
                 fused_norm = True
                 k3_ar_fusion.all_reduce_norm(
                     buf.view(-1, k3_ar_fusion.NORM_DIM),
@@ -1781,8 +1814,9 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
             else:
                 buf = self._reduce_latent_and_shared(buf)
 
-        latent = buf[:latent_numel].view(num_tokens, self.moe_hidden_size)
-        shared_output = buf[latent_numel:].view(num_tokens, hidden_size)
+        if buf is not None:
+            latent = buf[:latent_numel].view(num_tokens, self.moe_hidden_size)
+            shared_output = buf[latent_numel:].view(num_tokens, hidden_size)
         if not fused_norm:
             latent = self._latent_norm(latent)
         out, _ = self.routed_expert_up_proj(latent)
@@ -1816,19 +1850,7 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
             if not self._eligible_for_fused_front:
                 out = layernorm_sp.shard_token_rows(self.forward(full))
                 return out if prefix_sum is None else out + prefix_sum
-            gate_up, router_logits, routed_input = self._fused_front(full)
-            latent = k3_sp_collective.sp_partial_rows(
-                "moe_latent", full, self.moe_hidden_size
-            )
-            shared_output = k3_sp_collective.sp_partial_rows(
-                "moe_shared", full, full.shape[1]
-            )
-            self._forward_routed(full, router_logits, routed_input, latent)
-            self._forward_shared(gate_up, shared_output)
-        latent_rows = k3_sp_collective.sp_reduce_scatter(latent)
-        shared_rows = k3_sp_collective.sp_reduce_scatter(shared_output)
-        out, _ = self.routed_expert_up_proj(self._latent_norm(latent_rows))
-        return _add3(out, shared_rows, prefix_sum)
+            return self._forward_fused(full, prefix_sum=prefix_sum, scatters=True)
 
     def _forward_cp_shard_rows(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """This rank's CP rows of the complete output, for rows gathered
