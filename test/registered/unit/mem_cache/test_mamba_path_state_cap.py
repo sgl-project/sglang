@@ -227,16 +227,20 @@ class TestMambaPathStateCap(unittest.TestCase):
                 )
 
     def test_unified_cache_keeps_host_copies_that_are_locked_or_in_flight(self):
-        for guard in ("host_lock", "backup", "load_back"):
-            with self.subTest(guard=guard):
+        def host_lock(node):
+            node.component_data[ComponentType.MAMBA].host_lock_ref = 1
+
+        def backup(node):
+            node.write_through_pending_id = 1
+
+        def load_back(node):
+            node.load_back_pending_id = 1
+
+        for guard in (host_lock, backup, load_back):
+            with self.subTest(guard=guard.__name__):
                 component, nodes, core = self._chain_with_host_copies()
                 core.mamba_path_cap_counts_host = True
-                if guard == "host_lock":
-                    nodes[0].component_data[ComponentType.MAMBA].host_lock_ref = 1
-                elif guard == "backup":
-                    nodes[0].write_through_pending_id = 1
-                else:
-                    nodes[0].load_back_pending_id = 1
+                guard(nodes[0])
                 host_frees = defaultdict(list)
                 component._evict_excess_path_states(
                     nodes[-1], defaultdict(list), host_frees, []
@@ -247,6 +251,36 @@ class TestMambaPathStateCap(unittest.TestCase):
                 self.assertEqual(
                     [v.item() for v in host_frees[ComponentType.MAMBA]], [11]
                 )
+
+    def test_host_only_checkpoints_lose_both_copies_in_one_walk_when_counting_host(
+        self,
+    ):
+        # Host-only checkpoints already count a host copy toward the cap. A capped
+        # state holding both copies loses its device copy and, while still counted,
+        # its host copy in a later walk; counting host drops both at once.
+        for counts_host in (False, True):
+            with self.subTest(counts_host=counts_host):
+                component, nodes, core, _ = _build_unified_chain(cap=1, length=2)
+                component.host_only_checkpoint = True
+                core.mamba_path_cap_counts_host = counts_host
+                both = nodes[0].component_data[ComponentType.MAMBA]
+                both.host_value = torch.tensor([10])
+                device_frees = defaultdict(list)
+                host_frees = defaultdict(list)
+                component._evict_excess_path_states(
+                    nodes[-1], device_frees, host_frees, []
+                )
+                self.assertIsNone(both.value)
+                self.assertEqual(
+                    [v.item() for v in device_frees[ComponentType.MAMBA]], [0]
+                )
+                freed_host = [v.item() for v in host_frees[ComponentType.MAMBA]]
+                if counts_host:
+                    self.assertEqual(freed_host, [10])
+                    self.assertIsNone(both.host_value)
+                else:
+                    self.assertEqual(freed_host, [])
+                    self.assertIsNotNone(both.host_value)
 
     def test_host_counting_is_opt_in_and_needs_a_cap_and_a_cache_mode_host_tier(self):
         for name, host_mode, env, enabled in (
@@ -265,10 +299,9 @@ class TestMambaPathStateCap(unittest.TestCase):
                 cache = SimpleNamespace(
                     components={
                         ComponentType.MAMBA: SimpleNamespace(
-                            mamba_max_states_per_path=1
+                            mamba_max_states_per_path=1, _mamba_pool_host=object()
                         )
                     },
-                    cache_controller=object(),
                     host_memory_mode=host_mode,
                     tree_core=mock.Mock(),
                 )

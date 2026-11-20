@@ -3,6 +3,7 @@ from array import array
 from dataclasses import replace
 from unittest import mock
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     InitLoadBackParams,
@@ -622,6 +623,37 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
             self.assertFalse(cache.ongoing_write_through)
         finally:
             cache.dec_lock_ref(leaf, leaf_lock)
+        cache.sanity_check()
+
+    @requires_mamba
+    def test_hicache_write_through_mamba_path_cap_frees_superseded_host_copy(self):
+        """SGLANG_MAMBA_PATH_CAP_COUNTS_HOST, cap 1: the state a longer insert
+        supersedes loses its device value and its write-through host copy, and
+        its host slot returns to the Mamba host pool."""
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._init_hicache(cache, write_policy="write_through")
+        cache.write_through_threshold = 1
+        cache.components[ComponentType.MAMBA].mamba_max_states_per_path = 1
+        with envs.SGLANG_MAMBA_PATH_CAP_COUNTS_HOST.override(True):
+            cache._init_mamba_path_cap_counts_host()
+        host_pool = cache.mamba_pool_host
+
+        seq_a = self._make_seq(1, 2)
+        self._insert(cache, allocator, req_to_token_pool, seq_a)
+        cache.writing_check(write_back=True)
+        node_a = match_prefix(cache, seq_a).best_match_node
+        self.assertIsNotNone(node_host_value(cache, node_a, ComponentType.MAMBA))
+        free_after_first_backup = host_pool.available_size()
+
+        self._insert(
+            cache, allocator, req_to_token_pool, seq_a + self._make_seq(1000, 2)
+        )
+        cache.writing_check(write_back=True)
+
+        self.assertIsNone(node_device_value(cache, node_a, ComponentType.MAMBA))
+        self.assertIsNone(node_host_value(cache, node_a, ComponentType.MAMBA))
+        # The new tail's backup took one host slot; the superseded state's came back.
+        self.assertEqual(host_pool.available_size(), free_after_first_backup)
         cache.sanity_check()
 
     @requires_mamba

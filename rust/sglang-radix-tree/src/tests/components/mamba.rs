@@ -2661,18 +2661,24 @@ fn evict_excess_path_states_counts_and_frees_host_copies_when_counting_host() {
 
 #[test]
 fn evict_excess_path_states_keeps_host_copies_that_are_locked_or_in_flight() {
-    for guard in ["host_lock", "backup", "load_back"] {
+    type Guard = fn(&mut UnifiedTreeCore<Vec<i64>>, NodeIdx_);
+    let guards: [(&str, Guard); 3] = [
+        ("host_lock", |tc, a| {
+            tc.arena
+                .node_mut(a)
+                .set_lock_ref_(ValueSlotIdx::host(MAMBA), 1);
+        }),
+        ("backup", |tc, a| {
+            tc.arena.node_mut(a).write_through_pending_id = Some(1);
+        }),
+        ("load_back", |tc, a| {
+            tc.arena.node_mut(a).load_back_pending_id = Some(1);
+        }),
+    ];
+    for (guard, set_guard) in guards {
         let (mut tc, [a, b, c]) = capped_path_with_host_copies();
         tc.set_mamba_path_cap_counts_host(true);
-        match guard {
-            "host_lock" => tc
-                .arena
-                .node_mut(a)
-                .set_lock_ref_(ValueSlotIdx::host(MAMBA), 1),
-            "backup" => tc.arena.node_mut(a).write_through_pending_id = Some(1),
-            "load_back" => tc.arena.node_mut(a).load_back_pending_id = Some(1),
-            _ => unreachable!(),
-        }
+        set_guard(&mut tc, a);
         let result = tc
             .evict_excess_path_states(tc.arena.node(c).id)
             .expect("live test node");
