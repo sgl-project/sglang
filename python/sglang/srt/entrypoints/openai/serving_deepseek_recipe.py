@@ -184,18 +184,17 @@ class DeepSeekRecipeChatEncodingAdapter:
         thinking: bool,
         effort: Union[str, int, float, None],
         response_schema: Optional[dict[str, Any]],
-        continue_final_message: bool,
     ) -> NativePrompt:
         tier, budget = self._effort(effort)
         # recipe reads an effort as a request to think.
         if thinking and tier is not None:
             body = {**body, NATIVE_EFFORT_FIELDS[protocol]: {"effort": tier}}
-        conversation = self.deepseek_recipe.with_host_settings(
-            self.deepseek_recipe.convert_native(protocol, body, thinking=thinking),
-            response_schema=response_schema,
-            continue_final_message=continue_final_message,
+        conversation, namespace_names = self.deepseek_recipe.convert_native(
+            protocol, body, thinking=thinking
         )
-        last = conversation.messages[-1] if conversation.messages else None
+        conversation = self.deepseek_recipe.with_host_settings(
+            conversation, response_schema=response_schema
+        )
         # recipe's Messages conversion drops `strict`, which SGLang's grammar enforces.
         strict = {tool.get("name") for tool in body["tools"] if tool.get("strict")}
         tools = [
@@ -219,21 +218,7 @@ class DeepSeekRecipeChatEncodingAdapter:
                 ImageData(url=url)
                 for url in self.deepseek_recipe.image_urls(conversation)
             ],
-            namespace_names=(
-                self.deepseek_recipe.namespace_tool_names(_responses_namespaces(body))
-                if protocol == "responses"
-                else {}
-            ),
-            continued_turn=(
-                {"role": "assistant", "content": last.content}
-                | (
-                    {"reasoning_content": last.reasoning_content}
-                    if last.reasoning_content is not None
-                    else {}
-                )
-                if last is not None and last.prefix
-                else None
-            ),
+            namespace_names=namespace_names,
         )
 
     def _encode(
@@ -415,7 +400,7 @@ class DeepSeekRecipeChatEncodingAdapter:
         self, request: ChatCompletionRequest
     ) -> DeepSeekRecipeOutputParser:
         response_format = request.response_format
-        continued = request._continued_turn or (
+        continued = (
             _trailing_assistant_turn(
                 _null_content_as_empty(
                     [
@@ -462,11 +447,9 @@ class DeepSeekRecipeChatEncodingAdapter:
             self.deepseek_recipe,
             thinking_stage=self.deepseek_recipe.parse_start(thinking=require_reasoning),
             parse_tool_calls=parse_tool_calls,
-            # Under `none` the tool parser runs only to drop calls; a JSON answer
-            # must be read as JSON, or a call marker spelled in a string ends it.
-            parse_json_output=native
-            and request.tool_choice == "none"
-            and request.has_json_schema_constraint(),
+            # A JSON answer must be read as JSON, or a call marker spelled in one of
+            # its strings ends it.
+            parse_json_output=request.has_json_schema_constraint(),
             separate_reasoning=separate_reasoning,
             stop=_stop_strings(request.stop),
             callable_names=(
@@ -507,20 +490,6 @@ class DeepSeekRecipeResponsesStream:
         return delta.reasoning, delta.content, _tool_call_items(delta.tool_calls)
 
 
-def _responses_namespaces(body: dict[str, Any]) -> list[dict[str, Any]]:
-    """The namespace tools a Responses body declares and its history discovers, in
-    the order recipe's conversion names their members."""
-    discovered = [
-        tool
-        for item in body["input"]
-        if isinstance(item, dict) and item.get("type") == "tool_search_output"
-        for tool in item["tools"]
-    ]
-    return [
-        tool for tool in [*body["tools"], *discovered] if tool["type"] == "namespace"
-    ]
-
-
 def _null_content_as_empty(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """As `_process_messages` renders them: a null content is ""."""
     return [
@@ -558,8 +527,9 @@ def _native_callable_names(
     tools: list[Tool], tool_choice: Any
 ) -> Optional[frozenset[str]]:
     """The names of `tools`, all that a natively rendered prompt shows the model;
-    None when calls to other tools are returned. `none` allows no call at all."""
-    if tool_choice == "none":
+    None when calls to other tools are returned. `none`, which a request with no
+    loaded tool resolves to, allows no call at all."""
+    if tool_choice == "none" or not tools:
         return frozenset()
     if envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
         return None

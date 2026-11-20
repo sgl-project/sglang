@@ -252,7 +252,9 @@ def _declare_inline_tools(
         for position, block in enumerate(message.content):
             where = f"messages.{index}.content.{position}"
             for name in _referenced_tool_names(block):
-                if name not in declared:
+                if name in declared:
+                    offered.add(name)
+                else:
                     unresolved.setdefault(name, where)
             if block.type == "tool_addition" and block.tool.type != "tool_reference":
                 if message.role != "system":
@@ -328,18 +330,55 @@ def _definition(tool: AnthropicCustomTool) -> dict[str, Any]:
     return tool.model_dump(exclude={"type", "defer_loading"})
 
 
-def _native_block(block: dict[str, Any]) -> dict[str, Any]:
-    """`block` with SGLang's accepted aliases spelled as deepseek-recipe reads them."""
+def _text_from_search_result(item: dict[str, Any]) -> str:
+    search_parts = []
+    title = item.get("title")
+    if title:
+        search_parts.append(f"Title: {title}")
+
+    source = item.get("source")
+    if isinstance(source, dict):
+        source_text = source.get("url") or source.get("text")
+        if source_text:
+            search_parts.append(f"Source: {source_text}")
+    elif source:
+        search_parts.append(f"Source: {source}")
+
+    content = item.get("content")
+    content_parts = []
+    if isinstance(content, str):
+        content_parts.append(content)
+    elif isinstance(content, list):
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") == "text" and part.get("text"):
+                content_parts.append(part["text"])
+    if content_parts:
+        search_parts.append("Content: " + "\n".join(content_parts))
+
+    return "\n".join(search_parts)
+
+
+def _native_blocks(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [native for native in map(_native_block, blocks) if native is not None]
+
+
+def _native_block(block: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """`block` with SGLang's accepted aliases spelled as deepseek-recipe reads them;
+    None for a search result without text."""
     kind = block["type"]
+    if kind == "search_result":
+        # deepseek-recipe has no search result block; it reads as on the Chat path.
+        text = _text_from_search_result(block)
+        return {"type": "text", "text": text} if text else None
     if kind == "tool_result":
         content = block.get("content")
         fields = {
             "type": kind,
             "tool_use_id": block.get("tool_use_id") or block.get("id"),
             "content": (
-                [_native_block(item) for item in content]
-                if isinstance(content, list)
-                else content
+                _native_blocks(content) if isinstance(content, list) else content
             ),
             "is_error": block.get("is_error"),
         }
@@ -356,7 +395,7 @@ def _native_block(block: dict[str, Any]) -> dict[str, Any]:
 def _native_message(message: AnthropicMessage) -> dict[str, Any]:
     data = message.model_dump(exclude_none=True)
     if isinstance(data["content"], list):
-        data["content"] = [_native_block(block) for block in data["content"]]
+        data["content"] = _native_blocks(data["content"])
     return data
 
 
@@ -479,35 +518,6 @@ class AnthropicServing:
                 }
 
             return None
-
-        def _text_from_search_result(item: dict[str, Any]) -> str:
-            search_parts = []
-            title = item.get("title")
-            if title:
-                search_parts.append(f"Title: {title}")
-
-            source = item.get("source")
-            if isinstance(source, dict):
-                source_text = source.get("url") or source.get("text")
-                if source_text:
-                    search_parts.append(f"Source: {source_text}")
-            elif source:
-                search_parts.append(f"Source: {source}")
-
-            content = item.get("content")
-            content_parts = []
-            if isinstance(content, str):
-                content_parts.append(content)
-            elif isinstance(content, list):
-                for part in content:
-                    if not isinstance(part, dict):
-                        continue
-                    if part.get("type") == "text" and part.get("text"):
-                        content_parts.append(part["text"])
-            if content_parts:
-                search_parts.append("Content: " + "\n".join(content_parts))
-
-            return "\n".join(search_parts)
 
         def _convert_tool_result_content(
             content: Any,

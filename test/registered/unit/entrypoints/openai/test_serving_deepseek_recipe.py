@@ -48,6 +48,7 @@ def _serving(
         tokenizer=tokenizer,
         model_config=SimpleNamespace(
             is_multimodal=is_multimodal,
+            vocab_size=len(tokenizer),
             context_len=131072,
             hf_config=SimpleNamespace(
                 model_type="deepseek_v41",
@@ -640,6 +641,7 @@ CRM_NAMESPACE = {
     ],
 }
 APPLY_PATCH_TOOL = {"type": "custom", "name": "apply_patch"}
+SHELL_TOOL = {"type": "custom", "name": "shell_exec", "description": "Run a command"}
 PATCH = "*** Begin Patch\n*** Delete File: a.txt\n*** End Patch"
 ASK_TICKET = {"role": "user", "content": "Open a ticket for A-1"}
 ADD_TICKET = {
@@ -685,6 +687,11 @@ def _search_history(found_tools):
             "tools": found_tools,
         },
     ]
+
+
+def _searched_again(found_tools, call_id="again"):
+    """A further search call and its result, after `_search_history`."""
+    return [{**item, "call_id": call_id} for item in _search_history(found_tools)[1:]]
 
 
 def _dsml_call(name, **arguments):
@@ -935,22 +942,51 @@ class TestNativeToolLoading(CustomTestCase):
         self.assertEqual(serving._response_tools_to_chat_tools(request), [])
 
     def test_responses_search_output_loads_only_renderable_tools(self):
-        """A malformed search result, or one the encoding cannot render, is a client
-        error before generation, not a server error."""
+        """A malformed search result or tool declaration, a nameless one included, or
+        one the encoding cannot render, is a client error before generation, not a
+        server error."""
         from sglang.srt.entrypoints.openai.protocol import ResponsesRequest
 
         serving, engine = self._responses()
-        for name, found_tools in (
-            ("not a list", 42),
-            ("custom", [{"type": "custom", "name": "shell"}]),
-            ("custom member", [{**CRM_NAMESPACE, "tools": [APPLY_PATCH_TOOL]}]),
+        member = CRM_NAMESPACE["tools"][0]
+        nameless_crm = {k: v for k, v in CRM_NAMESPACE.items() if k != "name"}
+        deferred = [SEARCH_TOOL, {**WEATHER_TOOL, "defer_loading": True}]
+        for name, tools, found_tools in (
+            ("not a list", [SEARCH_TOOL], 42),
+            ("custom", [SEARCH_TOOL], [{"type": "custom", "name": "shell"}]),
+            (
+                "custom member",
+                [SEARCH_TOOL],
+                [{**CRM_NAMESPACE, "tools": [APPLY_PATCH_TOOL]}],
+            ),
+            (
+                "nameless deferred custom",
+                [SEARCH_TOOL, {"type": "custom", "defer_loading": True}],
+                [],
+            ),
+            (
+                "nameless deferred namespace",
+                [SEARCH_TOOL, {**nameless_crm, "defer_loading": True}],
+                [],
+            ),
+            (
+                "nameless namespace with a deferred member",
+                [
+                    SEARCH_TOOL,
+                    {**nameless_crm, "tools": [{**member, "defer_loading": True}]},
+                ],
+                [],
+            ),
+            ("nameless found namespace", deferred, [nameless_crm]),
+            ("list name", deferred, [{**WEATHER_TOOL, "name": ["get_weather"]}]),
+            ("dict name", deferred, [{**WEATHER_TOOL, "name": {"get": "weather"}}]),
         ):
             with self.subTest(name):
                 rejected = asyncio.run(
                     serving.create_responses(
                         ResponsesRequest(
                             model="dummy",
-                            tools=[SEARCH_TOOL],
+                            tools=tools,
                             input=_search_history(found_tools),
                         )
                     )
@@ -1194,6 +1230,62 @@ class TestNativeToolLoading(CustomTestCase):
             ("custom_tool_call", "apply_patch", PATCH),
         )
 
+    def test_responses_declared_custom_tool_runs_through_the_function_shim(self):
+        """A declared custom tool the encoding does not render itself is offered as
+        the single-string function shim beside tool search and reported as a custom
+        call; its call replays the same whether stored or sent back."""
+        command = "ls -l"
+        ask = {"role": "user", "content": "List the files"}
+        fields = {"tools": [SEARCH_TOOL, SHELL_TOOL]}
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                serving, engine = self._responses()
+                response = self._respond(
+                    serving,
+                    engine,
+                    _dsml_call("shell_exec", input=command),
+                    stream=stream,
+                    input=[ask],
+                    **fields,
+                )
+                self.assertEqual(
+                    _schema_names(engine.prompts[-1]), ["tool_search", "shell_exec"]
+                )
+                response = response[-1]["response"] if stream else response.model_dump()
+                (item,) = response["output"]
+                self.assertEqual(
+                    (item["type"], item["name"], item["input"]),
+                    ("custom_tool_call", "shell_exec", command),
+                )
+
+                result = {
+                    "type": "custom_tool_call_output",
+                    "call_id": item["call_id"],
+                    "output": "a.txt",
+                }
+                self._respond(
+                    serving,
+                    engine,
+                    "Done.",
+                    previous_response_id=response["id"],
+                    input=[result],
+                    **fields,
+                )
+                stored = engine.prompts[-1]
+                self.assertIn(
+                    f'<｜DSML｜ parameter name="input" string="true">{command}<',
+                    stored,
+                )
+                self._respond(
+                    serving,
+                    engine,
+                    "Done.",
+                    store=False,
+                    input=[ask, item, result],
+                    **fields,
+                )
+                self.assertEqual(engine.prompts[-1], stored)
+
     def test_images_reach_the_engine_in_prompt_order(self):
         """Images of a request rendered from its own wire form are sent with the
         prompt ids, one per placeholder and in placeholder order."""
@@ -1277,7 +1369,8 @@ class TestNativeToolLoading(CustomTestCase):
                 if block["type"] == "tool_use"
             ]
 
-        self.assertEqual(tool_uses(unloaded), ("end_turn", []))
+        with self.assertLogs("sglang.srt.parser.deepseek_recipe_output", "WARNING"):
+            self.assertEqual(tool_uses(unloaded), ("end_turn", []))
         self.assertEqual(tool_uses(loaded), ("tool_use", ["search_docs"]))
         both = unloaded.replace("</｜DSML｜ calls>", "") + loaded.partition("\n")[2]
         self.assertEqual(tool_uses(both), ("tool_use", ["search_docs"]))
@@ -1345,40 +1438,57 @@ class TestNativeToolLoading(CustomTestCase):
         self.assertEqual({block["type"] for block in blocks} - {"text"}, set())
         answers["messages"] = (text, finish, events)
 
-        response = self._respond(
-            serving,
-            engine,
-            output,
-            stream=stream,
-            tools=[SEARCH_TOOL],
-            tool_choice="none",
-            input=_search_history([WEATHER_TOOL]),
-            **formats.get("responses", {}),
-        )
-        final = response[-1]["response"] if stream else response.model_dump()
-        self.assertEqual(
-            {item["type"] for item in final["output"]} - {"message"}, set()
-        )
-        text = "".join(
-            part["text"] for item in final["output"] for part in item["content"]
-        )
-        if stream:
-            self.assertEqual(
-                "".join(
-                    event["delta"]
-                    for event in response
-                    if event["type"] == "response.output_text.delta"
-                ),
-                text,
+        for api, fields in (
+            (
+                "responses",
+                {
+                    "tools": [SEARCH_TOOL],
+                    "tool_choice": "none",
+                    "input": _search_history([WEATHER_TOOL]),
+                },
+            ),
+            # With no tool loaded yet, the default `auto` resolves to `none`.
+            (
+                "responses, none loaded",
+                {
+                    "tools": [{**WEATHER_TOOL, "defer_loading": True}],
+                    "input": "Weather in Paris?",
+                },
+            ),
+        ):
+            response = self._respond(
+                serving,
+                engine,
+                output,
+                stream=stream,
+                **fields,
+                **formats.get("responses", {}),
             )
-        answers["responses"] = (text, final["status"], response if stream else final)
+            final = response[-1]["response"] if stream else response.model_dump()
+            self.assertEqual(
+                {item["type"] for item in final["output"]} - {"message"}, set()
+            )
+            text = "".join(
+                part["text"] for item in final["output"] for part in item["content"]
+            )
+            if stream:
+                self.assertEqual(
+                    "".join(
+                        event["delta"]
+                        for event in response
+                        if event["type"] == "response.output_text.delta"
+                    ),
+                    text,
+                )
+            answers[api] = (text, final["status"], response if stream else final)
         return answers
 
     def test_none_ends_the_answer_at_a_call_the_model_writes_anyway(self):
-        """Under `tool_choice: none` the answer ends where the model starts a call
-        block, as any answer does: the text before it is returned, the call and
-        what follows are not, and no call is reported. A JSON answer is read as
-        JSON, so a call marker spelled in one of its strings stays."""
+        """Under `tool_choice: none`, or before any tool is loaded, the answer ends
+        where the model starts a call block, as any answer does: the text before it
+        is returned, the call and what follows are not, and no call is reported or
+        warned about. A JSON answer is read as JSON, so a call marker spelled in one
+        of its strings stays."""
         from sglang.srt.environ import envs
 
         anthropic, engine = self._messages()
@@ -1473,6 +1583,56 @@ class TestNativeToolLoading(CustomTestCase):
                 self.assertEqual(aborted["messages"][0], "Sure.")
                 self.assertEqual(aborted["responses"][:2], ("Sure.", "failed"))
 
+        engine.finish_type = "stop"
+        with self.assertNoLogs("sglang.srt.parser.deepseek_recipe_output", "WARNING"):
+            answers(call)
+
+    def test_json_answer_keeps_a_spelled_call_marker_under_auto(self):
+        """A JSON answer is read as JSON whatever the tool choice, so a call marker
+        spelled in one of its strings stays, beside tool search or function tools."""
+        schema = {
+            "type": "object",
+            "properties": {"answer": {"type": "string"}},
+            "required": ["answer"],
+            "additionalProperties": False,
+        }
+        text_format = {
+            "format": {
+                "type": "json_schema",
+                "name": "out",
+                "strict": True,
+                "schema": schema,
+            }
+        }
+        spelled = '{"answer":"<｜DSML｜ calls>"}'
+        for tools in ([SEARCH_TOOL], [WEATHER_TOOL]):
+            for chunk_tokens in (None, 1):
+                with self.subTest(tool=tools[0]["type"], chunk=chunk_tokens):
+                    serving, engine = self._responses()
+                    engine.chunk_tokens = chunk_tokens
+                    stream = chunk_tokens is not None
+                    response = self._respond(
+                        serving,
+                        engine,
+                        spelled,
+                        stream=stream,
+                        tools=tools,
+                        input="Answer in JSON",
+                        text=text_format,
+                    )
+                    final = (
+                        response[-1]["response"] if stream else response.model_dump()
+                    )
+                    self.assertEqual(final["status"], "completed")
+                    self.assertEqual(
+                        [
+                            part["text"]
+                            for item in final["output"]
+                            for part in item["content"]
+                        ],
+                        [spelled],
+                    )
+
     def test_responses_deferred_tool_loads_from_a_search_result(self):
         """A declared tool that defers loading is hidden and not callable until a
         search result names it, by reference or with its definition."""
@@ -1527,7 +1687,8 @@ class TestNativeToolLoading(CustomTestCase):
                 )
                 self.assertEqual(output(response), [("function_call", "get_weather")])
 
-        # A namespace member defers the same way and keeps its identity.
+        # A namespace member defers the same way and keeps its identity; a result
+        # naming it takes what it leaves out from the member and the namespace.
         member = CRM_NAMESPACE["tools"][0]
         response = self._respond(
             serving,
@@ -1540,7 +1701,8 @@ class TestNativeToolLoading(CustomTestCase):
             input=_search_history(
                 [
                     {
-                        **CRM_NAMESPACE,
+                        "type": "namespace",
+                        "name": "crm",
                         "tools": [{"type": "function", "name": "create_ticket"}],
                     }
                 ]
@@ -1548,7 +1710,9 @@ class TestNativeToolLoading(CustomTestCase):
         )
         prompt = engine.prompts[-1]
         self.assertEqual(_schema_names(prompt), ["tool_search", "crm::create_ticket"])
-        self.assertIn('"order"', prompt[prompt.index("### Updated Tool Schemas") :])
+        loaded = prompt[prompt.index("### Updated Tool Schemas") :]
+        self.assertIn('"description": "CRM\\nTicket"', loaded)
+        self.assertIn('"order"', loaded)
         (item,) = response.output
         self.assertEqual((item.namespace, item.name), ("crm", "create_ticket"))
 
@@ -1607,16 +1771,631 @@ class TestNativeToolLoading(CustomTestCase):
                     [("custom_tool_call", PATCH)],
                 )
 
-        # A custom choice does not force a function tool.
+        # A custom choice does not force a function tool, nor a function choice a
+        # custom one.
+        for name, choice, found in (
+            ("custom choice", {"type": "custom", "name": "get_weather"}, []),
+            (
+                "function choice",
+                {"type": "function", "name": "apply_patch"},
+                [APPLY_PATCH_TOOL],
+            ),
+        ):
+            with self.subTest(name):
+                rejected = self._respond(
+                    serving,
+                    engine,
+                    "",
+                    tools=[SEARCH_TOOL, deferred, WEATHER_TOOL],
+                    input=_search_history(found),
+                    tool_choice=choice,
+                )
+                self.assertEqual(
+                    json.loads(rejected.body)["error"]["param"], "tool_choice"
+                )
+
+    def test_responses_strict_functions_stand_beside_tool_search(self):
+        """Strict functions, declared or discovered, stand beside the search tool:
+        each keeps its strictness, the search tool renders as without them, and a
+        function still cannot take the search tool's name."""
+        serving, engine = self._responses()
+        ticket = CRM_NAMESPACE["tools"][0]
+        strict_tools = [SEARCH_TOOL, {**ticket, "strict": True}]
+        response = self._respond(
+            serving,
+            engine,
+            _dsml_call("get_weather", city="Paris"),
+            tools=strict_tools,
+            input=_search_history([{**WEATHER_TOOL, "strict": True}]),
+            tool_choice={"type": "function", "name": "get_weather"},
+        )
+        prompt = engine.prompts[-1]
+        self.assertEqual(
+            _schema_names(prompt), ["tool_search", "create_ticket", "get_weather"]
+        )
+        schemas = re.findall(r'^\{"name": .*$', prompt, flags=re.MULTILINE)
+        self.assertTrue(
+            all('"additionalProperties": false' in line for line in schemas[1:])
+        )
+        (call,) = response.output
+        self.assertEqual(
+            (call.name, json.loads(call.arguments)), ("get_weather", {"city": "Paris"})
+        )
+
+        self._respond(serving, engine, "Hi.", tools=[SEARCH_TOOL, ticket], input="hi")
+        self.assertEqual(
+            re.findall(r'^\{"name": .*$', engine.prompts[-1], flags=re.MULTILINE)[0],
+            schemas[0],
+        )
+        searched = self._respond(
+            serving,
+            engine,
+            _dsml_call("tool_search", query="weather"),
+            tools=strict_tools,
+            input="hi",
+        )
+        self.assertEqual([item.type for item in searched.output], ["tool_search_call"])
+
         rejected = self._respond(
             serving,
             engine,
             "",
-            tools=[SEARCH_TOOL, deferred, WEATHER_TOOL],
+            tools=[SEARCH_TOOL, {**ticket, "name": "tool_search", "strict": True}],
             input="hi",
-            tool_choice={"type": "custom", "name": "get_weather"},
         )
-        self.assertEqual(json.loads(rejected.body)["error"]["param"], "tool_choice")
+        self.assertEqual(rejected.status_code, 400)
+        self.assertIn("Tool names must be unique", rejected.body.decode())
+
+    def _final_output(self, response, stream):
+        return (
+            response[-1]["response"]
+            if stream
+            else json.loads(response.model_dump_json())
+        )
+
+    def test_responses_strict_tools_loaded_by_search_stand_beside_it(self):
+        """A strict tool that only the history loads, found by a search, deferred and
+        loaded by name, or a namespace member, stands beside the search tool and keeps
+        its strictness; a non-strict user tool beside it is still mixed strictness."""
+        strict_weather = {**WEATHER_TOOL, "strict": True}
+        strict_crm = {
+            **CRM_NAMESPACE,
+            "tools": [{**CRM_NAMESPACE["tools"][0], "strict": True}],
+        }
+        weather = _dsml_call("get_weather", city="Paris")
+        for name, tools, found, call, called in (
+            ("found", [SEARCH_TOOL], [strict_weather], weather, "get_weather"),
+            (
+                "deferred",
+                [SEARCH_TOOL, {**strict_weather, "defer_loading": True}],
+                [{"type": "function", "name": "get_weather"}],
+                weather,
+                "get_weather",
+            ),
+            (
+                "namespace member",
+                [SEARCH_TOOL],
+                [strict_crm],
+                _dsml_call("crm::create_ticket", order="A-1"),
+                "create_ticket",
+            ),
+        ):
+            for stream in (False, True):
+                with self.subTest(name, stream=stream):
+                    serving, engine = self._responses()
+                    response = self._respond(
+                        serving,
+                        engine,
+                        call,
+                        stream=stream,
+                        tools=tools,
+                        input=_search_history(found),
+                    )
+                    (loaded,) = re.findall(
+                        r'^\{"name": "(?!tool_search").*$',
+                        engine.prompts[-1],
+                        flags=re.MULTILINE,
+                    )
+                    self.assertIn('"additionalProperties": false', loaded)
+                    (item,) = self._final_output(response, stream)["output"]
+                    self.assertEqual(
+                        (item["type"], item["name"]), ("function_call", called)
+                    )
+
+        serving, engine = self._responses()
+        rejected = self._respond(
+            serving,
+            engine,
+            weather,
+            tools=[SEARCH_TOOL, WEATHER_TOOL],
+            input=_search_history([strict_crm]),
+        )
+        self.assertEqual(rejected.status_code, 400)
+        self.assertIn(
+            "Cannot use strict tool with non-strict tool", rejected.body.decode()
+        )
+        self.assertEqual(engine.prompts, [])
+
+    def test_responses_search_results_may_list_a_callable_tool_again(self):
+        """A search result may list a tool already callable, unchanged, by an earlier
+        result, `tools` or itself: every result still shows it as listed, its schema
+        is declared once and it stays callable."""
+        call = _dsml_call("get_weather", city="Paris")
+        listed = '{"type":"function","name":"get_weather","description":"Weather",'
+        for name, tools, history, listings in (
+            (
+                "searched twice",
+                [SEARCH_TOOL],
+                _search_history([WEATHER_TOOL]) + _searched_again([WEATHER_TOOL]),
+                2,
+            ),
+            (
+                "declared",
+                [SEARCH_TOOL, WEATHER_TOOL],
+                _search_history([WEATHER_TOOL]),
+                1,
+            ),
+            (
+                "twice in one result",
+                [SEARCH_TOOL],
+                _search_history([WEATHER_TOOL, WEATHER_TOOL]),
+                2,
+            ),
+        ):
+            for stream in (False, True):
+                with self.subTest(name, stream=stream):
+                    serving, engine = self._responses()
+                    response = self._respond(
+                        serving, engine, call, stream=stream, tools=tools, input=history
+                    )
+                    prompt = engine.prompts[-1]
+                    self.assertEqual(_schema_names(prompt).count("get_weather"), 1)
+                    self.assertEqual(prompt.count(listed), listings)
+                    self.assertEqual(
+                        [
+                            (item["type"], item["name"])
+                            for item in self._final_output(response, stream)["output"]
+                        ],
+                        [("function_call", "get_weather")],
+                    )
+
+        # A repeated apply_patch renders on its own, beside a repeated function.
+        found = [APPLY_PATCH_TOOL, WEATHER_TOOL]
+        serving, engine = self._responses()
+        response = self._respond(
+            serving,
+            engine,
+            _dsml_call("apply_patch", input=PATCH),
+            tools=[SEARCH_TOOL],
+            input=_search_history(found) + _searched_again(found),
+        )
+        prompt = engine.prompts[-1]
+        self.assertEqual(
+            _schema_names(prompt), ["tool_search", "apply_patch", "get_weather"]
+        )
+        self.assertEqual(
+            prompt.count(
+                '<tool_result>[{"type":"custom","name":"apply_patch"},' + listed
+            ),
+            2,
+        )
+        self.assertEqual(
+            [(item.type, item.input) for item in response.output],
+            [("custom_tool_call", PATCH)],
+        )
+
+        patch = '{"type":"custom","name":"apply_patch"}'
+        for stream in (False, True):
+            with self.subTest("apply_patch twice in one result", stream=stream):
+                serving, engine = self._responses()
+                response = self._respond(
+                    serving,
+                    engine,
+                    _dsml_call("apply_patch", input=PATCH),
+                    stream=stream,
+                    tools=[SEARCH_TOOL],
+                    input=_search_history([APPLY_PATCH_TOOL, APPLY_PATCH_TOOL]),
+                )
+                prompt = engine.prompts[-1]
+                self.assertEqual(_schema_names(prompt), ["tool_search", "apply_patch"])
+                self.assertIn(f"<tool_result>[{patch},{patch}]</tool_result>", prompt)
+                final = self._final_output(response, stream)
+                (item,) = final["output"]
+                self.assertEqual(
+                    (item["type"], item["input"]), ("custom_tool_call", PATCH)
+                )
+                self._respond(
+                    serving,
+                    engine,
+                    "Done.",
+                    previous_response_id=final["id"],
+                    tools=[SEARCH_TOOL],
+                    input=[
+                        {
+                            "type": "custom_tool_call_output",
+                            "call_id": item["call_id"],
+                            "output": "ok",
+                        }
+                    ],
+                )
+                self.assertTrue(engine.prompts[-1].startswith(prompt))
+
+    def test_responses_search_results_may_list_a_namespace_again(self):
+        """A namespace listed again unchanged keeps one version of its members, so
+        their call names stay; only a changed member gets a new version, which a
+        named choice forces. Stored and sent-back replays render alike."""
+        member = CRM_NAMESPACE["tools"][0]
+        changed = {
+            **CRM_NAMESPACE,
+            "tools": [
+                {
+                    **member,
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"ticket_id": {"type": "string"}},
+                    },
+                }
+            ],
+        }
+        listed = '"name":"create_ticket","description":"Ticket"'
+        history = (
+            _search_history([CRM_NAMESPACE])
+            + _searched_again([CRM_NAMESPACE])
+            + _searched_again([changed], call_id="changed")
+        )
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                serving, engine = self._responses()
+                response = self._respond(
+                    serving,
+                    engine,
+                    _dsml_call("crm::create_ticket_1", ticket_id="B-2"),
+                    stream=stream,
+                    tools=[SEARCH_TOOL],
+                    input=history,
+                    tool_choice={
+                        "type": "function",
+                        "namespace": "crm",
+                        "name": "create_ticket",
+                    },
+                )
+                prompt = engine.prompts[-1]
+                self.assertEqual(
+                    _schema_names(prompt),
+                    ["tool_search", "crm::create_ticket", "crm::create_ticket_1"],
+                )
+                self.assertEqual(prompt.count(listed), 3)
+                tag = json.loads(engine.requests[-1].sampling_params["structural_tag"])
+                forced = tag["format"]["elements"][1]
+                self.assertIn('invoke name="crm::create_ticket_1"', forced["begin"])
+                self.assertEqual(
+                    list(forced["content"]["json_schema"]["properties"]), ["ticket_id"]
+                )
+                (item,) = self._final_output(response, stream)["output"]
+                self.assertEqual(
+                    (item["namespace"], item["name"]), ("crm", "create_ticket")
+                )
+
+        serving, engine = self._responses()
+        first = self._respond(
+            serving,
+            engine,
+            "Found it.",
+            tools=[SEARCH_TOOL],
+            input=_search_history([CRM_NAMESPACE]),
+        )
+        again = [
+            {"role": "user", "content": "Search again"},
+            *_searched_again([CRM_NAMESPACE]),
+        ]
+        self._respond(
+            serving,
+            engine,
+            "Same.",
+            previous_response_id=first.id,
+            tools=[SEARCH_TOOL],
+            input=again,
+        )
+        stored = engine.prompts[-1]
+        self.assertEqual(_schema_names(stored), ["tool_search", "crm::create_ticket"])
+        self.assertEqual(stored.count(listed), 2)
+        self._respond(
+            serving,
+            engine,
+            "Same.",
+            store=False,
+            tools=[SEARCH_TOOL],
+            input=[
+                *_search_history([CRM_NAMESPACE]),
+                *(item.model_dump(exclude_none=True) for item in first.output),
+                *again,
+            ],
+        )
+        self.assertEqual(engine.prompts[-1], stored)
+
+    def test_responses_search_result_redefines_a_callable_function(self):
+        """A search result that lists a callable function with a changed definition
+        redefines it: the history keeps each definition where it loaded and the calls
+        made under it, the model calls the latest one, and stored and sent-back
+        replays render alike."""
+        from sglang.srt.parser.deepseek_recipe_renderer import REDEFINED_NAME_PREFIX
+
+        town = {
+            **WEATHER_TOOL,
+            "description": "Updated weather API",
+            "parameters": {
+                "type": "object",
+                "properties": {"town": {"type": "string"}},
+                "required": ["town"],
+            },
+        }
+        history = [
+            *_search_history([WEATHER_TOOL]),
+            {
+                "type": "function_call",
+                "call_id": "paris",
+                "name": "get_weather",
+                "arguments": json.dumps({"city": "Paris"}),
+            },
+            {"type": "function_call_output", "call_id": "paris", "output": "sunny"},
+            *_searched_again([town]),
+        ]
+        old_schema = '"description": "Weather"'
+        old_call = '<｜DSML｜ parameter name="city" string="true">Paris'
+        new_schema = '"description": "Updated weather API"'
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                serving, engine = self._responses()
+                response = self._respond(
+                    serving,
+                    engine,
+                    _dsml_call("get_weather", town="Lyon"),
+                    stream=stream,
+                    tools=[SEARCH_TOOL],
+                    input=history,
+                    tool_choice={"type": "function", "name": "get_weather"},
+                )
+                prompt = engine.prompts[-1]
+                self.assertEqual(
+                    _schema_names(prompt), ["tool_search", "get_weather", "get_weather"]
+                )
+                self.assertLess(prompt.index(old_schema), prompt.index(old_call))
+                self.assertLess(prompt.index(old_call), prompt.index(new_schema))
+                self.assertNotIn(REDEFINED_NAME_PREFIX, prompt)
+                tag = json.loads(engine.requests[-1].sampling_params["structural_tag"])
+                forced = tag["format"]["elements"][1]
+                self.assertEqual(
+                    list(forced["content"]["json_schema"]["properties"]), ["town"]
+                )
+                final = self._final_output(response, stream)
+                (item,) = final["output"]
+                self.assertEqual(
+                    (item["name"], json.loads(item["arguments"])),
+                    ("get_weather", {"town": "Lyon"}),
+                )
+
+                result = {
+                    "type": "function_call_output",
+                    "call_id": item["call_id"],
+                    "output": "rainy",
+                }
+                self._respond(
+                    serving,
+                    engine,
+                    "Rainy.",
+                    previous_response_id=final["id"],
+                    tools=[SEARCH_TOOL],
+                    input=[result],
+                )
+                stored = engine.prompts[-1]
+                self.assertTrue(stored.startswith(prompt))
+                self._respond(
+                    serving,
+                    engine,
+                    "Rainy.",
+                    store=False,
+                    tools=[SEARCH_TOOL],
+                    input=[
+                        *history,
+                        {k: v for k, v in item.items() if v is not None},
+                        result,
+                    ],
+                )
+                self.assertEqual(engine.prompts[-1], stored)
+
+    def test_responses_redefinitions_keep_names_and_listed_values(self):
+        """Several redefinitions in one history are rendered under the tools' own
+        names, distinct from user names of the same form, a namespace member's own
+        versions and 128-character names; every result shows its definitions as
+        recipe renders them first listed, schema values and descriptions spelling
+        such names included, and no other such name reaches the prompt, the output
+        or the stored history."""
+        from sglang.srt.parser.deepseek_recipe_renderer import REDEFINED_NAME_PREFIX
+
+        spelled = [f"{REDEFINED_NAME_PREFIX}{index}" for index in range(5)]
+        named = [*spelled[:2], "x" * 128]
+        payload = {
+            "type": "object",
+            "const": {"name": spelled[2]},
+            "default": {"name": spelled[3]},
+        }
+
+        def function(name, version):
+            return {
+                "type": "function",
+                "name": name,
+                "description": f'v{version} "name":"{spelled[4]}"',
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "payload": payload,
+                        f"v{version}": {"type": "string"},
+                    },
+                },
+            }
+
+        local = REDEFINED_NAME_PREFIX.rstrip("_")
+
+        def crm(version):
+            return {**CRM_NAMESPACE, "tools": [function(local, version)]}
+
+        listings = [
+            [*(function(name, 1) for name in named), crm(1)],
+            [*(function(name, 2) for name in named), crm(2)],
+            [function(named[0], 2), crm(3)],
+        ]
+        history = (
+            _search_history(listings[0])
+            + _searched_again(listings[1])
+            + _searched_again(listings[2], call_id="third")
+        )
+        member = f"crm::{local}"
+
+        def results(prompt):
+            return re.findall(r"<tool_result>(.*?)</tool_result>", prompt)
+
+        expected = []
+        for listing in listings:
+            serving, engine = self._responses()
+            self._respond(
+                serving,
+                engine,
+                "ok",
+                tools=[SEARCH_TOOL],
+                input=_search_history(listing),
+            )
+            expected += results(engine.prompts[-1])
+        given = set(re.findall(rf"{REDEFINED_NAME_PREFIX}\d+", json.dumps(history)))
+        for choice, call, version, called in (
+            (
+                {"type": "function", "namespace": "crm", "name": local},
+                f"{member}_2",
+                "v3",
+                {"namespace": "crm", "name": local},
+            ),
+            *(
+                ({"type": "function", "name": name}, name, "v2", {"name": name})
+                for name in named
+            ),
+        ):
+            for stream in (False, True):
+                with self.subTest(call=call[:24], stream=stream):
+                    serving, engine = self._responses()
+                    response = self._respond(
+                        serving,
+                        engine,
+                        _dsml_call(call, **{version: "new"}),
+                        stream=stream,
+                        tools=[SEARCH_TOOL],
+                        input=history,
+                        tool_choice=choice,
+                    )
+                    prompt = engine.prompts[-1]
+                    schemas = [
+                        "tool_search",
+                        *named,
+                        member,
+                        *named,
+                        f"{member}_1",
+                        f"{member}_2",
+                    ]
+                    self.assertEqual(
+                        (_schema_names(prompt), results(prompt)), (schemas, expected)
+                    )
+                    tag = json.loads(
+                        engine.requests[-1].sampling_params["structural_tag"]
+                    )
+                    forced = tag["format"]["elements"][1]
+                    self.assertIn(f'invoke name="{call}"', forced["begin"])
+                    self.assertEqual(
+                        list(forced["content"]["json_schema"]["properties"]),
+                        ["payload", version],
+                    )
+                    final = self._final_output(response, stream)
+                    (item,) = final["output"]
+                    self.assertEqual({key: item.get(key) for key in called}, called)
+                    stored = json.dumps(serving.msg_store[final["id"]])
+                    for text in (prompt, json.dumps(final), stored):
+                        self.assertLessEqual(
+                            set(re.findall(rf"{REDEFINED_NAME_PREFIX}\d+", text)),
+                            given,
+                        )
+
+    def test_responses_search_result_keeps_a_tools_kind(self):
+        """A search result that lists a callable tool as the other kind, function or
+        custom, is a client error before generation, whichever kind came first."""
+        from sglang.srt.entrypoints.openai.protocol import ResponsesRequest
+
+        function = {**WEATHER_TOOL, "name": "apply_patch"}
+        for name, tools, history in (
+            (
+                "declared function",
+                [SEARCH_TOOL, function],
+                _search_history([APPLY_PATCH_TOOL]),
+            ),
+            (
+                "declared custom",
+                [SEARCH_TOOL, APPLY_PATCH_TOOL],
+                _search_history([function]),
+            ),
+            (
+                "found function",
+                [SEARCH_TOOL],
+                _search_history([function]) + _searched_again([APPLY_PATCH_TOOL]),
+            ),
+        ):
+            for stream in (False, True):
+                with self.subTest(name, stream=stream):
+                    serving, engine = self._responses()
+                    engine.outputs.append(_dsml_call("apply_patch", city="Paris"))
+                    rejected = asyncio.run(
+                        serving.create_responses(
+                            ResponsesRequest(
+                                model="dummy", stream=stream, tools=tools, input=history
+                            )
+                        )
+                    )
+                    self.assertEqual(rejected.status_code, 400)
+                    error = json.loads(rejected.body)["error"]
+                    self.assertEqual(error["param"], "tools")
+                    self.assertIn("'apply_patch' as a", error["message"])
+                    self.assertEqual(engine.requests, [])
+
+    def test_responses_stored_search_result_keeps_the_loaded_definition(self):
+        """A stored search result that loaded a deferred tool by name replays its
+        declared definition, though a continuation no longer declares the tool."""
+        deferred = {**WEATHER_TOOL, "defer_loading": True}
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                serving, engine = self._responses()
+                response = self._respond(
+                    serving,
+                    engine,
+                    _dsml_call("get_weather", city="Paris"),
+                    stream=stream,
+                    tools=[SEARCH_TOOL, deferred],
+                    input=_search_history(
+                        [{"type": "function", "name": "get_weather"}]
+                    ),
+                )
+                loaded = engine.prompts[-1]
+                response = response[-1]["response"] if stream else response.model_dump()
+                (item,) = response["output"]
+                self._respond(
+                    serving,
+                    engine,
+                    "Sunny.",
+                    previous_response_id=response["id"],
+                    tools=[SEARCH_TOOL],
+                    input=[
+                        {
+                            "type": "function_call_output",
+                            "call_id": item["call_id"],
+                            "output": "sunny",
+                        }
+                    ],
+                )
+                self.assertTrue(engine.prompts[-1].startswith(loaded))
 
     def test_messages_response_format_renders_with_a_deferred_load(self):
         """`output_config.format` shows its schema in the prompt and constrains the
@@ -1672,20 +2451,10 @@ class TestNativeToolLoading(CustomTestCase):
 
     def test_trailing_assistant_keeps_the_loaded_tools(self):
         """A final assistant message is re-sent as a user turn, as on requests that
-        load no tools, or continued under continue_final_message; either way the
-        prompt holds one open assistant turn and the tools the history loaded."""
-        from unittest.mock import patch
-
-        from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
-
+        load no tools; the prompt holds one open assistant turn and the tools the
+        history loaded."""
         prefill = {"role": "assistant", "content": "The answer is"}
         loaded = '"name": "create_ticket"'
-        prepare = OpenAIServingChat.prepare_native_prompt
-
-        def continued(chat, request, **fields):
-            request.continue_final_message = True
-            return prepare(chat, request, **fields)
-
         anthropic, engine = self._messages()
         request = self._messages_request(
             [ASK_TICKET, ADD_TICKET, prefill],
@@ -1702,11 +2471,6 @@ class TestNativeToolLoading(CustomTestCase):
         tail, content = respond("Hm.</think> 42.")
         self.assertTrue(tail.endswith("<｜User｜>The answer is<｜Assistant｜><think>"))
         self.assertEqual([block["type"] for block in content], ["thinking", "text"])
-        # The continued turn stays open, and the output resumes its answer.
-        with patch.object(OpenAIServingChat, "prepare_native_prompt", continued):
-            tail, content = respond(" 42.")
-        self.assertTrue(tail.endswith("<｜Assistant｜><think></think>The answer is"))
-        self.assertEqual(content, [{"type": "text", "text": " 42."}])
 
         serving, engine = self._responses()
         self._respond(
@@ -1788,6 +2552,60 @@ class TestNativeToolLoading(CustomTestCase):
                     [("create_ticket", {"order": "A-1"})],
                 )
 
+    def test_messages_search_results_read_as_on_the_chat_path(self):
+        """A search result block, given directly or as a tool result, renders as its
+        Chat path text beside a deferred tool, and count_tokens counts that prompt."""
+        from sglang.srt.entrypoints.anthropic.protocol import (
+            AnthropicCountTokensRequest,
+        )
+
+        anthropic, engine = self._messages()
+        result = {
+            "type": "search_result",
+            "source": "https://example.com/refunds",
+            "title": "Refunds",
+            "content": [{"type": "text", "text": "Refunds take 5 days."}],
+        }
+        text = (
+            "Title: Refunds\nSource: https://example.com/refunds\n"
+            "Content: Refunds take 5 days."
+        )
+        messages = [
+            {"role": "user", "content": [result, {"type": "text", "text": "Why?"}]},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "id": "t", "name": "search_docs", "input": {}}
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "t", "content": [result]}
+                ],
+            },
+        ]
+        engine.outputs.append("5 days.")
+        request = self._messages_request(messages)
+        response = asyncio.run(anthropic.handle_messages(request, None))
+        self.assertEqual(response.status_code, 200)
+        prompt = engine.prompts[-1]
+        self.assertEqual(prompt.count(text), 2)
+        self.assertEqual(_schema_names(prompt), ["search_docs"])
+
+        counted = asyncio.run(
+            anthropic.handle_count_tokens(
+                AnthropicCountTokensRequest(
+                    model="dummy", messages=messages, tools=request.tools
+                ),
+                None,
+            )
+        )
+        self.assertEqual(
+            json.loads(counted.body)["input_tokens"],
+            len(engine.requests[-1].input_ids),
+        )
+
     def test_messages_tool_choice_follows_loaded_tools(self):
         anthropic, _ = self._messages()
         for fields, error in (
@@ -1854,8 +2672,8 @@ class TestNativeToolLoading(CustomTestCase):
             [("create_ticket", {"order": "A-1"})],
         )
 
-        # A definition of a tool already offered unchanged adds nothing; one equal
-        # to a deferred declaration loads that declaration.
+        # A definition of a tool already offered unchanged, by definition or by
+        # reference, adds nothing; one equal to a deferred declaration loads it.
         once, _ = prompt([ASK_TICKET, ADD_TICKET, *again])
         self.assertEqual(
             prompt(
@@ -1863,6 +2681,9 @@ class TestNativeToolLoading(CustomTestCase):
                 tools=[SEARCH_DOCS_TOOL],
             )[0],
             once,
+        )
+        self.assertEqual(
+            prompt([ASK_TICKET, ADD_TICKET, *again, DEFINE_TICKET])[0], once
         )
         self.assertEqual(prompt([ASK_TICKET, DEFINE_TICKET], **named)[0], by_reference)
         shown = [

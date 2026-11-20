@@ -36,8 +36,6 @@ class NativePrompt(msgspec.Struct, frozen=True, kw_only=True):
     namespace_names: dict[str, tuple[str, str]] = {}
     """The call name of each namespace member, mapped to its namespace and the
     name the request gives it there."""
-    continued_turn: Optional[dict[str, Any]] = None
-    """The final assistant message the prompt continues, as a chat message."""
 
 
 class ChatOutputHooks(msgspec.Struct, frozen=True, kw_only=True):
@@ -243,13 +241,12 @@ class NativeRequestEncoder(Protocol):
         thinking: bool,
         effort: Union[str, int, float, None],
         response_schema: Optional[dict[str, Any]],
-        continue_final_message: bool,
     ) -> NativePrompt:
         """``body`` carries the request's conversation, tools and, for
         ``tool_choice="none"``, its choice; ``thinking`` and ``effort`` are the
         handler's decisions, as for ``encode_messages``. ``response_schema`` is
-        the JSON schema the answer follows; a trailing assistant turn is continued
-        under ``continue_final_message`` and otherwise re-sent as a user turn."""
+        the JSON schema the answer follows; a trailing assistant turn is re-sent
+        as a user turn."""
         ...
 
 

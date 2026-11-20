@@ -1028,9 +1028,6 @@ class ChatCompletionRequest(PDRoutingFields):
     # Whether ``tools`` are the only tools the rendered prompt shows, so a call
     # to any other tool is dropped rather than returned.
     _drops_unlisted_tool_calls: bool = PrivateAttr(default=False)
-    # Set with ``input_ids`` under ``continue_final_message``: the final assistant
-    # message the prompt continues, where output parsing resumes.
-    _continued_turn: Optional[Dict[str, Any]] = PrivateAttr(default=None)
     tool_choice: Union[ToolChoice, Literal["auto", "required", "none"]] = Field(
         default="auto", examples=["none"]
     )  # noqa

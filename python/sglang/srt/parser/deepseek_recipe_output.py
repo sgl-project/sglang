@@ -221,7 +221,8 @@ class DeepSeekRecipeOutputParser:
             index = None
             if call.name in self._callable_names:
                 index = sum(kept is not None for kept in self._call_indices.values())
-            else:
+            # No callable name is `tool_choice: none`, which drops calls by design.
+            elif self._callable_names:
                 logger.warning(
                     "Model attempted to call undefined function: %s", call.name
                 )

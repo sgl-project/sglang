@@ -999,9 +999,9 @@ class OpenAIServingChat(OpenAIServingBase):
         """
         if not self.tool_call_parser or request._response_parser_json_response_format:
             return False
-        if request._drops_unlisted_tool_calls and request.tool_choice == "none":
-            # The history showed the model tools, so it can still write a call;
-            # parsing drops it, where skipping the parser would return its markup.
+        if request._drops_unlisted_tool_calls:
+            # The model may call a tool it cannot call now, under `none` or before
+            # the tool loads; parsing drops the call, where skipping it leaks markup.
             return True
         if not self._effective_tools(request):
             # With no tools declared, tool_choice only holds its default and limits nothing.
@@ -2000,7 +2000,6 @@ class OpenAIServingChat(OpenAIServingBase):
                 if response_format is not None and response_format.json_schema
                 else None
             ),
-            continue_final_message=request.continue_final_message,
         )
         if prompt.image_data and not self.tokenizer_manager.model_config.is_multimodal:
             raise ValueError("image input is not supported for this model")
@@ -2008,7 +2007,6 @@ class OpenAIServingChat(OpenAIServingBase):
         request.tools = prompt.tools or None
         request._input_image_data = prompt.image_data or None
         request._drops_unlisted_tool_calls = True
-        request._continued_turn = prompt.continued_turn
         return prompt
 
     def _apply_jinja_template(
