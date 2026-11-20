@@ -16,8 +16,8 @@ for name in (
     "torch_npu",
     "torch_npu.contrib",
     "sgl_kernel_npu",
-    "sgl_kernel_npu.attention",
-    "sgl_kernel_npu.attention.sinks_attention",
+    "sgl_kernel_npu.operators",
+    "sgl_kernel_npu.operators.attention",
 ):
     sys.modules.setdefault(name, MagicMock())
 
