@@ -8,6 +8,7 @@ from abc import abstractmethod
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from torch.distributed.tensor import DTensor
 from torch.nn.parameter import Parameter
 
 from sglang.kernels.kernel_api_logging import wrap_method_with_debug_kernel_once
@@ -281,6 +282,9 @@ def pack_rows_into_one_buffer(params: list[torch.Tensor]) -> None:
     """Move the tensors into consecutive rows of one new buffer and leave each a
     view of its rows, so one GEMM can read them all (``rows_of_one_buffer``).
     Only the views hold the buffer: moving or offloading a layer frees it."""
+    if any(isinstance(param, DTensor) for param in params):
+        # FSDP-sharded: FSDP owns the shard storage and gathers it per forward
+        return
     with torch.no_grad():
         packed = torch.cat([param.data for param in params])
     offset = 0
@@ -293,6 +297,9 @@ def pack_rows_into_one_buffer(params: list[torch.Tensor]) -> None:
 def rows_of_one_buffer(parts: list[torch.Tensor]) -> torch.Tensor | None:
     """``torch.cat(parts)`` without a copy while the parts are still consecutive
     rows of one buffer; None once a move, load or offload gave one its own."""
+    if any(isinstance(part, DTensor) for part in parts):
+        # FSDP-sharded parameters have no plain storage to read
+        return None
     first = parts[0]
     storage = first.untyped_storage().data_ptr()
     offset = first.storage_offset()
