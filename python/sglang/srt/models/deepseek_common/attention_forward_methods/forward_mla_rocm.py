@@ -462,7 +462,6 @@ def rocm_absorb_v_bmm(
 def _rope_cache_q_out_dtype(
     attn: DeepseekV2AttentionMLA, *, q_dtype: torch.dtype, num_heads: int
 ) -> torch.dtype:
-    """Q dtype the fused RoPE + KV-cache write kernels emit."""
     # gfx1250 MLA decode (aiter ASM, paged Gluon, triton) takes an unquantized Q;
     # q_nope is bf16 there, since rocm_absorb_q_bmm computes in bf16.
     if attn.kv_cache_dtype != "fp8_e4m3" or _use_gfx1250_fused_mla_rope:
@@ -476,7 +475,6 @@ def _rope_cache_q_out_dtype(
 def _fused_kv_cache_write_target(
     *, layer_id: int, out_cache_loc: torch.Tensor
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """KV buffer and device slots for an AITER kernel that writes the cache itself."""
     kv_pool = get_token_to_kv_pool()
     if isinstance(kv_pool, HiSparseDSATokenToKVPool):
         # The fused write bypasses set_mla_kv_buffer()'s logical-to-device mapping.
@@ -540,15 +538,6 @@ def _can_fuse_bmm_rope_cat_and_cache(
     except two MXFP4 scope terms. FP8 and MXFP4 ``w_kc`` each have their own
     kernel and terms.
 
-    MXFP4 fuses only while capturing CUDA graphs, and only for up to 256 tokens:
-    capture-only is the scope validated end to end, and the token bound is a
-    measured speed term. Eager decode and larger captured batches run split.
-
-    With an FP8 Q the MXFP4 kernel is not bit-exact: it rounds the BMM straight
-    to FP8 where the split path rounds through BF16 first, which moves about 1%
-    of those values by one FP8 step. The KV-cache bytes match. So eager and
-    graph decode of one batch are not bit-identical.
-
     The caller adds one more term it alone can see: DCP q replication splits the
     absorb across a different weight, which this kernel does not carry.
 
@@ -593,7 +582,6 @@ def _can_fuse_mxfp4_bmm_rope_cat_and_cache(
     is_capture_mode: bool,
     num_tokens: int,
 ) -> bool:
-    """MXFP4 terms: aiter graph decode of up to 256 tokens at kernel-tiled shapes."""
     return (
         # Graph decode is the scope validated end to end; eager decode runs split.
         is_capture_mode
