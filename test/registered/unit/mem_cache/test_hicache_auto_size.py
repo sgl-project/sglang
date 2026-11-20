@@ -275,11 +275,11 @@ class TestHiCacheAutoSize(CustomTestCase):
             # Three peers on this host pin their pools before this rank builds its own.
             host_free["bytes"] -= 3 * pool_bytes
             host = MHATokenToKVPoolHost(
-                pool.get_device_pool_infos()[0].buffer_info,
-                2.0,
-                1e-5,
-                2,
-                "layer_first",
+                buffer_info=pool.get_device_pool_infos()[0].buffer_info,
+                host_to_device_ratio=2.0,
+                host_size=1e-5,
+                page_size=2,
+                layout="layer_first",
                 pin_memory=False,
                 device="cpu",
                 device_capacity_tokens=pool.size,
