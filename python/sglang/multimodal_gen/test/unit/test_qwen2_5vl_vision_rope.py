@@ -9,6 +9,15 @@ from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImageEditPlus_2511_PipelineConfig,
     QwenImageEditPlusPipelineConfig,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers import (
+    component_residency_strategies,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    ComponentUse,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_strategies import (
+    ComponentOffloadStrategy,
+)
 from sglang.multimodal_gen.runtime.models.encoders.qwen2_5vl_vision import (
     Qwen2_5VLVisionRotaryEmbedding,
 )
@@ -35,6 +44,12 @@ def test_offloaded_vision_rope_matches_resident():
     torch.testing.assert_close(offloaded(positions), expected, atol=0, rtol=0)
     torch.testing.assert_close(offloaded(positions), expected, atol=0, rtol=0)
 
+    # --component-precisions.text_encoder bf16: each reload casts buffers too
+    for _ in range(2):
+        offloaded.cpu()
+        offloaded.to("cuda", dtype=torch.bfloat16)
+        torch.testing.assert_close(offloaded(positions), expected, atol=0, rtol=0)
+
 
 @pytest.mark.parametrize(
     "pipeline_config_cls, rebuilds",
@@ -49,6 +64,11 @@ def test_edit_pipeline_rebuilds_vision_rope_after_offload(
 ):
     with torch.device("cpu"):
         rotary = Qwen2_5VLVisionRotaryEmbedding(40)
+    _create_edit_stages(pipeline_config_cls, rotary)
+    assert rotary.recompute_on_device_change is rebuilds
+
+
+def _create_edit_stages(pipeline_config_cls, rotary):
     text_encoder = SimpleNamespace(
         model=SimpleNamespace(visual=SimpleNamespace(rotary_pos_emb=rotary))
     )
@@ -69,4 +89,29 @@ def test_edit_pipeline_rebuilds_vision_rope_after_offload(
     ):
         pipeline.create_pipeline_stages(server_args)
 
-    assert rotary.recompute_on_device_change is rebuilds
+
+def test_edit_pipeline_vision_rope_survives_bf16_offload_cycles():
+    positions = _vision_positions("cpu")
+    expected = Qwen2_5VLVisionRotaryEmbedding(40)(positions)
+    encoder = torch.nn.Module()
+    encoder.proj = torch.nn.Linear(4, 4)
+    encoder.rotary_pos_emb = Qwen2_5VLVisionRotaryEmbedding(40)
+    _create_edit_stages(QwenImageEditPlus_2511_PipelineConfig, encoder.rotary_pos_emb)
+
+    strategy = ComponentOffloadStrategy()
+    use = ComponentUse("text_encoding", "text_encoder", target_dtype=torch.bfloat16)
+    with mock.patch.object(
+        component_residency_strategies,
+        "get_local_torch_device",
+        return_value=torch.device("cpu"),
+    ):
+        for _ in range(2):
+            # On CPU only, fp32 weights make every reload cast, as each
+            # CPU->GPU reload does on a real device.
+            encoder.proj.float()
+            strategy.prepare_for_use(encoder, use, None)
+            assert encoder.rotary_pos_emb.inv_freq.dtype == torch.bfloat16
+            torch.testing.assert_close(
+                encoder.rotary_pos_emb(positions), expected, atol=0, rtol=0
+            )
+            strategy.finish_use(encoder, use, None)

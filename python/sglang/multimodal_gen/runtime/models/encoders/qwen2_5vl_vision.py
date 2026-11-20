@@ -37,11 +37,12 @@ class Qwen2_5VLVisionRotaryEmbedding(nn.Module):
         self._inv_freq_device = inv_freq.device
 
     def forward(self, position_ids: torch.Tensor) -> torch.Tensor:
-        if (
-            self.recompute_on_device_change
-            and self.inv_freq.device != self._inv_freq_device
+        if self.recompute_on_device_change and (
+            self.inv_freq.device != self._inv_freq_device
+            or self.inv_freq.dtype != torch.float32
         ):
-            # match resident initialization: CPU and GPU pow round differently
+            # match resident initialization: CPU and GPU pow round differently,
+            # and a reload with a component precision casts this buffer too
             indices = torch.arange(
                 0, self.dim, 2, dtype=torch.float32, device=self.inv_freq.device
             )
