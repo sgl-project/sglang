@@ -28,17 +28,15 @@ def main(args):
         lambda data: _transform_config(args, data),
     )
 
-    safetensors_index = _transform_json(
-        dir_input,
-        dir_output,
-        "model.safetensors.index.json",
-        lambda data: _transform_safetensors_index(args, data),
-    )
+    index_filename = "model.safetensors.index.json"
+    safetensors_index = json.loads((dir_input / index_filename).read_text())
+    _transform_safetensors_index(args, safetensors_index)
+    weight_map = safetensors_index["weight_map"]
+    total_size = 0
 
     for path_input_safetensors in sorted(list(dir_input.glob("*.safetensors"))):
-        path_output_safetensors = dir_output / path_input_safetensors.relative_to(
-            dir_input
-        )
+        shard = path_input_safetensors.relative_to(dir_input)
+        path_output_safetensors = dir_output / shard
 
         state_dict = load_file(path_input_safetensors)
         _transform_safetensors_file(
@@ -47,8 +45,16 @@ def main(args):
         if len(state_dict) > 0:
             print(f"Save {len(state_dict)} tensors to {path_output_safetensors}")
             save_file(state_dict, path_output_safetensors)
+            total_size += sum(
+                tensor.nbytes
+                for name, tensor in state_dict.items()
+                if Path(weight_map[name]) == shard
+            )
         else:
             print(f"Skip saving {path_output_safetensors} since it is empty")
+
+    safetensors_index.setdefault("metadata", {})["total_size"] = total_size
+    (dir_output / index_filename).write_text(json.dumps(safetensors_index, indent=4))
 
 
 def _maybe_snapshot_download(path):
