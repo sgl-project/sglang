@@ -40,6 +40,7 @@ if is_flashinfer_available():
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    from sglang.srt.distributed import GroupCoordinator
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
     from sglang.srt.layers.moe.topk import TopKConfig
 
@@ -646,10 +647,13 @@ def register_fused_all_reduce_comm(*, max_push_size: Optional[int] = None) -> No
         )
 
 
-def can_fuse_all_reduce(num_tokens: int, hidden_dim: int) -> bool:
+def can_fuse_all_reduce(
+    num_tokens: int, hidden_dim: int, *, group: Optional[GroupCoordinator] = None
+) -> bool:
     """Whether the registered push plane can stage ``[num_tokens, hidden_dim]``
     BF16 rows in one slot. The 384 ceiling is the bench-validated range of the
-    fused collective family.
+    fused collective family. When supplied, ``group`` must be the very group
+    whose push plane was registered (not just a group of the same size).
 
     The deferred-finalize handle type carries its own numeric contract (every
     producer folds the routed scaling; no consumer rescales)."""
@@ -657,7 +661,11 @@ def can_fuse_all_reduce(num_tokens: int, hidden_dim: int) -> bool:
     from sglang.kernels.ops.communication import all_reduce_fusion
 
     lease = _fused_all_reduce_lease
-    if lease is None or lease.world_size != get_parallel().tp_size:
+    if (
+        lease is None
+        or lease.world_size != get_parallel().tp_size
+        or (group is not None and lease.group is not group.cpu_group)
+    ):
         return False
     if not _fused_all_reduce_registered:
         all_reduce_fusion.register_comm(

@@ -50,11 +50,14 @@ from sglang.srt.layers.quantization.mxfp8_input import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.runner import compile_in_capture_mode
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    is_in_breakable_cuda_graph,
+)
 from sglang.srt.model_executor.runner_utils.prefill_graph import (
     is_in_prefill_graph_scope,
 )
 from sglang.srt.models.deepseek_v2 import MoEOutput
-from sglang.srt.runtime_context import get_forward, get_parallel, get_platform
+from sglang.srt.runtime_context import get_exec, get_forward, get_parallel, get_platform
 from sglang.srt.utils import is_gfx95_supported, is_hip, is_npu, is_xpu
 
 _is_gfx95_supported = is_gfx95_supported()
@@ -66,6 +69,10 @@ _is_xpu = is_xpu()
 # The fused all-reduce epilogues have world-size-templated kernels for TP2 and TP4.
 _FUSED_MHC_TP_SIZES = (2, 4)
 FUSED_MXFP8_PRODUCER_MAX_ROWS = 2048
+# SM90 TP8's tuned V2 push slot is 128 KiB (eager and graph). Each BF16
+# attention-output row is 5120 * 2 bytes: 12 fit, 13 do not. Retain the
+# actual lease check as well, including deployments with a smaller slot.
+SM90_ATTN_MHC_MAX_ROWS = (128 * 1024) // (5120 * 2)
 
 
 def fused_mxfp8_rows(rows: int) -> bool:
@@ -761,6 +768,69 @@ def can_fuse_post(cfg: HcConfig) -> bool:
         and cfg.hidden == 5120
         and get_parallel().attn_dp_size == 1
         and not cfg.cp_prefill
+    )
+
+
+def sm90_attn_mhc_enabled() -> bool:
+    """The Hopper attention experiment shares the *actual* TP V2 push plane.
+
+    Kept separate from ``can_fuse_post`` and ``fused_mhc_tp_ok``: neither a
+    same-sized attention subgroup nor a TP8 MoE finalize is eligible here.
+    """
+    if not envs.SGLANG_OPT_DSV41_SM90_ATTN_MHC_AR.get() or not get_platform().is_sm90:
+        return False
+    parallel = get_parallel()
+    return (
+        parallel.tp_size == parallel.attn_tp_size == 8
+        and parallel.attn_dp_size == parallel.attn_cp_size == 1
+        and parallel.attn_tp_group is parallel.tp_group
+        and not get_exec().comm.enable_quant_communications
+        and not is_batch_invariant_mode_enabled()
+    )
+
+
+def sm90_attn_mhc_rows_ok(x: torch.Tensor) -> bool:
+    return (
+        x.ndim == 2
+        and 0 < x.shape[0] <= SM90_ATTN_MHC_MAX_ROWS
+        and x.shape[1] == 5120
+        and x.dtype == torch.bfloat16
+        and x.is_contiguous()
+        and x.storage_offset() % 8 == 0
+    )
+
+
+def sm90_attn_mhc_batch_ok(x: torch.Tensor, batch: ForwardBatch) -> bool:
+    """Only decode and target verify, using the physical (including padded) rows.
+
+    Breakable/prefill graph scopes are excluded even when their capture flags
+    describe decode. TBO and token sharding must keep the ordinary reduction.
+    """
+    mode = batch.forward_mode
+    fwd = get_forward()
+    return (
+        sm90_attn_mhc_rows_ok(x)
+        and (mode.is_decode() or mode.is_target_verify())
+        and not batch.can_run_tbo
+        and not is_in_prefill_graph_scope()
+        and not is_in_breakable_cuda_graph()
+        and not fwd.sp_active
+        and not fwd.attn_input_scattered
+        and not fwd.attn_tp_sequence_sharded
+        and not fwd.mlp_reduce_scatter
+    )
+
+
+def sm90_attn_mhc_inputs_ok(x: torch.Tensor, residual: torch.Tensor) -> bool:
+    """Check the real partial and its source residual at the completing read."""
+    return (
+        sm90_attn_mhc_rows_ok(x)
+        and isinstance(residual, torch.Tensor)
+        and residual.shape == (x.shape[0], 4, 5120)
+        and residual.dtype == torch.bfloat16
+        and residual.device == x.device
+        and residual.is_contiguous()
+        and residual.storage_offset() % 8 == 0
     )
 
 
