@@ -485,45 +485,6 @@ class SupportsPrefillBody(Protocol):
         per-bucket metadata: refill this body's own tables for that bucket."""
 
 
-@runtime_checkable
-class SupportsDraftAux(Protocol):
-    """A DFlash draft spec that writes the target's context into the draft KV cache.
-
-    draft_aux issues collectives: every TP rank calls it in program order.
-    """
-
-    draft_aux_rows: tuple[int, ...]
-
-    def draft_aux(self, **kwargs: Any) -> None: ...
-
-
-@runtime_checkable
-class SupportsDraftSelectorHead(Protocol):
-    """A DFlash selector draft spec whose forward also proposes the draft block.
-
-    attach_draft_head runs once on every TP rank, before any draft forward or capture.
-    """
-
-    draft_head_requests: tuple[int, ...]
-    draft_head_sampling: bool
-
-    def attach_draft_head(self, **kwargs: Any) -> tuple: ...
-
-    def stage_draft_head_sampling(self, **kwargs: Any) -> None: ...
-
-
-@runtime_checkable
-class SupportsDraftEmbed(Protocol):
-    """A DFlash draft spec that embeds the draft block from its token ids itself.
-
-    attach_draft_embed runs once on every TP rank, before any draft forward or capture.
-    """
-
-    draft_embed_requests: tuple[int, ...]
-
-    def attach_draft_embed(self, **kwargs: Any) -> None: ...
-
-
 class RecurrentCommitIO(msgspec.Struct, frozen=True):
     """One chain verify's accepted recurrent state, per request ([bs] tensors). The
     slots are the verify's resolved ones: the request table may name others."""
@@ -567,13 +528,15 @@ class SupportsRecurrentCommit(Protocol):
 
 
 @runtime_checkable
-class SupportsKdaCommit(Protocol):
-    """A target spec that commits the KDA state after a chain verify in one launch.
+class SupportsDFlashRuntime(Protocol):
+    """A target build that runs the DFLASH decode round itself.
 
-    kda_commit returns False, launching nothing, when off; SGLang then commits itself.
+    dflash_runtime is the "module:attribute" path of its runtime class, which SGLang
+    imports only when every TP rank names the same and binds to the DFLASH worker
+    (sglang.srt.speculative.dflash_binding); "" keeps SGLang's round.
     """
 
-    def kda_commit(self, **kwargs: Any) -> bool: ...
+    dflash_runtime: str
 
 
 @runtime_checkable
@@ -584,54 +547,6 @@ class SupportsDecodeTensorEntry(Protocol):
     """
 
     tensor_binding_kind: int
-
-
-@runtime_checkable
-class SupportsDraftAccept(Protocol):
-    """A DFlash draft spec that runs the greedy verify accept itself.
-
-    draft_accept issues a collective: every TP rank calls it in program order.
-    """
-
-    draft_accept_requests: tuple[int, ...]
-
-    def attach_draft_accept(self, **kwargs: Any) -> None: ...
-
-    def draft_accept(self, **kwargs: Any) -> None: ...
-
-
-@runtime_checkable
-class SupportsRank0Broadcast(Protocol):
-    """A target spec that broadcasts rank 0's DFLASH sampled-accept result on device.
-
-    rank0_broadcast overwrites its args in place, or returns False when off; it is a
-    collective, so every rank calls it in the same order.
-    """
-
-    def rank0_broadcast(self, accept_len: Any, bonus: Any) -> bool: ...
-
-
-@runtime_checkable
-class SupportsSampledAccept(Protocol):
-    """A target spec that runs the DFLASH sampled accept on vocab-sharded verify logits.
-
-    sampled_accept returns rank 0's decision on every rank; these are collectives, so
-    every rank calls them in the same order.
-    """
-
-    def prepare_sampled_accept(
-        self,
-        *,
-        vocab_size: int,
-        softcap: Any,
-        shard_width: int,
-        seed: int,
-        topk: int = 16,
-    ) -> bool: ...
-
-    def sampled_accept_fits(self, requests: int, logits: Any = None) -> bool: ...
-
-    def sampled_accept(self, **kwargs: Any) -> Any: ...
 
 
 class MegakernelSpec(msgspec.Struct, frozen=True):

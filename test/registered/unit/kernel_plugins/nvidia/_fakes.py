@@ -115,3 +115,14 @@ def server_args(**kw):
         "cuda_graph_config": default_cuda_graph_config(),
     }
     return ServerArgs(**{**defaults, **kw})
+
+
+class FakeDFlashRuntime:
+    """A DFLASH runtime (speculative/dflash_binding.py) recording what it was built with."""
+
+    api_version = 1
+    exports = frozenset({"block_size", "mask_token_id"})
+    invariants = {"block_size": 8, "selector_sampling": True, "tp_size": frozenset({4})}
+
+    def __init__(self, binding, built):
+        self.binding, self.built = binding, built

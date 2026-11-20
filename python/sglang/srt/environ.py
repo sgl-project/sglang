@@ -1855,8 +1855,6 @@ class Envs:
     # Defer the TP gather of an unsoftcapped target-verify vocab shard. The DFLASH
     # sampled and megakernel accept paths defer it unless this is set to 0.
     SGLANG_OPT_DFLASH_DEFER_PLAIN_GATHER = EnvBool(False)
-    # Capture the megakernel post-verify tail as CUDA graphs.
-    SGLANG_OPT_DFLASH_MEGAKERNEL_TAIL_GRAPH = EnvBool(False)
     # Split the DFLASH draft's context fc across TP by output columns.
     SGLANG_OPT_DFLASH_TP_AUX_FC = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_K31_GB_OPTIMIZATION.get
