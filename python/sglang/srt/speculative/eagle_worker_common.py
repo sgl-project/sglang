@@ -338,6 +338,7 @@ def prepare_for_draft_extend(
     cuda_graph_runner: Any,
     *,
     return_hidden_states_before_norm: bool,
+    skip_native_metadata: bool = False,
     widened_out_cache_loc: Optional[torch.Tensor] = None,
     widened_positions: Optional[torch.Tensor] = None,
     iteration_ids: Optional[IterationIds] = None,
@@ -443,7 +444,7 @@ def prepare_for_draft_extend(
     can_run_decode_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run_graph(
         forward_batch
     )
-    if not batch.forward_mode.is_idle() and not can_run_decode_cuda_graph:
+    if not skip_native_metadata and not batch.forward_mode.is_idle() and not can_run_decode_cuda_graph:
         draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
         # Planned pre-pad; do NOT opt into post-pad re-plan. DSA's indexer
         # cannot rebuild its deep_gemm schedule_meta on a DP-padded batch

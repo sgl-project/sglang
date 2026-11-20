@@ -1286,6 +1286,11 @@ class Glm4MoeForCausalLM(nn.Module):
 
 
 class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
+    def init_megakernel(self, factory, bridge):
+        from sglang.srt.hardware_backend.npu.megakernel.weights import build_runtime
+
+        self._megakernel_model = build_runtime(self, factory, draft=False)
+
     fused_shared_experts_architecture = "GlmMoeDsaForCausalLM"
 
     @classmethod
@@ -1301,6 +1306,11 @@ class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
 
 
 class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):
+    def init_megakernel_mtp(self, factory, bridge):
+        from sglang.srt.hardware_backend.npu.megakernel.weights import build_runtime
+
+        self._megakernel_mtp_model = build_runtime(self, factory, draft=True)
+
     # ModelConfig rewrites a GLM draft's architecture to this class's own name,
     # so the inherited DeepSeek name would never match what the gate compares.
     fused_shared_experts_architecture = "GlmMoeDsaForCausalLMNextN"

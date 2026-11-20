@@ -3557,6 +3557,17 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             ):
                 output_dsa_topk_indices = None
             decode_req.req.output_dsa_topk_indices = output_dsa_topk_indices
+            if envs.SGLANG_ENABLE_NPU_MEGAKERNEL_PLUGIN.get():
+                queue = self.scheduler.disagg_decode_prealloc_queue
+                pool = queue.draft_token_to_kv_pool
+                decode_req.req.ascend_seed_ready = (
+                    not resumes_output
+                    and not _is_fake_transfer(decode_req.req)
+                    and actual_room == expected_room != 0
+                    and queue.draft_kv_ring is None
+                    and getattr(pool, "dsa_kv_cache_store_fp8", False)
+                    and getattr(pool, "index_k_scale_buffer", None) is not None
+                )
 
         decode_req.kv_receiver.clear()
         decode_req.kv_receiver = None

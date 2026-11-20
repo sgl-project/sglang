@@ -1287,6 +1287,7 @@ class Envs:
     # ===================================================================
     # Ascend NPU
     # ===================================================================
+    SGLANG_ENABLE_NPU_MEGAKERNEL_PLUGIN = EnvBool(False)
     SGLANG_NPU_ENABLE_STATIC_KERNEL = EnvBool(False)
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     # Requantize plain block-FP8 (fp32-scale) checkpoints to MXFP8 at load

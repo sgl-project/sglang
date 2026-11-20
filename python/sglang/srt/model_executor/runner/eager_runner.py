@@ -203,6 +203,20 @@ class EagerRunner(BaseRunner):
     ) -> Any:
         with self.model_context():
             mode = forward_batch.forward_mode
+            binding = getattr(self.model_runner, "ascend_binding", None)
+            if (
+                binding is not None
+                and binding.role == "target"
+                and binding.target_supported(
+                    forward_batch, forward_batch.input_embeds, pp_proxy_tensors
+                )
+            ):
+                from sglang.srt.hardware_backend.npu.megakernel.plugin import run_target
+
+                with forward_context(
+                    get_forward_context(), forward_batch=forward_batch
+                ):
+                    return run_target(binding, forward_batch)
             if mode.is_mixed() and not is_npu() and get_cp_strategy() is None:
                 # A mixed batch is extend-shaped (decode tails are 1-token
                 # extends); run it as EXTEND. NPU keeps MIXED for its dedicated

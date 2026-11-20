@@ -747,9 +747,19 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             else contextlib.nullcontext()
         )
 
+        binding = getattr(self.draft_runner, "ascend_binding", None)
+        chain = None
+        if binding is not None and not forward_batch.forward_mode.is_idle():
+            from sglang.srt.hardware_backend.npu.megakernel.draft import draft_chain
+
+            chain = draft_chain(self, binding, batch, forward_batch)
         with canary_outside_ctx:
             # Run draft
-            if can_run_decode_cuda_graph:
+            if chain is not None:
+                parent_list = self._topk1_parents_prealloc[:1]
+                top_scores_index = self._topk1_score_indices_prealloc[:1]
+                draft_tokens, draft_probs = chain, None
+            elif can_run_decode_cuda_graph:
                 parent_list, top_scores_index, draft_tokens, draft_probs = (
                     self.cuda_graph_runner.execute(forward_batch)
                 )
@@ -1227,6 +1237,16 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         iteration_ids: Optional[IterationIds] = None,
     ):
         self.draft_runtime.note_draft_extend()
+        binding = getattr(self.draft_runner, "ascend_binding", None)
+        fused = False
+        if binding is not None and not batch.forward_mode.is_idle():
+            if binding.mode == "fused_extend":
+                from sglang.srt.hardware_backend.npu.megakernel.draft import can_fuse
+
+                fused = can_fuse(self, binding, batch, batch_result)
+            elif binding.pd_decode and len(batch.reqs) == 1:
+                # A successful local extend supplies the seed for the next round.
+                batch.reqs[0].ascend_seed_ready = True
         # Cast to int64 before entering plan stream to avoid cross-stream
         # synchronization issues with .to() inside the plan stream context.
         if batch_result.prepared_draft_extend_inputs is not None:
@@ -1283,6 +1303,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 self.draft_runner,
                 self.cuda_graph_runner_for_draft_extend,
                 return_hidden_states_before_norm=False,
+                skip_native_metadata=fused,
                 iteration_ids=iteration_ids,
             )
 
@@ -1290,6 +1311,22 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             torch.get_device_module(self.device).current_stream().wait_stream(
                 self.plan_stream
             )
+
+        if fused:
+            from sglang.srt.hardware_backend.npu.megakernel.draft import publish
+
+            backend = self.draft_extend_attn_backend or self.draft_runner.attn_backend
+            with forward_context(
+                ForwardContext(attn_backend=backend), forward_batch=forward_batch
+            ):
+                publish(
+                    binding,
+                    batch,
+                    forward_batch,
+                    select_index,
+                    batch_result.next_draft_input,
+                )
+            return
 
         # Run draft extend batch in the main compute stream
         can_run_decode_cuda_graph = (
