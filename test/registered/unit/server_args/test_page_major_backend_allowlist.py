@@ -269,6 +269,27 @@ class TestPageMajorBackendAllowlist(unittest.TestCase):
                     f"{backend} has no virtual-to-physical id wiring and must be rejected",
                 )
 
+    def test_registered_page_major_backend_allowed(self):
+        """A backend registered with ``page_major_kv_layout=True`` (one defined
+        outside SGLang) passes the gate on every arm; without it, it does not."""
+        from sglang.srt.layers.attention import attention_registry
+
+        names = ("external_page_major", "external_unaudited")
+        try:
+            attention_registry.register_attention_backend(
+                names[0], page_major_kv_layout=True
+            )(object)
+            attention_registry.register_attention_backend(names[1])(object)
+            for use_mla, asymmetric in ((True, False), (False, False), (False, True)):
+                with self.subTest(use_mla=use_mla, has_asymmetric_kv=asymmetric):
+                    kwargs = dict(use_mla=use_mla, has_asymmetric_kv=asymmetric)
+                    self.assertTrue(_accepts(names[0], **kwargs))
+                    self.assertFalse(_accepts(names[1], **kwargs))
+        finally:
+            for name in names:
+                attention_registry.ATTENTION_BACKENDS.pop(name, None)
+                attention_registry.PAGE_MAJOR_KV_LAYOUT_BACKENDS.discard(name)
+
     def test_helion_linear_attention_is_kda_only(self):
         for phase in ("decode", "prefill"):
             kwargs = {f"linear_{phase}": "helion"}

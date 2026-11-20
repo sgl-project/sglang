@@ -970,6 +970,12 @@ def handle_page_major_kv_layout(server_args: Any):
             "flashinfer",
             "trtllm_mha",
         }
+    from sglang.srt.layers.attention.attention_registry import (
+        PAGE_MAJOR_KV_LAYOUT_BACKENDS,
+    )
+
+    # Backends registered outside SGLang that declare they read these views.
+    allowed_full |= PAGE_MAJOR_KV_LAYOUT_BACKENDS
     backends = set(attention_backends_of(resolved_view(server_args)))
     backends.discard(None)
     assert backends <= allowed_full, (
