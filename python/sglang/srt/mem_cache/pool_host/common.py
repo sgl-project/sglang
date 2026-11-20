@@ -11,7 +11,7 @@ import time
 import weakref
 from collections import defaultdict
 from functools import lru_cache
-from typing import Callable, Union
+from typing import Union
 
 import torch
 
@@ -216,6 +216,14 @@ def _cuda_host_register(
     hugepage_size = hugepage_size_requested() if tensor_uses_hugepage(buffer) else 0
     if hugepage_size:
         total = -(-total // hugepage_size) * hugepage_size
+    # Split floor: retry subdivisions never go below 2 MiB. The earlier
+    # theory that misaligned-boundary rejections came from THP promotion was
+    # wrong — issue #50015 traced the real mechanism to the driver's
+    # GUP FOLL_LONGTERM tracking array needing an order-N contiguous block
+    # (4 MiB at a 2 GiB range), which fails on fragmented buddy allocators
+    # regardless of alignment. 2 MiB stays as the floor because below it the
+    # copy-unit grid already dominates the split geometry.
+    thp_floor = 2 * 1024 * 1024
     chunk_limit_bytes = (
         max(envs.SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB.get(), 1) * 1024**3
     )
@@ -231,31 +239,108 @@ def _cuda_host_register(
             )
         # Every internal boundary must align to both a complete copy unit and
         # a hugepage. Rounding to either grid separately can break the other.
-        alignment_bytes = math.lcm(registration_granularity_bytes, hugepage_size or 1)
-        if alignment_bytes > chunk_limit_bytes:
-            raise ValueError(
-                "Host registration alignment exceeds the configured chunk limit: "
-                f"granularity={registration_granularity_bytes}, "
-                f"hugepage={hugepage_size}, alignment={alignment_bytes}, "
-                f"chunk_limit={chunk_limit_bytes}"
+        alignment_bytes = math.lcm(
+            registration_granularity_bytes, max(hugepage_size, thp_floor)
+        )
+        # Two independent grids constrain a chunk boundary: the copy-unit grid
+        # (a cudaMemcpyBatchAsync page copy must not span two registrations —
+        # measured crash: 'invalid argument' on the first write_through flush
+        # when a 2 MiB-aligned chunk boundary cut a page in half) and the
+        # hugepage grid (a THP-promoted region rejects misaligned registration
+        # calls, intermittently on this host). When one alignment grid cannot
+        # satisfy both within the per-call ceiling (lcm(224640, 2 MiB) = 3.43 GiB
+        # > 2 GiB), prefer the COPY-UNIT grid: a non-hugepage-aligned call may
+        # fail and the bisect retry splits it further, but a page cut by a
+        # registration boundary fails the flush at runtime with no fallback.
+        # Bisect keeps every split on the copy-unit grid too, so however far
+        # the registration range is subdivided, no page ever spans two ranges.
+        # The 512 MiB cap follows the kernel-side measurement in issue #50015:
+        # the GUP FOLL_LONGTERM tracking array needs an order-N contiguous
+        # block (4 MiB at 2 GiB, 1 MiB at 512 MiB), and a fragmented buddy
+        # allocator fails order-10 long before order-8 — chunk proactively
+        # below the fragmentation-sensitive size instead of relying on the
+        # bisect retry to absorb those failures.
+        reg_call_cap = 512 * 1024**2
+        if alignment_bytes > chunk_limit_bytes or alignment_bytes > reg_call_cap:
+            grid = registration_granularity_bytes
+            chunk_bytes = min(chunk_limit_bytes, reg_call_cap) // grid * grid
+            if chunk_bytes <= 0:
+                # A copy unit larger than the cap (or the chunk limit) cannot
+                # be subdivided: register it whole; the bisect retry still
+                # guards a failure inside it.
+                chunk_bytes = grid
+            logger.warning(
+                "Host registration alignment %d exceeds the chunk limit %d or "
+                "the per-call cap %d; using a copy-unit-aligned chunk of %d "
+                "(hugepage misalignment is handled by the bisect retry).",
+                alignment_bytes,
+                chunk_limit_bytes,
+                reg_call_cap,
+                chunk_bytes,
             )
-        chunk_bytes = (chunk_limit_bytes // alignment_bytes) * alignment_bytes
+        else:
+            chunk_bytes = (chunk_limit_bytes // alignment_bytes) * alignment_bytes
     registered_ranges: list[tuple[int, int]] = []
+
+    def _register(ptr: int, size: int) -> bool:
+        """Try to pin one range; consume the sticky CUDA error on failure."""
+        err = cudart.cudaHostRegister(ptr, size, 0)
+        rc = int(err)
+        if rc == 0:
+            registered_ranges.append((ptr, size))
+            return True
+        # A failed registration leaves a sticky CUDA error that would surface
+        # at the next unrelated call site with a misleading traceback; consume
+        # it so the real raise below is the whole story.
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            pass
+        logger.warning(
+            "cudaHostRegister failed (rc=%d, %s) at offset=%d size=%d; splitting.",
+            rc,
+            cudart.cudaGetErrorString(err),
+            ptr - base,
+            size,
+        )
+        return False
+
+    def _register_bisect(ptr: int, size: int, min_size: int) -> None:
+        """Pin [ptr, ptr+size), splitting on failure down to min_size.
+
+        The measured failure pattern (misaligned boundaries, >2 GiB calls, and
+        the 28 GiB mark of one pool) does not follow one clean rule per host,
+        so instead of guessing a threshold, guarantee progress: any failure
+        point is worked around by registering around it. Splits fall on the
+        copy-unit grid when the caller provides one — a cudaMemcpyBatchAsync
+        page copy must not span two registrations — and never below the
+        hugepage floor. The ranges list stays exact for cudaHostUnregister.
+        """
+        if _register(ptr, size):
+            return
+        if size // 2 < min_size:
+            raise RuntimeError(
+                f"cudaHostRegister failed below the minimum split size "
+                f"({min_size} bytes) at offset={ptr - base} size={size}; "
+                f"host buffer is not pinned and device transfers may silently "
+                f"return stale data."
+            )
+        half = size // 2
+        if registration_granularity_bytes is not None:
+            grid = registration_granularity_bytes
+            # Keep the split on the copy-unit grid; fall back to a plain half
+            # only when the whole size is under two copy units.
+            aligned = half // grid * grid
+            if aligned >= min_size and size - aligned >= min_size:
+                half = aligned
+        _register_bisect(ptr, half, min_size)
+        _register_bisect(ptr + half, size - half, min_size)
+
     try:
         offset = 0
         while offset < total:
             size = min(chunk_bytes, total - offset)
-            ptr = base + offset
-            err = cudart.cudaHostRegister(ptr, size, 0)
-            rc = int(err)
-            if rc != 0:
-                raise RuntimeError(
-                    f"cudaHostRegister failed (rc={rc}, "
-                    f"{cudart.cudaGetErrorString(err)}) at offset={offset} size={size} "
-                    f"(total={total}, chunk_limit={chunk_bytes}); host buffer is not "
-                    f"pinned and device transfers may silently return stale data."
-                )
-            registered_ranges.append((ptr, size))
+            _register_bisect(base + offset, size, thp_floor)
             offset += size
 
         # Keep the exact registration bases alive with the tensor. CUDA requires
@@ -481,36 +566,20 @@ def _uses_hip_owned_host_memory(
     )
 
 
-def alloc_owned_host_tensor(
-    dims: tuple,
-    dtype: torch.dtype,
-    alloc: Callable[[int], int],
-    free: Callable[[int], None],
-) -> torch.Tensor:
-    """A host tensor over ``alloc(nbytes)`` memory, released by ``free(ptr)``.
-
-    Unlike torch pin_memory, whose host allocator rounds each block up to a
-    power of two, the allocation has exactly the tensor's size.
-    """
+def _alloc_hip_host_tensor(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
+    # Not torch pin_memory: its host allocator rounds each block up to a power of
+    # two, so a 180 GB pool would pin 256 GiB of GTT.
     numel = math.prod(dims)
     nbytes = numel * dtype.itemsize
-    ptr = alloc(nbytes)
+    ptr = _hip_host_malloc(nbytes)
     try:
         array = (ctypes.c_uint8 * nbytes).from_address(ptr)
         buffer = torch.frombuffer(array, dtype=dtype, count=numel).reshape(dims)
     except BaseException:
-        free(ptr)
+        _hip_host_free(ptr)
         raise
     # Freed with the tensor's last view; at interpreter exit the driver reclaims it.
-    weakref.finalize(array, free, ptr).atexit = False
-    return buffer
-
-
-def _alloc_hip_host_tensor(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
-    # Not torch pin_memory: a 180 GB pool would pin 256 GiB of GTT.
-    buffer = alloc_owned_host_tensor(
-        dims=dims, dtype=dtype, alloc=_hip_host_malloc, free=_hip_host_free
-    )
+    weakref.finalize(array, _hip_host_free, ptr).atexit = False
     # Not host-registered, so HostKVCache.destroy() must not cudaHostUnregister it.
     setattr(buffer, _CUDA_HOST_REGISTERED_RANGES_ATTR, [])
     return buffer
