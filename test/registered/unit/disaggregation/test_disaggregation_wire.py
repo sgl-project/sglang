@@ -2793,6 +2793,7 @@ class TestMooncakeRegistrationDraftCount(CustomTestCase):
         manager.dcp_size = 1
         manager.dcp_rank = 0
         manager.enable_staging = False
+        manager.exchange_aux_item_lens = False
         manager.customized_info_enabled = False
         manager.local_ip = "127.0.0.1"
         manager.rank_port = 1234
