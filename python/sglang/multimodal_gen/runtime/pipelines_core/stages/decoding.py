@@ -10,6 +10,7 @@ import weakref
 import torch
 import torch.nn as nn
 
+from sglang.multimodal_gen import envs as diffusion_envs
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     quality_allows,
 )
@@ -386,7 +387,9 @@ class DecodingStage(PipelineStage):
         )
         if save_file_path is None:
             return None
-        return EncodeWhileDecoding(save_file_path, batch)
+        return EncodeWhileDecoding(
+            save_file_path, batch, use_nvenc=diffusion_envs.SGLANG_USE_NVENC
+        )
 
     @torch.no_grad()
     def forward(
