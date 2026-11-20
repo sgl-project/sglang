@@ -27,9 +27,10 @@ inline void* resolve_device_accessible_ptr(const at::Tensor& tensor) {
   }
 #elif !defined(USE_MUSA)
   if (tensor.device().is_cpu()) {
-    void* device_ptr = nullptr;
-    C10_CUDA_CHECK(cudaHostGetDevicePointer(&device_ptr, ptr, 0));
-    return device_ptr;
+    cudaPointerAttributes attributes{};
+    C10_CUDA_CHECK(cudaPointerGetAttributes(&attributes, ptr));
+    TORCH_CHECK(attributes.devicePointer != nullptr, "Host pointer has no device mapping");
+    return attributes.devicePointer;
   }
 #endif
   return ptr;

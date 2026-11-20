@@ -478,6 +478,15 @@ class HybridCacheController(BaseHiCacheController):
         storage_backend_extra_config: Optional[dict] = None,
         host_pools: Optional[list[PoolEntry]] = None,
     ):
+        from sglang.srt.mem_cache.pool_host.egm import EgmHostTensorAllocator
+
+        if any(
+            isinstance(
+                getattr(entry.host_pool, "allocator", None), EgmHostTensorAllocator
+            )
+            for entry in self.mem_pool_host.entry_map.values()
+        ):
+            raise ValueError("EGM host pools do not yet support storage backends")
         if any(
             isinstance(entry.host_pool, UnifiedPageEnvelopeHostPool)
             for entry in self.mem_pool_host.entry_map.values()

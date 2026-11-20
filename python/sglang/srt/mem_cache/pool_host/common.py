@@ -23,7 +23,7 @@ from sglang.srt.mem_cache.storage.mmap import (
 )
 from sglang.srt.mem_cache.storage.mmap.mmap_allocator import hugepage_size_requested
 from sglang.srt.runtime_context import get_memory
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_cuda, is_hip
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +112,10 @@ def _get_allocator_class_from_storage(
     get_allocator_from_storage() sees at instantiation (and falls back to the
     default allocator); tensorcast's SCRATCH transfer mode resolves there too.
     """
+    if allocator_type == "egm":
+        from sglang.srt.mem_cache.pool_host.egm import EgmHostTensorAllocator
+
+        return EgmHostTensorAllocator
     if allocator_type == "mooncake":
         # MooncakeHostTensorAllocator.__init__ imports this.
         from mooncake.store import MooncakeHostMemAllocator  # noqa: F401
@@ -180,6 +184,14 @@ def get_allocator_type() -> str:
     """The host-allocator kind the published HiCache configuration asks for."""
 
     backend = get_memory().hicache_storage_backend
+    if envs.SGLANG_HICACHE_EGM.get():
+        if not is_cuda():
+            raise ValueError("EGM host allocation requires CUDA")
+        if backend:
+            raise ValueError(
+                "EGM host allocation does not yet support storage backends"
+            )
+        return "egm"
     if backend == "shm":
         return "shm"
     if backend == "dynamic":
@@ -534,6 +546,13 @@ def alloc_with_host_register(
         _log_hip_owned_host_pool()
         return _alloc_hip_host_tensor(dims=dims, dtype=dtype)
     buffer = allocator.allocate(dims, dtype=dtype, device=device)
+    from sglang.srt.mem_cache.pool_host.egm import EgmHostTensorAllocator
+
+    if isinstance(allocator, EgmHostTensorAllocator):
+        # VMM already grants device access; cudaHostRegister is for ordinary
+        # host allocations and cannot turn them into exportable EGM.
+        setattr(buffer, _CUDA_HOST_REGISTERED_RANGES_ATTR, [])
+        return buffer
     if pin_memory:
         _cuda_host_register(buffer, registration_granularity_bytes)
     return buffer

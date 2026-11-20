@@ -291,6 +291,10 @@ def host_memory_preflight(
     aggregate stack-level checks whose constituent pools bill themselves at
     construction.
     """
+    mapping_lengths = tuple(mapping_lengths)
+    round_lengths = getattr(allocator, "round_mapping_lengths", None)
+    if mapping_lengths and round_lengths is not None:
+        mapping_lengths = round_lengths(mapping_lengths)
     available = _host_memory_budget.get()
     if available is not None:
         plain_rem, pool_rem = available

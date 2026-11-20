@@ -15,6 +15,16 @@ L1 and L2 are private to a single inference instance; only L3 can be shared. Hos
 
 ## Core HiCache Parameters
 
+### EGM-backed host pool on NVIDIA Grace
+
+On an EGM-capable Grace GPU system with CUDA FABRIC and IMEX configured, set
+`SGLANG_HICACHE_EGM=1` before starting the server to allocate the HiCache host
+pool on the NUMA node associated with each GPU. This option requires CUDA and
+currently supports HiCache without a storage backend. The pool remains local
+to the engine; sharing its pages requires an additional peer transport and
+cache-lifetime protocol. The default host allocator remains in use when the
+option is unset.
+
 ```bash Command
 # Essential HiCache flags
 --page-size 64                        # Page size for cache management
