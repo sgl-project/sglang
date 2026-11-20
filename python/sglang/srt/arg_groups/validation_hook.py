@@ -36,10 +36,7 @@ from sglang.srt.runtime_context import (
     get_platform,
     num_dp_ranks_of,
 )
-from sglang.srt.sampling.watermarking.config import (
-    MAX_WATERMARK_CONTEXT_WINDOW,
-    parse_watermark_key,
-)
+from sglang.srt.sampling.watermarking.runtime import check_watermark_algorithm_args
 from sglang.srt.utils.runai_utils import is_runai_obj_uri
 
 logger = logging.getLogger(__name__)
@@ -56,34 +53,6 @@ def check_watermark_server_args(server_args: Any) -> None:
     if cfg.device != "cuda":
         raise ValueError(
             f"--enable-watermark requires --device cuda, got {cfg.device!r}"
-        )
-    if cfg.watermark_key is not None:
-        parse_watermark_key(cfg.watermark_key)
-    if cfg.watermark_key_b is not None:
-        parse_watermark_key(cfg.watermark_key_b)
-    if (
-        isinstance(cfg.watermark_context_window, bool)
-        or not isinstance(cfg.watermark_context_window, int)
-        or not 1 <= cfg.watermark_context_window <= MAX_WATERMARK_CONTEXT_WINDOW
-    ):
-        raise ValueError("watermark context_window must be an integer from 1 to 64")
-    if cfg.watermark_key_b is not None and cfg.watermark_key is None:
-        raise ValueError("watermark key_b requires a server key")
-    if not 0 < cfg.watermark_mixing_probability < 1:
-        raise ValueError(
-            "watermark mixing_probability must be strictly between 0 and 1"
-        )
-    if cfg.watermark_key_b is None and cfg.watermark_mixing_probability != 0.5:
-        raise ValueError("watermark mixing_probability requires key_b")
-    if not 0 < cfg.watermark_max_probability <= 1:
-        raise ValueError(
-            "watermark max_probability must be greater than 0 and at most 1"
-        )
-    if (
-        cfg.watermark_default_enabled or cfg.watermark_enforce_all
-    ) and cfg.watermark_key is None:
-        raise ValueError(
-            "watermark default_enabled and enforce_all require a server key"
         )
     if cfg.enable_custom_logit_processor:
         raise ValueError(
@@ -111,13 +80,9 @@ def check_watermark_server_args(server_args: Any) -> None:
             "--enable-watermark is not supported with pipeline-parallel "
             "speculative decoding"
         )
-    if cfg.speculative_use_rejection_sampling:
-        raise ValueError(
-            "--enable-watermark is incompatible with "
-            "--speculative-use-rejection-sampling"
-        )
     if envs.SGLANG_RUST_SERVER.get():
         raise ValueError("--enable-watermark is not supported with SGLANG_RUST_SERVER")
+    check_watermark_algorithm_args(cfg)
 
 
 # Server arguments Rust-server mode (SGLANG_RUST_SERVER=1) does not honor, or

@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, Optional
 import torch
 
 from sglang.srt.runtime_context import get_exec
+from sglang.srt.sampling.watermarking.gumbel import adapter as gumbel_adapter
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -21,7 +22,7 @@ if TYPE_CHECKING:
         WatermarkRows,
     )
 
-_ADAPTERS: dict[str, ModuleType] = {}
+_ADAPTERS: dict[str, ModuleType] = {"gumbel": gumbel_adapter}
 
 # Provider ABI v2 (`VerifySamplingView.watermark_*`) fields of a batch without
 # watermark rows.

@@ -8,13 +8,13 @@ from sglang.kernels.ops.sampling.textseal_selector import (
     force_watermark_tokens_triton,
     prepare_watermark_contexts_triton,
 )
-from sglang.srt.sampling.watermarking.core import (
-    WatermarkState,
+from sglang.srt.sampling.watermarking.gumbel.algorithm import (
     _hash_contexts,
     _truncate_probabilities,
     _watermark_hash32_torch,
     select_watermark_tokens_torch,
 )
+from sglang.srt.sampling.watermarking.gumbel.state import WatermarkState
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-small")
