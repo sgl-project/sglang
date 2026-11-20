@@ -128,7 +128,7 @@ FP8 checkpoint with EAGLE MTP on four MI300X or MI325X GPUs (TP4·EP4), benchmar
 - **All-reduce.** `ROCM_QUICK_REDUCE_QUANTIZATION=NONE` overrides the image's `ROCM_QUICK_REDUCE_QUANTIZATION=INT8` default.
 - **Batch limits.** Set `--max-running-requests` and `--cuda-graph-max-bs-decode` to twice the concurrency. The commands below use concurrency 8.
 - **HiCache.** At the higher concurrencies, add `--enable-hierarchical-cache`. On MI300X, the host tier keeps its default size of twice the device KV pool, about 118–131 GiB per rank. On MI325X, also add `--hicache-host-memory-fraction 0.60 --hicache-io-backend direct --hicache-mem-layout page_first_direct`, and leave `--hicache-size` and `--hicache-ratio` unset so that the host pools of all ranks stay within 60% of the available host memory.
-- **Differences between the GPUs.** The MI300X command uses an FP8 E4M3 KV cache, `--prefill-decode-interval 0`, `--min-free-slots-delay 1`, and `SGLANG_OPT_KDA_TRITON_CHAIN_VERIFY=1`. The MI325X command uses a BF16 KV cache and the default scheduling settings.
+- **Differences between the GPUs.** The MI300X command uses an FP8 E4M3 KV cache, `--prefill-decode-interval 0`, `--min-free-slots-delay 1`, and `SGLANG_OPT_FUSED_KDA_VERIFY=1`. The MI325X command uses a BF16 KV cache and the default scheduling settings.
 
 <Tabs>
 <Tab title="MI300X">
@@ -139,7 +139,7 @@ SGLANG_AITER_GFX942_BLOCKSCALE_USE_CK=1 \
 AITER_ONLINE_TUNE=0 \
 ROCM_QUICK_REDUCE_QUANTIZATION=NONE \
 SGLANG_OPT_FUSE_MHC_POST_PRE=0 \
-SGLANG_OPT_KDA_TRITON_CHAIN_VERIFY=1 \
+SGLANG_OPT_FUSED_KDA_VERIFY=1 \
 SGLANG_DSA_FUSE_TOPK=0 \
 SGLANG_OPT_USE_TOPK_V2=0 \
 SGLANG_TIMEOUT_KEEP_ALIVE=900 \
