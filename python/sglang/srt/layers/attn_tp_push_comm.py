@@ -7,7 +7,6 @@ import logging
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_parallel, get_resources
 
 logger = logging.getLogger(__name__)
@@ -83,8 +82,7 @@ def initialize_attn_tp_push_comm(*, hidden_size: int, uses_megamoe: bool) -> Non
     group = parallel.attn_tp_group
     # MegaMoE syncs all EP ranks every layer, which orders a slot's reuse across forwards.
     if (
-        not envs.SGLANG_OPT_ATTN_TP2_PUSH_COMM.get()
-        or not uses_megamoe
+        not uses_megamoe
         or not torch.cuda.is_available()
         or group.world_size != 2
         or parallel.attn_tp_size == parallel.tp_size
