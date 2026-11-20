@@ -67,7 +67,6 @@ import psutil  # isort: skip
 import setproctitle
 import torch
 import torch.distributed
-from torch.distributed import barrier
 
 if TYPE_CHECKING:
     from torch.cuda import Stream as CudaStream
@@ -130,7 +129,6 @@ from sglang.srt.hf_transformers import (
     get_processor,
     get_tokenizer,
     get_tokenizer_from_processor,
-    resolve_image_processor_backend,
 )
 from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
 from sglang.srt.layers.cp.utils import from_cp_sharded
@@ -161,6 +159,7 @@ from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
+    ControlAckOutput,
     DestroyWeightsUpdateGroupReqInput,
     DetachHiCacheStorageReqInput,
     DetachHiCacheStorageReqOutput,
@@ -219,7 +218,6 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightVersionReqInput,
     UpdateWeightVersionReqOutput,
-    sock_send,
 )
 from sglang.srt.managers.load_snapshot import create_load_snapshot_writer
 from sglang.srt.managers.min_free_slots_delayer import (
@@ -273,6 +271,7 @@ from sglang.srt.managers.scheduler_components.dynamic_chunk_sizer import (
 )
 from sglang.srt.managers.scheduler_components.exit_ledger import record_send
 from sglang.srt.managers.scheduler_components.flush_wrapper import SchedulerFlushWrapper
+from sglang.srt.managers.scheduler_components.gc_freezer import GCFreezer
 from sglang.srt.managers.scheduler_components.idle_sleeper import (
     IdleSleeper,
     RustServerIdleSleeper,
@@ -412,7 +411,7 @@ from sglang.srt.state_capturer.indexer_topk import destroy_global_indexer_captur
 from sglang.srt.state_capturer.routed_experts import destroy_global_experts_capturer
 from sglang.srt.utils import (
     DynamicGradMode,
-    configure_gc_logger,
+    configure_gc_logging,
     configure_logger,
     freeze_gc,
     get_available_gpu_memory,
@@ -785,6 +784,7 @@ class Scheduler(
         self.init_pool_stats_observer()
 
         self.init_invariant_checker()
+        self.init_gc_freezer()
 
         self.init_load_publisher()
 
@@ -797,6 +797,8 @@ class Scheduler(
         self.init_beam_coordinator()
 
         self.init_request_retirer()
+
+        self.maybe_wire_uniboost_gamma_ada()
 
         self.init_deferred_responses()
 
@@ -929,10 +931,7 @@ class Scheduler(
             and get_device().sleep_on_idle
         ):
             self.idle_sleeper = IdleSleeper(
-                sockets=[
-                    self.ipc_channels.recv_from_tokenizer,
-                    self.ipc_channels.recv_from_rpc,
-                ],
+                sockets=[self.ipc_channels.recv_from_tokenizer],
                 can_empty_cache=lambda: not self.pause_state.paused,
             )
         else:
@@ -971,7 +970,7 @@ class Scheduler(
                     tokenizer_mode=get_serving().tokenizer_mode,
                     trust_remote_code=get_model().trust_remote_code,
                     revision=get_model().revision,
-                    image_processor_backend=resolve_image_processor_backend(get_mm()),
+                    image_processor_backend=get_mm().image_processor_backend,
                     tokenizer_backend=get_serving().tokenizer_backend,
                     model_name=get_model().model_path,
                 )
@@ -1549,6 +1548,12 @@ class Scheduler(
             self.schedule_low_priority_values_first,
             shortest_prefill_aging_factor=get_schedule().shortest_prefill_aging_factor,
             bounded_lpm_enabled=self.dllm_config is None,
+            uniboost_gamma=get_schedule().uniboost_gamma,
+            enable_uniboost_gamma_ada=get_schedule().enable_uniboost_gamma_ada,
+            # Every rank of a TP or PP group must admit the same batch.
+            uniboost_rank_invariant=get_parallel().tp_size > 1
+            or get_parallel().pp_size > 1,
+            uniboost_step_clock=lambda: self.forward_ct,
         )
         self.policy._on_bounded_state_change = lambda active: (
             self.waiting_queue.set_on_leave(
@@ -1620,9 +1625,7 @@ class Scheduler(
             else None
         )
 
-        # Configure GC logger
-        if envs.SGLANG_LOG_GC.get():
-            configure_gc_logger()
+        configure_gc_logging("Scheduler")
 
     def init_disaggregation(self):
         self.mm_receiver = None
@@ -2100,9 +2103,7 @@ class Scheduler(
             result_dict["rust_server_pid"] = os.getpid()
         result_dict["hicache_object_layout"] = self._hicache_l3_layout()
 
-        if get_serving().grpc_port is not None and not (
-            get_serving().smg_grpc_mode or get_serving().grpc_mode
-        ):
+        if get_serving().grpc_port is not None:
             result_dict["kv_event_sources"] = (
                 self.kv_events_publisher.local_kv_event_sources(
                     self.page_size * get_parallel().dcp_size
@@ -2176,6 +2177,12 @@ class Scheduler(
         if ev is not None and not envs.SGLANG_FORCE_COARSE_WAR_BARRIER.get():
             self.schedule_stream.wait_event(ev)
         else:
+            self.schedule_stream.wait_stream(self.forward_stream)
+
+    def wait_for_launched_forward(self) -> None:
+        """Order later schedule_stream work after every launched forward, not only
+        after its shared reads; an in_place pause can leave one reading the weights."""
+        if self.enable_overlap or get_parallel().pp_size > 1:
             self.schedule_stream.wait_stream(self.forward_stream)
 
     def increment_scheduler_iterations(self) -> None:
@@ -2389,11 +2396,10 @@ class Scheduler(
                 continue
 
             output = self._request_dispatcher(recv_req)
+            if output is None:
+                output = self._rust_control_ack(recv_req)
             if output is not None:
-                if self.rust_server is None and isinstance(output, RpcReqOutput):
-                    if self.ipc_channels.recv_from_rpc is not None:
-                        sock_send(self.ipc_channels.recv_from_rpc, output)
-                elif get_parallel().pp_size > 1 and isinstance(
+                if get_parallel().pp_size > 1 and isinstance(
                     output, ReleaseMemoryOccupationReqOutput
                 ):
                     # Answered by the first stage once every stage has released.
@@ -2422,6 +2428,24 @@ class Scheduler(
         else:
             self.output_streamer.release_detokenize_state(req)
             self.ipc_channels.send_to_tokenizer.send_output(abort_req, req)
+
+    # The control requests whose handlers return nothing: Python's
+    # TokenizerManager fire-and-forgets them. The Rust frontend waits for one
+    # reply per control request, so under it each gets a ControlAckOutput.
+    _RUST_ACKED_CONTROL_REQUESTS = (
+        PauseGenerationReqInput,
+        ContinueGenerationReqInput,
+        FreezeGCReq,
+        ConfigureLoggingReq,
+        CloseSessionReqInput,
+    )
+
+    def _rust_control_ack(self, recv_req):
+        """The reply the Rust frontend waits for after a no-reply control
+        handler ran; None for any other request, and under the Python frontend."""
+        if not isinstance(recv_req, self._RUST_ACKED_CONTROL_REQUESTS):
+            return None
+        return ControlAckOutput() if self.rust_server is not None else None
 
     def send_control_output(self, output, recv_req) -> None:
         """Answer a control request, at dispatch or later (a deferred flush)."""
@@ -2716,7 +2740,6 @@ class Scheduler(
             )
         self.request_receiver = receiver_factory(
             recv_from_tokenizer=self.recv_from_tokenizer,
-            recv_from_rpc=self.ipc_channels.recv_from_rpc,
             recv_skipper=self.recv_skipper,
             input_blocker=self.input_blocker,
             mm_receiver=self.mm_receiver,
@@ -2830,6 +2853,12 @@ class Scheduler(
                 )
             ),
             scheduler_stage_metrics=self.scheduler_stage_metrics,
+        )
+
+    def init_gc_freezer(self) -> None:
+        """Freeze the heap when idle; warn on heap growth and frozen garbage."""
+        self.gc_freezer = GCFreezer(
+            freeze_on_idle_secs=get_device().gc_freeze_on_idle_secs
         )
 
     def init_rank_consensus_checker(self) -> None:
@@ -2977,6 +3006,13 @@ class Scheduler(
             send_abort_output=self.send_abort_output,
             stream_output=self.output_streamer.stream_output,
         )
+
+    def maybe_wire_uniboost_gamma_ada(self) -> None:
+        # gamma-Ada records the latency of every request that ends.
+        if self.policy.uniboost_gamma_ada is not None:
+            self.request_retirer.release_observer = (
+                self.policy.uniboost_gamma_ada.record_finish
+            )
 
     def maybe_init_decode_offload_manager(self) -> None:
         self.decode_offload_manager = None
@@ -3381,7 +3417,7 @@ class Scheduler(
                 routed_dp_rank=recv_req.routed_dp_rank,
                 disagg_prefill_dp_rank=recv_req.disagg_prefill_dp_rank,
                 kv_hints=recv_req.kv_hints,
-                vocab_size=self.model_config.vocab_size,
+                vocab_size=self.model_config.token_id_vocab_size,
                 priority=recv_req.priority,
                 metrics_collector=(
                     self.metrics_collector
@@ -3436,7 +3472,7 @@ class Scheduler(
             req = session.create_req(
                 recv_req,
                 self.tokenizer,
-                self.model_config.vocab_size,
+                self.model_config.token_id_vocab_size,
                 eos_token_ids=self.model_config.hf_eos_token_id,
                 disagg_mode=self.disaggregation_mode,
                 req_factory=partial(self._create_generation_req, recv_req),
@@ -3467,7 +3503,7 @@ class Scheduler(
                 recv_req.input_text,
                 recv_req.input_ids,
                 recv_req.sampling_params,
-                vocab_size=self.model_config.vocab_size,
+                vocab_size=self.model_config.token_id_vocab_size,
                 http_worker_ipc=recv_req.http_worker_ipc,
             )
             req.tokenizer = self.tokenizer
@@ -5060,7 +5096,8 @@ class Scheduler(
         batch.after_idle_gap = self._sched_idled
         self._sched_idled = False
 
-        # Accumulate the prefill-token counter used for HRRN and shortest-prefill-first aging.
+        # Accumulate the prefill-token counter used for HRRN and shortest-prefill-first
+        # aging, and for UniBoost's arrival under tp or pp > 1.
         # A batch reused for decode keeps its stale extend_num_tokens, so count extend batches only.
         if batch.forward_mode.is_extend() and batch.extend_num_tokens:
             self.processed_tokens_counter += batch.extend_num_tokens
@@ -5760,6 +5797,8 @@ class Scheduler(
             return_hidden_states=batch.return_hidden_states,
         )
         self.copy_stream.wait_stream(self.forward_stream)
+        if batch_result.side_stream_done is not None:
+            self.copy_stream.wait_event(batch_result.side_stream_done)
         with self.copy_stream_ctx:
             if not self.enable_async_d2h_copy:
                 copy_fn()
@@ -5810,12 +5849,18 @@ class Scheduler(
         # Flush async trace ops here: in overlap mode this CPU work runs while
         # the next batch's GPU forward is in flight, giving free overlap.
         flush_trace_batch(batch.reqs)
-        snapshot = self.publish_load_snapshot(force=batch.forward_mode.is_extend())
+        # Extend and idle results always publish; decode steps are throttled
+        # to the publish interval. An idle batch exists only to join
+        # attention-DP collectives while other ranks have work, and on_idle
+        # never runs then, so a throttled idle rank's snapshot would lag its
+        # queues by many group steps.
+        force_publish = batch.forward_mode.is_extend() or batch.forward_mode.is_idle()
+        snapshot = self.publish_load_snapshot(force=force_publish)
         # Router-facing gauge on the dedicated PUB socket, reusing the
         # snapshot above rather than walking the queues again.
         self.load_publisher.publish_load_stat(
             self.load_inquirer.get_loads,
-            force=batch.forward_mode.is_extend(),
+            force=force_publish,
             snapshot=snapshot,
         )
 
@@ -6031,6 +6076,7 @@ class Scheduler(
             self.token_to_kv_pool_allocator.flush_opportunistic()
 
         self.invariant_checker.run(CheckPhase.IDLE)
+        self.gc_freezer.on_idle(self.forward_ct)
 
         # metrics every 30s
         self.metrics_reporter._maybe_log_idle_metrics()
@@ -6287,6 +6333,7 @@ class Scheduler(
             if self.metrics_reporter.is_stats_logging_rank:
                 logger.info("Cache flushed successfully!")
             self.invariant_checker.run(CheckPhase.FLUSH)
+            self.gc_freezer.on_cache_reset()
             success = True
         else:
             logging.warning(
@@ -6430,8 +6477,7 @@ class Scheduler(
             f"handle_rpc_request: {recv_req.method}, param: {recv_req.parameters}"
         )
 
-        success = True
-        exec = None
+        error = None
         try:
             func = getattr(self, recv_req.method)
             if recv_req.parameters is not None:
@@ -6439,12 +6485,26 @@ class Scheduler(
             else:
                 func()
         except Exception as e:
-            success = False
-            exec = e
-            logger.error(f"Failed to call rpc {recv_req.method}: {str(e)}")
+            error = str(e)
+            logger.error(f"Failed to call rpc {recv_req.method}: {error}")
 
-        barrier(group=self.tp_group.cpu_group)
-        return RpcReqOutput(success=success, message="" if not exec else str(exec))
+        # Gather over the ranks that ran this request in the same step: the DP
+        # shard under DP attention, where shards may reach it in different steps.
+        parallel = get_parallel()
+        if parallel.attn_dp_enabled:
+            groups = [parallel.attn_tp_group, parallel.attn_cp_group]
+        else:
+            groups = [parallel.tp_group]
+        errors = [error]
+        for group in groups:
+            if group.world_size > 1:
+                gathered = [None] * group.world_size
+                torch.distributed.all_gather_object(
+                    gathered, errors, group=group.cpu_group
+                )
+                errors = [e for rank_errors in gathered for e in rank_errors]
+        errors = [e for e in dict.fromkeys(errors) if e is not None]
+        return RpcReqOutput(success=not errors, message="; ".join(errors))
 
     def handle_update_weight_version(
         self, recv_req: UpdateWeightVersionReqInput
@@ -6932,7 +6992,10 @@ class Scheduler(
     def configure_logging(self, recv_req: ConfigureLoggingReq):
         if recv_req.log_level is not None:
             logging.getLogger().setLevel(recv_req.log_level.upper())
-        self.ipc_channels.send_to_detokenizer.send_output(recv_req, recv_req)
+        # The embedded Rust server's detokenizer runs in this process; no
+        # detokenizer process reads the socket (see handle_freeze_gc).
+        if self.rust_server is None:
+            self.ipc_channels.send_to_detokenizer.send_output(recv_req, recv_req)
 
     def handle_dumper_control(self, recv_req: DumperControlReqInput):
         from sglang.srt.debug_utils.dumper import dumper
@@ -6946,12 +7009,12 @@ class Scheduler(
                 response = dumper._http_manager.handle_request(
                     method=recv_req.method, body=recv_req.body
                 )
-            self.ipc_channels.send_to_tokenizer.send_output(
+            self.send_control_output(
                 DumperControlReqOutput(success=True, response=response), recv_req
             )
         except Exception as e:
             print(f"[Scheduler] handle_dumper_control error: {e}", flush=True)
-            self.ipc_channels.send_to_tokenizer.send_output(
+            self.send_control_output(
                 DumperControlReqOutput(success=False, response=[], error=str(e)),
                 recv_req,
             )

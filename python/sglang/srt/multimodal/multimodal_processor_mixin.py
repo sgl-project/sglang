@@ -32,7 +32,8 @@ def _tokenizer_of(processor):
 class MultimodalProcessorMixin:
     """Share media loading and preprocessing resources across training and serving."""
 
-    gpu_image_decode = True  # Enable GPU decoding by default
+    gpu_image_decode = True  # Enable device image decoding by default
+    gpu_video_decode = True
     smart_rgb_conversion = False
     auto_mm_io_worker_num = 4
     # Processors opt out only when their preprocessing is not thread-safe. The
@@ -61,8 +62,6 @@ class MultimodalProcessorMixin:
         )
 
         self.image_processor_backend = processor_config.image_processor_backend
-        if processor_config.disable_fast_image_processor:
-            self.image_processor_backend = "pil"
         self.disable_fast_image_processor = self.image_processor_backend == "pil"
 
         mm_process_config = processor_config.mm_process_config
@@ -218,7 +217,7 @@ class MultimodalProcessorMixin:
             if modality == Modality.IMAGE:
                 img, _ = load_image(data, cls.gpu_image_decode)
                 if isinstance(img, torch.Tensor):
-                    return img  # JPEG already decoded on GPU by nvJPEG
+                    return img  # JPEG already decoded to a device tensor
                 # PIL decodes lazily; do it here in the io worker so the decode
                 # doesn't run later on the event-loop thread.
                 if discard_alpha_channel:
@@ -231,7 +230,9 @@ class MultimodalProcessorMixin:
             elif modality == Modality.VIDEO:
                 if video_decode_device is None:
                     video_decode_device = cls.video_preprocessing_device
-                return load_video(data, use_gpu=video_decode_device != "cpu")
+                return load_video(
+                    data, use_gpu=cls.gpu_video_decode and video_decode_device != "cpu"
+                )
             elif modality == Modality.AUDIO:
                 return load_audio(data, audio_sample_rate)
 
