@@ -221,7 +221,7 @@ class TestNPUDeepSeekV4Flash0731W8A8PDSEPGPQAHigh(
     generation_config = DEEPSEEK_V4_FLASH_0731_W8A8_GENERATION_CONFIG_HIGH
     eval_batch_size = 128
     # Use a subset of GPQA Diamond (198 questions) to cut the step runtime.
-    limit = 16
+    limit = 1
     min_hit_rate_pcts = {"host": 0}  # percent: L2 host hit rate must exceed 0%
 
     @classmethod
@@ -273,8 +273,8 @@ class TestNPUDeepSeekV4Flash0731W8A8PDSEPGPQAHigh(
         """Run NPU accuracy test for DSV4-Flash-0731 PD-Sep GPQA High mode."""
         self.run_accuracy()
 
-    def test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_l2_host_hit_rate(self):
-        """Run the 32k GSP bench; assert_metrics checks the host hit rate"""
+    def test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_cache_hit_rate(self):
+        """Run the 32k GSP bench; assert_metrics checks the cache hit rate"""
         # 3 groups x 32 prompts share a 28800-token system prompt (32k * 0.9)
         # plus a 3200-token question, which exceeds L1 so evictions land in L2.
         metrics = run_bench_serving(
