@@ -4,12 +4,14 @@ from typing import TYPE_CHECKING, Tuple, Type
 
 import torch
 
+from sglang.kernels.ops.attention.dsa.head_gate import indexer_head_gate
 from sglang.kernels.ops.kvcache.dsv4_fp4_index_k_cache import store_fp4_index_k_cache
 from sglang.kernels.ops.quantization.fp4_indexer_quant import (
     quantize_fp4_indexer_tensor,
 )
 from sglang.srt.layers.attention.dsa.dsa_indexer import (
     Indexer,
+    _index_k_dcp,
     _index_k_write_targets,
 )
 from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
@@ -46,6 +48,12 @@ class Fp4Indexer(Indexer):
 
     def _quantize_query(self, query: torch.Tensor, act_quant):
         return query, None
+
+    def _fused_q_quant(
+        self, q: torch.Tensor, weights_raw: torch.Tensor, positions: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Reached from the merged no-RoPE K / head-gate GEMM only, whose gate is BF16.
+        return q, indexer_head_gate(weights_raw, self.softmax_scale)
 
     @torch.compile(dynamic=True)
     def _get_logits_head_gate_fp32(self, x, q_scale):
@@ -118,6 +126,18 @@ class Fp4Indexer(Indexer):
         act_quant,
         out_cache_loc: torch.Tensor,
     ) -> None:
+        dcp_size, dcp_rank = _index_k_dcp()
+        if dcp_size > 1:
+            store_fp4_index_k_cache(
+                key,
+                pool.get_index_k_with_scale_buffer(layer_id=layer_id),
+                out_cache_loc.contiguous(),
+                page_size=pool.index_page_size,
+                rne=True,
+                dcp_size=dcp_size,
+                dcp_rank=dcp_rank,
+            )
+            return
         for buf, loc, rows in _index_k_write_targets(pool, layer_id, out_cache_loc):
             store_fp4_index_k_cache(
                 key if rows is None else key.index_select(0, rows),

@@ -75,7 +75,6 @@ from sglang.srt.hf_transformers import (
     get_processor,
     get_tokenizer,
     get_tokenizer_from_processor,
-    resolve_image_processor_backend,
 )
 from sglang.srt.kv_canary.canary_info.tokenizer_manager_hook import (
     CanaryInfoTokenizerManagerHook,
@@ -205,9 +204,7 @@ from sglang.srt.sampling.custom_logit_processor import (
 )
 from sglang.srt.sampling.sampling_mask import SamplingMaskChunk
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.sampling.watermarking.core import (
-    resolve_watermark_request,
-)
+from sglang.srt.sampling.watermarking.runtime import watermark_request_enabled
 from sglang.srt.server_args import (
     PortArgs,
     ServerArgs,
@@ -246,16 +243,7 @@ logger = logging.getLogger(__name__)
 
 
 def _validate_watermark_request(sampling_params: SamplingParams) -> None:
-    watermark = sampling_params.watermark
-    features = get_exec().features
-    _, _, enabled = resolve_watermark_request(
-        watermark,
-        server_enabled=features.enable_watermark,
-        default_key=features.watermark_key,
-        default_context_window=features.watermark_context_window,
-        default_enabled=features.watermark_default_enabled,
-        enforce_all=features.watermark_enforce_all,
-    )
+    enabled = watermark_request_enabled(sampling_params)
     if enabled and (sampling_params.beam_width or 1) > 1:
         raise ValueError("beam search is not supported with watermarking")
 
@@ -563,6 +551,20 @@ _MANAGER_OWNED_FIELDS = ("model_path", "served_model_name")
 
 # Grace period from ShutdownReq to SIGKILL for each scheduler.
 _SCHEDULER_EXIT_TIMEOUT_SECS = 15
+
+
+def wait_for_schedulers_to_exit() -> None:
+    deadline = time.monotonic() + _SCHEDULER_EXIT_TIMEOUT_SECS
+    while time.monotonic() < deadline and collect_scheduler_processes():
+        time.sleep(0.1)
+    stragglers = [proc.pid for proc in collect_scheduler_processes()]
+    if stragglers:
+        # SIGKILL here lands mid-release,
+        # which is how GPU memory survives a shutdown. Name the pids.
+        logger.warning(
+            f"Schedulers still alive {_SCHEDULER_EXIT_TIMEOUT_SECS}s after "
+            f"ShutdownReq, killing them before they released: {stragglers}"
+        )
 
 
 class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
@@ -1665,7 +1667,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             return
         if not isinstance(token_ids_logprob, list):
             raise ValueError("token_ids_logprob must be a flat list of integers.")
-        vocab_size = self.model_config.vocab_size
+        vocab_size = self.model_config.token_id_vocab_size
         for token_id in token_ids_logprob:
             if not isinstance(token_id, int):
                 raise ValueError("token_ids_logprob must be a flat list of integers.")
@@ -1763,7 +1765,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             sampling_kwargs["custom_params"] = custom_params
         sampling_params = self.sampling_params_class(**sampling_kwargs)
         sampling_params.normalize(self.tokenizer)
-        sampling_params.verify(self.model_config.vocab_size)
+        sampling_params.verify(self.model_config.token_id_vocab_size)
         _validate_watermark_request(sampling_params)
 
         # Build return object
@@ -2466,9 +2468,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             # Expand requests, assign new rids for them, and send them
             for i in range(batch_size):
-                for _ in range(obj.parallel_sample_num):
+                for sample_index in range(obj.parallel_sample_num):
                     tmp_obj = copy.copy(objs[i])
                     tokenized_obj = copy.copy(tokenized_objs[i])
+                    tokenized_obj.sampling_params = (
+                        tokenized_obj.sampling_params.for_sample(sample_index)
+                    )
                     # Ensure independent mm_items so wrap_shm_features won't mutate the original
                     if hasattr(tokenized_obj, "mm_inputs") and tokenized_obj.mm_inputs:
                         tokenized_obj.mm_inputs = copy.copy(tokenized_obj.mm_inputs)
@@ -3793,6 +3798,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             await asyncio.sleep(5)
 
         # Drain requests
+        forced = False
         while True:
             remain_num_req = len(self.rid_to_state)
             remaining_rids = list(self.rid_to_state.keys())
@@ -3804,6 +3810,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
                 self.dump_requests_before_crash()
                 self.force_exit_handler()
+                forced = True
                 break
 
             elif envs.SGLANG_FORCE_SHUTDOWN.get():
@@ -3812,6 +3819,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "Signal SIGTERM received while force shutdown flag set. Force exiting."
                 )
                 self.force_exit_handler()
+                forced = True
                 break
 
             logger.info(
@@ -3825,22 +3833,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Stop the watchdog: child exits are expected during shutdown, not crashes.
         if self._subprocess_watchdog is not None:
             self._subprocess_watchdog.stop()
-        # Ask schedulers to release resources in userspace and exit (see
-        # ShutdownReq), then wait for them before hard-killing the rest.
-        self._dispatch_to_scheduler(ShutdownReq())
-        deadline = time.monotonic() + _SCHEDULER_EXIT_TIMEOUT_SECS
-        while time.monotonic() < deadline and collect_scheduler_processes():
-            time.sleep(0.1)
-        stragglers = [proc.pid for proc in collect_scheduler_processes()]
-        if stragglers:
-            # SIGKILL here lands mid-release,
-            # which is how GPU memory survives a shutdown. Name the pids.
-            logger.warning(
-                f"Schedulers still alive {_SCHEDULER_EXIT_TIMEOUT_SECS}s after "
-                f"ShutdownReq, killing them before they released: {stragglers}"
+        if self._subprocess_watchdog is not None or self.tokenizer_ipc_name is None:
+            # Ask schedulers to release resources in userspace and exit (see
+            # ShutdownReq), then wait for them before hard-killing the rest.
+            self._dispatch_to_scheduler(ShutdownReq())
+            wait_for_schedulers_to_exit()
+        else:
+            logger.info(
+                "Drained. The process that launched the schedulers shuts them down."
             )
         kill_process_tree(os.getpid(), include_parent=False, wait_timeout=60)
-        if self._server_stop_hook is not None:
+        if self._server_stop_hook is not None and not forced:
             # sys.exit() here raises SystemExit into the loop and kills it,
             # so the ASGI server never runs its lifespan shutdown.
             # The loop outlives this coroutine now, so drop our own tasks first;
@@ -3889,17 +3892,23 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             "weight_version": self.config_value("weight_version"),
             "e2e_latency": state.time_stats.get_e2e_latency(),
         }
+        is_generate = isinstance(state.obj, GenerateReqInput)
+        is_stream = is_generate and state.obj.stream
+        # The scheduler echoes an abort only for a request that holds no KV
+        # (queued, retracted or mid-chunk), so the routed experts of the tokens
+        # it produced are gone. A non-streaming reply then carries no output
+        # tokens rather than tokens without routed-experts rows.
+        drop_output = is_generate and not is_stream and state.obj.return_routed_experts
         if recv_obj.weight_versions is not None:
             add_weight_versions_to_meta_info(
                 meta_info,
                 recv_obj.weight_versions,
-                num_output_tokens=len(state.output_ids),
+                num_output_tokens=(0 if drop_output else len(state.output_ids)),
             )
         if prefill_spans := recv_obj.prefill_weight_versions:
             meta_info["prefill_weight_versions"] = weight_version_spans_to_json(
                 prefill_spans
             )
-        is_stream = getattr(state.obj, "stream", False)
         if getattr(state.obj, "return_logprob", False):
             self.add_logprob_to_meta_info(
                 meta_info,
@@ -3912,11 +3921,30 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
 
         output_ids = state.output_ids
+        text = state.get_text()
+        if drop_output:
+            output_ids, text = [], ""
+            meta_info["routed_experts"] = ""
+            for key in _INCREMENTAL_STREAMING_META_INFO_KEYS:
+                if key in meta_info:
+                    meta_info[key] = []
+            if "output_token_logprobs_length" in meta_info:
+                meta_info["output_token_logprobs_length"] = 0
+            if "output_top_logprobs_shape" in meta_info:
+                meta_info.update(
+                    _build_flat_top_logprobs_fields(
+                        "output",
+                        [],
+                        [],
+                        state.obj.top_logprobs_num,
+                        return_b64=state.obj.return_flat_raw_top_logprobs_b64,
+                    )
+                )
         meta_info["completion_tokens"] = len(output_ids)
         if is_stream and self.incremental_streaming_output:
             output_ids = [output_ids[-1]] if len(output_ids) > 0 else []
         out = {
-            "text": state.get_text(),
+            "text": text,
             "output_ids": output_ids,
             "meta_info": meta_info,
         }
@@ -4340,7 +4368,7 @@ def get_processor_wrapper():
         tokenizer_mode=get_serving().tokenizer_mode,
         trust_remote_code=get_model().trust_remote_code,
         revision=get_model().revision,
-        image_processor_backend=resolve_image_processor_backend(get_mm()),
+        image_processor_backend=get_mm().image_processor_backend,
         tokenizer_backend=get_serving().tokenizer_backend,
         model_name=get_model().model_path,
     )

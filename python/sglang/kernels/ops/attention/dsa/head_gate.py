@@ -72,3 +72,46 @@ def indexer_q_quant_head_gate(
             num_stages=0 if scale_fmt is not None else 2,
         )
     return q8, weights
+
+
+@triton.jit(do_not_specialize=["ROWS"])
+def _indexer_head_gate_kernel(
+    G,
+    W,
+    ROWS,
+    HEADS: tl.constexpr,
+    GATE_STRIDE: tl.constexpr,
+    GATE_SCALE: tl.constexpr,
+    SOFTMAX_SCALE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+):
+    rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    gate = tl.load(
+        G + rows // HEADS * GATE_STRIDE + rows % HEADS, rows < ROWS, other=0
+    ).to(tl.float32)
+    gate = (gate * GATE_SCALE).to(tl.bfloat16).to(tl.float32)
+    tl.store(W + rows, gate * SOFTMAX_SCALE, rows < ROWS)
+
+
+def indexer_head_gate(gate: torch.Tensor, softmax_scale: float) -> torch.Tensor:
+    """BF16 head-gate scaling for an indexer whose query carries no scale.
+
+    Equivalent to float(bf16(gate * heads**-0.5)).unsqueeze(-1) * softmax_scale.
+    Gate is [tokens, heads] and may have a padded row stride.
+    """
+    assert gate.is_cuda and gate.dtype == torch.bfloat16
+    assert gate.ndim == 2 and gate.stride(-1) == 1
+    tokens, heads = gate.shape
+    weights = torch.empty((tokens, heads, 1), device=gate.device, dtype=torch.float32)
+    if tokens:
+        _indexer_head_gate_kernel[(triton.cdiv(tokens * heads, 256),)](
+            gate,
+            weights,
+            tokens * heads,
+            heads,
+            gate.stride(0),
+            heads**-0.5,
+            softmax_scale,
+            256,
+        )
+    return weights

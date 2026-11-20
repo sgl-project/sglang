@@ -49,8 +49,8 @@ pub use parser::{
 };
 #[cfg(feature = "render")]
 pub use render::{
-    ChatFormatter, ChatFormatterOptions, DeepSeekTokenizer, OneOrMany, TemplateArgs, TemplateError,
-    ThinkingTemplates, continues_final_message, extract_images, extract_videos,
+    ChatFormatter, ChatFormatterOptions, DeepSeekTokenizer, EncodedPrompt, OneOrMany, TemplateArgs,
+    TemplateError, ThinkingTemplates, continues_final_message, extract_images, extract_videos,
     load_chat_formatter, requested_effort, requested_thinking, select_chat_formatter,
 };
 #[cfg(any(feature = "parser", feature = "openai"))]

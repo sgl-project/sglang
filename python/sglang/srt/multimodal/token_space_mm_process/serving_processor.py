@@ -90,13 +90,10 @@ class TokenSpaceSGLangProcessor:
             base_gpu_id=server_args.base_gpu_id,
             skip_mm_pool=skip_mm_pool,
         )
-        self._disable_fast_image_processor = (
-            mm.disable_fast_image_processor or mm.image_processor_backend == "pil"
-        )
+        self._disable_fast_image_processor = mm.image_processor_backend == "pil"
         self._rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
         processor_config = MultimodalProcessorConfig(
             image_processor_backend=mm.image_processor_backend,
-            disable_fast_image_processor=mm.disable_fast_image_processor,
             mm_process_config=mm.mm_process_config,
             # As in legacy: a processor built without the feature pool runs synchronously.
             mm_processor_worker_num=1

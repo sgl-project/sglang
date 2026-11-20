@@ -28,6 +28,8 @@ for _ in (
     "sgl_kernel_npu",
     "sgl_kernel_npu.attention",
     "sgl_kernel_npu.attention.sinks_attention",
+    "sgl_kernel_npu.operators",
+    "sgl_kernel_npu.operators.attention",
     "sglang.srt.speculative",
     "sglang.srt.speculative.decoupled_spec_io",
     "sglang.srt.speculative.spec_info",

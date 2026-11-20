@@ -62,7 +62,8 @@ impl CacheAwarePolicy {
                 signal.query_blocks,
                 matched_prefix_blocks,
             );
-            if !self.passes_cache_gate(input_tokens, matched_prefix_tokens) {
+            let remembered = !signal.media_winners.is_empty();
+            if !self.passes_cache_gate(input_tokens, matched_prefix_tokens, remembered) {
                 continue;
             }
             candidates.push(CacheCandidate {
@@ -114,10 +115,24 @@ impl CacheAwarePolicy {
         })
     }
 
-    fn passes_cache_gate(&self, input_tokens: u64, matched_prefix_tokens: u64) -> bool {
-        self.config
-            .cache_affinity_min_matched_tokens
-            .is_none_or(|minimum| matched_prefix_tokens >= minimum)
+    /// `remembered`: the prompt has a remembered media placement, so the
+    /// absolute token floor applies to none of its matches. The floor counts
+    /// routing tokens, and the image KV and vision encoding the placement
+    /// stands for are not among them, so even a short image chat keeps its
+    /// worker; its tied peers stay candidates too, so the pressure guard has
+    /// an alternative when that worker is materially more loaded. The ratio
+    /// floor still applies.
+    fn passes_cache_gate(
+        &self,
+        input_tokens: u64,
+        matched_prefix_tokens: u64,
+        remembered: bool,
+    ) -> bool {
+        (remembered
+            || self
+                .config
+                .cache_affinity_min_matched_tokens
+                .is_none_or(|minimum| matched_prefix_tokens >= minimum))
             && self
                 .config
                 .cache_affinity_min_match_ratio

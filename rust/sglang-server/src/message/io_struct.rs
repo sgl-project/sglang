@@ -39,8 +39,10 @@ wire_struct! {
         return_routed_experts: bool,
         routed_experts_start_len: i64,
         return_indexer_topk: bool,
-        session_id: (),
-        session_params: (),
+        /// Python's top-level `session_id` (radix-native sessions).
+        session_id: Option<&'a str>,
+        /// Python's `SessionParams`, positional (see `request::SessionParams`).
+        session_params: Option<&'a super::request::SessionParams>,
         lora_id: Option<&'a str>,
         custom_logit_processor: (),
         positional_embed_overrides: (),
@@ -112,26 +114,17 @@ control_messages! {
         gc_threshold: Option<Vec<i64>>,
     }
 
-    /// Clear the HiCache storage backend.
-    ClearHiCacheReqInput {}
-
-    /// Detach the HiCache storage backend.
-    DetachHiCacheStorageReqInput {}
-
-    /// Attach a HiCache storage backend with optional configuration and policies.
-    AttachHiCacheStorageReqInput {
-        hicache_storage_backend: String,
-        hicache_storage_backend_extra_config_json: Option<String>,
-        hicache_storage_prefetch_policy: Option<String>,
-        hicache_write_policy: Option<String>,
+    /// `/set_internal_state`'s control request: the numeric knobs to
+    /// override, as the JSON object the client sent (`Dict[str, int | float]`
+    /// on the Python side; the scheduler validates the keys).
+    SetInternalStateReq {
+        server_args: serde_json::Map<String, serde_json::Value>,
     }
 
-    /// `/start_profile` and `/stop_profile`'s control request, built only by
-    /// [`ProfileReq::start`] / [`ProfileReq::stop`]. The frontend fans it out
-    /// to every DP rank's scheduler, and each broadcasts it from its TP rank
-    /// 0, so every rank starts (or stops) its profiler.
+    /// `/start_profile` and `/stop_profile`'s control request, Python's
+    /// `ProfileReq`. `req_type` is the `ProfileReqType` enum's value on the
+    /// wire: 1 starts, 2 stops.
     ProfileReq {
-        /// Python's `ProfileReqType` value: 1 starts, 2 stops.
         req_type: u8,
         output_dir: Option<String>,
         start_step: Option<i64>,
@@ -145,6 +138,227 @@ control_messages! {
         profile_prefix: Option<String>,
         profile_stages: Option<Vec<String>>,
         detailed_annotations: bool,
+    }
+
+    /// The expert-distribution recorder; `action` is `ExpertDistributionReqType`'s
+    /// value: 1 start, 2 stop, 3 dump.
+    ExpertDistributionReq {
+        action: u8,
+    }
+
+    /// `/slow_down`: Python's `SlowDownReqInput`.
+    SlowDownReqInput {
+        forward_sleep_time: Option<f64>,
+    }
+
+    /// `/release_memory_occupation`: Python's `ReleaseMemoryOccupationReqInput`.
+    ReleaseMemoryOccupationReqInput {
+        tags: Option<Vec<String>>,
+    }
+
+    /// `/resume_memory_occupation`: Python's `ResumeMemoryOccupationReqInput`.
+    ResumeMemoryOccupationReqInput {
+        tags: Option<Vec<String>>,
+    }
+
+    /// `/get_weights_by_name`: Python's `GetWeightsByNameReqInput`.
+    GetWeightsByNameReqInput {
+        name: String,
+        truncate_size: i64,
+    }
+
+    /// `/init_weights_update_group`: Python's `InitWeightsUpdateGroupReqInput`.
+    InitWeightsUpdateGroupReqInput {
+        master_address: String,
+        master_port: i64,
+        rank_offset: i64,
+        world_size: i64,
+        group_name: String,
+        backend: String,
+    }
+
+    /// `/destroy_weights_update_group`.
+    DestroyWeightsUpdateGroupReqInput {
+        group_name: String,
+    }
+
+    /// `/init_weights_send_group_for_remote_instance`.
+    InitWeightsSendGroupForRemoteInstanceReqInput {
+        master_address: String,
+        ports: String,
+        group_rank: i64,
+        world_size: i64,
+        group_name: String,
+        backend: String,
+    }
+
+    /// `/send_weights_to_remote_instance`.
+    SendWeightsToRemoteInstanceReqInput {
+        master_address: String,
+        ports: String,
+        group_name: String,
+    }
+
+    /// `/add_external_corpus`: Python's `AddExternalCorpusReqInput`, after
+    /// the frontend tokenized `file_path` / `documents` into `token_chunks`.
+    AddExternalCorpusReqInput {
+        corpus_id: Option<String>,
+        file_path: Option<String>,
+        documents: Option<Vec<String>>,
+        token_chunks: Option<Vec<Vec<i64>>>,
+    }
+
+    /// `/remove_external_corpus`.
+    RemoveExternalCorpusReqInput {
+        corpus_id: String,
+    }
+
+    /// `/list_external_corpora`.
+    ListExternalCorporaReqInput {}
+
+    /// `/open_session`: Python's `OpenSessionReqInput`.
+    OpenSessionReqInput {
+        capacity_of_str_len: i64,
+        session_id: Option<String>,
+        streaming: Option<bool>,
+        timeout: Option<f64>,
+    }
+
+    /// `/close_session`: Python's `CloseSessionReqInput`.
+    CloseSessionReqInput {
+        session_id: String,
+    }
+
+    /// `/get_hicache_l3_cache_layout`'s control request: a bare `BaseReq`.
+    GetHiCacheL3LayoutReq {}
+
+    /// `/configure_logging`: Python's `ConfigureLoggingReq`. The scheduler
+    /// reads `log_level`; the rest is the Python frontend's own.
+    ConfigureLoggingReq {
+        log_requests: Option<bool>,
+        log_requests_level: Option<i64>,
+        log_requests_format: Option<String>,
+        log_level: Option<String>,
+        dump_requests_folder: Option<String>,
+        dump_requests_threshold: Option<i64>,
+        crash_dump_folder: Option<String>,
+        dump_requests_exclude_meta_keys: Option<Vec<String>>,
+    }
+
+    /// `/dumper/{method}`: Python's `DumperControlReqInput`.
+    DumperControlReqInput {
+        method: String,
+        body: serde_json::Map<String, serde_json::Value>,
+    }
+
+    /// `/update_weights_from_disk`: Python's `UpdateWeightFromDiskReqInput`.
+    /// `is_async`, `keep_pause`, `token_step` and `manifest` are carried as
+    /// Python carries them; its scheduler reads none of them.
+    UpdateWeightFromDiskReqInput {
+        model_path: String,
+        load_format: Option<String>,
+        abort_all_requests: bool,
+        weight_version: Option<String>,
+        is_async: bool,
+        torch_empty_cache: bool,
+        keep_pause: bool,
+        recapture_cuda_graph: bool,
+        token_step: i64,
+        flush_cache: bool,
+        manifest: Option<serde_json::Map<String, serde_json::Value>>,
+    }
+
+    /// `/update_weights_from_distributed`: Python's
+    /// `UpdateWeightsFromDistributedReqInput`.
+    UpdateWeightsFromDistributedReqInput {
+        names: Vec<String>,
+        dtypes: Vec<String>,
+        shapes: Vec<Vec<i64>>,
+        group_name: String,
+        flush_cache: bool,
+        abort_all_requests: bool,
+        weight_version: Option<String>,
+        load_format: Option<String>,
+        selector: String,
+        torch_empty_cache: bool,
+    }
+
+    /// `/update_weights_from_tensor`: Python's `UpdateWeightsFromTensorReqInput`,
+    /// one serialized payload per TP rank, decoded from the body's base64.
+    UpdateWeightsFromTensorReqInput {
+        serialized_named_tensors: Vec<WireBytes>,
+        load_format: Option<String>,
+        flush_cache: bool,
+        abort_all_requests: bool,
+        weight_version: Option<String>,
+        selector: String,
+        torch_empty_cache: bool,
+    }
+
+    /// `/update_weights_from_ipc`: Python's `UpdateWeightsFromIPCReqInput`.
+    UpdateWeightsFromIPCReqInput {
+        zmq_handles: std::collections::BTreeMap<String, String>,
+        flush_cache: bool,
+        weight_version: Option<String>,
+        torch_empty_cache: bool,
+    }
+
+    /// `/begin_weight_update`: Python's `BeginWeightUpdateReqInput`.
+    BeginWeightUpdateReqInput {
+        selector: String,
+    }
+
+    /// `/end_weight_update`: Python's `EndWeightUpdateReqInput`.
+    EndWeightUpdateReqInput {}
+
+    /// `/plugin_weight_update`: Python's `PluginWeightUpdateReqInput`.
+    PluginWeightUpdateReqInput {
+        handler: String,
+        payload: serde_json::Map<String, serde_json::Value>,
+        flush_cache: bool,
+        abort_all_requests: bool,
+        weight_version: Option<String>,
+        selector: String,
+        torch_empty_cache: bool,
+    }
+
+    /// `/pause_generation`: Python's `PauseGenerationReqInput`. The scheduler
+    /// accepts `in_place` and `retract`; `abort` never reaches it.
+    PauseGenerationReqInput {
+        mode: String,
+    }
+
+    /// `/continue_generation`: Python's `ContinueGenerationReqInput`.
+    ContinueGenerationReqInput {
+        torch_empty_cache: bool,
+    }
+
+    /// `/pd_role_switch`: Python's `PdRoleSwitchReqInput`.
+    PdRoleSwitchReqInput {
+        new_role: String,
+        decode_cuda_graph_bs: Option<Vec<i64>>,
+        decode_cuda_graph_memory_gb: Option<f64>,
+        prepare_only: bool,
+    }
+
+    /// `/update_weight_version`: Python's `UpdateWeightVersionReqInput`.
+    UpdateWeightVersionReqInput {
+        new_version: String,
+        abort_all_requests: bool,
+    }
+
+    /// Clear the HiCache storage backend.
+    ClearHiCacheReqInput {}
+
+    /// Detach the HiCache storage backend.
+    DetachHiCacheStorageReqInput {}
+
+    /// Attach a HiCache storage backend with optional configuration and policies.
+    AttachHiCacheStorageReqInput {
+        hicache_storage_backend: String,
+        hicache_storage_backend_extra_config_json: Option<String>,
+        hicache_storage_prefetch_policy: Option<String>,
+        hicache_write_policy: Option<String>,
     }
 }
 
@@ -200,8 +414,8 @@ impl<'a> From<&'a GenerateRequest> for TokenizedGenerateReqInput<'a> {
             return_routed_experts: false,
             routed_experts_start_len: 0,
             return_indexer_topk: false,
-            session_id: (),
-            session_params: (),
+            session_id: req.session_id.as_deref(),
+            session_params: req.session_params.as_ref(),
             lora_id: req.lora_id.as_deref(),
             custom_logit_processor: (),
             positional_embed_overrides: (),
@@ -231,11 +445,452 @@ impl<'a> From<&'a GenerateRequest> for TokenizedGenerateReqInput<'a> {
     }
 }
 
+impl SetInternalStateReq {
+    pub fn new(rid: String, server_args: serde_json::Map<String, serde_json::Value>) -> Self {
+        Self { rid, server_args }
+    }
+}
+
+impl GetWeightsByNameReqInput {
+    pub fn new(rid: String, name: String, truncate_size: i64) -> Self {
+        Self {
+            rid,
+            name,
+            truncate_size,
+        }
+    }
+}
+
+/// The `/init_weights_update_group` fields; the owned form of
+/// `api::InitWeightsUpdateGroupRequest` after its defaults are applied.
+#[derive(Debug, Clone)]
+pub struct WeightsUpdateGroup {
+    pub master_address: String,
+    pub master_port: i64,
+    pub rank_offset: i64,
+    pub world_size: i64,
+    pub group_name: String,
+    pub backend: String,
+}
+
+impl InitWeightsUpdateGroupReqInput {
+    pub fn new(rid: String, group: WeightsUpdateGroup) -> Self {
+        Self {
+            rid,
+            master_address: group.master_address,
+            master_port: group.master_port,
+            rank_offset: group.rank_offset,
+            world_size: group.world_size,
+            group_name: group.group_name,
+            backend: group.backend,
+        }
+    }
+}
+
+impl DestroyWeightsUpdateGroupReqInput {
+    pub fn new(rid: String, group_name: String) -> Self {
+        Self { rid, group_name }
+    }
+}
+
+/// The `/init_weights_send_group_for_remote_instance` fields.
+#[derive(Debug, Clone)]
+pub struct WeightsSendGroup {
+    pub master_address: String,
+    pub ports: String,
+    pub group_rank: i64,
+    pub world_size: i64,
+    pub group_name: String,
+    pub backend: String,
+}
+
+impl InitWeightsSendGroupForRemoteInstanceReqInput {
+    pub fn new(rid: String, group: WeightsSendGroup) -> Self {
+        Self {
+            rid,
+            master_address: group.master_address,
+            ports: group.ports,
+            group_rank: group.group_rank,
+            world_size: group.world_size,
+            group_name: group.group_name,
+            backend: group.backend,
+        }
+    }
+}
+
+impl SendWeightsToRemoteInstanceReqInput {
+    pub fn new(rid: String, master_address: String, ports: String, group_name: String) -> Self {
+        Self {
+            rid,
+            master_address,
+            ports,
+            group_name,
+        }
+    }
+}
+
+impl AddExternalCorpusReqInput {
+    pub fn new(rid: String, corpus_id: String, token_chunks: Vec<Vec<i64>>) -> Self {
+        Self {
+            rid,
+            corpus_id: Some(corpus_id),
+            file_path: None,
+            documents: None,
+            token_chunks: Some(token_chunks),
+        }
+    }
+}
+
+impl RemoveExternalCorpusReqInput {
+    pub fn new(rid: String, corpus_id: String) -> Self {
+        Self { rid, corpus_id }
+    }
+}
+
+impl ListExternalCorporaReqInput {
+    pub fn new(rid: String) -> Self {
+        Self { rid }
+    }
+}
+
+/// The `/open_session` fields; the owned form of `api::OpenSessionRequest`.
+#[derive(Debug, Clone, Default)]
+pub struct SessionOpen {
+    pub capacity_of_str_len: i64,
+    pub session_id: Option<String>,
+    pub streaming: Option<bool>,
+    pub timeout: Option<f64>,
+}
+
+impl OpenSessionReqInput {
+    pub fn new(rid: String, open: SessionOpen) -> Self {
+        Self {
+            rid,
+            capacity_of_str_len: open.capacity_of_str_len,
+            session_id: open.session_id,
+            streaming: open.streaming,
+            timeout: open.timeout,
+        }
+    }
+}
+
+impl CloseSessionReqInput {
+    pub fn new(rid: String, session_id: String) -> Self {
+        Self { rid, session_id }
+    }
+}
+
+impl GetHiCacheL3LayoutReq {
+    pub fn new(rid: String) -> Self {
+        Self { rid }
+    }
+}
+
+/// The `/configure_logging` fields; the owned form of
+/// `api::ConfigureLoggingRequest`.
+#[derive(Debug, Clone, Default)]
+pub struct LoggingConfig {
+    pub log_requests: Option<bool>,
+    pub log_requests_level: Option<i64>,
+    pub log_requests_format: Option<String>,
+    pub log_level: Option<String>,
+    pub dump_requests_folder: Option<String>,
+    pub dump_requests_threshold: Option<i64>,
+    pub crash_dump_folder: Option<String>,
+    pub dump_requests_exclude_meta_keys: Option<Vec<String>>,
+}
+
+impl ConfigureLoggingReq {
+    pub fn new(rid: String, config: LoggingConfig) -> Self {
+        Self {
+            rid,
+            log_requests: config.log_requests,
+            log_requests_level: config.log_requests_level,
+            log_requests_format: config.log_requests_format,
+            log_level: config.log_level,
+            dump_requests_folder: config.dump_requests_folder,
+            dump_requests_threshold: config.dump_requests_threshold,
+            crash_dump_folder: config.crash_dump_folder,
+            dump_requests_exclude_meta_keys: config.dump_requests_exclude_meta_keys,
+        }
+    }
+}
+
+impl DumperControlReqInput {
+    pub fn new(
+        rid: String,
+        method: String,
+        body: serde_json::Map<String, serde_json::Value>,
+    ) -> Self {
+        Self { rid, method, body }
+    }
+}
+
+/// Bytes on the msgpack wire as `bin`, which Python reads back as `bytes`
+/// (a `Vec<u8>` would serialize as an array of integers).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WireBytes(pub Vec<u8>);
+
+impl Serialize for WireBytes {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(&self.0)
+    }
+}
+
+/// The `/update_weights_from_disk` fields; the owned form of
+/// `api::UpdateWeightsFromDiskRequest` after the frontend resolved
+/// `load_format` from the launch.
+#[derive(Debug, Clone, Default)]
+pub struct DiskWeightUpdate {
+    pub model_path: String,
+    pub load_format: Option<String>,
+    pub abort_all_requests: bool,
+    pub weight_version: Option<String>,
+    pub is_async: bool,
+    pub torch_empty_cache: bool,
+    pub keep_pause: bool,
+    pub recapture_cuda_graph: bool,
+    pub token_step: i64,
+    pub flush_cache: bool,
+    pub manifest: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+impl UpdateWeightFromDiskReqInput {
+    pub fn new(rid: String, update: DiskWeightUpdate) -> Self {
+        Self {
+            rid,
+            model_path: update.model_path,
+            load_format: update.load_format,
+            abort_all_requests: update.abort_all_requests,
+            weight_version: update.weight_version,
+            is_async: update.is_async,
+            torch_empty_cache: update.torch_empty_cache,
+            keep_pause: update.keep_pause,
+            recapture_cuda_graph: update.recapture_cuda_graph,
+            token_step: update.token_step,
+            flush_cache: update.flush_cache,
+            manifest: update.manifest,
+        }
+    }
+}
+
+/// The `/update_weights_from_distributed` fields; the owned form of
+/// `api::UpdateWeightsFromDistributedRequest` with its defaults applied.
+#[derive(Debug, Clone, Default)]
+pub struct DistributedWeightUpdate {
+    pub names: Vec<String>,
+    pub dtypes: Vec<String>,
+    pub shapes: Vec<Vec<i64>>,
+    pub group_name: String,
+    pub flush_cache: bool,
+    pub abort_all_requests: bool,
+    pub weight_version: Option<String>,
+    pub load_format: Option<String>,
+    pub selector: String,
+    pub torch_empty_cache: bool,
+}
+
+impl UpdateWeightsFromDistributedReqInput {
+    pub fn new(rid: String, update: DistributedWeightUpdate) -> Self {
+        Self {
+            rid,
+            names: update.names,
+            dtypes: update.dtypes,
+            shapes: update.shapes,
+            group_name: update.group_name,
+            flush_cache: update.flush_cache,
+            abort_all_requests: update.abort_all_requests,
+            weight_version: update.weight_version,
+            load_format: update.load_format,
+            selector: update.selector,
+            torch_empty_cache: update.torch_empty_cache,
+        }
+    }
+}
+
+/// The `/update_weights_from_tensor` fields; the owned form of
+/// `api::UpdateWeightsFromTensorRequest` with the payloads decoded.
+#[derive(Debug, Clone, Default)]
+pub struct TensorWeightUpdate {
+    pub serialized_named_tensors: Vec<WireBytes>,
+    pub load_format: Option<String>,
+    pub flush_cache: bool,
+    pub abort_all_requests: bool,
+    pub weight_version: Option<String>,
+    pub selector: String,
+    pub torch_empty_cache: bool,
+}
+
+impl UpdateWeightsFromTensorReqInput {
+    pub fn new(rid: String, update: TensorWeightUpdate) -> Self {
+        Self {
+            rid,
+            serialized_named_tensors: update.serialized_named_tensors,
+            load_format: update.load_format,
+            flush_cache: update.flush_cache,
+            abort_all_requests: update.abort_all_requests,
+            weight_version: update.weight_version,
+            selector: update.selector,
+            torch_empty_cache: update.torch_empty_cache,
+        }
+    }
+}
+
+/// The `/update_weights_from_ipc` fields; the owned form of
+/// `api::UpdateWeightsFromIpcRequest` with its defaults applied.
+#[derive(Debug, Clone, Default)]
+pub struct IpcWeightUpdate {
+    pub zmq_handles: std::collections::BTreeMap<String, String>,
+    pub flush_cache: bool,
+    pub weight_version: Option<String>,
+    pub torch_empty_cache: bool,
+}
+
+impl UpdateWeightsFromIPCReqInput {
+    pub fn new(rid: String, update: IpcWeightUpdate) -> Self {
+        Self {
+            rid,
+            zmq_handles: update.zmq_handles,
+            flush_cache: update.flush_cache,
+            weight_version: update.weight_version,
+            torch_empty_cache: update.torch_empty_cache,
+        }
+    }
+}
+
+impl BeginWeightUpdateReqInput {
+    pub fn new(rid: String, selector: String) -> Self {
+        Self { rid, selector }
+    }
+}
+
+impl EndWeightUpdateReqInput {
+    pub fn new(rid: String) -> Self {
+        Self { rid }
+    }
+}
+
+/// The `/plugin_weight_update` fields; the owned form of
+/// `api::PluginWeightUpdateRequest` with its defaults applied.
+#[derive(Debug, Clone, Default)]
+pub struct PluginWeightUpdate {
+    pub handler: String,
+    pub payload: serde_json::Map<String, serde_json::Value>,
+    pub flush_cache: bool,
+    pub abort_all_requests: bool,
+    pub weight_version: Option<String>,
+    pub selector: String,
+    pub torch_empty_cache: bool,
+}
+
+impl PluginWeightUpdateReqInput {
+    pub fn new(rid: String, update: PluginWeightUpdate) -> Self {
+        Self {
+            rid,
+            handler: update.handler,
+            payload: update.payload,
+            flush_cache: update.flush_cache,
+            abort_all_requests: update.abort_all_requests,
+            weight_version: update.weight_version,
+            selector: update.selector,
+            torch_empty_cache: update.torch_empty_cache,
+        }
+    }
+}
+
 impl FreezeGCReq {
     pub fn new(rid: String, gc_threshold: Option<Vec<i64>>) -> Self {
         Self { rid, gc_threshold }
     }
 }
+
+impl PauseGenerationReqInput {
+    pub fn new(rid: String, mode: String) -> Self {
+        Self { rid, mode }
+    }
+}
+
+impl ContinueGenerationReqInput {
+    pub fn new(rid: String, torch_empty_cache: bool) -> Self {
+        Self {
+            rid,
+            torch_empty_cache,
+        }
+    }
+}
+
+/// The `/pd_role_switch` fields; the owned form of `api::PdRoleSwitchRequest`.
+#[derive(Debug, Clone)]
+pub struct PdRoleSwitch {
+    pub new_role: String,
+    pub decode_cuda_graph_bs: Option<Vec<i64>>,
+    pub decode_cuda_graph_memory_gb: Option<f64>,
+    pub prepare_only: bool,
+}
+
+impl PdRoleSwitchReqInput {
+    pub fn new(rid: String, switch: PdRoleSwitch) -> Self {
+        Self {
+            rid,
+            new_role: switch.new_role,
+            decode_cuda_graph_bs: switch.decode_cuda_graph_bs,
+            decode_cuda_graph_memory_gb: switch.decode_cuda_graph_memory_gb,
+            prepare_only: switch.prepare_only,
+        }
+    }
+}
+
+impl UpdateWeightVersionReqInput {
+    pub fn new(rid: String, new_version: String, abort_all_requests: bool) -> Self {
+        Self {
+            rid,
+            new_version,
+            abort_all_requests,
+        }
+    }
+}
+
+/// `ExpertDistributionReqType` on the wire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExpertDistributionAction {
+    Start = 1,
+    Stop = 2,
+    Dump = 3,
+}
+
+impl ExpertDistributionReq {
+    pub fn new(rid: String, action: ExpertDistributionAction) -> Self {
+        Self {
+            rid,
+            action: action as u8,
+        }
+    }
+}
+
+impl SlowDownReqInput {
+    pub fn new(rid: String, forward_sleep_time: Option<f64>) -> Self {
+        Self {
+            rid,
+            forward_sleep_time,
+        }
+    }
+}
+
+impl ReleaseMemoryOccupationReqInput {
+    pub fn new(rid: String, tags: Option<Vec<String>>) -> Self {
+        Self { rid, tags }
+    }
+}
+
+impl ResumeMemoryOccupationReqInput {
+    pub fn new(rid: String, tags: Option<Vec<String>>) -> Self {
+        Self { rid, tags }
+    }
+}
+
+/// `ProfileReqType.START_PROFILE` / `STOP_PROFILE` on the wire.
+pub const PROFILE_REQ_START: u8 = 1;
+pub const PROFILE_REQ_STOP: u8 = 2;
 
 impl ClearHiCacheReqInput {
     pub fn new(rid: String) -> Self {
@@ -318,7 +973,7 @@ impl ProfileReq {
         } = options;
         Self {
             rid,
-            req_type: 1,
+            req_type: PROFILE_REQ_START,
             output_dir,
             start_step,
             num_steps,
@@ -338,7 +993,7 @@ impl ProfileReq {
     /// other field at its default.
     pub fn stop(rid: String) -> Self {
         Self {
-            req_type: 2,
+            req_type: PROFILE_REQ_STOP,
             ..Self::start(rid, ProfileOptions::default())
         }
     }
@@ -576,6 +1231,50 @@ mod tests {
             Some(true),
             "return_hidden_states at idx 16"
         );
+        assert!(
+            arr[20].is_nil() && arr[21].is_nil(),
+            "no session at idx 20/21"
+        );
+    }
+
+    /// A session turn lands at Python's slots: the top-level `session_id` at
+    /// idx 20 and `SessionParams` at idx 21 as the positional 5-array its
+    /// `array_like` struct decodes.
+    #[test]
+    fn header_session_params_are_positional() {
+        let req = GenerateRequest {
+            rid: "turn-2".into(),
+            input_ids: Some(vec![]),
+            session_params: Some(crate::message::request::SessionParams {
+                id: Some("s".into()),
+                rid: Some("turn-1".into()),
+                offset: None,
+                replace: None,
+                drop_previous_output: Some(true),
+            }),
+            ..Default::default()
+        };
+        let bytes = TokenizedGenerateReqInput::from(&req).encode().unwrap();
+        let val = rmpv::decode::read_value(&mut &bytes[..]).unwrap();
+        let arr = val.as_array().expect("array");
+        assert!(arr[20].is_nil());
+        assert_eq!(
+            arr[21],
+            rmpv::Value::Array(vec![
+                "s".into(),
+                "turn-1".into(),
+                rmpv::Value::Nil,
+                rmpv::Value::Nil,
+                true.into()
+            ])
+        );
+        let radix = GenerateRequest {
+            session_id: Some("s".into()),
+            ..Default::default()
+        };
+        let bytes = TokenizedGenerateReqInput::from(&radix).encode().unwrap();
+        let val = rmpv::decode::read_value(&mut &bytes[..]).unwrap();
+        assert_eq!(val.as_array().unwrap()[20].as_str(), Some("s"));
     }
 
     /// Python's `KvHintsEnvelope` / `KvHintAction` are dict-shaped msgspec

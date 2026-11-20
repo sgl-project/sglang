@@ -117,6 +117,8 @@ The `/generate` endpoint accepts the following parameters in JSON format. For de
   </tbody>
 </table>
 
+With `return_routed_experts`, a non-streaming request aborted while it holds no KV cache (queued, retracted or mid-chunk) returns no output tokens, no output logprobs and an empty `routed_experts`, because the routing of its earlier tokens is gone.
+
 ## Sampling parameters
 
 The object is defined at `sampling_params.py::SamplingParams`. You can also read the source code to find more arguments and docs.
@@ -302,6 +304,11 @@ Please refer to our dedicated guide on [constrained decoding](../advanced_featur
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>ignore_eos</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`bool = False`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Don't stop generation when EOS token is sampled.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>sampling_seed</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`Optional[int] = None`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Seed for sampling this request. The same seed gives the same tokens when the logits are the same. Logits can differ slightly with the other requests in the batch, or with whether the prompt hits the prefix cache, unless `--enable-deterministic-inference` is set, so a seed alone does not make outputs reproducible across runs. With `n` > 1, the first sample uses the seed and each other sample a seed derived from it, so the samples differ and each is reproducible. While a batch contains a seeded request that is not greedy, it samples with the PyTorch sampler, which is slower than FlashInfer. With speculative decoding or on the MLX backend, the seed is used only with `--enable-deterministic-inference`.</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>skip_special_tokens</td>

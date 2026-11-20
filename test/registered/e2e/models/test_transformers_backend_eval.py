@@ -28,7 +28,8 @@ class TestTransformersBackendEval(DefaultServerBase):
         "--enable-torch-compile",
         "--torch-compile-max-bs",
         "4",
-        "--disable-cuda-graph",
+        "--disable-decode-cuda-graph",
+        "--disable-prefill-cuda-graph",
     ]
     if auto_config_device() == "cpu":
         other_args += [

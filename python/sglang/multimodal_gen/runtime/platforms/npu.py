@@ -112,6 +112,14 @@ class NPUPlatformBase(Platform):
             logger.info("Using Ascend Flash Attention backend.")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.ascend_fa.AscendFABackend"
 
+        elif selected_backend == AttentionBackendEnum.ASCEND_SPARSE_ATTN:
+            from sglang.multimodal_gen.runtime.layers.attention.backends.ascend_sparse_attn import (  # noqa: F401
+                AscendSparseAttentionBackend,
+            )
+
+            logger.info("Using Ascend sparse attention backend")
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.ascend_sparse_attn.AscendSparseAttentionBackend"
+
         elif selected_backend == AttentionBackendEnum.LASER_ATTN:
             try:
                 from sglang.multimodal_gen.runtime.layers.attention.backends.laser_attn import (  # noqa: F401
@@ -125,7 +133,7 @@ class NPUPlatformBase(Platform):
                 logger.error(f"Failed to import Laser Attention backend: {e}")
                 raise ImportError(
                     "Laser Attention backend is not installed. "
-                    "It requires the `attentions` module which can be installed along with sgl_kernel_npu. "
+                    "It requires the `sgl_kernel_npu` package with the attention.laser_attention operator. "
                     "Manual installation from source is required. See https://github.com/sgl-project/sgl-kernel-npu."
                 ) from e
 
@@ -142,7 +150,8 @@ class NPUPlatformBase(Platform):
                 logger.error(f"Failed to import Block Sparse Attention backend: {e}")
                 raise ImportError(
                     "Block Sparse Attention backend is not installed. "
-                    "It requires the `attentions` module which can be installed along with sgl_kernel_npu. "
+                    "It requires `attentions` for sparse block estimation and `sgl_kernel_npu` "
+                    "for block-sparse attention. "
                     "Manual installation from source is required. See https://github.com/sgl-project/sgl-kernel-npu."
                 ) from e
 

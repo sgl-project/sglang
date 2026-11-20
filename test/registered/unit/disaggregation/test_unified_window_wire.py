@@ -254,7 +254,7 @@ class TestStateEntryAgreement(CustomTestCase):
             with self.assertRaisesRegex(
                 RuntimeError,
                 f"only the {role} server registers a DFLASH draft KV ring.*"
-                f"SGLANG_ENABLE_DFLASH_DRAFT_KV_RING=0 on the {role} server",
+                f"unset SGLANG_ENABLE_DFLASH_DRAFT_KV_RING on the {role} server",
             ):
                 check_state_wire(prefill, decode)
         # Any other difference keeps the generic message.

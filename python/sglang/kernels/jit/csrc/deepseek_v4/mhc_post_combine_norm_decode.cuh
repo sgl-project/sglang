@@ -22,12 +22,6 @@ namespace sglang {
 
 namespace device::ptx {
 
-SGL_DEVICE uint32_t mapa_shared(uint32_t addr, uint32_t rank) {
-  uint32_t result;
-  asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(result) : "r"(addr), "r"(rank));
-  return result;
-}
-
 SGL_DEVICE void st_async_f32(uint32_t remote_addr, float x, uint32_t remote_bar) {
   asm volatile("st.async.shared::cluster.mbarrier::complete_tx::bytes.f32 [%0], %1, [%2];" ::"r"(remote_addr),
                "f"(x),

@@ -594,7 +594,9 @@ class TestOutputStreamerDecodeLatency(unittest.TestCase):
             send_to_detokenizer=None,
             tree_cache=None,
             server_args=SimpleNamespace(
-                enable_hierarchical_cache=False, enable_lmcache=False
+                enable_hierarchical_cache=False,
+                enable_lmcache=False,
+                enable_unified_cache_external_linker=False,
             ),
             is_generation=True,
             spec_algorithm=SpeculativeAlgorithm.NONE,
@@ -784,6 +786,7 @@ class TestOutputStreamerCachedTokensSplit(unittest.TestCase):
         self,
         *,
         hierarchical_cache,
+        external_linker=False,
         storage_backend=None,
         disaggregation_mode=DisaggregationMode.NULL,
     ):
@@ -796,7 +799,9 @@ class TestOutputStreamerCachedTokensSplit(unittest.TestCase):
                 cache_controller=SimpleNamespace(storage_backend=storage_backend)
             ),
             server_args=SimpleNamespace(
-                enable_hierarchical_cache=hierarchical_cache, enable_lmcache=False
+                enable_hierarchical_cache=hierarchical_cache,
+                enable_lmcache=False,
+                enable_unified_cache_external_linker=external_linker,
             ),
             is_generation=True,
             spec_algorithm=SpeculativeAlgorithm.NONE,
@@ -815,7 +820,7 @@ class TestOutputStreamerCachedTokensSplit(unittest.TestCase):
         return rust_server.push_generation.call_args.args[2:4]
 
     def test_rust_frames_split_cached_tokens_by_tier(self):
-        """A cache with a host or storage tier, or a PD decode server, sends
+        """A cache with a host or storage tier, an external linker, or PD decode sends
         each request's cached tokens by tier and the attached storage
         backend's type; a device-only cache sends neither."""
 
@@ -832,6 +837,10 @@ class TestOutputStreamerCachedTokensSplit(unittest.TestCase):
                 hierarchical_cache=False,
                 disaggregation_mode=DisaggregationMode.DECODE,
             ),
+            ([(1, 2, 3)], None),
+        )
+        self.assertEqual(
+            self._split_sent(hierarchical_cache=False, external_linker=True),
             ([(1, 2, 3)], None),
         )
         self.assertEqual(self._split_sent(hierarchical_cache=False), (None, None))
@@ -865,7 +874,9 @@ class TestOutputStreamerRustRequestStats(unittest.TestCase):
             send_to_detokenizer=None,
             tree_cache=None,
             server_args=SimpleNamespace(
-                enable_hierarchical_cache=False, enable_lmcache=False
+                enable_hierarchical_cache=False,
+                enable_lmcache=False,
+                enable_unified_cache_external_linker=False,
             ),
             is_generation=True,
             spec_algorithm=(

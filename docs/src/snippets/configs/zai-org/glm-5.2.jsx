@@ -343,7 +343,7 @@ sgl-eval run aime25 \\
         "--moe-a2a-backend deepep",
         "--deepep-mode normal",
         "--disable-shared-experts-fusion",
-        "--disable-cuda-graph",
+        "--disable-decode-cuda-graph", "--disable-prefill-cuda-graph",
         "--dtype bfloat16",
         "--load-balance-method round_robin",
         "--enable-dp-lm-head",
@@ -430,17 +430,14 @@ sgl-eval run aime25 \\
         "ASCEND_MF_STORE_URL=\"tcp://<memfabric-store-host>:31001\"",
         "ASCEND_MF_LOG_LEVEL=2",
         "HCCL_SOCKET_IFNAME=\"<network-interface>\"",
-        "DEEPEP_HCCL_BUFFSIZE=2048",
-        "SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1",
-        "SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=200"
+        "DEEPEP_HCCL_BUFFSIZE=2048"
       ],
       flags: [
         "--model-path \"/models/GLM-5.2\"",
         "--trust-remote-code",
         "--tp-size 16",
-        "--dp 4",
+        "--attn-dp-size 4",
         "--served-model-name glm52",
-        "--enable-dp-attention",
         "--enable-dp-lm-head",
         "--load-balance-method round_robin",
         "--disaggregation-mode prefill",
@@ -457,10 +454,12 @@ sgl-eval run aime25 \\
         "--kv-cache-dtype \"fp8_e4m3\"",
         "--moe-a2a-backend deepep",
         "--deepep-mode auto",
-        "--disable-cuda-graph",
+        "--disable-decode-cuda-graph", "--disable-prefill-cuda-graph",
         "--enable-metrics",
         "--host {{HOST_IP}}",
-        "--port {{PORT}}"
+        "--port {{PORT}}",
+        "--enable-prefill-delayer",
+        "--prefill-delayer-max-delay-passes 200"
       ]
     },
     {
@@ -493,9 +492,8 @@ sgl-eval run aime25 \\
         "--model-path \"/models/GLM-5.2\"",
         "--trust-remote-code",
         "--tp-size 16",
-        "--dp 4",
+        "--attn-dp-size 4",
         "--served-model-name glm52",
-        "--enable-dp-attention",
         "--enable-dp-lm-head",
         "--load-balance-method round_robin",
         "--disaggregation-mode decode",
@@ -1647,8 +1645,6 @@ sgl-eval run aime25 \\
         "ASCEND_USE_FIA=1",
         "SGLANG_NPU_USE_MLAPO=1",
         "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=35",
-        "SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1",
-        "SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=200",
         "SGLANG_ENABLE_SPEC_V2=1",
         "SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1",
         "TRANSFORMERS_VERBOSITY=error",
@@ -1660,7 +1656,7 @@ sgl-eval run aime25 \\
         "--model-path \"/models/GLM-5.2\"",
         "--trust-remote-code",
         "--tp-size 16",
-        "--dp 1",
+        "--attn-dp-size 1",
         "--served-model-name glm52",
         "--attention-backend ascend",
         "--device npu",
@@ -1672,7 +1668,6 @@ sgl-eval run aime25 \\
         "--chunked-prefill-size 16384",
         "--kv-cache-dtype fp8_e4m3",
         "--speculative-draft-kv-cache-dtype bf16",
-        "--enable-dp-attention",
         "--enable-dp-lm-head",
         "--load-balance-method round_robin",
         "--moe-a2a-backend deepep",
@@ -1683,7 +1678,9 @@ sgl-eval run aime25 \\
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 5",
         "--host {{HOST_IP}}",
-        "--port {{PORT}}"
+        "--port {{PORT}}",
+        "--enable-prefill-delayer",
+        "--prefill-delayer-max-delay-passes 200"
       ]
     },
 
