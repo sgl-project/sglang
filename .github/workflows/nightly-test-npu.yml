@@ -1,5 +1,12 @@
 name: Nightly Test (NPU)
 on:
+  # TEMP: pull request trigger for the isolated validation of the
+  # Qwen3.6-27B W8A8 3.5k/1.5k GPQA pinned host memory fix. Only the temp
+  # single-case suite runs on pull requests (see `set-image-config`); remove
+  # this trigger together with the temp suite.
+  pull_request:
+    branches:
+      - main
   schedule:
     - cron: '0 16 * * *'  # Execute at 0:00 a.m. Beijing Time every day
   workflow_dispatch:
@@ -90,6 +97,11 @@ jobs:
             echo "ref=${{ inputs.ref }}" >> $GITHUB_OUTPUT
           fi
           JOB_FILTER="$(echo "${JOB_FILTER}" | tr -d '[:space:]')"
+          # TEMP: pull request runs only the isolated validation job, so the
+          # other nightly jobs stay off while the fix is being verified.
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            JOB_FILTER="nightly-acc-test-2-npu-a3-temp-qwen36-27b-w8a8-3k5-gpqa"
+          fi
           echo "job_filter=${JOB_FILTER:-all}" | tee -a $GITHUB_OUTPUT
           if [ -z "${{ inputs.image_a3 }}" ]; then
             echo "image_a3=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.1.0-a3" >> $GITHUB_OUTPUT
@@ -305,6 +317,27 @@ jobs:
       install_sglang_deps: false
       device_type_for_deps: 'a3'
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
+
+  # TEMP: isolated validation of the Qwen3.6-27B W8A8 3.5k/1.5k GPQA pinned
+  # host memory fix. Runs only the temp single-case suite and never on the
+  # scheduled nightly run; remove together with the temp suite registration.
+  nightly-acc-test-2-npu-a3-temp-qwen36-27b-w8a8-3k5-gpqa:
+    name: nightly-acc-test-2-npu-a3-temp-qwen36-27b-w8a8-3k5-gpqa
+    if: ${{ !cancelled() && github.event_name != 'schedule' && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-acc-test-2-npu-a3-temp-qwen36-27b-w8a8-3k5-gpqa,')) }}
+    needs: [set-image-config]
+    uses: ./.github/workflows/_npu-single-node-test-stage.yml
+    with:
+      ref: ${{ inputs.ref || '' }}
+      runner: linux-aarch64-a3-2-
+      test_type: 'accuracy'
+      test_suite: nightly-acc-test-2-npu-a3-temp-qwen36-27b-w8a8-3k5-gpqa
+      is_nightly_pipeline_job: true
+      skip_pr_test_health_check: 'true'
+      image: ${{ needs.set-image-config.outputs.image_a3 }}
+      install_sglang_deps: false
+      device_type_for_deps: 'a3'
+      run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
+      test_timeout_minutes: '180'
 
   nightly-acc-test-16-npu-a3:
     name: nightly-acc-test-16-npu-a3
@@ -577,6 +610,7 @@ jobs:
       - nightly-perf-test-4-npu-a3
       - nightly-perf-test-16-npu-a3
       - nightly-acc-test-2-npu-a3
+      - nightly-acc-test-2-npu-a3-temp-qwen36-27b-w8a8-3k5-gpqa
       - nightly-acc-test-16-npu-a3
       - nightly-acc-test-4-npu-a5
       - nightly-poc-multi-node-tests
@@ -611,6 +645,7 @@ jobs:
             "${{ needs.nightly-perf-test-4-npu-a3.result }}" \
             "${{ needs.nightly-perf-test-16-npu-a3.result }}" \
             "${{ needs.nightly-acc-test-2-npu-a3.result }}" \
+            "${{ needs.nightly-acc-test-2-npu-a3-temp-qwen36-27b-w8a8-3k5-gpqa.result }}" \
             "${{ needs.nightly-acc-test-16-npu-a3.result }}"; do
             # TEMP: A5 power maintenance - line below disabled; when restoring, move '; do' back onto the a5 line
             # "${{ needs.nightly-acc-test-4-npu-a5.result }}"; do
@@ -643,6 +678,7 @@ jobs:
             "nightly-perf-test-4-npu-a3:${{ needs.nightly-perf-test-4-npu-a3.result }}" \
             "nightly-perf-test-16-npu-a3:${{ needs.nightly-perf-test-16-npu-a3.result }}" \
             "nightly-acc-test-2-npu-a3:${{ needs.nightly-acc-test-2-npu-a3.result }}" \
+            "nightly-acc-test-2-npu-a3-temp-qwen36-27b-w8a8-3k5-gpqa:${{ needs.nightly-acc-test-2-npu-a3-temp-qwen36-27b-w8a8-3k5-gpqa.result }}" \
             "nightly-acc-test-16-npu-a3:${{ needs.nightly-acc-test-16-npu-a3.result }}"; do
             # TEMP: A5 power maintenance - line below disabled; when restoring, move '; do' back onto the a5 line
             # "nightly-acc-test-4-npu-a5:${{ needs.nightly-acc-test-4-npu-a5.result }}"; do

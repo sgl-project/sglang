@@ -197,6 +197,10 @@ NIGHTLY_SUITES = {
         "nightly-test-8-npu-a3",
         "nightly-test-16-npu-a3",
         "nightly-acc-test-2-npu-a3",
+        # TEMP: single-case validation suite for the pinned host memory fix of
+        # test_npu_qwen3_6_27b_w8a8_1p_in3k5_out1k5_50ms_gpqa.py; remove once
+        # the fix is validated.
+        "nightly-acc-test-2-npu-a3-temp-qwen36-27b-w8a8-3k5-gpqa",
         "nightly-acc-test-8-npu-a3",
         "nightly-acc-test-16-npu-a3",
         "nightly-acc-test-4-npu-a5",
