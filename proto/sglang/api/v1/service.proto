@@ -278,6 +278,12 @@ message GetServerInfoResponse {
   // `PortArgs.instance_id` (shared IPC/load snapshot namespace). Not a
   // cluster-wide epoch, health check, or request-cleanup proof.
   string instance_id = 16;
+  // This private language listener accepts version-1 staged image descriptors.
+  bool accepts_encoder_handoff = 17;
+  // Accepts version-2 encoder handoffs containing video layouts.
+  bool supports_staged_video = 18;
+  // Native model type accepted by this listener's version-3 handoff.
+  string native_model_type = 19;
 }
 
 message DeploymentInfo {

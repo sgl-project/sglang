@@ -2029,11 +2029,15 @@ class Envs:
     # ===================================================================
     # Encoder pipeline and disaggregation
     # ===================================================================
+    # Accept staged descriptors from a trusted orchestrator on a private listener.
+    SGLANG_EXTERNAL_ENCODER_HANDOFF = EnvBool(False)
     SGLANG_ENCODER_GRPC_TIMEOUT_SECS = EnvInt(60)
     # Encoder receiver selection: http|grpc (used by EPD paths).
     SGLANG_ENCODER_MM_RECEIVER_MODE = EnvStr("http")
     SGLANG_ENCODER_RECV_TIMEOUT = EnvFloat(180.0)
     SGLANG_ENCODER_SEND_TIMEOUT = EnvFloat(180.0)
+    # Includes staged image encodes, unclaimed leases and deliveries in flight.
+    SGLANG_ENCODER_MAX_STAGED_REQUESTS = EnvInt(64)
     SGLANG_ENCODER_HTTP_TIMEOUT = EnvFloat(1800.0)
     SGLANG_ENCODER_REQ_TIMEOUT = EnvFloat(180.0)
     SGLANG_ENCODER_DISPATCH_MIN_ITEMS = EnvInt(2)

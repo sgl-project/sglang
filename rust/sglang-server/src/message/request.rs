@@ -11,13 +11,14 @@ use itertools::izip;
 
 use super::buffers::Buffer;
 use super::io_struct::{ControlRequest, TokenizedGenerateReqInput};
-use super::multimodal::{self, MmItem};
+use super::multimodal::{self, MediaHints, MmItem};
 use super::response::ResponseSink;
 use super::sampling::SamplingParams;
 use super::types::{OneOrMany, OneOrManyItem, TokenIds};
 use super::wire;
 use crate::message::config::ServerArgs;
 use crate::message::ids::Rid;
+use crate::multi_modality::worker::MediaError;
 use crate::utils::fsm::RequestState;
 use crate::utils::{environ::env_i64, error::Error};
 use sglang_api_types::api::v1 as api_v1;
@@ -115,6 +116,7 @@ pub fn into_requests(
         routed_dp_rank,
         disagg_prefill_dp_rank,
         image_data,
+        encoder_handoff,
         mm_hashes,
         video_data,
         audio_data,
@@ -538,6 +540,26 @@ pub fn into_requests(
         },
     )
     .collect();
+    // A staged embedding has a single receiver. Passing the descriptor as a
+    // named buffer preserves it across native gRPC/HTTP and the scheduler ring.
+    if let Some(handoff) = encoder_handoff {
+        let g = &mut requests[0];
+        if is_batch || g.input_ids.is_none() || g.mm.is_some() || g.sampling_params.n != 1 {
+            return Err(Error::Validation(
+                "encoder_handoff requires one tokenized prompt, n=1 and no raw media".into(),
+            ));
+        }
+        g.mm_buffers
+            .push(Buffer::inline("epd.handoff", handoff.into_bytes()));
+        if !mm_hashes.is_empty() {
+            let hashes: Vec<_> = mm_hashes
+                .iter()
+                .map(|h| crate::multi_modality::worker::parse_caller_hash(h))
+                .collect();
+            let hashes = rmp_serde::to_vec(&hashes).map_err(|e| Error::Internal(e.to_string()))?;
+            g.mm_buffers.push(Buffer::inline("epd.hashes", hashes));
+        }
+    }
     // Single requests only (batches rejected above). Malformed entries are
     // dropped here and warned about in `mm::apply_caller_hashes`, never a 400.
     if let Some(mm) = requests.first_mut().and_then(|req| req.mm.as_deref_mut()) {
@@ -1001,6 +1023,53 @@ impl GenerateRequest {
         buffers.append(&mut self.mm_buffers);
         buffers
     }
+
+    /// Move the media into the `epd.media` buffer, for Python to dispatch to
+    /// the encoders: a msgpack list with one entry per image, its source or
+    /// `{"url", "detail"}`, as Python's `image_data` holds it.
+    pub fn take_epd_media(&mut self, image_token_id: Option<i32>) -> Result<(), Error> {
+        let Some(mm) = self.mm.take() else {
+            return Ok(());
+        };
+        if !mm.video_data.is_empty() || !mm.audio_data.is_empty() {
+            return Err(Error::Validation(
+                "SGLANG_RUST_SERVER=1 with --language-only serves image inputs only; \
+                 video and audio are not supported"
+                    .into(),
+            ));
+        }
+        if mm.image_data.is_empty() {
+            return Ok(());
+        }
+        if let (Some(id), Some(ids)) = (image_token_id, &self.input_ids) {
+            let found = ids.iter().filter(|&&t| t == i64::from(id)).count();
+            let items = mm.image_data.len();
+            if found != items {
+                // The Rust MM pipeline's refusal (`layout_by_placeholder`), word for word.
+                return Err(Error::Encode(MediaError::Client(format!(
+                    "prompt has {found} media placeholder(s) but {items} media item(s)"
+                ))));
+            }
+        }
+        let images: Vec<serde_json::Value> = mm
+            .image_data
+            .iter()
+            .map(|item| match item {
+                MmItem::Ref {
+                    url,
+                    hints:
+                        MediaHints {
+                            detail: Some(detail),
+                            ..
+                        },
+                } => serde_json::json!({"url": url, "detail": detail}),
+                MmItem::Ref { url, .. } | MmItem::Source(url) => serde_json::json!(url),
+            })
+            .collect();
+        let media = rmp_serde::to_vec(&images).map_err(|e| Error::Internal(e.to_string()))?;
+        self.mm_buffers.push(Buffer::inline("epd.media", media));
+        Ok(())
+    }
 }
 
 /// Fan one scalar-or-list option out to `n` per-item values: absent → `None`
@@ -1213,6 +1282,43 @@ mod tests {
             serde_json::from_str::<api_v1::GenerateRequest>(body).unwrap(),
             policy,
         )
+    }
+
+    #[test]
+    fn staged_handoff_keeps_unexpanded_ids_without_media_work() {
+        let (mut parsed, _) = requests(
+            r#"{"input_ids":[4,2,4],"encoder_handoff":{"version":1},"mm_hashes":["0xff","bogus"]}"#,
+        )
+        .unwrap();
+        let g = &mut parsed[0];
+        assert!(g.mm.is_none());
+        assert_eq!(g.input_ids.as_deref(), Some(&[4, 2, 4][..]));
+        let names: Vec<_> = g
+            .mm_buffers
+            .iter()
+            .map(|buffer| buffer.name.as_str())
+            .collect();
+        assert_eq!(names, ["epd.handoff", "epd.hashes"]);
+        let super::super::buffers::BufferStore::Inline(hashes) = &g.mm_buffers[1].store else {
+            panic!("expected routing hash metadata inline");
+        };
+        assert_eq!(
+            rmp_serde::from_slice::<Vec<Option<u64>>>(hashes.as_bytes()).unwrap(),
+            [Some(255), None]
+        );
+        for body in [
+            r#"{"input_ids":[4],"encoder_handoff":{},"image_data":"source"}"#,
+            r#"{"input_ids":[[4]],"encoder_handoff":{}}"#,
+            r#"{"input_ids":[4],"encoder_handoff":{},"sampling_params":{"n":2}}"#,
+            r#"{"text":"image","encoder_handoff":{}}"#,
+        ] {
+            assert!(
+                requests(body)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("encoder_handoff")
+            );
+        }
     }
 
     #[test]

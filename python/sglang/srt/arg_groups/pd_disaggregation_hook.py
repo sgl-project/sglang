@@ -327,7 +327,11 @@ def handle_encoder_disaggregation(server_args: Any):
             "Cannot set --encoder-only and --disaggregation-mode prefill/decode together"
         )
 
-    if cfg.language_only and len(cfg.encoder_urls) == 0:
+    if (
+        cfg.language_only
+        and not cfg.encoder_urls
+        and not envs.SGLANG_EXTERNAL_ENCODER_HANDOFF.get()
+    ):
         logger.info(
             "--language-only is set without --encoder-urls. Encoders are "
             "expected to register dynamically via the "
@@ -348,6 +352,33 @@ def handle_encoder_disaggregation(server_args: Any):
     # Validate model type for encoder disaggregation
     hf_config = model_config_of(server_args).hf_config
     model_arch = hf_config.architectures[0]
+    if cfg.encoder_transfer_backend == "nixl":
+        if not (
+            (cfg.encoder_only and cfg.grpc_mode)
+            or (cfg.language_only and envs.SGLANG_EXTERNAL_ENCODER_HANDOFF.get())
+        ):
+            raise ValueError(
+                "--encoder-transfer-backend nixl requires --encoder-only --grpc-mode "
+                "or --language-only with SGLANG_EXTERNAL_ENCODER_HANDOFF=1"
+            )
+        if (
+            cfg.pp_size != 1
+            or num_dp_ranks_of(cfg) != 1
+            or (cfg.encoder_only and cfg.nnodes != 1)
+        ):
+            raise ValueError(
+                "Staged NIXL embeddings require PP=DP=1 and a single-node encoder"
+            )
+        from sglang.srt.disaggregation.encoder.native_handoff import (
+            NATIVE_IMAGE_MODEL_TYPES,
+            STAGED_VIDEO_MODEL_TYPES,
+        )
+
+        if (
+            hf_config.model_type
+            not in STAGED_VIDEO_MODEL_TYPES | NATIVE_IMAGE_MODEL_TYPES
+        ):
+            raise ValueError(f"Staged NIXL embeddings do not support {model_arch}")
     if cfg.encoder_transfer_backend == "auto":
         declare_resolution(
             server_args,
@@ -363,7 +394,7 @@ def handle_encoder_disaggregation(server_args: Any):
                 model_arch,
                 cfg.tp_size,
             )
-    if (cfg.encoder_only or cfg.language_only) and model_arch not in [
+    supported_architectures = [
         "Qwen2VLForConditionalGeneration",
         "Qwen3VLForConditionalGeneration",
         "Qwen2_5_VLForConditionalGeneration",
@@ -384,7 +415,17 @@ def handle_encoder_disaggregation(server_args: Any):
         "MiniMaxM3SparseForConditionalGeneration",
         "MuseSparkForConditionalGeneration",
         "Inkling2ForConditionalGeneration",
-    ]:
+    ]
+    if cfg.encoder_transfer_backend in ("nixl", "zmq_to_scheduler") and (
+        (cfg.encoder_only and cfg.grpc_mode)
+        or (cfg.language_only and envs.SGLANG_EXTERNAL_ENCODER_HANDOFF.get())
+    ):
+        supported_architectures.extend(
+            ("Glm4vForConditionalGeneration", "Glm4vMoeForConditionalGeneration")
+        )
+    if (
+        cfg.encoder_only or cfg.language_only
+    ) and model_arch not in supported_architectures:
         raise ValueError(
             f"Model type {model_arch} is not supported for encoder disaggregation. "
             f"Supported architectures: Qwen2VL, Qwen3VL, Qwen3.5, InternS2, "

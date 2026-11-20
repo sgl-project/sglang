@@ -112,6 +112,16 @@ def rust_mm_family_for(
     )
 
 
+def rust_mm_family_of(model_config: Any) -> Optional[RustMmFamily]:
+    from sglang.srt.managers.multimodal_processor import get_mm_processor_cls
+
+    hf_config = model_config.hf_config
+    return rust_mm_family_for(
+        get_mm_processor_cls(hf_config, model_config=model_config),
+        getattr(hf_config, "model_type", None),
+    )
+
+
 class _ModalityTable(dict):
     """``mm.meta`` modality names -> scheduler ``Modality``, resolved lazily so
     this module keeps its light import footprint."""
@@ -247,15 +257,8 @@ class RustMmProcessor:
         normalization, token ids — never the HF config, and is conservative by
         design: an unrecognized knob disables the Rust path rather than being
         approximated."""
-        from sglang.srt.managers.multimodal_processor import get_mm_processor_cls
-
         hf_config = self.model_config.hf_config
-        mm_processor_cls = get_mm_processor_cls(
-            hf_config, model_config=self.model_config
-        )
-        family = rust_mm_family_for(
-            mm_processor_cls, getattr(hf_config, "model_type", None)
-        )
+        family = rust_mm_family_of(self.model_config)
         if family is None:
             return None
         image_processor = getattr(self._processor, "image_processor", None)

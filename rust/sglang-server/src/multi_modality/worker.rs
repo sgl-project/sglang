@@ -43,7 +43,7 @@ fn apply_caller_hashes<'a>(hashes: impl ExactSizeIterator<Item = &'a mut u64>, c
 
 /// Hex of any width, as Python's `int(hex_hash, 16)` takes it (a full SHA-256
 /// being the common case), keeping the low 64 bits in this legacy field only.
-fn parse_caller_hash(entry: &str) -> Option<u64> {
+pub(crate) fn parse_caller_hash(entry: &str) -> Option<u64> {
     let hex = entry.strip_prefix("0x").unwrap_or(entry);
     if hex.is_empty() || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;

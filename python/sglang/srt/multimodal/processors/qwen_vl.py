@@ -319,16 +319,16 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
         modality_list = []
         cur_idx = 0
 
-        vision_start_indices = []
-        for i in range(len(prompt) - 1):
-            if img_token_id is not None and prompt[i + 1] == img_token_id:
-                vision_start_indices.append((i, Modality.IMAGE))
-            elif video_token_id is not None and prompt[i + 1] == video_token_id:
-                vision_start_indices.append((i, Modality.VIDEO))
+        media_positions = []
+        for i, token in enumerate(prompt):
+            if img_token_id is not None and token == img_token_id:
+                media_positions.append((i, Modality.IMAGE))
+            elif video_token_id is not None and token == video_token_id:
+                media_positions.append((i, Modality.VIDEO))
 
         img_idx = 0
         video_idx = 0
-        for mm_start_idx, modality in vision_start_indices:
+        for mm_start_idx, modality in media_positions:
             modality_list.append(modality)
             video_tokens = None
             if modality == Modality.IMAGE:
@@ -342,7 +342,7 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
                     spatial_merge_size**2
                 )
                 video_tokens = []
-                _current_offset = len(input_ids) + mm_start_idx + 1 - cur_idx
+                _current_offset = len(input_ids) + mm_start_idx - cur_idx
                 # take single frame as one mm_item
                 for frame_idx in range(num_frames):
                     if frame_idx > 0:
@@ -377,14 +377,14 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
                 )
                 continue
             assert cur_idx <= mm_start_idx
-            input_ids.extend(prompt[cur_idx : mm_start_idx + 1])
+            input_ids.extend(prompt[cur_idx:mm_start_idx])
             if modality == Modality.VIDEO:
                 input_ids.extend(video_tokens)
             else:
                 mm_offset_start = len(input_ids)
                 input_ids.extend([mm_token_id] * mm_token_num)
                 offsets.append((mm_offset_start, len(input_ids) - 1))
-            cur_idx = mm_start_idx + 2  # jump to vision_end_id
+            cur_idx = mm_start_idx + 1
         else:
             input_ids.extend(prompt[cur_idx:])
 
@@ -572,7 +572,14 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
             grid = input_data[0].get(key)
         return grid
 
+    def get_staged_media_layout(self, prompt, **kwargs):
+        """Rebuild Qwen token spans and M-RoPE before receiving staged tensors."""
+        return self._get_mm_data(prompt, None, **kwargs)
+
     def get_mm_data(self, prompt, embeddings, **kwargs):
+        return self._get_mm_data(prompt, embeddings, **kwargs)
+
+    def _get_mm_data(self, prompt, embeddings, **kwargs):
         img_grid_thw = kwargs.get("img_grid_thw", None)
         video_grid_thw = kwargs.get("video_grid_thw", None)
         audio_feature_lens = kwargs.get("audio_feature_lens", None)
@@ -645,9 +652,11 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
         for modality, offset in zip(modality_list, offsets):
             num_tokens = offset[1] - offset[0] + 1
             embedding_start = consumed_per_modality.get(modality, 0)
-            embedding_slice = embeddings[modality][
-                embedding_start : embedding_start + num_tokens
-            ]
+            embedding_slice = (
+                embeddings[modality][embedding_start : embedding_start + num_tokens]
+                if embeddings is not None
+                else None
+            )
             consumed_per_modality[modality] = embedding_start + num_tokens
             mm_items.append(
                 MultimodalDataItem(

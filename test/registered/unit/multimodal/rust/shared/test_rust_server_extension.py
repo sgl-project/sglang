@@ -633,10 +633,11 @@ def build_rust_customized_info_fixture() -> dict:
 
 
 @contextmanager
-def launch_context(server_cls, cores=(None, None)):
+def launch_context(server_cls, cores=(None, None), disagg=None):
     """Patch what `launch` reads so it runs as DP rank 1 of a two-rank node,
     with `cores` as the `(launch_cores, server_cores)` partition (unpinned by
-    default); yields the `_build_server_args` mock."""
+    default) and `disagg` as `get_disagg()` (no disaggregation by default);
+    yields the `_build_server_args` mock."""
     with (
         patch.object(
             server_module,
@@ -677,7 +678,8 @@ def launch_context(server_cls, cores=(None, None)):
         patch.object(
             server_module,
             "get_disagg",
-            return_value=SimpleNamespace(disaggregation_mode="null"),
+            return_value=disagg
+            or SimpleNamespace(disaggregation_mode="null", language_only=False),
         ),
         patch.object(
             server_module, "_build_server_args", return_value=sentinel.args
@@ -1256,6 +1258,84 @@ class TestRustServerExtension(CustomTestCase):
             self.assertEqual(json.load(f), build_rust_frame_metadata_fixture())
         with open(RUST_CUSTOMIZED_INFO_FIXTURE) as f:
             self.assertEqual(json.load(f), build_rust_customized_info_fixture())
+
+    def test_language_only_launch_dispatches_to_encoders_instead_of_the_mm_pool(
+        self,
+    ):
+        extension = ModuleType("server")
+        extension.Server = Mock()
+
+        class BuiltinServer(RustServer):
+            @classmethod
+            def _load_extension(cls):
+                return extension
+
+        model_config = SimpleNamespace(
+            is_multimodal=True,
+            is_generation=True,
+            hf_config=SimpleNamespace(model_type="kimi_k3"),
+            model_path="test/model",
+        )
+        scheduler = SimpleNamespace(
+            server_args=sentinel.server_args,
+            processor=sentinel.processor,
+            model_config=model_config,
+        )
+        # What `auto` resolves to for Kimi K3 at TP>1, after the validation hook ran.
+        disagg = SimpleNamespace(
+            disaggregation_mode="null",
+            language_only=True,
+            encoder_transfer_backend="zmq_to_tokenizer",
+        )
+        with (
+            launch_context(BuiltinServer, disagg=disagg),
+            patch.object(server_module, "RustMmProcessor") as mm_processor,
+            patch.object(
+                server_module, "rust_mm_family_of", return_value=None
+            ) as family_of,
+            patch.object(
+                BuiltinServer, "_start_encoder_dispatch", autospec=True
+            ) as start_dispatch,
+        ):
+            refusals = [
+                "SGLANG_RUST_SERVER=1 with --language-only needs "
+                "--encoder-transfer-backend zmq_to_scheduler, got zmq_to_tokenizer. "
+                "Unset SGLANG_RUST_SERVER to serve it.",
+                # A DP size derived after the validation hook, as --dwdp-size does.
+                "SGLANG_RUST_SERVER=1 with --language-only does not support data "
+                "parallelism, got 2 DP ranks. Unset SGLANG_RUST_SERVER to serve it.",
+                "SGLANG_RUST_SERVER=1 with --language-only serves the Qwen-VL family "
+                "(qwen2_5_vl, qwen2_vl, qwen3_5, qwen3_5_moe, qwen3_vl, qwen3_vl_moe; "
+                "images only), not model_type='kimi_k3'. "
+                "Unset SGLANG_RUST_SERVER to serve this model.",
+            ]
+            fixes = [
+                lambda: setattr(disagg, "encoder_transfer_backend", "zmq_to_scheduler"),
+                lambda: setattr(
+                    server_module.get_parallel.return_value, "num_dp_ranks", 1
+                ),
+                lambda: None,
+            ]
+            for refusal, fix in zip(refusals, fixes):
+                with self.assertRaises(RuntimeError) as ctx:
+                    BuiltinServer.launch(scheduler)
+                self.assertEqual(str(ctx.exception), refusal)
+                fix()
+            extension.Server.assert_not_called()
+
+            family_of.return_value = sentinel.qwen_vl
+            instance = BuiltinServer.launch(scheduler)
+            start_dispatch.assert_called_once_with(instance)
+
+            # A text-only model needs no Rust MM family.
+            family_of.return_value = None
+            model_config.is_multimodal = False
+            BuiltinServer.launch(scheduler)
+
+        mm_processor.assert_not_called()
+        instance.server.start_mm_workers.assert_not_called()
+        self.assertFalse(instance._multimodal_enabled)
+        self.assertIsNone(instance._mm_cache_namespace)
 
     def test_launch_resolves_the_mm_pipeline_before_the_server_starts(self):
         """The listener answers once the server is constructed, so a model

@@ -19,6 +19,33 @@ When launching a language-only model, you must additionally specify the encoder 
 
 We support multiple encoder transfer backends, including zmq_to_scheduler, zmq_to_tokenizer, and mooncake (the default is zmq_to_scheduler). The backend can be selected using `--encoder-transfer-backend`.
 
+### External encoder selection
+
+An external router can select an encoder before it selects the prefill worker.
+Start the encoder with `--encoder-only --grpc-mode`, and enable
+`SGLANG_EXTERNAL_ENCODER_HANDOFF=1` on the Rust language-only workers.
+Use the same `--encoder-transfer-backend nixl` or
+`--encoder-transfer-backend zmq_to_scheduler` on E and P/PD. NIXL requires
+the UCX plugin on both ends.
+
+| Model | Image | Video |
+|---|---|---|
+| Qwen2-VL, Qwen2.5-VL, Qwen3-VL/MoE, Qwen3.5/MoE, Intern-S2 Preview, Qwen3-Omni-MoE | Yes | Yes |
+| GLM-5-Next (GLM-5.3-Flash), GLM-4V/MoE, MiniMax-M3, Muse Spark | Yes | Yes |
+| MiMo-V2 with a vision tower | Yes | Clips without an audio track |
+| Kimi-VL, Kimi K2.5, K3, K3.1, Inkling2, Dots3-Note | Yes | Image items only |
+
+Use PP=DP=1. Each encoder replica can use tensor parallelism within one node.
+All media in a request go to one replica. On P/PD, TP rank 0 receives the
+embeddings and broadcasts them to its peers. In E/P/D, D reconstructs the token
+positions from the descriptor. Configure P→D KV transfer independently.
+
+Qwen-family image and video handoffs use v1 and v2 respectively. Other model
+families use v3 to carry the native model type, tensor width and per-item row
+counts, plus the grids, dimensions or timing their processors need.
+Video requires a compatible decoder on E. Audio and linked audio/video are
+outside this handoff protocol.
+
 ### Encoder transfer with Mooncake
 
 `--encoder-transfer-backend mooncake` controls **how encoder outputs are transferred** between encoder and language/prefill services. It is an encoder transfer option and can be used independently of the global multimodal embedding cache.

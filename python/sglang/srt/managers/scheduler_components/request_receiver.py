@@ -253,7 +253,7 @@ class SchedulerRequestReceiver:
             get_parallel().pp_rank == 0
             and get_disagg().language_only
             and get_disagg().encoder_transfer_backend
-            in ["zmq_to_scheduler", "mooncake"]
+            in ["zmq_to_scheduler", "mooncake", "nixl"]
         ):
             recv_reqs, abort_reqs = self.mm_receiver.process_waiting_requests(recv_reqs)
             for req, error_msg, error_code in abort_reqs:

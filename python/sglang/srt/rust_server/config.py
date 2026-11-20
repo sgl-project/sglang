@@ -12,6 +12,11 @@ from types import ModuleType
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 from sglang.srt.arg_groups.model_override_base import resolving_view
+from sglang.srt.disaggregation.encoder.native_handoff import (
+    NATIVE_IMAGE_MODEL_TYPES,
+    NATIVE_VIDEO_MODEL_TYPES,
+    STAGED_VIDEO_MODEL_TYPES,
+)
 from sglang.srt.disaggregation.kv_events import select_kv_publisher_dp_rank
 from sglang.srt.entrypoints.server_utils import (
     build_model_info_fields,
@@ -225,6 +230,13 @@ def _build_server_args(
             (get_mm().limit_mm_data_per_request or {}).items()
         ),
         allow_auto_truncate=get_serving().allow_auto_truncate,
+        epd_dispatch=get_disagg().language_only,
+        epd_image_token_id=(
+            scheduler.model_config.hf_config.image_token_id
+            if get_disagg().language_only
+            and not envs.SGLANG_EXTERNAL_ENCODER_HANDOFF.get()
+            else None
+        ),
         enable_return_hidden_states=sa.enable_return_hidden_states,
         return_hidden_states_mode=sa.return_hidden_states_mode,
         # Not a `server_args` field: `TokenizerManager` derives it, and the
@@ -496,6 +508,14 @@ def _launch_server_info(scheduler: Scheduler) -> str:
             build_server_info(scheduler.server_args, scheduler_info)
         )
     )
+    if envs.SGLANG_EXTERNAL_ENCODER_HANDOFF.get():
+        info["accepts_encoder_handoff"] = True
+        model_type = scheduler.model_config.hf_config.model_type
+        if model_type in NATIVE_IMAGE_MODEL_TYPES:
+            info["native_model_type"] = model_type
+        info["supports_staged_video"] = model_type in (
+            STAGED_VIDEO_MODEL_TYPES | NATIVE_VIDEO_MODEL_TYPES
+        )
     _redact_api_keys(info, scheduler.server_args)
     return json.dumps(info, default=str)
 

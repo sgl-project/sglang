@@ -53,6 +53,7 @@ import zmq.asyncio
 from pydantic import PlainValidator
 
 from sglang.srt.beam_search.types import BeamSearchSequence
+from sglang.srt.disaggregation.encoder.handoff import EncoderHandoff
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.embed_types import PositionalEmbeds
@@ -252,6 +253,9 @@ class GenerateReqInput:
     # actual content, shape, dtype, and processor configuration independently;
     # identical caller hashes cannot authorize sharing between different media.
     mm_hashes: Optional[Union[List[str], List[List[str]]]] = None
+    # Shared wire field for the private Rust listener. Python ingress rejects
+    # staged images before dispatch so it cannot accidentally run vision twice.
+    encoder_handoff: Optional[dict] = field(default=None, kw_only=True)
     # Optional caller routing labels, one opaque string per media input: the
     # image_data labels first, then video_data, then audio_data, each in input
     # order. The count must equal the request's media inputs. An empty string
@@ -502,6 +506,10 @@ class GenerateReqInput:
 
     def _validate_inputs(self):
         """Validate that the input configuration is valid."""
+        if self.encoder_handoff is not None:
+            raise ValueError(
+                "encoder_handoff requires the private SGLANG_RUST_SERVER listener"
+            )
         if (
             self.text is None and self.input_ids is None and self.input_embeds is None
         ) or (
@@ -1324,6 +1332,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     mm_routing_labels: Optional[Dict[str, List[str]]] = None
     # See GenerateReqInput.token_ids_logprob_rows.
     token_ids_logprob_rows: Optional[List[List[int]]] = None
+    # Private, append-only IPC fields for native orchestrated encoder handoff.
+    encoder_handoff: Optional[EncoderHandoff] = None
+    encoder_routing_hashes: Optional[List[Optional[int]]] = None
 
     def wrap_pickle_fields(self):
         self.mm_inputs = wrap_object_fields_as_pickle(self.mm_inputs)
