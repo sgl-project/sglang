@@ -76,7 +76,6 @@ register_kernel(
         op="speculative.div_argmax",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.speculative.row_argmax:div_argmax",
-        capabilities=CUDA_ONLY,
     )
 )
 register_kernel(

@@ -26,7 +26,10 @@ from sglang.srt.arg_groups.attention_hook import (
     handle_attention_backend_compatibility,
     handle_deterministic_inference,
 )
-from sglang.srt.arg_groups.choices import KV_CACHE_DTYPE_CHOICES
+from sglang.srt.arg_groups.choices import (
+    KV_CACHE_DTYPE_CHOICES,
+    WATERMARK_ALGORITHM_CHOICES,
+)
 from sglang.srt.arg_groups.cuda_graph_hook import (
     apply_cuda_graph_compatibility,
     finalize_cuda_graph_prefill_max_context,
@@ -572,6 +575,18 @@ class TestPrepareServerArgs(CustomTestCase):
                     chunked_prefill_size=-1,
                 ).check_server_args()
 
+    def test_disable_multimodal_rejects_enable_multimodal(self):
+        with self.assertRaisesRegex(
+            ValueError, "--disable-multimodal cannot be combined"
+        ):
+            ServerArgs(
+                model_path="dummy",
+                served_model_name="dummy",
+                enable_multimodal=True,
+                disable_multimodal=True,
+                chunked_prefill_size=-1,
+            ).check_server_args()
+
     def test_instanttensor_device_check_allows_cuda_and_other_loaders(self):
         for device, load_format in (
             ("cuda", "instanttensor"),
@@ -1043,6 +1058,19 @@ class TestPrepareServerArgs(CustomTestCase):
             self.assertEqual(parsed.mm_process_config, {"image": {"resize": 128}})
         finally:
             os.unlink(config_file)
+
+
+class TestWatermarkServerArgs(CustomTestCase):
+    def test_unknown_algorithm_refused_with_watermarking_off(self):
+        with self.assertRaisesRegex(ValueError, "unknown --watermark-algorithm"):
+            validation_hook.check_watermark_server_args(
+                ServerArgs(model_path="dummy", watermark_algorithm="synthid")
+            )
+
+    def test_every_algorithm_choice_has_an_adapter(self):
+        from sglang.srt.sampling.watermarking import runtime
+
+        self.assertEqual(sorted(runtime._ADAPTERS), sorted(WATERMARK_ALGORITHM_CHOICES))
 
 
 class TestMmEncoderDataParallelLogging(CustomTestCase):
@@ -4606,6 +4634,11 @@ class TestGrpcServerArgs(CustomTestCase):
     def test_native_grpc_rejects_multi_tokenizer(self):
         sa = self._args(grpc_port=40000, tokenizer_worker_num=2)
         with self.assertRaises(ValueError):
+            handle_grpc_args(sa)
+
+    def test_rust_server_grpc_accepts_multi_tokenizer(self):
+        sa = self._args(grpc_port=40000, tokenizer_worker_num=4)
+        with envs.SGLANG_RUST_SERVER.override(True):
             handle_grpc_args(sa)
 
     def test_native_grpc_rejects_http_auth(self):

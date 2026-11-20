@@ -249,7 +249,6 @@ class AsyncShmMaterializerTest(CustomTestCase):
         limit_reached = UocrRequestReceiver.recv_limit_reached
         receiver = UocrRequestReceiver(
             recv_from_tokenizer=None,
-            recv_from_rpc=None,
             recv_skipper=None,
             input_blocker=None,
             mm_receiver=None,
