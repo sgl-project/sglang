@@ -303,7 +303,7 @@ class TestDFlashBinding(CustomTestCase):
         self.assertEqual(runtime.binding.pull("mask_token_id"), 3)
         with self.assertRaisesRegex(KeyError, "without declaring it"):
             runtime.binding.pull("draft_model")
-        # an unset export must fail, not fall back to the target worker
+        # an unset binding must fail, not fall back to the target worker
         runtime = self._bind(names)
         with self.assertRaises(AttributeError):
             runtime.binding.pull("mask_token_id")
@@ -338,9 +338,9 @@ class TestDFlashBinding(CustomTestCase):
             return type("Runtime", (FakeDFlashRuntime,), attrs)
 
         with self.assertRaisesRegex(
-            RuntimeError, r"binding has no export \['draft_kv'\]"
+            RuntimeError, r"binding has no name \['draft_kv'\]"
         ):
-            self._bind(names, runtime=runtime(exports=frozenset({"draft_kv"})))
+            self._bind(names, runtime=runtime(bindings=frozenset({"draft_kv"})))
         unknown_key = runtime(guards={"draft_kv": 1})
         with self.assertRaisesRegex(RuntimeError, r"guard has no key \['draft_kv'\]"):
             self._bind(names, runtime=unknown_key)

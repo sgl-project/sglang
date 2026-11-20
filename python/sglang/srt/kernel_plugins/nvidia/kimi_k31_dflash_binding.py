@@ -6,7 +6,7 @@ that class three whole phases (``DFlashRuntime``) and keeps everything else.
 
 The class declares two things, each checked against a table here:
 
-* ``exports``, the worker state it reads, from ``EXPORTS``. It reads them on demand
+* ``bindings``, the worker state it reads, from ``BINDINGS``. It reads them on demand
   through ``DFlashBinding.pull``.
 * ``guards``, the value it expects for each setup key it depends on, from ``GUARDS``.
   ``DFlashGuard.unmet`` reads the actual values on every TP rank.
@@ -61,7 +61,7 @@ logger = logging.getLogger(__name__)
 class DFlashRuntime(Protocol):
     """The class a megakernel build names; the worker calls the three phases."""
 
-    exports: ClassVar[frozenset[str]]
+    bindings: ClassVar[frozenset[str]]
     guards: ClassVar[Mapping[str, Any]]
 
     def __init__(self, binding: DFlashBinding, built: Any) -> None:
@@ -84,61 +84,65 @@ class DFlashRuntime(Protocol):
 # ---- Binding: the worker state a runtime may read.
 
 
-class Export(msgspec.Struct, frozen=True):
-    member: str  # the DFlashWorkerV2 attribute or method
+class WorkerMember(msgspec.Struct, frozen=True):
+    attr: str  # the DFlashWorkerV2 attribute or method
     type: Any  # what pull checks the value against
 
 
-EXPORTS: dict[str, Export] = {
+BINDINGS: dict[str, WorkerMember] = {
     # set in __init__
-    "block_size": Export("block_size", int),
-    "device": Export("device", (str, torch.device)),  # "cuda": the server arg
-    "mask_token_id": Export("_mask_token_id", int),
-    "noise_embed_scale": Export("_noise_embed_scale", float),
-    "batched_small_copy": Export("_batched_small_copy", bool),
-    "draft_model": Export("draft_model", torch.nn.Module),
-    "draft_model_runner": Export("draft_model_runner", object),
-    "draft_parallel_layout": Export("draft_parallel_layout", object),
-    "draft_block_spec_info": Export("_draft_block_spec_info", object),
-    "target_worker": Export("target_worker", object),
-    "target_logits_processor": Export(
+    "block_size": WorkerMember("block_size", int),
+    "device": WorkerMember("device", (str, torch.device)),  # "cuda": the server arg
+    "mask_token_id": WorkerMember("_mask_token_id", int),
+    "noise_embed_scale": WorkerMember("_noise_embed_scale", float),
+    "batched_small_copy": WorkerMember("_batched_small_copy", bool),
+    "draft_model": WorkerMember("draft_model", torch.nn.Module),
+    "draft_model_runner": WorkerMember("draft_model_runner", object),
+    "draft_parallel_layout": WorkerMember("draft_parallel_layout", object),
+    "draft_block_spec_info": WorkerMember("_draft_block_spec_info", object),
+    "target_worker": WorkerMember("target_worker", object),
+    "target_logits_processor": WorkerMember(
         "_target_logits_processor", (LogitsProcessor, type(None))
     ),
-    "sim_acc_rng": Export("_simulated_acc_len_rng", (torch.Generator, type(None))),
+    "sim_acc_rng": WorkerMember(
+        "_simulated_acc_len_rng", (torch.Generator, type(None))
+    ),
     # set by init_attention_backends
-    "need_mamba_verify_commit": Export("_need_mamba_verify_commit", bool),
+    "need_mamba_verify_commit": WorkerMember("_need_mamba_verify_commit", bool),
     # the stock round's helpers
-    "compute_compact_draft_seq_lens": Export(
+    "compute_compact_draft_seq_lens": WorkerMember(
         "_compute_compact_draft_seq_lens", Callable
     ),
-    "fill_compact_seq_lens_cpu_bound": Export(
+    "fill_compact_seq_lens_cpu_bound": WorkerMember(
         "_fill_compact_seq_lens_cpu_bound", Callable
     ),
-    "rebuild_compact_draft_cache": Export("_rebuild_compact_draft_cache", Callable),
-    "accept_block": Export("_accept_block", Callable),
+    "rebuild_compact_draft_cache": WorkerMember(
+        "_rebuild_compact_draft_cache", Callable
+    ),
+    "accept_block": WorkerMember("_accept_block", Callable),
 }
 
 
 class DFlashBinding:
-    """A runtime's view of its worker: the exports it declared, read by name."""
+    """A runtime's view of its worker: the bindings it declared, read by name."""
 
     __slots__ = ("_worker", "_names")
 
     def __init__(self, worker: DFlashWorkerV2, names: frozenset[str]) -> None:
-        if unknown := sorted(names - EXPORTS.keys()):
-            raise RuntimeError(f"{FLAG}: the DFLASH binding has no export {unknown}")
+        if unknown := sorted(names - BINDINGS.keys()):
+            raise RuntimeError(f"{FLAG}: the DFLASH binding has no name {unknown}")
         self._worker = worker
         self._names = names
 
     def pull(self, name: str) -> Any:
         if name not in self._names:
             raise KeyError(f"the DFLASH runtime pulls {name!r} without declaring it")
-        export = EXPORTS[name]
+        member = BINDINGS[name]
         # Not through the worker's __getattr__, which falls back to the target worker.
-        value = object.__getattribute__(self._worker, export.member)
-        if not isinstance(value, export.type):
+        value = object.__getattribute__(self._worker, member.attr)
+        if not isinstance(value, member.type):
             raise TypeError(
-                f"DFLASH export {name!r} is {type(value).__name__}, not {export.type}"
+                f"DFLASH binding {name!r} is {type(value).__name__}, not {member.type}"
             )
         return value
 
@@ -235,7 +239,7 @@ def bind_dflash_runtime(
         return None
 
     runtime_cls = pkgutil.resolve_name(path)
-    binding = DFlashBinding(worker, frozenset(runtime_cls.exports))
+    binding = DFlashBinding(worker, frozenset(runtime_cls.bindings))
     unmet = DFlashGuard(runtime_cls.guards).unmet(worker)
     if unmet:
         if tp0:
