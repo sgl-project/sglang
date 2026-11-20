@@ -4,9 +4,9 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.speculative.bench_drafter import bench_drafter_temperature
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftParams,
-    bench_drafter_temperature,
     resolve_draft_params,
 )
 from sglang.srt.speculative.dspark_components.dspark_worker_v2 import DSparkWorkerV2

@@ -29,6 +29,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.sampling.watermarking.interface import VerifyWatermark
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+from sglang.srt.speculative.bench_drafter import bench_drafter_temperature
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dp_spec_prefill_coordination import (
     DPSpecPrefillCoordinationPlan,
@@ -54,7 +55,6 @@ from sglang.srt.speculative.dspark_components.dspark_deferred_draft_kv import (
 )
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftBlockProposer,
-    bench_drafter_temperature,
     make_next_draft_input,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (

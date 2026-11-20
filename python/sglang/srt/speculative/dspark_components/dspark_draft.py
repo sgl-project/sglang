@@ -3,7 +3,6 @@ from __future__ import annotations
 import bisect
 import functools
 import logging
-import math
 from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import msgspec
@@ -22,6 +21,10 @@ from sglang.srt.model_executor.forward_batch_info import (
     enable_num_token_non_padded,
 )
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
+from sglang.srt.speculative.bench_drafter import (
+    bench_drafter_temperature,
+    require_greedy_requests,
+)
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.draft_parallel import resolve_draft_parallel_layout
 from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
@@ -133,18 +136,6 @@ def _zero(device: torch.device) -> torch.Tensor:
     return torch.zeros((), dtype=torch.float32, device=device)
 
 
-@functools.cache
-def bench_drafter_temperature() -> float:
-    """SGLANG_BENCH_DRAFTER_TEMPERATURE, validated once per process; 0.0 when unset."""
-    value = float(envs.SGLANG_BENCH_DRAFTER_TEMPERATURE.get())
-    if not math.isfinite(value) or value < 0.0:
-        raise ValueError(
-            "SGLANG_BENCH_DRAFTER_TEMPERATURE must be a finite non-negative float "
-            f"(0 disables it), got {value!r}."
-        )
-    return value
-
-
 def resolve_draft_params(
     *,
     sampling_info,
@@ -179,13 +170,8 @@ def resolve_draft_params(
     if bench_temperature > 0.0:
         # Benchmark mode: only the draft step temperature changes. temperatures and
         # greedy_mask, which the verify reads, stay as resolved, so the target still
-        # verifies greedily; a sampled request would be accepted against step logits
-        # drawn at a temperature it did not ask for, hence greedy only.
-        if sampling_info is not None and not sampling_info.is_all_greedy:
-            raise ValueError(
-                "SGLANG_BENCH_DRAFTER_TEMPERATURE requires greedy requests "
-                "(temperature 0 / top_k 1)."
-            )
+        # verifies greedily.
+        require_greedy_requests(sampling_info)
         step_temperatures.fill_(bench_temperature)
     return DraftParams(temperatures, greedy_mask, step_temperatures)
 

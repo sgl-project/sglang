@@ -85,6 +85,17 @@ from sglang.srt.runtime_context import (
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, HiCacheDraftPlan
+from sglang.srt.speculative.bench_drafter import (
+    EAGER_STEP_OFFSET as BENCH_EAGER_STEP_OFFSET,
+)
+from sglang.srt.speculative.bench_drafter import ENV_NAME as BENCH_DRAFTER_ENV
+from sglang.srt.speculative.bench_drafter import (
+    bench_drafter_enabled,
+    bench_drafter_temperature,
+    gumbel_draft_scores,
+    override_draft_sampling,
+    require_greedy_requests,
+)
 from sglang.srt.speculative.dflash_dp import gather_draft_embedding
 from sglang.srt.speculative.dflash_draft_l2_prefetch import (
     DraftL2Prefetch,
@@ -231,16 +242,21 @@ class _DflashDraftSampler:
         max_tokens = int(max_bs) * (self.block_size - 1)
         device = weight.device
         self.out = torch.empty((max_tokens,), dtype=torch.int64, device=device)
+        # SGLANG_BENCH_DRAFTER_TEMPERATURE: Gumbel-max sampling replaces the argmax;
+        # the in-graph step counter advances the noise on every replay.
+        self.bench_sampling = bench_drafter_enabled()
+        self.noise_step = torch.zeros((), dtype=torch.int64, device=device)
+        score_dtype = torch.float32 if self.bench_sampling else weight.dtype
         if self.tp_size > 1:
             # Static buffers (fixed addresses) keep the in-graph select replay-safe.
             self.local_max = torch.empty(
-                (max_tokens,), dtype=weight.dtype, device=device
+                (max_tokens,), dtype=score_dtype, device=device
             )
             self.local_arg = torch.empty(
                 (max_tokens,), dtype=torch.int64, device=device
             )
             self.gathered_max = torch.empty(
-                (self.tp_size * max_tokens,), dtype=weight.dtype, device=device
+                (self.tp_size * max_tokens,), dtype=score_dtype, device=device
             )
             self.gathered_ids = torch.empty(
                 (self.tp_size * max_tokens,), dtype=torch.int64, device=device
@@ -262,6 +278,14 @@ class _DflashDraftSampler:
             hs = hs.to(self.weight.dtype)
         n = hs.shape[0]
         logits = torch.matmul(hs, self.weight[: self.num_org].T)
+        if self.bench_sampling:
+            logits = gumbel_draft_scores(
+                logits,
+                col_start=self.org_vocab_start,
+                row_start=0,
+                step=self.noise_step,
+            )
+            self.noise_step.add_(1)
         if self.tp_size == 1:
             tokens = torch.argmax(logits, dim=-1).to(torch.long)
             if self.org_vocab_start:
@@ -423,17 +447,20 @@ class _SelectorDraftSampler:
         if sampling_info is None or not self.sampling_enabled:
             self.temperatures[:bs].fill_(1.0)
             self.greedy_mask[:bs].fill_(True)
-            return
-        torch.clamp(
-            sampling_info.temperatures.view(-1)[:bs].to(torch.float32),
-            min=1e-5,
-            out=self.temperatures[:bs],
-        )
-        self.greedy_mask[:bs].copy_(
-            resolve_greedy_mask(
-                bs=bs, sampling_info=sampling_info, device=self.greedy_mask.device
+        else:
+            torch.clamp(
+                sampling_info.temperatures.view(-1)[:bs].to(torch.float32),
+                min=1e-5,
+                out=self.temperatures[:bs],
             )
-        )
+            self.greedy_mask[:bs].copy_(
+                resolve_greedy_mask(
+                    bs=bs, sampling_info=sampling_info, device=self.greedy_mask.device
+                )
+            )
+        if bench_drafter_enabled():
+            require_greedy_requests(sampling_info)
+            override_draft_sampling(self.temperatures[:bs], self.greedy_mask[:bs])
 
     def __call__(self, hidden_states, input_ids):
         bs = hidden_states.shape[0] // self.block_size
@@ -477,6 +504,20 @@ class _MegakernelSelectorDraftSampler:
 
     def stage_sampling_params(self, *, bs: int, sampling_info) -> None:
         if not self.sampling_enabled:
+            return
+        if bench_drafter_enabled():
+            require_greedy_requests(sampling_info)
+            device = self.q_out.device
+            self._head.stage_draft_head_sampling(
+                temperatures=torch.full(
+                    (bs,),
+                    bench_drafter_temperature(),
+                    dtype=torch.float32,
+                    device=device,
+                ),
+                greedy_mask=torch.zeros((bs,), dtype=torch.bool, device=device),
+            )
+            self._staged_greedy = False
             return
         if _is_all_greedy(sampling_info):
             if not self._staged_greedy:
@@ -634,6 +675,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         # spec broadcasts must stay within the attn-TP group.
         self._tp_sync = SpecTpSync(get_dp_tp_group())
         check_simulate_acc_token_mode()
+        # SGLANG_BENCH_DRAFTER_TEMPERATURE commits the sampled drafts: the default
+        # 'fixed' mode would commit one fixed token id however the drafts are drawn.
+        self._sim_acc_token_mode = (
+            "real-draft-token" if bench_drafter_enabled() else SIMULATE_ACC_TOKEN_MODE
+        )
         # The forced lengths overwrite accept_len after its broadcast, so every rank
         # draws them from the same server-seeded stream.
         self._simulated_acc_len_rng = (
@@ -833,6 +879,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_greedy_local_max_buf: Optional[torch.Tensor] = None
         self._draft_greedy_local_arg_buf: Optional[torch.Tensor] = None
         self._draft_greedy_local_cap: int = 0
+        # SGLANG_BENCH_DRAFTER_TEMPERATURE noise counter for the eager argmax heads.
+        self._bench_eager_noise_step: int = 0
         self._draft_greedy_best_rank_buf: Optional[torch.Tensor] = None
         self._draft_greedy_rank_index_buf: Optional[torch.Tensor] = None
         self._draft_greedy_selected_ids_buf: Optional[torch.Tensor] = None
@@ -919,6 +967,48 @@ class DFlashWorkerV2(BaseSpecWorker):
         if self._aux_overlap:
             logger.info("DFLASH aux graph runs on a side stream beside the draft prep")
         self._init_verify_planner()
+        self._check_bench_drafter_temperature()
+
+    def _check_bench_drafter_temperature(self) -> None:
+        """Refuse SGLANG_BENCH_DRAFTER_TEMPERATURE outside the fixed-work benchmark."""
+        temperature = bench_drafter_temperature()
+        if temperature <= 0.0:
+            return
+        name = BENCH_DRAFTER_ENV
+        if SIMULATE_ACC_LEN <= 0:
+            raise ValueError(
+                f"{name} requires SGLANG_SIMULATE_ACC_LEN > 0: real acceptance would "
+                "reject the drafts it samples."
+            )
+        if SIMULATE_ACC_TOKEN_MODE != "real-draft-token" and self._target_tp_rank == 0:
+            logger.warning(
+                "%s overrides SGLANG_SIMULATE_ACC_TOKEN_MODE=%s: simulated acceptance "
+                "commits the sampled drafts (real-draft-token), not a fixed token id.",
+                name,
+                SIMULATE_ACC_TOKEN_MODE,
+            )
+        if self._is_domino:
+            raise ValueError(
+                f"{name} does not support Domino drafts (a sequential argmax rollout)."
+            )
+        if self.selector is not None and not self._selector_sampling_enabled:
+            raise ValueError(
+                f"{name} needs selector sampling, which this backend does not support."
+            )
+        if self.lilicorr is not None and not self._lilicorr_sampling_enabled:
+            raise ValueError(
+                f"{name} with LiLiCorr requires SGLANG_ENABLE_LILICORR_SAMPLING=1, so "
+                "the draft graph captures its sampled walk."
+            )
+        if self._verify_planner is not None or self._acceptance_estimator is not None:
+            raise ValueError(f"{name} requires SGLANG_RAGGED_VERIFY_MODE=static.")
+        if self._target_tp_rank == 0:
+            logger.warning(
+                "BENCHMARK: DFLASH drafts sample at temperature %s; acceptance is "
+                "simulated (SGLANG_SIMULATE_ACC_LEN=%s, real-draft-token mode).",
+                temperature,
+                SIMULATE_ACC_LEN,
+            )
 
     def _init_verify_planner(self) -> None:
         """Confidence-scheduled verify (SGLANG_RAGGED_VERIFY_MODE cap-accept or
@@ -1408,6 +1498,14 @@ class DFlashWorkerV2(BaseSpecWorker):
         if head is None or not graph_bs <= set(head.draft_head_requests):
             return None
         sampling = self._selector_sampling_enabled and head.draft_head_sampling
+        if bench_drafter_enabled() and not sampling:
+            if self._target_tp_rank == 0:
+                logger.warning(
+                    "DFLASH megakernel head refused: %s needs sampled drafts, which "
+                    "this head does not support; using the selector draft graph.",
+                    BENCH_DRAFTER_ENV,
+                )
+            return None
         if not sampling and not self._default_sampling_is_greedy():
             if self._target_tp_rank == 0:
                 logger.warning(
@@ -2160,6 +2258,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             if not self._selector_sampling_enabled
             else resolve_greedy_mask(bs=bs, sampling_info=sampling_info, device=device)
         )
+        if bench_drafter_enabled():
+            require_greedy_requests(sampling_info)
+            override_draft_sampling(temperatures, greedy_mask)
         tokens, q_rows = self.selector.sample_path(
             candidate_ids=candidate_ids,
             scores=scores,
@@ -2224,6 +2325,18 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_probs.scatter_(-1, candidate_ids, 0.0)
         return accept_len.to(torch.int32), bonus.to(torch.int64), cap_trim_lens
 
+    def _bench_draft_scores(self, logits, *, col_start: int, row_start: int):
+        """SGLANG_BENCH_DRAFTER_TEMPERATURE on the eager argmax heads: Gumbel-max
+        scores at the benchmark temperature; ``logits`` unchanged when it is off."""
+        if not bench_drafter_enabled():
+            return logits
+        return gumbel_draft_scores(
+            logits,
+            col_start=col_start,
+            row_start=row_start,
+            step=self._bench_eager_noise_step + BENCH_EAGER_STEP_OFFSET,
+        )
+
     def _greedy_sample_from_quantized_head(
         self,
         *,
@@ -2257,6 +2370,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             logits = lm_head.quant_method.apply(lm_head, hidden_states[start:end], None)
             if num_org is not None and logits.shape[-1] > num_org:
                 logits = logits[:, :num_org]
+            logits = self._bench_draft_scores(logits, col_start=0, row_start=start)
             out_tokens[start:end] = torch.argmax(logits, dim=-1).to(torch.long)
         return out_tokens
 
@@ -2276,7 +2390,21 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         if hidden_states.numel() == 0:
             return torch.empty((0,), dtype=torch.long, device=hidden_states.device)
+        try:
+            return self._sample_from_vocab_parallel_head(
+                hidden_states=hidden_states, lm_head=lm_head, chunk_size=chunk_size
+            )
+        finally:
+            # One noise step per draft call, shared by every rank and chunk.
+            self._bench_eager_noise_step += 1
 
+    def _sample_from_vocab_parallel_head(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        lm_head,
+        chunk_size: int,
+    ) -> torch.Tensor:
         if not is_dense_head_weight(getattr(lm_head, "weight", None)):
             return self._greedy_sample_from_quantized_head(
                 hidden_states=hidden_states, lm_head=lm_head, chunk_size=chunk_size
@@ -2296,7 +2424,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             for start in range(0, num_tokens, int(chunk_size)):
                 end = min(num_tokens, start + int(chunk_size))
                 hs = _cast_hs(hidden_states[start:end])
-                logits = torch.matmul(hs, weight.T)
+                logits = self._bench_draft_scores(
+                    torch.matmul(hs, weight.T), col_start=0, row_start=start
+                )
                 out_tokens[start:end] = torch.argmax(logits, dim=-1).to(torch.long)
             return out_tokens
 
@@ -2351,7 +2481,11 @@ class DFlashWorkerV2(BaseSpecWorker):
                 end = min(num_tokens, start + fast_chunk_size)
                 hs = _cast_hs(hidden_states[start:end])
                 if num_org > 0:
-                    base_logits = torch.matmul(hs, weight[:num_org].T)
+                    base_logits = self._bench_draft_scores(
+                        torch.matmul(hs, weight[:num_org].T),
+                        col_start=org_vocab_start,
+                        row_start=start,
+                    )
                     local_max, local_arg = _ensure_local_reduce_buffers(
                         end - start, base_logits.dtype, hs.device
                     )
@@ -2368,8 +2502,13 @@ class DFlashWorkerV2(BaseSpecWorker):
             chunk_len = int(hs.shape[0])
 
             # Base vocab logits.
+            score_dtype = torch.float32 if bench_drafter_enabled() else weight_dtype
             if num_org > 0:
-                base_logits = torch.matmul(hs, weight[:num_org].T)
+                base_logits = self._bench_draft_scores(
+                    torch.matmul(hs, weight[:num_org].T),
+                    col_start=org_vocab_start,
+                    row_start=start,
+                )
                 local_max, local_arg = _ensure_local_reduce_buffers(
                     chunk_len, base_logits.dtype, hs.device
                 )
@@ -2377,8 +2516,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             else:
                 local_max = torch.full(
                     (chunk_len,),
-                    torch.finfo(weight_dtype).min,
-                    dtype=weight_dtype,
+                    torch.finfo(score_dtype).min,
+                    dtype=score_dtype,
                     device=hs.device,
                 )
                 local_arg = torch.zeros(
@@ -2389,8 +2528,10 @@ class DFlashWorkerV2(BaseSpecWorker):
             if num_added > 0:
                 added_slice_start = num_org_padded
                 added_slice_end = num_org_padded + num_added
-                added_logits = torch.matmul(
-                    hs, weight[added_slice_start:added_slice_end].T
+                added_logits = self._bench_draft_scores(
+                    torch.matmul(hs, weight[added_slice_start:added_slice_end].T),
+                    col_start=added_vocab_start,
+                    row_start=start,
                 )
                 added_max, added_arg = torch.max(added_logits, dim=-1)
                 use_added = added_max > local_max
@@ -3121,7 +3262,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         if accept is None or self._plain_deferral_refused("megakernel accept"):
             return None
         accept.attach_draft_accept(
-            sim_real_token=SIMULATE_ACC_TOKEN_MODE == "real-draft-token"
+            sim_real_token=self._sim_acc_token_mode == "real-draft-token"
         )
         self._arm_plain_deferral("megakernel accept")
         if self._target_tp_rank == 0:
@@ -3652,7 +3793,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 out_tokens=out_tokens,
                 simulate_acc_len=SIMULATE_ACC_LEN,
                 simulate_acc_method=SIMULATE_ACC_METHOD,
-                simulate_acc_token_mode=SIMULATE_ACC_TOKEN_MODE,
+                simulate_acc_token_mode=self._sim_acc_token_mode,
                 next_token_logits=next_token_logits,
                 generator=self._simulated_acc_len_rng,
                 prefix_lens=prefix_lens,

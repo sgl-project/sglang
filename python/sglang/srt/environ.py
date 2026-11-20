@@ -564,12 +564,13 @@ class Envs:
     # DSpark opt-in: with SGLANG_SIMULATE_ACC_LEN set, temperature-only sampling requests
     # run the greedy draft/accept path and only the bonus token is temperature-sampled.
     SGLANG_SIMULATE_ACC_GREEDY = EnvBool(False)
-    # Benchmark mode, with SGLANG_SIMULATE_ACC_LEN set: a positive value makes every
-    # DSpark draft row sample at this fixed temperature (e.g. 1000, near uniform), so
-    # forced acceptance commits random drafts instead of a greedy draft's short loops.
-    # Only the draft step temperature changes; requests must be greedy and the target
-    # still verifies greedily. Overrides SGLANG_DSPARK_USE_GREEDY_DRAFT. 0 (default)
-    # disables it.
+    # Benchmark mode, with SGLANG_SIMULATE_ACC_LEN set: a positive value makes DSpark
+    # and DFLASH-family drafters sample every draft row at this fixed temperature (e.g.
+    # 1000, near uniform), so forced acceptance commits diverse random drafts instead of
+    # a greedy draft's short loops (or DFLASH's fixed token id). Only the draft changes:
+    # requests must be greedy and the target still verifies greedily. Overrides
+    # SGLANG_DSPARK_USE_GREEDY_DRAFT and, for DFLASH, SGLANG_SIMULATE_ACC_TOKEN_MODE
+    # (real-draft-token). Other speculative algorithms refuse it. 0 (default) disables it.
     SGLANG_BENCH_DRAFTER_TEMPERATURE = EnvFloat(0.0)
     # DSpark opt-in: apply the simulated correct_len / bonus inside the folded verify epilogue
     # (CUDA/HIP graph) instead of falling back to the eager accept + commit path.
