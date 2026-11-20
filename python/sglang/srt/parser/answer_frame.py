@@ -30,10 +30,16 @@ class AnswerFrame:
         raise NotImplementedError()
 
     def structural_tag(
-        self, content: dict, *, in_answer_block: bool, max_think_tokens: int
+        self,
+        content: dict,
+        *,
+        in_answer_block: bool,
+        max_think_tokens: int,
+        allows_tools: bool = False,
     ) -> dict:
         """XGrammar structural tag framing ``content``; ``max_think_tokens < 0``
-        leaves thinking unbounded."""
+        leaves thinking unbounded. With ``allows_tools`` the turn may end in tool
+        calls instead of the answer."""
         raise NotImplementedError()
 
     def owns_turn(self, structural_tag: str) -> bool:
@@ -84,7 +90,12 @@ class InklingAnswerFrame(AnswerFrame):
         ]
 
     def structural_tag(
-        self, content: dict, *, in_answer_block: bool, max_think_tokens: int
+        self,
+        content: dict,
+        *,
+        in_answer_block: bool,
+        max_think_tokens: int,
+        allows_tools: bool = False,
     ) -> dict:
         elements = [content, _token(END_MESSAGE)]
         if in_answer_block:
@@ -121,3 +132,152 @@ class InklingAnswerFrame(AnswerFrame):
     def owns_turn(self, structural_tag: str) -> bool:
         # Only the canonical auto-tool schema owns the full turn; user restrictions may not.
         return json.loads(structural_tag) == _canonical_inkling_auto_tool_schema()
+
+
+# Muse Glimmer / Muse Spark Open (shared tokenizer). The generation prompt ends at
+# "<|start|>assistant"; the model writes " to=<recipient><|message|>" itself.
+_MUSE_EOS, _MUSE_EOM, _MUSE_EOT, _MUSE_START, _MUSE_MESSAGE = (
+    200001,
+    200007,
+    200008,
+    200022,
+    200023,
+)
+# <|start|>assistant to=user<|message|>
+_MUSE_OPEN_ANSWER = [_MUSE_START, 140680, 328, 76976, _MUSE_MESSAGE]
+
+
+def _muse_const(value: str) -> dict:
+    return {"type": "const_string", "value": value}
+
+
+def _muse_token(token_id: int) -> dict:
+    return {"type": "token", "token": token_id}
+
+
+# Recipients the frame handles itself; any other recipient is a tool.
+_MUSE_ROLES = ("user", "self", "commentary")
+
+
+def _muse_tool_recipient_ebnf() -> str:
+    """`` to=<name>``: any recipient except a role, so a turn may end in tool
+    calls but never reach the ``to=user`` answer unconstrained."""
+    alts = []
+
+    def walk(prefix: str) -> None:
+        nexts = sorted(
+            {
+                w[len(prefix)]
+                for w in _MUSE_ROLES
+                if w.startswith(prefix) and w != prefix
+            }
+        )
+        literal = json.dumps(prefix) + " " if prefix else ""
+        alts.append(f"{literal}[^{''.join(nexts)} \\t\\n\\r<] rest")
+        if prefix and prefix not in _MUSE_ROLES:
+            alts.append(json.dumps(prefix))
+        for c in nexts:
+            walk(prefix + c)
+
+    walk("")
+    return (
+        f'root ::= " to=" name\nname ::= {" | ".join(alts)}\nrest ::= [^ \\t\\n\\r<]*\n'
+    )
+
+
+class MuseAnswerFrame(AnswerFrame):
+    """Any number of ``to=self`` (reasoning) and ``to=commentary`` (visible
+    preamble) messages, then the ``to=user`` answer holding the constrained
+    content or, when the request offers tools, tool calls; <|eot|> is a stop
+    token and closes the turn."""
+
+    framed_key_types = ("json", "regex", "ebnf")
+
+    def framing_token_ids(self) -> List[int]:
+        return [_MUSE_START, _MUSE_MESSAGE, _MUSE_EOM, _MUSE_EOT, _MUSE_EOS]
+
+    def ends_in_open_answer_block(self, input_ids: Sequence[int]) -> bool:
+        return list(input_ids[-len(_MUSE_OPEN_ANSWER) :]) == _MUSE_OPEN_ANSWER
+
+    def structural_tag(
+        self,
+        content: dict,
+        *,
+        in_answer_block: bool,
+        max_think_tokens: int,
+        allows_tools: bool = False,
+    ) -> dict:
+        if in_answer_block:
+            elements = [content]
+        else:
+            body = {
+                "type": "any_tokens",
+                "exclude_tokens": [_MUSE_START, _MUSE_MESSAGE, _MUSE_EOM, _MUSE_EOT],
+            }
+            if max_think_tokens >= 0:
+                body["max_tokens"] = max_think_tokens
+            private = {
+                "type": "or",
+                "elements": [_muse_const(" to=self"), _muse_const(" to=commentary")],
+            }
+            tool = {"type": "grammar", "grammar": _muse_tool_recipient_ebnf()}
+            tool_body = {
+                "type": "any_tokens",
+                "exclude_tokens": [_MUSE_START, _MUSE_MESSAGE, _MUSE_EOM, _MUSE_EOT],
+            }
+
+            def message(recipient: dict, message_body: dict) -> list:
+                return [recipient, _muse_token(_MUSE_MESSAGE), message_body]
+
+            next_message = [
+                _muse_token(_MUSE_EOM),
+                _muse_token(_MUSE_START),
+                _muse_const("assistant"),
+            ]
+            answer = {
+                "type": "sequence",
+                "elements": [
+                    _muse_const(" to=user"),
+                    _muse_token(_MUSE_MESSAGE),
+                    content,
+                ],
+            }
+            # A turn that calls tools ends in tool calls, with reasoning or
+            # commentary allowed between them; only the answer is constrained.
+            tool_calls = {
+                "type": "sequence",
+                "elements": [
+                    *message(tool, tool_body),
+                    {
+                        "type": "star",
+                        "content": {
+                            "type": "sequence",
+                            "elements": [
+                                *next_message,
+                                {"type": "or", "elements": [tool, private]},
+                                _muse_token(_MUSE_MESSAGE),
+                                tool_body,
+                            ],
+                        },
+                    },
+                ],
+            }
+            elements = [
+                {
+                    "type": "star",
+                    "content": {
+                        "type": "sequence",
+                        "elements": [*message(private, body), *next_message],
+                    },
+                },
+                {"type": "or", "elements": [answer, tool_calls]}
+                if allows_tools
+                else answer,
+            ]
+        return {
+            "type": "structural_tag",
+            "format": {"type": "sequence", "elements": elements},
+        }
+
+    def owns_turn(self, structural_tag: str) -> bool:
+        return False

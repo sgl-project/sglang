@@ -761,6 +761,12 @@ class OpenAIServingResponses(OpenAIServingChat):
             stop=request.stop,
             reasoning_effort=(request.reasoning.effort if request.reasoning else None),
             chat_template_kwargs=request.chat_template_kwargs,
+            # Rendering only: templates that state the requested format read it.
+            response_format=(
+                rf.model_dump(by_alias=True, exclude_none=True)
+                if (rf := request.chat_response_format()) is not None
+                else None
+            ),
         )
         chat_request._template_tools = self._response_tools_to_template_tools(request)
 

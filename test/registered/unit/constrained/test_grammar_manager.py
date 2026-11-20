@@ -246,7 +246,10 @@ class TestProcessReqWithGrammar(unittest.TestCase):
         mgr.process_req_with_grammar(req)
 
         mgr.grammar_backend.get_request_grammar_key.assert_called_once_with(
-            ("regex", "[a-z]+"), input_ids=[1, 2, 3], thinking_budget=3
+            ("regex", "[a-z]+"),
+            input_ids=[1, 2, 3],
+            thinking_budget=3,
+            allows_tools=False,
         )
         mgr.grammar_backend.get_cached_or_future_value.assert_called_once_with(
             ("regex:variant", "[a-z]+"), False

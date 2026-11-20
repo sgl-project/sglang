@@ -31,7 +31,11 @@ from sglang.srt.function_call.muse_glimmer_format import (
     has_atem_markers,
     partial_marker_len,
 )
-from sglang.srt.parser.answer_frame import AnswerFrame, InklingAnswerFrame
+from sglang.srt.parser.answer_frame import (
+    AnswerFrame,
+    InklingAnswerFrame,
+    MuseAnswerFrame,
+)
 from sglang.srt.parser.beam import BeamReasoningDetector
 from sglang.srt.parser.harmony_parser import HarmonyParser
 from sglang.srt.parser.inkling_tokenizer import (
@@ -2169,6 +2173,9 @@ class MuseGlimmerDetector(BaseReasoningFormatDetector):
     terminator and the partial body is still attributed to whichever channel was open.
     """
 
+    def get_answer_frame(self) -> Optional[AnswerFrame]:
+        return MuseAnswerFrame()
+
     def __init__(
         self,
         stream_reasoning: bool = True,
@@ -2177,6 +2184,7 @@ class MuseGlimmerDetector(BaseReasoningFormatDetector):
         previous_content: str = "",
         force_nonempty_content: bool = False,
         tool_call_parser_active: bool = False,
+        commentary_is_reasoning: bool = False,
     ):
         super().__init__(
             " to=self" + MESSAGE,
@@ -2193,9 +2201,14 @@ class MuseGlimmerDetector(BaseReasoningFormatDetector):
         self._pending_reasoning = ""
         self._tool_call_parser_active = tool_call_parser_active
         self._saw_reasoning_block = False
+        # With constrained output the visible content is the constrained answer
+        # alone, so `to=commentary` updates are returned as reasoning instead.
+        self._reasoning_recipients = (
+            ("self", "commentary") if commentary_is_reasoning else ("self",)
+        )
 
     def _sink(self, recipient: Optional[str]) -> str:
-        return "reasoning" if recipient == "self" else "normal"
+        return "reasoning" if recipient in self._reasoning_recipients else "normal"
 
     def _consume(self, flush: bool, preserve_channels: bool = False) -> Tuple[str, str]:
         """Drain self._buffer into (reasoning, normal).
@@ -2483,6 +2496,23 @@ class ReasoningParser:
             sig = inspect.signature(detector_class)
             if "tool_call_parser_active" in sig.parameters:
                 kwargs["tool_call_parser_active"] = True
+        if (
+            isinstance(request, ChatCompletionRequest)
+            and (
+                request.regex is not None
+                or request.ebnf is not None
+                or (
+                    request.response_format is not None
+                    and request.response_format.type in ("json_schema", "json_object")
+                )
+            )
+        ) or (
+            isinstance(request, ResponsesRequest)
+            and request.has_json_schema_constraint()
+        ):
+            sig = inspect.signature(detector_class)
+            if "commentary_is_reasoning" in sig.parameters:
+                kwargs["commentary_is_reasoning"] = True
 
         if prefix is None:
             prefix = getattr(request, "_response_parser_prefix", "")

@@ -22,6 +22,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
 )
 from sglang.srt.runtime_context import get_parallel, get_serving
 from sglang.srt.sampling.sampling_params import (
+    get_request_answer_allows_tools,
     get_request_reasoning_end_token_ids,
     get_request_reasoning_in_grammar,
 )
@@ -184,6 +185,9 @@ class GrammarManager:
                     key,
                     input_ids=req.origin_input_ids,
                     thinking_budget=self._get_request_thinking_budget(req),
+                    allows_tools=get_request_answer_allows_tools(
+                        req.sampling_params.custom_params
+                    ),
                 )
 
                 value, cache_hit = self.grammar_backend.get_cached_or_future_value(
