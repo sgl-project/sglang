@@ -1284,9 +1284,6 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         self._release_warmup_pool_before_serving = False
         if current_platform.is_cpu() or current_platform.is_mps():
             return
-        from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a import (
-            IPC_A2A,
-        )
         from sglang.multimodal_gen.runtime.layers.usp import drop_a2a_staging_buffers
 
         IPC_A2A.drop_staging()

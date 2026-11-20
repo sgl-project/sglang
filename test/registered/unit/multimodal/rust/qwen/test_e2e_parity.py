@@ -180,7 +180,7 @@ class TestQwenE2eParity(CustomTestCase):
 
 
 class TestQwenE2eParityPil(TestQwenE2eParity):
-    """The PIL backend (`--disable-fast-image-processor`): the same parity
+    """The PIL backend (`--image-processor-backend pil`): the same parity
     suite, plus the transport-invariance check — a property of the native path
     alone, so running it under one backend is enough."""
 

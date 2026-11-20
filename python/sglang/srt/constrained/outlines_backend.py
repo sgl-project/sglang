@@ -50,6 +50,16 @@ class OutlinesGrammar(BaseGrammarObject):
     def accept_token(self, token: int):
         self.state = self.guide.get_next_state(self.state, token)
 
+    def try_accept_tokens(self, tokens: list[int]) -> bool:
+        state = self.state
+        for token in tokens:
+            # RegexGuide reports a rejected token as the dead state -1, not an error.
+            state = self.guide.get_next_state(state, token)
+            if state == -1:
+                return False
+        self.state = state
+        return True
+
     def allocate_vocab_mask(
         self, vocab_size: int, batch_size: int, device
     ) -> torch.Tensor:
@@ -105,6 +115,16 @@ class OutlinesGrammarBackend(BaseGrammarBackend):
                 self.outlines_tokenizer.tokenizer.get_vocab()
             )
         self.whitespace_pattern = whitespace_pattern
+
+    @staticmethod
+    def set_token_filter(
+        vocab_mask, token_ids, batch_idx, is_allowed=True, reset_vocab_mask=True
+    ):
+        # True masks a token out in this backend's boolean mask.
+        row = vocab_mask[batch_idx]
+        if reset_vocab_mask:
+            row.fill_(is_allowed)
+        row[token_ids] = not is_allowed
 
     def _compile_regex(self, regex: str) -> BaseGrammarObject:
         try:
