@@ -220,7 +220,29 @@ class QwenImage21AttentionBlock(nn.Module):
         qkv = qkv.reshape(batch_size * time, 1, channels * 3, -1)
         qkv = qkv.permute(0, 1, 3, 2).contiguous()
         q, k, v = qkv.chunk(3, dim=-1)
-        x = F.scaled_dot_product_attention(q, k, v)
+
+        # Fix for ROCm non-determinism: when head_dim > 256, PyTorch's SDPA math
+        # backend is not run-to-run deterministic on ROCm 7.2.1 at certain sequence
+        # lengths (e.g., 4096 tokens for 1024x1024 images). Enable deterministic
+        # algorithms temporarily around this call to ensure reproducibility.
+        # See: https://github.com/sgl-project/sglang/issues/47801
+        needs_deterministic_fix = (
+            hasattr(torch.version, "hip")
+            and torch.version.hip is not None
+            and q.shape[-1] > 256
+        )
+
+        if needs_deterministic_fix:
+            prev_deterministic = torch.are_deterministic_algorithms_enabled()
+            prev_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+            torch.use_deterministic_algorithms(True, warn_only=True)
+            try:
+                x = F.scaled_dot_product_attention(q, k, v)
+            finally:
+                torch.use_deterministic_algorithms(prev_deterministic, warn_only=prev_warn_only)
+        else:
+            x = F.scaled_dot_product_attention(q, k, v)
+
         x = (
             x.squeeze(1)
             .permute(0, 2, 1)
