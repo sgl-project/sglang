@@ -77,6 +77,7 @@ class Cosmos3SamplingParams(SamplingParams):
     """
 
     _explicit_fields: ClassVar[set[str] | None] = None
+    _request_size_model_name = "Cosmos3"
 
     height: int | None = None
     width: int | None = None
@@ -499,15 +500,7 @@ class Cosmos3SamplingParams(SamplingParams):
             self.output_file_name = None
             self.output_compression = 0
 
-    def _adjust_visual_fields(self, server_args, pipeline_config) -> None:
-        super()._adjust_visual_fields(server_args, pipeline_config)
-        self._align_resolution(pipeline_config)
-
-    def prepare_synthetic_warmup_request_for_queue(self, req, server_args) -> None:
-        # Warmup overwrites the dimensions after _adjust has run.
-        self._align_resolution(server_args.pipeline_config)
-
-    def _align_resolution(self, pipeline_config) -> None:
+    def _request_size_multiple(self, pipeline_config) -> int | None:
         from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import (
             Cosmos3Config,
         )
@@ -515,24 +508,8 @@ class Cosmos3SamplingParams(SamplingParams):
         # The simulation pipelines (Dreams, multiview, sim-auto) subclass
         # Cosmos3Config and validate their own canvas.
         if type(pipeline_config) is not Cosmos3Config:
-            return
-        if self.width is None or self.height is None:
-            return
-        if self.width <= 0 or self.height <= 0:
-            return
-        m = COSMOS3_SIZE_MULTIPLE
-        requested_size = (self.width, self.height)
-        self.width = max(m, self.width // m * m)
-        self.height = max(m, self.height // m * m)
-        if (self.width, self.height) != requested_size:
-            logger.warning(
-                "Cosmos3 requires dimensions divisible by %s; adjusted requested "
-                "resolution from %sx%s to %sx%s",
-                m,
-                *requested_size,
-                self.width,
-                self.height,
-            )
+            return None
+        return COSMOS3_SIZE_MULTIPLE
 
     def _validate(self) -> None:
         super()._validate()

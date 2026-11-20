@@ -4,9 +4,6 @@ from dataclasses import dataclass, field
 from typing import ClassVar
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-
-logger = init_logger(__name__)
 
 # VAE downsampling (8) times the DiT patch size (2)
 _MOSS_IMAGE_SIZE_MULTIPLE = 16
@@ -25,6 +22,7 @@ def resolve_uncond_skip_layers(params: "MOSSImageSamplingParams") -> tuple[int, 
 
 @dataclass
 class MOSSImageSamplingParams(SamplingParams):
+    _request_size_model_name = "MOSS-Image"
     _default_height: ClassVar[int] = 1024
     _default_width: ClassVar[int] = 1024
     seed: int | list[int] = field(default=0, metadata={"batch_sig_exclude": True})
@@ -39,15 +37,7 @@ class MOSSImageSamplingParams(SamplingParams):
     slg_start: float = 0.01
     slg_stop: float = 1.0
 
-    def _adjust_visual_fields(self, server_args, pipeline_config) -> None:
-        super()._adjust_visual_fields(server_args, pipeline_config)
-        self._align_resolution(pipeline_config)
-
-    def prepare_synthetic_warmup_request_for_queue(self, req, server_args) -> None:
-        # Warmup overwrites the dimensions after _adjust has run.
-        self._align_resolution(server_args.pipeline_config)
-
-    def _align_resolution(self, pipeline_config) -> None:
+    def _request_size_multiple(self, pipeline_config) -> int | None:
         from sglang.multimodal_gen.configs.pipeline_configs.moss_image import (
             MOSSImagePipelineConfig,
         )
@@ -55,24 +45,11 @@ class MOSSImageSamplingParams(SamplingParams):
         # MOSSImageBeforeDenoisingStage rejects other sizes. The diffusers
         # backend keeps its own size handling.
         if not isinstance(pipeline_config, MOSSImagePipelineConfig):
-            return
+            return None
+        # Non-int sizes are left to request validation.
         if not isinstance(self.width, int) or not isinstance(self.height, int):
-            return
-        if self.width <= 0 or self.height <= 0:
-            return
-        m = _MOSS_IMAGE_SIZE_MULTIPLE
-        requested_size = (self.width, self.height)
-        self.width = max(m, self.width // m * m)
-        self.height = max(m, self.height // m * m)
-        if (self.width, self.height) != requested_size:
-            logger.warning(
-                "MOSS-Image requires dimensions divisible by %s; adjusted requested "
-                "resolution from %sx%s to %sx%s",
-                m,
-                *requested_size,
-                self.width,
-                self.height,
-            )
+            return None
+        return _MOSS_IMAGE_SIZE_MULTIPLE
 
     def should_use_classifier_free_guidance(self) -> bool:
         # The reference evaluates both branches even for guidance below one.
