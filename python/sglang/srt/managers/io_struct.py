@@ -2488,8 +2488,8 @@ class ChecksumInfo(msgspec.Struct, kw_only=True):
 class CheckWeightsReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str
-    # One ChecksumInfo per TP rank. The producer wraps the tp==1 result in a
-    # one-element list so the shape is always a list.
+    # One ChecksumInfo per rank that ran the request in the same step: the TP
+    # group, or the DP shard under local control broadcast. Always a list.
     payload: Optional[List[ChecksumInfo]] = None
 
 

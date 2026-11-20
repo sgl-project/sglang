@@ -117,6 +117,7 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
 )
 from sglang.srt.distributed import bootstrap
+from sglang.srt.distributed.communication_op import control_request_all_gather_object
 from sglang.srt.distributed.parallel_state import (
     abort_distributed_environment,
     close_custom_all_reduce,
@@ -331,6 +332,7 @@ from sglang.srt.managers.scheduler_components.request_receiver import (
 from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
 from sglang.srt.managers.scheduler_components.state_check import CheckPhase
 from sglang.srt.managers.scheduler_components.weight_updater import (
+    RPC_METHODS,
     SchedulerWeightUpdaterManager,
 )
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
@@ -6465,44 +6467,24 @@ class Scheduler(
     def set_internal_state(self, recv_req: SetInternalStateReq):
         return self.internal_state.set_internal_state(recv_req)
 
-    def save_remote_model(self, **kwargs):
-        self.weight_updater.save_remote_model(kwargs)
-
-    def save_sharded_model(self, **kwargs):
-        self.weight_updater.save_sharded_model(kwargs)
-
     def handle_rpc_request(self, recv_req: RpcReqInput):
-        # Handle RPC requests
         logger.info(
             f"handle_rpc_request: {recv_req.method}, param: {recv_req.parameters}"
         )
 
         error = None
         try:
-            func = getattr(self, recv_req.method)
-            if recv_req.parameters is not None:
-                func(**recv_req.parameters)
-            else:
-                func()
+            if recv_req.method not in RPC_METHODS:
+                raise ValueError(
+                    f"{recv_req.method!r} is not an RPC method; allowed: "
+                    f"{', '.join(RPC_METHODS)}"
+                )
+            getattr(self.weight_updater, recv_req.method)(recv_req.parameters or {})
         except Exception as e:
             error = str(e)
             logger.error(f"Failed to call rpc {recv_req.method}: {error}")
 
-        # Gather over the ranks that ran this request in the same step: the DP
-        # shard under DP attention, where shards may reach it in different steps.
-        parallel = get_parallel()
-        if parallel.attn_dp_enabled:
-            groups = [parallel.attn_tp_group, parallel.attn_cp_group]
-        else:
-            groups = [parallel.tp_group]
-        errors = [error]
-        for group in groups:
-            if group.world_size > 1:
-                gathered = [None] * group.world_size
-                torch.distributed.all_gather_object(
-                    gathered, errors, group=group.cpu_group
-                )
-                errors = [e for rank_errors in gathered for e in rank_errors]
+        errors = control_request_all_gather_object(error)
         errors = [e for e in dict.fromkeys(errors) if e is not None]
         return RpcReqOutput(success=not errors, message="; ".join(errors))
 

@@ -27,6 +27,10 @@ from sglang.srt.constants import (
     GPU_MEMORY_TYPE_WEIGHTS,
 )
 from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.distributed.communication_op import (
+    control_request_all_gather_object,
+    control_request_barrier,
+)
 from sglang.srt.managers.io_struct import (
     BeginWeightUpdateReqInput,
     BeginWeightUpdateReqOutput,
@@ -69,6 +73,9 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
+
+# The SchedulerWeightUpdaterManager methods Engine.collective_rpc may call.
+RPC_METHODS = ("save_remote_model", "save_sharded_model")
 
 
 def _merge_checksum_payloads(role_payloads: List[Tuple[str, Dict]]) -> Dict:
@@ -305,7 +312,7 @@ class SchedulerWeightUpdaterManager:
                 )
             if not success:
                 logger.error(message)
-            torch.distributed.barrier(group=self.tp_cpu_group)
+            control_request_barrier()
             return UpdateWeightsFromTensorReqOutput(success=success, message=message)
 
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
@@ -330,7 +337,7 @@ class SchedulerWeightUpdaterManager:
                 )
             if not success:
                 logger.error(message)
-            torch.distributed.barrier(group=self.tp_cpu_group)
+            control_request_barrier()
             return UpdateWeightsFromIPCReqOutput(success=success, message=message)
 
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
@@ -379,7 +386,7 @@ class SchedulerWeightUpdaterManager:
         for _, runner in runners:
             runner.weight_updater.begin_weight_update()
         self._session = _WeightUpdateSession(selector=recv_req.selector)
-        torch.distributed.barrier(group=self.tp_cpu_group)
+        control_request_barrier()
         return BeginWeightUpdateReqOutput(success=True, message="Success")
 
     def end_weight_update(self, recv_req: EndWeightUpdateReqInput):
@@ -394,7 +401,7 @@ class SchedulerWeightUpdaterManager:
         for _, runner in self._select_runners(self._session.selector):
             runner.weight_updater.end_weight_update(run_post_load=run_post_load)
         self._session = None
-        torch.distributed.barrier(group=self.tp_cpu_group)
+        control_request_barrier()
         return EndWeightUpdateReqOutput(success=True, message="Success")
 
     def plugin_weight_update(self, recv_req: PluginWeightUpdateReqInput):
@@ -481,11 +488,7 @@ class SchedulerWeightUpdaterManager:
             ignore_waiting=scheduler is not None and scheduler.pause_state.paused
         )
         # A rank refusing alone would leave its peers in the barriers below.
-        busy = torch.tensor([int(not idle)])
-        torch.distributed.all_reduce(
-            busy, op=torch.distributed.ReduceOp.MAX, group=self.tp_cpu_group
-        )
-        if busy.item():
+        if not all(control_request_all_gather_object(idle)):
             return ReleaseMemoryOccupationReqOutput(
                 success=False,
                 message="Memory was not released because requests are still "
@@ -522,15 +525,15 @@ class SchedulerWeightUpdaterManager:
             self.stashed_model_static_state = _export_static_state(
                 self.tp_worker.model_runner.model
             )
-            torch.distributed.barrier(self.tp_cpu_group)
+            control_request_barrier()
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_WEIGHTS)
 
         if GPU_MEMORY_TYPE_CUDA_GRAPH in tags:
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_CUDA_GRAPH)
 
         torch.get_device_module().synchronize()
-        # The verdict leaves on return; every TP peer must have released by then.
-        torch.distributed.barrier(group=self.tp_cpu_group)
+        # The verdict leaves on return; every peer that received the request must have released by then.
+        control_request_barrier()
 
         return ReleaseMemoryOccupationReqOutput(success=True, message="Success")
 
@@ -549,7 +552,7 @@ class SchedulerWeightUpdaterManager:
         if GPU_MEMORY_TYPE_WEIGHTS in tags:
             self._assert_weight_cache_inactive("resume_memory_occupation")
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_WEIGHTS)
-            torch.distributed.barrier(self.tp_cpu_group)
+            control_request_barrier()
             _import_static_state(
                 self.tp_worker.model_runner.model,
                 self.stashed_model_static_state,
@@ -586,18 +589,12 @@ class SchedulerWeightUpdaterManager:
                     role_payloads.append((role, p))
             payload = _merge_checksum_payloads(role_payloads) if role_payloads else None
 
-            tp_size = torch.distributed.get_world_size(group=self.tp_cpu_group)
-            if tp_size > 1 and payload is not None:
-                all_payloads = [None] * tp_size
-                torch.distributed.all_gather_object(
-                    all_payloads, payload, group=self.tp_cpu_group
-                )
-                payload = all_payloads
             if payload is not None:
-                # Normalize to one ChecksumInfo per rank so the wire shape is a
-                # uniform List[ChecksumInfo] (tp==1 becomes a single-element list).
-                per_rank = payload if isinstance(payload, list) else [payload]
-                payload = [msgspec.convert(p, ChecksumInfo) for p in per_rank]
+                # One ChecksumInfo per rank, so the wire shape is a uniform List[ChecksumInfo].
+                payload = [
+                    msgspec.convert(p, ChecksumInfo)
+                    for p in control_request_all_gather_object(payload)
+                ]
             return CheckWeightsReqOutput(
                 success=True, message="Success.", payload=payload
             )

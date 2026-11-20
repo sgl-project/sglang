@@ -937,6 +937,7 @@ class PortArgs:
                 port_base = dist_init_port + 1
 
             detokenizer_port = port_base + 1
+            # port_base + 2 is unused; the slot stays so the ports below keep their offsets.
             metrics_port = port_base + 3
             load_collector_port = port_base + 5
             if dp_rank is None:

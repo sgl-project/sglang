@@ -307,7 +307,9 @@ def _request(**fields):
 
 class _WeightUpdaterManagerTestBase(CustomTestCase):
     def setUp(self):
-        patcher = patch("torch.distributed.barrier")
+        patcher = patch(
+            "sglang.srt.managers.scheduler_components.weight_updater.control_request_barrier"
+        )
         patcher.start()
         self.addCleanup(patcher.stop)
         self.recorded = []
@@ -402,7 +404,9 @@ class TestRecordWeightVersionAfterUpdate(_WeightUpdaterManagerTestBase):
 
         self.assertTrue(output.success)
         self.assertEqual(self.recorded, ["v2"])
-        with patch("torch.distributed.barrier"):
+        with patch(
+            "sglang.srt.managers.scheduler_components.weight_updater.control_request_barrier"
+        ):
             output = updater.end_weight_update(EndWeightUpdateReqInput())
 
         self.assertTrue(output.success)
@@ -725,10 +729,10 @@ class TestReleaseMemoryRefusal(_WeightUpdaterManagerTestBase):
         manager.scheduler = None
         manager.memory_saver_adapter = Mock()
 
-        def a_peer_is_busy(busy, **kwargs):
-            busy.fill_(1)
-
-        with patch("torch.distributed.all_reduce", side_effect=a_peer_is_busy):
+        with patch(
+            "sglang.srt.managers.scheduler_components.weight_updater.control_request_all_gather_object",
+            return_value=[True, False],
+        ):
             output = manager.release_memory_occupation(
                 ReleaseMemoryOccupationReqInput(tags=["cuda_graph"])
             )

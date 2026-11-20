@@ -7,9 +7,11 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 import torch.distributed
 
+from sglang.srt.runtime_context import is_control_broadcast_local
 from sglang.srt.utils import broadcast_pyobj
 
 from .parallel_state import (
+    GroupCoordinator,
     get_attn_cp_group,
     get_attn_tp_group,
     get_moe_ep_group,
@@ -115,6 +117,36 @@ def attn_cp_tp_broadcast_pyobj(data: List[Any]) -> List[Any]:
             data, tp_group.rank, tp_group.cpu_group, src=tp_group.ranks[0]
         )
     return data
+
+
+def _control_request_groups() -> List[GroupCoordinator]:
+    """The groups spanning the ranks that run a control request in the same
+    step: the DP shard under local control broadcast, where each shard receives
+    it in its own step while the others run their per-step DP-attention
+    collectives; the whole TP group otherwise."""
+    if is_control_broadcast_local():
+        return [get_attn_tp_group(), get_attn_cp_group()]
+    return [get_tp_group()]
+
+
+def control_request_barrier() -> None:
+    """Barrier over the ranks that run a control request in the same step."""
+    for group in _control_request_groups():
+        if group.world_size > 1:
+            torch.distributed.barrier(group=group.cpu_group)
+
+
+def control_request_all_gather_object(obj: Any) -> List[Any]:
+    """obj from each rank that runs a control request in the same step, in rank order."""
+    gathered = [obj]
+    for group in _control_request_groups():
+        if group.world_size > 1:
+            per_rank = [None] * group.world_size
+            torch.distributed.all_gather_object(
+                per_rank, gathered, group=group.cpu_group
+            )
+            gathered = [o for rank_objs in per_rank for o in rank_objs]
+    return gathered
 
 
 def attention_tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
