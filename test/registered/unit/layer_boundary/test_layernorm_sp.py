@@ -209,6 +209,13 @@ class TestLayerNormSPValidation(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "speculative"):
             validate_layernorm_sp(**{**self.VALID, "speculative_algorithm": "EAGLE3"})
 
+    def test_kimi_k3_gathers_its_draft_captures_and_rejects_attention_cp(self):
+        k3 = {**self.VALID, "architecture": "KimiK31ForConditionalGeneration"}
+        validate_layernorm_sp(**k3)
+        validate_layernorm_sp(**{**k3, "speculative_algorithm": "DFLASH"})
+        with self.assertRaisesRegex(ValueError, "attn_cp_size == 1"):
+            validate_layernorm_sp(**{**k3, "attn_cp_size": 2})
+
     def test_qwen4_exp_uses_the_standard_flag_with_general_tp_ep_constraint(self):
         validate_layernorm_sp(
             **{

@@ -80,8 +80,7 @@ def register_fake_ops():
         # the caller does not request the logsumexp.
         return None
 
-    @torch.library.register_fake("sgl_kernel::flash_mla_decode")
-    def _(
+    def flash_mla_decode_fake(
         out,
         q_nope,
         q_pe,
@@ -93,6 +92,11 @@ def register_fake_ops():
         num_kv_splits,
     ):
         return
+
+    if "sgl_kernel::flash_mla_decode" in torch._C._dispatch_get_all_op_names():
+        torch.library.register_fake("sgl_kernel::flash_mla_decode")(
+            flash_mla_decode_fake
+        )
 
 
 class XPUGraphRunner(DecodeCudaGraphRunner):
