@@ -953,11 +953,18 @@ mod tests {
         let policy = CacheAwarePolicy::new(config);
         let signal = |media_winners: Vec<String>| PrefixLookupResult {
             outcome: sgl_kv_indexer::PrefixOutcome::Matched {
-                matches: vec![sgl_kv_indexer::PrefixMatch {
-                    matched_prefix_blocks: 2,
-                    worker_id: "hot".into(),
-                    address: "http://hot:30000".into(),
-                }],
+                matches: vec![
+                    sgl_kv_indexer::PrefixMatch {
+                        matched_prefix_blocks: 2,
+                        worker_id: "hot".into(),
+                        address: "http://hot:30000".into(),
+                    },
+                    sgl_kv_indexer::PrefixMatch {
+                        matched_prefix_blocks: 1,
+                        worker_id: "other".into(),
+                        address: "http://other:30000".into(),
+                    },
+                ],
                 best_prefix_blocks: 2,
             },
             query_blocks: 2,
@@ -982,6 +989,16 @@ mod tests {
             .with_request_tokens(Some(&[1, 2, 3, 4]))
             .with_input_tokens(300)
             .with_external_prefix(Some(&remembered));
+        let PrefillProposal::CacheCandidates(proposal) = policy
+            .propose_prefill(&workers, &ctx)
+            .expect("a remembered placement proposes cache candidates")
+        else {
+            panic!("a remembered placement must not collapse to a load pair");
+        };
+        // The tied peer stays a candidate, so the pressure guard has an alternative.
+        assert_eq!(proposal.candidates.len(), 2);
+        assert_eq!(proposal.candidates[0].worker.id, hot.id);
+        assert_eq!(proposal.candidates[1].worker.id, other.id);
         let proposal = policy.propose(&workers, &ctx).expect("a proposal");
         assert_eq!(proposal.kind, ProposalKind::CacheAffinity);
         assert_eq!(proposal.primary.id, hot.id);

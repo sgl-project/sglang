@@ -31,6 +31,19 @@ pub struct PrefixLookupResult {
     pub media_winners: Vec<String>,
 }
 
+/// A worker's DP ranks holding a prompt (see [`RadixTreePrefixProvider::rank_depths`]).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct RankDepths {
+    /// `(dp_rank, cached prefix blocks)`, from KV events and, under media
+    /// affinity, the rank remembered for the chat.
+    pub depths: Vec<(u32, usize)>,
+    /// Under media affinity with no rank remembered for the chat: the rank a
+    /// rendezvous hash of the conversation prefers among those tied at the
+    /// deepest depth, so every replica prefers the same one. A tie-break only:
+    /// rank load decides first (see `select_dp_rank`).
+    pub preferred: Option<u32>,
+}
+
 #[derive(Clone, Debug)]
 pub struct RadixTreePrefixProvider {
     tree: Arc<HashTree>,
@@ -191,15 +204,15 @@ impl RadixTreePrefixProvider {
         }
     }
 
-    /// `(dp_rank, cached prefix blocks)` for each rank of `worker_url`.
+    /// The ranks of `worker_url` holding the prompt (see [`RankDepths`]).
     pub fn rank_depths(
         &self,
         tokens: &[u32],
         namespace: &CacheNamespace,
         worker_url: &str,
-    ) -> Vec<(u32, usize)> {
+    ) -> RankDepths {
         let Some(hashes) = self.block_hashes(tokens, namespace) else {
-            return Vec::new();
+            return RankDepths::default();
         };
         let mut depths: Vec<(u32, usize)> = self
             .tree
@@ -208,6 +221,7 @@ impl RadixTreePrefixProvider {
             .filter(|(worker, _)| worker.url == worker_url)
             .map(|(worker, depth)| (worker.dp_rank, depth))
             .collect();
+        let mut preferred = None;
         if let Some(media) = self.media_chain(tokens, namespace, &hashes) {
             let before = depths.iter().map(|&(_, d)| d).max();
             let owner_prefix = format!("{worker_url}#");
@@ -234,21 +248,22 @@ impl RadixTreePrefixProvider {
                 remembered = true;
             }
             if !remembered {
-                let mut by_rank: BTreeMap<String, u32> = depths
+                // No rank remembered (another router may have routed the previous
+                // turn): every router prefers the same tied rank, by rendezvous
+                // hash. A preference only: rank load decides first, as nothing at
+                // rank level guards against a loaded rank the way the pressure
+                // guard does for workers.
+                let by_rank: BTreeMap<String, u32> = depths
                     .iter()
                     .map(|&(rank, d)| (rank.to_string(), u32::try_from(d).unwrap_or(u32::MAX)))
                     .collect();
-                if prefer_rendezvous(&mut by_rank, media.key) {
+                if let Some(winner) = rendezvous_winner(&by_rank, media.key) {
+                    preferred = winner.parse().ok();
                     self.tree.record_media_tiebreak();
-                }
-                for (rank, d) in &mut depths {
-                    if let Some(&boosted) = by_rank.get(&rank.to_string()) {
-                        *d = boosted as usize;
-                    }
                 }
             }
         }
-        depths
+        RankDepths { depths, preferred }
     }
 
     /// A media chat's routing chain; `None` for a text prompt or with media
@@ -359,27 +374,31 @@ fn media_key(namespace: &CacheNamespace, parent: Option<i64>, tokens: &[u32]) ->
 /// rendezvous score for `key` with one more block, so a cache-aware pick prefers
 /// it. Deterministic across routers; ties of one entry are left alone.
 fn prefer_rendezvous(depths: &mut BTreeMap<String, u32>, key: i64) -> bool {
-    let Some(&deepest) = depths.values().max() else {
-        return false;
-    };
+    if let Some(winner) = rendezvous_winner(depths, key) {
+        let deepest = depths[&winner];
+        depths.insert(winner, deepest.saturating_add(1));
+        return true;
+    }
+    false
+}
+
+/// Among the names tied at the deepest depth (two or more, above zero), the one
+/// a rendezvous hash of `key` ranks first; `None` when there is no such tie.
+fn rendezvous_winner(depths: &BTreeMap<String, u32>, key: i64) -> Option<String> {
+    let deepest = *depths.values().max()?;
     if deepest == 0 || depths.values().filter(|&&d| d == deepest).count() < 2 {
-        return false;
+        return None;
     }
     let score = |name: &str| {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         std::hash::Hash::hash(&(key, name), &mut hasher);
         std::hash::Hasher::finish(&hasher)
     };
-    if let Some(winner) = depths
+    depths
         .iter()
         .filter(|(_, &d)| d == deepest)
         .max_by_key(|(name, _)| score(name))
         .map(|(name, _)| name.clone())
-    {
-        depths.insert(winner, deepest.saturating_add(1));
-        return true;
-    }
-    false
 }
 
 fn merge_depth(depth_by_url: &mut BTreeMap<String, u32>, url: String, depth: usize) {
@@ -501,8 +520,14 @@ mod tests {
         other.extend([IMAGE, 60_000, 60_001, 60_002, 60_003]);
         let signal = lookup(&provider, &other);
         assert!(matches!(signal.outcome, PrefixOutcome::Empty));
-        assert!(provider.rank_depths(&other, &ns, "http://b").is_empty());
-        assert!(provider.rank_depths(&first, &ns, "http://b").is_empty());
+        assert!(provider
+            .rank_depths(&other, &ns, "http://b")
+            .depths
+            .is_empty());
+        assert!(provider
+            .rank_depths(&first, &ns, "http://b")
+            .depths
+            .is_empty());
         assert_eq!(provider.tree.media().hits(), 0);
         assert_eq!(provider.tree.media_tiebreaks(), 0);
     }
@@ -629,7 +654,7 @@ mod tests {
         }
         let ns = CacheNamespace::default();
         provider.record_rank(&prompt[..(4 + 2) * BLOCK as usize], &ns, "http://a", 1);
-        let mut by_rank = provider.rank_depths(&prompt, &ns, "http://a");
+        let mut by_rank = provider.rank_depths(&prompt, &ns, "http://a").depths;
         by_rank.sort();
         assert_eq!(by_rank, [(0, 4), (1, 6)]);
         // Text prompts never record rank placements (a prompt sharing nothing with
@@ -713,7 +738,7 @@ mod tests {
             1,
             "remembered: no tie-break"
         );
-        let mut by_rank = provider.rank_depths(&turn2, &ns, "http://b");
+        let mut by_rank = provider.rank_depths(&turn2, &ns, "http://b").depths;
         by_rank.sort();
         assert_eq!(by_rank, [(0, 4), (1, 5)]);
     }
@@ -743,7 +768,58 @@ mod tests {
         assert_eq!(depths(&signal), [("http://b".into(), 1)]);
         assert_eq!(signal.media_winners, ["http://b"]);
         assert_eq!(provider.tree.media().hits(), 1);
-        assert_eq!(provider.rank_depths(&turn2, &ns, "http://b"), [(1, 1)]);
+        assert_eq!(
+            provider.rank_depths(&turn2, &ns, "http://b").depths,
+            [(1, 1)]
+        );
+    }
+
+    /// Ranks tied on the confirmed prefix with none remembered: the rendezvous
+    /// rank is a preference every replica shares, not a deeper depth, so rank
+    /// load still decides first.
+    #[test]
+    fn rank_preference_is_a_tie_break_not_a_depth() {
+        let prompt = media_prompt(4, 2);
+        let ns = CacheNamespace::default();
+        let preferred: Vec<_> = (0..2)
+            .map(|_| {
+                let provider = media_provider();
+                for rank in [0, 1] {
+                    let event = BlockStored {
+                        block_hashes: provider.block_hashes(&prompt, &ns).unwrap()[..4].to_vec(),
+                        parent_block_hash: None,
+                        token_ids: prompt[..4 * BLOCK as usize].to_vec(),
+                        block_size: BLOCK,
+                        lora_id: None,
+                        lora_name: None,
+                        cache_salt: None,
+                        is_bigram: false,
+                        medium: None,
+                    };
+                    provider
+                        .tree
+                        .store_event(&KvWorkerId::new("http://a".to_owned(), rank), &event);
+                }
+                let placement = provider.rank_depths(&prompt, &ns, "http://a");
+                let mut depths = placement.depths.clone();
+                depths.sort();
+                assert_eq!(depths, [(0, 4), (1, 4)], "no rank is boosted");
+                assert_eq!(provider.tree.media_tiebreaks(), 1);
+                let preferred = placement.preferred.expect("a tied rank is preferred");
+                // Once a rank is remembered, it is the depth that decides.
+                provider.record_rank(&prompt, &ns, "http://a", 1);
+                let placement = provider.rank_depths(&prompt, &ns, "http://a");
+                let mut depths = placement.depths.clone();
+                depths.sort();
+                assert_eq!(depths, [(0, 4), (1, 7)]);
+                assert_eq!(placement.preferred, None);
+                preferred
+            })
+            .collect();
+        assert_eq!(
+            preferred[0], preferred[1],
+            "every replica prefers the same rank"
+        );
     }
 
     /// A burst of new image chats on one cold system prompt: the first chat's
@@ -774,13 +850,19 @@ mod tests {
         );
         assert_eq!(provider.tree.media().hits(), 0);
         assert_eq!(provider.tree.media_tiebreaks(), 0);
-        assert!(provider.rank_depths(&other, &ns, "http://b").is_empty());
+        assert!(provider
+            .rank_depths(&other, &ns, "http://b")
+            .depths
+            .is_empty());
         // The first chat's own next turn still finds its placement.
         let next = media_prompt(4, 5);
         let signal = lookup(&provider, &next);
         assert_eq!(depths(&signal), [("http://b".into(), 7)]);
         assert_eq!(provider.tree.media().hits(), 1);
-        assert_eq!(provider.rank_depths(&next, &ns, "http://b"), [(1, 7)]);
+        assert_eq!(
+            provider.rank_depths(&next, &ns, "http://b").depths,
+            [(1, 7)]
+        );
     }
 
     #[test]
@@ -807,7 +889,10 @@ mod tests {
         let mut other = prompt[..4 * BLOCK as usize].to_vec();
         other.extend([IMAGE, MEDIA_TAG_MARK, 60_000, 60_001, 60_002]);
         provider.record_rank(&other, &ns, "http://a", 1);
-        assert_eq!(provider.rank_depths(&prompt, &ns, "http://a"), [(0, 4)]);
+        assert_eq!(
+            provider.rank_depths(&prompt, &ns, "http://a").depths,
+            [(0, 4)]
+        );
         assert_eq!(
             provider.tree.media_tiebreaks(),
             0,

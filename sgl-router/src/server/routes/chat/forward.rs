@@ -19,6 +19,7 @@ use crate::server::metrics::{
     classify_stream_end, outcome_from_status, MediaCounts, MetricsRegistry, RequestLogContext,
     RequestOutcome, StaleRequestOutcome, WorkerModeLabel,
 };
+use crate::state::kv_events::prefix_provider::RankDepths;
 use crate::state::load_monitor::router_inflight_load::RouterInflightLoadGuard;
 use crate::workers::{DecodeSlot, DpRankGuard, LoadGuard, Worker};
 use axum::body::Body;
@@ -301,7 +302,7 @@ async fn dispatch<T: Transport>(
             let decode_rank = dp_aware
                 .then(|| {
                     let rank_tokens = rank_tokens(ctx, &decode, decode_policy);
-                    select_dp_rank(&decode, None, &[], &rank_tokens, decode_policy)
+                    select_dp_rank(&decode, None, &[], None, &rank_tokens, decode_policy)
                 })
                 .flatten();
             let decode_load_guards = (
@@ -749,17 +750,18 @@ fn prompt_dp_rank(
         .into_iter()
         .flatten()
         .find_map(|name| nonempty_header(headers, name));
-    let prefix_depths = match (key, &ctx.dp_rank_prefix_provider, &request.tokens) {
+    let placement = match (key, &ctx.dp_rank_prefix_provider, &request.tokens) {
         (None, Some(provider), Some(tokens)) => {
             provider.rank_depths(&tokens.ids, &request.cache_namespace, &worker.url)
         }
-        _ => Vec::new(),
+        _ => RankDepths::default(),
     };
     let rank_tokens = rank_tokens(ctx, worker, model.dp_rank_policy);
     let rank = select_dp_rank(
         worker,
         key,
-        &prefix_depths,
+        &placement.depths,
+        placement.preferred,
         &rank_tokens,
         model.dp_rank_policy,
     );
