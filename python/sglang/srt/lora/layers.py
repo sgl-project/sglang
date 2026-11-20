@@ -1106,9 +1106,20 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                 is_shared_outer=experts_shared_outer_loras,
                 physical_rank=max_lora_rank,
             )
+            derived = self._moe_lora_runner.derived_base_weights
+            if derived is not None:
+                self._derived_weight_cache_error = (
+                    "Online weight updates are not supported while the MoE LoRA "
+                    f"runner holds {derived} derived from the base weights; "
+                    "restart to change the base weights."
+                )
             # Keep dispatch, combine, and distributed reduction in the base layer.
             self._base_run_moe_core = base_layer.run_moe_core
-            base_layer.run_moe_core = self._run_moe_core_with_lora
+            base_layer.run_moe_core = (
+                self._run_moe_core_base_only
+                if max_lora_rank is None
+                else self._run_moe_core_with_lora
+            )
             return
 
         if runner_backend.is_experimental_sgl_trtllm():
@@ -1242,6 +1253,14 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
 
         # run lora moe_runner
         return self._forward_with_lora(hidden_states, topk_output, lora_info, **kwargs)
+
+    def _run_moe_core_base_only(self, dispatch_output):
+        batch_info = self.lora_backend.get_batch_info(LoRABatchLayout.TP_GLOBAL)
+        return self._moe_lora_runner.run_base_only(
+            dispatch_output,
+            is_prefill=batch_info is not None and batch_info.is_prefill,
+            use_cuda_graph=batch_info is not None and batch_info.use_cuda_graph,
+        )
 
     def _run_moe_core_with_lora(self, dispatch_output):
         batch_info = self.lora_backend.get_batch_info(LoRABatchLayout.TP_GLOBAL)

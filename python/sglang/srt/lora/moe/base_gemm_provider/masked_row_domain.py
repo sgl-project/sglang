@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 import msgspec
@@ -10,6 +9,7 @@ import torch
 
 from sglang.srt.lora.moe.base_gemm_provider.base import (
     MoeBaseProvider,
+    RowBuffers,
     admit_weight_layout,
     expected_rows_per_expert,
     prepare_buffer,
@@ -17,7 +17,6 @@ from sglang.srt.lora.moe.base_gemm_provider.base import (
 from sglang.srt.lora.moe.quant_info import StandardLayoutQuantInfo
 
 if TYPE_CHECKING:
-    from sglang.kernels.ops.lora.common.route_view import RouteView
     from sglang.srt.lora.workspace import LoraWorkspace
 
 
@@ -27,34 +26,22 @@ def masked_m_max(num_tokens: int, alignment: int = 8) -> int:
 
 
 class MaskedRowState(msgspec.Struct, kw_only=True):
-    """``pair_to_row[t * top_k + k]`` is ``expert * m_max + offset``; a pair is
-    valid only when ``topk_ids[t, k] >= 0``.
-    """
+    """pair_to_row[t * top_k + k] = expert * m_max + offset when topk_ids[t, k] >= 0."""
 
     hidden_permuted: torch.Tensor  # [E_local, m_max, hidden], the GEMM input dtype
     masked_m: torch.Tensor  # [E_local] int32
-    expected_m: int
     pair_to_row: torch.Tensor  # [num_tokens * top_k] int32
     m_max: int
-    input_buffer_reuse: bool
 
 
 class MaskedRowDomainProvider(MoeBaseProvider):
+    """CuTeDSL supplies tile hooks. _row_state_cls includes buffer and schedule fields."""
+
+    _row_state_cls = MaskedRowState
+
     def __init__(self, quant_info: StandardLayoutQuantInfo):
         self.quant_info = quant_info
         self._gate_up_slices = admit_weight_layout(quant_info)
-
-        from sglang.kernels.ops.lora.moe.activation_delta import act_delta
-        from sglang.kernels.ops.lora.moe.dispatch_masked import (
-            dispatch_fill_masked_bf16,
-        )
-
-        self._preprocess = dispatch_fill_masked_bf16
-        self._act_kernel = act_delta
-
-        from sglang.kernels.ops.lora.moe.fused_act import fused_b_act
-
-        self._fused_act = fused_b_act
 
     def prepare(
         self,
@@ -65,7 +52,8 @@ class MaskedRowDomainProvider(MoeBaseProvider):
     ) -> MaskedRowState:
         num_experts = self.quant_info.num_local_experts
         num_pairs = topk_ids.numel()
-        m_max = masked_m_max(hidden_states.size(0))
+        expected_m = expected_rows_per_expert(num_pairs, num_experts)
+        token_width, m_max = self._plan_rows(hidden_states.size(0), expected_m)
         device = hidden_states.device
         masked_m = prepare_buffer(
             workspace,
@@ -81,90 +69,82 @@ class MaskedRowDomainProvider(MoeBaseProvider):
             dtype=torch.int32,
             device=device,
         )
-        hidden_permuted = prepare_buffer(
-            workspace,
-            "masked:hidden_permuted",
-            (num_experts, m_max, hidden_states.size(1)),
-            dtype=torch.bfloat16,
-            device=device,
+        rows, buffers = self._input_buffers(
+            workspace, "masked", (num_experts, m_max), hidden_states
         )
-        self._preprocess(
+        self._fill_masked(
+            hidden_states, topk_ids, top_k, masked_m, pair_to_row, rows, buffers
+        )
+        return self._row_state_cls(
+            hidden_permuted=rows,
+            masked_m=masked_m,
+            pair_to_row=pair_to_row,
+            m_max=m_max,
+            **buffers,
+            **self._schedules(
+                masked_m, token_width, "cutedsl_masked", workspace, m_max=m_max
+            ),
+        )
+
+    def _input_buffers(
+        self,
+        workspace: LoraWorkspace | None,
+        prefix: str,
+        lead: tuple[int, ...],
+        hidden_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, RowBuffers]:
+        """Allocate BF16 rows without clearing. The fill writes the live rows."""
+        rows = prepare_buffer(
+            workspace,
+            f"{prefix}:hidden_permuted",
+            (*lead, hidden_states.size(1)),
+            dtype=torch.bfloat16,
+            device=hidden_states.device,
+        )
+        return rows, {}
+
+    def _fill_masked(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        top_k: int,
+        masked_m: torch.Tensor,
+        pair_to_row: torch.Tensor,
+        rows: torch.Tensor,
+        buffers: RowBuffers,
+    ) -> None:
+        from sglang.kernels.ops.lora.moe.dispatch_masked import (
+            dispatch_fill_masked_bf16,
+        )
+
+        dispatch_fill_masked_bf16(
             hidden_states,
             topk_ids,
             top_k,
             masked_m_out=masked_m,
             pair_to_row_out=pair_to_row,
-            rows_out=hidden_permuted,
-        )
-        return MaskedRowState(
-            hidden_permuted=hidden_permuted,
-            masked_m=masked_m,
-            expected_m=expected_rows_per_expert(num_pairs, num_experts),
-            pair_to_row=pair_to_row,
-            m_max=m_max,
-            input_buffer_reuse=workspace is not None,
+            rows_out=rows,
         )
 
-    def release_prepared_inputs(self, row_state: MaskedRowState) -> None:
-        # Workspace buffers retain their addresses for graph replay.
-        if row_state.input_buffer_reuse:
-            return
-        from sglang.srt.utils import dispose_tensor
+    # The layout's view of rows for the GEMM launch and its compile stand-ins.
+    @staticmethod
+    def _rows_arg(tensor: torch.Tensor) -> torch.Tensor:
+        return tensor
 
-        dispose_tensor(row_state.hidden_permuted)
+    @staticmethod
+    def _input_rows(row_state: MaskedRowState) -> torch.Tensor:
+        return row_state.hidden_permuted
 
-    def act_with_delta(
-        self,
-        row_state: MaskedRowState,
-        gateup_out: torch.Tensor,
-        gate_up_delta: torch.Tensor | None,
-        topk_ids: torch.Tensor,
-        act_out: torch.Tensor,
-        activation_lora_input: torch.Tensor,
-        *,
-        activation: str = "silu",
-    ) -> None:
-        self._act_kernel(
-            gateup_out,
-            gate_up_delta,
-            act_out,
-            activation_lora_input,
-            row_state.pair_to_row,
-            topk_ids,
-            num_local_experts=self.num_local_experts,
-            gate_first=self.contract.gate_first,
-            interleaved=self.contract.interleaved,
-            activation=activation,
-        )
+    @staticmethod
+    def _group_arg(row_state: MaskedRowState) -> torch.Tensor:
+        return row_state.masked_m
 
-    def fused_act(
-        self,
-        row_state: MaskedRowState,
-        *,
-        activation: str,
-        base_gateup: torch.Tensor,
-        act_rows: torch.Tensor,
-        act_pairs: torch.Tensor | None,
-        routing: RouteView,
-        config: Mapping[str, int],
-        bridge_gateup: torch.Tensor | None = None,
-        b_gate_up: torch.Tensor | None = None,
-        bridge_top_k: int = 1,
-    ) -> None:
-        self._fused_act(
-            activation=activation,
-            base_gateup=base_gateup,
-            act_rows=act_rows,
-            act_pairs=act_pairs,
-            pair_to_row=row_state.pair_to_row,
-            routing=routing,
-            num_local_experts=self.num_local_experts,
-            gate_first=self.contract.gate_first,
-            interleaved=self.contract.interleaved,
-            config=config,
-            bridge_gateup=bridge_gateup,
-            b_gate_up=b_gate_up,
-            bridge_top_k=bridge_top_k,
+    def _dummy_layout(self, device) -> tuple[tuple, tuple, torch.Tensor]:
+        experts = self.quant_info.num_local_experts
+        return (
+            (experts, 256),
+            (experts, 256),
+            torch.zeros(experts, dtype=torch.int32, device=device),
         )
 
     def gateup_out_shape(self, row_state: MaskedRowState) -> tuple[int, ...]:

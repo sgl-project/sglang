@@ -1,5 +1,3 @@
-"""Invalid plan-table rows fail at load, even rows the selector never picks."""
-
 from __future__ import annotations
 
 import json
@@ -37,21 +35,47 @@ def override_table(tmp_path, monkeypatch):
     return data, write
 
 
-def _resolve():
-    """Per-expert sm100 selection; it never picks the rows the test mutates."""
+def _select(family, vendor, rank, *, shared=False, experts=256, act_scale="static"):
     return ep.resolve_plans(
-        quant_family="bf16",
+        quant_family=family,
+        vendor=vendor,
         architecture="sm100",
-        is_shared_outer=False,
-        physical_rank=16,
+        is_shared_outer=shared,
+        physical_rank=rank,
         activation=ActivationFn.SILU,
         hidden_size=4096,
-        num_local_experts=256,
+        num_local_experts=experts,
+        act_scale=act_scale,
+    )
+
+
+def test_shared_decode_plan_respects_vendor_and_family():
+    def row(family, vendor, experts=256):
+        return _select(family, vendor, 16, shared=True, experts=experts)[
+            ep.Phase.DECODE
+        ]
+
+    for family in ("nvfp4", "mxfp4"):
+        expected = (
+            "decode.shared.nvfp4" if family == "nvfp4" else "decode.shared.marlin"
+        )
+        assert row(family, "marlin").name == expected, family
+    assert row("fp8", "cutedsl").name == "decode.shared"
+    large_fp8 = row("fp8", "cutedsl", experts=512)
+    assert (large_fp8.name, large_fp8.base_gemm_rows) == (
+        "decode.shared.fp8.e_ge512",
+        "expert_major",
     )
 
 
 @pytest.mark.parametrize(
-    "defect", ("wildcard", "token_dense_b_act", "per_expert_token_a")
+    "defect",
+    (
+        "wildcard",
+        "token_dense_b_act",
+        "epilogue_with_shared_finalize",
+        "per_expert_token_a",
+    ),
 )
 def test_invalid_unselected_rows_fail_at_load(override_table, defect):
     data, write = override_table
@@ -64,13 +88,16 @@ def test_invalid_unselected_rows_fail_at_load(override_table, defect):
         row = rows["prefill.shared"]
         row["plan"]["gate_up_a_family"] = "token_dense"
         error = "only a standalone per_row gate/up B"
+    elif defect == "epilogue_with_shared_finalize":
+        rows["prefill.shared"]["plan"]["down_b_family"] = "epilogue"
+        error = "epilogue down-B requires a materialized finalize"
     else:
         row = rows["fallback.prefill.per_expert"]
         row["plan"]["gate_up_a_family"] = "token_grouped"
         error = "requires shared-outer A ownership"
     write()
     with pytest.raises(ValueError, match=error):
-        _resolve()
+        _select("bf16", "cutedsl", 16)  # selects none of the rows above
 
 
 if __name__ == "__main__":

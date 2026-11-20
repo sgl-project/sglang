@@ -139,6 +139,50 @@ class TestShouldApplyLoRAGate(CustomTestCase):
         self.assertEqual(list(manager.lora_modules[0]), [LANGUAGE_QKV])
         self.assertEqual(manager.embed_tokens_module, LANGUAGE_EMBED_TOKENS)
 
+    def test_attention_only_binds_explicit_marlin_without_expert_buffers(self):
+        from sglang.srt.layers.moe.utils import MoeRunnerBackend
+        from sglang.srt.lora.moe.runner import MoeLoraRunner
+
+        moe = FusedMoE.__new__(FusedMoE)
+        torch.nn.Module.__init__(moe)
+        moe.moe_runner_config = SimpleNamespace(gemm1_alpha=None)
+        moe.quant_method = moe.dispatcher = None
+        moe.num_local_experts = moe.intermediate_size_per_partition = 8
+        moe.moe_tp_size, moe.moe_tp_rank = 1, 0
+        moe.should_fuse_routed_scaling_factor_in_topk = False
+
+        manager = self._manager([], {"qkv_proj"})
+        manager.base_model = torch.nn.Module()
+        manager.base_model.experts = moe
+        manager.moe_lora_runner_backend = MoeRunnerBackend.LORA_MARLIN
+        manager.lora_backend = SimpleNamespace(
+            name="triton_v2", lora_workspace=object(), get_batch_info=Mock()
+        )
+
+        with (
+            patch(
+                "sglang.srt.layers.moe.utils.get_moe_runner_backend",
+                return_value=MoeRunnerBackend.LORA_MARLIN,
+            ),
+            patch.object(MoeLoraRunner, "from_layer") as bind,
+        ):
+            manager.init_lora_modules()
+
+        self.assertEqual(manager.lora_modules, [{}])
+        self.assertIsNone(bind.call_args.kwargs["physical_rank"])
+        for batch_info, is_prefill, use_cuda_graph in (
+            (None, False, False),
+            (SimpleNamespace(is_prefill=False, use_cuda_graph=True), False, True),
+            (SimpleNamespace(is_prefill=True, use_cuda_graph=False), True, False),
+        ):
+            manager.lora_backend.get_batch_info.return_value = batch_info
+            dispatch = object()
+            result = moe.run_moe_core(dispatch)
+            bind.return_value.run_base_only.assert_called_with(
+                dispatch, is_prefill=is_prefill, use_cuda_graph=use_cuda_graph
+            )
+            self.assertIs(result, bind.return_value.run_base_only.return_value)
+
 
 class TestModelLoRAScope(CustomTestCase):
     def test_model_scope_keeps_decoder_projections(self):
