@@ -61,6 +61,11 @@ class AscendQuantAttention:
         elif "fp8_fa_mode" in config:
             raise ValueError("fp8_fa_mode is only supported with precision=fp8")
         self.head_chunk_size = config.get("head_chunk_size", 4)
+        self.mxfp4_quant_options = {
+            key: config[key]
+            for key in ("mxfp4_scale_alg", "mxfp4_dst_type_max")
+            if self.precision == "mxfp4" and key in config
+        }
         if (
             isinstance(self.head_chunk_size, bool)
             or not isinstance(self.head_chunk_size, Integral)
@@ -161,6 +166,8 @@ class AscendQuantAttention:
         options = {}
         if self.precision == "fp8":
             options["fp8_fa_mode"] = self.fp8_fa_mode
+        elif self.precision == "mxfp4":
+            options.update(self.mxfp4_quant_options)
         # SD applies rotation exactly once, before quantization. Preserve its
         # output dtype, including the current MXFP4 kernel's BF16 output.
         return self._quant_attention(

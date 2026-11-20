@@ -20,6 +20,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionMetadataBuilder,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.mxfp4_utils import (
+    mxfp4_quant_kwargs,
     resolve_precision,
     uses_mxfp4_attention,
 )
@@ -392,6 +393,13 @@ class AscendFAImpl(AttentionImpl):
         # The dataclass supplies the defaults for unset head_chunk/fp8/rotation.
         metadata = metadata or AscendFAMetadata()
         config = {"precision": precision, "head_chunk_size": metadata.head_chunk_size}
+        if precision == "mxfp4" and self.use_mxfp4_attention:
+            config.update(
+                (f"mxfp4_{key}", value)
+                for key, value in mxfp4_quant_kwargs(
+                    self._attention_description
+                ).items()
+            )
         if precision == "fp8":
             config["fp8_fa_mode"] = metadata.fp8_fa_mode
         if metadata.qk_rotation is not None:

@@ -1445,10 +1445,11 @@ the exported Q/K rotations.
 </Accordion>
 
 <Note>
-  MindIE-SD applies its own attention quantization defaults.
-  Unlike the single-level linear path, the attention route does not take the
-  checkpoint's `mxfp4_scale_alg` / `mxfp4_dst_type_max` overrides or force
-  `round_mode="rint"`; those remain linear-only.
+  Descriptor-selected MXFP4 attention passes `mxfp4_scale_alg=2` and
+  `mxfp4_dst_type_max=7.25` to MindIE-SD, honoring checkpoint overrides.
+  MindIE-SD 3.2.0 does not expose attention rounding control; the SDK's
+  rounding and padding behavior still differ from the previous executor.
+  Explicit MXFP4 attention without a checkpoint descriptor retains SDK defaults.
 </Note>
 
 ### Precision during denoising

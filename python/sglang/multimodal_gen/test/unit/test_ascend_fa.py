@@ -91,6 +91,28 @@ def test_dispatch_preserves_inputs_and_rotates_once(
     assert ("fp8_fa_mode" in options) == (precision == "fp8")
 
 
+@pytest.mark.parametrize(
+    "overrides,expected",
+    [({}, (2, 7.25)), ({"mxfp4_scale_alg": 1, "mxfp4_dst_type_max": 6.0}, (1, 6.0))],
+)
+def test_checkpoint_mxfp4_quantization_reaches_provider(adapter, overrides, expected):
+    config, provider, build = adapter
+    config.update(precision="mxfp4")
+    description = {"blocks.0.attn1": "MXFP4_DYNAMIC", **overrides}
+    impl = build(
+        prefix="blocks.0.attn1.impl",
+        quant_config=SimpleNamespace(quant_description=description),
+    )
+    query = torch.randn(1, 7, 4, 64)
+    impl.forward(query, query, query, None)
+    options = provider.call_args.kwargs
+    assert (options["mxfp4_scale_alg"], options["mxfp4_dst_type_max"]) == expected
+    config["precision"] = "fp8"
+    impl.forward(query, query, query, AscendFAMetadata(precision="fp8"))
+    assert "mxfp4_scale_alg" not in provider.call_args.kwargs
+    assert "mxfp4_dst_type_max" not in provider.call_args.kwargs
+
+
 def test_offline_rotation_is_respected_and_conflicts_rejected(adapter):
     config, provider, build = adapter
     offline = SimpleNamespace(use_offline_qk_rotation=True)
