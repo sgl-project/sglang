@@ -25,8 +25,7 @@ _MIN_BUFFER_TOKENS = 8192
 
 
 def _buffer_height() -> int:
-    """Rows per buffer: the prefill token budget, floored and capped. Without a
-    budget it is the floor; taller batches keep the append kernel."""
+    # Rows per buffer: the prefill token budget, floored and capped; taller batches keep the append kernel.
     schedule = get_schedule()
     budget = max(schedule.chunked_prefill_size or 0, schedule.max_prefill_tokens or 0)
     return min(max(budget, _MIN_BUFFER_TOKENS), _MAX_BUFFER_TOKENS)
@@ -39,8 +38,7 @@ def _allocate_shared_columns(
     shared_weight: float,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """[height, routed_k + n_shared] weight/id buffers with the shared columns
-    pre-filled (id = num_experts + i, weight = shared_weight)."""
+    # Shared columns are pre-filled: id = num_experts + i, weight = shared_weight.
     height = _buffer_height()
     total = routed_k + n_shared
     weights = torch.empty((height, total), dtype=torch.float32, device=device)
@@ -60,8 +58,6 @@ def _shared_columns(
     num_tokens: int,
     device: torch.device,
 ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
-    """The config's persistent buffers, or None when creating them now would
-    land inside a graph capture."""
     n_shared = config.num_shared_topk_slots
     shared_weight = config.fused_shared_experts_scaling_factor
     shared_weight = 1.0 if shared_weight is None else float(shared_weight)
@@ -95,7 +91,7 @@ def _radix4_routes(
     num_expert_group: int,
     topk_group: int,
 ) -> bool:
-    """Whether the ordinary path routes this call with radix4 instead of AITER."""
+    # Whether the ordinary path routes this call with radix4 instead of AITER.
     if not envs.SGLANG_K3_RADIX4_TOPK.get():
         return False
     from sglang.kernels.ops.moe import moe_route_radix4
