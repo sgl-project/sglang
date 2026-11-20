@@ -1898,6 +1898,15 @@ class AscendAttnBackend(AttentionBackend):
                 actual_seq_qlen,
                 actual_seq_lengths_kv,
             )
+        # Before arch35, sparse attention requires a power-of-two head group.
+        # Arch35 supports K3.1's 96 query heads without padding.
+        num_q_heads = q_nope.shape[1]
+        head_padding = (
+            0 if is_npu_arch35() else next_power_of_2(num_q_heads) - num_q_heads
+        )
+        if head_padding:
+            q_nope = torch.nn.functional.pad(q_nope, (0, 0, 0, head_padding))
+            q_pe = torch.nn.functional.pad(q_pe, (0, 0, 0, head_padding))
         attn_out, _, _ = torch_npu.npu_sparse_flash_attention(
             query=q_nope,
             key=k_nope,
@@ -1920,7 +1929,7 @@ class AscendAttnBackend(AttentionBackend):
             attention_mode=2,
             return_softmax_lse=False,
         )
-        return attn_out
+        return attn_out[:, :num_q_heads]
 
     def _forward_fp8_sparse(
         self,
@@ -2181,13 +2190,12 @@ class AscendAttnBackend(AttentionBackend):
                     actual_seq_lengths_kv,
                 )
             else:
-                # npu_sparse_flash_attention requires the GQA group size
-                # (num_q_heads / num_kv_heads) to be a power of two; Kimi K3.1
-                # has 96 q heads / 32 kv heads (group size 3), so pad the query
-                # heads to the next power of two by duplicating the last head
-                # and slice the padding off the output.
+                # Arch35 accepts 96 query heads directly; older architectures
+                # need a power-of-two head count for this shared-KV MLA path.
                 num_q_heads = q_nope.shape[1]
-                pad_heads = next_power_of_2(num_q_heads)
+                pad_heads = (
+                    num_q_heads if is_npu_arch35() else next_power_of_2(num_q_heads)
+                )
                 if pad_heads != num_q_heads:
                     extra = pad_heads - num_q_heads
                     q_nope = torch.cat(

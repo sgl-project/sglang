@@ -24,6 +24,7 @@ class _AscendKDAExtendKernel:
     """Ascend-only KDA prefill decomposition backed by sgl-kernel-npu."""
 
     uses_state_checkpoints: bool = False
+    # Ascend converts the sequence offsets inside extend().
     wants_int64_query_start_loc: bool = False
 
     def extend(
