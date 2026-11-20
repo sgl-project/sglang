@@ -76,7 +76,7 @@ class TestRocmHiSparseFusedKV(CustomTestCase):
             patch.object(forward_mla_rocm, "_use_gfx1250_fused_mla_rope", False),
         ):
             forward_mla_rocm._fused_rope_cat_and_cache(
-                self.attn, torch.empty(0), None, None, None, None, locations
+                self.attn, torch.empty(0, 0, 0), None, None, None, None, locations
             )
             forward_mla_rocm._fused_bmm_rope_cat_and_cache(
                 self.attn, torch.empty(0, 0, 0), None, None, None, None, locations

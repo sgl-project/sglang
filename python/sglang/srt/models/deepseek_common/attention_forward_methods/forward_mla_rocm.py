@@ -460,16 +460,16 @@ def rocm_absorb_v_bmm(
 
 
 def _rope_cache_q_out_dtype(
-    attn: DeepseekV2AttentionMLA, *, q_nope: torch.Tensor
+    attn: DeepseekV2AttentionMLA, *, q_dtype: torch.dtype, num_heads: int
 ) -> torch.dtype:
     """Q dtype the fused RoPE + KV-cache write kernels emit."""
     # gfx1250 MLA decode (aiter ASM, paged Gluon, triton) takes an unquantized Q;
     # q_nope is bf16 there, since rocm_absorb_q_bmm computes in bf16.
     if attn.kv_cache_dtype != "fp8_e4m3" or _use_gfx1250_fused_mla_rope:
-        return q_nope.dtype
+        return q_dtype
     # Gluon MLA decode (bh16bn128) requires bf16 Q; vLLM #50563.
-    if attn.current_attention_backend == "aiter" and q_nope.shape[-2] == 12:
-        return q_nope.dtype
+    if attn.current_attention_backend == "aiter" and num_heads == 12:
+        return q_dtype
     return fp8_dtype
 
 
@@ -495,7 +495,9 @@ def _fused_rope_cat_and_cache(
     out_cache_loc: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """RoPE + concat + KV-cache write via the AITER fused kernel on gfx95 or gfx1250."""
-    q_out_dtype = _rope_cache_q_out_dtype(attn, q_nope=q_nope_out)
+    q_out_dtype = _rope_cache_q_out_dtype(
+        attn, q_dtype=q_nope_out.dtype, num_heads=q_nope_out.shape[-2]
+    )
     if _use_gfx1250_fused_mla_rope:
         # sglang's rope keeps [cos | sin] in one cache; the kernel takes strided
         # cos/sin, so the two halves go in as views.
@@ -640,7 +642,10 @@ def _fused_bmm_rope_cat_and_cache(
         kernel = fused_fp8_bmm_rope_cat_and_cache_mla
         w_scale = attn.w_scale
         kernel_kwargs = {"group_size": 128}
-    q_out_dtype = _rope_cache_q_out_dtype(attn, q_nope=q_nope)
+    # rocm_absorb_q_bmm emits BF16 whatever q_nope is, so the fused Q does too.
+    q_out_dtype = _rope_cache_q_out_dtype(
+        attn, q_dtype=torch.bfloat16, num_heads=q_nope.shape[-2]
+    )
     kv_cache, slot_mapping = _fused_kv_cache_write_target(
         layer_id=attn.attn_mqa.layer_id, out_cache_loc=out_cache_loc
     )

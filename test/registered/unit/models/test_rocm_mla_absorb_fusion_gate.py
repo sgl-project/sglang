@@ -308,7 +308,13 @@ class TestFusedAbsorbQDtype(CustomTestCase):
     cache the MXFP4 fused kernel must emit bf16 Q there, as the split path does.
     The FP8 w_kc kernel feeds DSA, which keeps FP8 Q at any head count."""
 
-    def _q_out_dtype(self, num_heads, kv_cache_dtype, w_kc_dtype=torch.uint8):
+    def _q_out_dtype(
+        self,
+        num_heads,
+        kv_cache_dtype,
+        w_kc_dtype=torch.uint8,
+        q_dtype=torch.bfloat16,
+    ):
         is_mxfp4 = w_kc_dtype == torch.uint8
         attn = SimpleNamespace(
             kv_cache_dtype=kv_cache_dtype,
@@ -321,7 +327,7 @@ class TestFusedAbsorbQDtype(CustomTestCase):
             ),
             attn_mqa=SimpleNamespace(layer_id=0, k_scale=None),
         )
-        q_nope = torch.empty(3, num_heads, 4, dtype=torch.bfloat16)
+        q_nope = torch.empty(3, num_heads, 4, dtype=q_dtype)
         fp4_kernel = mock.Mock()
         fp8_kernel = mock.Mock()
         kv_pool = mock.Mock()
@@ -367,6 +373,24 @@ class TestFusedAbsorbQDtype(CustomTestCase):
             self._q_out_dtype(12, "fp8_e4m3", w_kc_dtype=torch.float8_e4m3fn),
             forward_mla_rocm.fp8_dtype,
         )
+
+    def test_fp16_q_keeps_the_split_absorb_dtype(self):
+        # rocm_absorb_q_bmm emits BF16 whatever q_nope is, so FP16 input must not leak through.
+        fp16 = torch.float16
+        for num_heads, cache, w_kc_dtype, expected in (
+            (12, "fp8_e4m3", torch.uint8, torch.bfloat16),
+            (12, "auto", torch.uint8, torch.bfloat16),
+            (8, "auto", torch.uint8, torch.bfloat16),
+            (12, "auto", torch.float8_e4m3fn, torch.bfloat16),
+            (8, "fp8_e4m3", torch.uint8, forward_mla_rocm.fp8_dtype),
+        ):
+            with self.subTest(num_heads=num_heads, cache=cache, w_kc=w_kc_dtype):
+                self.assertEqual(
+                    self._q_out_dtype(
+                        num_heads, cache, w_kc_dtype=w_kc_dtype, q_dtype=fp16
+                    ),
+                    expected,
+                )
 
 
 _ROPE_HEAD_DIM = 64
