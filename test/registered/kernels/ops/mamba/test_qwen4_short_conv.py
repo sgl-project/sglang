@@ -1,11 +1,15 @@
-"""Correctness coverage for Qwen4 packed-varlen PLE short convolution."""
+"""Correctness coverage for Qwen4 PLE short convolution."""
 
 import unittest
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import torch
 import torch.nn.functional as F
 
+from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
+    fused_mamba_state_scatter_with_mask,
+)
 from sglang.kernels.ops.mamba.qwen4_short_conv import (
     can_fuse_qwen4_varlen_conv,
     fused_qwen4_varlen_conv,
@@ -97,6 +101,102 @@ def _reference(x, weight, state, query_start_loc, state_indices, dilation):
 
 @requires_cuda
 class TestQwen4ShortConv(CustomTestCase):
+    def test_fused_verify_commits_expected_windows(self):
+        width, channels, history = 3, 8, 2
+        pool_size = 6
+        x = torch.arange(
+            1, 3 * width * channels + 1, device="cuda", dtype=torch.bfloat16
+        ).reshape(3 * width, channels)
+        state_slots = torch.tensor([3, 5, 0], device="cuda")
+        # Row 0 is reserved; the maximum request row must remain live.
+        request_rows = torch.tensor([4, pool_size, 0], device="cuda")
+        accepted = torch.tensor([1, 2, -1], device="cuda")
+        lengths = torch.tensor([width, width, 0], device="cuda")
+        cache_locs = torch.arange(1, x.shape[0] + 1, device=x.device)
+        cache_locs[-width:] = 0
+        mode = ForwardMode.TARGET_VERIFY
+        forward_batch = SimpleNamespace(
+            _original_forward_mode=None,
+            forward_mode=mode,
+            req_pool_indices=request_rows,
+            tbo_parent_token_range=None,
+            spec_algorithm=None,
+            spec_info=SimpleNamespace(topk=1, draft_token_num=width),
+            global_num_token_non_padded_cpu=None,
+            extend_seq_lens_cpu=None,
+            out_cache_loc=cache_locs,
+        )
+        layer = qwen4_exp.Qwen4ExpPLELayer.__new__(qwen4_exp.Qwen4ExpPLELayer)
+        torch.nn.Module.__init__(layer)
+        layer.layer_id = 0
+        layer.hidden_size = channels
+        layer.hc_count = 1
+        layer._prefetch_state = None
+        layer.ple_embedding = Mock(return_value=2 * x, enable_ple_fusion=True)
+        layer.key_proj = layer.value_proj = lambda value: (value, None)
+        layer.norm_key = layer.norm_query = layer.norm_conv = torch.nn.Identity()
+        layer.short_conv_dilation = 1
+        layer.conv1d = SimpleNamespace(weight=x.new_ones((channels, 1, history + 1)))
+        layer._short_conv = Mock(side_effect=AssertionError("expected fused verify"))
+
+        state = x.new_zeros((pool_size + 1, channels, history))
+        windows = x.new_zeros((pool_size + 1, width, channels, history))
+        view = SimpleNamespace(
+            layer_cache=lambda _: state,
+            layer_intermediate_cache=lambda _: windows,
+        )
+        router = SimpleNamespace(
+            read=lambda *_: SimpleNamespace(view=view, view_layer_id=0)
+        )
+        expected = state.clone()
+        expected[3] = x[:2].T
+        expected[5] = x[width + 1 : 2 * width].T
+
+        for pp_spec in (False, True):
+            for graph_padding in (False, True):
+                with (
+                    self.subTest(pp_spec=pp_spec, graph_padding=graph_padding),
+                    qwen4_exp.envs.SGLANG_ENABLE_PP_SPEC.override(pp_spec),
+                    patch.object(qwen4_exp.layernorm_sp, "runs_sp", return_value=False),
+                    patch.object(
+                        qwen4_exp,
+                        "get_token_to_kv_pool",
+                        return_value=SimpleNamespace(layer_router=router),
+                    ),
+                    patch.object(
+                        qwen4_exp,
+                        "get_req_to_token_pool",
+                        return_value=SimpleNamespace(size=pool_size),
+                    ),
+                    patch.object(
+                        qwen4_exp,
+                        "get_attn_backend",
+                        return_value=SimpleNamespace(
+                            forward_state_slots=lambda *_: SimpleNamespace(
+                                working=state_slots
+                            )
+                        ),
+                    ),
+                ):
+                    forward_batch.extend_seq_lens = None if graph_padding else lengths
+                    batch = qwen4_exp._prepare_ple_batch(
+                        x.new_zeros(x.shape[0], dtype=torch.long),
+                        forward_batch,
+                        ngram_size=None,
+                        ngram_eos_token_id=None,
+                    )
+                    windows.zero_()
+                    layer(torch.zeros_like(x), forward_batch, batch)
+                    committed = state.clone().unsqueeze(0)
+                    fused_mamba_state_scatter_with_mask(
+                        committed,
+                        windows.unsqueeze(0),
+                        state_slots,
+                        accepted,
+                        request_rows if pp_spec else None,
+                    )
+                    torch.testing.assert_close(committed[0], expected, atol=0, rtol=0)
+
     def test_packed_varlen_matches_padded_reference(self):
         lengths = [1, 2, 8, 9, 10, 33, 0]
         state_indices = [7, 2, 9, 4, 11, 6, 0]

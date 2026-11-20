@@ -65,6 +65,7 @@ def _make_case(mode, fast, monkeypatch):
         physical_tokens=x.shape[0],
         processed_tokens=x.shape[0],
         lengths=torch.tensor(lengths, device="npu"),
+        valid_rows=torch.tensor(lengths, device="npu").ne(0),
         row_width=width,
         req_indices=req.to("npu"),
         token_offsets=offsets.to("npu"),

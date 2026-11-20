@@ -26,7 +26,7 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers import layernorm_sp
 from sglang.srt.layers.attention.linear.utils import (
-    select_verify_intermediate_state_indices,
+    pp_spec_stable_rows_enabled,
 )
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.cp.utils import (
@@ -189,6 +189,7 @@ class _PLEBatch(msgspec.Struct, frozen=True):
     physical_tokens: int
     processed_tokens: int
     lengths: torch.Tensor
+    valid_rows: torch.Tensor
     row_width: int
     req_indices: torch.Tensor
     token_offsets: torch.Tensor
@@ -197,6 +198,7 @@ class _PLEBatch(msgspec.Struct, frozen=True):
     query_start_loc: torch.Tensor | None
     ngram_context: Optional[torch.Tensor]
     ngram_eos_token_id: Optional[int]
+    intermediate_state_indices: torch.Tensor | None = None
 
 
 class _BreakablePLEBatch:
@@ -280,9 +282,8 @@ def _prepare_ple_batch(
     get_req_to_token_pool().ple_window_cache = None
     if mode.is_idle():
         return None
-    use_decode_fast_path = (
-        envs.SGLANG_ENABLE_QWEN4_PLE_FUSION.get() and mode.is_decode()
-    )
+    is_decode = mode.is_decode()
+    use_decode_fast_path = is_decode and envs.SGLANG_ENABLE_QWEN4_PLE_FUSION.get()
 
     if input_ids.dim() > 1:
         input_ids = input_ids.reshape(-1)
@@ -321,7 +322,7 @@ def _prepare_ple_batch(
             )
         req_indices = torch.div(positions, row_width, rounding_mode="floor")
         token_offsets = positions - req_indices * row_width
-    elif mode.is_decode():
+    elif is_decode:
         lengths = torch.ones(processed_tokens, dtype=torch.long, device=tokens.device)
         row_width = 1
         req_indices = positions
@@ -351,44 +352,41 @@ def _prepare_ple_batch(
         token_offsets = positions - query_start_loc.index_select(0, req_indices)
 
     sequence_count = lengths.shape[0]
-    if use_decode_fast_path:
-        # One token per decode row: every offset is valid, no index-select needed.
-        valid_tokens = torch.ones(
-            processed_tokens, dtype=torch.bool, device=tokens.device
-        )
-    else:
-        valid_tokens = token_offsets < lengths.index_select(0, req_indices)
-
-    # The forward's resolved slots: the request table may already be reused here.
-    # Graph replay marks padded rows -1; the clamp sends them to dummy slot 0.
+    # Use the forward's resolved slots: the request table may already be reused.
+    # Both request rows and state slots reserve row 0 for padding.
     state_indices = (
         get_attn_backend()
         .forward_state_slots(sequence_count, None)
         .working.long()
         .clamp(min=0)
     )
-
-    # CUDA graph padding uses request slot 0, which may belong to a real request.
-    # Map padded sequences to the state pools' reserved dummy slot instead.
     out_cache_loc = forward_batch.out_cache_loc
-    if use_decode_fast_path:
+    if is_decode:
         if out_cache_loc is not None:
             state_indices = torch.where(
-                out_cache_loc[:sequence_count].ne(0),
-                state_indices,
-                torch.zeros_like(state_indices),
+                out_cache_loc[:sequence_count].ne(0), state_indices, 0
             )
+        # Decode has one token per row. The masked slots already encode padding.
+        valid_rows = state_indices.ne(0)
+        valid_tokens = valid_rows
     else:
-        valid = lengths.ne(0)
-        if out_cache_loc is not None and mode.is_decode():
-            valid = valid & out_cache_loc[:sequence_count].ne(0)
-        elif out_cache_loc is not None and mode.is_target_verify():
-            valid = valid & out_cache_loc[:processed_tokens].reshape(
+        valid_rows = lengths.ne(0) & state_indices.ne(0)
+        if out_cache_loc is not None and mode.is_target_verify():
+            valid_rows = valid_rows & out_cache_loc[:processed_tokens].reshape(
                 sequence_count, row_width
             ).ne(0).any(dim=1)
-        state_indices = torch.where(
-            valid, state_indices, torch.zeros_like(state_indices)
-        )
+        state_indices = torch.where(valid_rows, state_indices, 0)
+        valid_tokens = (
+            token_offsets < lengths.index_select(0, req_indices)
+        ) & valid_rows.index_select(0, req_indices)
+
+    intermediate_state_indices = None
+    if mode.is_target_verify() and pp_spec_stable_rows_enabled():
+        # Request rows are 1..size; size is live, so discard padding in row 0.
+        # Compute once for fused/unfused convolution and the N-gram commit.
+        intermediate_state_indices = torch.where(
+            valid_rows, forward_batch.req_pool_indices[:sequence_count], 0
+        ).to(torch.int32)
 
     ngram_context = None
     if ngram_size is not None:
@@ -423,6 +421,7 @@ def _prepare_ple_batch(
         physical_tokens=physical_tokens,
         processed_tokens=processed_tokens,
         lengths=lengths,
+        valid_rows=valid_rows,
         row_width=row_width,
         req_indices=req_indices,
         token_offsets=token_offsets,
@@ -431,6 +430,7 @@ def _prepare_ple_batch(
         query_start_loc=packed_query_start_loc,
         ngram_context=ngram_context,
         ngram_eos_token_id=ngram_eos_token_id,
+        intermediate_state_indices=intermediate_state_indices,
     )
 
 
@@ -440,7 +440,6 @@ def _commit_ple_batch(batch: Optional[_PLEBatch], forward_batch: ForwardBatch) -
     if batch is None or batch.ngram_context is None or not batch.processed_tokens:
         return
 
-    pool = get_req_to_token_pool()
     ngram = get_token_to_kv_pool().layer_router.part_view(NGRAM_PART)
     context = batch.ngram_context
     context_len = context.shape[1] - batch.row_width
@@ -449,12 +448,7 @@ def _commit_ple_batch(batch: Optional[_PLEBatch], forward_batch: ForwardBatch) -
         valid_steps = batch.valid_tokens.reshape(
             batch.lengths.shape[0], batch.row_width
         )
-        dst_indices_raw = select_verify_intermediate_state_indices(
-            None,
-            forward_batch.req_pool_indices,
-            batch.lengths.ne(0),
-            pool.size,
-        )
+        dst_indices_raw = batch.intermediate_state_indices
         ngram.set_intermediate_context(
             torch.where(
                 valid_steps.unsqueeze(-1),
@@ -1395,12 +1389,7 @@ class Qwen4ExpPLELayer(nn.Module):
                 intermediate_state = intermediate_state.to(
                     dtype=intermediate_cache.dtype
                 )
-                dst_indices_raw = select_verify_intermediate_state_indices(
-                    None,
-                    forward_batch.req_pool_indices,
-                    batch.lengths.ne(0),
-                    get_req_to_token_pool().size,
-                )
+                dst_indices_raw = batch.intermediate_state_indices
                 if dst_indices_raw is None:
                     intermediate_cache[
                         : batch.lengths.shape[0], : batch.row_width
@@ -1600,6 +1589,9 @@ class Qwen4ExpPLELayer(nn.Module):
             short_conv = get_token_to_kv_pool().layer_router.read(
                 self.layer_id, SHORT_CONV_PART
             )
+            intermediate_cache = short_conv.view.layer_intermediate_cache(
+                short_conv.view_layer_id
+            )
             conv_args = (
                 gated_value_normed,
                 gated_value,
@@ -1609,10 +1601,13 @@ class Qwen4ExpPLELayer(nn.Module):
                 batch.valid_tokens,
                 batch.row_width,
                 self.short_conv_dilation,
-                short_conv.view.layer_intermediate_cache(short_conv.view_layer_id),
+                intermediate_cache,
             )
             if can_fuse_qwen4_verify_conv(*conv_args):
-                output = fused_qwen4_verify_conv(*conv_args)
+                output = fused_qwen4_verify_conv(
+                    *conv_args,
+                    intermediate_state_indices=batch.intermediate_state_indices,
+                )
                 return _pad_token_rows(output, batch.physical_tokens)
         if sp_active:
             full_conv_input = layernorm_sp.all_gather_token_rows(
