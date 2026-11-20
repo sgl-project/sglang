@@ -212,6 +212,7 @@ from sglang.srt.server_args import (
     ServerArgs,
     redact_server_args_secrets,
 )
+from sglang.srt.speculative.dfly_validation import resolve_hy4_dfly_sampling_defaults
 from sglang.srt.speculative.spec_decoding_metrics import (
     populate_spec_info,
 )
@@ -1762,6 +1763,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             sampling_kwargs = {**self.preferred_sampling_params, **obj.sampling_params}
         else:
             sampling_kwargs = dict(obj.sampling_params)
+        if get_spec().speculative_algorithm == "DFLY":
+            sampling_kwargs = resolve_hy4_dfly_sampling_defaults(
+                sampling_kwargs,
+                request_sampling=sampling_kwargs,
+                architectures=self.model_config.hf_config.architectures,
+            )
         if isinstance(obj, GenerateReqInput) and obj.watermark is not None:
             if sampling_kwargs.get("watermark") is not None:
                 raise ValueError(

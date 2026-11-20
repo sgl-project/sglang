@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import copy
 import logging
-from typing import Any
+from typing import Any, Optional, Sequence
 
 from sglang.srt.arg_groups.model_override_base import (
     model_config_of,
@@ -342,11 +342,15 @@ def handle_gpu_memory_settings(server_args: Any):
 
         # Multimodal models need more memory for the image processing.
         if is_vlm:
+            fixed_encoder_headroom = post_capture_kv_sizing or (
+                # A fixed reserve needs a capacity; otherwise keep the relative cut.
+                gpu_mem is not None and _is_hy4_vl(model_config.hf_config.architectures)
+            )
             mem_fraction_static = adjust_mem_fraction_for_vlm(
                 mem_fraction_static,
                 model_config,
-                post_capture_kv_sizing,
-                gpu_mem,
+                fixed_encoder_headroom=fixed_encoder_headroom,
+                gpu_mem=gpu_mem,
             )
 
         declare_resolution(
@@ -427,15 +431,20 @@ def reserve_for_deepep_a2a_mb(server_args: Any) -> float:
     return 0.0
 
 
+def _is_hy4_vl(architectures: Optional[Sequence[str]]) -> bool:
+    return bool(architectures) and architectures[0] == "HYV4VLForConditionalGeneration"
+
+
 def adjust_mem_fraction_for_vlm(
     mem_fraction_static: float,
     model_config,
-    post_capture_kv_sizing: bool,
+    *,
+    fixed_encoder_headroom: bool,
     gpu_mem,
 ) -> float:
-    if post_capture_kv_sizing:
-        # Graph and activation memory will be measured after capture, so only
-        # reserve a fixed 8 GiB of VLM headroom for image-encoder execution here.
+    if fixed_encoder_headroom:
+        # Fixed 8 GiB for the image encoder: post-capture sizing measures the rest,
+        # and a relative cut can shrink Hy4-VL's static budget below its weights.
         return (
             mem_fraction_static - 8 * 1024 / gpu_mem
             if gpu_mem is not None

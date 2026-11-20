@@ -123,7 +123,8 @@ def pcg_dsa_indexer_prefill_split(
     # Fused path stores K and computes q_fp8 + head gate in the
     # fused kernels, sliced to the unpadded count. Single stream: the split op is
     # captured, so the dual-stream overlap is disabled.
-    if indexer.use_dsa_indexer_fusion and not in_cp:
+    # The fused rope kernels index the cache with 1-D positions only.
+    if indexer.use_dsa_indexer_fusion and positions.ndim == 1 and not in_cp:
         q_fp8, weights = indexer._fused_q_prepare_and_store(
             x,
             q_lora,

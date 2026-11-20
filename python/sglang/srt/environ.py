@@ -1,11 +1,15 @@
 import base64
 import functools
+import importlib.util
 import json
 import os
+import re
+import shutil
+import subprocess
 import warnings
 from contextlib import contextmanager
 from enum import IntEnum
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Tuple
 
 
 @functools.lru_cache(maxsize=1)
@@ -1707,6 +1711,12 @@ class Envs:
     SGLANG_FORCE_FUSED_OP_BACKEND = EnvStr(None)
     USE_TRITON_W8A8_FP8_KERNEL = EnvBool(False)
     SGLANG_MOE_PADDING = EnvBool(False)
+    # HYV4 iHC backend policy: hpc | triton | mode (hpc for prefill, Triton/Torch
+    # for decode) | batch (Triton pre below the T threshold, hpc otherwise).
+    SGLANG_HY4_IHC_DECODE_POLICY = EnvStr("hpc")
+    # Token count at which the batch policy switches standalone pre to hpc.
+    # Measured H200 D=6144 crossover with 156 cycled weight matrices: ~130.
+    SGLANG_HY4_IHC_PRE_T_THRESHOLD = EnvInt(128)
 
     # ===================================================================
     # Logits and log-probability processing
@@ -2818,6 +2828,64 @@ def redirect_third_party_caches():
     """
     for key, value in third_party_cache_defaults().items():
         os.environ.setdefault(key, value)
+
+
+# Arbitrary bound; `ptxas --version` returns in milliseconds.
+_PTXAS_PROBE_TIMEOUT_S = 5
+
+
+def _ptxas_release(ptxas: str) -> Optional[Tuple[int, int]]:
+    try:
+        out = subprocess.run(
+            [ptxas, "--version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            errors="replace",
+            timeout=_PTXAS_PROBE_TIMEOUT_S,
+            check=True,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    match = re.search(r"release (\d+)\.(\d+)", out)
+    return (int(match.group(1)), int(match.group(2))) if match else None
+
+
+def keep_triton_blackwell_ptxas():
+    """Keep Triton's bundled Blackwell ptxas over an older CUDA release on PATH.
+
+    Importing FlashInfer points TRITON_PTXAS_BLACKWELL_PATH at any CUDA >= 13
+    ptxas on PATH, even one older than Triton's own, and ptxas 13.0 fuses
+    f32x2 mul/add into FFMA2 despite --fmad=false. Must run before FlashInfer
+    is imported; it cannot undo a choice FlashInfer already made. Sets the
+    variable only when both releases are identified and the bundled one is
+    strictly newer; an explicit setting is left as is.
+    """
+    # not a knob: Triton owns this variable; sglang only fills in a default.
+    if "TRITON_PTXAS_BLACKWELL_PATH" in os.environ:
+        return
+    try:
+        triton_spec = importlib.util.find_spec("triton")
+    except ValueError:
+        return
+    path_ptxas = shutil.which("ptxas")
+    if triton_spec is None or triton_spec.origin is None or path_ptxas is None:
+        return
+    bundled = os.path.join(
+        os.path.dirname(triton_spec.origin),
+        "backends",
+        "nvidia",
+        "bin",
+        "ptxas-blackwell",
+    )
+    if not os.path.isfile(bundled):
+        return
+    bundled_release = _ptxas_release(bundled)
+    if bundled_release is None:
+        return
+    path_release = _ptxas_release(path_ptxas)
+    if path_release is not None and bundled_release > path_release:
+        os.environ["TRITON_PTXAS_BLACKWELL_PATH"] = bundled
 
 
 _handle_deprecated_envs()

@@ -18,6 +18,7 @@ from typing import Callable, Optional
 
 import torch
 
+from sglang.srt.layers.layer_boundary.facts import ReadFacts, UpdateFacts
 from sglang.srt.layers.layer_boundary.residual import LayerResidualOps
 from sglang.srt.runtime_context import get_parallel
 
@@ -95,6 +96,17 @@ class IHCState:
             attn_update=_AttnUpdate(self),
             ffn_readout=_FfnReadout(self),
             ffn_update=_FfnUpdate(self),
+        )
+
+    @staticmethod
+    def facts() -> LayerResidualOps:
+        """What residual_ops() declares (see facts_of), for a layer that is not
+        built: its reads and updates carry only class constants."""
+        return LayerResidualOps(
+            attn_readout=ReadFacts.of(_AttnReadout),
+            attn_update=UpdateFacts.of(_AttnUpdate),
+            ffn_readout=ReadFacts.of(_FfnReadout),
+            ffn_update=UpdateFacts.of(_FfnUpdate),
         )
 
 

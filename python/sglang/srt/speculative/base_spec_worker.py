@@ -213,6 +213,7 @@ class BaseSpecWorker(ABC):
             draft_worker is None
             or spec_algorithm.is_ngram()
             or spec_algorithm.is_frozen_kv_mtp()
+            or spec_algorithm.is_dfly()
         ):
             return ()
         if spec_algorithm.is_dflash_family():

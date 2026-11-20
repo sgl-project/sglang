@@ -84,7 +84,8 @@ if _is_cuda or _is_xpu or _is_musa:
                 beta: torch.Tensor,
                 eps: float = 1e-6,
             ) -> torch.Tensor:
-                return flashinfer.norm.layernorm(input, gamma, beta, eps)
+                # FlashInfer's CUDA LayerNorm assumes contiguous row storage.
+                return flashinfer.norm.layernorm(input.contiguous(), gamma, beta, eps)
 
             _flashinfer_layernorm_available = True
         except (ImportError, AttributeError):

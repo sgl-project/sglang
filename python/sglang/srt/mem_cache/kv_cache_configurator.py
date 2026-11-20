@@ -2998,6 +2998,41 @@ class KVCacheConfigurator:
         )
         return ring_bytes
 
+    def _hyv4_dfly_buffer_bytes(self) -> int:
+        if self.is_draft_worker or not self.spec_algorithm.is_dfly():
+            return 0
+        from sglang.srt.configs.hy_v4 import HYV4VLConfig
+        from sglang.srt.configs.hy_v4_dfly import resolve_hyv4_dfly_spec
+        from sglang.srt.speculative.dfly_utils import vl_dfly_buffer_bytes
+        from sglang.srt.speculative.dfly_validation import dfly_targets_hy4_flash
+
+        hf_config = self.model_config.hf_config
+        if dfly_targets_hy4_flash(hf_config.architectures):
+            return 0
+        text_config = (
+            hf_config.text_config if isinstance(hf_config, HYV4VLConfig) else hf_config
+        )
+        max_num_reqs = max(1, get_schedule().max_running_requests // self.attn_dp_size)
+        num_request_rows = (
+            self._req_pool_rows(max_num_reqs) + self._req_pool_pre_alloc_size() + 1
+        )
+        nbytes = vl_dfly_buffer_bytes(
+            spec=resolve_hyv4_dfly_spec(
+                text_config,
+                speculative_num_draft_tokens=get_spec().speculative_num_draft_tokens,
+            ),
+            hidden_size=text_config.hidden_size,
+            hidden_dtype=self.model_dtype,
+            num_request_rows=num_request_rows,
+        )
+        logger.info(
+            "DFLY request state and verify buffers: %d request rows, %.2f GB "
+            "charged to the KV budget.",
+            num_request_rows,
+            nbytes / (1 << 30),
+        )
+        return nbytes
+
     def _hybrid_full_attention_pool_class(
         self, *, mha_pool_class: type, mla_pool_class: type, dsa_pool_class: type
     ) -> type:
@@ -3330,6 +3365,7 @@ class KVCacheConfigurator:
         if self.mambaish_config is not None and not get_memory().enable_unified_memory:
             rest_memory = self._handle_max_mamba_cache(rest_memory)
         rest_memory -= self._dflash_draft_kv_ring_bytes() / (1 << 30)
+        rest_memory -= self._hyv4_dfly_buffer_bytes() / (1 << 30)
 
         # Loaded weights (target + draft) can exceed the static budget
         if rest_memory <= 0:

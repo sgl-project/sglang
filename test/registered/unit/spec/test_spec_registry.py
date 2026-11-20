@@ -293,7 +293,7 @@ class TestConformanceGuard(_RegistryIsolated):
         interface = {
             name
             for name in vars(SpeculativeAlgorithm)
-            if name.startswith(("is_", "supports_"))
+            if name.startswith(("is_", "supports_", "uses_"))
         }
         body = {m: (lambda self: False) for m in interface if m != method}
         return type("Broken", (), body)
@@ -312,12 +312,12 @@ class TestConformanceGuard(_RegistryIsolated):
                 return MagicMock
 
     def test_enum_interface_subset_of_custom_spec_algo(self):
-        # Every is_*/supports_* method on the enum exists on CustomSpecAlgo.
+        # Every is_*/supports_*/uses_* method on the enum exists on CustomSpecAlgo.
         # vars() (not dir()) because EnumMeta.__dir__ hides instance methods.
         interface = {
             name
             for name in vars(SpeculativeAlgorithm)
-            if name.startswith(("is_", "supports_"))
+            if name.startswith(("is_", "supports_", "uses_"))
         }
         self.assertTrue(interface)  # guard against an empty (no-op) interface
         self.assertEqual(interface - set(dir(CustomSpecAlgo)), set())

@@ -517,6 +517,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                             else None
                         ),
                     )
+                    sampling_params = self._resolve_speculative_sampling_defaults(
+                        request, sampling_params
+                    )
                     if processed_messages is not None:
                         set_request_reasoning_end_token_ids(
                             sampling_params,

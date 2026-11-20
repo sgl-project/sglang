@@ -34,6 +34,9 @@ class SpecTpSyncSite(IntEnum):
     DFLASH_ACCEPT_GREEDY = 15
     DFLASH_TARGET = 16
 
+    DFLY_ACCEPT_GREEDY = 18
+    DFLY_ACCEPT_SAMPLE = 19
+
     @property
     def slug(self) -> str:
         return self.name.lower().replace("_", "-")
@@ -51,6 +54,7 @@ _RNG = frozenset(
         SpecTpSyncSite.DFLASH_SELECTOR,
         SpecTpSyncSite.DFLASH_ACCEPT_SAMPLE,
         SpecTpSyncSite.DFLASH_TARGET,
+        SpecTpSyncSite.DFLY_ACCEPT_SAMPLE,
     }
 )
 

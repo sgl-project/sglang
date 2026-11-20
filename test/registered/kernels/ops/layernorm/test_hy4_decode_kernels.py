@@ -8,6 +8,8 @@ import triton.language as tl
 from torch import nn
 
 import sglang.kernels.ops.layernorm.hy4_ihc as hy4_ihc
+from sglang.srt.environ import envs
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.models import hunyuan_v4
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -119,6 +121,64 @@ def _reference_hy4_ihc_pre(x, hc_fn, hc_scale, hc_base):
     return y, post
 
 
+def _ihc_pre_inputs(num_tokens, hidden_size, hc_mult=4):
+    x = torch.randn(
+        num_tokens, hc_mult, hidden_size, device="cuda", dtype=torch.bfloat16
+    )
+    hc_fn = (
+        torch.randn(
+            2 * hc_mult, hc_mult * hidden_size, device="cuda", dtype=torch.float32
+        )
+        * 0.02
+    )
+    hc_scale = torch.tensor([0.7, 1.3], device="cuda", dtype=torch.float32)
+    hc_base = torch.randn(2 * hc_mult, device="cuda", dtype=torch.float32) * 0.5
+    return x, hc_fn, hc_scale, hc_base
+
+
+def _fp64_hy4_ihc_pre(x, hc_fn, hc_scale, hc_base, magnitude, norm_eps, hc_eps):
+    num_tokens, hc_mult, _ = x.shape
+    x64 = x.double()
+    flat = x64.reshape(num_tokens, -1)
+    rsqrt = torch.rsqrt(flat.square().mean(dim=-1, keepdim=True) + norm_eps)
+    scale = hc_scale.double().repeat_interleave(hc_mult)
+    gate = torch.sigmoid(flat @ hc_fn.double().T * rsqrt * scale + hc_base.double())
+    pre = gate[:, :hc_mult] + hc_eps
+    post = magnitude * gate[:, hc_mult:] + hc_eps
+    return (pre.unsqueeze(-1) * x64).sum(dim=1), post
+
+
+class _TupleLinear(nn.Module):
+    def __init__(self, input_size, output_size, **kwargs):
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(output_size, input_size))
+
+    def forward(self, inputs):
+        return nn.functional.linear(inputs, self.weight), None
+
+
+_TINY_HC_CONFIG = SimpleNamespace(
+    hidden_size=8,
+    hc_mult=2,
+    hc_magnitude=2.0,
+    hc_eps=1e-6,
+    rms_norm_eps=1e-5,
+)
+
+
+def _tiny_hc_layers():
+    config = _TINY_HC_CONFIG
+    with patch.object(hunyuan_v4, "ReplicatedLinear", _TupleLinear):
+        pre_layer = hunyuan_v4.HYV4HCPreLayer(config, "pre").cuda()
+        layer = hunyuan_v4.HYV4HCLayer(config, "layer").cuda()
+        next_layer = hunyuan_v4.HYV4HCLayer(config, "next").cuda()
+        head_layer = hunyuan_v4.HYV4HCHeadLayer(config, "head").cuda()
+    norm = hunyuan_v4.RMSNorm(
+        config.hidden_size, eps=config.rms_norm_eps, force_native=True
+    ).cuda()
+    return pre_layer, layer, next_layer, head_layer, norm
+
+
 @unittest.skipUnless(torch.cuda.is_available(), "HYV4 Triton kernels need CUDA")
 class TestHy4DecodeKernels(CustomTestCase):
     def test_split_k_matches_single_cta(self):
@@ -128,31 +188,10 @@ class TestHy4DecodeKernels(CustomTestCase):
             (1, 4096),
             (3, 4100),
             (31, 6144),
-            (64, 6144),
+            (hy4_ihc._IHC_TOKEN_BLOCKED_MIN_T - 1, 6144),
         ):
             with self.subTest(num_tokens=num_tokens, hidden_size=hidden_size):
-                hc_mult = 4
-                k_total = hc_mult * hidden_size
-                x = torch.randn(
-                    num_tokens,
-                    hc_mult,
-                    hidden_size,
-                    device="cuda",
-                    dtype=torch.bfloat16,
-                )
-                hc_fn = (
-                    torch.randn(
-                        2 * hc_mult,
-                        k_total,
-                        device="cuda",
-                        dtype=torch.float32,
-                    )
-                    * 0.02
-                )
-                hc_scale = torch.tensor([0.7, 1.3], device="cuda", dtype=torch.float32)
-                hc_base = (
-                    torch.randn(2 * hc_mult, device="cuda", dtype=torch.float32) * 0.5
-                )
+                x, hc_fn, hc_scale, hc_base = _ihc_pre_inputs(num_tokens, hidden_size)
 
                 expected = _reference_hy4_ihc_pre(x, hc_fn, hc_scale, hc_base)
                 with patch.object(hy4_ihc, "_hpc_ihc_op", return_value=None):
@@ -163,22 +202,30 @@ class TestHy4DecodeKernels(CustomTestCase):
                 self.assertTrue(torch.equal(actual[0], expected[0]))
                 self.assertTrue(torch.equal(actual[1], expected[1]))
 
+    def test_token_blocked_split_k_matches_fp64_reference(self):
+        """From _IHC_TOKEN_BLOCKED_MIN_T tokens the pre kernel sums in another
+        order, so it is held to an fp64 reference instead of bitwise."""
+        torch.manual_seed(0)
+        min_t = hy4_ihc._IHC_TOKEN_BLOCKED_MIN_T
+        # 65 tokens leave a partial token block; 4100 leaves K and D tail tiles.
+        for num_tokens, hidden_size in ((min_t, 6144), (min_t + 1, 4100)):
+            with self.subTest(num_tokens=num_tokens, hidden_size=hidden_size):
+                inputs = _ihc_pre_inputs(num_tokens, hidden_size)
+                with patch.object(hy4_ihc, "_hpc_ihc_op", return_value=None):
+                    y, post = hy4_ihc.fused_hy4_ihc_pre(*inputs, 2.0, 1e-6, 1e-6)
+                y_ref, post_ref = _fp64_hy4_ihc_pre(*inputs, 2.0, 1e-6, 1e-6)
+
+                self.assertTrue(torch.isfinite(y).all())
+                self.assertTrue(torch.isfinite(post).all())
+                # rtol on y is half a bf16 ulp; each atol is ~10x the worst fp32
+                # error measured over 40 seeds on GB300 (9.4e-7 y, 1.7e-6 post).
+                torch.testing.assert_close(y.double(), y_ref, rtol=2**-8, atol=1e-5)
+                torch.testing.assert_close(
+                    post.double(), post_ref, rtol=1e-5, atol=1e-5
+                )
+
     def test_fused_ihc_failure_disables_each_path(self):
-        class TupleLinear(nn.Module):
-            def __init__(self, input_size, output_size):
-                super().__init__()
-                self.weight = nn.Parameter(torch.randn(output_size, input_size))
-
-            def forward(self, inputs):
-                return nn.functional.linear(inputs, self.weight), None
-
-        config = SimpleNamespace(
-            hidden_size=8,
-            hc_mult=2,
-            hc_magnitude=2.0,
-            hc_eps=1e-6,
-            rms_norm_eps=1e-5,
-        )
+        config = _TINY_HC_CONFIG
         counts = {"pre": 0, "post": 0, "post_pre": 0, "head": 0}
 
         def fail(name):
@@ -188,19 +235,8 @@ class TestHy4DecodeKernels(CustomTestCase):
 
             return raise_error
 
-        def make_linear(input_size, output_size, **kwargs):
-            return TupleLinear(input_size, output_size)
-
-        with patch.object(hunyuan_v4, "ReplicatedLinear", make_linear):
-            pre_layer = hunyuan_v4.HYV4HCPreLayer(config, "pre").cuda()
-            layer = hunyuan_v4.HYV4HCLayer(config, "layer").cuda()
-            next_layer = hunyuan_v4.HYV4HCLayer(config, "next").cuda()
-            head_layer = hunyuan_v4.HYV4HCHeadLayer(config, "head").cuda()
-
+        pre_layer, layer, next_layer, head_layer, norm = _tiny_hc_layers()
         next_layer.hc_pre._fused_ihc_pre_disabled = True
-        norm = hunyuan_v4.RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps, force_native=True
-        ).cuda()
         hidden_states = torch.randn(3, 2, 8, device="cuda")
         output = torch.randn(3, 8, device="cuda")
         residual = torch.randn(3, 2, 8, device="cuda")
@@ -223,6 +259,150 @@ class TestHy4DecodeKernels(CustomTestCase):
         self.assertEqual(counts, {"pre": 1, "post": 1, "post_pre": 1, "head": 1})
         self.assertEqual(len(logs.records), 4)
         self.assertTrue(all(record.exc_info is not None for record in logs.records))
+
+    def test_ihc_policy_normalizes_each_path_exactly_once(self):
+        """Whichever backend the policy picks, RMSNorm must run exactly once
+        (model norm or folded hpc op), never the multi-kernel torch fallback."""
+        _, layer, next_layer, head_layer, norm = _tiny_hc_layers()
+        hc_mult, hidden_size = _TINY_HC_CONFIG.hc_mult, _TINY_HC_CONFIG.hidden_size
+        hidden_states = torch.randn(3, hc_mult, hidden_size, device="cuda")
+        output = torch.randn(3, hidden_size, device="cuda")
+        post = torch.rand(3, hc_mult, device="cuda")
+        folded = []
+
+        def fake_pre(x, *args):
+            folded.append(("pre", args[6] is not None))
+            return x[:, 0], torch.ones(x.shape[:2], device=x.device)
+
+        def fake_post_pre(output, residual, post, *args):
+            folded.append(("post_pre", args[6] is not None))
+            return residual, output, post
+
+        def fake_head(hidden_states, *args):
+            folded.append(("head", args[5] is not None))
+            return hidden_states[:, 0]
+
+        fakes = {
+            "fuse_ihc_pre": fake_pre,
+            "fuse_ihc_post_pre": fake_post_pre,
+            "fuse_ihc_post": lambda output, residual, post: residual,
+            "fuse_ihc_head": fake_head,
+        }
+        all_folded = [("pre", True), ("post_pre", True), ("head", True)]
+        cases = [
+            ("hpc", False, all_folded, 0),
+            ("triton", False, [], 3),
+            ("mode", False, all_folded, 0),
+            ("mode", True, [], 3),
+            ("batch", True, [("post_pre", True), ("head", True)], 1),
+        ]
+        self.addCleanup(hy4_ihc._ihc_policy.cache_clear)
+        for policy, is_decode, expected_folded, expected_norms in cases:
+            folded.clear()
+            hy4_ihc._ihc_policy.cache_clear()
+            with (
+                self.subTest(policy=policy, is_decode=is_decode),
+                envs.SGLANG_HY4_IHC_DECODE_POLICY.override(policy),
+                hy4_ihc.hy4_ihc_forward_mode(is_decode),
+                patch.object(hy4_ihc, "_hpc_ihc_op", lambda op, *_: fakes[op]),
+                patch.object(hy4_ihc, "fused_hy4_ihc_head", fake_head),
+                patch.object(
+                    hy4_ihc, "_rms_norm", wraps=hy4_ihc._rms_norm
+                ) as torch_norm,
+                patch.object(norm, "forward", wraps=norm.forward) as norm_forward,
+                self.assertNoLogs(hunyuan_v4.logger, level="WARNING"),
+            ):
+                layer.pre(hidden_states, norm)
+                layer.post_pre(output, hidden_states, post, next_layer, norm)
+                head_layer(hidden_states, norm)
+                self.assertEqual(folded, expected_folded)
+                self.assertEqual(norm_forward.call_count, expected_norms)
+                self.assertEqual(torch_norm.call_count, 0)
+
+    def test_target_verify_graph_keeps_the_capture_time_ihc_choice(self):
+        """A speculative verify step is extend-side: its CUDA graph must bake in
+        the hpc ops with RMSNorm folded, whatever context the replay runs under."""
+        _, layer, next_layer, head_layer, norm = _tiny_hc_layers()
+        hc_mult, hidden_size = _TINY_HC_CONFIG.hc_mult, _TINY_HC_CONFIG.hidden_size
+        hidden_states = torch.randn(6, hc_mult, hidden_size, device="cuda")
+        output = torch.randn(6, hidden_size, device="cuda")
+        folded = []
+
+        def fake_pre(x, *args):
+            folded.append(("pre", args[6] is not None))
+            return x[:, 0] + 100, x.new_ones(x.shape[:2])
+
+        def fake_post_pre(output, residual, post, *args):
+            folded.append(("post_pre", args[6] is not None))
+            return residual + 100, output + 100, post
+
+        def fake_head(hidden_states, *args):
+            folded.append(("head", args[5] is not None))
+            return hidden_states[:, 0] + 100
+
+        fakes = {
+            "fuse_ihc_pre": fake_pre,
+            "fuse_ihc_post_pre": fake_post_pre,
+            "fuse_ihc_post": lambda output, residual, post: residual,
+            "fuse_ihc_head": fake_head,
+        }
+
+        def run(mode):
+            folded.clear()
+            with hunyuan_v4._ihc_forward_mode(SimpleNamespace(forward_mode=mode)):
+                reduced, post, residual = layer.pre(hidden_states, norm)
+                next_reduced, _, next_residual = layer.post_pre(
+                    output, residual, post, next_layer, norm
+                )
+                return reduced, next_reduced, head_layer(next_residual, norm)
+
+        all_folded = [("pre", True), ("post_pre", True), ("head", True)]
+        # batch counts tokens, not requests: 2 requests x 3 draft tokens cross 4.
+        cases = [("mode", 128, []), ("batch", 4, all_folded)]
+        self.addCleanup(hy4_ihc._ihc_policy.cache_clear)
+        for policy, threshold, decode_folded in cases:
+            hy4_ihc._ihc_policy.cache_clear()
+            with (
+                self.subTest(policy=policy),
+                envs.SGLANG_HY4_IHC_DECODE_POLICY.override(policy),
+                envs.SGLANG_HY4_IHC_PRE_T_THRESHOLD.override(threshold),
+                patch.object(hy4_ihc, "_hpc_ihc_op", lambda op, *_: fakes[op]),
+                patch.object(hy4_ihc, "fused_hy4_ihc_head", fake_head),
+                patch.object(
+                    hy4_ihc, "_rms_norm", wraps=hy4_ihc._rms_norm
+                ) as torch_norm,
+                patch.object(norm, "forward", wraps=norm.forward) as norm_forward,
+                self.assertNoLogs(hunyuan_v4.logger, level="WARNING"),
+            ):
+                decode = run(ForwardMode.DECODE)
+                self.assertEqual(folded, decode_folded)
+                run(ForwardMode.EXTEND)
+                self.assertEqual(folded, all_folded)
+
+                warmup_stream = torch.cuda.Stream()
+                warmup_stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(warmup_stream):
+                    run(ForwardMode.TARGET_VERIFY)
+                torch.cuda.current_stream().wait_stream(warmup_stream)
+                eager = [t.clone() for t in run(ForwardMode.TARGET_VERIFY)]
+
+                norm_forward.reset_mock()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    captured = run(ForwardMode.TARGET_VERIFY)
+                self.assertEqual(folded, all_folded)
+                self.assertEqual(norm_forward.call_count, 0)
+                self.assertEqual(torch_norm.call_count, 0)
+
+                for tensor in captured:
+                    tensor.zero_()
+                with hy4_ihc.hy4_ihc_forward_mode(True):
+                    graph.replay()
+                torch.cuda.synchronize()
+                self.assertTrue(all(map(torch.equal, eager, captured)))
+                self.assertEqual(
+                    not all(map(torch.equal, eager, decode)), policy == "mode"
+                )
 
 
 if __name__ == "__main__":

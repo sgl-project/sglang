@@ -90,6 +90,7 @@ def triton_sparse_mla_decode_splitk(
     lengths: torch.Tensor | None = None,
     expected_topk: int | None = None,
     natural_lse: bool = False,
+    attn_sink: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Split-K Triton sparse MLA decode (DSv4 pattern).
 
@@ -104,8 +105,13 @@ def triton_sparse_mla_decode_splitk(
              transform_index_page_table_dcp (transform_index.py) or dcp_local_topk.
     expected_topk: typical lengths value, which sizes the split count instead of topk
     natural_lse: return the LSE in natural log, -inf for a row with no key
+    attn_sink: optional [H] fp32 per-head sink logits added to the softmax
+               denominator (the returned LSE excludes them)
     returns: [1, bs, H, d_v] bf16, plus a [bs, H] fp32 base-2 LSE if return_lse
     """
+    if attn_sink is not None:
+        assert attn_sink.shape == (q_nope.shape[1],)
+        assert attn_sink.dtype == torch.float32
     kv, kv_scaled = _as_scaled_fp8_kv(kv, d_v, q_rope.shape[-1])
     is_fp8 = _validate_input_dtypes(q_nope, q_rope, kv)
     use_fp8_dot = is_fp8 and not kv_scaled
@@ -228,6 +234,8 @@ def triton_sparse_mla_decode_splitk(
                 lse_out_ptr=lse,
                 STORE_LSE=return_lse,
                 NATURAL_LSE=natural_lse,
+                sink_ptr=attn_sink,
+                HAS_SINK=attn_sink is not None,
                 num_warps=fused_num_warps,
                 num_stages=2,
             )
@@ -301,6 +309,8 @@ def triton_sparse_mla_decode_splitk(
         lse_out_ptr=lse,
         STORE_LSE=return_lse,
         NATURAL_LSE=natural_lse,
+        sink_ptr=attn_sink,
+        HAS_SINK=attn_sink is not None,
         num_warps=4,
     )
     return (out.unsqueeze(0), lse) if return_lse else out.unsqueeze(0)

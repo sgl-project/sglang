@@ -176,6 +176,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
 )
+from sglang.srt.speculative.dfly_validation import dfly_targets_hy4_flash
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
 from sglang.srt.utils import (
     get_available_gpu_memory,
@@ -188,6 +189,7 @@ from sglang.srt.utils.aiter import maybe_pre_warm_aiter_chip_info
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 logger = logging.getLogger(__name__)
 
@@ -207,6 +209,32 @@ def get_prefill_num_tokens_to_capture(capture_tokens: Sequence[int]) -> list[int
     collectives when a dense FFN runs with moe_dense_tp_size=1.
     """
     return sorted({get_cuda_graph_max_batch_size(n) for n in capture_tokens})
+
+
+def prefill_capture_hidden_mode(
+    *,
+    spec_algorithm: SpeculativeAlgorithm,
+    is_draft_worker: bool,
+    is_breakable: bool,
+    architectures: Sequence[str],
+    server_mode: CaptureHiddenMode,
+) -> CaptureHiddenMode:
+    """The hidden-state mode a prefill graph captures; a forward needing more
+    runs eagerly. Breakable EAGLE drafts need LAST, EAGLE targets and DFlash
+    FULL, and an HY4 DFly target LAST to seed each request's first draft."""
+    is_eagle = spec_algorithm.is_eagle()
+    if is_breakable and is_eagle and is_draft_worker:
+        return CaptureHiddenMode.LAST
+    if (is_eagle and not is_draft_worker) or spec_algorithm.is_dflash_family():
+        return CaptureHiddenMode.FULL
+    # Hy4-Flash prefill is not graph-validated; its DFly prefill stays eager.
+    if (
+        spec_algorithm.is_dfly()
+        and not is_draft_worker
+        and not dfly_targets_hy4_flash(architectures)
+    ):
+        return max(CaptureHiddenMode.LAST, server_mode)
+    return server_mode
 
 
 def _chunked_prefix_variant(num_chunks: int) -> str:
@@ -452,15 +480,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         # --- capture modes --------------------------------------------
         self.capture_forward_mode = ForwardMode.EXTEND
-        # Hidden-state capture mode cases:
-        # - Breakable EAGLE draft: LAST.
-        # - EAGLE target: FULL.
-        # - Return-hidden-states or DFLASH: FULL.
-        # - Otherwise: NULL.
-        is_eagle = model_runner.spec_algorithm.is_eagle()
         is_breakable_eagle_draft = (
             self.prefill_backend_name == Backend.BREAKABLE
-            and is_eagle
+            and model_runner.spec_algorithm.is_eagle()
             and model_runner.is_draft_worker
         )
         # A multimodal target prepares the EAGLE3 draft inputs as a merged
@@ -471,14 +493,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self._use_draft_input_embeds = (
             is_breakable_eagle_draft and model_runner.spec_algorithm.is_eagle3()
         )
-        if is_breakable_eagle_draft:
-            self.capture_hidden_mode = CaptureHiddenMode.LAST
-        elif (is_eagle and not model_runner.is_draft_worker) or (
-            model_runner.spec_algorithm.is_dflash_family()
-        ):
-            self.capture_hidden_mode = CaptureHiddenMode.FULL
-        else:
-            self.capture_hidden_mode = self.return_hidden_states_mode
+        self.capture_hidden_mode = prefill_capture_hidden_mode(
+            spec_algorithm=model_runner.spec_algorithm,
+            is_draft_worker=model_runner.is_draft_worker,
+            is_breakable=self.prefill_backend_name == Backend.BREAKABLE,
+            architectures=model_runner.model_config.hf_config.architectures,
+            server_mode=self.return_hidden_states_mode,
+        )
 
         self.mamba_track_enabled = self._is_mamba_track_enabled()
 
