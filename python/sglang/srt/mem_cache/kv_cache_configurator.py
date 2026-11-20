@@ -1764,10 +1764,12 @@ class KVCacheConfigurator:
         max_num_reqs: int,
         extra_max_context_len: int,
     ) -> ReqToTokenPool:
+        from sglang.srt.layers.attention.linear.utils import max_verify_batch_size
+
         req_to_token_pool = HybridReqToTokenPool(
             size=max_num_reqs,
             mamba_size=get_schedule().max_mamba_cache_size,
-            mamba_spec_state_size=max_num_reqs,
+            mamba_spec_state_size=max_verify_batch_size(max_num_reqs),
             max_context_len=self.model_config.context_len + extra_max_context_len,
             device=self.device,
             enable_memory_saver=get_exec().features.enable_memory_saver,
