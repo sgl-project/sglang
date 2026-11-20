@@ -275,5 +275,23 @@ class TestBatchInvariantOps(CustomTestCase):
                             self._assert_batch_invariant_results(difflist, dtype, name)
 
 
+class TestMeanDim(CustomTestCase):
+    def test_mean_over_a_middle_dim_of_a_large_tensor(self):
+        # 33.5M outputs: one program per output exceeds HIP's 2**32-thread launch
+        # limit (hyper-connection contraction at an 8k-token prefill).
+        x = torch.randn(8192, 4, 4096, dtype=torch.bfloat16)
+        out = batch_invariant_ops.mean_dim(x, dim=-2)
+        ref = x.float().mean(dim=-2)
+        torch.testing.assert_close(out.float(), ref, atol=1e-2, rtol=1e-2)
+
+    def test_rows_do_not_depend_on_the_batch(self):
+        x = torch.randn(8192, 4, 4096, dtype=torch.bfloat16)
+        full = batch_invariant_ops.mean_dim(x, dim=-2)
+        for m in (1, 7, 300, 4096):
+            self.assertTrue(
+                torch.equal(batch_invariant_ops.mean_dim(x[:m], dim=-2), full[:m])
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
