@@ -17,6 +17,7 @@ from sglang.test.kits.spec_server_kits import (
     SpecFeatureKit,
     SpecLogprobKit,
     SpecPenaltyKit,
+    SpecUnfilteredSamplingOutputKit,
 )
 from sglang.test.server_fixtures.spec_eagle_fixture import Eagle3Base
 
@@ -28,6 +29,7 @@ _KITS = (
     SpecLogprobKit,
     SpecPenaltyKit,
     SpecFeatureKit,
+    SpecUnfilteredSamplingOutputKit,
     MatchedStopMixin,
 )
 
