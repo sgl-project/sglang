@@ -10,7 +10,18 @@ export const benchmarks = [
     ],
     accuracy: { gsm8k_pct: 95.53 },
   },
-  { match: { hw: "h200", quant: "fp8", strategy: "high-throughput" } },
+  {
+    match: { hw: "h200", quant: "fp8", strategy: "high-throughput" },
+    sglang_version: "a3bfedf6656e",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 821.14, tpot_ms: 11.419, tokens_per_sec_per_gpu: 92.13 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 64 },
+        ttft_ms: 104232.10, tpot_ms: 38.962, tokens_per_sec_per_gpu: 535.53 },
+    ],
+    accuracy: { gsm8k_pct: 95.91 },
+    notes: "Not verified: the run did not pass qualification. During the C64 cell, every rank logged a recovered CUDA allocator OOM and GPU0 free memory fell to 61 MiB (all 256 requests completed). 17 cold multimodal requests spent their 4,096-token budget on thinking and ended with finish_reason length. GSM8K stop rate 99.01%.",
+  },
   {
     match: { hw: "gb300", quant: "fp8", strategy: "low-latency" },
     sglang_version: "dd8756f1189c",
