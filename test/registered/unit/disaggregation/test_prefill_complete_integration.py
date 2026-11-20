@@ -2,6 +2,7 @@
 
 import threading
 import unittest
+from array import array
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from types import MethodType, SimpleNamespace
@@ -26,8 +27,11 @@ from sglang.srt.disaggregation.mooncake.conn import (
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sglang.srt.disaggregation.utils import MetadataBuffers
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.schedule_batch import Req, ReqLogprob
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.logprob_result_processor import (
+    SchedulerLogprobResultProcessor,
+)
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     KeyedReqList,
@@ -371,6 +375,7 @@ class TestAllocationIntegration(CustomTestCase):
             storage_prefetch_retry_attempts=3,
             storage_prefetch_last_match_len=8,
             metadata_buffer_index=0,
+            return_logprob=False,
             sampling_mask_rows=None,
             reset_for_retract=Mock(),
             advance_cache_request_handle=Mock(),
@@ -452,6 +457,7 @@ class TestAllocationIntegration(CustomTestCase):
         req._compute_max_prefix_len = Mock(return_value=31)
         req.storage_prefetch_retry_attempts = 0
         req.storage_prefetch_last_match_len = None
+        req.return_logprob = False
         req.sampling_mask_rows = None
         req.reset_for_retract = Mock()
         req.advance_cache_request_handle = Mock()
@@ -480,22 +486,22 @@ class TestAllocationIntegration(CustomTestCase):
             req.cache_request_handle, CacheRequestOutcome.ABORT
         )
 
-    def test_requeued_parked_request_sends_only_its_retry_sampling_row(self):
-        """A captured request parked after prefill has queued its first token's
-        sampling row. Requeued, it prefills again and samples that token again;
-        the stale row must not reach the metadata buffer beside the new one."""
+    def test_requeued_parked_request_sends_only_its_retry_token(self):
+        """A request parked after prefill has recorded its first token's logprobs
+        and queued its sampling row. Requeued, it prefills again and samples that
+        token again; decode must receive the retry token with the retry's logprobs
+        and sampling row, not the first attempt's."""
         override = get_context().override_server_args(optimistic_prefill_attempts=3)
         override.install()
         self.addCleanup(override.restore)
+        req_logprob = ReqLogprob(top_logprobs_num=2, token_ids_logprob=None)
+        req_logprob.reset_output_records()
         rows = SamplingMaskRows()
-        rows.append(
-            -1.5, np.array([7, 8, 9], np.int32), np.array([-1.25, -1.5, -2.0], "f4")
-        )
         req = FakeReq(
-            rid="retry-mask",
-            cache_request_handle=CacheRequestHandle(rid="retry-mask", attempt_id=0),
+            rid="retry-token",
+            cache_request_handle=CacheRequestHandle(rid="retry-token", attempt_id=0),
             prefill_attempt_count=0,
-            output_ids=[101],
+            output_ids=array("q"),
             skip_radix_cache_insert=True,
             storage_prefetch_retry_attempts=0,
             storage_prefetch_last_match_len=None,
@@ -510,8 +516,31 @@ class TestAllocationIntegration(CustomTestCase):
             cached_tokens_host=0,
             cached_tokens_storage=0,
             get_mm_token_counts=lambda: (0, 0, 0),
-            return_logprob=False,
+            return_logprob=True,
+            logprob=req_logprob,
             bootstrap_room=9,
+        )
+
+        def sample_first_token(
+            *, token_id, logprob, top_idx, top_val, mask_idx, mask_val
+        ):
+            req.output_ids.append(token_id)
+            SchedulerLogprobResultProcessor.append_output_token_logprobs(
+                req,
+                token_id,
+                logprob,
+                top_logprobs_val=[top_val],
+                top_logprobs_idx=[top_idx],
+            )
+            rows.append(logprob, np.array(mask_idx, np.int32), np.array(mask_val, "f4"))
+
+        sample_first_token(
+            token_id=101,
+            logprob=-1.5,
+            top_idx=[101, 7],
+            top_val=[-1.5, -2.0],
+            mask_idx=[7, 8, 9],
+            mask_val=[-1.25, -1.5, -2.0],
         )
         scheduler = SimpleNamespace(
             tree_cache=Mock(supports_mamba=Mock(return_value=False)),
@@ -530,8 +559,14 @@ class TestAllocationIntegration(CustomTestCase):
                 scheduler, req
             )
 
-        req.output_ids = [102]
-        rows.append(-0.5, np.array([4, 5], np.int32), np.array([-0.5, -1.0], "f4"))
+        sample_first_token(
+            token_id=102,
+            logprob=-0.5,
+            top_idx=[102, 4],
+            top_val=[-0.5, -1.0],
+            mask_idx=[4, 5],
+            mask_val=[-0.5, -1.0],
+        )
         with envs.SGLANG_ENABLE_DISAGG_SAMPLING_MASK.override(True):
             buffers = MetadataBuffers(
                 size=1,
@@ -541,6 +576,11 @@ class TestAllocationIntegration(CustomTestCase):
             )
         buffers.set_buf(req)
 
+        self.assertEqual(buffers.output_ids[0, 0].item(), 102)
+        self.assertEqual(buffers.output_token_logprobs_idx[0, 0].item(), 102)
+        self.assertEqual(buffers.output_token_logprobs_val[0, 0].item(), -0.5)
+        self.assertEqual(buffers.output_top_logprobs_idx[0, :2].tolist(), [102, 4])
+        self.assertEqual(buffers.output_top_logprobs_val[0, :2].tolist(), [-0.5, -1.0])
         self.assertEqual(buffers.output_token_sampling_mask_len[0, 0].item(), 2)
         self.assertEqual(buffers.output_token_sampling_mask_idx[0, :2].tolist(), [4, 5])
         self.assertEqual(

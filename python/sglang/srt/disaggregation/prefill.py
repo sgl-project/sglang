@@ -2028,8 +2028,10 @@ class SchedulerDisaggregationPrefillMixin:
         release_kv_cache(req, self.tree_cache, checkpoint=False)
         req.reset_for_retract()
         req.output_ids = array("q")
-        # A parked request already queued its first token's row; the retry
-        # samples that token again.
+        # A parked request already recorded its first token's logprobs and queued
+        # its sampling row; the retry samples that token again.
+        if req.return_logprob:
+            req.logprob.reset_output_records()
         if req.sampling_mask_rows is not None:
             req.sampling_mask_rows.take()
         req.customized_info = None
